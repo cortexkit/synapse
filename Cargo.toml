@@ -5,6 +5,7 @@ members = [
     "bench/lanes/ort-embed",
     "bench/lanes/wrap-embed",
     "bench/lanes/llama",
+    "bench/lanes/mlx",
 ]
 
 [workspace.package]

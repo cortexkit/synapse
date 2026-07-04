@@ -1,0 +1,17 @@
+[package]
+name = "lane-mlx"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Bench lane: Apple Silicon GPU inference via mlx-rs for Qwen3 embedding and micro-LLM workloads"
+publish = false
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+tokenizers = { workspace = true }
+synapse-bench = { path = "../../harness" }
+mlx-rs = { version = "=0.25.3", features = ["safetensors"] }

@@ -10,6 +10,7 @@ RESULTS=bench/results
 # corpus-v2 = AFT's real chunk export (byte-exact embed_text, 15,271 chunks),
 # converted from corpus/aft-chunks.jsonl. v1 (line-chunked) is integration-only.
 CORPUS=bench/data/corpus-v2.jsonl
+PROMPTS=bench/data/microllm-prompts-v1.jsonl
 WAIT_MAX=${WAIT_MAX:-14400}   # max seconds to wait for idle per lane (4h)
 WAIT_STEP=60
 
@@ -28,7 +29,19 @@ wait_for_idle_and_run() {
   done
 }
 
+find_snapshot() {
+  local pattern="$1"
+  local found
+  found=$(ls -d $pattern 2>/dev/null | head -n 1 || true)
+  if [ -z "$found" ]; then
+    return 1
+  fi
+  printf '%s\n' "$found"
+}
+
 SNAP_ONNX=$HOME/.cache/huggingface/hub/models--onnx-community--Qwen3-Embedding-0.6B-ONNX/snapshots/c25a394dd583836952667c12f008335071b3f43d
+SNAP_MLX_EMBED=$(find_snapshot "$HOME/.cache/huggingface/hub/models--Qwen--Qwen3-Embedding-0.6B/snapshots/*")
+SNAP_MLX_MICROLLM=${SNAP_MLX_MICROLLM:-$(find_snapshot "$HOME/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/*" || true)}
 
 # Lane 1: ort-cpu reference (workload A)
 wait_for_idle_and_run ort-cpu-embed \
@@ -37,11 +50,35 @@ wait_for_idle_and_run ort-cpu-embed \
   --tokenizer "$SNAP_ONNX/tokenizer.json" \
   --corpus "$CORPUS" \
   --out "$RESULTS/ort-cpu-embed.json" \
+  --vectors-out "$RESULTS/ort-cpu-embed-vectors.jsonl" \
   --pooling last --max-length 512 \
   --model-label "Qwen3-Embedding-0.6B@onnx-fp32"
 
+# Lane 2: mlx-rs / Metal embedding (workload A)
+wait_for_idle_and_run mlx-embed \
+  ./target/release/lane-mlx embed \
+  --model "$SNAP_MLX_EMBED" \
+  --tokenizer "$SNAP_MLX_EMBED/tokenizer.json" \
+  --corpus "$CORPUS" \
+  --out "$RESULTS/mlx-embed.json" \
+  --vectors-out "$RESULTS/mlx-embed-vectors.jsonl" \
+  --reference "$RESULTS/ort-cpu-embed-vectors.jsonl" \
+  --model-label "Qwen3-Embedding-0.6B@mlx-bf16"
+
+# Lane 3: mlx-rs / Metal micro-LLM one-shot (workload B).
+# Leave SNAP_MLX_MICROLLM empty to skip until the bf16 safetensors snapshot is cached.
+if [ -n "$SNAP_MLX_MICROLLM" ]; then
+  wait_for_idle_and_run mlx-microllm \
+    ./target/release/lane-mlx microllm \
+    --model "$SNAP_MLX_MICROLLM" \
+    --tokenizer "$SNAP_MLX_MICROLLM/tokenizer.json" \
+    --prompts "$PROMPTS" \
+    --out "$RESULTS/mlx-microllm.json"
+else
+  echo "skip mlx-microllm: cache Qwen/Qwen3-0.6B bf16 safetensors and set SNAP_MLX_MICROLLM if auto-detect does not find it" >&2
+fi
+
 # Further lanes are appended as their binaries land:
-# - mlx-embed (workload A) + mlx-microllm (workload B)
 # - llama-metal-embed (A) + llama-metal-microllm (B)
 # - burn-wgpu-embed (A)
 # - wrap-lmstudio-embed (A), wrap-ollama-embed (A)
