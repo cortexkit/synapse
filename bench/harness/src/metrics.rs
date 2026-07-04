@@ -26,6 +26,13 @@ struct Measurement {
     peak_rss_bytes: u64,
     power: PowerAgg,
     samples: usize,
+    /// Foreign-load check: CPU consumed by processes OTHER than the measured
+    /// child tree, sampled during the run. If foreign load exceeded the
+    /// threshold the run is marked contaminated and the wrapper exits nonzero
+    /// so the matrix runner retries the lane.
+    foreign_cpu_avg_pct: f64,
+    foreign_cpu_peak_pct: f64,
+    contaminated: bool,
 }
 
 #[derive(Serialize, Default)]
@@ -79,6 +86,49 @@ fn assert_idle(max_cpu_pct: f64, max_gpu_pct: f64) -> Result<()> {
     Ok(())
 }
 
+/// Total CPU percent of all processes except the given pid's tree and our own
+/// sampling overhead. Uses `ps` so per-process attribution is possible (macmon
+/// only reports machine totals, which cannot distinguish the measured child
+/// from a foreign agent burst).
+fn foreign_cpu_pct(child_pid: u32) -> Option<f64> {
+    let out = Command::new("ps").args(["-axo", "pid=,ppid=,pcpu="]).output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut rows: Vec<(u32, u32, f64)> = Vec::new();
+    for line in text.lines() {
+        let mut parts = line.split_whitespace();
+        let (Some(pid), Some(ppid), Some(pcpu)) = (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        let (Ok(pid), Ok(ppid), Ok(pcpu)) =
+            (pid.parse::<u32>(), ppid.parse::<u32>(), pcpu.parse::<f64>())
+        else {
+            continue;
+        };
+        rows.push((pid, ppid, pcpu));
+    }
+    // Build the child's process tree (children of children included).
+    let mut tree: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    tree.insert(child_pid);
+    tree.insert(std::process::id());
+    loop {
+        let before = tree.len();
+        for (pid, ppid, _) in &rows {
+            if tree.contains(ppid) {
+                tree.insert(*pid);
+            }
+        }
+        if tree.len() == before {
+            break;
+        }
+    }
+    // ps pcpu is per-core (100 = one full core); normalize to machine percent
+    // so the value is comparable with the preflight gate's macmon threshold.
+    let sum: f64 = rows.iter().filter(|(pid, _, _)| !tree.contains(pid)).map(|(_, _, p)| p).sum();
+    let ncpu = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) as f64;
+    Some(sum / ncpu)
+}
+
 pub fn run_wrapped(
     out: &Path,
     interval_ms: u64,
@@ -127,9 +177,12 @@ pub fn run_wrapped(
         .with_context(|| format!("spawning {}", cmd[0]))?;
     let child_pid = child.id();
 
-    // Sample child RSS while it runs (process tree via pgrep -P not needed:
-    // lanes are single-process; runtimes that spawn children report their own).
+    // Sample child RSS and foreign CPU while it runs. Foreign load is CPU
+    // consumed outside the child's process tree; sampled every ~2s (ps is
+    // costlier than the RSS probe).
     let mut peak_rss: u64 = 0;
+    let mut foreign_samples: Vec<f64> = Vec::new();
+    let mut ticks: u32 = 0;
     let exit_code = loop {
         if let Some(status) = child.try_wait()? {
             break status.code().unwrap_or(-1);
@@ -137,6 +190,12 @@ pub fn run_wrapped(
         if let Some(rss) = sample_rss(child_pid) {
             peak_rss = peak_rss.max(rss);
         }
+        if ticks % 20 == 0 {
+            if let Some(pct) = foreign_cpu_pct(child_pid) {
+                foreign_samples.push(pct);
+            }
+        }
+        ticks += 1;
         std::thread::sleep(Duration::from_millis(100));
     };
     let wall_s = started.elapsed().as_secs_f64();
@@ -163,6 +222,15 @@ pub fn run_wrapped(
     agg.combined_avg_w = agg.cpu_avg_w + agg.gpu_avg_w + agg.ane_avg_w;
     agg.energy_j = agg.combined_avg_w * wall_s;
 
+    // Contamination verdict: sustained foreign CPU during the run means the
+    // numbers are not attributable to the measured child. Threshold mirrors
+    // the preflight gate. WindowServer/kernel background sits ~5-10%, so the
+    // preflight max_cpu_pct (default 15) is a sane bar here too.
+    let n_foreign = foreign_samples.len().max(1) as f64;
+    let foreign_avg = foreign_samples.iter().sum::<f64>() / n_foreign;
+    let foreign_peak = foreign_samples.iter().cloned().fold(0.0f64, f64::max);
+    let contaminated = !skip_idle_check && foreign_avg > max_cpu_pct;
+
     let m = Measurement {
         cmd: cmd.to_vec(),
         wall_s,
@@ -170,6 +238,9 @@ pub fn run_wrapped(
         peak_rss_bytes: peak_rss,
         power: agg,
         samples: samples.len(),
+        foreign_cpu_avg_pct: foreign_avg,
+        foreign_cpu_peak_pct: foreign_peak,
+        contaminated,
     };
     if let Some(parent) = out.parent() {
         std::fs::create_dir_all(parent)?;
@@ -186,6 +257,10 @@ pub fn run_wrapped(
         m.samples
     );
     anyhow::ensure!(exit_code == 0, "child exited nonzero: {exit_code}");
+    anyhow::ensure!(
+        !contaminated,
+        "run contaminated: foreign CPU avg {foreign_avg:.1}% (max {max_cpu_pct}%) during measurement — discarding; the matrix runner will retry"
+    );
     Ok(())
 }
 
