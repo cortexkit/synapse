@@ -89,9 +89,17 @@ mlx-rs/llama-server lanes, both parity-proven in this bench).
 
 ## Recommendation
 
-[PENDING measured numbers. Preliminary shape, to be confirmed or falsified by the
-matrix: hybrid in-house module — ort CPU floor everywhere, MLX lane where it wins
-on Apple Silicon, llama.cpp child process as the general local-LLM/GGUF engine,
-remote endpoints (including user-pointed vllm/Ollama/LMStudio) as just another
-backend behind the same surface. Wrap-as-primary looks dead on architecture grounds
-(supervision, admission control, reliability ceiling) before speed even enters.]
+Direction set by Ufuk (2026-07-04): **borrow the kernels, own the stack.** Native
+engine layers under a fully-owned Rust serving stack; no adopted Python packaging.
+Rationale: every capable Apple-Silicon stack already concedes compute to native
+engines (see convergence finding); the packaging layer is the part Synapse must own
+anyway (subc supervision, machine-wide admission, credential integration, model
+lifecycle), and Python packaging is the part that fails our end-user constraints
+(install burden, interpreter footprint, cold start, energy).
+
+The measured matrix decides the remaining question — which engine carries which
+workload per platform: ort CPU floor everywhere; MLX lane (mlx-rs) vs llama.cpp
+child process on Apple Silicon per workload; remote endpoints (user-pointed
+vllm/sglang/Ollama/LMStudio/oMLX) as another backend behind the same surface.
+
+[MEASURED TABLE PENDING — idle-gated matrix on AFT's corpus.]

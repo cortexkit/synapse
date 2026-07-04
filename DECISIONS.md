@@ -53,9 +53,13 @@ approval state: **decided** (reversible, AFT-approved or within pre-approved sco
 
 ## D-005 (open): Decision #1 — in-house hybrid vs wrapping existing servers
 
-- State: evaluation in progress (empirical bench per AFT's steer)
-- Ufuk decides after the tradeoff doc; AFT may green-light direction if evidence is
-  one-sided (formal lock still Ufuk's).
+- State: evaluation in progress (empirical bench per AFT's steer); DIRECTION set by
+  Ufuk 2026-07-04: "borrow the kernels but own the stack fully so we can have
+  optimal control for our use cases" — i.e. native engine layers (MLX, llama.cpp,
+  ort) under a fully-owned Rust serving stack; no Python packaging layers adopted.
+- The measured matrix still runs: it picks WHICH engine lanes carry which
+  workloads (and provides the evidence record), not whether we own the stack.
+- Formal lock lands with the tradeoff doc review.
 
 ## D-006: Shared content-addressed model blob cache
 
