@@ -78,9 +78,67 @@ else
   echo "skip mlx-microllm: cache Qwen/Qwen3-0.6B bf16 safetensors and set SNAP_MLX_MICROLLM if auto-detect does not find it" >&2
 fi
 
-# Further lanes are appended as their binaries land:
-# - llama-metal-embed (A) + llama-metal-microllm (B)
-# - burn-wgpu-embed (A)
-# - wrap-lmstudio-embed (A), wrap-ollama-embed (A)
+SNAP_GGUF_EMBED=$(find_snapshot "$HOME/.cache/huggingface/hub/models--Qwen--Qwen3-Embedding-0.6B-GGUF/snapshots/*")
+SNAP_GGUF_LLM=$(find_snapshot "$HOME/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B-GGUF/snapshots/*")
+SNAP_MINILM=$(find_snapshot "$HOME/.cache/huggingface/hub/models--Qdrant--all-MiniLM-L6-v2-onnx/snapshots/*")
+
+# Lane 4: llama-server / Metal embedding (workload A)
+wait_for_idle_and_run llama-metal-embed \
+  ./target/release/lane-llama embed \
+  --model "$SNAP_GGUF_EMBED/Qwen3-Embedding-0.6B-f16.gguf" \
+  --tokenizer "$SNAP_MLX_EMBED/tokenizer.json" \
+  --corpus "$CORPUS" \
+  --out "$RESULTS/llama-metal-embed.json" \
+  --vectors-out "$RESULTS/llama-metal-embed-vectors.jsonl" \
+  --reference "$RESULTS/ort-cpu-embed-vectors.jsonl" \
+  --model-label "Qwen3-Embedding-0.6B@gguf-f16"
+
+# Lane 5: llama-server / Metal micro-LLM one-shot (workload B)
+wait_for_idle_and_run llama-metal-microllm \
+  ./target/release/lane-llama microllm \
+  --model "$SNAP_GGUF_LLM/Qwen3-0.6B-Q8_0.gguf" \
+  --prompts "$PROMPTS" \
+  --out "$RESULTS/llama-metal-microllm.json" \
+  --model-label "Qwen3-0.6B@gguf-q8_0"
+
+# Lane 6a: ort-cpu MiniLM (floor pair for burn, which could not import Qwen3)
+wait_for_idle_and_run ort-cpu-minilm-embed \
+  ./target/release/lane-ort-embed \
+  --model "$SNAP_MINILM/model.onnx" \
+  --tokenizer "$SNAP_MINILM/tokenizer.json" \
+  --corpus "$CORPUS" \
+  --out "$RESULTS/ort-cpu-minilm-embed.json" \
+  --vectors-out "$RESULTS/ort-cpu-minilm-embed-vectors.jsonl" \
+  --pooling mean --max-length 512 \
+  --model-label "all-MiniLM-L6-v2@ort-cpu-fp32"
+
+# Lane 6b: burn wgpu/Metal MiniLM (compare against 6a, same model)
+wait_for_idle_and_run burn-wgpu-embed \
+  ./target/release/lane-burn \
+  --model "$SNAP_MINILM/model.onnx" \
+  --tokenizer "$SNAP_MINILM/tokenizer.json" \
+  --corpus "$CORPUS" \
+  --out "$RESULTS/burn-wgpu-embed.json" \
+  --reference "$RESULTS/ort-cpu-minilm-embed-vectors.jsonl" \
+  --pooling mean \
+  --model-label "all-MiniLM-L6-v2@burn-wgpu-f32"
+
+# Lane 7: wrapped LMStudio (workload A). Requires LMStudio running with
+# the qwen3 embedding model loaded; skipped when unreachable.
+if curl -sf http://127.0.0.1:1234/v1/models >/dev/null 2>&1; then
+  wait_for_idle_and_run wrap-lmstudio-embed \
+    ./target/release/lane-wrap-embed \
+    --base-url http://127.0.0.1:1234 \
+    --model text-embedding-qwen3-embedding-0.6b \
+    --lane wrap-lmstudio \
+    --corpus "$CORPUS" \
+    --out "$RESULTS/wrap-lmstudio-embed.json" \
+    --reference "$RESULTS/ort-cpu-embed-vectors.jsonl" \
+    --tokenizer "$SNAP_MLX_EMBED/tokenizer.json" \
+    --rss-process-names "LM Studio Helper,lms" \
+    --model-label "Qwen3-Embedding-0.6B@lmstudio"
+else
+  echo "skip wrap-lmstudio-embed: LMStudio not reachable on :1234" >&2
+fi
 
 echo "matrix complete; results in $RESULTS/"
