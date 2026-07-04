@@ -9,13 +9,15 @@
 //! Batching mirrors the scar tissue: small sub-batches with bounded retry on
 //! transient failures (LMStudio 400s under concurrent load).
 
-use std::io::BufRead;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use synapse_bench::results::LaneResult;
+use synapse_bench::{
+    parity::{cosine, load_corpus, load_reference, Chunk},
+    results::LaneResult,
+};
 use tokenizers::{Tokenizer, TruncationParams};
 
 #[derive(Parser)]
@@ -54,12 +56,6 @@ struct Args {
     model_label: String,
 }
 
-#[derive(serde::Deserialize)]
-struct Chunk {
-    id: String,
-    text: String,
-}
-
 fn main() -> Result<()> {
     let args = Args::parse();
 
@@ -69,11 +65,7 @@ fn main() -> Result<()> {
         .with_truncation(Some(TruncationParams { max_length: 512, ..Default::default() }))
         .map_err(|e| anyhow::anyhow!("truncation: {e}"))?;
 
-    let file = std::fs::File::open(&args.corpus)?;
-    let mut chunks: Vec<Chunk> = std::io::BufReader::new(file)
-        .lines()
-        .map(|l| Ok(serde_json::from_str::<Chunk>(&l?)?))
-        .collect::<Result<_>>()?;
+    let mut chunks: Vec<Chunk> = load_corpus(&args.corpus, None)?;
     if let Some(limit) = args.limit {
         chunks.truncate(limit);
     }
@@ -214,27 +206,6 @@ fn embed_batch(
     Ok(out)
 }
 
-fn load_reference(path: &std::path::Path) -> Result<std::collections::HashMap<String, Vec<f32>>> {
-    let file = std::fs::File::open(path)?;
-    let mut map = std::collections::HashMap::new();
-    for line in std::io::BufReader::new(file).lines() {
-        let v: serde_json::Value = serde_json::from_str(&line?)?;
-        let id = v["id"].as_str().context("id")?.to_string();
-        let vec = v["vec"].as_array().context("vec")?.iter().map(|x| x.as_f64().unwrap_or(0.0) as f32).collect();
-        map.insert(id, vec);
-    }
-    Ok(map)
-}
-
-fn cosine(a: &[f32], b: &[f32]) -> f64 {
-    if a.len() != b.len() {
-        return 0.0;
-    }
-    let dot: f64 = a.iter().zip(b).map(|(x, y)| (*x as f64) * (*y as f64)).sum();
-    let na: f64 = a.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
-    let nb: f64 = b.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
-    dot / (na * nb + 1e-12)
-}
 
 fn rss_of_named(name: &str) -> Option<u64> {
     let out = std::process::Command::new("pgrep").args(["-f", name]).output().ok()?;

@@ -10,7 +10,6 @@
 //! Emits a LaneResult JSON plus optionally the raw vectors (for parity
 //! reference against GPU lanes).
 
-use std::io::BufRead;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -18,7 +17,10 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use ndarray::Array2;
 use ort::session::{builder::GraphOptimizationLevel, Session};
-use synapse_bench::results::LaneResult;
+use synapse_bench::{
+    parity::{load_corpus, Chunk},
+    results::LaneResult,
+};
 use tokenizers::{Tokenizer, TruncationParams};
 
 #[derive(Parser)]
@@ -50,12 +52,6 @@ struct Args {
     /// Model label for the result
     #[arg(long)]
     model_label: String,
-}
-
-#[derive(serde::Deserialize)]
-struct Chunk {
-    id: String,
-    text: String,
 }
 
 fn main() -> Result<()> {
@@ -99,12 +95,7 @@ fn main() -> Result<()> {
     let cold_load_s = started.elapsed().as_secs_f64();
 
     // --- Corpus ---
-    let file = std::fs::File::open(&args.corpus)?;
-    let chunks: Vec<Chunk> = std::io::BufReader::new(file)
-        .lines()
-        .map(|l| Ok(serde_json::from_str::<Chunk>(&l?)?))
-        .collect::<Result<_>>()?;
-    anyhow::ensure!(!chunks.is_empty(), "empty corpus");
+    let chunks: Vec<Chunk> = load_corpus(&args.corpus, None)?;
 
     // --- Embed with AFT's greedy attention-unit batching ---
     let mut vectors_writer = match &args.vectors_out {
