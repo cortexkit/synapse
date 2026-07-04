@@ -37,6 +37,9 @@ struct PowerAgg {
     ane_avg_w: f64,
     ane_peak_w: f64,
     combined_avg_w: f64,
+    /// Energy over the run window: combined average watts * wall seconds.
+    /// Joules/task = this divided by the lane's item count.
+    energy_j: f64,
 }
 
 #[derive(Deserialize)]
@@ -158,6 +161,7 @@ pub fn run_wrapped(
     agg.gpu_avg_w /= n;
     agg.ane_avg_w /= n;
     agg.combined_avg_w = agg.cpu_avg_w + agg.gpu_avg_w + agg.ane_avg_w;
+    agg.energy_j = agg.combined_avg_w * wall_s;
 
     let m = Measurement {
         cmd: cmd.to_vec(),
