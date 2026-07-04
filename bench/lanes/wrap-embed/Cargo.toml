@@ -1,0 +1,17 @@
+[package]
+name = "lane-wrap-embed"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Bench lane: wrapped local servers (LMStudio/Ollama) over OpenAI-compatible /v1/embeddings"
+publish = false
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+tokenizers = { workspace = true }
+synapse-bench = { path = "../../harness" }
+reqwest = { version = "0.12", features = ["json", "blocking"] }
