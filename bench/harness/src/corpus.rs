@@ -105,7 +105,7 @@ pub fn build(
     writer.flush()?;
     eprintln!(
         "corpus: {count} chunks, {total_tokens} tokens total, avg {} tok/chunk -> {}",
-        if count > 0 { total_tokens / count } else { 0 },
+        total_tokens.checked_div(count).unwrap_or(0),
         out.display()
     );
     anyhow::ensure!(count > 0, "no chunks produced from {}", root.display());
