@@ -1,0 +1,19 @@
+[package]
+name = "lane-ort-embed"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Bench lane: bounded-CPU raw ort embedding (AFT production policies: Level3, ceil(cores/2) intra threads, 4M attention-unit batching)"
+publish = false
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+tokenizers = { workspace = true }
+synapse-bench = { path = "../../harness" }
+ort = { version = "=2.0.0-rc.11", features = ["ndarray", "half"] }
+ndarray = "0.17.2"
+half = "2"

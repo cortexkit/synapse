@@ -1,0 +1,16 @@
+[package]
+name = "synapse-bench"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Decision #1 runtime evaluation harness: identical workloads across candidate inference runtimes"
+publish = false
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+tokenizers = { workspace = true }
+walkdir = "2"
