@@ -61,6 +61,16 @@ approval state: **decided** (reversible, AFT-approved or within pre-approved sco
   workloads (and provides the evidence record), not whether we own the stack.
 - Formal lock lands with the tradeoff doc review.
 
+## D-008: Pin subc-protocol 0.7.0 + subc-transport 0.3.1; health() carries model state
+
+- State: decided (SUBC directive, 2026-07-04)
+- Pin 0.7.0/0.3.1 from day one (lockstep; released after the founding study which
+  observed 0.6.0/0.3.0). Adopt the HEALTH system (docs/specs/subc-health.md):
+  override ModuleHandler::health() with model-serving state — ok|degraded|failing
+  plus detail/metrics (cold load in progress = degraded "loading <model>", GPU
+  queue depth as metric). Daemon probes on cadence; restart policy default
+  report-only. Pairs with the poll-first job-ops design (D-003).
+
 ## D-006: Shared content-addressed model blob cache
 
 - State: decided (SUBC-blessed as a new family convention, pm_fe84493f)
