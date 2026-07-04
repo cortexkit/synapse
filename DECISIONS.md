@@ -72,6 +72,9 @@ approval state: **decided** (reversible, AFT-approved or within pre-approved sco
 
 - State: decided (consumer requirements, folded into API design round)
 - Date: 2026-07-04
+- Machine-wide admission/queuing for embed calls is a v1 requirement, not a consumer
+  convention (AFT live incident: 6 concurrent processes' per-process backoff did not
+  compose; buried LMStudio). The module is the single admission point.
 - Model fingerprint on every embed response; changes iff vector space changes (runtime
   lanes with different float outputs = different fingerprints); dims explicit; hard
   reject-on-substitution (never silently serve a different identity). input_type

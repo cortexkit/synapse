@@ -7,7 +7,9 @@ cd "$(dirname "$0")/.."
 
 BENCH=./target/release/synapse-bench
 RESULTS=bench/results
-CORPUS=bench/data/corpus-v1.jsonl
+# corpus-v2 = AFT's real chunk export (byte-exact embed_text, 15,271 chunks),
+# converted from corpus/aft-chunks.jsonl. v1 (line-chunked) is integration-only.
+CORPUS=bench/data/corpus-v2.jsonl
 WAIT_MAX=${WAIT_MAX:-14400}   # max seconds to wait for idle per lane (4h)
 WAIT_STEP=60
 
