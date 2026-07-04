@@ -138,3 +138,46 @@ model binding is structurally wrong for a model-SERVING module (models arrive at
 runtime); mlx-rs requires hand-implementing every architecture (worked for Qwen3, but
 each new model family = new Rust code); llama.cpp child process gives runtime model
 loading + per-request timings + one binary for embed+LLM.
+
+## New candidates round 2 (user request, 2026-07-04 evening)
+
+- LFM2.5-230M: added to workload B on the llama lane (Q8_0, verified working on
+  llama-server b9580 — valid label answer in manual probe). NOTE: it cannot join the
+  mlx lane without hand-implementing LFM2.5's hybrid conv/attention architecture in
+  mlx-rs — which is itself the mlx-rs finding restated: every model family = new
+  Rust code; llama.cpp got it for free from the GGUF ecosystem.
+- sglang ([task-id]): Python-first serving stack, quickstart still Linux+CUDA
+  sm80+, no Windows story — BUT it now has an official Apple Silicon path via a
+  separate MLX/Metal guide (docs.sglang.io hardware-platforms/apple_metal, v0.5.14
+  2026-06-26 shows active MLX work). Embeddings first-class (/v1/embeddings,
+  Qwen3-Embedding-0.6B is their own bench default). Verdict: dispositioned as
+  primary desktop runtime (Python stack, datacenter-oriented, no Windows); its
+  Apple lane is MLX underneath — see the convergence note below.
+- vllm Metal claim ([task-id]): CORRECTION to our disposition. vLLM-Metal is
+  REAL: an official-org out-of-tree plugin (vllm-project/vllm-metal, created
+  2025-12-12, alpha, ~1.4k stars), MLX-backed (deps: mlx, mlx-lm, mlx-vlm),
+  registered via vllm.platform_plugins. Core vllm still has no in-tree Metal
+  backend, so the repo-inspection finding stands for core; the disposition wording
+  was stale about the ecosystem. Limits: installer pulls dev wheels + builds vllm
+  0.24.0 core from source (Python 3.12 arm64 + uv + Xcode CLT burden), pooling
+  experimental/LAST-only, narrow GGUF. Even its experimental vllm-rs Rust frontend
+  spawns the Python engine. Verdict unchanged for shipping: not a consumer
+  child-process candidate; noted honestly in the doc.
+- waybarrios/vllm-mlx (same worker): independent Apple MLX server with vLLM-like
+  batching/paged-KV (delegates to mlx-lm/mlx-vlm/mlx-embeddings), alpha, not the
+  upstream path (official docs point at vllm-metal instead). Self-reported 417.9
+  tok/s Qwen3-0.6B-8bit on M4 Max. Python-heavy; disposition for shipping.
+- oMLX (omlx.ai, jundot/omlx): the strongest wrap-class candidate found — DMG +
+  Homebrew service + CLI serve, OpenAI+Anthropic APIs, embeddings/rerank, SSD KV
+  cache; 17.5k stars, 100+ contributors, v0.4.4 2026-06-16. Still a ~750MB
+  Python/MLX app stack, macOS 15+. Verdict: not a subprocess-class engine; a
+  candidate optional EXTERNAL backend behind our remote-endpoint lane (same class
+  as LMStudio, materially healthier project).
+
+CONVERGENCE NOTE (feeds the doc): every 2026 Apple-Silicon serving stack examined
+(vllm-metal, vllm-mlx, sglang-apple, oMLX, unsloth Studio, LMStudio's MLX engine)
+delegates compute to MLX. The ecosystem has already voted: on Apple hardware the
+engine layer is MLX or llama.cpp-Metal; everything above it is packaging. This
+narrows decision #1 to: whose packaging — theirs (Python stacks we can't ship to
+end users) or ours (Rust module + mlx-rs/llama-server lanes, both parity-proven
+in our bench).

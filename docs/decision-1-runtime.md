@@ -38,8 +38,12 @@ lanes. Contaminated runs are registered and excluded.
 | burn (wgpu/Metal) | measured (embed only) | pending matrix |
 | LMStudio (wrap) | measured (workload A) | pending matrix |
 | Ollama (wrap) | not installed; LMStudio represents the wrap class; install+measure only if wrap survives on other grounds | dispositioned unless revived |
-| vllm | dispositioned by inspection | no Metal path (macOS forced CPU-only), Python server footprint, native Windows unsupported; remains relevant as a REMOTE endpoint users point us at |
+| vllm | dispositioned by inspection, then CORRECTED and re-checked | core vllm: no in-tree Metal (macOS CPU-only), confirmed. Ecosystem: official out-of-tree vLLM-Metal plugin exists (alpha, MLX-backed, dev-wheel installs, Python 3.12 + source-built vllm core) — real but not shippable to end users; its own Rust frontend still spawns the Python engine. Remains relevant as a REMOTE endpoint users point us at |
+| vllm-mlx (waybarrios) | researched | independent MLX server, alpha, not the upstream path; self-reported strong numbers; Python-heavy — disposition for shipping |
+| sglang | researched | Python-first, datacenter-oriented, no Windows story; official Apple lane exists and is MLX underneath — disposition as primary, same remote-endpoint relevance as vllm |
+| oMLX | researched | strongest wrap-class option found (DMG/Homebrew service, OpenAI+Anthropic APIs, healthy project); still a ~750MB Python/MLX app — candidate optional EXTERNAL backend via the remote-endpoint lane, not a subprocess engine |
 | unsloth | dispositioned by inspection | training-first; its own serving delegates to llama-server + MLX — independent confirmation of the hybrid we're evaluating |
+| LFM2.5-230M (model, not runtime) | added to workload B | runs on llama-server b9580 out of the box; NOT runnable on the mlx-rs lane without hand-implementing its hybrid architecture — which is the mlx-rs finding restated |
 | ANE (CoreML-direct / Core AI) | deferred spike with written rationale | on-Mac LLM decode loses joules/token to GPU despite lower watts; wins are memory + always-on niches; revisit when STT/always-on lands. ORT-CoreML-EP dead end stands. |
 
 ## Integration findings (independent of measured speed)
@@ -69,6 +73,15 @@ what the matrix measures:
    cannot fix from outside.
 5. **ort CPU**: the proven universal floor; AFT's shipped policies reproduced
    exactly (Level3, ceil(cores/2) threads, 4M attention-unit batching).
+
+## The convergence finding
+
+Every 2026 Apple-Silicon serving stack examined (vLLM-Metal, vllm-mlx, sglang's
+Apple lane, oMLX, unsloth Studio, LMStudio's MLX engine) delegates compute to MLX.
+The engine layer on Apple hardware is decided — MLX or llama.cpp-Metal; everything
+above it is packaging. Decision #1 therefore reduces to: whose packaging — theirs
+(Python stacks we cannot ship to end users) or ours (Rust module with
+mlx-rs/llama-server lanes, both parity-proven in this bench).
 
 ## Results
 
