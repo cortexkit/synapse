@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["bench/harness", "bench/lanes/ort-embed"]
+members = ["bench/harness", "bench/lanes/ort-embed", "bench/lanes/burn"]
 
 [workspace.package]
 edition = "2021"
