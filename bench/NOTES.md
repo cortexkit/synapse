@@ -117,3 +117,24 @@ Old conclusion (ORT-CoreML-EP dead end) holds for THAT path only; direct paths m
   workloads favor GPU decisively). Recorded as a deferred spike: CoreML-direct
   embedder + small-LLM measurement behind a Swift shim, relevant when always-on
   micro-LLM/STT workloads land. This defers with evidence, not by omission.
+
+## Lane integration results (masons, smoke = correctness only, timings contaminated)
+
+| Lane | Parity vs reference | Cold load (smoke) | Integration findings |
+|------|--------------------:|------------------:|----------------------|
+| ort-cpu (Qwen3-Emb fp32) | reference | 1.4s | KV-cache inputs in onnx-community export fed empty; AFT policies reproduced exactly |
+| llama-metal (f16 GGUF, llama-server child) | 0.9999994 | 13.1s (incl model load) | --pooling last + --embd-normalize 2 verified; server returns per-request timings; chat_template_kwargs.enable_thinking=false works on build 9580; clean child lifecycle incl error paths |
+| mlx (bf16, mlx-rs 0.25.3) | 0.9958 | 4.4s | Full Qwen3 forward pass hand-written (RMSNorm/RoPE/GQA/q&k-norm); plain completion gave 0.000 label validity → Qwen chat template + thinking-disabled gives 1.000; mlx-sys release build 13m08s, needs cmake + DEVELOPER_DIR (real CI cost) |
+| burn-wgpu (MiniLM fallback, f32) | 1.0000 (vs ort same model) | 105.5s (Metal shader setup) | Qwen3 ONNX REFUSED by burn-onnx: "Nodes are not topologically sorted (ONNX spec violation)" — the validated-models path works, arbitrary exports don't; compile-time codegen pins the binary to one ONNX snapshot (no runtime model swap); 4m31s release build |
+| wrap-lmstudio | pending | n/a | blocked on AFT burst |
+
+Workload B smoke (10 prompts, greedy, 16 max tokens):
+- llama-metal: 10/10 valid labels, server decode ~281 tok/s (contaminated)
+- mlx: 10/10 valid labels with chat template, decode ~21.9 tok/s (contaminated, and
+  hand-rolled decode loop — production would batch/optimize; treat as floor not ceiling)
+
+Architecture signal already visible (pre-measurement): burn's compile-time-codegen
+model binding is structurally wrong for a model-SERVING module (models arrive at
+runtime); mlx-rs requires hand-implementing every architecture (worked for Qwen3, but
+each new model family = new Rust code); llama.cpp child process gives runtime model
+loading + per-request timings + one binary for embed+LLM.
