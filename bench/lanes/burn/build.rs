@@ -110,6 +110,8 @@ pub const BUILD_NOTES: &str = {build_notes:?};
 pub const QWEN_IMPORT_ERROR: Option<&str> = {qwen_error};
 pub const WEIGHTS_PATH: &str = concat!(env!("OUT_DIR"), "/model/model.bpk");
 
+// burn-onnx codegen output is machine-generated; exempt it from lints.
+#[allow(clippy::all)]
 pub mod generated_model {{
     include!(concat!(env!("OUT_DIR"), "/model/model.rs"));
 }}
