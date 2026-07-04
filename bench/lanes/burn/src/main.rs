@@ -1,7 +1,6 @@
 #![recursion_limit = "256"]
 
-use std::collections::HashMap;
-use std::io::{BufRead, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -10,8 +9,10 @@ use burn::backend::{Metal, wgpu::WgpuDevice};
 use burn::prelude::{Float, Int};
 use burn::tensor::TensorData;
 use clap::Parser;
-use serde::Deserialize;
-use synapse_bench::results::LaneResult;
+use synapse_bench::{
+    parity::{load_corpus, load_reference, mean_parity, Chunk},
+    results::LaneResult,
+};
 use tokenizers::{Tokenizer, TruncationParams};
 
 const BURN_VERSION: &str = "0.21.0";
@@ -60,18 +61,6 @@ struct Args {
     model_label: String,
 }
 
-#[derive(Deserialize)]
-struct Chunk {
-    id: String,
-    text: String,
-}
-
-#[derive(Deserialize)]
-struct ReferenceVector {
-    id: String,
-    vec: Vec<f32>,
-}
-
 fn main() -> Result<()> {
     let args = Args::parse();
     validate_runtime_model_path(&args.model)?;
@@ -92,12 +81,7 @@ fn main() -> Result<()> {
     let _ = run_batch(&model, &device, &tokenizer, &["warmup"], &args.pooling)?;
     let cold_load_s = started.elapsed().as_secs_f64();
 
-    let file = std::fs::File::open(&args.corpus)?;
-    let chunks: Vec<Chunk> = std::io::BufReader::new(file)
-        .lines()
-        .map(|line| Ok(serde_json::from_str::<Chunk>(&line?)?))
-        .collect::<Result<_>>()?;
-    anyhow::ensure!(!chunks.is_empty(), "empty corpus");
+    let chunks: Vec<Chunk> = load_corpus(&args.corpus, None)?;
 
     let texts: Vec<&str> = chunks.iter().map(|chunk| chunk.text.as_str()).collect();
     let encodings = tokenizer
@@ -272,31 +256,10 @@ fn run_batch(
 }
 
 fn compare_reference(reference_path: &Path, produced: &[(String, Vec<f32>)]) -> Result<f64> {
-    let file = std::fs::File::open(reference_path)?;
-    let references: HashMap<String, Vec<f32>> = std::io::BufReader::new(file)
-        .lines()
-        .map(|line| -> Result<ReferenceVector> { Ok(serde_json::from_str(&line?)?) })
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .map(|item| (item.id, item.vec))
-        .collect();
-
-    let mut total = 0.0f64;
-    let mut matched = 0usize;
-    for (id, vector) in produced {
-        let Some(reference) = references.get(id) else { continue };
-        anyhow::ensure!(
-            vector.len() == reference.len(),
-            "vector length mismatch for {id}: {} vs {}",
-            vector.len(),
-            reference.len()
-        );
-        total += cosine(vector, reference) as f64;
-        matched += 1;
-    }
-
+    let reference = load_reference(reference_path)?;
+    let (mean, matched) = mean_parity(produced.iter().cloned(), &reference);
     anyhow::ensure!(matched > 0, "no overlapping ids found in reference vectors");
-    Ok(total / matched as f64)
+    Ok(mean.expect("matched count implies a parity mean"))
 }
 
 fn write_vectors(path: &Path, produced: &[(String, Vec<f32>)]) -> Result<()> {
@@ -315,18 +278,6 @@ fn write_vectors(path: &Path, produced: &[(String, Vec<f32>)]) -> Result<()> {
 fn normalize(vector: &mut [f32]) {
     let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt() + 1e-12;
     vector.iter_mut().for_each(|value| *value /= norm);
-}
-
-fn cosine(lhs: &[f32], rhs: &[f32]) -> f32 {
-    let mut dot = 0.0f32;
-    let mut lhs_norm = 0.0f32;
-    let mut rhs_norm = 0.0f32;
-    for (&a, &b) in lhs.iter().zip(rhs) {
-        dot += a * b;
-        lhs_norm += a * a;
-        rhs_norm += b * b;
-    }
-    dot / ((lhs_norm.sqrt() * rhs_norm.sqrt()) + 1e-12)
 }
 
 fn validate_runtime_model_path(runtime_model: &Path) -> Result<()> {

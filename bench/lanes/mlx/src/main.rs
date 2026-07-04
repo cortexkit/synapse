@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{BufRead, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -13,7 +13,10 @@ use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::transforms;
 use mlx_rs::{Array, Device, Dtype};
 use serde::Deserialize;
-use synapse_bench::results::LaneResult;
+use synapse_bench::{
+    parity::{load_corpus, load_jsonl, load_reference, mean_parity, Chunk, Prompt},
+    results::LaneResult,
+};
 use tokenizers::Tokenizer;
 
 const LABELS: &[&str] = &["config", "test", "logic", "io", "types", "docs"];
@@ -90,24 +93,6 @@ struct MicrollmArgs {
 }
 
 #[derive(Debug, Deserialize)]
-struct CorpusChunk {
-    id: String,
-    text: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct PromptItem {
-    id: String,
-    prompt: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ReferenceVector {
-    id: String,
-    vec: Vec<f32>,
-}
-
-#[derive(Debug, Deserialize)]
 struct SafetensorsIndex {
     weight_map: HashMap<String, String>,
 }
@@ -157,7 +142,7 @@ struct LinearWeight {
 
 impl LinearWeight {
     fn forward(&self, x: &Array) -> Result<Array> {
-        Ok(ops::matmul(x, &self.weight.t())?)
+        Ok(ops::matmul(x, self.weight.t())?)
     }
 }
 
@@ -485,8 +470,7 @@ impl QwenModel {
     }
 
     fn logits_for_last_hidden(&self, last_hidden: &Array) -> Result<Vec<f32>> {
-        let logits =
-            ops::matmul(last_hidden, &self.tied_lm_head().t())?.as_dtype(Dtype::Float32)?;
+        let logits = ops::matmul(last_hidden, self.tied_lm_head().t())?.as_dtype(Dtype::Float32)?;
         let data = logits.as_slice::<f32>();
         Ok(data.to_vec())
     }
@@ -636,8 +620,7 @@ fn run_embed(args: EmbedArgs) -> Result<()> {
     let _ = embed_batch(&model, &warmup, pad_id)?;
     let cold_load_s = started.elapsed().as_secs_f64();
 
-    let chunks = read_jsonl::<CorpusChunk>(&args.corpus)?;
-    ensure!(!chunks.is_empty(), "empty corpus");
+    let chunks: Vec<Chunk> = load_corpus(&args.corpus, None)?;
 
     let mut encoded = Vec::with_capacity(chunks.len());
     for chunk in chunks {
@@ -666,7 +649,7 @@ fn run_embed(args: EmbedArgs) -> Result<()> {
             let batch = &encoded[batch_start..index];
             let batch_ids: Vec<Vec<u32>> = batch.iter().map(|item| item.ids.clone()).collect();
             let batch_vectors = embed_batch(&model, &batch_ids, pad_id)?;
-            for (item, vector) in batch.iter().zip(batch_vectors.into_iter()) {
+            for (item, vector) in batch.iter().zip(batch_vectors) {
                 total_input_tokens += item.ids.len() as u64;
                 vectors.push(ProducedVector {
                     id: item.id.clone(),
@@ -694,13 +677,22 @@ fn run_embed(args: EmbedArgs) -> Result<()> {
 
     let parity_mean_cosine = match &args.reference {
         Some(reference_path) => {
-            let parity = compute_parity(reference_path, &vectors)?;
-            ensure!(
-                parity >= 0.98,
-                "parity mean cosine {:.6} is below the required debug threshold",
-                parity
+            let reference_vectors = load_reference(reference_path)?;
+            let (mean_cosine, matched) = mean_parity(
+                vectors.iter().map(|vector| (vector.id.clone(), vector.vec.clone())),
+                &reference_vectors,
             );
-            Some(parity)
+            ensure!(
+                matched > 0,
+                "reference file had no ids in common with produced vectors"
+            );
+            let mean_cosine = mean_cosine.expect("matched count implies a parity mean");
+            ensure!(
+                mean_cosine >= 0.98,
+                "parity mean cosine {:.6} is below the required debug threshold",
+                mean_cosine
+            );
+            Some(mean_cosine)
         }
         None => None,
     };
@@ -744,7 +736,7 @@ fn run_microllm(args: MicrollmArgs) -> Result<()> {
     let tokenizer = load_tokenizer(&args.tokenizer)?;
     let model = QwenModel::load(&args.model)?;
 
-    let all_prompts = read_jsonl::<PromptItem>(&args.prompts)?;
+    let all_prompts: Vec<Prompt> = load_jsonl(&args.prompts)?;
     ensure!(!all_prompts.is_empty(), "empty prompts");
     let limit = args
         .limit
@@ -1095,49 +1087,6 @@ fn get_optional_tensor(
         .find_map(|name| tensors.get(name.as_ref()).cloned())
 }
 
-fn compute_parity(reference_path: &Path, produced: &[ProducedVector]) -> Result<f64> {
-    let reference = read_jsonl::<ReferenceVector>(reference_path)?
-        .into_iter()
-        .map(|item| (item.id, item.vec))
-        .collect::<HashMap<_, _>>();
-    let mut cosine_sum = 0.0f64;
-    let mut matched = 0usize;
-
-    for vector in produced {
-        let Some(reference_vec) = reference.get(&vector.id) else {
-            continue;
-        };
-        cosine_sum += cosine(&vector.vec, reference_vec)? as f64;
-        matched += 1;
-    }
-
-    ensure!(
-        matched > 0,
-        "reference file had no ids in common with produced vectors"
-    );
-    Ok(cosine_sum / matched as f64)
-}
-
-fn cosine(left: &[f32], right: &[f32]) -> Result<f32> {
-    ensure!(
-        left.len() == right.len(),
-        "cosine dimension mismatch: {} vs {}",
-        left.len(),
-        right.len()
-    );
-    let mut dot = 0.0f32;
-    let mut left_norm = 0.0f32;
-    let mut right_norm = 0.0f32;
-    for (&left_value, &right_value) in left.iter().zip(right.iter()) {
-        dot += left_value * right_value;
-        left_norm += left_value * left_value;
-        right_norm += right_value * right_value;
-    }
-    let denom = left_norm.sqrt() * right_norm.sqrt();
-    ensure!(denom > 0.0, "cosine denominator was zero");
-    Ok(dot / denom)
-}
-
 fn normalize_l2(vector: &mut [f32]) {
     let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
     let denom = norm.max(1e-12);
@@ -1183,28 +1132,6 @@ fn compact_answer(text: &str) -> String {
     } else {
         compact
     }
-}
-
-fn read_jsonl<T>(path: &Path) -> Result<Vec<T>>
-where
-    T: for<'de> Deserialize<'de>,
-{
-    let file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-    std::io::BufReader::new(file)
-        .lines()
-        .enumerate()
-        .map(|(line_idx, line)| {
-            let line = line
-                .with_context(|| format!("read line {} from {}", line_idx + 1, path.display()))?;
-            serde_json::from_str(&line).with_context(|| {
-                format!(
-                    "parse JSON on line {} from {}",
-                    line_idx + 1,
-                    path.display()
-                )
-            })
-        })
-        .collect()
 }
 
 fn write_vectors_jsonl(path: &Path, vectors: &[ProducedVector]) -> Result<()> {

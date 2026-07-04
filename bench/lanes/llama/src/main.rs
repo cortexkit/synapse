@@ -5,9 +5,8 @@
 //! - `embed`: workload A, batched embeddings over a JSONL corpus.
 //! - `microllm`: workload B, single-turn intent classification prompts.
 
-use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufWriter, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -20,9 +19,12 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, ensure, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use reqwest::blocking::Client;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
-use synapse_bench::results::LaneResult;
+use synapse_bench::{
+    parity::{load_corpus, load_jsonl, load_reference, mean_parity, Chunk, Prompt},
+    results::LaneResult,
+};
 use tokenizers::{Tokenizer, TruncationParams};
 
 const DEFAULT_SERVER_BINARY: &str = "/opt/zerobrew/bin/llama-server";
@@ -142,24 +144,6 @@ struct MicrollmArgs {
     parallel: usize,
 }
 
-#[derive(Debug, Deserialize)]
-struct Chunk {
-    id: String,
-    text: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct PromptRecord {
-    id: String,
-    prompt: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ReferenceVector {
-    id: String,
-    vec: Vec<f32>,
-}
-
 #[derive(Debug)]
 struct ProducedVector {
     id: String,
@@ -269,12 +253,7 @@ fn main() -> Result<()> {
 
 fn run_embed(args: EmbedArgs) -> Result<()> {
     let tokenizer = load_tokenizer(&args.tokenizer, args.max_length)?;
-    let chunks: Vec<Chunk> = read_jsonl(&args.corpus)?;
-    ensure!(
-        !chunks.is_empty(),
-        "empty corpus: {}",
-        args.corpus.display()
-    );
+    let chunks: Vec<Chunk> = load_corpus(&args.corpus, None)?;
 
     let texts: Vec<&str> = chunks.iter().map(|chunk| chunk.text.as_str()).collect();
     let encodings = tokenizer
@@ -369,13 +348,22 @@ fn run_embed(args: EmbedArgs) -> Result<()> {
 
     let (parity_mean_cosine, parity_matches) = match &args.reference {
         Some(reference) => {
-            let parity = compute_parity(reference, &produced)?;
-            ensure!(
-                parity.mean_cosine >= 0.98,
-                "parity {:.6} is below 0.98; check pooling and normalization",
-                parity.mean_cosine
+            let reference_vectors = load_reference(reference)?;
+            let (mean_cosine, matches) = mean_parity(
+                produced.iter().map(|vector| (vector.id.clone(), vector.vec.clone())),
+                &reference_vectors,
             );
-            (Some(parity.mean_cosine), parity.matches)
+            ensure!(
+                matches > 0,
+                "no overlapping ids with reference vectors"
+            );
+            let mean_cosine = mean_cosine.expect("matched count implies a parity mean");
+            ensure!(
+                mean_cosine >= 0.98,
+                "parity {:.6} is below 0.98; check pooling and normalization",
+                mean_cosine
+            );
+            (Some(mean_cosine), matches)
         }
         None => (None, 0),
     };
@@ -421,7 +409,7 @@ fn run_embed(args: EmbedArgs) -> Result<()> {
 }
 
 fn run_microllm(args: MicrollmArgs) -> Result<()> {
-    let mut prompts: Vec<PromptRecord> = read_jsonl(&args.prompts)?;
+    let mut prompts: Vec<Prompt> = load_jsonl(&args.prompts)?;
     if let Some(limit) = args.limit {
         prompts.truncate(limit);
     }
@@ -661,20 +649,6 @@ fn wait_for_health_and_warmup(
     }
 }
 
-fn read_jsonl<T: DeserializeOwned>(path: &Path) -> Result<Vec<T>> {
-    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-    BufReader::new(file)
-        .lines()
-        .enumerate()
-        .map(|(index, line)| {
-            let line =
-                line.with_context(|| format!("read {} line {}", path.display(), index + 1))?;
-            serde_json::from_str::<T>(&line)
-                .with_context(|| format!("parse {} line {}", path.display(), index + 1))
-        })
-        .collect()
-}
-
 fn write_result(path: &Path, result: &LaneResult) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -699,57 +673,6 @@ fn write_vectors(path: &Path, vectors: &[ProducedVector]) -> Result<()> {
         writer.write_all(b"\n")?;
     }
     writer.flush().context("flush vectors writer")
-}
-
-struct ParityResult {
-    mean_cosine: f64,
-    matches: usize,
-}
-
-fn compute_parity(reference_path: &Path, produced: &[ProducedVector]) -> Result<ParityResult> {
-    let reference: Vec<ReferenceVector> = read_jsonl(reference_path)?;
-    let reference_by_id: HashMap<&str, &[f32]> = reference
-        .iter()
-        .map(|vector| (vector.id.as_str(), vector.vec.as_slice()))
-        .collect();
-
-    let mut sum = 0.0f64;
-    let mut matches = 0usize;
-    for vector in produced {
-        if let Some(reference_vec) = reference_by_id.get(vector.id.as_str()) {
-            sum += cosine_similarity(vector.vec.as_slice(), reference_vec)?;
-            matches += 1;
-        }
-    }
-    ensure!(matches > 0, "no overlapping ids with reference vectors");
-    Ok(ParityResult {
-        mean_cosine: sum / matches as f64,
-        matches,
-    })
-}
-
-fn cosine_similarity(left: &[f32], right: &[f32]) -> Result<f64> {
-    ensure!(
-        left.len() == right.len(),
-        "vector length mismatch: {} vs {}",
-        left.len(),
-        right.len()
-    );
-    let mut dot = 0.0f64;
-    let mut left_norm = 0.0f64;
-    let mut right_norm = 0.0f64;
-    for (&lhs, &rhs) in left.iter().zip(right.iter()) {
-        let lhs = lhs as f64;
-        let rhs = rhs as f64;
-        dot += lhs * rhs;
-        left_norm += lhs * lhs;
-        right_norm += rhs * rhs;
-    }
-    ensure!(
-        left_norm > 0.0 && right_norm > 0.0,
-        "cannot compare zero-length vector norms"
-    );
-    Ok(dot / (left_norm.sqrt() * right_norm.sqrt()))
 }
 
 fn normalize_label(output: &str) -> Option<&'static str> {
