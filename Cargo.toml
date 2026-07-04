@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["bench/harness", "bench/lanes/ort-embed", "bench/lanes/wrap-embed"]
+members = [
+    "bench/harness",
+    "bench/lanes/ort-embed",
+    "bench/lanes/wrap-embed",
+    "bench/lanes/llama",
+]
 
 [workspace.package]
 edition = "2021"
@@ -13,3 +18,4 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive"] }
 tokenizers = "0.21"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
