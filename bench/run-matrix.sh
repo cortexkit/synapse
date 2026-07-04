@@ -101,6 +101,16 @@ wait_for_idle_and_run llama-metal-microllm \
   --out "$RESULTS/llama-metal-microllm.json" \
   --model-label "Qwen3-0.6B@gguf-q8_0"
 
+# Lane 5b: llama-server / Metal micro-LLM, LFM2.5-230M (tok/s comparison point
+# for the micro-LLM class; same prompts/contract as 5)
+SNAP_LFM=$(find_snapshot "$HOME/.cache/huggingface/hub/models--LiquidAI--LFM2.5-230M-GGUF/snapshots/*")
+wait_for_idle_and_run llama-metal-microllm-lfm \
+  ./target/release/lane-llama microllm \
+  --model "$SNAP_LFM/LFM2.5-230M-Q8_0.gguf" \
+  --prompts "$PROMPTS" \
+  --out "$RESULTS/llama-metal-microllm-lfm.json" \
+  --model-label "LFM2.5-230M@gguf-q8_0"
+
 # Lane 6a: ort-cpu MiniLM (floor pair for burn, which could not import Qwen3)
 wait_for_idle_and_run ort-cpu-minilm-embed \
   ./target/release/lane-ort-embed \
