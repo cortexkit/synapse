@@ -44,10 +44,51 @@ struct MacmonSample {
     cpu_power: f64,
     gpu_power: f64,
     ane_power: f64,
+    #[serde(default)]
+    cpu_usage_pct: f64,
+    #[serde(default)]
+    gpu_usage: (u64, f64),
 }
 
-pub fn run_wrapped(out: &Path, interval_ms: u64, cmd: &[String]) -> Result<()> {
+/// Idle gate: refuse to measure on a busy machine so results are not
+/// contaminated by other processes. Samples macmon for a few seconds and
+/// requires CPU and GPU utilization below thresholds.
+fn assert_idle(max_cpu_pct: f64, max_gpu_pct: f64) -> Result<()> {
+    let out = Command::new("macmon")
+        .args(["pipe", "-s", "6", "-i", "500"])
+        .stderr(Stdio::null())
+        .output()
+        .context("spawning macmon for idle preflight")?;
+    let samples: Vec<MacmonSample> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    anyhow::ensure!(samples.len() >= 3, "idle preflight: too few macmon samples");
+    // Drop the first sample (startup transient), average the rest.
+    let rest = &samples[1..];
+    let cpu = rest.iter().map(|s| s.cpu_usage_pct * 100.0).sum::<f64>() / rest.len() as f64;
+    let gpu = rest.iter().map(|s| s.gpu_usage.1 * 100.0).sum::<f64>() / rest.len() as f64;
+    anyhow::ensure!(
+        cpu <= max_cpu_pct && gpu <= max_gpu_pct,
+        "machine not idle: cpu {cpu:.1}% (max {max_cpu_pct}%), gpu {gpu:.1}% (max {max_gpu_pct}%) — close other workloads before measuring"
+    );
+    eprintln!("idle preflight ok: cpu {cpu:.1}%, gpu {gpu:.1}%");
+    Ok(())
+}
+
+pub fn run_wrapped(
+    out: &Path,
+    interval_ms: u64,
+    cmd: &[String],
+    skip_idle_check: bool,
+    max_cpu_pct: f64,
+    max_gpu_pct: f64,
+) -> Result<()> {
     anyhow::ensure!(!cmd.is_empty(), "empty command");
+
+    if !skip_idle_check {
+        assert_idle(max_cpu_pct, max_gpu_pct)?;
+    }
 
     // Start macmon sampler.
     let mut macmon = Command::new("macmon")

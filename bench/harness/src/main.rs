@@ -43,6 +43,7 @@ enum Command {
         token_budget: usize,
     },
     /// Run a child command under power/RSS sampling; write measurement JSON.
+    /// Refuses to run unless the machine is idle (see --max-cpu/--max-gpu).
     Power {
         /// Where to write the measurement JSON.
         #[arg(long)]
@@ -50,6 +51,16 @@ enum Command {
         /// Sampling interval for macmon, in ms.
         #[arg(long, default_value_t = 250)]
         interval_ms: u64,
+        /// Skip the idle preflight (integration smoke only; never for
+        /// published numbers).
+        #[arg(long)]
+        skip_idle_check: bool,
+        /// Idle gate: max average CPU utilization percent.
+        #[arg(long, default_value_t = 15.0)]
+        max_cpu: f64,
+        /// Idle gate: max average GPU utilization percent.
+        #[arg(long, default_value_t = 5.0)]
+        max_gpu: f64,
         /// The command to run (everything after --).
         #[arg(last = true, required = true)]
         cmd: Vec<String>,
@@ -62,6 +73,8 @@ fn main() -> Result<()> {
         Command::Corpus { root, out, tokenizer, target, token_budget } => {
             corpus::build(&root, &out, &tokenizer, target, token_budget)
         }
-        Command::Power { out, interval_ms, cmd } => metrics::run_wrapped(&out, interval_ms, &cmd),
+        Command::Power { out, interval_ms, skip_idle_check, max_cpu, max_gpu, cmd } => {
+            metrics::run_wrapped(&out, interval_ms, &cmd, skip_idle_check, max_cpu, max_gpu)
+        }
     }
 }

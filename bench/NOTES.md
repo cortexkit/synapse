@@ -12,6 +12,17 @@ Evidence accumulator for the tradeoff doc. Raw run JSONs land in bench/results/.
   avg 354 tok/chunk, Qwen3-Embedding tokenizer, line-based chunker.
   To be superseded by AFT's real chunk export for final numbers.
 
+## Measurement protocol
+
+- ALL published numbers come from `synapse-bench power` runs, which hard-refuse to
+  start unless the machine is idle (6s macmon preflight: avg CPU <= 15%, GPU <= 5%).
+  `--skip-idle-check` exists for integration smoke only, never for published numbers.
+- Lanes run SERIALLY, one at a time, idle-gated between lanes (bench/run-matrix.sh).
+- Deterministic outputs (parity reference vectors) may be generated on a busy machine;
+  timing/power from those runs is discarded.
+- Contaminated-run register: bench/results/smoke-ort.json timings (LMStudio was
+  serving AFT's embedding burst during the run) — integration proof only.
+
 ## Dispositions by inspection (worker [task-id], evidence cited in report)
 
 ### vllm — dispositioned (not benched)
