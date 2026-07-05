@@ -1,0 +1,14 @@
+{
+  "name": "@synapse-bench/ts-embed",
+  "private": true,
+  "type": "module",
+  "main": "./main.mjs",
+  "description": "TypeScript embedding benchmark lane for Synapse (Transformers.js and onnxruntime-node)",
+  "scripts": {
+    "bench": "node ./main.mjs"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "4.2.0",
+    "onnxruntime-node": "1.27.0"
+  }
+}
