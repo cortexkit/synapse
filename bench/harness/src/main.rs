@@ -12,6 +12,8 @@
 mod corpus;
 mod metrics;
 
+use synapse_bench::parity;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
@@ -41,6 +43,23 @@ enum Command {
         /// Per-chunk token budget (chunks are cut to stay under this).
         #[arg(long, default_value_t = 448)]
         token_budget: usize,
+    },
+    /// Compare two vector spaces: mean cosine + top-k rank overlap.
+    /// Both files are JSONL of {id, vec}; ids are intersected.
+    Parity {
+        /// Reference vector space (e.g. ort fp32).
+        #[arg(long)]
+        reference: std::path::PathBuf,
+        /// Candidate vector space (e.g. mlx 4-bit DWQ).
+        #[arg(long)]
+        candidate: std::path::PathBuf,
+        /// Top-k for rank-overlap.
+        #[arg(long, default_value_t = 10)]
+        k: usize,
+        /// Use every Nth shared id as a rank query (full corpus x corpus is
+        /// quadratic; stride keeps it tractable).
+        #[arg(long, default_value_t = 50)]
+        stride: usize,
     },
     /// Run a child command under power/RSS sampling; write measurement JSON.
     /// Refuses to run unless the machine is idle (see --max-cpu/--max-gpu).
@@ -75,6 +94,22 @@ fn main() -> Result<()> {
         }
         Command::Power { out, interval_ms, skip_idle_check, max_cpu, max_gpu, cmd } => {
             metrics::run_wrapped(&out, interval_ms, &cmd, skip_idle_check, max_cpu, max_gpu)
+        }
+        Command::Parity { reference, candidate, k, stride } => {
+            let reference = parity::load_reference(&reference)?;
+            let candidate_vecs = parity::load_reference(&candidate)?;
+            let (mean, matched) = parity::mean_parity(
+                candidate_vecs.iter().map(|(id, v)| (id.clone(), v.clone())),
+                &reference,
+            );
+            let rank = parity::rank_overlap(&reference, &candidate_vecs, k, stride)?;
+            let report = serde_json::json!({
+                "matched": matched,
+                "mean_cosine": mean,
+                "rank": rank,
+            });
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            Ok(())
         }
     }
 }

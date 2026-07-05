@@ -77,3 +77,62 @@ pub fn mean_parity(
     }
     ((n > 0).then(|| sum / n as f64), n)
 }
+
+/// Rank-stability check between two vector spaces over the same ids.
+/// Uses every `stride`-th vector as a query against all others (self excluded)
+/// and reports mean top-k neighbor overlap (Jaccard-free: |A ∩ B| / k).
+/// Detects quantization-induced reordering that mean cosine hides: near-tie
+/// neighbors can swap order while per-vector cosine stays > 0.99.
+pub fn rank_overlap(
+    a: &HashMap<String, Vec<f32>>,
+    b: &HashMap<String, Vec<f32>>,
+    k: usize,
+    stride: usize,
+) -> Result<RankOverlap> {
+    let ids: Vec<&String> = {
+        let mut ids: Vec<&String> = a.keys().filter(|id| b.contains_key(*id)).collect();
+        ids.sort(); // deterministic across runs
+        ids
+    };
+    anyhow::ensure!(ids.len() > k + 1, "not enough shared ids ({}) for k={k}", ids.len());
+
+    let queries: Vec<&String> = ids.iter().step_by(stride.max(1)).copied().collect();
+    let mut overlap_sum = 0f64;
+
+    for query in &queries {
+        let top_a = top_k_neighbors(query, &ids, a, k);
+        let top_b = top_k_neighbors(query, &ids, b, k);
+        let hits = top_a.iter().filter(|id| top_b.contains(*id)).count();
+        overlap_sum += hits as f64 / k as f64;
+    }
+
+    Ok(RankOverlap {
+        queries: queries.len(),
+        k,
+        mean_topk_overlap: overlap_sum / queries.len() as f64,
+    })
+}
+
+#[derive(serde::Serialize)]
+pub struct RankOverlap {
+    pub queries: usize,
+    pub k: usize,
+    pub mean_topk_overlap: f64,
+}
+
+fn top_k_neighbors(
+    query: &str,
+    ids: &[&String],
+    space: &HashMap<String, Vec<f32>>,
+    k: usize,
+) -> Vec<String> {
+    let qv = &space[query];
+    let mut scored: Vec<(f64, &String)> = ids
+        .iter()
+        .filter(|id| id.as_str() != query)
+        .map(|id| (cosine(&space[id.as_str()], qv), *id))
+        .collect();
+    scored.sort_by(|x, y| y.0.total_cmp(&x.0));
+    scored.truncate(k);
+    scored.into_iter().map(|(_, id)| id.clone()).collect()
+}
