@@ -72,6 +72,10 @@ struct EmbedArgs {
     /// Optional: compare produced vectors against reference JSONL ({id, vec}).
     #[arg(long)]
     reference: Option<PathBuf>,
+    /// Minimum allowed mean cosine when --reference is set. Defaults to the
+    /// existing 0.98 guard; lower it for coarse quant smoke/parity runs.
+    #[arg(long, default_value_t = 0.98)]
+    min_parity: f64,
     /// Model label for the result.
     #[arg(long)]
     model_label: String,
@@ -81,6 +85,9 @@ struct EmbedArgs {
     /// Tokenizer truncation max length.
     #[arg(long, default_value_t = 512)]
     max_length: usize,
+    /// Optional string prepended to every corpus text before tokenization.
+    #[arg(long)]
+    prefix_document: Option<String>,
     /// Pooling applied by llama-server for embeddings.
     #[arg(long, default_value = "last")]
     pooling: String,
@@ -254,10 +261,14 @@ fn main() -> Result<()> {
 fn run_embed(args: EmbedArgs) -> Result<()> {
     let tokenizer = load_tokenizer(&args.tokenizer, args.max_length)?;
     let chunks: Vec<Chunk> = load_corpus(&args.corpus, None)?;
+    let texts: Vec<String> = chunks
+        .iter()
+        .map(|chunk| prefixed_text(args.prefix_document.as_deref(), &chunk.text))
+        .collect();
 
-    let texts: Vec<&str> = chunks.iter().map(|chunk| chunk.text.as_str()).collect();
+    let batch_texts: Vec<&str> = texts.iter().map(String::as_str).collect();
     let encodings = tokenizer
-        .encode_batch(texts, true)
+        .encode_batch(batch_texts, true)
         .map_err(|err| anyhow::anyhow!("encode_batch: {err}"))?;
     let token_counts: Vec<usize> = encodings
         .iter()
@@ -310,9 +321,9 @@ fn run_embed(args: EmbedArgs) -> Result<()> {
 
         if should_flush {
             let batch_chunks = &chunks[batch_start..index];
-            let batch_inputs: Vec<&str> = batch_chunks
+            let batch_inputs: Vec<&str> = texts[batch_start..index]
                 .iter()
-                .map(|chunk| chunk.text.as_str())
+                .map(String::as_str)
                 .collect();
             let embeddings = request_embeddings(&client, &server.base_url, &batch_inputs)?;
             ensure!(
@@ -350,18 +361,18 @@ fn run_embed(args: EmbedArgs) -> Result<()> {
         Some(reference) => {
             let reference_vectors = load_reference(reference)?;
             let (mean_cosine, matches) = mean_parity(
-                produced.iter().map(|vector| (vector.id.clone(), vector.vec.clone())),
+                produced
+                    .iter()
+                    .map(|vector| (vector.id.clone(), vector.vec.clone())),
                 &reference_vectors,
             );
-            ensure!(
-                matches > 0,
-                "no overlapping ids with reference vectors"
-            );
+            ensure!(matches > 0, "no overlapping ids with reference vectors");
             let mean_cosine = mean_cosine.expect("matched count implies a parity mean");
             ensure!(
-                mean_cosine >= 0.98,
-                "parity {:.6} is below 0.98; check pooling and normalization",
-                mean_cosine
+                mean_cosine >= args.min_parity,
+                "parity {:.6} is below {:.6}; check pooling and normalization",
+                mean_cosine,
+                args.min_parity,
             );
             (Some(mean_cosine), matches)
         }
@@ -372,7 +383,7 @@ fn run_embed(args: EmbedArgs) -> Result<()> {
     let peak_rss = server.peak_rss_bytes();
 
     let notes = format!(
-        "endpoint=/v1/embeddings; request_batching=greedy_sum_tokens<=batch_size; cold_load=health+warmup_request; pooling={}; embd_normalize={}; ctx_size={}; batch_size={}; ubatch_size={}; ngl={}; parallel={}; reference_matches={}",
+        "endpoint=/v1/embeddings; request_batching=greedy_sum_tokens<=batch_size; cold_load=health+warmup_request; pooling={}; embd_normalize={}; ctx_size={}; batch_size={}; ubatch_size={}; ngl={}; parallel={}; prefix_document={}; min_parity={}; reference_matches={}",
         args.pooling,
         args.embd_normalize,
         args.ctx_size,
@@ -380,6 +391,8 @@ fn run_embed(args: EmbedArgs) -> Result<()> {
         args.ubatch_size,
         args.gpu_layers,
         args.parallel,
+        format_optional_prefix(args.prefix_document.as_deref()),
+        args.min_parity,
         parity_matches
     );
 
@@ -681,6 +694,19 @@ fn normalize_label(output: &str) -> Option<&'static str> {
         .trim_matches(|ch: char| ch.is_ascii_punctuation() || ch.is_whitespace())
         .to_ascii_lowercase();
     VALID_LABELS.iter().copied().find(|label| *label == cleaned)
+}
+
+fn prefixed_text(prefix_document: Option<&str>, text: &str) -> String {
+    match prefix_document {
+        Some(prefix) => format!("{prefix}{text}"),
+        None => text.to_owned(),
+    }
+}
+
+fn format_optional_prefix(prefix_document: Option<&str>) -> String {
+    prefix_document
+        .map(|prefix| format!("{prefix:?}"))
+        .unwrap_or_else(|| "none".to_string())
 }
 
 fn rate(tokens: f64, seconds: f64) -> f64 {

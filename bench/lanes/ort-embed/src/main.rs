@@ -4,8 +4,8 @@
 //! - intra-op threads = ceil(available_parallelism / 2)
 //! - greedy attention-unit batching: flush when (count+1) * max_len^2 > 4M
 //! - tokenizer truncation at 512 (MiniLM) or model max (Qwen3), manual zero pad
-//! - mean pooling (MiniLM-class) or last-token pooling (Qwen3-Embedding),
-//!   then L2 normalization
+//! - mean pooling (MiniLM-class), CLS pooling (ModernBERT-class), or
+//!   last-token pooling (Qwen3-Embedding), then L2 normalization
 //!
 //! Emits a LaneResult JSON plus optionally the raw vectors (for parity
 //! reference against GPU lanes).
@@ -40,12 +40,15 @@ struct Args {
     /// Optional: write produced vectors (JSONL: {id, vec}) for parity reference
     #[arg(long)]
     vectors_out: Option<PathBuf>,
-    /// Pooling: "mean" (MiniLM-class) or "last" (Qwen3-Embedding-class)
+    /// Pooling: "mean" (MiniLM-class), "cls" (ModernBERT-class), or "last" (Qwen3-Embedding-class)
     #[arg(long, default_value = "last")]
     pooling: String,
     /// Tokenizer truncation max length
     #[arg(long, default_value_t = 512)]
     max_length: usize,
+    /// Optional string prepended to every corpus text before tokenization.
+    #[arg(long)]
+    prefix_document: Option<String>,
     /// Attention-unit budget per inference batch (AFT production: 4M)
     #[arg(long, default_value_t = 4_000_000)]
     attention_units: usize,
@@ -64,7 +67,11 @@ fn main() -> Result<()> {
 
     // --- Model + tokenizer load (cold-load window) ---
     let intra = args.intra_threads.unwrap_or_else(|| {
-        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).div_ceil(2).max(1)
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .div_ceil(2)
+            .max(1)
     });
     let mut session = Session::builder()?
         .with_optimization_level(GraphOptimizationLevel::Level3)?
@@ -81,9 +88,10 @@ fn main() -> Result<()> {
         }))
         .map_err(|e| anyhow::anyhow!("truncation: {e}"))?;
 
-    // Collect input names plus static dims for KV-cache inputs (the
-    // onnx-community Qwen3 export carries past_key_values.* inputs; an
-    // embedding pass feeds them empty with past_len=0).
+    // Collect only the inputs this session actually declares plus static
+    // dims for any KV-cache tensors. The onnx-community Qwen3 export carries
+    // past_key_values.* inputs; a fresh embedding pass feeds them empty with
+    // past_len=0.
     let input_names: Vec<(String, Vec<i64>)> = session
         .inputs()
         .iter()
@@ -97,11 +105,22 @@ fn main() -> Result<()> {
         .collect();
 
     // Warmup: one tiny inference so cold_load includes first-run graph prep.
-    run_batch(&mut session, &input_names, &tokenizer, &["warmup"], &args.pooling)?;
+    let warmup = prefixed_text(args.prefix_document.as_deref(), "warmup");
+    run_batch(
+        &mut session,
+        &input_names,
+        &tokenizer,
+        &[warmup.as_str()],
+        &args.pooling,
+    )?;
     let cold_load_s = started.elapsed().as_secs_f64();
 
     // --- Corpus ---
     let chunks: Vec<Chunk> = load_corpus(&args.corpus, None)?;
+    let texts: Vec<String> = chunks
+        .iter()
+        .map(|chunk| prefixed_text(args.prefix_document.as_deref(), &chunk.text))
+        .collect();
 
     // --- Embed with AFT's greedy attention-unit batching ---
     let mut vectors_writer = match &args.vectors_out {
@@ -121,9 +140,9 @@ fn main() -> Result<()> {
     // Pre-tokenize to know lengths (token counts contribute to input_tokens
     // as the model sees them, post-truncation).
     let encodings: Vec<usize> = {
-        let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
+        let batch_texts: Vec<&str> = texts.iter().map(String::as_str).collect();
         let encs = tokenizer
-            .encode_batch(texts, true)
+            .encode_batch(batch_texts, true)
             .map_err(|e| anyhow::anyhow!("encode_batch: {e}"))?;
         encs.iter().map(|e| e.get_ids().len()).collect()
     };
@@ -140,16 +159,24 @@ fn main() -> Result<()> {
             count > 0 && (count + 1) * candidate_max * candidate_max > args.attention_units
         };
         if flush {
-            let batch: Vec<&str> =
-                chunks[batch_start..idx].iter().map(|c| c.text.as_str()).collect();
-            let embeds = run_batch(&mut session, &input_names, &tokenizer, &batch, &args.pooling)?;
+            let batch: Vec<&str> = texts[batch_start..idx].iter().map(String::as_str).collect();
+            let embeds = run_batch(
+                &mut session,
+                &input_names,
+                &tokenizer,
+                &batch,
+                &args.pooling,
+            )?;
             for (offset, vec) in embeds.iter().enumerate() {
                 let chunk = &chunks[batch_start + offset];
                 input_tokens += encodings[batch_start + offset] as u64;
                 items += 1;
                 if let Some(w) = vectors_writer.as_mut() {
                     use std::io::Write;
-                    serde_json::to_writer(&mut *w, &serde_json::json!({"id": chunk.id, "vec": vec}))?;
+                    serde_json::to_writer(
+                        &mut *w,
+                        &serde_json::json!({"id": chunk.id, "vec": vec}),
+                    )?;
                     w.write_all(b"\n")?;
                 }
             }
@@ -183,8 +210,11 @@ fn main() -> Result<()> {
         parity_mean_cosine: None, // this lane IS the reference
         self_peak_rss_bytes: None,
         notes: format!(
-            "Level3, intra_threads={intra}, attention_units={}, pooling={}, max_len={}",
-            args.attention_units, args.pooling, args.max_length
+            "Level3, intra_threads={intra}, attention_units={}, pooling={}, max_len={}, prefix_document={}",
+            args.attention_units,
+            args.pooling,
+            args.max_length,
+            format_optional_prefix(args.prefix_document.as_deref()),
         ),
     };
     if let Some(parent) = args.out.parent() {
@@ -193,9 +223,26 @@ fn main() -> Result<()> {
     std::fs::write(&args.out, serde_json::to_string_pretty(&result)?)?;
     eprintln!(
         "ort-cpu: {} items, {} tokens, {:.1} tok/s, cold_load {:.1}s, infer {:.1}s",
-        result.items, result.input_tokens, result.tok_per_s, result.cold_load_s, result.infer_wall_s
+        result.items,
+        result.input_tokens,
+        result.tok_per_s,
+        result.cold_load_s,
+        result.infer_wall_s
     );
     Ok(())
+}
+
+fn prefixed_text(prefix_document: Option<&str>, text: &str) -> String {
+    match prefix_document {
+        Some(prefix) => format!("{prefix}{text}"),
+        None => text.to_owned(),
+    }
+}
+
+fn format_optional_prefix(prefix_document: Option<&str>) -> String {
+    prefix_document
+        .map(|prefix| format!("{prefix:?}"))
+        .unwrap_or_else(|| "none".to_string())
 }
 
 /// Tokenize + run + pool + L2-normalize one batch. Mirrors AFT local_embed.rs.
@@ -210,12 +257,22 @@ fn run_batch(
         .encode_batch(texts.to_vec(), true)
         .map_err(|e| anyhow::anyhow!("encode_batch: {e}"))?;
     let batch = encodings.len();
-    let max_len = encodings.iter().map(|e| e.get_ids().len()).max().unwrap_or(1).max(1);
+    let max_len = encodings
+        .iter()
+        .map(|e| e.get_ids().len())
+        .max()
+        .unwrap_or(1)
+        .max(1);
 
     let mut ids = vec![0i64; batch * max_len];
     let mut mask = vec![0i64; batch * max_len];
     for (row, enc) in encodings.iter().enumerate() {
-        for (col, (&id, &m)) in enc.get_ids().iter().zip(enc.get_attention_mask()).enumerate() {
+        for (col, (&id, &m)) in enc
+            .get_ids()
+            .iter()
+            .zip(enc.get_attention_mask())
+            .enumerate()
+        {
             ids[row * max_len + col] = id as i64;
             mask[row * max_len + col] = m as i64;
         }
@@ -226,14 +283,20 @@ fn run_batch(
     let mut inputs: Vec<(&str, ort::value::DynValue)> = Vec::new();
     for (name, dims) in input_names {
         match name.as_str() {
-            "input_ids" => {
-                inputs.push(("input_ids", ort::value::Tensor::from_array(ids.clone())?.into_dyn()))
-            }
-            "attention_mask" => inputs
-                .push(("attention_mask", ort::value::Tensor::from_array(mask_arr.clone())?.into_dyn())),
+            "input_ids" => inputs.push((
+                "input_ids",
+                ort::value::Tensor::from_array(ids.clone())?.into_dyn(),
+            )),
+            "attention_mask" => inputs.push((
+                "attention_mask",
+                ort::value::Tensor::from_array(mask_arr.clone())?.into_dyn(),
+            )),
             "token_type_ids" => {
                 let tt = Array2::<i64>::zeros((batch, max_len));
-                inputs.push(("token_type_ids", ort::value::Tensor::from_array(tt)?.into_dyn()));
+                inputs.push((
+                    "token_type_ids",
+                    ort::value::Tensor::from_array(tt)?.into_dyn(),
+                ));
             }
             "position_ids" => {
                 let mut pos = Array2::<i64>::zeros((batch, max_len));
@@ -242,7 +305,10 @@ fn run_batch(
                         pos[[r, c]] = c as i64;
                     }
                 }
-                inputs.push(("position_ids", ort::value::Tensor::from_array(pos)?.into_dyn()));
+                inputs.push((
+                    "position_ids",
+                    ort::value::Tensor::from_array(pos)?.into_dyn(),
+                ));
             }
             other if other.starts_with("past_key_values.") => {
                 // Empty KV cache: [batch, num_kv_heads, 0, head_dim]. Static
@@ -259,13 +325,17 @@ fn run_batch(
     }
 
     let outputs = session.run(inputs)?;
-    let (shape, data) = outputs[0].try_extract_tensor::<f32>().map(|(s, d)| (s.to_vec(), d.to_vec())).or_else(
-        |_| -> Result<_, ort::Error> {
+    let (shape, data) = outputs[0]
+        .try_extract_tensor::<f32>()
+        .map(|(s, d)| (s.to_vec(), d.to_vec()))
+        .or_else(|_| -> Result<_, ort::Error> {
             let (s, d) = outputs[0].try_extract_tensor::<half::f16>()?;
             Ok((s.to_vec(), d.iter().map(|v| v.to_f32()).collect()))
-        },
-    )?;
-    anyhow::ensure!(shape.len() == 3, "expected [batch, seq, hidden], got {shape:?}");
+        })?;
+    anyhow::ensure!(
+        shape.len() == 3,
+        "expected [batch, seq, hidden], got {shape:?}"
+    );
     let (b, s, h) = (shape[0] as usize, shape[1] as usize, shape[2] as usize);
     anyhow::ensure!(b == batch, "batch mismatch");
 
@@ -286,9 +356,17 @@ fn run_batch(
                 let denom = count.max(1.0);
                 vec.iter_mut().for_each(|v| *v /= denom);
             }
+            "cls" => {
+                // First token hidden state (for ModernBERT exports this is the
+                // [CLS] position).
+                vec.copy_from_slice(&data[row * s * h..row * s * h + h]);
+            }
             "last" => {
                 // Last valid (attended) token position.
-                let last = (0..s).rev().find(|&col| mask[row * max_len + col] == 1).unwrap_or(0);
+                let last = (0..s)
+                    .rev()
+                    .find(|&col| mask[row * max_len + col] == 1)
+                    .unwrap_or(0);
                 vec.copy_from_slice(&data[(row * s + last) * h..(row * s + last + 1) * h]);
             }
             other => anyhow::bail!("unknown pooling: {other}"),

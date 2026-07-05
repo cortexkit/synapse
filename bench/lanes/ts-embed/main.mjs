@@ -18,8 +18,8 @@ const MAX_BATCH_TOKENS = 16_384;
 const RSS_SAMPLE_MS = 50;
 
 const HELP = `Usage:
-  bun main.mjs --engine transformersjs --corpus <jsonl> --out <json> [--vectors-out <jsonl>] [--limit N] --model-label <label> [--dtype default|fp32]
-  node main.mjs --engine ort-node --corpus <jsonl> --out <json> [--vectors-out <jsonl>] [--limit N] --model-label <label>
+  bun main.mjs --engine transformersjs --corpus <jsonl> --out <json> [--vectors-out <jsonl>] [--limit N] --model-label <label> [--dtype default|fp32] [--prefix-document <str>]
+  node main.mjs --engine ort-node --corpus <jsonl> --out <json> [--vectors-out <jsonl>] [--limit N] --model-label <label> [--prefix-document <str>]
 
 Required flags:
   --engine transformersjs|ort-node
@@ -31,6 +31,7 @@ Optional flags:
   --vectors-out <jsonl>
   --limit <n>
   --dtype <label>   Transformers.js only; "default" maps to the shipped q8 profile. Default: default
+  --prefix-document <str>  Prepend this string to every corpus text before tokenization
 `;
 
 function parseArgs(argv) {
@@ -112,7 +113,7 @@ async function main() {
   }
 }
 
-async function loadCorpus(corpusPath, limit) {
+async function loadCorpus(corpusPath, limit, prefixDocument) {
   const rows = [];
   const input = await fsp.readFile(corpusPath, 'utf8');
   for (const [index, line] of input.split(/\r?\n/).entries()) {
@@ -128,7 +129,7 @@ async function loadCorpus(corpusPath, limit) {
     if (typeof row.id !== 'string' || typeof row.text !== 'string') {
       throw new Error(`Corpus row ${index + 1} must contain string id and text fields`);
     }
-    rows.push({ id: row.id, text: row.text });
+    rows.push({ id: row.id, text: applyPrefix(prefixDocument, row.text) });
     if (limit != null && rows.length >= limit) {
       break;
     }
@@ -148,11 +149,11 @@ async function runTransformersJsLane(args, sampleRss) {
   );
 
   try {
-    await extractor('warmup', { pooling: 'mean', normalize: true });
+    await extractor(applyPrefix(args.prefixDocument, 'warmup'), { pooling: 'mean', normalize: true });
     sampleRss();
     const coldLoadS = process.uptime();
 
-    const corpus = await loadCorpus(args.corpus, args.limit);
+    const corpus = await loadCorpus(args.corpus, args.limit, args.prefixDocument);
     const tokenized = pretokenizeCorpus(extractor.tokenizer, corpus);
     const batches = buildBatches(tokenized);
     const vectorsWriter = createVectorsWriter(args.vectorsOut);
@@ -189,6 +190,7 @@ async function runTransformersJsLane(args, sampleRss) {
         'normalize=l2',
         `batch=sum_tokens<=${MAX_BATCH_TOKENS},items<=${MAX_BATCH_ITEMS}`,
         `max_length=${MAX_LENGTH}`,
+        `prefix_document=${formatPrefixNote(args.prefixDocument)}`,
       ].join(', '),
     });
   } finally {
@@ -230,11 +232,11 @@ async function runOrtNodeLane(args, sampleRss) {
   const session = await ortApi.InferenceSession.create(ORT_MODEL_PATH);
   const inputNames = new Set(session.inputNames);
 
-  await embedOrtBatch(ortApi, session, inputNames, tokenizer, ['warmup']);
+  await embedOrtBatch(ortApi, session, inputNames, tokenizer, [applyPrefix(args.prefixDocument, 'warmup')]);
   sampleRss();
   const coldLoadS = process.uptime();
 
-  const corpus = await loadCorpus(args.corpus, args.limit);
+  const corpus = await loadCorpus(args.corpus, args.limit, args.prefixDocument);
   const tokenized = pretokenizeCorpus(tokenizer, corpus);
   const batches = buildBatches(tokenized);
   const vectorsWriter = createVectorsWriter(args.vectorsOut);
@@ -275,8 +277,17 @@ async function runOrtNodeLane(args, sampleRss) {
       'normalize=l2',
       `batch=sum_tokens<=${MAX_BATCH_TOKENS},items<=${MAX_BATCH_ITEMS}`,
       `max_length=${MAX_LENGTH}`,
+      `prefix_document=${formatPrefixNote(args.prefixDocument)}`,
     ].join(', '),
   });
+}
+
+function applyPrefix(prefixDocument, text) {
+  return prefixDocument == null ? text : `${prefixDocument}${text}`;
+}
+
+function formatPrefixNote(prefixDocument) {
+  return prefixDocument == null ? 'none' : JSON.stringify(prefixDocument);
 }
 
 function pretokenizeCorpus(tokenizer, corpus) {

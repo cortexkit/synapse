@@ -45,6 +45,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vectors-out", type=Path)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--model-label", required=True)
+    parser.add_argument("--prefix-document")
     parser.add_argument(
         "--model",
         default=None,
@@ -65,12 +66,15 @@ def main() -> int:
     model, tokenizer, source_note = load_model_and_tokenizer(args.model)
 
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
-    warmup_ids = encode_text(tokenizer, "warmup")
+    warmup_ids = encode_text(tokenizer, apply_prefix(args.prefix_document, "warmup"))
     _ = embed_batch(model, [EncodedRow(id="warmup", ids=warmup_ids)], pad_id)
     cold_load_s = time.perf_counter() - started
 
     rows = load_corpus(args.corpus, args.limit)
-    encoded_rows = [EncodedRow(row.id, encode_text(tokenizer, row.text)) for row in rows]
+    encoded_rows = [
+        EncodedRow(row.id, encode_text(tokenizer, apply_prefix(args.prefix_document, row.text)))
+        for row in rows
+    ]
     # Sort by length so padded batches carry near-uniform lengths: mixed-length
     # batches pad everything to the batch max and burn GPU on padding tokens.
     # Output order is irrelevant (vectors are keyed by id).
@@ -112,7 +116,8 @@ def main() -> int:
         "self_peak_rss_bytes": peak_rss_bytes(),
         "notes": (
             f"source={source_note}; device={device_note}; pooling=mean+l2; "
-            f"token_budget={args.token_budget}; item_cap={args.item_cap}; max_len={MAX_LENGTH}"
+            f"token_budget={args.token_budget}; item_cap={args.item_cap}; max_len={MAX_LENGTH}; "
+            f"prefix_document={format_prefix_note(args.prefix_document)}"
         ),
     }
 
@@ -207,6 +212,18 @@ def load_model_and_tokenizer(explicit_model: str | None = None) -> tuple[Any, An
     convert(SOURCE_MODEL, mlx_path=str(LOCAL_CONVERTED_MODEL), dtype="bfloat16")
     model, tokenizer = load(str(LOCAL_CONVERTED_MODEL))
     return model, tokenizer, f"converted:{SOURCE_MODEL}"
+
+
+def apply_prefix(prefix_document: str | None, text: str) -> str:
+    if prefix_document is None:
+        return text
+    return f"{prefix_document}{text}"
+
+
+def format_prefix_note(prefix_document: str | None) -> str:
+    if prefix_document is None:
+        return "none"
+    return repr(prefix_document)
 
 
 def load_corpus(path: Path, limit: int | None) -> list[CorpusRow]:
