@@ -20,8 +20,8 @@ PRIMARY_MODEL = "mlx-community/all-MiniLM-L6-v2-bf16"
 SOURCE_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 LOCAL_CONVERTED_MODEL = Path.home() / ".cache" / "synapse" / "mlx-minilm" / "all-MiniLM-L6-v2-bf16"
 MAX_LENGTH = 512
-DEFAULT_TOKEN_BUDGET = 16_384
-DEFAULT_ITEM_CAP = 64
+DEFAULT_TOKEN_BUDGET = 32_768
+DEFAULT_ITEM_CAP = 256
 
 _AUTO_TOKENIZER_REGISTER_PATCHED = False
 
@@ -71,6 +71,10 @@ def main() -> int:
 
     rows = load_corpus(args.corpus, args.limit)
     encoded_rows = [EncodedRow(row.id, encode_text(tokenizer, row.text)) for row in rows]
+    # Sort by length so padded batches carry near-uniform lengths: mixed-length
+    # batches pad everything to the batch max and burn GPU on padding tokens.
+    # Output order is irrelevant (vectors are keyed by id).
+    encoded_rows.sort(key=lambda row: len(row.ids))
 
     if args.vectors_out is not None:
         args.vectors_out.parent.mkdir(parents=True, exist_ok=True)

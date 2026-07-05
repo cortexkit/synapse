@@ -87,6 +87,19 @@ fn main() -> Result<()> {
     let encodings = tokenizer
         .encode_batch(texts, true)
         .map_err(|e| anyhow::anyhow!("encode_batch: {e}"))?;
+    // Sort by tokenized length so padded batches carry near-uniform lengths
+    // (mixed-length batches pad to the batch max and waste GPU on padding).
+    // Vectors are keyed by id, so output order is irrelevant.
+    let mut order: Vec<usize> = (0..chunks.len()).collect();
+    order.sort_by_key(|&i| encodings[i].get_ids().len());
+    let chunks: Vec<Chunk> = {
+        let mut src: Vec<Option<Chunk>> = chunks.into_iter().map(Some).collect();
+        order.iter().map(|&i| src[i].take().expect("each index taken once")).collect()
+    };
+    let encodings: Vec<_> = {
+        let mut src: Vec<Option<_>> = encodings.into_iter().map(Some).collect();
+        order.iter().map(|&i| src[i].take().expect("each index taken once")).collect()
+    };
     let lengths: Vec<usize> = encodings.iter().map(|encoding| encoding.get_ids().len()).collect();
 
     let infer_started = Instant::now();
