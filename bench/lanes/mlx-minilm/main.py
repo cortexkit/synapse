@@ -20,8 +20,8 @@ PRIMARY_MODEL = "mlx-community/all-MiniLM-L6-v2-bf16"
 SOURCE_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 LOCAL_CONVERTED_MODEL = Path.home() / ".cache" / "synapse" / "mlx-minilm" / "all-MiniLM-L6-v2-bf16"
 MAX_LENGTH = 512
-TOKEN_BUDGET = 16_384
-ITEM_CAP = 64
+DEFAULT_TOKEN_BUDGET = 16_384
+DEFAULT_ITEM_CAP = 64
 
 _AUTO_TOKENIZER_REGISTER_PATCHED = False
 
@@ -50,6 +50,8 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="HF repo or local path for mlx_embeddings.load; default: MiniLM chain",
     )
+    parser.add_argument("--token-budget", type=int, default=DEFAULT_TOKEN_BUDGET)
+    parser.add_argument("--item-cap", type=int, default=DEFAULT_ITEM_CAP)
     args = parser.parse_args()
     if args.limit is not None and args.limit < 0:
         parser.error("--limit must be non-negative")
@@ -78,7 +80,7 @@ def main() -> int:
     input_tokens = 0
     items = 0
 
-    for batch in iter_batches(encoded_rows):
+    for batch in iter_batches(encoded_rows, args.token_budget, args.item_cap):
         vectors = embed_batch(model, batch, pad_id)
         for row, vector in zip(batch, vectors, strict=True):
             produced.append({"id": row.id, "vec": vector})
@@ -106,7 +108,7 @@ def main() -> int:
         "self_peak_rss_bytes": peak_rss_bytes(),
         "notes": (
             f"source={source_note}; device={device_note}; pooling=mean+l2; "
-            f"token_budget={TOKEN_BUDGET}; item_cap={ITEM_CAP}; max_len={MAX_LENGTH}"
+            f"token_budget={args.token_budget}; item_cap={args.item_cap}; max_len={MAX_LENGTH}"
         ),
     }
 
@@ -236,18 +238,20 @@ def encode_text(tokenizer: Any, text: str) -> list[int]:
     return list(ids)
 
 
-def iter_batches(rows: Sequence[EncodedRow]) -> Iterator[list[EncodedRow]]:
+def iter_batches(
+    rows: Sequence[EncodedRow], token_budget: int, item_cap: int
+) -> Iterator[list[EncodedRow]]:
     batch: list[EncodedRow] = []
     token_sum = 0
     for row in rows:
         row_tokens = len(row.ids)
-        if batch and (len(batch) >= ITEM_CAP or token_sum + row_tokens > TOKEN_BUDGET):
+        if batch and (len(batch) >= item_cap or token_sum + row_tokens > token_budget):
             yield batch
             batch = []
             token_sum = 0
         batch.append(row)
         token_sum += row_tokens
-        if len(batch) >= ITEM_CAP:
+        if len(batch) >= item_cap:
             yield batch
             batch = []
             token_sum = 0
