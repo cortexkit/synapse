@@ -1,0 +1,13 @@
+{
+  "lane": "wrap-vllm-mlx",
+  "workload": "embed-corpus-v1",
+  "model": "all-MiniLM-L6-v2@vllm-mlx",
+  "cold_load_s": 0.00523225,
+  "infer_wall_s": 0.8687885,
+  "input_tokens": 47601,
+  "tok_per_s": 54790.08987803131,
+  "items": 200,
+  "parity_mean_cosine": null,
+  "self_peak_rss_bytes": null,
+  "notes": "external server (cold_load = first-request latency only, server pre-running), batch=1, parity_ids=0"
+}
