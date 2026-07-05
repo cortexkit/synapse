@@ -101,10 +101,32 @@ reference on identical inputs. Energy = combined avg watts x wall seconds.
 | wrap: LMStudio | (server) | [pending] | 0.99958 (smoke) | n/a | external | [pending] | [pending] |
 
 - llama-server wins energy (7.9 vs 11.1 kJ) despite lower tok/s: it draws 39W
-  where mlx-bf16 draws 62W. Joules per corpus is the end-user metric.
+  where mlx-bf16 draws 62W. (Energy caveat: macmon watts are machine totals
+  under the idle gate, comparatively valid but not per-process attribution.)
 - Parity is a fingerprint story: llama f16 is numerically indistinguishable from
   the fp32 reference; mlx bf16's 0.9960 is a REAL vector-space difference that
   must surface as a distinct model fingerprint (MC contract).
+
+### Quantization is not free: the DWQ rank-stability finding
+
+mlx-community's 4-bit DWQ quant of the same model doubles throughput
+(26.3k tok/s smoke vs 9.1k bf16) — and quietly rewrites retrieval results.
+Against the fp32 reference on 400 real code chunks (k=10 neighbor overlap):
+
+| metric | value |
+|---|---|
+| mean cosine | 0.9664 |
+| mean top-10 overlap | 0.836 |
+| p50 / p10 overlap | 0.90 / 0.70 |
+| worst-decile mean | 0.63 |
+| worst query | 0.40 |
+
+The median query loses 1 of its 10 nearest neighbors; the worst decile loses
+~4; one query lost 6. A 0.9664 mean cosine "looks fine" while a visible
+minority of searches degrades — the canonical proof that cosine-only parity
+gates are insufficient. Consequence: DWQ is an opt-in speed tier with its own
+fingerprint (full reembed to adopt), never a silent default. bf16 (0.996
+parity, 7.5x the CPU floor) is the quality-safe Apple lane.
 - ort-cpu is 6.4-7.5x slower and 4-5.6x more energy-hungry than the Metal lanes
   on the same model: the CPU floor exists for compatibility, not for daily use.
 
