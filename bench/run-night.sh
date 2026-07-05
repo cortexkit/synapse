@@ -107,6 +107,15 @@ else
   echo "skip wrap-lmstudio-embed: not reachable" >&2
 fi
 
+# AFT spike replication: Qwen3-Embedding 4-bit DWQ via Python mlx-embeddings
+# (their 2026-06 spike measured 22.8k tok/s on code chunks with this config).
+run mlx-qwen-dwq-embed \
+  /tmp/synapse-mlx-minilm-venv/bin/python bench/lanes/mlx-minilm/main.py \
+  --model mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ \
+  --corpus "$CORPUS" --out "$RESULTS/mlx-qwen-dwq-embed.json" \
+  --vectors-out "$RESULTS/mlx-qwen-dwq-vectors.jsonl" \
+  --model-label "Qwen3-Embedding-0.6B@mlx-4bit-dwq"
+
 # --- Workload A floor: all-MiniLM-L6-v2 across every engine ------------------
 run ort-cpu-minilm-embed \
   ./target/release/lane-ort-embed \

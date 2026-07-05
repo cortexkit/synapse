@@ -45,6 +45,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vectors-out", type=Path)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--model-label", required=True)
+    parser.add_argument(
+        "--model",
+        default=None,
+        help="HF repo or local path for mlx_embeddings.load; default: MiniLM chain",
+    )
     args = parser.parse_args()
     if args.limit is not None and args.limit < 0:
         parser.error("--limit must be non-negative")
@@ -55,7 +60,7 @@ def main() -> int:
     args = parse_args()
     started = time.perf_counter()
     device_note = set_gpu_default_device()
-    model, tokenizer, source_note = load_model_and_tokenizer()
+    model, tokenizer, source_note = load_model_and_tokenizer(args.model)
 
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
     warmup_ids = encode_text(tokenizer, "warmup")
@@ -169,8 +174,12 @@ def import_mlx_embeddings_helpers() -> tuple[Any, Any]:
     return load, convert
 
 
-def load_model_and_tokenizer() -> tuple[Any, Any, str]:
+def load_model_and_tokenizer(explicit_model: str | None = None) -> tuple[Any, Any, str]:
     load, convert = import_mlx_embeddings_helpers()
+
+    if explicit_model is not None:
+        model, tokenizer = load(explicit_model)
+        return model, tokenizer, explicit_model
 
     try:
         model, tokenizer = load(PRIMARY_MODEL)
