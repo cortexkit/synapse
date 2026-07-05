@@ -116,6 +116,13 @@ run mlx-qwen-dwq-embed \
   --vectors-out "$RESULTS/mlx-qwen-dwq-vectors.jsonl" \
   --model-label "Qwen3-Embedding-0.6B@mlx-4bit-dwq"
 
+# Full-corpus DWQ quality report (cosine + top-k rank overlap vs fp32).
+# Not idle-gated: pure math, no performance measurement.
+$BENCH parity \
+  --reference "$RESULTS/ort-cpu-embed-vectors.jsonl" \
+  --candidate "$RESULTS/mlx-qwen-dwq-vectors.jsonl" \
+  --k 10 --stride 50 > "$RESULTS/dwq-parity-report.json" || echo "dwq parity report failed" >&2
+
 # --- Workload A floor: all-MiniLM-L6-v2 across every engine ------------------
 run ort-cpu-minilm-embed \
   ./target/release/lane-ort-embed \
