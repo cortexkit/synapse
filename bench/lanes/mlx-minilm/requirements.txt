@@ -1,0 +1,2 @@
+mlx-embeddings==0.1.0
+huggingface-hub[hf_xet]>=0.25.1
