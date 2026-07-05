@@ -85,7 +85,51 @@ mlx-rs/llama-server lanes, both parity-proven in this bench).
 
 ## Results
 
-[TABLE PENDING — generated from bench/results/*.json after idle-gated runs]
+Measured 2026-07-04/05 on M5 Max (18 cores, 128 GB), macOS 26.5.1, idle-gated
+(CPU <= 15%, GPU <= 5% preflight; mid-run foreign-CPU attribution, all runs
+`contaminated=false`). Corpus: AFT's real chunk export, 15,271 chunks /
+1,569,409 tokens (byte-exact embed_text). Parity = mean cosine vs ort-cpu fp32
+reference on identical inputs. Energy = combined avg watts x wall seconds.
+
+### Workload A: batch embedding, Qwen3-Embedding-0.6B
+
+| lane | precision | tok/s | parity | cold load | peak RSS | avg W | energy |
+|---|---|---|---|---|---|---|---|
+| ort-cpu (9 threads) | fp32 | 1,211 | reference | 1.7s | (lane) | 34.3 | 44.5 kJ |
+| mlx-rs Metal | bf16 | 9,078 | 0.99600 | 0.4s | n/a | 61.7 | 11.1 kJ |
+| llama-server Metal | f16 gguf | 7,783 | 0.9999994 | 0.8s | 1.55 GB | 38.8 | 7.9 kJ |
+| wrap: LMStudio | (server) | [pending] | 0.99958 (smoke) | n/a | external | [pending] | [pending] |
+
+- llama-server wins energy (7.9 vs 11.1 kJ) despite lower tok/s: it draws 39W
+  where mlx-bf16 draws 62W. Joules per corpus is the end-user metric.
+- Parity is a fingerprint story: llama f16 is numerically indistinguishable from
+  the fp32 reference; mlx bf16's 0.9960 is a REAL vector-space difference that
+  must surface as a distinct model fingerprint (MC contract).
+- ort-cpu is 6.4-7.5x slower and 4-5.6x more energy-hungry than the Metal lanes
+  on the same model: the CPU floor exists for compatibility, not for daily use.
+
+### Workload A floor pair: all-MiniLM-L6-v2 (burn cannot import Qwen3)
+
+| lane | precision | tok/s | parity | cold load | energy |
+|---|---|---|---|---|---|
+| ort-cpu (9 threads) | fp32 | 28,915 | reference (same model) | 0.08s | 2.4 kJ |
+| burn wgpu/Metal | f32 | [pending] | [pending] | [pending] | [pending] |
+
+### Workload B: micro-LLM one-shot classification, 100 prompts
+
+| lane | model | combined tok/s | decode tok/s | valid labels | cold load |
+|---|---|---|---|---|---|
+| llama-server Metal | Qwen3-0.6B q8_0 | 12,352 | 573 | 97/100 | 0.55s |
+| mlx-rs Metal | Qwen3-0.6B bf16 | 7,896 | 49* | 96/100 | 0.35s |
+| llama-server Metal | LFM2.5-230M q8_0 | 28,776 | 1,140 | 81/100 | 0.33s |
+
+*mlx decode rate is unbatched greedy decoding in our hand-rolled lane — an
+implementation artifact (no speculative/batched decode), not an MLX ceiling.
+
+- LFM2.5-230M is 2.3x faster and materially less accurate on this task (81%
+  valid labels vs 97%): attractive tok/s, unusable accuracy for one-shot
+  classification without prompt work. Model choice stays a per-task decision.
+- Qwen3-0.6B q8_0 on llama-server is the current quality/speed sweet spot.
 
 ## Recommendation
 
