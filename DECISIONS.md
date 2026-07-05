@@ -61,6 +61,16 @@ approval state: **decided** (reversible, AFT-approved or within pre-approved sco
   workloads (and provides the evidence record), not whether we own the stack.
 - Formal lock lands with the tradeoff doc review.
 
+## D-009: Model matrix + speed-vs-energy knob (Ufuk, 2026-07-05)
+
+- Synapse recommends models per user hardware; a user-facing speed-vs-energy
+  knob ships later (fan-noise matters; bench shows 14.7-62W spread for the same
+  workload across engine/batch configs).
+- Model matrix: class (22M / 150M ModernBERT / 600M Qwen3) x format x quant.
+- Cross-model quality: public benchmark data (MTEB/CoIR) — no in-house
+  retrieval eval for now. Intra-model quant quality: our parity + rank-overlap
+  tooling (4-bit DWQ already disqualified as default by rank instability).
+
 ## D-008: Pin subc-protocol 0.7.0 + subc-transport 0.3.1; health() carries model state
 
 - State: decided (SUBC directive, 2026-07-04)
