@@ -33,6 +33,12 @@ struct Measurement {
     foreign_cpu_avg_pct: f64,
     foreign_cpu_peak_pct: f64,
     contaminated: bool,
+    /// Machine utilization during the run (macmon): saturation evidence.
+    /// A GPU lane averaging 40% GPU is leaving throughput on the table.
+    cpu_usage_avg_pct: f64,
+    cpu_usage_peak_pct: f64,
+    gpu_usage_avg_pct: f64,
+    gpu_usage_peak_pct: f64,
 }
 
 #[derive(Serialize, Default)]
@@ -208,6 +214,7 @@ pub fn run_wrapped(
 
     let n = samples.len().max(1) as f64;
     let mut agg = PowerAgg::default();
+    let (mut cpu_u_sum, mut cpu_u_peak, mut gpu_u_sum, mut gpu_u_peak) = (0f64, 0f64, 0f64, 0f64);
     for s in &samples {
         agg.cpu_avg_w += s.cpu_power;
         agg.gpu_avg_w += s.gpu_power;
@@ -215,6 +222,12 @@ pub fn run_wrapped(
         agg.cpu_peak_w = agg.cpu_peak_w.max(s.cpu_power);
         agg.gpu_peak_w = agg.gpu_peak_w.max(s.gpu_power);
         agg.ane_peak_w = agg.ane_peak_w.max(s.ane_power);
+        let cpu_u = s.cpu_usage_pct * 100.0;
+        let gpu_u = s.gpu_usage.1 * 100.0;
+        cpu_u_sum += cpu_u;
+        gpu_u_sum += gpu_u;
+        cpu_u_peak = cpu_u_peak.max(cpu_u);
+        gpu_u_peak = gpu_u_peak.max(gpu_u);
     }
     agg.cpu_avg_w /= n;
     agg.gpu_avg_w /= n;
@@ -241,6 +254,10 @@ pub fn run_wrapped(
         foreign_cpu_avg_pct: foreign_avg,
         foreign_cpu_peak_pct: foreign_peak,
         contaminated,
+        cpu_usage_avg_pct: cpu_u_sum / n,
+        cpu_usage_peak_pct: cpu_u_peak,
+        gpu_usage_avg_pct: gpu_u_sum / n,
+        gpu_usage_peak_pct: gpu_u_peak,
     };
     if let Some(parent) = out.parent() {
         std::fs::create_dir_all(parent)?;

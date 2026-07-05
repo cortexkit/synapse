@@ -52,6 +52,10 @@ struct Args {
     /// Model label for the result
     #[arg(long)]
     model_label: String,
+    /// ORT intra-op threads. Default: ceil(cores/2), AFT's production policy
+    /// (all-cores measured 1.7x slower there; sweepable here to re-verify).
+    #[arg(long)]
+    intra_threads: Option<usize>,
 }
 
 fn main() -> Result<()> {
@@ -59,7 +63,9 @@ fn main() -> Result<()> {
     let started = Instant::now();
 
     // --- Model + tokenizer load (cold-load window) ---
-    let intra = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).div_ceil(2).max(1);
+    let intra = args.intra_threads.unwrap_or_else(|| {
+        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).div_ceil(2).max(1)
+    });
     let mut session = Session::builder()?
         .with_optimization_level(GraphOptimizationLevel::Level3)?
         .with_intra_threads(intra)?
