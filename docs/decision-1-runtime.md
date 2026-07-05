@@ -99,27 +99,37 @@ mlx-rs/llama-server lanes, both parity-proven in this bench).
 
 ## Results
 
-Measured 2026-07-04/05 on M5 Max (18 cores, 128 GB), macOS 26.5.1, idle-gated
-(CPU <= 15%, GPU <= 5% preflight; mid-run foreign-CPU attribution, all runs
-`contaminated=false`). Corpus: AFT's real chunk export, 15,271 chunks /
-1,569,409 tokens (byte-exact embed_text). Parity = mean cosine vs ort-cpu fp32
-reference on identical inputs. Energy = combined avg watts x wall seconds.
+Final set measured 2026-07-05 (single sequential run, bench/results/night-20260705/)
+on M5 Max (18 cores, 128 GB), macOS 26.5.1, idle-gated (CPU <= 15%, GPU <= 5%
+preflight; mid-run foreign-CPU attribution, ALL 16 runs `contaminated=false`,
+foreign CPU 1-9%). Corpus: AFT's real chunk export, 15,271 chunks / 1,569,409
+tokens Qwen3-tokenized, 2,349,040 MiniLM-tokenized (byte-exact embed_text).
+Parity = mean cosine vs ort-cpu fp32 reference on identical inputs. Performance
+(tok/s, cold load) is the primary axis; energy is secondary (macmon watts are
+machine totals under the idle gate — comparatively valid, not per-process
+attribution). Sub-2s runs get no meaningful power sample (250ms sampler).
 
-### Workload A: batch embedding, Qwen3-Embedding-0.6B
+### Workload A: batch embedding, Qwen3-Embedding-0.6B (quality-upgrade model)
 
-| lane | precision | tok/s | parity | cold load | peak RSS | avg W | energy |
-|---|---|---|---|---|---|---|---|
-| ort-cpu (9 threads) | fp32 | 1,211 | reference | 1.7s | (lane) | 34.3 | 44.5 kJ |
-| mlx-rs Metal | bf16 | 9,078 | 0.99600 | 0.4s | n/a | 61.7 | 11.1 kJ |
-| llama-server Metal | f16 gguf | 7,783 | 0.9999994 | 0.8s | 1.55 GB | 38.8 | 7.9 kJ |
-| wrap: LMStudio | (server) | [pending] | 0.99958 (smoke) | n/a | external | [pending] | [pending] |
+| lane | precision | tok/s | parity | cold load | avg W | energy |
+|---|---|---|---|---|---|---|
+| ort-cpu (9 threads) | fp32 | 1,222 | reference | 0.9s | 30.3 | 38.9 kJ |
+| mlx-rs Metal | bf16 | 8,521 | 0.99600 | 0.2s | 38.5 | 7.2 kJ |
+| mlx-embeddings Metal (Python) | 4-bit DWQ | 23,421 | 0.9671* | 1.5s | 36.6 | 2.8 kJ |
+| llama-server Metal | f16 gguf | 7,685 | 1.00000 | 0.8s | 32.6 | 6.7 kJ |
+| wrap: LMStudio | (server, gguf) | 4,343 | 0.99973 | n/a | 38.9 | 14.1 kJ |
 
-- llama-server wins energy (7.9 vs 11.1 kJ) despite lower tok/s: it draws 39W
-  where mlx-bf16 draws 62W. (Energy caveat: macmon watts are machine totals
-  under the idle gate, comparatively valid but not per-process attribution.)
-- Parity is a fingerprint story: llama f16 is numerically indistinguishable from
-  the fp32 reference; mlx bf16's 0.9960 is a REAL vector-space difference that
-  must surface as a distinct model fingerprint (MC contract).
+*DWQ parity is quality-disqualifying despite the throughput — see the
+rank-stability finding below.
+
+- The Metal lanes are 6.3-7x the CPU floor at equal quality (bf16/f16), and the
+  DWQ quant reproduces AFT's June spike number (23.4k vs their 22.8k tok/s).
+- llama-server f16 is numerically indistinguishable from the fp32 reference
+  (1.00000 over all 15,271 chunks); mlx bf16's 0.9960 is a REAL vector-space
+  difference that must surface as a distinct model fingerprint (MC contract).
+- Wrapping LMStudio costs 1.8x throughput vs supervising llama-server directly
+  ON THE SAME ENGINE AND QUANT CLASS (4.3k vs 7.7k): HTTP + app overhead, no
+  control, and the machine-wide-admission failure class on top.
 
 ### Quantization is not free: the DWQ rank-stability finding
 
@@ -135,29 +145,54 @@ Against the fp32 reference on 400 real code chunks (k=10 neighbor overlap):
 | worst-decile mean | 0.63 |
 | worst query | 0.40 |
 
-The median query loses 1 of its 10 nearest neighbors; the worst decile loses
-~4; one query lost 6. A 0.9664 mean cosine "looks fine" while a visible
-minority of searches degrades — the canonical proof that cosine-only parity
-gates are insufficient. Consequence: DWQ is an opt-in speed tier with its own
-fingerprint (full reembed to adopt), never a silent default. bf16 (0.996
-parity, 7.5x the CPU floor) is the quality-safe Apple lane.
-- ort-cpu is 6.4-7.5x slower and 4-5.6x more energy-hungry than the Metal lanes
-  on the same model: the CPU floor exists for compatibility, not for daily use.
+Full-corpus confirmation (15,271 chunks, 306 rank queries, k=10): mean cosine
+0.9671, mean overlap 0.829, p50 0.90, p10 0.70, worst-decile mean 0.58, min
+0.40. The median query loses 1 of its 10 nearest neighbors; the worst decile
+loses ~4. A 0.967 mean cosine "looks fine" while a visible minority of searches
+degrades — the canonical proof that cosine-only parity gates are insufficient.
+Consequence: DWQ is an opt-in speed tier with its own fingerprint (full reembed
+to adopt), never a silent default. bf16/f16 are the quality-safe Apple lanes.
 
-### Workload A floor pair: all-MiniLM-L6-v2 (burn cannot import Qwen3)
+### Workload A floor: all-MiniLM-L6-v2 across every engine (today's production model)
 
-| lane | precision | tok/s | parity | cold load | energy |
-|---|---|---|---|---|---|
-| ort-cpu (9 threads) | fp32 | 28,915 | reference (same model) | 0.08s | 2.4 kJ |
-| burn wgpu/Metal | f32 | [pending] | [pending] | [pending] | [pending] |
+| lane | mode | tok/s | parity | cold load | avg W | energy |
+|---|---|---|---|---|---|---|
+| llama-server Metal | f16 gguf | 92,777 | 1.00000 | 0.28s | 22.0 | 0.57 kJ |
+| burn wgpu/Metal | f32 (compiled-in) | 64,865 | 1.00000 | 7.6s | 41.9 | 1.85 kJ |
+| MLX Metal (mlx-embeddings) | bf16 | 38,039 | n/a | 1.1s | 14.7 | 0.88 kJ |
+| ort Rust CPU (9 threads) | fp32 | 29,643 | reference | 0.08s | 26.9 | 2.14 kJ |
+| ts onnxruntime-node CPU | fp32 | 28,909 | n/a | 0.16s | 31.4 | 2.39 kJ |
+| ts transformers.js CPU | q8 (MC ships this) | 26,129 | n/a | 2.1s | 29.6 | 2.55 kJ |
+| ts transformers.js CPU | fp32 | 24,365 | n/a | 3.0s | 32.1 | 2.98 kJ |
+| llama-server CPU (-ngl 0) | f16 gguf | 11,836 | 1.00000 | 0.26s | 38.9 | 7.76 kJ |
+| vllm CPU (smoke, wrap) | fp32 | 7,793 | n/a | 13s server | n/a | n/a |
+
+Findings:
+
+- **Correction of our own contended-machine smoke**: with the machine quiet, GPU
+  wins MiniLM too. The earlier "tiny encoders lose on GPU" readout (11.6k) was
+  contention noise; clean MLX GPU is 38k and llama-Metal 92.8k. The quadrant
+  rule that survives: GPU wins BIG on 600M-class; on 150M-class GPU still wins
+  but CPU is within 3x, so CPU-only machines remain first-class for MiniLM.
+- **llama-server Metal at 92.8k tok/s with parity 1.00000 and 22W** is the
+  single best MiniLM result on every axis at once: 3.1x the CPU floor, 3.8x less
+  energy, 0.28s cold load. The whole 15,271-chunk corpus embedded in 26 seconds.
+- **Today's TS production path is not slow** — ort-node hits 97.5% of Rust ort;
+  transformers.js costs ~12-18% over raw ort-node. The upgrade Synapse offers
+  MiniLM-class users is llama-Metal's 3.1x + CPU freed, not "Rust instead of JS".
+- **burn's 64.9k** (2nd place, parity 1.0) comes with the architectural
+  disqualifiers unchanged: model compiled into the binary at build time (no
+  runtime loading), 7.6s Metal cold start every process start.
+- **q8 beat fp32 in transformers.js on the full corpus** (26.1k vs 24.4k) —
+  the smoke had it reversed; quantized wins once the corpus amortizes warmup.
 
 ### Workload B: micro-LLM one-shot classification, 100 prompts
 
 | lane | model | combined tok/s | decode tok/s | valid labels | cold load |
 |---|---|---|---|---|---|
-| llama-server Metal | Qwen3-0.6B q8_0 | 12,352 | 573 | 97/100 | 0.55s |
-| mlx-rs Metal | Qwen3-0.6B bf16 | 7,896 | 49* | 96/100 | 0.35s |
-| llama-server Metal | LFM2.5-230M q8_0 | 28,776 | 1,140 | 81/100 | 0.33s |
+| llama-server Metal | Qwen3-0.6B q8_0 | 12,110 | 558 | 97/100 | 0.55s |
+| mlx-rs Metal | Qwen3-0.6B bf16 | 7,265 | 45* | 96/100 | 0.32s |
+| llama-server Metal | LFM2.5-230M q8_0 | 30,278 | 1,171 | 81/100 | 0.27s |
 
 *mlx decode rate is unbatched greedy decoding in our hand-rolled lane — an
 implementation artifact (no speculative/batched decode), not an MLX ceiling.
@@ -177,9 +212,48 @@ anyway (subc supervision, machine-wide admission, credential integration, model
 lifecycle), and Python packaging is the part that fails our end-user constraints
 (install burden, interpreter footprint, cold start, energy).
 
-The measured matrix decides the remaining question — which engine carries which
-workload per platform: ort CPU floor everywhere; MLX lane (mlx-rs) vs llama.cpp
-child process on Apple Silicon per workload; remote endpoints (user-pointed
-vllm/sglang/Ollama/LMStudio/oMLX) as another backend behind the same surface.
+The measured matrix (above) answers the remaining question — which engine
+carries which workload. Engine assignments from the clean full-corpus run:
 
-[MEASURED TABLE PENDING — idle-gated matrix on AFT's corpus.]
+**llama.cpp (supervised llama-server child) is the primary local engine on
+Apple Silicon — for both workloads and both model classes.**
+
+- MiniLM-class embed: 92.8k tok/s, parity 1.00000, 0.28s cold, 22W — best on
+  every axis simultaneously.
+- Qwen3-class embed: 7.7k tok/s at parity 1.00000. mlx-rs bf16 is 11% faster
+  (8.5k) but at 0.996 parity (distinct fingerprint) and it costs a hand-written
+  Rust forward pass per model family; llama.cpp gets new architectures free
+  from the GGUF ecosystem (LFM2.5's hybrid arch ran day-one unmodified).
+- Micro-LLM: 12.1k tok/s combined, 97% label validity, full server timings.
+
+**ort (in-process Rust) is the universal CPU floor** — every platform, no GPU
+required: 29.6k MiniLM / 1.2k Qwen3. Proven AFT policies reproduce exactly.
+On CPU-only machines it beats llama-cpu by 2.5x on MiniLM.
+
+**mlx-rs**: not an engine for v1. The 11% embed edge on Qwen3 doesn't pay for
+per-architecture Rust implementations plus the Metal-toolchain CI burden; its
+unbatched decode is 12x slower than llama-server's. Revisit only if a workload
+appears where MLX kernels are unbeatable AND the model family is stable enough
+to hand-implement once (the mlx-embeddings DWQ lane shows 23.4k is reachable —
+but that's a quant-quality tradeoff, not an mlx-rs advantage).
+
+**burn**: dispositioned (compile-time model binding, 7.6s cold start), evidence
+recorded at 64.9k tok/s / parity 1.0 for the baked-in-model niche.
+
+**Remote/wrap endpoints** (user-pointed LMStudio/Ollama/vllm/sglang/oMLX):
+supported as explicit remote backends behind the same surface, never the
+default local engine — wrapping LMStudio measured 1.8x slower than supervising
+the same engine class directly, with the machine-wide-admission failure class
+unfixable from outside.
+
+**Model defaults per workload** (fingerprint-stable choices):
+- embed floor: MiniLM fp32 (ort, CPU) — today's spaces remain valid.
+- embed quality tier: Qwen3-Embedding-0.6B f16 GGUF (llama-Metal) on Apple;
+  ort fp32 elsewhere. DWQ quant: opt-in only (rank-stability finding).
+- micro-LLM: Qwen3-0.6B q8_0 (llama-Metal). LFM2.5-230M rejected at 81% label
+  validity despite 2.5x throughput.
+
+The lock decision for D-005 is therefore: Rust module owning admission, model
+lifecycle, and the subc surface; llama-server as supervised child engine; ort
+in-process as floor; remote endpoints as a peer backend lane. No Python in the
+shipped path.
