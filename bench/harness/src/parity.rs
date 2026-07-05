@@ -97,19 +97,30 @@ pub fn rank_overlap(
     anyhow::ensure!(ids.len() > k + 1, "not enough shared ids ({}) for k={k}", ids.len());
 
     let queries: Vec<&String> = ids.iter().step_by(stride.max(1)).copied().collect();
-    let mut overlap_sum = 0f64;
+    let mut overlaps: Vec<f64> = Vec::with_capacity(queries.len());
 
     for query in &queries {
         let top_a = top_k_neighbors(query, &ids, a, k);
         let top_b = top_k_neighbors(query, &ids, b, k);
         let hits = top_a.iter().filter(|id| top_b.contains(*id)).count();
-        overlap_sum += hits as f64 / k as f64;
+        overlaps.push(hits as f64 / k as f64);
     }
 
+    // Retrieval pain lives in the tail: a good mean with a fat low tail is
+    // materially worse than the same mean uniform, so report the distribution.
+    overlaps.sort_by(f64::total_cmp);
+    let n = overlaps.len();
+    let pct = |p: f64| overlaps[((n as f64 * p) as usize).min(n - 1)];
+    let worst_decile = &overlaps[..n.div_ceil(10)];
+
     Ok(RankOverlap {
-        queries: queries.len(),
+        queries: n,
         k,
-        mean_topk_overlap: overlap_sum / queries.len() as f64,
+        mean_topk_overlap: overlaps.iter().sum::<f64>() / n as f64,
+        p50_overlap: pct(0.50),
+        p10_overlap: pct(0.10),
+        worst_decile_mean: worst_decile.iter().sum::<f64>() / worst_decile.len() as f64,
+        min_overlap: overlaps[0],
     })
 }
 
@@ -118,6 +129,10 @@ pub struct RankOverlap {
     pub queries: usize,
     pub k: usize,
     pub mean_topk_overlap: f64,
+    pub p50_overlap: f64,
+    pub p10_overlap: f64,
+    pub worst_decile_mean: f64,
+    pub min_overlap: f64,
 }
 
 fn top_k_neighbors(
