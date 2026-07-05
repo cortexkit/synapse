@@ -67,12 +67,26 @@ what the matrix measures:
    engine for embed + LLM, correct last-token pooling via --pooling last (parity
    0.9999994), per-request server timings, clean child lifecycle under our
    supervision — matches SUBC's module-spawns-runtime-children model exactly.
-4. **wrap (LMStudio)**: [pending smoke] — plus the standing evidence: GUI app
-   lifecycle outside subc supervision, and today's live incident (6 concurrent AFT
-   processes buried it; no machine-wide admission) is the class of failure wrapping
-   cannot fix from outside.
+4. **wrap (LMStudio)**: smoke parity 0.9996 through /v1/embeddings — plus the
+   standing evidence: GUI app lifecycle outside subc supervision, and the live
+   incident (6 concurrent AFT processes buried it; no machine-wide admission) is
+   the class of failure wrapping cannot fix from outside.
 5. **ort CPU**: the proven universal floor; AFT's shipped policies reproduced
    exactly (Level3, ceil(cores/2) threads, 4M attention-unit batching).
+6. **vllm family (measured empirically after the by-inspection disposition)**:
+   vllm-CPU 0.24.0 serves MiniLM on macOS but needed memory-reservation flags,
+   single-process mode, and a truncated corpus (MiniLM 256-token limit surfaced
+   as opaque 400s/timeouts); smoke 7.8k tok/s — 3.7x SLOWER than our bounded ort
+   on the same model, with a 1.3 GB venv and 13s cold start. vllm-metal 0.3.0
+   installs (with workspace + Xcode workarounds) but CANNOT serve MiniLM at all:
+   "Model type bert not supported" (its pooling support today is
+   Qwen3-Embedding/Reranker only). vllm-mlx serves MiniLM only as an auxiliary
+   model hitched to a supported primary LLM (BERT rejected as primary; also
+   needed a transformers version pin to even start). Its raw smoke number
+   (54.8k tok/s, contended machine, unvalidated quality) shows MLX kernel
+   potential, but three-of-three modes required version pins or config surgery
+   to serve a 5-year-old, 22M-parameter industry-standard embedder — the
+   packaging-fragility disposition is now empirical fact, not inspection.
 
 ## The convergence finding
 
