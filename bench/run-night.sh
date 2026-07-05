@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 # THE night run: every lane, sequentially, idle-gated, on the full AFT corpus.
+# Rev 2 (saturation audit): burn 16M attention units, sorted length-uniform
+# batching in burn/mlx lanes, mlx-python 32k/256 defaults. ort keeps the
+# 9-thread production policy ON PURPOSE (the saturated-machine number is a
+# separate column, not the default).
 # Fresh results directory per run so no stale JSON mixes into the table.
 #
 # Usage:  nohup bash bench/run-night.sh > /tmp/night-run.log 2>&1 & disown
@@ -155,7 +159,7 @@ run burn-wgpu-embed \
   --model "$SNAP_MINILM/model.onnx" --tokenizer "$SNAP_MINILM/tokenizer.json" \
   --corpus "$CORPUS" --out "$RESULTS/burn-wgpu-embed.json" \
   --reference "$RESULTS/ort-cpu-minilm-embed-vectors.jsonl" \
-  --pooling mean \
+  --pooling mean --attention-units 16000000 \
   --model-label "all-MiniLM-L6-v2@burn-wgpu-f32"
 
 run ts-transformersjs-q8-embed \

@@ -629,6 +629,11 @@ fn run_embed(args: EmbedArgs) -> Result<()> {
         encoded.push(EncodedChunk { id: chunk.id, ids });
     }
 
+    // Sort by tokenized length so padded batches carry near-uniform lengths
+    // (mixed-length batches pad to the batch max and waste GPU on padding).
+    // Vectors are keyed by id, so output order is irrelevant.
+    encoded.sort_by_key(|item| item.ids.len());
+
     let infer_started = Instant::now();
     let mut batch_start = 0usize;
     let mut batch_max_len = 0usize;
