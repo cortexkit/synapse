@@ -186,6 +186,88 @@ Findings:
 - **q8 beat fp32 in transformers.js on the full corpus** (26.1k vs 24.4k) —
   the smoke had it reversed; quantized wins once the corpus amortizes warmup.
 
+### Saturation audit (2026-07-06): three table rows above are undersaturated
+
+Post-run GPU-utilization auditing (utilization capture now lands in every
+measure.json) showed the night-20260705 configs left GPU on the table in three
+lanes. Root cause everywhere: mixed-length padded batches — batches pad to
+their longest member, so short chunks burn GPU on padding tokens. Fix: sort by
+tokenized length (output is keyed by id; order is irrelevant) + bigger batch
+budgets. Contended-machine PROBE numbers (relative evidence only, not table
+grade):
+
+| lane | night config | GPU util | fixed config | probe result |
+|---|---|---|---|---|
+| burn MiniLM | 4M attn units, unsorted | 68% | 16M units, sorted | 82k → 137.5k tok/s (parity 1.0 unchanged) |
+| mlx-python MiniLM | 8k budget, unsorted | 77% | 32k/256, sorted | 178k → 355k tok/s probe* |
+| mlx-rs Qwen3 | unsorted | ~85% | sorted | 8.5k → 13.4k tok/s, GPU 98% |
+| ort CPU MiniLM | 9 threads | 43% CPU | (by design) | 18 threads: +20% — AFT policy row stays the default, saturated column reported separately |
+
+*probe subset skews long (158 vs 142 avg tokens); treat direction, not magnitude.
+
+Consequences pending the rev-2 clean rerun (script updated, run pending):
+- The "llama-server wins GPU embedding on every axis" conclusion does NOT
+  survive saturation fixes; MLX leads GPU embedding in both model classes in
+  the probes. The Recommendation section's engine assignment for embed will be
+  re-decided on rev-2 numbers.
+- mlx-rs bf16 parity moved 0.99600 → 0.99626 under sorted batching: batch
+  shape perturbs bf16 numerics. One more reason fingerprints must capture
+  runtime config, not just model+quant.
+- llama.cpp caveat (petejm/apple-silicon-embed-bench, community-corroborated):
+  current llama.cpp macOS 26.5 builds report `has tensor = false` — Apple M5
+  tensor accelerators are DISABLED in llama.cpp while MLX uses them. Part of
+  the MLX-vs-llama gap is API state, closable by future llama.cpp releases:
+  engine assignments must stay pluggable, not locked to today's winner.
+
+### Model matrix (provisional — smoke-grade, full-corpus rev-2 run pending)
+
+Model axis added 2026-07-06 (D-009: best options per hardware class + a
+speed-vs-energy knob; bench spread supports the knob — same workload spans
+14.7W to 62W by engine/batch choice). Model classes: static 16M (Model2Vec
+potion-code-16M) / 22M MiniLM / 150M ModernBERT-class / 600M Qwen3. Cross-MODEL
+quality comes from public data (MTEB/CoIR) + our own retrieval eval
+(bench/eval-coir, cosqa first, semble's 1,250-query code-search dataset as
+second column); intra-model QUANT quality from our parity+rank-overlap tooling.
+
+Qwen3-Embedding-0.6B quant ladder (400-chunk smoke vs fp32 reference, k=10;
+first public quant-quality data for these embedders — none published anywhere):
+
+| quant | mean cosine | rank overlap | worst decile |
+|---|---|---|---|
+| Q8_0 (GGUF) | pending full run | | |
+| Q6_K (GGUF) | 0.9963 | 0.965 | 0.88 |
+| Q4_K_M (GGUF) | 0.9750 | 0.869 | 0.67 |
+| 4bit DWQ (MLX) | 0.9664 | 0.836 | 0.63 |
+| 8bit (MLX) | 0.8899 | 0.837 | 0.10 (min 0.0) |
+
+- Q6_K is the quant sweet spot so far: 0.965 rank stability at ~60% of f16 size.
+- The MLX 8bit row is ANOMALOUS (8-bit scoring below 4-bit is not how
+  quantization error works): suspected broken mlx-community upload or an
+  mlx-embeddings handling bug for that format. Under investigation — do not
+  cite as a real measurement.
+- ModernBERT-class candidates verified runnable cross-engine (200-chunk smokes,
+  ort fp32 vs llama GGUF): gte-modernbert-base 0.99997 (CLS pooling),
+  nomic-modernbert-embed 0.99931 (mean + search prefixes), jina-v5-nano
+  0.99999 (EuroBERT, last pooling; NOTE: produces 768-dim vectors on both
+  engines, not the 512 the repo docs suggest — consistent cross-engine, needs
+  pooling-config verification before quality claims).
+- Static class (Model2Vec): semble's own ablations put raw potion-code-16M at
+  NDCG 0.650 vs 0.765 for a 137M transformer — viable ONLY behind hybrid
+  retrieval (BM25 carries symbol queries), i.e. AFT-shaped consumers on very
+  constrained machines; disqualified for MC's pure vector search. Lane built;
+  speed/footprint numbers pending.
+
+### Workload C (rerank) and retrieval-quality eval: in flight
+
+Qwen3-Reranker-0.6B via llama-server /v1/rerank (lane in build). Latency per
+20-doc rerank request decides interactive-path vs background-only for AFT.
+Quality eval harness (bench/eval-coir) scores THE ARTIFACTS WE SHIP (lane
+vectors, per model x quant x engine) on public retrieval tasks — quant damage
+gets priced in nDCG, not just neighbor churn. Pipeline-vs-pipeline vs semble
+agreed with AFT (four columns: raw dense / naive hybrid / AFT full stack /
+semble published — if AFT signals don't clear naive hybrid on their
+distribution, that's the finding).
+
 ### Workload B: micro-LLM one-shot classification, 100 prompts
 
 | lane | model | combined tok/s | decode tok/s | valid labels | cold load |
@@ -211,6 +293,13 @@ engines (see convergence finding); the packaging layer is the part Synapse must 
 anyway (subc supervision, machine-wide admission, credential integration, model
 lifecycle), and Python packaging is the part that fails our end-user constraints
 (install burden, interpreter footprint, cold start, energy).
+
+> **REVISION PENDING (2026-07-06):** the saturation audit above invalidates
+> the embed-workload engine assignments below — MLX leads GPU embedding in
+> post-fix probes (both model classes). The assignments stand as written for
+> micro-LLM and the CPU floor; the embed rows will be re-decided from the
+> rev-2 clean rerun before D-005 lock. Kept unedited meanwhile so the review
+> trail stays honest.
 
 The measured matrix (above) answers the remaining question — which engine
 carries which workload. Engine assignments from the clean full-corpus run:
