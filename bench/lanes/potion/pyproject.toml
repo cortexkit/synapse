@@ -1,0 +1,12 @@
+[project]
+name = "potion-lane"
+version = "0.1.0"
+description = "Static embedding benchmark lane for Model2Vec potion-code-16M"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "model2vec==0.8.2",
+  "numpy==2.5.1",
+]
+
+[tool.uv]
+package = false
