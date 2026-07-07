@@ -24,6 +24,7 @@ CORPUS=bench/data/corpus-v2.jsonl
 PROMPTS=bench/data/microllm-prompts-v1.jsonl
 LLAMA_BIN=${LLAMA_SERVER_BIN:-/opt/zerobrew/bin/llama-server}
 MLX_PY=${MLX_PYTHON:-/tmp/synapse-mlx-minilm-venv/bin/python}
+POTION_PY=${POTION_PYTHON:-bench/lanes/potion/.venv/bin/python}
 WAIT_MAX=${WAIT_MAX:-43200}
 WAIT_STEP=60
 mkdir -p "$RESULTS"
@@ -51,6 +52,7 @@ need "$CORPUS"
 need "$PROMPTS"
 need bench/lanes/ts-embed/node_modules
 need "$MLX_PY"
+need "$POTION_PY"
 
 SNAP_ONNX=$(find_snapshot "$HOME/.cache/huggingface/hub/models--onnx-community--Qwen3-Embedding-0.6B-ONNX/snapshots/*" || true)
 SNAP_MLX_EMBED=$(find_snapshot "$HOME/.cache/huggingface/hub/models--Qwen--Qwen3-Embedding-0.6B/snapshots/*" || true)
@@ -227,6 +229,12 @@ run mlx-minilm-embed \
   "$MLX_PY" bench/lanes/mlx-minilm/main.py \
   --corpus "$CORPUS" --out "$RESULTS/mlx-minilm-embed.json" \
   --model-label "all-MiniLM-L6-v2@mlx-bf16"
+
+run potion-static-embed \
+  "$POTION_PY" bench/lanes/potion/main.py \
+  --corpus "$CORPUS" --out "$RESULTS/potion-static-embed.json" \
+  --vectors-out "$RESULTS/potion-static-embed-vectors.jsonl" \
+  --model-label "potion-code-16M@model2vec-static"
 
 # --- Model matrix: ModernBERT-class + Jina + Qwen3 quant lanes ---------------
 run ort-cpu-gte-modernbert-embed \
