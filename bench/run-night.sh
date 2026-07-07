@@ -22,6 +22,8 @@ BENCH=./target/release/synapse-bench
 RESULTS=bench/results/night-$(date +%Y%m%d)
 CORPUS=bench/data/corpus-v2.jsonl
 PROMPTS=bench/data/microllm-prompts-v1.jsonl
+LLAMA_BIN=${LLAMA_SERVER_BIN:-/opt/zerobrew/bin/llama-server}
+MLX_PY=${MLX_PYTHON:-/tmp/synapse-mlx-minilm-venv/bin/python}
 WAIT_MAX=${WAIT_MAX:-43200}
 WAIT_STEP=60
 mkdir -p "$RESULTS"
@@ -48,7 +50,7 @@ need target/release/synapse-bench
 need "$CORPUS"
 need "$PROMPTS"
 need bench/lanes/ts-embed/node_modules
-need /tmp/synapse-mlx-minilm-venv/bin/python
+need "$MLX_PY"
 
 SNAP_ONNX=$(find_snapshot "$HOME/.cache/huggingface/hub/models--onnx-community--Qwen3-Embedding-0.6B-ONNX/snapshots/*" || true)
 SNAP_MLX_EMBED=$(find_snapshot "$HOME/.cache/huggingface/hub/models--Qwen--Qwen3-Embedding-0.6B/snapshots/*" || true)
@@ -134,7 +136,7 @@ run mlx-embed \
   --model-label "Qwen3-Embedding-0.6B@mlx-bf16"
 
 run llama-metal-embed \
-  ./target/release/lane-llama embed \
+  ./target/release/lane-llama embed --server-binary "$LLAMA_BIN" \
   --model "$SNAP_GGUF_EMBED/Qwen3-Embedding-0.6B-f16.gguf" \
   --tokenizer "$SNAP_MLX_EMBED/tokenizer.json" \
   --corpus "$CORPUS" --out "$RESULTS/llama-metal-embed.json" \
@@ -158,7 +160,7 @@ fi
 # AFT spike replication: Qwen3-Embedding 4-bit DWQ via Python mlx-embeddings
 # (their 2026-06 spike measured 22.8k tok/s on code chunks with this config).
 run mlx-qwen-dwq-embed \
-  /tmp/synapse-mlx-minilm-venv/bin/python bench/lanes/mlx-minilm/main.py \
+  "$MLX_PY" bench/lanes/mlx-minilm/main.py \
   --model mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ \
   --corpus "$CORPUS" --out "$RESULTS/mlx-qwen-dwq-embed.json" \
   --vectors-out "$RESULTS/mlx-qwen-dwq-vectors.jsonl" \
@@ -181,7 +183,7 @@ run ort-cpu-minilm-embed \
   --model-label "all-MiniLM-L6-v2@ort-cpu-fp32"
 
 run llama-metal-minilm-embed \
-  ./target/release/lane-llama embed \
+  ./target/release/lane-llama embed --server-binary "$LLAMA_BIN" \
   --model "$SNAP_MINILM_GGUF/all-MiniLM-L6-v2-ggml-model-f16.gguf" \
   --tokenizer "$SNAP_MINILM/tokenizer.json" \
   --corpus "$CORPUS" --out "$RESULTS/llama-metal-minilm-embed.json" \
@@ -190,7 +192,7 @@ run llama-metal-minilm-embed \
   --model-label "all-MiniLM-L6-v2@gguf-f16-metal"
 
 run llama-cpu-minilm-embed \
-  ./target/release/lane-llama embed \
+  ./target/release/lane-llama embed --server-binary "$LLAMA_BIN" \
   --model "$SNAP_MINILM_GGUF/all-MiniLM-L6-v2-ggml-model-f16.gguf" \
   --tokenizer "$SNAP_MINILM/tokenizer.json" \
   --corpus "$CORPUS" --out "$RESULTS/llama-cpu-minilm-embed.json" \
@@ -222,7 +224,7 @@ run ts-ort-node-embed \
   --model-label "Qdrant/all-MiniLM-L6-v2-onnx@ort-node-fp32"
 
 run mlx-minilm-embed \
-  /tmp/synapse-mlx-minilm-venv/bin/python bench/lanes/mlx-minilm/main.py \
+  "$MLX_PY" bench/lanes/mlx-minilm/main.py \
   --corpus "$CORPUS" --out "$RESULTS/mlx-minilm-embed.json" \
   --model-label "all-MiniLM-L6-v2@mlx-bf16"
 
@@ -236,7 +238,7 @@ run ort-cpu-gte-modernbert-embed \
   --model-label "gte-modernbert-base@onnx-fp32"
 
 run llama-metal-gte-modernbert-embed \
-  ./target/release/lane-llama embed \
+  ./target/release/lane-llama embed --server-binary "$LLAMA_BIN" \
   --model "$SNAP_GTE_GGUF/gte-modernbert-base-F16.gguf" \
   --tokenizer "$SNAP_GTE_MODERNBERT/tokenizer.json" \
   --corpus "$CORPUS" --out "$RESULTS/llama-metal-gte-modernbert-embed.json" \
@@ -253,7 +255,7 @@ run ort-cpu-nomic-modernbert-embed \
   --model-label "modernbert-embed-base@onnx-fp32"
 
 run llama-metal-nomic-modernbert-embed \
-  ./target/release/lane-llama embed \
+  ./target/release/lane-llama embed --server-binary "$LLAMA_BIN" \
   --model "$SNAP_NOMIC_GGUF/modernbert-embed-base-Q8_0.gguf" \
   --tokenizer "$SNAP_NOMIC_MODERNBERT/tokenizer.json" \
   --corpus "$CORPUS" --out "$RESULTS/llama-metal-nomic-modernbert-embed.json" \
@@ -270,7 +272,7 @@ run ort-cpu-jina-v5-nano-embed \
   --model-label "jina-embeddings-v5-text-nano-retrieval@onnx-fp32"
 
 run llama-metal-jina-v5-nano-embed \
-  ./target/release/lane-llama embed \
+  ./target/release/lane-llama embed --server-binary "$LLAMA_BIN" \
   --model "$SNAP_JINA/v5-nano-retrieval-F16.gguf" \
   --tokenizer "$SNAP_JINA/tokenizer.json" \
   --corpus "$CORPUS" --out "$RESULTS/llama-metal-jina-v5-nano-embed.json" \
@@ -279,7 +281,7 @@ run llama-metal-jina-v5-nano-embed \
   --model-label "jina-embeddings-v5-text-nano-retrieval@gguf-f16"
 
 run llama-metal-qwen-q4-k-m-embed \
-  ./target/release/lane-llama embed \
+  ./target/release/lane-llama embed --server-binary "$LLAMA_BIN" \
   --model "$SNAP_QWEN_QUANTS/Qwen3-Embedding-0.6B.Q4_K_M.gguf" \
   --tokenizer "$SNAP_MLX_EMBED/tokenizer.json" \
   --corpus "$CORPUS" --out "$RESULTS/llama-metal-qwen-q4-k-m-embed.json" \
@@ -288,7 +290,7 @@ run llama-metal-qwen-q4-k-m-embed \
   --model-label "Qwen3-Embedding-0.6B@gguf-q4_k_m"
 
 run llama-metal-qwen-q6-k-embed \
-  ./target/release/lane-llama embed \
+  ./target/release/lane-llama embed --server-binary "$LLAMA_BIN" \
   --model "$SNAP_QWEN_QUANTS/Qwen3-Embedding-0.6B.Q6_K.gguf" \
   --tokenizer "$SNAP_MLX_EMBED/tokenizer.json" \
   --corpus "$CORPUS" --out "$RESULTS/llama-metal-qwen-q6-k-embed.json" \
@@ -297,7 +299,7 @@ run llama-metal-qwen-q6-k-embed \
   --model-label "Qwen3-Embedding-0.6B@gguf-q6_k"
 
 run llama-metal-qwen-q8-0-embed \
-  ./target/release/lane-llama embed \
+  ./target/release/lane-llama embed --server-binary "$LLAMA_BIN" \
   --model "$SNAP_GGUF_EMBED/Qwen3-Embedding-0.6B-Q8_0.gguf" \
   --tokenizer "$SNAP_MLX_EMBED/tokenizer.json" \
   --corpus "$CORPUS" --out "$RESULTS/llama-metal-qwen-q8-0-embed.json" \
@@ -306,7 +308,7 @@ run llama-metal-qwen-q8-0-embed \
   --model-label "Qwen3-Embedding-0.6B@gguf-q8_0"
 
 run mlx-qwen-8bit-embed \
-  /tmp/synapse-mlx-minilm-venv/bin/python bench/lanes/mlx-minilm/main.py \
+  "$MLX_PY" bench/lanes/mlx-minilm/main.py \
   --model "$SNAP_QWEN_MLX_8BIT" \
   --corpus "$CORPUS" --out "$RESULTS/mlx-qwen-8bit-embed.json" \
   --vectors-out "$RESULTS/mlx-qwen-8bit-vectors.jsonl" \
@@ -326,13 +328,13 @@ run mlx-microllm \
   --prompts "$PROMPTS" --out "$RESULTS/mlx-microllm.json"
 
 run llama-metal-microllm \
-  ./target/release/lane-llama microllm \
+  ./target/release/lane-llama microllm --server-binary "$LLAMA_BIN" \
   --model "$SNAP_GGUF_LLM/Qwen3-0.6B-Q8_0.gguf" \
   --prompts "$PROMPTS" --out "$RESULTS/llama-metal-microllm.json" \
   --model-label "Qwen3-0.6B@gguf-q8_0"
 
 run llama-metal-microllm-lfm \
-  ./target/release/lane-llama microllm \
+  ./target/release/lane-llama microllm --server-binary "$LLAMA_BIN" \
   --model "$SNAP_LFM/LFM2.5-230M-Q8_0.gguf" \
   --prompts "$PROMPTS" --out "$RESULTS/llama-metal-microllm-lfm.json" \
   --model-label "LFM2.5-230M@gguf-q8_0"

@@ -9,11 +9,13 @@
 ├── bench/                  # Main benchmarking workspace containing harness and lanes
 │   ├── data/               # Evaluation prompt datasets and corpus targets
 │   ├── harness/            # Core benchmark metrics and telemetry runner library
-│   ├── lanes/              # Crate workspace members for model runtimes
+│   ├── lanes/              # Crate workspace members and runtime scripts
 │   │   ├── burn/           # WGPU/Metal shader engine using Burn
 │   │   ├── llama/          # Supervised llama-server child process executor
+│   │   ├── mlx-minilm/     # Python-based MLX GPU executor for MiniLM
 │   │   ├── mlx/            # Metal-accelerated MLX GPU executor
 │   │   ├── ort-embed/      # Bounded-CPU ONNX runtime embedding runner
+│   │   ├── ts-embed/       # TypeScript Bun/Node runner (Transformers.js or ORT Node)
 │   │   └── wrap-embed/     # External API wrapper (Ollama/LMStudio)
 │   └── results/            # Saved telemetry metrics, results, and vectors
 ├── corpus/                 # Code chunk files used for evaluations
@@ -46,9 +48,9 @@
 - Key files: `bench/harness/src/metrics.rs`, `bench/harness/src/parity.rs`, `bench/harness/src/results.rs`
 
 **bench/lanes/:**
-- Purpose: Groups individual workspace crates that run candidate models.
-- Contains: Sub-directories for each runtime backend.
-- Key files: `bench/lanes/ort-embed/src/main.rs`, `bench/lanes/mlx/src/main.rs`, `bench/lanes/llama/src/main.rs`
+- Purpose: Groups individual workspace crates and runtime scripts that run candidate models.
+- Contains: Sub-directories for each runtime backend (Rust crates, Python venvs, Bun packages).
+- Key files: `bench/lanes/ort-embed/src/main.rs`, `bench/lanes/mlx/src/main.rs`, `bench/lanes/llama/src/main.rs`, `bench/lanes/mlx-minilm/main.py`, `bench/lanes/ts-embed/main.mjs`
 
 **bench/results/:**
 - Purpose: Storage directory for the output log files, parity vectors, and metrics.
@@ -63,9 +65,10 @@
 ## Key File Locations
 
 **Entry Points:**
-- `bench/harness/src/main.rs`: CLI runner for corpus generation and power wrapper execution.
-- `bench/lanes/*/src/main.rs`: Main executables for each specific runtime lane.
+- `bench/harness/src/main.rs`: CLI runner for corpus generation, power wrapper execution, and parity check.
+- `bench/lanes/*/src/main.rs` (Rust), `bench/lanes/mlx-minilm/main.py` (Python), `bench/lanes/ts-embed/main.mjs` (JS): Main executables for each specific runtime lane.
 - `bench/run-matrix.sh`: Global benchmark suite runner.
+- `bench/run-night.sh`: Nightly full-corpus multi-lane orchestrator.
 
 **Configuration:**
 - `Cargo.toml`: Cargo workspace manifest listing all members.
@@ -73,8 +76,10 @@
 
 **Core Logic:**
 - `bench/harness/src/metrics.rs`: Macmon power metrics execution, parsing, and system idle gating.
-- `bench/harness/src/parity.rs`: Numerical calculation of cosine similarity and file parsing functions.
+- `bench/harness/src/parity.rs`: Numerical calculation of cosine similarity, rank stability/overlap checks, and file parsing functions.
 - `bench/lanes/mlx/src/main.rs`: Qwen3 model architecture implementation and custom forward passes in MLX.
+- `bench/lanes/mlx-minilm/main.py`: Length-sorted batched MLX GPU execution for MiniLM.
+- `bench/lanes/ts-embed/main.mjs`: Transformers.js (q8/fp32) and native `onnxruntime-node` embedding logic.
 
 **Tests:**
 - Standalone nextest-compatible test suites are managed via library configurations and workspace flags.
@@ -86,7 +91,7 @@
 
 ## Where to Add New Code
 
-**New benchmark lane:** Create a new workspace crate under `bench/lanes/[lane-name]/`. Register the crate path in the root `Cargo.toml` `members` list. Follow the standard lane structure (arguments, warmup step, token-based batching, and `LaneResult` generation), then add the command runner invocation inside `bench/run-matrix.sh`.
+**New benchmark lane:** For Rust-based lanes, create a new workspace crate under `bench/lanes/[lane-name]/` and register the crate path in the root `Cargo.toml` `members` list. For Python or JavaScript/TypeScript-based lanes, create a new sub-directory under `bench/lanes/[lane-name]/` with the corresponding package or dependency manifest (`requirements.txt`, `package.json`). Follow standard batching structures, output a valid `LaneResult` json structure, then add the runner invocation inside `bench/run-matrix.sh` and `bench/run-night.sh`.
 **New benchmark workload:** Add a subcommand and its schema parsing in `bench/harness/src/main.rs`, support loading and typing under `bench/harness/src/parity.rs`, and implement the evaluation logic in the corresponding lane executables.
 **Shared utilities:** Place shared functions or data representations within `bench/harness/src/parity.rs` or `bench/harness/src/results.rs`.
 **Tests:** Co-locate unit tests within the source files as nested `#[cfg(test)]` modules, and integration tests inside `tests/` directories at the crate roots.
