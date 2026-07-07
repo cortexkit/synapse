@@ -27,7 +27,7 @@ use synapse_bench::{
     parity::{load_corpus, load_jsonl, load_reference, mean_parity, Chunk, Prompt},
     results::LaneResult,
 };
-use tokenizers::{Tokenizer, TruncationParams};
+use tokenizers::{Encoding, Tokenizer, TruncationParams};
 
 const DEFAULT_SERVER_BINARY: &str = "/opt/zerobrew/bin/llama-server";
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(120);
@@ -346,15 +346,19 @@ fn main() -> Result<()> {
 fn run_embed(args: EmbedArgs) -> Result<()> {
     let tokenizer = load_tokenizer(&args.tokenizer, args.max_length)?;
     let chunks: Vec<Chunk> = load_corpus(&args.corpus, None)?;
-    let texts: Vec<String> = chunks
+    let prefixed_texts: Vec<String> = chunks
         .iter()
         .map(|chunk| prefixed_text(args.prefix_document.as_deref(), &chunk.text))
         .collect();
 
-    let batch_texts: Vec<&str> = texts.iter().map(String::as_str).collect();
+    let batch_texts: Vec<&str> = prefixed_texts.iter().map(String::as_str).collect();
     let encodings = tokenizer
         .encode_batch(batch_texts, true)
         .map_err(|err| anyhow::anyhow!("encode_batch: {err}"))?;
+    let texts: Vec<String> = encodings
+        .iter()
+        .map(|encoding| decode_truncated_text(&tokenizer, encoding))
+        .collect::<Result<_>>()?;
     let token_counts: Vec<usize> = encodings
         .iter()
         .map(|encoding| encoding.get_ids().len())
@@ -800,6 +804,13 @@ fn count_tokens(tokenizer: &Tokenizer, text: &str) -> Result<usize> {
         .encode(text, false)
         .map_err(|err| anyhow::anyhow!("tokenizer encode: {err}"))?;
     Ok(encoding.get_ids().len())
+}
+
+fn decode_truncated_text(tokenizer: &Tokenizer, encoding: &Encoding) -> Result<String> {
+    // Send the same truncated text that the client-side token counts were computed from.
+    tokenizer
+        .decode(encoding.get_ids(), true)
+        .map_err(|err| anyhow::anyhow!("tokenizer decode: {err}"))
 }
 
 fn build_http_client() -> Result<Client> {
