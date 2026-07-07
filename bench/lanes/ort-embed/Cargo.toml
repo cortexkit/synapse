@@ -15,6 +15,8 @@ clap = { workspace = true }
 tokenizers = { workspace = true }
 synapse-bench = { path = "../../harness" }
 ort = { version = "=2.0.0-rc.11", features = ["ndarray", "half"] }
+ndarray = "0.17.2"
+half = "2"
 
 # Windows: link onnxruntime at runtime from the official DLL (ORT_DYLIB_PATH)
 # instead of pyke's static archives — the prebuilt .lib CRT flavor conflicts
@@ -22,5 +24,3 @@ ort = { version = "=2.0.0-rc.11", features = ["ndarray", "half"] }
 # CRT choice irrelevant. Also lets the same binary load the DirectML DLL.
 [target.'cfg(windows)'.dependencies]
 ort = { version = "=2.0.0-rc.11", features = ["ndarray", "half", "load-dynamic"] }
-ndarray = "0.17.2"
-half = "2"
