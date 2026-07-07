@@ -1178,8 +1178,7 @@ impl LlamaServer {
         }
         self.cleaned_up = true;
 
-        let pid = self.child.id() as i32;
-        let _ = send_signal(pid, libc::SIGTERM);
+        graceful_terminate(&mut self.child);
 
         let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
         loop {
@@ -1251,6 +1250,7 @@ fn update_peak(peak: &AtomicU64, sample: u64) {
     }
 }
 
+#[cfg(unix)]
 fn sample_rss_bytes(pid: u32) -> Option<u64> {
     let output = Command::new("ps")
         .args(["-o", "rss=", "-p", &pid.to_string()])
@@ -1266,14 +1266,31 @@ fn sample_rss_bytes(pid: u32) -> Option<u64> {
     Some(rss_kib.saturating_mul(1024))
 }
 
-fn send_signal(pid: i32, signal: i32) -> Result<()> {
-    let rc = unsafe { libc::kill(pid, signal) };
-    if rc == 0 {
-        return Ok(());
+/// Windows: working-set size via tasklist CSV ("123,456 K" in the 5th column).
+#[cfg(windows)]
+fn sample_rss_bytes(pid: u32) -> Option<u64> {
+    let output = Command::new("tasklist")
+        .args(["/NH", "/FO", "CSV", "/FI", &format!("PID eq {pid}")])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
     }
-    let err = std::io::Error::last_os_error();
-    if err.raw_os_error() == Some(libc::ESRCH) {
-        return Ok(());
-    }
-    Err(err).with_context(|| format!("send signal {signal} to pid {pid}"))
+    let line = String::from_utf8_lossy(&output.stdout);
+    let mem_field = line.trim().rsplit("\",\"").next()?;
+    let digits: String = mem_field.chars().filter(|c: &char| c.is_ascii_digit()).collect();
+    let kib: u64 = digits.parse().ok()?;
+    Some(kib.saturating_mul(1024))
 }
+
+/// Ask the child to exit gracefully. On unix that is SIGTERM (llama-server
+/// flushes and exits); Windows has no SIGTERM equivalent, so the timeout +
+/// force-kill loop in cleanup() is the whole story there.
+#[cfg(unix)]
+fn graceful_terminate(child: &mut std::process::Child) {
+    let rc = unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let _ = rc;
+}
+
+#[cfg(windows)]
+fn graceful_terminate(_child: &mut std::process::Child) {}

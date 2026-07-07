@@ -15,4 +15,6 @@ clap = { workspace = true }
 tokenizers = { workspace = true }
 reqwest = { workspace = true }
 synapse-bench = { path = "../../harness" }
+
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
