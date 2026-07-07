@@ -181,3 +181,14 @@ engine layer is MLX or llama.cpp-Metal; everything above it is packaging. This
 narrows decision #1 to: whose packaging — theirs (Python stacks we can't ship to
 end users) or ours (Rust module + mlx-rs/llama-server lanes, both parity-proven
 in our bench).
+
+## Rerank smoke dataset
+
+- `bench/data/rerank-smoke-v1.jsonl` is a deterministic smoke/latency set: 50 requests,
+  20 documents per request, 10 planted-relevance topics repeated 5 times with rotated
+  distractors.
+- The first document in each request is the known relevant chunk; the remaining 19 are
+  distractors. The cheap smoke sanity check uses that planted first-document convention.
+- This checkout does not contain `bench/data/corpus-smoke.jsonl`, so the rerank smoke set
+  was hand-built from committed bench source snippets instead of a missing corpus export.
+  Each document string keeps its source file and line range in the text for traceability.

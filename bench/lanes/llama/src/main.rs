@@ -4,6 +4,7 @@
 //! Subcommands:
 //! - `embed`: workload A, batched embeddings over a JSONL corpus.
 //! - `microllm`: workload B, single-turn intent classification prompts.
+//! - `rerank`: workload C, sequential cross-encoder reranking via /v1/rerank.
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -19,6 +20,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, ensure, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use reqwest::blocking::Client;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use synapse_bench::{
@@ -35,6 +37,8 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const RSS_SAMPLE_INTERVAL: Duration = Duration::from_millis(200);
 const EMBED_WARMUP_TEXT: &str = "warmup";
 const MICROLLM_WARMUP_PROMPT: &str = "Reply with exactly one word: warmup";
+const RERANK_WARMUP_QUERY: &str = "Which text is the warmup document?";
+const RERANK_WARMUP_DOCUMENTS: &[&str] = &["warmup", "cooldown"];
 const VALID_LABELS: &[&str] = &["config", "test", "logic", "io", "types", "docs"];
 
 #[derive(Parser)]
@@ -50,6 +54,8 @@ enum LaneCommand {
     Embed(EmbedArgs),
     /// Workload B: run one-shot micro-LLM prompts through chat completions.
     Microllm(MicrollmArgs),
+    /// Workload C: rerank query/document sets through llama-server's rerank API.
+    Rerank(RerankArgs),
 }
 
 #[derive(Args)]
@@ -151,10 +157,66 @@ struct MicrollmArgs {
     parallel: usize,
 }
 
+#[derive(Args)]
+struct RerankArgs {
+    /// Path to the reranker GGUF model.
+    #[arg(long)]
+    model: PathBuf,
+    /// Path to tokenizer.json used for input token accounting.
+    #[arg(long)]
+    tokenizer: PathBuf,
+    /// Query JSONL ({id, query, documents} per line).
+    #[arg(long)]
+    queries: PathBuf,
+    /// Output LaneResult JSON path.
+    #[arg(long)]
+    out: PathBuf,
+    /// Optional: write raw rerank scores (JSONL: {id, scores}) in document order.
+    #[arg(long)]
+    scores_out: Option<PathBuf>,
+    /// Model label for the result.
+    #[arg(long)]
+    model_label: String,
+    /// Path to the llama-server binary.
+    #[arg(long, default_value = DEFAULT_SERVER_BINARY)]
+    server_binary: PathBuf,
+    /// Optional top-N limit for server-side truncation. Defaults to all documents.
+    #[arg(long)]
+    top_n: Option<usize>,
+    /// Context window passed to llama-server.
+    #[arg(long, default_value_t = 8192)]
+    ctx_size: usize,
+    /// Logical batch-size token budget for llama-server.
+    #[arg(long, default_value_t = 1024)]
+    batch_size: usize,
+    /// Physical batch-size token budget for llama-server.
+    #[arg(long, default_value_t = 512)]
+    ubatch_size: usize,
+    /// Number of layers to place on the GPU.
+    #[arg(long, default_value_t = 99)]
+    gpu_layers: usize,
+    /// Number of server slots.
+    #[arg(long, default_value_t = 1)]
+    parallel: usize,
+}
+
 #[derive(Debug)]
 struct ProducedVector {
     id: String,
     vec: Vec<f32>,
+}
+
+#[derive(Debug)]
+struct ProducedScores {
+    id: String,
+    scores: Vec<Option<f64>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RerankQueryRow {
+    id: String,
+    query: String,
+    documents: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -194,6 +256,27 @@ struct ChatCompletionResponse {
     choices: Vec<ChatChoice>,
     usage: Option<Usage>,
     timings: Option<Timings>,
+}
+
+#[derive(Debug, Serialize)]
+struct RerankRequest<'a> {
+    model: &'a str,
+    query: &'a str,
+    documents: &'a [&'a str],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_n: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RerankResponse {
+    results: Vec<RerankResult>,
+    usage: Option<Usage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RerankResult {
+    index: usize,
+    relevance_score: f64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -248,6 +331,7 @@ struct LlamaServer {
 enum WarmupKind {
     Embed,
     Chat,
+    Rerank,
 }
 
 fn main() -> Result<()> {
@@ -255,6 +339,7 @@ fn main() -> Result<()> {
     match cli.command {
         LaneCommand::Embed(args) => run_embed(args),
         LaneCommand::Microllm(args) => run_microllm(args),
+        LaneCommand::Rerank(args) => run_rerank(args),
     }
 }
 
@@ -558,6 +643,146 @@ fn run_microllm(args: MicrollmArgs) -> Result<()> {
     Ok(())
 }
 
+fn run_rerank(args: RerankArgs) -> Result<()> {
+    if let Some(top_n) = args.top_n {
+        ensure!(top_n > 0, "top-n must be > 0");
+    }
+
+    let tokenizer = load_tokenizer(&args.tokenizer, args.ctx_size)?;
+    let queries: Vec<RerankQueryRow> = load_jsonl(&args.queries)?;
+    ensure!(
+        !queries.is_empty(),
+        "empty rerank query set: {}",
+        args.queries.display()
+    );
+
+    let server_args = vec![
+        "--rerank".to_string(),
+        "--ctx-size".to_string(),
+        args.ctx_size.to_string(),
+        "--batch-size".to_string(),
+        args.batch_size.to_string(),
+        "--ubatch-size".to_string(),
+        args.ubatch_size.to_string(),
+        "-ngl".to_string(),
+        args.gpu_layers.to_string(),
+        "--parallel".to_string(),
+        args.parallel.to_string(),
+    ];
+
+    let client = build_http_client()?;
+    let started = Instant::now();
+    let mut server = LlamaServer::spawn(&args.server_binary, &args.model, &server_args)?;
+    wait_for_health_and_warmup(&client, &mut server, WarmupKind::Rerank)?;
+    let cold_load_s = started.elapsed().as_secs_f64();
+
+    let infer_started = Instant::now();
+    let mut input_tokens = 0u64;
+    let mut prompt_tokens_reported = 0u64;
+    let mut latencies_ms = Vec::with_capacity(queries.len());
+    let mut produced_scores = Vec::with_capacity(queries.len());
+
+    for row in &queries {
+        ensure!(
+            !row.documents.is_empty(),
+            "rerank request {} has no documents",
+            row.id
+        );
+
+        let query_tokens = count_tokens(&tokenizer, &row.query)?;
+        let mut max_pair_tokens = query_tokens;
+        input_tokens += query_tokens as u64;
+
+        for document in &row.documents {
+            let document_tokens = count_tokens(&tokenizer, document)?;
+            input_tokens += document_tokens as u64;
+            max_pair_tokens = max_pair_tokens.max(query_tokens.saturating_add(document_tokens));
+        }
+        ensure!(
+            max_pair_tokens <= args.ctx_size,
+            "rerank request {} needs {} query+document tokens, exceeds ctx-size {}",
+            row.id,
+            max_pair_tokens,
+            args.ctx_size
+        );
+
+        let documents: Vec<&str> = row.documents.iter().map(String::as_str).collect();
+        let request_started = Instant::now();
+        let response = request_rerank(
+            &client,
+            &server.base_url,
+            &row.query,
+            &documents,
+            args.top_n,
+        )?;
+        latencies_ms.push(request_started.elapsed().as_secs_f64() * 1000.0);
+        prompt_tokens_reported += response
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.prompt_tokens)
+            .unwrap_or(0);
+        let scores = rerank_scores_in_document_order(
+            row.id.as_str(),
+            row.documents.len(),
+            args.top_n,
+            &response.results,
+        )?;
+        produced_scores.push(ProducedScores {
+            id: row.id.clone(),
+            scores,
+        });
+    }
+    let infer_wall_s = infer_started.elapsed().as_secs_f64();
+
+    if let Some(path) = &args.scores_out {
+        write_scores(path, &produced_scores)?;
+    }
+
+    server.shutdown()?;
+    let peak_rss = server.peak_rss_bytes();
+
+    let latency_summary = summarize_latencies_ms(&latencies_ms)
+        .context("rerank latency summary requires at least one request")?;
+    let notes = format!(
+        "endpoint=/v1/rerank; request_shape=query+documents_strings; response_shape=results[index,relevance_score]; cold_load=health+warmup_request; token_counting=client_tokenizer(query_plus_all_docs); server_prompt_tokens={}; top_n={}; latency_p50_ms={:.1}; latency_p95_ms={:.1}; latency_max_ms={:.1}; ctx_size={}; batch_size={}; ubatch_size={}; ngl={}; parallel={}",
+        prompt_tokens_reported,
+        format_top_n(args.top_n),
+        latency_summary.p50_ms,
+        latency_summary.p95_ms,
+        latency_summary.max_ms,
+        args.ctx_size,
+        args.batch_size,
+        args.ubatch_size,
+        args.gpu_layers,
+        args.parallel
+    );
+
+    let result = LaneResult {
+        lane: "llama-metal-rerank".into(),
+        workload: "rerank-queries-v1".into(),
+        model: args.model_label,
+        cold_load_s,
+        infer_wall_s,
+        input_tokens,
+        tok_per_s: rate(input_tokens as f64, infer_wall_s),
+        items: produced_scores.len() as u64,
+        parity_mean_cosine: None,
+        self_peak_rss_bytes: Some(peak_rss),
+        notes,
+    };
+    write_result(&args.out, &result)?;
+    eprintln!(
+        "llama-metal-rerank: {} items, {} counted tokens, {:.1} tok/s, cold_load {:.1}s, infer {:.1}s, p50 {:.1} ms",
+        result.items,
+        result.input_tokens,
+        result.tok_per_s,
+        result.cold_load_s,
+        result.infer_wall_s,
+        latency_summary.p50_ms
+    );
+    Ok(())
+}
+
 fn load_tokenizer(path: &Path, max_length: usize) -> Result<Tokenizer> {
     let mut tokenizer =
         Tokenizer::from_file(path).map_err(|err| anyhow::anyhow!("tokenizer: {err}"))?;
@@ -570,6 +795,13 @@ fn load_tokenizer(path: &Path, max_length: usize) -> Result<Tokenizer> {
     Ok(tokenizer)
 }
 
+fn count_tokens(tokenizer: &Tokenizer, text: &str) -> Result<usize> {
+    let encoding = tokenizer
+        .encode(text, false)
+        .map_err(|err| anyhow::anyhow!("tokenizer encode: {err}"))?;
+    Ok(encoding.get_ids().len())
+}
+
 fn build_http_client() -> Result<Client> {
     Client::builder()
         .connect_timeout(Duration::from_secs(1))
@@ -579,18 +811,17 @@ fn build_http_client() -> Result<Client> {
 }
 
 fn request_embeddings(client: &Client, base_url: &str, inputs: &[&str]) -> Result<Vec<Vec<f32>>> {
-    let response: EmbeddingsResponse = client
-        .post(format!("{base_url}/v1/embeddings"))
-        .json(&EmbeddingsRequest {
-            model: "llama-server",
-            input: inputs,
-        })
-        .send()
-        .context("POST /v1/embeddings")?
-        .error_for_status()
-        .context("/v1/embeddings returned error status")?
-        .json()
-        .context("decode /v1/embeddings response")?;
+    let response: EmbeddingsResponse = read_json_response(
+        client
+            .post(format!("{base_url}/v1/embeddings"))
+            .json(&EmbeddingsRequest {
+                model: "llama-server",
+                input: inputs,
+            })
+            .send()
+            .context("POST /v1/embeddings")?,
+        "/v1/embeddings",
+    )?;
 
     let mut data = response.data;
     data.sort_by_key(|datum| datum.index);
@@ -605,24 +836,61 @@ fn request_chat_completion(
 ) -> Result<ChatCompletionResponse> {
     // Prefer template kwargs over a prompt prefix so the benchmark keeps the workload text
     // unchanged while still disabling Qwen3 thinking mode on this llama-server build.
-    client
-        .post(format!("{base_url}/v1/chat/completions"))
-        .json(&ChatCompletionRequest {
-            model: "llama-server",
-            messages: [ChatMessage {
-                role: "user",
-                content: prompt,
-            }],
-            temperature: 0.0,
-            max_tokens,
-            chat_template_kwargs: json!({ "enable_thinking": false }),
-        })
-        .send()
-        .context("POST /v1/chat/completions")?
-        .error_for_status()
-        .context("/v1/chat/completions returned error status")?
-        .json()
-        .context("decode /v1/chat/completions response")
+    read_json_response(
+        client
+            .post(format!("{base_url}/v1/chat/completions"))
+            .json(&ChatCompletionRequest {
+                model: "llama-server",
+                messages: [ChatMessage {
+                    role: "user",
+                    content: prompt,
+                }],
+                temperature: 0.0,
+                max_tokens,
+                chat_template_kwargs: json!({ "enable_thinking": false }),
+            })
+            .send()
+            .context("POST /v1/chat/completions")?,
+        "/v1/chat/completions",
+    )
+}
+
+fn request_rerank(
+    client: &Client,
+    base_url: &str,
+    query: &str,
+    documents: &[&str],
+    top_n: Option<usize>,
+) -> Result<RerankResponse> {
+    read_json_response(
+        client
+            .post(format!("{base_url}/v1/rerank"))
+            .json(&RerankRequest {
+                model: "llama-server",
+                query,
+                documents,
+                top_n,
+            })
+            .send()
+            .context("POST /v1/rerank")?,
+        "/v1/rerank",
+    )
+}
+
+fn read_json_response<T: DeserializeOwned>(
+    response: reqwest::blocking::Response,
+    endpoint: &str,
+) -> Result<T> {
+    let status = response.status();
+    let body = response
+        .text()
+        .with_context(|| format!("read {endpoint} response body"))?;
+    ensure!(
+        status.is_success(),
+        "{endpoint} returned error status {status}: {}",
+        format_nonempty_body(&body)
+    );
+    serde_json::from_str(&body).with_context(|| format!("decode {endpoint} response"))
 }
 
 fn wait_for_health_and_warmup(
@@ -650,6 +918,14 @@ fn wait_for_health_and_warmup(
                         request_chat_completion(client, &server.base_url, MICROLLM_WARMUP_PROMPT, 1)
                             .map(|_| ())
                     }
+                    WarmupKind::Rerank => request_rerank(
+                        client,
+                        &server.base_url,
+                        RERANK_WARMUP_QUERY,
+                        RERANK_WARMUP_DOCUMENTS,
+                        None,
+                    )
+                    .map(|_| ()),
                 };
                 if warmup.is_ok() {
                     return Ok(());
@@ -686,6 +962,99 @@ fn write_vectors(path: &Path, vectors: &[ProducedVector]) -> Result<()> {
         writer.write_all(b"\n")?;
     }
     writer.flush().context("flush vectors writer")
+}
+
+fn write_scores(path: &Path, scores: &[ProducedScores]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create score parent {}", parent.display()))?;
+    }
+    let file = File::create(path).with_context(|| format!("create {}", path.display()))?;
+    let mut writer = BufWriter::new(file);
+    for row in scores {
+        // Keep positions aligned to the original document list. When top_n truncates the
+        // server response, omitted documents stay as null instead of shifting indices.
+        serde_json::to_writer(
+            &mut writer,
+            &json!({ "id": &row.id, "scores": &row.scores }),
+        )?;
+        writer.write_all(b"\n")?;
+    }
+    writer.flush().context("flush scores writer")
+}
+
+fn rerank_scores_in_document_order(
+    request_id: &str,
+    document_count: usize,
+    top_n: Option<usize>,
+    results: &[RerankResult],
+) -> Result<Vec<Option<f64>>> {
+    let mut scores = vec![None; document_count];
+    for result in results {
+        ensure!(
+            result.index < document_count,
+            "rerank request {request_id} returned out-of-range index {} for {} documents",
+            result.index,
+            document_count
+        );
+        ensure!(
+            scores[result.index].is_none(),
+            "rerank request {request_id} returned duplicate index {}",
+            result.index
+        );
+        scores[result.index] = Some(result.relevance_score);
+    }
+
+    if top_n.is_none() {
+        ensure!(
+            scores.iter().all(Option::is_some),
+            "rerank request {request_id} omitted scores even though top_n=all"
+        );
+    }
+
+    Ok(scores)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LatencySummary {
+    p50_ms: f64,
+    p95_ms: f64,
+    max_ms: f64,
+}
+
+fn summarize_latencies_ms(latencies_ms: &[f64]) -> Option<LatencySummary> {
+    if latencies_ms.is_empty() {
+        return None;
+    }
+    let mut sorted = latencies_ms.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    Some(LatencySummary {
+        p50_ms: percentile(&sorted, 0.50),
+        p95_ms: percentile(&sorted, 0.95),
+        max_ms: *sorted.last().expect("non-empty after guard"),
+    })
+}
+
+fn percentile(sorted: &[f64], p: f64) -> f64 {
+    let index = ((sorted.len() as f64 * p).ceil() as usize)
+        .saturating_sub(1)
+        .min(sorted.len() - 1);
+    sorted[index]
+}
+
+fn format_top_n(top_n: Option<usize>) -> String {
+    top_n
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "all".to_string())
+}
+
+fn format_nonempty_body(body: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        "<empty body>".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn normalize_label(output: &str) -> Option<&'static str> {
