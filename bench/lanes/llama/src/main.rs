@@ -694,21 +694,11 @@ fn run_rerank(args: RerankArgs) -> Result<()> {
         );
 
         let query_tokens = count_tokens(&tokenizer, &row.query)?;
-        let mut max_pair_tokens = query_tokens;
-        input_tokens += query_tokens as u64;
+        let mut estimated_prompt_tokens = query_tokens as u64;
 
         for document in &row.documents {
-            let document_tokens = count_tokens(&tokenizer, document)?;
-            input_tokens += document_tokens as u64;
-            max_pair_tokens = max_pair_tokens.max(query_tokens.saturating_add(document_tokens));
+            estimated_prompt_tokens += count_tokens(&tokenizer, document)? as u64;
         }
-        ensure!(
-            max_pair_tokens <= args.ctx_size,
-            "rerank request {} needs {} query+document tokens, exceeds ctx-size {}",
-            row.id,
-            max_pair_tokens,
-            args.ctx_size
-        );
 
         let documents: Vec<&str> = row.documents.iter().map(String::as_str).collect();
         let request_started = Instant::now();
@@ -720,11 +710,14 @@ fn run_rerank(args: RerankArgs) -> Result<()> {
             args.top_n,
         )?;
         latencies_ms.push(request_started.elapsed().as_secs_f64() * 1000.0);
-        prompt_tokens_reported += response
+        // Prefer the server's token count here because rerank models truncate
+        // each query+document pair together, not as two independent strings.
+        let server_prompt_tokens = response
             .usage
             .as_ref()
-            .and_then(|usage| usage.prompt_tokens)
-            .unwrap_or(0);
+            .and_then(|usage| usage.prompt_tokens);
+        input_tokens += server_prompt_tokens.unwrap_or(estimated_prompt_tokens);
+        prompt_tokens_reported += server_prompt_tokens.unwrap_or(0);
         let scores = rerank_scores_in_document_order(
             row.id.as_str(),
             row.documents.len(),
@@ -748,7 +741,7 @@ fn run_rerank(args: RerankArgs) -> Result<()> {
     let latency_summary = summarize_latencies_ms(&latencies_ms)
         .context("rerank latency summary requires at least one request")?;
     let notes = format!(
-        "endpoint=/v1/rerank; request_shape=query+documents_strings; response_shape=results[index,relevance_score]; cold_load=health+warmup_request; token_counting=client_tokenizer(query_plus_all_docs); server_prompt_tokens={}; top_n={}; latency_p50_ms={:.1}; latency_p95_ms={:.1}; latency_max_ms={:.1}; ctx_size={}; batch_size={}; ubatch_size={}; ngl={}; parallel={}",
+        "endpoint=/v1/rerank; request_shape=query+documents_strings; response_shape=results[index,relevance_score]; cold_load=health+warmup_request; token_counting=server_prompt_tokens_or_client_sum_fallback; server_prompt_tokens={}; top_n={}; latency_p50_ms={:.1}; latency_p95_ms={:.1}; latency_max_ms={:.1}; ctx_size={}; batch_size={}; ubatch_size={}; ngl={}; parallel={}",
         prompt_tokens_reported,
         format_top_n(args.top_n),
         latency_summary.p50_ms,
