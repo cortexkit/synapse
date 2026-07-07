@@ -10,6 +10,12 @@ dependencies = [
   "pytrec-eval-terrier==0.5.6",
 ]
 
+[dependency-groups]
+reference = [
+  "torch==2.7.1",
+  "transformers==4.53.3",
+]
+
 [tool.uv]
 package = false
 

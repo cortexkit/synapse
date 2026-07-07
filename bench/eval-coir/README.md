@@ -10,7 +10,15 @@ This project is managed with `uv` and expects Python 3.12.
 uv sync
 ```
 
+The optional Python reference reranker uses a separate dependency group so the default harness environment stays lean.
+
+```bash
+uv sync --group reference
+```
+
 ## 1. Prepare the CoIR task files
+
+### cosqa
 
 ```bash
 uv run prepare.py --task cosqa --out-dir work/cosqa
@@ -21,6 +29,14 @@ That command downloads the public `CoIR-Retrieval/cosqa` dataset from Hugging Fa
 - `work/cosqa/corpus.jsonl`
 - `work/cosqa/queries.jsonl`
 - `work/cosqa/qrels.tsv`
+
+### csn-python
+
+```bash
+uv run prepare.py --task csn-python --out-dir work/csn-python --max-queries 2000
+```
+
+That command downloads the Python slice of `CoIR-Retrieval/CodeSearchNet`, keeps the full corpus, and optionally keeps only the first `N` sorted test-query ids plus matching qrels.
 
 The JSONL files use the lane schema:
 
@@ -86,6 +102,25 @@ Example report:
 
 ```json
 {"mrr_at_10":0.0,"n_corpus":20604,"n_queries":500,"ndcg_at_10":0.0,"recall_at_10":0.0,"task":"cosqa"}
+```
+
+## 4. Reference rerank cross-checks
+
+Score rerank requests with the Hugging Face reference `Alibaba-NLP/gte-reranker-modernbert-base` implementation:
+
+```bash
+uv run --group reference reference_rerank.py \
+  --requests work/cosqa/rerank-requests-subset.jsonl \
+  --out work/cosqa/reference-scores-subset.jsonl
+```
+
+Compare two rerank score files on the same request subset:
+
+```bash
+uv run compare_rerank_scores.py \
+  --reference-scores work/cosqa/reference-scores-subset.jsonl \
+  --candidate-scores work/cosqa/llama-scores-subset.jsonl \
+  --requests work/cosqa/rerank-requests-subset.jsonl
 ```
 
 ## Tests

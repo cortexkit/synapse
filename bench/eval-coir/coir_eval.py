@@ -12,7 +12,9 @@ import pytrec_eval  # pyright: ignore[reportMissingImports]
 from datasets import load_dataset
 
 COSQA_DATASET = "CoIR-Retrieval/cosqa"
+CODESEARCHNET_DATASET = "CoIR-Retrieval/CodeSearchNet"
 DEFAULT_K = 10
+MAX_SCORE_MATRIX_BYTES = 256 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -27,20 +29,65 @@ class VectorTable:
     matrix: np.ndarray
 
 
-def prepare_cosqa(out_dir: Path) -> dict[str, int]:
-    corpus_ds = load_dataset(COSQA_DATASET, name="corpus", split="corpus")
-    queries_ds = load_dataset(COSQA_DATASET, name="queries", split="queries")
-    qrels_ds = load_dataset(COSQA_DATASET, split="test")
+@dataclass(frozen=True)
+class DatasetSpec:
+    dataset: str
+    corpus_name: str | None
+    corpus_split: str
+    queries_name: str | None
+    queries_split: str
+    query_partition: str | None
+    qrels_name: str | None
+    qrels_split: str
 
-    corpus_rows = sorted(
-        (text_row_from_record(record) for record in corpus_ds),
-        key=lambda row: row.id,
-    )
+
+COSQA_SPEC = DatasetSpec(
+    dataset=COSQA_DATASET,
+    corpus_name="corpus",
+    corpus_split="corpus",
+    queries_name="queries",
+    queries_split="queries",
+    query_partition="test",
+    qrels_name=None,
+    qrels_split="test",
+)
+
+CSN_PYTHON_SPEC = DatasetSpec(
+    dataset=CODESEARCHNET_DATASET,
+    corpus_name="python-corpus",
+    corpus_split="corpus",
+    queries_name="python-queries",
+    queries_split="queries",
+    query_partition="test",
+    qrels_name="python-qrels",
+    qrels_split="test",
+)
+
+
+def prepare_cosqa(out_dir: Path, max_queries: int | None = None) -> dict[str, int]:
+    return prepare_text_retrieval_task(COSQA_SPEC, out_dir, max_queries=max_queries)
+
+
+def prepare_csn_python(out_dir: Path, max_queries: int | None = None) -> dict[str, int]:
+    return prepare_text_retrieval_task(CSN_PYTHON_SPEC, out_dir, max_queries=max_queries)
+
+
+def prepare_text_retrieval_task(
+    spec: DatasetSpec,
+    out_dir: Path,
+    *,
+    max_queries: int | None = None,
+) -> dict[str, int]:
+    corpus_ds = load_dataset_split(spec.dataset, spec.corpus_name, spec.corpus_split)
+    queries_ds = load_dataset_split(spec.dataset, spec.queries_name, spec.queries_split)
+    qrels_ds = load_dataset_split(spec.dataset, spec.qrels_name, spec.qrels_split)
+
+    corpus_rows = sorted((text_row_from_record(record) for record in corpus_ds), key=lambda row: row.id)
     query_rows = sorted(
         (
             text_row_from_record(record)
             for record in queries_ds
-            if record_value(record, "partition") == "test"
+            if spec.query_partition is None or record_value(record, "partition") == spec.query_partition
         ),
         key=lambda row: row.id,
     )
@@ -49,6 +96,49 @@ def prepare_cosqa(out_dir: Path) -> dict[str, int]:
         key=lambda row: (row[0], row[1], row[2]),
     )
 
+    query_rows, qrels_rows = limit_queries(query_rows, qrels_rows, max_queries=max_queries)
+    validate_task_rows(corpus_rows, query_rows, qrels_rows)
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    write_text_jsonl(out_dir / "corpus.jsonl", corpus_rows)
+    write_text_jsonl(out_dir / "queries.jsonl", query_rows)
+    write_qrels_tsv(out_dir / "qrels.tsv", qrels_rows)
+
+    return {
+        "n_corpus": len(corpus_rows),
+        "n_queries": len(query_rows),
+        "n_qrels": len(qrels_rows),
+    }
+
+
+def load_dataset_split(dataset: str, config_name: str | None, split: str) -> Iterable[object]:
+    if config_name is None:
+        return load_dataset(dataset, split=split)
+    return load_dataset(dataset, name=config_name, split=split)
+
+
+def limit_queries(
+    query_rows: list[TextRow],
+    qrels_rows: list[tuple[str, str, int]],
+    *,
+    max_queries: int | None,
+) -> tuple[list[TextRow], list[tuple[str, str, int]]]:
+    if max_queries is None or max_queries >= len(query_rows):
+        return query_rows, qrels_rows
+    if max_queries <= 0:
+        raise ValueError("max_queries must be positive")
+
+    limited_query_rows = query_rows[:max_queries]
+    limited_query_ids = {row.id for row in limited_query_rows}
+    limited_qrels_rows = [row for row in qrels_rows if row[0] in limited_query_ids]
+    return limited_query_rows, limited_qrels_rows
+
+
+def validate_task_rows(
+    corpus_rows: list[TextRow],
+    query_rows: list[TextRow],
+    qrels_rows: list[tuple[str, str, int]],
+) -> None:
     query_ids = {row.id for row in query_rows}
     qrel_query_ids = {query_id for query_id, _, _ in qrels_rows}
     if query_ids != qrel_query_ids:
@@ -67,17 +157,6 @@ def prepare_cosqa(out_dir: Path) -> dict[str, int]:
         raise ValueError(
             f"qrels reference corpus ids that are missing from the corpus split: {missing_docs[:5]}"
         )
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-    write_text_jsonl(out_dir / "corpus.jsonl", corpus_rows)
-    write_text_jsonl(out_dir / "queries.jsonl", query_rows)
-    write_qrels_tsv(out_dir / "qrels.tsv", qrels_rows)
-
-    return {
-        "n_corpus": len(corpus_rows),
-        "n_queries": len(query_rows),
-        "n_qrels": len(qrels_rows),
-    }
 
 
 def text_row_from_record(record: object) -> TextRow:
@@ -262,18 +341,28 @@ def score_task(
 def brute_force_search(
     *, corpus_vectors: VectorTable, query_vectors: VectorTable, k: int
 ) -> tuple[dict[str, dict[str, float]], dict[str, list[str]]]:
-    score_matrix = query_vectors.matrix @ corpus_vectors.matrix.T
+    query_batch_size = score_batch_size(n_corpus=len(corpus_vectors.ids))
     run: dict[str, dict[str, float]] = {}
     ranked_doc_ids: dict[str, list[str]] = {}
 
-    for row_index, query_id in enumerate(query_vectors.ids):
-        row_scores = score_matrix[row_index]
-        top_indices = np.argsort(-row_scores, kind="stable")[: min(k, len(corpus_vectors.ids))]
-        ranked_ids = [corpus_vectors.ids[index] for index in top_indices]
-        ranked_doc_ids[query_id] = ranked_ids
-        run[query_id] = {corpus_vectors.ids[index]: float(row_scores[index]) for index in top_indices}
+    for batch_start in range(0, len(query_vectors.ids), query_batch_size):
+        batch_end = min(batch_start + query_batch_size, len(query_vectors.ids))
+        batch_scores = query_vectors.matrix[batch_start:batch_end] @ corpus_vectors.matrix.T
+        for local_index, query_id in enumerate(query_vectors.ids[batch_start:batch_end]):
+            row_scores = batch_scores[local_index]
+            top_indices = np.argsort(-row_scores, kind="stable")[: min(k, len(corpus_vectors.ids))]
+            ranked_ids = [corpus_vectors.ids[index] for index in top_indices]
+            ranked_doc_ids[query_id] = ranked_ids
+            run[query_id] = {corpus_vectors.ids[index]: float(row_scores[index]) for index in top_indices}
 
     return run, ranked_doc_ids
+
+
+def score_batch_size(n_corpus: int) -> int:
+    if n_corpus <= 0:
+        raise ValueError("n_corpus must be positive")
+    bytes_per_query = max(n_corpus, 1) * np.dtype(np.float32).itemsize
+    return max(1, MAX_SCORE_MATRIX_BYTES // bytes_per_query)
 
 
 def evaluate_run(
