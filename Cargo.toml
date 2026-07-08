@@ -11,7 +11,9 @@ members = [
     "bench/spikes/unified-rt",
     "bench/lanes/candle-embed",
     "crates/synapse-core",
+    "crates/synapse-engine-ort",
     "crates/synapse-module",
+    "crates/synapse-worker-llama",
 ]
 
 [workspace.package]
