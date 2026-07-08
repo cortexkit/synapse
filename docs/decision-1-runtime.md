@@ -1,7 +1,15 @@
 # Decision #1: Synapse's local inference engine strategy
 
-Status: DRAFT — measured numbers pending (idle-gated matrix on AFT's real corpus).
+Status: CONSOLIDATED (2026-07-08) — full cross-platform campaign measured; ready
+for the D-005 lock review (Ufuk + AFT + SUBC + Synapse).
 Decision owner: Ufuk. Reviewers: AFT-Alfonso (driving), SUBC-Alfonso (offered).
+
+Evidence base: 60+ idle-gated full-corpus lane runs across 4 hardware classes
+(M5 Max, M1 Max, RTX 3060, Ryzen Z1 Extreme), retrieval-quality evals on CoIR
+(cosqa + CSN-python), reranker cross-validation against a Python reference
+implementation, and source-grounded engine research. Raw artifacts under
+bench/results/ (local, gitignored): night-20260705, m1-night-20260707,
+ally-20260708, cuda3060-20260708.
 
 ## Question
 
@@ -32,11 +40,11 @@ lanes. Contaminated runs are registered and excluded.
 
 | Candidate | Handling | Outcome |
 |-----------|----------|---------|
-| raw ort (CPU, AFT policies) | measured (reference lane) | pending matrix |
-| mlx-rs (Metal, bf16) | measured | pending matrix |
-| llama.cpp (llama-server child, Metal) | measured | pending matrix |
-| burn (wgpu/Metal) | measured (embed only) | pending matrix |
-| LMStudio (wrap) | measured (workload A) | pending matrix |
+| raw ort (CPU, AFT policies) | measured (reference lane) | Apple CPU floor + ONNX/DirectML lane (loses to llama-CPU ~2x on x86) |
+| mlx-rs (Metal, bf16) | measured | Apple embed fast lane confirmed (M1: 2.6x llama-Metal on MiniLM); shipping form (mlx-rs vs sidecar) = the one open sub-decision |
+| llama.cpp (llama-server child) | measured on Metal, CUDA, Vulkan, CPU | general workhorse on every platform: micro-LLM, non-Apple GPU embed, rerank, x86 CPU floor |
+| burn (wgpu/Metal) | measured (embed only) | dispositioned: compile-time model binding, 7.6s Metal cold start (64.9k tok/s recorded for baked-in niche) |
+| LMStudio (wrap) | measured (workload A) | wrap class dispositioned: 1.8x slower than supervising the same engine directly; admission unfixable from outside |
 | Ollama (wrap) | not installed; LMStudio represents the wrap class; install+measure only if wrap survives on other grounds | dispositioned unless revived |
 | vllm | dispositioned by inspection, then CORRECTED and re-checked | core vllm: no in-tree Metal (macOS CPU-only), confirmed. Ecosystem: official out-of-tree vLLM-Metal plugin exists (alpha, MLX-backed, dev-wheel installs, Python 3.12 + source-built vllm core) — real but not shippable to end users; its own Rust frontend still spawns the Python engine. Remains relevant as a REMOTE endpoint users point us at |
 | vllm-mlx (waybarrios) | researched | independent MLX server, alpha, not the upstream path; self-reported strong numbers; Python-heavy — disposition for shipping |
@@ -44,7 +52,7 @@ lanes. Contaminated runs are registered and excluded.
 | oMLX | researched | strongest wrap-class option found (DMG/Homebrew service, OpenAI+Anthropic APIs, healthy project); still a ~750MB Python/MLX app — candidate optional EXTERNAL backend via the remote-endpoint lane, not a subprocess engine |
 | unsloth | dispositioned by inspection | training-first; its own serving delegates to llama-server + MLX — independent confirmation of the hybrid we're evaluating |
 | LFM2.5-230M (model, not runtime) | added to workload B | runs on llama-server b9580 out of the box; NOT runnable on the mlx-rs lane without hand-implementing its hybrid architecture — which is the mlx-rs finding restated |
-| ANE (CoreML-direct / Core AI) | deferred spike with written rationale | on-Mac LLM decode loses joules/token to GPU despite lower watts; wins are memory + always-on niches; revisit when STT/always-on lands. ORT-CoreML-EP dead end stands. |
+| ANE (CoreML-direct / Core AI) | surveyed 2026-07-08 (see ANE section) | REVERSED for encoders: fixed-bucket CoreML conversion runs BERT→Qwen3-0.6B-class encoders ~99.8% on ANE at ~2W. The old dead-end verdict was the ORT-CoreML-EP path only. Spike specified; quiet-tier engine candidate. |
 
 ## Integration findings (independent of measured speed)
 
@@ -205,11 +213,13 @@ grade):
 
 *probe subset skews long (158 vs 142 avg tokens); treat direction, not magnitude.
 
-Consequences pending the rev-2 clean rerun (script updated, run pending):
+Consequences (M5 rev-2 clean rerun demoted to opportunistic — the M1 clean
+run and cross-platform rows already settle every decision; M5 embed rows keep
+a probe-grade caveat until an idle window allows the rerun):
 - The "llama-server wins GPU embedding on every axis" conclusion does NOT
-  survive saturation fixes; MLX leads GPU embedding in both model classes in
-  the probes. The Recommendation section's engine assignment for embed will be
-  re-decided on rev-2 numbers.
+  survive saturation fixes; MLX leads GPU embedding in both model classes
+  (confirmed CLEAN on M1: 132.6k vs 51.8k MiniLM). The engine-assignment
+  section reflects this.
 - mlx-rs bf16 parity moved 0.99600 → 0.99626 under sorted batching: batch
   shape perturbs bf16 numerics. One more reason fingerprints must capture
   runtime config, not just model+quant.
@@ -229,44 +239,173 @@ quality comes from public data (MTEB/CoIR) + our own retrieval eval
 (bench/eval-coir, cosqa first, semble's 1,250-query code-search dataset as
 second column); intra-model QUANT quality from our parity+rank-overlap tooling.
 
-Qwen3-Embedding-0.6B quant ladder (400-chunk smoke vs fp32 reference, k=10;
+Qwen3-Embedding-0.6B quant ladder — quality (rank metrics from 400-chunk smoke
+vs fp32 reference, k=10; parity from the M1 full-corpus run, 15,271 chunks;
 first public quant-quality data for these embedders — none published anywhere):
 
-| quant | mean cosine | rank overlap | worst decile |
-|---|---|---|---|
-| Q8_0 (GGUF) | pending full run | | |
-| Q6_K (GGUF) | 0.9963 | 0.965 | 0.88 |
-| Q4_K_M (GGUF) | 0.9750 | 0.869 | 0.67 |
-| 4bit DWQ (MLX) | 0.9664 | 0.836 | 0.63 |
-| 8bit (MLX) | 0.8899 | 0.837 | 0.10 (min 0.0) |
+| quant | full-corpus cosine | rank overlap | worst decile | cosqa NDCG@10 |
+|---|---|---|---|---|
+| f16 (GGUF) | 1.00000 | — | — | 0.3487 |
+| Q8_0 (GGUF) | 0.99973 | — | — | — |
+| Q6_K (GGUF) | 0.99684 | 0.965 | 0.88 | 0.3486 |
+| Q4_K_M (GGUF) | 0.97761 | 0.869 | 0.67 | 0.339 |
+| 4bit DWQ (MLX) | 0.9671 | 0.829 | 0.58 | — |
+| 8bit (MLX) | 0.8899* | 0.837 | 0.10 (min 0.0) | — |
 
-- Q6_K is the quant sweet spot so far: 0.965 rank stability at ~60% of f16 size.
-- The MLX 8bit row is ANOMALOUS (8-bit scoring below 4-bit is not how
+The retrieval eval (cosqa) prices the ladder in NDCG: Q6_K is quality-FREE
+(0.3486 vs f16's 0.3487) at ~60% of f16 size; Q4_K_M costs ~3% NDCG. The
+rank-overlap and NDCG orderings agree — our cheap parity tooling predicts
+expensive retrieval-quality outcomes.
+
+- Q6_K is the quant sweet spot: 0.965 rank stability, NDCG-identical to f16.
+- *The MLX 8bit row is ANOMALOUS (8-bit scoring below 4-bit is not how
   quantization error works): suspected broken mlx-community upload or an
-  mlx-embeddings handling bug for that format. Under investigation — do not
-  cite as a real measurement.
-- ModernBERT-class candidates verified runnable cross-engine (200-chunk smokes,
-  ort fp32 vs llama GGUF): gte-modernbert-base 0.99997 (CLS pooling),
-  nomic-modernbert-embed 0.99931 (mean + search prefixes), jina-v5-nano
-  0.99999 (EuroBERT, last pooling; NOTE: produces 768-dim vectors on both
-  engines, not the 512 the repo docs suggest — consistent cross-engine, needs
-  pooling-config verification before quality claims).
-- Static class (Model2Vec): semble's own ablations put raw potion-code-16M at
-  NDCG 0.650 vs 0.765 for a 137M transformer — viable ONLY behind hybrid
-  retrieval (BM25 carries symbol queries), i.e. AFT-shaped consumers on very
-  constrained machines; disqualified for MC's pure vector search. Lane built;
-  speed/footprint numbers pending.
+  mlx-embeddings handling bug for that format. Reproduced on the M1 full
+  corpus — still under investigation, do not cite as a real measurement.
+- ModernBERT-class verified cross-engine on the M1 FULL corpus (ort fp32 vs
+  llama GGUF): gte-modernbert-base 1.00000 (CLS pooling),
+  nomic-modernbert-embed 0.99938 q8 (mean + search prefixes), jina-v5-nano
+  0.99999 (EuroBERT, last pooling, 768-dim on both engines).
 
-### Workload C (rerank) and retrieval-quality eval: in flight
+### Retrieval-quality screen (cosqa, NDCG@10; bench/eval-coir)
 
-Qwen3-Reranker-0.6B via llama-server /v1/rerank (lane in build). Latency per
-20-doc rerank request decides interactive-path vs background-only for AFT.
-Quality eval harness (bench/eval-coir) scores THE ARTIFACTS WE SHIP (lane
-vectors, per model x quant x engine) on public retrieval tasks — quant damage
-gets priced in nDCG, not just neighbor churn. Pipeline-vs-pipeline vs semble
-agreed with AFT (four columns: raw dense / naive hybrid / AFT full stack /
-semble published — if AFT signals don't clear naive hybrid on their
-distribution, that's the finding).
+| model | params | NDCG@10 | R@10 |
+|---|---|---|---|
+| gte-modernbert-base f16 | 149M | **0.360** | 0.630 |
+| Qwen3-Embedding-0.6B f16 | 595M | 0.3487 | 0.602 |
+| Qwen3-Embedding-0.6B Q6_K | 595M | 0.3486 | 0.606 |
+| Qwen3-Embedding-0.6B Q4_K_M | 595M | 0.339 | — |
+| all-MiniLM-L6-v2 fp32 | 22M | 0.284 | 0.498 |
+| potion-code-16M (static) | 16M | 0.185 | — |
+| jina-v5-nano | 199M | 0.142* | — |
+
+*jina number is a broken-config artifact (task-adapter/pooling suspected), not
+a model verdict — under investigation.
+
+- **gte-modernbert-base beats Qwen3-0.6B at a quarter of the size** — the
+  150M ModernBERT class is the quality/footprint sweet spot and the strongest
+  default-model candidate (also CPU-viable: see cross-platform table).
+- cosqa is a SMOKE screen only (single-qrel NL queries; see rerank section for
+  how it misled) — absolute values are noisy, ordering is directional. The
+  semble 1,250-query code-search dataset is the planned second column.
+- Static class (Model2Vec potion-code-16M): measured NDCG 0.185 vs MiniLM's
+  0.284 — 35% quality drop confirms semble's own ablations. Quality bar ruling
+  (Ufuk): standalone vector quality is the bar; hybrid-fusion rescue does not
+  qualify a default. Potion = explicit constrained-machine opt-in only. Speed
+  measured: ~2.7M tok/s CPU, 0.4s cold load, ~30MB — the extreme-frugality
+  point if ever needed.
+
+### Workload C: reranking (verified end-to-end)
+
+Measured via llama-server b9580 /v1/rerank, cross-validated against a Python
+transformers reference implementation, and quality-scored on CoIR (cosqa +
+CSN-python 2,000 queries / 280k-doc corpus).
+
+| reranker | params | cosqa delta | CSN-py delta (MiniLM / gte front-end) | p50 latency (50 docs) |
+|---|---|---|---|---|
+| gte-reranker-modernbert-base f16 | 149M | +0.051 | **+0.112 / +0.063** | 510-666ms (real code); 283ms (cosqa snippets) |
+| bge-reranker-v2-m3 | 568M | -0.028 | — | 567ms |
+| Qwen3-Reranker-0.6B | 595M | -0.224 | — | 304ms |
+
+Findings, in verification order:
+
+1. **The engine is faithful for ModernBERT-class rerankers**: llama.cpp scores
+   match the Python reference at Pearson 0.999992 over 2,500 pairs (tie-aware
+   top-1 agreement 1.0). Engine exonerated.
+2. **The Qwen3-Reranker path in llama.cpp b9580 is broken** (template/token
+   handling: known-relevant docs score ~e-11 vs distractors ~e-06). Parked;
+   watch llama.cpp PR #20009. Not a model verdict.
+3. **cosqa initially produced a false conclusion** ("reranking hurts strong
+   dense retrievers") that the reference implementation *reproduced* — it is a
+   dataset property (single-qrel NL queries penalize rerankers for surfacing
+   other relevant docs), not an engine or model property. On code-shaped CSN-python
+   the reranker helps BOTH front-ends monotonically: MiniLM 0.781→0.893,
+   gte 0.917→0.980. cosqa is hereby demoted to smoke-only.
+4. **gte-reranker-modernbert-base (149M, Apache-2.0, official ONNX) is the
+   working default reranker.** Caveat carried: gte's absolute CSN numbers are
+   likely training-contaminated — trust the deltas, not the absolutes.
+5. Latency scales with doc length (real code ~2x cosqa snippets); top-20
+   requests land ~250-350ms — rerank-on-by-default is justified for search
+   paths tolerating ~0.5s, background-only otherwise.
+
+Pending: ms-marco ORT floor (llama.cpp blocked on token_type_ids, PR #21729),
+Qwen3-Reranker-4B quality ceiling, semble dataset column, joint 4-column
+pipeline run with AFT (raw dense / naive hybrid / AFT stack / semble published).
+
+### Cross-platform campaign (2026-07-07/08): four hardware classes, one engine stack
+
+Same corpus, same llama.cpp build (b9580), same lane code everywhere.
+M1 Max = clean idle-gated macOS row (25 lanes, all contaminated=false).
+RTX 3060 (rented, $0.49 total) = consumer-CUDA row with per-GPU watts via
+nvidia-smi. ROG Ally X (Z1 Extreme, Zen4 + RDNA3 iGPU) = low-end Windows row.
+CPU rows on the 3060 box carry a shared-host caveat; its GPU rows are exclusive.
+
+**MiniLM-class embed (tok/s):**
+
+| path | M5 Max | M1 Max | RTX 3060 | Ally Z1E |
+|---|---|---|---|---|
+| best GPU | 355k probe* (MLX) | 132.6k (MLX) | 57.4k (CUDA, 76W) | 35.9k (Vulkan) |
+| llama GPU | 92.8k | 51.8k | 57.4k | 35.9k |
+| best CPU | 29.6k (ort) | 11.5k (ort) | 7.2k (llama) | 17.2k (llama) |
+
+**gte-modernbert-base (150M class):** M1 11.5k Metal / 1.1k ort-CPU; 3060
+18.7k CUDA (94W) / 0.9k CPU; Ally 6.7k Vulkan / 2.1k CPU. GPU-accelerated
+everywhere including the handheld iGPU; CPU-viable for indexing smaller corpora.
+
+**Qwen3-Embedding-0.6B:** M5 13.4k (MLX sorted) → M1 7.7k (MLX) → 3060 4.9k
+(CUDA, 98W) → Ally 1.6k (Vulkan q6k) → ~250-275 pure CPU (any platform).
+
+**Micro-LLM (Qwen3-0.6B q8, 100 one-shots):** label validity 97-98/100 on every
+platform. Combined tok/s: M5 12.1k → M1 5.2k → 3060 4.0k → Ally-Vulkan 2.0k →
+Ally-CPU 509 → 3060-CPU 232.
+
+Campaign findings that reshape the recommendation:
+
+1. **The 600M embed tier requires an accelerator.** Pure-CPU Qwen3-0.6B is
+   ~250 tok/s everywhere (a 15k-chunk corpus = ~100 minutes). CPU-only machines
+   cap at the 150M class — which the quality screen independently crowned.
+2. **"ort is the universal CPU floor" is Apple-only.** On Zen4/x86, llama-CPU
+   beats ort by ~2x (Ally: 17.2k vs 8.6k; 3060 box: 7.2k vs 4.0k). The floor
+   engine is per-platform: ort on Apple, llama.cpp on x86.
+3. **Vulkan on RDNA3 iGPUs is a real acceleration tier**: 2-4x over CPU on
+   every workload at parity 1.0 on a handheld gaming PC. llama.cpp's single
+   GGUF + multi-backend story (Metal/CUDA/Vulkan/CPU) covered every platform
+   we touched with zero lane-code changes.
+4. **Quant speed behavior is architecture-dependent**: q6k fastest on the
+   bandwidth-bound iGPU (beats f16 by 19%), all quants within 5% on the
+   compute-bound 3060, DWQ pays only on M5 (2.5x) and is 6x SLOWER than bf16
+   on M1. No global quant default is correct.
+5. **MLX-vs-llama.cpp flips by Apple Si generation** (M1: MLX 2.6x llama on
+   MiniLM; M5 probes: ~3.8x with tensor-accelerator asymmetry) — but MLX's
+   Qwen3 lead over llama-Metal on M1 is modest (7.7k vs 3.4k... 2.3x). Engine
+   choice per hardware requires measurement, not tables.
+6. **llama.cpp CUDA builds offload batch matmuls even at -ngl 0** (67W GPU
+   draw with zero layers "offloaded") — pure-CPU measurement on CUDA builds
+   requires CUDA_VISIBLE_DEVICES="". Recorded as a telemetry-hygiene trap.
+
+### ANE survey (2026-07-08): the quiet tier exists
+
+Source-grounded survey (ane-book, CoreML-LLM PR #169,
+smpanaro/ModernBERT-AppleNeuralEngine, Apple docs) REVERSES the inherited
+"CoreML dead end for embedders" verdict for the direct-CoreML path (the dead
+end was ORT-CoreML-EP specifically):
+
+- Encoders convert and run on ANE today: fixed-shape token buckets
+  (128/256/512) fp16, Linear→Conv2d(1x1) 4D layout, CPU_AND_NE; verified via
+  MLComputePlan placement + powermetrics ANE counters.
+- Proof points: Qwen3-0.6B-class encoder at ~99.8% ANE residency (100.6ms/doc
+  @512, M4 Max); ModernBERT-on-ANE at ~2.1W vs our GPU lanes' 14-62W.
+- Traps mapped: naive int8 collapses on these encoders (rotation/outlier
+  mitigation required); 8192-token buckets pass static placement but fail at
+  runtime (chunk-and-pool for long context); dynamic shapes fall off ANE
+  (bucket + GPU catch-all).
+- macOS 27 "Golden Gate" Core AI = compute-unit preference + tooling, no
+  direct ANE API — do not wait for it.
+- Quiet-tier ladder: MiniLM → ModernBERT-class → Qwen3-0.6B, all ~2W-class,
+  GPU catch-all for shapes that fall off ANE. Integration: Swift sidecar
+  serving .mlmodelc first (ane-book runtime pattern), objc2-core-ml native
+  path later. Spike specified (MiniLM 256/512 buckets; gates: cosine parity,
+  MLComputePlan NE placement, GPU-idle powermetrics; measure docs/s + J/doc).
 
 ### Workload B: micro-LLM one-shot classification, 100 prompts
 
@@ -294,40 +433,34 @@ anyway (subc supervision, machine-wide admission, credential integration, model
 lifecycle), and Python packaging is the part that fails our end-user constraints
 (install burden, interpreter footprint, cold start, energy).
 
-> **REVISION PENDING (2026-07-06):** the saturation audit above invalidates
-> the embed-workload engine assignments below — MLX leads GPU embedding in
-> post-fix probes (both model classes). The assignments stand as written for
-> micro-LLM and the CPU floor; the embed rows will be re-decided from the
-> rev-2 clean rerun before D-005 lock. Kept unedited meanwhile so the review
-> trail stays honest.
+### Engine assignments (final, campaign-informed)
 
-The measured matrix (above) answers the remaining question — which engine
-carries which workload. Engine assignments from the clean full-corpus run:
+**llama.cpp (supervised llama-server child) is the general workhorse on every
+platform.** One GGUF artifact, four backends measured (Metal/CUDA/Vulkan/CPU),
+runtime model loading, new architectures free from the GGUF ecosystem, parity
+1.00000 at f16, and the only engine that covered ALL our hardware rows with
+zero code changes. Carries: micro-LLM everywhere; embedding on every
+non-Apple GPU (CUDA/Vulkan); reranking (/v1/rerank, reference-faithful for
+ModernBERT-class); CPU floor on x86 (beats ort ~2x on Zen4).
 
-**llama.cpp (supervised llama-server child) is the primary local engine on
-Apple Silicon — for both workloads and both model classes.**
+**MLX is the Apple-Silicon embedding fast lane** (132.6k vs 51.8k MiniLM on
+M1; probes say the gap widens on M5 where llama.cpp's tensor-accelerator
+support lags). HOW we ship MLX remains the one open engine question:
+mlx-rs (hand-written forward passes, bf16 = distinct fingerprint at 0.996
+parity) vs a slim mlx-embeddings sidecar. The M5-vs-M1 flip and llama.cpp's
+closable tensor-accelerator gap both argue: keep the assignment PLUGGABLE and
+let the onboarding probe decide per machine.
 
-- MiniLM-class embed: 92.8k tok/s, parity 1.00000, 0.28s cold, 22W — best on
-  every axis simultaneously.
-- Qwen3-class embed: 7.7k tok/s at parity 1.00000. mlx-rs bf16 is 11% faster
-  (8.5k) but at 0.996 parity (distinct fingerprint) and it costs a hand-written
-  Rust forward pass per model family; llama.cpp gets new architectures free
-  from the GGUF ecosystem (LFM2.5's hybrid arch ran day-one unmodified).
-- Micro-LLM: 12.1k tok/s combined, 97% label validity, full server timings.
+**ort (in-process Rust) is the Apple CPU floor and the ONNX-ecosystem lane**
+(29.6k MiniLM M5 / 11.5k M1 — 1.6-2x llama-CPU on Apple; loses the same ratio
+on x86). Also the DirectML door on Windows (lane already ported, load-dynamic).
 
-**ort (in-process Rust) is the universal CPU floor** — every platform, no GPU
-required: 29.6k MiniLM / 1.2k Qwen3. Proven AFT policies reproduce exactly.
-On CPU-only machines it beats llama-cpu by 2.5x on MiniLM.
+**ANE (CoreML sidecar) is the quiet-tier engine candidate** — ~2W encoder
+serving with the ladder MiniLM → ModernBERT → Qwen3-0.6B. Spike next; not a
+v1 lock item.
 
-**mlx-rs**: not an engine for v1. The 11% embed edge on Qwen3 doesn't pay for
-per-architecture Rust implementations plus the Metal-toolchain CI burden; its
-unbatched decode is 12x slower than llama-server's. Revisit only if a workload
-appears where MLX kernels are unbeatable AND the model family is stable enough
-to hand-implement once (the mlx-embeddings DWQ lane shows 23.4k is reachable —
-but that's a quant-quality tradeoff, not an mlx-rs advantage).
-
-**burn**: dispositioned (compile-time model binding, 7.6s cold start), evidence
-recorded at 64.9k tok/s / parity 1.0 for the baked-in-model niche.
+**burn**: dispositioned (compile-time model binding, 7.6s Metal cold start);
+evidence recorded for the baked-in-model niche.
 
 **Remote/wrap endpoints** (user-pointed LMStudio/Ollama/vllm/sglang/oMLX):
 supported as explicit remote backends behind the same surface, never the
@@ -335,14 +468,56 @@ default local engine — wrapping LMStudio measured 1.8x slower than supervising
 the same engine class directly, with the machine-wide-admission failure class
 unfixable from outside.
 
-**Model defaults per workload** (fingerprint-stable choices):
-- embed floor: MiniLM fp32 (ort, CPU) — today's spaces remain valid.
-- embed quality tier: Qwen3-Embedding-0.6B f16 GGUF (llama-Metal) on Apple;
-  ort fp32 elsewhere. DWQ quant: opt-in only (rank-stability finding).
-- micro-LLM: Qwen3-0.6B q8_0 (llama-Metal). LFM2.5-230M rejected at 81% label
-  validity despite 2.5x throughput.
+### Model defaults per hardware class (D-009 input)
 
-The lock decision for D-005 is therefore: Rust module owning admission, model
-lifecycle, and the subc surface; llama-server as supervised child engine; ort
-in-process as floor; remote endpoints as a peer backend lane. No Python in the
-shipped path.
+Quality screen + cross-platform speed jointly produce the ladder. All choices
+fingerprint-stable; quant policy: Q8_0/Q6_K quality-safe, 4-bit opt-in only.
+
+| hardware class | embed default | embed quality tier | micro-LLM | rerank |
+|---|---|---|---|---|
+| Apple Silicon (any) | MiniLM (compat floor) | gte-modernbert f16 → Qwen3-0.6B f16 | Qwen3-0.6B q8 Metal | gte-reranker-modernbert |
+| Windows/Linux + dGPU | MiniLM | gte-modernbert f16 → Qwen3-0.6B q6k/q8 (CUDA/Vulkan) | Qwen3-0.6B q8 | gte-reranker-modernbert |
+| iGPU-class (handhelds, thin laptops) | MiniLM Vulkan | gte-modernbert f16 Vulkan; Qwen3 q6k for patient indexing | Qwen3-0.6B q8 Vulkan | gte-reranker (background) |
+| CPU-only | MiniLM (ort on Apple, llama on x86) | gte-modernbert (indexing-speed caveat) | Qwen3-0.6B q8 (slow: ~250 tok/s) | background-only |
+| quiet tier (ANE, post-spike) | MiniLM ANE | ModernBERT-class ANE → Qwen3-0.6B ANE | GPU or declined | MiniLM cross-encoder ANE |
+
+Key model verdicts feeding the table: gte-modernbert-base (149M) beats
+Qwen3-0.6B on code retrieval at a quarter of the size and stays GPU-viable on
+a handheld; the 600M tier needs an accelerator (pure-CPU ~250 tok/s);
+LFM2.5-230M rejected for one-shots (81% label validity); potion static =
+explicit constrained-machine opt-in only (quality bar ruling); DWQ = opt-in
+speed tier on M5-class only (rank-stability + it's slower on M1).
+
+### The onboarding bench (end-game requirement, Ufuk 2026-07-08)
+
+The campaign's strongest meta-finding: optimal config is NOT predictable from
+specs. MLX-vs-llama flips by Si generation; DWQ is 2.5x faster on M5 and 6x
+slower on M1; ort-vs-llama CPU flips by ISA; quant speed inverts between
+bandwidth-bound and compute-bound GPUs; ANE residency depends on op placement
+only a live probe can verify; Core AI showed the same export recipe regressing
+2.2x across an OS update. Therefore Synapse ships a first-run probe (~1-2 min):
+detect hardware → micro-bench available engines on a built-in corpus → verify
+quality (parity vs shipped reference vectors; MLComputePlan for ANE) → present
+what the machine supports with measured numbers → map the speed-vs-energy knob
+(performance|balanced|quiet) to MEASURED per-machine configs. Re-probe on
+OS/driver updates. Lab campaign data = the probe's priors + shipped reference
+vectors. (Independent validation: MTPLX's auto-tune arrived at the same
+design for the same reason — measure real configs on the user's machine
+against a kept baseline, save only verified wins, honest verdict UI.)
+
+### The lock decision
+
+D-005 as proposed for lock: a Rust module owning admission (machine-wide),
+model lifecycle (shared content-addressed cache), fingerprints (model + quant
++ engine + runtime-config), and the subc surface; llama-server as the
+supervised child workhorse across all platforms/backends; ort in-process as
+the Apple CPU floor and ONNX/DirectML lane; MLX as the Apple embed fast lane
+(shipping form TBD — the one open sub-decision); ANE spike scheduled for the
+quiet tier; remote endpoints as a peer backend lane; engine-per-workload
+assignments made per-machine by the onboarding probe, never hardcoded. No
+Python in the shipped path.
+
+Deferred / watch items: llama.cpp M5 tensor-accelerator support (closes the
+MLX gap?), llama.cpp Qwen3-reranker template fix (PR #20009), ms-marco
+token_type_ids (PR #21729), Core AI as engine (macOS 27+), MTP/speculative
+decode for the future agentic-LLM lane, MLX 8bit anomaly, jina-v5 config.
