@@ -31,13 +31,19 @@ const DEFAULT_MAX_BATCH_SEQUENCES: usize = 256;
 #[command(name = "synapse-worker-mlx")]
 struct Args {
     #[arg(long)]
-    socket: PathBuf,
+    socket: Option<PathBuf>,
     #[arg(long)]
-    nonce: String,
+    nonce: Option<String>,
     #[arg(long = "test-abort", hide = true)]
     test_abort: bool,
     #[arg(long, hide = true)]
     test_abort_on_request: bool,
+    #[arg(long, hide = true)]
+    debug_bert_model: Option<PathBuf>,
+    #[arg(long, hide = true)]
+    debug_bert_token_ids: Option<String>,
+    #[arg(long, hide = true)]
+    debug_bert_f32: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -58,6 +64,8 @@ struct BertConfig {
     layer_norm_eps: f32,
     #[serde(default = "default_hidden_act")]
     hidden_act: String,
+    #[serde(default = "default_pad_token_id")]
+    pad_token_id: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -244,6 +252,10 @@ fn default_hidden_act() -> String {
     "gelu".to_string()
 }
 
+fn default_pad_token_id() -> u32 {
+    0
+}
+
 impl MiniLmModel {
     fn load(
         model_root: &Path,
@@ -341,13 +353,24 @@ impl MiniLmModel {
         pooling: WorkerPooling,
         normalize: bool,
     ) -> Result<Vec<Vec<f32>>> {
-        let (input_ids, mask_values, additive_mask) =
-            bert_inputs(batch_ids, self.config.max_position_embeddings)?;
+        let (input_ids, mask_values, additive_mask) = bert_inputs(
+            batch_ids,
+            self.config.max_position_embeddings,
+            self.config.pad_token_id,
+        )?;
         let hidden = self.forward_hidden(&input_ids, &additive_mask)?;
         pool_hidden(&hidden, batch_ids, &mask_values, pooling, normalize)
     }
 
     fn forward_hidden(&self, input_ids: &Array, additive_mask: &Array) -> Result<Array> {
+        let mut hidden = self.embedding_hidden(input_ids)?;
+        for layer in &self.layers {
+            hidden = layer.forward(&hidden, additive_mask)?;
+        }
+        Ok(hidden)
+    }
+
+    fn embedding_hidden(&self, input_ids: &Array) -> Result<Array> {
         let batch = input_ids.dim(0);
         let seq_len = input_ids.dim(1);
         let mut hidden = self.word_embeddings.index(input_ids);
@@ -359,16 +382,64 @@ impl MiniLmModel {
         hidden = hidden
             .add(&position_embeddings)?
             .add(&token_type_embeddings)?;
+        self.embeddings_layer_norm.forward(&hidden)
+    }
+
+    fn debug_forward_summaries(
+        &self,
+        input_ids: &Array,
+        additive_mask: &Array,
+    ) -> Result<Vec<serde_json::Value>> {
+        let batch = input_ids.dim(0);
+        let seq_len = input_ids.dim(1);
+        let word_embeddings = self.word_embeddings.index(input_ids);
+        let position_ids = Array::from_iter(0..seq_len, &[seq_len]);
+        let position_embeddings = self.position_embeddings.index(&position_ids);
+        let token_type_ids = vec![0_i32; (batch * seq_len) as usize];
+        let token_type_ids = Array::from_slice(&token_type_ids, &[batch, seq_len]);
+        let token_type_embeddings = self.token_type_embeddings.index(&token_type_ids);
+        let mut summaries = Vec::new();
+        summarize_debug_array(&mut summaries, "embeddings.word", &word_embeddings)?;
+        summarize_debug_array(&mut summaries, "embeddings.position", &position_embeddings)?;
+        summarize_debug_array(
+            &mut summaries,
+            "embeddings.token_type",
+            &token_type_embeddings,
+        )?;
+        let mut hidden = word_embeddings
+            .add(&position_embeddings)?
+            .add(&token_type_embeddings)?;
+        summarize_debug_array(&mut summaries, "embeddings.add", &hidden)?;
         hidden = self.embeddings_layer_norm.forward(&hidden)?;
-        for layer in &self.layers {
-            hidden = layer.forward(&hidden, additive_mask)?;
+        summarize_debug_array(&mut summaries, "embeddings.hidden", &hidden)?;
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            hidden = layer.forward_debug(layer_idx, &hidden, additive_mask, &mut summaries)?;
         }
-        Ok(hidden)
+        Ok(summaries)
     }
 }
 
 impl BertLayer {
     fn forward(&self, x: &Array, additive_mask: &Array) -> Result<Array> {
+        self.forward_inner(x, additive_mask, None)
+    }
+
+    fn forward_debug(
+        &self,
+        layer_idx: usize,
+        x: &Array,
+        additive_mask: &Array,
+        summaries: &mut Vec<serde_json::Value>,
+    ) -> Result<Array> {
+        self.forward_inner(x, additive_mask, Some((layer_idx, summaries)))
+    }
+
+    fn forward_inner(
+        &self,
+        x: &Array,
+        additive_mask: &Array,
+        mut debug: Option<(usize, &mut Vec<serde_json::Value>)>,
+    ) -> Result<Array> {
         let batch = x.dim(0);
         let seq_len = x.dim(1);
         let query = self
@@ -386,6 +457,12 @@ impl BertLayer {
             .forward(x)?
             .reshape(&[batch, seq_len, self.num_attention_heads, self.head_dim])?
             .transpose_axes(&[0, 2, 1, 3])?;
+        if let Some((layer_idx, summaries)) = &mut debug {
+            let layer_idx = *layer_idx;
+            summarize_debug_array(summaries, &format!("layer.{layer_idx}.query"), &query)?;
+            summarize_debug_array(summaries, &format!("layer.{layer_idx}.key"), &key)?;
+            summarize_debug_array(summaries, &format!("layer.{layer_idx}.value"), &value)?;
+        }
         // MLX fused attention requires the mask dtype to promote to the output
         // dtype; an f32 mask against bf16 Q/K/V promotes to f32 and is rejected,
         // so the additive mask is cast to the computation dtype here.
@@ -399,20 +476,147 @@ impl BertLayer {
         )?
         .transpose_axes(&[0, 2, 1, 3])?
         .reshape(&[batch, seq_len, self.num_attention_heads * self.head_dim])?;
+        if let Some((layer_idx, summaries)) = &mut debug {
+            let layer_idx = *layer_idx;
+            summarize_debug_array(
+                summaries,
+                &format!("layer.{layer_idx}.attention"),
+                &attention,
+            )?;
+        }
         let attention_output = self.attention_output.forward(&attention)?;
+        if let Some((layer_idx, summaries)) = &mut debug {
+            let layer_idx = *layer_idx;
+            summarize_debug_array(
+                summaries,
+                &format!("layer.{layer_idx}.attention_output"),
+                &attention_output,
+            )?;
+        }
         let hidden = self
             .attention_layer_norm
             .forward(&x.add(&attention_output)?)?;
+        if let Some((layer_idx, summaries)) = &mut debug {
+            let layer_idx = *layer_idx;
+            summarize_debug_array(
+                summaries,
+                &format!("layer.{layer_idx}.attention_layer_norm"),
+                &hidden,
+            )?;
+        }
+        let intermediate_dense = self.intermediate.forward(&hidden)?;
         let intermediate = match self.hidden_act.as_str() {
-            "gelu" => nn::gelu(self.intermediate.forward(&hidden)?)?,
+            "gelu" => nn::gelu(intermediate_dense)?,
             "gelu_new" | "gelu_fast" | "gelu_pytorch_tanh" => {
-                nn::gelu_approximate(self.intermediate.forward(&hidden)?)?
+                nn::gelu_approximate(intermediate_dense)?
             }
             other => bail!("unsupported BERT hidden_act '{other}'"),
         };
+        if let Some((layer_idx, summaries)) = &mut debug {
+            let layer_idx = *layer_idx;
+            summarize_debug_array(
+                summaries,
+                &format!("layer.{layer_idx}.intermediate"),
+                &intermediate,
+            )?;
+        }
         let output = self.output.forward(&intermediate)?;
-        self.output_layer_norm.forward(&hidden.add(&output)?)
+        if let Some((layer_idx, summaries)) = &mut debug {
+            let layer_idx = *layer_idx;
+            summarize_debug_array(summaries, &format!("layer.{layer_idx}.output"), &output)?;
+        }
+        let hidden = self.output_layer_norm.forward(&hidden.add(&output)?)?;
+        if let Some((layer_idx, summaries)) = debug {
+            summarize_debug_array(summaries, &format!("layer.{layer_idx}.hidden"), &hidden)?;
+        }
+        Ok(hidden)
     }
+}
+
+fn dump_bert_debug(model_path: &Path, token_ids: Option<&str>, force_f32: bool) -> Result<()> {
+    let model_root = resolve_model_root(model_path)?;
+    let config_path = model_root.join("config.json");
+    let config_text = fs::read_to_string(&config_path)
+        .with_context(|| format!("read config {}", config_path.display()))?;
+    let config: BertConfig = serde_json::from_str(&config_text)
+        .with_context(|| format!("parse BERT config {}", config_path.display()))?;
+    let mut tensors = load_safetensor_map(&model_root)?;
+    if force_f32 {
+        tensors = tensors
+            .into_iter()
+            .map(|(name, tensor)| tensor.as_dtype(Dtype::Float32).map(|tensor| (name, tensor)))
+            .collect::<mlx_rs::error::Result<HashMap<_, _>>>()?;
+    }
+    let model = MiniLmModel::load(&model_root, config, &tensors)?;
+    let sequences = parse_debug_token_sequences(token_ids)?;
+    let (input_ids, mask_values, additive_mask) = bert_inputs(
+        &sequences,
+        model.config.max_position_embeddings,
+        model.config.pad_token_id,
+    )?;
+    let summaries = model.debug_forward_summaries(&input_ids, &additive_mask)?;
+    let hidden = model.forward_hidden(&input_ids, &additive_mask)?;
+    let pooled = pool_hidden(&hidden, &sequences, &mask_values, WorkerPooling::Mean, true)?;
+    let payload = serde_json::json!({
+        "model_root": model_root,
+        "token_ids": sequences,
+        "force_f32": force_f32,
+        "pooled_mean_normalized": pooled,
+        "summaries": summaries,
+    });
+
+    println!("{}", serde_json::to_string_pretty(&payload)?);
+    Ok(())
+}
+
+fn parse_debug_token_sequences(token_ids: Option<&str>) -> Result<Vec<Vec<u32>>> {
+    let token_ids = token_ids.unwrap_or("101,2139,8569,2290,7163,13728,11968,3012,2085,102");
+    let sequences = token_ids
+        .split(';')
+        .map(|sequence| {
+            sequence
+                .split(|ch: char| ch == ',' || ch.is_ascii_whitespace())
+                .filter(|part| !part.is_empty())
+                .map(|part| {
+                    part.parse::<u32>()
+                        .with_context(|| format!("parse token id '{part}'"))
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .collect::<Result<Vec<_>>>()?;
+    ensure!(
+        !sequences.is_empty(),
+        "--debug-bert-token-ids cannot be empty"
+    );
+    ensure!(
+        sequences.iter().all(|sequence| !sequence.is_empty()),
+        "--debug-bert-token-ids contains an empty sequence"
+    );
+    Ok(sequences)
+}
+
+fn summarize_debug_array(
+    summaries: &mut Vec<serde_json::Value>,
+    name: &str,
+    array: &Array,
+) -> Result<()> {
+    let array = array.as_dtype(Dtype::Float32)?;
+    transforms::eval([&array])?;
+    let shape = array.shape();
+    let values = array.as_slice::<f32>();
+    let mean = if values.is_empty() {
+        0.0
+    } else {
+        values.iter().copied().sum::<f32>() / values.len() as f32
+    };
+    let first8 = values.iter().copied().take(8).collect::<Vec<_>>();
+    summaries.push(serde_json::json!({
+        "name": name,
+        "shape": shape,
+        "mean": mean,
+        "first8": first8,
+    }));
+    Ok(())
 }
 
 impl QwenModel {
@@ -682,11 +886,27 @@ impl DecoderLayer {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let mut stream = UnixStream::connect(&args.socket)
-        .with_context(|| format!("connect worker socket {}", args.socket.display()))?;
+    if let Some(model_path) = &args.debug_bert_model {
+        return dump_bert_debug(
+            model_path,
+            args.debug_bert_token_ids.as_deref(),
+            args.debug_bert_f32,
+        );
+    }
+
+    let socket = args
+        .socket
+        .as_ref()
+        .context("--socket is required unless --debug-bert-model is used")?;
+    let nonce = args
+        .nonce
+        .clone()
+        .context("--nonce is required unless --debug-bert-model is used")?;
+    let mut stream = UnixStream::connect(socket)
+        .with_context(|| format!("connect worker socket {}", socket.display()))?;
     let hello = WorkerHello {
         v: WORKER_PROTOCOL_VERSION,
-        nonce: args.nonce,
+        nonce,
         engine: engine_identity(),
         pid: std::process::id(),
         max_frame: DEFAULT_MAX_FRAME_BYTES,
@@ -993,6 +1213,7 @@ fn resolve_architecture(value: &str, config: &serde_json::Value) -> Result<Model
 fn bert_inputs(
     sequences: &[Vec<u32>],
     max_position_embeddings: i32,
+    pad_token_id: u32,
 ) -> Result<(Array, Vec<i64>, Array)> {
     ensure!(!sequences.is_empty(), "empty batch");
     let batch = sequences.len();
@@ -1007,13 +1228,32 @@ fn bert_inputs(
     for (row, token_ids) in sequences.iter().enumerate() {
         for (col, token_id) in token_ids.iter().copied().enumerate() {
             ids[row * max_len + col] = i32::try_from(token_id).context("token id exceeds i32")?;
-            mask[row * max_len + col] = 1;
-            additive[row * max_len + col] = 0.0;
+            if token_id != pad_token_id {
+                mask[row * max_len + col] = 1;
+                additive[row * max_len + col] = 0.0;
+            }
         }
     }
     let input_ids = Array::from_slice(&ids, &[batch as i32, max_len as i32]);
     let additive_mask = Array::from_slice(&additive, &[batch as i32, 1, 1, max_len as i32]);
     Ok((input_ids, mask, additive_mask))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bert_inputs_masks_configured_padding_tokens() {
+        let (_input_ids, mask, additive_mask) =
+            bert_inputs(&[vec![101, 102, 0, 0], vec![101, 7592, 102, 0]], 8, 0)
+                .expect("BERT inputs should build");
+        assert_eq!(mask, vec![1, 1, 0, 0, 1, 1, 1, 0]);
+        assert_eq!(
+            additive_mask.as_slice::<f32>(),
+            &[0.0, 0.0, -10_000.0, -10_000.0, 0.0, 0.0, 0.0, -10_000.0]
+        );
+    }
 }
 
 fn batch_to_array(sequences: &[Vec<u32>], pad_id: u32) -> Result<Array> {
