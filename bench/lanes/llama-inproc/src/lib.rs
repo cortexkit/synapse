@@ -118,6 +118,10 @@ pub fn load_tokenizer(path: &Path, max_length: usize) -> Result<Tokenizer> {
     ensure!(max_length > 0, "max-length must be > 0");
     let mut tokenizer =
         Tokenizer::from_file(path).map_err(|err| anyhow::anyhow!("tokenizer: {err}"))?;
+    // Some published tokenizer.json artifacts (e.g. Qdrant's MiniLM export) bake in
+    // fixed-length padding. llama.cpp batches have no attention-mask concept, so pad
+    // tokens would enter the forward pass as real tokens and poison pooled embeddings.
+    tokenizer.with_padding(None);
     tokenizer
         .with_truncation(Some(TruncationParams {
             max_length,

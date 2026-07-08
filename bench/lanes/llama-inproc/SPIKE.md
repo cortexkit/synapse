@@ -1,6 +1,44 @@
 # Spike A — llama.cpp in-process embeddings
 
-## Status
+## RESOLUTION (post-spike, 2026-07-08): MiniLM parity failure root-caused and fixed
+
+The "owned pretokenized token-id path" suspect below was correct, and the exact
+mechanism is now proven: the Qdrant `all-MiniLM-L6-v2-onnx` `tokenizer.json`
+ships with **baked-in fixed padding to 128 tokens** (`padding.strategy =
+{"Fixed": 128}`). Our lanes override truncation at load time but never touched
+padding, so every short chunk carried up to 124 `[PAD]` ids. The ort lane is
+immune because it passes the attention mask (pads are masked out of pooling);
+llama.cpp batches have no attention-mask concept, so the pads entered the
+forward pass as real tokens and poisoned the pooled vectors. The child was
+immune because llama-server tokenizes raw text itself from the GGUF vocab.
+
+Fix: `tokenizer.with_padding(None)` in `load_tokenizer` (committed). Re-measured
+on the 1,000-chunk subset vs ort fp32 reference:
+
+| Path | mean cosine | rank overlap (k=10) | worst decile |
+|---|---:|---:|---:|
+| in-process manual mean pool, padding stripped | **0.9999977** | 0.995 | 0.95 |
+
+Real token count 166,697 (was 172,746 with pads — note: lanes tokenizing with
+this artifact counted pads in tok/s, a ~3.5% inflation on MiniLM rows; vectors
+were always correct where attention masks were honored).
+
+Two issues remain open from this spike:
+1. **builtin-pooling + encode path aborts** with
+   `GGML_ASSERT(ggml_can_mul_mat)` on unpadded inputs (llama-cpp-2 0.1.151) —
+   manual pooling is the working encoder path in-process. Also a live example
+   of the in-process crash-domain concern: the assert is a process abort, not
+   an error return.
+2. **Qwen3 single-call latency gap vs child** (17.7ms vs 7.4ms p50 on M1) —
+   unexplained by config knobs, still open.
+
+The verdict below is the honest pre-resolution record; with parity fixed, the
+in-process path's throughput advantage (224k tok/s M5-contended vs 93k child
+M5-clean on MiniLM; 4.6k vs 3.8k on Qwen3 M1) makes it viable for BATCH
+embedding, while the child keeps the single-query latency edge on decoder-style
+models pending issue 2.
+
+## Status (pre-resolution record)
 
 **Result: still no clear replacement for the child path.**
 
