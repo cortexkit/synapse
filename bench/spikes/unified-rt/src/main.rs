@@ -44,15 +44,18 @@ struct Args {
     /// Kernel provider to use.
     #[arg(long, value_enum, default_value_t = DeviceArg::Cpu)]
     device: DeviceArg,
+    /// Precision for the Metal resident encoder path.
+    #[arg(long, value_enum, default_value_t = Precision::F32)]
+    dtype: Precision,
     /// Tokenizer truncation max length.
     #[arg(long, default_value_t = 512)]
     max_length: usize,
     /// Greedy attention-unit budget per batch.
     #[arg(long, default_value_t = 4_000_000)]
     attention_units: usize,
-    /// Model label for the result.
-    #[arg(long, default_value = "all-MiniLM-L6-v2@owned-rt-fp32")]
-    model_label: String,
+    /// Optional model label for the result.
+    #[arg(long)]
+    model_label: Option<String>,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug, ValueEnum)]
@@ -61,11 +64,30 @@ enum DeviceArg {
     Metal,
 }
 
+#[derive(Copy, Clone, Eq, PartialEq, Debug, ValueEnum)]
+enum Precision {
+    F32,
+    F16,
+}
+
+impl Precision {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::F32 => "f32",
+            Self::F16 => "f16",
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
+    ensure!(
+        !(matches!(args.device, DeviceArg::Cpu) && matches!(args.dtype, Precision::F16)),
+        "cpu + f16 is not supported for this spike; use --dtype f32 on cpu"
+    );
     let started = Instant::now();
 
-    let model = BertModel::load(&args.model)?;
+    let model = BertModel::load(&args.model, args.dtype)?;
     let mut tokenizer = Tokenizer::from_file(&args.tokenizer)
         .map_err(|error| anyhow::anyhow!("tokenizer: {error}"))?;
     tokenizer
@@ -75,7 +97,7 @@ fn main() -> Result<()> {
         }))
         .map_err(|error| anyhow::anyhow!("truncation: {error}"))?;
 
-    let mut provider = make_provider(args.device)?;
+    let mut provider = make_provider(args.device, args.dtype)?;
     let _ = model.embed_batch(provider.as_mut(), &tokenizer, &["warmup"])?;
     let cold_load_s = started.elapsed().as_secs_f64();
 
@@ -161,7 +183,9 @@ fn main() -> Result<()> {
     let result = LaneResult {
         lane: format!("owned-rt-{}", provider.name()),
         workload: "embed-corpus-v1".into(),
-        model: args.model_label,
+        model: args
+            .model_label
+            .unwrap_or_else(|| format!("all-MiniLM-L6-v2@owned-rt-{}", args.dtype.as_str())),
         cold_load_s,
         infer_wall_s,
         input_tokens,
@@ -170,8 +194,9 @@ fn main() -> Result<()> {
         parity_mean_cosine,
         self_peak_rss_bytes: None,
         notes: format!(
-            "direct BERT encoder, provider={}, length-sorted attention_units={}, max_len={}, mean_pool+l2 on CPU; providers may override the encoder block, and the Metal provider keeps encoder-layer hidden states resident inside one MPSGraph per batch shape",
+            "direct BERT encoder, provider={}, dtype={}, length-sorted attention_units={}, max_len={}, mean_pool+l2 on CPU; providers may override the encoder block, and the Metal provider keeps encoder-layer hidden states resident inside one MPSGraph per batch shape",
             provider.name(),
+            args.dtype.as_str(),
             args.attention_units,
             args.max_length
         ),
@@ -189,10 +214,10 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn make_provider(device: DeviceArg) -> Result<Box<dyn KernelProvider>> {
+fn make_provider(device: DeviceArg, dtype: Precision) -> Result<Box<dyn KernelProvider>> {
     match device {
         DeviceArg::Cpu => Ok(Box::new(CpuProvider)),
-        DeviceArg::Metal => Ok(Box::new(MetalProvider::new()?)),
+        DeviceArg::Metal => Ok(Box::new(MetalProvider::new(dtype)?)),
     }
 }
 
@@ -324,19 +349,24 @@ impl KernelProvider for CpuProvider {
 
 struct MetalProvider {
     context: metal_backend::MpsGraphContext,
+    dtype: Precision,
 }
 
 impl MetalProvider {
-    fn new() -> Result<Self> {
+    fn new(dtype: Precision) -> Result<Self> {
         Ok(Self {
             context: metal_backend::MpsGraphContext::new()?,
+            dtype,
         })
     }
 }
 
 impl KernelProvider for MetalProvider {
     fn name(&self) -> &'static str {
-        "metal-mpsgraph-resident-encoder"
+        match self.dtype {
+            Precision::F32 => "metal-mpsgraph-resident-encoder-fp32",
+            Precision::F16 => "metal-mpsgraph-resident-encoder-f16",
+        }
     }
 
     fn matmul(
@@ -352,7 +382,8 @@ impl KernelProvider for MetalProvider {
         ensure!(a.len() == m * k, "matmul A shape mismatch");
         ensure!(b.len() == n * k, "matmul B shape mismatch");
         ensure!(c.len() == m * n, "matmul C shape mismatch");
-        self.context.matmul(m, n, k, a, b, b_layout, c, false)
+        self.context
+            .matmul(m, n, k, a, b, b_layout, c, false, self.dtype)
     }
 
     fn matmul_static_rhs(
@@ -368,7 +399,8 @@ impl KernelProvider for MetalProvider {
         ensure!(a.len() == m * k, "matmul A shape mismatch");
         ensure!(b.len() == n * k, "matmul B shape mismatch");
         ensure!(c.len() == m * n, "matmul C shape mismatch");
-        self.context.matmul(m, n, k, a, b, b_layout, c, true)
+        self.context
+            .matmul(m, n, k, a, b, b_layout, c, true, self.dtype)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -402,6 +434,7 @@ impl KernelProvider for MetalProvider {
             intermediate,
             layer_norm_eps,
             layers,
+            self.dtype,
         )?;
         Ok(true)
     }
@@ -414,26 +447,42 @@ mod metal_backend {
 
     use anyhow::{bail, ensure, Result};
 
-    use super::{BLayout, EncoderLayer};
+    use super::{decode_f16_bits, encode_f16_bits, BLayout, EncoderLayer, Precision};
 
     #[repr(C)]
     struct SynapseMpsEncoderLayerParams {
-        query_weight: *const f32,
-        query_bias: *const f32,
-        key_weight: *const f32,
-        key_bias: *const f32,
-        value_weight: *const f32,
-        value_bias: *const f32,
-        attention_output_weight: *const f32,
-        attention_output_bias: *const f32,
-        attention_ln_weight: *const f32,
-        attention_ln_bias: *const f32,
-        intermediate_weight: *const f32,
-        intermediate_bias: *const f32,
-        output_weight: *const f32,
-        output_bias: *const f32,
-        output_ln_weight: *const f32,
-        output_ln_bias: *const f32,
+        query_weight: *const c_void,
+        query_bias: *const c_void,
+        key_weight: *const c_void,
+        key_bias: *const c_void,
+        value_weight: *const c_void,
+        value_bias: *const c_void,
+        attention_output_weight: *const c_void,
+        attention_output_bias: *const c_void,
+        attention_ln_weight: *const c_void,
+        attention_ln_bias: *const c_void,
+        intermediate_weight: *const c_void,
+        intermediate_bias: *const c_void,
+        output_weight: *const c_void,
+        output_bias: *const c_void,
+        output_ln_weight: *const c_void,
+        output_ln_bias: *const c_void,
+    }
+
+    #[repr(i32)]
+    #[derive(Copy, Clone)]
+    enum SynapseMpsDType {
+        Float32 = 0,
+        Float16 = 1,
+    }
+
+    impl From<Precision> for SynapseMpsDType {
+        fn from(value: Precision) -> Self {
+            match value {
+                Precision::F32 => Self::Float32,
+                Precision::F16 => Self::Float16,
+            }
+        }
     }
 
     pub struct MpsGraphContext {
@@ -458,23 +507,51 @@ mod metal_backend {
             b_layout: BLayout,
             c: &mut [f32],
             cache_rhs: bool,
+            dtype: Precision,
         ) -> Result<()> {
             let b_is_row_major_nk = match b_layout {
                 BLayout::RowMajorKn => 0,
                 BLayout::RowMajorNkTransposed => 1,
             };
-            let status = unsafe {
-                synapse_mps_matmul(
-                    self.raw.as_ptr(),
-                    m as u64,
-                    n as u64,
-                    k as u64,
-                    a.as_ptr(),
-                    b.as_ptr(),
-                    b_is_row_major_nk,
-                    c.as_mut_ptr(),
-                    i32::from(cache_rhs),
-                )
+            let ffi_dtype = SynapseMpsDType::from(dtype) as i32;
+            let status = match dtype {
+                Precision::F32 => unsafe {
+                    synapse_mps_matmul(
+                        self.raw.as_ptr(),
+                        m as u64,
+                        n as u64,
+                        k as u64,
+                        a.as_ptr().cast(),
+                        b.as_ptr().cast(),
+                        ffi_dtype,
+                        b_is_row_major_nk,
+                        c.as_mut_ptr().cast(),
+                        i32::from(cache_rhs),
+                    )
+                },
+                Precision::F16 => {
+                    let a_half = encode_f16_bits(a);
+                    let b_half = encode_f16_bits(b);
+                    let mut output_half = vec![0u16; c.len()];
+                    let status = unsafe {
+                        synapse_mps_matmul(
+                            self.raw.as_ptr(),
+                            m as u64,
+                            n as u64,
+                            k as u64,
+                            a_half.as_ptr().cast(),
+                            b_half.as_ptr().cast(),
+                            ffi_dtype,
+                            b_is_row_major_nk,
+                            output_half.as_mut_ptr().cast(),
+                            i32::from(cache_rhs),
+                        )
+                    };
+                    if status == 0 {
+                        c.copy_from_slice(&decode_f16_bits(&output_half));
+                    }
+                    status
+                }
             };
             if status != 0 {
                 bail!(
@@ -497,6 +574,7 @@ mod metal_backend {
             intermediate: usize,
             layer_norm_eps: f32,
             layers: &[EncoderLayer],
+            dtype: Precision,
         ) -> Result<()> {
             ensure!(
                 batch > 0 && seq > 0 && hidden > 0 && heads > 0 && intermediate > 0,
@@ -551,43 +629,140 @@ mod metal_backend {
                 .iter()
                 .map(|&mask| if mask == 0 { -10_000.0 } else { 0.0 })
                 .collect();
-            let params: Vec<SynapseMpsEncoderLayerParams> = layers
-                .iter()
-                .map(|layer| SynapseMpsEncoderLayerParams {
-                    query_weight: layer.query.weight.data.as_ptr(),
-                    query_bias: layer.query.bias.as_ptr(),
-                    key_weight: layer.key.weight.data.as_ptr(),
-                    key_bias: layer.key.bias.as_ptr(),
-                    value_weight: layer.value.weight.data.as_ptr(),
-                    value_bias: layer.value.bias.as_ptr(),
-                    attention_output_weight: layer.attention_output.weight.data.as_ptr(),
-                    attention_output_bias: layer.attention_output.bias.as_ptr(),
-                    attention_ln_weight: layer.attention_ln_weight.as_ptr(),
-                    attention_ln_bias: layer.attention_ln_bias.as_ptr(),
-                    intermediate_weight: layer.intermediate.weight.data.as_ptr(),
-                    intermediate_bias: layer.intermediate.bias.as_ptr(),
-                    output_weight: layer.output.weight.data.as_ptr(),
-                    output_bias: layer.output.bias.as_ptr(),
-                    output_ln_weight: layer.output_ln_weight.as_ptr(),
-                    output_ln_bias: layer.output_ln_bias.as_ptr(),
-                })
-                .collect();
-            let mut output = vec![0.0f32; hidden_states.len()];
-            let status = unsafe {
-                synapse_mps_encoder_forward(
-                    self.raw.as_ptr(),
-                    batch as u64,
-                    seq as u64,
-                    hidden as u64,
-                    heads as u64,
-                    intermediate as u64,
-                    layers.len() as u64,
-                    layer_norm_eps,
-                    hidden_states.as_ptr(),
-                    additive_mask.as_ptr(),
-                    output.as_mut_ptr(),
-                    params.as_ptr(),
-                )
+            let params: Vec<SynapseMpsEncoderLayerParams> = match dtype {
+                Precision::F32 => layers
+                    .iter()
+                    .map(|layer| SynapseMpsEncoderLayerParams {
+                        query_weight: layer.query.weight.data.as_ptr().cast(),
+                        query_bias: layer.query.bias.as_slice().as_ptr().cast(),
+                        key_weight: layer.key.weight.data.as_ptr().cast(),
+                        key_bias: layer.key.bias.as_slice().as_ptr().cast(),
+                        value_weight: layer.value.weight.data.as_ptr().cast(),
+                        value_bias: layer.value.bias.as_slice().as_ptr().cast(),
+                        attention_output_weight: layer.attention_output.weight.data.as_ptr().cast(),
+                        attention_output_bias: layer
+                            .attention_output
+                            .bias
+                            .as_slice()
+                            .as_ptr()
+                            .cast(),
+                        attention_ln_weight: layer.attention_ln_weight.as_slice().as_ptr().cast(),
+                        attention_ln_bias: layer.attention_ln_bias.as_slice().as_ptr().cast(),
+                        intermediate_weight: layer.intermediate.weight.data.as_ptr().cast(),
+                        intermediate_bias: layer.intermediate.bias.as_slice().as_ptr().cast(),
+                        output_weight: layer.output.weight.data.as_ptr().cast(),
+                        output_bias: layer.output.bias.as_slice().as_ptr().cast(),
+                        output_ln_weight: layer.output_ln_weight.as_slice().as_ptr().cast(),
+                        output_ln_bias: layer.output_ln_bias.as_slice().as_ptr().cast(),
+                    })
+                    .collect(),
+                Precision::F16 => layers
+                    .iter()
+                    .map(|layer| {
+                        Ok(SynapseMpsEncoderLayerParams {
+                            query_weight: layer.query.weight.metal_f16_bits()?.as_ptr().cast(),
+                            query_bias: layer.query.bias.metal_f16_bits()?.as_ptr().cast(),
+                            key_weight: layer.key.weight.metal_f16_bits()?.as_ptr().cast(),
+                            key_bias: layer.key.bias.metal_f16_bits()?.as_ptr().cast(),
+                            value_weight: layer.value.weight.metal_f16_bits()?.as_ptr().cast(),
+                            value_bias: layer.value.bias.metal_f16_bits()?.as_ptr().cast(),
+                            attention_output_weight: layer
+                                .attention_output
+                                .weight
+                                .metal_f16_bits()?
+                                .as_ptr()
+                                .cast(),
+                            attention_output_bias: layer
+                                .attention_output
+                                .bias
+                                .metal_f16_bits()?
+                                .as_ptr()
+                                .cast(),
+                            attention_ln_weight: layer
+                                .attention_ln_weight
+                                .metal_f16_bits()?
+                                .as_ptr()
+                                .cast(),
+                            attention_ln_bias: layer
+                                .attention_ln_bias
+                                .metal_f16_bits()?
+                                .as_ptr()
+                                .cast(),
+                            intermediate_weight: layer
+                                .intermediate
+                                .weight
+                                .metal_f16_bits()?
+                                .as_ptr()
+                                .cast(),
+                            intermediate_bias: layer
+                                .intermediate
+                                .bias
+                                .metal_f16_bits()?
+                                .as_ptr()
+                                .cast(),
+                            output_weight: layer.output.weight.metal_f16_bits()?.as_ptr().cast(),
+                            output_bias: layer.output.bias.metal_f16_bits()?.as_ptr().cast(),
+                            output_ln_weight: layer
+                                .output_ln_weight
+                                .metal_f16_bits()?
+                                .as_ptr()
+                                .cast(),
+                            output_ln_bias: layer.output_ln_bias.metal_f16_bits()?.as_ptr().cast(),
+                        })
+                    })
+                    .collect::<Result<_>>()?,
+            };
+            let ffi_dtype = SynapseMpsDType::from(dtype) as i32;
+            let status = match dtype {
+                Precision::F32 => {
+                    let mut output = vec![0.0f32; hidden_states.len()];
+                    let status = unsafe {
+                        synapse_mps_encoder_forward(
+                            self.raw.as_ptr(),
+                            batch as u64,
+                            seq as u64,
+                            hidden as u64,
+                            heads as u64,
+                            intermediate as u64,
+                            layers.len() as u64,
+                            layer_norm_eps,
+                            ffi_dtype,
+                            hidden_states.as_ptr().cast(),
+                            additive_mask.as_ptr(),
+                            output.as_mut_ptr().cast(),
+                            params.as_ptr(),
+                        )
+                    };
+                    if status == 0 {
+                        hidden_states.copy_from_slice(&output);
+                    }
+                    status
+                }
+                Precision::F16 => {
+                    let input_half = encode_f16_bits(hidden_states);
+                    let mut output_half = vec![0u16; hidden_states.len()];
+                    let status = unsafe {
+                        synapse_mps_encoder_forward(
+                            self.raw.as_ptr(),
+                            batch as u64,
+                            seq as u64,
+                            hidden as u64,
+                            heads as u64,
+                            intermediate as u64,
+                            layers.len() as u64,
+                            layer_norm_eps,
+                            ffi_dtype,
+                            input_half.as_ptr().cast(),
+                            additive_mask.as_ptr(),
+                            output_half.as_mut_ptr().cast(),
+                            params.as_ptr(),
+                        )
+                    };
+                    if status == 0 {
+                        hidden_states.copy_from_slice(&decode_f16_bits(&output_half));
+                    }
+                    status
+                }
             };
             if status != 0 {
                 bail!(
@@ -595,7 +770,6 @@ mod metal_backend {
                     last_error()
                 );
             }
-            hidden_states.copy_from_slice(&output);
             Ok(())
         }
     }
@@ -629,10 +803,11 @@ mod metal_backend {
             m: u64,
             n: u64,
             k: u64,
-            a: *const f32,
-            b: *const f32,
+            a: *const c_void,
+            b: *const c_void,
+            dtype: i32,
             b_is_row_major_nk: i32,
-            c: *mut f32,
+            c: *mut c_void,
             cache_rhs: i32,
         ) -> i32;
         fn synapse_mps_encoder_forward(
@@ -644,9 +819,10 @@ mod metal_backend {
             intermediate: u64,
             layer_count: u64,
             layer_norm_eps: f32,
-            input: *const f32,
+            dtype: i32,
+            input: *const c_void,
             additive_mask: *const f32,
-            output: *mut f32,
+            output: *mut c_void,
             layers: *const SynapseMpsEncoderLayerParams,
         ) -> i32;
         fn synapse_mps_last_error() -> *const c_char;
@@ -657,7 +833,7 @@ mod metal_backend {
 mod metal_backend {
     use anyhow::{bail, Result};
 
-    use super::{BLayout, EncoderLayer};
+    use super::{BLayout, EncoderLayer, Precision};
 
     pub struct MpsGraphContext;
 
@@ -676,6 +852,7 @@ mod metal_backend {
             _b_layout: BLayout,
             _c: &mut [f32],
             _cache_rhs: bool,
+            _dtype: Precision,
         ) -> Result<()> {
             bail!("Metal MPSGraph provider is only available on macOS")
         }
@@ -692,6 +869,7 @@ mod metal_backend {
             _intermediate: usize,
             _layer_norm_eps: f32,
             _layers: &[EncoderLayer],
+            _dtype: Precision,
         ) -> Result<()> {
             bail!("Metal MPSGraph provider is only available on macOS")
         }
@@ -794,11 +972,45 @@ struct Tensor {
     shape: Vec<usize>,
     strides: Vec<usize>,
     data: Vec<f32>,
+    metal_f16_bits: Option<Vec<u16>>,
 }
 
 #[derive(Copy, Clone, Debug)]
 enum TensorDType {
     F32,
+}
+
+#[derive(Clone, Debug)]
+struct ParamVector {
+    values: Vec<f32>,
+    metal_f16_bits: Option<Vec<u16>>,
+}
+
+impl ParamVector {
+    fn new(values: Vec<f32>) -> Self {
+        Self {
+            values,
+            metal_f16_bits: None,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    fn as_slice(&self) -> &[f32] {
+        &self.values
+    }
+
+    fn prepare_metal_f16(&mut self) {
+        self.metal_f16_bits = Some(encode_f16_bits(&self.values));
+    }
+
+    fn metal_f16_bits(&self) -> Result<&[u16]> {
+        self.metal_f16_bits
+            .as_deref()
+            .context("f16 mirror missing for Metal parameter")
+    }
 }
 
 impl Tensor {
@@ -815,6 +1027,7 @@ impl Tensor {
             strides: row_major_strides(&shape),
             shape,
             data,
+            metal_f16_bits: None,
         })
     }
 
@@ -825,11 +1038,22 @@ impl Tensor {
             strides: row_major_strides(&shape),
             shape,
             data: vec![0.0; len],
+            metal_f16_bits: None,
         }
     }
 
     fn dim(&self, index: usize) -> usize {
         self.shape[index]
+    }
+
+    fn prepare_metal_f16(&mut self) {
+        self.metal_f16_bits = Some(encode_f16_bits(&self.data));
+    }
+
+    fn metal_f16_bits(&self) -> Result<&[u16]> {
+        self.metal_f16_bits
+            .as_deref()
+            .context("f16 mirror missing for Metal tensor")
     }
 
     fn as_vector(&self) -> Result<&[f32]> {
@@ -875,6 +1099,20 @@ fn row_major_strides(shape: &[usize]) -> Vec<usize> {
     strides
 }
 
+fn encode_f16_bits(values: &[f32]) -> Vec<u16> {
+    values
+        .iter()
+        .map(|&value| half::f16::from_f32(value).to_bits())
+        .collect()
+}
+
+fn decode_f16_bits(values: &[u16]) -> Vec<f32> {
+    values
+        .iter()
+        .map(|&value| half::f16::from_bits(value).to_f32())
+        .collect()
+}
+
 #[derive(Deserialize)]
 struct BertConfig {
     hidden_size: usize,
@@ -913,8 +1151,8 @@ struct Embeddings {
     word: Tensor,
     position: Tensor,
     token_type: Tensor,
-    layer_norm_weight: Vec<f32>,
-    layer_norm_bias: Vec<f32>,
+    layer_norm_weight: ParamVector,
+    layer_norm_bias: ParamVector,
 }
 
 struct EncoderLayer {
@@ -922,21 +1160,43 @@ struct EncoderLayer {
     key: Linear,
     value: Linear,
     attention_output: Linear,
-    attention_ln_weight: Vec<f32>,
-    attention_ln_bias: Vec<f32>,
+    attention_ln_weight: ParamVector,
+    attention_ln_bias: ParamVector,
     intermediate: Linear,
     output: Linear,
-    output_ln_weight: Vec<f32>,
-    output_ln_bias: Vec<f32>,
+    output_ln_weight: ParamVector,
+    output_ln_bias: ParamVector,
 }
 
 struct Linear {
     weight: Tensor,
-    bias: Vec<f32>,
+    bias: ParamVector,
+}
+
+impl EncoderLayer {
+    fn prepare_metal_f16(&mut self) {
+        self.query.prepare_metal_f16();
+        self.key.prepare_metal_f16();
+        self.value.prepare_metal_f16();
+        self.attention_output.prepare_metal_f16();
+        self.attention_ln_weight.prepare_metal_f16();
+        self.attention_ln_bias.prepare_metal_f16();
+        self.intermediate.prepare_metal_f16();
+        self.output.prepare_metal_f16();
+        self.output_ln_weight.prepare_metal_f16();
+        self.output_ln_bias.prepare_metal_f16();
+    }
+}
+
+impl Linear {
+    fn prepare_metal_f16(&mut self) {
+        self.weight.prepare_metal_f16();
+        self.bias.prepare_metal_f16();
+    }
 }
 
 impl BertModel {
-    fn load(path: &Path) -> Result<Self> {
+    fn load(path: &Path, precision: Precision) -> Result<Self> {
         let model_root = resolve_model_root(path)?;
         let config_path = model_root.join("config.json");
         let config: BertConfig = serde_json::from_str(
@@ -959,12 +1219,16 @@ impl BertModel {
             word: get_tensor(&tensors, "embeddings.word_embeddings.weight")?,
             position: get_tensor(&tensors, "embeddings.position_embeddings.weight")?,
             token_type: get_tensor(&tensors, "embeddings.token_type_embeddings.weight")?,
-            layer_norm_weight: get_tensor(&tensors, "embeddings.LayerNorm.weight")?
-                .as_vector()?
-                .to_vec(),
-            layer_norm_bias: get_tensor(&tensors, "embeddings.LayerNorm.bias")?
-                .as_vector()?
-                .to_vec(),
+            layer_norm_weight: ParamVector::new(
+                get_tensor(&tensors, "embeddings.LayerNorm.weight")?
+                    .as_vector()?
+                    .to_vec(),
+            ),
+            layer_norm_bias: ParamVector::new(
+                get_tensor(&tensors, "embeddings.LayerNorm.bias")?
+                    .as_vector()?
+                    .to_vec(),
+            ),
         };
         ensure!(
             embeddings.word.shape == vec![config.vocab_size, config.hidden_size],
@@ -991,30 +1255,41 @@ impl BertModel {
                     &tensors,
                     &format!("{prefix}.attention.output.dense"),
                 )?,
-                attention_ln_weight: get_tensor(
-                    &tensors,
-                    &format!("{prefix}.attention.output.LayerNorm.weight"),
-                )?
-                .as_vector()?
-                .to_vec(),
-                attention_ln_bias: get_tensor(
-                    &tensors,
-                    &format!("{prefix}.attention.output.LayerNorm.bias"),
-                )?
-                .as_vector()?
-                .to_vec(),
-                intermediate: Linear::load(&tensors, &format!("{prefix}.intermediate.dense"))?,
-                output: Linear::load(&tensors, &format!("{prefix}.output.dense"))?,
-                output_ln_weight: get_tensor(
-                    &tensors,
-                    &format!("{prefix}.output.LayerNorm.weight"),
-                )?
-                .as_vector()?
-                .to_vec(),
-                output_ln_bias: get_tensor(&tensors, &format!("{prefix}.output.LayerNorm.bias"))?
+                attention_ln_weight: ParamVector::new(
+                    get_tensor(
+                        &tensors,
+                        &format!("{prefix}.attention.output.LayerNorm.weight"),
+                    )?
                     .as_vector()?
                     .to_vec(),
+                ),
+                attention_ln_bias: ParamVector::new(
+                    get_tensor(
+                        &tensors,
+                        &format!("{prefix}.attention.output.LayerNorm.bias"),
+                    )?
+                    .as_vector()?
+                    .to_vec(),
+                ),
+                intermediate: Linear::load(&tensors, &format!("{prefix}.intermediate.dense"))?,
+                output: Linear::load(&tensors, &format!("{prefix}.output.dense"))?,
+                output_ln_weight: ParamVector::new(
+                    get_tensor(&tensors, &format!("{prefix}.output.LayerNorm.weight"))?
+                        .as_vector()?
+                        .to_vec(),
+                ),
+                output_ln_bias: ParamVector::new(
+                    get_tensor(&tensors, &format!("{prefix}.output.LayerNorm.bias"))?
+                        .as_vector()?
+                        .to_vec(),
+                ),
             });
+        }
+
+        if matches!(precision, Precision::F16) {
+            for layer in &mut layers {
+                layer.prepare_metal_f16();
+            }
         }
 
         Ok(Self {
@@ -1100,8 +1375,8 @@ impl BertModel {
             rows,
             hidden,
             &mut x.data,
-            &self.embeddings.layer_norm_weight,
-            &self.embeddings.layer_norm_bias,
+            self.embeddings.layer_norm_weight.as_slice(),
+            self.embeddings.layer_norm_bias.as_slice(),
             self.config.layer_norm_eps,
         )?;
 
@@ -1177,8 +1452,8 @@ fn encoder_layers_scalar_forward(
             rows,
             hidden,
             &mut attention_out,
-            &layer.attention_ln_weight,
-            &layer.attention_ln_bias,
+            layer.attention_ln_weight.as_slice(),
+            layer.attention_ln_bias.as_slice(),
             layer_norm_eps,
         )?;
 
@@ -1200,8 +1475,8 @@ fn encoder_layers_scalar_forward(
             rows,
             hidden,
             &mut output,
-            &layer.output_ln_weight,
-            &layer.output_ln_bias,
+            layer.output_ln_weight.as_slice(),
+            layer.output_ln_bias.as_slice(),
             layer_norm_eps,
         )?;
         current = output;
@@ -1213,9 +1488,11 @@ fn encoder_layers_scalar_forward(
 impl Linear {
     fn load(tensors: &HashMap<String, Tensor>, prefix: &str) -> Result<Self> {
         let weight = get_tensor(tensors, &format!("{prefix}.weight"))?;
-        let bias = get_tensor(tensors, &format!("{prefix}.bias"))?
-            .as_vector()?
-            .to_vec();
+        let bias = ParamVector::new(
+            get_tensor(tensors, &format!("{prefix}.bias"))?
+                .as_vector()?
+                .to_vec(),
+        );
         Ok(Self { weight, bias })
     }
 
@@ -1232,6 +1509,7 @@ impl Linear {
             "linear input mismatch: weight expects {weight_input}, got {input}"
         );
         ensure!(self.bias.len() == output, "linear bias shape mismatch");
+        let bias = self.bias.as_slice();
         ensure!(values.len() == rows * input, "linear values shape mismatch");
         let mut out = vec![0.0f32; rows * output];
         provider.matmul_static_rhs(
@@ -1246,7 +1524,7 @@ impl Linear {
         for row in 0..rows {
             let start = row * output;
             for col in 0..output {
-                out[start + col] += self.bias[col];
+                out[start + col] += bias[col];
             }
         }
         Ok(out)
@@ -1530,7 +1808,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn metal_provider_matches_cpu_for_row_major_rhs() {
-        let mut metal = MetalProvider::new().expect("create MPSGraph provider");
+        let mut metal = MetalProvider::new(Precision::F32).expect("create MPSGraph provider");
         let mut cpu = CpuProvider;
         let a = vec![1.0, 2.0, 3.0, 4.0, -2.0, 0.5];
         let b = vec![
@@ -1549,7 +1827,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn metal_provider_matches_cpu_for_transposed_rhs_storage() {
-        let mut metal = MetalProvider::new().expect("create MPSGraph provider");
+        let mut metal = MetalProvider::new(Precision::F32).expect("create MPSGraph provider");
         let mut cpu = CpuProvider;
         let a = vec![1.0, 2.0, 3.0, 4.0, -2.0, 0.5];
         let b = vec![
@@ -1586,7 +1864,7 @@ mod tests {
                 patterned_values(output * input, scale, 0.0),
             )
             .expect("linear test weight"),
-            bias: patterned_values(output, scale * 0.25, 0.0),
+            bias: ParamVector::new(patterned_values(output, scale * 0.25, 0.0)),
         }
     }
 
@@ -1596,12 +1874,12 @@ mod tests {
             key: test_linear(hidden, hidden, -0.009),
             value: test_linear(hidden, hidden, 0.007),
             attention_output: test_linear(hidden, hidden, 0.013),
-            attention_ln_weight: patterned_values(hidden, 0.01, 1.0),
-            attention_ln_bias: patterned_values(hidden, 0.003, 0.0),
+            attention_ln_weight: ParamVector::new(patterned_values(hidden, 0.01, 1.0)),
+            attention_ln_bias: ParamVector::new(patterned_values(hidden, 0.003, 0.0)),
             intermediate: test_linear(intermediate, hidden, 0.008),
             output: test_linear(hidden, intermediate, -0.006),
-            output_ln_weight: patterned_values(hidden, 0.012, 1.0),
-            output_ln_bias: patterned_values(hidden, -0.002, 0.0),
+            output_ln_weight: ParamVector::new(patterned_values(hidden, 0.012, 1.0)),
+            output_ln_bias: ParamVector::new(patterned_values(hidden, -0.002, 0.0)),
         }
     }
 
@@ -1633,7 +1911,7 @@ mod tests {
         )
         .expect("run CPU encoder block");
 
-        let mut metal = MetalProvider::new().expect("create MPSGraph provider");
+        let mut metal = MetalProvider::new(Precision::F32).expect("create MPSGraph provider");
         assert!(metal
             .encoder_forward(
                 &mut actual,
@@ -1648,5 +1926,53 @@ mod tests {
             )
             .expect("run resident MPSGraph encoder block"));
         assert_close_with_tolerance(&actual, &expected, 5e-3);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn metal_provider_f16_tracks_cpu_for_tiny_encoder_block() {
+        let batch = 2;
+        let seq = 3;
+        let hidden = 4;
+        let heads = 2;
+        let intermediate = 8;
+        let attention_mask = vec![1, 1, 0, 1, 1, 1];
+        let mut layers = vec![test_layer(hidden, intermediate)];
+        for layer in &mut layers {
+            layer.prepare_metal_f16();
+        }
+        let mut expected = patterned_values(batch * seq * hidden, 0.02, 0.01);
+        let mut actual = expected.clone();
+
+        let mut cpu = CpuProvider;
+        encoder_layers_scalar_forward(
+            &mut cpu,
+            &mut expected,
+            &attention_mask,
+            batch,
+            seq,
+            hidden,
+            heads,
+            intermediate,
+            1e-12,
+            &layers,
+        )
+        .expect("run CPU encoder block");
+
+        let mut metal = MetalProvider::new(Precision::F16).expect("create MPSGraph provider");
+        assert!(metal
+            .encoder_forward(
+                &mut actual,
+                &attention_mask,
+                batch,
+                seq,
+                hidden,
+                heads,
+                intermediate,
+                1e-12,
+                &layers,
+            )
+            .expect("run resident MPSGraph encoder block"));
+        assert_close_with_tolerance(&actual, &expected, 3e-2);
     }
 }
