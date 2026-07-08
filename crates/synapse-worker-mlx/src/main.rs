@@ -49,7 +49,6 @@ struct SafetensorsIndex {
 struct BertConfig {
     vocab_size: i32,
     hidden_size: i32,
-    intermediate_size: i32,
     num_attention_heads: i32,
     num_hidden_layers: i32,
     max_position_embeddings: i32,
@@ -86,7 +85,6 @@ struct QwenGenerationConfig {
 #[derive(Debug, Deserialize)]
 struct QwenConfig {
     hidden_size: i32,
-    intermediate_size: i32,
     num_attention_heads: i32,
     num_hidden_layers: i32,
     num_key_value_heads: i32,
