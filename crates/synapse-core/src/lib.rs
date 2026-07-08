@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod cache;
 pub mod engine;
 pub mod envelope;
 pub mod error_contract;
@@ -8,6 +9,7 @@ pub mod scheduler;
 pub mod tokenizer;
 pub mod worker_protocol;
 
+pub use cache::*;
 pub use engine::*;
 pub use envelope::*;
 pub use error_contract::*;

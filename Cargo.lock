@@ -6280,7 +6280,9 @@ name = "synapse-core"
 version = "0.0.0"
 dependencies = [
  "ahash",
+ "cortexkit-lease",
  "hex",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",
