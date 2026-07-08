@@ -6,6 +6,8 @@ use std::{
 };
 
 mod store;
+#[cfg(unix)]
+pub mod worker_host;
 
 use cortexkit_store_types::{sqlite_store_path, Isolation, StorageBackend, StorageDescriptor};
 use serde::{Deserialize, Serialize};

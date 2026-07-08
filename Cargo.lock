@@ -6288,6 +6288,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "synapse-engine-ort"
+version = "0.0.0"
+dependencies = [
+ "half",
+ "hex",
+ "ndarray 0.17.2",
+ "ort",
+ "serde",
+ "serde_json",
+ "sha2",
+ "synapse-core",
+ "thiserror 1.0.69",
+ "tokenizers 0.21.4",
+]
+
+[[package]]
 name = "synapse-module"
 version = "0.0.0"
 dependencies = [
@@ -6302,6 +6318,25 @@ dependencies = [
  "subc-transport",
  "synapse-core",
  "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
+name = "synapse-worker-llama"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "hex",
+ "llama-cpp-2",
+ "llama-cpp-sys-2",
+ "serde",
+ "serde_json",
+ "sha2",
+ "synapse-core",
+ "synapse-engine-ort",
+ "synapse-module",
+ "tokenizers 0.21.4",
  "tokio",
 ]
 
