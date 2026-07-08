@@ -6,7 +6,7 @@ use rusqlite::{params, OptionalExtension, Row};
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use synapse_core::{AliasRow, Fingerprint};
+use synapse_core::{AliasRow, AliasTable, Fingerprint, NumericProfileId};
 use thiserror::Error;
 
 const NAMESPACE: &str = "synapse_module";
@@ -84,6 +84,45 @@ const MIGRATIONS: &[Migration] = &[
                  CREATE INDEX jobs_expires_idx ON jobs(expires_ms);
         "#,
     },
+    Migration {
+        version: 3,
+        statements: r#"
+                 ALTER TABLE alias_rows RENAME TO alias_rows_v2;
+                 CREATE TABLE alias_rows (
+                     fingerprint_a TEXT NOT NULL,
+                     fingerprint_b TEXT NOT NULL,
+                     valid_from_ms INTEGER NOT NULL,
+                     valid_to_ms INTEGER,
+                     evidence_json TEXT NOT NULL DEFAULT '{}',
+                     PRIMARY KEY (fingerprint_a, fingerprint_b, valid_from_ms)
+                 );
+                 INSERT INTO alias_rows (
+                     fingerprint_a, fingerprint_b, valid_from_ms, valid_to_ms, evidence_json
+                 )
+                 SELECT left_fingerprint, right_fingerprint, valid_from_epoch,
+                        valid_to_epoch_exclusive, '{}'
+                 FROM alias_rows_v2;
+                 DROP TABLE alias_rows_v2;
+
+                 ALTER TABLE cert_rows RENAME TO cert_rows_v1;
+                 CREATE TABLE cert_rows (
+                     machine_profile_hash TEXT NOT NULL,
+                     numeric_profile_id TEXT NOT NULL,
+                     fingerprint TEXT NOT NULL,
+                     certified_at_ms INTEGER NOT NULL,
+                     evidence_json TEXT NOT NULL,
+                     PRIMARY KEY (machine_profile_hash, fingerprint)
+                 );
+                 INSERT OR IGNORE INTO cert_rows (
+                     machine_profile_hash, numeric_profile_id, fingerprint, certified_at_ms, evidence_json
+                 )
+                 SELECT machine_profile_hash, '', fingerprint, created_ms,
+                        json_object('certified_shape_json', certified_shape_json)
+                 FROM cert_rows_v1;
+                 DROP TABLE cert_rows_v1;
+                 CREATE INDEX cert_rows_fingerprint_idx ON cert_rows(fingerprint);
+        "#,
+    },
 ];
 
 static JOB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -103,11 +142,20 @@ pub struct ModelCatalogEntry {
     pub fingerprints: Vec<Fingerprint>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct CatalogSnapshot {
     pub table_epoch: u64,
     pub models: Vec<ModelCatalogEntry>,
     pub alias_rows: Vec<AliasRow>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct CertificationRow {
+    pub machine_profile_hash: String,
+    pub numeric_profile_id: NumericProfileId,
+    pub fingerprint: Fingerprint,
+    pub certified_at_ms: u64,
+    pub evidence: Value,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -178,34 +226,184 @@ impl SynapseStore {
     }
 
     pub fn catalog_snapshot(&self) -> Result<CatalogSnapshot, SynapseStoreError> {
-        let snapshot = self.store.with_conn(|conn| {
+        let alias_table = self.alias_table()?;
+        Ok(CatalogSnapshot {
+            table_epoch: alias_table.table_epoch,
+            models: Vec::new(),
+            alias_rows: alias_table.rows,
+        })
+    }
+
+    pub fn alias_table(&self) -> Result<AliasTable, SynapseStoreError> {
+        let rows = self.store.with_conn(|conn| {
             let table_epoch: i64 = conn.query_row(
                 "SELECT table_epoch FROM module_meta WHERE id = 0",
                 [],
                 |row| row.get(0),
             )?;
             let mut stmt = conn.prepare(
-                "SELECT left_fingerprint, right_fingerprint, valid_from_epoch, valid_to_epoch_exclusive \
+                "SELECT fingerprint_a, fingerprint_b, valid_from_ms, valid_to_ms, evidence_json \
                  FROM alias_rows \
-                 ORDER BY left_fingerprint, right_fingerprint, valid_from_epoch",
+                 ORDER BY fingerprint_a, fingerprint_b, valid_from_ms",
             )?;
-            let alias_rows = stmt
+            let rows = stmt
                 .query_map([], |row| {
-                    Ok(AliasRow::new(
+                    let evidence_json: String = row.get(4)?;
+                    let evidence = serde_json::from_str(&evidence_json).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            4,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?;
+                    Ok(AliasRow::with_evidence(
                         Fingerprint(row.get(0)?),
                         Fingerprint(row.get(1)?),
                         row.get::<_, i64>(2)? as u64,
                         row.get::<_, Option<i64>>(3)?.map(|value| value as u64),
+                        evidence,
                     ))
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
-            Ok(CatalogSnapshot {
-                table_epoch: table_epoch as u64,
-                models: Vec::new(),
-                alias_rows,
-            })
+            Ok((table_epoch as u64, rows))
         })?;
-        Ok(snapshot)
+        Ok(AliasTable {
+            table_epoch: rows.0,
+            rows: rows.1,
+        })
+    }
+
+    pub fn store_cert_row(&self, row: &CertificationRow) -> Result<(), SynapseStoreError> {
+        let evidence_json = serde_json::to_string(&row.evidence)?;
+        self.store.with_conn_fenced(|tx| {
+            tx.execute(
+                "INSERT INTO cert_rows (machine_profile_hash, numeric_profile_id, fingerprint, certified_at_ms, evidence_json) \
+                 VALUES (?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT(machine_profile_hash, fingerprint) DO UPDATE SET \
+                 numeric_profile_id = excluded.numeric_profile_id, \
+                 certified_at_ms = excluded.certified_at_ms, \
+                 evidence_json = excluded.evidence_json",
+                params![
+                    &row.machine_profile_hash,
+                    &row.numeric_profile_id.0,
+                    &row.fingerprint.0,
+                    row.certified_at_ms as i64,
+                    evidence_json,
+                ],
+            )
+        })?;
+        Ok(())
+    }
+
+    pub fn get_cert_row(
+        &self,
+        machine_profile_hash: &str,
+        fingerprint: &Fingerprint,
+    ) -> Result<Option<CertificationRow>, SynapseStoreError> {
+        let raw = self.store.with_conn(|conn| {
+            conn.query_row(
+                "SELECT machine_profile_hash, numeric_profile_id, fingerprint, certified_at_ms, evidence_json \
+                 FROM cert_rows WHERE machine_profile_hash = ?1 AND fingerprint = ?2",
+                params![machine_profile_hash, &fingerprint.0],
+                cert_row_from_row,
+            )
+            .optional()
+        })?;
+        raw.map(decode_cert_row).transpose()
+    }
+
+    pub fn has_stale_cert_row(
+        &self,
+        machine_profile_hash: &str,
+        fingerprint: &Fingerprint,
+    ) -> Result<bool, SynapseStoreError> {
+        let count = self.store.with_conn(|conn| {
+            conn.query_row(
+                "SELECT COUNT(1) FROM cert_rows WHERE fingerprint = ?1 AND machine_profile_hash <> ?2",
+                params![&fingerprint.0, machine_profile_hash],
+                |row| row.get::<_, i64>(0),
+            )
+        })?;
+        Ok(count > 0)
+    }
+
+    pub fn declare_alias_pair(
+        &self,
+        fingerprint_a: &Fingerprint,
+        fingerprint_b: &Fingerprint,
+        evidence: &Value,
+        now_ms: u64,
+    ) -> Result<(bool, u64), SynapseStoreError> {
+        let row = AliasRow::with_evidence(
+            fingerprint_a.clone(),
+            fingerprint_b.clone(),
+            now_ms,
+            None,
+            evidence.clone(),
+        );
+        let evidence_json = serde_json::to_string(&row.evidence)?;
+        let outcome = self.store.with_conn_fenced(|tx| {
+            let current_epoch = table_epoch_tx(tx)?;
+            let existing: Option<i64> = tx
+                .query_row(
+                    "SELECT rowid FROM alias_rows \
+                     WHERE fingerprint_a = ?1 AND fingerprint_b = ?2 AND valid_to_ms IS NULL",
+                    params![&row.fingerprint_a.0, &row.fingerprint_b.0],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if existing.is_some() {
+                return Ok((false, current_epoch as u64));
+            }
+            tx.execute(
+                "INSERT INTO alias_rows (fingerprint_a, fingerprint_b, valid_from_ms, valid_to_ms, evidence_json) \
+                 VALUES (?1, ?2, ?3, NULL, ?4)",
+                params![
+                    &row.fingerprint_a.0,
+                    &row.fingerprint_b.0,
+                    row.valid_from_ms as i64,
+                    evidence_json,
+                ],
+            )?;
+            let next_epoch = bump_table_epoch_tx(tx)?;
+            Ok((true, next_epoch as u64))
+        })?;
+        Ok(outcome)
+    }
+
+    pub fn retract_alias_pair(
+        &self,
+        fingerprint_a: &Fingerprint,
+        fingerprint_b: &Fingerprint,
+        evidence: &Value,
+        now_ms: u64,
+    ) -> Result<(bool, u64), SynapseStoreError> {
+        let row = AliasRow::with_evidence(
+            fingerprint_a.clone(),
+            fingerprint_b.clone(),
+            now_ms,
+            Some(now_ms),
+            evidence.clone(),
+        );
+        let evidence_json = serde_json::to_string(&row.evidence)?;
+        let outcome = self.store.with_conn_fenced(|tx| {
+            let changed = tx.execute(
+                "UPDATE alias_rows SET valid_to_ms = ?3, evidence_json = ?4 \
+                 WHERE fingerprint_a = ?1 AND fingerprint_b = ?2 AND valid_to_ms IS NULL",
+                params![
+                    &row.fingerprint_a.0,
+                    &row.fingerprint_b.0,
+                    now_ms as i64,
+                    evidence_json,
+                ],
+            )?;
+            if changed == 0 {
+                return Ok((false, table_epoch_tx(tx)? as u64));
+            }
+            let next_epoch = bump_table_epoch_tx(tx)?;
+            Ok((true, next_epoch as u64))
+        })?;
+        Ok(outcome)
     }
 
     pub fn admit_job(
@@ -450,6 +648,51 @@ fn job_by_id_conn(
 
 const JOB_SELECT_SQL: &str = "SELECT job_id, request_key, kind, module_generation, state,\
         created_ms, updated_ms, expires_ms, page_count, result_json, error_json FROM jobs";
+
+struct RawCertificationRow {
+    machine_profile_hash: String,
+    numeric_profile_id: String,
+    fingerprint: String,
+    certified_at_ms: u64,
+    evidence_json: String,
+}
+
+fn cert_row_from_row(row: &Row<'_>) -> rusqlite::Result<RawCertificationRow> {
+    Ok(RawCertificationRow {
+        machine_profile_hash: row.get(0)?,
+        numeric_profile_id: row.get(1)?,
+        fingerprint: row.get(2)?,
+        certified_at_ms: row.get::<_, i64>(3)? as u64,
+        evidence_json: row.get(4)?,
+    })
+}
+
+fn decode_cert_row(row: RawCertificationRow) -> Result<CertificationRow, SynapseStoreError> {
+    Ok(CertificationRow {
+        machine_profile_hash: row.machine_profile_hash,
+        numeric_profile_id: NumericProfileId(row.numeric_profile_id),
+        fingerprint: Fingerprint(row.fingerprint),
+        certified_at_ms: row.certified_at_ms,
+        evidence: serde_json::from_str(&row.evidence_json)?,
+    })
+}
+
+fn table_epoch_tx(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<i64> {
+    tx.query_row(
+        "SELECT table_epoch FROM module_meta WHERE id = 0",
+        [],
+        |row| row.get(0),
+    )
+}
+
+fn bump_table_epoch_tx(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<i64> {
+    let next = table_epoch_tx(tx)? + 1;
+    tx.execute(
+        "UPDATE module_meta SET table_epoch = ?1 WHERE id = 0",
+        params![next],
+    )?;
+    Ok(next)
+}
 
 fn row_to_job(row: &Row<'_>) -> rusqlite::Result<JobRecord> {
     Ok(JobRecord {

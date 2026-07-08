@@ -3,12 +3,10 @@
 mod common;
 
 use std::{
-    fs::OpenOptions,
-    io::ErrorKind,
     net::Ipv4Addr,
     path::{Path, PathBuf},
     process,
-    time::{Duration, Instant as StdInstant},
+    time::Duration,
 };
 
 use common::{
@@ -272,6 +270,7 @@ async fn embed_query_preloaded_minilm_returns_vectors_and_envelope() {
     let _lock = acquire_minilm_e2e_lock();
     let (_daemon, _module, mut consumer, route_channel) =
         open_route_with_preloads(Some(&preloads)).await;
+    certify_preloaded_models(&mut consumer, route_channel, 40).await;
 
     let first = route_request(
         &mut consumer,
@@ -323,6 +322,7 @@ async fn embed_batch_preloaded_minilm_preserves_order_and_envelope() {
     let _lock = acquire_minilm_e2e_lock();
     let (_daemon, _module, mut consumer, route_channel) =
         open_route_with_preloads(Some(&preloads)).await;
+    certify_preloaded_models(&mut consumer, route_channel, 60).await;
     let items = (0..16)
         .map(|index| {
             serde_json::json!({
@@ -376,6 +376,7 @@ async fn over_budget_embed_batch_returns_job_and_pages_results() {
     .to_string();
     let _lock = acquire_minilm_e2e_lock();
     let (_daemon, _module, mut consumer, route_channel) = open_route_with_config(&config).await;
+    certify_preloaded_models(&mut consumer, route_channel, 80).await;
     let texts = [
         "job tier first text",
         "job tier second text",
@@ -476,6 +477,155 @@ async fn over_budget_embed_batch_returns_job_and_pages_results() {
 }
 
 #[tokio::test]
+async fn alias_surface_certifies_declares_retracts_and_preserves_old_job_pages() {
+    let Some(preloads) = minilm_alias_preload_config() else {
+        eprintln!("skipping MiniLM alias e2e: local HF ONNX snapshot is missing");
+        return;
+    };
+    let config = serde_json::json!({
+        "preload_models": preloads,
+        "inline": { "max_items": 1 },
+        "jobs": { "ttl_ms": 60_000, "result_page_bytes": 4096, "bulk_quantum_tokens": 2048 },
+        "alias_admin_enabled": true
+    })
+    .to_string();
+    let _lock = acquire_minilm_e2e_lock();
+    let (_daemon, _module, mut consumer, route_channel) = open_route_with_config(&config).await;
+    let probe = certify_preloaded_models(&mut consumer, route_channel, 120).await;
+    let lanes = probe["result"]["lanes"].as_array().expect("probe lanes");
+    let fingerprint_a = lanes
+        .iter()
+        .find(|lane| lane["model_id"] == "minilm-a")
+        .and_then(|lane| lane["fingerprint"].as_str())
+        .expect("minilm-a fingerprint")
+        .to_string();
+    let fingerprint_b = lanes
+        .iter()
+        .find(|lane| lane["model_id"] == "minilm-b")
+        .and_then(|lane| lane["fingerprint"].as_str())
+        .expect("minilm-b fingerprint")
+        .to_string();
+    assert_ne!(fingerprint_a, fingerprint_b);
+
+    let before = route_request(
+        &mut consumer,
+        route_channel,
+        500,
+        serde_json::json!({
+            "method": "embed.query",
+            "params": { "model": "minilm-a", "text": "alias before retract" }
+        }),
+    )
+    .await;
+    assert_eq!(before["result"]["equivalent_to"][0], fingerprint_b);
+
+    let valid = route_request(
+        &mut consumer,
+        route_channel,
+        501,
+        serde_json::json!({
+            "method": "aliases.check_index",
+            "params": {
+                "index_fingerprint": fingerprint_a,
+                "provenance_set": [fingerprint_a, fingerprint_b]
+            }
+        }),
+    )
+    .await;
+    assert_eq!(valid["result"]["verdict"]["status"], "valid");
+
+    let accepted = route_request(
+        &mut consumer,
+        route_channel,
+        502,
+        serde_json::json!({
+            "method": "embed.batch",
+            "params": {
+                "model": "minilm-a",
+                "request_key": "alias-retroactive-e2e",
+                "items": [
+                    {"id": "a", "text": "alias job page one"},
+                    {"id": "b", "text": "alias job page two"}
+                ]
+            }
+        }),
+    )
+    .await;
+    let job_id = accepted["result"]["job_id"].as_str().unwrap().to_string();
+    let done = poll_embed_result(&mut consumer, route_channel, 503, &job_id).await;
+    assert_eq!(done["result"]["equivalent_to"][0], fingerprint_b);
+
+    let retracted = route_request(
+        &mut consumer,
+        route_channel,
+        600,
+        serde_json::json!({
+            "method": "alias.retract",
+            "params": {
+                "fingerprint_a": fingerprint_a,
+                "fingerprint_b": fingerprint_b,
+                "evidence": {"reason": "e2e"}
+            }
+        }),
+    )
+    .await;
+    assert_eq!(retracted["result"]["changed"], Value::Bool(true));
+
+    let migration = route_request(
+        &mut consumer,
+        route_channel,
+        601,
+        serde_json::json!({
+            "method": "aliases.check_index",
+            "params": {
+                "index_fingerprint": fingerprint_a,
+                "provenance_set": [fingerprint_a, fingerprint_b]
+            }
+        }),
+    )
+    .await;
+    assert_eq!(
+        migration["result"]["verdict"]["status"],
+        "migration_required"
+    );
+    let pair_a = migration["result"]["verdict"]["retracted_pair"]["fingerprint_a"]
+        .as_str()
+        .unwrap();
+    let pair_b = migration["result"]["verdict"]["retracted_pair"]["fingerprint_b"]
+        .as_str()
+        .unwrap();
+    assert!(
+        (pair_a == fingerprint_a && pair_b == fingerprint_b)
+            || (pair_a == fingerprint_b && pair_b == fingerprint_a),
+        "unexpected retracted pair: {migration:?}"
+    );
+
+    let old_page = route_request(
+        &mut consumer,
+        route_channel,
+        602,
+        serde_json::json!({
+            "method": "embed.result",
+            "params": { "job_id": job_id, "page": 0 }
+        }),
+    )
+    .await;
+    assert_eq!(old_page["result"]["equivalent_to"][0], fingerprint_b);
+
+    let after = route_request(
+        &mut consumer,
+        route_channel,
+        603,
+        serde_json::json!({
+            "method": "embed.query",
+            "params": { "model": "minilm-a", "text": "alias after retract" }
+        }),
+    )
+    .await;
+    assert_eq!(after["result"]["equivalent_to"], Value::Array(Vec::new()));
+}
+
+#[tokio::test]
 async fn embed_query_deadline_one_returns_typed_rejection() {
     let Some(preloads) = minilm_preload_config() else {
         eprintln!("skipping MiniLM deadline e2e: local HF ONNX snapshot is missing");
@@ -484,6 +634,7 @@ async fn embed_query_deadline_one_returns_typed_rejection() {
     let _lock = acquire_minilm_e2e_lock();
     let (_daemon, _module, mut consumer, route_channel) =
         open_route_with_preloads(Some(&preloads)).await;
+    certify_preloaded_models(&mut consumer, route_channel, 90).await;
 
     let body = route_request(
         &mut consumer,
@@ -512,6 +663,7 @@ async fn concurrent_embed_burst_finishes_with_vectors_or_typed_rejections() {
     let _lock = acquire_minilm_e2e_lock();
     let (_daemon, _module, mut consumer, route_channel) =
         open_route_with_preloads(Some(&preloads)).await;
+    certify_preloaded_models(&mut consumer, route_channel, 110).await;
     let start_corr = 10_000_u64;
     let count = 32_u64;
     for offset in 0..count {
@@ -548,6 +700,58 @@ async fn concurrent_embed_burst_finishes_with_vectors_or_typed_rejections() {
             assert_eq!(body["result"]["vectors"].as_array().unwrap().len(), 1);
         }
         seen += 1;
+    }
+}
+
+async fn certify_preloaded_models(
+    consumer: &mut tokio::net::TcpStream,
+    route_channel: u16,
+    start_corr: u64,
+) -> Value {
+    let accepted = route_request(
+        consumer,
+        route_channel,
+        start_corr,
+        serde_json::json!({ "method": "probe.start", "params": {} }),
+    )
+    .await;
+    let job_id = accepted["result"]["job_id"]
+        .as_str()
+        .expect("probe.start returns job_id")
+        .to_string();
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let mut corr = start_corr + 1;
+    loop {
+        let body = route_request(
+            consumer,
+            route_channel,
+            corr,
+            serde_json::json!({
+                "method": "probe.status",
+                "params": { "job_id": &job_id }
+            }),
+        )
+        .await;
+        match body["result"]["state"].as_str() {
+            Some("done") => {
+                let lanes = body["result"]["lanes"].as_array().expect("probe lanes");
+                assert!(!lanes.is_empty(), "probe should certify at least one lane");
+                for lane in lanes {
+                    assert_eq!(lane["status"], "certified", "probe lane failed: {lane:?}");
+                }
+                return body;
+            }
+            Some("failed_transient" | "failed_permanent") => panic!("probe failed: {body:?}"),
+            Some("queued" | "running") => {
+                assert!(
+                    Instant::now() < deadline,
+                    "probe did not complete before timeout: {body:?}"
+                );
+                corr += 1;
+                sleep(Duration::from_millis(100)).await;
+            }
+            other => panic!("unexpected probe.status state {other:?}: {body:?}"),
+        }
     }
 }
 
@@ -621,6 +825,37 @@ fn minilm_preload_config() -> Option<String> {
     )
 }
 
+fn minilm_alias_preload_config() -> Option<Value> {
+    let snapshot = minilm_onnx_snapshot()?;
+    let model_path = snapshot.join("model.onnx");
+    let tokenizer_path = snapshot.join("tokenizer.json");
+    if !model_path.exists() || !tokenizer_path.exists() {
+        return None;
+    }
+    Some(serde_json::json!([
+        {
+            "model_id": "minilm-a",
+            "engine": "ort",
+            "model_path": model_path,
+            "tokenizer_path": tokenizer_path,
+            "pooling": "mean",
+            "normalize": true,
+            "max_tokens": 512,
+            "quant": "fp32"
+        },
+        {
+            "model_id": "minilm-b",
+            "engine": "ort",
+            "model_path": model_path,
+            "tokenizer_path": tokenizer_path,
+            "pooling": "mean",
+            "normalize": true,
+            "max_tokens": 512,
+            "quant": "fp32-alias"
+        }
+    ]))
+}
+
 fn minilm_onnx_snapshot() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("SYNAPSE_MINILM_ONNX_SNAPSHOT") {
         return Some(PathBuf::from(path));
@@ -643,48 +878,8 @@ fn first_snapshot_with(snapshots: &Path, file_name: &str) -> Option<PathBuf> {
         .find(|path| path.join(file_name).exists())
 }
 
-struct MinilmE2eLock {
-    path: PathBuf,
-}
-
-impl Drop for MinilmE2eLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
+struct MinilmE2eLock;
 
 fn acquire_minilm_e2e_lock() -> MinilmE2eLock {
-    let path = std::env::temp_dir().join("synapse-minilm-e2e.lock");
-    let deadline = StdInstant::now() + Duration::from_secs(120);
-    loop {
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(_) => return MinilmE2eLock { path },
-            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-                if stale_lock(&path) {
-                    let _ = std::fs::remove_file(&path);
-                    continue;
-                }
-                assert!(
-                    StdInstant::now() < deadline,
-                    "timed out waiting for MiniLM e2e lock at {}",
-                    path.display()
-                );
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(error) => panic!("create MiniLM e2e lock {}: {error}", path.display()),
-        }
-    }
-}
-
-fn stale_lock(path: &Path) -> bool {
-    let Ok(metadata) = std::fs::metadata(path) else {
-        return false;
-    };
-    let Ok(modified) = metadata.modified() else {
-        return false;
-    };
-    modified
-        .elapsed()
-        .map(|age| age > Duration::from_secs(120))
-        .unwrap_or(false)
+    MinilmE2eLock
 }

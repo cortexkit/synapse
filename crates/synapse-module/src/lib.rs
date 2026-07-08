@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env, fs,
     io::Read,
     path::{Path, PathBuf},
@@ -18,9 +18,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use store::{
-    CatalogSnapshot, JobAdmission, JobRecord, ModelCatalogEntry, SynapseStore, SynapseStoreError,
-    JOB_STATE_DONE, JOB_STATE_FAILED_PERMANENT, JOB_STATE_FAILED_TRANSIENT, JOB_STATE_QUEUED,
-    JOB_STATE_RUNNING,
+    CatalogSnapshot, CertificationRow, JobAdmission, JobRecord, ModelCatalogEntry, SynapseStore,
+    SynapseStoreError, JOB_STATE_DONE, JOB_STATE_FAILED_PERMANENT, JOB_STATE_FAILED_TRANSIENT,
+    JOB_STATE_QUEUED, JOB_STATE_RUNNING,
 };
 use subc_client_rs::{
     async_trait, BindDecision, HandlerOutcome, HealthReport, ModuleHandler, RequestCtx,
@@ -36,12 +36,13 @@ use subc_protocol::{
 use synapse_core::{
     AdmissionDecision, AdmissionRequest, AliasTable, CacheGcOutcome, CertifiedShapeEnvelope, Clock,
     EmbedEngine, EngineError, EngineErrorStage, EngineIdentity, ErrorClass, Fingerprint,
-    FlashAttentionSetting, LaneBudgetSnapshot, LaneScheduler, LoadedModel, ModelCache,
-    ModelCacheError, ModelCacheIngest, ModelCacheMeta, NormalizationMode, NumericDType,
-    NumericProfile, PoolingStrategy, QueueClass, ResponseEnvelope, ResponseProvenance,
-    RuntimeConfig, SanitizedTokenizer, SchedulerConfig, StableError, ThreadPolicyClass, TokenBatch,
-    TokenizationError, TokenizedBatch, TokenizerConfig, TruncationDisclosure, ValidatedArtifact,
-    Vectors, WorkRequest, WorkerPooling,
+    FlashAttentionSetting, LaneBudgetSnapshot, LaneScheduler, LoadedModel, MachineProfile,
+    ModelCache, ModelCacheError, ModelCacheIngest, ModelCacheMeta, NormalizationMode, NumericDType,
+    NumericProfile, NumericProfileId, PoolingStrategy, QueueClass, ResponseEnvelope,
+    ResponseProvenance, RuntimeConfig, SanitizedTokenizer, SchedulerConfig, StableError,
+    SystemMachineProfileCollector, ThreadPolicyClass, TokenBatch, TokenizationError,
+    TokenizedBatch, TokenizerConfig, TruncationDisclosure, ValidatedArtifact, Vectors, WorkRequest,
+    WorkerPooling,
 };
 use synapse_engine_ort::OrtEmbedEngine;
 use thiserror::Error;
@@ -59,6 +60,8 @@ const DEFAULT_MAX_CONCURRENT_WORKERS: usize = 2;
 const DEFAULT_JOB_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
 const DEFAULT_JOB_RESULT_PAGE_BYTES: usize = 512 * 1024;
 const DEFAULT_JOB_BULK_QUANTUM_TOKENS: u64 = 2_048;
+const DEFAULT_PROBE_MEAN_COSINE_THRESHOLD: f64 = 0.999;
+const DEFAULT_PROBE_WORST_DECILE_RANK_OVERLAP_THRESHOLD: f64 = 0.9;
 
 pub async fn run_from_env() -> Result<(), ModuleError> {
     let module_id = env::var(SUBC_MODULE_ID_ENV)
@@ -103,7 +106,8 @@ struct ModuleState {
     module_id: String,
     store: Arc<SynapseStore>,
     module_generation: u64,
-    health: ModuleHealth,
+    machine_profile: MachineProfile,
+    machine_profile_hash: String,
     runtime: Arc<RuntimeState>,
     model_cache: Arc<ModelCache>,
 }
@@ -113,6 +117,17 @@ struct ModuleHealth {
     status: String,
     module_generation: u64,
     loaded_models: usize,
+    machine_profile_hash: String,
+    certification_stale: bool,
+    lanes: Vec<LaneHealth>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct LaneHealth {
+    model_id: String,
+    fingerprint: Fingerprint,
+    certified: bool,
+    certification_stale: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -146,16 +161,6 @@ impl WireOperationError {
             message: message.into(),
         }
     }
-
-    fn not_implemented(message: impl Into<String>) -> Self {
-        Self {
-            code: "not_implemented".to_string(),
-            class: ErrorClass::Permanent,
-            retry_after_ms: None,
-            safe_to_retry_same_request: false,
-            message: message.into(),
-        }
-    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -166,6 +171,12 @@ struct ModuleConfig {
     inline: InlineConfig,
     #[serde(default)]
     jobs: JobConfig,
+    #[serde(default)]
+    probe: ProbeConfig,
+    #[serde(default, alias = "dev_alias_admin", alias = "enable_alias_admin")]
+    alias_admin_enabled: bool,
+    #[serde(default)]
+    dev: DevConfig,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -245,6 +256,30 @@ impl Default for JobConfig {
     }
 }
 
+#[derive(Clone, Debug, Deserialize)]
+struct ProbeConfig {
+    #[serde(default = "default_probe_mean_cosine_threshold")]
+    mean_cosine_threshold: f64,
+    #[serde(default = "default_probe_worst_decile_rank_overlap_threshold")]
+    worst_decile_rank_overlap_threshold: f64,
+}
+
+impl Default for ProbeConfig {
+    fn default() -> Self {
+        Self {
+            mean_cosine_threshold: default_probe_mean_cosine_threshold(),
+            worst_decile_rank_overlap_threshold: default_probe_worst_decile_rank_overlap_threshold(
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct DevConfig {
+    #[serde(default, alias = "enable_alias_admin")]
+    alias_admin_enabled: bool,
+}
+
 fn default_inline_max_items() -> usize {
     DEFAULT_INLINE_MAX_ITEMS
 }
@@ -285,11 +320,21 @@ fn default_job_bulk_quantum_tokens() -> u64 {
     DEFAULT_JOB_BULK_QUANTUM_TOKENS
 }
 
+fn default_probe_mean_cosine_threshold() -> f64 {
+    DEFAULT_PROBE_MEAN_COSINE_THRESHOLD
+}
+
+fn default_probe_worst_decile_rank_overlap_threshold() -> f64 {
+    DEFAULT_PROBE_WORST_DECILE_RANK_OVERLAP_THRESHOLD
+}
+
 struct RuntimeState {
     models: BTreeMap<String, Arc<EmbeddingModel>>,
     default_model_id: Option<String>,
     inline: InlineConfig,
     jobs: JobConfig,
+    probe: ProbeConfig,
+    alias_admin_enabled: bool,
     scheduler: Arc<Mutex<InlineScheduler>>,
     execution: Arc<Semaphore>,
 }
@@ -317,6 +362,7 @@ struct EmbeddingModel {
     loaded_model: LoadedModel,
     backend: EmbedBackend,
     tokenizer: SanitizedTokenizer,
+    numeric_profile_id: NumericProfileId,
     fingerprint: Fingerprint,
     engine_identity: EngineIdentity,
 }
@@ -403,7 +449,7 @@ struct EmbedBatchJobWork {
     model: Arc<EmbeddingModel>,
     ids: Vec<String>,
     tokenized: TokenizedBatch,
-    table_epoch: u64,
+    alias_table: AliasTable,
     request_bytes: u64,
     total_tokens: u64,
 }
@@ -437,6 +483,81 @@ struct CacheGcParams {
     digest: Option<String>,
     #[serde(default)]
     grace_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProbeStartParams {
+    #[serde(default)]
+    request_key: Option<String>,
+    #[serde(default)]
+    models: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProbeStatusParams {
+    job_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AliasesCheckIndexParams {
+    index_fingerprint: String,
+    #[serde(default)]
+    provenance_set: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AliasPairParams {
+    #[serde(default, alias = "fingerprint_a")]
+    left: Option<String>,
+    #[serde(default, alias = "fingerprint_b")]
+    right: Option<String>,
+    #[serde(default)]
+    evidence: Option<Value>,
+}
+
+impl AliasPairParams {
+    fn fingerprints(self) -> Result<(Fingerprint, Fingerprint, Value), String> {
+        let left = self
+            .left
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| "alias pair requires fingerprint_a".to_string())?;
+        let right = self
+            .right
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| "alias pair requires fingerprint_b".to_string())?;
+        Ok((
+            Fingerprint(left),
+            Fingerprint(right),
+            self.evidence.unwrap_or_else(|| json!({})),
+        ))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ProbeFixture {
+    #[serde(default)]
+    generation_command: Option<String>,
+    items: Vec<ProbeFixtureItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProbeFixtureItem {
+    id: String,
+    text: String,
+    vector: Vec<f32>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ProbeEvidence {
+    mean_cosine: f64,
+    rank_overlap: f64,
+    worst_decile: f64,
+    items: usize,
+}
+
+struct ProbeLaneVectors {
+    model: Arc<EmbeddingModel>,
+    vectors: Vec<Vec<f32>>,
 }
 
 struct SystemClock;
@@ -479,16 +600,20 @@ impl SynapseHandler {
             load_module_config()?,
             Arc::clone(&model_cache),
         )?);
-        let health = ModuleHealth {
-            status: "ok".to_string(),
-            module_generation,
-            loaded_models: runtime.models.len(),
-        };
+        let machine_profile = MachineProfile::collect(
+            &SystemMachineProfileCollector,
+            runtime
+                .models
+                .values()
+                .map(|model| model.engine_identity.clone()),
+        );
+        let machine_profile_hash = machine_profile.hash();
         Ok(Arc::new(ModuleState {
             module_id: self.inner.module_id.clone(),
             store,
             module_generation,
-            health,
+            machine_profile,
+            machine_profile_hash,
             runtime,
             model_cache,
         }))
@@ -502,6 +627,8 @@ impl RuntimeState {
     ) -> Result<Self, ModuleError> {
         let inline = config.inline;
         let jobs = config.jobs;
+        let probe = config.probe;
+        let alias_admin_enabled = config.alias_admin_enabled || config.dev.alias_admin_enabled;
         let scheduler = Arc::new(Mutex::new(InlineScheduler { in_flight_bytes: 0 }));
         let execution = Arc::new(Semaphore::new(inline.max_concurrent_workers.max(1)));
         let mut models = BTreeMap::new();
@@ -523,6 +650,8 @@ impl RuntimeState {
             default_model_id,
             inline,
             jobs,
+            probe,
+            alias_admin_enabled,
             scheduler,
             execution,
         })
@@ -728,12 +857,14 @@ fn preload_embedding_model(
         prefix_template: None,
         thread_policy: ThreadPolicyClass::Balanced,
     };
+    let numeric_profile_id = numeric_profile.numeric_profile_id();
     let fingerprint = numeric_profile.fingerprint();
     Ok(EmbeddingModel {
         model_id,
         loaded_model,
         backend,
         tokenizer,
+        numeric_profile_id,
         fingerprint,
         engine_identity,
     })
@@ -825,12 +956,16 @@ impl ModuleHandler for SynapseHandler {
         let Some(state) = self.state() else {
             return HealthReport::ok();
         };
+        let health = module_health(&state);
+        let detail = if health.certification_stale {
+            "ok; certification_stale=true"
+        } else {
+            "ok"
+        };
         HealthReport {
             status: subc_client_rs::HealthStatus::Ok,
-            detail: Some("ok".to_string()),
-            metrics: Some(
-                serde_json::to_value(&state.health).expect("module health should serialize"),
-            ),
+            detail: Some(detail.to_string()),
+            metrics: Some(serde_json::to_value(&health).expect("module health should serialize")),
         }
     }
 
@@ -884,22 +1019,13 @@ async fn dispatch_request(state: Arc<ModuleState>, request: MethodEnvelope) -> H
         )),
         "cache.pin" => cache_pin(state, request.params).await,
         "cache.gc" => cache_gc(state, request.params).await,
-        "probe.start" => result_outcome(error_payload(
-            &state,
-            WireOperationError::not_implemented(format!(
-                "{} is reserved in the scaffold but not implemented yet",
-                request.method
-            )),
-        )),
-        "model.status" | "probe.status" | "aliases.check_index" | "admission.status" => {
-            result_outcome(error_payload(
-                &state,
-                WireOperationError::not_implemented(format!(
-                    "{} is not implemented in the wire-alive scaffold",
-                    request.method
-                )),
-            ))
-        }
+        "probe.start" => probe_start(state, request.params).await,
+        "probe.status" => probe_status(state, request.params).await,
+        "aliases.check_index" => aliases_check_index(state, request.params).await,
+        "alias.retract" => alias_retract(state, request.params).await,
+        "alias.declare" => alias_declare(state, request.params).await,
+        "admission.status" => admission_status(state).await,
+        "model.status" => result_outcome(models_status_payload(&state)),
         other => channel_error(
             "unknown_method",
             format!("unknown method '{other}' for synapse management surface"),
@@ -917,14 +1043,20 @@ async fn embed_query(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
             )
         }
     };
-    let table_epoch = table_epoch(&state);
+    let alias_table = match state.store.alias_table() {
+        Ok(alias_table) => alias_table,
+        Err(error) => return channel_error("store_failure", error.to_string()),
+    };
     let model = match state.runtime.resolve_model(params.model.as_deref()) {
         Ok(model) => model,
         Err(error) => return result_outcome(error_payload(&state, error)),
     };
+    if let Err(error) = ensure_model_certified(&state, &model) {
+        return result_outcome(error_payload(&state, error));
+    }
     if let Err(error) = check_fingerprint_constraints(
         &model,
-        table_epoch,
+        &alias_table,
         params.target_fingerprint.as_deref(),
         params.required_fingerprint.as_deref(),
         params.allow_equivalent,
@@ -953,7 +1085,7 @@ async fn embed_query(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         }
     };
     let ids = vec![params.id.unwrap_or_else(|| "query".to_string())];
-    embed_tokenized(state, model, ids, tokenized, table_epoch).await
+    embed_tokenized(state, model, ids, tokenized, alias_table).await
 }
 
 async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
@@ -974,14 +1106,20 @@ async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         return channel_error("invalid_request", "embed.batch requires at least one item");
     }
 
-    let table_epoch = table_epoch(&state);
+    let alias_table = match state.store.alias_table() {
+        Ok(alias_table) => alias_table,
+        Err(error) => return channel_error("store_failure", error.to_string()),
+    };
     let model = match state.runtime.resolve_model(params.model.as_deref()) {
         Ok(model) => model,
         Err(error) => return result_outcome(error_payload(&state, error)),
     };
+    if let Err(error) = ensure_model_certified(&state, &model) {
+        return result_outcome(error_payload(&state, error));
+    }
     if let Err(error) = check_fingerprint_constraints(
         &model,
-        table_epoch,
+        &alias_table,
         params.target_fingerprint.as_deref(),
         params.required_fingerprint.as_deref(),
         params.allow_equivalent,
@@ -1020,7 +1158,7 @@ async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
                 model,
                 ids,
                 tokenized,
-                table_epoch,
+                alias_table,
                 request_bytes,
                 total_tokens,
             },
@@ -1037,7 +1175,7 @@ async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         Ok(admission) => admission,
         Err(error) => return result_outcome(error_payload(&state, error)),
     };
-    embed_tokenized(state, model, ids, tokenized, table_epoch).await
+    embed_tokenized(state, model, ids, tokenized, alias_table).await
 }
 
 async fn submit_embed_batch_job(
@@ -1129,7 +1267,7 @@ async fn execute_embed_batch_job(state: Arc<ModuleState>, job_id: String, work: 
         work.ids,
         vectors,
         work.tokenized,
-        work.table_epoch,
+        work.alias_table,
         &job_id,
     ) {
         Ok(pages) => pages,
@@ -1223,10 +1361,11 @@ fn embed_result_pages(
     ids: Vec<String>,
     vectors: Vectors,
     tokenized: TokenizedBatch,
-    table_epoch: u64,
+    alias_table: AliasTable,
     job_id: &str,
 ) -> Result<(Value, Vec<Vec<u8>>), WireOperationError> {
     let dims = vectors.first().map(Vec::len).unwrap_or(0) as u32;
+    let equivalent_to = equivalent_fingerprints(&alias_table, model);
     let response_vectors = ids
         .into_iter()
         .zip(vectors)
@@ -1247,13 +1386,13 @@ fn embed_result_pages(
         };
         let envelope = ResponseEnvelope {
             fingerprint: model.fingerprint.clone(),
-            table_epoch,
+            table_epoch: alias_table.table_epoch,
             dims,
             provenance: ResponseProvenance {
                 engine: model.engine_identity.clone(),
             },
             module_generation: state.module_generation,
-            equivalent_to: Vec::new(),
+            equivalent_to: equivalent_to.clone(),
             payload,
         };
         let mut value = serde_json::to_value(envelope).expect("embed job page serializes");
@@ -1430,7 +1569,7 @@ async fn embed_tokenized(
     model: Arc<EmbeddingModel>,
     ids: Vec<String>,
     tokenized: TokenizedBatch,
-    table_epoch: u64,
+    alias_table: AliasTable,
 ) -> HandlerOutcome {
     let vectors = match execute_embedding(&state.runtime, &model, tokenized.batch).await {
         Ok(vectors) => vectors,
@@ -1450,6 +1589,7 @@ async fn embed_tokenized(
         ));
     }
     let dims = vectors.first().map(Vec::len).unwrap_or(0) as u32;
+    let equivalent_to = equivalent_fingerprints(&alias_table, &model);
     let response_vectors = ids
         .into_iter()
         .zip(vectors)
@@ -1462,13 +1602,13 @@ async fn embed_tokenized(
     };
     let envelope = ResponseEnvelope {
         fingerprint: model.fingerprint.clone(),
-        table_epoch,
+        table_epoch: alias_table.table_epoch,
         dims,
         provenance: ResponseProvenance {
             engine: model.engine_identity.clone(),
         },
         module_generation: state.module_generation,
-        equivalent_to: Vec::new(),
+        equivalent_to,
         payload,
     };
     result_outcome(serde_json::to_value(envelope).expect("embed envelope should serialize"))
@@ -1580,18 +1720,19 @@ fn batch_items(
 
 fn check_fingerprint_constraints(
     model: &EmbeddingModel,
-    table_epoch: u64,
+    alias_table: &AliasTable,
     target_fingerprint: Option<&str>,
     required_fingerprint: Option<&str>,
     allow_equivalent: bool,
     required_epoch: Option<u64>,
 ) -> Result<(), WireOperationError> {
     if let Some(required_epoch) = required_epoch {
-        if required_epoch > table_epoch {
+        if required_epoch > alias_table.table_epoch {
             return Err(WireOperationError::from_stable(
                 StableError::migration_required(),
                 format!(
-                    "request requires alias table epoch {required_epoch}, but module is at epoch {table_epoch}"
+                    "request requires alias table epoch {required_epoch}, but module is at epoch {}",
+                    alias_table.table_epoch
                 ),
             ));
         }
@@ -1599,13 +1740,8 @@ fn check_fingerprint_constraints(
     let requested = required_fingerprint.or(target_fingerprint);
     if let Some(requested) = requested {
         if requested != model.fingerprint.0 {
-            let alias_table = AliasTable {
-                table_epoch,
-                rows: Vec::new(),
-            };
             let equivalent = allow_equivalent
-                && alias_table
-                    .equivalent_fingerprints_at(&model.fingerprint, table_epoch)
+                && equivalent_fingerprints(alias_table, model)
                     .iter()
                     .any(|fingerprint| fingerprint.0 == requested);
             if !equivalent {
@@ -1620,6 +1756,591 @@ fn check_fingerprint_constraints(
         }
     }
     Ok(())
+}
+
+fn equivalent_fingerprints(alias_table: &AliasTable, model: &EmbeddingModel) -> Vec<Fingerprint> {
+    alias_table
+        .equivalent_fingerprints_at(&model.fingerprint, now_ms())
+        .into_iter()
+        .collect()
+}
+
+fn ensure_model_certified(
+    state: &ModuleState,
+    model: &EmbeddingModel,
+) -> Result<(), WireOperationError> {
+    match state
+        .store
+        .get_cert_row(&state.machine_profile_hash, &model.fingerprint)
+    {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => {
+            let stale = state
+                .store
+                .has_stale_cert_row(&state.machine_profile_hash, &model.fingerprint)
+                .unwrap_or(false);
+            let message = if stale {
+                format!(
+                    "fingerprint {} has only stale certification rows for a different machine profile",
+                    model.fingerprint.0
+                )
+            } else {
+                format!(
+                    "fingerprint {} is not certified on machine profile {}",
+                    model.fingerprint.0, state.machine_profile_hash
+                )
+            };
+            Err(WireOperationError::from_stable(
+                StableError::not_certified(),
+                message,
+            ))
+        }
+        Err(error) => Err(WireOperationError::from_stable(
+            StableError::engine_crashed(Some(100)),
+            format!("read certification rows: {error}"),
+        )),
+    }
+}
+
+async fn probe_start(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
+    let params: ProbeStartParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(error) => {
+            return channel_error(
+                "invalid_request",
+                format!("invalid probe.start params: {error}"),
+            )
+        }
+    };
+    let now = now_ms();
+    let model_filter = params.models;
+    let request_key = params
+        .request_key
+        .filter(|key| !key.trim().is_empty())
+        .unwrap_or_else(|| format!("probe:{}:{now}", state.module_generation));
+    let admission = match state.store.admit_job(
+        &request_key,
+        "probe",
+        state.module_generation,
+        &json!({ "models": model_filter.clone() }),
+        now,
+        state.runtime.jobs.ttl_ms,
+    ) {
+        Ok(admission) => admission,
+        Err(error) => return channel_error("store_failure", error.to_string()),
+    };
+    let record = admission.record().clone();
+    if matches!(admission, JobAdmission::Admitted(_)) {
+        let task_state = Arc::clone(&state);
+        let task_job_id = record.job_id.clone();
+        tokio::spawn(async move {
+            execute_probe_job(task_state, task_job_id, model_filter).await;
+        });
+    }
+    result_outcome(json!({
+        "module_generation": state.module_generation,
+        "job_id": record.job_id,
+        "state": record.state,
+    }))
+}
+
+async fn probe_status(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
+    let params: ProbeStatusParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(error) => {
+            return channel_error(
+                "invalid_request",
+                format!("invalid probe.status params: {error}"),
+            )
+        }
+    };
+    match state.store.get_job(&params.job_id) {
+        Ok(Some(record)) if record.kind == "probe" => {
+            result_outcome(probe_status_payload(&state, &record))
+        }
+        Ok(Some(_)) => channel_error("invalid_request", "job_id does not refer to a probe job"),
+        Ok(None) => channel_error("invalid_request", "unknown or expired job_id"),
+        Err(error) => channel_error("store_failure", error.to_string()),
+    }
+}
+
+async fn execute_probe_job(state: Arc<ModuleState>, job_id: String, model_filter: Vec<String>) {
+    if !matches!(
+        state
+            .store
+            .mark_job_running(&job_id, state.module_generation, now_ms()),
+        Ok(true)
+    ) {
+        return;
+    }
+
+    let fixture = match probe_fixture() {
+        Ok(fixture) => fixture,
+        Err(error) => {
+            fail_job_with_wire_error(&state, &job_id, false, error);
+            return;
+        }
+    };
+    let selected_models = state
+        .runtime
+        .models
+        .values()
+        .filter(|model| {
+            model_filter.is_empty() || model_filter.iter().any(|id| id == &model.model_id)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let mut lane_results = Vec::new();
+    let mut certified_vectors = Vec::new();
+    for model in selected_models {
+        let texts = fixture
+            .items
+            .iter()
+            .map(|item| item.text.as_str())
+            .collect::<Vec<_>>();
+        let tokenized = match model.tokenizer.tokenize_batch(texts) {
+            Ok(tokenized) => tokenized,
+            Err(error) => {
+                lane_results.push(json!({
+                    "model_id": model.model_id,
+                    "fingerprint": model.fingerprint,
+                    "numeric_profile_id": model.numeric_profile_id,
+                    "status": "uncertified",
+                    "error": error.to_string(),
+                }));
+                continue;
+            }
+        };
+        let vectors = match execute_embedding(&state.runtime, &model, tokenized.batch).await {
+            Ok(vectors) => vectors,
+            Err(error) => {
+                lane_results.push(json!({
+                    "model_id": model.model_id,
+                    "fingerprint": model.fingerprint,
+                    "numeric_profile_id": model.numeric_profile_id,
+                    "status": "uncertified",
+                    "error": error,
+                }));
+                continue;
+            }
+        };
+        let evidence = probe_evidence(&vectors, &fixture.items);
+        let passed = evidence.mean_cosine >= state.runtime.probe.mean_cosine_threshold
+            && evidence.worst_decile >= state.runtime.probe.worst_decile_rank_overlap_threshold;
+        if passed {
+            let row = CertificationRow {
+                machine_profile_hash: state.machine_profile_hash.clone(),
+                numeric_profile_id: model.numeric_profile_id.clone(),
+                fingerprint: model.fingerprint.clone(),
+                certified_at_ms: now_ms(),
+                evidence: serde_json::to_value(&evidence).expect("probe evidence serializes"),
+            };
+            if let Err(error) = state.store.store_cert_row(&row) {
+                fail_job_with_wire_error(
+                    &state,
+                    &job_id,
+                    true,
+                    WireOperationError::from_stable(
+                        StableError::engine_crashed(Some(100)),
+                        format!("write certification row: {error}"),
+                    ),
+                );
+                return;
+            }
+            certified_vectors.push(ProbeLaneVectors {
+                model: Arc::clone(&model),
+                vectors: vectors.clone(),
+            });
+        }
+        lane_results.push(json!({
+            "model_id": model.model_id,
+            "fingerprint": model.fingerprint,
+            "numeric_profile_id": model.numeric_profile_id,
+            "status": if passed { "certified" } else { "uncertified" },
+            "evidence": evidence,
+            "thresholds": {
+                "mean_cosine": state.runtime.probe.mean_cosine_threshold,
+                "worst_decile": state.runtime.probe.worst_decile_rank_overlap_threshold,
+            },
+        }));
+    }
+
+    let mut alias_results = Vec::new();
+    for left_index in 0..certified_vectors.len() {
+        for right_index in left_index + 1..certified_vectors.len() {
+            let left = &certified_vectors[left_index];
+            let right = &certified_vectors[right_index];
+            if left.model.fingerprint == right.model.fingerprint {
+                continue;
+            }
+            let evidence = probe_evidence_between(&left.vectors, &right.vectors);
+            let passed = evidence.mean_cosine >= state.runtime.probe.mean_cosine_threshold
+                && evidence.worst_decile >= state.runtime.probe.worst_decile_rank_overlap_threshold;
+            if !passed {
+                continue;
+            }
+            let evidence_json = json!({
+                "source": "probe",
+                "left_model_id": left.model.model_id,
+                "right_model_id": right.model.model_id,
+                "metrics": evidence,
+            });
+            match state.store.declare_alias_pair(
+                &left.model.fingerprint,
+                &right.model.fingerprint,
+                &evidence_json,
+                now_ms(),
+            ) {
+                Ok((changed, table_epoch)) => alias_results.push(json!({
+                    "fingerprint_a": left.model.fingerprint,
+                    "fingerprint_b": right.model.fingerprint,
+                    "changed": changed,
+                    "table_epoch": table_epoch,
+                })),
+                Err(error) => {
+                    fail_job_with_wire_error(
+                        &state,
+                        &job_id,
+                        true,
+                        WireOperationError::from_stable(
+                            StableError::engine_crashed(Some(100)),
+                            format!("write alias row: {error}"),
+                        ),
+                    );
+                    return;
+                }
+            }
+        }
+    }
+
+    let result = json!({
+        "module_generation": state.module_generation,
+        "machine_profile_hash": state.machine_profile_hash,
+        "machine_profile": state.machine_profile,
+        "fixture": {
+            "items": fixture.items.len(),
+            "first_id": fixture.items.first().map(|item| item.id.clone()),
+            "generation_command": fixture.generation_command,
+        },
+        "lanes": lane_results,
+        "aliases": alias_results,
+    });
+    if let Err(error) = state.store.complete_job(&job_id, &result, &[], now_ms()) {
+        fail_job_with_wire_error(
+            &state,
+            &job_id,
+            true,
+            WireOperationError::from_stable(
+                StableError::engine_crashed(Some(100)),
+                format!("complete probe job: {error}"),
+            ),
+        );
+    }
+}
+
+fn probe_status_payload(state: &ModuleState, record: &JobRecord) -> Value {
+    let mut payload = job_status_payload(state, record);
+    if let Value::Object(map) = &mut payload {
+        if let Some(Value::Object(result)) = record.result_json.clone() {
+            map.extend(result);
+        }
+    }
+    payload
+}
+
+fn probe_fixture() -> Result<ProbeFixture, WireOperationError> {
+    serde_json::from_str(include_str!("fixtures/probe_corpus_minilm_ort_fp32.json")).map_err(
+        |error| {
+            WireOperationError::from_stable(
+                StableError::artifact_invalid(),
+                format!("decode built-in probe fixture: {error}"),
+            )
+        },
+    )
+}
+
+fn probe_evidence(vectors: &[Vec<f32>], items: &[ProbeFixtureItem]) -> ProbeEvidence {
+    let reference = items
+        .iter()
+        .map(|item| item.vector.clone())
+        .collect::<Vec<_>>();
+    probe_evidence_between(vectors, &reference)
+}
+
+fn probe_evidence_between(left: &[Vec<f32>], right: &[Vec<f32>]) -> ProbeEvidence {
+    let items = left.len().min(right.len());
+    if items == 0 || left.len() != right.len() {
+        return ProbeEvidence {
+            mean_cosine: 0.0,
+            rank_overlap: 0.0,
+            worst_decile: 0.0,
+            items: 0,
+        };
+    }
+    let mean_cosine = left
+        .iter()
+        .zip(right)
+        .map(|(left, right)| cosine(left, right))
+        .sum::<f64>()
+        / items as f64;
+    let (rank_overlap, worst_decile) = rank_overlap_metrics(left, right);
+    ProbeEvidence {
+        mean_cosine,
+        rank_overlap,
+        worst_decile,
+        items,
+    }
+}
+
+fn rank_overlap_metrics(left: &[Vec<f32>], right: &[Vec<f32>]) -> (f64, f64) {
+    let n = left.len().min(right.len());
+    if n <= 2 {
+        return (1.0, 1.0);
+    }
+    let k = (n / 10).max(1).min(n - 1);
+    let mut overlaps = Vec::with_capacity(n);
+    for query in 0..n {
+        let top_left = top_k_neighbors(query, left, k);
+        let top_right = top_k_neighbors(query, right, k);
+        let hits = top_left
+            .iter()
+            .filter(|candidate| top_right.contains(candidate))
+            .count();
+        overlaps.push(hits as f64 / k as f64);
+    }
+    overlaps.sort_by(f64::total_cmp);
+    let mean = overlaps.iter().sum::<f64>() / overlaps.len() as f64;
+    let worst_len = overlaps.len().div_ceil(10).max(1);
+    let worst = overlaps[..worst_len].iter().sum::<f64>() / worst_len as f64;
+    (mean, worst)
+}
+
+fn top_k_neighbors(query: usize, vectors: &[Vec<f32>], k: usize) -> BTreeSet<usize> {
+    let mut scored = vectors
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != query)
+        .map(|(index, vector)| (cosine(&vectors[query], vector), index))
+        .collect::<Vec<_>>();
+    scored.sort_by(|left, right| {
+        right
+            .0
+            .total_cmp(&left.0)
+            .then_with(|| left.1.cmp(&right.1))
+    });
+    scored.into_iter().take(k).map(|(_, index)| index).collect()
+}
+
+fn cosine(left: &[f32], right: &[f32]) -> f64 {
+    if left.len() != right.len() || left.is_empty() {
+        return 0.0;
+    }
+    let dot = left
+        .iter()
+        .zip(right)
+        .map(|(left, right)| f64::from(*left) * f64::from(*right))
+        .sum::<f64>();
+    let left_norm = left
+        .iter()
+        .map(|value| f64::from(*value).powi(2))
+        .sum::<f64>()
+        .sqrt();
+    let right_norm = right
+        .iter()
+        .map(|value| f64::from(*value).powi(2))
+        .sum::<f64>()
+        .sqrt();
+    dot / (left_norm * right_norm + 1e-12)
+}
+
+async fn aliases_check_index(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
+    let params: AliasesCheckIndexParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(error) => {
+            return channel_error(
+                "invalid_request",
+                format!("invalid aliases.check_index params: {error}"),
+            )
+        }
+    };
+    let alias_table = match state.store.alias_table() {
+        Ok(alias_table) => alias_table,
+        Err(error) => return channel_error("store_failure", error.to_string()),
+    };
+    let provenance_set = params
+        .provenance_set
+        .into_iter()
+        .filter(|fingerprint| !fingerprint.trim().is_empty())
+        .map(Fingerprint)
+        .collect::<BTreeSet<_>>();
+    let verdict = alias_table.check_index(&Fingerprint(params.index_fingerprint), &provenance_set);
+    result_outcome(json!({
+        "module_generation": state.module_generation,
+        "table_epoch": alias_table.table_epoch,
+        "verdict": verdict,
+    }))
+}
+
+async fn alias_retract(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
+    mutate_alias_pair(state, params, AliasMutation::Retract).await
+}
+
+async fn alias_declare(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
+    mutate_alias_pair(state, params, AliasMutation::Declare).await
+}
+
+enum AliasMutation {
+    Declare,
+    Retract,
+}
+
+async fn mutate_alias_pair(
+    state: Arc<ModuleState>,
+    params: Value,
+    mutation: AliasMutation,
+) -> HandlerOutcome {
+    if !state.runtime.alias_admin_enabled {
+        return result_outcome(error_payload(
+            &state,
+            WireOperationError::from_stable(
+                StableError::substitution_rejected(),
+                "alias admin mutations require alias_admin_enabled config",
+            ),
+        ));
+    }
+    let params: AliasPairParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(error) => {
+            return channel_error(
+                "invalid_request",
+                format!("invalid alias mutation params: {error}"),
+            )
+        }
+    };
+    let (left, right, evidence) = match params.fingerprints() {
+        Ok(pair) => pair,
+        Err(message) => return channel_error("invalid_request", message),
+    };
+    let result = match mutation {
+        AliasMutation::Declare => {
+            state
+                .store
+                .declare_alias_pair(&left, &right, &evidence, now_ms())
+        }
+        AliasMutation::Retract => {
+            state
+                .store
+                .retract_alias_pair(&left, &right, &evidence, now_ms())
+        }
+    };
+    match result {
+        Ok((changed, table_epoch)) => result_outcome(json!({
+            "module_generation": state.module_generation,
+            "changed": changed,
+            "table_epoch": table_epoch,
+        })),
+        Err(error) => channel_error("store_failure", error.to_string()),
+    }
+}
+
+async fn admission_status(state: Arc<ModuleState>) -> HandlerOutcome {
+    let scheduler = match state.runtime.scheduler.lock() {
+        Ok(scheduler) => scheduler,
+        Err(_) => {
+            return result_outcome(error_payload(
+                &state,
+                WireOperationError::from_stable(
+                    StableError::queue_full(Some(100)),
+                    "inline scheduler state is unavailable",
+                ),
+            ))
+        }
+    };
+    let predicted_start_delay_ms = if state.runtime.execution.available_permits() == 0 {
+        state.runtime.inline.estimated_execution_ms
+    } else {
+        0
+    };
+    let lanes = state
+        .runtime
+        .models
+        .values()
+        .map(|model| {
+            let certified = state
+                .store
+                .get_cert_row(&state.machine_profile_hash, &model.fingerprint)
+                .ok()
+                .flatten()
+                .is_some();
+            let certification_stale = state
+                .store
+                .has_stale_cert_row(&state.machine_profile_hash, &model.fingerprint)
+                .unwrap_or(false)
+                && !certified;
+            json!({
+                "model_id": model.model_id,
+                "fingerprint": model.fingerprint,
+                "meeting_deadlines": predicted_start_delay_ms <= state.runtime.inline.max_queue_ms,
+                "p50_start_delay_ms": predicted_start_delay_ms,
+                "certified": certified,
+                "certification_stale": certification_stale,
+            })
+        })
+        .collect::<Vec<_>>();
+    let certification_stale = lanes
+        .iter()
+        .any(|lane| lane["certification_stale"].as_bool().unwrap_or(false));
+    result_outcome(json!({
+        "module_generation": state.module_generation,
+        "machine_profile_hash": state.machine_profile_hash,
+        "inline_in_flight_bytes": scheduler.in_flight_bytes,
+        "lanes": lanes,
+        "certification_stale": certification_stale,
+    }))
+}
+
+fn models_status_payload(state: &ModuleState) -> Value {
+    json!({
+        "module_generation": state.module_generation,
+        "machine_profile_hash": state.machine_profile_hash,
+        "models": state.runtime.catalog_entries(),
+    })
+}
+
+fn module_health(state: &ModuleState) -> ModuleHealth {
+    let lanes = state
+        .runtime
+        .models
+        .values()
+        .map(|model| {
+            let certified = state
+                .store
+                .get_cert_row(&state.machine_profile_hash, &model.fingerprint)
+                .ok()
+                .flatten()
+                .is_some();
+            let certification_stale = state
+                .store
+                .has_stale_cert_row(&state.machine_profile_hash, &model.fingerprint)
+                .unwrap_or(false)
+                && !certified;
+            LaneHealth {
+                model_id: model.model_id.clone(),
+                fingerprint: model.fingerprint.clone(),
+                certified,
+                certification_stale,
+            }
+        })
+        .collect::<Vec<_>>();
+    ModuleHealth {
+        status: "ok".to_string(),
+        module_generation: state.module_generation,
+        loaded_models: state.runtime.models.len(),
+        machine_profile_hash: state.machine_profile_hash.clone(),
+        certification_stale: lanes.iter().any(|lane| lane.certification_stale),
+        lanes,
+    }
 }
 
 async fn cache_pin(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
@@ -1767,6 +2488,8 @@ fn management_operations() -> Vec<ManagementOperation> {
         op("probe.start", Mutate),
         op("probe.status", Query),
         op("aliases.check_index", Query),
+        op("alias.retract", Mutate),
+        op("alias.declare", Mutate),
         op("cache.pin", Mutate),
         op("cache.gc", Mutate),
         op("admission.status", Query),
@@ -1812,6 +2535,9 @@ fn load_module_config() -> Result<ModuleConfig, ModuleError> {
             preload_models,
             inline: InlineConfig::default(),
             jobs: JobConfig::default(),
+            probe: ProbeConfig::default(),
+            alias_admin_enabled: false,
+            dev: DevConfig::default(),
         });
     }
     if let Ok(path) = env::var("SYNAPSE_CONFIG") {
@@ -1931,14 +2657,6 @@ fn sha256_file(path: &Path) -> Result<String, ModuleError> {
 
 fn request_bytes_for_texts<'text>(texts: impl IntoIterator<Item = &'text str>) -> u64 {
     texts.into_iter().map(|text| text.len() as u64 + 128).sum()
-}
-
-fn table_epoch(state: &ModuleState) -> u64 {
-    state
-        .store
-        .catalog_snapshot()
-        .map(|snapshot| snapshot.table_epoch)
-        .unwrap_or(0)
 }
 
 fn now_ms() -> u64 {

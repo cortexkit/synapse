@@ -77,14 +77,15 @@ pub async fn read_frame_timeout(stream: &mut TcpStream) -> Frame {
 
 pub async fn route_open(stream: &mut TcpStream, project_root: &Path, corr: u64) -> u16 {
     let mut last_error = String::new();
-    for attempt in 0..4 {
+    for attempt in 0..10 {
         let target = RouteTarget::ManagementSurface {
             module_id: MODULE_ID.to_string(),
         };
+        let bind_id = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let identity = BindIdentity {
             project_root: project_root.to_path_buf(),
-            harness: "synapse-e2e".to_string(),
-            session: "session-1".to_string(),
+            harness: format!("synapse-e2e-{}-{bind_id}", process::id()),
+            session: format!("session-{}-{bind_id}", process::id()),
         };
         let frame = control_rpc(
             stream,
@@ -101,9 +102,9 @@ pub async fn route_open(stream: &mut TcpStream, project_root: &Path, corr: u64) 
                 let value: Value = serde_json::from_slice(&frame.body).unwrap();
                 return value["route_channel"].as_u64().unwrap() as u16;
             }
-            FrameType::Error if is_module_timeout(&frame.body) && attempt < 3 => {
+            FrameType::Error if is_module_timeout(&frame.body) && attempt < 9 => {
                 last_error = String::from_utf8_lossy(&frame.body).to_string();
-                sleep(Duration::from_millis(250)).await;
+                sleep(Duration::from_millis(500)).await;
             }
             _ => {
                 panic!(
