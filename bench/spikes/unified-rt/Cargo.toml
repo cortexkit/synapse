@@ -17,3 +17,6 @@ synapse-bench = { path = "../../harness" }
 safetensors = "0.6.2"
 half = "2"
 libm = "0.2"
+
+[build-dependencies]
+cc = "1"

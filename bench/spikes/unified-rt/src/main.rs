@@ -170,7 +170,7 @@ fn main() -> Result<()> {
         parity_mean_cosine,
         self_peak_rss_bytes: None,
         notes: format!(
-            "direct eager BERT encoder, provider={}, length-sorted attention_units={}, max_len={}, mean_pool+l2; Metal provider currently initializes only as a trait-boundary stub",
+            "direct eager BERT encoder, provider={}, length-sorted attention_units={}, max_len={}, mean_pool+l2; Metal path uses MPSGraph for all matmuls and CPU loops for pointwise ops",
             provider.name(),
             args.attention_units,
             args.max_length
@@ -192,7 +192,7 @@ fn main() -> Result<()> {
 fn make_provider(device: DeviceArg) -> Result<Box<dyn KernelProvider>> {
     match device {
         DeviceArg::Cpu => Ok(Box::new(CpuProvider)),
-        DeviceArg::Metal => Ok(Box::new(MetalProvider)),
+        DeviceArg::Metal => Ok(Box::new(MetalProvider::new()?)),
     }
 }
 
@@ -209,6 +209,7 @@ fn write_vectors(path: &Path, vectors: &[(String, Vec<f32>)]) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 trait KernelProvider {
     fn name(&self) -> &'static str;
 
@@ -222,6 +223,19 @@ trait KernelProvider {
         b_layout: BLayout,
         c: &mut [f32],
     ) -> Result<()>;
+
+    fn matmul_static_rhs(
+        &mut self,
+        m: usize,
+        n: usize,
+        k: usize,
+        a: &[f32],
+        b: &[f32],
+        b_layout: BLayout,
+        c: &mut [f32],
+    ) -> Result<()> {
+        self.matmul(m, n, k, a, b, b_layout, c)
+    }
 
     fn layer_norm(
         &mut self,
@@ -292,26 +306,180 @@ impl KernelProvider for CpuProvider {
     }
 }
 
-struct MetalProvider;
+struct MetalProvider {
+    context: metal_backend::MpsGraphContext,
+}
+
+impl MetalProvider {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            context: metal_backend::MpsGraphContext::new()?,
+        })
+    }
+}
 
 impl KernelProvider for MetalProvider {
     fn name(&self) -> &'static str {
-        "metal-stub"
+        "metal-mpsgraph-matmul-cpu-pointwise"
     }
 
     fn matmul(
         &mut self,
-        _m: usize,
-        _n: usize,
-        _k: usize,
-        _a: &[f32],
-        _b: &[f32],
-        _b_layout: BLayout,
-        _c: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+        a: &[f32],
+        b: &[f32],
+        b_layout: BLayout,
+        c: &mut [f32],
     ) -> Result<()> {
-        bail!(
-            "Metal provider boundary exists but execution is not implemented in this spike; CPU parity was prioritized per supervision"
-        )
+        ensure!(a.len() == m * k, "matmul A shape mismatch");
+        ensure!(b.len() == n * k, "matmul B shape mismatch");
+        ensure!(c.len() == m * n, "matmul C shape mismatch");
+        self.context.matmul(m, n, k, a, b, b_layout, c, false)
+    }
+
+    fn matmul_static_rhs(
+        &mut self,
+        m: usize,
+        n: usize,
+        k: usize,
+        a: &[f32],
+        b: &[f32],
+        b_layout: BLayout,
+        c: &mut [f32],
+    ) -> Result<()> {
+        ensure!(a.len() == m * k, "matmul A shape mismatch");
+        ensure!(b.len() == n * k, "matmul B shape mismatch");
+        ensure!(c.len() == m * n, "matmul C shape mismatch");
+        self.context.matmul(m, n, k, a, b, b_layout, c, true)
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod metal_backend {
+    use std::ffi::{c_char, c_void, CStr};
+    use std::ptr::NonNull;
+
+    use anyhow::{bail, Result};
+
+    use super::BLayout;
+
+    pub struct MpsGraphContext {
+        raw: NonNull<c_void>,
+    }
+
+    impl MpsGraphContext {
+        pub fn new() -> Result<Self> {
+            let raw = unsafe { synapse_mps_context_new() };
+            let raw = NonNull::new(raw).ok_or_else(last_error)?;
+            Ok(Self { raw })
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn matmul(
+            &mut self,
+            m: usize,
+            n: usize,
+            k: usize,
+            a: &[f32],
+            b: &[f32],
+            b_layout: BLayout,
+            c: &mut [f32],
+            cache_rhs: bool,
+        ) -> Result<()> {
+            let b_is_row_major_nk = match b_layout {
+                BLayout::RowMajorKn => 0,
+                BLayout::RowMajorNkTransposed => 1,
+            };
+            let status = unsafe {
+                synapse_mps_matmul(
+                    self.raw.as_ptr(),
+                    m as u64,
+                    n as u64,
+                    k as u64,
+                    a.as_ptr(),
+                    b.as_ptr(),
+                    b_is_row_major_nk,
+                    c.as_mut_ptr(),
+                    i32::from(cache_rhs),
+                )
+            };
+            if status != 0 {
+                bail!(
+                    "MPSGraph matmul failed with status {status}: {}",
+                    last_error()
+                );
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for MpsGraphContext {
+        fn drop(&mut self) {
+            unsafe { synapse_mps_context_free(self.raw.as_ptr()) }
+        }
+    }
+
+    fn last_error() -> anyhow::Error {
+        unsafe {
+            let raw = synapse_mps_last_error();
+            if raw.is_null() {
+                return anyhow::anyhow!("unknown MPSGraph error");
+            }
+            let message = CStr::from_ptr(raw).to_string_lossy();
+            if message.is_empty() {
+                anyhow::anyhow!("unknown MPSGraph error")
+            } else {
+                anyhow::anyhow!(message.into_owned())
+            }
+        }
+    }
+
+    unsafe extern "C" {
+        fn synapse_mps_context_new() -> *mut c_void;
+        fn synapse_mps_context_free(context: *mut c_void);
+        fn synapse_mps_matmul(
+            context: *mut c_void,
+            m: u64,
+            n: u64,
+            k: u64,
+            a: *const f32,
+            b: *const f32,
+            b_is_row_major_nk: i32,
+            c: *mut f32,
+            cache_rhs: i32,
+        ) -> i32;
+        fn synapse_mps_last_error() -> *const c_char;
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+mod metal_backend {
+    use anyhow::{bail, Result};
+
+    use super::BLayout;
+
+    pub struct MpsGraphContext;
+
+    impl MpsGraphContext {
+        pub fn new() -> Result<Self> {
+            bail!("Metal MPSGraph provider is only available on macOS")
+        }
+
+        pub fn matmul(
+            &mut self,
+            _m: usize,
+            _n: usize,
+            _k: usize,
+            _a: &[f32],
+            _b: &[f32],
+            _b_layout: BLayout,
+            _c: &mut [f32],
+            _cache_rhs: bool,
+        ) -> Result<()> {
+            bail!("Metal MPSGraph provider is only available on macOS")
+        }
     }
 }
 
@@ -809,7 +977,7 @@ impl Linear {
         ensure!(self.bias.len() == output, "linear bias shape mismatch");
         ensure!(values.len() == rows * input, "linear values shape mismatch");
         let mut out = vec![0.0f32; rows * output];
-        provider.matmul(
+        provider.matmul_static_rhs(
             rows,
             output,
             input,
@@ -828,6 +996,7 @@ impl Linear {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn self_attention(
     provider: &mut dyn KernelProvider,
     q: &[f32],
@@ -932,8 +1101,11 @@ fn mean_pool_l2(
             if attention_mask[b * seq + s] == 1 {
                 count += 1.0;
                 let start = (b * seq + s) * hidden_size;
-                for h in 0..hidden_size {
-                    vector[h] += hidden.data[start + h];
+                for (value, hidden_value) in vector
+                    .iter_mut()
+                    .zip(&hidden.data[start..start + hidden_size])
+                {
+                    *value += *hidden_value;
                 }
             }
         }
@@ -1077,4 +1249,66 @@ fn get_tensor(tensors: &HashMap<String, Tensor>, base_name: &str) -> Result<Tens
         }
     }
     bail!("missing tensor; tried {}", candidates.join(", "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_close(actual: &[f32], expected: &[f32]) {
+        assert_eq!(actual.len(), expected.len());
+        for (index, (left, right)) in actual.iter().zip(expected).enumerate() {
+            let diff = (left - right).abs();
+            assert!(
+                diff <= 1e-3,
+                "value {index} differs: actual={left}, expected={right}, diff={diff}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn metal_provider_matches_cpu_for_row_major_rhs() {
+        let mut metal = MetalProvider::new().expect("create MPSGraph provider");
+        let mut cpu = CpuProvider;
+        let a = vec![1.0, 2.0, 3.0, 4.0, -2.0, 0.5];
+        let b = vec![
+            0.5, -1.0, 2.0, 1.5, 3.0, -0.5, -2.0, 0.25, 1.25, -1.5, 0.75, 2.5,
+        ];
+        let mut metal_out = vec![0.0; 8];
+        let mut cpu_out = vec![0.0; 8];
+        metal
+            .matmul(2, 4, 3, &a, &b, BLayout::RowMajorKn, &mut metal_out)
+            .expect("run MPSGraph matmul");
+        cpu.matmul(2, 4, 3, &a, &b, BLayout::RowMajorKn, &mut cpu_out)
+            .expect("run CPU matmul");
+        assert_close(&metal_out, &cpu_out);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn metal_provider_matches_cpu_for_transposed_rhs_storage() {
+        let mut metal = MetalProvider::new().expect("create MPSGraph provider");
+        let mut cpu = CpuProvider;
+        let a = vec![1.0, 2.0, 3.0, 4.0, -2.0, 0.5];
+        let b = vec![
+            0.5, 3.0, 1.25, -1.0, -0.5, -1.5, 2.0, -2.0, 0.75, 1.5, 0.25, 2.5,
+        ];
+        let mut metal_out = vec![0.0; 8];
+        let mut cpu_out = vec![0.0; 8];
+        metal
+            .matmul(
+                2,
+                4,
+                3,
+                &a,
+                &b,
+                BLayout::RowMajorNkTransposed,
+                &mut metal_out,
+            )
+            .expect("run MPSGraph matmul");
+        cpu.matmul(2, 4, 3, &a, &b, BLayout::RowMajorNkTransposed, &mut cpu_out)
+            .expect("run CPU matmul");
+        assert_close(&metal_out, &cpu_out);
+    }
 }

@@ -5930,6 +5930,7 @@ name = "spike-unified-rt"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "cc",
  "clap",
  "half",
  "libm",
