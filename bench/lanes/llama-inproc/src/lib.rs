@@ -1,5 +1,6 @@
 use std::num::NonZeroU32;
 use std::path::Path;
+use std::time::Instant;
 
 use anyhow::{ensure, Context, Result};
 use llama_cpp_2::{
@@ -99,6 +100,27 @@ pub struct PreparedText {
     pub id: String,
     pub original_index: usize,
     pub token_ids: Vec<i32>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResetPolicy {
+    Sequence,
+    Context,
+    None,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SequenceRef<'a> {
+    pub seq_id: i32,
+    pub token_ids: &'a [i32],
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct EmbedCallMetrics {
+    pub batch_build_ms: f64,
+    pub reset_ms: f64,
+    pub infer_ms: f64,
+    pub pool_ms: f64,
 }
 
 impl PreparedText {
@@ -266,57 +288,119 @@ pub fn embed_token_batches(
     pooling_implementation: PoolingImplementation,
     forward_pass: ForwardPass,
 ) -> Result<Vec<Vec<f32>>> {
+    let sequences = sequences
+        .iter()
+        .enumerate()
+        .map(|(seq_id, token_ids)| {
+            Ok(SequenceRef {
+                seq_id: i32::try_from(seq_id).context("sequence id does not fit into i32")?,
+                token_ids,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let (embeddings, _) = embed_sequences_with_metrics(
+        context,
+        &sequences,
+        pooling,
+        pooling_implementation,
+        forward_pass,
+        ResetPolicy::Sequence,
+    )?;
+    Ok(embeddings)
+}
+
+pub fn embed_sequences_with_metrics(
+    context: &mut LlamaContext<'_>,
+    sequences: &[SequenceRef<'_>],
+    pooling: PoolingMode,
+    pooling_implementation: PoolingImplementation,
+    forward_pass: ForwardPass,
+    reset_policy: ResetPolicy,
+) -> Result<(Vec<Vec<f32>>, EmbedCallMetrics)> {
     ensure!(!sequences.is_empty(), "cannot embed an empty batch");
 
-    let total_tokens = sequences.iter().map(Vec::len).sum::<usize>();
+    let total_tokens = sequences
+        .iter()
+        .map(|sequence| sequence.token_ids.len())
+        .sum::<usize>();
     ensure!(total_tokens > 0, "cannot embed a batch with zero tokens");
 
+    let batch_build_started = Instant::now();
     let seq_count =
         i32::try_from(sequences.len()).context("sequence count does not fit into i32")?;
     let mut batch = LlamaBatch::new(total_tokens, seq_count);
 
-    for (seq_id, tokens) in sequences.iter().enumerate() {
-        ensure!(!tokens.is_empty(), "sequence {seq_id} has zero tokens");
-        let llama_tokens: Vec<LlamaToken> = tokens.iter().copied().map(LlamaToken::new).collect();
+    for sequence in sequences {
+        ensure!(sequence.seq_id >= 0, "sequence ids must be non-negative");
+        ensure!(
+            !sequence.token_ids.is_empty(),
+            "sequence {} has zero tokens",
+            sequence.seq_id
+        );
+        let llama_tokens: Vec<LlamaToken> = sequence
+            .token_ids
+            .iter()
+            .copied()
+            .map(LlamaToken::new)
+            .collect();
         batch
-            .add_sequence(
-                &llama_tokens,
-                i32::try_from(seq_id).context("sequence id does not fit into i32")?,
-                true,
-            )
-            .with_context(|| format!("add sequence {seq_id} to llama batch"))?;
+            .add_sequence(&llama_tokens, sequence.seq_id, true)
+            .with_context(|| format!("add sequence {} to llama batch", sequence.seq_id))?;
     }
+    let batch_build_ms = batch_build_started.elapsed().as_secs_f64() * 1000.0;
 
-    reset_sequences(context, seq_count)?;
+    let reset_started = Instant::now();
+    reset_sequence_state(context, sequences, reset_policy)?;
+    let reset_ms = reset_started.elapsed().as_secs_f64() * 1000.0;
+
+    let infer_started = Instant::now();
     match forward_pass {
         ForwardPass::Encode => context.encode(&mut batch).context("llama_encode failed")?,
         ForwardPass::Decode => context.decode(&mut batch).context("llama_decode failed")?,
     }
+    let infer_ms = infer_started.elapsed().as_secs_f64() * 1000.0;
 
-    match pooling_implementation {
-        PoolingImplementation::Builtin => collect_builtin_embeddings(context, sequences.len()),
+    let pool_started = Instant::now();
+    let embeddings = match pooling_implementation {
+        PoolingImplementation::Builtin => collect_builtin_embeddings(context, sequences)?,
         PoolingImplementation::Manual => {
             let mut pooled = Vec::with_capacity(sequences.len());
             let mut token_offset = 0i32;
-            for tokens in sequences {
-                pooled.push(pool_sequence(context, token_offset, tokens.len(), pooling)?);
-                token_offset +=
-                    i32::try_from(tokens.len()).context("token count does not fit into i32")?;
+            for sequence in sequences {
+                pooled.push(pool_sequence(
+                    context,
+                    token_offset,
+                    sequence.token_ids.len(),
+                    pooling,
+                )?);
+                token_offset += i32::try_from(sequence.token_ids.len())
+                    .context("token count does not fit into i32")?;
             }
-            Ok(pooled)
+            pooled
         }
-    }
+    };
+    let pool_ms = pool_started.elapsed().as_secs_f64() * 1000.0;
+
+    Ok((
+        embeddings,
+        EmbedCallMetrics {
+            batch_build_ms,
+            reset_ms,
+            infer_ms,
+            pool_ms,
+        },
+    ))
 }
 
 fn collect_builtin_embeddings(
     context: &LlamaContext<'_>,
-    sequence_count: usize,
+    sequences: &[SequenceRef<'_>],
 ) -> Result<Vec<Vec<f32>>> {
-    let mut embeddings = Vec::with_capacity(sequence_count);
-    for seq_id in 0..sequence_count {
+    let mut embeddings = Vec::with_capacity(sequences.len());
+    for sequence in sequences {
         let mut vector = context
-            .embeddings_seq_ith(i32::try_from(seq_id).context("sequence id does not fit into i32")?)
-            .with_context(|| format!("read sequence embedding {seq_id}"))?
+            .embeddings_seq_ith(sequence.seq_id)
+            .with_context(|| format!("read sequence embedding {}", sequence.seq_id))?
             .to_vec();
         l2_normalize(&mut vector);
         embeddings.push(vector);
@@ -324,19 +408,38 @@ fn collect_builtin_embeddings(
     Ok(embeddings)
 }
 
-fn reset_sequences(context: &mut LlamaContext<'_>, sequence_count: i32) -> Result<()> {
-    let max_sequence_count =
-        usize::try_from(sequence_count).context("sequence count does not fit into usize")?;
-    for seq_id in 0..max_sequence_count {
-        context
-            .clear_kv_cache_seq(
-                Some(u32::try_from(seq_id).context("sequence id does not fit into u32")?),
-                None,
-                None,
-            )
-            .map_err(kv_reset_error)?;
+fn reset_sequence_state(
+    context: &mut LlamaContext<'_>,
+    sequences: &[SequenceRef<'_>],
+    reset_policy: ResetPolicy,
+) -> Result<()> {
+    match reset_policy {
+        ResetPolicy::None => Ok(()),
+        ResetPolicy::Context => {
+            context.clear_kv_cache();
+            Ok(())
+        }
+        ResetPolicy::Sequence => {
+            let mut seen = Vec::with_capacity(sequences.len());
+            for sequence in sequences {
+                if seen.contains(&sequence.seq_id) {
+                    continue;
+                }
+                context
+                    .clear_kv_cache_seq(
+                        Some(
+                            u32::try_from(sequence.seq_id)
+                                .context("sequence id does not fit into u32")?,
+                        ),
+                        None,
+                        None,
+                    )
+                    .map_err(kv_reset_error)?;
+                seen.push(sequence.seq_id);
+            }
+            Ok(())
+        }
     }
-    Ok(())
 }
 
 fn kv_reset_error(error: KvCacheConversionError) -> anyhow::Error {
