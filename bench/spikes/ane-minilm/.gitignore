@@ -1,0 +1,12 @@
+.build/
+.venv/
+__pycache__/
+artifacts/
+results/
+*.mlpackage
+*.mlmodelc/
+*.jsonl
+*.report.json
+*.stats.json
+*.placement.json
+*.powermetrics.txt
