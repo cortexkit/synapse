@@ -2,35 +2,38 @@
 
 ## Verdict
 
-The owned-runtime path is technically viable for a narrow fp32 encoder, and the Metal provider now has the backend contract this spike needed: a block-level MiniLM encoder entry point that runs all 6 encoder layers as one MPSGraph per batch shape while keeping hidden states resident on device. Correctness is not the blocker: the resident Metal path passes the 1,000-chunk ORT fp32 parity gate with mean cosine `0.9999999999985806`.
+The owned-runtime path is still technically viable for a narrow fp32 encoder, and the Metal provider still has the backend contract this spike needed: a block-level MiniLM encoder entry point that runs all 6 encoder layers as one MPSGraph per batch shape while keeping hidden states resident on device. Correctness remains strong: the resident fp32 Metal path still passes the 1,000-chunk ORT fp32 parity gate with mean cosine `0.9999999999986154`, mean top-10 rank overlap `1.0`, and worst-decile overlap `1.0`.
 
-Performance changed qualitatively once the CPU/GPU boundary moved from eager matmuls to whole encoder blocks. On the M1 bench box, the old mixed provider reached only **2.34k tok/s** because it read activations back for CPU pointwise work. The resident encoder reached **75.996k tok/s** on the first locked run after upload and **116.534k tok/s** on the final locked rerun after MPSGraph/system caches were warm, versus **6.955k tok/s** for the owned CPU/Accelerate path on the same 1,000 chunks. Even the conservative first resident run is above the lane's llama.cpp-Metal context number (**51.8k tok/s**); the honest remaining gap is to MLX (**132.6k tok/s**), where resident MPSGraph is about **1.7x slower cold-ish** and **1.14x slower warm**.
+The new f16 variant answers a different question: **quality stayed inside the certified-equivalence band, but throughput collapsed on the M1 bench box**. On the same 1,000-chunk subset, resident f16 measured mean cosine `0.9999993204962262`, mean top-10 rank overlap `0.9995`, and worst-decile overlap `0.995`, so the vectors stayed extremely close to ORT fp32. But the timed locked runs reached only **4.236k tok/s** on the first run and **4.234k tok/s** warm. That is below the owned CPU/Accelerate baseline (**6.955k tok/s**) and nowhere near resident fp32 (**76.0k/116.5k**) or MLX (**132.6k**).
 
-For Synapse v1, full ownership is still not automatically the economical default, but the Metal conclusion is now different: **MPSGraph is a viable Metal path when the provider receives whole encoder blocks with explicit residency**. It is not viable one eager op at a time. The remaining owned-runtime question is whether building and maintaining graph-level contracts, f16/quant variants, schedulers, and additional model families is worth the product schedule cost compared with linking llama.cpp/MLX.
+The public MPSGraph matrix-multiplication API in Xcode 26.6 exposes operand dtypes, but not a separate accumulation-precision control. This implementation therefore keeps hidden states and static encoder weights resident in f16, upcasts layernorm / GELU / softmax reductions to f32 where explicit casts are available, and leaves embeddings + pooling on CPU fp32. That was enough to keep quality strong, but not enough to make MPSGraph float16 fast on this M1 path.
+
+For Synapse v1, the Metal conclusion is now split: **MPSGraph block residency is a viable fp32 Metal path for MiniLM-like encoders, but this measured f16 path is not a performance win and does not narrow the MLX gap**. Treat `--dtype f16` as an honest negative result, not an optimization.
 
 ## What works
 
 Implemented at `bench/spikes/unified-rt/`:
 
 - A workspace crate and CLI-compatible lane binary (`spike-unified-rt`).
-- Owned tensor type: shape, row-major stride metadata, dtype, and owned f32 buffers.
+- Owned tensor type: shape, row-major stride metadata, dtype, owned f32 buffers, and optional f16 mirrors for Metal-only static encoder parameters.
 - Direct BERT execution rather than a general graph IR. For this spike that was the right trade: the hard evidence was model/kernels/scheduling, not graph optimizations.
 - Safetensors loader for f32/f16/bf16 float tensors, with non-float tensors ignored.
 - CPU kernel provider using Apple Accelerate `cblas_sgemm` for all dense and attention matmuls; layernorm, softmax, GELU, pooling, and L2 normalization are owned Rust loops.
 - Provider trait separating the model graph from kernels, with an optional block-level `encoder_forward` override. CPU keeps the scalar fallback path; Metal overrides the block.
 - Metal provider using a small Objective-C MPSGraph shim compiled by `cc`:
-  - `--device metal` initializes a Metal device and command queue.
+  - `--device metal --dtype f32|f16` initializes a Metal device and command queue.
   - The legacy eager `matmul` / `matmul_static_rhs` hooks remain for unit coverage and fallback experiments.
   - Dense weights, biases, and layernorm parameters are cached as Metal buffers by pointer and byte length.
-  - The resident path builds one MPSGraph per `(batch, seq, hidden, heads, intermediate, layers)` shape. The graph contains Q/K/V projections, scaled masked attention, softmax, attention output, residual adds, exact-erf GELU, FFN, and both encoder layernorms for all 6 layers.
+  - The resident path builds one MPSGraph per `(batch, seq, hidden, heads, intermediate, layers, dtype)` shape. The graph contains Q/K/V projections, scaled masked attention, softmax, attention output, residual adds, exact-erf GELU, FFN, and both encoder layernorms for all 6 layers.
   - CPU touches hidden states once to upload embedding+embedding-layernorm output and once to read back final hidden states. Mean pooling and L2 normalization remain CPU-side.
+  - `--dtype f16` converts encoder-layer static parameters once at load while keeping fp32 masters on CPU, uploads hidden states as f16, reads them back as f16, and converts only at the CPU boundary. Layernorm / GELU / softmax reductions are explicitly cast to f32 inside the graph where MPSGraph exposes that control. The public matmul API does not expose a separate accumulation-precision knob, so f16 matmuls use native MPSGraph behavior as measured.
 - Tokenizers preprocessing with 512 truncation, mean pooling, L2 normalization, and length-sorted greedy batching by attention-unit budget.
-- Unit tests compare MPSGraph matmul against the CPU provider for both supported RHS layouts and compare a tiny resident encoder block against the scalar CPU path.
+- Unit tests compare MPSGraph matmul against the CPU provider for both supported RHS layouts and compare tiny resident encoder blocks against the scalar CPU path for both fp32 and f16.
 
 Not working / deliberately out of scope for this lane:
 
 - GPU embedding lookup, embedding layernorm, mean pooling, and L2 normalization. They are once-per-batch boundaries and were not the measured bottleneck.
-- f16 Metal. The delivered provider is fp32 so it remains parity-comparable with the ORT fp32 reference; f16 should be measured separately before treating the speedup as a production number.
+- MPSGraph float16 as a production speedup on the M1 bench box. The measured `--dtype f16` path keeps quality, but it is much slower than resident fp32 and slower than the owned CPU baseline.
 - General graph compilation, custom Metal shaders, quantization, or new model families.
 
 ## Binding choice
@@ -39,29 +42,41 @@ I checked the objc2 ecosystem first. `objc2-metal-performance-shaders-graph` exi
 
 ## Correctness and throughput evidence
 
-The committed repo does not include `bench/data/corpus-v2.jsonl` because `bench/data/*.jsonl` is gitignored. Verification used `target/unified-rt-corpus-v2-1000.jsonl` from the first 1,000 rows of `bench/data/corpus-v2.jsonl` on the M1 bench box, matching `bench/run-matrix.sh`'s note that corpus-v2 is converted from the AFT chunk export.
+The committed repo does not include `bench/data/corpus-v2.jsonl` because `bench/data/*.jsonl` is gitignored. Verification used `~/bench-tools/unified-rt-metal/corpus-1000.jsonl` on the M1 bench box, matching the previously documented 1,000-row corpus-v2 subset.
 
-Reference vectors were generated with `lane-ort-embed` using `sentence-transformers/all-MiniLM-L6-v2` ONNX fp32, mean pooling, max length 512. The M1 timed run used the shared timed-run lock at `[bench-user-home]/bench.lock`.
+Reference vectors were generated with `lane-ort-embed` using `sentence-transformers/all-MiniLM-L6-v2` ONNX fp32, mean pooling, max length 512. Rank-overlap checks used `synapse-bench parity --k 10 --stride 1` so every shared item acted as a query.
 
-| Lane / variant | Machine | Items | Tokens | Mean cosine vs ORT | Tok/s | Notes |
-|---|---|---:|---:|---:|---:|---|
-| ORT MiniLM fp32 reference | M1 bench | 1,000 | 172,746 | reference | 11,488.2 | Reference vectors for this run |
-| Owned RT CPU/Accelerate | M1 bench | 1,000 | 172,746 | 0.9999999999985222 | 6,955.5 | Scalar provider, Accelerate SGEMM |
-| Owned RT Metal MPSGraph matmul + CPU pointwise | M1 bench | 1,000 | 172,746 | 0.9999999999985539 | 2,338.8 | Previous eager mixed provider; boundary dominated |
-| Owned RT Metal resident encoder MPSGraph | M1 bench | 1,000 | 172,746 | 0.9999999999985806 | 75,996.3 | First locked resident run after upload; one full 6-layer encoder graph per batch shape |
-| Owned RT Metal resident encoder MPSGraph | M1 bench | 1,000 | 172,746 | 0.9999999999985806 | 116,534.4 | Final locked rerun after MPSGraph/system caches were warm |
-| Owned RT Metal MPSGraph matmul + CPU pointwise | local M5 dev run | 1,000 | 172,746 | 0.9999999999985539 | 3,513.1 | Older non-authoritative dev-loop run |
+### Quality / parity on the 1,000-chunk subset
 
-Context numbers from the lane prompt for the same M1 bench box and corpus:
+| Variant | Mean cosine vs ORT fp32 | Mean top-10 overlap | Worst-decile overlap | Notes |
+|---|---:|---:|---:|---|
+| ORT MiniLM fp32 reference | reference | reference | reference | Reference vectors for this run |
+| Owned RT Metal resident encoder fp32 | 0.9999999999986154 | 1.0000 | 1.0000 | Current fp32 recheck on the resident path |
+| Owned RT Metal resident encoder f16 | 0.9999993204962262 | 0.9995 | 0.9950 | `--dtype f16` resident path |
 
-| Engine context | Tok/s | Resident Metal gap |
-|---|---:|---:|
-| llama.cpp Metal | 51.8k | resident MPSGraph is ~1.47x faster on the conservative run, ~2.25x faster warm |
-| MLX Metal | 132.6k | resident MPSGraph is ~0.57x as fast cold-ish, ~0.88x as fast warm |
-| ORT CPU | 11.5k | resident MPSGraph is ~6.6x to ~10.1x faster |
-| Owned RT CPU seed | ~5-10k | resident MPSGraph is above this band |
+The f16 path cleared the tail-sensitive gate shape the project uses elsewhere (`>= 0.999` cosine, `>= 0.95` rank overlap, `>= 0.9` worst-decile overlap). The f16-vs-fp32 quality delta was tiny: about `-6.80e-7` mean cosine, `-0.0005` mean top-10 overlap, and `-0.0050` worst-decile overlap.
 
-Interpretation: Metal correctness stayed excellent, and moving pointwise work into the same MPSGraph eliminated the dominant transfer cost. The two resident rows show the likely MPSGraph compile/system-cache sensitivity; both clear the CPU and mixed-provider bars. This is still a narrow fp32 MiniLM result, not a claim that the owned runtime is broadly competitive with MLX across models or dtypes.
+### Throughput on the M1 bench box
+
+Timed runs used the shared lock at `[bench-user-home]/bench.lock`. The new f16 numbers were measured after the parity pass above, then rerun immediately under the same lock to capture the warm-cache state identically to the published fp32 rows.
+
+| Variant | First locked tok/s | Warm locked tok/s | Notes |
+|---|---:|---:|---|
+| Owned RT CPU/Accelerate | 6,955.5 | — | Scalar provider, Accelerate SGEMM |
+| Owned RT Metal MPSGraph matmul + CPU pointwise | 2,338.8 | — | Previous eager mixed provider; boundary dominated |
+| Owned RT Metal resident encoder MPSGraph fp32 | 75,996.3 | 116,534.4 | Published resident fp32 locked pair |
+| Owned RT Metal resident encoder MPSGraph f16 | 4,236.4 | 4,234.3 | New locked pair; essentially no warm-cache gain |
+
+### Context numbers from the lane prompt for the same M1 bench box and corpus
+
+| Engine context | Tok/s | Resident fp32 gap | Resident f16 gap |
+|---|---:|---:|---:|
+| llama.cpp Metal | 51.8k | fp32 is ~1.47x faster cold-ish, ~2.25x faster warm | f16 is ~0.08x as fast |
+| MLX Metal | 132.6k | fp32 is ~0.57x as fast cold-ish, ~0.88x as fast warm | f16 is ~0.03x as fast |
+| ORT CPU | 11.5k | fp32 is ~6.6x to ~10.1x faster | f16 is ~0.37x as fast |
+| Owned RT CPU seed | ~5-10k | fp32 is above this band | f16 falls below the measured CPU baseline |
+
+Interpretation: the fp32 resident result still says block-level residency matters, and the f16 result says dtype alone is not a free speed win on this backend. **f16 kept the vectors but lost the speed**: versus resident fp32, the new path is about **17.9x slower** on the first locked run and **27.5x slower** on the warm rerun.
 
 ## Transfer-cost analysis
 
@@ -84,7 +99,14 @@ What the resident encoder saves:
 - Head layout changes are MPSGraph reshapes/transposes rather than CPU scratch packing.
 - Static weights and biases are still cached as Metal buffers and fed to the per-shape graph.
 
-The measured effect is the core lesson of the spike: replacing CPU loops with separate GPU ops would have increased synchronization pressure, while changing the provider contract to whole encoder blocks removes hundreds of per-batch upload/readback boundaries.
+What the f16 resident variant changed:
+
+- Encoder-layer static parameters are converted once to f16 mirrors at load and uploaded from those mirrors rather than from fp32 buffers.
+- Hidden states cross the CPU/GPU boundary as f16 instead of fp32.
+- Layernorm / GELU / softmax are explicitly cast to f32 inside the graph, then cast back to f16, because those are the cheap reduction-heavy spots where MPSGraph gives an explicit control surface.
+- The public MPSGraph matmul API does **not** expose a separate accumulation-precision control, so the measured performance difference comes from MPSGraph's native float16 execution path rather than from extra synchronization boundaries.
+
+The measured effect remains the core lesson of the spike: replacing CPU loops with separate GPU ops would have increased synchronization pressure, while changing the provider contract to whole encoder blocks removes hundreds of per-batch upload/readback boundaries. But the new result adds an important qualifier: **cutting boundary bytes in half was not enough to make MPSGraph float16 faster on this M1 path**.
 
 ## Time spent / velocity datum
 
@@ -101,9 +123,10 @@ Approximate additional Lane 2 allocation:
 | Full-stack MPSGraph encoder shim | 2.0 | One 6-layer graph per batch shape with resident attention, GELU, residual, and layernorm intermediates |
 | Resident encoder tests and debug | 0.7 | Added tiny encoder CPU-vs-Metal unit coverage and fixed graph shape/feed details |
 | Resident M1 parity/throughput measurement | 0.6 | Uploaded arm64 binary, regenerated ORT references, measured CPU and resident Metal under lock, then reran final Metal binary after caches were warm |
+| Resident f16 variant + M1 measurement | 1.6 | Added load-time f16 mirrors, upload/readback boundary casts, full-tail parity checks, and honest locked throughput numbers |
 | Memo update | 0.5 | Results, transfer analysis, revised verdict |
 
-Total Lane 2 time is about **7.5-8 hours**. Combined with the first CPU/runtime spike, the evidence base is about **12-13 hours**.
+Total Lane 2 time is about **9-9.5 hours**. Combined with the first CPU/runtime spike, the evidence base is about **13.5-14.5 hours**.
 
 ## Walls hit
 
@@ -112,17 +135,17 @@ Total Lane 2 time is about **7.5-8 hours**. Combined with the first CPU/runtime 
 3. **Shape specialization remains a scheduling concern.** The implementation caches one graph per batch/sequence shape; production should bucket or prewarm shapes to control compile/cache churn.
 4. **Numerical parity requires exact boring details.** GELU variant, layernorm epsilon, mask value, mean-pooling mask, tokenization/truncation, and position/type embeddings all had to match. A model family change repeats this work.
 5. **This does not solve the runtime product surface.** Production still needs scheduler-level queues, cancellation, backpressure, warm pools, memory budget accounting, f16/quant coverage, and model-family coverage.
+6. **Float16 quality and performance decoupled.** Tail metrics stayed excellent, but throughput collapsed. Until MPSGraph's float16 behavior is explained and improved, a smaller dtype does not imply a faster Metal lane.
 
 ## What would be hard next
 
 Engineering-hard, not research-hard:
 
 - Generalize the block-level provider contract or introduce a tiny graph IR so other encoders can hand MPSGraph whole blocks without bespoke FFI structs.
-- Add f16 and measure the speed/parity trade, including whether MPSGraph's reduced-precision paths beat fp32 on the M1/M-series matrix units.
+- Diagnose why MPSGraph float16 is dramatically slower than the resident fp32 graph on M1, and test whether a different graph formulation or newer runtime/API surface changes that result.
 - Move mean pooling/L2 normalization to the device when returning pooled vectors directly, while preserving the option to read final hidden states.
 - Add shape bucketing, graph prewarming, memory planning, and scratch-buffer accounting to avoid per-shape surprises.
 - CUDA and Vulkan providers with common layout contracts and per-provider autotuning.
-- CI matrix for model artifacts, parity fixtures, backend availability, and macOS/Xcode drift.
 
 Harder / partially research-shaped:
 
@@ -148,10 +171,10 @@ Estimated effort to turn this seed into Synapse's v1 local inference surface:
 | Test/parity harness, packaging, artifact management, docs | 6-10 | Medium |
 | Performance tuning to approach llama.cpp/MLX broadly | 8-14 | Medium-low |
 
-Total remains **60-90 engineer-weeks**, with meaningful risk that Vulkan/quant/Metal tuning expands the upper bound. The resident MiniLM result lowers the Metal technical-risk line item, but it does not remove the breadth cost.
+Total remains **60-90 engineer-weeks**, with meaningful risk that Vulkan/quant/Metal tuning expands the upper bound. The resident fp32 MiniLM result lowers the block-residency risk line item, but the f16 regression shows dtype-path risk is still real.
 
-Adopt-path comparison: linking llama.cpp/MLX as libraries still looks like **6-12 engineer-weeks** for robust packaging, lifecycle, scheduling, API wrapping, and parity/power measurement. Owned runtime therefore costs roughly **5-10x** more before it reaches comparable breadth, even though MPSGraph block residency is now a credible Metal implementation strategy for encoder models.
+Adopt-path comparison: linking llama.cpp/MLX as libraries still looks like **6-12 engineer-weeks** for robust packaging, lifecycle, scheduling, API wrapping, and parity/power measurement. Owned runtime therefore costs roughly **5-10x** more before it reaches comparable breadth, even though MPSGraph block residency is now a credible fp32 Metal implementation strategy for encoder models.
 
 ## Recommendation
 
-Keep this crate as evidence and as a CPU/Metal correctness harness. If the team wants an owned MiniLM-like encoder provider, MPSGraph block subgraphs are now a viable implementation path. Do not choose full ownership for all v1 local inference solely from this result: make that choice only if the strategy explicitly values long-term kernel/control ownership enough to pay the runtime, scheduler, dtype, quantization, and model-family cost.
+Keep this crate as evidence and as a CPU/Metal correctness harness. If the team wants an owned fp32 MiniLM-like encoder provider, MPSGraph block subgraphs are now a viable implementation path. Do **not** treat `--dtype f16` as a Metal speedup on the current M1 path: it preserves quality but destroys throughput. Do not choose full ownership for all v1 local inference solely from this result; make that choice only if the strategy explicitly values long-term kernel/control ownership enough to pay the runtime, scheduler, dtype, quantization, and model-family cost.
