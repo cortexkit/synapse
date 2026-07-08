@@ -44,11 +44,16 @@ trait EmbedEngine {
   over a unix socket (pre-tokenized ids in, vectors out) — not llama-server
   HTTP, not a foreign app. Worker crash = classified error + worker restart
   with crash budget; the module process never dies from engine faults. The
-  measured cost of process separation is small at batch granularity, and the
-  spike showed the child *winning* the Qwen hot-query path anyway (7.4 vs
-  17.7ms). If the latency spike closes the in-process gap, promotion of
-  llama.cpp to in-process remains possible LATER, per-engine-version, once a
-  crash-free record exists under the probe's shape envelope.
+  measured cost of process separation is small at batch granularity.
+  (History: an earlier draft cited the child's "latency win" on the Qwen hot
+  path as a second justification; the latency spike root-caused that as a
+  benchmark artifact — the child was replaying a cached prefix. Same-workload
+  comparison has in-process/worker FASTER than the HTTP child, so the worker
+  decision now rests on crash-domain grounds alone, which were sufficient
+  anyway. Honest fresh-query cost, M1-class: Qwen3-0.6B 14-17ms, MiniLM
+  ~2.5ms.) Promotion of llama.cpp to in-process remains possible LATER,
+  per-engine-version, once a crash-free record exists under the probe's shape
+  envelope.
 
 Artifact digest + format validation happens before any engine (worker or
 in-process) touches a file; engine-load failure = classified permanent error,
@@ -242,9 +247,11 @@ activation, alias events beyond the day-1 pair.
 
 ## Open items
 
-- Qwen hot-query latency mechanism (spike in flight) — decides worker protocol
-  tuning; does NOT block the worker-process decision (it's the safer shape
-  regardless, per F7).
+- ~~Qwen hot-query latency mechanism~~ RESOLVED: benchmark artifact
+  (cached-prefix replay in llama-server slots; see
+  bench/lanes/llama-inproc/SPIKE.md). Worker protocol spec now exists:
+  docs/design-worker-protocol.md. Harness rule adopted: latency loops must
+  vary query text (llama-server slot reuse cannot be disabled by flags).
 - ANE spike verdict → quiet-tier reality on M1-gen hardware.
 - Probe workload contents (built-in corpus + reference vectors: size/licensing
   pass pending).
