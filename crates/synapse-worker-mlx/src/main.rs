@@ -386,12 +386,16 @@ impl BertLayer {
             .forward(x)?
             .reshape(&[batch, seq_len, self.num_attention_heads, self.head_dim])?
             .transpose_axes(&[0, 2, 1, 3])?;
+        // MLX fused attention requires the mask dtype to promote to the output
+        // dtype; an f32 mask against bf16 Q/K/V promotes to f32 and is rejected,
+        // so the additive mask is cast to the computation dtype here.
+        let additive_mask = additive_mask.as_dtype(query.dtype())?;
         let attention = fast::scaled_dot_product_attention(
             &query,
             &key,
             &value,
             1.0 / (self.head_dim as f32).sqrt(),
-            additive_mask,
+            &additive_mask,
         )?
         .transpose_axes(&[0, 2, 1, 3])?
         .reshape(&[batch, seq_len, self.num_attention_heads * self.head_dim])?;

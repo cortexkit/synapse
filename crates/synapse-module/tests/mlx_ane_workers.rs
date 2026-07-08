@@ -166,6 +166,7 @@ fn assert_worker_crash_is_quarantined(label: &str, worker_bin: PathBuf) {
         },
         &runtime_config,
     );
+    eprintln!("{label} first load error: {:?}", first.as_ref().err());
     assert!(
         first.is_err(),
         "{label} worker load should fail after forced abort"
