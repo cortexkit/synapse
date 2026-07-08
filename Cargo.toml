@@ -10,6 +10,8 @@ members = [
     "bench/lanes/burn",
     "bench/spikes/unified-rt",
     "bench/lanes/candle-embed",
+    "crates/synapse-core",
+    "crates/synapse-module",
 ]
 
 [workspace.package]
@@ -24,3 +26,14 @@ serde_json = "1"
 clap = { version = "4", features = ["derive"] }
 tokenizers = "0.21"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+hex = "0.4"
+rusqlite = { version = "0.32", features = ["bundled"] }
+sha2 = "0.10"
+thiserror = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "process"] }
+subc-client-rs = { path = "../subconscious/crates/subc-client-rs" }
+subc-core = { path = "../subconscious/crates/subc-core" }
+subc-protocol = { path = "../subconscious/crates/subc-protocol" }
+subc-transport = { path = "../subconscious/crates/subc-transport" }
+cortexkit-store = { path = "../commons/crates/cortexkit-store" }
+cortexkit-store-types = { path = "../commons/crates/cortexkit-store-types" }
