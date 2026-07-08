@@ -14,3 +14,7 @@ rusqlite = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 thiserror = { workspace = true }
+tokenizers = { workspace = true }
+
+[dev-dependencies]
+ahash = "0.8"
