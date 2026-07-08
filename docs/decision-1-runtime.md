@@ -1,8 +1,14 @@
 # Decision #1: Synapse's local inference engine strategy
 
-Status: CONSOLIDATED (2026-07-08) — full cross-platform campaign measured; ready
-for the D-005 lock review (Ufuk + AFT + SUBC + Synapse).
-Decision owner: Ufuk. Reviewers: AFT-Alfonso (driving), SUBC-Alfonso (offered).
+Status: **RATIFIED (D-005, 2026-07-08)** — decided by Ufuk as written, no
+meeting required: every fork was resolved in signed written rounds (AFT, SUBC,
+MC) and validated by the implemented, hardened Lane 1 v1 surface before
+ratification. Later amendments by Ufuk folded in: two-lane engine program
+(adopt + owned runtime graduating by measurement), day-1 best-per-hardware
+incl. MLX/ANE on Macs, fingerprint contract as implemented
+(docs/wire-contract-v1.md).
+Decision owner: Ufuk. Reviewers: AFT-Alfonso (driving), SUBC-Alfonso, MC
+(written sign-offs on the fingerprint/equivalence contract).
 
 Evidence base: 60+ idle-gated full-corpus lane runs across 4 hardware classes
 (M5 Max, M1 Max, RTX 3060, Ryzen Z1 Extreme), retrieval-quality evals on CoIR
