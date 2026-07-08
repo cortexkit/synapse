@@ -129,7 +129,9 @@ substitution rejection preserved byte-for-byte), `required_epoch` (Oracle F15).
   (token/item/byte caps) is job-shaped: accept → {job_id}, paged result
   retrieval, `queue_full` when the lane's memory budget is exhausted (Oracle
   F3). Response envelope everywhere: {fingerprint, table_epoch, dims,
-  provenance, vectors, real_token_counts}. Every item also carries an explicit
+  provenance, vectors, real_token_counts, module_generation} —
+  module_generation on EVERY response (not just job errors) so consumers
+  detect restarts mid-conversation cheaply (SUBC r2 note). Every item also carries an explicit
   truncation disclosure: {submitted_tokens, effective_tokens, truncated: bool}
   (AFT r2 note 1 — silent truncation is a retrieval-quality bug invisible
   downstream; the era of guessing what max_length did is over).
@@ -186,7 +188,10 @@ against lane budgets.
 
 ## Jobs, restart, and durability (Oracle F8)
 
-Accepted jobs are persisted (module-private sqlite) with `module_generation`.
+Accepted jobs are persisted in the module's daemon-delivered storage
+(HELLO_ACK.storage descriptor — the jobs DB lives in the same store.db as the
+alias table and certification rows, no hand-rolled paths) with
+`module_generation`.
 On startup, any prior-generation job in queued/running becomes terminal
 `failed_transient: module_restarted`; results pages of completed jobs survive
 restart until TTL. Direct (non-job) calls fail via transport closure on crash —
@@ -202,6 +207,14 @@ lease per digest and two-phase tombstones (mark, grace period, delete) so a
 concurrent validate/mmap never loses its file. Refcount/pin metadata beside
 blobs; Synapse-owns-GC; never touches other modules' pins. Artifact record:
 {digest, source, format, sanitized-tokenizer digest, validation state, pins}.
+
+**Lease primitive gap (SUBC r2 review, source-verified)**: cortexkit-lease
+currently ships try_lock_exclusive ONLY — no shared mode. Resolution: option
+(a), extend cortexkit-lease with a shared-lock mode (fs4 exposes
+try_lock_shared; small commons addition). Synapse owns the commons PR; SUBC
+gates the merge. The reader-refcount liveness protocol (option b) is rejected
+as more moving parts for worse semantics. Until the commons PR lands, cache GC
+stays DISABLED (pin-only cache) — fail-safe, not fail-clever.
 
 ## Health
 
@@ -236,4 +249,9 @@ activation, alias events beyond the day-1 pair.
 - Probe workload contents (built-in corpus + reference vectors: size/licensing
   pass pending).
 - Worker protocol spec (length-prefixed frames over unix socket; Windows named
-  pipes) — write before implementation.
+  pipes) — write before implementation. Handshake carries a protocol-version
+  byte + a module-issued generation nonce so a stale worker from a previous
+  module generation can never answer a new module's socket (SUBC r2 note,
+  subc launch-nonce pattern).
+- cortexkit-lease shared-mode commons PR (Synapse-owned, SUBC-gated) —
+  prerequisite for enabling cache GC.
