@@ -15,3 +15,4 @@ clap = { workspace = true }
 tokenizers = { workspace = true }
 synapse-bench = { path = "../../harness" }
 llama-cpp-2 = { version = "0.1.151", default-features = false, features = ["metal"] }
+llama-cpp-sys-2 = { version = "0.1.151", features = ["metal"] }

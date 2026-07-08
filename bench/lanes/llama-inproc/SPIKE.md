@@ -2,13 +2,22 @@
 
 ## Status
 
-**Result: mixed, not a clear replacement for the child path.**
+**Result: still no clear replacement for the child path.**
 
-- **Qwen3-Embedding-0.6B f16 GGUF**: in-process worked, matched ORT numerically, and beat the child on 2,000-item corpus throughput.
-- **all-MiniLM-L6-v2 f16 GGUF**: the owned tokenize → forward → manual mean-pool pipeline **missed parity badly** against ORT fp32, while the child lane stayed effectively perfect.
-- **Headline latency claim** also split by model: MiniLM single-call latency improved vs the child, Qwen3 got worse.
+This follow-up changed the question from:
 
-My bottom line: **llama.cpp as an in-process library does not clear the bar for a production replacement of the child for embeddings today**, because the encoder/manual-pooling path failed the parity gate.
+- "does in-process with our own manual pooling clear the bar?"
+
+to:
+
+- "does in-process with llama.cpp's builtin sequence pooling clear the bar?"
+
+The answer is still **no** on the clean **M1 Max** bench box.
+
+- **MiniLM**: builtin pooling did **not** fix parity. It landed at **0.9736516294** vs ORT fp32, essentially identical to the manual path, while the child lane stayed at **0.9999959826**.
+- **Qwen3**: builtin pooling kept parity at **0.9999996803** and improved throughput over the child, but the in-process single-call latency gap stayed large: **~17.7 ms p50** vs **~7.39 ms p50** for the child on the same box.
+
+So the new finding is sharper than the first pass: **the MiniLM failure is not manual-pooling-specific on a clean machine**. Builtin pooling and manual pooling behave the same under the owned pretokenized token-id path.
 
 ## Path decision: `llama-cpp-2` vs direct FFI
 
@@ -16,128 +25,186 @@ I stayed on **`llama-cpp-2` 0.1.151** with Metal enabled and did **not** fall ba
 
 Why:
 
-- the crate built cleanly here,
-- it exposed enough surface to load GGUF models, create contexts, submit batches, and read embeddings,
-- the blocker was **not** missing API or build failure; it was the **numerical behavior** of manual pooling for MiniLM.
+- the crate built cleanly,
+- it exposes context pooling type, sequence embeddings, and flash-attention policy,
+- the blocker was not missing API or build failure,
+- the blocker was the **measured behavior** of the in-process token-id path.
 
-So the spike result is about the runtime/API semantics, not a packaging failure.
+## Measurement setup
 
-## Measurement setup / caveats
+All timed measurements in this follow-up ran on the **M1 Max bench box over LAN SSH**, not the contended M5.
 
-- Machine: **M5 Max**, macOS, with light background activity allowed.
-- These are **correctness + relative-latency** numbers, not idle-gated publish-table numbers.
-- The worktree did **not** contain `bench/data/corpus-v2.jsonl`. I generated a temporary equivalent subset from the first 2,000 rows of `corpus/aft-chunks.jsonl` using `text = embed_text` and stable line-number ids. `bench/run-matrix.sh` already documents that `corpus-v2` is converted from `corpus/aft-chunks.jsonl`, so this is close in content, but it is still a caveat.
-- The local cache under `models--mradermacher--Qwen3-Embedding-0.6B-GGUF` did **not** contain an f16 file here (only Q4/Q6). For the Qwen f16 run I used the locally cached official snapshot under `models--Qwen--Qwen3-Embedding-0.6B-GGUF`.
-- Single-call latency used the same 42-word query for both runtimes. That query tokenized to **128 MiniLM tokens** and **47 Qwen tokens**.
+- Binaries were built locally for arm64 and rsynced to `~/bench-tools/llama-inproc-followup/`.
+- The 2,000-item subset was regenerated on the M1 from `~/Work/synapse/corpus/aft-chunks.jsonl` using `text = embed_text` and stable line-number ids.
+- Child-process comparison used `~/bench-tools/bin/llama-server-wrap.sh`.
+- Single-call latency used two query shapes:
+  - a longer code-search query (the same one as the first pass),
+  - a shorter search-like query.
+- Caveat: under the MiniLM tokenizer, both query strings ended up at **128 tokens**, so the "short" query was not actually a shorter model input for MiniLM. Under Qwen3, the short query was **16 tokens** vs **47 tokens** for the long query.
 
-## Implementation summary
+## Implementation changes in this follow-up
 
-The new crate is `bench/lanes/llama-inproc/`.
+The crate now supports:
 
-It does:
+- `--pooling-implementation builtin|manual`
+- builtin sequence pooling via `embeddings_seq_ith`
+- manual token pooling via `embeddings_ith`
+- `--flash-attention auto|enabled|disabled`
+- latency tests that reuse one context and reset sequence cache between calls instead of rebuilding contexts
 
-- Hugging Face `tokenizers` preprocessing,
-- truncation before inference,
-- length-sorted token-budget batching,
-- explicit `encode` (MiniLM) vs `decode` (Qwen3) forward paths,
-- manual pooling from per-token embeddings,
-- L2 normalization,
-- LaneResult JSON output plus optional raw vectors,
-- a small latency helper binary for 200 sequential warm single-text calls.
+## 1) Parity + throughput over the first 2,000 chunks
 
-## 1) Parity vs ORT fp32 (`synapse-bench parity`, first 2,000 chunks)
+### all-MiniLM-L6-v2
 
-| Model | In-process mean cosine vs ORT fp32 | Gate (>= 0.9999) | Child mean cosine vs ORT fp32 |
-|---|---:|---:|---:|
-| all-MiniLM-L6-v2 f16 GGUF | **0.9736238726** | **FAIL** | 0.9999953568 |
-| Qwen3-Embedding-0.6B f16 GGUF | **0.9999994553** | **PASS** | 0.9999994527 |
+| Path | tok/s | Mean cosine vs ORT fp32 | Cold load | Result |
+|---|---:|---:|---:|---|
+| ORT fp32 reference | 11,737.63 | reference | 0.0766 s | baseline |
+| in-process, manual mean pool | 107,963.40 | 0.9736516294 | 0.0660 s | **FAIL** |
+| in-process, builtin mean pool | 106,517.29 | 0.9736516294 | 0.0661 s | **FAIL** |
+| child (`llama-server`) | 56,099.94 | 0.9999959826 | 0.2707 s | PASS |
 
-This is the key spike result.
+### Qwen3-Embedding-0.6B
 
-- **Qwen3**: manual last-token pooling is numerically fine.
-- **MiniLM**: manual mean pooling over token embeddings is **not** equivalent to the child / ORT reference path.
+| Path | tok/s | Mean cosine vs ORT fp32 | Cold load | Result |
+|---|---:|---:|---:|---|
+| ORT fp32 reference | 319.74 | reference | 2.4967 s | baseline |
+| in-process, manual last pool | 4,078.66 | 0.9999996803 | 1.4038 s | PASS |
+| in-process, builtin last pool | 4,623.60 | 0.9999996803 | 1.0074 s | PASS |
+| child (`llama-server`) | 3,785.74 | 0.9999996788 | 0.5326 s | PASS |
+
+### Parity verdict
+
+The requested builtin-pooling follow-up **did not rescue MiniLM**.
+
+Manual and builtin MiniLM parity are numerically the same to the printed precision, which changes the diagnosis:
+
+- the clean-box failure is **not** explained by manual pooling,
+- the remaining suspect is the broader **owned pretokenized token-id path** for encoder models.
+
+That is an inference from the measurements, not a proven internal root cause, but it is the strongest supported read.
 
 ## 2) Single-call latency, 200 warm sequential single-text embeds
 
-| Model | In-process p50 | In-process p95 | Child p50 | Child p95 | Winner |
-|---|---:|---:|---:|---:|---|
-| all-MiniLM-L6-v2 | **1.451 ms** | **1.970 ms** | 1.969 ms | 2.367 ms | in-process |
-| Qwen3-Embedding-0.6B | 14.010 ms | 15.878 ms | **5.258 ms** | **5.734 ms** | child |
+### MiniLM
 
-Claim #1 only holds for MiniLM here. It fails for Qwen3.
+| Path | Query shape | p50 | p95 | Cold load |
+|---|---|---:|---:|---:|
+| in-process, manual | long | 2.536 ms | 3.115 ms | 0.0788 s |
+| in-process, builtin | long | 2.547 ms | 2.595 ms | 0.0620 s |
+| child | long | 2.734 ms | 5.899 ms | 0.2642 s |
+| in-process, builtin | short | 2.533 ms | 2.564 ms | 0.0630 s |
+| child | short | 2.619 ms | 6.292 ms | 0.2641 s |
 
-## 3) Batch throughput over the 2,000-chunk subset
+MiniLM in-process is slightly better than the child on latency, especially in the tail, **but the parity miss makes that win unusable**.
 
-| Model | In-process tok/s | Child tok/s | Delta |
-|---|---:|---:|---:|
-| all-MiniLM-L6-v2 | **235,334** | 93,776 | **2.51x faster** |
-| Qwen3-Embedding-0.6B | **7,176** | 5,489 | **1.31x faster** |
+### Qwen3 regression chase
 
-Claim #2 is only half true:
+Long-query results on the same M1 box:
 
-- throughput is at least equal, often materially better,
-- but parity is **not** at least equal because MiniLM failed hard.
+| In-process variant | ctx / batch / ubatch | flash | p50 | p95 |
+|---|---|---|---:|---:|
+| manual last pooling | 1024 / 4096 / 1024 | auto | 17.127 ms | 17.195 ms |
+| builtin last pooling | 1024 / 4096 / 1024 | auto | 17.700 ms | 17.790 ms |
+| builtin last pooling | 256 / 256 / 256 | auto | 17.677 ms | 17.765 ms |
+| builtin last pooling | 128 / 128 / 128 | auto | 17.680 ms | 17.774 ms |
+| builtin last pooling | 256 / 256 / 256 | enabled | 17.670 ms | 17.764 ms |
+| child | 1024 / 4096 / 1024 | server default | **7.386 ms** | **8.012 ms** |
 
-## 4) Cold load wall time
+Short-query result:
 
-These came from the full lane runs in the same warmed development session. Treat them as **process-cold, shader-cache-warm** numbers, not first-boot numbers.
+| Path | Query shape | p50 | p95 |
+|---|---|---:|---:|
+| in-process best tried | short | 13.726 ms | 13.823 ms |
+| child | short | **7.302 ms** | **7.693 ms** |
 
-| Model | In-process cold load | Child cold load |
-|---|---:|---:|
-| all-MiniLM-L6-v2 | **0.064 s** | 0.258 s |
-| Qwen3-Embedding-0.6B | 1.036 s | **1.031 s** |
+### Qwen latency verdict
 
-So in-process only showed a meaningful cold-load win for MiniLM.
+The gap **did not close**.
 
-## API / runtime sharp edges discovered
+What I tried:
 
-1. **`n_ctx` is total context, not per-sequence context.**
-   For multi-sequence batching I had to set `total_n_ctx = per_sequence_ctx * n_seq_max`. If I passed `512` with `n_seq_max > 1`, llama.cpp silently reduced `n_ctx_seq`, and MiniLM parity cratered further because sequences were effectively truncated.
+1. builtin last pooling instead of manual,
+2. much smaller `ctx` / `batch` / `ubatch` sized for single queries,
+3. a latency loop that reuses one context and only resets the sequence cache between calls,
+4. explicit flash attention enable.
 
-2. **Encoder batches are effectively capped by `n_ubatch`.**
-   The encoder path hit a GGML assert requiring `n_ubatch >= n_tokens`. The child/server path hides this by internally managing work, but the in-process path did not. For MiniLM the effective batch token budget became `min(batch_size, ubatch_size) = 1024`.
+What happened:
 
-3. **Manual token-embedding pooling is not equivalent to sequence embeddings on MiniLM.**
-   The owned pipeline used `pooling_type = none`, read per-token embeddings, mean-pooled, and normalized. That landed at **0.9736** instead of ~1.0. The child lane using llama.cpp's built-in mean pooling stayed at **0.999995** on the same inputs.
+- builtin pooling was actually a little **slower** than manual on the long query,
+- smaller context and batch sizes changed almost nothing,
+- explicit flash enable changed almost nothing,
+- the child stayed around **2.3x faster** on long-query p50.
 
-4. **Decoder memory balloons with large `n_seq_max`.**
-   On the 2,000-chunk Qwen run, the in-process context chose `n_seq_max = 101`, which made llama.cpp reserve about **11.3 GiB** of Metal KV cache. That is a real production footgun for a hot in-process runner.
+So the supported conclusion is: **the Qwen single-call latency regression remains unexplained by the obvious config knobs and is real on the M1**.
 
-5. **`llama-cpp-2` is usable but thin.**
-   Important gaps for this spike:
-   - no safe `has_encoder` / `has_decoder` helper,
-   - no direct `n_embd_out` helper,
-   - `LlamaContext` borrows `LlamaModel`, so a long-lived owned `model + context` object needs self-referential structure patterns or a different abstraction.
+## 3) KV-reservation footgun
+
+This remains prominent and is a real production concern.
+
+Observed in the full-corpus Qwen in-process run on the M1:
+
+- `n_seq_max = 101`
+- Metal KV buffer size = **11,312 MiB**
+
+MiniLM was tame by comparison:
+
+- `n_seq_max = 8`
+- no large KV cache because the encoder path is non-causal
+
+This means the in-process runner cannot naively size `n_seq_max` from the largest corpus batch shape and then keep that context hot forever for query latency. The design needs explicit separation between:
+
+- **throughput contexts** sized for corpus batches, and
+- **hot single-query contexts** sized narrowly for the latency path.
+
+Even after trying smaller single-query contexts, the Qwen latency gap to the child still held, but the KV sizing issue is independently real and must stay visible in the design.
+
+## 4) Updated interpretation
+
+The first-pass M5 diagnosis was:
+
+- "MiniLM parity failure is manual-pooling-specific."
+
+The clean M1 follow-up changed that.
+
+What the new evidence supports:
+
+- **MiniLM parity failure survives builtin pooling unchanged**, so manual pooling is not the root of the problem.
+- **Qwen parity is fine** in both manual and builtin forms.
+- **Qwen latency gap survives** builtin pooling, smaller contexts, smaller batch sizes, and explicit flash-attention enable.
+
+The most useful architecture read from this spike now is:
+
+1. llama.cpp **can** be embedded in-process cleanly,
+2. decoder-style embedding models like Qwen3 can be **numerically faithful** in-process,
+3. encoder-style MiniLM under the owned pretokenized token-id path is **not numerically faithful** here,
+4. the child path still has a real latency advantage for Qwen single-query embeds on the M1,
+5. large causal-batch contexts create a substantial **KV residency hazard** for a hot in-process daemon.
 
 ## Verdict
 
-**No — not as specified.**
+**No — even with builtin pooling, in-process llama.cpp does not clear the replacement bar yet.**
 
-If the requirement is:
+Why:
 
-- in-process,
-- our own Hugging Face tokenization,
-- our own forward selection,
-- our own manual pooling,
-- and parity at least equal to the child,
+- the MiniLM parity gate still fails badly (**0.9736516294** instead of `>= 0.9999`),
+- the Qwen single-call latency gap to the child remains large (**17.7 ms vs 7.39 ms p50** on the long query),
+- and the KV-reservation behavior for causal batch contexts is a real operational footgun.
 
-then this spike does **not** clear the bar.
+What improved:
 
-What it proved:
+- builtin pooling improved the Qwen throughput/cold-load story,
+- MiniLM and Qwen both still beat the child on batch throughput in-process,
+- MiniLM single-call latency is slightly better in-process.
 
-- llama.cpp **can** be embedded in-process on Metal cleanly,
-- the decoder/last-token path (Qwen3) is good,
-- throughput can beat the child.
+But the bar for replacement was parity-first, and the clean follow-up says **builtin pooling is not enough**.
 
-What killed it:
+## Next fork
 
-- the encoder/manual-mean path for MiniLM missed parity by a mile,
-- the Qwen single-call latency headline was worse than the child,
-- multi-sequence decoder contexts reserve much more GPU memory than the child architecture exposes at the HTTP boundary.
+If this spike continues, the next decision is no longer about manual vs builtin pooling. That fork is settled.
 
-If this leg is revisited later, the next fork is explicit:
+The next fork is:
 
-1. **accept llama.cpp built-in pooling** and stop insisting on fully owned pooling semantics, or
-2. **drop below `llama-cpp-2` into lower-level FFI / upstream investigation** and prove whether MiniLM token embeddings can be made numerically equivalent to the child path.
-
-Until then, the child remains the safer architecture for embeddings.
+1. **accept that the external-tokenizer token-id path is the problem** and either
+   - let llama.cpp own tokenization for encoder models, or
+   - prove/token-diff why the HF-tokenizer ids diverge from the child path, or
+2. keep the child for embeddings and treat in-process llama.cpp as an interesting but not yet production-safe lane.

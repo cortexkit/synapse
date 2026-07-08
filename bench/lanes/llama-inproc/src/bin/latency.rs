@@ -5,7 +5,8 @@ use anyhow::{ensure, Context, Result};
 use clap::{Parser, ValueEnum};
 use lane_llama_inproc::{
     default_threads, embed_token_batches, load_runtime, load_tokenizer, new_context,
-    summarize_latencies_ms, tokenize_text, warmup_context, ForwardPass, PoolingMode, RuntimeConfig,
+    summarize_latencies_ms, tokenize_text, warmup_context, FlashAttentionSetting, ForwardPass,
+    PoolingImplementation, PoolingMode, RuntimeConfig,
 };
 use serde::Serialize;
 
@@ -27,9 +28,12 @@ struct Args {
     /// Number of timed embedding calls.
     #[arg(long, default_value_t = 200)]
     iterations: usize,
-    /// Manual pooling policy over token embeddings.
+    /// Pooling policy.
     #[arg(long, value_enum, default_value_t = PoolingArg::Last)]
     pooling: PoolingArg,
+    /// Whether embeddings come from llama.cpp sequence pooling or local token pooling.
+    #[arg(long, value_enum, default_value_t = PoolingImplementationArg::Builtin)]
+    pooling_implementation: PoolingImplementationArg,
     /// Tokenizer truncation max length.
     #[arg(long, default_value_t = 512)]
     max_length: usize,
@@ -48,6 +52,9 @@ struct Args {
     /// Embedding forward pass. Auto uses encode for mean/cls and decode for last.
     #[arg(long, value_enum, default_value_t = ForwardPassArg::Auto)]
     forward_pass: ForwardPassArg,
+    /// Flash attention policy.
+    #[arg(long, value_enum, default_value_t = FlashAttentionArg::Auto)]
+    flash_attention: FlashAttentionArg,
     /// CPU thread count used by llama.cpp.
     #[arg(long)]
     threads: Option<usize>,
@@ -65,6 +72,19 @@ enum ForwardPassArg {
     Auto,
     Encode,
     Decode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum PoolingImplementationArg {
+    Builtin,
+    Manual,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum FlashAttentionArg {
+    Auto,
+    Enabled,
+    Disabled,
 }
 
 #[derive(Serialize)]
@@ -91,6 +111,15 @@ fn main() -> Result<()> {
         PoolingArg::Last => PoolingMode::Last,
         PoolingArg::Cls => PoolingMode::Cls,
     };
+    let pooling_implementation = match args.pooling_implementation {
+        PoolingImplementationArg::Builtin => PoolingImplementation::Builtin,
+        PoolingImplementationArg::Manual => PoolingImplementation::Manual,
+    };
+    let flash_attention = match args.flash_attention {
+        FlashAttentionArg::Auto => FlashAttentionSetting::Auto,
+        FlashAttentionArg::Enabled => FlashAttentionSetting::Enabled,
+        FlashAttentionArg::Disabled => FlashAttentionSetting::Disabled,
+    };
     let forward_pass = resolve_forward_pass(args.forward_pass, pooling);
     let threads = args.threads.unwrap_or_else(default_threads);
     let runtime_config = RuntimeConfig {
@@ -101,13 +130,21 @@ fn main() -> Result<()> {
         gpu_layers: args.gpu_layers,
         threads,
         pooling,
+        pooling_implementation,
+        flash_attention,
         forward_pass,
     };
 
     let started = Instant::now();
     let runtime = load_runtime(&args.model, &runtime_config)?;
     let mut context = new_context(&runtime, &runtime_config)?;
-    warmup_context(&tokenizer, &mut context, pooling, forward_pass)?;
+    warmup_context(
+        &tokenizer,
+        &mut context,
+        pooling,
+        pooling_implementation,
+        forward_pass,
+    )?;
     let cold_load_s = started.elapsed().as_secs_f64();
 
     let token_ids = tokenize_text(&tokenizer, &args.text)?;
@@ -120,6 +157,7 @@ fn main() -> Result<()> {
             &mut context,
             std::slice::from_ref(&token_ids),
             pooling,
+            pooling_implementation,
             forward_pass,
         )?;
         latencies_ms.push(started.elapsed().as_secs_f64() * 1000.0);

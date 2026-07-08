@@ -8,8 +8,8 @@ use clap::{Parser, ValueEnum};
 use lane_llama_inproc::{
     default_threads, embed_token_batches, format_optional_prefix, load_runtime, load_tokenizer,
     max_batch_sequences, new_context, prefixed_text, prepare_texts, rate, warmup_context,
-    ForwardPass, PoolingMode, PreparedText, RuntimeConfig, LLAMA_CPP_2_VERSION,
-    MAX_BATCH_SEQUENCES,
+    FlashAttentionSetting, ForwardPass, PoolingImplementation, PoolingMode, PreparedText,
+    RuntimeConfig, LLAMA_CPP_2_VERSION, MAX_BATCH_SEQUENCES,
 };
 use synapse_bench::{
     parity::{load_corpus, load_reference, mean_parity, Chunk},
@@ -46,9 +46,12 @@ struct Args {
     /// Model label for the result.
     #[arg(long)]
     model_label: String,
-    /// Manual pooling policy over token embeddings.
+    /// Pooling policy.
     #[arg(long, value_enum, default_value_t = PoolingArg::Last)]
     pooling: PoolingArg,
+    /// Whether embeddings come from llama.cpp sequence pooling or local token pooling.
+    #[arg(long, value_enum, default_value_t = PoolingImplementationArg::Builtin)]
+    pooling_implementation: PoolingImplementationArg,
     /// Tokenizer truncation max length.
     #[arg(long, default_value_t = 512)]
     max_length: usize,
@@ -70,6 +73,9 @@ struct Args {
     /// Embedding forward pass. Auto uses encode for mean/cls and decode for last.
     #[arg(long, value_enum, default_value_t = ForwardPassArg::Auto)]
     forward_pass: ForwardPassArg,
+    /// Flash attention policy.
+    #[arg(long, value_enum, default_value_t = FlashAttentionArg::Auto)]
+    flash_attention: FlashAttentionArg,
     /// CPU thread count used by llama.cpp.
     #[arg(long)]
     threads: Option<usize>,
@@ -87,6 +93,19 @@ enum ForwardPassArg {
     Auto,
     Encode,
     Decode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum PoolingImplementationArg {
+    Builtin,
+    Manual,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum FlashAttentionArg {
+    Auto,
+    Enabled,
+    Disabled,
 }
 
 #[derive(Debug)]
@@ -118,6 +137,15 @@ fn main() -> Result<()> {
         PoolingArg::Last => PoolingMode::Last,
         PoolingArg::Cls => PoolingMode::Cls,
     };
+    let pooling_implementation = match args.pooling_implementation {
+        PoolingImplementationArg::Builtin => PoolingImplementation::Builtin,
+        PoolingImplementationArg::Manual => PoolingImplementation::Manual,
+    };
+    let flash_attention = match args.flash_attention {
+        FlashAttentionArg::Auto => FlashAttentionSetting::Auto,
+        FlashAttentionArg::Enabled => FlashAttentionSetting::Enabled,
+        FlashAttentionArg::Disabled => FlashAttentionSetting::Disabled,
+    };
     let forward_pass = resolve_forward_pass(args.forward_pass, pooling)?;
     let threads = args.threads.unwrap_or_else(default_threads);
     let batch_token_budget = match forward_pass {
@@ -146,13 +174,21 @@ fn main() -> Result<()> {
         gpu_layers: args.gpu_layers,
         threads,
         pooling,
+        pooling_implementation,
+        flash_attention,
         forward_pass,
     };
 
     let started = Instant::now();
     let runtime = load_runtime(&args.model, &runtime_config)?;
     let mut context = new_context(&runtime, &runtime_config)?;
-    warmup_context(&tokenizer, &mut context, pooling, forward_pass)?;
+    warmup_context(
+        &tokenizer,
+        &mut context,
+        pooling,
+        pooling_implementation,
+        forward_pass,
+    )?;
     let cold_load_s = started.elapsed().as_secs_f64();
 
     let mut vectors_writer = match &args.vectors_out {
@@ -187,8 +223,13 @@ fn main() -> Result<()> {
             let batch = &prepared[batch_start..index];
             let batch_tokens_only: Vec<Vec<i32>> =
                 batch.iter().map(|item| item.token_ids.clone()).collect();
-            let embeddings =
-                embed_token_batches(&mut context, &batch_tokens_only, pooling, forward_pass)?;
+            let embeddings = embed_token_batches(
+                &mut context,
+                &batch_tokens_only,
+                pooling,
+                pooling_implementation,
+                forward_pass,
+            )?;
             ensure!(
                 embeddings.len() == batch.len(),
                 "embedding count mismatch: got {}, expected {}",
@@ -256,7 +297,7 @@ fn main() -> Result<()> {
     };
 
     let notes = format!(
-        "llama-cpp-2={LLAMA_CPP_2_VERSION}, in-process=true, manual_pooling={pooling:?}, forward_pass={forward_pass:?}, tokenizer=hf-tokenizers, batching=length_sorted_sum_tokens<=effective_budget&&seqs<=256, effective_batch_budget={}, ctx_size={}, batch_size={}, ubatch_size={}, ngl={}, threads={}, prefix_document={}, min_parity={}, reference_matches={}",
+        "llama-cpp-2={LLAMA_CPP_2_VERSION}, in-process=true, pooling={pooling:?}, pooling_implementation={pooling_implementation:?}, flash_attention={flash_attention:?}, forward_pass={forward_pass:?}, tokenizer=hf-tokenizers, batching=length_sorted_sum_tokens<=effective_budget&&seqs<=256, effective_batch_budget={}, ctx_size={}, batch_size={}, ubatch_size={}, ngl={}, threads={}, prefix_document={}, min_parity={}, reference_matches={}",
         batch_token_budget,
         args.ctx_size,
         args.batch_size,

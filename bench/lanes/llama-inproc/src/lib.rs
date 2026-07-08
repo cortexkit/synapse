@@ -4,6 +4,7 @@ use std::path::Path;
 use anyhow::{ensure, Context, Result};
 use llama_cpp_2::{
     context::{
+        kv_cache::KvCacheConversionError,
         params::{LlamaAttentionType, LlamaContextParams, LlamaPoolingType},
         LlamaContext,
     },
@@ -11,6 +12,10 @@ use llama_cpp_2::{
     llama_batch::LlamaBatch,
     model::{params::LlamaModelParams, LlamaModel},
     token::LlamaToken,
+};
+use llama_cpp_sys_2::{
+    llama_flash_attn_type, LLAMA_FLASH_ATTN_TYPE_AUTO, LLAMA_FLASH_ATTN_TYPE_DISABLED,
+    LLAMA_FLASH_ATTN_TYPE_ENABLED,
 };
 use tokenizers::{Tokenizer, TruncationParams};
 
@@ -26,9 +31,47 @@ pub enum PoolingMode {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PoolingImplementation {
+    Builtin,
+    Manual,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FlashAttentionSetting {
+    Auto,
+    Enabled,
+    Disabled,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ForwardPass {
     Encode,
     Decode,
+}
+
+impl PoolingImplementation {
+    #[must_use]
+    pub fn context_pooling_type(self, pooling: PoolingMode) -> LlamaPoolingType {
+        match self {
+            Self::Builtin => match pooling {
+                PoolingMode::Mean => LlamaPoolingType::Mean,
+                PoolingMode::Last => LlamaPoolingType::Last,
+                PoolingMode::Cls => LlamaPoolingType::Cls,
+            },
+            Self::Manual => LlamaPoolingType::None,
+        }
+    }
+}
+
+impl FlashAttentionSetting {
+    #[must_use]
+    pub fn raw_policy(self) -> llama_flash_attn_type {
+        match self {
+            Self::Auto => LLAMA_FLASH_ATTN_TYPE_AUTO,
+            Self::Enabled => LLAMA_FLASH_ATTN_TYPE_ENABLED,
+            Self::Disabled => LLAMA_FLASH_ATTN_TYPE_DISABLED,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -40,6 +83,8 @@ pub struct RuntimeConfig {
     pub gpu_layers: usize,
     pub threads: usize,
     pub pooling: PoolingMode,
+    pub pooling_implementation: PoolingImplementation,
+    pub flash_attention: FlashAttentionSetting,
     pub forward_pass: ForwardPass,
 }
 
@@ -178,8 +223,13 @@ pub fn new_context<'a>(
         .with_n_threads(threads)
         .with_n_threads_batch(threads)
         .with_embeddings(true)
-        .with_pooling_type(LlamaPoolingType::None)
-        .with_attention_type(attention_type);
+        .with_pooling_type(
+            config
+                .pooling_implementation
+                .context_pooling_type(config.pooling),
+        )
+        .with_attention_type(attention_type)
+        .with_flash_attention_policy(config.flash_attention.raw_policy());
 
     runtime
         .model
@@ -191,10 +241,17 @@ pub fn warmup_context(
     tokenizer: &Tokenizer,
     context: &mut LlamaContext<'_>,
     pooling: PoolingMode,
+    pooling_implementation: PoolingImplementation,
     forward_pass: ForwardPass,
 ) -> Result<()> {
     let warmup_ids = tokenize_text(tokenizer, WARMUP_TEXT)?;
-    let _ = embed_token_batches(context, &[warmup_ids], pooling, forward_pass)?;
+    let _ = embed_token_batches(
+        context,
+        &[warmup_ids],
+        pooling,
+        pooling_implementation,
+        forward_pass,
+    )?;
     Ok(())
 }
 
@@ -202,6 +259,7 @@ pub fn embed_token_batches(
     context: &mut LlamaContext<'_>,
     sequences: &[Vec<i32>],
     pooling: PoolingMode,
+    pooling_implementation: PoolingImplementation,
     forward_pass: ForwardPass,
 ) -> Result<Vec<Vec<f32>>> {
     ensure!(!sequences.is_empty(), "cannot embed an empty batch");
@@ -209,10 +267,9 @@ pub fn embed_token_batches(
     let total_tokens = sequences.iter().map(Vec::len).sum::<usize>();
     ensure!(total_tokens > 0, "cannot embed a batch with zero tokens");
 
-    let mut batch = LlamaBatch::new(
-        total_tokens,
-        i32::try_from(sequences.len()).context("sequence count does not fit into i32")?,
-    );
+    let seq_count =
+        i32::try_from(sequences.len()).context("sequence count does not fit into i32")?;
+    let mut batch = LlamaBatch::new(total_tokens, seq_count);
 
     for (seq_id, tokens) in sequences.iter().enumerate() {
         ensure!(!tokens.is_empty(), "sequence {seq_id} has zero tokens");
@@ -226,19 +283,60 @@ pub fn embed_token_batches(
             .with_context(|| format!("add sequence {seq_id} to llama batch"))?;
     }
 
-    context.clear_kv_cache();
+    reset_sequences(context, seq_count)?;
     match forward_pass {
         ForwardPass::Encode => context.encode(&mut batch).context("llama_encode failed")?,
         ForwardPass::Decode => context.decode(&mut batch).context("llama_decode failed")?,
     }
 
-    let mut pooled = Vec::with_capacity(sequences.len());
-    let mut token_offset = 0i32;
-    for tokens in sequences {
-        pooled.push(pool_sequence(context, token_offset, tokens.len(), pooling)?);
-        token_offset += i32::try_from(tokens.len()).context("token count does not fit into i32")?;
+    match pooling_implementation {
+        PoolingImplementation::Builtin => collect_builtin_embeddings(context, sequences.len()),
+        PoolingImplementation::Manual => {
+            let mut pooled = Vec::with_capacity(sequences.len());
+            let mut token_offset = 0i32;
+            for tokens in sequences {
+                pooled.push(pool_sequence(context, token_offset, tokens.len(), pooling)?);
+                token_offset +=
+                    i32::try_from(tokens.len()).context("token count does not fit into i32")?;
+            }
+            Ok(pooled)
+        }
     }
-    Ok(pooled)
+}
+
+fn collect_builtin_embeddings(
+    context: &LlamaContext<'_>,
+    sequence_count: usize,
+) -> Result<Vec<Vec<f32>>> {
+    let mut embeddings = Vec::with_capacity(sequence_count);
+    for seq_id in 0..sequence_count {
+        let mut vector = context
+            .embeddings_seq_ith(i32::try_from(seq_id).context("sequence id does not fit into i32")?)
+            .with_context(|| format!("read sequence embedding {seq_id}"))?
+            .to_vec();
+        l2_normalize(&mut vector);
+        embeddings.push(vector);
+    }
+    Ok(embeddings)
+}
+
+fn reset_sequences(context: &mut LlamaContext<'_>, sequence_count: i32) -> Result<()> {
+    let max_sequence_count =
+        usize::try_from(sequence_count).context("sequence count does not fit into usize")?;
+    for seq_id in 0..max_sequence_count {
+        context
+            .clear_kv_cache_seq(
+                Some(u32::try_from(seq_id).context("sequence id does not fit into u32")?),
+                None,
+                None,
+            )
+            .map_err(kv_reset_error)?;
+    }
+    Ok(())
+}
+
+fn kv_reset_error(error: KvCacheConversionError) -> anyhow::Error {
+    anyhow::anyhow!("reset sequence cache: {error}")
 }
 
 fn pool_sequence(
