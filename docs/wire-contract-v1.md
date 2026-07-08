@@ -115,6 +115,7 @@ provider hash.
   (soak-proven). Nothing hangs: every request ends in result, typed error,
   or transport closure.
 - Health: cached state only; worker liveness/crash-window and certification
-  staleness ride models.list and health detail.
+  staleness ride models.list and health detail. ANE worker PING refreshes the
+  last Neural Engine placement share used by explicit certification probes.
 - module_generation on every envelope: if it changes mid-conversation,
   re-poll jobs (prior-generation jobs are terminal module_restarted).

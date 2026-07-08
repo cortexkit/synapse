@@ -116,7 +116,8 @@ formalized (Oracle F11/F12):
   model file hash change, machine_profile_hash change.
 
 Day-1 declared pair: llama-f16 ≡ ort-fp32 (1.00000 full corpus). MLX bf16 and
-DWQ: distinct fingerprints always.
+ANE fp16/Core ML profiles are distinct fingerprints always; ANE certification
+also gates the MLComputePlan Neural Engine placement share.
 
 ## Surface (ops)
 

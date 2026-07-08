@@ -1,0 +1,16 @@
+[package]
+name = "synapse-worker-ane"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Synapse supervised Core ML / Apple Neural Engine embedding worker wrapper."
+publish = false
+build = "build.rs"
+
+[[bin]]
+name = "synapse-worker-ane"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
