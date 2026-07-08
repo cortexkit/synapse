@@ -216,10 +216,12 @@ blobs; Synapse-owns-GC; never touches other modules' pins. Artifact record:
 **Lease primitive gap (SUBC r2 review, source-verified)**: cortexkit-lease
 currently ships try_lock_exclusive ONLY — no shared mode. Resolution: option
 (a), extend cortexkit-lease with a shared-lock mode (fs4 exposes
-try_lock_shared; small commons addition). Synapse owns the commons PR; SUBC
-gates the merge. The reader-refcount liveness protocol (option b) is rejected
-as more moving parts for worse semantics. Until the commons PR lands, cache GC
-stays DISABLED (pin-only cache) — fail-safe, not fail-clever.
+try_lock_shared; small commons addition). RESOLVED 2026-07-08: commons PR #1
+merged (16aed47, CI green 3 OSes) — acquire_shared exists with the exact
+semantics F14 needs (shared blocks exclusive until last holder drops, epoch-
+neutral shared handles). Path-dep to commons master until SUBC's next release
+pass publishes the semver-minor bump. Cache GC is UNBLOCKED for the cache
+implementation wave.
 
 ## Health
 
@@ -260,5 +262,4 @@ activation, alias events beyond the day-1 pair.
   byte + a module-issued generation nonce so a stale worker from a previous
   module generation can never answer a new module's socket (SUBC r2 note,
   subc launch-nonce pattern).
-- cortexkit-lease shared-mode commons PR (Synapse-owned, SUBC-gated) —
-  prerequisite for enabling cache GC.
+- ~~cortexkit-lease shared-mode commons PR~~ MERGED (commons #1, 16aed47).
