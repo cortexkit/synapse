@@ -505,6 +505,58 @@ vectors. (Independent validation: MTPLX's auto-tune arrived at the same
 design for the same reason — measure real configs on the user's machine
 against a kept baseline, save only verified wins, honest verdict UI.)
 
+### Fingerprint and equivalence contract (pre-agreed by all three consumers, 2026-07-08)
+
+Converged via written review rounds (AFT pm_4373925e/pm_74b2aff8, SUBC
+pm_fc39f725, MC pm_82691068 — all signed):
+
+**Strict identity, declared equivalence, probe-enforced.** Fingerprints are
+strict per (model, quant, engine-lane, runtime-config). Interchangeability is
+an explicit, revocable ALIAS TABLE layered on top — never baked into the
+identity string. Engine is recorded as provenance metadata beside every
+response.
+
+- **The gate**: equivalence is certified against CANONICAL SHIPPED REFERENCE
+  VECTORS (model-canonical), never pairwise engine-vs-engine (transitivity
+  drift with mixed-provenance indexes). The bar is parity AND worst-decile
+  rank-overlap — tail-sensitive by design (the DWQ finding: 0.967 mean cosine
+  still fails; means hide tail rank damage). Certified per (machine, engine,
+  model, quant, runtime-config) by the onboarding probe; re-checked on
+  re-probe.
+- **Explicit re-probe triggers** (MC pin): engine version bump, runtime-config
+  change, model file hash change. Periodic checks may be added; they are never
+  the sole trigger.
+- **Revocation is never retroactive** (MC pin): vectors written under a
+  certified fingerprint remain valid forever; a lane that falls out of the
+  class on re-probe is demoted going forward only (alias row retracted, no
+  identity churn).
+- **Threshold revisions re-certify lanes, never churn identity** (MC pin): the
+  gate definition is Synapse-owned and versioned; a threshold change triggers
+  re-certification, and identity moves only when actual membership of the
+  writing lane changes.
+- **Table epoch** (AFT rider): the alias table carries a version bumped on any
+  row change; every embed/rerank response carries (fingerprint, table_epoch).
+  Consumers cache interchangeability verdicts per (index_fingerprint,
+  table_epoch) and revalidate only on epoch change.
+- **Mixed-provenance rule** (AFT rider): while A≡B holds, an A-keyed index may
+  legitimately accumulate B-written vectors. On revocation, a pure-A index
+  remains servable; an index whose written-provenance set spans a retracted
+  pair is invalidated (internally inconsistent in a way neither fingerprint
+  names). Consumers record the provenance set per index; the embed surface
+  supplies provenance on every response to make that possible.
+- **Migration contract**: promoting a non-faithful engine (e.g. MLX bf16) or
+  demoting a lane triggers background re-embed with the old index served
+  until swap — never a cold hole.
+- Day-1 declared pair: llama-server f16 GGUF ≡ ort fp32 (measured 1.00000
+  mean cosine, full 15,271-chunk corpus). Day-1 fleet is one class; the first
+  alias event exercises the machinery.
+
+Consumer API consequences (lock inputs): fingerprint is a first-class
+queryable field on the embed surface (with equivalent_to list); rerank
+returns per-candidate raw scores + fingerprint; admission never hides queue
+latency inside per-call latency (fast-fail/degraded signal for interactive
+budgets); error responses classify transient-vs-permanent at the source.
+
 ### The lock decision
 
 D-005 as proposed for lock: a Rust module owning admission (machine-wide),
