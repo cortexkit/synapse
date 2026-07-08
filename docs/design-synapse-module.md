@@ -129,7 +129,10 @@ substitution rejection preserved byte-for-byte), `required_epoch` (Oracle F15).
   (token/item/byte caps) is job-shaped: accept → {job_id}, paged result
   retrieval, `queue_full` when the lane's memory budget is exhausted (Oracle
   F3). Response envelope everywhere: {fingerprint, table_epoch, dims,
-  provenance, vectors, real_token_counts}.
+  provenance, vectors, real_token_counts}. Every item also carries an explicit
+  truncation disclosure: {submitted_tokens, effective_tokens, truncated: bool}
+  (AFT r2 note 1 — silent truncation is a retrieval-quality bug invisible
+  downstream; the era of guessing what max_length did is over).
 - `rerank.score` — query + candidates → per-candidate RAW scores +
   fingerprint; candidate-count/token budgets; large requests job-shaped.
 - `microllm.oneshot` — prompt → text, max_tokens ≤ 64, greedy default.
@@ -140,7 +143,10 @@ substitution rejection preserved byte-for-byte), `required_epoch` (Oracle F15).
 - `aliases.check_index` — see above.
 - `cache.pin` / `cache.gc` — cache management.
 - `admission.status` — advisory only; the contract lives in per-request
-  budgets, not in this snapshot (Oracle F2).
+  budgets, not in this snapshot (Oracle F2). It does expose, cheaply from
+  cached scheduler state: per-lane `meeting_deadlines: bool` + rolling p50
+  start-delay (AFT r2 note 3 — feeds consumer-side degradation notices;
+  advisory for UX, never a substitute for per-request budgets).
 
 **Error contract (Oracle F16)**: stable codes, not just classes —
 `queue_full`, `deadline_exceeded`, `model_loading`, `not_certified`,
@@ -170,7 +176,13 @@ Execution: engine calls run on bounded dedicated worker pools
 per-request tokio spawns never run engine work directly, so the wire loop and
 health/status stay responsive under full route credits (Oracle F6). Memory:
 each lane has a byte budget covering queued inputs + in-flight tensors +
-pending results; admission rejects beyond it (F3).
+  pending results; admission rejects beyond it (F3).
+
+**Idempotent job resubmission (AFT r2 note 2)**: job-shaped requests carry a
+consumer-supplied `request_key`; resubmitting after `module_restarted` with the
+same key returns the existing terminal job or admits a fresh one, never two —
+and budget accounting is keyed on request_key so a retry is never double-billed
+against lane budgets.
 
 ## Jobs, restart, and durability (Oracle F8)
 
