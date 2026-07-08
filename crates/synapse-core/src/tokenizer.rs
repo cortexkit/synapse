@@ -82,17 +82,38 @@ impl SanitizedTokenizer {
     }
 
     pub fn tokenize(&self, text: &str) -> Result<TokenizedItem, TokenizationError> {
-        self.tokenize_one(0, text)
+        self.tokenize_one(0, text, true)
     }
 
     pub fn tokenize_batch<'text, I>(&self, texts: I) -> Result<TokenizedBatch, TokenizationError>
     where
         I: IntoIterator<Item = &'text str>,
     {
+        self.tokenize_batch_with_special_tokens(texts, true)
+    }
+
+    pub fn tokenize_batch_without_special_tokens<'text, I>(
+        &self,
+        texts: I,
+    ) -> Result<TokenizedBatch, TokenizationError>
+    where
+        I: IntoIterator<Item = &'text str>,
+    {
+        self.tokenize_batch_with_special_tokens(texts, false)
+    }
+
+    fn tokenize_batch_with_special_tokens<'text, I>(
+        &self,
+        texts: I,
+        add_special_tokens: bool,
+    ) -> Result<TokenizedBatch, TokenizationError>
+    where
+        I: IntoIterator<Item = &'text str>,
+    {
         let items = texts
             .into_iter()
             .enumerate()
-            .map(|(index, text)| self.tokenize_one(index, text))
+            .map(|(index, text)| self.tokenize_one(index, text, add_special_tokens))
             .collect::<Result<Vec<_>, _>>()?;
         let batch = TokenBatch {
             items: items.iter().map(|item| item.ids.clone()).collect(),
@@ -112,14 +133,19 @@ impl SanitizedTokenizer {
         })
     }
 
-    fn tokenize_one(&self, index: usize, text: &str) -> Result<TokenizedItem, TokenizationError> {
-        let encoding =
-            self.tokenizer
-                .encode(text, true)
-                .map_err(|error| TokenizationError::Encode {
-                    index,
-                    message: error.to_string(),
-                })?;
+    fn tokenize_one(
+        &self,
+        index: usize,
+        text: &str,
+        add_special_tokens: bool,
+    ) -> Result<TokenizedItem, TokenizationError> {
+        let encoding = self
+            .tokenizer
+            .encode(text, add_special_tokens)
+            .map_err(|error| TokenizationError::Encode {
+                index,
+                message: error.to_string(),
+            })?;
         let submitted_tokens = encoding.get_ids().len();
         let mut ids = encoding.get_ids().to_vec();
         if ids.len() > self.max_tokens {

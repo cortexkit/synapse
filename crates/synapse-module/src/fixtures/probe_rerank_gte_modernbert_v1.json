@@ -1,0 +1,25 @@
+{
+  "generation_command": "cargo test -p synapse-worker-llama worker_reranks_gte_modernbert_when_cached -- --ignored --nocapture",
+  "items": [
+    {
+      "id": "rerank-animals",
+      "query": "Which document is about a cat sitting on a mat?",
+      "candidates": [
+        "A small cat sits on a woven mat near the window.",
+        "The spacecraft entered orbit after a six month flight.",
+        "A dog chased a tennis ball across the park."
+      ],
+      "scores": [2.5030794, -2.900275, -0.8026122]
+    },
+    {
+      "id": "rerank-weather",
+      "query": "Which passage discusses rainfall and umbrellas?",
+      "candidates": [
+        "Heavy rain fell downtown, so commuters opened their umbrellas.",
+        "The recipe calls for flour, butter, and sliced apples.",
+        "A pianist practiced scales before the evening concert."
+      ],
+      "scores": [2.0191998, -2.4361007, -2.2742145]
+    }
+  ]
+}

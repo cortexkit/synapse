@@ -80,12 +80,16 @@ pub struct RerankScores {
 pub struct GenerateRequest {
     pub prompt: TokenIds,
     pub max_tokens: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grammar: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GenerateOutput {
     pub text: String,
     pub finish_reason: String,
+    pub n_prompt: usize,
+    pub n_gen: usize,
 }
 
 pub trait EmbedEngine {

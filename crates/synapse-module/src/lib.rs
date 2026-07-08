@@ -36,13 +36,13 @@ use subc_protocol::{
 use synapse_core::{
     AdmissionDecision, AdmissionRequest, AliasTable, CacheGcOutcome, CertifiedShapeEnvelope, Clock,
     EmbedEngine, EngineError, EngineErrorStage, EngineIdentity, ErrorClass, Fingerprint,
-    FlashAttentionSetting, LaneBudgetSnapshot, LaneScheduler, LoadedModel, MachineProfile,
-    ModelCache, ModelCacheError, ModelCacheIngest, ModelCacheMeta, NormalizationMode, NumericDType,
-    NumericProfile, NumericProfileId, PoolingStrategy, QueueClass, ResponseEnvelope,
-    ResponseProvenance, RuntimeConfig, SanitizedTokenizer, SchedulerConfig, StableError,
-    SystemMachineProfileCollector, ThreadPolicyClass, TokenBatch, TokenizationError,
-    TokenizedBatch, TokenizerConfig, TruncationDisclosure, ValidatedArtifact, Vectors, WorkRequest,
-    WorkerPooling,
+    FlashAttentionSetting, GenerateEngine, GenerateOutput, GenerateRequest, LaneBudgetSnapshot,
+    LaneScheduler, LoadedModel, MachineProfile, ModelCache, ModelCacheError, ModelCacheIngest,
+    ModelCacheMeta, NormalizationMode, NumericDType, NumericProfile, NumericProfileId,
+    PoolingStrategy, QueueClass, RerankEngine, RerankRequest, ResponseEnvelope, ResponseProvenance,
+    RuntimeConfig, SanitizedTokenizer, SchedulerConfig, StableError, SystemMachineProfileCollector,
+    ThreadPolicyClass, TokenBatch, TokenizationError, TokenizedBatch, TokenizerConfig,
+    TruncationDisclosure, ValidatedArtifact, Vectors, WorkRequest, WorkerPooling,
 };
 use synapse_engine_ort::OrtEmbedEngine;
 use thiserror::Error;
@@ -62,6 +62,8 @@ const DEFAULT_JOB_RESULT_PAGE_BYTES: usize = 512 * 1024;
 const DEFAULT_JOB_BULK_QUANTUM_TOKENS: u64 = 2_048;
 const DEFAULT_PROBE_MEAN_COSINE_THRESHOLD: f64 = 0.999;
 const DEFAULT_PROBE_WORST_DECILE_RANK_OVERLAP_THRESHOLD: f64 = 0.9;
+const RERANK_PROBE_PEARSON_THRESHOLD: f64 = 0.999;
+const GENERATE_PROBE_MIN_LABEL_MATCHES: usize = 7;
 
 pub async fn run_from_env() -> Result<(), ModuleError> {
     let module_id = env::var(SUBC_MODULE_ID_ENV)
@@ -184,6 +186,8 @@ struct PreloadModelConfig {
     #[serde(default)]
     model_id: Option<String>,
     engine: String,
+    #[serde(default, alias = "kind", alias = "capability")]
+    task: Option<String>,
     model_path: PathBuf,
     tokenizer_path: PathBuf,
     #[serde(default)]
@@ -359,12 +363,20 @@ impl Drop for InlineAdmission {
 
 struct EmbeddingModel {
     model_id: String,
+    task: ModelTask,
     loaded_model: LoadedModel,
     backend: EmbedBackend,
     tokenizer: SanitizedTokenizer,
     numeric_profile_id: NumericProfileId,
     fingerprint: Fingerprint,
     engine_identity: EngineIdentity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ModelTask {
+    Embed,
+    Rerank,
+    Generate,
 }
 
 #[derive(Clone)]
@@ -430,6 +442,66 @@ struct EmbedBatchParams {
     allow_equivalent: bool,
     #[serde(default)]
     required_epoch: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RerankScoreParams {
+    #[serde(default, alias = "model_id")]
+    model: Option<String>,
+    query: String,
+    #[serde(default)]
+    candidates: Vec<String>,
+    #[serde(default)]
+    deadline_ms: Option<u64>,
+    #[serde(default)]
+    max_queue_ms: Option<u64>,
+    #[serde(default)]
+    target_fingerprint: Option<String>,
+    #[serde(default)]
+    required_fingerprint: Option<String>,
+    #[serde(default)]
+    allow_equivalent: bool,
+    #[serde(default)]
+    required_epoch: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct RerankScorePayload {
+    scores: Vec<f32>,
+    real_token_counts: Vec<u32>,
+    truncation_disclosures: Vec<TruncationDisclosure>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MicroLlmOneshotParams {
+    #[serde(default, alias = "model_id")]
+    model: Option<String>,
+    prompt: String,
+    max_tokens: u32,
+    #[serde(default)]
+    grammar: Option<String>,
+    #[serde(default)]
+    deadline_ms: Option<u64>,
+    #[serde(default)]
+    max_queue_ms: Option<u64>,
+    #[serde(default)]
+    target_fingerprint: Option<String>,
+    #[serde(default)]
+    required_fingerprint: Option<String>,
+    #[serde(default)]
+    allow_equivalent: bool,
+    #[serde(default)]
+    required_epoch: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct MicroLlmOneshotPayload {
+    text: String,
+    finish_reason: String,
+    n_prompt: usize,
+    n_gen: usize,
+    real_token_counts: Vec<u32>,
+    truncation_disclosures: Vec<TruncationDisclosure>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -547,6 +619,49 @@ struct ProbeFixtureItem {
     vector: Vec<f32>,
 }
 
+#[derive(Debug, Deserialize)]
+struct RerankProbeFixture {
+    #[serde(default)]
+    generation_command: Option<String>,
+    items: Vec<RerankProbeItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RerankProbeItem {
+    id: String,
+    query: String,
+    candidates: Vec<String>,
+    scores: Vec<f32>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct RerankProbeEvidence {
+    pearson: f64,
+    pairs: usize,
+    requests: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct GenerateProbeFixture {
+    #[serde(default)]
+    generation_command: Option<String>,
+    items: Vec<GenerateProbeItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GenerateProbeItem {
+    id: String,
+    prompt: String,
+    expected_label: String,
+    max_tokens: u32,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct GenerateProbeEvidence {
+    label_matches: usize,
+    items: usize,
+}
+
 #[derive(Clone, Debug, Serialize)]
 struct ProbeEvidence {
     mean_cosine: f64,
@@ -558,6 +673,11 @@ struct ProbeEvidence {
 struct ProbeLaneVectors {
     model: Arc<EmbeddingModel>,
     vectors: Vec<Vec<f32>>,
+}
+
+struct ProbeModelResult {
+    lane_result: Value,
+    certified_vectors: Option<Vec<Vec<f32>>>,
 }
 
 struct SystemClock;
@@ -678,7 +798,7 @@ impl RuntimeState {
             .ok_or_else(|| {
                 WireOperationError::from_stable(
                     StableError::probe_required(),
-                    "embed requests require a preloaded v1-dev embedding model",
+                    "synapse requests require a preloaded v1-dev model",
                 )
             })?;
         self.models.get(&model_id).cloned().ok_or_else(|| {
@@ -755,6 +875,7 @@ fn preload_embedding_model(
         .clone()
         .unwrap_or_else(|| format!("{}-{index}", preload.engine));
     let engine_name = preload.engine.trim().to_ascii_lowercase();
+    let task = parse_model_task(preload.task.as_deref(), &engine_name, &model_id)?;
     let pooling = parse_pooling(preload.pooling.as_deref().unwrap_or("mean"))?;
     let normalize = preload.normalize.unwrap_or(true);
     let max_tokens = preload.max_tokens.unwrap_or(512);
@@ -853,7 +974,11 @@ fn preload_embedding_model(
                 .min(u32::MAX as u64) as u32,
             max_sequences: inline.max_items.min(u32::MAX as usize) as u32,
         },
-        prompt_template: None,
+        prompt_template: match task {
+            ModelTask::Embed => None,
+            ModelTask::Rerank => Some("synapse-rerank-bos-query-sep-doc-eos-v1".to_string()),
+            ModelTask::Generate => Some("synapse-microllm-greedy-v1".to_string()),
+        },
         prefix_template: None,
         thread_policy: ThreadPolicyClass::Balanced,
     };
@@ -861,6 +986,7 @@ fn preload_embedding_model(
     let fingerprint = numeric_profile.fingerprint();
     Ok(EmbeddingModel {
         model_id,
+        task,
         loaded_model,
         backend,
         tokenizer,
@@ -900,13 +1026,14 @@ fn preload_llama_backend(
                 "create llama worker engine for '{model_id_for_error}': {error}"
             ))
         })?;
-        let engine_identity = engine.identity();
-        let loaded_model = engine.load(&artifact, &runtime_config).map_err(|error| {
-            ModuleError::Engine(format!(
-                "preload llama model '{model_id_for_error}' failed: {}",
-                error.message
-            ))
-        })?;
+        let engine_identity = EmbedEngine::identity(&engine);
+        let loaded_model =
+            EmbedEngine::load(&mut engine, &artifact, &runtime_config).map_err(|error| {
+                ModuleError::Engine(format!(
+                    "preload llama model '{model_id_for_error}' failed: {}",
+                    error.message
+                ))
+            })?;
         Ok((
             EmbedBackend::Llama(Arc::new(Mutex::new(engine))),
             engine_identity,
@@ -1000,16 +1127,8 @@ async fn dispatch_request(state: Arc<ModuleState>, request: MethodEnvelope) -> H
         "embed.query" => embed_query(state, request.params).await,
         "embed.batch" => embed_batch(state, request.params).await,
         "embed.result" => embed_result(state, request.params).await,
-        "rerank.score" | "microllm.oneshot" => result_outcome(error_payload(
-            &state,
-            WireOperationError::from_stable(
-                StableError::probe_required(),
-                format!(
-                    "{} requires a completed probe before this scaffold can serve requests",
-                    request.method
-                ),
-            ),
-        )),
+        "rerank.score" => rerank_score(state, request.params).await,
+        "microllm.oneshot" => microllm_oneshot(state, request.params).await,
         "model.load" => result_outcome(error_payload(
             &state,
             WireOperationError::from_stable(
@@ -1176,6 +1295,301 @@ async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         Err(error) => return result_outcome(error_payload(&state, error)),
     };
     embed_tokenized(state, model, ids, tokenized, alias_table).await
+}
+
+async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
+    let params: RerankScoreParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(error) => {
+            return channel_error(
+                "invalid_request",
+                format!("invalid rerank.score params: {error}"),
+            )
+        }
+    };
+    if params.candidates.is_empty() {
+        return channel_error(
+            "invalid_request",
+            "rerank.score requires at least one candidate",
+        );
+    }
+    if params.candidates.len() > state.runtime.inline.max_items {
+        return result_outcome(error_payload(
+            &state,
+            WireOperationError::from_stable(
+                StableError::queue_full(Some(state.runtime.inline.max_queue_ms)),
+                format!(
+                    "rerank.score candidate count {} exceeds inline budget {}",
+                    params.candidates.len(),
+                    state.runtime.inline.max_items
+                ),
+            ),
+        ));
+    }
+
+    let alias_table = match state.store.alias_table() {
+        Ok(alias_table) => alias_table,
+        Err(error) => return channel_error("store_failure", error.to_string()),
+    };
+    let model = match state.runtime.resolve_model(params.model.as_deref()) {
+        Ok(model) => model,
+        Err(error) => return result_outcome(error_payload(&state, error)),
+    };
+    if model.task != ModelTask::Rerank {
+        return result_outcome(error_payload(
+            &state,
+            WireOperationError::from_stable(
+                StableError::artifact_invalid(),
+                format!(
+                    "model '{}' is not configured for rerank.score",
+                    model.model_id
+                ),
+            ),
+        ));
+    }
+    if let Err(error) = ensure_model_certified(&state, &model) {
+        return result_outcome(error_payload(&state, error));
+    }
+    if let Err(error) = check_fingerprint_constraints(
+        &model,
+        &alias_table,
+        params.target_fingerprint.as_deref(),
+        params.required_fingerprint.as_deref(),
+        params.allow_equivalent,
+        params.required_epoch,
+    ) {
+        return result_outcome(error_payload(&state, error));
+    }
+
+    let mut texts = Vec::with_capacity(params.candidates.len() + 1);
+    texts.push(params.query.as_str());
+    texts.extend(params.candidates.iter().map(String::as_str));
+    let request_bytes = request_bytes_for_texts(texts.iter().copied());
+    let tokenized = match model.tokenizer.tokenize_batch_without_special_tokens(texts) {
+        Ok(tokenized) => tokenized,
+        Err(error) => {
+            return result_outcome(error_payload(
+                &state,
+                WireOperationError::from_stable(StableError::artifact_invalid(), error.to_string()),
+            ))
+        }
+    };
+    let mut token_items = tokenized.batch.items.clone();
+    let query = token_items.remove(0);
+    let candidate_token_counts = token_items
+        .iter()
+        .map(|candidate| {
+            candidate
+                .len()
+                .saturating_add(query.len())
+                .saturating_add(3) as u64
+        })
+        .sum::<u64>();
+    if candidate_token_counts > state.runtime.inline.max_tokens {
+        return result_outcome(error_payload(
+            &state,
+            WireOperationError::from_stable(
+                StableError::queue_full(Some(state.runtime.inline.max_queue_ms)),
+                format!(
+                    "rerank.score token budget {candidate_token_counts} exceeds inline budget {}",
+                    state.runtime.inline.max_tokens
+                ),
+            ),
+        ));
+    }
+    let queue_class = if params.candidates.len() <= 20 {
+        QueueClass::Interactive
+    } else {
+        QueueClass::Bulk
+    };
+    let _admission = match state.runtime.admit_inline(
+        queue_class,
+        request_bytes,
+        params.deadline_ms,
+        params.max_queue_ms,
+    ) {
+        Ok(admission) => admission,
+        Err(error) => return result_outcome(error_payload(&state, error)),
+    };
+
+    let scores = match execute_rerank(
+        &state.runtime,
+        &model,
+        RerankRequest {
+            query,
+            candidates: token_items,
+        },
+    )
+    .await
+    {
+        Ok(scores) => scores,
+        Err(error) => return result_outcome(error_payload(&state, error)),
+    };
+    if scores.scores.len() != params.candidates.len() {
+        return result_outcome(error_payload(
+            &state,
+            WireOperationError::from_stable(
+                StableError::engine_crashed(None),
+                format!(
+                    "engine returned {} rerank scores for {} candidates",
+                    scores.scores.len(),
+                    params.candidates.len()
+                ),
+            ),
+        ));
+    }
+    let equivalent_to = equivalent_fingerprints(&alias_table, &model);
+    let payload = RerankScorePayload {
+        scores: scores.scores,
+        real_token_counts: tokenized.real_token_counts,
+        truncation_disclosures: tokenized.disclosures,
+    };
+    let envelope = ResponseEnvelope {
+        fingerprint: model.fingerprint.clone(),
+        table_epoch: alias_table.table_epoch,
+        dims: 1,
+        provenance: ResponseProvenance {
+            engine: model.engine_identity.clone(),
+        },
+        module_generation: state.module_generation,
+        equivalent_to,
+        payload,
+    };
+    result_outcome(serde_json::to_value(envelope).expect("rerank envelope should serialize"))
+}
+
+async fn microllm_oneshot(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
+    let params: MicroLlmOneshotParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(error) => {
+            return channel_error(
+                "invalid_request",
+                format!("invalid microllm.oneshot params: {error}"),
+            )
+        }
+    };
+    if params.max_tokens > 64 {
+        return channel_error(
+            "invalid_request",
+            "microllm.oneshot max_tokens must be <= 64",
+        );
+    }
+    if params.grammar.is_some() {
+        return channel_error(
+            "invalid_request",
+            "microllm.oneshot grammar is not supported by the current llama-cpp-2 worker build",
+        );
+    }
+
+    let alias_table = match state.store.alias_table() {
+        Ok(alias_table) => alias_table,
+        Err(error) => return channel_error("store_failure", error.to_string()),
+    };
+    let model = match state.runtime.resolve_model(params.model.as_deref()) {
+        Ok(model) => model,
+        Err(error) => return result_outcome(error_payload(&state, error)),
+    };
+    if model.task != ModelTask::Generate {
+        return result_outcome(error_payload(
+            &state,
+            WireOperationError::from_stable(
+                StableError::artifact_invalid(),
+                format!(
+                    "model '{}' is not configured for microllm.oneshot",
+                    model.model_id
+                ),
+            ),
+        ));
+    }
+    if let Err(error) = ensure_model_certified(&state, &model) {
+        return result_outcome(error_payload(&state, error));
+    }
+    if let Err(error) = check_fingerprint_constraints(
+        &model,
+        &alias_table,
+        params.target_fingerprint.as_deref(),
+        params.required_fingerprint.as_deref(),
+        params.allow_equivalent,
+        params.required_epoch,
+    ) {
+        return result_outcome(error_payload(&state, error));
+    }
+
+    let request_bytes = request_bytes_for_texts([params.prompt.as_str()]);
+    let tokenized = match model.tokenizer.tokenize_batch([params.prompt.as_str()]) {
+        Ok(tokenized) => tokenized,
+        Err(error) => {
+            return result_outcome(error_payload(
+                &state,
+                WireOperationError::from_stable(StableError::artifact_invalid(), error.to_string()),
+            ))
+        }
+    };
+    let prompt_tokens = tokenized
+        .real_token_counts
+        .first()
+        .copied()
+        .unwrap_or_default() as u64;
+    let total_tokens = prompt_tokens.saturating_add(u64::from(params.max_tokens));
+    if total_tokens > state.runtime.inline.max_tokens {
+        return result_outcome(error_payload(
+            &state,
+            WireOperationError::from_stable(
+                StableError::queue_full(Some(state.runtime.inline.max_queue_ms)),
+                format!(
+                    "microllm.oneshot token budget {total_tokens} exceeds inline budget {}",
+                    state.runtime.inline.max_tokens
+                ),
+            ),
+        ));
+    }
+    let _admission = match state.runtime.admit_inline(
+        QueueClass::Interactive,
+        request_bytes,
+        params.deadline_ms,
+        params.max_queue_ms,
+    ) {
+        Ok(admission) => admission,
+        Err(error) => return result_outcome(error_payload(&state, error)),
+    };
+
+    let mut prompt_items = tokenized.batch.items.clone();
+    let prompt = prompt_items.pop().unwrap_or_default();
+    let output = match execute_generate(
+        &state.runtime,
+        &model,
+        GenerateRequest {
+            prompt,
+            max_tokens: params.max_tokens,
+            grammar: None,
+        },
+    )
+    .await
+    {
+        Ok(output) => output,
+        Err(error) => return result_outcome(error_payload(&state, error)),
+    };
+    let equivalent_to = equivalent_fingerprints(&alias_table, &model);
+    let payload = MicroLlmOneshotPayload {
+        text: output.text,
+        finish_reason: output.finish_reason,
+        n_prompt: output.n_prompt,
+        n_gen: output.n_gen,
+        real_token_counts: tokenized.real_token_counts,
+        truncation_disclosures: tokenized.disclosures,
+    };
+    let envelope = ResponseEnvelope {
+        fingerprint: model.fingerprint.clone(),
+        table_epoch: alias_table.table_epoch,
+        dims: 0,
+        provenance: ResponseProvenance {
+            engine: model.engine_identity.clone(),
+        },
+        module_generation: state.module_generation,
+        equivalent_to,
+        payload,
+    };
+    result_outcome(serde_json::to_value(envelope).expect("microllm envelope should serialize"))
 }
 
 async fn submit_embed_batch_job(
@@ -1681,6 +2095,105 @@ async fn execute_embedding(
     }
 }
 
+async fn execute_rerank(
+    runtime: &RuntimeState,
+    model: &EmbeddingModel,
+    request: RerankRequest,
+) -> Result<synapse_core::RerankScores, WireOperationError> {
+    let permit = runtime
+        .execution
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| {
+            WireOperationError::from_stable(
+                StableError::queue_full(Some(100)),
+                "inline rerank executor is closed",
+            )
+        })?;
+    match &model.backend {
+        EmbedBackend::Ort(_) => Err(WireOperationError::from_stable(
+            StableError::artifact_invalid(),
+            format!("model '{}' does not support rerank.score", model.model_id),
+        )),
+        #[cfg(unix)]
+        EmbedBackend::Llama(engine) => {
+            let engine = Arc::clone(engine);
+            let loaded_model = model.loaded_model.clone();
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                let engine = engine.lock().map_err(|_| EngineError {
+                    stage: EngineErrorStage::Inference,
+                    risk_class: synapse_core::EngineRiskClass::AbortCapable,
+                    message: "llama worker engine mutex was poisoned during rerank".to_string(),
+                    retry_after_ms: Some(100),
+                    safe_to_retry_same_request: true,
+                })?;
+                engine.rerank(&loaded_model, request)
+            })
+            .await
+            .map_err(|error| {
+                WireOperationError::from_stable(
+                    StableError::engine_crashed(Some(100)),
+                    format!("rerank worker join failed: {error}"),
+                )
+            })?
+            .map_err(engine_error_to_wire)
+        }
+    }
+}
+
+async fn execute_generate(
+    runtime: &RuntimeState,
+    model: &EmbeddingModel,
+    request: GenerateRequest,
+) -> Result<GenerateOutput, WireOperationError> {
+    let permit = runtime
+        .execution
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| {
+            WireOperationError::from_stable(
+                StableError::queue_full(Some(100)),
+                "inline generate executor is closed",
+            )
+        })?;
+    match &model.backend {
+        EmbedBackend::Ort(_) => Err(WireOperationError::from_stable(
+            StableError::artifact_invalid(),
+            format!(
+                "model '{}' does not support microllm.oneshot",
+                model.model_id
+            ),
+        )),
+        #[cfg(unix)]
+        EmbedBackend::Llama(engine) => {
+            let engine = Arc::clone(engine);
+            let loaded_model = model.loaded_model.clone();
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                let engine = engine.lock().map_err(|_| EngineError {
+                    stage: EngineErrorStage::Inference,
+                    risk_class: synapse_core::EngineRiskClass::AbortCapable,
+                    message: "llama worker engine mutex was poisoned during generate".to_string(),
+                    retry_after_ms: Some(100),
+                    safe_to_retry_same_request: true,
+                })?;
+                engine.generate(&loaded_model, request)
+            })
+            .await
+            .map_err(|error| {
+                WireOperationError::from_stable(
+                    StableError::engine_crashed(Some(100)),
+                    format!("generate worker join failed: {error}"),
+                )
+            })?
+            .map_err(engine_error_to_wire)
+        }
+    }
+}
+
 fn engine_error_to_wire(error: EngineError) -> WireOperationError {
     WireOperationError::from_stable(
         StableError::engine_crashed(error.retry_after_ms),
@@ -1874,7 +2387,21 @@ async fn execute_probe_job(state: Arc<ModuleState>, job_id: String, model_filter
         return;
     }
 
-    let fixture = match probe_fixture() {
+    let embed_fixture = match probe_fixture() {
+        Ok(fixture) => fixture,
+        Err(error) => {
+            fail_job_with_wire_error(&state, &job_id, false, error);
+            return;
+        }
+    };
+    let rerank_fixture = match rerank_probe_fixture() {
+        Ok(fixture) => fixture,
+        Err(error) => {
+            fail_job_with_wire_error(&state, &job_id, false, error);
+            return;
+        }
+    };
+    let generate_fixture = match generate_probe_fixture() {
         Ok(fixture) => fixture,
         Err(error) => {
             fail_job_with_wire_error(&state, &job_id, false, error);
@@ -1894,76 +2421,32 @@ async fn execute_probe_job(state: Arc<ModuleState>, job_id: String, model_filter
     let mut lane_results = Vec::new();
     let mut certified_vectors = Vec::new();
     for model in selected_models {
-        let texts = fixture
-            .items
-            .iter()
-            .map(|item| item.text.as_str())
-            .collect::<Vec<_>>();
-        let tokenized = match model.tokenizer.tokenize_batch(texts) {
-            Ok(tokenized) => tokenized,
-            Err(error) => {
-                lane_results.push(json!({
-                    "model_id": model.model_id,
-                    "fingerprint": model.fingerprint,
-                    "numeric_profile_id": model.numeric_profile_id,
-                    "status": "uncertified",
-                    "error": error.to_string(),
-                }));
-                continue;
+        let probe_result = match model.task {
+            ModelTask::Embed => {
+                execute_embed_probe_for_model(&state, Arc::clone(&model), &embed_fixture).await
+            }
+            ModelTask::Rerank => {
+                execute_rerank_probe_for_model(&state, Arc::clone(&model), &rerank_fixture).await
+            }
+            ModelTask::Generate => {
+                execute_generate_probe_for_model(&state, Arc::clone(&model), &generate_fixture)
+                    .await
             }
         };
-        let vectors = match execute_embedding(&state.runtime, &model, tokenized.batch).await {
-            Ok(vectors) => vectors,
+        let probe_result = match probe_result {
+            Ok(result) => result,
             Err(error) => {
-                lane_results.push(json!({
-                    "model_id": model.model_id,
-                    "fingerprint": model.fingerprint,
-                    "numeric_profile_id": model.numeric_profile_id,
-                    "status": "uncertified",
-                    "error": error,
-                }));
-                continue;
-            }
-        };
-        let evidence = probe_evidence(&vectors, &fixture.items);
-        let passed = evidence.mean_cosine >= state.runtime.probe.mean_cosine_threshold
-            && evidence.worst_decile >= state.runtime.probe.worst_decile_rank_overlap_threshold;
-        if passed {
-            let row = CertificationRow {
-                machine_profile_hash: state.machine_profile_hash.clone(),
-                numeric_profile_id: model.numeric_profile_id.clone(),
-                fingerprint: model.fingerprint.clone(),
-                certified_at_ms: now_ms(),
-                evidence: serde_json::to_value(&evidence).expect("probe evidence serializes"),
-            };
-            if let Err(error) = state.store.store_cert_row(&row) {
-                fail_job_with_wire_error(
-                    &state,
-                    &job_id,
-                    true,
-                    WireOperationError::from_stable(
-                        StableError::engine_crashed(Some(100)),
-                        format!("write certification row: {error}"),
-                    ),
-                );
+                fail_job_with_wire_error(&state, &job_id, true, error);
                 return;
             }
+        };
+        if let Some(vectors) = probe_result.certified_vectors {
             certified_vectors.push(ProbeLaneVectors {
                 model: Arc::clone(&model),
-                vectors: vectors.clone(),
+                vectors,
             });
         }
-        lane_results.push(json!({
-            "model_id": model.model_id,
-            "fingerprint": model.fingerprint,
-            "numeric_profile_id": model.numeric_profile_id,
-            "status": if passed { "certified" } else { "uncertified" },
-            "evidence": evidence,
-            "thresholds": {
-                "mean_cosine": state.runtime.probe.mean_cosine_threshold,
-                "worst_decile": state.runtime.probe.worst_decile_rank_overlap_threshold,
-            },
-        }));
+        lane_results.push(probe_result.lane_result);
     }
 
     let mut alias_results = Vec::new();
@@ -2019,9 +2502,26 @@ async fn execute_probe_job(state: Arc<ModuleState>, job_id: String, model_filter
         "machine_profile_hash": state.machine_profile_hash,
         "machine_profile": state.machine_profile,
         "fixture": {
-            "items": fixture.items.len(),
-            "first_id": fixture.items.first().map(|item| item.id.clone()),
-            "generation_command": fixture.generation_command,
+            "items": embed_fixture.items.len(),
+            "first_id": embed_fixture.items.first().map(|item| item.id.clone()),
+            "generation_command": embed_fixture.generation_command,
+        },
+        "fixtures": {
+            "embed": {
+                "items": embed_fixture.items.len(),
+                "first_id": embed_fixture.items.first().map(|item| item.id.clone()),
+                "generation_command": embed_fixture.generation_command,
+            },
+            "rerank": {
+                "items": rerank_fixture.items.len(),
+                "first_id": rerank_fixture.items.first().map(|item| item.id.clone()),
+                "generation_command": rerank_fixture.generation_command,
+            },
+            "generate": {
+                "items": generate_fixture.items.len(),
+                "first_id": generate_fixture.items.first().map(|item| item.id.clone()),
+                "generation_command": generate_fixture.generation_command,
+            }
         },
         "lanes": lane_results,
         "aliases": alias_results,
@@ -2037,6 +2537,283 @@ async fn execute_probe_job(state: Arc<ModuleState>, job_id: String, model_filter
             ),
         );
     }
+}
+
+async fn execute_embed_probe_for_model(
+    state: &ModuleState,
+    model: Arc<EmbeddingModel>,
+    fixture: &ProbeFixture,
+) -> Result<ProbeModelResult, WireOperationError> {
+    let texts = fixture
+        .items
+        .iter()
+        .map(|item| item.text.as_str())
+        .collect::<Vec<_>>();
+    let tokenized = match model.tokenizer.tokenize_batch(texts) {
+        Ok(tokenized) => tokenized,
+        Err(error) => {
+            return Ok(ProbeModelResult {
+                lane_result: json!({
+                    "model_id": model.model_id,
+                    "task": "embed",
+                    "fingerprint": model.fingerprint,
+                    "numeric_profile_id": model.numeric_profile_id,
+                    "status": "uncertified",
+                    "error": error.to_string(),
+                }),
+                certified_vectors: None,
+            })
+        }
+    };
+    let vectors = match execute_embedding(&state.runtime, &model, tokenized.batch).await {
+        Ok(vectors) => vectors,
+        Err(error) => {
+            return Ok(ProbeModelResult {
+                lane_result: json!({
+                    "model_id": model.model_id,
+                    "task": "embed",
+                    "fingerprint": model.fingerprint,
+                    "numeric_profile_id": model.numeric_profile_id,
+                    "status": "uncertified",
+                    "error": error,
+                }),
+                certified_vectors: None,
+            })
+        }
+    };
+    let evidence = probe_evidence(&vectors, &fixture.items);
+    let passed = evidence.mean_cosine >= state.runtime.probe.mean_cosine_threshold
+        && evidence.worst_decile >= state.runtime.probe.worst_decile_rank_overlap_threshold;
+    if passed {
+        store_probe_cert_row(
+            state,
+            &model,
+            json!({ "task": "embed", "metrics": evidence }),
+        )?;
+    }
+    Ok(ProbeModelResult {
+        lane_result: json!({
+            "model_id": model.model_id,
+            "task": "embed",
+            "fingerprint": model.fingerprint,
+            "numeric_profile_id": model.numeric_profile_id,
+            "status": if passed { "certified" } else { "uncertified" },
+            "evidence": evidence,
+            "thresholds": {
+                "mean_cosine": state.runtime.probe.mean_cosine_threshold,
+                "worst_decile": state.runtime.probe.worst_decile_rank_overlap_threshold,
+            },
+        }),
+        certified_vectors: passed.then_some(vectors),
+    })
+}
+
+async fn execute_rerank_probe_for_model(
+    state: &ModuleState,
+    model: Arc<EmbeddingModel>,
+    fixture: &RerankProbeFixture,
+) -> Result<ProbeModelResult, WireOperationError> {
+    let mut actual = Vec::new();
+    let mut reference = Vec::new();
+    for item in &fixture.items {
+        if item.candidates.len() != item.scores.len() {
+            return Ok(ProbeModelResult {
+                lane_result: json!({
+                    "model_id": model.model_id,
+                    "task": "rerank",
+                    "fingerprint": model.fingerprint,
+                    "numeric_profile_id": model.numeric_profile_id,
+                    "status": "uncertified",
+                    "error": format!("rerank fixture '{}' has {} candidates and {} scores", item.id, item.candidates.len(), item.scores.len()),
+                }),
+                certified_vectors: None,
+            });
+        }
+        let mut texts = Vec::with_capacity(item.candidates.len() + 1);
+        texts.push(item.query.as_str());
+        texts.extend(item.candidates.iter().map(String::as_str));
+        let tokenized = match model.tokenizer.tokenize_batch_without_special_tokens(texts) {
+            Ok(tokenized) => tokenized,
+            Err(error) => {
+                return Ok(ProbeModelResult {
+                    lane_result: json!({
+                        "model_id": model.model_id,
+                        "task": "rerank",
+                        "fingerprint": model.fingerprint,
+                        "numeric_profile_id": model.numeric_profile_id,
+                        "status": "uncertified",
+                        "error": error.to_string(),
+                    }),
+                    certified_vectors: None,
+                })
+            }
+        };
+        let mut token_items = tokenized.batch.items;
+        let query = token_items.remove(0);
+        let scores = match execute_rerank(
+            &state.runtime,
+            &model,
+            RerankRequest {
+                query,
+                candidates: token_items,
+            },
+        )
+        .await
+        {
+            Ok(scores) => scores,
+            Err(error) => {
+                return Ok(ProbeModelResult {
+                    lane_result: json!({
+                        "model_id": model.model_id,
+                        "task": "rerank",
+                        "fingerprint": model.fingerprint,
+                        "numeric_profile_id": model.numeric_profile_id,
+                        "status": "uncertified",
+                        "error": error,
+                    }),
+                    certified_vectors: None,
+                })
+            }
+        };
+        actual.extend(scores.scores.into_iter().map(f64::from));
+        reference.extend(item.scores.iter().copied().map(f64::from));
+    }
+    let pearson = pearson_correlation(&actual, &reference);
+    let evidence = RerankProbeEvidence {
+        pearson,
+        pairs: actual.len(),
+        requests: fixture.items.len(),
+    };
+    let passed = pearson >= RERANK_PROBE_PEARSON_THRESHOLD;
+    if passed {
+        store_probe_cert_row(
+            state,
+            &model,
+            json!({ "task": "rerank", "metrics": evidence }),
+        )?;
+    }
+    Ok(ProbeModelResult {
+        lane_result: json!({
+            "model_id": model.model_id,
+            "task": "rerank",
+            "fingerprint": model.fingerprint,
+            "numeric_profile_id": model.numeric_profile_id,
+            "status": if passed { "certified" } else { "uncertified" },
+            "evidence": evidence,
+            "thresholds": { "pearson": RERANK_PROBE_PEARSON_THRESHOLD },
+        }),
+        certified_vectors: None,
+    })
+}
+
+async fn execute_generate_probe_for_model(
+    state: &ModuleState,
+    model: Arc<EmbeddingModel>,
+    fixture: &GenerateProbeFixture,
+) -> Result<ProbeModelResult, WireOperationError> {
+    let mut matches = 0_usize;
+    let mut examples = Vec::new();
+    for item in &fixture.items {
+        let tokenized = match model.tokenizer.tokenize_batch([item.prompt.as_str()]) {
+            Ok(tokenized) => tokenized,
+            Err(error) => {
+                return Ok(ProbeModelResult {
+                    lane_result: json!({
+                        "model_id": model.model_id,
+                        "task": "generate",
+                        "fingerprint": model.fingerprint,
+                        "numeric_profile_id": model.numeric_profile_id,
+                        "status": "uncertified",
+                        "error": error.to_string(),
+                    }),
+                    certified_vectors: None,
+                })
+            }
+        };
+        let prompt = tokenized.batch.items.into_iter().next().unwrap_or_default();
+        let output = match execute_generate(
+            &state.runtime,
+            &model,
+            GenerateRequest {
+                prompt,
+                max_tokens: item.max_tokens.min(64),
+                grammar: None,
+            },
+        )
+        .await
+        {
+            Ok(output) => output,
+            Err(error) => {
+                return Ok(ProbeModelResult {
+                    lane_result: json!({
+                        "model_id": model.model_id,
+                        "task": "generate",
+                        "fingerprint": model.fingerprint,
+                        "numeric_profile_id": model.numeric_profile_id,
+                        "status": "uncertified",
+                        "error": error,
+                    }),
+                    certified_vectors: None,
+                })
+            }
+        };
+        let actual_label = normalize_probe_label(&output.text);
+        let expected_label = normalize_probe_label(&item.expected_label);
+        if actual_label == expected_label {
+            matches += 1;
+        } else if examples.len() < 3 {
+            examples.push(json!({
+                "id": item.id,
+                "expected": item.expected_label,
+                "actual": output.text,
+            }));
+        }
+    }
+    let evidence = GenerateProbeEvidence {
+        label_matches: matches,
+        items: fixture.items.len(),
+    };
+    let passed = matches >= GENERATE_PROBE_MIN_LABEL_MATCHES;
+    if passed {
+        store_probe_cert_row(
+            state,
+            &model,
+            json!({ "task": "generate", "metrics": evidence }),
+        )?;
+    }
+    Ok(ProbeModelResult {
+        lane_result: json!({
+            "model_id": model.model_id,
+            "task": "generate",
+            "fingerprint": model.fingerprint,
+            "numeric_profile_id": model.numeric_profile_id,
+            "status": if passed { "certified" } else { "uncertified" },
+            "evidence": evidence,
+            "thresholds": { "label_matches": GENERATE_PROBE_MIN_LABEL_MATCHES },
+            "mismatches": examples,
+        }),
+        certified_vectors: None,
+    })
+}
+
+fn store_probe_cert_row(
+    state: &ModuleState,
+    model: &EmbeddingModel,
+    evidence: Value,
+) -> Result<(), WireOperationError> {
+    let row = CertificationRow {
+        machine_profile_hash: state.machine_profile_hash.clone(),
+        numeric_profile_id: model.numeric_profile_id.clone(),
+        fingerprint: model.fingerprint.clone(),
+        certified_at_ms: now_ms(),
+        evidence,
+    };
+    state.store.store_cert_row(&row).map_err(|error| {
+        WireOperationError::from_stable(
+            StableError::engine_crashed(Some(100)),
+            format!("write certification row: {error}"),
+        )
+    })
 }
 
 fn probe_status_payload(state: &ModuleState, record: &JobRecord) -> Value {
@@ -2055,6 +2832,28 @@ fn probe_fixture() -> Result<ProbeFixture, WireOperationError> {
             WireOperationError::from_stable(
                 StableError::artifact_invalid(),
                 format!("decode built-in probe fixture: {error}"),
+            )
+        },
+    )
+}
+
+fn rerank_probe_fixture() -> Result<RerankProbeFixture, WireOperationError> {
+    serde_json::from_str(include_str!("fixtures/probe_rerank_gte_modernbert_v1.json")).map_err(
+        |error| {
+            WireOperationError::from_stable(
+                StableError::artifact_invalid(),
+                format!("decode built-in rerank probe fixture: {error}"),
+            )
+        },
+    )
+}
+
+fn generate_probe_fixture() -> Result<GenerateProbeFixture, WireOperationError> {
+    serde_json::from_str(include_str!("fixtures/probe_generate_qwen3_0_6b_v1.json")).map_err(
+        |error| {
+            WireOperationError::from_stable(
+                StableError::artifact_invalid(),
+                format!("decode built-in generate probe fixture: {error}"),
             )
         },
     )
@@ -2130,6 +2929,38 @@ fn top_k_neighbors(query: usize, vectors: &[Vec<f32>], k: usize) -> BTreeSet<usi
             .then_with(|| left.1.cmp(&right.1))
     });
     scored.into_iter().take(k).map(|(_, index)| index).collect()
+}
+
+fn pearson_correlation(left: &[f64], right: &[f64]) -> f64 {
+    if left.len() != right.len() || left.len() < 2 {
+        return 0.0;
+    }
+    let left_mean = left.iter().sum::<f64>() / left.len() as f64;
+    let right_mean = right.iter().sum::<f64>() / right.len() as f64;
+    let mut numerator = 0.0;
+    let mut left_denominator = 0.0;
+    let mut right_denominator = 0.0;
+    for (left, right) in left.iter().zip(right) {
+        let left_delta = left - left_mean;
+        let right_delta = right - right_mean;
+        numerator += left_delta * right_delta;
+        left_denominator += left_delta * left_delta;
+        right_denominator += right_delta * right_delta;
+    }
+    let denominator = left_denominator.sqrt() * right_denominator.sqrt();
+    if denominator <= f64::EPSILON {
+        0.0
+    } else {
+        numerator / denominator
+    }
+}
+
+fn normalize_probe_label(output: &str) -> String {
+    output
+        .split(|ch: char| ch.is_ascii_punctuation() || ch.is_whitespace())
+        .find(|part| !part.is_empty())
+        .unwrap_or("")
+        .to_ascii_lowercase()
 }
 
 fn cosine(left: &[f32], right: &[f32]) -> f64 {
@@ -2612,6 +3443,43 @@ fn strip_json_comments(input: &str) -> String {
         output.push(ch);
     }
     output
+}
+
+fn parse_model_task(
+    configured: Option<&str>,
+    engine_name: &str,
+    model_id: &str,
+) -> Result<ModelTask, ModuleError> {
+    let inferred;
+    let value = match configured.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) => value,
+        None => {
+            let lower_model_id = model_id.to_ascii_lowercase();
+            inferred = if engine_name == "llama" || engine_name == "llama.cpp" {
+                if lower_model_id.contains("rerank") {
+                    "rerank"
+                } else if lower_model_id.contains("generate")
+                    || lower_model_id.contains("microllm")
+                    || lower_model_id.contains("qwen")
+                {
+                    "generate"
+                } else {
+                    "embed"
+                }
+            } else {
+                "embed"
+            };
+            inferred
+        }
+    };
+    match value.to_ascii_lowercase().as_str() {
+        "embed" | "embedding" | "embeddings" => Ok(ModelTask::Embed),
+        "rerank" | "reranker" | "rerank.score" => Ok(ModelTask::Rerank),
+        "generate" | "generation" | "microllm" | "microllm.oneshot" => Ok(ModelTask::Generate),
+        other => Err(ModuleError::Config(format!(
+            "unsupported model task '{other}' for model '{model_id}'"
+        ))),
+    }
 }
 
 fn parse_pooling(value: &str) -> Result<WorkerPooling, ModuleError> {

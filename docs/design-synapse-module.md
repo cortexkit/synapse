@@ -143,6 +143,9 @@ substitution rejection preserved byte-for-byte), `required_epoch` (Oracle F15).
 - `rerank.score` — query + candidates → per-candidate RAW scores +
   fingerprint; candidate-count/token budgets; large requests job-shaped.
 - `microllm.oneshot` — prompt → text, max_tokens ≤ 64, greedy default.
+  The protocol reserves a `grammar` field, but this llama-cpp-2 worker build
+  does not expose GBNF support; non-empty grammar requests fail as invalid
+  rather than running unconstrained.
 - `model.load` / `model.status` — control-class job (below).
 - `models.list` — cached catalog, states, fingerprints, alias rows.
 - `probe.start` / `probe.status` — explicit op, job-shaped; writes
