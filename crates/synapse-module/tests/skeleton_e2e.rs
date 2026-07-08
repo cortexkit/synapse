@@ -103,6 +103,21 @@ fn spawn_synapse_module_with_preloads(
     subc_connection_file: &Path,
     preload_models: Option<&str>,
 ) -> ModuleProcess {
+    spawn_synapse_module_with_env(subc_connection_file, preload_models, None)
+}
+
+fn spawn_synapse_module_with_config(
+    subc_connection_file: &Path,
+    config_json: &str,
+) -> ModuleProcess {
+    spawn_synapse_module_with_env(subc_connection_file, None, Some(config_json))
+}
+
+fn spawn_synapse_module_with_env(
+    subc_connection_file: &Path,
+    preload_models: Option<&str>,
+    config_json: Option<&str>,
+) -> ModuleProcess {
     let mut command = Command::new(env!("CARGO_BIN_EXE_synapse-module"));
     command
         .arg("--subc")
@@ -112,6 +127,9 @@ fn spawn_synapse_module_with_preloads(
         .kill_on_drop(true);
     if let Some(preload_models) = preload_models {
         command.env("SYNAPSE_PRELOAD_MODELS", preload_models);
+    }
+    if let Some(config_json) = config_json {
+        command.env("SYNAPSE_CONFIG_JSON", config_json);
     }
     let child = command.spawn().expect("spawn synapse-module");
     ModuleProcess { child }
@@ -145,6 +163,21 @@ async fn open_route_with_preloads(
         }
         None => spawn_synapse_module(&daemon.connection_file_path),
     };
+    open_route_for_started_module(daemon, module).await
+}
+
+async fn open_route_with_config(
+    config_json: &str,
+) -> (TestDaemon, ModuleProcess, tokio::net::TcpStream, u16) {
+    let daemon = start_daemon().await;
+    let module = spawn_synapse_module_with_config(&daemon.connection_file_path, config_json);
+    open_route_for_started_module(daemon, module).await
+}
+
+async fn open_route_for_started_module(
+    daemon: TestDaemon,
+    module: ModuleProcess,
+) -> (TestDaemon, ModuleProcess, tokio::net::TcpStream, u16) {
     wait_for_registration(&daemon.registry, MODULE_ID, SETUP_TIMEOUT).await;
 
     let project_root = unique_temp_dir("synapse-e2e-project");
@@ -325,6 +358,124 @@ async fn embed_batch_preloaded_minilm_preserves_order_and_envelope() {
 }
 
 #[tokio::test]
+async fn over_budget_embed_batch_returns_job_and_pages_results() {
+    let Some(preloads) = minilm_preload_config() else {
+        eprintln!("skipping MiniLM job-tier e2e: local HF ONNX snapshot is missing");
+        return;
+    };
+    let preload_models: Value = serde_json::from_str(&preloads).expect("preload config is json");
+    let config = serde_json::json!({
+        "preload_models": preload_models,
+        "inline": { "max_items": 2 },
+        "jobs": {
+            "ttl_ms": 60_000,
+            "result_page_bytes": 4_096,
+            "bulk_quantum_tokens": 16
+        }
+    })
+    .to_string();
+    let _lock = acquire_minilm_e2e_lock();
+    let (_daemon, _module, mut consumer, route_channel) = open_route_with_config(&config).await;
+    let texts = [
+        "job tier first text",
+        "job tier second text",
+        "job tier third text",
+    ];
+
+    let mut inline_vectors = Vec::new();
+    for (index, text) in texts.iter().enumerate() {
+        let body = route_request(
+            &mut consumer,
+            route_channel,
+            100 + index as u64,
+            serde_json::json!({
+                "method": "embed.query",
+                "params": { "id": format!("item-{index}"), "text": text }
+            }),
+        )
+        .await;
+        inline_vectors.push(body["result"]["vectors"][0]["vector"].clone());
+    }
+
+    let items = texts
+        .iter()
+        .enumerate()
+        .map(|(index, text)| {
+            serde_json::json!({
+                "id": format!("item-{index}"),
+                "text": text,
+            })
+        })
+        .collect::<Vec<_>>();
+    let accepted = route_request(
+        &mut consumer,
+        route_channel,
+        200,
+        serde_json::json!({
+            "method": "embed.batch",
+            "params": { "request_key": "job-tier-e2e", "items": items }
+        }),
+    )
+    .await;
+    let job_id = accepted["result"]["job_id"]
+        .as_str()
+        .expect("job response includes job_id")
+        .to_string();
+    assert!(matches!(
+        accepted["result"]["state"].as_str(),
+        Some("queued" | "running" | "done")
+    ));
+
+    let duplicate = route_request(
+        &mut consumer,
+        route_channel,
+        201,
+        serde_json::json!({
+            "method": "embed.batch",
+            "params": {
+                "request_key": "job-tier-e2e",
+                "items": texts.iter().enumerate().map(|(index, text)| serde_json::json!({
+                    "id": format!("item-{index}"),
+                    "text": text,
+                })).collect::<Vec<_>>()
+            }
+        }),
+    )
+    .await;
+    assert_eq!(duplicate["result"]["job_id"], job_id);
+
+    let done = poll_embed_result(&mut consumer, route_channel, 300, &job_id).await;
+    assert_eq!(done["result"]["state"], "done");
+    let page_count = done["result"]["page_count"].as_u64().unwrap();
+    assert!(page_count >= 1);
+    let mut vectors = done["result"]["vectors"].as_array().unwrap().clone();
+    for page in 1..page_count {
+        let body = route_request(
+            &mut consumer,
+            route_channel,
+            300 + page,
+            serde_json::json!({
+                "method": "embed.result",
+                "params": { "job_id": &job_id, "page": page }
+            }),
+        )
+        .await;
+        vectors.extend(
+            body["result"]["vectors"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .cloned(),
+        );
+    }
+    assert_eq!(vectors.len(), texts.len());
+    for (index, vector) in vectors.iter().enumerate() {
+        assert_eq!(vector["id"], format!("item-{index}"));
+        assert_vectors_close(&vector["vector"], &inline_vectors[index]);
+    }
+}
+
+#[tokio::test]
 async fn embed_query_deadline_one_returns_typed_rejection() {
     let Some(preloads) = minilm_preload_config() else {
         eprintln!("skipping MiniLM deadline e2e: local HF ONNX snapshot is missing");
@@ -397,6 +548,54 @@ async fn concurrent_embed_burst_finishes_with_vectors_or_typed_rejections() {
             assert_eq!(body["result"]["vectors"].as_array().unwrap().len(), 1);
         }
         seen += 1;
+    }
+}
+
+async fn poll_embed_result(
+    consumer: &mut tokio::net::TcpStream,
+    route_channel: u16,
+    start_corr: u64,
+    job_id: &str,
+) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut corr = start_corr;
+    loop {
+        let body = route_request(
+            consumer,
+            route_channel,
+            corr,
+            serde_json::json!({
+                "method": "embed.result",
+                "params": { "job_id": job_id }
+            }),
+        )
+        .await;
+        match body["result"]["state"].as_str() {
+            Some("done") | Some("failed_transient") | Some("failed_permanent") => return body,
+            Some("queued" | "running") => {
+                assert!(
+                    Instant::now() < deadline,
+                    "embed.result did not reach a terminal state before timeout: {body:?}"
+                );
+                corr += 1;
+                sleep(Duration::from_millis(100)).await;
+            }
+            other => panic!("unexpected embed.result state {other:?}: {body:?}"),
+        }
+    }
+}
+
+fn assert_vectors_close(actual: &Value, expected: &Value) {
+    let actual = actual.as_array().expect("actual vector is an array");
+    let expected = expected.as_array().expect("expected vector is an array");
+    assert_eq!(actual.len(), expected.len());
+    for (left, right) in actual.iter().zip(expected) {
+        let left = left.as_f64().unwrap();
+        let right = right.as_f64().unwrap();
+        assert!(
+            (left - right).abs() < 1e-5,
+            "vector components differ: {left} vs {right}"
+        );
     }
 }
 

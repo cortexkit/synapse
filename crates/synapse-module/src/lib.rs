@@ -17,7 +17,11 @@ use cortexkit_store_types::{sqlite_store_path, Isolation, StorageBackend, Storag
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use store::{CatalogSnapshot, ModelCatalogEntry, SynapseStore, SynapseStoreError};
+use store::{
+    CatalogSnapshot, JobAdmission, JobRecord, ModelCatalogEntry, SynapseStore, SynapseStoreError,
+    JOB_STATE_DONE, JOB_STATE_FAILED_PERMANENT, JOB_STATE_FAILED_TRANSIENT, JOB_STATE_QUEUED,
+    JOB_STATE_RUNNING,
+};
 use subc_client_rs::{
     async_trait, BindDecision, HandlerOutcome, HealthReport, ModuleHandler, RequestCtx,
     RouteBindRequest, SubcModuleError,
@@ -30,13 +34,14 @@ use subc_protocol::{
     ModuleHelloAckBody, PROTOCOL_VERSION, SUBC_MODULE_ID_ENV,
 };
 use synapse_core::{
-    AdmissionDecision, AdmissionRequest, AliasTable, CertifiedShapeEnvelope, Clock, EmbedEngine,
-    EngineError, EngineErrorStage, EngineIdentity, ErrorClass, Fingerprint, FlashAttentionSetting,
-    LaneBudgetSnapshot, LoadedModel, NormalizationMode, NumericDType, NumericProfile,
-    PoolingStrategy, QueueClass, ResponseEnvelope, ResponseProvenance, RuntimeConfig,
-    SanitizedTokenizer, SchedulerConfig, StableError, ThreadPolicyClass, TokenBatch,
+    AdmissionDecision, AdmissionRequest, AliasTable, CacheGcOutcome, CertifiedShapeEnvelope, Clock,
+    EmbedEngine, EngineError, EngineErrorStage, EngineIdentity, ErrorClass, Fingerprint,
+    FlashAttentionSetting, LaneBudgetSnapshot, LaneScheduler, LoadedModel, ModelCache,
+    ModelCacheError, ModelCacheIngest, ModelCacheMeta, NormalizationMode, NumericDType,
+    NumericProfile, PoolingStrategy, QueueClass, ResponseEnvelope, ResponseProvenance,
+    RuntimeConfig, SanitizedTokenizer, SchedulerConfig, StableError, ThreadPolicyClass, TokenBatch,
     TokenizationError, TokenizedBatch, TokenizerConfig, TruncationDisclosure, ValidatedArtifact,
-    Vectors, WorkerPooling,
+    Vectors, WorkRequest, WorkerPooling,
 };
 use synapse_engine_ort::OrtEmbedEngine;
 use thiserror::Error;
@@ -51,6 +56,9 @@ const DEFAULT_MAX_QUEUE_MS: u64 = 5_000;
 const DEFAULT_DEADLINE_MS: u64 = 30_000;
 const DEFAULT_ESTIMATED_EXECUTION_MS: u64 = 25;
 const DEFAULT_MAX_CONCURRENT_WORKERS: usize = 2;
+const DEFAULT_JOB_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
+const DEFAULT_JOB_RESULT_PAGE_BYTES: usize = 512 * 1024;
+const DEFAULT_JOB_BULK_QUANTUM_TOKENS: u64 = 2_048;
 
 pub async fn run_from_env() -> Result<(), ModuleError> {
     let module_id = env::var(SUBC_MODULE_ID_ENV)
@@ -73,6 +81,8 @@ pub enum ModuleError {
     Serve(#[from] SubcModuleError),
     #[error("tokenization: {0}")]
     Tokenization(#[from] TokenizationError),
+    #[error("model cache: {0}")]
+    Cache(#[from] ModelCacheError),
     #[error("engine: {0}")]
     Engine(String),
     #[error("config: {0}")]
@@ -90,10 +100,12 @@ struct SynapseHandlerInner {
 }
 
 struct ModuleState {
+    module_id: String,
     store: Arc<SynapseStore>,
     module_generation: u64,
     health: ModuleHealth,
     runtime: Arc<RuntimeState>,
+    model_cache: Arc<ModelCache>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -152,6 +164,8 @@ struct ModuleConfig {
     preload_models: Vec<PreloadModelConfig>,
     #[serde(default)]
     inline: InlineConfig,
+    #[serde(default)]
+    jobs: JobConfig,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -211,6 +225,26 @@ impl Default for InlineConfig {
     }
 }
 
+#[derive(Clone, Debug, Deserialize)]
+struct JobConfig {
+    #[serde(default = "default_job_ttl_ms")]
+    ttl_ms: u64,
+    #[serde(default = "default_job_result_page_bytes")]
+    result_page_bytes: usize,
+    #[serde(default = "default_job_bulk_quantum_tokens")]
+    bulk_quantum_tokens: u64,
+}
+
+impl Default for JobConfig {
+    fn default() -> Self {
+        Self {
+            ttl_ms: default_job_ttl_ms(),
+            result_page_bytes: default_job_result_page_bytes(),
+            bulk_quantum_tokens: default_job_bulk_quantum_tokens(),
+        }
+    }
+}
+
 fn default_inline_max_items() -> usize {
     DEFAULT_INLINE_MAX_ITEMS
 }
@@ -239,10 +273,23 @@ fn default_max_concurrent_workers() -> usize {
     DEFAULT_MAX_CONCURRENT_WORKERS
 }
 
+fn default_job_ttl_ms() -> u64 {
+    DEFAULT_JOB_TTL_MS
+}
+
+fn default_job_result_page_bytes() -> usize {
+    DEFAULT_JOB_RESULT_PAGE_BYTES
+}
+
+fn default_job_bulk_quantum_tokens() -> u64 {
+    DEFAULT_JOB_BULK_QUANTUM_TOKENS
+}
+
 struct RuntimeState {
     models: BTreeMap<String, Arc<EmbeddingModel>>,
     default_model_id: Option<String>,
     inline: InlineConfig,
+    jobs: JobConfig,
     scheduler: Arc<Mutex<InlineScheduler>>,
     execution: Arc<Semaphore>,
 }
@@ -322,6 +369,8 @@ struct EmbedBatchParams {
     #[serde(default)]
     texts: Vec<String>,
     #[serde(default)]
+    request_key: Option<String>,
+    #[serde(default)]
     model: Option<String>,
     #[serde(default)]
     deadline_ms: Option<u64>,
@@ -350,6 +399,46 @@ struct EmbedBatchItem {
     text: String,
 }
 
+struct EmbedBatchJobWork {
+    model: Arc<EmbeddingModel>,
+    ids: Vec<String>,
+    tokenized: TokenizedBatch,
+    table_epoch: u64,
+    request_bytes: u64,
+    total_tokens: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct EmbedResultParams {
+    job_id: String,
+    #[serde(default)]
+    page: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CachePinParams {
+    #[serde(default)]
+    digest: Option<String>,
+    #[serde(default)]
+    source_url: Option<String>,
+    #[serde(default)]
+    expected_digest: Option<String>,
+    #[serde(default)]
+    format: Option<String>,
+    #[serde(default)]
+    tokenizer_path: Option<PathBuf>,
+    #[serde(default)]
+    module_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CacheGcParams {
+    #[serde(default)]
+    digest: Option<String>,
+    #[serde(default)]
+    grace_ms: Option<u64>,
+}
+
 struct SystemClock;
 
 impl Clock for SystemClock {
@@ -376,31 +465,56 @@ impl SynapseHandler {
         let descriptor = resolve_storage_descriptor(&ack.storage, &self.inner.module_id)?;
         let store = Arc::new(SynapseStore::open(&descriptor)?);
         let module_generation = store.next_module_generation()?;
-        let runtime = Arc::new(RuntimeState::from_config(load_module_config()?)?);
+        let restart_error = WireOperationError::from_stable(
+            StableError::module_restarted(),
+            "module restarted before the durable job reached a terminal result",
+        );
+        store.fail_prior_generation_incomplete_jobs(
+            module_generation,
+            &serde_json::to_value(&restart_error).expect("restart error serializes"),
+            now_ms(),
+        )?;
+        let model_cache = Arc::new(ModelCache::new(ModelCache::default_root()?));
+        let runtime = Arc::new(RuntimeState::from_config(
+            load_module_config()?,
+            Arc::clone(&model_cache),
+        )?);
         let health = ModuleHealth {
             status: "ok".to_string(),
             module_generation,
             loaded_models: runtime.models.len(),
         };
         Ok(Arc::new(ModuleState {
+            module_id: self.inner.module_id.clone(),
             store,
             module_generation,
             health,
             runtime,
+            model_cache,
         }))
     }
 }
 
 impl RuntimeState {
-    fn from_config(config: ModuleConfig) -> Result<Self, ModuleError> {
+    fn from_config(
+        config: ModuleConfig,
+        model_cache: Arc<ModelCache>,
+    ) -> Result<Self, ModuleError> {
         let inline = config.inline;
+        let jobs = config.jobs;
         let scheduler = Arc::new(Mutex::new(InlineScheduler { in_flight_bytes: 0 }));
         let execution = Arc::new(Semaphore::new(inline.max_concurrent_workers.max(1)));
         let mut models = BTreeMap::new();
         let ort_engine = Arc::new(Mutex::new(OrtEmbedEngine::new()));
 
         for (index, preload) in config.preload_models.into_iter().enumerate() {
-            let model = preload_embedding_model(index, preload, Arc::clone(&ort_engine), &inline)?;
+            let model = preload_embedding_model(
+                index,
+                preload,
+                Arc::clone(&ort_engine),
+                &inline,
+                &model_cache,
+            )?;
             models.insert(model.model_id.clone(), Arc::new(model));
         }
         let default_model_id = models.keys().next().cloned();
@@ -408,6 +522,7 @@ impl RuntimeState {
             models,
             default_model_id,
             inline,
+            jobs,
             scheduler,
             execution,
         })
@@ -504,6 +619,7 @@ fn preload_embedding_model(
     preload: PreloadModelConfig,
     ort_engine: Arc<Mutex<OrtEmbedEngine>>,
     inline: &InlineConfig,
+    model_cache: &ModelCache,
 ) -> Result<EmbeddingModel, ModuleError> {
     let model_id = preload
         .model_id
@@ -553,6 +669,7 @@ fn preload_embedding_model(
         digest: model_digest.clone(),
         format: artifact_format,
     };
+    let _cache_read_lease = model_cache.acquire_read(&model_digest)?;
 
     let (backend, engine_identity, loaded_model) = match engine_name.as_str() {
         "ort" | "onnx" => {
@@ -747,6 +864,7 @@ async fn dispatch_request(state: Arc<ModuleState>, request: MethodEnvelope) -> H
         },
         "embed.query" => embed_query(state, request.params).await,
         "embed.batch" => embed_batch(state, request.params).await,
+        "embed.result" => embed_result(state, request.params).await,
         "rerank.score" | "microllm.oneshot" => result_outcome(error_payload(
             &state,
             WireOperationError::from_stable(
@@ -764,7 +882,9 @@ async fn dispatch_request(state: Arc<ModuleState>, request: MethodEnvelope) -> H
                 "model.load is disabled for v1-dev; configure startup preloads instead",
             ),
         )),
-        "probe.start" | "cache.pin" | "cache.gc" => result_outcome(error_payload(
+        "cache.pin" => cache_pin(state, request.params).await,
+        "cache.gc" => cache_gc(state, request.params).await,
+        "probe.start" => result_outcome(error_payload(
             &state,
             WireOperationError::not_implemented(format!(
                 "{} is reserved in the scaffold but not implemented yet",
@@ -853,18 +973,6 @@ async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
     if items.is_empty() {
         return channel_error("invalid_request", "embed.batch requires at least one item");
     }
-    if items.len() > state.runtime.inline.max_items {
-        return result_outcome(error_payload(
-            &state,
-            WireOperationError::from_stable(
-                StableError::probe_required(),
-                format!(
-                    "embed.batch item count {} exceeds inline limit {}; job-shaped batch tier is not enabled yet",
-                    items.len(), state.runtime.inline.max_items
-                ),
-            ),
-        ));
-    }
 
     let table_epoch = table_epoch(&state);
     let model = match state.runtime.resolve_model(params.model.as_deref()) {
@@ -887,15 +995,6 @@ async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         .map(|item| item.text.as_str())
         .collect::<Vec<_>>();
     let request_bytes = request_bytes_for_texts(text_refs.iter().copied());
-    let _admission = match state.runtime.admit_inline(
-        QueueClass::Bulk,
-        request_bytes,
-        params.deadline_ms,
-        params.max_queue_ms,
-    ) {
-        Ok(admission) => admission,
-        Err(error) => return result_outcome(error_payload(&state, error)),
-    };
     let tokenized = match model.tokenizer.tokenize_batch(text_refs) {
         Ok(tokenized) => tokenized,
         Err(error) => {
@@ -910,20 +1009,420 @@ async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         .iter()
         .map(|tokens| u64::from(*tokens))
         .sum::<u64>();
-    if total_tokens > state.runtime.inline.max_tokens {
-        return result_outcome(error_payload(
+    let ids = items.into_iter().map(|item| item.id).collect::<Vec<_>>();
+
+    if ids.len() > state.runtime.inline.max_items || total_tokens > state.runtime.inline.max_tokens
+    {
+        return submit_embed_batch_job(
+            state,
+            params.request_key,
+            EmbedBatchJobWork {
+                model,
+                ids,
+                tokenized,
+                table_epoch,
+                request_bytes,
+                total_tokens,
+            },
+        )
+        .await;
+    }
+
+    let _admission = match state.runtime.admit_inline(
+        QueueClass::Bulk,
+        request_bytes,
+        params.deadline_ms,
+        params.max_queue_ms,
+    ) {
+        Ok(admission) => admission,
+        Err(error) => return result_outcome(error_payload(&state, error)),
+    };
+    embed_tokenized(state, model, ids, tokenized, table_epoch).await
+}
+
+async fn submit_embed_batch_job(
+    state: Arc<ModuleState>,
+    request_key: Option<String>,
+    work: EmbedBatchJobWork,
+) -> HandlerOutcome {
+    let Some(request_key) = request_key.filter(|key| !key.trim().is_empty()) else {
+        return channel_error(
+            "invalid_request",
+            "job-shaped embed.batch requires a non-empty request_key",
+        );
+    };
+    let now = now_ms();
+    let admission = match state.store.admit_job(
+        &request_key,
+        "embed.batch",
+        state.module_generation,
+        &json!({
+            "model": work.model.model_id.clone(),
+            "items": work.ids.len(),
+            "request_bytes": work.request_bytes,
+            "total_tokens": work.total_tokens,
+        }),
+        now,
+        state.runtime.jobs.ttl_ms,
+    ) {
+        Ok(admission) => admission,
+        Err(error) => return channel_error("store_failure", error.to_string()),
+    };
+
+    let record = admission.record().clone();
+    if matches!(admission, JobAdmission::Admitted(_)) {
+        let task_state = Arc::clone(&state);
+        let task_job_id = record.job_id.clone();
+        tokio::spawn(async move {
+            execute_embed_batch_job(task_state, task_job_id, work).await;
+        });
+    }
+
+    result_outcome(job_status_payload(&state, &record))
+}
+
+async fn execute_embed_batch_job(state: Arc<ModuleState>, job_id: String, work: EmbedBatchJobWork) {
+    if !matches!(
+        state
+            .store
+            .mark_job_running(&job_id, state.module_generation, now_ms()),
+        Ok(true)
+    ) {
+        return;
+    }
+
+    let vectors = match execute_embedding_quanta(
+        &state.runtime,
+        &work.model,
+        work.tokenized.batch.clone(),
+        work.total_tokens,
+        work.request_bytes,
+    )
+    .await
+    {
+        Ok(vectors) => vectors,
+        Err(error) => {
+            fail_job_with_wire_error(&state, &job_id, true, error);
+            return;
+        }
+    };
+    if vectors.len() != work.ids.len() {
+        fail_job_with_wire_error(
             &state,
+            &job_id,
+            true,
             WireOperationError::from_stable(
-                StableError::probe_required(),
+                StableError::engine_crashed(None),
                 format!(
-                    "embed.batch token count {total_tokens} exceeds inline limit {}; job-shaped batch tier is not enabled yet",
-                    state.runtime.inline.max_tokens
+                    "engine returned {} vectors for {} requested job items",
+                    vectors.len(),
+                    work.ids.len()
                 ),
             ),
-        ));
+        );
+        return;
     }
-    let ids = items.into_iter().map(|item| item.id).collect();
-    embed_tokenized(state, model, ids, tokenized, table_epoch).await
+
+    let (summary, pages) = match embed_result_pages(
+        &state,
+        &work.model,
+        work.ids,
+        vectors,
+        work.tokenized,
+        work.table_epoch,
+        &job_id,
+    ) {
+        Ok(pages) => pages,
+        Err(error) => {
+            fail_job_with_wire_error(&state, &job_id, false, error);
+            return;
+        }
+    };
+    if let Err(error) = state
+        .store
+        .complete_job(&job_id, &summary, &pages, now_ms())
+    {
+        fail_job_with_wire_error(
+            &state,
+            &job_id,
+            true,
+            WireOperationError::from_stable(
+                StableError::engine_crashed(Some(100)),
+                format!("store completed job pages: {error}"),
+            ),
+        );
+    }
+}
+
+async fn execute_embedding_quanta(
+    runtime: &RuntimeState,
+    model: &EmbeddingModel,
+    batch: TokenBatch,
+    total_tokens: u64,
+    request_bytes: u64,
+) -> Result<Vectors, WireOperationError> {
+    let mut scheduler = LaneScheduler::new(SchedulerConfig {
+        byte_budget: request_bytes.max(1),
+        bulk_quantum_tokens: runtime.jobs.bulk_quantum_tokens.max(1),
+        max_concurrent_workers: 1,
+        default_execution_ms: runtime.inline.estimated_execution_ms,
+        ..SchedulerConfig::default()
+    });
+    scheduler
+        .admit(
+            &SystemClock,
+            WorkRequest {
+                queue_class: QueueClass::Bulk,
+                deadline_ms: None,
+                max_queue_ms: runtime.inline.max_queue_ms,
+                request_bytes,
+                token_cost: total_tokens.max(1),
+                estimated_execution_ms: runtime.inline.estimated_execution_ms,
+                payload: (),
+            },
+        )
+        .map_err(|rejection| WireOperationError::from_stable(rejection.error, rejection.reason))?;
+
+    let mut all_vectors = Vec::new();
+    let mut cursor = 0_usize;
+    while cursor < batch.items.len() {
+        let Some(dispatch) = scheduler.next_dispatch(&SystemClock) else {
+            tokio::task::yield_now().await;
+            continue;
+        };
+        let mut quantum_tokens = 0_u64;
+        let mut quantum_items = Vec::new();
+        while cursor < batch.items.len() {
+            let item_tokens = batch.items[cursor].len().max(1) as u64;
+            if !quantum_items.is_empty()
+                && quantum_tokens.saturating_add(item_tokens) > dispatch.quantum_tokens
+            {
+                break;
+            }
+            quantum_tokens = quantum_tokens.saturating_add(item_tokens);
+            quantum_items.push(batch.items[cursor].clone());
+            cursor += 1;
+        }
+        let mut vectors = execute_embedding(
+            runtime,
+            model,
+            TokenBatch {
+                items: quantum_items,
+            },
+        )
+        .await?;
+        scheduler.complete_dispatch(&dispatch);
+        all_vectors.append(&mut vectors);
+    }
+    Ok(all_vectors)
+}
+
+fn embed_result_pages(
+    state: &ModuleState,
+    model: &EmbeddingModel,
+    ids: Vec<String>,
+    vectors: Vectors,
+    tokenized: TokenizedBatch,
+    table_epoch: u64,
+    job_id: &str,
+) -> Result<(Value, Vec<Vec<u8>>), WireOperationError> {
+    let dims = vectors.first().map(Vec::len).unwrap_or(0) as u32;
+    let response_vectors = ids
+        .into_iter()
+        .zip(vectors)
+        .map(|(id, vector)| EmbedVector { id, vector })
+        .collect::<Vec<_>>();
+    let page_ranges = page_ranges(
+        &response_vectors,
+        &tokenized.real_token_counts,
+        state.runtime.jobs.result_page_bytes.max(1),
+    );
+    let page_count = page_ranges.len() as u32;
+    let mut pages = Vec::with_capacity(page_ranges.len());
+    for (page_index, (start, end)) in page_ranges.iter().copied().enumerate() {
+        let payload = EmbedResponsePayload {
+            vectors: response_vectors[start..end].to_vec(),
+            real_token_counts: tokenized.real_token_counts[start..end].to_vec(),
+            truncation_disclosures: tokenized.disclosures[start..end].to_vec(),
+        };
+        let envelope = ResponseEnvelope {
+            fingerprint: model.fingerprint.clone(),
+            table_epoch,
+            dims,
+            provenance: ResponseProvenance {
+                engine: model.engine_identity.clone(),
+            },
+            module_generation: state.module_generation,
+            equivalent_to: Vec::new(),
+            payload,
+        };
+        let mut value = serde_json::to_value(envelope).expect("embed job page serializes");
+        if let Value::Object(map) = &mut value {
+            map.insert("job_id".to_string(), Value::String(job_id.to_string()));
+            map.insert(
+                "state".to_string(),
+                Value::String(JOB_STATE_DONE.to_string()),
+            );
+            map.insert("page".to_string(), Value::from(page_index as u64));
+            map.insert("page_count".to_string(), Value::from(page_count));
+            map.insert(
+                "job_module_generation".to_string(),
+                Value::from(state.module_generation),
+            );
+        }
+        pages.push(serde_json::to_vec(&value).map_err(|error| {
+            WireOperationError::from_stable(
+                StableError::artifact_invalid(),
+                format!("serialize embed job page: {error}"),
+            )
+        })?);
+    }
+    Ok((
+        json!({
+            "job_id": job_id,
+            "state": JOB_STATE_DONE,
+            "page_count": page_count,
+            "dims": dims,
+            "module_generation": state.module_generation,
+        }),
+        pages,
+    ))
+}
+
+fn page_ranges(
+    vectors: &[EmbedVector],
+    token_counts: &[u32],
+    max_bytes: usize,
+) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut start = 0_usize;
+    while start < vectors.len() {
+        let mut end = start;
+        let mut bytes = 0_usize;
+        while end < vectors.len() {
+            let item_bytes = vectors[end]
+                .vector
+                .len()
+                .saturating_mul(std::mem::size_of::<f32>())
+                .saturating_add(vectors[end].id.len())
+                .saturating_add(
+                    usize::try_from(token_counts.get(end).copied().unwrap_or(0)).unwrap_or(0),
+                )
+                .saturating_add(256);
+            if end > start && bytes.saturating_add(item_bytes) > max_bytes {
+                break;
+            }
+            bytes = bytes.saturating_add(item_bytes);
+            end += 1;
+        }
+        ranges.push((start, end.max(start + 1).min(vectors.len())));
+        start = ranges.last().map(|(_, end)| *end).unwrap_or(vectors.len());
+    }
+    ranges
+}
+
+fn fail_job_with_wire_error(
+    state: &ModuleState,
+    job_id: &str,
+    transient: bool,
+    error: WireOperationError,
+) {
+    let _ = state.store.fail_job(
+        job_id,
+        transient,
+        &serde_json::to_value(error).expect("wire error serializes"),
+        now_ms(),
+    );
+}
+
+fn job_status_payload(state: &ModuleState, record: &JobRecord) -> Value {
+    let mut payload = json!({
+        "module_generation": state.module_generation,
+        "job_id": record.job_id,
+        "state": record.state,
+        "request_key": record.request_key,
+    });
+    if let Value::Object(map) = &mut payload {
+        if record.state == JOB_STATE_DONE {
+            map.insert("page_count".to_string(), Value::from(record.page_count));
+        }
+        if record.state == JOB_STATE_FAILED_TRANSIENT || record.state == JOB_STATE_FAILED_PERMANENT
+        {
+            map.insert(
+                "error".to_string(),
+                record.error_json.clone().unwrap_or_else(|| {
+                    serde_json::to_value(WireOperationError::from_stable(
+                        StableError::engine_crashed(Some(100)),
+                        "durable job failed without a stored typed error",
+                    ))
+                    .expect("fallback error serializes")
+                }),
+            );
+        }
+    }
+    payload
+}
+
+async fn embed_result(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
+    let params: EmbedResultParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(error) => {
+            return channel_error(
+                "invalid_request",
+                format!("invalid embed.result params: {error}"),
+            )
+        }
+    };
+    if let Err(error) = state.store.purge_expired_jobs(now_ms()) {
+        return channel_error("store_failure", error.to_string());
+    }
+    let record = match state.store.get_job(&params.job_id) {
+        Ok(Some(record)) => record,
+        Ok(None) => return channel_error("invalid_request", "unknown or expired job_id"),
+        Err(error) => return channel_error("store_failure", error.to_string()),
+    };
+    match record.state.as_str() {
+        JOB_STATE_QUEUED | JOB_STATE_RUNNING => result_outcome(job_status_payload(&state, &record)),
+        JOB_STATE_FAILED_TRANSIENT | JOB_STATE_FAILED_PERMANENT => {
+            result_outcome(job_status_payload(&state, &record))
+        }
+        JOB_STATE_DONE => {
+            let page = params.page.unwrap_or(0);
+            if page >= record.page_count {
+                return channel_error(
+                    "invalid_request",
+                    format!(
+                        "embed.result page {page} is outside available page_count {}",
+                        record.page_count
+                    ),
+                );
+            }
+            let bytes = match state.store.get_job_page(&record.job_id, page) {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => return channel_error("store_failure", "job result page is missing"),
+                Err(error) => return channel_error("store_failure", error.to_string()),
+            };
+            let mut value: Value = match serde_json::from_slice(&bytes) {
+                Ok(value) => value,
+                Err(error) => return channel_error("store_failure", error.to_string()),
+            };
+            if let Value::Object(map) = &mut value {
+                map.insert(
+                    "module_generation".to_string(),
+                    Value::from(state.module_generation),
+                );
+                map.insert(
+                    "job_module_generation".to_string(),
+                    Value::from(record.module_generation),
+                );
+            }
+            result_outcome(value)
+        }
+        other => channel_error(
+            "store_failure",
+            format!("job {} has unknown state {other}", record.job_id),
+        ),
+    }
 }
 
 async fn embed_tokenized(
@@ -1123,6 +1622,82 @@ fn check_fingerprint_constraints(
     Ok(())
 }
 
+async fn cache_pin(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
+    let params: CachePinParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(error) => {
+            return channel_error(
+                "invalid_request",
+                format!("invalid cache.pin params: {error}"),
+            )
+        }
+    };
+    let module_id = params
+        .module_id
+        .as_deref()
+        .unwrap_or(&state.module_id)
+        .to_string();
+    let result: Result<ModelCacheMeta, ModelCacheError> =
+        if let Some(source_url) = params.source_url {
+            state.model_cache.ingest(ModelCacheIngest {
+                source_url,
+                expected_digest: params.expected_digest.or(params.digest),
+                format: params.format.unwrap_or_else(|| "unknown".to_string()),
+                tokenizer_path: params.tokenizer_path,
+                pin_module_id: Some(module_id),
+            })
+        } else if let Some(digest) = params.digest {
+            state.model_cache.pin(&digest, &module_id)
+        } else {
+            return channel_error(
+                "invalid_request",
+                "cache.pin requires either source_url or digest",
+            );
+        };
+
+    match result {
+        Ok(meta) => result_outcome(json!({
+            "module_generation": state.module_generation,
+            "cache_root": state.model_cache.root().to_string_lossy(),
+            "artifact": meta,
+        })),
+        Err(error) => result_outcome(error_payload(&state, cache_error_to_wire(error))),
+    }
+}
+
+async fn cache_gc(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
+    let params: CacheGcParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(error) => {
+            return channel_error(
+                "invalid_request",
+                format!("invalid cache.gc params: {error}"),
+            )
+        }
+    };
+    let now = now_ms();
+    let grace_ms = params.grace_ms.unwrap_or(60_000);
+    let result: Result<Vec<CacheGcOutcome>, ModelCacheError> = if let Some(digest) = params.digest {
+        state
+            .model_cache
+            .gc_digest(&digest, &state.module_id, now, grace_ms)
+            .map(|outcome| vec![outcome])
+    } else {
+        state.model_cache.gc_all(&state.module_id, now, grace_ms)
+    };
+    match result {
+        Ok(outcomes) => result_outcome(json!({
+            "module_generation": state.module_generation,
+            "outcomes": outcomes,
+        })),
+        Err(error) => result_outcome(error_payload(&state, cache_error_to_wire(error))),
+    }
+}
+
+fn cache_error_to_wire(error: ModelCacheError) -> WireOperationError {
+    WireOperationError::from_stable(StableError::artifact_invalid(), error.to_string())
+}
+
 fn models_list_payload(state: &ModuleState, snapshot: CatalogSnapshot) -> Value {
     let mut models = snapshot.models;
     models.extend(state.runtime.catalog_entries());
@@ -1183,6 +1758,7 @@ fn management_operations() -> Vec<ManagementOperation> {
     vec![
         op("embed.query", Query),
         op("embed.batch", Query),
+        op("embed.result", Query),
         op("rerank.score", Query),
         op("microllm.oneshot", Query),
         op("model.load", Mutate),
@@ -1235,6 +1811,7 @@ fn load_module_config() -> Result<ModuleConfig, ModuleError> {
         return Ok(ModuleConfig {
             preload_models,
             inline: InlineConfig::default(),
+            jobs: JobConfig::default(),
         });
     }
     if let Ok(path) = env::var("SYNAPSE_CONFIG") {

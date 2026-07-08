@@ -37,5 +37,6 @@ subc-client-rs = { path = "../subconscious/crates/subc-client-rs" }
 subc-core = { path = "../subconscious/crates/subc-core" }
 subc-protocol = { path = "../subconscious/crates/subc-protocol" }
 subc-transport = { path = "../subconscious/crates/subc-transport" }
+cortexkit-lease = { path = "../commons/crates/cortexkit-lease" }
 cortexkit-store = { path = "../commons/crates/cortexkit-store" }
 cortexkit-store-types = { path = "../commons/crates/cortexkit-store-types" }
