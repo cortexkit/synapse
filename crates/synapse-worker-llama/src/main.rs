@@ -19,7 +19,9 @@ use llama_cpp_2::{
     llama_backend::LlamaBackend,
     llama_batch::LlamaBatch,
     model::{params::LlamaModelParams, LlamaModel},
+    sampling::LlamaSampler,
     token::LlamaToken,
+    TokenToStringError,
 };
 use llama_cpp_sys_2::{
     llama_flash_attn_type, LLAMA_FLASH_ATTN_TYPE_AUTO, LLAMA_FLASH_ATTN_TYPE_DISABLED,
@@ -33,6 +35,8 @@ use synapse_core::{
 
 const ENGINE_VERSION: &str = "llama-cpp-2-0.1.151";
 const MAX_BATCH_SEQUENCES: usize = 256;
+const MAX_GENERATE_TOKENS: u32 = 64;
+const LLAMA_TOKEN_NULL: i32 = -1;
 
 #[derive(Parser)]
 #[command(name = "synapse-worker-llama")]
@@ -265,37 +269,55 @@ fn main() -> Result<()> {
             }
             WorkerRequest::Rerank {
                 req_id,
-                query_n_tokens: _,
-                candidates: _,
-                model_ref: _,
+                query_n_tokens,
+                candidates,
+                model_ref,
             } => {
-                let _ = read_frame(&mut stream, max_frame).context("read RERANK ids")?;
-                write_json_frame(
-                    &mut stream,
-                    &WorkerResponse::Err {
+                let raw = read_frame(&mut stream, max_frame).context("read RERANK ids")?;
+                let response = match handle_rerank(
+                    &mut state,
+                    &req_id,
+                    &model_ref,
+                    query_n_tokens,
+                    &candidates,
+                    &raw,
+                ) {
+                    Ok((response, scores)) => {
+                        write_json_frame(&mut stream, &response, max_frame)?;
+                        write_frame(&mut stream, &scores, max_frame)?;
+                        continue;
+                    }
+                    Err(error) => WorkerResponse::Err {
                         req_id: Some(req_id),
-                        code: "unknown_type".to_string(),
-                        msg: "RERANK is not implemented in the first worker cut".to_string(),
+                        code: "inference_failed".to_string(),
+                        msg: error.to_string(),
                     },
-                    max_frame,
-                )?;
+                };
+                write_json_frame(&mut stream, &response, max_frame)?;
             }
             WorkerRequest::Generate {
                 req_id,
-                model_ref: _,
-                max_tokens: _,
-                grammar: _,
+                model_ref,
+                max_tokens,
+                grammar,
             } => {
-                let _ = read_frame(&mut stream, max_frame).context("read GENERATE ids")?;
-                write_json_frame(
-                    &mut stream,
-                    &WorkerResponse::Err {
+                let raw = read_frame(&mut stream, max_frame).context("read GENERATE ids")?;
+                let response = match handle_generate(
+                    &mut state,
+                    &req_id,
+                    &model_ref,
+                    max_tokens,
+                    grammar.as_deref(),
+                    &raw,
+                ) {
+                    Ok(response) => response,
+                    Err(error) => WorkerResponse::Err {
                         req_id: Some(req_id),
-                        code: "unknown_type".to_string(),
-                        msg: "GENERATE is not implemented in the first worker cut".to_string(),
+                        code: "inference_failed".to_string(),
+                        msg: error.to_string(),
                     },
-                    max_frame,
-                )?;
+                };
+                write_json_frame(&mut stream, &response, max_frame)?;
             }
             WorkerRequest::Unload { req_id, model_ref } => {
                 state.models.remove(&model_ref);
@@ -457,9 +479,302 @@ fn handle_embed_batch(
     ))
 }
 
+fn handle_rerank(
+    state: &mut WorkerState,
+    req_id: &str,
+    model_ref: &str,
+    query_n_tokens: usize,
+    candidates: &[synapse_core::WorkerCandidate],
+    raw: &[u8],
+) -> Result<(WorkerResponse, Vec<u8>)> {
+    ensure!(query_n_tokens > 0, "RERANK query has zero tokens");
+    ensure!(
+        !candidates.is_empty(),
+        "RERANK requires at least one candidate"
+    );
+    ensure!(
+        candidates.len() <= MAX_BATCH_SEQUENCES,
+        "too many candidates in one worker request"
+    );
+    let runtime = state
+        .models
+        .get(model_ref)
+        .ok_or_else(|| anyhow!("unknown model_ref '{model_ref}'"))?;
+    reject_qwen3_reranker(runtime)?;
+
+    let ids = decode_i32_frame(raw).map_err(|error| anyhow!(error.to_string()))?;
+    let expected_tokens = query_n_tokens
+        + candidates
+            .iter()
+            .map(|candidate| candidate.n_tokens)
+            .sum::<usize>();
+    ensure!(
+        ids.len() == expected_tokens,
+        "raw id frame has {} tokens, expected {expected_tokens}",
+        ids.len()
+    );
+
+    let query = trim_rerank_segment(&runtime.model, &ids[..query_n_tokens]);
+    ensure!(
+        !query.is_empty(),
+        "RERANK query is empty after special-token trimming"
+    );
+    let mut offset = query_n_tokens;
+    let mut sequences = Vec::with_capacity(candidates.len());
+    for (index, candidate) in candidates.iter().enumerate() {
+        ensure!(candidate.n_tokens > 0, "candidate {index} has zero tokens");
+        let end = offset + candidate.n_tokens;
+        let document = trim_rerank_segment(&runtime.model, &ids[offset..end]);
+        ensure!(
+            !document.is_empty(),
+            "candidate {index} is empty after special-token trimming"
+        );
+        sequences.push(build_rerank_sequence(&runtime.model, query, document)?);
+        offset = end;
+    }
+
+    let max_tokens_per_seq = sequences.iter().map(Vec::len).max().unwrap_or(1);
+    let mut context = new_context_with(
+        runtime,
+        LlamaPoolingType::Rank,
+        LlamaAttentionType::NonCausal,
+        true,
+        1,
+        max_tokens_per_seq,
+        max_tokens_per_seq,
+    )?;
+    let mut scores = Vec::with_capacity(sequences.len());
+    for (seq_id, token_ids) in sequences.iter().enumerate() {
+        scores.push(score_rerank_sequence(&mut context, seq_id, token_ids)?);
+    }
+    Ok((
+        WorkerResponse::Scores {
+            req_id: req_id.to_string(),
+        },
+        encode_f32_frame(&scores),
+    ))
+}
+
+fn score_rerank_sequence(
+    context: &mut LlamaContext<'_>,
+    seq_id: usize,
+    token_ids: &[i32],
+) -> Result<f32> {
+    context.clear_kv_cache();
+    let llama_tokens = token_ids
+        .iter()
+        .copied()
+        .map(LlamaToken::new)
+        .collect::<Vec<_>>();
+    let mut batch = LlamaBatch::new(token_ids.len(), 1);
+    batch
+        .add_sequence(&llama_tokens, 0, false)
+        .with_context(|| format!("add rerank sequence {seq_id} to llama batch"))?;
+    context
+        .encode(&mut batch)
+        .with_context(|| format!("llama_encode rerank sequence {seq_id} failed"))?;
+    let embedding = context
+        .embeddings_seq_ith(0)
+        .with_context(|| format!("read rerank score for sequence {seq_id}"))?;
+    ensure!(
+        !embedding.is_empty(),
+        "rerank head returned no values for sequence {seq_id}"
+    );
+    Ok(embedding[0])
+}
+
+fn handle_generate(
+    state: &mut WorkerState,
+    req_id: &str,
+    model_ref: &str,
+    max_tokens: u32,
+    grammar: Option<&str>,
+    raw: &[u8],
+) -> Result<WorkerResponse> {
+    ensure!(
+        max_tokens <= MAX_GENERATE_TOKENS,
+        "max_tokens must be <= {MAX_GENERATE_TOKENS}"
+    );
+    if grammar.is_some_and(|value| !value.trim().is_empty()) {
+        bail!("GBNF grammar is not supported by this synapse-worker-llama build because llama-cpp-2 grammar support requires the optional common feature");
+    }
+    let runtime = state
+        .models
+        .get(model_ref)
+        .ok_or_else(|| anyhow!("unknown model_ref '{model_ref}'"))?;
+    let prompt_ids = decode_i32_frame(raw).map_err(|error| anyhow!(error.to_string()))?;
+    ensure!(!prompt_ids.is_empty(), "GENERATE prompt has zero tokens");
+
+    let n_prompt = prompt_ids.len();
+    let total_capacity = n_prompt
+        .checked_add(usize::try_from(max_tokens).context("max_tokens does not fit usize")?)
+        .context("prompt + max_tokens overflowed")?
+        .max(1);
+    let mut context = new_context_with(
+        runtime,
+        LlamaPoolingType::None,
+        LlamaAttentionType::Causal,
+        false,
+        1,
+        total_capacity,
+        total_capacity,
+    )?;
+    let prompt_tokens = prompt_ids
+        .iter()
+        .copied()
+        .map(LlamaToken::new)
+        .collect::<Vec<_>>();
+    let mut prompt_batch = LlamaBatch::new(n_prompt, 1);
+    prompt_batch
+        .add_sequence(&prompt_tokens, 0, false)
+        .context("add prompt to llama batch")?;
+    context
+        .decode(&mut prompt_batch)
+        .context("llama_decode prompt failed")?;
+
+    let mut sampler = LlamaSampler::greedy();
+    sampler.accept_many(&prompt_tokens);
+    let mut generated = Vec::new();
+    let mut finish_reason = "length";
+    for step in 0..max_tokens {
+        let token = sampler.sample(&context, -1);
+        if runtime.model.is_eog_token(token) {
+            finish_reason = "stop";
+            break;
+        }
+        sampler.accept(token);
+        generated.push(token);
+        let pos = i32::try_from(n_prompt)
+            .context("prompt length does not fit into i32")?
+            .checked_add(i32::try_from(step).context("generation step does not fit into i32")?)
+            .context("generation position overflowed")?;
+        let mut next_batch = LlamaBatch::new(1, 1);
+        next_batch
+            .add(token, pos, &[0], true)
+            .context("add generated token to llama batch")?;
+        context
+            .decode(&mut next_batch)
+            .context("llama_decode generated token failed")?;
+    }
+    let text = decode_generated_text(&runtime.model, &generated)?;
+    Ok(WorkerResponse::Text {
+        req_id: req_id.to_string(),
+        text,
+        n_prompt,
+        n_gen: generated.len(),
+        finish_reason: finish_reason.to_string(),
+    })
+}
+
+fn reject_qwen3_reranker(runtime: &LoadedRuntime) -> Result<()> {
+    let architecture = runtime
+        .model
+        .meta_val_str("general.architecture")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    ensure!(
+        !architecture.contains("qwen3"),
+        "Qwen3 reranker GGUFs are disabled because their rerank templates are not faithful in this worker"
+    );
+    Ok(())
+}
+
+fn build_rerank_sequence(model: &LlamaModel, query: &[i32], document: &[i32]) -> Result<Vec<i32>> {
+    let bos = model.token_bos().0;
+    let sep = model.token_sep().0;
+    let eos = model.token_eos().0;
+    ensure!(
+        bos != LLAMA_TOKEN_NULL,
+        "rerank model vocab has no BOS/CLS token"
+    );
+    ensure!(
+        sep != LLAMA_TOKEN_NULL,
+        "rerank model vocab has no SEP token"
+    );
+    let end = if eos != LLAMA_TOKEN_NULL { eos } else { sep };
+
+    let mut sequence = Vec::with_capacity(query.len() + document.len() + 3);
+    sequence.push(bos);
+    sequence.extend_from_slice(query);
+    sequence.push(sep);
+    sequence.extend_from_slice(document);
+    sequence.push(end);
+    Ok(sequence)
+}
+
+fn trim_rerank_segment<'a>(model: &LlamaModel, ids: &'a [i32]) -> &'a [i32] {
+    let bos = model.token_bos().0;
+    let sep = model.token_sep().0;
+    let eos = model.token_eos().0;
+    let mut start = 0;
+    let mut end = ids.len();
+    if ids.first().is_some_and(|token| *token == bos) {
+        start = 1;
+    }
+    while end > start
+        && ids
+            .get(end - 1)
+            .is_some_and(|token| *token == sep || *token == eos)
+    {
+        end -= 1;
+    }
+    &ids[start..end]
+}
+
+fn decode_generated_text(model: &LlamaModel, tokens: &[LlamaToken]) -> Result<String> {
+    let mut bytes = Vec::new();
+    for token in tokens {
+        bytes.extend(decode_token_piece_bytes(model, *token)?);
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn decode_token_piece_bytes(model: &LlamaModel, token: LlamaToken) -> Result<Vec<u8>> {
+    match model.token_to_piece_bytes(token, 8, false, None) {
+        Ok(bytes) => Ok(bytes),
+        Err(TokenToStringError::InsufficientBufferSpace(size)) => model
+            .token_to_piece_bytes(
+                token,
+                usize::try_from(-size).context("token piece size does not fit usize")?,
+                false,
+                None,
+            )
+            .context("decode generated token"),
+        Err(error) => Err(anyhow!(error)).context("decode generated token"),
+    }
+}
+
 fn new_context<'a>(
     runtime: &'a LoadedRuntime,
     pooling: WorkerPooling,
+    n_seq_max: usize,
+    max_tokens_per_seq: usize,
+    total_tokens: usize,
+) -> Result<LlamaContext<'a>> {
+    let forward_pass = runtime.config.forward_pass.resolve(pooling);
+    let attention_type = match forward_pass {
+        ForwardPass::Encode => LlamaAttentionType::NonCausal,
+        ForwardPass::Decode => LlamaAttentionType::Causal,
+    };
+    new_context_with(
+        runtime,
+        runtime
+            .config
+            .pooling_implementation
+            .context_pooling_type(pooling),
+        attention_type,
+        true,
+        n_seq_max,
+        max_tokens_per_seq,
+        total_tokens,
+    )
+}
+
+fn new_context_with<'a>(
+    runtime: &'a LoadedRuntime,
+    pooling_type: LlamaPoolingType,
+    attention_type: LlamaAttentionType,
+    embeddings: bool,
     n_seq_max: usize,
     max_tokens_per_seq: usize,
     total_tokens: usize,
@@ -471,15 +786,18 @@ fn new_context<'a>(
     let ctx_size =
         NonZeroU32::new(u32::try_from(total_ctx_size).context("ctx_size does not fit into u32")?)
             .context("ctx_size must be > 0")?;
-    let batch_size = runtime.config.batch_size.max(total_tokens).max(1);
-    let ubatch_size = runtime.config.ubatch_size.min(batch_size).max(1);
+    let batch_size = if pooling_type == LlamaPoolingType::Rank {
+        total_tokens.max(1)
+    } else {
+        runtime.config.batch_size.max(total_tokens).max(1)
+    };
+    let ubatch_size = if pooling_type == LlamaPoolingType::Rank {
+        batch_size
+    } else {
+        runtime.config.ubatch_size.min(batch_size).max(1)
+    };
     let n_seq_max = n_seq_max.clamp(1, MAX_BATCH_SEQUENCES);
     let threads = i32::try_from(runtime.config.threads).context("threads does not fit into i32")?;
-    let forward_pass = runtime.config.forward_pass.resolve(pooling);
-    let attention_type = match forward_pass {
-        ForwardPass::Encode => LlamaAttentionType::NonCausal,
-        ForwardPass::Decode => LlamaAttentionType::Causal,
-    };
     let params = LlamaContextParams::default()
         .with_n_ctx(Some(ctx_size))
         .with_n_batch(u32::try_from(batch_size).context("batch_size does not fit into u32")?)
@@ -487,13 +805,8 @@ fn new_context<'a>(
         .with_n_seq_max(u32::try_from(n_seq_max).context("n_seq_max does not fit into u32")?)
         .with_n_threads(threads)
         .with_n_threads_batch(threads)
-        .with_embeddings(true)
-        .with_pooling_type(
-            runtime
-                .config
-                .pooling_implementation
-                .context_pooling_type(pooling),
-        )
+        .with_embeddings(embeddings)
+        .with_pooling_type(pooling_type)
         .with_attention_type(attention_type)
         .with_flash_attention_policy(runtime.config.flash_attention.raw_policy());
     runtime

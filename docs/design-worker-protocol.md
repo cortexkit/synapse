@@ -54,9 +54,14 @@ hung request maps to exactly one process to kill). Request/response pairs:
   → VECTORS {req_id, dims, n: usize} + one raw frame of concatenated f32
   | ERR {req_id, code, msg}
 - RERANK {req_id, model_ref, query_n_tokens, candidates: [{n_tokens}]} + raw
-  ids frame → SCORES {req_id} + raw f32 frame | ERR
+  ids frame → SCORES {req_id} + raw f32 frame | ERR. The llama worker builds
+  BOS/SEP/EOS query-document pairs internally and keeps Qwen3 reranker GGUFs
+  disabled until their templates are faithful.
 - GENERATE {req_id, model_ref, max_tokens, grammar?} + raw ids frame
-  → TEXT {req_id, text, n_prompt, n_gen, finish_reason} | ERR
+  → TEXT {req_id, text, n_prompt, n_gen, finish_reason} | ERR. Grammar is a
+  protocol field; the current llama-cpp-2 build does not expose GBNF because it
+  is compiled without the optional common feature, so non-empty grammar requests
+  are rejected instead of silently ignored.
 - UNLOAD {req_id, model_ref} → UNLOADED {req_id} | ERR
 - PING {req_id} → PONG {req_id, rss_mb, models_loaded} — module-initiated,
   NEVER on the health dispatch path (health serves cached state; PING feeds

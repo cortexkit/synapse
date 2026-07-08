@@ -249,4 +249,47 @@ mod tests {
             values
         );
     }
+
+    #[test]
+    fn rerank_and_generate_messages_round_trip_with_raw_frames() {
+        let rerank = WorkerRequest::Rerank {
+            req_id: "rerank-1".to_string(),
+            model_ref: "llama:0".to_string(),
+            query_n_tokens: 2,
+            candidates: vec![
+                WorkerCandidate { n_tokens: 3 },
+                WorkerCandidate { n_tokens: 4 },
+            ],
+        };
+        let encoded = serde_json::to_vec(&rerank).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<WorkerRequest>(&encoded).unwrap(),
+            rerank
+        );
+        let ids = [101, 102, 201, 202, 203, 301, 302, 303, 304];
+        assert_eq!(decode_i32_frame(&encode_i32_frame(&ids)).unwrap(), ids);
+
+        let generate = WorkerRequest::Generate {
+            req_id: "generate-1".to_string(),
+            model_ref: "llama:0".to_string(),
+            max_tokens: 8,
+            grammar: Some("root ::= \"yes\" | \"no\"".to_string()),
+        };
+        let encoded = serde_json::to_vec(&generate).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<WorkerRequest>(&encoded).unwrap(),
+            generate
+        );
+        assert_eq!(
+            serde_json::to_value(WorkerResponse::Text {
+                req_id: "generate-1".to_string(),
+                text: "yes".to_string(),
+                n_prompt: 4,
+                n_gen: 1,
+                finish_reason: "stop".to_string(),
+            })
+            .unwrap()["type"],
+            "TEXT"
+        );
+    }
 }
