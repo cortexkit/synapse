@@ -23,20 +23,65 @@ Real token count 166,697 (was 172,746 with pads — note: lanes tokenizing with
 this artifact counted pads in tok/s, a ~3.5% inflation on MiniLM rows; vectors
 were always correct where attention masks were honored).
 
-Two issues remain open from this spike:
+## Qwen latency: resolved (post-spike, 2026-07-08)
+
+The `17.7 ms` vs `7.4 ms` Qwen3 gap was **not** a raw in-process penalty. The
+child benchmark was reusing one hot `llama-server` slot across 200 identical
+requests, and the server kept the first `N-1` tokens resident between calls.
+Verbose server logs show the exact mechanism on every repeated request:
+`n_past = 47`, then `n_past was set to 46`, so only the **last token** is
+re-evaluated. Our in-process loop reset the sequence and re-ran all `47`
+tokens every time, so the comparison mixed **fresh full-query embed** with
+**cached suffix replay**.
+
+### Measurement trail on the M1 Max
+
+| Variant | Long p50 / p95 | Short p50 / p95 | Read |
+|---|---:|---:|---|
+| in-process, full query, reset seq, fixed slot, 8 threads | 17.700 / 17.884 ms | 13.852 / 13.934 ms | baseline fresh embed |
+| in-process, fresh seq ids, no reset, rotate across 201 slots | 17.680 / 17.762 ms | 13.788 / 13.877 ms | clearing cost is not the gap |
+| in-process, keep prefix KV and re-evaluate only the last token (`--reuse-prefix-tokens 46` long / `15` short) | **6.090 / 6.718 ms** | **6.080 / 6.187 ms** | mirrors server reuse path |
+| child `llama-server` default | 7.373 / 8.044 ms | 7.303 / 7.697 ms | one hot slot, repeated identical prompt |
+| child `llama-server --slot-prompt-similarity 0.0 --no-cache-prompt --cache-ram 0` | 7.378 / 8.109 ms | 7.306 / 7.978 ms | still reuses the live slot by LRU |
+
+Two useful negatives:
+
+- changing threads from `8` to `10` did nothing meaningful (`17.700 ms` ->
+  `17.721 ms` on the long query),
+- rotating across fresh sequence ids without clearing changed almost nothing,
+  so the missing ~10 ms was not sequence-reset overhead or graph-shape churn.
+
+The step timings from the in-process long-query run make that visible: batch
+build is ~`0.001 ms`, explicit KV reset is ~`0.003 ms`, the `decode()` call
+returns in ~`1.09 ms`, and the remaining wall time lands when pooled
+embeddings are materialized back to host memory. When we keep the first 46
+Qwen tokens resident and replay only the last token, that pool/materialization
+phase drops from ~`16.6 ms` to ~`5.0 ms` and total p50 drops below the child.
+
+### Root cause and consequence
+
+- **Root cause:** the old benchmark compared two different workloads.
+  `llama-server` was serving an identical-query **prefix-cache replay** path;
+  the in-process lane was serving a **fresh full-query embed** path.
+- **Consequence for Synapse:** for ordinary one-off search queries on this M1,
+  the honest Qwen3 full-query cost is still about `17-14 ms` depending on query
+  length. If Synapse has an exact-prefix reuse opportunity, in-process llama.cpp
+  can exploit it too and is actually faster than the child on that path.
+- **Benchmarking consequence:** repeated-same-text latency loops understate the
+  child's real single-query cost. To compare fresh-query latency fairly, the
+  harness must either vary the query text each iteration or explicitly clear the
+  server slot state between requests.
+
+One issue still remains open from this spike:
 1. **builtin-pooling + encode path aborts** with
    `GGML_ASSERT(ggml_can_mul_mat)` on unpadded inputs (llama-cpp-2 0.1.151) —
    manual pooling is the working encoder path in-process. Also a live example
    of the in-process crash-domain concern: the assert is a process abort, not
    an error return.
-2. **Qwen3 single-call latency gap vs child** (17.7ms vs 7.4ms p50 on M1) —
-   unexplained by config knobs, still open.
 
-The verdict below is the honest pre-resolution record; with parity fixed, the
-in-process path's throughput advantage (224k tok/s M5-contended vs 93k child
-M5-clean on MiniLM; 4.6k vs 3.8k on Qwen3 M1) makes it viable for BATCH
-embedding, while the child keeps the single-query latency edge on decoder-style
-models pending issue 2.
+The verdict below is the honest pre-resolution record; with parity fixed and
+Qwen latency root-caused, the remaining open question is the builtin-pooling
+encoder abort.
 
 ## Status (pre-resolution record)
 
@@ -88,7 +133,10 @@ The crate now supports:
 - builtin sequence pooling via `embeddings_seq_ith`
 - manual token pooling via `embeddings_ith`
 - `--flash-attention auto|enabled|disabled`
-- latency tests that reuse one context and reset sequence cache between calls instead of rebuilding contexts
+- `--reset-policy sequence|context|none`
+- `--sequence-strategy fixed|rotate`
+- `--reuse-prefix-tokens N` for server-style identical-prefix replay experiments
+- latency tests that reuse one context and can either reset, rotate, or replay only a suffix instead of rebuilding contexts
 
 ## 1) Parity + throughput over the first 2,000 chunks
 
