@@ -63,9 +63,11 @@ hung request maps to exactly one process to kill). Request/response pairs:
   is compiled without the optional common feature, so non-empty grammar requests
   are rejected instead of silently ignored.
 - UNLOAD {req_id, model_ref} → UNLOADED {req_id} | ERR
-- PING {req_id} → PONG {req_id, rss_mb, models_loaded} — module-initiated,
-  NEVER on the health dispatch path (health serves cached state; PING feeds
-  the background refresher that stamps it).
+- PING {req_id} → PONG {req_id, rss_mb, models_loaded, placement_share?} —
+  module-initiated, NEVER on the health dispatch path (health serves cached
+  state; PING feeds the background refresher that stamps it). ANE workers set
+  placement_share to the last MLComputePlan Neural Engine dispatchable-operation
+  share so certification can gate quality and placement together.
 - SHUTDOWN {} → worker exits 0 after current request.
 
 Tokenization stays module-side (sanitized tokenizers, padding rules, token

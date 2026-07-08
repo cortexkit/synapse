@@ -14,6 +14,8 @@ members = [
     "crates/synapse-engine-ort",
     "crates/synapse-module",
     "crates/synapse-worker-llama",
+    "crates/synapse-worker-mlx",
+    "crates/synapse-worker-ane",
 ]
 
 [workspace.package]

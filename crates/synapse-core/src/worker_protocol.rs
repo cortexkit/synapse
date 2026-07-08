@@ -148,6 +148,8 @@ pub enum WorkerResponse {
         req_id: String,
         rss_mb: u64,
         models_loaded: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        placement_share: Option<f64>,
     },
     Err {
         #[serde(default, skip_serializing_if = "Option::is_none")]

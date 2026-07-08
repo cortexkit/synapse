@@ -63,6 +63,7 @@ const DEFAULT_JOB_RESULT_PAGE_BYTES: usize = 512 * 1024;
 const DEFAULT_JOB_BULK_QUANTUM_TOKENS: u64 = 2_048;
 const DEFAULT_PROBE_MEAN_COSINE_THRESHOLD: f64 = 0.999;
 const DEFAULT_PROBE_WORST_DECILE_RANK_OVERLAP_THRESHOLD: f64 = 0.9;
+const DEFAULT_PROBE_ANE_PLACEMENT_THRESHOLD: f64 = 0.9;
 const RERANK_PROBE_PEARSON_THRESHOLD: f64 = 0.999;
 const GENERATE_PROBE_MIN_LABEL_MATCHES: usize = 7;
 
@@ -115,7 +116,7 @@ struct ModuleState {
     model_cache: Arc<ModelCache>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 struct ModuleHealth {
     status: String,
     module_generation: u64,
@@ -125,7 +126,7 @@ struct ModuleHealth {
     lanes: Vec<LaneHealth>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 struct LaneHealth {
     model_id: String,
     fingerprint: Fingerprint,
@@ -270,6 +271,8 @@ struct ProbeConfig {
     mean_cosine_threshold: f64,
     #[serde(default = "default_probe_worst_decile_rank_overlap_threshold")]
     worst_decile_rank_overlap_threshold: f64,
+    #[serde(default = "default_probe_ane_placement_threshold")]
+    ane_placement_threshold: f64,
 }
 
 impl Default for ProbeConfig {
@@ -278,6 +281,7 @@ impl Default for ProbeConfig {
             mean_cosine_threshold: default_probe_mean_cosine_threshold(),
             worst_decile_rank_overlap_threshold: default_probe_worst_decile_rank_overlap_threshold(
             ),
+            ane_placement_threshold: default_probe_ane_placement_threshold(),
         }
     }
 }
@@ -334,6 +338,10 @@ fn default_probe_mean_cosine_threshold() -> f64 {
 
 fn default_probe_worst_decile_rank_overlap_threshold() -> f64 {
     DEFAULT_PROBE_WORST_DECILE_RANK_OVERLAP_THRESHOLD
+}
+
+fn default_probe_ane_placement_threshold() -> f64 {
+    DEFAULT_PROBE_ANE_PLACEMENT_THRESHOLD
 }
 
 struct RuntimeState {
@@ -428,7 +436,7 @@ impl ModelTask {
 enum EmbedBackend {
     Ort(Arc<Mutex<OrtEmbedEngine>>),
     #[cfg(unix)]
-    Llama(Arc<Mutex<worker_host::WorkerEngine>>),
+    Worker(Arc<Mutex<worker_host::WorkerEngine>>),
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1127,10 +1135,10 @@ fn build_stored_model_config(
         } else {
             NormalizationMode::None
         },
-        dtype: if engine_name == "llama" {
-            NumericDType::F16
-        } else {
-            NumericDType::F32
+        dtype: match engine_name {
+            "llama" | "ane" => NumericDType::F16,
+            "mlx" => NumericDType::Bf16,
+            _ => NumericDType::F32,
         },
         flash_attention: FlashAttentionSetting::Disabled,
         certified_shape: CertifiedShapeEnvelope {
@@ -1175,59 +1183,68 @@ fn canonical_engine_name(engine: &str) -> String {
     match engine.trim().to_ascii_lowercase().as_str() {
         "onnx" => "ort".to_string(),
         "llama.cpp" => "llama".to_string(),
+        "coreml" | "neural_engine" => "ane".to_string(),
         other => other.to_string(),
     }
 }
 
 fn default_artifact_format(engine_name: &str) -> String {
-    if engine_name == "llama" {
-        "gguf".to_string()
-    } else {
-        "onnx".to_string()
+    match engine_name {
+        "llama" => "gguf".to_string(),
+        "mlx" => "safetensors".to_string(),
+        "ane" => "mlmodelc".to_string(),
+        _ => "onnx".to_string(),
     }
 }
 
 fn default_quant(engine_name: &str) -> String {
-    if engine_name == "llama" {
-        "f16".to_string()
-    } else {
-        "fp32".to_string()
+    match engine_name {
+        "llama" => "f16".to_string(),
+        "mlx" => "bf16".to_string(),
+        "ane" => "fp16".to_string(),
+        _ => "fp32".to_string(),
     }
 }
 
 fn catalog_model_engine_identity(engine_name: &str) -> Result<EngineIdentity, ModuleError> {
     match engine_name {
         "ort" => Ok(OrtEmbedEngine::new().identity()),
-        "llama" => Ok(llama_engine_identity()),
+        "llama" => Ok(worker_catalog_identity(
+            "llama.cpp-worker",
+            "protocol-v1",
+            &[("transport", "unix-socket-worker")],
+        )),
+        "mlx" => Ok(worker_catalog_identity(
+            "mlx-worker",
+            "protocol-v1",
+            &[("transport", "unix-socket-worker"), ("numeric_profile", "bf16-distinct")],
+        )),
+        "ane" => Ok(worker_catalog_identity(
+            "ane-coreml-worker",
+            "protocol-v1",
+            &[("transport", "unix-socket-worker"), ("placement_gate", "neural-engine")],
+        )),
         other => Err(ModuleError::Config(format!(
             "unsupported engine '{other}' for catalog model"
         ))),
     }
 }
 
-fn local_file_url(path: &Path) -> String {
-    format!("file://{}", path.to_string_lossy())
-}
-
-#[cfg(unix)]
-fn llama_engine_identity() -> EngineIdentity {
+fn worker_catalog_identity(engine: &str, version: &str, flags: &[(&str, &str)]) -> EngineIdentity {
     let mut build_flags = BTreeMap::new();
     build_flags.insert("risk_class".to_string(), "abort_capable".to_string());
-    build_flags.insert("transport".to_string(), "unix-socket-worker".to_string());
+    for (key, value) in flags {
+        build_flags.insert((*key).to_string(), (*value).to_string());
+    }
     EngineIdentity {
-        engine: "llama.cpp-worker".to_string(),
-        version: "protocol-v1".to_string(),
+        engine: engine.to_string(),
+        version: version.to_string(),
         build_flags,
     }
 }
 
-#[cfg(not(unix))]
-fn llama_engine_identity() -> EngineIdentity {
-    EngineIdentity {
-        engine: "llama.cpp-worker".to_string(),
-        version: "protocol-v1".to_string(),
-        build_flags: BTreeMap::new(),
-    }
+fn local_file_url(path: &Path) -> String {
+    format!("file://{}", path.to_string_lossy())
 }
 
 #[async_trait]
@@ -1850,7 +1867,7 @@ fn load_catalog_model_blocking(
             let loaded_model = engine.load(&artifact, &runtime_config).map_err(engine_error_to_wire)?;
             (EmbedBackend::Ort(Arc::clone(&ort_engine)), loaded_model)
         }
-        "llama" => load_llama_backend_blocking(&spec, &artifact, &runtime_config)?,
+        "llama" | "mlx" | "ane" => load_worker_backend_blocking(&spec, &artifact, &runtime_config)?,
         other => {
             return Err(artifact_invalid_error(format!(
                 "unsupported engine '{other}' for model '{}'",
@@ -1871,52 +1888,58 @@ fn load_catalog_model_blocking(
 }
 
 #[cfg(unix)]
-fn load_llama_backend_blocking(
+fn load_worker_backend_blocking(
     spec: &StoredModelConfig,
     artifact: &ValidatedArtifact,
     runtime_config: &RuntimeConfig,
 ) -> Result<(EmbedBackend, LoadedModel), WireOperationError> {
     use worker_host::{WorkerEngine, WorkerHostConfig};
 
+    let env_prefix = spec.engine.to_ascii_uppercase().replace('.', "_");
+    let worker_bin_var = format!("SYNAPSE_{env_prefix}_WORKER_BIN");
+    let worker_runtime_dir_var = format!("SYNAPSE_{env_prefix}_WORKER_RUNTIME_DIR");
     let worker_bin = spec
         .worker_bin
         .clone()
-        .or_else(|| env::var_os("SYNAPSE_LLAMA_WORKER_BIN").map(PathBuf::from))
+        .or_else(|| env::var_os(&worker_bin_var).map(PathBuf::from))
         .ok_or_else(|| {
             artifact_invalid_error(format!(
-                "llama model '{}' requires worker_bin or SYNAPSE_LLAMA_WORKER_BIN",
-                spec.model_id
+                "{} model '{}' requires worker_bin or {}",
+                spec.engine, spec.model_id, worker_bin_var
             ))
         })?;
     let runtime_dir = spec
         .worker_runtime_dir
         .clone()
-        .or_else(|| env::var_os("SYNAPSE_LLAMA_WORKER_RUNTIME_DIR").map(PathBuf::from))
+        .or_else(|| env::var_os(&worker_runtime_dir_var).map(PathBuf::from))
         .unwrap_or_else(|| env::temp_dir().join("synapse-workers"));
     let mut config = WorkerHostConfig::new(worker_bin, runtime_dir);
-    config.worker_id = format!("synapse-{}", spec.model_id);
+    config.worker_id = format!("synapse-{}-{}", spec.engine, spec.model_id);
     config.pooling =
         parse_pooling(&spec.pooling).map_err(|error| artifact_invalid_error(error.to_string()))?;
     config.normalize = spec.normalize;
     let mut engine = WorkerEngine::new(config).map_err(|error| {
         WireOperationError::from_stable(
             StableError::engine_crashed(Some(100)),
-            format!("create llama worker engine for '{}': {error}", spec.model_id),
+            format!(
+                "create {} worker engine for '{}': {error}",
+                spec.engine, spec.model_id
+            ),
         )
     })?;
     let loaded_model = EmbedEngine::load(&mut engine, artifact, runtime_config).map_err(engine_error_to_wire)?;
-    Ok((EmbedBackend::Llama(Arc::new(Mutex::new(engine))), loaded_model))
+    Ok((EmbedBackend::Worker(Arc::new(Mutex::new(engine))), loaded_model))
 }
 
 #[cfg(not(unix))]
-fn load_llama_backend_blocking(
+fn load_worker_backend_blocking(
     spec: &StoredModelConfig,
     _artifact: &ValidatedArtifact,
     _runtime_config: &RuntimeConfig,
 ) -> Result<(EmbedBackend, LoadedModel), WireOperationError> {
     Err(artifact_invalid_error(format!(
-        "llama model '{}' is only supported on unix",
-        spec.model_id
+        "{} model '{}' is only supported on unix",
+        spec.engine, spec.model_id
     )))
 }
 
@@ -1933,11 +1956,11 @@ fn unload_embedding_model_blocking(model: Arc<EmbeddingModel>) -> Result<(), Wir
             Ok(())
         }
         #[cfg(unix)]
-        EmbedBackend::Llama(engine) => {
+        EmbedBackend::Worker(engine) => {
             let mut engine = engine.lock().map_err(|_| {
                 WireOperationError::from_stable(
                     StableError::engine_crashed(Some(100)),
-                    "llama worker engine mutex was poisoned during model unload",
+                    "worker engine mutex was poisoned during model unload",
                 )
             })?;
             EmbedEngine::unload(&mut *engine, &model.loaded_model);
@@ -3339,7 +3362,7 @@ async fn execute_embedding(
             .map_err(engine_error_to_wire)
         }
         #[cfg(unix)]
-        EmbedBackend::Llama(engine) => {
+        EmbedBackend::Worker(engine) => {
             let engine = Arc::clone(engine);
             let loaded_model = model.loaded_model.clone();
             tokio::task::spawn_blocking(move || {
@@ -3347,7 +3370,7 @@ async fn execute_embedding(
                 let engine = engine.lock().map_err(|_| EngineError {
                     stage: EngineErrorStage::Inference,
                     risk_class: synapse_core::EngineRiskClass::AbortCapable,
-                    message: "llama worker engine mutex was poisoned during inference".to_string(),
+                    message: "worker engine mutex was poisoned during inference".to_string(),
                     retry_after_ms: Some(100),
                     safe_to_retry_same_request: true,
                 })?;
@@ -3387,7 +3410,7 @@ async fn execute_rerank(
             format!("model '{}' does not support rerank.score", model.model_id),
         )),
         #[cfg(unix)]
-        EmbedBackend::Llama(engine) => {
+        EmbedBackend::Worker(engine) => {
             let engine = Arc::clone(engine);
             let loaded_model = model.loaded_model.clone();
             tokio::task::spawn_blocking(move || {
@@ -3395,7 +3418,7 @@ async fn execute_rerank(
                 let engine = engine.lock().map_err(|_| EngineError {
                     stage: EngineErrorStage::Inference,
                     risk_class: synapse_core::EngineRiskClass::AbortCapable,
-                    message: "llama worker engine mutex was poisoned during rerank".to_string(),
+                    message: "worker engine mutex was poisoned during rerank".to_string(),
                     retry_after_ms: Some(100),
                     safe_to_retry_same_request: true,
                 })?;
@@ -3438,7 +3461,7 @@ async fn execute_generate(
             ),
         )),
         #[cfg(unix)]
-        EmbedBackend::Llama(engine) => {
+        EmbedBackend::Worker(engine) => {
             let engine = Arc::clone(engine);
             let loaded_model = model.loaded_model.clone();
             tokio::task::spawn_blocking(move || {
@@ -3446,7 +3469,7 @@ async fn execute_generate(
                 let engine = engine.lock().map_err(|_| EngineError {
                     stage: EngineErrorStage::Inference,
                     risk_class: synapse_core::EngineRiskClass::AbortCapable,
-                    message: "llama worker engine mutex was poisoned during generate".to_string(),
+                    message: "worker engine mutex was poisoned during generate".to_string(),
                     retry_after_ms: Some(100),
                     safe_to_retry_same_request: true,
                 })?;
@@ -3871,14 +3894,22 @@ async fn execute_embed_probe_for_model(
         }
     };
     let evidence = probe_evidence(&vectors, &fixture.items);
-    let passed = evidence.mean_cosine >= state.runtime.probe.mean_cosine_threshold
+    let placement_share = ane_placement_share_for_model(&model)?;
+    let quality_passed = evidence.mean_cosine >= state.runtime.probe.mean_cosine_threshold
         && evidence.worst_decile >= state.runtime.probe.worst_decile_rank_overlap_threshold;
+    let placement_passed = if model.engine_identity.engine == "ane-coreml-worker" {
+        placement_share.is_some_and(|share| share >= state.runtime.probe.ane_placement_threshold)
+    } else {
+        true
+    };
+    let passed = quality_passed && placement_passed;
+    let certification_evidence = json!({
+        "task": "embed",
+        "metrics": evidence,
+        "ane_placement_share": placement_share,
+    });
     if passed {
-        store_probe_cert_row(
-            state,
-            &model,
-            json!({ "task": "embed", "metrics": evidence }),
-        )?;
+        store_probe_cert_row(state, &model, certification_evidence.clone())?;
     }
     Ok(ProbeModelResult {
         lane_result: json!({
@@ -3888,13 +3919,46 @@ async fn execute_embed_probe_for_model(
             "numeric_profile_id": model.numeric_profile_id,
             "status": if passed { "certified" } else { "uncertified" },
             "evidence": evidence,
+            "ane_placement_share": placement_share,
             "thresholds": {
                 "mean_cosine": state.runtime.probe.mean_cosine_threshold,
                 "worst_decile": state.runtime.probe.worst_decile_rank_overlap_threshold,
+                "ane_placement_share": state.runtime.probe.ane_placement_threshold,
             },
         }),
         certified_vectors: passed.then_some(vectors),
     })
+}
+
+fn ane_placement_share_for_model(model: &EmbeddingModel) -> Result<Option<f64>, WireOperationError> {
+    if model.engine_identity.engine != "ane-coreml-worker" {
+        return Ok(None);
+    }
+    #[cfg(unix)]
+    {
+        match &model.backend {
+            EmbedBackend::Worker(engine) => {
+                let engine = engine.lock().map_err(|_| {
+                    WireOperationError::from_stable(
+                        StableError::engine_crashed(Some(100)),
+                        "worker engine mutex was poisoned during ANE placement ping",
+                    )
+                })?;
+                let ping = engine.ping().map_err(|error| {
+                    WireOperationError::from_stable(
+                        StableError::engine_crashed(Some(100)),
+                        format!("ANE placement ping failed: {error}"),
+                    )
+                })?;
+                Ok(ping.placement_share)
+            }
+            EmbedBackend::Ort(_) => Ok(None),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(None)
+    }
 }
 
 async fn execute_rerank_probe_for_model(
@@ -4423,7 +4487,7 @@ async fn admission_status(state: Arc<ModuleState>) -> HandlerOutcome {
 #[cfg(unix)]
 fn worker_health_for_model(model: &EmbeddingModel) -> Option<worker_host::WorkerHostHealth> {
     match &model.backend {
-        EmbedBackend::Llama(engine) => engine
+        EmbedBackend::Worker(engine) => engine
             .lock()
             .ok()
             .and_then(|engine| engine.health_snapshot().ok()),
@@ -4800,9 +4864,46 @@ fn normalize_digest(value: &str) -> String {
 }
 
 fn sha256_file(path: &Path) -> Result<String, ModuleError> {
+    let mut hasher = Sha256::new();
+    if path.is_dir() {
+        let mut files = Vec::new();
+        collect_hash_files(path, &mut files)?;
+        files.sort();
+        for file in files {
+            let relative = file
+                .strip_prefix(path)
+                .unwrap_or(&file)
+                .to_string_lossy()
+                .replace('\\', "/");
+            hasher.update(relative.as_bytes());
+            hasher.update([0]);
+            hash_file_into(&file, &mut hasher)?;
+        }
+    } else {
+        hash_file_into(path, &mut hasher)?;
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn collect_hash_files(path: &Path, files: &mut Vec<PathBuf>) -> Result<(), ModuleError> {
+    for entry in fs::read_dir(path)
+        .map_err(|error| ModuleError::Config(format!("hash {}: {error}", path.display())))?
+    {
+        let entry =
+            entry.map_err(|error| ModuleError::Config(format!("hash {}: {error}", path.display())))?;
+        let entry_path = entry.path();
+        if entry_path.is_dir() {
+            collect_hash_files(&entry_path, files)?;
+        } else if entry_path.is_file() {
+            files.push(entry_path);
+        }
+    }
+    Ok(())
+}
+
+fn hash_file_into(path: &Path, hasher: &mut Sha256) -> Result<(), ModuleError> {
     let mut file = fs::File::open(path)
         .map_err(|error| ModuleError::Config(format!("hash {}: {error}", path.display())))?;
-    let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
         let read = file
@@ -4813,7 +4914,7 @@ fn sha256_file(path: &Path) -> Result<String, ModuleError> {
         }
         hasher.update(&buffer[..read]);
     }
-    Ok(hex::encode(hasher.finalize()))
+    Ok(())
 }
 
 fn request_bytes_for_texts<'text>(texts: impl IntoIterator<Item = &'text str>) -> u64 {
@@ -4851,5 +4952,16 @@ mod tests {
             url,
             "https://huggingface.co/Qdrant/all-MiniLM-L6-v2-onnx/resolve/main/onnx/model.onnx"
         );
+    }
+
+    #[test]
+    fn mlx_and_ane_catalog_identities_are_distinct_worker_profiles() {
+        let mlx = catalog_model_engine_identity("mlx").unwrap();
+        let ane = catalog_model_engine_identity("ane").unwrap();
+        assert_eq!(mlx.engine, "mlx-worker");
+        assert_eq!(mlx.build_flags.get("numeric_profile").map(String::as_str), Some("bf16-distinct"));
+        assert_eq!(ane.engine, "ane-coreml-worker");
+        assert_eq!(ane.build_flags.get("placement_gate").map(String::as_str), Some("neural-engine"));
+        assert_ne!(mlx, ane);
     }
 }

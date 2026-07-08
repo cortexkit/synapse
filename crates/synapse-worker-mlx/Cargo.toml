@@ -1,0 +1,22 @@
+[package]
+name = "synapse-worker-mlx"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Synapse supervised MLX/Metal embedding worker binary."
+publish = false
+
+[[bin]]
+name = "synapse-worker-mlx"
+path = "src/main.rs"
+
+[dependencies]
+synapse-core = { path = "../synapse-core" }
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+mlx-rs = { version = "=0.25.3", features = ["safetensors"] }

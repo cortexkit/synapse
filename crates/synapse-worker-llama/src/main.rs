@@ -334,6 +334,7 @@ fn main() -> Result<()> {
                         req_id,
                         rss_mb: 0,
                         models_loaded: state.models.len(),
+                        placement_share: None,
                     },
                     max_frame,
                 )?;
