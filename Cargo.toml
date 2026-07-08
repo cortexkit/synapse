@@ -8,6 +8,7 @@ members = [
     "bench/lanes/mlx",
     "bench/lanes/burn",
     "bench/spikes/unified-rt",
+    "bench/lanes/candle-embed",
 ]
 
 [workspace.package]
