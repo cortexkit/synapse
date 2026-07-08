@@ -170,7 +170,7 @@ fn main() -> Result<()> {
         parity_mean_cosine,
         self_peak_rss_bytes: None,
         notes: format!(
-            "direct eager BERT encoder, provider={}, length-sorted attention_units={}, max_len={}, mean_pool+l2; Metal path uses MPSGraph for all matmuls and CPU loops for pointwise ops",
+            "direct BERT encoder, provider={}, length-sorted attention_units={}, max_len={}, mean_pool+l2 on CPU; providers may override the encoder block, and the Metal provider keeps encoder-layer hidden states resident inside one MPSGraph per batch shape",
             provider.name(),
             args.attention_units,
             args.max_length
@@ -235,6 +235,22 @@ trait KernelProvider {
         c: &mut [f32],
     ) -> Result<()> {
         self.matmul(m, n, k, a, b, b_layout, c)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encoder_forward(
+        &mut self,
+        _hidden_states: &mut [f32],
+        _attention_mask: &[u8],
+        _batch: usize,
+        _seq: usize,
+        _hidden: usize,
+        _heads: usize,
+        _intermediate: usize,
+        _layer_norm_eps: f32,
+        _layers: &[EncoderLayer],
+    ) -> Result<bool> {
+        Ok(false)
     }
 
     fn layer_norm(
@@ -320,7 +336,7 @@ impl MetalProvider {
 
 impl KernelProvider for MetalProvider {
     fn name(&self) -> &'static str {
-        "metal-mpsgraph-matmul-cpu-pointwise"
+        "metal-mpsgraph-resident-encoder"
     }
 
     fn matmul(
@@ -354,6 +370,41 @@ impl KernelProvider for MetalProvider {
         ensure!(c.len() == m * n, "matmul C shape mismatch");
         self.context.matmul(m, n, k, a, b, b_layout, c, true)
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encoder_forward(
+        &mut self,
+        hidden_states: &mut [f32],
+        attention_mask: &[u8],
+        batch: usize,
+        seq: usize,
+        hidden: usize,
+        heads: usize,
+        intermediate: usize,
+        layer_norm_eps: f32,
+        layers: &[EncoderLayer],
+    ) -> Result<bool> {
+        ensure!(
+            hidden_states.len() == batch * seq * hidden,
+            "encoder hidden shape mismatch"
+        );
+        ensure!(
+            attention_mask.len() == batch * seq,
+            "encoder mask shape mismatch"
+        );
+        self.context.encoder_forward(
+            hidden_states,
+            attention_mask,
+            batch,
+            seq,
+            hidden,
+            heads,
+            intermediate,
+            layer_norm_eps,
+            layers,
+        )?;
+        Ok(true)
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -361,9 +412,29 @@ mod metal_backend {
     use std::ffi::{c_char, c_void, CStr};
     use std::ptr::NonNull;
 
-    use anyhow::{bail, Result};
+    use anyhow::{bail, ensure, Result};
 
-    use super::BLayout;
+    use super::{BLayout, EncoderLayer};
+
+    #[repr(C)]
+    struct SynapseMpsEncoderLayerParams {
+        query_weight: *const f32,
+        query_bias: *const f32,
+        key_weight: *const f32,
+        key_bias: *const f32,
+        value_weight: *const f32,
+        value_bias: *const f32,
+        attention_output_weight: *const f32,
+        attention_output_bias: *const f32,
+        attention_ln_weight: *const f32,
+        attention_ln_bias: *const f32,
+        intermediate_weight: *const f32,
+        intermediate_bias: *const f32,
+        output_weight: *const f32,
+        output_bias: *const f32,
+        output_ln_weight: *const f32,
+        output_ln_bias: *const f32,
+    }
 
     pub struct MpsGraphContext {
         raw: NonNull<c_void>,
@@ -413,6 +484,120 @@ mod metal_backend {
             }
             Ok(())
         }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn encoder_forward(
+            &mut self,
+            hidden_states: &mut [f32],
+            attention_mask: &[u8],
+            batch: usize,
+            seq: usize,
+            hidden: usize,
+            heads: usize,
+            intermediate: usize,
+            layer_norm_eps: f32,
+            layers: &[EncoderLayer],
+        ) -> Result<()> {
+            ensure!(
+                batch > 0 && seq > 0 && hidden > 0 && heads > 0 && intermediate > 0,
+                "encoder dimensions must be non-zero"
+            );
+            ensure!(hidden % heads == 0, "hidden size must divide heads");
+            ensure!(
+                hidden_states.len() == batch * seq * hidden,
+                "encoder hidden shape mismatch"
+            );
+            ensure!(
+                attention_mask.len() == batch * seq,
+                "encoder mask shape mismatch"
+            );
+            ensure!(!layers.is_empty(), "encoder requires at least one layer");
+
+            let hidden_hidden = hidden * hidden;
+            let intermediate_hidden = intermediate * hidden;
+            let hidden_intermediate = hidden * intermediate;
+            for (index, layer) in layers.iter().enumerate() {
+                ensure!(
+                    layer.query.weight.data.len() == hidden_hidden
+                        && layer.key.weight.data.len() == hidden_hidden
+                        && layer.value.weight.data.len() == hidden_hidden
+                        && layer.attention_output.weight.data.len() == hidden_hidden,
+                    "encoder layer {index} attention weight shape mismatch"
+                );
+                ensure!(
+                    layer.query.bias.len() == hidden
+                        && layer.key.bias.len() == hidden
+                        && layer.value.bias.len() == hidden
+                        && layer.attention_output.bias.len() == hidden
+                        && layer.attention_ln_weight.len() == hidden
+                        && layer.attention_ln_bias.len() == hidden
+                        && layer.output_ln_weight.len() == hidden
+                        && layer.output_ln_bias.len() == hidden,
+                    "encoder layer {index} hidden vector shape mismatch"
+                );
+                ensure!(
+                    layer.intermediate.weight.data.len() == intermediate_hidden
+                        && layer.intermediate.bias.len() == intermediate,
+                    "encoder layer {index} intermediate shape mismatch"
+                );
+                ensure!(
+                    layer.output.weight.data.len() == hidden_intermediate
+                        && layer.output.bias.len() == hidden,
+                    "encoder layer {index} output shape mismatch"
+                );
+            }
+
+            let additive_mask: Vec<f32> = attention_mask
+                .iter()
+                .map(|&mask| if mask == 0 { -10_000.0 } else { 0.0 })
+                .collect();
+            let params: Vec<SynapseMpsEncoderLayerParams> = layers
+                .iter()
+                .map(|layer| SynapseMpsEncoderLayerParams {
+                    query_weight: layer.query.weight.data.as_ptr(),
+                    query_bias: layer.query.bias.as_ptr(),
+                    key_weight: layer.key.weight.data.as_ptr(),
+                    key_bias: layer.key.bias.as_ptr(),
+                    value_weight: layer.value.weight.data.as_ptr(),
+                    value_bias: layer.value.bias.as_ptr(),
+                    attention_output_weight: layer.attention_output.weight.data.as_ptr(),
+                    attention_output_bias: layer.attention_output.bias.as_ptr(),
+                    attention_ln_weight: layer.attention_ln_weight.as_ptr(),
+                    attention_ln_bias: layer.attention_ln_bias.as_ptr(),
+                    intermediate_weight: layer.intermediate.weight.data.as_ptr(),
+                    intermediate_bias: layer.intermediate.bias.as_ptr(),
+                    output_weight: layer.output.weight.data.as_ptr(),
+                    output_bias: layer.output.bias.as_ptr(),
+                    output_ln_weight: layer.output_ln_weight.as_ptr(),
+                    output_ln_bias: layer.output_ln_bias.as_ptr(),
+                })
+                .collect();
+            let mut output = vec![0.0f32; hidden_states.len()];
+            let status = unsafe {
+                synapse_mps_encoder_forward(
+                    self.raw.as_ptr(),
+                    batch as u64,
+                    seq as u64,
+                    hidden as u64,
+                    heads as u64,
+                    intermediate as u64,
+                    layers.len() as u64,
+                    layer_norm_eps,
+                    hidden_states.as_ptr(),
+                    additive_mask.as_ptr(),
+                    output.as_mut_ptr(),
+                    params.as_ptr(),
+                )
+            };
+            if status != 0 {
+                bail!(
+                    "MPSGraph encoder forward failed with status {status}: {}",
+                    last_error()
+                );
+            }
+            hidden_states.copy_from_slice(&output);
+            Ok(())
+        }
     }
 
     impl Drop for MpsGraphContext {
@@ -450,6 +635,20 @@ mod metal_backend {
             c: *mut f32,
             cache_rhs: i32,
         ) -> i32;
+        fn synapse_mps_encoder_forward(
+            context: *mut c_void,
+            batch: u64,
+            seq: u64,
+            hidden: u64,
+            heads: u64,
+            intermediate: u64,
+            layer_count: u64,
+            layer_norm_eps: f32,
+            input: *const f32,
+            additive_mask: *const f32,
+            output: *mut f32,
+            layers: *const SynapseMpsEncoderLayerParams,
+        ) -> i32;
         fn synapse_mps_last_error() -> *const c_char;
     }
 }
@@ -458,7 +657,7 @@ mod metal_backend {
 mod metal_backend {
     use anyhow::{bail, Result};
 
-    use super::BLayout;
+    use super::{BLayout, EncoderLayer};
 
     pub struct MpsGraphContext;
 
@@ -477,6 +676,22 @@ mod metal_backend {
             _b_layout: BLayout,
             _c: &mut [f32],
             _cache_rhs: bool,
+        ) -> Result<()> {
+            bail!("Metal MPSGraph provider is only available on macOS")
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn encoder_forward(
+            &mut self,
+            _hidden_states: &mut [f32],
+            _attention_mask: &[u8],
+            _batch: usize,
+            _seq: usize,
+            _hidden: usize,
+            _heads: usize,
+            _intermediate: usize,
+            _layer_norm_eps: f32,
+            _layers: &[EncoderLayer],
         ) -> Result<()> {
             bail!("Metal MPSGraph provider is only available on macOS")
         }
@@ -859,7 +1074,6 @@ impl BertModel {
     ) -> Result<Tensor> {
         let hidden = self.config.hidden_size;
         let heads = self.config.num_attention_heads;
-        let head_dim = hidden / heads;
         let rows = batch * seq;
         let mut x = Tensor::zeros(vec![batch, seq, hidden]);
 
@@ -891,66 +1105,109 @@ impl BertModel {
             self.config.layer_norm_eps,
         )?;
 
-        for layer in &self.layers {
-            let residual = x.data.clone();
-            let q = layer.query.forward(provider, rows, hidden, &x.data)?;
-            let k = layer.key.forward(provider, rows, hidden, &x.data)?;
-            let v = layer.value.forward(provider, rows, hidden, &x.data)?;
-            let context = self_attention(
-                provider,
-                &q,
-                &k,
-                &v,
-                attention_mask,
-                batch,
-                seq,
-                heads,
-                head_dim,
-            )?;
-            let mut attention_out = layer
-                .attention_output
-                .forward(provider, rows, hidden, &context)?;
-            for (value, residual_value) in attention_out.iter_mut().zip(residual) {
-                *value += residual_value;
-            }
-            provider.layer_norm(
-                rows,
-                hidden,
-                &mut attention_out,
-                &layer.attention_ln_weight,
-                &layer.attention_ln_bias,
-                self.config.layer_norm_eps,
-            )?;
-
-            let residual = attention_out.clone();
-            let mut intermediate =
-                layer
-                    .intermediate
-                    .forward(provider, rows, hidden, &attention_out)?;
-            for value in &mut intermediate {
-                *value = gelu(*value);
-            }
-            let mut output = layer.output.forward(
-                provider,
-                rows,
-                self.config.intermediate_size,
-                &intermediate,
-            )?;
-            for (value, residual_value) in output.iter_mut().zip(residual) {
-                *value += residual_value;
-            }
-            provider.layer_norm(
-                rows,
-                hidden,
-                &mut output,
-                &layer.output_ln_weight,
-                &layer.output_ln_bias,
-                self.config.layer_norm_eps,
-            )?;
-            x.data = output;
+        if provider.encoder_forward(
+            &mut x.data,
+            attention_mask,
+            batch,
+            seq,
+            hidden,
+            heads,
+            self.config.intermediate_size,
+            self.config.layer_norm_eps,
+            &self.layers,
+        )? {
+            return Ok(x);
         }
+
+        encoder_layers_scalar_forward(
+            provider,
+            &mut x.data,
+            attention_mask,
+            batch,
+            seq,
+            hidden,
+            heads,
+            self.config.intermediate_size,
+            self.config.layer_norm_eps,
+            &self.layers,
+        )?;
         Ok(x)
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encoder_layers_scalar_forward(
+    provider: &mut dyn KernelProvider,
+    hidden_states: &mut [f32],
+    attention_mask: &[u8],
+    batch: usize,
+    seq: usize,
+    hidden: usize,
+    heads: usize,
+    intermediate_size: usize,
+    layer_norm_eps: f32,
+    layers: &[EncoderLayer],
+) -> Result<()> {
+    let rows = batch * seq;
+    let head_dim = hidden / heads;
+    let mut current = hidden_states.to_vec();
+    for layer in layers {
+        let residual = current.clone();
+        let q = layer.query.forward(provider, rows, hidden, &current)?;
+        let k = layer.key.forward(provider, rows, hidden, &current)?;
+        let v = layer.value.forward(provider, rows, hidden, &current)?;
+        let context = self_attention(
+            provider,
+            &q,
+            &k,
+            &v,
+            attention_mask,
+            batch,
+            seq,
+            heads,
+            head_dim,
+        )?;
+        let mut attention_out = layer
+            .attention_output
+            .forward(provider, rows, hidden, &context)?;
+        for (value, residual_value) in attention_out.iter_mut().zip(residual) {
+            *value += residual_value;
+        }
+        provider.layer_norm(
+            rows,
+            hidden,
+            &mut attention_out,
+            &layer.attention_ln_weight,
+            &layer.attention_ln_bias,
+            layer_norm_eps,
+        )?;
+
+        let residual = attention_out.clone();
+        let mut intermediate =
+            layer
+                .intermediate
+                .forward(provider, rows, hidden, &attention_out)?;
+        for value in &mut intermediate {
+            *value = gelu(*value);
+        }
+        let mut output = layer
+            .output
+            .forward(provider, rows, intermediate_size, &intermediate)?;
+        for (value, residual_value) in output.iter_mut().zip(residual) {
+            *value += residual_value;
+        }
+        provider.layer_norm(
+            rows,
+            hidden,
+            &mut output,
+            &layer.output_ln_weight,
+            &layer.output_ln_bias,
+            layer_norm_eps,
+        )?;
+        current = output;
+    }
+    hidden_states.copy_from_slice(&current);
+    Ok(())
 }
 
 impl Linear {
@@ -1256,12 +1513,16 @@ mod tests {
     use super::*;
 
     fn assert_close(actual: &[f32], expected: &[f32]) {
+        assert_close_with_tolerance(actual, expected, 1e-3);
+    }
+
+    fn assert_close_with_tolerance(actual: &[f32], expected: &[f32], tolerance: f32) {
         assert_eq!(actual.len(), expected.len());
         for (index, (left, right)) in actual.iter().zip(expected).enumerate() {
             let diff = (left - right).abs();
             assert!(
-                diff <= 1e-3,
-                "value {index} differs: actual={left}, expected={right}, diff={diff}"
+                diff <= tolerance,
+                "value {index} differs: actual={left}, expected={right}, diff={diff}, tolerance={tolerance}"
             );
         }
     }
@@ -1310,5 +1571,82 @@ mod tests {
         cpu.matmul(2, 4, 3, &a, &b, BLayout::RowMajorNkTransposed, &mut cpu_out)
             .expect("run CPU matmul");
         assert_close(&metal_out, &cpu_out);
+    }
+
+    fn patterned_values(len: usize, scale: f32, bias: f32) -> Vec<f32> {
+        (0..len)
+            .map(|index| ((((index * 37) % 23) as f32) - 11.0) * scale + bias)
+            .collect()
+    }
+
+    fn test_linear(output: usize, input: usize, scale: f32) -> Linear {
+        Linear {
+            weight: Tensor::new(
+                vec![output, input],
+                patterned_values(output * input, scale, 0.0),
+            )
+            .expect("linear test weight"),
+            bias: patterned_values(output, scale * 0.25, 0.0),
+        }
+    }
+
+    fn test_layer(hidden: usize, intermediate: usize) -> EncoderLayer {
+        EncoderLayer {
+            query: test_linear(hidden, hidden, 0.011),
+            key: test_linear(hidden, hidden, -0.009),
+            value: test_linear(hidden, hidden, 0.007),
+            attention_output: test_linear(hidden, hidden, 0.013),
+            attention_ln_weight: patterned_values(hidden, 0.01, 1.0),
+            attention_ln_bias: patterned_values(hidden, 0.003, 0.0),
+            intermediate: test_linear(intermediate, hidden, 0.008),
+            output: test_linear(hidden, intermediate, -0.006),
+            output_ln_weight: patterned_values(hidden, 0.012, 1.0),
+            output_ln_bias: patterned_values(hidden, -0.002, 0.0),
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn metal_provider_matches_cpu_for_tiny_encoder_block() {
+        let batch = 2;
+        let seq = 3;
+        let hidden = 4;
+        let heads = 2;
+        let intermediate = 8;
+        let attention_mask = vec![1, 1, 0, 1, 1, 1];
+        let layers = vec![test_layer(hidden, intermediate)];
+        let mut expected = patterned_values(batch * seq * hidden, 0.02, 0.01);
+        let mut actual = expected.clone();
+
+        let mut cpu = CpuProvider;
+        encoder_layers_scalar_forward(
+            &mut cpu,
+            &mut expected,
+            &attention_mask,
+            batch,
+            seq,
+            hidden,
+            heads,
+            intermediate,
+            1e-12,
+            &layers,
+        )
+        .expect("run CPU encoder block");
+
+        let mut metal = MetalProvider::new().expect("create MPSGraph provider");
+        assert!(metal
+            .encoder_forward(
+                &mut actual,
+                &attention_mask,
+                batch,
+                seq,
+                hidden,
+                heads,
+                intermediate,
+                1e-12,
+                &layers,
+            )
+            .expect("run resident MPSGraph encoder block"));
+        assert_close_with_tolerance(&actual, &expected, 5e-3);
     }
 }
