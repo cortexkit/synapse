@@ -17,6 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 synapse-core = { path = "../synapse-core" }
+synapse-engine-ort = { path = "../synapse-engine-ort" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
@@ -26,6 +27,8 @@ subc-client-rs = { workspace = true }
 subc-protocol = { workspace = true }
 cortexkit-store = { workspace = true }
 cortexkit-store-types = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]
 rusqlite = { workspace = true }

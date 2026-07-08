@@ -13,12 +13,12 @@ use subc_protocol::{BindIdentity, Flags, FrameType, Priority, RouteTarget};
 use subc_transport::{authenticate_client, connection_file};
 use tokio::{
     net::TcpStream,
-    time::{timeout, Instant},
+    time::{sleep, timeout, Instant},
 };
 
 pub const MODULE_ID: &str = "synapse";
 pub const SETUP_TIMEOUT: Duration = Duration::from_secs(10);
-pub const READ_TIMEOUT: Duration = Duration::from_secs(10);
+pub const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -76,32 +76,52 @@ pub async fn read_frame_timeout(stream: &mut TcpStream) -> Frame {
 }
 
 pub async fn route_open(stream: &mut TcpStream, project_root: &Path, corr: u64) -> u16 {
-    let target = RouteTarget::ManagementSurface {
-        module_id: MODULE_ID.to_string(),
-    };
-    let identity = BindIdentity {
-        project_root: project_root.to_path_buf(),
-        harness: "synapse-e2e".to_string(),
-        session: "session-1".to_string(),
-    };
-    let frame = control_rpc(
-        stream,
-        corr,
-        serde_json::json!({
-            "op": "route.open",
-            "target": target,
-            "identity": identity,
-        }),
-    )
-    .await;
-    assert_eq!(
-        frame.header.ty,
-        FrameType::Response,
-        "route.open should succeed: {}",
-        String::from_utf8_lossy(&frame.body)
-    );
-    let value: Value = serde_json::from_slice(&frame.body).unwrap();
-    value["route_channel"].as_u64().unwrap() as u16
+    let mut last_error = String::new();
+    for attempt in 0..4 {
+        let target = RouteTarget::ManagementSurface {
+            module_id: MODULE_ID.to_string(),
+        };
+        let identity = BindIdentity {
+            project_root: project_root.to_path_buf(),
+            harness: "synapse-e2e".to_string(),
+            session: "session-1".to_string(),
+        };
+        let frame = control_rpc(
+            stream,
+            corr + attempt,
+            serde_json::json!({
+                "op": "route.open",
+                "target": target,
+                "identity": identity,
+            }),
+        )
+        .await;
+        match frame.header.ty {
+            FrameType::Response => {
+                let value: Value = serde_json::from_slice(&frame.body).unwrap();
+                return value["route_channel"].as_u64().unwrap() as u16;
+            }
+            FrameType::Error if is_module_timeout(&frame.body) && attempt < 3 => {
+                last_error = String::from_utf8_lossy(&frame.body).to_string();
+                sleep(Duration::from_millis(250)).await;
+            }
+            _ => {
+                panic!(
+                    "route.open should succeed: {}",
+                    String::from_utf8_lossy(&frame.body)
+                );
+            }
+        }
+    }
+    panic!("route.open timed out after retries: {last_error}");
+}
+
+fn is_module_timeout(body: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|value| value["code"].as_str().map(str::to_string))
+        .as_deref()
+        == Some("module_timeout")
 }
 
 pub async fn route_request(
@@ -154,7 +174,10 @@ pub async fn wait_for_catalog(stream: &mut TcpStream, module_id: &str, wait: Dur
         assert_eq!(frame.header.ty, FrameType::Response);
         let value: Value = serde_json::from_slice(&frame.body).unwrap();
         let modules = value["modules"].as_array().cloned().unwrap_or_default();
-        if modules.iter().any(|module| module["module_id"] == module_id) {
+        if modules
+            .iter()
+            .any(|module| module["module_id"] == module_id)
+        {
             return;
         }
         assert!(

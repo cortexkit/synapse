@@ -6279,12 +6279,14 @@ dependencies = [
 name = "synapse-core"
 version = "0.0.0"
 dependencies = [
+ "ahash",
  "hex",
  "rusqlite",
  "serde",
  "serde_json",
  "sha2",
  "thiserror 1.0.69",
+ "tokenizers 0.21.4",
 ]
 
 [[package]]
@@ -6309,14 +6311,17 @@ version = "0.0.0"
 dependencies = [
  "cortexkit-store",
  "cortexkit-store-types",
+ "hex",
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "subc-client-rs",
  "subc-core",
  "subc-protocol",
  "subc-transport",
  "synapse-core",
+ "synapse-engine-ort",
  "thiserror 1.0.69",
  "tokio",
 ]

@@ -21,7 +21,8 @@ pub struct ResponseEnvelope<T> {
     pub dims: u32,
     pub provenance: ResponseProvenance,
     pub module_generation: u64,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub equivalent_to: Vec<Fingerprint>,
-    pub result: T,
+    #[serde(flatten)]
+    pub payload: T,
 }
