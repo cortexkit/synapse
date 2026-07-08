@@ -8,6 +8,7 @@
 ├── .cortexkit/             # Prompts, configurations, and historian logs
 ├── bench/                  # Main benchmarking workspace containing harness and lanes
 │   ├── data/               # Evaluation prompt datasets and corpus targets
+│   ├── eval-coir/          # CoIR retrieval evaluation harness and tools
 │   ├── harness/            # Core benchmark metrics and telemetry runner library
 │   ├── lanes/              # Crate workspace members and runtime scripts
 │   │   ├── burn/           # WGPU/Metal shader engine using Burn
@@ -15,6 +16,7 @@
 │   │   ├── mlx-minilm/     # Python-based MLX GPU executor for MiniLM
 │   │   ├── mlx/            # Metal-accelerated MLX GPU executor
 │   │   ├── ort-embed/      # Bounded-CPU ONNX runtime embedding runner
+│   │   ├── potion/         # Model2Vec static embedding lane (potion-code-16M)
 │   │   ├── ts-embed/       # TypeScript Bun/Node runner (Transformers.js or ORT Node)
 │   │   └── wrap-embed/     # External API wrapper (Ollama/LMStudio)
 │   └── results/            # Saved telemetry metrics, results, and vectors
@@ -47,10 +49,15 @@
 - Contains: Cargo manifest, Rust code for metrics, corpus chunking, parity, and results formatting.
 - Key files: `bench/harness/src/metrics.rs`, `bench/harness/src/parity.rs`, `bench/harness/src/results.rs`
 
+**bench/eval-coir/:**
+- Purpose: Hosts the CoIR retrieval and rerank quality evaluation harness.
+- Contains: Dataset preparation scripts, numpy metrics scoring, and reference rerank cross-check tools.
+- Key files: `bench/eval-coir/prepare.py`, `bench/eval-coir/score.py`, `bench/eval-coir/coir_eval.py`
+
 **bench/lanes/:**
 - Purpose: Groups individual workspace crates and runtime scripts that run candidate models.
 - Contains: Sub-directories for each runtime backend (Rust crates, Python venvs, Bun packages).
-- Key files: `bench/lanes/ort-embed/src/main.rs`, `bench/lanes/mlx/src/main.rs`, `bench/lanes/llama/src/main.rs`, `bench/lanes/mlx-minilm/main.py`, `bench/lanes/ts-embed/main.mjs`
+- Key files: `bench/lanes/ort-embed/src/main.rs`, `bench/lanes/mlx/src/main.rs`, `bench/lanes/llama/src/main.rs`, `bench/lanes/mlx-minilm/main.py`, `bench/lanes/ts-embed/main.mjs`, `bench/lanes/potion/main.py`
 
 **bench/results/:**
 - Purpose: Storage directory for the output log files, parity vectors, and metrics.
@@ -66,7 +73,9 @@
 
 **Entry Points:**
 - `bench/harness/src/main.rs`: CLI runner for corpus generation, power wrapper execution, and parity check.
-- `bench/lanes/*/src/main.rs` (Rust), `bench/lanes/mlx-minilm/main.py` (Python), `bench/lanes/ts-embed/main.mjs` (JS): Main executables for each specific runtime lane.
+- `bench/lanes/*/src/main.rs` (Rust), `bench/lanes/mlx-minilm/main.py` (Python), `bench/lanes/ts-embed/main.mjs` (JS), `bench/lanes/potion/main.py` (Python): Main executables for each specific runtime lane.
+- `bench/eval-coir/prepare.py`: Downloads and structures datasets for retrieval tasks.
+- `bench/eval-coir/score.py`: Computes retrieval quality metrics on generated vectors.
 - `bench/run-matrix.sh`: Global benchmark suite runner.
 - `bench/run-night.sh`: Nightly full-corpus multi-lane orchestrator.
 
@@ -80,6 +89,9 @@
 - `bench/lanes/mlx/src/main.rs`: Qwen3 model architecture implementation and custom forward passes in MLX.
 - `bench/lanes/mlx-minilm/main.py`: Length-sorted batched MLX GPU execution for MiniLM.
 - `bench/lanes/ts-embed/main.mjs`: Transformers.js (q8/fp32) and native `onnxruntime-node` embedding logic.
+- `bench/lanes/potion/main.py`: Model2Vec static embedding lane utilizing `model2vec` (StaticModel) with `potion-code-16M`.
+- `bench/eval-coir/coir_eval.py`: Brute-force numpy cosine retrieval and pytrec_eval scoring logic.
+- `bench/eval-coir/reference_rerank.py`: Reference Alibaba-NLP/gte-reranker-modernbert-base rerank calculation.
 
 **Tests:**
 - Standalone nextest-compatible test suites are managed via library configurations and workspace flags.

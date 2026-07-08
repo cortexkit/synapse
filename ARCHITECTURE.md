@@ -6,8 +6,9 @@
 
 **Key Characteristics:**
 - **Serial Execution under Idle-Gate Constraints:** Prevent measurement contamination by ensuring the host machine is idle (average CPU <= 15%, GPU <= 5% for 6 seconds) before starting any run.
-- **Self-Contained Execution Lanes:** Separate binaries or runtime environments for each target (`lane-ort-embed`, `lane-mlx`, `lane-llama`, `lane-burn`, `lane-wrap-embed`, `mlx-minilm`, `ts-embed`) compile/execute independently to avoid compile-time dependency leakage or driver pollution.
+- **Self-Contained Execution Lanes:** Separate binaries or runtime environments for each target (`lane-ort-embed`, `lane-mlx`, `lane-llama`, `lane-burn`, `lane-wrap-embed`, `mlx-minilm`, `ts-embed`, `potion`) compile/execute independently to avoid compile-time dependency leakage or driver pollution. Key lanes (`lane-ort-embed`, `lane-llama`) support cross-platform builds, dynamically loading `ort` on Windows via DLL boundary to sidestep CRT conflicts and enable DirectML, and using Windows-specific tasklist process RSS sampling and cfg-gated shutdown.
 - **Numerical Parity Auditing:** Quantify accuracy drift across acceleration targets by calculating the mean cosine similarity of generated embeddings against a CPU-based `ort` (ONNX Runtime) reference lane. Perform rank-stability auditing (top-k neighbor overlap) to detect quantization-induced reordering.
+- **Retrieval Quality and Reranking Parity Auditing:** Assess retrieval quality using offline evaluation datasets (COSQA, CodeSearchNet-Python) from the CoIR suite. Reranking workloads compare candidate scores against reference Alibaba-NLP/gte-reranker-modernbert-base scores to evaluate score drift and rank stability.
 
 ## Layers
 
@@ -20,17 +21,24 @@
 
 **Native Engine Inference Lanes:**
 - Purpose: Execute in-memory tokenization, tensor forward passes, and pooling over target platforms.
-- Location: `bench/lanes/ort-embed`, `bench/lanes/mlx`, `bench/lanes/burn`, `bench/lanes/mlx-minilm`, `bench/lanes/ts-embed`
-- Contains: Bounded-thread ONNX Runtime embedding logic, Metal-accelerated MLX custom model implementations (including Qwen3's attention layers and length-uniform batch sorting), WGPU-based Burn ONNX imports, python-based MLX community/source loading, and TypeScript (Transformers.js or native `onnxruntime-node`) setups.
-- Depends on: `bench/harness` (for Rust crates), target runtime libraries (`ort`, `mlx-rs`, `burn`, `@huggingface/transformers`, `mlx-embeddings`), and `tokenizers`.
+- Location: `bench/lanes/ort-embed`, `bench/lanes/mlx`, `bench/lanes/burn`, `bench/lanes/mlx-minilm`, `bench/lanes/ts-embed`, `bench/lanes/potion`
+- Contains: Bounded-thread ONNX Runtime embedding logic, Metal-accelerated MLX custom model implementations (including Qwen3's attention layers and length-uniform batch sorting), WGPU-based Burn ONNX imports, python-based MLX community/source loading, Model2Vec static embedding (`potion-code-16M`), and TypeScript (Transformers.js or native `onnxruntime-node`) setups.
+- Depends on: `bench/harness` (for Rust crates), target runtime libraries (`ort`, `mlx-rs`, `burn`, `@huggingface/transformers`, `mlx-embeddings`, `model2vec`), and `tokenizers`.
 - Used by: The benchmark suite runners `bench/run-matrix.sh` and `bench/run-night.sh`.
 
 **Supervised Child Server Lane:**
 - Purpose: Spawns, monitors, and terminates a child server process (`llama-server`) and routes inference requests over standard HTTP endpoints.
 - Location: `bench/lanes/llama`
-- Contains: Supervised subprocess spawning, TCP port binding probes, `/health` API polling, and batched OpenAI-compatible API request orchestration.
+- Contains: Supervised subprocess spawning, TCP port binding probes, `/health` API polling, and batched OpenAI-compatible API request orchestration. Also handles `/v1/rerank` request routing for reranker workloads.
 - Depends on: `bench/harness`, `reqwest`, `serde`, `serde_json`.
-- Used by: The benchmark suite runner `bench/run-matrix.sh`.
+- Used by: The benchmark suite runner `bench/run-matrix.sh` and `bench/run-night.sh`.
+
+**CoIR Retrieval Evaluation Harness:**
+- Purpose: Score retrieval quality and rerank similarity of Synapse embeddings offline.
+- Location: `bench/eval-coir`
+- Contains: Data preparation scripts for download and conversion, numpy brute-force cosine search and pytrec_eval scoring, and candidate-vs-reference reranker validation.
+- Depends on: `uv`, `numpy`, `pytrec_eval`, and `transformers` (for reference reranking).
+- Used by: Developers running evaluation checks during model selection and quality screening.
 
 **External Service Wrapper Lane:**
 - Purpose: Integrates and profiles pre-existing external inference servers (LMStudio, Ollama) that run out-of-process.
@@ -56,11 +64,24 @@
 
 **Inference and Numerical Parity Check:**
 
-1. Parse arguments, load weights/servers, configure tokenizers, and execute a warmup batch — `bench/lanes/*/src/main.rs` (Rust), `bench/lanes/mlx-minilm/main.py` (Python), `bench/lanes/ts-embed/main.mjs` (JS)
-2. Divide inputs and run model forward execution under token-budget or attention-unit batch limits (optionally sorting inputs by token count to prevent padding waste) — `bench/lanes/*/src/main.rs` (Rust), `bench/lanes/mlx-minilm/main.py` (Python), `bench/lanes/ts-embed/main.mjs` (JS)
+1. Parse arguments, load weights/servers, configure tokenizers, and execute a warmup batch — `bench/lanes/*/src/main.rs` (Rust), `bench/lanes/mlx-minilm/main.py` (Python), `bench/lanes/ts-embed/main.mjs` (JS), `bench/lanes/potion/main.py` (Python)
+2. Divide inputs and run model forward execution under token-budget or attention-unit batch limits (optionally sorting inputs by token count to prevent padding waste) — `bench/lanes/*/src/main.rs` (Rust), `bench/lanes/mlx-minilm/main.py` (Python), `bench/lanes/ts-embed/main.mjs` (JS), `bench/lanes/potion/main.py` (Python)
 3. Calculate mean cosine similarity of produced output vectors against the `ort-cpu` baseline reference — `bench/harness/src/parity.rs`
 4. Calculate top-k neighbor overlap metrics to check for rank stability against the reference lane — `bench/harness/src/parity.rs`
 5. Write results structured in the `LaneResult` schema to the output results JSON — `bench/harness/src/results.rs`
+
+**CoIR Retrieval Evaluation Flow:**
+
+1. Prepare evaluation task files (COSQA and CodeSearchNet-Python) into uniform JSONL shape (queries and corpus) — `bench/eval-coir/prepare.py`
+2. Run target inference lanes with document/query prefixes to generate vector outputs — `bench/lanes/*/src/main.rs`, `bench/lanes/potion/main.py`, etc.
+3. Execute brute-force cosine retrieval and calculate metrics (MRR@10, NDCG@10, Recall@10) — `bench/eval-coir/score.py`
+
+**Reranking Quality Check Flow:**
+
+1. Spawn `llama-server` with `--rerank` argument — `bench/lanes/llama/src/main.rs`
+2. Submit batch query and document pairs to the `/v1/rerank` endpoint, accumulating server-reported prompt token counts — `bench/lanes/llama/src/main.rs`
+3. Generate reference scores using Hugging Face reference implementation (`Alibaba-NLP/gte-reranker-modernbert-base`) — `bench/eval-coir/reference_rerank.py`
+4. Compare candidate rerank scores against the reference scores to calculate delta/drift — `bench/eval-coir/compare_rerank_scores.py`
 
 ## Key Abstractions
 
@@ -73,6 +94,11 @@
 - Purpose: Uniform representations of inputs for embedding (Chunk) and classification (Prompt) workloads.
 - Location: `bench/harness/src/parity.rs`
 - Pattern: Deserializable Data Structures.
+
+**Rerank Query Row:**
+- Purpose: Represents a query and its candidate documents to be reranked.
+- Location: `bench/lanes/llama/src/main.rs`
+- Pattern: Deserializable Data Structure.
 
 **System Idle Gate:**
 - Purpose: Preflight check to guard executions and prevent run telemetry contamination by background system tasks.
@@ -87,9 +113,14 @@
 - Responsibilities: Routes commands to either chunk source files into a corpus, execute telemetry-monitored child commands, or calculate top-k neighbor rank-overlap parity.
 
 **Inference Lane Runners:**
-- Location: `bench/lanes/ort-embed/src/main.rs`, `bench/lanes/wrap-embed/src/main.rs`, `bench/lanes/llama/src/main.rs`, `bench/lanes/mlx/src/main.rs`, `bench/lanes/burn/src/main.rs` (Rust crates); `bench/lanes/mlx-minilm/main.py` (Python script); `bench/lanes/ts-embed/main.mjs` (TypeScript script)
+- Location: `bench/lanes/ort-embed/src/main.rs`, `bench/lanes/wrap-embed/src/main.rs`, `bench/lanes/llama/src/main.rs`, `bench/lanes/mlx/src/main.rs`, `bench/lanes/burn/src/main.rs` (Rust crates); `bench/lanes/mlx-minilm/main.py` (Python script); `bench/lanes/ts-embed/main.mjs` (TypeScript script); `bench/lanes/potion/main.py` (Python script)
 - Triggers: Invocation by the power wrapper or direct script executions.
 - Responsibilities: Model initialization, cold-load timing tracking, batched inference execution, and vector/result output generation.
+
+**CoIR Evaluation Entry Points:**
+- Location: `bench/eval-coir/prepare.py`, `bench/eval-coir/score.py`, `bench/eval-coir/reference_rerank.py`
+- Triggers: Invoked by developers during retrieval and reranking quality audits.
+- Responsibilities: Retrieval task data prep, vector scoring, and reference rerank scoring.
 
 **Matrix Orchestration Script:**
 - Location: `bench/run-matrix.sh`
@@ -104,7 +135,7 @@
 ## Error Handling
 
 **Strategy:** Fail-fast utilizing `anyhow::Result` error propagation with contextual layers (`.context()`).
-- **Child Supervision:** Spawned subprocesses (`llama-server`) are tracked via PID. If a child dies or fails to bind to its designated port within `HEALTH_TIMEOUT` (120s), the lane runner fails immediately rather than silently hanging.
+- **Child Supervision:** Spawned subprocesses (`llama-server`) are tracked via PID. If a child dies or fails to bind to its designated port within `HEALTH_TIMEOUT` (120s), the lane runner fails immediately rather than silently hanging. Platform-specific process control signals (such as SIGTERM on Unix) are gated appropriately so subprocess lifecycles function seamlessly on both Windows and Unix platforms.
 - **HTTP Resiliency:** Requests to external wrapping endpoints (`wrap-embed`) implement read timeouts, connect timeouts, and bounded retry loops with backoff to recover from transient rate limits or cold-load stalls.
 
 ## Cross-Cutting Concerns
