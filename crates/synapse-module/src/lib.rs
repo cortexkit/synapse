@@ -130,6 +130,9 @@ struct LaneHealth {
     fingerprint: Fingerprint,
     certified: bool,
     certification_stale: bool,
+    #[cfg(unix)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    worker: Option<worker_host::WorkerHostHealth>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1710,7 +1713,7 @@ async fn execute_embedding_quanta(
     runtime: &RuntimeState,
     model: &EmbeddingModel,
     batch: TokenBatch,
-    total_tokens: u64,
+    _total_tokens: u64,
     request_bytes: u64,
 ) -> Result<Vectors, WireOperationError> {
     let mut scheduler = LaneScheduler::new(SchedulerConfig {
@@ -1720,6 +1723,7 @@ async fn execute_embedding_quanta(
         default_execution_ms: runtime.inline.estimated_execution_ms,
         ..SchedulerConfig::default()
     });
+    let scheduled_tokens = batch_token_cost(&batch);
     scheduler
         .admit(
             &SystemClock,
@@ -1728,7 +1732,7 @@ async fn execute_embedding_quanta(
                 deadline_ms: None,
                 max_queue_ms: runtime.inline.max_queue_ms,
                 request_bytes,
-                token_cost: total_tokens.max(1),
+                token_cost: scheduled_tokens,
                 estimated_execution_ms: runtime.inline.estimated_execution_ms,
                 payload: (),
             },
@@ -1767,6 +1771,15 @@ async fn execute_embedding_quanta(
         all_vectors.append(&mut vectors);
     }
     Ok(all_vectors)
+}
+
+fn batch_token_cost(batch: &TokenBatch) -> u64 {
+    batch
+        .items
+        .iter()
+        .map(|item| item.len().max(1) as u64)
+        .sum::<u64>()
+        .max(1)
 }
 
 fn embed_result_pages(
@@ -2195,6 +2208,9 @@ async fn execute_generate(
 }
 
 fn engine_error_to_wire(error: EngineError) -> WireOperationError {
+    if error.stage == EngineErrorStage::WorkerCrash && error.retry_after_ms.is_none() {
+        return WireOperationError::from_stable(StableError::probe_required(), error.message);
+    }
     WireOperationError::from_stable(
         StableError::engine_crashed(error.retry_after_ms),
         error.message,
@@ -3136,7 +3152,19 @@ fn models_status_payload(state: &ModuleState) -> Value {
         "module_generation": state.module_generation,
         "machine_profile_hash": state.machine_profile_hash,
         "models": state.runtime.catalog_entries(),
+        "health": module_health(state),
     })
+}
+
+#[cfg(unix)]
+fn worker_health_for_model(model: &EmbeddingModel) -> Option<worker_host::WorkerHostHealth> {
+    match &model.backend {
+        EmbedBackend::Llama(engine) => engine
+            .lock()
+            .ok()
+            .and_then(|engine| engine.health_snapshot().ok()),
+        EmbedBackend::Ort(_) => None,
+    }
 }
 
 fn module_health(state: &ModuleState) -> ModuleHealth {
@@ -3161,6 +3189,8 @@ fn module_health(state: &ModuleState) -> ModuleHealth {
                 fingerprint: model.fingerprint.clone(),
                 certified,
                 certification_stale,
+                #[cfg(unix)]
+                worker: worker_health_for_model(model),
             }
         })
         .collect::<Vec<_>>();
@@ -3532,4 +3562,18 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batch_token_cost_tracks_actual_token_id_chunks() {
+        let batch = TokenBatch {
+            items: vec![vec![1, 2, 3], Vec::new(), vec![4, 5]],
+        };
+
+        assert_eq!(batch_token_cost(&batch), 6);
+    }
 }

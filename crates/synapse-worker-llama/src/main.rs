@@ -45,6 +45,8 @@ struct Args {
     socket: PathBuf,
     #[arg(long)]
     nonce: String,
+    #[arg(long = "test-abort", hide = true)]
+    test_abort: bool,
     #[arg(long, hide = true)]
     test_abort_on_request: bool,
 }
@@ -215,7 +217,9 @@ fn main() -> Result<()> {
         };
         let request: WorkerRequest =
             serde_json::from_slice(&frame).context("decode request JSON")?;
-        if args.test_abort_on_request {
+        let should_abort = args.test_abort_on_request
+            || (args.test_abort && !matches!(request, WorkerRequest::Load { .. }));
+        if should_abort {
             std::process::abort();
         }
         match request {
