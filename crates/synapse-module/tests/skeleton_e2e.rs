@@ -101,20 +101,21 @@ fn spawn_synapse_module_with_preloads(
     subc_connection_file: &Path,
     preload_models: Option<&str>,
 ) -> ModuleProcess {
-    spawn_synapse_module_with_env(subc_connection_file, preload_models, None)
+    spawn_synapse_module_with_env(subc_connection_file, preload_models, None, &[])
 }
 
 fn spawn_synapse_module_with_config(
     subc_connection_file: &Path,
     config_json: &str,
 ) -> ModuleProcess {
-    spawn_synapse_module_with_env(subc_connection_file, None, Some(config_json))
+    spawn_synapse_module_with_env(subc_connection_file, None, Some(config_json), &[])
 }
 
 fn spawn_synapse_module_with_env(
     subc_connection_file: &Path,
     preload_models: Option<&str>,
     config_json: Option<&str>,
+    extra_env: &[(&str, &str)],
 ) -> ModuleProcess {
     let mut command = Command::new(env!("CARGO_BIN_EXE_synapse-module"));
     command
@@ -128,6 +129,9 @@ fn spawn_synapse_module_with_env(
     }
     if let Some(config_json) = config_json {
         command.env("SYNAPSE_CONFIG_JSON", config_json);
+    }
+    for (key, value) in extra_env {
+        command.env(key, value);
     }
     let child = command.spawn().expect("spawn synapse-module");
     ModuleProcess { child }
@@ -216,7 +220,7 @@ async fn models_list_round_trips_and_opens_the_daemon_delivered_store() {
     );
 
     let conn = Connection::open(&store_path).expect("open migrated synapse store");
-    for table in ["module_meta", "jobs", "alias_rows", "cert_rows"] {
+    for table in ["module_meta", "jobs", "alias_rows", "cert_rows", "models"] {
         let found: Option<String> = conn
             .query_row(
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -703,16 +707,252 @@ async fn concurrent_embed_burst_finishes_with_vectors_or_typed_rejections() {
     }
 }
 
+#[tokio::test]
+async fn model_load_file_source_reaches_ready_and_lazy_reload_after_unload() {
+    let Some(source_dir) = copied_minilm_source_dir("synapse-model-load-file") else {
+        eprintln!("skipping model.load file e2e: local HF ONNX snapshot is missing");
+        return;
+    };
+    let _lock = acquire_minilm_e2e_lock();
+    let (_daemon, _module, mut consumer, route_channel) = open_route().await;
+
+    let accepted = route_request(
+        &mut consumer,
+        route_channel,
+        20_000,
+        serde_json::json!({
+            "method": "model.load",
+            "params": {
+                "source": "file",
+                "path": source_dir,
+                "files": { "model": "model.onnx", "tokenizer": "tokenizer.json" },
+                "engine": "ort",
+                "pooling": "mean",
+                "task": "embed",
+                "pin": true,
+                "request_key": "model-load-file-e2e"
+            }
+        }),
+    )
+    .await;
+    let job_id = accepted["result"]["job_id"].as_str().unwrap().to_string();
+    let ready = poll_model_load_job(&mut consumer, route_channel, 20_001, &job_id).await;
+    assert_eq!(ready["result"]["state"], "ready");
+    let model_id = ready["result"]["model_id"].as_str().unwrap().to_string();
+
+    let uncertified = route_request(
+        &mut consumer,
+        route_channel,
+        20_100,
+        serde_json::json!({
+            "method": "embed.query",
+            "params": { "model": &model_id, "text": "uncertified should fail" }
+        }),
+    )
+    .await;
+    assert!(
+        uncertified["result"]["error"]["code"] == "probe_required"
+            || uncertified["result"]["error"]["code"] == "not_certified"
+    );
+
+    run_probe_job(
+        &mut consumer,
+        route_channel,
+        20_200,
+        serde_json::json!({ "models": [model_id.clone()] }),
+    )
+    .await;
+
+    let first = route_request(
+        &mut consumer,
+        route_channel,
+        20_300,
+        serde_json::json!({
+            "method": "embed.query",
+            "params": { "model": &model_id, "id": "first", "text": "hello from model.load" }
+        }),
+    )
+    .await;
+    assert_eq!(first["result"]["dims"].as_u64(), Some(384));
+
+    let unloaded = route_request(
+        &mut consumer,
+        route_channel,
+        20_400,
+        serde_json::json!({
+            "method": "model.unload",
+            "params": { "model_id": &model_id }
+        }),
+    )
+    .await;
+    assert_eq!(unloaded["result"]["state"], "unloaded");
+
+    let loading = route_request(
+        &mut consumer,
+        route_channel,
+        20_500,
+        serde_json::json!({
+            "method": "embed.query",
+            "params": { "model": &model_id, "text": "reload after unload" }
+        }),
+    )
+    .await;
+    assert_eq!(loading["result"]["error"]["code"], "model_loading");
+
+    let ready_again = poll_model_ready(&mut consumer, route_channel, 20_600, &model_id).await;
+    assert_eq!(ready_again["result"]["state"], "ready");
+
+    let second = route_request(
+        &mut consumer,
+        route_channel,
+        20_700,
+        serde_json::json!({
+            "method": "embed.query",
+            "params": { "model": &model_id, "id": "second", "text": "reload succeeded" }
+        }),
+    )
+    .await;
+    assert_eq!(second["result"]["dims"].as_u64(), Some(384));
+}
+
+#[tokio::test]
+async fn model_load_digest_mismatch_fails_with_artifact_invalid() {
+    let Some(source_dir) = copied_minilm_source_dir("synapse-model-load-digest-mismatch") else {
+        eprintln!("skipping model.load digest mismatch e2e: local HF ONNX snapshot is missing");
+        return;
+    };
+    let _lock = acquire_minilm_e2e_lock();
+    let (_daemon, _module, mut consumer, route_channel) = open_route().await;
+
+    let accepted = route_request(
+        &mut consumer,
+        route_channel,
+        21_000,
+        serde_json::json!({
+            "method": "model.load",
+            "params": {
+                "source": "file",
+                "path": source_dir,
+                "files": { "model": "model.onnx", "tokenizer": "tokenizer.json" },
+                "expected_digest": format!("sha256:{}", "0".repeat(64)),
+                "engine": "ort",
+                "pooling": "mean",
+                "task": "embed",
+                "request_key": "model-load-digest-mismatch"
+            }
+        }),
+    )
+    .await;
+    let job_id = accepted["result"]["job_id"].as_str().unwrap().to_string();
+    let failed = poll_model_load_job(&mut consumer, route_channel, 21_001, &job_id).await;
+    assert_eq!(failed["result"]["state"], "failed");
+    assert_eq!(failed["result"]["error"]["code"], "artifact_invalid");
+    assert_eq!(failed["result"]["error"]["class"], "permanent");
+}
+
+#[tokio::test]
+async fn model_load_restart_mid_download_marks_job_restarted_and_resubmit_succeeds() {
+    let Some(source_dir) = copied_minilm_source_dir("synapse-model-load-restart") else {
+        eprintln!("skipping model.load restart e2e: local HF ONNX snapshot is missing");
+        return;
+    };
+    let _lock = acquire_minilm_e2e_lock();
+    let daemon = start_daemon().await;
+    let module = spawn_synapse_module_with_env(
+        &daemon.connection_file_path,
+        None,
+        None,
+        &[("SYNAPSE_TEST_MODEL_LOAD_CHUNK_DELAY_MS", "25")],
+    );
+    let (daemon, mut module, mut consumer, route_channel) =
+        open_route_for_started_module(daemon, module).await;
+
+    let request = serde_json::json!({
+        "method": "model.load",
+        "params": {
+            "source": "file",
+            "path": source_dir,
+            "files": { "model": "model.onnx", "tokenizer": "tokenizer.json" },
+            "engine": "ort",
+            "pooling": "mean",
+            "task": "embed",
+            "request_key": "model-load-restart"
+        }
+    });
+    let accepted = route_request(&mut consumer, route_channel, 22_000, request.clone()).await;
+    let job_id = accepted["result"]["job_id"].as_str().unwrap().to_string();
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut corr = 22_001;
+    loop {
+        let body = route_request(
+            &mut consumer,
+            route_channel,
+            corr,
+            serde_json::json!({
+                "method": "model.status",
+                "params": { "job_id": &job_id }
+            }),
+        )
+        .await;
+        match body["result"]["state"].as_str() {
+            Some("downloading") => break,
+            Some("resolving" | "validating" | "loading") => {
+                assert!(Instant::now() < deadline, "model.load never reached downloading: {body:?}");
+                corr += 1;
+                sleep(Duration::from_millis(50)).await;
+            }
+            other => panic!("unexpected model.load state before restart {other:?}: {body:?}"),
+        }
+    }
+
+    let _ = module.child.start_kill();
+    let _ = module.child.wait().await;
+    drop(consumer);
+
+    let restarted = spawn_synapse_module_with_env(&daemon.connection_file_path, None, None, &[]);
+    let (_daemon, _module, mut consumer, route_channel) =
+        open_route_for_started_module(daemon, restarted).await;
+
+    let restarted_status = route_request(
+        &mut consumer,
+        route_channel,
+        22_100,
+        serde_json::json!({
+            "method": "model.status",
+            "params": { "job_id": &job_id }
+        }),
+    )
+    .await;
+    assert_eq!(restarted_status["result"]["state"], "failed");
+    assert_eq!(restarted_status["result"]["error"]["code"], "module_restarted");
+
+    let retried = route_request(&mut consumer, route_channel, 22_200, request).await;
+    let retried_job_id = retried["result"]["job_id"].as_str().unwrap().to_string();
+    assert_ne!(retried_job_id, job_id);
+    let ready = poll_model_load_job(&mut consumer, route_channel, 22_201, &retried_job_id).await;
+    assert_eq!(ready["result"]["state"], "ready");
+}
+
 async fn certify_preloaded_models(
     consumer: &mut tokio::net::TcpStream,
     route_channel: u16,
     start_corr: u64,
 ) -> Value {
+    run_probe_job(consumer, route_channel, start_corr, serde_json::json!({})).await
+}
+
+async fn run_probe_job(
+    consumer: &mut tokio::net::TcpStream,
+    route_channel: u16,
+    start_corr: u64,
+    params: Value,
+) -> Value {
     let accepted = route_request(
         consumer,
         route_channel,
         start_corr,
-        serde_json::json!({ "method": "probe.start", "params": {} }),
+        serde_json::json!({ "method": "probe.start", "params": params }),
     )
     .await;
     let job_id = accepted["result"]["job_id"]
@@ -751,6 +991,74 @@ async fn certify_preloaded_models(
                 sleep(Duration::from_millis(100)).await;
             }
             other => panic!("unexpected probe.status state {other:?}: {body:?}"),
+        }
+    }
+}
+
+async fn poll_model_load_job(
+    consumer: &mut tokio::net::TcpStream,
+    route_channel: u16,
+    start_corr: u64,
+    job_id: &str,
+) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let mut corr = start_corr;
+    loop {
+        let body = route_request(
+            consumer,
+            route_channel,
+            corr,
+            serde_json::json!({
+                "method": "model.status",
+                "params": { "job_id": job_id }
+            }),
+        )
+        .await;
+        match body["result"]["state"].as_str() {
+            Some("ready" | "failed") => return body,
+            Some("resolving" | "downloading" | "validating" | "loading") => {
+                assert!(
+                    Instant::now() < deadline,
+                    "model.load did not reach a terminal state before timeout: {body:?}"
+                );
+                corr += 1;
+                sleep(Duration::from_millis(100)).await;
+            }
+            other => panic!("unexpected model.status state {other:?}: {body:?}"),
+        }
+    }
+}
+
+async fn poll_model_ready(
+    consumer: &mut tokio::net::TcpStream,
+    route_channel: u16,
+    start_corr: u64,
+    model_id: &str,
+) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let mut corr = start_corr;
+    loop {
+        let body = route_request(
+            consumer,
+            route_channel,
+            corr,
+            serde_json::json!({
+                "method": "model.status",
+                "params": { "model_id": model_id }
+            }),
+        )
+        .await;
+        match body["result"]["state"].as_str() {
+            Some("ready" | "failed") => return body,
+            Some("unloaded" | "loading") => {
+                assert!(
+                    Instant::now() < deadline,
+                    "model.status(model_id) did not become ready before timeout: {body:?}"
+                );
+                corr += 1;
+                sleep(Duration::from_millis(100)).await;
+            }
+            other => panic!("unexpected model.status(model_id) state {other:?}: {body:?}"),
         }
     }
 }
@@ -801,6 +1109,20 @@ fn assert_vectors_close(actual: &Value, expected: &Value) {
             "vector components differ: {left} vs {right}"
         );
     }
+}
+
+fn copied_minilm_source_dir(label: &str) -> Option<PathBuf> {
+    let snapshot = minilm_onnx_snapshot()?;
+    let model_path = snapshot.join("model.onnx");
+    let tokenizer_path = snapshot.join("tokenizer.json");
+    if !model_path.exists() || !tokenizer_path.exists() {
+        return None;
+    }
+    let source_dir = unique_temp_dir(label);
+    std::fs::create_dir_all(&source_dir).ok()?;
+    std::fs::copy(&model_path, source_dir.join("model.onnx")).ok()?;
+    std::fs::copy(&tokenizer_path, source_dir.join("tokenizer.json")).ok()?;
+    Some(source_dir)
 }
 
 fn minilm_preload_config() -> Option<String> {
@@ -878,8 +1200,31 @@ fn first_snapshot_with(snapshots: &Path, file_name: &str) -> Option<PathBuf> {
         .find(|path| path.join(file_name).exists())
 }
 
-struct MinilmE2eLock;
+struct MinilmE2eLock {
+    path: PathBuf,
+    #[allow(dead_code)]
+    file: std::fs::File,
+}
+
+impl Drop for MinilmE2eLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
 
 fn acquire_minilm_e2e_lock() -> MinilmE2eLock {
-    MinilmE2eLock
+    let path = std::env::temp_dir().join("synapse-minilm-e2e.lock");
+    loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => return MinilmE2eLock { path, file },
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => panic!("failed to acquire MiniLM e2e lock: {error}"),
+        }
+    }
 }

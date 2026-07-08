@@ -1,12 +1,15 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    path::PathBuf,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use cortexkit_store::{open_sqlite, Migration, SqliteStore, StoreError};
 use cortexkit_store_types::StorageDescriptor;
 use rusqlite::{params, OptionalExtension, Row};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use synapse_core::{AliasRow, AliasTable, Fingerprint, NumericProfileId};
+use synapse_core::{AliasRow, AliasTable, EngineIdentity, Fingerprint, NumericProfileId};
 use thiserror::Error;
 
 const NAMESPACE: &str = "synapse_module";
@@ -103,7 +106,7 @@ const MIGRATIONS: &[Migration] = &[
                         valid_to_epoch_exclusive, '{}'
                  FROM alias_rows_v2;
                  DROP TABLE alias_rows_v2;
-
+ 
                  ALTER TABLE cert_rows RENAME TO cert_rows_v1;
                  CREATE TABLE cert_rows (
                      machine_profile_hash TEXT NOT NULL,
@@ -121,6 +124,21 @@ const MIGRATIONS: &[Migration] = &[
                  FROM cert_rows_v1;
                  DROP TABLE cert_rows_v1;
                  CREATE INDEX cert_rows_fingerprint_idx ON cert_rows(fingerprint);
+         "#,
+    },
+    Migration {
+        version: 4,
+        statements: r#"
+                 CREATE TABLE models (
+                     model_id TEXT PRIMARY KEY,
+                     engine TEXT NOT NULL,
+                     task TEXT NOT NULL,
+                     fingerprint TEXT NOT NULL,
+                     config_json BLOB NOT NULL,
+                     created_ms INTEGER NOT NULL,
+                     updated_ms INTEGER NOT NULL
+                 );
+                 CREATE INDEX models_fingerprint_idx ON models(fingerprint);
         "#,
     },
 ];
@@ -140,6 +158,39 @@ pub struct ModelCatalogEntry {
     pub model_id: String,
     pub state: String,
     pub fingerprints: Vec<Fingerprint>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum ModelAssetLocator {
+    LocalPath { path: PathBuf },
+    CacheDigest { digest: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredModelConfig {
+    pub model_id: String,
+    pub engine: String,
+    pub task: String,
+    pub artifact_digest: String,
+    pub artifact_format: String,
+    pub tokenizer_sanitized_digest: String,
+    pub model_locator: ModelAssetLocator,
+    pub tokenizer_locator: ModelAssetLocator,
+    pub model_source_url: String,
+    pub tokenizer_source_url: String,
+    pub pooling: String,
+    pub normalize: bool,
+    pub max_tokens: usize,
+    pub quant: String,
+    pub pin: bool,
+    pub engine_identity: EngineIdentity,
+    pub numeric_profile_id: NumericProfileId,
+    pub fingerprint: Fingerprint,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_bin: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_runtime_dir: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -227,11 +278,64 @@ impl SynapseStore {
 
     pub fn catalog_snapshot(&self) -> Result<CatalogSnapshot, SynapseStoreError> {
         let alias_table = self.alias_table()?;
+        let models = self
+            .catalog_models()?
+            .into_iter()
+            .map(|model| ModelCatalogEntry {
+                model_id: model.model_id,
+                state: "unloaded".to_string(),
+                fingerprints: vec![model.fingerprint],
+            })
+            .collect();
         Ok(CatalogSnapshot {
             table_epoch: alias_table.table_epoch,
-            models: Vec::new(),
+            models,
             alias_rows: alias_table.rows,
         })
+    }
+
+    pub fn catalog_models(&self) -> Result<Vec<StoredModelConfig>, SynapseStoreError> {
+        let models = self.store.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT config_json FROM models ORDER BY created_ms ASC, model_id ASC",
+            )?;
+            let rows = stmt
+                .query_map([], |row| decode_model_config(row.get::<_, Vec<u8>>(0)?))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })?;
+        Ok(models)
+    }
+
+    pub fn upsert_model(
+        &self,
+        config: &StoredModelConfig,
+        now_ms: u64,
+    ) -> Result<(), SynapseStoreError> {
+        let config_json = serde_json::to_vec(config)?;
+        self.store.with_conn_fenced(|tx| {
+            tx.execute(
+                "INSERT INTO models (
+                     model_id, engine, task, fingerprint, config_json, created_ms, updated_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+                 ON CONFLICT(model_id) DO UPDATE SET
+                     engine = excluded.engine,
+                     task = excluded.task,
+                     fingerprint = excluded.fingerprint,
+                     config_json = excluded.config_json,
+                     updated_ms = excluded.updated_ms",
+                params![
+                    &config.model_id,
+                    &config.engine,
+                    &config.task,
+                    &config.fingerprint.0,
+                    config_json,
+                    now_ms as i64,
+                ],
+            )?;
+            Ok(())
+        })?;
+        Ok(())
     }
 
     pub fn alias_table(&self) -> Result<AliasTable, SynapseStoreError> {
@@ -724,6 +828,16 @@ fn decode_optional_json(bytes: Option<Vec<u8>>, index: usize) -> rusqlite::Resul
         .transpose()
 }
 
+fn decode_model_config(bytes: Vec<u8>) -> rusqlite::Result<StoredModelConfig> {
+    serde_json::from_slice(&bytes).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Blob,
+            Box::new(error),
+        )
+    })
+}
+
 fn new_job_id(request_key: &str, generation: u64, now_ms: u64) -> String {
     let counter = JOB_COUNTER.fetch_add(1, Ordering::Relaxed);
     let mut hasher = Sha256::new();
@@ -737,6 +851,8 @@ fn new_job_id(request_key: &str, generation: u64, now_ms: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
     use cortexkit_store_types::{Isolation, StorageBackend};
 
@@ -895,6 +1011,56 @@ mod tests {
         assert!(store.get_job(&job_id).unwrap().is_some());
         assert_eq!(store.purge_expired_jobs(1_100).unwrap(), 1);
         assert!(store.get_job(&job_id).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn catalog_models_survive_reopen_and_appear_in_snapshot() {
+        let (root, descriptor) = temp_descriptor("catalog-models");
+        let config = StoredModelConfig {
+            model_id: "minilm".to_string(),
+            engine: "ort".to_string(),
+            task: "embed".to_string(),
+            artifact_digest: format!("sha256:{}", "1".repeat(64)),
+            artifact_format: "onnx".to_string(),
+            tokenizer_sanitized_digest: format!("sha256:{}", "2".repeat(64)),
+            model_locator: ModelAssetLocator::CacheDigest {
+                digest: format!("sha256:{}", "1".repeat(64)),
+            },
+            tokenizer_locator: ModelAssetLocator::CacheDigest {
+                digest: format!("sha256:{}", "3".repeat(64)),
+            },
+            model_source_url: "file:///tmp/model.onnx".to_string(),
+            tokenizer_source_url: "file:///tmp/tokenizer.json".to_string(),
+            pooling: "mean".to_string(),
+            normalize: true,
+            max_tokens: 512,
+            quant: "fp32".to_string(),
+            pin: true,
+            engine_identity: EngineIdentity {
+                engine: "ort".to_string(),
+                version: "test".to_string(),
+                build_flags: BTreeMap::new(),
+            },
+            numeric_profile_id: NumericProfileId("np-test".to_string()),
+            fingerprint: Fingerprint("fp-test".to_string()),
+            worker_bin: None,
+            worker_runtime_dir: None,
+        };
+
+        {
+            let store = SynapseStore::open(&descriptor).unwrap();
+            store.upsert_model(&config, 10).unwrap();
+        }
+
+        let reopened = SynapseStore::open(&descriptor).unwrap();
+        let models = reopened.catalog_models().unwrap();
+        assert_eq!(models, vec![config.clone()]);
+        let snapshot = reopened.catalog_snapshot().unwrap();
+        assert_eq!(snapshot.models.len(), 1);
+        assert_eq!(snapshot.models[0].model_id, config.model_id);
+        assert_eq!(snapshot.models[0].state, "unloaded");
+        assert_eq!(snapshot.models[0].fingerprints, vec![config.fingerprint]);
         let _ = std::fs::remove_dir_all(root);
     }
 

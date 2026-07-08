@@ -3,10 +3,10 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
-    io::Read,
+    io::{Read, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 mod store;
@@ -14,13 +14,14 @@ mod store;
 pub mod worker_host;
 
 use cortexkit_store_types::{sqlite_store_path, Isolation, StorageBackend, StorageDescriptor};
+use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use store::{
-    CatalogSnapshot, CertificationRow, JobAdmission, JobRecord, ModelCatalogEntry, SynapseStore,
-    SynapseStoreError, JOB_STATE_DONE, JOB_STATE_FAILED_PERMANENT, JOB_STATE_FAILED_TRANSIENT,
-    JOB_STATE_QUEUED, JOB_STATE_RUNNING,
+    CatalogSnapshot, CertificationRow, JobAdmission, JobRecord, ModelAssetLocator,
+    ModelCatalogEntry, StoredModelConfig, SynapseStore, SynapseStoreError, JOB_STATE_DONE,
+    JOB_STATE_FAILED_PERMANENT, JOB_STATE_FAILED_TRANSIENT, JOB_STATE_QUEUED, JOB_STATE_RUNNING,
 };
 use subc_client_rs::{
     async_trait, BindDecision, HandlerOutcome, HealthReport, ModuleHandler, RequestCtx,
@@ -46,7 +47,7 @@ use synapse_core::{
 };
 use synapse_engine_ort::OrtEmbedEngine;
 use thiserror::Error;
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 
 pub const DEFAULT_MODULE_ID: &str = "synapse";
 
@@ -336,14 +337,45 @@ fn default_probe_worst_decile_rank_overlap_threshold() -> f64 {
 }
 
 struct RuntimeState {
-    models: BTreeMap<String, Arc<EmbeddingModel>>,
-    default_model_id: Option<String>,
     inline: InlineConfig,
     jobs: JobConfig,
     probe: ProbeConfig,
     alias_admin_enabled: bool,
     scheduler: Arc<Mutex<InlineScheduler>>,
     execution: Arc<Semaphore>,
+    control_loads: Arc<Semaphore>,
+    ort_engine: Arc<Mutex<OrtEmbedEngine>>,
+    catalog: Arc<Mutex<BTreeMap<String, ModelSlot>>>,
+    job_progress: Arc<Mutex<BTreeMap<String, ModelRuntimeState>>>,
+}
+
+struct ModelSlot {
+    spec: StoredModelConfig,
+    loaded: Option<Arc<EmbeddingModel>>,
+    state: ModelRuntimeState,
+    notify: Arc<Notify>,
+}
+
+#[derive(Clone)]
+struct ModelSlotSnapshot {
+    spec: StoredModelConfig,
+    loaded: Option<Arc<EmbeddingModel>>,
+    state: ModelRuntimeState,
+    notify: Arc<Notify>,
+}
+
+#[derive(Clone, Debug)]
+enum ModelRuntimeState {
+    Unloaded,
+    Resolving,
+    Downloading {
+        bytes_done: u64,
+        bytes_total: Option<u64>,
+    },
+    Validating,
+    Loading,
+    Ready,
+    Failed(WireOperationError),
 }
 
 struct InlineScheduler {
@@ -380,6 +412,16 @@ enum ModelTask {
     Embed,
     Rerank,
     Generate,
+}
+
+impl ModelTask {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Embed => "embed",
+            Self::Rerank => "rerank",
+            Self::Generate => "generate",
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -534,6 +576,60 @@ struct EmbedResultParams {
     job_id: String,
     #[serde(default)]
     page: Option<u32>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ModelLoadFiles {
+    model: String,
+    tokenizer: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ModelLoadParams {
+    source: String,
+    #[serde(default)]
+    repo: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    files: ModelLoadFiles,
+    #[serde(default)]
+    expected_digest: Option<String>,
+    engine: String,
+    #[serde(default)]
+    pooling: Option<String>,
+    #[serde(default, alias = "kind", alias = "capability")]
+    task: Option<String>,
+    #[serde(default)]
+    pin: bool,
+    #[serde(default)]
+    request_key: Option<String>,
+    #[serde(default)]
+    model_id: Option<String>,
+    #[serde(default)]
+    normalize: Option<bool>,
+    #[serde(default)]
+    max_tokens: Option<usize>,
+    #[serde(default)]
+    quant: Option<String>,
+    #[serde(default)]
+    worker_bin: Option<PathBuf>,
+    #[serde(default)]
+    worker_runtime_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelStatusParams {
+    #[serde(default)]
+    job_id: Option<String>,
+    #[serde(default)]
+    model_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelUnloadParams {
+    model_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -718,17 +814,13 @@ impl SynapseHandler {
             &serde_json::to_value(&restart_error).expect("restart error serializes"),
             now_ms(),
         )?;
+        let config = load_module_config()?;
+        let catalog_models = sync_and_load_catalog_models(&store, &config)?;
         let model_cache = Arc::new(ModelCache::new(ModelCache::default_root()?));
-        let runtime = Arc::new(RuntimeState::from_config(
-            load_module_config()?,
-            Arc::clone(&model_cache),
-        )?);
+        let runtime = Arc::new(RuntimeState::from_catalog(config, catalog_models)?);
         let machine_profile = MachineProfile::collect(
             &SystemMachineProfileCollector,
-            runtime
-                .models
-                .values()
-                .map(|model| model.engine_identity.clone()),
+            runtime.engine_identities(),
         );
         let machine_profile_hash = machine_profile.hash();
         Ok(Arc::new(ModuleState {
@@ -744,72 +836,98 @@ impl SynapseHandler {
 }
 
 impl RuntimeState {
-    fn from_config(
-        config: ModuleConfig,
-        model_cache: Arc<ModelCache>,
-    ) -> Result<Self, ModuleError> {
+    fn from_catalog(config: ModuleConfig, models: Vec<StoredModelConfig>) -> Result<Self, ModuleError> {
         let inline = config.inline;
         let jobs = config.jobs;
         let probe = config.probe;
         let alias_admin_enabled = config.alias_admin_enabled || config.dev.alias_admin_enabled;
         let scheduler = Arc::new(Mutex::new(InlineScheduler { in_flight_bytes: 0 }));
         let execution = Arc::new(Semaphore::new(inline.max_concurrent_workers.max(1)));
-        let mut models = BTreeMap::new();
-        let ort_engine = Arc::new(Mutex::new(OrtEmbedEngine::new()));
-
-        for (index, preload) in config.preload_models.into_iter().enumerate() {
-            let model = preload_embedding_model(
-                index,
-                preload,
-                Arc::clone(&ort_engine),
-                &inline,
-                &model_cache,
-            )?;
-            models.insert(model.model_id.clone(), Arc::new(model));
-        }
-        let default_model_id = models.keys().next().cloned();
+        let catalog = models
+            .into_iter()
+            .map(|spec| {
+                (
+                    spec.model_id.clone(),
+                    ModelSlot {
+                        spec,
+                        loaded: None,
+                        state: ModelRuntimeState::Unloaded,
+                        notify: Arc::new(Notify::new()),
+                    },
+                )
+            })
+            .collect();
         Ok(Self {
-            models,
-            default_model_id,
             inline,
             jobs,
             probe,
             alias_admin_enabled,
             scheduler,
             execution,
+            control_loads: Arc::new(Semaphore::new(1)),
+            ort_engine: Arc::new(Mutex::new(OrtEmbedEngine::new())),
+            catalog: Arc::new(Mutex::new(catalog)),
+            job_progress: Arc::new(Mutex::new(BTreeMap::new())),
         })
+    }
+
+    fn engine_identities(&self) -> Vec<EngineIdentity> {
+        self.catalog
+            .lock()
+            .map(|catalog| {
+                catalog
+                    .values()
+                    .map(|slot| slot.spec.engine_identity.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn default_model_id(&self) -> Option<String> {
+        self.catalog
+            .lock()
+            .ok()
+            .and_then(|catalog| catalog.keys().next().cloned())
+    }
+
+    fn loaded_models(&self) -> Vec<Arc<EmbeddingModel>> {
+        self.catalog
+            .lock()
+            .map(|catalog| {
+                catalog
+                    .values()
+                    .filter_map(|slot| slot.loaded.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    }
+
+    fn loaded_model_count(&self) -> usize {
+        self.catalog
+            .lock()
+            .map(|catalog| {
+                catalog
+                    .values()
+                    .filter(|slot| slot.loaded.is_some())
+                    .count()
+            })
+            .unwrap_or(0)
     }
 
     fn catalog_entries(&self) -> Vec<ModelCatalogEntry> {
-        self.models
-            .values()
-            .map(|model| ModelCatalogEntry {
-                model_id: model.model_id.clone(),
-                state: "loaded".to_string(),
-                fingerprints: vec![model.fingerprint.clone()],
+        self.catalog
+            .lock()
+            .map(|catalog| {
+                catalog
+                    .values()
+                    .map(|slot| ModelCatalogEntry {
+                        model_id: slot.spec.model_id.clone(),
+                        state: model_runtime_state_name(&slot.state).to_string(),
+                        fingerprints: vec![slot.spec.fingerprint.clone()],
+                    })
+                    .collect::<Vec<_>>()
             })
-            .collect()
-    }
-
-    fn resolve_model(
-        &self,
-        requested: Option<&str>,
-    ) -> Result<Arc<EmbeddingModel>, WireOperationError> {
-        let model_id = requested
-            .map(str::to_string)
-            .or_else(|| self.default_model_id.clone())
-            .ok_or_else(|| {
-                WireOperationError::from_stable(
-                    StableError::probe_required(),
-                    "synapse requests require a preloaded v1-dev model",
-                )
-            })?;
-        self.models.get(&model_id).cloned().ok_or_else(|| {
-            WireOperationError::from_stable(
-                StableError::model_loading(Some(250)),
-                format!("embedding model '{model_id}' is not loaded"),
-            )
-        })
+            .unwrap_or_default()
     }
 
     fn admit_inline(
@@ -866,97 +984,143 @@ impl RuntimeState {
     }
 }
 
-fn preload_embedding_model(
+fn sync_and_load_catalog_models(
+    store: &SynapseStore,
+    config: &ModuleConfig,
+) -> Result<Vec<StoredModelConfig>, ModuleError> {
+    let now = now_ms();
+    for (index, preload) in config.preload_models.clone().into_iter().enumerate() {
+        let spec = build_preload_catalog_model(index, preload, &config.inline, &config.jobs)?;
+        store.upsert_model(&spec, now)?;
+    }
+
+    let mut normalized = Vec::new();
+    for model in store.catalog_models()? {
+        let refreshed = normalize_catalog_model(model.clone(), &config.inline, &config.jobs)?;
+        if refreshed != model {
+            store.upsert_model(&refreshed, now)?;
+        }
+        normalized.push(refreshed);
+    }
+    Ok(normalized)
+}
+
+fn build_preload_catalog_model(
     index: usize,
     preload: PreloadModelConfig,
-    ort_engine: Arc<Mutex<OrtEmbedEngine>>,
     inline: &InlineConfig,
-    model_cache: &ModelCache,
-) -> Result<EmbeddingModel, ModuleError> {
+    jobs: &JobConfig,
+) -> Result<StoredModelConfig, ModuleError> {
     let model_id = preload
         .model_id
         .clone()
         .unwrap_or_else(|| format!("{}-{index}", preload.engine));
-    let engine_name = preload.engine.trim().to_ascii_lowercase();
+    let engine_name = canonical_engine_name(&preload.engine);
     let task = parse_model_task(preload.task.as_deref(), &engine_name, &model_id)?;
     let pooling = parse_pooling(preload.pooling.as_deref().unwrap_or("mean"))?;
     let normalize = preload.normalize.unwrap_or(true);
     let max_tokens = preload.max_tokens.unwrap_or(512);
-    let artifact_format = preload.format.clone().unwrap_or_else(|| {
-        if engine_name == "llama" {
-            "gguf".to_string()
-        } else {
-            "onnx".to_string()
-        }
-    });
-    let model_digest = match preload.artifact_digest.clone() {
+    let artifact_format = preload
+        .format
+        .clone()
+        .unwrap_or_else(|| default_artifact_format(&engine_name));
+    let artifact_digest = match preload.artifact_digest.clone() {
         Some(digest) => normalize_digest(&digest),
         None => format!("sha256:{}", sha256_file(&preload.model_path)?),
     };
-    let quant = preload.quant.clone().unwrap_or_else(|| {
-        if engine_name == "llama" {
-            "f16".to_string()
-        } else {
-            "fp32".to_string()
-        }
-    });
-    let tokenizer =
-        SanitizedTokenizer::from_file(&preload.tokenizer_path, TokenizerConfig { max_tokens })?;
-    let mut runtime_config = RuntimeConfig::default();
-    runtime_config.values.insert(
-        "model_path".to_string(),
-        preload.model_path.to_string_lossy().to_string(),
-    );
-    runtime_config.values.insert(
-        "artifact_path".to_string(),
-        preload.model_path.to_string_lossy().to_string(),
-    );
-    runtime_config
-        .values
-        .insert("pooling".to_string(), pooling.as_str().to_string());
-    runtime_config.values.insert(
-        "normalize".to_string(),
-        if normalize { "true" } else { "false" }.to_string(),
-    );
-    let artifact = ValidatedArtifact {
-        digest: model_digest.clone(),
-        format: artifact_format,
-    };
-    let _cache_read_lease = model_cache.acquire_read(&model_digest)?;
+    let tokenizer = SanitizedTokenizer::from_file(
+        &preload.tokenizer_path,
+        TokenizerConfig { max_tokens },
+    )?;
+    build_stored_model_config(
+        model_id,
+        &engine_name,
+        task,
+        artifact_digest,
+        artifact_format,
+        format!("sha256:{}", tokenizer.sanitized_sha256()),
+        ModelAssetLocator::LocalPath {
+            path: preload.model_path.clone(),
+        },
+        ModelAssetLocator::LocalPath {
+            path: preload.tokenizer_path.clone(),
+        },
+        local_file_url(&preload.model_path),
+        local_file_url(&preload.tokenizer_path),
+        pooling,
+        normalize,
+        max_tokens,
+        preload
+            .quant
+            .clone()
+            .unwrap_or_else(|| default_quant(&engine_name)),
+        false,
+        preload.worker_bin.clone(),
+        preload.worker_runtime_dir.clone(),
+        inline,
+        jobs,
+    )
+}
 
-    let (backend, engine_identity, loaded_model) = match engine_name.as_str() {
-        "ort" | "onnx" => {
-            let mut engine = ort_engine.lock().map_err(|_| {
-                ModuleError::Engine("ORT engine mutex was poisoned during preload".to_string())
-            })?;
-            let engine_identity = engine.identity();
-            let loaded_model = engine.load(&artifact, &runtime_config).map_err(|error| {
-                ModuleError::Engine(format!(
-                    "preload model '{model_id}' failed: {}",
-                    error.message
-                ))
-            })?;
-            (
-                EmbedBackend::Ort(Arc::clone(&ort_engine)),
-                engine_identity,
-                loaded_model,
-            )
-        }
-        "llama" | "llama.cpp" => {
-            preload_llama_backend(&model_id, preload, &artifact, &runtime_config)?
-        }
-        other => {
-            return Err(ModuleError::Config(format!(
-                "unsupported preload engine '{other}' for model '{model_id}'"
-            )))
-        }
-    };
+fn normalize_catalog_model(
+    model: StoredModelConfig,
+    inline: &InlineConfig,
+    jobs: &JobConfig,
+) -> Result<StoredModelConfig, ModuleError> {
+    let engine_name = canonical_engine_name(&model.engine);
+    let task = parse_model_task(Some(&model.task), &engine_name, &model.model_id)?;
+    let pooling = parse_pooling(&model.pooling)?;
+    build_stored_model_config(
+        model.model_id,
+        &engine_name,
+        task,
+        normalize_digest(&model.artifact_digest),
+        model.artifact_format,
+        normalize_digest(&model.tokenizer_sanitized_digest),
+        model.model_locator,
+        model.tokenizer_locator,
+        model.model_source_url,
+        model.tokenizer_source_url,
+        pooling,
+        model.normalize,
+        model.max_tokens,
+        model.quant,
+        model.pin,
+        model.worker_bin,
+        model.worker_runtime_dir,
+        inline,
+        jobs,
+    )
+}
 
+#[allow(clippy::too_many_arguments)]
+fn build_stored_model_config(
+    model_id: String,
+    engine_name: &str,
+    task: ModelTask,
+    artifact_digest: String,
+    artifact_format: String,
+    tokenizer_sanitized_digest: String,
+    model_locator: ModelAssetLocator,
+    tokenizer_locator: ModelAssetLocator,
+    model_source_url: String,
+    tokenizer_source_url: String,
+    pooling: WorkerPooling,
+    normalize: bool,
+    max_tokens: usize,
+    quant: String,
+    pin: bool,
+    worker_bin: Option<PathBuf>,
+    worker_runtime_dir: Option<PathBuf>,
+    inline: &InlineConfig,
+    jobs: &JobConfig,
+) -> Result<StoredModelConfig, ModuleError> {
+    let engine_identity = catalog_model_engine_identity(engine_name)?;
     let numeric_profile = NumericProfile {
-        model_digest,
+        model_digest: artifact_digest.clone(),
         quant,
         engine: engine_identity.clone(),
-        sanitized_tokenizer_digest: format!("sha256:{}", tokenizer.sanitized_sha256()),
+        sanitized_tokenizer_digest: tokenizer_sanitized_digest.clone(),
         pooling: profile_pooling(pooling),
         normalization: if normalize {
             NormalizationMode::L2
@@ -972,9 +1136,7 @@ fn preload_embedding_model(
         certified_shape: CertifiedShapeEnvelope {
             max_context_tokens: max_tokens.min(u32::MAX as usize) as u32,
             max_batch_tokens: inline.max_tokens.min(u32::MAX as u64) as u32,
-            max_micro_batch_tokens: SchedulerConfig::default()
-                .bulk_quantum_tokens
-                .min(u32::MAX as u64) as u32,
+            max_micro_batch_tokens: jobs.bulk_quantum_tokens.min(u32::MAX as u64) as u32,
             max_sequences: inline.max_items.min(u32::MAX as usize) as u32,
         },
         prompt_template: match task {
@@ -985,78 +1147,87 @@ fn preload_embedding_model(
         prefix_template: None,
         thread_policy: ThreadPolicyClass::Balanced,
     };
-    let numeric_profile_id = numeric_profile.numeric_profile_id();
-    let fingerprint = numeric_profile.fingerprint();
-    Ok(EmbeddingModel {
+    Ok(StoredModelConfig {
         model_id,
-        task,
-        loaded_model,
-        backend,
-        tokenizer,
-        numeric_profile_id,
-        fingerprint,
+        engine: engine_name.to_string(),
+        task: task.as_str().to_string(),
+        artifact_digest,
+        artifact_format,
+        tokenizer_sanitized_digest,
+        model_locator,
+        tokenizer_locator,
+        model_source_url,
+        tokenizer_source_url,
+        pooling: pooling.as_str().to_string(),
+        normalize,
+        max_tokens,
+        quant: numeric_profile.quant.clone(),
+        pin,
         engine_identity,
+        numeric_profile_id: numeric_profile.numeric_profile_id(),
+        fingerprint: numeric_profile.fingerprint(),
+        worker_bin,
+        worker_runtime_dir,
     })
+}
+
+fn canonical_engine_name(engine: &str) -> String {
+    match engine.trim().to_ascii_lowercase().as_str() {
+        "onnx" => "ort".to_string(),
+        "llama.cpp" => "llama".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn default_artifact_format(engine_name: &str) -> String {
+    if engine_name == "llama" {
+        "gguf".to_string()
+    } else {
+        "onnx".to_string()
+    }
+}
+
+fn default_quant(engine_name: &str) -> String {
+    if engine_name == "llama" {
+        "f16".to_string()
+    } else {
+        "fp32".to_string()
+    }
+}
+
+fn catalog_model_engine_identity(engine_name: &str) -> Result<EngineIdentity, ModuleError> {
+    match engine_name {
+        "ort" => Ok(OrtEmbedEngine::new().identity()),
+        "llama" => Ok(llama_engine_identity()),
+        other => Err(ModuleError::Config(format!(
+            "unsupported engine '{other}' for catalog model"
+        ))),
+    }
+}
+
+fn local_file_url(path: &Path) -> String {
+    format!("file://{}", path.to_string_lossy())
 }
 
 #[cfg(unix)]
-fn preload_llama_backend(
-    model_id: &str,
-    preload: PreloadModelConfig,
-    artifact: &ValidatedArtifact,
-    runtime_config: &RuntimeConfig,
-) -> Result<(EmbedBackend, EngineIdentity, LoadedModel), ModuleError> {
-    use worker_host::{WorkerEngine, WorkerHostConfig};
-
-    let worker_bin = preload.worker_bin.ok_or_else(|| {
-        ModuleError::Config(format!(
-            "llama preload for model '{model_id}' requires worker_bin"
-        ))
-    })?;
-    let runtime_dir = preload
-        .worker_runtime_dir
-        .unwrap_or_else(|| env::temp_dir().join("synapse-workers"));
-    let mut config = WorkerHostConfig::new(worker_bin, runtime_dir);
-    config.worker_id = format!("synapse-{model_id}");
-    config.pooling = parse_pooling(preload.pooling.as_deref().unwrap_or("mean"))?;
-    config.normalize = preload.normalize.unwrap_or(true);
-    let artifact = artifact.clone();
-    let runtime_config = runtime_config.clone();
-    let model_id_for_error = model_id.to_string();
-    std::thread::spawn(move || {
-        let mut engine = WorkerEngine::new(config).map_err(|error| {
-            ModuleError::Engine(format!(
-                "create llama worker engine for '{model_id_for_error}': {error}"
-            ))
-        })?;
-        let engine_identity = EmbedEngine::identity(&engine);
-        let loaded_model =
-            EmbedEngine::load(&mut engine, &artifact, &runtime_config).map_err(|error| {
-                ModuleError::Engine(format!(
-                    "preload llama model '{model_id_for_error}' failed: {}",
-                    error.message
-                ))
-            })?;
-        Ok((
-            EmbedBackend::Llama(Arc::new(Mutex::new(engine))),
-            engine_identity,
-            loaded_model,
-        ))
-    })
-    .join()
-    .map_err(|_| ModuleError::Engine(format!("llama preload thread for '{model_id}' panicked")))?
+fn llama_engine_identity() -> EngineIdentity {
+    let mut build_flags = BTreeMap::new();
+    build_flags.insert("risk_class".to_string(), "abort_capable".to_string());
+    build_flags.insert("transport".to_string(), "unix-socket-worker".to_string());
+    EngineIdentity {
+        engine: "llama.cpp-worker".to_string(),
+        version: "protocol-v1".to_string(),
+        build_flags,
+    }
 }
 
 #[cfg(not(unix))]
-fn preload_llama_backend(
-    model_id: &str,
-    _preload: PreloadModelConfig,
-    _artifact: &ValidatedArtifact,
-    _runtime_config: &RuntimeConfig,
-) -> Result<(EmbedBackend, EngineIdentity, LoadedModel), ModuleError> {
-    Err(ModuleError::Config(format!(
-        "llama worker preload for model '{model_id}' is only available on unix"
-    )))
+fn llama_engine_identity() -> EngineIdentity {
+    EngineIdentity {
+        engine: "llama.cpp-worker".to_string(),
+        version: "protocol-v1".to_string(),
+        build_flags: BTreeMap::new(),
+    }
 }
 
 #[async_trait]
@@ -1132,13 +1303,8 @@ async fn dispatch_request(state: Arc<ModuleState>, request: MethodEnvelope) -> H
         "embed.result" => embed_result(state, request.params).await,
         "rerank.score" => rerank_score(state, request.params).await,
         "microllm.oneshot" => microllm_oneshot(state, request.params).await,
-        "model.load" => result_outcome(error_payload(
-            &state,
-            WireOperationError::from_stable(
-                StableError::probe_required(),
-                "model.load is disabled for v1-dev; configure startup preloads instead",
-            ),
-        )),
+        "model.load" => model_load(state, request.params).await,
+        "model.unload" => model_unload(state, request.params).await,
         "cache.pin" => cache_pin(state, request.params).await,
         "cache.gc" => cache_gc(state, request.params).await,
         "probe.start" => probe_start(state, request.params).await,
@@ -1147,12 +1313,1103 @@ async fn dispatch_request(state: Arc<ModuleState>, request: MethodEnvelope) -> H
         "alias.retract" => alias_retract(state, request.params).await,
         "alias.declare" => alias_declare(state, request.params).await,
         "admission.status" => admission_status(state).await,
-        "model.status" => result_outcome(models_status_payload(&state)),
+        "model.status" => model_status(state, request.params).await,
         other => channel_error(
             "unknown_method",
             format!("unknown method '{other}' for synapse management surface"),
         ),
     }
+}
+
+#[derive(Clone)]
+struct ResolvedModelLoadSources {
+    model_source_url: String,
+    tokenizer_source_url: String,
+}
+
+fn model_runtime_state_name(state: &ModelRuntimeState) -> &'static str {
+    match state {
+        ModelRuntimeState::Unloaded => "unloaded",
+        ModelRuntimeState::Resolving => "resolving",
+        ModelRuntimeState::Downloading { .. } => "downloading",
+        ModelRuntimeState::Validating => "validating",
+        ModelRuntimeState::Loading => "loading",
+        ModelRuntimeState::Ready => "ready",
+        ModelRuntimeState::Failed(_) => "failed",
+    }
+}
+
+fn model_slot_snapshot(runtime: &RuntimeState, model_id: &str) -> Option<ModelSlotSnapshot> {
+    runtime.catalog.lock().ok()?.get(model_id).map(|slot| ModelSlotSnapshot {
+        spec: slot.spec.clone(),
+        loaded: slot.loaded.clone(),
+        state: slot.state.clone(),
+        notify: Arc::clone(&slot.notify),
+    })
+}
+
+fn set_model_slot_state(runtime: &RuntimeState, model_id: &str, state: ModelRuntimeState) {
+    if let Ok(mut catalog) = runtime.catalog.lock() {
+        if let Some(slot) = catalog.get_mut(model_id) {
+            let clear_loaded = !matches!(state, ModelRuntimeState::Ready);
+            slot.state = state;
+            if clear_loaded {
+                slot.loaded = None;
+            }
+            slot.notify.notify_waiters();
+        }
+    }
+}
+
+fn set_model_slot_ready(runtime: &RuntimeState, model_id: &str, model: Arc<EmbeddingModel>) {
+    if let Ok(mut catalog) = runtime.catalog.lock() {
+        if let Some(slot) = catalog.get_mut(model_id) {
+            slot.loaded = Some(model);
+            slot.state = ModelRuntimeState::Ready;
+            slot.notify.notify_waiters();
+        }
+    }
+}
+
+fn set_job_progress(runtime: &RuntimeState, job_id: &str, state: ModelRuntimeState) {
+    if let Ok(mut progress) = runtime.job_progress.lock() {
+        progress.insert(job_id.to_string(), state);
+    }
+}
+
+fn clear_job_progress(runtime: &RuntimeState, job_id: &str) {
+    if let Ok(mut progress) = runtime.job_progress.lock() {
+        progress.remove(job_id);
+    }
+}
+
+fn job_progress_state(runtime: &RuntimeState, job_id: &str) -> Option<ModelRuntimeState> {
+    runtime
+        .job_progress
+        .lock()
+        .ok()
+        .and_then(|progress| progress.get(job_id).cloned())
+}
+
+fn register_runtime_catalog_model(
+    runtime: &RuntimeState,
+    spec: StoredModelConfig,
+) -> Result<(), WireOperationError> {
+    let mut catalog = runtime.catalog.lock().map_err(|_| {
+        WireOperationError::from_stable(
+            StableError::model_loading(Some(100)),
+            "model catalog state is unavailable",
+        )
+    })?;
+    match catalog.get_mut(&spec.model_id) {
+        Some(slot) if slot.spec.fingerprint != spec.fingerprint => Err(
+            WireOperationError::from_stable(
+                StableError::artifact_invalid(),
+                format!(
+                    "model_id '{}' already refers to fingerprint {}",
+                    spec.model_id, slot.spec.fingerprint.0
+                ),
+            ),
+        ),
+        Some(slot) => {
+            slot.spec = spec;
+            if slot.loaded.is_none() {
+                slot.state = ModelRuntimeState::Unloaded;
+            }
+            slot.notify.notify_waiters();
+            Ok(())
+        }
+        None => {
+            catalog.insert(
+                spec.model_id.clone(),
+                ModelSlot {
+                    spec,
+                    loaded: None,
+                    state: ModelRuntimeState::Unloaded,
+                    notify: Arc::new(Notify::new()),
+                },
+            );
+            Ok(())
+        }
+    }
+}
+
+fn model_status_payload(module_generation: u64, slot: &ModelSlotSnapshot) -> Value {
+    let mut payload = json!({
+        "module_generation": module_generation,
+        "model_id": slot.spec.model_id,
+        "fingerprint": slot.spec.fingerprint,
+        "state": model_runtime_state_name(&slot.state),
+        "engine": slot.spec.engine,
+        "task": slot.spec.task,
+    });
+    if let Value::Object(map) = &mut payload {
+        match &slot.state {
+            ModelRuntimeState::Downloading {
+                bytes_done,
+                bytes_total,
+            } => {
+                map.insert("bytes_done".to_string(), Value::from(*bytes_done));
+                if let Some(bytes_total) = bytes_total {
+                    map.insert("bytes_total".to_string(), Value::from(*bytes_total));
+                }
+            }
+            ModelRuntimeState::Failed(error) => {
+                map.insert(
+                    "error".to_string(),
+                    serde_json::to_value(error).expect("model error serializes"),
+                );
+            }
+            _ => {}
+        }
+    }
+    payload
+}
+
+fn model_load_job_status_payload(state: &ModuleState, record: &JobRecord) -> Value {
+    let mut payload = json!({
+        "module_generation": state.module_generation,
+        "job_id": record.job_id,
+        "request_key": record.request_key,
+    });
+    if let Value::Object(map) = &mut payload {
+        if record.state == JOB_STATE_DONE {
+            map.insert("state".to_string(), Value::from("ready"));
+            if let Some(Value::Object(result)) = record.result_json.clone() {
+                for (key, value) in result {
+                    map.insert(key, value);
+                }
+            }
+            return payload;
+        }
+        if record.state == JOB_STATE_FAILED_TRANSIENT || record.state == JOB_STATE_FAILED_PERMANENT {
+            map.insert("state".to_string(), Value::from("failed"));
+            map.insert(
+                "error".to_string(),
+                record.error_json.clone().unwrap_or_else(|| {
+                    serde_json::to_value(WireOperationError::from_stable(
+                        StableError::model_loading(Some(100)),
+                        "model load failed without a stored typed error",
+                    ))
+                    .expect("fallback model load error serializes")
+                }),
+            );
+            return payload;
+        }
+        match job_progress_state(&state.runtime, &record.job_id) {
+            Some(ModelRuntimeState::Downloading {
+                bytes_done,
+                bytes_total,
+            }) => {
+                map.insert("state".to_string(), Value::from("downloading"));
+                map.insert("bytes_done".to_string(), Value::from(bytes_done));
+                if let Some(bytes_total) = bytes_total {
+                    map.insert("bytes_total".to_string(), Value::from(bytes_total));
+                }
+            }
+            Some(ModelRuntimeState::Resolving) => {
+                map.insert("state".to_string(), Value::from("resolving"));
+            }
+            Some(ModelRuntimeState::Validating) => {
+                map.insert("state".to_string(), Value::from("validating"));
+            }
+            Some(ModelRuntimeState::Loading | ModelRuntimeState::Ready) => {
+                map.insert("state".to_string(), Value::from("loading"));
+            }
+            Some(ModelRuntimeState::Unloaded | ModelRuntimeState::Failed(_)) | None => {
+                map.insert(
+                    "state".to_string(),
+                    Value::from(if record.state == JOB_STATE_QUEUED {
+                        "resolving"
+                    } else {
+                        "loading"
+                    }),
+                );
+            }
+        }
+    }
+    payload
+}
+
+async fn model_load(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
+    let params: ModelLoadParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(error) => {
+            return channel_error(
+                "invalid_request",
+                format!("invalid model.load params: {error}"),
+            )
+        }
+    };
+    if let Err(message) = validate_model_load_request(&params) {
+        return channel_error("invalid_request", message);
+    }
+    let now = now_ms();
+    let request_key = params
+        .request_key
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| format!("model-load:{}:{now}", state.module_generation));
+    let params_json = match serde_json::to_value(&params) {
+        Ok(value) => value,
+        Err(error) => return channel_error("invalid_request", error.to_string()),
+    };
+    let admission = match state.store.admit_job(
+        &request_key,
+        "model.load",
+        state.module_generation,
+        &params_json,
+        now,
+        state.runtime.jobs.ttl_ms,
+    ) {
+        Ok(admission) => admission,
+        Err(error) => return channel_error("store_failure", error.to_string()),
+    };
+    let record = admission.record().clone();
+    if matches!(admission, JobAdmission::Admitted(_)) {
+        let task_state = Arc::clone(&state);
+        let task_job_id = record.job_id.clone();
+        let task_params = params.clone();
+        set_job_progress(&state.runtime, &task_job_id, ModelRuntimeState::Resolving);
+        tokio::spawn(async move {
+            execute_model_load_job(task_state, task_job_id, task_params).await;
+        });
+    }
+    result_outcome(model_load_job_status_payload(&state, &record))
+}
+
+async fn model_status(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
+    let params: ModelStatusParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(error) => {
+            return channel_error(
+                "invalid_request",
+                format!("invalid model.status params: {error}"),
+            )
+        }
+    };
+    match (params.job_id, params.model_id) {
+        (Some(job_id), None) => match state.store.get_job(&job_id) {
+            Ok(Some(record)) if record.kind == "model.load" => {
+                result_outcome(model_load_job_status_payload(&state, &record))
+            }
+            Ok(Some(_)) => channel_error("invalid_request", "job_id does not refer to a model.load job"),
+            Ok(None) => channel_error("invalid_request", "unknown or expired job_id"),
+            Err(error) => channel_error("store_failure", error.to_string()),
+        },
+        (None, Some(model_id)) => match model_slot_snapshot(&state.runtime, &model_id) {
+            Some(slot) => result_outcome(model_status_payload(state.module_generation, &slot)),
+            None => channel_error("invalid_request", "unknown model_id"),
+        },
+        _ => channel_error(
+            "invalid_request",
+            "model.status requires exactly one of job_id or model_id",
+        ),
+    }
+}
+
+async fn model_unload(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
+    let params: ModelUnloadParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(error) => {
+            return channel_error(
+                "invalid_request",
+                format!("invalid model.unload params: {error}"),
+            )
+        }
+    };
+    let Some(snapshot) = model_slot_snapshot(&state.runtime, &params.model_id) else {
+        return channel_error("invalid_request", "unknown model_id");
+    };
+    if matches!(
+        snapshot.state,
+        ModelRuntimeState::Resolving
+            | ModelRuntimeState::Downloading { .. }
+            | ModelRuntimeState::Validating
+            | ModelRuntimeState::Loading
+    ) {
+        return result_outcome(error_payload(
+            &state,
+            WireOperationError::from_stable(
+                StableError::model_loading(Some(250)),
+                format!("model '{}' is still loading", params.model_id),
+            ),
+        ));
+    }
+    if let Some(loaded) = snapshot.loaded {
+        let unload = tokio::task::spawn_blocking(move || unload_embedding_model_blocking(loaded))
+            .await
+            .map_err(|error| {
+                WireOperationError::from_stable(
+                    StableError::engine_crashed(Some(100)),
+                    format!("model unload join failed: {error}"),
+                )
+            });
+        match unload {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) | Err(error) => {
+                return result_outcome(error_payload(&state, error));
+            }
+        }
+    }
+    set_model_slot_state(&state.runtime, &params.model_id, ModelRuntimeState::Unloaded);
+    let slot = model_slot_snapshot(&state.runtime, &params.model_id).expect("unloaded model remains registered");
+    result_outcome(model_status_payload(state.module_generation, &slot))
+}
+
+async fn resolve_model_for_request(
+    state: Arc<ModuleState>,
+    requested: Option<&str>,
+) -> Result<Arc<EmbeddingModel>, WireOperationError> {
+    let Some(default_model_id) = state.runtime.default_model_id() else {
+        return Err(WireOperationError::from_stable(
+            StableError::probe_required(),
+            "synapse requests require a registered model",
+        ));
+    };
+    let model_id = requested
+        .map(str::to_string)
+        .unwrap_or(default_model_id);
+    let Some(snapshot) = model_slot_snapshot(&state.runtime, &model_id) else {
+        return Err(WireOperationError::from_stable(
+            StableError::model_loading(Some(250)),
+            format!("model '{model_id}' is not registered"),
+        ));
+    };
+    match (&snapshot.state, snapshot.loaded) {
+        (ModelRuntimeState::Ready, Some(model)) => Ok(model),
+        (ModelRuntimeState::Failed(error), _) if error.class == ErrorClass::Permanent => {
+            Err(error.clone())
+        }
+        (
+            ModelRuntimeState::Resolving
+            | ModelRuntimeState::Downloading { .. }
+            | ModelRuntimeState::Validating
+            | ModelRuntimeState::Loading,
+            _,
+        ) => Err(WireOperationError::from_stable(
+            StableError::model_loading(Some(250)),
+            format!("model '{model_id}' is loading"),
+        )),
+        _ => {
+            begin_background_catalog_load(Arc::clone(&state), model_id.clone());
+            Err(WireOperationError::from_stable(
+                StableError::model_loading(Some(250)),
+                format!("model '{model_id}' is loading"),
+            ))
+        }
+    }
+}
+
+fn begin_background_catalog_load(state: Arc<ModuleState>, model_id: String) {
+    let should_spawn = {
+        let Ok(mut catalog) = state.runtime.catalog.lock() else {
+            return;
+        };
+        let Some(slot) = catalog.get_mut(&model_id) else {
+            return;
+        };
+        if slot.loaded.is_some()
+            || matches!(
+                slot.state,
+                ModelRuntimeState::Resolving
+                    | ModelRuntimeState::Downloading { .. }
+                    | ModelRuntimeState::Validating
+                    | ModelRuntimeState::Loading
+                    | ModelRuntimeState::Ready
+            )
+        {
+            false
+        } else {
+            slot.state = ModelRuntimeState::Loading;
+            slot.notify.notify_waiters();
+            true
+        }
+    };
+    if should_spawn {
+        tokio::spawn(async move {
+            let _ = load_catalog_model_task(state, model_id).await;
+        });
+    }
+}
+
+async fn ensure_model_loaded_for_control(
+    state: Arc<ModuleState>,
+    model_id: &str,
+) -> Result<Arc<EmbeddingModel>, WireOperationError> {
+    loop {
+        let Some(snapshot) = model_slot_snapshot(&state.runtime, model_id) else {
+            return Err(WireOperationError::from_stable(
+                StableError::artifact_invalid(),
+                format!("unknown model_id '{model_id}'"),
+            ));
+        };
+        match (&snapshot.state, snapshot.loaded.clone()) {
+            (ModelRuntimeState::Ready, Some(model)) => return Ok(model),
+            (ModelRuntimeState::Failed(error), _) => return Err(error.clone()),
+            (
+                ModelRuntimeState::Resolving
+                | ModelRuntimeState::Downloading { .. }
+                | ModelRuntimeState::Validating
+                | ModelRuntimeState::Loading,
+                _,
+            ) => snapshot.notify.notified().await,
+            _ => {
+                begin_background_catalog_load(Arc::clone(&state), model_id.to_string());
+                snapshot.notify.notified().await;
+            }
+        }
+    }
+}
+
+async fn load_catalog_model_task(
+    state: Arc<ModuleState>,
+    model_id: String,
+) -> Result<Arc<EmbeddingModel>, WireOperationError> {
+    let _permit = state
+        .runtime
+        .control_loads
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| {
+            WireOperationError::from_stable(
+                StableError::model_loading(Some(100)),
+                "control load queue is closed",
+            )
+        })?;
+    set_model_slot_state(&state.runtime, &model_id, ModelRuntimeState::Loading);
+    let Some(snapshot) = model_slot_snapshot(&state.runtime, &model_id) else {
+        return Err(WireOperationError::from_stable(
+            StableError::artifact_invalid(),
+            format!("unknown model_id '{model_id}'"),
+        ));
+    };
+    let spec = snapshot.spec.clone();
+    let ort_engine = Arc::clone(&state.runtime.ort_engine);
+    let model_cache = Arc::clone(&state.model_cache);
+    let loaded = tokio::task::spawn_blocking(move || {
+        load_catalog_model_blocking(spec, ort_engine, model_cache)
+    })
+    .await
+    .map_err(|error| {
+        WireOperationError::from_stable(
+            StableError::engine_crashed(Some(100)),
+            format!("model load join failed: {error}"),
+        )
+    })?;
+    match loaded {
+        Ok(model) => {
+            let model = Arc::new(model);
+            set_model_slot_ready(&state.runtime, &model_id, Arc::clone(&model));
+            Ok(model)
+        }
+        Err(error) => {
+            set_model_slot_state(&state.runtime, &model_id, ModelRuntimeState::Failed(error.clone()));
+            Err(error)
+        }
+    }
+}
+
+fn load_catalog_model_blocking(
+    spec: StoredModelConfig,
+    ort_engine: Arc<Mutex<OrtEmbedEngine>>,
+    model_cache: Arc<ModelCache>,
+) -> Result<EmbeddingModel, WireOperationError> {
+    let task = parse_model_task(Some(&spec.task), &spec.engine, &spec.model_id)
+        .map_err(|error| artifact_invalid_error(error.to_string()))?;
+    let model_path = locator_path(&spec.model_locator, &model_cache)?;
+    let tokenizer_path = locator_path(&spec.tokenizer_locator, &model_cache)?;
+    let tokenizer = SanitizedTokenizer::from_file(
+        &tokenizer_path.path,
+        TokenizerConfig {
+            max_tokens: spec.max_tokens,
+        },
+    )
+    .map_err(|error| artifact_invalid_error(error.to_string()))?;
+    let actual_tokenizer_digest = format!("sha256:{}", tokenizer.sanitized_sha256());
+    if actual_tokenizer_digest != normalize_digest(&spec.tokenizer_sanitized_digest) {
+        return Err(artifact_invalid_error(format!(
+            "tokenizer digest mismatch for '{}': expected {}, got {}",
+            spec.model_id, spec.tokenizer_sanitized_digest, actual_tokenizer_digest
+        )));
+    }
+    let runtime_config = model_runtime_config(&spec, &model_path.path);
+    let artifact = ValidatedArtifact {
+        digest: spec.artifact_digest.clone(),
+        format: spec.artifact_format.clone(),
+    };
+    let (backend, loaded_model) = match spec.engine.as_str() {
+        "ort" => {
+            let mut engine = ort_engine.lock().map_err(|_| {
+                WireOperationError::from_stable(
+                    StableError::engine_crashed(Some(100)),
+                    "ORT engine mutex was poisoned during model load",
+                )
+            })?;
+            let loaded_model = engine.load(&artifact, &runtime_config).map_err(engine_error_to_wire)?;
+            (EmbedBackend::Ort(Arc::clone(&ort_engine)), loaded_model)
+        }
+        "llama" => load_llama_backend_blocking(&spec, &artifact, &runtime_config)?,
+        other => {
+            return Err(artifact_invalid_error(format!(
+                "unsupported engine '{other}' for model '{}'",
+                spec.model_id
+            )))
+        }
+    };
+    Ok(EmbeddingModel {
+        model_id: spec.model_id.clone(),
+        task,
+        loaded_model,
+        backend,
+        tokenizer,
+        numeric_profile_id: spec.numeric_profile_id.clone(),
+        fingerprint: spec.fingerprint.clone(),
+        engine_identity: spec.engine_identity.clone(),
+    })
+}
+
+#[cfg(unix)]
+fn load_llama_backend_blocking(
+    spec: &StoredModelConfig,
+    artifact: &ValidatedArtifact,
+    runtime_config: &RuntimeConfig,
+) -> Result<(EmbedBackend, LoadedModel), WireOperationError> {
+    use worker_host::{WorkerEngine, WorkerHostConfig};
+
+    let worker_bin = spec
+        .worker_bin
+        .clone()
+        .or_else(|| env::var_os("SYNAPSE_LLAMA_WORKER_BIN").map(PathBuf::from))
+        .ok_or_else(|| {
+            artifact_invalid_error(format!(
+                "llama model '{}' requires worker_bin or SYNAPSE_LLAMA_WORKER_BIN",
+                spec.model_id
+            ))
+        })?;
+    let runtime_dir = spec
+        .worker_runtime_dir
+        .clone()
+        .or_else(|| env::var_os("SYNAPSE_LLAMA_WORKER_RUNTIME_DIR").map(PathBuf::from))
+        .unwrap_or_else(|| env::temp_dir().join("synapse-workers"));
+    let mut config = WorkerHostConfig::new(worker_bin, runtime_dir);
+    config.worker_id = format!("synapse-{}", spec.model_id);
+    config.pooling =
+        parse_pooling(&spec.pooling).map_err(|error| artifact_invalid_error(error.to_string()))?;
+    config.normalize = spec.normalize;
+    let mut engine = WorkerEngine::new(config).map_err(|error| {
+        WireOperationError::from_stable(
+            StableError::engine_crashed(Some(100)),
+            format!("create llama worker engine for '{}': {error}", spec.model_id),
+        )
+    })?;
+    let loaded_model = EmbedEngine::load(&mut engine, artifact, runtime_config).map_err(engine_error_to_wire)?;
+    Ok((EmbedBackend::Llama(Arc::new(Mutex::new(engine))), loaded_model))
+}
+
+#[cfg(not(unix))]
+fn load_llama_backend_blocking(
+    spec: &StoredModelConfig,
+    _artifact: &ValidatedArtifact,
+    _runtime_config: &RuntimeConfig,
+) -> Result<(EmbedBackend, LoadedModel), WireOperationError> {
+    Err(artifact_invalid_error(format!(
+        "llama model '{}' is only supported on unix",
+        spec.model_id
+    )))
+}
+
+fn unload_embedding_model_blocking(model: Arc<EmbeddingModel>) -> Result<(), WireOperationError> {
+    match &model.backend {
+        EmbedBackend::Ort(engine) => {
+            let mut engine = engine.lock().map_err(|_| {
+                WireOperationError::from_stable(
+                    StableError::engine_crashed(Some(100)),
+                    "ORT engine mutex was poisoned during model unload",
+                )
+            })?;
+            engine.unload(&model.loaded_model);
+            Ok(())
+        }
+        #[cfg(unix)]
+        EmbedBackend::Llama(engine) => {
+            let mut engine = engine.lock().map_err(|_| {
+                WireOperationError::from_stable(
+                    StableError::engine_crashed(Some(100)),
+                    "llama worker engine mutex was poisoned during model unload",
+                )
+            })?;
+            EmbedEngine::unload(&mut *engine, &model.loaded_model);
+            Ok(())
+        }
+    }
+}
+
+fn model_runtime_config(spec: &StoredModelConfig, model_path: &Path) -> RuntimeConfig {
+    let mut runtime_config = RuntimeConfig::default();
+    runtime_config.values.insert(
+        "model_path".to_string(),
+        model_path.to_string_lossy().to_string(),
+    );
+    runtime_config.values.insert(
+        "artifact_path".to_string(),
+        model_path.to_string_lossy().to_string(),
+    );
+    runtime_config
+        .values
+        .insert("pooling".to_string(), spec.pooling.clone());
+    runtime_config.values.insert(
+        "normalize".to_string(),
+        if spec.normalize { "true" } else { "false" }.to_string(),
+    );
+    runtime_config
+}
+
+struct LocatedAsset {
+    path: PathBuf,
+    _guard: Option<synapse_core::ModelCacheReadGuard>,
+}
+
+fn locator_path(
+    locator: &ModelAssetLocator,
+    model_cache: &ModelCache,
+) -> Result<LocatedAsset, WireOperationError> {
+    match locator {
+        ModelAssetLocator::LocalPath { path } => Ok(LocatedAsset {
+            path: path.clone(),
+            _guard: None,
+        }),
+        ModelAssetLocator::CacheDigest { digest } => {
+            let guard = model_cache.acquire_read(digest).map_err(model_cache_load_error)?;
+            Ok(LocatedAsset {
+                path: guard.blob_path().to_path_buf(),
+                _guard: Some(guard),
+            })
+        }
+    }
+}
+
+fn artifact_invalid_error(message: impl Into<String>) -> WireOperationError {
+    WireOperationError::from_stable(StableError::artifact_invalid(), message)
+}
+
+fn transient_model_load_error(message: impl Into<String>) -> WireOperationError {
+    WireOperationError::from_stable(StableError::model_loading(Some(1_000)), message)
+}
+
+fn model_cache_load_error(error: ModelCacheError) -> WireOperationError {
+    match error {
+        ModelCacheError::ArtifactInvalid(message)
+        | ModelCacheError::InvalidSource(message) => artifact_invalid_error(message),
+        ModelCacheError::Tokenizer(error) => artifact_invalid_error(error.to_string()),
+        ModelCacheError::NotFound(digest) => transient_model_load_error(format!(
+            "cache artifact {digest} is missing; re-submit model.load to reacquire it"
+        )),
+        ModelCacheError::Io { action, path, source } => {
+            io_to_load_error(action, Path::new(&path), &source)
+        }
+        ModelCacheError::Download { url, message } => {
+            transient_model_load_error(format!("download {url}: {message}"))
+        }
+        ModelCacheError::Json(error) => transient_model_load_error(error.to_string()),
+        ModelCacheError::Lease(error) => transient_model_load_error(error.to_string()),
+    }
+}
+
+fn io_to_load_error(action: &str, path: &Path, source: &std::io::Error) -> WireOperationError {
+    if source.raw_os_error() == Some(28) {
+        return transient_model_load_error(format!(
+            "disk is full while {action} {}: {source}",
+            path.display()
+        ));
+    }
+    transient_model_load_error(format!("{action} {}: {source}", path.display()))
+}
+
+async fn execute_model_load_job(state: Arc<ModuleState>, job_id: String, params: ModelLoadParams) {
+    if !matches!(
+        state
+            .store
+            .mark_job_running(&job_id, state.module_generation, now_ms()),
+        Ok(true)
+    ) {
+        clear_job_progress(&state.runtime, &job_id);
+        return;
+    }
+
+    let result = async {
+        let sources = resolve_model_load_sources(&params).map_err(artifact_invalid_error)?;
+        let temp_dir = env::temp_dir().join(format!(
+            "synapse-model-load-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::create_dir_all(&temp_dir).map_err(|error| io_to_load_error("create temp directory", &temp_dir, &error))?;
+        let model_path = temp_dir.join("model.bin");
+        let tokenizer_path = temp_dir.join("tokenizer.json");
+
+        set_job_progress(&state.runtime, &job_id, ModelRuntimeState::Downloading { bytes_done: 0, bytes_total: None });
+        download_source_to_temp(
+            &sources.model_source_url,
+            &model_path,
+            |bytes_done, bytes_total| {
+                set_job_progress(
+                    &state.runtime,
+                    &job_id,
+                    ModelRuntimeState::Downloading { bytes_done, bytes_total },
+                );
+            },
+        )?;
+        download_source_to_temp(
+            &sources.tokenizer_source_url,
+            &tokenizer_path,
+            |_, _| {},
+        )?;
+
+        set_job_progress(&state.runtime, &job_id, ModelRuntimeState::Validating);
+        let engine_name = canonical_engine_name(&params.engine);
+        validate_artifact_file(&model_path, &engine_name)?;
+
+        let pin_module_id = params.pin.then(|| state.module_id.clone());
+        let tokenizer_meta = state
+            .model_cache
+            .ingest(ModelCacheIngest {
+                source_url: local_file_url(&tokenizer_path),
+                expected_digest: None,
+                format: "tokenizer_json".to_string(),
+                tokenizer_path: None,
+                pin_module_id: pin_module_id.clone(),
+            })
+            .map_err(model_cache_load_error)?;
+        let model_meta = state
+            .model_cache
+            .ingest(ModelCacheIngest {
+                source_url: local_file_url(&model_path),
+                expected_digest: params.expected_digest.clone(),
+                format: default_artifact_format(&engine_name),
+                tokenizer_path: Some(tokenizer_path.clone()),
+                pin_module_id,
+            })
+            .map_err(model_cache_load_error)?;
+        let spec = build_loaded_catalog_model(
+            &params,
+            &engine_name,
+            &sources,
+            &model_meta,
+            &tokenizer_meta,
+            &state.runtime.inline,
+            &state.runtime.jobs,
+        )?;
+        register_runtime_catalog_model(&state.runtime, spec.clone())?;
+        state.store.upsert_model(&spec, now_ms()).map_err(|error| {
+            transient_model_load_error(format!("persist catalog entry for '{}': {error}", spec.model_id))
+        })?;
+        set_job_progress(&state.runtime, &job_id, ModelRuntimeState::Loading);
+        let loaded = ensure_model_loaded_for_control(Arc::clone(&state), &spec.model_id).await?;
+        let result = json!({
+            "model_id": loaded.model_id,
+            "fingerprint": loaded.fingerprint,
+        });
+        let _ = fs::remove_dir_all(&temp_dir);
+        Ok::<_, WireOperationError>(result)
+    }
+    .await;
+
+    clear_job_progress(&state.runtime, &job_id);
+    match result {
+        Ok(result) => {
+            if let Err(error) = state.store.complete_job(&job_id, &result, &[], now_ms()) {
+                fail_job_with_wire_error(
+                    &state,
+                    &job_id,
+                    true,
+                    transient_model_load_error(format!("complete model.load job: {error}")),
+                );
+            }
+        }
+        Err(error) => {
+            fail_job_with_wire_error(
+                &state,
+                &job_id,
+                error.class == ErrorClass::Transient,
+                error,
+            );
+        }
+    }
+}
+
+fn validate_model_load_request(params: &ModelLoadParams) -> Result<(), String> {
+    if params.files.model.trim().is_empty() || params.files.tokenizer.trim().is_empty() {
+        return Err("model.load requires files.model and files.tokenizer".to_string());
+    }
+    resolve_model_load_sources(params).map(|_| ())
+}
+
+fn resolve_model_load_sources(params: &ModelLoadParams) -> Result<ResolvedModelLoadSources, String> {
+    match params.source.trim().to_ascii_lowercase().as_str() {
+        "hf" => {
+            let repo = params
+                .repo
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| "model.load source=hf requires repo".to_string())?;
+            Ok(ResolvedModelLoadSources {
+                model_source_url: huggingface_resolve_url(repo, &params.files.model)?,
+                tokenizer_source_url: huggingface_resolve_url(repo, &params.files.tokenizer)?,
+            })
+        }
+        "url" => {
+            let base = params
+                .url
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| "model.load source=url requires url".to_string())?;
+            Ok(ResolvedModelLoadSources {
+                model_source_url: join_base_url(base, &params.files.model)?,
+                tokenizer_source_url: join_base_url(base, &params.files.tokenizer)?,
+            })
+        }
+        "file" => {
+            let base = params
+                .path
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| "model.load source=file requires path".to_string())?;
+            Ok(ResolvedModelLoadSources {
+                model_source_url: join_file_source(base, &params.files.model)?,
+                tokenizer_source_url: join_file_source(base, &params.files.tokenizer)?,
+            })
+        }
+        other => Err(format!("unsupported model.load source '{other}'")),
+    }
+}
+
+fn huggingface_resolve_url(repo: &str, file: &str) -> Result<String, String> {
+    let mut url = Url::parse("https://huggingface.co/")
+        .map_err(|error| format!("build Hugging Face base URL: {error}"))?;
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|_| "build Hugging Face path segments".to_string())?;
+        for segment in repo.split('/') {
+            if !segment.is_empty() {
+                segments.push(segment);
+            }
+        }
+        segments.push("resolve");
+        segments.push("main");
+        for segment in file.split('/') {
+            if !segment.is_empty() {
+                segments.push(segment);
+            }
+        }
+    }
+    Ok(url.to_string())
+}
+
+fn join_base_url(base: &str, file: &str) -> Result<String, String> {
+    let mut url = Url::parse(base).map_err(|error| format!("invalid url base '{base}': {error}"))?;
+    let had_trailing_slash = base.ends_with('/');
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|_| format!("url '{base}' cannot accept path segments"))?;
+        if !had_trailing_slash {
+            segments.pop_if_empty();
+        }
+        for segment in file.split('/') {
+            if !segment.is_empty() {
+                segments.push(segment);
+            }
+        }
+    }
+    Ok(url.to_string())
+}
+
+fn join_file_source(base: &str, file: &str) -> Result<String, String> {
+    let base_path = if let Some(path) = base.strip_prefix("file://") {
+        PathBuf::from(path)
+    } else {
+        PathBuf::from(base)
+    };
+    Ok(local_file_url(&base_path.join(file)))
+}
+
+fn build_loaded_catalog_model(
+    params: &ModelLoadParams,
+    engine_name: &str,
+    sources: &ResolvedModelLoadSources,
+    model_meta: &ModelCacheMeta,
+    tokenizer_meta: &ModelCacheMeta,
+    inline: &InlineConfig,
+    jobs: &JobConfig,
+) -> Result<StoredModelConfig, WireOperationError> {
+    let model_id = params.model_id.clone().unwrap_or_else(|| {
+        derive_loaded_model_id(engine_name, &sources.model_source_url, &model_meta.digest)
+    });
+    let task = parse_model_task(params.task.as_deref(), engine_name, &model_id)
+        .map_err(|error| artifact_invalid_error(error.to_string()))?;
+    let pooling = parse_pooling(params.pooling.as_deref().unwrap_or("mean"))
+        .map_err(|error| artifact_invalid_error(error.to_string()))?;
+    let tokenizer_sanitized_digest = model_meta
+        .sanitized_tokenizer_digest
+        .clone()
+        .ok_or_else(|| artifact_invalid_error("model cache metadata is missing tokenizer digest"))?;
+    build_stored_model_config(
+        model_id,
+        engine_name,
+        task,
+        model_meta.digest.clone(),
+        default_artifact_format(engine_name),
+        tokenizer_sanitized_digest,
+        ModelAssetLocator::CacheDigest {
+            digest: model_meta.digest.clone(),
+        },
+        ModelAssetLocator::CacheDigest {
+            digest: tokenizer_meta.digest.clone(),
+        },
+        sources.model_source_url.clone(),
+        sources.tokenizer_source_url.clone(),
+        pooling,
+        params.normalize.unwrap_or(true),
+        params.max_tokens.unwrap_or(512),
+        params
+            .quant
+            .clone()
+            .unwrap_or_else(|| default_quant(engine_name)),
+        params.pin,
+        params.worker_bin.clone(),
+        params.worker_runtime_dir.clone(),
+        inline,
+        jobs,
+    )
+    .map_err(|error| artifact_invalid_error(error.to_string()))
+}
+
+fn derive_loaded_model_id(engine_name: &str, model_source_url: &str, digest: &str) -> String {
+    let base = model_source_url
+        .rsplit('/')
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(engine_name)
+        .trim_end_matches(".onnx")
+        .trim_end_matches(".gguf")
+        .trim_end_matches(".json");
+    let digest_suffix = digest
+        .strip_prefix("sha256:")
+        .unwrap_or(digest)
+        .chars()
+        .take(8)
+        .collect::<String>();
+    format!(
+        "{}-{}",
+        sanitize_model_id_component(base),
+        digest_suffix.to_ascii_lowercase()
+    )
+}
+
+fn sanitize_model_id_component(value: &str) -> String {
+    let mut output = String::new();
+    let mut last_dash = false;
+    for ch in value.chars() {
+        let ch = ch.to_ascii_lowercase();
+        if ch.is_ascii_alphanumeric() {
+            output.push(ch);
+            last_dash = false;
+        } else if !last_dash {
+            output.push('-');
+            last_dash = true;
+        }
+    }
+    output.trim_matches('-').to_string()
+}
+
+fn validate_artifact_file(path: &Path, engine_name: &str) -> Result<(), WireOperationError> {
+    let expected_format = default_artifact_format(engine_name);
+    let mut header = [0_u8; 8];
+    let mut file = fs::File::open(path)
+        .map_err(|error| io_to_load_error("open downloaded artifact", path, &error))?;
+    let read = file
+        .read(&mut header)
+        .map_err(|error| io_to_load_error("read downloaded artifact", path, &error))?;
+    match expected_format.as_str() {
+        "gguf" if read >= 4 && &header[..4] == b"GGUF" => Ok(()),
+        "gguf" => Err(artifact_invalid_error(format!(
+            "expected GGUF magic at {}",
+            path.display()
+        ))),
+        "onnx" if read >= 1 && header[0] == 0x08 => Ok(()),
+        "onnx" => Err(artifact_invalid_error(format!(
+            "expected ONNX protobuf header at {}",
+            path.display()
+        ))),
+        other => Err(artifact_invalid_error(format!(
+            "unsupported artifact format '{other}' for {}",
+            path.display()
+        ))),
+    }
+}
+
+fn download_source_to_temp(
+    source_url: &str,
+    destination: &Path,
+    mut on_progress: impl FnMut(u64, Option<u64>),
+) -> Result<(), WireOperationError> {
+    let mut output = fs::File::create(destination)
+        .map_err(|error| io_to_load_error("create download destination", destination, &error))?;
+    if let Some(path) = source_url.strip_prefix("file://") {
+        let path = Path::new(path);
+        let total = fs::metadata(path).ok().map(|meta| meta.len());
+        let mut input = fs::File::open(path)
+            .map_err(|error| io_to_load_error("open source artifact", path, &error))?;
+        copy_source_stream(&mut input, &mut output, total, destination, &mut on_progress)?;
+    } else {
+        let client = reqwest::blocking::Client::new();
+        let mut response = client
+            .get(source_url)
+            .send()
+            .map_err(|error| transient_model_load_error(format!("download {source_url}: {error}")))?
+            .error_for_status()
+            .map_err(|error| transient_model_load_error(format!("download {source_url}: {error}")))?;
+        let total = response.content_length();
+        copy_source_stream(&mut response, &mut output, total, destination, &mut on_progress)?;
+    }
+    output
+        .flush()
+        .map_err(|error| io_to_load_error("flush downloaded artifact", destination, &error))?;
+    Ok(())
+}
+
+fn copy_source_stream(
+    input: &mut impl Read,
+    output: &mut fs::File,
+    total: Option<u64>,
+    destination: &Path,
+    on_progress: &mut impl FnMut(u64, Option<u64>),
+) -> Result<(), WireOperationError> {
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut done = 0_u64;
+    let delay_ms = env::var("SYNAPSE_TEST_MODEL_LOAD_CHUNK_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    loop {
+        let read = input
+            .read(&mut buffer)
+            .map_err(|error| io_to_load_error("read source artifact", destination, &error))?;
+        if read == 0 {
+            break;
+        }
+        output
+            .write_all(&buffer[..read])
+            .map_err(|error| io_to_load_error("write downloaded artifact", destination, &error))?;
+        done = done.saturating_add(read as u64);
+        on_progress(done, total);
+        if delay_ms > 0 {
+            std::thread::sleep(Duration::from_millis(delay_ms));
+        }
+    }
+    Ok(())
 }
 
 async fn embed_query(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
@@ -1169,7 +2426,7 @@ async fn embed_query(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         Ok(alias_table) => alias_table,
         Err(error) => return channel_error("store_failure", error.to_string()),
     };
-    let model = match state.runtime.resolve_model(params.model.as_deref()) {
+    let model = match resolve_model_for_request(Arc::clone(&state), params.model.as_deref()).await {
         Ok(model) => model,
         Err(error) => return result_outcome(error_payload(&state, error)),
     };
@@ -1232,7 +2489,7 @@ async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         Ok(alias_table) => alias_table,
         Err(error) => return channel_error("store_failure", error.to_string()),
     };
-    let model = match state.runtime.resolve_model(params.model.as_deref()) {
+    let model = match resolve_model_for_request(Arc::clone(&state), params.model.as_deref()).await {
         Ok(model) => model,
         Err(error) => return result_outcome(error_payload(&state, error)),
     };
@@ -1334,7 +2591,7 @@ async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
         Ok(alias_table) => alias_table,
         Err(error) => return channel_error("store_failure", error.to_string()),
     };
-    let model = match state.runtime.resolve_model(params.model.as_deref()) {
+    let model = match resolve_model_for_request(Arc::clone(&state), params.model.as_deref()).await {
         Ok(model) => model,
         Err(error) => return result_outcome(error_payload(&state, error)),
     };
@@ -1488,7 +2745,7 @@ async fn microllm_oneshot(state: Arc<ModuleState>, params: Value) -> HandlerOutc
         Ok(alias_table) => alias_table,
         Err(error) => return channel_error("store_failure", error.to_string()),
     };
-    let model = match state.runtime.resolve_model(params.model.as_deref()) {
+    let model = match resolve_model_for_request(Arc::clone(&state), params.model.as_deref()).await {
         Ok(model) => model,
         Err(error) => return result_outcome(error_payload(&state, error)),
     };
@@ -2424,15 +3681,31 @@ async fn execute_probe_job(state: Arc<ModuleState>, job_id: String, model_filter
             return;
         }
     };
-    let selected_models = state
+    let selected_model_ids = state
         .runtime
-        .models
-        .values()
-        .filter(|model| {
-            model_filter.is_empty() || model_filter.iter().any(|id| id == &model.model_id)
+        .catalog
+        .lock()
+        .map(|catalog| {
+            catalog
+                .keys()
+                .filter(|model_id| {
+                    model_filter.is_empty() || model_filter.iter().any(|id| id == *model_id)
+                })
+                .cloned()
+                .collect::<Vec<_>>()
         })
-        .cloned()
-        .collect::<Vec<_>>();
+        .unwrap_or_default();
+    let mut selected_models = Vec::new();
+    for model_id in selected_model_ids {
+        let model = match ensure_model_loaded_for_control(Arc::clone(&state), &model_id).await {
+            Ok(model) => model,
+            Err(error) => {
+                fail_job_with_wire_error(&state, &job_id, error.class == ErrorClass::Transient, error);
+                return;
+            }
+        };
+        selected_models.push(model);
+    }
 
     let mut lane_results = Vec::new();
     let mut certified_vectors = Vec::new();
@@ -3111,8 +4384,8 @@ async fn admission_status(state: Arc<ModuleState>) -> HandlerOutcome {
     };
     let lanes = state
         .runtime
-        .models
-        .values()
+        .loaded_models()
+        .into_iter()
         .map(|model| {
             let certified = state
                 .store
@@ -3147,15 +4420,6 @@ async fn admission_status(state: Arc<ModuleState>) -> HandlerOutcome {
     }))
 }
 
-fn models_status_payload(state: &ModuleState) -> Value {
-    json!({
-        "module_generation": state.module_generation,
-        "machine_profile_hash": state.machine_profile_hash,
-        "models": state.runtime.catalog_entries(),
-        "health": module_health(state),
-    })
-}
-
 #[cfg(unix)]
 fn worker_health_for_model(model: &EmbeddingModel) -> Option<worker_host::WorkerHostHealth> {
     match &model.backend {
@@ -3170,8 +4434,8 @@ fn worker_health_for_model(model: &EmbeddingModel) -> Option<worker_host::Worker
 fn module_health(state: &ModuleState) -> ModuleHealth {
     let lanes = state
         .runtime
-        .models
-        .values()
+        .loaded_models()
+        .into_iter()
         .map(|model| {
             let certified = state
                 .store
@@ -3190,14 +4454,14 @@ fn module_health(state: &ModuleState) -> ModuleHealth {
                 certified,
                 certification_stale,
                 #[cfg(unix)]
-                worker: worker_health_for_model(model),
+                worker: worker_health_for_model(&model),
             }
         })
         .collect::<Vec<_>>();
     ModuleHealth {
         status: "ok".to_string(),
         module_generation: state.module_generation,
-        loaded_models: state.runtime.models.len(),
+        loaded_models: state.runtime.loaded_model_count(),
         machine_profile_hash: state.machine_profile_hash.clone(),
         certification_stale: lanes.iter().any(|lane| lane.certification_stale),
         lanes,
@@ -3281,12 +4545,10 @@ fn cache_error_to_wire(error: ModelCacheError) -> WireOperationError {
 }
 
 fn models_list_payload(state: &ModuleState, snapshot: CatalogSnapshot) -> Value {
-    let mut models = snapshot.models;
-    models.extend(state.runtime.catalog_entries());
     json!({
         "module_generation": state.module_generation,
         "table_epoch": snapshot.table_epoch,
-        "models": models,
+        "models": state.runtime.catalog_entries(),
         "alias_rows": snapshot.alias_rows,
     })
 }
@@ -3345,6 +4607,7 @@ fn management_operations() -> Vec<ManagementOperation> {
         op("microllm.oneshot", Query),
         op("model.load", Mutate),
         op("model.status", Query),
+        op("model.unload", Mutate),
         op("models.list", Query),
         op("probe.start", Mutate),
         op("probe.status", Query),
@@ -3575,5 +4838,18 @@ mod tests {
         };
 
         assert_eq!(batch_token_cost(&batch), 6);
+    }
+
+    #[test]
+    fn huggingface_resolve_url_uses_repo_segments_and_resolve_main() {
+        let url = huggingface_resolve_url(
+            "Qdrant/all-MiniLM-L6-v2-onnx",
+            "onnx/model.onnx",
+        )
+        .expect("hf url should resolve");
+        assert_eq!(
+            url,
+            "https://huggingface.co/Qdrant/all-MiniLM-L6-v2-onnx/resolve/main/onnx/model.onnx"
+        );
     }
 }

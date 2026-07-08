@@ -6314,6 +6314,7 @@ dependencies = [
  "cortexkit-store",
  "cortexkit-store-types",
  "hex",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",
