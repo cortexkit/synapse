@@ -5402,6 +5402,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "spike-unified-rt"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "half",
+ "libm",
+ "safetensors 0.6.2",
+ "serde",
+ "serde_json",
+ "synapse-bench",
+ "tokenizers 0.21.4",
+]
+
+[[package]]
 name = "spin"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
