@@ -5,6 +5,7 @@ members = [
     "bench/lanes/ort-embed",
     "bench/lanes/wrap-embed",
     "bench/lanes/llama",
+    "bench/lanes/llama-inproc",
     "bench/lanes/mlx",
     "bench/lanes/burn",
     "bench/spikes/unified-rt",
