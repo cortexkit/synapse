@@ -1,0 +1,144 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Production crates gated by CI. Bench lanes are excluded on purpose:
+  # heavy engine deps (burn, candle, python venvs) with no gate value.
+  SYNAPSE_CRATES: -p synapse-core -p synapse-engine-ort -p synapse-module -p synapse-worker-llama
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux
+            runner: blacksmith-4vcpu-ubuntu-2404
+          - name: windows
+            runner: blacksmith-4vcpu-windows-2025
+          - name: macos-metal
+            runner: macos-14
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Create cross-repo token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.CK_CI_APP_ID }}
+          private-key: ${{ secrets.CK_CI_APP_PRIVATE_KEY }}
+          owner: cortexkit
+          repositories: synapse,subconscious,commons
+
+      - name: Checkout synapse
+        uses: actions/checkout@v4
+        with:
+          path: synapse
+
+      # Sibling layout: Cargo path deps resolve ../subconscious and ../commons.
+      - name: Checkout subconscious (sibling)
+        uses: actions/checkout@v4
+        with:
+          repository: cortexkit/subconscious
+          token: ${{ steps.app-token.outputs.token }}
+          path: subconscious
+
+      - name: Checkout commons (sibling)
+        uses: actions/checkout@v4
+        with:
+          repository: cortexkit/commons
+          token: ${{ steps.app-token.outputs.token }}
+          path: commons
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: taiki-e/install-action@nextest
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: synapse
+
+      # llama-cpp-sys-2 needs cmake everywhere and libclang (bindgen) on
+      # linux/windows. GitHub/Blacksmith images ship LLVM + CMake; these
+      # steps only pin the env vars the build scripts read.
+      - name: Windows build env (libclang for bindgen)
+        if: matrix.name == 'windows'
+        shell: pwsh
+        run: |
+          echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
+
+      - name: MiniLM e2e fixture cache
+        id: fixture-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface/hub/models--Qdrant--all-MiniLM-L6-v2-onnx
+          key: minilm-onnx-fixture-v1
+
+      - name: Download MiniLM e2e fixture
+        if: steps.fixture-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          snap="$HOME/.cache/huggingface/hub/models--Qdrant--all-MiniLM-L6-v2-onnx/snapshots/main"
+          mkdir -p "$snap"
+          base="https://huggingface.co/Qdrant/all-MiniLM-L6-v2-onnx/resolve/main"
+          for f in config.json model.onnx special_tokens_map.json tokenizer.json tokenizer_config.json vocab.txt; do
+            curl -sSfL "$base/$f" -o "$snap/$f"
+          done
+
+      # Windows exercises the wave-11 load-dynamic ort path end to end: the
+      # official DLL is what ORT_DYLIB_PATH points at in production.
+      - name: onnxruntime DLL (windows)
+        if: matrix.name == 'windows'
+        shell: pwsh
+        run: |
+          $v = "1.23.2"
+          $dir = "C:\onnxruntime"
+          if (!(Test-Path "$dir\onnxruntime-win-x64-$v\lib\onnxruntime.dll")) {
+            curl.exe -sSfL "https://github.com/microsoft/onnxruntime/releases/download/v$v/onnxruntime-win-x64-$v.zip" -o ort.zip
+            Expand-Archive ort.zip -DestinationPath $dir
+          }
+          echo "ORT_DYLIB_PATH=$dir\onnxruntime-win-x64-$v\lib\onnxruntime.dll" >> $env:GITHUB_ENV
+
+      - name: fmt
+        working-directory: synapse
+        run: cargo fmt --all --check
+
+      - name: clippy
+        working-directory: synapse
+        shell: bash
+        run: |
+          crates="$SYNAPSE_CRATES"
+          if [ "${{ matrix.name }}" = "macos-metal" ]; then
+            crates="$crates -p synapse-worker-mlx -p synapse-worker-ane"
+          fi
+          cargo clippy $crates --all-targets -- -D warnings
+
+      - name: nextest
+        working-directory: synapse
+        shell: bash
+        run: |
+          crates="$SYNAPSE_CRATES"
+          if [ "${{ matrix.name }}" = "macos-metal" ]; then
+            crates="$crates -p synapse-worker-mlx -p synapse-worker-ane"
+          fi
+          cargo nextest run $crates --retries 0
+
+      # Hollow-green guard: fixture e2e "pass" with a skip message when the
+      # snapshot is missing; fail the lane loudly instead of shipping air.
+      - name: Assert no silently-skipped e2e
+        working-directory: synapse
+        shell: bash
+        run: |
+          out=$(cargo nextest run -p synapse-module --test skeleton_e2e --retries 0 --no-capture 2>&1 || true)
+          if echo "$out" | grep -q "skipping"; then
+            echo "$out" | grep "skipping"
+            echo "::error::fixture e2e silently skipped — fixture staging is broken on this runner"
+            exit 1
+          fi
