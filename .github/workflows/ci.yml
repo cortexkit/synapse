@@ -65,6 +65,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: synapse
+          # v2: CRT flavor lives in cmake's cached configure (CMakeCache.txt
+          # inside OUT_DIR) — a cache from the MD era keeps producing MD
+          # objects even after LLAMA_STATIC_CRT changes, because cmake reruns
+          # against its cached configuration. Bump to force clean configure.
+          prefix-key: v2-static-crt
 
       # llama-cpp-sys-2 needs cmake everywhere and libclang (bindgen) on
       # linux/windows. GitHub/Blacksmith images ship LLVM + CMake; these
