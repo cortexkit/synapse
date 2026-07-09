@@ -150,6 +150,7 @@ mod tests {
         let pipe_name = worker_pipe_name(&worker_id);
         let server = bind_listener(&pipe_name).expect("create pipe server");
         let expected_nonce = test_nonce();
+        let client_nonce = expected_nonce.clone();
         let max_frame = 4096_u32;
 
         let server_task = tokio::spawn(async move {
@@ -178,7 +179,7 @@ mod tests {
             .expect("open client pipe");
         let hello = WorkerHello {
             v: WORKER_PROTOCOL_VERSION,
-            nonce: expected_nonce.clone(),
+            nonce: client_nonce,
             engine: EngineIdentity {
                 engine: "test".to_string(),
                 version: "0".to_string(),
