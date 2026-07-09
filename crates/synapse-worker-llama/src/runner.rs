@@ -37,7 +37,7 @@ use synapse_core::{
 
 const ENGINE_VERSION: &str = "llama-cpp-2-0.1.151";
 const MAX_BATCH_SEQUENCES: usize = 256;
-const MAX_GENERATE_TOKENS: u32 = 64;
+const DEFAULT_MAX_GENERATE_TOKENS: u32 = 512;
 const LLAMA_TOKEN_NULL: i32 = -1;
 
 #[derive(Parser)]
@@ -92,6 +92,7 @@ struct WorkerRuntimeConfig {
     pooling_implementation: PoolingImplementation,
     flash_attention: FlashAttentionSetting,
     forward_pass: ForwardPassSetting,
+    max_generate_tokens: u32,
 }
 
 struct LoadedRuntime {
@@ -188,6 +189,11 @@ impl WorkerRuntimeConfig {
                 "decode" => ForwardPassSetting::Decode,
                 other => bail!("invalid forward_pass '{other}'"),
             },
+            max_generate_tokens: parse_u32(
+                values,
+                "microllm_max_tokens",
+                DEFAULT_MAX_GENERATE_TOKENS,
+            )?,
         })
     }
 }
@@ -649,17 +655,16 @@ fn handle_generate(
     grammar: Option<&str>,
     raw: &[u8],
 ) -> Result<WorkerResponse> {
-    ensure!(
-        max_tokens <= MAX_GENERATE_TOKENS,
-        "max_tokens must be <= {MAX_GENERATE_TOKENS}"
-    );
-    if grammar.is_some_and(|value| !value.trim().is_empty()) {
-        bail!("GBNF grammar is not supported by this synapse-worker-llama build because llama-cpp-2 grammar support requires the optional common feature");
-    }
     let runtime = state
         .models
         .get(model_ref)
         .ok_or_else(|| anyhow!("unknown model_ref '{model_ref}'"))?;
+    let ceiling = runtime.config.max_generate_tokens;
+    ensure!(
+        max_tokens <= ceiling,
+        "max_tokens must be <= configured ceiling {ceiling}"
+    );
+    let grammar_rule = grammar.filter(|value| !value.trim().is_empty());
     let prompt_ids = decode_i32_frame(raw).map_err(|error| anyhow!(error.to_string()))?;
     ensure!(!prompt_ids.is_empty(), "GENERATE prompt has zero tokens");
 
@@ -690,7 +695,7 @@ fn handle_generate(
         .decode(&mut prompt_batch)
         .context("llama_decode prompt failed")?;
 
-    let mut sampler = LlamaSampler::greedy();
+    let mut sampler = build_generate_sampler(&runtime.model, grammar_rule)?;
     sampler.accept_many(&prompt_tokens);
     let mut generated = Vec::new();
     let mut finish_reason = "length";
@@ -1021,6 +1026,29 @@ fn parse_usize(values: &BTreeMap<String, String>, key: &str, default: usize) -> 
                 .with_context(|| format!("invalid {key} '{value}'"))
         })
         .unwrap_or(Ok(default))
+}
+
+fn parse_u32(values: &BTreeMap<String, String>, key: &str, default: u32) -> Result<u32> {
+    values
+        .get(key)
+        .map(|value| {
+            value
+                .parse::<u32>()
+                .with_context(|| format!("invalid {key} '{value}'"))
+        })
+        .unwrap_or(Ok(default))
+}
+
+fn build_generate_sampler(model: &LlamaModel, grammar: Option<&str>) -> Result<LlamaSampler> {
+    if let Some(grammar_str) = grammar {
+        let grammar_sampler = LlamaSampler::grammar(model, grammar_str, "root")
+            .map_err(|error| anyhow!("grammar sampler init failed: {error}"))?;
+        return Ok(LlamaSampler::chain_simple([
+            grammar_sampler,
+            LlamaSampler::greedy(),
+        ]));
+    }
+    Ok(LlamaSampler::greedy())
 }
 
 fn default_threads() -> usize {

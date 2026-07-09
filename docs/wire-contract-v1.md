@@ -62,11 +62,12 @@ certified-equivalent profile, else substitution_rejected/not_certified).
   bulk beyond. Qwen3-Reranker architectures are rejected at load (measured
   broken template path in llama.cpp b9580).
 - **microllm.oneshot** {model, prompt, max_tokens, grammar?, …} — greedy.
-  `grammar` is RESERVED: unset = free-text; set → typed rejection until the
-  GBNF feature lands (then: constrained decoding, no wire change). The
-  current 64-token cap is a v1-dev cap, not a design ceiling — the intended
-  ceiling covers multi-hundred-token one-shot classes (dreamer manifests);
-  it moves via config, not contract change.
+  `max_tokens` is capped by module config `microllm_max_tokens` (default 512);
+  requests above the ceiling are rejected with both numbers in the error.
+  `grammar` (GBNF): unset or empty = free-text. When set, constrained decoding
+  runs only if module config `grammar_enabled` is true (default false); otherwise
+  typed `invalid_request` naming the gate. If the llama worker build lacks GBNF
+  support, grammar requests fail with reason `grammar_unavailable_in_build`.
 - **models.list** — catalog + per-model state, fingerprints, alias rows,
   recommended_batch (ADVISORY batch sizing per model; admission remains the
   enforcement — consumers should not carry their own batch knobs).

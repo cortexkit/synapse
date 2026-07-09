@@ -12,6 +12,7 @@ use std::{
 mod store;
 pub mod worker_host;
 
+use cortexkit_lease::{FileLeaseStore, LeaseHandle, LeaseKey, LeaseStore};
 use cortexkit_store_types::{sqlite_store_path, Isolation, StorageBackend, StorageDescriptor};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
@@ -72,16 +73,59 @@ const PROBE_PERF_TARGET_TOTAL_TOKENS: u64 = 4_096;
 const PROBE_PERF_MIN_BATCH_SAMPLES: usize = 3;
 const PROBE_PERF_SINGLE_SAMPLES: usize = 20;
 const SYNAPSE_OS_BUILD_OVERRIDE_ENV: &str = "SYNAPSE_OS_BUILD_OVERRIDE";
+const SYNAPSE_CONFIG_PATH_ENV: &str = "SYNAPSE_CONFIG_PATH";
+const DEFAULT_MICROLLM_MAX_TOKENS: u32 = 512;
+const DEFAULT_CACHE_MAX_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+const SYNAPSE_SINGLETON_LEASE_SCOPE: &str = "singleton";
+
+struct SynapseSingletonLease {
+    _handle: Box<dyn LeaseHandle>,
+}
 
 pub async fn run_from_env() -> Result<(), ModuleError> {
     let module_id = env::var(SUBC_MODULE_ID_ENV)
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| DEFAULT_MODULE_ID.to_string());
+    let _singleton = acquire_synapse_singleton_lease(&module_id)?;
     let handler = SynapseHandler::new(module_id.clone());
     subc_client_rs::serve(manifest(&module_id), handler)
         .await
         .map_err(ModuleError::Serve)
+}
+
+fn acquire_synapse_singleton_lease(module_id: &str) -> Result<SynapseSingletonLease, ModuleError> {
+    let lease_root = synapse_lease_root()?;
+    let store = FileLeaseStore::new(lease_root);
+    let key = LeaseKey::new(module_id, "file", SYNAPSE_SINGLETON_LEASE_SCOPE);
+    match store.acquire(&key) {
+        Ok(handle) => Ok(SynapseSingletonLease { _handle: handle }),
+        Err(cortexkit_lease::LeaseError::Held { .. }) => {
+            let message = format!(
+                "synapse singleton lease held: only one synapse module may run machine-wide \
+                 (module={module_id}, scope={SYNAPSE_SINGLETON_LEASE_SCOPE})"
+            );
+            eprintln!("{message}");
+            Err(ModuleError::SingletonHeld(message))
+        }
+        Err(cortexkit_lease::LeaseError::Io(error)) => {
+            Err(ModuleError::Config(format!("singleton lease io: {error}")))
+        }
+    }
+}
+
+fn synapse_lease_root() -> Result<PathBuf, ModuleError> {
+    if let Ok(root) = env::var("CORTEXKIT_LEASE_ROOT") {
+        return Ok(PathBuf::from(root));
+    }
+    let home = env::var_os("HOME").ok_or_else(|| {
+        ModuleError::Config("HOME is unset; cannot resolve cortexkit lease root".to_string())
+    })?;
+    Ok(PathBuf::from(home)
+        .join(".local")
+        .join("share")
+        .join("cortexkit")
+        .join("leases"))
 }
 
 #[derive(Debug, Error)]
@@ -100,6 +144,8 @@ pub enum ModuleError {
     Engine(String),
     #[error("config: {0}")]
     Config(String),
+    #[error("singleton: {0}")]
+    SingletonHeld(String),
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -206,7 +252,8 @@ impl WireOperationError {
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
-struct ModuleConfig {
+#[serde(deny_unknown_fields)]
+pub(crate) struct ModuleConfig {
     #[serde(default)]
     preload_models: Vec<PreloadModelConfig>,
     #[serde(default)]
@@ -219,8 +266,22 @@ struct ModuleConfig {
     knob: PerfKnob,
     #[serde(default, alias = "dev_alias_admin", alias = "enable_alias_admin")]
     alias_admin_enabled: bool,
+    #[serde(default = "default_microllm_max_tokens")]
+    microllm_max_tokens: u32,
+    #[serde(default)]
+    grammar_enabled: bool,
+    #[serde(default = "default_cache_max_bytes")]
+    cache_max_bytes: u64,
     #[serde(default)]
     dev: DevConfig,
+}
+
+fn default_microllm_max_tokens() -> u32 {
+    DEFAULT_MICROLLM_MAX_TOKENS
+}
+
+fn default_cache_max_bytes() -> u64 {
+    DEFAULT_CACHE_MAX_BYTES
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -387,6 +448,9 @@ struct RuntimeState {
     probe: ProbeConfig,
     knob: PerfKnob,
     alias_admin_enabled: bool,
+    microllm_max_tokens: u32,
+    grammar_enabled: bool,
+    cache_max_bytes: u64,
     scheduler: Arc<Mutex<InlineScheduler>>,
     execution: Arc<Semaphore>,
     control_loads: Arc<Semaphore>,
@@ -907,6 +971,9 @@ impl RuntimeState {
         let probe = config.probe;
         let knob = config.knob;
         let alias_admin_enabled = config.alias_admin_enabled || config.dev.alias_admin_enabled;
+        let microllm_max_tokens = config.microllm_max_tokens;
+        let grammar_enabled = config.grammar_enabled;
+        let cache_max_bytes = config.cache_max_bytes;
         let scheduler = Arc::new(Mutex::new(InlineScheduler { in_flight_bytes: 0 }));
         let execution = Arc::new(Semaphore::new(inline.max_concurrent_workers.max(1)));
         let catalog = models
@@ -930,6 +997,9 @@ impl RuntimeState {
             probe,
             knob,
             alias_admin_enabled,
+            microllm_max_tokens,
+            grammar_enabled,
+            cache_max_bytes,
             scheduler,
             execution,
             control_loads: Arc::new(Semaphore::new(1)),
@@ -1961,8 +2031,9 @@ async fn load_catalog_model_task(
     let ort_engine = Arc::clone(&state.runtime.ort_engine);
     let model_cache = Arc::clone(&state.model_cache);
     let load_started = std::time::Instant::now();
+    let microllm_max_tokens = state.runtime.microllm_max_tokens;
     let loaded = tokio::task::spawn_blocking(move || {
-        load_catalog_model_blocking(spec, ort_engine, model_cache)
+        load_catalog_model_blocking(spec, ort_engine, model_cache, microllm_max_tokens)
     })
     .await
     .map_err(|error| {
@@ -1993,6 +2064,7 @@ fn load_catalog_model_blocking(
     spec: StoredModelConfig,
     ort_engine: Arc<Mutex<OrtEmbedEngine>>,
     model_cache: Arc<ModelCache>,
+    microllm_max_tokens: u32,
 ) -> Result<EmbeddingModel, WireOperationError> {
     let task = parse_model_task(Some(&spec.task), &spec.engine, &spec.model_id)
         .map_err(|error| artifact_invalid_error(error.to_string()))?;
@@ -2012,7 +2084,7 @@ fn load_catalog_model_blocking(
             spec.model_id, spec.tokenizer_sanitized_digest, actual_tokenizer_digest
         )));
     }
-    let runtime_config = model_runtime_config(&spec, &model_path.path);
+    let runtime_config = model_runtime_config(&spec, &model_path.path, microllm_max_tokens);
     let artifact = ValidatedArtifact {
         digest: spec.artifact_digest.clone(),
         format: spec.artifact_format.clone(),
@@ -2087,6 +2159,9 @@ fn load_worker_backend_blocking(
     config.pooling =
         parse_pooling(&spec.pooling).map_err(|error| artifact_invalid_error(error.to_string()))?;
     config.normalize = spec.normalize;
+    if spec.task == "generate" {
+        config.request_timeout = Duration::from_secs(180);
+    }
     let mut engine = WorkerEngine::new(config).map_err(|error| {
         WireOperationError::from_stable(
             StableError::engine_crashed(Some(100)),
@@ -2129,7 +2204,11 @@ fn unload_embedding_model_blocking(model: Arc<EmbeddingModel>) -> Result<(), Wir
     }
 }
 
-fn model_runtime_config(spec: &StoredModelConfig, model_path: &Path) -> RuntimeConfig {
+fn model_runtime_config(
+    spec: &StoredModelConfig,
+    model_path: &Path,
+    microllm_max_tokens: u32,
+) -> RuntimeConfig {
     let mut runtime_config = RuntimeConfig::default();
     runtime_config.values.insert(
         "model_path".to_string(),
@@ -2145,6 +2224,10 @@ fn model_runtime_config(spec: &StoredModelConfig, model_path: &Path) -> RuntimeC
     runtime_config.values.insert(
         "normalize".to_string(),
         if spec.normalize { "true" } else { "false" }.to_string(),
+    );
+    runtime_config.values.insert(
+        "microllm_max_tokens".to_string(),
+        microllm_max_tokens.to_string(),
     );
     runtime_config
 }
@@ -2959,17 +3042,28 @@ async fn microllm_oneshot(state: Arc<ModuleState>, params: Value) -> HandlerOutc
             )
         }
     };
-    if params.max_tokens > 64 {
+    let ceiling = state.runtime.microllm_max_tokens;
+    if params.max_tokens > ceiling {
         return channel_error(
             "invalid_request",
-            "microllm.oneshot max_tokens must be <= 64",
+            format!(
+                "microllm.oneshot max_tokens {} exceeds configured ceiling {}",
+                params.max_tokens, ceiling
+            ),
         );
     }
-    if params.grammar.is_some() {
-        return channel_error(
-            "invalid_request",
-            "microllm.oneshot grammar is not supported by the current llama-cpp-2 worker build",
-        );
+    match params.grammar.as_deref() {
+        None | Some("") => {}
+        Some(raw) if raw.trim().is_empty() => {}
+        Some(_) if !state.runtime.grammar_enabled => {
+            return channel_error(
+                "invalid_request",
+                "microllm.oneshot grammar requires grammar_enabled=true in module config",
+            );
+        }
+        Some(_) => {
+            return channel_error("invalid_request", "grammar_unavailable_in_build");
+        }
     }
 
     let alias_table = match state.store.alias_table() {
@@ -5460,7 +5554,12 @@ async fn cache_gc(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
             .gc_digest(&digest, &state.module_id, now, grace_ms)
             .map(|outcome| vec![outcome])
     } else {
-        state.model_cache.gc_all(&state.module_id, now, grace_ms)
+        state.model_cache.gc_to_watermark(
+            &state.module_id,
+            now,
+            grace_ms,
+            state.runtime.cache_max_bytes,
+        )
     };
     match result {
         Ok(outcomes) => result_outcome(json!({
@@ -5582,30 +5681,28 @@ fn manifest(module_id: &str) -> ModuleManifest {
 }
 
 fn load_module_config() -> Result<ModuleConfig, ModuleError> {
-    if let Ok(json) = env::var("SYNAPSE_CONFIG_JSON") {
-        return serde_json::from_str(&strip_json_comments(&json)).map_err(ModuleError::Json);
-    }
-    if let Ok(json) = env::var("SYNAPSE_PRELOAD_MODELS") {
-        let preload_models = serde_json::from_str(&strip_json_comments(&json))?;
-        return Ok(ModuleConfig {
-            preload_models,
-            inline: InlineConfig::default(),
-            jobs: JobConfig::default(),
-            probe: ProbeConfig::default(),
-            knob: PerfKnob::default(),
-            alias_admin_enabled: false,
-            dev: DevConfig::default(),
-        });
+    if let Ok(path) = env::var(SYNAPSE_CONFIG_PATH_ENV) {
+        let path = PathBuf::from(path);
+        return load_module_config_file(&path);
     }
     if let Ok(path) = env::var("SYNAPSE_CONFIG") {
         return load_module_config_file(Path::new(&path));
+    }
+    if let Ok(json) = env::var("SYNAPSE_CONFIG_JSON") {
+        return parse_module_config_json(&json, "SYNAPSE_CONFIG_JSON");
+    }
+    if let Ok(cwd) = env::current_dir() {
+        let project_path = cwd.join(".cortexkit").join("synapse.jsonc");
+        if project_path.is_file() {
+            return load_module_config_file(&project_path);
+        }
     }
     if let Some(home) = env::var_os("HOME") {
         let path = PathBuf::from(home)
             .join(".config")
             .join("cortexkit")
             .join("synapse.jsonc");
-        if path.exists() {
+        if path.is_file() {
             return load_module_config_file(&path);
         }
     }
@@ -5615,7 +5712,31 @@ fn load_module_config() -> Result<ModuleConfig, ModuleError> {
 fn load_module_config_file(path: &Path) -> Result<ModuleConfig, ModuleError> {
     let contents = fs::read_to_string(path)
         .map_err(|error| ModuleError::Config(format!("read {}: {error}", path.display())))?;
-    serde_json::from_str(&strip_json_comments(&contents)).map_err(ModuleError::Json)
+    parse_module_config_json(&contents, &path.display().to_string())
+}
+
+fn parse_module_config_json(contents: &str, source: &str) -> Result<ModuleConfig, ModuleError> {
+    let stripped = strip_json_comments(contents);
+    serde_json::from_str(&stripped).map_err(|error| {
+        if let Some(field) = unknown_field_from_json_error(&error) {
+            eprintln!("synapse config parse error in {source}: unknown field '{field}'");
+            ModuleError::Config(format!(
+                "unknown config field '{field}' in {source} (deny_unknown_fields)"
+            ))
+        } else {
+            eprintln!("synapse config parse error in {source}: {error}");
+            ModuleError::Json(error)
+        }
+    })
+}
+
+fn unknown_field_from_json_error(error: &serde_json::Error) -> Option<String> {
+    let message = error.to_string();
+    let marker = "unknown field `";
+    let start = message.find(marker)? + marker.len();
+    let rest = &message[start..];
+    let end = rest.find('`')?;
+    Some(rest[..end].to_string())
 }
 
 fn strip_json_comments(input: &str) -> String {
@@ -5800,6 +5921,30 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn module_config_rejects_unknown_fields() {
+        let error = parse_module_config_json(r#"{ "typo_field": true }"#, "test")
+            .expect_err("unknown fields should fail");
+        assert!(matches!(error, ModuleError::Config(_)));
+        assert!(error.to_string().contains("typo_field"));
+    }
+
+    #[test]
+    fn module_config_parses_microllm_and_cache_fields() {
+        let config = parse_module_config_json(
+            r#"{
+                "microllm_max_tokens": 128,
+                "grammar_enabled": true,
+                "cache_max_bytes": 4096
+            }"#,
+            "test",
+        )
+        .expect("valid config");
+        assert_eq!(config.microllm_max_tokens, 128);
+        assert!(config.grammar_enabled);
+        assert_eq!(config.cache_max_bytes, 4096);
+    }
 
     #[test]
     fn batch_token_cost_tracks_actual_token_id_chunks() {

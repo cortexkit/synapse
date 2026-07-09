@@ -143,10 +143,12 @@ substitution rejection preserved byte-for-byte), `required_epoch` (Oracle F15).
   downstream; the era of guessing what max_length did is over).
 - `rerank.score` — query + candidates → per-candidate RAW scores +
   fingerprint; candidate-count/token budgets; large requests job-shaped.
-- `microllm.oneshot` — prompt → text, max_tokens ≤ 64, greedy default.
-  The protocol reserves a `grammar` field, but this llama-cpp-2 worker build
-  does not expose GBNF support; non-empty grammar requests fail as invalid
-  rather than running unconstrained.
+- `microllm.oneshot` — prompt → text, greedy default. Per-request
+  `max_tokens` must be ≤ `microllm_max_tokens` in config (default 512).
+  Optional `grammar` (GBNF) is gated by `grammar_enabled` (default false);
+  when enabled, the supervised llama worker applies grammar sampling when the
+  build includes llama-cpp-2 `common` (GBNF); otherwise requests fail closed
+  with `grammar_unavailable_in_build`.
 - `model.load` / `model.status` — control-class job (below).
 - `models.list` — cached catalog, states, fingerprints, alias rows.
 - `probe.start` / `probe.status` / `probe.report` — explicit ops; start/status
@@ -242,10 +244,23 @@ No engine/GPU/worker probes on the dispatch path.
 
 ## Config
 
-~/.config/cortexkit/synapse.jsonc: knob (performance|balanced|quiet,
-default=balanced), model pins, cache budget, remote endpoints (post-v1).
-Everything else measured (probe) or contracted (subc). v1 samples config at
-startup; knob changes take effect after restart.
+Layered resolution (first hit wins per field): `SYNAPSE_CONFIG_PATH` env
+(tests), `<project>/.cortexkit/synapse.jsonc`, then
+`~/.config/cortexkit/synapse.jsonc`, then built-in defaults. JSONC comments
+are stripped before parse; unknown fields are rejected at boot (`deny_unknown_fields`)
+with the offending field named in the module log.
+
+`~/.config/cortexkit/synapse.jsonc` carries knob (performance|balanced|quiet,
+default=balanced), `preload_models` (replaces the removed `SYNAPSE_PRELOAD_MODELS`
+env), inline/jobs/probe tuning, `alias_admin_enabled`, `microllm_max_tokens`
+(default 512), `grammar_enabled` (default false), and `cache_max_bytes` (GC
+watermark target for two-phase `cache.gc` without an explicit digest). Remote
+endpoints remain post-v1. v1 samples config at startup; knob and gate changes
+take effect after restart.
+
+Machine-wide admission: an exclusive cortexkit-lease
+(`module=synapse`, `scope=singleton`) is taken at boot; a second live instance
+exits nonzero with a typed log line.
 
 ## v1 cut line
 
