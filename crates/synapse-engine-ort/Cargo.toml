@@ -14,9 +14,14 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
-ort = { version = "=2.0.0-rc.11", features = ["ndarray", "half"] }
 ndarray = "0.17.2"
 half = "2"
+
+[target.'cfg(not(windows))'.dependencies]
+ort = { version = "=2.0.0-rc.11", features = ["ndarray", "half"] }
+
+[target.'cfg(windows)'.dependencies]
+ort = { version = "=2.0.0-rc.11", features = ["ndarray", "half", "load-dynamic"] }
 
 [dev-dependencies]
 tokenizers = { workspace = true }

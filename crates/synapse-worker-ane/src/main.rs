@@ -1,17 +1,14 @@
 #![forbid(unsafe_code)]
 
-use std::os::unix::process::CommandExt;
-use std::process::Command;
+#[cfg(target_os = "macos")]
+mod macos;
 
-use anyhow::{bail, Result};
+#[cfg(target_os = "macos")]
+fn main() -> anyhow::Result<()> {
+    macos::main()
+}
 
-fn main() -> Result<()> {
-    let worker = env!("SYNAPSE_ANE_SWIFT_WORKER");
-    if worker.is_empty() || !std::path::Path::new(worker).is_file() {
-        bail!("synapse-worker-ane Swift worker was not built for this target");
-    }
-    let error = Command::new(worker)
-        .args(std::env::args_os().skip(1))
-        .exec();
-    Err(error.into())
+#[cfg(not(target_os = "macos"))]
+fn main() -> anyhow::Result<()> {
+    anyhow::bail!("synapse-worker-ane is only supported on macOS");
 }

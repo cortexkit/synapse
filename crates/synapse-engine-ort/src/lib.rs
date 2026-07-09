@@ -17,6 +17,18 @@ use synapse_core::{
 
 const ENGINE_VERSION: &str = "ort-2.0.0-rc.11";
 
+#[cfg(windows)]
+fn ort_windows_dylib_hint() -> &'static str {
+    " (on Windows, download the official onnxruntime release (>= 1.23) from \
+     https://github.com/microsoft/onnxruntime/releases, extract onnxruntime.dll, and set \
+     ORT_DYLIB_PATH to its full path before starting the module)"
+}
+
+#[cfg(not(windows))]
+fn ort_windows_dylib_hint() -> &'static str {
+    ""
+}
+
 pub struct OrtEmbedEngine {
     models: HashMap<String, OrtLoadedModel>,
     next_model: u64,
@@ -376,7 +388,12 @@ impl EmbedEngine for OrtEmbedEngine {
             .map_err(|error| {
                 Self::error(
                     EngineErrorStage::Load,
-                    format!("load ORT model {}: {error}", path.display()),
+                    format!(
+                        "load ORT model {}: {}{}",
+                        path.display(),
+                        error,
+                        ort_windows_dylib_hint()
+                    ),
                 )
             })?;
         let input_names = Self::input_names(&session);

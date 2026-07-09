@@ -10,7 +10,6 @@ use std::{
 };
 
 mod store;
-#[cfg(unix)]
 pub mod worker_host;
 
 use cortexkit_store_types::{sqlite_store_path, Isolation, StorageBackend, StorageDescriptor};
@@ -169,7 +168,6 @@ struct LaneHealth {
     certified: bool,
     certification_stale: bool,
     performance_stale: bool,
-    #[cfg(unix)]
     #[serde(skip_serializing_if = "Option::is_none")]
     worker: Option<worker_host::WorkerHostHealth>,
 }
@@ -476,7 +474,6 @@ impl ModelTask {
 #[derive(Clone)]
 enum EmbedBackend {
     Ort(Arc<Mutex<OrtEmbedEngine>>),
-    #[cfg(unix)]
     Worker(Arc<Mutex<worker_host::WorkerEngine>>),
 }
 
@@ -1273,13 +1270,13 @@ fn catalog_model_engine_identity(engine_name: &str) -> Result<EngineIdentity, Mo
         "llama" => Ok(worker_catalog_identity(
             "llama.cpp-worker",
             "protocol-v1",
-            &[("transport", "unix-socket-worker")],
+            &[("transport", worker_catalog_transport())],
         )),
         "mlx" => Ok(worker_catalog_identity(
             "mlx-worker",
             "protocol-v1",
             &[
-                ("transport", "unix-socket-worker"),
+                ("transport", worker_catalog_transport()),
                 ("numeric_profile", "bf16-distinct"),
             ],
         )),
@@ -1287,13 +1284,21 @@ fn catalog_model_engine_identity(engine_name: &str) -> Result<EngineIdentity, Mo
             "ane-coreml-worker",
             "protocol-v1",
             &[
-                ("transport", "unix-socket-worker"),
+                ("transport", worker_catalog_transport()),
                 ("placement_gate", "neural-engine"),
             ],
         )),
         other => Err(ModuleError::Config(format!(
             "unsupported engine '{other}' for catalog model"
         ))),
+    }
+}
+
+fn worker_catalog_transport() -> &'static str {
+    if cfg!(windows) {
+        "named-pipe-worker"
+    } else {
+        "unix-socket-worker"
     }
 }
 
@@ -2045,13 +2050,19 @@ fn load_catalog_model_blocking(
     })
 }
 
-#[cfg(unix)]
 fn load_worker_backend_blocking(
     spec: &StoredModelConfig,
     artifact: &ValidatedArtifact,
     runtime_config: &RuntimeConfig,
 ) -> Result<(EmbedBackend, LoadedModel), WireOperationError> {
     use worker_host::{WorkerEngine, WorkerHostConfig};
+
+    if matches!(spec.engine.as_str(), "mlx" | "ane") && !cfg!(target_os = "macos") {
+        return Err(artifact_invalid_error(format!(
+            "{} model '{}' is only supported on macOS",
+            spec.engine, spec.model_id
+        )));
+    }
 
     let env_prefix = spec.engine.to_ascii_uppercase().replace('.', "_");
     let worker_bin_var = format!("SYNAPSE_{env_prefix}_WORKER_BIN");
@@ -2093,18 +2104,6 @@ fn load_worker_backend_blocking(
     ))
 }
 
-#[cfg(not(unix))]
-fn load_worker_backend_blocking(
-    spec: &StoredModelConfig,
-    _artifact: &ValidatedArtifact,
-    _runtime_config: &RuntimeConfig,
-) -> Result<(EmbedBackend, LoadedModel), WireOperationError> {
-    Err(artifact_invalid_error(format!(
-        "{} model '{}' is only supported on unix",
-        spec.engine, spec.model_id
-    )))
-}
-
 fn unload_embedding_model_blocking(model: Arc<EmbeddingModel>) -> Result<(), WireOperationError> {
     match &model.backend {
         EmbedBackend::Ort(engine) => {
@@ -2117,7 +2116,6 @@ fn unload_embedding_model_blocking(model: Arc<EmbeddingModel>) -> Result<(), Wir
             engine.unload(&model.loaded_model);
             Ok(())
         }
-        #[cfg(unix)]
         EmbedBackend::Worker(engine) => {
             let mut engine = engine.lock().map_err(|_| {
                 WireOperationError::from_stable(
@@ -3577,7 +3575,6 @@ async fn execute_embedding(
             })?
             .map_err(engine_error_to_wire)
         }
-        #[cfg(unix)]
         EmbedBackend::Worker(engine) => {
             let engine = Arc::clone(engine);
             let loaded_model = model.loaded_model.clone();
@@ -3625,7 +3622,6 @@ async fn execute_rerank(
             StableError::artifact_invalid(),
             format!("model '{}' does not support rerank.score", model.model_id),
         )),
-        #[cfg(unix)]
         EmbedBackend::Worker(engine) => {
             let engine = Arc::clone(engine);
             let loaded_model = model.loaded_model.clone();
@@ -3676,7 +3672,6 @@ async fn execute_generate(
                 model.model_id
             ),
         )),
-        #[cfg(unix)]
         EmbedBackend::Worker(engine) => {
             let engine = Arc::clone(engine);
             let loaded_model = model.loaded_model.clone();
@@ -5175,16 +5170,10 @@ fn lane_measurement_rows(state: &ModuleState, fingerprint: &Fingerprint) -> Lane
     }
 }
 
-#[cfg(unix)]
 fn worker_health_from_slot(slot: &ModelSlotSnapshot) -> Option<worker_host::WorkerHostHealth> {
     slot.loaded
         .as_ref()
         .and_then(|model| worker_health_for_model(model))
-}
-
-#[cfg(not(unix))]
-fn worker_health_from_slot(_slot: &ModelSlotSnapshot) -> Option<Value> {
-    None
 }
 
 fn lane_blocking_reason(
@@ -5201,7 +5190,7 @@ fn lane_blocking_reason(
     );
     if worker_quarantined || failed_quarantined {
         Some("quarantined")
-    } else if !cfg!(unix) && matches!(slot.spec.engine.as_str(), "llama" | "mlx" | "ane") {
+    } else if !cfg!(target_os = "macos") && matches!(slot.spec.engine.as_str(), "mlx" | "ane") {
         Some("unsupported_platform")
     } else {
         Some("probe_required")
