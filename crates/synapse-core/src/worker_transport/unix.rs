@@ -41,11 +41,14 @@ pub fn bind_listener(socket_path: &std::path::Path) -> Result<UnixListener, Tran
 }
 
 pub async fn accept_worker_handshake(
-    listener: &UnixListener,
+    listener: UnixListener,
     expected_nonce: &str,
     max_frame: u32,
     handshake_timeout: Duration,
 ) -> Result<UnixStream, TransportError> {
+    // By-value for signature parity with the Windows named-pipe variant,
+    // where the listener instance IS the connection after accept. Each spawn
+    // prepares a fresh listener, so single-accept ownership is the contract.
     let accept = timeout(handshake_timeout, listener.accept())
         .await
         .map_err(|_| TransportError::Protocol("worker handshake timed out".to_string()))?;

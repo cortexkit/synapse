@@ -38,16 +38,19 @@ pub fn bind_listener(pipe_name: &str) -> Result<NamedPipeServer, TransportError>
 }
 
 pub async fn accept_worker_handshake(
-    server: &NamedPipeServer,
+    mut server: NamedPipeServer,
     expected_nonce: &str,
     max_frame: u32,
     handshake_timeout: Duration,
 ) -> Result<NamedPipeServer, TransportError> {
+    // A named-pipe server instance becomes the connection once a client
+    // connects (unlike a unix listener, which yields a separate stream), so
+    // this takes the listener by value and returns it as the stream.
     timeout(handshake_timeout, server.connect())
         .await
         .map_err(|_| TransportError::Protocol("worker handshake timed out".to_string()))??;
-    handshake_on_stream(server, expected_nonce, max_frame, handshake_timeout).await?;
-    Ok(server.clone())
+    handshake_on_stream(&mut server, expected_nonce, max_frame, handshake_timeout).await?;
+    Ok(server)
 }
 
 pub async fn handshake_on_stream<S>(

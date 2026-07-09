@@ -573,7 +573,7 @@ impl WorkerHost {
         }
 
         let stream = match accept_worker_handshake(
-            &listener,
+            listener,
             &nonce,
             self.config.max_frame,
             self.config.handshake_timeout,
@@ -1039,7 +1039,7 @@ mod tests {
                 .unwrap();
         });
         let error: WorkerHostError = accept_worker_handshake(
-            &listener,
+            listener,
             "expectednonce000",
             DEFAULT_MAX_FRAME_BYTES,
             Duration::from_secs(1),
