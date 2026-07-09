@@ -684,7 +684,9 @@ fn run_embed(args: EmbedArgs) -> Result<()> {
         Some(reference_path) => {
             let reference_vectors = load_reference(reference_path)?;
             let (mean_cosine, matched) = mean_parity(
-                vectors.iter().map(|vector| (vector.id.clone(), vector.vec.clone())),
+                vectors
+                    .iter()
+                    .map(|vector| (vector.id.clone(), vector.vec.clone())),
                 &reference_vectors,
             );
             ensure!(

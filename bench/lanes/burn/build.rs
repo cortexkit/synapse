@@ -161,7 +161,9 @@ fn find_latest_snapshot(repo: &str, suffix: &[&str]) -> Option<PathBuf> {
     entries.sort();
     entries.reverse();
     for entry in entries {
-        let candidate = suffix.iter().fold(entry.clone(), |path, segment| path.join(segment));
+        let candidate = suffix
+            .iter()
+            .fold(entry.clone(), |path, segment| path.join(segment));
         if candidate.exists() {
             return Some(candidate);
         }
@@ -178,9 +180,9 @@ enum ProbeOutcome {
 impl ProbeOutcome {
     fn summary(&self) -> &str {
         match self {
-            ProbeOutcome::Imported(msg) | ProbeOutcome::Failed(msg) | ProbeOutcome::Skipped(msg) => {
-                msg.as_str()
-            }
+            ProbeOutcome::Imported(msg)
+            | ProbeOutcome::Failed(msg)
+            | ProbeOutcome::Skipped(msg) => msg.as_str(),
         }
     }
 }

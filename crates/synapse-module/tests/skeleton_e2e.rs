@@ -648,12 +648,21 @@ async fn probe_report_exposes_blocking_reasons_perf_rows_and_default_assignments
     .await;
     assert_eq!(before["result"]["current_knob"], "balanced");
     assert_eq!(before["result"]["lanes"].as_array().unwrap().len(), 1);
-    assert_eq!(before["result"]["lanes"][0]["blocking_reason"], "probe_required");
+    assert_eq!(
+        before["result"]["lanes"][0]["blocking_reason"],
+        "probe_required"
+    );
     assert_eq!(before["result"]["lanes"][0]["performance"], Value::Null);
 
     let probed = certify_preloaded_models(&mut consumer, route_channel, 86).await;
     assert_eq!(probed["result"]["current_knob"], "balanced");
-    assert_eq!(probed["result"]["knob_assignments"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        probed["result"]["knob_assignments"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
     let perf = &probed["result"]["lanes"][0]["performance"];
     assert!(perf["throughput_tok_s"].as_f64().unwrap() > 0.0);
     assert!(perf["cold_load_ms"].as_f64().unwrap() >= 0.0);
@@ -734,7 +743,10 @@ async fn quiet_knob_restart_uses_persisted_assignment() {
     )
     .await;
     assert_eq!(quiet_report["result"]["current_knob"], "quiet");
-    assert_eq!(quiet_report["result"]["active_assignments"][0]["model_id"], quiet_model_id);
+    assert_eq!(
+        quiet_report["result"]["active_assignments"][0]["model_id"],
+        quiet_model_id
+    );
 
     let first = route_request(
         &mut consumer,
@@ -796,11 +808,20 @@ async fn os_build_override_marks_probe_rows_stale_in_report_and_status() {
     .await;
     assert_eq!(report["result"]["certification_stale"], true);
     assert_eq!(report["result"]["performance_stale"], true);
-    assert_eq!(report["result"]["lanes"][0]["blocking_reason"], "probe_required");
+    assert_eq!(
+        report["result"]["lanes"][0]["blocking_reason"],
+        "probe_required"
+    );
     assert_eq!(report["result"]["lanes"][0]["certification"]["stale"], true);
     assert_eq!(report["result"]["lanes"][0]["performance"]["stale"], true);
-    assert_eq!(report["result"]["lanes"][0]["certification"]["stale_os_build"], true);
-    assert_eq!(report["result"]["lanes"][0]["performance"]["stale_os_build"], true);
+    assert_eq!(
+        report["result"]["lanes"][0]["certification"]["stale_os_build"],
+        true
+    );
+    assert_eq!(
+        report["result"]["lanes"][0]["performance"]["stale_os_build"],
+        true
+    );
 
     ensure_model_loaded_by_query(&mut consumer, route_channel, 132, "minilm").await;
     let status = route_request(
@@ -1085,7 +1106,10 @@ async fn model_load_restart_mid_download_marks_job_restarted_and_resubmit_succee
         match body["result"]["state"].as_str() {
             Some("downloading") => break,
             Some("resolving" | "validating" | "loading") => {
-                assert!(Instant::now() < deadline, "model.load never reached downloading: {body:?}");
+                assert!(
+                    Instant::now() < deadline,
+                    "model.load never reached downloading: {body:?}"
+                );
                 corr += 1;
                 sleep(Duration::from_millis(50)).await;
             }
@@ -1112,7 +1136,10 @@ async fn model_load_restart_mid_download_marks_job_restarted_and_resubmit_succee
     )
     .await;
     assert_eq!(restarted_status["result"]["state"], "failed");
-    assert_eq!(restarted_status["result"]["error"]["code"], "module_restarted");
+    assert_eq!(
+        restarted_status["result"]["error"]["code"],
+        "module_restarted"
+    );
 
     let retried = route_request(&mut consumer, route_channel, 22_200, request).await;
     let retried_job_id = retried["result"]["job_id"].as_str().unwrap().to_string();
@@ -1329,7 +1356,9 @@ fn overwrite_knob_assignment(
     knob: &str,
     lane: &Value,
 ) {
-    let performance = lane["performance"].as_object().expect("lane performance row");
+    let performance = lane["performance"]
+        .as_object()
+        .expect("lane performance row");
     let conn = Connection::open(store_path).expect("open synapse store");
     let changed = conn
         .execute(

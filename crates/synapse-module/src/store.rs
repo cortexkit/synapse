@@ -398,9 +398,8 @@ impl SynapseStore {
 
     pub fn catalog_models(&self) -> Result<Vec<StoredModelConfig>, SynapseStoreError> {
         let models = self.store.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT config_json FROM models ORDER BY created_ms ASC, model_id ASC",
-            )?;
+            let mut stmt = conn
+                .prepare("SELECT config_json FROM models ORDER BY created_ms ASC, model_id ASC")?;
             let rows = stmt
                 .query_map([], |row| decode_model_config(row.get::<_, Vec<u8>>(0)?))?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -620,7 +619,10 @@ impl SynapseStore {
         raw.map(decode_perf_row).transpose()
     }
 
-    pub fn latest_perf_row(&self, fingerprint: &Fingerprint) -> Result<Option<PerfRow>, SynapseStoreError> {
+    pub fn latest_perf_row(
+        &self,
+        fingerprint: &Fingerprint,
+    ) -> Result<Option<PerfRow>, SynapseStoreError> {
         let raw = self.store.with_conn(|conn| {
             conn.query_row(
                 "SELECT machine_profile_hash, model_id, workload, numeric_profile_id, fingerprint,
@@ -638,7 +640,10 @@ impl SynapseStore {
         raw.map(decode_perf_row).transpose()
     }
 
-    pub fn current_perf_rows(&self, machine_profile_hash: &str) -> Result<Vec<PerfRow>, SynapseStoreError> {
+    pub fn current_perf_rows(
+        &self,
+        machine_profile_hash: &str,
+    ) -> Result<Vec<PerfRow>, SynapseStoreError> {
         let rows = self.store.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT machine_profile_hash, model_id, workload, numeric_profile_id, fingerprint,
@@ -731,7 +736,9 @@ impl SynapseStore {
             )?;
             let rows = stmt
                 .query_map(params![machine_profile_hash], knob_assignment_from_row)?
-                .map(|row| row.and_then(|raw| decode_knob_assignment_row(raw).map_err(to_sql_error)))
+                .map(|row| {
+                    row.and_then(|raw| decode_knob_assignment_row(raw).map_err(to_sql_error))
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(rows)
         })?;
@@ -1198,11 +1205,7 @@ fn decode_knob_assignment_row(
 }
 
 fn to_sql_error(error: SynapseStoreError) -> rusqlite::Error {
-    rusqlite::Error::FromSqlConversionFailure(
-        0,
-        rusqlite::types::Type::Text,
-        Box::new(error),
-    )
+    rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
 }
 
 fn table_epoch_tx(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<i64> {
@@ -1254,11 +1257,7 @@ fn decode_optional_json(bytes: Option<Vec<u8>>, index: usize) -> rusqlite::Resul
 
 fn decode_model_config(bytes: Vec<u8>) -> rusqlite::Result<StoredModelConfig> {
     serde_json::from_slice(&bytes).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(
-            0,
-            rusqlite::types::Type::Blob,
-            Box::new(error),
-        )
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Blob, Box::new(error))
     })
 }
 

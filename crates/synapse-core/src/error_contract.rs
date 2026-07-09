@@ -157,7 +157,8 @@ mod tests {
         ];
 
         let json = serde_json::to_string(&errors).expect("serialize stable errors");
-        let decoded: Vec<StableError> = serde_json::from_str(&json).expect("deserialize stable errors");
+        let decoded: Vec<StableError> =
+            serde_json::from_str(&json).expect("deserialize stable errors");
         assert_eq!(decoded, errors);
     }
 }

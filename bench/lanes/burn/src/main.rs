@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use burn::backend::{Metal, wgpu::WgpuDevice};
+use burn::backend::{wgpu::WgpuDevice, Metal};
 use burn::prelude::{Float, Int};
 use burn::tensor::TensorData;
 use clap::Parser;
@@ -94,13 +94,22 @@ fn main() -> Result<()> {
     order.sort_by_key(|&i| encodings[i].get_ids().len());
     let chunks: Vec<Chunk> = {
         let mut src: Vec<Option<Chunk>> = chunks.into_iter().map(Some).collect();
-        order.iter().map(|&i| src[i].take().expect("each index taken once")).collect()
+        order
+            .iter()
+            .map(|&i| src[i].take().expect("each index taken once"))
+            .collect()
     };
     let encodings: Vec<_> = {
         let mut src: Vec<Option<_>> = encodings.into_iter().map(Some).collect();
-        order.iter().map(|&i| src[i].take().expect("each index taken once")).collect()
+        order
+            .iter()
+            .map(|&i| src[i].take().expect("each index taken once"))
+            .collect()
     };
-    let lengths: Vec<usize> = encodings.iter().map(|encoding| encoding.get_ids().len()).collect();
+    let lengths: Vec<usize> = encodings
+        .iter()
+        .map(|encoding| encoding.get_ids().len())
+        .collect();
 
     let infer_started = Instant::now();
     let mut input_tokens = 0u64;
@@ -179,7 +188,11 @@ fn main() -> Result<()> {
     std::fs::write(&args.out, serde_json::to_string_pretty(&result)?)?;
     eprintln!(
         "burn-wgpu-embed: {} items, {} tokens, {:.1} tok/s, cold_load {:.1}s, infer {:.1}s",
-        result.items, result.input_tokens, result.tok_per_s, result.cold_load_s, result.infer_wall_s
+        result.items,
+        result.input_tokens,
+        result.tok_per_s,
+        result.cold_load_s,
+        result.infer_wall_s
     );
     println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
@@ -226,7 +239,10 @@ fn run_batch(
     let last_hidden_state = model.forward(input_ids, attention_mask, token_type_ids);
     let shape: [usize; 3] = last_hidden_state.shape().dims();
     let [actual_batch, seq_len, hidden] = shape;
-    anyhow::ensure!(actual_batch == batch, "batch mismatch: expected {batch}, got {actual_batch}");
+    anyhow::ensure!(
+        actual_batch == batch,
+        "batch mismatch: expected {batch}, got {actual_batch}"
+    );
 
     let tensor_data = last_hidden_state.into_data();
     let hidden_data = tensor_data
@@ -294,9 +310,12 @@ fn normalize(vector: &mut [f32]) {
 }
 
 fn validate_runtime_model_path(runtime_model: &Path) -> Result<()> {
-    let runtime = runtime_model
-        .canonicalize()
-        .with_context(|| format!("runtime model path does not exist: {}", runtime_model.display()))?;
+    let runtime = runtime_model.canonicalize().with_context(|| {
+        format!(
+            "runtime model path does not exist: {}",
+            runtime_model.display()
+        )
+    })?;
     let compiled = Path::new(COMPILED_MODEL_PATH)
         .canonicalize()
         .with_context(|| format!("compiled model path does not exist: {COMPILED_MODEL_PATH}"))?;

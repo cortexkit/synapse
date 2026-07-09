@@ -89,13 +89,27 @@ enum Command {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Corpus { root, out, tokenizer, target, token_budget } => {
-            corpus::build(&root, &out, &tokenizer, target, token_budget)
-        }
-        Command::Power { out, interval_ms, skip_idle_check, max_cpu, max_gpu, cmd } => {
-            metrics::run_wrapped(&out, interval_ms, &cmd, skip_idle_check, max_cpu, max_gpu)
-        }
-        Command::Parity { reference, candidate, k, stride } => {
+        Command::Corpus {
+            root,
+            out,
+            tokenizer,
+            target,
+            token_budget,
+        } => corpus::build(&root, &out, &tokenizer, target, token_budget),
+        Command::Power {
+            out,
+            interval_ms,
+            skip_idle_check,
+            max_cpu,
+            max_gpu,
+            cmd,
+        } => metrics::run_wrapped(&out, interval_ms, &cmd, skip_idle_check, max_cpu, max_gpu),
+        Command::Parity {
+            reference,
+            candidate,
+            k,
+            stride,
+        } => {
             let reference = parity::load_reference(&reference)?;
             let candidate_vecs = parity::load_reference(&candidate)?;
             let (mean, matched) = parity::mean_parity(

@@ -36,8 +36,8 @@ pub fn build(
     target: usize,
     token_budget: usize,
 ) -> Result<()> {
-    let tokenizer = Tokenizer::from_file(tokenizer_path)
-        .map_err(|e| anyhow::anyhow!("tokenizer load: {e}"))?;
+    let tokenizer =
+        Tokenizer::from_file(tokenizer_path).map_err(|e| anyhow::anyhow!("tokenizer load: {e}"))?;
 
     if let Some(parent) = out.parent() {
         std::fs::create_dir_all(parent)?;
@@ -67,8 +67,14 @@ pub fn build(
     let mut total_tokens = 0usize;
 
     'outer: for file in files {
-        let Ok(content) = std::fs::read_to_string(&file) else { continue };
-        let rel = file.strip_prefix(root).unwrap_or(&file).to_string_lossy().to_string();
+        let Ok(content) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        let rel = file
+            .strip_prefix(root)
+            .unwrap_or(&file)
+            .to_string_lossy()
+            .to_string();
         let lines: Vec<&str> = content.lines().collect();
 
         let mut start = 0usize;
