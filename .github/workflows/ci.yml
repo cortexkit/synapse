@@ -78,10 +78,8 @@ jobs:
             choco install llvm -y --no-progress | Out-Null
           }
           echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
-          # One CRT flavor across llama.cpp (cmake), cc-built C deps, and rust:
-          # static release CRT (/MT + libcmt via .cargo/config.toml crt-static).
-          # Tests run --release on this lane because rust always links the
-          # release CRT while cc/cmake debug profiles would pick /MTd.
+          # Static CRT everywhere (see .cargo/config.toml): llama.cpp's cmake
+          # must match the MT_* objects that esaxx/onig hardcode via cc.
           echo "LLAMA_STATIC_CRT=1" >> $env:GITHUB_ENV
 
       - name: MiniLM e2e fixture cache
@@ -130,6 +128,11 @@ jobs:
           fi
           cargo clippy $crates --all-targets -- -D warnings
 
+      # Windows tests run --release: rust links the release CRT even in debug
+      # builds, while cc-built C++ deps (esaxx, onig) follow the cargo profile
+      # — release everywhere is the only combination where every object agrees
+      # on MD_DynamicRelease (llama.cpp's cmake default matches cc's release
+      # default and rust's msvcrt default).
       - name: nextest
         working-directory: synapse
         shell: bash
