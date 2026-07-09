@@ -2,15 +2,36 @@
 
 ## Pattern Overview
 
-**Overall:** Serial, Idle-Gated Multi-Lane Benchmarking Harness.
+**Overall:** Serial, Idle-Gated Multi-Lane Benchmarking Harness AND the Production Synapse Engine runtime.
 
 **Key Characteristics:**
-- **Serial Execution under Idle-Gate Constraints:** Prevent measurement contamination by ensuring the host machine is idle (average CPU <= 15%, GPU <= 5% for 6 seconds) before starting any run.
-- **Self-Contained Execution Lanes:** Separate binaries or runtime environments for each target (`lane-ort-embed`, `lane-mlx`, `lane-llama`, `lane-burn`, `lane-wrap-embed`, `mlx-minilm`, `ts-embed`, `potion`) compile/execute independently to avoid compile-time dependency leakage or driver pollution. Key lanes (`lane-ort-embed`, `lane-llama`) support cross-platform builds, dynamically loading `ort` on Windows via DLL boundary to sidestep CRT conflicts and enable DirectML, and using Windows-specific tasklist process RSS sampling and cfg-gated shutdown.
-- **Numerical Parity Auditing:** Quantify accuracy drift across acceleration targets by calculating the mean cosine similarity of generated embeddings against a CPU-based `ort` (ONNX Runtime) reference lane. Perform rank-stability auditing (top-k neighbor overlap) to detect quantization-induced reordering.
+- **Local Inference Service:** The primary production system (`synapse-module`) acts as a persistent SubC node that receives embedding, generation, and reranking requests. It routes work via a 3-class fair-share aging scheduler to underlying engine lanes.
+- **Hardware-Specific Workers:** Model inference runs outside the host process via supervised binary children (`synapse-worker-mlx`, `synapse-worker-ane`, `synapse-worker-llama`). The host speaks to them over UNIX domain sockets using a fast binary framing protocol.
+- **Content-Addressed Cache & Durable Jobs:** Persistent SQLite storage manages model downloading (with concurrent shared-lease readers and a two-phase GC), machine capability probing, alias translation, and restartable generation requests.
+- **Serial Execution under Idle-Gate Constraints (Bench Harness):** Prevent measurement contamination by ensuring the host machine is idle (average CPU <= 15%, GPU <= 5% for 6 seconds) before starting any evaluation run.
+- **Self-Contained Execution Lanes (Bench Harness):** Separate binaries or runtime environments for each target evaluate hardware backends before promoting them to production workers.
+- **Numerical Parity Auditing (Bench Harness):** Quantify accuracy drift across acceleration targets by calculating the mean cosine similarity of generated embeddings against a CPU-based `ort` (ONNX Runtime) reference lane.
 - **Retrieval Quality and Reranking Parity Auditing:** Assess retrieval quality using offline evaluation datasets (COSQA, CodeSearchNet-Python) from the CoIR suite. Reranking workloads compare candidate scores against reference Alibaba-NLP/gte-reranker-modernbert-base scores to evaluate score drift and rank stability.
 
 ## Layers
+
+**Synapse SubC Module (`synapse-module`):**
+- Purpose: The main service listening on the SubC bus. Handles route binding, job admission, the model cache, and worker lifecycle supervision.
+- Location: `crates/synapse-module`
+- Contains: A 3-class aging scheduler, SQLite durable job and cache lease state, machine probe certification logic, and socket-based worker host.
+- Depends on: `synapse-core`, `subc-client-rs`, `rusqlite`, `tokio`.
+
+**Synapse Worker Lanes (`synapse-worker-*`):**
+- Purpose: Execute in-memory tokenization, tensor forward passes, and pooling for specific hardware classes (Apple Silicon MLX, Apple Neural Engine, Llama GGUF).
+- Location: `crates/synapse-worker-mlx`, `crates/synapse-worker-ane`, `crates/synapse-worker-llama`
+- Contains: Metal-accelerated customized MLX models, CoreML graphs, and `llama.cpp` inference processes.
+- Depends on: `synapse-core`, `mlx-rs`, `coreml` (via Swift), `reqwest`.
+- Used by: The `synapse-module` host spawning them dynamically based on user requests and capability tiers.
+
+**Synapse Core Abstractions (`synapse-core`):**
+- Purpose: Core vocabulary structs, engine traits, and error contracts shared between the host and its workers.
+- Location: `crates/synapse-core`
+- Contains: `WorkerHello` handshake and binary framing logic, `EngineError` contract, `RuntimeConfig`, `TokenBatch`, and scheduling traits.
 
 **Benchmark Harness Core:**
 - Purpose: Provides CLI commands for corpus generation, power-monitored process wrapping, result schema definition, and numerical parity functions.
@@ -49,7 +70,17 @@
 
 ## Data Flow
 
-**Corpus Generation Flow:**
+**Production Inference Flow:**
+
+1. Route request received via SubC — `crates/synapse-module/src/lib.rs`
+2. Validate alias surfaces, apply machine capability capability profiles (Perf/Quiet tiers), and admit into job table — `crates/synapse-module/src/store.rs`
+3. Download/Verify models through content-addressed cache with shared leases — `crates/synapse-module/src/store.rs`
+4. Admit task to the Fair-Share Aging Scheduler (3-class: Embed, Generation, System) — `crates/synapse-core/src/scheduler.rs`
+5. Handshake and spawn the appropriate Worker lane — `crates/synapse-module/src/worker_host.rs`
+6. Submit frames over UNIX domain socket, accumulate partial outputs or vector results — `crates/synapse-core/src/worker_protocol.rs`
+7. Mark durable job completed and return response envelope to SubC — `crates/synapse-module/src/lib.rs`
+
+**Corpus Generation Flow (Bench):**
 
 1. Scan files recursively from a source code tree — `bench/harness/src/main.rs`
 2. Parse text and split contents into chunks constrained by token budgets — `bench/harness/src/corpus.rs`
@@ -85,6 +116,21 @@
 
 ## Key Abstractions
 
+**Worker Framing Protocol:**
+- Purpose: A byte-exact IPC mechanism sending dynamic float and integer arrays between the Rust host and worker children over sockets.
+- Location: `crates/synapse-core/src/worker_protocol.rs`
+- Pattern: Binary Serialization (e.g., `decode_f32_frame`, `encode_i32_frame`).
+
+**Fair-Share Scheduler:**
+- Purpose: Manage execution time slices across queued, active, and completed jobs, guaranteeing that background operations don't starve foreground priority work.
+- Location: `crates/synapse-core/src/scheduler.rs`
+- Pattern: Trait-based State Machine Interface.
+
+**Content-Addressed Lease Cache:**
+- Purpose: Safe and crash-resilient model storage using atomic file renaming and reference-counted shared leases preventing active models from two-phase garbage collection.
+- Location: `crates/synapse-module/src/store.rs`
+- Pattern: Persistent DB Leasing.
+
 **LaneResult:**
 - Purpose: Unified schema for reporting execution performance, throughput metrics, telemetry outputs, and parity calculations.
 - Location: `bench/harness/src/results.rs`
@@ -106,6 +152,16 @@
 - Pattern: Guard clause loop checking CPU and GPU utilization thresholds.
 
 ## Entry Points
+
+**Synapse Module Main:**
+- Location: `crates/synapse-module/src/main.rs`
+- Triggers: Starts the primary SubC worker process.
+- Responsibilities: DB initializations, environment bootstrapping, SubC binding registrations, and polling the scheduler.
+
+**Worker Binaries:**
+- Location: `crates/synapse-worker-*/src/main.rs`
+- Triggers: Spawned directly by `synapse-module/src/worker_host.rs`.
+- Responsibilities: Initializing accelerator graphs/sessions (MLX, ANE, Llama), socket handshaking, loop listening for compute requests, returning tensors.
 
 **Bench Harness CLI (`synapse-bench`):**
 - Location: `bench/harness/src/main.rs`
@@ -134,7 +190,12 @@
 
 ## Error Handling
 
-**Strategy:** Fail-fast utilizing `anyhow::Result` error propagation with contextual layers (`.context()`).
+**Strategy:** Fail-fast utilizing `anyhow::Result` and typed subsystem errors (`SubcModuleError`, `EngineError`) with contextual layers.
+- **Worker Crash Domain:** If a worker binary crashes, deadlocks, or hangs, the `synapse-module` supervisor reclaims the job. Workers isolate dirty driver states, preventing host process termination.
+- **Durable Job Resiliency:** Jobs track their generation cycles. Crash-interrupted requests can be recovered via idempotent request keys if the host restarts.
+- **SubC Communication:** Submodule failures strictly return properly formatted error envelopes detailing the specific layer failure (e.g., CacheMiss, EngineOOM).
+
+**Bench Harness Strategy:** Fail-fast utilizing `anyhow::Result` error propagation with contextual layers (`.context()`).
 - **Child Supervision:** Spawned subprocesses (`llama-server`) are tracked via PID. If a child dies or fails to bind to its designated port within `HEALTH_TIMEOUT` (120s), the lane runner fails immediately rather than silently hanging. Platform-specific process control signals (such as SIGTERM on Unix) are gated appropriately so subprocess lifecycles function seamlessly on both Windows and Unix platforms.
 - **HTTP Resiliency:** Requests to external wrapping endpoints (`wrap-embed`) implement read timeouts, connect timeouts, and bounded retry loops with backoff to recover from transient rate limits or cold-load stalls.
 
