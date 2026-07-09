@@ -130,7 +130,6 @@ mod tests {
     use crate::worker_transport::worker_pipe_name;
     use crate::EngineIdentity;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::Arc;
     use std::time::SystemTime;
     use tokio::net::windows::named_pipe::ClientOptions;
 
