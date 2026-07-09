@@ -28,7 +28,11 @@ anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive"] }
-tokenizers = "0.21"
+# default-features minus esaxx_fast: esaxx-rs hardcodes a static MSVC CRT in
+# its C++ build, which can never link against llama.cpp's dynamic-CRT objects
+# on Windows. esaxx only accelerates the unigram TRAINER — Synapse never
+# trains tokenizers, so the pure-Rust fallback path is not even exercised.
+tokenizers = { version = "0.21", default-features = false, features = ["progressbar", "onig"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 hex = "0.4"
 rusqlite = { version = "0.32", features = ["bundled"] }

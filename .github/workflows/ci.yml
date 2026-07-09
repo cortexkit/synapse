@@ -83,9 +83,6 @@ jobs:
             choco install llvm -y --no-progress | Out-Null
           }
           echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
-          # Static CRT everywhere (see .cargo/config.toml): llama.cpp's cmake
-          # must match the MT_* objects that esaxx/onig hardcode via cc.
-          echo "LLAMA_STATIC_CRT=1" >> $env:GITHUB_ENV
 
       - name: MiniLM e2e fixture cache
         id: fixture-cache
