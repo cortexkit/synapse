@@ -73,6 +73,10 @@ jobs:
         if: matrix.name == 'windows'
         shell: pwsh
         run: |
+          # Blacksmith's windows image does not ship LLVM (unlike GitHub-hosted).
+          if (!(Test-Path "C:\Program Files\LLVM\bin\libclang.dll")) {
+            choco install llvm -y --no-progress | Out-Null
+          }
           echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
 
       - name: MiniLM e2e fixture cache
