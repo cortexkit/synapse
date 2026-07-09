@@ -12,6 +12,8 @@ use sha2::{Digest, Sha256};
 use synapse_core::{AliasRow, AliasTable, EngineIdentity, Fingerprint, NumericProfileId};
 use thiserror::Error;
 
+use crate::PerfKnob;
+
 const NAMESPACE: &str = "synapse_module";
 pub const JOB_STATE_QUEUED: &str = "queued";
 pub const JOB_STATE_RUNNING: &str = "running";
@@ -141,6 +143,69 @@ const MIGRATIONS: &[Migration] = &[
                  CREATE INDEX models_fingerprint_idx ON models(fingerprint);
         "#,
     },
+    Migration {
+        version: 5,
+        statements: r#"
+                 DROP INDEX IF EXISTS cert_rows_fingerprint_idx;
+                 ALTER TABLE cert_rows RENAME TO cert_rows_v4;
+                 CREATE TABLE cert_rows (
+                     machine_profile_hash TEXT NOT NULL,
+                     numeric_profile_id TEXT NOT NULL,
+                     fingerprint TEXT NOT NULL,
+                     certified_at_ms INTEGER NOT NULL,
+                     os_build TEXT NOT NULL,
+                     module_generation INTEGER NOT NULL,
+                     evidence_json TEXT NOT NULL,
+                     PRIMARY KEY (machine_profile_hash, fingerprint)
+                 );
+                 INSERT INTO cert_rows (
+                     machine_profile_hash, numeric_profile_id, fingerprint, certified_at_ms,
+                     os_build, module_generation, evidence_json
+                 )
+                 SELECT machine_profile_hash, numeric_profile_id, fingerprint, certified_at_ms,
+                        '', 0, evidence_json
+                 FROM cert_rows_v4;
+                 DROP TABLE cert_rows_v4;
+                 CREATE INDEX cert_rows_fingerprint_idx ON cert_rows(fingerprint);
+
+                 CREATE TABLE perf_rows (
+                     machine_profile_hash TEXT NOT NULL,
+                     model_id TEXT NOT NULL,
+                     workload TEXT NOT NULL,
+                     numeric_profile_id TEXT NOT NULL,
+                     fingerprint TEXT NOT NULL,
+                     engine TEXT NOT NULL,
+                     measured_at_ms INTEGER NOT NULL,
+                     os_build TEXT NOT NULL,
+                     module_generation INTEGER NOT NULL,
+                     throughput_tok_s REAL NOT NULL,
+                     cold_load_ms REAL NOT NULL,
+                     single_item_latency_p50_ms REAL NOT NULL,
+                     details_json TEXT NOT NULL,
+                     PRIMARY KEY (machine_profile_hash, fingerprint)
+                 );
+                 CREATE INDEX perf_rows_fingerprint_idx ON perf_rows(fingerprint);
+                 CREATE INDEX perf_rows_workload_idx ON perf_rows(machine_profile_hash, workload);
+
+                 CREATE TABLE knob_assignments (
+                     machine_profile_hash TEXT NOT NULL,
+                     workload TEXT NOT NULL,
+                     knob TEXT NOT NULL,
+                     model_id TEXT NOT NULL,
+                     numeric_profile_id TEXT NOT NULL,
+                     fingerprint TEXT NOT NULL,
+                     engine TEXT NOT NULL,
+                     measured_at_ms INTEGER NOT NULL,
+                     os_build TEXT NOT NULL,
+                     module_generation INTEGER NOT NULL,
+                     throughput_tok_s REAL NOT NULL,
+                     single_item_latency_p50_ms REAL NOT NULL,
+                     PRIMARY KEY (machine_profile_hash, workload, knob)
+                 );
+                 CREATE INDEX knob_assignments_lookup_idx
+                     ON knob_assignments(machine_profile_hash, knob, workload);
+        "#,
+    },
 ];
 
 static JOB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -151,6 +216,8 @@ pub enum SynapseStoreError {
     Store(#[from] StoreError),
     #[error("synapse store json: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("synapse store decode: {0}")]
+    Decode(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -206,7 +273,42 @@ pub struct CertificationRow {
     pub numeric_profile_id: NumericProfileId,
     pub fingerprint: Fingerprint,
     pub certified_at_ms: u64,
+    pub os_build: String,
+    pub module_generation: u64,
     pub evidence: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct PerfRow {
+    pub machine_profile_hash: String,
+    pub model_id: String,
+    pub workload: String,
+    pub numeric_profile_id: NumericProfileId,
+    pub fingerprint: Fingerprint,
+    pub engine: String,
+    pub measured_at_ms: u64,
+    pub os_build: String,
+    pub module_generation: u64,
+    pub throughput_tok_s: f64,
+    pub cold_load_ms: f64,
+    pub single_item_latency_p50_ms: f64,
+    pub details: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct KnobAssignmentRow {
+    pub machine_profile_hash: String,
+    pub workload: String,
+    pub knob: PerfKnob,
+    pub model_id: String,
+    pub numeric_profile_id: NumericProfileId,
+    pub fingerprint: Fingerprint,
+    pub engine: String,
+    pub measured_at_ms: u64,
+    pub os_build: String,
+    pub module_generation: u64,
+    pub throughput_tok_s: f64,
+    pub single_item_latency_p50_ms: f64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -381,17 +483,23 @@ impl SynapseStore {
         let evidence_json = serde_json::to_string(&row.evidence)?;
         self.store.with_conn_fenced(|tx| {
             tx.execute(
-                "INSERT INTO cert_rows (machine_profile_hash, numeric_profile_id, fingerprint, certified_at_ms, evidence_json) \
-                 VALUES (?1, ?2, ?3, ?4, ?5) \
-                 ON CONFLICT(machine_profile_hash, fingerprint) DO UPDATE SET \
-                 numeric_profile_id = excluded.numeric_profile_id, \
-                 certified_at_ms = excluded.certified_at_ms, \
-                 evidence_json = excluded.evidence_json",
+                "INSERT INTO cert_rows (
+                     machine_profile_hash, numeric_profile_id, fingerprint, certified_at_ms,
+                     os_build, module_generation, evidence_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(machine_profile_hash, fingerprint) DO UPDATE SET
+                     numeric_profile_id = excluded.numeric_profile_id,
+                     certified_at_ms = excluded.certified_at_ms,
+                     os_build = excluded.os_build,
+                     module_generation = excluded.module_generation,
+                     evidence_json = excluded.evidence_json",
                 params![
                     &row.machine_profile_hash,
                     &row.numeric_profile_id.0,
                     &row.fingerprint.0,
                     row.certified_at_ms as i64,
+                    &row.os_build,
+                    row.module_generation as i64,
                     evidence_json,
                 ],
             )
@@ -406,9 +514,30 @@ impl SynapseStore {
     ) -> Result<Option<CertificationRow>, SynapseStoreError> {
         let raw = self.store.with_conn(|conn| {
             conn.query_row(
-                "SELECT machine_profile_hash, numeric_profile_id, fingerprint, certified_at_ms, evidence_json \
+                "SELECT machine_profile_hash, numeric_profile_id, fingerprint, certified_at_ms,
+                        os_build, module_generation, evidence_json
                  FROM cert_rows WHERE machine_profile_hash = ?1 AND fingerprint = ?2",
                 params![machine_profile_hash, &fingerprint.0],
+                cert_row_from_row,
+            )
+            .optional()
+        })?;
+        raw.map(decode_cert_row).transpose()
+    }
+
+    pub fn latest_cert_row(
+        &self,
+        fingerprint: &Fingerprint,
+    ) -> Result<Option<CertificationRow>, SynapseStoreError> {
+        let raw = self.store.with_conn(|conn| {
+            conn.query_row(
+                "SELECT machine_profile_hash, numeric_profile_id, fingerprint, certified_at_ms,
+                        os_build, module_generation, evidence_json
+                 FROM cert_rows
+                 WHERE fingerprint = ?1
+                 ORDER BY certified_at_ms DESC
+                 LIMIT 1",
+                params![&fingerprint.0],
                 cert_row_from_row,
             )
             .optional()
@@ -429,6 +558,184 @@ impl SynapseStore {
             )
         })?;
         Ok(count > 0)
+    }
+
+    pub fn store_perf_row(&self, row: &PerfRow) -> Result<(), SynapseStoreError> {
+        let details_json = serde_json::to_string(&row.details)?;
+        self.store.with_conn_fenced(|tx| {
+            tx.execute(
+                "INSERT INTO perf_rows (
+                     machine_profile_hash, model_id, workload, numeric_profile_id, fingerprint,
+                     engine, measured_at_ms, os_build, module_generation, throughput_tok_s,
+                     cold_load_ms, single_item_latency_p50_ms, details_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                 ON CONFLICT(machine_profile_hash, fingerprint) DO UPDATE SET
+                     model_id = excluded.model_id,
+                     workload = excluded.workload,
+                     numeric_profile_id = excluded.numeric_profile_id,
+                     engine = excluded.engine,
+                     measured_at_ms = excluded.measured_at_ms,
+                     os_build = excluded.os_build,
+                     module_generation = excluded.module_generation,
+                     throughput_tok_s = excluded.throughput_tok_s,
+                     cold_load_ms = excluded.cold_load_ms,
+                     single_item_latency_p50_ms = excluded.single_item_latency_p50_ms,
+                     details_json = excluded.details_json",
+                params![
+                    &row.machine_profile_hash,
+                    &row.model_id,
+                    &row.workload,
+                    &row.numeric_profile_id.0,
+                    &row.fingerprint.0,
+                    &row.engine,
+                    row.measured_at_ms as i64,
+                    &row.os_build,
+                    row.module_generation as i64,
+                    row.throughput_tok_s,
+                    row.cold_load_ms,
+                    row.single_item_latency_p50_ms,
+                    details_json,
+                ],
+            )
+        })?;
+        Ok(())
+    }
+
+    pub fn get_perf_row(
+        &self,
+        machine_profile_hash: &str,
+        fingerprint: &Fingerprint,
+    ) -> Result<Option<PerfRow>, SynapseStoreError> {
+        let raw = self.store.with_conn(|conn| {
+            conn.query_row(
+                "SELECT machine_profile_hash, model_id, workload, numeric_profile_id, fingerprint,
+                        engine, measured_at_ms, os_build, module_generation, throughput_tok_s,
+                        cold_load_ms, single_item_latency_p50_ms, details_json
+                 FROM perf_rows WHERE machine_profile_hash = ?1 AND fingerprint = ?2",
+                params![machine_profile_hash, &fingerprint.0],
+                perf_row_from_row,
+            )
+            .optional()
+        })?;
+        raw.map(decode_perf_row).transpose()
+    }
+
+    pub fn latest_perf_row(&self, fingerprint: &Fingerprint) -> Result<Option<PerfRow>, SynapseStoreError> {
+        let raw = self.store.with_conn(|conn| {
+            conn.query_row(
+                "SELECT machine_profile_hash, model_id, workload, numeric_profile_id, fingerprint,
+                        engine, measured_at_ms, os_build, module_generation, throughput_tok_s,
+                        cold_load_ms, single_item_latency_p50_ms, details_json
+                 FROM perf_rows
+                 WHERE fingerprint = ?1
+                 ORDER BY measured_at_ms DESC
+                 LIMIT 1",
+                params![&fingerprint.0],
+                perf_row_from_row,
+            )
+            .optional()
+        })?;
+        raw.map(decode_perf_row).transpose()
+    }
+
+    pub fn current_perf_rows(&self, machine_profile_hash: &str) -> Result<Vec<PerfRow>, SynapseStoreError> {
+        let rows = self.store.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT machine_profile_hash, model_id, workload, numeric_profile_id, fingerprint,
+                        engine, measured_at_ms, os_build, module_generation, throughput_tok_s,
+                        cold_load_ms, single_item_latency_p50_ms, details_json
+                 FROM perf_rows
+                 WHERE machine_profile_hash = ?1
+                 ORDER BY workload ASC, throughput_tok_s DESC, model_id ASC",
+            )?;
+            let rows = stmt
+                .query_map(params![machine_profile_hash], perf_row_from_row)?
+                .map(|row| row.and_then(|raw| decode_perf_row(raw).map_err(to_sql_error)))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })?;
+        Ok(rows)
+    }
+
+    pub fn replace_knob_assignments(
+        &self,
+        machine_profile_hash: &str,
+        rows: &[KnobAssignmentRow],
+    ) -> Result<(), SynapseStoreError> {
+        self.store.with_conn_fenced(|tx| {
+            tx.execute(
+                "DELETE FROM knob_assignments WHERE machine_profile_hash = ?1",
+                params![machine_profile_hash],
+            )?;
+            for row in rows {
+                tx.execute(
+                    "INSERT INTO knob_assignments (
+                         machine_profile_hash, workload, knob, model_id, numeric_profile_id,
+                         fingerprint, engine, measured_at_ms, os_build, module_generation,
+                         throughput_tok_s, single_item_latency_p50_ms
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    params![
+                        &row.machine_profile_hash,
+                        &row.workload,
+                        row.knob.as_str(),
+                        &row.model_id,
+                        &row.numeric_profile_id.0,
+                        &row.fingerprint.0,
+                        &row.engine,
+                        row.measured_at_ms as i64,
+                        &row.os_build,
+                        row.module_generation as i64,
+                        row.throughput_tok_s,
+                        row.single_item_latency_p50_ms,
+                    ],
+                )?;
+            }
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    pub fn knob_assignment(
+        &self,
+        machine_profile_hash: &str,
+        workload: &str,
+        knob: PerfKnob,
+    ) -> Result<Option<KnobAssignmentRow>, SynapseStoreError> {
+        let raw = self.store.with_conn(|conn| {
+            conn.query_row(
+                "SELECT machine_profile_hash, workload, knob, model_id, numeric_profile_id,
+                        fingerprint, engine, measured_at_ms, os_build, module_generation,
+                        throughput_tok_s, single_item_latency_p50_ms
+                 FROM knob_assignments
+                 WHERE machine_profile_hash = ?1 AND workload = ?2 AND knob = ?3",
+                params![machine_profile_hash, workload, knob.as_str()],
+                knob_assignment_from_row,
+            )
+            .optional()
+        })?;
+        raw.map(decode_knob_assignment_row).transpose()
+    }
+
+    pub fn knob_assignments(
+        &self,
+        machine_profile_hash: &str,
+    ) -> Result<Vec<KnobAssignmentRow>, SynapseStoreError> {
+        let rows = self.store.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT machine_profile_hash, workload, knob, model_id, numeric_profile_id,
+                        fingerprint, engine, measured_at_ms, os_build, module_generation,
+                        throughput_tok_s, single_item_latency_p50_ms
+                 FROM knob_assignments
+                 WHERE machine_profile_hash = ?1
+                 ORDER BY workload ASC, knob ASC",
+            )?;
+            let rows = stmt
+                .query_map(params![machine_profile_hash], knob_assignment_from_row)?
+                .map(|row| row.and_then(|raw| decode_knob_assignment_row(raw).map_err(to_sql_error)))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })?;
+        Ok(rows)
     }
 
     pub fn declare_alias_pair(
@@ -758,7 +1065,40 @@ struct RawCertificationRow {
     numeric_profile_id: String,
     fingerprint: String,
     certified_at_ms: u64,
+    os_build: String,
+    module_generation: u64,
     evidence_json: String,
+}
+
+struct RawPerfRow {
+    machine_profile_hash: String,
+    model_id: String,
+    workload: String,
+    numeric_profile_id: String,
+    fingerprint: String,
+    engine: String,
+    measured_at_ms: u64,
+    os_build: String,
+    module_generation: u64,
+    throughput_tok_s: f64,
+    cold_load_ms: f64,
+    single_item_latency_p50_ms: f64,
+    details_json: String,
+}
+
+struct RawKnobAssignmentRow {
+    machine_profile_hash: String,
+    workload: String,
+    knob: String,
+    model_id: String,
+    numeric_profile_id: String,
+    fingerprint: String,
+    engine: String,
+    measured_at_ms: u64,
+    os_build: String,
+    module_generation: u64,
+    throughput_tok_s: f64,
+    single_item_latency_p50_ms: f64,
 }
 
 fn cert_row_from_row(row: &Row<'_>) -> rusqlite::Result<RawCertificationRow> {
@@ -767,7 +1107,44 @@ fn cert_row_from_row(row: &Row<'_>) -> rusqlite::Result<RawCertificationRow> {
         numeric_profile_id: row.get(1)?,
         fingerprint: row.get(2)?,
         certified_at_ms: row.get::<_, i64>(3)? as u64,
-        evidence_json: row.get(4)?,
+        os_build: row.get(4)?,
+        module_generation: row.get::<_, i64>(5)? as u64,
+        evidence_json: row.get(6)?,
+    })
+}
+
+fn perf_row_from_row(row: &Row<'_>) -> rusqlite::Result<RawPerfRow> {
+    Ok(RawPerfRow {
+        machine_profile_hash: row.get(0)?,
+        model_id: row.get(1)?,
+        workload: row.get(2)?,
+        numeric_profile_id: row.get(3)?,
+        fingerprint: row.get(4)?,
+        engine: row.get(5)?,
+        measured_at_ms: row.get::<_, i64>(6)? as u64,
+        os_build: row.get(7)?,
+        module_generation: row.get::<_, i64>(8)? as u64,
+        throughput_tok_s: row.get(9)?,
+        cold_load_ms: row.get(10)?,
+        single_item_latency_p50_ms: row.get(11)?,
+        details_json: row.get(12)?,
+    })
+}
+
+fn knob_assignment_from_row(row: &Row<'_>) -> rusqlite::Result<RawKnobAssignmentRow> {
+    Ok(RawKnobAssignmentRow {
+        machine_profile_hash: row.get(0)?,
+        workload: row.get(1)?,
+        knob: row.get(2)?,
+        model_id: row.get(3)?,
+        numeric_profile_id: row.get(4)?,
+        fingerprint: row.get(5)?,
+        engine: row.get(6)?,
+        measured_at_ms: row.get::<_, i64>(7)? as u64,
+        os_build: row.get(8)?,
+        module_generation: row.get::<_, i64>(9)? as u64,
+        throughput_tok_s: row.get(10)?,
+        single_item_latency_p50_ms: row.get(11)?,
     })
 }
 
@@ -777,8 +1154,55 @@ fn decode_cert_row(row: RawCertificationRow) -> Result<CertificationRow, Synapse
         numeric_profile_id: NumericProfileId(row.numeric_profile_id),
         fingerprint: Fingerprint(row.fingerprint),
         certified_at_ms: row.certified_at_ms,
+        os_build: row.os_build,
+        module_generation: row.module_generation,
         evidence: serde_json::from_str(&row.evidence_json)?,
     })
+}
+
+fn decode_perf_row(row: RawPerfRow) -> Result<PerfRow, SynapseStoreError> {
+    Ok(PerfRow {
+        machine_profile_hash: row.machine_profile_hash,
+        model_id: row.model_id,
+        workload: row.workload,
+        numeric_profile_id: NumericProfileId(row.numeric_profile_id),
+        fingerprint: Fingerprint(row.fingerprint),
+        engine: row.engine,
+        measured_at_ms: row.measured_at_ms,
+        os_build: row.os_build,
+        module_generation: row.module_generation,
+        throughput_tok_s: row.throughput_tok_s,
+        cold_load_ms: row.cold_load_ms,
+        single_item_latency_p50_ms: row.single_item_latency_p50_ms,
+        details: serde_json::from_str(&row.details_json)?,
+    })
+}
+
+fn decode_knob_assignment_row(
+    row: RawKnobAssignmentRow,
+) -> Result<KnobAssignmentRow, SynapseStoreError> {
+    Ok(KnobAssignmentRow {
+        machine_profile_hash: row.machine_profile_hash,
+        workload: row.workload,
+        knob: PerfKnob::parse(&row.knob).map_err(SynapseStoreError::Decode)?,
+        model_id: row.model_id,
+        numeric_profile_id: NumericProfileId(row.numeric_profile_id),
+        fingerprint: Fingerprint(row.fingerprint),
+        engine: row.engine,
+        measured_at_ms: row.measured_at_ms,
+        os_build: row.os_build,
+        module_generation: row.module_generation,
+        throughput_tok_s: row.throughput_tok_s,
+        single_item_latency_p50_ms: row.single_item_latency_p50_ms,
+    })
+}
+
+fn to_sql_error(error: SynapseStoreError) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        0,
+        rusqlite::types::Type::Text,
+        Box::new(error),
+    )
 }
 
 fn table_epoch_tx(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<i64> {

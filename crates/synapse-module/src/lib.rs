@@ -19,9 +19,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use store::{
-    CatalogSnapshot, CertificationRow, JobAdmission, JobRecord, ModelAssetLocator,
-    ModelCatalogEntry, StoredModelConfig, SynapseStore, SynapseStoreError, JOB_STATE_DONE,
-    JOB_STATE_FAILED_PERMANENT, JOB_STATE_FAILED_TRANSIENT, JOB_STATE_QUEUED, JOB_STATE_RUNNING,
+    CatalogSnapshot, CertificationRow, JobAdmission, JobRecord, KnobAssignmentRow,
+    ModelAssetLocator, ModelCatalogEntry, PerfRow, StoredModelConfig, SynapseStore,
+    SynapseStoreError, JOB_STATE_DONE, JOB_STATE_FAILED_PERMANENT, JOB_STATE_FAILED_TRANSIENT,
+    JOB_STATE_QUEUED, JOB_STATE_RUNNING,
 };
 use subc_client_rs::{
     async_trait, BindDecision, HandlerOutcome, HealthReport, ModuleHandler, RequestCtx,
@@ -66,6 +67,12 @@ const DEFAULT_PROBE_WORST_DECILE_RANK_OVERLAP_THRESHOLD: f64 = 0.9;
 const DEFAULT_PROBE_ANE_PLACEMENT_THRESHOLD: f64 = 0.9;
 const RERANK_PROBE_PEARSON_THRESHOLD: f64 = 0.999;
 const GENERATE_PROBE_MIN_LABEL_MATCHES: usize = 7;
+const BALANCED_QUIET_MIN_THROUGHPUT_RATIO: f64 = 0.5;
+const PROBE_PERF_BATCH_TOKEN_BUDGET: usize = 1_024;
+const PROBE_PERF_TARGET_TOTAL_TOKENS: u64 = 4_096;
+const PROBE_PERF_MIN_BATCH_SAMPLES: usize = 3;
+const PROBE_PERF_SINGLE_SAMPLES: usize = 20;
+const SYNAPSE_OS_BUILD_OVERRIDE_ENV: &str = "SYNAPSE_OS_BUILD_OVERRIDE";
 
 pub async fn run_from_env() -> Result<(), ModuleError> {
     let module_id = env::var(SUBC_MODULE_ID_ENV)
@@ -96,6 +103,34 @@ pub enum ModuleError {
     Config(String),
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PerfKnob {
+    Performance,
+    #[default]
+    Balanced,
+    Quiet,
+}
+
+impl PerfKnob {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Performance => "performance",
+            Self::Balanced => "balanced",
+            Self::Quiet => "quiet",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "performance" => Ok(Self::Performance),
+            "balanced" => Ok(Self::Balanced),
+            "quiet" => Ok(Self::Quiet),
+            other => Err(format!("unknown performance knob '{other}'")),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct SynapseHandler {
     inner: Arc<SynapseHandlerInner>,
@@ -123,6 +158,7 @@ struct ModuleHealth {
     loaded_models: usize,
     machine_profile_hash: String,
     certification_stale: bool,
+    performance_stale: bool,
     lanes: Vec<LaneHealth>,
 }
 
@@ -132,6 +168,7 @@ struct LaneHealth {
     fingerprint: Fingerprint,
     certified: bool,
     certification_stale: bool,
+    performance_stale: bool,
     #[cfg(unix)]
     #[serde(skip_serializing_if = "Option::is_none")]
     worker: Option<worker_host::WorkerHostHealth>,
@@ -180,6 +217,8 @@ struct ModuleConfig {
     jobs: JobConfig,
     #[serde(default)]
     probe: ProbeConfig,
+    #[serde(default)]
+    knob: PerfKnob,
     #[serde(default, alias = "dev_alias_admin", alias = "enable_alias_admin")]
     alias_admin_enabled: bool,
     #[serde(default)]
@@ -348,6 +387,7 @@ struct RuntimeState {
     inline: InlineConfig,
     jobs: JobConfig,
     probe: ProbeConfig,
+    knob: PerfKnob,
     alias_admin_enabled: bool,
     scheduler: Arc<Mutex<InlineScheduler>>,
     execution: Arc<Semaphore>,
@@ -362,6 +402,7 @@ struct ModelSlot {
     loaded: Option<Arc<EmbeddingModel>>,
     state: ModelRuntimeState,
     notify: Arc<Notify>,
+    last_cold_load_ms: Option<f64>,
 }
 
 #[derive(Clone)]
@@ -787,6 +828,22 @@ struct ProbeModelResult {
     certified_vectors: Option<Vec<Vec<f32>>>,
 }
 
+struct LaneMeasurementRows {
+    current_certification: Option<CertificationRow>,
+    latest_certification: Option<CertificationRow>,
+    certification_stale: bool,
+    current_performance: Option<PerfRow>,
+    latest_performance: Option<PerfRow>,
+    performance_stale: bool,
+}
+
+struct PerfBenchResult {
+    throughput_tok_s: f64,
+    cold_load_ms: f64,
+    single_item_latency_p50_ms: f64,
+    details: Value,
+}
+
 struct SystemClock;
 
 impl Clock for SystemClock {
@@ -826,10 +883,10 @@ impl SynapseHandler {
         let catalog_models = sync_and_load_catalog_models(&store, &config)?;
         let model_cache = Arc::new(ModelCache::new(ModelCache::default_root()?));
         let runtime = Arc::new(RuntimeState::from_catalog(config, catalog_models)?);
-        let machine_profile = MachineProfile::collect(
+        let machine_profile = machine_profile_with_overrides(MachineProfile::collect(
             &SystemMachineProfileCollector,
             runtime.engine_identities(),
-        );
+        ));
         let machine_profile_hash = machine_profile.hash();
         Ok(Arc::new(ModuleState {
             module_id: self.inner.module_id.clone(),
@@ -848,6 +905,7 @@ impl RuntimeState {
         let inline = config.inline;
         let jobs = config.jobs;
         let probe = config.probe;
+        let knob = config.knob;
         let alias_admin_enabled = config.alias_admin_enabled || config.dev.alias_admin_enabled;
         let scheduler = Arc::new(Mutex::new(InlineScheduler { in_flight_bytes: 0 }));
         let execution = Arc::new(Semaphore::new(inline.max_concurrent_workers.max(1)));
@@ -861,6 +919,7 @@ impl RuntimeState {
                         loaded: None,
                         state: ModelRuntimeState::Unloaded,
                         notify: Arc::new(Notify::new()),
+                        last_cold_load_ms: None,
                     },
                 )
             })
@@ -869,6 +928,7 @@ impl RuntimeState {
             inline,
             jobs,
             probe,
+            knob,
             alias_admin_enabled,
             scheduler,
             execution,
@@ -1247,6 +1307,16 @@ fn local_file_url(path: &Path) -> String {
     format!("file://{}", path.to_string_lossy())
 }
 
+fn machine_profile_with_overrides(mut machine_profile: MachineProfile) -> MachineProfile {
+    if let Ok(os_build) = env::var(SYNAPSE_OS_BUILD_OVERRIDE_ENV) {
+        let os_build = os_build.trim();
+        if !os_build.is_empty() {
+            machine_profile.os_build = os_build.to_string();
+        }
+    }
+    machine_profile
+}
+
 #[async_trait]
 impl ModuleHandler for SynapseHandler {
     async fn on_hello_ack(&self, ack: &ModuleHelloAckBody) {
@@ -1275,14 +1345,21 @@ impl ModuleHandler for SynapseHandler {
             return HealthReport::ok();
         };
         let health = module_health(&state);
-        let detail = if health.certification_stale {
-            "ok; certification_stale=true"
+        let mut detail_parts = Vec::new();
+        if health.certification_stale {
+            detail_parts.push("certification_stale=true");
+        }
+        if health.performance_stale {
+            detail_parts.push("performance_stale=true");
+        }
+        let detail = if detail_parts.is_empty() {
+            "ok".to_string()
         } else {
-            "ok"
+            format!("ok; {}", detail_parts.join("; "))
         };
         HealthReport {
             status: subc_client_rs::HealthStatus::Ok,
-            detail: Some(detail.to_string()),
+            detail: Some(detail),
             metrics: Some(serde_json::to_value(&health).expect("module health should serialize")),
         }
     }
@@ -1326,6 +1403,7 @@ async fn dispatch_request(state: Arc<ModuleState>, request: MethodEnvelope) -> H
         "cache.gc" => cache_gc(state, request.params).await,
         "probe.start" => probe_start(state, request.params).await,
         "probe.status" => probe_status(state, request.params).await,
+        "probe.report" => probe_report(state).await,
         "aliases.check_index" => aliases_check_index(state, request.params).await,
         "alias.retract" => alias_retract(state, request.params).await,
         "alias.declare" => alias_declare(state, request.params).await,
@@ -1378,11 +1456,25 @@ fn set_model_slot_state(runtime: &RuntimeState, model_id: &str, state: ModelRunt
     }
 }
 
-fn set_model_slot_ready(runtime: &RuntimeState, model_id: &str, model: Arc<EmbeddingModel>) {
+fn model_cold_load_ms(runtime: &RuntimeState, model_id: &str) -> Option<f64> {
+    runtime
+        .catalog
+        .lock()
+        .ok()
+        .and_then(|catalog| catalog.get(model_id).and_then(|slot| slot.last_cold_load_ms))
+}
+
+fn set_model_slot_ready(
+    runtime: &RuntimeState,
+    model_id: &str,
+    model: Arc<EmbeddingModel>,
+    cold_load_ms: f64,
+) {
     if let Ok(mut catalog) = runtime.catalog.lock() {
         if let Some(slot) = catalog.get_mut(model_id) {
             slot.loaded = Some(model);
             slot.state = ModelRuntimeState::Ready;
+            slot.last_cold_load_ms = Some(cold_load_ms);
             slot.notify.notify_waiters();
         }
     }
@@ -1444,6 +1536,7 @@ fn register_runtime_catalog_model(
                     loaded: None,
                     state: ModelRuntimeState::Unloaded,
                     notify: Arc::new(Notify::new()),
+                    last_cold_load_ms: None,
                 },
             );
             Ok(())
@@ -1677,16 +1770,51 @@ async fn model_unload(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
 async fn resolve_model_for_request(
     state: Arc<ModuleState>,
     requested: Option<&str>,
+    task: ModelTask,
 ) -> Result<Arc<EmbeddingModel>, WireOperationError> {
-    let Some(default_model_id) = state.runtime.default_model_id() else {
-        return Err(WireOperationError::from_stable(
-            StableError::probe_required(),
-            "synapse requests require a registered model",
-        ));
+    let model_id = if let Some(requested) = requested {
+        requested.to_string()
+    } else {
+        match state
+            .store
+            .knob_assignment(&state.machine_profile_hash, task.as_str(), state.runtime.knob)
+        {
+            Ok(Some(assignment)) => assignment.model_id,
+            Ok(None) => {
+                let has_known_task = state
+                    .runtime
+                    .catalog
+                    .lock()
+                    .ok()
+                    .map(|catalog| catalog.values().any(|slot| slot.spec.task == task.as_str()))
+                    .unwrap_or(false);
+                if has_known_task {
+                    return Err(WireOperationError::from_stable(
+                        StableError::probe_required(),
+                        format!(
+                            "task '{}' has no {} knob assignment on machine profile {}; run probe.start",
+                            task.as_str(),
+                            state.runtime.knob.as_str(),
+                            state.machine_profile_hash,
+                        ),
+                    ));
+                }
+                let Some(default_model_id) = state.runtime.default_model_id() else {
+                    return Err(WireOperationError::from_stable(
+                        StableError::probe_required(),
+                        "synapse requests require a registered model",
+                    ));
+                };
+                default_model_id
+            }
+            Err(error) => {
+                return Err(WireOperationError::from_stable(
+                    StableError::engine_crashed(Some(100)),
+                    format!("read knob assignment: {error}"),
+                ))
+            }
+        }
     };
-    let model_id = requested
-        .map(str::to_string)
-        .unwrap_or(default_model_id);
     let Some(snapshot) = model_slot_snapshot(&state.runtime, &model_id) else {
         return Err(WireOperationError::from_stable(
             StableError::model_loading(Some(250)),
@@ -1805,6 +1933,7 @@ async fn load_catalog_model_task(
     let spec = snapshot.spec.clone();
     let ort_engine = Arc::clone(&state.runtime.ort_engine);
     let model_cache = Arc::clone(&state.model_cache);
+    let load_started = std::time::Instant::now();
     let loaded = tokio::task::spawn_blocking(move || {
         load_catalog_model_blocking(spec, ort_engine, model_cache)
     })
@@ -1817,8 +1946,9 @@ async fn load_catalog_model_task(
     })?;
     match loaded {
         Ok(model) => {
+            let cold_load_ms = load_started.elapsed().as_secs_f64() * 1_000.0;
             let model = Arc::new(model);
-            set_model_slot_ready(&state.runtime, &model_id, Arc::clone(&model));
+            set_model_slot_ready(&state.runtime, &model_id, Arc::clone(&model), cold_load_ms);
             Ok(model)
         }
         Err(error) => {
@@ -2449,7 +2579,13 @@ async fn embed_query(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         Ok(alias_table) => alias_table,
         Err(error) => return channel_error("store_failure", error.to_string()),
     };
-    let model = match resolve_model_for_request(Arc::clone(&state), params.model.as_deref()).await {
+    let model = match resolve_model_for_request(
+        Arc::clone(&state),
+        params.model.as_deref(),
+        ModelTask::Embed,
+    )
+    .await
+    {
         Ok(model) => model,
         Err(error) => return result_outcome(error_payload(&state, error)),
     };
@@ -2512,7 +2648,13 @@ async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         Ok(alias_table) => alias_table,
         Err(error) => return channel_error("store_failure", error.to_string()),
     };
-    let model = match resolve_model_for_request(Arc::clone(&state), params.model.as_deref()).await {
+    let model = match resolve_model_for_request(
+        Arc::clone(&state),
+        params.model.as_deref(),
+        ModelTask::Embed,
+    )
+    .await
+    {
         Ok(model) => model,
         Err(error) => return result_outcome(error_payload(&state, error)),
     };
@@ -2614,7 +2756,13 @@ async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
         Ok(alias_table) => alias_table,
         Err(error) => return channel_error("store_failure", error.to_string()),
     };
-    let model = match resolve_model_for_request(Arc::clone(&state), params.model.as_deref()).await {
+    let model = match resolve_model_for_request(
+        Arc::clone(&state),
+        params.model.as_deref(),
+        ModelTask::Rerank,
+    )
+    .await
+    {
         Ok(model) => model,
         Err(error) => return result_outcome(error_payload(&state, error)),
     };
@@ -2768,7 +2916,13 @@ async fn microllm_oneshot(state: Arc<ModuleState>, params: Value) -> HandlerOutc
         Ok(alias_table) => alias_table,
         Err(error) => return channel_error("store_failure", error.to_string()),
     };
-    let model = match resolve_model_for_request(Arc::clone(&state), params.model.as_deref()).await {
+    let model = match resolve_model_for_request(
+        Arc::clone(&state),
+        params.model.as_deref(),
+        ModelTask::Generate,
+    )
+    .await
+    {
         Ok(model) => model,
         Err(error) => return result_outcome(error_payload(&state, error)),
     };
@@ -3809,10 +3963,56 @@ async fn execute_probe_job(state: Arc<ModuleState>, job_id: String, model_filter
         }
     }
 
+    let catalog_model_ids = state
+        .runtime
+        .catalog
+        .lock()
+        .map(|catalog| catalog.keys().cloned().collect::<BTreeSet<_>>())
+        .unwrap_or_default();
+    let perf_rows = match state.store.current_perf_rows(&state.machine_profile_hash) {
+        Ok(rows) => rows
+            .into_iter()
+            .filter(|row| catalog_model_ids.contains(&row.model_id))
+            .collect::<Vec<_>>(),
+        Err(error) => {
+            fail_job_with_wire_error(
+                &state,
+                &job_id,
+                true,
+                WireOperationError::from_stable(
+                    StableError::engine_crashed(Some(100)),
+                    format!("read performance rows: {error}"),
+                ),
+            );
+            return;
+        }
+    };
+    let knob_assignments = compute_knob_assignments(&perf_rows);
+    if let Err(error) = state
+        .store
+        .replace_knob_assignments(&state.machine_profile_hash, &knob_assignments)
+    {
+        fail_job_with_wire_error(
+            &state,
+            &job_id,
+            true,
+            WireOperationError::from_stable(
+                StableError::engine_crashed(Some(100)),
+                format!("persist knob assignments: {error}"),
+            ),
+        );
+        return;
+    }
+    let active_assignments = knob_assignments
+        .iter()
+        .filter(|assignment| assignment.knob == state.runtime.knob)
+        .cloned()
+        .collect::<Vec<_>>();
     let result = json!({
         "module_generation": state.module_generation,
         "machine_profile_hash": state.machine_profile_hash,
         "machine_profile": state.machine_profile,
+        "current_knob": state.runtime.knob,
         "fixture": {
             "items": embed_fixture.items.len(),
             "first_id": embed_fixture.items.first().map(|item| item.id.clone()),
@@ -3837,6 +4037,8 @@ async fn execute_probe_job(state: Arc<ModuleState>, job_id: String, model_filter
         },
         "lanes": lane_results,
         "aliases": alias_results,
+        "knob_assignments": knob_assignments,
+        "active_assignments": active_assignments,
     });
     if let Err(error) = state.store.complete_job(&job_id, &result, &[], now_ms()) {
         fail_job_with_wire_error(
@@ -3877,7 +4079,7 @@ async fn execute_embed_probe_for_model(
             })
         }
     };
-    let vectors = match execute_embedding(&state.runtime, &model, tokenized.batch).await {
+    let vectors = match execute_embedding(&state.runtime, &model, tokenized.batch.clone()).await {
         Ok(vectors) => vectors,
         Err(error) => {
             return Ok(ProbeModelResult {
@@ -3908,9 +4110,19 @@ async fn execute_embed_probe_for_model(
         "metrics": evidence,
         "ane_placement_share": placement_share,
     });
-    if passed {
+    let performance = if passed {
+        let cold_load_ms = model_cold_load_ms(&state.runtime, &model.model_id).ok_or_else(|| {
+            WireOperationError::from_stable(
+                StableError::engine_crashed(Some(100)),
+                format!("missing cold-load measurement for '{}'", model.model_id),
+            )
+        })?;
+        let perf = measure_embed_perf(&state.runtime, &model, &tokenized, cold_load_ms).await?;
         store_probe_cert_row(state, &model, certification_evidence.clone())?;
-    }
+        Some(store_probe_perf_row(state, &model, ModelTask::Embed.as_str(), &perf)?)
+    } else {
+        None
+    };
     Ok(ProbeModelResult {
         lane_result: json!({
             "model_id": model.model_id,
@@ -3925,6 +4137,7 @@ async fn execute_embed_probe_for_model(
                 "worst_decile": state.runtime.probe.worst_decile_rank_overlap_threshold,
                 "ane_placement_share": state.runtime.probe.ane_placement_threshold,
             },
+            "performance": performance,
         }),
         certified_vectors: passed.then_some(vectors),
     })
@@ -4038,13 +4251,23 @@ async fn execute_rerank_probe_for_model(
         requests: fixture.items.len(),
     };
     let passed = pearson >= RERANK_PROBE_PEARSON_THRESHOLD;
-    if passed {
+    let performance = if passed {
+        let cold_load_ms = model_cold_load_ms(&state.runtime, &model.model_id).ok_or_else(|| {
+            WireOperationError::from_stable(
+                StableError::engine_crashed(Some(100)),
+                format!("missing cold-load measurement for '{}'", model.model_id),
+            )
+        })?;
+        let perf = measure_rerank_perf(&state.runtime, &model, fixture, cold_load_ms).await?;
         store_probe_cert_row(
             state,
             &model,
             json!({ "task": "rerank", "metrics": evidence }),
         )?;
-    }
+        Some(store_probe_perf_row(state, &model, ModelTask::Rerank.as_str(), &perf)?)
+    } else {
+        None
+    };
     Ok(ProbeModelResult {
         lane_result: json!({
             "model_id": model.model_id,
@@ -4054,6 +4277,7 @@ async fn execute_rerank_probe_for_model(
             "status": if passed { "certified" } else { "uncertified" },
             "evidence": evidence,
             "thresholds": { "pearson": RERANK_PROBE_PEARSON_THRESHOLD },
+            "performance": performance,
         }),
         certified_vectors: None,
     })
@@ -4127,13 +4351,23 @@ async fn execute_generate_probe_for_model(
         items: fixture.items.len(),
     };
     let passed = matches >= GENERATE_PROBE_MIN_LABEL_MATCHES;
-    if passed {
+    let performance = if passed {
+        let cold_load_ms = model_cold_load_ms(&state.runtime, &model.model_id).ok_or_else(|| {
+            WireOperationError::from_stable(
+                StableError::engine_crashed(Some(100)),
+                format!("missing cold-load measurement for '{}'", model.model_id),
+            )
+        })?;
+        let perf = measure_generate_perf(&state.runtime, &model, fixture, cold_load_ms).await?;
         store_probe_cert_row(
             state,
             &model,
             json!({ "task": "generate", "metrics": evidence }),
         )?;
-    }
+        Some(store_probe_perf_row(state, &model, ModelTask::Generate.as_str(), &perf)?)
+    } else {
+        None
+    };
     Ok(ProbeModelResult {
         lane_result: json!({
             "model_id": model.model_id,
@@ -4144,6 +4378,7 @@ async fn execute_generate_probe_for_model(
             "evidence": evidence,
             "thresholds": { "label_matches": GENERATE_PROBE_MIN_LABEL_MATCHES },
             "mismatches": examples,
+            "performance": performance,
         }),
         certified_vectors: None,
     })
@@ -4159,6 +4394,8 @@ fn store_probe_cert_row(
         numeric_profile_id: model.numeric_profile_id.clone(),
         fingerprint: model.fingerprint.clone(),
         certified_at_ms: now_ms(),
+        os_build: state.machine_profile.os_build.clone(),
+        module_generation: state.module_generation,
         evidence,
     };
     state.store.store_cert_row(&row).map_err(|error| {
@@ -4167,6 +4404,379 @@ fn store_probe_cert_row(
             format!("write certification row: {error}"),
         )
     })
+}
+
+fn store_probe_perf_row(
+    state: &ModuleState,
+    model: &EmbeddingModel,
+    workload: &str,
+    perf: &PerfBenchResult,
+) -> Result<PerfRow, WireOperationError> {
+    let row = PerfRow {
+        machine_profile_hash: state.machine_profile_hash.clone(),
+        model_id: model.model_id.clone(),
+        workload: workload.to_string(),
+        numeric_profile_id: model.numeric_profile_id.clone(),
+        fingerprint: model.fingerprint.clone(),
+        engine: model.engine_identity.engine.clone(),
+        measured_at_ms: now_ms(),
+        os_build: state.machine_profile.os_build.clone(),
+        module_generation: state.module_generation,
+        throughput_tok_s: perf.throughput_tok_s,
+        cold_load_ms: perf.cold_load_ms,
+        single_item_latency_p50_ms: perf.single_item_latency_p50_ms,
+        details: perf.details.clone(),
+    };
+    state.store.store_perf_row(&row).map_err(|error| {
+        WireOperationError::from_stable(
+            StableError::engine_crashed(Some(100)),
+            format!("write performance row: {error}"),
+        )
+    })?;
+    Ok(row)
+}
+
+async fn measure_embed_perf(
+    runtime: &RuntimeState,
+    model: &EmbeddingModel,
+    tokenized: &TokenizedBatch,
+    cold_load_ms: f64,
+) -> Result<PerfBenchResult, WireOperationError> {
+    if tokenized.batch.items.is_empty() {
+        return Err(WireOperationError::from_stable(
+            StableError::artifact_invalid(),
+            format!("probe fixture has no embed items for '{}'", model.model_id),
+        ));
+    }
+    let mut cursor = 0_usize;
+    let mut total_tokens = 0_u64;
+    let mut batch_samples = 0_usize;
+    let started = std::time::Instant::now();
+    while total_tokens < PROBE_PERF_TARGET_TOTAL_TOKENS
+        || batch_samples < PROBE_PERF_MIN_BATCH_SAMPLES
+    {
+        let mut batch_items = Vec::new();
+        let mut batch_tokens = 0_usize;
+        while batch_tokens < PROBE_PERF_BATCH_TOKEN_BUDGET || batch_items.is_empty() {
+            let index = cursor % tokenized.batch.items.len();
+            let item_tokens = u64::from(
+                tokenized
+                    .real_token_counts
+                    .get(index)
+                    .copied()
+                    .unwrap_or_default(),
+            )
+            .max(1);
+            if !batch_items.is_empty()
+                && batch_tokens.saturating_add(item_tokens as usize) > PROBE_PERF_BATCH_TOKEN_BUDGET
+            {
+                break;
+            }
+            batch_items.push(tokenized.batch.items[index].clone());
+            batch_tokens = batch_tokens.saturating_add(item_tokens as usize);
+            total_tokens = total_tokens.saturating_add(item_tokens);
+            cursor += 1;
+            if batch_tokens >= PROBE_PERF_BATCH_TOKEN_BUDGET {
+                break;
+            }
+        }
+        execute_embedding(runtime, model, TokenBatch { items: batch_items }).await?;
+        batch_samples += 1;
+    }
+    let elapsed_secs = started.elapsed().as_secs_f64().max(f64::EPSILON);
+    let throughput_tok_s = total_tokens as f64 / elapsed_secs;
+    let mut latency_samples = Vec::with_capacity(PROBE_PERF_SINGLE_SAMPLES);
+    for sample in 0..PROBE_PERF_SINGLE_SAMPLES {
+        let index = sample % tokenized.batch.items.len();
+        let started = std::time::Instant::now();
+        execute_embedding(
+            runtime,
+            model,
+            TokenBatch {
+                items: vec![tokenized.batch.items[index].clone()],
+            },
+        )
+        .await?;
+        latency_samples.push(started.elapsed().as_secs_f64() * 1_000.0);
+    }
+    let single_item_latency_p50_ms = median_ms(&mut latency_samples);
+    Ok(PerfBenchResult {
+        throughput_tok_s,
+        cold_load_ms,
+        single_item_latency_p50_ms,
+        details: json!({
+            "batch_token_budget": PROBE_PERF_BATCH_TOKEN_BUDGET,
+            "target_total_tokens": PROBE_PERF_TARGET_TOTAL_TOKENS,
+            "throughput_total_tokens": total_tokens,
+            "throughput_samples": batch_samples,
+            "single_samples": PROBE_PERF_SINGLE_SAMPLES,
+        }),
+    })
+}
+
+async fn measure_rerank_perf(
+    runtime: &RuntimeState,
+    model: &EmbeddingModel,
+    fixture: &RerankProbeFixture,
+    cold_load_ms: f64,
+) -> Result<PerfBenchResult, WireOperationError> {
+    let mut requests = Vec::new();
+    for item in &fixture.items {
+        let mut texts = Vec::with_capacity(item.candidates.len() + 1);
+        texts.push(item.query.as_str());
+        texts.extend(item.candidates.iter().map(String::as_str));
+        let tokenized = model
+            .tokenizer
+            .tokenize_batch_without_special_tokens(texts)
+            .map_err(|error| {
+                WireOperationError::from_stable(StableError::artifact_invalid(), error.to_string())
+            })?;
+        let mut token_items = tokenized.batch.items;
+        let query = token_items.remove(0);
+        let token_cost = token_items
+            .iter()
+            .map(|candidate| candidate.len().saturating_add(query.len()).saturating_add(3) as u64)
+            .sum::<u64>()
+            .max(1);
+        requests.push((RerankRequest { query, candidates: token_items }, token_cost));
+    }
+    if requests.is_empty() {
+        return Err(WireOperationError::from_stable(
+            StableError::artifact_invalid(),
+            format!("probe fixture has no rerank items for '{}'", model.model_id),
+        ));
+    }
+    let mut cursor = 0_usize;
+    let mut total_tokens = 0_u64;
+    let mut batch_samples = 0_usize;
+    let started = std::time::Instant::now();
+    while total_tokens < PROBE_PERF_TARGET_TOTAL_TOKENS
+        || batch_samples < PROBE_PERF_MIN_BATCH_SAMPLES
+    {
+        let mut batch_tokens = 0_usize;
+        while batch_tokens < PROBE_PERF_BATCH_TOKEN_BUDGET || batch_tokens == 0 {
+            let (request, token_cost) = &requests[cursor % requests.len()];
+            execute_rerank(runtime, model, request.clone()).await?;
+            batch_tokens = batch_tokens.saturating_add(*token_cost as usize);
+            total_tokens = total_tokens.saturating_add(*token_cost);
+            cursor += 1;
+            if batch_tokens >= PROBE_PERF_BATCH_TOKEN_BUDGET {
+                break;
+            }
+        }
+        batch_samples += 1;
+    }
+    let elapsed_secs = started.elapsed().as_secs_f64().max(f64::EPSILON);
+    let throughput_tok_s = total_tokens as f64 / elapsed_secs;
+    let mut latency_samples = Vec::with_capacity(PROBE_PERF_SINGLE_SAMPLES);
+    for sample in 0..PROBE_PERF_SINGLE_SAMPLES {
+        let (request, _) = &requests[sample % requests.len()];
+        let started = std::time::Instant::now();
+        execute_rerank(runtime, model, request.clone()).await?;
+        latency_samples.push(started.elapsed().as_secs_f64() * 1_000.0);
+    }
+    let single_item_latency_p50_ms = median_ms(&mut latency_samples);
+    Ok(PerfBenchResult {
+        throughput_tok_s,
+        cold_load_ms,
+        single_item_latency_p50_ms,
+        details: json!({
+            "batch_token_budget": PROBE_PERF_BATCH_TOKEN_BUDGET,
+            "target_total_tokens": PROBE_PERF_TARGET_TOTAL_TOKENS,
+            "throughput_total_tokens": total_tokens,
+            "throughput_samples": batch_samples,
+            "single_samples": PROBE_PERF_SINGLE_SAMPLES,
+        }),
+    })
+}
+
+async fn measure_generate_perf(
+    runtime: &RuntimeState,
+    model: &EmbeddingModel,
+    fixture: &GenerateProbeFixture,
+    cold_load_ms: f64,
+) -> Result<PerfBenchResult, WireOperationError> {
+    let mut requests = Vec::new();
+    for item in &fixture.items {
+        let tokenized = model
+            .tokenizer
+            .tokenize_batch([item.prompt.as_str()])
+            .map_err(|error| {
+                WireOperationError::from_stable(StableError::artifact_invalid(), error.to_string())
+            })?;
+        let prompt = tokenized.batch.items.into_iter().next().unwrap_or_default();
+        let prompt_tokens = prompt.len() as u64;
+        let max_tokens = item.max_tokens.min(64);
+        requests.push((
+            GenerateRequest {
+                prompt,
+                max_tokens,
+                grammar: None,
+            },
+            prompt_tokens.max(1),
+        ));
+    }
+    if requests.is_empty() {
+        return Err(WireOperationError::from_stable(
+            StableError::artifact_invalid(),
+            format!("probe fixture has no generate items for '{}'", model.model_id),
+        ));
+    }
+    let mut cursor = 0_usize;
+    let mut total_tokens = 0_u64;
+    let mut batch_samples = 0_usize;
+    let started = std::time::Instant::now();
+    while total_tokens < PROBE_PERF_TARGET_TOTAL_TOKENS
+        || batch_samples < PROBE_PERF_MIN_BATCH_SAMPLES
+    {
+        let mut batch_tokens = 0_usize;
+        while batch_tokens < PROBE_PERF_BATCH_TOKEN_BUDGET || batch_tokens == 0 {
+            let (request, prompt_tokens) = &requests[cursor % requests.len()];
+            let output = execute_generate(runtime, model, request.clone()).await?;
+            let estimated_tokens = prompt_tokens
+                .saturating_add(u64::from(request.max_tokens))
+                .max(1);
+            batch_tokens = batch_tokens.saturating_add(estimated_tokens as usize);
+            total_tokens = total_tokens
+                .saturating_add(prompt_tokens.saturating_add(output.n_gen as u64).max(1));
+            cursor += 1;
+            if batch_tokens >= PROBE_PERF_BATCH_TOKEN_BUDGET {
+                break;
+            }
+        }
+        batch_samples += 1;
+    }
+    let elapsed_secs = started.elapsed().as_secs_f64().max(f64::EPSILON);
+    let throughput_tok_s = total_tokens as f64 / elapsed_secs;
+    let mut latency_samples = Vec::with_capacity(PROBE_PERF_SINGLE_SAMPLES);
+    for sample in 0..PROBE_PERF_SINGLE_SAMPLES {
+        let (request, _) = &requests[sample % requests.len()];
+        let started = std::time::Instant::now();
+        execute_generate(runtime, model, request.clone()).await?;
+        latency_samples.push(started.elapsed().as_secs_f64() * 1_000.0);
+    }
+    let single_item_latency_p50_ms = median_ms(&mut latency_samples);
+    Ok(PerfBenchResult {
+        throughput_tok_s,
+        cold_load_ms,
+        single_item_latency_p50_ms,
+        details: json!({
+            "batch_token_budget": PROBE_PERF_BATCH_TOKEN_BUDGET,
+            "target_total_tokens": PROBE_PERF_TARGET_TOTAL_TOKENS,
+            "throughput_total_tokens": total_tokens,
+            "throughput_samples": batch_samples,
+            "single_samples": PROBE_PERF_SINGLE_SAMPLES,
+        }),
+    })
+}
+
+fn median_ms(samples: &mut [f64]) -> f64 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    samples.sort_by(f64::total_cmp);
+    let mid = samples.len() / 2;
+    if samples.len() % 2 == 1 {
+        samples[mid]
+    } else {
+        (samples[mid - 1] + samples[mid]) / 2.0
+    }
+}
+
+fn compute_knob_assignments(perf_rows: &[PerfRow]) -> Vec<KnobAssignmentRow> {
+    let mut by_workload = BTreeMap::<String, Vec<&PerfRow>>::new();
+    for row in perf_rows {
+        by_workload.entry(row.workload.clone()).or_default().push(row);
+    }
+    let mut assignments = Vec::new();
+    for (workload, rows) in by_workload {
+        let Some(performance_pick) = select_performance_row(&rows) else {
+            continue;
+        };
+        let quiet_pick = select_quiet_row(&rows).unwrap_or(performance_pick);
+        let balanced_pick = if quiet_pick.throughput_tok_s
+            >= performance_pick.throughput_tok_s * BALANCED_QUIET_MIN_THROUGHPUT_RATIO
+        {
+            quiet_pick
+        } else {
+            performance_pick
+        };
+        for (knob, row) in [
+            (PerfKnob::Performance, performance_pick),
+            (PerfKnob::Balanced, balanced_pick),
+            (PerfKnob::Quiet, quiet_pick),
+        ] {
+            assignments.push(KnobAssignmentRow {
+                machine_profile_hash: row.machine_profile_hash.clone(),
+                workload: workload.clone(),
+                knob,
+                model_id: row.model_id.clone(),
+                numeric_profile_id: row.numeric_profile_id.clone(),
+                fingerprint: row.fingerprint.clone(),
+                engine: row.engine.clone(),
+                measured_at_ms: row.measured_at_ms,
+                os_build: row.os_build.clone(),
+                module_generation: row.module_generation,
+                throughput_tok_s: row.throughput_tok_s,
+                single_item_latency_p50_ms: row.single_item_latency_p50_ms,
+            });
+        }
+    }
+    assignments.sort_by(|left, right| {
+        left.workload
+            .cmp(&right.workload)
+            .then_with(|| left.knob.as_str().cmp(right.knob.as_str()))
+            .then_with(|| left.model_id.cmp(&right.model_id))
+    });
+    assignments
+}
+
+fn select_performance_row<'a>(rows: &[&'a PerfRow]) -> Option<&'a PerfRow> {
+    let mut candidates = rows.to_vec();
+    candidates.sort_by(|left, right| {
+        right
+            .throughput_tok_s
+            .total_cmp(&left.throughput_tok_s)
+            .then_with(|| {
+                left.single_item_latency_p50_ms.total_cmp(&right.single_item_latency_p50_ms)
+            })
+            .then_with(|| left.model_id.cmp(&right.model_id))
+    });
+    candidates.into_iter().next()
+}
+
+fn select_quiet_row<'a>(rows: &[&'a PerfRow]) -> Option<&'a PerfRow> {
+    let mut candidates = rows.to_vec();
+    if candidates.iter().any(|row| is_ane_engine(&row.engine)) {
+        candidates.retain(|row| is_ane_engine(&row.engine));
+    }
+    candidates.sort_by(|left, right| {
+        engine_power_rank(&left.engine)
+            .cmp(&engine_power_rank(&right.engine))
+            .then_with(|| right.throughput_tok_s.total_cmp(&left.throughput_tok_s))
+            .then_with(|| {
+                left.single_item_latency_p50_ms.total_cmp(&right.single_item_latency_p50_ms)
+            })
+            .then_with(|| left.model_id.cmp(&right.model_id))
+    });
+    candidates.into_iter().next()
+}
+
+fn is_ane_engine(engine: &str) -> bool {
+    engine == "ane-coreml-worker"
+}
+
+/// Rank engines by expected power use for quiet mode: ANE first, CPU ORT second,
+/// and Metal-family workers last. Synapse uses this static ordering in v1 because
+/// the module does not yet have direct per-lane power measurements.
+fn engine_power_rank(engine: &str) -> u8 {
+    if is_ane_engine(engine) {
+        0
+    } else if engine == "ort" {
+        1
+    } else {
+        2
+    }
 }
 
 fn probe_status_payload(state: &ModuleState, record: &JobRecord) -> Value {
@@ -4428,6 +5038,194 @@ async fn mutate_alias_pair(
     }
 }
 
+fn lane_measurement_rows(state: &ModuleState, fingerprint: &Fingerprint) -> LaneMeasurementRows {
+    let current_certification = state
+        .store
+        .get_cert_row(&state.machine_profile_hash, fingerprint)
+        .ok()
+        .flatten();
+    let latest_certification = if current_certification.is_some() {
+        current_certification.clone()
+    } else {
+        state.store.latest_cert_row(fingerprint).ok().flatten()
+    };
+    let current_performance = state
+        .store
+        .get_perf_row(&state.machine_profile_hash, fingerprint)
+        .ok()
+        .flatten();
+    let latest_performance = if current_performance.is_some() {
+        current_performance.clone()
+    } else {
+        state.store.latest_perf_row(fingerprint).ok().flatten()
+    };
+    LaneMeasurementRows {
+        certification_stale: current_certification.is_none() && latest_certification.is_some(),
+        performance_stale: current_performance.is_none() && latest_performance.is_some(),
+        current_certification,
+        latest_certification,
+        current_performance,
+        latest_performance,
+    }
+}
+
+#[cfg(unix)]
+fn worker_health_from_slot(slot: &ModelSlotSnapshot) -> Option<worker_host::WorkerHostHealth> {
+    slot.loaded.as_ref().and_then(|model| worker_health_for_model(model))
+}
+
+#[cfg(not(unix))]
+fn worker_health_from_slot(_slot: &ModelSlotSnapshot) -> Option<Value> {
+    None
+}
+
+fn lane_blocking_reason(
+    slot: &ModelSlotSnapshot,
+    measurements: &LaneMeasurementRows,
+    worker_quarantined: bool,
+) -> Option<&'static str> {
+    if measurements.current_certification.is_some() {
+        return None;
+    }
+    let failed_quarantined = matches!(
+        &slot.state,
+        ModelRuntimeState::Failed(error) if error.message.contains("quarantined")
+    );
+    if worker_quarantined || failed_quarantined {
+        Some("quarantined")
+    } else if !cfg!(unix) && matches!(slot.spec.engine.as_str(), "llama" | "mlx" | "ane") {
+        Some("unsupported_platform")
+    } else {
+        Some("probe_required")
+    }
+}
+
+fn certification_report_row(
+    state: &ModuleState,
+    row: &CertificationRow,
+    stale: bool,
+) -> Value {
+    json!({
+        "machine_profile_hash": row.machine_profile_hash,
+        "numeric_profile_id": row.numeric_profile_id,
+        "fingerprint": row.fingerprint,
+        "certified_at_ms": row.certified_at_ms,
+        "os_build": row.os_build,
+        "module_generation": row.module_generation,
+        "stale": stale,
+        "stale_os_build": row.os_build != state.machine_profile.os_build,
+        "evidence": row.evidence,
+    })
+}
+
+fn performance_report_row(state: &ModuleState, row: &PerfRow, stale: bool) -> Value {
+    json!({
+        "machine_profile_hash": row.machine_profile_hash,
+        "model_id": row.model_id,
+        "workload": row.workload,
+        "numeric_profile_id": row.numeric_profile_id,
+        "fingerprint": row.fingerprint,
+        "engine": row.engine,
+        "measured_at_ms": row.measured_at_ms,
+        "os_build": row.os_build,
+        "module_generation": row.module_generation,
+        "throughput_tok_s": row.throughput_tok_s,
+        "cold_load_ms": row.cold_load_ms,
+        "single_item_latency_p50_ms": row.single_item_latency_p50_ms,
+        "stale": stale,
+        "stale_os_build": row.os_build != state.machine_profile.os_build,
+        "details": row.details,
+    })
+}
+
+async fn probe_report(state: Arc<ModuleState>) -> HandlerOutcome {
+    let slots = state
+        .runtime
+        .catalog
+        .lock()
+        .map(|catalog| {
+            catalog
+                .values()
+                .map(|slot| ModelSlotSnapshot {
+                    spec: slot.spec.clone(),
+                    loaded: slot.loaded.clone(),
+                    state: slot.state.clone(),
+                    notify: Arc::clone(&slot.notify),
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let knob_assignments = match state.store.knob_assignments(&state.machine_profile_hash) {
+        Ok(assignments) => assignments,
+        Err(error) => return channel_error("store_failure", error.to_string()),
+    };
+    let active_assignments = knob_assignments
+        .iter()
+        .filter(|assignment| assignment.knob == state.runtime.knob)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut lanes = Vec::with_capacity(slots.len());
+    let mut certification_stale = false;
+    let mut performance_stale = false;
+    for slot in slots {
+        let measurements = lane_measurement_rows(&state, &slot.spec.fingerprint);
+        certification_stale |= measurements.certification_stale;
+        performance_stale |= measurements.performance_stale;
+        let worker = worker_health_from_slot(&slot);
+        #[cfg(unix)]
+        let worker_quarantined = worker
+            .as_ref()
+            .map(|health| health.quarantined_models > 0)
+            .unwrap_or(false);
+        #[cfg(not(unix))]
+        let worker_quarantined = false;
+        let blocking_reason = lane_blocking_reason(&slot, &measurements, worker_quarantined);
+        let certification = measurements
+            .current_certification
+            .as_ref()
+            .or(measurements.latest_certification.as_ref())
+            .map(|row| certification_report_row(&state, row, measurements.certification_stale));
+        let performance = measurements
+            .current_performance
+            .as_ref()
+            .or(measurements.latest_performance.as_ref())
+            .map(|row| performance_report_row(&state, row, measurements.performance_stale));
+        let error = match &slot.state {
+            ModelRuntimeState::Failed(error) => Some(
+                serde_json::to_value(error).expect("model error should serialize in probe.report"),
+            ),
+            _ => None,
+        };
+        lanes.push(json!({
+            "model_id": slot.spec.model_id,
+            "task": slot.spec.task,
+            "engine": slot.spec.engine,
+            "fingerprint": slot.spec.fingerprint,
+            "numeric_profile_id": slot.spec.numeric_profile_id,
+            "state": model_runtime_state_name(&slot.state),
+            "certified": measurements.current_certification.is_some(),
+            "certification_stale": measurements.certification_stale,
+            "performance_stale": measurements.performance_stale,
+            "blocking_reason": blocking_reason,
+            "certification": certification,
+            "performance": performance,
+            "error": error,
+            "worker": worker,
+        }));
+    }
+    result_outcome(json!({
+        "module_generation": state.module_generation,
+        "machine_profile_hash": state.machine_profile_hash,
+        "machine_profile": state.machine_profile,
+        "current_knob": state.runtime.knob,
+        "certification_stale": certification_stale,
+        "performance_stale": performance_stale,
+        "knob_assignments": knob_assignments,
+        "active_assignments": active_assignments,
+        "lanes": lanes,
+    }))
+}
+
 async fn admission_status(state: Arc<ModuleState>) -> HandlerOutcome {
     let scheduler = match state.runtime.scheduler.lock() {
         Ok(scheduler) => scheduler,
@@ -4451,36 +5249,32 @@ async fn admission_status(state: Arc<ModuleState>) -> HandlerOutcome {
         .loaded_models()
         .into_iter()
         .map(|model| {
-            let certified = state
-                .store
-                .get_cert_row(&state.machine_profile_hash, &model.fingerprint)
-                .ok()
-                .flatten()
-                .is_some();
-            let certification_stale = state
-                .store
-                .has_stale_cert_row(&state.machine_profile_hash, &model.fingerprint)
-                .unwrap_or(false)
-                && !certified;
+            let measurements = lane_measurement_rows(&state, &model.fingerprint);
             json!({
                 "model_id": model.model_id,
                 "fingerprint": model.fingerprint,
                 "meeting_deadlines": predicted_start_delay_ms <= state.runtime.inline.max_queue_ms,
                 "p50_start_delay_ms": predicted_start_delay_ms,
-                "certified": certified,
-                "certification_stale": certification_stale,
+                "certified": measurements.current_certification.is_some(),
+                "certification_stale": measurements.certification_stale,
+                "performance_stale": measurements.performance_stale,
             })
         })
         .collect::<Vec<_>>();
     let certification_stale = lanes
         .iter()
         .any(|lane| lane["certification_stale"].as_bool().unwrap_or(false));
+    let performance_stale = lanes
+        .iter()
+        .any(|lane| lane["performance_stale"].as_bool().unwrap_or(false));
     result_outcome(json!({
         "module_generation": state.module_generation,
         "machine_profile_hash": state.machine_profile_hash,
+        "current_knob": state.runtime.knob,
         "inline_in_flight_bytes": scheduler.in_flight_bytes,
         "lanes": lanes,
         "certification_stale": certification_stale,
+        "performance_stale": performance_stale,
     }))
 }
 
@@ -4501,22 +5295,13 @@ fn module_health(state: &ModuleState) -> ModuleHealth {
         .loaded_models()
         .into_iter()
         .map(|model| {
-            let certified = state
-                .store
-                .get_cert_row(&state.machine_profile_hash, &model.fingerprint)
-                .ok()
-                .flatten()
-                .is_some();
-            let certification_stale = state
-                .store
-                .has_stale_cert_row(&state.machine_profile_hash, &model.fingerprint)
-                .unwrap_or(false)
-                && !certified;
+            let measurements = lane_measurement_rows(state, &model.fingerprint);
             LaneHealth {
                 model_id: model.model_id.clone(),
                 fingerprint: model.fingerprint.clone(),
-                certified,
-                certification_stale,
+                certified: measurements.current_certification.is_some(),
+                certification_stale: measurements.certification_stale,
+                performance_stale: measurements.performance_stale,
                 #[cfg(unix)]
                 worker: worker_health_for_model(&model),
             }
@@ -4528,6 +5313,7 @@ fn module_health(state: &ModuleState) -> ModuleHealth {
         loaded_models: state.runtime.loaded_model_count(),
         machine_profile_hash: state.machine_profile_hash.clone(),
         certification_stale: lanes.iter().any(|lane| lane.certification_stale),
+        performance_stale: lanes.iter().any(|lane| lane.performance_stale),
         lanes,
     }
 }
@@ -4675,6 +5461,7 @@ fn management_operations() -> Vec<ManagementOperation> {
         op("models.list", Query),
         op("probe.start", Mutate),
         op("probe.status", Query),
+        op("probe.report", Query),
         op("aliases.check_index", Query),
         op("alias.retract", Mutate),
         op("alias.declare", Mutate),
@@ -4724,6 +5511,7 @@ fn load_module_config() -> Result<ModuleConfig, ModuleError> {
             inline: InlineConfig::default(),
             jobs: JobConfig::default(),
             probe: ProbeConfig::default(),
+            knob: PerfKnob::default(),
             alias_admin_enabled: false,
             dev: DevConfig::default(),
         });
@@ -4963,5 +5751,60 @@ mod tests {
         assert_eq!(ane.engine, "ane-coreml-worker");
         assert_eq!(ane.build_flags.get("placement_gate").map(String::as_str), Some("neural-engine"));
         assert_ne!(mlx, ane);
+    }
+
+    #[test]
+    fn knob_assignments_prefer_throughput_but_allow_quiet_when_within_ratio() {
+        let rows = vec![
+            PerfRow {
+                machine_profile_hash: "machine-a".to_string(),
+                model_id: "metal-fast".to_string(),
+                workload: "embed".to_string(),
+                numeric_profile_id: NumericProfileId("np-fast".to_string()),
+                fingerprint: Fingerprint("fp-fast".to_string()),
+                engine: "mlx-worker".to_string(),
+                measured_at_ms: 10,
+                os_build: "24A1".to_string(),
+                module_generation: 1,
+                throughput_tok_s: 200.0,
+                cold_load_ms: 20.0,
+                single_item_latency_p50_ms: 9.0,
+                details: json!({}),
+            },
+            PerfRow {
+                machine_profile_hash: "machine-a".to_string(),
+                model_id: "ane-quiet".to_string(),
+                workload: "embed".to_string(),
+                numeric_profile_id: NumericProfileId("np-quiet".to_string()),
+                fingerprint: Fingerprint("fp-quiet".to_string()),
+                engine: "ane-coreml-worker".to_string(),
+                measured_at_ms: 11,
+                os_build: "24A1".to_string(),
+                module_generation: 1,
+                throughput_tok_s: 120.0,
+                cold_load_ms: 22.0,
+                single_item_latency_p50_ms: 11.0,
+                details: json!({}),
+            },
+        ];
+
+        let assignments = compute_knob_assignments(&rows);
+        let performance = assignments
+            .iter()
+            .find(|row| row.knob == PerfKnob::Performance)
+            .expect("performance assignment");
+        let balanced = assignments
+            .iter()
+            .find(|row| row.knob == PerfKnob::Balanced)
+            .expect("balanced assignment");
+        let quiet = assignments
+            .iter()
+            .find(|row| row.knob == PerfKnob::Quiet)
+            .expect("quiet assignment");
+
+        assert_eq!(performance.model_id, "metal-fast");
+        assert_eq!(quiet.model_id, "ane-quiet");
+        assert_eq!(balanced.model_id, "ane-quiet");
+        assert!(quiet.throughput_tok_s >= performance.throughput_tok_s * BALANCED_QUIET_MIN_THROUGHPUT_RATIO);
     }
 }
