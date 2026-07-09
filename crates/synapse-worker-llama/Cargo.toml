@@ -21,12 +21,12 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-llama-cpp-2 = { version = "0.1.151", default-features = false, features = ["metal"] }
-llama-cpp-sys-2 = { version = "0.1.151", features = ["metal"] }
+llama-cpp-2 = { version = "0.1.151", default-features = false, features = ["metal", "common"] }
+llama-cpp-sys-2 = { version = "0.1.151", features = ["metal", "common"] }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-llama-cpp-2 = { version = "0.1.151", default-features = false }
-llama-cpp-sys-2 = "0.1.151"
+llama-cpp-2 = { version = "0.1.151", default-features = false, features = ["common"] }
+llama-cpp-sys-2 = { version = "0.1.151", features = ["common"] }
 
 [dev-dependencies]
 synapse-module = { path = "../synapse-module" }

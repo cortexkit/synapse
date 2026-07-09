@@ -396,6 +396,80 @@ impl ModelCache {
         Ok(outcomes)
     }
 
+    /// Sum of on-disk blob sizes for artifacts with metadata present.
+    pub fn total_blob_bytes(&self) -> Result<u64, ModelCacheError> {
+        self.ensure_layout()?;
+        let meta_dir = self.root.join(META_DIR);
+        let mut total = 0_u64;
+        for entry in fs::read_dir(&meta_dir).map_err(|source| ModelCacheError::Io {
+            action: "list cache metadata",
+            path: meta_dir.display().to_string(),
+            source,
+        })? {
+            let entry = entry.map_err(|source| ModelCacheError::Io {
+                action: "read cache metadata entry",
+                path: meta_dir.display().to_string(),
+                source,
+            })?;
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let stem = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or_default();
+            if stem.is_empty() {
+                continue;
+            }
+            let digest = normalize_digest(stem)?;
+            let blob_path = self.blob_path(&digest);
+            if !blob_path.exists() {
+                continue;
+            }
+            let len = fs::metadata(&blob_path).map_err(|source| ModelCacheError::Io {
+                action: "stat cache blob",
+                path: blob_path.display().to_string(),
+                source,
+            })?;
+            total = total.saturating_add(len.len());
+        }
+        Ok(total)
+    }
+
+    /// Two-phase GC until total blob bytes are at or below `target_max_bytes`, or no
+    /// further deletions are possible in this pass.
+    pub fn gc_to_watermark(
+        &self,
+        module_id: &str,
+        now_ms: u64,
+        grace_ms: u64,
+        target_max_bytes: u64,
+    ) -> Result<Vec<CacheGcOutcome>, ModelCacheError> {
+        let mut outcomes = Vec::new();
+        const MAX_PASSES: usize = 64;
+        for _ in 0..MAX_PASSES {
+            if self.total_blob_bytes()? <= target_max_bytes {
+                break;
+            }
+            let pass = self.gc_all(module_id, now_ms, grace_ms)?;
+            let progress = pass.iter().any(|outcome| {
+                matches!(
+                    outcome,
+                    CacheGcOutcome::Marked { .. } | CacheGcOutcome::Deleted { .. }
+                )
+            });
+            outcomes.extend(pass);
+            if !progress {
+                break;
+            }
+            if self.total_blob_bytes()? <= target_max_bytes {
+                break;
+            }
+        }
+        Ok(outcomes)
+    }
+
     fn ensure_layout(&self) -> Result<(), ModelCacheError> {
         for dir in [
             self.root.join(BLOBS_DIR),
@@ -710,6 +784,32 @@ mod tests {
                 digest: meta.digest.clone()
             }
         );
+        assert!(!cache.blob_path(&meta.digest).exists());
+    }
+
+    #[test]
+    fn gc_to_watermark_runs_mark_and_delete_passes() {
+        let root = temp_root("watermark-gc");
+        fs::create_dir_all(&root).unwrap();
+        let cache = ModelCache::new(&root);
+        let source = root.join("blob.bin");
+        fs::write(&source, b"0123456789").unwrap();
+        let meta = cache
+            .ingest(ModelCacheIngest {
+                source_url: format!("file://{}", source.display()),
+                expected_digest: None,
+                format: "bin".to_string(),
+                tokenizer_path: None,
+                pin_module_id: None,
+            })
+            .expect("ingest");
+        assert_eq!(cache.total_blob_bytes().unwrap(), 10);
+        let outcomes = cache
+            .gc_to_watermark("synapse", 50, 0, 0)
+            .expect("watermark gc");
+        assert!(outcomes
+            .iter()
+            .any(|o| matches!(o, CacheGcOutcome::Deleted { .. })));
         assert!(!cache.blob_path(&meta.digest).exists());
     }
 

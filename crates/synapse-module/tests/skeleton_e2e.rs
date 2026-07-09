@@ -111,24 +111,45 @@ fn spawn_synapse_module_with_config(
     spawn_synapse_module_with_env(subc_connection_file, None, Some(config_json), &[])
 }
 
+fn spawn_synapse_module_on_shared_lease(
+    subc_connection_file: &Path,
+    lease_root: &Path,
+) -> ModuleProcess {
+    spawn_synapse_module_with_env(
+        subc_connection_file,
+        None,
+        None,
+        &[(
+            "CORTEXKIT_LEASE_ROOT",
+            lease_root.to_string_lossy().as_ref(),
+        )],
+    )
+}
+
 fn spawn_synapse_module_with_env(
     subc_connection_file: &Path,
     preload_models: Option<&str>,
     config_json: Option<&str>,
     extra_env: &[(&str, &str)],
 ) -> ModuleProcess {
+    let lease_root = unique_temp_dir("synapse-module-lease");
+    std::fs::create_dir_all(&lease_root).unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_synapse-module"));
     command
         .arg("--subc")
         .arg(subc_connection_file)
         .env("SUBC_MODULE_ID", MODULE_ID)
+        .env(
+            "CORTEXKIT_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        )
         .stderr(process::Stdio::inherit())
         .kill_on_drop(true);
-    if let Some(preload_models) = preload_models {
-        command.env("SYNAPSE_PRELOAD_MODELS", preload_models);
-    }
     if let Some(config_json) = config_json {
         command.env("SYNAPSE_CONFIG_JSON", config_json);
+    } else if let Some(preload_models) = preload_models {
+        let wrapped = serde_json::json!({ "preload_models": serde_json::from_str::<Value>(preload_models).unwrap_or_else(|_| serde_json::json!([])) });
+        command.env("SYNAPSE_CONFIG_JSON", wrapped.to_string());
     }
     for (key, value) in extra_env {
         command.env(key, value);
@@ -1505,6 +1526,86 @@ impl Drop for MinilmE2eLock {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
     }
+}
+
+#[tokio::test]
+async fn singleton_lease_blocks_second_module_on_same_daemon() {
+    let shared_lease_root = unique_temp_dir("synapse-singleton-lease");
+    std::fs::create_dir_all(&shared_lease_root).unwrap();
+    let daemon = start_daemon().await;
+    let first = spawn_synapse_module_on_shared_lease(
+        &daemon.connection_file_path,
+        &shared_lease_root,
+    );
+    wait_for_registration(&daemon.registry, MODULE_ID, SETUP_TIMEOUT).await;
+    let mut second = spawn_synapse_module_on_shared_lease(
+        &daemon.connection_file_path,
+        &shared_lease_root,
+    );
+    let status = second
+        .child
+        .wait()
+        .await
+        .expect("second module should exit");
+    assert!(
+        !status.success(),
+        "second synapse module should refuse singleton lease"
+    );
+    drop(second);
+    drop(first);
+}
+
+#[tokio::test]
+async fn microllm_grammar_rejects_when_gate_disabled() {
+    let config = serde_json::json!({ "grammar_enabled": false }).to_string();
+    let (_daemon, _module, mut consumer, route_channel) = open_route_with_config(&config).await;
+    let frame = raw_route_frame(
+        &mut consumer,
+        route_channel,
+        90_001,
+        serde_json::json!({
+            "method": "microllm.oneshot",
+            "params": {
+                "model": "missing",
+                "prompt": "yes or no",
+                "max_tokens": 4,
+                "grammar": "root ::= \"yes\" | \"no\""
+            }
+        }),
+    )
+    .await;
+    assert_eq!(frame.header.ty, FrameType::Error);
+    let body: Value = serde_json::from_slice(&frame.body).unwrap();
+    assert_eq!(body["code"], "invalid_request");
+    assert!(body["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("grammar_enabled"));
+}
+
+#[tokio::test]
+async fn microllm_grammar_unavailable_in_build_when_gate_enabled() {
+    let config = serde_json::json!({ "grammar_enabled": true }).to_string();
+    let (_daemon, _module, mut consumer, route_channel) = open_route_with_config(&config).await;
+    let frame = raw_route_frame(
+        &mut consumer,
+        route_channel,
+        90_002,
+        serde_json::json!({
+            "method": "microllm.oneshot",
+            "params": {
+                "model": "any",
+                "prompt": "yes or no",
+                "max_tokens": 4,
+                "grammar": "root ::= \"yes\" | \"no\""
+            }
+        }),
+    )
+    .await;
+    assert_eq!(frame.header.ty, FrameType::Error);
+    let body: Value = serde_json::from_slice(&frame.body).unwrap();
+    assert_eq!(body["code"], "invalid_request");
+    assert_eq!(body["message"], "grammar_unavailable_in_build");
 }
 
 fn acquire_minilm_e2e_lock() -> MinilmE2eLock {
