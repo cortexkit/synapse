@@ -1,5 +1,3 @@
-#![forbid(unsafe_code)]
-
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
@@ -862,7 +860,7 @@ impl DecoderLayer {
     }
 }
 
-fn main() -> Result<()> {
+pub fn main() -> Result<()> {
     let args = Args::parse();
     if let Some(model_path) = &args.debug_bert_model {
         return dump_bert_debug(
