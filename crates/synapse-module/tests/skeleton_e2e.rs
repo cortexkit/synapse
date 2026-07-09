@@ -145,11 +145,22 @@ fn spawn_synapse_module_with_env(
         )
         .stderr(process::Stdio::inherit())
         .kill_on_drop(true);
-    if let Some(config_json) = config_json {
-        command.env("SYNAPSE_CONFIG_JSON", config_json);
-    } else if let Some(preload_models) = preload_models {
-        let wrapped = serde_json::json!({ "preload_models": serde_json::from_str::<Value>(preload_models).unwrap_or_else(|_| serde_json::json!([])) });
-        command.env("SYNAPSE_CONFIG_JSON", wrapped.to_string());
+    // Tests exercise the production config path: write a real file and point
+    // SYNAPSE_CONFIG_PATH at it (the only config env var the module honors).
+    let config_contents = if let Some(config_json) = config_json {
+        Some(config_json.to_string())
+    } else {
+        preload_models.map(|preload_models| {
+            serde_json::json!({ "preload_models": serde_json::from_str::<Value>(preload_models).unwrap_or_else(|_| serde_json::json!([])) }).to_string()
+        })
+    };
+    if let Some(contents) = config_contents {
+        let config_path = lease_root.join("synapse.jsonc");
+        std::fs::write(&config_path, contents).unwrap();
+        command.env(
+            "SYNAPSE_CONFIG_PATH",
+            config_path.to_string_lossy().to_string(),
+        );
     }
     for (key, value) in extra_env {
         command.env(key, value);

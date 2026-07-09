@@ -5685,12 +5685,6 @@ fn load_module_config() -> Result<ModuleConfig, ModuleError> {
         let path = PathBuf::from(path);
         return load_module_config_file(&path);
     }
-    if let Ok(path) = env::var("SYNAPSE_CONFIG") {
-        return load_module_config_file(Path::new(&path));
-    }
-    if let Ok(json) = env::var("SYNAPSE_CONFIG_JSON") {
-        return parse_module_config_json(&json, "SYNAPSE_CONFIG_JSON");
-    }
     if let Ok(cwd) = env::current_dir() {
         let project_path = cwd.join(".cortexkit").join("synapse.jsonc");
         if project_path.is_file() {
