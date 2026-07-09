@@ -4217,30 +4217,23 @@ fn ane_placement_share_for_model(
     if model.engine_identity.engine != "ane-coreml-worker" {
         return Ok(None);
     }
-    #[cfg(unix)]
-    {
-        match &model.backend {
-            EmbedBackend::Worker(engine) => {
-                let engine = engine.lock().map_err(|_| {
-                    WireOperationError::from_stable(
-                        StableError::engine_crashed(Some(100)),
-                        "worker engine mutex was poisoned during ANE placement ping",
-                    )
-                })?;
-                let ping = engine.ping().map_err(|error| {
-                    WireOperationError::from_stable(
-                        StableError::engine_crashed(Some(100)),
-                        format!("ANE placement ping failed: {error}"),
-                    )
-                })?;
-                Ok(ping.placement_share)
-            }
-            EmbedBackend::Ort(_) => Ok(None),
+    match &model.backend {
+        EmbedBackend::Worker(engine) => {
+            let engine = engine.lock().map_err(|_| {
+                WireOperationError::from_stable(
+                    StableError::engine_crashed(Some(100)),
+                    "worker engine mutex was poisoned during ANE placement ping",
+                )
+            })?;
+            let ping = engine.ping().map_err(|error| {
+                WireOperationError::from_stable(
+                    StableError::engine_crashed(Some(100)),
+                    format!("ANE placement ping failed: {error}"),
+                )
+            })?;
+            Ok(ping.placement_share)
         }
-    }
-    #[cfg(not(unix))]
-    {
-        Ok(None)
+        EmbedBackend::Ort(_) => Ok(None),
     }
 }
 
@@ -5265,13 +5258,10 @@ async fn probe_report(state: Arc<ModuleState>) -> HandlerOutcome {
         certification_stale |= measurements.certification_stale;
         performance_stale |= measurements.performance_stale;
         let worker = worker_health_from_slot(&slot);
-        #[cfg(unix)]
         let worker_quarantined = worker
             .as_ref()
             .map(|health| health.quarantined_models > 0)
             .unwrap_or(false);
-        #[cfg(not(unix))]
-        let worker_quarantined = false;
         let blocking_reason = lane_blocking_reason(&slot, &measurements, worker_quarantined);
         let certification = measurements
             .current_certification
@@ -5371,7 +5361,6 @@ async fn admission_status(state: Arc<ModuleState>) -> HandlerOutcome {
     }))
 }
 
-#[cfg(unix)]
 fn worker_health_for_model(model: &EmbeddingModel) -> Option<worker_host::WorkerHostHealth> {
     match &model.backend {
         EmbedBackend::Worker(engine) => engine
@@ -5395,7 +5384,6 @@ fn module_health(state: &ModuleState) -> ModuleHealth {
                 certified: measurements.current_certification.is_some(),
                 certification_stale: measurements.certification_stale,
                 performance_stale: measurements.performance_stale,
-                #[cfg(unix)]
                 worker: worker_health_for_model(&model),
             }
         })
