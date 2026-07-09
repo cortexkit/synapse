@@ -5,7 +5,7 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeServer, ServerOptions};
+use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use tokio::time::timeout;
 
 use crate::worker_framing::{read_frame, read_json_frame, write_frame, write_json_frame};
@@ -124,31 +124,6 @@ pub async fn write_raw<S: AsyncWrite + Unpin>(
         .map_err(TransportError::from)
 }
 
-/// Worker-side: connect to the module-owned pipe and complete HELLO.
-pub async fn connect_worker_client(
-    pipe_name: &str,
-    hello: &WorkerHello,
-    max_frame: u32,
-) -> Result<tokio::net::windows::named_pipe::NamedPipeClient, TransportError> {
-    let mut client = ClientOptions::new()
-        .open(pipe_name)
-        .map_err(TransportError::from)?;
-    write_json_frame(&mut client, hello, max_frame).await?;
-    let ack: WorkerHelloAck = read_json_frame(&mut client, max_frame).await?;
-    if ack.v != WORKER_PROTOCOL_VERSION {
-        return Err(TransportError::Protocol(format!(
-            "module replied with protocol v{}",
-            ack.v
-        )));
-    }
-    if !ack.accept {
-        return Err(TransportError::Protocol(
-            "module rejected worker handshake".to_string(),
-        ));
-    }
-    Ok(client)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,6 +132,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
     use std::time::SystemTime;
+    use tokio::net::windows::named_pipe::ClientOptions;
 
     fn test_nonce() -> String {
         static COUNTER: AtomicU64 = AtomicU64::new(0);

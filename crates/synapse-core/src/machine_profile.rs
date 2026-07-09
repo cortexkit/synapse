@@ -117,6 +117,7 @@ fn ram_class() -> String {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn ram_class_from_bytes(bytes: u64) -> String {
     const GIB: u64 = 1024 * 1024 * 1024;
     let gib = bytes.div_ceil(GIB).max(1);

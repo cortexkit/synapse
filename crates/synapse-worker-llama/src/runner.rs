@@ -28,9 +28,11 @@ use llama_cpp_sys_2::{
     LLAMA_FLASH_ATTN_TYPE_ENABLED,
 };
 use sha2::{Digest, Sha256};
+#[cfg(unix)]
+use synapse_core::WorkerHelloAck;
 use synapse_core::{
-    decode_i32_frame, encode_f32_frame, EngineIdentity, WorkerHello, WorkerHelloAck, WorkerPooling,
-    WorkerRequest, WorkerResponse, DEFAULT_MAX_FRAME_BYTES, WORKER_PROTOCOL_VERSION,
+    decode_i32_frame, encode_f32_frame, EngineIdentity, WorkerHello, WorkerPooling, WorkerRequest,
+    WorkerResponse, DEFAULT_MAX_FRAME_BYTES, WORKER_PROTOCOL_VERSION,
 };
 
 const ENGINE_VERSION: &str = "llama-cpp-2-0.1.151";
@@ -211,7 +213,11 @@ fn run_worker_loop(args: Args, hello: WorkerHello) -> Result<u32> {
         .context("worker requires --socket on unix")?;
     let mut stream = UnixStream::connect(socket)
         .with_context(|| format!("connect worker socket {}", socket.display()))?;
-    synapse_core::worker_framing_sync::write_json_frame(&mut stream, &hello, DEFAULT_MAX_FRAME_BYTES)?;
+    synapse_core::worker_framing_sync::write_json_frame(
+        &mut stream,
+        &hello,
+        DEFAULT_MAX_FRAME_BYTES,
+    )?;
     let ack: WorkerHelloAck =
         synapse_core::worker_framing_sync::read_json_frame(&mut stream, DEFAULT_MAX_FRAME_BYTES)?;
     ensure!(
@@ -291,14 +297,18 @@ fn worker_request_loop<S: Read + Write>(
                 normalize,
                 items,
             } => {
-                let raw =
-                    synapse_core::worker_framing_sync::read_frame(stream, max_frame).context("read EMBED_BATCH ids")?;
+                let raw = synapse_core::worker_framing_sync::read_frame(stream, max_frame)
+                    .context("read EMBED_BATCH ids")?;
                 let response = match handle_embed_batch(
                     &mut state, &req_id, &model_ref, pooling, normalize, &items, &raw,
                 ) {
                     Ok((response, vectors)) => {
-                        synapse_core::worker_framing_sync::write_json_frame(stream, &response, max_frame)?;
-                        synapse_core::worker_framing_sync::write_frame(stream, &vectors, max_frame)?;
+                        synapse_core::worker_framing_sync::write_json_frame(
+                            stream, &response, max_frame,
+                        )?;
+                        synapse_core::worker_framing_sync::write_frame(
+                            stream, &vectors, max_frame,
+                        )?;
                         continue;
                     }
                     Err(error) => WorkerResponse::Err {
@@ -315,7 +325,8 @@ fn worker_request_loop<S: Read + Write>(
                 candidates,
                 model_ref,
             } => {
-                let raw = synapse_core::worker_framing_sync::read_frame(stream, max_frame).context("read RERANK ids")?;
+                let raw = synapse_core::worker_framing_sync::read_frame(stream, max_frame)
+                    .context("read RERANK ids")?;
                 let response = match handle_rerank(
                     &mut state,
                     &req_id,
@@ -325,7 +336,9 @@ fn worker_request_loop<S: Read + Write>(
                     &raw,
                 ) {
                     Ok((response, scores)) => {
-                        synapse_core::worker_framing_sync::write_json_frame(stream, &response, max_frame)?;
+                        synapse_core::worker_framing_sync::write_json_frame(
+                            stream, &response, max_frame,
+                        )?;
                         synapse_core::worker_framing_sync::write_frame(stream, &scores, max_frame)?;
                         continue;
                     }
@@ -343,8 +356,8 @@ fn worker_request_loop<S: Read + Write>(
                 max_tokens,
                 grammar,
             } => {
-                let raw =
-                    synapse_core::worker_framing_sync::read_frame(stream, max_frame).context("read GENERATE ids")?;
+                let raw = synapse_core::worker_framing_sync::read_frame(stream, max_frame)
+                    .context("read GENERATE ids")?;
                 let response = match handle_generate(
                     &mut state,
                     &req_id,
