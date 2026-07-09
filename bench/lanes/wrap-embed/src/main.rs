@@ -62,7 +62,10 @@ fn main() -> Result<()> {
     let mut tokenizer =
         Tokenizer::from_file(&args.tokenizer).map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
     tokenizer
-        .with_truncation(Some(TruncationParams { max_length: 512, ..Default::default() }))
+        .with_truncation(Some(TruncationParams {
+            max_length: 512,
+            ..Default::default()
+        }))
         .map_err(|e| anyhow::anyhow!("truncation: {e}"))?;
 
     let mut chunks: Vec<Chunk> = load_corpus(&args.corpus, None)?;
@@ -181,7 +184,11 @@ fn embed_batch(
         .post(url)
         .json(&serde_json::json!({ "model": model, "input": texts }))
         .send()?;
-    anyhow::ensure!(resp.status().is_success(), "server returned {}", resp.status());
+    anyhow::ensure!(
+        resp.status().is_success(),
+        "server returned {}",
+        resp.status()
+    );
     let body: serde_json::Value = resp.json()?;
     let data = body["data"].as_array().context("missing data[]")?;
     let mut out = Vec::with_capacity(data.len());
@@ -206,9 +213,11 @@ fn embed_batch(
     Ok(out)
 }
 
-
 fn rss_of_named(name: &str) -> Option<u64> {
-    let out = std::process::Command::new("pgrep").args(["-f", name]).output().ok()?;
+    let out = std::process::Command::new("pgrep")
+        .args(["-f", name])
+        .output()
+        .ok()?;
     let pids = String::from_utf8_lossy(&out.stdout);
     let mut total = 0u64;
     for pid in pids.lines() {

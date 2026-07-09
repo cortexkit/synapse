@@ -901,7 +901,10 @@ impl SynapseHandler {
 }
 
 impl RuntimeState {
-    fn from_catalog(config: ModuleConfig, models: Vec<StoredModelConfig>) -> Result<Self, ModuleError> {
+    fn from_catalog(
+        config: ModuleConfig,
+        models: Vec<StoredModelConfig>,
+    ) -> Result<Self, ModuleError> {
         let inline = config.inline;
         let jobs = config.jobs;
         let probe = config.probe;
@@ -1096,10 +1099,8 @@ fn build_preload_catalog_model(
         Some(digest) => normalize_digest(&digest),
         None => format!("sha256:{}", sha256_file(&preload.model_path)?),
     };
-    let tokenizer = SanitizedTokenizer::from_file(
-        &preload.tokenizer_path,
-        TokenizerConfig { max_tokens },
-    )?;
+    let tokenizer =
+        SanitizedTokenizer::from_file(&preload.tokenizer_path, TokenizerConfig { max_tokens })?;
     build_stored_model_config(
         model_id,
         &engine_name,
@@ -1277,12 +1278,18 @@ fn catalog_model_engine_identity(engine_name: &str) -> Result<EngineIdentity, Mo
         "mlx" => Ok(worker_catalog_identity(
             "mlx-worker",
             "protocol-v1",
-            &[("transport", "unix-socket-worker"), ("numeric_profile", "bf16-distinct")],
+            &[
+                ("transport", "unix-socket-worker"),
+                ("numeric_profile", "bf16-distinct"),
+            ],
         )),
         "ane" => Ok(worker_catalog_identity(
             "ane-coreml-worker",
             "protocol-v1",
-            &[("transport", "unix-socket-worker"), ("placement_gate", "neural-engine")],
+            &[
+                ("transport", "unix-socket-worker"),
+                ("placement_gate", "neural-engine"),
+            ],
         )),
         other => Err(ModuleError::Config(format!(
             "unsupported engine '{other}' for catalog model"
@@ -1435,12 +1442,17 @@ fn model_runtime_state_name(state: &ModelRuntimeState) -> &'static str {
 }
 
 fn model_slot_snapshot(runtime: &RuntimeState, model_id: &str) -> Option<ModelSlotSnapshot> {
-    runtime.catalog.lock().ok()?.get(model_id).map(|slot| ModelSlotSnapshot {
-        spec: slot.spec.clone(),
-        loaded: slot.loaded.clone(),
-        state: slot.state.clone(),
-        notify: Arc::clone(&slot.notify),
-    })
+    runtime
+        .catalog
+        .lock()
+        .ok()?
+        .get(model_id)
+        .map(|slot| ModelSlotSnapshot {
+            spec: slot.spec.clone(),
+            loaded: slot.loaded.clone(),
+            state: slot.state.clone(),
+            notify: Arc::clone(&slot.notify),
+        })
 }
 
 fn set_model_slot_state(runtime: &RuntimeState, model_id: &str, state: ModelRuntimeState) {
@@ -1457,11 +1469,11 @@ fn set_model_slot_state(runtime: &RuntimeState, model_id: &str, state: ModelRunt
 }
 
 fn model_cold_load_ms(runtime: &RuntimeState, model_id: &str) -> Option<f64> {
-    runtime
-        .catalog
-        .lock()
-        .ok()
-        .and_then(|catalog| catalog.get(model_id).and_then(|slot| slot.last_cold_load_ms))
+    runtime.catalog.lock().ok().and_then(|catalog| {
+        catalog
+            .get(model_id)
+            .and_then(|slot| slot.last_cold_load_ms)
+    })
 }
 
 fn set_model_slot_ready(
@@ -1511,15 +1523,15 @@ fn register_runtime_catalog_model(
         )
     })?;
     match catalog.get_mut(&spec.model_id) {
-        Some(slot) if slot.spec.fingerprint != spec.fingerprint => Err(
-            WireOperationError::from_stable(
+        Some(slot) if slot.spec.fingerprint != spec.fingerprint => {
+            Err(WireOperationError::from_stable(
                 StableError::artifact_invalid(),
                 format!(
                     "model_id '{}' already refers to fingerprint {}",
                     spec.model_id, slot.spec.fingerprint.0
                 ),
-            ),
-        ),
+            ))
+        }
         Some(slot) => {
             slot.spec = spec;
             if slot.loaded.is_none() {
@@ -1592,7 +1604,8 @@ fn model_load_job_status_payload(state: &ModuleState, record: &JobRecord) -> Val
             }
             return payload;
         }
-        if record.state == JOB_STATE_FAILED_TRANSIENT || record.state == JOB_STATE_FAILED_PERMANENT {
+        if record.state == JOB_STATE_FAILED_TRANSIENT || record.state == JOB_STATE_FAILED_PERMANENT
+        {
             map.insert("state".to_string(), Value::from("failed"));
             map.insert(
                 "error".to_string(),
@@ -1703,7 +1716,10 @@ async fn model_status(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
             Ok(Some(record)) if record.kind == "model.load" => {
                 result_outcome(model_load_job_status_payload(&state, &record))
             }
-            Ok(Some(_)) => channel_error("invalid_request", "job_id does not refer to a model.load job"),
+            Ok(Some(_)) => channel_error(
+                "invalid_request",
+                "job_id does not refer to a model.load job",
+            ),
             Ok(None) => channel_error("invalid_request", "unknown or expired job_id"),
             Err(error) => channel_error("store_failure", error.to_string()),
         },
@@ -1762,8 +1778,13 @@ async fn model_unload(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
             }
         }
     }
-    set_model_slot_state(&state.runtime, &params.model_id, ModelRuntimeState::Unloaded);
-    let slot = model_slot_snapshot(&state.runtime, &params.model_id).expect("unloaded model remains registered");
+    set_model_slot_state(
+        &state.runtime,
+        &params.model_id,
+        ModelRuntimeState::Unloaded,
+    );
+    let slot = model_slot_snapshot(&state.runtime, &params.model_id)
+        .expect("unloaded model remains registered");
     result_outcome(model_status_payload(state.module_generation, &slot))
 }
 
@@ -1775,10 +1796,11 @@ async fn resolve_model_for_request(
     let model_id = if let Some(requested) = requested {
         requested.to_string()
     } else {
-        match state
-            .store
-            .knob_assignment(&state.machine_profile_hash, task.as_str(), state.runtime.knob)
-        {
+        match state.store.knob_assignment(
+            &state.machine_profile_hash,
+            task.as_str(),
+            state.runtime.knob,
+        ) {
             Ok(Some(assignment)) => assignment.model_id,
             Ok(None) => {
                 let has_known_task = state
@@ -1952,7 +1974,11 @@ async fn load_catalog_model_task(
             Ok(model)
         }
         Err(error) => {
-            set_model_slot_state(&state.runtime, &model_id, ModelRuntimeState::Failed(error.clone()));
+            set_model_slot_state(
+                &state.runtime,
+                &model_id,
+                ModelRuntimeState::Failed(error.clone()),
+            );
             Err(error)
         }
     }
@@ -1994,7 +2020,9 @@ fn load_catalog_model_blocking(
                     "ORT engine mutex was poisoned during model load",
                 )
             })?;
-            let loaded_model = engine.load(&artifact, &runtime_config).map_err(engine_error_to_wire)?;
+            let loaded_model = engine
+                .load(&artifact, &runtime_config)
+                .map_err(engine_error_to_wire)?;
             (EmbedBackend::Ort(Arc::clone(&ort_engine)), loaded_model)
         }
         "llama" | "mlx" | "ane" => load_worker_backend_blocking(&spec, &artifact, &runtime_config)?,
@@ -2057,8 +2085,12 @@ fn load_worker_backend_blocking(
             ),
         )
     })?;
-    let loaded_model = EmbedEngine::load(&mut engine, artifact, runtime_config).map_err(engine_error_to_wire)?;
-    Ok((EmbedBackend::Worker(Arc::new(Mutex::new(engine))), loaded_model))
+    let loaded_model =
+        EmbedEngine::load(&mut engine, artifact, runtime_config).map_err(engine_error_to_wire)?;
+    Ok((
+        EmbedBackend::Worker(Arc::new(Mutex::new(engine))),
+        loaded_model,
+    ))
 }
 
 #[cfg(not(unix))]
@@ -2134,7 +2166,9 @@ fn locator_path(
             _guard: None,
         }),
         ModelAssetLocator::CacheDigest { digest } => {
-            let guard = model_cache.acquire_read(digest).map_err(model_cache_load_error)?;
+            let guard = model_cache
+                .acquire_read(digest)
+                .map_err(model_cache_load_error)?;
             Ok(LocatedAsset {
                 path: guard.blob_path().to_path_buf(),
                 _guard: Some(guard),
@@ -2153,15 +2187,18 @@ fn transient_model_load_error(message: impl Into<String>) -> WireOperationError 
 
 fn model_cache_load_error(error: ModelCacheError) -> WireOperationError {
     match error {
-        ModelCacheError::ArtifactInvalid(message)
-        | ModelCacheError::InvalidSource(message) => artifact_invalid_error(message),
+        ModelCacheError::ArtifactInvalid(message) | ModelCacheError::InvalidSource(message) => {
+            artifact_invalid_error(message)
+        }
         ModelCacheError::Tokenizer(error) => artifact_invalid_error(error.to_string()),
         ModelCacheError::NotFound(digest) => transient_model_load_error(format!(
             "cache artifact {digest} is missing; re-submit model.load to reacquire it"
         )),
-        ModelCacheError::Io { action, path, source } => {
-            io_to_load_error(action, Path::new(&path), &source)
-        }
+        ModelCacheError::Io {
+            action,
+            path,
+            source,
+        } => io_to_load_error(action, Path::new(&path), &source),
         ModelCacheError::Download { url, message } => {
             transient_model_load_error(format!("download {url}: {message}"))
         }
@@ -2198,11 +2235,19 @@ async fn execute_model_load_job(state: Arc<ModuleState>, job_id: String, params:
             std::process::id(),
             now_ms()
         ));
-        fs::create_dir_all(&temp_dir).map_err(|error| io_to_load_error("create temp directory", &temp_dir, &error))?;
+        fs::create_dir_all(&temp_dir)
+            .map_err(|error| io_to_load_error("create temp directory", &temp_dir, &error))?;
         let model_path = temp_dir.join("model.bin");
         let tokenizer_path = temp_dir.join("tokenizer.json");
 
-        set_job_progress(&state.runtime, &job_id, ModelRuntimeState::Downloading { bytes_done: 0, bytes_total: None });
+        set_job_progress(
+            &state.runtime,
+            &job_id,
+            ModelRuntimeState::Downloading {
+                bytes_done: 0,
+                bytes_total: None,
+            },
+        );
         download_source_to_temp(
             &sources.model_source_url,
             &model_path,
@@ -2210,15 +2255,14 @@ async fn execute_model_load_job(state: Arc<ModuleState>, job_id: String, params:
                 set_job_progress(
                     &state.runtime,
                     &job_id,
-                    ModelRuntimeState::Downloading { bytes_done, bytes_total },
+                    ModelRuntimeState::Downloading {
+                        bytes_done,
+                        bytes_total,
+                    },
                 );
             },
         )?;
-        download_source_to_temp(
-            &sources.tokenizer_source_url,
-            &tokenizer_path,
-            |_, _| {},
-        )?;
+        download_source_to_temp(&sources.tokenizer_source_url, &tokenizer_path, |_, _| {})?;
 
         set_job_progress(&state.runtime, &job_id, ModelRuntimeState::Validating);
         let engine_name = canonical_engine_name(&params.engine);
@@ -2256,7 +2300,10 @@ async fn execute_model_load_job(state: Arc<ModuleState>, job_id: String, params:
         )?;
         register_runtime_catalog_model(&state.runtime, spec.clone())?;
         state.store.upsert_model(&spec, now_ms()).map_err(|error| {
-            transient_model_load_error(format!("persist catalog entry for '{}': {error}", spec.model_id))
+            transient_model_load_error(format!(
+                "persist catalog entry for '{}': {error}",
+                spec.model_id
+            ))
         })?;
         set_job_progress(&state.runtime, &job_id, ModelRuntimeState::Loading);
         let loaded = ensure_model_loaded_for_control(Arc::clone(&state), &spec.model_id).await?;
@@ -2282,12 +2329,7 @@ async fn execute_model_load_job(state: Arc<ModuleState>, job_id: String, params:
             }
         }
         Err(error) => {
-            fail_job_with_wire_error(
-                &state,
-                &job_id,
-                error.class == ErrorClass::Transient,
-                error,
-            );
+            fail_job_with_wire_error(&state, &job_id, error.class == ErrorClass::Transient, error);
         }
     }
 }
@@ -2299,7 +2341,9 @@ fn validate_model_load_request(params: &ModelLoadParams) -> Result<(), String> {
     resolve_model_load_sources(params).map(|_| ())
 }
 
-fn resolve_model_load_sources(params: &ModelLoadParams) -> Result<ResolvedModelLoadSources, String> {
+fn resolve_model_load_sources(
+    params: &ModelLoadParams,
+) -> Result<ResolvedModelLoadSources, String> {
     match params.source.trim().to_ascii_lowercase().as_str() {
         "hf" => {
             let repo = params
@@ -2362,7 +2406,8 @@ fn huggingface_resolve_url(repo: &str, file: &str) -> Result<String, String> {
 }
 
 fn join_base_url(base: &str, file: &str) -> Result<String, String> {
-    let mut url = Url::parse(base).map_err(|error| format!("invalid url base '{base}': {error}"))?;
+    let mut url =
+        Url::parse(base).map_err(|error| format!("invalid url base '{base}': {error}"))?;
     let had_trailing_slash = base.ends_with('/');
     {
         let mut segments = url
@@ -2405,10 +2450,13 @@ fn build_loaded_catalog_model(
         .map_err(|error| artifact_invalid_error(error.to_string()))?;
     let pooling = parse_pooling(params.pooling.as_deref().unwrap_or("mean"))
         .map_err(|error| artifact_invalid_error(error.to_string()))?;
-    let tokenizer_sanitized_digest = model_meta
-        .sanitized_tokenizer_digest
-        .clone()
-        .ok_or_else(|| artifact_invalid_error("model cache metadata is missing tokenizer digest"))?;
+    let tokenizer_sanitized_digest =
+        model_meta
+            .sanitized_tokenizer_digest
+            .clone()
+            .ok_or_else(|| {
+                artifact_invalid_error("model cache metadata is missing tokenizer digest")
+            })?;
     build_stored_model_config(
         model_id,
         engine_name,
@@ -2515,7 +2563,13 @@ fn download_source_to_temp(
         let total = fs::metadata(path).ok().map(|meta| meta.len());
         let mut input = fs::File::open(path)
             .map_err(|error| io_to_load_error("open source artifact", path, &error))?;
-        copy_source_stream(&mut input, &mut output, total, destination, &mut on_progress)?;
+        copy_source_stream(
+            &mut input,
+            &mut output,
+            total,
+            destination,
+            &mut on_progress,
+        )?;
     } else {
         let client = reqwest::blocking::Client::new();
         let mut response = client
@@ -2523,9 +2577,17 @@ fn download_source_to_temp(
             .send()
             .map_err(|error| transient_model_load_error(format!("download {source_url}: {error}")))?
             .error_for_status()
-            .map_err(|error| transient_model_load_error(format!("download {source_url}: {error}")))?;
+            .map_err(|error| {
+                transient_model_load_error(format!("download {source_url}: {error}"))
+            })?;
         let total = response.content_length();
-        copy_source_stream(&mut response, &mut output, total, destination, &mut on_progress)?;
+        copy_source_stream(
+            &mut response,
+            &mut output,
+            total,
+            destination,
+            &mut on_progress,
+        )?;
     }
     output
         .flush()
@@ -3877,7 +3939,12 @@ async fn execute_probe_job(state: Arc<ModuleState>, job_id: String, model_filter
         let model = match ensure_model_loaded_for_control(Arc::clone(&state), &model_id).await {
             Ok(model) => model,
             Err(error) => {
-                fail_job_with_wire_error(&state, &job_id, error.class == ErrorClass::Transient, error);
+                fail_job_with_wire_error(
+                    &state,
+                    &job_id,
+                    error.class == ErrorClass::Transient,
+                    error,
+                );
                 return;
             }
         };
@@ -4111,15 +4178,21 @@ async fn execute_embed_probe_for_model(
         "ane_placement_share": placement_share,
     });
     let performance = if passed {
-        let cold_load_ms = model_cold_load_ms(&state.runtime, &model.model_id).ok_or_else(|| {
-            WireOperationError::from_stable(
-                StableError::engine_crashed(Some(100)),
-                format!("missing cold-load measurement for '{}'", model.model_id),
-            )
-        })?;
+        let cold_load_ms =
+            model_cold_load_ms(&state.runtime, &model.model_id).ok_or_else(|| {
+                WireOperationError::from_stable(
+                    StableError::engine_crashed(Some(100)),
+                    format!("missing cold-load measurement for '{}'", model.model_id),
+                )
+            })?;
         let perf = measure_embed_perf(&state.runtime, &model, &tokenized, cold_load_ms).await?;
         store_probe_cert_row(state, &model, certification_evidence.clone())?;
-        Some(store_probe_perf_row(state, &model, ModelTask::Embed.as_str(), &perf)?)
+        Some(store_probe_perf_row(
+            state,
+            &model,
+            ModelTask::Embed.as_str(),
+            &perf,
+        )?)
     } else {
         None
     };
@@ -4143,7 +4216,9 @@ async fn execute_embed_probe_for_model(
     })
 }
 
-fn ane_placement_share_for_model(model: &EmbeddingModel) -> Result<Option<f64>, WireOperationError> {
+fn ane_placement_share_for_model(
+    model: &EmbeddingModel,
+) -> Result<Option<f64>, WireOperationError> {
     if model.engine_identity.engine != "ane-coreml-worker" {
         return Ok(None);
     }
@@ -4252,19 +4327,25 @@ async fn execute_rerank_probe_for_model(
     };
     let passed = pearson >= RERANK_PROBE_PEARSON_THRESHOLD;
     let performance = if passed {
-        let cold_load_ms = model_cold_load_ms(&state.runtime, &model.model_id).ok_or_else(|| {
-            WireOperationError::from_stable(
-                StableError::engine_crashed(Some(100)),
-                format!("missing cold-load measurement for '{}'", model.model_id),
-            )
-        })?;
+        let cold_load_ms =
+            model_cold_load_ms(&state.runtime, &model.model_id).ok_or_else(|| {
+                WireOperationError::from_stable(
+                    StableError::engine_crashed(Some(100)),
+                    format!("missing cold-load measurement for '{}'", model.model_id),
+                )
+            })?;
         let perf = measure_rerank_perf(&state.runtime, &model, fixture, cold_load_ms).await?;
         store_probe_cert_row(
             state,
             &model,
             json!({ "task": "rerank", "metrics": evidence }),
         )?;
-        Some(store_probe_perf_row(state, &model, ModelTask::Rerank.as_str(), &perf)?)
+        Some(store_probe_perf_row(
+            state,
+            &model,
+            ModelTask::Rerank.as_str(),
+            &perf,
+        )?)
     } else {
         None
     };
@@ -4352,19 +4433,25 @@ async fn execute_generate_probe_for_model(
     };
     let passed = matches >= GENERATE_PROBE_MIN_LABEL_MATCHES;
     let performance = if passed {
-        let cold_load_ms = model_cold_load_ms(&state.runtime, &model.model_id).ok_or_else(|| {
-            WireOperationError::from_stable(
-                StableError::engine_crashed(Some(100)),
-                format!("missing cold-load measurement for '{}'", model.model_id),
-            )
-        })?;
+        let cold_load_ms =
+            model_cold_load_ms(&state.runtime, &model.model_id).ok_or_else(|| {
+                WireOperationError::from_stable(
+                    StableError::engine_crashed(Some(100)),
+                    format!("missing cold-load measurement for '{}'", model.model_id),
+                )
+            })?;
         let perf = measure_generate_perf(&state.runtime, &model, fixture, cold_load_ms).await?;
         store_probe_cert_row(
             state,
             &model,
             json!({ "task": "generate", "metrics": evidence }),
         )?;
-        Some(store_probe_perf_row(state, &model, ModelTask::Generate.as_str(), &perf)?)
+        Some(store_probe_perf_row(
+            state,
+            &model,
+            ModelTask::Generate.as_str(),
+            &perf,
+        )?)
     } else {
         None
     };
@@ -4535,10 +4622,21 @@ async fn measure_rerank_perf(
         let query = token_items.remove(0);
         let token_cost = token_items
             .iter()
-            .map(|candidate| candidate.len().saturating_add(query.len()).saturating_add(3) as u64)
+            .map(|candidate| {
+                candidate
+                    .len()
+                    .saturating_add(query.len())
+                    .saturating_add(3) as u64
+            })
             .sum::<u64>()
             .max(1);
-        requests.push((RerankRequest { query, candidates: token_items }, token_cost));
+        requests.push((
+            RerankRequest {
+                query,
+                candidates: token_items,
+            },
+            token_cost,
+        ));
     }
     if requests.is_empty() {
         return Err(WireOperationError::from_stable(
@@ -4619,7 +4717,10 @@ async fn measure_generate_perf(
     if requests.is_empty() {
         return Err(WireOperationError::from_stable(
             StableError::artifact_invalid(),
-            format!("probe fixture has no generate items for '{}'", model.model_id),
+            format!(
+                "probe fixture has no generate items for '{}'",
+                model.model_id
+            ),
         ));
     }
     let mut cursor = 0_usize;
@@ -4686,7 +4787,10 @@ fn median_ms(samples: &mut [f64]) -> f64 {
 fn compute_knob_assignments(perf_rows: &[PerfRow]) -> Vec<KnobAssignmentRow> {
     let mut by_workload = BTreeMap::<String, Vec<&PerfRow>>::new();
     for row in perf_rows {
-        by_workload.entry(row.workload.clone()).or_default().push(row);
+        by_workload
+            .entry(row.workload.clone())
+            .or_default()
+            .push(row);
     }
     let mut assignments = Vec::new();
     for (workload, rows) in by_workload {
@@ -4738,7 +4842,8 @@ fn select_performance_row<'a>(rows: &[&'a PerfRow]) -> Option<&'a PerfRow> {
             .throughput_tok_s
             .total_cmp(&left.throughput_tok_s)
             .then_with(|| {
-                left.single_item_latency_p50_ms.total_cmp(&right.single_item_latency_p50_ms)
+                left.single_item_latency_p50_ms
+                    .total_cmp(&right.single_item_latency_p50_ms)
             })
             .then_with(|| left.model_id.cmp(&right.model_id))
     });
@@ -4755,7 +4860,8 @@ fn select_quiet_row<'a>(rows: &[&'a PerfRow]) -> Option<&'a PerfRow> {
             .cmp(&engine_power_rank(&right.engine))
             .then_with(|| right.throughput_tok_s.total_cmp(&left.throughput_tok_s))
             .then_with(|| {
-                left.single_item_latency_p50_ms.total_cmp(&right.single_item_latency_p50_ms)
+                left.single_item_latency_p50_ms
+                    .total_cmp(&right.single_item_latency_p50_ms)
             })
             .then_with(|| left.model_id.cmp(&right.model_id))
     });
@@ -5071,7 +5177,9 @@ fn lane_measurement_rows(state: &ModuleState, fingerprint: &Fingerprint) -> Lane
 
 #[cfg(unix)]
 fn worker_health_from_slot(slot: &ModelSlotSnapshot) -> Option<worker_host::WorkerHostHealth> {
-    slot.loaded.as_ref().and_then(|model| worker_health_for_model(model))
+    slot.loaded
+        .as_ref()
+        .and_then(|model| worker_health_for_model(model))
 }
 
 #[cfg(not(unix))]
@@ -5100,11 +5208,7 @@ fn lane_blocking_reason(
     }
 }
 
-fn certification_report_row(
-    state: &ModuleState,
-    row: &CertificationRow,
-    stale: bool,
-) -> Value {
+fn certification_report_row(state: &ModuleState, row: &CertificationRow, stale: bool) -> Value {
     json!({
         "machine_profile_hash": row.machine_profile_hash,
         "numeric_profile_id": row.numeric_profile_id,
@@ -5677,8 +5781,8 @@ fn collect_hash_files(path: &Path, files: &mut Vec<PathBuf>) -> Result<(), Modul
     for entry in fs::read_dir(path)
         .map_err(|error| ModuleError::Config(format!("hash {}: {error}", path.display())))?
     {
-        let entry =
-            entry.map_err(|error| ModuleError::Config(format!("hash {}: {error}", path.display())))?;
+        let entry = entry
+            .map_err(|error| ModuleError::Config(format!("hash {}: {error}", path.display())))?;
         let entry_path = entry.path();
         if entry_path.is_dir() {
             collect_hash_files(&entry_path, files)?;
@@ -5731,11 +5835,8 @@ mod tests {
 
     #[test]
     fn huggingface_resolve_url_uses_repo_segments_and_resolve_main() {
-        let url = huggingface_resolve_url(
-            "Qdrant/all-MiniLM-L6-v2-onnx",
-            "onnx/model.onnx",
-        )
-        .expect("hf url should resolve");
+        let url = huggingface_resolve_url("Qdrant/all-MiniLM-L6-v2-onnx", "onnx/model.onnx")
+            .expect("hf url should resolve");
         assert_eq!(
             url,
             "https://huggingface.co/Qdrant/all-MiniLM-L6-v2-onnx/resolve/main/onnx/model.onnx"
@@ -5747,9 +5848,15 @@ mod tests {
         let mlx = catalog_model_engine_identity("mlx").unwrap();
         let ane = catalog_model_engine_identity("ane").unwrap();
         assert_eq!(mlx.engine, "mlx-worker");
-        assert_eq!(mlx.build_flags.get("numeric_profile").map(String::as_str), Some("bf16-distinct"));
+        assert_eq!(
+            mlx.build_flags.get("numeric_profile").map(String::as_str),
+            Some("bf16-distinct")
+        );
         assert_eq!(ane.engine, "ane-coreml-worker");
-        assert_eq!(ane.build_flags.get("placement_gate").map(String::as_str), Some("neural-engine"));
+        assert_eq!(
+            ane.build_flags.get("placement_gate").map(String::as_str),
+            Some("neural-engine")
+        );
         assert_ne!(mlx, ane);
     }
 
@@ -5805,6 +5912,9 @@ mod tests {
         assert_eq!(performance.model_id, "metal-fast");
         assert_eq!(quiet.model_id, "ane-quiet");
         assert_eq!(balanced.model_id, "ane-quiet");
-        assert!(quiet.throughput_tok_s >= performance.throughput_tok_s * BALANCED_QUIET_MIN_THROUGHPUT_RATIO);
+        assert!(
+            quiet.throughput_tok_s
+                >= performance.throughput_tok_s * BALANCED_QUIET_MIN_THROUGHPUT_RATIO
+        );
     }
 }

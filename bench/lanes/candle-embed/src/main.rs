@@ -2,14 +2,17 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{ensure, Context, Result};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config as BertConfig};
 use clap::{Parser, ValueEnum};
-use hf_hub::{Repo, api::sync::{ApiBuilder, ApiRepo}};
+use hf_hub::{
+    api::sync::{ApiBuilder, ApiRepo},
+    Repo,
+};
 use synapse_bench::{
-    parity::{Chunk, load_corpus, load_reference, mean_parity},
+    parity::{load_corpus, load_reference, mean_parity, Chunk},
     results::LaneResult,
 };
 use tokenizers::{Tokenizer, TruncationParams};
@@ -263,7 +266,9 @@ fn resolve_model_files() -> Result<ModelFiles> {
         .build()
         .context("build hf-hub api")?;
     let repo = api.repo(Repo::model(MODEL_ID.to_owned()));
-    let config = repo.get("config.json").context("get config.json from hf-hub")?;
+    let config = repo
+        .get("config.json")
+        .context("get config.json from hf-hub")?;
     let tokenizer = repo
         .get("tokenizer.json")
         .context("get tokenizer.json from hf-hub")?;
@@ -289,9 +294,7 @@ fn collect_weight_files(repo: &ApiRepo) -> Result<Vec<PathBuf>> {
     for shard_index in 1..=128 {
         let mut found = None;
         for total_shards in 1..=128 {
-            let candidate = format!(
-                "model-{shard_index:05}-of-{total_shards:05}.safetensors"
-            );
+            let candidate = format!("model-{shard_index:05}-of-{total_shards:05}.safetensors");
             if let Ok(path) = repo.get(&candidate) {
                 found = Some(path);
                 break;
@@ -311,7 +314,8 @@ fn collect_weight_files(repo: &ApiRepo) -> Result<Vec<PathBuf>> {
 }
 
 fn load_tokenizer(path: &Path, max_length: usize) -> Result<Tokenizer> {
-    let mut tokenizer = Tokenizer::from_file(path).map_err(|err| anyhow::anyhow!("tokenizer: {err}"))?;
+    let mut tokenizer =
+        Tokenizer::from_file(path).map_err(|err| anyhow::anyhow!("tokenizer: {err}"))?;
     tokenizer
         .with_truncation(Some(TruncationParams {
             max_length,
@@ -337,7 +341,10 @@ fn load_model(
     Ok((model, config))
 }
 
-fn encode_chunks(tokenizer: &Tokenizer, chunks: Vec<Chunk>) -> Result<(Vec<EncodedChunk>, Vec<String>)> {
+fn encode_chunks(
+    tokenizer: &Tokenizer,
+    chunks: Vec<Chunk>,
+) -> Result<(Vec<EncodedChunk>, Vec<String>)> {
     let texts: Vec<&str> = chunks.iter().map(|chunk| chunk.text.as_str()).collect();
     let encodings = tokenizer
         .encode_batch(texts, true)

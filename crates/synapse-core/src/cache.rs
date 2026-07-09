@@ -98,7 +98,6 @@ pub enum CacheGcOutcome {
 #[derive(Debug)]
 pub struct ModelCacheReadGuard {
     blob_path: PathBuf,
-    digest: String,
     _lease: Box<dyn LeaseHandle>,
 }
 
@@ -106,11 +105,6 @@ impl ModelCacheReadGuard {
     #[must_use]
     pub fn blob_path(&self) -> &Path {
         &self.blob_path
-    }
-
-    #[must_use]
-    pub fn digest(&self) -> &str {
-        &self.digest
     }
 }
 
@@ -167,7 +161,6 @@ impl ModelCache {
         let lease = self.leases.acquire_shared(&lease_key(&normalized))?;
         Ok(ModelCacheReadGuard {
             blob_path: self.blob_path(&normalized),
-            digest: normalized,
             _lease: lease,
         })
     }

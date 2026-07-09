@@ -103,20 +103,6 @@ pub enum WorkerRequest {
     Shutdown {},
 }
 
-impl WorkerRequest {
-    pub fn req_id(&self) -> Option<&str> {
-        match self {
-            Self::Load { req_id, .. }
-            | Self::EmbedBatch { req_id, .. }
-            | Self::Rerank { req_id, .. }
-            | Self::Generate { req_id, .. }
-            | Self::Unload { req_id, .. }
-            | Self::Ping { req_id } => Some(req_id),
-            Self::Shutdown {} => None,
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum WorkerResponse {
@@ -157,20 +143,6 @@ pub enum WorkerResponse {
         code: String,
         msg: String,
     },
-}
-
-impl WorkerResponse {
-    pub fn req_id(&self) -> Option<&str> {
-        match self {
-            Self::Loaded { req_id, .. }
-            | Self::Vectors { req_id, .. }
-            | Self::Scores { req_id }
-            | Self::Text { req_id, .. }
-            | Self::Unloaded { req_id }
-            | Self::Pong { req_id, .. } => Some(req_id),
-            Self::Err { req_id, .. } => req_id.as_deref(),
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

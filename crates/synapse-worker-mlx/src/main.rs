@@ -68,26 +68,9 @@ struct BertConfig {
     pad_token_id: u32,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum OneOrManyTokenIds {
-    One(u32),
-    Many(Vec<u32>),
-}
-
-impl OneOrManyTokenIds {
-    fn into_vec(self) -> Vec<u32> {
-        match self {
-            Self::One(id) => vec![id],
-            Self::Many(ids) => ids,
-        }
-    }
-}
-
 #[derive(Debug, Deserialize, Default)]
 struct QwenGenerationConfig {
     pad_token_id: Option<u32>,
-    eos_token_id: Option<OneOrManyTokenIds>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -767,11 +750,6 @@ impl QwenModel {
             .or(config.pad_token_id)
             .or(config.eos_token_id)
             .unwrap_or(0);
-        let _stop_token_ids = generation_config
-            .eos_token_id
-            .map(OneOrManyTokenIds::into_vec)
-            .unwrap_or_default();
-
         Ok(Self {
             config,
             pad_token_id,
@@ -1239,23 +1217,6 @@ fn bert_inputs(
     Ok((input_ids, mask, additive_mask))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn bert_inputs_masks_configured_padding_tokens() {
-        let (_input_ids, mask, additive_mask) =
-            bert_inputs(&[vec![101, 102, 0, 0], vec![101, 7592, 102, 0]], 8, 0)
-                .expect("BERT inputs should build");
-        assert_eq!(mask, vec![1, 1, 0, 0, 1, 1, 1, 0]);
-        assert_eq!(
-            additive_mask.as_slice::<f32>(),
-            &[0.0, 0.0, -10_000.0, -10_000.0, 0.0, 0.0, 0.0, -10_000.0]
-        );
-    }
-}
-
 fn batch_to_array(sequences: &[Vec<u32>], pad_id: u32) -> Result<Array> {
     ensure!(!sequences.is_empty(), "empty batch");
     let batch = sequences.len();
@@ -1645,4 +1606,21 @@ fn write_frame(stream: &mut UnixStream, bytes: &[u8], max_frame: u32) -> Result<
     stream.write_all(bytes)?;
     stream.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bert_inputs_masks_configured_padding_tokens() {
+        let (_input_ids, mask, additive_mask) =
+            bert_inputs(&[vec![101, 102, 0, 0], vec![101, 7592, 102, 0]], 8, 0)
+                .expect("BERT inputs should build");
+        assert_eq!(mask, vec![1, 1, 0, 0, 1, 1, 1, 0]);
+        assert_eq!(
+            additive_mask.as_slice::<f32>(),
+            &[0.0, 0.0, -10_000.0, -10_000.0, 0.0, 0.0, 0.0, -10_000.0]
+        );
+    }
 }

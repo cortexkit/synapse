@@ -97,13 +97,15 @@ fn assert_idle(max_cpu_pct: f64, max_gpu_pct: f64) -> Result<()> {
 /// only reports machine totals, which cannot distinguish the measured child
 /// from a foreign agent burst).
 fn foreign_cpu_pct(child_pid: u32) -> Option<f64> {
-    let out = Command::new("ps").args(["-axo", "pid=,ppid=,pcpu="]).output().ok()?;
+    let out = Command::new("ps")
+        .args(["-axo", "pid=,ppid=,pcpu="])
+        .output()
+        .ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     let mut rows: Vec<(u32, u32, f64)> = Vec::new();
     for line in text.lines() {
         let mut parts = line.split_whitespace();
-        let (Some(pid), Some(ppid), Some(pcpu)) = (parts.next(), parts.next(), parts.next())
-        else {
+        let (Some(pid), Some(ppid), Some(pcpu)) = (parts.next(), parts.next(), parts.next()) else {
             continue;
         };
         let (Ok(pid), Ok(ppid), Ok(pcpu)) =
@@ -130,8 +132,14 @@ fn foreign_cpu_pct(child_pid: u32) -> Option<f64> {
     }
     // ps pcpu is per-core (100 = one full core); normalize to machine percent
     // so the value is comparable with the preflight gate's macmon threshold.
-    let sum: f64 = rows.iter().filter(|(pid, _, _)| !tree.contains(pid)).map(|(_, _, p)| p).sum();
-    let ncpu = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) as f64;
+    let sum: f64 = rows
+        .iter()
+        .filter(|(pid, _, _)| !tree.contains(pid))
+        .map(|(_, _, p)| p)
+        .sum();
+    let ncpu = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1) as f64;
     Some(sum / ncpu)
 }
 
@@ -282,7 +290,10 @@ pub fn run_wrapped(
 }
 
 fn sample_rss(pid: u32) -> Option<u64> {
-    let out = Command::new("ps").args(["-o", "rss=", "-p", &pid.to_string()]).output().ok()?;
+    let out = Command::new("ps")
+        .args(["-o", "rss=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
     let kb: u64 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
     Some(kb * 1024)
 }

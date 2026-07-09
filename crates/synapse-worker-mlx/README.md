@@ -12,11 +12,15 @@ Supported v1 model families:
   `bench/lanes/mlx`.
 
 Build note: `mlx-rs` builds Metal support through the Apple toolchain. On macOS
-CI/dev hosts use:
+CI/dev hosts need the full Xcode Metal toolchain; Command Line Tools alone can
+make `xcrun` resolve without `metal`/`metallib` and fail inside `mlx-sys`. Use:
 
 ```bash
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer cargo build -p synapse-worker-mlx
 ```
+
+The build script checks for `xcrun --find metal` and `xcrun --find metallib` so
+missing toolchains fail with this requirement instead of a later CMake error.
 
 Packaging trap: `mlx.metallib` must ship next to the installed worker binary.
 The MLX runtime looks beside the executable at run time; relocating only the

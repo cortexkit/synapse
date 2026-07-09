@@ -47,7 +47,10 @@ pub fn load_reference(path: &Path) -> Result<HashMap<String, Vec<f32>>> {
         id: String,
         vec: Vec<f32>,
     }
-    Ok(load_jsonl::<Row>(path)?.into_iter().map(|r| (r.id, r.vec)).collect())
+    Ok(load_jsonl::<Row>(path)?
+        .into_iter()
+        .map(|r| (r.id, r.vec))
+        .collect())
 }
 
 /// Cosine similarity in f64 accumulation (bf16/f16 lanes need the headroom).
@@ -55,7 +58,11 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f64 {
     if a.len() != b.len() {
         return 0.0;
     }
-    let dot: f64 = a.iter().zip(b).map(|(x, y)| (*x as f64) * (*y as f64)).sum();
+    let dot: f64 = a
+        .iter()
+        .zip(b)
+        .map(|(x, y)| (*x as f64) * (*y as f64))
+        .sum();
     let na: f64 = a.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
     let nb: f64 = b.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
     dot / (na * nb + 1e-12)
@@ -94,7 +101,11 @@ pub fn rank_overlap(
         ids.sort(); // deterministic across runs
         ids
     };
-    anyhow::ensure!(ids.len() > k + 1, "not enough shared ids ({}) for k={k}", ids.len());
+    anyhow::ensure!(
+        ids.len() > k + 1,
+        "not enough shared ids ({}) for k={k}",
+        ids.len()
+    );
 
     let queries: Vec<&String> = ids.iter().step_by(stride.max(1)).copied().collect();
     let mut overlaps: Vec<f64> = Vec::with_capacity(queries.len());

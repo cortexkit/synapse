@@ -65,6 +65,7 @@
 - Purpose: Specialized out-of-process inference engines built for specific hardware (ANE, MLX, llama.cpp).
 - Contains: Binaries that speak the `worker_protocol` over a local socket.
 - Key files: `crates/synapse-worker-mlx/src/main.rs`, `crates/synapse-worker-ane/src/main.rs`
+- Build note: `synapse-worker-mlx` requires full Xcode with the Metal toolchain on macOS. If `xcrun` resolves to Command Line Tools only, build with `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer`; the workspace does not auto-set it.
 
 **bench/:**
 - Purpose: Contains all performance evaluation execution infrastructure.

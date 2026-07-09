@@ -1278,7 +1278,10 @@ fn sample_rss_bytes(pid: u32) -> Option<u64> {
     }
     let line = String::from_utf8_lossy(&output.stdout);
     let mem_field = line.trim().rsplit("\",\"").next()?;
-    let digits: String = mem_field.chars().filter(|c: &char| c.is_ascii_digit()).collect();
+    let digits: String = mem_field
+        .chars()
+        .filter(|c: &char| c.is_ascii_digit())
+        .collect();
     let kib: u64 = digits.parse().ok()?;
     Some(kib.saturating_mul(1024))
 }
