@@ -149,15 +149,21 @@ substitution rejection preserved byte-for-byte), `required_epoch` (Oracle F15).
   rather than running unconstrained.
 - `model.load` / `model.status` — control-class job (below).
 - `models.list` — cached catalog, states, fingerprints, alias rows.
-- `probe.start` / `probe.status` — explicit op, job-shaped; writes
-  certification + machine profile rows.
+- `probe.start` / `probe.status` / `probe.report` — explicit ops; start/status
+  are job-shaped. Probe writes certification + perf rows stamped with
+  (machine_profile_hash, os_build, module_generation) and persists the
+  per-workload knob assignments. `probe.report` returns the full measured
+  capability table (quality, perf, stale flags, current knob, assignments) for
+  the onboarding screen. v1 reads the knob at startup; changing it requires a
+  module restart.
 - `aliases.check_index` — see above.
 - `cache.pin` / `cache.gc` — cache management.
 - `admission.status` — advisory only; the contract lives in per-request
   budgets, not in this snapshot (Oracle F2). It does expose, cheaply from
   cached scheduler state: per-lane `meeting_deadlines: bool` + rolling p50
-  start-delay (AFT r2 note 3 — feeds consumer-side degradation notices;
-  advisory for UX, never a substitute for per-request budgets).
+  start-delay, plus certification/perf staleness for loaded lanes (AFT r2 note
+  3 — feeds consumer-side degradation notices; advisory for UX, never a
+  substitute for per-request budgets).
 
 **Error contract (Oracle F16)**: stable codes, not just classes —
 `queue_full`, `deadline_exceeded`, `model_loading`, `not_certified`,
@@ -230,15 +236,16 @@ implementation wave.
 ## Health
 
 Cached in-memory state ONLY (SUBC invariant): model/lane states, queue depths,
-worker liveness — stamped by the serving paths; ages computed at probe time.
-Cold load in progress = degraded + "loading <model>". No engine/GPU/worker
-probes on the dispatch path.
+worker liveness, and probe-row staleness — stamped by the serving paths; ages
+computed at probe time. Cold load in progress = degraded + "loading <model>".
+No engine/GPU/worker probes on the dispatch path.
 
 ## Config
 
-~/.config/cortexkit/synapse.jsonc: knob (performance|balanced|quiet), model
-pins, cache budget, remote endpoints (post-v1). Everything else measured
-(probe) or contracted (subc).
+~/.config/cortexkit/synapse.jsonc: knob (performance|balanced|quiet,
+default=balanced), model pins, cache budget, remote endpoints (post-v1).
+Everything else measured (probe) or contracted (subc). v1 samples config at
+startup; knob changes take effect after restart.
 
 ## v1 cut line
 

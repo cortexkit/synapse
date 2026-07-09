@@ -13,7 +13,7 @@ use common::{
     connect_consumer, raw_route_frame, read_frame_timeout, route_open, route_request,
     unique_temp_dir, wait_for_catalog, MODULE_ID, SETUP_TIMEOUT,
 };
-use rusqlite::Connection;
+use rusqlite::{params, Connection};
 use serde_json::Value;
 use subc_core::{
     daemon_config::StorageConfig, serve_listener, write_frame, ControlHandler, Frame, Registry,
@@ -630,6 +630,193 @@ async fn alias_surface_certifies_declares_retracts_and_preserves_old_job_pages()
 }
 
 #[tokio::test]
+async fn probe_report_exposes_blocking_reasons_perf_rows_and_default_assignments() {
+    let Some(preloads) = minilm_preload_config() else {
+        eprintln!("skipping probe.report e2e: local HF ONNX snapshot is missing");
+        return;
+    };
+    let _lock = acquire_minilm_e2e_lock();
+    let (_daemon, _module, mut consumer, route_channel) =
+        open_route_with_preloads(Some(&preloads)).await;
+
+    let before = route_request(
+        &mut consumer,
+        route_channel,
+        85,
+        serde_json::json!({ "method": "probe.report", "params": {} }),
+    )
+    .await;
+    assert_eq!(before["result"]["current_knob"], "balanced");
+    assert_eq!(before["result"]["lanes"].as_array().unwrap().len(), 1);
+    assert_eq!(before["result"]["lanes"][0]["blocking_reason"], "probe_required");
+    assert_eq!(before["result"]["lanes"][0]["performance"], Value::Null);
+
+    let probed = certify_preloaded_models(&mut consumer, route_channel, 86).await;
+    assert_eq!(probed["result"]["current_knob"], "balanced");
+    assert_eq!(probed["result"]["knob_assignments"].as_array().unwrap().len(), 3);
+    let perf = &probed["result"]["lanes"][0]["performance"];
+    assert!(perf["throughput_tok_s"].as_f64().unwrap() > 0.0);
+    assert!(perf["cold_load_ms"].as_f64().unwrap() >= 0.0);
+    assert!(perf["single_item_latency_p50_ms"].as_f64().unwrap() >= 0.0);
+
+    let report = route_request(
+        &mut consumer,
+        route_channel,
+        87,
+        serde_json::json!({ "method": "probe.report", "params": {} }),
+    )
+    .await;
+    let result = &report["result"];
+    assert_eq!(result["current_knob"], "balanced");
+    assert_eq!(result["knob_assignments"].as_array().unwrap().len(), 3);
+    assert_eq!(result["active_assignments"].as_array().unwrap().len(), 1);
+    assert_eq!(result["active_assignments"][0]["model_id"], "minilm");
+    assert_eq!(result["lanes"][0]["blocking_reason"], Value::Null);
+    assert_eq!(result["lanes"][0]["certification_stale"], false);
+    assert_eq!(result["lanes"][0]["performance_stale"], false);
+    assert_eq!(result["lanes"][0]["performance"]["stale"], false);
+}
+
+#[tokio::test]
+async fn quiet_knob_restart_uses_persisted_assignment() {
+    let Some(preloads) = minilm_alias_preload_config() else {
+        eprintln!("skipping knob routing e2e: local HF ONNX snapshot is missing");
+        return;
+    };
+    let config = module_config_with_preloads(preloads.clone(), "balanced");
+    let _lock = acquire_minilm_e2e_lock();
+    let (daemon, mut module, mut consumer, route_channel) = open_route_with_config(&config).await;
+    certify_preloaded_models(&mut consumer, route_channel, 120).await;
+
+    let report = route_request(
+        &mut consumer,
+        route_channel,
+        121,
+        serde_json::json!({ "method": "probe.report", "params": {} }),
+    )
+    .await;
+    let lanes = report["result"]["lanes"].as_array().unwrap();
+    assert_eq!(lanes.len(), 2);
+    let current_model_id = report["result"]["active_assignments"][0]["model_id"]
+        .as_str()
+        .unwrap();
+    let quiet_target = lanes
+        .iter()
+        .find(|lane| lane["model_id"].as_str().unwrap() != current_model_id)
+        .cloned()
+        .expect("alternate lane for quiet assignment");
+    let quiet_model_id = quiet_target["model_id"].as_str().unwrap().to_string();
+    let quiet_fingerprint = quiet_target["fingerprint"].as_str().unwrap().to_string();
+    overwrite_knob_assignment(
+        &expected_store_path(&daemon.data_home),
+        report["result"]["machine_profile_hash"].as_str().unwrap(),
+        "embed",
+        "quiet",
+        &quiet_target,
+    );
+
+    let _ = module.child.start_kill();
+    let _ = module.child.wait().await;
+    drop(consumer);
+
+    let restarted = spawn_synapse_module_with_config(
+        &daemon.connection_file_path,
+        &module_config_with_preloads(preloads, "quiet"),
+    );
+    let (_daemon, _module, mut consumer, route_channel) =
+        open_route_for_started_module(daemon, restarted).await;
+
+    let quiet_report = route_request(
+        &mut consumer,
+        route_channel,
+        122,
+        serde_json::json!({ "method": "probe.report", "params": {} }),
+    )
+    .await;
+    assert_eq!(quiet_report["result"]["current_knob"], "quiet");
+    assert_eq!(quiet_report["result"]["active_assignments"][0]["model_id"], quiet_model_id);
+
+    let first = route_request(
+        &mut consumer,
+        route_channel,
+        123,
+        serde_json::json!({
+            "method": "embed.query",
+            "params": { "id": "quiet-knob", "text": "quiet knob uses the persisted assignment" }
+        }),
+    )
+    .await;
+    if first["result"]["error"]["code"] == "model_loading" {
+        let ready = poll_model_ready(&mut consumer, route_channel, 124, &quiet_model_id).await;
+        assert_eq!(ready["result"]["state"], "ready");
+    }
+    let routed = route_request(
+        &mut consumer,
+        route_channel,
+        125,
+        serde_json::json!({
+            "method": "embed.query",
+            "params": { "id": "quiet-knob-2", "text": "quiet knob uses the persisted assignment after restart" }
+        }),
+    )
+    .await;
+    assert_eq!(routed["result"]["fingerprint"], quiet_fingerprint);
+}
+
+#[tokio::test]
+async fn os_build_override_marks_probe_rows_stale_in_report_and_status() {
+    let Some(preloads) = minilm_preload_config() else {
+        eprintln!("skipping stale probe e2e: local HF ONNX snapshot is missing");
+        return;
+    };
+    let _lock = acquire_minilm_e2e_lock();
+    let (daemon, mut module, mut consumer, route_channel) =
+        open_route_with_preloads(Some(&preloads)).await;
+    certify_preloaded_models(&mut consumer, route_channel, 130).await;
+
+    let _ = module.child.start_kill();
+    let _ = module.child.wait().await;
+    drop(consumer);
+
+    let restarted = spawn_synapse_module_with_env(
+        &daemon.connection_file_path,
+        Some(&preloads),
+        None,
+        &[("SYNAPSE_OS_BUILD_OVERRIDE", "synthetic-stale-build")],
+    );
+    let (_daemon, _module, mut consumer, route_channel) =
+        open_route_for_started_module(daemon, restarted).await;
+
+    let report = route_request(
+        &mut consumer,
+        route_channel,
+        131,
+        serde_json::json!({ "method": "probe.report", "params": {} }),
+    )
+    .await;
+    assert_eq!(report["result"]["certification_stale"], true);
+    assert_eq!(report["result"]["performance_stale"], true);
+    assert_eq!(report["result"]["lanes"][0]["blocking_reason"], "probe_required");
+    assert_eq!(report["result"]["lanes"][0]["certification"]["stale"], true);
+    assert_eq!(report["result"]["lanes"][0]["performance"]["stale"], true);
+    assert_eq!(report["result"]["lanes"][0]["certification"]["stale_os_build"], true);
+    assert_eq!(report["result"]["lanes"][0]["performance"]["stale_os_build"], true);
+
+    ensure_model_loaded_by_query(&mut consumer, route_channel, 132, "minilm").await;
+    let status = route_request(
+        &mut consumer,
+        route_channel,
+        135,
+        serde_json::json!({ "method": "admission.status", "params": {} }),
+    )
+    .await;
+    assert_eq!(status["result"]["certification_stale"], true);
+    assert_eq!(status["result"]["performance_stale"], true);
+    assert_eq!(status["result"]["lanes"][0]["certification_stale"], true);
+    assert_eq!(status["result"]["lanes"][0]["performance_stale"], true);
+}
+
+#[tokio::test]
 async fn embed_query_deadline_one_returns_typed_rejection() {
     let Some(preloads) = minilm_preload_config() else {
         eprintln!("skipping MiniLM deadline e2e: local HF ONNX snapshot is missing");
@@ -1095,6 +1282,85 @@ async fn poll_embed_result(
             other => panic!("unexpected embed.result state {other:?}: {body:?}"),
         }
     }
+}
+
+async fn ensure_model_loaded_by_query(
+    consumer: &mut tokio::net::TcpStream,
+    route_channel: u16,
+    start_corr: u64,
+    model_id: &str,
+) {
+    let body = route_request(
+        consumer,
+        route_channel,
+        start_corr,
+        serde_json::json!({
+            "method": "embed.query",
+            "params": {
+                "model": model_id,
+                "id": "stale-load",
+                "text": "load the model so admission.status can report stale probe rows"
+            }
+        }),
+    )
+    .await;
+    match body["result"]["error"]["code"].as_str() {
+        Some("model_loading") => {
+            let ready = poll_model_ready(consumer, route_channel, start_corr + 1, model_id).await;
+            assert_eq!(ready["result"]["state"], "ready");
+        }
+        Some("not_certified" | "probe_required") | None => {}
+        other => panic!("unexpected model load kick response {other:?}: {body:?}"),
+    }
+}
+
+fn module_config_with_preloads(preloads: Value, knob: &str) -> String {
+    serde_json::json!({
+        "preload_models": preloads,
+        "knob": knob,
+    })
+    .to_string()
+}
+
+fn overwrite_knob_assignment(
+    store_path: &Path,
+    machine_profile_hash: &str,
+    workload: &str,
+    knob: &str,
+    lane: &Value,
+) {
+    let performance = lane["performance"].as_object().expect("lane performance row");
+    let conn = Connection::open(store_path).expect("open synapse store");
+    let changed = conn
+        .execute(
+            "UPDATE knob_assignments
+             SET model_id = ?1,
+                 numeric_profile_id = ?2,
+                 fingerprint = ?3,
+                 engine = ?4,
+                 measured_at_ms = ?5,
+                 os_build = ?6,
+                 module_generation = ?7,
+                 throughput_tok_s = ?8,
+                 single_item_latency_p50_ms = ?9
+             WHERE machine_profile_hash = ?10 AND workload = ?11 AND knob = ?12",
+            params![
+                lane["model_id"].as_str().unwrap(),
+                lane["numeric_profile_id"].as_str().unwrap(),
+                lane["fingerprint"].as_str().unwrap(),
+                performance["engine"].as_str().unwrap(),
+                performance["measured_at_ms"].as_u64().unwrap() as i64,
+                performance["os_build"].as_str().unwrap(),
+                performance["module_generation"].as_u64().unwrap() as i64,
+                performance["throughput_tok_s"].as_f64().unwrap(),
+                performance["single_item_latency_p50_ms"].as_f64().unwrap(),
+                machine_profile_hash,
+                workload,
+                knob,
+            ],
+        )
+        .expect("rewrite knob assignment");
+    assert_eq!(changed, 1, "expected one knob assignment row to update");
 }
 
 fn assert_vectors_close(actual: &Value, expected: &Value) {
