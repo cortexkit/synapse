@@ -12,26 +12,6 @@ pub enum QueueClass {
     Control,
 }
 
-pub trait QueueClassMarker {
-    const CLASS: QueueClass;
-}
-
-pub struct InteractiveQueue;
-pub struct BulkQueue;
-pub struct ControlQueue;
-
-impl QueueClassMarker for InteractiveQueue {
-    const CLASS: QueueClass = QueueClass::Interactive;
-}
-
-impl QueueClassMarker for BulkQueue {
-    const CLASS: QueueClass = QueueClass::Bulk;
-}
-
-impl QueueClassMarker for ControlQueue {
-    const CLASS: QueueClass = QueueClass::Control;
-}
-
 pub trait Clock {
     fn now_ms(&self) -> u64;
 }

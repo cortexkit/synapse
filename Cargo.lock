@@ -5597,6 +5597,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rlimit"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f35ee2729c56bb610f6dba436bf78135f728b7373bdffae2ec815b2d3eb98cc3"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "rmp"
 version = "0.8.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6199,6 +6208,7 @@ dependencies = [
  "cortexkit-paths",
  "fs4",
  "getrandom 0.2.17",
+ "rlimit",
  "serde",
  "serde_json",
  "subc-control",
@@ -6283,7 +6293,6 @@ dependencies = [
  "cortexkit-lease",
  "hex",
  "reqwest",
- "rusqlite",
  "serde",
  "serde_json",
  "sha2",

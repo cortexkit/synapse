@@ -1,10 +1,8 @@
 use std::collections::BTreeSet;
 
-use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use thiserror::Error;
 
 use crate::engine::EngineIdentity;
 
@@ -123,21 +121,6 @@ pub struct AliasRow {
 }
 
 impl AliasRow {
-    pub fn new(
-        fingerprint_a: Fingerprint,
-        fingerprint_b: Fingerprint,
-        valid_from_ms: u64,
-        valid_to_ms: Option<u64>,
-    ) -> Self {
-        Self::with_evidence(
-            fingerprint_a,
-            fingerprint_b,
-            valid_from_ms,
-            valid_to_ms,
-            empty_evidence(),
-        )
-    }
-
     pub fn with_evidence(
         fingerprint_a: Fingerprint,
         fingerprint_b: Fingerprint,
@@ -157,19 +140,6 @@ impl AliasRow {
 
     pub fn is_active_at(&self, at_ms: u64) -> bool {
         self.valid_from_ms <= at_ms && self.valid_to_ms.map(|until| at_ms < until).unwrap_or(true)
-    }
-
-    pub fn was_retracted(&self) -> bool {
-        self.valid_to_ms.is_some()
-    }
-
-    pub fn was_retracted_by(&self, _table_epoch: u64) -> bool {
-        self.was_retracted()
-    }
-
-    pub fn spans(&self, a: &Fingerprint, b: &Fingerprint) -> bool {
-        let (a, b) = canonical_pair(a.clone(), b.clone());
-        self.fingerprint_a == a && self.fingerprint_b == b
     }
 }
 
@@ -209,7 +179,7 @@ impl AliasTable {
         for row in &self.rows {
             if provenance_set.contains(&row.fingerprint_a)
                 && provenance_set.contains(&row.fingerprint_b)
-                && row.was_retracted_by(self.table_epoch)
+                && row.valid_to_ms.is_some()
             {
                 return AliasCheckVerdict::MigrationRequired {
                     retracted_pair: RetractedAliasPair {
@@ -240,117 +210,6 @@ pub enum AliasCheckVerdict {
         retracted_pair: RetractedAliasPair,
         rebuild_target: Fingerprint,
     },
-}
-
-#[derive(Debug, Error)]
-pub enum AliasStoreError {
-    #[error("sqlite alias store: {0}")]
-    Sqlite(#[from] rusqlite::Error),
-}
-
-pub trait AliasTableStore {
-    fn migrate(&self) -> Result<(), AliasStoreError>;
-    fn load_alias_table(&self) -> Result<AliasTable, AliasStoreError>;
-    fn store_alias_row(&self, row: &AliasRow) -> Result<(), AliasStoreError>;
-    fn set_table_epoch(&self, table_epoch: u64) -> Result<(), AliasStoreError>;
-}
-
-pub struct SqliteAliasTableStore<'conn> {
-    conn: &'conn Connection,
-}
-
-impl<'conn> SqliteAliasTableStore<'conn> {
-    pub fn new(conn: &'conn Connection) -> Self {
-        Self { conn }
-    }
-}
-
-impl AliasTableStore for SqliteAliasTableStore<'_> {
-    fn migrate(&self) -> Result<(), AliasStoreError> {
-        self.conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS alias_table_meta (\
-                 id INTEGER PRIMARY KEY CHECK (id = 0),\
-                 table_epoch INTEGER NOT NULL\
-             );\
-             INSERT OR IGNORE INTO alias_table_meta (id, table_epoch) VALUES (0, 0);\
-             CREATE TABLE IF NOT EXISTS alias_rows (\
-                  fingerprint_a TEXT NOT NULL,\
-                  fingerprint_b TEXT NOT NULL,\
-                  valid_from_ms INTEGER NOT NULL,\
-                  valid_to_ms INTEGER,\
-                  evidence_json TEXT NOT NULL DEFAULT '{}',\
-                  PRIMARY KEY (fingerprint_a, fingerprint_b, valid_from_ms)\
-              );",
-        )?;
-        Ok(())
-    }
-
-    fn load_alias_table(&self) -> Result<AliasTable, AliasStoreError> {
-        let table_epoch = self.conn.query_row(
-            "SELECT table_epoch FROM alias_table_meta WHERE id = 0",
-            [],
-            |row| row.get::<_, i64>(0),
-        )? as u64;
-
-        let mut stmt = self.conn.prepare(
-            "SELECT fingerprint_a, fingerprint_b, valid_from_ms, valid_to_ms, evidence_json \
-             FROM alias_rows \
-             ORDER BY fingerprint_a, fingerprint_b, valid_from_ms",
-        )?;
-        let rows = stmt
-            .query_map([], |row| {
-                let evidence_json: String = row.get(4)?;
-                let evidence = serde_json::from_str(&evidence_json).map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        4,
-                        rusqlite::types::Type::Text,
-                        Box::new(error),
-                    )
-                })?;
-                Ok(AliasRow::with_evidence(
-                    Fingerprint(row.get(0)?),
-                    Fingerprint(row.get(1)?),
-                    row.get::<_, i64>(2)? as u64,
-                    row.get::<_, Option<i64>>(3)?.map(|value| value as u64),
-                    evidence,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(AliasTable { table_epoch, rows })
-    }
-
-    fn store_alias_row(&self, row: &AliasRow) -> Result<(), AliasStoreError> {
-        let canonical = AliasRow::new(
-            row.fingerprint_a.clone(),
-            row.fingerprint_b.clone(),
-            row.valid_from_ms,
-            row.valid_to_ms,
-        );
-        let evidence_json = serde_json::to_string(&canonical.evidence)
-            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-        self.conn.execute(
-            "INSERT INTO alias_rows (fingerprint_a, fingerprint_b, valid_from_ms, valid_to_ms, evidence_json) \
-             VALUES (?1, ?2, ?3, ?4, ?5) \
-             ON CONFLICT(fingerprint_a, fingerprint_b, valid_from_ms) DO UPDATE SET \
-             valid_to_ms = excluded.valid_to_ms, evidence_json = excluded.evidence_json",
-            params![
-                canonical.fingerprint_a.0,
-                canonical.fingerprint_b.0,
-                canonical.valid_from_ms as i64,
-                canonical.valid_to_ms.map(|value| value as i64),
-                evidence_json,
-            ],
-        )?;
-        Ok(())
-    }
-
-    fn set_table_epoch(&self, table_epoch: u64) -> Result<(), AliasStoreError> {
-        self.conn.execute(
-            "UPDATE alias_table_meta SET table_epoch = ?1 WHERE id = 0",
-            params![table_epoch as i64],
-        )?;
-        Ok(())
-    }
 }
 
 fn empty_evidence() -> Value {
@@ -425,7 +284,13 @@ mod tests {
         let b = Fingerprint("fp-b".to_string());
         let active = AliasTable {
             table_epoch: 4,
-            rows: vec![AliasRow::new(a.clone(), b.clone(), 1, None)],
+            rows: vec![AliasRow::with_evidence(
+                a.clone(),
+                b.clone(),
+                1,
+                None,
+                empty_evidence(),
+            )],
         };
         assert_eq!(
             active.equivalent_fingerprints_at(&a, 4),
@@ -438,7 +303,13 @@ mod tests {
 
         let retracted = AliasTable {
             table_epoch: 5,
-            rows: vec![AliasRow::new(a.clone(), b.clone(), 1, Some(5))],
+            rows: vec![AliasRow::with_evidence(
+                a.clone(),
+                b.clone(),
+                1,
+                Some(5),
+                empty_evidence(),
+            )],
         };
         assert_eq!(
             retracted.check_index(&a, &BTreeSet::from([a.clone(), b.clone()])),
@@ -454,29 +325,5 @@ mod tests {
             retracted.check_index(&a, &BTreeSet::from([a.clone()])),
             AliasCheckVerdict::Valid
         );
-    }
-
-    #[test]
-    fn sqlite_alias_store_round_trips_rows() {
-        let conn = Connection::open_in_memory().expect("open in-memory sqlite");
-        let store = SqliteAliasTableStore::new(&conn);
-        store.migrate().expect("migrate alias schema");
-        store.set_table_epoch(7).expect("set table epoch");
-        store
-            .store_alias_row(&AliasRow::new(
-                Fingerprint("fp-a".to_string()),
-                Fingerprint("fp-b".to_string()),
-                3,
-                Some(9),
-            ))
-            .expect("store alias row");
-
-        let loaded = store.load_alias_table().expect("load alias table");
-        assert_eq!(loaded.table_epoch, 7);
-        assert_eq!(loaded.rows.len(), 1);
-        assert_eq!(loaded.rows[0].fingerprint_a.0, "fp-a");
-        assert_eq!(loaded.rows[0].fingerprint_b.0, "fp-b");
-        assert_eq!(loaded.rows[0].valid_from_ms, 3);
-        assert_eq!(loaded.rows[0].valid_to_ms, Some(9));
     }
 }
