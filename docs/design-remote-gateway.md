@@ -1,8 +1,9 @@
-# Synapse Remote Endpoint Gateway — design r3
+# Synapse Remote Endpoint Gateway — design r4
 
-Status: r3 — closes the second-pass review's start-blockers. Owner: Synapse.
+Status: r4 — folds the third-pass closure review (F2/N1 and F6/N4 closed
+there; this rev closes the six residuals it listed). Owner: Synapse.
 2026-07-10. History: r1 (20 findings, 8 DB) → r2 (8 resolved, 10 partial,
-2 papered-over per second pass) → r3 (this doc). Sections cite the findings
+2 papered-over per second pass) → r3 (start-blocker closures) → r4. Sections cite the findings
 they close. [CONSUMER] items are collected at the end; they gate Wave A
 SHIP, not start.
 
@@ -38,7 +39,11 @@ credentials, error classification, retry/breaker, rate-limit lore.
   an unchanged profile → typed boot error naming the provider; the only
   path forward is bumping `identity_revision` (new fingerprint, consumers
   re-embed). Renames stay free (name is not identity); URL moves always
-  cost a revision. No one-shot state machine to wedge.
+  cost a revision. No one-shot state machine to wedge. URL-binding rows
+  are immutable and live independently of certification rows (a cert
+  invalidation or re-probe never touches the binding; the row is removed
+  only when its profile hash no longer appears in config after a
+  config-removal grace sweep).
 - **Assurance + opt-in (F1)**: `identity_assurance: declared` on every
   remote model; requests must carry `accept_declared: true` to receive
   declared vectors, else typed permanent `declared_identity_not_accepted`.
@@ -91,8 +96,19 @@ a measured gate, seed aliases, or appear in `equivalent_to` (F6, held).
   permanent `remote_identity_drift` (operator exits via identity_revision
   bump). Single noisy calls can no longer force consumer re-embeds.
 - Drift gate derives from calibration: `drift_gate = calibration_floor -
-  (1 - calibration_floor)`, floored at the config minimum — NOT the local
-  measured-lane gates (those were designed for deterministic comparisons).
+  (1 - calibration_floor)` (i.e. twice the observed self-noise distance),
+  capped at 0.9999 for numerical headroom when a provider is perfectly
+  deterministic — NOT the local measured-lane gates (those were designed
+  for deterministic comparisons). Edge rules:
+  - Certification is REFUSED when `calibration_floor <
+    (1 + drift_gate_min) / 2` (the derived gate would fall below the
+    config minimum `drift_gate_min` — self-noise too high to monitor).
+  - Any zero-norm, NaN, or non-finite sentinel vector during calibration
+    → refusal (`provider_protocol_violation` reason).
+  - `drift_gate_min` config changes after certification apply at the
+    NEXT drift check: gates are recomputed from the stored
+    calibration_floor and current config; existing certs are not
+    invalidated by a config edit.
 
 ## Wire contract v1.1 (F7, F8, F20)
 
@@ -107,7 +123,7 @@ section before any implementation hardens; consumer ack gates ship
     "engine": {
       "engine": "remote_openai_compatible",
       "version": "<adapter semver>",
-      "build_flags": []
+      "build_flags": {}
     },
     "remote": {
       "provider": "openai",
@@ -116,6 +132,8 @@ section before any implementation hardens; consumer ack gates ship
     }
   }
   ```
+  (`build_flags` is a string-keyed object in the real EngineIdentity —
+  empty object or serde-omitted when empty, never an array.)
   `remote` is an optional sibling; absent for local lanes. No existing
   field changes shape.
 - New request fields: `accept_declared: bool` (embed/rerank/microllm ops).
@@ -130,7 +148,20 @@ section before any implementation hardens; consumer ack gates ship
   `idempotency_conflict` (permanent),
   `needs_reauth` (permanent-shaped inline rejection naming the handle),
   `needs_reauth_expired` (permanent, terminal job),
-  `remote_deployment_changed` (permanent; boot/serve refusal surface).
+  `remote_deployment_changed` (permanent; boot/serve refusal surface),
+  `credential_config_invalid` (permanent; vault handle not_found or
+  malformed — config errors, never retried).
+  Baseline codes that remote paths REUSE unchanged (not new, listed for
+  the union): `module_restarted` (job state after a restart, existing v1
+  contract), `invalid_request`, `probe_required`. Vault error mapping is
+  exact: not_found/malformed → `credential_config_invalid`; credentials
+  module unreachable/restarting → `provider_unavailable` (transient);
+  vault_locked/needs_reauth → pause path (jobs) or `needs_reauth`
+  (inline).
+- `provider_request_id` when the provider returns none: the field is
+  OMITTED entirely (never null, never empty string); page-level
+  `provider_request_ids` omits missing entries and is itself omitted when
+  empty.
 - Page availability: pages become readable WHILE THE JOB RUNS
   (`pages_available` on status; `embed.result` serves committed pages for
   running jobs). This fixes the local lane to match the snapshot's
@@ -158,9 +189,19 @@ section before any implementation hardens; consumer ack gates ship
 - **Request digest binds auth identity (N2)**: digest = sha256 over
   (op, synapse_model_id, remote_profile_hash, logical_handle,
   constraints, ordered item ids, per-item content hashes). Same key +
-  different digest → `idempotency_conflict`. After a reauth resume, a
-  sentinel continuity check runs BEFORE new vectors mix with committed
-  pages (drift → quarantine instead of resume).
+  different digest → `idempotency_conflict`.
+- **Continuity is checkpoint-driven, not state-driven**: ANY attempt that
+  would append to a NONEMPTY checkpoint set for its digest runs the
+  sentinel continuity check first — regardless of how the prior attempt
+  ended (reauth pause, module_restarted, crash). Restart cannot erase the
+  need for the check because the trigger is the checkpoints' existence,
+  not remembered pause state. Drift at continuity → quarantine, prior
+  pages stay readable, no mixing.
+- **Single-owner resume (CAS)**: the job row carries
+  `active_attempt_id`; `job.resume` and same-digest resubmission both
+  claim ownership via compare-and-swap on it (SQLite conditional update).
+  Exactly one claimant dispatches; the loser attaches to the winner
+  (status polling) instead of double-dispatching.
 - **Pause semantics (F9, F11)**: entering `paused_needs_reauth` RELEASES
   execution slots and queued-byte budget; the job retains only its row +
   digest + checkpoints. Wakeup paths: explicit `job.resume {job_id}`
@@ -204,9 +245,11 @@ but never touch providers", so the loader changes:
   unspecified (`0.0.0.0`, `::`), and IPv4-mapped (`::ffff:127.0.0.1`)
   forms are all rejected; boot-tested each.
 - Environment proxies bypassed for gateway calls (no_proxy semantics
-  enforced in the client build); redirects disabled; the connected peer
-  address is validated against the loopback rule BEFORE any HTTP bytes
-  are written (connect → getpeername → verify → send).
+  enforced in the client build); redirects disabled globally. Peer
+  validation (connect → getpeername → verify → send) applies to
+  `auth: none` endpoints ONLY — it enforces the loopback rule. Vault-
+  backed endpoints are protected by mandatory https/TLS, not peer
+  checks.
 - Vault-backed providers: https only, no URL userinfo, no query secrets,
   response body cap (default 32 MiB).
 
@@ -220,23 +263,31 @@ but never touch providers", so the loader changes:
   are SIZED to a latency target (`target_subbatch_ms`, default 10s, from
   the rolling estimate) so bulk permits recycle on that cadence — worst-
   case interactive wait is one sub-batch, not one read timeout. At
-  `max_concurrency: 1` the sub-batch sizing alone bounds the wait
-  (documented).
+  `max_concurrency: 1` there is NO hard interactive isolation: sizing
+  bounds expected (not worst-case) wait, and the only guarantee is strict
+  interactive-first priority at every permit turnover. The config docs
+  state this plainly and default shipped presets to `max_concurrency: 2`
+  minimum; operators choosing 1 accept bulk-behind-interactive latency.
 - Breaker (held from r2): provider transport breaker + per-model
   quarantine, single half-open lease across tiers, epoch-checked
   transitions, shared retry budget. Explicit rule (F19): 429 feeds AIMD
   pacing only — it never increments transport-breaker failure counts.
 - **Deadline estimator (F18, N5)**: absolute-by-module semantics frozen
-  and e2e-pinned. Estimate hierarchy per (provider, op, size-bucket):
-  (1) measured p90 when ≥8 successful samples in the window;
-  (2) coarser bucket, then op-level aggregate;
-  (3) configured cold estimate (`cold_estimate_ms`, defaults: embed 15s,
-  generate 30s).
-  Censored timeouts never enter the sample set as latencies; they set a
-  conservative FLOOR (estimate = max(chosen estimate, most recent timeout
-  floor within window)). Sustained failure is the breaker's job, not the
-  estimator's. Admission against an open breaker fails immediately
-  (transient), never queues.
+  and e2e-pinned. Fully specified:
+  - Size buckets by total input tokens: ≤1k, ≤8k, ≤64k, >64k.
+  - Window: per (provider, op, bucket) ring buffer of 256 samples;
+    samples expire after 30 minutes.
+  - p90 = nearest-rank on the sorted live window.
+  - Hierarchy: (1) bucket p90 when ≥8 live samples; (2) merged-op p90
+    (all buckets pooled) when ≥8; (3) configured cold estimate
+    (`cold_estimate_ms` per op — defaults: embed 15s, rerank 15s,
+    generate 30s).
+  - Censored timeouts never enter the sample set as latencies; they set
+    a conservative FLOOR: estimate = max(chosen estimate, MAX unexpired
+    censored duration in the bucket's window) — maximum, not
+    most-recent, so a later short censor can never shrink the floor.
+  Sustained failure is the breaker's job, not the estimator's. Admission
+  against an open breaker fails immediately (transient), never queues.
 
 ## Health (F20 — held)
 
