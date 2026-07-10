@@ -12,7 +12,9 @@ name = "synapse_module"
 path = "src/lib.rs"
 
 [[bin]]
-name = "synapse-module"
+# Fleet convention: supervised binaries carry the ck-* prefix so they group
+# in Activity Monitor. module_id stays "synapse"; this is the exe name only.
+name = "ck-synapse"
 path = "src/main.rs"
 
 [dependencies]

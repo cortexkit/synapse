@@ -8,7 +8,8 @@ description = "Synapse supervised llama.cpp worker binary."
 publish = false
 
 [[bin]]
-name = "synapse-worker-llama"
+# ck-* prefix: fleet Activity Monitor grouping convention.
+name = "ck-synapse-worker-llama"
 path = "src/main.rs"
 
 [dependencies]

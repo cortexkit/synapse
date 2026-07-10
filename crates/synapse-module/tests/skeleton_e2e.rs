@@ -134,7 +134,7 @@ fn spawn_synapse_module_with_env(
 ) -> ModuleProcess {
     let lease_root = unique_temp_dir("synapse-module-lease");
     std::fs::create_dir_all(&lease_root).unwrap();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_synapse-module"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ck-synapse"));
     command
         .arg("--subc")
         .arg(subc_connection_file)

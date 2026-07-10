@@ -26,7 +26,7 @@ const ENGINE_VERSION: &str = "mlx-rs-0.25.3";
 const DEFAULT_MAX_BATCH_SEQUENCES: usize = 256;
 
 #[derive(Parser)]
-#[command(name = "synapse-worker-mlx")]
+#[command(name = "ck-synapse-worker-mlx")]
 struct Args {
     #[arg(long)]
     socket: Option<PathBuf>,

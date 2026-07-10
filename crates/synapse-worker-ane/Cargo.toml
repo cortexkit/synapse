@@ -9,7 +9,8 @@ publish = false
 build = "build.rs"
 
 [[bin]]
-name = "synapse-worker-ane"
+# ck-* prefix: fleet Activity Monitor grouping convention.
+name = "ck-synapse-worker-ane"
 path = "src/main.rs"
 
 [dependencies]

@@ -361,7 +361,7 @@ fn spawn_synapse_module_with_config(
     subc_connection_file: &Path,
     config_json: &str,
 ) -> ModuleProcess {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_synapse-module"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ck-synapse"));
     command
         .arg("--subc")
         .arg(subc_connection_file)
@@ -695,7 +695,7 @@ fn short_worker_runtime_dir(temp_dir: &Path) -> PathBuf {
 }
 
 fn aborting_worker_wrapper(real_worker: &Path, temp_dir: &Path) -> PathBuf {
-    let wrapper = temp_dir.join("synapse-worker-llama-abort.sh");
+    let wrapper = temp_dir.join("ck-synapse-worker-llama-abort.sh");
     let script = format!(
         "#!/bin/sh\nexec '{}' \"$@\" --test-abort\n",
         real_worker.display()
@@ -733,7 +733,7 @@ fn llama_worker_bin() -> Option<PathBuf> {
     }
     let current_exe = std::env::current_exe().ok()?;
     let debug_dir = current_exe.parent()?.parent()?;
-    let candidate = debug_dir.join("synapse-worker-llama");
+    let candidate = debug_dir.join("ck-synapse-worker-llama");
     candidate.exists().then_some(candidate)
 }
 

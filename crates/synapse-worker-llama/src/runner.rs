@@ -41,7 +41,7 @@ const DEFAULT_MAX_GENERATE_TOKENS: u32 = 512;
 const LLAMA_TOKEN_NULL: i32 = -1;
 
 #[derive(Parser)]
-#[command(name = "synapse-worker-llama")]
+#[command(name = "ck-synapse-worker-llama")]
 struct Args {
     #[arg(long)]
     socket: Option<PathBuf>,

@@ -8,7 +8,8 @@ description = "Synapse supervised MLX/Metal embedding worker binary."
 publish = false
 
 [[bin]]
-name = "synapse-worker-mlx"
+# ck-* prefix: fleet Activity Monitor grouping convention.
+name = "ck-synapse-worker-mlx"
 path = "src/main.rs"
 
 [dependencies]
