@@ -1544,15 +1544,11 @@ async fn singleton_lease_blocks_second_module_on_same_daemon() {
     let shared_lease_root = unique_temp_dir("synapse-singleton-lease");
     std::fs::create_dir_all(&shared_lease_root).unwrap();
     let daemon = start_daemon().await;
-    let first = spawn_synapse_module_on_shared_lease(
-        &daemon.connection_file_path,
-        &shared_lease_root,
-    );
+    let first =
+        spawn_synapse_module_on_shared_lease(&daemon.connection_file_path, &shared_lease_root);
     wait_for_registration(&daemon.registry, MODULE_ID, SETUP_TIMEOUT).await;
-    let mut second = spawn_synapse_module_on_shared_lease(
-        &daemon.connection_file_path,
-        &shared_lease_root,
-    );
+    let mut second =
+        spawn_synapse_module_on_shared_lease(&daemon.connection_file_path, &shared_lease_root);
     let status = second
         .child
         .wait()
