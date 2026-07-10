@@ -34,6 +34,8 @@ clap = { version = "4", features = ["derive"] }
 # trains tokenizers, so the pure-Rust fallback path is not even exercised.
 tokenizers = { version = "0.21", default-features = false, features = ["progressbar", "onig"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+httpdate = "1"
+url = "2"
 hex = "0.4"
 rusqlite = { version = "0.32", features = ["bundled"] }
 sha2 = "0.10"

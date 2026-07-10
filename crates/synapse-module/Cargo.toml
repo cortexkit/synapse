@@ -32,6 +32,8 @@ cortexkit-store-types = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 reqwest = { workspace = true }
+httpdate = { workspace = true }
+url = { workspace = true }
 cortexkit-lease = { workspace = true }
 
 [dev-dependencies]

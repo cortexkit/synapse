@@ -9,6 +9,9 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+// The remote substrate remains private until gateway routing is wired to it.
+#[allow(dead_code)]
+mod remote;
 mod store;
 pub mod worker_host;
 
