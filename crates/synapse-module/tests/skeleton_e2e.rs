@@ -404,7 +404,9 @@ async fn over_budget_embed_batch_returns_job_and_pages_results() {
         "preload_models": preload_models,
         "inline": { "max_items": 2 },
         "jobs": {
-            "ttl_ms": 60_000,
+            "execution_ttl_ms": 60_000,
+            "result_retention_ttl_ms": 60_000,
+            "resume_deadline_ms": 60_000,
             "result_page_bytes": 4_096,
             "bulk_quantum_tokens": 16
         }
@@ -462,6 +464,7 @@ async fn over_budget_embed_batch_returns_job_and_pages_results() {
         accepted["result"]["state"].as_str(),
         Some("queued" | "running" | "done")
     ));
+    assert!(accepted["result"]["pages_available"].is_number());
 
     let duplicate = route_request(
         &mut consumer,
@@ -481,8 +484,32 @@ async fn over_budget_embed_batch_returns_job_and_pages_results() {
     .await;
     assert_eq!(duplicate["result"]["job_id"], job_id);
 
+    let conflict = route_request(
+        &mut consumer,
+        route_channel,
+        202,
+        serde_json::json!({
+            "method": "embed.batch",
+            "params": {
+                "request_key": "job-tier-e2e",
+                "items": [
+                    { "id": "item-0", "text": "different request content" },
+                    { "id": "item-1", "text": texts[1] },
+                    { "id": "item-2", "text": texts[2] }
+                ]
+            }
+        }),
+    )
+    .await;
+    assert_eq!(conflict["result"]["code"], "idempotency_conflict");
+    assert_eq!(conflict["result"]["class"], "permanent");
+
     let done = poll_embed_result(&mut consumer, route_channel, 300, &job_id).await;
     assert_eq!(done["result"]["state"], "done");
+    assert_eq!(
+        done["result"]["pages_available"],
+        done["result"]["page_count"]
+    );
     let page_count = done["result"]["page_count"].as_u64().unwrap();
     assert!(page_count >= 1);
     let mut vectors = done["result"]["vectors"].as_array().unwrap().clone();

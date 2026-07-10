@@ -17,14 +17,16 @@ pub mod worker_host;
 
 use cortexkit_lease::{FileLeaseStore, LeaseHandle, LeaseKey, LeaseStore};
 use cortexkit_store_types::{sqlite_store_path, Isolation, StorageBackend, StorageDescriptor};
+use remote::{ContinuityCheck, NoopContinuityCheck};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use store::{
-    CatalogSnapshot, CertificationRow, JobAdmission, JobRecord, KnobAssignmentRow,
-    ModelAssetLocator, ModelCatalogEntry, PerfRow, StoredModelConfig, SynapseStore,
-    SynapseStoreError, JOB_STATE_DONE, JOB_STATE_FAILED_PERMANENT, JOB_STATE_FAILED_TRANSIENT,
+    AssuranceClass, CatalogSnapshot, CertificationKey, CertificationRow, CheckpointItem,
+    JobAdmission, JobAttemptClaim, JobRecord, KnobAssignmentRow, ModelAssetLocator,
+    ModelCatalogEntry, PerfRow, StoredModelConfig, SynapseStore, SynapseStoreError, JOB_STATE_DONE,
+    JOB_STATE_FAILED_PERMANENT, JOB_STATE_FAILED_TRANSIENT, JOB_STATE_PAUSED_NEEDS_REAUTH,
     JOB_STATE_QUEUED, JOB_STATE_RUNNING,
 };
 use subc_client_rs::{
@@ -62,7 +64,9 @@ const DEFAULT_MAX_QUEUE_MS: u64 = 5_000;
 const DEFAULT_DEADLINE_MS: u64 = 30_000;
 const DEFAULT_ESTIMATED_EXECUTION_MS: u64 = 25;
 const DEFAULT_MAX_CONCURRENT_WORKERS: usize = 2;
-const DEFAULT_JOB_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
+const DEFAULT_JOB_EXECUTION_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
+const DEFAULT_JOB_RESULT_RETENTION_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
+const DEFAULT_RESUME_DEADLINE_MS: u64 = 24 * 60 * 60 * 1_000;
 const DEFAULT_JOB_RESULT_PAGE_BYTES: usize = 512 * 1024;
 const DEFAULT_JOB_BULK_QUANTUM_TOKENS: u64 = 2_048;
 const DEFAULT_PROBE_MEAN_COSINE_THRESHOLD: f64 = 0.999;
@@ -197,6 +201,7 @@ struct ModuleState {
     machine_profile_hash: String,
     runtime: Arc<RuntimeState>,
     model_cache: Arc<ModelCache>,
+    continuity_check: Arc<dyn ContinuityCheck>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -348,8 +353,13 @@ impl Default for InlineConfig {
 
 #[derive(Clone, Debug, Deserialize)]
 struct JobConfig {
-    #[serde(default = "default_job_ttl_ms")]
-    ttl_ms: u64,
+    #[serde(default = "default_job_execution_ttl_ms", alias = "ttl_ms")]
+    execution_ttl_ms: u64,
+    #[serde(default = "default_job_result_retention_ttl_ms")]
+    result_retention_ttl_ms: u64,
+    #[allow(dead_code)]
+    #[serde(default = "default_resume_deadline_ms")]
+    resume_deadline_ms: u64,
     #[serde(default = "default_job_result_page_bytes")]
     result_page_bytes: usize,
     #[serde(default = "default_job_bulk_quantum_tokens")]
@@ -359,7 +369,9 @@ struct JobConfig {
 impl Default for JobConfig {
     fn default() -> Self {
         Self {
-            ttl_ms: default_job_ttl_ms(),
+            execution_ttl_ms: default_job_execution_ttl_ms(),
+            result_retention_ttl_ms: default_job_result_retention_ttl_ms(),
+            resume_deadline_ms: default_resume_deadline_ms(),
             result_page_bytes: default_job_result_page_bytes(),
             bulk_quantum_tokens: default_job_bulk_quantum_tokens(),
         }
@@ -421,8 +433,16 @@ fn default_max_concurrent_workers() -> usize {
     DEFAULT_MAX_CONCURRENT_WORKERS
 }
 
-fn default_job_ttl_ms() -> u64 {
-    DEFAULT_JOB_TTL_MS
+fn default_job_execution_ttl_ms() -> u64 {
+    DEFAULT_JOB_EXECUTION_TTL_MS
+}
+
+fn default_job_result_retention_ttl_ms() -> u64 {
+    DEFAULT_JOB_RESULT_RETENTION_TTL_MS
+}
+
+fn default_resume_deadline_ms() -> u64 {
+    DEFAULT_RESUME_DEADLINE_MS
 }
 
 fn default_job_result_page_bytes() -> usize {
@@ -576,6 +596,8 @@ struct EmbedQueryParams {
     allow_equivalent: bool,
     #[serde(default)]
     required_epoch: Option<u64>,
+    #[serde(default)]
+    accept_declared: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -600,6 +622,8 @@ struct EmbedBatchParams {
     allow_equivalent: bool,
     #[serde(default)]
     required_epoch: Option<u64>,
+    #[serde(default)]
+    accept_declared: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -621,6 +645,8 @@ struct RerankScoreParams {
     allow_equivalent: bool,
     #[serde(default)]
     required_epoch: Option<u64>,
+    #[serde(default)]
+    accept_declared: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -650,6 +676,8 @@ struct MicroLlmOneshotParams {
     allow_equivalent: bool,
     #[serde(default)]
     required_epoch: Option<u64>,
+    #[serde(default)]
+    accept_declared: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -677,6 +705,7 @@ struct EmbedBatchItem {
 
 struct EmbedBatchJobWork {
     model: Arc<EmbeddingModel>,
+    request_digest: String,
     ids: Vec<String>,
     tokenized: TokenizedBatch,
     alias_table: AliasTable,
@@ -684,11 +713,22 @@ struct EmbedBatchJobWork {
     total_tokens: u64,
 }
 
+struct PreparedJobPage {
+    page_no: u32,
+    bytes: Vec<u8>,
+    checkpoints: Vec<CheckpointItem>,
+}
+
 #[derive(Debug, Deserialize)]
 struct EmbedResultParams {
     job_id: String,
     #[serde(default)]
     page: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct JobResumeParams {
+    job_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -960,6 +1000,7 @@ impl SynapseHandler {
             machine_profile_hash,
             runtime,
             model_cache,
+            continuity_check: Arc::new(NoopContinuityCheck),
         }))
     }
 }
@@ -1480,6 +1521,7 @@ async fn dispatch_request(state: Arc<ModuleState>, request: MethodEnvelope) -> H
         "embed.query" => embed_query(state, request.params).await,
         "embed.batch" => embed_batch(state, request.params).await,
         "embed.result" => embed_result(state, request.params).await,
+        "job.resume" => job_resume(state, request.params).await,
         "rerank.score" => rerank_score(state, request.params).await,
         "microllm.oneshot" => microllm_oneshot(state, request.params).await,
         "model.load" => model_load(state, request.params).await,
@@ -1755,15 +1797,29 @@ async fn model_load(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         Ok(value) => value,
         Err(error) => return channel_error("invalid_request", error.to_string()),
     };
+    let request_digest =
+        compute_request_digest("model.load", "management", None, None, &params_json, &[]);
     let admission = match state.store.admit_job(
         &request_key,
+        &request_digest,
         "model.load",
         state.module_generation,
+        None,
         &params_json,
         now,
-        state.runtime.jobs.ttl_ms,
+        state.runtime.jobs.execution_ttl_ms,
+        state.runtime.jobs.result_retention_ttl_ms,
     ) {
         Ok(admission) => admission,
+        Err(SynapseStoreError::IdempotencyConflict { .. }) => {
+            return result_outcome(error_payload(
+                &state,
+                WireOperationError::from_stable(
+                    StableError::idempotency_conflict(),
+                    format!("request_key '{request_key}' was already used for different request content"),
+                ),
+            ))
+        }
         Err(error) => return channel_error("store_failure", error.to_string()),
     };
     let record = admission.record().clone();
@@ -2735,7 +2791,7 @@ async fn embed_query(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         Ok(model) => model,
         Err(error) => return result_outcome(error_payload(&state, error)),
     };
-    if let Err(error) = ensure_model_certified(&state, &model) {
+    if let Err(error) = ensure_model_certified(&state, &model, params.accept_declared) {
         return result_outcome(error_payload(&state, error));
     }
     if let Err(error) = check_fingerprint_constraints(
@@ -2804,7 +2860,7 @@ async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         Ok(model) => model,
         Err(error) => return result_outcome(error_payload(&state, error)),
     };
-    if let Err(error) = ensure_model_certified(&state, &model) {
+    if let Err(error) = ensure_model_certified(&state, &model, params.accept_declared) {
         return result_outcome(error_payload(&state, error));
     }
     if let Err(error) = check_fingerprint_constraints(
@@ -2837,6 +2893,24 @@ async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         .iter()
         .map(|tokens| u64::from(*tokens))
         .sum::<u64>();
+    let digest_items = items
+        .iter()
+        .map(|item| (item.id.clone(), sha256_hex(item.text.as_bytes())))
+        .collect::<Vec<_>>();
+    let request_digest = compute_request_digest(
+        "embed.batch",
+        &model.model_id,
+        None,
+        None,
+        &json!({
+            "target_fingerprint": params.target_fingerprint,
+            "required_fingerprint": params.required_fingerprint,
+            "allow_equivalent": params.allow_equivalent,
+            "required_epoch": params.required_epoch,
+            "accept_declared": params.accept_declared,
+        }),
+        &digest_items,
+    );
     let ids = items.into_iter().map(|item| item.id).collect::<Vec<_>>();
 
     if ids.len() > state.runtime.inline.max_items || total_tokens > state.runtime.inline.max_tokens
@@ -2846,6 +2920,7 @@ async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
             params.request_key,
             EmbedBatchJobWork {
                 model,
+                request_digest,
                 ids,
                 tokenized,
                 alias_table,
@@ -2924,7 +2999,7 @@ async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
             ),
         ));
     }
-    if let Err(error) = ensure_model_certified(&state, &model) {
+    if let Err(error) = ensure_model_certified(&state, &model, params.accept_declared) {
         return result_outcome(error_payload(&state, error));
     }
     if let Err(error) = check_fingerprint_constraints(
@@ -3027,6 +3102,7 @@ async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
         dims: 1,
         provenance: ResponseProvenance {
             engine: model.engine_identity.clone(),
+            remote: None,
         },
         module_generation: state.module_generation,
         equivalent_to,
@@ -3095,7 +3171,7 @@ async fn microllm_oneshot(state: Arc<ModuleState>, params: Value) -> HandlerOutc
             ),
         ));
     }
-    if let Err(error) = ensure_model_certified(&state, &model) {
+    if let Err(error) = ensure_model_certified(&state, &model, params.accept_declared) {
         return result_outcome(error_payload(&state, error));
     }
     if let Err(error) = check_fingerprint_constraints(
@@ -3178,12 +3254,83 @@ async fn microllm_oneshot(state: Arc<ModuleState>, params: Value) -> HandlerOutc
         dims: 0,
         provenance: ResponseProvenance {
             engine: model.engine_identity.clone(),
+            remote: None,
         },
         module_generation: state.module_generation,
         equivalent_to,
         payload,
     };
     result_outcome(serde_json::to_value(envelope).expect("microllm envelope should serialize"))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+fn update_digest_bytes(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+}
+
+fn update_digest_json(hasher: &mut Sha256, value: &Value) {
+    match value {
+        Value::Null => hasher.update([0]),
+        Value::Bool(value) => hasher.update([1, u8::from(*value)]),
+        Value::Number(value) => {
+            hasher.update([2]);
+            update_digest_bytes(hasher, value.to_string().as_bytes());
+        }
+        Value::String(value) => {
+            hasher.update([3]);
+            update_digest_bytes(hasher, value.as_bytes());
+        }
+        Value::Array(values) => {
+            hasher.update([4]);
+            hasher.update((values.len() as u64).to_be_bytes());
+            for value in values {
+                update_digest_json(hasher, value);
+            }
+        }
+        Value::Object(values) => {
+            hasher.update([5]);
+            hasher.update((values.len() as u64).to_be_bytes());
+            let mut keys = values.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            for key in keys {
+                update_digest_bytes(hasher, key.as_bytes());
+                update_digest_json(hasher, &values[key]);
+            }
+        }
+    }
+}
+
+fn compute_request_digest(
+    op: &str,
+    synapse_model_id: &str,
+    remote_profile_hash: Option<&str>,
+    logical_handle: Option<&str>,
+    constraints: &Value,
+    items: &[(String, String)],
+) -> String {
+    let mut hasher = Sha256::new();
+    update_digest_bytes(&mut hasher, b"synapse-request-digest-v1");
+    update_digest_bytes(&mut hasher, op.as_bytes());
+    update_digest_bytes(&mut hasher, synapse_model_id.as_bytes());
+    hasher.update([u8::from(remote_profile_hash.is_some())]);
+    if let Some(remote_profile_hash) = remote_profile_hash {
+        update_digest_bytes(&mut hasher, remote_profile_hash.as_bytes());
+    }
+    hasher.update([u8::from(logical_handle.is_some())]);
+    if let Some(logical_handle) = logical_handle {
+        update_digest_bytes(&mut hasher, logical_handle.as_bytes());
+    }
+    update_digest_json(&mut hasher, constraints);
+    hasher.update((items.len() as u64).to_be_bytes());
+    for (item_id, content_hash) in items {
+        update_digest_bytes(&mut hasher, item_id.as_bytes());
+        update_digest_bytes(&mut hasher, content_hash.as_bytes());
+    }
+    hex::encode(hasher.finalize())
 }
 
 async fn submit_embed_batch_job(
@@ -3200,8 +3347,10 @@ async fn submit_embed_batch_job(
     let now = now_ms();
     let admission = match state.store.admit_job(
         &request_key,
+        &work.request_digest,
         "embed.batch",
         state.module_generation,
+        None,
         &json!({
             "model": work.model.model_id.clone(),
             "items": work.ids.len(),
@@ -3209,9 +3358,19 @@ async fn submit_embed_batch_job(
             "total_tokens": work.total_tokens,
         }),
         now,
-        state.runtime.jobs.ttl_ms,
+        state.runtime.jobs.execution_ttl_ms,
+        state.runtime.jobs.result_retention_ttl_ms,
     ) {
         Ok(admission) => admission,
+        Err(SynapseStoreError::IdempotencyConflict { .. }) => {
+            return result_outcome(error_payload(
+                &state,
+                WireOperationError::from_stable(
+                    StableError::idempotency_conflict(),
+                    format!("request_key '{request_key}' was already used for different request content"),
+                ),
+            ))
+        }
         Err(error) => return channel_error("store_failure", error.to_string()),
     };
 
@@ -3227,13 +3386,93 @@ async fn submit_embed_batch_job(
     result_outcome(job_status_payload(&state, &record))
 }
 
-async fn execute_embed_batch_job(state: Arc<ModuleState>, job_id: String, work: EmbedBatchJobWork) {
-    if !matches!(
-        state
-            .store
-            .mark_job_running(&job_id, state.module_generation, now_ms()),
-        Ok(true)
-    ) {
+async fn execute_embed_batch_job(
+    state: Arc<ModuleState>,
+    job_id: String,
+    mut work: EmbedBatchJobWork,
+) {
+    let record = match state
+        .store
+        .claim_job_attempt(&job_id, state.module_generation, now_ms())
+    {
+        Ok(JobAttemptClaim::Claimed(record)) => record,
+        Ok(JobAttemptClaim::Attached { .. } | JobAttemptClaim::NotClaimable(_)) | Err(_) => return,
+    };
+
+    if !enforce_checkpoint_continuity(
+        &state,
+        &job_id,
+        &record.request_digest,
+        &work.model.model_id,
+        record.logical_handle.as_deref(),
+    )
+    .await
+    {
+        return;
+    }
+
+    let committed_ids = match state.store.committed_item_ids(&record.request_digest) {
+        Ok(ids) => ids,
+        Err(error) => {
+            fail_job_with_wire_error(
+                &state,
+                &job_id,
+                true,
+                WireOperationError::from_stable(
+                    StableError::engine_crashed(Some(100)),
+                    format!("read committed checkpoint ids: {error}"),
+                ),
+            );
+            return;
+        }
+    };
+    let pending_indices = work
+        .ids
+        .iter()
+        .enumerate()
+        .filter_map(|(index, id)| (!committed_ids.contains(id)).then_some(index))
+        .collect::<Vec<_>>();
+    work.ids = pending_indices
+        .iter()
+        .map(|index| work.ids[*index].clone())
+        .collect();
+    work.tokenized.batch.items = pending_indices
+        .iter()
+        .map(|index| work.tokenized.batch.items[*index].clone())
+        .collect();
+    work.tokenized.disclosures = pending_indices
+        .iter()
+        .map(|index| work.tokenized.disclosures[*index].clone())
+        .collect();
+    work.tokenized.real_token_counts = pending_indices
+        .iter()
+        .map(|index| work.tokenized.real_token_counts[*index])
+        .collect();
+    work.total_tokens = work
+        .tokenized
+        .real_token_counts
+        .iter()
+        .map(|tokens| u64::from(*tokens))
+        .sum();
+
+    if work.ids.is_empty() {
+        let summary = json!({
+            "job_id": job_id,
+            "state": JOB_STATE_DONE,
+            "page_count": record.page_count,
+            "module_generation": state.module_generation,
+        });
+        if let Err(error) = state.store.finish_job(&job_id, &summary, now_ms()) {
+            fail_job_with_wire_error(
+                &state,
+                &job_id,
+                true,
+                WireOperationError::from_stable(
+                    StableError::engine_crashed(Some(100)),
+                    format!("finish resumed checkpoint-only job: {error}"),
+                ),
+            );
+        }
         return;
     }
 
@@ -3277,6 +3516,7 @@ async fn execute_embed_batch_job(state: Arc<ModuleState>, job_id: String, work: 
         work.tokenized,
         work.alias_table,
         &job_id,
+        record.page_count,
     ) {
         Ok(pages) => pages,
         Err(error) => {
@@ -3284,19 +3524,98 @@ async fn execute_embed_batch_job(state: Arc<ModuleState>, job_id: String, work: 
             return;
         }
     };
-    if let Err(error) = state
-        .store
-        .complete_job(&job_id, &summary, &pages, now_ms())
-    {
+    for page in pages {
+        if let Err(error) = state.store.commit_job_page(
+            &job_id,
+            page.page_no,
+            &page.bytes,
+            &page.checkpoints,
+            now_ms(),
+        ) {
+            fail_job_with_wire_error(
+                &state,
+                &job_id,
+                true,
+                WireOperationError::from_stable(
+                    StableError::engine_crashed(Some(100)),
+                    format!("atomically commit job page: {error}"),
+                ),
+            );
+            return;
+        }
+    }
+    if let Err(error) = state.store.finish_job(&job_id, &summary, now_ms()) {
         fail_job_with_wire_error(
             &state,
             &job_id,
             true,
             WireOperationError::from_stable(
                 StableError::engine_crashed(Some(100)),
-                format!("store completed job pages: {error}"),
+                format!("finish completed job pages: {error}"),
             ),
         );
+    }
+}
+
+async fn apply_checkpoint_continuity(
+    store: &SynapseStore,
+    continuity_check: &dyn ContinuityCheck,
+    job_id: &str,
+    request_digest: &str,
+    synapse_model_id: &str,
+    logical_handle: Option<&str>,
+    now_ms: u64,
+) -> Result<bool, SynapseStoreError> {
+    if store.checkpoint_count(request_digest)? == 0 {
+        return Ok(true);
+    }
+    match continuity_check
+        .check(request_digest, synapse_model_id, logical_handle)
+        .await
+    {
+        Ok(()) => Ok(true),
+        Err(error) => {
+            store.quarantine_job_for_continuity(
+                job_id,
+                &format!("continuity check failed before appending checkpoints: {error}"),
+                now_ms,
+            )?;
+            Ok(false)
+        }
+    }
+}
+
+async fn enforce_checkpoint_continuity(
+    state: &ModuleState,
+    job_id: &str,
+    request_digest: &str,
+    synapse_model_id: &str,
+    logical_handle: Option<&str>,
+) -> bool {
+    match apply_checkpoint_continuity(
+        &state.store,
+        state.continuity_check.as_ref(),
+        job_id,
+        request_digest,
+        synapse_model_id,
+        logical_handle,
+        now_ms(),
+    )
+    .await
+    {
+        Ok(allowed) => allowed,
+        Err(error) => {
+            fail_job_with_wire_error(
+                state,
+                job_id,
+                true,
+                WireOperationError::from_stable(
+                    StableError::engine_crashed(Some(100)),
+                    format!("inspect checkpoint continuity trigger: {error}"),
+                ),
+            );
+            false
+        }
     }
 }
 
@@ -3373,6 +3692,7 @@ fn batch_token_cost(batch: &TokenBatch) -> u64 {
         .max(1)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn embed_result_pages(
     state: &ModuleState,
     model: &EmbeddingModel,
@@ -3381,7 +3701,8 @@ fn embed_result_pages(
     tokenized: TokenizedBatch,
     alias_table: AliasTable,
     job_id: &str,
-) -> Result<(Value, Vec<Vec<u8>>), WireOperationError> {
+    first_page_no: u32,
+) -> Result<(Value, Vec<PreparedJobPage>), WireOperationError> {
     let dims = vectors.first().map(Vec::len).unwrap_or(0) as u32;
     let equivalent_to = equivalent_fingerprints(&alias_table, model);
     let response_vectors = ids
@@ -3394,20 +3715,38 @@ fn embed_result_pages(
         &tokenized.real_token_counts,
         state.runtime.jobs.result_page_bytes.max(1),
     );
-    let page_count = page_ranges.len() as u32;
+    let page_count = first_page_no.saturating_add(page_ranges.len() as u32);
     let mut pages = Vec::with_capacity(page_ranges.len());
-    for (page_index, (start, end)) in page_ranges.iter().copied().enumerate() {
+    for (page_offset, (start, end)) in page_ranges.iter().copied().enumerate() {
+        let page_no = first_page_no.saturating_add(page_offset as u32);
         let payload = EmbedResponsePayload {
             vectors: response_vectors[start..end].to_vec(),
             real_token_counts: tokenized.real_token_counts[start..end].to_vec(),
             truncation_disclosures: tokenized.disclosures[start..end].to_vec(),
         };
+        let checkpoints = payload
+            .vectors
+            .iter()
+            .map(|vector| {
+                Ok(CheckpointItem {
+                    item_id: vector.id.clone(),
+                    result: serde_json::to_vec(vector).map_err(|error| {
+                        WireOperationError::from_stable(
+                            StableError::artifact_invalid(),
+                            format!("serialize checkpoint item: {error}"),
+                        )
+                    })?,
+                    provider_request_id: None,
+                })
+            })
+            .collect::<Result<Vec<_>, WireOperationError>>()?;
         let envelope = ResponseEnvelope {
             fingerprint: model.fingerprint.clone(),
             table_epoch: alias_table.table_epoch,
             dims,
             provenance: ResponseProvenance {
                 engine: model.engine_identity.clone(),
+                remote: None,
             },
             module_generation: state.module_generation,
             equivalent_to: equivalent_to.clone(),
@@ -3418,21 +3757,29 @@ fn embed_result_pages(
             map.insert("job_id".to_string(), Value::String(job_id.to_string()));
             map.insert(
                 "state".to_string(),
-                Value::String(JOB_STATE_DONE.to_string()),
+                Value::String(JOB_STATE_RUNNING.to_string()),
             );
-            map.insert("page".to_string(), Value::from(page_index as u64));
+            map.insert("page".to_string(), Value::from(page_no));
             map.insert("page_count".to_string(), Value::from(page_count));
+            map.insert(
+                "pages_available".to_string(),
+                Value::from(page_no.saturating_add(1)),
+            );
             map.insert(
                 "job_module_generation".to_string(),
                 Value::from(state.module_generation),
             );
         }
-        pages.push(serde_json::to_vec(&value).map_err(|error| {
-            WireOperationError::from_stable(
-                StableError::artifact_invalid(),
-                format!("serialize embed job page: {error}"),
-            )
-        })?);
+        pages.push(PreparedJobPage {
+            page_no,
+            bytes: serde_json::to_vec(&value).map_err(|error| {
+                WireOperationError::from_stable(
+                    StableError::artifact_invalid(),
+                    format!("serialize embed job page: {error}"),
+                )
+            })?,
+            checkpoints,
+        });
     }
     Ok((
         json!({
@@ -3498,10 +3845,29 @@ fn job_status_payload(state: &ModuleState, record: &JobRecord) -> Value {
         "job_id": record.job_id,
         "state": record.state,
         "request_key": record.request_key,
+        "pages_available": record.page_count,
     });
     if let Value::Object(map) = &mut payload {
         if record.state == JOB_STATE_DONE {
             map.insert("page_count".to_string(), Value::from(record.page_count));
+        }
+        if record.state == JOB_STATE_PAUSED_NEEDS_REAUTH {
+            if let Some(logical_handle) = &record.logical_handle {
+                map.insert(
+                    "logical_handle".to_string(),
+                    Value::String(logical_handle.clone()),
+                );
+            }
+            if let Some(paused_at_ms) = record.paused_at_ms {
+                map.insert("paused_at_ms".to_string(), Value::from(paused_at_ms));
+            }
+            if let Some(resume_deadline_ms) = record.resume_deadline_ms {
+                map.insert(
+                    "resume_deadline_ms".to_string(),
+                    Value::from(resume_deadline_ms),
+                );
+            }
+            map.insert("action".to_string(), Value::String("reauth".to_string()));
         }
         if record.state == JOB_STATE_FAILED_TRANSIENT || record.state == JOB_STATE_FAILED_PERMANENT
         {
@@ -3518,6 +3884,32 @@ fn job_status_payload(state: &ModuleState, record: &JobRecord) -> Value {
         }
     }
     payload
+}
+
+async fn job_resume(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
+    let params: JobResumeParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(error) => {
+            return channel_error(
+                "invalid_request",
+                format!("invalid job.resume params: {error}"),
+            )
+        }
+    };
+    let now = now_ms();
+    match state.store.resume_paused_job(
+        &params.job_id,
+        state.module_generation,
+        now,
+        state.runtime.jobs.execution_ttl_ms,
+    ) {
+        Ok(_) => match state.store.get_job(&params.job_id) {
+            Ok(Some(record)) => result_outcome(job_status_payload(&state, &record)),
+            Ok(None) => channel_error("invalid_request", "unknown or expired job_id"),
+            Err(error) => channel_error("store_failure", error.to_string()),
+        },
+        Err(error) => channel_error("store_failure", error.to_string()),
+    }
 }
 
 async fn embed_result(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
@@ -3538,43 +3930,52 @@ async fn embed_result(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
         Ok(None) => return channel_error("invalid_request", "unknown or expired job_id"),
         Err(error) => return channel_error("store_failure", error.to_string()),
     };
+
+    let requested_page = params.page.unwrap_or(0);
+    if requested_page < record.page_count {
+        let bytes = match state.store.get_job_page(&record.job_id, requested_page) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return channel_error("store_failure", "job result page is missing"),
+            Err(error) => return channel_error("store_failure", error.to_string()),
+        };
+        let mut value: Value = match serde_json::from_slice(&bytes) {
+            Ok(value) => value,
+            Err(error) => return channel_error("store_failure", error.to_string()),
+        };
+        if let Value::Object(map) = &mut value {
+            map.insert("job_id".to_string(), Value::String(record.job_id.clone()));
+            map.insert(
+                "module_generation".to_string(),
+                Value::from(state.module_generation),
+            );
+            map.insert(
+                "job_module_generation".to_string(),
+                Value::from(record.module_generation),
+            );
+            map.insert("state".to_string(), Value::String(record.state.clone()));
+            map.insert("page_count".to_string(), Value::from(record.page_count));
+            map.insert(
+                "pages_available".to_string(),
+                Value::from(record.page_count),
+            );
+        }
+        return result_outcome(value);
+    }
+
     match record.state.as_str() {
-        JOB_STATE_QUEUED | JOB_STATE_RUNNING => result_outcome(job_status_payload(&state, &record)),
+        JOB_STATE_QUEUED | JOB_STATE_RUNNING | JOB_STATE_PAUSED_NEEDS_REAUTH => {
+            result_outcome(job_status_payload(&state, &record))
+        }
         JOB_STATE_FAILED_TRANSIENT | JOB_STATE_FAILED_PERMANENT => {
             result_outcome(job_status_payload(&state, &record))
         }
-        JOB_STATE_DONE => {
-            let page = params.page.unwrap_or(0);
-            if page >= record.page_count {
-                return channel_error(
-                    "invalid_request",
-                    format!(
-                        "embed.result page {page} is outside available page_count {}",
-                        record.page_count
-                    ),
-                );
-            }
-            let bytes = match state.store.get_job_page(&record.job_id, page) {
-                Ok(Some(bytes)) => bytes,
-                Ok(None) => return channel_error("store_failure", "job result page is missing"),
-                Err(error) => return channel_error("store_failure", error.to_string()),
-            };
-            let mut value: Value = match serde_json::from_slice(&bytes) {
-                Ok(value) => value,
-                Err(error) => return channel_error("store_failure", error.to_string()),
-            };
-            if let Value::Object(map) = &mut value {
-                map.insert(
-                    "module_generation".to_string(),
-                    Value::from(state.module_generation),
-                );
-                map.insert(
-                    "job_module_generation".to_string(),
-                    Value::from(record.module_generation),
-                );
-            }
-            result_outcome(value)
-        }
+        JOB_STATE_DONE => channel_error(
+            "invalid_request",
+            format!(
+                "embed.result page {requested_page} is outside available page_count {}",
+                record.page_count
+            ),
+        ),
         other => channel_error(
             "store_failure",
             format!("job {} has unknown state {other}", record.job_id),
@@ -3624,6 +4025,7 @@ async fn embed_tokenized(
         dims,
         provenance: ResponseProvenance {
             engine: model.engine_identity.clone(),
+            remote: None,
         },
         module_generation: state.module_generation,
         equivalent_to,
@@ -3885,11 +4287,28 @@ fn equivalent_fingerprints(alias_table: &AliasTable, model: &EmbeddingModel) -> 
 fn ensure_model_certified(
     state: &ModuleState,
     model: &EmbeddingModel,
+    accept_declared: bool,
 ) -> Result<(), WireOperationError> {
     match state
         .store
         .get_cert_row(&state.machine_profile_hash, &model.fingerprint)
     {
+        Ok(Some(_)) => return Ok(()),
+        Ok(None) => {}
+        Err(error) => {
+            return Err(WireOperationError::from_stable(
+                StableError::engine_crashed(Some(100)),
+                format!("read measured certification rows: {error}"),
+            ))
+        }
+    }
+
+    match declared_certification_for_request(
+        &state.store,
+        &model.fingerprint,
+        &model.model_id,
+        accept_declared,
+    ) {
         Ok(Some(_)) => Ok(()),
         Ok(None) => {
             let stale = state
@@ -3912,9 +4331,28 @@ fn ensure_model_certified(
                 message,
             ))
         }
+        Err(error) => Err(error),
+    }
+}
+
+fn declared_certification_for_request(
+    store: &SynapseStore,
+    fingerprint: &Fingerprint,
+    model_id: &str,
+    accept_declared: bool,
+) -> Result<Option<CertificationRow>, WireOperationError> {
+    match store.declared_cert_row_for_fingerprint(fingerprint) {
+        Ok(Some(row)) if accept_declared => Ok(Some(row)),
+        Ok(Some(_)) => Err(WireOperationError::from_stable(
+            StableError::declared_identity_not_accepted(),
+            format!(
+                "model '{model_id}' has declared identity assurance; set accept_declared=true to opt in"
+            ),
+        )),
+        Ok(None) => Ok(None),
         Err(error) => Err(WireOperationError::from_stable(
             StableError::engine_crashed(Some(100)),
-            format!("read certification rows: {error}"),
+            format!("read declared certification rows: {error}"),
         )),
     }
 }
@@ -3935,15 +4373,30 @@ async fn probe_start(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         .request_key
         .filter(|key| !key.trim().is_empty())
         .unwrap_or_else(|| format!("probe:{}:{now}", state.module_generation));
+    let params_json = json!({ "models": model_filter.clone() });
+    let request_digest =
+        compute_request_digest("probe", "management", None, None, &params_json, &[]);
     let admission = match state.store.admit_job(
         &request_key,
+        &request_digest,
         "probe",
         state.module_generation,
-        &json!({ "models": model_filter.clone() }),
+        None,
+        &params_json,
         now,
-        state.runtime.jobs.ttl_ms,
+        state.runtime.jobs.execution_ttl_ms,
+        state.runtime.jobs.result_retention_ttl_ms,
     ) {
         Ok(admission) => admission,
+        Err(SynapseStoreError::IdempotencyConflict { .. }) => {
+            return result_outcome(error_payload(
+                &state,
+                WireOperationError::from_stable(
+                    StableError::idempotency_conflict(),
+                    format!("request_key '{request_key}' was already used for different request content"),
+                ),
+            ))
+        }
         Err(error) => return channel_error("store_failure", error.to_string()),
     };
     let record = admission.record().clone();
@@ -4562,7 +5015,10 @@ fn store_probe_cert_row(
     evidence: Value,
 ) -> Result<(), WireOperationError> {
     let row = CertificationRow {
-        machine_profile_hash: state.machine_profile_hash.clone(),
+        assurance_class: AssuranceClass::Measured,
+        key: CertificationKey::Measured {
+            machine_profile_hash: state.machine_profile_hash.clone(),
+        },
         numeric_profile_id: model.numeric_profile_id.clone(),
         fingerprint: model.fingerprint.clone(),
         certified_at_ms: now_ms(),
@@ -5288,8 +5744,18 @@ fn lane_blocking_reason(
 }
 
 fn certification_report_row(state: &ModuleState, row: &CertificationRow, stale: bool) -> Value {
+    let (machine_profile_hash, remote_profile_hash) = match &row.key {
+        CertificationKey::Measured {
+            machine_profile_hash,
+        } => (Some(machine_profile_hash.as_str()), None),
+        CertificationKey::Declared {
+            remote_profile_hash,
+        } => (None, Some(remote_profile_hash.as_str())),
+    };
     json!({
-        "machine_profile_hash": row.machine_profile_hash,
+        "assurance_class": row.assurance_class,
+        "machine_profile_hash": machine_profile_hash,
+        "remote_profile_hash": remote_profile_hash,
         "numeric_profile_id": row.numeric_profile_id,
         "fingerprint": row.fingerprint,
         "certified_at_ms": row.certified_at_ms,
@@ -5636,6 +6102,7 @@ fn management_operations() -> Vec<ManagementOperation> {
         op("embed.query", Query),
         op("embed.batch", Query),
         op("embed.result", Query),
+        op("job.resume", Mutate),
         op("rerank.score", Query),
         op("microllm.oneshot", Query),
         op("model.load", Mutate),
@@ -5941,6 +6408,67 @@ mod tests {
         assert_eq!(config.microllm_max_tokens, 128);
         assert!(config.grammar_enabled);
         assert_eq!(config.cache_max_bytes, 4096);
+    }
+
+    #[test]
+    fn job_config_parses_split_ttls_and_legacy_execution_alias() {
+        let split = parse_module_config_json(
+            r#"{
+                "jobs": {
+                    "execution_ttl_ms": 10,
+                    "result_retention_ttl_ms": 20,
+                    "resume_deadline_ms": 30
+                }
+            }"#,
+            "test",
+        )
+        .unwrap();
+        assert_eq!(split.jobs.execution_ttl_ms, 10);
+        assert_eq!(split.jobs.result_retention_ttl_ms, 20);
+        assert_eq!(split.jobs.resume_deadline_ms, 30);
+
+        let legacy = parse_module_config_json(r#"{"jobs":{"ttl_ms":40}}"#, "test").unwrap();
+        assert_eq!(legacy.jobs.execution_ttl_ms, 40);
+    }
+
+    #[test]
+    fn request_digest_is_canonical_and_binds_order_content_and_remote_identity() {
+        let items = vec![
+            ("a".to_string(), sha256_hex(b"first")),
+            ("b".to_string(), sha256_hex(b"second")),
+        ];
+        let constraints_a: Value = serde_json::from_str(r#"{"z":1,"a":true}"#).unwrap();
+        let constraints_b: Value = serde_json::from_str(r#"{"a":true,"z":1}"#).unwrap();
+        let local =
+            compute_request_digest("embed.batch", "model", None, None, &constraints_a, &items);
+        assert_eq!(
+            local,
+            compute_request_digest("embed.batch", "model", None, None, &constraints_b, &items,)
+        );
+        let mut reordered = items.clone();
+        reordered.reverse();
+        assert_ne!(
+            local,
+            compute_request_digest(
+                "embed.batch",
+                "model",
+                None,
+                None,
+                &constraints_a,
+                &reordered,
+            )
+        );
+        assert_ne!(
+            local,
+            compute_request_digest(
+                "embed.batch",
+                "model",
+                Some("remote-profile"),
+                Some("vault/provider"),
+                &constraints_a,
+                &items,
+            )
+        );
     }
 
     #[test]
