@@ -32,6 +32,7 @@ pub enum MockBehavior {
     OversizedBody { bytes: usize },
     Redirect { location: String },
     SilentTruncateEcho { max_chars: usize, dimensions: usize },
+    EmbeddingVectors { vectors: Vec<Vec<f64>> },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -247,6 +248,7 @@ async fn response_for(behavior: MockBehavior, request: &RecordedRequest) -> Mock
             max_chars,
             dimensions,
         } => silent_truncate_echo_response(request, max_chars, dimensions),
+        MockBehavior::EmbeddingVectors { vectors } => embedding_vectors_response(request, vectors),
     }
 }
 
@@ -370,6 +372,26 @@ fn silent_truncate_echo_response(
             "usage": {
                 "prompt_tokens": truncated.iter().map(|value| value.chars().count()).sum::<usize>(),
                 "total_tokens": truncated.iter().map(|value| value.chars().count()).sum::<usize>(),
+            }
+        }),
+    )
+}
+
+fn embedding_vectors_response(request: &RecordedRequest, vectors: Vec<Vec<f64>>) -> MockResponse {
+    let incoming = incoming_embedding_request(request);
+    let data = vectors
+        .into_iter()
+        .enumerate()
+        .map(|(index, embedding)| json!({"index": index, "embedding": embedding}))
+        .collect::<Vec<_>>();
+    MockResponse::json(
+        200,
+        json!({
+            "data": data,
+            "model": incoming.model,
+            "usage": {
+                "prompt_tokens": incoming.input.len(),
+                "total_tokens": incoming.input.len(),
             }
         }),
     )
