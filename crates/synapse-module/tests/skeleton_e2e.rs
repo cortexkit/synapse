@@ -501,8 +501,12 @@ async fn over_budget_embed_batch_returns_job_and_pages_results() {
         }),
     )
     .await;
-    assert_eq!(conflict["result"]["code"], "idempotency_conflict");
-    assert_eq!(conflict["result"]["class"], "permanent");
+    assert_eq!(conflict["result"]["error"]["code"], "idempotency_conflict");
+    assert_eq!(conflict["result"]["error"]["class"], "permanent");
+    assert_eq!(
+        conflict["result"]["error"]["safe_to_retry_same_request"],
+        Value::Bool(false)
+    );
 
     let done = poll_embed_result(&mut consumer, route_channel, 300, &job_id).await;
     assert_eq!(done["result"]["state"], "done");
