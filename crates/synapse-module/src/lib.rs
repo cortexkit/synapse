@@ -17,7 +17,7 @@ pub mod worker_host;
 
 use cortexkit_lease::{FileLeaseStore, LeaseHandle, LeaseKey, LeaseStore};
 use cortexkit_store_types::{sqlite_store_path, Isolation, StorageBackend, StorageDescriptor};
-use remote::{ContinuityCheck, NoopContinuityCheck};
+use remote::{runtime::SentinelContinuityCheck, ContinuityCheck};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -996,6 +996,7 @@ impl SynapseHandler {
             runtime.engine_identities(),
         ));
         let machine_profile_hash = machine_profile.hash();
+        let continuity_check = Arc::new(SentinelContinuityCheck::empty(Arc::clone(&store)));
         Ok(Arc::new(ModuleState {
             module_id: self.inner.module_id.clone(),
             store,
@@ -1004,7 +1005,7 @@ impl SynapseHandler {
             machine_profile_hash,
             runtime,
             model_cache,
-            continuity_check: Arc::new(NoopContinuityCheck),
+            continuity_check,
         }))
     }
 }

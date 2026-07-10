@@ -1,6 +1,7 @@
 pub(super) mod classify;
 pub(super) mod client;
 pub(super) mod openai_compat;
+pub(super) mod runtime;
 pub(super) mod validator;
 
 #[cfg(test)]
@@ -31,18 +32,4 @@ pub trait ContinuityCheck: Send + Sync {
         synapse_model_id: &str,
         logical_handle: Option<&str>,
     ) -> Result<(), ContinuityError>;
-}
-
-pub struct NoopContinuityCheck;
-
-#[async_trait]
-impl ContinuityCheck for NoopContinuityCheck {
-    async fn check(
-        &self,
-        _request_digest: &str,
-        _synapse_model_id: &str,
-        _logical_handle: Option<&str>,
-    ) -> Result<(), ContinuityError> {
-        Ok(())
-    }
 }
