@@ -548,7 +548,7 @@ async fn alias_surface_certifies_declares_retracts_and_preserves_old_job_pages()
     let config = serde_json::json!({
         "preload_models": preloads,
         "inline": { "max_items": 1 },
-        "jobs": { "ttl_ms": 60_000, "result_page_bytes": 4096, "bulk_quantum_tokens": 2048 },
+        "jobs": { "execution_ttl_ms": 60_000, "result_page_bytes": 4096, "bulk_quantum_tokens": 2048 },
         "alias_admin_enabled": true
     })
     .to_string();

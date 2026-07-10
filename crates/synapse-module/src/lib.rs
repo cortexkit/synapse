@@ -293,6 +293,7 @@ fn default_cache_max_bytes() -> u64 {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PreloadModelConfig {
     #[serde(default)]
     model_id: Option<String>,
@@ -320,6 +321,7 @@ struct PreloadModelConfig {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct InlineConfig {
     #[serde(default = "default_inline_max_items")]
     max_items: usize,
@@ -352,8 +354,9 @@ impl Default for InlineConfig {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct JobConfig {
-    #[serde(default = "default_job_execution_ttl_ms", alias = "ttl_ms")]
+    #[serde(default = "default_job_execution_ttl_ms")]
     execution_ttl_ms: u64,
     #[serde(default = "default_job_result_retention_ttl_ms")]
     result_retention_ttl_ms: u64,
@@ -379,6 +382,7 @@ impl Default for JobConfig {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ProbeConfig {
     #[serde(default = "default_probe_mean_cosine_threshold")]
     mean_cosine_threshold: f64,
@@ -6411,7 +6415,7 @@ mod tests {
     }
 
     #[test]
-    fn job_config_parses_split_ttls_and_legacy_execution_alias() {
+    fn job_config_parses_split_ttls_and_rejects_legacy_alias() {
         let split = parse_module_config_json(
             r#"{
                 "jobs": {
@@ -6427,8 +6431,10 @@ mod tests {
         assert_eq!(split.jobs.result_retention_ttl_ms, 20);
         assert_eq!(split.jobs.resume_deadline_ms, 30);
 
-        let legacy = parse_module_config_json(r#"{"jobs":{"ttl_ms":40}}"#, "test").unwrap();
-        assert_eq!(legacy.jobs.execution_ttl_ms, 40);
+        // Pre-release rename, no compatibility surface: the old key must fail
+        // loudly (deny_unknown_fields) instead of being silently accepted.
+        let legacy = parse_module_config_json(r#"{"jobs":{"ttl_ms":40}}"#, "test");
+        assert!(legacy.is_err(), "legacy ttl_ms key must be rejected");
     }
 
     #[test]

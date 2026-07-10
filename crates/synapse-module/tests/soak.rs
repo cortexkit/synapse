@@ -680,7 +680,7 @@ fn soak_config(assets: &SoakAssets, worker_bin: &Path, temp_dir: &Path) -> Strin
             "max_concurrent_workers": 2
         },
         "jobs": {
-            "ttl_ms": 300_000,
+            "execution_ttl_ms": 300_000,
             "result_page_bytes": 262_144,
             "bulk_quantum_tokens": 65_536
         }
