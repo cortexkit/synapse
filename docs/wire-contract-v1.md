@@ -1,6 +1,6 @@
 # Synapse wire contract v1 (consumer snapshot)
 
-Status: SNAPSHOT of the implemented surface as of 2026-07-08 (post wave 7).
+Status: SNAPSHOT of the additive v1.1 surface as of 2026-07-10.
 Authoritative examples: crates/synapse-module/tests/skeleton_e2e.rs and
 tests/soak.rs. This doc restates the contract for consumer integration (AFT,
 MC); on any disagreement, the e2e tests win and this doc gets fixed.
@@ -50,13 +50,16 @@ certified-equivalent profile, else substitution_rejected/not_certified).
   hot path).
 - **embed.batch** {model, items[{id, text}], …} — inline under the byte/item
   budget; over budget → job: {job_id} back immediately.
-  - **embed.result** {job_id, cursor?, max_page_bytes?} — pages become
-    readable AS COMPLETED (streaming-bounded cold builds); default page
-    512 KiB; page order is job-internal (length-sorted execution) — items
-    carry ids, KEY WRITES BY ID, never by position. Pages survive restart
-    until TTL. request_key makes resubmission idempotent (same key → same
-    job; after module_restarted terminal → fresh job, old pages readable
-    until TTL).
+  - **embed.result** {job_id, cursor?, max_page_bytes?} — committed pages are
+    readable while the job is still running; `pages_available` on job status
+    is the visible committed-page count. The default page is 512 KiB; page
+    order is job-internal (length-sorted execution) — items carry ids, KEY
+    WRITES BY ID, never by position. This behavior is identical for local and
+    remote jobs. Pages survive restart until the result-retention TTL.
+    `request_key` makes resubmission idempotent: the same key and digest attach
+    to or resume the same work; a different digest is `idempotency_conflict`.
+    After a terminal restart failure, a fresh attempt keeps prior committed
+    pages readable and resumes by item id.
 - **rerank.score** {model, query, candidates[], …} — RAW per-candidate
   scores (no server-side ordering opinions); interactive ≤20 candidates,
   bulk beyond. Qwen3-Reranker architectures are rejected at load (measured
@@ -125,3 +128,112 @@ provider hash.
   certification probes.
 - module_generation on every envelope: if it changes mid-conversation,
   re-poll jobs (prior-generation jobs are terminal module_restarted).
+
+
+## Additive wire contract v1.1: remote gateway and durable pages
+
+All v1.1 fields are additive. Local responses retain their existing shapes unless
+this section explicitly aligns durable-page behavior across both lanes.
+
+### Provenance
+
+Remote responses use the real `EngineIdentity` object and add `remote` as an
+optional sibling of `engine`:
+
+```json
+"provenance": {
+  "engine": {
+    "engine": "remote_openai_compatible",
+    "version": "<adapter semver>",
+    "build_flags": {}
+  },
+  "remote": {
+    "provider": "openai",
+    "deployment": "api.openai.com",
+    "assurance": "declared"
+  }
+}
+```
+
+`build_flags` is a string-keyed object: it is an empty object or is omitted by
+serde when empty, never an array. `remote` is absent for local lanes. No existing
+provenance field changes shape.
+
+For `assurance: "declared"`, `content_sha256` hashes the exact post-truncation
+text Synapse submitted to the provider. In this lane, “embedded” means
+“submitted to the provider”; provider-side preprocessing is part of the declared
+risk accepted by the caller.
+
+### Request opt-in
+
+`embed.query`, `embed.batch`, `rerank.score`, and `microllm.oneshot` accept
+`accept_declared: bool`, defaulting to `false`. Requesting a model whose identity
+assurance is declared without `accept_declared: true` fails permanently with
+`declared_identity_not_accepted`.
+
+### Durable job status and resume
+
+A credential pause has this status payload:
+
+```json
+{
+  "state": "paused_needs_reauth",
+  "logical_handle": "provider-handle",
+  "paused_at_ms": 1780000000000,
+  "resume_deadline_ms": 1780086400000,
+  "action": "reauth"
+}
+```
+
+The execution TTL is suspended while paused; `resume_deadline_ms` is the only
+active clock. Consumers resume with `job.resume {job_id}` after repairing
+credentials, or by resubmitting the same request key and digest. Deadline expiry
+transitions durably to terminal `needs_reauth_expired`; result retention starts
+at that terminal transition.
+
+Every job status carries `pages_available`. `embed.result` serves any committed
+page whose index is below that count while the job is queued, running, paused,
+done, or failed. A page commit atomically makes its item results, page metadata,
+and incremented visible count observable. Previously committed pages remain
+readable after a later failure, including continuity quarantine. This
+page-while-running rule applies equally to local and remote jobs.
+
+The request digest is bound at admission to the operation, `synapse_model_id`,
+constraints, ordered item ids, and per-item content hashes. Remote-bound digests
+also bind `remote_profile_hash` and `logical_handle`; local digests omit those
+two fields. Reusing a request key with different bound content is the permanent
+`idempotency_conflict` error. Same-key/same-digest resubmission resumes from
+committed item ids.
+
+### Provider request ids
+
+When the provider returns no request id, `provider_request_id` is omitted
+entirely; it is never `null` or an empty string. Success envelopes and error
+payloads carry the final attempt's `provider_request_id`, limited to 128 bytes.
+Job pages carry `provider_request_ids: [string]`, one per sub-batch, limited to
+16 entries. Missing entries are omitted, and `provider_request_ids` itself is
+omitted when the resulting array is empty.
+
+### Stable error-code union and credential mapping
+
+Every error retains `{code, class, retry_after_ms?,
+safe_to_retry_same_request}`. The complete remote additions are:
+
+- `declared_identity_not_accepted` — permanent.
+- `remote_identity_drift` — permanent; the model is quarantined.
+- `provider_unavailable` — transient.
+- `provider_protocol_violation` — permanent; the model is quarantined.
+- `idempotency_conflict` — permanent.
+- `needs_reauth` — permanent-shaped inline rejection naming the logical handle.
+- `needs_reauth_expired` — permanent terminal job failure.
+- `remote_deployment_changed` — permanent boot or serve refusal.
+- `credential_config_invalid` — permanent vault-handle `not_found` or malformed
+  configuration; it is never retried.
+
+Remote paths reuse these baseline codes unchanged: `module_restarted` (the
+existing post-restart job state), `invalid_request`, and `probe_required`.
+Credential mapping is exact: vault `not_found` or malformed data maps to
+`credential_config_invalid`; an unreachable or restarting credentials module
+maps to transient `provider_unavailable`; `vault_locked` or `needs_reauth`
+enters the pause path for jobs and returns inline `needs_reauth` for inline
+operations.
