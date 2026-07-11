@@ -6,7 +6,7 @@ The runtime now accepts `--dtype f16` for MiniLM, gte-modernbert, and Qwen3-Embe
 
 `--package-cache DIR` stores one `.mpsgraphpackage` per `(batch, seq)` shape. The cache directory key includes model-family, graph revision, a hash of the canonical checkpoint path, dtype, and macOS build; the filename supplies the shape. Packages are never appended. A cache hit uses `initWithMPSGraphPackageAtURL:compilationDescriptor:` and a miss compiles, specializes, and serializes before the first execution of that shape.
 
-This assembly remains partially certified because the official 400-row MiniLM ORT file used by the evidence run was not available on this host; the locally regenerated ONNX reference also failed the existing fp32 path and therefore is not a valid certification oracle. ModernBERT and Qwen3 pass the full 400-vector gate.
+This assembly is certified against ORT fp32 for all three families. MiniLM was re-certified on the locked M1 against the frozen evidence pack's original reference; ModernBERT and Qwen3 also pass the full 400-vector gate. The locked-machine matrix and reference provenance are recorded in [M1-SERVING-MATRIX.md](M1-SERVING-MATRIX.md).
 
 ## f16 parity
 
@@ -14,11 +14,11 @@ Certification thresholds are mean cosine `>= 0.9999` and mean top-10 overlap `>=
 
 | Family | Rows | f16 mean cosine | Top-10 overlap | Result | Topology |
 |---|---:|---:|---:|---|---|
-| MiniLM | 400 | official rerun unavailable | official rerun unavailable | not re-certified | native f16 matmuls and inter-block activations; fp32 layernorm, GELU, and softmax islands (the frozen evidence run measured cosine `0.9999993186`) |
+| MiniLM | 400 | `0.9999993186` | `0.999250` | **PASS** | native f16 matmuls and inter-block activations; fp32 layernorm, GELU, and softmax islands |
 | gte-modernbert | 400 | `0.9999990763` | `0.998500` | **PASS** | f16 storage/inter-block activations; fp32 norm scales, matmuls, RoPE, layernorm, additive masks, and softmax |
 | Qwen3-Embedding-0.6B | 400 | `0.9999987315` | `0.998500` | **PASS** | native f16 weights/matmuls/inter-block activations; fp32 RMSNorm and masked softmax |
 
-The MiniLM reference check cannot be treated as a product failure: the generated ONNX file scored `0.99920633` against the unchanged fp32 runtime and `0.99920582` against f16, so it is not equivalent to the existing parity oracle. `cargo test` still covers f16-vs-fp32 behavior for the tiny resident encoder block.
+The rejected regenerated MiniLM ONNX reference scored `0.99920633` against the unchanged fp32 runtime and `0.99920582` against f16, so it was not equivalent to the existing parity oracle. The locked-M1 rerun used the frozen evidence pack's original reference and passed both gates for fp32 and f16. `cargo test` still covers f16-vs-fp32 behavior for the tiny resident encoder block.
 
 ### ModernBERT differential
 
@@ -66,7 +66,7 @@ These are Apple M5 Max, macOS 26.5.2 build 25F84 measurements. They are explicit
 | Qwen3 standard corpus | fp32 | 46,716 | mixed cache | `6,551.5` | — |
 | Qwen3 standard corpus | f16 | 46,716 | mixed cache | `6,813.0` | `1.04x` |
 
-The locked M1 comparison was not run from this M5 worktree. The benchmark-lock and `Runner.Worker` protocol remains required before these numbers can graduate.
+The locked-M1 comparison is now complete under the benchmark-lock and `Runner.Worker` protocol; see [M1-SERVING-MATRIX.md](M1-SERVING-MATRIX.md). These M5 rows remain useful only as the contended-host comparison captured before that run.
 
 ## Magic-context corpus payoff
 
@@ -147,7 +147,6 @@ SYNAPSE_MODERNBERT_DUMP_DIR=target/mb-dump-f16 $BIN ... --limit 1 --dtype f16 --
 
 ## Open items
 
-1. Re-run MiniLM against the exact official ORT fp32 reference used by the frozen evidence pack.
-2. Run first/warm/steady fp32-vs-f16 for all families under the locked M1 `bench.lock` plus `Runner.Worker` check protocol.
-3. Pre-discover serving buckets so every shape is compiled/loaded before inference timing; this spike currently prepares each shape synchronously immediately before its first execution.
-4. Replace exact corpus shapes with a bounded serving bucket policy, especially for the 162-shape MC workload.
+1. Add multi-pass support to the main harness and record true in-process first/warm/steady labels. The locked-M1 matrix currently uses two fresh single-pass process repeats per cache state because the main binary has no `--passes` option.
+2. Pre-discover serving buckets so every shape is compiled/loaded before inference timing; this spike currently prepares each shape synchronously immediately before its first execution.
+3. Replace exact corpus shapes with a bounded serving bucket policy, especially for the 162-shape MC workload.
