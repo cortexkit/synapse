@@ -88,6 +88,8 @@ enum Execution {
     Lazy,
 }
 
+const GRAPH_REVISION: u32 = 2;
+
 #[derive(Clone, Debug)]
 struct MetalExecutionConfig {
     execution: Execution,
@@ -111,7 +113,7 @@ impl MetalExecutionConfig {
                 .filter(|build| !build.is_empty())
                 .unwrap_or_else(|| "unknown-os-build".to_owned());
             root.join(format!(
-                "{family}-{:016x}-{}-{os_build}",
+                "{family}-graph-v{GRAPH_REVISION}-{:016x}-{}-{os_build}",
                 hash,
                 args.dtype.as_str()
             ))
@@ -2178,11 +2180,13 @@ mod tests {
     fn package_cache_uses_one_path_per_shape() {
         let config = MetalExecutionConfig {
             execution: Execution::Explicit,
-            package_root: Some(PathBuf::from("cache/model-f16-os")),
+            package_root: Some(PathBuf::from("cache/model-graph-v2-f16-os")),
         };
         assert_eq!(
             config.package_path(8, 128),
-            Some(PathBuf::from("cache/model-f16-os/8x128.mpsgraphpackage"))
+            Some(PathBuf::from(
+                "cache/model-graph-v2-f16-os/8x128.mpsgraphpackage"
+            ))
         );
         assert_ne!(config.package_path(8, 128), config.package_path(4, 256));
     }

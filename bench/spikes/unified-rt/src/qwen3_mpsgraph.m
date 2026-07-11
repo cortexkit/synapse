@@ -323,6 +323,8 @@ static NSString *plan_key(uint64_t batch, uint64_t seq, uint64_t hidden, uint64_
             batch, seq, hidden, qh, kvh, head_dim, intermediate, layers, (double)eps, dtype];
 }
 
+// Pointer-keyed entries are restricted to model-owned tensors and persistent f16 mirrors.
+// Input, mask, and RoPE temporaries are copied into uncached buffers for every invocation.
 static id<MTLBuffer> cached_buffer(Qwen3Context *context, const void *values, NSUInteger bytes) {
     NSString *key = [NSString stringWithFormat:@"%p:%llu", values, (unsigned long long)bytes];
     id<MTLBuffer> buffer = [context->weights objectForKey:key];
