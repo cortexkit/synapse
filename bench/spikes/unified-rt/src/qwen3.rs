@@ -61,7 +61,7 @@ pub(crate) struct RmsNorm {
 }
 
 impl Model {
-    pub(crate) fn load(path: &Path) -> Result<Self> {
+    pub(crate) fn load(path: &Path, precision: super::Precision) -> Result<Self> {
         let root = resolve_model_root(path)?;
         let config_path = root.join("config.json");
         let config: Config = serde_json::from_str(
@@ -124,11 +124,29 @@ impl Model {
             });
         }
         validate_layers(&config, &layers)?;
+        if matches!(precision, super::Precision::F16) {
+            for layer in &mut layers {
+                layer.input_norm.weight.prepare_metal_f16();
+                layer.post_attention_norm.weight.prepare_metal_f16();
+                layer.q_proj.tensor.prepare_metal_f16();
+                layer.q_norm.weight.prepare_metal_f16();
+                layer.k_proj.tensor.prepare_metal_f16();
+                layer.k_norm.weight.prepare_metal_f16();
+                layer.v_proj.tensor.prepare_metal_f16();
+                layer.o_proj.tensor.prepare_metal_f16();
+                layer.gate_proj.tensor.prepare_metal_f16();
+                layer.up_proj.tensor.prepare_metal_f16();
+                layer.down_proj.tensor.prepare_metal_f16();
+            }
+        }
 
         let eos_token_id = config
             .eos_token_id
             .context("Qwen3 embedding config is missing eos_token_id")?;
-        let final_norm = load_norm(&tensors, "norm", config.rms_norm_eps)?;
+        let mut final_norm = load_norm(&tensors, "norm", config.rms_norm_eps)?;
+        if matches!(precision, super::Precision::F16) {
+            final_norm.weight.prepare_metal_f16();
+        }
         Ok(Self {
             config,
             eos_token_id,
@@ -239,8 +257,8 @@ impl Model {
         ))
     }
 
-    pub(crate) fn default_label(&self) -> &'static str {
-        "Qwen3-Embedding-0.6B@owned-rt-fp32"
+    pub(crate) fn default_label(&self, precision: super::Precision) -> String {
+        format!("Qwen3-Embedding-0.6B@owned-rt-{}", precision.as_str())
     }
 
     pub(crate) fn notes(&self) -> String {
@@ -621,31 +639,36 @@ mod metal {
     use anyhow::{bail, ensure, Result};
 
     use super::{Layer, RmsNorm};
+    use crate::{decode_f16_bits, encode_f16_bits, Execution, MetalExecutionConfig, Precision};
 
     #[repr(C)]
     struct LayerParams {
-        input_norm: *const f32,
-        post_attention_norm: *const f32,
-        q_weight: *const f32,
-        q_norm: *const f32,
-        k_weight: *const f32,
-        k_norm: *const f32,
-        v_weight: *const f32,
-        o_weight: *const f32,
-        gate_weight: *const f32,
-        up_weight: *const f32,
-        down_weight: *const f32,
+        input_norm: *const c_void,
+        post_attention_norm: *const c_void,
+        q_weight: *const c_void,
+        q_norm: *const c_void,
+        k_weight: *const c_void,
+        k_norm: *const c_void,
+        v_weight: *const c_void,
+        o_weight: *const c_void,
+        gate_weight: *const c_void,
+        up_weight: *const c_void,
+        down_weight: *const c_void,
     }
 
     pub(crate) struct Context {
         raw: NonNull<c_void>,
+        precision: Precision,
+        execution: MetalExecutionConfig,
     }
 
     impl Context {
-        pub(crate) fn new() -> Result<Self> {
+        pub(crate) fn new(precision: Precision, execution: MetalExecutionConfig) -> Result<Self> {
             let raw = unsafe { synapse_qwen3_context_new() };
             Ok(Self {
                 raw: NonNull::new(raw).ok_or_else(last_error)?,
+                precision,
+                execution,
             })
         }
 
@@ -700,23 +723,84 @@ mod metal {
                     }
                 }
             }
+            let f16 = matches!(self.precision, Precision::F16);
             let params: Vec<LayerParams> = layers
                 .iter()
-                .map(|layer| LayerParams {
-                    input_norm: layer.input_norm.weight.data.as_ptr(),
-                    post_attention_norm: layer.post_attention_norm.weight.data.as_ptr(),
-                    q_weight: layer.q_proj.tensor.data.as_ptr(),
-                    q_norm: layer.q_norm.weight.data.as_ptr(),
-                    k_weight: layer.k_proj.tensor.data.as_ptr(),
-                    k_norm: layer.k_norm.weight.data.as_ptr(),
-                    v_weight: layer.v_proj.tensor.data.as_ptr(),
-                    o_weight: layer.o_proj.tensor.data.as_ptr(),
-                    gate_weight: layer.gate_proj.tensor.data.as_ptr(),
-                    up_weight: layer.up_proj.tensor.data.as_ptr(),
-                    down_weight: layer.down_proj.tensor.data.as_ptr(),
+                .map(|layer| -> Result<_> {
+                    Ok(LayerParams {
+                        input_norm: if f16 {
+                            layer.input_norm.weight.metal_f16_bits()?.as_ptr().cast()
+                        } else {
+                            layer.input_norm.weight.data.as_ptr().cast()
+                        },
+                        post_attention_norm: if f16 {
+                            layer
+                                .post_attention_norm
+                                .weight
+                                .metal_f16_bits()?
+                                .as_ptr()
+                                .cast()
+                        } else {
+                            layer.post_attention_norm.weight.data.as_ptr().cast()
+                        },
+                        q_weight: if f16 {
+                            layer.q_proj.tensor.metal_f16_bits()?.as_ptr().cast()
+                        } else {
+                            layer.q_proj.tensor.data.as_ptr().cast()
+                        },
+                        q_norm: if f16 {
+                            layer.q_norm.weight.metal_f16_bits()?.as_ptr().cast()
+                        } else {
+                            layer.q_norm.weight.data.as_ptr().cast()
+                        },
+                        k_weight: if f16 {
+                            layer.k_proj.tensor.metal_f16_bits()?.as_ptr().cast()
+                        } else {
+                            layer.k_proj.tensor.data.as_ptr().cast()
+                        },
+                        k_norm: if f16 {
+                            layer.k_norm.weight.metal_f16_bits()?.as_ptr().cast()
+                        } else {
+                            layer.k_norm.weight.data.as_ptr().cast()
+                        },
+                        v_weight: if f16 {
+                            layer.v_proj.tensor.metal_f16_bits()?.as_ptr().cast()
+                        } else {
+                            layer.v_proj.tensor.data.as_ptr().cast()
+                        },
+                        o_weight: if f16 {
+                            layer.o_proj.tensor.metal_f16_bits()?.as_ptr().cast()
+                        } else {
+                            layer.o_proj.tensor.data.as_ptr().cast()
+                        },
+                        gate_weight: if f16 {
+                            layer.gate_proj.tensor.metal_f16_bits()?.as_ptr().cast()
+                        } else {
+                            layer.gate_proj.tensor.data.as_ptr().cast()
+                        },
+                        up_weight: if f16 {
+                            layer.up_proj.tensor.metal_f16_bits()?.as_ptr().cast()
+                        } else {
+                            layer.up_proj.tensor.data.as_ptr().cast()
+                        },
+                        down_weight: if f16 {
+                            layer.down_proj.tensor.metal_f16_bits()?.as_ptr().cast()
+                        } else {
+                            layer.down_proj.tensor.data.as_ptr().cast()
+                        },
+                    })
                 })
-                .collect();
-            let mut output = vec![0.0f32; hidden_states.len()];
+                .collect::<Result<_>>()?;
+            let input_f16 = f16.then(|| encode_f16_bits(hidden_states));
+            let cos_f16 = f16.then(|| encode_f16_bits(&rope_cos));
+            let sin_f16 = f16.then(|| encode_f16_bits(&rope_sin));
+            let package = self.execution.package_path(batch, seq);
+            let package_c = package
+                .as_ref()
+                .map(|path| std::ffi::CString::new(path.to_string_lossy().as_bytes()))
+                .transpose()?;
+            let mut output_f32 = vec![0.0f32; hidden_states.len()];
+            let mut output_f16 = vec![0u16; hidden_states.len()];
             let status = unsafe {
                 synapse_qwen3_forward(
                     self.raw.as_ptr(),
@@ -729,13 +813,34 @@ mod metal {
                     intermediate as u64,
                     layers.len() as u64,
                     epsilon,
-                    hidden_states.as_ptr(),
+                    i32::from(f16),
+                    i32::from(matches!(self.execution.execution, Execution::Explicit)),
+                    package_c
+                        .as_ref()
+                        .map_or(std::ptr::null(), |path| path.as_ptr()),
+                    input_f16
+                        .as_ref()
+                        .map_or(hidden_states.as_ptr().cast(), |values| {
+                            values.as_ptr().cast()
+                        }),
                     additive_mask.as_ptr(),
-                    rope_cos.as_ptr(),
-                    rope_sin.as_ptr(),
+                    cos_f16
+                        .as_ref()
+                        .map_or(rope_cos.as_ptr().cast(), |values| values.as_ptr().cast()),
+                    sin_f16
+                        .as_ref()
+                        .map_or(rope_sin.as_ptr().cast(), |values| values.as_ptr().cast()),
                     params.as_ptr(),
-                    final_norm.weight.data.as_ptr(),
-                    output.as_mut_ptr(),
+                    if f16 {
+                        final_norm.weight.metal_f16_bits()?.as_ptr().cast()
+                    } else {
+                        final_norm.weight.data.as_ptr().cast()
+                    },
+                    if f16 {
+                        output_f16.as_mut_ptr().cast()
+                    } else {
+                        output_f32.as_mut_ptr().cast()
+                    },
                 )
             };
             if status != 0 {
@@ -744,7 +849,11 @@ mod metal {
                     last_error()
                 );
             }
-            hidden_states.copy_from_slice(&output);
+            if f16 {
+                hidden_states.copy_from_slice(&decode_f16_bits(&output_f16));
+            } else {
+                hidden_states.copy_from_slice(&output_f32);
+            }
             Ok(())
         }
     }
@@ -780,13 +889,16 @@ mod metal {
             intermediate: u64,
             layer_count: u64,
             epsilon: f32,
-            input: *const f32,
+            dtype: i32,
+            explicit_execution: i32,
+            package_path: *const c_char,
+            input: *const c_void,
             mask: *const f32,
-            rope_cos: *const f32,
-            rope_sin: *const f32,
+            rope_cos: *const c_void,
+            rope_sin: *const c_void,
             layers: *const LayerParams,
-            final_norm: *const f32,
-            output: *mut f32,
+            final_norm: *const c_void,
+            output: *mut c_void,
         ) -> i32;
         fn synapse_qwen3_last_error() -> *const c_char;
     }
@@ -800,7 +912,10 @@ pub(crate) struct MetalContext;
 
 #[cfg(not(target_os = "macos"))]
 impl MetalContext {
-    pub(crate) fn new() -> Result<Self> {
+    pub(crate) fn new(
+        _precision: super::Precision,
+        _execution: super::MetalExecutionConfig,
+    ) -> Result<Self> {
         anyhow::bail!("Qwen3 Metal MPSGraph is only available on macOS")
     }
 

@@ -53,6 +53,12 @@ struct Args {
     /// Precision for the Metal resident encoder path.
     #[arg(long, value_enum, default_value_t = Precision::F32)]
     dtype: Precision,
+    /// Metal graph execution strategy. Explicit O0 compilation is the serving default.
+    #[arg(long, value_enum, default_value_t = Execution::Explicit)]
+    execution: Execution,
+    /// Optional directory for one compiled MPSGraph package per batch/sequence shape.
+    #[arg(long)]
+    package_cache: Option<PathBuf>,
     /// Tokenizer truncation max length.
     #[arg(long, default_value_t = 512)]
     max_length: usize,
@@ -74,6 +80,57 @@ enum DeviceArg {
 enum Precision {
     F32,
     F16,
+}
+
+#[derive(Copy, Clone, Eq, PartialEq, Debug, ValueEnum)]
+enum Execution {
+    Explicit,
+    Lazy,
+}
+
+#[derive(Clone, Debug)]
+struct MetalExecutionConfig {
+    execution: Execution,
+    package_root: Option<PathBuf>,
+}
+
+impl MetalExecutionConfig {
+    fn from_args(args: &Args, family: &str) -> Result<Self> {
+        let package_root = args.package_cache.as_ref().map(|root| {
+            let model = fs::canonicalize(&args.model).unwrap_or_else(|_| args.model.clone());
+            let identity = format!("{}", model.display());
+            let hash = identity.bytes().fold(1469598103934665603u64, |hash, byte| {
+                (hash ^ u64::from(byte)).wrapping_mul(1099511628211)
+            });
+            let os_build = std::process::Command::new("sw_vers")
+                .arg("-buildVersion")
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+                .filter(|build| !build.is_empty())
+                .unwrap_or_else(|| "unknown-os-build".to_owned());
+            root.join(format!(
+                "{family}-{:016x}-{}-{os_build}",
+                hash,
+                args.dtype.as_str()
+            ))
+        });
+        if let Some(root) = &package_root {
+            fs::create_dir_all(root)
+                .with_context(|| format!("create package cache {}", root.display()))?;
+        }
+        Ok(Self {
+            execution: args.execution,
+            package_root,
+        })
+    }
+
+    fn package_path(&self, batch: usize, seq: usize) -> Option<PathBuf> {
+        self.package_root
+            .as_ref()
+            .map(|root| root.join(format!("{batch}x{seq}.mpsgraphpackage")))
+    }
 }
 
 impl Precision {
@@ -98,10 +155,6 @@ fn main() -> Result<()> {
     let started = Instant::now();
 
     let model = RuntimeModel::load(&args.model, args.dtype)?;
-    ensure!(
-        !(model.is_qwen3() && matches!(args.dtype, Precision::F16)),
-        "Qwen3 is fp32-only in this spike; f16 is intentionally out of scope"
-    );
     let mut tokenizer = Tokenizer::from_file(&args.tokenizer)
         .map_err(|error| anyhow::anyhow!("tokenizer: {error}"))?;
     tokenizer
@@ -111,7 +164,8 @@ fn main() -> Result<()> {
         }))
         .map_err(|error| anyhow::anyhow!("truncation: {error}"))?;
 
-    let mut provider = make_provider(args.device, args.dtype)?;
+    let execution = MetalExecutionConfig::from_args(&args, model.family_name())?;
+    let mut provider = make_provider(args.device, args.dtype, execution)?;
     let _ = model.embed_batch(provider.as_mut(), &tokenizer, &["warmup"], args.max_length)?;
     let cold_load_s = started.elapsed().as_secs_f64();
 
@@ -214,10 +268,12 @@ fn main() -> Result<()> {
         parity_mean_cosine,
         self_peak_rss_bytes: None,
         notes: format!(
-            "{}, provider={}, dtype={}, length-sorted attention_units={}, max_len={}; providers may override the model-family block, and Metal keeps block hidden states resident inside one MPSGraph per batch shape",
+            "{}, provider={}, dtype={}, execution={:?}, package_cache={}, length-sorted attention_units={}, max_len={}; providers may override the model-family block, and Metal keeps block hidden states resident inside one MPSGraph per batch shape",
             model.notes(),
             provider.name(),
             args.dtype.as_str(),
+            args.execution,
+            args.package_cache.as_ref().map_or("disabled".into(), |path| path.display().to_string()),
             args.attention_units,
             args.max_length
         ),
@@ -283,14 +339,17 @@ impl RuntimeModel {
                     })
                 });
         if is_qwen3 {
-            Ok(Self::Qwen3(qwen3::Model::load(path)?))
+            Ok(Self::Qwen3(qwen3::Model::load(path, precision)?))
         } else {
             Ok(Self::Bert(BertModel::load(path, precision)?))
         }
     }
 
-    fn is_qwen3(&self) -> bool {
-        matches!(self, Self::Qwen3(_))
+    fn family_name(&self) -> &'static str {
+        match self {
+            Self::Bert(_) => "minilm",
+            Self::Qwen3(_) => "qwen3-0.6b",
+        }
     }
 
     fn token_length(&self, tokenizer: &Tokenizer, text: &str, max_length: usize) -> Result<usize> {
@@ -319,7 +378,7 @@ impl RuntimeModel {
     fn default_label(&self, precision: Precision) -> String {
         match self {
             Self::Bert(_) => format!("all-MiniLM-L6-v2@owned-rt-{}", precision.as_str()),
-            Self::Qwen3(model) => model.default_label().to_string(),
+            Self::Qwen3(model) => model.default_label(precision),
         }
     }
 
@@ -331,10 +390,14 @@ impl RuntimeModel {
     }
 }
 
-fn make_provider(device: DeviceArg, dtype: Precision) -> Result<Box<dyn KernelProvider>> {
+fn make_provider(
+    device: DeviceArg,
+    dtype: Precision,
+    execution: MetalExecutionConfig,
+) -> Result<Box<dyn KernelProvider>> {
     match device {
         DeviceArg::Cpu => Ok(Box::new(CpuProvider)),
-        DeviceArg::Metal => Ok(Box::new(MetalProvider::new(dtype)?)),
+        DeviceArg::Metal => Ok(Box::new(MetalProvider::new_with_config(dtype, execution)?)),
     }
 }
 
@@ -515,14 +578,27 @@ struct MetalProvider {
     context: metal_backend::MpsGraphContext,
     qwen3_context: Option<qwen3::MetalContext>,
     dtype: Precision,
+    execution: MetalExecutionConfig,
 }
 
 impl MetalProvider {
+    #[cfg(test)]
     fn new(dtype: Precision) -> Result<Self> {
+        Self::new_with_config(
+            dtype,
+            MetalExecutionConfig {
+                execution: Execution::Lazy,
+                package_root: None,
+            },
+        )
+    }
+
+    fn new_with_config(dtype: Precision, execution: MetalExecutionConfig) -> Result<Self> {
         Ok(Self {
-            context: metal_backend::MpsGraphContext::new()?,
+            context: metal_backend::MpsGraphContext::new_with_config(execution.clone())?,
             qwen3_context: None,
             dtype,
+            execution,
         })
     }
 }
@@ -622,12 +698,11 @@ impl KernelProvider for MetalProvider {
         layers: &[qwen3::Layer],
         final_norm: &qwen3::RmsNorm,
     ) -> Result<bool> {
-        ensure!(
-            matches!(self.dtype, Precision::F32),
-            "Qwen3 Metal graph supports fp32 only"
-        );
         if self.qwen3_context.is_none() {
-            self.qwen3_context = Some(qwen3::MetalContext::new()?);
+            self.qwen3_context = Some(qwen3::MetalContext::new(
+                self.dtype,
+                self.execution.clone(),
+            )?);
         }
         self.qwen3_context
             .as_mut()
@@ -653,12 +728,15 @@ impl KernelProvider for MetalProvider {
 
 #[cfg(target_os = "macos")]
 mod metal_backend {
-    use std::ffi::{c_char, c_void, CStr};
+    use std::ffi::{c_char, c_void, CStr, CString};
     use std::ptr::NonNull;
 
     use anyhow::{bail, ensure, Result};
 
-    use super::{decode_f16_bits, encode_f16_bits, BLayout, EncoderLayer, Precision};
+    use super::{
+        decode_f16_bits, encode_f16_bits, BLayout, EncoderLayer, Execution, MetalExecutionConfig,
+        Precision,
+    };
 
     #[repr(C)]
     struct SynapseMpsEncoderLayerParams {
@@ -698,13 +776,14 @@ mod metal_backend {
 
     pub struct MpsGraphContext {
         raw: NonNull<c_void>,
+        execution: MetalExecutionConfig,
     }
 
     impl MpsGraphContext {
-        pub fn new() -> Result<Self> {
+        pub fn new_with_config(execution: MetalExecutionConfig) -> Result<Self> {
             let raw = unsafe { synapse_mps_context_new() };
             let raw = NonNull::new(raw).ok_or_else(last_error)?;
-            Ok(Self { raw })
+            Ok(Self { raw, execution })
         }
 
         #[allow(clippy::too_many_arguments)]
@@ -924,6 +1003,49 @@ mod metal_backend {
                     .collect::<Result<_>>()?,
             };
             let ffi_dtype = SynapseMpsDType::from(dtype) as i32;
+            if matches!(self.execution.execution, Execution::Explicit) {
+                let package = self.execution.package_path(batch, seq);
+                let load_package = package.as_ref().is_some_and(|path| path.exists());
+                let package_c = package
+                    .as_ref()
+                    .map(|path| CString::new(path.to_string_lossy().as_bytes()))
+                    .transpose()?;
+                let mut prepare_wall_s = 0.0;
+                let mut specialize_wall_s = 0.0;
+                let mut serialize_wall_s = 0.0;
+                let prepare_status = unsafe {
+                    synapse_mps_prepare_encoder(
+                        self.raw.as_ptr(),
+                        batch as u64,
+                        seq as u64,
+                        hidden as u64,
+                        heads as u64,
+                        intermediate as u64,
+                        layers.len() as u64,
+                        layer_norm_eps,
+                        ffi_dtype,
+                        0,
+                        package_c
+                            .as_ref()
+                            .map_or(std::ptr::null(), |path| path.as_ptr()),
+                        i32::from(load_package),
+                        0,
+                        &mut prepare_wall_s,
+                        &mut specialize_wall_s,
+                        &mut serialize_wall_s,
+                    )
+                };
+                if prepare_status != 0 {
+                    bail!(
+                        "MPSGraph encoder preparation failed with status {prepare_status}: {}",
+                        last_error()
+                    );
+                }
+                eprintln!(
+                    "Metal executable {} {}x{}: prepare={prepare_wall_s:.6}s specialize={specialize_wall_s:.6}s serialize={serialize_wall_s:.6}s",
+                    if load_package { "loaded" } else { "compiled" }, batch, seq
+                );
+            }
             let status = match dtype {
                 Precision::F32 => {
                     let mut output = vec![0.0f32; hidden_states.len()];
@@ -1021,6 +1143,24 @@ mod metal_backend {
             c: *mut c_void,
             cache_rhs: i32,
         ) -> i32;
+        fn synapse_mps_prepare_encoder(
+            context: *mut c_void,
+            batch: u64,
+            seq: u64,
+            hidden: u64,
+            heads: u64,
+            intermediate: u64,
+            layer_count: u64,
+            layer_norm_eps: f32,
+            dtype: i32,
+            optimization_level: i32,
+            package_path: *const c_char,
+            load_package: i32,
+            append_package: i32,
+            prepare_wall_s: *mut f64,
+            specialize_wall_s: *mut f64,
+            serialize_wall_s: *mut f64,
+        ) -> i32;
         fn synapse_mps_encoder_forward(
             context: *mut c_void,
             batch: u64,
@@ -1049,7 +1189,7 @@ mod metal_backend {
     pub struct MpsGraphContext;
 
     impl MpsGraphContext {
-        pub fn new() -> Result<Self> {
+        pub fn new_with_config(_execution: super::MetalExecutionConfig) -> Result<Self> {
             bail!("Metal MPSGraph provider is only available on macOS")
         }
 
@@ -1214,7 +1354,9 @@ impl ParamVector {
     }
 
     fn prepare_metal_f16(&mut self) {
-        self.metal_f16_bits = Some(encode_f16_bits(&self.values));
+        if self.metal_f16_bits.is_none() {
+            self.metal_f16_bits = Some(encode_f16_bits(&self.values));
+        }
     }
 
     fn metal_f16_bits(&self) -> Result<&[u16]> {
@@ -1258,7 +1400,9 @@ impl Tensor {
     }
 
     fn prepare_metal_f16(&mut self) {
-        self.metal_f16_bits = Some(encode_f16_bits(&self.data));
+        if self.metal_f16_bits.is_none() {
+            self.metal_f16_bits = Some(encode_f16_bits(&self.data));
+        }
     }
 
     fn metal_f16_bits(&self) -> Result<&[u16]> {
@@ -1963,7 +2107,16 @@ fn tensor_from_view(dtype: SafeDtype, shape: &[usize], bytes: &[u8]) -> Result<T
             .collect(),
         other => bail!("unsupported safetensor dtype {other:?}; expected f32/f16/bf16"),
     };
-    Tensor::new(shape.to_vec(), values)
+    let mut tensor = Tensor::new(shape.to_vec(), values)?;
+    if matches!(dtype, SafeDtype::F16) {
+        tensor.metal_f16_bits = Some(
+            bytes
+                .chunks_exact(2)
+                .map(|chunk| u16::from_le_bytes(chunk.try_into().expect("chunk_exact length")))
+                .collect(),
+        );
+    }
+    Ok(tensor)
 }
 
 fn resolve_model_root(path: &Path) -> Result<PathBuf> {
@@ -2000,6 +2153,39 @@ fn get_tensor(tensors: &HashMap<String, Tensor>, base_name: &str) -> Result<Tens
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn serving_execution_defaults_to_explicit_and_lazy_is_opt_in() {
+        let base = [
+            "spike-unified-rt",
+            "--model",
+            "model",
+            "--tokenizer",
+            "tokenizer.json",
+            "--corpus",
+            "corpus.jsonl",
+            "--out",
+            "result.json",
+        ];
+        let default = Args::try_parse_from(base).expect("parse default serving arguments");
+        assert_eq!(default.execution, Execution::Explicit);
+        let lazy = Args::try_parse_from(base.into_iter().chain(["--execution", "lazy"]))
+            .expect("parse lazy execution override");
+        assert_eq!(lazy.execution, Execution::Lazy);
+    }
+
+    #[test]
+    fn package_cache_uses_one_path_per_shape() {
+        let config = MetalExecutionConfig {
+            execution: Execution::Explicit,
+            package_root: Some(PathBuf::from("cache/model-f16-os")),
+        };
+        assert_eq!(
+            config.package_path(8, 128),
+            Some(PathBuf::from("cache/model-f16-os/8x128.mpsgraphpackage"))
+        );
+        assert_ne!(config.package_path(8, 128), config.package_path(4, 256));
+    }
 
     #[test]
     fn qwen3_parity_gate_enforces_certification_thresholds() {

@@ -12,8 +12,8 @@ use synapse_bench::{
 use tokenizers::{Tokenizer, TruncationParams};
 
 use super::{
-    get_tensor, load_safetensor_map, normalize_l2, resolve_model_root, write_vectors, Args,
-    BLayout, DeviceArg, Precision, Tensor,
+    decode_f16_bits, encode_f16_bits, get_tensor, load_safetensor_map, normalize_l2,
+    resolve_model_root, write_vectors, Args, BLayout, DeviceArg, Execution, Precision, Tensor,
 };
 
 const PARITY_K: usize = 10;
@@ -144,7 +144,7 @@ struct ModernBertModel {
 }
 
 impl ModernBertModel {
-    fn load(path: &Path) -> Result<Self> {
+    fn load(path: &Path, precision: Precision) -> Result<Self> {
         let model_root = resolve_model_root(path)?;
         let config = load_config(&model_root)?;
         ensure!(config.model_type == "modernbert", "model is not ModernBERT");
@@ -199,6 +199,15 @@ impl ModernBertModel {
                 )?,
                 attention_type,
             });
+        }
+
+        if matches!(precision, Precision::F16) {
+            for layer in &mut layers {
+                layer.qkv.weight.prepare_metal_f16();
+                layer.attention_output.weight.prepare_metal_f16();
+                layer.mlp_input.weight.prepare_metal_f16();
+                layer.mlp_output.weight.prepare_metal_f16();
+            }
         }
 
         Ok(Self {
@@ -576,13 +585,16 @@ enum Backend {
 }
 
 impl Backend {
-    fn new(device: DeviceArg, precision: Precision) -> Result<Self> {
+    fn new(
+        device: DeviceArg,
+        precision: Precision,
+        execution: super::MetalExecutionConfig,
+    ) -> Result<Self> {
         match (device, precision) {
             (DeviceArg::Cpu, Precision::F32) => Ok(Self::Cpu),
             (DeviceArg::Cpu, Precision::F16) => bail!("ModernBERT CPU supports fp32 only"),
-            (DeviceArg::Metal, Precision::F32) => Ok(Self::Metal(MetalContext::new()?)),
-            (DeviceArg::Metal, Precision::F16) => {
-                bail!("ModernBERT Metal supports fp32 only in this parity spike")
+            (DeviceArg::Metal, Precision::F32 | Precision::F16) => {
+                Ok(Self::Metal(MetalContext::new(precision, execution)?))
             }
         }
     }
@@ -590,14 +602,17 @@ impl Backend {
     fn name(&self) -> &'static str {
         match self {
             Self::Cpu => "cpu-accelerate-modernbert-fp32",
-            Self::Metal(_) => "metal-mpsgraph-modernbert-resident-fp32",
+            Self::Metal(context) => match context.precision {
+                Precision::F32 => "metal-mpsgraph-modernbert-resident-fp32",
+                Precision::F16 => "metal-mpsgraph-modernbert-resident-f16",
+            },
         }
     }
 }
 
 pub(super) fn run(args: &Args) -> Result<()> {
     let started = Instant::now();
-    let model = ModernBertModel::load(&args.model)?;
+    let model = ModernBertModel::load(&args.model, args.dtype)?;
     let mut tokenizer = Tokenizer::from_file(&args.tokenizer)
         .map_err(|error| anyhow::anyhow!("tokenizer: {error}"))?;
     tokenizer.with_padding(None);
@@ -607,7 +622,8 @@ pub(super) fn run(args: &Args) -> Result<()> {
             ..Default::default()
         }))
         .map_err(|error| anyhow::anyhow!("truncation: {error}"))?;
-    let mut backend = Backend::new(args.device, args.dtype)?;
+    let execution = super::MetalExecutionConfig::from_args(args, "gte-modernbert")?;
+    let mut backend = Backend::new(args.device, args.dtype, execution)?;
     let _ = model.embed_batch(&mut backend, &tokenizer, &["warmup"])?;
     let cold_load_s = started.elapsed().as_secs_f64();
 
@@ -696,7 +712,7 @@ pub(super) fn run(args: &Args) -> Result<()> {
         model: args
             .model_label
             .clone()
-            .unwrap_or_else(|| "Alibaba-NLP/gte-modernbert-base@owned-rt-fp32".into()),
+            .unwrap_or_else(|| format!("Alibaba-NLP/gte-modernbert-base@owned-rt-{}", args.dtype.as_str())),
         cold_load_s,
         infer_wall_s,
         input_tokens,
@@ -705,7 +721,10 @@ pub(super) fn run(args: &Args) -> Result<()> {
         parity_mean_cosine,
         self_peak_rss_bytes: None,
         notes: format!(
-            "ModernBERT fp32, CLS+l2, RoPE, alternating full/local-{} attention, GeGLU, pre-norm; length-sorted attention_units={}, max_len={}, top10_rank_overlap={rank_mean:?}",
+            "ModernBERT {}, execution={:?}, package_cache={}, CLS+l2, RoPE, alternating full/local-{} attention, GeGLU, pre-norm; length-sorted attention_units={}, max_len={}, top10_rank_overlap={rank_mean:?}",
+            args.dtype.as_str(),
+            args.execution,
+            args.package_cache.as_ref().map_or("disabled".into(), |path| path.display().to_string()),
             model.config.local_attention, args.attention_units, args.max_length
         ),
     };
@@ -733,6 +752,8 @@ fn validate_parity(cosine: f64, rank: f64, minimum_cosine: f64, minimum_rank: f6
 struct MetalContext {
     raw: std::ptr::NonNull<std::ffi::c_void>,
     buckets: HashMap<usize, MetalBucket>,
+    precision: Precision,
+    execution: super::MetalExecutionConfig,
 }
 
 #[cfg(target_os = "macos")]
@@ -746,12 +767,14 @@ struct MetalBucket {
 
 #[cfg(target_os = "macos")]
 impl MetalContext {
-    fn new() -> Result<Self> {
+    fn new(precision: Precision, execution: super::MetalExecutionConfig) -> Result<Self> {
         let raw = unsafe { synapse_modernbert_mps_context_new() };
         let raw = std::ptr::NonNull::new(raw).ok_or_else(metal_error)?;
         Ok(Self {
             raw,
             buckets: HashMap::new(),
+            precision,
+            execution,
         })
     }
 
@@ -777,26 +800,87 @@ impl MetalContext {
             }
         });
         let masks = additive_masks_with_band(attention_mask, batch, seq, &bucket.band_mask);
+        let input_f16 =
+            matches!(self.precision, Precision::F16).then(|| encode_f16_bits(hidden_states));
+        let final_norm_f16 =
+            matches!(self.precision, Precision::F16).then(|| encode_f16_bits(&model.final_norm));
+        let attention_norm_f16: Vec<Option<Vec<u16>>> = model
+            .layers
+            .iter()
+            .map(|layer| {
+                layer
+                    .attention_norm
+                    .as_ref()
+                    .map(|weight| encode_f16_bits(weight))
+            })
+            .collect();
+        let mlp_norm_f16: Vec<Vec<u16>> = model
+            .layers
+            .iter()
+            .map(|layer| encode_f16_bits(&layer.mlp_norm))
+            .collect();
         let params: Vec<ModernBertLayerParams> = model
             .layers
             .iter()
-            .map(|layer| ModernBertLayerParams {
-                qkv_weight: layer.qkv.weight.data.as_ptr(),
-                attention_output_weight: layer.attention_output.weight.data.as_ptr(),
-                attention_norm_weight: layer
-                    .attention_norm
-                    .as_ref()
-                    .map_or(std::ptr::null(), |weight| weight.as_ptr()),
-                mlp_input_weight: layer.mlp_input.weight.data.as_ptr(),
-                mlp_output_weight: layer.mlp_output.weight.data.as_ptr(),
-                mlp_norm_weight: layer.mlp_norm.as_ptr(),
-                attention_type: match layer.attention_type {
-                    AttentionType::Full => 0,
-                    AttentionType::Sliding => 1,
-                },
+            .enumerate()
+            .map(|(index, layer)| -> Result<_> {
+                let f16 = matches!(self.precision, Precision::F16);
+                Ok(ModernBertLayerParams {
+                    qkv_weight: if f16 {
+                        layer.qkv.weight.metal_f16_bits()?.as_ptr().cast()
+                    } else {
+                        layer.qkv.weight.data.as_ptr().cast()
+                    },
+                    attention_output_weight: if f16 {
+                        layer
+                            .attention_output
+                            .weight
+                            .metal_f16_bits()?
+                            .as_ptr()
+                            .cast()
+                    } else {
+                        layer.attention_output.weight.data.as_ptr().cast()
+                    },
+                    attention_norm_weight: if f16 {
+                        attention_norm_f16[index]
+                            .as_ref()
+                            .map_or(std::ptr::null(), |weight| weight.as_ptr().cast())
+                    } else {
+                        layer
+                            .attention_norm
+                            .as_ref()
+                            .map_or(std::ptr::null(), |weight| weight.as_ptr().cast())
+                    },
+                    mlp_input_weight: if f16 {
+                        layer.mlp_input.weight.metal_f16_bits()?.as_ptr().cast()
+                    } else {
+                        layer.mlp_input.weight.data.as_ptr().cast()
+                    },
+                    mlp_output_weight: if f16 {
+                        layer.mlp_output.weight.metal_f16_bits()?.as_ptr().cast()
+                    } else {
+                        layer.mlp_output.weight.data.as_ptr().cast()
+                    },
+                    mlp_norm_weight: if f16 {
+                        mlp_norm_f16[index].as_ptr().cast()
+                    } else {
+                        layer.mlp_norm.as_ptr().cast()
+                    },
+                    attention_type: match layer.attention_type {
+                        AttentionType::Full => 0,
+                        AttentionType::Sliding => 1,
+                    },
+                })
             })
-            .collect();
-        let mut output = vec![0.0; hidden_states.len()];
+            .collect::<Result<_>>()?;
+        let package = self.execution.package_path(batch, seq);
+        let package_c = package
+            .as_ref()
+            .map(|path| std::ffi::CString::new(path.to_string_lossy().as_bytes()))
+            .transpose()?;
+        let mut output_f32 = vec![0.0; hidden_states.len()];
+        let mut output_f16 = vec![0u16; hidden_states.len()];
+        let f16 = matches!(self.precision, Precision::F16);
         let status = unsafe {
             synapse_modernbert_mps_forward(
                 self.raw.as_ptr(),
@@ -807,16 +891,33 @@ impl MetalContext {
                 model.config.intermediate_size as u64,
                 model.layers.len() as u64,
                 model.config.norm_eps,
-                hidden_states.as_ptr(),
+                i32::from(f16),
+                i32::from(matches!(self.execution.execution, Execution::Explicit)),
+                package_c
+                    .as_ref()
+                    .map_or(std::ptr::null(), |path| path.as_ptr()),
+                input_f16
+                    .as_ref()
+                    .map_or(hidden_states.as_ptr().cast(), |values| {
+                        values.as_ptr().cast()
+                    }),
                 masks.full.as_ptr(),
                 masks.local.as_ptr(),
                 bucket.global_cos.as_ptr(),
                 bucket.global_sin.as_ptr(),
                 bucket.local_cos.as_ptr(),
                 bucket.local_sin.as_ptr(),
-                model.final_norm.as_ptr(),
+                final_norm_f16
+                    .as_ref()
+                    .map_or(model.final_norm.as_ptr().cast(), |values| {
+                        values.as_ptr().cast()
+                    }),
                 params.as_ptr(),
-                output.as_mut_ptr(),
+                if f16 {
+                    output_f16.as_mut_ptr().cast()
+                } else {
+                    output_f32.as_mut_ptr().cast()
+                },
             )
         };
         ensure!(
@@ -824,7 +925,11 @@ impl MetalContext {
             "ModernBERT MPSGraph forward failed: {}",
             metal_error()
         );
-        hidden_states.copy_from_slice(&output);
+        if f16 {
+            hidden_states.copy_from_slice(&decode_f16_bits(&output_f16));
+        } else {
+            hidden_states.copy_from_slice(&output_f32);
+        }
         Ok(())
     }
 }
@@ -839,12 +944,12 @@ impl Drop for MetalContext {
 #[cfg(target_os = "macos")]
 #[repr(C)]
 struct ModernBertLayerParams {
-    qkv_weight: *const f32,
-    attention_output_weight: *const f32,
-    attention_norm_weight: *const f32,
-    mlp_input_weight: *const f32,
-    mlp_output_weight: *const f32,
-    mlp_norm_weight: *const f32,
+    qkv_weight: *const std::ffi::c_void,
+    attention_output_weight: *const std::ffi::c_void,
+    attention_norm_weight: *const std::ffi::c_void,
+    mlp_input_weight: *const std::ffi::c_void,
+    mlp_output_weight: *const std::ffi::c_void,
+    mlp_norm_weight: *const std::ffi::c_void,
     attention_type: i32,
 }
 
@@ -876,7 +981,10 @@ unsafe extern "C" {
         intermediate: u64,
         layers: u64,
         epsilon: f32,
-        input: *const f32,
+        dtype: i32,
+        explicit_execution: i32,
+        package_path: *const std::ffi::c_char,
+        input: *const std::ffi::c_void,
         full_mask: *const f32,
         local_mask: *const f32,
         global_cos: *const f32,
@@ -885,7 +993,7 @@ unsafe extern "C" {
         local_sin: *const f32,
         final_norm: *const f32,
         layer_params: *const ModernBertLayerParams,
-        output: *mut f32,
+        output: *mut std::ffi::c_void,
     ) -> i32;
 }
 
@@ -894,7 +1002,7 @@ struct MetalContext;
 
 #[cfg(not(target_os = "macos"))]
 impl MetalContext {
-    fn new() -> Result<Self> {
+    fn new(_precision: Precision, _execution: super::MetalExecutionConfig) -> Result<Self> {
         bail!("ModernBERT Metal MPSGraph is only available on macOS")
     }
 
