@@ -7,6 +7,10 @@ license.workspace = true
 description = "Spike C: owned unified tensor runtime for all-MiniLM-L6-v2 embeddings"
 publish = false
 
+[features]
+default = []
+cuda = []
+
 [dependencies]
 anyhow = { workspace = true }
 serde = { workspace = true }

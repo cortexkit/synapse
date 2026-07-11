@@ -7,10 +7,11 @@ use anyhow::{bail, ensure, Context, Result};
 use serde::Deserialize;
 use tokenizers::{Tokenizer, TruncationParams};
 
+#[cfg(target_os = "macos")]
+use super::{decode_f16_bits, encode_f16_bits, Execution};
 use super::{
-    decode_f16_bits, encode_f16_bits, get_tensor, load_safetensor_map, normalize_l2,
-    resolve_model_root, BLayout, BlockForwardRequest, Execution, KernelProvider,
-    MetalExecutionConfig, ModelFamily, Precision, Tensor,
+    get_tensor, load_safetensor_map, normalize_l2, resolve_model_root, BLayout, BlockBackend,
+    BlockForwardRequest, KernelProvider, MetalExecutionConfig, ModelFamily, Precision, Tensor,
 };
 
 #[derive(Clone, Deserialize)]
@@ -636,6 +637,7 @@ impl ModelFamily for ModernBertModel {
 fn new_block_context(
     precision: Precision,
     execution: MetalExecutionConfig,
+    _backend: BlockBackend,
 ) -> Result<Box<dyn Any>> {
     Ok(Box::new(MetalContext::new(precision, execution)?))
 }
@@ -891,11 +893,13 @@ impl MetalContext {
     }
 }
 
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
 struct AdditiveMasks {
     full: Vec<f32>,
     local: Vec<f32>,
 }
 
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
 fn band_mask(seq: usize, half_window: usize) -> Vec<f32> {
     let mut band = vec![0.0; seq * seq];
     for query in 0..seq {
@@ -908,6 +912,7 @@ fn band_mask(seq: usize, half_window: usize) -> Vec<f32> {
     band
 }
 
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
 fn additive_masks_with_band(mask: &[u8], batch: usize, seq: usize, band: &[f32]) -> AdditiveMasks {
     debug_assert_eq!(band.len(), seq * seq);
     let mut full = vec![0.0; batch * seq * seq];
@@ -934,6 +939,7 @@ fn additive_masks(mask: &[u8], batch: usize, seq: usize, half_window: usize) -> 
     additive_masks_with_band(mask, batch, seq, &band_mask(seq, half_window))
 }
 
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
 fn rope_tables(seq: usize, head_dim: usize, theta: f32) -> (Vec<f32>, Vec<f32>) {
     let half = head_dim / 2;
     let mut cos = vec![0.0; seq * head_dim];
