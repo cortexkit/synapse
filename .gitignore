@@ -1,3 +1,4 @@
 /target
 bench/results/
 bench/data/*.jsonl
+.cortexkit/alfonso/task-outputs/
