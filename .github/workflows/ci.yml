@@ -23,7 +23,11 @@ jobs:
           - name: windows
             runner: blacksmith-4vcpu-windows-2025
           - name: macos-metal
-            runner: macos-14
+            # Temporary self-hosted M1 Max runner (GitHub-hosted macos-14 is
+            # blocked on org billing; permanent home will be the rented rig).
+            # The box doubles as the Lane 2 bench machine: CI jobs are
+            # correctness-only there, timed benches take the mkdir bench lock.
+            runner: [self-hosted, macos-metal]
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
     steps:
