@@ -32,6 +32,12 @@ pub enum TokenizationError {
 pub struct TokenizedItem {
     pub ids: TokenIds,
     pub disclosure: TruncationDisclosure,
+    /// The exact text the vector will represent. Equal to the submitted text
+    /// unless token-level truncation dropped content, in which case it is the
+    /// decode of the kept tokens. Consumers compare its hash against their own
+    /// stored-content hash as a divergence detector, so a truncated item must
+    /// hash differently from the full submitted text.
+    pub embedded_text: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,6 +45,7 @@ pub struct TokenizedBatch {
     pub batch: TokenBatch,
     pub disclosures: Vec<TruncationDisclosure>,
     pub real_token_counts: Vec<u32>,
+    pub embedded_texts: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -126,10 +133,12 @@ impl SanitizedTokenizer {
             .iter()
             .map(|disclosure| disclosure.effective_tokens)
             .collect();
+        let embedded_texts = items.into_iter().map(|item| item.embedded_text).collect();
         Ok(TokenizedBatch {
             batch,
             disclosures,
             real_token_counts,
+            embedded_texts,
         })
     }
 
@@ -152,8 +161,19 @@ impl SanitizedTokenizer {
             ids.truncate(self.max_tokens);
         }
         let effective_tokens = ids.len();
+        let embedded_text = if effective_tokens < submitted_tokens {
+            self.tokenizer
+                .decode(&ids, true)
+                .map_err(|error| TokenizationError::Encode {
+                    index,
+                    message: format!("decode truncated ids: {error}"),
+                })?
+        } else {
+            text.to_string()
+        };
         Ok(TokenizedItem {
             ids,
+            embedded_text,
             disclosure: TruncationDisclosure {
                 submitted_tokens: submitted_tokens.min(u32::MAX as usize) as u32,
                 effective_tokens: effective_tokens.min(u32::MAX as usize) as u32,
@@ -210,6 +230,14 @@ mod tests {
                 effective_tokens: 3,
                 truncated: true,
             }
+        );
+        assert_eq!(
+            tokenized.embedded_texts[0], "a b",
+            "untruncated items must carry the submitted text verbatim"
+        );
+        assert_eq!(
+            tokenized.embedded_texts[1], "a b c",
+            "truncated items must carry the decode of the kept tokens, not the submitted text"
         );
     }
 

@@ -598,6 +598,7 @@ enum EmbedBackend {
 struct EmbedVector {
     id: String,
     vector: Vec<f32>,
+    content_sha256: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -4388,7 +4389,12 @@ fn embed_result_pages(
     let response_vectors = ids
         .into_iter()
         .zip(vectors)
-        .map(|(id, vector)| EmbedVector { id, vector })
+        .zip(&tokenized.embedded_texts)
+        .map(|((id, vector), text)| EmbedVector {
+            id,
+            vector,
+            content_sha256: sha256_text(text),
+        })
         .collect::<Vec<_>>();
     let page_ranges = page_ranges(
         &response_vectors,
@@ -4692,7 +4698,12 @@ async fn embed_tokenized(
     let response_vectors = ids
         .into_iter()
         .zip(vectors)
-        .map(|(id, vector)| EmbedVector { id, vector })
+        .zip(&tokenized.embedded_texts)
+        .map(|((id, vector), text)| EmbedVector {
+            id,
+            vector,
+            content_sha256: sha256_text(text),
+        })
         .collect::<Vec<_>>();
     let payload = EmbedResponsePayload {
         vectors: response_vectors,
