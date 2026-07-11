@@ -9,15 +9,17 @@ use clap::{Parser, ValueEnum};
 use safetensors::tensor::{Dtype as SafeDtype, SafeTensors};
 use serde::Deserialize;
 use synapse_bench::{
-    parity::{load_corpus, load_reference, mean_parity, Chunk},
+    parity::{load_corpus, load_reference, mean_parity, rank_overlap, Chunk},
     results::LaneResult,
 };
 use tokenizers::{Tokenizer, TruncationParams};
 
+mod qwen3;
+
 #[derive(Parser)]
 #[command(name = "spike-unified-rt")]
 struct Args {
-    /// Path to a MiniLM safetensors file or snapshot directory.
+    /// Path to a MiniLM or Qwen3 safetensors file or snapshot directory.
     #[arg(long)]
     model: PathBuf,
     /// Path to tokenizer.json.
@@ -41,6 +43,9 @@ struct Args {
     /// Minimum mean cosine when --reference is supplied.
     #[arg(long, default_value_t = 0.9999)]
     min_parity: f64,
+    /// Minimum mean top-10 neighbor overlap when --reference is supplied.
+    #[arg(long, default_value_t = 0.995)]
+    min_rank_overlap: f64,
     /// Kernel provider to use.
     #[arg(long, value_enum, default_value_t = DeviceArg::Cpu)]
     device: DeviceArg,
@@ -87,7 +92,11 @@ fn main() -> Result<()> {
     );
     let started = Instant::now();
 
-    let model = BertModel::load(&args.model, args.dtype)?;
+    let model = RuntimeModel::load(&args.model, args.dtype)?;
+    ensure!(
+        !(model.is_qwen3() && matches!(args.dtype, Precision::F16)),
+        "Qwen3 is fp32-only in this spike; f16 is intentionally out of scope"
+    );
     let mut tokenizer = Tokenizer::from_file(&args.tokenizer)
         .map_err(|error| anyhow::anyhow!("tokenizer: {error}"))?;
     tokenizer
@@ -98,18 +107,14 @@ fn main() -> Result<()> {
         .map_err(|error| anyhow::anyhow!("truncation: {error}"))?;
 
     let mut provider = make_provider(args.device, args.dtype)?;
-    let _ = model.embed_batch(provider.as_mut(), &tokenizer, &["warmup"])?;
+    let _ = model.embed_batch(provider.as_mut(), &tokenizer, &["warmup"], args.max_length)?;
     let cold_load_s = started.elapsed().as_secs_f64();
 
     let chunks: Vec<Chunk> = load_corpus(&args.corpus, args.limit)?;
-    let all_texts: Vec<&str> = chunks.iter().map(|chunk| chunk.text.as_str()).collect();
-    let encodings = tokenizer
-        .encode_batch(all_texts, true)
-        .map_err(|error| anyhow::anyhow!("encode_batch: {error}"))?;
-    let lengths: Vec<usize> = encodings
+    let lengths = chunks
         .iter()
-        .map(|encoding| encoding.get_ids().len())
-        .collect();
+        .map(|chunk| model.token_length(&tokenizer, &chunk.text, args.max_length))
+        .collect::<Result<Vec<_>>>()?;
 
     let mut order: Vec<usize> = (0..chunks.len()).collect();
     order.sort_by_key(|&index| lengths[index]);
@@ -136,7 +141,8 @@ fn main() -> Result<()> {
                 .iter()
                 .map(|&index| chunks[index].text.as_str())
                 .collect();
-            let vectors = model.embed_batch(provider.as_mut(), &tokenizer, &batch_texts)?;
+            let vectors =
+                model.embed_batch(provider.as_mut(), &tokenizer, &batch_texts, args.max_length)?;
             for (offset, vector) in vectors.into_iter().enumerate() {
                 let original_index = batch_indices[offset];
                 input_tokens += lengths[original_index] as u64;
@@ -170,10 +176,19 @@ fn main() -> Result<()> {
                 &reference,
             );
             let mean = mean.context("no overlapping ids with parity reference")?;
-            ensure!(
-                mean >= args.min_parity,
-                "mean parity {mean:.8} below minimum {:.8} over {matched} vectors",
-                args.min_parity
+            let produced: HashMap<String, Vec<f32>> = produced_vectors.iter().cloned().collect();
+            let ranks = rank_overlap(&produced, &reference, 10, 1)?;
+            enforce_parity_gates(
+                mean,
+                ranks.mean_topk_overlap,
+                args.min_parity,
+                args.min_rank_overlap,
+                matched,
+                ranks.queries,
+            )?;
+            eprintln!(
+                "parity gate: mean cosine {mean:.8}, top-10 rank overlap {:.6}",
+                ranks.mean_topk_overlap
             );
             Some(mean)
         }
@@ -185,7 +200,7 @@ fn main() -> Result<()> {
         workload: "embed-corpus-v1".into(),
         model: args
             .model_label
-            .unwrap_or_else(|| format!("all-MiniLM-L6-v2@owned-rt-{}", args.dtype.as_str())),
+            .unwrap_or_else(|| model.default_label(args.dtype)),
         cold_load_s,
         infer_wall_s,
         input_tokens,
@@ -194,7 +209,8 @@ fn main() -> Result<()> {
         parity_mean_cosine,
         self_peak_rss_bytes: None,
         notes: format!(
-            "direct BERT encoder, provider={}, dtype={}, length-sorted attention_units={}, max_len={}, mean_pool+l2 on CPU; providers may override the encoder block, and the Metal provider keeps encoder-layer hidden states resident inside one MPSGraph per batch shape",
+            "{}, provider={}, dtype={}, length-sorted attention_units={}, max_len={}; providers may override the model-family block, and Metal keeps block hidden states resident inside one MPSGraph per batch shape",
+            model.notes(),
             provider.name(),
             args.dtype.as_str(),
             args.attention_units,
@@ -212,6 +228,102 @@ fn main() -> Result<()> {
     );
     println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
+}
+
+fn enforce_parity_gates(
+    mean_cosine: f64,
+    mean_top10_overlap: f64,
+    min_cosine: f64,
+    min_top10_overlap: f64,
+    matched: usize,
+    queries: usize,
+) -> Result<()> {
+    ensure!(
+        mean_cosine >= min_cosine,
+        "mean parity {mean_cosine:.8} below minimum {min_cosine:.8} over {matched} vectors"
+    );
+    ensure!(
+        mean_top10_overlap >= min_top10_overlap,
+        "mean top-10 rank overlap {mean_top10_overlap:.6} below minimum {min_top10_overlap:.6} over {queries} queries"
+    );
+    Ok(())
+}
+
+enum RuntimeModel {
+    Bert(BertModel),
+    Qwen3(qwen3::Model),
+}
+
+impl RuntimeModel {
+    fn load(path: &Path, precision: Precision) -> Result<Self> {
+        let root = resolve_model_root(path)?;
+        let config_path = root.join("config.json");
+        let config: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(&config_path)
+                .with_context(|| format!("read config {}", config_path.display()))?,
+        )
+        .with_context(|| format!("parse config {}", config_path.display()))?;
+        let model_type = config
+            .get("model_type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let is_qwen3 = model_type.starts_with("qwen3")
+            || config
+                .get("architectures")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|architectures| {
+                    architectures.iter().any(|name| {
+                        name.as_str()
+                            .is_some_and(|name| name.to_ascii_lowercase().contains("qwen3"))
+                    })
+                });
+        if is_qwen3 {
+            Ok(Self::Qwen3(qwen3::Model::load(path)?))
+        } else {
+            Ok(Self::Bert(BertModel::load(path, precision)?))
+        }
+    }
+
+    fn is_qwen3(&self) -> bool {
+        matches!(self, Self::Qwen3(_))
+    }
+
+    fn token_length(&self, tokenizer: &Tokenizer, text: &str, max_length: usize) -> Result<usize> {
+        match self {
+            Self::Bert(_) => tokenizer
+                .encode(text, true)
+                .map(|encoding| encoding.get_ids().len())
+                .map_err(|error| anyhow::anyhow!("encode: {error}")),
+            Self::Qwen3(model) => Ok(model.encode(tokenizer, text, max_length)?.len()),
+        }
+    }
+
+    fn embed_batch(
+        &self,
+        provider: &mut dyn KernelProvider,
+        tokenizer: &Tokenizer,
+        texts: &[&str],
+        max_length: usize,
+    ) -> Result<Vec<Vec<f32>>> {
+        match self {
+            Self::Bert(model) => model.embed_batch(provider, tokenizer, texts),
+            Self::Qwen3(model) => model.embed_batch(provider, tokenizer, texts, max_length),
+        }
+    }
+
+    fn default_label(&self, precision: Precision) -> String {
+        match self {
+            Self::Bert(_) => format!("all-MiniLM-L6-v2@owned-rt-{}", precision.as_str()),
+            Self::Qwen3(model) => model.default_label().to_string(),
+        }
+    }
+
+    fn notes(&self) -> String {
+        match self {
+            Self::Bert(_) => "direct BERT encoder, mean pool+l2 on CPU".to_string(),
+            Self::Qwen3(model) => model.notes(),
+        }
+    }
 }
 
 fn make_provider(device: DeviceArg, dtype: Precision) -> Result<Box<dyn KernelProvider>> {
@@ -276,6 +388,33 @@ trait KernelProvider {
         _layers: &[EncoderLayer],
     ) -> Result<bool> {
         Ok(false)
+    }
+
+    // Block-resident graphs are model-shaped by nature. During this spike the
+    // provider surface is deliberately additive per family; a general graph
+    // abstraction will be extracted from MiniLM, ModernBERT, and Qwen3 evidence
+    // instead of guessed before those three concrete implementations exist.
+    #[allow(clippy::too_many_arguments)]
+    fn qwen3_forward(
+        &mut self,
+        _hidden_states: &mut [f32],
+        _attention_mask: &[u8],
+        _batch: usize,
+        _seq: usize,
+        _hidden: usize,
+        _query_heads: usize,
+        _kv_heads: usize,
+        _head_dim: usize,
+        _intermediate: usize,
+        _rms_norm_eps: f32,
+        _rope_theta: f32,
+        _layers: &[qwen3::Layer],
+        _final_norm: &qwen3::RmsNorm,
+    ) -> Result<bool> {
+        bail!(
+            "Qwen3 block graph is unsupported by provider {}",
+            self.name()
+        )
     }
 
     fn layer_norm(
@@ -345,10 +484,31 @@ impl KernelProvider for CpuProvider {
         matmul_impl(m, n, k, a, b, b_layout, c);
         Ok(())
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn qwen3_forward(
+        &mut self,
+        _hidden_states: &mut [f32],
+        _attention_mask: &[u8],
+        _batch: usize,
+        _seq: usize,
+        _hidden: usize,
+        _query_heads: usize,
+        _kv_heads: usize,
+        _head_dim: usize,
+        _intermediate: usize,
+        _rms_norm_eps: f32,
+        _rope_theta: f32,
+        _layers: &[qwen3::Layer],
+        _final_norm: &qwen3::RmsNorm,
+    ) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 struct MetalProvider {
     context: metal_backend::MpsGraphContext,
+    qwen3_context: Option<qwen3::MetalContext>,
     dtype: Precision,
 }
 
@@ -356,6 +516,7 @@ impl MetalProvider {
     fn new(dtype: Precision) -> Result<Self> {
         Ok(Self {
             context: metal_backend::MpsGraphContext::new()?,
+            qwen3_context: None,
             dtype,
         })
     }
@@ -436,6 +597,51 @@ impl KernelProvider for MetalProvider {
             layers,
             self.dtype,
         )?;
+        Ok(true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn qwen3_forward(
+        &mut self,
+        hidden_states: &mut [f32],
+        attention_mask: &[u8],
+        batch: usize,
+        seq: usize,
+        hidden: usize,
+        query_heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        intermediate: usize,
+        rms_norm_eps: f32,
+        rope_theta: f32,
+        layers: &[qwen3::Layer],
+        final_norm: &qwen3::RmsNorm,
+    ) -> Result<bool> {
+        ensure!(
+            matches!(self.dtype, Precision::F32),
+            "Qwen3 Metal graph supports fp32 only"
+        );
+        if self.qwen3_context.is_none() {
+            self.qwen3_context = Some(qwen3::MetalContext::new()?);
+        }
+        self.qwen3_context
+            .as_mut()
+            .expect("Qwen3 context initialized above")
+            .forward(
+                hidden_states,
+                attention_mask,
+                batch,
+                seq,
+                hidden,
+                query_heads,
+                kv_heads,
+                head_dim,
+                intermediate,
+                rms_norm_eps,
+                rope_theta,
+                layers,
+                final_norm,
+            )?;
         Ok(true)
     }
 }
@@ -1789,6 +1995,14 @@ fn get_tensor(tensors: &HashMap<String, Tensor>, base_name: &str) -> Result<Tens
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qwen3_parity_gate_enforces_certification_thresholds() {
+        enforce_parity_gates(0.9999, 0.995, 0.9999, 0.995, 400, 400)
+            .expect("Qwen3 certification boundary must pass");
+        assert!(enforce_parity_gates(0.99989, 1.0, 0.9999, 0.995, 400, 400).is_err());
+        assert!(enforce_parity_gates(1.0, 0.9949, 0.9999, 0.995, 400, 400).is_err());
+    }
 
     fn assert_close(actual: &[f32], expected: &[f32]) {
         assert_close_with_tolerance(actual, expected, 1e-3);
