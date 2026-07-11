@@ -12,7 +12,7 @@ use serde::Deserialize;
 use tokenizers::Tokenizer;
 
 use super::{
-    get_tensor, load_safetensor_map, normalize_l2, resolve_model_root, BLayout,
+    get_tensor, load_safetensor_map, normalize_l2, resolve_model_root, BLayout, BlockBackend,
     BlockForwardRequest, KernelProvider, MetalExecutionConfig, ModelFamily, Precision, Tensor,
 };
 
@@ -335,6 +335,7 @@ pub(super) fn load_family(path: &Path, precision: Precision) -> Result<Box<dyn M
 fn new_block_context(
     precision: Precision,
     execution: MetalExecutionConfig,
+    _backend: BlockBackend,
 ) -> Result<Box<dyn Any>> {
     Ok(Box::new(MetalContext::new(precision, execution)?))
 }

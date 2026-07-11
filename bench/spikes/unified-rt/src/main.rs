@@ -15,6 +15,7 @@ use synapse_bench::{
 };
 use tokenizers::{Tokenizer, TruncationParams};
 
+mod cuda_backend;
 mod modernbert;
 mod qwen3;
 
@@ -51,9 +52,12 @@ struct Args {
     /// Kernel provider to use.
     #[arg(long, value_enum, default_value_t = DeviceArg::Cpu)]
     device: DeviceArg,
-    /// Precision for the Metal resident encoder path.
+    /// Precision for the resident encoder path.
     #[arg(long, value_enum, default_value_t = Precision::F32)]
     dtype: Precision,
+    /// Launch the CUDA encoder through a per-shape CUDA Graph.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    cuda_graphs: bool,
     /// Metal graph execution strategy. Explicit O0 compilation is the serving default.
     #[arg(long, value_enum, default_value_t = Execution::Explicit)]
     execution: Execution,
@@ -75,6 +79,7 @@ struct Args {
 enum DeviceArg {
     Cpu,
     Metal,
+    Cuda,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug, ValueEnum)]
@@ -93,7 +98,9 @@ const GRAPH_REVISION: u32 = 2;
 
 #[derive(Clone, Debug)]
 struct MetalExecutionConfig {
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     execution: Execution,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     package_root: Option<PathBuf>,
 }
 
@@ -129,6 +136,7 @@ impl MetalExecutionConfig {
         })
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn package_path(&self, batch: usize, seq: usize) -> Option<PathBuf> {
         self.package_root
             .as_ref()
@@ -159,9 +167,9 @@ fn main() -> Result<()> {
     model.configure_tokenizer(&mut tokenizer, args.max_length)?;
 
     let execution = MetalExecutionConfig::from_args(&args, model.family_name())?;
-    let mut provider = make_provider(args.device, args.dtype, execution)?;
+    let mut provider = make_provider(args.device, args.dtype, execution, args.cuda_graphs)?;
     let _ = model.embed_batch(provider.as_mut(), &tokenizer, &["warmup"], args.max_length)?;
-    let cold_load_s = started.elapsed().as_secs_f64();
+    let initial_cold_load_s = started.elapsed().as_secs_f64();
 
     let chunks: Vec<Chunk> = load_corpus(&args.corpus, args.limit)?;
     let lengths = chunks
@@ -171,47 +179,41 @@ fn main() -> Result<()> {
 
     let mut order: Vec<usize> = (0..chunks.len()).collect();
     order.sort_by_key(|&index| lengths[index]);
+    let batch_ranges = batch_ranges(&order, &lengths, args.attention_units);
+    if provider.eager_shape_preload() {
+        for range in &batch_ranges {
+            let texts = order[range.clone()]
+                .iter()
+                .map(|&index| chunks[index].text.as_str())
+                .collect::<Vec<_>>();
+            let _ = model.embed_batch(provider.as_mut(), &tokenizer, &texts, args.max_length)?;
+        }
+    }
+    let cold_load_s = if provider.eager_shape_preload() {
+        started.elapsed().as_secs_f64()
+    } else {
+        initial_cold_load_s
+    };
 
     let infer_started = Instant::now();
     let mut input_tokens = 0u64;
     let mut items = 0u64;
     let mut produced_vectors: Vec<(String, Vec<f32>)> = Vec::with_capacity(chunks.len());
 
-    let mut batch_start = 0usize;
-    let mut batch_max_len = 0usize;
-    let mut idx = 0usize;
-    while idx <= order.len() {
-        let flush = if idx == order.len() {
-            idx > batch_start
-        } else {
-            let candidate_max = batch_max_len.max(lengths[order[idx]]);
-            let count = idx - batch_start;
-            count > 0 && (count + 1) * candidate_max * candidate_max > args.attention_units
-        };
-        if flush {
-            let batch_indices = &order[batch_start..idx];
-            let batch_texts: Vec<&str> = batch_indices
-                .iter()
-                .map(|&index| chunks[index].text.as_str())
-                .collect();
-            let vectors =
-                model.embed_batch(provider.as_mut(), &tokenizer, &batch_texts, args.max_length)?;
-            for (offset, vector) in vectors.into_iter().enumerate() {
-                let original_index = batch_indices[offset];
-                input_tokens += lengths[original_index] as u64;
-                items += 1;
-                produced_vectors.push((chunks[original_index].id.clone(), vector));
-            }
-            batch_start = idx;
-            batch_max_len = 0;
-            if idx == order.len() {
-                break;
-            }
+    for range in batch_ranges {
+        let batch_indices = &order[range];
+        let batch_texts = batch_indices
+            .iter()
+            .map(|&index| chunks[index].text.as_str())
+            .collect::<Vec<_>>();
+        let vectors =
+            model.embed_batch(provider.as_mut(), &tokenizer, &batch_texts, args.max_length)?;
+        for (offset, vector) in vectors.into_iter().enumerate() {
+            let original_index = batch_indices[offset];
+            input_tokens += lengths[original_index] as u64;
+            items += 1;
+            produced_vectors.push((chunks[original_index].id.clone(), vector));
         }
-        if idx < order.len() {
-            batch_max_len = batch_max_len.max(lengths[order[idx]]);
-        }
-        idx += 1;
     }
     let infer_wall_s = infer_started.elapsed().as_secs_f64();
 
@@ -263,7 +265,7 @@ fn main() -> Result<()> {
         parity_mean_cosine,
         self_peak_rss_bytes: None,
         notes: format!(
-            "{}, provider={}, dtype={}, execution={:?}, package_cache={}, length-sorted attention_units={}, max_len={}; providers may override the model-family block, and Metal keeps block hidden states resident inside one MPSGraph per batch shape",
+            "{}, provider={}, dtype={}, execution={:?}, package_cache={}, length-sorted attention_units={}, max_len={}; providers may override the model-family block; Metal uses one resident MPSGraph and CUDA one stable-address graph instance per exact batch shape",
             model.notes(),
             provider.name(),
             args.dtype.as_str(),
@@ -384,11 +386,37 @@ fn make_provider(
     device: DeviceArg,
     dtype: Precision,
     execution: MetalExecutionConfig,
+    cuda_graphs: bool,
 ) -> Result<Box<dyn KernelProvider>> {
     match device {
         DeviceArg::Cpu => Ok(Box::new(CpuProvider)),
         DeviceArg::Metal => Ok(Box::new(MetalProvider::new_with_config(dtype, execution)?)),
+        DeviceArg::Cuda => Ok(Box::new(CudaProvider::new(dtype, execution, cuda_graphs)?)),
     }
+}
+
+fn batch_ranges(
+    order: &[usize],
+    lengths: &[usize],
+    attention_units: usize,
+) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    let mut max_len = 0usize;
+    for index in 0..order.len() {
+        let candidate_max = max_len.max(lengths[order[index]]);
+        let count = index - start;
+        if count > 0 && (count + 1) * candidate_max * candidate_max > attention_units {
+            ranges.push(start..index);
+            start = index;
+            max_len = 0;
+        }
+        max_len = max_len.max(lengths[order[index]]);
+    }
+    if start < order.len() {
+        ranges.push(start..order.len());
+    }
+    ranges
 }
 
 fn write_vectors(path: &Path, vectors: &[(String, Vec<f32>)]) -> Result<()> {
@@ -404,7 +432,14 @@ fn write_vectors(path: &Path, vectors: &[(String, Vec<f32>)]) -> Result<()> {
     Ok(())
 }
 
-type BlockContextFactory = fn(Precision, MetalExecutionConfig) -> Result<Box<dyn Any>>;
+#[derive(Copy, Clone)]
+enum BlockBackend {
+    Metal,
+    Cuda { graphs: bool },
+}
+
+type BlockContextFactory =
+    fn(Precision, MetalExecutionConfig, BlockBackend) -> Result<Box<dyn Any>>;
 
 /// A block request keeps family-specific graph inputs inside the family while the
 /// provider owns context lifetime and reuse. Because embedding graphs have different
@@ -447,6 +482,14 @@ trait KernelProvider {
 
     fn block_forward(&mut self, _request: BlockForwardRequest<'_>) -> Result<bool> {
         Ok(false)
+    }
+
+    fn eager_shape_preload(&self) -> bool {
+        false
+    }
+
+    fn take_pooled_output(&mut self) -> Option<Vec<Vec<f32>>> {
+        None
     }
 
     fn layer_norm(
@@ -547,6 +590,87 @@ impl MetalProvider {
     }
 }
 
+struct CudaProvider {
+    block_contexts: HashMap<&'static str, Box<dyn Any>>,
+    dtype: Precision,
+    execution: MetalExecutionConfig,
+    graphs: bool,
+}
+
+impl CudaProvider {
+    fn new(dtype: Precision, execution: MetalExecutionConfig, graphs: bool) -> Result<Self> {
+        ensure!(
+            matches!(dtype, Precision::F16),
+            "CUDA day-1 supports only --dtype f16"
+        );
+        cuda_backend::ensure_available()?;
+        Ok(Self {
+            block_contexts: HashMap::new(),
+            dtype,
+            execution,
+            graphs,
+        })
+    }
+}
+
+impl KernelProvider for CudaProvider {
+    fn name(&self) -> &'static str {
+        if self.graphs {
+            "cuda-cublaslt-minilm-f16-graph"
+        } else {
+            "cuda-cublaslt-minilm-f16-uncaptured"
+        }
+    }
+
+    fn matmul(
+        &mut self,
+        _m: usize,
+        _n: usize,
+        _k: usize,
+        _a: &[f32],
+        _b: &[f32],
+        _b_layout: BLayout,
+        _c: &mut [f32],
+    ) -> Result<()> {
+        bail!("CUDA day-1 requires the MiniLM resident block path")
+    }
+
+    fn block_forward(&mut self, request: BlockForwardRequest<'_>) -> Result<bool> {
+        ensure!(
+            request.family == "minilm",
+            "CUDA day-1 supports only MiniLM, got {}",
+            request.family
+        );
+        if !self.block_contexts.contains_key(request.family) {
+            let context = (request.create_context)(
+                self.dtype,
+                self.execution.clone(),
+                BlockBackend::Cuda {
+                    graphs: self.graphs,
+                },
+            )?;
+            self.block_contexts.insert(request.family, context);
+        }
+        let context = self
+            .block_contexts
+            .get_mut(request.family)
+            .expect("block context inserted above");
+        (request.run)(context.as_mut())?;
+        Ok(true)
+    }
+
+    fn eager_shape_preload(&self) -> bool {
+        true
+    }
+
+    fn take_pooled_output(&mut self) -> Option<Vec<Vec<f32>>> {
+        self.block_contexts
+            .get_mut("minilm")
+            .and_then(|context| context.downcast_mut::<MiniLmBlockContext>())
+            .and_then(|context| context.last_pooled.take())
+    }
+}
+
 impl KernelProvider for MetalProvider {
     fn name(&self) -> &'static str {
         match self.dtype {
@@ -591,7 +715,8 @@ impl KernelProvider for MetalProvider {
 
     fn block_forward(&mut self, request: BlockForwardRequest<'_>) -> Result<bool> {
         if !self.block_contexts.contains_key(request.family) {
-            let context = (request.create_context)(self.dtype, self.execution.clone())?;
+            let context =
+                (request.create_context)(self.dtype, self.execution.clone(), BlockBackend::Metal)?;
             self.block_contexts.insert(request.family, context);
         }
         let context = self
@@ -1070,6 +1195,7 @@ mod metal_backend {
             bail!("Metal MPSGraph provider is only available on macOS")
         }
 
+        #[allow(clippy::too_many_arguments)]
         pub fn matmul(
             &mut self,
             _m: usize,
@@ -1236,6 +1362,7 @@ impl ParamVector {
         }
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn metal_f16_bits(&self) -> Result<&[u16]> {
         self.metal_f16_bits
             .as_deref()
@@ -1282,6 +1409,7 @@ impl Tensor {
         }
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn metal_f16_bits(&self) -> Result<&[u16]> {
         self.metal_f16_bits
             .as_deref()
@@ -1338,6 +1466,7 @@ fn encode_f16_bits(values: &[f32]) -> Vec<u16> {
         .collect()
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn decode_f16_bits(values: &[u16]) -> Vec<f32> {
     values
         .iter()
@@ -1562,6 +1691,16 @@ impl BertModel {
         }
 
         let hidden = self.forward(provider, &input_ids, &attention_mask, batch, seq)?;
+        if let Some(pooled) = provider.take_pooled_output() {
+            ensure!(
+                pooled.len() == batch
+                    && pooled
+                        .iter()
+                        .all(|row| row.len() == self.config.hidden_size),
+                "provider returned pooled vectors with the wrong shape"
+            );
+            return Ok(pooled);
+        }
         Ok(mean_pool_l2(
             &hidden,
             &attention_mask,
@@ -1616,7 +1755,7 @@ impl BertModel {
             let context = context
                 .downcast_mut::<MiniLmBlockContext>()
                 .context("MiniLM provider returned the wrong block context type")?;
-            context.graph.encoder_forward(
+            context.last_pooled = context.graph.encoder_forward(
                 &mut x.data,
                 attention_mask,
                 batch,
@@ -1627,7 +1766,8 @@ impl BertModel {
                 self.config.layer_norm_eps,
                 &self.layers,
                 context.precision,
-            )
+            )?;
+            Ok(())
         };
         if provider.block_forward(BlockForwardRequest {
             family: self.family_name(),
@@ -1680,23 +1820,86 @@ impl ModelFamily for BertModel {
     }
 
     fn notes(&self) -> String {
-        "direct BERT encoder, mean pool+l2 on CPU".to_owned()
+        "direct BERT encoder, provider-selected mean pool+l2".to_owned()
     }
 }
 
 fn new_minilm_block_context(
     precision: Precision,
     execution: MetalExecutionConfig,
+    backend: BlockBackend,
 ) -> Result<Box<dyn Any>> {
+    let graph = match backend {
+        BlockBackend::Metal => {
+            MiniLmBlockGraph::Metal(metal_backend::MpsGraphContext::new_with_config(execution)?)
+        }
+        BlockBackend::Cuda { graphs } => {
+            MiniLmBlockGraph::Cuda(cuda_backend::CudaContext::new(graphs)?)
+        }
+    };
     Ok(Box::new(MiniLmBlockContext {
-        graph: metal_backend::MpsGraphContext::new_with_config(execution)?,
+        graph,
         precision,
+        last_pooled: None,
     }))
 }
 
+enum MiniLmBlockGraph {
+    Metal(metal_backend::MpsGraphContext),
+    Cuda(cuda_backend::CudaContext),
+}
+
+impl MiniLmBlockGraph {
+    #[allow(clippy::too_many_arguments)]
+    fn encoder_forward(
+        &mut self,
+        hidden_states: &mut [f32],
+        attention_mask: &[u8],
+        batch: usize,
+        seq: usize,
+        hidden: usize,
+        heads: usize,
+        intermediate: usize,
+        layer_norm_eps: f32,
+        layers: &[EncoderLayer],
+        precision: Precision,
+    ) -> Result<Option<Vec<Vec<f32>>>> {
+        match self {
+            Self::Metal(graph) => graph
+                .encoder_forward(
+                    hidden_states,
+                    attention_mask,
+                    batch,
+                    seq,
+                    hidden,
+                    heads,
+                    intermediate,
+                    layer_norm_eps,
+                    layers,
+                    precision,
+                )
+                .map(|()| None),
+            Self::Cuda(graph) => graph
+                .encoder_forward(
+                    hidden_states,
+                    attention_mask,
+                    batch,
+                    seq,
+                    hidden,
+                    heads,
+                    intermediate,
+                    layer_norm_eps,
+                    layers,
+                )
+                .map(Some),
+        }
+    }
+}
+
 struct MiniLmBlockContext {
-    graph: metal_backend::MpsGraphContext,
+    graph: MiniLmBlockGraph,
     precision: Precision,
+    last_pooled: Option<Vec<Vec<f32>>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2241,7 +2444,7 @@ mod tests {
             let context = context
                 .downcast_mut::<MiniLmBlockContext>()
                 .context("test provider returned the wrong MiniLM context")?;
-            context.graph.encoder_forward(
+            context.last_pooled = context.graph.encoder_forward(
                 hidden_states,
                 attention_mask,
                 batch,
@@ -2252,7 +2455,8 @@ mod tests {
                 1e-12,
                 layers,
                 context.precision,
-            )
+            )?;
+            Ok(())
         };
         provider.block_forward(BlockForwardRequest {
             family: "minilm",
