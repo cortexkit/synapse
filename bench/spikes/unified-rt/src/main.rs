@@ -14,6 +14,7 @@ use synapse_bench::{
 };
 use tokenizers::{Tokenizer, TruncationParams};
 
+mod modernbert;
 mod qwen3;
 
 #[derive(Parser)]
@@ -90,6 +91,10 @@ fn main() -> Result<()> {
         !(matches!(args.device, DeviceArg::Cpu) && matches!(args.dtype, Precision::F16)),
         "cpu + f16 is not supported for this spike; use --dtype f32 on cpu"
     );
+    if modernbert::is_modernbert(&args.model)? {
+        return modernbert::run(&args);
+    }
+
     let started = Instant::now();
 
     let model = RuntimeModel::load(&args.model, args.dtype)?;

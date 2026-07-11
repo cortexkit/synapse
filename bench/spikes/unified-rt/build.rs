@@ -1,6 +1,7 @@
 fn main() {
     println!("cargo:rerun-if-changed=src/metal_mpsgraph.m");
     println!("cargo:rerun-if-changed=src/qwen3_mpsgraph.m");
+    println!("cargo:rerun-if-changed=src/modernbert_mpsgraph.m");
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
         return;
@@ -9,6 +10,7 @@ fn main() {
     cc::Build::new()
         .file("src/metal_mpsgraph.m")
         .file("src/qwen3_mpsgraph.m")
+        .file("src/modernbert_mpsgraph.m")
         .flag("-fobjc-exceptions")
         .compile("synapse_unified_rt_mpsgraph");
 
