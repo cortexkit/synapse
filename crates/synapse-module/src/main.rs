@@ -1,5 +1,4 @@
 #![forbid(unsafe_code)]
-#![forbid(unsafe_code)]
 
 #[tokio::main]
 async fn main() {
