@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
@@ -150,21 +151,12 @@ fn main() -> Result<()> {
         !(matches!(args.device, DeviceArg::Cpu) && matches!(args.dtype, Precision::F16)),
         "cpu + f16 is not supported for this spike; use --dtype f32 on cpu"
     );
-    if modernbert::is_modernbert(&args.model)? {
-        return modernbert::run(&args);
-    }
-
     let started = Instant::now();
 
-    let model = RuntimeModel::load(&args.model, args.dtype)?;
+    let model = load_model_family(&args.model, args.dtype)?;
     let mut tokenizer = Tokenizer::from_file(&args.tokenizer)
         .map_err(|error| anyhow::anyhow!("tokenizer: {error}"))?;
-    tokenizer
-        .with_truncation(Some(TruncationParams {
-            max_length: args.max_length,
-            ..Default::default()
-        }))
-        .map_err(|error| anyhow::anyhow!("truncation: {error}"))?;
+    model.configure_tokenizer(&mut tokenizer, args.max_length)?;
 
     let execution = MetalExecutionConfig::from_args(&args, model.family_name())?;
     let mut provider = make_provider(args.device, args.dtype, execution)?;
@@ -237,6 +229,7 @@ fn main() -> Result<()> {
                 &reference,
             );
             let mean = mean.context("no overlapping ids with parity reference")?;
+            model.validate_reference_coverage(matched, produced_vectors.len())?;
             let produced: HashMap<String, Vec<f32>> = produced_vectors.iter().cloned().collect();
             let ranks = rank_overlap(&produced, &reference, 10, 1)?;
             enforce_parity_gates(
@@ -312,57 +305,26 @@ fn enforce_parity_gates(
     Ok(())
 }
 
-enum RuntimeModel {
-    Bert(BertModel),
-    Qwen3(qwen3::Model),
-}
+/// A loaded model family owns every policy that varies between embedding graphs.
+///
+/// Detection remains in the registry because it runs before a model exists. Keeping
+/// loading, tokenizer behavior, token accounting, pooling, labels, and provider-hook
+/// installation behind this object-safe seam lets the batch runner stay unchanged
+/// when another family is registered.
+trait ModelFamily {
+    fn family_name(&self) -> &'static str;
 
-impl RuntimeModel {
-    fn load(path: &Path, precision: Precision) -> Result<Self> {
-        let root = resolve_model_root(path)?;
-        let config_path = root.join("config.json");
-        let config: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(&config_path)
-                .with_context(|| format!("read config {}", config_path.display()))?,
-        )
-        .with_context(|| format!("parse config {}", config_path.display()))?;
-        let model_type = config
-            .get("model_type")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        let is_qwen3 = model_type.starts_with("qwen3")
-            || config
-                .get("architectures")
-                .and_then(serde_json::Value::as_array)
-                .is_some_and(|architectures| {
-                    architectures.iter().any(|name| {
-                        name.as_str()
-                            .is_some_and(|name| name.to_ascii_lowercase().contains("qwen3"))
-                    })
-                });
-        if is_qwen3 {
-            Ok(Self::Qwen3(qwen3::Model::load(path, precision)?))
-        } else {
-            Ok(Self::Bert(BertModel::load(path, precision)?))
-        }
+    fn configure_tokenizer(&self, tokenizer: &mut Tokenizer, max_length: usize) -> Result<()> {
+        tokenizer
+            .with_truncation(Some(TruncationParams {
+                max_length,
+                ..Default::default()
+            }))
+            .map_err(|error| anyhow::anyhow!("truncation: {error}"))?;
+        Ok(())
     }
 
-    fn family_name(&self) -> &'static str {
-        match self {
-            Self::Bert(_) => "minilm",
-            Self::Qwen3(_) => "qwen3-0.6b",
-        }
-    }
-
-    fn token_length(&self, tokenizer: &Tokenizer, text: &str, max_length: usize) -> Result<usize> {
-        match self {
-            Self::Bert(_) => tokenizer
-                .encode(text, true)
-                .map(|encoding| encoding.get_ids().len())
-                .map_err(|error| anyhow::anyhow!("encode: {error}")),
-            Self::Qwen3(model) => Ok(model.encode(tokenizer, text, max_length)?.len()),
-        }
-    }
+    fn token_length(&self, tokenizer: &Tokenizer, text: &str, max_length: usize) -> Result<usize>;
 
     fn embed_batch(
         &self,
@@ -370,26 +332,52 @@ impl RuntimeModel {
         tokenizer: &Tokenizer,
         texts: &[&str],
         max_length: usize,
-    ) -> Result<Vec<Vec<f32>>> {
-        match self {
-            Self::Bert(model) => model.embed_batch(provider, tokenizer, texts),
-            Self::Qwen3(model) => model.embed_batch(provider, tokenizer, texts, max_length),
-        }
+    ) -> Result<Vec<Vec<f32>>>;
+
+    fn validate_reference_coverage(&self, _matched: usize, _produced: usize) -> Result<()> {
+        Ok(())
     }
 
-    fn default_label(&self, precision: Precision) -> String {
-        match self {
-            Self::Bert(_) => format!("all-MiniLM-L6-v2@owned-rt-{}", precision.as_str()),
-            Self::Qwen3(model) => model.default_label(precision),
-        }
-    }
+    fn default_label(&self, precision: Precision) -> String;
+    fn notes(&self) -> String;
+}
 
-    fn notes(&self) -> String {
-        match self {
-            Self::Bert(_) => "direct BERT encoder, mean pool+l2 on CPU".to_string(),
-            Self::Qwen3(model) => model.notes(),
-        }
-    }
+struct FamilyRegistration {
+    detect: fn(&serde_json::Value) -> bool,
+    load: fn(&Path, Precision) -> Result<Box<dyn ModelFamily>>,
+}
+
+fn load_model_family(path: &Path, precision: Precision) -> Result<Box<dyn ModelFamily>> {
+    let root = resolve_model_root(path)?;
+    let config_path = root.join("config.json");
+    let config: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&config_path)
+            .with_context(|| format!("read config {}", config_path.display()))?,
+    )
+    .with_context(|| format!("parse config {}", config_path.display()))?;
+    let registry = [
+        FamilyRegistration {
+            detect: modernbert::detect_config,
+            load: modernbert::load_family,
+        },
+        FamilyRegistration {
+            detect: qwen3::detect_config,
+            load: qwen3::load_family,
+        },
+        FamilyRegistration {
+            detect: detect_minilm_config,
+            load: |path, precision| Ok(Box::new(BertModel::load(path, precision)?)),
+        },
+    ];
+    let registration = registry
+        .iter()
+        .find(|registration| (registration.detect)(&config))
+        .context("config.json does not describe a supported embedding model family")?;
+    (registration.load)(path, precision)
+}
+
+fn detect_minilm_config(config: &serde_json::Value) -> bool {
+    config.get("model_type").and_then(serde_json::Value::as_str) == Some("bert")
 }
 
 fn make_provider(
@@ -414,6 +402,19 @@ fn write_vectors(path: &Path, vectors: &[(String, Vec<f32>)]) -> Result<()> {
     }
     writer.flush()?;
     Ok(())
+}
+
+type BlockContextFactory = fn(Precision, MetalExecutionConfig) -> Result<Box<dyn Any>>;
+
+/// A block request keeps family-specific graph inputs inside the family while the
+/// provider owns context lifetime and reuse. Because embedding graphs have different
+/// typed parameters, erasing those parameters into a universal tensor schema would
+/// invent unsupported generality; a family key plus a typed context callback gives all
+/// providers one block-level dispatch surface without central family matches.
+struct BlockForwardRequest<'a> {
+    family: &'static str,
+    create_context: BlockContextFactory,
+    run: &'a mut dyn FnMut(&mut dyn Any) -> Result<()>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -444,47 +445,8 @@ trait KernelProvider {
         self.matmul(m, n, k, a, b, b_layout, c)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn encoder_forward(
-        &mut self,
-        _hidden_states: &mut [f32],
-        _attention_mask: &[u8],
-        _batch: usize,
-        _seq: usize,
-        _hidden: usize,
-        _heads: usize,
-        _intermediate: usize,
-        _layer_norm_eps: f32,
-        _layers: &[EncoderLayer],
-    ) -> Result<bool> {
+    fn block_forward(&mut self, _request: BlockForwardRequest<'_>) -> Result<bool> {
         Ok(false)
-    }
-
-    // Block-resident graphs are model-shaped by nature. During this spike the
-    // provider surface is deliberately additive per family; a general graph
-    // abstraction will be extracted from MiniLM, ModernBERT, and Qwen3 evidence
-    // instead of guessed before those three concrete implementations exist.
-    #[allow(clippy::too_many_arguments)]
-    fn qwen3_forward(
-        &mut self,
-        _hidden_states: &mut [f32],
-        _attention_mask: &[u8],
-        _batch: usize,
-        _seq: usize,
-        _hidden: usize,
-        _query_heads: usize,
-        _kv_heads: usize,
-        _head_dim: usize,
-        _intermediate: usize,
-        _rms_norm_eps: f32,
-        _rope_theta: f32,
-        _layers: &[qwen3::Layer],
-        _final_norm: &qwen3::RmsNorm,
-    ) -> Result<bool> {
-        bail!(
-            "Qwen3 block graph is unsupported by provider {}",
-            self.name()
-        )
     }
 
     fn layer_norm(
@@ -554,31 +516,11 @@ impl KernelProvider for CpuProvider {
         matmul_impl(m, n, k, a, b, b_layout, c);
         Ok(())
     }
-
-    #[allow(clippy::too_many_arguments)]
-    fn qwen3_forward(
-        &mut self,
-        _hidden_states: &mut [f32],
-        _attention_mask: &[u8],
-        _batch: usize,
-        _seq: usize,
-        _hidden: usize,
-        _query_heads: usize,
-        _kv_heads: usize,
-        _head_dim: usize,
-        _intermediate: usize,
-        _rms_norm_eps: f32,
-        _rope_theta: f32,
-        _layers: &[qwen3::Layer],
-        _final_norm: &qwen3::RmsNorm,
-    ) -> Result<bool> {
-        Ok(false)
-    }
 }
 
 struct MetalProvider {
     context: metal_backend::MpsGraphContext,
-    qwen3_context: Option<qwen3::MetalContext>,
+    block_contexts: HashMap<&'static str, Box<dyn Any>>,
     dtype: Precision,
     execution: MetalExecutionConfig,
 }
@@ -598,7 +540,7 @@ impl MetalProvider {
     fn new_with_config(dtype: Precision, execution: MetalExecutionConfig) -> Result<Self> {
         Ok(Self {
             context: metal_backend::MpsGraphContext::new_with_config(execution.clone())?,
-            qwen3_context: None,
+            block_contexts: HashMap::new(),
             dtype,
             execution,
         })
@@ -647,83 +589,16 @@ impl KernelProvider for MetalProvider {
             .matmul(m, n, k, a, b, b_layout, c, true, self.dtype)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn encoder_forward(
-        &mut self,
-        hidden_states: &mut [f32],
-        attention_mask: &[u8],
-        batch: usize,
-        seq: usize,
-        hidden: usize,
-        heads: usize,
-        intermediate: usize,
-        layer_norm_eps: f32,
-        layers: &[EncoderLayer],
-    ) -> Result<bool> {
-        ensure!(
-            hidden_states.len() == batch * seq * hidden,
-            "encoder hidden shape mismatch"
-        );
-        ensure!(
-            attention_mask.len() == batch * seq,
-            "encoder mask shape mismatch"
-        );
-        self.context.encoder_forward(
-            hidden_states,
-            attention_mask,
-            batch,
-            seq,
-            hidden,
-            heads,
-            intermediate,
-            layer_norm_eps,
-            layers,
-            self.dtype,
-        )?;
-        Ok(true)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn qwen3_forward(
-        &mut self,
-        hidden_states: &mut [f32],
-        attention_mask: &[u8],
-        batch: usize,
-        seq: usize,
-        hidden: usize,
-        query_heads: usize,
-        kv_heads: usize,
-        head_dim: usize,
-        intermediate: usize,
-        rms_norm_eps: f32,
-        rope_theta: f32,
-        layers: &[qwen3::Layer],
-        final_norm: &qwen3::RmsNorm,
-    ) -> Result<bool> {
-        if self.qwen3_context.is_none() {
-            self.qwen3_context = Some(qwen3::MetalContext::new(
-                self.dtype,
-                self.execution.clone(),
-            )?);
+    fn block_forward(&mut self, request: BlockForwardRequest<'_>) -> Result<bool> {
+        if !self.block_contexts.contains_key(request.family) {
+            let context = (request.create_context)(self.dtype, self.execution.clone())?;
+            self.block_contexts.insert(request.family, context);
         }
-        self.qwen3_context
-            .as_mut()
-            .expect("Qwen3 context initialized above")
-            .forward(
-                hidden_states,
-                attention_mask,
-                batch,
-                seq,
-                hidden,
-                query_heads,
-                kv_heads,
-                head_dim,
-                intermediate,
-                rms_norm_eps,
-                rope_theta,
-                layers,
-                final_norm,
-            )?;
+        let context = self
+            .block_contexts
+            .get_mut(request.family)
+            .expect("block context inserted above");
+        (request.run)(context.as_mut())?;
         Ok(true)
     }
 }
@@ -1737,17 +1612,28 @@ impl BertModel {
             self.config.layer_norm_eps,
         )?;
 
-        if provider.encoder_forward(
-            &mut x.data,
-            attention_mask,
-            batch,
-            seq,
-            hidden,
-            heads,
-            self.config.intermediate_size,
-            self.config.layer_norm_eps,
-            &self.layers,
-        )? {
+        let mut run = |context: &mut dyn Any| {
+            let context = context
+                .downcast_mut::<MiniLmBlockContext>()
+                .context("MiniLM provider returned the wrong block context type")?;
+            context.graph.encoder_forward(
+                &mut x.data,
+                attention_mask,
+                batch,
+                seq,
+                hidden,
+                heads,
+                self.config.intermediate_size,
+                self.config.layer_norm_eps,
+                &self.layers,
+                context.precision,
+            )
+        };
+        if provider.block_forward(BlockForwardRequest {
+            family: self.family_name(),
+            create_context: new_minilm_block_context,
+            run: &mut run,
+        })? {
             return Ok(x);
         }
 
@@ -1765,6 +1651,52 @@ impl BertModel {
         )?;
         Ok(x)
     }
+}
+
+impl ModelFamily for BertModel {
+    fn family_name(&self) -> &'static str {
+        "minilm"
+    }
+
+    fn token_length(&self, tokenizer: &Tokenizer, text: &str, _max_length: usize) -> Result<usize> {
+        tokenizer
+            .encode(text, true)
+            .map(|encoding| encoding.get_ids().len())
+            .map_err(|error| anyhow::anyhow!("encode: {error}"))
+    }
+
+    fn embed_batch(
+        &self,
+        provider: &mut dyn KernelProvider,
+        tokenizer: &Tokenizer,
+        texts: &[&str],
+        _max_length: usize,
+    ) -> Result<Vec<Vec<f32>>> {
+        self.embed_batch(provider, tokenizer, texts)
+    }
+
+    fn default_label(&self, precision: Precision) -> String {
+        format!("all-MiniLM-L6-v2@owned-rt-{}", precision.as_str())
+    }
+
+    fn notes(&self) -> String {
+        "direct BERT encoder, mean pool+l2 on CPU".to_owned()
+    }
+}
+
+fn new_minilm_block_context(
+    precision: Precision,
+    execution: MetalExecutionConfig,
+) -> Result<Box<dyn Any>> {
+    Ok(Box::new(MiniLmBlockContext {
+        graph: metal_backend::MpsGraphContext::new_with_config(execution)?,
+        precision,
+    }))
+}
+
+struct MiniLmBlockContext {
+    graph: metal_backend::MpsGraphContext,
+    precision: Precision,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2292,6 +2224,43 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    #[allow(clippy::too_many_arguments)]
+    fn run_minilm_block(
+        provider: &mut MetalProvider,
+        hidden_states: &mut [f32],
+        attention_mask: &[u8],
+        batch: usize,
+        seq: usize,
+        hidden: usize,
+        heads: usize,
+        intermediate: usize,
+        layers: &[EncoderLayer],
+    ) -> Result<bool> {
+        let mut run = |context: &mut dyn Any| {
+            let context = context
+                .downcast_mut::<MiniLmBlockContext>()
+                .context("test provider returned the wrong MiniLM context")?;
+            context.graph.encoder_forward(
+                hidden_states,
+                attention_mask,
+                batch,
+                seq,
+                hidden,
+                heads,
+                intermediate,
+                1e-12,
+                layers,
+                context.precision,
+            )
+        };
+        provider.block_forward(BlockForwardRequest {
+            family: "minilm",
+            create_context: new_minilm_block_context,
+            run: &mut run,
+        })
+    }
+
     #[test]
     #[cfg(target_os = "macos")]
     fn metal_provider_matches_cpu_for_tiny_encoder_block() {
@@ -2321,19 +2290,18 @@ mod tests {
         .expect("run CPU encoder block");
 
         let mut metal = MetalProvider::new(Precision::F32).expect("create MPSGraph provider");
-        assert!(metal
-            .encoder_forward(
-                &mut actual,
-                &attention_mask,
-                batch,
-                seq,
-                hidden,
-                heads,
-                intermediate,
-                1e-12,
-                &layers,
-            )
-            .expect("run resident MPSGraph encoder block"));
+        assert!(run_minilm_block(
+            &mut metal,
+            &mut actual,
+            &attention_mask,
+            batch,
+            seq,
+            hidden,
+            heads,
+            intermediate,
+            &layers,
+        )
+        .expect("run resident MPSGraph encoder block"));
         assert_close_with_tolerance(&actual, &expected, 5e-3);
     }
 
@@ -2369,19 +2337,18 @@ mod tests {
         .expect("run CPU encoder block");
 
         let mut metal = MetalProvider::new(Precision::F16).expect("create MPSGraph provider");
-        assert!(metal
-            .encoder_forward(
-                &mut actual,
-                &attention_mask,
-                batch,
-                seq,
-                hidden,
-                heads,
-                intermediate,
-                1e-12,
-                &layers,
-            )
-            .expect("run resident MPSGraph encoder block"));
+        assert!(run_minilm_block(
+            &mut metal,
+            &mut actual,
+            &attention_mask,
+            batch,
+            seq,
+            hidden,
+            heads,
+            intermediate,
+            &layers,
+        )
+        .expect("run resident MPSGraph encoder block"));
         assert_close_with_tolerance(&actual, &expected, 3e-2);
     }
 }

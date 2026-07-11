@@ -9,6 +9,8 @@
 #import <MetalPerformanceShadersGraph/MPSGraphNormalizationOps.h>
 #import <MetalPerformanceShadersGraph/MPSGraphTensorShapeOps.h>
 
+#include "mpsgraph_runtime.h"
+
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -117,11 +119,8 @@ typedef struct SynapseMpsEncoderPlan {
 } SynapseMpsEncoderPlan;
 
 typedef struct SynapseMpsContext {
-    id<MTLDevice> device;
-    id<MTLCommandQueue> queue;
-    NSMutableDictionary<NSString *, NSValue *> *plans;
+    SynapseMpsRuntimeContext runtime;
     NSMutableDictionary<NSString *, NSValue *> *encoder_plans;
-    NSMutableDictionary<NSString *, id<MTLBuffer>> *rhs_buffers;
     NSString *capture_path;
     NSString *graph_dump_path;
     BOOL capture_pending;
@@ -255,10 +254,6 @@ static NSString *synapse_mps_encoder_plan_key(
                                       (unsigned long long)layer_count,
                                       (double)layer_norm_eps,
                                       variant];
-}
-
-static NSString *synapse_mps_rhs_key(const void *b, NSUInteger byte_count) {
-    return [NSString stringWithFormat:@"%p:%llu", b, (unsigned long long)byte_count];
 }
 
 static void synapse_mps_plan_free(SynapseMpsPlan *plan) {
@@ -582,16 +577,14 @@ static SynapseMpsPlan *synapse_mps_get_plan(
     int32_t b_is_row_major_nk
 ) {
     NSString *key = synapse_mps_plan_key(m, n, k, dtype, b_is_row_major_nk);
-    NSValue *cached = [context->plans objectForKey:key];
-    if (cached != nil) {
-        return (SynapseMpsPlan *)cached.pointerValue;
-    }
+    SynapseMpsPlan *cached = synapse_mps_cached_plan(&context->runtime, key);
+    if (cached != NULL) return cached;
 
     SynapseMpsPlan *plan = synapse_mps_plan_new(m, n, k, dtype, b_is_row_major_nk);
     if (plan == NULL) {
         return NULL;
     }
-    [context->plans setObject:[NSValue valueWithPointer:plan] forKey:key];
+    synapse_mps_cache_plan(&context->runtime, key, plan);
     return plan;
 }
 
@@ -627,47 +620,22 @@ static id<MTLBuffer> synapse_mps_get_cached_buffer(
     const void *values,
     NSUInteger byte_count
 ) {
-    if (values == NULL || byte_count == 0) {
-        synapse_mps_set_c_error("encoder feed received a null or empty static tensor");
-        return nil;
-    }
-    NSString *key = synapse_mps_rhs_key(values, byte_count);
-    id<MTLBuffer> buffer = [context->rhs_buffers objectForKey:key];
-    if (buffer != nil) {
-        return buffer;
-    }
-    buffer = [context->device newBufferWithBytes:values
-                                         length:byte_count
-                                        options:MTLResourceStorageModeShared];
-    if (buffer == nil) {
-        synapse_mps_set_c_error("failed to allocate Metal static encoder buffer");
-        return nil;
-    }
-    [context->rhs_buffers setObject:buffer forKey:key];
-    [buffer release];
-    return [context->rhs_buffers objectForKey:key];
+    id<MTLBuffer> buffer = synapse_mps_cached_static_buffer(&context->runtime, values, byte_count);
+    if (buffer == nil) synapse_mps_set_c_error("encoder feed received a null, empty, or unallocatable static tensor");
+    return buffer;
 }
 
-static BOOL synapse_mps_add_feed(
+static BOOL synapse_minilm_add_feed(
     NSMutableDictionary<MPSGraphTensor *, MPSGraphTensorData *> *feeds,
     MPSGraphTensor *tensor,
     MPSShape *shape,
     id<MTLBuffer> buffer,
     MPSDataType data_type
 ) {
-    if (tensor == nil || shape == nil || buffer == nil) {
+    if (!synapse_mps_add_feed(feeds, tensor, shape, buffer, data_type)) {
         synapse_mps_set_c_error("encoder feed is missing a tensor, shape, or Metal buffer");
         return NO;
     }
-    MPSGraphTensorData *data = [[MPSGraphTensorData alloc] initWithMTLBuffer:buffer
-                                                                       shape:shape
-                                                                    dataType:data_type];
-    if (data == nil) {
-        synapse_mps_set_c_error("failed to wrap Metal buffer for MPSGraph encoder feed");
-        return NO;
-    }
-    [feeds setObject:data forKey:tensor];
-    [data release];
     return YES;
 }
 
@@ -684,7 +652,7 @@ static BOOL synapse_mps_add_cached_feed(
     if (buffer == nil) {
         return NO;
     }
-    return synapse_mps_add_feed(feeds, tensor, shape, buffer, data_type);
+    return synapse_minilm_add_feed(feeds, tensor, shape, buffer, data_type);
 }
 
 static BOOL synapse_mps_add_shaped_type(
@@ -741,7 +709,7 @@ static NSMutableDictionary<MPSGraphTensor *, MPSGraphShapedType *> *synapse_mps_
     return feeds;
 }
 
-static NSArray<MPSGraphTensorData *> *synapse_mps_executable_inputs(
+static NSArray<MPSGraphTensorData *> *synapse_minilm_executable_inputs(
     SynapseMpsEncoderPlan *plan,
     NSDictionary<MPSGraphTensor *, MPSGraphTensorData *> *feeds
 ) {
@@ -788,7 +756,7 @@ int32_t synapse_mps_prepare_encoder(
         @try {
             synapse_mps_clear_error();
             SynapseMpsContext *context = (SynapseMpsContext *)raw_context;
-            if (context == NULL || context->device == nil || context->queue == nil) {
+            if (context == NULL || context->runtime.device == nil || context->runtime.queue == nil) {
                 synapse_mps_set_c_error("Metal context is not initialized");
                 return -1;
             }
@@ -811,85 +779,40 @@ int32_t synapse_mps_prepare_encoder(
                 return 0;
             }
 
-            MPSGraphCompilationDescriptor *descriptor = [[MPSGraphCompilationDescriptor alloc] init];
-            descriptor.optimizationLevel = optimization_level == 0 ? MPSGraphOptimizationLevel0 : MPSGraphOptimizationLevel1;
-            descriptor.waitForCompilationCompletion = YES;
-            NSTimeInterval started = [NSDate timeIntervalSinceReferenceDate];
-            if (load_package) {
-                if (package_path == NULL) {
-                    [descriptor release];
-                    synapse_mps_set_c_error("package load requires a package path");
-                    return -4;
-                }
-                NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:package_path]];
-                plan->executable = [[MPSGraphExecutable alloc] initWithMPSGraphPackageAtURL:url
-                                                                    compilationDescriptor:descriptor];
-            } else {
-                SynapsePrecisionPolicy policy = synapse_mps_precision_policy(variant);
-                NSMutableDictionary<MPSGraphTensor *, MPSGraphShapedType *> *feeds =
-                    synapse_mps_encoder_shaped_feeds(plan, policy);
-                if (feeds == nil) {
-                    [descriptor release];
-                    return -5;
-                }
-                MPSGraphDevice *device = [MPSGraphDevice deviceWithMTLDevice:context->device];
-                plan->executable = [[plan->graph compileWithDevice:device
-                                                            feeds:feeds
-                                                    targetTensors:@[ plan->output_tensor ]
-                                                 targetOperations:nil
-                                            compilationDescriptor:descriptor] retain];
-                if (plan->executable != nil) {
-                    NSMutableArray<MPSGraphType *> *input_types =
-                        [NSMutableArray arrayWithCapacity:plan->executable.feedTensors.count];
-                    for (MPSGraphTensor *feed_tensor in plan->executable.feedTensors) {
-                        MPSGraphShapedType *input_type = [feeds objectForKey:feed_tensor];
-                        if (input_type == nil) {
-                            [feeds release];
-                            [descriptor release];
-                            synapse_mps_set_ns_error([NSString stringWithFormat:@"no shaped type for executable input %@",
-                                                                                feed_tensor.operation.name]);
-                            return -8;
-                        }
-                        [input_types addObject:input_type];
-                    }
-                    NSTimeInterval specialize_started = [NSDate timeIntervalSinceReferenceDate];
-                    [plan->executable specializeWithDevice:device
-                                                inputTypes:input_types
-                                     compilationDescriptor:descriptor];
-                    *specialize_wall_s = [NSDate timeIntervalSinceReferenceDate] - specialize_started;
-                }
-                [feeds release];
+            if (load_package && package_path == NULL) {
+                synapse_mps_set_c_error("package load requires a package path");
+                return -4;
             }
-            *prepare_wall_s = [NSDate timeIntervalSinceReferenceDate] - started;
-            [descriptor release];
+            NSMutableDictionary<MPSGraphTensor *, MPSGraphShapedType *> *feeds = nil;
+            if (!load_package) {
+                SynapsePrecisionPolicy policy = synapse_mps_precision_policy(variant);
+                feeds = synapse_mps_encoder_shaped_feeds(plan, policy);
+                if (feeds == nil) return -5;
+            }
+            plan->executable = synapse_mps_prepare_executable(
+                plan->graph,
+                context->runtime.device,
+                plan->output_tensor,
+                feeds,
+                optimization_level,
+                package_path,
+                load_package != 0,
+                append_package != 0,
+                prepare_wall_s,
+                specialize_wall_s,
+                serialize_wall_s,
+                &plan->executable_feed_tensors
+            );
+            [feeds release];
             if (plan->executable == nil) {
                 synapse_mps_set_c_error(load_package ? "MPSGraph package returned no executable" : "MPSGraph compile returned no executable");
                 return -6;
-            }
-            plan->executable.options = MPSGraphOptionsSynchronizeResults;
-
-            NSArray<MPSGraphTensor *> *feed_tensors = plan->executable.feedTensors;
-            if (feed_tensors.count > 0) {
-                plan->executable_feed_tensors = [feed_tensors retain];
-            } else {
-                plan->executable_feed_tensors = [plan->graph.placeholderTensors retain];
             }
             if (plan->executable_feed_tensors.count != (NSUInteger)(2 + layer_count * 16)) {
                 synapse_mps_set_ns_error([NSString stringWithFormat:@"unexpected executable feed count %llu, expected %llu",
                                                                     (unsigned long long)plan->executable_feed_tensors.count,
                                                                     (unsigned long long)(2 + layer_count * 16)]);
                 return -7;
-            }
-
-            if (!load_package && package_path != NULL) {
-                NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:package_path]];
-                MPSGraphExecutableSerializationDescriptor *serialization_descriptor =
-                    [[MPSGraphExecutableSerializationDescriptor alloc] init];
-                serialization_descriptor.append = append_package != 0;
-                started = [NSDate timeIntervalSinceReferenceDate];
-                [plan->executable serializeToMPSGraphPackageAtURL:url descriptor:serialization_descriptor];
-                *serialize_wall_s = [NSDate timeIntervalSinceReferenceDate] - started;
-                [serialization_descriptor release];
             }
             return 0;
         } @catch (NSException *exception) {
@@ -903,38 +826,17 @@ void *synapse_mps_context_new(void) {
     @autoreleasepool {
         @try {
             synapse_mps_clear_error();
-            id<MTLDevice> device = MTLCreateSystemDefaultDevice();
-            if (device == nil) {
-                synapse_mps_set_c_error("no Metal device is available");
-                return NULL;
-            }
-            id<MTLCommandQueue> queue = [device newCommandQueue];
-            if (queue == nil) {
-                [device release];
-                synapse_mps_set_c_error("failed to create Metal command queue");
-                return NULL;
-            }
-
             SynapseMpsContext *context = (SynapseMpsContext *)calloc(1, sizeof(SynapseMpsContext));
-            if (context == NULL) {
-                [queue release];
-                [device release];
-                synapse_mps_set_c_error("failed to allocate Metal context");
+            if (context == NULL || !synapse_mps_runtime_init(&context->runtime)) {
+                free(context);
+                synapse_mps_set_c_error("failed to initialize Metal context");
                 return NULL;
             }
-            context->device = device;
-            context->queue = queue;
-            context->plans = [[NSMutableDictionary alloc] init];
             context->encoder_plans = [[NSMutableDictionary alloc] init];
-            context->rhs_buffers = [[NSMutableDictionary alloc] init];
-            if (context->plans == nil || context->encoder_plans == nil || context->rhs_buffers == nil) {
-                [context->rhs_buffers release];
-                [context->encoder_plans release];
-                [context->plans release];
-                [queue release];
-                [device release];
+            if (context->encoder_plans == nil) {
+                synapse_mps_runtime_release(&context->runtime, NULL);
                 free(context);
-                synapse_mps_set_c_error("failed to allocate Metal cache dictionaries");
+                synapse_mps_set_c_error("failed to allocate Metal encoder plan cache");
                 return NULL;
             }
             return context;
@@ -969,24 +871,20 @@ int32_t synapse_mps_configure_graph_dump(void *raw_context, const char *path) {
     return context->graph_dump_pending ? 0 : -2;
 }
 
+static void synapse_mps_plan_free_erased(void *plan) {
+    synapse_mps_plan_free((SynapseMpsPlan *)plan);
+}
+
 void synapse_mps_context_free(void *raw_context) {
-    if (raw_context == NULL) {
-        return;
-    }
+    if (raw_context == NULL) return;
     SynapseMpsContext *context = (SynapseMpsContext *)raw_context;
-    for (NSValue *value in [context->plans allValues]) {
-        synapse_mps_plan_free((SynapseMpsPlan *)value.pointerValue);
-    }
     for (NSValue *value in [context->encoder_plans allValues]) {
         synapse_mps_encoder_plan_free((SynapseMpsEncoderPlan *)value.pointerValue);
     }
     [context->capture_path release];
     [context->graph_dump_path release];
-    [context->rhs_buffers release];
     [context->encoder_plans release];
-    [context->plans release];
-    [context->queue release];
-    [context->device release];
+    synapse_mps_runtime_release(&context->runtime, synapse_mps_plan_free_erased);
     free(context);
 }
 
@@ -1006,7 +904,7 @@ int32_t synapse_mps_matmul(
         @try {
             synapse_mps_clear_error();
             SynapseMpsContext *context = (SynapseMpsContext *)raw_context;
-            if (context == NULL || context->device == nil || context->queue == nil) {
+            if (context == NULL || context->runtime.device == nil || context->runtime.queue == nil) {
                 synapse_mps_set_c_error("Metal context is not initialized");
                 return -1;
             }
@@ -1038,7 +936,7 @@ int32_t synapse_mps_matmul(
                 return -5;
             }
 
-            id<MTLBuffer> a_buffer = [context->device newBufferWithBytes:a
+            id<MTLBuffer> a_buffer = [context->runtime.device newBufferWithBytes:a
                                                                    length:a_bytes
                                                                   options:MTLResourceStorageModeShared];
             id<MTLBuffer> b_buffer = nil;
@@ -1046,7 +944,7 @@ int32_t synapse_mps_matmul(
             if (cache_rhs) {
                 b_buffer = synapse_mps_get_cached_buffer(context, b, b_bytes);
             } else {
-                b_buffer = [context->device newBufferWithBytes:b
+                b_buffer = [context->runtime.device newBufferWithBytes:b
                                                         length:b_bytes
                                                        options:MTLResourceStorageModeShared];
                 release_b_buffer = YES;
@@ -1082,7 +980,7 @@ int32_t synapse_mps_matmul(
                 plan->b_tensor: b_data,
             };
             NSDictionary<MPSGraphTensor *, MPSGraphTensorData *> *results =
-                [plan->graph runWithMTLCommandQueue:context->queue
+                [plan->graph runWithMTLCommandQueue:context->runtime.queue
                                               feeds:feeds
                                       targetTensors:@[ plan->product_tensor ]
                                    targetOperations:nil];
@@ -1143,7 +1041,7 @@ int32_t synapse_mps_encoder_forward(
         @try {
             synapse_mps_clear_error();
             SynapseMpsContext *context = (SynapseMpsContext *)raw_context;
-            if (context == NULL || context->device == nil || context->queue == nil) {
+            if (context == NULL || context->runtime.device == nil || context->runtime.queue == nil) {
                 synapse_mps_set_c_error("Metal context is not initialized");
                 return -1;
             }
@@ -1202,10 +1100,10 @@ int32_t synapse_mps_encoder_forward(
                 context->graph_dump_pending = NO;
             }
 
-            id<MTLBuffer> input_buffer = [context->device newBufferWithBytes:input
+            id<MTLBuffer> input_buffer = [context->runtime.device newBufferWithBytes:input
                                                                        length:input_bytes
                                                                       options:MTLResourceStorageModeShared];
-            id<MTLBuffer> mask_buffer = [context->device newBufferWithBytes:additive_mask
+            id<MTLBuffer> mask_buffer = [context->runtime.device newBufferWithBytes:additive_mask
                                                                       length:mask_bytes
                                                                      options:MTLResourceStorageModeShared];
             if (input_buffer == nil || mask_buffer == nil) {
@@ -1261,7 +1159,7 @@ int32_t synapse_mps_encoder_forward(
             if (context->capture_pending) {
                 MTLCaptureManager *manager = [MTLCaptureManager sharedCaptureManager];
                 MTLCaptureDescriptor *descriptor = [[MTLCaptureDescriptor alloc] init];
-                descriptor.captureObject = context->queue;
+                descriptor.captureObject = context->runtime.queue;
                 descriptor.destination = MTLCaptureDestinationGPUTraceDocument;
                 descriptor.outputURL = [NSURL fileURLWithPath:context->capture_path];
                 [[NSFileManager defaultManager] removeItemAtURL:descriptor.outputURL error:nil];
@@ -1280,7 +1178,7 @@ int32_t synapse_mps_encoder_forward(
             MPSGraphTensorData *output_data = nil;
             @try {
                 if (plan->executable != nil) {
-                    NSArray<MPSGraphTensorData *> *inputs = synapse_mps_executable_inputs(plan, feeds);
+                    NSArray<MPSGraphTensorData *> *inputs = synapse_minilm_executable_inputs(plan, feeds);
                     if (inputs == nil) {
                         [feeds release];
                         [input_buffer release];
@@ -1288,14 +1186,14 @@ int32_t synapse_mps_encoder_forward(
                         return -15;
                     }
                     NSArray<MPSGraphTensorData *> *results =
-                        [plan->executable runWithMTLCommandQueue:context->queue
+                        [plan->executable runWithMTLCommandQueue:context->runtime.queue
                                                     inputsArray:inputs
                                                    resultsArray:nil
                                             executionDescriptor:nil];
                     output_data = results.firstObject;
                 } else {
                     NSDictionary<MPSGraphTensor *, MPSGraphTensorData *> *results =
-                        [plan->graph runWithMTLCommandQueue:context->queue
+                        [plan->graph runWithMTLCommandQueue:context->runtime.queue
                                                      feeds:feeds
                                              targetTensors:@[ plan->output_tensor ]
                                           targetOperations:nil];

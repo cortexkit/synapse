@@ -6,7 +6,7 @@
 #import <MetalPerformanceShadersGraph/MPSGraphNormalizationOps.h>
 #import <MetalPerformanceShadersGraph/MPSGraphTensorShapeOps.h>
 
-#include "mpsgraph_executable.h"
+#include "mpsgraph_runtime.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -64,10 +64,7 @@ typedef struct ModernBertPlan {
 } ModernBertPlan;
 
 typedef struct ModernBertContext {
-    id<MTLDevice> device;
-    id<MTLCommandQueue> queue;
-    NSMutableDictionary<NSString *, NSValue *> *plans;
-    NSMutableDictionary<NSString *, id<MTLBuffer>> *static_buffers;
+    SynapseMpsRuntimeContext runtime;
 } ModernBertContext;
 
 static void modernbert_clear_error(void) {
@@ -401,13 +398,11 @@ static ModernBertPlan *modernbert_get_plan(
 ) {
     uint64_t pattern = modernbert_attention_pattern(params, layer_count);
     NSString *key = modernbert_plan_key(batch, seq, hidden, heads, intermediate, layer_count, epsilon, pattern, dtype);
-    NSValue *cached = [context->plans objectForKey:key];
-    if (cached != nil) {
-        return (ModernBertPlan *)cached.pointerValue;
-    }
+    ModernBertPlan *cached = synapse_mps_cached_plan(&context->runtime, key);
+    if (cached != NULL) return cached;
     ModernBertPlan *plan = modernbert_plan_new(batch, seq, hidden, heads, intermediate, layer_count, epsilon, params, dtype);
     if (plan != NULL) {
-        [context->plans setObject:[NSValue valueWithPointer:plan] forKey:key];
+        synapse_mps_cache_plan(&context->runtime, key, plan);
     }
     return plan;
 }
@@ -416,22 +411,8 @@ static ModernBertPlan *modernbert_get_plan(
 // Per-call activations and masks use uncached buffers; RoPE tables are host-cached by sequence
 // bucket but also use per-call buffers so no temporary pointer can alias a static tensor.
 static id<MTLBuffer> modernbert_static_buffer(ModernBertContext *context, const void *values, NSUInteger bytes) {
-    if (values == NULL || bytes == 0) {
-        modernbert_set_error("ModernBERT static tensor is null or empty");
-        return nil;
-    }
-    NSString *key = [NSString stringWithFormat:@"%p:%llu", values, (unsigned long long)bytes];
-    id<MTLBuffer> buffer = [context->static_buffers objectForKey:key];
-    if (buffer == nil) {
-        buffer = [context->device newBufferWithBytes:values length:bytes options:MTLResourceStorageModeShared];
-        if (buffer == nil) {
-            modernbert_set_error("failed to allocate ModernBERT static Metal buffer");
-            return nil;
-        }
-        [context->static_buffers setObject:buffer forKey:key];
-        [buffer release];
-        buffer = [context->static_buffers objectForKey:key];
-    }
+    id<MTLBuffer> buffer = synapse_mps_cached_static_buffer(&context->runtime, values, bytes);
+    if (buffer == nil) modernbert_set_error("ModernBERT static tensor is null, empty, or could not be allocated");
     return buffer;
 }
 
@@ -442,17 +423,10 @@ static BOOL modernbert_add_feed(
     id<MTLBuffer> buffer,
     MPSDataType data_type
 ) {
-    if (tensor == nil || shape == nil || buffer == nil) {
+    if (!synapse_mps_add_feed(feeds, tensor, shape, buffer, data_type)) {
         modernbert_set_error("ModernBERT MPSGraph feed is incomplete");
         return NO;
     }
-    MPSGraphTensorData *data = [[MPSGraphTensorData alloc] initWithMTLBuffer:buffer shape:shape dataType:data_type];
-    if (data == nil) {
-        modernbert_set_error("failed to wrap ModernBERT Metal buffer");
-        return NO;
-    }
-    [feeds setObject:data forKey:tensor];
-    [data release];
     return YES;
 }
 
@@ -476,25 +450,12 @@ void *synapse_modernbert_mps_context_new(void) {
     @autoreleasepool {
         @try {
             modernbert_clear_error();
-            id<MTLDevice> device = MTLCreateSystemDefaultDevice();
-            id<MTLCommandQueue> queue = [device newCommandQueue];
-            if (device == nil || queue == nil) {
-                [queue release];
-                [device release];
+            ModernBertContext *context = (ModernBertContext *)calloc(1, sizeof(ModernBertContext));
+            if (context == NULL || !synapse_mps_runtime_init(&context->runtime)) {
+                free(context);
                 modernbert_set_error("no Metal device or command queue is available");
                 return NULL;
             }
-            ModernBertContext *context = (ModernBertContext *)calloc(1, sizeof(ModernBertContext));
-            if (context == NULL) {
-                [queue release];
-                [device release];
-                modernbert_set_error("failed to allocate ModernBERT Metal context");
-                return NULL;
-            }
-            context->device = device;
-            context->queue = queue;
-            context->plans = [[NSMutableDictionary alloc] init];
-            context->static_buffers = [[NSMutableDictionary alloc] init];
             return context;
         } @catch (NSException *exception) {
             modernbert_set_ns_error(exception.reason);
@@ -503,18 +464,14 @@ void *synapse_modernbert_mps_context_new(void) {
     }
 }
 
+static void modernbert_plan_free_erased(void *plan) {
+    modernbert_plan_free((ModernBertPlan *)plan);
+}
+
 void synapse_modernbert_mps_context_free(void *raw_context) {
-    if (raw_context == NULL) {
-        return;
-    }
+    if (raw_context == NULL) return;
     ModernBertContext *context = (ModernBertContext *)raw_context;
-    for (NSValue *value in [context->plans allValues]) {
-        modernbert_plan_free((ModernBertPlan *)value.pointerValue);
-    }
-    [context->static_buffers release];
-    [context->plans release];
-    [context->queue release];
-    [context->device release];
+    synapse_mps_runtime_release(&context->runtime, modernbert_plan_free_erased);
     free(context);
 }
 
@@ -564,8 +521,8 @@ int32_t synapse_modernbert_mps_forward(
             MPSDataType data_type = dtype == 1 ? MPSDataTypeFloat16 : MPSDataTypeFloat32;
             NSUInteger element_size = dtype == 1 ? sizeof(uint16_t) : sizeof(float);
             if (explicit_execution && plan->executable == nil) {
-                plan->executable = synapse_explicit_executable(
-                    plan->graph, context->device, plan->output_tensor, package_path,
+                plan->executable = synapse_mps_explicit_executable(
+                    plan->graph, context->runtime.device, plan->output_tensor, package_path,
                     &plan->executable_feed_tensors
                 );
                 if (plan->executable == nil) {
@@ -575,13 +532,13 @@ int32_t synapse_modernbert_mps_forward(
             }
             NSUInteger mask_count = (NSUInteger)(batch * seq * seq);
             NSUInteger rope_count = (NSUInteger)(seq * (hidden / heads));
-            id<MTLBuffer> input_buffer = [context->device newBufferWithBytes:input length:hidden_count * element_size options:MTLResourceStorageModeShared];
-            id<MTLBuffer> full_mask_buffer = [context->device newBufferWithBytes:full_mask length:mask_count * sizeof(float) options:MTLResourceStorageModeShared];
-            id<MTLBuffer> local_mask_buffer = [context->device newBufferWithBytes:local_mask length:mask_count * sizeof(float) options:MTLResourceStorageModeShared];
-            id<MTLBuffer> global_cos_buffer = [context->device newBufferWithBytes:global_cos length:rope_count * sizeof(float) options:MTLResourceStorageModeShared];
-            id<MTLBuffer> global_sin_buffer = [context->device newBufferWithBytes:global_sin length:rope_count * sizeof(float) options:MTLResourceStorageModeShared];
-            id<MTLBuffer> local_cos_buffer = [context->device newBufferWithBytes:local_cos length:rope_count * sizeof(float) options:MTLResourceStorageModeShared];
-            id<MTLBuffer> local_sin_buffer = [context->device newBufferWithBytes:local_sin length:rope_count * sizeof(float) options:MTLResourceStorageModeShared];
+            id<MTLBuffer> input_buffer = [context->runtime.device newBufferWithBytes:input length:hidden_count * element_size options:MTLResourceStorageModeShared];
+            id<MTLBuffer> full_mask_buffer = [context->runtime.device newBufferWithBytes:full_mask length:mask_count * sizeof(float) options:MTLResourceStorageModeShared];
+            id<MTLBuffer> local_mask_buffer = [context->runtime.device newBufferWithBytes:local_mask length:mask_count * sizeof(float) options:MTLResourceStorageModeShared];
+            id<MTLBuffer> global_cos_buffer = [context->runtime.device newBufferWithBytes:global_cos length:rope_count * sizeof(float) options:MTLResourceStorageModeShared];
+            id<MTLBuffer> global_sin_buffer = [context->runtime.device newBufferWithBytes:global_sin length:rope_count * sizeof(float) options:MTLResourceStorageModeShared];
+            id<MTLBuffer> local_cos_buffer = [context->runtime.device newBufferWithBytes:local_cos length:rope_count * sizeof(float) options:MTLResourceStorageModeShared];
+            id<MTLBuffer> local_sin_buffer = [context->runtime.device newBufferWithBytes:local_sin length:rope_count * sizeof(float) options:MTLResourceStorageModeShared];
             if (input_buffer == nil || full_mask_buffer == nil || local_mask_buffer == nil || global_cos_buffer == nil ||
                 global_sin_buffer == nil || local_cos_buffer == nil || local_sin_buffer == nil) {
                 modernbert_set_error("failed to allocate ModernBERT dynamic Metal buffers");
@@ -614,8 +571,8 @@ int32_t synapse_modernbert_mps_forward(
             } else {
                 MPSGraphTensorData *result = nil;
                 if (plan->executable != nil) {
-                    NSArray<MPSGraphTensorData *> *inputs = synapse_executable_inputs(plan->executable_feed_tensors, feeds);
-                    result = [[plan->executable runWithMTLCommandQueue:context->queue inputsArray:inputs resultsArray:nil executionDescriptor:nil] firstObject];
+                    NSArray<MPSGraphTensorData *> *inputs = synapse_mps_executable_inputs(plan->executable_feed_tensors, feeds);
+                    result = [[plan->executable runWithMTLCommandQueue:context->runtime.queue inputsArray:inputs resultsArray:nil executionDescriptor:nil] firstObject];
                 } else {
                     NSString *dump_dir = [[[NSProcessInfo processInfo] environment] objectForKey:@"SYNAPSE_MODERNBERT_DUMP_DIR"];
                     NSArray<MPSGraphTensor *> *targets = @[ plan->output_tensor ];
@@ -623,7 +580,7 @@ int32_t synapse_modernbert_mps_forward(
                         targets = [[plan->debug_outputs arrayByAddingObjectsFromArray:plan->layer_outputs] arrayByAddingObject:plan->output_tensor];
                     }
                     NSDictionary<MPSGraphTensor *, MPSGraphTensorData *> *results =
-                        [plan->graph runWithMTLCommandQueue:context->queue feeds:feeds targetTensors:targets targetOperations:nil];
+                        [plan->graph runWithMTLCommandQueue:context->runtime.queue feeds:feeds targetTensors:targets targetOperations:nil];
                     result = [results objectForKey:plan->output_tensor];
                     if (dump_dir != nil) {
                         [[NSFileManager defaultManager] createDirectoryAtPath:dump_dir withIntermediateDirectories:YES attributes:nil error:nil];

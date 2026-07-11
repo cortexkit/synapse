@@ -1,23 +1,17 @@
+use std::any::Any;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-use std::time::Instant;
 
 use anyhow::{bail, ensure, Context, Result};
 use serde::Deserialize;
-use synapse_bench::{
-    parity::{load_corpus, load_reference, mean_parity, rank_overlap, Chunk},
-    results::LaneResult,
-};
 use tokenizers::{Tokenizer, TruncationParams};
 
 use super::{
     decode_f16_bits, encode_f16_bits, get_tensor, load_safetensor_map, normalize_l2,
-    resolve_model_root, write_vectors, Args, BLayout, DeviceArg, Execution, Precision, Tensor,
+    resolve_model_root, BLayout, BlockForwardRequest, Execution, KernelProvider,
+    MetalExecutionConfig, ModelFamily, Precision, Tensor,
 };
-
-const PARITY_K: usize = 10;
-const PARITY_STRIDE: usize = 1;
 
 #[derive(Clone, Deserialize)]
 struct ModernBertConfig {
@@ -221,7 +215,7 @@ impl ModernBertModel {
 
     fn embed_batch(
         &self,
-        backend: &mut Backend,
+        provider: &mut dyn KernelProvider,
         tokenizer: &Tokenizer,
         texts: &[&str],
     ) -> Result<Vec<Vec<f32>>> {
@@ -252,7 +246,7 @@ impl ModernBertModel {
             }
         }
 
-        let hidden = self.forward(backend, &input_ids, &attention_mask, batch, seq)?;
+        let hidden = self.forward(provider, &input_ids, &attention_mask, batch, seq)?;
         let mut vectors = Vec::with_capacity(batch);
         for row in 0..batch {
             let start = row * seq * self.config.hidden_size;
@@ -265,7 +259,7 @@ impl ModernBertModel {
 
     fn forward(
         &self,
-        backend: &mut Backend,
+        provider: &mut dyn KernelProvider,
         input_ids: &[u32],
         attention_mask: &[u8],
         batch: usize,
@@ -291,11 +285,18 @@ impl ModernBertModel {
             self.config.norm_eps,
         );
 
-        match backend {
-            Backend::Cpu => self.forward_cpu(&mut current, attention_mask, batch, seq)?,
-            Backend::Metal(context) => {
-                context.forward(self, &mut current, attention_mask, batch, seq)?
-            }
+        let mut run = |context: &mut dyn Any| {
+            let context = context
+                .downcast_mut::<MetalContext>()
+                .context("ModernBERT provider returned the wrong block context type")?;
+            context.forward(self, &mut current, attention_mask, batch, seq)
+        };
+        if !provider.block_forward(BlockForwardRequest {
+            family: self.family_name(),
+            create_context: new_block_context,
+            run: &mut run,
+        })? {
+            self.forward_cpu(&mut current, attention_mask, batch, seq)?;
         }
         Ok(current)
     }
@@ -568,174 +569,78 @@ fn load_config(model_root: &Path) -> Result<ModernBertConfig> {
     .with_context(|| format!("parse ModernBERT config {}", path.display()))
 }
 
-pub(super) fn is_modernbert(path: &Path) -> Result<bool> {
-    let root = resolve_model_root(path)?;
-    let config_path = root.join("config.json");
-    let config: serde_json::Value = serde_json::from_str(
-        &fs::read_to_string(&config_path)
-            .with_context(|| format!("read config {}", config_path.display()))?,
-    )
-    .with_context(|| format!("parse config {}", config_path.display()))?;
-    Ok(config.get("model_type").and_then(|value| value.as_str()) == Some("modernbert"))
+pub(super) fn detect_config(config: &serde_json::Value) -> bool {
+    config.get("model_type").and_then(serde_json::Value::as_str) == Some("modernbert")
 }
 
-enum Backend {
-    Cpu,
-    Metal(MetalContext),
+pub(super) fn load_family(path: &Path, precision: Precision) -> Result<Box<dyn ModelFamily>> {
+    Ok(Box::new(ModernBertModel::load(path, precision)?))
 }
 
-impl Backend {
-    fn new(
-        device: DeviceArg,
-        precision: Precision,
-        execution: super::MetalExecutionConfig,
-    ) -> Result<Self> {
-        match (device, precision) {
-            (DeviceArg::Cpu, Precision::F32) => Ok(Self::Cpu),
-            (DeviceArg::Cpu, Precision::F16) => bail!("ModernBERT CPU supports fp32 only"),
-            (DeviceArg::Metal, Precision::F32 | Precision::F16) => {
-                Ok(Self::Metal(MetalContext::new(precision, execution)?))
-            }
-        }
+impl ModelFamily for ModernBertModel {
+    fn family_name(&self) -> &'static str {
+        "gte-modernbert"
     }
 
-    fn name(&self) -> &'static str {
-        match self {
-            Self::Cpu => "cpu-accelerate-modernbert-fp32",
-            Self::Metal(context) => match context.precision {
-                Precision::F32 => "metal-mpsgraph-modernbert-resident-fp32",
-                Precision::F16 => "metal-mpsgraph-modernbert-resident-f16",
-            },
-        }
-    }
-}
-
-pub(super) fn run(args: &Args) -> Result<()> {
-    let started = Instant::now();
-    let model = ModernBertModel::load(&args.model, args.dtype)?;
-    let mut tokenizer = Tokenizer::from_file(&args.tokenizer)
-        .map_err(|error| anyhow::anyhow!("tokenizer: {error}"))?;
-    tokenizer.with_padding(None);
-    tokenizer
-        .with_truncation(Some(TruncationParams {
-            max_length: args.max_length,
-            ..Default::default()
-        }))
-        .map_err(|error| anyhow::anyhow!("truncation: {error}"))?;
-    let execution = super::MetalExecutionConfig::from_args(args, "gte-modernbert")?;
-    let mut backend = Backend::new(args.device, args.dtype, execution)?;
-    let _ = model.embed_batch(&mut backend, &tokenizer, &["warmup"])?;
-    let cold_load_s = started.elapsed().as_secs_f64();
-
-    let chunks: Vec<Chunk> = load_corpus(&args.corpus, args.limit)?;
-    let all_texts: Vec<&str> = chunks.iter().map(|chunk| chunk.text.as_str()).collect();
-    let encodings = tokenizer
-        .encode_batch(all_texts, true)
-        .map_err(|error| anyhow::anyhow!("encode_batch: {error}"))?;
-    let lengths: Vec<usize> = encodings
-        .iter()
-        .map(|encoding| encoding.get_ids().len())
-        .collect();
-    let mut order: Vec<usize> = (0..chunks.len()).collect();
-    order.sort_by_key(|&index| lengths[index]);
-
-    let infer_started = Instant::now();
-    let mut input_tokens = 0u64;
-    let mut produced = Vec::with_capacity(chunks.len());
-    let mut batch_start = 0usize;
-    let mut batch_max_len = 0usize;
-    let mut index = 0usize;
-    while index <= order.len() {
-        let flush = if index == order.len() {
-            index > batch_start
-        } else {
-            let candidate_max = batch_max_len.max(lengths[order[index]]);
-            let count = index - batch_start;
-            count > 0 && (count + 1) * candidate_max * candidate_max > args.attention_units
-        };
-        if flush {
-            let batch_indices = &order[batch_start..index];
-            let texts: Vec<&str> = batch_indices
-                .iter()
-                .map(|&item| chunks[item].text.as_str())
-                .collect();
-            let vectors = model.embed_batch(&mut backend, &tokenizer, &texts)?;
-            for (offset, vector) in vectors.into_iter().enumerate() {
-                let original = batch_indices[offset];
-                input_tokens += lengths[original] as u64;
-                produced.push((chunks[original].id.clone(), vector));
-            }
-            batch_start = index;
-            batch_max_len = 0;
-            if index == order.len() {
-                break;
-            }
-        }
-        if index < order.len() {
-            batch_max_len = batch_max_len.max(lengths[order[index]]);
-        }
-        index += 1;
-    }
-    let infer_wall_s = infer_started.elapsed().as_secs_f64();
-
-    if let Some(path) = &args.vectors_out {
-        write_vectors(path, &produced)?;
+    fn configure_tokenizer(&self, tokenizer: &mut Tokenizer, max_length: usize) -> Result<()> {
+        tokenizer.with_padding(None);
+        tokenizer
+            .with_truncation(Some(TruncationParams {
+                max_length,
+                ..Default::default()
+            }))
+            .map_err(|error| anyhow::anyhow!("truncation: {error}"))?;
+        Ok(())
     }
 
-    let mut rank_mean = None;
-    let parity_mean_cosine = if let Some(path) = &args.reference {
-        let reference = load_reference(path)?;
-        let (mean, matched) = mean_parity(produced.iter().cloned(), &reference);
-        let mean = mean.context("no overlapping ids with ModernBERT parity reference")?;
-        let produced_map: HashMap<String, Vec<f32>> = produced.iter().cloned().collect();
-        let rank = rank_overlap(&produced_map, &reference, PARITY_K, PARITY_STRIDE)?;
-        validate_parity(
-            mean,
-            rank.mean_topk_overlap,
-            args.min_parity,
-            args.min_rank_overlap,
-        )?;
+    fn token_length(&self, tokenizer: &Tokenizer, text: &str, _max_length: usize) -> Result<usize> {
+        tokenizer
+            .encode(text, true)
+            .map(|encoding| encoding.get_ids().len())
+            .map_err(|error| anyhow::anyhow!("encode: {error}"))
+    }
+
+    fn embed_batch(
+        &self,
+        provider: &mut dyn KernelProvider,
+        tokenizer: &Tokenizer,
+        texts: &[&str],
+        _max_length: usize,
+    ) -> Result<Vec<Vec<f32>>> {
+        ModernBertModel::embed_batch(self, provider, tokenizer, texts)
+    }
+
+    fn validate_reference_coverage(&self, matched: usize, produced: usize) -> Result<()> {
         ensure!(
-            matched == produced.len(),
-            "ModernBERT reference matched {matched} of {} produced vectors",
-            produced.len()
+            matched == produced,
+            "ModernBERT reference matched {matched} of {produced} produced vectors"
         );
-        rank_mean = Some(rank.mean_topk_overlap);
-        Some(mean)
-    } else {
-        None
-    };
-
-    let result = LaneResult {
-        lane: format!("owned-rt-{}", backend.name()),
-        workload: "embed-corpus-v1".into(),
-        model: args
-            .model_label
-            .clone()
-            .unwrap_or_else(|| format!("Alibaba-NLP/gte-modernbert-base@owned-rt-{}", args.dtype.as_str())),
-        cold_load_s,
-        infer_wall_s,
-        input_tokens,
-        tok_per_s: input_tokens as f64 / infer_wall_s,
-        items: produced.len() as u64,
-        parity_mean_cosine,
-        self_peak_rss_bytes: None,
-        notes: format!(
-            "ModernBERT {}, execution={:?}, package_cache={}, CLS+l2, RoPE, alternating full/local-{} attention, GeGLU, pre-norm; length-sorted attention_units={}, max_len={}, top10_rank_overlap={rank_mean:?}",
-            args.dtype.as_str(),
-            args.execution,
-            args.package_cache.as_ref().map_or("disabled".into(), |path| path.display().to_string()),
-            model.config.local_attention, args.attention_units, args.max_length
-        ),
-    };
-    if let Some(parent) = args.out.parent() {
-        fs::create_dir_all(parent)?;
+        Ok(())
     }
-    fs::write(&args.out, serde_json::to_string_pretty(&result)?)?;
-    println!("{}", serde_json::to_string_pretty(&result)?);
-    Ok(())
+
+    fn default_label(&self, precision: Precision) -> String {
+        format!(
+            "Alibaba-NLP/gte-modernbert-base@owned-rt-{}",
+            precision.as_str()
+        )
+    }
+
+    fn notes(&self) -> String {
+        format!(
+            "ModernBERT CLS+l2, RoPE, alternating full/local-{} attention, GeGLU, pre-norm",
+            self.config.local_attention
+        )
+    }
 }
 
+fn new_block_context(
+    precision: Precision,
+    execution: MetalExecutionConfig,
+) -> Result<Box<dyn Any>> {
+    Ok(Box::new(MetalContext::new(precision, execution)?))
+}
+
+#[cfg(test)]
 fn validate_parity(cosine: f64, rank: f64, minimum_cosine: f64, minimum_rank: f64) -> Result<()> {
     ensure!(
         cosine >= minimum_cosine,
@@ -1049,6 +954,10 @@ fn rope_tables(seq: usize, head_dim: usize, theta: f32) -> (Vec<f32>, Vec<f32>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use synapse_bench::parity::{load_reference, mean_parity, rank_overlap};
+
+    const PARITY_K: usize = 10;
+    const PARITY_STRIDE: usize = 1;
 
     #[test]
     fn modernbert_layer_pattern_starts_with_global_attention() {
@@ -1130,7 +1039,7 @@ mod tests {
             execution: Execution::Lazy,
             package_root: None,
         };
-        let mut backend = Backend::new(DeviceArg::Metal, Precision::F16, execution).unwrap();
+        let mut backend = crate::MetalProvider::new_with_config(Precision::F16, execution).unwrap();
 
         if let Ok(output_path) = std::env::var(CHILD_OUTPUT) {
             let baseline = model
