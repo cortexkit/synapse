@@ -336,6 +336,46 @@ const MIGRATIONS: &[Migration] = &[
                  END;
         "#,
     },
+    Migration {
+        version: 7,
+        statements: r#"
+                 DROP INDEX IF EXISTS cert_rows_fingerprint_idx;
+                 ALTER TABLE cert_rows RENAME TO cert_rows_v6;
+                 CREATE TABLE cert_rows (
+                     assurance_class TEXT NOT NULL CHECK (assurance_class IN ('measured', 'declared')),
+                     key_hash TEXT NOT NULL,
+                     machine_profile_hash TEXT NOT NULL,
+                     remote_profile_hash TEXT,
+                     identity_revision TEXT,
+                     numeric_profile_id TEXT NOT NULL,
+                     fingerprint TEXT NOT NULL,
+                     certified_at_ms INTEGER NOT NULL,
+                     os_build TEXT NOT NULL,
+                     module_generation INTEGER NOT NULL,
+                     evidence_json TEXT NOT NULL,
+                     PRIMARY KEY (assurance_class, key_hash, fingerprint),
+                     CHECK (
+                         (assurance_class = 'measured' AND machine_profile_hash = key_hash
+                          AND remote_profile_hash IS NULL AND identity_revision IS NULL)
+                         OR
+                         (assurance_class = 'declared' AND remote_profile_hash IS NOT NULL
+                          AND identity_revision IS NOT NULL)
+                     )
+                 );
+                 INSERT INTO cert_rows (
+                     assurance_class, key_hash, machine_profile_hash, remote_profile_hash,
+                     identity_revision, numeric_profile_id, fingerprint, certified_at_ms,
+                     os_build, module_generation, evidence_json
+                 )
+                 SELECT assurance_class, key_hash, machine_profile_hash, NULL, NULL,
+                        numeric_profile_id, fingerprint, certified_at_ms, os_build,
+                        module_generation, evidence_json
+                 FROM cert_rows_v6
+                 WHERE assurance_class = 'measured';
+                 DROP TABLE cert_rows_v6;
+                 CREATE INDEX cert_rows_fingerprint_idx ON cert_rows(fingerprint);
+        "#,
+    },
 ];
 
 static JOB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -438,19 +478,30 @@ impl AssuranceClass {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum CertificationKey {
-    Measured { machine_profile_hash: String },
-    Declared { remote_profile_hash: String },
+    Measured {
+        machine_profile_hash: String,
+    },
+    Declared {
+        machine_profile_hash: String,
+        remote_profile_hash: String,
+        identity_revision: String,
+    },
 }
 
 impl CertificationKey {
-    fn key_hash(&self) -> &str {
+    fn key_hash(&self) -> String {
         match self {
             Self::Measured {
                 machine_profile_hash,
-            } => machine_profile_hash,
+            } => machine_profile_hash.clone(),
             Self::Declared {
+                machine_profile_hash,
                 remote_profile_hash,
-            } => remote_profile_hash,
+                identity_revision,
+            } => hex::encode(Sha256::digest(
+                serde_json::to_vec(&(machine_profile_hash, remote_profile_hash, identity_revision))
+                    .expect("declared certification key serializes"),
+            )),
         }
     }
 
@@ -712,22 +763,28 @@ impl SynapseStore {
             ));
         }
         let evidence_json = serde_json::to_string(&row.evidence)?;
-        let (machine_profile_hash, remote_profile_hash) = match &row.key {
+        let (machine_profile_hash, remote_profile_hash, identity_revision) = match &row.key {
             CertificationKey::Measured {
                 machine_profile_hash,
-            } => (Some(machine_profile_hash.as_str()), None),
+            } => (machine_profile_hash.as_str(), None, None),
             CertificationKey::Declared {
+                machine_profile_hash,
                 remote_profile_hash,
-            } => (None, Some(remote_profile_hash.as_str())),
+                identity_revision,
+            } => (
+                machine_profile_hash.as_str(),
+                Some(remote_profile_hash.as_str()),
+                Some(identity_revision.as_str()),
+            ),
         };
         self.store.with_conn_fenced(|tx| {
             tx.execute(
                 "INSERT INTO cert_rows (
                      assurance_class, key_hash, machine_profile_hash, remote_profile_hash,
-                     numeric_profile_id, fingerprint, certified_at_ms, os_build,
-                     module_generation, evidence_json
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-                 ON CONFLICT(assurance_class, key_hash, fingerprint) DO UPDATE SET
+                     identity_revision, numeric_profile_id, fingerprint, certified_at_ms,
+                     os_build, module_generation, evidence_json
+                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                  ON CONFLICT(assurance_class, key_hash, fingerprint) DO UPDATE SET
                      numeric_profile_id = excluded.numeric_profile_id,
                      certified_at_ms = excluded.certified_at_ms,
                      os_build = excluded.os_build,
@@ -738,6 +795,7 @@ impl SynapseStore {
                     row.key.key_hash(),
                     machine_profile_hash,
                     remote_profile_hash,
+                    identity_revision,
                     &row.numeric_profile_id.0,
                     &row.fingerprint.0,
                     row.certified_at_ms as i64,
@@ -804,15 +862,22 @@ impl SynapseStore {
     #[allow(dead_code)]
     pub fn get_declared_cert_row(
         &self,
+        machine_profile_hash: &str,
         remote_profile_hash: &str,
+        identity_revision: &str,
         fingerprint: &Fingerprint,
     ) -> Result<Option<CertificationRow>, SynapseStoreError> {
+        let key = CertificationKey::Declared {
+            machine_profile_hash: machine_profile_hash.to_string(),
+            remote_profile_hash: remote_profile_hash.to_string(),
+            identity_revision: identity_revision.to_string(),
+        };
         let raw = self.store.with_conn(|conn| {
             conn.query_row(
                 &format!(
                     "{CERT_SELECT_SQL} WHERE assurance_class = 'declared' AND key_hash = ?1 AND fingerprint = ?2"
                 ),
-                params![remote_profile_hash, &fingerprint.0],
+                params![key.key_hash(), &fingerprint.0],
                 cert_row_from_row,
             )
             .optional()
@@ -1853,13 +1918,14 @@ fn unix_now_ms() -> u64 {
 }
 
 const CERT_SELECT_SQL: &str = "SELECT assurance_class, machine_profile_hash,
-        remote_profile_hash, numeric_profile_id, fingerprint, certified_at_ms,
-        os_build, module_generation, evidence_json FROM cert_rows";
+        remote_profile_hash, identity_revision, numeric_profile_id, fingerprint,
+        certified_at_ms, os_build, module_generation, evidence_json FROM cert_rows";
 
 struct RawCertificationRow {
     assurance_class: String,
     machine_profile_hash: Option<String>,
     remote_profile_hash: Option<String>,
+    identity_revision: Option<String>,
     numeric_profile_id: String,
     fingerprint: String,
     certified_at_ms: u64,
@@ -1904,12 +1970,13 @@ fn cert_row_from_row(row: &Row<'_>) -> rusqlite::Result<RawCertificationRow> {
         assurance_class: row.get(0)?,
         machine_profile_hash: row.get(1)?,
         remote_profile_hash: row.get(2)?,
-        numeric_profile_id: row.get(3)?,
-        fingerprint: row.get(4)?,
-        certified_at_ms: row.get::<_, i64>(5)? as u64,
-        os_build: row.get(6)?,
-        module_generation: row.get::<_, i64>(7)? as u64,
-        evidence_json: row.get(8)?,
+        identity_revision: row.get(3)?,
+        numeric_profile_id: row.get(4)?,
+        fingerprint: row.get(5)?,
+        certified_at_ms: row.get::<_, i64>(6)? as u64,
+        os_build: row.get(7)?,
+        module_generation: row.get::<_, i64>(8)? as u64,
+        evidence_json: row.get(9)?,
     })
 }
 
@@ -1959,9 +2026,19 @@ fn decode_cert_row(row: RawCertificationRow) -> Result<CertificationRow, Synapse
             })?,
         },
         AssuranceClass::Declared => CertificationKey::Declared {
+            machine_profile_hash: row.machine_profile_hash.ok_or_else(|| {
+                SynapseStoreError::Decode(
+                    "declared certification row has no machine profile key".to_string(),
+                )
+            })?,
             remote_profile_hash: row.remote_profile_hash.ok_or_else(|| {
                 SynapseStoreError::Decode(
                     "declared certification row has no remote profile key".to_string(),
+                )
+            })?,
+            identity_revision: row.identity_revision.ok_or_else(|| {
+                SynapseStoreError::Decode(
+                    "declared certification row has no identity revision".to_string(),
                 )
             })?,
         },
@@ -2560,7 +2637,9 @@ mod tests {
         let row = CertificationRow {
             assurance_class: AssuranceClass::Declared,
             key: CertificationKey::Declared {
+                machine_profile_hash: "machine-a".to_string(),
                 remote_profile_hash: "remote-profile".to_string(),
+                identity_revision: "r1".to_string(),
             },
             numeric_profile_id: NumericProfileId("np".to_string()),
             fingerprint: fingerprint.clone(),
@@ -2572,12 +2651,16 @@ mod tests {
         store.store_cert_row(&row).unwrap();
         assert_eq!(
             store
-                .get_declared_cert_row("remote-profile", &fingerprint)
+                .get_declared_cert_row("machine-a", "remote-profile", "r1", &fingerprint)
                 .unwrap(),
             Some(row)
         );
         assert!(store
             .get_cert_row("remote-profile", &fingerprint)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .get_declared_cert_row("machine-b", "remote-profile", "r1", &fingerprint)
             .unwrap()
             .is_none());
         let rejected = crate::declared_certification_for_request(

@@ -1,8 +1,11 @@
 pub(super) mod classify;
 pub(super) mod client;
+pub(crate) mod config;
+pub(super) mod gateway;
 pub(super) mod openai_compat;
 pub(super) mod runtime;
 pub(super) mod validator;
+pub(super) mod vault;
 
 #[cfg(test)]
 pub mod mock;

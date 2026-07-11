@@ -6,6 +6,10 @@ use std::{
     net::Ipv4Addr,
     path::{Path, PathBuf},
     process,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
@@ -24,7 +28,8 @@ use subc_transport::{
     generate_daemon_id, generate_key, write_atomic, ConnectionInfo, Endpoint, SCHEMA_VERSION,
 };
 use tokio::{
-    net::TcpListener,
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
     process::{Child, Command},
     time::{sleep, Instant},
 };
@@ -52,6 +57,153 @@ impl Drop for ModuleProcess {
     fn drop(&mut self) {
         let _ = self.child.start_kill();
     }
+}
+
+struct RemoteMockProvider {
+    port: u16,
+    failures_remaining: Arc<AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl RemoteMockProvider {
+    async fn start() -> Self {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let failures_remaining = Arc::new(AtomicUsize::new(0));
+        let task_failures = Arc::clone(&failures_remaining);
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let failures = Arc::clone(&task_failures);
+                tokio::spawn(async move {
+                    serve_remote_mock_request(stream, failures).await;
+                });
+            }
+        });
+        Self {
+            port,
+            failures_remaining,
+            task,
+        }
+    }
+
+    fn base_url(&self) -> String {
+        format!("http://127.0.0.1:{}/v1", self.port)
+    }
+
+    fn fail_next(&self, count: usize) {
+        self.failures_remaining.store(count, Ordering::SeqCst);
+    }
+}
+
+impl Drop for RemoteMockProvider {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn serve_remote_mock_request(mut stream: TcpStream, failures_remaining: Arc<AtomicUsize>) {
+    let mut request = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    let header_end = loop {
+        let Ok(read) = stream.read(&mut buffer).await else {
+            return;
+        };
+        if read == 0 {
+            return;
+        }
+        request.extend_from_slice(&buffer[..read]);
+        if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+            break index + 4;
+        }
+    };
+    let headers = String::from_utf8_lossy(&request[..header_end]);
+    let content_length = headers
+        .lines()
+        .find_map(|line| {
+            line.split_once(':').and_then(|(name, value)| {
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+        })
+        .unwrap_or(0);
+    while request.len() < header_end + content_length {
+        let Ok(read) = stream.read(&mut buffer).await else {
+            return;
+        };
+        if read == 0 {
+            return;
+        }
+        request.extend_from_slice(&buffer[..read]);
+    }
+    if failures_remaining
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+            remaining.checked_sub(1)
+        })
+        .is_ok()
+    {
+        let _ =
+            write_mock_http_response(&mut stream, 500, serde_json::json!({"error":"storm"})).await;
+        return;
+    }
+    let body: Value = serde_json::from_slice(&request[header_end..header_end + content_length])
+        .unwrap_or_else(|_| serde_json::json!({"input": []}));
+    let inputs = body["input"].as_array().cloned().unwrap_or_default();
+    if inputs.iter().any(|input| {
+        input
+            .as_str()
+            .is_some_and(|text| text.split_whitespace().count() > 128)
+    }) {
+        let _ = write_mock_http_response(
+            &mut stream,
+            400,
+            serde_json::json!({"error":"input exceeds context window"}),
+        )
+        .await;
+        return;
+    }
+    let data = inputs
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            serde_json::json!({
+                "index": index,
+                "embedding": [index as f64 + 1.0, 1.0, 0.5]
+            })
+        })
+        .collect::<Vec<_>>();
+    let _ = write_mock_http_response(
+        &mut stream,
+        200,
+        serde_json::json!({
+            "model":"mock-embed",
+            "data":data,
+            "usage":{"prompt_tokens":inputs.len(),"total_tokens":inputs.len()}
+        }),
+    )
+    .await;
+}
+
+async fn write_mock_http_response(
+    stream: &mut TcpStream,
+    status: u16,
+    body: Value,
+) -> std::io::Result<()> {
+    let body = serde_json::to_vec(&body).unwrap();
+    let reason = match status {
+        200 => "OK",
+        400 => "Bad Request",
+        _ => "Internal Server Error",
+    };
+    let headers = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-Request-Id: mock-{status}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(headers.as_bytes()).await?;
+    stream.write_all(&body).await
 }
 
 async fn start_daemon() -> TestDaemon {
@@ -270,6 +422,171 @@ async fn models_list_round_trips_and_opens_the_daemon_delivered_store() {
         )
         .expect("read module generation");
     assert_eq!(module_generation, 1);
+}
+
+#[tokio::test]
+async fn remote_gateway_declares_calibrates_checkpoints_trips_and_recovers() {
+    let provider = RemoteMockProvider::start().await;
+    let config = serde_json::json!({
+        "inline": {"max_items": 1, "max_tokens": 8192},
+        "remote_providers": [{
+            "name": "mock",
+            "base_url": provider.base_url(),
+            "adapter": {"kind": "openai_compatible"},
+            "auth": {"kind": "none"},
+            "models": [{
+                "synapse_model_id": "remote-embed",
+                "task": "embed",
+                "model": "mock-embed",
+                "identity_revision": "r1",
+                "dims": 3,
+                "input_profile_id": "whitespace-v1",
+                "max_input_tokens": 128,
+                "sentinel_texts": ["alpha", "beta", "gamma"]
+            }],
+            "breaker": {"failure_threshold": 3, "cooldown_ms": 100},
+            "cold_estimate_ms": {"embed": 10, "rerank": 10, "generate": 10},
+            "connect_timeout_ms": 1000,
+            "read_timeout_ms": 1000,
+            "target_subbatch_ms": 100
+        }]
+    })
+    .to_string();
+    let (_daemon, _module, mut consumer, route_channel) = open_route_with_config(&config).await;
+
+    let listed = route_request(
+        &mut consumer,
+        route_channel,
+        20,
+        serde_json::json!({"method":"models.list","params":{}}),
+    )
+    .await;
+    let remote = listed["result"]["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|model| model["model_id"] == "remote-embed")
+        .expect("declared remote model appears in catalog");
+    assert_eq!(remote["assurance"], "declared");
+    assert_eq!(remote["identity_revision"], "r1");
+
+    let before_probe = route_request(
+        &mut consumer,
+        route_channel,
+        21,
+        serde_json::json!({
+            "method":"embed.query",
+            "params":{"model":"remote-embed","text":"hello","accept_declared":true}
+        }),
+    )
+    .await;
+    assert_eq!(before_probe["result"]["error"]["code"], "not_certified");
+
+    for (corr, method, params) in [
+        (
+            22,
+            "rerank.score",
+            serde_json::json!({
+                "model":"remote-embed","query":"q","candidates":["a"],"accept_declared":true
+            }),
+        ),
+        (
+            23,
+            "microllm.oneshot",
+            serde_json::json!({
+                "model":"remote-embed","prompt":"q","max_tokens":1,"accept_declared":true
+            }),
+        ),
+    ] {
+        let rejected = route_request(
+            &mut consumer,
+            route_channel,
+            corr,
+            serde_json::json!({"method":method,"params":params}),
+        )
+        .await;
+        assert_eq!(
+            rejected["result"]["error"]["code"],
+            "op_not_supported_for_remote"
+        );
+    }
+
+    run_probe_job(
+        &mut consumer,
+        route_channel,
+        30,
+        serde_json::json!({"models":["remote-embed"],"request_key":"remote-probe"}),
+    )
+    .await;
+
+    let embedded = route_request(
+        &mut consumer,
+        route_channel,
+        40,
+        serde_json::json!({
+            "method":"embed.query",
+            "params":{"model":"remote-embed","id":"q","text":"hello remote","accept_declared":true}
+        }),
+    )
+    .await;
+    assert_eq!(embedded["result"]["assurance"], "declared");
+    assert_eq!(embedded["result"]["identity_revision"], "r1");
+    assert_eq!(
+        embedded["result"]["provenance"]["remote"]["assurance"],
+        "declared"
+    );
+    assert_eq!(embedded["result"]["payload"]["vectors"][0]["id"], "q");
+    assert!(embedded["result"]["payload"]["vectors"][0]["content_sha256"].is_string());
+
+    let accepted = route_request(
+        &mut consumer,
+        route_channel,
+        41,
+        serde_json::json!({
+            "method":"embed.batch",
+            "params":{
+                "model":"remote-embed",
+                "request_key":"remote-batch",
+                "accept_declared":true,
+                "items":[{"id":"a","text":"alpha"},{"id":"b","text":"beta"}]
+            }
+        }),
+    )
+    .await;
+    let job_id = accepted["result"]["job_id"].as_str().unwrap();
+    let completed = poll_embed_result(&mut consumer, route_channel, 42, job_id).await;
+    assert_eq!(completed["result"]["state"], "done");
+    assert_eq!(completed["result"]["page_count"], 2);
+
+    provider.fail_next(3);
+    let unavailable = route_request(
+        &mut consumer,
+        route_channel,
+        50,
+        serde_json::json!({
+            "method":"embed.query",
+            "params":{"model":"remote-embed","text":"storm","accept_declared":true}
+        }),
+    )
+    .await;
+    assert_eq!(
+        unavailable["result"]["error"]["code"],
+        "provider_unavailable"
+    );
+    assert!(unavailable["result"]["error"]["retry_after_ms"].is_number());
+
+    sleep(Duration::from_millis(150)).await;
+    let recovered = route_request(
+        &mut consumer,
+        route_channel,
+        51,
+        serde_json::json!({
+            "method":"embed.query",
+            "params":{"model":"remote-embed","text":"recovered","accept_declared":true}
+        }),
+    )
+    .await;
+    assert_eq!(recovered["result"]["assurance"], "declared");
 }
 
 #[tokio::test]
