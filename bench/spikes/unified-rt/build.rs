@@ -2,6 +2,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/metal_mpsgraph.m");
     println!("cargo:rerun-if-changed=src/qwen3_mpsgraph.m");
     println!("cargo:rerun-if-changed=src/modernbert_mpsgraph.m");
+    println!("cargo:rerun-if-changed=src/mpsgraph_executable.h");
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
         return;

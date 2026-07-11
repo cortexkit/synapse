@@ -3,6 +3,7 @@
 #import <MetalPerformanceShadersGraph/MPSGraph.h>
 #import <MetalPerformanceShadersGraph/MPSGraphActivationOps.h>
 #import <MetalPerformanceShadersGraph/MPSGraphArithmeticOps.h>
+#import <MetalPerformanceShadersGraph/MPSGraphExecutable.h>
 #import <MetalPerformanceShadersGraph/MPSGraphMatrixMultiplicationOps.h>
 #import <MetalPerformanceShadersGraph/MPSGraphMemoryOps.h>
 #import <MetalPerformanceShadersGraph/MPSGraphNormalizationOps.h>
@@ -19,6 +20,35 @@ typedef NS_ENUM(int32_t, SynapseMpsDType) {
     SynapseMpsDTypeFloat32 = 0,
     SynapseMpsDTypeFloat16 = 1,
 };
+
+typedef NS_ENUM(int32_t, SynapseEvidenceVariant) {
+    SynapseEvidenceFp32 = 0,
+    SynapseEvidencePureF16 = 1,
+    SynapseEvidenceOnlyMatmulF16 = 2,
+    SynapseEvidenceOnlyLayernormF16 = 3,
+    SynapseEvidenceOnlyGeluF16 = 4,
+    SynapseEvidenceOnlyAttentionF16 = 5,
+    SynapseEvidenceOnlyIoF16 = 6,
+    SynapseEvidenceExceptMatmulFp32 = 7,
+    SynapseEvidenceExceptLayernormFp32 = 8,
+    SynapseEvidenceExceptGeluFp32 = 9,
+    SynapseEvidenceExceptAttentionFp32 = 10,
+    SynapseEvidenceExceptIoFp32 = 11,
+    SynapseEvidenceWeightsF16ComputeF32 = 12,
+    SynapseEvidenceWeightsF32ActivationsF16 = 13,
+    SynapseEvidenceF16Fp32MatmulIslands = 14,
+};
+
+typedef struct SynapsePrecisionPolicy {
+    MPSDataType io_type;
+    MPSDataType weight_type;
+    MPSDataType base_type;
+    MPSDataType linear_type;
+    MPSDataType layernorm_type;
+    MPSDataType gelu_type;
+    MPSDataType attention_type;
+    MPSDataType softmax_type;
+} SynapsePrecisionPolicy;
 
 typedef struct SynapseMpsPlan {
     MPSGraph *graph;
@@ -80,6 +110,8 @@ typedef struct SynapseMpsEncoderPlan {
     MPSGraphTensor *input_tensor;
     MPSGraphTensor *mask_tensor;
     MPSGraphTensor *output_tensor;
+    MPSGraphExecutable *executable;
+    NSArray<MPSGraphTensor *> *executable_feed_tensors;
     SynapseMpsEncoderLayerTensors *layers;
     uint64_t layer_count;
 } SynapseMpsEncoderPlan;
@@ -90,6 +122,10 @@ typedef struct SynapseMpsContext {
     NSMutableDictionary<NSString *, NSValue *> *plans;
     NSMutableDictionary<NSString *, NSValue *> *encoder_plans;
     NSMutableDictionary<NSString *, id<MTLBuffer>> *rhs_buffers;
+    NSString *capture_path;
+    NSString *graph_dump_path;
+    BOOL capture_pending;
+    BOOL graph_dump_pending;
 } SynapseMpsContext;
 
 static void synapse_mps_clear_error(void) {
@@ -131,6 +167,66 @@ static NSUInteger synapse_mps_dtype_size(int32_t dtype) {
     }
 }
 
+static NSUInteger synapse_mps_type_size(MPSDataType data_type) {
+    return data_type == MPSDataTypeFloat16 ? sizeof(uint16_t) : sizeof(float);
+}
+
+static SynapsePrecisionPolicy synapse_mps_precision_policy(int32_t variant) {
+    const MPSDataType f32 = MPSDataTypeFloat32;
+    const MPSDataType f16 = MPSDataTypeFloat16;
+    SynapsePrecisionPolicy policy = {f32, f32, f32, f32, f32, f32, f32, f32};
+    switch (variant) {
+        case SynapseEvidencePureF16:
+            policy = (SynapsePrecisionPolicy){f16, f16, f16, f16, f32, f32, f16, f32};
+            break;
+        case SynapseEvidenceOnlyMatmulF16:
+            policy.linear_type = f16;
+            policy.weight_type = f16;
+            break;
+        case SynapseEvidenceOnlyLayernormF16:
+            policy.layernorm_type = f16;
+            break;
+        case SynapseEvidenceOnlyGeluF16:
+            policy.gelu_type = f16;
+            break;
+        case SynapseEvidenceOnlyAttentionF16:
+            policy.attention_type = f16;
+            policy.softmax_type = f16;
+            break;
+        case SynapseEvidenceOnlyIoF16:
+            policy.io_type = f16;
+            break;
+        case SynapseEvidenceExceptMatmulFp32:
+            policy = (SynapsePrecisionPolicy){f16, f32, f16, f32, f16, f16, f16, f16};
+            break;
+        case SynapseEvidenceExceptLayernormFp32:
+            policy = (SynapsePrecisionPolicy){f16, f16, f16, f16, f32, f16, f16, f16};
+            break;
+        case SynapseEvidenceExceptGeluFp32:
+            policy = (SynapsePrecisionPolicy){f16, f16, f16, f16, f16, f32, f16, f16};
+            break;
+        case SynapseEvidenceExceptAttentionFp32:
+            policy = (SynapsePrecisionPolicy){f16, f16, f16, f16, f16, f16, f32, f32};
+            break;
+        case SynapseEvidenceExceptIoFp32:
+            policy = (SynapsePrecisionPolicy){f32, f16, f16, f16, f16, f16, f16, f16};
+            break;
+        case SynapseEvidenceWeightsF16ComputeF32:
+            policy.weight_type = f16;
+            break;
+        case SynapseEvidenceWeightsF32ActivationsF16:
+            policy = (SynapsePrecisionPolicy){f32, f32, f16, f32, f32, f32, f32, f32};
+            break;
+        case SynapseEvidenceF16Fp32MatmulIslands:
+            policy = (SynapsePrecisionPolicy){f16, f16, f16, f32, f32, f32, f32, f32};
+            break;
+        case SynapseEvidenceFp32:
+        default:
+            break;
+    }
+    return policy;
+}
+
 static NSString *synapse_mps_plan_key(uint64_t m, uint64_t n, uint64_t k, int32_t dtype, int32_t b_is_row_major_nk) {
     return [NSString stringWithFormat:@"%llu:%llu:%llu:%d:%d",
                                       (unsigned long long)m,
@@ -148,7 +244,7 @@ static NSString *synapse_mps_encoder_plan_key(
     uint64_t intermediate,
     uint64_t layer_count,
     float layer_norm_eps,
-    int32_t dtype
+    int32_t variant
 ) {
     return [NSString stringWithFormat:@"encoder:%llu:%llu:%llu:%llu:%llu:%llu:%.9g:%d",
                                       (unsigned long long)batch,
@@ -158,7 +254,7 @@ static NSString *synapse_mps_encoder_plan_key(
                                       (unsigned long long)intermediate,
                                       (unsigned long long)layer_count,
                                       (double)layer_norm_eps,
-                                      dtype];
+                                      variant];
 }
 
 static NSString *synapse_mps_rhs_key(const void *b, NSUInteger byte_count) {
@@ -207,6 +303,8 @@ static void synapse_mps_encoder_plan_free(SynapseMpsEncoderPlan *plan) {
         }
         free(plan->layers);
     }
+    [plan->executable_feed_tensors release];
+    [plan->executable release];
     [plan->output_tensor release];
     [plan->mask_tensor release];
     [plan->input_tensor release];
@@ -230,17 +328,27 @@ static MPSGraphTensor *synapse_mps_scalar(MPSGraph *graph, double value, MPSData
     return [graph constantWithScalar:value dataType:data_type];
 }
 
+static MPSGraphTensor *synapse_mps_cast(MPSGraph *graph, MPSGraphTensor *tensor, MPSDataType data_type) {
+    return tensor.dataType == data_type ? tensor : [graph castTensor:tensor toType:data_type name:nil];
+}
+
 static MPSGraphTensor *synapse_mps_linear(
     MPSGraph *graph,
     MPSGraphTensor *input,
     MPSGraphTensor *weight,
-    MPSGraphTensor *bias
+    MPSGraphTensor *bias,
+    MPSDataType compute_type,
+    MPSDataType output_type
 ) {
+    input = synapse_mps_cast(graph, input, compute_type);
+    weight = synapse_mps_cast(graph, weight, compute_type);
+    bias = synapse_mps_cast(graph, bias, compute_type);
     MPSGraphTensor *weight_t = [graph transposeTensor:weight dimension:0 withDimension:1 name:nil];
     MPSGraphTensor *product = [graph matrixMultiplicationWithPrimaryTensor:input
                                                             secondaryTensor:weight_t
                                                                        name:nil];
-    return [graph additionWithPrimaryTensor:product secondaryTensor:bias name:nil];
+    MPSGraphTensor *output = [graph additionWithPrimaryTensor:product secondaryTensor:bias name:nil];
+    return synapse_mps_cast(graph, output, output_type);
 }
 
 static MPSGraphTensor *synapse_mps_layer_norm(
@@ -250,19 +358,14 @@ static MPSGraphTensor *synapse_mps_layer_norm(
     MPSGraphTensor *bias,
     uint64_t rows,
     float epsilon,
-    MPSDataType graph_data_type
+    MPSDataType compute_type,
+    MPSDataType output_type
 ) {
     NSArray<NSNumber *> *axes = @[ @1 ];
     MPSShape *mean_shape = @[ @(rows), @1 ];
-    MPSDataType compute_type = graph_data_type == MPSDataTypeFloat16 ? MPSDataTypeFloat32 : graph_data_type;
-    MPSGraphTensor *norm_input = input;
-    MPSGraphTensor *norm_weight = weight;
-    MPSGraphTensor *norm_bias = bias;
-    if (compute_type != graph_data_type) {
-        norm_input = [graph castTensor:input toType:compute_type name:nil];
-        norm_weight = [graph castTensor:weight toType:compute_type name:nil];
-        norm_bias = [graph castTensor:bias toType:compute_type name:nil];
-    }
+    MPSGraphTensor *norm_input = synapse_mps_cast(graph, input, compute_type);
+    MPSGraphTensor *norm_weight = synapse_mps_cast(graph, weight, compute_type);
+    MPSGraphTensor *norm_bias = synapse_mps_cast(graph, bias, compute_type);
     MPSGraphTensor *mean = [graph meanOfTensor:norm_input axes:axes name:nil];
     MPSGraphTensor *variance = [graph varianceOfTensor:norm_input meanTensor:mean axes:axes name:nil];
     mean = [graph reshapeTensor:mean withShape:mean_shape name:nil];
@@ -274,18 +377,16 @@ static MPSGraphTensor *synapse_mps_layer_norm(
     MPSGraphTensor *normalized = [graph divisionWithPrimaryTensor:centered secondaryTensor:std name:nil];
     MPSGraphTensor *scaled = [graph multiplicationWithPrimaryTensor:normalized secondaryTensor:norm_weight name:nil];
     MPSGraphTensor *output = [graph additionWithPrimaryTensor:scaled secondaryTensor:norm_bias name:nil];
-    if (compute_type != graph_data_type) {
-        output = [graph castTensor:output toType:graph_data_type name:nil];
-    }
-    return output;
+    return synapse_mps_cast(graph, output, output_type);
 }
 
-static MPSGraphTensor *synapse_mps_gelu(MPSGraph *graph, MPSGraphTensor *input, MPSDataType graph_data_type) {
-    MPSDataType compute_type = graph_data_type == MPSDataTypeFloat16 ? MPSDataTypeFloat32 : graph_data_type;
-    MPSGraphTensor *gelu_input = input;
-    if (compute_type != graph_data_type) {
-        gelu_input = [graph castTensor:input toType:compute_type name:nil];
-    }
+static MPSGraphTensor *synapse_mps_gelu(
+    MPSGraph *graph,
+    MPSGraphTensor *input,
+    MPSDataType compute_type,
+    MPSDataType output_type
+) {
+    MPSGraphTensor *gelu_input = synapse_mps_cast(graph, input, compute_type);
     MPSGraphTensor *inv_sqrt2 = synapse_mps_scalar(graph, 0.70710678118654752440, compute_type);
     MPSGraphTensor *one = synapse_mps_scalar(graph, 1.0, compute_type);
     MPSGraphTensor *half = synapse_mps_scalar(graph, 0.5, compute_type);
@@ -294,10 +395,7 @@ static MPSGraphTensor *synapse_mps_gelu(MPSGraph *graph, MPSGraphTensor *input, 
     MPSGraphTensor *one_plus_erf = [graph additionWithPrimaryTensor:one secondaryTensor:erf name:nil];
     MPSGraphTensor *weighted = [graph multiplicationWithPrimaryTensor:gelu_input secondaryTensor:one_plus_erf name:nil];
     MPSGraphTensor *output = [graph multiplicationWithPrimaryTensor:weighted secondaryTensor:half name:nil];
-    if (compute_type != graph_data_type) {
-        output = [graph castTensor:output toType:graph_data_type name:nil];
-    }
-    return output;
+    return synapse_mps_cast(graph, output, output_type);
 }
 
 static BOOL synapse_mps_encoder_layer_tensors_valid(SynapseMpsEncoderLayerTensors *layer) {
@@ -361,7 +459,7 @@ static SynapseMpsEncoderPlan *synapse_mps_encoder_plan_new(
     uint64_t intermediate,
     uint64_t layer_count,
     float layer_norm_eps,
-    int32_t dtype
+    int32_t variant
 ) {
     SynapseMpsEncoderPlan *plan = (SynapseMpsEncoderPlan *)calloc(1, sizeof(SynapseMpsEncoderPlan));
     if (plan == NULL) {
@@ -371,12 +469,9 @@ static SynapseMpsEncoderPlan *synapse_mps_encoder_plan_new(
 
     const uint64_t rows = batch * seq;
     const uint64_t head_dim = hidden / heads;
-    MPSDataType graph_data_type = synapse_mps_data_type(dtype);
-    // The public MPSGraph matrix-multiplication API in this SDK exposes operand
-    // dtypes but not a separate accumulation-precision control. The f16 path
-    // therefore uses native MPSGraph float16 matmuls and only upcasts the
-    // cheaper reduction-heavy pieces where explicit casts are available.
-    MPSDataType softmax_data_type = graph_data_type == MPSDataTypeFloat16 ? MPSDataTypeFloat32 : graph_data_type;
+    SynapsePrecisionPolicy policy = synapse_mps_precision_policy(variant);
+    // MPSGraph exposes operand dtypes but no independent accumulation control.
+    // Explicit casts make each evidence variant's arithmetic islands inspectable.
     plan->layer_count = layer_count;
     plan->hidden_shape = [@[ @(batch), @(seq), @(hidden) ] retain];
     plan->hidden_2d_shape = [@[ @(rows), @(hidden) ] retain];
@@ -398,30 +493,31 @@ static SynapseMpsEncoderPlan *synapse_mps_encoder_plan_new(
     }
     plan->graph.options = MPSGraphOptionsSynchronizeResults;
 
-    plan->input_tensor = synapse_mps_placeholder(plan->graph, plan->hidden_shape, graph_data_type, @"encoder_input");
+    plan->input_tensor = synapse_mps_placeholder(plan->graph, plan->hidden_shape, policy.io_type, @"encoder_input");
     plan->mask_tensor = synapse_mps_placeholder(plan->graph, plan->mask_shape, MPSDataTypeFloat32, @"attention_mask_additive");
     MPSGraphTensor *x = [plan->graph reshapeTensor:plan->input_tensor withShape:plan->hidden_2d_shape name:nil];
+    x = synapse_mps_cast(plan->graph, x, policy.base_type);
     MPSShape *hidden_4d_shape = @[ @(batch), @(seq), @(heads), @(head_dim) ];
 
     for (uint64_t layer_index = 0; layer_index < layer_count; layer_index++) {
         SynapseMpsEncoderLayerTensors *layer = &plan->layers[layer_index];
         NSString *prefix = [NSString stringWithFormat:@"layer_%llu", (unsigned long long)layer_index];
-        layer->query_weight = synapse_mps_placeholder(plan->graph, plan->hidden_hidden_weight_shape, graph_data_type, [prefix stringByAppendingString:@"_query_weight"]);
-        layer->query_bias = synapse_mps_placeholder(plan->graph, plan->hidden_bias_shape, graph_data_type, [prefix stringByAppendingString:@"_query_bias"]);
-        layer->key_weight = synapse_mps_placeholder(plan->graph, plan->hidden_hidden_weight_shape, graph_data_type, [prefix stringByAppendingString:@"_key_weight"]);
-        layer->key_bias = synapse_mps_placeholder(plan->graph, plan->hidden_bias_shape, graph_data_type, [prefix stringByAppendingString:@"_key_bias"]);
-        layer->value_weight = synapse_mps_placeholder(plan->graph, plan->hidden_hidden_weight_shape, graph_data_type, [prefix stringByAppendingString:@"_value_weight"]);
-        layer->value_bias = synapse_mps_placeholder(plan->graph, plan->hidden_bias_shape, graph_data_type, [prefix stringByAppendingString:@"_value_bias"]);
-        layer->attention_output_weight = synapse_mps_placeholder(plan->graph, plan->hidden_hidden_weight_shape, graph_data_type, [prefix stringByAppendingString:@"_attention_output_weight"]);
-        layer->attention_output_bias = synapse_mps_placeholder(plan->graph, plan->hidden_bias_shape, graph_data_type, [prefix stringByAppendingString:@"_attention_output_bias"]);
-        layer->attention_ln_weight = synapse_mps_placeholder(plan->graph, plan->hidden_bias_shape, graph_data_type, [prefix stringByAppendingString:@"_attention_ln_weight"]);
-        layer->attention_ln_bias = synapse_mps_placeholder(plan->graph, plan->hidden_bias_shape, graph_data_type, [prefix stringByAppendingString:@"_attention_ln_bias"]);
-        layer->intermediate_weight = synapse_mps_placeholder(plan->graph, plan->intermediate_hidden_weight_shape, graph_data_type, [prefix stringByAppendingString:@"_intermediate_weight"]);
-        layer->intermediate_bias = synapse_mps_placeholder(plan->graph, plan->intermediate_bias_shape, graph_data_type, [prefix stringByAppendingString:@"_intermediate_bias"]);
-        layer->output_weight = synapse_mps_placeholder(plan->graph, plan->hidden_intermediate_weight_shape, graph_data_type, [prefix stringByAppendingString:@"_output_weight"]);
-        layer->output_bias = synapse_mps_placeholder(plan->graph, plan->hidden_bias_shape, graph_data_type, [prefix stringByAppendingString:@"_output_bias"]);
-        layer->output_ln_weight = synapse_mps_placeholder(plan->graph, plan->hidden_bias_shape, graph_data_type, [prefix stringByAppendingString:@"_output_ln_weight"]);
-        layer->output_ln_bias = synapse_mps_placeholder(plan->graph, plan->hidden_bias_shape, graph_data_type, [prefix stringByAppendingString:@"_output_ln_bias"]);
+        layer->query_weight = synapse_mps_placeholder(plan->graph, plan->hidden_hidden_weight_shape, policy.weight_type, [prefix stringByAppendingString:@"_query_weight"]);
+        layer->query_bias = synapse_mps_placeholder(plan->graph, plan->hidden_bias_shape, policy.weight_type, [prefix stringByAppendingString:@"_query_bias"]);
+        layer->key_weight = synapse_mps_placeholder(plan->graph, plan->hidden_hidden_weight_shape, policy.weight_type, [prefix stringByAppendingString:@"_key_weight"]);
+        layer->key_bias = synapse_mps_placeholder(plan->graph, plan->hidden_bias_shape, policy.weight_type, [prefix stringByAppendingString:@"_key_bias"]);
+        layer->value_weight = synapse_mps_placeholder(plan->graph, plan->hidden_hidden_weight_shape, policy.weight_type, [prefix stringByAppendingString:@"_value_weight"]);
+        layer->value_bias = synapse_mps_placeholder(plan->graph, plan->hidden_bias_shape, policy.weight_type, [prefix stringByAppendingString:@"_value_bias"]);
+        layer->attention_output_weight = synapse_mps_placeholder(plan->graph, plan->hidden_hidden_weight_shape, policy.weight_type, [prefix stringByAppendingString:@"_attention_output_weight"]);
+        layer->attention_output_bias = synapse_mps_placeholder(plan->graph, plan->hidden_bias_shape, policy.weight_type, [prefix stringByAppendingString:@"_attention_output_bias"]);
+        layer->attention_ln_weight = synapse_mps_placeholder(plan->graph, plan->hidden_bias_shape, policy.weight_type, [prefix stringByAppendingString:@"_attention_ln_weight"]);
+        layer->attention_ln_bias = synapse_mps_placeholder(plan->graph, plan->hidden_bias_shape, policy.weight_type, [prefix stringByAppendingString:@"_attention_ln_bias"]);
+        layer->intermediate_weight = synapse_mps_placeholder(plan->graph, plan->intermediate_hidden_weight_shape, policy.weight_type, [prefix stringByAppendingString:@"_intermediate_weight"]);
+        layer->intermediate_bias = synapse_mps_placeholder(plan->graph, plan->intermediate_bias_shape, policy.weight_type, [prefix stringByAppendingString:@"_intermediate_bias"]);
+        layer->output_weight = synapse_mps_placeholder(plan->graph, plan->hidden_intermediate_weight_shape, policy.weight_type, [prefix stringByAppendingString:@"_output_weight"]);
+        layer->output_bias = synapse_mps_placeholder(plan->graph, plan->hidden_bias_shape, policy.weight_type, [prefix stringByAppendingString:@"_output_bias"]);
+        layer->output_ln_weight = synapse_mps_placeholder(plan->graph, plan->hidden_bias_shape, policy.weight_type, [prefix stringByAppendingString:@"_output_ln_weight"]);
+        layer->output_ln_bias = synapse_mps_placeholder(plan->graph, plan->hidden_bias_shape, policy.weight_type, [prefix stringByAppendingString:@"_output_ln_bias"]);
         if (!synapse_mps_encoder_layer_tensors_valid(layer)) {
             synapse_mps_encoder_plan_free(plan);
             synapse_mps_set_c_error("failed to create MPSGraph encoder placeholders");
@@ -429,43 +525,45 @@ static SynapseMpsEncoderPlan *synapse_mps_encoder_plan_new(
         }
 
         MPSGraphTensor *attention_residual = x;
-        MPSGraphTensor *q = synapse_mps_linear(plan->graph, x, layer->query_weight, layer->query_bias);
-        MPSGraphTensor *k = synapse_mps_linear(plan->graph, x, layer->key_weight, layer->key_bias);
-        MPSGraphTensor *v = synapse_mps_linear(plan->graph, x, layer->value_weight, layer->value_bias);
+        MPSGraphTensor *q = synapse_mps_linear(plan->graph, x, layer->query_weight, layer->query_bias, policy.linear_type, policy.base_type);
+        MPSGraphTensor *k = synapse_mps_linear(plan->graph, x, layer->key_weight, layer->key_bias, policy.linear_type, policy.base_type);
+        MPSGraphTensor *v = synapse_mps_linear(plan->graph, x, layer->value_weight, layer->value_bias, policy.linear_type, policy.base_type);
         q = [plan->graph reshapeTensor:q withShape:hidden_4d_shape name:nil];
         k = [plan->graph reshapeTensor:k withShape:hidden_4d_shape name:nil];
         v = [plan->graph reshapeTensor:v withShape:hidden_4d_shape name:nil];
         q = [plan->graph transposeTensor:q permutation:@[ @0, @2, @1, @3 ] name:nil];
         k = [plan->graph transposeTensor:k permutation:@[ @0, @2, @1, @3 ] name:nil];
         v = [plan->graph transposeTensor:v permutation:@[ @0, @2, @1, @3 ] name:nil];
+        q = synapse_mps_cast(plan->graph, q, policy.attention_type);
+        k = synapse_mps_cast(plan->graph, k, policy.attention_type);
+        v = synapse_mps_cast(plan->graph, v, policy.attention_type);
         k = [plan->graph transposeTensor:k dimension:2 withDimension:3 name:nil];
         MPSGraphTensor *scores = [plan->graph matrixMultiplicationWithPrimaryTensor:q secondaryTensor:k name:nil];
-        if (softmax_data_type != graph_data_type) {
-            scores = [plan->graph castTensor:scores toType:softmax_data_type name:nil];
-        }
-        MPSGraphTensor *scale = synapse_mps_scalar(plan->graph, 1.0 / sqrt((double)head_dim), softmax_data_type);
+        scores = synapse_mps_cast(plan->graph, scores, policy.softmax_type);
+        MPSGraphTensor *scale = synapse_mps_scalar(plan->graph, 1.0 / sqrt((double)head_dim), policy.softmax_type);
+        MPSGraphTensor *mask = synapse_mps_cast(plan->graph, plan->mask_tensor, policy.softmax_type);
         scores = [plan->graph multiplicationWithPrimaryTensor:scores secondaryTensor:scale name:nil];
-        scores = [plan->graph additionWithPrimaryTensor:scores secondaryTensor:plan->mask_tensor name:nil];
+        scores = [plan->graph additionWithPrimaryTensor:scores secondaryTensor:mask name:nil];
         scores = [plan->graph softMaxWithTensor:scores axis:3 name:nil];
-        if (softmax_data_type != graph_data_type) {
-            scores = [plan->graph castTensor:scores toType:graph_data_type name:nil];
-        }
+        scores = synapse_mps_cast(plan->graph, scores, policy.attention_type);
         MPSGraphTensor *context = [plan->graph matrixMultiplicationWithPrimaryTensor:scores secondaryTensor:v name:nil];
+        context = synapse_mps_cast(plan->graph, context, policy.base_type);
         context = [plan->graph transposeTensor:context permutation:@[ @0, @2, @1, @3 ] name:nil];
         context = [plan->graph reshapeTensor:context withShape:plan->hidden_2d_shape name:nil];
 
-        MPSGraphTensor *attention_out = synapse_mps_linear(plan->graph, context, layer->attention_output_weight, layer->attention_output_bias);
+        MPSGraphTensor *attention_out = synapse_mps_linear(plan->graph, context, layer->attention_output_weight, layer->attention_output_bias, policy.linear_type, policy.base_type);
         attention_out = [plan->graph additionWithPrimaryTensor:attention_out secondaryTensor:attention_residual name:nil];
-        x = synapse_mps_layer_norm(plan->graph, attention_out, layer->attention_ln_weight, layer->attention_ln_bias, rows, layer_norm_eps, graph_data_type);
+        x = synapse_mps_layer_norm(plan->graph, attention_out, layer->attention_ln_weight, layer->attention_ln_bias, rows, layer_norm_eps, policy.layernorm_type, policy.base_type);
 
         MPSGraphTensor *ffn_residual = x;
-        MPSGraphTensor *intermediate_out = synapse_mps_linear(plan->graph, x, layer->intermediate_weight, layer->intermediate_bias);
-        intermediate_out = synapse_mps_gelu(plan->graph, intermediate_out, graph_data_type);
-        MPSGraphTensor *output = synapse_mps_linear(plan->graph, intermediate_out, layer->output_weight, layer->output_bias);
+        MPSGraphTensor *intermediate_out = synapse_mps_linear(plan->graph, x, layer->intermediate_weight, layer->intermediate_bias, policy.linear_type, policy.base_type);
+        intermediate_out = synapse_mps_gelu(plan->graph, intermediate_out, policy.gelu_type, policy.base_type);
+        MPSGraphTensor *output = synapse_mps_linear(plan->graph, intermediate_out, layer->output_weight, layer->output_bias, policy.linear_type, policy.base_type);
         output = [plan->graph additionWithPrimaryTensor:output secondaryTensor:ffn_residual name:nil];
-        x = synapse_mps_layer_norm(plan->graph, output, layer->output_ln_weight, layer->output_ln_bias, rows, layer_norm_eps, graph_data_type);
+        x = synapse_mps_layer_norm(plan->graph, output, layer->output_ln_weight, layer->output_ln_bias, rows, layer_norm_eps, policy.layernorm_type, policy.base_type);
     }
 
+    x = synapse_mps_cast(plan->graph, x, policy.io_type);
     plan->output_tensor = [[plan->graph reshapeTensor:x withShape:plan->hidden_shape name:@"encoder_output"] retain];
     if (plan->input_tensor == nil || plan->mask_tensor == nil || plan->output_tensor == nil) {
         synapse_mps_encoder_plan_free(plan);
@@ -506,15 +604,15 @@ static SynapseMpsEncoderPlan *synapse_mps_get_encoder_plan(
     uint64_t intermediate,
     uint64_t layer_count,
     float layer_norm_eps,
-    int32_t dtype
+    int32_t variant
 ) {
-    NSString *key = synapse_mps_encoder_plan_key(batch, seq, hidden, heads, intermediate, layer_count, layer_norm_eps, dtype);
+    NSString *key = synapse_mps_encoder_plan_key(batch, seq, hidden, heads, intermediate, layer_count, layer_norm_eps, variant);
     NSValue *cached = [context->encoder_plans objectForKey:key];
     if (cached != nil) {
         return (SynapseMpsEncoderPlan *)cached.pointerValue;
     }
 
-    SynapseMpsEncoderPlan *plan = synapse_mps_encoder_plan_new(batch, seq, hidden, heads, intermediate, layer_count, layer_norm_eps, dtype);
+    SynapseMpsEncoderPlan *plan = synapse_mps_encoder_plan_new(batch, seq, hidden, heads, intermediate, layer_count, layer_norm_eps, variant);
     if (plan == NULL) {
         return NULL;
     }
@@ -578,13 +676,225 @@ static BOOL synapse_mps_add_cached_feed(
     MPSShape *shape,
     const void *values,
     NSUInteger element_count,
-    int32_t dtype
+    MPSDataType data_type
 ) {
-    id<MTLBuffer> buffer = synapse_mps_get_cached_buffer(context, values, element_count * synapse_mps_dtype_size(dtype));
+    id<MTLBuffer> buffer = synapse_mps_get_cached_buffer(context, values, element_count * synapse_mps_type_size(data_type));
     if (buffer == nil) {
         return NO;
     }
-    return synapse_mps_add_feed(feeds, tensor, shape, buffer, synapse_mps_data_type(dtype));
+    return synapse_mps_add_feed(feeds, tensor, shape, buffer, data_type);
+}
+
+static BOOL synapse_mps_add_shaped_type(
+    NSMutableDictionary<MPSGraphTensor *, MPSGraphShapedType *> *feeds,
+    MPSGraphTensor *tensor,
+    MPSShape *shape,
+    MPSDataType data_type
+) {
+    MPSGraphShapedType *shaped_type = [[MPSGraphShapedType alloc] initWithShape:shape dataType:data_type];
+    if (shaped_type == nil) {
+        synapse_mps_set_c_error("failed to create MPSGraph shaped feed type");
+        return NO;
+    }
+    [feeds setObject:shaped_type forKey:tensor];
+    [shaped_type release];
+    return YES;
+}
+
+static NSMutableDictionary<MPSGraphTensor *, MPSGraphShapedType *> *synapse_mps_encoder_shaped_feeds(
+    SynapseMpsEncoderPlan *plan,
+    SynapsePrecisionPolicy policy
+) {
+    NSMutableDictionary<MPSGraphTensor *, MPSGraphShapedType *> *feeds =
+        [[NSMutableDictionary alloc] initWithCapacity:(NSUInteger)(2 + plan->layer_count * 16)];
+    if (feeds == nil ||
+        !synapse_mps_add_shaped_type(feeds, plan->input_tensor, plan->hidden_shape, policy.io_type) ||
+        !synapse_mps_add_shaped_type(feeds, plan->mask_tensor, plan->mask_shape, MPSDataTypeFloat32)) {
+        [feeds release];
+        return nil;
+    }
+
+    for (uint64_t layer_index = 0; layer_index < plan->layer_count; layer_index++) {
+        SynapseMpsEncoderLayerTensors *layer = &plan->layers[layer_index];
+        if (!synapse_mps_add_shaped_type(feeds, layer->query_weight, plan->hidden_hidden_weight_shape, policy.weight_type) ||
+            !synapse_mps_add_shaped_type(feeds, layer->query_bias, plan->hidden_bias_shape, policy.weight_type) ||
+            !synapse_mps_add_shaped_type(feeds, layer->key_weight, plan->hidden_hidden_weight_shape, policy.weight_type) ||
+            !synapse_mps_add_shaped_type(feeds, layer->key_bias, plan->hidden_bias_shape, policy.weight_type) ||
+            !synapse_mps_add_shaped_type(feeds, layer->value_weight, plan->hidden_hidden_weight_shape, policy.weight_type) ||
+            !synapse_mps_add_shaped_type(feeds, layer->value_bias, plan->hidden_bias_shape, policy.weight_type) ||
+            !synapse_mps_add_shaped_type(feeds, layer->attention_output_weight, plan->hidden_hidden_weight_shape, policy.weight_type) ||
+            !synapse_mps_add_shaped_type(feeds, layer->attention_output_bias, plan->hidden_bias_shape, policy.weight_type) ||
+            !synapse_mps_add_shaped_type(feeds, layer->attention_ln_weight, plan->hidden_bias_shape, policy.weight_type) ||
+            !synapse_mps_add_shaped_type(feeds, layer->attention_ln_bias, plan->hidden_bias_shape, policy.weight_type) ||
+            !synapse_mps_add_shaped_type(feeds, layer->intermediate_weight, plan->intermediate_hidden_weight_shape, policy.weight_type) ||
+            !synapse_mps_add_shaped_type(feeds, layer->intermediate_bias, plan->intermediate_bias_shape, policy.weight_type) ||
+            !synapse_mps_add_shaped_type(feeds, layer->output_weight, plan->hidden_intermediate_weight_shape, policy.weight_type) ||
+            !synapse_mps_add_shaped_type(feeds, layer->output_bias, plan->hidden_bias_shape, policy.weight_type) ||
+            !synapse_mps_add_shaped_type(feeds, layer->output_ln_weight, plan->hidden_bias_shape, policy.weight_type) ||
+            !synapse_mps_add_shaped_type(feeds, layer->output_ln_bias, plan->hidden_bias_shape, policy.weight_type)) {
+            [feeds release];
+            return nil;
+        }
+    }
+    return feeds;
+}
+
+static NSArray<MPSGraphTensorData *> *synapse_mps_executable_inputs(
+    SynapseMpsEncoderPlan *plan,
+    NSDictionary<MPSGraphTensor *, MPSGraphTensorData *> *feeds
+) {
+    NSMutableArray<MPSGraphTensorData *> *inputs =
+        [NSMutableArray arrayWithCapacity:plan->executable_feed_tensors.count];
+    for (MPSGraphTensor *tensor in plan->executable_feed_tensors) {
+        MPSGraphTensorData *data = [feeds objectForKey:tensor];
+        if (data == nil) {
+            for (MPSGraphTensor *feed_tensor in feeds) {
+                if ([feed_tensor.operation.name isEqualToString:tensor.operation.name]) {
+                    data = [feeds objectForKey:feed_tensor];
+                    break;
+                }
+            }
+        }
+        if (data == nil) {
+            synapse_mps_set_ns_error([NSString stringWithFormat:@"no encoder feed for executable input %@", tensor.operation.name]);
+            return nil;
+        }
+        [inputs addObject:data];
+    }
+    return inputs;
+}
+
+int32_t synapse_mps_prepare_encoder(
+    void *raw_context,
+    uint64_t batch,
+    uint64_t seq,
+    uint64_t hidden,
+    uint64_t heads,
+    uint64_t intermediate,
+    uint64_t layer_count,
+    float layer_norm_eps,
+    int32_t variant,
+    int32_t optimization_level,
+    const char *package_path,
+    int32_t load_package,
+    int32_t append_package,
+    double *prepare_wall_s,
+    double *specialize_wall_s,
+    double *serialize_wall_s
+) {
+    @autoreleasepool {
+        @try {
+            synapse_mps_clear_error();
+            SynapseMpsContext *context = (SynapseMpsContext *)raw_context;
+            if (context == NULL || context->device == nil || context->queue == nil) {
+                synapse_mps_set_c_error("Metal context is not initialized");
+                return -1;
+            }
+            if (batch == 0 || seq == 0 || hidden == 0 || heads == 0 || intermediate == 0 || layer_count == 0 ||
+                prepare_wall_s == NULL || specialize_wall_s == NULL || serialize_wall_s == NULL) {
+                synapse_mps_set_c_error("encoder preparation received invalid dimensions or timing pointers");
+                return -2;
+            }
+            *prepare_wall_s = 0.0;
+            *specialize_wall_s = 0.0;
+            *serialize_wall_s = 0.0;
+
+            SynapseMpsEncoderPlan *plan = synapse_mps_get_encoder_plan(
+                context, batch, seq, hidden, heads, intermediate, layer_count, layer_norm_eps, variant
+            );
+            if (plan == NULL) {
+                return -3;
+            }
+            if (plan->executable != nil) {
+                return 0;
+            }
+
+            MPSGraphCompilationDescriptor *descriptor = [[MPSGraphCompilationDescriptor alloc] init];
+            descriptor.optimizationLevel = optimization_level == 0 ? MPSGraphOptimizationLevel0 : MPSGraphOptimizationLevel1;
+            descriptor.waitForCompilationCompletion = YES;
+            NSTimeInterval started = [NSDate timeIntervalSinceReferenceDate];
+            if (load_package) {
+                if (package_path == NULL) {
+                    [descriptor release];
+                    synapse_mps_set_c_error("package load requires a package path");
+                    return -4;
+                }
+                NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:package_path]];
+                plan->executable = [[MPSGraphExecutable alloc] initWithMPSGraphPackageAtURL:url
+                                                                    compilationDescriptor:descriptor];
+            } else {
+                SynapsePrecisionPolicy policy = synapse_mps_precision_policy(variant);
+                NSMutableDictionary<MPSGraphTensor *, MPSGraphShapedType *> *feeds =
+                    synapse_mps_encoder_shaped_feeds(plan, policy);
+                if (feeds == nil) {
+                    [descriptor release];
+                    return -5;
+                }
+                MPSGraphDevice *device = [MPSGraphDevice deviceWithMTLDevice:context->device];
+                plan->executable = [[plan->graph compileWithDevice:device
+                                                            feeds:feeds
+                                                    targetTensors:@[ plan->output_tensor ]
+                                                 targetOperations:nil
+                                            compilationDescriptor:descriptor] retain];
+                if (plan->executable != nil) {
+                    NSMutableArray<MPSGraphType *> *input_types =
+                        [NSMutableArray arrayWithCapacity:plan->executable.feedTensors.count];
+                    for (MPSGraphTensor *feed_tensor in plan->executable.feedTensors) {
+                        MPSGraphShapedType *input_type = [feeds objectForKey:feed_tensor];
+                        if (input_type == nil) {
+                            [feeds release];
+                            [descriptor release];
+                            synapse_mps_set_ns_error([NSString stringWithFormat:@"no shaped type for executable input %@",
+                                                                                feed_tensor.operation.name]);
+                            return -8;
+                        }
+                        [input_types addObject:input_type];
+                    }
+                    NSTimeInterval specialize_started = [NSDate timeIntervalSinceReferenceDate];
+                    [plan->executable specializeWithDevice:device
+                                                inputTypes:input_types
+                                     compilationDescriptor:descriptor];
+                    *specialize_wall_s = [NSDate timeIntervalSinceReferenceDate] - specialize_started;
+                }
+                [feeds release];
+            }
+            *prepare_wall_s = [NSDate timeIntervalSinceReferenceDate] - started;
+            [descriptor release];
+            if (plan->executable == nil) {
+                synapse_mps_set_c_error(load_package ? "MPSGraph package returned no executable" : "MPSGraph compile returned no executable");
+                return -6;
+            }
+            plan->executable.options = MPSGraphOptionsSynchronizeResults;
+
+            NSArray<MPSGraphTensor *> *feed_tensors = plan->executable.feedTensors;
+            if (feed_tensors.count > 0) {
+                plan->executable_feed_tensors = [feed_tensors retain];
+            } else {
+                plan->executable_feed_tensors = [plan->graph.placeholderTensors retain];
+            }
+            if (plan->executable_feed_tensors.count != (NSUInteger)(2 + layer_count * 16)) {
+                synapse_mps_set_ns_error([NSString stringWithFormat:@"unexpected executable feed count %llu, expected %llu",
+                                                                    (unsigned long long)plan->executable_feed_tensors.count,
+                                                                    (unsigned long long)(2 + layer_count * 16)]);
+                return -7;
+            }
+
+            if (!load_package && package_path != NULL) {
+                NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:package_path]];
+                MPSGraphExecutableSerializationDescriptor *serialization_descriptor =
+                    [[MPSGraphExecutableSerializationDescriptor alloc] init];
+                serialization_descriptor.append = append_package != 0;
+                started = [NSDate timeIntervalSinceReferenceDate];
+                [plan->executable serializeToMPSGraphPackageAtURL:url descriptor:serialization_descriptor];
+                *serialize_wall_s = [NSDate timeIntervalSinceReferenceDate] - started;
+                [serialization_descriptor release];
+            }
+            return 0;
+        } @catch (NSException *exception) {
+            synapse_mps_set_ns_error(exception.reason);
+            return -100;
+        }
+    }
 }
 
 void *synapse_mps_context_new(void) {
@@ -633,6 +943,30 @@ void *synapse_mps_context_new(void) {
     }
 }
 
+int32_t synapse_mps_configure_capture(void *raw_context, const char *path) {
+    SynapseMpsContext *context = (SynapseMpsContext *)raw_context;
+    if (context == NULL || path == NULL) {
+        synapse_mps_set_c_error("capture configuration received a null context or path");
+        return -1;
+    }
+    [context->capture_path release];
+    context->capture_path = [[NSString alloc] initWithUTF8String:path];
+    context->capture_pending = context->capture_path != nil;
+    return context->capture_pending ? 0 : -2;
+}
+
+int32_t synapse_mps_configure_graph_dump(void *raw_context, const char *path) {
+    SynapseMpsContext *context = (SynapseMpsContext *)raw_context;
+    if (context == NULL || path == NULL) {
+        synapse_mps_set_c_error("graph dump configuration received a null context or path");
+        return -1;
+    }
+    [context->graph_dump_path release];
+    context->graph_dump_path = [[NSString alloc] initWithUTF8String:path];
+    context->graph_dump_pending = context->graph_dump_path != nil;
+    return context->graph_dump_pending ? 0 : -2;
+}
+
 void synapse_mps_context_free(void *raw_context) {
     if (raw_context == NULL) {
         return;
@@ -644,6 +978,8 @@ void synapse_mps_context_free(void *raw_context) {
     for (NSValue *value in [context->encoder_plans allValues]) {
         synapse_mps_encoder_plan_free((SynapseMpsEncoderPlan *)value.pointerValue);
     }
+    [context->capture_path release];
+    [context->graph_dump_path release];
     [context->rhs_buffers release];
     [context->encoder_plans release];
     [context->plans release];
@@ -795,7 +1131,7 @@ int32_t synapse_mps_encoder_forward(
     uint64_t intermediate,
     uint64_t layer_count,
     float layer_norm_eps,
-    int32_t dtype,
+    int32_t variant,
     const void *input,
     const float *additive_mask,
     void *output,
@@ -833,9 +1169,9 @@ int32_t synapse_mps_encoder_forward(
             const NSUInteger hidden_hidden_count = (NSUInteger)(hidden * hidden);
             const NSUInteger intermediate_hidden_count = (NSUInteger)(intermediate * hidden);
             const NSUInteger hidden_intermediate_count = (NSUInteger)(hidden * intermediate);
-            const NSUInteger input_bytes = hidden_count * synapse_mps_dtype_size(dtype);
+            SynapsePrecisionPolicy policy = synapse_mps_precision_policy(variant);
+            const NSUInteger input_bytes = hidden_count * synapse_mps_type_size(policy.io_type);
             const NSUInteger mask_bytes = mask_count * sizeof(float);
-            MPSDataType graph_data_type = synapse_mps_data_type(dtype);
 
             SynapseMpsEncoderPlan *plan = synapse_mps_get_encoder_plan(
                 context,
@@ -846,10 +1182,22 @@ int32_t synapse_mps_encoder_forward(
                 intermediate,
                 layer_count,
                 layer_norm_eps,
-                dtype
+                variant
             );
             if (plan == NULL) {
                 return -6;
+            }
+            if (context->graph_dump_pending) {
+                NSError *dump_error = nil;
+                BOOL wrote = [plan->graph.description writeToFile:context->graph_dump_path
+                                                      atomically:YES
+                                                        encoding:NSUTF8StringEncoding
+                                                           error:&dump_error];
+                if (!wrote) {
+                    synapse_mps_set_ns_error([NSString stringWithFormat:@"graph dump failed: %@", dump_error]);
+                    return -13;
+                }
+                context->graph_dump_pending = NO;
             }
 
             id<MTLBuffer> input_buffer = [context->device newBufferWithBytes:input
@@ -873,7 +1221,7 @@ int32_t synapse_mps_encoder_forward(
                 synapse_mps_set_c_error("failed to allocate MPSGraph encoder feeds");
                 return -8;
             }
-            if (!synapse_mps_add_feed(feeds, plan->input_tensor, plan->hidden_shape, input_buffer, graph_data_type) ||
+            if (!synapse_mps_add_feed(feeds, plan->input_tensor, plan->hidden_shape, input_buffer, policy.io_type) ||
                 !synapse_mps_add_feed(feeds, plan->mask_tensor, plan->mask_shape, mask_buffer, MPSDataTypeFloat32)) {
                 [feeds release];
                 [input_buffer release];
@@ -884,22 +1232,22 @@ int32_t synapse_mps_encoder_forward(
             for (uint64_t layer_index = 0; layer_index < layer_count; layer_index++) {
                 const SynapseMpsEncoderLayerParams *params = &layers[layer_index];
                 SynapseMpsEncoderLayerTensors *tensors = &plan->layers[layer_index];
-                if (!synapse_mps_add_cached_feed(context, feeds, tensors->query_weight, plan->hidden_hidden_weight_shape, params->query_weight, hidden_hidden_count, dtype) ||
-                    !synapse_mps_add_cached_feed(context, feeds, tensors->query_bias, plan->hidden_bias_shape, params->query_bias, (NSUInteger)hidden, dtype) ||
-                    !synapse_mps_add_cached_feed(context, feeds, tensors->key_weight, plan->hidden_hidden_weight_shape, params->key_weight, hidden_hidden_count, dtype) ||
-                    !synapse_mps_add_cached_feed(context, feeds, tensors->key_bias, plan->hidden_bias_shape, params->key_bias, (NSUInteger)hidden, dtype) ||
-                    !synapse_mps_add_cached_feed(context, feeds, tensors->value_weight, plan->hidden_hidden_weight_shape, params->value_weight, hidden_hidden_count, dtype) ||
-                    !synapse_mps_add_cached_feed(context, feeds, tensors->value_bias, plan->hidden_bias_shape, params->value_bias, (NSUInteger)hidden, dtype) ||
-                    !synapse_mps_add_cached_feed(context, feeds, tensors->attention_output_weight, plan->hidden_hidden_weight_shape, params->attention_output_weight, hidden_hidden_count, dtype) ||
-                    !synapse_mps_add_cached_feed(context, feeds, tensors->attention_output_bias, plan->hidden_bias_shape, params->attention_output_bias, (NSUInteger)hidden, dtype) ||
-                    !synapse_mps_add_cached_feed(context, feeds, tensors->attention_ln_weight, plan->hidden_bias_shape, params->attention_ln_weight, (NSUInteger)hidden, dtype) ||
-                    !synapse_mps_add_cached_feed(context, feeds, tensors->attention_ln_bias, plan->hidden_bias_shape, params->attention_ln_bias, (NSUInteger)hidden, dtype) ||
-                    !synapse_mps_add_cached_feed(context, feeds, tensors->intermediate_weight, plan->intermediate_hidden_weight_shape, params->intermediate_weight, intermediate_hidden_count, dtype) ||
-                    !synapse_mps_add_cached_feed(context, feeds, tensors->intermediate_bias, plan->intermediate_bias_shape, params->intermediate_bias, (NSUInteger)intermediate, dtype) ||
-                    !synapse_mps_add_cached_feed(context, feeds, tensors->output_weight, plan->hidden_intermediate_weight_shape, params->output_weight, hidden_intermediate_count, dtype) ||
-                    !synapse_mps_add_cached_feed(context, feeds, tensors->output_bias, plan->hidden_bias_shape, params->output_bias, (NSUInteger)hidden, dtype) ||
-                    !synapse_mps_add_cached_feed(context, feeds, tensors->output_ln_weight, plan->hidden_bias_shape, params->output_ln_weight, (NSUInteger)hidden, dtype) ||
-                    !synapse_mps_add_cached_feed(context, feeds, tensors->output_ln_bias, plan->hidden_bias_shape, params->output_ln_bias, (NSUInteger)hidden, dtype)) {
+                if (!synapse_mps_add_cached_feed(context, feeds, tensors->query_weight, plan->hidden_hidden_weight_shape, params->query_weight, hidden_hidden_count, policy.weight_type) ||
+                    !synapse_mps_add_cached_feed(context, feeds, tensors->query_bias, plan->hidden_bias_shape, params->query_bias, (NSUInteger)hidden, policy.weight_type) ||
+                    !synapse_mps_add_cached_feed(context, feeds, tensors->key_weight, plan->hidden_hidden_weight_shape, params->key_weight, hidden_hidden_count, policy.weight_type) ||
+                    !synapse_mps_add_cached_feed(context, feeds, tensors->key_bias, plan->hidden_bias_shape, params->key_bias, (NSUInteger)hidden, policy.weight_type) ||
+                    !synapse_mps_add_cached_feed(context, feeds, tensors->value_weight, plan->hidden_hidden_weight_shape, params->value_weight, hidden_hidden_count, policy.weight_type) ||
+                    !synapse_mps_add_cached_feed(context, feeds, tensors->value_bias, plan->hidden_bias_shape, params->value_bias, (NSUInteger)hidden, policy.weight_type) ||
+                    !synapse_mps_add_cached_feed(context, feeds, tensors->attention_output_weight, plan->hidden_hidden_weight_shape, params->attention_output_weight, hidden_hidden_count, policy.weight_type) ||
+                    !synapse_mps_add_cached_feed(context, feeds, tensors->attention_output_bias, plan->hidden_bias_shape, params->attention_output_bias, (NSUInteger)hidden, policy.weight_type) ||
+                    !synapse_mps_add_cached_feed(context, feeds, tensors->attention_ln_weight, plan->hidden_bias_shape, params->attention_ln_weight, (NSUInteger)hidden, policy.weight_type) ||
+                    !synapse_mps_add_cached_feed(context, feeds, tensors->attention_ln_bias, plan->hidden_bias_shape, params->attention_ln_bias, (NSUInteger)hidden, policy.weight_type) ||
+                    !synapse_mps_add_cached_feed(context, feeds, tensors->intermediate_weight, plan->intermediate_hidden_weight_shape, params->intermediate_weight, intermediate_hidden_count, policy.weight_type) ||
+                    !synapse_mps_add_cached_feed(context, feeds, tensors->intermediate_bias, plan->intermediate_bias_shape, params->intermediate_bias, (NSUInteger)intermediate, policy.weight_type) ||
+                    !synapse_mps_add_cached_feed(context, feeds, tensors->output_weight, plan->hidden_intermediate_weight_shape, params->output_weight, hidden_intermediate_count, policy.weight_type) ||
+                    !synapse_mps_add_cached_feed(context, feeds, tensors->output_bias, plan->hidden_bias_shape, params->output_bias, (NSUInteger)hidden, policy.weight_type) ||
+                    !synapse_mps_add_cached_feed(context, feeds, tensors->output_ln_weight, plan->hidden_bias_shape, params->output_ln_weight, (NSUInteger)hidden, policy.weight_type) ||
+                    !synapse_mps_add_cached_feed(context, feeds, tensors->output_ln_bias, plan->hidden_bias_shape, params->output_ln_bias, (NSUInteger)hidden, policy.weight_type)) {
                     [feeds release];
                     [input_buffer release];
                     [mask_buffer release];
@@ -907,12 +1255,55 @@ int32_t synapse_mps_encoder_forward(
                 }
             }
 
-            NSDictionary<MPSGraphTensor *, MPSGraphTensorData *> *results =
-                [plan->graph runWithMTLCommandQueue:context->queue
-                                              feeds:feeds
-                                      targetTensors:@[ plan->output_tensor ]
-                                   targetOperations:nil];
-            MPSGraphTensorData *output_data = [results objectForKey:plan->output_tensor];
+            BOOL capturing = NO;
+            if (context->capture_pending) {
+                MTLCaptureManager *manager = [MTLCaptureManager sharedCaptureManager];
+                MTLCaptureDescriptor *descriptor = [[MTLCaptureDescriptor alloc] init];
+                descriptor.captureObject = context->queue;
+                descriptor.destination = MTLCaptureDestinationGPUTraceDocument;
+                descriptor.outputURL = [NSURL fileURLWithPath:context->capture_path];
+                [[NSFileManager defaultManager] removeItemAtURL:descriptor.outputURL error:nil];
+                NSError *capture_error = nil;
+                capturing = [manager startCaptureWithDescriptor:descriptor error:&capture_error];
+                [descriptor release];
+                if (!capturing) {
+                    synapse_mps_set_ns_error([NSString stringWithFormat:@"Metal capture start failed: %@", capture_error]);
+                    [feeds release];
+                    [input_buffer release];
+                    [mask_buffer release];
+                    return -14;
+                }
+                context->capture_pending = NO;
+            }
+            MPSGraphTensorData *output_data = nil;
+            @try {
+                if (plan->executable != nil) {
+                    NSArray<MPSGraphTensorData *> *inputs = synapse_mps_executable_inputs(plan, feeds);
+                    if (inputs == nil) {
+                        [feeds release];
+                        [input_buffer release];
+                        [mask_buffer release];
+                        return -15;
+                    }
+                    NSArray<MPSGraphTensorData *> *results =
+                        [plan->executable runWithMTLCommandQueue:context->queue
+                                                    inputsArray:inputs
+                                                   resultsArray:nil
+                                            executionDescriptor:nil];
+                    output_data = results.firstObject;
+                } else {
+                    NSDictionary<MPSGraphTensor *, MPSGraphTensorData *> *results =
+                        [plan->graph runWithMTLCommandQueue:context->queue
+                                                     feeds:feeds
+                                             targetTensors:@[ plan->output_tensor ]
+                                          targetOperations:nil];
+                    output_data = [results objectForKey:plan->output_tensor];
+                }
+            } @finally {
+                if (capturing) {
+                    [[MTLCaptureManager sharedCaptureManager] stopCapture];
+                }
+            }
             if (output_data == nil) {
                 [feeds release];
                 [input_buffer release];

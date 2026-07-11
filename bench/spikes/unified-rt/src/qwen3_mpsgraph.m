@@ -8,6 +8,8 @@
 #import <MetalPerformanceShadersGraph/MPSGraphNormalizationOps.h>
 #import <MetalPerformanceShadersGraph/MPSGraphTensorShapeOps.h>
 
+#include "mpsgraph_executable.h"
+
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -16,17 +18,17 @@
 static char qwen3_error[1024];
 
 typedef struct Qwen3LayerParams {
-    const float *input_norm;
-    const float *post_attention_norm;
-    const float *q_weight;
-    const float *q_norm;
-    const float *k_weight;
-    const float *k_norm;
-    const float *v_weight;
-    const float *o_weight;
-    const float *gate_weight;
-    const float *up_weight;
-    const float *down_weight;
+    const void *input_norm;
+    const void *post_attention_norm;
+    const void *q_weight;
+    const void *q_norm;
+    const void *k_weight;
+    const void *k_norm;
+    const void *v_weight;
+    const void *o_weight;
+    const void *gate_weight;
+    const void *up_weight;
+    const void *down_weight;
 } Qwen3LayerParams;
 
 typedef struct Qwen3LayerTensors {
@@ -63,6 +65,8 @@ typedef struct Qwen3Plan {
     MPSGraphTensor *output;
     Qwen3LayerTensors *layers;
     uint64_t layer_count;
+    MPSGraphExecutable *executable;
+    NSArray<MPSGraphTensor *> *executable_feed_tensors;
 } Qwen3Plan;
 
 typedef struct Qwen3Context {
@@ -80,8 +84,12 @@ const char *synapse_qwen3_last_error(void) {
     return qwen3_error;
 }
 
-static MPSGraphTensor *placeholder(MPSGraph *graph, MPSShape *shape, NSString *name) {
-    return [[graph placeholderWithShape:shape dataType:MPSDataTypeFloat32 name:name] retain];
+static MPSGraphTensor *placeholder(MPSGraph *graph, MPSShape *shape, MPSDataType data_type, NSString *name) {
+    return [[graph placeholderWithShape:shape dataType:data_type name:name] retain];
+}
+
+static MPSGraphTensor *qwen3_cast(MPSGraph *graph, MPSGraphTensor *tensor, MPSDataType data_type) {
+    return tensor.dataType == data_type ? tensor : [graph castTensor:tensor toType:data_type name:nil];
 }
 
 static MPSGraphTensor *linear(MPSGraph *graph, MPSGraphTensor *input, MPSGraphTensor *weight) {
@@ -95,15 +103,22 @@ static MPSGraphTensor *rms_norm(
     MPSGraphTensor *weight,
     NSInteger axis,
     MPSShape *reduced_shape,
-    float epsilon
+    float epsilon,
+    MPSDataType data_type
 ) {
+    input = qwen3_cast(graph, input, MPSDataTypeFloat32);
+    weight = qwen3_cast(graph, weight, MPSDataTypeFloat32);
     MPSGraphTensor *square = [graph multiplicationWithPrimaryTensor:input secondaryTensor:input name:nil];
     MPSGraphTensor *mean = [graph meanOfTensor:square axes:@[ @(axis) ] name:nil];
     mean = [graph reshapeTensor:mean withShape:reduced_shape name:nil];
     MPSGraphTensor *eps = [graph constantWithScalar:epsilon dataType:MPSDataTypeFloat32];
     MPSGraphTensor *denominator = [graph squareRootWithTensor:[graph additionWithPrimaryTensor:mean secondaryTensor:eps name:nil] name:nil];
     MPSGraphTensor *normalized = [graph divisionWithPrimaryTensor:input secondaryTensor:denominator name:nil];
-    return [graph multiplicationWithPrimaryTensor:normalized secondaryTensor:weight name:nil];
+    return qwen3_cast(
+        graph,
+        [graph multiplicationWithPrimaryTensor:normalized secondaryTensor:weight name:nil],
+        data_type
+    );
 }
 
 static MPSGraphTensor *rope(
@@ -159,6 +174,8 @@ static void release_layer(Qwen3LayerTensors *layer) {
 
 static void free_plan(Qwen3Plan *plan) {
     if (plan == NULL) return;
+    [plan->executable_feed_tensors release];
+    [plan->executable release];
     if (plan->layers != NULL) {
         for (uint64_t i = 0; i < plan->layer_count; ++i) release_layer(&plan->layers[i]);
         free(plan->layers);
@@ -192,7 +209,8 @@ static Qwen3Plan *new_plan(
     uint64_t head_dim,
     uint64_t intermediate,
     uint64_t layer_count,
-    float epsilon
+    float epsilon,
+    int32_t dtype
 ) {
     Qwen3Plan *plan = calloc(1, sizeof(Qwen3Plan));
     if (plan == NULL) {
@@ -200,6 +218,7 @@ static Qwen3Plan *new_plan(
         return NULL;
     }
     const uint64_t rows = batch * seq;
+    MPSDataType data_type = dtype == 1 ? MPSDataTypeFloat16 : MPSDataTypeFloat32;
     const uint64_t q_width = query_heads * head_dim;
     const uint64_t kv_width = kv_heads * head_dim;
     const uint64_t groups = query_heads / kv_heads;
@@ -222,17 +241,17 @@ static Qwen3Plan *new_plan(
         return NULL;
     }
     plan->graph.options = MPSGraphOptionsSynchronizeResults;
-    plan->input = placeholder(plan->graph, plan->hidden_shape, @"qwen3_input");
-    plan->mask = placeholder(plan->graph, plan->mask_shape, @"qwen3_causal_padding_mask");
-    plan->rope_cos = placeholder(plan->graph, plan->rope_shape, @"qwen3_rope_cos");
-    plan->rope_sin = placeholder(plan->graph, plan->rope_shape, @"qwen3_rope_sin");
-    plan->final_norm = placeholder(plan->graph, plan->hidden_vector_shape, @"qwen3_final_norm");
+    plan->input = placeholder(plan->graph, plan->hidden_shape, data_type, @"qwen3_input");
+    plan->mask = placeholder(plan->graph, plan->mask_shape, MPSDataTypeFloat32, @"qwen3_causal_padding_mask");
+    plan->rope_cos = placeholder(plan->graph, plan->rope_shape, data_type, @"qwen3_rope_cos");
+    plan->rope_sin = placeholder(plan->graph, plan->rope_shape, data_type, @"qwen3_rope_sin");
+    plan->final_norm = placeholder(plan->graph, plan->hidden_vector_shape, data_type, @"qwen3_final_norm");
     MPSGraphTensor *x = [plan->graph reshapeTensor:plan->input withShape:@[ @(rows), @(hidden) ] name:nil];
 
     for (uint64_t index = 0; index < layer_count; ++index) {
         Qwen3LayerTensors *layer = &plan->layers[index];
         NSString *prefix = [NSString stringWithFormat:@"qwen3_layer_%llu", (unsigned long long)index];
-#define PH(field, shape) layer->field = placeholder(plan->graph, shape, [prefix stringByAppendingFormat:@"_%s", #field])
+#define PH(field, shape) layer->field = placeholder(plan->graph, shape, data_type, [prefix stringByAppendingFormat:@"_%s", #field])
         PH(input_norm, plan->hidden_vector_shape);
         PH(post_attention_norm, plan->hidden_vector_shape);
         PH(q_weight, plan->q_weight_shape);
@@ -246,15 +265,15 @@ static Qwen3Plan *new_plan(
         PH(down_weight, plan->down_weight_shape);
 #undef PH
         MPSGraphTensor *attention_residual = x;
-        MPSGraphTensor *normalized = rms_norm(plan->graph, x, layer->input_norm, 1, @[ @(rows), @1 ], epsilon);
+        MPSGraphTensor *normalized = rms_norm(plan->graph, x, layer->input_norm, 1, @[ @(rows), @1 ], epsilon, data_type);
         MPSGraphTensor *q = linear(plan->graph, normalized, layer->q_weight);
         MPSGraphTensor *k = linear(plan->graph, normalized, layer->k_weight);
         MPSGraphTensor *v = linear(plan->graph, normalized, layer->v_weight);
         q = [plan->graph reshapeTensor:q withShape:@[ @(batch), @(seq), @(query_heads), @(head_dim) ] name:nil];
         k = [plan->graph reshapeTensor:k withShape:@[ @(batch), @(seq), @(kv_heads), @(head_dim) ] name:nil];
         v = [plan->graph reshapeTensor:v withShape:@[ @(batch), @(seq), @(kv_heads), @(head_dim) ] name:nil];
-        q = rms_norm(plan->graph, q, layer->q_norm, 3, @[ @(batch), @(seq), @(query_heads), @1 ], epsilon);
-        k = rms_norm(plan->graph, k, layer->k_norm, 3, @[ @(batch), @(seq), @(kv_heads), @1 ], epsilon);
+        q = rms_norm(plan->graph, q, layer->q_norm, 3, @[ @(batch), @(seq), @(query_heads), @1 ], epsilon, data_type);
+        k = rms_norm(plan->graph, k, layer->k_norm, 3, @[ @(batch), @(seq), @(kv_heads), @1 ], epsilon, data_type);
         q = [plan->graph transposeTensor:q permutation:@[ @0, @2, @1, @3 ] name:nil];
         k = [plan->graph transposeTensor:k permutation:@[ @0, @2, @1, @3 ] name:nil];
         v = [plan->graph transposeTensor:v permutation:@[ @0, @2, @1, @3 ] name:nil];
@@ -264,10 +283,12 @@ static Qwen3Plan *new_plan(
         v = repeat_kv(plan->graph, v, batch, kv_heads, groups, seq, head_dim);
         MPSGraphTensor *k_transposed = [plan->graph transposeTensor:k dimension:2 withDimension:3 name:nil];
         MPSGraphTensor *scores = [plan->graph matrixMultiplicationWithPrimaryTensor:q secondaryTensor:k_transposed name:nil];
+        scores = qwen3_cast(plan->graph, scores, MPSDataTypeFloat32);
         MPSGraphTensor *scale = [plan->graph constantWithScalar:1.0 / sqrt((double)head_dim) dataType:MPSDataTypeFloat32];
         scores = [plan->graph multiplicationWithPrimaryTensor:scores secondaryTensor:scale name:nil];
         scores = [plan->graph additionWithPrimaryTensor:scores secondaryTensor:plan->mask name:nil];
         scores = [plan->graph softMaxWithTensor:scores axis:3 name:nil];
+        scores = qwen3_cast(plan->graph, scores, data_type);
         MPSGraphTensor *context = [plan->graph matrixMultiplicationWithPrimaryTensor:scores secondaryTensor:v name:nil];
         context = [plan->graph transposeTensor:context permutation:@[ @0, @2, @1, @3 ] name:nil];
         context = [plan->graph reshapeTensor:context withShape:@[ @(rows), @(q_width) ] name:nil];
@@ -275,7 +296,7 @@ static Qwen3Plan *new_plan(
                                    secondaryTensor:linear(plan->graph, context, layer->o_weight)
                                               name:nil];
         MPSGraphTensor *mlp_residual = x;
-        normalized = rms_norm(plan->graph, x, layer->post_attention_norm, 1, @[ @(rows), @1 ], epsilon);
+        normalized = rms_norm(plan->graph, x, layer->post_attention_norm, 1, @[ @(rows), @1 ], epsilon, data_type);
         MPSGraphTensor *gate = linear(plan->graph, normalized, layer->gate_weight);
         MPSGraphTensor *sigmoid = [plan->graph sigmoidWithTensor:gate name:nil];
         gate = [plan->graph multiplicationWithPrimaryTensor:gate secondaryTensor:sigmoid name:nil];
@@ -285,7 +306,7 @@ static Qwen3Plan *new_plan(
                                    secondaryTensor:linear(plan->graph, gated, layer->down_weight)
                                               name:nil];
     }
-    x = rms_norm(plan->graph, x, plan->final_norm, 1, @[ @(rows), @1 ], epsilon);
+    x = rms_norm(plan->graph, x, plan->final_norm, 1, @[ @(rows), @1 ], epsilon, data_type);
     plan->output = [[plan->graph reshapeTensor:x withShape:plan->hidden_shape name:@"qwen3_output"] retain];
     if (plan->input == nil || plan->mask == nil || plan->rope_cos == nil || plan->rope_sin == nil ||
         plan->final_norm == nil || plan->output == nil) {
@@ -297,16 +318,16 @@ static Qwen3Plan *new_plan(
 }
 
 static NSString *plan_key(uint64_t batch, uint64_t seq, uint64_t hidden, uint64_t qh, uint64_t kvh,
-                          uint64_t head_dim, uint64_t intermediate, uint64_t layers, float eps) {
-    return [NSString stringWithFormat:@"%llu:%llu:%llu:%llu:%llu:%llu:%llu:%llu:%.9g",
-            batch, seq, hidden, qh, kvh, head_dim, intermediate, layers, (double)eps];
+                          uint64_t head_dim, uint64_t intermediate, uint64_t layers, float eps, int32_t dtype) {
+    return [NSString stringWithFormat:@"%llu:%llu:%llu:%llu:%llu:%llu:%llu:%llu:%.9g:%d",
+            batch, seq, hidden, qh, kvh, head_dim, intermediate, layers, (double)eps, dtype];
 }
 
-static id<MTLBuffer> cached_buffer(Qwen3Context *context, const float *values, NSUInteger count) {
-    NSString *key = [NSString stringWithFormat:@"%p:%llu", values, (unsigned long long)count];
+static id<MTLBuffer> cached_buffer(Qwen3Context *context, const void *values, NSUInteger bytes) {
+    NSString *key = [NSString stringWithFormat:@"%p:%llu", values, (unsigned long long)bytes];
     id<MTLBuffer> buffer = [context->weights objectForKey:key];
     if (buffer == nil) {
-        buffer = [context->device newBufferWithBytes:values length:count * sizeof(float) options:MTLResourceStorageModeShared];
+        buffer = [context->device newBufferWithBytes:values length:bytes options:MTLResourceStorageModeShared];
         if (buffer != nil) {
             [context->weights setObject:buffer forKey:key];
             [buffer release];
@@ -317,11 +338,11 @@ static id<MTLBuffer> cached_buffer(Qwen3Context *context, const float *values, N
 }
 
 static BOOL add_feed(NSMutableDictionary *feeds, MPSGraphTensor *tensor, MPSShape *shape,
-                     id<MTLBuffer> buffer) {
+                      id<MTLBuffer> buffer, MPSDataType data_type) {
     if (tensor == nil || shape == nil || buffer == nil) return NO;
     MPSGraphTensorData *data = [[MPSGraphTensorData alloc] initWithMTLBuffer:buffer
                                                                       shape:shape
-                                                                   dataType:MPSDataTypeFloat32];
+                                                                    dataType:data_type];
     if (data == nil) return NO;
     [feeds setObject:data forKey:tensor];
     [data release];
@@ -329,8 +350,9 @@ static BOOL add_feed(NSMutableDictionary *feeds, MPSGraphTensor *tensor, MPSShap
 }
 
 static BOOL add_weight(Qwen3Context *context, NSMutableDictionary *feeds, MPSGraphTensor *tensor,
-                       MPSShape *shape, const float *values, NSUInteger count) {
-    return add_feed(feeds, tensor, shape, cached_buffer(context, values, count));
+                        MPSShape *shape, const void *values, NSUInteger count, MPSDataType data_type) {
+    NSUInteger element_size = data_type == MPSDataTypeFloat16 ? sizeof(uint16_t) : sizeof(float);
+    return add_feed(feeds, tensor, shape, cached_buffer(context, values, count * element_size), data_type);
 }
 
 void *synapse_qwen3_context_new(void) {
@@ -374,13 +396,16 @@ int32_t synapse_qwen3_forward(
     uint64_t intermediate,
     uint64_t layer_count,
     float epsilon,
-    const float *input,
+    int32_t dtype,
+    int32_t explicit_execution,
+    const char *package_path,
+    const void *input,
     const float *mask,
-    const float *rope_cos,
-    const float *rope_sin,
+    const void *rope_cos,
+    const void *rope_sin,
     const Qwen3LayerParams *params,
-    const float *final_norm,
-    float *output
+    const void *final_norm,
+    void *output
 ) {
     @autoreleasepool {
         @try {
@@ -392,24 +417,36 @@ int32_t synapse_qwen3_forward(
                 set_error(@"invalid Qwen3 MPSGraph forward arguments");
                 return -1;
             }
-            NSString *key = plan_key(batch, seq, hidden, query_heads, kv_heads, head_dim, intermediate, layer_count, epsilon);
+            NSString *key = plan_key(batch, seq, hidden, query_heads, kv_heads, head_dim, intermediate, layer_count, epsilon, dtype);
             Qwen3Plan *plan = [[context->plans objectForKey:key] pointerValue];
             if (plan == NULL) {
-                plan = new_plan(batch, seq, hidden, query_heads, kv_heads, head_dim, intermediate, layer_count, epsilon);
+                plan = new_plan(batch, seq, hidden, query_heads, kv_heads, head_dim, intermediate, layer_count, epsilon, dtype);
                 if (plan == NULL) return -2;
                 [context->plans setObject:[NSValue valueWithPointer:plan] forKey:key];
             }
+            MPSDataType data_type = dtype == 1 ? MPSDataTypeFloat16 : MPSDataTypeFloat32;
+            NSUInteger element_size = dtype == 1 ? sizeof(uint16_t) : sizeof(float);
+            if (explicit_execution && plan->executable == nil) {
+                plan->executable = synapse_explicit_executable(
+                    plan->graph, context->device, plan->output, package_path,
+                    &plan->executable_feed_tensors
+                );
+                if (plan->executable == nil) {
+                    set_error(@"failed to compile or load Qwen3 executable");
+                    return -6;
+                }
+            }
             const NSUInteger rows = (NSUInteger)(batch * seq);
-            id<MTLBuffer> input_buffer = [context->device newBufferWithBytes:input length:rows * hidden * sizeof(float) options:MTLResourceStorageModeShared];
+            id<MTLBuffer> input_buffer = [context->device newBufferWithBytes:input length:rows * hidden * element_size options:MTLResourceStorageModeShared];
             id<MTLBuffer> mask_buffer = [context->device newBufferWithBytes:mask length:batch * seq * seq * sizeof(float) options:MTLResourceStorageModeShared];
-            id<MTLBuffer> cos_buffer = [context->device newBufferWithBytes:rope_cos length:seq * head_dim * sizeof(float) options:MTLResourceStorageModeShared];
-            id<MTLBuffer> sin_buffer = [context->device newBufferWithBytes:rope_sin length:seq * head_dim * sizeof(float) options:MTLResourceStorageModeShared];
+            id<MTLBuffer> cos_buffer = [context->device newBufferWithBytes:rope_cos length:seq * head_dim * element_size options:MTLResourceStorageModeShared];
+            id<MTLBuffer> sin_buffer = [context->device newBufferWithBytes:rope_sin length:seq * head_dim * element_size options:MTLResourceStorageModeShared];
             NSMutableDictionary *feeds = [[NSMutableDictionary alloc] initWithCapacity:(NSUInteger)(5 + layer_count * 11)];
-            if (!add_feed(feeds, plan->input, plan->hidden_shape, input_buffer) ||
-                !add_feed(feeds, plan->mask, plan->mask_shape, mask_buffer) ||
-                !add_feed(feeds, plan->rope_cos, plan->rope_shape, cos_buffer) ||
-                !add_feed(feeds, plan->rope_sin, plan->rope_shape, sin_buffer) ||
-                !add_weight(context, feeds, plan->final_norm, plan->hidden_vector_shape, final_norm, hidden)) {
+            if (!add_feed(feeds, plan->input, plan->hidden_shape, input_buffer, data_type) ||
+                !add_feed(feeds, plan->mask, plan->mask_shape, mask_buffer, MPSDataTypeFloat32) ||
+                !add_feed(feeds, plan->rope_cos, plan->rope_shape, cos_buffer, data_type) ||
+                !add_feed(feeds, plan->rope_sin, plan->rope_shape, sin_buffer, data_type) ||
+                !add_weight(context, feeds, plan->final_norm, plan->hidden_vector_shape, final_norm, hidden, data_type)) {
                 set_error(@"failed to feed Qwen3 graph inputs");
                 [feeds release]; [input_buffer release]; [mask_buffer release]; [cos_buffer release]; [sin_buffer release];
                 return -3;
@@ -421,27 +458,31 @@ int32_t synapse_qwen3_forward(
             for (uint64_t i = 0; i < layer_count; ++i) {
                 Qwen3LayerTensors *t = &plan->layers[i];
                 const Qwen3LayerParams *p = &params[i];
-                if (!add_weight(context, feeds, t->input_norm, plan->hidden_vector_shape, p->input_norm, hidden) ||
-                    !add_weight(context, feeds, t->post_attention_norm, plan->hidden_vector_shape, p->post_attention_norm, hidden) ||
-                    !add_weight(context, feeds, t->q_weight, plan->q_weight_shape, p->q_weight, q_count) ||
-                    !add_weight(context, feeds, t->q_norm, plan->head_vector_shape, p->q_norm, head_dim) ||
-                    !add_weight(context, feeds, t->k_weight, plan->kv_weight_shape, p->k_weight, kv_count) ||
-                    !add_weight(context, feeds, t->k_norm, plan->head_vector_shape, p->k_norm, head_dim) ||
-                    !add_weight(context, feeds, t->v_weight, plan->kv_weight_shape, p->v_weight, kv_count) ||
-                    !add_weight(context, feeds, t->o_weight, plan->o_weight_shape, p->o_weight, o_count) ||
-                    !add_weight(context, feeds, t->gate_weight, plan->mlp_weight_shape, p->gate_weight, mlp_count) ||
-                    !add_weight(context, feeds, t->up_weight, plan->mlp_weight_shape, p->up_weight, mlp_count) ||
-                    !add_weight(context, feeds, t->down_weight, plan->down_weight_shape, p->down_weight, mlp_count)) {
+                if (!add_weight(context, feeds, t->input_norm, plan->hidden_vector_shape, p->input_norm, hidden, data_type) ||
+                    !add_weight(context, feeds, t->post_attention_norm, plan->hidden_vector_shape, p->post_attention_norm, hidden, data_type) ||
+                    !add_weight(context, feeds, t->q_weight, plan->q_weight_shape, p->q_weight, q_count, data_type) ||
+                    !add_weight(context, feeds, t->q_norm, plan->head_vector_shape, p->q_norm, head_dim, data_type) ||
+                    !add_weight(context, feeds, t->k_weight, plan->kv_weight_shape, p->k_weight, kv_count, data_type) ||
+                    !add_weight(context, feeds, t->k_norm, plan->head_vector_shape, p->k_norm, head_dim, data_type) ||
+                    !add_weight(context, feeds, t->v_weight, plan->kv_weight_shape, p->v_weight, kv_count, data_type) ||
+                    !add_weight(context, feeds, t->o_weight, plan->o_weight_shape, p->o_weight, o_count, data_type) ||
+                    !add_weight(context, feeds, t->gate_weight, plan->mlp_weight_shape, p->gate_weight, mlp_count, data_type) ||
+                    !add_weight(context, feeds, t->up_weight, plan->mlp_weight_shape, p->up_weight, mlp_count, data_type) ||
+                    !add_weight(context, feeds, t->down_weight, plan->down_weight_shape, p->down_weight, mlp_count, data_type)) {
                     set_error(@"failed to feed Qwen3 static weights");
                     [feeds release]; [input_buffer release]; [mask_buffer release]; [cos_buffer release]; [sin_buffer release];
                     return -4;
                 }
             }
-            NSDictionary *results = [plan->graph runWithMTLCommandQueue:context->queue
-                                                                  feeds:feeds
-                                                          targetTensors:@[ plan->output ]
-                                                       targetOperations:nil];
-            MPSNDArray *array = [[results objectForKey:plan->output] mpsndarray];
+            MPSGraphTensorData *result = nil;
+            if (plan->executable != nil) {
+                NSArray<MPSGraphTensorData *> *inputs = synapse_executable_inputs(plan->executable_feed_tensors, feeds);
+                result = [[plan->executable runWithMTLCommandQueue:context->queue inputsArray:inputs resultsArray:nil executionDescriptor:nil] firstObject];
+            } else {
+                NSDictionary *results = [plan->graph runWithMTLCommandQueue:context->queue feeds:feeds targetTensors:@[ plan->output ] targetOperations:nil];
+                result = [results objectForKey:plan->output];
+            }
+            MPSNDArray *array = [result mpsndarray];
             if (array == nil) {
                 set_error(@"Qwen3 MPSGraph returned no output");
                 [feeds release]; [input_buffer release]; [mask_buffer release]; [cos_buffer release]; [sin_buffer release];
