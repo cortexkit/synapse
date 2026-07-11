@@ -4,9 +4,9 @@
 
 The runtime now accepts `--dtype f16` for MiniLM, gte-modernbert, and Qwen3-Embedding-0.6B. Metal uses explicit `MPSGraphExecutable` compilation with optimization level 0, synchronous compilation, and explicit specialization by default. `--execution lazy` keeps the old `runWithFeeds` path for A/B checks.
 
-`--package-cache DIR` stores one `.mpsgraphpackage` per `(batch, seq)` shape. The cache directory key includes model-family, a hash of the canonical checkpoint path, dtype, and macOS build; the filename supplies the shape. Packages are never appended. A cache hit uses `initWithMPSGraphPackageAtURL:compilationDescriptor:` and a miss compiles, specializes, and serializes before the first execution of that shape.
+`--package-cache DIR` stores one `.mpsgraphpackage` per `(batch, seq)` shape. The cache directory key includes model-family, graph revision, a hash of the canonical checkpoint path, dtype, and macOS build; the filename supplies the shape. Packages are never appended. A cache hit uses `initWithMPSGraphPackageAtURL:compilationDescriptor:` and a miss compiles, specializes, and serializes before the first execution of that shape.
 
-This assembly is **partial** because gte-modernbert f16 does not meet the parity gate, even after the prescribed fallback and two additional hypothesis-driven islands. Qwen3 passes the full 400-vector gate. MiniLM retains the frozen evidence topology and passes its backend unit parity test, but the official 400-row ORT file used by the evidence run was not available on this host; the locally regenerated ONNX reference also failed the existing fp32 path and therefore is not a valid certification oracle.
+This assembly remains partially certified because the official 400-row MiniLM ORT file used by the evidence run was not available on this host; the locally regenerated ONNX reference also failed the existing fp32 path and therefore is not a valid certification oracle. ModernBERT and Qwen3 pass the full 400-vector gate.
 
 ## f16 parity
 
@@ -15,7 +15,7 @@ Certification thresholds are mean cosine `>= 0.9999` and mean top-10 overlap `>=
 | Family | Rows | f16 mean cosine | Top-10 overlap | Result | Topology |
 |---|---:|---:|---:|---|---|
 | MiniLM | 400 | official rerun unavailable | official rerun unavailable | not re-certified | native f16 matmuls and inter-block activations; fp32 layernorm, GELU, and softmax islands (the frozen evidence run measured cosine `0.9999993186`) |
-| gte-modernbert | 400 | `0.5302198331` | `0.235750` | **FAIL** | f16 storage/inter-block activations; fp32 matmuls, RoPE, layernorm, additive masks, and softmax |
+| gte-modernbert | 400 | `0.9999990763` | `0.998500` | **PASS** | f16 storage/inter-block activations; fp32 norm scales, matmuls, RoPE, layernorm, additive masks, and softmax |
 | Qwen3-Embedding-0.6B | 400 | `0.9999987315` | `0.998500` | **PASS** | native f16 weights/matmuls/inter-block activations; fp32 RMSNorm and masked softmax |
 
 The MiniLM reference check cannot be treated as a product failure: the generated ONNX file scored `0.99920633` against the unchanged fp32 runtime and `0.99920582` against f16, so it is not equivalent to the existing parity oracle. `cargo test` still covers f16-vs-fp32 behavior for the tiny resident encoder block.
@@ -45,7 +45,13 @@ The earlier all-matmul-fp32 fallback already diverged at layer 0 and compounded 
 | 11 | `0.032200779` | `1.002839` |
 | 21 | `0.474928131` | `0.941781` |
 
-This kills the initial “global theta 160,000 RoPE is the first divergence” hypothesis. Keeping RoPE tables/rotation and attention scores in fp32 raised the full 400-row cosine only to `0.5302198331`; work stopped at the agreed investigation boundary.
+This killed the initial “global theta 160,000 RoPE is the first divergence” hypothesis. The root cause was the pointer-keyed static Metal buffer cache receiving per-call f16 norm-scale temporaries. Allocator address reuse let later calls bind a cached buffer for a different layer's gamma. Feeding all norm scales as fp32 from model-owned storage removed that lifetime violation. The repaired layer-0 stages remain aligned through the MLP:
+
+| Repaired layer-0 stage | cosine vs fp32 | relative L2 |
+|---|---:|---:|
+| MLP normalization | `0.999999936` | `0.000357` |
+| MLP projection | `0.999999922` | `0.000396` |
+| MLP output | `0.999999944` | `0.000334` |
 
 ## Contended local throughput
 
@@ -56,7 +62,7 @@ These are Apple M5 Max, macOS 26.5.2 build 25F84 measurements. They are explicit
 | MiniLM parity corpus | fp32 | 158,310 | miss/compile | `71,950.2` | — |
 | MiniLM parity corpus | f16 | 158,310 | hit/load | `86,957.7` | `1.21x` |
 | gte-modernbert standard corpus | fp32 | 62,838 | hit/load | `23,183.6` | — |
-| gte-modernbert standard corpus | f16 | 62,838 | hit/load | `16,385.2` | `0.71x` (invalid parity) |
+| gte-modernbert standard corpus | f16 | 62,838 | hit/load | `17,063.7` | `0.74x` (fixed parity) |
 | Qwen3 standard corpus | fp32 | 46,716 | mixed cache | `6,551.5` | — |
 | Qwen3 standard corpus | f16 | 46,716 | mixed cache | `6,813.0` | `1.04x` |
 
@@ -68,9 +74,10 @@ The requested `/tmp/mc-corpus.jsonl` run completed on the contended M5 host:
 
 | Path | chunks | tokens | wall | tok/s | versus 342 s fp32 baseline |
 |---|---:|---:|---:|---:|---:|
-| gte-modernbert f16 + explicit O0 | 11,293 | 4,172,183 | `214.032 s` | `19,493.3` | `1.60x` / 37.4% less wall time |
+| gte-modernbert f16 + explicit O0 (invalid norm feeds) | 11,293 | 4,172,183 | `214.032 s` | `19,493.3` | `1.60x` / 37.4% less wall time |
+| gte-modernbert f16 + explicit O0 (fixed norm feeds) | 11,293 | 4,172,183 | `211.356 s` | `19,740.1` | `1.62x` / 38.2% less wall time |
 
-This payoff is **not shippable** because the same f16 topology fails the ModernBERT parity gate. The result was labeled `gte-modernbert-f16-o0-contended-invalid-parity` in the output JSON.
+The fixed payoff run passed the separate 400-row parity gate and was labeled `gte-modernbert-f16-o0-contended-fixed-parity`. Both payoff measurements are contended local results, not locked-machine serving numbers.
 
 ## Package cache behavior
 
@@ -84,7 +91,7 @@ A fresh-process MiniLM cache-hit run loaded 19 shapes in `0.123996 s` total (`6.
 | Qwen3 fp32 | 5 | `203.681–203.795 KiB` | `1,018.77 KiB` |
 | ModernBERT f16 MC corpus | 162 | `189.494–189.670 KiB` | `30,720.88 KiB` |
 
-The 162-package MC result reflects exact dynamic `(batch, seq)` shapes. A production bucketing policy should reduce that set before graduation. Package compatibility is deliberately separated by OS build. A checkpoint replaced in-place at the same canonical snapshot path would retain the same model key; immutable snapshot paths are assumed for this spike.
+The 162-package MC result reflects exact dynamic `(batch, seq)` shapes. A production bucketing policy should reduce that set before graduation. Package compatibility is separated by OS build and an explicit graph revision, so placeholder or topology changes cannot load stale packages. A checkpoint replaced in-place at the same canonical snapshot path would retain the same model key; immutable snapshot paths are assumed for this spike.
 
 ## Commands executed
 
@@ -140,8 +147,7 @@ SYNAPSE_MODERNBERT_DUMP_DIR=target/mb-dump-f16 $BIN ... --limit 1 --dtype f16 --
 
 ## Open items
 
-1. Resolve the ModernBERT f16 MLP-normalization divergence. Do not use its throughput or MC payoff until both parity thresholds pass.
-2. Re-run MiniLM against the exact official ORT fp32 reference used by the frozen evidence pack.
-3. Run first/warm/steady fp32-vs-f16 for all families under the locked M1 `bench.lock` plus `Runner.Worker` check protocol.
-4. Pre-discover serving buckets so every shape is compiled/loaded before inference timing; this spike currently prepares each shape synchronously immediately before its first execution.
-5. Replace exact corpus shapes with a bounded serving bucket policy, especially for the 162-shape MC workload.
+1. Re-run MiniLM against the exact official ORT fp32 reference used by the frozen evidence pack.
+2. Run first/warm/steady fp32-vs-f16 for all families under the locked M1 `bench.lock` plus `Runner.Worker` check protocol.
+3. Pre-discover serving buckets so every shape is compiled/loaded before inference timing; this spike currently prepares each shape synchronously immediately before its first execution.
+4. Replace exact corpus shapes with a bounded serving bucket policy, especially for the 162-shape MC workload.

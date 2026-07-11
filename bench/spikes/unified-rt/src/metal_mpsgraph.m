@@ -620,6 +620,8 @@ static SynapseMpsEncoderPlan *synapse_mps_get_encoder_plan(
     return plan;
 }
 
+// This pointer-keyed cache accepts only model-owned parameters and their persistent f16 mirrors.
+// Dynamic activations and masks are copied into uncached buffers for each encoder invocation.
 static id<MTLBuffer> synapse_mps_get_cached_buffer(
     SynapseMpsContext *context,
     const void *values,

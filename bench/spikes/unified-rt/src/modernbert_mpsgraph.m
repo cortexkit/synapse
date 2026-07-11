@@ -300,7 +300,7 @@ static ModernBertPlan *modernbert_plan_new(
     plan->global_sin_tensor = modernbert_placeholder(plan->graph, plan->rope_shape, MPSDataTypeFloat32, @"global_sin");
     plan->local_cos_tensor = modernbert_placeholder(plan->graph, plan->rope_shape, MPSDataTypeFloat32, @"local_cos");
     plan->local_sin_tensor = modernbert_placeholder(plan->graph, plan->rope_shape, MPSDataTypeFloat32, @"local_sin");
-    plan->final_norm_tensor = modernbert_placeholder(plan->graph, plan->hidden_vector_shape, data_type, @"final_norm");
+    plan->final_norm_tensor = modernbert_placeholder(plan->graph, plan->hidden_vector_shape, MPSDataTypeFloat32, @"final_norm");
 
     MPSGraphTensor *x = [plan->graph reshapeTensor:plan->input_tensor withShape:plan->hidden_2d_shape name:nil];
     MPSShape *qkv_shape = @[ @(batch), @(seq), @3, @(heads), @(head_dim) ];
@@ -317,11 +317,11 @@ static ModernBertPlan *modernbert_plan_new(
         layer->qkv_weight = modernbert_placeholder(plan->graph, plan->qkv_weight_shape, data_type, [prefix stringByAppendingString:@"_qkv"]);
         layer->attention_output_weight = modernbert_placeholder(plan->graph, plan->hidden_weight_shape, data_type, [prefix stringByAppendingString:@"_attention_output"]);
         if (index > 0) {
-            layer->attention_norm_weight = modernbert_placeholder(plan->graph, plan->hidden_vector_shape, data_type, [prefix stringByAppendingString:@"_attention_norm"]);
+            layer->attention_norm_weight = modernbert_placeholder(plan->graph, plan->hidden_vector_shape, MPSDataTypeFloat32, [prefix stringByAppendingString:@"_attention_norm"]);
         }
         layer->mlp_input_weight = modernbert_placeholder(plan->graph, plan->mlp_input_weight_shape, data_type, [prefix stringByAppendingString:@"_mlp_input"]);
         layer->mlp_output_weight = modernbert_placeholder(plan->graph, plan->mlp_output_weight_shape, data_type, [prefix stringByAppendingString:@"_mlp_output"]);
-        layer->mlp_norm_weight = modernbert_placeholder(plan->graph, plan->hidden_vector_shape, data_type, [prefix stringByAppendingString:@"_mlp_norm"]);
+        layer->mlp_norm_weight = modernbert_placeholder(plan->graph, plan->hidden_vector_shape, MPSDataTypeFloat32, [prefix stringByAppendingString:@"_mlp_norm"]);
 
         MPSGraphTensor *attention_input = x;
         if (index > 0) {
@@ -412,6 +412,9 @@ static ModernBertPlan *modernbert_get_plan(
     return plan;
 }
 
+// Pointer identity is a cache key only for model-owned allocations that outlive this context.
+// Per-call activations and masks use uncached buffers; RoPE tables are host-cached by sequence
+// bucket but also use per-call buffers so no temporary pointer can alias a static tensor.
 static id<MTLBuffer> modernbert_static_buffer(ModernBertContext *context, const void *values, NSUInteger bytes) {
     if (values == NULL || bytes == 0) {
         modernbert_set_error("ModernBERT static tensor is null or empty");
@@ -593,17 +596,17 @@ int32_t synapse_modernbert_mps_forward(
                 modernbert_add_feed(feeds, plan->global_sin_tensor, plan->rope_shape, global_sin_buffer, MPSDataTypeFloat32) &&
                 modernbert_add_feed(feeds, plan->local_cos_tensor, plan->rope_shape, local_cos_buffer, MPSDataTypeFloat32) &&
                 modernbert_add_feed(feeds, plan->local_sin_tensor, plan->rope_shape, local_sin_buffer, MPSDataTypeFloat32) &&
-                modernbert_add_static_feed(context, feeds, plan->final_norm_tensor, plan->hidden_vector_shape, final_norm, (NSUInteger)hidden, data_type);
+                modernbert_add_static_feed(context, feeds, plan->final_norm_tensor, plan->hidden_vector_shape, final_norm, (NSUInteger)hidden, MPSDataTypeFloat32);
             for (uint64_t index = 0; feeds_ok && index < layer_count; index++) {
                 ModernBertLayerTensors *tensors = &plan->layers[index];
                 const ModernBertLayerParams *layer = &params[index];
                 feeds_ok =
                     modernbert_add_static_feed(context, feeds, tensors->qkv_weight, plan->qkv_weight_shape, layer->qkv_weight, (NSUInteger)(3 * hidden * hidden), data_type) &&
                     modernbert_add_static_feed(context, feeds, tensors->attention_output_weight, plan->hidden_weight_shape, layer->attention_output_weight, (NSUInteger)(hidden * hidden), data_type) &&
-                    (index == 0 || modernbert_add_static_feed(context, feeds, tensors->attention_norm_weight, plan->hidden_vector_shape, layer->attention_norm_weight, (NSUInteger)hidden, data_type)) &&
+                    (index == 0 || modernbert_add_static_feed(context, feeds, tensors->attention_norm_weight, plan->hidden_vector_shape, layer->attention_norm_weight, (NSUInteger)hidden, MPSDataTypeFloat32)) &&
                     modernbert_add_static_feed(context, feeds, tensors->mlp_input_weight, plan->mlp_input_weight_shape, layer->mlp_input_weight, (NSUInteger)(2 * intermediate * hidden), data_type) &&
                     modernbert_add_static_feed(context, feeds, tensors->mlp_output_weight, plan->mlp_output_weight_shape, layer->mlp_output_weight, (NSUInteger)(hidden * intermediate), data_type) &&
-                    modernbert_add_static_feed(context, feeds, tensors->mlp_norm_weight, plan->hidden_vector_shape, layer->mlp_norm_weight, (NSUInteger)hidden, data_type);
+                    modernbert_add_static_feed(context, feeds, tensors->mlp_norm_weight, plan->hidden_vector_shape, layer->mlp_norm_weight, (NSUInteger)hidden, MPSDataTypeFloat32);
             }
             int32_t status = 0;
             if (!feeds_ok) {

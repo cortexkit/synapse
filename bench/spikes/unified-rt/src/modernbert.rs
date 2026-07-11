@@ -802,28 +802,10 @@ impl MetalContext {
         let masks = additive_masks_with_band(attention_mask, batch, seq, &bucket.band_mask);
         let input_f16 =
             matches!(self.precision, Precision::F16).then(|| encode_f16_bits(hidden_states));
-        let final_norm_f16 =
-            matches!(self.precision, Precision::F16).then(|| encode_f16_bits(&model.final_norm));
-        let attention_norm_f16: Vec<Option<Vec<u16>>> = model
-            .layers
-            .iter()
-            .map(|layer| {
-                layer
-                    .attention_norm
-                    .as_ref()
-                    .map(|weight| encode_f16_bits(weight))
-            })
-            .collect();
-        let mlp_norm_f16: Vec<Vec<u16>> = model
-            .layers
-            .iter()
-            .map(|layer| encode_f16_bits(&layer.mlp_norm))
-            .collect();
         let params: Vec<ModernBertLayerParams> = model
             .layers
             .iter()
-            .enumerate()
-            .map(|(index, layer)| -> Result<_> {
+            .map(|layer| -> Result<_> {
                 let f16 = matches!(self.precision, Precision::F16);
                 Ok(ModernBertLayerParams {
                     qkv_weight: if f16 {
@@ -841,16 +823,10 @@ impl MetalContext {
                     } else {
                         layer.attention_output.weight.data.as_ptr().cast()
                     },
-                    attention_norm_weight: if f16 {
-                        attention_norm_f16[index]
-                            .as_ref()
-                            .map_or(std::ptr::null(), |weight| weight.as_ptr().cast())
-                    } else {
-                        layer
-                            .attention_norm
-                            .as_ref()
-                            .map_or(std::ptr::null(), |weight| weight.as_ptr().cast())
-                    },
+                    attention_norm_weight: layer
+                        .attention_norm
+                        .as_ref()
+                        .map_or(std::ptr::null(), |weight| weight.as_ptr().cast()),
                     mlp_input_weight: if f16 {
                         layer.mlp_input.weight.metal_f16_bits()?.as_ptr().cast()
                     } else {
@@ -861,11 +837,7 @@ impl MetalContext {
                     } else {
                         layer.mlp_output.weight.data.as_ptr().cast()
                     },
-                    mlp_norm_weight: if f16 {
-                        mlp_norm_f16[index].as_ptr().cast()
-                    } else {
-                        layer.mlp_norm.as_ptr().cast()
-                    },
+                    mlp_norm_weight: layer.mlp_norm.as_ptr().cast(),
                     attention_type: match layer.attention_type {
                         AttentionType::Full => 0,
                         AttentionType::Sliding => 1,
@@ -907,11 +879,7 @@ impl MetalContext {
                 bucket.global_sin.as_ptr(),
                 bucket.local_cos.as_ptr(),
                 bucket.local_sin.as_ptr(),
-                final_norm_f16
-                    .as_ref()
-                    .map_or(model.final_norm.as_ptr().cast(), |values| {
-                        values.as_ptr().cast()
-                    }),
+                model.final_norm.as_ptr(),
                 params.as_ptr(),
                 if f16 {
                     output_f16.as_mut_ptr().cast()
@@ -1136,6 +1104,90 @@ mod tests {
         let mut values = vec![1.0, 2.0, 3.0, 4.0];
         apply_rope(&mut values, 0, 10_000.0);
         assert_eq!(values, vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires MODERNBERT_F16_MODEL and a Metal device"]
+    fn modernbert_f16_static_feeds_survive_multiple_calls() {
+        const CHILD_OUTPUT: &str = "MODERNBERT_F16_MULTICALL_CHILD_OUTPUT";
+        const TARGET_TEXTS: &[&str] = &[
+            "A persistent cache must preserve every learned normalization scale.",
+            "The third invocation uses a different batch shape and different content.",
+            "Fresh-process output is the reference for detecting cross-call pointer reuse.",
+        ];
+
+        let model_path = std::path::PathBuf::from(
+            std::env::var("MODERNBERT_F16_MODEL").expect("set MODERNBERT_F16_MODEL"),
+        );
+        let tokenizer_path = std::env::var("MODERNBERT_F16_TOKENIZER")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| model_path.join("tokenizer.json"));
+        let model = ModernBertModel::load(&model_path, Precision::F16).unwrap();
+        let mut tokenizer = Tokenizer::from_file(&tokenizer_path).unwrap();
+        tokenizer.with_padding(None);
+        let execution = super::super::MetalExecutionConfig {
+            execution: Execution::Lazy,
+            package_root: None,
+        };
+        let mut backend = Backend::new(DeviceArg::Metal, Precision::F16, execution).unwrap();
+
+        if let Ok(output_path) = std::env::var(CHILD_OUTPUT) {
+            let baseline = model
+                .embed_batch(&mut backend, &tokenizer, TARGET_TEXTS)
+                .unwrap();
+            fs::write(output_path, serde_json::to_vec(&baseline).unwrap()).unwrap();
+            return;
+        }
+
+        model
+            .embed_batch(&mut backend, &tokenizer, &["first call"])
+            .unwrap();
+        model
+            .embed_batch(
+                &mut backend,
+                &tokenizer,
+                &[
+                    "second call has two rows",
+                    "and enough distinct content to use another shape",
+                ],
+            )
+            .unwrap();
+        let third_call = model
+            .embed_batch(&mut backend, &tokenizer, TARGET_TEXTS)
+            .unwrap();
+
+        let baseline_path = std::env::temp_dir().join(format!(
+            "modernbert-f16-multicall-baseline-{}.json",
+            std::process::id()
+        ));
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "modernbert::tests::modernbert_f16_static_feeds_survive_multiple_calls",
+                "--ignored",
+            ])
+            .env(CHILD_OUTPUT, &baseline_path)
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "fresh-process baseline failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
+        let baseline: Vec<Vec<f32>> =
+            serde_json::from_slice(&fs::read(&baseline_path).unwrap()).unwrap();
+        fs::remove_file(&baseline_path).unwrap();
+
+        assert_eq!(third_call.len(), baseline.len());
+        for (index, (actual, expected)) in third_call.iter().zip(&baseline).enumerate() {
+            let similarity = synapse_bench::parity::cosine(actual, expected);
+            assert!(
+                similarity >= 0.999999,
+                "row {index} changed after repeated calls: cosine={similarity:.9}"
+            );
+        }
     }
 
     #[test]
