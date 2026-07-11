@@ -8,7 +8,7 @@
 #import <MetalPerformanceShadersGraph/MPSGraphNormalizationOps.h>
 #import <MetalPerformanceShadersGraph/MPSGraphTensorShapeOps.h>
 
-#include "mpsgraph_executable.h"
+#include "mpsgraph_runtime.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -70,10 +70,7 @@ typedef struct Qwen3Plan {
 } Qwen3Plan;
 
 typedef struct Qwen3Context {
-    id<MTLDevice> device;
-    id<MTLCommandQueue> queue;
-    NSMutableDictionary<NSString *, NSValue *> *plans;
-    NSMutableDictionary<NSString *, id<MTLBuffer>> *weights;
+    SynapseMpsRuntimeContext runtime;
 } Qwen3Context;
 
 static void set_error(NSString *message) {
@@ -326,29 +323,12 @@ static NSString *plan_key(uint64_t batch, uint64_t seq, uint64_t hidden, uint64_
 // Pointer-keyed entries are restricted to model-owned tensors and persistent f16 mirrors.
 // Input, mask, and RoPE temporaries are copied into uncached buffers for every invocation.
 static id<MTLBuffer> cached_buffer(Qwen3Context *context, const void *values, NSUInteger bytes) {
-    NSString *key = [NSString stringWithFormat:@"%p:%llu", values, (unsigned long long)bytes];
-    id<MTLBuffer> buffer = [context->weights objectForKey:key];
-    if (buffer == nil) {
-        buffer = [context->device newBufferWithBytes:values length:bytes options:MTLResourceStorageModeShared];
-        if (buffer != nil) {
-            [context->weights setObject:buffer forKey:key];
-            [buffer release];
-            buffer = [context->weights objectForKey:key];
-        }
-    }
-    return buffer;
+    return synapse_mps_cached_static_buffer(&context->runtime, values, bytes);
 }
 
 static BOOL add_feed(NSMutableDictionary *feeds, MPSGraphTensor *tensor, MPSShape *shape,
                       id<MTLBuffer> buffer, MPSDataType data_type) {
-    if (tensor == nil || shape == nil || buffer == nil) return NO;
-    MPSGraphTensorData *data = [[MPSGraphTensorData alloc] initWithMTLBuffer:buffer
-                                                                      shape:shape
-                                                                    dataType:data_type];
-    if (data == nil) return NO;
-    [feeds setObject:data forKey:tensor];
-    [data release];
-    return YES;
+    return synapse_mps_add_feed(feeds, tensor, shape, buffer, data_type);
 }
 
 static BOOL add_weight(Qwen3Context *context, NSMutableDictionary *feeds, MPSGraphTensor *tensor,
@@ -359,31 +339,24 @@ static BOOL add_weight(Qwen3Context *context, NSMutableDictionary *feeds, MPSGra
 
 void *synapse_qwen3_context_new(void) {
     @autoreleasepool {
-        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
-        id<MTLCommandQueue> queue = [device newCommandQueue];
-        if (device == nil || queue == nil) {
-            [queue release];
-            [device release];
+        Qwen3Context *context = calloc(1, sizeof(Qwen3Context));
+        if (context == NULL || !synapse_mps_runtime_init(&context->runtime)) {
+            free(context);
             set_error(@"no Metal device or command queue for Qwen3");
             return NULL;
         }
-        Qwen3Context *context = calloc(1, sizeof(Qwen3Context));
-        context->device = device;
-        context->queue = queue;
-        context->plans = [[NSMutableDictionary alloc] init];
-        context->weights = [[NSMutableDictionary alloc] init];
         return context;
     }
+}
+
+static void free_plan_erased(void *plan) {
+    free_plan((Qwen3Plan *)plan);
 }
 
 void synapse_qwen3_context_free(void *raw) {
     if (raw == NULL) return;
     Qwen3Context *context = raw;
-    for (NSValue *value in context->plans.allValues) free_plan(value.pointerValue);
-    [context->weights release];
-    [context->plans release];
-    [context->queue release];
-    [context->device release];
+    synapse_mps_runtime_release(&context->runtime, free_plan_erased);
     free(context);
 }
 
@@ -420,17 +393,17 @@ int32_t synapse_qwen3_forward(
                 return -1;
             }
             NSString *key = plan_key(batch, seq, hidden, query_heads, kv_heads, head_dim, intermediate, layer_count, epsilon, dtype);
-            Qwen3Plan *plan = [[context->plans objectForKey:key] pointerValue];
+            Qwen3Plan *plan = synapse_mps_cached_plan(&context->runtime, key);
             if (plan == NULL) {
                 plan = new_plan(batch, seq, hidden, query_heads, kv_heads, head_dim, intermediate, layer_count, epsilon, dtype);
                 if (plan == NULL) return -2;
-                [context->plans setObject:[NSValue valueWithPointer:plan] forKey:key];
+                synapse_mps_cache_plan(&context->runtime, key, plan);
             }
             MPSDataType data_type = dtype == 1 ? MPSDataTypeFloat16 : MPSDataTypeFloat32;
             NSUInteger element_size = dtype == 1 ? sizeof(uint16_t) : sizeof(float);
             if (explicit_execution && plan->executable == nil) {
-                plan->executable = synapse_explicit_executable(
-                    plan->graph, context->device, plan->output, package_path,
+                plan->executable = synapse_mps_explicit_executable(
+                    plan->graph, context->runtime.device, plan->output, package_path,
                     &plan->executable_feed_tensors
                 );
                 if (plan->executable == nil) {
@@ -439,10 +412,10 @@ int32_t synapse_qwen3_forward(
                 }
             }
             const NSUInteger rows = (NSUInteger)(batch * seq);
-            id<MTLBuffer> input_buffer = [context->device newBufferWithBytes:input length:rows * hidden * element_size options:MTLResourceStorageModeShared];
-            id<MTLBuffer> mask_buffer = [context->device newBufferWithBytes:mask length:batch * seq * seq * sizeof(float) options:MTLResourceStorageModeShared];
-            id<MTLBuffer> cos_buffer = [context->device newBufferWithBytes:rope_cos length:seq * head_dim * element_size options:MTLResourceStorageModeShared];
-            id<MTLBuffer> sin_buffer = [context->device newBufferWithBytes:rope_sin length:seq * head_dim * element_size options:MTLResourceStorageModeShared];
+            id<MTLBuffer> input_buffer = [context->runtime.device newBufferWithBytes:input length:rows * hidden * element_size options:MTLResourceStorageModeShared];
+            id<MTLBuffer> mask_buffer = [context->runtime.device newBufferWithBytes:mask length:batch * seq * seq * sizeof(float) options:MTLResourceStorageModeShared];
+            id<MTLBuffer> cos_buffer = [context->runtime.device newBufferWithBytes:rope_cos length:seq * head_dim * element_size options:MTLResourceStorageModeShared];
+            id<MTLBuffer> sin_buffer = [context->runtime.device newBufferWithBytes:rope_sin length:seq * head_dim * element_size options:MTLResourceStorageModeShared];
             NSMutableDictionary *feeds = [[NSMutableDictionary alloc] initWithCapacity:(NSUInteger)(5 + layer_count * 11)];
             if (!add_feed(feeds, plan->input, plan->hidden_shape, input_buffer, data_type) ||
                 !add_feed(feeds, plan->mask, plan->mask_shape, mask_buffer, MPSDataTypeFloat32) ||
@@ -478,10 +451,10 @@ int32_t synapse_qwen3_forward(
             }
             MPSGraphTensorData *result = nil;
             if (plan->executable != nil) {
-                NSArray<MPSGraphTensorData *> *inputs = synapse_executable_inputs(plan->executable_feed_tensors, feeds);
-                result = [[plan->executable runWithMTLCommandQueue:context->queue inputsArray:inputs resultsArray:nil executionDescriptor:nil] firstObject];
+                NSArray<MPSGraphTensorData *> *inputs = synapse_mps_executable_inputs(plan->executable_feed_tensors, feeds);
+                result = [[plan->executable runWithMTLCommandQueue:context->runtime.queue inputsArray:inputs resultsArray:nil executionDescriptor:nil] firstObject];
             } else {
-                NSDictionary *results = [plan->graph runWithMTLCommandQueue:context->queue feeds:feeds targetTensors:@[ plan->output ] targetOperations:nil];
+                NSDictionary *results = [plan->graph runWithMTLCommandQueue:context->runtime.queue feeds:feeds targetTensors:@[ plan->output ] targetOperations:nil];
                 result = [results objectForKey:plan->output];
             }
             MPSNDArray *array = [result mpsndarray];

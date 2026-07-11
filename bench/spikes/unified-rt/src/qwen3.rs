@@ -4,6 +4,7 @@
 //! every dense/attention product to `KernelProvider`. Metal providers may take
 //! the whole decoder stack through the Qwen3-specific block hook.
 
+use std::any::Any;
 use std::path::Path;
 
 use anyhow::{ensure, Context, Result};
@@ -11,8 +12,8 @@ use serde::Deserialize;
 use tokenizers::Tokenizer;
 
 use super::{
-    get_tensor, load_safetensor_map, normalize_l2, resolve_model_root, BLayout, KernelProvider,
-    Tensor,
+    get_tensor, load_safetensor_map, normalize_l2, resolve_model_root, BLayout,
+    BlockForwardRequest, KernelProvider, MetalExecutionConfig, ModelFamily, Precision, Tensor,
 };
 
 #[derive(Debug, Deserialize)]
@@ -222,21 +223,31 @@ impl Model {
             }
         }
 
-        if !provider.qwen3_forward(
-            &mut hidden_states,
-            &attention_mask,
-            batch,
-            seq,
-            hidden,
-            self.config.num_attention_heads,
-            self.config.num_key_value_heads,
-            self.config.head_dim,
-            self.config.intermediate_size,
-            self.config.rms_norm_eps,
-            self.config.rope_theta,
-            &self.layers,
-            &self.final_norm,
-        )? {
+        let mut run = |context: &mut dyn Any| {
+            let context = context
+                .downcast_mut::<MetalContext>()
+                .context("Qwen3 provider returned the wrong block context type")?;
+            context.forward(
+                &mut hidden_states,
+                &attention_mask,
+                batch,
+                seq,
+                hidden,
+                self.config.num_attention_heads,
+                self.config.num_key_value_heads,
+                self.config.head_dim,
+                self.config.intermediate_size,
+                self.config.rms_norm_eps,
+                self.config.rope_theta,
+                &self.layers,
+                &self.final_norm,
+            )
+        };
+        if !provider.block_forward(BlockForwardRequest {
+            family: self.family_name(),
+            create_context: new_block_context,
+            run: &mut run,
+        })? {
             scalar_forward(
                 provider,
                 &mut hidden_states,
@@ -270,6 +281,62 @@ impl Model {
             self.config.rope_theta
         )
     }
+}
+
+impl ModelFamily for Model {
+    fn family_name(&self) -> &'static str {
+        "qwen3-0.6b"
+    }
+
+    fn token_length(&self, tokenizer: &Tokenizer, text: &str, max_length: usize) -> Result<usize> {
+        Ok(self.encode(tokenizer, text, max_length)?.len())
+    }
+
+    fn embed_batch(
+        &self,
+        provider: &mut dyn KernelProvider,
+        tokenizer: &Tokenizer,
+        texts: &[&str],
+        max_length: usize,
+    ) -> Result<Vec<Vec<f32>>> {
+        Model::embed_batch(self, provider, tokenizer, texts, max_length)
+    }
+
+    fn default_label(&self, precision: Precision) -> String {
+        Model::default_label(self, precision)
+    }
+
+    fn notes(&self) -> String {
+        Model::notes(self)
+    }
+}
+
+pub(super) fn detect_config(config: &serde_json::Value) -> bool {
+    let model_type = config
+        .get("model_type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    model_type.starts_with("qwen3")
+        || config
+            .get("architectures")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|architectures| {
+                architectures.iter().any(|name| {
+                    name.as_str()
+                        .is_some_and(|name| name.to_ascii_lowercase().contains("qwen3"))
+                })
+            })
+}
+
+pub(super) fn load_family(path: &Path, precision: Precision) -> Result<Box<dyn ModelFamily>> {
+    Ok(Box::new(Model::load(path, precision)?))
+}
+
+fn new_block_context(
+    precision: Precision,
+    execution: MetalExecutionConfig,
+) -> Result<Box<dyn Any>> {
+    Ok(Box::new(MetalContext::new(precision, execution)?))
 }
 
 fn get_qwen_tensor(
