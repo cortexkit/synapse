@@ -14,6 +14,8 @@ use synapse_bench::{
 };
 use tokenizers::{Tokenizer, TruncationParams};
 
+mod modernbert;
+
 #[derive(Parser)]
 #[command(name = "spike-unified-rt")]
 struct Args {
@@ -41,6 +43,9 @@ struct Args {
     /// Minimum mean cosine when --reference is supplied.
     #[arg(long, default_value_t = 0.9999)]
     min_parity: f64,
+    /// Minimum mean top-10 rank overlap for ModernBERT parity.
+    #[arg(long, default_value_t = 0.995)]
+    min_rank_overlap: f64,
     /// Kernel provider to use.
     #[arg(long, value_enum, default_value_t = DeviceArg::Cpu)]
     device: DeviceArg,
@@ -85,6 +90,10 @@ fn main() -> Result<()> {
         !(matches!(args.device, DeviceArg::Cpu) && matches!(args.dtype, Precision::F16)),
         "cpu + f16 is not supported for this spike; use --dtype f32 on cpu"
     );
+    if modernbert::is_modernbert(&args.model)? {
+        return modernbert::run(&args);
+    }
+
     let started = Instant::now();
 
     let model = BertModel::load(&args.model, args.dtype)?;
