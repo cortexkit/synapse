@@ -30,6 +30,8 @@ pub enum StableErrorCode {
     NeedsReauthExpired,
     RemoteDeploymentChanged,
     CredentialConfigInvalid,
+    OpNotSupportedForRemote,
+    SentinelCalibrationRefused,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -235,6 +237,24 @@ impl StableError {
             false,
         )
     }
+
+    pub const fn op_not_supported_for_remote() -> Self {
+        Self::new(
+            StableErrorCode::OpNotSupportedForRemote,
+            ErrorClass::Permanent,
+            None,
+            false,
+        )
+    }
+
+    pub const fn sentinel_calibration_refused() -> Self {
+        Self::new(
+            StableErrorCode::SentinelCalibrationRefused,
+            ErrorClass::Permanent,
+            None,
+            false,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -264,6 +284,8 @@ mod tests {
             StableError::needs_reauth_expired(),
             StableError::remote_deployment_changed(),
             StableError::credential_config_invalid(),
+            StableError::op_not_supported_for_remote(),
+            StableError::sentinel_calibration_refused(),
         ];
 
         let json = serde_json::to_string(&errors).expect("serialize stable errors");
@@ -284,6 +306,8 @@ mod tests {
             StableError::needs_reauth_expired(),
             StableError::remote_deployment_changed(),
             StableError::credential_config_invalid(),
+            StableError::op_not_supported_for_remote(),
+            StableError::sentinel_calibration_refused(),
         ] {
             assert_eq!(error.class, ErrorClass::Permanent);
             assert!(!error.safe_to_retry_same_request);

@@ -22,7 +22,7 @@ const PERFECT_DRIFT_GATE: f64 = 0.9999;
 
 /// Admission class for remote I/O. These permits are independent from local GPU lane quanta.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum RemoteClass {
+pub(crate) enum RemoteClass {
     Interactive,
     Bulk,
 }
@@ -539,16 +539,18 @@ fn nearest_rank_p90(mut values: Vec<u64>) -> u64 {
     values[rank - 1]
 }
 
-pub(super) struct CredentialToken {
+pub(crate) struct CredentialToken {
     secret: String,
     pub expires_at_ms: u64,
+    pub record_version: u64,
 }
 
 impl CredentialToken {
-    pub(super) fn new(secret: String, expires_at_ms: u64) -> Self {
+    pub(super) fn new(secret: String, expires_at_ms: u64, record_version: u64) -> Self {
         Self {
             secret,
             expires_at_ms,
+            record_version,
         }
     }
 
@@ -563,12 +565,13 @@ impl std::fmt::Debug for CredentialToken {
             .debug_struct("CredentialToken")
             .field("secret", &"[REDACTED]")
             .field("expires_at_ms", &self.expires_at_ms)
+            .field("record_version", &self.record_version)
             .finish()
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum VaultError {
+pub(crate) enum VaultError {
     NotFound,
     MalformedHandle,
     MalformedHandlesFile,
@@ -578,14 +581,19 @@ pub(super) enum VaultError {
 }
 
 #[async_trait]
-pub(super) trait VaultCredentialClient: Send + Sync {
+pub(crate) trait VaultCredentialClient: Send + Sync {
     async fn fetch(
         &self,
         logical_handle: &str,
         min_ttl_ms: u64,
     ) -> Result<CredentialToken, VaultError>;
 
-    async fn report_auth_failure(&self, logical_handle: &str);
+    async fn report_auth_failure(
+        &self,
+        logical_handle: &str,
+        provider_status: u16,
+        record_version: u64,
+    );
 }
 
 #[derive(Debug)]
@@ -674,9 +682,12 @@ impl CredentialManager {
         &self,
         logical_handle: &str,
         provider_status: u16,
+        record_version: u64,
     ) {
         if matches!(provider_status, 401 | 403) {
-            self.client.report_auth_failure(logical_handle).await;
+            self.client
+                .report_auth_failure(logical_handle, provider_status, record_version)
+                .await;
         }
     }
 }
@@ -684,7 +695,9 @@ impl CredentialManager {
 #[derive(Clone, Debug)]
 pub(super) struct SentinelProfile {
     pub synapse_model_id: String,
+    pub machine_profile_hash: String,
     pub remote_profile_hash: String,
+    pub identity_revision: String,
     pub fingerprint: Fingerprint,
     pub numeric_profile_id: NumericProfileId,
     pub sentinel_texts: Vec<String>,
@@ -815,7 +828,9 @@ impl SentinelContinuityCheck {
         let row = CertificationRow {
             assurance_class: AssuranceClass::Declared,
             key: CertificationKey::Declared {
+                machine_profile_hash: profile.machine_profile_hash.clone(),
                 remote_profile_hash: profile.remote_profile_hash.clone(),
+                identity_revision: profile.identity_revision.clone(),
             },
             numeric_profile_id: profile.numeric_profile_id.clone(),
             fingerprint: profile.fingerprint.clone(),
@@ -842,9 +857,20 @@ impl SentinelContinuityCheck {
         validate_drift_config(profile)?;
         let mut row = self
             .store
-            .get_declared_cert_row(&profile.remote_profile_hash, &profile.fingerprint)
+            .get_declared_cert_row(
+                &profile.machine_profile_hash,
+                &profile.remote_profile_hash,
+                &profile.identity_revision,
+                &profile.fingerprint,
+            )
             .map_err(RuntimeError::store)?
-            .ok_or_else(|| RuntimeError::identity_drift(&profile.synapse_model_id))?;
+            .ok_or_else(|| RuntimeError {
+                stable: StableError::not_certified(),
+                message: format!(
+                    "remote profile '{}' has not been calibrated on this machine",
+                    profile.synapse_model_id
+                ),
+            })?;
         if row
             .evidence
             .get("remote_sentinel_quarantined")
@@ -1056,6 +1082,17 @@ pub(super) struct RuntimeError {
 }
 
 impl RuntimeError {
+    pub(super) fn from_parts(stable: StableError, message: impl Into<String>) -> Self {
+        Self {
+            stable,
+            message: message.into(),
+        }
+    }
+
+    pub(super) fn unavailable(retry_after_ms: u64, provider: &str) -> Self {
+        Self::provider_unavailable(retry_after_ms, provider)
+    }
+
     fn invalid_config(message: impl Into<String>) -> Self {
         Self {
             stable: StableError::invalid_request(),
@@ -1318,7 +1355,12 @@ mod tests {
             self.fetches.lock().unwrap().pop_front().unwrap()
         }
 
-        async fn report_auth_failure(&self, _logical_handle: &str) {
+        async fn report_auth_failure(
+            &self,
+            _logical_handle: &str,
+            _provider_status: u16,
+            _record_version: u64,
+        ) {
             self.reports.fetch_add(1, AtomicOrdering::Relaxed);
         }
     }
@@ -1368,7 +1410,7 @@ mod tests {
         let vault = Arc::new(ScriptedVault {
             fetches: Mutex::new(VecDeque::from([
                 Err(VaultError::NeedsReauth),
-                Ok(CredentialToken::new("fresh".to_string(), 100_000)),
+                Ok(CredentialToken::new("fresh".to_string(), 100_000, 7)),
             ])),
             min_ttls: Mutex::new(Vec::new()),
             reports: AtomicUsize::new(0),
@@ -1522,7 +1564,9 @@ mod tests {
         );
         let profile = SentinelProfile {
             synapse_model_id: "remote-model".to_string(),
+            machine_profile_hash: "machine-a".to_string(),
             remote_profile_hash: "profile-hash".to_string(),
+            identity_revision: "r1".to_string(),
             fingerprint: Fingerprint("fingerprint".to_string()),
             numeric_profile_id: NumericProfileId("numeric".to_string()),
             sentinel_texts: vec!["alpha".to_string(), "beta".to_string()],
@@ -1560,7 +1604,9 @@ mod tests {
             SentinelContinuityCheck::new(Arc::new(store), embedder as Arc<dyn SentinelEmbedder>);
         let profile = SentinelProfile {
             synapse_model_id: "remote-model".to_string(),
+            machine_profile_hash: "machine-a".to_string(),
             remote_profile_hash: "profile-hash".to_string(),
+            identity_revision: "r1".to_string(),
             fingerprint: Fingerprint("fingerprint".to_string()),
             numeric_profile_id: NumericProfileId("numeric".to_string()),
             sentinel_texts: vec!["alpha".to_string()],
@@ -1572,6 +1618,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn vault_locked_pauses_and_resumes_a_durable_job() {
+        let (path, store) = temp_store("vault-locked-resume");
+        let generation = store.next_module_generation().unwrap();
+        let now = crate::now_ms();
+        let record = match store
+            .admit_job(
+                "locked-request",
+                "locked-digest",
+                "embed_batch",
+                generation,
+                Some("vault:test"),
+                &serde_json::json!({}),
+                now,
+                10_000,
+                10_000,
+            )
+            .unwrap()
+        {
+            JobAdmission::Admitted(record) => record,
+            JobAdmission::Existing(_) => panic!("unexpected existing job"),
+        };
+        assert!(matches!(
+            store
+                .claim_job_attempt(&record.job_id, generation, now + 1)
+                .unwrap(),
+            JobAttemptClaim::Claimed(_)
+        ));
+        let vault = Arc::new(ScriptedVault {
+            fetches: Mutex::new(VecDeque::from([Err(VaultError::VaultLocked)])),
+            min_ttls: Mutex::new(Vec::new()),
+            reports: AtomicUsize::new(0),
+        });
+        let manager = CredentialManager::new(vault as Arc<dyn VaultCredentialClient>);
+        assert!(manager
+            .acquire_for_job(
+                &store,
+                JobCredentialRequest {
+                    job_id: &record.job_id,
+                    logical_handle: "vault:test",
+                    configured_attempt_timeout_ms: 10_000,
+                    remaining_deadline_ms: 20_000,
+                    now_ms: now + 2,
+                    resume_window_ms: 5_000,
+                },
+            )
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store.get_job(&record.job_id).unwrap().unwrap().state,
+            "paused_needs_reauth"
+        );
+        assert!(store
+            .resume_paused_job(&record.job_id, generation, now + 3, 10_000)
+            .unwrap());
+        assert_eq!(
+            store.get_job(&record.job_id).unwrap().unwrap().state,
+            "queued"
+        );
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
     async fn auth_failure_reporting_excludes_rate_limits_and_server_errors() {
         let vault = Arc::new(ScriptedVault {
             fetches: Mutex::new(VecDeque::new()),
@@ -1579,10 +1688,10 @@ mod tests {
             reports: AtomicUsize::new(0),
         });
         let manager = CredentialManager::new(vault.clone() as Arc<dyn VaultCredentialClient>);
-        manager.report_terminal_auth_failure("handle", 429).await;
-        manager.report_terminal_auth_failure("handle", 500).await;
-        manager.report_terminal_auth_failure("handle", 401).await;
-        manager.report_terminal_auth_failure("handle", 403).await;
+        manager.report_terminal_auth_failure("handle", 429, 7).await;
+        manager.report_terminal_auth_failure("handle", 500, 7).await;
+        manager.report_terminal_auth_failure("handle", 401, 7).await;
+        manager.report_terminal_auth_failure("handle", 403, 7).await;
         assert_eq!(vault.reports.load(AtomicOrdering::Relaxed), 2);
     }
 

@@ -9,7 +9,8 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-// The remote substrate remains private until gateway routing is wired to it.
+// Provider adapters stay module-private so credentials and remote identity checks
+// cannot be bypassed by a second public call path.
 #[allow(dead_code)]
 mod remote;
 mod store;
@@ -17,7 +18,13 @@ pub mod worker_host;
 
 use cortexkit_lease::{FileLeaseStore, LeaseHandle, LeaseKey, LeaseStore};
 use cortexkit_store_types::{sqlite_store_path, Isolation, StorageBackend, StorageDescriptor};
-use remote::{runtime::SentinelContinuityCheck, ContinuityCheck};
+use remote::{
+    config::{validate_remote_providers, ConfiguredProvider, RemoteProviderConfig, RemoteTask},
+    gateway::{RemoteEmbedVector, RemoteGateway, RemoteGatewayError},
+    runtime::RemoteClass,
+    vault::SubcVaultCredentialClient,
+    ContinuityCheck,
+};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -95,10 +102,25 @@ pub async fn run_from_env() -> Result<(), ModuleError> {
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| DEFAULT_MODULE_ID.to_string());
     let _singleton = acquire_synapse_singleton_lease(&module_id)?;
-    let handler = SynapseHandler::new(module_id.clone());
+    let connection_file = subc_connection_file_from_args()?;
+    let handler = SynapseHandler::new(module_id.clone(), connection_file);
     subc_client_rs::serve(manifest(&module_id), handler)
         .await
         .map_err(ModuleError::Serve)
+}
+
+fn subc_connection_file_from_args() -> Result<PathBuf, ModuleError> {
+    let mut args = env::args_os().skip(1);
+    while let Some(argument) = args.next() {
+        if argument == "--subc" {
+            return args.next().map(PathBuf::from).ok_or_else(|| {
+                ModuleError::Config("--subc requires a connection file path".to_string())
+            });
+        }
+    }
+    Err(ModuleError::Config(
+        "missing required --subc connection file path".to_string(),
+    ))
 }
 
 fn acquire_synapse_singleton_lease(module_id: &str) -> Result<SynapseSingletonLease, ModuleError> {
@@ -190,6 +212,7 @@ struct SynapseHandler {
 
 struct SynapseHandlerInner {
     module_id: String,
+    connection_file: PathBuf,
     state: OnceLock<Arc<ModuleState>>,
 }
 
@@ -202,6 +225,7 @@ struct ModuleState {
     runtime: Arc<RuntimeState>,
     model_cache: Arc<ModelCache>,
     continuity_check: Arc<dyn ContinuityCheck>,
+    remote_gateway: Arc<RemoteGateway>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -282,6 +306,8 @@ pub(crate) struct ModuleConfig {
     cache_max_bytes: u64,
     #[serde(default)]
     dev: DevConfig,
+    #[serde(default)]
+    remote_providers: Vec<RemoteProviderConfig>,
 }
 
 fn default_microllm_max_tokens() -> u32 {
@@ -717,6 +743,13 @@ struct EmbedBatchJobWork {
     total_tokens: u64,
 }
 
+struct RemoteEmbedBatchJobWork {
+    profile: Arc<remote::config::ConfiguredRemoteProfile>,
+    request_digest: String,
+    items: Vec<EmbedBatchItem>,
+    deadline_ms: u64,
+}
+
 struct PreparedJobPage {
     page_no: u32,
     bytes: Vec<u8>,
@@ -961,10 +994,11 @@ impl Clock for SystemClock {
 }
 
 impl SynapseHandler {
-    fn new(module_id: String) -> Self {
+    fn new(module_id: String, connection_file: PathBuf) -> Self {
         Self {
             inner: Arc::new(SynapseHandlerInner {
                 module_id,
+                connection_file,
                 state: OnceLock::new(),
             }),
         }
@@ -988,15 +1022,32 @@ impl SynapseHandler {
             now_ms(),
         )?;
         let config = load_module_config()?;
+        let configured_remote =
+            validate_remote_providers(&config.remote_providers).map_err(ModuleError::Config)?;
+        bind_remote_provider_urls(&store, &configured_remote)?;
         let catalog_models = sync_and_load_catalog_models(&store, &config)?;
-        let model_cache = Arc::new(ModelCache::new(ModelCache::default_root()?));
-        let runtime = Arc::new(RuntimeState::from_catalog(config, catalog_models)?);
         let machine_profile = machine_profile_with_overrides(MachineProfile::collect(
             &SystemMachineProfileCollector,
-            runtime.engine_identities(),
+            catalog_models
+                .iter()
+                .map(|model| model.engine_identity.clone()),
         ));
         let machine_profile_hash = machine_profile.hash();
-        let continuity_check = Arc::new(SentinelContinuityCheck::empty(Arc::clone(&store)));
+        let model_cache = Arc::new(ModelCache::new(ModelCache::default_root()?));
+        let vault_client = Arc::new(SubcVaultCredentialClient::new(
+            self.inner.connection_file.clone(),
+        ));
+        let remote_gateway = Arc::new(
+            RemoteGateway::new(
+                Arc::clone(&store),
+                configured_remote,
+                vault_client,
+                machine_profile_hash.clone(),
+            )
+            .map_err(|error| ModuleError::Config(error.message))?,
+        );
+        let runtime = Arc::new(RuntimeState::from_catalog(config, catalog_models)?);
+        let continuity_check: Arc<dyn ContinuityCheck> = remote_gateway.continuity.clone();
         Ok(Arc::new(ModuleState {
             module_id: self.inner.module_id.clone(),
             store,
@@ -1006,6 +1057,7 @@ impl SynapseHandler {
             runtime,
             model_cache,
             continuity_check,
+            remote_gateway,
         }))
     }
 }
@@ -1056,18 +1108,6 @@ impl RuntimeState {
             catalog: Arc::new(Mutex::new(catalog)),
             job_progress: Arc::new(Mutex::new(BTreeMap::new())),
         })
-    }
-
-    fn engine_identities(&self) -> Vec<EngineIdentity> {
-        self.catalog
-            .lock()
-            .map(|catalog| {
-                catalog
-                    .values()
-                    .map(|slot| slot.spec.engine_identity.clone())
-                    .collect()
-            })
-            .unwrap_or_default()
     }
 
     fn default_model_id(&self) -> Option<String> {
@@ -1169,6 +1209,25 @@ impl RuntimeState {
             )),
         }
     }
+}
+
+fn bind_remote_provider_urls(
+    store: &SynapseStore,
+    providers: &[ConfiguredProvider],
+) -> Result<(), ModuleError> {
+    let now = now_ms();
+    let mut active_hashes = Vec::new();
+    for provider in providers {
+        for profile in &provider.models {
+            store.bind_remote_profile_url(
+                &profile.remote_profile_hash,
+                provider.base_url.as_str(),
+            )?;
+            active_hashes.push(profile.remote_profile_hash.clone());
+        }
+    }
+    store.sweep_remote_url_bindings(&active_hashes, now, 7 * 24 * 60 * 60 * 1_000)?;
+    Ok(())
 }
 
 fn sync_and_load_catalog_models(
@@ -2782,6 +2841,13 @@ async fn embed_query(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
             )
         }
     };
+    if params
+        .model
+        .as_deref()
+        .is_some_and(|model_id| state.remote_gateway.is_remote(model_id))
+    {
+        return remote_embed_query(state, params).await;
+    }
     let alias_table = match state.store.alias_table() {
         Ok(alias_table) => alias_table,
         Err(error) => return channel_error("store_failure", error.to_string()),
@@ -2833,6 +2899,202 @@ async fn embed_query(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
     embed_tokenized(state, model, ids, tokenized, alias_table).await
 }
 
+async fn remote_embed_query(state: Arc<ModuleState>, params: EmbedQueryParams) -> HandlerOutcome {
+    let model_id = params
+        .model
+        .as_deref()
+        .expect("remote query has an explicit model");
+    let profile = state
+        .remote_gateway
+        .profile(model_id)
+        .expect("remote query profile was checked before dispatch");
+    if profile.task != RemoteTask::Embed {
+        return result_outcome(error_payload(
+            &state,
+            WireOperationError::from_stable(
+                StableError::op_not_supported_for_remote(),
+                "the named remote profile does not support embed.query",
+            ),
+        ));
+    }
+    if !params.accept_declared {
+        return result_outcome(error_payload(
+            &state,
+            WireOperationError::from_stable(
+                StableError::declared_identity_not_accepted(),
+                "remote profiles require accept_declared=true",
+            ),
+        ));
+    }
+    if let Err(error) = check_remote_fingerprint_constraints(
+        &profile,
+        params.target_fingerprint.as_deref(),
+        params.required_fingerprint.as_deref(),
+        params.required_epoch,
+        &state,
+    ) {
+        return result_outcome(error_payload(&state, error));
+    }
+    let id = params.id.unwrap_or_else(|| "query".to_string());
+    if let Err(error) = state.remote_gateway.ensure_certified(&profile).await {
+        return remote_error_outcome(&state, error);
+    }
+    let request_bytes = request_bytes_for_texts([params.text.as_str()]);
+    let deadline_ms = params
+        .deadline_ms
+        .unwrap_or(state.runtime.inline.deadline_ms);
+    let estimated_ms = match state.remote_gateway.predicted_finish_ms(
+        &profile,
+        params.text.split_whitespace().count().max(1) as u64,
+        now_ms(),
+    ) {
+        Ok(estimate) => estimate,
+        Err(error) => return remote_error_outcome(&state, error),
+    };
+    if estimated_ms > deadline_ms {
+        return result_outcome(error_payload(
+            &state,
+            WireOperationError::from_stable(
+                StableError::deadline_exceeded(),
+                format!(
+                    "predicted remote finish {estimated_ms}ms exceeds deadline {deadline_ms}ms"
+                ),
+            ),
+        ));
+    }
+    let _admission = match state.runtime.admit_inline(
+        QueueClass::Interactive,
+        request_bytes,
+        params.deadline_ms,
+        params.max_queue_ms,
+    ) {
+        Ok(admission) => admission,
+        Err(error) => return result_outcome(error_payload(&state, error)),
+    };
+    let original_count = params.text.split_whitespace().count().max(1) as u32;
+    match state
+        .remote_gateway
+        .embed(
+            &profile,
+            &[params.text],
+            RemoteClass::Interactive,
+            deadline_ms,
+        )
+        .await
+    {
+        Ok(result) => {
+            remote_embed_success(&state, &profile, vec![id], vec![original_count], result)
+        }
+        Err(error) => remote_error_outcome(&state, error),
+    }
+}
+
+fn remote_embed_success(
+    state: &ModuleState,
+    profile: &remote::config::ConfiguredRemoteProfile,
+    ids: Vec<String>,
+    original_token_counts: Vec<u32>,
+    result: remote::gateway::RemoteEmbeddingResult,
+) -> HandlerOutcome {
+    let disclosures = original_token_counts
+        .iter()
+        .zip(&result.token_counts)
+        .map(|(submitted, effective)| TruncationDisclosure {
+            submitted_tokens: *submitted,
+            effective_tokens: *effective,
+            truncated: effective < submitted,
+        })
+        .collect::<Vec<_>>();
+    let vectors = ids
+        .into_iter()
+        .zip(result.vectors)
+        .zip(result.submitted_texts)
+        .map(|((id, vector), text)| RemoteEmbedVector {
+            id,
+            vector,
+            content_sha256: sha256_text(&text),
+        })
+        .collect::<Vec<_>>();
+    let dims = profile.dims.min(u32::MAX as usize) as u32;
+    let table_epoch = state
+        .store
+        .alias_table()
+        .map(|table| table.table_epoch)
+        .unwrap_or(0);
+    let mut envelope = json!({
+        "fingerprint": profile.fingerprint,
+        "table_epoch": table_epoch,
+        "dims": dims,
+        "provenance": state.remote_gateway.provenance(profile),
+        "module_generation": state.module_generation,
+        "equivalent_to": [],
+        "assurance": "declared",
+        "identity_revision": profile.identity_revision,
+        "payload": {
+            "vectors": vectors,
+            "real_token_counts": result.token_counts,
+            "truncation_disclosures": disclosures,
+        },
+    });
+    if let Some(provider_request_id) = result.provider_request_id {
+        envelope["provider_request_id"] = Value::String(provider_request_id);
+    }
+    result_outcome(envelope)
+}
+
+fn remote_error_outcome(state: &ModuleState, error: RemoteGatewayError) -> HandlerOutcome {
+    let mut payload = json!({
+        "module_generation": state.module_generation,
+        "error": WireOperationError::from_stable(error.stable, error.message),
+    });
+    if let Some(provider_request_id) = error.provider_request_id {
+        payload["provider_request_id"] = Value::String(provider_request_id);
+    }
+    result_outcome(payload)
+}
+
+fn check_remote_fingerprint_constraints(
+    profile: &remote::config::ConfiguredRemoteProfile,
+    target_fingerprint: Option<&str>,
+    required_fingerprint: Option<&str>,
+    required_epoch: Option<u64>,
+    state: &ModuleState,
+) -> Result<(), WireOperationError> {
+    if target_fingerprint
+        .into_iter()
+        .chain(required_fingerprint)
+        .any(|required| required != profile.fingerprint.0)
+    {
+        return Err(WireOperationError::from_stable(
+            StableError::substitution_rejected(),
+            "the remote profile fingerprint does not satisfy the request constraint",
+        ));
+    }
+    if let Some(required_epoch) = required_epoch {
+        let current_epoch = state
+            .store
+            .alias_table()
+            .map_err(|error| {
+                WireOperationError::from_stable(
+                    StableError::engine_crashed(Some(100)),
+                    format!("read alias table: {error}"),
+                )
+            })?
+            .table_epoch;
+        if current_epoch != required_epoch {
+            return Err(WireOperationError::from_stable(
+                StableError::substitution_rejected(),
+                format!("required table epoch {required_epoch} does not match current epoch {current_epoch}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn sha256_text(text: &str) -> String {
+    hex::encode(Sha256::digest(text.as_bytes()))
+}
+
 async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
     let params: EmbedBatchParams = match serde_json::from_value(params) {
         Ok(params) => params,
@@ -2843,6 +3105,13 @@ async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
             )
         }
     };
+    if params
+        .model
+        .as_deref()
+        .is_some_and(|model_id| state.remote_gateway.is_remote(model_id))
+    {
+        return remote_embed_batch(state, params).await;
+    }
     let items = match batch_items(params.items, params.texts) {
         Ok(items) => items,
         Err(message) => return channel_error("invalid_request", message),
@@ -2948,6 +3217,386 @@ async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
     embed_tokenized(state, model, ids, tokenized, alias_table).await
 }
 
+async fn remote_embed_batch(state: Arc<ModuleState>, params: EmbedBatchParams) -> HandlerOutcome {
+    let model_id = params
+        .model
+        .as_deref()
+        .expect("remote batch has an explicit model");
+    let profile = state
+        .remote_gateway
+        .profile(model_id)
+        .expect("remote batch profile was checked before dispatch");
+    if profile.task != RemoteTask::Embed {
+        return result_outcome(error_payload(
+            &state,
+            WireOperationError::from_stable(
+                StableError::op_not_supported_for_remote(),
+                "the named remote profile does not support embed.batch",
+            ),
+        ));
+    }
+    if !params.accept_declared {
+        return result_outcome(error_payload(
+            &state,
+            WireOperationError::from_stable(
+                StableError::declared_identity_not_accepted(),
+                "remote profiles require accept_declared=true",
+            ),
+        ));
+    }
+    let items = match batch_items(params.items, params.texts) {
+        Ok(items) if !items.is_empty() => items,
+        Ok(_) => return channel_error("invalid_request", "embed.batch requires at least one item"),
+        Err(message) => return channel_error("invalid_request", message),
+    };
+    if let Err(error) = check_remote_fingerprint_constraints(
+        &profile,
+        params.target_fingerprint.as_deref(),
+        params.required_fingerprint.as_deref(),
+        params.required_epoch,
+        &state,
+    ) {
+        return result_outcome(error_payload(&state, error));
+    }
+    if let Err(error) = state.remote_gateway.ensure_certified(&profile).await {
+        return remote_error_outcome(&state, error);
+    }
+    let counts = items
+        .iter()
+        .map(|item| {
+            item.text
+                .split_whitespace()
+                .count()
+                .max(1)
+                .min(u32::MAX as usize) as u32
+        })
+        .collect::<Vec<_>>();
+    let total_tokens = counts.iter().map(|count| u64::from(*count)).sum::<u64>();
+    let request_bytes = request_bytes_for_texts(items.iter().map(|item| item.text.as_str()));
+    let digest_items = items
+        .iter()
+        .map(|item| (item.id.clone(), sha256_text(&item.text)))
+        .collect::<Vec<_>>();
+    let request_digest = compute_request_digest(
+        "embed.batch",
+        &profile.synapse_model_id,
+        Some(&profile.remote_profile_hash),
+        state.remote_gateway.logical_handle(&profile).as_deref(),
+        &json!({
+            "target_fingerprint": params.target_fingerprint,
+            "required_fingerprint": params.required_fingerprint,
+            "allow_equivalent": params.allow_equivalent,
+            "required_epoch": params.required_epoch,
+            "accept_declared": true,
+        }),
+        &digest_items,
+    );
+    let deadline_ms = params
+        .deadline_ms
+        .unwrap_or(state.runtime.inline.deadline_ms);
+    let estimated_ms =
+        match state
+            .remote_gateway
+            .predicted_finish_ms(&profile, total_tokens, now_ms())
+        {
+            Ok(estimate) => estimate,
+            Err(error) => return remote_error_outcome(&state, error),
+        };
+    if estimated_ms > deadline_ms {
+        return result_outcome(error_payload(
+            &state,
+            WireOperationError::from_stable(
+                StableError::deadline_exceeded(),
+                format!(
+                    "predicted remote finish {estimated_ms}ms exceeds deadline {deadline_ms}ms"
+                ),
+            ),
+        ));
+    }
+    if items.len() > state.runtime.inline.max_items
+        || total_tokens > state.runtime.inline.max_tokens
+    {
+        return submit_remote_embed_batch_job(
+            state,
+            params.request_key,
+            RemoteEmbedBatchJobWork {
+                profile,
+                request_digest,
+                items,
+                deadline_ms,
+            },
+        )
+        .await;
+    }
+    let _admission = match state.runtime.admit_inline(
+        QueueClass::Bulk,
+        request_bytes,
+        params.deadline_ms,
+        params.max_queue_ms,
+    ) {
+        Ok(admission) => admission,
+        Err(error) => return result_outcome(error_payload(&state, error)),
+    };
+    let ids = items.iter().map(|item| item.id.clone()).collect::<Vec<_>>();
+    let texts = items.into_iter().map(|item| item.text).collect::<Vec<_>>();
+    match state
+        .remote_gateway
+        .embed(&profile, &texts, RemoteClass::Bulk, deadline_ms)
+        .await
+    {
+        Ok(result) => remote_embed_success(&state, &profile, ids, counts, result),
+        Err(error) => remote_error_outcome(&state, error),
+    }
+}
+
+async fn submit_remote_embed_batch_job(
+    state: Arc<ModuleState>,
+    request_key: Option<String>,
+    work: RemoteEmbedBatchJobWork,
+) -> HandlerOutcome {
+    let Some(request_key) = request_key.filter(|key| !key.trim().is_empty()) else {
+        return channel_error(
+            "invalid_request",
+            "job-shaped remote embed.batch requires a non-empty request_key",
+        );
+    };
+    let now = now_ms();
+    let logical_handle = state.remote_gateway.logical_handle(&work.profile);
+    let admission = match state.store.admit_job(
+        &request_key,
+        &work.request_digest,
+        "embed.batch",
+        state.module_generation,
+        logical_handle.as_deref(),
+        &json!({
+            "remote_profile_hash": work.profile.remote_profile_hash,
+            "model": work.profile.synapse_model_id,
+            "items": work.items.iter().map(|item| json!({"id": item.id, "text": item.text})).collect::<Vec<_>>(),
+            "deadline_ms": work.deadline_ms,
+            "accept_declared": true,
+        }),
+        now,
+        state.runtime.jobs.execution_ttl_ms,
+        state.runtime.jobs.result_retention_ttl_ms,
+    ) {
+        Ok(admission) => admission,
+        Err(SynapseStoreError::IdempotencyConflict { .. }) => {
+            return result_outcome(error_payload(
+                &state,
+                WireOperationError::from_stable(
+                    StableError::idempotency_conflict(),
+                    format!("request_key '{request_key}' was already used for different request content"),
+                ),
+            ))
+        }
+        Err(error) => return channel_error("store_failure", error.to_string()),
+    };
+    let record = admission.record().clone();
+    if matches!(admission, JobAdmission::Admitted(_)) {
+        let task_state = Arc::clone(&state);
+        let task_job_id = record.job_id.clone();
+        tokio::spawn(async move {
+            execute_remote_embed_batch_job(task_state, task_job_id, work).await;
+        });
+    }
+    result_outcome(job_status_payload(&state, &record))
+}
+
+async fn execute_remote_embed_batch_job(
+    state: Arc<ModuleState>,
+    job_id: String,
+    work: RemoteEmbedBatchJobWork,
+) {
+    let record = match state
+        .store
+        .claim_job_attempt(&job_id, state.module_generation, now_ms())
+    {
+        Ok(JobAttemptClaim::Claimed(record)) => record,
+        Ok(JobAttemptClaim::Attached { .. } | JobAttemptClaim::NotClaimable(_)) | Err(_) => return,
+    };
+    if let Err(error) = state.remote_gateway.ensure_certified(&work.profile).await {
+        fail_job_with_wire_error(
+            &state,
+            &job_id,
+            error.stable.class == ErrorClass::Transient,
+            WireOperationError::from_stable(error.stable, error.message),
+        );
+        return;
+    }
+    let committed = match state.store.committed_item_ids(&record.request_digest) {
+        Ok(committed) => committed,
+        Err(error) => {
+            fail_job_with_wire_error(
+                &state,
+                &job_id,
+                true,
+                WireOperationError::from_stable(
+                    StableError::engine_crashed(Some(100)),
+                    format!("read remote checkpoints: {error}"),
+                ),
+            );
+            return;
+        }
+    };
+    let pending = work
+        .items
+        .into_iter()
+        .filter(|item| !committed.contains(&item.id))
+        .collect::<Vec<_>>();
+    let chunk_size = state.runtime.inline.max_items.max(1);
+    let mut page_no = record.page_count;
+    for chunk in pending.chunks(chunk_size) {
+        let ids = chunk.iter().map(|item| item.id.clone()).collect::<Vec<_>>();
+        let texts = chunk
+            .iter()
+            .map(|item| item.text.clone())
+            .collect::<Vec<_>>();
+        let original_counts = texts
+            .iter()
+            .map(|text| {
+                text.split_whitespace()
+                    .count()
+                    .max(1)
+                    .min(u32::MAX as usize) as u32
+            })
+            .collect::<Vec<_>>();
+        let result = match state
+            .remote_gateway
+            .embed(&work.profile, &texts, RemoteClass::Bulk, work.deadline_ms)
+            .await
+        {
+            Ok(result) => result,
+            Err(error) if error.stable == StableError::needs_reauth() => {
+                if let Some(handle) = state.remote_gateway.logical_handle(&work.profile) {
+                    let _ = state.store.pause_job_needs_reauth(
+                        &job_id,
+                        &handle,
+                        now_ms(),
+                        state.runtime.jobs.resume_deadline_ms,
+                    );
+                } else {
+                    fail_job_with_wire_error(
+                        &state,
+                        &job_id,
+                        false,
+                        WireOperationError::from_stable(error.stable, error.message),
+                    );
+                }
+                return;
+            }
+            Err(error) => {
+                fail_job_with_wire_error(
+                    &state,
+                    &job_id,
+                    error.stable.class == ErrorClass::Transient,
+                    WireOperationError::from_stable(error.stable, error.message),
+                );
+                return;
+            }
+        };
+        let provider_request_id = result.provider_request_id.clone();
+        let disclosures = original_counts
+            .iter()
+            .zip(&result.token_counts)
+            .map(|(submitted, effective)| TruncationDisclosure {
+                submitted_tokens: *submitted,
+                effective_tokens: *effective,
+                truncated: effective < submitted,
+            })
+            .collect::<Vec<_>>();
+        let vectors = ids
+            .iter()
+            .cloned()
+            .zip(result.vectors)
+            .zip(result.submitted_texts)
+            .map(|((id, vector), text)| RemoteEmbedVector {
+                id,
+                vector,
+                content_sha256: sha256_text(&text),
+            })
+            .collect::<Vec<_>>();
+        let mut page_value = json!({
+            "fingerprint": work.profile.fingerprint,
+            "table_epoch": state.store.alias_table().map(|table| table.table_epoch).unwrap_or(0),
+            "dims": work.profile.dims,
+            "provenance": state.remote_gateway.provenance(&work.profile),
+            "module_generation": state.module_generation,
+            "equivalent_to": [],
+            "assurance": "declared",
+            "identity_revision": work.profile.identity_revision,
+            "payload": {
+                "vectors": vectors,
+                "real_token_counts": result.token_counts,
+                "truncation_disclosures": disclosures,
+            },
+        });
+        if let Some(provider_request_id) = provider_request_id.as_ref() {
+            page_value["provider_request_ids"] = json!([provider_request_id]);
+        }
+        let page_bytes = match serde_json::to_vec(&page_value) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                fail_job_with_wire_error(
+                    &state,
+                    &job_id,
+                    false,
+                    WireOperationError::from_stable(
+                        StableError::engine_crashed(None),
+                        format!("serialize remote result page: {error}"),
+                    ),
+                );
+                return;
+            }
+        };
+        let checkpoints = vectors
+            .iter()
+            .map(|vector| CheckpointItem {
+                item_id: vector.id.clone(),
+                result: serde_json::to_vec(vector).expect("remote checkpoint serializes"),
+                provider_request_id: provider_request_id.clone(),
+            })
+            .collect::<Vec<_>>();
+        if let Err(error) =
+            state
+                .store
+                .commit_job_page(&job_id, page_no, &page_bytes, &checkpoints, now_ms())
+        {
+            fail_job_with_wire_error(
+                &state,
+                &job_id,
+                true,
+                WireOperationError::from_stable(
+                    StableError::engine_crashed(Some(100)),
+                    format!("atomically commit remote checkpoint page: {error}"),
+                ),
+            );
+            return;
+        }
+        page_no = page_no.saturating_add(1);
+    }
+    let summary = json!({
+        "job_id": job_id,
+        "state": JOB_STATE_DONE,
+        "page_count": page_no,
+        "module_generation": state.module_generation,
+        "fingerprint": work.profile.fingerprint,
+        "assurance": "declared",
+        "identity_revision": work.profile.identity_revision,
+        "provenance": state.remote_gateway.provenance(&work.profile),
+    });
+    if let Err(error) = state.store.finish_job(&job_id, &summary, now_ms()) {
+        fail_job_with_wire_error(
+            &state,
+            &job_id,
+            true,
+            WireOperationError::from_stable(
+                StableError::engine_crashed(Some(100)),
+                format!("finish remote checkpoint job: {error}"),
+            ),
+        );
+    }
+}
+
 async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
     let params: RerankScoreParams = match serde_json::from_value(params) {
         Ok(params) => params,
@@ -2958,6 +3607,19 @@ async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
             )
         }
     };
+    if params
+        .model
+        .as_deref()
+        .is_some_and(|model_id| state.remote_gateway.is_remote(model_id))
+    {
+        return result_outcome(error_payload(
+            &state,
+            WireOperationError::from_stable(
+                StableError::op_not_supported_for_remote(),
+                "rerank.score is not supported for remote profiles in gateway v1",
+            ),
+        ));
+    }
     if params.candidates.is_empty() {
         return channel_error(
             "invalid_request",
@@ -3126,6 +3788,19 @@ async fn microllm_oneshot(state: Arc<ModuleState>, params: Value) -> HandlerOutc
             )
         }
     };
+    if params
+        .model
+        .as_deref()
+        .is_some_and(|model_id| state.remote_gateway.is_remote(model_id))
+    {
+        return result_outcome(error_payload(
+            &state,
+            WireOperationError::from_stable(
+                StableError::op_not_supported_for_remote(),
+                "microllm.oneshot is not supported for remote profiles in gateway v1",
+            ),
+        ));
+    }
     let ceiling = state.runtime.microllm_max_tokens;
     if params.max_tokens > ceiling {
         return channel_error(
@@ -4502,6 +5177,42 @@ async fn execute_probe_job(state: Arc<ModuleState>, job_id: String, model_filter
     }
 
     let mut lane_results = Vec::new();
+    for profile in state
+        .remote_gateway
+        .profiles()
+        .into_iter()
+        .filter(|profile| {
+            model_filter.is_empty()
+                || model_filter
+                    .iter()
+                    .any(|model_id| model_id == &profile.synapse_model_id)
+        })
+    {
+        match state
+            .remote_gateway
+            .calibrate(&profile, state.module_generation, now_ms())
+            .await
+        {
+            Ok(()) => lane_results.push(json!({
+                "model_id": profile.synapse_model_id,
+                "fingerprint": profile.fingerprint,
+                "assurance": "declared",
+                "identity_revision": profile.identity_revision,
+                "passed": true,
+                "status": "certified",
+                "probe": "remote_sentinel_calibration",
+            })),
+            Err(error) => {
+                fail_job_with_wire_error(
+                    &state,
+                    &job_id,
+                    error.stable.class == ErrorClass::Transient,
+                    WireOperationError::from_stable(error.stable, error.message),
+                );
+                return;
+            }
+        }
+    }
     let mut certified_vectors = Vec::new();
     for model in selected_models {
         let probe_result = match model.task {
@@ -5749,18 +6460,25 @@ fn lane_blocking_reason(
 }
 
 fn certification_report_row(state: &ModuleState, row: &CertificationRow, stale: bool) -> Value {
-    let (machine_profile_hash, remote_profile_hash) = match &row.key {
+    let (machine_profile_hash, remote_profile_hash, identity_revision) = match &row.key {
         CertificationKey::Measured {
             machine_profile_hash,
-        } => (Some(machine_profile_hash.as_str()), None),
+        } => (Some(machine_profile_hash.as_str()), None, None),
         CertificationKey::Declared {
+            machine_profile_hash,
             remote_profile_hash,
-        } => (None, Some(remote_profile_hash.as_str())),
+            identity_revision,
+        } => (
+            Some(machine_profile_hash.as_str()),
+            Some(remote_profile_hash.as_str()),
+            Some(identity_revision.as_str()),
+        ),
     };
     json!({
         "assurance_class": row.assurance_class,
         "machine_profile_hash": machine_profile_hash,
         "remote_profile_hash": remote_profile_hash,
+        "identity_revision": identity_revision,
         "numeric_profile_id": row.numeric_profile_id,
         "fingerprint": row.fingerprint,
         "certified_at_ms": row.certified_at_ms,
@@ -6049,10 +6767,18 @@ fn cache_error_to_wire(error: ModelCacheError) -> WireOperationError {
 }
 
 fn models_list_payload(state: &ModuleState, snapshot: CatalogSnapshot) -> Value {
+    let mut models = state
+        .runtime
+        .catalog_entries()
+        .into_iter()
+        .map(|entry| serde_json::to_value(entry).expect("catalog entry serializes"))
+        .collect::<Vec<_>>();
+    models.extend(state.remote_gateway.catalog_entries());
+    models.sort_by(|left, right| left["model_id"].as_str().cmp(&right["model_id"].as_str()));
     json!({
         "module_generation": state.module_generation,
         "table_epoch": snapshot.table_epoch,
-        "models": state.runtime.catalog_entries(),
+        "models": models,
         "alias_rows": snapshot.alias_rows,
     })
 }
@@ -6158,35 +6884,61 @@ fn manifest(module_id: &str) -> ModuleManifest {
 fn load_module_config() -> Result<ModuleConfig, ModuleError> {
     if let Ok(path) = env::var(SYNAPSE_CONFIG_PATH_ENV) {
         let path = PathBuf::from(path);
-        return load_module_config_file(&path);
+        return load_module_config_file(&path, ConfigTier::User);
     }
+    let user_path = env::var_os("HOME").map(|home| {
+        PathBuf::from(home)
+            .join(".config")
+            .join("cortexkit")
+            .join("synapse.jsonc")
+    });
     if let Ok(cwd) = env::current_dir() {
         let project_path = cwd.join(".cortexkit").join("synapse.jsonc");
         if project_path.is_file() {
-            return load_module_config_file(&project_path);
+            let mut project = load_module_config_file(&project_path, ConfigTier::Project)?;
+            if let Some(user_path) = user_path.as_ref().filter(|path| path.is_file()) {
+                project.remote_providers =
+                    load_module_config_file(user_path, ConfigTier::User)?.remote_providers;
+            }
+            return Ok(project);
         }
     }
-    if let Some(home) = env::var_os("HOME") {
-        let path = PathBuf::from(home)
-            .join(".config")
-            .join("cortexkit")
-            .join("synapse.jsonc");
-        if path.is_file() {
-            return load_module_config_file(&path);
-        }
+    if let Some(path) = user_path.filter(|path| path.is_file()) {
+        return load_module_config_file(&path, ConfigTier::User);
     }
     Ok(ModuleConfig::default())
 }
 
-fn load_module_config_file(path: &Path) -> Result<ModuleConfig, ModuleError> {
-    let contents = fs::read_to_string(path)
-        .map_err(|error| ModuleError::Config(format!("read {}: {error}", path.display())))?;
-    parse_module_config_json(&contents, &path.display().to_string())
+#[derive(Clone, Copy)]
+enum ConfigTier {
+    User,
+    Project,
 }
 
-fn parse_module_config_json(contents: &str, source: &str) -> Result<ModuleConfig, ModuleError> {
+fn load_module_config_file(path: &Path, tier: ConfigTier) -> Result<ModuleConfig, ModuleError> {
+    let contents = fs::read_to_string(path)
+        .map_err(|error| ModuleError::Config(format!("read {}: {error}", path.display())))?;
+    parse_module_config_json(&contents, &path.display().to_string(), tier)
+}
+
+fn parse_module_config_json(
+    contents: &str,
+    source: &str,
+    tier: ConfigTier,
+) -> Result<ModuleConfig, ModuleError> {
     let stripped = strip_json_comments(contents);
-    serde_json::from_str(&stripped).map_err(|error| {
+    let value: Value = serde_json::from_str(&stripped).map_err(ModuleError::Json)?;
+    if matches!(tier, ConfigTier::Project)
+        && value
+            .as_object()
+            .is_some_and(|object| object.contains_key("remote_providers"))
+    {
+        return Err(ModuleError::Config(
+            "remote_providers is user-tier only and may not appear in project-tier config"
+                .to_string(),
+        ));
+    }
+    let config: ModuleConfig = serde_json::from_value(value).map_err(|error| {
         if let Some(field) = unknown_field_from_json_error(&error) {
             eprintln!("synapse config parse error in {source}: unknown field '{field}'");
             ModuleError::Config(format!(
@@ -6196,7 +6948,9 @@ fn parse_module_config_json(contents: &str, source: &str) -> Result<ModuleConfig
             eprintln!("synapse config parse error in {source}: {error}");
             ModuleError::Json(error)
         }
-    })
+    })?;
+    validate_remote_providers(&config.remote_providers).map_err(ModuleError::Config)?;
+    Ok(config)
 }
 
 fn unknown_field_from_json_error(error: &serde_json::Error) -> Option<String> {
@@ -6393,10 +7147,50 @@ mod tests {
 
     #[test]
     fn module_config_rejects_unknown_fields() {
-        let error = parse_module_config_json(r#"{ "typo_field": true }"#, "test")
+        let error = parse_module_config_json(r#"{ "typo_field": true }"#, "test", ConfigTier::User)
             .expect_err("unknown fields should fail");
         assert!(matches!(error, ModuleError::Config(_)));
         assert!(error.to_string().contains("typo_field"));
+    }
+
+    #[test]
+    fn project_tier_rejects_remote_providers_with_security_boundary_error() {
+        let error = parse_module_config_json(
+            r#"{"remote_providers": []}"#,
+            "project",
+            ConfigTier::Project,
+        )
+        .expect_err("project tier must not control remote credentials or endpoints");
+        assert_eq!(
+            error.to_string(),
+            "config: remote_providers is user-tier only and may not appear in project-tier config"
+        );
+    }
+
+    #[test]
+    fn user_tier_parses_declared_remote_provider() {
+        let config = parse_module_config_json(
+            r#"{
+                "remote_providers": [{
+                    "name": "mock",
+                    "base_url": "http://127.0.0.1:8080/v1",
+                    "adapter": {"kind": "openai_compatible"},
+                    "auth": {"kind": "none"},
+                    "models": [{
+                        "synapse_model_id": "remote-embed",
+                        "task": "embed",
+                        "model": "mock-embed",
+                        "identity_revision": "r1",
+                        "dims": 3,
+                        "input_profile_id": "whitespace-v1"
+                    }]
+                }]
+            }"#,
+            "user",
+            ConfigTier::User,
+        )
+        .expect("user tier may configure remote providers");
+        assert_eq!(config.remote_providers.len(), 1);
     }
 
     #[test]
@@ -6408,6 +7202,7 @@ mod tests {
                 "cache_max_bytes": 4096
             }"#,
             "test",
+            ConfigTier::User,
         )
         .expect("valid config");
         assert_eq!(config.microllm_max_tokens, 128);
@@ -6426,6 +7221,7 @@ mod tests {
                 }
             }"#,
             "test",
+            ConfigTier::User,
         )
         .unwrap();
         assert_eq!(split.jobs.execution_ttl_ms, 10);
@@ -6434,7 +7230,8 @@ mod tests {
 
         // Pre-release rename, no compatibility surface: the old key must fail
         // loudly (deny_unknown_fields) instead of being silently accepted.
-        let legacy = parse_module_config_json(r#"{"jobs":{"ttl_ms":40}}"#, "test");
+        let legacy =
+            parse_module_config_json(r#"{"jobs":{"ttl_ms":40}}"#, "test", ConfigTier::User);
         assert!(legacy.is_err(), "legacy ttl_ms key must be rejected");
     }
 
