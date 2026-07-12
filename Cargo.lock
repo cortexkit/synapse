@@ -6321,6 +6321,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "synapse-engine-owned"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "cc",
+ "half",
+ "libm",
+ "safetensors 0.6.2",
+ "serde",
+ "serde_json",
+ "synapse-core",
+ "thiserror 1.0.69",
+ "tokenizers 0.21.4",
+]
+
+[[package]]
 name = "synapse-module"
 version = "0.0.0"
 dependencies = [
@@ -6340,6 +6356,7 @@ dependencies = [
  "subc-transport",
  "synapse-core",
  "synapse-engine-ort",
+ "synapse-engine-owned",
  "thiserror 1.0.69",
  "tokenizers 0.21.4",
  "tokio",

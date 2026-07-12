@@ -433,6 +433,18 @@ pub struct StoredModelConfig {
     pub max_tokens: usize,
     pub quant: String,
     pub pin: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owned_family: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owned_dtype: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owned_execution: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owned_attention_units: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_locator: Option<ModelAssetLocator>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_locators: Vec<ModelAssetLocator>,
     pub engine_identity: EngineIdentity,
     pub numeric_profile_id: NumericProfileId,
     pub fingerprint: Fingerprint,
@@ -2728,6 +2740,12 @@ mod tests {
             max_tokens: 512,
             quant: "fp32".to_string(),
             pin: true,
+            owned_family: None,
+            owned_dtype: None,
+            owned_execution: None,
+            owned_attention_units: None,
+            config_locator: None,
+            extra_locators: Vec::new(),
             engine_identity: EngineIdentity {
                 engine: "ort".to_string(),
                 version: "test".to_string(),

@@ -1,0 +1,690 @@
+#![cfg_attr(not(target_os = "macos"), forbid(unsafe_code))]
+
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use serde::{Deserialize, Serialize};
+use synapse_core::{
+    EmbedEngine, EngineError, EngineErrorStage, EngineIdentity, EngineRiskClass, LoadedModel,
+    RuntimeConfig, TokenBatch, TokenIds, ValidatedArtifact, Vector, Vectors,
+};
+
+#[cfg(target_os = "macos")]
+mod runtime;
+
+pub const ENGINE_VERSION: &str = "owned-metal-v1";
+pub const GRAPH_REVISION: u32 = 3;
+pub const BUCKET_POLICY_VERSION: u32 = 1;
+pub const DEFAULT_ATTENTION_UNITS: usize = 4_000_000;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ModelFamily {
+    MiniLm,
+    GteModernBert,
+    Qwen3,
+}
+
+impl ModelFamily {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MiniLm => "minilm",
+            Self::GteModernBert => "gte-modernbert",
+            Self::Qwen3 => "qwen3-0.6b",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, OwnedEngineError> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "minilm" | "all-minilm-l6-v2" => Ok(Self::MiniLm),
+            "gte-modernbert" | "modernbert" => Ok(Self::GteModernBert),
+            "qwen3" | "qwen3-0.6b" | "qwen3-embedding-0.6b" => Ok(Self::Qwen3),
+            other => Err(OwnedEngineError::UnsupportedFamily(other.to_string())),
+        }
+    }
+
+    #[must_use]
+    pub const fn recommended_dtype(self) -> OwnedDType {
+        match self {
+            Self::MiniLm | Self::Qwen3 => OwnedDType::F16,
+            Self::GteModernBert => OwnedDType::F32,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OwnedDType {
+    F16,
+    F32,
+}
+
+impl OwnedDType {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::F16 => "f16",
+            Self::F32 => "f32",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, OwnedEngineError> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "f16" | "fp16" => Ok(Self::F16),
+            "f32" | "fp32" => Ok(Self::F32),
+            other => Err(OwnedEngineError::UnsupportedDType(other.to_string())),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExecutionMode {
+    #[default]
+    Explicit,
+    Lazy,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OwnedExecutionConfig {
+    pub package_cache_root: PathBuf,
+    pub max_length: usize,
+    pub attention_units: usize,
+    pub execution: ExecutionMode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TokenizerPolicy {
+    pub add_special_tokens: bool,
+    pub pad_token_id: u32,
+    pub terminal_token_id: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Capability {
+    pub family: ModelFamily,
+    pub dtype: OwnedDType,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum OwnedEngineError {
+    #[error("unsupported owned-metal family '{0}'")]
+    UnsupportedFamily(String),
+    #[error("unsupported owned-metal dtype '{0}'")]
+    UnsupportedDType(String),
+    #[error("owned-metal is available only on macOS")]
+    UnsupportedPlatform,
+    #[error("owned-metal model package: {0}")]
+    InvalidPackage(String),
+}
+
+#[must_use]
+pub fn capabilities() -> Vec<Capability> {
+    if !cfg!(target_os = "macos") {
+        return Vec::new();
+    }
+    vec![
+        Capability {
+            family: ModelFamily::MiniLm,
+            dtype: OwnedDType::F16,
+        },
+        Capability {
+            family: ModelFamily::MiniLm,
+            dtype: OwnedDType::F32,
+        },
+        Capability {
+            family: ModelFamily::GteModernBert,
+            dtype: OwnedDType::F32,
+        },
+        Capability {
+            family: ModelFamily::GteModernBert,
+            dtype: OwnedDType::F16,
+        },
+        Capability {
+            family: ModelFamily::Qwen3,
+            dtype: OwnedDType::F16,
+        },
+        Capability {
+            family: ModelFamily::Qwen3,
+            dtype: OwnedDType::F32,
+        },
+    ]
+}
+
+pub fn detect_family(model_dir: impl AsRef<Path>) -> Result<ModelFamily, OwnedEngineError> {
+    let config = read_model_config(model_dir.as_ref())?;
+    let model_type = config
+        .get("model_type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if model_type == "bert" {
+        Ok(ModelFamily::MiniLm)
+    } else if model_type == "modernbert" {
+        Ok(ModelFamily::GteModernBert)
+    } else if model_type.starts_with("qwen3") {
+        Ok(ModelFamily::Qwen3)
+    } else {
+        Err(OwnedEngineError::UnsupportedFamily(model_type.to_string()))
+    }
+}
+
+pub fn tokenizer_policy_for_package(
+    model_dir: impl AsRef<Path>,
+    family: ModelFamily,
+) -> Result<TokenizerPolicy, OwnedEngineError> {
+    let config = read_model_config(model_dir.as_ref())?;
+    let pad_token_id = config
+        .get("pad_token_id")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+        .min(u64::from(u32::MAX)) as u32;
+    let terminal_token_id = if family == ModelFamily::Qwen3 {
+        Some(
+            config
+                .get("eos_token_id")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| {
+                    OwnedEngineError::InvalidPackage(
+                        "Qwen3 config is missing eos_token_id".to_string(),
+                    )
+                })?
+                .min(u64::from(u32::MAX)) as u32,
+        )
+    } else {
+        None
+    };
+    Ok(TokenizerPolicy {
+        add_special_tokens: true,
+        pad_token_id,
+        terminal_token_id,
+    })
+}
+
+fn read_model_config(model_dir: &Path) -> Result<serde_json::Value, OwnedEngineError> {
+    let root = if model_dir.is_dir() {
+        model_dir
+    } else {
+        model_dir.parent().unwrap_or_else(|| Path::new("."))
+    };
+    let config_path = root.join("config.json");
+    let bytes = std::fs::read(&config_path).map_err(|error| {
+        OwnedEngineError::InvalidPackage(format!("read {}: {error}", config_path.display()))
+    })?;
+    serde_json::from_slice(&bytes).map_err(|error| {
+        OwnedEngineError::InvalidPackage(format!("parse {}: {error}", config_path.display()))
+    })
+}
+
+#[must_use]
+pub fn engine_identity(family: ModelFamily, dtype: OwnedDType) -> EngineIdentity {
+    let mut build_flags = BTreeMap::new();
+    build_flags.insert("backend".to_string(), "metal-mpsgraph".to_string());
+    build_flags.insert("family".to_string(), family.as_str().to_string());
+    build_flags.insert("dtype".to_string(), dtype.as_str().to_string());
+    build_flags.insert("graph_revision".to_string(), GRAPH_REVISION.to_string());
+    build_flags.insert(
+        "bucket_policy".to_string(),
+        format!("v{BUCKET_POLICY_VERSION}"),
+    );
+    build_flags.insert("risk_class".to_string(), "abort_safe".to_string());
+    EngineIdentity {
+        engine: "owned-metal".to_string(),
+        version: ENGINE_VERSION.to_string(),
+        build_flags,
+    }
+}
+
+pub struct OwnedMetalEmbedEngine {
+    family: ModelFamily,
+    dtype: OwnedDType,
+    models: HashMap<String, OwnedModelHandle>,
+    next_model: u64,
+}
+
+#[cfg(target_os = "macos")]
+type OwnedModelHandle = Arc<Mutex<OwnedLoadedModel>>;
+#[cfg(not(target_os = "macos"))]
+type OwnedModelHandle = ();
+
+#[cfg(target_os = "macos")]
+struct OwnedLoadedModel {
+    family: Box<dyn runtime::ModelFamily>,
+    provider: runtime::MetalProvider,
+    buckets: Vec<runtime::BatchShape>,
+    tokenizer_policy: TokenizerPolicy,
+}
+
+impl OwnedMetalEmbedEngine {
+    #[must_use]
+    pub fn new(family: ModelFamily, dtype: OwnedDType) -> Self {
+        Self {
+            family,
+            dtype,
+            models: HashMap::new(),
+            next_model: 0,
+        }
+    }
+
+    #[must_use]
+    pub const fn family(&self) -> ModelFamily {
+        self.family
+    }
+
+    #[must_use]
+    pub const fn dtype(&self) -> OwnedDType {
+        self.dtype
+    }
+
+    pub fn load_from_dir(
+        &mut self,
+        model_dir: impl AsRef<Path>,
+        execution: OwnedExecutionConfig,
+    ) -> Result<LoadedModel, EngineError> {
+        let mut runtime = RuntimeConfig::default();
+        runtime.values.insert(
+            "model_path".to_string(),
+            model_dir.as_ref().to_string_lossy().to_string(),
+        );
+        runtime.values.insert(
+            "package_cache_root".to_string(),
+            execution.package_cache_root.to_string_lossy().to_string(),
+        );
+        runtime.values.insert(
+            "execution".to_string(),
+            match execution.execution {
+                ExecutionMode::Explicit => "explicit".to_string(),
+                ExecutionMode::Lazy => "lazy".to_string(),
+            },
+        );
+        runtime
+            .values
+            .insert("max_tokens".to_string(), execution.max_length.to_string());
+        runtime.values.insert(
+            "attention_units".to_string(),
+            execution.attention_units.to_string(),
+        );
+        self.load(
+            &ValidatedArtifact {
+                digest: String::new(),
+                format: "safetensors-package".to_string(),
+            },
+            &runtime,
+        )
+    }
+
+    pub fn embed_tokens(
+        &self,
+        model: &LoadedModel,
+        sequences: Vec<Vec<u32>>,
+    ) -> Result<Vec<Vec<f32>>, EngineError> {
+        self.embed_batch(model, TokenBatch { items: sequences })
+    }
+
+    fn error(stage: EngineErrorStage, message: impl Into<String>) -> EngineError {
+        EngineError {
+            stage,
+            risk_class: EngineRiskClass::AbortSafe,
+            message: message.into(),
+            retry_after_ms: None,
+            safe_to_retry_same_request: false,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn load_macos(&mut self, cfg: &RuntimeConfig) -> Result<LoadedModel, EngineError> {
+        let model_path = required_path(cfg, "model_path")?;
+        let detected = detect_family(&model_path)
+            .map_err(|error| Self::error(EngineErrorStage::Load, error.to_string()))?;
+        if detected != self.family {
+            return Err(Self::error(
+                EngineErrorStage::Load,
+                format!(
+                    "configured family {} does not match detected family {}",
+                    self.family.as_str(),
+                    detected.as_str()
+                ),
+            ));
+        }
+        let max_length = parse_usize(cfg, "max_tokens", 512)?;
+        let attention_units = parse_usize(cfg, "attention_units", DEFAULT_ATTENTION_UNITS)?;
+        if max_length == 0 || attention_units < max_length.saturating_mul(max_length) {
+            return Err(Self::error(
+                EngineErrorStage::Load,
+                "bucket attention budget cannot cover max_tokens",
+            ));
+        }
+        let cache_root = required_path(cfg, "package_cache_root")?;
+        let execution = match cfg
+            .values
+            .get("execution")
+            .map(String::as_str)
+            .unwrap_or("explicit")
+        {
+            "explicit" => runtime::Execution::Explicit,
+            "lazy" => runtime::Execution::Lazy,
+            other => {
+                return Err(Self::error(
+                    EngineErrorStage::Load,
+                    format!("unsupported Metal execution mode '{other}'"),
+                ))
+            }
+        };
+        let package_root = package_root(&cache_root, &model_path, self.family, self.dtype)
+            .map_err(|error| Self::error(EngineErrorStage::Load, error))?;
+        let config = runtime::MetalExecutionConfig::new(execution, Some(package_root))
+            .map_err(|error| Self::error(EngineErrorStage::Load, error.to_string()))?;
+        let family = runtime::load_model_family(&model_path, precision(self.dtype))
+            .map_err(|error| Self::error(EngineErrorStage::Load, error.to_string()))?;
+        let policy = family.tokenizer_policy();
+        let tokenizer_policy = TokenizerPolicy {
+            add_special_tokens: true,
+            pad_token_id: policy.pad_token_id,
+            terminal_token_id: policy.terminal_token_id,
+        };
+        let buckets = runtime::bucket_shapes(max_length, attention_units);
+        if buckets.len() > 12 {
+            return Err(Self::error(
+                EngineErrorStage::Load,
+                format!("bucket policy produced {} shapes", buckets.len()),
+            ));
+        }
+        let mut provider =
+            runtime::MetalProvider::new_with_config(precision(self.dtype), config)
+                .map_err(|error| Self::error(EngineErrorStage::Load, error.to_string()))?;
+        let preload_ids = vec![vec![policy
+            .terminal_token_id
+            .unwrap_or(policy.pad_token_id)]];
+        for &shape in &buckets {
+            family
+                .embed_batch(&mut provider, &preload_ids, Some(shape))
+                .map_err(|error| {
+                    Self::error(
+                        EngineErrorStage::Load,
+                        format!("precompile {}x{}: {error}", shape.batch, shape.seq),
+                    )
+                })?;
+        }
+        let model_id = format!("owned-metal:{}:{}", self.family.as_str(), self.next_model);
+        self.next_model += 1;
+        self.models.insert(
+            model_id.clone(),
+            Arc::new(Mutex::new(OwnedLoadedModel {
+                family,
+                provider,
+                buckets,
+                tokenizer_policy,
+            })),
+        );
+        Ok(LoadedModel { model_id })
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn tokenizer_policy(&self, model: &LoadedModel) -> Result<TokenizerPolicy, EngineError> {
+        let loaded = self.models.get(&model.model_id).ok_or_else(|| {
+            Self::error(
+                EngineErrorStage::Inference,
+                format!("unknown owned-metal model ref '{}'", model.model_id),
+            )
+        })?;
+        let loaded = loaded.lock().map_err(|_| {
+            Self::error(
+                EngineErrorStage::Inference,
+                "owned-metal model mutex was poisoned",
+            )
+        })?;
+        Ok(loaded.tokenizer_policy)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn tokenizer_policy(&self, _model: &LoadedModel) -> Result<TokenizerPolicy, EngineError> {
+        Err(Self::error(
+            EngineErrorStage::Load,
+            OwnedEngineError::UnsupportedPlatform.to_string(),
+        ))
+    }
+}
+
+impl EmbedEngine for OwnedMetalEmbedEngine {
+    fn identity(&self) -> EngineIdentity {
+        engine_identity(self.family, self.dtype)
+    }
+
+    fn load(
+        &mut self,
+        artifact: &ValidatedArtifact,
+        cfg: &RuntimeConfig,
+    ) -> Result<LoadedModel, EngineError> {
+        if artifact.format != "safetensors-package" {
+            return Err(Self::error(
+                EngineErrorStage::Load,
+                format!(
+                    "owned-metal requires safetensors-package, got {}",
+                    artifact.format
+                ),
+            ));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            self.load_macos(cfg)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = cfg;
+            Err(Self::error(
+                EngineErrorStage::Load,
+                OwnedEngineError::UnsupportedPlatform.to_string(),
+            ))
+        }
+    }
+
+    fn embed_batch(&self, model: &LoadedModel, batch: TokenBatch) -> Result<Vectors, EngineError> {
+        #[cfg(target_os = "macos")]
+        {
+            let loaded = self.models.get(&model.model_id).ok_or_else(|| {
+                Self::error(
+                    EngineErrorStage::Inference,
+                    format!("unknown owned-metal model ref '{}'", model.model_id),
+                )
+            })?;
+            let mut loaded = loaded.lock().map_err(|_| {
+                Self::error(
+                    EngineErrorStage::Inference,
+                    "owned-metal model mutex was poisoned",
+                )
+            })?;
+            run_bucketed(&mut loaded, batch)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (model, batch);
+            Err(Self::error(
+                EngineErrorStage::Inference,
+                OwnedEngineError::UnsupportedPlatform.to_string(),
+            ))
+        }
+    }
+
+    fn embed_one(&self, model: &LoadedModel, ids: TokenIds) -> Result<Vector, EngineError> {
+        let mut vectors = self.embed_batch(model, TokenBatch { items: vec![ids] })?;
+        vectors.pop().ok_or_else(|| {
+            Self::error(
+                EngineErrorStage::Inference,
+                "owned-metal returned no vector",
+            )
+        })
+    }
+
+    fn unload(&mut self, model: &LoadedModel) {
+        self.models.remove(&model.model_id);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn run_bucketed(loaded: &mut OwnedLoadedModel, batch: TokenBatch) -> Result<Vectors, EngineError> {
+    if batch.items.is_empty() {
+        return Ok(Vec::new());
+    }
+    for (index, ids) in batch.items.iter().enumerate() {
+        if ids.is_empty() {
+            return Err(OwnedMetalEmbedEngine::error(
+                EngineErrorStage::Inference,
+                format!("token batch item {index} is empty"),
+            ));
+        }
+        if let Some(terminal) = loaded.tokenizer_policy.terminal_token_id {
+            if ids.last() != Some(&terminal) {
+                return Err(OwnedMetalEmbedEngine::error(
+                    EngineErrorStage::Inference,
+                    format!(
+                        "token batch item {index} is missing required terminal token {terminal}"
+                    ),
+                ));
+            }
+        }
+    }
+    let mut order = (0..batch.items.len()).collect::<Vec<_>>();
+    order.sort_by_key(|&index| batch.items[index].len());
+    let mut vectors = vec![Vec::new(); batch.items.len()];
+    let mut start = 0;
+    while start < order.len() {
+        let mut end = start;
+        while end < order.len() {
+            let length = batch.items[order[end]].len();
+            let bucket = runtime::covering_bucket(length, &loaded.buckets).ok_or_else(|| {
+                OwnedMetalEmbedEngine::error(
+                    EngineErrorStage::Inference,
+                    format!("sequence length {length} exceeds certified bucket envelope"),
+                )
+            })?;
+            if end - start + 1 > bucket.batch {
+                break;
+            }
+            end += 1;
+        }
+        let length = batch.items[order[end - 1]].len();
+        let shape =
+            runtime::covering_bucket(length, &loaded.buckets).expect("bucket checked above");
+        let sequences = order[start..end]
+            .iter()
+            .map(|&index| batch.items[index].clone())
+            .collect::<Vec<_>>();
+        let produced = loaded
+            .family
+            .embed_batch(&mut loaded.provider, &sequences, Some(shape))
+            .map_err(|error| {
+                OwnedMetalEmbedEngine::error(EngineErrorStage::Inference, error.to_string())
+            })?;
+        for (&original, vector) in order[start..end].iter().zip(produced) {
+            vectors[original] = vector;
+        }
+        start = end;
+    }
+    Ok(vectors)
+}
+
+#[cfg(target_os = "macos")]
+fn precision(dtype: OwnedDType) -> runtime::Precision {
+    match dtype {
+        OwnedDType::F16 => runtime::Precision::F16,
+        OwnedDType::F32 => runtime::Precision::F32,
+    }
+}
+
+fn required_path(cfg: &RuntimeConfig, key: &str) -> Result<PathBuf, EngineError> {
+    cfg.values
+        .get(key)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            OwnedMetalEmbedEngine::error(
+                EngineErrorStage::Load,
+                format!("runtime config missing {key}"),
+            )
+        })
+}
+
+fn parse_usize(cfg: &RuntimeConfig, key: &str, default: usize) -> Result<usize, EngineError> {
+    cfg.values.get(key).map_or(Ok(default), |value| {
+        value.parse::<usize>().map_err(|error| {
+            OwnedMetalEmbedEngine::error(
+                EngineErrorStage::Load,
+                format!("invalid {key} '{value}': {error}"),
+            )
+        })
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn package_root(
+    cache_root: &Path,
+    model_path: &Path,
+    family: ModelFamily,
+    dtype: OwnedDType,
+) -> Result<PathBuf, String> {
+    let canonical = std::fs::canonicalize(model_path).unwrap_or_else(|_| model_path.to_path_buf());
+    let hash = canonical
+        .to_string_lossy()
+        .bytes()
+        .fold(1469598103934665603u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(1099511628211)
+        });
+    let os_build = std::process::Command::new("sw_vers")
+        .arg("-buildVersion")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .filter(|build| !build.is_empty())
+        .unwrap_or_else(|| "unknown-os-build".to_string());
+    let root = cache_root.join(format!(
+        "{}-graph-v{}-bucket-policy-v{}-{hash:016x}-{}-{os_build}",
+        family.as_str(),
+        GRAPH_REVISION,
+        BUCKET_POLICY_VERSION,
+        dtype.as_str()
+    ));
+    std::fs::create_dir_all(&root)
+        .map_err(|error| format!("create package root {}: {error}", root.display()))?;
+    Ok(root)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identity_separates_family_dtype_graph_and_policy() {
+        let minilm_f16 = engine_identity(ModelFamily::MiniLm, OwnedDType::F16);
+        let minilm_f32 = engine_identity(ModelFamily::MiniLm, OwnedDType::F32);
+        let qwen_f16 = engine_identity(ModelFamily::Qwen3, OwnedDType::F16);
+        assert_ne!(minilm_f16, minilm_f32);
+        assert_ne!(minilm_f16, qwen_f16);
+        assert_eq!(
+            minilm_f16.build_flags["graph_revision"],
+            GRAPH_REVISION.to_string()
+        );
+        assert_eq!(
+            minilm_f16.build_flags["bucket_policy"],
+            format!("v{BUCKET_POLICY_VERSION}")
+        );
+    }
+
+    #[test]
+    fn recommendations_match_certified_serving_profiles() {
+        assert_eq!(ModelFamily::MiniLm.recommended_dtype(), OwnedDType::F16);
+        assert_eq!(
+            ModelFamily::GteModernBert.recommended_dtype(),
+            OwnedDType::F32
+        );
+        assert_eq!(ModelFamily::Qwen3.recommended_dtype(), OwnedDType::F16);
+    }
+
+    #[test]
+    fn non_macos_capability_probe_is_empty() {
+        if !cfg!(target_os = "macos") {
+            assert!(capabilities().is_empty());
+        }
+    }
+}
