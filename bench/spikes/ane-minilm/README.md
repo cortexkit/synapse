@@ -4,14 +4,16 @@ This folder contains the fixed-bucket Core ML proof path for `sentence-transform
 
 ## Contents
 
-- `convert_minilm_to_coreml.py` — converts the HF MiniLM encoder to a fixed-shape fp16 `.mlpackage`.
+- `convert_minilm_to_coreml.py` — converts the HF MiniLM encoder to a fixed-shape fp16 `.mlpackage` using export only.
+- `convert_modernbert_to_coreml.py` — converts fixed-bucket GTE ModernBERT embedder or reranker packages with pooling/head inside Core ML and verifies eager/export/Core ML smoke parity.
 - `prep_tokenized_jsonl.py` — turns corpus JSONL into fixed-bucket `{id,input_ids,attention_mask}` JSONL.
 - `ort_reference.py` — ONNX Runtime fp32 reference over the same pretokenized inputs.
-- `ane_minilm.swift` — Swift CLI with two subcommands:
+- `ane_coreml.swift` — generalized Swift CLI with two subcommands:
   - `compile` — `.mlpackage`/`.mlmodel` -> permanent `.mlmodelc`
-  - `embed` — load `.mlmodelc`, run batches, mean-pool with the attention mask, L2-normalize, emit `{id,vec}` JSONL, optionally dump MLComputePlan placement
-- `build_runner.sh` — builds the Swift CLI to `.build/ane-minilm`.
-- `SPIKE.md` — measured results and verdict.
+  - `run` (`embed` alias) — load `.mlmodelc`, select graph/mean/CLS pooling or pair scoring, emit JSONL, and optionally dump MLComputePlan placement
+- `build_runner.sh` — builds the Swift CLI to `.build/ane-coreml`.
+- `SPIKE.md` — original MiniLM results and verdict.
+- `ANE-WAVE1.md` — ModernBERT wave-1 conversion, parity, placement, power, throughput, and latency evidence.
 
 ## Requirements
 
@@ -42,7 +44,7 @@ uv pip install -r requirements.txt
 
 ## Convert the 256 and 512 bucket variants
 
-The default `--frontend auto` mode probes the straightforward TorchScript trace path first, but writes the final package with `torch.export`. That is intentional: the trace-built `seq=512` variant converted successfully in local smoke, but missed parity badly, so the reproducible path here is export-backed.
+The converter accepts only `--frontend export`. Trace conversion is intentionally unavailable because the trace-built seq512 variant missed parity catastrophically.
 
 ```bash
 cd bench/spikes/ane-minilm
@@ -69,7 +71,7 @@ cd bench/spikes/ane-minilm
 The binary lands at:
 
 ```bash
-bench/spikes/ane-minilm/.build/ane-minilm
+bench/spikes/ane-minilm/.build/ane-coreml
 ```
 
 ## Prepare pretokenized inputs locally
@@ -117,11 +119,11 @@ python ort_reference.py \
 ## Optional local smoke / parity check
 
 ```bash
-./bench/spikes/ane-minilm/.build/ane-minilm compile \
+./bench/spikes/ane-minilm/.build/ane-coreml compile \
   --model ~/bench-tools/ane-spike/models/all-MiniLM-L6-v2-seq256.mlpackage \
   --out ~/bench-tools/ane-spike/models/all-MiniLM-L6-v2-seq256.mlmodelc
 
-./bench/spikes/ane-minilm/.build/ane-minilm embed \
+./bench/spikes/ane-minilm/.build/ane-coreml embed \
   --model ~/bench-tools/ane-spike/models/all-MiniLM-L6-v2-seq256.mlmodelc \
   --input ~/bench-tools/ane-spike/data/aft-1000-b256.jsonl \
   --output ~/bench-tools/ane-spike/results/coreml-1000-b256.jsonl \
@@ -147,7 +149,7 @@ Build locally, then rsync the source, binaries, model packages, prepared JSONL, 
 ssh [bench-host-alias] 'rm -rf ~/bench-tools/ane-spike && mkdir -p ~/bench-tools/ane-spike/{src,bin,models,data,reference,results}'
 
 rsync -av bench/spikes/ane-minilm/ [bench-host-alias]:~/bench-tools/ane-spike/src/
-rsync -av bench/spikes/ane-minilm/.build/ane-minilm [bench-host-alias]:~/bench-tools/ane-spike/bin/
+rsync -av bench/spikes/ane-minilm/.build/ane-coreml [bench-host-alias]:~/bench-tools/ane-spike/bin/
 rsync -av target/release/synapse-bench [bench-host-alias]:~/bench-tools/ane-spike/bin/
 rsync -av ~/bench-tools/ane-spike/models/ [bench-host-alias]:~/bench-tools/ane-spike/models/
 rsync -av ~/bench-tools/ane-spike/data/ [bench-host-alias]:~/bench-tools/ane-spike/data/
@@ -162,8 +164,8 @@ The remote host does not need `coremlcompiler`; the Swift CLI's `compile` subcom
 ssh [bench-host-alias] '
 set -euo pipefail
 cd ~/bench-tools/ane-spike
-bin/ane-minilm compile --model models/all-MiniLM-L6-v2-seq256.mlpackage --out models/all-MiniLM-L6-v2-seq256.mlmodelc
-bin/ane-minilm compile --model models/all-MiniLM-L6-v2-seq512.mlpackage --out models/all-MiniLM-L6-v2-seq512.mlmodelc
+bin/ane-coreml compile --model models/all-MiniLM-L6-v2-seq256.mlpackage --out models/all-MiniLM-L6-v2-seq256.mlmodelc
+bin/ane-coreml compile --model models/all-MiniLM-L6-v2-seq512.mlpackage --out models/all-MiniLM-L6-v2-seq512.mlmodelc
 '
 ```
 
@@ -175,14 +177,14 @@ set -euo pipefail
 cd ~/bench-tools/ane-spike
 head -n 1 data/aft-1000-b256.jsonl > data/aft-1-b256.jsonl
 head -n 1 data/aft-1000-b512.jsonl > data/aft-1-b512.jsonl
-bin/ane-minilm embed \
+bin/ane-coreml embed \
   --model models/all-MiniLM-L6-v2-seq256.mlmodelc \
   --input data/aft-1-b256.jsonl \
   --output results/placement-b256.jsonl \
   --stats-out results/placement-b256.stats.json \
   --placement-out results/placement-b256.report.json \
   --batch-size 1 > /dev/null
-bin/ane-minilm embed \
+bin/ane-coreml embed \
   --model models/all-MiniLM-L6-v2-seq512.mlmodelc \
   --input data/aft-1-b512.jsonl \
   --output results/placement-b512.jsonl \
@@ -214,7 +216,7 @@ for bucket in 256 512; do
   rm -f "results/powermetrics-b${bucket}.txt"
   sudo -n powermetrics -i 500 -s ane_power,gpu_power,cpu_power > "results/powermetrics-b${bucket}.txt" 2>/dev/null &
   PM_PID=$!
-  bin/ane-minilm embed \
+  bin/ane-coreml embed \
     --model "models/all-MiniLM-L6-v2-seq${bucket}.mlmodelc" \
     --input "data/aft-1000-b${bucket}.jsonl" \
     --output "results/coreml-1000-b${bucket}.jsonl" \

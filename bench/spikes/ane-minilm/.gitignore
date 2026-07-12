@@ -10,3 +10,5 @@ results/
 *.stats.json
 *.placement.json
 *.powermetrics.txt
+!results/
+!results/*.json
