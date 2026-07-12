@@ -10,8 +10,9 @@ use tokenizers::{Tokenizer, TruncationParams};
 #[cfg(target_os = "macos")]
 use super::{decode_f16_bits, encode_f16_bits, Execution};
 use super::{
-    get_tensor, load_safetensor_map, normalize_l2, resolve_model_root, BLayout, BlockBackend,
-    BlockForwardRequest, KernelProvider, MetalExecutionConfig, ModelFamily, Precision, Tensor,
+    get_tensor, load_safetensor_map, normalize_l2, resolve_model_root, BLayout, BatchShape,
+    BlockBackend, BlockForwardRequest, KernelProvider, MetalExecutionConfig, ModelFamily,
+    Precision, Tensor,
 };
 
 #[derive(Clone, Deserialize)]
@@ -219,17 +220,32 @@ impl ModernBertModel {
         provider: &mut dyn KernelProvider,
         tokenizer: &Tokenizer,
         texts: &[&str],
+        shape: Option<BatchShape>,
     ) -> Result<Vec<Vec<f32>>> {
         let encodings = tokenizer
             .encode_batch(texts.to_vec(), true)
             .map_err(|error| anyhow::anyhow!("encode_batch: {error}"))?;
-        let batch = encodings.len();
-        let seq = encodings
+        let real_batch = encodings.len();
+        ensure!(real_batch > 0, "ModernBERT batch must not be empty");
+        let real_seq = encodings
             .iter()
             .map(|encoding| encoding.get_ids().len())
             .max()
             .unwrap_or(1)
             .max(1);
+        let target = shape.unwrap_or(BatchShape {
+            batch: real_batch,
+            seq: real_seq,
+        });
+        ensure!(
+            target.batch >= real_batch && target.seq >= real_seq,
+            "ModernBERT target shape {}x{} does not cover input {}x{}",
+            target.batch,
+            target.seq,
+            real_batch,
+            real_seq
+        );
+        let (batch, seq) = (target.batch, target.seq);
         ensure!(
             seq <= self.config.max_position_embeddings,
             "sequence length {seq} exceeds ModernBERT maximum {}",
@@ -248,8 +264,8 @@ impl ModernBertModel {
         }
 
         let hidden = self.forward(provider, &input_ids, &attention_mask, batch, seq)?;
-        let mut vectors = Vec::with_capacity(batch);
-        for row in 0..batch {
+        let mut vectors = Vec::with_capacity(real_batch);
+        for row in 0..real_batch {
             let start = row * seq * self.config.hidden_size;
             let mut vector = hidden[start..start + self.config.hidden_size].to_vec();
             normalize_l2(&mut vector);
@@ -607,8 +623,9 @@ impl ModelFamily for ModernBertModel {
         tokenizer: &Tokenizer,
         texts: &[&str],
         _max_length: usize,
+        shape: Option<BatchShape>,
     ) -> Result<Vec<Vec<f32>>> {
-        ModernBertModel::embed_batch(self, provider, tokenizer, texts)
+        ModernBertModel::embed_batch(self, provider, tokenizer, texts, shape)
     }
 
     fn validate_reference_coverage(&self, matched: usize, produced: usize) -> Result<()> {
@@ -1049,14 +1066,14 @@ mod tests {
 
         if let Ok(output_path) = std::env::var(CHILD_OUTPUT) {
             let baseline = model
-                .embed_batch(&mut backend, &tokenizer, TARGET_TEXTS)
+                .embed_batch(&mut backend, &tokenizer, TARGET_TEXTS, None)
                 .unwrap();
             fs::write(output_path, serde_json::to_vec(&baseline).unwrap()).unwrap();
             return;
         }
 
         model
-            .embed_batch(&mut backend, &tokenizer, &["first call"])
+            .embed_batch(&mut backend, &tokenizer, &["first call"], None)
             .unwrap();
         model
             .embed_batch(
@@ -1066,10 +1083,11 @@ mod tests {
                     "second call has two rows",
                     "and enough distinct content to use another shape",
                 ],
+                None,
             )
             .unwrap();
         let third_call = model
-            .embed_batch(&mut backend, &tokenizer, TARGET_TEXTS)
+            .embed_batch(&mut backend, &tokenizer, TARGET_TEXTS, None)
             .unwrap();
 
         let baseline_path = std::env::temp_dir().join(format!(

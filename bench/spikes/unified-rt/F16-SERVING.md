@@ -145,8 +145,6 @@ SYNAPSE_MODERNBERT_DUMP_DIR=target/mb-dump-f32 $BIN ... --limit 1 --dtype f32 --
 SYNAPSE_MODERNBERT_DUMP_DIR=target/mb-dump-f16 $BIN ... --limit 1 --dtype f16 --execution lazy
 ```
 
-## Open items
+## Bucket-policy follow-up
 
-1. Add multi-pass support to the main harness and record true in-process first/warm/steady labels. The locked-M1 matrix currently uses two fresh single-pass process repeats per cache state because the main binary has no `--passes` option.
-2. Pre-discover serving buckets so every shape is compiled/loaded before inference timing; this spike currently prepares each shape synchronously immediately before its first execution.
-3. Replace exact corpus shapes with a bounded serving bucket policy, especially for the 162-shape MC workload.
+The three serving-shape open items are implemented by [BUCKET-POLICY.md](BUCKET-POLICY.md): the main harness supports in-process `--passes`, accelerator bucket shapes are pre-discovered during cold load, and bucket policy v1 replaces corpus-dependent shapes by default. `--shapes exact` remains available for A/B measurements. The locked-M1 rerun described there is still pending.
