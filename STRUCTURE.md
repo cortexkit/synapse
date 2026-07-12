@@ -57,9 +57,9 @@
 - Key files: `crates/synapse-core/src/worker_protocol.rs`, `crates/synapse-core/src/scheduler.rs`
 
 **crates/synapse-module/:**
-- Purpose: The primary SubC service module. Handles the content-addressed model cache, durable jobs, worker hosting, and route binding.
-- Contains: SQLite store initialization, SubC `ModuleHandler` implementation, and UNIX socket worker spawning.
-- Key files: `crates/synapse-module/src/lib.rs`, `crates/synapse-module/src/worker_host.rs`
+- Purpose: The primary SubC service module. Handles the content-addressed model cache, durable jobs, worker hosting, remote provider dispatch, and route binding.
+- Contains: SQLite store initialization, SubC `ModuleHandler` implementation, UNIX socket / Windows pipe worker spawning, and the remote gateway client.
+- Key files: `crates/synapse-module/src/lib.rs`, `crates/synapse-module/src/worker_host/mod.rs`, `crates/synapse-module/src/remote/gateway.rs`
 
 **crates/synapse-worker-*/:**
 - Purpose: Specialized out-of-process inference engines built for specific hardware (ANE, MLX, llama.cpp).
@@ -114,8 +114,9 @@
 - `bench/lanes/burn/build.rs`: Burn compilation setup for model building.
 
 **Core Logic:**
-- `crates/synapse-module/src/worker_host.rs`: Spawns and manages worker lifecycles over Unix domain sockets using a binary framing protocol.
-- `crates/synapse-module/src/store.rs`: SQLite-backed state for content-addressed model cache, durable jobs, and performance tier capabilities.
+- `crates/synapse-module/src/remote/runtime.rs`: Provider pool routing, circuit breaker enforcement, and telemetry collection for external model execution.
+- `crates/synapse-module/src/worker_host/mod.rs`: Spawns and manages worker lifecycles over Unix domain sockets or Windows named pipes using a binary framing protocol.
+- `crates/synapse-module/src/store.rs`: SQLite-backed state for content-addressed model cache, durable jobs, active attempts, and performance tier capabilities.
 - `crates/synapse-core/src/scheduler.rs`: 3-class fair-share aging scheduler for managing concurrent inference requests.
 - `bench/harness/src/metrics.rs`: Macmon power metrics execution, parsing, and system idle gating.
 - `bench/harness/src/parity.rs`: Numerical calculation of cosine similarity, rank stability/overlap checks, and file parsing functions.
@@ -132,12 +133,13 @@
 ## Naming Conventions
 
 **Files:** Snake case for Rust files (`main.rs`, `metrics.rs`) and scripts (`run-matrix.sh`).
-**Directories:** Kebap case for lane folder structures (`ort-embed`, `wrap-embed`).
+**Directories:** Kebab case for lane folder structures (`ort-embed`, `wrap-embed`).
+**Binaries:** The fleet convention prefixes runtime executables with `ck-` (e.g., `ck-synapse`, `ck-synapse-worker-mlx`) to group them in Activity Monitor, while preserving the un-prefixed module ID and crate names.
 
 ## Where to Add New Code
 
 **New benchmark lane:** For Rust-based lanes, create a new workspace crate under `bench/lanes/[lane-name]/` and register the crate path in the root `Cargo.toml` `members` list. For Python or JavaScript/TypeScript-based lanes, create a new sub-directory under `bench/lanes/[lane-name]/` with the corresponding package or dependency manifest (`requirements.txt`, `package.json`). Follow standard batching structures, output a valid `LaneResult` json structure, then add the runner invocation inside `bench/run-matrix.sh` and `bench/run-night.sh`.
-**New worker backend:** Create a new workspace crate `crates/synapse-worker-[name]`, implement the binary frame protocol defined in `crates/synapse-core/src/worker_protocol.rs`, and integrate its lifecycle into `crates/synapse-module/src/worker_host.rs`.
+**New worker backend:** Create a new workspace crate `crates/synapse-worker-[name]`, implement the binary frame protocol defined in `crates/synapse-core/src/worker_protocol.rs`, and integrate its lifecycle into `crates/synapse-module/src/worker_host/mod.rs`.
 **New benchmark workload:** Add a subcommand and its schema parsing in `bench/harness/src/main.rs`, support loading and typing under `bench/harness/src/parity.rs`, and implement the evaluation logic in the corresponding lane executables.
 **Shared utilities:** Place shared functions or data representations within `bench/harness/src/parity.rs` or `bench/harness/src/results.rs`.
 **Tests:** Co-locate unit tests within the source files as nested `#[cfg(test)]` modules, and integration tests inside `tests/` directories at the crate roots.
