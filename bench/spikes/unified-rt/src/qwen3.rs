@@ -241,7 +241,7 @@ impl Model {
 
         let mut run = |context: &mut dyn Any| {
             let context = context
-                .downcast_mut::<MetalContext>()
+                .downcast_mut::<BlockContext>()
                 .context("Qwen3 provider returned the wrong block context type")?;
             context.forward(
                 &mut hidden_states,
@@ -348,9 +348,95 @@ pub(super) fn load_family(path: &Path, precision: Precision) -> Result<Box<dyn M
 fn new_block_context(
     precision: Precision,
     execution: MetalExecutionConfig,
-    _backend: BlockBackend,
+    backend: BlockBackend,
 ) -> Result<Box<dyn Any>> {
-    Ok(Box::new(MetalContext::new(precision, execution)?))
+    let backend = match backend {
+        BlockBackend::Metal => BlockContextBackend::Metal(MetalContext::new(precision, execution)?),
+        BlockBackend::Cuda { graphs } => {
+            BlockContextBackend::Cuda(super::cuda_backend::Qwen3Context::new(graphs, precision)?)
+        }
+    };
+    Ok(Box::new(BlockContext { backend }))
+}
+
+enum BlockContextBackend {
+    Metal(MetalContext),
+    Cuda(super::cuda_backend::Qwen3Context),
+}
+
+struct BlockContext {
+    backend: BlockContextBackend,
+}
+
+impl BlockContext {
+    #[allow(clippy::too_many_arguments)]
+    fn forward(
+        &mut self,
+        hidden_states: &mut [f32],
+        attention_mask: &[u8],
+        batch: usize,
+        seq: usize,
+        hidden: usize,
+        query_heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        intermediate: usize,
+        epsilon: f32,
+        rope_theta: f32,
+        layers: &[Layer],
+        final_norm: &RmsNorm,
+    ) -> Result<()> {
+        match &mut self.backend {
+            BlockContextBackend::Metal(context) => context.forward(
+                hidden_states,
+                attention_mask,
+                batch,
+                seq,
+                hidden,
+                query_heads,
+                kv_heads,
+                head_dim,
+                intermediate,
+                epsilon,
+                rope_theta,
+                layers,
+                final_norm,
+            ),
+            BlockContextBackend::Cuda(context) => {
+                let params = layers
+                    .iter()
+                    .map(|layer| super::cuda_backend::Qwen3LayerParams {
+                        input_norm: layer.input_norm.weight.data.as_ptr(),
+                        post_attention_norm: layer.post_attention_norm.weight.data.as_ptr(),
+                        q_weight: layer.q_proj.tensor.data.as_ptr(),
+                        q_norm: layer.q_norm.weight.data.as_ptr(),
+                        k_weight: layer.k_proj.tensor.data.as_ptr(),
+                        k_norm: layer.k_norm.weight.data.as_ptr(),
+                        v_weight: layer.v_proj.tensor.data.as_ptr(),
+                        o_weight: layer.o_proj.tensor.data.as_ptr(),
+                        gate_weight: layer.gate_proj.tensor.data.as_ptr(),
+                        up_weight: layer.up_proj.tensor.data.as_ptr(),
+                        down_weight: layer.down_proj.tensor.data.as_ptr(),
+                    })
+                    .collect::<Vec<_>>();
+                context.forward(
+                    hidden_states,
+                    attention_mask,
+                    batch,
+                    seq,
+                    hidden,
+                    query_heads,
+                    kv_heads,
+                    head_dim,
+                    intermediate,
+                    epsilon,
+                    rope_theta,
+                    &params,
+                    &final_norm.weight.data,
+                )
+            }
+        }
+    }
 }
 
 fn get_qwen_tensor(
@@ -1060,5 +1146,55 @@ mod tests {
         let pooled = last_token_pool_l2(&hidden, &[1, 1, 0], 1, 3, 2);
         assert!((pooled[0][0] - 0.6).abs() < 1e-6);
         assert!((pooled[0][1] - 0.8).abs() < 1e-6);
+    }
+
+    #[cfg(all(target_os = "linux", feature = "cuda"))]
+    #[test]
+    #[ignore = "requires QWEN3_CUDA_MODEL"]
+    fn qwen3_cuda_static_feeds_survive_multiple_calls() {
+        let model_root =
+            std::env::var("QWEN3_CUDA_MODEL").expect("set QWEN3_CUDA_MODEL to the model snapshot");
+        let model = Model::load(Path::new(&model_root), Precision::F16).expect("load Qwen3 model");
+        let tokenizer = Tokenizer::from_file(Path::new(&model_root).join("tokenizer.json"))
+            .expect("load Qwen3 tokenizer");
+        let execution = super::super::MetalExecutionConfig {
+            execution: super::super::Execution::Explicit,
+            package_root: None,
+        };
+        let mut provider = super::super::CudaProvider::new(Precision::F16, execution, true)
+            .expect("CUDA provider");
+        let shape = Some(BatchShape { batch: 2, seq: 64 });
+        let first = model
+            .embed_batch(
+                &mut provider,
+                &tokenizer,
+                &["first document", "second document"],
+                512,
+                shape,
+            )
+            .expect("first CUDA call");
+        let different = model
+            .embed_batch(
+                &mut provider,
+                &tokenizer,
+                &["unrelated text", "another sample"],
+                512,
+                shape,
+            )
+            .expect("second CUDA call");
+        let repeated = model
+            .embed_batch(
+                &mut provider,
+                &tokenizer,
+                &["first document", "second document"],
+                512,
+                shape,
+            )
+            .expect("third CUDA call");
+        assert_eq!(
+            first, repeated,
+            "repeated CUDA call changed persistent feeds"
+        );
+        assert_ne!(first, different, "distinct CUDA inputs reused stale output");
     }
 }

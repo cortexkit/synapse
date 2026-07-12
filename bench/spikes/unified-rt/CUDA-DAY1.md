@@ -374,3 +374,98 @@ SYNAPSE_CUDA_ENUMERATE="$ENUMERATE" \
 **PRUNE.** Enumeration improved the fair device total by only `0.98%`, below the explicit `3%` retention threshold. The CUDA source was restored to the retained heuristic-default implementation. Because the win was not material, no JSON sidecar cache was retained and the wave-3 fused-QKV branch was not re-tested; both were conditional on clearing the material-win gate. The negative result also closes the specific algorithm-selection lever identified by waves 2 and 3 on this driver: isolated GEMM classes can choose substantially better configurations, but exhaustive per-shape selection does not materially move the complete encoder.
 
 Raw `wave4-*.json` process results, all 50 full algorithm identities, the stage/cold-load calculations, and P-state annotations are in [`results/cuda-day1/`](results/cuda-day1/). The commands used were the day-1 benchmark command with bucket-policy v1, `SYNAPSE_CUDA_ENUMERATE=0` for the heuristic control, and the experimental enumeration build for candidate cells. Long cells were timeout-wrapped and preceded by an idle-utilization gate as described above.
+
+
+## Wave 5: family coverage
+
+Wave 5 retained the Wave-1 execution discipline while adding resident graphs for `Alibaba-NLP/gte-modernbert-base` and `Qwen/Qwen3-Embedding-0.6B`. The family-specific CUDA contexts are reached through the existing typed `block_forward` seam. They own persistent device weights, per-shape plans, 256-byte-aligned arena slices, preselected cuBLASLt algorithms, and both captured and uncaptured execution. Every shape is run uncaptured once and captured once during plan construction; output bytes must match exactly before the graph executable is retained.
+
+### Rig and immutable inputs
+
+Measurements are labeled **dev-rig-4090** and are directional comparisons, not M1-equivalent results. The rig was idle before each timed process. Its fingerprint was RTX 4090 Ada, driver `595.71.05`, CUDA runtime reported by `nvidia-smi` `13.2`, CUDA toolkit `12.8.61`, rustc `1.97.0`, persistent mode enabled, and no compute processes. The timed rows sampled P0 after inference, 2700-2715 MHz SM clocks, and 76-136 W; the post-command utilization sample was 0-8% because it occurred after the synchronization boundary. The full `nvidia-smi -q`, compiler versions, source/binary hashes, and idle state are retained in `results/cuda-wave5/wave5-rig-fingerprint.txt`.
+
+The staged inputs were verified before use:
+
+| Input | SHA-256 |
+|---|---|
+| ModernBERT 400-row corpus | `b4ff00f6d2d9f0652146b7438c2ecd421746bcead466cccf18ec79e45ff79aa8` |
+| ModernBERT frozen ORT vectors | `d1fb6aaf48c36c8ed7b06b9c69e6244f01393e085d32f49b15194671f7a44000` |
+| Qwen3 400-row corpus | `5a9bfdc8c069657aa46cbb45bef91bc1a0ddc72602bfb96b189af31ba55f630c` |
+| Qwen3 frozen ORT vectors | `cacee1f64d12704ea94cded9861f6aef903a018800b2e0a1ec67589c33c7cf46` |
+
+### Implemented graph semantics
+
+ModernBERT has f32 and f16-storage/f32-accumulation paths. Both preserve the layer-0 attention-norm identity, dual-theta RoPE (`160000` global and `10000` local), global layers at indices divisible by three, inclusive local half-window 64, `gelu(first_half) * second_half` GeGLU ordering, final norm, CLS pooling, and L2 normalization. Global and local RoPE tables and the additive local band are precomputed per bucket. Norm parameters remain persistent fp32 allocations in both dtypes.
+
+Qwen3 uses f16 storage with fp32 accumulation and persistent fp32 RMSNorm parameters. It preserves 16 query heads, 8 KV heads, head-local q/k RMSNorm, theta `1000000` RoPE, causal and key-padding masks, SwiGLU, final RMSNorm, last-valid-token pooling, and L2 normalization. GQA stores KV once. Query heads are laid out as even/odd query-per-KV groups, then two cuBLASLt strided-batched calls each process `batch * 8` matrices while viewing the same KV storage. This is two group calls per attention class, not per-head fragmentation, and materializes no KV repeat (`kv_repeat_bytes=0`).
+
+The first Qwen bisection found rows `0..batch/2` at cosine `0.999996-0.999997` while later rows collapsed to a shared residual-only vector. The initial suspicion was the pointer-array broadcast experiment, but replacing it with the retained two-group strided path reproduced the split exactly. The actual defect was launch geometry: Qwen has query width 2048 but hidden width 1024, and the context-transpose kernel had been launched with hidden-width coverage. A 6/8/12-row differential made the exact half-coverage invariant visible. Launching over query-width elements fixed every row. The pointer-array experiment is not classified as a CUDA/driver failure because the corrected launch was not re-tested on that discarded branch.
+
+ModernBERT classification/reranking is intentionally not added to CUDA in this embedding-family wave. Embedding lookup, tokenizer work, CLS/last-token selection, and final L2 remain owned Rust operations, as on Metal; all encoder layers and final encoder norm are resident CUDA work.
+
+### 400-row parity
+
+All rows use bucket policy v1 and the same 4,000,000 attention-unit budget as the M1 evidence. Both required gates are enforced by the executable: cosine at least `0.9999` and mean top-10 overlap at least `0.995`.
+
+| Family | CUDA dtype | Corpus tokens | Mean cosine vs frozen ORT | Top-10 overlap | Gate |
+|---|---:|---:|---:|---:|---|
+| gte-modernbert | f32 correctness oracle | 62,838 | 0.9999999999966669 | 1.0000 | pass |
+| gte-modernbert | f16 serving | 62,838 | 0.9999985740871632 | 0.9975 | pass |
+| Qwen3-Embedding-0.6B | f16 serving | 46,716 | 0.9999978464874446 | 0.9975 | pass |
+
+The per-shape constructor logs asserted `captured_exact=true` for all ten buckets (`8x64` through `8x512`). Ignored, environment-gated regression tests make three calls through one context with A/B/A inputs and assert both A outputs are byte-identical while B differs. Both family tests passed on the rig.
+
+### Fresh-process throughput
+
+The 5x2 protocol used five new processes with graphs disabled and five with graphs enabled for each family at f16. Each row passed the parity gates; raw JSON and the P-state/power CSV are retained under `results/cuda-wave5/`.
+
+| Family | Graph mode | r1 | r2 | r3 | r4 | r5 | Mean tok/s | Median tok/s |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| gte-modernbert | off | 131,478.1 | 130,958.7 | 130,537.5 | 130,939.2 | 129,435.3 | 130,669.8 | 130,939.2 |
+| gte-modernbert | on | 132,777.0 | 131,773.3 | 132,620.0 | 134,308.1 | 132,835.9 | 132,862.9 | 132,777.0 |
+| Qwen3-Embedding-0.6B | off | 62,232.5 | 62,175.1 | 62,208.7 | 61,698.3 | 62,112.8 | 62,085.5 | 62,175.1 |
+| Qwen3-Embedding-0.6B | on | 63,712.1 | 63,085.5 | 63,828.8 | 63,695.8 | 63,113.2 | 63,487.1 | 63,695.8 |
+
+Graph capture improved the fresh-process mean by `1.68%` for ModernBERT and `2.26%` for Qwen3. A separate three-pass in-process graph run measured ModernBERT `132,619.5 / 133,825.3 / 132,876.4 tok/s` and Qwen3 `63,160.6 / 63,306.1 / 63,340.5 tok/s` for first/warm/steady. There is no meaningful warm drift after per-shape construction and capture.
+
+The available M1 documents report Metal fp32 first/warm numbers rather than an identical f16 protocol: ModernBERT `12,405.3 / 14,564.3 tok/s` and Qwen3 `3,935.1 / 4,473.3 tok/s`. The dev-rig-4090 graph means are therefore approximately `9.1x` the ModernBERT Metal warm number and `14.2x` the Qwen3 Metal warm number, but dtype, host, and power differ, so these ratios are directional only. No family-matched llama.cpp-CUDA 400-row baseline was present in the checked-in campaign artifacts; this wave does not invent one.
+
+### Stage profiles
+
+CUDA events surrounded each stage during the uncaptured constructor run for every bucket. The table sums all ten bucket profiles once; it is a cost-structure probe, not the timed corpus wall clock. Profile construction occurred after algorithms were selected and before capture.
+
+| Family | Projection + MLP GEMMs | Attention GEMMs | Mask + softmax | Norm/layout/activation | Final norm/output | Profile total |
+|---|---:|---:|---:|---:|---:|---:|
+| gte-modernbert f16 | 37.534 ms (12.33%) | 7.704 ms (2.53%) | 13.426 ms (4.41%) | 245.652 ms (80.69%) | 0.131 ms (0.04%) | 304.447 ms |
+| Qwen3 f16 | 128.446 ms (56.55%) | 18.390 ms (8.10%) | 17.472 ms (7.69%) | 62.662 ms (27.59%) | 0.149 ms (0.07%) | 227.119 ms |
+
+ModernBERT's measured cost is dominated by exact-erf GeGLU plus the numerous pre-norm/layout kernels; the additive local band itself stays inside the mask/softmax category and does not dominate. Qwen3 reverses the shape: its seven projections per layer dominate, while the two-group GQA products plus causal softmax account for `15.79%`. The Qwen attention share includes four strided-batched calls per layer (two qk and two pv) without KV-repeat traffic.
+
+### Reproduction commands
+
+The CUDA build and gates used:
+
+```sh
+source ~/.cargo/env
+export PATH=/usr/local/cuda/bin:$PATH CUDA_HOME=/usr/local/cuda
+cargo fmt --manifest-path bench/spikes/unified-rt/Cargo.toml -- --check
+cargo test --features cuda --manifest-path bench/spikes/unified-rt/Cargo.toml
+cargo clippy --features cuda --manifest-path bench/spikes/unified-rt/Cargo.toml -- -D warnings
+cargo build --release --features cuda --manifest-path bench/spikes/unified-rt/Cargo.toml
+```
+
+A parity/performance cell used the family model, corpus, and frozen reference listed above with:
+
+```sh
+until [ "$(nvidia-smi --query-gpu=utilization.gpu \
+  --format=csv,noheader,nounits)" -le 5 ]; do sleep 2; done
+./target/release/spike-unified-rt \
+  --model "$MODEL" --tokenizer "$MODEL/tokenizer.json" \
+  --corpus "$CORPUS" --reference "$REFERENCE" --limit 400 \
+  --out "$RESULT" --dtype "$DTYPE" --device cuda \
+  --cuda-graphs "$GRAPHS" --shapes bucketed
+nvidia-smi --query-gpu=pstate,power.draw,clocks.sm,utilization.gpu \
+  --format=csv,noheader
+```
+
+The in-process run added `--passes 3`. The environment-gated regression tests used `MODERNBERT_CUDA_MODEL=/work/model-gte` and `QWEN3_CUDA_MODEL=/work/model-qwen3` with their corresponding ignored test filters.

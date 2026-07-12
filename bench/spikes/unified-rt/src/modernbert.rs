@@ -218,7 +218,14 @@ impl ModernBertModel {
             });
         }
 
-        let classification_head = if let Some(pooling) = &config.classifier_pooling {
+        let has_classifier = tensors
+            .keys()
+            .any(|name| name == "classifier.weight" || name.ends_with(".classifier.weight"));
+        let classification_head = if let Some(pooling) = config
+            .classifier_pooling
+            .as_ref()
+            .filter(|_| has_classifier)
+        {
             ensure!(
                 pooling == "mean",
                 "unsupported ModernBERT classifier pooling {pooling}; rerank reference requires mean"
@@ -423,12 +430,12 @@ impl ModernBertModel {
         seq: usize,
     ) -> Result<Vec<f32>> {
         let mut current = self.initial_hidden(input_ids)?;
-        let mut metal_scores = None;
+        let mut accelerated_scores = None;
         let mut run = |context: &mut dyn Any| {
             let context = context
-                .downcast_mut::<MetalContext>()
+                .downcast_mut::<BlockContext>()
                 .context("ModernBERT provider returned the wrong block context type")?;
-            metal_scores = Some(context.forward_rerank(
+            accelerated_scores = Some(context.forward_rerank(
                 self,
                 head,
                 &mut current,
@@ -443,7 +450,8 @@ impl ModernBertModel {
             create_context: new_block_context,
             run: &mut run,
         })? {
-            return metal_scores.context("ModernBERT Metal rerank did not return scores");
+            return accelerated_scores
+                .context("ModernBERT accelerated rerank did not return scores");
         }
 
         self.forward_cpu(&mut current, attention_mask, batch, seq)?;
@@ -516,7 +524,7 @@ impl ModernBertModel {
 
         let mut run = |context: &mut dyn Any| {
             let context = context
-                .downcast_mut::<MetalContext>()
+                .downcast_mut::<BlockContext>()
                 .context("ModernBERT provider returned the wrong block context type")?;
             context.forward(self, &mut current, attention_mask, batch, seq)
         };
@@ -900,9 +908,96 @@ impl ModelFamily for ModernBertModel {
 fn new_block_context(
     precision: Precision,
     execution: MetalExecutionConfig,
-    _backend: BlockBackend,
+    backend: BlockBackend,
 ) -> Result<Box<dyn Any>> {
-    Ok(Box::new(MetalContext::new(precision, execution)?))
+    let backend = match backend {
+        BlockBackend::Metal => BlockContextBackend::Metal(MetalContext::new(precision, execution)?),
+        BlockBackend::Cuda { graphs } => BlockContextBackend::Cuda(
+            super::cuda_backend::ModernBertContext::new(graphs, precision)?,
+        ),
+    };
+    Ok(Box::new(BlockContext { backend }))
+}
+
+enum BlockContextBackend {
+    Metal(MetalContext),
+    Cuda(super::cuda_backend::ModernBertContext),
+}
+
+struct BlockContext {
+    backend: BlockContextBackend,
+}
+
+impl BlockContext {
+    fn forward(
+        &mut self,
+        model: &ModernBertModel,
+        hidden_states: &mut [f32],
+        attention_mask: &[u8],
+        batch: usize,
+        seq: usize,
+    ) -> Result<()> {
+        match &mut self.backend {
+            BlockContextBackend::Metal(context) => {
+                context.forward(model, hidden_states, attention_mask, batch, seq)
+            }
+            BlockContextBackend::Cuda(context) => {
+                let params = model
+                    .layers
+                    .iter()
+                    .map(|layer| super::cuda_backend::ModernBertLayerParams {
+                        qkv_weight: layer.qkv.weight.data.as_ptr(),
+                        attention_output_weight: layer.attention_output.weight.data.as_ptr(),
+                        attention_norm_weight: layer
+                            .attention_norm
+                            .as_ref()
+                            .map_or(std::ptr::null(), Vec::as_ptr),
+                        mlp_input_weight: layer.mlp_input.weight.data.as_ptr(),
+                        mlp_output_weight: layer.mlp_output.weight.data.as_ptr(),
+                        mlp_norm_weight: layer.mlp_norm.as_ptr(),
+                        attention_type: i32::from(matches!(
+                            layer.attention_type,
+                            AttentionType::Sliding
+                        )),
+                    })
+                    .collect::<Vec<_>>();
+                context.forward(
+                    hidden_states,
+                    attention_mask,
+                    batch,
+                    seq,
+                    model.config.hidden_size,
+                    model.config.num_attention_heads,
+                    model.config.intermediate_size,
+                    model.config.norm_eps,
+                    model.config.global_rope_theta,
+                    model.config.local_rope_theta,
+                    model.config.local_attention / 2,
+                    &params,
+                    &model.final_norm,
+                )
+            }
+        }
+    }
+
+    fn forward_rerank(
+        &mut self,
+        model: &ModernBertModel,
+        head: &ClassificationHead,
+        hidden_states: &mut [f32],
+        attention_mask: &[u8],
+        batch: usize,
+        seq: usize,
+    ) -> Result<Vec<f32>> {
+        match &mut self.backend {
+            BlockContextBackend::Metal(context) => {
+                context.forward_rerank(model, head, hidden_states, attention_mask, batch, seq)
+            }
+            BlockContextBackend::Cuda(_) => {
+                bail!("ModernBERT CUDA reranking is not part of the embedding-family path")
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1630,6 +1725,57 @@ mod tests {
                 "row {index} changed after repeated calls: cosine={similarity:.9}"
             );
         }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "cuda"))]
+    #[test]
+    #[ignore = "requires MODERNBERT_CUDA_MODEL"]
+    fn modernbert_cuda_static_feeds_survive_multiple_calls() {
+        let model_root = std::env::var("MODERNBERT_CUDA_MODEL")
+            .expect("set MODERNBERT_CUDA_MODEL to the model snapshot");
+        let model = ModernBertModel::load(Path::new(&model_root), Precision::F16)
+            .expect("load ModernBERT model");
+        let mut tokenizer = Tokenizer::from_file(Path::new(&model_root).join("tokenizer.json"))
+            .expect("load ModernBERT tokenizer");
+        model
+            .configure_tokenizer(&mut tokenizer, 512)
+            .expect("configure ModernBERT tokenizer");
+        let execution = super::super::MetalExecutionConfig {
+            execution: super::super::Execution::Explicit,
+            package_root: None,
+        };
+        let mut provider = super::super::CudaProvider::new(Precision::F16, execution, true)
+            .expect("CUDA provider");
+        let shape = Some(BatchShape { batch: 2, seq: 64 });
+        let first = model
+            .embed_batch(
+                &mut provider,
+                &tokenizer,
+                &["first document", "second document"],
+                shape,
+            )
+            .expect("first CUDA call");
+        let different = model
+            .embed_batch(
+                &mut provider,
+                &tokenizer,
+                &["unrelated text", "another sample"],
+                shape,
+            )
+            .expect("second CUDA call");
+        let repeated = model
+            .embed_batch(
+                &mut provider,
+                &tokenizer,
+                &["first document", "second document"],
+                shape,
+            )
+            .expect("third CUDA call");
+        assert_eq!(
+            first, repeated,
+            "repeated CUDA call changed persistent feeds"
+        );
+        assert_ne!(first, different, "distinct CUDA inputs reused stale output");
     }
 
     #[test]

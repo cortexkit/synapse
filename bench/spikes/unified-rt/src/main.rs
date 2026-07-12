@@ -1568,10 +1568,6 @@ struct CudaProvider {
 
 impl CudaProvider {
     fn new(dtype: Precision, execution: MetalExecutionConfig, graphs: bool) -> Result<Self> {
-        ensure!(
-            matches!(dtype, Precision::F16),
-            "CUDA day-1 supports only --dtype f16"
-        );
         cuda_backend::ensure_available()?;
         Ok(Self {
             block_contexts: HashMap::new(),
@@ -1585,9 +1581,9 @@ impl CudaProvider {
 impl KernelProvider for CudaProvider {
     fn name(&self) -> &'static str {
         if self.graphs {
-            "cuda-cublaslt-minilm-f16-graph"
+            "cuda-cublaslt-family-graph"
         } else {
-            "cuda-cublaslt-minilm-f16-uncaptured"
+            "cuda-cublaslt-family-uncaptured"
         }
     }
 
@@ -1601,15 +1597,10 @@ impl KernelProvider for CudaProvider {
         _b_layout: BLayout,
         _c: &mut [f32],
     ) -> Result<()> {
-        bail!("CUDA day-1 requires the MiniLM resident block path")
+        bail!("CUDA requires a family-resident block path")
     }
 
     fn block_forward(&mut self, request: BlockForwardRequest<'_>) -> Result<bool> {
-        ensure!(
-            request.family == "minilm",
-            "CUDA day-1 supports only MiniLM, got {}",
-            request.family
-        );
         if !self.block_contexts.contains_key(request.family) {
             let context = (request.create_context)(
                 self.dtype,
@@ -2824,6 +2815,10 @@ fn new_minilm_block_context(
             MiniLmBlockGraph::Metal(metal_backend::MpsGraphContext::new_with_config(execution)?)
         }
         BlockBackend::Cuda { graphs } => {
+            ensure!(
+                matches!(precision, Precision::F16),
+                "MiniLM CUDA requires --dtype f16"
+            );
             MiniLmBlockGraph::Cuda(cuda_backend::CudaContext::new(graphs)?)
         }
     };
