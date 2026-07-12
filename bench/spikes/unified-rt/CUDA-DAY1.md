@@ -160,3 +160,61 @@ The same command was run in five fresh processes per mode. Fingerprint commands 
   --dtype f16 --device cuda --cuda-graphs false
 # ERR_NVGPUCTRPERM: performance counters unavailable to the container
 ```
+
+
+## Wave 2: layout fusion
+
+Wave 2 executed the day-1 layout branch and pruned it. A transpose-equivalent column-major cuBLASLt descriptor made `CUBLASLT_EPILOGUE_BIAS` available for Q, K, and V while preserving physical BSH output. QK then consumed each BSH head through a strided batch, and PV used a matching output view to write context directly into BSH columns. The full candidate removed both explicit transpose kernels and reduced the fused arena for the largest corpus bucket from `427,867,360` to `316,703,968` bytes while preserving 256-byte slice alignment.
+
+The direct views had a cost: QK and PV could no longer flatten `batch * heads` into one strided batch because the BSH offset between the last head of one batch item and the first head of the next item is not constant. They therefore ran one `batch`-wide cuBLASLt call per head. Retained calls rose from 85 to 205 per bucket, and the stable event profile regressed. Per the decision tree, all source changes were reverted; the raw measurements remain as negative evidence.
+
+### Per-fusion runs
+
+Each graph mode below is a fresh 400-row process. CUDA-event values come from the graph-off process and sum the uncaptured construction profiles for the warmup and five corpus buckets. Every run was P2 with the 425 W software power cap active. Post-run clocks show why cross-process deltas are not by themselves retention evidence.
+
+| Candidate | Graph-off tok/s and state | Graph-on tok/s and state | Projection + MLP GEMMs | Attention GEMMs | Softmax | Pointwise + transposes | Pool | Device total | Result |
+|---|---|---|---:|---:|---:|---:|---:|---:|---|
+| Baseline | 399,500.1 — P2, 2190 MHz, 423.35 W | 596,299.9 — P2, 2790 MHz, 314.08 W | 29.543 ms | 20.808 ms | 22.452 ms | 18.942 ms | 0.150 ms | 91.895 ms | retained control |
+| QKV bias epilogue + direct BSH views | 424,940.4 — P2, 2580 MHz, 422.30 W | 573,456.7 — P2, 2790 MHz, 232.55 W | 32.154 ms | 25.790 ms | 22.059 ms | 10.774 ms | 0.147 ms | 90.924 ms | continue to context test |
+| Context-direct PV only | 424,556.1 — P2, 2280 MHz, 424.03 W | 418,536.7 — P2, 2250 MHz, 423.20 W | 23.009 ms | 30.584 ms | 15.296 ms | 18.779 ms | 0.149 ms | 87.817 ms | independent branch; per-head PV cost visible |
+| QKV + context direct views | 561,882.3 — P2, 2550 MHz, 422.52 W | 580,211.0 — P2, 2790 MHz, 185.95 W | 28.055 ms | 15.827 ms | 15.217 ms | 8.379 ms | 0.148 ms | 67.626 ms | recheck at stable clocks |
+
+All candidates passed the 400-row gate. The QKV and full-layout candidates produced mean cosine `0.9999996269` and mean top-10 overlap `0.999000`; the context-only candidate produced mean cosine `0.9999995934` and overlap `0.999250`. Every exact-shape construction printed `captured_exact=true`, graph-on and graph-off both completed, and `cmp` found their vector JSONL files byte-identical.
+
+The QKV bias descriptor selected the same algorithm ids and workspace sizes as the corresponding hidden-to-hidden GEMM for all six shapes. Capture therefore remained stable; no capture-contract blocker occurred. The first row-major bias descriptor had no supported CUDA 12.8 heuristic, so the measured candidate used the mathematically equivalent column-major transpose formulation.
+
+### Stable profile and retention decision
+
+The cap produced wide process-level variance even though every row remained P2. The retention comparison therefore uses two fast-clock CUDA-event profiles: the final reverted implementation's uncaptured profile from the graph-on process and the full candidate's `wave2-layout-fused-off-r6` profile. Both had 2790 MHz post-run SM clocks.
+
+| Stage | Retained baseline | Full layout candidate | Delta |
+|---|---:|---:|---:|
+| Projection + MLP GEMMs | 16.152 ms | 21.143 ms | +4.991 ms |
+| Attention QK + PV GEMMs | 6.388 ms | 8.670 ms | +2.282 ms |
+| Fused scale + mask + softmax | 9.345 ms | 9.000 ms | -0.345 ms |
+| Bias/GELU, residual/norm, layout kernels | 9.434 ms | 5.761 ms | -3.673 ms |
+| Mean pool + L2 | 0.131 ms | 0.133 ms | +0.002 ms |
+| **Profiled device total** | **41.450 ms** | **44.707 ms** | **+3.257 ms (+7.86%)** |
+
+The candidate removed `3.673 ms` of pointwise/layout work, but fragmenting QK/PV into per-head batches added `7.273 ms` to GEMM stages. The stable device total regressed `7.86%`, so both layout changes were reverted. The existing fused residual+bias+layer-normalization and bias+GELU chains were not changed because the profile gave no independent reason to split or rewrite them.
+
+### Retained throughput range
+
+The final source is byte-for-byte the day-1 CUDA implementation. The table includes five wave-2 fresh processes per mode; state was sampled immediately after each process. Low sampled power can mean the process had already completed, so SM clock and the active power-cap flag are more useful than the instantaneous wattage alone.
+
+| Repeat | Graph-off tok/s and state | Graph-on tok/s and state |
+|---:|---|---|
+| 1 | 399,500.1 — P2, 2190 MHz, 423.35 W | 596,299.9 — P2, 2790 MHz, 314.08 W |
+| 2 | 428,017.5 — P2, 2175 MHz, 423.83 W | 551,886.0 — P2, 2790 MHz, 130.89 W |
+| 3 | 567,336.9 — P2, 2790 MHz, 172.72 W | 563,667.5 — P2, 2790 MHz, 147.88 W |
+| 4 | 505,764.9 — P2, 2790 MHz, 133.37 W | 428,655.0 — P2, 2310 MHz, 352.65 W |
+| 5 | 591,995.8 — P2, 2790 MHz, 394.20 W | 464,831.9 — P2, 2790 MHz, 154.26 W |
+| **Range** | **399,500–591,996 tok/s** | **428,655–596,300 tok/s** |
+
+The full candidate's exploratory ranges were graph-off `472,415–599,246 tok/s` across six processes and graph-on `420,184–580,414 tok/s` across five. Every throughput sample, including its P-state, post-run SM clock, and power reading, is recorded in [`wave2-summary.json`](results/cuda-day1/wave2-summary.json). Because those ranges overlap and the board remained software-power-capped, they do not override the stable CUDA-event regression.
+
+### Wave-2 verdict
+
+Flash-attention promotion does **not** trigger. After reverting the failed layout branch, GEMMs again account for `54.4%` of the stable device profile, softmax/score traffic `22.5%`, pointwise plus transposes `22.8%`, and pooling `0.3%`. The next branch is GEMM layout and algorithm work: preserve a single `batch * heads` attention batch while eliminating layout traffic, likely through a genuinely fused projection/output path rather than per-head cuBLASLt views. Flash attention remains behind evidence that score/softmax traffic dominates after a non-regressing layout strategy.
+
+Raw `wave2-*.json` files, the machine-readable delta table, power annotations, and the updated rig fingerprint are in [`results/cuda-day1/`](results/cuda-day1/). Nsight Compute remains blocked by `ERR_NVGPUCTRPERM`; no counter-derived utilization claim is made.
