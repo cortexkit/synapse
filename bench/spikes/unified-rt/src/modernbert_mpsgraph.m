@@ -44,12 +44,21 @@ typedef struct ModernBertPlan {
     MPSGraphTensor *local_cos_tensor;
     MPSGraphTensor *local_sin_tensor;
     MPSGraphTensor *final_norm_tensor;
+    MPSGraphTensor *pooling_mask_tensor;
+    MPSGraphTensor *head_dense_tensor;
+    MPSGraphTensor *head_norm_tensor;
+    MPSGraphTensor *classifier_weight_tensor;
+    MPSGraphTensor *classifier_bias_tensor;
     MPSGraphTensor *output_tensor;
     MPSShape *hidden_shape;
     MPSShape *hidden_2d_shape;
     MPSShape *mask_shape;
     MPSShape *rope_shape;
     MPSShape *hidden_vector_shape;
+    MPSShape *pooling_mask_shape;
+    MPSShape *classifier_weight_shape;
+    MPSShape *classifier_bias_shape;
+    MPSShape *score_shape;
     MPSShape *qkv_weight_shape;
     MPSShape *hidden_weight_shape;
     MPSShape *mlp_input_weight_shape;
@@ -201,6 +210,11 @@ static void modernbert_plan_free(ModernBertPlan *plan) {
         free(plan->layers);
     }
     [plan->output_tensor release];
+    [plan->classifier_bias_tensor release];
+    [plan->classifier_weight_tensor release];
+    [plan->head_norm_tensor release];
+    [plan->head_dense_tensor release];
+    [plan->pooling_mask_tensor release];
     [plan->final_norm_tensor release];
     [plan->local_sin_tensor release];
     [plan->local_cos_tensor release];
@@ -213,6 +227,10 @@ static void modernbert_plan_free(ModernBertPlan *plan) {
     [plan->mlp_input_weight_shape release];
     [plan->hidden_weight_shape release];
     [plan->qkv_weight_shape release];
+    [plan->score_shape release];
+    [plan->classifier_bias_shape release];
+    [plan->classifier_weight_shape release];
+    [plan->pooling_mask_shape release];
     [plan->hidden_vector_shape release];
     [plan->rope_shape release];
     [plan->mask_shape release];
@@ -239,9 +257,10 @@ static NSString *modernbert_plan_key(
     uint64_t layer_count,
     float epsilon,
     uint64_t pattern,
-    int32_t dtype
+    int32_t dtype,
+    int32_t rerank
 ) {
-    return [NSString stringWithFormat:@"modernbert:%llu:%llu:%llu:%llu:%llu:%llu:%.9g:%llu:%d",
+    return [NSString stringWithFormat:@"modernbert:%llu:%llu:%llu:%llu:%llu:%llu:%.9g:%llu:%d:%d",
                                       (unsigned long long)batch,
                                       (unsigned long long)seq,
                                       (unsigned long long)hidden,
@@ -250,7 +269,8 @@ static NSString *modernbert_plan_key(
                                       (unsigned long long)layer_count,
                                       (double)epsilon,
                                       (unsigned long long)pattern,
-                                      dtype];
+                                      dtype,
+                                      rerank];
 }
 
 static ModernBertPlan *modernbert_plan_new(
@@ -262,7 +282,8 @@ static ModernBertPlan *modernbert_plan_new(
     uint64_t layer_count,
     float epsilon,
     const ModernBertLayerParams *params,
-    int32_t dtype
+    int32_t dtype,
+    int32_t rerank
 ) {
     ModernBertPlan *plan = (ModernBertPlan *)calloc(1, sizeof(ModernBertPlan));
     if (plan == NULL) {
@@ -278,6 +299,10 @@ static ModernBertPlan *modernbert_plan_new(
     plan->mask_shape = [@[ @(batch), @1, @(seq), @(seq) ] retain];
     plan->rope_shape = [@[ @1, @1, @(seq), @(head_dim) ] retain];
     plan->hidden_vector_shape = [@[ @(hidden) ] retain];
+    plan->pooling_mask_shape = [@[ @(batch), @(seq), @1 ] retain];
+    plan->classifier_weight_shape = [@[ @1, @(hidden) ] retain];
+    plan->classifier_bias_shape = [@[ @1 ] retain];
+    plan->score_shape = [@[ @(batch) ] retain];
     plan->qkv_weight_shape = [@[ @(3 * hidden), @(hidden) ] retain];
     plan->hidden_weight_shape = [@[ @(hidden), @(hidden) ] retain];
     plan->mlp_input_weight_shape = [@[ @(2 * intermediate), @(hidden) ] retain];
@@ -298,6 +323,13 @@ static ModernBertPlan *modernbert_plan_new(
     plan->local_cos_tensor = modernbert_placeholder(plan->graph, plan->rope_shape, MPSDataTypeFloat32, @"local_cos");
     plan->local_sin_tensor = modernbert_placeholder(plan->graph, plan->rope_shape, MPSDataTypeFloat32, @"local_sin");
     plan->final_norm_tensor = modernbert_placeholder(plan->graph, plan->hidden_vector_shape, MPSDataTypeFloat32, @"final_norm");
+    if (rerank) {
+        plan->pooling_mask_tensor = modernbert_placeholder(plan->graph, plan->pooling_mask_shape, MPSDataTypeFloat32, @"pooling_mask");
+        plan->head_dense_tensor = modernbert_placeholder(plan->graph, plan->hidden_weight_shape, MPSDataTypeFloat32, @"head_dense");
+        plan->head_norm_tensor = modernbert_placeholder(plan->graph, plan->hidden_vector_shape, MPSDataTypeFloat32, @"head_norm");
+        plan->classifier_weight_tensor = modernbert_placeholder(plan->graph, plan->classifier_weight_shape, MPSDataTypeFloat32, @"classifier_weight");
+        plan->classifier_bias_tensor = modernbert_placeholder(plan->graph, plan->classifier_bias_shape, MPSDataTypeFloat32, @"classifier_bias");
+    }
 
     MPSGraphTensor *x = [plan->graph reshapeTensor:plan->input_tensor withShape:plan->hidden_2d_shape name:nil];
     MPSShape *qkv_shape = @[ @(batch), @(seq), @3, @(heads), @(head_dim) ];
@@ -373,10 +405,31 @@ static ModernBertPlan *modernbert_plan_new(
     plan->debug_outputs = [debug_outputs copy];
     plan->debug_names = [debug_names copy];
     x = modernbert_layer_norm(plan->graph, x, plan->final_norm_tensor, rows, epsilon, data_type);
-    plan->output_tensor = [[plan->graph reshapeTensor:x withShape:plan->hidden_shape name:@"hidden_output"] retain];
+    if (rerank) {
+        MPSGraphTensor *hidden_3d = [plan->graph reshapeTensor:x withShape:plan->hidden_shape name:nil];
+        MPSGraphTensor *masked = [plan->graph multiplicationWithPrimaryTensor:hidden_3d secondaryTensor:plan->pooling_mask_tensor name:nil];
+        MPSGraphTensor *pooled = [plan->graph reductionSumWithTensor:masked axes:@[ @1 ] name:nil];
+        pooled = [plan->graph reshapeTensor:pooled withShape:@[ @(batch), @(hidden) ] name:nil];
+        MPSGraphTensor *counts = [plan->graph reductionSumWithTensor:plan->pooling_mask_tensor axes:@[ @1 ] name:nil];
+        counts = [plan->graph reshapeTensor:counts withShape:@[ @(batch), @1 ] name:nil];
+        MPSGraphTensor *one_count = [plan->graph constantWithScalar:1.0 dataType:MPSDataTypeFloat32];
+        counts = [plan->graph maximumWithPrimaryTensor:counts secondaryTensor:one_count name:nil];
+        pooled = [plan->graph divisionWithPrimaryTensor:pooled secondaryTensor:counts name:nil];
+        pooled = modernbert_linear(plan->graph, pooled, plan->head_dense_tensor, MPSDataTypeFloat32);
+        pooled = modernbert_gelu(plan->graph, pooled, MPSDataTypeFloat32);
+        pooled = modernbert_layer_norm(plan->graph, pooled, plan->head_norm_tensor, batch, epsilon, MPSDataTypeFloat32);
+        MPSGraphTensor *logits = modernbert_linear(plan->graph, pooled, plan->classifier_weight_tensor, MPSDataTypeFloat32);
+        logits = [plan->graph additionWithPrimaryTensor:logits secondaryTensor:plan->classifier_bias_tensor name:nil];
+        plan->output_tensor = [[plan->graph reshapeTensor:logits withShape:plan->score_shape name:@"rerank_scores"] retain];
+    } else {
+        plan->output_tensor = [[plan->graph reshapeTensor:x withShape:plan->hidden_shape name:@"hidden_output"] retain];
+    }
     if (plan->input_tensor == nil || plan->full_mask_tensor == nil || plan->local_mask_tensor == nil ||
         plan->global_cos_tensor == nil || plan->global_sin_tensor == nil || plan->local_cos_tensor == nil ||
-        plan->local_sin_tensor == nil || plan->final_norm_tensor == nil || plan->output_tensor == nil) {
+        plan->local_sin_tensor == nil || plan->final_norm_tensor == nil || plan->output_tensor == nil ||
+        (rerank && (plan->pooling_mask_tensor == nil || plan->head_dense_tensor == nil ||
+                    plan->head_norm_tensor == nil || plan->classifier_weight_tensor == nil ||
+                    plan->classifier_bias_tensor == nil))) {
         modernbert_plan_free(plan);
         modernbert_set_error("failed to construct ModernBERT MPSGraph plan");
         return NULL;
@@ -394,13 +447,14 @@ static ModernBertPlan *modernbert_get_plan(
     uint64_t layer_count,
     float epsilon,
     const ModernBertLayerParams *params,
-    int32_t dtype
+    int32_t dtype,
+    int32_t rerank
 ) {
     uint64_t pattern = modernbert_attention_pattern(params, layer_count);
-    NSString *key = modernbert_plan_key(batch, seq, hidden, heads, intermediate, layer_count, epsilon, pattern, dtype);
+    NSString *key = modernbert_plan_key(batch, seq, hidden, heads, intermediate, layer_count, epsilon, pattern, dtype, rerank);
     ModernBertPlan *cached = synapse_mps_cached_plan(&context->runtime, key);
     if (cached != NULL) return cached;
-    ModernBertPlan *plan = modernbert_plan_new(batch, seq, hidden, heads, intermediate, layer_count, epsilon, params, dtype);
+    ModernBertPlan *plan = modernbert_plan_new(batch, seq, hidden, heads, intermediate, layer_count, epsilon, params, dtype, rerank);
     if (plan != NULL) {
         synapse_mps_cache_plan(&context->runtime, key, plan);
     }
@@ -495,6 +549,12 @@ int32_t synapse_modernbert_mps_forward(
     const float *local_cos,
     const float *local_sin,
     const float *final_norm,
+    const float *pooling_mask,
+    const float *head_dense,
+    const float *head_norm,
+    const float *classifier_weight,
+    float classifier_bias,
+    int32_t rerank,
     const ModernBertLayerParams *params,
     void *output
 ) {
@@ -504,7 +564,8 @@ int32_t synapse_modernbert_mps_forward(
             ModernBertContext *context = (ModernBertContext *)raw_context;
             if (context == NULL || input == NULL || full_mask == NULL || local_mask == NULL ||
                 global_cos == NULL || global_sin == NULL || local_cos == NULL || local_sin == NULL ||
-                final_norm == NULL || params == NULL || output == NULL) {
+                final_norm == NULL || params == NULL || output == NULL ||
+                (rerank && (pooling_mask == NULL || head_dense == NULL || head_norm == NULL || classifier_weight == NULL))) {
                 modernbert_set_error("ModernBERT forward received a null pointer");
                 return -1;
             }
@@ -512,7 +573,7 @@ int32_t synapse_modernbert_mps_forward(
                 modernbert_set_error("ModernBERT forward received invalid dimensions");
                 return -2;
             }
-            ModernBertPlan *plan = modernbert_get_plan(context, batch, seq, hidden, heads, intermediate, layer_count, epsilon, params, dtype);
+            ModernBertPlan *plan = modernbert_get_plan(context, batch, seq, hidden, heads, intermediate, layer_count, epsilon, params, dtype, rerank);
             if (plan == NULL) {
                 return -3;
             }
@@ -539,8 +600,15 @@ int32_t synapse_modernbert_mps_forward(
             id<MTLBuffer> global_sin_buffer = [context->runtime.device newBufferWithBytes:global_sin length:rope_count * sizeof(float) options:MTLResourceStorageModeShared];
             id<MTLBuffer> local_cos_buffer = [context->runtime.device newBufferWithBytes:local_cos length:rope_count * sizeof(float) options:MTLResourceStorageModeShared];
             id<MTLBuffer> local_sin_buffer = [context->runtime.device newBufferWithBytes:local_sin length:rope_count * sizeof(float) options:MTLResourceStorageModeShared];
+            id<MTLBuffer> pooling_mask_buffer = nil;
+            id<MTLBuffer> classifier_bias_buffer = nil;
+            if (rerank) {
+                pooling_mask_buffer = [context->runtime.device newBufferWithBytes:pooling_mask length:(NSUInteger)(batch * seq) * sizeof(float) options:MTLResourceStorageModeShared];
+                classifier_bias_buffer = [context->runtime.device newBufferWithBytes:&classifier_bias length:sizeof(float) options:MTLResourceStorageModeShared];
+            }
             if (input_buffer == nil || full_mask_buffer == nil || local_mask_buffer == nil || global_cos_buffer == nil ||
-                global_sin_buffer == nil || local_cos_buffer == nil || local_sin_buffer == nil) {
+                global_sin_buffer == nil || local_cos_buffer == nil || local_sin_buffer == nil ||
+                (rerank && (pooling_mask_buffer == nil || classifier_bias_buffer == nil))) {
                 modernbert_set_error("failed to allocate ModernBERT dynamic Metal buffers");
                 return -4;
             }
@@ -554,6 +622,14 @@ int32_t synapse_modernbert_mps_forward(
                 modernbert_add_feed(feeds, plan->local_cos_tensor, plan->rope_shape, local_cos_buffer, MPSDataTypeFloat32) &&
                 modernbert_add_feed(feeds, plan->local_sin_tensor, plan->rope_shape, local_sin_buffer, MPSDataTypeFloat32) &&
                 modernbert_add_static_feed(context, feeds, plan->final_norm_tensor, plan->hidden_vector_shape, final_norm, (NSUInteger)hidden, MPSDataTypeFloat32);
+            if (feeds_ok && rerank) {
+                feeds_ok =
+                    modernbert_add_feed(feeds, plan->pooling_mask_tensor, plan->pooling_mask_shape, pooling_mask_buffer, MPSDataTypeFloat32) &&
+                    modernbert_add_static_feed(context, feeds, plan->head_dense_tensor, plan->hidden_weight_shape, head_dense, (NSUInteger)(hidden * hidden), MPSDataTypeFloat32) &&
+                    modernbert_add_static_feed(context, feeds, plan->head_norm_tensor, plan->hidden_vector_shape, head_norm, (NSUInteger)hidden, MPSDataTypeFloat32) &&
+                    modernbert_add_static_feed(context, feeds, plan->classifier_weight_tensor, plan->classifier_weight_shape, classifier_weight, (NSUInteger)hidden, MPSDataTypeFloat32) &&
+                    modernbert_add_feed(feeds, plan->classifier_bias_tensor, plan->classifier_bias_shape, classifier_bias_buffer, MPSDataTypeFloat32);
+            }
             for (uint64_t index = 0; feeds_ok && index < layer_count; index++) {
                 ModernBertLayerTensors *tensors = &plan->layers[index];
                 const ModernBertLayerParams *layer = &params[index];
@@ -623,6 +699,8 @@ int32_t synapse_modernbert_mps_forward(
             [global_sin_buffer release];
             [local_cos_buffer release];
             [local_sin_buffer release];
+            [pooling_mask_buffer release];
+            [classifier_bias_buffer release];
             return status;
         } @catch (NSException *exception) {
             modernbert_set_ns_error(exception.reason);
