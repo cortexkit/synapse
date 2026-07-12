@@ -12,8 +12,9 @@ use serde::Deserialize;
 use tokenizers::Tokenizer;
 
 use super::{
-    get_tensor, load_safetensor_map, normalize_l2, resolve_model_root, BLayout, BlockBackend,
-    BlockForwardRequest, KernelProvider, MetalExecutionConfig, ModelFamily, Precision, Tensor,
+    get_tensor, load_safetensor_map, normalize_l2, resolve_model_root, BLayout, BatchShape,
+    BlockBackend, BlockForwardRequest, KernelProvider, MetalExecutionConfig, ModelFamily,
+    Precision, Tensor,
 };
 
 #[derive(Debug, Deserialize)]
@@ -189,22 +190,37 @@ impl Model {
         tokenizer: &Tokenizer,
         texts: &[&str],
         max_length: usize,
+        shape: Option<BatchShape>,
     ) -> Result<Vec<Vec<f32>>> {
         let ids = texts
             .iter()
             .map(|text| self.encode(tokenizer, text, max_length))
             .collect::<Result<Vec<_>>>()?;
-        self.embed_ids(provider, &ids)
+        self.embed_ids(provider, &ids, shape)
     }
 
     fn embed_ids(
         &self,
         provider: &mut dyn KernelProvider,
         sequences: &[Vec<u32>],
+        shape: Option<BatchShape>,
     ) -> Result<Vec<Vec<f32>>> {
-        let batch = sequences.len();
-        ensure!(batch > 0, "Qwen3 batch must not be empty");
-        let seq = sequences.iter().map(Vec::len).max().unwrap_or(1).max(1);
+        let real_batch = sequences.len();
+        ensure!(real_batch > 0, "Qwen3 batch must not be empty");
+        let real_seq = sequences.iter().map(Vec::len).max().unwrap_or(1).max(1);
+        let target = shape.unwrap_or(BatchShape {
+            batch: real_batch,
+            seq: real_seq,
+        });
+        ensure!(
+            target.batch >= real_batch && target.seq >= real_seq,
+            "Qwen3 target shape {}x{} does not cover input {}x{}",
+            target.batch,
+            target.seq,
+            real_batch,
+            real_seq
+        );
+        let (batch, seq) = (target.batch, target.seq);
         let hidden = self.config.hidden_size;
         let mut hidden_states = vec![0.0f32; batch * seq * hidden];
         let mut attention_mask = vec![0u8; batch * seq];
@@ -259,13 +275,9 @@ impl Model {
                 &self.final_norm,
             )?;
         }
-        Ok(last_token_pool_l2(
-            &hidden_states,
-            &attention_mask,
-            batch,
-            seq,
-            hidden,
-        ))
+        let mut pooled = last_token_pool_l2(&hidden_states, &attention_mask, batch, seq, hidden);
+        pooled.truncate(real_batch);
+        Ok(pooled)
     }
 
     pub(crate) fn default_label(&self, precision: super::Precision) -> String {
@@ -298,8 +310,9 @@ impl ModelFamily for Model {
         tokenizer: &Tokenizer,
         texts: &[&str],
         max_length: usize,
+        shape: Option<BatchShape>,
     ) -> Result<Vec<Vec<f32>>> {
-        Model::embed_batch(self, provider, tokenizer, texts, max_length)
+        Model::embed_batch(self, provider, tokenizer, texts, max_length, shape)
     }
 
     fn default_label(&self, precision: Precision) -> String {

@@ -8,7 +8,7 @@ use std::time::Instant;
 use anyhow::{bail, ensure, Context, Result};
 use clap::{Parser, ValueEnum};
 use safetensors::tensor::{Dtype as SafeDtype, SafeTensors};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use synapse_bench::{
     parity::{load_corpus, load_reference, mean_parity, rank_overlap, Chunk},
     results::LaneResult,
@@ -70,6 +70,12 @@ struct Args {
     /// Greedy attention-unit budget per batch.
     #[arg(long, default_value_t = 4_000_000)]
     attention_units: usize,
+    /// Shape policy used by the serving runner.
+    #[arg(long, value_enum, default_value_t = Shapes::Bucketed)]
+    shapes: Shapes,
+    /// Number of in-process corpus passes.
+    #[arg(long, default_value_t = 1)]
+    passes: usize,
     /// Optional model label for the result.
     #[arg(long)]
     model_label: Option<String>,
@@ -94,7 +100,71 @@ enum Execution {
     Lazy,
 }
 
+#[derive(Copy, Clone, Eq, PartialEq, Debug, ValueEnum, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum Shapes {
+    Exact,
+    Bucketed,
+}
+
 const GRAPH_REVISION: u32 = 2;
+const BUCKET_POLICY_VERSION: u32 = 1;
+const BUCKET_MAX_BATCH_ROWS: usize = 8;
+const BUCKET_SEQUENCE_LADDER: &[usize] = &[64, 96, 128, 160, 192, 256, 320, 384, 448, 512];
+const MAX_LARGE_CORPUS_RANK_QUERIES: usize = 100;
+
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+struct BatchShape {
+    batch: usize,
+    seq: usize,
+}
+
+#[derive(Clone, Debug)]
+struct PlannedBatch {
+    range: std::ops::Range<usize>,
+    shape: BatchShape,
+}
+
+struct WorkloadResult {
+    infer_wall_s: f64,
+    input_tokens: u64,
+    padded_tokens: u64,
+    produced_vectors: Vec<(String, Vec<f32>)>,
+}
+
+#[derive(Serialize)]
+struct PassResult {
+    pass: usize,
+    label: &'static str,
+    infer_wall_s: f64,
+    input_tokens: u64,
+    padded_tokens: u64,
+    padding_waste_fraction: f64,
+    tok_per_s: f64,
+    items: u64,
+    parity_mean_cosine: Option<f64>,
+    top10_rank_overlap: Option<f64>,
+}
+
+#[derive(Default, Serialize)]
+struct PackageCacheStats {
+    package_count: usize,
+    package_bytes: u64,
+}
+
+#[derive(Serialize)]
+struct ServingResult {
+    #[serde(flatten)]
+    lane: LaneResult,
+    shape_policy: Shapes,
+    bucket_policy_version: Option<u32>,
+    bucket_shapes: Vec<BatchShape>,
+    real_tokens: u64,
+    padded_tokens: u64,
+    padding_waste_fraction: f64,
+    package_cache: PackageCacheStats,
+    passes: Vec<PassResult>,
+}
 
 #[derive(Clone, Debug)]
 struct MetalExecutionConfig {
@@ -120,8 +190,9 @@ impl MetalExecutionConfig {
                 .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
                 .filter(|build| !build.is_empty())
                 .unwrap_or_else(|| "unknown-os-build".to_owned());
+            let shape_key = shape_cache_key(args.shapes);
             root.join(format!(
-                "{family}-graph-v{GRAPH_REVISION}-{:016x}-{}-{os_build}",
+                "{family}-graph-v{GRAPH_REVISION}-{shape_key}-{:016x}-{}-{os_build}",
                 hash,
                 args.dtype.as_str()
             ))
@@ -144,6 +215,13 @@ impl MetalExecutionConfig {
     }
 }
 
+fn shape_cache_key(shapes: Shapes) -> String {
+    match shapes {
+        Shapes::Exact => "shapes-exact".to_owned(),
+        Shapes::Bucketed => format!("bucket-policy-v{BUCKET_POLICY_VERSION}"),
+    }
+}
+
 impl Precision {
     fn as_str(self) -> &'static str {
         match self {
@@ -155,6 +233,12 @@ impl Precision {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    ensure!(args.passes > 0, "--passes must be at least one");
+    ensure!(args.max_length > 0, "--max-length must be at least one");
+    ensure!(
+        args.attention_units >= args.max_length.saturating_mul(args.max_length),
+        "--attention-units must fit at least one max-length sequence"
+    );
     ensure!(
         !(matches!(args.device, DeviceArg::Cpu) && matches!(args.dtype, Precision::F16)),
         "cpu + f16 is not supported for this spike; use --dtype f32 on cpu"
@@ -166,114 +250,206 @@ fn main() -> Result<()> {
         .map_err(|error| anyhow::anyhow!("tokenizer: {error}"))?;
     model.configure_tokenizer(&mut tokenizer, args.max_length)?;
 
+    let bucket_shapes = bucket_shapes(args.max_length, args.attention_units);
+    ensure!(
+        args.shapes != Shapes::Bucketed || bucket_shapes.len() <= 12,
+        "bucket policy produced {} shapes; serving limit is 12",
+        bucket_shapes.len()
+    );
     let execution = MetalExecutionConfig::from_args(&args, model.family_name())?;
-    let mut provider = make_provider(args.device, args.dtype, execution, args.cuda_graphs)?;
-    let _ = model.embed_batch(provider.as_mut(), &tokenizer, &["warmup"], args.max_length)?;
+    let mut provider = make_provider(args.device, args.dtype, execution.clone(), args.cuda_graphs)?;
+    let accelerator = matches!(args.device, DeviceArg::Metal | DeviceArg::Cuda);
+    if args.shapes == Shapes::Bucketed && accelerator {
+        for &shape in &bucket_shapes {
+            let _ = model.embed_batch(
+                provider.as_mut(),
+                &tokenizer,
+                &["bucket preload"],
+                args.max_length,
+                Some(shape),
+            )?;
+        }
+    } else {
+        let _ = model.embed_batch(
+            provider.as_mut(),
+            &tokenizer,
+            &["warmup"],
+            args.max_length,
+            None,
+        )?;
+    }
     let initial_cold_load_s = started.elapsed().as_secs_f64();
 
     let chunks: Vec<Chunk> = load_corpus(&args.corpus, args.limit)?;
+    ensure!(!chunks.is_empty(), "corpus must contain at least one row");
     let lengths = chunks
         .iter()
         .map(|chunk| model.token_length(&tokenizer, &chunk.text, args.max_length))
         .collect::<Result<Vec<_>>>()?;
+    ensure!(
+        lengths.iter().all(|&length| length <= args.max_length),
+        "tokenizer returned a sequence longer than --max-length"
+    );
 
     let mut order: Vec<usize> = (0..chunks.len()).collect();
     order.sort_by_key(|&index| lengths[index]);
-    let batch_ranges = batch_ranges(&order, &lengths, args.attention_units);
-    if provider.eager_shape_preload() {
-        for range in &batch_ranges {
-            let texts = order[range.clone()]
+    let batches = planned_batches(
+        &order,
+        &lengths,
+        args.attention_units,
+        args.shapes,
+        &bucket_shapes,
+    );
+    if args.shapes == Shapes::Exact && provider.eager_shape_preload() {
+        for batch in &batches {
+            let texts = order[batch.range.clone()]
                 .iter()
                 .map(|&index| chunks[index].text.as_str())
                 .collect::<Vec<_>>();
-            let _ = model.embed_batch(provider.as_mut(), &tokenizer, &texts, args.max_length)?;
+            let _ =
+                model.embed_batch(provider.as_mut(), &tokenizer, &texts, args.max_length, None)?;
         }
     }
-    let cold_load_s = if provider.eager_shape_preload() {
+    let cold_load_s = if args.shapes == Shapes::Bucketed && accelerator
+        || args.shapes == Shapes::Exact && provider.eager_shape_preload()
+    {
         started.elapsed().as_secs_f64()
     } else {
         initial_cold_load_s
     };
 
-    let infer_started = Instant::now();
-    let mut input_tokens = 0u64;
-    let mut items = 0u64;
-    let mut produced_vectors: Vec<(String, Vec<f32>)> = Vec::with_capacity(chunks.len());
-
-    for range in batch_ranges {
-        let batch_indices = &order[range];
-        let batch_texts = batch_indices
-            .iter()
-            .map(|&index| chunks[index].text.as_str())
-            .collect::<Vec<_>>();
-        let vectors =
-            model.embed_batch(provider.as_mut(), &tokenizer, &batch_texts, args.max_length)?;
-        for (offset, vector) in vectors.into_iter().enumerate() {
-            let original_index = batch_indices[offset];
-            input_tokens += lengths[original_index] as u64;
-            items += 1;
-            produced_vectors.push((chunks[original_index].id.clone(), vector));
+    let reference = args
+        .reference
+        .as_ref()
+        .map(|path| load_reference(path))
+        .transpose()?;
+    let mut passes = Vec::with_capacity(args.passes);
+    let mut final_vectors = Vec::new();
+    for pass in 0..args.passes {
+        let workload = run_workload(
+            model.as_ref(),
+            provider.as_mut(),
+            &tokenizer,
+            &chunks,
+            &lengths,
+            &order,
+            &batches,
+            args.max_length,
+            args.shapes,
+        )?;
+        let (parity_mean_cosine, top10_rank_overlap) = match &reference {
+            Some(reference) => {
+                let (mean, matched) = mean_parity(
+                    workload
+                        .produced_vectors
+                        .iter()
+                        .map(|(id, vector)| (id.clone(), vector.clone())),
+                    reference,
+                );
+                let mean = mean.context("no overlapping ids with parity reference")?;
+                model.validate_reference_coverage(matched, workload.produced_vectors.len())?;
+                let produced: HashMap<String, Vec<f32>> =
+                    workload.produced_vectors.iter().cloned().collect();
+                let rank_stride = if produced.len() > 1_000 {
+                    produced.len().div_ceil(MAX_LARGE_CORPUS_RANK_QUERIES)
+                } else {
+                    1
+                };
+                let ranks = rank_overlap(&produced, reference, 10, rank_stride)?;
+                enforce_parity_gates(
+                    mean,
+                    ranks.mean_topk_overlap,
+                    args.min_parity,
+                    args.min_rank_overlap,
+                    matched,
+                    ranks.queries,
+                )?;
+                eprintln!(
+                    "pass {} parity gate: mean cosine {mean:.8}, top-10 rank overlap {:.6}",
+                    pass + 1,
+                    ranks.mean_topk_overlap
+                );
+                (Some(mean), Some(ranks.mean_topk_overlap))
+            }
+            None => (None, None),
+        };
+        let padding_waste_fraction =
+            padding_waste_fraction(workload.input_tokens, workload.padded_tokens);
+        if args.shapes == Shapes::Bucketed {
+            ensure!(
+                padding_waste_fraction < 0.15,
+                "bucket padding waste {:.2}% exceeds the 15% serving gate",
+                padding_waste_fraction * 100.0
+            );
         }
+        passes.push(PassResult {
+            pass: pass + 1,
+            label: pass_label(pass, args.passes),
+            infer_wall_s: workload.infer_wall_s,
+            input_tokens: workload.input_tokens,
+            padded_tokens: workload.padded_tokens,
+            padding_waste_fraction,
+            tok_per_s: workload.input_tokens as f64 / workload.infer_wall_s,
+            items: workload.produced_vectors.len() as u64,
+            parity_mean_cosine,
+            top10_rank_overlap,
+        });
+        final_vectors = workload.produced_vectors;
     }
-    let infer_wall_s = infer_started.elapsed().as_secs_f64();
 
     if let Some(path) = &args.vectors_out {
-        write_vectors(path, &produced_vectors)?;
+        write_vectors(path, &final_vectors)?;
     }
 
-    let parity_mean_cosine = match &args.reference {
-        Some(path) => {
-            let reference = load_reference(path)?;
-            let (mean, matched) = mean_parity(
-                produced_vectors
-                    .iter()
-                    .map(|(id, vector)| (id.clone(), vector.clone())),
-                &reference,
-            );
-            let mean = mean.context("no overlapping ids with parity reference")?;
-            model.validate_reference_coverage(matched, produced_vectors.len())?;
-            let produced: HashMap<String, Vec<f32>> = produced_vectors.iter().cloned().collect();
-            let ranks = rank_overlap(&produced, &reference, 10, 1)?;
-            enforce_parity_gates(
-                mean,
-                ranks.mean_topk_overlap,
-                args.min_parity,
-                args.min_rank_overlap,
-                matched,
-                ranks.queries,
-            )?;
-            eprintln!(
-                "parity gate: mean cosine {mean:.8}, top-10 rank overlap {:.6}",
-                ranks.mean_topk_overlap
-            );
-            Some(mean)
-        }
-        None => None,
-    };
-
-    let result = LaneResult {
+    let last = passes.last().context("at least one pass is required")?;
+    let lane = LaneResult {
         lane: format!("owned-rt-{}", provider.name()),
         workload: "embed-corpus-v1".into(),
         model: args
             .model_label
             .unwrap_or_else(|| model.default_label(args.dtype)),
         cold_load_s,
-        infer_wall_s,
-        input_tokens,
-        tok_per_s: input_tokens as f64 / infer_wall_s,
-        items,
-        parity_mean_cosine,
+        infer_wall_s: last.infer_wall_s,
+        input_tokens: last.input_tokens,
+        tok_per_s: last.tok_per_s,
+        items: last.items,
+        parity_mean_cosine: last.parity_mean_cosine,
         self_peak_rss_bytes: None,
         notes: format!(
-            "{}, provider={}, dtype={}, execution={:?}, package_cache={}, length-sorted attention_units={}, max_len={}; providers may override the model-family block; Metal uses one resident MPSGraph and CUDA one stable-address graph instance per exact batch shape",
+            "{}, provider={}, dtype={}, execution={:?}, package_cache={}, shapes={:?}, policy_version={}, passes={}, length-sorted attention_units={}, max_len={}; {}",
             model.notes(),
             provider.name(),
             args.dtype.as_str(),
             args.execution,
             args.package_cache.as_ref().map_or("disabled".into(), |path| path.display().to_string()),
+            args.shapes,
+            if args.shapes == Shapes::Bucketed { BUCKET_POLICY_VERSION.to_string() } else { "none".to_owned() },
+            args.passes,
             args.attention_units,
-            args.max_length
+            args.max_length,
+            match (args.shapes, accelerator) {
+                (Shapes::Bucketed, true) => {
+                    "all bucket shapes were pre-discovered before inference"
+                }
+                (Shapes::Bucketed, false) => "CPU execution uses bucket padding without accelerator pre-discovery",
+                (Shapes::Exact, _) => "exact shapes retain the prior A/B behavior",
+            }
         ),
+    };
+    let result = ServingResult {
+        real_tokens: last.input_tokens,
+        padded_tokens: last.padded_tokens,
+        padding_waste_fraction: last.padding_waste_fraction,
+        shape_policy: args.shapes,
+        bucket_policy_version: (args.shapes == Shapes::Bucketed).then_some(BUCKET_POLICY_VERSION),
+        bucket_shapes: if args.shapes == Shapes::Bucketed {
+            bucket_shapes
+        } else {
+            Vec::new()
+        },
+        package_cache: package_cache_stats(execution.package_root.as_deref())?,
+        lane,
+        passes,
     };
 
     if let Some(parent) = args.out.parent() {
@@ -281,8 +457,13 @@ fn main() -> Result<()> {
     }
     fs::write(&args.out, serde_json::to_string_pretty(&result)?)?;
     eprintln!(
-        "{}: {} items, {} tokens, {:.1} tok/s, parity {:?}",
-        result.lane, result.items, result.input_tokens, result.tok_per_s, result.parity_mean_cosine
+        "{}: {} items, {} real / {} padded tokens, {:.1} tok/s, parity {:?}",
+        result.lane.lane,
+        result.lane.items,
+        result.real_tokens,
+        result.padded_tokens,
+        result.lane.tok_per_s,
+        result.lane.parity_mean_cosine
     );
     println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
@@ -317,6 +498,7 @@ trait ModelFamily {
     fn family_name(&self) -> &'static str;
 
     fn configure_tokenizer(&self, tokenizer: &mut Tokenizer, max_length: usize) -> Result<()> {
+        tokenizer.with_padding(None);
         tokenizer
             .with_truncation(Some(TruncationParams {
                 max_length,
@@ -334,6 +516,7 @@ trait ModelFamily {
         tokenizer: &Tokenizer,
         texts: &[&str],
         max_length: usize,
+        shape: Option<BatchShape>,
     ) -> Result<Vec<Vec<f32>>>;
 
     fn validate_reference_coverage(&self, _matched: usize, _produced: usize) -> Result<()> {
@@ -395,7 +578,33 @@ fn make_provider(
     }
 }
 
-fn batch_ranges(
+fn bucket_shapes(max_length: usize, attention_units: usize) -> Vec<BatchShape> {
+    let mut sequence_lengths = BUCKET_SEQUENCE_LADDER
+        .iter()
+        .copied()
+        .take_while(|&seq| seq < max_length)
+        .collect::<Vec<_>>();
+    sequence_lengths.push(max_length);
+    sequence_lengths.sort_unstable();
+    sequence_lengths.dedup();
+    sequence_lengths
+        .into_iter()
+        .map(|seq| BatchShape {
+            batch: BUCKET_MAX_BATCH_ROWS.min((attention_units / seq.saturating_mul(seq)).max(1)),
+            seq,
+        })
+        .collect()
+}
+
+fn covering_bucket(length: usize, buckets: &[BatchShape]) -> BatchShape {
+    buckets
+        .iter()
+        .copied()
+        .find(|shape| shape.seq >= length)
+        .expect("bucket policy is capped by max_length")
+}
+
+fn exact_batch_ranges(
     order: &[usize],
     lengths: &[usize],
     attention_units: usize,
@@ -417,6 +626,151 @@ fn batch_ranges(
         ranges.push(start..order.len());
     }
     ranges
+}
+
+fn planned_batches(
+    order: &[usize],
+    lengths: &[usize],
+    attention_units: usize,
+    shapes: Shapes,
+    buckets: &[BatchShape],
+) -> Vec<PlannedBatch> {
+    if shapes == Shapes::Exact {
+        let ranges = exact_batch_ranges(order, lengths, attention_units);
+        return ranges
+            .into_iter()
+            .map(|range| {
+                let shape = BatchShape {
+                    batch: range.len(),
+                    seq: order[range.clone()]
+                        .iter()
+                        .map(|&index| lengths[index])
+                        .max()
+                        .unwrap_or(1),
+                };
+                PlannedBatch { range, shape }
+            })
+            .collect();
+    }
+
+    let mut batches = Vec::new();
+    let mut start = 0usize;
+    while start < order.len() {
+        let mut end = start;
+        while end < order.len() {
+            let bucket = covering_bucket(lengths[order[end]], buckets);
+            if end - start + 1 > bucket.batch {
+                break;
+            }
+            end += 1;
+        }
+        let shape = covering_bucket(lengths[order[end - 1]], buckets);
+        batches.push(PlannedBatch {
+            range: start..end,
+            shape,
+        });
+        start = end;
+    }
+    batches
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_workload(
+    model: &dyn ModelFamily,
+    provider: &mut dyn KernelProvider,
+    tokenizer: &Tokenizer,
+    chunks: &[Chunk],
+    lengths: &[usize],
+    order: &[usize],
+    batches: &[PlannedBatch],
+    max_length: usize,
+    shapes: Shapes,
+) -> Result<WorkloadResult> {
+    let started = Instant::now();
+    let mut input_tokens = 0u64;
+    let mut padded_tokens = 0u64;
+    let mut produced_vectors = Vec::with_capacity(chunks.len());
+    for batch in batches {
+        let batch_indices = &order[batch.range.clone()];
+        let batch_texts = batch_indices
+            .iter()
+            .map(|&index| chunks[index].text.as_str())
+            .collect::<Vec<_>>();
+        let vectors = model.embed_batch(
+            provider,
+            tokenizer,
+            &batch_texts,
+            max_length,
+            (shapes == Shapes::Bucketed).then_some(batch.shape),
+        )?;
+        ensure!(
+            vectors.len() == batch_indices.len(),
+            "model returned {} vectors for {} real bucket rows",
+            vectors.len(),
+            batch_indices.len()
+        );
+        padded_tokens += (batch.shape.batch * batch.shape.seq) as u64;
+        for (offset, vector) in vectors.into_iter().enumerate() {
+            let original_index = batch_indices[offset];
+            input_tokens += lengths[original_index] as u64;
+            produced_vectors.push((chunks[original_index].id.clone(), vector));
+        }
+    }
+    Ok(WorkloadResult {
+        infer_wall_s: started.elapsed().as_secs_f64(),
+        input_tokens,
+        padded_tokens,
+        produced_vectors,
+    })
+}
+
+fn pass_label(pass: usize, passes: usize) -> &'static str {
+    if pass == 0 {
+        "first"
+    } else if pass + 1 == passes && passes > 2 {
+        "steady"
+    } else {
+        "warm"
+    }
+}
+
+fn padding_waste_fraction(real_tokens: u64, padded_tokens: u64) -> f64 {
+    if padded_tokens == 0 {
+        0.0
+    } else {
+        padded_tokens.saturating_sub(real_tokens) as f64 / padded_tokens as f64
+    }
+}
+
+fn package_cache_stats(root: Option<&Path>) -> Result<PackageCacheStats> {
+    fn directory_bytes(path: &Path) -> Result<u64> {
+        let mut bytes = 0u64;
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            let metadata = entry.metadata()?;
+            if metadata.is_dir() {
+                bytes += directory_bytes(&entry.path())?;
+            } else {
+                bytes += metadata.len();
+            }
+        }
+        Ok(bytes)
+    }
+
+    let Some(root) = root else {
+        return Ok(PackageCacheStats::default());
+    };
+    let mut stats = PackageCacheStats::default();
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir()
+            && entry.path().extension().and_then(|value| value.to_str()) == Some("mpsgraphpackage")
+        {
+            stats.package_count += 1;
+            stats.package_bytes += directory_bytes(&entry.path())?;
+        }
+    }
+    Ok(stats)
 }
 
 fn write_vectors(path: &Path, vectors: &[(String, Vec<f32>)]) -> Result<()> {
@@ -1488,6 +1842,8 @@ struct BertConfig {
     layer_norm_eps: f32,
     #[serde(default = "default_hidden_act")]
     hidden_act: String,
+    #[serde(default)]
+    pad_token_id: u32,
 }
 
 fn default_type_vocab_size() -> usize {
@@ -1665,18 +2021,33 @@ impl BertModel {
         provider: &mut dyn KernelProvider,
         tokenizer: &Tokenizer,
         texts: &[&str],
+        shape: Option<BatchShape>,
     ) -> Result<Vec<Vec<f32>>> {
         let encodings = tokenizer
             .encode_batch(texts.to_vec(), true)
             .map_err(|error| anyhow::anyhow!("encode_batch: {error}"))?;
-        let batch = encodings.len();
-        let seq = encodings
+        let real_batch = encodings.len();
+        ensure!(real_batch > 0, "MiniLM batch must not be empty");
+        let real_seq = encodings
             .iter()
             .map(|encoding| encoding.get_ids().len())
             .max()
             .unwrap_or(1)
             .max(1);
-        let mut input_ids = vec![0u32; batch * seq];
+        let target = shape.unwrap_or(BatchShape {
+            batch: real_batch,
+            seq: real_seq,
+        });
+        ensure!(
+            target.batch >= real_batch && target.seq >= real_seq,
+            "MiniLM target shape {}x{} does not cover input {}x{}",
+            target.batch,
+            target.seq,
+            real_batch,
+            real_seq
+        );
+        let (batch, seq) = (target.batch, target.seq);
+        let mut input_ids = vec![self.config.pad_token_id; batch * seq];
         let mut attention_mask = vec![0u8; batch * seq];
         for (row, encoding) in encodings.iter().enumerate() {
             for (col, (&id, &mask)) in encoding
@@ -1691,7 +2062,7 @@ impl BertModel {
         }
 
         let hidden = self.forward(provider, &input_ids, &attention_mask, batch, seq)?;
-        if let Some(pooled) = provider.take_pooled_output() {
+        if let Some(mut pooled) = provider.take_pooled_output() {
             ensure!(
                 pooled.len() == batch
                     && pooled
@@ -1699,15 +2070,18 @@ impl BertModel {
                         .all(|row| row.len() == self.config.hidden_size),
                 "provider returned pooled vectors with the wrong shape"
             );
+            pooled.truncate(real_batch);
             return Ok(pooled);
         }
-        Ok(mean_pool_l2(
+        let mut pooled = mean_pool_l2(
             &hidden,
             &attention_mask,
             batch,
             seq,
             self.config.hidden_size,
-        ))
+        );
+        pooled.truncate(real_batch);
+        Ok(pooled)
     }
 
     fn forward(
@@ -1811,8 +2185,9 @@ impl ModelFamily for BertModel {
         tokenizer: &Tokenizer,
         texts: &[&str],
         _max_length: usize,
+        shape: Option<BatchShape>,
     ) -> Result<Vec<Vec<f32>>> {
-        self.embed_batch(provider, tokenizer, texts)
+        self.embed_batch(provider, tokenizer, texts, shape)
     }
 
     fn default_label(&self, precision: Precision) -> String {
@@ -2306,9 +2681,52 @@ mod tests {
         ];
         let default = Args::try_parse_from(base).expect("parse default serving arguments");
         assert_eq!(default.execution, Execution::Explicit);
+        assert_eq!(default.shapes, Shapes::Bucketed);
+        assert_eq!(default.passes, 1);
         let lazy = Args::try_parse_from(base.into_iter().chain(["--execution", "lazy"]))
             .expect("parse lazy execution override");
         assert_eq!(lazy.execution, Execution::Lazy);
+    }
+
+    #[test]
+    fn bucket_policy_is_bounded_stable_and_capped_at_max_length() {
+        let shapes = bucket_shapes(512, 4_000_000);
+        assert_eq!(shapes.len(), 10);
+        assert_eq!(
+            shapes,
+            BUCKET_SEQUENCE_LADDER
+                .iter()
+                .map(|&seq| BatchShape { batch: 8, seq })
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            bucket_shapes(150, 4_000_000),
+            vec![
+                BatchShape { batch: 8, seq: 64 },
+                BatchShape { batch: 8, seq: 96 },
+                BatchShape { batch: 8, seq: 128 },
+                BatchShape { batch: 8, seq: 150 },
+            ]
+        );
+    }
+
+    #[test]
+    fn bucket_batcher_maps_to_covering_shapes_and_pads_tail_rows() {
+        let lengths = vec![60, 60, 60, 60, 60, 60, 60, 60, 65, 65];
+        let order = (0..lengths.len()).collect::<Vec<_>>();
+        let buckets = bucket_shapes(512, 4_000_000);
+        let batches = planned_batches(&order, &lengths, 4_000_000, Shapes::Bucketed, &buckets);
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].range, 0..8);
+        assert_eq!(batches[0].shape, BatchShape { batch: 8, seq: 64 });
+        assert_eq!(batches[1].range, 8..10);
+        assert_eq!(batches[1].shape, BatchShape { batch: 8, seq: 96 });
+    }
+
+    #[test]
+    fn package_cache_identity_includes_shape_policy() {
+        assert_eq!(shape_cache_key(Shapes::Exact), "shapes-exact");
+        assert_eq!(shape_cache_key(Shapes::Bucketed), "bucket-policy-v1");
     }
 
     #[test]
