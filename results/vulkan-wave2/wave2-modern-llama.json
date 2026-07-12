@@ -1,0 +1,13 @@
+{
+  "lane": "llama-vulkan-embed",
+  "workload": "embed-corpus-v1",
+  "model": "gte-modernbert-f16-llama-vulkan",
+  "cold_load_s": 0.7756093,
+  "infer_wall_s": 8.3505121,
+  "input_tokens": 62838,
+  "tok_per_s": 7525.047475830854,
+  "items": 400,
+  "parity_mean_cosine": 0.9999565918068872,
+  "self_peak_rss_bytes": 859013120,
+  "notes": "endpoint=/v1/embeddings; request_batching=greedy_sum_tokens<=batch_size; cold_load=health+warmup_request; pooling=cls; embd_normalize=2; ctx_size=512; batch_size=4096; ubatch_size=1024; ngl=99; parallel=1; prefix_document=none; min_parity=0.9999; reference_matches=400"
+}

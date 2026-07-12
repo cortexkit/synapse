@@ -1,0 +1,31 @@
+#version 460
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_scalar_block_layout : require
+layout(local_size_x = 256) in;
+layout(set=0,binding=0,scalar) readonly buffer Raw { float values[]; } raw_values;
+layout(set=0,binding=1,scalar) readonly buffer Cosine { float values[]; } cosine;
+layout(set=0,binding=2,scalar) readonly buffer Sine { float values[]; } sine;
+layout(set=0,binding=3,scalar) writeonly buffer Q { float16_t values[]; } q;
+layout(set=0,binding=4,scalar) writeonly buffer K { float16_t values[]; } k;
+layout(set=0,binding=5,scalar) writeonly buffer V { float16_t values[]; } v;
+layout(push_constant) uniform Params { uint batch; uint seq; uint heads; uint head_dim; } p;
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    uint total = p.batch * p.heads * p.seq * p.head_dim;
+    if (index >= total) return;
+    uint dimension = index % p.head_dim;
+    uint remainder = index / p.head_dim;
+    uint position = remainder % p.seq; remainder /= p.seq;
+    uint head = remainder % p.heads;
+    uint batch_index = remainder / p.heads;
+    uint hidden = p.heads * p.head_dim;
+    uint half_dim = p.head_dim / 2;
+    uint pair = dimension < half_dim ? dimension + half_dim : dimension - half_dim;
+    uint hidden_index = head * p.head_dim + dimension;
+    uint pair_index = head * p.head_dim + pair;
+    uint base = (batch_index * p.seq + position) * 3 * hidden;
+    float sign_value = dimension < half_dim ? -1.0 : 1.0;
+    q.values[index] = float16_t(raw_values.values[base + hidden_index] * cosine.values[position * p.head_dim + dimension] + sign_value * raw_values.values[base + pair_index] * sine.values[position * p.head_dim + dimension]);
+    k.values[index] = float16_t(raw_values.values[base + hidden + hidden_index] * cosine.values[position * p.head_dim + dimension] + sign_value * raw_values.values[base + hidden + pair_index] * sine.values[position * p.head_dim + dimension]);
+    v.values[index] = float16_t(raw_values.values[base + 2 * hidden + hidden_index]);
+}

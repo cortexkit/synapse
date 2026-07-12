@@ -13,6 +13,9 @@ layout(push_constant) uniform Params {
     uint batch_count;
     uint transpose_b;
     uint edge_only;
+    uint a_offset;
+    uint b_offset;
+    uint c_offset;
 } p;
 
 shared float tile_a[16][16];
@@ -25,8 +28,8 @@ void main() {
     if (p.edge_only != 0 && row + (15 - gl_LocalInvocationID.y) < p.m && column + (15 - gl_LocalInvocationID.x) < p.n) {
         return;
     }
-    uint a_base = matrix * p.m * p.k;
-    uint b_base = matrix * p.k * p.n;
+    uint a_base = p.a_offset + matrix * p.m * p.k;
+    uint b_base = p.b_offset + matrix * p.k * p.n;
     float sum = 0.0;
     for (uint tile = 0; tile < p.k; tile += 16) {
         uint a_column = tile + gl_LocalInvocationID.x;
@@ -45,6 +48,6 @@ void main() {
         barrier();
     }
     if (row < p.m && column < p.n && matrix < p.batch_count) {
-        c.values[(matrix * p.m + row) * p.n + column] = sum;
+        c.values[p.c_offset + (matrix * p.m + row) * p.n + column] = sum;
     }
 }

@@ -1,0 +1,26 @@
+#version 460
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_scalar_block_layout : require
+layout(local_size_x = 256) in;
+layout(set=0,binding=0,scalar) readonly buffer Input { float16_t values[]; } input_values;
+layout(set=0,binding=1,scalar) readonly buffer Weight { float values[]; } weight_values;
+layout(set=0,binding=2,scalar) writeonly buffer Output { float16_t values[]; } output_values;
+layout(push_constant) uniform Params { uint rows; uint width; float epsilon; uint unused; } p;
+shared float squares[256];
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationID.x;
+    float square = 0.0;
+    for (uint column = lane; column < p.width; column += 256) {
+        float value = float(input_values.values[row * p.width + column]);
+        square += value * value;
+    }
+    squares[lane] = square;
+    barrier();
+    for (uint step = 128; step > 0; step >>= 1) { if (lane < step) squares[lane] += squares[lane + step]; barrier(); }
+    float inverse = inversesqrt(squares[0] / float(p.width) + p.epsilon);
+    for (uint column = lane; column < p.width; column += 256) {
+        uint index = row * p.width + column;
+        output_values.values[index] = float16_t(float(input_values.values[index]) * inverse * weight_values.values[column]);
+    }
+}

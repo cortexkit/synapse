@@ -1,0 +1,21 @@
+{
+  "hardware": "ASUS ROG Ally AMD RDNA3 iGPU",
+  "vulkan_device": "AMD Radeon Graphics",
+  "vulkan_api": "1.4.334",
+  "driver_raw": 8388981,
+  "subgroup_size": 64,
+  "power_scheme_guid": "6fecc5ae-f350-48a5-b669-b472cb895ccf",
+  "power_scheme_name": "Turbo",
+  "fixture_hashes": {
+    "modernbert_corpus": "b4ff00f6d2d9f0652146b7438c2ecd421746bcead466cccf18ec79e45ff79aa8",
+    "modernbert_reference": "d1fb6aaf48c36c8ed7b06b9c69e6244f01393e085d32f49b15194671f7a44000",
+    "qwen3_corpus": "5a9bfdc8c069657aa46cbb45bef91bc1a0ddc72602bfb96b189af31ba55f630c",
+    "qwen3_reference": "cacee1f64d12704ea94cded9861f6aef903a018800b2e0a1ec67589c33c7cf46"
+  },
+  "model_hashes": {
+    "modernbert_safetensors": "3e85899d5728cb7de79781c0c3acfb91ccef9f875f1f7e0b3c9f3dd4b6a724ba",
+    "qwen3_safetensors": "0437e45c94563b09e13cb7a64478fc406947a93cb34a7e05870fc8dcd48e23fd",
+    "modernbert_f16_gguf": "2cda419ce09e87b1dd5294177a1c7d563e9536700e33652a9bb9e9c503c4e437",
+    "qwen3_embedding_f16_gguf": "421a27e58d165478cc7acb984a688c2aa41404968b0203e7cd743ece44c54340"
+  }
+}

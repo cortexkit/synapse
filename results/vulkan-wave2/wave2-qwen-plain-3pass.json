@@ -1,0 +1,103 @@
+{
+  "lane": "owned-rt-vulkan-plain-fused-family-command-buffer",
+  "workload": "embed-corpus-v1",
+  "model": "Qwen3-Embedding-0.6B@owned-rt-f16",
+  "cold_load_s": 39.4726517,
+  "infer_wall_s": 84.6665313,
+  "input_tokens": 46716,
+  "tok_per_s": 551.7646616993272,
+  "items": 400,
+  "parity_mean_cosine": 0.9999989124245944,
+  "self_peak_rss_bytes": null,
+  "notes": "direct Qwen3 decoder encoder, 28 layers, causal GQA 16/8, q_norm+k_norm, RoPE theta=1000000, pre-RMSNorm, SwiGLU, manual EOS, last-token pool+l2, provider=vulkan-plain-fused-family-command-buffer, dtype=f16, execution=Explicit, package_cache=disabled, shapes=Bucketed, policy_version=1, passes=3, length-sorted attention_units=4000000, max_len=512; all bucket shapes were pre-discovered before inference",
+  "shape_policy": "bucketed",
+  "bucket_policy_version": 1,
+  "bucket_shapes": [
+    {
+      "batch": 8,
+      "seq": 64
+    },
+    {
+      "batch": 8,
+      "seq": 96
+    },
+    {
+      "batch": 8,
+      "seq": 128
+    },
+    {
+      "batch": 8,
+      "seq": 160
+    },
+    {
+      "batch": 8,
+      "seq": 192
+    },
+    {
+      "batch": 8,
+      "seq": 256
+    },
+    {
+      "batch": 8,
+      "seq": 320
+    },
+    {
+      "batch": 8,
+      "seq": 384
+    },
+    {
+      "batch": 8,
+      "seq": 448
+    },
+    {
+      "batch": 8,
+      "seq": 512
+    }
+  ],
+  "real_tokens": 46716,
+  "padded_tokens": 53504,
+  "padding_waste_fraction": 0.12686901913875598,
+  "padding_waste_gate_passed": true,
+  "package_cache": {
+    "package_count": 0,
+    "package_bytes": 0
+  },
+  "passes": [
+    {
+      "pass": 1,
+      "label": "first",
+      "infer_wall_s": 93.7459047,
+      "input_tokens": 46716,
+      "padded_tokens": 53504,
+      "padding_waste_fraction": 0.12686901913875598,
+      "tok_per_s": 498.325768464209,
+      "items": 400,
+      "parity_mean_cosine": 0.9999989124245944,
+      "top10_rank_overlap": 0.99875
+    },
+    {
+      "pass": 2,
+      "label": "warm",
+      "infer_wall_s": 93.8173269,
+      "input_tokens": 46716,
+      "padded_tokens": 53504,
+      "padding_waste_fraction": 0.12686901913875598,
+      "tok_per_s": 497.94639800166806,
+      "items": 400,
+      "parity_mean_cosine": 0.9999989124245944,
+      "top10_rank_overlap": 0.99875
+    },
+    {
+      "pass": 3,
+      "label": "steady",
+      "infer_wall_s": 84.6665313,
+      "input_tokens": 46716,
+      "padded_tokens": 53504,
+      "padding_waste_fraction": 0.12686901913875598,
+      "tok_per_s": 551.7646616993272,
+      "items": 400,
+      "parity_mean_cosine": 0.9999989124245944,
+      "top10_rank_overlap": 0.99875
+    }
+  ]
+}

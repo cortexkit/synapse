@@ -1,0 +1,13 @@
+{
+  "lane": "llama-vulkan-embed",
+  "workload": "embed-corpus-v1",
+  "model": "qwen3-embed-f16-llama-vulkan",
+  "cold_load_s": 1.5583866,
+  "infer_wall_s": 28.8083775,
+  "input_tokens": 46716,
+  "tok_per_s": 1621.6116301586233,
+  "items": 400,
+  "parity_mean_cosine": 0.9998910794658529,
+  "self_peak_rss_bytes": 3695042560,
+  "notes": "endpoint=/v1/embeddings; request_batching=greedy_sum_tokens<=batch_size; cold_load=health+warmup_request; pooling=last; embd_normalize=2; ctx_size=512; batch_size=4096; ubatch_size=1024; ngl=99; parallel=1; prefix_document=none; min_parity=0.9998; reference_matches=400"
+}

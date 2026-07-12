@@ -16,6 +16,9 @@ layout(push_constant) uniform Params {
     uint batch_count;
     uint transpose_b;
     uint edge_only;
+    uint a_offset;
+    uint b_offset;
+    uint c_offset;
 } p;
 
 void main() {
@@ -26,8 +29,8 @@ void main() {
         return;
     }
     coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> accum = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
-    uint a_base = matrix * p.m * p.k;
-    uint b_base = matrix * p.k * p.n;
+    uint a_base = p.a_offset + matrix * p.m * p.k;
+    uint b_base = p.b_offset + matrix * p.k * p.n;
     for (uint inner = 0; inner < p.k; inner += 16) {
         coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> tile_a;
         coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> tile_b;
@@ -40,5 +43,5 @@ void main() {
             p.transpose_b != 0 ? gl_CooperativeMatrixLayoutColumnMajor : gl_CooperativeMatrixLayoutRowMajor);
         accum = coopMatMulAdd(tile_a, tile_b, accum);
     }
-    coopMatStore(accum, c.values, (matrix * p.m + tile_row) * p.n + tile_column, p.n, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(accum, c.values, p.c_offset + (matrix * p.m + tile_row) * p.n + tile_column, p.n, gl_CooperativeMatrixLayoutRowMajor);
 }
