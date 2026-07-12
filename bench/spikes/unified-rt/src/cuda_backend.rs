@@ -5,7 +5,7 @@ mod enabled {
 
     use anyhow::{bail, ensure, Result};
 
-    use super::super::{encode_f16_bits, EncoderLayer};
+    use super::super::{encode_f16_bits, EncoderLayer, Precision};
 
     #[repr(C)]
     struct SynapseCudaEncoderLayerParams {
@@ -25,6 +25,34 @@ mod enabled {
         output_bias: *const f32,
         output_ln_weight: *const f32,
         output_ln_bias: *const f32,
+    }
+
+    #[repr(C)]
+    #[allow(dead_code)]
+    pub struct ModernBertLayerParams {
+        pub qkv_weight: *const f32,
+        pub attention_output_weight: *const f32,
+        pub attention_norm_weight: *const f32,
+        pub mlp_input_weight: *const f32,
+        pub mlp_output_weight: *const f32,
+        pub mlp_norm_weight: *const f32,
+        pub attention_type: i32,
+    }
+
+    #[repr(C)]
+    #[allow(dead_code)]
+    pub struct Qwen3LayerParams {
+        pub input_norm: *const f32,
+        pub post_attention_norm: *const f32,
+        pub q_weight: *const f32,
+        pub q_norm: *const f32,
+        pub k_weight: *const f32,
+        pub k_norm: *const f32,
+        pub v_weight: *const f32,
+        pub o_weight: *const f32,
+        pub gate_weight: *const f32,
+        pub up_weight: *const f32,
+        pub down_weight: *const f32,
     }
 
     pub fn ensure_available() -> Result<()> {
@@ -111,9 +139,7 @@ mod enabled {
                     params.as_ptr(),
                 )
             };
-            if status != 0 {
-                bail!("CUDA encoder failed with status {status}: {}", last_error());
-            }
+            check_status(status, "CUDA MiniLM encoder")?;
             Ok(output.chunks_exact(hidden).map(<[f32]>::to_vec).collect())
         }
     }
@@ -122,6 +148,174 @@ mod enabled {
         fn drop(&mut self) {
             unsafe { synapse_cuda_context_free(self.raw.as_ptr()) }
         }
+    }
+
+    pub struct ModernBertContext {
+        raw: NonNull<c_void>,
+        precision: Precision,
+    }
+
+    impl ModernBertContext {
+        pub fn new(graphs: bool, precision: Precision) -> Result<Self> {
+            let raw = unsafe {
+                synapse_cuda_modernbert_context_new(i32::from(graphs), precision_code(precision))
+            };
+            Ok(Self {
+                raw: NonNull::new(raw).ok_or_else(last_error)?,
+                precision,
+            })
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn forward(
+            &mut self,
+            hidden_states: &mut [f32],
+            attention_mask: &[u8],
+            batch: usize,
+            seq: usize,
+            hidden: usize,
+            heads: usize,
+            intermediate: usize,
+            epsilon: f32,
+            global_theta: f32,
+            local_theta: f32,
+            local_half_window: usize,
+            layers: &[ModernBertLayerParams],
+            final_norm: &[f32],
+        ) -> Result<()> {
+            ensure!(
+                hidden_states.len() == batch * seq * hidden,
+                "ModernBERT CUDA hidden shape mismatch"
+            );
+            ensure!(
+                attention_mask.len() == batch * seq,
+                "ModernBERT CUDA mask shape mismatch"
+            );
+            ensure!(
+                final_norm.len() == hidden,
+                "ModernBERT CUDA final norm shape mismatch"
+            );
+            let input_f16 =
+                matches!(self.precision, Precision::F16).then(|| encode_f16_bits(hidden_states));
+            let input = input_f16
+                .as_ref()
+                .map_or(hidden_states.as_ptr().cast(), |values| {
+                    values.as_ptr().cast()
+                });
+            let status = unsafe {
+                synapse_cuda_modernbert_forward(
+                    self.raw.as_ptr(),
+                    batch as u64,
+                    seq as u64,
+                    hidden as u64,
+                    heads as u64,
+                    intermediate as u64,
+                    layers.len() as u64,
+                    epsilon,
+                    global_theta,
+                    local_theta,
+                    local_half_window as u64,
+                    input,
+                    attention_mask.as_ptr(),
+                    layers.as_ptr(),
+                    final_norm.as_ptr(),
+                    hidden_states.as_mut_ptr(),
+                )
+            };
+            check_status(status, "CUDA ModernBERT encoder")
+        }
+    }
+
+    impl Drop for ModernBertContext {
+        fn drop(&mut self) {
+            unsafe { synapse_cuda_modernbert_context_free(self.raw.as_ptr()) }
+        }
+    }
+
+    pub struct Qwen3Context {
+        raw: NonNull<c_void>,
+    }
+
+    impl Qwen3Context {
+        pub fn new(graphs: bool, precision: Precision) -> Result<Self> {
+            ensure!(
+                matches!(precision, Precision::F16),
+                "Qwen3 CUDA requires f16 storage"
+            );
+            let raw = unsafe { synapse_cuda_qwen3_context_new(i32::from(graphs)) };
+            Ok(Self {
+                raw: NonNull::new(raw).ok_or_else(last_error)?,
+            })
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn forward(
+            &mut self,
+            hidden_states: &mut [f32],
+            attention_mask: &[u8],
+            batch: usize,
+            seq: usize,
+            hidden: usize,
+            query_heads: usize,
+            kv_heads: usize,
+            head_dim: usize,
+            intermediate: usize,
+            epsilon: f32,
+            rope_theta: f32,
+            layers: &[Qwen3LayerParams],
+            final_norm: &[f32],
+        ) -> Result<()> {
+            ensure!(
+                hidden_states.len() == batch * seq * hidden,
+                "Qwen3 CUDA hidden shape mismatch"
+            );
+            ensure!(
+                attention_mask.len() == batch * seq,
+                "Qwen3 CUDA mask shape mismatch"
+            );
+            let input = encode_f16_bits(hidden_states);
+            let status = unsafe {
+                synapse_cuda_qwen3_forward(
+                    self.raw.as_ptr(),
+                    batch as u64,
+                    seq as u64,
+                    hidden as u64,
+                    query_heads as u64,
+                    kv_heads as u64,
+                    head_dim as u64,
+                    intermediate as u64,
+                    layers.len() as u64,
+                    epsilon,
+                    rope_theta,
+                    input.as_ptr(),
+                    attention_mask.as_ptr(),
+                    layers.as_ptr(),
+                    final_norm.as_ptr(),
+                    hidden_states.as_mut_ptr(),
+                )
+            };
+            check_status(status, "CUDA Qwen3 encoder")
+        }
+    }
+
+    impl Drop for Qwen3Context {
+        fn drop(&mut self) {
+            unsafe { synapse_cuda_qwen3_context_free(self.raw.as_ptr()) }
+        }
+    }
+
+    fn precision_code(precision: Precision) -> i32 {
+        match precision {
+            Precision::F32 => 0,
+            Precision::F16 => 1,
+        }
+    }
+
+    fn check_status(status: i32, operation: &str) -> Result<()> {
+        if status != 0 {
+            bail!("{operation} failed with status {status}: {}", last_error());
+        }
+        Ok(())
     }
 
     fn last_error() -> anyhow::Error {
@@ -156,6 +350,46 @@ mod enabled {
             output: *mut f32,
             layers: *const SynapseCudaEncoderLayerParams,
         ) -> i32;
+        fn synapse_cuda_modernbert_context_new(graphs_enabled: i32, precision: i32) -> *mut c_void;
+        fn synapse_cuda_modernbert_context_free(context: *mut c_void);
+        fn synapse_cuda_modernbert_forward(
+            context: *mut c_void,
+            batch: u64,
+            seq: u64,
+            hidden: u64,
+            heads: u64,
+            intermediate: u64,
+            layer_count: u64,
+            epsilon: f32,
+            global_theta: f32,
+            local_theta: f32,
+            local_half_window: u64,
+            input: *const c_void,
+            attention_mask: *const u8,
+            layers: *const ModernBertLayerParams,
+            final_norm: *const f32,
+            output: *mut f32,
+        ) -> i32;
+        fn synapse_cuda_qwen3_context_new(graphs_enabled: i32) -> *mut c_void;
+        fn synapse_cuda_qwen3_context_free(context: *mut c_void);
+        fn synapse_cuda_qwen3_forward(
+            context: *mut c_void,
+            batch: u64,
+            seq: u64,
+            hidden: u64,
+            query_heads: u64,
+            kv_heads: u64,
+            head_dim: u64,
+            intermediate: u64,
+            layer_count: u64,
+            epsilon: f32,
+            rope_theta: f32,
+            input: *const u16,
+            attention_mask: *const u8,
+            layers: *const Qwen3LayerParams,
+            final_norm: *const f32,
+            output: *mut f32,
+        ) -> i32;
         fn synapse_cuda_last_error() -> *const c_char;
         fn synapse_cuda_cublaslt_version() -> u64;
     }
@@ -165,19 +399,43 @@ mod enabled {
 mod enabled {
     use anyhow::{bail, Result};
 
-    use super::super::EncoderLayer;
+    use super::super::{EncoderLayer, Precision};
+
+    #[allow(dead_code)]
+    pub struct ModernBertLayerParams {
+        pub qkv_weight: *const f32,
+        pub attention_output_weight: *const f32,
+        pub attention_norm_weight: *const f32,
+        pub mlp_input_weight: *const f32,
+        pub mlp_output_weight: *const f32,
+        pub mlp_norm_weight: *const f32,
+        pub attention_type: i32,
+    }
+
+    #[allow(dead_code)]
+    pub struct Qwen3LayerParams {
+        pub input_norm: *const f32,
+        pub post_attention_norm: *const f32,
+        pub q_weight: *const f32,
+        pub q_norm: *const f32,
+        pub k_weight: *const f32,
+        pub k_norm: *const f32,
+        pub v_weight: *const f32,
+        pub o_weight: *const f32,
+        pub gate_weight: *const f32,
+        pub up_weight: *const f32,
+        pub down_weight: *const f32,
+    }
 
     pub fn ensure_available() -> Result<()> {
         bail!("CUDA provider requires Linux and cargo feature `cuda`")
     }
 
     pub struct CudaContext;
-
     impl CudaContext {
         pub fn new(_graphs: bool) -> Result<Self> {
             bail!("CUDA provider requires Linux and cargo feature `cuda`")
         }
-
         #[allow(clippy::too_many_arguments)]
         pub fn encoder_forward(
             &mut self,
@@ -194,6 +452,61 @@ mod enabled {
             bail!("CUDA provider requires Linux and cargo feature `cuda`")
         }
     }
+
+    pub struct ModernBertContext;
+    impl ModernBertContext {
+        pub fn new(_graphs: bool, _precision: Precision) -> Result<Self> {
+            bail!("CUDA provider requires Linux and cargo feature `cuda`")
+        }
+        #[allow(clippy::too_many_arguments)]
+        pub fn forward(
+            &mut self,
+            _hidden_states: &mut [f32],
+            _attention_mask: &[u8],
+            _batch: usize,
+            _seq: usize,
+            _hidden: usize,
+            _heads: usize,
+            _intermediate: usize,
+            _epsilon: f32,
+            _global_theta: f32,
+            _local_theta: f32,
+            _local_half_window: usize,
+            _layers: &[ModernBertLayerParams],
+            _final_norm: &[f32],
+        ) -> Result<()> {
+            bail!("CUDA provider requires Linux and cargo feature `cuda`")
+        }
+    }
+
+    pub struct Qwen3Context;
+    impl Qwen3Context {
+        pub fn new(_graphs: bool, _precision: Precision) -> Result<Self> {
+            bail!("CUDA provider requires Linux and cargo feature `cuda`")
+        }
+        #[allow(clippy::too_many_arguments)]
+        pub fn forward(
+            &mut self,
+            _hidden_states: &mut [f32],
+            _attention_mask: &[u8],
+            _batch: usize,
+            _seq: usize,
+            _hidden: usize,
+            _query_heads: usize,
+            _kv_heads: usize,
+            _head_dim: usize,
+            _intermediate: usize,
+            _epsilon: f32,
+            _rope_theta: f32,
+            _layers: &[Qwen3LayerParams],
+            _final_norm: &[f32],
+        ) -> Result<()> {
+            bail!("CUDA provider requires Linux and cargo feature `cuda`")
+        }
+    }
 }
 
-pub use enabled::{ensure_available, CudaContext};
+pub use enabled::{
+    ensure_available, CudaContext, ModernBertContext, ModernBertLayerParams, Qwen3Context,
+    Qwen3LayerParams,
+};

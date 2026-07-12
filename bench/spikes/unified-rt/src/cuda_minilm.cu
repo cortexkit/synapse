@@ -846,6 +846,10 @@ const char *synapse_cuda_last_error(void) {
     return last_error.c_str();
 }
 
+void synapse_cuda_set_last_error(const char *message) {
+    last_error = message ? message : "unknown CUDA error";
+}
+
 uint64_t synapse_cuda_cublaslt_version(void) {
     return static_cast<uint64_t>(cublasLtGetVersion());
 }

@@ -1,0 +1,266 @@
+#ifndef SYNAPSE_CUDA_FAMILY_COMMON_CUH
+#define SYNAPSE_CUDA_FAMILY_COMMON_CUH
+
+#include <cublasLt.h>
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <memory>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+namespace synapse_cuda_family {
+
+inline void cuda_check(cudaError_t status, const char *call, const char *file, int line) {
+    if (status != cudaSuccess) {
+        std::ostringstream message;
+        message << call << " failed at " << file << ':' << line << ": " << cudaGetErrorString(status);
+        throw std::runtime_error(message.str());
+    }
+}
+
+inline void cublas_check(cublasStatus_t status, const char *call, const char *file, int line) {
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        std::ostringstream message;
+        message << call << " failed at " << file << ':' << line << " with cuBLAS status " << status;
+        throw std::runtime_error(message.str());
+    }
+}
+
+#define FAMILY_CUDA_CHECK(call) ::synapse_cuda_family::cuda_check((call), #call, __FILE__, __LINE__)
+#define FAMILY_CUBLAS_CHECK(call) ::synapse_cuda_family::cublas_check((call), #call, __FILE__, __LINE__)
+
+template <typename T>
+struct DeviceAllocation {
+    T *pointer = nullptr;
+    size_t count = 0;
+
+    DeviceAllocation() = default;
+    explicit DeviceAllocation(size_t elements) { allocate(elements); }
+    DeviceAllocation(const DeviceAllocation &) = delete;
+    DeviceAllocation &operator=(const DeviceAllocation &) = delete;
+    DeviceAllocation(DeviceAllocation &&other) noexcept { *this = std::move(other); }
+    DeviceAllocation &operator=(DeviceAllocation &&other) noexcept {
+        if (this != &other) {
+            reset();
+            pointer = other.pointer;
+            count = other.count;
+            other.pointer = nullptr;
+            other.count = 0;
+        }
+        return *this;
+    }
+    ~DeviceAllocation() { reset(); }
+
+    void allocate(size_t elements) {
+        reset();
+        count = elements;
+        if (count != 0) FAMILY_CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&pointer), count * sizeof(T)));
+    }
+    void reset() {
+        if (pointer != nullptr) cudaFree(pointer);
+        pointer = nullptr;
+        count = 0;
+    }
+};
+
+inline std::vector<half> to_half(const float *values, size_t count) {
+    std::vector<half> converted(count);
+    for (size_t index = 0; index < count; ++index) converted[index] = __float2half(values[index]);
+    return converted;
+}
+
+template <typename T>
+void copy_weight(DeviceAllocation<unsigned char> &target, const float *source, size_t count);
+
+template <>
+inline void copy_weight<float>(DeviceAllocation<unsigned char> &target, const float *source, size_t count) {
+    target.allocate(count * sizeof(float));
+    FAMILY_CUDA_CHECK(cudaMemcpy(target.pointer, source, count * sizeof(float), cudaMemcpyHostToDevice));
+}
+
+template <>
+inline void copy_weight<half>(DeviceAllocation<unsigned char> &target, const float *source, size_t count) {
+    target.allocate(count * sizeof(half));
+    std::vector<half> converted = to_half(source, count);
+    FAMILY_CUDA_CHECK(cudaMemcpy(target.pointer, converted.data(), count * sizeof(half), cudaMemcpyHostToDevice));
+}
+
+inline void copy_float(DeviceAllocation<float> &target, const float *source, size_t count) {
+    target.allocate(count);
+    FAMILY_CUDA_CHECK(cudaMemcpy(target.pointer, source, count * sizeof(float), cudaMemcpyHostToDevice));
+}
+
+struct MatmulPlan {
+    std::string name;
+    cublasLtMatmulDesc_t operation = nullptr;
+    cublasLtMatrixLayout_t a_layout = nullptr;
+    cublasLtMatrixLayout_t b_layout = nullptr;
+    cublasLtMatrixLayout_t c_layout = nullptr;
+    cublasLtMatmulAlgo_t algorithm{};
+    size_t workspace_bytes = 0;
+    int algorithm_id = -1;
+    int split_k = 1;
+
+    MatmulPlan() = default;
+    MatmulPlan(const MatmulPlan &) = delete;
+    MatmulPlan &operator=(const MatmulPlan &) = delete;
+    MatmulPlan(MatmulPlan &&other) noexcept { *this = std::move(other); }
+    MatmulPlan &operator=(MatmulPlan &&other) noexcept {
+        if (this != &other) {
+            release();
+            name = std::move(other.name);
+            operation = other.operation;
+            a_layout = other.a_layout;
+            b_layout = other.b_layout;
+            c_layout = other.c_layout;
+            algorithm = other.algorithm;
+            workspace_bytes = other.workspace_bytes;
+            algorithm_id = other.algorithm_id;
+            split_k = other.split_k;
+            other.operation = nullptr;
+            other.a_layout = other.b_layout = other.c_layout = nullptr;
+        }
+        return *this;
+    }
+    ~MatmulPlan() { release(); }
+    void release() {
+        if (c_layout) cublasLtMatrixLayoutDestroy(c_layout);
+        if (b_layout) cublasLtMatrixLayoutDestroy(b_layout);
+        if (a_layout) cublasLtMatrixLayoutDestroy(a_layout);
+        if (operation) cublasLtMatmulDescDestroy(operation);
+        operation = nullptr;
+        a_layout = b_layout = c_layout = nullptr;
+    }
+};
+
+inline MatmulPlan select_matmul(
+    cublasLtHandle_t handle,
+    const char *name,
+    cudaDataType_t dtype,
+    int64_t m,
+    int64_t n,
+    int64_t k,
+    bool transpose_b,
+    int batch_count = 1,
+    int64_t a_stride = 0,
+    int64_t b_stride = 0,
+    int64_t c_stride = 0
+) {
+    MatmulPlan plan;
+    plan.name = name;
+    FAMILY_CUBLAS_CHECK(cublasLtMatmulDescCreate(&plan.operation, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+    cublasOperation_t op_a = CUBLAS_OP_N;
+    cublasOperation_t op_b = transpose_b ? CUBLAS_OP_T : CUBLAS_OP_N;
+    FAMILY_CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(plan.operation, CUBLASLT_MATMUL_DESC_TRANSA, &op_a, sizeof(op_a)));
+    FAMILY_CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(plan.operation, CUBLASLT_MATMUL_DESC_TRANSB, &op_b, sizeof(op_b)));
+    const int64_t b_rows = transpose_b ? n : k;
+    const int64_t b_cols = transpose_b ? k : n;
+    FAMILY_CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&plan.a_layout, dtype, m, k, k));
+    FAMILY_CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&plan.b_layout, dtype, b_rows, b_cols, b_cols));
+    FAMILY_CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&plan.c_layout, dtype, m, n, n));
+    cublasLtOrder_t order = CUBLASLT_ORDER_ROW;
+    FAMILY_CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(plan.a_layout, CUBLASLT_MATRIX_LAYOUT_ORDER, &order, sizeof(order)));
+    FAMILY_CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(plan.b_layout, CUBLASLT_MATRIX_LAYOUT_ORDER, &order, sizeof(order)));
+    FAMILY_CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(plan.c_layout, CUBLASLT_MATRIX_LAYOUT_ORDER, &order, sizeof(order)));
+    if (batch_count > 1) {
+        FAMILY_CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(plan.a_layout, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count, sizeof(batch_count)));
+        FAMILY_CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(plan.b_layout, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count, sizeof(batch_count)));
+        FAMILY_CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(plan.c_layout, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count, sizeof(batch_count)));
+        FAMILY_CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(plan.a_layout, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &a_stride, sizeof(a_stride)));
+        FAMILY_CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(plan.b_layout, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &b_stride, sizeof(b_stride)));
+        FAMILY_CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(plan.c_layout, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &c_stride, sizeof(c_stride)));
+    }
+    constexpr size_t workspace_limit = 64 * 1024 * 1024;
+    cublasLtMatmulPreference_t preference = nullptr;
+    FAMILY_CUBLAS_CHECK(cublasLtMatmulPreferenceCreate(&preference));
+    FAMILY_CUBLAS_CHECK(cublasLtMatmulPreferenceSetAttribute(preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace_limit, sizeof(workspace_limit)));
+    cublasLtMatmulHeuristicResult_t result{};
+    int returned = 0;
+    cublasStatus_t status = cublasLtMatmulAlgoGetHeuristic(handle, plan.operation, plan.a_layout, plan.b_layout, plan.c_layout, plan.c_layout, preference, 1, &result, &returned);
+    cublasLtMatmulPreferenceDestroy(preference);
+    FAMILY_CUBLAS_CHECK(status);
+    if (returned != 1 || result.state != CUBLAS_STATUS_SUCCESS) throw std::runtime_error(std::string("no cuBLASLt algorithm for ") + name);
+    plan.algorithm = result.algo;
+    plan.workspace_bytes = result.workspaceSize;
+    FAMILY_CUBLAS_CHECK(cublasLtMatmulAlgoConfigGetAttribute(&plan.algorithm, CUBLASLT_ALGO_CONFIG_ID, &plan.algorithm_id, sizeof(plan.algorithm_id), nullptr));
+    FAMILY_CUBLAS_CHECK(cublasLtMatmulAlgoConfigGetAttribute(&plan.algorithm, CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &plan.split_k, sizeof(plan.split_k), nullptr));
+    return plan;
+}
+
+inline void launch_matmul(cublasLtHandle_t handle, const MatmulPlan &plan, const void *a, const void *b, void *c, void *workspace, cudaStream_t stream) {
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    FAMILY_CUBLAS_CHECK(cublasLtMatmul(handle, plan.operation, &alpha, a, plan.a_layout, b, plan.b_layout, &beta, c, plan.c_layout, c, plan.c_layout, &plan.algorithm, workspace, plan.workspace_bytes, stream));
+}
+
+inline __device__ float warp_sum(float value) {
+    for (int offset = 16; offset > 0; offset /= 2) value += __shfl_down_sync(0xffffffff, value, offset);
+    return value;
+}
+
+inline __device__ float warp_max(float value) {
+    for (int offset = 16; offset > 0; offset /= 2) value = fmaxf(value, __shfl_down_sync(0xffffffff, value, offset));
+    return value;
+}
+
+template <typename T> inline __device__ float load_value(const T *values, int index);
+template <> inline __device__ float load_value<half>(const half *values, int index) { return __half2float(values[index]); }
+template <> inline __device__ float load_value<float>(const float *values, int index) { return values[index]; }
+template <typename T> inline __device__ void store_value(T *values, int index, float value);
+template <> inline __device__ void store_value<half>(half *values, int index, float value) { values[index] = __float2half(value); }
+template <> inline __device__ void store_value<float>(float *values, int index, float value) { values[index] = value; }
+
+struct StageEvent {
+    std::string name;
+    cudaEvent_t start = nullptr;
+    cudaEvent_t stop = nullptr;
+};
+
+struct StageProfile {
+    std::vector<StageEvent> events;
+
+    void begin(const char *name, cudaStream_t stream) {
+        StageEvent event;
+        event.name = name;
+        FAMILY_CUDA_CHECK(cudaEventCreate(&event.start));
+        FAMILY_CUDA_CHECK(cudaEventCreate(&event.stop));
+        FAMILY_CUDA_CHECK(cudaEventRecord(event.start, stream));
+        events.push_back(std::move(event));
+    }
+
+    void end(cudaStream_t stream) {
+        FAMILY_CUDA_CHECK(cudaEventRecord(events.back().stop, stream));
+    }
+
+    std::unordered_map<std::string, double> collect() {
+        std::unordered_map<std::string, double> totals;
+        for (StageEvent &event : events) {
+            float milliseconds = 0.0f;
+            FAMILY_CUDA_CHECK(cudaEventElapsedTime(&milliseconds, event.start, event.stop));
+            totals[event.name] += milliseconds;
+            cudaEventDestroy(event.start);
+            cudaEventDestroy(event.stop);
+        }
+        events.clear();
+        return totals;
+    }
+};
+
+inline std::string shape_key(int batch, int seq) {
+    return std::to_string(batch) + "x" + std::to_string(seq);
+}
+
+}  // namespace synapse_cuda_family
+
+extern "C" void synapse_cuda_set_last_error(const char *message);
+
+#endif

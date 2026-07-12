@@ -6,6 +6,9 @@ fn main() {
     println!("cargo:rerun-if-changed=src/mpsgraph_runtime.h");
     println!("cargo:rerun-if-changed=src/cuda_minilm.cu");
     println!("cargo:rerun-if-changed=src/cuda_minilm.h");
+    println!("cargo:rerun-if-changed=src/cuda_family_common.cuh");
+    println!("cargo:rerun-if-changed=src/cuda_modernbert.cu");
+    println!("cargo:rerun-if-changed=src/cuda_qwen3.cu");
 
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     if target_os == "macos" {
@@ -30,6 +33,8 @@ fn main() {
             .cuda(true)
             .cudart("shared")
             .file("src/cuda_minilm.cu")
+            .file("src/cuda_modernbert.cu")
+            .file("src/cuda_qwen3.cu")
             .include(format!("{cuda_root}/include"))
             .flag("-O3")
             .flag("-Wno-deprecated-gpu-targets");
