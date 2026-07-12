@@ -915,6 +915,7 @@ fn new_block_context(
         BlockBackend::Cuda { graphs } => BlockContextBackend::Cuda(
             super::cuda_backend::ModernBertContext::new(graphs, precision)?,
         ),
+        BlockBackend::Vulkan { .. } => bail!("Vulkan day-1 supports MiniLM only"),
     };
     Ok(Box::new(BlockContext { backend }))
 }

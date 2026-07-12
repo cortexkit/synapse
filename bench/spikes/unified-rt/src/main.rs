@@ -22,6 +22,7 @@ use tokenizers::{Tokenizer, TruncationParams};
 mod cuda_backend;
 mod modernbert;
 mod qwen3;
+mod vulkan_backend;
 
 #[derive(Parser)]
 #[command(name = "spike-unified-rt")]
@@ -74,6 +75,12 @@ struct Args {
     /// Launch the CUDA encoder through a per-shape CUDA Graph.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     cuda_graphs: bool,
+    /// GEMM implementation used by the Vulkan MiniLM block.
+    #[arg(long, value_enum, default_value_t = VulkanGemm::Plain)]
+    vulkan_gemm: VulkanGemm,
+    /// Optional serialized VkPipelineCache file for Vulkan cold/warm measurements.
+    #[arg(long)]
+    vulkan_pipeline_cache: Option<PathBuf>,
     /// Metal graph execution strategy. Explicit O0 compilation is the serving default.
     #[arg(long, value_enum, default_value_t = Execution::Explicit)]
     execution: Execution,
@@ -108,6 +115,23 @@ enum DeviceArg {
     Cpu,
     Metal,
     Cuda,
+    Vulkan,
+}
+
+#[derive(Copy, Clone, Eq, PartialEq, Debug, ValueEnum)]
+enum VulkanGemm {
+    Plain,
+    Cooperative,
+}
+
+impl VulkanGemm {
+    #[cfg(all(target_os = "windows", feature = "vulkan"))]
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Plain => "plain",
+            Self::Cooperative => "cooperative",
+        }
+    }
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug, ValueEnum)]
@@ -328,8 +352,18 @@ fn main() -> Result<()> {
         bucket_shapes.len()
     );
     let execution = MetalExecutionConfig::from_args(&args, model.family_name())?;
-    let mut provider = make_provider(args.device, args.dtype, execution.clone(), args.cuda_graphs)?;
-    let accelerator = matches!(args.device, DeviceArg::Metal | DeviceArg::Cuda);
+    let mut provider = make_provider(
+        args.device,
+        args.dtype,
+        execution.clone(),
+        args.cuda_graphs,
+        args.vulkan_gemm,
+        args.vulkan_pipeline_cache.clone(),
+    )?;
+    let accelerator = matches!(
+        args.device,
+        DeviceArg::Metal | DeviceArg::Cuda | DeviceArg::Vulkan
+    );
     if let Some(requests_path) = &args.rerank_requests {
         return run_rerank_cli(
             &args,
@@ -581,7 +615,14 @@ fn serve_stdio(args: Args) -> Result<()> {
         .package_root
         .as_ref()
         .map(|path| path.display().to_string());
-    let mut provider = make_provider(args.device, args.dtype, execution, args.cuda_graphs)?;
+    let mut provider = make_provider(
+        args.device,
+        args.dtype,
+        execution,
+        args.cuda_graphs,
+        args.vulkan_gemm,
+        args.vulkan_pipeline_cache.clone(),
+    )?;
     let eager_shape_preload = provider.eager_shape_preload();
     let metadata = CandidateMetadata {
         lane: format!("owned-rt-{}", provider.name()),
@@ -1189,11 +1230,19 @@ fn make_provider(
     dtype: Precision,
     execution: MetalExecutionConfig,
     cuda_graphs: bool,
+    vulkan_gemm: VulkanGemm,
+    vulkan_pipeline_cache: Option<PathBuf>,
 ) -> Result<Box<dyn KernelProvider>> {
     match device {
         DeviceArg::Cpu => Ok(Box::new(CpuProvider)),
         DeviceArg::Metal => Ok(Box::new(MetalProvider::new_with_config(dtype, execution)?)),
         DeviceArg::Cuda => Ok(Box::new(CudaProvider::new(dtype, execution, cuda_graphs)?)),
+        DeviceArg::Vulkan => Ok(Box::new(VulkanProvider::new(
+            dtype,
+            execution,
+            vulkan_gemm,
+            vulkan_pipeline_cache,
+        )?)),
     }
 }
 
@@ -1416,10 +1465,16 @@ fn write_vectors(path: &Path, vectors: &[(String, Vec<f32>)]) -> Result<()> {
     Ok(())
 }
 
-#[derive(Copy, Clone)]
+#[derive(Clone)]
 enum BlockBackend {
     Metal,
-    Cuda { graphs: bool },
+    Cuda {
+        graphs: bool,
+    },
+    Vulkan {
+        gemm: VulkanGemm,
+        pipeline_cache: Option<PathBuf>,
+    },
 }
 
 type BlockContextFactory =
@@ -1581,6 +1636,14 @@ struct CudaProvider {
     graphs: bool,
 }
 
+struct VulkanProvider {
+    block_contexts: HashMap<&'static str, Box<dyn Any>>,
+    dtype: Precision,
+    execution: MetalExecutionConfig,
+    gemm: VulkanGemm,
+    pipeline_cache: Option<PathBuf>,
+}
+
 impl CudaProvider {
     fn new(dtype: Precision, execution: MetalExecutionConfig, graphs: bool) -> Result<Self> {
         cuda_backend::ensure_available()?;
@@ -1590,6 +1653,84 @@ impl CudaProvider {
             execution,
             graphs,
         })
+    }
+}
+
+impl VulkanProvider {
+    fn new(
+        dtype: Precision,
+        execution: MetalExecutionConfig,
+        gemm: VulkanGemm,
+        pipeline_cache: Option<PathBuf>,
+    ) -> Result<Self> {
+        ensure!(
+            matches!(dtype, Precision::F16),
+            "MiniLM Vulkan requires --dtype f16"
+        );
+        Ok(Self {
+            block_contexts: HashMap::new(),
+            dtype,
+            execution,
+            gemm,
+            pipeline_cache,
+        })
+    }
+}
+
+impl KernelProvider for VulkanProvider {
+    fn name(&self) -> &'static str {
+        match self.gemm {
+            VulkanGemm::Plain => "vulkan-plain-fused-family-command-buffer",
+            VulkanGemm::Cooperative => "vulkan-cooperative-matrix-family-command-buffer",
+        }
+    }
+
+    fn matmul(
+        &mut self,
+        _m: usize,
+        _n: usize,
+        _k: usize,
+        _a: &[f32],
+        _b: &[f32],
+        _b_layout: BLayout,
+        _c: &mut [f32],
+    ) -> Result<()> {
+        bail!("Vulkan requires the MiniLM family-resident block path")
+    }
+
+    fn block_forward(&mut self, request: BlockForwardRequest<'_>) -> Result<bool> {
+        ensure!(
+            request.family == "minilm",
+            "Vulkan day-1 supports MiniLM only"
+        );
+        if !self.block_contexts.contains_key(request.family) {
+            let context = (request.create_context)(
+                self.dtype,
+                self.execution.clone(),
+                BlockBackend::Vulkan {
+                    gemm: self.gemm,
+                    pipeline_cache: self.pipeline_cache.clone(),
+                },
+            )?;
+            self.block_contexts.insert(request.family, context);
+        }
+        let context = self
+            .block_contexts
+            .get_mut(request.family)
+            .expect("block context inserted above");
+        (request.run)(context.as_mut())?;
+        Ok(true)
+    }
+
+    fn eager_shape_preload(&self) -> bool {
+        true
+    }
+
+    fn take_pooled_output(&mut self) -> Option<Vec<Vec<f32>>> {
+        self.block_contexts
+            .get_mut("minilm")
+            .and_then(|context| context.downcast_mut::<MiniLmBlockContext>())
+            .and_then(|context| context.last_pooled.take())
     }
 }
 
@@ -2836,6 +2977,16 @@ fn new_minilm_block_context(
             );
             MiniLmBlockGraph::Cuda(cuda_backend::CudaContext::new(graphs)?)
         }
+        BlockBackend::Vulkan {
+            gemm,
+            pipeline_cache,
+        } => {
+            ensure!(
+                matches!(precision, Precision::F16),
+                "MiniLM Vulkan requires --dtype f16"
+            );
+            MiniLmBlockGraph::Vulkan(vulkan_backend::VulkanContext::new(gemm, pipeline_cache)?)
+        }
     };
     Ok(Box::new(MiniLmBlockContext {
         graph,
@@ -2847,6 +2998,7 @@ fn new_minilm_block_context(
 enum MiniLmBlockGraph {
     Metal(metal_backend::MpsGraphContext),
     Cuda(cuda_backend::CudaContext),
+    Vulkan(vulkan_backend::VulkanContext),
 }
 
 impl MiniLmBlockGraph {
@@ -2880,6 +3032,19 @@ impl MiniLmBlockGraph {
                 )
                 .map(|()| None),
             Self::Cuda(graph) => graph
+                .encoder_forward(
+                    hidden_states,
+                    attention_mask,
+                    batch,
+                    seq,
+                    hidden,
+                    heads,
+                    intermediate,
+                    layer_norm_eps,
+                    layers,
+                )
+                .map(Some),
+            Self::Vulkan(graph) => graph
                 .encoder_forward(
                     hidden_states,
                     attention_mask,

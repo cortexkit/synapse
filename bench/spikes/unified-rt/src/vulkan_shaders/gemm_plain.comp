@@ -1,0 +1,50 @@
+#version 460
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(set = 0, binding = 0, scalar) readonly buffer ABuffer { float16_t values[]; } a;
+layout(set = 0, binding = 1, scalar) readonly buffer BBuffer { float16_t values[]; } b;
+layout(set = 0, binding = 2, scalar) writeonly buffer CBuffer { float values[]; } c;
+layout(push_constant) uniform Params {
+    uint m;
+    uint n;
+    uint k;
+    uint batch_count;
+    uint transpose_b;
+    uint edge_only;
+} p;
+
+shared float tile_a[16][16];
+shared float tile_b[16][16];
+
+void main() {
+    uint row = gl_WorkGroupID.y * 16 + gl_LocalInvocationID.y;
+    uint column = gl_WorkGroupID.x * 16 + gl_LocalInvocationID.x;
+    uint matrix = gl_WorkGroupID.z;
+    if (p.edge_only != 0 && row + (15 - gl_LocalInvocationID.y) < p.m && column + (15 - gl_LocalInvocationID.x) < p.n) {
+        return;
+    }
+    uint a_base = matrix * p.m * p.k;
+    uint b_base = matrix * p.k * p.n;
+    float sum = 0.0;
+    for (uint tile = 0; tile < p.k; tile += 16) {
+        uint a_column = tile + gl_LocalInvocationID.x;
+        uint b_row = tile + gl_LocalInvocationID.y;
+        tile_a[gl_LocalInvocationID.y][gl_LocalInvocationID.x] =
+            row < p.m && a_column < p.k ? float(a.values[a_base + row * p.k + a_column]) : 0.0;
+        uint b_index = p.transpose_b != 0
+            ? b_base + column * p.k + b_row
+            : b_base + b_row * p.n + column;
+        tile_b[gl_LocalInvocationID.y][gl_LocalInvocationID.x] =
+            b_row < p.k && column < p.n ? float(b.values[b_index]) : 0.0;
+        barrier();
+        for (uint inner = 0; inner < 16; ++inner) {
+            sum += tile_a[gl_LocalInvocationID.y][inner] * tile_b[inner][gl_LocalInvocationID.x];
+        }
+        barrier();
+    }
+    if (row < p.m && column < p.n && matrix < p.batch_count) {
+        c.values[(matrix * p.m + row) * p.n + column] = sum;
+    }
+}

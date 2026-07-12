@@ -6073,6 +6073,7 @@ name = "spike-unified-rt"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "ash",
  "cc",
  "clap",
  "half",
