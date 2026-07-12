@@ -271,3 +271,106 @@ For context, wave 2's retained five-process means were `498,523.0 tok/s` graph-o
 The fused path did not lower GEMM share: GEMMs rose from `54.38%` of the retained profile to `59.09%` of the candidate. Softmax was `20.65%`, so softmax is not the next dominant stage and flash-attention promotion still does not trigger. Nsight Compute remains blocked by `ERR_NVGPUCTRPERM`; no tensor-core utilization or occupancy improvement is claimed merely because three launches became one.
 
 The tree points to cuBLASLt algorithm tuning and steady/cold projection measurement, not another layout rewrite. A future fused-QKV attempt should enumerate and time algorithms for the `[rows, hidden] x [hidden, 3 * hidden]` class rather than accept the first heuristic result. QK/PV must continue to preserve the single `batch * heads` strided batch. Raw `wave3-*.json` files, the machine-readable delta and power table, and the updated fingerprint are in [`results/cuda-day1/`](results/cuda-day1/).
+
+
+## Wave 4: measured cuBLASLt algorithm enumeration
+
+Wave 4 tested the branch identified by both pruned layout experiments: instead of accepting the first cuBLASLt heuristic, plan construction requested 32 candidates for every `(bucket shape, GEMM class)`, timed every candidate returned by CUDA 12.8 over five repetitions on the real model buffers, and fixed the measured-fastest concrete configuration before capture. cuBLASLt returned eight successful candidates for each of the 50 descriptor classes. The candidate was then pruned: after equalizing warmup, its clock-matched device total improved only `0.98%`, below the predeclared `3%` materiality gate.
+
+### Replacement rig and clean re-baseline
+
+The original rental became unusable for this wave: it remained at `90–93%` GPU utilization and about `423 W` with no process visible inside the container, including after the Vast instance was stopped and restarted. This revealed a phantom host-side load. Wave-2/3 pruning decisions still stand because they used matched event-profile comparisons, but their absolute fresh-process throughput ranges may be contention-widened rather than merely power-cap-widened.
+
+Wave 4 therefore moved to a clean replacement RTX 4090 and fingerprinted it separately. It has driver `550.127.08`, a `450 W` limit, and was `0%` / about `30 W` before cells. The current master also includes bucket-policy v1, so the clean retained baseline was rebuilt for ten `8xS` buckets (`S=64,96,128,160,192,256,320,384,448,512`) rather than comparing the new bucketed workload to the older exact-shape table. The clean one-process baseline pair measured `318,773.8 tok/s` uncaptured and `331,967.3 tok/s` captured; both passed parity and reported `captured_exact=true` for all ten shapes.
+
+The replacement's 550 driver cannot JIT PTX emitted by the CUDA 12.8 toolkit. The measurement binary was therefore built with benchmark-only `-gencode=arch=compute_89,code=sm_89`, and runtime was forced to the host driver library with `LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/usr/local/cuda/lib64`. cuBLASLt remained version `120803`. Full hardware, hashes, clocks, and toolchain output are in [`wave4-rig-fingerprint.txt`](results/cuda-day1/wave4-rig-fingerprint.txt).
+
+### Enumeration method and selected configurations
+
+Enumeration happened once per shape outside capture. HH, HI, and IH used the actual hidden states and layer weights. QK used Q/K produced by the selected HH plan and the retained bias-transpose kernel; PV used the resulting real score and V buffers. Each candidate received one untimed launch and five CUDA-event-timed repetitions. The normal full encoder profile was taken only after one additional common unprofiled execution for both the heuristic control and enumerated candidate. This common warmup matters: without it, enumeration's candidate timing accidentally pre-warmed cuBLASLt and made the first profile look about `8%` faster. Equal treatment reduced the apparent win to `0.98%`.
+
+Entries below are `algorithm id / tile / stages / split-K (average candidate time)`. The full identity also includes reduction scheme, swizzle, custom option, workspace, and is recorded in [`wave4-summary.json`](results/cuda-day1/wave4-summary.json).
+
+| Shape | HH default → best | HI default → best | IH default → best | QK default → best | PV default → best |
+|---|---|---|---|---|---|
+| 8x64 | `21/t11/s14/k1 (6.27us)` → `21/t11/s20/k1 (5.12us)` (18.37%) | `6/t18/s12/k1 (8.99us)` → same (0.00%) | `21/t11/s20/k1 (11.06us)` → `6/t15/s17/k2 (10.85us)` (1.85%) | `21/t11/s7/k1 (3.07us)` → same (0.00%) | `21/t11/s13/k1 (3.23us)` → same (0.00%) |
+| 8x96 | `21/t11/s14/k1 (6.33us)` → `21/t15/s12/k1 (5.53us)` (12.64%) | `21/t15/s12/k1 (12.04us)` → same (0.00%) | `21/t11/s14/k1 (15.36us)` → `21/t15/s12/k1 (13.11us)` (14.67%) | `21/t11/s7/k1 (3.69us)` → same (0.00%) | `21/t11/s7/k1 (3.75us)` → same (0.00%) |
+| 8x128 | `21/t11/s14/k1 (7.99us)` → `21/t15/s12/k1 (5.73us)` (28.20%) | `21/t15/s12/k1 (12.71us)` → same (0.00%) | `6/t15/s17/k1 (13.66us)` → `21/t15/s12/k1 (13.31us)` (2.53%) | `21/t11/s7/k1 (4.65us)` → same (0.00%) | `21/t11/s13/k1 (4.54us)` → `21/t11/s7/k1 (4.29us)` (5.50%) |
+| 8x160 | `6/t15/s17/k1 (7.52us)` → same (0.00%) | `5/t20/s7/k1 (14.52us)` → same (0.00%) | `6/t15/s17/k1 (14.13us)` → same (0.00%) | `21/t11/s7/k1 (6.14us)` → same (0.00%) | `21/t11/s13/k1 (5.12us)` → `21/t11/s7/k1 (4.89us)` (4.50%) |
+| 8x192 | `21/t11/s13/k1 (8.60us)` → `21/t11/s14/k1 (8.33us)` (3.12%) | `21/t15/s12/k1 (18.64us)` → same (0.00%) | `30/t18/s0/k3 (22.32us)` → `21/t15/s12/k2 (21.45us)` (3.93%) | `21/t11/s7/k1 (7.17us)` → same (0.00%) | `21/t11/s7/k1 (5.72us)` → same (0.00%) |
+| 8x256 | `6/t18/s12/k1 (9.20us)` → same (0.00%) | `30/t18/s0/k1 (21.68us)` → same (0.00%) | `30/t15/s0/k2 (25.18us)` → `6/t18/s12/k1 (23.75us)` (5.67%) | `5/t20/s7/k1 (11.48us)` → `5/t20/s7/k1 (10.85us)` (5.41%) | `21/t11/s7/k1 (7.58us)` → same (0.00%) |
+| 8x320 | `6/t18/s12/k1 (9.42us)` → `6/t17/s12/k1 (9.40us)` (0.20%) | `5/t20/s7/k1 (25.39us)` → `5/t21/s0/k1 (25.19us)` (0.78%) | `6/t18/s12/k1 (23.93us)` → same (0.00%) | `21/t11/s7/k1 (16.38us)` → `6/t18/s0/k1 (15.15us)` (7.50%) | `21/t11/s7/k1 (10.24us)` → same (0.00%) |
+| 8x384 | `21/t11/s7/k1 (12.90us)` → `21/t15/s12/k1 (12.06us)` (6.50%) | `30/t18/s0/k1 (31.99us)` → `21/t15/s12/k1 (31.12us)` (2.70%) | `21/t15/s12/k3 (34.86us)` → `21/t15/s12/k2 (34.61us)` (0.72%) | `5/t20/s7/k1 (25.81us)` → `21/t11/s7/k1 (22.56us)` (12.57%) | `21/t11/s7/k1 (12.90us)` → same (0.00%) |
+| 8x448 | `21/t15/s12/k1 (12.68us)` → same (0.00%) | `5/t20/s7/k1 (36.05us)` → `21/t15/s12/k1 (35.28us)` (2.13%) | `5/t20/s7/k3 (35.43us)` → same (0.00%) | `5/t20/s7/k1 (39.96us)` → `21/t11/s7/k1 (31.62us)` (20.88%) | `21/t11/s13/k1 (18.23us)` → same (0.00%) |
+| 8x512 | `21/t15/s12/k1 (13.29us)` → same (0.00%) | `5/t20/s7/k1 (36.45us)` → same (0.00%) | `30/t15/s0/k1 (41.37us)` → `21/t15/s12/k1 (37.68us)` (8.91%) | `5/t20/s7/k1 (52.40us)` → `21/t11/s7/k1 (42.80us)` (18.32%) | `21/t11/s13/k1 (22.66us)` → same (0.00%) |
+
+The microbenchmarks found real local wins, particularly HH at short sequence lengths and QK at 384–512. They did not aggregate into a material encoder win because many HI, PV, and middle-shape plans already used the measured best, while GEMMs are only part of the full device path.
+
+### Clock-matched stage delta
+
+Both rows are graph-off construction profiles on the clean replacement board after the common full warmup. Both post-run samples were P0 at `2550 MHz`. Values sum all ten bucket shapes.
+
+| Stage | Heuristic default | Enumerated | Delta |
+|---|---:|---:|---:|
+| Projection + MLP GEMMs | 5.099 ms | 5.007 ms | -0.092 ms |
+| Attention QK + PV GEMMs | 1.532 ms | 1.559 ms | +0.027 ms |
+| Fused scale + mask + softmax | 2.759 ms | 2.726 ms | -0.033 ms |
+| Bias/GELU, residual/norm, layout kernels | 2.555 ms | 2.533 ms | -0.022 ms |
+| Mean pool + L2 | 0.140 ms | 0.141 ms | +0.001 ms |
+| **Profiled device total** | **12.085 ms** | **11.966 ms** | **-0.119 ms (-0.98%)** |
+
+The total candidate-timing phase was `68.462 ms` across ten shapes. End-to-end cold load was `539.886 ms` for the heuristic control and `577.951 ms` for enumeration, a `38.065 ms` increase. The smaller wall delta reflects cold work shared by both paths, including descriptor creation, first cuBLASLt heuristic initialization, common warmup, capture, and graph instantiation.
+
+### Five-by-two fresh-process protocol
+
+Every row is a fresh 400-item process. Each cell started only after `nvidia-smi` reported at most `5%` utilization, was wrapped in `timeout --signal=TERM --kill-after=10s 90s`, passed the frozen parity gate, and reported bit-exact captured-versus-uncaptured output for all ten shapes. Post-run samples were P0 at `2550–2640 MHz`; sampled power was `83–138 W` after work had drained.
+
+| Repeat | Enumerated graph-off tok/s | Enumerated graph-on tok/s |
+|---:|---:|---:|
+| 1 | 320,290.9 | 334,733.6 |
+| 2 | 321,816.7 | 332,995.5 |
+| 3 | 326,747.6 | 332,735.4 |
+| 4 | 321,336.5 | 330,248.4 |
+| 5 | 334,135.4 | 321,938.1 |
+| **Mean** | **324,865.4** | **330,530.2** |
+| **Median** | **321,816.7** | **332,735.4** |
+| **Range** | **320,291–334,135** | **321,938–334,734** |
+
+Independent fresh processes sometimes selected different near-tied configurations, so graph-off and graph-on r1 vector files were not byte-identical to each other. This was not capture instability: each process fixed its chosen algorithm before capture, and every captured launch was bit-exact with that process's uncaptured output. Mean cosine ranged from `0.9999995982` to `0.9999995989`; mean top-10 overlap was `0.999000–0.999250`.
+
+### Commands executed
+
+The minimal workspace was built and gated with:
+
+```sh
+source ~/.cargo/env
+export PATH=/usr/local/cuda/bin:$PATH CUDA_HOME=/usr/local/cuda
+# The replacement driver requires an sm_89 SASS-only benchmark build.
+cargo build --release --features cuda \
+  --manifest-path bench/spikes/unified-rt/Cargo.toml
+cargo test --features cuda --manifest-path bench/spikes/unified-rt/Cargo.toml
+```
+
+Each performance cell used the following shape, with `MODE`, `REPEAT`, and `ENUMERATE` varied by the protocol. `SYNAPSE_CUDA_ENUMERATE=0` selected the first heuristic for the control; the candidate omitted that override.
+
+```sh
+until [ "$(nvidia-smi --query-gpu=utilization.gpu \
+  --format=csv,noheader,nounits)" -le 5 ]; do sleep 2; done
+export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/usr/local/cuda/lib64
+SYNAPSE_CUDA_ENUMERATE="$ENUMERATE" \
+  timeout --signal=TERM --kill-after=10s 90s \
+  ./target/release/spike-unified-rt \
+  --model /work/model --tokenizer /work/model/tokenizer.json \
+  --corpus /work/data/minilm-corpus-1000-official.jsonl \
+  --reference /work/data/ort-minilm-1000-vectors-official.jsonl \
+  --limit 400 --out "/tmp/wave4-${MODE}-r${REPEAT}.json" \
+  --vectors-out "/tmp/wave4-${MODE}-r${REPEAT}-vectors.jsonl" \
+  --dtype f16 --device cuda --cuda-graphs "$GRAPHS" \
+  --model-label "wave4-${MODE}-r${REPEAT}"
+```
+
+### Wave-4 verdict
+
+**PRUNE.** Enumeration improved the fair device total by only `0.98%`, below the explicit `3%` retention threshold. The CUDA source was restored to the retained heuristic-default implementation. Because the win was not material, no JSON sidecar cache was retained and the wave-3 fused-QKV branch was not re-tested; both were conditional on clearing the material-win gate. The negative result also closes the specific algorithm-selection lever identified by waves 2 and 3 on this driver: isolated GEMM classes can choose substantially better configurations, but exhaustive per-shape selection does not materially move the complete encoder.
+
+Raw `wave4-*.json` process results, all 50 full algorithm identities, the stage/cold-load calculations, and P-state annotations are in [`results/cuda-day1/`](results/cuda-day1/). The commands used were the day-1 benchmark command with bucket-policy v1, `SYNAPSE_CUDA_ENUMERATE=0` for the heuristic control, and the experimental enumeration build for candidate cells. Long cells were timeout-wrapped and preceded by an idle-utilization gate as described above.
