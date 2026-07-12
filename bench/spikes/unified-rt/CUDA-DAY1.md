@@ -218,3 +218,56 @@ The full candidate's exploratory ranges were graph-off `472,415–599,246 tok/s`
 Flash-attention promotion does **not** trigger. After reverting the failed layout branch, GEMMs again account for `54.4%` of the stable device profile, softmax/score traffic `22.5%`, pointwise plus transposes `22.8%`, and pooling `0.3%`. The next branch is GEMM layout and algorithm work: preserve a single `batch * heads` attention batch while eliminating layout traffic, likely through a genuinely fused projection/output path rather than per-head cuBLASLt views. Flash attention remains behind evidence that score/softmax traffic dominates after a non-regressing layout strategy.
 
 Raw `wave2-*.json` files, the machine-readable delta table, power annotations, and the updated rig fingerprint are in [`results/cuda-day1/`](results/cuda-day1/). Nsight Compute remains blocked by `ERR_NVGPUCTRPERM`; no counter-derived utilization claim is made.
+
+
+## Wave 3: fused QKV without attention-batch fragmentation
+
+Wave 3 built the branch named by the wave-2 verdict and pruned it. At model load, each layer's Q, K, and V weights were concatenated into one f16 allocation and their biases into one f16 vector. A column-major transpose-equivalent cuBLASLt descriptor computed the physical row-major `[batch * sequence, 3 * hidden]` result with `CUBLASLT_EPILOGUE_BIAS`. One custom kernel then interleaved that result into the original BHSD Q/K/V arena. QK and PV were unchanged and retained one strided cuBLASLt batch over `batch * heads`; unlike wave 2, no per-head GEMM calls were introduced.
+
+The candidate reduced retained calls from 85 to 73 per bucket and reduced the largest arena from `427,867,360` to `390,812,896` bytes. It passed every correctness and capture gate, but it lost the clock-matched CUDA-event comparison and was reverted. The final CUDA source is again the day-1 implementation.
+
+### Correctness and capture contract
+
+All ten fresh 400-row candidate processes passed the frozen gate with mean cosine `0.9999996267` and mean top-10 overlap `0.998750`. Every process constructed the warmup shape and all five corpus shapes with `captured_exact=true`. The graph-on and graph-off r1 vector JSONL files were byte-identical under `cmp`.
+
+The fused bias descriptor was supported on CUDA 12.8 for every shape and remained capture-stable. Its selected algorithm ids were `21` for 1x128 and 1x300, `6` for 148x163, 110x189, and 90x210, and `5` for 51x243; all selected zero workspace. This differs from the hidden-to-hidden algorithms for several large shapes, so algorithm identity cannot be inferred merely from equal FLOPs.
+
+### Clock-matched stage delta and retention decision
+
+The retained control is wave 2's 2790 MHz day-1 profile. The candidate is `wave3-fused-qkv-on-r3`, also sampled at 2790 MHz after the process. Both tables sum the uncaptured construction profiles for the warmup and five corpus shapes, matching the established measurement method.
+
+| Stage | Retained baseline | Fused-QKV candidate | Delta |
+|---|---:|---:|---:|
+| Projection + MLP GEMMs | 16.152 ms | 21.046 ms | +4.894 ms |
+| Attention QK + PV GEMMs | 6.388 ms | 6.409 ms | +0.021 ms |
+| Fused scale + mask + softmax | 9.345 ms | 9.595 ms | +0.250 ms |
+| Bias/GELU, residual/norm, QKV/context layout | 9.434 ms | 9.283 ms | -0.151 ms |
+| Mean pool + L2 | 0.131 ms | 0.132 ms | +0.001 ms |
+| **Profiled device total** | **41.450 ms** | **46.465 ms** | **+5.015 ms (+12.10%)** |
+
+Inside the candidate's projection row, the fused QKV GEMM accounted for `4.203 ms` and the remaining projection/MLP GEMMs for `16.843 ms`. The interleave kernel cost `2.549 ms`, the unchanged context transpose `0.730 ms`, and other pointwise work `6.004 ms`. Moving bias into the GEMM therefore removed little layout-stage time: the day-1 kernel had already combined three bias additions and three transposes into one launch. The extra fused GEMM class and its selected algorithms raised the measured projection stage enough to dominate the small layout saving.
+
+The context transpose was only `1.57%` of the candidate device total. Replacing it with a more specialized symmetric kernel was not promoted: its maximum possible saving could not recover the fused-QKV regression, and the existing kernel already performs one BHSD-to-BSH pass before output projection.
+
+### Five-by-two fresh-process throughput
+
+Each row is a fresh process. The board remained P2 with the 425 W software power cap active. The state shown was sampled immediately after the process; the 2790 MHz samples mixed with capped lower-clock samples, so the overlapping ranges do not override the event-profile regression.
+
+| Repeat | Fused graph-off tok/s and state | Fused graph-on tok/s and state |
+|---:|---|---|
+| 1 | 560,693.6 — 375.28 W, 2790 MHz | 400,968.4 — 423.67 W, 2490 MHz |
+| 2 | 548,485.3 — 365.45 W, 2790 MHz | 521,182.3 — 385.05 W, 2790 MHz |
+| 3 | 450,546.9 — 424.00 W, 2505 MHz | 401,669.0 — 424.33 W, 2460 MHz |
+| 4 | 424,048.4 — 423.60 W, 2040 MHz | 401,405.7 — 420.57 W, 2790 MHz |
+| 5 | 429,573.0 — 404.79 W, 2790 MHz | 391,461.6 — 423.85 W, 2295 MHz |
+| **Mean** | **482,669.5** | **423,337.4** |
+| **Median** | **450,546.9** | **401,405.7** |
+| **Range** | **424,048–560,694** | **391,462–521,182** |
+
+For context, wave 2's retained five-process means were `498,523.0 tok/s` graph-off and `521,068.0 tok/s` graph-on, with ranges `399,500–591,996` and `428,655–596,300`. These are separate fresh-process samples under the same unstable software cap, not a claim that their mean deltas are deterministic.
+
+### Wave-3 verdict
+
+The fused path did not lower GEMM share: GEMMs rose from `54.38%` of the retained profile to `59.09%` of the candidate. Softmax was `20.65%`, so softmax is not the next dominant stage and flash-attention promotion still does not trigger. Nsight Compute remains blocked by `ERR_NVGPUCTRPERM`; no tensor-core utilization or occupancy improvement is claimed merely because three launches became one.
+
+The tree points to cuBLASLt algorithm tuning and steady/cold projection measurement, not another layout rewrite. A future fused-QKV attempt should enumerate and time algorithms for the `[rows, hidden] x [hidden, 3 * hidden]` class rather than accept the first heuristic result. QK/PV must continue to preserve the single `batch * heads` strided batch. Raw `wave3-*.json` files, the machine-readable delta and power table, and the updated fingerprint are in [`results/cuda-day1/`](results/cuda-day1/).
