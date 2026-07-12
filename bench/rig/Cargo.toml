@@ -1,0 +1,33 @@
+[package]
+name = "synapse-rig"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Hash-pinned external measurement rig for Synapse candidate runtimes"
+publish = false
+default-run = "synapse-rig"
+build = "build.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+hex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+synapse-bench = { path = "../harness" }
+tokenizers = { workspace = true }
+
+[[bin]]
+name = "synapse-rig"
+path = "src/main.rs"
+
+[[bin]]
+name = "rig-fixture-candidate"
+path = "src/bin/rig_fixture_candidate.rs"
+test = false
+doc = false
+
+[dev-dependencies]
+ahash = "0.8"

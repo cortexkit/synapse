@@ -3,3 +3,4 @@
 
 pub mod parity;
 pub mod results;
+pub mod rig_protocol;
