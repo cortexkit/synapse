@@ -89,6 +89,9 @@ struct Args {
     /// Shape policy used by the serving runner.
     #[arg(long, value_enum, default_value_t = Shapes::Bucketed)]
     shapes: Shapes,
+    /// Bucket policy version. Version 1 remains available for A/B measurements.
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=BUCKET_POLICY_VERSION as i64))]
+    bucket_policy: u32,
     /// Number of in-process corpus passes.
     #[arg(long, default_value_t = 1)]
     passes: usize,
@@ -128,8 +131,9 @@ enum Shapes {
 }
 
 const GRAPH_REVISION: u32 = 3;
-const BUCKET_POLICY_VERSION: u32 = 1;
-const BUCKET_MAX_BATCH_ROWS: usize = 8;
+const BUCKET_POLICY_VERSION: u32 = 2;
+const BUCKET_V1_MAX_BATCH_ROWS: usize = 8;
+const BUCKET_V2_BATCH_ROW_LADDER: &[usize] = &[16, 16, 16, 16, 16, 16, 12, 12, 8, 8];
 const BUCKET_SEQUENCE_LADDER: &[usize] = &[64, 96, 128, 160, 192, 256, 320, 384, 448, 512];
 const MAX_LARGE_CORPUS_RANK_QUERIES: usize = 100;
 
@@ -182,6 +186,7 @@ struct ServingResult {
     real_tokens: u64,
     padded_tokens: u64,
     padding_waste_fraction: f64,
+    padding_waste_gate_passed: Option<bool>,
     package_cache: PackageCacheStats,
     passes: Vec<PassResult>,
 }
@@ -249,7 +254,7 @@ impl MetalExecutionConfig {
                 .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
                 .filter(|build| !build.is_empty())
                 .unwrap_or_else(|| "unknown-os-build".to_owned());
-            let shape_key = shape_cache_key(args.shapes);
+            let shape_key = shape_cache_key(args.shapes, args.bucket_policy);
             root.join(format!(
                 "{family}-graph-v{GRAPH_REVISION}-{shape_key}-{:016x}-{}-{os_build}",
                 hash,
@@ -274,10 +279,10 @@ impl MetalExecutionConfig {
     }
 }
 
-fn shape_cache_key(shapes: Shapes) -> String {
+fn shape_cache_key(shapes: Shapes, bucket_policy: u32) -> String {
     match shapes {
         Shapes::Exact => "shapes-exact".to_owned(),
-        Shapes::Bucketed => format!("bucket-policy-v{BUCKET_POLICY_VERSION}"),
+        Shapes::Bucketed => format!("bucket-policy-v{bucket_policy}"),
     }
 }
 
@@ -316,7 +321,7 @@ fn main() -> Result<()> {
         .map_err(|error| anyhow::anyhow!("tokenizer: {error}"))?;
     model.configure_tokenizer(&mut tokenizer, args.max_length)?;
 
-    let bucket_shapes = bucket_shapes(args.max_length, args.attention_units);
+    let bucket_shapes = bucket_shapes(args.max_length, args.attention_units, args.bucket_policy);
     ensure!(
         args.shapes != Shapes::Bucketed || bucket_shapes.len() <= 12,
         "bucket policy produced {} shapes; serving limit is 12",
@@ -457,13 +462,6 @@ fn main() -> Result<()> {
         };
         let padding_waste_fraction =
             padding_waste_fraction(workload.input_tokens, workload.padded_tokens);
-        if args.shapes == Shapes::Bucketed {
-            ensure!(
-                padding_waste_fraction < 0.15,
-                "bucket padding waste {:.2}% exceeds the 15% serving gate",
-                padding_waste_fraction * 100.0
-            );
-        }
         passes.push(PassResult {
             pass: pass + 1,
             label: pass_label(pass, args.passes),
@@ -505,7 +503,7 @@ fn main() -> Result<()> {
             args.execution,
             args.package_cache.as_ref().map_or("disabled".into(), |path| path.display().to_string()),
             args.shapes,
-            if args.shapes == Shapes::Bucketed { BUCKET_POLICY_VERSION.to_string() } else { "none".to_owned() },
+            if args.shapes == Shapes::Bucketed { args.bucket_policy.to_string() } else { "none".to_owned() },
             args.passes,
             args.attention_units,
             args.max_length,
@@ -522,8 +520,10 @@ fn main() -> Result<()> {
         real_tokens: last.input_tokens,
         padded_tokens: last.padded_tokens,
         padding_waste_fraction: last.padding_waste_fraction,
+        padding_waste_gate_passed: (args.shapes == Shapes::Bucketed)
+            .then_some(last.padding_waste_fraction < 0.15),
         shape_policy: args.shapes,
-        bucket_policy_version: (args.shapes == Shapes::Bucketed).then_some(BUCKET_POLICY_VERSION),
+        bucket_policy_version: (args.shapes == Shapes::Bucketed).then_some(args.bucket_policy),
         bucket_shapes: if args.shapes == Shapes::Bucketed {
             bucket_shapes
         } else {
@@ -552,6 +552,11 @@ fn main() -> Result<()> {
         result.lane.parity_mean_cosine
     );
     println!("{}", serde_json::to_string_pretty(&result)?);
+    ensure!(
+        args.shapes != Shapes::Bucketed || result.padding_waste_fraction < 0.15,
+        "bucket padding waste {:.2}% exceeds the 15% serving gate",
+        result.padding_waste_fraction * 100.0
+    );
     Ok(())
 }
 
@@ -933,8 +938,7 @@ fn run_rerank_cli(
         dtype: args.dtype.as_str(),
         execution: args.execution,
         shape_policy: args.shapes,
-        bucket_policy_version: (args.shapes == Shapes::Bucketed)
-            .then_some(BUCKET_POLICY_VERSION),
+        bucket_policy_version: (args.shapes == Shapes::Bucketed).then_some(args.bucket_policy),
         bucket_shapes: if args.shapes == Shapes::Bucketed {
             bucket_shapes.to_vec()
         } else {
@@ -1193,7 +1197,7 @@ fn make_provider(
     }
 }
 
-fn bucket_shapes(max_length: usize, attention_units: usize) -> Vec<BatchShape> {
+fn bucket_shapes(max_length: usize, attention_units: usize, bucket_policy: u32) -> Vec<BatchShape> {
     let mut sequence_lengths = BUCKET_SEQUENCE_LADDER
         .iter()
         .copied()
@@ -1204,9 +1208,20 @@ fn bucket_shapes(max_length: usize, attention_units: usize) -> Vec<BatchShape> {
     sequence_lengths.dedup();
     sequence_lengths
         .into_iter()
-        .map(|seq| BatchShape {
-            batch: BUCKET_MAX_BATCH_ROWS.min((attention_units / seq.saturating_mul(seq)).max(1)),
-            seq,
+        .enumerate()
+        .map(|(index, seq)| {
+            let policy_rows = match bucket_policy {
+                1 => BUCKET_V1_MAX_BATCH_ROWS,
+                2 => BUCKET_V2_BATCH_ROW_LADDER
+                    .get(index)
+                    .copied()
+                    .unwrap_or(BUCKET_V1_MAX_BATCH_ROWS),
+                _ => unreachable!("bucket policy is validated by clap"),
+            };
+            BatchShape {
+                batch: policy_rows.min((attention_units / seq.saturating_mul(seq)).max(1)),
+                seq,
+            }
         })
         .collect()
 }
@@ -3297,7 +3312,12 @@ mod tests {
         let default = Args::try_parse_from(base).expect("parse default serving arguments");
         assert_eq!(default.execution, Execution::Explicit);
         assert_eq!(default.shapes, Shapes::Bucketed);
+        assert_eq!(default.bucket_policy, 1);
         assert_eq!(default.passes, 1);
+        let v2 = Args::try_parse_from(base.into_iter().chain(["--bucket-policy", "2"]))
+            .expect("parse policy v2 override");
+        assert_eq!(v2.bucket_policy, 2);
+        assert!(Args::try_parse_from(base.into_iter().chain(["--bucket-policy", "3"])).is_err());
         let lazy = Args::try_parse_from(base.into_iter().chain(["--execution", "lazy"]))
             .expect("parse lazy execution override");
         assert_eq!(lazy.execution, Execution::Lazy);
@@ -3305,22 +3325,36 @@ mod tests {
 
     #[test]
     fn bucket_policy_is_bounded_stable_and_capped_at_max_length() {
-        let shapes = bucket_shapes(512, 4_000_000);
-        assert_eq!(shapes.len(), 10);
+        let v1_shapes = bucket_shapes(512, 4_000_000, 1);
+        assert_eq!(v1_shapes.len(), 10);
         assert_eq!(
-            shapes,
+            v1_shapes,
             BUCKET_SEQUENCE_LADDER
                 .iter()
                 .map(|&seq| BatchShape { batch: 8, seq })
                 .collect::<Vec<_>>()
         );
         assert_eq!(
-            bucket_shapes(150, 4_000_000),
+            bucket_shapes(512, 4_000_000, 2),
+            BUCKET_SEQUENCE_LADDER
+                .iter()
+                .zip(BUCKET_V2_BATCH_ROW_LADDER)
+                .map(|(&seq, &batch)| BatchShape { batch, seq })
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            bucket_shapes(150, 4_000_000, 2),
             vec![
-                BatchShape { batch: 8, seq: 64 },
-                BatchShape { batch: 8, seq: 96 },
-                BatchShape { batch: 8, seq: 128 },
-                BatchShape { batch: 8, seq: 150 },
+                BatchShape { batch: 16, seq: 64 },
+                BatchShape { batch: 16, seq: 96 },
+                BatchShape {
+                    batch: 16,
+                    seq: 128,
+                },
+                BatchShape {
+                    batch: 16,
+                    seq: 150,
+                },
             ]
         );
     }
@@ -3329,7 +3363,7 @@ mod tests {
     fn bucket_batcher_maps_to_covering_shapes_and_pads_tail_rows() {
         let lengths = vec![60, 60, 60, 60, 60, 60, 60, 60, 65, 65];
         let order = (0..lengths.len()).collect::<Vec<_>>();
-        let buckets = bucket_shapes(512, 4_000_000);
+        let buckets = bucket_shapes(512, 4_000_000, 1);
         let batches = planned_batches(&order, &lengths, 4_000_000, Shapes::Bucketed, &buckets);
         assert_eq!(batches.len(), 2);
         assert_eq!(batches[0].range, 0..8);
@@ -3340,8 +3374,9 @@ mod tests {
 
     #[test]
     fn package_cache_identity_includes_shape_policy() {
-        assert_eq!(shape_cache_key(Shapes::Exact), "shapes-exact");
-        assert_eq!(shape_cache_key(Shapes::Bucketed), "bucket-policy-v1");
+        assert_eq!(shape_cache_key(Shapes::Exact, 1), "shapes-exact");
+        assert_eq!(shape_cache_key(Shapes::Bucketed, 1), "bucket-policy-v1");
+        assert_eq!(shape_cache_key(Shapes::Bucketed, 2), "bucket-policy-v2");
     }
 
     #[test]

@@ -4,7 +4,7 @@
 
 The locked M1 confirms the fixed-eight-row steady-throughput regression seen on the contended local host. Against cache-matched exact mode, bucketed v1 is slower by 17.0% on MiniLM and 4.6% on gte-ModernBERT for MISS, and by 16.0% and 4.4% respectively for HIT. Qwen3 also regresses by 2.7% in both cache states. The result is consistent across first, warm, and steady passes; it is not a compilation artifact.
 
-Policy v1 remains bounded and valid: every bucketed cell has exactly ten packages, package inventories do not change during inference, all four corpora stay below 15% padding waste, and all parity gates pass. For policy v2, the next experiment should test the sequence-indexed row ladder `16/16/16/16/16/16/12/12/8/8` for sequence buckets `64/96/128/160/192/256/320/384/448/512`. This raises concurrency where the three short standard corpora concentrate while leaving the long MC buckets conservative. It is a test candidate, not an adoption recommendation: it must retain the `<15%` waste gate and use a new `bucket-policy-v2` cache identity.
+Policy v1 remains bounded and valid: every bucketed cell has exactly ten packages, package inventories do not change during inference, all four corpora stay below 15% padding waste, and all parity gates pass. The defined policy-v2 ladder `16/16/16/16/16/16/12/12/8/8` was subsequently tested and rejected. It improves MiniLM over v1 but remains 9.9–10.6% behind exact, barely moves gte or MC, and fails the padding gate at 17.71% MiniLM and 18.45% gte. The retained [Policy v2](#policy-v2--rejected) section contains the full matrix.
 
 ## Host, binary, and protocol
 
@@ -105,3 +105,80 @@ The eight-row bucket policy does not leave the GPU broadly idle: effective use i
 ## Reproduction and retained artifacts
 
 The committed `run-m1-bucket-matrix.sh` contains the lock/retry guard, model snapshots, mode and cache ordering, macmon capture, fresh-root handling, and package-inventory check. `summarize-m1-bucket-matrix.py` derives the committed power and inventory summaries from the raw M1 files. Raw process logs, macmon JSONL, and before/after inventories remain at `[bench-user-home]/bench-tools/unified-rt-serving/results/m1-bucket-matrix/`. The 15 harness result JSON files and two evidence summaries are committed under `results/m1-bucket-matrix/`.
+
+## Policy v2 — rejected
+
+### Verdict
+
+Do **not** adopt policy v2 as specified. It raises MiniLM steady throughput by 7.7% on MISS and 7.3% on HIT relative to v1, but it still trails exact mode by 10.6% and 9.9%. It does not materially move gte-ModernBERT or MC: their MISS gains over v1 are only 0.24%, leaving gaps to exact mode of 4.4% and 4.6%. Qwen3 improves by 4.1% over v1 and finishes 1.3% above exact on MISS, but that isolated win cannot rescue the candidate.
+
+The decisive failure is padding. The larger short-sequence rows raise MiniLM waste from 13.62% to 17.71% and gte-ModernBERT from 13.57% to 18.45%. Both violate the strict `<15%` gate. Qwen3 (13.92%) and MC (7.28%) pass. The ladder was tested unchanged; no corpus-specific tuning was applied.
+
+Policy v2 preserves the bounded-package property: every cell has exactly ten packages, all eight recursive inventories remain unchanged during inference, and MC still uses 93.7% fewer packages and bytes than exact mode (10 and 1.30 MB versus 158 and 20.49 MB). These wins are not sufficient for adoption when two canonical corpora fail the serving gate. Policy v1 therefore remains the selectable default, and exact mode remains available for A/B measurements.
+
+### Revision and protocol caveat
+
+The v2 binary was built from base revision `6aea8ccd334123157c6aad91650faf9f0cf74b1a` plus the policy-v2 changes in this commit; its SHA-256 is `da4ffedce076173b4c4c51e2ee8a4c3e789d8f56968189207b7529b8d8543958`. The committed v1 comparison rows used revision `fb8a7276986f122b945274891843a3fe9dc8c92c` and binary `3b92806c…f9e2b3`, so the percentages below are a cross-revision A/B rather than a same-binary toggle. The v2 performance change is isolated to bucket selection, versioned cache identity, and auditable gate reporting, but the revision difference remains a measurement caveat. The final source subsequently corrected the version number in rerank result metadata; that branch is not reached by embedding measurements.
+
+Current-source ModernBERT distinguishes the reranker by `classifier_pooling`, while the retained embedding snapshot also carries that metadata despite having no classification tensors. The M1 staging view removed only that metadata field so the same `e7f32e3c…` embedding weights and tokenizer continued through the established CLS-plus-L2 path. No model tensor, tokenizer, corpus, or reference changed.
+
+All cells otherwise followed the earlier locked protocol: Metal with MiniLM f16, gte fp32, and Qwen3 f16; a 4,000,000-unit budget; maximum length 512; three in-process passes; a fresh policy-v2 package root for MISS followed by a fresh HIT process; lock acquisition with five-minute retry; an empty `Runner.Worker` check; and a trap that kills macmon before releasing the lock. macmon produced an idle sample and then waited another two seconds before each timed process. The runner retained result JSON and returned a gate failure after all three passes for MiniLM and gte, allowing the failed policy to remain auditable without weakening the exit-status gate.
+
+### Locked matrix
+
+Each pass cell is `infer wall / real-token throughput`. All eight processes ran three passes and every pass passed its family parity gates.
+
+| Family/corpus | cache | load | packages | bytes | first | warm | steady |
+|---|---|---:|---:|---:|---:|---:|---:|
+| MiniLM f16 | MISS | 0.624 s | 10 | 558,982 | 0.529 s / 126,188 tok/s | 0.531 s / 125,655 tok/s | 0.529 s / 126,205 tok/s |
+| MiniLM f16 | HIT | 0.453 s | 10 | 558,982 | 0.534 s / 125,047 tok/s | 0.531 s / 125,747 tok/s | 0.528 s / 126,550 tok/s |
+| gte-ModernBERT fp32 | MISS | 2.481 s | 10 | 1,296,744 | 2.841 s / 22,119 tok/s | 2.836 s / 22,160 tok/s | 2.837 s / 22,146 tok/s |
+| gte-ModernBERT fp32 | HIT | 1.934 s | 10 | 1,296,744 | 2.835 s / 22,163 tok/s | 2.836 s / 22,154 tok/s | 2.835 s / 22,168 tok/s |
+| Qwen3 f16 | MISS | 6.597 s | 10 | 2,677,408 | 6.591 s / 7,087 tok/s | 6.582 s / 7,098 tok/s | 6.586 s / 7,093 tok/s |
+| Qwen3 f16 | HIT | 5.513 s | 10 | 2,677,408 | 6.589 s / 7,090 tok/s | 6.593 s / 7,085 tok/s | 6.593 s / 7,086 tok/s |
+| gte-ModernBERT MC fp32 | MISS | 5.743 s | 10 | 1,296,744 | 182.731 s / 22,832 tok/s | 182.759 s / 22,829 tok/s | 182.699 s / 22,836 tok/s |
+| gte-ModernBERT MC fp32 | HIT | 5.132 s | 10 | 1,296,744 | 182.740 s / 22,831 tok/s | 182.726 s / 22,833 tok/s | 182.636 s / 22,844 tok/s |
+
+### Steady comparison
+
+The exact and v1 columns are the committed rows above; v2 is the new observation. MC exact has only the planned MISS cell.
+
+| Family/corpus | cache | exact steady | v1 steady | v2 steady | v2 vs exact | v2 vs v1 |
+|---|---|---:|---:|---:|---:|---:|
+| MiniLM | MISS | 141,113 | 117,139 | 126,205 | -10.6% | +7.7% |
+| MiniLM | HIT | 140,428 | 117,896 | 126,550 | -9.9% | +7.3% |
+| gte-ModernBERT | MISS | 23,168 | 22,094 | 22,146 | -4.4% | +0.24% |
+| gte-ModernBERT | HIT | 23,157 | 22,132 | 22,168 | -4.3% | +0.16% |
+| Qwen3 | MISS | 7,001 | 6,815 | 7,093 | +1.3% | +4.1% |
+| Qwen3 | HIT | 7,009 | 6,819 | 7,086 | +1.1% | +3.9% |
+| gte-ModernBERT MC | MISS | 23,929 | 22,781 | 22,836 | -4.6% | +0.24% |
+
+### Padding gate and parity
+
+| Corpus | real tokens | padded tokens | waste | gate | lowest cosine | lowest top-10 |
+|---|---:|---:|---:|---|---:|---:|
+| MiniLM standard | 66,783 | 81,152 | 17.71% | **FAIL** | 0.99999932 | 0.999250 |
+| gte-ModernBERT standard | 62,838 | 77,056 | 18.45% | **FAIL** | 1.00000000 | 1.000000 |
+| Qwen3 standard | 46,716 | 54,272 | 13.92% | PASS | 0.99999880 | 0.998500 |
+| gte-ModernBERT MC | 4,172,183 | 4,499,712 | 7.28% | PASS | 1.00000000 | 1.000000 |
+
+The larger row buckets add 3,840 padded token slots for MiniLM and 4,352 for gte relative to v1. Qwen3 adds 768 slots and remains within the gate. MC adds only 512 because its rows remain concentrated in the conservative long-sequence buckets.
+
+### Steady-pass GPU power
+
+| Family/corpus | cache | samples | mean GPU use | mean GPU power | max GPU power |
+|---|---|---:|---:|---:|---:|
+| MiniLM | MISS | 4 | 62.3% | 20.30 W | 27.72 W |
+| MiniLM | HIT | 4 | 62.7% | 20.48 W | 27.45 W |
+| gte-ModernBERT | MISS | 18 | 90.7% | 40.34 W | 44.31 W |
+| gte-ModernBERT | HIT | 18 | 91.4% | 41.03 W | 45.54 W |
+| Qwen3 | MISS | 42 | 95.7% | 40.85 W | 45.45 W |
+| Qwen3 | HIT | 41 | 97.3% | 41.94 W | 45.01 W |
+| gte-ModernBERT MC | MISS | 1,143 | 92.2% | 41.63 W | 48.32 W |
+| gte-ModernBERT MC | HIT | 1,289 | 92.5% | 41.72 W | 48.16 W |
+
+The extra rows raise gte power by roughly 2.5–3.4 W versus v1 without a meaningful throughput gain. MiniLM gains throughput while its short power windows remain near 20 W, but the gain is not enough to close exact mode and comes with a gate failure.
+
+### Retained evidence
+
+`run-m1-policy-v2.sh` is the executed campaign script. The eight result files, macmon-derived power summary, and byte-for-byte package inventory summary are committed under `results/m1-policy-v2/`. Raw logs, macmon JSONL, gate-status files, and before/after inventories remain at `[bench-user-home]/bench-tools/unified-rt-serving/results/m1-policy-v2/` on the M1.
