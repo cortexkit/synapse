@@ -1,0 +1,24 @@
+#version 460
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_scalar_block_layout : require
+layout(local_size_x = 256) in;
+layout(set=0,binding=0,scalar) readonly buffer Input { float values[]; } input_values;
+layout(set=0,binding=1,scalar) writeonly buffer Output { float16_t values[]; } output_values;
+layout(push_constant) uniform Params { uint rows; uint width; uint unused0; uint unused1; } p;
+float erf_approx(float value) {
+    float sign_value = value < 0.0 ? -1.0 : 1.0;
+    float x = abs(value);
+    float t = 1.0 / (1.0 + 0.3275911 * x);
+    float polynomial = (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t;
+    return sign_value * (1.0 - polynomial * exp(-x * x));
+}
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= p.rows * p.width) return;
+    uint row = index / p.width;
+    uint column = index % p.width;
+    uint base = row * p.width * 2;
+    float gate = input_values.values[base + column];
+    float gelu = 0.5 * gate * (1.0 + erf_approx(gate * 0.7071067811865475));
+    output_values.values[index] = float16_t(gelu * input_values.values[base + p.width + column]);
+}

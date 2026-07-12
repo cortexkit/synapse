@@ -7,7 +7,7 @@
 use std::any::Any;
 use std::path::Path;
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{ensure, Context, Result};
 use serde::Deserialize;
 use tokenizers::Tokenizer;
 
@@ -355,7 +355,13 @@ fn new_block_context(
         BlockBackend::Cuda { graphs } => {
             BlockContextBackend::Cuda(super::cuda_backend::Qwen3Context::new(graphs, precision)?)
         }
-        BlockBackend::Vulkan { .. } => bail!("Vulkan day-1 supports MiniLM only"),
+        BlockBackend::Vulkan {
+            gemm,
+            pipeline_cache,
+        } => BlockContextBackend::Vulkan(super::vulkan_backend::Qwen3Context::new(
+            gemm,
+            pipeline_cache,
+        )?),
     };
     Ok(Box::new(BlockContext { backend }))
 }
@@ -363,6 +369,7 @@ fn new_block_context(
 enum BlockContextBackend {
     Metal(MetalContext),
     Cuda(super::cuda_backend::Qwen3Context),
+    Vulkan(super::vulkan_backend::Qwen3Context),
 }
 
 struct BlockContext {
@@ -418,6 +425,39 @@ impl BlockContext {
                         gate_weight: layer.gate_proj.tensor.data.as_ptr(),
                         up_weight: layer.up_proj.tensor.data.as_ptr(),
                         down_weight: layer.down_proj.tensor.data.as_ptr(),
+                    })
+                    .collect::<Vec<_>>();
+                context.forward(
+                    hidden_states,
+                    attention_mask,
+                    batch,
+                    seq,
+                    hidden,
+                    query_heads,
+                    kv_heads,
+                    head_dim,
+                    intermediate,
+                    epsilon,
+                    rope_theta,
+                    &params,
+                    &final_norm.weight.data,
+                )
+            }
+            BlockContextBackend::Vulkan(context) => {
+                let params = layers
+                    .iter()
+                    .map(|layer| super::vulkan_backend::Qwen3Layer {
+                        input_norm: &layer.input_norm.weight.data,
+                        post_attention_norm: &layer.post_attention_norm.weight.data,
+                        q_weight: &layer.q_proj.tensor.data,
+                        q_norm: &layer.q_norm.weight.data,
+                        k_weight: &layer.k_proj.tensor.data,
+                        k_norm: &layer.k_norm.weight.data,
+                        v_weight: &layer.v_proj.tensor.data,
+                        o_weight: &layer.o_proj.tensor.data,
+                        gate_weight: &layer.gate_proj.tensor.data,
+                        up_weight: &layer.up_proj.tensor.data,
+                        down_weight: &layer.down_proj.tensor.data,
                     })
                     .collect::<Vec<_>>();
                 context.forward(

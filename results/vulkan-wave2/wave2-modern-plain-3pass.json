@@ -1,0 +1,103 @@
+{
+  "lane": "owned-rt-vulkan-plain-fused-family-command-buffer",
+  "workload": "embed-corpus-v1",
+  "model": "Alibaba-NLP/gte-modernbert-base@owned-rt-f16",
+  "cold_load_s": 9.1487624,
+  "infer_wall_s": 29.8104414,
+  "input_tokens": 62838,
+  "tok_per_s": 2107.9191400366185,
+  "items": 400,
+  "parity_mean_cosine": 0.9999989703650753,
+  "self_peak_rss_bytes": null,
+  "notes": "ModernBERT CLS+l2, RoPE, alternating full/local-128 attention, GeGLU, pre-norm, provider=vulkan-plain-fused-family-command-buffer, dtype=f16, execution=Explicit, package_cache=disabled, shapes=Bucketed, policy_version=1, passes=3, length-sorted attention_units=4000000, max_len=512; all bucket shapes were pre-discovered before inference",
+  "shape_policy": "bucketed",
+  "bucket_policy_version": 1,
+  "bucket_shapes": [
+    {
+      "batch": 8,
+      "seq": 64
+    },
+    {
+      "batch": 8,
+      "seq": 96
+    },
+    {
+      "batch": 8,
+      "seq": 128
+    },
+    {
+      "batch": 8,
+      "seq": 160
+    },
+    {
+      "batch": 8,
+      "seq": 192
+    },
+    {
+      "batch": 8,
+      "seq": 256
+    },
+    {
+      "batch": 8,
+      "seq": 320
+    },
+    {
+      "batch": 8,
+      "seq": 384
+    },
+    {
+      "batch": 8,
+      "seq": 448
+    },
+    {
+      "batch": 8,
+      "seq": 512
+    }
+  ],
+  "real_tokens": 62838,
+  "padded_tokens": 72704,
+  "padding_waste_fraction": 0.13570092429577466,
+  "padding_waste_gate_passed": true,
+  "package_cache": {
+    "package_count": 0,
+    "package_bytes": 0
+  },
+  "passes": [
+    {
+      "pass": 1,
+      "label": "first",
+      "infer_wall_s": 27.5603051,
+      "input_tokens": 62838,
+      "padded_tokens": 72704,
+      "padding_waste_fraction": 0.13570092429577466,
+      "tok_per_s": 2280.018300668232,
+      "items": 400,
+      "parity_mean_cosine": 0.9999989703650753,
+      "top10_rank_overlap": 0.9984999999999999
+    },
+    {
+      "pass": 2,
+      "label": "warm",
+      "infer_wall_s": 29.2016657,
+      "input_tokens": 62838,
+      "padded_tokens": 72704,
+      "padding_waste_fraction": 0.13570092429577466,
+      "tok_per_s": 2151.863549345406,
+      "items": 400,
+      "parity_mean_cosine": 0.9999989703650753,
+      "top10_rank_overlap": 0.9984999999999999
+    },
+    {
+      "pass": 3,
+      "label": "steady",
+      "infer_wall_s": 29.8104414,
+      "input_tokens": 62838,
+      "padded_tokens": 72704,
+      "padding_waste_fraction": 0.13570092429577466,
+      "tok_per_s": 2107.9191400366185,
+      "items": 400,
+      "parity_mean_cosine": 0.9999989703650753,
+      "top10_rank_overlap": 0.9984999999999999
+    }
+  ]
+}

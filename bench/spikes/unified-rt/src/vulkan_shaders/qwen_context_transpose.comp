@@ -1,0 +1,22 @@
+#version 460
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_scalar_block_layout : require
+layout(local_size_x = 256) in;
+layout(set=0,binding=0,scalar) readonly buffer Input { float values[]; } input_values;
+layout(set=0,binding=1,scalar) writeonly buffer Output { float16_t values[]; } output_values;
+layout(push_constant) uniform Params { uint batch; uint seq; uint query_heads; uint kv_heads; uint head_dim; } p;
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    uint total = p.batch * p.seq * p.query_heads * p.head_dim;
+    if (index >= total) return;
+    uint dimension = index % p.head_dim;
+    uint remainder = index / p.head_dim;
+    uint head = remainder % p.query_heads; remainder /= p.query_heads;
+    uint position = remainder % p.seq;
+    uint batch_index = remainder / p.seq;
+    uint groups = p.query_heads / p.kv_heads;
+    uint group = head % groups;
+    uint kv_head = head / groups;
+    uint source = ((group * p.batch * p.kv_heads + batch_index * p.kv_heads + kv_head) * p.seq + position) * p.head_dim + dimension;
+    output_values.values[index] = float16_t(input_values.values[source]);
+}

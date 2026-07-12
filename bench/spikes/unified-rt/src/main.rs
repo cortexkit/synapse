@@ -1665,7 +1665,7 @@ impl VulkanProvider {
     ) -> Result<Self> {
         ensure!(
             matches!(dtype, Precision::F16),
-            "MiniLM Vulkan requires --dtype f16"
+            "Vulkan family graphs require --dtype f16"
         );
         Ok(Self {
             block_contexts: HashMap::new(),
@@ -1695,13 +1695,14 @@ impl KernelProvider for VulkanProvider {
         _b_layout: BLayout,
         _c: &mut [f32],
     ) -> Result<()> {
-        bail!("Vulkan requires the MiniLM family-resident block path")
+        bail!("Vulkan requires a family-resident block path")
     }
 
     fn block_forward(&mut self, request: BlockForwardRequest<'_>) -> Result<bool> {
         ensure!(
-            request.family == "minilm",
-            "Vulkan day-1 supports MiniLM only"
+            matches!(request.family, "minilm" | "gte-modernbert" | "qwen3-0.6b"),
+            "Vulkan has no resident graph for family {}",
+            request.family
         );
         if !self.block_contexts.contains_key(request.family) {
             let context = (request.create_context)(
@@ -2983,7 +2984,7 @@ fn new_minilm_block_context(
         } => {
             ensure!(
                 matches!(precision, Precision::F16),
-                "MiniLM Vulkan requires --dtype f16"
+                "Vulkan family graphs require --dtype f16"
             );
             MiniLmBlockGraph::Vulkan(vulkan_backend::VulkanContext::new(gemm, pipeline_cache)?)
         }

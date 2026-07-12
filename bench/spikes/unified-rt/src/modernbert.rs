@@ -915,7 +915,13 @@ fn new_block_context(
         BlockBackend::Cuda { graphs } => BlockContextBackend::Cuda(
             super::cuda_backend::ModernBertContext::new(graphs, precision)?,
         ),
-        BlockBackend::Vulkan { .. } => bail!("Vulkan day-1 supports MiniLM only"),
+        BlockBackend::Vulkan {
+            gemm,
+            pipeline_cache,
+        } => BlockContextBackend::Vulkan(super::vulkan_backend::ModernBertContext::new(
+            gemm,
+            pipeline_cache,
+        )?),
     };
     Ok(Box::new(BlockContext { backend }))
 }
@@ -923,6 +929,7 @@ fn new_block_context(
 enum BlockContextBackend {
     Metal(MetalContext),
     Cuda(super::cuda_backend::ModernBertContext),
+    Vulkan(super::vulkan_backend::ModernBertContext),
 }
 
 struct BlockContext {
@@ -978,6 +985,36 @@ impl BlockContext {
                     &model.final_norm,
                 )
             }
+            BlockContextBackend::Vulkan(context) => {
+                let params = model
+                    .layers
+                    .iter()
+                    .map(|layer| super::vulkan_backend::ModernBertLayer {
+                        qkv_weight: &layer.qkv.weight.data,
+                        attention_output_weight: &layer.attention_output.weight.data,
+                        attention_norm_weight: layer.attention_norm.as_deref(),
+                        mlp_input_weight: &layer.mlp_input.weight.data,
+                        mlp_output_weight: &layer.mlp_output.weight.data,
+                        mlp_norm_weight: &layer.mlp_norm,
+                        sliding_attention: matches!(layer.attention_type, AttentionType::Sliding),
+                    })
+                    .collect::<Vec<_>>();
+                context.forward(
+                    hidden_states,
+                    attention_mask,
+                    batch,
+                    seq,
+                    model.config.hidden_size,
+                    model.config.num_attention_heads,
+                    model.config.intermediate_size,
+                    model.config.norm_eps,
+                    model.config.global_rope_theta,
+                    model.config.local_rope_theta,
+                    model.config.local_attention / 2,
+                    &params,
+                    &model.final_norm,
+                )
+            }
         }
     }
 
@@ -996,6 +1033,9 @@ impl BlockContext {
             }
             BlockContextBackend::Cuda(_) => {
                 bail!("ModernBERT CUDA reranking is not part of the embedding-family path")
+            }
+            BlockContextBackend::Vulkan(_) => {
+                bail!("ModernBERT Vulkan reranking is not part of the embedding-family path")
             }
         }
     }
