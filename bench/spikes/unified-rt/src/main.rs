@@ -28,9 +28,12 @@ struct Args {
     /// Path to tokenizer.json.
     #[arg(long)]
     tokenizer: PathBuf,
-    /// Corpus JSONL ({id, path, text, tokens} per line).
+    /// Corpus JSONL ({id, path, text, tokens} per line). Required for embedding mode.
     #[arg(long)]
-    corpus: PathBuf,
+    corpus: Option<PathBuf>,
+    /// Rerank request JSONL ({id, query, documents} per line).
+    #[arg(long, conflicts_with = "corpus")]
+    rerank_requests: Option<PathBuf>,
     /// Optional cap for parity/throughput smoke runs.
     #[arg(long)]
     limit: Option<usize>,
@@ -40,15 +43,24 @@ struct Args {
     /// Optional: write produced vectors (JSONL: {id, vec}). Alias kept for the spike prompt.
     #[arg(long = "vectors-out", alias = "emit-vectors")]
     vectors_out: Option<PathBuf>,
-    /// Optional parity reference vectors (JSONL: {id, vec}).
+    /// Rerank score output JSONL ({id, scores} per line).
+    #[arg(long)]
+    scores_out: Option<PathBuf>,
+    /// Optional embedding vectors or rerank scores used as the mode-specific reference.
     #[arg(long)]
     reference: Option<PathBuf>,
     /// Minimum mean cosine when --reference is supplied.
     #[arg(long, default_value_t = 0.9999)]
     min_parity: f64,
-    /// Minimum mean top-10 neighbor overlap when --reference is supplied.
+    /// Minimum mean top-10 neighbor overlap when an embedding reference is supplied.
     #[arg(long, default_value_t = 0.995)]
     min_rank_overlap: f64,
+    /// Minimum overall Pearson correlation for rerank reference scores.
+    #[arg(long, default_value_t = 0.999)]
+    min_pearson: f64,
+    /// Minimum tie-aware top-1 agreement for rerank reference scores.
+    #[arg(long, default_value_t = 0.98)]
+    min_top1_agreement: f64,
     /// Kernel provider to use.
     #[arg(long, value_enum, default_value_t = DeviceArg::Cpu)]
     device: DeviceArg,
@@ -94,7 +106,8 @@ enum Precision {
     F16,
 }
 
-#[derive(Copy, Clone, Eq, PartialEq, Debug, ValueEnum)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Serialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
 enum Execution {
     Explicit,
     Lazy,
@@ -107,7 +120,7 @@ enum Shapes {
     Bucketed,
 }
 
-const GRAPH_REVISION: u32 = 2;
+const GRAPH_REVISION: u32 = 3;
 const BUCKET_POLICY_VERSION: u32 = 1;
 const BUCKET_MAX_BATCH_ROWS: usize = 8;
 const BUCKET_SEQUENCE_LADDER: &[usize] = &[64, 96, 128, 160, 192, 256, 320, 384, 448, 512];
@@ -164,6 +177,45 @@ struct ServingResult {
     padding_waste_fraction: f64,
     package_cache: PackageCacheStats,
     passes: Vec<PassResult>,
+}
+
+#[derive(Clone, Deserialize)]
+struct RerankRequest {
+    id: String,
+    query: String,
+    documents: Vec<String>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct RerankScores {
+    id: String,
+    scores: Vec<f32>,
+}
+
+#[derive(Serialize)]
+struct RerankServingResult {
+    lane: String,
+    workload: &'static str,
+    model: String,
+    provider: &'static str,
+    dtype: &'static str,
+    execution: Execution,
+    shape_policy: Shapes,
+    bucket_policy_version: Option<u32>,
+    bucket_shapes: Vec<BatchShape>,
+    requests: usize,
+    pairs: usize,
+    real_tokens: u64,
+    padded_tokens: u64,
+    padding_waste_fraction: f64,
+    infer_wall_s: f64,
+    pairs_per_s: f64,
+    request_latency_p50_ms: f64,
+    request_latency_p95_ms: f64,
+    pearson: Option<f64>,
+    tie_aware_top1_agreement: Option<f64>,
+    package_cache: PackageCacheStats,
+    notes: String,
 }
 
 #[derive(Clone, Debug)]
@@ -236,6 +288,10 @@ fn main() -> Result<()> {
     ensure!(args.passes > 0, "--passes must be at least one");
     ensure!(args.max_length > 0, "--max-length must be at least one");
     ensure!(
+        args.corpus.is_some() ^ args.rerank_requests.is_some(),
+        "provide exactly one of --corpus or --rerank-requests"
+    );
+    ensure!(
         args.attention_units >= args.max_length.saturating_mul(args.max_length),
         "--attention-units must fit at least one max-length sequence"
     );
@@ -259,6 +315,18 @@ fn main() -> Result<()> {
     let execution = MetalExecutionConfig::from_args(&args, model.family_name())?;
     let mut provider = make_provider(args.device, args.dtype, execution.clone(), args.cuda_graphs)?;
     let accelerator = matches!(args.device, DeviceArg::Metal | DeviceArg::Cuda);
+    if let Some(requests_path) = &args.rerank_requests {
+        return run_rerank_cli(
+            &args,
+            requests_path,
+            model.as_ref(),
+            provider.as_mut(),
+            &tokenizer,
+            &bucket_shapes,
+            execution,
+            started,
+        );
+    }
     if args.shapes == Shapes::Bucketed && accelerator {
         for &shape in &bucket_shapes {
             let _ = model.embed_batch(
@@ -280,7 +348,11 @@ fn main() -> Result<()> {
     }
     let initial_cold_load_s = started.elapsed().as_secs_f64();
 
-    let chunks: Vec<Chunk> = load_corpus(&args.corpus, args.limit)?;
+    let corpus_path = args
+        .corpus
+        .as_ref()
+        .context("embedding mode requires --corpus")?;
+    let chunks: Vec<Chunk> = load_corpus(corpus_path, args.limit)?;
     ensure!(!chunks.is_empty(), "corpus must contain at least one row");
     let lengths = chunks
         .iter()
@@ -469,6 +541,279 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn run_rerank_cli(
+    args: &Args,
+    requests_path: &Path,
+    model: &dyn ModelFamily,
+    provider: &mut dyn KernelProvider,
+    tokenizer: &Tokenizer,
+    bucket_shapes: &[BatchShape],
+    execution: MetalExecutionConfig,
+    started: Instant,
+) -> Result<()> {
+    ensure!(
+        matches!(args.dtype, Precision::F32),
+        "reranking is fp32-only"
+    );
+    let accelerator = matches!(args.device, DeviceArg::Metal | DeviceArg::Cuda);
+    if args.shapes == Shapes::Bucketed && accelerator {
+        for &shape in bucket_shapes {
+            let _ = model.rerank_batch(
+                provider,
+                tokenizer,
+                &[("bucket preload", "bucket preload document")],
+                args.max_length,
+                Some(shape),
+            )?;
+        }
+    } else {
+        let _ = model.rerank_batch(
+            provider,
+            tokenizer,
+            &[("warmup", "warmup document")],
+            args.max_length,
+            None,
+        )?;
+    }
+    let cold_load_s = started.elapsed().as_secs_f64();
+    let mut requests = load_rerank_rows::<RerankRequest>(requests_path)?;
+    if let Some(limit) = args.limit {
+        requests.truncate(limit);
+    }
+    ensure!(
+        !requests.is_empty(),
+        "rerank request file must contain at least one row"
+    );
+    ensure!(
+        requests.iter().all(|request| !request.documents.is_empty()),
+        "every rerank request must contain at least one document"
+    );
+
+    let mut rows = Vec::with_capacity(requests.len());
+    let mut latencies_ms = Vec::with_capacity(requests.len());
+    let mut real_tokens = 0u64;
+    let mut padded_tokens = 0u64;
+    let mut infer_wall_s = 0.0;
+    let mut pair_count = 0usize;
+    for request in &requests {
+        let request_started = Instant::now();
+        let lengths = request
+            .documents
+            .iter()
+            .map(|document| model.rerank_pair_length(tokenizer, &request.query, document))
+            .collect::<Result<Vec<_>>>()?;
+        ensure!(
+            lengths.iter().all(|&length| length <= args.max_length),
+            "pair tokenizer returned a sequence longer than --max-length"
+        );
+        let mut order = (0..request.documents.len()).collect::<Vec<_>>();
+        order.sort_by_key(|&index| lengths[index]);
+        let batches = planned_batches(
+            &order,
+            &lengths,
+            args.attention_units,
+            args.shapes,
+            bucket_shapes,
+        );
+        let mut scores = vec![0.0f32; request.documents.len()];
+        for batch in batches {
+            let indices = &order[batch.range.clone()];
+            let pairs = indices
+                .iter()
+                .map(|&index| (request.query.as_str(), request.documents[index].as_str()))
+                .collect::<Vec<_>>();
+            let batch_scores = model.rerank_batch(
+                provider,
+                tokenizer,
+                &pairs,
+                args.max_length,
+                (args.shapes == Shapes::Bucketed).then_some(batch.shape),
+            )?;
+            ensure!(
+                batch_scores.len() == indices.len(),
+                "model returned {} scores for {} real pairs",
+                batch_scores.len(),
+                indices.len()
+            );
+            padded_tokens += (batch.shape.batch * batch.shape.seq) as u64;
+            for (offset, score) in batch_scores.into_iter().enumerate() {
+                scores[indices[offset]] = score;
+            }
+        }
+        let request_s = request_started.elapsed().as_secs_f64();
+        infer_wall_s += request_s;
+        latencies_ms.push(request_s * 1_000.0);
+        real_tokens += lengths.iter().sum::<usize>() as u64;
+        pair_count += request.documents.len();
+        rows.push(RerankScores {
+            id: request.id.clone(),
+            scores,
+        });
+    }
+    let padding_waste_fraction = padding_waste_fraction(real_tokens, padded_tokens);
+
+    let (pearson, tie_aware_top1_agreement) = if let Some(reference_path) = &args.reference {
+        let reference_rows = load_rerank_rows::<RerankScores>(reference_path)?;
+        let (pearson, top1) = rerank_agreement(&rows, &reference_rows)?;
+        ensure!(
+            pearson >= args.min_pearson,
+            "rerank Pearson {pearson:.9} below minimum {:.9}",
+            args.min_pearson
+        );
+        ensure!(
+            top1 >= args.min_top1_agreement,
+            "rerank tie-aware top-1 agreement {top1:.6} below minimum {:.6}",
+            args.min_top1_agreement
+        );
+        eprintln!("rerank gate: Pearson {pearson:.9}, tie-aware top-1 {top1:.6}");
+        (Some(pearson), Some(top1))
+    } else {
+        (None, None)
+    };
+
+    if let Some(path) = &args.scores_out {
+        write_jsonl(path, &rows)?;
+    }
+    latencies_ms.sort_by(f64::total_cmp);
+    let result = RerankServingResult {
+        lane: format!("owned-rt-{}", provider.name()),
+        workload: "rerank-pairs-v1",
+        model: args
+            .model_label
+            .clone()
+            .unwrap_or_else(|| model.default_label(args.dtype)),
+        provider: provider.name(),
+        dtype: args.dtype.as_str(),
+        execution: args.execution,
+        shape_policy: args.shapes,
+        bucket_policy_version: (args.shapes == Shapes::Bucketed)
+            .then_some(BUCKET_POLICY_VERSION),
+        bucket_shapes: if args.shapes == Shapes::Bucketed {
+            bucket_shapes.to_vec()
+        } else {
+            Vec::new()
+        },
+        requests: requests.len(),
+        pairs: pair_count,
+        real_tokens,
+        padded_tokens,
+        padding_waste_fraction,
+        infer_wall_s,
+        pairs_per_s: pair_count as f64 / infer_wall_s,
+        request_latency_p50_ms: percentile(&latencies_ms, 0.50),
+        request_latency_p95_ms: percentile(&latencies_ms, 0.95),
+        pearson,
+        tie_aware_top1_agreement,
+        package_cache: package_cache_stats(execution.package_root.as_deref())?,
+        notes: format!(
+            "{}; raw logits (no sigmoid), combined pair-length buckets, cold_load_s={cold_load_s:.6}",
+            model.notes()
+        ),
+    };
+    if let Some(parent) = args.out.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&args.out, serde_json::to_string_pretty(&result)?)?;
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    Ok(())
+}
+
+fn load_rerank_rows<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Vec<T>> {
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("read rerank JSONL {}", path.display()))?;
+    content
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty())
+        .map(|(index, line)| {
+            serde_json::from_str(line)
+                .with_context(|| format!("parse rerank JSONL {}:{}", path.display(), index + 1))
+        })
+        .collect()
+}
+
+fn write_jsonl<T: Serialize>(path: &Path, rows: &[T]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut writer = std::io::BufWriter::new(fs::File::create(path)?);
+    for row in rows {
+        serde_json::to_writer(&mut writer, row)?;
+        writer.write_all(b"\n")?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+fn rerank_agreement(candidate: &[RerankScores], reference: &[RerankScores]) -> Result<(f64, f64)> {
+    let reference = reference
+        .iter()
+        .map(|row| (row.id.as_str(), row.scores.as_slice()))
+        .collect::<HashMap<_, _>>();
+    let candidate_ids = candidate
+        .iter()
+        .map(|row| row.id.as_str())
+        .collect::<HashSet<_>>();
+    let reference_ids = reference.keys().copied().collect::<HashSet<_>>();
+    ensure!(
+        candidate.len() == candidate_ids.len() && candidate_ids == reference_ids,
+        "rerank candidate/reference request IDs mismatch"
+    );
+    let mut xs = Vec::new();
+    let mut ys = Vec::new();
+    let mut top1_matches = 0usize;
+    for row in candidate {
+        let expected = reference
+            .get(row.id.as_str())
+            .with_context(|| format!("reference is missing rerank request {}", row.id))?;
+        ensure!(
+            row.scores.len() == expected.len(),
+            "rerank pair count mismatch for {}",
+            row.id
+        );
+        xs.extend(expected.iter().map(|&value| f64::from(value)));
+        ys.extend(row.scores.iter().map(|&value| f64::from(value)));
+        let expected_top = expected.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let candidate_top = row.scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        if row
+            .scores
+            .iter()
+            .zip(*expected)
+            .any(|(&actual, &reference)| actual == candidate_top && reference == expected_top)
+        {
+            top1_matches += 1;
+        }
+    }
+    let x_mean = xs.iter().sum::<f64>() / xs.len() as f64;
+    let y_mean = ys.iter().sum::<f64>() / ys.len() as f64;
+    let mut numerator = 0.0;
+    let mut x_norm = 0.0;
+    let mut y_norm = 0.0;
+    for (&x, &y) in xs.iter().zip(&ys) {
+        let x = x - x_mean;
+        let y = y - y_mean;
+        numerator += x * y;
+        x_norm += x * x;
+        y_norm += y * y;
+    }
+    ensure!(
+        x_norm > 0.0 && y_norm > 0.0,
+        "rerank Pearson requires non-constant scores"
+    );
+    Ok((
+        numerator / (x_norm.sqrt() * y_norm.sqrt()),
+        top1_matches as f64 / candidate.len() as f64,
+    ))
+}
+
+fn percentile(sorted: &[f64], percentile: f64) -> f64 {
+    let index = ((sorted.len() as f64 * percentile).ceil() as usize)
+        .saturating_sub(1)
+        .min(sorted.len() - 1);
+    sorted[index]
+}
+
 fn enforce_parity_gates(
     mean_cosine: f64,
     mean_top10_overlap: f64,
@@ -488,12 +833,12 @@ fn enforce_parity_gates(
     Ok(())
 }
 
-/// A loaded model family owns every policy that varies between embedding graphs.
+/// A loaded model family owns every policy that varies between embedding and rerank graphs.
 ///
 /// Detection remains in the registry because it runs before a model exists. Keeping
-/// loading, tokenizer behavior, token accounting, pooling, labels, and provider-hook
-/// installation behind this object-safe seam lets the batch runner stay unchanged
-/// when another family is registered.
+/// loading, tokenizer behavior, token accounting, output heads, labels, and provider-hook
+/// installation behind this object-safe seam lets workload runners stay independent of
+/// model-specific graph types.
 trait ModelFamily {
     fn family_name(&self) -> &'static str;
 
@@ -518,6 +863,26 @@ trait ModelFamily {
         max_length: usize,
         shape: Option<BatchShape>,
     ) -> Result<Vec<Vec<f32>>>;
+
+    fn rerank_pair_length(
+        &self,
+        _tokenizer: &Tokenizer,
+        _query: &str,
+        _document: &str,
+    ) -> Result<usize> {
+        bail!("{} does not support reranking", self.family_name())
+    }
+
+    fn rerank_batch(
+        &self,
+        _provider: &mut dyn KernelProvider,
+        _tokenizer: &Tokenizer,
+        _pairs: &[(&str, &str)],
+        _max_length: usize,
+        _shape: Option<BatchShape>,
+    ) -> Result<Vec<f32>> {
+        bail!("{} does not support reranking", self.family_name())
+    }
 
     fn validate_reference_coverage(&self, _matched: usize, _produced: usize) -> Result<()> {
         Ok(())
@@ -2742,6 +3107,33 @@ mod tests {
             ))
         );
         assert_ne!(config.package_path(8, 128), config.package_path(4, 256));
+    }
+
+    #[test]
+    fn rerank_gate_uses_pearson_and_tie_aware_top1() {
+        let reference = vec![
+            RerankScores {
+                id: "q1".into(),
+                scores: vec![2.0, 2.0, -1.0],
+            },
+            RerankScores {
+                id: "q2".into(),
+                scores: vec![0.0, 1.0, 3.0],
+            },
+        ];
+        let candidate = vec![
+            RerankScores {
+                id: "q1".into(),
+                scores: vec![1.999, 2.001, -0.999],
+            },
+            RerankScores {
+                id: "q2".into(),
+                scores: vec![0.001, 1.001, 3.001],
+            },
+        ];
+        let (pearson, agreement) = rerank_agreement(&candidate, &reference).unwrap();
+        assert!(pearson >= 0.999);
+        assert_eq!(agreement, 1.0);
     }
 
     #[test]

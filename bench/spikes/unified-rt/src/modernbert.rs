@@ -5,7 +5,7 @@ use std::path::Path;
 
 use anyhow::{bail, ensure, Context, Result};
 use serde::Deserialize;
-use tokenizers::{Tokenizer, TruncationParams};
+use tokenizers::{EncodeInput, Tokenizer, TruncationParams};
 
 #[cfg(target_os = "macos")]
 use super::{decode_f16_bits, encode_f16_bits, Execution};
@@ -41,6 +41,14 @@ struct ModernBertConfig {
     attention_bias: bool,
     #[serde(default)]
     mlp_bias: bool,
+    #[serde(default)]
+    classifier_pooling: Option<String>,
+    #[serde(default = "default_classifier_activation")]
+    classifier_activation: String,
+    #[serde(default)]
+    classifier_bias: bool,
+    #[serde(default)]
+    norm_bias: bool,
     layer_types: Option<Vec<String>>,
 }
 
@@ -65,6 +73,10 @@ fn default_local_rope_theta() -> f32 {
 }
 
 fn default_hidden_activation() -> String {
+    "gelu".to_owned()
+}
+
+fn default_classifier_activation() -> String {
     "gelu".to_owned()
 }
 
@@ -115,6 +127,14 @@ struct Layer {
     attention_type: AttentionType,
 }
 
+#[derive(Clone)]
+struct ClassificationHead {
+    dense: Linear,
+    norm: Vec<f32>,
+    classifier_weight: Vec<f32>,
+    classifier_bias: f32,
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum AttentionType {
     Full,
@@ -137,6 +157,7 @@ struct ModernBertModel {
     embedding_norm: Vec<f32>,
     layers: Vec<Layer>,
     final_norm: Vec<f32>,
+    classification_head: Option<ClassificationHead>,
 }
 
 impl ModernBertModel {
@@ -197,7 +218,40 @@ impl ModernBertModel {
             });
         }
 
+        let classification_head = if let Some(pooling) = &config.classifier_pooling {
+            ensure!(
+                pooling == "mean",
+                "unsupported ModernBERT classifier pooling {pooling}; rerank reference requires mean"
+            );
+            ensure!(
+                config.classifier_activation == "gelu",
+                "unsupported ModernBERT classifier activation {}",
+                config.classifier_activation
+            );
+            ensure!(
+                !config.classifier_bias && !config.norm_bias,
+                "ModernBERT classifier dense/norm biases are not supported"
+            );
+            let classifier = get_tensor(&tensors, "classifier.weight")?;
+            ensure!(
+                classifier.shape == vec![1, config.hidden_size],
+                "ModernBERT classifier weight must have shape [1, hidden_size]"
+            );
+            Some(ClassificationHead {
+                dense: Linear::load(&tensors, "head.dense")?,
+                norm: vector(&tensors, "head.norm.weight", config.hidden_size)?,
+                classifier_weight: classifier.data,
+                classifier_bias: vector(&tensors, "classifier.bias", 1)?[0],
+            })
+        } else {
+            None
+        };
+
         if matches!(precision, Precision::F16) {
+            ensure!(
+                classification_head.is_none(),
+                "ModernBERT reranking is fp32-only; f16 is a later serving experiment"
+            );
             for layer in &mut layers {
                 layer.qkv.weight.prepare_metal_f16();
                 layer.attention_output.weight.prepare_metal_f16();
@@ -212,6 +266,7 @@ impl ModernBertModel {
             embedding_norm,
             layers,
             final_norm,
+            classification_head,
         })
     }
 
@@ -274,16 +329,70 @@ impl ModernBertModel {
         Ok(vectors)
     }
 
-    fn forward(
+    fn rerank_batch(
         &self,
         provider: &mut dyn KernelProvider,
-        input_ids: &[u32],
-        attention_mask: &[u8],
-        batch: usize,
-        seq: usize,
+        tokenizer: &Tokenizer,
+        pairs: &[(&str, &str)],
+        shape: Option<BatchShape>,
     ) -> Result<Vec<f32>> {
+        let head = self
+            .classification_head
+            .as_ref()
+            .context("this ModernBERT checkpoint has no sequence-classification head")?;
+        let inputs = pairs
+            .iter()
+            .map(|&(query, document)| EncodeInput::Dual(query.into(), document.into()))
+            .collect::<Vec<_>>();
+        let encodings = tokenizer
+            .encode_batch(inputs, true)
+            .map_err(|error| anyhow::anyhow!("encode pair batch: {error}"))?;
+        let real_batch = encodings.len();
+        ensure!(real_batch > 0, "ModernBERT rerank batch must not be empty");
+        let real_seq = encodings
+            .iter()
+            .map(|encoding| encoding.get_ids().len())
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let target = shape.unwrap_or(BatchShape {
+            batch: real_batch,
+            seq: real_seq,
+        });
+        ensure!(
+            target.batch >= real_batch && target.seq >= real_seq,
+            "ModernBERT rerank target shape {}x{} does not cover input {}x{}",
+            target.batch,
+            target.seq,
+            real_batch,
+            real_seq
+        );
+        ensure!(
+            target.seq <= self.config.max_position_embeddings,
+            "sequence length {} exceeds ModernBERT maximum {}",
+            target.seq,
+            self.config.max_position_embeddings
+        );
+
+        let (batch, seq) = (target.batch, target.seq);
+        let mut input_ids = vec![self.config.pad_token_id; batch * seq];
+        let mut attention_mask = vec![0u8; batch * seq];
+        for (row, encoding) in encodings.iter().enumerate() {
+            for (col, &id) in encoding.get_ids().iter().enumerate() {
+                input_ids[row * seq + col] = id;
+                attention_mask[row * seq + col] = u8::from(
+                    id != self.config.pad_token_id && encoding.get_attention_mask()[col] != 0,
+                );
+            }
+        }
+        let scores =
+            self.forward_rerank(provider, head, &input_ids, &attention_mask, batch, seq)?;
+        Ok(scores[..real_batch].to_vec())
+    }
+
+    fn initial_hidden(&self, input_ids: &[u32]) -> Result<Vec<f32>> {
         let hidden = self.config.hidden_size;
-        let rows = batch * seq;
+        let rows = input_ids.len();
         let mut current = vec![0.0; rows * hidden];
         for (row, &token_id) in input_ids.iter().enumerate() {
             let token = token_id as usize;
@@ -301,6 +410,109 @@ impl ModernBertModel {
             &self.embedding_norm,
             self.config.norm_eps,
         );
+        Ok(current)
+    }
+
+    fn forward_rerank(
+        &self,
+        provider: &mut dyn KernelProvider,
+        head: &ClassificationHead,
+        input_ids: &[u32],
+        attention_mask: &[u8],
+        batch: usize,
+        seq: usize,
+    ) -> Result<Vec<f32>> {
+        let mut current = self.initial_hidden(input_ids)?;
+        let mut metal_scores = None;
+        let mut run = |context: &mut dyn Any| {
+            let context = context
+                .downcast_mut::<MetalContext>()
+                .context("ModernBERT provider returned the wrong block context type")?;
+            metal_scores = Some(context.forward_rerank(
+                self,
+                head,
+                &mut current,
+                attention_mask,
+                batch,
+                seq,
+            )?);
+            Ok(())
+        };
+        if provider.block_forward(BlockForwardRequest {
+            family: self.family_name(),
+            create_context: new_block_context,
+            run: &mut run,
+        })? {
+            return metal_scores.context("ModernBERT Metal rerank did not return scores");
+        }
+
+        self.forward_cpu(&mut current, attention_mask, batch, seq)?;
+        self.classify_cpu(head, &current, attention_mask, batch, seq)
+    }
+
+    fn classify_cpu(
+        &self,
+        head: &ClassificationHead,
+        hidden_states: &[f32],
+        attention_mask: &[u8],
+        batch: usize,
+        seq: usize,
+    ) -> Result<Vec<f32>> {
+        let hidden = self.config.hidden_size;
+        let mut pooled = vec![0.0; batch * hidden];
+        for row in 0..batch {
+            let token_count = attention_mask[row * seq..(row + 1) * seq]
+                .iter()
+                .map(|&value| usize::from(value))
+                .sum::<usize>();
+            if token_count == 0 {
+                continue;
+            }
+            for col in 0..seq {
+                if attention_mask[row * seq + col] == 0 {
+                    continue;
+                }
+                for feature in 0..hidden {
+                    pooled[row * hidden + feature] +=
+                        hidden_states[(row * seq + col) * hidden + feature];
+                }
+            }
+            for feature in 0..hidden {
+                pooled[row * hidden + feature] /= token_count as f32;
+            }
+        }
+        let mut activated = head.dense.forward(batch, hidden, &pooled)?;
+        for value in &mut activated {
+            *value = gelu(*value);
+        }
+        layer_norm(
+            &mut activated,
+            batch,
+            hidden,
+            &head.norm,
+            self.config.norm_eps,
+        );
+        Ok(activated
+            .chunks_exact(hidden)
+            .map(|row| {
+                row.iter()
+                    .zip(&head.classifier_weight)
+                    .map(|(&value, &weight)| value * weight)
+                    .sum::<f32>()
+                    + head.classifier_bias
+            })
+            .collect())
+    }
+
+    fn forward(
+        &self,
+        provider: &mut dyn KernelProvider,
+        input_ids: &[u32],
+        attention_mask: &[u8],
+        batch: usize,
+        seq: usize,
+    ) -> Result<Vec<f32>> {
+        let mut current = self.initial_hidden(input_ids)?;
 
         let mut run = |context: &mut dyn Any| {
             let context = context
@@ -628,6 +840,33 @@ impl ModelFamily for ModernBertModel {
         ModernBertModel::embed_batch(self, provider, tokenizer, texts, shape)
     }
 
+    fn rerank_pair_length(
+        &self,
+        tokenizer: &Tokenizer,
+        query: &str,
+        document: &str,
+    ) -> Result<usize> {
+        ensure!(
+            self.classification_head.is_some(),
+            "this ModernBERT checkpoint has no sequence-classification head"
+        );
+        tokenizer
+            .encode(EncodeInput::Dual(query.into(), document.into()), true)
+            .map(|encoding| encoding.get_ids().len())
+            .map_err(|error| anyhow::anyhow!("encode pair: {error}"))
+    }
+
+    fn rerank_batch(
+        &self,
+        provider: &mut dyn KernelProvider,
+        tokenizer: &Tokenizer,
+        pairs: &[(&str, &str)],
+        _max_length: usize,
+        shape: Option<BatchShape>,
+    ) -> Result<Vec<f32>> {
+        ModernBertModel::rerank_batch(self, provider, tokenizer, pairs, shape)
+    }
+
     fn validate_reference_coverage(&self, matched: usize, produced: usize) -> Result<()> {
         ensure!(
             matched == produced,
@@ -637,15 +876,22 @@ impl ModelFamily for ModernBertModel {
     }
 
     fn default_label(&self, precision: Precision) -> String {
-        format!(
-            "Alibaba-NLP/gte-modernbert-base@owned-rt-{}",
-            precision.as_str()
-        )
+        let checkpoint = if self.classification_head.is_some() {
+            "Alibaba-NLP/gte-reranker-modernbert-base"
+        } else {
+            "Alibaba-NLP/gte-modernbert-base"
+        };
+        format!("{checkpoint}@owned-rt-{}", precision.as_str())
     }
 
     fn notes(&self) -> String {
+        let output = if self.classification_head.is_some() {
+            "masked-mean+dense+GELU+norm+classifier raw logit"
+        } else {
+            "CLS+l2"
+        };
         format!(
-            "ModernBERT CLS+l2, RoPE, alternating full/local-{} attention, GeGLU, pre-norm",
+            "ModernBERT {output}, RoPE, alternating full/local-{} attention, GeGLU, pre-norm",
             self.config.local_attention
         )
     }
@@ -804,6 +1050,12 @@ impl MetalContext {
                 bucket.local_cos.as_ptr(),
                 bucket.local_sin.as_ptr(),
                 model.final_norm.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0.0,
+                0,
                 params.as_ptr(),
                 if f16 {
                     output_f16.as_mut_ptr().cast()
@@ -823,6 +1075,106 @@ impl MetalContext {
             hidden_states.copy_from_slice(&output_f32);
         }
         Ok(())
+    }
+
+    fn forward_rerank(
+        &mut self,
+        model: &ModernBertModel,
+        head: &ClassificationHead,
+        hidden_states: &mut [f32],
+        attention_mask: &[u8],
+        batch: usize,
+        seq: usize,
+    ) -> Result<Vec<f32>> {
+        ensure!(
+            matches!(self.precision, Precision::F32),
+            "ModernBERT reranking is fp32-only"
+        );
+        let bucket = self.buckets.entry(seq).or_insert_with(|| {
+            let head_dim = model.config.hidden_size / model.config.num_attention_heads;
+            let (global_cos, global_sin) =
+                rope_tables(seq, head_dim, model.config.global_rope_theta);
+            let (local_cos, local_sin) = rope_tables(seq, head_dim, model.config.local_rope_theta);
+            MetalBucket {
+                band_mask: band_mask(seq, model.config.local_attention / 2),
+                global_cos,
+                global_sin,
+                local_cos,
+                local_sin,
+            }
+        });
+        let masks = additive_masks_with_band(attention_mask, batch, seq, &bucket.band_mask);
+        let pooling_mask = attention_mask
+            .iter()
+            .map(|&value| f32::from(value))
+            .collect::<Vec<_>>();
+        let params: Vec<ModernBertLayerParams> = model
+            .layers
+            .iter()
+            .map(|layer| ModernBertLayerParams {
+                qkv_weight: layer.qkv.weight.data.as_ptr().cast(),
+                attention_output_weight: layer.attention_output.weight.data.as_ptr().cast(),
+                attention_norm_weight: layer
+                    .attention_norm
+                    .as_ref()
+                    .map_or(std::ptr::null(), |weight| weight.as_ptr().cast()),
+                mlp_input_weight: layer.mlp_input.weight.data.as_ptr().cast(),
+                mlp_output_weight: layer.mlp_output.weight.data.as_ptr().cast(),
+                mlp_norm_weight: layer.mlp_norm.as_ptr().cast(),
+                attention_type: match layer.attention_type {
+                    AttentionType::Full => 0,
+                    AttentionType::Sliding => 1,
+                },
+            })
+            .collect();
+        let package = self
+            .execution
+            .package_path(batch, seq)
+            .map(|path| path.with_file_name(format!("{batch}x{seq}-rerank.mpsgraphpackage")));
+        let package_c = package
+            .as_ref()
+            .map(|path| std::ffi::CString::new(path.to_string_lossy().as_bytes()))
+            .transpose()?;
+        let mut scores = vec![0.0f32; batch];
+        let status = unsafe {
+            synapse_modernbert_mps_forward(
+                self.raw.as_ptr(),
+                batch as u64,
+                seq as u64,
+                model.config.hidden_size as u64,
+                model.config.num_attention_heads as u64,
+                model.config.intermediate_size as u64,
+                model.layers.len() as u64,
+                model.config.norm_eps,
+                0,
+                i32::from(matches!(self.execution.execution, Execution::Explicit)),
+                package_c
+                    .as_ref()
+                    .map_or(std::ptr::null(), |path| path.as_ptr()),
+                hidden_states.as_ptr().cast(),
+                masks.full.as_ptr(),
+                masks.local.as_ptr(),
+                bucket.global_cos.as_ptr(),
+                bucket.global_sin.as_ptr(),
+                bucket.local_cos.as_ptr(),
+                bucket.local_sin.as_ptr(),
+                model.final_norm.as_ptr(),
+                pooling_mask.as_ptr(),
+                head.dense.weight.data.as_ptr(),
+                head.norm.as_ptr(),
+                head.classifier_weight.as_ptr(),
+                head.classifier_bias,
+                1,
+                params.as_ptr(),
+                scores.as_mut_ptr().cast(),
+            )
+        };
+        ensure!(
+            status == 0,
+            "ModernBERT MPSGraph rerank failed: {}",
+            metal_error()
+        );
+        Ok(scores)
     }
 }
 
@@ -884,6 +1236,12 @@ unsafe extern "C" {
         local_cos: *const f32,
         local_sin: *const f32,
         final_norm: *const f32,
+        pooling_mask: *const f32,
+        head_dense: *const f32,
+        head_norm: *const f32,
+        classifier_weight: *const f32,
+        classifier_bias: f32,
+        rerank: i32,
         layer_params: *const ModernBertLayerParams,
         output: *mut std::ffi::c_void,
     ) -> i32;
@@ -906,6 +1264,18 @@ impl MetalContext {
         _batch: usize,
         _seq: usize,
     ) -> Result<()> {
+        bail!("ModernBERT Metal MPSGraph is only available on macOS")
+    }
+
+    fn forward_rerank(
+        &mut self,
+        _model: &ModernBertModel,
+        _head: &ClassificationHead,
+        _hidden_states: &mut [f32],
+        _attention_mask: &[u8],
+        _batch: usize,
+        _seq: usize,
+    ) -> Result<Vec<f32>> {
         bail!("ModernBERT Metal MPSGraph is only available on macOS")
     }
 }
@@ -1001,6 +1371,10 @@ mod tests {
             hidden_activation: "gelu".into(),
             attention_bias: false,
             mlp_bias: false,
+            classifier_pooling: None,
+            classifier_activation: "gelu".into(),
+            classifier_bias: false,
+            norm_bias: false,
             layer_types: None,
         };
         assert_eq!(
@@ -1036,6 +1410,141 @@ mod tests {
         let mut values = vec![1.0, 2.0, 3.0, 4.0];
         apply_rope(&mut values, 0, 10_000.0);
         assert_eq!(values, vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[derive(Deserialize)]
+    struct RerankFixture {
+        query: String,
+        documents: Vec<String>,
+        token_ids: Vec<Vec<u32>>,
+        scores: Vec<f32>,
+    }
+
+    fn rerank_fixture() -> RerankFixture {
+        serde_json::from_str(include_str!("../fixtures/rerank-reference.json")).unwrap()
+    }
+
+    #[test]
+    #[ignore = "requires MODERNBERT_RERANK_MODEL"]
+    fn modernbert_rerank_matches_transformers_reference_fixture_on_cpu() {
+        let model_path = std::path::PathBuf::from(
+            std::env::var("MODERNBERT_RERANK_MODEL").expect("set MODERNBERT_RERANK_MODEL"),
+        );
+        let tokenizer_path = std::env::var("MODERNBERT_RERANK_TOKENIZER")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| model_path.join("tokenizer.json"));
+        let model = ModernBertModel::load(&model_path, Precision::F32).unwrap();
+        let mut tokenizer = Tokenizer::from_file(&tokenizer_path).unwrap();
+        model.configure_tokenizer(&mut tokenizer, 512).unwrap();
+        let fixture = rerank_fixture();
+        let pairs = fixture
+            .documents
+            .iter()
+            .map(|document| (fixture.query.as_str(), document.as_str()))
+            .collect::<Vec<_>>();
+        for (pair, expected_ids) in pairs.iter().zip(&fixture.token_ids) {
+            let encoding = tokenizer
+                .encode(EncodeInput::Dual(pair.0.into(), pair.1.into()), true)
+                .unwrap();
+            assert_eq!(encoding.get_ids(), expected_ids);
+        }
+        let mut provider = crate::CpuProvider;
+        let scores = model
+            .rerank_batch(&mut provider, &tokenizer, &pairs, None)
+            .unwrap();
+        for (&actual, &expected) in scores.iter().zip(&fixture.scores) {
+            assert!(
+                (actual - expected).abs() <= 5e-5,
+                "rerank score {actual} differs from reference {expected}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires MODERNBERT_RERANK_MODEL and a Metal device"]
+    fn modernbert_rerank_static_feeds_survive_multiple_calls() {
+        const CHILD_OUTPUT: &str = "MODERNBERT_RERANK_MULTICALL_CHILD_OUTPUT";
+        let model_path = std::path::PathBuf::from(
+            std::env::var("MODERNBERT_RERANK_MODEL").expect("set MODERNBERT_RERANK_MODEL"),
+        );
+        let tokenizer_path = std::env::var("MODERNBERT_RERANK_TOKENIZER")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| model_path.join("tokenizer.json"));
+        let model = ModernBertModel::load(&model_path, Precision::F32).unwrap();
+        let mut tokenizer = Tokenizer::from_file(&tokenizer_path).unwrap();
+        model.configure_tokenizer(&mut tokenizer, 512).unwrap();
+        let execution = super::super::MetalExecutionConfig {
+            execution: Execution::Lazy,
+            package_root: None,
+        };
+        let mut backend = crate::MetalProvider::new_with_config(Precision::F32, execution).unwrap();
+        let fixture = rerank_fixture();
+        let target_pairs = fixture
+            .documents
+            .iter()
+            .map(|document| (fixture.query.as_str(), document.as_str()))
+            .collect::<Vec<_>>();
+
+        if let Ok(output_path) = std::env::var(CHILD_OUTPUT) {
+            let baseline = model
+                .rerank_batch(&mut backend, &tokenizer, &target_pairs, None)
+                .unwrap();
+            fs::write(output_path, serde_json::to_vec(&baseline).unwrap()).unwrap();
+            return;
+        }
+
+        model
+            .rerank_batch(
+                &mut backend,
+                &tokenizer,
+                &[("first query", "first document")],
+                None,
+            )
+            .unwrap();
+        model
+            .rerank_batch(
+                &mut backend,
+                &tokenizer,
+                &[
+                    ("second query", "one document"),
+                    ("second query", "a distinct second document"),
+                ],
+                None,
+            )
+            .unwrap();
+        let third_call = model
+            .rerank_batch(&mut backend, &tokenizer, &target_pairs, None)
+            .unwrap();
+
+        let baseline_path = std::env::temp_dir().join(format!(
+            "modernbert-rerank-multicall-baseline-{}.json",
+            std::process::id()
+        ));
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "modernbert::tests::modernbert_rerank_static_feeds_survive_multiple_calls",
+                "--ignored",
+            ])
+            .env(CHILD_OUTPUT, &baseline_path)
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "fresh-process baseline failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
+        let baseline: Vec<f32> =
+            serde_json::from_slice(&fs::read(&baseline_path).unwrap()).unwrap();
+        fs::remove_file(&baseline_path).unwrap();
+        for (index, (&actual, &expected)) in third_call.iter().zip(&baseline).enumerate() {
+            assert!(
+                (actual - expected).abs() <= 5e-5,
+                "row {index} changed after repeated calls: {actual} vs {expected}"
+            );
+        }
     }
 
     #[cfg(target_os = "macos")]
