@@ -1,8 +1,8 @@
-# Serving bucket policy v1
+# Serving bucket policies
 
 ## Status
 
-Bucket policy v1 is the default serving shape policy. `--shapes exact` retains the former corpus-dependent behavior for A/B measurements. The default policy produces 10 shapes for `--max-length 512 --attention-units 4000000`, pre-discovers every accelerator shape before timed inference, and records in-process `first`, `warm`, and `steady` rows with `--passes N`.
+Bucket policy v1 remains the default serving shape policy. `--bucket-policy 1|2` selects a version while `--shapes exact` retains the former corpus-dependent behavior for A/B measurements. Both bucket policies produce 10 shapes for `--max-length 512 --attention-units 4000000`, pre-discover every accelerator shape before timed inference, and record in-process `first`, `warm`, and `steady` rows with `--passes N`. Policy v2 is implemented for reproducible A/B testing but is not recommended for adoption because its locked-M1 run fails the padding gate on two standard corpora.
 
 ## Pure policy function
 
@@ -33,6 +33,25 @@ The complete default set is:
 
 The set has 10 entries, below the 12-shape target. Changing the ladder, row cap, mapping, or padding semantics requires a policy-version bump.
 
+## Policy v2 row ladder
+
+Policy v2 retains the v1 sequence ladder and padding semantics but makes the row cap a pure function of sequence-bucket index. For the default ten buckets, the caps are `16/16/16/16/16/16/12/12/8/8`. The attention-unit budget remains an upper bound, so the final row count is `min(indexed_cap, floor(attention_units / S²))`.
+
+| index | sequence | v2 batch rows | attention units |
+|---:|---:|---:|---:|
+| 0 | 64 | 16 | 65,536 |
+| 1 | 96 | 16 | 147,456 |
+| 2 | 128 | 16 | 262,144 |
+| 3 | 160 | 16 | 409,600 |
+| 4 | 192 | 16 | 589,824 |
+| 5 | 256 | 16 | 1,048,576 |
+| 6 | 320 | 12 | 1,228,800 |
+| 7 | 384 | 12 | 1,769,472 |
+| 8 | 448 | 8 | 1,605,632 |
+| 9 | 512 | 8 | 2,097,152 |
+
+The locked result in [M1-BUCKET-MATRIX.md](M1-BUCKET-MATRIX.md#policy-v2--rejected) rejects this ladder unchanged: MiniLM wastes 17.71% and gte-ModernBERT wastes 18.45%, both above the strict 15% gate. The implementation remains selectable so the failed candidate and its `bucket-policy-v2` cache identity are reproducible; v1 remains the default.
+
 ## Distribution justification
 
 The ladder was selected from the retained standard corpora and the 11,293-row magic-context (MC) corpus, not from shapes encountered during serving. Lengths below are after each family's production tokenizer rules and a 512-token cap.
@@ -50,7 +69,7 @@ The initial seven-step candidate `64/96/128/192/256/384/512` had sequence-only w
 
 Metal and CUDA use the same `BatchShape` policy and model-family `embed_batch` seam. During load, accelerator providers execute one fully padded request for every policy shape. Metal therefore compiles or loads all MPSGraph packages and CUDA constructs all enabled per-shape graphs before `cold_load_s` stops. Timed pass 1 performs inference only. CPU has no shape compilation and does not run the accelerator pre-discovery loop.
 
-Metal package roots include both graph revision and shape identity: bucketed roots contain `bucket-policy-v1`, while exact roots contain `shapes-exact`. A policy change cannot reuse an older policy's packages. Result JSON reports the selected shapes plus package count and recursive bytes.
+Metal package roots include both graph revision and shape identity: bucketed roots contain `bucket-policy-v1` or `bucket-policy-v2`, while exact roots contain `shapes-exact`. A policy change cannot reuse another policy's packages. Result JSON reports the selected version and shapes plus package count and recursive bytes.
 
 Exact mode intentionally keeps synchronous first-use discovery so it remains an honest baseline for the cost that bucketing removes. Its pass-1 inference includes compilation on a cache miss; its warm and steady passes reuse in-process plans.
 
@@ -58,7 +77,7 @@ Exact mode intentionally keeps synchronous first-use discovery so it remains an 
 
 `--passes N` emits one row per corpus pass. Pass 1 is `first`; the final pass is `steady` when `N > 2`; intervening rows are `warm`. The top-level lane timing remains compatible with the shared result schema and mirrors the final pass. Parity is checked after every pass, outside the inference timer. Corpora above 1,000 rows deterministically sample at most 100 rank queries against the full vector set; all 400 standard rows remain rank queries.
 
-`real_tokens` counts non-padding input tokens. `padded_tokens` is total dispatched bucket area, including sequence padding and inactive batch rows. `padding_waste_fraction` is `(padded_tokens - real_tokens) / padded_tokens`. Bucketed runs fail if this reaches 15%.
+`real_tokens` counts non-padding input tokens. `padded_tokens` is total dispatched bucket area, including sequence padding and inactive batch rows. `padding_waste_fraction` is `(padded_tokens - real_tokens) / padded_tokens`. Result JSON reports `padding_waste_gate_passed`; bucketed runs write the auditable result and then return a failure if waste reaches 15%. Exact-mode results report no bucket gate.
 
 ## Contended-local tradeoff
 

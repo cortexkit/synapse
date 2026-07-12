@@ -100,7 +100,10 @@ def summarize_power(raw_dir: Path, result_dir: Path) -> dict:
             "The steady window has the result JSON pass-3 duration and ends at the "
             "last sample with at least 1 W GPU power and 5% effective GPU usage."
         ),
-        "raw_logs": "[bench-user-home]/bench-tools/unified-rt-serving/results/m1-bucket-matrix/",
+        "raw_logs": (
+            "[bench-user-home]/bench-tools/unified-rt-serving/results/"
+            f"{result_dir.name}/"
+        ),
         "cells": cells,
     }
 

@@ -50,7 +50,9 @@ The required thresholds are Pearson >= 0.999 and tie-aware top-1 >= 0.98. One co
 
 The committed snippet's Transformers scores are `3.0635757446289062` and `-1.2756527662277222`. Executed owned scores were `[3.063575, -1.2756505]` on CPU and `[3.0635748, -1.2756476]` on Metal.
 
-## Contended-local serving measurement
+## Serving measurements
+
+### Contended-local
 
 These are local development-machine numbers, explicitly labeled **contended-local** rather than M1 graduation numbers. The command repeated one real cosqa query with 50 documents 20 times, used fp32 Metal, combined-length buckets, explicit O0 execution, and a warm package cache containing all ten sequence buckets.
 
@@ -59,6 +61,37 @@ These are local development-machine numbers, explicitly labeled **contended-loca
 | 1 query x 50 documents | 20 | 505.34 ms | 651.77 ms | 94.45 pairs/s |
 
 The executed run scored 1,000 pairs in 10.5875 s. Request-local fixed eight-row buckets reported 35.46% padding waste because tail batches are not coalesced across independent queries; all padded keys remained masked in attention and all padded rows were omitted from returned scores.
+
+### Locked M1
+
+The locked run used `[bench-host]` (Apple M1 Max, 64 GiB, macOS 26.5.2 build `25F84`) and binary SHA-256 `3fae0455ccc650c1b597c7bc4b8c4dc8d08c224b45d471128fe360b9cddc9db3`. A non-measured prime process created all ten policy-v1 packages. Each measured row is then a fresh process reusing that warm cache, with fp32 Metal, explicit O0, maximum length 512, and the fixed eight-row combined-length buckets.
+
+The committed fixture [`fixtures/cosqa-rerank-1x50-repeated.jsonl`](fixtures/cosqa-rerank-1x50-repeated.jsonl) repeats one real cosqa query with its 50 dense candidates 20 times, giving both 20 request-latency samples and a 1,000-pair throughput set. Its committed Transformers reference is [`fixtures/cosqa-rerank-1x50-repeated-reference.jsonl`](fixtures/cosqa-rerank-1x50-repeated-reference.jsonl). Every process passed Pearson and tie-aware top-1 gates.
+
+| Process | Requests x documents | p50 | p95 | 1,000-pair wall | Throughput | Pearson | tie-aware top-1 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| HIT r1 | 20 x (1 x 50) | 242.15 ms | 242.94 ms | 4.844 s | 206.42 pairs/s | 0.999999999995 | 1.00 |
+| HIT r2 | 20 x (1 x 50) | 242.43 ms | 243.03 ms | 4.849 s | 206.25 pairs/s | 0.999999999995 | 1.00 |
+
+The two fresh processes agree within 0.3 ms at p50 and 0.1 ms at p95. Their locked throughput is about 2.18x the 94.45 pairs/s contended-local observation. The AFT budget of p50 <= approximately 0.5 s for 50 documents **passes** with 242.43 ms worst-repeat p50, using only 48.5% of the budget.
+
+macmon started, produced an idle sample, and waited another two seconds before each process. The inference-window summaries are:
+
+| Process | samples | mean GPU use | mean GPU power | max GPU power |
+|---|---:|---:|---:|---:|
+| HIT r1 | 31 | 95.2% | 36.97 W | 44.30 W |
+| HIT r2 | 31 | 94.0% | 36.38 W | 40.20 W |
+
+Every timed process acquired `[bench-user-home]/bench.lock`, verified that `Runner.Worker` was absent, and used trap-based macmon cleanup before releasing the lock. Raw logs remain under `[bench-user-home]/bench-tools/unified-rt-serving/results/m1-rerank/`; result JSON and the macmon-derived summary are committed under `results/m1-rerank/`.
+
+The fixture is reproducible from the first row of the canonical cosqa `gte-rerank-requests.jsonl`: duplicate its 50-document request 20 times with IDs `q20105-run-00` through `q20105-run-19`, then score the single request and duplicate its score row under the same IDs. The executed reference command was:
+
+```sh
+uv run --group reference reference_rerank.py \
+  --requests /tmp/cosqa-rerank-1x50.jsonl \
+  --out /tmp/cosqa-rerank-1x50-reference.jsonl \
+  --max-length 512 --batch-size 8 --device mps
+```
 
 ## Tests and reproduction
 
@@ -84,7 +117,6 @@ spike-unified-rt \
 
 ## Open items
 
-- Measure M1 latency and throughput through the graduation-probe machinery; no M1 measurement was taken here.
 - Evaluate f16 separately. Existing M1 evidence makes gte f16 regressive, so reranking rejects f16 rather than silently changing precision.
 - Add batch-dimension tail buckets or safe cross-request coalescing if rerank padding waste becomes a serving bottleneck.
 - Add Qwen3-class rerankers after their sequence-classification architecture and scoring conventions are independently verified.
