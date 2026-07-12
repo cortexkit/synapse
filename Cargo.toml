@@ -13,6 +13,7 @@ members = [
     "bench/lanes/candle-embed",
     "crates/synapse-core",
     "crates/synapse-engine-ort",
+    "crates/synapse-engine-owned",
     "crates/synapse-module",
     "crates/synapse-worker-llama",
     "crates/synapse-worker-mlx",

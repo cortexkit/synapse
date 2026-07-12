@@ -666,6 +666,156 @@ async fn embed_query_preloaded_minilm_returns_vectors_and_envelope() {
     assert_eq!(result["fingerprint"], second["result"]["fingerprint"]);
 }
 
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn embed_query_loaded_owned_metal_carries_distinct_provenance_and_content_hash() {
+    let Some(snapshot) = minilm_safetensors_snapshot() else {
+        eprintln!("skipping owned-metal MiniLM e2e: local safetensors snapshot is missing");
+        return;
+    };
+    let Some(ort_preloads) = minilm_preload_config() else {
+        eprintln!("skipping owned-metal cross-engine e2e: local ONNX snapshot is missing");
+        return;
+    };
+    let _lock = acquire_minilm_e2e_lock();
+    let daemon = start_daemon().await;
+    let cache = unique_temp_dir("synapse-owned-model-cache");
+    let module = spawn_synapse_module_with_env(
+        &daemon.connection_file_path,
+        Some(&ort_preloads),
+        None,
+        &[("CORTEXKIT_MODEL_CACHE", cache.to_string_lossy().as_ref())],
+    );
+    let (_daemon, _module, mut consumer, route_channel) =
+        open_route_for_started_module(daemon, module).await;
+    let accepted = route_request(
+        &mut consumer,
+        route_channel,
+        46,
+        serde_json::json!({
+            "method": "model.load",
+            "params": {
+                "source": "file",
+                "path": snapshot,
+                "files": {
+                    "model": {
+                        "url": "model.safetensors",
+                        "sha256": test_sha256(snapshot.join("model.safetensors"))
+                    },
+                    "tokenizer": {
+                        "url": "tokenizer.json",
+                        "sha256": test_sha256(snapshot.join("tokenizer.json"))
+                    },
+                    "config": {
+                        "url": "config.json",
+                        "sha256": test_sha256(snapshot.join("config.json"))
+                    }
+                },
+                "engine": "owned-metal",
+                "family": "minilm",
+                "dtype": "f16",
+                "execution": "explicit",
+                "model_id": "minilm-owned",
+                "task": "embed",
+                "max_tokens": 512,
+                "pin": true,
+                "request_key": "owned-metal-model-load-e2e"
+            }
+        }),
+    )
+    .await;
+    let job_id = accepted["result"]["job_id"].as_str().unwrap();
+    let ready = poll_model_load_job(&mut consumer, route_channel, 47, job_id).await;
+    assert_eq!(
+        ready["result"]["state"], "ready",
+        "owned load failed: {ready:?}"
+    );
+    run_probe_job(
+        &mut consumer,
+        route_channel,
+        60,
+        serde_json::json!({ "models": ["minilm", "minilm-owned"] }),
+    )
+    .await;
+
+    let body = route_request(
+        &mut consumer,
+        route_channel,
+        2_000,
+        serde_json::json!({
+            "method": "embed.query",
+            "params": {
+                "model": "minilm-owned",
+                "id": "owned-q1",
+                "text": "hello world"
+            }
+        }),
+    )
+    .await;
+    let result = &body["result"];
+    assert_eq!(result["dims"], 384);
+    assert_eq!(result["vectors"][0]["id"], "owned-q1");
+    assert_eq!(
+        result["vectors"][0]["content_sha256"],
+        "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+    );
+    assert_eq!(result["provenance"]["engine"]["engine"], "owned-metal");
+    assert_eq!(
+        result["provenance"]["engine"]["build_flags"]["family"],
+        "minilm"
+    );
+    assert_eq!(
+        result["provenance"]["engine"]["build_flags"]["dtype"],
+        "f16"
+    );
+    assert_eq!(
+        result["provenance"]["engine"]["build_flags"]["graph_revision"],
+        "3"
+    );
+    assert_eq!(
+        result["provenance"]["engine"]["build_flags"]["bucket_policy"],
+        "v1"
+    );
+    assert_eq!(result["fingerprint"].as_str().unwrap().len(), 64);
+    let spike_golden: Value =
+        serde_json::from_str(include_str!("fixtures/minilm_owned_spike_f16.jsonl"))
+            .expect("decode frozen spike handoff vector");
+    assert_vector_cosine_at_least(
+        &result["vectors"][0]["vector"],
+        &spike_golden["vec"],
+        0.999_999,
+    );
+
+    let ort = route_request(
+        &mut consumer,
+        route_channel,
+        2_001,
+        serde_json::json!({
+            "method": "embed.query",
+            "params": { "model": "minilm", "text": "hello world" }
+        }),
+    )
+    .await;
+    let ort_fingerprint = ort["result"]["fingerprint"].as_str().unwrap();
+    assert_ne!(ort_fingerprint, result["fingerprint"].as_str().unwrap());
+    let rejected = route_request(
+        &mut consumer,
+        route_channel,
+        2_002,
+        serde_json::json!({
+            "method": "embed.query",
+            "params": {
+                "model": "minilm-owned",
+                "text": "hello world",
+                "target_fingerprint": ort_fingerprint
+            }
+        }),
+    )
+    .await;
+    assert_eq!(rejected["result"]["error"]["code"], "substitution_rejected");
+    let _ = std::fs::remove_dir_all(cache);
+}
+
 #[tokio::test]
 async fn embed_batch_preloaded_minilm_preserves_order_and_envelope() {
     let Some(preloads) = minilm_preload_config() else {
@@ -1772,6 +1922,32 @@ fn overwrite_knob_assignment(
     assert_eq!(changed, 1, "expected one knob assignment row to update");
 }
 
+fn assert_vector_cosine_at_least(actual: &Value, expected: &Value, minimum: f64) {
+    let actual = actual.as_array().expect("actual vector is an array");
+    let expected = expected.as_array().expect("expected vector is an array");
+    assert_eq!(actual.len(), expected.len());
+    let dot = actual
+        .iter()
+        .zip(expected)
+        .map(|(left, right)| left.as_f64().unwrap() * right.as_f64().unwrap())
+        .sum::<f64>();
+    let actual_norm = actual
+        .iter()
+        .map(|value| value.as_f64().unwrap().powi(2))
+        .sum::<f64>()
+        .sqrt();
+    let expected_norm = expected
+        .iter()
+        .map(|value| value.as_f64().unwrap().powi(2))
+        .sum::<f64>()
+        .sqrt();
+    let cosine = dot / (actual_norm * expected_norm + 1e-12);
+    assert!(
+        cosine >= minimum,
+        "vector cosine {cosine:.9} is below {minimum:.9}"
+    );
+}
+
 fn assert_vectors_close(actual: &Value, expected: &Value) {
     let actual = actual.as_array().expect("actual vector is an array");
     let expected = expected.as_array().expect("expected vector is an array");
@@ -1820,6 +1996,26 @@ fn minilm_preload_config() -> Option<String> {
         }])
         .to_string(),
     )
+}
+
+#[cfg(target_os = "macos")]
+fn test_sha256(path: PathBuf) -> String {
+    use sha2::{Digest, Sha256};
+
+    format!(
+        "sha256:{}",
+        hex::encode(Sha256::digest(std::fs::read(path).unwrap()))
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn minilm_safetensors_snapshot() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("SYNAPSE_MINILM_SAFETENSORS_SNAPSHOT") {
+        return Some(PathBuf::from(path));
+    }
+    let snapshots = PathBuf::from(std::env::var("HOME").ok()?)
+        .join(".cache/huggingface/hub/models--sentence-transformers--all-MiniLM-L6-v2/snapshots");
+    first_snapshot_with(&snapshots, "model.safetensors")
 }
 
 fn minilm_alias_preload_config() -> Option<Value> {

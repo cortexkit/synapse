@@ -59,6 +59,11 @@ use synapse_core::{
     TruncationDisclosure, ValidatedArtifact, Vectors, WorkRequest, WorkerPooling,
 };
 use synapse_engine_ort::OrtEmbedEngine;
+use synapse_engine_owned::{
+    engine_identity as owned_engine_identity, ModelFamily as OwnedFamily, OwnedDType,
+    OwnedMetalEmbedEngine, TokenizerPolicy as OwnedTokenizerPolicy,
+    DEFAULT_ATTENTION_UNITS as OWNED_DEFAULT_ATTENTION_UNITS,
+};
 use thiserror::Error;
 use tokio::sync::{Notify, Semaphore};
 
@@ -341,6 +346,14 @@ struct PreloadModelConfig {
     #[serde(default)]
     quant: Option<String>,
     #[serde(default)]
+    family: Option<String>,
+    #[serde(default)]
+    dtype: Option<String>,
+    #[serde(default)]
+    execution: Option<String>,
+    #[serde(default)]
+    attention_units: Option<usize>,
+    #[serde(default)]
     worker_bin: Option<PathBuf>,
     #[serde(default)]
     worker_runtime_dir: Option<PathBuf>,
@@ -569,6 +582,7 @@ struct EmbeddingModel {
     numeric_profile_id: NumericProfileId,
     fingerprint: Fingerprint,
     engine_identity: EngineIdentity,
+    owned_tokenizer_policy: Option<OwnedTokenizerPolicy>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -591,6 +605,7 @@ impl ModelTask {
 #[derive(Clone)]
 enum EmbedBackend {
     Ort(Arc<Mutex<OrtEmbedEngine>>),
+    Owned(Arc<Mutex<OwnedMetalEmbedEngine>>),
     Worker(Arc<Mutex<worker_host::WorkerEngine>>),
 }
 
@@ -770,9 +785,36 @@ struct JobResumeParams {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+enum ModelLoadFileSpec {
+    Legacy(String),
+    Detailed { url: String, sha256: String },
+}
+
+impl ModelLoadFileSpec {
+    fn locator(&self) -> &str {
+        match self {
+            Self::Legacy(value) => value,
+            Self::Detailed { url, .. } => url,
+        }
+    }
+
+    fn expected_digest(&self) -> Option<String> {
+        match self {
+            Self::Legacy(_) => None,
+            Self::Detailed { sha256, .. } => Some(normalize_digest(sha256)),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct ModelLoadFiles {
-    model: String,
-    tokenizer: String,
+    model: ModelLoadFileSpec,
+    tokenizer: ModelLoadFileSpec,
+    #[serde(default)]
+    config: Option<ModelLoadFileSpec>,
+    #[serde(default)]
+    extra: Vec<ModelLoadFileSpec>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -804,6 +846,14 @@ struct ModelLoadParams {
     max_tokens: Option<usize>,
     #[serde(default)]
     quant: Option<String>,
+    #[serde(default)]
+    family: Option<String>,
+    #[serde(default)]
+    dtype: Option<String>,
+    #[serde(default)]
+    execution: Option<String>,
+    #[serde(default)]
+    attention_units: Option<usize>,
     #[serde(default)]
     worker_bin: Option<PathBuf>,
     #[serde(default)]
@@ -1275,8 +1325,32 @@ fn build_preload_catalog_model(
         Some(digest) => normalize_digest(&digest),
         None => format!("sha256:{}", sha256_file(&preload.model_path)?),
     };
-    let tokenizer =
-        SanitizedTokenizer::from_file(&preload.tokenizer_path, TokenizerConfig { max_tokens })?;
+    let owned = (engine_name == "owned-metal")
+        .then(|| {
+            owned_catalog_config(
+                &preload.model_path,
+                preload.family.as_deref(),
+                preload.dtype.as_deref(),
+                preload.execution.as_deref(),
+                preload.attention_units,
+                None,
+                Vec::new(),
+            )
+        })
+        .transpose()?;
+    let tokenizer_max_tokens = owned_tokenizer_max_tokens(max_tokens, owned.as_ref());
+    let tokenizer = SanitizedTokenizer::from_file(
+        &preload.tokenizer_path,
+        TokenizerConfig {
+            max_tokens: tokenizer_max_tokens,
+        },
+    )?;
+    let quant = preload.quant.clone().unwrap_or_else(|| {
+        owned
+            .as_ref()
+            .map(|profile| profile.dtype.as_str().to_string())
+            .unwrap_or_else(|| default_quant(&engine_name))
+    });
     build_stored_model_config(
         model_id,
         &engine_name,
@@ -1295,13 +1369,11 @@ fn build_preload_catalog_model(
         pooling,
         normalize,
         max_tokens,
-        preload
-            .quant
-            .clone()
-            .unwrap_or_else(|| default_quant(&engine_name)),
+        quant,
         false,
         preload.worker_bin.clone(),
         preload.worker_runtime_dir.clone(),
+        owned,
         inline,
         jobs,
     )
@@ -1315,6 +1387,29 @@ fn normalize_catalog_model(
     let engine_name = canonical_engine_name(&model.engine);
     let task = parse_model_task(Some(&model.task), &engine_name, &model.model_id)?;
     let pooling = parse_pooling(&model.pooling)?;
+    let owned = if engine_name == "owned-metal" {
+        Some(OwnedCatalogConfig {
+            family: OwnedFamily::parse(model.owned_family.as_deref().ok_or_else(|| {
+                ModuleError::Config("owned-metal catalog entry is missing family".to_string())
+            })?)
+            .map_err(|error| ModuleError::Config(error.to_string()))?,
+            dtype: OwnedDType::parse(model.owned_dtype.as_deref().ok_or_else(|| {
+                ModuleError::Config("owned-metal catalog entry is missing dtype".to_string())
+            })?)
+            .map_err(|error| ModuleError::Config(error.to_string()))?,
+            execution: model
+                .owned_execution
+                .clone()
+                .unwrap_or_else(|| "explicit".to_string()),
+            attention_units: model
+                .owned_attention_units
+                .unwrap_or(OWNED_DEFAULT_ATTENTION_UNITS),
+            config_locator: model.config_locator.clone(),
+            extra_locators: model.extra_locators.clone(),
+        })
+    } else {
+        None
+    };
     build_stored_model_config(
         model.model_id,
         &engine_name,
@@ -1333,9 +1428,20 @@ fn normalize_catalog_model(
         model.pin,
         model.worker_bin,
         model.worker_runtime_dir,
+        owned,
         inline,
         jobs,
     )
+}
+
+#[derive(Clone, Debug)]
+struct OwnedCatalogConfig {
+    family: OwnedFamily,
+    dtype: OwnedDType,
+    execution: String,
+    attention_units: usize,
+    config_locator: Option<ModelAssetLocator>,
+    extra_locators: Vec<ModelAssetLocator>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1357,10 +1463,19 @@ fn build_stored_model_config(
     pin: bool,
     worker_bin: Option<PathBuf>,
     worker_runtime_dir: Option<PathBuf>,
+    owned: Option<OwnedCatalogConfig>,
     inline: &InlineConfig,
     jobs: &JobConfig,
 ) -> Result<StoredModelConfig, ModuleError> {
-    let engine_identity = catalog_model_engine_identity(engine_name)?;
+    if engine_name == "owned-metal" && task != ModelTask::Embed {
+        return Err(ModuleError::Config(
+            "owned-metal supports embedding models only in wave 1".to_string(),
+        ));
+    }
+    let engine_identity = owned
+        .as_ref()
+        .map(|profile| owned_engine_identity(profile.family, profile.dtype))
+        .map_or_else(|| catalog_model_engine_identity(engine_name), Ok)?;
     let numeric_profile = NumericProfile {
         model_digest: artifact_digest.clone(),
         quant,
@@ -1372,10 +1487,14 @@ fn build_stored_model_config(
         } else {
             NormalizationMode::None
         },
-        dtype: match engine_name {
-            "llama" | "ane" => NumericDType::F16,
-            "mlx" => NumericDType::Bf16,
-            _ => NumericDType::F32,
+        dtype: match owned.as_ref().map(|profile| profile.dtype) {
+            Some(OwnedDType::F16) => NumericDType::F16,
+            Some(OwnedDType::F32) => NumericDType::F32,
+            None => match engine_name {
+                "llama" | "ane" => NumericDType::F16,
+                "mlx" => NumericDType::Bf16,
+                _ => NumericDType::F32,
+            },
         },
         flash_attention: FlashAttentionSetting::Disabled,
         certified_shape: CertifiedShapeEnvelope {
@@ -1408,6 +1527,21 @@ fn build_stored_model_config(
         max_tokens,
         quant: numeric_profile.quant.clone(),
         pin,
+        owned_family: owned
+            .as_ref()
+            .map(|profile| profile.family.as_str().to_string()),
+        owned_dtype: owned
+            .as_ref()
+            .map(|profile| profile.dtype.as_str().to_string()),
+        owned_execution: owned.as_ref().map(|profile| profile.execution.clone()),
+        owned_attention_units: owned.as_ref().map(|profile| profile.attention_units),
+        config_locator: owned
+            .as_ref()
+            .and_then(|profile| profile.config_locator.clone()),
+        extra_locators: owned
+            .as_ref()
+            .map(|profile| profile.extra_locators.clone())
+            .unwrap_or_default(),
         engine_identity,
         numeric_profile_id: numeric_profile.numeric_profile_id(),
         fingerprint: numeric_profile.fingerprint(),
@@ -1416,11 +1550,66 @@ fn build_stored_model_config(
     })
 }
 
+fn owned_tokenizer_max_tokens(max_tokens: usize, owned: Option<&OwnedCatalogConfig>) -> usize {
+    if owned.is_some_and(|profile| profile.family == OwnedFamily::Qwen3) {
+        max_tokens.saturating_sub(1).max(1)
+    } else {
+        max_tokens
+    }
+}
+
+fn owned_catalog_config(
+    model_path: &Path,
+    family: Option<&str>,
+    dtype: Option<&str>,
+    execution: Option<&str>,
+    attention_units: Option<usize>,
+    config_locator: Option<ModelAssetLocator>,
+    extra_locators: Vec<ModelAssetLocator>,
+) -> Result<OwnedCatalogConfig, ModuleError> {
+    let detected = synapse_engine_owned::detect_family(model_path)
+        .map_err(|error| ModuleError::Config(error.to_string()))?;
+    if let Some(family) = family {
+        let declared =
+            OwnedFamily::parse(family).map_err(|error| ModuleError::Config(error.to_string()))?;
+        if declared != detected {
+            return Err(ModuleError::Config(format!(
+                "declared owned-metal family {} does not match detected family {}",
+                declared.as_str(),
+                detected.as_str()
+            )));
+        }
+    }
+    let dtype = dtype
+        .map(OwnedDType::parse)
+        .transpose()
+        .map_err(|error| ModuleError::Config(error.to_string()))?
+        .unwrap_or_else(|| detected.recommended_dtype());
+    let execution = execution.unwrap_or("explicit").to_ascii_lowercase();
+    if !matches!(execution.as_str(), "explicit" | "lazy") {
+        return Err(ModuleError::Config(format!(
+            "unsupported owned-metal execution mode '{execution}'"
+        )));
+    }
+    let attention_units = attention_units.unwrap_or(OWNED_DEFAULT_ATTENTION_UNITS);
+    Ok(OwnedCatalogConfig {
+        family: detected,
+        dtype,
+        execution,
+        attention_units,
+        config_locator,
+        extra_locators,
+    })
+}
+
 fn canonical_engine_name(engine: &str) -> String {
     match engine.trim().to_ascii_lowercase().as_str() {
         "onnx" => "ort".to_string(),
         "llama.cpp" => "llama".to_string(),
         "coreml" | "neural_engine" => "ane".to_string(),
+        // Catalog entries select this engine explicitly. Future hardware probes can
+        // populate the same catalog value without changing request dispatch.
+        "owned" | "metal" | "owned_metal" => "owned-metal".to_string(),
         other => other.to_string(),
     }
 }
@@ -1430,6 +1619,7 @@ fn default_artifact_format(engine_name: &str) -> String {
         "llama" => "gguf".to_string(),
         "mlx" => "safetensors".to_string(),
         "ane" => "mlmodelc".to_string(),
+        "owned-metal" => "safetensors-package".to_string(),
         _ => "onnx".to_string(),
     }
 }
@@ -1439,6 +1629,7 @@ fn default_quant(engine_name: &str) -> String {
         "llama" => "f16".to_string(),
         "mlx" => "bf16".to_string(),
         "ane" => "fp16".to_string(),
+        "owned-metal" => "f16".to_string(),
         _ => "fp32".to_string(),
     }
 }
@@ -1609,9 +1800,17 @@ async fn dispatch_request(state: Arc<ModuleState>, request: MethodEnvelope) -> H
 }
 
 #[derive(Clone)]
+struct ResolvedModelLoadAsset {
+    source_url: String,
+    expected_digest: Option<String>,
+}
+
+#[derive(Clone)]
 struct ResolvedModelLoadSources {
-    model_source_url: String,
-    tokenizer_source_url: String,
+    model: ResolvedModelLoadAsset,
+    tokenizer: ResolvedModelLoadAsset,
+    config: Option<ResolvedModelLoadAsset>,
+    extra: Vec<ResolvedModelLoadAsset>,
 }
 
 fn model_runtime_state_name(state: &ModelRuntimeState) -> &'static str {
@@ -2184,6 +2383,98 @@ async fn load_catalog_model_task(
     }
 }
 
+fn stored_owned_profile(
+    spec: &StoredModelConfig,
+) -> Result<Option<OwnedCatalogConfig>, WireOperationError> {
+    if spec.engine != "owned-metal" {
+        return Ok(None);
+    }
+    let family = spec
+        .owned_family
+        .as_deref()
+        .ok_or_else(|| artifact_invalid_error("owned-metal catalog entry is missing family"))?;
+    let dtype = spec
+        .owned_dtype
+        .as_deref()
+        .ok_or_else(|| artifact_invalid_error("owned-metal catalog entry is missing dtype"))?;
+    Ok(Some(OwnedCatalogConfig {
+        family: OwnedFamily::parse(family)
+            .map_err(|error| artifact_invalid_error(error.to_string()))?,
+        dtype: OwnedDType::parse(dtype)
+            .map_err(|error| artifact_invalid_error(error.to_string()))?,
+        execution: spec
+            .owned_execution
+            .clone()
+            .unwrap_or_else(|| "explicit".to_string()),
+        attention_units: spec
+            .owned_attention_units
+            .unwrap_or(OWNED_DEFAULT_ATTENTION_UNITS),
+        config_locator: spec.config_locator.clone(),
+        extra_locators: spec.extra_locators.clone(),
+    }))
+}
+
+fn assemble_owned_model_package(
+    spec: &StoredModelConfig,
+    model_path: &Path,
+    model_cache: &ModelCache,
+    profile: &OwnedCatalogConfig,
+) -> Result<PathBuf, WireOperationError> {
+    if model_path.is_dir()
+        || model_path
+            .parent()
+            .is_some_and(|parent| parent.join("config.json").is_file())
+    {
+        return Ok(model_path.to_path_buf());
+    }
+    if !profile.extra_locators.is_empty() {
+        return Err(artifact_invalid_error(
+            "sharded owned-metal packages are reserved but not supported in wave 1",
+        ));
+    }
+    let config_locator = profile.config_locator.as_ref().ok_or_else(|| {
+        artifact_invalid_error("owned-metal model package is missing files.config")
+    })?;
+    let config = locator_path(config_locator, model_cache)?;
+    let package_key = spec.artifact_digest.trim_start_matches("sha256:");
+    let packages_root = model_cache.root().join("owned-metal-models");
+    let package_root = packages_root.join(package_key);
+    if package_root.join("config.json").is_file()
+        && package_root.join("model.safetensors").is_file()
+    {
+        return Ok(package_root);
+    }
+    fs::create_dir_all(&packages_root).map_err(|error| {
+        io_to_load_error("create owned-metal package root", &packages_root, &error)
+    })?;
+    let temporary = packages_root.join(format!(".{package_key}.{}.tmp", std::process::id()));
+    if temporary.exists() {
+        fs::remove_dir_all(&temporary).map_err(|error| {
+            io_to_load_error("remove stale owned-metal package temp", &temporary, &error)
+        })?;
+    }
+    fs::create_dir_all(&temporary)
+        .map_err(|error| io_to_load_error("create owned-metal package temp", &temporary, &error))?;
+    fs::copy(model_path, temporary.join("model.safetensors"))
+        .map_err(|error| io_to_load_error("copy owned-metal model", model_path, &error))?;
+    fs::copy(&config.path, temporary.join("config.json"))
+        .map_err(|error| io_to_load_error("copy owned-metal config", &config.path, &error))?;
+    match fs::rename(&temporary, &package_root) {
+        Ok(()) => {}
+        Err(_) if package_root.is_dir() => {
+            let _ = fs::remove_dir_all(&temporary);
+        }
+        Err(error) => {
+            return Err(io_to_load_error(
+                "publish owned-metal model package",
+                &package_root,
+                &error,
+            ))
+        }
+    }
+    Ok(package_root)
+}
+
 fn load_catalog_model_blocking(
     spec: StoredModelConfig,
     ort_engine: Arc<Mutex<OrtEmbedEngine>>,
@@ -2194,10 +2485,16 @@ fn load_catalog_model_blocking(
         .map_err(|error| artifact_invalid_error(error.to_string()))?;
     let model_path = locator_path(&spec.model_locator, &model_cache)?;
     let tokenizer_path = locator_path(&spec.tokenizer_locator, &model_cache)?;
+    let owned_profile = stored_owned_profile(&spec)?;
+    let effective_model_path = if let Some(profile) = owned_profile.as_ref() {
+        assemble_owned_model_package(&spec, &model_path.path, &model_cache, profile)?
+    } else {
+        model_path.path.clone()
+    };
     let tokenizer = SanitizedTokenizer::from_file(
         &tokenizer_path.path,
         TokenizerConfig {
-            max_tokens: spec.max_tokens,
+            max_tokens: owned_tokenizer_max_tokens(spec.max_tokens, owned_profile.as_ref()),
         },
     )
     .map_err(|error| artifact_invalid_error(error.to_string()))?;
@@ -2208,12 +2505,17 @@ fn load_catalog_model_blocking(
             spec.model_id, spec.tokenizer_sanitized_digest, actual_tokenizer_digest
         )));
     }
-    let runtime_config = model_runtime_config(&spec, &model_path.path, microllm_max_tokens);
+    let runtime_config = model_runtime_config(
+        &spec,
+        &effective_model_path,
+        model_cache.root(),
+        microllm_max_tokens,
+    );
     let artifact = ValidatedArtifact {
         digest: spec.artifact_digest.clone(),
         format: spec.artifact_format.clone(),
     };
-    let (backend, loaded_model) = match spec.engine.as_str() {
+    let (backend, loaded_model, owned_tokenizer_policy) = match spec.engine.as_str() {
         "ort" => {
             let mut engine = ort_engine.lock().map_err(|_| {
                 WireOperationError::from_stable(
@@ -2224,9 +2526,40 @@ fn load_catalog_model_blocking(
             let loaded_model = engine
                 .load(&artifact, &runtime_config)
                 .map_err(engine_error_to_wire)?;
-            (EmbedBackend::Ort(Arc::clone(&ort_engine)), loaded_model)
+            (
+                EmbedBackend::Ort(Arc::clone(&ort_engine)),
+                loaded_model,
+                None,
+            )
         }
-        "llama" | "mlx" | "ane" => load_worker_backend_blocking(&spec, &artifact, &runtime_config)?,
+        "owned-metal" => {
+            if !cfg!(target_os = "macos") {
+                return Err(artifact_invalid_error(format!(
+                    "owned-metal model '{}' is only supported on macOS",
+                    spec.model_id
+                )));
+            }
+            let profile = owned_profile.as_ref().ok_or_else(|| {
+                artifact_invalid_error("owned-metal catalog entry is missing runtime profile")
+            })?;
+            let mut engine = OwnedMetalEmbedEngine::new(profile.family, profile.dtype);
+            let loaded_model = engine
+                .load(&artifact, &runtime_config)
+                .map_err(engine_error_to_wire)?;
+            let policy = engine
+                .tokenizer_policy(&loaded_model)
+                .map_err(engine_error_to_wire)?;
+            (
+                EmbedBackend::Owned(Arc::new(Mutex::new(engine))),
+                loaded_model,
+                Some(policy),
+            )
+        }
+        "llama" | "mlx" | "ane" => {
+            let (backend, loaded) =
+                load_worker_backend_blocking(&spec, &artifact, &runtime_config)?;
+            (backend, loaded, None)
+        }
         other => {
             return Err(artifact_invalid_error(format!(
                 "unsupported engine '{other}' for model '{}'",
@@ -2243,6 +2576,7 @@ fn load_catalog_model_blocking(
         numeric_profile_id: spec.numeric_profile_id.clone(),
         fingerprint: spec.fingerprint.clone(),
         engine_identity: spec.engine_identity.clone(),
+        owned_tokenizer_policy,
     })
 }
 
@@ -2315,6 +2649,16 @@ fn unload_embedding_model_blocking(model: Arc<EmbeddingModel>) -> Result<(), Wir
             engine.unload(&model.loaded_model);
             Ok(())
         }
+        EmbedBackend::Owned(engine) => {
+            let mut engine = engine.lock().map_err(|_| {
+                WireOperationError::from_stable(
+                    StableError::engine_crashed(Some(100)),
+                    "owned-metal engine mutex was poisoned during model unload",
+                )
+            })?;
+            engine.unload(&model.loaded_model);
+            Ok(())
+        }
         EmbedBackend::Worker(engine) => {
             let mut engine = engine.lock().map_err(|_| {
                 WireOperationError::from_stable(
@@ -2331,6 +2675,7 @@ fn unload_embedding_model_blocking(model: Arc<EmbeddingModel>) -> Result<(), Wir
 fn model_runtime_config(
     spec: &StoredModelConfig,
     model_path: &Path,
+    model_cache_root: &Path,
     microllm_max_tokens: u32,
 ) -> RuntimeConfig {
     let mut runtime_config = RuntimeConfig::default();
@@ -2353,6 +2698,30 @@ fn model_runtime_config(
         "microllm_max_tokens".to_string(),
         microllm_max_tokens.to_string(),
     );
+    if spec.engine == "owned-metal" {
+        runtime_config
+            .values
+            .insert("max_tokens".to_string(), spec.max_tokens.to_string());
+        runtime_config.values.insert(
+            "package_cache_root".to_string(),
+            model_cache_root
+                .join("owned-metal-packages")
+                .to_string_lossy()
+                .to_string(),
+        );
+        runtime_config.values.insert(
+            "execution".to_string(),
+            spec.owned_execution
+                .clone()
+                .unwrap_or_else(|| "explicit".to_string()),
+        );
+        runtime_config.values.insert(
+            "attention_units".to_string(),
+            spec.owned_attention_units
+                .unwrap_or(OWNED_DEFAULT_ATTENTION_UNITS)
+                .to_string(),
+        );
+    }
     runtime_config
 }
 
@@ -2444,6 +2813,16 @@ async fn execute_model_load_job(state: Arc<ModuleState>, job_id: String, params:
             .map_err(|error| io_to_load_error("create temp directory", &temp_dir, &error))?;
         let model_path = temp_dir.join("model.bin");
         let tokenizer_path = temp_dir.join("tokenizer.json");
+        let config_path = sources
+            .config
+            .as_ref()
+            .map(|_| temp_dir.join("config.json"));
+        let extra_paths = sources
+            .extra
+            .iter()
+            .enumerate()
+            .map(|(index, _)| temp_dir.join(format!("extra-{index}.safetensors")))
+            .collect::<Vec<_>>();
 
         set_job_progress(
             &state.runtime,
@@ -2454,7 +2833,7 @@ async fn execute_model_load_job(state: Arc<ModuleState>, job_id: String, params:
             },
         );
         download_source_to_temp(
-            &sources.model_source_url,
+            &sources.model.source_url,
             &model_path,
             |bytes_done, bytes_total| {
                 set_job_progress(
@@ -2467,7 +2846,13 @@ async fn execute_model_load_job(state: Arc<ModuleState>, job_id: String, params:
                 );
             },
         )?;
-        download_source_to_temp(&sources.tokenizer_source_url, &tokenizer_path, |_, _| {})?;
+        download_source_to_temp(&sources.tokenizer.source_url, &tokenizer_path, |_, _| {})?;
+        if let (Some(source), Some(path)) = (&sources.config, &config_path) {
+            download_source_to_temp(&source.source_url, path, |_, _| {})?;
+        }
+        for (source, path) in sources.extra.iter().zip(&extra_paths) {
+            download_source_to_temp(&source.source_url, path, |_, _| {})?;
+        }
 
         set_job_progress(&state.runtime, &job_id, ModelRuntimeState::Validating);
         let engine_name = canonical_engine_name(&params.engine);
@@ -2478,7 +2863,7 @@ async fn execute_model_load_job(state: Arc<ModuleState>, job_id: String, params:
             .model_cache
             .ingest(ModelCacheIngest {
                 source_url: local_file_url(&tokenizer_path),
-                expected_digest: None,
+                expected_digest: sources.tokenizer.expected_digest.clone(),
                 format: "tokenizer_json".to_string(),
                 tokenizer_path: None,
                 pin_module_id: pin_module_id.clone(),
@@ -2488,18 +2873,90 @@ async fn execute_model_load_job(state: Arc<ModuleState>, job_id: String, params:
             .model_cache
             .ingest(ModelCacheIngest {
                 source_url: local_file_url(&model_path),
-                expected_digest: params.expected_digest.clone(),
+                expected_digest: sources
+                    .model
+                    .expected_digest
+                    .clone()
+                    .or_else(|| params.expected_digest.clone()),
                 format: default_artifact_format(&engine_name),
                 tokenizer_path: Some(tokenizer_path.clone()),
-                pin_module_id,
+                pin_module_id: pin_module_id.clone(),
             })
             .map_err(model_cache_load_error)?;
+        let config_meta = config_path
+            .as_ref()
+            .map(|path| {
+                state.model_cache.ingest(ModelCacheIngest {
+                    source_url: local_file_url(path),
+                    expected_digest: sources
+                        .config
+                        .as_ref()
+                        .and_then(|source| source.expected_digest.clone()),
+                    format: "json".to_string(),
+                    tokenizer_path: None,
+                    pin_module_id: pin_module_id.clone(),
+                })
+            })
+            .transpose()
+            .map_err(model_cache_load_error)?;
+        let extra_metas = extra_paths
+            .iter()
+            .zip(&sources.extra)
+            .map(|(path, source)| {
+                state.model_cache.ingest(ModelCacheIngest {
+                    source_url: local_file_url(path),
+                    expected_digest: source.expected_digest.clone(),
+                    format: "safetensors".to_string(),
+                    tokenizer_path: None,
+                    pin_module_id: pin_module_id.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(model_cache_load_error)?;
+        let package_digest = package_digest(
+            &model_meta,
+            &tokenizer_meta,
+            config_meta.as_ref(),
+            &extra_metas,
+        );
+        let owned = if engine_name == "owned-metal" {
+            if config_meta.is_none() {
+                return Err(artifact_invalid_error(
+                    "owned-metal model.load requires files.config",
+                ));
+            }
+            Some(
+                owned_catalog_config(
+                    &temp_dir,
+                    params.family.as_deref(),
+                    params.dtype.as_deref(),
+                    params.execution.as_deref(),
+                    params.attention_units,
+                    config_meta
+                        .as_ref()
+                        .map(|meta| ModelAssetLocator::CacheDigest {
+                            digest: meta.digest.clone(),
+                        }),
+                    extra_metas
+                        .iter()
+                        .map(|meta| ModelAssetLocator::CacheDigest {
+                            digest: meta.digest.clone(),
+                        })
+                        .collect(),
+                )
+                .map_err(|error| artifact_invalid_error(error.to_string()))?,
+            )
+        } else {
+            None
+        };
         let spec = build_loaded_catalog_model(
             &params,
             &engine_name,
             &sources,
             &model_meta,
             &tokenizer_meta,
+            package_digest,
+            owned,
             &state.runtime.inline,
             &state.runtime.jobs,
         )?;
@@ -2540,7 +2997,9 @@ async fn execute_model_load_job(state: Arc<ModuleState>, job_id: String, params:
 }
 
 fn validate_model_load_request(params: &ModelLoadParams) -> Result<(), String> {
-    if params.files.model.trim().is_empty() || params.files.tokenizer.trim().is_empty() {
+    if params.files.model.locator().trim().is_empty()
+        || params.files.tokenizer.locator().trim().is_empty()
+    {
         return Err("model.load requires files.model and files.tokenizer".to_string());
     }
     resolve_model_load_sources(params).map(|_| ())
@@ -2549,42 +3008,60 @@ fn validate_model_load_request(params: &ModelLoadParams) -> Result<(), String> {
 fn resolve_model_load_sources(
     params: &ModelLoadParams,
 ) -> Result<ResolvedModelLoadSources, String> {
-    match params.source.trim().to_ascii_lowercase().as_str() {
-        "hf" => {
-            let repo = params
-                .repo
-                .as_deref()
-                .filter(|value| !value.trim().is_empty())
-                .ok_or_else(|| "model.load source=hf requires repo".to_string())?;
-            Ok(ResolvedModelLoadSources {
-                model_source_url: huggingface_resolve_url(repo, &params.files.model)?,
-                tokenizer_source_url: huggingface_resolve_url(repo, &params.files.tokenizer)?,
-            })
-        }
-        "url" => {
-            let base = params
-                .url
-                .as_deref()
-                .filter(|value| !value.trim().is_empty())
-                .ok_or_else(|| "model.load source=url requires url".to_string())?;
-            Ok(ResolvedModelLoadSources {
-                model_source_url: join_base_url(base, &params.files.model)?,
-                tokenizer_source_url: join_base_url(base, &params.files.tokenizer)?,
-            })
-        }
-        "file" => {
-            let base = params
-                .path
-                .as_deref()
-                .filter(|value| !value.trim().is_empty())
-                .ok_or_else(|| "model.load source=file requires path".to_string())?;
-            Ok(ResolvedModelLoadSources {
-                model_source_url: join_file_source(base, &params.files.model)?,
-                tokenizer_source_url: join_file_source(base, &params.files.tokenizer)?,
-            })
-        }
-        other => Err(format!("unsupported model.load source '{other}'")),
-    }
+    let resolve = |spec: &ModelLoadFileSpec| -> Result<ResolvedModelLoadAsset, String> {
+        let locator = spec.locator();
+        let source_url = if matches!(spec, ModelLoadFileSpec::Detailed { .. })
+            && (locator.starts_with("https://")
+                || locator.starts_with("http://")
+                || locator.starts_with("file://"))
+        {
+            locator.to_string()
+        } else {
+            match params.source.trim().to_ascii_lowercase().as_str() {
+                "hf" => {
+                    let repo = params
+                        .repo
+                        .as_deref()
+                        .filter(|value| !value.trim().is_empty())
+                        .ok_or_else(|| "model.load source=hf requires repo".to_string())?;
+                    huggingface_resolve_url(repo, locator)?
+                }
+                "url" => {
+                    let base = params
+                        .url
+                        .as_deref()
+                        .filter(|value| !value.trim().is_empty())
+                        .ok_or_else(|| "model.load source=url requires url".to_string())?;
+                    join_base_url(base, locator)?
+                }
+                "file" => {
+                    let base = params
+                        .path
+                        .as_deref()
+                        .filter(|value| !value.trim().is_empty())
+                        .ok_or_else(|| "model.load source=file requires path".to_string())?;
+                    join_file_source(base, locator)?
+                }
+                other => return Err(format!("unsupported model.load source '{other}'")),
+            }
+        };
+        Ok(ResolvedModelLoadAsset {
+            source_url,
+            expected_digest: spec.expected_digest(),
+        })
+    };
+
+    Ok(ResolvedModelLoadSources {
+        model: resolve(&params.files.model)?,
+        tokenizer: resolve(&params.files.tokenizer)?,
+        config: params.files.config.as_ref().map(resolve).transpose()?,
+        extra: params
+            .files
+            .extra
+            .iter()
+            .map(resolve)
+            .collect::<Result<Vec<_>, _>>()?,
+    })
 }
 
 fn huggingface_resolve_url(repo: &str, file: &str) -> Result<String, String> {
@@ -2639,17 +3116,48 @@ fn join_file_source(base: &str, file: &str) -> Result<String, String> {
     Ok(local_file_url(&base_path.join(file)))
 }
 
+fn package_digest(
+    model: &ModelCacheMeta,
+    tokenizer: &ModelCacheMeta,
+    config: Option<&ModelCacheMeta>,
+    extra: &[ModelCacheMeta],
+) -> String {
+    let mut roles = vec![
+        ("model".to_string(), model.digest.clone()),
+        ("tokenizer".to_string(), tokenizer.digest.clone()),
+    ];
+    if let Some(config) = config {
+        roles.push(("config".to_string(), config.digest.clone()));
+    }
+    roles.extend(extra.iter().map(|meta| {
+        let role = meta
+            .source_url
+            .rsplit('/')
+            .find(|segment| !segment.is_empty())
+            .unwrap_or("extra");
+        (format!("extra:{role}"), meta.digest.clone())
+    }));
+    roles.sort_by(|left, right| left.0.cmp(&right.0));
+    format!(
+        "sha256:{}",
+        sha256_hex(&serde_json::to_vec(&roles).expect("package digest tuple serializes"))
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_loaded_catalog_model(
     params: &ModelLoadParams,
     engine_name: &str,
     sources: &ResolvedModelLoadSources,
     model_meta: &ModelCacheMeta,
     tokenizer_meta: &ModelCacheMeta,
+    package_digest: String,
+    owned: Option<OwnedCatalogConfig>,
     inline: &InlineConfig,
     jobs: &JobConfig,
 ) -> Result<StoredModelConfig, WireOperationError> {
     let model_id = params.model_id.clone().unwrap_or_else(|| {
-        derive_loaded_model_id(engine_name, &sources.model_source_url, &model_meta.digest)
+        derive_loaded_model_id(engine_name, &sources.model.source_url, &model_meta.digest)
     });
     let task = parse_model_task(params.task.as_deref(), engine_name, &model_id)
         .map_err(|error| artifact_invalid_error(error.to_string()))?;
@@ -2666,7 +3174,11 @@ fn build_loaded_catalog_model(
         model_id,
         engine_name,
         task,
-        model_meta.digest.clone(),
+        if owned.is_some() {
+            package_digest
+        } else {
+            model_meta.digest.clone()
+        },
         default_artifact_format(engine_name),
         tokenizer_sanitized_digest,
         ModelAssetLocator::CacheDigest {
@@ -2675,18 +3187,21 @@ fn build_loaded_catalog_model(
         ModelAssetLocator::CacheDigest {
             digest: tokenizer_meta.digest.clone(),
         },
-        sources.model_source_url.clone(),
-        sources.tokenizer_source_url.clone(),
+        sources.model.source_url.clone(),
+        sources.tokenizer.source_url.clone(),
         pooling,
         params.normalize.unwrap_or(true),
         params.max_tokens.unwrap_or(512),
-        params
-            .quant
-            .clone()
-            .unwrap_or_else(|| default_quant(engine_name)),
+        params.quant.clone().unwrap_or_else(|| {
+            owned
+                .as_ref()
+                .map(|profile| profile.dtype.as_str().to_string())
+                .unwrap_or_else(|| default_quant(engine_name))
+        }),
         params.pin,
         params.worker_bin.clone(),
         params.worker_runtime_dir.clone(),
+        owned,
         inline,
         jobs,
     )
@@ -2749,6 +3264,18 @@ fn validate_artifact_file(path: &Path, engine_name: &str) -> Result<(), WireOper
             "expected ONNX protobuf header at {}",
             path.display()
         ))),
+        "safetensors-package" if read == 8 => {
+            let header_len = u64::from_le_bytes(header);
+            let file_len = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+            if header_len > 0 && header_len.saturating_add(8) <= file_len {
+                Ok(())
+            } else {
+                Err(artifact_invalid_error(format!(
+                    "invalid safetensors header at {}",
+                    path.display()
+                )))
+            }
+        }
         other => Err(artifact_invalid_error(format!(
             "unsupported artifact format '{other}' for {}",
             path.display()
@@ -2887,7 +3414,7 @@ async fn embed_query(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         Ok(admission) => admission,
         Err(error) => return result_outcome(error_payload(&state, error)),
     };
-    let tokenized = match model.tokenizer.tokenize_batch([params.text.as_str()]) {
+    let mut tokenized = match model.tokenizer.tokenize_batch([params.text.as_str()]) {
         Ok(tokenized) => tokenized,
         Err(error) => {
             return result_outcome(error_payload(
@@ -2896,6 +3423,7 @@ async fn embed_query(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
             ))
         }
     };
+    apply_owned_tokenizer_policy(&model, &mut tokenized);
     let ids = vec![params.id.unwrap_or_else(|| "query".to_string())];
     embed_tokenized(state, model, ids, tokenized, alias_table).await
 }
@@ -3154,7 +3682,7 @@ async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         .map(|item| item.text.as_str())
         .collect::<Vec<_>>();
     let request_bytes = request_bytes_for_texts(text_refs.iter().copied());
-    let tokenized = match model.tokenizer.tokenize_batch(text_refs) {
+    let mut tokenized = match model.tokenizer.tokenize_batch(text_refs) {
         Ok(tokenized) => tokenized,
         Err(error) => {
             return result_outcome(error_payload(
@@ -3163,6 +3691,7 @@ async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
             ))
         }
     };
+    apply_owned_tokenizer_policy(&model, &mut tokenized);
     let total_tokens = tokenized
         .real_token_counts
         .iter()
@@ -4725,6 +5254,33 @@ async fn embed_tokenized(
     result_outcome(serde_json::to_value(envelope).expect("embed envelope should serialize"))
 }
 
+fn apply_owned_tokenizer_policy(model: &EmbeddingModel, tokenized: &mut TokenizedBatch) {
+    let Some(terminal) = model
+        .owned_tokenizer_policy
+        .and_then(|policy| policy.terminal_token_id)
+    else {
+        return;
+    };
+    for (index, ids) in tokenized.batch.items.iter_mut().enumerate() {
+        let already_terminal = ids.last() == Some(&terminal);
+        if already_terminal {
+            ids.pop();
+        }
+        ids.truncate(model.tokenizer.max_tokens());
+        ids.push(terminal);
+        let effective = ids.len().min(u32::MAX as usize) as u32;
+        tokenized.real_token_counts[index] = effective;
+        tokenized.disclosures[index].effective_tokens = effective;
+        if !already_terminal {
+            tokenized.disclosures[index].submitted_tokens = tokenized.disclosures[index]
+                .submitted_tokens
+                .saturating_add(1);
+        }
+        tokenized.disclosures[index].truncated =
+            tokenized.disclosures[index].submitted_tokens > effective;
+    }
+}
+
 async fn execute_embedding(
     runtime: &RuntimeState,
     model: &EmbeddingModel,
@@ -4751,6 +5307,29 @@ async fn execute_embedding(
                     stage: EngineErrorStage::Inference,
                     risk_class: synapse_core::EngineRiskClass::AbortSafe,
                     message: "ORT engine mutex was poisoned during inference".to_string(),
+                    retry_after_ms: Some(100),
+                    safe_to_retry_same_request: true,
+                })?;
+                engine.embed_batch(&loaded_model, batch)
+            })
+            .await
+            .map_err(|error| {
+                WireOperationError::from_stable(
+                    StableError::engine_crashed(Some(100)),
+                    format!("embedding worker join failed: {error}"),
+                )
+            })?
+            .map_err(engine_error_to_wire)
+        }
+        EmbedBackend::Owned(engine) => {
+            let engine = Arc::clone(engine);
+            let loaded_model = model.loaded_model.clone();
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                let engine = engine.lock().map_err(|_| EngineError {
+                    stage: EngineErrorStage::Inference,
+                    risk_class: synapse_core::EngineRiskClass::AbortSafe,
+                    message: "owned-metal engine mutex was poisoned during inference".to_string(),
                     retry_after_ms: Some(100),
                     safe_to_retry_same_request: true,
                 })?;
@@ -4808,7 +5387,7 @@ async fn execute_rerank(
             )
         })?;
     match &model.backend {
-        EmbedBackend::Ort(_) => Err(WireOperationError::from_stable(
+        EmbedBackend::Ort(_) | EmbedBackend::Owned(_) => Err(WireOperationError::from_stable(
             StableError::artifact_invalid(),
             format!("model '{}' does not support rerank.score", model.model_id),
         )),
@@ -4855,7 +5434,7 @@ async fn execute_generate(
             )
         })?;
     match &model.backend {
-        EmbedBackend::Ort(_) => Err(WireOperationError::from_stable(
+        EmbedBackend::Ort(_) | EmbedBackend::Owned(_) => Err(WireOperationError::from_stable(
             StableError::artifact_invalid(),
             format!(
                 "model '{}' does not support microllm.oneshot",
@@ -5402,7 +5981,7 @@ async fn execute_embed_probe_for_model(
         .iter()
         .map(|item| item.text.as_str())
         .collect::<Vec<_>>();
-    let tokenized = match model.tokenizer.tokenize_batch(texts) {
+    let mut tokenized = match model.tokenizer.tokenize_batch(texts) {
         Ok(tokenized) => tokenized,
         Err(error) => {
             return Ok(ProbeModelResult {
@@ -5418,6 +5997,7 @@ async fn execute_embed_probe_for_model(
             })
         }
     };
+    apply_owned_tokenizer_policy(&model, &mut tokenized);
     let vectors = match execute_embedding(&state.runtime, &model, tokenized.batch.clone()).await {
         Ok(vectors) => vectors,
         Err(error) => {
@@ -5510,7 +6090,7 @@ fn ane_placement_share_for_model(
             })?;
             Ok(ping.placement_share)
         }
-        EmbedBackend::Ort(_) => Ok(None),
+        EmbedBackend::Ort(_) | EmbedBackend::Owned(_) => Ok(None),
     }
 }
 
@@ -6664,7 +7244,7 @@ fn worker_health_for_model(model: &EmbeddingModel) -> Option<worker_host::Worker
             .lock()
             .ok()
             .and_then(|engine| engine.health_snapshot().ok()),
-        EmbedBackend::Ort(_) => None,
+        EmbedBackend::Ort(_) | EmbedBackend::Owned(_) => None,
     }
 }
 
