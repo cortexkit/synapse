@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare fixed-bucket MiniLM inputs as JSONL.
+"""Prepare fixed-bucket encoder inputs as JSONL.
 
 Input rows are read from stdin or a file and must contain the configured text
 field (default: `embed_text`). Output rows are:
@@ -36,7 +36,7 @@ DEFAULT_TOKENIZER = (
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tokenizer", type=Path, default=DEFAULT_TOKENIZER)
-    parser.add_argument("--bucket", type=int, required=True, choices=(256, 512))
+    parser.add_argument("--bucket", type=int, required=True, choices=(128, 256, 512))
     parser.add_argument(
         "--input",
         default="-",
@@ -93,7 +93,9 @@ def main() -> int:
 
     pad_id = tokenizer.token_to_id("[PAD]")
     if pad_id is None:
-        raise RuntimeError("tokenizer is missing a [PAD] token id")
+        pad_id = tokenizer.token_to_id("<|padding|>")
+    if pad_id is None:
+        raise RuntimeError("tokenizer is missing a supported padding token id")
 
     source_name, lines = open_input(args.input)
     output_handle = open_output(args.output)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate an ONNX Runtime fp32 reference from pretokenized MiniLM inputs."""
+"""Generate an ONNX Runtime fp32 embedding reference from pretokenized inputs."""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True, help="Output JSONL path for {id, vec}")
     parser.add_argument("--stats-out", type=Path, help="Optional stats JSON path")
     parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--pooling", choices=("mean", "cls"), default="mean")
     parser.add_argument(
         "--output-name",
         help="Optional explicit ONNX output name. Defaults to the session's first output.",
@@ -42,13 +43,18 @@ def read_rows(path: Path) -> list[dict[str, object]]:
     return rows
 
 
-def pool_and_normalize(hidden_states: np.ndarray, attention_mask: np.ndarray) -> np.ndarray:
-    mask = attention_mask.astype(np.float32)[..., None]
-    masked = hidden_states.astype(np.float32) * mask
-    lengths = mask.sum(axis=1)
-    if np.any(lengths <= 0):
-        raise ValueError("attention mask contains an all-zero row")
-    pooled = masked.sum(axis=1) / lengths
+def pool_and_normalize(
+    hidden_states: np.ndarray, attention_mask: np.ndarray, pooling: str
+) -> np.ndarray:
+    if pooling == "cls":
+        pooled = hidden_states[:, 0, :].astype(np.float32)
+    else:
+        mask = attention_mask.astype(np.float32)[..., None]
+        masked = hidden_states.astype(np.float32) * mask
+        lengths = mask.sum(axis=1)
+        if np.any(lengths <= 0):
+            raise ValueError("attention mask contains an all-zero row")
+        pooled = masked.sum(axis=1) / lengths
     norms = np.linalg.norm(pooled, axis=1, keepdims=True)
     norms = np.where(norms > 0, norms, 1.0)
     return pooled / norms
@@ -128,7 +134,7 @@ def main() -> int:
                 feeds["token_type_ids"] = np.zeros_like(input_ids)
 
             hidden_states = np.asarray(session.run([output_name], feeds)[0])
-            pooled = pool_and_normalize(hidden_states, attention_mask)
+            pooled = pool_and_normalize(hidden_states, attention_mask, args.pooling)
             input_tokens += int(attention_mask.sum())
 
             for row, vector in zip(batch, pooled, strict=True):

@@ -1,23 +1,22 @@
 #!/usr/bin/env python3
 """Convert all-MiniLM-L6-v2 into a fixed-shape Core ML package.
 
-The default frontend is `auto`: try the simpler TorchScript trace path first, and
-fall back to `torch.export` when Core ML conversion hits the known traced-graph
-`int`-cast failure on this MiniLM/BERT graph.
+The conversion always uses `torch.export`; trace-built encoder packages are
+forbidden because the original spike demonstrated catastrophic parity loss.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import platform
 import shutil
-import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Literal
 
 import coremltools as ct  # pyright: ignore[reportMissingImports]
 import torch
+import transformers
 from transformers import AutoModel
 
 DEFAULT_MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"
@@ -30,7 +29,7 @@ DEFAULT_MODEL_CACHE = (
     / "snapshots"
 )
 DEFAULT_OUTPUT_NAME = "last_hidden_state"
-SUPPORTED_FRONTENDS = ("auto", "trace", "export")
+SUPPORTED_FRONTENDS = ("export",)
 
 
 @dataclass
@@ -44,6 +43,10 @@ class ConversionReport:
     trace_status: str
     compute_precision: str
     compute_units: str
+    torch_version: str
+    coremltools_version: str
+    transformers_version: str
+    macos_version: str
 
 
 class MiniLMEncoder(torch.nn.Module):
@@ -79,11 +82,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--frontend",
         choices=SUPPORTED_FRONTENDS,
-        default="auto",
-        help=(
-            "Conversion frontend. auto = probe the trace path first for evidence, then build the "
-            "final package with torch.export because the trace-built seq=512 model failed local parity smoke."
-        ),
+        default="export",
+        help="Conversion frontend. Only torch.export is supported.",
     )
     parser.add_argument(
         "--output-name",
@@ -138,27 +138,6 @@ def build_example_inputs(seq_len: int) -> tuple[torch.Tensor, torch.Tensor]:
     return example_ids, example_mask
 
 
-def convert_with_trace(wrapper: MiniLMEncoder, seq_len: int, output_name: str) -> ct.models.MLModel:
-    example_ids, example_mask = build_example_inputs(seq_len)
-    with torch.no_grad():
-        traced = torch.jit.trace(wrapper, (example_ids, example_mask), strict=False)
-        traced = torch.jit.freeze(traced)
-
-    mlmodel = ct.convert(
-        traced,
-        convert_to="mlprogram",
-        inputs=[
-            ct.TensorType(name="input_ids", shape=example_ids.shape),
-            ct.TensorType(name="attention_mask", shape=example_mask.shape),
-        ],
-        outputs=[ct.TensorType(name=output_name)],
-        minimum_deployment_target=ct.target.macOS14,
-        compute_precision=ct.precision.FLOAT16,
-        compute_units=ct.ComputeUnit.CPU_AND_NE,
-    )
-    return mlmodel
-
-
 def convert_with_export(wrapper: MiniLMEncoder, seq_len: int, output_name: str) -> ct.models.MLModel:
     example_ids, example_mask = build_example_inputs(seq_len)
     with torch.no_grad():
@@ -187,6 +166,10 @@ def ensure_metadata(mlmodel: ct.models.MLModel, report: ConversionReport) -> Non
     mlmodel.user_defined_metadata["synapse.seq_len"] = str(report.seq_len)
     mlmodel.user_defined_metadata["synapse.frontend"] = report.frontend_used
     mlmodel.user_defined_metadata["synapse.output_name"] = report.output_name
+    mlmodel.user_defined_metadata["synapse.torch_version"] = report.torch_version
+    mlmodel.user_defined_metadata["synapse.coremltools_version"] = report.coremltools_version
+    mlmodel.user_defined_metadata["synapse.transformers_version"] = report.transformers_version
+    mlmodel.user_defined_metadata["synapse.macos_version"] = report.macos_version
 
 
 def remove_path(path: Path) -> None:
@@ -217,39 +200,10 @@ def main() -> int:
     resolved_model_ref, report_model_ref = resolve_model_ref(args.model)
     wrapper = load_model(resolved_model_ref, allow_download=args.allow_download)
 
-    trace_status = "not-run"
     requested_frontend = args.frontend
-    mlmodel: ct.models.MLModel | None = None
-    frontend_used: str | None = None
-
-    if requested_frontend == "trace":
-        mlmodel = convert_with_trace(wrapper, args.seq_len, args.output_name)
-        frontend_used = "trace"
-        trace_status = "requested-and-used"
-    elif requested_frontend == "export":
-        mlmodel = convert_with_export(wrapper, args.seq_len, args.output_name)
-        frontend_used = "export"
-        trace_status = "not-run"
-    else:
-        try:
-            _ = convert_with_trace(wrapper, args.seq_len, args.output_name)
-            trace_status = (
-                "succeeded-but-skipped: auto mode still uses torch.export because the trace-built "
-                "seq=512 variant failed local parity smoke in this spike"
-            )
-            print(
-                "trace conversion succeeded, but auto mode still uses torch.export because the "
-                "trace-built seq=512 model failed local parity smoke",
-                file=sys.stderr,
-            )
-        except Exception as exc:  # pragma: no cover - exercised from CLI
-            trace_status = f"failed: {type(exc).__name__}: {exc}"
-            print(f"trace conversion failed, auto mode will use torch.export: {exc}", file=sys.stderr)
-        mlmodel = convert_with_export(wrapper, args.seq_len, args.output_name)
-        frontend_used = "export"
-
-    if mlmodel is None or frontend_used is None:
-        raise RuntimeError("conversion frontend did not produce a model")
+    mlmodel = convert_with_export(wrapper, args.seq_len, args.output_name)
+    frontend_used = "export"
+    trace_status = "disabled: trace-built packages are forbidden by the parity evidence"
 
     report = ConversionReport(
         source_model=report_model_ref,
@@ -261,6 +215,10 @@ def main() -> int:
         trace_status=trace_status,
         compute_precision="float16",
         compute_units="CPU_AND_NE",
+        torch_version=torch.__version__,
+        coremltools_version=ct.__version__,
+        transformers_version=transformers.__version__,
+        macos_version=platform.mac_ver()[0],
     )
     ensure_metadata(mlmodel, report)
 
