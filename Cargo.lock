@@ -6347,6 +6347,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "synapse-rig"
+version = "0.0.0"
+dependencies = [
+ "ahash",
+ "anyhow",
+ "clap",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "synapse-bench",
+ "tokenizers 0.21.4",
+]
+
+[[package]]
 name = "synapse-worker-ane"
 version = "0.0.0"
 dependencies = [

@@ -1,7 +1,7 @@
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Write;
+use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -12,6 +12,10 @@ use serde::{Deserialize, Serialize};
 use synapse_bench::{
     parity::{load_corpus, load_reference, mean_parity, rank_overlap, Chunk},
     results::LaneResult,
+    rig_protocol::{
+        read_json_frame, write_json_frame, CandidateMetadata, CandidateRequest, CandidateResponse,
+        ShapePolicy, Workload, PROTOCOL_VERSION,
+    },
 };
 use tokenizers::{Tokenizer, TruncationParams};
 
@@ -37,9 +41,9 @@ struct Args {
     /// Optional cap for parity/throughput smoke runs.
     #[arg(long)]
     limit: Option<usize>,
-    /// Output LaneResult JSON path.
-    #[arg(long)]
-    out: PathBuf,
+    /// Output LaneResult JSON path. Not used by --serve-stdio.
+    #[arg(long, required_unless_present = "serve_stdio")]
+    out: Option<PathBuf>,
     /// Optional: write produced vectors (JSONL: {id, vec}). Alias kept for the spike prompt.
     #[arg(long = "vectors-out", alias = "emit-vectors")]
     vectors_out: Option<PathBuf>,
@@ -91,6 +95,9 @@ struct Args {
     /// Optional model label for the result.
     #[arg(long)]
     model_label: Option<String>,
+    /// Load the model and serve length-prefixed JSON requests on stdin/stdout.
+    #[arg(long)]
+    serve_stdio: bool,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug, ValueEnum)]
@@ -285,6 +292,9 @@ impl Precision {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    if args.serve_stdio {
+        return serve_stdio(args);
+    }
     ensure!(args.passes > 0, "--passes must be at least one");
     ensure!(args.max_length > 0, "--max-length must be at least one");
     ensure!(
@@ -524,10 +534,14 @@ fn main() -> Result<()> {
         passes,
     };
 
-    if let Some(parent) = args.out.parent() {
+    let out = args
+        .out
+        .as_ref()
+        .context("standalone mode requires --out")?;
+    if let Some(parent) = out.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&args.out, serde_json::to_string_pretty(&result)?)?;
+    fs::write(out, serde_json::to_string_pretty(&result)?)?;
     eprintln!(
         "{}: {} items, {} real / {} padded tokens, {:.1} tok/s, parity {:?}",
         result.lane.lane,
@@ -539,6 +553,238 @@ fn main() -> Result<()> {
     );
     println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
+}
+
+fn serve_stdio(args: Args) -> Result<()> {
+    ensure!(args.max_length > 0, "--max-length must be at least one");
+    ensure!(
+        args.attention_units >= args.max_length.saturating_mul(args.max_length),
+        "--attention-units must fit at least one max-length sequence"
+    );
+    ensure!(
+        !(matches!(args.device, DeviceArg::Cpu) && matches!(args.dtype, Precision::F16)),
+        "cpu + f16 is not supported for this spike; use --dtype f32 on cpu"
+    );
+
+    let started = Instant::now();
+    let model = load_model_family(&args.model, args.dtype)?;
+    let mut tokenizer = Tokenizer::from_file(&args.tokenizer)
+        .map_err(|error| anyhow::anyhow!("tokenizer: {error}"))?;
+    model.configure_tokenizer(&mut tokenizer, args.max_length)?;
+    let execution = MetalExecutionConfig::from_args(&args, model.family_name())?;
+    let package_cache_root = execution
+        .package_root
+        .as_ref()
+        .map(|path| path.display().to_string());
+    let mut provider = make_provider(args.device, args.dtype, execution, args.cuda_graphs)?;
+    let eager_shape_preload = provider.eager_shape_preload();
+    let metadata = CandidateMetadata {
+        lane: format!("owned-rt-{}", provider.name()),
+        model: args
+            .model_label
+            .clone()
+            .unwrap_or_else(|| model.default_label(args.dtype)),
+        provider: provider.name().to_owned(),
+        dtype: args.dtype.as_str().to_owned(),
+        execution: match args.execution {
+            Execution::Explicit => "explicit",
+            Execution::Lazy => "lazy",
+        }
+        .to_owned(),
+        notes: model.notes(),
+        package_cache_root,
+        internal_load_s: started.elapsed().as_secs_f64(),
+        eager_shape_preload,
+    };
+
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let mut reader = BufReader::new(stdin.lock());
+    let mut writer = BufWriter::new(stdout.lock());
+    write_json_frame(
+        &mut writer,
+        &CandidateResponse::Ready {
+            protocol_version: PROTOCOL_VERSION,
+            metadata,
+        },
+    )?;
+
+    loop {
+        let request: CandidateRequest = read_json_frame(&mut reader)?;
+        let response = (|| -> Result<CandidateResponse> {
+            match request {
+                CandidateRequest::PrepareShapes {
+                    workload,
+                    shapes,
+                    max_length,
+                    force_shapes,
+                } => {
+                    ensure!(
+                        max_length == args.max_length,
+                        "rig/candidate max-length mismatch"
+                    );
+                    let prepare_started = Instant::now();
+                    for shape in shapes {
+                        ensure!(
+                            shape.batch > 0 && shape.seq > 0,
+                            "invalid preparation shape"
+                        );
+                        let shape = BatchShape {
+                            batch: shape.batch,
+                            seq: shape.seq,
+                        };
+                        match workload {
+                            Workload::Embedding => {
+                                let texts = vec![
+                                    "shape preload";
+                                    if force_shapes && args.shapes == Shapes::Exact {
+                                        shape.batch
+                                    } else {
+                                        1
+                                    }
+                                ];
+                                let _ = model.embed_batch(
+                                    provider.as_mut(),
+                                    &tokenizer,
+                                    &texts,
+                                    max_length,
+                                    force_shapes.then_some(shape),
+                                )?;
+                            }
+                            Workload::Rerank => {
+                                let pairs = vec![
+                                    ("shape preload", "shape preload document");
+                                    if force_shapes && args.shapes == Shapes::Exact {
+                                        shape.batch
+                                    } else {
+                                        1
+                                    }
+                                ];
+                                let _ = model.rerank_batch(
+                                    provider.as_mut(),
+                                    &tokenizer,
+                                    &pairs,
+                                    max_length,
+                                    force_shapes.then_some(shape),
+                                )?;
+                            }
+                        }
+                    }
+                    Ok(CandidateResponse::Prepared {
+                        internal_wall_s: prepare_started.elapsed().as_secs_f64(),
+                    })
+                }
+                CandidateRequest::Embed {
+                    texts,
+                    max_length,
+                    shape_policy,
+                    shape,
+                } => {
+                    ensure!(
+                        max_length == args.max_length,
+                        "rig/candidate max-length mismatch"
+                    );
+                    ensure!(
+                        shape_policy
+                            == if args.shapes == Shapes::Bucketed {
+                                ShapePolicy::Bucketed
+                            } else {
+                                ShapePolicy::Exact
+                            },
+                        "rig/candidate shape-policy mismatch"
+                    );
+                    ensure!(
+                        texts.len() <= shape.batch,
+                        "embedding batch exceeds directed shape"
+                    );
+                    let reported_real_tokens = texts
+                        .iter()
+                        .map(|text| model.token_length(&tokenizer, text, max_length))
+                        .collect::<Result<Vec<_>>>()?
+                        .into_iter()
+                        .sum::<usize>() as u64;
+                    let refs = texts.iter().map(String::as_str).collect::<Vec<_>>();
+                    let infer_started = Instant::now();
+                    let vectors = model.embed_batch(
+                        provider.as_mut(),
+                        &tokenizer,
+                        &refs,
+                        max_length,
+                        (shape_policy == ShapePolicy::Bucketed).then_some(BatchShape {
+                            batch: shape.batch,
+                            seq: shape.seq,
+                        }),
+                    )?;
+                    Ok(CandidateResponse::Embedding {
+                        vectors,
+                        reported_real_tokens,
+                        internal_infer_wall_s: infer_started.elapsed().as_secs_f64(),
+                    })
+                }
+                CandidateRequest::Rerank {
+                    pairs,
+                    max_length,
+                    shape_policy,
+                    shape,
+                } => {
+                    ensure!(
+                        max_length == args.max_length,
+                        "rig/candidate max-length mismatch"
+                    );
+                    ensure!(
+                        shape_policy
+                            == if args.shapes == Shapes::Bucketed {
+                                ShapePolicy::Bucketed
+                            } else {
+                                ShapePolicy::Exact
+                            },
+                        "rig/candidate shape-policy mismatch"
+                    );
+                    ensure!(
+                        pairs.len() <= shape.batch,
+                        "rerank batch exceeds directed shape"
+                    );
+                    let reported_real_tokens = pairs
+                        .iter()
+                        .map(|pair| {
+                            model.rerank_pair_length(&tokenizer, &pair.query, &pair.document)
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                        .into_iter()
+                        .sum::<usize>() as u64;
+                    let refs = pairs
+                        .iter()
+                        .map(|pair| (pair.query.as_str(), pair.document.as_str()))
+                        .collect::<Vec<_>>();
+                    let infer_started = Instant::now();
+                    let scores = model.rerank_batch(
+                        provider.as_mut(),
+                        &tokenizer,
+                        &refs,
+                        max_length,
+                        (shape_policy == ShapePolicy::Bucketed).then_some(BatchShape {
+                            batch: shape.batch,
+                            seq: shape.seq,
+                        }),
+                    )?;
+                    Ok(CandidateResponse::Rerank {
+                        scores,
+                        reported_real_tokens,
+                        internal_infer_wall_s: infer_started.elapsed().as_secs_f64(),
+                    })
+                }
+                CandidateRequest::Shutdown => Ok(CandidateResponse::Shutdown),
+            }
+        })()
+        .unwrap_or_else(|error| CandidateResponse::Error {
+            message: format!("{error:#}"),
+        });
+        let shutdown = matches!(response, CandidateResponse::Shutdown);
+        write_json_frame(&mut writer, &response)?;
+        if shutdown {
+            return Ok(());
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -711,10 +957,14 @@ fn run_rerank_cli(
             model.notes()
         ),
     };
-    if let Some(parent) = args.out.parent() {
+    let out = args
+        .out
+        .as_ref()
+        .context("standalone mode requires --out")?;
+    if let Some(parent) = out.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&args.out, serde_json::to_string_pretty(&result)?)?;
+    fs::write(out, serde_json::to_string_pretty(&result)?)?;
     println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
 }

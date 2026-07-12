@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "bench/harness",
+    "bench/rig",
     "bench/lanes/ort-embed",
     "bench/lanes/wrap-embed",
     "bench/lanes/llama",
