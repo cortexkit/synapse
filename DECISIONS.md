@@ -106,3 +106,44 @@ approval state: **decided** (reversible, AFT-approved or within pre-approved sco
   first-class (vector store optional, AFT-only). Rerank + structured-output micro-LLM
   shapes reserved in v1 surface. Transient-vs-permanent error typing is a top-level
   field in every error response.
+
+## D-009: Lane 2 (owned runtime) is the primary engine program; Lane 1 frozen as reference
+
+- State: decided (Ufuk, 2026-07-12)
+- Date: 2026-07-12
+- Context: the two-lane program (D-005) assumed the owned runtime was a months-scale
+  bet gated behind the adopt lane. Three days of Lane 2 work produced: one ModelFamily
+  seam over four backends (CPU/Accelerate, Metal MPSGraph for three families, CUDA
+  MiniLM), parity-exact serving vs frozen ORT references everywhere, MLX-class Metal
+  throughput on locked hardware (MiniLM f16 1.03x MLX, Qwen3 f16 0.88x, gte fp32 with
+  no incumbent baseline), ~2.6x llama.cpp-CUDA-class directional on a 130W RTX 3060,
+  compile-at-load + per-shape package caching, a bounded bucket policy, and three
+  optimization branches pruned with clock-matched evidence. Pace, not just numbers,
+  drove the decision: construction compresses under agentic parallelism, and there is
+  no consumer deadline forcing the adopt seam (AFT/MC cutover is not urgent).
+- Decision:
+  - Lane 2 is the primary engine program. All new engine build effort lands there.
+  - Lane 1 is FROZEN as the reference implementation and fallback: no new investment,
+    kept CI-green, kept shippable. It is not deleted — it is the incumbent the
+    graduation probe measures against and the instant fallback if a Lane 2 path
+    regresses in the field.
+  - Cutover is per-workload-per-hardware through the existing certification/alias
+    machinery (fingerprint + probe + graduation), never a big-bang engine swap.
+    Consumers see fingerprints, not lanes.
+  - Sequence: (1) embeddings + reranking nailed on all target hardware classes at
+    at-least-LMStudio speed (the user-visible product bar; the internal engineering
+    bar stays MLX/llama-direct, which Mac embeddings already meet), (2) decode
+    (micro-LLM) as the next big campaign — designed instrumentable from day one
+    because the research endgame (mid-thought injection, PAQ) requires owning the
+    decode loop regardless, (3) quants + remaining hardware breadth (Vulkan, x86
+    CPU floor, DirectML) gradually behind measurement.
+  - Footprint is a named driver: the owned Metal/Accelerate path ships zero extra
+    engine bytes (OS frameworks) vs Lane 1's llama.cpp worker binaries and the ort
+    dylib; Synapse curates a small model set for CortexKit's own use cases rather
+    than serving arbitrary GGUFs, which is what makes per-family graph work viable.
+- Known gaps accepted at decision time: no decode path, no int4/int8 quants, no
+  Vulkan/DirectML, CPU floor is Apple-only (Accelerate), per-family graph work is a
+  recurring cost for new models (~mason-day per family at current pace).
+- First action: same-harness graduation probe on the locked M1 (owned runtime vs
+  llama-server-Metal vs MLX python, identical corpus/token accounting) to convert
+  directional ratios into certifiable ones.
