@@ -1,0 +1,44 @@
+#version 460
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_cooperative_matrix : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0, scalar) readonly buffer ABuffer { float16_t values[]; } a;
+layout(set = 0, binding = 1, scalar) readonly buffer BBuffer { float16_t values[]; } b;
+layout(set = 0, binding = 2, scalar) writeonly buffer CBuffer { float values[]; } c;
+layout(push_constant) uniform Params {
+    uint m;
+    uint n;
+    uint k;
+    uint batch_count;
+    uint transpose_b;
+    uint edge_only;
+} p;
+
+void main() {
+    uint tile_row = gl_WorkGroupID.y * 16;
+    uint tile_column = gl_WorkGroupID.x * 16;
+    uint matrix = gl_WorkGroupID.z;
+    if (tile_row + 15 >= p.m || tile_column + 15 >= p.n) {
+        return;
+    }
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> accum = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    uint a_base = matrix * p.m * p.k;
+    uint b_base = matrix * p.k * p.n;
+    for (uint inner = 0; inner < p.k; inner += 16) {
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> tile_a;
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> tile_b;
+        coopMatLoad(tile_a, a.values, a_base + tile_row * p.k + inner, p.k, gl_CooperativeMatrixLayoutRowMajor);
+        uint b_offset = p.transpose_b != 0
+            ? b_base + tile_column * p.k + inner
+            : b_base + inner * p.n + tile_column;
+        uint b_stride = p.transpose_b != 0 ? p.k : p.n;
+        coopMatLoad(tile_b, b.values, b_offset, b_stride,
+            p.transpose_b != 0 ? gl_CooperativeMatrixLayoutColumnMajor : gl_CooperativeMatrixLayoutRowMajor);
+        accum = coopMatMulAdd(tile_a, tile_b, accum);
+    }
+    coopMatStore(accum, c.values, (matrix * p.m + tile_row) * p.n + tile_column, p.n, gl_CooperativeMatrixLayoutRowMajor);
+}

@@ -7,7 +7,7 @@
 use std::any::Any;
 use std::path::Path;
 
-use anyhow::{ensure, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use serde::Deserialize;
 use tokenizers::Tokenizer;
 
@@ -355,6 +355,7 @@ fn new_block_context(
         BlockBackend::Cuda { graphs } => {
             BlockContextBackend::Cuda(super::cuda_backend::Qwen3Context::new(graphs, precision)?)
         }
+        BlockBackend::Vulkan { .. } => bail!("Vulkan day-1 supports MiniLM only"),
     };
     Ok(Box::new(BlockContext { backend }))
 }

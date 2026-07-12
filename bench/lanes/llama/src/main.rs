@@ -85,6 +85,9 @@ struct EmbedArgs {
     /// Model label for the result.
     #[arg(long)]
     model_label: String,
+    /// Lane label identifying the llama.cpp accelerator build.
+    #[arg(long, default_value = "llama-metal-embed")]
+    lane_label: String,
     /// Path to the llama-server binary.
     #[arg(long, default_value = DEFAULT_SERVER_BINARY)]
     server_binary: PathBuf,
@@ -486,7 +489,7 @@ fn run_embed(args: EmbedArgs) -> Result<()> {
     );
 
     let result = LaneResult {
-        lane: "llama-metal-embed".into(),
+        lane: args.lane_label.clone(),
         workload: "embed-corpus-v1".into(),
         model: args.model_label,
         cold_load_s,
@@ -500,7 +503,8 @@ fn run_embed(args: EmbedArgs) -> Result<()> {
     };
     write_result(&args.out, &result)?;
     eprintln!(
-        "llama-metal-embed: {} items, {} tokens, {:.1} tok/s, cold_load {:.1}s, infer {:.1}s",
+        "{}: {} items, {} tokens, {:.1} tok/s, cold_load {:.1}s, infer {:.1}s",
+        result.lane,
         result.items,
         result.input_tokens,
         result.tok_per_s,
@@ -783,6 +787,9 @@ fn run_rerank(args: RerankArgs) -> Result<()> {
 fn load_tokenizer(path: &Path, max_length: usize) -> Result<Tokenizer> {
     let mut tokenizer =
         Tokenizer::from_file(path).map_err(|err| anyhow::anyhow!("tokenizer: {err}"))?;
+    // Request batching accounts real tokens, so checkpoint-level fixed padding must not
+    // inflate the lane's throughput denominator before llama-server performs batching.
+    tokenizer.with_padding(None);
     tokenizer
         .with_truncation(Some(TruncationParams {
             max_length,

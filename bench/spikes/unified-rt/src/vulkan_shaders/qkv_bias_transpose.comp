@@ -1,0 +1,29 @@
+#version 460
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_scalar_block_layout : require
+layout(local_size_x = 256) in;
+layout(set=0,binding=0,scalar) readonly buffer QIn { float values[]; } qi;
+layout(set=0,binding=1,scalar) readonly buffer KIn { float values[]; } ki;
+layout(set=0,binding=2,scalar) readonly buffer VIn { float values[]; } vi;
+layout(set=0,binding=3,scalar) readonly buffer QB { float16_t values[]; } qb;
+layout(set=0,binding=4,scalar) readonly buffer KB { float16_t values[]; } kb;
+layout(set=0,binding=5,scalar) readonly buffer VB { float16_t values[]; } vb;
+layout(set=0,binding=6,scalar) writeonly buffer QOut { float16_t values[]; } qo;
+layout(set=0,binding=7,scalar) writeonly buffer KOut { float16_t values[]; } ko;
+layout(set=0,binding=8,scalar) writeonly buffer VOut { float16_t values[]; } vo;
+layout(push_constant) uniform Params { uint batch; uint seq; uint heads; uint head_dim; } p;
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    uint total = p.batch * p.heads * p.seq * p.head_dim;
+    if (index >= total) return;
+    uint d = index % p.head_dim;
+    uint rem = index / p.head_dim;
+    uint s = rem % p.seq; rem /= p.seq;
+    uint head = rem % p.heads;
+    uint batch = rem / p.heads;
+    uint h = head * p.head_dim + d;
+    uint raw = (batch * p.seq + s) * (p.heads * p.head_dim) + h;
+    qo.values[index] = float16_t(qi.values[raw] + float(qb.values[h]));
+    ko.values[index] = float16_t(ki.values[raw] + float(kb.values[h]));
+    vo.values[index] = float16_t(vi.values[raw] + float(vb.values[h]));
+}

@@ -1,0 +1,30 @@
+#version 460
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_scalar_block_layout : require
+layout(local_size_x = 256) in;
+layout(set=0,binding=0,scalar) readonly buffer Hidden { float16_t values[]; } hidden_values;
+layout(set=0,binding=1,scalar) readonly buffer Mask { uint values[]; } mask;
+layout(set=0,binding=2,scalar) buffer Pooled { float values[]; } pooled;
+layout(push_constant) uniform Params { uint batch; uint seq; uint hidden; } p;
+shared float norm_values[256];
+void main() {
+    uint batch = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationID.x;
+    uint count = 0;
+    for (uint token = 0; token < p.seq; ++token) count += mask.values[batch * p.seq + token] != 0 ? 1 : 0;
+    count = max(count, 1);
+    float local_norm = 0.0;
+    for (uint column = lane; column < p.hidden; column += 256) {
+        float sum = 0.0;
+        for (uint token = 0; token < p.seq; ++token) {
+            if (mask.values[batch * p.seq + token] != 0) sum += float(hidden_values.values[(batch * p.seq + token) * p.hidden + column]);
+        }
+        float value = sum / float(count);
+        pooled.values[batch * p.hidden + column] = value;
+        local_norm += value * value;
+    }
+    norm_values[lane] = local_norm; barrier();
+    for (uint step = 128; step > 0; step >>= 1) { if (lane < step) norm_values[lane] += norm_values[lane + step]; barrier(); }
+    float inverse = inversesqrt(max(norm_values[0], 1e-24));
+    for (uint column = lane; column < p.hidden; column += 256) pooled.values[batch * p.hidden + column] *= inverse;
+}
