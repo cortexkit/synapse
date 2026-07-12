@@ -90,13 +90,13 @@ The standard corpora use only a subset of possible exact shapes, so bucket pre-d
 
 Raw result JSON is retained in `results/bucket-policy/`.
 
-## Locked-M1 follow-up
+## Locked-M1 follow-up — completed
 
-The next locked-M1 matrix should:
+The locked matrix is retained in [M1-BUCKET-MATRIX.md](M1-BUCKET-MATRIX.md). It completed every planned check:
 
-1. Clear each versioned package root and record bucketed miss `cold_load_s`, package count/bytes, and all three in-process pass rows; repeat from a fresh process with cache hits.
-2. Run exact mode beside bucketed mode for the three standard corpora and MC, keeping compilation in exact pass 1 visible rather than folding it into load.
-3. Verify no package count or modification-time change during bucketed inference.
-4. Recheck real/padded tokens and the `<15%` gate against the canonical M1 corpora; the local MiniLM input differs from the prior M1 staging copy.
-5. Record GPU occupancy and power for the fixed eight-row policy. If the locked data confirms the MiniLM/ModernBERT steady regression, evaluate a policy-v2 row ladder without changing v1 cache identity or results.
-6. Preserve external parity gates for all 400-row cells and deterministic large-corpus rank sampling for MC.
+- [x] Cleared each versioned package root and recorded bucketed MISS `cold_load_s`, package count/bytes, and all three in-process pass rows, then repeated from a fresh HIT process.
+- [x] Ran exact mode beside bucketed mode for the three standard corpora and one fresh-root MC MISS, keeping exact compilation in pass 1.
+- [x] Verified that package count and recursive path/mtime/size inventories did not change during bucketed inference.
+- [x] Rechecked real/padded tokens and the `<15%` gate against all four canonical corpora.
+- [x] Recorded macmon GPU effective utilization and power for the fixed eight-row policy. The locked data confirms the MiniLM and ModernBERT regression and defines a policy-v2 row-ladder experiment without changing v1 identity or results.
+- [x] Preserved external parity gates for all 400-row cells and deterministic large-corpus rank sampling for MC.
