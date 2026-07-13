@@ -39,7 +39,7 @@ A request timeout resets a wedged child and retries once after respawn. If the r
 
 ## Authentication and safety
 
-For a cheap-key dry run, set `GATHER_DISTILL_API_KEY`; requests use `x-api-key`. For OAuth generation, copy `accounts.json.example` to the ignored `accounts.json`, set `GATHER_DISTILL_ACCOUNTS_FILE` if it is elsewhere, and let the operator refresh tokens externally. OAuth requests use `Authorization: Bearer`, `anthropic-beta: oauth-2025-04-20`, and `anthropic-version: 2023-06-01`.
+For a cheap-key dry run, set `GATHER_DISTILL_API_KEY`; requests use `x-api-key`. For OAuth generation, copy `accounts.json.example` to the ignored `accounts.json`, set `GATHER_DISTILL_ACCOUNTS_FILE` if it is elsewhere, and let the operator refresh tokens externally. OAuth subscription requests are assembled, signed, and headed as Claude Code requests; API-key requests remain plain.
 
 The pool reparses changed credentials (with a 30-second stat cache), rotates healthy accounts round-robin, enforces a per-account in-flight cap, and cools an account after a 401 or quota response. Tokens are held only in memory and are never logged or written to rows.
 
@@ -53,10 +53,11 @@ The harness verifies `git rev-parse HEAD` against that manifest before gathering
 
 ## Install and test
 
-No package install is required after placing the pinned AFT binary above.
+Install the local authentication dependency after placing the pinned AFT binary above.
 
 ```sh
 cd tools/gather-distill
+bun install
 bun test
 ```
 

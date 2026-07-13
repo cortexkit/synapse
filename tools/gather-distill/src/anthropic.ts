@@ -1,3 +1,13 @@
+import {
+  applyClaudeCodeHeaders,
+  applyClaudeCodeMetadata,
+  buildBillingHeaderValue,
+  CLAUDE_CODE_ENTRYPOINT,
+  CLAUDE_CODE_IDENTITY,
+  orderClaudeCodeBody,
+  resolveClaudeCodeIdentity,
+  signRequestBody,
+} from "@cortexkit/anthropic-auth-core";
 import type { Credential } from "./auth.ts";
 import type { AnthropicContentBlock, TrajectoryMessage } from "./types.ts";
 import type { ToolDeclaration } from "./tools.ts";
@@ -48,30 +58,42 @@ function responseShape(value: unknown): MessageResponse {
 }
 
 export async function sendMessage(credential: Credential, request: MessageRequest): Promise<MessageResponse> {
-  const headers: Record<string, string> = {
+  const headers = new Headers({
     "anthropic-version": "2023-06-01",
     "content-type": "application/json",
-  };
-  if (credential.kind === "oauth") {
-    headers.authorization = `Bearer ${credential.secret}`;
-    headers["anthropic-beta"] = "oauth-2025-04-20";
-  } else {
-    headers["x-api-key"] = credential.secret;
-  }
+  });
+  const messages = request.messages.map(({ role, content }) => ({ role, content }));
   const body: Record<string, unknown> = {
     model: request.model,
     max_tokens: request.max_tokens,
     system: request.system,
-    messages: request.messages.map(({ role, content }) => ({ role, content })),
+    messages,
   };
   if (request.tools) body.tools = request.tools;
   if (request.tool_choice) body.tool_choice = request.tool_choice;
   if (request.effort) body.output_config = { effort: request.effort };
 
+  let bodyText: string;
+  if (credential.kind === "oauth") {
+    const identity = await resolveClaudeCodeIdentity(credential.secret, request.model);
+    const billingHeader = buildBillingHeaderValue(messages, undefined, CLAUDE_CODE_ENTRYPOINT);
+    body.system = [
+      { type: "text", text: billingHeader },
+      { type: "text", text: CLAUDE_CODE_IDENTITY },
+      { type: "text", text: request.system },
+    ];
+    applyClaudeCodeMetadata(body, identity);
+    applyClaudeCodeHeaders(headers, credential.secret, { body, identity });
+    bodyText = await signRequestBody(JSON.stringify(orderClaudeCodeBody(body)));
+  } else {
+    headers.set("x-api-key", credential.secret);
+    bodyText = JSON.stringify(body);
+  }
+
   const response = await fetch(ANTHROPIC_MESSAGES_URL, {
     method: "POST",
     headers,
-    body: JSON.stringify(body),
+    body: bodyText,
   });
   if (response.status === 401 || response.status === 429) throw new AccountRejectedError(response.status);
   if (!response.ok) {
