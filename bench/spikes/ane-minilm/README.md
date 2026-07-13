@@ -1,19 +1,23 @@
-# ANE MiniLM spike
+# ANE encoder spike
 
-This folder contains the fixed-bucket Core ML proof path for `sentence-transformers/all-MiniLM-L6-v2` on Apple Silicon ANE.
+This folder contains the fixed-bucket Core ML proof paths for MiniLM, GTE ModernBERT, and Qwen3-Embedding-0.6B on Apple Silicon ANE.
 
 ## Contents
 
 - `convert_minilm_to_coreml.py` — converts the HF MiniLM encoder to a fixed-shape fp16 `.mlpackage` using export only.
 - `convert_modernbert_to_coreml.py` — converts fixed-bucket GTE ModernBERT embedder or reranker packages with pooling/head inside Core ML and verifies eager/export/Core ML smoke parity.
+- `convert_qwen3_to_coreml.py` — converts fixed-bucket Qwen3-Embedding-0.6B with causal attention, terminal-EOS pooling, and the Conv2d ANE layout using `torch.export` only.
 - `prep_tokenized_jsonl.py` — turns corpus JSONL into fixed-bucket `{id,input_ids,attention_mask}` JSONL.
+- `prep_qwen3_tokenized_jsonl.py` — creates left-padded Qwen3 inputs with the model-config terminal EOS in the final position.
 - `ort_reference.py` — ONNX Runtime fp32 reference over the same pretokenized inputs.
+- `qwen3_fp32_reference.py` — regenerates only the bucket-specific Qwen fp32 rows whose active tokens differ from the frozen reference.
 - `ane_coreml.swift` — generalized Swift CLI with two subcommands:
   - `compile` — `.mlpackage`/`.mlmodel` -> permanent `.mlmodelc`
   - `run` (`embed` alias) — load `.mlmodelc`, select graph/mean/CLS pooling or pair scoring, emit JSONL, and optionally dump MLComputePlan placement
 - `build_runner.sh` — builds the Swift CLI to `.build/ane-coreml`.
 - `SPIKE.md` — original MiniLM results and verdict.
 - `ANE-WAVE1.md` — ModernBERT wave-1 conversion, parity, placement, power, throughput, and latency evidence.
+- `ANE-WAVE2-QWEN3.md` — Qwen3-Embedding-0.6B wave-2 conversion, locked-M1 ANE evidence, fingerprint verdict, and product recommendation.
 
 ## Requirements
 
@@ -25,6 +29,7 @@ Local conversion / prep machine:
 - Hugging Face cache entries already present locally:
   - `sentence-transformers/all-MiniLM-L6-v2`
   - `Qdrant/all-MiniLM-L6-v2-onnx` (for `model.onnx` + `tokenizer.json`)
+  - `Qwen/Qwen3-Embedding-0.6B` (for the Wave 2 Qwen converter and reference runner)
 
 Bench host requirements:
 
@@ -41,6 +46,33 @@ source .venv/bin/activate
 uv pip install -r requirements.txt
 ./build_runner.sh
 ```
+
+## Qwen3-Embedding-0.6B fixed-bucket workflow
+
+Qwen3 requires `transformers` 4.51.3, so use its separate requirements file
+rather than changing the Wave 1 environment. The converter is export-only;
+trace-built packages are not a valid Qwen parity path.
+
+```bash
+cd bench/spikes/ane-minilm
+uv venv --python 3.12 .venv-qwen3
+uv pip install --python .venv-qwen3/bin/python -r requirements-qwen3.txt
+
+for bucket in 128 256 512; do
+  .venv-qwen3/bin/python convert_qwen3_to_coreml.py \
+    --seq-len "$bucket" \
+    --out "/tmp/ane-wave2/models/qwen3-seq${bucket}.mlpackage" \
+    --report-json "/tmp/ane-wave2/reports/qwen3-seq${bucket}.json"
+  .venv-qwen3/bin/python prep_qwen3_tokenized_jsonl.py \
+    --bucket "$bucket" --input /tmp/qwen3-corpus-400.jsonl \
+    --output "/tmp/ane-wave2/data/qwen3-400-b${bucket}.jsonl"
+done
+```
+
+Use `qwen3_fp32_reference.py` only when a shorter bucket changes active
+Qwen tokens. Reuse the checked frozen ORT fp32 reference for rows whose active
+token sequence is unchanged; do not compare a truncated candidate to a
+longer-token reference vector.
 
 ## Convert the 256 and 512 bucket variants
 
