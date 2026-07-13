@@ -19,6 +19,7 @@ use synapse_bench::{
 };
 use tokenizers::{Tokenizer, TruncationParams};
 
+mod cpu_backend;
 mod cuda_backend;
 mod modernbert;
 mod qwen3;
@@ -72,6 +73,12 @@ struct Args {
     /// Precision for the resident encoder path.
     #[arg(long, value_enum, default_value_t = Precision::F32)]
     dtype: Precision,
+    /// GEMM substrate used by the CPU provider.
+    #[arg(long, value_enum, default_value_t = cpu_backend::CpuGemm::Platform)]
+    cpu_gemm: cpu_backend::CpuGemm,
+    /// CPU worker threads. Defaults to ceil(available logical CPUs / 2).
+    #[arg(long)]
+    cpu_threads: Option<usize>,
     /// Launch the CUDA encoder through a per-shape CUDA Graph.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     cuda_graphs: bool,
@@ -192,6 +199,19 @@ struct PassResult {
     items: u64,
     parity_mean_cosine: Option<f64>,
     top10_rank_overlap: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cpu_phase: Option<CpuPhaseResult>,
+}
+
+#[derive(Serialize)]
+struct CpuPhaseResult {
+    gemm_wall_s: f64,
+    pointwise_wall_s: f64,
+    gemm_share: f64,
+    gemm_calls: u64,
+    gemm_dispatches: u64,
+    static_pack_wall_s: f64,
+    static_pack_count: u64,
 }
 
 #[derive(Default, Serialize)]
@@ -355,6 +375,8 @@ fn main() -> Result<()> {
     let mut provider = make_provider(
         args.device,
         args.dtype,
+        args.cpu_gemm,
+        args.cpu_threads,
         execution.clone(),
         args.cuda_graphs,
         args.vulkan_gemm,
@@ -447,6 +469,7 @@ fn main() -> Result<()> {
     let mut passes = Vec::with_capacity(args.passes);
     let mut final_vectors = Vec::new();
     for pass in 0..args.passes {
+        provider.reset_profile();
         let workload = run_workload(
             model.as_ref(),
             provider.as_mut(),
@@ -496,6 +519,18 @@ fn main() -> Result<()> {
         };
         let padding_waste_fraction =
             padding_waste_fraction(workload.input_tokens, workload.padded_tokens);
+        let cpu_phase = provider.cpu_profile().map(|profile| {
+            let pointwise_wall_s = (workload.infer_wall_s - profile.gemm_wall_s).max(0.0);
+            CpuPhaseResult {
+                gemm_wall_s: profile.gemm_wall_s,
+                pointwise_wall_s,
+                gemm_share: profile.gemm_wall_s / workload.infer_wall_s.max(f64::MIN_POSITIVE),
+                gemm_calls: profile.gemm_calls,
+                gemm_dispatches: profile.gemm_dispatches,
+                static_pack_wall_s: profile.static_pack_wall_s,
+                static_pack_count: profile.static_pack_count,
+            }
+        });
         passes.push(PassResult {
             pass: pass + 1,
             label: pass_label(pass, args.passes),
@@ -507,6 +542,7 @@ fn main() -> Result<()> {
             items: workload.produced_vectors.len() as u64,
             parity_mean_cosine,
             top10_rank_overlap,
+            cpu_phase,
         });
         final_vectors = workload.produced_vectors;
     }
@@ -530,10 +566,11 @@ fn main() -> Result<()> {
         parity_mean_cosine: last.parity_mean_cosine,
         self_peak_rss_bytes: None,
         notes: format!(
-            "{}, provider={}, dtype={}, execution={:?}, package_cache={}, shapes={:?}, policy_version={}, passes={}, length-sorted attention_units={}, max_len={}; {}",
+            "{}, provider={}, dtype={}, {}, execution={:?}, package_cache={}, shapes={:?}, policy_version={}, passes={}, length-sorted attention_units={}, max_len={}; {}",
             model.notes(),
             provider.name(),
             args.dtype.as_str(),
+            provider.details(),
             args.execution,
             args.package_cache.as_ref().map_or("disabled".into(), |path| path.display().to_string()),
             args.shapes,
@@ -618,6 +655,8 @@ fn serve_stdio(args: Args) -> Result<()> {
     let mut provider = make_provider(
         args.device,
         args.dtype,
+        args.cpu_gemm,
+        args.cpu_threads,
         execution,
         args.cuda_graphs,
         args.vulkan_gemm,
@@ -1225,16 +1264,19 @@ fn detect_minilm_config(config: &serde_json::Value) -> bool {
     config.get("model_type").and_then(serde_json::Value::as_str) == Some("bert")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn make_provider(
     device: DeviceArg,
     dtype: Precision,
+    cpu_gemm: cpu_backend::CpuGemm,
+    cpu_threads: Option<usize>,
     execution: MetalExecutionConfig,
     cuda_graphs: bool,
     vulkan_gemm: VulkanGemm,
     vulkan_pipeline_cache: Option<PathBuf>,
 ) -> Result<Box<dyn KernelProvider>> {
     match device {
-        DeviceArg::Cpu => Ok(Box::new(CpuProvider)),
+        DeviceArg::Cpu => Ok(Box::new(CpuProvider::new(cpu_gemm, cpu_threads)?)),
         DeviceArg::Metal => Ok(Box::new(MetalProvider::new_with_config(dtype, execution)?)),
         DeviceArg::Cuda => Ok(Box::new(CudaProvider::new(dtype, execution, cuda_graphs)?)),
         DeviceArg::Vulkan => Ok(Box::new(VulkanProvider::new(
@@ -1495,6 +1537,114 @@ struct BlockForwardRequest<'a> {
 trait KernelProvider {
     fn name(&self) -> &'static str;
 
+    fn details(&self) -> String {
+        format!("provider={}", self.name())
+    }
+
+    fn reset_profile(&mut self) {}
+
+    fn cpu_profile(&self) -> Option<cpu_backend::CpuProfile> {
+        None
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn pack_attention_heads(
+        &mut self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        batch: usize,
+        seq: usize,
+        heads: usize,
+        head_dim: usize,
+        q_heads: &mut [f32],
+        k_heads: &mut [f32],
+        v_heads: &mut [f32],
+    ) {
+        let hidden = heads * head_dim;
+        for batch_index in 0..batch {
+            for head in 0..heads {
+                let head_batch = batch_index * heads + head;
+                for position in 0..seq {
+                    let source = (batch_index * seq + position) * hidden + head * head_dim;
+                    let destination = (head_batch * seq + position) * head_dim;
+                    q_heads[destination..destination + head_dim]
+                        .copy_from_slice(&q[source..source + head_dim]);
+                    k_heads[destination..destination + head_dim]
+                        .copy_from_slice(&k[source..source + head_dim]);
+                    v_heads[destination..destination + head_dim]
+                        .copy_from_slice(&v[source..source + head_dim]);
+                }
+            }
+        }
+    }
+
+    fn masked_softmax(
+        &mut self,
+        scores: &mut [f32],
+        attention_mask: &[u8],
+        seq: usize,
+        heads: usize,
+        scale: f32,
+    ) {
+        for (score_row, row) in scores.chunks_mut(seq).enumerate() {
+            let head_batch = score_row / seq;
+            let batch_index = head_batch / heads;
+            for key_position in 0..seq {
+                row[key_position] = if attention_mask[batch_index * seq + key_position] == 0 {
+                    -10_000.0
+                } else {
+                    row[key_position] * scale
+                };
+            }
+            softmax(row);
+        }
+    }
+
+    fn unpack_attention_heads(
+        &mut self,
+        context_heads: &[f32],
+        batch: usize,
+        seq: usize,
+        heads: usize,
+        head_dim: usize,
+        context: &mut [f32],
+    ) {
+        let hidden = heads * head_dim;
+        for batch_index in 0..batch {
+            for head in 0..heads {
+                let head_batch = batch_index * heads + head;
+                for position in 0..seq {
+                    let source = (head_batch * seq + position) * head_dim;
+                    let destination = (batch_index * seq + position) * hidden + head * head_dim;
+                    context[destination..destination + head_dim]
+                        .copy_from_slice(&context_heads[source..source + head_dim]);
+                }
+            }
+        }
+    }
+
+    fn add_bias(&mut self, rows: usize, columns: usize, data: &mut [f32], bias: &[f32]) {
+        for row in 0..rows {
+            let start = row * columns;
+            for column in 0..columns {
+                data[start + column] += bias[column];
+            }
+        }
+    }
+
+    fn add_in_place(&mut self, destination: &mut [f32], source: &[f32]) {
+        for (destination, source) in destination.iter_mut().zip(source) {
+            *destination += *source;
+        }
+    }
+
+    fn apply_gelu(&mut self, values: &mut [f32]) {
+        for value in values {
+            *value = gelu(*value);
+        }
+    }
+
     fn matmul(
         &mut self,
         m: usize,
@@ -1517,6 +1667,44 @@ trait KernelProvider {
         c: &mut [f32],
     ) -> Result<()> {
         self.matmul(m, n, k, a, b, b_layout, c)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn matmul_batched(
+        &mut self,
+        batches: usize,
+        m: usize,
+        n: usize,
+        k: usize,
+        a: &[f32],
+        b: &[f32],
+        b_layout: BLayout,
+        c: &mut [f32],
+    ) -> Result<()> {
+        ensure!(
+            a.len() == batches * m * k,
+            "batched matmul A shape mismatch"
+        );
+        ensure!(
+            b.len() == batches * n * k,
+            "batched matmul B shape mismatch"
+        );
+        ensure!(
+            c.len() == batches * m * n,
+            "batched matmul C shape mismatch"
+        );
+        for batch in 0..batches {
+            self.matmul(
+                m,
+                n,
+                k,
+                &a[batch * m * k..(batch + 1) * m * k],
+                &b[batch * n * k..(batch + 1) * n * k],
+                b_layout,
+                &mut c[batch * m * n..(batch + 1) * m * n],
+            )?;
+        }
+        Ok(())
     }
 
     fn block_forward(&mut self, _request: BlockForwardRequest<'_>) -> Result<bool> {
@@ -1569,17 +1757,100 @@ trait KernelProvider {
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
 enum BLayout {
     RowMajorKn,
     RowMajorNkTransposed,
 }
 
-struct CpuProvider;
+struct CpuProvider {
+    backend: cpu_backend::CpuBackend,
+}
+
+impl CpuProvider {
+    fn new(kind: cpu_backend::CpuGemm, threads: Option<usize>) -> Result<Self> {
+        Ok(Self {
+            backend: cpu_backend::CpuBackend::new(kind, threads)?,
+        })
+    }
+
+    #[cfg(test)]
+    fn platform_for_test() -> Self {
+        Self::new(cpu_backend::CpuGemm::Platform, Some(1)).expect("build test CPU provider")
+    }
+}
 
 impl KernelProvider for CpuProvider {
     fn name(&self) -> &'static str {
-        "cpu-accelerate"
+        self.backend.name()
+    }
+
+    fn details(&self) -> String {
+        self.backend.details()
+    }
+
+    fn reset_profile(&mut self) {
+        self.backend.reset_profile();
+    }
+
+    fn cpu_profile(&self) -> Option<cpu_backend::CpuProfile> {
+        Some(self.backend.profile())
+    }
+
+    fn pack_attention_heads(
+        &mut self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        batch: usize,
+        seq: usize,
+        heads: usize,
+        head_dim: usize,
+        q_heads: &mut [f32],
+        k_heads: &mut [f32],
+        v_heads: &mut [f32],
+    ) {
+        self.backend.pack_attention_heads(
+            q, k, v, batch, seq, heads, head_dim, q_heads, k_heads, v_heads,
+        );
+    }
+
+    fn masked_softmax(
+        &mut self,
+        scores: &mut [f32],
+        attention_mask: &[u8],
+        seq: usize,
+        heads: usize,
+        scale: f32,
+    ) {
+        self.backend
+            .masked_softmax(scores, attention_mask, seq, heads, scale);
+    }
+
+    fn unpack_attention_heads(
+        &mut self,
+        context_heads: &[f32],
+        batch: usize,
+        seq: usize,
+        heads: usize,
+        head_dim: usize,
+        context: &mut [f32],
+    ) {
+        self.backend
+            .unpack_attention_heads(context_heads, batch, seq, heads, head_dim, context);
+    }
+
+    fn add_bias(&mut self, rows: usize, columns: usize, data: &mut [f32], bias: &[f32]) {
+        debug_assert_eq!(data.len(), rows * columns);
+        self.backend.add_bias(columns, data, bias);
+    }
+
+    fn add_in_place(&mut self, destination: &mut [f32], source: &[f32]) {
+        self.backend.add_in_place(destination, source);
+    }
+
+    fn apply_gelu(&mut self, values: &mut [f32]) {
+        self.backend.gelu(values);
     }
 
     fn matmul(
@@ -1592,12 +1863,88 @@ impl KernelProvider for CpuProvider {
         b_layout: BLayout,
         c: &mut [f32],
     ) -> Result<()> {
-        ensure!(a.len() == m * k, "matmul A shape mismatch");
-        ensure!(b.len() == n * k, "matmul B shape mismatch");
-        ensure!(c.len() == m * n, "matmul C shape mismatch");
-        matmul_impl(m, n, k, a, b, b_layout, c);
+        validate_matmul_shapes(m, n, k, a, b, c)?;
+        self.backend.matmul(m, n, k, a, b, b_layout, c, false);
         Ok(())
     }
+
+    fn matmul_static_rhs(
+        &mut self,
+        m: usize,
+        n: usize,
+        k: usize,
+        a: &[f32],
+        b: &[f32],
+        b_layout: BLayout,
+        c: &mut [f32],
+    ) -> Result<()> {
+        validate_matmul_shapes(m, n, k, a, b, c)?;
+        self.backend.matmul(m, n, k, a, b, b_layout, c, true);
+        Ok(())
+    }
+
+    fn matmul_batched(
+        &mut self,
+        batches: usize,
+        m: usize,
+        n: usize,
+        k: usize,
+        a: &[f32],
+        b: &[f32],
+        b_layout: BLayout,
+        c: &mut [f32],
+    ) -> Result<()> {
+        ensure!(
+            a.len() == batches * m * k,
+            "batched matmul A shape mismatch"
+        );
+        ensure!(
+            b.len() == batches * n * k,
+            "batched matmul B shape mismatch"
+        );
+        ensure!(
+            c.len() == batches * m * n,
+            "batched matmul C shape mismatch"
+        );
+        self.backend
+            .matmul_batched(batches, m, n, k, a, b, b_layout, c);
+        Ok(())
+    }
+
+    fn layer_norm(
+        &mut self,
+        rows: usize,
+        hidden: usize,
+        data: &mut [f32],
+        weight: &[f32],
+        bias: &[f32],
+        eps: f32,
+    ) -> Result<()> {
+        ensure!(
+            data.len() == rows * hidden,
+            "layer_norm data shape mismatch"
+        );
+        ensure!(
+            weight.len() == hidden && bias.len() == hidden,
+            "layer_norm parameter shape mismatch"
+        );
+        self.backend.layer_norm(hidden, data, weight, bias, eps);
+        Ok(())
+    }
+}
+
+fn validate_matmul_shapes(
+    m: usize,
+    n: usize,
+    k: usize,
+    a: &[f32],
+    b: &[f32],
+    c: &[f32],
+) -> Result<()> {
+    ensure!(a.len() == m * k, "matmul A shape mismatch");
+    ensure!(b.len() == n * k, "matmul B shape mismatch");
+    ensure!(c.len() == m * n, "matmul C shape mismatch");
+    Ok(())
 }
 
 struct MetalProvider {
@@ -3103,9 +3450,7 @@ fn encoder_layers_scalar_forward(
         let mut attention_out = layer
             .attention_output
             .forward(provider, rows, hidden, &context)?;
-        for (value, residual_value) in attention_out.iter_mut().zip(residual) {
-            *value += residual_value;
-        }
+        provider.add_in_place(&mut attention_out, &residual);
         provider.layer_norm(
             rows,
             hidden,
@@ -3120,15 +3465,11 @@ fn encoder_layers_scalar_forward(
             layer
                 .intermediate
                 .forward(provider, rows, hidden, &attention_out)?;
-        for value in &mut intermediate {
-            *value = gelu(*value);
-        }
+        provider.apply_gelu(&mut intermediate);
         let mut output = layer
             .output
             .forward(provider, rows, intermediate_size, &intermediate)?;
-        for (value, residual_value) in output.iter_mut().zip(residual) {
-            *value += residual_value;
-        }
+        provider.add_in_place(&mut output, &residual);
         provider.layer_norm(
             rows,
             hidden,
@@ -3179,12 +3520,7 @@ impl Linear {
             BLayout::RowMajorNkTransposed,
             &mut out,
         )?;
-        for row in 0..rows {
-            let start = row * output;
-            for col in 0..output {
-                out[start + col] += bias[col];
-            }
-        }
+        provider.add_bias(rows, output, &mut out, bias);
         Ok(out)
     }
 }
@@ -3202,63 +3538,53 @@ fn self_attention(
     head_dim: usize,
 ) -> Result<Vec<f32>> {
     let hidden = heads * head_dim;
-    let mut context = vec![0.0f32; batch * seq * hidden];
+    let head_batches = batch * heads;
+    let head_matrix_len = seq * head_dim;
+    let mut q_heads = vec![0.0f32; head_batches * head_matrix_len];
+    let mut k_heads = vec![0.0f32; head_batches * head_matrix_len];
+    let mut v_heads = vec![0.0f32; head_batches * head_matrix_len];
+
+    provider.pack_attention_heads(
+        q,
+        k,
+        v,
+        batch,
+        seq,
+        heads,
+        head_dim,
+        &mut q_heads,
+        &mut k_heads,
+        &mut v_heads,
+    );
+
+    let mut scores = vec![0.0f32; head_batches * seq * seq];
+    provider.matmul_batched(
+        head_batches,
+        seq,
+        seq,
+        head_dim,
+        &q_heads,
+        &k_heads,
+        BLayout::RowMajorNkTransposed,
+        &mut scores,
+    )?;
     let scale = 1.0f32 / (head_dim as f32).sqrt();
+    provider.masked_softmax(&mut scores, attention_mask, seq, heads, scale);
 
-    let mut q_head = vec![0.0f32; seq * head_dim];
-    let mut k_head = vec![0.0f32; seq * head_dim];
-    let mut v_head = vec![0.0f32; seq * head_dim];
-    let mut scores = vec![0.0f32; seq * seq];
-    let mut ctx_head = vec![0.0f32; seq * head_dim];
+    let mut context_heads = vec![0.0f32; head_batches * head_matrix_len];
+    provider.matmul_batched(
+        head_batches,
+        seq,
+        head_dim,
+        seq,
+        &scores,
+        &v_heads,
+        BLayout::RowMajorKn,
+        &mut context_heads,
+    )?;
 
-    for b in 0..batch {
-        for head in 0..heads {
-            for s in 0..seq {
-                let source = (b * seq + s) * hidden + head * head_dim;
-                let dest = s * head_dim;
-                q_head[dest..dest + head_dim].copy_from_slice(&q[source..source + head_dim]);
-                k_head[dest..dest + head_dim].copy_from_slice(&k[source..source + head_dim]);
-                v_head[dest..dest + head_dim].copy_from_slice(&v[source..source + head_dim]);
-            }
-
-            provider.matmul(
-                seq,
-                seq,
-                head_dim,
-                &q_head,
-                &k_head,
-                BLayout::RowMajorNkTransposed,
-                &mut scores,
-            )?;
-            for query_pos in 0..seq {
-                let row_start = query_pos * seq;
-                let row = &mut scores[row_start..row_start + seq];
-                for key_pos in 0..seq {
-                    row[key_pos] *= scale;
-                    if attention_mask[b * seq + key_pos] == 0 {
-                        row[key_pos] = -10_000.0;
-                    }
-                }
-                softmax(row);
-            }
-
-            provider.matmul(
-                seq,
-                head_dim,
-                seq,
-                &scores,
-                &v_head,
-                BLayout::RowMajorKn,
-                &mut ctx_head,
-            )?;
-            for s in 0..seq {
-                let source = s * head_dim;
-                let dest = (b * seq + s) * hidden + head * head_dim;
-                context[dest..dest + head_dim]
-                    .copy_from_slice(&ctx_head[source..source + head_dim]);
-            }
-        }
-    }
+    let mut context = vec![0.0f32; batch * seq * hidden];
+    provider.unpack_attention_heads(&context_heads, batch, seq, heads, head_dim, &mut context);
     Ok(context)
 }
 
@@ -3609,7 +3935,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn metal_provider_matches_cpu_for_row_major_rhs() {
         let mut metal = MetalProvider::new(Precision::F32).expect("create MPSGraph provider");
-        let mut cpu = CpuProvider;
+        let mut cpu = CpuProvider::platform_for_test();
         let a = vec![1.0, 2.0, 3.0, 4.0, -2.0, 0.5];
         let b = vec![
             0.5, -1.0, 2.0, 1.5, 3.0, -0.5, -2.0, 0.25, 1.25, -1.5, 0.75, 2.5,
@@ -3628,7 +3954,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn metal_provider_matches_cpu_for_transposed_rhs_storage() {
         let mut metal = MetalProvider::new(Precision::F32).expect("create MPSGraph provider");
-        let mut cpu = CpuProvider;
+        let mut cpu = CpuProvider::platform_for_test();
         let a = vec![1.0, 2.0, 3.0, 4.0, -2.0, 0.5];
         let b = vec![
             0.5, 3.0, 1.25, -1.0, -0.5, -1.5, 2.0, -2.0, 0.75, 1.5, 0.25, 2.5,
@@ -3734,7 +4060,7 @@ mod tests {
         let mut expected = patterned_values(batch * seq * hidden, 0.02, 0.01);
         let mut actual = expected.clone();
 
-        let mut cpu = CpuProvider;
+        let mut cpu = CpuProvider::platform_for_test();
         encoder_layers_scalar_forward(
             &mut cpu,
             &mut expected,
@@ -3781,7 +4107,7 @@ mod tests {
         let mut expected = patterned_values(batch * seq * hidden, 0.02, 0.01);
         let mut actual = expected.clone();
 
-        let mut cpu = CpuProvider;
+        let mut cpu = CpuProvider::platform_for_test();
         encoder_layers_scalar_forward(
             &mut cpu,
             &mut expected,

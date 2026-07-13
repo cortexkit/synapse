@@ -22,6 +22,8 @@ synapse-bench = { path = "../../harness" }
 safetensors = "0.6.2"
 half = "2"
 libm = "0.2"
+faer = { version = "=0.22.6", default-features = false, features = ["std", "rayon"] }
+rayon = "1.10"
 ash = { version = "0.38", optional = true }
 
 [build-dependencies]
