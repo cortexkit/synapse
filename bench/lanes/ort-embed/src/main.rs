@@ -37,6 +37,9 @@ struct Args {
     /// Output LaneResult JSON path
     #[arg(long)]
     out: PathBuf,
+    /// Optional cap for same-slice comparison runs.
+    #[arg(long)]
+    limit: Option<usize>,
     /// Optional: write produced vectors (JSONL: {id, vec}) for parity reference
     #[arg(long)]
     vectors_out: Option<PathBuf>,
@@ -81,6 +84,8 @@ fn main() -> Result<()> {
 
     let mut tokenizer =
         Tokenizer::from_file(&args.tokenizer).map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
+    // Token accounting uses real post-truncation tokens; batching pads explicitly in run_batch.
+    tokenizer.with_padding(None);
     tokenizer
         .with_truncation(Some(TruncationParams {
             max_length: args.max_length,
@@ -116,7 +121,7 @@ fn main() -> Result<()> {
     let cold_load_s = started.elapsed().as_secs_f64();
 
     // --- Corpus ---
-    let chunks: Vec<Chunk> = load_corpus(&args.corpus, None)?;
+    let chunks: Vec<Chunk> = load_corpus(&args.corpus, args.limit)?;
     let texts: Vec<String> = chunks
         .iter()
         .map(|chunk| prefixed_text(args.prefix_document.as_deref(), &chunk.text))

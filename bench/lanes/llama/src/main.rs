@@ -72,6 +72,9 @@ struct EmbedArgs {
     /// Output LaneResult JSON path.
     #[arg(long)]
     out: PathBuf,
+    /// Optional cap for same-slice comparison runs.
+    #[arg(long)]
+    limit: Option<usize>,
     /// Optional: write produced vectors (JSONL: {id, vec}) for parity reference.
     #[arg(long)]
     vectors_out: Option<PathBuf>,
@@ -118,6 +121,9 @@ struct EmbedArgs {
     /// Number of server slots.
     #[arg(long, default_value_t = 1)]
     parallel: usize,
+    /// CPU worker threads. Defaults to ceil(available logical CPUs / 2).
+    #[arg(long)]
+    threads: Option<usize>,
 }
 
 #[derive(Args)]
@@ -348,7 +354,7 @@ fn main() -> Result<()> {
 
 fn run_embed(args: EmbedArgs) -> Result<()> {
     let tokenizer = load_tokenizer(&args.tokenizer, args.max_length)?;
-    let chunks: Vec<Chunk> = load_corpus(&args.corpus, None)?;
+    let chunks: Vec<Chunk> = load_corpus(&args.corpus, args.limit)?;
     let prefixed_texts: Vec<String> = chunks
         .iter()
         .map(|chunk| prefixed_text(args.prefix_document.as_deref(), &chunk.text))
@@ -373,6 +379,13 @@ fn run_embed(args: EmbedArgs) -> Result<()> {
         args.ctx_size
     );
 
+    let threads = args.threads.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(|parallelism| parallelism.get())
+            .unwrap_or(1)
+            .div_ceil(2)
+            .max(1)
+    });
     let server_args = vec![
         "--embedding".to_string(),
         "--pooling".to_string(),
@@ -389,6 +402,10 @@ fn run_embed(args: EmbedArgs) -> Result<()> {
         args.gpu_layers.to_string(),
         "--parallel".to_string(),
         args.parallel.to_string(),
+        "--threads".to_string(),
+        threads.to_string(),
+        "--threads-batch".to_string(),
+        threads.to_string(),
     ];
 
     let client = build_http_client()?;
@@ -475,7 +492,7 @@ fn run_embed(args: EmbedArgs) -> Result<()> {
     let peak_rss = server.peak_rss_bytes();
 
     let notes = format!(
-        "endpoint=/v1/embeddings; request_batching=greedy_sum_tokens<=batch_size; cold_load=health+warmup_request; pooling={}; embd_normalize={}; ctx_size={}; batch_size={}; ubatch_size={}; ngl={}; parallel={}; prefix_document={}; min_parity={}; reference_matches={}",
+        "endpoint=/v1/embeddings; request_batching=greedy_sum_tokens<=batch_size; cold_load=health+warmup_request; pooling={}; embd_normalize={}; ctx_size={}; batch_size={}; ubatch_size={}; ngl={}; parallel={}; threads={}; threads_batch={}; prefix_document={}; min_parity={}; reference_matches={}",
         args.pooling,
         args.embd_normalize,
         args.ctx_size,
@@ -483,6 +500,8 @@ fn run_embed(args: EmbedArgs) -> Result<()> {
         args.ubatch_size,
         args.gpu_layers,
         args.parallel,
+        threads,
+        threads,
         format_optional_prefix(args.prefix_document.as_deref()),
         args.min_parity,
         parity_matches

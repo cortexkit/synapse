@@ -9,8 +9,17 @@ fn main() {
     println!("cargo:rerun-if-changed=src/cuda_family_common.cuh");
     println!("cargo:rerun-if-changed=src/cuda_modernbert.cu");
     println!("cargo:rerun-if-changed=src/cuda_qwen3.cu");
+    println!("cargo:rerun-if-changed=src/cpu_hand_kernel.c");
 
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    if target_arch == "x86_64" && target_env != "msvc" {
+        cc::Build::new()
+            .file("src/cpu_hand_kernel.c")
+            .flag_if_supported("-O3")
+            .compile("synapse_unified_rt_cpu_hand");
+    }
     if target_os == "macos" {
         cc::Build::new()
             .file("src/mpsgraph_runtime.m")

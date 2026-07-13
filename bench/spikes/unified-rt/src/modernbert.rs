@@ -1584,7 +1584,7 @@ mod tests {
                 .unwrap();
             assert_eq!(encoding.get_ids(), expected_ids);
         }
-        let mut provider = crate::CpuProvider;
+        let mut provider = crate::CpuProvider::platform_for_test();
         let scores = model
             .rerank_batch(&mut provider, &tokenizer, &pairs, None)
             .unwrap();
