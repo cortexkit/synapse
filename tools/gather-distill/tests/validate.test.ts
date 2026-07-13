@@ -12,20 +12,25 @@ async function fixtureRepo(): Promise<string> {
   return root;
 }
 
-function finalJson(endLine: number): GatherFinalJson {
+function finalJson(startLine: number, endLine: number): GatherFinalJson {
   return {
     interpretation: "Find the exported constants.",
     scope: ["src/lib.ts"],
-    snippets: [{ path: "src/lib.ts", startLine: 1, endLine, why: "Defines the constants." }],
+    snippets: [{ path: "src/lib.ts", startLine, endLine, why: "Defines the constants." }],
     omissions: [],
   };
 }
 
 describe("citation validation", () => {
-  test("known-bad out-of-range citation must fail", async () => {
-    const errors = await validateCitations(await fixtureRepo(), finalJson(99));
+  test("known-bad citation (startLine past EOF) must fail", async () => {
+    const errors = await validateCitations(await fixtureRepo(), finalJson(90, 99));
     expect(errors.length).toBeGreaterThan(0);
-    expect(errors.join(" ")).toContain("exceeds file length");
+    expect(errors.join(" ")).toContain("past the end");
+  });
+
+  test("endLine past EOF clamps and passes (production parity)", async () => {
+    const errors = await validateCitations(await fixtureRepo(), finalJson(1, 99));
+    expect(errors).toEqual([]);
   });
 
   test("rejects trajectory snippet bytes that differ from the pinned file", async () => {
@@ -45,7 +50,7 @@ describe("citation validation", () => {
         ],
       },
     ];
-    const errors = await validateCitations(await fixtureRepo(), finalJson(2), trajectory);
+    const errors = await validateCitations(await fixtureRepo(), finalJson(1, 2), trajectory);
     expect(errors).toEqual(["final_json.snippets[0]: trajectory snippet bytes do not match the pinned clone"]);
   });
 });
@@ -69,4 +74,24 @@ test("parseJsonText falls back to the outermost brace span when unfenced", () =>
   const bare = 'Here it is: {"interpretation":"bare","scope":[],"snippets":[],"omissions":[]} thanks';
   const parsed = parseJsonText(bare) as Record<string, unknown>;
   expect(parsed.interpretation).toBe("bare");
+});
+
+import { readLineRange } from "../src/repo.ts";
+import { mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { execSync } from "node:child_process";
+
+test("readLineRange clamps endLine past EOF (production parity) but rejects startLine past EOF", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "clamp-test-"));
+  execSync("git init -q", { cwd: dir });
+  writeFileSync(join(dir, "f.txt"), "a\nb\nc\n");
+  const sha = "0000000000000000000000000000000000000000";
+  writeFileSync(join(dir, ".gather-corpus-manifest.json"), JSON.stringify({ fullName: "t/t", sha, language: "x", size_mb: 0 }));
+  // endLine 90 on a 3-line file: clamped, accepted
+  const clamped = await readLineRange(dir, "f.txt", 1, 90);
+  expect(clamped.text).toBe("a\nb\nc\n");
+  expect(clamped.lineCount).toBe(3);
+  // startLine past EOF: genuine error, rejected
+  await expect(readLineRange(dir, "f.txt", 10, 12)).rejects.toThrow(/past the end/);
 });

@@ -90,10 +90,15 @@ export async function readLineRange(
     throw new Error("line ranges use positive 1-based integers");
   }
   if (endLine < startLine) throw new Error("endLine must be at least startLine");
-  if (endLine > lines.length) {
-    throw new Error(`line range ${startLine}-${endLine} exceeds file length ${lines.length}`);
+  // Production parity (manager_runtime.rs::read_snippet_from_root): a
+  // startLine past EOF is a genuine model error and rejects, but an endLine
+  // past EOF is CLAMPED to the file length and the snippet is accepted — the
+  // model guessing a generous end is harmless and production serves it.
+  if (startLine > lines.length) {
+    throw new Error(`snippet startLine ${startLine} is past the end of ${path} (${lines.length} lines)`);
   }
-  return { text: lines.slice(startLine - 1, endLine).join(""), lineCount: lines.length };
+  const clampedEnd = Math.min(endLine, lines.length);
+  return { text: lines.slice(startLine - 1, clampedEnd).join(""), lineCount: lines.length };
 }
 
 export async function discoverRepos(corpusRoot = DEFAULT_CORPUS_ROOT): Promise<string[]> {
