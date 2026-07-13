@@ -70,12 +70,7 @@ export async function resolveRepoFile(repoDir: string, requestedPath: string): P
   return resolved;
 }
 
-export async function resolveRepoDirectory(repoDir: string, requestedPath: string): Promise<string> {
-  const resolved = await resolveRepoEntry(repoDir, requestedPath);
-  const metadata = await stat(resolved);
-  if (!metadata.isDirectory()) throw new Error("path is not a directory");
-  return resolved;
-}
+
 
 export function splitLinesInclusive(text: string): string[] {
   return text.match(/[^\n]*\n|[^\n]+$/g) ?? [];
