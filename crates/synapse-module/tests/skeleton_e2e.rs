@@ -15,7 +15,7 @@ use std::{
 
 use common::{
     connect_consumer, raw_route_frame, read_frame_timeout, route_open, route_request,
-    unique_temp_dir, wait_for_catalog, MODULE_ID, SETUP_TIMEOUT,
+    unique_temp_dir, wait_for_catalog, TestRoute, MODULE_ID, SETUP_TIMEOUT,
 };
 use rusqlite::{params, Connection};
 use serde_json::Value;
@@ -335,13 +335,13 @@ async fn wait_for_registration(registry: &Registry, module_id: &str, wait: Durat
     }
 }
 
-async fn open_route() -> (TestDaemon, ModuleProcess, tokio::net::TcpStream, u16) {
+async fn open_route() -> (TestDaemon, ModuleProcess, tokio::net::TcpStream, TestRoute) {
     open_route_with_preloads(None).await
 }
 
 async fn open_route_with_preloads(
     preload_models: Option<&str>,
-) -> (TestDaemon, ModuleProcess, tokio::net::TcpStream, u16) {
+) -> (TestDaemon, ModuleProcess, tokio::net::TcpStream, TestRoute) {
     let daemon = start_daemon().await;
     let module = match preload_models {
         Some(preload_models) => {
@@ -354,7 +354,7 @@ async fn open_route_with_preloads(
 
 async fn open_route_with_config(
     config_json: &str,
-) -> (TestDaemon, ModuleProcess, tokio::net::TcpStream, u16) {
+) -> (TestDaemon, ModuleProcess, tokio::net::TcpStream, TestRoute) {
     let daemon = start_daemon().await;
     let module = spawn_synapse_module_with_config(&daemon.connection_file_path, config_json);
     open_route_for_started_module(daemon, module).await
@@ -363,7 +363,7 @@ async fn open_route_with_config(
 async fn open_route_for_started_module(
     daemon: TestDaemon,
     module: ModuleProcess,
-) -> (TestDaemon, ModuleProcess, tokio::net::TcpStream, u16) {
+) -> (TestDaemon, ModuleProcess, tokio::net::TcpStream, TestRoute) {
     wait_for_registration(&daemon.registry, MODULE_ID, SETUP_TIMEOUT).await;
 
     let project_root = unique_temp_dir("synapse-e2e-project");
@@ -371,9 +371,9 @@ async fn open_route_for_started_module(
 
     let mut consumer = connect_consumer(&daemon.connection_file_path).await;
     wait_for_catalog(&mut consumer, MODULE_ID, SETUP_TIMEOUT).await;
-    let route_channel = route_open(&mut consumer, &project_root, 1).await;
+    let route = route_open(&mut consumer, &project_root, 1).await;
     let _ = std::fs::remove_dir_all(&project_root);
-    (daemon, module, consumer, route_channel)
+    (daemon, module, consumer, route)
 }
 
 fn expected_store_path(data_home: &Path) -> PathBuf {
@@ -382,10 +382,10 @@ fn expected_store_path(data_home: &Path) -> PathBuf {
 
 #[tokio::test]
 async fn models_list_round_trips_and_opens_the_daemon_delivered_store() {
-    let (daemon, _module, mut consumer, route_channel) = open_route().await;
+    let (daemon, _module, mut consumer, route) = open_route().await;
     let body = route_request(
         &mut consumer,
-        route_channel,
+        route,
         2,
         serde_json::json!({ "method": "models.list", "params": {} }),
     )
@@ -452,11 +452,11 @@ async fn remote_gateway_declares_calibrates_checkpoints_trips_and_recovers() {
         }]
     })
     .to_string();
-    let (_daemon, _module, mut consumer, route_channel) = open_route_with_config(&config).await;
+    let (_daemon, _module, mut consumer, route) = open_route_with_config(&config).await;
 
     let listed = route_request(
         &mut consumer,
-        route_channel,
+        route,
         20,
         serde_json::json!({"method":"models.list","params":{}}),
     )
@@ -472,7 +472,7 @@ async fn remote_gateway_declares_calibrates_checkpoints_trips_and_recovers() {
 
     let before_probe = route_request(
         &mut consumer,
-        route_channel,
+        route,
         21,
         serde_json::json!({
             "method":"embed.query",
@@ -500,7 +500,7 @@ async fn remote_gateway_declares_calibrates_checkpoints_trips_and_recovers() {
     ] {
         let rejected = route_request(
             &mut consumer,
-            route_channel,
+            route,
             corr,
             serde_json::json!({"method":method,"params":params}),
         )
@@ -513,7 +513,7 @@ async fn remote_gateway_declares_calibrates_checkpoints_trips_and_recovers() {
 
     run_probe_job(
         &mut consumer,
-        route_channel,
+        route,
         30,
         serde_json::json!({"models":["remote-embed"],"request_key":"remote-probe"}),
     )
@@ -521,7 +521,7 @@ async fn remote_gateway_declares_calibrates_checkpoints_trips_and_recovers() {
 
     let embedded = route_request(
         &mut consumer,
-        route_channel,
+        route,
         40,
         serde_json::json!({
             "method":"embed.query",
@@ -540,7 +540,7 @@ async fn remote_gateway_declares_calibrates_checkpoints_trips_and_recovers() {
 
     let accepted = route_request(
         &mut consumer,
-        route_channel,
+        route,
         41,
         serde_json::json!({
             "method":"embed.batch",
@@ -554,14 +554,14 @@ async fn remote_gateway_declares_calibrates_checkpoints_trips_and_recovers() {
     )
     .await;
     let job_id = accepted["result"]["job_id"].as_str().unwrap();
-    let completed = poll_embed_result(&mut consumer, route_channel, 42, job_id).await;
+    let completed = poll_embed_result(&mut consumer, route, 42, job_id).await;
     assert_eq!(completed["result"]["state"], "done");
     assert_eq!(completed["result"]["page_count"], 2);
 
     provider.fail_next(3);
     let unavailable = route_request(
         &mut consumer,
-        route_channel,
+        route,
         50,
         serde_json::json!({
             "method":"embed.query",
@@ -578,7 +578,7 @@ async fn remote_gateway_declares_calibrates_checkpoints_trips_and_recovers() {
     sleep(Duration::from_millis(150)).await;
     let recovered = route_request(
         &mut consumer,
-        route_channel,
+        route,
         51,
         serde_json::json!({
             "method":"embed.query",
@@ -591,10 +591,10 @@ async fn remote_gateway_declares_calibrates_checkpoints_trips_and_recovers() {
 
 #[tokio::test]
 async fn embed_query_returns_typed_probe_required_error() {
-    let (_daemon, _module, mut consumer, route_channel) = open_route().await;
+    let (_daemon, _module, mut consumer, route) = open_route().await;
     let frame = raw_route_frame(
         &mut consumer,
-        route_channel,
+        route,
         3,
         serde_json::json!({
             "method": "embed.query",
@@ -621,13 +621,12 @@ async fn embed_query_preloaded_minilm_returns_vectors_and_envelope() {
         return;
     };
     let _lock = acquire_minilm_e2e_lock();
-    let (_daemon, _module, mut consumer, route_channel) =
-        open_route_with_preloads(Some(&preloads)).await;
-    certify_preloaded_models(&mut consumer, route_channel, 40).await;
+    let (_daemon, _module, mut consumer, route) = open_route_with_preloads(Some(&preloads)).await;
+    certify_preloaded_models(&mut consumer, route, 40).await;
 
     let first = route_request(
         &mut consumer,
-        route_channel,
+        route,
         4,
         serde_json::json!({
             "method": "embed.query",
@@ -637,7 +636,7 @@ async fn embed_query_preloaded_minilm_returns_vectors_and_envelope() {
     .await;
     let second = route_request(
         &mut consumer,
-        route_channel,
+        route,
         5,
         serde_json::json!({
             "method": "embed.query",
@@ -686,11 +685,11 @@ async fn embed_query_loaded_owned_metal_carries_distinct_provenance_and_content_
         None,
         &[("CORTEXKIT_MODEL_CACHE", cache.to_string_lossy().as_ref())],
     );
-    let (_daemon, _module, mut consumer, route_channel) =
+    let (_daemon, _module, mut consumer, route) =
         open_route_for_started_module(daemon, module).await;
     let accepted = route_request(
         &mut consumer,
-        route_channel,
+        route,
         46,
         serde_json::json!({
             "method": "model.load",
@@ -725,14 +724,14 @@ async fn embed_query_loaded_owned_metal_carries_distinct_provenance_and_content_
     )
     .await;
     let job_id = accepted["result"]["job_id"].as_str().unwrap();
-    let ready = poll_model_load_job(&mut consumer, route_channel, 47, job_id).await;
+    let ready = poll_model_load_job(&mut consumer, route, 47, job_id).await;
     assert_eq!(
         ready["result"]["state"], "ready",
         "owned load failed: {ready:?}"
     );
     run_probe_job(
         &mut consumer,
-        route_channel,
+        route,
         60,
         serde_json::json!({ "models": ["minilm", "minilm-owned"] }),
     )
@@ -740,7 +739,7 @@ async fn embed_query_loaded_owned_metal_carries_distinct_provenance_and_content_
 
     let body = route_request(
         &mut consumer,
-        route_channel,
+        route,
         2_000,
         serde_json::json!({
             "method": "embed.query",
@@ -788,7 +787,7 @@ async fn embed_query_loaded_owned_metal_carries_distinct_provenance_and_content_
 
     let ort = route_request(
         &mut consumer,
-        route_channel,
+        route,
         2_001,
         serde_json::json!({
             "method": "embed.query",
@@ -800,7 +799,7 @@ async fn embed_query_loaded_owned_metal_carries_distinct_provenance_and_content_
     assert_ne!(ort_fingerprint, result["fingerprint"].as_str().unwrap());
     let rejected = route_request(
         &mut consumer,
-        route_channel,
+        route,
         2_002,
         serde_json::json!({
             "method": "embed.query",
@@ -823,9 +822,8 @@ async fn embed_batch_preloaded_minilm_preserves_order_and_envelope() {
         return;
     };
     let _lock = acquire_minilm_e2e_lock();
-    let (_daemon, _module, mut consumer, route_channel) =
-        open_route_with_preloads(Some(&preloads)).await;
-    certify_preloaded_models(&mut consumer, route_channel, 60).await;
+    let (_daemon, _module, mut consumer, route) = open_route_with_preloads(Some(&preloads)).await;
+    certify_preloaded_models(&mut consumer, route, 60).await;
     let items = (0..16)
         .map(|index| {
             serde_json::json!({
@@ -837,7 +835,7 @@ async fn embed_batch_preloaded_minilm_preserves_order_and_envelope() {
 
     let body = route_request(
         &mut consumer,
-        route_channel,
+        route,
         6,
         serde_json::json!({
             "method": "embed.batch",
@@ -880,8 +878,8 @@ async fn over_budget_embed_batch_returns_job_and_pages_results() {
     })
     .to_string();
     let _lock = acquire_minilm_e2e_lock();
-    let (_daemon, _module, mut consumer, route_channel) = open_route_with_config(&config).await;
-    certify_preloaded_models(&mut consumer, route_channel, 80).await;
+    let (_daemon, _module, mut consumer, route) = open_route_with_config(&config).await;
+    certify_preloaded_models(&mut consumer, route, 80).await;
     let texts = [
         "job tier first text",
         "job tier second text",
@@ -892,7 +890,7 @@ async fn over_budget_embed_batch_returns_job_and_pages_results() {
     for (index, text) in texts.iter().enumerate() {
         let body = route_request(
             &mut consumer,
-            route_channel,
+            route,
             100 + index as u64,
             serde_json::json!({
                 "method": "embed.query",
@@ -915,7 +913,7 @@ async fn over_budget_embed_batch_returns_job_and_pages_results() {
         .collect::<Vec<_>>();
     let accepted = route_request(
         &mut consumer,
-        route_channel,
+        route,
         200,
         serde_json::json!({
             "method": "embed.batch",
@@ -935,7 +933,7 @@ async fn over_budget_embed_batch_returns_job_and_pages_results() {
 
     let duplicate = route_request(
         &mut consumer,
-        route_channel,
+        route,
         201,
         serde_json::json!({
             "method": "embed.batch",
@@ -953,7 +951,7 @@ async fn over_budget_embed_batch_returns_job_and_pages_results() {
 
     let conflict = route_request(
         &mut consumer,
-        route_channel,
+        route,
         202,
         serde_json::json!({
             "method": "embed.batch",
@@ -975,7 +973,7 @@ async fn over_budget_embed_batch_returns_job_and_pages_results() {
         Value::Bool(false)
     );
 
-    let done = poll_embed_result(&mut consumer, route_channel, 300, &job_id).await;
+    let done = poll_embed_result(&mut consumer, route, 300, &job_id).await;
     assert_eq!(done["result"]["state"], "done");
     assert_eq!(
         done["result"]["pages_available"],
@@ -987,7 +985,7 @@ async fn over_budget_embed_batch_returns_job_and_pages_results() {
     for page in 1..page_count {
         let body = route_request(
             &mut consumer,
-            route_channel,
+            route,
             300 + page,
             serde_json::json!({
                 "method": "embed.result",
@@ -1024,8 +1022,8 @@ async fn alias_surface_certifies_declares_retracts_and_preserves_old_job_pages()
     })
     .to_string();
     let _lock = acquire_minilm_e2e_lock();
-    let (_daemon, _module, mut consumer, route_channel) = open_route_with_config(&config).await;
-    let probe = certify_preloaded_models(&mut consumer, route_channel, 120).await;
+    let (_daemon, _module, mut consumer, route) = open_route_with_config(&config).await;
+    let probe = certify_preloaded_models(&mut consumer, route, 120).await;
     let lanes = probe["result"]["lanes"].as_array().expect("probe lanes");
     let fingerprint_a = lanes
         .iter()
@@ -1043,7 +1041,7 @@ async fn alias_surface_certifies_declares_retracts_and_preserves_old_job_pages()
 
     let before = route_request(
         &mut consumer,
-        route_channel,
+        route,
         500,
         serde_json::json!({
             "method": "embed.query",
@@ -1055,7 +1053,7 @@ async fn alias_surface_certifies_declares_retracts_and_preserves_old_job_pages()
 
     let valid = route_request(
         &mut consumer,
-        route_channel,
+        route,
         501,
         serde_json::json!({
             "method": "aliases.check_index",
@@ -1070,7 +1068,7 @@ async fn alias_surface_certifies_declares_retracts_and_preserves_old_job_pages()
 
     let accepted = route_request(
         &mut consumer,
-        route_channel,
+        route,
         502,
         serde_json::json!({
             "method": "embed.batch",
@@ -1086,12 +1084,12 @@ async fn alias_surface_certifies_declares_retracts_and_preserves_old_job_pages()
     )
     .await;
     let job_id = accepted["result"]["job_id"].as_str().unwrap().to_string();
-    let done = poll_embed_result(&mut consumer, route_channel, 503, &job_id).await;
+    let done = poll_embed_result(&mut consumer, route, 503, &job_id).await;
     assert_eq!(done["result"]["equivalent_to"][0], fingerprint_b);
 
     let retracted = route_request(
         &mut consumer,
-        route_channel,
+        route,
         600,
         serde_json::json!({
             "method": "alias.retract",
@@ -1107,7 +1105,7 @@ async fn alias_surface_certifies_declares_retracts_and_preserves_old_job_pages()
 
     let migration = route_request(
         &mut consumer,
-        route_channel,
+        route,
         601,
         serde_json::json!({
             "method": "aliases.check_index",
@@ -1136,7 +1134,7 @@ async fn alias_surface_certifies_declares_retracts_and_preserves_old_job_pages()
 
     let old_page = route_request(
         &mut consumer,
-        route_channel,
+        route,
         602,
         serde_json::json!({
             "method": "embed.result",
@@ -1148,7 +1146,7 @@ async fn alias_surface_certifies_declares_retracts_and_preserves_old_job_pages()
 
     let after = route_request(
         &mut consumer,
-        route_channel,
+        route,
         603,
         serde_json::json!({
             "method": "embed.query",
@@ -1166,12 +1164,11 @@ async fn probe_report_exposes_blocking_reasons_perf_rows_and_default_assignments
         return;
     };
     let _lock = acquire_minilm_e2e_lock();
-    let (_daemon, _module, mut consumer, route_channel) =
-        open_route_with_preloads(Some(&preloads)).await;
+    let (_daemon, _module, mut consumer, route) = open_route_with_preloads(Some(&preloads)).await;
 
     let before = route_request(
         &mut consumer,
-        route_channel,
+        route,
         85,
         serde_json::json!({ "method": "probe.report", "params": {} }),
     )
@@ -1184,7 +1181,7 @@ async fn probe_report_exposes_blocking_reasons_perf_rows_and_default_assignments
     );
     assert_eq!(before["result"]["lanes"][0]["performance"], Value::Null);
 
-    let probed = certify_preloaded_models(&mut consumer, route_channel, 86).await;
+    let probed = certify_preloaded_models(&mut consumer, route, 86).await;
     assert_eq!(probed["result"]["current_knob"], "balanced");
     assert_eq!(
         probed["result"]["knob_assignments"]
@@ -1200,7 +1197,7 @@ async fn probe_report_exposes_blocking_reasons_perf_rows_and_default_assignments
 
     let report = route_request(
         &mut consumer,
-        route_channel,
+        route,
         87,
         serde_json::json!({ "method": "probe.report", "params": {} }),
     )
@@ -1224,12 +1221,12 @@ async fn quiet_knob_restart_uses_persisted_assignment() {
     };
     let config = module_config_with_preloads(preloads.clone(), "balanced");
     let _lock = acquire_minilm_e2e_lock();
-    let (daemon, mut module, mut consumer, route_channel) = open_route_with_config(&config).await;
-    certify_preloaded_models(&mut consumer, route_channel, 120).await;
+    let (daemon, mut module, mut consumer, route) = open_route_with_config(&config).await;
+    certify_preloaded_models(&mut consumer, route, 120).await;
 
     let report = route_request(
         &mut consumer,
-        route_channel,
+        route,
         121,
         serde_json::json!({ "method": "probe.report", "params": {} }),
     )
@@ -1262,12 +1259,12 @@ async fn quiet_knob_restart_uses_persisted_assignment() {
         &daemon.connection_file_path,
         &module_config_with_preloads(preloads, "quiet"),
     );
-    let (_daemon, _module, mut consumer, route_channel) =
+    let (_daemon, _module, mut consumer, route) =
         open_route_for_started_module(daemon, restarted).await;
 
     let quiet_report = route_request(
         &mut consumer,
-        route_channel,
+        route,
         122,
         serde_json::json!({ "method": "probe.report", "params": {} }),
     )
@@ -1280,7 +1277,7 @@ async fn quiet_knob_restart_uses_persisted_assignment() {
 
     let first = route_request(
         &mut consumer,
-        route_channel,
+        route,
         123,
         serde_json::json!({
             "method": "embed.query",
@@ -1289,12 +1286,12 @@ async fn quiet_knob_restart_uses_persisted_assignment() {
     )
     .await;
     if first["result"]["error"]["code"] == "model_loading" {
-        let ready = poll_model_ready(&mut consumer, route_channel, 124, &quiet_model_id).await;
+        let ready = poll_model_ready(&mut consumer, route, 124, &quiet_model_id).await;
         assert_eq!(ready["result"]["state"], "ready");
     }
     let routed = route_request(
         &mut consumer,
-        route_channel,
+        route,
         125,
         serde_json::json!({
             "method": "embed.query",
@@ -1312,9 +1309,8 @@ async fn os_build_override_marks_probe_rows_stale_in_report_and_status() {
         return;
     };
     let _lock = acquire_minilm_e2e_lock();
-    let (daemon, mut module, mut consumer, route_channel) =
-        open_route_with_preloads(Some(&preloads)).await;
-    certify_preloaded_models(&mut consumer, route_channel, 130).await;
+    let (daemon, mut module, mut consumer, route) = open_route_with_preloads(Some(&preloads)).await;
+    certify_preloaded_models(&mut consumer, route, 130).await;
 
     let _ = module.child.start_kill();
     let _ = module.child.wait().await;
@@ -1326,12 +1322,12 @@ async fn os_build_override_marks_probe_rows_stale_in_report_and_status() {
         None,
         &[("SYNAPSE_OS_BUILD_OVERRIDE", "synthetic-stale-build")],
     );
-    let (_daemon, _module, mut consumer, route_channel) =
+    let (_daemon, _module, mut consumer, route) =
         open_route_for_started_module(daemon, restarted).await;
 
     let report = route_request(
         &mut consumer,
-        route_channel,
+        route,
         131,
         serde_json::json!({ "method": "probe.report", "params": {} }),
     )
@@ -1353,10 +1349,10 @@ async fn os_build_override_marks_probe_rows_stale_in_report_and_status() {
         true
     );
 
-    ensure_model_loaded_by_query(&mut consumer, route_channel, 132, "minilm").await;
+    ensure_model_loaded_by_query(&mut consumer, route, 132, "minilm").await;
     let status = route_request(
         &mut consumer,
-        route_channel,
+        route,
         135,
         serde_json::json!({ "method": "admission.status", "params": {} }),
     )
@@ -1374,13 +1370,12 @@ async fn embed_query_deadline_one_returns_typed_rejection() {
         return;
     };
     let _lock = acquire_minilm_e2e_lock();
-    let (_daemon, _module, mut consumer, route_channel) =
-        open_route_with_preloads(Some(&preloads)).await;
-    certify_preloaded_models(&mut consumer, route_channel, 90).await;
+    let (_daemon, _module, mut consumer, route) = open_route_with_preloads(Some(&preloads)).await;
+    certify_preloaded_models(&mut consumer, route, 90).await;
 
     let body = route_request(
         &mut consumer,
-        route_channel,
+        route,
         7,
         serde_json::json!({
             "method": "embed.query",
@@ -1403,16 +1398,16 @@ async fn concurrent_embed_burst_finishes_with_vectors_or_typed_rejections() {
         return;
     };
     let _lock = acquire_minilm_e2e_lock();
-    let (_daemon, _module, mut consumer, route_channel) =
-        open_route_with_preloads(Some(&preloads)).await;
-    certify_preloaded_models(&mut consumer, route_channel, 110).await;
+    let (_daemon, _module, mut consumer, route) = open_route_with_preloads(Some(&preloads)).await;
+    certify_preloaded_models(&mut consumer, route, 110).await;
     let start_corr = 10_000_u64;
     let count = 32_u64;
     for offset in 0..count {
         let frame = Frame::build(
             FrameType::Request,
             Flags::new(false, Priority::Interactive, false),
-            route_channel,
+            route.channel,
+            route.epoch,
             start_corr + offset,
             serde_json::to_vec(&serde_json::json!({
                 "method": "embed.query",
@@ -1452,11 +1447,11 @@ async fn model_load_file_source_reaches_ready_and_lazy_reload_after_unload() {
         return;
     };
     let _lock = acquire_minilm_e2e_lock();
-    let (_daemon, _module, mut consumer, route_channel) = open_route().await;
+    let (_daemon, _module, mut consumer, route) = open_route().await;
 
     let accepted = route_request(
         &mut consumer,
-        route_channel,
+        route,
         20_000,
         serde_json::json!({
             "method": "model.load",
@@ -1474,13 +1469,13 @@ async fn model_load_file_source_reaches_ready_and_lazy_reload_after_unload() {
     )
     .await;
     let job_id = accepted["result"]["job_id"].as_str().unwrap().to_string();
-    let ready = poll_model_load_job(&mut consumer, route_channel, 20_001, &job_id).await;
+    let ready = poll_model_load_job(&mut consumer, route, 20_001, &job_id).await;
     assert_eq!(ready["result"]["state"], "ready");
     let model_id = ready["result"]["model_id"].as_str().unwrap().to_string();
 
     let uncertified = route_request(
         &mut consumer,
-        route_channel,
+        route,
         20_100,
         serde_json::json!({
             "method": "embed.query",
@@ -1495,7 +1490,7 @@ async fn model_load_file_source_reaches_ready_and_lazy_reload_after_unload() {
 
     run_probe_job(
         &mut consumer,
-        route_channel,
+        route,
         20_200,
         serde_json::json!({ "models": [model_id.clone()] }),
     )
@@ -1503,7 +1498,7 @@ async fn model_load_file_source_reaches_ready_and_lazy_reload_after_unload() {
 
     let first = route_request(
         &mut consumer,
-        route_channel,
+        route,
         20_300,
         serde_json::json!({
             "method": "embed.query",
@@ -1515,7 +1510,7 @@ async fn model_load_file_source_reaches_ready_and_lazy_reload_after_unload() {
 
     let unloaded = route_request(
         &mut consumer,
-        route_channel,
+        route,
         20_400,
         serde_json::json!({
             "method": "model.unload",
@@ -1527,7 +1522,7 @@ async fn model_load_file_source_reaches_ready_and_lazy_reload_after_unload() {
 
     let loading = route_request(
         &mut consumer,
-        route_channel,
+        route,
         20_500,
         serde_json::json!({
             "method": "embed.query",
@@ -1537,12 +1532,12 @@ async fn model_load_file_source_reaches_ready_and_lazy_reload_after_unload() {
     .await;
     assert_eq!(loading["result"]["error"]["code"], "model_loading");
 
-    let ready_again = poll_model_ready(&mut consumer, route_channel, 20_600, &model_id).await;
+    let ready_again = poll_model_ready(&mut consumer, route, 20_600, &model_id).await;
     assert_eq!(ready_again["result"]["state"], "ready");
 
     let second = route_request(
         &mut consumer,
-        route_channel,
+        route,
         20_700,
         serde_json::json!({
             "method": "embed.query",
@@ -1560,11 +1555,11 @@ async fn model_load_digest_mismatch_fails_with_artifact_invalid() {
         return;
     };
     let _lock = acquire_minilm_e2e_lock();
-    let (_daemon, _module, mut consumer, route_channel) = open_route().await;
+    let (_daemon, _module, mut consumer, route) = open_route().await;
 
     let accepted = route_request(
         &mut consumer,
-        route_channel,
+        route,
         21_000,
         serde_json::json!({
             "method": "model.load",
@@ -1582,7 +1577,7 @@ async fn model_load_digest_mismatch_fails_with_artifact_invalid() {
     )
     .await;
     let job_id = accepted["result"]["job_id"].as_str().unwrap().to_string();
-    let failed = poll_model_load_job(&mut consumer, route_channel, 21_001, &job_id).await;
+    let failed = poll_model_load_job(&mut consumer, route, 21_001, &job_id).await;
     assert_eq!(failed["result"]["state"], "failed");
     assert_eq!(failed["result"]["error"]["code"], "artifact_invalid");
     assert_eq!(failed["result"]["error"]["class"], "permanent");
@@ -1602,7 +1597,7 @@ async fn model_load_restart_mid_download_marks_job_restarted_and_resubmit_succee
         None,
         &[("SYNAPSE_TEST_MODEL_LOAD_CHUNK_DELAY_MS", "25")],
     );
-    let (daemon, mut module, mut consumer, route_channel) =
+    let (daemon, mut module, mut consumer, route) =
         open_route_for_started_module(daemon, module).await;
 
     let request = serde_json::json!({
@@ -1617,7 +1612,7 @@ async fn model_load_restart_mid_download_marks_job_restarted_and_resubmit_succee
             "request_key": "model-load-restart"
         }
     });
-    let accepted = route_request(&mut consumer, route_channel, 22_000, request.clone()).await;
+    let accepted = route_request(&mut consumer, route, 22_000, request.clone()).await;
     let job_id = accepted["result"]["job_id"].as_str().unwrap().to_string();
 
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -1625,7 +1620,7 @@ async fn model_load_restart_mid_download_marks_job_restarted_and_resubmit_succee
     loop {
         let body = route_request(
             &mut consumer,
-            route_channel,
+            route,
             corr,
             serde_json::json!({
                 "method": "model.status",
@@ -1652,12 +1647,12 @@ async fn model_load_restart_mid_download_marks_job_restarted_and_resubmit_succee
     drop(consumer);
 
     let restarted = spawn_synapse_module_with_env(&daemon.connection_file_path, None, None, &[]);
-    let (_daemon, _module, mut consumer, route_channel) =
+    let (_daemon, _module, mut consumer, route) =
         open_route_for_started_module(daemon, restarted).await;
 
     let restarted_status = route_request(
         &mut consumer,
-        route_channel,
+        route,
         22_100,
         serde_json::json!({
             "method": "model.status",
@@ -1671,30 +1666,30 @@ async fn model_load_restart_mid_download_marks_job_restarted_and_resubmit_succee
         "module_restarted"
     );
 
-    let retried = route_request(&mut consumer, route_channel, 22_200, request).await;
+    let retried = route_request(&mut consumer, route, 22_200, request).await;
     let retried_job_id = retried["result"]["job_id"].as_str().unwrap().to_string();
     assert_ne!(retried_job_id, job_id);
-    let ready = poll_model_load_job(&mut consumer, route_channel, 22_201, &retried_job_id).await;
+    let ready = poll_model_load_job(&mut consumer, route, 22_201, &retried_job_id).await;
     assert_eq!(ready["result"]["state"], "ready");
 }
 
 async fn certify_preloaded_models(
     consumer: &mut tokio::net::TcpStream,
-    route_channel: u16,
+    route: TestRoute,
     start_corr: u64,
 ) -> Value {
-    run_probe_job(consumer, route_channel, start_corr, serde_json::json!({})).await
+    run_probe_job(consumer, route, start_corr, serde_json::json!({})).await
 }
 
 async fn run_probe_job(
     consumer: &mut tokio::net::TcpStream,
-    route_channel: u16,
+    route: TestRoute,
     start_corr: u64,
     params: Value,
 ) -> Value {
     let accepted = route_request(
         consumer,
-        route_channel,
+        route,
         start_corr,
         serde_json::json!({ "method": "probe.start", "params": params }),
     )
@@ -1708,7 +1703,7 @@ async fn run_probe_job(
     loop {
         let body = route_request(
             consumer,
-            route_channel,
+            route,
             corr,
             serde_json::json!({
                 "method": "probe.status",
@@ -1741,7 +1736,7 @@ async fn run_probe_job(
 
 async fn poll_model_load_job(
     consumer: &mut tokio::net::TcpStream,
-    route_channel: u16,
+    route: TestRoute,
     start_corr: u64,
     job_id: &str,
 ) -> Value {
@@ -1750,7 +1745,7 @@ async fn poll_model_load_job(
     loop {
         let body = route_request(
             consumer,
-            route_channel,
+            route,
             corr,
             serde_json::json!({
                 "method": "model.status",
@@ -1775,7 +1770,7 @@ async fn poll_model_load_job(
 
 async fn poll_model_ready(
     consumer: &mut tokio::net::TcpStream,
-    route_channel: u16,
+    route: TestRoute,
     start_corr: u64,
     model_id: &str,
 ) -> Value {
@@ -1784,7 +1779,7 @@ async fn poll_model_ready(
     loop {
         let body = route_request(
             consumer,
-            route_channel,
+            route,
             corr,
             serde_json::json!({
                 "method": "model.status",
@@ -1809,7 +1804,7 @@ async fn poll_model_ready(
 
 async fn poll_embed_result(
     consumer: &mut tokio::net::TcpStream,
-    route_channel: u16,
+    route: TestRoute,
     start_corr: u64,
     job_id: &str,
 ) -> Value {
@@ -1818,7 +1813,7 @@ async fn poll_embed_result(
     loop {
         let body = route_request(
             consumer,
-            route_channel,
+            route,
             corr,
             serde_json::json!({
                 "method": "embed.result",
@@ -1843,13 +1838,13 @@ async fn poll_embed_result(
 
 async fn ensure_model_loaded_by_query(
     consumer: &mut tokio::net::TcpStream,
-    route_channel: u16,
+    route: TestRoute,
     start_corr: u64,
     model_id: &str,
 ) {
     let body = route_request(
         consumer,
-        route_channel,
+        route,
         start_corr,
         serde_json::json!({
             "method": "embed.query",
@@ -1863,7 +1858,7 @@ async fn ensure_model_loaded_by_query(
     .await;
     match body["result"]["error"]["code"].as_str() {
         Some("model_loading") => {
-            let ready = poll_model_ready(consumer, route_channel, start_corr + 1, model_id).await;
+            let ready = poll_model_ready(consumer, route, start_corr + 1, model_id).await;
             assert_eq!(ready["result"]["state"], "ready");
         }
         Some("not_certified" | "probe_required") | None => {}
@@ -2109,10 +2104,10 @@ async fn singleton_lease_blocks_second_module_on_same_daemon() {
 #[tokio::test]
 async fn microllm_grammar_rejects_when_gate_disabled() {
     let config = serde_json::json!({ "grammar_enabled": false }).to_string();
-    let (_daemon, _module, mut consumer, route_channel) = open_route_with_config(&config).await;
+    let (_daemon, _module, mut consumer, route) = open_route_with_config(&config).await;
     let frame = raw_route_frame(
         &mut consumer,
-        route_channel,
+        route,
         90_001,
         serde_json::json!({
             "method": "microllm.oneshot",
@@ -2137,10 +2132,10 @@ async fn microllm_grammar_rejects_when_gate_disabled() {
 #[tokio::test]
 async fn microllm_grammar_unavailable_in_build_when_gate_enabled() {
     let config = serde_json::json!({ "grammar_enabled": true }).to_string();
-    let (_daemon, _module, mut consumer, route_channel) = open_route_with_config(&config).await;
+    let (_daemon, _module, mut consumer, route) = open_route_with_config(&config).await;
     let frame = raw_route_frame(
         &mut consumer,
-        route_channel,
+        route,
         90_002,
         serde_json::json!({
             "method": "microllm.oneshot",

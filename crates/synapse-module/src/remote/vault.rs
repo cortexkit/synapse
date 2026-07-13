@@ -224,9 +224,13 @@ fn map_call_error(error: CallError) -> VaultError {
         CallError::Module(body) if body.code == "vault_locked" => VaultError::VaultLocked,
         CallError::Module(body) if body.code == "not_found" => VaultError::NotFound,
         CallError::Module(_) => VaultError::MalformedHandlesFile,
+        // StaleRouteHandle is grouped with the transport failures: no frame was
+        // emitted for the request, so the vault is unreachable through the held
+        // connection until a reconnect establishes a fresh route.
         CallError::NotSent(_)
         | CallError::OutcomeUnknown(_)
-        | CallError::SubscriptionBackpressure(_) => VaultError::Unreachable,
+        | CallError::SubscriptionBackpressure(_)
+        | CallError::StaleRouteHandle(_) => VaultError::Unreachable,
     }
 }
 

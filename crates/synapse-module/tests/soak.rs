@@ -15,7 +15,7 @@ use std::{
 
 use common::{
     connect_consumer, raw_route_frame, read_frame_timeout, route_open, route_request,
-    unique_temp_dir, wait_for_catalog, MODULE_ID, SETUP_TIMEOUT,
+    unique_temp_dir, wait_for_catalog, TestRoute, MODULE_ID, SETUP_TIMEOUT,
 };
 use serde_json::Value;
 use subc_core::{
@@ -98,14 +98,13 @@ async fn mixed_load_burst_and_idempotent_job_invariants_hold() {
     });
     let mut race_handles = Vec::new();
     for index in 0..SOAK_CONSUMERS {
-        let (mut stream, route_channel) =
+        let (mut stream, route) =
             open_additional_route(&daemon.connection_file_path, 10_000 + (index as u64) * 100)
                 .await;
         let body = job_body.clone();
         race_handles.push(tokio::spawn(async move {
-            let response =
-                route_request(&mut stream, route_channel, 10_100 + index as u64, body).await;
-            ((stream, route_channel), response)
+            let response = route_request(&mut stream, route, 10_100 + index as u64, body).await;
+            ((stream, route), response)
         }));
     }
 
@@ -130,7 +129,7 @@ async fn mixed_load_burst_and_idempotent_job_invariants_hold() {
     let query_handles = consumers
         .into_iter()
         .enumerate()
-        .map(|(consumer_index, (mut stream, route_channel))| {
+        .map(|(consumer_index, (mut stream, route))| {
             tokio::spawn(async move {
                 let mut generations = Vec::new();
                 for query_index in 0..SUSTAINED_QUERIES_PER_CONSUMER {
@@ -139,7 +138,7 @@ async fn mixed_load_burst_and_idempotent_job_invariants_hold() {
                         + u64::try_from(query_index).unwrap();
                     let body = route_request_with_wall_timeout(
                         &mut stream,
-                        route_channel,
+                        route,
                         corr,
                         serde_json::json!({
                             "method": "embed.query",
@@ -375,25 +374,25 @@ fn spawn_synapse_module_with_config(
 
 async fn open_route_with_config(
     config_json: &str,
-) -> (TestDaemon, ModuleProcess, tokio::net::TcpStream, u16) {
+) -> (TestDaemon, ModuleProcess, tokio::net::TcpStream, TestRoute) {
     let daemon = start_daemon().await;
     let module = spawn_synapse_module_with_config(&daemon.connection_file_path, config_json);
     wait_for_registration(&daemon.registry, MODULE_ID, SETUP_TIMEOUT).await;
-    let (consumer, route_channel) = open_additional_route(&daemon.connection_file_path, 1).await;
-    (daemon, module, consumer, route_channel)
+    let (consumer, route) = open_additional_route(&daemon.connection_file_path, 1).await;
+    (daemon, module, consumer, route)
 }
 
 async fn open_additional_route(
     connection_file_path: &Path,
     corr: u64,
-) -> (tokio::net::TcpStream, u16) {
+) -> (tokio::net::TcpStream, TestRoute) {
     let project_root = unique_temp_dir("synapse-soak-project");
     std::fs::create_dir_all(&project_root).unwrap();
     let mut consumer = connect_consumer(connection_file_path).await;
     wait_for_catalog(&mut consumer, MODULE_ID, SETUP_TIMEOUT).await;
-    let route_channel = route_open(&mut consumer, &project_root, corr).await;
+    let route = route_open(&mut consumer, &project_root, corr).await;
     let _ = std::fs::remove_dir_all(&project_root);
-    (consumer, route_channel)
+    (consumer, route)
 }
 
 async fn wait_for_registration(registry: &Registry, module_id: &str, wait: Duration) {
@@ -412,13 +411,13 @@ async fn wait_for_registration(registry: &Registry, module_id: &str, wait: Durat
 
 async fn certify_models(
     consumer: &mut tokio::net::TcpStream,
-    route_channel: u16,
+    route: TestRoute,
     start_corr: u64,
     models: &[&str],
 ) -> Value {
     let accepted = route_request(
         consumer,
-        route_channel,
+        route,
         start_corr,
         serde_json::json!({
             "method": "probe.start",
@@ -427,7 +426,7 @@ async fn certify_models(
     )
     .await;
     let job_id = accepted["result"]["job_id"].as_str().unwrap().to_string();
-    let done = poll_probe_status(consumer, route_channel, start_corr + 1, &job_id).await;
+    let done = poll_probe_status(consumer, route, start_corr + 1, &job_id).await;
     assert_eq!(done["result"]["state"], "done");
     for lane in done["result"]["lanes"].as_array().unwrap() {
         assert_eq!(lane["status"], "certified", "probe lane failed: {lane:?}");
@@ -437,7 +436,7 @@ async fn certify_models(
 
 async fn poll_probe_status(
     consumer: &mut tokio::net::TcpStream,
-    route_channel: u16,
+    route: TestRoute,
     start_corr: u64,
     job_id: &str,
 ) -> Value {
@@ -446,7 +445,7 @@ async fn poll_probe_status(
     loop {
         let body = route_request(
             consumer,
-            route_channel,
+            route,
             corr,
             serde_json::json!({
                 "method": "probe.status",
@@ -471,7 +470,7 @@ async fn poll_probe_status(
 
 async fn poll_embed_job(
     consumer: &mut tokio::net::TcpStream,
-    route_channel: u16,
+    route: TestRoute,
     start_corr: u64,
     job_id: &str,
 ) -> Value {
@@ -480,7 +479,7 @@ async fn poll_embed_job(
     loop {
         let body = route_request(
             consumer,
-            route_channel,
+            route,
             corr,
             serde_json::json!({
                 "method": "embed.result",
@@ -505,17 +504,14 @@ async fn poll_embed_job(
 
 async fn route_request_with_wall_timeout(
     stream: &mut tokio::net::TcpStream,
-    route_channel: u16,
+    route: TestRoute,
     corr: u64,
     body: Value,
     wall_timeout: Duration,
 ) -> Frame {
-    timeout(
-        wall_timeout,
-        raw_route_frame(stream, route_channel, corr, body),
-    )
-    .await
-    .expect("route request exceeded wall timeout")
+    timeout(wall_timeout, raw_route_frame(stream, route, corr, body))
+        .await
+        .expect("route request exceeded wall timeout")
 }
 
 fn response_body(frame: Frame) -> Value {
@@ -539,7 +535,7 @@ fn assert_vector_or_typed_rejection(body: &Value, allowed_errors: &[&str]) {
 async fn burst_queries_fast_fail_without_hangs(connection_file_path: &Path) {
     let mut handles = Vec::new();
     for connection_index in 0..BURST_CONNECTIONS {
-        let (mut stream, route_channel) = open_additional_route(
+        let (mut stream, route) = open_additional_route(
             connection_file_path,
             70_000 + (connection_index as u64) * 100,
         )
@@ -552,7 +548,8 @@ async fn burst_queries_fast_fail_without_hangs(connection_file_path: &Path) {
                 let frame = Frame::build(
                     FrameType::Request,
                     Flags::new(false, Priority::Interactive, false),
-                    route_channel,
+                    route.channel,
+                    route.epoch,
                     corr,
                     serde_json::to_vec(&serde_json::json!({
                         "method": "embed.query",
@@ -602,7 +599,7 @@ async fn burst_queries_fast_fail_without_hangs(connection_file_path: &Path) {
 
 async fn wait_for_inline_drain(
     consumer: &mut tokio::net::TcpStream,
-    route_channel: u16,
+    route: TestRoute,
     start_corr: u64,
 ) {
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -610,7 +607,7 @@ async fn wait_for_inline_drain(
     loop {
         let body = route_request(
             consumer,
-            route_channel,
+            route,
             corr,
             serde_json::json!({ "method": "admission.status", "params": {} }),
         )

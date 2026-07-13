@@ -19,11 +19,14 @@
 │   │   ├── potion/         # Model2Vec static embedding lane (potion-code-16M)
 │   │   ├── ts-embed/       # TypeScript Bun/Node runner (Transformers.js or ORT Node)
 │   │   └── wrap-embed/     # External API wrapper (Ollama/LMStudio)
+│   ├── rig/                # External measurement harness and candidate supervisor
+│   ├── spikes/             # Benchmarking experimental spikes (unified-rt, ane-minilm)
 │   └── results/            # Saved telemetry metrics, results, and vectors
 ├── corpus/                 # Code chunk files used for evaluations
 ├── crates/                 # Core Synapse application and worker binaries
 │   ├── synapse-core/       # Shared types, protocol, and scheduler traits
 │   ├── synapse-engine-ort/ # In-process ONNX Runtime inference engine
+│   ├── synapse-engine-owned/ # Primary owned Metal MPSGraph engine (macOS)
 │   ├── synapse-module/     # Main SubC module host, job queue, and worker manager
 │   ├── synapse-worker-ane/ # Apple Neural Engine supervised worker (Swift/CoreML)
 │   ├── synapse-worker-llama/ # llama.cpp supervised worker (GGUF)
@@ -56,6 +59,11 @@
 - Contains: Envelopes, machine profile structs, engine traits, and error contracts.
 - Key files: `crates/synapse-core/src/worker_protocol.rs`, `crates/synapse-core/src/scheduler.rs`
 
+**crates/synapse-engine-owned/:**
+- Purpose: The primary in-process execution engine for Apple Silicon (macOS).
+- Contains: Metal MPSGraph inference layers for ModernBERT, Qwen3, and MiniLM models.
+- Key files: `crates/synapse-engine-owned/src/lib.rs`, `crates/synapse-engine-owned/src/metal_mpsgraph.m`
+
 **crates/synapse-module/:**
 - Purpose: The primary SubC service module. Handles the content-addressed model cache, durable jobs, worker hosting, remote provider dispatch, and route binding.
 - Contains: SQLite store initialization, SubC `ModuleHandler` implementation, UNIX socket / Windows pipe worker spawning, and the remote gateway client.
@@ -75,7 +83,17 @@
 **bench/harness/:**
 - Purpose: Acts as the core telemetry library and dataset builder.
 - Contains: Cargo manifest, Rust code for metrics, corpus chunking, parity, and results formatting.
-- Key files: `bench/harness/src/metrics.rs`, `bench/harness/src/parity.rs`, `bench/harness/src/results.rs`
+- Key files: `bench/harness/src/metrics.rs`, `bench/harness/src/parity.rs`, `bench/harness/src/results.rs`, `bench/harness/src/rig_protocol.rs`
+
+**bench/rig/:**
+- Purpose: External measurement harness for strict bounding of benchmark candidate timing, token accounting, and semantics parity.
+- Contains: Cargo manifest, subprocess supervisor logic, and reference checking.
+- Key files: `bench/rig/src/main.rs`, `bench/rig/RIG.md`
+
+**bench/spikes/:**
+- Purpose: Holds discrete architecture experimentation paths and new backend developments.
+- Contains: `unified-rt` (CUDA/Vulkan/M1 exact-match execution) and `ane-minilm` (Apple Neural Engine CoreML conversion) spikes.
+- Key files: `bench/spikes/unified-rt/src/main.rs`, `bench/spikes/unified-rt/src/vulkan_backend.rs`, `bench/spikes/unified-rt/src/cuda_backend.rs`
 
 **bench/eval-coir/:**
 - Purpose: Hosts the CoIR retrieval and rerank quality evaluation harness.

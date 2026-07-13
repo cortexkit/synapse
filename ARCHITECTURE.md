@@ -16,10 +16,10 @@
 ## Layers
 
 **Synapse SubC Module (`synapse-module`):**
-- Purpose: The main service listening on the SubC bus. Handles route binding, job admission, the model cache, remote provider dispatch, and worker lifecycle supervision.
+- Purpose: The main service listening on the SubC bus. Handles route binding, job admission, the model cache, remote provider dispatch, worker lifecycle supervision, and in-process execution via the owned engine.
 - Location: `crates/synapse-module`
-- Contains: A 3-class aging scheduler, SQLite durable job and cache lease state, machine probe certification logic, socket/pipe-based worker host, and the remote gateway client.
-- Depends on: `synapse-core`, `subc-client-rs`, `rusqlite`, `tokio`.
+- Contains: A 3-class aging scheduler, SQLite durable job and cache lease state, machine probe certification logic, socket/pipe-based worker host, the remote gateway client, and direct bindings to `synapse-engine-owned`.
+- Depends on: `synapse-core`, `synapse-engine-owned`, `subc-client-rs`, `rusqlite`, `tokio`.
 
 **Remote Gateway (`synapse-module/src/remote`):**
 - Purpose: Executes remote provider dispatch through interactive-first turnover pools, circuit breakers, and loopback-verified clients.
@@ -27,10 +27,17 @@
 - Contains: `ProviderRuntime`, client dispatch, vault credential management via `cortexkit-credentials` SubC route, HTTP validators, mock provider e2e, and checkpoint-driven continuity logic.
 - Depends on: `synapse-core`, `subc-client-rs`, `reqwest`.
 
+**Synapse Owned Engine (`synapse-engine-owned`):**
+- Purpose: Primary in-process execution engine for Apple Silicon (macOS), providing exact-match Metal MPSGraph inference for ModernBERT, Qwen3, and MiniLM models. 
+- Location: `crates/synapse-engine-owned`
+- Contains: Rust-to-Objective-C bindings, Metal shader graphs, and tensor operations for embedding and reranking. The module stays the sole tokenizer owner; this engine strictly consumes canonical token IDs and executes tensor logic.
+- Depends on: `synapse-core`, `safetensors`, `half`, Apple's `Metal` and `MPSGraph` frameworks.
+- Used by: `synapse-module` as the primary local engine.
+
 **Synapse Worker Lanes (`synapse-worker-*`):**
 - Purpose: Execute in-memory tokenization, tensor forward passes, and pooling for specific hardware classes (Apple Silicon MLX, Apple Neural Engine, Llama GGUF).
 - Location: `crates/synapse-worker-mlx`, `crates/synapse-worker-ane`, `crates/synapse-worker-llama`
-- Contains: Metal-accelerated customized MLX models, CoreML graphs, and `llama.cpp` inference processes.
+- Contains: Metal-accelerated customized MLX models, CoreML graphs (including the `gte-modernbert` embedder and reranker for the ANE quiet-tier), and `llama.cpp` inference processes.
 - Depends on: `synapse-core`, `mlx-rs`, `coreml` (via Swift), `reqwest`.
 - Used by: The `synapse-module` host spawning them dynamically based on user requests and capability tiers.
 
@@ -46,11 +53,18 @@
 - Depends on: `clap`, `serde`, `serde_json`, `tokenizers`, `reqwest`.
 - Used by: All inference lanes (compiled as the `synapse-bench` library dependency).
 
+**Benchmark Measurement Rig (`synapse-rig`):**
+- Purpose: A hash-pinned external measurement harness split out of the candidate tree. Drives candidate inference as a subprocess to guarantee strict execution walls, exact tokenizer application, canonical token accounting, and un-tampered semantic parity metrics.
+- Location: `bench/rig`
+- Contains: Length-prefixed JSON stdio framing protocol (`rig_protocol.rs`), exact-shape tokenizer constraints, canonical throughput calculation, and result schema enforcement.
+- Depends on: `synapse-core`, `tokenizers`, `serde_json`.
+- Used by: All modern lane runners evaluating throughput, correctness, or parity on candidate backends.
+
 **Native Engine Inference Lanes:**
 - Purpose: Execute in-memory tokenization, tensor forward passes, and pooling over target platforms.
-- Location: `bench/lanes/ort-embed`, `bench/lanes/mlx`, `bench/lanes/burn`, `bench/lanes/mlx-minilm`, `bench/lanes/ts-embed`, `bench/lanes/potion`
-- Contains: Bounded-thread ONNX Runtime embedding logic, Metal-accelerated MLX custom model implementations (including Qwen3's attention layers and length-uniform batch sorting), WGPU-based Burn ONNX imports, python-based MLX community/source loading, Model2Vec static embedding (`potion-code-16M`), and TypeScript (Transformers.js or native `onnxruntime-node`) setups.
-- Depends on: `bench/harness` (for Rust crates), target runtime libraries (`ort`, `mlx-rs`, `burn`, `@huggingface/transformers`, `mlx-embeddings`, `model2vec`), and `tokenizers`.
+- Location: `bench/lanes/ort-embed`, `bench/lanes/mlx`, `bench/lanes/burn`, `bench/lanes/mlx-minilm`, `bench/lanes/ts-embed`, `bench/lanes/potion`, `bench/spikes/unified-rt`
+- Contains: Bounded-thread ONNX Runtime embedding logic, Metal-accelerated MLX custom model implementations, unified-rt candidate implementations (Vulkan cooperative-matrix/plain shaders on RDNA3, CUDA cuBLASLt fused graphs on NVIDIA), WGPU-based Burn ONNX imports, python-based MLX community/source loading, Model2Vec static embedding (`potion-code-16M`), and TypeScript setups.
+- Depends on: `bench/harness` or `bench/rig`, target runtime libraries (`ort`, `mlx-rs`, `vulkano`, `cudarc`), and `tokenizers`.
 - Used by: The benchmark suite runners `bench/run-matrix.sh` and `bench/run-night.sh`.
 
 **Supervised Child Server Lane:**
@@ -102,10 +116,10 @@
 
 **Inference and Numerical Parity Check:**
 
-1. Parse arguments, load weights/servers, configure tokenizers, and execute a warmup batch — `bench/lanes/*/src/main.rs` (Rust), `bench/lanes/mlx-minilm/main.py` (Python), `bench/lanes/ts-embed/main.mjs` (JS), `bench/lanes/potion/main.py` (Python)
-2. Divide inputs and run model forward execution under token-budget or attention-unit batch limits (optionally sorting inputs by token count to prevent padding waste) — `bench/lanes/*/src/main.rs` (Rust), `bench/lanes/mlx-minilm/main.py` (Python), `bench/lanes/ts-embed/main.mjs` (JS), `bench/lanes/potion/main.py` (Python)
-3. Calculate mean cosine similarity of produced output vectors against the `ort-cpu` baseline reference — `bench/harness/src/parity.rs`
-4. Calculate top-k neighbor overlap metrics to check for rank stability against the reference lane — `bench/harness/src/parity.rs`
+1. Launch `synapse-rig` which spawns the target inference candidate as a subprocess over stdio, or run a legacy native lane script directly — `bench/rig/src/main.rs` or `bench/lanes/*/src/main.rs`
+2. The rig or legacy lane parser prepares inputs. For rig runs, the rig sends batched length-prefixed JSON frames (`prepare_shapes`, `embed`) to the candidate.
+3. The candidate returns vector arrays. The rig ensures exact canonical token accounting independent of the candidate padding tricks.
+4. Calculate mean cosine similarity of produced output vectors against the `ort-cpu` baseline reference, and top-k neighbor overlap metrics to check for rank stability — `bench/harness/src/parity.rs`
 5. Write results structured in the `LaneResult` schema to the output results JSON — `bench/harness/src/results.rs`
 
 **CoIR Retrieval Evaluation Flow:**
@@ -116,10 +130,10 @@
 
 **Reranking Quality Check Flow:**
 
-1. Spawn `llama-server` with `--rerank` argument — `bench/lanes/llama/src/main.rs`
-2. Submit batch query and document pairs to the `/v1/rerank` endpoint, accumulating server-reported prompt token counts — `bench/lanes/llama/src/main.rs`
+1. Start `synapse-rig` targeting a candidate backend (such as `unified-rt` or `llama-server`) with `--rerank-requests` — `bench/rig/src/main.rs`
+2. The rig submits length-prefixed JSON batches of query-document pairs to the candidate, accumulating strict canonical real-token counts — `bench/rig/src/main.rs`
 3. Generate reference scores using Hugging Face reference implementation (`Alibaba-NLP/gte-reranker-modernbert-base`) — `bench/eval-coir/reference_rerank.py`
-4. Compare candidate rerank scores against the reference scores to calculate delta/drift — `bench/eval-coir/compare_rerank_scores.py`
+4. The rig automatically calculates Pearson correlation and tie-aware top-1 overlap against reference scores, rejecting the candidate if it drifts below the `.999` and `.98` thresholds.
 
 ## Key Abstractions
 
@@ -184,6 +198,11 @@
 - Location: `bench/harness/src/main.rs`
 - Triggers: Execution of the `synapse-bench` binary.
 - Responsibilities: Routes commands to either chunk source files into a corpus, execute telemetry-monitored child commands, or calculate top-k neighbor rank-overlap parity.
+
+**Benchmark Measurement Rig (`synapse-rig`):**
+- Location: `bench/rig/src/main.rs`
+- Triggers: Direct invocation by orchestrators during candidate evaluation and performance testing.
+- Responsibilities: External measurement harness, bounding execution timings, hashing candidates for validation, enforcing gate thresholds for parity and padding waste, and generating `LaneResult` json.
 
 **Inference Lane Runners:**
 - Location: `bench/lanes/ort-embed/src/main.rs`, `bench/lanes/wrap-embed/src/main.rs`, `bench/lanes/llama/src/main.rs`, `bench/lanes/mlx/src/main.rs`, `bench/lanes/burn/src/main.rs` (Rust crates); `bench/lanes/mlx-minilm/main.py` (Python script); `bench/lanes/ts-embed/main.mjs` (TypeScript script); `bench/lanes/potion/main.py` (Python script)

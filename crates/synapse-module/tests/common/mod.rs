@@ -39,10 +39,20 @@ pub async fn connect_consumer(connection_file_path: &Path) -> TcpStream {
     stream
 }
 
+/// A bound route as the raw-frame tests address it: the daemon-assigned
+/// channel plus the per-slot binding epoch that wire v2 requires in every
+/// frame header on that route (channel 0 is fixed at epoch 0).
+#[derive(Clone, Copy, Debug)]
+pub struct TestRoute {
+    pub channel: u16,
+    pub epoch: u32,
+}
+
 pub async fn control_rpc(stream: &mut TcpStream, corr: u64, body: Value) -> Frame {
     let frame = Frame::build(
         FrameType::Request,
         Flags::new(false, Priority::Passive, false),
+        0,
         0,
         corr,
         serde_json::to_vec(&body).unwrap(),
@@ -75,7 +85,7 @@ pub async fn read_frame_timeout(stream: &mut TcpStream) -> Frame {
     .expect("timed out waiting for a frame")
 }
 
-pub async fn route_open(stream: &mut TcpStream, project_root: &Path, corr: u64) -> u16 {
+pub async fn route_open(stream: &mut TcpStream, project_root: &Path, corr: u64) -> TestRoute {
     let mut last_error = String::new();
     for attempt in 0..10 {
         let target = RouteTarget::ManagementSurface {
@@ -100,7 +110,10 @@ pub async fn route_open(stream: &mut TcpStream, project_root: &Path, corr: u64) 
         match frame.header.ty {
             FrameType::Response => {
                 let value: Value = serde_json::from_slice(&frame.body).unwrap();
-                return value["route_channel"].as_u64().unwrap() as u16;
+                return TestRoute {
+                    channel: value["route_channel"].as_u64().unwrap() as u16,
+                    epoch: value["route_epoch"].as_u64().unwrap() as u32,
+                };
             }
             FrameType::Error if is_module_timeout(&frame.body) && attempt < 9 => {
                 last_error = String::from_utf8_lossy(&frame.body).to_string();
@@ -127,11 +140,11 @@ fn is_module_timeout(body: &[u8]) -> bool {
 
 pub async fn route_request(
     stream: &mut TcpStream,
-    route_channel: u16,
+    route: TestRoute,
     corr: u64,
     body: Value,
 ) -> Value {
-    let frame = raw_route_frame(stream, route_channel, corr, body).await;
+    let frame = raw_route_frame(stream, route, corr, body).await;
     match frame.header.ty {
         FrameType::Response => serde_json::from_slice(&frame.body).unwrap(),
         FrameType::Error => panic!(
@@ -144,14 +157,15 @@ pub async fn route_request(
 
 pub async fn raw_route_frame(
     stream: &mut TcpStream,
-    route_channel: u16,
+    route: TestRoute,
     corr: u64,
     body: Value,
 ) -> Frame {
     let frame = Frame::build(
         FrameType::Request,
         Flags::new(false, Priority::Interactive, false),
-        route_channel,
+        route.channel,
+        route.epoch,
         corr,
         serde_json::to_vec(&body).unwrap(),
     )
