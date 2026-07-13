@@ -1,0 +1,17 @@
+{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "@synapse-tools/gather-distill",
+      "dependencies": {
+        "@cortexkit/anthropic-auth-core": "file:../../../anthropic-auth/packages/core",
+      },
+    },
+  },
+  "packages": {
+    "@cortexkit/anthropic-auth-core": ["@cortexkit/anthropic-auth-core@file:../../../anthropic-auth/packages/core", { "dependencies": { "xxhash-wasm": "^1.1.0" } }],
+
+    "xxhash-wasm": ["xxhash-wasm@1.1.0", "", {}, "sha512-147y/6YNh+tlp6nd/2pWq38i9h6mz/EuQ6njIrmW8D1BS5nCqs0P6DG+m6zTGnNz5I+uhZ0SHxBs9BsPrwcKDA=="],
+  }
+}
