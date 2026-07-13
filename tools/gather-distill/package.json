@@ -1,0 +1,9 @@
+{
+  "name": "@synapse-tools/gather-distill",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun run src/cli.ts",
+    "test": "bun test"
+  }
+}
