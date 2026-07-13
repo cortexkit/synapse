@@ -61,6 +61,8 @@ export interface TrajectoryMessage {
 }
 
 export interface BankedRow {
+  /** Present on newly banked rows; older campaign rows are matched by repo, SHA, and request. */
+  job_id?: string;
   request: string;
   repo_full: string;
   repo_sha: string;
@@ -72,6 +74,8 @@ export interface BankedRow {
   output_tokens: number;
   cache_creation_input_tokens: number;
   cache_read_input_tokens: number;
+  /** Tokens spent inside local-model reasoning blocks when the server exposes or the harness estimates them. */
+  thinking_tokens: number;
   model: string;
   account: string;
   ts: string;

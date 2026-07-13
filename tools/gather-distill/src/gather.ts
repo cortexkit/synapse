@@ -1,5 +1,6 @@
 import { AccountPool, type AccountLease } from "./auth.ts";
 import { AccountRejectedError, assistantText, sendMessage, type MessageResponse } from "./anthropic.ts";
+import { sendOpenAiMessage } from "./openai.ts";
 import {
   assertProductionFinalizeMode,
   gatherToolCallBudget,
@@ -16,10 +17,15 @@ import type {
   GatherJob,
   TrajectoryMessage,
 } from "./types.ts";
-import { parseJsonText } from "./utils.ts";
+import { parseJsonText, stableJobId } from "./utils.ts";
 import { validateBankedRow } from "./validate.ts";
 
+export type GatherBackend = "anthropic" | "openai";
+
 export interface GatherOptions {
+  backend?: GatherBackend;
+  baseUrl?: string;
+  requestTimeoutMs?: number;
   model?: string;
   maxSteps?: number;
   maxPackageTokens?: number;
@@ -41,6 +47,10 @@ function toolUses(content: AnthropicContentBlock[]): Array<Extract<AnthropicCont
   );
 }
 
+function ignoredOpenAiFinalizeToolCall(content: AnthropicContentBlock[]): boolean {
+  return toolUses(content).length > 0 || /<(?:function|tool_call)\b/i.test(assistantText(content));
+}
+
 function parseFinal(response: MessageResponse): { finalJson: GatherFinalJson | null; error?: string } {
   try {
     const parsed = parseJsonText(assistantText(response.content));
@@ -51,11 +61,17 @@ function parseFinal(response: MessageResponse): { finalJson: GatherFinalJson | n
   }
 }
 
+function modelForBackend(backend: GatherBackend, requested: string | undefined): string {
+  return requested ?? (backend === "openai" ? "local-model" : "claude-opus-4-8");
+}
+
 export async function runGatherJob(job: GatherJob, options: GatherOptions = {}): Promise<BankedRow> {
+  const backend = options.backend ?? "anthropic";
   const maxSteps = options.maxSteps ?? 40;
   const maxPackageTokens = options.maxPackageTokens ?? 40_000;
   const tokenCeiling = options.tokenCeiling ?? 200_000;
   const maxResponseTokens = options.maxResponseTokens ?? 8_000;
+  const model = modelForBackend(backend, options.model);
   const finalizeMode = options.finalizeMode ?? "tool_choice_none_full_toolset";
   assertProductionFinalizeMode(finalizeMode);
   const budget = gatherToolCallBudget(maxSteps);
@@ -64,12 +80,13 @@ export async function runGatherJob(job: GatherJob, options: GatherOptions = {}):
   const trajectory: TrajectoryMessage[] = [
     { role: "user", content: userPrompt(job, manifest.sha, maxSteps, maxPackageTokens) },
   ];
-  const pool = options.pool ?? new AccountPool();
-  let lease: AccountLease = await pool.acquire();
+  const pool = backend === "anthropic" ? options.pool ?? new AccountPool() : undefined;
+  let lease: AccountLease | undefined = pool ? await pool.acquire() : undefined;
   let inputTokens = 0;
   let outputTokens = 0;
   let cacheCreationTokens = 0;
   let cacheReadTokens = 0;
+  let thinkingTokens = 0;
   let toolCallCount = 0;
   const firedNudges = new Set<number>();
   let finalJson: GatherFinalJson | null = null;
@@ -77,25 +94,39 @@ export async function runGatherJob(job: GatherJob, options: GatherOptions = {}):
   let budgetOutcome: BankedRow["budget_outcome"] = "natural";
 
   const callModel = async (finalize = false): Promise<MessageResponse> => {
+    const request = {
+      model,
+      max_tokens: maxResponseTokens,
+      system: loadGatherSystemPrompt(),
+      messages: trajectory,
+      tools: GATHER_TOOLS,
+      tool_choice: finalize ? ({ type: "none" } as const) : undefined,
+    };
+    const recordUsage = (response: MessageResponse): MessageResponse => {
+      inputTokens += response.usage.input_tokens;
+      outputTokens += response.usage.output_tokens;
+      cacheCreationTokens += response.usage.cache_creation_input_tokens;
+      cacheReadTokens += response.usage.cache_read_input_tokens;
+      thinkingTokens += response.usage.thinking_tokens;
+      return response;
+    };
+
+    if (backend === "openai") {
+      return recordUsage(
+        await sendOpenAiMessage(request, {
+          baseUrl: options.baseUrl,
+          requestTimeoutMs: options.requestTimeoutMs,
+        }),
+      );
+    }
+
     for (;;) {
       try {
-        const response = await sendMessage(lease.credential, {
-          model: options.model ?? "claude-opus-4-8",
-          max_tokens: maxResponseTokens,
-          system: loadGatherSystemPrompt(),
-          messages: trajectory,
-          tools: GATHER_TOOLS,
-          tool_choice: finalize ? { type: "none" } : undefined,
-        });
-        inputTokens += response.usage.input_tokens;
-        outputTokens += response.usage.output_tokens;
-        cacheCreationTokens += response.usage.cache_creation_input_tokens;
-        cacheReadTokens += response.usage.cache_read_input_tokens;
-        return response;
+        return recordUsage(await sendMessage(lease!.credential, request));
       } catch (error) {
         if (!(error instanceof AccountRejectedError)) throw error;
-        await pool.coolDown(lease);
-        lease = await pool.acquire();
+        await pool!.coolDown(lease!);
+        lease = await pool!.acquire();
       }
     }
   };
@@ -141,18 +172,24 @@ export async function runGatherJob(job: GatherJob, options: GatherOptions = {}):
       trajectory.push({ role: "user", content: budget.finalize_text, synthetic: "budget_finalize" });
       const response = await callModel(true);
       trajectory.push({ role: "assistant", content: response.content });
-      const parsed = parseFinal(response);
-      finalJson = parsed.finalJson;
-      reason = parsed.error;
+      if (backend === "openai" && ignoredOpenAiFinalizeToolCall(response.content)) {
+        // A local server ignored tool_choice:none. Do not execute another tool turn after the budget cap.
+        reason = "budget_finalize: OpenAI-compatible server returned tool calls despite tool_choice:none";
+      } else {
+        const parsed = parseFinal(response);
+        finalJson = parsed.finalJson;
+        reason = parsed.error;
+      }
     }
   } catch (error) {
     budgetOutcome = "api_error";
     reason = error instanceof Error ? error.message : String(error);
   } finally {
-    pool.release(lease);
+    if (pool && lease) pool.release(lease);
   }
 
   const row: BankedRow = {
+    job_id: stableJobId(job.dir, job.request),
     request: job.request,
     repo_full: manifest.fullName,
     repo_sha: manifest.sha,
@@ -164,8 +201,9 @@ export async function runGatherJob(job: GatherJob, options: GatherOptions = {}):
     output_tokens: outputTokens,
     cache_creation_input_tokens: cacheCreationTokens,
     cache_read_input_tokens: cacheReadTokens,
-    model: options.model ?? "claude-opus-4-8",
-    account: lease.credential.name,
+    thinking_tokens: thinkingTokens,
+    model,
+    account: backend === "openai" ? "local" : lease!.credential.name,
     ts: new Date().toISOString(),
     valid: false,
     reason,
@@ -183,10 +221,12 @@ export async function runGatherJob(job: GatherJob, options: GatherOptions = {}):
 export async function failedGatherJob(
   job: GatherJob,
   reason: string,
-  options: Pick<GatherOptions, "model"> = {},
+  options: Pick<GatherOptions, "backend" | "model"> = {},
 ): Promise<BankedRow> {
+  const backend = options.backend ?? "anthropic";
   const manifest = await loadManifest(job.dir);
   return {
+    job_id: stableJobId(job.dir, job.request),
     request: job.request,
     repo_full: manifest.fullName,
     repo_sha: manifest.sha,
@@ -198,8 +238,9 @@ export async function failedGatherJob(
     output_tokens: 0,
     cache_creation_input_tokens: 0,
     cache_read_input_tokens: 0,
-    model: options.model ?? "claude-opus-4-8",
-    account: "aft-warmup",
+    thinking_tokens: 0,
+    model: modelForBackend(backend, options.model),
+    account: backend === "openai" ? "local" : "aft-warmup",
     ts: new Date().toISOString(),
     valid: false,
     reason,
