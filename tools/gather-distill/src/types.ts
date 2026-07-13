@@ -70,6 +70,8 @@ export interface BankedRow {
   budget_outcome: "natural" | "budget_finalize" | "api_error" | "invalid_final";
   input_tokens: number;
   output_tokens: number;
+  cache_creation_input_tokens: number;
+  cache_read_input_tokens: number;
   model: string;
   account: string;
   ts: string;

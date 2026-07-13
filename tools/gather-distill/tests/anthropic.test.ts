@@ -40,14 +40,25 @@ test("OAuth messages impersonate Claude Code and preserve the gather prompt", as
 
     const bodyText = String(oauthInit.body);
     const body = JSON.parse(bodyText);
+    // system layout: [billing, identity, gatherPrompt] with a 5m cache
+    // breakpoint on the stable trailing prompt block.
     expect(body.system).toEqual([
       { type: "text", text: expect.stringContaining("x-anthropic-billing-header: ") },
       { type: "text", text: CLAUDE_CODE_IDENTITY },
-      { type: "text", text: prompt },
+      { type: "text", text: prompt, cache_control: { type: "ephemeral" } },
     ]);
     expect(body.system[0].text).toMatch(/\bcch=[0-9a-f]{5};/);
     expect(bodyText).not.toContain("cch=00000;");
-    expect(body.tools).toEqual(GATHER_TOOLS);
+    // tools preserved with a 5m cache breakpoint on the last (stable) tool.
+    expect(body.tools).toEqual(
+      GATHER_TOOLS.map((tool, index) =>
+        index === GATHER_TOOLS.length - 1 ? { ...tool, cache_control: { type: "ephemeral" } } : tool,
+      ),
+    );
+    // the growing message prefix is anchored on the last user block.
+    const lastMessage = body.messages[body.messages.length - 1];
+    const lastBlock = lastMessage.content[lastMessage.content.length - 1];
+    expect(lastBlock.cache_control).toEqual({ type: "ephemeral" });
     expect(body.tool_choice).toEqual({ type: "none" });
     expect(createHash("sha256").update(prompt).digest("hex")).toBe(
       "c87b1aa778e1bbb742f8bb076bb11944d26ed19ddcdb1a1241e07cfbff2707b1",
@@ -66,7 +77,10 @@ test("OAuth messages impersonate Claude Code and preserve the gather prompt", as
     const apiHeaders = new Headers(apiInit.headers);
     expect(apiHeaders.get("x-api-key")).toBe("test-api-key");
     expect(apiHeaders.has("authorization")).toBeFalse();
-    expect(JSON.parse(String(apiInit.body)).system).toBe(prompt);
+    // the api-key path also caches: the system string becomes a single cached block.
+    expect(JSON.parse(String(apiInit.body)).system).toEqual([
+      { type: "text", text: prompt, cache_control: { type: "ephemeral" } },
+    ]);
   } finally {
     globalThis.fetch = originalFetch;
   }

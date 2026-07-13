@@ -68,6 +68,8 @@ export async function runGatherJob(job: GatherJob, options: GatherOptions = {}):
   let lease: AccountLease = await pool.acquire();
   let inputTokens = 0;
   let outputTokens = 0;
+  let cacheCreationTokens = 0;
+  let cacheReadTokens = 0;
   let toolCallCount = 0;
   const firedNudges = new Set<number>();
   let finalJson: GatherFinalJson | null = null;
@@ -87,6 +89,8 @@ export async function runGatherJob(job: GatherJob, options: GatherOptions = {}):
         });
         inputTokens += response.usage.input_tokens;
         outputTokens += response.usage.output_tokens;
+        cacheCreationTokens += response.usage.cache_creation_input_tokens;
+        cacheReadTokens += response.usage.cache_read_input_tokens;
         return response;
       } catch (error) {
         if (!(error instanceof AccountRejectedError)) throw error;
@@ -158,6 +162,8 @@ export async function runGatherJob(job: GatherJob, options: GatherOptions = {}):
     budget_outcome: budgetOutcome,
     input_tokens: inputTokens,
     output_tokens: outputTokens,
+    cache_creation_input_tokens: cacheCreationTokens,
+    cache_read_input_tokens: cacheReadTokens,
     model: options.model ?? "claude-opus-4-8",
     account: lease.credential.name,
     ts: new Date().toISOString(),
@@ -190,6 +196,8 @@ export async function failedGatherJob(
     budget_outcome: "api_error",
     input_tokens: 0,
     output_tokens: 0,
+    cache_creation_input_tokens: 0,
+    cache_read_input_tokens: 0,
     model: options.model ?? "claude-opus-4-8",
     account: "aft-warmup",
     ts: new Date().toISOString(),

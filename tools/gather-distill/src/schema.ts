@@ -5,9 +5,11 @@ import { isRecord } from "./utils.ts";
 const OMISSION_REASONS = new Set(["budget", "empty_result", "skipped_candidate", "depth_limit"]);
 const SPECIFICITIES = new Set(["low", "med", "high"]);
 
-function exactKeys(value: Record<string, unknown>, keys: string[], at: string, errors: string[]): void {
-  const expected = new Set(keys);
-  for (const key of Object.keys(value)) if (!expected.has(key)) errors.push(`${at}.${key}: unexpected field`);
+// Production parity: alfonso-core's serde structs (evidence/types.rs) do NOT
+// set deny_unknown_fields, so extra fields the model invents are silently
+// ignored by the real consumer. Rejecting them here would discard packages
+// production accepts. Require the known fields; tolerate extras.
+function requiredKeys(value: Record<string, unknown>, keys: string[], at: string, errors: string[]): void {
   for (const key of keys) if (!(key in value)) errors.push(`${at}.${key}: missing field`);
 }
 
@@ -22,7 +24,7 @@ function nonEmptyString(value: unknown, at: string, errors: string[]): value is 
 export function validateFinalJson(value: unknown): { valid: boolean; errors: string[]; value?: GatherFinalJson } {
   const errors: string[] = [];
   if (!isRecord(value)) return { valid: false, errors: ["final_json: expected an object"] };
-  exactKeys(value, ["interpretation", "scope", "snippets", "omissions"], "final_json", errors);
+  requiredKeys(value, ["interpretation", "scope", "snippets", "omissions"], "final_json", errors);
   nonEmptyString(value.interpretation, "final_json.interpretation", errors);
   if (!Array.isArray(value.scope)) errors.push("final_json.scope: expected an array");
   else value.scope.forEach((item, index) => nonEmptyString(item, `final_json.scope[${index}]`, errors));
@@ -31,7 +33,7 @@ export function validateFinalJson(value: unknown): { valid: boolean; errors: str
     value.snippets.forEach((item, index) => {
       const at = `final_json.snippets[${index}]`;
       if (!isRecord(item)) return errors.push(`${at}: expected an object`);
-      exactKeys(item, ["path", "startLine", "endLine", "why"], at, errors);
+      requiredKeys(item, ["path", "startLine", "endLine", "why"], at, errors);
       if (nonEmptyString(item.path, `${at}.path`, errors)) {
         if (item.path.startsWith("/") || item.path.split(/[\\/]/).includes("..")) {
           errors.push(`${at}.path: expected a repository-relative path without '..'`);
@@ -51,7 +53,7 @@ export function validateFinalJson(value: unknown): { valid: boolean; errors: str
     value.omissions.forEach((item, index) => {
       const at = `final_json.omissions[${index}]`;
       if (!isRecord(item)) return errors.push(`${at}: expected an object`);
-      exactKeys(item, ["what", "why", "detail"], at, errors);
+      requiredKeys(item, ["what", "why", "detail"], at, errors);
       nonEmptyString(item.what, `${at}.what`, errors);
       if (!OMISSION_REASONS.has(String(item.why))) errors.push(`${at}.why: invalid omission reason`);
       nonEmptyString(item.detail, `${at}.detail`, errors);
