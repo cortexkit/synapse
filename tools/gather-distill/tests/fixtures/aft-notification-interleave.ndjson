@@ -1,0 +1,4 @@
+{"type":"status_changed","session_id":null,"snapshot":{"search_index":{"status":"building"}}}
+{"type":"configure_warnings","session_id":"trainer","warnings":[]}
+{"id":"unsolicited","success":true,"text":"unmatched frame"}
+{"id":"2","success":true,"text":"id-matched tool result"}

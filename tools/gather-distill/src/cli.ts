@@ -137,13 +137,20 @@ async function gatherCommand(args: ParsedArgs): Promise<void> {
   const model = one(args, "model", "claude-opus-4-8");
   const aftPool = new AftClientPool(concurrency);
   const warmups = new AftWarmupCoordinator();
+  const reportedWarmupWarnings = new Set<string>();
   const aftRetries = new Map<string, number>();
   let cursor = 0;
   let bankChain = Promise.resolve();
 
-  const bank = async (job: GatherJob, row: BankedRow, duration: number, index: number): Promise<void> => {
+  const bank = async (
+    job: GatherJob,
+    row: BankedRow,
+    duration: number,
+    index: number,
+    warnings: string[] = [],
+  ): Promise<void> => {
     bankChain = bankChain.then(async () => {
-      await appendBankedResult(rowsPath, ledgerPath, job, row, duration);
+      await appendBankedResult(rowsPath, ledgerPath, job, row, duration, warnings);
       await updateBurnRate(rowsPath, statusPath);
       console.log(JSON.stringify({ lane: "gather", job: index, total: queue.length, row }));
     });
@@ -157,18 +164,33 @@ async function gatherCommand(args: ParsedArgs): Promise<void> {
       if (!job) return;
       const started = Date.now();
       let skippedForWarmup = false;
+      let ledgerWarnings: string[] = [];
       const row = await aftPool.withClient(job.dir, async (aftClient) => {
         const warmup = await warmups.ensureWarmed(job.dir, aftClient);
         if (!warmup.ok) {
           skippedForWarmup = true;
           const timeout = warmup.timedOut || warmup.durationMs >= AFT_WARMUP_TIMEOUT_MS;
           const queueNote = timeout
-            ? "AFT warm-up exceeded five minutes; skipped repository"
+            ? "AFT warm-up request exceeded its timeout; skipped repository"
             : "AFT warm-up failed; skipped repository";
           console.warn(
             JSON.stringify({ lane: "gather", queue_note: queueNote, repo: job.dir, duration_ms: warmup.durationMs, error: warmup.error }),
           );
           return failedGatherJob(job, `AFT warm-up: ${warmup.error ?? queueNote}`, { model });
+        }
+        if (warmup.warning && !reportedWarmupWarnings.has(job.dir)) {
+          reportedWarmupWarnings.add(job.dir);
+          ledgerWarnings = [warmup.warning];
+          console.warn(
+            JSON.stringify({
+              lane: "gather",
+              queue_note: "AFT SEARCH INDEX WARM-UP TIMED OUT; PROCEEDING COLD",
+              repo: job.dir,
+              duration_ms: warmup.durationMs,
+              search_attempts: warmup.searchAttempts,
+              warning: warmup.warning,
+            }),
+          );
         }
         return runGatherJob(job, {
           pool,
@@ -185,7 +207,7 @@ async function gatherCommand(args: ParsedArgs): Promise<void> {
         });
       });
       const duration = Date.now() - started;
-      await bank(job, row, duration, index + 1);
+      await bank(job, row, duration, index + 1, ledgerWarnings);
 
       const retryKey = stableJobId(job.dir, job.request);
       const retries = aftRetries.get(retryKey) ?? 0;

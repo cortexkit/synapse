@@ -11,7 +11,7 @@ Standalone Bun/TypeScript data generation for the production gatherer contract. 
 
 ## AFT NDJSON integration
 
-The harness starts `bin/aft-v0.46.0` directly with no command-line arguments and uses newline-delimited JSON on stdin/stdout. It configures each repository before use with `harness: "opencode"`, `session_id: "trainer"`, `semantic_search: false`, `search_index: true`, and `storage_dir: "/tmp/gather-campaign-aft"`.
+The harness starts `bin/aft-v0.46.0` directly with no command-line arguments and uses newline-delimited JSON on stdin/stdout. It configures each repository before use with `harness: "opencode"` and `session_id: "trainer"`. The core flags `semantic_search: false` and `search_index: true` are encoded in v0.46.0's inline user-tier config document, while `storage_dir: "/tmp/gather-campaign-aft"` is a top-level configure field.
 
 The model receives the same bare production declarations as the gather sender at commit `3ff7970`: `search`, `outline`, `zoom`, `callgraph`, `read`, `grep`, `glob`, `inspect`, and `conflicts`. `src/aft-tool-catalog.ts` is the verbatim v0.46.0 schema catalog for those declarations. The v0.46.0 NDJSON wire manifest uses those same bare names. AFT response `text` is sent to the model verbatim; the harness never JSON-wraps, trims, or drops a trailing AFT status line. In particular, lexical-only search disclosures remain in trajectories.
 
@@ -33,7 +33,7 @@ bin/aft-v0.46.0 --version
 
 A small AFT process pool is bounded by gather concurrency. It keeps one process for each active repository and reconfigures the least-recently-used idle process when work moves to another clone. The harness starts the AFT binary directly, then best-effort lowers only that child process's priority with `renice 19`; platforms that deny `renice` continue without changing the harness process priority.
 
-Before the queue opens, a scratch-repository canary sends `search` and requires `Semantic search unavailable; returning lexical-only fallback results.` in the returned text. Before the first job for each corpus repository, the worker configures AFT and warms it with `glob README*`. A warm-up that reaches five minutes is ledgered as a failed, retryable job and the repository is skipped with a queue note. Callgraph storage is never pre-warmed: giant repositories build it only if a trajectory actually calls `callgraph`.
+Before the queue opens, a scratch-repository canary sends `search` and requires `Semantic search unavailable; returning lexical-only fallback results.` in the returned text. Before the first job for each corpus repository, the worker configures AFT and retries a real `search` with exponential backoff until the trigram index stops reporting a fully degraded fallback. The default wait is bounded at 60 seconds; a repository that remains cold is logged loudly and its first job ledger entry records a warning, but gathering proceeds so the campaign cannot hang. Callgraph storage is never explicitly pre-warmed: giant repositories build it only through AFT's own configure maintenance or if a trajectory calls `callgraph`.
 
 A request timeout resets a wedged child and retries once after respawn. If the retry cannot recover, the failed row is ledgered and the gather queue retries that job once without ending the campaign.
 
