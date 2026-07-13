@@ -1,0 +1,12 @@
+{
+  "accounts": [
+    {
+      "name": "acct1",
+      "access_token": "replace-with-operator-managed-oauth-token"
+    },
+    {
+      "name": "acct2",
+      "access_token": "replace-with-operator-managed-oauth-token"
+    }
+  ]
+}
