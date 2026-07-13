@@ -49,3 +49,24 @@ describe("citation validation", () => {
     expect(errors).toEqual(["final_json.snippets[0]: trajectory snippet bytes do not match the pinned clone"]);
   });
 });
+
+import { parseJsonText } from "../src/utils.ts";
+
+test("parseJsonText extracts the fenced block after a prose preamble", () => {
+  const withPreamble = 'I have the complete picture across the client and server.\n\n```json\n{\n  "interpretation": "x",\n  "scope": ["a"],\n  "snippets": [],\n  "omissions": []\n}\n```';
+  const parsed = parseJsonText(withPreamble) as Record<string, unknown>;
+  expect(parsed.interpretation).toBe("x");
+  expect(parsed.scope).toEqual(["a"]);
+});
+
+test("parseJsonText prefers the last fenced block and tolerates a trailing sign-off", () => {
+  const multi = 'thinking:\n```json\n{"draft":true}\n```\nfinal:\n```json\n{"interpretation":"final","scope":[],"snippets":[],"omissions":[]}\n```\nDone.';
+  const parsed = parseJsonText(multi) as Record<string, unknown>;
+  expect(parsed.interpretation).toBe("final");
+});
+
+test("parseJsonText falls back to the outermost brace span when unfenced", () => {
+  const bare = 'Here it is: {"interpretation":"bare","scope":[],"snippets":[],"omissions":[]} thanks';
+  const parsed = parseJsonText(bare) as Record<string, unknown>;
+  expect(parsed.interpretation).toBe("bare");
+});

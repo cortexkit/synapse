@@ -7,8 +7,20 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
 
 export function parseJsonText(text: string): unknown {
   const trimmed = text.trim();
-  const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
-  return JSON.parse(fenced ? fenced[1] : trimmed);
+  // The model may emit a prose preamble ("I have the picture...") before a
+  // ```json fenced block, and/or a trailing sign-off — so the fence is not
+  // anchored to the whole string. Prefer the LAST fenced block (the final
+  // answer), then fall back to the outermost brace span, then the raw text.
+  const fences = [...trimmed.matchAll(/```(?:json)?\s*([\s\S]*?)\s*```/gi)];
+  if (fences.length > 0) {
+    return JSON.parse(fences[fences.length - 1]![1]!);
+  }
+  const firstBrace = trimmed.indexOf("{");
+  const lastBrace = trimmed.lastIndexOf("}");
+  if (firstBrace !== -1 && lastBrace > firstBrace) {
+    return JSON.parse(trimmed.slice(firstBrace, lastBrace + 1));
+  }
+  return JSON.parse(trimmed);
 }
 
 export async function readJsonl<T>(path: string): Promise<T[]> {
