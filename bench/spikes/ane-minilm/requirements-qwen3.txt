@@ -1,0 +1,7 @@
+# Qwen3 support begins in transformers 4.51; keep the proven conversion pair pinned.
+coremltools==8.3.0
+torch==2.5.1
+transformers==4.51.3
+tokenizers==0.21.0
+safetensors==0.5.3
+numpy==2.3.2
