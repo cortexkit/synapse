@@ -18,25 +18,41 @@ use super::{
 };
 
 #[derive(Debug, Deserialize)]
-struct Config {
-    hidden_size: usize,
-    intermediate_size: usize,
-    num_attention_heads: usize,
-    num_hidden_layers: usize,
-    num_key_value_heads: usize,
-    head_dim: usize,
-    rms_norm_eps: f32,
-    rope_theta: f32,
-    vocab_size: usize,
-    eos_token_id: Option<u32>,
+#[serde(untagged)]
+enum OneOrManyTokenIds {
+    One(u32),
+    Many(Vec<u32>),
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct GenerationConfig {
+    eos_token_id: Option<OneOrManyTokenIds>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct Config {
+    pub(crate) hidden_size: usize,
+    pub(crate) intermediate_size: usize,
+    pub(crate) num_attention_heads: usize,
+    pub(crate) num_hidden_layers: usize,
+    pub(crate) num_key_value_heads: usize,
+    pub(crate) head_dim: usize,
+    pub(crate) rms_norm_eps: f32,
+    pub(crate) rope_theta: f32,
+    pub(crate) vocab_size: usize,
+    #[serde(default)]
+    pub(crate) tie_word_embeddings: bool,
+    pub(crate) eos_token_id: Option<u32>,
 }
 
 pub(crate) struct Model {
-    config: Config,
-    eos_token_id: u32,
-    embeddings: Tensor,
+    pub(crate) config: Config,
+    pub(crate) eos_token_id: u32,
+    pub(crate) generation_stop_ids: Vec<u32>,
+    pub(crate) embeddings: Tensor,
     pub(crate) layers: Vec<Layer>,
-    final_norm: RmsNorm,
+    pub(crate) final_norm: RmsNorm,
+    pub(crate) lm_head: Option<Weight>,
 }
 
 pub(crate) struct Layer {
@@ -85,7 +101,7 @@ impl Model {
             "Qwen3 query heads must divide evenly across KV heads"
         );
         let tensors = load_safetensor_map(&root, path)?;
-        let embeddings = get_qwen_tensor(&tensors, "embed_tokens.weight")?;
+        let mut embeddings = get_qwen_tensor(&tensors, "embed_tokens.weight")?;
         ensure!(
             embeddings.shape == vec![config.vocab_size, config.hidden_size],
             "Qwen3 embedding shape {:?} does not match config",
@@ -126,7 +142,25 @@ impl Model {
             });
         }
         validate_layers(&config, &layers)?;
+        // Embedding-only Qwen3 snapshots legitimately omit lm_head. Causal-LM
+        // decode validates an untied head when the decode context is created.
+        let mut lm_head = if config.tie_word_embeddings {
+            None
+        } else {
+            load_weight(&tensors, "lm_head").ok()
+        };
+        if let Some(weight) = &lm_head {
+            ensure!(
+                weight.tensor.shape == vec![config.vocab_size, config.hidden_size],
+                "Qwen3 LM head shape {:?} does not match config",
+                weight.tensor.shape
+            );
+        }
         if matches!(precision, super::Precision::F16) {
+            embeddings.prepare_metal_f16();
+            if let Some(weight) = &mut lm_head {
+                weight.tensor.prepare_metal_f16();
+            }
             for layer in &mut layers {
                 layer.input_norm.weight.prepare_metal_f16();
                 layer.post_attention_norm.weight.prepare_metal_f16();
@@ -145,6 +179,35 @@ impl Model {
         let eos_token_id = config
             .eos_token_id
             .context("Qwen3 embedding config is missing eos_token_id")?;
+        let generation_config_path = root.join("generation_config.json");
+        let generation_config: GenerationConfig = if generation_config_path.exists() {
+            serde_json::from_str(
+                &std::fs::read_to_string(&generation_config_path).with_context(|| {
+                    format!(
+                        "read generation config {}",
+                        generation_config_path.display()
+                    )
+                })?,
+            )
+            .with_context(|| {
+                format!(
+                    "parse generation config {}",
+                    generation_config_path.display()
+                )
+            })?
+        } else {
+            GenerationConfig::default()
+        };
+        let mut generation_stop_ids = match generation_config.eos_token_id {
+            Some(OneOrManyTokenIds::One(token)) => vec![token],
+            Some(OneOrManyTokenIds::Many(tokens)) => tokens,
+            None => vec![eos_token_id],
+        };
+        if !generation_stop_ids.contains(&eos_token_id) {
+            generation_stop_ids.push(eos_token_id);
+        }
+        generation_stop_ids.sort_unstable();
+        generation_stop_ids.dedup();
         let mut final_norm = load_norm(&tensors, "norm", config.rms_norm_eps)?;
         if matches!(precision, super::Precision::F16) {
             final_norm.weight.prepare_metal_f16();
@@ -152,10 +215,51 @@ impl Model {
         Ok(Self {
             config,
             eos_token_id,
+            generation_stop_ids,
             embeddings,
             layers,
             final_norm,
+            lm_head,
         })
+    }
+
+    /// Tokenizes a raw completion prompt without embedding-only EOS rewriting.
+    pub(crate) fn encode_generation(
+        &self,
+        tokenizer: &Tokenizer,
+        text: &str,
+        max_length: usize,
+    ) -> Result<Vec<u32>> {
+        ensure!(max_length > 0, "max_length must be positive");
+        let encoding = tokenizer
+            .encode(text, true)
+            .map_err(|error| anyhow::anyhow!("encode Qwen3 generation prompt: {error}"))?;
+        let ids = encoding.get_ids();
+        ensure!(
+            !ids.is_empty(),
+            "Qwen3 generation prompt produced no tokens"
+        );
+        ensure!(
+            ids.len() <= max_length,
+            "Qwen3 generation prompt has {} tokens, exceeding cache capacity {max_length}",
+            ids.len()
+        );
+        Ok(ids.to_vec())
+    }
+
+    pub(crate) fn generation_stop_ids(&self) -> &[u32] {
+        &self.generation_stop_ids
+    }
+
+    pub(crate) fn lm_head(&self) -> Result<&Tensor> {
+        if self.config.tie_word_embeddings {
+            Ok(&self.embeddings)
+        } else {
+            self.lm_head
+                .as_ref()
+                .map(|weight| &weight.tensor)
+                .context("untied Qwen3 causal LM is missing lm_head.weight")
+        }
     }
 
     pub(crate) fn encode(

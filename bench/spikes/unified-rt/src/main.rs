@@ -23,6 +23,7 @@ mod cpu_backend;
 mod cuda_backend;
 mod modernbert;
 mod qwen3;
+mod qwen3_decode;
 mod vulkan_backend;
 
 #[derive(Parser)]
@@ -38,8 +39,26 @@ struct Args {
     #[arg(long)]
     corpus: Option<PathBuf>,
     /// Rerank request JSONL ({id, query, documents} per line).
-    #[arg(long, conflicts_with = "corpus")]
+    #[arg(long, conflicts_with_all = ["corpus", "generate_prompts"])]
     rerank_requests: Option<PathBuf>,
+    /// Raw-completion prompt JSONL ({id, prompt} per line) for Qwen3 greedy decode.
+    #[arg(long, conflicts_with_all = ["corpus", "rerank_requests"])]
+    generate_prompts: Option<PathBuf>,
+    /// Transformers reference JSONL emitted by reference_qwen3_decode.py.
+    #[arg(long, requires = "generate_prompts")]
+    decode_reference: Option<PathBuf>,
+    /// Maximum generated tokens per raw-completion prompt.
+    #[arg(long, default_value_t = 64)]
+    max_new_tokens: usize,
+    /// Fixed KV capacity; decode graphs are compiled once for this bucket.
+    #[arg(long, default_value_t = 512)]
+    decode_cache_bucket: usize,
+    /// Number of fp32 logits exposed to the pre-commit token tap.
+    #[arg(long, default_value_t = 5)]
+    decode_top_k: usize,
+    /// Optional JSONL destination for pre-commit token tap events.
+    #[arg(long, requires = "generate_prompts")]
+    decode_tap_out: Option<PathBuf>,
     /// Optional cap for parity/throughput smoke runs.
     #[arg(long)]
     limit: Option<usize>,
@@ -161,7 +180,7 @@ enum Shapes {
     Bucketed,
 }
 
-const GRAPH_REVISION: u32 = 3;
+const GRAPH_REVISION: u32 = 6;
 const BUCKET_POLICY_VERSION: u32 = 2;
 const BUCKET_V1_MAX_BATCH_ROWS: usize = 8;
 const BUCKET_V2_BATCH_ROW_LADDER: &[usize] = &[16, 16, 16, 16, 16, 16, 12, 12, 8, 8];
@@ -233,6 +252,55 @@ struct ServingResult {
     padding_waste_gate_passed: Option<bool>,
     package_cache: PackageCacheStats,
     passes: Vec<PassResult>,
+}
+
+#[derive(Clone, Deserialize)]
+struct DecodePrompt {
+    id: String,
+    prompt: String,
+}
+
+#[derive(Clone, Deserialize)]
+struct DecodeReference {
+    id: String,
+    tokens: Vec<u32>,
+    #[serde(default)]
+    top_logits: Vec<Vec<qwen3_decode::TopLogit>>,
+}
+
+#[derive(Serialize)]
+struct DecodeTapRow {
+    id: String,
+    step: usize,
+    token_id: u32,
+    top_logits: Vec<qwen3_decode::TopLogit>,
+}
+
+#[derive(Serialize)]
+struct DecodePromptResult {
+    id: String,
+    prompt_tokens: usize,
+    tokens: Vec<u32>,
+    exact_reference: Option<bool>,
+    accepted_near_ties: Vec<usize>,
+}
+
+#[derive(Serialize)]
+struct DecodeServingResult {
+    lane: &'static str,
+    workload: &'static str,
+    model: String,
+    cache_bucket: usize,
+    max_new_tokens: usize,
+    prompts: usize,
+    exact_prompts: Option<usize>,
+    accepted_near_ties: usize,
+    prefill_wall_s: f64,
+    decode_wall_s: f64,
+    prefill_tok_per_s: f64,
+    decode_tok_per_s: f64,
+    weight_regions: usize,
+    results: Vec<DecodePromptResult>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -321,6 +389,13 @@ impl MetalExecutionConfig {
             .as_ref()
             .map(|root| root.join(format!("{batch}x{seq}.mpsgraphpackage")))
     }
+
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    fn decode_package_path(&self, pass: &str, bucket: usize) -> Option<PathBuf> {
+        self.package_root
+            .as_ref()
+            .map(|root| root.join(format!("decode-{pass}-{bucket}.mpsgraphpackage")))
+    }
 }
 
 fn shape_cache_key(shapes: Shapes, bucket_policy: u32) -> String {
@@ -346,10 +421,17 @@ fn main() -> Result<()> {
     }
     ensure!(args.passes > 0, "--passes must be at least one");
     ensure!(args.max_length > 0, "--max-length must be at least one");
+    let started = Instant::now();
+    let mode_count = usize::from(args.corpus.is_some())
+        + usize::from(args.rerank_requests.is_some())
+        + usize::from(args.generate_prompts.is_some());
     ensure!(
-        args.corpus.is_some() ^ args.rerank_requests.is_some(),
-        "provide exactly one of --corpus or --rerank-requests"
+        mode_count == 1,
+        "provide exactly one of --corpus, --rerank-requests, or --generate-prompts"
     );
+    if args.generate_prompts.is_some() {
+        return run_decode_cli(&args, started);
+    }
     ensure!(
         args.attention_units >= args.max_length.saturating_mul(args.max_length),
         "--attention-units must fit at least one max-length sequence"
@@ -358,7 +440,6 @@ fn main() -> Result<()> {
         !(matches!(args.device, DeviceArg::Cpu) && matches!(args.dtype, Precision::F16)),
         "cpu + f16 is not supported for this spike; use --dtype f32 on cpu"
     );
-    let started = Instant::now();
 
     let model = load_model_family(&args.model, args.dtype)?;
     let mut tokenizer = Tokenizer::from_file(&args.tokenizer)
@@ -629,6 +710,224 @@ fn main() -> Result<()> {
         result.padding_waste_fraction * 100.0
     );
     Ok(())
+}
+
+fn run_decode_cli(args: &Args, started: Instant) -> Result<()> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (args, started);
+        bail!("Qwen3 owned-runtime decode is only available on macOS");
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use qwen3_decode::{DecodeSession, MetalDecoder, TokenTapEvent};
+
+        ensure!(
+            matches!(args.device, DeviceArg::Metal),
+            "Qwen3 decode requires --device metal"
+        );
+        ensure!(
+            matches!(args.dtype, Precision::F16),
+            "Qwen3 decode requires --dtype f16"
+        );
+        ensure!(args.max_new_tokens > 0, "--max-new-tokens must be positive");
+        ensure!(args.decode_top_k > 0, "--decode-top-k must be positive");
+        let prompts_path = args
+            .generate_prompts
+            .as_ref()
+            .context("decode mode requires --generate-prompts")?;
+        let mut prompts: Vec<DecodePrompt> = load_rerank_rows(prompts_path)?;
+        if let Some(limit) = args.limit {
+            prompts.truncate(limit);
+        }
+        ensure!(!prompts.is_empty(), "decode prompt set must not be empty");
+        let references = args
+            .decode_reference
+            .as_ref()
+            .map(|path| load_rerank_rows::<DecodeReference>(path))
+            .transpose()?
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| (row.id.clone(), row))
+                    .collect::<HashMap<_, _>>()
+            });
+
+        let model = qwen3::Model::load(&args.model, args.dtype)?;
+        let mut tokenizer = Tokenizer::from_file(&args.tokenizer)
+            .map_err(|error| anyhow::anyhow!("tokenizer: {error}"))?;
+        tokenizer.with_padding(None);
+        tokenizer
+            .with_truncation(None)
+            .map_err(|error| anyhow::anyhow!("disable generation truncation: {error}"))?;
+        let execution = MetalExecutionConfig::from_args(args, "qwen3-0.6b-decode")?;
+        let mut decoder =
+            MetalDecoder::new(&model, args.dtype, &execution, args.decode_cache_bucket)?;
+        let cold_load_s = started.elapsed().as_secs_f64();
+        let stop_tokens = model
+            .generation_stop_ids()
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        let mut tap_rows = Vec::new();
+        let mut results = Vec::with_capacity(prompts.len());
+        let mut prefill_wall_s = 0.0;
+        let mut decode_wall_s = 0.0;
+        let mut prefill_tokens = 0usize;
+        let mut generated_tokens = 0usize;
+        let mut exact_prompts = 0usize;
+        let mut accepted_near_ties = 0usize;
+        let mut hard_divergences = Vec::new();
+
+        for prompt in &prompts {
+            let prompt_ids =
+                model.encode_generation(&tokenizer, &prompt.prompt, args.decode_cache_bucket)?;
+            ensure!(
+                prompt_ids.len() + args.max_new_tokens <= args.decode_cache_bucket,
+                "prompt {} plus {} generated tokens exceeds cache bucket {}",
+                prompt.id,
+                args.max_new_tokens,
+                args.decode_cache_bucket
+            );
+            prefill_tokens += prompt_ids.len();
+            let prefill_started = Instant::now();
+            let mut session = DecodeSession::prefill(&mut decoder, &prompt_ids)?;
+            prefill_wall_s += prefill_started.elapsed().as_secs_f64();
+            let mut prompt_top_logits = Vec::new();
+            let decode_started = Instant::now();
+            let tokens = session.generate(
+                args.max_new_tokens,
+                &stop_tokens,
+                args.decode_top_k,
+                &mut |event: TokenTapEvent<'_>| {
+                    prompt_top_logits.push(event.top_logits.to_vec());
+                    tap_rows.push(DecodeTapRow {
+                        id: prompt.id.clone(),
+                        step: event.step,
+                        token_id: event.token_id,
+                        top_logits: event.top_logits.to_vec(),
+                    });
+                },
+            )?;
+            decode_wall_s += decode_started.elapsed().as_secs_f64();
+            generated_tokens += tokens.len();
+
+            let mut exact_reference = None;
+            let mut prompt_near_ties = Vec::new();
+            if let Some(reference) = references
+                .as_ref()
+                .and_then(|references| references.get(&prompt.id))
+            {
+                let exact = tokens == reference.tokens;
+                exact_reference = Some(exact);
+                if exact {
+                    exact_prompts += 1;
+                } else {
+                    let divergences_before_prompt = hard_divergences.len();
+                    let shared = tokens.len().min(reference.tokens.len());
+                    for step in 0..shared {
+                        if tokens[step] == reference.tokens[step] {
+                            continue;
+                        }
+                        let owned_top = prompt_top_logits.get(step).cloned().unwrap_or_default();
+                        let reference_top =
+                            reference.top_logits.get(step).cloned().unwrap_or_default();
+                        let owned_gap = top_two_gap(&owned_top);
+                        let reference_gap = top_two_gap(&reference_top);
+                        if owned_gap.is_some_and(|gap| gap < 1e-3)
+                            || reference_gap.is_some_and(|gap| gap < 1e-3)
+                        {
+                            prompt_near_ties.push(step);
+                            accepted_near_ties += 1;
+                        } else {
+                            hard_divergences.push(format!(
+                                "{} step {}: owned token {}, reference token {}, owned top-5 {:?}, reference top-5 {:?}",
+                                prompt.id,
+                                step,
+                                tokens[step],
+                                reference.tokens[step],
+                                owned_top,
+                                reference_top
+                            ));
+                            break;
+                        }
+                    }
+                    if tokens.len() != reference.tokens.len()
+                        && hard_divergences.len() == divergences_before_prompt
+                    {
+                        hard_divergences.push(format!(
+                            "{}: owned generated {} tokens, reference generated {} tokens",
+                            prompt.id,
+                            tokens.len(),
+                            reference.tokens.len()
+                        ));
+                    }
+                }
+            } else if references.is_some() {
+                hard_divergences.push(format!("{}: missing decode reference row", prompt.id));
+            }
+            results.push(DecodePromptResult {
+                id: prompt.id.clone(),
+                prompt_tokens: prompt_ids.len(),
+                tokens,
+                exact_reference,
+                accepted_near_ties: prompt_near_ties,
+            });
+        }
+
+        if let Some(path) = &args.decode_tap_out {
+            write_jsonl(path, &tap_rows)?;
+        }
+        let weight_regions = model.weight_regions();
+        ensure!(
+            weight_regions
+                .values()
+                .all(|region| region.buffer_handle != 0),
+            "Qwen3 weight registry contains a null buffer handle"
+        );
+        let result = DecodeServingResult {
+            lane: "owned-rt-metal",
+            workload: "qwen3-greedy-raw-completion",
+            model: args
+                .model_label
+                .clone()
+                .unwrap_or_else(|| "Qwen3-0.6B@owned-rt-f16".to_owned()),
+            cache_bucket: args.decode_cache_bucket,
+            max_new_tokens: args.max_new_tokens,
+            prompts: prompts.len(),
+            exact_prompts: references.as_ref().map(|_| exact_prompts),
+            accepted_near_ties,
+            prefill_wall_s,
+            decode_wall_s,
+            prefill_tok_per_s: prefill_tokens as f64 / prefill_wall_s,
+            decode_tok_per_s: generated_tokens as f64 / decode_wall_s,
+            weight_regions: weight_regions.len(),
+            results,
+        };
+        let out = args.out.as_ref().context("decode mode requires --out")?;
+        if let Some(parent) = out.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(out, serde_json::to_string_pretty(&result)?)?;
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        eprintln!(
+            "decode cold load {:.3}s, prefill {:.1} tok/s, decode {:.1} tok/s, exact {:?}/{}",
+            cold_load_s,
+            result.prefill_tok_per_s,
+            result.decode_tok_per_s,
+            result.exact_prompts,
+            result.prompts
+        );
+        ensure!(
+            hard_divergences.is_empty(),
+            "token-exact decode gate failed:\n{}",
+            hard_divergences.join("\n")
+        );
+        Ok(())
+    }
+}
+
+fn top_two_gap(top: &[qwen3_decode::TopLogit]) -> Option<f32> {
+    (top.len() >= 2).then(|| (top[0].logit - top[1].logit).abs())
 }
 
 fn serve_stdio(args: Args) -> Result<()> {
