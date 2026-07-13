@@ -89,6 +89,7 @@ export interface LedgerEntry {
   account: string;
   valid: boolean;
   reason?: string;
+  warnings?: string[];
   ts: string;
 }
 

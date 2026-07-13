@@ -1,5 +1,5 @@
 import { realpath } from "node:fs/promises";
-import { resolve } from "node:path";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 import { PRODUCTION_AFT_TOOL_SCHEMAS } from "./aft-tool-catalog.ts";
 import { expandHome } from "./repo.ts";
 import type { ToolResult } from "./types.ts";
@@ -26,8 +26,12 @@ export const GATHER_TOOLS: ToolDeclaration[] = PRODUCTION_TOOL_NAMES.map((name) 
 
 export const AFT_STORAGE_DIR = "/tmp/gather-campaign-aft";
 export const AFT_REQUEST_TIMEOUT_MS = 10 * 60_000;
-export const AFT_WARMUP_TIMEOUT_MS = 5 * 60_000;
+export const AFT_WARMUP_TIMEOUT_MS = 60_000;
 export const DEFAULT_AFT_BINARY = resolve(import.meta.dir, "../bin/aft-v0.46.0");
+
+const AFT_WARMUP_INITIAL_BACKOFF_MS = 100;
+const AFT_WARMUP_MAX_BACKOFF_MS = 2_000;
+const PATH_ARGUMENT_KEYS = new Set(["filePath", "target", "path", "toFile", "scope", "url"]);
 
 export type AftToolName = "search" | "outline" | "zoom" | "callgraph" | "read" | "grep" | "glob" | "inspect" | "conflicts";
 
@@ -132,13 +136,14 @@ const DOCUMENTED_NDJSON_PROTOCOL: AftWireProtocol = {
       harness: "opencode",
       project_root: projectRoot,
       session_id: "trainer",
-      config: {
-        user: {
-          semantic_search: false,
-          search_index: true,
-          storage_dir: AFT_STORAGE_DIR,
+      storage_dir: AFT_STORAGE_DIR,
+      config: [
+        {
+          tier: "user",
+          source: "inline:gather-distill",
+          doc: JSON.stringify({ semantic_search: false, search_index: true }),
         },
-      },
+      ],
     };
   },
   toolCall(id, name, arguments_) {
@@ -172,6 +177,67 @@ function lowerAftProcessPriority(pid: number | undefined): void {
 
 export async function canonicalRepoRoot(repoDir: string): Promise<string> {
   return realpath(expandHome(repoDir));
+}
+
+function escapesRoot(root: string, candidate: string): boolean {
+  const pathFromRoot = relative(root, candidate);
+  return pathFromRoot === ".." || pathFromRoot.startsWith(`..${sep}`) || isAbsolute(pathFromRoot);
+}
+
+function pathGuardError(key: string, requestedPath: string): Error {
+  return new Error(`path outside project: ${key} must resolve inside the configured repository (${JSON.stringify(requestedPath)})`);
+}
+
+async function validateRepositoryPath(root: string, key: string, requestedPath: string): Promise<void> {
+  if (isAbsolute(requestedPath) || requestedPath.startsWith("~") || /^[a-z][a-z\d+.-]*:\/\//i.test(requestedPath)) {
+    throw pathGuardError(key, requestedPath);
+  }
+  const candidate = resolve(root, requestedPath);
+  if (escapesRoot(root, candidate)) throw pathGuardError(key, requestedPath);
+
+  let canonicalPath: string;
+  try {
+    canonicalPath = await realpath(candidate);
+  } catch (error) {
+    throw new Error(`repository path ${key} could not be resolved: ${errorMessage(error)}`);
+  }
+  if (escapesRoot(root, canonicalPath)) throw pathGuardError(key, requestedPath);
+}
+
+async function validatePathValue(root: string, key: string, value: unknown): Promise<void> {
+  const paths = Array.isArray(value) ? value : [value];
+  for (const requestedPath of paths) {
+    if (typeof requestedPath !== "string") {
+      throw new Error(`repository path ${key} must be a string or an array of strings`);
+    }
+    await validateRepositoryPath(root, key, requestedPath);
+  }
+}
+
+async function validateToolPaths(root: string, value: unknown): Promise<void> {
+  if (Array.isArray(value)) {
+    for (const item of value) await validateToolPaths(root, item);
+    return;
+  }
+  if (!isRecord(value)) return;
+  for (const [key, nested] of Object.entries(value)) {
+    if (PATH_ARGUMENT_KEYS.has(key)) await validatePathValue(root, key, nested);
+    else await validateToolPaths(root, nested);
+  }
+}
+
+function isColdSearchOutput(text: string): boolean {
+  const normalized = text.trim();
+  const lower = normalized.toLowerCase();
+  return (
+    lower.includes("fully degraded") ||
+    lower.includes("lexical-only fallback returned 0 result") ||
+    normalized === "Semantic search is not enabled."
+  );
+}
+
+function sleep(delayMs: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, delayMs));
 }
 
 function errorMessage(error: unknown): string {
@@ -217,6 +283,7 @@ export class AftClient {
     options: AftCallOptions = {},
   ): Promise<string> {
     const root = await canonicalRepoRoot(repoDir);
+    await validateToolPaths(root, arguments_);
     const release = await this.reserveRoot(root, options);
     try {
       const attempts = options.retryOnDeath === false ? 1 : 2;
@@ -243,16 +310,48 @@ export class AftClient {
     }
   }
 
-  async warm(repoDir: string, timeoutMs = AFT_WARMUP_TIMEOUT_MS): Promise<void> {
+  async warm(
+    repoDir: string,
+    timeoutMs = AFT_WARMUP_TIMEOUT_MS,
+    initialBackoffMs = AFT_WARMUP_INITIAL_BACKOFF_MS,
+    maxBackoffMs = AFT_WARMUP_MAX_BACKOFF_MS,
+  ): Promise<{ ready: boolean; attempts: number }> {
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error("AFT warm-up timeout must be positive");
+    if (!Number.isFinite(initialBackoffMs) || initialBackoffMs <= 0) throw new Error("AFT warm-up backoff must be positive");
+    if (!Number.isFinite(maxBackoffMs) || maxBackoffMs < initialBackoffMs) {
+      throw new Error("AFT warm-up maximum backoff must be at least the initial backoff");
+    }
+
     const started = Date.now();
-    const remaining = (): number => {
-      const value = timeoutMs - (Date.now() - started);
-      if (value <= 0) throw new AftRequestTimeoutError(`warm-up exceeded ${timeoutMs}ms`);
-      return value;
-    };
+    const remaining = (): number => timeoutMs - (Date.now() - started);
     const options = { retryOnDeath: false } as const;
-    await this.configure(repoDir, { ...options, timeoutMs: remaining() });
-    await this.call(repoDir, "glob", { pattern: "README*" }, { ...options, timeoutMs: remaining() });
+    await this.configure(repoDir, { ...options, timeoutMs: timeoutMs });
+
+    let attempts = 0;
+    let backoffMs = initialBackoffMs;
+    for (;;) {
+      const requestTimeoutMs = remaining();
+      if (requestTimeoutMs <= 0) return { ready: false, attempts };
+      let text: string;
+      try {
+        text = await this.call(
+          repoDir,
+          "search",
+          { query: "function" },
+          { ...options, timeoutMs: requestTimeoutMs },
+        );
+      } catch (error) {
+        if (error instanceof AftRequestTimeoutError) return { ready: false, attempts };
+        throw error;
+      }
+      attempts += 1;
+      if (!isColdSearchOutput(text)) return { ready: true, attempts };
+
+      const delayMs = Math.min(backoffMs, remaining());
+      if (delayMs <= 0) return { ready: false, attempts };
+      await sleep(delayMs);
+      backoffMs = Math.min(maxBackoffMs, backoffMs * 2);
+    }
   }
 
   async close(): Promise<void> {
@@ -417,12 +516,9 @@ export class AftClient {
       this.resetProcess(new AftProtocolError("AFT emitted a non-JSON NDJSON line"));
       return;
     }
-    if (!isRecord(value) || typeof value.id !== "string") {
-      // AFT emits session-status notifications between request responses.
-      if (isRecord(value) && typeof value.type === "string") return;
-      this.resetProcess(new AftProtocolError("AFT response is missing a string id"));
-      return;
-    }
+    // AFT emits JSON notifications between responses. Only a frame whose id
+    // matches an outstanding request can complete that request.
+    if (!isRecord(value) || typeof value.id !== "string") return;
     const pending = this.pending.get(value.id);
     if (!pending) return;
     this.pending.delete(value.id);
@@ -536,10 +632,27 @@ export interface AftWarmupResult {
   durationMs: number;
   error?: string;
   timedOut?: boolean;
+  warning?: string;
+  searchAttempts?: number;
+}
+
+export interface AftWarmupCoordinatorOptions {
+  timeoutMs?: number;
+  initialBackoffMs?: number;
+  maxBackoffMs?: number;
 }
 
 export class AftWarmupCoordinator {
   private readonly warmups = new Map<string, Promise<AftWarmupResult>>();
+  private readonly timeoutMs: number;
+  private readonly initialBackoffMs: number;
+  private readonly maxBackoffMs: number;
+
+  constructor(options: AftWarmupCoordinatorOptions = {}) {
+    this.timeoutMs = options.timeoutMs ?? AFT_WARMUP_TIMEOUT_MS;
+    this.initialBackoffMs = options.initialBackoffMs ?? AFT_WARMUP_INITIAL_BACKOFF_MS;
+    this.maxBackoffMs = options.maxBackoffMs ?? AFT_WARMUP_MAX_BACKOFF_MS;
+  }
 
   async ensureWarmed(repoDir: string, client: AftClient): Promise<AftWarmupResult> {
     const root = await canonicalRepoRoot(repoDir);
@@ -548,8 +661,18 @@ export class AftWarmupCoordinator {
       warmup = (async () => {
         const started = Date.now();
         try {
-          await client.warm(root);
-          return { ok: true, durationMs: Date.now() - started };
+          const search = await client.warm(root, this.timeoutMs, this.initialBackoffMs, this.maxBackoffMs);
+          const durationMs = Date.now() - started;
+          if (!search.ready) {
+            return {
+              ok: true,
+              durationMs,
+              timedOut: true,
+              searchAttempts: search.attempts,
+              warning: `AFT search index remained degraded after ${durationMs}ms; proceeding with cold search`,
+            };
+          }
+          return { ok: true, durationMs, searchAttempts: search.attempts };
         } catch (error) {
           return {
             ok: false,

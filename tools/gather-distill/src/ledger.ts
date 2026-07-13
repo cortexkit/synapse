@@ -6,6 +6,7 @@ export function ledgerEntry(
   row: BankedRow,
   durationMs: number,
   outcome: LedgerEntry["outcome"],
+  warnings: string[] = [],
 ): LedgerEntry {
   return {
     job_id: stableJobId(job.dir, job.request),
@@ -19,6 +20,7 @@ export function ledgerEntry(
     account: row.account,
     valid: row.valid,
     reason: row.reason,
+    ...(warnings.length > 0 ? { warnings } : {}),
     ts: new Date().toISOString(),
   };
 }
@@ -29,8 +31,9 @@ export async function appendBankedResult(
   job: GatherJob,
   row: BankedRow,
   durationMs: number,
+  warnings: string[] = [],
 ): Promise<void> {
   await appendJsonl(rowsPath, row);
   const outcome = row.budget_outcome === "api_error" ? "failed" : row.valid ? "banked" : "rejected";
-  await appendJsonl(ledgerPath, ledgerEntry(job, row, durationMs, outcome));
+  await appendJsonl(ledgerPath, ledgerEntry(job, row, durationMs, outcome, warnings));
 }
