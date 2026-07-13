@@ -1,14 +1,18 @@
 #!/usr/bin/env bun
 import { AccountPool, CredentialStore } from "./auth.ts";
-import { runGatherJob } from "./gather.ts";
+import { failedGatherJob, runGatherJob } from "./gather.ts";
 import { appendBankedResult } from "./ledger.ts";
 import { updateBurnRate } from "./meter.ts";
 import { balanceJobs, pendingJobsAfterCrash } from "./queue.ts";
 import { discoverRepos, expandHome } from "./repo.ts";
 import { generateQuestions } from "./qgen.ts";
 import type { BankedRow, GatherJob, LedgerEntry } from "./types.ts";
-import { readJsonl, writeJsonl } from "./utils.ts";
+import { readJsonl, stableJobId, writeJsonl } from "./utils.ts";
 import { repoDirForRow, validateBankedRow } from "./validate.ts";
+import { AftClientPool, AftWarmupCoordinator, AFT_WARMUP_TIMEOUT_MS } from "./tools.ts";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 interface ParsedArgs {
   command: string;
@@ -57,6 +61,38 @@ function accountPool(args: ParsedArgs): AccountPool {
   });
 }
 
+const LEXICAL_SEARCH_DISCLOSURE = "Semantic search unavailable; returning lexical-only fallback results.";
+
+async function runGit(repo: string, ...args: string[]): Promise<void> {
+  const process = Bun.spawn(["git", "-C", repo, ...args], { stdout: "pipe", stderr: "pipe" });
+  const [status, _stdout, stderr] = await Promise.all([
+    process.exited,
+    new Response(process.stdout).text(),
+    new Response(process.stderr).text(),
+  ]);
+  if (status !== 0) throw new Error(`AFT canary could not run git ${args.join(" ")}: ${stderr.trim()}`);
+}
+
+async function runAftCanary(pool: AftClientPool): Promise<void> {
+  const repo = await mkdtemp(join(tmpdir(), "gather-aft-canary-"));
+  try {
+    await runGit(repo, "init", "-q");
+    await runGit(repo, "config", "user.name", "AFT Canary");
+    await runGit(repo, "config", "user.email", "aft-canary@example.invalid");
+    await writeFile(join(repo, "README.md"), "# lexicalCanary\n");
+    await runGit(repo, "add", "README.md");
+    await runGit(repo, "commit", "-qm", "canary");
+    await pool.withClient(repo, async (client) => {
+      const text = await client.call(repo, "search", { query: "lexicalCanary", topK: 1 });
+      if (!text.includes(LEXICAL_SEARCH_DISCLOSURE)) {
+        throw new Error("AFT canary did not confirm lexical-only search output");
+      }
+    });
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+}
+
 async function qgenCommand(args: ParsedArgs): Promise<void> {
   const explicit = args.flags.get("repo")?.map(expandHome) ?? [];
   const repos = explicit.length > 0 ? explicit : await discoverRepos(one(args, "corpus-root"));
@@ -90,8 +126,21 @@ async function gatherCommand(args: ParsedArgs): Promise<void> {
   const queue = await balanceJobs(await pendingJobsAfterCrash(jobs, ledger, existingRows));
   const pool = accountPool(args);
   const concurrency = Math.floor(numberFlag(args, "concurrency", 2));
+  const model = one(args, "model", "claude-opus-4-8");
+  const aftPool = new AftClientPool(concurrency);
+  const warmups = new AftWarmupCoordinator();
+  const aftRetries = new Map<string, number>();
   let cursor = 0;
   let bankChain = Promise.resolve();
+
+  const bank = async (job: GatherJob, row: BankedRow, duration: number, index: number): Promise<void> => {
+    bankChain = bankChain.then(async () => {
+      await appendBankedResult(rowsPath, ledgerPath, job, row, duration);
+      await updateBurnRate(rowsPath, statusPath);
+      console.log(JSON.stringify({ lane: "gather", job: index, total: queue.length, row }));
+    });
+    await bankChain;
+  };
 
   const worker = async (): Promise<void> => {
     for (;;) {
@@ -99,28 +148,53 @@ async function gatherCommand(args: ParsedArgs): Promise<void> {
       const job = queue[index];
       if (!job) return;
       const started = Date.now();
-      const row = await runGatherJob(job, {
-        pool,
-        model: one(args, "model", "claude-opus-4-8"),
-        maxSteps: numberFlag(args, "max-steps", 40),
-        maxPackageTokens: numberFlag(args, "max-package-tokens", 40_000),
-        tokenCeiling: numberFlag(args, "token-ceiling", 200_000),
-        maxResponseTokens: numberFlag(args, "max-response-tokens", 8_000),
-        finalizeMode: one(args, "finalize-mode", "tool_choice_none_full_toolset") as
-          | "tool_choice_none_full_toolset"
-          | "tools_empty",
-        inlineValidate: enabled(args, "inline-validate"),
+      let skippedForWarmup = false;
+      const row = await aftPool.withClient(job.dir, async (aftClient) => {
+        const warmup = await warmups.ensureWarmed(job.dir, aftClient);
+        if (!warmup.ok) {
+          skippedForWarmup = true;
+          const timeout = warmup.timedOut || warmup.durationMs >= AFT_WARMUP_TIMEOUT_MS;
+          const queueNote = timeout
+            ? "AFT warm-up exceeded five minutes; skipped repository"
+            : "AFT warm-up failed; skipped repository";
+          console.warn(
+            JSON.stringify({ lane: "gather", queue_note: queueNote, repo: job.dir, duration_ms: warmup.durationMs, error: warmup.error }),
+          );
+          return failedGatherJob(job, `AFT warm-up: ${warmup.error ?? queueNote}`, { model });
+        }
+        return runGatherJob(job, {
+          pool,
+          model,
+          maxSteps: numberFlag(args, "max-steps", 40),
+          maxPackageTokens: numberFlag(args, "max-package-tokens", 40_000),
+          tokenCeiling: numberFlag(args, "token-ceiling", 200_000),
+          maxResponseTokens: numberFlag(args, "max-response-tokens", 8_000),
+          finalizeMode: one(args, "finalize-mode", "tool_choice_none_full_toolset") as
+            | "tool_choice_none_full_toolset"
+            | "tools_empty",
+          inlineValidate: enabled(args, "inline-validate"),
+          aftClient,
+        });
       });
       const duration = Date.now() - started;
-      bankChain = bankChain.then(async () => {
-        await appendBankedResult(rowsPath, ledgerPath, job, row, duration);
-        await updateBurnRate(rowsPath, statusPath);
-        console.log(JSON.stringify({ lane: "gather", job: index + 1, total: queue.length, row }));
-      });
-      await bankChain;
+      await bank(job, row, duration, index + 1);
+
+      const retryKey = stableJobId(job.dir, job.request);
+      const retries = aftRetries.get(retryKey) ?? 0;
+      if (!skippedForWarmup && row.budget_outcome === "api_error" && row.reason?.startsWith("AFT transport:") && retries === 0) {
+        aftRetries.set(retryKey, retries + 1);
+        queue.push(job);
+        console.warn(JSON.stringify({ lane: "gather", queue_note: "retrying job after AFT transport failure", repo: job.dir }));
+      }
     }
   };
-  await Promise.all(Array.from({ length: concurrency }, () => worker()));
+
+  try {
+    if (queue.length > 0) await runAftCanary(aftPool);
+    await Promise.all(Array.from({ length: concurrency }, () => worker()));
+  } finally {
+    await aftPool.close();
+  }
   console.log(JSON.stringify({ lane: "gather", completed: queue.length, rows: rowsPath, ledger: ledgerPath, status: statusPath }));
 }
 

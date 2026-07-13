@@ -8,7 +8,7 @@ import {
 } from "../prompts/gather-system.ts";
 import { loadManifest, verifyPinnedHead } from "./repo.ts";
 import { validateFinalJson } from "./schema.ts";
-import { executeTool, GATHER_TOOLS } from "./tools.ts";
+import { type AftClient, executeTool, GATHER_TOOLS } from "./tools.ts";
 import type {
   AnthropicContentBlock,
   BankedRow,
@@ -28,6 +28,7 @@ export interface GatherOptions {
   finalizeMode?: FinalizeMode;
   inlineValidate?: boolean;
   pool?: AccountPool;
+  aftClient?: AftClient;
 }
 
 function userPrompt(job: GatherJob, sha: string, maxSteps: number, maxPackageTokens: number): string {
@@ -110,11 +111,12 @@ export async function runGatherJob(job: GatherJob, options: GatherOptions = {}):
       }
       const toolResults: AnthropicContentBlock[] = [];
       for (const call of calls) {
-        const result = await executeTool(job.dir, call.name, call.input);
+        const result = await executeTool(job.dir, call.name, call.input, options.aftClient);
         toolResults.push({
           type: "tool_result",
           tool_use_id: call.id,
-          content: JSON.stringify(result),
+          // AFT formats tool output server-side; do not wrap or rewrite it.
+          content: result.output,
           is_error: !result.ok,
         });
         toolCallCount += 1;
@@ -170,4 +172,28 @@ export async function runGatherJob(job: GatherJob, options: GatherOptions = {}):
     row.valid = validateFinalJson(row.final_json).valid;
   }
   return row;
+}
+
+export async function failedGatherJob(
+  job: GatherJob,
+  reason: string,
+  options: Pick<GatherOptions, "model"> = {},
+): Promise<BankedRow> {
+  const manifest = await loadManifest(job.dir);
+  return {
+    request: job.request,
+    repo_full: manifest.fullName,
+    repo_sha: manifest.sha,
+    tags: { ...job.tags, language: job.tags.language ?? manifest.language },
+    full_trajectory: [],
+    final_json: null,
+    budget_outcome: "api_error",
+    input_tokens: 0,
+    output_tokens: 0,
+    model: options.model ?? "claude-opus-4-8",
+    account: "aft-warmup",
+    ts: new Date().toISOString(),
+    valid: false,
+    reason,
+  };
 }

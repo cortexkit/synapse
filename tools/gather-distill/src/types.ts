@@ -99,7 +99,7 @@ export interface ToolProvenance {
   text: string;
 }
 
-export interface LocalToolResult {
+export interface ToolResult {
   ok: boolean;
   output: string;
   provenance?: ToolProvenance[];

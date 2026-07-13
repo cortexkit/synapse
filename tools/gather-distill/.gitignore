@@ -2,3 +2,4 @@ accounts.json
 data/
 *.jsonl
 status.json
+bin/

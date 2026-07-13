@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { GATHER_TOOLS } from "../src/tools.ts";
 import {
   assertProductionFinalizeMode,
   GATHER_BUDGET_FINALIZE_TEXT,
@@ -34,5 +35,26 @@ describe("production gather contract", () => {
   test("tools-empty finalization is forbidden", () => {
     expect(() => assertProductionFinalizeMode("tools_empty")).toThrow("byte-identical toolset");
     expect(() => assertProductionFinalizeMode("tool_choice_none_full_toolset")).not.toThrow();
+  });
+
+  test("declares the bare production AFT catalog without the retired tree tool", () => {
+    expect(GATHER_TOOLS.map((tool) => tool.name)).toEqual([
+      "search",
+      "outline",
+      "zoom",
+      "callgraph",
+      "read",
+      "grep",
+      "glob",
+      "inspect",
+      "conflicts",
+    ]);
+    expect(GATHER_TOOLS.find((tool) => tool.name === "search")?.input_schema).toMatchObject({
+      required: ["query"],
+      properties: { hint: { enum: ["regex", "literal", "semantic", "auto"] } },
+    });
+    expect(GATHER_TOOLS.find((tool) => tool.name === "callgraph")?.input_schema).toMatchObject({
+      required: ["op", "filePath", "symbol"],
+    });
   });
 });

@@ -1,6 +1,6 @@
 # External gather-distillation harness
 
-Standalone Bun/TypeScript data generation for the production gatherer contract. It calls `https://api.anthropic.com/v1/messages` directly and has no CortexKit, OpenCode, subc, or fleet dependency. Repository tools are implemented locally and only read SHA-pinned clones below `~/Work/OSS/gather-corpus`.
+Standalone Bun/TypeScript data generation for the production gatherer contract. It calls `https://api.anthropic.com/v1/messages` directly and proxies every repository tool through a pinned AFT binary, so trajectories preserve production-ranked search and canonical server-side formatting. It only reads SHA-pinned clones below `~/Work/OSS/gather-corpus`.
 
 ## Contract provenance
 
@@ -8,6 +8,34 @@ Standalone Bun/TypeScript data generation for the production gatherer contract. 
 - Budget control: `gather_tool_call_budget_thresholds`, `gather_tool_call_budget`, and `GATHER_BUDGET_FINALIZE_TEXT` in `crates/alfonso-core-module/src/manager_runtime.rs` at the same commit. With `maxSteps=40`, nudges fire at tool calls 20 and 25 and finalization fires at 30.
 - Final JSON and snippet-pointer ingestion: `crates/alfonso-core/src/evidence/render.rs`, `crates/alfonso-core/src/evidence/types.rs`, and the active prompt above.
 - The older salvage section in `.cortexkit/alfonso/docs/gather-context-request-flow.md` is stale. This harness keeps the tool declaration array byte-identical on the forced final turn and sends Anthropic `tool_choice: {"type":"none"}`. Selecting `tools_empty` is an error because it forks the student contract.
+
+## AFT NDJSON integration
+
+The harness starts `bin/aft-v0.46.0` directly with no command-line arguments and uses newline-delimited JSON on stdin/stdout. It configures each repository before use with `harness: "opencode"`, `session_id: "trainer"`, `semantic_search: false`, `search_index: true`, and `storage_dir: "/tmp/gather-campaign-aft"`.
+
+The model receives the same bare production declarations as the gather sender at commit `3ff7970`: `search`, `outline`, `zoom`, `callgraph`, `read`, `grep`, `glob`, `inspect`, and `conflicts`. `src/aft-tool-catalog.ts` is the verbatim v0.46.0 schema catalog for those declarations. The v0.46.0 NDJSON wire manifest uses those same bare names. AFT response `text` is sent to the model verbatim; the harness never JSON-wraps, trims, or drops a trailing AFT status line. In particular, lexical-only search disclosures remain in trajectories.
+
+### Pinned binary provenance
+
+The campaign binary is the Darwin arm64 asset from [`cortexkit/aft` v0.46.0](https://github.com/cortexkit/aft/releases/tag/v0.46.0), not the fleet-staged `~/.local/share/cortexkit/aft/bin/aft-stable` path. It is intentionally ignored by Git so a fleet restage cannot change an in-progress campaign.
+
+```sh
+cd tools/gather-distill
+mkdir -p bin
+curl --fail --location https://github.com/cortexkit/aft/releases/download/v0.46.0/aft-darwin-arm64 \
+  -o bin/aft-v0.46.0
+chmod 755 bin/aft-v0.46.0
+shasum -a 256 bin/aft-v0.46.0
+# expected: e8aef37ba914f8760110c7feabddc19da67e936b9645d303a6c843dcc8557e2d
+bin/aft-v0.46.0 --version
+# expected: aft 0.46.0
+```
+
+A small AFT process pool is bounded by gather concurrency. It keeps one process for each active repository and reconfigures the least-recently-used idle process when work moves to another clone. The harness starts the AFT binary directly, then best-effort lowers only that child process's priority with `renice 19`; platforms that deny `renice` continue without changing the harness process priority.
+
+Before the queue opens, a scratch-repository canary sends `search` and requires `Semantic search unavailable; returning lexical-only fallback results.` in the returned text. Before the first job for each corpus repository, the worker configures AFT and warms it with `glob README*`. A warm-up that reaches five minutes is ledgered as a failed, retryable job and the repository is skipped with a queue note. Callgraph storage is never pre-warmed: giant repositories build it only if a trajectory actually calls `callgraph`.
+
+A request timeout resets a wedged child and retries once after respawn. If the retry cannot recover, the failed row is ledgered and the gather queue retries that job once without ending the campaign.
 
 ## Authentication and safety
 
@@ -25,7 +53,7 @@ The harness verifies `git rev-parse HEAD` against that manifest before gathering
 
 ## Install and test
 
-No package install is required.
+No package install is required after placing the pinned AFT binary above.
 
 ```sh
 cd tools/gather-distill
@@ -73,7 +101,7 @@ bun run src/cli.ts qgen \
   --output data/jobs.jsonl
 ```
 
-QGEN grounds on the manifest, bounded tree, README, and a few entry files. It accepts only a strict JSON array of code-answerable questions tagged with request class, difficulty 1–5, and specificity.
+QGEN grounds on the manifest, bounded AFT file listing, README, and a few entry files. It accepts only a strict JSON array of code-answerable questions tagged with request class, difficulty 1–5, and specificity.
 
 ### GATHER
 

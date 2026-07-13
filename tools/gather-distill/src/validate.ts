@@ -1,7 +1,7 @@
 import { join } from "node:path";
 import { loadManifest, readLineRange, splitLinesInclusive, verifyPinnedHead } from "./repo.ts";
 import { validateFinalJson } from "./schema.ts";
-import type { BankedRow, GatherFinalJson, LocalToolResult, ToolProvenance, TrajectoryMessage } from "./types.ts";
+import type { BankedRow, GatherFinalJson, ToolResult, ToolProvenance, TrajectoryMessage } from "./types.ts";
 import { isRecord } from "./utils.ts";
 
 function trajectoryProvenance(trajectory: TrajectoryMessage[]): ToolProvenance[] {
@@ -13,7 +13,7 @@ function trajectoryProvenance(trajectory: TrajectoryMessage[]): ToolProvenance[]
       try {
         const parsed: unknown = JSON.parse(block.content);
         if (!isRecord(parsed) || !Array.isArray(parsed.provenance)) continue;
-        for (const item of parsed.provenance as LocalToolResult["provenance"]) {
+        for (const item of parsed.provenance as ToolResult["provenance"]) {
           if (
             item &&
             typeof item.path === "string" &&

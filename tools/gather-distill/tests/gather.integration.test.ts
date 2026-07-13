@@ -4,6 +4,8 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { AccountLease, AccountPool } from "../src/auth.ts";
 import { runGatherJob } from "../src/gather.ts";
+import { AftClient } from "../src/tools.ts";
+import { recordedProcessFactory } from "./support/aft-process.ts";
 
 async function git(repo: string, ...args: string[]): Promise<string> {
   const process = Bun.spawn(["git", "-C", repo, ...args], { stdout: "pipe", stderr: "pipe" });
@@ -43,6 +45,14 @@ test("banks and validates a forced-finalize trajectory with an unchanged toolset
     coolDown: async () => {},
   } as unknown as AccountPool;
 
+  const { factory } = recordedProcessFactory((toolRequest, process) => {
+    if (toolRequest.command === "configure") {
+      process.respond({ id: toolRequest.id, success: true });
+      return;
+    }
+    process.respond({ id: toolRequest.id, success: true, text: "1: export const answer = 42;\n[AFT E0 W0 | D0 U0 C0 | T0]" });
+  });
+  const aftClient = new AftClient({ processFactory: factory });
   const originalFetch = globalThis.fetch;
   const bodies: Array<Record<string, unknown>> = [];
   let request = 0;
@@ -85,16 +95,20 @@ test("banks and validates a forced-finalize trajectory with an unchanged toolset
         request: "Where is the answer constant defined?",
         tags: { request_class: "feature_orientation", expected_difficulty: 1, specificity: "high" },
       },
-      { pool, model: "cheap-dry-run-model", maxSteps: 5, inlineValidate: true },
+      { pool, model: "cheap-dry-run-model", maxSteps: 5, inlineValidate: true, aftClient },
     );
 
     expect(row.valid).toBeTrue();
     expect(row.budget_outcome).toBe("budget_finalize");
     expect(row.full_trajectory.some((message) => message.synthetic === "budget_finalize")).toBeTrue();
+    const toolResultTurn = row.full_trajectory.find((message) => message.role === "user" && Array.isArray(message.content));
+    const toolResults = Array.isArray(toolResultTurn?.content) ? toolResultTurn.content : [];
+    expect(toolResults[0]).toMatchObject({ content: "1: export const answer = 42;\n[AFT E0 W0 | D0 U0 C0 | T0]" });
     expect(bodies).toHaveLength(2);
     expect(bodies[1].tools).toEqual(bodies[0].tools);
     expect(bodies[1].tool_choice).toEqual({ type: "none" });
   } finally {
     globalThis.fetch = originalFetch;
+    await aftClient.close();
   }
 });
