@@ -1,6 +1,7 @@
 fn main() {
     println!("cargo:rerun-if-changed=src/metal_mpsgraph.m");
     println!("cargo:rerun-if-changed=src/qwen3_mpsgraph.m");
+    println!("cargo:rerun-if-changed=src/qwen3_decode_mpsgraph.m");
     println!("cargo:rerun-if-changed=src/modernbert_mpsgraph.m");
     println!("cargo:rerun-if-changed=src/mpsgraph_runtime.m");
     println!("cargo:rerun-if-changed=src/mpsgraph_runtime.h");
@@ -16,6 +17,7 @@ fn main() {
             .file("src/mpsgraph_runtime.m")
             .file("src/metal_mpsgraph.m")
             .file("src/qwen3_mpsgraph.m")
+            .file("src/qwen3_decode_mpsgraph.m")
             .file("src/modernbert_mpsgraph.m")
             .flag("-fobjc-exceptions")
             .compile("synapse_unified_rt_mpsgraph");
