@@ -11,6 +11,9 @@ export interface QgenOptions {
   model?: string;
   count?: number;
   maxTokens?: number;
+  /** Send output_config.effort. Off by default: only newer models accept it;
+   * models without it reject the request with HTTP 400. */
+  effort?: "low" | "medium" | "high";
   pool?: AccountPool;
   aftClient?: AftClient;
 }
@@ -63,7 +66,7 @@ export async function generateQuestions(repoDir: string, options: QgenOptions = 
           const response = await sendMessage(lease.credential, {
             model,
             max_tokens: options.maxTokens ?? 6_000,
-            effort: "low",
+            ...(options.effort ? { effort: options.effort } : {}),
             system: QGEN_SYSTEM_PROMPT,
             messages: [
               {

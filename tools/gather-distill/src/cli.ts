@@ -93,6 +93,13 @@ async function runAftCanary(pool: AftClientPool): Promise<void> {
   }
 }
 
+function effortFlag(args: ParsedArgs): "low" | "medium" | "high" | undefined {
+  const value = one(args, "effort");
+  if (value === undefined) return undefined;
+  if (value === "low" || value === "medium" || value === "high") return value;
+  throw new Error(`--effort must be low, medium, or high (got ${value})`);
+}
+
 async function qgenCommand(args: ParsedArgs): Promise<void> {
   const explicit = args.flags.get("repo")?.map(expandHome) ?? [];
   const repos = explicit.length > 0 ? explicit : await discoverRepos(one(args, "corpus-root"));
@@ -106,6 +113,7 @@ async function qgenCommand(args: ParsedArgs): Promise<void> {
         model: one(args, "model", "claude-sonnet-5-0"),
         count: numberFlag(args, "count", 20),
         maxTokens: numberFlag(args, "max-response-tokens", 6_000),
+        effort: effortFlag(args),
       })),
     );
   }
