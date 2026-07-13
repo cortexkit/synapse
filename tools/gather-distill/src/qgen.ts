@@ -75,7 +75,17 @@ export async function generateQuestions(repoDir: string, options: QgenOptions = 
               },
             ],
           });
-          const parsed = parseJsonText(assistantText(response.content));
+          const text = assistantText(response.content);
+          let parsed: unknown;
+          try {
+            parsed = parseJsonText(text);
+          } catch (parseError) {
+            // Dump the raw model text so a parse failure is diagnosable
+            // (a terse "Unable to parse" with no artifact cost us a full pass).
+            const dump = `/tmp/qgen-parse-fail-${Date.now()}.txt`;
+            await Bun.write(dump, `repo: ${repoDir}\nstop_reason: ${response.stop_reason}\n---\n${text}`);
+            throw new Error(`qgen parse failure (raw response dumped to ${dump}, stop_reason=${response.stop_reason}): ${parseError}`);
+          }
           if (!Array.isArray(parsed)) throw new Error("qgen response must be a JSON array");
           return parsed.map((question) => ({ dir: repoDir, ...validateQuestion(question) }));
         } catch (error) {
