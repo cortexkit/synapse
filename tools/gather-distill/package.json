@@ -2,6 +2,9 @@
   "name": "@synapse-tools/gather-distill",
   "private": true,
   "type": "module",
+  "dependencies": {
+    "@cortexkit/anthropic-auth-core": "file:../../../anthropic-auth/packages/core"
+  },
   "scripts": {
     "start": "bun run src/cli.ts",
     "test": "bun test"
