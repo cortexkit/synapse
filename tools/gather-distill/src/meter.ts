@@ -6,20 +6,23 @@ export async function updateBurnRate(rowsPath: string, statusPath: string): Prom
   if (rows.length === 0) return;
   const first = Date.parse(rows[0].ts);
   const elapsedHours = Math.max((Date.now() - first) / 3_600_000, 1 / 3_600);
-  const accounts: Record<string, { trajectories: number; input_tokens: number; output_tokens: number }> = {};
+  const accounts: Record<string, { trajectories: number; input_tokens: number; output_tokens: number; thinking_tokens: number }> = {};
   let inputTokens = 0;
   let outputTokens = 0;
   let cacheCreationTokens = 0;
   let cacheReadTokens = 0;
+  let thinkingTokens = 0;
   for (const row of rows) {
     inputTokens += row.input_tokens;
     outputTokens += row.output_tokens;
     cacheCreationTokens += row.cache_creation_input_tokens;
     cacheReadTokens += row.cache_read_input_tokens;
-    const account = (accounts[row.account] ??= { trajectories: 0, input_tokens: 0, output_tokens: 0 });
+    thinkingTokens += row.thinking_tokens ?? 0;
+    const account = (accounts[row.account] ??= { trajectories: 0, input_tokens: 0, output_tokens: 0, thinking_tokens: 0 });
     account.trajectories += 1;
     account.input_tokens += row.input_tokens;
     account.output_tokens += row.output_tokens;
+    account.thinking_tokens += row.thinking_tokens ?? 0;
   }
   // Cache-read tokens bill at ~10% of fresh input, so the cache hit ratio is
   // the headline efficiency number for an expiring subscription quota.
@@ -34,6 +37,7 @@ export async function updateBurnRate(rowsPath: string, statusPath: string): Prom
     output_tokens: outputTokens,
     cache_creation_input_tokens: cacheCreationTokens,
     cache_read_input_tokens: cacheReadTokens,
+    thinking_tokens: thinkingTokens,
     cache_hit_ratio: cacheHitRatio,
     rolling_tokens_per_hour: (inputTokens + outputTokens) / elapsedHours,
     rolling_trajectories_per_hour: rows.length / elapsedHours,

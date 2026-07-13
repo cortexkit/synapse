@@ -31,9 +31,10 @@ export interface MessageResponse {
   usage: {
     input_tokens: number;
     output_tokens: number;
-    cache_creation_input_tokens: number;
-    cache_read_input_tokens: number;
-  };
+      cache_creation_input_tokens: number;
+      cache_read_input_tokens: number;
+      thinking_tokens: number;
+    };
 }
 
 // 5-minute ephemeral cache. Our reuse is WITHIN a single trajectory (turns
@@ -112,6 +113,7 @@ function responseShape(value: unknown): MessageResponse {
       output_tokens: output,
       cache_creation_input_tokens: typeof cacheCreation === "number" ? cacheCreation : 0,
       cache_read_input_tokens: typeof cacheRead === "number" ? cacheRead : 0,
+      thinking_tokens: 0,
     },
   };
 }

@@ -1,14 +1,15 @@
 #!/usr/bin/env bun
 import { AccountPool, CredentialStore } from "./auth.ts";
-import { failedGatherJob, runGatherJob } from "./gather.ts";
+import { failedGatherJob, runGatherJob, type GatherBackend } from "./gather.ts";
 import { appendBankedResult } from "./ledger.ts";
 import { updateBurnRate } from "./meter.ts";
 import { balanceJobs, pendingJobsAfterCrash } from "./queue.ts";
 import { discoverRepos, expandHome } from "./repo.ts";
 import { generateQuestions } from "./qgen.ts";
 import type { BankedRow, GatherJob, LedgerEntry } from "./types.ts";
-import { readJsonl, stableJobId, writeJsonl } from "./utils.ts";
+import { readJsonl, stableJobId, writeJsonAtomic, writeJsonl } from "./utils.ts";
 import { repoDirForRow, validateBankedRow } from "./validate.ts";
+import { citationLineCapsForScore, scoreRows, validateCandidateRowsForScore } from "./scorer.ts";
 import { AftClientPool, AftWarmupCoordinator, AFT_WARMUP_TIMEOUT_MS } from "./tools.ts";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -59,6 +60,12 @@ function accountPool(args: ParsedArgs): AccountPool {
     inFlightCap: numberFlag(args, "account-inflight", 2),
     cooldownMs: numberFlag(args, "auth-cooldown-ms", 300_000),
   });
+}
+
+function gatherBackend(args: ParsedArgs): GatherBackend {
+  const backend = one(args, "backend", "anthropic");
+  if (backend === "anthropic" || backend === "openai") return backend;
+  throw new Error(`--backend must be anthropic or openai (got ${backend})`);
 }
 
 const LEXICAL_SEARCH_DISCLOSURE = "Semantic search unavailable; returning lexical-only fallback results.";
@@ -132,9 +139,13 @@ async function gatherCommand(args: ParsedArgs): Promise<void> {
   const ledger = await readJsonl<LedgerEntry>(ledgerPath);
   const existingRows = await readJsonl<BankedRow>(rowsPath);
   const queue = await balanceJobs(await pendingJobsAfterCrash(jobs, ledger, existingRows));
-  const pool = accountPool(args);
+  const backend = gatherBackend(args);
+  // Local OpenAI-compatible servers do not use account files, credentials, or OAuth.
+  const pool = backend === "anthropic" ? accountPool(args) : undefined;
   const concurrency = Math.floor(numberFlag(args, "concurrency", 2));
-  const model = one(args, "model", "claude-opus-4-8");
+  const model = one(args, "model", backend === "openai" ? "local-model" : "claude-opus-4-8");
+  const baseUrl = backend === "openai" ? one(args, "base-url", "http://127.0.0.1:8080/v1") : undefined;
+  const requestTimeoutMs = backend === "openai" ? numberFlag(args, "request-timeout", 300) * 1_000 : undefined;
   const aftPool = new AftClientPool(concurrency);
   const warmups = new AftWarmupCoordinator();
   const reportedWarmupWarnings = new Set<string>();
@@ -176,7 +187,7 @@ async function gatherCommand(args: ParsedArgs): Promise<void> {
           console.warn(
             JSON.stringify({ lane: "gather", queue_note: queueNote, repo: job.dir, duration_ms: warmup.durationMs, error: warmup.error }),
           );
-          return failedGatherJob(job, `AFT warm-up: ${warmup.error ?? queueNote}`, { model });
+          return failedGatherJob(job, `AFT warm-up: ${warmup.error ?? queueNote}`, { backend, model });
         }
         if (warmup.warning && !reportedWarmupWarnings.has(job.dir)) {
           reportedWarmupWarnings.add(job.dir);
@@ -193,6 +204,9 @@ async function gatherCommand(args: ParsedArgs): Promise<void> {
           );
         }
         return runGatherJob(job, {
+          backend,
+          baseUrl,
+          requestTimeoutMs,
           pool,
           model,
           maxSteps: numberFlag(args, "max-steps", 40),
@@ -246,15 +260,43 @@ async function validateCommand(args: ParsedArgs): Promise<void> {
   if (rejected > 0) process.exitCode = 1;
 }
 
+async function scoreCommand(args: ParsedArgs): Promise<void> {
+  const candidatePath = required(args, "candidate");
+  const goldPath = required(args, "gold");
+  const output = required(args, "output");
+  const corpusRoot = one(args, "corpus-root", "~/Work/OSS/gather-corpus")!;
+  const candidateRows = await readJsonl<BankedRow>(candidatePath);
+  const goldRows = await readJsonl<BankedRow>(goldPath);
+  const contractValidity = await validateCandidateRowsForScore(candidateRows, corpusRoot);
+  const lineCaps = await citationLineCapsForScore([...candidateRows, ...goldRows], corpusRoot);
+  const report = scoreRows(candidateRows, goldRows, contractValidity, lineCaps);
+  await writeJsonAtomic(output, report);
+  console.log(
+    JSON.stringify({
+      lane: "score",
+      candidate: candidatePath,
+      gold: goldPath,
+      output,
+      ...report.summary_row,
+      unmatched_candidate_jobs: report.unmatched_candidate_job_ids.length,
+      unmatched_gold_jobs: report.unmatched_gold_job_ids.length,
+    }),
+  );
+}
+
 function help(): void {
   console.log(`gather-distill
 
 Subcommands:
   qgen     --repo DIR [--repo DIR...] --output data/jobs.jsonl [--model MODEL]
-  gather   --jobs data/jobs.jsonl [--rows PATH --ledger PATH --status PATH] [--inline-validate]
+  gather   --jobs data/jobs.jsonl [--backend anthropic|openai] [--base-url URL] [--request-timeout SECONDS]
+           [--rows PATH --ledger PATH --status PATH] [--inline-validate]
   validate --rows data/rows.jsonl [--output PATH --corpus-root DIR]
+  score    --candidate data/model-rows.jsonl --gold data/eval-gold.jsonl --output data/model-scores.json
+           [--corpus-root DIR]
 
-Authentication comes only from GATHER_DISTILL_API_KEY or GATHER_DISTILL_ACCOUNTS_FILE/--accounts-file.`);
+Anthropic qgen and gather use GATHER_DISTILL_API_KEY or GATHER_DISTILL_ACCOUNTS_FILE/--accounts-file.
+OpenAI-compatible gather is local-only and never reads account credentials or OAuth settings.`);
 }
 
 async function main(): Promise<void> {
@@ -262,6 +304,7 @@ async function main(): Promise<void> {
   if (args.command === "qgen") await qgenCommand(args);
   else if (args.command === "gather") await gatherCommand(args);
   else if (args.command === "validate") await validateCommand(args);
+  else if (args.command === "score") await scoreCommand(args);
   else help();
 }
 
