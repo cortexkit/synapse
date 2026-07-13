@@ -28,11 +28,11 @@ pub struct Qwen3Layer<'a> {
 mod enabled {
     use std::collections::HashMap;
     use std::ffi::{CStr, CString};
-    use std::io::Cursor;
+    use std::io::{Cursor, Write};
     use std::mem::size_of;
     use std::path::PathBuf;
     use std::ptr;
-    use std::sync::Arc;
+    use std::sync::{Arc, Once};
     use std::time::Instant;
 
     use anyhow::{ensure, Context, Result};
@@ -43,6 +43,7 @@ mod enabled {
 
     const DESCRIPTOR_BINDINGS: u32 = 10;
     const PUSH_CONSTANT_BYTES: u32 = 128;
+    static MEMORY_TYPE_REPORT: Once = Once::new();
 
     struct Buffer {
         state: Arc<DeviceState>,
@@ -66,6 +67,13 @@ mod enabled {
                     vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
                 )
                 .context("no coherent host-visible Vulkan storage memory")?;
+            MEMORY_TYPE_REPORT.call_once(|| {
+                let memory = state.memory_properties.memory_types[memory_type as usize];
+                eprintln!(
+                    "Vulkan storage memory: type_index={memory_type} heap_index={} flags={:?}",
+                    memory.heap_index, memory.property_flags
+                );
+            });
             let allocate = vk::MemoryAllocateInfo::default()
                 .allocation_size(requirements.size)
                 .memory_type_index(memory_type);
@@ -174,6 +182,10 @@ mod enabled {
         pipeline_layout: vk::PipelineLayout,
         pipeline_cache: vk::PipelineCache,
         pipeline_cache_path: Option<PathBuf>,
+        profile_enabled: bool,
+        profile_output: Option<PathBuf>,
+        timestamp_period_ns: f64,
+        timestamp_valid_bits: u32,
         gemm: VulkanGemm,
     }
 
@@ -220,12 +232,39 @@ mod enabled {
                     instance.get_physical_device_properties2(physical_device, &mut properties2);
                     subgroup
                 };
-                let queue_family = instance
-                    .get_physical_device_queue_family_properties(physical_device)
+                let queue_families =
+                    instance.get_physical_device_queue_family_properties(physical_device);
+                let queue_family = queue_families
                     .iter()
                     .position(|family| family.queue_flags.contains(vk::QueueFlags::COMPUTE))
                     .context("Vulkan GPU has no compute queue")?
                     as u32;
+                let profile_requested = std::env::var_os("SYNAPSE_VULKAN_PROFILE").is_some()
+                    || std::env::var_os("SYNAPSE_VULKAN_PROFILE_OUT").is_some();
+                let timestamp_period_ns = f64::from(properties.limits.timestamp_period);
+                let timestamp_valid_bits =
+                    queue_families[queue_family as usize].timestamp_valid_bits;
+                if profile_requested {
+                    ensure!(
+                        properties.limits.timestamp_compute_and_graphics != 0,
+                        "Vulkan timestamp profiling requested, but timestampComputeAndGraphics is false"
+                    );
+                    ensure!(
+                        timestamp_period_ns.is_finite() && timestamp_period_ns > 0.0,
+                        "Vulkan timestamp profiling requested, but timestampPeriod is invalid: {}",
+                        properties.limits.timestamp_period
+                    );
+                    ensure!(
+                        timestamp_valid_bits > 0,
+                        "Vulkan timestamp profiling requested, but the compute queue exposes no timestamp bits"
+                    );
+                    eprintln!(
+                        "Vulkan timestamps: timestampComputeAndGraphics=true timestampPeriod_ns={timestamp_period_ns:.6} compute_queue_valid_bits={timestamp_valid_bits}"
+                    );
+                }
+                let profile_output = profile_requested
+                    .then(|| std::env::var_os("SYNAPSE_VULKAN_PROFILE_OUT").map(PathBuf::from))
+                    .flatten();
 
                 let mut supported_storage16 = vk::PhysicalDevice16BitStorageFeatures::default();
                 let mut supported_float16 = vk::PhysicalDeviceShaderFloat16Int8Features::default();
@@ -365,6 +404,10 @@ mod enabled {
                     pipeline_layout,
                     pipeline_cache,
                     pipeline_cache_path,
+                    profile_enabled: profile_requested,
+                    profile_output,
+                    timestamp_period_ns,
+                    timestamp_valid_bits,
                     gemm,
                 }))
             }
@@ -704,12 +747,373 @@ mod enabled {
         epsilon: f32,
     }
 
+    const PROFILE_STAGE_COUNT: usize = 10;
+
+    #[derive(Copy, Clone)]
+    #[repr(usize)]
+    enum StageClass {
+        GemmQkv,
+        GemmAttentionScores,
+        SoftmaxMask,
+        GemmPv,
+        GemmOut,
+        GemmMlpUp,
+        GemmMlpDown,
+        Pointwise,
+        LayoutTranspose,
+        Readback,
+    }
+
+    impl StageClass {
+        const ALL: [Self; PROFILE_STAGE_COUNT] = [
+            Self::GemmQkv,
+            Self::GemmAttentionScores,
+            Self::SoftmaxMask,
+            Self::GemmPv,
+            Self::GemmOut,
+            Self::GemmMlpUp,
+            Self::GemmMlpDown,
+            Self::Pointwise,
+            Self::LayoutTranspose,
+            Self::Readback,
+        ];
+
+        fn label(self) -> &'static str {
+            match self {
+                Self::GemmQkv => "GEMM-qkv",
+                Self::GemmAttentionScores => "GEMM-attn-scores",
+                Self::SoftmaxMask => "softmax+mask",
+                Self::GemmPv => "GEMM-PV",
+                Self::GemmOut => "GEMM-out",
+                Self::GemmMlpUp => "GEMM-mlp-up",
+                Self::GemmMlpDown => "GEMM-mlp-down",
+                Self::Pointwise => "pointwise",
+                Self::LayoutTranspose => "layout/transpose",
+                Self::Readback => "readback",
+            }
+        }
+    }
+
+    struct DispatchQueries {
+        layer: usize,
+        stage: StageClass,
+        start: u32,
+        dispatch_end: u32,
+        barrier_end: u32,
+    }
+
+    struct QueryRecording {
+        pool: vk::QueryPool,
+        capacity: u32,
+        next_query: u32,
+        dispatches: Vec<DispatchQueries>,
+        total_end: Option<u32>,
+        empty_start: Option<u32>,
+        empty_end: Option<u32>,
+    }
+
+    impl QueryRecording {
+        fn new(
+            state: &DeviceState,
+            command: vk::CommandBuffer,
+            max_dispatches: u32,
+        ) -> Result<Option<Self>> {
+            if !state.profile_enabled {
+                return Ok(None);
+            }
+            let capacity = max_dispatches * 3 + 4;
+            let pool = unsafe {
+                state.device.create_query_pool(
+                    &vk::QueryPoolCreateInfo::default()
+                        .query_type(vk::QueryType::TIMESTAMP)
+                        .query_count(capacity),
+                    None,
+                )?
+            };
+            unsafe {
+                state
+                    .device
+                    .cmd_reset_query_pool(command, pool, 0, capacity);
+                state.device.cmd_write_timestamp(
+                    command,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    pool,
+                    0,
+                );
+            }
+            Ok(Some(Self {
+                pool,
+                capacity,
+                next_query: 1,
+                dispatches: Vec::new(),
+                total_end: None,
+                empty_start: None,
+                empty_end: None,
+            }))
+        }
+
+        fn reserve_dispatch(&mut self, layer: usize, stage: StageClass) -> Result<(u32, u32, u32)> {
+            ensure!(
+                self.next_query + 3 <= self.capacity - 3,
+                "Vulkan profile query pool is too small"
+            );
+            let queries = (self.next_query, self.next_query + 1, self.next_query + 2);
+            self.next_query += 3;
+            self.dispatches.push(DispatchQueries {
+                layer,
+                stage,
+                start: queries.0,
+                dispatch_end: queries.1,
+                barrier_end: queries.2,
+            });
+            Ok(queries)
+        }
+
+        fn finish(&mut self, state: &DeviceState, command: vk::CommandBuffer) -> Result<()> {
+            ensure!(
+                self.next_query + 3 <= self.capacity,
+                "Vulkan profile query pool cannot fit terminal timestamps"
+            );
+            let total_end = self.next_query;
+            let empty_start = total_end + 1;
+            let empty_end = total_end + 2;
+            unsafe {
+                state.device.cmd_write_timestamp(
+                    command,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    self.pool,
+                    total_end,
+                );
+                // Adjacent timestamps quantify query-command overhead without removing a data
+                // dependency that the encoder requires for correctness.
+                state.device.cmd_write_timestamp(
+                    command,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    self.pool,
+                    empty_start,
+                );
+                state.device.cmd_write_timestamp(
+                    command,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    self.pool,
+                    empty_end,
+                );
+            }
+            self.next_query += 3;
+            self.total_end = Some(total_end);
+            self.empty_start = Some(empty_start);
+            self.empty_end = Some(empty_end);
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct LayerProfile {
+        stage_us: [f64; PROFILE_STAGE_COUNT],
+        barrier_us: f64,
+    }
+
+    struct ProfileCapture {
+        query: QueryRecording,
+        family: &'static str,
+        batch: usize,
+        seq: usize,
+        layer_count: usize,
+        samples_seen: u64,
+        recording_current_sample: bool,
+        executions: u64,
+        layers: Vec<LayerProfile>,
+        gpu_total_us: f64,
+        gpu_interval_residual_us: f64,
+        submit_wait_us: f64,
+        empty_sandwich_us: f64,
+    }
+
+    impl ProfileCapture {
+        fn new(
+            query: QueryRecording,
+            family: &'static str,
+            batch: usize,
+            seq: usize,
+            layer_count: usize,
+        ) -> Self {
+            Self {
+                query,
+                family,
+                batch,
+                seq,
+                layer_count,
+                samples_seen: 0,
+                recording_current_sample: false,
+                executions: 0,
+                layers: (0..=layer_count).map(|_| LayerProfile::default()).collect(),
+                gpu_total_us: 0.0,
+                gpu_interval_residual_us: 0.0,
+                submit_wait_us: 0.0,
+                empty_sandwich_us: 0.0,
+            }
+        }
+
+        fn ticks_between(state: &DeviceState, start: u64, end: u64) -> u64 {
+            let delta = end.wrapping_sub(start);
+            if state.timestamp_valid_bits >= 64 {
+                delta
+            } else {
+                delta & ((1_u64 << state.timestamp_valid_bits) - 1)
+            }
+        }
+
+        fn microseconds(state: &DeviceState, start: u64, end: u64) -> f64 {
+            Self::ticks_between(state, start, end) as f64 * state.timestamp_period_ns / 1_000.0
+        }
+
+        fn record_queries(&mut self, state: &DeviceState, submit_wait_us: f64) -> Result<()> {
+            let mut timestamps = vec![0_u64; self.query.next_query as usize];
+            unsafe {
+                state.device.get_query_pool_results(
+                    self.query.pool,
+                    0,
+                    &mut timestamps,
+                    vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+                )?;
+            }
+            self.samples_seen += 1;
+            if self.samples_seen == 1 {
+                self.recording_current_sample = false;
+                return Ok(());
+            }
+            self.recording_current_sample = true;
+            let total_end = self
+                .query
+                .total_end
+                .context("profile total timestamp missing")?;
+            let empty_start = self
+                .query
+                .empty_start
+                .context("profile empty-sandwich start missing")?;
+            let empty_end = self
+                .query
+                .empty_end
+                .context("profile empty-sandwich end missing")?;
+            let total_us = Self::microseconds(state, timestamps[0], timestamps[total_end as usize]);
+            let mut attributed_us = 0.0;
+            for dispatch in &self.query.dispatches {
+                let dispatch_us = Self::microseconds(
+                    state,
+                    timestamps[dispatch.start as usize],
+                    timestamps[dispatch.dispatch_end as usize],
+                );
+                let barrier_us = Self::microseconds(
+                    state,
+                    timestamps[dispatch.dispatch_end as usize],
+                    timestamps[dispatch.barrier_end as usize],
+                );
+                self.layers[dispatch.layer].stage_us[dispatch.stage as usize] += dispatch_us;
+                self.layers[dispatch.layer].barrier_us += barrier_us;
+                attributed_us += dispatch_us + barrier_us;
+            }
+            self.executions += 1;
+            self.gpu_total_us += total_us;
+            self.gpu_interval_residual_us += total_us - attributed_us;
+            self.submit_wait_us += submit_wait_us;
+            self.empty_sandwich_us += Self::microseconds(
+                state,
+                timestamps[empty_start as usize],
+                timestamps[empty_end as usize],
+            );
+            Ok(())
+        }
+
+        fn record_readback(&mut self, readback_us: f64) {
+            if self.recording_current_sample {
+                self.layers[self.layer_count].stage_us[StageClass::Readback as usize] +=
+                    readback_us;
+            }
+        }
+
+        fn emit(&self, state: &DeviceState) {
+            if self.executions == 0 {
+                return;
+            }
+            let divisor = self.executions as f64;
+            let layers = self
+                .layers
+                .iter()
+                .enumerate()
+                .map(|(layer, aggregate)| {
+                    let stage_us = StageClass::ALL
+                        .into_iter()
+                        .map(|stage| {
+                            (
+                                stage.label().to_owned(),
+                                serde_json::json!(aggregate.stage_us[stage as usize] / divisor),
+                            )
+                        })
+                        .collect::<serde_json::Map<_, _>>();
+                    let dispatches = self
+                        .query
+                        .dispatches
+                        .iter()
+                        .filter(|dispatch| dispatch.layer == layer)
+                        .count();
+                    serde_json::json!({
+                        "layer": if layer == self.layer_count { serde_json::json!("final/readback") } else { serde_json::json!(layer) },
+                        "stage_us_mean": stage_us,
+                        "barrier_us_mean": aggregate.barrier_us / divisor,
+                        "pipeline_barriers_per_execution": dispatches,
+                        "descriptor_rebinds_per_execution": dispatches,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let record = serde_json::json!({
+                "schema": "synapse-vulkan-stage-profile-v1",
+                "family": self.family,
+                "shape": {"batch": self.batch, "seq": self.seq},
+                "executions": self.executions,
+                "warmup_executions_skipped": self.samples_seen - self.executions,
+                "timestamp_period_ns": state.timestamp_period_ns,
+                "timestamp_valid_bits": state.timestamp_valid_bits,
+                "gpu_total_us_mean": self.gpu_total_us / divisor,
+                "gpu_interval_residual_us_mean": self.gpu_interval_residual_us / divisor,
+                "submit_wait_us_mean": self.submit_wait_us / divisor,
+                "empty_timestamp_sandwich_us_mean": self.empty_sandwich_us / divisor,
+                "dispatches_per_execution": self.query.dispatches.len(),
+                "pipeline_barriers_per_execution": self.query.dispatches.len(),
+                "descriptor_rebinds_per_execution": self.query.dispatches.len(),
+                "layers": layers,
+            });
+            let line = match serde_json::to_string(&record) {
+                Ok(line) => line,
+                Err(error) => {
+                    eprintln!("Vulkan profile serialization failed: {error}");
+                    return;
+                }
+            };
+            if let Some(path) = &state.profile_output {
+                let result = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .and_then(|mut file| writeln!(file, "{line}"));
+                if let Err(error) = result {
+                    eprintln!(
+                        "Vulkan profile write failed for {}: {error}",
+                        path.display()
+                    );
+                }
+            } else {
+                eprintln!("VULKAN_PROFILE {line}");
+            }
+        }
+    }
+
     struct Recorder<'a> {
         state: &'a DeviceState,
         command: vk::CommandBuffer,
         descriptor_pool: vk::DescriptorPool,
         descriptor_sets: Vec<vk::DescriptorSet>,
         pipelines: &'a Pipelines,
+        profile: Option<QueryRecording>,
     }
 
     impl Recorder<'_> {
@@ -719,6 +1123,8 @@ mod enabled {
             buffers: &[&Buffer],
             params: &T,
             groups: [u32; 3],
+            layer: usize,
+            stage: StageClass,
         ) -> Result<()> {
             let layouts = [self.state.descriptor_layout];
             let set = unsafe {
@@ -748,6 +1154,11 @@ mod enabled {
                         .buffer_info(info)
                 })
                 .collect::<Vec<_>>();
+            let queries = self
+                .profile
+                .as_mut()
+                .map(|profile| profile.reserve_dispatch(layer, stage))
+                .transpose()?;
             unsafe {
                 self.state.device.update_descriptor_sets(&writes, &[]);
                 self.state.device.cmd_bind_pipeline(
@@ -770,9 +1181,25 @@ mod enabled {
                     0,
                     bytes_of(params),
                 );
+                if let Some((start, _, _)) = queries {
+                    self.state.device.cmd_write_timestamp(
+                        self.command,
+                        vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                        self.profile.as_ref().expect("profile exists").pool,
+                        start,
+                    );
+                }
                 self.state
                     .device
                     .cmd_dispatch(self.command, groups[0], groups[1], groups[2]);
+                if let Some((_, dispatch_end, _)) = queries {
+                    self.state.device.cmd_write_timestamp(
+                        self.command,
+                        vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                        self.profile.as_ref().expect("profile exists").pool,
+                        dispatch_end,
+                    );
+                }
                 let barrier = [vk::MemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::SHADER_WRITE)
                     .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)];
@@ -785,6 +1212,21 @@ mod enabled {
                     &[],
                     &[],
                 );
+                if let Some((_, _, barrier_end)) = queries {
+                    self.state.device.cmd_write_timestamp(
+                        self.command,
+                        vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                        self.profile.as_ref().expect("profile exists").pool,
+                        barrier_end,
+                    );
+                }
+            }
+            Ok(())
+        }
+
+        fn finish_profile(&mut self) -> Result<()> {
+            if let Some(profile) = &mut self.profile {
+                profile.finish(self.state, self.command)?;
             }
             Ok(())
         }
@@ -800,8 +1242,24 @@ mod enabled {
             k: usize,
             batch_count: usize,
             transpose_b: bool,
+            layer: usize,
+            stage: StageClass,
         ) -> Result<()> {
-            self.gemm_offset(a, b, c, m, n, k, batch_count, transpose_b, 0, 0, 0)
+            self.gemm_offset(
+                a,
+                b,
+                c,
+                m,
+                n,
+                k,
+                batch_count,
+                transpose_b,
+                0,
+                0,
+                0,
+                layer,
+                stage,
+            )
         }
 
         #[allow(clippy::too_many_arguments)]
@@ -818,6 +1276,8 @@ mod enabled {
             a_offset: usize,
             b_offset: usize,
             c_offset: usize,
+            layer: usize,
+            stage: StageClass,
         ) -> Result<()> {
             let groups = [
                 n.div_ceil(16) as u32,
@@ -845,6 +1305,8 @@ mod enabled {
                     &[a, b, c],
                     &params,
                     groups,
+                    layer,
+                    stage,
                 )?;
                 if m % 16 != 0 || n % 16 != 0 {
                     self.dispatch(
@@ -855,11 +1317,20 @@ mod enabled {
                             ..params
                         },
                         groups,
+                        layer,
+                        stage,
                     )?;
                 }
                 Ok(())
             } else {
-                self.dispatch(self.pipelines.plain, &[a, b, c], &params, groups)
+                self.dispatch(
+                    self.pipelines.plain,
+                    &[a, b, c],
+                    &params,
+                    groups,
+                    layer,
+                    stage,
+                )
             }
         }
     }
@@ -873,6 +1344,7 @@ mod enabled {
         pipelines: Pipelines,
         _descriptor_sets: Vec<vk::DescriptorSet>,
         activations: Activations,
+        profile: Option<ProfileCapture>,
         batch: usize,
         hidden: usize,
     }
@@ -937,12 +1409,13 @@ mod enabled {
                 descriptor_pool,
                 descriptor_sets: Vec::new(),
                 pipelines: &pipelines,
+                profile: QueryRecording::new(&state, command, dispatch_count)?,
             };
             let rows = batch * seq;
             let head_dim = hidden / heads;
             let current = &activations.input;
             let next = &activations.x1;
-            for layer in layers {
+            for (layer_index, layer) in layers.iter().enumerate() {
                 recorder.gemm(
                     current,
                     &layer.query.weight,
@@ -952,6 +1425,8 @@ mod enabled {
                     hidden,
                     1,
                     true,
+                    layer_index,
+                    StageClass::GemmQkv,
                 )?;
                 recorder.gemm(
                     current,
@@ -962,6 +1437,8 @@ mod enabled {
                     hidden,
                     1,
                     true,
+                    layer_index,
+                    StageClass::GemmQkv,
                 )?;
                 recorder.gemm(
                     current,
@@ -972,6 +1449,8 @@ mod enabled {
                     hidden,
                     1,
                     true,
+                    layer_index,
+                    StageClass::GemmQkv,
                 )?;
                 recorder.dispatch(
                     pipelines.qkv,
@@ -993,6 +1472,8 @@ mod enabled {
                         d: head_dim as u32,
                     },
                     [(batch * heads * seq * head_dim).div_ceil(256) as u32, 1, 1],
+                    layer_index,
+                    StageClass::LayoutTranspose,
                 )?;
                 recorder.gemm(
                     &activations.q,
@@ -1003,6 +1484,8 @@ mod enabled {
                     head_dim,
                     batch * heads,
                     true,
+                    layer_index,
+                    StageClass::GemmAttentionScores,
                 )?;
                 recorder.dispatch(
                     pipelines.softmax,
@@ -1018,6 +1501,8 @@ mod enabled {
                         scale: 1.0 / (head_dim as f32).sqrt(),
                     },
                     [(batch * heads * seq) as u32, 1, 1],
+                    layer_index,
+                    StageClass::SoftmaxMask,
                 )?;
                 recorder.gemm(
                     &activations.scores_f16,
@@ -1028,6 +1513,8 @@ mod enabled {
                     seq,
                     batch * heads,
                     false,
+                    layer_index,
+                    StageClass::GemmPv,
                 )?;
                 recorder.dispatch(
                     pipelines.transpose,
@@ -1039,6 +1526,8 @@ mod enabled {
                         d: head_dim as u32,
                     },
                     [(batch * seq * hidden).div_ceil(256) as u32, 1, 1],
+                    layer_index,
+                    StageClass::LayoutTranspose,
                 )?;
                 recorder.gemm(
                     &activations.context_f16,
@@ -1049,6 +1538,8 @@ mod enabled {
                     hidden,
                     1,
                     true,
+                    layer_index,
+                    StageClass::GemmOut,
                 )?;
                 recorder.dispatch(
                     pipelines.residual_norm,
@@ -1066,6 +1557,8 @@ mod enabled {
                         epsilon,
                     },
                     [rows as u32, 1, 1],
+                    layer_index,
+                    StageClass::Pointwise,
                 )?;
                 recorder.gemm(
                     next,
@@ -1076,6 +1569,8 @@ mod enabled {
                     hidden,
                     1,
                     true,
+                    layer_index,
+                    StageClass::GemmMlpUp,
                 )?;
                 recorder.dispatch(
                     pipelines.gelu,
@@ -1091,6 +1586,8 @@ mod enabled {
                         d: 0,
                     },
                     [(rows * intermediate).div_ceil(256) as u32, 1, 1],
+                    layer_index,
+                    StageClass::Pointwise,
                 )?;
                 recorder.gemm(
                     &activations.intermediate_f16,
@@ -1101,6 +1598,8 @@ mod enabled {
                     intermediate,
                     1,
                     true,
+                    layer_index,
+                    StageClass::GemmMlpDown,
                 )?;
                 recorder.dispatch(
                     pipelines.residual_norm,
@@ -1118,6 +1617,8 @@ mod enabled {
                         epsilon,
                     },
                     [rows as u32, 1, 1],
+                    layer_index,
+                    StageClass::Pointwise,
                 )?;
             }
             recorder.dispatch(
@@ -1130,8 +1631,15 @@ mod enabled {
                     d: 0,
                 },
                 [batch as u32, 1, 1],
+                layers.len(),
+                StageClass::Pointwise,
             )?;
+            recorder.finish_profile()?;
             unsafe { state.device.end_command_buffer(command)? };
+            let profile = recorder
+                .profile
+                .take()
+                .map(|query| ProfileCapture::new(query, "MiniLM", batch, seq, layers.len()));
             let descriptor_sets = std::mem::take(&mut recorder.descriptor_sets);
             let descriptor_set_count = descriptor_sets.len();
             drop(recorder);
@@ -1148,6 +1656,7 @@ mod enabled {
                 pipelines,
                 _descriptor_sets: descriptor_sets,
                 activations,
+                profile,
                 batch,
                 hidden,
             })
@@ -1162,6 +1671,7 @@ mod enabled {
                 .map(|value| u32::from(*value))
                 .collect::<Vec<_>>();
             self.activations.mask.write(&mask_u32)?;
+            let submit_started = Instant::now();
             unsafe {
                 self.state.device.reset_fences(&[self.fence])?;
                 self.state.device.queue_submit(
@@ -1173,7 +1683,17 @@ mod enabled {
                     .device
                     .wait_for_fences(&[self.fence], true, u64::MAX)?;
             }
+            if let Some(profile) = &mut self.profile {
+                profile.record_queries(
+                    &self.state,
+                    submit_started.elapsed().as_secs_f64() * 1_000_000.0,
+                )?;
+            }
+            let readback_started = Instant::now();
             let output = self.activations.pooled.read_f32(self.batch * self.hidden)?;
+            if let Some(profile) = &mut self.profile {
+                profile.record_readback(readback_started.elapsed().as_secs_f64() * 1_000_000.0);
+            }
             Ok(output
                 .chunks_exact(self.hidden)
                 .map(<[f32]>::to_vec)
@@ -1185,6 +1705,12 @@ mod enabled {
         fn drop(&mut self) {
             unsafe {
                 let _ = self.state.device.device_wait_idle();
+                if let Some(profile) = &self.profile {
+                    profile.emit(&self.state);
+                    self.state
+                        .device
+                        .destroy_query_pool(profile.query.pool, None);
+                }
                 for pipeline in self.pipelines.all() {
                     self.state.device.destroy_pipeline(pipeline, None);
                 }
@@ -1439,6 +1965,7 @@ mod enabled {
         pipelines: Pipelines,
         _descriptor_sets: Vec<vk::DescriptorSet>,
         activations: ModernActivations,
+        profile: Option<ProfileCapture>,
         values: usize,
     }
 
@@ -1511,10 +2038,11 @@ mod enabled {
                 descriptor_pool,
                 descriptor_sets: Vec::new(),
                 pipelines: &pipelines,
+                profile: QueryRecording::new(&state, command, max_sets)?,
             };
             let rows = batch * seq;
             let head_dim = hidden / heads;
-            for layer in layers {
+            for (layer_index, layer) in layers.iter().enumerate() {
                 recorder.dispatch(
                     pipelines.layer_norm,
                     &[
@@ -1529,6 +2057,8 @@ mod enabled {
                         identity: u32::from(!layer.has_attention_norm),
                     },
                     [rows as u32, 1, 1],
+                    layer_index,
+                    StageClass::Pointwise,
                 )?;
                 recorder.gemm(
                     &activations.normed,
@@ -1539,6 +2069,8 @@ mod enabled {
                     hidden,
                     1,
                     true,
+                    layer_index,
+                    StageClass::GemmQkv,
                 )?;
                 let (cosine, sine) = if layer.sliding_attention {
                     (&activations.local_cos, &activations.local_sin)
@@ -1562,6 +2094,8 @@ mod enabled {
                         d: head_dim as u32,
                     },
                     [(batch * heads * seq * head_dim).div_ceil(256) as u32, 1, 1],
+                    layer_index,
+                    StageClass::LayoutTranspose,
                 )?;
                 recorder.gemm(
                     &activations.q,
@@ -1572,6 +2106,8 @@ mod enabled {
                     head_dim,
                     batch * heads,
                     true,
+                    layer_index,
+                    StageClass::GemmAttentionScores,
                 )?;
                 recorder.dispatch(
                     pipelines.modern_softmax,
@@ -1589,6 +2125,8 @@ mod enabled {
                         sliding: u32::from(layer.sliding_attention),
                     },
                     [(batch * heads * seq) as u32, 1, 1],
+                    layer_index,
+                    StageClass::SoftmaxMask,
                 )?;
                 recorder.gemm(
                     &activations.probabilities,
@@ -1599,6 +2137,8 @@ mod enabled {
                     seq,
                     batch * heads,
                     false,
+                    layer_index,
+                    StageClass::GemmPv,
                 )?;
                 recorder.dispatch(
                     pipelines.transpose,
@@ -1610,6 +2150,8 @@ mod enabled {
                         d: head_dim as u32,
                     },
                     [(rows * hidden).div_ceil(256) as u32, 1, 1],
+                    layer_index,
+                    StageClass::LayoutTranspose,
                 )?;
                 recorder.gemm(
                     &activations.context,
@@ -1620,6 +2162,8 @@ mod enabled {
                     hidden,
                     1,
                     true,
+                    layer_index,
+                    StageClass::GemmOut,
                 )?;
                 recorder.dispatch(
                     pipelines.add_residual,
@@ -1631,6 +2175,8 @@ mod enabled {
                         d: 0,
                     },
                     [(rows * hidden).div_ceil(256) as u32, 1, 1],
+                    layer_index,
+                    StageClass::Pointwise,
                 )?;
                 recorder.dispatch(
                     pipelines.layer_norm,
@@ -1642,6 +2188,8 @@ mod enabled {
                         identity: 0,
                     },
                     [rows as u32, 1, 1],
+                    layer_index,
+                    StageClass::Pointwise,
                 )?;
                 recorder.gemm(
                     &activations.normed,
@@ -1652,6 +2200,8 @@ mod enabled {
                     hidden,
                     1,
                     true,
+                    layer_index,
+                    StageClass::GemmMlpUp,
                 )?;
                 recorder.dispatch(
                     pipelines.geglu,
@@ -1663,6 +2213,8 @@ mod enabled {
                         d: 0,
                     },
                     [(rows * intermediate).div_ceil(256) as u32, 1, 1],
+                    layer_index,
+                    StageClass::Pointwise,
                 )?;
                 recorder.gemm(
                     &activations.activated,
@@ -1673,6 +2225,8 @@ mod enabled {
                     intermediate,
                     1,
                     true,
+                    layer_index,
+                    StageClass::GemmMlpDown,
                 )?;
                 recorder.dispatch(
                     pipelines.add_residual,
@@ -1684,6 +2238,8 @@ mod enabled {
                         d: 0,
                     },
                     [(rows * hidden).div_ceil(256) as u32, 1, 1],
+                    layer_index,
+                    StageClass::Pointwise,
                 )?;
             }
             recorder.dispatch(
@@ -1696,10 +2252,16 @@ mod enabled {
                     identity: 0,
                 },
                 [rows as u32, 1, 1],
+                layers.len(),
+                StageClass::Pointwise,
             )?;
+            recorder.finish_profile()?;
             unsafe {
                 state.device.end_command_buffer(command)?;
             }
+            let profile = recorder.profile.take().map(|query| {
+                ProfileCapture::new(query, "gte-modernbert", batch, seq, layers.len())
+            });
             let descriptor_sets = std::mem::take(&mut recorder.descriptor_sets);
             drop(recorder);
             eprintln!("Vulkan ModernBERT shape {batch}x{seq}: gemm={} encoder_resident=true dual_theta=true local_mask=content", state.gemm.as_str());
@@ -1712,6 +2274,7 @@ mod enabled {
                 pipelines,
                 _descriptor_sets: descriptor_sets,
                 activations,
+                profile,
                 values: rows * hidden,
             })
         }
@@ -1726,6 +2289,7 @@ mod enabled {
                     .map(|value| u32::from(*value))
                     .collect::<Vec<_>>(),
             )?;
+            let submit_started = Instant::now();
             unsafe {
                 self.state.device.reset_fences(&[self.fence])?;
                 self.state.device.queue_submit(
@@ -1737,9 +2301,18 @@ mod enabled {
                     .device
                     .wait_for_fences(&[self.fence], true, u64::MAX)?;
             }
-            hidden_states.copy_from_slice(&decode_f16_bits(
-                &self.activations.x1.read_u16(self.values)?,
-            ));
+            if let Some(profile) = &mut self.profile {
+                profile.record_queries(
+                    &self.state,
+                    submit_started.elapsed().as_secs_f64() * 1_000_000.0,
+                )?;
+            }
+            let readback_started = Instant::now();
+            let output = self.activations.x1.read_u16(self.values)?;
+            if let Some(profile) = &mut self.profile {
+                profile.record_readback(readback_started.elapsed().as_secs_f64() * 1_000_000.0);
+            }
+            hidden_states.copy_from_slice(&decode_f16_bits(&output));
             Ok(())
         }
     }
@@ -1748,6 +2321,12 @@ mod enabled {
         fn drop(&mut self) {
             unsafe {
                 let _ = self.state.device.device_wait_idle();
+                if let Some(profile) = &self.profile {
+                    profile.emit(&self.state);
+                    self.state
+                        .device
+                        .destroy_query_pool(profile.query.pool, None);
+                }
                 for pipeline in self.pipelines.all() {
                     self.state.device.destroy_pipeline(pipeline, None);
                 }
@@ -1987,6 +2566,7 @@ mod enabled {
         pipelines: Pipelines,
         _descriptor_sets: Vec<vk::DescriptorSet>,
         activations: QwenActivations,
+        profile: Option<ProfileCapture>,
         values: usize,
     }
 
@@ -2059,6 +2639,7 @@ mod enabled {
                 descriptor_pool,
                 descriptor_sets: Vec::new(),
                 pipelines: &pipelines,
+                profile: QueryRecording::new(&state, command, max_sets)?,
             };
             let rows = batch * seq;
             let query_width = query_heads * head_dim;
@@ -2067,7 +2648,7 @@ mod enabled {
             let group_batches = batch * kv_heads;
             let query_group_values = batch * kv_heads * seq * head_dim;
             let score_group_values = batch * kv_heads * seq * seq;
-            for layer in layers {
+            for (layer_index, layer) in layers.iter().enumerate() {
                 recorder.dispatch(
                     pipelines.rms_norm,
                     &[&activations.input, &layer.input_norm, &activations.normed],
@@ -2078,6 +2659,8 @@ mod enabled {
                         identity: 0,
                     },
                     [rows as u32, 1, 1],
+                    layer_index,
+                    StageClass::Pointwise,
                 )?;
                 recorder.gemm(
                     &activations.normed,
@@ -2088,6 +2671,8 @@ mod enabled {
                     hidden,
                     1,
                     true,
+                    layer_index,
+                    StageClass::GemmQkv,
                 )?;
                 recorder.gemm(
                     &activations.normed,
@@ -2098,6 +2683,8 @@ mod enabled {
                     hidden,
                     1,
                     true,
+                    layer_index,
+                    StageClass::GemmQkv,
                 )?;
                 recorder.gemm(
                     &activations.normed,
@@ -2108,6 +2695,8 @@ mod enabled {
                     hidden,
                     1,
                     true,
+                    layer_index,
+                    StageClass::GemmQkv,
                 )?;
                 recorder.dispatch(
                     pipelines.qwen_head_norm_rope,
@@ -2127,6 +2716,8 @@ mod enabled {
                         groups: groups as u32,
                     },
                     [(rows * query_heads) as u32, 1, 1],
+                    layer_index,
+                    StageClass::LayoutTranspose,
                 )?;
                 recorder.dispatch(
                     pipelines.qwen_head_norm_rope,
@@ -2146,6 +2737,8 @@ mod enabled {
                         groups: 1,
                     },
                     [(rows * kv_heads) as u32, 1, 1],
+                    layer_index,
+                    StageClass::LayoutTranspose,
                 )?;
                 recorder.dispatch(
                     pipelines.qwen_value_transpose,
@@ -2157,6 +2750,8 @@ mod enabled {
                         d: head_dim as u32,
                     },
                     [(rows * kv_width).div_ceil(256) as u32, 1, 1],
+                    layer_index,
+                    StageClass::LayoutTranspose,
                 )?;
                 for group in 0..groups {
                     recorder.gemm_offset(
@@ -2171,6 +2766,8 @@ mod enabled {
                         group * query_group_values,
                         0,
                         group * score_group_values,
+                        layer_index,
+                        StageClass::GemmAttentionScores,
                     )?;
                 }
                 recorder.dispatch(
@@ -2187,6 +2784,8 @@ mod enabled {
                         scale: 1.0 / (head_dim as f32).sqrt(),
                     },
                     [(batch * query_heads * seq) as u32, 1, 1],
+                    layer_index,
+                    StageClass::SoftmaxMask,
                 )?;
                 for group in 0..groups {
                     recorder.gemm_offset(
@@ -2201,6 +2800,8 @@ mod enabled {
                         group * score_group_values,
                         0,
                         group * query_group_values,
+                        layer_index,
+                        StageClass::GemmPv,
                     )?;
                 }
                 // Query width is 2048 for this checkpoint, twice hidden. Dispatching from hidden
@@ -2216,6 +2817,8 @@ mod enabled {
                         head_dim: head_dim as u32,
                     },
                     [(rows * query_width).div_ceil(256) as u32, 1, 1],
+                    layer_index,
+                    StageClass::LayoutTranspose,
                 )?;
                 recorder.gemm(
                     &activations.context,
@@ -2226,6 +2829,8 @@ mod enabled {
                     query_width,
                     1,
                     true,
+                    layer_index,
+                    StageClass::GemmOut,
                 )?;
                 recorder.dispatch(
                     pipelines.add_residual,
@@ -2237,6 +2842,8 @@ mod enabled {
                         d: 0,
                     },
                     [(rows * hidden).div_ceil(256) as u32, 1, 1],
+                    layer_index,
+                    StageClass::Pointwise,
                 )?;
                 recorder.dispatch(
                     pipelines.rms_norm,
@@ -2252,6 +2859,8 @@ mod enabled {
                         identity: 0,
                     },
                     [rows as u32, 1, 1],
+                    layer_index,
+                    StageClass::Pointwise,
                 )?;
                 recorder.gemm(
                     &activations.normed,
@@ -2262,6 +2871,8 @@ mod enabled {
                     hidden,
                     1,
                     true,
+                    layer_index,
+                    StageClass::GemmMlpUp,
                 )?;
                 recorder.gemm(
                     &activations.normed,
@@ -2272,6 +2883,8 @@ mod enabled {
                     hidden,
                     1,
                     true,
+                    layer_index,
+                    StageClass::GemmMlpUp,
                 )?;
                 recorder.dispatch(
                     pipelines.swiglu,
@@ -2283,6 +2896,8 @@ mod enabled {
                         d: 0,
                     },
                     [(rows * intermediate).div_ceil(256) as u32, 1, 1],
+                    layer_index,
+                    StageClass::Pointwise,
                 )?;
                 recorder.gemm(
                     &activations.activated,
@@ -2293,6 +2908,8 @@ mod enabled {
                     intermediate,
                     1,
                     true,
+                    layer_index,
+                    StageClass::GemmMlpDown,
                 )?;
                 recorder.dispatch(
                     pipelines.add_residual,
@@ -2304,6 +2921,8 @@ mod enabled {
                         d: 0,
                     },
                     [(rows * hidden).div_ceil(256) as u32, 1, 1],
+                    layer_index,
+                    StageClass::Pointwise,
                 )?;
             }
             recorder.dispatch(
@@ -2316,10 +2935,16 @@ mod enabled {
                     identity: 0,
                 },
                 [rows as u32, 1, 1],
+                layers.len(),
+                StageClass::Pointwise,
             )?;
+            recorder.finish_profile()?;
             unsafe {
                 state.device.end_command_buffer(command)?;
             }
+            let profile = recorder.profile.take().map(|query| {
+                ProfileCapture::new(query, "Qwen3-Embedding-0.6B", batch, seq, layers.len())
+            });
             let descriptor_sets = std::mem::take(&mut recorder.descriptor_sets);
             drop(recorder);
             eprintln!("Vulkan Qwen3 shape {batch}x{seq}: gemm={} encoder_resident=true gqa=two-group-strided kv_repeat_bytes=0 query_width={query_width}", state.gemm.as_str());
@@ -2332,6 +2957,7 @@ mod enabled {
                 pipelines,
                 _descriptor_sets: descriptor_sets,
                 activations,
+                profile,
                 values: rows * hidden,
             })
         }
@@ -2346,6 +2972,7 @@ mod enabled {
                     .map(|value| u32::from(*value))
                     .collect::<Vec<_>>(),
             )?;
+            let submit_started = Instant::now();
             unsafe {
                 self.state.device.reset_fences(&[self.fence])?;
                 self.state.device.queue_submit(
@@ -2357,9 +2984,18 @@ mod enabled {
                     .device
                     .wait_for_fences(&[self.fence], true, u64::MAX)?;
             }
-            hidden_states.copy_from_slice(&decode_f16_bits(
-                &self.activations.x1.read_u16(self.values)?,
-            ));
+            if let Some(profile) = &mut self.profile {
+                profile.record_queries(
+                    &self.state,
+                    submit_started.elapsed().as_secs_f64() * 1_000_000.0,
+                )?;
+            }
+            let readback_started = Instant::now();
+            let output = self.activations.x1.read_u16(self.values)?;
+            if let Some(profile) = &mut self.profile {
+                profile.record_readback(readback_started.elapsed().as_secs_f64() * 1_000_000.0);
+            }
+            hidden_states.copy_from_slice(&decode_f16_bits(&output));
             Ok(())
         }
     }
@@ -2368,6 +3004,12 @@ mod enabled {
         fn drop(&mut self) {
             unsafe {
                 let _ = self.state.device.device_wait_idle();
+                if let Some(profile) = &self.profile {
+                    profile.emit(&self.state);
+                    self.state
+                        .device
+                        .destroy_query_pool(profile.query.pool, None);
+                }
                 for pipeline in self.pipelines.all() {
                     self.state.device.destroy_pipeline(pipeline, None);
                 }

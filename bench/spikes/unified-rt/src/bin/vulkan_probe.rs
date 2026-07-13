@@ -26,6 +26,9 @@ fn main() -> anyhow::Result<()> {
         driver_version_raw: u32,
         cooperative_matrix: bool,
         cooperative_matrix_robust_buffer_access: bool,
+        timestamp_compute_and_graphics: bool,
+        timestamp_period_ns: f32,
+        compute_queue_timestamp_valid_bits: Option<u32>,
         properties: Vec<MatrixProperty>,
     }
 
@@ -43,6 +46,11 @@ fn main() -> anyhow::Result<()> {
             let mut cooperative = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default();
             let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut cooperative);
             instance.get_physical_device_features2(physical_device, &mut features);
+            let compute_queue_timestamp_valid_bits = instance
+                .get_physical_device_queue_family_properties(physical_device)
+                .into_iter()
+                .find(|family| family.queue_flags.contains(vk::QueueFlags::COMPUTE))
+                .map(|family| family.timestamp_valid_bits);
             let matrix_properties = loader
                 .get_physical_device_cooperative_matrix_properties(physical_device)?
                 .into_iter()
@@ -74,6 +82,10 @@ fn main() -> anyhow::Result<()> {
                 cooperative_matrix_robust_buffer_access: cooperative
                     .cooperative_matrix_robust_buffer_access
                     != 0,
+                timestamp_compute_and_graphics: properties.limits.timestamp_compute_and_graphics
+                    != 0,
+                timestamp_period_ns: properties.limits.timestamp_period,
+                compute_queue_timestamp_valid_bits,
                 properties: matrix_properties,
             });
         }
