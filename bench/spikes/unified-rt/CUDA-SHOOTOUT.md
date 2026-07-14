@@ -106,3 +106,63 @@ Every coordinate-file digest supplied in `RIG-CUDA-SHOOTOUT.txt` was recomputed 
 | Staged Synapse bundle | `13052737d2bae84c072fcb515ce9052e94de82d0c73afe5f5093faca71ef7254` |
 
 Raw final, tuning, latency, and parity JSONs were copied to `bench/results/cuda-shootout-2026-07-14/`; that directory is intentionally gitignored. Reproduction helpers are `cuda_shootout_client.py`, `cuda_shootout_direct.sh`, `cuda_shootout_owned_latency.py`, and `cuda_shootout_ort_latency.py` in this directory.
+
+
+## vLLM cell (2026-07-14 addendum)
+
+This fresh-cell measurement used vast.ai contract 44882011: RTX 4090 24 GiB, driver 590.48.01, CUDA 12.6 image, and an AMD EPYC 7B13 host with 32 effective cores. It uses the same 15,271-row corpus, frozen ORT-fp32 references, canonical denominator, f16 dtype, client batch size, parity gate, telemetry cadence, and repeat selection as the baseline above.
+
+| Contender | Model | dtype | Real tok/s | GPU W avg / peak | J/Mtok | Peak VRAM | Cold load | Single-query p50 | Parity cosine / top-10 |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| vLLM pooling | all-MiniLM-L6-v2 | f16 | 187,432 | 77.9 / 85.9 | 416 | 729 MiB | 25.28 s | 6.48 ms | 0.99999928 / 0.9993 |
+| vLLM pooling | gte-modernbert-base | f16 | 114,568 | 161.7 / 206.9 | 1,411 | 1,395 MiB | 29.26 s | 9.14 ms | 0.99999873 / 0.9980 |
+| vLLM pooling | Qwen3-Embedding-0.6B | f16 | 47,639 | 209.8 / 243.2 | 4,403 | 23,207 MiB | 48.60 s | 9.26 ms | 0.99999907 / 0.9988 |
+
+### Version pins and invocation
+
+| Component | Exact pin / configuration |
+|---|---|
+| vLLM | `pip` in a fresh Python 3.12 venv: `vllm==0.25.1`, release tag commit `752a3a504485790a2e8491cacbb35c137339ad34` |
+| PyTorch | `2.11.0` installed by the pinned vLLM wheel |
+| Server | `vllm serve <model-dir> --served-model-name benchmark --runner pooling --pooler-config '{"task":"embed"}' --dtype float16 --max-model-len 512 --max-num-seqs 512 --max-num-batched-tokens <sweep value>` |
+| API/client | OpenAI-compatible `POST /v1/embeddings`; `cuda_shootout_client.py --flavor vllm`, client batch 512 |
+
+vLLM 0.25.1 no longer accepts the earlier `--task embed` spelling, so `--runner pooling --pooler-config '{"task":"embed"}'` is its current equivalent. Startup logs confirmed that vLLM read each Sentence-Transformers module configuration and used canonical sequence pooling without a pooling override: MiniLM `MEAN`, ModernBERT `CLS`, and Qwen3 `LAST`.
+
+MiniLM's Sentence-Transformers configuration advertises a 256-token application limit even though the underlying BERT checkpoint has 512 absolute positions; `VLLM_ALLOW_LONG_MAX_MODEL_LEN=1` was used only for that server's 512-token canonical cap. The longest canonical MiniLM corpus input was 300 tokens, and the other two servers were likewise capped at 512 tokens.
+
+### Method, integrity, and cold phases
+
+The denominator was always the checkpoint `AutoTokenizer` count after the 512-token cap: 2,178,482 MiniLM, 2,031,766 ModernBERT, and 1,569,409 Qwen3 tokens; Qwen3 terminal EOS was forced to 151643. The helper never used vLLM usage fields; for reported power and VRAM it sampled `nvidia-smi` every 500 ms only around timed full-corpus windows, and it measured each p50 with 30 warmed, nonce-varied sequential one-text requests. The 400-row parity gate ran before each sweep, and all three cells passed both required gates shown in the result table.
+
+Final-window preflights recorded 0% GPU utilization and only the serving cell's `VLLM::EngineCore` process; every selected JSON has `foreign_gpu_pids: []` and `contaminated: false`. Cold load is process-spawn-to-healthy after clearing vLLM's torch-compile cache; the engine's separately logged phases were:
+
+| Model | Cold load | Weights | `torch.compile` | Graph capture / engine warmup |
+|---|---:|---:|---:|---:|
+| MiniLM | 25.28 s | 0.12 s | 3.52 s | 5 s / 5.64 s |
+| ModernBERT | 29.26 s | 0.09 s | 9.01 s | 11 s / 11.38 s |
+| Qwen3 | 48.60 s | 2.00 s | 19.14 s | 3 s / 26.23 s |
+
+On-box SHA-256 verification matched the corpus, all three model safetensors, and all six staged parity corpus/vector files listed in the baseline artifact-integrity table. Raw parity vectors, tuning/final JSONs, cold-load records, logs, and `run-metadata.json` are in `bench/results/cuda-shootout-2026-07-14/vllm/`, which is intentionally gitignored.
+
+### Configuration and tuning appendix
+
+| Contender / model | Three-point sweep (tok/s) | Selected full-corpus configuration |
+|---|---|---|
+| vLLM / MiniLM | max batched tokens 8,192: 182,043; 16,384: 179,935; 32,768: 178,530 | 8,192; client batch 512; max seqs 512; f16; mean pool |
+| vLLM / ModernBERT | 8,192: 116,618; 16,384: 117,470; 32,768: 117,044 | 16,384; client batch 512; max seqs 512; f16; CLS pool |
+| vLLM / Qwen3 | 8,192: 48,089; 16,384: 48,633; 32,768: 48,673 | 32,768; client batch 512; max seqs 512; f16; last-token pool |
+
+### Full-corpus repeats and host load
+
+| Cell | Repeat 1 tok/s | Repeat 2 tok/s | Selected repeat | Host 1m load start -> end (R1 / R2) |
+|---|---:|---:|---:|---|
+| vLLM MiniLM | 187,432 | 187,832 | 1 | 19.12 -> 17.54 / 13.47 -> 12.17 |
+| vLLM ModernBERT | 116,478 | 114,568 | 2 | 10.61 -> 8.84 / 7.92 -> 8.09 |
+| vLLM Qwen3 | 47,639 | 49,394 | 1 | 21.74 -> 16.41 / 14.97 -> 15.13 |
+
+The selected row is the lower-throughput repeat, and its telemetry and latency populate the table above. Although one-minute host load varied on the shared fresh rig, it remained below the 32 effective cores; GPU preflights, one-process checks, and the two repeats provide the contamination guard rather than interpreting host load as GPU work.
+
+### Verdict
+
+vLLM did not beat TEI: TEI was 4.14x, 2.02x, and 1.84x faster than vLLM on MiniLM, ModernBERT, and Qwen3 respectively, while also using less energy per million tokens in every row. OWNED was also faster in all three cells (1.71x, 1.18x, and 1.33x respectively), so vLLM's pooling path is not the performance choice on this 4090 despite passing parity.
