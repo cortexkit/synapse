@@ -7,18 +7,31 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
 
 export function parseJsonText(text: string): unknown {
   const trimmed = text.trim();
+  // Whole-text valid JSON is the common case — try it before any extraction.
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    // fall through to extraction
+  }
   // The model may emit a prose preamble ("I have the picture...") before a
   // ```json fenced block, and/or a trailing sign-off — so the fence is not
   // anchored to the whole string. Prefer the LAST fenced block (the final
-  // answer), then fall back to the outermost brace span, then the raw text.
+  // answer), then fall back to the outermost object/array span.
   const fences = [...trimmed.matchAll(/```(?:json)?\s*([\s\S]*?)\s*```/gi)];
   if (fences.length > 0) {
     return JSON.parse(fences[fences.length - 1]![1]!);
   }
-  const firstBrace = trimmed.indexOf("{");
-  const lastBrace = trimmed.lastIndexOf("}");
-  if (firstBrace !== -1 && lastBrace > firstBrace) {
-    return JSON.parse(trimmed.slice(firstBrace, lastBrace + 1));
+  // Outermost span must respect the top-level container type: taking the
+  // first-{ to last-} span of a bare ARRAY strips its brackets and yields
+  // garbage (bit us on an unfenced qgen array response).
+  const starts = [trimmed.indexOf("{"), trimmed.indexOf("[")].filter((i) => i !== -1);
+  if (starts.length > 0) {
+    const start = Math.min(...starts);
+    const closer = trimmed[start] === "[" ? "]" : "}";
+    const end = trimmed.lastIndexOf(closer);
+    if (end > start) {
+      return JSON.parse(trimmed.slice(start, end + 1));
+    }
   }
   return JSON.parse(trimmed);
 }
