@@ -12,7 +12,7 @@ from pathlib import Path
 
 import numpy as np
 import requests
-from tokenizers import Tokenizer
+from transformers import AutoTokenizer
 
 
 def rows(path, limit=None):
@@ -27,8 +27,7 @@ def rows(path, limit=None):
 
 
 def token_count(tok, text, family, eos):
-    e = tok.encode(text, add_special_tokens=True)
-    ids = [x for x, m in zip(e.ids, e.attention_mask) if m][:512]
+    ids = tok.encode(text, add_special_tokens=True, truncation=True, max_length=512)
     if family == "qwen3":
         if ids and ids[-1] == eos:
             ids.pop()
@@ -118,7 +117,7 @@ def parity(vectors, data, ref_path):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--flavor", choices=["tei", "llama"], required=True)
+    p.add_argument("--flavor", choices=["tei", "llama", "vllm"], required=True)
     p.add_argument("--port", type=int, required=True)
     p.add_argument("--corpus", required=True)
     p.add_argument("--tokenizer", required=True)
@@ -134,9 +133,7 @@ def main():
     p.add_argument("--latency-iters", type=int, default=30)
     a = p.parse_args()
     data = rows(a.corpus, a.limit)
-    tok = Tokenizer.from_file(a.tokenizer)
-    tok.no_padding()
-    tok.enable_truncation(max_length=512)
+    tok = AutoTokenizer.from_pretrained(a.tokenizer)
     real_tokens = sum(
         token_count(tok, r["text"], a.family, a.eos_token_id) for r in data
     )
