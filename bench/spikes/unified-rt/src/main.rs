@@ -22,6 +22,7 @@ use tokenizers::{Tokenizer, TruncationParams};
 mod cpu_backend;
 mod cuda_backend;
 mod lfm2;
+mod lfm2_audio;
 mod lfm2_decode;
 mod modernbert;
 mod qwen3;
@@ -41,11 +42,20 @@ struct Args {
     #[arg(long)]
     corpus: Option<PathBuf>,
     /// Rerank request JSONL ({id, query, documents} per line).
-    #[arg(long, conflicts_with_all = ["corpus", "generate_prompts"])]
+    #[arg(long, conflicts_with_all = ["corpus", "generate_prompts", "asr_audio"])]
     rerank_requests: Option<PathBuf>,
     /// Raw-completion prompt JSONL ({id, prompt} per line) for causal-LM greedy decode.
-    #[arg(long, conflicts_with_all = ["corpus", "rerank_requests"])]
+    #[arg(long, conflicts_with_all = ["corpus", "rerank_requests", "asr_audio"])]
     generate_prompts: Option<PathBuf>,
+    /// ASR input JSONL ({id, path} per line; paths are WAV files).
+    #[arg(long, conflicts_with_all = ["corpus", "rerank_requests", "generate_prompts"])]
+    asr_audio: Option<PathBuf>,
+    /// liquid-audio mel, projected-embedding, and greedy-token reference JSONL.
+    #[arg(long, requires = "asr_audio")]
+    asr_reference: Option<PathBuf>,
+    /// Optional JSONL destination containing owned mel and projected embeddings.
+    #[arg(long, requires = "asr_audio")]
+    asr_artifacts_out: Option<PathBuf>,
     /// Transformers token/logit reference JSONL for greedy decode.
     #[arg(long, requires = "generate_prompts")]
     decode_reference: Option<PathBuf>,
@@ -330,6 +340,67 @@ struct DecodeServingResult {
     results: Vec<DecodePromptResult>,
 }
 
+#[derive(Debug, Deserialize)]
+struct AsrInput {
+    id: String,
+    path: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+struct AsrReference {
+    id: String,
+    #[serde(default)]
+    mel_frames: usize,
+    #[serde(default)]
+    mel: Vec<f32>,
+    #[serde(default)]
+    embeddings: Vec<Vec<f32>>,
+    #[serde(default)]
+    tokens: Vec<u32>,
+    #[serde(default)]
+    text: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AsrArtifactRow {
+    id: String,
+    mel_frames: usize,
+    mel: Vec<f32>,
+    embeddings: Vec<Vec<f32>>,
+    tokens: Vec<u32>,
+    text: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AsrPromptResult {
+    id: String,
+    audio_samples: usize,
+    mel_frames: usize,
+    encoder_frames: usize,
+    prefill_positions: usize,
+    tokens: Vec<u32>,
+    text: String,
+    exact_reference: Option<bool>,
+    mel_max_abs: Option<f32>,
+    encoder_min_cosine: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+struct AsrServingResult {
+    lane: String,
+    workload: &'static str,
+    model: String,
+    checkpoint_revision: &'static str,
+    prompts: usize,
+    exact_prompts: Option<usize>,
+    mel_max_abs: Option<f32>,
+    encoder_min_cosine: Option<f64>,
+    cold_load_s: f64,
+    frontend_encoder_wall_s: f64,
+    prefill_decode_wall_s: f64,
+    results: Vec<AsrPromptResult>,
+}
+
 #[derive(Clone, Deserialize)]
 struct RerankRequest {
     id: String,
@@ -456,13 +527,17 @@ fn main() -> Result<()> {
     let started = Instant::now();
     let mode_count = usize::from(args.corpus.is_some())
         + usize::from(args.rerank_requests.is_some())
-        + usize::from(args.generate_prompts.is_some());
+        + usize::from(args.generate_prompts.is_some())
+        + usize::from(args.asr_audio.is_some());
     ensure!(
         mode_count == 1,
-        "provide exactly one of --corpus, --rerank-requests, or --generate-prompts"
+        "provide exactly one of --corpus, --rerank-requests, --generate-prompts, or --asr-audio"
     );
     if args.generate_prompts.is_some() {
         return run_decode_cli(&args, started);
+    }
+    if args.asr_audio.is_some() {
+        return run_lfm2_audio_asr_cli(&args, started);
     }
     ensure!(
         args.attention_units >= args.max_length.saturating_mul(args.max_length),
@@ -1230,6 +1305,13 @@ fn run_lfm2_decode_cli(args: &Args, started: Instant) -> Result<()> {
         decode_wall_s,
         prefill_tok_per_s: prefill_tokens as f64 / prefill_wall_s.max(f64::MIN_POSITIVE),
         decode_tok_per_s: generated_tokens as f64 / decode_wall_s.max(f64::MIN_POSITIVE),
+        load_stages: qwen3_decode::DecodeStageTimings::default(),
+        prefill_stages: qwen3_decode::DecodeStageTimings::default(),
+        decode_stages: qwen3_decode::DecodeStageTimings::default(),
+        sample_wall_s: 0.0,
+        kv_update_path: "owned-rust-hybrid-cache",
+        weight_feed_path: "provider-static-rhs",
+        optimization_level: 0,
         weight_regions: weight_count,
         results,
     };
@@ -1265,6 +1347,300 @@ fn run_lfm2_decode_cli(args: &Args, started: Instant) -> Result<()> {
         hard_divergences.is_empty(),
         "LFM2 token/cache exactness gate failed:\n{}",
         hard_divergences.join("\n")
+    );
+    Ok(())
+}
+
+fn run_lfm2_audio_asr_cli(args: &Args, started: Instant) -> Result<()> {
+    ensure!(
+        matches!(args.device, DeviceArg::Cpu | DeviceArg::Metal),
+        "LFM2-Audio ASR supports CPU/Accelerate and Metal MPSGraph providers"
+    );
+    ensure!(
+        matches!(args.dtype, Precision::F32),
+        "LFM2-Audio correctness gates require --dtype f32"
+    );
+    ensure!(args.max_new_tokens > 0, "--max-new-tokens must be positive");
+    ensure!(args.decode_top_k > 0, "--decode-top-k must be positive");
+    let config = read_model_config(&args.model)?;
+    ensure!(
+        lfm2_audio::detect_config(&config),
+        "--asr-audio requires an LFM2-Audio checkpoint"
+    );
+
+    let inputs_path = args
+        .asr_audio
+        .as_ref()
+        .context("ASR mode requires --asr-audio")?;
+    let mut inputs: Vec<AsrInput> = load_rerank_rows(inputs_path)?;
+    if let Some(limit) = args.limit {
+        inputs.truncate(limit);
+    }
+    ensure!(!inputs.is_empty(), "ASR input set must not be empty");
+    let input_root = inputs_path.parent().unwrap_or_else(|| Path::new("."));
+    let references = args
+        .asr_reference
+        .as_ref()
+        .map(|path| load_rerank_rows::<AsrReference>(path))
+        .transpose()?
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| (row.id.clone(), row))
+                .collect::<HashMap<_, _>>()
+        });
+
+    let model = lfm2_audio::AudioModel::load(&args.model, args.dtype)?;
+    let mut tokenizer = Tokenizer::from_file(&args.tokenizer)
+        .map_err(|error| anyhow::anyhow!("tokenizer: {error}"))?;
+    tokenizer.with_padding(None);
+    tokenizer
+        .with_truncation(None)
+        .map_err(|error| anyhow::anyhow!("disable ASR truncation: {error}"))?;
+    let execution = MetalExecutionConfig::from_args(args, "lfm2-audio-asr")?;
+    let mut provider = make_provider(
+        args.device,
+        args.dtype,
+        args.cpu_gemm,
+        args.cpu_threads,
+        execution,
+        args.cuda_graphs,
+        args.vulkan_gemm,
+        args.vulkan_pipeline_cache.clone(),
+    )?;
+    let provider_name = provider.name();
+    let cold_load_s = started.elapsed().as_secs_f64();
+
+    let mut artifacts = Vec::with_capacity(inputs.len());
+    let mut results = Vec::with_capacity(inputs.len());
+    let mut frontend_encoder_wall_s = 0.0;
+    let mut prefill_decode_wall_s = 0.0;
+    let mut overall_mel_max = None::<f32>;
+    let mut overall_encoder_min = None::<f64>;
+    let mut exact_prompts = 0usize;
+    let mut failures = Vec::new();
+
+    for input in &inputs {
+        let audio_path = if input.path.is_absolute() {
+            input.path.clone()
+        } else {
+            input_root.join(&input.path)
+        };
+        let encoder_started = Instant::now();
+        let projection = model.project_wav(provider.as_mut(), &audio_path)?;
+        frontend_encoder_wall_s += encoder_started.elapsed().as_secs_f64();
+
+        let reference = references
+            .as_ref()
+            .and_then(|references| references.get(&input.id));
+        if references.is_some() && reference.is_none() {
+            failures.push(format!("{}: missing ASR reference row", input.id));
+        }
+        let mut mel_max_abs = None;
+        let mut encoder_min_cosine = None;
+        if let Some(reference) = reference {
+            if !reference.mel.is_empty() {
+                if reference.mel_frames != projection.mel.frames
+                    || reference.mel.len() != projection.mel.values.len()
+                {
+                    failures.push(format!(
+                        "{}: mel shape owned {}x{}, reference {} frames / {} values",
+                        input.id,
+                        projection.mel.frames,
+                        projection.mel.features,
+                        reference.mel_frames,
+                        reference.mel.len()
+                    ));
+                } else {
+                    let maximum = projection
+                        .mel
+                        .values
+                        .iter()
+                        .zip(&reference.mel)
+                        .map(|(&owned, &expected)| (owned - expected).abs())
+                        .fold(0.0_f32, f32::max);
+                    mel_max_abs = Some(maximum);
+                    overall_mel_max =
+                        Some(overall_mel_max.map_or(maximum, |value| value.max(maximum)));
+                    if maximum >= 1.0e-3 {
+                        failures.push(format!(
+                            "{}: mel max abs {maximum:.8} is not below 1e-3",
+                            input.id
+                        ));
+                    }
+                }
+            }
+            if !reference.embeddings.is_empty() {
+                if reference.embeddings.len() != projection.embeddings.len() {
+                    failures.push(format!(
+                        "{}: encoder frame count owned {}, reference {}",
+                        input.id,
+                        projection.embeddings.len(),
+                        reference.embeddings.len()
+                    ));
+                } else {
+                    let mut minimum = 1.0_f64;
+                    for (frame, (owned, expected)) in projection
+                        .embeddings
+                        .iter()
+                        .zip(&reference.embeddings)
+                        .enumerate()
+                    {
+                        let cosine = vector_cosine(owned, expected)
+                            .with_context(|| format!("{} encoder frame {frame}", input.id))?;
+                        minimum = minimum.min(cosine);
+                    }
+                    encoder_min_cosine = Some(minimum);
+                    overall_encoder_min =
+                        Some(overall_encoder_min.map_or(minimum, |value| value.min(minimum)));
+                    if minimum < 0.9999 {
+                        failures.push(format!(
+                            "{}: encoder minimum cosine {minimum:.8} below 0.9999",
+                            input.id
+                        ));
+                    }
+                }
+            }
+        }
+
+        let (text_tokens, modality) = model.asr_prompt(&tokenizer, projection.embeddings.len())?;
+        let prefill = model.splice_prefill(&text_tokens, &modality, &projection.embeddings)?;
+        ensure!(
+            prefill.len() + args.max_new_tokens <= args.decode_cache_bucket,
+            "{} needs {} prefill + {} decode positions, exceeding cache bucket {}",
+            input.id,
+            prefill.len(),
+            args.max_new_tokens,
+            args.decode_cache_bucket
+        );
+        let decode_started = Instant::now();
+        let mut decoder = lfm2_decode::Decoder::new(
+            &model.backbone,
+            provider.as_mut(),
+            args.decode_cache_bucket,
+        )?;
+        let (mut cache, mut logits) = decoder.prefill_embeddings(&prefill)?;
+        let mut tokens = Vec::new();
+        for _ in 0..args.max_new_tokens {
+            let top = qwen3_decode::top_logits(&logits, args.decode_top_k);
+            let token = top[0].token_id;
+            ensure!(
+                token != 128,
+                "{}: model switched to audio output during ASR-only generation",
+                input.id
+            );
+            tokens.push(token);
+            if token == 7 || token == lfm2_audio::TEXT_END_TOKEN {
+                break;
+            }
+            logits = decoder.advance_token(&mut cache, token)?;
+        }
+        ensure!(
+            tokens
+                .last()
+                .is_some_and(|token| { *token == 7 || *token == lfm2_audio::TEXT_END_TOKEN }),
+            "{}: greedy ASR did not emit an end token within {} steps",
+            input.id,
+            args.max_new_tokens
+        );
+        prefill_decode_wall_s += decode_started.elapsed().as_secs_f64();
+        let transcript_tokens = tokens
+            .iter()
+            .copied()
+            .filter(|&token| token != 7 && token != lfm2_audio::TEXT_END_TOKEN)
+            .collect::<Vec<_>>();
+        let text = tokenizer
+            .decode(&transcript_tokens, true)
+            .map_err(|error| anyhow::anyhow!("decode ASR transcript: {error}"))?;
+        let exact_reference = reference.and_then(|reference| {
+            if reference.tokens.is_empty() {
+                None
+            } else {
+                Some(tokens == reference.tokens)
+            }
+        });
+        if exact_reference == Some(true) {
+            exact_prompts += 1;
+        } else if exact_reference == Some(false) {
+            let expected = &reference
+                .expect("reference exists when exactness was checked")
+                .tokens;
+            let shared = tokens.len().min(expected.len());
+            let first = (0..shared).find(|&index| tokens[index] != expected[index]);
+            failures.push(match first {
+                Some(index) => format!(
+                    "{}: first token divergence at step {index}: owned {}, reference {}",
+                    input.id, tokens[index], expected[index]
+                ),
+                None => format!(
+                    "{}: generated {} tokens, reference generated {} tokens",
+                    input.id,
+                    tokens.len(),
+                    expected.len()
+                ),
+            });
+        }
+        if let Some(reference) = reference {
+            if !reference.text.is_empty() && exact_reference == Some(true) && text != reference.text
+            {
+                eprintln!(
+                    "{}: token-exact reference decodes differently (owned {:?}, reference {:?})",
+                    input.id, text, reference.text
+                );
+            }
+        }
+
+        artifacts.push(AsrArtifactRow {
+            id: input.id.clone(),
+            mel_frames: projection.mel.frames,
+            mel: projection.mel.values.clone(),
+            embeddings: projection.embeddings.clone(),
+            tokens: tokens.clone(),
+            text: text.clone(),
+        });
+        results.push(AsrPromptResult {
+            id: input.id.clone(),
+            audio_samples: projection.samples,
+            mel_frames: projection.mel.frames,
+            encoder_frames: projection.embeddings.len(),
+            prefill_positions: prefill.len(),
+            tokens,
+            text,
+            exact_reference,
+            mel_max_abs,
+            encoder_min_cosine,
+        });
+    }
+
+    if let Some(path) = &args.asr_artifacts_out {
+        write_jsonl(path, &artifacts)?;
+    }
+    let result = AsrServingResult {
+        lane: provider_name.to_owned(),
+        workload: "lfm2-audio-batch-asr-greedy",
+        model: args
+            .model_label
+            .clone()
+            .unwrap_or_else(|| format!("LFM2-Audio-1.5B@owned-rt-{}", args.dtype.as_str())),
+        checkpoint_revision: "c798aad30dc3cd72e72970beab51326b8443bd94",
+        prompts: inputs.len(),
+        exact_prompts: references.as_ref().map(|_| exact_prompts),
+        mel_max_abs: overall_mel_max,
+        encoder_min_cosine: overall_encoder_min,
+        cold_load_s,
+        frontend_encoder_wall_s,
+        prefill_decode_wall_s,
+        results,
+    };
+    let out = args.out.as_ref().context("ASR mode requires --out")?;
+    if let Some(parent) = out.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(out, serde_json::to_string_pretty(&result)?)?;
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    ensure!(
+        failures.is_empty(),
+        "LFM2-Audio ASR parity gate failed:\n{}",
+        failures.join("\n")
     );
     Ok(())
 }
@@ -1925,6 +2301,10 @@ fn load_model_family(path: &Path, precision: Precision) -> Result<Box<dyn ModelF
         FamilyRegistration {
             detect: modernbert::detect_config,
             load: modernbert::load_family,
+        },
+        FamilyRegistration {
+            detect: lfm2_audio::detect_config,
+            load: lfm2_audio::load_family,
         },
         FamilyRegistration {
             detect: lfm2::detect_config,
