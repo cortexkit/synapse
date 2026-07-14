@@ -88,6 +88,13 @@
 - Depends on: `bench/harness`, `reqwest`, `tokenizers`.
 - Used by: The benchmark suite runner `bench/run-matrix.sh`.
 
+**External Gather-Distillation Harness:**
+- Purpose: Standalone Bun/TypeScript data generation for the production gatherer contract, supporting both Anthropic API (with multi-account OAuth rotation) and local OpenAI-compatible endpoints.
+- Location: `tools/gather-distill`
+- Contains: Trajectory generation, work queue handling, `AftClientPool` process wrapping, validation, and gold-overlap scoring.
+- Depends on: Bun, pinned `aft-v0.46.0` binary, and `@cortexkit/anthropic-auth-core`.
+- Used by: Developers running qgen, gather, validate, or score campaigns.
+
 ## Data Flow
 
 **Production Inference Flow:**
@@ -134,6 +141,14 @@
 2. The rig submits length-prefixed JSON batches of query-document pairs to the candidate, accumulating strict canonical real-token counts — `bench/rig/src/main.rs`
 3. Generate reference scores using Hugging Face reference implementation (`Alibaba-NLP/gte-reranker-modernbert-base`) — `bench/eval-coir/reference_rerank.py`
 4. The rig automatically calculates Pearson correlation and tie-aware top-1 overlap against reference scores, rejecting the candidate if it drifts below the `.999` and `.98` thresholds.
+
+**Gather-Distillation and Evaluation Flow:**
+
+1. Generate question candidates grounded on corpus manifests and entry files using `qgen` — `tools/gather-distill/src/qgen.ts`
+2. Process questions round-robin via the gather queue, proxying all tool calls (`search`, `outline`, `zoom`, etc.) to a background `aft` v0.46.0 subprocess over an NDJSON stream — `tools/gather-distill/src/gather.ts`
+3. Force the final turn with the toolset intact (`tool_choice: "none"`) to retrieve structured evidence JSON and snippet citations — `tools/gather-distill/src/gather.ts`
+4. Validate trajectory JSON rows, confirming commit SHAs, file bounds, and citation content against the pinned repo — `tools/gather-distill/src/validate.ts`
+5. Perform offline gold-overlap scoring to evaluate candidate trajectory quality (tracking line-range Jaccard, file F1, and token usage) — `tools/gather-distill/src/scorer.ts`
 
 ## Key Abstractions
 
@@ -182,6 +197,16 @@
 - Location: `bench/harness/src/metrics.rs`
 - Pattern: Guard clause loop checking CPU and GPU utilization thresholds.
 
+**AftClientPool:**
+- Purpose: A bounded pool managing background `aft` subprocesses, configuring repositories with trigram-indexing preflight checks and routing commands over NDJSON.
+- Location: `tools/gather-distill/src/tools.ts`
+- Pattern: LRU process cache with timeout recovery.
+
+**AccountPool:**
+- Purpose: Managed pool for token rotation, concurrency limits, and cooldowns across multiple credentials.
+- Location: `tools/gather-distill/src/auth.ts`
+- Pattern: Rotating Credentials Pool with in-flight caps.
+
 ## Entry Points
 
 **Synapse Module Main (`ck-synapse`):**
@@ -223,6 +248,11 @@
 - Location: `bench/run-night.sh`
 - Triggers: Scheduled execution or manual trigger by developer.
 - Responsibilities: Precondition validation, sequential idle-gated run of all 16 target lanes on the full AFT corpus, full-corpus parity and rank-overlap calculations, and archiving outputs under `bench/results/night-YYYYMMDD/`.
+
+**Gather-Distillation CLI (`gather-distill`):**
+- Location: `tools/gather-distill/src/cli.ts`
+- Triggers: Invocation of Bun running the CLI commands.
+- Responsibilities: Routes commands to qgen (question generation), gather (trajectory collection), validate (trajectory inspection), and score (gold-overlap performance comparison).
 
 ## Error Handling
 

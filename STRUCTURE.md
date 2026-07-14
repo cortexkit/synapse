@@ -32,6 +32,8 @@
 │   ├── synapse-worker-llama/ # llama.cpp supervised worker (GGUF)
 │   └── synapse-worker-mlx/ # Apple Silicon MLX supervised worker
 ├── docs/                   # Design logs and decisions documentation
+├── tools/                  # Shared system tools and distillation harnesses
+│   └── gather-distill/     # External gather-distillation data generation harness
 ├── Cargo.toml              # Cargo workspace definition
 ├── DECISIONS.md            # Log of architecture design decisions
 └── FOUNDING.md             # Foundational constraints and handoff requirements
@@ -115,6 +117,15 @@
 - Contains: Markdown documents.
 - Key files: `docs/decision-1-runtime.md`
 
+**tools/:**
+- Purpose: Houses shared development tools, utilities, and datasets generation/distillation harnesses.
+- Contains: The `gather-distill` TypeScript project workspace.
+
+**tools/gather-distill/:**
+- Purpose: Standalone external harness for generating QA datasets and collecting model tool-use trajectories.
+- Contains: Bun workspaces, Anthropic/OpenAI API adapters, AFT child process pools, validation scripts, and scoring modules.
+- Key files: `tools/gather-distill/src/cli.ts`, `tools/gather-distill/README.md`
+
 ## Key File Locations
 
 **Entry Points:**
@@ -126,6 +137,7 @@
 - `bench/eval-coir/score.py`: Computes retrieval quality metrics on generated vectors.
 - `bench/run-matrix.sh`: Global benchmark suite runner.
 - `bench/run-night.sh`: Nightly full-corpus multi-lane orchestrator.
+- `tools/gather-distill/src/cli.ts`: Entry point for the gather-distillation harness commands (`qgen`, `gather`, `validate`, `score`).
 
 **Configuration:**
 - `Cargo.toml`: Cargo workspace manifest listing all members.
@@ -144,6 +156,11 @@
 - `bench/lanes/potion/main.py`: Model2Vec static embedding lane utilizing `model2vec` (StaticModel) with `potion-code-16M`.
 - `bench/eval-coir/coir_eval.py`: Brute-force numpy cosine retrieval and pytrec_eval scoring logic.
 - `bench/eval-coir/reference_rerank.py`: Reference Alibaba-NLP/gte-reranker-modernbert-base rerank calculation.
+- `tools/gather-distill/src/auth.ts`: Multi-account credential storage, verification, and rotation pool.
+- `tools/gather-distill/src/tools.ts`: Verbatim v0.46.0 tool definitions schema and `AftClientPool` process allocation.
+- `tools/gather-distill/src/gather.ts`: Work queue execution loop driving model tool interactions.
+- `tools/gather-distill/src/validate.ts`: Citation verification, SHA-checking, and path bounds checker.
+- `tools/gather-distill/src/scorer.ts`: Offline gold-standard Jaccard and file F1 overlap quality scorer.
 
 **Tests:**
 - Standalone nextest-compatible test suites are managed via library configurations and workspace flags.
