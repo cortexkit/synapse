@@ -288,11 +288,14 @@ impl Model {
     pub(crate) fn load(path: &Path, _precision: Precision) -> Result<Self> {
         let root = resolve_model_root(path)?;
         let config_path = root.join("config.json");
-        let raw_config: RawConfig = serde_json::from_str(
+        let config_json: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(&config_path)
                 .with_context(|| format!("read config {}", config_path.display()))?,
         )
         .with_context(|| format!("parse config {}", config_path.display()))?;
+        let raw_config: RawConfig =
+            serde_json::from_value(config_json.get("lfm").cloned().unwrap_or(config_json))
+                .context("parse LFM2 backbone config")?;
         let mut config = raw_config.into_config()?;
         let tensors = load_safetensor_map(&root, path)?;
         let embeddings = get_lfm2_tensor(&tensors, "embed_tokens.weight")?;
@@ -473,11 +476,30 @@ impl Model {
         }
     }
 
+    pub(crate) fn token_embedding(&self, token: u32) -> Result<&[f32]> {
+        let hidden = self.config.hidden_size;
+        let token = token as usize;
+        ensure!(
+            token < self.config.vocab_size,
+            "token id {token} outside LFM2 vocab"
+        );
+        Ok(&self.embeddings.data[token * hidden..(token + 1) * hidden])
+    }
+
     pub(crate) fn decode_token(
         &self,
         provider: &mut dyn KernelProvider,
         cache: &mut DecodeCache,
         token: u32,
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        self.decode_embedding(provider, cache, self.token_embedding(token)?)
+    }
+
+    pub(crate) fn decode_embedding(
+        &self,
+        provider: &mut dyn KernelProvider,
+        cache: &mut DecodeCache,
+        embedding: &[f32],
     ) -> Result<(Vec<f32>, Vec<f32>)> {
         ensure!(cache.position < cache.capacity, "LFM2 decode cache is full");
         ensure!(
@@ -485,12 +507,12 @@ impl Model {
             "LFM2 decode cache layer count mismatch"
         );
         let hidden = self.config.hidden_size;
-        let token = token as usize;
         ensure!(
-            token < self.config.vocab_size,
-            "token id {token} outside LFM2 vocab"
+            embedding.len() == hidden,
+            "LFM2 input embedding width {} does not match hidden size {hidden}",
+            embedding.len()
         );
-        let mut current = self.embeddings.data[token * hidden..(token + 1) * hidden].to_vec();
+        let mut current = embedding.to_vec();
 
         for (layer, layer_cache) in self.layers.iter().zip(&mut cache.layers) {
             let residual = current.clone();
@@ -706,6 +728,9 @@ impl ModelFamily for Model {
 }
 
 pub(super) fn detect_config(config: &serde_json::Value) -> bool {
+    if config.get("lfm").is_some() {
+        return false;
+    }
     config.get("model_type").and_then(serde_json::Value::as_str) == Some("lfm2")
         || config
             .get("architectures")
@@ -723,7 +748,7 @@ pub(super) fn load_family(path: &Path, precision: Precision) -> Result<Box<dyn M
 }
 
 fn get_lfm2_tensor(tensors: &HashMap<String, Tensor>, name: &str) -> Result<Tensor> {
-    get_tensor(tensors, name)
+    get_tensor(tensors, name).or_else(|_| get_tensor(tensors, &format!("lfm.{name}")))
 }
 
 fn load_weight(tensors: &HashMap<String, Tensor>, prefix: &str) -> Result<Weight> {

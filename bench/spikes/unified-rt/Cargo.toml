@@ -24,6 +24,8 @@ half = "2"
 libm = "0.2"
 faer = { version = "=0.22.6", default-features = false, features = ["std", "rayon"] }
 rayon = "1.10"
+rustfft = "6.2"
+hound = "3.5"
 ash = { version = "0.38", optional = true }
 
 [build-dependencies]

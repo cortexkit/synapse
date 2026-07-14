@@ -60,6 +60,42 @@ impl<'model, 'provider> Decoder<'model, 'provider> {
     pub(crate) fn weight_count(&self) -> usize {
         self.model.weight_count()
     }
+
+    pub(crate) fn prefill_embeddings(
+        &mut self,
+        embeddings: &[Vec<f32>],
+    ) -> Result<(DecodeCache, Vec<f32>)> {
+        ensure!(
+            !embeddings.is_empty(),
+            "decode prefill embeddings must not be empty"
+        );
+        ensure!(
+            embeddings.len() <= self.capacity,
+            "decode prefill embeddings exceed cache capacity"
+        );
+        let mut cache = self.model.empty_decode_cache(self.capacity);
+        let mut logits = None;
+        for embedding in embeddings {
+            let (_, next_logits) =
+                self.model
+                    .decode_embedding(self.provider, &mut cache, embedding)?;
+            logits = Some(next_logits);
+        }
+        Ok((
+            cache,
+            logits.context("decode prefill embeddings must not be empty")?,
+        ))
+    }
+
+    pub(crate) fn advance_token(
+        &mut self,
+        cache: &mut DecodeCache,
+        token: u32,
+    ) -> Result<Vec<f32>> {
+        self.model
+            .decode_token(self.provider, cache, token)
+            .map(|(_, logits)| logits)
+    }
 }
 
 impl DecodeKernel for Decoder<'_, '_> {

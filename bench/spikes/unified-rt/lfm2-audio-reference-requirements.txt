@@ -1,0 +1,10 @@
+# Reference environment used for LFM2-Audio ASR correctness gates.
+# Create with: uv venv --python 3.12 && uv pip install -r this-file
+liquid-audio @ git+https://github.com/Liquid4All/liquid-audio.git@84cdb243859aaa53db660bc3f4718b54133336bd
+torch==2.13.0
+torchaudio==2.11.0
+transformers==5.13.1
+accelerate==1.14.0
+librosa==0.11.0
+numpy==2.4.6
+soundfile==0.14.0
