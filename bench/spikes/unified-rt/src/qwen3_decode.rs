@@ -5,6 +5,7 @@
 //! Qwen3 implementation and keeps its KV buffers alive across calls.
 
 use std::collections::{BTreeMap, HashSet};
+use std::time::Instant;
 
 use anyhow::{ensure, Result};
 use serde::{Deserialize, Serialize};
@@ -46,6 +47,9 @@ pub(crate) trait DecodeKernel {
     fn advance(&mut self, cache: &mut Self::Cache, token: u32) -> Result<Vec<f32>>;
     fn cache_position(&self, cache: &Self::Cache) -> usize;
     fn inspect_cache_layer(&self, cache: &Self::Cache, layer: usize) -> Result<Vec<f32>>;
+    fn stage_timings(&self) -> DecodeStageTimings {
+        DecodeStageTimings::default()
+    }
 }
 
 /// A paused session owns all logical state needed to resume generation exactly.
@@ -55,6 +59,7 @@ pub(crate) struct DecodeSession<'a, K: DecodeKernel> {
     sequence: Vec<u32>,
     generated: Vec<u32>,
     next_logits: Vec<f32>,
+    sample_wall_s: f64,
 }
 
 #[allow(dead_code)]
@@ -75,6 +80,7 @@ impl<'a, K: DecodeKernel> DecodeSession<'a, K> {
             sequence: prompt.to_vec(),
             generated: Vec::new(),
             next_logits,
+            sample_wall_s: 0.0,
         })
     }
 
@@ -94,6 +100,14 @@ impl<'a, K: DecodeKernel> DecodeSession<'a, K> {
         self.kernel.inspect_cache_layer(&self.cache, layer)
     }
 
+    pub(crate) fn sample_wall_s(&self) -> f64 {
+        self.sample_wall_s
+    }
+
+    pub(crate) fn stage_timings(&self) -> DecodeStageTimings {
+        self.kernel.stage_timings()
+    }
+
     pub(crate) fn generate(
         &mut self,
         max_tokens: usize,
@@ -109,8 +123,10 @@ impl<'a, K: DecodeKernel> DecodeSession<'a, K> {
                 "decode cache capacity {} exhausted",
                 self.kernel.capacity()
             );
+            let sample_started = Instant::now();
             let top = top_logits(&self.next_logits, top_k);
             let token = top[0].token_id;
+            self.sample_wall_s += sample_started.elapsed().as_secs_f64();
             tap.before_commit(TokenTapEvent {
                 step: self.generated.len(),
                 token_id: token,
@@ -140,6 +156,44 @@ impl<'a, K: DecodeKernel> DecodeSession<'a, K> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub(crate) struct DecodeStageTimings {
+    pub(crate) graph_prepare_wall_s: f64,
+    pub(crate) host_prepare_wall_s: f64,
+    pub(crate) feed_wall_s: f64,
+    pub(crate) execute_wall_s: f64,
+    pub(crate) logits_readback_wall_s: f64,
+    pub(crate) kv_update_wall_s: f64,
+    pub(crate) prefill_calls: u64,
+    pub(crate) step_calls: u64,
+}
+
+impl DecodeStageTimings {
+    pub(crate) fn delta(self, earlier: Self) -> Self {
+        Self {
+            graph_prepare_wall_s: self.graph_prepare_wall_s - earlier.graph_prepare_wall_s,
+            host_prepare_wall_s: self.host_prepare_wall_s - earlier.host_prepare_wall_s,
+            feed_wall_s: self.feed_wall_s - earlier.feed_wall_s,
+            execute_wall_s: self.execute_wall_s - earlier.execute_wall_s,
+            logits_readback_wall_s: self.logits_readback_wall_s - earlier.logits_readback_wall_s,
+            kv_update_wall_s: self.kv_update_wall_s - earlier.kv_update_wall_s,
+            prefill_calls: self.prefill_calls - earlier.prefill_calls,
+            step_calls: self.step_calls - earlier.step_calls,
+        }
+    }
+
+    pub(crate) fn accumulate(&mut self, other: Self) {
+        self.graph_prepare_wall_s += other.graph_prepare_wall_s;
+        self.host_prepare_wall_s += other.host_prepare_wall_s;
+        self.feed_wall_s += other.feed_wall_s;
+        self.execute_wall_s += other.execute_wall_s;
+        self.logits_readback_wall_s += other.logits_readback_wall_s;
+        self.kv_update_wall_s += other.kv_update_wall_s;
+        self.prefill_calls += other.prefill_calls;
+        self.step_calls += other.step_calls;
+    }
+}
+
 pub(crate) fn top_logits(logits: &[f32], top_k: usize) -> Vec<TopLogit> {
     assert!(!logits.is_empty(), "logits must not be empty");
     assert!(top_k > 0, "top-k must be positive");
@@ -149,13 +203,12 @@ pub(crate) fn top_logits(logits: &[f32], top_k: usize) -> Vec<TopLogit> {
             token_id: token_id as u32,
             logit,
         };
+        if top.len() == top_k && !logit_precedes(&candidate, &top[top_k - 1]) {
+            continue;
+        }
         let insertion = top
             .iter()
-            .position(|current| {
-                candidate.logit.total_cmp(&current.logit).is_gt()
-                    || (candidate.logit.total_cmp(&current.logit).is_eq()
-                        && candidate.token_id < current.token_id)
-            })
+            .position(|current| logit_precedes(&candidate, current))
             .unwrap_or(top.len());
         if insertion < top_k {
             top.insert(insertion, candidate);
@@ -165,6 +218,12 @@ pub(crate) fn top_logits(logits: &[f32], top_k: usize) -> Vec<TopLogit> {
         }
     }
     top
+}
+
+fn logit_precedes(candidate: &TopLogit, current: &TopLogit) -> bool {
+    candidate.logit.total_cmp(&current.logit).is_gt()
+        || (candidate.logit.total_cmp(&current.logit).is_eq()
+            && candidate.token_id < current.token_id)
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -301,10 +360,11 @@ mod metal {
     use std::ffi::{c_char, c_void, CStr, CString};
     use std::path::Path;
     use std::ptr::NonNull;
+    use std::time::Instant;
 
     use anyhow::{bail, ensure, Result};
 
-    use super::{DecodeKernel, Model};
+    use super::{DecodeKernel, DecodeStageTimings, Model};
     use crate::{encode_f16_bits, Execution, MetalExecutionConfig, Precision};
 
     #[repr(C)]
@@ -322,6 +382,18 @@ mod metal {
         down_weight: *const c_void,
     }
 
+    #[derive(Clone, Copy, Default)]
+    #[repr(C)]
+    struct NativeDecodeStageTimings {
+        graph_prepare_wall_s: f64,
+        feed_wall_s: f64,
+        execute_wall_s: f64,
+        logits_readback_wall_s: f64,
+        kv_update_wall_s: f64,
+        prefill_calls: u64,
+        step_calls: u64,
+    }
+
     pub(crate) struct MetalKvCache {
         position: usize,
     }
@@ -332,6 +404,9 @@ mod metal {
         bucket: usize,
         prefill_package: Option<CString>,
         step_package: Option<CString>,
+        host_prepare_wall_s: f64,
+        legacy_cpu_readback: bool,
+        optimization_level_one: bool,
     }
 
     impl<'a> MetalDecoder<'a> {
@@ -347,31 +422,65 @@ mod metal {
             );
             ensure!(
                 matches!(execution.execution, Execution::Explicit),
-                "Qwen3 decode requires explicit O0 graph compilation"
+                "Qwen3 decode requires explicit graph compilation"
             );
             ensure!(
                 [512, 1024, 2048].contains(&bucket),
                 "decode cache bucket must be 512, 1024, or 2048"
             );
-            let raw = unsafe {
+            let raw = NonNull::new(unsafe {
                 synapse_qwen3_decode_context_new(
                     bucket as u64,
                     model.layers.len() as u64,
                     model.config.num_key_value_heads as u64,
                     model.config.head_dim as u64,
                 )
-            };
+            })
+            .ok_or_else(last_error)?;
             let prefill_package =
                 package_cstring(execution.decode_package_path("prefill", bucket).as_deref())?;
             let step_package =
                 package_cstring(execution.decode_package_path("step", bucket).as_deref())?;
-            Ok(Self {
-                raw: NonNull::new(raw).ok_or_else(last_error)?,
+            let decoder = Self {
+                raw,
                 model,
                 bucket,
                 prefill_package,
                 step_package,
-            })
+                host_prepare_wall_s: 0.0,
+                legacy_cpu_readback: std::env::var_os("SYNAPSE_QWEN3_DECODE_LEGACY_READBACK")
+                    .is_some_and(|value| value == std::ffi::OsStr::new("1")),
+                optimization_level_one: std::env::var_os("SYNAPSE_QWEN3_DECODE_OPT_LEVEL")
+                    .is_none_or(|value| value != std::ffi::OsStr::new("0")),
+            };
+            let status = unsafe {
+                synapse_qwen3_decode_prepare(
+                    decoder.raw.as_ptr(),
+                    model.config.hidden_size as u64,
+                    model.config.num_attention_heads as u64,
+                    model.config.num_key_value_heads as u64,
+                    model.config.head_dim as u64,
+                    model.config.intermediate_size as u64,
+                    model.layers.len() as u64,
+                    model.config.vocab_size as u64,
+                    model.config.rms_norm_eps,
+                    decoder
+                        .prefill_package
+                        .as_ref()
+                        .map_or(std::ptr::null(), |path| path.as_ptr()),
+                    decoder
+                        .step_package
+                        .as_ref()
+                        .map_or(std::ptr::null(), |path| path.as_ptr()),
+                )
+            };
+            if status != 0 {
+                bail!(
+                    "Qwen3 Metal decode preparation failed with status {status}: {}",
+                    last_error()
+                );
+            }
+            Ok(decoder)
         }
 
         fn layer_params(&self) -> Result<Vec<LayerParams>> {
@@ -444,6 +553,37 @@ mod metal {
             let lm_head = self.model.lm_head()?.metal_f16_bits()?.as_ptr().cast();
             Ok((layers, final_norm, lm_head))
         }
+
+        pub(crate) fn kv_update_path(&self) -> &'static str {
+            if self.legacy_cpu_readback {
+                "cpu-readback-control"
+            } else {
+                "device-resident-blit"
+            }
+        }
+
+        pub(crate) fn weight_feed_path(&self) -> &'static str {
+            "f16-static-feeds-with-fp32-matmul-casts"
+        }
+
+        pub(crate) fn optimization_level(&self) -> u8 {
+            u8::from(self.optimization_level_one)
+        }
+
+        pub(crate) fn stage_timings(&self) -> DecodeStageTimings {
+            let mut native = NativeDecodeStageTimings::default();
+            unsafe { synapse_qwen3_decode_stage_timings(self.raw.as_ptr(), &mut native) };
+            DecodeStageTimings {
+                graph_prepare_wall_s: native.graph_prepare_wall_s,
+                host_prepare_wall_s: self.host_prepare_wall_s,
+                feed_wall_s: native.feed_wall_s,
+                execute_wall_s: native.execute_wall_s,
+                logits_readback_wall_s: native.logits_readback_wall_s,
+                kv_update_wall_s: native.kv_update_wall_s,
+                prefill_calls: native.prefill_calls,
+                step_calls: native.step_calls,
+            }
+        }
     }
 
     impl DecodeKernel for MetalDecoder<'_> {
@@ -454,6 +594,7 @@ mod metal {
         }
 
         fn prefill(&mut self, tokens: &[u32]) -> Result<(Self::Cache, Vec<f32>)> {
+            let host_prepare_started = Instant::now();
             ensure!(!tokens.is_empty(), "decode prompt must not be empty");
             ensure!(
                 tokens.len() <= self.bucket,
@@ -478,6 +619,7 @@ mod metal {
             let (rope_cos, rope_sin) = self.rope(0..self.bucket);
             let (layers, final_norm, lm_head) = self.common_call_args()?;
             let mut logits = vec![0.0f32; self.model.config.vocab_size];
+            self.host_prepare_wall_s += host_prepare_started.elapsed().as_secs_f64();
             let status = unsafe {
                 synapse_qwen3_decode_prefill(
                     self.raw.as_ptr(),
@@ -518,6 +660,7 @@ mod metal {
         }
 
         fn advance(&mut self, cache: &mut Self::Cache, token: u32) -> Result<Vec<f32>> {
+            let host_prepare_started = Instant::now();
             ensure!(
                 cache.position < self.bucket,
                 "decode cache capacity exhausted"
@@ -530,6 +673,7 @@ mod metal {
             let (rope_cos, rope_sin) = self.rope(cache.position..cache.position + 1);
             let (layers, final_norm, lm_head) = self.common_call_args()?;
             let mut logits = vec![0.0f32; self.model.config.vocab_size];
+            self.host_prepare_wall_s += host_prepare_started.elapsed().as_secs_f64();
             let status = unsafe {
                 synapse_qwen3_decode_step(
                     self.raw.as_ptr(),
@@ -567,6 +711,10 @@ mod metal {
 
         fn cache_position(&self, cache: &Self::Cache) -> usize {
             cache.position
+        }
+
+        fn stage_timings(&self) -> DecodeStageTimings {
+            MetalDecoder::stage_timings(self)
         }
 
         fn inspect_cache_layer(&self, _cache: &Self::Cache, layer: usize) -> Result<Vec<f32>> {
@@ -631,6 +779,19 @@ mod metal {
             head_dim: u64,
         ) -> *mut c_void;
         fn synapse_qwen3_decode_context_free(context: *mut c_void);
+        fn synapse_qwen3_decode_prepare(
+            context: *mut c_void,
+            hidden: u64,
+            query_heads: u64,
+            kv_heads: u64,
+            head_dim: u64,
+            intermediate: u64,
+            layer_count: u64,
+            vocab: u64,
+            epsilon: f32,
+            prefill_package_path: *const c_char,
+            step_package_path: *const c_char,
+        ) -> i32;
         fn synapse_qwen3_decode_prefill(
             context: *mut c_void,
             hidden: u64,
@@ -673,6 +834,10 @@ mod metal {
             lm_head: *const c_void,
             logits: *mut f32,
         ) -> i32;
+        fn synapse_qwen3_decode_stage_timings(
+            context: *mut c_void,
+            timings: *mut NativeDecodeStageTimings,
+        );
         fn synapse_qwen3_decode_cache_copy(
             context: *mut c_void,
             layer: u64,

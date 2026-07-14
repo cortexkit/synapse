@@ -82,6 +82,16 @@ typedef struct Qwen3DecodePlan {
     NSArray<MPSGraphTensor *> *executable_feed_tensors;
 } Qwen3DecodePlan;
 
+typedef struct Qwen3DecodeStageTimings {
+    double graph_prepare_wall_s;
+    double feed_wall_s;
+    double execute_wall_s;
+    double logits_readback_wall_s;
+    double kv_update_wall_s;
+    uint64_t prefill_calls;
+    uint64_t step_calls;
+} Qwen3DecodeStageTimings;
+
 typedef struct Qwen3DecodeContext {
     SynapseMpsRuntimeContext runtime;
     uint64_t bucket;
@@ -90,7 +100,16 @@ typedef struct Qwen3DecodeContext {
     uint64_t head_dim;
     NSMutableArray<id<MTLBuffer>> *key_caches;
     NSMutableArray<id<MTLBuffer>> *value_caches;
+    NSMutableArray<id<MTLBuffer>> *key_updates;
+    NSMutableArray<id<MTLBuffer>> *value_updates;
+    BOOL legacy_cpu_readback;
+    BOOL optimization_level_one;
+    Qwen3DecodeStageTimings timings;
 } Qwen3DecodeContext;
+
+static double wall_time(void) {
+    return [NSDate timeIntervalSinceReferenceDate];
+}
 
 static void set_error(NSString *message) {
     snprintf(decode_error, sizeof(decode_error), "%s", message.UTF8String ?: "unknown Qwen3 decode error");
@@ -272,7 +291,7 @@ static Qwen3DecodePlan *new_plan(
         set_error(@"failed to allocate Qwen3 decode graph objects");
         return NULL;
     }
-    plan->graph.options = MPSGraphOptionsSynchronizeResults;
+    plan->graph.options = MPSGraphOptionsNone;
     plan->input = placeholder(plan->graph, plan->input_shape, MPSDataTypeFloat16, @"decode_input");
     plan->mask = placeholder(plan->graph, plan->mask_shape, MPSDataTypeFloat32, @"decode_mask");
     plan->rope_cos = placeholder(plan->graph, plan->rope_shape, MPSDataTypeFloat16, @"decode_rope_cos");
@@ -286,23 +305,25 @@ static Qwen3DecodePlan *new_plan(
     for (uint64_t index = 0; index < layer_count; ++index) {
         Qwen3DecodeLayerTensors *layer = &plan->layers[index];
         NSString *prefix = [NSString stringWithFormat:@"decode_layer_%llu", (unsigned long long)index];
-#define PH(field, shape) layer->field = placeholder(plan->graph, shape, MPSDataTypeFloat16, [prefix stringByAppendingFormat:@"_%s", #field])
-        PH(input_norm, plan->hidden_vector_shape);
-        PH(post_attention_norm, plan->hidden_vector_shape);
-        PH(q_weight, plan->q_weight_shape);
-        PH(q_norm, plan->head_vector_shape);
-        PH(k_weight, plan->kv_weight_shape);
-        PH(k_norm, plan->head_vector_shape);
-        PH(v_weight, plan->kv_weight_shape);
-        PH(o_weight, plan->o_weight_shape);
-        PH(gate_weight, plan->mlp_weight_shape);
-        PH(up_weight, plan->mlp_weight_shape);
-        PH(down_weight, plan->down_weight_shape);
+#define PH_WEIGHT(field, shape) layer->field = placeholder(plan->graph, shape, MPSDataTypeFloat16, [prefix stringByAppendingFormat:@"_%s", #field])
+        PH_WEIGHT(input_norm, plan->hidden_vector_shape);
+        PH_WEIGHT(post_attention_norm, plan->hidden_vector_shape);
+        PH_WEIGHT(q_weight, plan->q_weight_shape);
+        PH_WEIGHT(q_norm, plan->head_vector_shape);
+        PH_WEIGHT(k_weight, plan->kv_weight_shape);
+        PH_WEIGHT(k_norm, plan->head_vector_shape);
+        PH_WEIGHT(v_weight, plan->kv_weight_shape);
+        PH_WEIGHT(o_weight, plan->o_weight_shape);
+        PH_WEIGHT(gate_weight, plan->mlp_weight_shape);
+        PH_WEIGHT(up_weight, plan->mlp_weight_shape);
+        PH_WEIGHT(down_weight, plan->down_weight_shape);
         if (step) {
-            PH(key_cache, plan->cache_shape);
-            PH(value_cache, plan->cache_shape);
+            layer->key_cache = placeholder(plan->graph, plan->cache_shape, MPSDataTypeFloat16,
+                                           [prefix stringByAppendingString:@"_key_cache"]);
+            layer->value_cache = placeholder(plan->graph, plan->cache_shape, MPSDataTypeFloat16,
+                                             [prefix stringByAppendingString:@"_value_cache"]);
         }
-#undef PH
+#undef PH_WEIGHT
         MPSGraphTensor *attention_residual = x;
         MPSGraphTensor *normalized = rms_norm(plan->graph, x, layer->input_norm, 1, @[ @(sequence), @1 ], epsilon);
         MPSGraphTensor *q = linear(plan->graph, normalized, layer->q_weight);
@@ -423,9 +444,12 @@ static NSDictionary<MPSGraphTensor *, MPSGraphShapedType *> *shaped_feeds(Qwen3D
     return [feeds autorelease];
 }
 
-static MPSGraphExecutable *prepare_executable(Qwen3DecodePlan *plan, id<MTLDevice> device, uint64_t vocab, const char *package_path) {
+static MPSGraphExecutable *prepare_executable(Qwen3DecodePlan *plan, id<MTLDevice> device, uint64_t vocab,
+                                               BOOL optimization_level_one, const char *package_path) {
     MPSGraphCompilationDescriptor *descriptor = [[MPSGraphCompilationDescriptor alloc] init];
-    descriptor.optimizationLevel = MPSGraphOptimizationLevel0;
+    descriptor.optimizationLevel = optimization_level_one
+        ? MPSGraphOptimizationLevel1
+        : MPSGraphOptimizationLevel0;
     descriptor.waitForCompilationCompletion = YES;
     MPSGraphExecutable *executable = nil;
     NSString *path = package_path == NULL ? nil : [NSString stringWithUTF8String:package_path];
@@ -474,7 +498,7 @@ static MPSGraphExecutable *prepare_executable(Qwen3DecodePlan *plan, id<MTLDevic
     }
     [descriptor release];
     if (executable != nil) {
-        executable.options = MPSGraphOptionsSynchronizeResults;
+        executable.options = MPSGraphOptionsNone;
         NSArray<MPSGraphTensor *> *inputs = executable.feedTensors;
         plan->executable_feed_tensors = [(inputs.count > 0 ? inputs : plan->graph.placeholderTensors) retain];
     }
@@ -524,6 +548,8 @@ static BOOL add_layer_weights(
     return YES;
 }
 
+
+
 static NSArray<MPSGraphTensorData *> *run_plan(Qwen3DecodeContext *context, Qwen3DecodePlan *plan, NSDictionary *feeds) {
     NSArray<MPSGraphTensorData *> *inputs = synapse_mps_executable_inputs(plan->executable_feed_tensors, feeds);
     if (inputs == nil) return nil;
@@ -531,6 +557,68 @@ static NSArray<MPSGraphTensorData *> *run_plan(Qwen3DecodeContext *context, Qwen
                                         inputsArray:inputs
                                       resultsArray:nil
                                executionDescriptor:nil];
+}
+
+static BOOL export_prefill_cache(Qwen3DecodeContext *context, NSArray<MPSGraphTensorData *> *results) {
+    id<MTLCommandBuffer> command_buffer = [context->runtime.queue commandBuffer];
+    if (command_buffer == nil) return NO;
+    for (uint64_t i = 0; i < context->layer_count; ++i) {
+        [[[results objectAtIndex:(NSUInteger)(1 + i * 2)] mpsndarray]
+            exportDataWithCommandBuffer:command_buffer
+                                toBuffer:[context->key_caches objectAtIndex:(NSUInteger)i]
+                     destinationDataType:MPSDataTypeFloat16
+                                  offset:0
+                              rowStrides:NULL];
+        [[[results objectAtIndex:(NSUInteger)(2 + i * 2)] mpsndarray]
+            exportDataWithCommandBuffer:command_buffer
+                                toBuffer:[context->value_caches objectAtIndex:(NSUInteger)i]
+                     destinationDataType:MPSDataTypeFloat16
+                                  offset:0
+                              rowStrides:NULL];
+    }
+    [command_buffer commit];
+    return YES;
+}
+
+static BOOL export_step_cache(Qwen3DecodeContext *context, NSArray<MPSGraphTensorData *> *results,
+                              uint64_t position) {
+    id<MTLCommandBuffer> command_buffer = [context->runtime.queue commandBuffer];
+    if (command_buffer == nil) return NO;
+    for (uint64_t i = 0; i < context->layer_count; ++i) {
+        [[[results objectAtIndex:(NSUInteger)(1 + i * 2)] mpsndarray]
+            exportDataWithCommandBuffer:command_buffer
+                                toBuffer:[context->key_updates objectAtIndex:(NSUInteger)i]
+                     destinationDataType:MPSDataTypeFloat16
+                                  offset:0
+                              rowStrides:NULL];
+        [[[results objectAtIndex:(NSUInteger)(2 + i * 2)] mpsndarray]
+            exportDataWithCommandBuffer:command_buffer
+                                toBuffer:[context->value_updates objectAtIndex:(NSUInteger)i]
+                     destinationDataType:MPSDataTypeFloat16
+                                  offset:0
+                              rowStrides:NULL];
+    }
+
+    id<MTLBlitCommandEncoder> blit = [command_buffer blitCommandEncoder];
+    if (blit == nil) return NO;
+    NSUInteger head_bytes = (NSUInteger)(context->head_dim * sizeof(uint16_t));
+    for (uint64_t i = 0; i < context->layer_count; ++i) {
+        id<MTLBuffer> key_source = [context->key_updates objectAtIndex:(NSUInteger)i];
+        id<MTLBuffer> value_source = [context->value_updates objectAtIndex:(NSUInteger)i];
+        id<MTLBuffer> key_destination = [context->key_caches objectAtIndex:(NSUInteger)i];
+        id<MTLBuffer> value_destination = [context->value_caches objectAtIndex:(NSUInteger)i];
+        for (uint64_t head = 0; head < context->kv_heads; ++head) {
+            NSUInteger source_offset = (NSUInteger)head * head_bytes;
+            NSUInteger destination_offset = (NSUInteger)(head * context->bucket + position) * head_bytes;
+            [blit copyFromBuffer:key_source sourceOffset:source_offset
+                      toBuffer:key_destination destinationOffset:destination_offset size:head_bytes];
+            [blit copyFromBuffer:value_source sourceOffset:source_offset
+                      toBuffer:value_destination destinationOffset:destination_offset size:head_bytes];
+        }
+    }
+    [blit endEncoding];
+    [command_buffer commit];
+    return YES;
 }
 
 static void free_plan_erased(void *plan) {
@@ -555,25 +643,47 @@ void *synapse_qwen3_decode_context_new(uint64_t bucket, uint64_t layer_count, ui
         context->layer_count = layer_count;
         context->kv_heads = kv_heads;
         context->head_dim = head_dim;
+        const char *legacy = getenv("SYNAPSE_QWEN3_DECODE_LEGACY_READBACK");
+        context->legacy_cpu_readback = legacy != NULL && strcmp(legacy, "1") == 0;
+        const char *optimization_level = getenv("SYNAPSE_QWEN3_DECODE_OPT_LEVEL");
+        context->optimization_level_one = optimization_level == NULL || strcmp(optimization_level, "0") != 0;
         context->key_caches = [[NSMutableArray alloc] initWithCapacity:(NSUInteger)layer_count];
         context->value_caches = [[NSMutableArray alloc] initWithCapacity:(NSUInteger)layer_count];
+        context->key_updates = [[NSMutableArray alloc] initWithCapacity:(NSUInteger)layer_count];
+        context->value_updates = [[NSMutableArray alloc] initWithCapacity:(NSUInteger)layer_count];
         NSUInteger bytes = (NSUInteger)(kv_heads * bucket * head_dim * sizeof(uint16_t));
         for (uint64_t i = 0; i < layer_count; ++i) {
-            id<MTLBuffer> key = [context->runtime.device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
-            id<MTLBuffer> value = [context->runtime.device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
-            if (key == nil || value == nil) {
+            MTLResourceOptions options = context->legacy_cpu_readback
+                ? MTLResourceStorageModeShared
+                : MTLResourceStorageModePrivate;
+            id<MTLBuffer> key = [context->runtime.device newBufferWithLength:bytes options:options];
+            id<MTLBuffer> value = [context->runtime.device newBufferWithLength:bytes options:options];
+            NSUInteger update_bytes = (NSUInteger)(kv_heads * head_dim * sizeof(uint16_t));
+            id<MTLBuffer> key_update = [context->runtime.device newBufferWithLength:update_bytes
+                                                                           options:MTLResourceStorageModePrivate];
+            id<MTLBuffer> value_update = [context->runtime.device newBufferWithLength:update_bytes
+                                                                             options:MTLResourceStorageModePrivate];
+            if (key == nil || value == nil || key_update == nil || value_update == nil) {
                 [key release];
                 [value release];
+                [key_update release];
+                [value_update release];
                 synapse_qwen3_decode_context_free(context);
                 set_error(@"failed to allocate Qwen3 decode KV buffers");
                 return NULL;
             }
-            memset(key.contents, 0, bytes);
-            memset(value.contents, 0, bytes);
+            if (context->legacy_cpu_readback) {
+                memset(key.contents, 0, bytes);
+                memset(value.contents, 0, bytes);
+            }
             [context->key_caches addObject:key];
             [context->value_caches addObject:value];
+            [context->key_updates addObject:key_update];
+            [context->value_updates addObject:value_update];
             [key release];
             [value release];
+            [key_update release];
+            [value_update release];
         }
         return context;
     }
@@ -582,6 +692,8 @@ void *synapse_qwen3_decode_context_new(uint64_t bucket, uint64_t layer_count, ui
 void synapse_qwen3_decode_context_free(void *raw) {
     if (raw == NULL) return;
     Qwen3DecodeContext *context = raw;
+    [context->value_updates release];
+    [context->key_updates release];
     [context->value_caches release];
     [context->key_caches release];
     synapse_mps_runtime_release(&context->runtime, free_plan_erased);
@@ -601,25 +713,69 @@ static Qwen3DecodePlan *cached_decode_plan(
     float epsilon,
     const char *package_path
 ) {
-    NSString *key = [NSString stringWithFormat:@"decode:%d:%llu:%llu:%llu:%llu:%llu:%llu:%llu:%.9g",
-        step, (unsigned long long)context->bucket, (unsigned long long)hidden,
+    NSString *key = [NSString stringWithFormat:@"decode:%d:%d:%llu:%llu:%llu:%llu:%llu:%llu:%llu:%.9g",
+        step, context->optimization_level_one, (unsigned long long)context->bucket, (unsigned long long)hidden,
         (unsigned long long)query_heads, (unsigned long long)kv_heads,
         (unsigned long long)head_dim, (unsigned long long)intermediate,
         (unsigned long long)vocab, (double)epsilon];
     Qwen3DecodePlan *plan = synapse_mps_cached_plan(&context->runtime, key);
     if (plan == NULL) {
+        double prepare_started = wall_time();
         plan = new_plan(step, context->bucket, hidden, query_heads, kv_heads, head_dim,
                         intermediate, layer_count, vocab, epsilon);
         if (plan == NULL) return NULL;
-        plan->executable = prepare_executable(plan, context->runtime.device, vocab, package_path);
+        plan->graph.options = context->legacy_cpu_readback
+            ? MPSGraphOptionsSynchronizeResults
+            : MPSGraphOptionsNone;
+        plan->executable = prepare_executable(plan, context->runtime.device, vocab,
+                                              context->optimization_level_one, package_path);
+        if (plan->executable != nil) {
+            plan->executable.options = context->legacy_cpu_readback
+                ? MPSGraphOptionsSynchronizeResults
+                : MPSGraphOptionsNone;
+        }
         if (plan->executable == nil) {
             free_plan(plan);
-            set_error(@"failed to compile or load Qwen3 decode executable");
+            set_error(@"failed to prepare Qwen3 decode executable");
             return NULL;
         }
         synapse_mps_cache_plan(&context->runtime, key, plan);
+        context->timings.graph_prepare_wall_s += wall_time() - prepare_started;
     }
     return plan;
+}
+
+int32_t synapse_qwen3_decode_prepare(
+    void *raw,
+    uint64_t hidden,
+    uint64_t query_heads,
+    uint64_t kv_heads,
+    uint64_t head_dim,
+    uint64_t intermediate,
+    uint64_t layer_count,
+    uint64_t vocab,
+    float epsilon,
+    const char *prefill_package_path,
+    const char *step_package_path
+) {
+    @autoreleasepool {
+        @try {
+            Qwen3DecodeContext *context = raw;
+            if (context == NULL || layer_count != context->layer_count || kv_heads != context->kv_heads ||
+                head_dim != context->head_dim || query_heads % kv_heads != 0 || head_dim % 2 != 0) {
+                set_error(@"invalid Qwen3 decode preparation arguments");
+                return -1;
+            }
+            Qwen3DecodePlan *prefill = cached_decode_plan(context, NO, hidden, query_heads, kv_heads, head_dim,
+                                                          intermediate, layer_count, vocab, epsilon, prefill_package_path);
+            Qwen3DecodePlan *step = cached_decode_plan(context, YES, hidden, query_heads, kv_heads, head_dim,
+                                                       intermediate, layer_count, vocab, epsilon, step_package_path);
+            return prefill != NULL && step != NULL ? 0 : -2;
+        } @catch (NSException *exception) {
+            set_error(exception.reason);
+            return -100;
+        }
+    }
 }
 
 int32_t synapse_qwen3_decode_prefill(
@@ -657,7 +813,9 @@ int32_t synapse_qwen3_decode_prefill(
             Qwen3DecodePlan *plan = cached_decode_plan(context, NO, hidden, query_heads, kv_heads, head_dim,
                                                         intermediate, layer_count, vocab, epsilon, package_path);
             if (plan == NULL) return -2;
+            context->timings.prefill_calls += 1;
             NSUInteger sequence = (NSUInteger)context->bucket;
+            double feed_started = wall_time();
             id<MTLBuffer> input_buffer = [context->runtime.device newBufferWithBytes:input length:sequence * hidden * sizeof(uint16_t) options:MTLResourceStorageModeShared];
             id<MTLBuffer> mask_buffer = [context->runtime.device newBufferWithBytes:mask length:sequence * sequence * sizeof(float) options:MTLResourceStorageModeShared];
             id<MTLBuffer> cos_buffer = [context->runtime.device newBufferWithBytes:rope_cos length:sequence * head_dim * sizeof(uint16_t) options:MTLResourceStorageModeShared];
@@ -672,20 +830,31 @@ int32_t synapse_qwen3_decode_prefill(
                 add_weight(context, feeds, plan->final_norm, plan->hidden_vector_shape, final_norm, hidden) &&
                 add_weight(context, feeds, plan->lm_head, @[ @(vocab), @(hidden) ], lm_head, vocab * hidden) &&
                 add_layer_weights(context, plan, feeds, params, hidden, query_heads, kv_heads, head_dim, intermediate);
+            context->timings.feed_wall_s += wall_time() - feed_started;
+            double execute_started = wall_time();
             NSArray<MPSGraphTensorData *> *results = ok ? run_plan(context, plan, feeds) : nil;
+            context->timings.execute_wall_s += wall_time() - execute_started;
             if (results.count != plan->targets.count) {
                 set_error(@"Qwen3 prefill executable returned incomplete outputs");
                 ok = NO;
             }
             if (ok) {
-                MPSNDArray *logit_array = [results[0] mpsndarray];
-                [logit_array readBytes:logits strideBytes:NULL];
-                for (uint64_t i = 0; i < layer_count; ++i) {
-                    MPSNDArray *key = [results[1 + i * 2] mpsndarray];
-                    MPSNDArray *value = [results[2 + i * 2] mpsndarray];
-                    [key readBytes:[context->key_caches[(NSUInteger)i] contents] strideBytes:NULL];
-                    [value readBytes:[context->value_caches[(NSUInteger)i] contents] strideBytes:NULL];
+                double logits_started = wall_time();
+                [[[results objectAtIndex:0] mpsndarray] readBytes:logits strideBytes:NULL];
+                context->timings.logits_readback_wall_s += wall_time() - logits_started;
+                double kv_started = wall_time();
+                if (context->legacy_cpu_readback) {
+                    for (uint64_t i = 0; i < layer_count; ++i) {
+                        MPSNDArray *key = [[results objectAtIndex:(NSUInteger)(1 + i * 2)] mpsndarray];
+                        MPSNDArray *value = [[results objectAtIndex:(NSUInteger)(2 + i * 2)] mpsndarray];
+                        [key readBytes:[context->key_caches[(NSUInteger)i] contents] strideBytes:NULL];
+                        [value readBytes:[context->value_caches[(NSUInteger)i] contents] strideBytes:NULL];
+                    }
+                } else if (!export_prefill_cache(context, results)) {
+                    set_error(@"failed to encode Qwen3 device-resident prefill cache export");
+                    ok = NO;
                 }
+                context->timings.kv_update_wall_s += wall_time() - kv_started;
             }
             [feeds release];
             [selector_buffer release];
@@ -736,7 +905,9 @@ int32_t synapse_qwen3_decode_step(
             Qwen3DecodePlan *plan = cached_decode_plan(context, YES, hidden, query_heads, kv_heads, head_dim,
                                                         intermediate, layer_count, vocab, epsilon, package_path);
             if (plan == NULL) return -2;
+            context->timings.step_calls += 1;
             NSUInteger keys = (NSUInteger)(context->bucket + 1);
+            double feed_started = wall_time();
             id<MTLBuffer> input_buffer = [context->runtime.device newBufferWithBytes:input length:hidden * sizeof(uint16_t) options:MTLResourceStorageModeShared];
             id<MTLBuffer> mask_buffer = [context->runtime.device newBufferWithBytes:mask length:keys * sizeof(float) options:MTLResourceStorageModeShared];
             id<MTLBuffer> cos_buffer = [context->runtime.device newBufferWithBytes:rope_cos length:head_dim * sizeof(uint16_t) options:MTLResourceStorageModeShared];
@@ -756,36 +927,50 @@ int32_t synapse_qwen3_decode_step(
                 ok = add_feed(feeds, plan->layers[i].key_cache, plan->cache_shape, context->key_caches[(NSUInteger)i], MPSDataTypeFloat16) &&
                     add_feed(feeds, plan->layers[i].value_cache, plan->cache_shape, context->value_caches[(NSUInteger)i], MPSDataTypeFloat16);
             }
+            context->timings.feed_wall_s += wall_time() - feed_started;
+            double execute_started = wall_time();
             NSArray<MPSGraphTensorData *> *results = ok ? run_plan(context, plan, feeds) : nil;
+            context->timings.execute_wall_s += wall_time() - execute_started;
             if (results.count != plan->targets.count) {
                 set_error(@"Qwen3 decode executable returned incomplete outputs");
                 ok = NO;
             }
             if (ok) {
-                [[results[0] mpsndarray] readBytes:logits strideBytes:NULL];
-                NSUInteger head_bytes = (NSUInteger)(head_dim * sizeof(uint16_t));
-                NSUInteger current_elements = (NSUInteger)(kv_heads * head_dim);
-                uint16_t *temporary = malloc(current_elements * sizeof(uint16_t));
-                if (temporary == NULL) {
-                    set_error(@"failed to allocate Qwen3 cache update staging");
-                    ok = NO;
-                } else {
-                    for (uint64_t i = 0; i < layer_count; ++i) {
-                        [[results[1 + i * 2] mpsndarray] readBytes:temporary strideBytes:NULL];
-                        uint8_t *key_destination = [context->key_caches[(NSUInteger)i] contents];
-                        for (uint64_t head = 0; head < kv_heads; ++head) {
-                            memcpy(key_destination + (head * context->bucket + position) * head_bytes,
-                                   temporary + head * head_dim, head_bytes);
+                double logits_started = wall_time();
+                [[[results objectAtIndex:0] mpsndarray] readBytes:logits strideBytes:NULL];
+                context->timings.logits_readback_wall_s += wall_time() - logits_started;
+                double kv_started = wall_time();
+                if (context->legacy_cpu_readback) {
+                    NSUInteger head_bytes = (NSUInteger)(head_dim * sizeof(uint16_t));
+                    NSUInteger current_elements = (NSUInteger)(kv_heads * head_dim);
+                    uint16_t *temporary = malloc(current_elements * sizeof(uint16_t));
+                    if (temporary == NULL) {
+                        set_error(@"failed to allocate Qwen3 cache update staging");
+                        ok = NO;
+                    } else {
+                        for (uint64_t i = 0; i < layer_count; ++i) {
+                            [[[results objectAtIndex:(NSUInteger)(1 + i * 2)] mpsndarray]
+                                readBytes:temporary strideBytes:NULL];
+                            uint8_t *key_destination = [context->key_caches[(NSUInteger)i] contents];
+                            for (uint64_t head = 0; head < kv_heads; ++head) {
+                                memcpy(key_destination + (head * context->bucket + position) * head_bytes,
+                                       temporary + head * head_dim, head_bytes);
+                            }
+                            [[[results objectAtIndex:(NSUInteger)(2 + i * 2)] mpsndarray]
+                                readBytes:temporary strideBytes:NULL];
+                            uint8_t *value_destination = [context->value_caches[(NSUInteger)i] contents];
+                            for (uint64_t head = 0; head < kv_heads; ++head) {
+                                memcpy(value_destination + (head * context->bucket + position) * head_bytes,
+                                       temporary + head * head_dim, head_bytes);
+                            }
                         }
-                        [[results[2 + i * 2] mpsndarray] readBytes:temporary strideBytes:NULL];
-                        uint8_t *value_destination = [context->value_caches[(NSUInteger)i] contents];
-                        for (uint64_t head = 0; head < kv_heads; ++head) {
-                            memcpy(value_destination + (head * context->bucket + position) * head_bytes,
-                                   temporary + head * head_dim, head_bytes);
-                        }
+                        free(temporary);
                     }
-                    free(temporary);
+                } else if (!export_step_cache(context, results, position)) {
+                    set_error(@"failed to encode Qwen3 device-resident cache export");
+                    ok = NO;
                 }
+                context->timings.kv_update_wall_s += wall_time() - kv_started;
             }
             [feeds release];
             [selector_buffer release];
@@ -801,6 +986,11 @@ int32_t synapse_qwen3_decode_step(
     }
 }
 
+void synapse_qwen3_decode_stage_timings(void *raw, Qwen3DecodeStageTimings *timings) {
+    if (raw == NULL || timings == NULL) return;
+    *timings = ((Qwen3DecodeContext *)raw)->timings;
+}
+
 int32_t synapse_qwen3_decode_cache_copy(void *raw, uint64_t layer, uint16_t *output, uint64_t elements) {
     @autoreleasepool {
         Qwen3DecodeContext *context = raw;
@@ -809,8 +999,30 @@ int32_t synapse_qwen3_decode_cache_copy(void *raw, uint64_t layer, uint16_t *out
             set_error(@"invalid Qwen3 decode cache inspection arguments");
             return -1;
         }
-        memcpy(output, [context->key_caches[(NSUInteger)layer] contents], (size_t)one_cache * sizeof(uint16_t));
-        memcpy(output + one_cache, [context->value_caches[(NSUInteger)layer] contents], (size_t)one_cache * sizeof(uint16_t));
+        NSUInteger one_cache_bytes = (NSUInteger)one_cache * sizeof(uint16_t);
+        id<MTLBuffer> staging = [context->runtime.device newBufferWithLength:one_cache_bytes * 2
+                                                                     options:MTLResourceStorageModeShared];
+        id<MTLCommandBuffer> command_buffer = [context->runtime.queue commandBuffer];
+        id<MTLBlitCommandEncoder> blit = [command_buffer blitCommandEncoder];
+        if (staging == nil || command_buffer == nil || blit == nil) {
+            [staging release];
+            set_error(@"failed to stage Qwen3 cache inspection");
+            return -2;
+        }
+        [blit copyFromBuffer:[context->key_caches objectAtIndex:(NSUInteger)layer]
+                sourceOffset:0 toBuffer:staging destinationOffset:0 size:one_cache_bytes];
+        [blit copyFromBuffer:[context->value_caches objectAtIndex:(NSUInteger)layer]
+                sourceOffset:0 toBuffer:staging destinationOffset:one_cache_bytes size:one_cache_bytes];
+        [blit endEncoding];
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+        if (command_buffer.status == MTLCommandBufferStatusError) {
+            set_error(command_buffer.error.localizedDescription ?: @"Qwen3 cache inspection blit failed");
+            [staging release];
+            return -3;
+        }
+        memcpy(output, staging.contents, one_cache_bytes * 2);
+        [staging release];
         return 0;
     }
 }
