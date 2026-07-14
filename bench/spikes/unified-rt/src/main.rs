@@ -21,6 +21,8 @@ use tokenizers::{Tokenizer, TruncationParams};
 
 mod cpu_backend;
 mod cuda_backend;
+mod lfm2;
+mod lfm2_decode;
 mod modernbert;
 mod qwen3;
 mod qwen3_decode;
@@ -29,7 +31,7 @@ mod vulkan_backend;
 #[derive(Parser)]
 #[command(name = "spike-unified-rt")]
 struct Args {
-    /// Path to a MiniLM or Qwen3 safetensors file or snapshot directory.
+    /// Path to a supported safetensors file or snapshot directory.
     #[arg(long)]
     model: PathBuf,
     /// Path to tokenizer.json.
@@ -41,10 +43,10 @@ struct Args {
     /// Rerank request JSONL ({id, query, documents} per line).
     #[arg(long, conflicts_with_all = ["corpus", "generate_prompts"])]
     rerank_requests: Option<PathBuf>,
-    /// Raw-completion prompt JSONL ({id, prompt} per line) for Qwen3 greedy decode.
+    /// Raw-completion prompt JSONL ({id, prompt} per line) for causal-LM greedy decode.
     #[arg(long, conflicts_with_all = ["corpus", "rerank_requests"])]
     generate_prompts: Option<PathBuf>,
-    /// Transformers reference JSONL emitted by reference_qwen3_decode.py.
+    /// Transformers token/logit reference JSONL for greedy decode.
     #[arg(long, requires = "generate_prompts")]
     decode_reference: Option<PathBuf>,
     /// Maximum generated tokens per raw-completion prompt.
@@ -59,6 +61,18 @@ struct Args {
     /// Optional JSONL destination for pre-commit token tap events.
     #[arg(long, requires = "generate_prompts")]
     decode_tap_out: Option<PathBuf>,
+    /// Transformers final-hidden-state JSONL used by the LFM2 per-position parity gate.
+    #[arg(long, requires = "generate_prompts")]
+    decode_hidden_reference: Option<PathBuf>,
+    /// Optional JSONL destination for LFM2 final hidden states.
+    #[arg(long, requires = "generate_prompts")]
+    decode_hidden_out: Option<PathBuf>,
+    /// Minimum cosine required at every prompt position in the hidden-state gate.
+    #[arg(long, default_value_t = 0.9999)]
+    min_hidden_cosine: f64,
+    /// Compare cached LFM2 decode with full reprefill after every generated token.
+    #[arg(long, requires = "generate_prompts")]
+    verify_decode_cache: bool,
     /// Optional cap for parity/throughput smoke runs.
     #[arg(long)]
     limit: Option<usize>,
@@ -266,6 +280,12 @@ struct DecodeReference {
     tokens: Vec<u32>,
     #[serde(default)]
     top_logits: Vec<Vec<qwen3_decode::TopLogit>>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct DecodeHiddenRow {
+    id: String,
+    hidden_states: Vec<Vec<f32>>,
 }
 
 #[derive(Serialize)]
@@ -713,6 +733,14 @@ fn main() -> Result<()> {
 }
 
 fn run_decode_cli(args: &Args, started: Instant) -> Result<()> {
+    let config = read_model_config(&args.model)?;
+    if lfm2::detect_config(&config) {
+        return run_lfm2_decode_cli(args, started);
+    }
+    ensure!(
+        qwen3::detect_config(&config),
+        "decode mode supports only Qwen3 and LFM2 causal language models"
+    );
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (args, started);
@@ -823,9 +851,10 @@ fn run_decode_cli(args: &Args, started: Instant) -> Result<()> {
                     exact_prompts += 1;
                 } else {
                     let divergences_before_prompt = hard_divergences.len();
-                    let shared = tokens.len().min(reference.tokens.len());
-                    for step in 0..shared {
-                        if tokens[step] == reference.tokens[step] {
+                    for (step, (&owned_token, &reference_token)) in
+                        tokens.iter().zip(&reference.tokens).enumerate()
+                    {
+                        if owned_token == reference_token {
                             continue;
                         }
                         let owned_top = prompt_top_logits.get(step).cloned().unwrap_or_default();
@@ -843,8 +872,8 @@ fn run_decode_cli(args: &Args, started: Instant) -> Result<()> {
                                 "{} step {}: owned token {}, reference token {}, owned top-5 {:?}, reference top-5 {:?}",
                                 prompt.id,
                                 step,
-                                tokens[step],
-                                reference.tokens[step],
+                                owned_token,
+                                reference_token,
                                 owned_top,
                                 reference_top
                             ));
@@ -924,6 +953,332 @@ fn run_decode_cli(args: &Args, started: Instant) -> Result<()> {
         );
         Ok(())
     }
+}
+
+fn run_lfm2_decode_cli(args: &Args, started: Instant) -> Result<()> {
+    use qwen3_decode::{DecodeSession, TokenTapEvent};
+
+    ensure!(
+        matches!(args.device, DeviceArg::Cpu | DeviceArg::Metal),
+        "LFM2 decode supports CPU/Accelerate and Metal MPSGraph providers"
+    );
+    ensure!(
+        !(matches!(args.device, DeviceArg::Cpu) && matches!(args.dtype, Precision::F16)),
+        "LFM2 CPU decode requires --dtype f32"
+    );
+    ensure!(args.max_new_tokens > 0, "--max-new-tokens must be positive");
+    ensure!(args.decode_top_k > 0, "--decode-top-k must be positive");
+    let prompts_path = args
+        .generate_prompts
+        .as_ref()
+        .context("decode mode requires --generate-prompts")?;
+    let mut prompts: Vec<DecodePrompt> = load_rerank_rows(prompts_path)?;
+    if let Some(limit) = args.limit {
+        prompts.truncate(limit);
+    }
+    ensure!(!prompts.is_empty(), "decode prompt set must not be empty");
+    let references = args
+        .decode_reference
+        .as_ref()
+        .map(|path| load_rerank_rows::<DecodeReference>(path))
+        .transpose()?
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| (row.id.clone(), row))
+                .collect::<HashMap<_, _>>()
+        });
+    let hidden_references = args
+        .decode_hidden_reference
+        .as_ref()
+        .map(|path| load_rerank_rows::<DecodeHiddenRow>(path))
+        .transpose()?
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| (row.id.clone(), row))
+                .collect::<HashMap<_, _>>()
+        });
+
+    let model = lfm2::Model::load(&args.model, args.dtype)?;
+    let mut tokenizer = Tokenizer::from_file(&args.tokenizer)
+        .map_err(|error| anyhow::anyhow!("tokenizer: {error}"))?;
+    tokenizer.with_padding(None);
+    tokenizer
+        .with_truncation(None)
+        .map_err(|error| anyhow::anyhow!("disable generation truncation: {error}"))?;
+    let execution = MetalExecutionConfig::from_args(args, "lfm2-decode")?;
+    let mut provider = make_provider(
+        args.device,
+        args.dtype,
+        args.cpu_gemm,
+        args.cpu_threads,
+        execution,
+        args.cuda_graphs,
+        args.vulkan_gemm,
+        args.vulkan_pipeline_cache.clone(),
+    )?;
+    let provider_name = provider.name();
+    let mut decoder =
+        lfm2_decode::Decoder::new(&model, provider.as_mut(), args.decode_cache_bucket)?;
+    let cold_load_s = started.elapsed().as_secs_f64();
+    let stop_tokens = model
+        .generation_stop_ids()
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    let allow_f16_drift =
+        matches!(args.device, DeviceArg::Metal) && matches!(args.dtype, Precision::F16);
+    let mut tap_rows = Vec::new();
+    let mut hidden_rows = Vec::new();
+    let mut results = Vec::with_capacity(prompts.len());
+    let mut prefill_wall_s = 0.0;
+    let mut decode_wall_s = 0.0;
+    let mut prefill_tokens = 0usize;
+    let mut generated_tokens = 0usize;
+    let mut exact_prompts = 0usize;
+    let mut cache_verified_prompts = 0usize;
+    let mut minimum_hidden_cosine = 1.0f64;
+    let mut hard_divergences = Vec::new();
+    let mut f16_divergences = Vec::new();
+    let mut hidden_failures = Vec::new();
+
+    for prompt in &prompts {
+        let prompt_ids =
+            model.encode_generation(&tokenizer, &prompt.prompt, args.decode_cache_bucket)?;
+        ensure!(
+            prompt_ids.len() + args.max_new_tokens <= args.decode_cache_bucket,
+            "prompt {} plus {} generated tokens exceeds cache bucket {}",
+            prompt.id,
+            args.max_new_tokens,
+            args.decode_cache_bucket
+        );
+        if hidden_references.is_some() || args.decode_hidden_out.is_some() {
+            let hidden_states = decoder.full_hidden(&prompt_ids)?;
+            if let Some(reference) = hidden_references
+                .as_ref()
+                .and_then(|rows| rows.get(&prompt.id))
+            {
+                if hidden_states.len() != reference.hidden_states.len() {
+                    hidden_failures.push(format!(
+                        "{}: owned {} positions, reference {} positions",
+                        prompt.id,
+                        hidden_states.len(),
+                        reference.hidden_states.len()
+                    ));
+                } else {
+                    for (position, (owned, expected)) in hidden_states
+                        .iter()
+                        .zip(&reference.hidden_states)
+                        .enumerate()
+                    {
+                        let cosine = vector_cosine(owned, expected)
+                            .with_context(|| format!("{} hidden position {position}", prompt.id))?;
+                        minimum_hidden_cosine = minimum_hidden_cosine.min(cosine);
+                        if cosine < args.min_hidden_cosine {
+                            hidden_failures.push(format!(
+                                "{} position {}: cosine {:.8} below {:.8}",
+                                prompt.id, position, cosine, args.min_hidden_cosine
+                            ));
+                            break;
+                        }
+                    }
+                }
+            } else if hidden_references.is_some() {
+                hidden_failures.push(format!("{}: missing hidden-state reference row", prompt.id));
+            }
+            hidden_rows.push(DecodeHiddenRow {
+                id: prompt.id.clone(),
+                hidden_states,
+            });
+        }
+
+        prefill_tokens += prompt_ids.len();
+        let prefill_started = Instant::now();
+        let mut session = DecodeSession::prefill(&mut decoder, &prompt_ids)?;
+        prefill_wall_s += prefill_started.elapsed().as_secs_f64();
+        let mut prompt_top_logits = Vec::new();
+        let decode_started = Instant::now();
+        let tokens = session.generate(
+            args.max_new_tokens,
+            &stop_tokens,
+            args.decode_top_k,
+            &mut |event: TokenTapEvent<'_>| {
+                prompt_top_logits.push(event.top_logits.to_vec());
+                tap_rows.push(DecodeTapRow {
+                    id: prompt.id.clone(),
+                    step: event.step,
+                    token_id: event.token_id,
+                    top_logits: event.top_logits.to_vec(),
+                });
+            },
+        )?;
+        decode_wall_s += decode_started.elapsed().as_secs_f64();
+        generated_tokens += tokens.len();
+        drop(session);
+
+        if args.verify_decode_cache {
+            let reprefilled =
+                decoder.full_reprefill_tokens(&prompt_ids, args.max_new_tokens, &stop_tokens)?;
+            if reprefilled == tokens {
+                cache_verified_prompts += 1;
+            } else {
+                hard_divergences.push(format!(
+                    "{}: cached tokens {:?} differ from full-reprefill tokens {:?}",
+                    prompt.id, tokens, reprefilled
+                ));
+            }
+        }
+
+        let mut exact_reference = None;
+        if let Some(reference) = references
+            .as_ref()
+            .and_then(|references| references.get(&prompt.id))
+        {
+            let exact = tokens == reference.tokens;
+            exact_reference = Some(exact);
+            if exact {
+                exact_prompts += 1;
+            } else {
+                let shared = tokens.len().min(reference.tokens.len());
+                let first_difference =
+                    (0..shared).find(|&step| tokens[step] != reference.tokens[step]);
+                let detail = if let Some(step) = first_difference {
+                    format!(
+                        "{} step {}: owned token {}, reference token {}, owned top-{} {:?}, reference top-{} {:?}",
+                        prompt.id,
+                        step,
+                        tokens[step],
+                        reference.tokens[step],
+                        args.decode_top_k,
+                        prompt_top_logits.get(step).cloned().unwrap_or_default(),
+                        args.decode_top_k,
+                        reference.top_logits.get(step).cloned().unwrap_or_default()
+                    )
+                } else {
+                    format!(
+                        "{}: owned generated {} tokens, reference generated {} tokens",
+                        prompt.id,
+                        tokens.len(),
+                        reference.tokens.len()
+                    )
+                };
+                if allow_f16_drift {
+                    f16_divergences.push(detail);
+                } else {
+                    hard_divergences.push(detail);
+                }
+            }
+        } else if references.is_some() {
+            hard_divergences.push(format!("{}: missing decode reference row", prompt.id));
+        }
+        results.push(DecodePromptResult {
+            id: prompt.id.clone(),
+            prompt_tokens: prompt_ids.len(),
+            tokens,
+            exact_reference,
+            accepted_near_ties: Vec::new(),
+        });
+    }
+
+    if let Some(path) = &args.decode_tap_out {
+        write_jsonl(path, &tap_rows)?;
+    }
+    if let Some(path) = &args.decode_hidden_out {
+        write_jsonl(path, &hidden_rows)?;
+    }
+    let weight_count = decoder.weight_count();
+    let result = DecodeServingResult {
+        lane: provider_name,
+        workload: "lfm2-greedy-raw-completion",
+        model: args
+            .model_label
+            .clone()
+            .unwrap_or_else(|| format!("LFM2-1.2B@owned-rt-{}", args.dtype.as_str())),
+        cache_bucket: args.decode_cache_bucket,
+        max_new_tokens: args.max_new_tokens,
+        prompts: prompts.len(),
+        exact_prompts: references.as_ref().map(|_| exact_prompts),
+        accepted_near_ties: 0,
+        prefill_wall_s,
+        decode_wall_s,
+        prefill_tok_per_s: prefill_tokens as f64 / prefill_wall_s.max(f64::MIN_POSITIVE),
+        decode_tok_per_s: generated_tokens as f64 / decode_wall_s.max(f64::MIN_POSITIVE),
+        weight_regions: weight_count,
+        results,
+    };
+    let out = args.out.as_ref().context("decode mode requires --out")?;
+    if let Some(parent) = out.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(out, serde_json::to_string_pretty(&result)?)?;
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    eprintln!(
+        "LFM2 decode cold load {:.3}s, prefill {:.1} tok/s, decode {:.2} tok/s, exact {:?}/{}, hidden min cosine {:.8}, cache verified {}/{}",
+        cold_load_s,
+        result.prefill_tok_per_s,
+        result.decode_tok_per_s,
+        result.exact_prompts,
+        result.prompts,
+        minimum_hidden_cosine,
+        cache_verified_prompts,
+        if args.verify_decode_cache { result.prompts } else { 0 }
+    );
+    if !f16_divergences.is_empty() {
+        eprintln!(
+            "Metal f16 first divergences (reported, not certified token-exact):\n{}",
+            f16_divergences.join("\n")
+        );
+    }
+    ensure!(
+        hidden_failures.is_empty(),
+        "LFM2 hidden-state parity gate failed:\n{}",
+        hidden_failures.join("\n")
+    );
+    ensure!(
+        hard_divergences.is_empty(),
+        "LFM2 token/cache exactness gate failed:\n{}",
+        hard_divergences.join("\n")
+    );
+    Ok(())
+}
+
+fn read_model_config(path: &Path) -> Result<serde_json::Value> {
+    let root = resolve_model_root(path)?;
+    let config_path = root.join("config.json");
+    serde_json::from_str(
+        &fs::read_to_string(&config_path)
+            .with_context(|| format!("read config {}", config_path.display()))?,
+    )
+    .with_context(|| format!("parse config {}", config_path.display()))
+}
+
+fn vector_cosine(left: &[f32], right: &[f32]) -> Result<f64> {
+    ensure!(
+        left.len() == right.len(),
+        "hidden-state width mismatch: {} vs {}",
+        left.len(),
+        right.len()
+    );
+    ensure!(!left.is_empty(), "hidden-state vector must not be empty");
+    let dot = left
+        .iter()
+        .zip(right)
+        .map(|(&left, &right)| f64::from(left) * f64::from(right))
+        .sum::<f64>();
+    let left_norm = left
+        .iter()
+        .map(|&value| f64::from(value).powi(2))
+        .sum::<f64>()
+        .sqrt();
+    let right_norm = right
+        .iter()
+        .map(|&value| f64::from(value).powi(2))
+        .sum::<f64>()
+        .sqrt();
+    ensure!(
+        left_norm > 0.0 && right_norm > 0.0,
+        "hidden-state vector has zero norm"
+    );
+    Ok(dot / (left_norm * right_norm))
 }
 
 fn top_two_gap(top: &[qwen3_decode::TopLogit]) -> Option<f32> {
@@ -1544,6 +1899,10 @@ fn load_model_family(path: &Path, precision: Precision) -> Result<Box<dyn ModelF
             load: modernbert::load_family,
         },
         FamilyRegistration {
+            detect: lfm2::detect_config,
+            load: lfm2::load_family,
+        },
+        FamilyRegistration {
             detect: qwen3::detect_config,
             load: qwen3::load_family,
         },
@@ -2002,6 +2361,50 @@ trait KernelProvider {
                 b_layout,
                 &mut c[batch * m * n..(batch + 1) * m * n],
             )?;
+        }
+        Ok(())
+    }
+
+    fn depthwise_causal_conv1d(
+        &mut self,
+        values: &[f32],
+        batch: usize,
+        seq: usize,
+        channels: usize,
+        weights: &[f32],
+        kernel: usize,
+        output: &mut [f32],
+    ) -> Result<()> {
+        ensure!(
+            values.len() == batch * seq * channels,
+            "depthwise convolution input shape mismatch"
+        );
+        ensure!(
+            weights.len() == channels * kernel,
+            "depthwise convolution weight shape mismatch"
+        );
+        ensure!(
+            output.len() == values.len(),
+            "depthwise convolution output shape mismatch"
+        );
+        ensure!(kernel > 0, "depthwise convolution kernel must be non-zero");
+        for batch_index in 0..batch {
+            for position in 0..seq {
+                for channel in 0..channels {
+                    let mut sum = 0.0;
+                    for tap in 0..kernel {
+                        let Some(source_position) = position
+                            .checked_add(tap + 1)
+                            .and_then(|end| end.checked_sub(kernel))
+                        else {
+                            continue;
+                        };
+                        let source = (batch_index * seq + source_position) * channels + channel;
+                        sum += values[source] * weights[channel * kernel + tap];
+                    }
+                    output[(batch_index * seq + position) * channels + channel] = sum;
+                }
+            }
         }
         Ok(())
     }
@@ -2476,6 +2879,21 @@ impl KernelProvider for MetalProvider {
             .matmul(m, n, k, a, b, b_layout, c, true, self.dtype)
     }
 
+    fn depthwise_causal_conv1d(
+        &mut self,
+        values: &[f32],
+        batch: usize,
+        seq: usize,
+        channels: usize,
+        weights: &[f32],
+        kernel: usize,
+        output: &mut [f32],
+    ) -> Result<()> {
+        self.context.depthwise_causal_conv1d(
+            values, batch, seq, channels, weights, kernel, output, self.dtype,
+        )
+    }
+
     fn block_forward(&mut self, request: BlockForwardRequest<'_>) -> Result<bool> {
         if !self.block_contexts.contains_key(request.family) {
             let context =
@@ -2493,6 +2911,7 @@ impl KernelProvider for MetalProvider {
 
 #[cfg(target_os = "macos")]
 mod metal_backend {
+    use std::collections::HashMap;
     use std::ffi::{c_char, c_void, CStr, CString};
     use std::ptr::NonNull;
 
@@ -2542,13 +2961,18 @@ mod metal_backend {
     pub struct MpsGraphContext {
         raw: NonNull<c_void>,
         execution: MetalExecutionConfig,
+        f16_static_values: HashMap<usize, Vec<u16>>,
     }
 
     impl MpsGraphContext {
         pub fn new_with_config(execution: MetalExecutionConfig) -> Result<Self> {
             let raw = unsafe { synapse_mps_context_new() };
             let raw = NonNull::new(raw).ok_or_else(last_error)?;
-            Ok(Self { raw, execution })
+            Ok(Self {
+                raw,
+                execution,
+                f16_static_values: HashMap::new(),
+            })
         }
 
         #[allow(clippy::too_many_arguments)]
@@ -2586,11 +3010,24 @@ mod metal_backend {
                 },
                 Precision::F16 => {
                     let a_half = encode_f16_bits(a);
-                    let b_half = encode_f16_bits(b);
+                    let dynamic_b = (!cache_rhs).then(|| encode_f16_bits(b));
+                    let raw = self.raw.as_ptr();
+                    let b_half = if cache_rhs {
+                        self.f16_static_values
+                            .entry(b.as_ptr() as usize)
+                            .or_insert_with(|| encode_f16_bits(b))
+                            .as_slice()
+                    } else {
+                        dynamic_b.as_deref().expect("dynamic f16 RHS created above")
+                    };
+                    ensure!(
+                        b_half.len() == b.len(),
+                        "cached MPSGraph f16 RHS length mismatch"
+                    );
                     let mut output_half = vec![0u16; c.len()];
                     let status = unsafe {
                         synapse_mps_matmul(
-                            self.raw.as_ptr(),
+                            raw,
                             m as u64,
                             n as u64,
                             k as u64,
@@ -2611,6 +3048,107 @@ mod metal_backend {
             if status != 0 {
                 bail!(
                     "MPSGraph matmul failed with status {status}: {}",
+                    last_error()
+                );
+            }
+            Ok(())
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn depthwise_causal_conv1d(
+            &mut self,
+            values: &[f32],
+            batch: usize,
+            seq: usize,
+            channels: usize,
+            weights: &[f32],
+            kernel: usize,
+            output: &mut [f32],
+            dtype: Precision,
+        ) -> Result<()> {
+            ensure!(
+                values.len() == batch * seq * channels,
+                "MPSGraph depthwise convolution input shape mismatch"
+            );
+            ensure!(
+                weights.len() == channels * kernel,
+                "MPSGraph depthwise convolution weight shape mismatch"
+            );
+            ensure!(
+                output.len() == values.len(),
+                "MPSGraph depthwise convolution output shape mismatch"
+            );
+            ensure!(kernel > 0, "depthwise convolution kernel must be non-zero");
+
+            let rows = batch * seq;
+            let mut windows = vec![0.0f32; rows * channels * kernel];
+            for batch_index in 0..batch {
+                for position in 0..seq {
+                    for channel in 0..channels {
+                        for tap in 0..kernel {
+                            let Some(source_position) = position
+                                .checked_add(tap + 1)
+                                .and_then(|end| end.checked_sub(kernel))
+                            else {
+                                continue;
+                            };
+                            let source = (batch_index * seq + source_position) * channels + channel;
+                            let target = ((batch_index * seq + position) * channels + channel)
+                                * kernel
+                                + tap;
+                            windows[target] = values[source];
+                        }
+                    }
+                }
+            }
+
+            let ffi_dtype = SynapseMpsDType::from(dtype) as i32;
+            let status = match dtype {
+                Precision::F32 => unsafe {
+                    synapse_mps_depthwise_conv1d(
+                        self.raw.as_ptr(),
+                        rows as u64,
+                        channels as u64,
+                        kernel as u64,
+                        windows.as_ptr().cast(),
+                        weights.as_ptr().cast(),
+                        ffi_dtype,
+                        output.as_mut_ptr().cast(),
+                    )
+                },
+                Precision::F16 => {
+                    let windows_half = encode_f16_bits(&windows);
+                    let raw = self.raw.as_ptr();
+                    let weights_half = self
+                        .f16_static_values
+                        .entry(weights.as_ptr() as usize)
+                        .or_insert_with(|| encode_f16_bits(weights));
+                    ensure!(
+                        weights_half.len() == weights.len(),
+                        "cached MPSGraph f16 convolution weight length mismatch"
+                    );
+                    let mut output_half = vec![0u16; output.len()];
+                    let status = unsafe {
+                        synapse_mps_depthwise_conv1d(
+                            raw,
+                            rows as u64,
+                            channels as u64,
+                            kernel as u64,
+                            windows_half.as_ptr().cast(),
+                            weights_half.as_ptr().cast(),
+                            ffi_dtype,
+                            output_half.as_mut_ptr().cast(),
+                        )
+                    };
+                    if status == 0 {
+                        output.copy_from_slice(&decode_f16_bits(&output_half));
+                    }
+                    status
+                }
+            };
+            if status != 0 {
+                bail!(
+                    "MPSGraph depthwise convolution failed with status {status}: {}",
                     last_error()
                 );
             }
@@ -2908,6 +3446,16 @@ mod metal_backend {
             c: *mut c_void,
             cache_rhs: i32,
         ) -> i32;
+        fn synapse_mps_depthwise_conv1d(
+            context: *mut c_void,
+            rows: u64,
+            channels: u64,
+            kernel: u64,
+            windows: *const c_void,
+            weights: *const c_void,
+            dtype: i32,
+            output: *mut c_void,
+        ) -> i32;
         fn synapse_mps_prepare_encoder(
             context: *mut c_void,
             batch: u64,
@@ -2969,6 +3517,21 @@ mod metal_backend {
             _b_layout: BLayout,
             _c: &mut [f32],
             _cache_rhs: bool,
+            _dtype: Precision,
+        ) -> Result<()> {
+            bail!("Metal MPSGraph provider is only available on macOS")
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn depthwise_causal_conv1d(
+            &mut self,
+            _values: &[f32],
+            _batch: usize,
+            _seq: usize,
+            _channels: usize,
+            _weights: &[f32],
+            _kernel: usize,
+            _output: &mut [f32],
             _dtype: Precision,
         ) -> Result<()> {
             bail!("Metal MPSGraph provider is only available on macOS")
