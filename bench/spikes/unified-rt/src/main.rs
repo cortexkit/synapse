@@ -180,7 +180,7 @@ enum Shapes {
     Bucketed,
 }
 
-const GRAPH_REVISION: u32 = 6;
+const GRAPH_REVISION: u32 = 9;
 const BUCKET_POLICY_VERSION: u32 = 2;
 const BUCKET_V1_MAX_BATCH_ROWS: usize = 8;
 const BUCKET_V2_BATCH_ROW_LADDER: &[usize] = &[16, 16, 16, 16, 16, 16, 12, 12, 8, 8];
@@ -299,6 +299,13 @@ struct DecodeServingResult {
     decode_wall_s: f64,
     prefill_tok_per_s: f64,
     decode_tok_per_s: f64,
+    load_stages: qwen3_decode::DecodeStageTimings,
+    prefill_stages: qwen3_decode::DecodeStageTimings,
+    decode_stages: qwen3_decode::DecodeStageTimings,
+    sample_wall_s: f64,
+    kv_update_path: &'static str,
+    weight_feed_path: &'static str,
+    optimization_level: u8,
     weight_regions: usize,
     results: Vec<DecodePromptResult>,
 }
@@ -392,9 +399,14 @@ impl MetalExecutionConfig {
 
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn decode_package_path(&self, pass: &str, bucket: usize) -> Option<PathBuf> {
-        self.package_root
-            .as_ref()
-            .map(|root| root.join(format!("decode-{pass}-{bucket}.mpsgraphpackage")))
+        let optimization_level = std::env::var_os("SYNAPSE_QWEN3_DECODE_OPT_LEVEL")
+            .filter(|value| value == "0")
+            .map_or(1, |_| 0);
+        self.package_root.as_ref().map(|root| {
+            root.join(format!(
+                "decode-{pass}-{bucket}-o{optimization_level}.mpsgraphpackage"
+            ))
+        })
     }
 }
 
@@ -762,6 +774,7 @@ fn run_decode_cli(args: &Args, started: Instant) -> Result<()> {
         let execution = MetalExecutionConfig::from_args(args, "qwen3-0.6b-decode")?;
         let mut decoder =
             MetalDecoder::new(&model, args.dtype, &execution, args.decode_cache_bucket)?;
+        let load_stages = decoder.stage_timings();
         let cold_load_s = started.elapsed().as_secs_f64();
         let stop_tokens = model
             .generation_stop_ids()
@@ -772,6 +785,9 @@ fn run_decode_cli(args: &Args, started: Instant) -> Result<()> {
         let mut results = Vec::with_capacity(prompts.len());
         let mut prefill_wall_s = 0.0;
         let mut decode_wall_s = 0.0;
+        let mut sample_wall_s = 0.0;
+        let mut prefill_stages = qwen3_decode::DecodeStageTimings::default();
+        let mut decode_stages = qwen3_decode::DecodeStageTimings::default();
         let mut prefill_tokens = 0usize;
         let mut generated_tokens = 0usize;
         let mut exact_prompts = 0usize;
@@ -789,9 +805,12 @@ fn run_decode_cli(args: &Args, started: Instant) -> Result<()> {
                 args.decode_cache_bucket
             );
             prefill_tokens += prompt_ids.len();
+            let before_prefill = decoder.stage_timings();
             let prefill_started = Instant::now();
             let mut session = DecodeSession::prefill(&mut decoder, &prompt_ids)?;
             prefill_wall_s += prefill_started.elapsed().as_secs_f64();
+            let after_prefill = session.stage_timings();
+            prefill_stages.accumulate(after_prefill.delta(before_prefill));
             let mut prompt_top_logits = Vec::new();
             let decode_started = Instant::now();
             let tokens = session.generate(
@@ -809,6 +828,8 @@ fn run_decode_cli(args: &Args, started: Instant) -> Result<()> {
                 },
             )?;
             decode_wall_s += decode_started.elapsed().as_secs_f64();
+            decode_stages.accumulate(session.stage_timings().delta(after_prefill));
+            sample_wall_s += session.sample_wall_s();
             generated_tokens += tokens.len();
 
             let mut exact_reference = None;
@@ -900,6 +921,13 @@ fn run_decode_cli(args: &Args, started: Instant) -> Result<()> {
             decode_wall_s,
             prefill_tok_per_s: prefill_tokens as f64 / prefill_wall_s,
             decode_tok_per_s: generated_tokens as f64 / decode_wall_s,
+            load_stages,
+            prefill_stages,
+            decode_stages,
+            sample_wall_s,
+            kv_update_path: decoder.kv_update_path(),
+            weight_feed_path: decoder.weight_feed_path(),
+            optimization_level: decoder.optimization_level(),
             weight_regions: weight_regions.len(),
             results,
         };
