@@ -14,6 +14,9 @@ export interface QgenOptions {
   /** Send output_config.effort. Off by default: only newer models accept it;
    * models without it reject the request with HTTP 400. */
   effort?: "low" | "medium" | "high";
+  /** Questions from earlier passes over the same repo; the prompt instructs
+   * the model not to duplicate them (deeper-coverage reruns). */
+  avoid?: string[];
   pool?: AccountPool;
   aftClient?: AftClient;
 }
@@ -55,6 +58,7 @@ export async function generateQuestions(repoDir: string, options: QgenOptions = 
   const pool = options.pool ?? new AccountPool();
   const model = options.model ?? "claude-sonnet-5-0";
   const count = options.count ?? 20;
+  const avoid = options.avoid ?? [];
   const ownsAftClient = options.aftClient === undefined;
   const aftClient = options.aftClient ?? new AftClient();
   try {
@@ -71,7 +75,18 @@ export async function generateQuestions(repoDir: string, options: QgenOptions = 
             messages: [
               {
                 role: "user",
-                content: `${grounding}\n\nGenerate ${count} questions. The array must be balanced across request_class values.`,
+                content: [
+                  grounding,
+                  ...(avoid.length > 0
+                    ? [
+                        "",
+                        "Questions ALREADY generated for this repository in earlier passes (do NOT duplicate or trivially rephrase any of them; cover different files, subsystems, and behaviors):",
+                        ...avoid.map((q) => `- ${q}`),
+                      ]
+                    : []),
+                  "",
+                  `Generate ${count} questions. The array must be balanced across request_class values.`,
+                ].join("\n"),
               },
             ],
           });

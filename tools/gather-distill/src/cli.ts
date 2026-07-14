@@ -112,6 +112,16 @@ async function qgenCommand(args: ParsedArgs): Promise<void> {
   const repos = explicit.length > 0 ? explicit : await discoverRepos(one(args, "corpus-root"));
   if (repos.length === 0) throw new Error("qgen found no pinned repositories");
   const pool = accountPool(args);
+  // --avoid-from: prior job files whose questions must not be duplicated
+  // (deeper-coverage reruns over the same repos).
+  const avoidByDir = new Map<string, string[]>();
+  for (const path of args.flags.get("avoid-from") ?? []) {
+    for (const job of await readJsonl<GatherJob>(path)) {
+      const list = avoidByDir.get(job.dir) ?? [];
+      list.push(job.request);
+      avoidByDir.set(job.dir, list);
+    }
+  }
   const jobs: GatherJob[] = [];
   for (const repo of repos) {
     jobs.push(
@@ -121,6 +131,7 @@ async function qgenCommand(args: ParsedArgs): Promise<void> {
         count: numberFlag(args, "count", 20),
         maxTokens: numberFlag(args, "max-response-tokens", 6_000),
         effort: effortFlag(args),
+        avoid: avoidByDir.get(repo) ?? [],
       })),
     );
   }
