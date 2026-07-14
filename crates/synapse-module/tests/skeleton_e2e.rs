@@ -223,6 +223,7 @@ async fn start_daemon() -> TestDaemon {
         daemon_id: generate_daemon_id().unwrap(),
         pid: process::id(),
         daemon_ver: "test-synapse-e2e".to_owned(),
+        wire_version: Some(subc_protocol::PROTOCOL_VERSION),
     };
     write_atomic(&connection_file_path, &conn).unwrap();
 
