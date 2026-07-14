@@ -7,6 +7,7 @@
 #import <MetalPerformanceShadersGraph/MPSGraphMatrixMultiplicationOps.h>
 #import <MetalPerformanceShadersGraph/MPSGraphMemoryOps.h>
 #import <MetalPerformanceShadersGraph/MPSGraphNormalizationOps.h>
+#import <MetalPerformanceShadersGraph/MPSGraphReductionOps.h>
 #import <MetalPerformanceShadersGraph/MPSGraphTensorShapeOps.h>
 
 #include "mpsgraph_runtime.h"
@@ -235,6 +236,19 @@ static NSString *synapse_mps_plan_key(uint64_t m, uint64_t n, uint64_t k, int32_
                                       b_is_row_major_nk];
 }
 
+static NSString *synapse_mps_depthwise_plan_key(
+    uint64_t rows,
+    uint64_t channels,
+    uint64_t kernel,
+    int32_t dtype
+) {
+    return [NSString stringWithFormat:@"depthwise:%llu:%llu:%llu:%d",
+                                      (unsigned long long)rows,
+                                      (unsigned long long)channels,
+                                      (unsigned long long)kernel,
+                                      dtype];
+}
+
 static NSString *synapse_mps_encoder_plan_key(
     uint64_t batch,
     uint64_t seq,
@@ -446,6 +460,40 @@ static SynapseMpsPlan *synapse_mps_plan_new(
     return plan;
 }
 
+static SynapseMpsPlan *synapse_mps_depthwise_plan_new(
+    uint64_t rows,
+    uint64_t channels,
+    uint64_t kernel,
+    int32_t dtype
+) {
+    SynapseMpsPlan *plan = (SynapseMpsPlan *)calloc(1, sizeof(SynapseMpsPlan));
+    if (plan == NULL) {
+        synapse_mps_set_c_error("failed to allocate MPSGraph depthwise convolution plan");
+        return NULL;
+    }
+
+    MPSDataType graph_data_type = synapse_mps_data_type(dtype);
+    plan->a_shape = [@[ @(rows), @(channels), @(kernel) ] retain];
+    plan->b_shape = [@[ @1, @(channels), @(kernel) ] retain];
+    plan->graph = [[MPSGraph alloc] init];
+    plan->graph.options = MPSGraphOptionsSynchronizeResults;
+    plan->a_tensor = synapse_mps_placeholder(plan->graph, plan->a_shape, graph_data_type, @"windows");
+    plan->b_tensor = synapse_mps_placeholder(plan->graph, plan->b_shape, graph_data_type, @"weights");
+    MPSGraphTensor *products = [plan->graph multiplicationWithPrimaryTensor:plan->a_tensor
+                                                            secondaryTensor:plan->b_tensor
+                                                                       name:@"depthwise_products"];
+    plan->product_tensor = [[plan->graph reductionSumWithTensor:products
+                                                          axes:@[ @2 ]
+                                                          name:@"depthwise_output"] retain];
+    if (plan->a_shape == nil || plan->b_shape == nil || plan->graph == nil ||
+        plan->a_tensor == nil || plan->b_tensor == nil || plan->product_tensor == nil) {
+        synapse_mps_plan_free(plan);
+        synapse_mps_set_c_error("failed to create MPSGraph depthwise convolution plan");
+        return NULL;
+    }
+    return plan;
+}
+
 static SynapseMpsEncoderPlan *synapse_mps_encoder_plan_new(
     uint64_t batch,
     uint64_t seq,
@@ -581,6 +629,25 @@ static SynapseMpsPlan *synapse_mps_get_plan(
     if (cached != NULL) return cached;
 
     SynapseMpsPlan *plan = synapse_mps_plan_new(m, n, k, dtype, b_is_row_major_nk);
+    if (plan == NULL) {
+        return NULL;
+    }
+    synapse_mps_cache_plan(&context->runtime, key, plan);
+    return plan;
+}
+
+static SynapseMpsPlan *synapse_mps_get_depthwise_plan(
+    SynapseMpsContext *context,
+    uint64_t rows,
+    uint64_t channels,
+    uint64_t kernel,
+    int32_t dtype
+) {
+    NSString *key = synapse_mps_depthwise_plan_key(rows, channels, kernel, dtype);
+    SynapseMpsPlan *cached = synapse_mps_cached_plan(&context->runtime, key);
+    if (cached != NULL) return cached;
+
+    SynapseMpsPlan *plan = synapse_mps_depthwise_plan_new(rows, channels, kernel, dtype);
     if (plan == NULL) {
         return NULL;
     }
@@ -1014,6 +1081,93 @@ int32_t synapse_mps_matmul(
             if (release_b_buffer) {
                 [b_buffer release];
             }
+            return 0;
+        } @catch (NSException *exception) {
+            synapse_mps_set_ns_error(exception.reason);
+            return -100;
+        }
+    }
+}
+
+int32_t synapse_mps_depthwise_conv1d(
+    void *raw_context,
+    uint64_t rows,
+    uint64_t channels,
+    uint64_t kernel,
+    const void *windows,
+    const void *weights,
+    int32_t dtype,
+    void *output
+) {
+    @autoreleasepool {
+        @try {
+            synapse_mps_clear_error();
+            SynapseMpsContext *context = (SynapseMpsContext *)raw_context;
+            if (context == NULL || context->runtime.device == nil || context->runtime.queue == nil) {
+                synapse_mps_set_c_error("Metal context is not initialized");
+                return -1;
+            }
+            if (windows == NULL || weights == NULL || output == NULL) {
+                synapse_mps_set_c_error("depthwise convolution received a null data pointer");
+                return -2;
+            }
+            if (rows == 0 || channels == 0 || kernel == 0) {
+                synapse_mps_set_c_error("depthwise convolution dimensions must be non-zero");
+                return -3;
+            }
+            if (rows > NSUIntegerMax || channels > NSUIntegerMax || kernel > NSUIntegerMax) {
+                synapse_mps_set_c_error("depthwise convolution dimensions exceed NSUIntegerMax");
+                return -4;
+            }
+
+            const NSUInteger element_size = synapse_mps_dtype_size(dtype);
+            const NSUInteger windows_bytes = (NSUInteger)rows * (NSUInteger)channels * (NSUInteger)kernel * element_size;
+            const NSUInteger weights_bytes = (NSUInteger)channels * (NSUInteger)kernel * element_size;
+            MPSDataType graph_data_type = synapse_mps_data_type(dtype);
+            SynapseMpsPlan *plan = synapse_mps_get_depthwise_plan(context, rows, channels, kernel, dtype);
+            if (plan == NULL) {
+                return -5;
+            }
+
+            id<MTLBuffer> windows_buffer = synapse_mps_uncached_buffer(&context->runtime, windows, windows_bytes);
+            id<MTLBuffer> weights_buffer = synapse_mps_cached_static_buffer(&context->runtime, weights, weights_bytes);
+            if (windows_buffer == nil || weights_buffer == nil) {
+                [windows_buffer release];
+                synapse_mps_set_c_error("failed to allocate depthwise convolution input buffers");
+                return -6;
+            }
+            MPSGraphTensorData *windows_data = [[MPSGraphTensorData alloc] initWithMTLBuffer:windows_buffer
+                                                                                        shape:plan->a_shape
+                                                                                     dataType:graph_data_type];
+            MPSGraphTensorData *weights_data = [[MPSGraphTensorData alloc] initWithMTLBuffer:weights_buffer
+                                                                                        shape:plan->b_shape
+                                                                                     dataType:graph_data_type];
+            if (windows_data == nil || weights_data == nil) {
+                [windows_data release];
+                [weights_data release];
+                [windows_buffer release];
+                synapse_mps_set_c_error("failed to wrap depthwise convolution input buffers");
+                return -7;
+            }
+
+            NSDictionary<MPSGraphTensor *, MPSGraphTensorData *> *results =
+                [plan->graph runWithMTLCommandQueue:context->runtime.queue
+                                             feeds:@{ plan->a_tensor: windows_data, plan->b_tensor: weights_data }
+                                     targetTensors:@[ plan->product_tensor ]
+                                  targetOperations:nil];
+            MPSGraphTensorData *output_data = [results objectForKey:plan->product_tensor];
+            MPSNDArray *output_array = [output_data mpsndarray];
+            if (output_array == nil) {
+                [windows_data release];
+                [weights_data release];
+                [windows_buffer release];
+                synapse_mps_set_c_error("MPSGraph did not return depthwise convolution output");
+                return -8;
+            }
+            [output_array readBytes:output strideBytes:NULL];
+            [windows_data release];
+            [weights_data release];
+            [windows_buffer release];
             return 0;
         } @catch (NSException *exception) {
             synapse_mps_set_ns_error(exception.reason);
