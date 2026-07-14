@@ -27,7 +27,14 @@ export const GATHER_TOOLS: ToolDeclaration[] = PRODUCTION_TOOL_NAMES.map((name) 
 export const AFT_STORAGE_DIR = "/tmp/gather-campaign-aft";
 export const AFT_REQUEST_TIMEOUT_MS = 10 * 60_000;
 export const AFT_WARMUP_TIMEOUT_MS = 60_000;
-export const DEFAULT_AFT_BINARY = resolve(import.meta.dir, "../bin/aft-v0.46.0");
+// Tranche 2 pin: aft-dev-7cabfdd0 (AFT-handed contingency, hours of production
+// soak; v0.47.0 tag was blocked on unmerged wire-v2 + three open perf defects).
+// Deviation from the tag-only rule recorded in the campaign notes — one binary
+// for the entire tranche. Includes the configure↔eviction blake3 rebind fix
+// (574ms -> 19µs) that tranche 1's per-repo configure pattern kept triggering.
+// Override per-run with GATHER_DISTILL_AFT_BINARY.
+export const DEFAULT_AFT_BINARY =
+  process.env.GATHER_DISTILL_AFT_BINARY ?? resolve(import.meta.dir, "../bin/aft-dev-7cabfdd0");
 
 const AFT_WARMUP_INITIAL_BACKOFF_MS = 100;
 const AFT_WARMUP_MAX_BACKOFF_MS = 2_000;
