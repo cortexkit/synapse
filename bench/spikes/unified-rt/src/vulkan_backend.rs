@@ -32,6 +32,7 @@ mod enabled {
     use std::mem::size_of;
     use std::path::PathBuf;
     use std::ptr;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Once};
     use std::time::Instant;
 
@@ -43,7 +44,86 @@ mod enabled {
 
     const DESCRIPTOR_BINDINGS: u32 = 10;
     const PUSH_CONSTANT_BYTES: u32 = 128;
-    static MEMORY_TYPE_REPORT: Once = Once::new();
+    static HOST_STORAGE_MEMORY_TYPE_REPORT: Once = Once::new();
+    static STAGING_MEMORY_TYPE_REPORT: Once = Once::new();
+    static WEIGHT_MEMORY_TYPE_REPORT: Once = Once::new();
+
+    #[derive(Clone, Copy)]
+    enum MemoryPool {
+        HostStorage,
+        Staging,
+        Weight,
+    }
+
+    impl MemoryPool {
+        fn label(self) -> &'static str {
+            match self {
+                Self::HostStorage => "host-storage",
+                Self::Staging => "staging",
+                Self::Weight => "weight",
+            }
+        }
+
+        fn report(self) -> &'static Once {
+            match self {
+                Self::HostStorage => &HOST_STORAGE_MEMORY_TYPE_REPORT,
+                Self::Staging => &STAGING_MEMORY_TYPE_REPORT,
+                Self::Weight => &WEIGHT_MEMORY_TYPE_REPORT,
+            }
+        }
+    }
+
+    fn select_memory_type(
+        memory_types: &[vk::MemoryType],
+        bits: u32,
+        required: vk::MemoryPropertyFlags,
+        forbidden: vk::MemoryPropertyFlags,
+    ) -> Option<u32> {
+        memory_types
+            .iter()
+            .enumerate()
+            .find(|(index, memory)| {
+                bits & (1 << index) != 0
+                    && memory.property_flags.contains(required)
+                    && !memory.property_flags.intersects(forbidden)
+            })
+            .map(|(index, _)| index as u32)
+    }
+
+    #[cfg(test)]
+    mod memory_tests {
+        use super::*;
+
+        #[test]
+        fn weight_memory_excludes_host_visible_device_local_types() {
+            let types = [
+                vk::MemoryType::default().property_flags(
+                    vk::MemoryPropertyFlags::DEVICE_LOCAL
+                        | vk::MemoryPropertyFlags::HOST_VISIBLE
+                        | vk::MemoryPropertyFlags::HOST_COHERENT,
+                ),
+                vk::MemoryType::default().property_flags(vk::MemoryPropertyFlags::DEVICE_LOCAL),
+            ];
+            assert_eq!(
+                select_memory_type(
+                    &types,
+                    0b11,
+                    vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                    vk::MemoryPropertyFlags::HOST_VISIBLE,
+                ),
+                Some(1)
+            );
+            assert_eq!(
+                select_memory_type(
+                    &types[..1],
+                    0b1,
+                    vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                    vk::MemoryPropertyFlags::HOST_VISIBLE,
+                ),
+                None
+            );
+        }
+    }
 
     struct Buffer {
         state: Arc<DeviceState>,
@@ -54,31 +134,84 @@ mod enabled {
 
     impl Buffer {
         fn new(state: Arc<DeviceState>, bytes: usize) -> Result<Self> {
+            Self::allocate(
+                state,
+                bytes,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                vk::MemoryPropertyFlags::empty(),
+                MemoryPool::HostStorage,
+            )
+        }
+
+        fn allocate(
+            state: Arc<DeviceState>,
+            bytes: usize,
+            usage: vk::BufferUsageFlags,
+            required: vk::MemoryPropertyFlags,
+            forbidden: vk::MemoryPropertyFlags,
+            pool: MemoryPool,
+        ) -> Result<Self> {
             let bytes = bytes.max(4) as vk::DeviceSize;
             let create = vk::BufferCreateInfo::default()
                 .size(bytes)
-                .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
+                .usage(usage)
                 .sharing_mode(vk::SharingMode::EXCLUSIVE);
             let buffer = unsafe { state.device.create_buffer(&create, None)? };
             let requirements = unsafe { state.device.get_buffer_memory_requirements(buffer) };
-            let memory_type = state
-                .memory_type(
-                    requirements.memory_type_bits,
-                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-                )
-                .context("no coherent host-visible Vulkan storage memory")?;
-            MEMORY_TYPE_REPORT.call_once(|| {
-                let memory = state.memory_properties.memory_types[memory_type as usize];
-                eprintln!(
-                    "Vulkan storage memory: type_index={memory_type} heap_index={} flags={:?}",
-                    memory.heap_index, memory.property_flags
+            let Some(memory_type) =
+                state.memory_type(requirements.memory_type_bits, required, forbidden)
+            else {
+                unsafe { state.device.destroy_buffer(buffer, None) };
+                anyhow::bail!(
+                    "no Vulkan {} memory with required={required:?} forbidden={forbidden:?}",
+                    pool.label()
                 );
-            });
+            };
+            let memory_properties = state.memory_properties.memory_types[memory_type as usize];
+            let heap_index = memory_properties.heap_index;
+            if matches!(pool, MemoryPool::Weight) {
+                if let Err(error) = state.ensure_heap_budget(heap_index, requirements.size) {
+                    unsafe { state.device.destroy_buffer(buffer, None) };
+                    return Err(error);
+                }
+            }
             let allocate = vk::MemoryAllocateInfo::default()
                 .allocation_size(requirements.size)
                 .memory_type_index(memory_type);
-            let memory = unsafe { state.device.allocate_memory(&allocate, None)? };
-            unsafe { state.device.bind_buffer_memory(buffer, memory, 0)? };
+            let memory = match unsafe { state.device.allocate_memory(&allocate, None) } {
+                Ok(memory) => memory,
+                Err(error) => {
+                    unsafe { state.device.destroy_buffer(buffer, None) };
+                    return Err(error.into());
+                }
+            };
+            if let Err(error) = unsafe { state.device.bind_buffer_memory(buffer, memory, 0) } {
+                unsafe {
+                    state.device.free_memory(memory, None);
+                    state.device.destroy_buffer(buffer, None);
+                }
+                return Err(error.into());
+            }
+            pool.report().call_once(|| {
+                let budget = state.heap_budget(heap_index);
+                eprintln!(
+                    "Vulkan memory pool: pool={} type_index={memory_type} heap_index={heap_index} flags={:?} heap_size={} heap_usage={} heap_budget={}",
+                    pool.label(),
+                    memory_properties.property_flags,
+                    state.memory_properties.memory_heaps[heap_index as usize].size,
+                    budget.map_or(0, |value| value.0),
+                    budget.map_or(0, |value| value.1),
+                );
+            });
+            if matches!(pool, MemoryPool::Weight) {
+                state
+                    .immutable_allocation_count
+                    .fetch_add(1, Ordering::Relaxed);
+                state
+                    .immutable_allocation_bytes
+                    .fetch_add(requirements.size, Ordering::Relaxed);
+            }
             Ok(Self {
                 state,
                 buffer,
@@ -87,17 +220,41 @@ mod enabled {
             })
         }
 
+        fn staging(state: Arc<DeviceState>, bytes: usize) -> Result<Self> {
+            Self::allocate(
+                state,
+                bytes,
+                vk::BufferUsageFlags::TRANSFER_SRC,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                vk::MemoryPropertyFlags::empty(),
+                MemoryPool::Staging,
+            )
+        }
+
         fn from_f16(state: Arc<DeviceState>, values: &[f32]) -> Result<Self> {
-            let encoded = encode_f16_bits(values);
-            let buffer = Self::new(state, encoded.len() * size_of::<u16>())?;
-            buffer.write(&encoded)?;
-            Ok(buffer)
+            Self::from_slice(state, &encode_f16_bits(values))
         }
 
         fn from_f32(state: Arc<DeviceState>, values: &[f32]) -> Result<Self> {
-            let buffer = Self::new(state, std::mem::size_of_val(values))?;
-            buffer.write(values)?;
-            Ok(buffer)
+            Self::from_slice(state, values)
+        }
+
+        fn from_slice<T: Copy>(state: Arc<DeviceState>, values: &[T]) -> Result<Self> {
+            let bytes = std::mem::size_of_val(values);
+            let destination = Self::allocate(
+                state.clone(),
+                bytes,
+                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                vk::MemoryPropertyFlags::HOST_VISIBLE,
+                MemoryPool::Weight,
+            )?;
+            if bytes > 0 {
+                let staging = Self::staging(state.clone(), bytes)?;
+                staging.write(values)?;
+                state.copy_buffer(staging.buffer, destination.buffer, bytes as u64)?;
+            }
+            Ok(destination)
         }
 
         fn write<T: Copy>(&self, values: &[T]) -> Result<()> {
@@ -174,10 +331,16 @@ mod enabled {
     struct DeviceState {
         _entry: Entry,
         instance: Instance,
+        physical_device: vk::PhysicalDevice,
         device: Device,
         queue: vk::Queue,
         queue_family: u32,
         memory_properties: vk::PhysicalDeviceMemoryProperties,
+        memory_budget_supported: bool,
+        upload_command_pool: vk::CommandPool,
+        upload_fence: vk::Fence,
+        immutable_allocation_count: AtomicUsize,
+        immutable_allocation_bytes: AtomicU64,
         descriptor_layout: vk::DescriptorSetLayout,
         pipeline_layout: vk::PipelineLayout,
         pipeline_cache: vk::PipelineCache,
@@ -265,6 +428,33 @@ mod enabled {
                 let profile_output = profile_requested
                     .then(|| std::env::var_os("SYNAPSE_VULKAN_PROFILE_OUT").map(PathBuf::from))
                     .flatten();
+                let memory_budget_supported = instance
+                    .enumerate_device_extension_properties(physical_device)?
+                    .iter()
+                    .any(|extension| {
+                        CStr::from_ptr(extension.extension_name.as_ptr())
+                            == ash::ext::memory_budget::NAME
+                    });
+                let memory_properties =
+                    instance.get_physical_device_memory_properties(physical_device);
+                let budget_snapshot = memory_budget_supported.then(|| {
+                    let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+                    let mut properties =
+                        vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
+                    instance
+                        .get_physical_device_memory_properties2(physical_device, &mut properties);
+                    budget
+                });
+                for heap_index in 0..memory_properties.memory_heap_count as usize {
+                    let heap = memory_properties.memory_heaps[heap_index];
+                    eprintln!(
+                        "Vulkan memory heap: heap_index={heap_index} size={} flags={:?} usage={} budget={} memory_budget_ext={memory_budget_supported}",
+                        heap.size,
+                        heap.flags,
+                        budget_snapshot.as_ref().map_or(0, |budget| budget.heap_usage[heap_index]),
+                        budget_snapshot.as_ref().map_or(0, |budget| budget.heap_budget[heap_index]),
+                    );
+                }
 
                 let mut supported_storage16 = vk::PhysicalDevice16BitStorageFeatures::default();
                 let mut supported_float16 = vk::PhysicalDeviceShaderFloat16Int8Features::default();
@@ -323,10 +513,13 @@ mod enabled {
                 let queue = [vk::DeviceQueueCreateInfo::default()
                     .queue_family_index(queue_family)
                     .queue_priorities(&priority)];
-                let extension_names = matches!(gemm, VulkanGemm::Cooperative)
-                    .then_some(ash::khr::cooperative_matrix::NAME.as_ptr())
-                    .into_iter()
-                    .collect::<Vec<_>>();
+                let mut extension_names = Vec::new();
+                if matches!(gemm, VulkanGemm::Cooperative) {
+                    extension_names.push(ash::khr::cooperative_matrix::NAME.as_ptr());
+                }
+                if memory_budget_supported {
+                    extension_names.push(ash::ext::memory_budget::NAME.as_ptr());
+                }
                 let mut storage16 = vk::PhysicalDevice16BitStorageFeatures::default()
                     .storage_buffer16_bit_access(true);
                 let mut float16 =
@@ -345,6 +538,13 @@ mod enabled {
                 let device_started = Instant::now();
                 let device = instance.create_device(physical_device, &create, None)?;
                 let queue = device.get_device_queue(queue_family, 0);
+                let upload_command_pool = device.create_command_pool(
+                    &vk::CommandPoolCreateInfo::default()
+                        .queue_family_index(queue_family)
+                        .flags(vk::CommandPoolCreateFlags::TRANSIENT),
+                    None,
+                )?;
+                let upload_fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
                 eprintln!(
                     "Vulkan phase: device_ms={:.3}",
                     device_started.elapsed().as_secs_f64() * 1_000.0
@@ -391,15 +591,19 @@ mod enabled {
                     gemm.as_str(),
                     initial_cache.len()
                 );
-                let memory_properties =
-                    instance.get_physical_device_memory_properties(physical_device);
                 Ok(Arc::new(Self {
                     _entry: entry,
                     instance,
+                    physical_device,
                     device,
                     queue,
                     queue_family,
                     memory_properties,
+                    memory_budget_supported,
+                    upload_command_pool,
+                    upload_fence,
+                    immutable_allocation_count: AtomicUsize::new(0),
+                    immutable_allocation_bytes: AtomicU64::new(0),
                     descriptor_layout,
                     pipeline_layout,
                     pipeline_cache,
@@ -413,14 +617,107 @@ mod enabled {
             }
         }
 
-        fn memory_type(&self, bits: u32, required: vk::MemoryPropertyFlags) -> Option<u32> {
-            self.memory_properties.memory_types[..self.memory_properties.memory_type_count as usize]
-                .iter()
-                .enumerate()
-                .find(|(index, memory)| {
-                    bits & (1 << index) != 0 && memory.property_flags.contains(required)
-                })
-                .map(|(index, _)| index as u32)
+        fn memory_type(
+            &self,
+            bits: u32,
+            required: vk::MemoryPropertyFlags,
+            forbidden: vk::MemoryPropertyFlags,
+        ) -> Option<u32> {
+            select_memory_type(
+                &self.memory_properties.memory_types
+                    [..self.memory_properties.memory_type_count as usize],
+                bits,
+                required,
+                forbidden,
+            )
+        }
+
+        fn heap_budget(&self, heap_index: u32) -> Option<(vk::DeviceSize, vk::DeviceSize)> {
+            self.memory_budget_supported.then(|| unsafe {
+                let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+                let mut properties =
+                    vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
+                self.instance
+                    .get_physical_device_memory_properties2(self.physical_device, &mut properties);
+                (
+                    budget.heap_usage[heap_index as usize],
+                    budget.heap_budget[heap_index as usize],
+                )
+            })
+        }
+
+        fn ensure_heap_budget(&self, heap_index: u32, allocation: vk::DeviceSize) -> Result<()> {
+            if let Some((usage, budget)) = self.heap_budget(heap_index) {
+                ensure!(
+                    usage.saturating_add(allocation) <= budget,
+                    "Vulkan device-local heap {heap_index} budget exhausted: usage={usage} allocation={allocation} budget={budget}"
+                );
+            }
+            Ok(())
+        }
+
+        fn copy_buffer(
+            &self,
+            source: vk::Buffer,
+            destination: vk::Buffer,
+            bytes: vk::DeviceSize,
+        ) -> Result<()> {
+            let command = unsafe {
+                self.device.allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default()
+                        .command_pool(self.upload_command_pool)
+                        .level(vk::CommandBufferLevel::PRIMARY)
+                        .command_buffer_count(1),
+                )?[0]
+            };
+            let result = (|| unsafe {
+                self.device.begin_command_buffer(
+                    command,
+                    &vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                )?;
+                self.device.cmd_copy_buffer(
+                    command,
+                    source,
+                    destination,
+                    &[vk::BufferCopy::default().size(bytes)],
+                );
+                self.device.cmd_pipeline_barrier(
+                    command,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[vk::BufferMemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                        .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                        .buffer(destination)
+                        .size(bytes)],
+                    &[],
+                );
+                self.device.end_command_buffer(command)?;
+                self.device.reset_fences(&[self.upload_fence])?;
+                self.device.queue_submit(
+                    self.queue,
+                    &[vk::SubmitInfo::default().command_buffers(&[command])],
+                    self.upload_fence,
+                )?;
+                self.device
+                    .wait_for_fences(&[self.upload_fence], true, u64::MAX)?;
+                Ok::<_, anyhow::Error>(())
+            })();
+            unsafe {
+                self.device
+                    .free_command_buffers(self.upload_command_pool, &[command]);
+            }
+            result
+        }
+
+        fn immutable_allocation_summary(&self) -> (usize, u64) {
+            (
+                self.immutable_allocation_count.load(Ordering::Relaxed),
+                self.immutable_allocation_bytes.load(Ordering::Relaxed),
+            )
         }
     }
 
@@ -455,6 +752,9 @@ mod enabled {
                     .destroy_pipeline_layout(self.pipeline_layout, None);
                 self.device
                     .destroy_descriptor_set_layout(self.descriptor_layout, None);
+                self.device.destroy_fence(self.upload_fence, None);
+                self.device
+                    .destroy_command_pool(self.upload_command_pool, None);
                 self.device.destroy_device(None);
                 self.instance.destroy_instance(None);
             }
@@ -1775,8 +2075,9 @@ mod enabled {
                     .map(|layer| DeviceLayer::upload(self.state.clone(), layer))
                     .collect::<Result<Vec<_>>>()?;
                 self.model_shape = Some((hidden, intermediate, layers.len()));
+                let (allocations, allocated_bytes) = self.state.immutable_allocation_summary();
                 eprintln!(
-                    "Vulkan persistent weights: upload_ms={:.3} layers={} hidden={} intermediate={} storage=f16 norm_params=fp32",
+                    "Vulkan persistent weights: family=MiniLM upload_ms={:.3} layers={} hidden={} intermediate={} storage=f16 norm_params=fp32 allocations={allocations} allocated_bytes={allocated_bytes} placement=DEVICE_LOCAL host_visible=false upload=staging-copy",
                     started.elapsed().as_secs_f64() * 1_000.0,
                     layers.len(),
                     hidden,
@@ -2386,12 +2687,21 @@ mod enabled {
                 "ModernBERT Vulkan mask shape mismatch"
             );
             if self.layers.is_empty() {
+                let started = Instant::now();
                 self.layers = layers
                     .iter()
                     .map(|layer| DeviceModernLayer::upload(self.state.clone(), layer, hidden))
                     .collect::<Result<_>>()?;
                 self.final_norm = Some(Buffer::from_f32(self.state.clone(), final_norm)?);
                 self.model_shape = Some((hidden, intermediate, layers.len()));
+                let (allocations, allocated_bytes) = self.state.immutable_allocation_summary();
+                eprintln!(
+                    "Vulkan persistent weights: family=gte-modernbert upload_ms={:.3} layers={} hidden={} intermediate={} storage=f16 norm_params=fp32 allocations={allocations} allocated_bytes={allocated_bytes} placement=DEVICE_LOCAL host_visible=false upload=staging-copy",
+                    started.elapsed().as_secs_f64() * 1_000.0,
+                    layers.len(),
+                    hidden,
+                    intermediate
+                );
             }
             ensure!(
                 self.model_shape == Some((hidden, intermediate, layers.len())),
@@ -3073,6 +3383,7 @@ mod enabled {
                 "Qwen3 Vulkan invalid GQA heads"
             );
             if self.layers.is_empty() {
+                let started = Instant::now();
                 self.layers = layers
                     .iter()
                     .map(|layer| DeviceQwenLayer::upload(self.state.clone(), layer))
@@ -3080,6 +3391,14 @@ mod enabled {
                 self.final_norm = Some(Buffer::from_f32(self.state.clone(), final_norm)?);
                 self.model_shape =
                     Some((hidden, query_heads, kv_heads, intermediate, layers.len()));
+                let (allocations, allocated_bytes) = self.state.immutable_allocation_summary();
+                eprintln!(
+                    "Vulkan persistent weights: family=Qwen3-Embedding-0.6B upload_ms={:.3} layers={} hidden={} intermediate={} storage=f16 norm_params=fp32 allocations={allocations} allocated_bytes={allocated_bytes} placement=DEVICE_LOCAL host_visible=false upload=staging-copy",
+                    started.elapsed().as_secs_f64() * 1_000.0,
+                    layers.len(),
+                    hidden,
+                    intermediate
+                );
             }
             ensure!(
                 self.model_shape
