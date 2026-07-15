@@ -28,6 +28,7 @@
 #   EVAL_OUTPUT_DIR             default: $EVAL_DATA_DIR/students
 #   EVAL_CONFIG_JSON            required beside a standalone GGUF to clamp ctx
 #   EVAL_CONTEXT_SIZE           request a smaller serving context deliberately
+#   EVAL_CHAT_TEMPLATE_KWARGS   JSON passed to llama-server --chat-template-kwargs
 #   EVAL_RESET=1                discard this label's resumable run artifacts
 #   EVAL_REMOTE_ENDPOINT        ssh destination for a pre-running remote server
 #   GATHER_DISTILL_AFT_BINARY   pinned AFT executable used by the harness
@@ -64,6 +65,7 @@ EVAL_CONCURRENCY="${EVAL_CONCURRENCY:-2}"
 EVAL_HOST="${EVAL_HOST:-127.0.0.1}"
 EVAL_PORT="${EVAL_PORT:-8090}"
 EVAL_GPU_LAYERS="${EVAL_GPU_LAYERS:-99}"
+EVAL_CHAT_TEMPLATE_KWARGS="${EVAL_CHAT_TEMPLATE_KWARGS:-}"
 LLAMA_CPP_REVISION="${LLAMA_CPP_REVISION:-b4e3dc613}"
 LLAMA_CPP_DIR="${LLAMA_CPP_DIR:-$ROOT/bin/llama.cpp}"
 LLAMA_CONVERT="${LLAMA_CONVERT:-$LLAMA_CPP_DIR/convert_hf_to_gguf.py}"
@@ -225,8 +227,12 @@ case "$SERVER_MODE" in
     fi
 
     SERVER_BIN="$(resolve_binary "$LLAMA_SERVER" "llama-server")"
+    SERVER_ARGS=(-m "$SERVED_GGUF" --host "$EVAL_HOST" --port "$EVAL_PORT" -ngl "$EVAL_GPU_LAYERS" --jinja -fa on -c "$SERVED_CONTEXT")
+    if [[ -n "$EVAL_CHAT_TEMPLATE_KWARGS" ]]; then
+      SERVER_ARGS+=(--chat-template-kwargs "$EVAL_CHAT_TEMPLATE_KWARGS")
+    fi
     echo "eval-student: starting $SERVER_BIN (llama.cpp $LLAMA_CPP_REVISION)"
-    "$SERVER_BIN" -m "$SERVED_GGUF" --host "$EVAL_HOST" --port "$EVAL_PORT" -ngl "$EVAL_GPU_LAYERS" --jinja -fa on -c "$SERVED_CONTEXT" >"$SERVER_LOG" 2>&1 &
+    "$SERVER_BIN" "${SERVER_ARGS[@]}" >"$SERVER_LOG" 2>&1 &
     CHILD_PID="$!"
     BASE_URL="${EVAL_BASE_URL:-http://$EVAL_HOST:$EVAL_PORT/v1}"
     wait_for_server "$BASE_URL"
