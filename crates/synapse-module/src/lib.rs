@@ -30,8 +30,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use store::{
-    AssuranceClass, CatalogSnapshot, CertificationKey, CertificationRow, CheckpointItem,
-    JobAdmission, JobAttemptClaim, JobRecord, KnobAssignmentRow, ModelAssetLocator,
+    AssuranceClass, CatalogSnapshot, CertificationKey, CertificationRow, CertificationStatus,
+    CheckpointItem, JobAdmission, JobAttemptClaim, JobRecord, KnobAssignmentRow, ModelAssetLocator,
     ModelCatalogEntry, PerfRow, StoredModelConfig, SynapseStore, SynapseStoreError, JOB_STATE_DONE,
     JOB_STATE_FAILED_PERMANENT, JOB_STATE_FAILED_TRANSIENT, JOB_STATE_PAUSED_NEEDS_REAUTH,
     JOB_STATE_QUEUED, JOB_STATE_RUNNING,
@@ -86,7 +86,6 @@ const DEFAULT_PROBE_MEAN_COSINE_THRESHOLD: f64 = 0.999;
 const DEFAULT_PROBE_WORST_DECILE_RANK_OVERLAP_THRESHOLD: f64 = 0.9;
 const DEFAULT_PROBE_ANE_PLACEMENT_THRESHOLD: f64 = 0.9;
 const RERANK_PROBE_PEARSON_THRESHOLD: f64 = 0.999;
-const GENERATE_PROBE_MIN_LABEL_MATCHES: usize = 7;
 const BALANCED_QUIET_MIN_THROUGHPUT_RATIO: f64 = 0.5;
 const PROBE_PERF_BATCH_TOKEN_BUDGET: usize = 1_024;
 const PROBE_PERF_TARGET_TOTAL_TOKENS: u64 = 4_096;
@@ -990,25 +989,31 @@ struct RerankProbeEvidence {
     requests: usize,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct GenerateProbeFixture {
+    family: String,
+    dtype: String,
+    model: String,
+    model_revision: String,
     #[serde(default)]
     generation_command: Option<String>,
+    provenance: Value,
     items: Vec<GenerateProbeItem>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct GenerateProbeItem {
     id: String,
     prompt: String,
-    expected_label: String,
-    max_tokens: u32,
+    expected_token_ids: Vec<u32>,
+    max_new_tokens: u32,
 }
 
 #[derive(Clone, Debug, Serialize)]
 struct GenerateProbeEvidence {
-    label_matches: usize,
+    token_exact_matches: usize,
     items: usize,
+    tokens_compared: usize,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1032,6 +1037,8 @@ struct ProbeModelResult {
 struct LaneMeasurementRows {
     current_certification: Option<CertificationRow>,
     latest_certification: Option<CertificationRow>,
+    current_probe: Option<CertificationRow>,
+    latest_probe: Option<CertificationRow>,
     certification_stale: bool,
     current_performance: Option<PerfRow>,
     latest_performance: Option<PerfRow>,
@@ -4390,8 +4397,10 @@ async fn microllm_oneshot(state: Arc<ModuleState>, params: Value) -> HandlerOutc
             ),
         ));
     }
-    if let Err(error) = ensure_model_certified(&state, &model, params.accept_declared) {
-        return result_outcome(error_payload(&state, error));
+    if microllm_certification_required(&model) {
+        if let Err(error) = ensure_model_certified(&state, &model, params.accept_declared) {
+            return result_outcome(error_payload(&state, error));
+        }
     }
     if let Err(error) = check_fingerprint_constraints(
         &model,
@@ -5571,10 +5580,23 @@ fn ensure_model_certified(
     model: &EmbeddingModel,
     accept_declared: bool,
 ) -> Result<(), WireOperationError> {
-    match state
-        .store
-        .get_cert_row(&state.machine_profile_hash, &model.fingerprint)
-    {
+    ensure_fingerprint_certified(
+        &state.store,
+        &state.machine_profile_hash,
+        &model.fingerprint,
+        &model.model_id,
+        accept_declared,
+    )
+}
+
+fn ensure_fingerprint_certified(
+    store: &SynapseStore,
+    machine_profile_hash: &str,
+    fingerprint: &Fingerprint,
+    model_id: &str,
+    accept_declared: bool,
+) -> Result<(), WireOperationError> {
+    match store.get_cert_row(machine_profile_hash, fingerprint) {
         Ok(Some(_)) => return Ok(()),
         Ok(None) => {}
         Err(error) => {
@@ -5585,27 +5607,44 @@ fn ensure_model_certified(
         }
     }
 
-    match declared_certification_for_request(
-        &state.store,
-        &model.fingerprint,
-        &model.model_id,
-        accept_declared,
-    ) {
+    match declared_certification_for_request(store, fingerprint, model_id, accept_declared) {
         Ok(Some(_)) => Ok(()),
         Ok(None) => {
-            let stale = state
-                .store
-                .has_stale_cert_row(&state.machine_profile_hash, &model.fingerprint)
+            let failed_probe = store
+                .get_probe_row(machine_profile_hash, fingerprint)
+                .map_err(|error| {
+                    WireOperationError::from_stable(
+                        StableError::engine_crashed(Some(100)),
+                        format!("read probe outcome row: {error}"),
+                    )
+                })?
+                .filter(|row| row.status == CertificationStatus::Uncertified);
+            if let Some(row) = failed_probe {
+                let reason = row
+                    .evidence
+                    .get("blocking_reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("probe_failed");
+                return Err(WireOperationError::from_stable(
+                    StableError::not_certified(),
+                    format!(
+                        "fingerprint {} is uncertified on machine profile {}: {}",
+                        fingerprint.0, machine_profile_hash, reason
+                    ),
+                ));
+            }
+            let stale = store
+                .has_stale_cert_row(machine_profile_hash, fingerprint)
                 .unwrap_or(false);
             let message = if stale {
                 format!(
                     "fingerprint {} has only stale certification rows for a different machine profile",
-                    model.fingerprint.0
+                    fingerprint.0
                 )
             } else {
                 format!(
                     "fingerprint {} is not certified on machine profile {}",
-                    model.fingerprint.0, state.machine_profile_hash
+                    fingerprint.0, machine_profile_hash
                 )
             };
             Err(WireOperationError::from_stable(
@@ -5917,7 +5956,37 @@ async fn execute_probe_job(state: Arc<ModuleState>, job_id: String, model_filter
             return;
         }
     };
-    let knob_assignments = compute_knob_assignments(&perf_rows);
+    let mut routable_perf_rows = Vec::with_capacity(perf_rows.len());
+    for row in perf_rows {
+        let certification_required =
+            row.workload != ModelTask::Generate.as_str() || row.engine == "owned-metal";
+        let certified = if certification_required {
+            match state
+                .store
+                .get_cert_row(&state.machine_profile_hash, &row.fingerprint)
+            {
+                Ok(row) => row.is_some(),
+                Err(error) => {
+                    fail_job_with_wire_error(
+                        &state,
+                        &job_id,
+                        true,
+                        WireOperationError::from_stable(
+                            StableError::engine_crashed(Some(100)),
+                            format!("read certification rows for knob mapping: {error}"),
+                        ),
+                    );
+                    return;
+                }
+            }
+        } else {
+            true
+        };
+        if certified {
+            routable_perf_rows.push(row);
+        }
+    }
+    let knob_assignments = compute_knob_assignments(&routable_perf_rows);
     if let Err(error) = state
         .store
         .replace_knob_assignments(&state.machine_profile_hash, &knob_assignments)
@@ -5959,11 +6028,7 @@ async fn execute_probe_job(state: Arc<ModuleState>, job_id: String, model_filter
                 "first_id": rerank_fixture.items.first().map(|item| item.id.clone()),
                 "generation_command": rerank_fixture.generation_command,
             },
-            "generate": {
-                "items": generate_fixture.items.len(),
-                "first_id": generate_fixture.items.first().map(|item| item.id.clone()),
-                "generation_command": generate_fixture.generation_command,
-            }
+            "generate": generate_fixture_provenance(&generate_fixture)
         },
         "lanes": lane_results,
         "aliases": alias_results,
@@ -6226,32 +6291,78 @@ async fn execute_generate_probe_for_model(
     model: Arc<EmbeddingModel>,
     fixture: &GenerateProbeFixture,
 ) -> Result<ProbeModelResult, WireOperationError> {
-    let mut matches = 0_usize;
-    let mut examples = Vec::new();
+    if !microllm_certification_required(&model) {
+        return Ok(ProbeModelResult {
+            lane_result: json!({
+                "model_id": model.model_id,
+                "task": "generate",
+                "fingerprint": model.fingerprint,
+                "numeric_profile_id": model.numeric_profile_id,
+                "status": "not_required",
+                "certification_required": false,
+                "reason": "worker_lane_uses_existing_dispatch_path",
+            }),
+            certified_vectors: None,
+        });
+    }
+
+    if !generate_fixture_matches_model(fixture, &model) {
+        let evidence = json!({
+            "task": "generate",
+            "gate": "token_exact",
+            "blocking_reason": "fixture_unavailable",
+            "fixture": generate_fixture_provenance(fixture),
+            "model_family": model.engine_identity.build_flags.get("family"),
+            "model_dtype": model.engine_identity.build_flags.get("dtype"),
+        });
+        store_probe_outcome_row(
+            state,
+            &model,
+            CertificationStatus::Uncertified,
+            evidence.clone(),
+        )?;
+        return Ok(ProbeModelResult {
+            lane_result: json!({
+                "model_id": model.model_id,
+                "task": "generate",
+                "fingerprint": model.fingerprint,
+                "numeric_profile_id": model.numeric_profile_id,
+                "status": "uncertified",
+                "certification_required": true,
+                "blocking_reason": "fixture_unavailable",
+                "evidence": evidence,
+                "performance": Value::Null,
+            }),
+            certified_vectors: None,
+        });
+    }
+
+    let mut exact_matches = 0_usize;
+    let mut tokens_compared = 0_usize;
+    let mut mismatches = Vec::new();
+    let mut throughput_samples = Vec::with_capacity(fixture.items.len());
+    let mut latency_samples = Vec::with_capacity(fixture.items.len());
     for item in &fixture.items {
         let tokenized = match model.tokenizer.tokenize_batch([item.prompt.as_str()]) {
             Ok(tokenized) => tokenized,
             Err(error) => {
-                return Ok(ProbeModelResult {
-                    lane_result: json!({
-                        "model_id": model.model_id,
-                        "task": "generate",
-                        "fingerprint": model.fingerprint,
-                        "numeric_profile_id": model.numeric_profile_id,
-                        "status": "uncertified",
-                        "error": error.to_string(),
-                    }),
-                    certified_vectors: None,
-                })
+                return store_generate_probe_error(
+                    state,
+                    &model,
+                    fixture,
+                    "tokenization_failed",
+                    error.to_string(),
+                )
             }
         };
         let prompt = tokenized.batch.items.into_iter().next().unwrap_or_default();
+        let started = std::time::Instant::now();
         let output = match execute_generate(
             &state.runtime,
             &model,
             GenerateRequest {
                 prompt,
-                max_tokens: item.max_tokens.min(64),
+                max_tokens: item.max_new_tokens,
                 grammar: None,
             },
         )
@@ -6259,36 +6370,51 @@ async fn execute_generate_probe_for_model(
         {
             Ok(output) => output,
             Err(error) => {
-                return Ok(ProbeModelResult {
-                    lane_result: json!({
-                        "model_id": model.model_id,
-                        "task": "generate",
-                        "fingerprint": model.fingerprint,
-                        "numeric_profile_id": model.numeric_profile_id,
-                        "status": "uncertified",
-                        "error": error,
-                    }),
-                    certified_vectors: None,
-                })
+                return store_generate_probe_error(
+                    state,
+                    &model,
+                    fixture,
+                    "generation_failed",
+                    error.message,
+                )
             }
         };
-        let actual_label = normalize_probe_label(&output.text);
-        let expected_label = normalize_probe_label(&item.expected_label);
-        if actual_label == expected_label {
-            matches += 1;
-        } else if examples.len() < 3 {
-            examples.push(json!({
-                "id": item.id,
-                "expected": item.expected_label,
-                "actual": output.text,
-            }));
+        let elapsed_secs = started.elapsed().as_secs_f64().max(f64::EPSILON);
+        latency_samples.push(elapsed_secs * 1_000.0);
+        throughput_samples.push(output.generated_token_ids.len() as f64 / elapsed_secs);
+        tokens_compared = tokens_compared.saturating_add(item.expected_token_ids.len());
+        if output.generated_token_ids == item.expected_token_ids {
+            exact_matches += 1;
+        } else {
+            mismatches.push(decode_token_mismatch(item, &output.generated_token_ids));
         }
     }
+
     let evidence = GenerateProbeEvidence {
-        label_matches: matches,
+        token_exact_matches: exact_matches,
         items: fixture.items.len(),
+        tokens_compared,
     };
-    let passed = matches >= GENERATE_PROBE_MIN_LABEL_MATCHES;
+    let passed = exact_matches == fixture.items.len();
+    let certification_evidence = json!({
+        "task": "generate",
+        "gate": "token_exact",
+        "blocking_reason": if passed { Value::Null } else { json!("token_mismatch") },
+        "metrics": evidence,
+        "mismatches": mismatches,
+        "fixture": generate_fixture_provenance(fixture),
+    });
+    store_probe_outcome_row(
+        state,
+        &model,
+        if passed {
+            CertificationStatus::Certified
+        } else {
+            CertificationStatus::Uncertified
+        },
+        certification_evidence.clone(),
+    )?;
+
     let performance = if passed {
         let cold_load_ms =
             model_cold_load_ms(&state.runtime, &model.model_id).ok_or_else(|| {
@@ -6297,12 +6423,17 @@ async fn execute_generate_probe_for_model(
                     format!("missing cold-load measurement for '{}'", model.model_id),
                 )
             })?;
-        let perf = measure_generate_perf(&state.runtime, &model, fixture, cold_load_ms).await?;
-        store_probe_cert_row(
-            state,
-            &model,
-            json!({ "task": "generate", "metrics": evidence }),
-        )?;
+        let perf = PerfBenchResult {
+            throughput_tok_s: median_value(&mut throughput_samples),
+            cold_load_ms,
+            single_item_latency_p50_ms: median_value(&mut latency_samples),
+            details: json!({
+                "mode": "single_stream",
+                "statistic": "median_over_fixtures",
+                "fixture_samples": fixture.items.len(),
+                "generated_tokens_per_fixture": fixture.items.first().map(|item| item.expected_token_ids.len()),
+            }),
+        };
         Some(store_probe_perf_row(
             state,
             &model,
@@ -6312,6 +6443,7 @@ async fn execute_generate_probe_for_model(
     } else {
         None
     };
+
     Ok(ProbeModelResult {
         lane_result: json!({
             "model_id": model.model_id,
@@ -6319,10 +6451,97 @@ async fn execute_generate_probe_for_model(
             "fingerprint": model.fingerprint,
             "numeric_profile_id": model.numeric_profile_id,
             "status": if passed { "certified" } else { "uncertified" },
-            "evidence": evidence,
-            "thresholds": { "label_matches": GENERATE_PROBE_MIN_LABEL_MATCHES },
-            "mismatches": examples,
+            "certification_required": true,
+            "blocking_reason": if passed { Value::Null } else { json!("token_mismatch") },
+            "evidence": certification_evidence,
             "performance": performance,
+        }),
+        certified_vectors: None,
+    })
+}
+
+fn microllm_certification_required(model: &EmbeddingModel) -> bool {
+    engine_requires_microllm_certification(&model.engine_identity.engine)
+}
+
+fn engine_requires_microllm_certification(engine: &str) -> bool {
+    engine == "owned-metal"
+}
+
+fn generate_fixture_matches_model(fixture: &GenerateProbeFixture, model: &EmbeddingModel) -> bool {
+    model
+        .engine_identity
+        .build_flags
+        .get("family")
+        .is_some_and(|family| family == &fixture.family)
+        && model
+            .engine_identity
+            .build_flags
+            .get("dtype")
+            .is_some_and(|dtype| dtype == &fixture.dtype)
+}
+
+fn generate_fixture_provenance(fixture: &GenerateProbeFixture) -> Value {
+    json!({
+        "family": fixture.family,
+        "dtype": fixture.dtype,
+        "model": fixture.model,
+        "model_revision": fixture.model_revision,
+        "generation_command": fixture.generation_command,
+        "provenance": fixture.provenance,
+        "items": fixture.items.len(),
+    })
+}
+
+fn decode_token_mismatch(item: &GenerateProbeItem, actual: &[u32]) -> Value {
+    let divergence_index = item
+        .expected_token_ids
+        .iter()
+        .zip(actual)
+        .position(|(expected, actual)| expected != actual)
+        .unwrap_or_else(|| item.expected_token_ids.len().min(actual.len()));
+    json!({
+        "id": item.id,
+        "prompt": item.prompt,
+        "divergence_token_index": divergence_index,
+        "expected_token_id": item.expected_token_ids.get(divergence_index),
+        "actual_token_id": actual.get(divergence_index),
+        "expected_token_ids": item.expected_token_ids,
+        "actual_token_ids": actual,
+    })
+}
+
+fn store_generate_probe_error(
+    state: &ModuleState,
+    model: &EmbeddingModel,
+    fixture: &GenerateProbeFixture,
+    blocking_reason: &str,
+    error: String,
+) -> Result<ProbeModelResult, WireOperationError> {
+    let evidence = json!({
+        "task": "generate",
+        "gate": "token_exact",
+        "blocking_reason": blocking_reason,
+        "error": error,
+        "fixture": generate_fixture_provenance(fixture),
+    });
+    store_probe_outcome_row(
+        state,
+        model,
+        CertificationStatus::Uncertified,
+        evidence.clone(),
+    )?;
+    Ok(ProbeModelResult {
+        lane_result: json!({
+            "model_id": model.model_id,
+            "task": "generate",
+            "fingerprint": model.fingerprint,
+            "numeric_profile_id": model.numeric_profile_id,
+            "status": "uncertified",
+            "certification_required": true,
+            "blocking_reason": blocking_reason,
+            "evidence": evidence,
+            "performance": Value::Null,
         }),
         certified_vectors: None,
     })
@@ -6333,8 +6552,18 @@ fn store_probe_cert_row(
     model: &EmbeddingModel,
     evidence: Value,
 ) -> Result<(), WireOperationError> {
+    store_probe_outcome_row(state, model, CertificationStatus::Certified, evidence)
+}
+
+fn store_probe_outcome_row(
+    state: &ModuleState,
+    model: &EmbeddingModel,
+    status: CertificationStatus,
+    evidence: Value,
+) -> Result<(), WireOperationError> {
     let row = CertificationRow {
         assurance_class: AssuranceClass::Measured,
+        status,
         key: CertificationKey::Measured {
             machine_profile_hash: state.machine_profile_hash.clone(),
         },
@@ -6548,90 +6777,11 @@ async fn measure_rerank_perf(
     })
 }
 
-async fn measure_generate_perf(
-    runtime: &RuntimeState,
-    model: &EmbeddingModel,
-    fixture: &GenerateProbeFixture,
-    cold_load_ms: f64,
-) -> Result<PerfBenchResult, WireOperationError> {
-    let mut requests = Vec::new();
-    for item in &fixture.items {
-        let tokenized = model
-            .tokenizer
-            .tokenize_batch([item.prompt.as_str()])
-            .map_err(|error| {
-                WireOperationError::from_stable(StableError::artifact_invalid(), error.to_string())
-            })?;
-        let prompt = tokenized.batch.items.into_iter().next().unwrap_or_default();
-        let prompt_tokens = prompt.len() as u64;
-        let max_tokens = item.max_tokens.min(64);
-        requests.push((
-            GenerateRequest {
-                prompt,
-                max_tokens,
-                grammar: None,
-            },
-            prompt_tokens.max(1),
-        ));
-    }
-    if requests.is_empty() {
-        return Err(WireOperationError::from_stable(
-            StableError::artifact_invalid(),
-            format!(
-                "probe fixture has no generate items for '{}'",
-                model.model_id
-            ),
-        ));
-    }
-    let mut cursor = 0_usize;
-    let mut total_tokens = 0_u64;
-    let mut batch_samples = 0_usize;
-    let started = std::time::Instant::now();
-    while total_tokens < PROBE_PERF_TARGET_TOTAL_TOKENS
-        || batch_samples < PROBE_PERF_MIN_BATCH_SAMPLES
-    {
-        let mut batch_tokens = 0_usize;
-        while batch_tokens < PROBE_PERF_BATCH_TOKEN_BUDGET || batch_tokens == 0 {
-            let (request, prompt_tokens) = &requests[cursor % requests.len()];
-            let output = execute_generate(runtime, model, request.clone()).await?;
-            let estimated_tokens = prompt_tokens
-                .saturating_add(u64::from(request.max_tokens))
-                .max(1);
-            batch_tokens = batch_tokens.saturating_add(estimated_tokens as usize);
-            total_tokens = total_tokens
-                .saturating_add(prompt_tokens.saturating_add(output.n_gen as u64).max(1));
-            cursor += 1;
-            if batch_tokens >= PROBE_PERF_BATCH_TOKEN_BUDGET {
-                break;
-            }
-        }
-        batch_samples += 1;
-    }
-    let elapsed_secs = started.elapsed().as_secs_f64().max(f64::EPSILON);
-    let throughput_tok_s = total_tokens as f64 / elapsed_secs;
-    let mut latency_samples = Vec::with_capacity(PROBE_PERF_SINGLE_SAMPLES);
-    for sample in 0..PROBE_PERF_SINGLE_SAMPLES {
-        let (request, _) = &requests[sample % requests.len()];
-        let started = std::time::Instant::now();
-        execute_generate(runtime, model, request.clone()).await?;
-        latency_samples.push(started.elapsed().as_secs_f64() * 1_000.0);
-    }
-    let single_item_latency_p50_ms = median_ms(&mut latency_samples);
-    Ok(PerfBenchResult {
-        throughput_tok_s,
-        cold_load_ms,
-        single_item_latency_p50_ms,
-        details: json!({
-            "batch_token_budget": PROBE_PERF_BATCH_TOKEN_BUDGET,
-            "target_total_tokens": PROBE_PERF_TARGET_TOTAL_TOKENS,
-            "throughput_total_tokens": total_tokens,
-            "throughput_samples": batch_samples,
-            "single_samples": PROBE_PERF_SINGLE_SAMPLES,
-        }),
-    })
+fn median_ms(samples: &mut [f64]) -> f64 {
+    median_value(samples)
 }
 
-fn median_ms(samples: &mut [f64]) -> f64 {
+fn median_value(samples: &mut [f64]) -> f64 {
     if samples.is_empty() {
         return 0.0;
     }
@@ -6778,7 +6928,7 @@ fn rerank_probe_fixture() -> Result<RerankProbeFixture, WireOperationError> {
 }
 
 fn generate_probe_fixture() -> Result<GenerateProbeFixture, WireOperationError> {
-    serde_json::from_str(include_str!("fixtures/probe_generate_qwen3_0_6b_v1.json")).map_err(
+    serde_json::from_str(include_str!("fixtures/probe_decode_qwen3_0_6b_f16_v1.json")).map_err(
         |error| {
             WireOperationError::from_stable(
                 StableError::artifact_invalid(),
@@ -6882,14 +7032,6 @@ fn pearson_correlation(left: &[f64], right: &[f64]) -> f64 {
     } else {
         numerator / denominator
     }
-}
-
-fn normalize_probe_label(output: &str) -> String {
-    output
-        .split(|ch: char| ch.is_ascii_punctuation() || ch.is_whitespace())
-        .find(|part| !part.is_empty())
-        .unwrap_or("")
-        .to_ascii_lowercase()
 }
 
 fn cosine(left: &[f32], right: &[f32]) -> f64 {
@@ -7015,6 +7157,16 @@ fn lane_measurement_rows(state: &ModuleState, fingerprint: &Fingerprint) -> Lane
     } else {
         state.store.latest_cert_row(fingerprint).ok().flatten()
     };
+    let current_probe = state
+        .store
+        .get_probe_row(&state.machine_profile_hash, fingerprint)
+        .ok()
+        .flatten();
+    let latest_probe = if current_probe.is_some() {
+        current_probe.clone()
+    } else {
+        state.store.latest_probe_row(fingerprint).ok().flatten()
+    };
     let current_performance = state
         .store
         .get_perf_row(&state.machine_profile_hash, fingerprint)
@@ -7030,6 +7182,8 @@ fn lane_measurement_rows(state: &ModuleState, fingerprint: &Fingerprint) -> Lane
         performance_stale: current_performance.is_none() && latest_performance.is_some(),
         current_certification,
         latest_certification,
+        current_probe,
+        latest_probe,
         current_performance,
         latest_performance,
     }
@@ -7041,13 +7195,31 @@ fn worker_health_from_slot(slot: &ModelSlotSnapshot) -> Option<worker_host::Work
         .and_then(|model| worker_health_for_model(model))
 }
 
+fn lane_requires_certification(slot: &ModelSlotSnapshot) -> bool {
+    slot.spec.task != ModelTask::Generate.as_str() || slot.spec.engine == "owned-metal"
+}
+
 fn lane_blocking_reason(
     slot: &ModelSlotSnapshot,
     measurements: &LaneMeasurementRows,
     worker_quarantined: bool,
 ) -> Option<&'static str> {
-    if measurements.current_certification.is_some() {
+    if !lane_requires_certification(slot) || measurements.current_certification.is_some() {
         return None;
+    }
+    if let Some(reason) = measurements
+        .current_probe
+        .as_ref()
+        .and_then(|row| row.evidence.get("blocking_reason"))
+        .and_then(Value::as_str)
+    {
+        return Some(match reason {
+            "token_mismatch" => "token_mismatch",
+            "fixture_unavailable" => "fixture_unavailable",
+            "tokenization_failed" => "tokenization_failed",
+            "generation_failed" => "generation_failed",
+            _ => "probe_failed",
+        });
     }
     let failed_quarantined = matches!(
         &slot.state,
@@ -7079,6 +7251,7 @@ fn certification_report_row(state: &ModuleState, row: &CertificationRow, stale: 
     };
     json!({
         "assurance_class": row.assurance_class,
+        "status": row.status,
         "machine_profile_hash": machine_profile_hash,
         "remote_profile_hash": remote_profile_hash,
         "identity_revision": identity_revision,
@@ -7151,12 +7324,24 @@ async fn probe_report(state: Arc<ModuleState>) -> HandlerOutcome {
             .as_ref()
             .map(|health| health.quarantined_models > 0)
             .unwrap_or(false);
+        let certification_required = lane_requires_certification(&slot);
         let blocking_reason = lane_blocking_reason(&slot, &measurements, worker_quarantined);
+        let probe_stale =
+            measurements.current_probe.is_none() && measurements.latest_probe.is_some();
         let certification = measurements
-            .current_certification
+            .current_probe
             .as_ref()
+            .or(measurements.latest_probe.as_ref())
+            .or(measurements.current_certification.as_ref())
             .or(measurements.latest_certification.as_ref())
-            .map(|row| certification_report_row(&state, row, measurements.certification_stale));
+            .map(|row| certification_report_row(&state, row, probe_stale));
+        let certification_status = if !certification_required {
+            "not_required"
+        } else if measurements.current_certification.is_some() {
+            "certified"
+        } else {
+            "uncertified"
+        };
         let performance = measurements
             .current_performance
             .as_ref()
@@ -7175,6 +7360,8 @@ async fn probe_report(state: Arc<ModuleState>) -> HandlerOutcome {
             "fingerprint": slot.spec.fingerprint,
             "numeric_profile_id": slot.spec.numeric_profile_id,
             "state": model_runtime_state_name(&slot.state),
+            "certification_required": certification_required,
+            "certification_status": certification_status,
             "certified": measurements.current_certification.is_some(),
             "certification_stale": measurements.certification_stale,
             "performance_stale": measurements.performance_stale,
@@ -7747,6 +7934,45 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_certification_fixture_is_the_pinned_twenty_by_sixty_four_oracle() {
+        let fixture = generate_probe_fixture().expect("shipped decode fixture should parse");
+        assert_eq!(fixture.family, "qwen3");
+        assert_eq!(fixture.dtype, "f16");
+        assert_eq!(fixture.model, "Qwen/Qwen3-0.6B");
+        assert_eq!(fixture.items.len(), 20);
+        assert!(fixture
+            .items
+            .iter()
+            .all(|item| item.max_new_tokens == 64 && item.expected_token_ids.len() == 64));
+        assert_eq!(
+            fixture.provenance["source_tokens_sha256"],
+            "b2d11f2aaf92cdce0fc906dc7ef0468308bce43bf5661b490f336cc1215b1ee9"
+        );
+    }
+
+    #[test]
+    fn corrupted_decode_fixture_records_the_first_diverging_prompt_and_token() {
+        let fixture = generate_probe_fixture().expect("shipped decode fixture should parse");
+        let item = &fixture.items[0];
+        let mut corrupted = item.expected_token_ids.clone();
+        corrupted[7] = corrupted[7].wrapping_add(1);
+
+        let mismatch = decode_token_mismatch(item, &corrupted);
+        assert_eq!(mismatch["id"], item.id);
+        assert_eq!(mismatch["prompt"], item.prompt);
+        assert_eq!(mismatch["divergence_token_index"], 7);
+        assert_eq!(mismatch["expected_token_id"], item.expected_token_ids[7]);
+        assert_eq!(mismatch["actual_token_id"], corrupted[7]);
+    }
+
+    #[test]
+    fn only_owned_microllm_lanes_require_decode_certification() {
+        assert!(engine_requires_microllm_certification("owned-metal"));
+        assert!(!engine_requires_microllm_certification("llama"));
+        assert!(!engine_requires_microllm_certification("mlx"));
+    }
 
     #[test]
     fn engine_load_failures_are_permanent_artifact_errors() {

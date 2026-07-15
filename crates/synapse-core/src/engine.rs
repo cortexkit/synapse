@@ -90,6 +90,8 @@ pub struct GenerateOutput {
     pub finish_reason: String,
     pub n_prompt: usize,
     pub n_gen: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub generated_token_ids: Vec<u32>,
 }
 
 pub trait EmbedEngine {

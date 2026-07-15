@@ -1,0 +1,53 @@
+{
+  "generation_command": "cargo test -p synapse-worker-llama worker_generates_qwen3_when_cached -- --nocapture",
+  "items": [
+    {
+      "id": "label-yes-1",
+      "prompt": "Answer with exactly one lowercase word, yes or no. Is fire hot?\nAnswer:",
+      "expected_label": "yes",
+      "max_tokens": 4
+    },
+    {
+      "id": "label-yes-2",
+      "prompt": "Answer with exactly one lowercase word, yes or no. Is water wet?\nAnswer:",
+      "expected_label": "yes",
+      "max_tokens": 4
+    },
+    {
+      "id": "label-yes-3",
+      "prompt": "Answer with exactly one lowercase word, yes or no. Is two plus two equal to four?\nAnswer:",
+      "expected_label": "yes",
+      "max_tokens": 4
+    },
+    {
+      "id": "label-yes-4",
+      "prompt": "Answer with exactly one lowercase word, yes or no. Can humans breathe air?\nAnswer:",
+      "expected_label": "yes",
+      "max_tokens": 4
+    },
+    {
+      "id": "label-yes-5",
+      "prompt": "Answer with exactly one lowercase word, yes or no. Is snow cold?\nAnswer:",
+      "expected_label": "yes",
+      "max_tokens": 4
+    },
+    {
+      "id": "label-yes-6",
+      "prompt": "Answer with exactly one lowercase word, yes or no. Do fish swim in water?\nAnswer:",
+      "expected_label": "yes",
+      "max_tokens": 4
+    },
+    {
+      "id": "label-yes-7",
+      "prompt": "Answer with exactly one lowercase word, yes or no. Is the sky often blue during a clear day?\nAnswer:",
+      "expected_label": "yes",
+      "max_tokens": 4
+    },
+    {
+      "id": "label-yes-8",
+      "prompt": "Answer with exactly one lowercase word, yes or no. Do books contain pages?\nAnswer:",
+      "expected_label": "yes",
+      "max_tokens": 4
+    }
+  ]
+}

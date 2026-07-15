@@ -726,6 +726,7 @@ fn handle_generate(
         n_prompt,
         n_gen: generated.len(),
         finish_reason: finish_reason.to_string(),
+        generated_token_ids: generated.into_iter().map(|token| token.0 as u32).collect(),
     })
 }
 

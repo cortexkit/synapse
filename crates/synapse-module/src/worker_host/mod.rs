@@ -340,6 +340,7 @@ impl WorkerHost {
                     n_prompt,
                     n_gen,
                     finish_reason,
+                    generated_token_ids,
                 },
                 _,
             )) => {
@@ -349,6 +350,7 @@ impl WorkerHost {
                     finish_reason,
                     n_prompt,
                     n_gen,
+                    generated_token_ids,
                 })
             }
             Ok((WorkerResponse::Err { code, msg, .. }, _)) => {
