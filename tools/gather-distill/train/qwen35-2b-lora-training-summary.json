@@ -1,0 +1,79 @@
+{
+  "configured_epochs": 3,
+  "reported_final_epoch": 2.986666666666667,
+  "steps": 336,
+  "trainable_parameters": 21823488,
+  "total_parameters": 1903648576,
+  "loss_first": 0.8572771549224854,
+  "loss_last": 0.5812965035438538,
+  "loss_first_10_mean": 0.8222097635269165,
+  "loss_last_10_mean": 0.6038614511489868,
+  "loss_min": 0.5302555561065674,
+  "loss_max": 1.2994670867919922,
+  "per_epoch": [
+    {
+      "epoch": 1,
+      "steps": 112,
+      "loss_mean": 0.6807724264051233,
+      "loss_first": 0.8572771549224854,
+      "loss_last": 0.6321470141410828
+    },
+    {
+      "epoch": 2,
+      "steps": 112,
+      "loss_mean": 0.619587422481605,
+      "loss_first": 1.2994670867919922,
+      "loss_last": 0.6059366464614868
+    },
+    {
+      "epoch": 3,
+      "steps": 112,
+      "loss_mean": 0.5978236262287412,
+      "loss_first": 0.6703469753265381,
+      "loss_last": 0.5812965035438538
+    }
+  ],
+  "evaluation": [
+    {
+      "eval_loss": 0.8464179039001465,
+      "eval_ppl": 2.33128,
+      "epoch": 0,
+      "step": 0
+    },
+    {
+      "eval_loss": 0.6149290204048157,
+      "eval_ppl": 1.84953,
+      "epoch": 0.9955555555555555,
+      "step": 112
+    },
+    {
+      "eval_loss": 0.5979298949241638,
+      "eval_ppl": 1.81835,
+      "epoch": 1.9955555555555555,
+      "step": 224
+    },
+    {
+      "eval_loss": 0.5953880548477173,
+      "eval_ppl": 1.81373,
+      "epoch": 2.986666666666667,
+      "step": 336
+    }
+  ],
+  "trainer_runtime_seconds": 4071.0,
+  "input_tokens": 88014848,
+  "supervised_tokens": 8821337,
+  "aggregate_input_tokens_per_second": 21619.95774993859,
+  "aggregate_supervised_tokens_per_second": 2166.8722672562026,
+  "pytorch_peak_allocated_gib": 37.47,
+  "retained_checkpoints": [
+    "checkpoint-330",
+    "checkpoint-336"
+  ],
+  "nan_or_inf": false,
+  "adapter_bytes": 87319256,
+  "adapter_sha256": "0daac44d913b1c829176b76d62d8067a86b0c51f0d817028362aa19c06760be6",
+  "merged_model_bytes": 3763692048,
+  "merged_model_sha256": "4e3b6aed6d48bbb29849f9afe0cd14c63a4316e2de4a507180c4fca46828aef3",
+  "gguf_q8_0_bytes": 2012011968,
+  "gguf_q8_0_sha256": "bab75e9826fafea79961b6d6901af5d0c893f2f3a93122f7edcc23db9f12ce85"
+}

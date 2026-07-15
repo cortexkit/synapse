@@ -25,8 +25,10 @@ REVISION = "15852e8c16360a2fea060d615a32b45270f8a8fc"
 SAMPLE_INDICES = [155, 340, 677]
 
 
-def load_samples(dataset: Path) -> dict[int, dict[str, Any]]:
-    wanted = set(SAMPLE_INDICES)
+def load_samples(
+    dataset: Path, sample_indices: list[int]
+) -> dict[int, dict[str, Any]]:
+    wanted = set(sample_indices)
     samples: dict[int, dict[str, Any]] = {}
     with dataset.open() as handle:
         for index, line in enumerate(handle):
@@ -50,7 +52,16 @@ def main() -> None:
     parser.add_argument(
         "--output", type=Path, default=TRAIN_DIR / "qwen35-2b-loss-mask-verification.json"
     )
+    parser.add_argument(
+        "--sample-indices",
+        type=int,
+        nargs="+",
+        default=SAMPLE_INDICES,
+        help="Zero-based dataset rows to verify",
+    )
     args = parser.parse_args()
+    if len(args.sample_indices) != len(set(args.sample_indices)):
+        raise ValueError("sample indices must be unique")
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL, revision=REVISION)
     chat_template = (
@@ -74,10 +85,10 @@ def main() -> None:
         roles_to_train=["assistant"],
         train_on_eos="turn",
     )
-    samples = load_samples(args.dataset)
+    samples = load_samples(args.dataset, args.sample_indices)
     results = [
         verify_example(strategy, tokenizer, chat_template, samples[index], index)
-        for index in SAMPLE_INDICES
+        for index in args.sample_indices
     ]
     template_label = (
         str(args.template.resolve().relative_to(TRAIN_DIR.parent))
