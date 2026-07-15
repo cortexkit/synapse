@@ -218,14 +218,11 @@ impl ModernBertModel {
             });
         }
 
-        let has_classifier = tensors
-            .keys()
-            .any(|name| name == "classifier.weight" || name.ends_with(".classifier.weight"));
-        let classification_head = if let Some(pooling) = config
-            .classifier_pooling
-            .as_ref()
-            .filter(|_| has_classifier)
-        {
+        let classification_head = if has_classification_head_tensors(&tensors) {
+            let pooling = config
+                .classifier_pooling
+                .as_deref()
+                .context("ModernBERT classifier tensors require classifier_pooling")?;
             ensure!(
                 pooling == "mean",
                 "unsupported ModernBERT classifier pooling {pooling}; rerank reference requires mean"
@@ -786,6 +783,28 @@ fn add_in_place(destination: &mut [f32], source: &[f32]) {
     for (destination, source) in destination.iter_mut().zip(source) {
         *destination += *source;
     }
+}
+
+fn has_classification_head_tensors(tensors: &HashMap<String, Tensor>) -> bool {
+    [
+        "head.dense.weight",
+        "head.norm.weight",
+        "classifier.weight",
+        "classifier.bias",
+    ]
+    .iter()
+    .any(|name| has_tensor(tensors, name))
+}
+
+fn has_tensor(tensors: &HashMap<String, Tensor>, base_name: &str) -> bool {
+    [
+        base_name.to_string(),
+        format!("bert.{base_name}"),
+        format!("model.{base_name}"),
+        format!("model.bert.{base_name}"),
+    ]
+    .iter()
+    .any(|candidate| tensors.contains_key(candidate))
 }
 
 fn vector(tensors: &HashMap<String, Tensor>, name: &str, expected: usize) -> Result<Vec<f32>> {
