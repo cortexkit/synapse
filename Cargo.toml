@@ -15,6 +15,7 @@ members = [
     "crates/synapse-engine-ort",
     "crates/synapse-engine-owned",
     "crates/synapse-module",
+    "crates/synapse-opctl",
     "crates/synapse-worker-llama",
     "crates/synapse-worker-mlx",
     "crates/synapse-worker-ane",

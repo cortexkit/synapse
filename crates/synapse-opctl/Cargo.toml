@@ -1,0 +1,22 @@
+[package]
+name = "synapse-opctl"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Operator CLI for the Synapse management surface."
+publish = false
+
+[[bin]]
+name = "ck-synapse-opctl"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+hex = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+subc-client-rs = { workspace = true }
+subc-protocol = { workspace = true }
+tokio = { workspace = true }
