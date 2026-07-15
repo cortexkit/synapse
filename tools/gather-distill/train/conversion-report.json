@@ -1,0 +1,608 @@
+{
+  "generated_at": "2026-07-15T08:11:01.463Z",
+  "input": "data/dataset-v1.jsonl",
+  "output": "train/sft-dataset.jsonl",
+  "input_sha256": "d5b49e2c2effa5c171c2040793a35ff8a4ac3ebb5456ce0b52107650bbe6370b",
+  "output_sha256": "4a5a7d14c9137f21e2f2714e14f10921668bc1aa3e5ca1b9adb5f49c334e5e1d",
+  "rows_in": 1884,
+  "rows_out": 1884,
+  "rows_dropped": 0,
+  "drop_rate": 0,
+  "drop_reasons": [],
+  "dropped_rows": [],
+  "tools": {
+    "count": 9,
+    "names": [
+      "search",
+      "outline",
+      "zoom",
+      "callgraph",
+      "read",
+      "grep",
+      "glob",
+      "inspect",
+      "conflicts"
+    ],
+    "schema_sha256": "c878b0d1f7b717fb5498d33d01b6b61f569fa95d3733dbe1c11c739205b0844c"
+  },
+  "random_verification": {
+    "method": "five smallest SHA-256 ranks of 8918:zero-based-row-index",
+    "samples": [
+      {
+        "row_index": 1432,
+        "repo_full": "rust-lang/rust",
+        "request": "In library/std/src/sync, how is `Mutex` poisoning implemented, and which method must callers use to recover a `MutexGuard` after a panic occurred while the lock was held?",
+        "messages": 18,
+        "toolCalls": 10,
+        "toolResults": 10,
+        "assistantMessages": 6,
+        "assistantContentCharacters": 2668,
+        "final_text_sha256": "f9196591f576cb99d7ef63942e5a5d664e2bed0f63aaa12d17af9184df8f98d5",
+        "passed": true
+      },
+      {
+        "row_index": 155,
+        "repo_full": "topjohnwu/Magisk",
+        "request": "What public API or interface does the Magisk app expose for third-party modules to query root/Magisk status at runtime, and which class implements the corresponding IPC or content provider?",
+        "messages": 35,
+        "toolCalls": 22,
+        "toolResults": 22,
+        "assistantMessages": 10,
+        "assistantContentCharacters": 6507,
+        "final_text_sha256": "96ceee633e4916819b373d50d4cff8b6f33215f14b519588345603e1848397f1",
+        "passed": true
+      },
+      {
+        "row_index": 1204,
+        "repo_full": "electron/electron",
+        "request": "In shell/browser/api/electron_api_web_request.cc, what happens when a JS webRequest listener (e.g., onBeforeRequest) throws an exception or returns a malformed response object — is the underlying network request aborted, allowed to proceed, or does it hang, and where in the code is that decision made?",
+        "messages": 25,
+        "toolCalls": 13,
+        "toolResults": 13,
+        "assistantMessages": 10,
+        "assistantContentCharacters": 6653,
+        "final_text_sha256": "46295b0eb7101e77838a1a39c2ee0af4aa7611a3a49b588135b3a5d7e2512fd3",
+        "passed": true
+      },
+      {
+        "row_index": 340,
+        "repo_full": "swiftlang/swift",
+        "request": "If a linker error reports missing concurrency runtime symbols when building with the singlethreaded backend, which CMakeLists.txt file selects that backend and what source files does it add to the build?",
+        "messages": 10,
+        "toolCalls": 4,
+        "toolResults": 4,
+        "assistantMessages": 4,
+        "assistantContentCharacters": 1889,
+        "final_text_sha256": "c030eee20011f7f0ad2ccadd90d7ae069c240258ea2bdca288033ddb358ba12d",
+        "passed": true
+      },
+      {
+        "row_index": 677,
+        "repo_full": "ventoy/Ventoy",
+        "request": "What input fields does .github/ISSUE_TEMPLATE/issue_template.yml require versus success_image_report.yml, and how do their YAML schemas differ (validations, dropdowns, required flags)?",
+        "messages": 6,
+        "toolCalls": 2,
+        "toolResults": 2,
+        "assistantMessages": 2,
+        "assistantContentCharacters": 2516,
+        "final_text_sha256": "5d94eb344b5bfdf942a7db9eaef2f3804b3948abcfa355a3976e5716427f6189",
+        "passed": true
+      }
+    ]
+  },
+  "side_by_side": {
+    "row_index": 677,
+    "note": "The original trajectory and complete converted training example below are intentionally unabridged.",
+    "anthropic_original": [
+      {
+        "role": "user",
+        "content": "Request:\nWhat input fields does .github/ISSUE_TEMPLATE/issue_template.yml require versus success_image_report.yml, and how do their YAML schemas differ (validations, dropdowns, required flags)?\n\nScope:\n(caller did not restrict scope)\n\nRepository git HEAD: a3995a0267ef95e8c0032bf2a7b820c381e8f64e\n\nBudgets:\n- maxSteps: 40\n- maxPackageTokens: 40000\n\nExplore with the attached read tools, then finish with the single JSON object described in the system instructions. Snippets should be path and line pointers only; the harness reads the bytes from disk."
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "I'll examine both YAML issue template files."
+          },
+          {
+            "type": "tool_use",
+            "id": "toolu_01MuFf2sAymPcLfYFDWg3r9m",
+            "name": "read",
+            "input": {
+              "filePath": ".github/ISSUE_TEMPLATE/issue_template.yml"
+            },
+            "caller": {
+              "type": "direct"
+            }
+          },
+          {
+            "type": "tool_use",
+            "id": "toolu_0182AkS5jVtuiamykZ4imk98",
+            "name": "read",
+            "input": {
+              "filePath": ".github/ISSUE_TEMPLATE/success_image_report.yml"
+            },
+            "caller": {
+              "type": "direct"
+            }
+          }
+        ]
+      },
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "tool_result",
+            "tool_use_id": "toolu_01MuFf2sAymPcLfYFDWg3r9m",
+            "content": "  1: name: Issue Report\n  2: description: File an issue report\n  3: title: \"[issue]: \"\n  4: assignees:\n  5:   - octocat\n  6: body:\n  7:   - type: markdown\n  8:     attributes:\n  9:       value: |\n 10:         Thanks for taking the time to fill out this issue report!\n 11:   - type: checkboxes\n 12:     id: faq\n 13:     attributes:\n 14:       label: Official FAQ\n 15:       description: Have you checked the official FAQ at [https://www.ventoy.net/en/faq.html](https://www.ventoy.net/en/faq.html) ?\n 16:       options:\n 17:         - label: I have checked the official FAQ. \n 18:           required: true\n 19:   - type: input\n 20:     id: version\n 21:     attributes:\n 22:       label: Ventoy Version\n 23:       description: What version of ventoy are you running?\n 24:       placeholder: 1.0.96\n 25:     validations:\n 26:       required: true\n 27:   - type: dropdown\n 28:     id: latestrelease\n 29:     attributes:\n 30:       label: What about latest release\n 31:       description: Have you tried with the latest release of Ventoy?\n 32:       options:\n 33:         - Yes. I have tried the latest release, but the bug still exist.\n 34:         - No. I didn't try the latest release.\n 35:     validations:\n 36:       required: true\n 37:   - type: dropdown\n 38:     id: alternativemode\n 39:     attributes:\n 40:       label: Try alternative boot mode\n 41:       description: Have you tried alternative boot mode? (wimboot mode for Windows/WinPE, grub2 mode for linux)\n 42:       options:\n 43:         - Yes. I have tried them, but the bug still exist.\n 44:         - No. I didn't try these alternative boot modes.\n 45:     validations:\n 46:       required: true\n 47:   - type: dropdown\n 48:     id: bios\n 49:     attributes:\n 50:       label: BIOS Mode\n 51:       description: In which BIOS mode did you find the bug?\n 52:       options:\n 53:         - Legacy BIOS Mode\n 54:         - UEFI Mode\n 55:         - Both\n 56:     validations:\n 57:       required: true\n 58:   - type: dropdown\n 59:     id: partstyle\n 60:     attributes:\n 61:       label: Partition Style\n 62:       description: Which partition style did you select when you install Ventoy?\n 63:       options:\n 64:         - MBR\n 65:         - GPT\n 66:     validations:\n 67:       required: true\n 68:   - type: input\n 69:     id: capacity\n 70:     attributes:\n 71:       label: Disk Capacity\n 72:       description: What is the capacity of the disk installed with Ventoy?\n 73:       placeholder: 32GB\n 74:     validations:\n 75:       required: true\n 76:   - type: input\n 77:     id: vendor\n 78:     attributes:\n 79:       label: Disk Manufacturer\n 80:       description: What is the manufacturer of the disk installed with Ventoy? (e.g. SanDisk/Kingston...)      \n 81:     validations:\n 82:       required: false\n 83:   - type: dropdown\n 84:     id: checksum\n 85:     attributes:\n 86:       label: Image file checksum (if applicable)\n 87:       description: Have you checked the image file in Ventoy's menu as [https://www.ventoy.net/en/faq.html#faq_boot_checksum](https://www.ventoy.net/en/faq.html#faq_boot_checksum) ?\n 88:       options:\n 89:         - Yes.\n 90:         - No.        \n 91:     validations:\n 92:       required: false\n 93:   - type: input\n 94:     id: link\n 95:     attributes:\n 96:       label: Image file download link (if applicable)\n 97:       description: What is the image file download link?\n 98:       placeholder: https://xxx\n 99:     validations:\n100:       required: false\n101:   - type: textarea\n102:     id: what-happened\n103:     attributes:\n104:       label: What happened?\n105:       description: Tell me what happened. It's highly recommended to include some photo or video about the bug.\n106:       placeholder: Tell us what you see!\n107:       value: \"A bug happened!\"\n108:     validations:\n109:       required: true\n110: \n",
+            "is_error": false
+          },
+          {
+            "type": "tool_result",
+            "tool_use_id": "toolu_0182AkS5jVtuiamykZ4imk98",
+            "content": "  1: name: Success Image Report\n  2: description: To report an image file that boot successfully in Ventoy and is not yet listed in https://www.ventoy.net/en/isolist.html\n  3: title: \"[Success Image Report]: \"\n  4: assignees:\n  5:   - octocat\n  6: body:\n  7:   - type: markdown\n  8:     attributes:\n  9:       value: |\n 10:         I list all the successfully tested image files in the official website: https://www.ventoy.net/en/isolist.html   \n 11:         If you successfully test an image file which is not listed in the above page, you can tell me and I will be very glad to add it to the tested list.\n 12:   - type: checkboxes\n 13:     id: faq\n 14:     attributes:\n 15:       label: Official Website List\n 16:       description: Have you checked the list at [https://www.ventoy.net/en/isolist.html](https://www.ventoy.net/en/isolist.html) and the image file is not listed?\n 17:       options:\n 18:         - label: I have checked the list in official website and the image file is not listed there. \n 19:           required: true\n 20:   - type: input\n 21:     id: version\n 22:     attributes:\n 23:       label: Ventoy Version\n 24:       description: What version of ventoy did you test with the image file.\n 25:       placeholder: 1.0.57\n 26:     validations:\n 27:       required: true\n 28:   - type: dropdown\n 29:     id: bios\n 30:     attributes:\n 31:       label: BIOS Mode\n 32:       description: In which BIOS mode did you successfully test the image file? (It's recommended to test in both mode)\n 33:       options:\n 34:         - Legacy BIOS Mode\n 35:         - UEFI Mode\n 36:         - Both\n 37:     validations:\n 38:       required: true\n 39:   - type: dropdown\n 40:     id: partstyle\n 41:     attributes:\n 42:       label: Partition Style\n 43:       description: Which partition style did you use with Ventoy?\n 44:       options:\n 45:         - MBR\n 46:         - GPT\n 47:     validations:\n 48:       required: true\n 49:   - type: input\n 50:     id: filename\n 51:     attributes:\n 52:       label: Image file name\n 53:       description: The successfully tested image file name.\n 54:       placeholder: xxxx.iso\n 55:     validations:\n 56:       required: true\n 57:   - type: dropdown\n 58:     id: checksum\n 59:     attributes:\n 60:       label: Image file checksum type\n 61:       description: \n 62:       options:\n 63:         - MD5\n 64:         - SHA1        \n 65:         - SHA256        \n 66:         - SHA512        \n 67:     validations:\n 68:       required: true\n 69:   - type: input\n 70:     id: checkvalue\n 71:     attributes:\n 72:       label: Image file checksum value\n 73:       description: What is the image file checksum value corresponding to the above checksum type?\n 74:       placeholder: xxxx\n 75:     validations:\n 76:       required: true\n 77:   - type: input\n 78:     id: link\n 79:     attributes:\n 80:       label: Image file download link (if applicable)\n 81:       description: What is the image file download link?\n 82:       placeholder: https://xxx\n 83:     validations:\n 84:       required: false\n 85:   - type: input\n 86:     id: testenv\n 87:     attributes:\n 88:       label: Test environment\n 89:       description: The manufacturer/model and other details about your computer (or VM).\n 90:       placeholder: Lenovo Thinkpad T420 laptop\n 91:     validations:\n 92:       required: true\n 93:   - type: textarea\n 94:     id: details\n 95:     attributes:\n 96:       label: More Details?\n 97:       description: You can give more details here.\n 98:       value: \"This image file booted successfully in Ventoy.\"\n 99:     validations:\n100:       required: false\n101: \n",
+            "is_error": false
+          }
+        ]
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "Both files are fully read. I have everything needed.\n\n```json\n{\n  \"interpretation\": \"Compared required input fields and YAML schema differences (validations, dropdowns, required flags) between issue_template.yml and success_image_report.yml\",\n  \"scope\": [\".github/ISSUE_TEMPLATE/issue_template.yml\", \".github/ISSUE_TEMPLATE/success_image_report.yml\"],\n  \"snippets\": [\n    { \"path\": \".github/ISSUE_TEMPLATE/issue_template.yml\", \"startLine\": 1, \"endLine\": 6, \"why\": \"issue_template top-level metadata: name/description/title '[issue]:'/assignees\" },\n    { \"path\": \".github/ISSUE_TEMPLATE/issue_template.yml\", \"startLine\": 11, \"endLine\": 18, \"why\": \"faq checkboxes with required:true label (checked FAQ page)\" },\n    { \"path\": \".github/ISSUE_TEMPLATE/issue_template.yml\", \"startLine\": 19, \"endLine\": 46, \"why\": \"version input (required), latestrelease & alternativemode dropdowns (required) — unique to issue template\" },\n    { \"path\": \".github/ISSUE_TEMPLATE/issue_template.yml\", \"startLine\": 47, \"endLine\": 67, \"why\": \"bios & partstyle dropdowns (required) — shared shape with success report\" },\n    { \"path\": \".github/ISSUE_TEMPLATE/issue_template.yml\", \"startLine\": 68, \"endLine\": 100, \"why\": \"capacity(required), vendor(optional), checksum dropdown Yes/No(optional), link(optional) — issue-specific fields\" },\n    { \"path\": \".github/ISSUE_TEMPLATE/issue_template.yml\", \"startLine\": 101, \"endLine\": 109, \"why\": \"what-happened textarea, required:true, with default value\" },\n    { \"path\": \".github/ISSUE_TEMPLATE/success_image_report.yml\", \"startLine\": 1, \"endLine\": 6, \"why\": \"success report metadata: title '[Success Image Report]:' and different description\" },\n    { \"path\": \".github/ISSUE_TEMPLATE/success_image_report.yml\", \"startLine\": 12, \"endLine\": 27, \"why\": \"faq checkboxes (isolist page, required:true) and version input (required)\" },\n    { \"path\": \".github/ISSUE_TEMPLATE/success_image_report.yml\", \"startLine\": 28, \"endLine\": 56, \"why\": \"bios & partstyle dropdowns (required), filename input (required) — filename unique here\" },\n    { \"path\": \".github/ISSUE_TEMPLATE/success_image_report.yml\", \"startLine\": 57, \"endLine\": 92, \"why\": \"checksum dropdown MD5/SHA1/SHA256/SHA512 (required), checkvalue(required), link(optional), testenv(required) — success-specific\" },\n    { \"path\": \".github/ISSUE_TEMPLATE/success_image_report.yml\", \"startLine\": 93, \"endLine\": 100, \"why\": \"details textarea, required:false, with default value\" }\n  ],\n  \"omissions\": []\n}\n```"
+          }
+        ]
+      }
+    ],
+    "openai_converted": {
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a sidekick to a powerful coding agent. The agent is busy reasoning about a hard problem and sent you ahead into this repository to find the code it will need, so it does not burn its own turns searching.\n\nExplore the repository with the read tools until you know where the relevant code lives. You do not need to record anything while exploring — just look.\n\nHow to pick the right tool (in order):\n- Start with search — it understands concepts (\"how are peer messages delivered\"), identifiers, and regex alike, and returns ranked hits. Prefer it over grep.\n- outline a file or directory to see its structure (symbols, line ranges) before reading anything whole.\n- zoom on a named symbol to read exactly its source. read with startLine/endLine for a specific range. Never read a whole large file when a symbol or range answers the question.\n- callgraph when the question is about relationships: who calls X, what X calls, how a value flows.\n- grep only for exact literal strings (error messages, config keys). glob only to find files by name.\n\nWhen you are done exploring, reply with one json code block and nothing else:\n\n```json\n{\n  \"interpretation\": \"one sentence: what you looked for\",\n  \"scope\": [\"dirs or files you covered\"],\n  \"snippets\": [\n    { \"path\": \"src/file.rs\", \"startLine\": 10, \"endLine\": 42, \"why\": \"one short line: how this bears on the request\" }\n  ],\n  \"omissions\": [\n    { \"what\": \"a relevant lead you did not chase\", \"why\": \"budget\", \"detail\": \"one sentence\" }\n  ]\n}\n```\n\nRules:\n- Snippets point at code; the system reads the exact lines from disk itself. Never paste code into the JSON.\n- Include every location that bears on the request — the agent easily discards extras but cannot see what you skipped.\n- If the repository contains nothing on the topic, say so honestly: empty snippets plus one omission with why \"empty_result\". Never pad with unrelated code.\n- omission.why is exactly one of: budget | empty_result | skipped_candidate | depth_limit.\n"
+        },
+        {
+          "role": "user",
+          "content": "Request:\nWhat input fields does .github/ISSUE_TEMPLATE/issue_template.yml require versus success_image_report.yml, and how do their YAML schemas differ (validations, dropdowns, required flags)?\n\nScope:\n(caller did not restrict scope)\n\nRepository git HEAD: a3995a0267ef95e8c0032bf2a7b820c381e8f64e\n\nBudgets:\n- maxSteps: 40\n- maxPackageTokens: 40000\n\nExplore with the attached read tools, then finish with the single JSON object described in the system instructions. Snippets should be path and line pointers only; the harness reads the bytes from disk."
+        },
+        {
+          "role": "assistant",
+          "content": "I'll examine both YAML issue template files.",
+          "tool_calls": [
+            {
+              "id": "toolu_01MuFf2sAymPcLfYFDWg3r9m",
+              "type": "function",
+              "function": {
+                "name": "read",
+                "arguments": "{\"filePath\":\".github/ISSUE_TEMPLATE/issue_template.yml\"}"
+              }
+            },
+            {
+              "id": "toolu_0182AkS5jVtuiamykZ4imk98",
+              "type": "function",
+              "function": {
+                "name": "read",
+                "arguments": "{\"filePath\":\".github/ISSUE_TEMPLATE/success_image_report.yml\"}"
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "content": "  1: name: Issue Report\n  2: description: File an issue report\n  3: title: \"[issue]: \"\n  4: assignees:\n  5:   - octocat\n  6: body:\n  7:   - type: markdown\n  8:     attributes:\n  9:       value: |\n 10:         Thanks for taking the time to fill out this issue report!\n 11:   - type: checkboxes\n 12:     id: faq\n 13:     attributes:\n 14:       label: Official FAQ\n 15:       description: Have you checked the official FAQ at [https://www.ventoy.net/en/faq.html](https://www.ventoy.net/en/faq.html) ?\n 16:       options:\n 17:         - label: I have checked the official FAQ. \n 18:           required: true\n 19:   - type: input\n 20:     id: version\n 21:     attributes:\n 22:       label: Ventoy Version\n 23:       description: What version of ventoy are you running?\n 24:       placeholder: 1.0.96\n 25:     validations:\n 26:       required: true\n 27:   - type: dropdown\n 28:     id: latestrelease\n 29:     attributes:\n 30:       label: What about latest release\n 31:       description: Have you tried with the latest release of Ventoy?\n 32:       options:\n 33:         - Yes. I have tried the latest release, but the bug still exist.\n 34:         - No. I didn't try the latest release.\n 35:     validations:\n 36:       required: true\n 37:   - type: dropdown\n 38:     id: alternativemode\n 39:     attributes:\n 40:       label: Try alternative boot mode\n 41:       description: Have you tried alternative boot mode? (wimboot mode for Windows/WinPE, grub2 mode for linux)\n 42:       options:\n 43:         - Yes. I have tried them, but the bug still exist.\n 44:         - No. I didn't try these alternative boot modes.\n 45:     validations:\n 46:       required: true\n 47:   - type: dropdown\n 48:     id: bios\n 49:     attributes:\n 50:       label: BIOS Mode\n 51:       description: In which BIOS mode did you find the bug?\n 52:       options:\n 53:         - Legacy BIOS Mode\n 54:         - UEFI Mode\n 55:         - Both\n 56:     validations:\n 57:       required: true\n 58:   - type: dropdown\n 59:     id: partstyle\n 60:     attributes:\n 61:       label: Partition Style\n 62:       description: Which partition style did you select when you install Ventoy?\n 63:       options:\n 64:         - MBR\n 65:         - GPT\n 66:     validations:\n 67:       required: true\n 68:   - type: input\n 69:     id: capacity\n 70:     attributes:\n 71:       label: Disk Capacity\n 72:       description: What is the capacity of the disk installed with Ventoy?\n 73:       placeholder: 32GB\n 74:     validations:\n 75:       required: true\n 76:   - type: input\n 77:     id: vendor\n 78:     attributes:\n 79:       label: Disk Manufacturer\n 80:       description: What is the manufacturer of the disk installed with Ventoy? (e.g. SanDisk/Kingston...)      \n 81:     validations:\n 82:       required: false\n 83:   - type: dropdown\n 84:     id: checksum\n 85:     attributes:\n 86:       label: Image file checksum (if applicable)\n 87:       description: Have you checked the image file in Ventoy's menu as [https://www.ventoy.net/en/faq.html#faq_boot_checksum](https://www.ventoy.net/en/faq.html#faq_boot_checksum) ?\n 88:       options:\n 89:         - Yes.\n 90:         - No.        \n 91:     validations:\n 92:       required: false\n 93:   - type: input\n 94:     id: link\n 95:     attributes:\n 96:       label: Image file download link (if applicable)\n 97:       description: What is the image file download link?\n 98:       placeholder: https://xxx\n 99:     validations:\n100:       required: false\n101:   - type: textarea\n102:     id: what-happened\n103:     attributes:\n104:       label: What happened?\n105:       description: Tell me what happened. It's highly recommended to include some photo or video about the bug.\n106:       placeholder: Tell us what you see!\n107:       value: \"A bug happened!\"\n108:     validations:\n109:       required: true\n110: \n",
+          "tool_call_id": "toolu_01MuFf2sAymPcLfYFDWg3r9m"
+        },
+        {
+          "role": "tool",
+          "content": "  1: name: Success Image Report\n  2: description: To report an image file that boot successfully in Ventoy and is not yet listed in https://www.ventoy.net/en/isolist.html\n  3: title: \"[Success Image Report]: \"\n  4: assignees:\n  5:   - octocat\n  6: body:\n  7:   - type: markdown\n  8:     attributes:\n  9:       value: |\n 10:         I list all the successfully tested image files in the official website: https://www.ventoy.net/en/isolist.html   \n 11:         If you successfully test an image file which is not listed in the above page, you can tell me and I will be very glad to add it to the tested list.\n 12:   - type: checkboxes\n 13:     id: faq\n 14:     attributes:\n 15:       label: Official Website List\n 16:       description: Have you checked the list at [https://www.ventoy.net/en/isolist.html](https://www.ventoy.net/en/isolist.html) and the image file is not listed?\n 17:       options:\n 18:         - label: I have checked the list in official website and the image file is not listed there. \n 19:           required: true\n 20:   - type: input\n 21:     id: version\n 22:     attributes:\n 23:       label: Ventoy Version\n 24:       description: What version of ventoy did you test with the image file.\n 25:       placeholder: 1.0.57\n 26:     validations:\n 27:       required: true\n 28:   - type: dropdown\n 29:     id: bios\n 30:     attributes:\n 31:       label: BIOS Mode\n 32:       description: In which BIOS mode did you successfully test the image file? (It's recommended to test in both mode)\n 33:       options:\n 34:         - Legacy BIOS Mode\n 35:         - UEFI Mode\n 36:         - Both\n 37:     validations:\n 38:       required: true\n 39:   - type: dropdown\n 40:     id: partstyle\n 41:     attributes:\n 42:       label: Partition Style\n 43:       description: Which partition style did you use with Ventoy?\n 44:       options:\n 45:         - MBR\n 46:         - GPT\n 47:     validations:\n 48:       required: true\n 49:   - type: input\n 50:     id: filename\n 51:     attributes:\n 52:       label: Image file name\n 53:       description: The successfully tested image file name.\n 54:       placeholder: xxxx.iso\n 55:     validations:\n 56:       required: true\n 57:   - type: dropdown\n 58:     id: checksum\n 59:     attributes:\n 60:       label: Image file checksum type\n 61:       description: \n 62:       options:\n 63:         - MD5\n 64:         - SHA1        \n 65:         - SHA256        \n 66:         - SHA512        \n 67:     validations:\n 68:       required: true\n 69:   - type: input\n 70:     id: checkvalue\n 71:     attributes:\n 72:       label: Image file checksum value\n 73:       description: What is the image file checksum value corresponding to the above checksum type?\n 74:       placeholder: xxxx\n 75:     validations:\n 76:       required: true\n 77:   - type: input\n 78:     id: link\n 79:     attributes:\n 80:       label: Image file download link (if applicable)\n 81:       description: What is the image file download link?\n 82:       placeholder: https://xxx\n 83:     validations:\n 84:       required: false\n 85:   - type: input\n 86:     id: testenv\n 87:     attributes:\n 88:       label: Test environment\n 89:       description: The manufacturer/model and other details about your computer (or VM).\n 90:       placeholder: Lenovo Thinkpad T420 laptop\n 91:     validations:\n 92:       required: true\n 93:   - type: textarea\n 94:     id: details\n 95:     attributes:\n 96:       label: More Details?\n 97:       description: You can give more details here.\n 98:       value: \"This image file booted successfully in Ventoy.\"\n 99:     validations:\n100:       required: false\n101: \n",
+          "tool_call_id": "toolu_0182AkS5jVtuiamykZ4imk98"
+        },
+        {
+          "role": "assistant",
+          "content": "Both files are fully read. I have everything needed.\n\n```json\n{\n  \"interpretation\": \"Compared required input fields and YAML schema differences (validations, dropdowns, required flags) between issue_template.yml and success_image_report.yml\",\n  \"scope\": [\".github/ISSUE_TEMPLATE/issue_template.yml\", \".github/ISSUE_TEMPLATE/success_image_report.yml\"],\n  \"snippets\": [\n    { \"path\": \".github/ISSUE_TEMPLATE/issue_template.yml\", \"startLine\": 1, \"endLine\": 6, \"why\": \"issue_template top-level metadata: name/description/title '[issue]:'/assignees\" },\n    { \"path\": \".github/ISSUE_TEMPLATE/issue_template.yml\", \"startLine\": 11, \"endLine\": 18, \"why\": \"faq checkboxes with required:true label (checked FAQ page)\" },\n    { \"path\": \".github/ISSUE_TEMPLATE/issue_template.yml\", \"startLine\": 19, \"endLine\": 46, \"why\": \"version input (required), latestrelease & alternativemode dropdowns (required) — unique to issue template\" },\n    { \"path\": \".github/ISSUE_TEMPLATE/issue_template.yml\", \"startLine\": 47, \"endLine\": 67, \"why\": \"bios & partstyle dropdowns (required) — shared shape with success report\" },\n    { \"path\": \".github/ISSUE_TEMPLATE/issue_template.yml\", \"startLine\": 68, \"endLine\": 100, \"why\": \"capacity(required), vendor(optional), checksum dropdown Yes/No(optional), link(optional) — issue-specific fields\" },\n    { \"path\": \".github/ISSUE_TEMPLATE/issue_template.yml\", \"startLine\": 101, \"endLine\": 109, \"why\": \"what-happened textarea, required:true, with default value\" },\n    { \"path\": \".github/ISSUE_TEMPLATE/success_image_report.yml\", \"startLine\": 1, \"endLine\": 6, \"why\": \"success report metadata: title '[Success Image Report]:' and different description\" },\n    { \"path\": \".github/ISSUE_TEMPLATE/success_image_report.yml\", \"startLine\": 12, \"endLine\": 27, \"why\": \"faq checkboxes (isolist page, required:true) and version input (required)\" },\n    { \"path\": \".github/ISSUE_TEMPLATE/success_image_report.yml\", \"startLine\": 28, \"endLine\": 56, \"why\": \"bios & partstyle dropdowns (required), filename input (required) — filename unique here\" },\n    { \"path\": \".github/ISSUE_TEMPLATE/success_image_report.yml\", \"startLine\": 57, \"endLine\": 92, \"why\": \"checksum dropdown MD5/SHA1/SHA256/SHA512 (required), checkvalue(required), link(optional), testenv(required) — success-specific\" },\n    { \"path\": \".github/ISSUE_TEMPLATE/success_image_report.yml\", \"startLine\": 93, \"endLine\": 100, \"why\": \"details textarea, required:false, with default value\" }\n  ],\n  \"omissions\": []\n}\n```"
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "search",
+            "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nSet hint to 'regex', 'literal', or 'semantic' to force a lane.",
+            "parameters": {
+              "$schema": "https://json-schema.org/draft/2020-12/schema",
+              "type": "object",
+              "properties": {
+                "query": {
+                  "description": "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'.",
+                  "type": "string"
+                },
+                "topK": {
+                  "description": "Number of results (default: 10, max: 100)",
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 100
+                },
+                "hint": {
+                  "description": "Optional routing hint. Defaults to 'auto'.",
+                  "type": "string",
+                  "enum": [
+                    "regex",
+                    "literal",
+                    "semantic",
+                    "auto"
+                  ]
+                },
+                "includeTests": {
+                  "description": "Include test files (*.test.*, *_test.rs, __tests__/, …) plus test-support, fixture, mock, snapshot, and corpus files. Defaults to false.",
+                  "type": "boolean"
+                },
+                "path": {
+                  "description": "Search a different project root (absolute or ~ path). Requires that project to have been indexed by AFT.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "query"
+              ],
+              "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nSet hint to 'regex', 'literal', or 'semantic' to force a lane."
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "outline",
+            "description": "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with aft_zoom. Set `files: true` with a directory target for a flat indexed file tree with language, symbol count, and byte metadata.\n\nFor understanding a specific feature, prefer aft_search + aft_zoom on named symbols; use aft_outline on a whole directory only for high-level structure mapping. aft_zoom with `callgraph:true` gives one-level forward calls-out; use aft_callgraph only for reverse callers or multi-level traces.\n\nPass a single `target`:\n  • file path → outline that file (with signatures)\n  • directory path → outline all source files under it (recursively, up to 200 files)\n  • URL (http:// or https://) → fetch and outline a remote HTML/Markdown document\n  • array of paths → outline multiple files in one call; with files:true, every path must be a directory",
+            "parameters": {
+              "$schema": "https://json-schema.org/draft/2020-12/schema",
+              "type": "object",
+              "properties": {
+                "target": {
+                  "description": "What to outline: a file path, directory path, URL, or array of paths. The mode is auto-detected: URLs by `http://`/`https://` prefix, directories by stat, arrays as multi-file.",
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  ]
+                },
+                "files": {
+                  "description": "Directory-only mode: when true, target must be a directory or array of directories and the result is a flat file tree with path, language, symbol count, and byte size instead of a symbol outline.",
+                  "type": "boolean"
+                },
+                "includeTests": {
+                  "description": "Directory outline only: include test files. Defaults to false; tests are hidden.",
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "target"
+              ],
+              "description": "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with aft_zoom. Set `files: true` with a directory target for a flat indexed file tree with language, symbol count, and byte metadata.\n\nFor understanding a specific feature, prefer aft_search + aft_zoom on named symbols; use aft_outline on a whole directory only for high-level structure mapping. aft_zoom with `callgraph:true` gives one-level forward calls-out; use aft_callgraph only for reverse callers or multi-level traces.\n\nPass a single `target`:\n  • file path → outline that file (with signatures)\n  • directory path → outline all source files under it (recursively, up to 200 files)\n  • URL (http:// or https://) → fetch and outline a remote HTML/Markdown document\n  • array of paths → outline multiple files in one call; with files:true, every path must be a directory"
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "zoom",
+            "description": "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse exactly ONE mode: `{ filePath, symbols }`, `{ url, symbols }`, or `{ targets }`. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ filePath, symbol }` or an array of them.",
+            "parameters": {
+              "$schema": "https://json-schema.org/draft/2020-12/schema",
+              "type": "object",
+              "properties": {
+                "filePath": {
+                  "description": "Path to file (absolute or relative to project root)",
+                  "type": "string"
+                },
+                "url": {
+                  "description": "HTTP/HTTPS URL of an HTML or Markdown document to fetch and zoom into",
+                  "type": "string"
+                },
+                "symbols": {
+                  "description": "Symbol name for code, or heading text for Markdown/HTML. Pass a string for one lookup or an array for batched lookups in the same file/URL.",
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  ]
+                },
+                "targets": {
+                  "description": "Cross-file batch: `{ filePath, symbol }` or an array of them. Mutually exclusive with filePath/url/symbols.",
+                  "anyOf": [
+                    {
+                      "type": "object",
+                      "properties": {
+                        "filePath": {
+                          "description": "Path to file (absolute or relative to project root)",
+                          "type": "string"
+                        },
+                        "symbol": {
+                          "description": "Symbol name in that file",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "filePath",
+                        "symbol"
+                      ]
+                    },
+                    {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "filePath": {
+                            "description": "Path to file (absolute or relative to project root)",
+                            "type": "string"
+                          },
+                          "symbol": {
+                            "description": "Symbol name in that file",
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "filePath",
+                          "symbol"
+                        ]
+                      }
+                    }
+                  ]
+                },
+                "contextLines": {
+                  "description": "Lines of context before/after the symbol (default: 3)",
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 9007199254740991
+                },
+                "callgraph": {
+                  "description": "Include call-graph annotations (calls-out / called-by within the same file). Default false; off keeps zoom output minimal.",
+                  "type": "boolean"
+                }
+              },
+              "description": "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse exactly ONE mode: `{ filePath, symbols }`, `{ url, symbols }`, or `{ targets }`. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ filePath, symbol }` or an array of them."
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "callgraph",
+            "description": "Answer code-relationship questions from a real call graph — instead of grep + read chains. Reach for this whenever the question is about how symbols connect: who calls X, what X calls, what breaks if X changes, how execution reaches X, or how a value flows.\n\nUse aft_zoom with `callgraph:true` for one-level forward calls-out while reading source. Use aft_callgraph only for reverse callers or multi-level traces so you do not double-fetch the same relationships.\n\nOps:\n- 'callers': Find all call sites of a symbol. Use before renaming or changing a function's signature.\n- 'impact': What breaks if a symbol changes — affected callers with signatures and entry-point status (blast radius). Use before a risky edit.\n- 'call_tree': What a function calls (forward traversal). Use to understand a function's dependencies before modifying it.\n- 'trace_to': How execution reaches a function from entry points (routes, exports, main). Use to understand context around deeply-nested code.\n- 'trace_to_symbol': Shortest call path from one symbol to another. Requires 'toSymbol'. If multiple targets match, the error returns candidate files; retry with 'toFile' to disambiguate.\n- 'trace_data': Follow a value through variable assignments and function parameters across files. Requires 'symbol' (scope to trace from) and 'expression'.\n\nAll ops require both 'filePath' and 'symbol'. 'expression' is additionally required for trace_data; 'toSymbol' for trace_to_symbol.\n\nMarkers: ~ = edge resolved by name only (may point at the wrong same-named symbol); [unresolved] = callee not resolved to a definition, so the location shown is the call site. Unmarked edges are resolved exactly. By default, unresolved external/stdlib leaf calls in call_tree are collapsed into one summary per parent; pass includeUnresolved=true to show every unresolved edge individually.\n",
+            "parameters": {
+              "$schema": "https://json-schema.org/draft/2020-12/schema",
+              "type": "object",
+              "properties": {
+                "op": {
+                  "description": "Navigation operation",
+                  "type": "string",
+                  "enum": [
+                    "call_tree",
+                    "callers",
+                    "trace_to",
+                    "trace_to_symbol",
+                    "impact",
+                    "trace_data"
+                  ]
+                },
+                "filePath": {
+                  "description": "Path to the source file containing the symbol (absolute or relative to project root)",
+                  "type": "string"
+                },
+                "symbol": {
+                  "description": "Name of the symbol to analyze",
+                  "type": "string"
+                },
+                "depth": {
+                  "description": "Max traversal depth (default: call_tree=5, callers=1, trace_to=10, trace_to_symbol=10 capped at 16, impact=5, trace_data=5)",
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 9007199254740991
+                },
+                "expression": {
+                  "description": "Expression to track through data flow (required for trace_data op)",
+                  "type": "string"
+                },
+                "toSymbol": {
+                  "description": "Target symbol name for trace_to_symbol; the returned path ends at this symbol",
+                  "type": "string"
+                },
+                "toFile": {
+                  "description": "Optional target file for trace_to_symbol; required when toSymbol exists in multiple files",
+                  "type": "string"
+                },
+                "includeTests": {
+                  "description": "Include test files in callers/paths. Defaults to false; tests are hidden.",
+                  "type": "boolean"
+                },
+                "includeUnresolved": {
+                  "description": "Show every unresolved external/stdlib call individually. Defaults to false; unresolved leaf calls are collapsed into one summary per parent.",
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "op",
+                "filePath",
+                "symbol"
+              ],
+              "description": "Answer code-relationship questions from a real call graph — instead of grep + read chains. Reach for this whenever the question is about how symbols connect: who calls X, what X calls, what breaks if X changes, how execution reaches X, or how a value flows.\n\nUse aft_zoom with `callgraph:true` for one-level forward calls-out while reading source. Use aft_callgraph only for reverse callers or multi-level traces so you do not double-fetch the same relationships.\n\nOps:\n- 'callers': Find all call sites of a symbol. Use before renaming or changing a function's signature.\n- 'impact': What breaks if a symbol changes — affected callers with signatures and entry-point status (blast radius). Use before a risky edit.\n- 'call_tree': What a function calls (forward traversal). Use to understand a function's dependencies before modifying it.\n- 'trace_to': How execution reaches a function from entry points (routes, exports, main). Use to understand context around deeply-nested code.\n- 'trace_to_symbol': Shortest call path from one symbol to another. Requires 'toSymbol'. If multiple targets match, the error returns candidate files; retry with 'toFile' to disambiguate.\n- 'trace_data': Follow a value through variable assignments and function parameters across files. Requires 'symbol' (scope to trace from) and 'expression'.\n\nAll ops require both 'filePath' and 'symbol'. 'expression' is additionally required for trace_data; 'toSymbol' for trace_to_symbol.\n\nMarkers: ~ = edge resolved by name only (may point at the wrong same-named symbol); [unresolved] = callee not resolved to a definition, so the location shown is the call site. Unmarked edges are resolved exactly. By default, unresolved external/stdlib leaf calls in call_tree are collapsed into one summary per parent; pass includeUnresolved=true to show every unresolved edge individually.\n"
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "read",
+            "description": "Read file contents or list directory entries.\n\nUse either startLine/endLine OR offset/limit to read a section of a file.\n\nBehavior:\n- Returns line-numbered content (e.g., \"1: const x = 1\")\n- Lines longer than 2000 characters are truncated\n- Output capped at 50KB\n- Binary files are auto-detected and return a size-only message\n- Supported images (PNG, JPEG, GIF, WebP) and PDFs are returned as tool attachments; range arguments are ignored for media\n- Directories return sorted entries with trailing / for subdirectories\n\nExamples:\n  Read full file: { \"filePath\": \"src/app.ts\" }\n  Read lines 50-100: { \"filePath\": \"src/app.ts\", \"startLine\": 50, \"endLine\": 100 }\n  Read 30 lines from line 200: { \"filePath\": \"src/app.ts\", \"offset\": 200, \"limit\": 30 }\n  List directory: { \"filePath\": \"src/\" }\n",
+            "parameters": {
+              "$schema": "https://json-schema.org/draft/2020-12/schema",
+              "type": "object",
+              "properties": {
+                "filePath": {
+                  "description": "Path to file or directory (absolute or relative to project root)",
+                  "type": "string"
+                },
+                "startLine": {
+                  "description": "1-based line to start reading from",
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 9007199254740991
+                },
+                "endLine": {
+                  "description": "1-based line to stop reading at (inclusive)",
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 9007199254740991
+                },
+                "limit": {
+                  "description": "Max lines to return (default: 2000)",
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 9007199254740991
+                },
+                "offset": {
+                  "description": "1-based line number to start reading from (use with limit). Ignored if startLine is provided",
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 9007199254740991
+                }
+              },
+              "required": [
+                "filePath"
+              ],
+              "description": "Read file contents or list directory entries.\n\nUse either startLine/endLine OR offset/limit to read a section of a file.\n\nBehavior:\n- Returns line-numbered content (e.g., \"1: const x = 1\")\n- Lines longer than 2000 characters are truncated\n- Output capped at 50KB\n- Binary files are auto-detected and return a size-only message\n- Supported images (PNG, JPEG, GIF, WebP) and PDFs are returned as tool attachments; range arguments are ignored for media\n- Directories return sorted entries with trailing / for subdirectories\n\nExamples:\n  Read full file: { \"filePath\": \"src/app.ts\" }\n  Read lines 50-100: { \"filePath\": \"src/app.ts\", \"startLine\": 50, \"endLine\": 100 }\n  Read 30 lines from line 200: { \"filePath\": \"src/app.ts\", \"offset\": 200, \"limit\": 30 }\n  List directory: { \"filePath\": \"src/\" }\n"
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "grep",
+            "description": "Search file contents using regular expressions. Returns matching lines with file paths and line numbers (no surrounding context lines — use `read` for that). Always case-sensitive. Capped at 100 matches; if you hit the cap, narrow with `path` or `include` and re-run.",
+            "parameters": {
+              "$schema": "https://json-schema.org/draft/2020-12/schema",
+              "type": "object",
+              "properties": {
+                "pattern": {
+                  "type": "string"
+                },
+                "include": {
+                  "type": "string"
+                },
+                "path": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "pattern"
+              ],
+              "description": "Search file contents using regular expressions. Returns matching lines with file paths and line numbers (no surrounding context lines — use `read` for that). Always case-sensitive. Capped at 100 matches; if you hit the cap, narrow with `path` or `include` and re-run."
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "glob",
+            "description": "Find files matching a glob pattern. Returns matching file paths sorted by modification time.",
+            "parameters": {
+              "$schema": "https://json-schema.org/draft/2020-12/schema",
+              "type": "object",
+              "properties": {
+                "pattern": {
+                  "type": "string"
+                },
+                "path": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "pattern"
+              ],
+              "description": "Find files matching a glob pattern. Returns matching file paths sorted by modification time."
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "inspect",
+            "description": "Codebase health snapshot. One call returns summary stats for: TODOs, diagnostics, file/symbol metrics, dead code, unused exports, code duplicates, and TS/JS import cycles. Pass `sections` for per-category drill-down details.\n\nCategories run in tiers — Tier 1 (todos, metrics) return synchronously from cache. Tier 2 (dead_code, unused_exports, duplicates, cycles) waits for a fresh reuse scan up to a short deadline; if a category is still scanning the response reports `complete: false` with `pending_categories: [...]` rather than a fabricated clean count. Rust module cycles are out of scope for `cycles`.\n\nUse when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.\n\nTreat `dead_code` as a hint, not proof: reachability is call-based, so symbols reached only via method dispatch or referenced only in type position may be false positives — verify before deleting.",
+            "parameters": {
+              "$schema": "https://json-schema.org/draft/2020-12/schema",
+              "type": "object",
+              "properties": {
+                "sections": {
+                  "description": "Categories to include in detailed drill-down (e.g. 'todos' or ['todos', 'dead_code', 'cycles']). Use 'all' for every active category. Omit for summary-only mode.",
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  ]
+                },
+                "scope": {
+                  "description": "Restrict scan/results to paths under this scope (file or directory, absolute or relative to project root). Tier 1 scopes the scan; Tier 2 scans project-wide and applies scope as a result filter.",
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  ]
+                },
+                "topK": {
+                  "description": "Max drill-down items per category. Default 20, max 100.",
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 100
+                }
+              },
+              "description": "Codebase health snapshot. One call returns summary stats for: TODOs, diagnostics, file/symbol metrics, dead code, unused exports, code duplicates, and TS/JS import cycles. Pass `sections` for per-category drill-down details.\n\nCategories run in tiers — Tier 1 (todos, metrics) return synchronously from cache. Tier 2 (dead_code, unused_exports, duplicates, cycles) waits for a fresh reuse scan up to a short deadline; if a category is still scanning the response reports `complete: false` with `pending_categories: [...]` rather than a fabricated clean count. Rust module cycles are out of scope for `cycles`.\n\nUse when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.\n\nTreat `dead_code` as a hint, not proof: reachability is call-based, so symbols reached only via method dispatch or referenced only in type position may be false positives — verify before deleting."
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "conflicts",
+            "description": "Show all git merge conflicts across the repository — returns line-numbered conflict regions with context for every conflicted file in a single call. Conflicts are discovered from the git repository's top level. By default it inspects the session's project repository; pass `path` to inspect a different repository or git worktree (e.g. where a rebase/merge is running).",
+            "parameters": {
+              "$schema": "https://json-schema.org/draft/2020-12/schema",
+              "type": "object",
+              "properties": {
+                "path": {
+                  "description": "Optional path inside the git repository or worktree to inspect (absolute or relative to project root). Conflicts are discovered from that repository's top level. Defaults to the session project root.",
+                  "type": "string"
+                }
+              },
+              "description": "Show all git merge conflicts across the repository — returns line-numbered conflict regions with context for every conflicted file in a single call. Conflicts are discovered from the git repository's top level. By default it inspects the session's project repository; pass `path` to inspect a different repository or git worktree (e.g. where a rebase/merge is running)."
+            }
+          }
+        }
+      ]
+    }
+  },
+  "argument_fidelity": "Anthropic input blocks in BankedRow are parsed JSON values, not raw response substrings. The converter therefore reuses src/openai.ts, whose toolArguments applies the only possible compact JSON.stringify serialization while preserving IDs, names, values, key insertion order, strings, and numeric values."
+}

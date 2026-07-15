@@ -1,0 +1,56 @@
+base_model: Qwen/Qwen3.5-9B
+tokenizer_type: AutoTokenizer
+trust_remote_code: false
+
+chat_template: tokenizer_default
+datasets:
+  - path: train/sft-dataset.jsonl
+    type: chat_template
+    field_messages: messages
+    field_tools: tools
+    roles_to_train:
+      - assistant
+    train_on_eos: turn
+
+dataset_prepared_path: train/prepared/qwen35-9b-lora
+output_dir: train/outputs/qwen35-9b-lora
+val_set_size: 0.02
+
+sequence_len: 32768
+sample_packing: true
+eval_sample_packing: false
+
+adapter: lora
+lora_r: 32
+lora_alpha: 64
+lora_dropout: 0.05
+lora_target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj
+
+micro_batch_size: 1
+gradient_accumulation_steps: 16
+num_epochs: 2
+learning_rate: 0.0001
+lr_scheduler: cosine
+warmup_ratio: 0.03
+weight_decay: 0.0
+optimizer: adamw_torch_fused
+
+bf16: true
+tf32: true
+attn_implementation: flash_attention_2
+gradient_checkpointing: true
+gradient_checkpointing_kwargs:
+  use_reentrant: false
+
+logging_steps: 1
+evals_per_epoch: 1
+saves_per_epoch: 1
+save_safetensors: true
+seed: 8918
