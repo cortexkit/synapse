@@ -63,7 +63,7 @@
 **Native Engine Inference Lanes:**
 - Purpose: Execute in-memory tokenization, tensor forward passes, and pooling over target platforms.
 - Location: `bench/lanes/ort-embed`, `bench/lanes/mlx`, `bench/lanes/burn`, `bench/lanes/mlx-minilm`, `bench/lanes/ts-embed`, `bench/lanes/potion`, `bench/spikes/unified-rt`
-- Contains: Bounded-thread ONNX Runtime embedding logic, Metal-accelerated MLX custom model implementations, unified-rt candidate implementations (Vulkan cooperative-matrix/plain shaders on RDNA3, CUDA cuBLASLt fused graphs on NVIDIA), WGPU-based Burn ONNX imports, python-based MLX community/source loading, Model2Vec static embedding (`potion-code-16M`), and TypeScript setups.
+- Contains: Bounded-thread ONNX Runtime embedding logic, Metal-accelerated MLX custom model implementations, unified-rt candidate implementations (Vulkan cooperative-matrix/plain shaders on RDNA3 with device-local memory staging and budget validation, CUDA cuBLASLt fused graphs on NVIDIA, Metal graph execution optimization levels O0/O1 and package caching), LFM2 hybrid causal backbone, LFM2-Audio ASR speech encoder (FastConformer and Slaney mel filterbank frontend), Qwen3-0.6B f16 Metal decode throughput optimizations, WGPU-based Burn ONNX imports, python-based MLX community/source loading, Model2Vec static embedding (`potion-code-16M`), and TypeScript setups.
 - Depends on: `bench/harness` or `bench/rig`, target runtime libraries (`ort`, `mlx-rs`, `vulkano`, `cudarc`), and `tokenizers`.
 - Used by: The benchmark suite runners `bench/run-matrix.sh` and `bench/run-night.sh`.
 
@@ -91,7 +91,7 @@
 **External Gather-Distillation Harness:**
 - Purpose: Standalone Bun/TypeScript data generation for the production gatherer contract, supporting both Anthropic API (with multi-account OAuth rotation) and local OpenAI-compatible endpoints.
 - Location: `tools/gather-distill`
-- Contains: Trajectory generation, work queue handling, `AftClientPool` process wrapping, validation, and gold-overlap scoring.
+- Contains: Trajectory generation, work queue handling, `AftClientPool` process wrapping, validation, gold-overlap scoring, and zero-shot gatherer bake-off evaluation leaderboards (`tools/gather-distill/BAKEOFF-ZEROSHOT.md`).
 - Depends on: Bun, pinned `aft-v0.46.0` binary, and `@cortexkit/anthropic-auth-core`.
 - Used by: Developers running qgen, gather, validate, or score campaigns.
 
@@ -150,6 +150,16 @@
 4. Validate trajectory JSON rows, confirming commit SHAs, file bounds, and citation content against the pinned repo — `tools/gather-distill/src/validate.ts`
 5. Perform offline gold-overlap scoring to evaluate candidate trajectory quality (tracking line-range Jaccard, file F1, and token usage) — `tools/gather-distill/src/scorer.ts`
 
+**LFM2 Causal Decode and LFM2-Audio ASR Flow (unified-rt):**
+
+1. Detect model family from config `model_type` (`lfm2` or `lfm2-audio`).
+2. Initialize LFM2 hybrid backbone containing 10 short-convolution layers and 6 full-attention layers with tied embeddings and GQA KV cache.
+3. If processing audio (`lfm2-audio`):
+   - Read mono 16 kHz WAV file, apply pre-emphasis, centered STFT with Hann window, power spectrum, and 128-bin Slaney-normalized mel filterbank.
+   - Normalize log-mel features and process through a noncausal FastConformer encoder and audio projector to map speech inputs to 2048-wide vectors.
+   - Splice projected audio embeddings into the LFM2 backbone text token space.
+4. Execute greedy causal decode using `DecodeModel` cache and token taps, keeping execution token-exact against Python references.
+
 ## Key Abstractions
 
 **Worker Framing Protocol:**
@@ -207,6 +217,21 @@
 - Location: `tools/gather-distill/src/auth.ts`
 - Pattern: Rotating Credentials Pool with in-flight caps.
 
+**LFM2 Causal Mixer:**
+- Purpose: Alternates 10 short-convolution layers and 6 full-attention layers with tied embeddings and GQA KV cache, supporting modern `layer_types` configurations.
+- Location: `bench/spikes/unified-rt/src/lfm2.rs`
+- Pattern: Causal hybrid model architecture.
+
+**FastConformer Audio Encoder:**
+- Purpose: Translates Mel-spectrogram DSP features into projection-aligned backbone embeddings for ASR splicing.
+- Location: `bench/spikes/unified-rt/src/lfm2_audio.rs`
+- Pattern: Feature extraction and modality alignment.
+
+**Vulkan Device-Local Weight Stager:**
+- Purpose: Performs staging buffer transfers (`vkCmdCopyBuffer`) to isolated device-local Vulkan memory and tracks heap budgets via `VK_EXT_memory_budget`.
+- Location: `bench/spikes/unified-rt/src/vulkan_backend.rs`
+- Pattern: Isolated memory placement.
+
 ## Entry Points
 
 **Synapse Module Main (`ck-synapse`):**
@@ -230,9 +255,9 @@
 - Responsibilities: External measurement harness, bounding execution timings, hashing candidates for validation, enforcing gate thresholds for parity and padding waste, and generating `LaneResult` json.
 
 **Inference Lane Runners:**
-- Location: `bench/lanes/ort-embed/src/main.rs`, `bench/lanes/wrap-embed/src/main.rs`, `bench/lanes/llama/src/main.rs`, `bench/lanes/mlx/src/main.rs`, `bench/lanes/burn/src/main.rs` (Rust crates); `bench/lanes/mlx-minilm/main.py` (Python script); `bench/lanes/ts-embed/main.mjs` (TypeScript script); `bench/lanes/potion/main.py` (Python script)
+- Location: `bench/lanes/ort-embed/src/main.rs`, `bench/lanes/wrap-embed/src/main.rs`, `bench/lanes/llama/src/main.rs`, `bench/lanes/mlx/src/main.rs`, `bench/lanes/burn/src/main.rs` (Rust crates); `bench/spikes/unified-rt/src/main.rs` (spike unified-rt runner); `bench/lanes/mlx-minilm/main.py` (Python script); `bench/lanes/ts-embed/main.mjs` (TypeScript script); `bench/lanes/potion/main.py` (Python script)
 - Triggers: Invocation by the power wrapper or direct script executions.
-- Responsibilities: Model initialization, cold-load timing tracking, batched inference execution, and vector/result output generation.
+- Responsibilities: Model initialization, cold-load timing tracking, batched inference execution (including causal decoding `--generate-prompts` and ASR transcribing `--asr-audio` for LFM2), and vector/result output generation.
 
 **CoIR Evaluation Entry Points:**
 - Location: `bench/eval-coir/prepare.py`, `bench/eval-coir/score.py`, `bench/eval-coir/reference_rerank.py`
@@ -249,10 +274,15 @@
 - Triggers: Scheduled execution or manual trigger by developer.
 - Responsibilities: Precondition validation, sequential idle-gated run of all 16 target lanes on the full AFT corpus, full-corpus parity and rank-overlap calculations, and archiving outputs under `bench/results/night-YYYYMMDD/`.
 
+**Vulkan Capability Prober:**
+- Location: `bench/spikes/unified-rt/src/bin/vulkan_probe.rs`
+- Triggers: Execution of the `vulkan_probe` binary.
+- Responsibilities: Queries and logs Vulkan physical heaps, memory types, and memory budget metrics.
+
 **Gather-Distillation CLI (`gather-distill`):**
 - Location: `tools/gather-distill/src/cli.ts`
 - Triggers: Invocation of Bun running the CLI commands.
-- Responsibilities: Routes commands to qgen (question generation), gather (trajectory collection), validate (trajectory inspection), and score (gold-overlap performance comparison).
+- Responsibilities: Routes commands to qgen (question generation with optional `--avoid-from` to avoid duplicating question lists), gather (trajectory collection), validate (trajectory inspection), and score (gold-overlap performance comparison and zero-shot bake-off evaluation).
 
 ## Error Handling
 

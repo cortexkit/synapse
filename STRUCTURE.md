@@ -95,7 +95,7 @@
 **bench/spikes/:**
 - Purpose: Holds discrete architecture experimentation paths and new backend developments.
 - Contains: `unified-rt` (CUDA/Vulkan/M1 exact-match execution) and `ane-minilm` (Apple Neural Engine CoreML conversion) spikes.
-- Key files: `bench/spikes/unified-rt/src/main.rs`, `bench/spikes/unified-rt/src/vulkan_backend.rs`, `bench/spikes/unified-rt/src/cuda_backend.rs`
+- Key files: `bench/spikes/unified-rt/src/main.rs`, `bench/spikes/unified-rt/src/vulkan_backend.rs`, `bench/spikes/unified-rt/src/cuda_backend.rs`, `bench/spikes/unified-rt/src/lfm2.rs`, `bench/spikes/unified-rt/src/lfm2_audio.rs`, `bench/spikes/unified-rt/src/lfm2_decode.rs`, `bench/spikes/unified-rt/src/qwen3_decode.rs`
 
 **bench/eval-coir/:**
 - Purpose: Hosts the CoIR retrieval and rerank quality evaluation harness.
@@ -124,7 +124,7 @@
 **tools/gather-distill/:**
 - Purpose: Standalone external harness for generating QA datasets and collecting model tool-use trajectories.
 - Contains: Bun workspaces, Anthropic/OpenAI API adapters, AFT child process pools, validation scripts, and scoring modules.
-- Key files: `tools/gather-distill/src/cli.ts`, `tools/gather-distill/README.md`
+- Key files: `tools/gather-distill/src/cli.ts`, `tools/gather-distill/README.md`, `tools/gather-distill/BAKEOFF-ZEROSHOT.md`
 
 ## Key File Locations
 
@@ -138,6 +138,7 @@
 - `bench/run-matrix.sh`: Global benchmark suite runner.
 - `bench/run-night.sh`: Nightly full-corpus multi-lane orchestrator.
 - `tools/gather-distill/src/cli.ts`: Entry point for the gather-distillation harness commands (`qgen`, `gather`, `validate`, `score`).
+- `bench/spikes/unified-rt/src/bin/vulkan_probe.rs`: Vulkan memory type and budget capability prober.
 
 **Configuration:**
 - `Cargo.toml`: Cargo workspace manifest listing all members.
@@ -161,6 +162,10 @@
 - `tools/gather-distill/src/gather.ts`: Work queue execution loop driving model tool interactions.
 - `tools/gather-distill/src/validate.ts`: Citation verification, SHA-checking, and path bounds checker.
 - `tools/gather-distill/src/scorer.ts`: Offline gold-standard Jaccard and file F1 overlap quality scorer.
+- `bench/spikes/unified-rt/src/lfm2.rs`: LFM2 model family, short-convolution, and full-attention mixer logic.
+- `bench/spikes/unified-rt/src/lfm2_audio.rs`: Mel-spectrogram DSP frontend, FastConformer speech encoder, and audio projector.
+- `bench/spikes/unified-rt/src/lfm2_decode.rs`: Causal decoding logic for LFM2 hybrid backbone models.
+- `bench/spikes/unified-rt/src/qwen3_decode.rs`: Fast Metal decode optimizations for Qwen3-0.6B f16.
 
 **Tests:**
 - Standalone nextest-compatible test suites are managed via library configurations and workspace flags.
