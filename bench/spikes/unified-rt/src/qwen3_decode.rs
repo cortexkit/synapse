@@ -10,6 +10,7 @@ use std::time::Instant;
 use anyhow::{ensure, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::json_constraint::{DecodeConstraint, TokenMask};
 use crate::{qwen3::Model, Tensor};
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -60,6 +61,7 @@ pub(crate) struct DecodeSession<'a, K: DecodeKernel> {
     generated: Vec<u32>,
     next_logits: Vec<f32>,
     sample_wall_s: f64,
+    constraint_wall_s: f64,
 }
 
 #[allow(dead_code)]
@@ -81,6 +83,7 @@ impl<'a, K: DecodeKernel> DecodeSession<'a, K> {
             generated: Vec::new(),
             next_logits,
             sample_wall_s: 0.0,
+            constraint_wall_s: 0.0,
         })
     }
 
@@ -104,6 +107,10 @@ impl<'a, K: DecodeKernel> DecodeSession<'a, K> {
         self.sample_wall_s
     }
 
+    pub(crate) fn constraint_wall_s(&self) -> f64 {
+        self.constraint_wall_s
+    }
+
     pub(crate) fn stage_timings(&self) -> DecodeStageTimings {
         self.kernel.stage_timings()
     }
@@ -115,6 +122,28 @@ impl<'a, K: DecodeKernel> DecodeSession<'a, K> {
         top_k: usize,
         tap: &mut dyn TokenStreamTap,
     ) -> Result<Vec<u32>> {
+        self.generate_inner(max_tokens, stop_tokens, top_k, None, tap)
+    }
+
+    pub(crate) fn generate_constrained(
+        &mut self,
+        max_tokens: usize,
+        stop_tokens: &HashSet<u32>,
+        top_k: usize,
+        constraint: &mut dyn DecodeConstraint,
+        tap: &mut dyn TokenStreamTap,
+    ) -> Result<Vec<u32>> {
+        self.generate_inner(max_tokens, stop_tokens, top_k, Some(constraint), tap)
+    }
+
+    fn generate_inner(
+        &mut self,
+        max_tokens: usize,
+        stop_tokens: &HashSet<u32>,
+        top_k: usize,
+        mut constraint: Option<&mut dyn DecodeConstraint>,
+        tap: &mut dyn TokenStreamTap,
+    ) -> Result<Vec<u32>> {
         ensure!(top_k > 0, "decode tap top-k must be positive");
         let first_generated = self.generated.len();
         for _ in 0..max_tokens {
@@ -124,7 +153,16 @@ impl<'a, K: DecodeKernel> DecodeSession<'a, K> {
                 self.kernel.capacity()
             );
             let sample_started = Instant::now();
-            let top = top_logits(&self.next_logits, top_k);
+            let top = if let Some(constraint) = constraint.as_deref_mut() {
+                let constraint_started = Instant::now();
+                let mask = constraint.allowed()?;
+                let top = top_logits_masked(&self.next_logits, &mask, top_k);
+                self.constraint_wall_s += constraint_started.elapsed().as_secs_f64();
+                top
+            } else {
+                top_logits(&self.next_logits, top_k)
+            };
+            ensure!(top.len() > 0, "decode constraint masked every model token");
             let token = top[0].token_id;
             self.sample_wall_s += sample_started.elapsed().as_secs_f64();
             tap.before_commit(TokenTapEvent {
@@ -132,12 +170,24 @@ impl<'a, K: DecodeKernel> DecodeSession<'a, K> {
                 token_id: token,
                 top_logits: &top,
             });
+            if let Some(constraint) = constraint.as_deref_mut() {
+                let constraint_started = Instant::now();
+                constraint.advance(token)?;
+                self.constraint_wall_s += constraint_started.elapsed().as_secs_f64();
+            }
             self.sequence.push(token);
             self.generated.push(token);
             self.next_logits = self.kernel.advance(&mut self.cache, token)?;
             if stop_tokens.contains(&token) {
                 break;
             }
+        }
+        if let Some(constraint) = constraint {
+            ensure!(
+                constraint.is_complete(),
+                "JSON constraint did not complete within {max_tokens} generated tokens: {}",
+                constraint.describe()
+            );
         }
         Ok(self.generated[first_generated..].to_vec())
     }
@@ -218,6 +268,35 @@ pub(crate) fn top_logits(logits: &[f32], top_k: usize) -> Vec<TopLogit> {
         }
     }
     top
+}
+
+pub(crate) fn top_logits_masked(logits: &[f32], mask: &TokenMask, top_k: usize) -> Vec<TopLogit> {
+    assert!(!logits.is_empty(), "logits must not be empty");
+    assert!(top_k > 0, "top-k must be positive");
+    let mut top = Vec::<TopLogit>::with_capacity(top_k.min(mask.len()));
+    for token_id in mask.token_ids() {
+        let Some(&logit) = logits.get(token_id as usize) else {
+            continue;
+        };
+        insert_top_logit(&mut top, TopLogit { token_id, logit }, top_k);
+    }
+    top
+}
+
+fn insert_top_logit(top: &mut Vec<TopLogit>, candidate: TopLogit, top_k: usize) {
+    if top.len() == top_k && !logit_precedes(&candidate, &top[top_k - 1]) {
+        return;
+    }
+    let insertion = top
+        .iter()
+        .position(|current| logit_precedes(&candidate, current))
+        .unwrap_or(top.len());
+    if insertion < top_k {
+        top.insert(insertion, candidate);
+        if top.len() > top_k {
+            top.pop();
+        }
+    }
 }
 
 fn logit_precedes(candidate: &TopLogit, current: &TopLogit) -> bool {
@@ -853,7 +932,10 @@ pub(crate) use metal::MetalDecoder;
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::json_constraint::{JsonConstraint, TokenVocabulary};
 
     #[derive(Default)]
     struct MockKernel {
@@ -899,6 +981,58 @@ mod tests {
 
     fn no_stops() -> HashSet<u32> {
         HashSet::new()
+    }
+
+    struct ConstraintKernel;
+
+    impl DecodeKernel for ConstraintKernel {
+        type Cache = usize;
+
+        fn capacity(&self) -> usize {
+            8
+        }
+
+        fn prefill(&mut self, tokens: &[u32]) -> Result<(Self::Cache, Vec<f32>)> {
+            Ok((tokens.len(), vec![100.0, 10.0, 1.0]))
+        }
+
+        fn advance(&mut self, cache: &mut Self::Cache, _token: u32) -> Result<Vec<f32>> {
+            *cache += 1;
+            Ok(vec![100.0, 10.0, 1.0])
+        }
+
+        fn cache_position(&self, cache: &Self::Cache) -> usize {
+            *cache
+        }
+
+        fn inspect_cache_layer(&self, _cache: &Self::Cache, _layer: usize) -> Result<Vec<f32>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn constraint_masks_invalid_logits_before_the_token_tap() {
+        let vocabulary = Arc::new(TokenVocabulary::from_pieces(vec![
+            Some(b"prose".to_vec()),
+            Some(b"{}".to_vec()),
+            None,
+        ]));
+        let stops = HashSet::from([2]);
+        let mut constraint = JsonConstraint::new(vocabulary, None, &stops);
+        let mut kernel = ConstraintKernel;
+        let mut session = DecodeSession::prefill(&mut kernel, &[0]).unwrap();
+        let mut tapped = Vec::new();
+        let generated = session
+            .generate_constrained(
+                4,
+                &stops,
+                3,
+                &mut constraint,
+                &mut |event: TokenTapEvent<'_>| tapped.push(event.token_id),
+            )
+            .unwrap();
+        assert_eq!(generated, vec![1, 2]);
+        assert_eq!(tapped, generated);
     }
 
     #[test]

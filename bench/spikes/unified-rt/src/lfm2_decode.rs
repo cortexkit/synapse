@@ -4,8 +4,9 @@ use std::collections::HashSet;
 
 use anyhow::{ensure, Context, Result};
 
+use crate::json_constraint::DecodeConstraint;
 use crate::lfm2::{DecodeCache, LayerCache, Model};
-use crate::qwen3_decode::{top_logits, DecodeKernel};
+use crate::qwen3_decode::{top_logits, top_logits_masked, DecodeKernel};
 use crate::KernelProvider;
 
 pub(crate) struct Decoder<'model, 'provider> {
@@ -38,6 +39,26 @@ impl<'model, 'provider> Decoder<'model, 'provider> {
         max_tokens: usize,
         stop_tokens: &HashSet<u32>,
     ) -> Result<Vec<u32>> {
+        self.full_reprefill_tokens_inner(prompt, max_tokens, stop_tokens, None)
+    }
+
+    pub(crate) fn full_reprefill_tokens_constrained(
+        &mut self,
+        prompt: &[u32],
+        max_tokens: usize,
+        stop_tokens: &HashSet<u32>,
+        constraint: &mut dyn DecodeConstraint,
+    ) -> Result<Vec<u32>> {
+        self.full_reprefill_tokens_inner(prompt, max_tokens, stop_tokens, Some(constraint))
+    }
+
+    fn full_reprefill_tokens_inner(
+        &mut self,
+        prompt: &[u32],
+        max_tokens: usize,
+        stop_tokens: &HashSet<u32>,
+        mut constraint: Option<&mut dyn DecodeConstraint>,
+    ) -> Result<Vec<u32>> {
         ensure!(!prompt.is_empty(), "decode prompt must not be empty");
         ensure!(
             prompt.len() + max_tokens <= self.capacity,
@@ -47,12 +68,27 @@ impl<'model, 'provider> Decoder<'model, 'provider> {
         let mut generated = Vec::with_capacity(max_tokens);
         for _ in 0..max_tokens {
             let logits = self.model.forward_logits(self.provider, &sequence)?;
-            let token = top_logits(&logits, 1)[0].token_id;
+            let token = if let Some(constraint) = constraint.as_deref_mut() {
+                let mask = constraint.allowed()?;
+                top_logits_masked(&logits, &mask, 1)[0].token_id
+            } else {
+                top_logits(&logits, 1)[0].token_id
+            };
+            if let Some(constraint) = constraint.as_deref_mut() {
+                constraint.advance(token)?;
+            }
             sequence.push(token);
             generated.push(token);
             if stop_tokens.contains(&token) {
                 break;
             }
+        }
+        if let Some(constraint) = constraint {
+            ensure!(
+                constraint.is_complete(),
+                "full-reprefill JSON constraint did not complete: {}",
+                constraint.describe()
+            );
         }
         Ok(generated)
     }

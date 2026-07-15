@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{bail, ensure, Context, Result};
@@ -21,6 +22,7 @@ use tokenizers::{Tokenizer, TruncationParams};
 
 mod cpu_backend;
 mod cuda_backend;
+mod json_constraint;
 mod lfm2;
 mod lfm2_audio;
 mod lfm2_decode;
@@ -71,6 +73,12 @@ struct Args {
     /// Optional JSONL destination for pre-commit token tap events.
     #[arg(long, requires = "generate_prompts")]
     decode_tap_out: Option<PathBuf>,
+    /// Constrain generation to one complete JSON value.
+    #[arg(long, requires = "generate_prompts")]
+    decode_json: bool,
+    /// Optional JSON-schema-subset file; also enables JSON constrained decoding.
+    #[arg(long, requires = "generate_prompts")]
+    decode_json_schema: Option<PathBuf>,
     /// Transformers final-hidden-state JSONL used by the LFM2 per-position parity gate.
     #[arg(long, requires = "generate_prompts")]
     decode_hidden_reference: Option<PathBuf>,
@@ -311,6 +319,8 @@ struct DecodePromptResult {
     id: String,
     prompt_tokens: usize,
     tokens: Vec<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
     exact_reference: Option<bool>,
     accepted_near_ties: Vec<usize>,
 }
@@ -333,11 +343,61 @@ struct DecodeServingResult {
     prefill_stages: qwen3_decode::DecodeStageTimings,
     decode_stages: qwen3_decode::DecodeStageTimings,
     sample_wall_s: f64,
+    constraint: Option<&'static str>,
+    constraint_vocab_size: Option<usize>,
+    constraint_valid_prompts: Option<usize>,
+    constraint_wall_s: f64,
+    constraint_ms_per_token: f64,
     kv_update_path: &'static str,
     weight_feed_path: &'static str,
     optimization_level: u8,
     weight_regions: usize,
     results: Vec<DecodePromptResult>,
+}
+
+struct JsonConstraintConfig {
+    vocabulary: Arc<json_constraint::TokenVocabulary>,
+    schema: Option<json_constraint::JsonSchema>,
+}
+
+fn load_json_constraint_config(
+    args: &Args,
+    tokenizer: &Tokenizer,
+) -> Result<Option<JsonConstraintConfig>> {
+    if !args.decode_json && args.decode_json_schema.is_none() {
+        return Ok(None);
+    }
+    let schema = args
+        .decode_json_schema
+        .as_ref()
+        .map(|path| {
+            let bytes = fs::read(path)
+                .with_context(|| format!("read decode JSON schema {}", path.display()))?;
+            let value: serde_json::Value = serde_json::from_slice(&bytes)
+                .with_context(|| format!("parse decode JSON schema {}", path.display()))?;
+            json_constraint::JsonSchema::from_value(&value)
+        })
+        .transpose()?;
+    Ok(Some(JsonConstraintConfig {
+        vocabulary: Arc::new(json_constraint::TokenVocabulary::from_tokenizer(tokenizer)?),
+        schema,
+    }))
+}
+
+fn validate_constrained_output(
+    tokenizer: &Tokenizer,
+    tokens: &[u32],
+    schema: Option<&json_constraint::JsonSchema>,
+) -> Result<String> {
+    let text = tokenizer
+        .decode(tokens, true)
+        .map_err(|error| anyhow::anyhow!("decode constrained tokens: {error}"))?;
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .with_context(|| format!("constrained output is not complete JSON: {text:?}"))?;
+    if let Some(schema) = schema {
+        schema.validate(&value)?;
+    }
+    Ok(text)
 }
 
 #[derive(Debug, Deserialize)]
@@ -878,17 +938,20 @@ fn run_decode_cli(args: &Args, started: Instant) -> Result<()> {
         let mut decoder =
             MetalDecoder::new(&model, args.dtype, &execution, args.decode_cache_bucket)?;
         let load_stages = decoder.stage_timings();
-        let cold_load_s = started.elapsed().as_secs_f64();
         let stop_tokens = model
             .generation_stop_ids()
             .iter()
             .copied()
             .collect::<HashSet<_>>();
+        let constraint_config = load_json_constraint_config(args, &tokenizer)?;
+        let cold_load_s = started.elapsed().as_secs_f64();
         let mut tap_rows = Vec::new();
         let mut results = Vec::with_capacity(prompts.len());
         let mut prefill_wall_s = 0.0;
         let mut decode_wall_s = 0.0;
         let mut sample_wall_s = 0.0;
+        let mut constraint_wall_s = 0.0;
+        let mut constraint_valid_prompts = 0usize;
         let mut prefill_stages = qwen3_decode::DecodeStageTimings::default();
         let mut decode_stages = qwen3_decode::DecodeStageTimings::default();
         let mut prefill_tokens = 0usize;
@@ -916,24 +979,50 @@ fn run_decode_cli(args: &Args, started: Instant) -> Result<()> {
             prefill_stages.accumulate(after_prefill.delta(before_prefill));
             let mut prompt_top_logits = Vec::new();
             let decode_started = Instant::now();
-            let tokens = session.generate(
-                args.max_new_tokens,
-                &stop_tokens,
-                args.decode_top_k,
-                &mut |event: TokenTapEvent<'_>| {
-                    prompt_top_logits.push(event.top_logits.to_vec());
-                    tap_rows.push(DecodeTapRow {
-                        id: prompt.id.clone(),
-                        step: event.step,
-                        token_id: event.token_id,
-                        top_logits: event.top_logits.to_vec(),
-                    });
-                },
-            )?;
+            let mut tap = |event: TokenTapEvent<'_>| {
+                prompt_top_logits.push(event.top_logits.to_vec());
+                tap_rows.push(DecodeTapRow {
+                    id: prompt.id.clone(),
+                    step: event.step,
+                    token_id: event.token_id,
+                    top_logits: event.top_logits.to_vec(),
+                });
+            };
+            let tokens = if let Some(config) = &constraint_config {
+                let mut constraint = json_constraint::JsonConstraint::new(
+                    config.vocabulary.clone(),
+                    config.schema.as_ref(),
+                    &stop_tokens,
+                );
+                session.generate_constrained(
+                    args.max_new_tokens,
+                    &stop_tokens,
+                    args.decode_top_k,
+                    &mut constraint,
+                    &mut tap,
+                )?
+            } else {
+                session.generate(
+                    args.max_new_tokens,
+                    &stop_tokens,
+                    args.decode_top_k,
+                    &mut tap,
+                )?
+            };
             decode_wall_s += decode_started.elapsed().as_secs_f64();
             decode_stages.accumulate(session.stage_timings().delta(after_prefill));
             sample_wall_s += session.sample_wall_s();
+            constraint_wall_s += session.constraint_wall_s();
             generated_tokens += tokens.len();
+            let text = constraint_config
+                .as_ref()
+                .map(|config| {
+                    validate_constrained_output(&tokenizer, &tokens, config.schema.as_ref())
+                })
+                .transpose()?;
+            if text.is_some() {
+                constraint_valid_prompts += 1;
+            }
 
             let mut exact_reference = None;
             let mut prompt_near_ties = Vec::new();
@@ -994,6 +1083,7 @@ fn run_decode_cli(args: &Args, started: Instant) -> Result<()> {
                 id: prompt.id.clone(),
                 prompt_tokens: prompt_ids.len(),
                 tokens,
+                text,
                 exact_reference,
                 accepted_near_ties: prompt_near_ties,
             });
@@ -1011,7 +1101,11 @@ fn run_decode_cli(args: &Args, started: Instant) -> Result<()> {
         );
         let result = DecodeServingResult {
             lane: "owned-rt-metal",
-            workload: "qwen3-greedy-raw-completion",
+            workload: if constraint_config.is_some() {
+                "qwen3-greedy-json"
+            } else {
+                "qwen3-greedy-raw-completion"
+            },
             model: args
                 .model_label
                 .clone()
@@ -1029,6 +1123,19 @@ fn run_decode_cli(args: &Args, started: Instant) -> Result<()> {
             prefill_stages,
             decode_stages,
             sample_wall_s,
+            constraint: constraint_config.as_ref().map(|config| {
+                if config.schema.is_some() {
+                    "json-schema"
+                } else {
+                    "json"
+                }
+            }),
+            constraint_vocab_size: constraint_config
+                .as_ref()
+                .map(|config| config.vocabulary.len()),
+            constraint_valid_prompts: constraint_config.as_ref().map(|_| constraint_valid_prompts),
+            constraint_wall_s,
+            constraint_ms_per_token: 1_000.0 * constraint_wall_s / generated_tokens.max(1) as f64,
             kv_update_path: decoder.kv_update_path(),
             weight_feed_path: decoder.weight_feed_path(),
             optimization_level: decoder.optimization_level(),
@@ -1122,12 +1229,13 @@ fn run_lfm2_decode_cli(args: &Args, started: Instant) -> Result<()> {
     let provider_name = provider.name();
     let mut decoder =
         lfm2_decode::Decoder::new(&model, provider.as_mut(), args.decode_cache_bucket)?;
-    let cold_load_s = started.elapsed().as_secs_f64();
     let stop_tokens = model
         .generation_stop_ids()
         .iter()
         .copied()
         .collect::<HashSet<_>>();
+    let constraint_config = load_json_constraint_config(args, &tokenizer)?;
+    let cold_load_s = started.elapsed().as_secs_f64();
     let allow_f16_drift =
         matches!(args.device, DeviceArg::Metal) && matches!(args.dtype, Precision::F16);
     let mut tap_rows = Vec::new();
@@ -1135,6 +1243,9 @@ fn run_lfm2_decode_cli(args: &Args, started: Instant) -> Result<()> {
     let mut results = Vec::with_capacity(prompts.len());
     let mut prefill_wall_s = 0.0;
     let mut decode_wall_s = 0.0;
+    let mut sample_wall_s = 0.0;
+    let mut constraint_wall_s = 0.0;
+    let mut constraint_valid_prompts = 0usize;
     let mut prefill_tokens = 0usize;
     let mut generated_tokens = 0usize;
     let mut exact_prompts = 0usize;
@@ -1200,27 +1311,65 @@ fn run_lfm2_decode_cli(args: &Args, started: Instant) -> Result<()> {
         prefill_wall_s += prefill_started.elapsed().as_secs_f64();
         let mut prompt_top_logits = Vec::new();
         let decode_started = Instant::now();
-        let tokens = session.generate(
-            args.max_new_tokens,
-            &stop_tokens,
-            args.decode_top_k,
-            &mut |event: TokenTapEvent<'_>| {
-                prompt_top_logits.push(event.top_logits.to_vec());
-                tap_rows.push(DecodeTapRow {
-                    id: prompt.id.clone(),
-                    step: event.step,
-                    token_id: event.token_id,
-                    top_logits: event.top_logits.to_vec(),
-                });
-            },
-        )?;
+        let mut tap = |event: TokenTapEvent<'_>| {
+            prompt_top_logits.push(event.top_logits.to_vec());
+            tap_rows.push(DecodeTapRow {
+                id: prompt.id.clone(),
+                step: event.step,
+                token_id: event.token_id,
+                top_logits: event.top_logits.to_vec(),
+            });
+        };
+        let tokens = if let Some(config) = &constraint_config {
+            let mut constraint = json_constraint::JsonConstraint::new(
+                config.vocabulary.clone(),
+                config.schema.as_ref(),
+                &stop_tokens,
+            );
+            session.generate_constrained(
+                args.max_new_tokens,
+                &stop_tokens,
+                args.decode_top_k,
+                &mut constraint,
+                &mut tap,
+            )?
+        } else {
+            session.generate(
+                args.max_new_tokens,
+                &stop_tokens,
+                args.decode_top_k,
+                &mut tap,
+            )?
+        };
         decode_wall_s += decode_started.elapsed().as_secs_f64();
+        sample_wall_s += session.sample_wall_s();
+        constraint_wall_s += session.constraint_wall_s();
         generated_tokens += tokens.len();
         drop(session);
+        let text = constraint_config
+            .as_ref()
+            .map(|config| validate_constrained_output(&tokenizer, &tokens, config.schema.as_ref()))
+            .transpose()?;
+        if text.is_some() {
+            constraint_valid_prompts += 1;
+        }
 
         if args.verify_decode_cache {
-            let reprefilled =
-                decoder.full_reprefill_tokens(&prompt_ids, args.max_new_tokens, &stop_tokens)?;
+            let reprefilled = if let Some(config) = &constraint_config {
+                let mut constraint = json_constraint::JsonConstraint::new(
+                    config.vocabulary.clone(),
+                    config.schema.as_ref(),
+                    &stop_tokens,
+                );
+                decoder.full_reprefill_tokens_constrained(
+                    &prompt_ids,
+                    args.max_new_tokens,
+                    &stop_tokens,
+                    &mut constraint,
+                )?
+            } else {
+                decoder.full_reprefill_tokens(&prompt_ids, args.max_new_tokens, &stop_tokens)?
+            };
             if reprefilled == tokens {
                 cache_verified_prompts += 1;
             } else {
@@ -1277,6 +1426,7 @@ fn run_lfm2_decode_cli(args: &Args, started: Instant) -> Result<()> {
             id: prompt.id.clone(),
             prompt_tokens: prompt_ids.len(),
             tokens,
+            text,
             exact_reference,
             accepted_near_ties: Vec::new(),
         });
@@ -1291,7 +1441,11 @@ fn run_lfm2_decode_cli(args: &Args, started: Instant) -> Result<()> {
     let weight_count = decoder.weight_count();
     let result = DecodeServingResult {
         lane: provider_name,
-        workload: "lfm2-greedy-raw-completion",
+        workload: if constraint_config.is_some() {
+            "lfm2-greedy-json"
+        } else {
+            "lfm2-greedy-raw-completion"
+        },
         model: args
             .model_label
             .clone()
@@ -1308,7 +1462,20 @@ fn run_lfm2_decode_cli(args: &Args, started: Instant) -> Result<()> {
         load_stages: qwen3_decode::DecodeStageTimings::default(),
         prefill_stages: qwen3_decode::DecodeStageTimings::default(),
         decode_stages: qwen3_decode::DecodeStageTimings::default(),
-        sample_wall_s: 0.0,
+        sample_wall_s,
+        constraint: constraint_config.as_ref().map(|config| {
+            if config.schema.is_some() {
+                "json-schema"
+            } else {
+                "json"
+            }
+        }),
+        constraint_vocab_size: constraint_config
+            .as_ref()
+            .map(|config| config.vocabulary.len()),
+        constraint_valid_prompts: constraint_config.as_ref().map(|_| constraint_valid_prompts),
+        constraint_wall_s,
+        constraint_ms_per_token: 1_000.0 * constraint_wall_s / generated_tokens.max(1) as f64,
         kv_update_path: "owned-rust-hybrid-cache",
         weight_feed_path: "provider-static-rhs",
         optimization_level: 0,
