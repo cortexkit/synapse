@@ -543,7 +543,10 @@ def run_harness(workspace_arg: str, runner_arg: str, result_arg: str) -> int:
             result_payload(gate_passed, hooks_passed, [], None, workspace_commit, note)
         )
         print(f"decode campaign candidate rejected: {error}", file=sys.stderr)
-        return 0
+        # The campaign gate reads only the exit code and the numeric sample
+        # field; a zero exit here would surface as an invalid measurement
+        # instead of a rejected proposal.
+        return 3
     except Exception as error:
         note = f"Frozen master baseline: {baseline:.2f} tok/s on locked M1. Harness refused: {error}"
         writer.write(

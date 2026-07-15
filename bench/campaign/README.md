@@ -83,6 +83,11 @@ The verdict has this shape:
 
 A correctness or instrumentation failure writes empty `samples` and
 `median_tok_s: null`; no speed value can be banked from a failed candidate.
+The exit code is the machine-read verdict — the campaign gate extracts only
+the numeric `median_tok_s` and the process exit status, not the JSON booleans:
+`0` = valid measurement, `3` = candidate rejected (gate or hook failure),
+`1` = harness refused to run (environment/integrity problem), `2` = usage
+error. The JSON booleans remain as human-readable diagnostics.
 Acceptance thresholds remain campaign policy. The registration supplies a 5%
 baseline stability width and 5% control drift tolerance, plus a one-minute load
 threshold of 2.5 that makes Alfonso pause and requeue noisy work.
