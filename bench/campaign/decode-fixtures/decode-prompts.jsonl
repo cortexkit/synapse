@@ -1,0 +1,20 @@
+{"id":"completion-01","prompt":"The capital of France is"}
+{"id":"completion-02","prompt":"Complete this sequence: 1, 1, 2, 3, 5,"}
+{"id":"completion-03","prompt":"Rust ownership prevents data races because"}
+{"id":"completion-04","prompt":"A concise definition of entropy is"}
+{"id":"completion-05","prompt":"Translate to Spanish: The build passed all tests."}
+{"id":"completion-06","prompt":"Write one valid JSON object with keys name and count:"}
+{"id":"completion-07","prompt":"fn fibonacci(n: u32) -> u32 {"}
+{"id":"completion-08","prompt":"In a causal transformer, the KV cache stores"}
+{"id":"completion-09","prompt":"The opposite of 'scarce' is"}
+{"id":"completion-10","prompt":"Summarize in five words: Water freezes at zero degrees Celsius."}
+{"id":"completion-11","prompt":"Question: What is 17 * 19? Answer:"}
+{"id":"completion-12","prompt":"A haiku about a quiet server:\n"}
+{"id":"completion-13","prompt":"Linux, macOS, and Windows are examples of"}
+{"id":"completion-14","prompt":"Complete the SQL: SELECT name FROM users WHERE active ="}
+{"id":"completion-15","prompt":"If all ravens are birds and this animal is a raven, then"}
+{"id":"completion-16","prompt":"Explain why the sky appears blue in one sentence:"}
+{"id":"completion-17","prompt":"The hexadecimal representation of 255 is"}
+{"id":"completion-18","prompt":"Continue the dialogue:\nUser: Hello!\nAssistant:"}
+{"id":"completion-19","prompt":"A safe way to handle an optional Rust value is"}
+{"id":"completion-20","prompt":"Three primary colors are"}
