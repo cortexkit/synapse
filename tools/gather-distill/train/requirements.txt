@@ -1,0 +1,7 @@
+# Tokenizer audit environment. Install with: uv venv .venv && uv pip sync --python .venv/bin/python requirements.txt
+transformers==5.13.1
+tokenizers==0.22.2
+huggingface-hub==1.23.0
+jinja2==3.1.6
+sentencepiece==0.2.2
+protobuf==7.35.1

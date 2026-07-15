@@ -1,0 +1,3199 @@
+{
+  "generated_at": "2026-07-15T08:25:37.399635+00:00",
+  "method": "Direct invocation of the installed Axolotl 0.17.0 ChatTemplateStrategy used by type: chat_template datasets. The CLI import was unavailable on macOS because bitsandbytes has no Darwin package; no training was attempted.",
+  "cross_check": "Axolotl transform_message parses OpenAI function.arguments JSON strings before apply_chat_template. Its _tokenize_single_prompt initializes every label to -100, locates each turn with find_turn, unmasks only roles_to_train, and trains the assistant turn EOS/EOT when train_on_eos is turn. A generation-tag semantic mask independently rejects context-label leakage and masked assistant payload tokens.",
+  "chat_template": "train/axolotl/templates/qwen3-aft.jinja",
+  "chat_template_sha256": "e65ab8305f9c767dc82d5fb6cded0803ef58ea3237b6c7dbffe77ca4ef33104b",
+  "template_patch": "The official Qwen3 template with a real_last_index override used only during Axolotl prefix probes. Full-conversation rendering is byte-identical to the pinned tokenizer template.",
+  "model": "Qwen/Qwen3-1.7B",
+  "revision": "70d244cc86ccca08cf5af4e1e306ecf908b1ad5e",
+  "qwen36_decoder_layer_class": "Qwen3_5DecoderLayer",
+  "versions": {
+    "axolotl": "0.17.0",
+    "transformers": "5.9.0",
+    "trl": "1.5.1",
+    "peft": "0.19.1",
+    "torch": "2.13.0"
+  },
+  "config_contract": {
+    "dataset_type": "chat_template",
+    "field_messages": "messages",
+    "field_tools": "tools",
+    "roles_to_train": [
+      "assistant"
+    ],
+    "train_on_eos": "turn",
+    "sequence_len": 32768,
+    "chat_template": "jinja",
+    "chat_template_jinja": "train/axolotl/templates/qwen3-aft.jinja"
+  },
+  "samples": [
+    {
+      "row_index": 155,
+      "tokens": 16553,
+      "trained_tokens": 2441,
+      "masked_tokens": 14112,
+      "assistant_tool_calls_present": true,
+      "final_assistant_trained": true,
+      "user_and_tool_turns_masked": true,
+      "full_render_byte_equal_to_tokenizer_template": true,
+      "semantic_assistant_tokens": 2451,
+      "masked_separator_newlines": 10,
+      "turn_checks": [
+        {
+          "turn": 0,
+          "role": "system",
+          "start": 3,
+          "end_exclusive": 456,
+          "span_tokens": 453,
+          "trained_tokens": 0,
+          "masked_tokens": 453,
+          "content_excerpt": "You are a sidekick to a powerful coding agent. The agent is busy reasoning about a hard problem and sent you ahead into this repository to find the code it will need, so it does no",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 1,
+          "role": "user",
+          "start": 5717,
+          "end_exclusive": 5863,
+          "span_tokens": 146,
+          "trained_tokens": 0,
+          "masked_tokens": 146,
+          "content_excerpt": "Request:\nWhat public API or interface does the Magisk app expose for third-party modules to query root/Magisk status at runtime, and which class implements the corresponding IPC or",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 2,
+          "role": "assistant",
+          "start": 5868,
+          "end_exclusive": 5952,
+          "span_tokens": 84,
+          "trained_tokens": 84,
+          "masked_tokens": 0,
+          "content_excerpt": "I'll explore the repository to find the public API for third-party modules to query root/Magisk status.",
+          "has_tool_calls": true
+        },
+        {
+          "turn": 3,
+          "role": "tool",
+          "start": 5959,
+          "end_exclusive": 5993,
+          "span_tokens": 34,
+          "trained_tokens": 0,
+          "masked_tokens": 34,
+          "content_excerpt": "Semantic search is not enabled.\nSemantic search unavailable; lexical-only fallback returned 0 result(s). [semantic: unavailable]\nSearch status: fully degraded; partial/incomplete.",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 4,
+          "role": "tool",
+          "start": 5997,
+          "end_exclusive": 6031,
+          "span_tokens": 34,
+          "trained_tokens": 0,
+          "masked_tokens": 34,
+          "content_excerpt": "Semantic search is not enabled.\nSemantic search unavailable; lexical-only fallback returned 0 result(s). [semantic: unavailable]\nSearch status: fully degraded; partial/incomplete.",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 5,
+          "role": "assistant",
+          "start": 6037,
+          "end_exclusive": 6122,
+          "span_tokens": 85,
+          "trained_tokens": 85,
+          "masked_tokens": 0,
+          "content_excerpt": "Semantic search is unavailable. Let me use grep and glob instead.",
+          "has_tool_calls": true
+        },
+        {
+          "turn": 6,
+          "role": "tool",
+          "start": 6129,
+          "end_exclusive": 6161,
+          "span_tokens": 32,
+          "trained_tokens": 0,
+          "masked_tokens": 32,
+          "content_excerpt": "1 file matching **/*.aidl\n\napp/core/src/main/aidl/com/topjohnwu/magisk/core/utils/IRootUtils.aidl",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 7,
+          "role": "tool",
+          "start": 6165,
+          "end_exclusive": 6255,
+          "span_tokens": 90,
+          "trained_tokens": 0,
+          "masked_tokens": 90,
+          "content_excerpt": "app/stub/src/main/java/com/topjohnwu/magisk/dummy/DummyProvider.java\n3: import android.content.ContentProvider;\n8: public class DummyProvider extends ContentProvider {\n\napp/stub/sr",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 8,
+          "role": "tool",
+          "start": 6259,
+          "end_exclusive": 6307,
+          "span_tokens": 48,
+          "trained_tokens": 0,
+          "masked_tokens": 48,
+          "content_excerpt": "app/core/src/main/java/com/topjohnwu/magisk/core/base/BaseProvider.kt\n3: import android.content.ContentProvider\n11: open class BaseProvider : ContentProvider() {\n\nFound 2 match acr",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 9,
+          "role": "assistant",
+          "start": 6313,
+          "end_exclusive": 6453,
+          "span_tokens": 140,
+          "trained_tokens": 140,
+          "masked_tokens": 0,
+          "content_excerpt": "The AIDL `IRootUtils` seems internal. Let me look for the actual third-party facing API. Let me check the provider classes and search more broadly.",
+          "has_tool_calls": true
+        },
+        {
+          "turn": 10,
+          "role": "tool",
+          "start": 6460,
+          "end_exclusive": 6496,
+          "span_tokens": 36,
+          "trained_tokens": 0,
+          "masked_tokens": 36,
+          "content_excerpt": "app/core/src/main/java/com/topjohnwu/magisk/core/Provider.kt\n7: class Provider : BaseProvider() {\n\nFound 1 match across 1 file",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 11,
+          "role": "tool",
+          "start": 6500,
+          "end_exclusive": 6570,
+          "span_tokens": 70,
+          "trained_tokens": 0,
+          "masked_tokens": 70,
+          "content_excerpt": "app/core/src/main/AndroidManifest.xml\n47:         <provider\n48:             android:name=\".Provider\"\n49:             android:authorities=\"${applicationId}.provider\"\n60:         <pr",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 12,
+          "role": "tool",
+          "start": 6574,
+          "end_exclusive": 6670,
+          "span_tokens": 96,
+          "trained_tokens": 0,
+          "masked_tokens": 96,
+          "content_excerpt": " 1: // IRootUtils.aidl\n 2: package com.topjohnwu.magisk.core.utils;\n 3: \n 4: // Declare any non-default types here with import statements\n 5: \n 6: interface IRootUtils {\n 7:     an",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 13,
+          "role": "assistant",
+          "start": 6676,
+          "end_exclusive": 6820,
+          "span_tokens": 144,
+          "trained_tokens": 144,
+          "masked_tokens": 0,
+          "content_excerpt": "`IRootUtils` is an internal AIDL. Let me examine the `Provider` and `BaseProvider` classes, and the manifest around the provider.",
+          "has_tool_calls": true
+        },
+        {
+          "turn": 14,
+          "role": "tool",
+          "start": 6827,
+          "end_exclusive": 6999,
+          "span_tokens": 172,
+          "trained_tokens": 0,
+          "masked_tokens": 172,
+          "content_excerpt": " 1: package com.topjohnwu.magisk.core\n 2: \n 3: import android.os.Bundle\n 4: import com.topjohnwu.magisk.core.base.BaseProvider\n 5: import com.topjohnwu.magisk.core.su.SuCallbackHan",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 15,
+          "role": "tool",
+          "start": 7003,
+          "end_exclusive": 7288,
+          "span_tokens": 285,
+          "trained_tokens": 0,
+          "masked_tokens": 285,
+          "content_excerpt": " 1: package com.topjohnwu.magisk.core.base\n 2: \n 3: import android.content.ContentProvider\n 4: import android.content.ContentValues\n 5: import android.content.Context\n 6: import an",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 16,
+          "role": "tool",
+          "start": 7292,
+          "end_exclusive": 7607,
+          "span_tokens": 315,
+          "trained_tokens": 0,
+          "masked_tokens": 315,
+          "content_excerpt": "40:             android:foregroundServiceType=\"dataSync\" />\n41: \n42:         <service\n43:             android:name=\".JobService\"\n44:             android:exported=\"false\"\n45:       ",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 17,
+          "role": "assistant",
+          "start": 7613,
+          "end_exclusive": 7801,
+          "span_tokens": 188,
+          "trained_tokens": 188,
+          "masked_tokens": 0,
+          "content_excerpt": "The `Provider` is `exported=false` and only handles su-callback logging \u2014 not a third-party status query. The actual third-party root-status API in Magisk is historically the `IShe",
+          "has_tool_calls": true
+        },
+        {
+          "turn": 18,
+          "role": "tool",
+          "start": 7808,
+          "end_exclusive": 8353,
+          "span_tokens": 545,
+          "trained_tokens": 0,
+          "masked_tokens": 545,
+          "content_excerpt": "app/core/src/main/java/com/topjohnwu/magisk/core/utils/ShellInit.kt\n20:             Info.isRooted = true\n\napp/core/src/main/java/com/topjohnwu/magisk/core/utils/RootUtils.kt\n130:  ",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 19,
+          "role": "tool",
+          "start": 8357,
+          "end_exclusive": 8416,
+          "span_tokens": 59,
+          "trained_tokens": 0,
+          "masked_tokens": 59,
+          "content_excerpt": "11 files matching docs/**/*.md\n\ndocs/README.md\ndocs/app_changes.md\ndocs/boot.md\ndocs/build.md\ndocs/changes.md\ndocs/details.md\ndocs/faq.md\ndocs/guides.md\ndocs/install.md\ndocs/ota.md",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 20,
+          "role": "tool",
+          "start": 8420,
+          "end_exclusive": 8449,
+          "span_tokens": 29,
+          "trained_tokens": 0,
+          "masked_tokens": 29,
+          "content_excerpt": "docs/app_changes.md\n53: - Support new MagiskSU communication method (ContentProvider)\n\nFound 1 match across 1 file",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 21,
+          "role": "assistant",
+          "start": 8455,
+          "end_exclusive": 8610,
+          "span_tokens": 155,
+          "trained_tokens": 155,
+          "masked_tokens": 0,
+          "content_excerpt": "The docs mention a ContentProvider for MagiskSU communication. But the question is about third-party modules querying root/Magisk status. Let me check the docs guides for the docum",
+          "has_tool_calls": true
+        },
+        {
+          "turn": 22,
+          "role": "tool",
+          "start": 8617,
+          "end_exclusive": 8756,
+          "span_tokens": 139,
+          "trained_tokens": 0,
+          "masked_tokens": 139,
+          "content_excerpt": "docs/guides.md\n7: Every single shell script running in the context of Magisk will be executed in BusyBox's `ash` shell with standalone mode enabled. For what is relevant to 3rd par",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 23,
+          "role": "tool",
+          "start": 8760,
+          "end_exclusive": 10706,
+          "span_tokens": 1946,
+          "trained_tokens": 0,
+          "masked_tokens": 1946,
+          "content_excerpt": "scripts/util_functions.sh\n489:     bin/app_process_init bin/su /cache/su lib/libsupol.so lib64/libsupol.so \\\n492:     app/Superuser.apk app/SuperSU /cache/Superuser.apk\n\ndocs/app_c",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 24,
+          "role": "assistant",
+          "start": 10712,
+          "end_exclusive": 10889,
+          "span_tokens": 177,
+          "trained_tokens": 177,
+          "masked_tokens": 0,
+          "content_excerpt": "The question is specifically about third-party modules/apps querying root/Magisk status at runtime. In Magisk, the documented mechanism is the su request protocol and the Provider.",
+          "has_tool_calls": true
+        },
+        {
+          "turn": 25,
+          "role": "tool",
+          "start": 10896,
+          "end_exclusive": 12408,
+          "span_tokens": 1512,
+          "trained_tokens": 0,
+          "masked_tokens": 1512,
+          "content_excerpt": "  1: package com.topjohnwu.magisk.core.su\n  2: \n  3: import android.content.Context\n  4: import android.os.Bundle\n  5: import android.widget.Toast\n  6: import com.topjohnwu.magisk.",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 26,
+          "role": "tool",
+          "start": 12412,
+          "end_exclusive": 12462,
+          "span_tokens": 50,
+          "trained_tokens": 0,
+          "masked_tokens": 50,
+          "content_excerpt": "app/apk/src/main/AndroidManifest.xml\n8:             android:exported=\"true\"\n\napp/apk-ng/src/main/AndroidManifest.xml\n8:             android:exported=\"true\"\n\nFound 2 match across 2 ",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 27,
+          "role": "assistant",
+          "start": 12468,
+          "end_exclusive": 12569,
+          "span_tokens": 101,
+          "trained_tokens": 101,
+          "masked_tokens": 0,
+          "content_excerpt": "Let me look at what those exported components are in the apk manifests, and also check `SuRequestActivity` and the su-request handling path (the actual IPC that grants root to thir",
+          "has_tool_calls": true
+        },
+        {
+          "turn": 28,
+          "role": "tool",
+          "start": 12576,
+          "end_exclusive": 12934,
+          "span_tokens": 358,
+          "trained_tokens": 0,
+          "masked_tokens": 358,
+          "content_excerpt": " 1: <?xml version=\"1.0\" encoding=\"utf-8\"?>\n 2: <manifest xmlns:android=\"http://schemas.android.com/apk/res/android\"\n 3:     xmlns:tools=\"http://schemas.android.com/tools\">\n 4: \n 5:",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 29,
+          "role": "tool",
+          "start": 12938,
+          "end_exclusive": 14054,
+          "span_tokens": 1116,
+          "trained_tokens": 0,
+          "masked_tokens": 1116,
+          "content_excerpt": "app/core/src/main/java/com/topjohnwu/magisk/test/MagiskAppTest.kt\n38:     fun testSuRequest() {\n67:         // Make sure SuRequestActivity is launched\n69:         assertNotNull(\"Su",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 30,
+          "role": "user",
+          "start": 14060,
+          "end_exclusive": 14078,
+          "span_tokens": 18,
+          "trained_tokens": 0,
+          "masked_tokens": 18,
+          "content_excerpt": "you have used 20 tool calls; steer toward wrapping up \u2014 record what you have",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 31,
+          "role": "assistant",
+          "start": 14083,
+          "end_exclusive": 14332,
+          "span_tokens": 249,
+          "trained_tokens": 249,
+          "masked_tokens": 0,
+          "content_excerpt": "I have enough understanding now. The key finding: Magisk does NOT expose a public exported ContentProvider or AIDL for third-party modules to query root/Magisk status. The `Provide",
+          "has_tool_calls": true
+        },
+        {
+          "turn": 32,
+          "role": "tool",
+          "start": 14339,
+          "end_exclusive": 14812,
+          "span_tokens": 473,
+          "trained_tokens": 0,
+          "masked_tokens": 473,
+          "content_excerpt": "175: ##### Variables\n176: \n177: - `MAGISK_VER` (string): the version string of current installed Magisk (e.g. `v20.0`)\n178: - `MAGISK_VER_CODE` (int): the version code of current i",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 33,
+          "role": "tool",
+          "start": 14816,
+          "end_exclusive": 15433,
+          "span_tokens": 617,
+          "trained_tokens": 0,
+          "masked_tokens": 617,
+          "content_excerpt": " 1: package com.topjohnwu.magisk.core.su\n 2: \n 3: import android.content.Intent\n 4: import android.content.pm.PackageInfo\n 5: import android.content.pm.PackageManager\n 6: import co",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 34,
+          "role": "assistant",
+          "start": 15443,
+          "end_exclusive": 16551,
+          "span_tokens": 1108,
+          "trained_tokens": 1108,
+          "masked_tokens": 0,
+          "content_excerpt": "I have a complete picture now.\n\n```json\n{\n  \"interpretation\": \"Looked for a public API/interface (ContentProvider or AIDL/IPC) the Magisk app exposes so third-party modules/apps ca",
+          "has_tool_calls": false
+        }
+      ],
+      "rendered_prefix": "<|im_start|>system\nYou are a sidekick to a powerful coding agent. The agent is busy reasoning about a hard problem and sent you ahead into this repository to find the code it will need, so it does not burn its own turns searching.\n\nExplore the repository with the read tools until you know where the relevant code lives. You do not need to record anything while exploring \u2014 just look.\n\nHow to pick the right tool (in order):\n- Start with search \u2014 it understands concepts (\"how are peer messages deliv",
+      "rendered_suffix": "ts and apps actually use to detect Magisk\", \"why\": \"budget\", \"detail\": \"Runtime detection for native/CLI consumers likely lives under native/ (C++) rather than the app Kotlin/Java layer I focused on.\" },\n    { \"what\": \"Whether any older exported provider/permission for status queries existed and was removed\", \"why\": \"budget\", \"detail\": \"docs/app_changes.md line 53 notes a ContentProvider communication method was added for MagiskSU; deeper git/history review not performed.\" }\n  ]\n}\n```<|im_end|>\n",
+      "label_runs": [
+        {
+          "start": 0,
+          "end_exclusive": 5868,
+          "tokens": 5868,
+          "label": "MASK",
+          "decoded_excerpt": "<|im_start|>system\nYou are a sidekick to a powerful coding agent. The agent is busy reasoning about a hard problem and sent you ahead into this repository to find the code it will need, so it does not burn its own turns searching.\n\nExplore the repository with the read tools until you know where the relevant code lives. You do not need to record anything while exploring \u2014 just look.\n\nHow to pick the right tool (in order):\n- Start with search \u2014 it understands concepts (\"how are peer messages deliv",
+          "excerpt_truncated": true
+        },
+        {
+          "start": 5868,
+          "end_exclusive": 5953,
+          "tokens": 85,
+          "label": "TRAIN",
+          "decoded_excerpt": "I'll explore the repository to find the public API for third-party modules to query root/Magisk status.\n<tool_call>\n{\"name\": \"search\", \"arguments\": {\"query\": \"public API for third-party apps to query Magisk root status via content provider or IPC\"}}\n</tool_call>\n<tool_call>\n{\"name\": \"search\", \"arguments\": {\"query\": \"AIDL interface for external apps to check root status\"}}\n</tool_call><|im_end|>",
+          "excerpt_truncated": false
+        },
+        {
+          "start": 5953,
+          "end_exclusive": 6037,
+          "tokens": 84,
+          "label": "MASK",
+          "decoded_excerpt": "\n<|im_start|>user\n<tool_response>\nSemantic search is not enabled.\nSemantic search unavailable; lexical-only fallback returned 0 result(s). [semantic: unavailable]\nSearch status: fully degraded; partial/incomplete.\n</tool_response>\n<tool_response>\nSemantic search is not enabled.\nSemantic search unavailable; lexical-only fallback returned 0 result(s). [semantic: unavailable]\nSearch status: fully degraded; partial/incomplete.\n</tool_response><|im_end|>\n<|im_start|>assistant\n",
+          "excerpt_truncated": false
+        },
+        {
+          "start": 6037,
+          "end_exclusive": 6123,
+          "tokens": 86,
+          "label": "TRAIN",
+          "decoded_excerpt": "Semantic search is unavailable. Let me use grep and glob instead.\n<tool_call>\n{\"name\": \"glob\", \"arguments\": {\"pattern\": \"**/*.aidl\"}}\n</tool_call>\n<tool_call>\n{\"name\": \"grep\", \"arguments\": {\"pattern\": \"ContentProvider\", \"include\": \"*.java\"}}\n</tool_call>\n<tool_call>\n{\"name\": \"grep\", \"arguments\": {\"pattern\": \"ContentProvider\", \"include\": \"*.kt\"}}\n</tool_call><|im_end|>",
+          "excerpt_truncated": false
+        },
+        {
+          "start": 6123,
+          "end_exclusive": 6313,
+          "tokens": 190,
+          "label": "MASK",
+          "decoded_excerpt": "\n<|im_start|>user\n<tool_response>\n1 file matching **/*.aidl\n\napp/core/src/main/aidl/com/topjohnwu/magisk/core/utils/IRootUtils.aidl\n</tool_response>\n<tool_response>\napp/stub/src/main/java/com/topjohnwu/magisk/dummy/DummyProvider.java\n3: import android.content.ContentProvider;\n8: public class DummyProvider extends ContentProvider {\n\napp/stub/src/main/java/com/topjohnwu/magisk/DelegateComponentFactory.java\n9: import android.content.ContentProvider;\n61:     public ContentProvider instantiateProvide",
+          "excerpt_truncated": true
+        },
+        {
+          "start": 6313,
+          "end_exclusive": 6454,
+          "tokens": 141,
+          "label": "TRAIN",
+          "decoded_excerpt": "The AIDL `IRootUtils` seems internal. Let me look for the actual third-party facing API. Let me check the provider classes and search more broadly.\n<tool_call>\n{\"name\": \"grep\", \"arguments\": {\"pattern\": \"extends BaseProvider|: BaseProvider|BaseProvider\\\\(\"}}\n</tool_call>\n<tool_call>\n{\"name\": \"grep\", \"arguments\": {\"pattern\": \"PROVIDER|provider|Provider\", \"include\": \"*.xml\", \"path\": \"app\"}}\n</tool_call>\n<tool_call>\n{\"name\": \"read\", \"arguments\": {\"filePath\": \"app/core/src/main/aidl/com/topjohnwu/mag",
+          "excerpt_truncated": true
+        },
+        {
+          "start": 6454,
+          "end_exclusive": 6676,
+          "tokens": 222,
+          "label": "MASK",
+          "decoded_excerpt": "\n<|im_start|>user\n<tool_response>\napp/core/src/main/java/com/topjohnwu/magisk/core/Provider.kt\n7: class Provider : BaseProvider() {\n\nFound 1 match across 1 file\n</tool_response>\n<tool_response>\napp/core/src/main/AndroidManifest.xml\n47:         <provider\n48:             android:name=\".Provider\"\n49:             android:authorities=\"${applicationId}.provider\"\n60:         <provider\n61:             android:name=\"androidx.startup.InitializationProvider\"\n\nFound 5 match across 1 file\n</tool_response>\n<t",
+          "excerpt_truncated": true
+        },
+        {
+          "start": 6676,
+          "end_exclusive": 6821,
+          "tokens": 145,
+          "label": "TRAIN",
+          "decoded_excerpt": "`IRootUtils` is an internal AIDL. Let me examine the `Provider` and `BaseProvider` classes, and the manifest around the provider.\n<tool_call>\n{\"name\": \"read\", \"arguments\": {\"filePath\": \"app/core/src/main/java/com/topjohnwu/magisk/core/Provider.kt\"}}\n</tool_call>\n<tool_call>\n{\"name\": \"read\", \"arguments\": {\"filePath\": \"app/core/src/main/java/com/topjohnwu/magisk/core/base/BaseProvider.kt\"}}\n</tool_call>\n<tool_call>\n{\"name\": \"read\", \"arguments\": {\"filePath\": \"app/core/src/main/AndroidManifest.xml\",",
+          "excerpt_truncated": true
+        },
+        {
+          "start": 6821,
+          "end_exclusive": 7613,
+          "tokens": 792,
+          "label": "MASK",
+          "decoded_excerpt": "\n<|im_start|>user\n<tool_response>\n 1: package com.topjohnwu.magisk.core\n 2: \n 3: import android.os.Bundle\n 4: import com.topjohnwu.magisk.core.base.BaseProvider\n 5: import com.topjohnwu.magisk.core.su.SuCallbackHandler\n 6: \n 7: class Provider : BaseProvider() {\n 8: \n 9:     override fun call(method: String, arg: String?, extras: Bundle?): Bundle? {\n10:         return when (method) {\n11:             SuCallbackHandler.LOG, SuCallbackHandler.NOTIFY -> {\n12:                 SuCallbackHandler.run(con",
+          "excerpt_truncated": true
+        },
+        {
+          "start": 7613,
+          "end_exclusive": 7802,
+          "tokens": 189,
+          "label": "TRAIN",
+          "decoded_excerpt": "The `Provider` is `exported=false` and only handles su-callback logging \u2014 not a third-party status query. The actual third-party root-status API in Magisk is historically the `IShell`/root-request protocol used by `libsu`, or the \"install\" / root state exposed via the su daemon. Let me search for how apps query root status \u2014 likely a documented protocol under `docs/` or the `Info`/root state code.\n<tool_call>\n{\"name\": \"grep\", \"arguments\": {\"pattern\": \"MAGISK_VER|getMagisk|magiskVersion|isRooted|",
+          "excerpt_truncated": true
+        },
+        {
+          "start": 7802,
+          "end_exclusive": 8455,
+          "tokens": 653,
+          "label": "MASK",
+          "decoded_excerpt": "\n<|im_start|>user\n<tool_response>\napp/core/src/main/java/com/topjohnwu/magisk/core/utils/ShellInit.kt\n20:             Info.isRooted = true\n\napp/core/src/main/java/com/topjohnwu/magisk/core/utils/RootUtils.kt\n130:             if (!Info.isRooted)\n\napp/core/src/main/java/com/topjohnwu/magisk/core/Info.kt\n36:     var isRooted = false\n80:             isRooted -> code\n\napp/build-logic/src/main/java/Setup.kt\n186:                             \"#MAGISK_VERSION_STUB\",\n187:                             \"MAGI",
+          "excerpt_truncated": true
+        },
+        {
+          "start": 8455,
+          "end_exclusive": 8611,
+          "tokens": 156,
+          "label": "TRAIN",
+          "decoded_excerpt": "The docs mention a ContentProvider for MagiskSU communication. But the question is about third-party modules querying root/Magisk status. Let me check the docs guides for the documented interface for developers, and look at how the su request / root granting works (the exposed superuser API). Let me check `guides.md` and `details.md`.\n<tool_call>\n{\"name\": \"grep\", \"arguments\": {\"pattern\": \"provider|Provider|root request|su request|third.party|3rd.party|API|com.topjohnwu.magisk\", \"path\": \"docs/gui",
+          "excerpt_truncated": true
+        },
+        {
+          "start": 8611,
+          "end_exclusive": 10712,
+          "tokens": 2101,
+          "label": "MASK",
+          "decoded_excerpt": "\n<|im_start|>user\n<tool_response>\ndocs/guides.md\n7: Every single shell script running in the context of Magisk will be executed in BusyBox's `ash` shell with standalone mode enabled. For what is relevant to 3rd party developers, this includes all boot \u2026\n131: Zygisk is a feature of Magisk that allows advanced module developers to run code directly in every Android applications' processes before they are specialized and running. For more details about the Z\u2026\n185: - `API` (int): the API level (Andr",
+          "excerpt_truncated": true
+        },
+        {
+          "start": 10712,
+          "end_exclusive": 10890,
+          "tokens": 178,
+          "label": "TRAIN",
+          "decoded_excerpt": "The question is specifically about third-party modules/apps querying root/Magisk status at runtime. In Magisk, the documented mechanism is the su request protocol and the Provider. But let me verify whether there's an exported provider/service that third parties use. The `Provider` is `exported=false`. Let me check the su callback handler and how su requests come in (the socket/broadcast/provider protocol), and look at `SuCallbackHandler` and the su request handling which is the actual IPC expos",
+          "excerpt_truncated": true
+        },
+        {
+          "start": 10890,
+          "end_exclusive": 12468,
+          "tokens": 1578,
+          "label": "MASK",
+          "decoded_excerpt": "\n<|im_start|>user\n<tool_response>\n  1: package com.topjohnwu.magisk.core.su\n  2: \n  3: import android.content.Context\n  4: import android.os.Bundle\n  5: import android.widget.Toast\n  6: import com.topjohnwu.magisk.core.AppContext\n  7: import com.topjohnwu.magisk.core.BuildConfig\n  8: import com.topjohnwu.magisk.core.Config\n  9: import com.topjohnwu.magisk.core.R\n 10: import com.topjohnwu.magisk.core.di.ServiceLocator\n 11: import com.topjohnwu.magisk.core.ktx.getLabel\n 12: import com.topjohnwu.ma",
+          "excerpt_truncated": true
+        },
+        {
+          "start": 12468,
+          "end_exclusive": 12570,
+          "tokens": 102,
+          "label": "TRAIN",
+          "decoded_excerpt": "Let me look at what those exported components are in the apk manifests, and also check `SuRequestActivity` and the su-request handling path (the actual IPC that grants root to third-party apps).\n<tool_call>\n{\"name\": \"read\", \"arguments\": {\"filePath\": \"app/apk/src/main/AndroidManifest.xml\"}}\n</tool_call>\n<tool_call>\n{\"name\": \"grep\", \"arguments\": {\"pattern\": \"SuRequest|su/request|SuRequestActivity|REQUEST\", \"include\": \"*.kt\"}}\n</tool_call><|im_end|>",
+          "excerpt_truncated": false
+        },
+        {
+          "start": 12570,
+          "end_exclusive": 14083,
+          "tokens": 1513,
+          "label": "MASK",
+          "decoded_excerpt": "\n<|im_start|>user\n<tool_response>\n 1: <?xml version=\"1.0\" encoding=\"utf-8\"?>\n 2: <manifest xmlns:android=\"http://schemas.android.com/apk/res/android\"\n 3:     xmlns:tools=\"http://schemas.android.com/tools\">\n 4: \n 5:     <application android:localeConfig=\"@xml/locale_config\">\n 6:         <activity\n 7:             android:name=\".ui.MainActivity\"\n 8:             android:exported=\"true\"\n 9:             android:theme=\"@style/SplashTheme\">\n10:             <intent-filter>\n11:                 <action and",
+          "excerpt_truncated": true
+        },
+        {
+          "start": 14083,
+          "end_exclusive": 14333,
+          "tokens": 250,
+          "label": "TRAIN",
+          "decoded_excerpt": "I have enough understanding now. The key finding: Magisk does NOT expose a public exported ContentProvider or AIDL for third-party modules to query root/Magisk status. The `Provider` (`.provider` authority) is `exported=false` and only handles su-daemon callbacks (LOG/NOTIFY) via `call()`. The `IRootUtils` AIDL is internal (root service). `Info.isRooted` is internal app state. The su-request IPC (`SuRequestActivity`, `SuRequestHandler`) is the interface the native su daemon uses to communicate w",
+          "excerpt_truncated": true
+        },
+        {
+          "start": 14333,
+          "end_exclusive": 15443,
+          "tokens": 1110,
+          "label": "MASK",
+          "decoded_excerpt": "\n<|im_start|>user\n<tool_response>\n175: ##### Variables\n176: \n177: - `MAGISK_VER` (string): the version string of current installed Magisk (e.g. `v20.0`)\n178: - `MAGISK_VER_CODE` (int): the version code of current installed Magisk (e.g. `20000`)\n179: - `BOOTMODE` (bool): `true` if the module is being installed in the Magisk app\n180: - `MODPATH` (path): the path where your module files should be installed\n181: - `TMPDIR` (path): a place where you can temporarily store files\n182: - `ZIPFILE` (path)",
+          "excerpt_truncated": true
+        },
+        {
+          "start": 15443,
+          "end_exclusive": 16552,
+          "tokens": 1109,
+          "label": "TRAIN",
+          "decoded_excerpt": "I have a complete picture now.\n\n```json\n{\n  \"interpretation\": \"Looked for a public API/interface (ContentProvider or AIDL/IPC) the Magisk app exposes so third-party modules/apps can query root/Magisk status at runtime, and the class implementing it.\",\n  \"scope\": [\n    \"app/core/src/main/AndroidManifest.xml\",\n    \"app/core/src/main/java/com/topjohnwu/magisk/core/Provider.kt\",\n    \"app/core/src/main/java/com/topjohnwu/magisk/core/base/BaseProvider.kt\",\n    \"app/core/src/main/aidl/com/topjohnwu/mag",
+          "excerpt_truncated": true
+        },
+        {
+          "start": 16552,
+          "end_exclusive": 16553,
+          "tokens": 1,
+          "label": "MASK",
+          "decoded_excerpt": "\n",
+          "excerpt_truncated": false
+        }
+      ],
+      "token_windows": {
+        "first_assistant_tool_call": {
+          "span_start": 5868,
+          "span_end_exclusive": 5952,
+          "start_boundary": [
+            {
+              "index": 5862,
+              "token_id": 13,
+              "token": ".",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5863,
+              "token_id": 151645,
+              "token": "<|im_end|>",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5864,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5865,
+              "token_id": 151644,
+              "token": "<|im_start|>",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5866,
+              "token_id": 77091,
+              "token": "assistant",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5867,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5868,
+              "token_id": 40,
+              "token": "I",
+              "label": 40,
+              "trained": true
+            },
+            {
+              "index": 5869,
+              "token_id": 3278,
+              "token": "'ll",
+              "label": 3278,
+              "trained": true
+            },
+            {
+              "index": 5870,
+              "token_id": 13186,
+              "token": "\u0120explore",
+              "label": 13186,
+              "trained": true
+            },
+            {
+              "index": 5871,
+              "token_id": 279,
+              "token": "\u0120the",
+              "label": 279,
+              "trained": true
+            },
+            {
+              "index": 5872,
+              "token_id": 12542,
+              "token": "\u0120repository",
+              "label": 12542,
+              "trained": true
+            },
+            {
+              "index": 5873,
+              "token_id": 311,
+              "token": "\u0120to",
+              "label": 311,
+              "trained": true
+            },
+            {
+              "index": 5874,
+              "token_id": 1477,
+              "token": "\u0120find",
+              "label": 1477,
+              "trained": true
+            },
+            {
+              "index": 5875,
+              "token_id": 279,
+              "token": "\u0120the",
+              "label": 279,
+              "trained": true
+            },
+            {
+              "index": 5876,
+              "token_id": 584,
+              "token": "\u0120public",
+              "label": 584,
+              "trained": true
+            },
+            {
+              "index": 5877,
+              "token_id": 5333,
+              "token": "\u0120API",
+              "label": 5333,
+              "trained": true
+            },
+            {
+              "index": 5878,
+              "token_id": 369,
+              "token": "\u0120for",
+              "label": 369,
+              "trained": true
+            },
+            {
+              "index": 5879,
+              "token_id": 4843,
+              "token": "\u0120third",
+              "label": 4843,
+              "trained": true
+            }
+          ],
+          "end_boundary": [
+            {
+              "index": 5940,
+              "token_id": 32,
+              "token": "A",
+              "label": 32,
+              "trained": true
+            },
+            {
+              "index": 5941,
+              "token_id": 49938,
+              "token": "IDL",
+              "label": 49938,
+              "trained": true
+            },
+            {
+              "index": 5942,
+              "token_id": 3749,
+              "token": "\u0120interface",
+              "label": 3749,
+              "trained": true
+            },
+            {
+              "index": 5943,
+              "token_id": 369,
+              "token": "\u0120for",
+              "label": 369,
+              "trained": true
+            },
+            {
+              "index": 5944,
+              "token_id": 9250,
+              "token": "\u0120external",
+              "label": 9250,
+              "trained": true
+            },
+            {
+              "index": 5945,
+              "token_id": 10500,
+              "token": "\u0120apps",
+              "label": 10500,
+              "trained": true
+            },
+            {
+              "index": 5946,
+              "token_id": 311,
+              "token": "\u0120to",
+              "label": 311,
+              "trained": true
+            },
+            {
+              "index": 5947,
+              "token_id": 1779,
+              "token": "\u0120check",
+              "label": 1779,
+              "trained": true
+            },
+            {
+              "index": 5948,
+              "token_id": 3704,
+              "token": "\u0120root",
+              "label": 3704,
+              "trained": true
+            },
+            {
+              "index": 5949,
+              "token_id": 2639,
+              "token": "\u0120status",
+              "label": 2639,
+              "trained": true
+            },
+            {
+              "index": 5950,
+              "token_id": 95642,
+              "token": "\"}}\u010a",
+              "label": 95642,
+              "trained": true
+            },
+            {
+              "index": 5951,
+              "token_id": 151658,
+              "token": "</tool_call>",
+              "label": 151658,
+              "trained": true
+            },
+            {
+              "index": 5952,
+              "token_id": 151645,
+              "token": "<|im_end|>",
+              "label": 151645,
+              "trained": true
+            },
+            {
+              "index": 5953,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5954,
+              "token_id": 151644,
+              "token": "<|im_start|>",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5955,
+              "token_id": 872,
+              "token": "user",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5956,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5957,
+              "token_id": 151665,
+              "token": "<tool_response>",
+              "label": -100,
+              "trained": false
+            }
+          ],
+          "omitted_interior_tokens": 60
+        },
+        "first_tool_result": {
+          "span_start": 5959,
+          "span_end_exclusive": 5993,
+          "start_boundary": [
+            {
+              "index": 5953,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5954,
+              "token_id": 151644,
+              "token": "<|im_start|>",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5955,
+              "token_id": 872,
+              "token": "user",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5956,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5957,
+              "token_id": 151665,
+              "token": "<tool_response>",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5958,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5959,
+              "token_id": 97931,
+              "token": "Semantic",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5960,
+              "token_id": 2711,
+              "token": "\u0120search",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5961,
+              "token_id": 374,
+              "token": "\u0120is",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5962,
+              "token_id": 537,
+              "token": "\u0120not",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5963,
+              "token_id": 8970,
+              "token": "\u0120enabled",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5964,
+              "token_id": 624,
+              "token": ".\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5965,
+              "token_id": 97931,
+              "token": "Semantic",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5966,
+              "token_id": 2711,
+              "token": "\u0120search",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5967,
+              "token_id": 34987,
+              "token": "\u0120unavailable",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5968,
+              "token_id": 26,
+              "token": ";",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5969,
+              "token_id": 77586,
+              "token": "\u0120lexical",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5970,
+              "token_id": 15382,
+              "token": "-only",
+              "label": -100,
+              "trained": false
+            }
+          ],
+          "end_boundary": [
+            {
+              "index": 5981,
+              "token_id": 34987,
+              "token": "\u0120unavailable",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5982,
+              "token_id": 921,
+              "token": "]\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5983,
+              "token_id": 5890,
+              "token": "Search",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5984,
+              "token_id": 2639,
+              "token": "\u0120status",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5985,
+              "token_id": 25,
+              "token": ":",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5986,
+              "token_id": 7225,
+              "token": "\u0120fully",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5987,
+              "token_id": 90878,
+              "token": "\u0120degraded",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5988,
+              "token_id": 26,
+              "token": ";",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5989,
+              "token_id": 7130,
+              "token": "\u0120partial",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5990,
+              "token_id": 17996,
+              "token": "/in",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5991,
+              "token_id": 14737,
+              "token": "complete",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5992,
+              "token_id": 624,
+              "token": ".\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5993,
+              "token_id": 151666,
+              "token": "</tool_response>",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5994,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5995,
+              "token_id": 151665,
+              "token": "<tool_response>",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5996,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5997,
+              "token_id": 97931,
+              "token": "Semantic",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5998,
+              "token_id": 2711,
+              "token": "\u0120search",
+              "label": -100,
+              "trained": false
+            }
+          ],
+          "omitted_interior_tokens": 10
+        },
+        "final_assistant_answer": {
+          "span_start": 15443,
+          "span_end_exclusive": 16551,
+          "start_boundary": [
+            {
+              "index": 15437,
+              "token_id": 77091,
+              "token": "assistant",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 15438,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 15439,
+              "token_id": 151667,
+              "token": "<think>",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 15440,
+              "token_id": 271,
+              "token": "\u010a\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 15441,
+              "token_id": 151668,
+              "token": "</think>",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 15442,
+              "token_id": 271,
+              "token": "\u010a\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 15443,
+              "token_id": 40,
+              "token": "I",
+              "label": 40,
+              "trained": true
+            },
+            {
+              "index": 15444,
+              "token_id": 614,
+              "token": "\u0120have",
+              "label": 614,
+              "trained": true
+            },
+            {
+              "index": 15445,
+              "token_id": 264,
+              "token": "\u0120a",
+              "label": 264,
+              "trained": true
+            },
+            {
+              "index": 15446,
+              "token_id": 4583,
+              "token": "\u0120complete",
+              "label": 4583,
+              "trained": true
+            },
+            {
+              "index": 15447,
+              "token_id": 6802,
+              "token": "\u0120picture",
+              "label": 6802,
+              "trained": true
+            },
+            {
+              "index": 15448,
+              "token_id": 1431,
+              "token": "\u0120now",
+              "label": 1431,
+              "trained": true
+            },
+            {
+              "index": 15449,
+              "token_id": 382,
+              "token": ".\u010a\u010a",
+              "label": 382,
+              "trained": true
+            },
+            {
+              "index": 15450,
+              "token_id": 73594,
+              "token": "```",
+              "label": 73594,
+              "trained": true
+            },
+            {
+              "index": 15451,
+              "token_id": 2236,
+              "token": "json",
+              "label": 2236,
+              "trained": true
+            },
+            {
+              "index": 15452,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": 198,
+              "trained": true
+            },
+            {
+              "index": 15453,
+              "token_id": 515,
+              "token": "{\u010a",
+              "label": 515,
+              "trained": true
+            },
+            {
+              "index": 15454,
+              "token_id": 220,
+              "token": "\u0120",
+              "label": 220,
+              "trained": true
+            }
+          ],
+          "end_boundary": [
+            {
+              "index": 16539,
+              "token_id": 19117,
+              "token": "\u0120deeper",
+              "label": 19117,
+              "trained": true
+            },
+            {
+              "index": 16540,
+              "token_id": 16345,
+              "token": "\u0120git",
+              "label": 16345,
+              "trained": true
+            },
+            {
+              "index": 16541,
+              "token_id": 81883,
+              "token": "/history",
+              "label": 81883,
+              "trained": true
+            },
+            {
+              "index": 16542,
+              "token_id": 3395,
+              "token": "\u0120review",
+              "label": 3395,
+              "trained": true
+            },
+            {
+              "index": 16543,
+              "token_id": 537,
+              "token": "\u0120not",
+              "label": 537,
+              "trained": true
+            },
+            {
+              "index": 16544,
+              "token_id": 10660,
+              "token": "\u0120performed",
+              "label": 10660,
+              "trained": true
+            },
+            {
+              "index": 16545,
+              "token_id": 1189,
+              "token": ".\"",
+              "label": 1189,
+              "trained": true
+            },
+            {
+              "index": 16546,
+              "token_id": 456,
+              "token": "\u0120}\u010a",
+              "label": 456,
+              "trained": true
+            },
+            {
+              "index": 16547,
+              "token_id": 220,
+              "token": "\u0120",
+              "label": 220,
+              "trained": true
+            },
+            {
+              "index": 16548,
+              "token_id": 5133,
+              "token": "\u0120]\u010a",
+              "label": 5133,
+              "trained": true
+            },
+            {
+              "index": 16549,
+              "token_id": 532,
+              "token": "}\u010a",
+              "label": 532,
+              "trained": true
+            },
+            {
+              "index": 16550,
+              "token_id": 73594,
+              "token": "```",
+              "label": 73594,
+              "trained": true
+            },
+            {
+              "index": 16551,
+              "token_id": 151645,
+              "token": "<|im_end|>",
+              "label": 151645,
+              "trained": true
+            },
+            {
+              "index": 16552,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            }
+          ],
+          "omitted_interior_tokens": 1084
+        }
+      }
+    },
+    {
+      "row_index": 340,
+      "tokens": 9638,
+      "trained_tokens": 620,
+      "masked_tokens": 9018,
+      "assistant_tool_calls_present": true,
+      "final_assistant_trained": true,
+      "user_and_tool_turns_masked": true,
+      "full_render_byte_equal_to_tokenizer_template": true,
+      "semantic_assistant_tokens": 624,
+      "masked_separator_newlines": 4,
+      "turn_checks": [
+        {
+          "turn": 0,
+          "role": "system",
+          "start": 3,
+          "end_exclusive": 456,
+          "span_tokens": 453,
+          "trained_tokens": 0,
+          "masked_tokens": 453,
+          "content_excerpt": "You are a sidekick to a powerful coding agent. The agent is busy reasoning about a hard problem and sent you ahead into this repository to find the code it will need, so it does no",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 1,
+          "role": "user",
+          "start": 5717,
+          "end_exclusive": 5864,
+          "span_tokens": 147,
+          "trained_tokens": 0,
+          "masked_tokens": 147,
+          "content_excerpt": "Request:\nIf a linker error reports missing concurrency runtime symbols when building with the singlethreaded backend, which CMakeLists.txt file selects that backend and what source",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 2,
+          "role": "assistant",
+          "start": 5869,
+          "end_exclusive": 5937,
+          "span_tokens": 68,
+          "trained_tokens": 68,
+          "masked_tokens": 0,
+          "content_excerpt": "I'll search for the singlethreaded concurrency backend and its CMake configuration.",
+          "has_tool_calls": true
+        },
+        {
+          "turn": 3,
+          "role": "tool",
+          "start": 5944,
+          "end_exclusive": 5978,
+          "span_tokens": 34,
+          "trained_tokens": 0,
+          "masked_tokens": 34,
+          "content_excerpt": "Semantic search is not enabled.\nSemantic search unavailable; lexical-only fallback returned 0 result(s). [semantic: unavailable]\nSearch status: fully degraded; partial/incomplete.",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 4,
+          "role": "tool",
+          "start": 5982,
+          "end_exclusive": 6080,
+          "span_tokens": 98,
+          "trained_tokens": 0,
+          "masked_tokens": 98,
+          "content_excerpt": "stdlib/public/Concurrency/CMakeLists.txt\n50: elseif(\"${SWIFT_CONCURRENCY_GLOBAL_EXECUTOR}\" STREQUAL \"singlethreaded\" OR\n206: elseif(\"${SWIFT_CONCURRENCY_GLOBAL_EXECUTOR}\" STREQUAL ",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 5,
+          "role": "assistant",
+          "start": 6086,
+          "end_exclusive": 6128,
+          "span_tokens": 42,
+          "trained_tokens": 42,
+          "masked_tokens": 0,
+          "content_excerpt": "",
+          "has_tool_calls": true
+        },
+        {
+          "turn": 6,
+          "role": "tool",
+          "start": 6135,
+          "end_exclusive": 8665,
+          "span_tokens": 2530,
+          "trained_tokens": 0,
+          "masked_tokens": 2530,
+          "content_excerpt": " 30:     if(TARGET dispatch)\n 31:       get_target_property(dispatch_include_directories\n 32:         dispatch INTERFACE_INCLUDE_DIRECTORIES)\n 33:       if(dispatch_include_directo",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 7,
+          "role": "assistant",
+          "start": 8671,
+          "end_exclusive": 8738,
+          "span_tokens": 67,
+          "trained_tokens": 67,
+          "masked_tokens": 0,
+          "content_excerpt": "I have the key CMake file. Let me also check the stdlib/CMakeLists.txt reference at line 206.",
+          "has_tool_calls": true
+        },
+        {
+          "turn": 8,
+          "role": "tool",
+          "start": 8745,
+          "end_exclusive": 9187,
+          "span_tokens": 442,
+          "trained_tokens": 0,
+          "masked_tokens": 442,
+          "content_excerpt": "195:       ${ALL_keyword}\n196:       DEPENDS\n197:       ${name}${SWIFT_PRIMARY_VARIANT_SUFFIX}${variant})\n198:     set_target_properties(${name}${variant}\n199:       PROPERTIES\n200",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 9,
+          "role": "assistant",
+          "start": 9197,
+          "end_exclusive": 9636,
+          "span_tokens": 439,
+          "trained_tokens": 439,
+          "masked_tokens": 0,
+          "content_excerpt": "I have everything needed. The `stdlib/public/Concurrency/CMakeLists.txt` file selects the backend and defines the source lists.\n\n```json\n{\n  \"interpretation\": \"which CMakeLists.txt",
+          "has_tool_calls": false
+        }
+      ],
+      "rendered_prefix": "<|im_start|>system\nYou are a sidekick to a powerful coding agent. The agent is busy reasoning about a hard problem and sent you ahead into this repository to find the code it will need, so it does not burn its own turns searching.\n\nExplore the repository with the read tools until you know where the relevant code lives. You do not need to record anything while exploring \u2014 just look.\n\nHow to pick the right tool (in order):\n- Start with search \u2014 it understands concepts (\"how are peer messages deliv",
+      "rendered_suffix": "t\", \"startLine\": 206, \"endLine\": 222, \"why\": \"guard requiring SWIFT_STDLIB_SINGLE_THREADED_CONCURRENCY when the singlethreaded executor is selected\" }\n  ],\n  \"omissions\": [\n    { \"what\": \"definition/default of the SWIFT_CONCURRENCY_GLOBAL_EXECUTOR cache variable and where it is set per-platform\", \"why\": \"budget\", \"detail\": \"Did not trace where the executor value is defaulted (likely in a top-level config or platform preset), which determines when singlethreaded is chosen.\" }\n  ]\n}\n```<|im_end|>\n",
+      "label_runs": [
+        {
+          "start": 0,
+          "end_exclusive": 5869,
+          "tokens": 5869,
+          "label": "MASK",
+          "decoded_excerpt": "<|im_start|>system\nYou are a sidekick to a powerful coding agent. The agent is busy reasoning about a hard problem and sent you ahead into this repository to find the code it will need, so it does not burn its own turns searching.\n\nExplore the repository with the read tools until you know where the relevant code lives. You do not need to record anything while exploring \u2014 just look.\n\nHow to pick the right tool (in order):\n- Start with search \u2014 it understands concepts (\"how are peer messages deliv",
+          "excerpt_truncated": true
+        },
+        {
+          "start": 5869,
+          "end_exclusive": 5938,
+          "tokens": 69,
+          "label": "TRAIN",
+          "decoded_excerpt": "I'll search for the singlethreaded concurrency backend and its CMake configuration.\n<tool_call>\n{\"name\": \"search\", \"arguments\": {\"query\": \"singlethreaded concurrency backend\"}}\n</tool_call>\n<tool_call>\n{\"name\": \"grep\", \"arguments\": {\"pattern\": \"singlethreaded\", \"include\": \"CMakeLists.txt\"}}\n</tool_call><|im_end|>",
+          "excerpt_truncated": false
+        },
+        {
+          "start": 5938,
+          "end_exclusive": 6086,
+          "tokens": 148,
+          "label": "MASK",
+          "decoded_excerpt": "\n<|im_start|>user\n<tool_response>\nSemantic search is not enabled.\nSemantic search unavailable; lexical-only fallback returned 0 result(s). [semantic: unavailable]\nSearch status: fully degraded; partial/incomplete.\n</tool_response>\n<tool_response>\nstdlib/public/Concurrency/CMakeLists.txt\n50: elseif(\"${SWIFT_CONCURRENCY_GLOBAL_EXECUTOR}\" STREQUAL \"singlethreaded\" OR\n206: elseif(\"${SWIFT_CONCURRENCY_GLOBAL_EXECUTOR}\" STREQUAL \"singlethreaded\")\n\nstdlib/CMakeLists.txt\n206: if(\"${SWIFT_CONCURRENCY_GLO",
+          "excerpt_truncated": true
+        },
+        {
+          "start": 6086,
+          "end_exclusive": 6129,
+          "tokens": 43,
+          "label": "TRAIN",
+          "decoded_excerpt": "<tool_call>\n{\"name\": \"read\", \"arguments\": {\"filePath\": \"stdlib/public/Concurrency/CMakeLists.txt\", \"startLine\": 30, \"endLine\": 240}}\n</tool_call><|im_end|>",
+          "excerpt_truncated": false
+        },
+        {
+          "start": 6129,
+          "end_exclusive": 8671,
+          "tokens": 2542,
+          "label": "MASK",
+          "decoded_excerpt": "\n<|im_start|>user\n<tool_response>\n 30:     if(TARGET dispatch)\n 31:       get_target_property(dispatch_include_directories\n 32:         dispatch INTERFACE_INCLUDE_DIRECTORIES)\n 33:       if(dispatch_include_directories)\n 34:         list(APPEND swift_concurrency_dispatch_include_directories\n 35:           ${dispatch_include_directories})\n 36:       endif()\n 37:     endif()\n 38:     list(REMOVE_DUPLICATES swift_concurrency_dispatch_include_directories)\n 39:     foreach(directory ${swift_concurren",
+          "excerpt_truncated": true
+        },
+        {
+          "start": 8671,
+          "end_exclusive": 8739,
+          "tokens": 68,
+          "label": "TRAIN",
+          "decoded_excerpt": "I have the key CMake file. Let me also check the stdlib/CMakeLists.txt reference at line 206.\n<tool_call>\n{\"name\": \"read\", \"arguments\": {\"filePath\": \"stdlib/CMakeLists.txt\", \"startLine\": 195, \"endLine\": 225}}\n</tool_call><|im_end|>",
+          "excerpt_truncated": false
+        },
+        {
+          "start": 8739,
+          "end_exclusive": 9197,
+          "tokens": 458,
+          "label": "MASK",
+          "decoded_excerpt": "\n<|im_start|>user\n<tool_response>\n195:       ${ALL_keyword}\n196:       DEPENDS\n197:       ${name}${SWIFT_PRIMARY_VARIANT_SUFFIX}${variant})\n198:     set_target_properties(${name}${variant}\n199:       PROPERTIES\n200:       FOLDER \"Swift libraries/Aggregate\")\n201:   else()\n202:     message(WARNING \"Primary variant ${SWIFT_PRIMARY_VARIANT_SDK} is not being built, not creating ${name}${variant} alias target for it.\")\n203:   endif()\n204: endfunction()\n205: \n206: if(\"${SWIFT_CONCURRENCY_GLOBAL_EXECUTO",
+          "excerpt_truncated": true
+        },
+        {
+          "start": 9197,
+          "end_exclusive": 9637,
+          "tokens": 440,
+          "label": "TRAIN",
+          "decoded_excerpt": "I have everything needed. The `stdlib/public/Concurrency/CMakeLists.txt` file selects the backend and defines the source lists.\n\n```json\n{\n  \"interpretation\": \"which CMakeLists.txt selects the singlethreaded concurrency global executor backend and which source files it adds to the build\",\n  \"scope\": [\"stdlib/public/Concurrency/CMakeLists.txt\", \"stdlib/CMakeLists.txt\"],\n  \"snippets\": [\n    { \"path\": \"stdlib/public/Concurrency/CMakeLists.txt\", \"startLine\": 50, \"endLine\": 57, \"why\": \"singlethreaded",
+          "excerpt_truncated": true
+        },
+        {
+          "start": 9637,
+          "end_exclusive": 9638,
+          "tokens": 1,
+          "label": "MASK",
+          "decoded_excerpt": "\n",
+          "excerpt_truncated": false
+        }
+      ],
+      "token_windows": {
+        "first_assistant_tool_call": {
+          "span_start": 5869,
+          "span_end_exclusive": 5937,
+          "start_boundary": [
+            {
+              "index": 5863,
+              "token_id": 13,
+              "token": ".",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5864,
+              "token_id": 151645,
+              "token": "<|im_end|>",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5865,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5866,
+              "token_id": 151644,
+              "token": "<|im_start|>",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5867,
+              "token_id": 77091,
+              "token": "assistant",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5868,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5869,
+              "token_id": 40,
+              "token": "I",
+              "label": 40,
+              "trained": true
+            },
+            {
+              "index": 5870,
+              "token_id": 3278,
+              "token": "'ll",
+              "label": 3278,
+              "trained": true
+            },
+            {
+              "index": 5871,
+              "token_id": 2711,
+              "token": "\u0120search",
+              "label": 2711,
+              "trained": true
+            },
+            {
+              "index": 5872,
+              "token_id": 369,
+              "token": "\u0120for",
+              "label": 369,
+              "trained": true
+            },
+            {
+              "index": 5873,
+              "token_id": 279,
+              "token": "\u0120the",
+              "label": 279,
+              "trained": true
+            },
+            {
+              "index": 5874,
+              "token_id": 3175,
+              "token": "\u0120single",
+              "label": 3175,
+              "trained": true
+            },
+            {
+              "index": 5875,
+              "token_id": 4528,
+              "token": "thread",
+              "label": 4528,
+              "trained": true
+            },
+            {
+              "index": 5876,
+              "token_id": 291,
+              "token": "ed",
+              "label": 291,
+              "trained": true
+            },
+            {
+              "index": 5877,
+              "token_id": 78010,
+              "token": "\u0120concurrency",
+              "label": 78010,
+              "trained": true
+            },
+            {
+              "index": 5878,
+              "token_id": 19163,
+              "token": "\u0120backend",
+              "label": 19163,
+              "trained": true
+            },
+            {
+              "index": 5879,
+              "token_id": 323,
+              "token": "\u0120and",
+              "label": 323,
+              "trained": true
+            },
+            {
+              "index": 5880,
+              "token_id": 1181,
+              "token": "\u0120its",
+              "label": 1181,
+              "trained": true
+            }
+          ],
+          "end_boundary": [
+            {
+              "index": 5925,
+              "token_id": 291,
+              "token": "ed",
+              "label": 291,
+              "trained": true
+            },
+            {
+              "index": 5926,
+              "token_id": 497,
+              "token": "\",",
+              "label": 497,
+              "trained": true
+            },
+            {
+              "index": 5927,
+              "token_id": 330,
+              "token": "\u0120\"",
+              "label": 330,
+              "trained": true
+            },
+            {
+              "index": 5928,
+              "token_id": 997,
+              "token": "include",
+              "label": 997,
+              "trained": true
+            },
+            {
+              "index": 5929,
+              "token_id": 788,
+              "token": "\":",
+              "label": 788,
+              "trained": true
+            },
+            {
+              "index": 5930,
+              "token_id": 330,
+              "token": "\u0120\"",
+              "label": 330,
+              "trained": true
+            },
+            {
+              "index": 5931,
+              "token_id": 34,
+              "token": "C",
+              "label": 34,
+              "trained": true
+            },
+            {
+              "index": 5932,
+              "token_id": 8078,
+              "token": "Make",
+              "label": 8078,
+              "trained": true
+            },
+            {
+              "index": 5933,
+              "token_id": 37848,
+              "token": "Lists",
+              "label": 37848,
+              "trained": true
+            },
+            {
+              "index": 5934,
+              "token_id": 3909,
+              "token": ".txt",
+              "label": 3909,
+              "trained": true
+            },
+            {
+              "index": 5935,
+              "token_id": 95642,
+              "token": "\"}}\u010a",
+              "label": 95642,
+              "trained": true
+            },
+            {
+              "index": 5936,
+              "token_id": 151658,
+              "token": "</tool_call>",
+              "label": 151658,
+              "trained": true
+            },
+            {
+              "index": 5937,
+              "token_id": 151645,
+              "token": "<|im_end|>",
+              "label": 151645,
+              "trained": true
+            },
+            {
+              "index": 5938,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5939,
+              "token_id": 151644,
+              "token": "<|im_start|>",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5940,
+              "token_id": 872,
+              "token": "user",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5941,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5942,
+              "token_id": 151665,
+              "token": "<tool_response>",
+              "label": -100,
+              "trained": false
+            }
+          ],
+          "omitted_interior_tokens": 44
+        },
+        "first_tool_result": {
+          "span_start": 5944,
+          "span_end_exclusive": 5978,
+          "start_boundary": [
+            {
+              "index": 5938,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5939,
+              "token_id": 151644,
+              "token": "<|im_start|>",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5940,
+              "token_id": 872,
+              "token": "user",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5941,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5942,
+              "token_id": 151665,
+              "token": "<tool_response>",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5943,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5944,
+              "token_id": 97931,
+              "token": "Semantic",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5945,
+              "token_id": 2711,
+              "token": "\u0120search",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5946,
+              "token_id": 374,
+              "token": "\u0120is",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5947,
+              "token_id": 537,
+              "token": "\u0120not",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5948,
+              "token_id": 8970,
+              "token": "\u0120enabled",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5949,
+              "token_id": 624,
+              "token": ".\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5950,
+              "token_id": 97931,
+              "token": "Semantic",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5951,
+              "token_id": 2711,
+              "token": "\u0120search",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5952,
+              "token_id": 34987,
+              "token": "\u0120unavailable",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5953,
+              "token_id": 26,
+              "token": ";",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5954,
+              "token_id": 77586,
+              "token": "\u0120lexical",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5955,
+              "token_id": 15382,
+              "token": "-only",
+              "label": -100,
+              "trained": false
+            }
+          ],
+          "end_boundary": [
+            {
+              "index": 5966,
+              "token_id": 34987,
+              "token": "\u0120unavailable",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5967,
+              "token_id": 921,
+              "token": "]\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5968,
+              "token_id": 5890,
+              "token": "Search",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5969,
+              "token_id": 2639,
+              "token": "\u0120status",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5970,
+              "token_id": 25,
+              "token": ":",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5971,
+              "token_id": 7225,
+              "token": "\u0120fully",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5972,
+              "token_id": 90878,
+              "token": "\u0120degraded",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5973,
+              "token_id": 26,
+              "token": ";",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5974,
+              "token_id": 7130,
+              "token": "\u0120partial",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5975,
+              "token_id": 17996,
+              "token": "/in",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5976,
+              "token_id": 14737,
+              "token": "complete",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5977,
+              "token_id": 624,
+              "token": ".\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5978,
+              "token_id": 151666,
+              "token": "</tool_response>",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5979,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5980,
+              "token_id": 151665,
+              "token": "<tool_response>",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5981,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5982,
+              "token_id": 13149,
+              "token": "stdlib",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5983,
+              "token_id": 22041,
+              "token": "/public",
+              "label": -100,
+              "trained": false
+            }
+          ],
+          "omitted_interior_tokens": 10
+        },
+        "final_assistant_answer": {
+          "span_start": 9197,
+          "span_end_exclusive": 9636,
+          "start_boundary": [
+            {
+              "index": 9191,
+              "token_id": 77091,
+              "token": "assistant",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 9192,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 9193,
+              "token_id": 151667,
+              "token": "<think>",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 9194,
+              "token_id": 271,
+              "token": "\u010a\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 9195,
+              "token_id": 151668,
+              "token": "</think>",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 9196,
+              "token_id": 271,
+              "token": "\u010a\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 9197,
+              "token_id": 40,
+              "token": "I",
+              "label": 40,
+              "trained": true
+            },
+            {
+              "index": 9198,
+              "token_id": 614,
+              "token": "\u0120have",
+              "label": 614,
+              "trained": true
+            },
+            {
+              "index": 9199,
+              "token_id": 4297,
+              "token": "\u0120everything",
+              "label": 4297,
+              "trained": true
+            },
+            {
+              "index": 9200,
+              "token_id": 4362,
+              "token": "\u0120needed",
+              "label": 4362,
+              "trained": true
+            },
+            {
+              "index": 9201,
+              "token_id": 13,
+              "token": ".",
+              "label": 13,
+              "trained": true
+            },
+            {
+              "index": 9202,
+              "token_id": 576,
+              "token": "\u0120The",
+              "label": 576,
+              "trained": true
+            },
+            {
+              "index": 9203,
+              "token_id": 1565,
+              "token": "\u0120`",
+              "label": 1565,
+              "trained": true
+            },
+            {
+              "index": 9204,
+              "token_id": 13149,
+              "token": "stdlib",
+              "label": 13149,
+              "trained": true
+            },
+            {
+              "index": 9205,
+              "token_id": 22041,
+              "token": "/public",
+              "label": 22041,
+              "trained": true
+            },
+            {
+              "index": 9206,
+              "token_id": 14,
+              "token": "/",
+              "label": 14,
+              "trained": true
+            },
+            {
+              "index": 9207,
+              "token_id": 79611,
+              "token": "Concurrency",
+              "label": 79611,
+              "trained": true
+            },
+            {
+              "index": 9208,
+              "token_id": 11295,
+              "token": "/C",
+              "label": 11295,
+              "trained": true
+            }
+          ],
+          "end_boundary": [
+            {
+              "index": 9624,
+              "token_id": 979,
+              "token": "\u0120when",
+              "label": 979,
+              "trained": true
+            },
+            {
+              "index": 9625,
+              "token_id": 3175,
+              "token": "\u0120single",
+              "label": 3175,
+              "trained": true
+            },
+            {
+              "index": 9626,
+              "token_id": 4528,
+              "token": "thread",
+              "label": 4528,
+              "trained": true
+            },
+            {
+              "index": 9627,
+              "token_id": 291,
+              "token": "ed",
+              "label": 291,
+              "trained": true
+            },
+            {
+              "index": 9628,
+              "token_id": 374,
+              "token": "\u0120is",
+              "label": 374,
+              "trained": true
+            },
+            {
+              "index": 9629,
+              "token_id": 11882,
+              "token": "\u0120chosen",
+              "label": 11882,
+              "trained": true
+            },
+            {
+              "index": 9630,
+              "token_id": 1189,
+              "token": ".\"",
+              "label": 1189,
+              "trained": true
+            },
+            {
+              "index": 9631,
+              "token_id": 456,
+              "token": "\u0120}\u010a",
+              "label": 456,
+              "trained": true
+            },
+            {
+              "index": 9632,
+              "token_id": 220,
+              "token": "\u0120",
+              "label": 220,
+              "trained": true
+            },
+            {
+              "index": 9633,
+              "token_id": 5133,
+              "token": "\u0120]\u010a",
+              "label": 5133,
+              "trained": true
+            },
+            {
+              "index": 9634,
+              "token_id": 532,
+              "token": "}\u010a",
+              "label": 532,
+              "trained": true
+            },
+            {
+              "index": 9635,
+              "token_id": 73594,
+              "token": "```",
+              "label": 73594,
+              "trained": true
+            },
+            {
+              "index": 9636,
+              "token_id": 151645,
+              "token": "<|im_end|>",
+              "label": 151645,
+              "trained": true
+            },
+            {
+              "index": 9637,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            }
+          ],
+          "omitted_interior_tokens": 415
+        }
+      }
+    },
+    {
+      "row_index": 677,
+      "tokens": 9021,
+      "trained_tokens": 766,
+      "masked_tokens": 8255,
+      "assistant_tool_calls_present": true,
+      "final_assistant_trained": true,
+      "user_and_tool_turns_masked": true,
+      "full_render_byte_equal_to_tokenizer_template": true,
+      "semantic_assistant_tokens": 768,
+      "masked_separator_newlines": 2,
+      "turn_checks": [
+        {
+          "turn": 0,
+          "role": "system",
+          "start": 3,
+          "end_exclusive": 456,
+          "span_tokens": 453,
+          "trained_tokens": 0,
+          "masked_tokens": 453,
+          "content_excerpt": "You are a sidekick to a powerful coding agent. The agent is busy reasoning about a hard problem and sent you ahead into this repository to find the code it will need, so it does no",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 1,
+          "role": "user",
+          "start": 5717,
+          "end_exclusive": 5870,
+          "span_tokens": 153,
+          "trained_tokens": 0,
+          "masked_tokens": 153,
+          "content_excerpt": "Request:\nWhat input fields does .github/ISSUE_TEMPLATE/issue_template.yml require versus success_image_report.yml, and how do their YAML schemas differ (validations, dropdowns, req",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 2,
+          "role": "assistant",
+          "start": 5875,
+          "end_exclusive": 5938,
+          "span_tokens": 63,
+          "trained_tokens": 63,
+          "masked_tokens": 0,
+          "content_excerpt": "I'll examine both YAML issue template files.",
+          "has_tool_calls": true
+        },
+        {
+          "turn": 3,
+          "role": "tool",
+          "start": 5945,
+          "end_exclusive": 7173,
+          "span_tokens": 1228,
+          "trained_tokens": 0,
+          "masked_tokens": 1228,
+          "content_excerpt": "  1: name: Issue Report\n  2: description: File an issue report\n  3: title: \"[issue]: \"\n  4: assignees:\n  5:   - octocat\n  6: body:\n  7:   - type: markdown\n  8:     attributes:\n  9:",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 4,
+          "role": "tool",
+          "start": 7177,
+          "end_exclusive": 8308,
+          "span_tokens": 1131,
+          "trained_tokens": 0,
+          "masked_tokens": 1131,
+          "content_excerpt": "  1: name: Success Image Report\n  2: description: To report an image file that boot successfully in Ventoy and is not yet listed in https://www.ventoy.net/en/isolist.html\n  3: titl",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 5,
+          "role": "assistant",
+          "start": 8318,
+          "end_exclusive": 9019,
+          "span_tokens": 701,
+          "trained_tokens": 701,
+          "masked_tokens": 0,
+          "content_excerpt": "Both files are fully read. I have everything needed.\n\n```json\n{\n  \"interpretation\": \"Compared required input fields and YAML schema differences (validations, dropdowns, required fl",
+          "has_tool_calls": false
+        }
+      ],
+      "rendered_prefix": "<|im_start|>system\nYou are a sidekick to a powerful coding agent. The agent is busy reasoning about a hard problem and sent you ahead into this repository to find the code it will need, so it does not burn its own turns searching.\n\nExplore the repository with the read tools until you know where the relevant code lives. You do not need to record anything while exploring \u2014 just look.\n\nHow to pick the right tool (in order):\n- Start with search \u2014 it understands concepts (\"how are peer messages deliv",
+      "rendered_suffix": "quired), filename input (required) \u2014 filename unique here\" },\n    { \"path\": \".github/ISSUE_TEMPLATE/success_image_report.yml\", \"startLine\": 57, \"endLine\": 92, \"why\": \"checksum dropdown MD5/SHA1/SHA256/SHA512 (required), checkvalue(required), link(optional), testenv(required) \u2014 success-specific\" },\n    { \"path\": \".github/ISSUE_TEMPLATE/success_image_report.yml\", \"startLine\": 93, \"endLine\": 100, \"why\": \"details textarea, required:false, with default value\" }\n  ],\n  \"omissions\": []\n}\n```<|im_end|>\n",
+      "label_runs": [
+        {
+          "start": 0,
+          "end_exclusive": 5875,
+          "tokens": 5875,
+          "label": "MASK",
+          "decoded_excerpt": "<|im_start|>system\nYou are a sidekick to a powerful coding agent. The agent is busy reasoning about a hard problem and sent you ahead into this repository to find the code it will need, so it does not burn its own turns searching.\n\nExplore the repository with the read tools until you know where the relevant code lives. You do not need to record anything while exploring \u2014 just look.\n\nHow to pick the right tool (in order):\n- Start with search \u2014 it understands concepts (\"how are peer messages deliv",
+          "excerpt_truncated": true
+        },
+        {
+          "start": 5875,
+          "end_exclusive": 5939,
+          "tokens": 64,
+          "label": "TRAIN",
+          "decoded_excerpt": "I'll examine both YAML issue template files.\n<tool_call>\n{\"name\": \"read\", \"arguments\": {\"filePath\": \".github/ISSUE_TEMPLATE/issue_template.yml\"}}\n</tool_call>\n<tool_call>\n{\"name\": \"read\", \"arguments\": {\"filePath\": \".github/ISSUE_TEMPLATE/success_image_report.yml\"}}\n</tool_call><|im_end|>",
+          "excerpt_truncated": false
+        },
+        {
+          "start": 5939,
+          "end_exclusive": 8318,
+          "tokens": 2379,
+          "label": "MASK",
+          "decoded_excerpt": "\n<|im_start|>user\n<tool_response>\n  1: name: Issue Report\n  2: description: File an issue report\n  3: title: \"[issue]: \"\n  4: assignees:\n  5:   - octocat\n  6: body:\n  7:   - type: markdown\n  8:     attributes:\n  9:       value: |\n 10:         Thanks for taking the time to fill out this issue report!\n 11:   - type: checkboxes\n 12:     id: faq\n 13:     attributes:\n 14:       label: Official FAQ\n 15:       description: Have you checked the official FAQ at [https://www.ventoy.net/en/faq.html](https:",
+          "excerpt_truncated": true
+        },
+        {
+          "start": 8318,
+          "end_exclusive": 9020,
+          "tokens": 702,
+          "label": "TRAIN",
+          "decoded_excerpt": "Both files are fully read. I have everything needed.\n\n```json\n{\n  \"interpretation\": \"Compared required input fields and YAML schema differences (validations, dropdowns, required flags) between issue_template.yml and success_image_report.yml\",\n  \"scope\": [\".github/ISSUE_TEMPLATE/issue_template.yml\", \".github/ISSUE_TEMPLATE/success_image_report.yml\"],\n  \"snippets\": [\n    { \"path\": \".github/ISSUE_TEMPLATE/issue_template.yml\", \"startLine\": 1, \"endLine\": 6, \"why\": \"issue_template top-level metadata: ",
+          "excerpt_truncated": true
+        },
+        {
+          "start": 9020,
+          "end_exclusive": 9021,
+          "tokens": 1,
+          "label": "MASK",
+          "decoded_excerpt": "\n",
+          "excerpt_truncated": false
+        }
+      ],
+      "token_windows": {
+        "first_assistant_tool_call": {
+          "span_start": 5875,
+          "span_end_exclusive": 5938,
+          "start_boundary": [
+            {
+              "index": 5869,
+              "token_id": 13,
+              "token": ".",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5870,
+              "token_id": 151645,
+              "token": "<|im_end|>",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5871,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5872,
+              "token_id": 151644,
+              "token": "<|im_start|>",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5873,
+              "token_id": 77091,
+              "token": "assistant",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5874,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5875,
+              "token_id": 40,
+              "token": "I",
+              "label": 40,
+              "trained": true
+            },
+            {
+              "index": 5876,
+              "token_id": 3278,
+              "token": "'ll",
+              "label": 3278,
+              "trained": true
+            },
+            {
+              "index": 5877,
+              "token_id": 20961,
+              "token": "\u0120examine",
+              "label": 20961,
+              "trained": true
+            },
+            {
+              "index": 5878,
+              "token_id": 2176,
+              "token": "\u0120both",
+              "label": 2176,
+              "trained": true
+            },
+            {
+              "index": 5879,
+              "token_id": 53127,
+              "token": "\u0120YAML",
+              "label": 53127,
+              "trained": true
+            },
+            {
+              "index": 5880,
+              "token_id": 4265,
+              "token": "\u0120issue",
+              "label": 4265,
+              "trained": true
+            },
+            {
+              "index": 5881,
+              "token_id": 3811,
+              "token": "\u0120template",
+              "label": 3811,
+              "trained": true
+            },
+            {
+              "index": 5882,
+              "token_id": 3542,
+              "token": "\u0120files",
+              "label": 3542,
+              "trained": true
+            },
+            {
+              "index": 5883,
+              "token_id": 624,
+              "token": ".\u010a",
+              "label": 624,
+              "trained": true
+            },
+            {
+              "index": 5884,
+              "token_id": 151657,
+              "token": "<tool_call>",
+              "label": 151657,
+              "trained": true
+            },
+            {
+              "index": 5885,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": 198,
+              "trained": true
+            },
+            {
+              "index": 5886,
+              "token_id": 4913,
+              "token": "{\"",
+              "label": 4913,
+              "trained": true
+            }
+          ],
+          "end_boundary": [
+            {
+              "index": 5926,
+              "token_id": 5204,
+              "token": "github",
+              "label": 5204,
+              "trained": true
+            },
+            {
+              "index": 5927,
+              "token_id": 14,
+              "token": "/",
+              "label": 14,
+              "trained": true
+            },
+            {
+              "index": 5928,
+              "token_id": 30849,
+              "token": "ISS",
+              "label": 30849,
+              "trained": true
+            },
+            {
+              "index": 5929,
+              "token_id": 2230,
+              "token": "UE",
+              "label": 2230,
+              "trained": true
+            },
+            {
+              "index": 5930,
+              "token_id": 34786,
+              "token": "_TEMPLATE",
+              "label": 34786,
+              "trained": true
+            },
+            {
+              "index": 5931,
+              "token_id": 2687,
+              "token": "/s",
+              "label": 2687,
+              "trained": true
+            },
+            {
+              "index": 5932,
+              "token_id": 2557,
+              "token": "uccess",
+              "label": 2557,
+              "trained": true
+            },
+            {
+              "index": 5933,
+              "token_id": 4954,
+              "token": "_image",
+              "label": 4954,
+              "trained": true
+            },
+            {
+              "index": 5934,
+              "token_id": 14813,
+              "token": "_report",
+              "label": 14813,
+              "trained": true
+            },
+            {
+              "index": 5935,
+              "token_id": 33936,
+              "token": ".yml",
+              "label": 33936,
+              "trained": true
+            },
+            {
+              "index": 5936,
+              "token_id": 95642,
+              "token": "\"}}\u010a",
+              "label": 95642,
+              "trained": true
+            },
+            {
+              "index": 5937,
+              "token_id": 151658,
+              "token": "</tool_call>",
+              "label": 151658,
+              "trained": true
+            },
+            {
+              "index": 5938,
+              "token_id": 151645,
+              "token": "<|im_end|>",
+              "label": 151645,
+              "trained": true
+            },
+            {
+              "index": 5939,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5940,
+              "token_id": 151644,
+              "token": "<|im_start|>",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5941,
+              "token_id": 872,
+              "token": "user",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5942,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5943,
+              "token_id": 151665,
+              "token": "<tool_response>",
+              "label": -100,
+              "trained": false
+            }
+          ],
+          "omitted_interior_tokens": 39
+        },
+        "first_tool_result": {
+          "span_start": 5945,
+          "span_end_exclusive": 7173,
+          "start_boundary": [
+            {
+              "index": 5939,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5940,
+              "token_id": 151644,
+              "token": "<|im_start|>",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5941,
+              "token_id": 872,
+              "token": "user",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5942,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5943,
+              "token_id": 151665,
+              "token": "<tool_response>",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5944,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5945,
+              "token_id": 220,
+              "token": "\u0120",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5946,
+              "token_id": 220,
+              "token": "\u0120",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5947,
+              "token_id": 16,
+              "token": "1",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5948,
+              "token_id": 25,
+              "token": ":",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5949,
+              "token_id": 829,
+              "token": "\u0120name",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5950,
+              "token_id": 25,
+              "token": ":",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5951,
+              "token_id": 25226,
+              "token": "\u0120Issue",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5952,
+              "token_id": 8259,
+              "token": "\u0120Report",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5953,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5954,
+              "token_id": 220,
+              "token": "\u0120",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5955,
+              "token_id": 220,
+              "token": "\u0120",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 5956,
+              "token_id": 17,
+              "token": "2",
+              "label": -100,
+              "trained": false
+            }
+          ],
+          "end_boundary": [
+            {
+              "index": 7161,
+              "token_id": 24,
+              "token": "9",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 7162,
+              "token_id": 25,
+              "token": ":",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 7163,
+              "token_id": 981,
+              "token": "\u0120\u0120\u0120\u0120\u0120\u0120",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 7164,
+              "token_id": 2567,
+              "token": "\u0120required",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 7165,
+              "token_id": 25,
+              "token": ":",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 7166,
+              "token_id": 830,
+              "token": "\u0120true",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 7167,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 7168,
+              "token_id": 16,
+              "token": "1",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 7169,
+              "token_id": 16,
+              "token": "1",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 7170,
+              "token_id": 15,
+              "token": "0",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 7171,
+              "token_id": 25,
+              "token": ":",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 7172,
+              "token_id": 4710,
+              "token": "\u0120\u010a\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 7173,
+              "token_id": 151666,
+              "token": "</tool_response>",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 7174,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 7175,
+              "token_id": 151665,
+              "token": "<tool_response>",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 7176,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 7177,
+              "token_id": 220,
+              "token": "\u0120",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 7178,
+              "token_id": 220,
+              "token": "\u0120",
+              "label": -100,
+              "trained": false
+            }
+          ],
+          "omitted_interior_tokens": 1204
+        },
+        "final_assistant_answer": {
+          "span_start": 8318,
+          "span_end_exclusive": 9019,
+          "start_boundary": [
+            {
+              "index": 8312,
+              "token_id": 77091,
+              "token": "assistant",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 8313,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 8314,
+              "token_id": 151667,
+              "token": "<think>",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 8315,
+              "token_id": 271,
+              "token": "\u010a\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 8316,
+              "token_id": 151668,
+              "token": "</think>",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 8317,
+              "token_id": 271,
+              "token": "\u010a\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 8318,
+              "token_id": 20629,
+              "token": "Both",
+              "label": 20629,
+              "trained": true
+            },
+            {
+              "index": 8319,
+              "token_id": 3542,
+              "token": "\u0120files",
+              "label": 3542,
+              "trained": true
+            },
+            {
+              "index": 8320,
+              "token_id": 525,
+              "token": "\u0120are",
+              "label": 525,
+              "trained": true
+            },
+            {
+              "index": 8321,
+              "token_id": 7225,
+              "token": "\u0120fully",
+              "label": 7225,
+              "trained": true
+            },
+            {
+              "index": 8322,
+              "token_id": 1349,
+              "token": "\u0120read",
+              "label": 1349,
+              "trained": true
+            },
+            {
+              "index": 8323,
+              "token_id": 13,
+              "token": ".",
+              "label": 13,
+              "trained": true
+            },
+            {
+              "index": 8324,
+              "token_id": 358,
+              "token": "\u0120I",
+              "label": 358,
+              "trained": true
+            },
+            {
+              "index": 8325,
+              "token_id": 614,
+              "token": "\u0120have",
+              "label": 614,
+              "trained": true
+            },
+            {
+              "index": 8326,
+              "token_id": 4297,
+              "token": "\u0120everything",
+              "label": 4297,
+              "trained": true
+            },
+            {
+              "index": 8327,
+              "token_id": 4362,
+              "token": "\u0120needed",
+              "label": 4362,
+              "trained": true
+            },
+            {
+              "index": 8328,
+              "token_id": 382,
+              "token": ".\u010a\u010a",
+              "label": 382,
+              "trained": true
+            },
+            {
+              "index": 8329,
+              "token_id": 73594,
+              "token": "```",
+              "label": 73594,
+              "trained": true
+            }
+          ],
+          "end_boundary": [
+            {
+              "index": 9007,
+              "token_id": 1,
+              "token": "\"",
+              "label": 1,
+              "trained": true
+            },
+            {
+              "index": 9008,
+              "token_id": 456,
+              "token": "\u0120}\u010a",
+              "label": 456,
+              "trained": true
+            },
+            {
+              "index": 9009,
+              "token_id": 220,
+              "token": "\u0120",
+              "label": 220,
+              "trained": true
+            },
+            {
+              "index": 9010,
+              "token_id": 3211,
+              "token": "\u0120],\u010a",
+              "label": 3211,
+              "trained": true
+            },
+            {
+              "index": 9011,
+              "token_id": 220,
+              "token": "\u0120",
+              "label": 220,
+              "trained": true
+            },
+            {
+              "index": 9012,
+              "token_id": 330,
+              "token": "\u0120\"",
+              "label": 330,
+              "trained": true
+            },
+            {
+              "index": 9013,
+              "token_id": 316,
+              "token": "om",
+              "label": 316,
+              "trained": true
+            },
+            {
+              "index": 9014,
+              "token_id": 16528,
+              "token": "issions",
+              "label": 16528,
+              "trained": true
+            },
+            {
+              "index": 9015,
+              "token_id": 788,
+              "token": "\":",
+              "label": 788,
+              "trained": true
+            },
+            {
+              "index": 9016,
+              "token_id": 4167,
+              "token": "\u0120[]\u010a",
+              "label": 4167,
+              "trained": true
+            },
+            {
+              "index": 9017,
+              "token_id": 532,
+              "token": "}\u010a",
+              "label": 532,
+              "trained": true
+            },
+            {
+              "index": 9018,
+              "token_id": 73594,
+              "token": "```",
+              "label": 73594,
+              "trained": true
+            },
+            {
+              "index": 9019,
+              "token_id": 151645,
+              "token": "<|im_end|>",
+              "label": 151645,
+              "trained": true
+            },
+            {
+              "index": 9020,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            }
+          ],
+          "omitted_interior_tokens": 677
+        }
+      }
+    }
+  ],
+  "passed": true
+}

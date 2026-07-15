@@ -4,3 +4,10 @@ data/
 status.json
 bin/
 node_modules/
+# Rendered training data is reproducible and remains local.
+train/sft-dataset.jsonl
+train/.venv/
+train/.venv-axolotl/
+train/prepared/
+train/outputs/
+train/__pycache__/

@@ -1,0 +1,1283 @@
+{
+  "generated_at": "2026-07-15T08:25:31.124844+00:00",
+  "dataset": "train/sft-dataset.jsonl",
+  "dataset_sha256": "4a5a7d14c9137f21e2f2714e14f10921668bc1aa3e5ca1b9adb5f49c334e5e1d",
+  "rows": 1884,
+  "transformers_version": "5.13.1",
+  "percentile_method": "nearest-rank; rank=max(1, ceil(p*N))",
+  "truncation": "disabled",
+  "tools_included": true,
+  "models": [
+    {
+      "label": "Qwen3 1.7B",
+      "repo_id": "Qwen/Qwen3-1.7B",
+      "revision": "70d244cc86ccca08cf5af4e1e306ecf908b1ad5e",
+      "argument_mode": "openai_string",
+      "instrumentation": "qwen",
+      "resolved": true,
+      "tokenizer_class": "Qwen2Tokenizer",
+      "config_class": "Qwen3Config",
+      "model_type": "qwen3",
+      "architectures": [
+        "Qwen3ForCausalLM"
+      ],
+      "chat_template_sha256": "a55ee1b1660128b7098723e0abcd92caa0788061051c62d51cbe87d9cf1974d8",
+      "rows": 1884,
+      "raw_openai_argument_strings": {
+        "supported": true,
+        "error": null
+      },
+      "hf_argument_objects_parsed": 0,
+      "argument_adapter_note": "No adapter needed; the official template accepts OpenAI JSON-string arguments.",
+      "total_tokens": {
+        "p50": 13802,
+        "p90": 21399,
+        "p95": 24759,
+        "p99": 32431,
+        "max": 108036,
+        "sum": 27677934
+      },
+      "loss_bearing_assistant_tokens": {
+        "p50": 1372,
+        "p90": 2243,
+        "p95": 2468,
+        "p99": 3009,
+        "max": 4572,
+        "sum": 2703078
+      },
+      "masked_context_tokens": {
+        "p50": 12290,
+        "p90": 19412,
+        "p95": 22584,
+        "p99": 30108,
+        "max": 106335,
+        "sum": 24974856
+      },
+      "aggregate_loss_share": 0.09766184137876766,
+      "over_32768": 17,
+      "over_32768_rate": 0.009023354564755838,
+      "over_40960": 6,
+      "over_40960_rate": 0.0031847133757961785,
+      "overflow_records": [
+        {
+          "row_index": 49,
+          "repo_full": "anoma/anoma",
+          "request": "Trace the full path of a transaction from intent submission through the intent pool, mempool, executor, and resource machine to final storage commit\u2014which module boundaries does the data cross and what transformations occur at each?",
+          "tokens": 42597,
+          "assistant_tokens": 2535,
+          "context_tokens": 40062,
+          "assistant_messages": 12,
+          "disposition": "split",
+          "reason": "Split only at complete assistant-tool transaction boundaries; never cut a tool call from its results."
+        },
+        {
+          "row_index": 174,
+          "repo_full": "NousResearch/hermes-agent",
+          "request": "How should a developer call the agent's public API to run a single-turn completion versus a multi-turn conversation, based on the exposed methods/classes?",
+          "tokens": 108036,
+          "assistant_tokens": 1701,
+          "context_tokens": 106335,
+          "assistant_messages": 11,
+          "disposition": "split",
+          "reason": "Split only at complete assistant-tool transaction boundaries; never cut a tool call from its results."
+        },
+        {
+          "row_index": 328,
+          "repo_full": "ultraworkers/claw-code",
+          "request": "Which public functions or CLI subcommands are exposed for consumers of this crate/binary, and what arguments do they require?",
+          "tokens": 40391,
+          "assistant_tokens": 2164,
+          "context_tokens": 38227,
+          "assistant_messages": 12,
+          "disposition": "longer-context variant",
+          "reason": "Fits 40,960 tokens without truncation but not the 32,768-token ladder configs."
+        },
+        {
+          "row_index": 356,
+          "repo_full": "openclaw/openclaw",
+          "request": "Which of the two harness implementations (`test-review-harness.py` or `test-review-harness.ps1`) is actually invoked by the `autoreview` skill's primary script, and under what platform condition is that choice made?",
+          "tokens": 36571,
+          "assistant_tokens": 1308,
+          "context_tokens": 35263,
+          "assistant_messages": 7,
+          "disposition": "longer-context variant",
+          "reason": "Fits 40,960 tokens without truncation but not the 32,768-token ladder configs."
+        },
+        {
+          "row_index": 365,
+          "repo_full": "openclaw/openclaw",
+          "request": "In `.agents/skills/autoreview/scripts/autoreview`, what happens if the underlying review harness process exits with a non-zero status \u2014 does the script propagate the failure or swallow it?",
+          "tokens": 36332,
+          "assistant_tokens": 2249,
+          "context_tokens": 34083,
+          "assistant_messages": 19,
+          "disposition": "longer-context variant",
+          "reason": "Fits 40,960 tokens without truncation but not the 32,768-token ladder configs."
+        },
+        {
+          "row_index": 387,
+          "repo_full": "NousResearch/hermes-agent",
+          "request": "What CLI entry point or command dispatches user prompts into the agent, and what argument parsing library or pattern does it use?",
+          "tokens": 61604,
+          "assistant_tokens": 2178,
+          "context_tokens": 59426,
+          "assistant_messages": 14,
+          "disposition": "split",
+          "reason": "Split only at complete assistant-tool transaction boundaries; never cut a tool call from its results."
+        },
+        {
+          "row_index": 425,
+          "repo_full": "openclaw/openclaw",
+          "request": "Does the `autoreview` script call the `agent-transcript` script directly, or is there an intermediate module/skill that connects the two?",
+          "tokens": 36952,
+          "assistant_tokens": 1132,
+          "context_tokens": 35820,
+          "assistant_messages": 8,
+          "disposition": "longer-context variant",
+          "reason": "Fits 40,960 tokens without truncation but not the 32,768-token ladder configs."
+        },
+        {
+          "row_index": 914,
+          "repo_full": "anomalyco/opencode",
+          "request": "When the LLM response contains a tool call, trace the code path from response parsing through tool dispatch to the actual shell or file-system execution, noting each module boundary crossed.",
+          "tokens": 33319,
+          "assistant_tokens": 2355,
+          "context_tokens": 30964,
+          "assistant_messages": 16,
+          "disposition": "longer-context variant",
+          "reason": "Fits 40,960 tokens without truncation but not the 32,768-token ladder configs."
+        },
+        {
+          "row_index": 929,
+          "repo_full": "redis/redis",
+          "request": "How does a module author invoke RedisModule_BlockClient and what callback signatures must be supplied, based on the implementation in module.c?",
+          "tokens": 32891,
+          "assistant_tokens": 1110,
+          "context_tokens": 31781,
+          "assistant_messages": 8,
+          "disposition": "longer-context variant",
+          "reason": "Fits 40,960 tokens without truncation but not the 32,768-token ladder configs."
+        },
+        {
+          "row_index": 983,
+          "repo_full": "microsoft/PowerToys",
+          "request": "Which unit or integration tests exist for the Keyboard Manager's key remapping engine, and what edge cases (e.g., conflicting shortcuts) do they explicitly cover?",
+          "tokens": 44807,
+          "assistant_tokens": 3407,
+          "context_tokens": 41400,
+          "assistant_messages": 19,
+          "disposition": "split",
+          "reason": "Split only at complete assistant-tool transaction boundaries; never cut a tool call from its results."
+        },
+        {
+          "row_index": 1457,
+          "repo_full": "ultraworkers/claw-code",
+          "request": "If a user invokes the CLI with malformed or missing configuration, what is the exact code path from input parsing to the error message printed to stderr?",
+          "tokens": 43880,
+          "assistant_tokens": 2571,
+          "context_tokens": 41309,
+          "assistant_messages": 16,
+          "disposition": "split",
+          "reason": "Split only at complete assistant-tool transaction boundaries; never cut a tool call from its results."
+        },
+        {
+          "row_index": 1467,
+          "repo_full": "ultraworkers/claw-code",
+          "request": "Is there logic duplicated between the CLI argument handling and any config-file loading code that could be unified into a single settings-resolution function before a refactor?",
+          "tokens": 41179,
+          "assistant_tokens": 2332,
+          "context_tokens": 38847,
+          "assistant_messages": 15,
+          "disposition": "split",
+          "reason": "Split only at complete assistant-tool transaction boundaries; never cut a tool call from its results."
+        },
+        {
+          "row_index": 1540,
+          "repo_full": "anomalyco/opencode",
+          "request": "What is the public API surface exposed by opencode's HTTP/server mode, and which module defines the route handlers for creating a session and posting a new message to it?",
+          "tokens": 34844,
+          "assistant_tokens": 2059,
+          "context_tokens": 32785,
+          "assistant_messages": 11,
+          "disposition": "longer-context variant",
+          "reason": "Fits 40,960 tokens without truncation but not the 32,768-token ladder configs."
+        },
+        {
+          "row_index": 1570,
+          "repo_full": "openclaw/openclaw",
+          "request": "Does `.agents/skills/autoreview/scripts/autoreview` (or its test suite) make any assumptions about the current working directory or git repository root, and what happens if it is invoked from a subdirectory of the repo?",
+          "tokens": 37221,
+          "assistant_tokens": 2650,
+          "context_tokens": 34571,
+          "assistant_messages": 22,
+          "disposition": "longer-context variant",
+          "reason": "Fits 40,960 tokens without truncation but not the 32,768-token ladder configs."
+        },
+        {
+          "row_index": 1758,
+          "repo_full": "NousResearch/hermes-agent",
+          "request": "Trace how a configuration value defined in `.env.example` flows from process startup, through whatever config-loading module parses it, into the agent's initialization/constructor arguments.",
+          "tokens": 34518,
+          "assistant_tokens": 2543,
+          "context_tokens": 31975,
+          "assistant_messages": 14,
+          "disposition": "longer-context variant",
+          "reason": "Fits 40,960 tokens without truncation but not the 32,768-token ladder configs."
+        },
+        {
+          "row_index": 1792,
+          "repo_full": "ultraworkers/claw-code",
+          "request": "Which Rust module defines the crate's error type(s), and how do functions across the codebase propagate errors up to main() \u2014 via `?`, custom `From` impls, or manual matching?",
+          "tokens": 35307,
+          "assistant_tokens": 2025,
+          "context_tokens": 33282,
+          "assistant_messages": 10,
+          "disposition": "longer-context variant",
+          "reason": "Fits 40,960 tokens without truncation but not the 32,768-token ladder configs."
+        },
+        {
+          "row_index": 1880,
+          "repo_full": "denoland/deno",
+          "request": "Which structs and call sites in cli/args depend on the exact field layout of the CLI's Flags/CliOptions struct, such that adding or removing a field would require updating them?",
+          "tokens": 34995,
+          "assistant_tokens": 2703,
+          "context_tokens": 32292,
+          "assistant_messages": 11,
+          "disposition": "longer-context variant",
+          "reason": "Fits 40,960 tokens without truncation but not the 32,768-token ladder configs."
+        }
+      ],
+      "render_checks": [
+        {
+          "row_index": 155,
+          "render_sha256": "18701bfb6757daaa14aea3a3c6329b601590b840922f2360c1434b4c3f550943",
+          "characters": 63759,
+          "tokens": 16508,
+          "assistant_tokens": 2406,
+          "context_tokens": 14102,
+          "render_prefix": "<|im_start|>system\nYou are a sidekick to a powerful coding agent. The agent is busy reasoning about a hard problem and sent you ahead into this repository to find the code it will need, so it does not burn its own turns searching.\n\nExplore ",
+          "render_suffix": "ssion for status queries existed and was removed\", \"why\": \"budget\", \"detail\": \"docs/app_changes.md line 53 notes a ContentProvider communication method was added for MagiskSU; deeper git/history review not performed.\" }\n  ]\n}\n```<|im_end|>\n",
+          "instrumented_render_byte_identical": true
+        },
+        {
+          "row_index": 340,
+          "render_sha256": "66b89a897a62c8f55e450367e2dae10fc113058b96dca5b62bc599507a1ac110",
+          "characters": 36298,
+          "tokens": 9624,
+          "assistant_tokens": 610,
+          "context_tokens": 9014,
+          "render_prefix": "<|im_start|>system\nYou are a sidekick to a powerful coding agent. The agent is busy reasoning about a hard problem and sent you ahead into this repository to find the code it will need, so it does not burn its own turns searching.\n\nExplore ",
+          "render_suffix": "le and where it is set per-platform\", \"why\": \"budget\", \"detail\": \"Did not trace where the executor value is defaulted (likely in a top-level config or platform preset), which determines when singlethreaded is chosen.\" }\n  ]\n}\n```<|im_end|>\n",
+          "instrumented_render_byte_identical": true
+        },
+        {
+          "row_index": 677,
+          "render_sha256": "7e93a8063a389bf250a9be6e6bc818d4448741a61e07e24e86447125f48c65f0",
+          "characters": 34359,
+          "tokens": 9021,
+          "assistant_tokens": 768,
+          "context_tokens": 8253,
+          "render_prefix": "<|im_start|>system\nYou are a sidekick to a powerful coding agent. The agent is busy reasoning about a hard problem and sent you ahead into this repository to find the code it will need, so it does not burn its own turns searching.\n\nExplore ",
+          "render_suffix": "stenv(required) \u2014 success-specific\" },\n    { \"path\": \".github/ISSUE_TEMPLATE/success_image_report.yml\", \"startLine\": 93, \"endLine\": 100, \"why\": \"details textarea, required:false, with default value\" }\n  ],\n  \"omissions\": []\n}\n```<|im_end|>\n",
+          "instrumented_render_byte_identical": true
+        },
+        {
+          "row_index": 1204,
+          "render_sha256": "c40a809a7c41b4a707abd1b96bfbc6d11ec9bf670531a408669d5ca6c66a1331",
+          "characters": 66810,
+          "tokens": 17637,
+          "assistant_tokens": 1985,
+          "context_tokens": 15652,
+          "render_prefix": "<|im_start|>system\nYou are a sidekick to a powerful coding agent. The agent is busy reasoning about a hard problem and sent you ahead into this repository to find the code it will need, so it does not burn its own turns searching.\n\nExplore ",
+          "render_suffix": "y\": \"budget\", \"detail\": \"The hang conclusion follows from blocked_requests_ never being extracted, but the loader-side timeout behavior lives in shell/browser/net/proxying_url_loader_factory.cc which I did not trace.\" }\n  ]\n}\n```<|im_end|>\n",
+          "instrumented_render_byte_identical": true
+        },
+        {
+          "row_index": 1432,
+          "render_sha256": "64ca89253b84510476a405257f2efe5299bb892ea96b2390091231607190b949",
+          "characters": 43234,
+          "tokens": 12588,
+          "assistant_tokens": 1126,
+          "context_tokens": 11462,
+          "render_prefix": "<|im_start|>system\nYou are a sidekick to a powerful coding agent. The agent is busy reasoning about a hard problem and sent you ahead into this repository to find the code it will need, so it does not burn its own turns searching.\n\nExplore ",
+          "render_suffix": "    { \"what\": \"RwLock poison implementation (poison/rwlock.rs) and condvar interplay\", \"why\": \"budget\", \"detail\": \"RwLock uses the same poison::Flag mechanism; not chased since the request targets Mutex specifically.\" }\n  ]\n}\n```<|im_end|>\n",
+          "instrumented_render_byte_identical": true
+        }
+      ],
+      "mask_method": "No-output Jinja generation tags instrument the official template. The script proves byte-identical rendered text on the five conversion samples, then uses Transformers assistant_masks. Assistant payload and turn-ending branches are marked while role headers remain context; Gemma marks assistant tool-call/content branches separately so forward-scanned tool results remain context."
+    },
+    {
+      "label": "Gemma 4 E4B IT",
+      "repo_id": "google/gemma-4-E4B-it",
+      "revision": "a4c2d58be94dda072b918d9db64ee85c8ed34e3f",
+      "argument_mode": "openai_string",
+      "instrumentation": "gemma4",
+      "resolved": true,
+      "tokenizer_class": "GemmaTokenizer",
+      "config_class": "Gemma4Config",
+      "model_type": "gemma4",
+      "architectures": [
+        "Gemma4ForConditionalGeneration"
+      ],
+      "chat_template_sha256": "2f1b4d75d067bae3fe44e676721c7f077d243bc007156cb9c2f8b5836613d082",
+      "rows": 1884,
+      "raw_openai_argument_strings": {
+        "supported": true,
+        "error": null
+      },
+      "hf_argument_objects_parsed": 0,
+      "argument_adapter_note": "No adapter needed; the official template accepts OpenAI JSON-string arguments.",
+      "total_tokens": {
+        "p50": 12409,
+        "p90": 20961,
+        "p95": 25144,
+        "p99": 32264,
+        "max": 118978,
+        "sum": 25416410
+      },
+      "loss_bearing_assistant_tokens": {
+        "p50": 1390,
+        "p90": 2289,
+        "p95": 2543,
+        "p99": 3161,
+        "max": 4679,
+        "sum": 2759813
+      },
+      "masked_context_tokens": {
+        "p50": 10912,
+        "p90": 18989,
+        "p95": 22590,
+        "p99": 30099,
+        "max": 117243,
+        "sum": 22656597
+      },
+      "aggregate_loss_share": 0.10858390307679172,
+      "over_32768": 18,
+      "over_32768_rate": 0.009554140127388535,
+      "over_40960": 7,
+      "over_40960_rate": 0.0037154989384288748,
+      "overflow_records": [
+        {
+          "row_index": 49,
+          "repo_full": "anoma/anoma",
+          "request": "Trace the full path of a transaction from intent submission through the intent pool, mempool, executor, and resource machine to final storage commit\u2014which module boundaries does the data cross and what transformations occur at each?",
+          "tokens": 45059,
+          "assistant_tokens": 2681,
+          "context_tokens": 42378,
+          "assistant_messages": 12,
+          "disposition": "split",
+          "reason": "Split only at complete assistant-tool transaction boundaries; never cut a tool call from its results."
+        },
+        {
+          "row_index": 174,
+          "repo_full": "NousResearch/hermes-agent",
+          "request": "How should a developer call the agent's public API to run a single-turn completion versus a multi-turn conversation, based on the exposed methods/classes?",
+          "tokens": 118978,
+          "assistant_tokens": 1735,
+          "context_tokens": 117243,
+          "assistant_messages": 11,
+          "disposition": "split",
+          "reason": "Split only at complete assistant-tool transaction boundaries; never cut a tool call from its results."
+        },
+        {
+          "row_index": 328,
+          "repo_full": "ultraworkers/claw-code",
+          "request": "Which public functions or CLI subcommands are exposed for consumers of this crate/binary, and what arguments do they require?",
+          "tokens": 42220,
+          "assistant_tokens": 2168,
+          "context_tokens": 40052,
+          "assistant_messages": 12,
+          "disposition": "split",
+          "reason": "Split only at complete assistant-tool transaction boundaries; never cut a tool call from its results."
+        },
+        {
+          "row_index": 356,
+          "repo_full": "openclaw/openclaw",
+          "request": "Which of the two harness implementations (`test-review-harness.py` or `test-review-harness.ps1`) is actually invoked by the `autoreview` skill's primary script, and under what platform condition is that choice made?",
+          "tokens": 38219,
+          "assistant_tokens": 1326,
+          "context_tokens": 36893,
+          "assistant_messages": 7,
+          "disposition": "longer-context variant",
+          "reason": "Fits 40,960 tokens without truncation but not the 32,768-token ladder configs."
+        },
+        {
+          "row_index": 365,
+          "repo_full": "openclaw/openclaw",
+          "request": "In `.agents/skills/autoreview/scripts/autoreview`, what happens if the underlying review harness process exits with a non-zero status \u2014 does the script propagate the failure or swallow it?",
+          "tokens": 38467,
+          "assistant_tokens": 2172,
+          "context_tokens": 36295,
+          "assistant_messages": 19,
+          "disposition": "longer-context variant",
+          "reason": "Fits 40,960 tokens without truncation but not the 32,768-token ladder configs."
+        },
+        {
+          "row_index": 387,
+          "repo_full": "NousResearch/hermes-agent",
+          "request": "What CLI entry point or command dispatches user prompts into the agent, and what argument parsing library or pattern does it use?",
+          "tokens": 66130,
+          "assistant_tokens": 2234,
+          "context_tokens": 63896,
+          "assistant_messages": 14,
+          "disposition": "split",
+          "reason": "Split only at complete assistant-tool transaction boundaries; never cut a tool call from its results."
+        },
+        {
+          "row_index": 393,
+          "repo_full": "NousResearch/hermes-agent",
+          "request": "What environment variables defined in `.env.example` are actually read by the application code, and which ones (if any) are unused dead configuration?",
+          "tokens": 34316,
+          "assistant_tokens": 4217,
+          "context_tokens": 30099,
+          "assistant_messages": 18,
+          "disposition": "longer-context variant",
+          "reason": "Fits 40,960 tokens without truncation but not the 32,768-token ladder configs."
+        },
+        {
+          "row_index": 425,
+          "repo_full": "openclaw/openclaw",
+          "request": "Does the `autoreview` script call the `agent-transcript` script directly, or is there an intermediate module/skill that connects the two?",
+          "tokens": 38469,
+          "assistant_tokens": 1080,
+          "context_tokens": 37389,
+          "assistant_messages": 8,
+          "disposition": "longer-context variant",
+          "reason": "Fits 40,960 tokens without truncation but not the 32,768-token ladder configs."
+        },
+        {
+          "row_index": 914,
+          "repo_full": "anomalyco/opencode",
+          "request": "When the LLM response contains a tool call, trace the code path from response parsing through tool dispatch to the actual shell or file-system execution, noting each module boundary crossed.",
+          "tokens": 34879,
+          "assistant_tokens": 2464,
+          "context_tokens": 32415,
+          "assistant_messages": 16,
+          "disposition": "longer-context variant",
+          "reason": "Fits 40,960 tokens without truncation but not the 32,768-token ladder configs."
+        },
+        {
+          "row_index": 983,
+          "repo_full": "microsoft/PowerToys",
+          "request": "Which unit or integration tests exist for the Keyboard Manager's key remapping engine, and what edge cases (e.g., conflicting shortcuts) do they explicitly cover?",
+          "tokens": 46274,
+          "assistant_tokens": 3445,
+          "context_tokens": 42829,
+          "assistant_messages": 19,
+          "disposition": "split",
+          "reason": "Split only at complete assistant-tool transaction boundaries; never cut a tool call from its results."
+        },
+        {
+          "row_index": 1451,
+          "repo_full": "ultraworkers/claw-code",
+          "request": "What CLI argument-parsing library (e.g., clap) does the binary use, and where in the source is the argument struct defined with its subcommands and flags?",
+          "tokens": 33325,
+          "assistant_tokens": 1268,
+          "context_tokens": 32057,
+          "assistant_messages": 6,
+          "disposition": "longer-context variant",
+          "reason": "Fits 40,960 tokens without truncation but not the 32,768-token ladder configs."
+        },
+        {
+          "row_index": 1457,
+          "repo_full": "ultraworkers/claw-code",
+          "request": "If a user invokes the CLI with malformed or missing configuration, what is the exact code path from input parsing to the error message printed to stderr?",
+          "tokens": 46581,
+          "assistant_tokens": 2653,
+          "context_tokens": 43928,
+          "assistant_messages": 16,
+          "disposition": "split",
+          "reason": "Split only at complete assistant-tool transaction boundaries; never cut a tool call from its results."
+        },
+        {
+          "row_index": 1467,
+          "repo_full": "ultraworkers/claw-code",
+          "request": "Is there logic duplicated between the CLI argument handling and any config-file loading code that could be unified into a single settings-resolution function before a refactor?",
+          "tokens": 42985,
+          "assistant_tokens": 2508,
+          "context_tokens": 40477,
+          "assistant_messages": 15,
+          "disposition": "split",
+          "reason": "Split only at complete assistant-tool transaction boundaries; never cut a tool call from its results."
+        },
+        {
+          "row_index": 1540,
+          "repo_full": "anomalyco/opencode",
+          "request": "What is the public API surface exposed by opencode's HTTP/server mode, and which module defines the route handlers for creating a session and posting a new message to it?",
+          "tokens": 36639,
+          "assistant_tokens": 2170,
+          "context_tokens": 34469,
+          "assistant_messages": 11,
+          "disposition": "longer-context variant",
+          "reason": "Fits 40,960 tokens without truncation but not the 32,768-token ladder configs."
+        },
+        {
+          "row_index": 1570,
+          "repo_full": "openclaw/openclaw",
+          "request": "Does `.agents/skills/autoreview/scripts/autoreview` (or its test suite) make any assumptions about the current working directory or git repository root, and what happens if it is invoked from a subdirectory of the repo?",
+          "tokens": 39465,
+          "assistant_tokens": 2634,
+          "context_tokens": 36831,
+          "assistant_messages": 22,
+          "disposition": "longer-context variant",
+          "reason": "Fits 40,960 tokens without truncation but not the 32,768-token ladder configs."
+        },
+        {
+          "row_index": 1758,
+          "repo_full": "NousResearch/hermes-agent",
+          "request": "Trace how a configuration value defined in `.env.example` flows from process startup, through whatever config-loading module parses it, into the agent's initialization/constructor arguments.",
+          "tokens": 37115,
+          "assistant_tokens": 2577,
+          "context_tokens": 34538,
+          "assistant_messages": 14,
+          "disposition": "longer-context variant",
+          "reason": "Fits 40,960 tokens without truncation but not the 32,768-token ladder configs."
+        },
+        {
+          "row_index": 1792,
+          "repo_full": "ultraworkers/claw-code",
+          "request": "Which Rust module defines the crate's error type(s), and how do functions across the codebase propagate errors up to main() \u2014 via `?`, custom `From` impls, or manual matching?",
+          "tokens": 36329,
+          "assistant_tokens": 2077,
+          "context_tokens": 34252,
+          "assistant_messages": 10,
+          "disposition": "longer-context variant",
+          "reason": "Fits 40,960 tokens without truncation but not the 32,768-token ladder configs."
+        },
+        {
+          "row_index": 1880,
+          "repo_full": "denoland/deno",
+          "request": "Which structs and call sites in cli/args depend on the exact field layout of the CLI's Flags/CliOptions struct, such that adding or removing a field would require updating them?",
+          "tokens": 36194,
+          "assistant_tokens": 2801,
+          "context_tokens": 33393,
+          "assistant_messages": 11,
+          "disposition": "longer-context variant",
+          "reason": "Fits 40,960 tokens without truncation but not the 32,768-token ladder configs."
+        }
+      ],
+      "render_checks": [
+        {
+          "row_index": 155,
+          "render_sha256": "854b8cbc2ff05e11cf0ac657db0dc2d5718eb0b80d9d0c14cb914daa17d1b24c",
+          "characters": 54726,
+          "tokens": 15835,
+          "assistant_tokens": 2471,
+          "context_tokens": 13364,
+          "render_prefix": "<bos><|turn>system\nYou are a sidekick to a powerful coding agent. The agent is busy reasoning about a hard problem and sent you ahead into this repository to find the code it will need, so it does not burn its own turns searching.\n\nExplore ",
+          "render_suffix": "rmission for status queries existed and was removed\", \"why\": \"budget\", \"detail\": \"docs/app_changes.md line 53 notes a ContentProvider communication method was added for MagiskSU; deeper git/history review not performed.\" }\n  ]\n}\n```<turn|>\n",
+          "instrumented_render_byte_identical": true
+        },
+        {
+          "row_index": 340,
+          "render_sha256": "a968001a2725053c2d168d519f0169eacfabdacd8a0292f9d7572362fe632cbe",
+          "characters": 27437,
+          "tokens": 7876,
+          "assistant_tokens": 624,
+          "context_tokens": 7252,
+          "render_prefix": "<bos><|turn>system\nYou are a sidekick to a powerful coding agent. The agent is busy reasoning about a hard problem and sent you ahead into this repository to find the code it will need, so it does not burn its own turns searching.\n\nExplore ",
+          "render_suffix": "iable and where it is set per-platform\", \"why\": \"budget\", \"detail\": \"Did not trace where the executor value is defaulted (likely in a top-level config or platform preset), which determines when singlethreaded is chosen.\" }\n  ]\n}\n```<turn|>\n",
+          "instrumented_render_byte_identical": true
+        },
+        {
+          "row_index": 677,
+          "render_sha256": "2cea166d94b6a79e1875c4babe6f5827f4b401d9b1cca2f59ed05f0ff87d1e0b",
+          "characters": 25593,
+          "tokens": 7024,
+          "assistant_tokens": 844,
+          "context_tokens": 6180,
+          "render_prefix": "<bos><|turn>system\nYou are a sidekick to a powerful coding agent. The agent is busy reasoning about a hard problem and sent you ahead into this repository to find the code it will need, so it does not burn its own turns searching.\n\nExplore ",
+          "render_suffix": " testenv(required) \u2014 success-specific\" },\n    { \"path\": \".github/ISSUE_TEMPLATE/success_image_report.yml\", \"startLine\": 93, \"endLine\": 100, \"why\": \"details textarea, required:false, with default value\" }\n  ],\n  \"omissions\": []\n}\n```<turn|>\n",
+          "instrumented_render_byte_identical": true
+        },
+        {
+          "row_index": 1204,
+          "render_sha256": "55336caa27ae912025110257f2e4214071869a2f44e5fe6599c9d6146f4d0e55",
+          "characters": 57712,
+          "tokens": 16878,
+          "assistant_tokens": 2080,
+          "context_tokens": 14798,
+          "render_prefix": "<bos><|turn>system\nYou are a sidekick to a powerful coding agent. The agent is busy reasoning about a hard problem and sent you ahead into this repository to find the code it will need, so it does not burn its own turns searching.\n\nExplore ",
+          "render_suffix": "\"why\": \"budget\", \"detail\": \"The hang conclusion follows from blocked_requests_ never being extracted, but the loader-side timeout behavior lives in shell/browser/net/proxying_url_loader_factory.cc which I did not trace.\" }\n  ]\n}\n```<turn|>\n",
+          "instrumented_render_byte_identical": true
+        },
+        {
+          "row_index": 1432,
+          "render_sha256": "4031455c9adb8541bafcbb0eff480a9881b947a242c4f28fa336edd6ead1417d",
+          "characters": 34310,
+          "tokens": 10884,
+          "assistant_tokens": 1137,
+          "context_tokens": 9747,
+          "render_prefix": "<bos><|turn>system\nYou are a sidekick to a powerful coding agent. The agent is busy reasoning about a hard problem and sent you ahead into this repository to find the code it will need, so it does not burn its own turns searching.\n\nExplore ",
+          "render_suffix": " [\n    { \"what\": \"RwLock poison implementation (poison/rwlock.rs) and condvar interplay\", \"why\": \"budget\", \"detail\": \"RwLock uses the same poison::Flag mechanism; not chased since the request targets Mutex specifically.\" }\n  ]\n}\n```<turn|>\n",
+          "instrumented_render_byte_identical": true
+        }
+      ],
+      "mask_method": "No-output Jinja generation tags instrument the official template. The script proves byte-identical rendered text on the five conversion samples, then uses Transformers assistant_masks. Assistant payload and turn-ending branches are marked while role headers remain context; Gemma marks assistant tool-call/content branches separately so forward-scanned tool results remain context."
+    },
+    {
+      "label": "Qwen3.5 9B",
+      "repo_id": "Qwen/Qwen3.5-9B",
+      "revision": "c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+      "argument_mode": "hf_object",
+      "instrumentation": "qwen",
+      "resolved": true,
+      "tokenizer_class": "Qwen2Tokenizer",
+      "config_class": "Qwen3_5Config",
+      "model_type": "qwen3_5",
+      "architectures": [
+        "Qwen3_5ForConditionalGeneration"
+      ],
+      "chat_template_sha256": "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715",
+      "rows": 1884,
+      "raw_openai_argument_strings": {
+        "supported": false,
+        "error": "TypeError: Can only get item pairs from a mapping."
+      },
+      "hf_argument_objects_parsed": 24615,
+      "argument_adapter_note": "The official template calls Jinja |items on function.arguments. Each OpenAI JSON string was parsed to an equivalent object in memory before rendering; the committed JSONL remains OpenAI-shaped.",
+      "total_tokens": {
+        "p50": 14455,
+        "p90": 22418,
+        "p95": 25791,
+        "p99": 33324,
+        "max": 112747,
+        "sum": 28963788
+      },
+      "loss_bearing_assistant_tokens": {
+        "p50": 1555,
+        "p90": 2573,
+        "p95": 2811,
+        "p99": 3369,
+        "max": 4982,
+        "sum": 3083928
+      },
+      "masked_context_tokens": {
+        "p50": 12762,
+        "p90": 20168,
+        "p95": 23437,
+        "p99": 31286,
+        "max": 110759,
+        "sum": 25879860
+      },
+      "aggregate_loss_share": 0.10647529943251897,
+      "over_32768": 20,
+      "over_32768_rate": 0.010615711252653927,
+      "over_40960": 7,
+      "over_40960_rate": 0.0037154989384288748,
+      "overflow_records": [
+        {
+          "row_index": 49,
+          "repo_full": "anoma/anoma",
+          "request": "Trace the full path of a transaction from intent submission through the intent pool, mempool, executor, and resource machine to final storage commit\u2014which module boundaries does the data cross and what transformations occur at each?",
+          "tokens": 44292,
+          "assistant_tokens": 2843,
+          "context_tokens": 41449,
+          "assistant_messages": 12,
+          "disposition": "split",
+          "reason": "Split only at complete assistant-tool transaction boundaries; never cut a tool call from its results."
+        },
+        {
+          "row_index": 174,
+          "repo_full": "NousResearch/hermes-agent",
+          "request": "How should a developer call the agent's public API to run a single-turn completion versus a multi-turn conversation, based on the exposed methods/classes?",
+          "tokens": 112747,
+          "assistant_tokens": 1988,
+          "context_tokens": 110759,
+          "assistant_messages": 11,
+          "disposition": "split",
+          "reason": "Split only at complete assistant-tool transaction boundaries; never cut a tool call from its results."
+        },
+        {
+          "row_index": 253,
+          "repo_full": "2dust/v2rayN",
+          "request": "Which configuration/settings classes use hardcoded file paths or magic strings that should be extracted into constants before a cross-platform packaging refactor?",
+          "tokens": 33897,
+          "assistant_tokens": 2611,
+          "context_tokens": 31286,
+          "assistant_messages": 12,
+          "disposition": "longer-context variant",
+          "reason": "Fits 40,960 tokens without truncation but not the 32,768-token ladder configs."
+        },
+        {
+          "row_index": 328,
+          "repo_full": "ultraworkers/claw-code",
+          "request": "Which public functions or CLI subcommands are exposed for consumers of this crate/binary, and what arguments do they require?",
+          "tokens": 41799,
+          "assistant_tokens": 2459,
+          "context_tokens": 39340,
+          "assistant_messages": 12,
+          "disposition": "split",
+          "reason": "Split only at complete assistant-tool transaction boundaries; never cut a tool call from its results."
+        },
+        {
+          "row_index": 356,
+          "repo_full": "openclaw/openclaw",
+          "request": "Which of the two harness implementations (`test-review-harness.py` or `test-review-harness.ps1`) is actually invoked by the `autoreview` skill's primary script, and under what platform condition is that choice made?",
+          "tokens": 38149,
+          "assistant_tokens": 1410,
+          "context_tokens": 36739,
+          "assistant_messages": 7,
+          "disposition": "longer-context variant",
+          "reason": "Fits 40,960 tokens without truncation but not the 32,768-token ladder configs."
+        },
+        {
+          "row_index": 365,
+          "repo_full": "openclaw/openclaw",
+          "request": "In `.agents/skills/autoreview/scripts/autoreview`, what happens if the underlying review harness process exits with a non-zero status \u2014 does the script propagate the failure or swallow it?",
+          "tokens": 38486,
+          "assistant_tokens": 2551,
+          "context_tokens": 35935,
+          "assistant_messages": 19,
+          "disposition": "longer-context variant",
+          "reason": "Fits 40,960 tokens without truncation but not the 32,768-token ladder configs."
+        },
+        {
+          "row_index": 387,
+          "repo_full": "NousResearch/hermes-agent",
+          "request": "What CLI entry point or command dispatches user prompts into the agent, and what argument parsing library or pattern does it use?",
+          "tokens": 64362,
+          "assistant_tokens": 2525,
+          "context_tokens": 61837,
+          "assistant_messages": 14,
+          "disposition": "split",
+          "reason": "Split only at complete assistant-tool transaction boundaries; never cut a tool call from its results."
+        },
+        {
+          "row_index": 393,
+          "repo_full": "NousResearch/hermes-agent",
+          "request": "What environment variables defined in `.env.example` are actually read by the application code, and which ones (if any) are unused dead configuration?",
+          "tokens": 33014,
+          "assistant_tokens": 4271,
+          "context_tokens": 28743,
+          "assistant_messages": 18,
+          "disposition": "longer-context variant",
+          "reason": "Fits 40,960 tokens without truncation but not the 32,768-token ladder configs."
+        },
+        {
+          "row_index": 425,
+          "repo_full": "openclaw/openclaw",
+          "request": "Does the `autoreview` script call the `agent-transcript` script directly, or is there an intermediate module/skill that connects the two?",
+          "tokens": 38551,
+          "assistant_tokens": 1229,
+          "context_tokens": 37322,
+          "assistant_messages": 8,
+          "disposition": "longer-context variant",
+          "reason": "Fits 40,960 tokens without truncation but not the 32,768-token ladder configs."
+        },
+        {
+          "row_index": 914,
+          "repo_full": "anomalyco/opencode",
+          "request": "When the LLM response contains a tool call, trace the code path from response parsing through tool dispatch to the actual shell or file-system execution, noting each module boundary crossed.",
+          "tokens": 35351,
+          "assistant_tokens": 2641,
+          "context_tokens": 32710,
+          "assistant_messages": 16,
+          "disposition": "longer-context variant",
+          "reason": "Fits 40,960 tokens without truncation but not the 32,768-token ladder configs."
+        },
+        {
+          "row_index": 929,
+          "repo_full": "redis/redis",
+          "request": "How does a module author invoke RedisModule_BlockClient and what callback signatures must be supplied, based on the implementation in module.c?",
+          "tokens": 33531,
+          "assistant_tokens": 1304,
+          "context_tokens": 32227,
+          "assistant_messages": 8,
+          "disposition": "longer-context variant",
+          "reason": "Fits 40,960 tokens without truncation but not the 32,768-token ladder configs."
+        },
+        {
+          "row_index": 983,
+          "repo_full": "microsoft/PowerToys",
+          "request": "Which unit or integration tests exist for the Keyboard Manager's key remapping engine, and what edge cases (e.g., conflicting shortcuts) do they explicitly cover?",
+          "tokens": 46862,
+          "assistant_tokens": 3921,
+          "context_tokens": 42941,
+          "assistant_messages": 19,
+          "disposition": "split",
+          "reason": "Split only at complete assistant-tool transaction boundaries; never cut a tool call from its results."
+        },
+        {
+          "row_index": 1451,
+          "repo_full": "ultraworkers/claw-code",
+          "request": "What CLI argument-parsing library (e.g., clap) does the binary use, and where in the source is the argument struct defined with its subcommands and flags?",
+          "tokens": 33324,
+          "assistant_tokens": 1399,
+          "context_tokens": 31925,
+          "assistant_messages": 6,
+          "disposition": "longer-context variant",
+          "reason": "Fits 40,960 tokens without truncation but not the 32,768-token ladder configs."
+        },
+        {
+          "row_index": 1457,
+          "repo_full": "ultraworkers/claw-code",
+          "request": "If a user invokes the CLI with malformed or missing configuration, what is the exact code path from input parsing to the error message printed to stderr?",
+          "tokens": 45421,
+          "assistant_tokens": 2975,
+          "context_tokens": 42446,
+          "assistant_messages": 16,
+          "disposition": "split",
+          "reason": "Split only at complete assistant-tool transaction boundaries; never cut a tool call from its results."
+        },
+        {
+          "row_index": 1467,
+          "repo_full": "ultraworkers/claw-code",
+          "request": "Is there logic duplicated between the CLI argument handling and any config-file loading code that could be unified into a single settings-resolution function before a refactor?",
+          "tokens": 42047,
+          "assistant_tokens": 2634,
+          "context_tokens": 39413,
+          "assistant_messages": 15,
+          "disposition": "split",
+          "reason": "Split only at complete assistant-tool transaction boundaries; never cut a tool call from its results."
+        },
+        {
+          "row_index": 1540,
+          "repo_full": "anomalyco/opencode",
+          "request": "What is the public API surface exposed by opencode's HTTP/server mode, and which module defines the route handlers for creating a session and posting a new message to it?",
+          "tokens": 36975,
+          "assistant_tokens": 2378,
+          "context_tokens": 34597,
+          "assistant_messages": 11,
+          "disposition": "longer-context variant",
+          "reason": "Fits 40,960 tokens without truncation but not the 32,768-token ladder configs."
+        },
+        {
+          "row_index": 1570,
+          "repo_full": "openclaw/openclaw",
+          "request": "Does `.agents/skills/autoreview/scripts/autoreview` (or its test suite) make any assumptions about the current working directory or git repository root, and what happens if it is invoked from a subdirectory of the repo?",
+          "tokens": 39261,
+          "assistant_tokens": 2972,
+          "context_tokens": 36289,
+          "assistant_messages": 22,
+          "disposition": "longer-context variant",
+          "reason": "Fits 40,960 tokens without truncation but not the 32,768-token ladder configs."
+        },
+        {
+          "row_index": 1758,
+          "repo_full": "NousResearch/hermes-agent",
+          "request": "Trace how a configuration value defined in `.env.example` flows from process startup, through whatever config-loading module parses it, into the agent's initialization/constructor arguments.",
+          "tokens": 36261,
+          "assistant_tokens": 3015,
+          "context_tokens": 33246,
+          "assistant_messages": 14,
+          "disposition": "longer-context variant",
+          "reason": "Fits 40,960 tokens without truncation but not the 32,768-token ladder configs."
+        },
+        {
+          "row_index": 1792,
+          "repo_full": "ultraworkers/claw-code",
+          "request": "Which Rust module defines the crate's error type(s), and how do functions across the codebase propagate errors up to main() \u2014 via `?`, custom `From` impls, or manual matching?",
+          "tokens": 36208,
+          "assistant_tokens": 2355,
+          "context_tokens": 33853,
+          "assistant_messages": 10,
+          "disposition": "longer-context variant",
+          "reason": "Fits 40,960 tokens without truncation but not the 32,768-token ladder configs."
+        },
+        {
+          "row_index": 1880,
+          "repo_full": "denoland/deno",
+          "request": "Which structs and call sites in cli/args depend on the exact field layout of the CLI's Flags/CliOptions struct, such that adding or removing a field would require updating them?",
+          "tokens": 36261,
+          "assistant_tokens": 3050,
+          "context_tokens": 33211,
+          "assistant_messages": 11,
+          "disposition": "longer-context variant",
+          "reason": "Fits 40,960 tokens without truncation but not the 32,768-token ladder configs."
+        }
+      ],
+      "render_checks": [
+        {
+          "row_index": 155,
+          "render_sha256": "7a1c5ac24b6697491329008d486cafaeff419ab6f107b226809fee4e508fdebb",
+          "characters": 64960,
+          "tokens": 17271,
+          "assistant_tokens": 2718,
+          "context_tokens": 14553,
+          "render_prefix": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search code with one tool: concepts, identifiers, error strings, regex, literals, and filen",
+          "render_suffix": "ssion for status queries existed and was removed\", \"why\": \"budget\", \"detail\": \"docs/app_changes.md line 53 notes a ContentProvider communication method was added for MagiskSU; deeper git/history review not performed.\" }\n  ]\n}\n```<|im_end|>\n",
+          "instrumented_render_byte_identical": true
+        },
+        {
+          "row_index": 340,
+          "render_sha256": "2545f35bfff38b18f8e9098ff11a26105103d738964cee1b86a683aad2a9b3f4",
+          "characters": 37046,
+          "tokens": 9962,
+          "assistant_tokens": 690,
+          "context_tokens": 9272,
+          "render_prefix": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search code with one tool: concepts, identifiers, error strings, regex, literals, and filen",
+          "render_suffix": "le and where it is set per-platform\", \"why\": \"budget\", \"detail\": \"Did not trace where the executor value is defaulted (likely in a top-level config or platform preset), which determines when singlethreaded is chosen.\" }\n  ]\n}\n```<|im_end|>\n",
+          "instrumented_render_byte_identical": true
+        },
+        {
+          "row_index": 677,
+          "render_sha256": "6711c9e8e6d82393510dbf934c3ef4901f2d50b658ee7858f8a6a4b09c8f31df",
+          "characters": 34918,
+          "tokens": 9295,
+          "assistant_tokens": 799,
+          "context_tokens": 8496,
+          "render_prefix": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search code with one tool: concepts, identifiers, error strings, regex, literals, and filen",
+          "render_suffix": "stenv(required) \u2014 success-specific\" },\n    { \"path\": \".github/ISSUE_TEMPLATE/success_image_report.yml\", \"startLine\": 93, \"endLine\": 100, \"why\": \"details textarea, required:false, with default value\" }\n  ],\n  \"omissions\": []\n}\n```<|im_end|>\n",
+          "instrumented_render_byte_identical": true
+        },
+        {
+          "row_index": 1204,
+          "render_sha256": "a042246c4046c060ca364681446c8847c8ce79fea8d25b19ac416a6c1b87988d",
+          "characters": 68106,
+          "tokens": 18635,
+          "assistant_tokens": 2241,
+          "context_tokens": 16394,
+          "render_prefix": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search code with one tool: concepts, identifiers, error strings, regex, literals, and filen",
+          "render_suffix": "y\": \"budget\", \"detail\": \"The hang conclusion follows from blocked_requests_ never being extracted, but the loader-side timeout behavior lives in shell/browser/net/proxying_url_loader_factory.cc which I did not trace.\" }\n  ]\n}\n```<|im_end|>\n",
+          "instrumented_render_byte_identical": true
+        },
+        {
+          "row_index": 1432,
+          "render_sha256": "b4336108b0e21f8f784f3bf56de8f4d9b7972198e204467df7088ebc73f5a253",
+          "characters": 44250,
+          "tokens": 13174,
+          "assistant_tokens": 1293,
+          "context_tokens": 11881,
+          "render_prefix": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search code with one tool: concepts, identifiers, error strings, regex, literals, and filen",
+          "render_suffix": "    { \"what\": \"RwLock poison implementation (poison/rwlock.rs) and condvar interplay\", \"why\": \"budget\", \"detail\": \"RwLock uses the same poison::Flag mechanism; not chased since the request targets Mutex specifically.\" }\n  ]\n}\n```<|im_end|>\n",
+          "instrumented_render_byte_identical": true
+        }
+      ],
+      "mask_method": "No-output Jinja generation tags instrument the official template. The script proves byte-identical rendered text on the five conversion samples, then uses Transformers assistant_masks. Assistant payload and turn-ending branches are marked while role headers remain context; Gemma marks assistant tool-call/content branches separately so forward-scanned tool results remain context."
+    },
+    {
+      "label": "Qwen3.6 27B",
+      "repo_id": "Qwen/Qwen3.6-27B",
+      "revision": "6a9e13bd6fc8f0983b9b99948120bc37f49c13e9",
+      "argument_mode": "hf_object",
+      "instrumentation": "qwen",
+      "resolved": true,
+      "tokenizer_class": "Qwen2Tokenizer",
+      "config_class": "Qwen3_5Config",
+      "model_type": "qwen3_5",
+      "architectures": [
+        "Qwen3_5ForConditionalGeneration"
+      ],
+      "chat_template_sha256": "e84f32a23fdda27689f868aa4a1a5621f41133e51a48d7f3efcbea2839574259",
+      "rows": 1884,
+      "raw_openai_argument_strings": {
+        "supported": false,
+        "error": "TypeError: Can only get item pairs from a mapping."
+      },
+      "hf_argument_objects_parsed": 24615,
+      "argument_adapter_note": "The official template calls Jinja |items on function.arguments. Each OpenAI JSON string was parsed to an equivalent object in memory before rendering; the committed JSONL remains OpenAI-shaped.",
+      "total_tokens": {
+        "p50": 14455,
+        "p90": 22418,
+        "p95": 25791,
+        "p99": 33324,
+        "max": 112747,
+        "sum": 28963788
+      },
+      "loss_bearing_assistant_tokens": {
+        "p50": 1555,
+        "p90": 2573,
+        "p95": 2811,
+        "p99": 3369,
+        "max": 4982,
+        "sum": 3083928
+      },
+      "masked_context_tokens": {
+        "p50": 12762,
+        "p90": 20168,
+        "p95": 23437,
+        "p99": 31286,
+        "max": 110759,
+        "sum": 25879860
+      },
+      "aggregate_loss_share": 0.10647529943251897,
+      "over_32768": 20,
+      "over_32768_rate": 0.010615711252653927,
+      "over_40960": 7,
+      "over_40960_rate": 0.0037154989384288748,
+      "overflow_records": [
+        {
+          "row_index": 49,
+          "repo_full": "anoma/anoma",
+          "request": "Trace the full path of a transaction from intent submission through the intent pool, mempool, executor, and resource machine to final storage commit\u2014which module boundaries does the data cross and what transformations occur at each?",
+          "tokens": 44292,
+          "assistant_tokens": 2843,
+          "context_tokens": 41449,
+          "assistant_messages": 12,
+          "disposition": "split",
+          "reason": "Split only at complete assistant-tool transaction boundaries; never cut a tool call from its results."
+        },
+        {
+          "row_index": 174,
+          "repo_full": "NousResearch/hermes-agent",
+          "request": "How should a developer call the agent's public API to run a single-turn completion versus a multi-turn conversation, based on the exposed methods/classes?",
+          "tokens": 112747,
+          "assistant_tokens": 1988,
+          "context_tokens": 110759,
+          "assistant_messages": 11,
+          "disposition": "split",
+          "reason": "Split only at complete assistant-tool transaction boundaries; never cut a tool call from its results."
+        },
+        {
+          "row_index": 253,
+          "repo_full": "2dust/v2rayN",
+          "request": "Which configuration/settings classes use hardcoded file paths or magic strings that should be extracted into constants before a cross-platform packaging refactor?",
+          "tokens": 33897,
+          "assistant_tokens": 2611,
+          "context_tokens": 31286,
+          "assistant_messages": 12,
+          "disposition": "longer-context variant",
+          "reason": "Fits 40,960 tokens without truncation but not the 32,768-token ladder configs."
+        },
+        {
+          "row_index": 328,
+          "repo_full": "ultraworkers/claw-code",
+          "request": "Which public functions or CLI subcommands are exposed for consumers of this crate/binary, and what arguments do they require?",
+          "tokens": 41799,
+          "assistant_tokens": 2459,
+          "context_tokens": 39340,
+          "assistant_messages": 12,
+          "disposition": "split",
+          "reason": "Split only at complete assistant-tool transaction boundaries; never cut a tool call from its results."
+        },
+        {
+          "row_index": 356,
+          "repo_full": "openclaw/openclaw",
+          "request": "Which of the two harness implementations (`test-review-harness.py` or `test-review-harness.ps1`) is actually invoked by the `autoreview` skill's primary script, and under what platform condition is that choice made?",
+          "tokens": 38149,
+          "assistant_tokens": 1410,
+          "context_tokens": 36739,
+          "assistant_messages": 7,
+          "disposition": "longer-context variant",
+          "reason": "Fits 40,960 tokens without truncation but not the 32,768-token ladder configs."
+        },
+        {
+          "row_index": 365,
+          "repo_full": "openclaw/openclaw",
+          "request": "In `.agents/skills/autoreview/scripts/autoreview`, what happens if the underlying review harness process exits with a non-zero status \u2014 does the script propagate the failure or swallow it?",
+          "tokens": 38486,
+          "assistant_tokens": 2551,
+          "context_tokens": 35935,
+          "assistant_messages": 19,
+          "disposition": "longer-context variant",
+          "reason": "Fits 40,960 tokens without truncation but not the 32,768-token ladder configs."
+        },
+        {
+          "row_index": 387,
+          "repo_full": "NousResearch/hermes-agent",
+          "request": "What CLI entry point or command dispatches user prompts into the agent, and what argument parsing library or pattern does it use?",
+          "tokens": 64362,
+          "assistant_tokens": 2525,
+          "context_tokens": 61837,
+          "assistant_messages": 14,
+          "disposition": "split",
+          "reason": "Split only at complete assistant-tool transaction boundaries; never cut a tool call from its results."
+        },
+        {
+          "row_index": 393,
+          "repo_full": "NousResearch/hermes-agent",
+          "request": "What environment variables defined in `.env.example` are actually read by the application code, and which ones (if any) are unused dead configuration?",
+          "tokens": 33014,
+          "assistant_tokens": 4271,
+          "context_tokens": 28743,
+          "assistant_messages": 18,
+          "disposition": "longer-context variant",
+          "reason": "Fits 40,960 tokens without truncation but not the 32,768-token ladder configs."
+        },
+        {
+          "row_index": 425,
+          "repo_full": "openclaw/openclaw",
+          "request": "Does the `autoreview` script call the `agent-transcript` script directly, or is there an intermediate module/skill that connects the two?",
+          "tokens": 38551,
+          "assistant_tokens": 1229,
+          "context_tokens": 37322,
+          "assistant_messages": 8,
+          "disposition": "longer-context variant",
+          "reason": "Fits 40,960 tokens without truncation but not the 32,768-token ladder configs."
+        },
+        {
+          "row_index": 914,
+          "repo_full": "anomalyco/opencode",
+          "request": "When the LLM response contains a tool call, trace the code path from response parsing through tool dispatch to the actual shell or file-system execution, noting each module boundary crossed.",
+          "tokens": 35351,
+          "assistant_tokens": 2641,
+          "context_tokens": 32710,
+          "assistant_messages": 16,
+          "disposition": "longer-context variant",
+          "reason": "Fits 40,960 tokens without truncation but not the 32,768-token ladder configs."
+        },
+        {
+          "row_index": 929,
+          "repo_full": "redis/redis",
+          "request": "How does a module author invoke RedisModule_BlockClient and what callback signatures must be supplied, based on the implementation in module.c?",
+          "tokens": 33531,
+          "assistant_tokens": 1304,
+          "context_tokens": 32227,
+          "assistant_messages": 8,
+          "disposition": "longer-context variant",
+          "reason": "Fits 40,960 tokens without truncation but not the 32,768-token ladder configs."
+        },
+        {
+          "row_index": 983,
+          "repo_full": "microsoft/PowerToys",
+          "request": "Which unit or integration tests exist for the Keyboard Manager's key remapping engine, and what edge cases (e.g., conflicting shortcuts) do they explicitly cover?",
+          "tokens": 46862,
+          "assistant_tokens": 3921,
+          "context_tokens": 42941,
+          "assistant_messages": 19,
+          "disposition": "split",
+          "reason": "Split only at complete assistant-tool transaction boundaries; never cut a tool call from its results."
+        },
+        {
+          "row_index": 1451,
+          "repo_full": "ultraworkers/claw-code",
+          "request": "What CLI argument-parsing library (e.g., clap) does the binary use, and where in the source is the argument struct defined with its subcommands and flags?",
+          "tokens": 33324,
+          "assistant_tokens": 1399,
+          "context_tokens": 31925,
+          "assistant_messages": 6,
+          "disposition": "longer-context variant",
+          "reason": "Fits 40,960 tokens without truncation but not the 32,768-token ladder configs."
+        },
+        {
+          "row_index": 1457,
+          "repo_full": "ultraworkers/claw-code",
+          "request": "If a user invokes the CLI with malformed or missing configuration, what is the exact code path from input parsing to the error message printed to stderr?",
+          "tokens": 45421,
+          "assistant_tokens": 2975,
+          "context_tokens": 42446,
+          "assistant_messages": 16,
+          "disposition": "split",
+          "reason": "Split only at complete assistant-tool transaction boundaries; never cut a tool call from its results."
+        },
+        {
+          "row_index": 1467,
+          "repo_full": "ultraworkers/claw-code",
+          "request": "Is there logic duplicated between the CLI argument handling and any config-file loading code that could be unified into a single settings-resolution function before a refactor?",
+          "tokens": 42047,
+          "assistant_tokens": 2634,
+          "context_tokens": 39413,
+          "assistant_messages": 15,
+          "disposition": "split",
+          "reason": "Split only at complete assistant-tool transaction boundaries; never cut a tool call from its results."
+        },
+        {
+          "row_index": 1540,
+          "repo_full": "anomalyco/opencode",
+          "request": "What is the public API surface exposed by opencode's HTTP/server mode, and which module defines the route handlers for creating a session and posting a new message to it?",
+          "tokens": 36975,
+          "assistant_tokens": 2378,
+          "context_tokens": 34597,
+          "assistant_messages": 11,
+          "disposition": "longer-context variant",
+          "reason": "Fits 40,960 tokens without truncation but not the 32,768-token ladder configs."
+        },
+        {
+          "row_index": 1570,
+          "repo_full": "openclaw/openclaw",
+          "request": "Does `.agents/skills/autoreview/scripts/autoreview` (or its test suite) make any assumptions about the current working directory or git repository root, and what happens if it is invoked from a subdirectory of the repo?",
+          "tokens": 39261,
+          "assistant_tokens": 2972,
+          "context_tokens": 36289,
+          "assistant_messages": 22,
+          "disposition": "longer-context variant",
+          "reason": "Fits 40,960 tokens without truncation but not the 32,768-token ladder configs."
+        },
+        {
+          "row_index": 1758,
+          "repo_full": "NousResearch/hermes-agent",
+          "request": "Trace how a configuration value defined in `.env.example` flows from process startup, through whatever config-loading module parses it, into the agent's initialization/constructor arguments.",
+          "tokens": 36261,
+          "assistant_tokens": 3015,
+          "context_tokens": 33246,
+          "assistant_messages": 14,
+          "disposition": "longer-context variant",
+          "reason": "Fits 40,960 tokens without truncation but not the 32,768-token ladder configs."
+        },
+        {
+          "row_index": 1792,
+          "repo_full": "ultraworkers/claw-code",
+          "request": "Which Rust module defines the crate's error type(s), and how do functions across the codebase propagate errors up to main() \u2014 via `?`, custom `From` impls, or manual matching?",
+          "tokens": 36208,
+          "assistant_tokens": 2355,
+          "context_tokens": 33853,
+          "assistant_messages": 10,
+          "disposition": "longer-context variant",
+          "reason": "Fits 40,960 tokens without truncation but not the 32,768-token ladder configs."
+        },
+        {
+          "row_index": 1880,
+          "repo_full": "denoland/deno",
+          "request": "Which structs and call sites in cli/args depend on the exact field layout of the CLI's Flags/CliOptions struct, such that adding or removing a field would require updating them?",
+          "tokens": 36261,
+          "assistant_tokens": 3050,
+          "context_tokens": 33211,
+          "assistant_messages": 11,
+          "disposition": "longer-context variant",
+          "reason": "Fits 40,960 tokens without truncation but not the 32,768-token ladder configs."
+        }
+      ],
+      "render_checks": [
+        {
+          "row_index": 155,
+          "render_sha256": "7a1c5ac24b6697491329008d486cafaeff419ab6f107b226809fee4e508fdebb",
+          "characters": 64960,
+          "tokens": 17271,
+          "assistant_tokens": 2718,
+          "context_tokens": 14553,
+          "render_prefix": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search code with one tool: concepts, identifiers, error strings, regex, literals, and filen",
+          "render_suffix": "ssion for status queries existed and was removed\", \"why\": \"budget\", \"detail\": \"docs/app_changes.md line 53 notes a ContentProvider communication method was added for MagiskSU; deeper git/history review not performed.\" }\n  ]\n}\n```<|im_end|>\n",
+          "instrumented_render_byte_identical": true
+        },
+        {
+          "row_index": 340,
+          "render_sha256": "2545f35bfff38b18f8e9098ff11a26105103d738964cee1b86a683aad2a9b3f4",
+          "characters": 37046,
+          "tokens": 9962,
+          "assistant_tokens": 690,
+          "context_tokens": 9272,
+          "render_prefix": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search code with one tool: concepts, identifiers, error strings, regex, literals, and filen",
+          "render_suffix": "le and where it is set per-platform\", \"why\": \"budget\", \"detail\": \"Did not trace where the executor value is defaulted (likely in a top-level config or platform preset), which determines when singlethreaded is chosen.\" }\n  ]\n}\n```<|im_end|>\n",
+          "instrumented_render_byte_identical": true
+        },
+        {
+          "row_index": 677,
+          "render_sha256": "6711c9e8e6d82393510dbf934c3ef4901f2d50b658ee7858f8a6a4b09c8f31df",
+          "characters": 34918,
+          "tokens": 9295,
+          "assistant_tokens": 799,
+          "context_tokens": 8496,
+          "render_prefix": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search code with one tool: concepts, identifiers, error strings, regex, literals, and filen",
+          "render_suffix": "stenv(required) \u2014 success-specific\" },\n    { \"path\": \".github/ISSUE_TEMPLATE/success_image_report.yml\", \"startLine\": 93, \"endLine\": 100, \"why\": \"details textarea, required:false, with default value\" }\n  ],\n  \"omissions\": []\n}\n```<|im_end|>\n",
+          "instrumented_render_byte_identical": true
+        },
+        {
+          "row_index": 1204,
+          "render_sha256": "a042246c4046c060ca364681446c8847c8ce79fea8d25b19ac416a6c1b87988d",
+          "characters": 68106,
+          "tokens": 18635,
+          "assistant_tokens": 2241,
+          "context_tokens": 16394,
+          "render_prefix": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search code with one tool: concepts, identifiers, error strings, regex, literals, and filen",
+          "render_suffix": "y\": \"budget\", \"detail\": \"The hang conclusion follows from blocked_requests_ never being extracted, but the loader-side timeout behavior lives in shell/browser/net/proxying_url_loader_factory.cc which I did not trace.\" }\n  ]\n}\n```<|im_end|>\n",
+          "instrumented_render_byte_identical": true
+        },
+        {
+          "row_index": 1432,
+          "render_sha256": "b4336108b0e21f8f784f3bf56de8f4d9b7972198e204467df7088ebc73f5a253",
+          "characters": 44250,
+          "tokens": 13174,
+          "assistant_tokens": 1293,
+          "context_tokens": 11881,
+          "render_prefix": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search code with one tool: concepts, identifiers, error strings, regex, literals, and filen",
+          "render_suffix": "    { \"what\": \"RwLock poison implementation (poison/rwlock.rs) and condvar interplay\", \"why\": \"budget\", \"detail\": \"RwLock uses the same poison::Flag mechanism; not chased since the request targets Mutex specifically.\" }\n  ]\n}\n```<|im_end|>\n",
+          "instrumented_render_byte_identical": true
+        }
+      ],
+      "mask_method": "No-output Jinja generation tags instrument the official template. The script proves byte-identical rendered text on the five conversion samples, then uses Transformers assistant_masks. Assistant payload and turn-ending branches are marked while role headers remain context; Gemma marks assistant tool-call/content branches separately so forward-scanned tool results remain context."
+    }
+  ],
+  "stop_threshold_triggered": false,
+  "stop_threshold_models": []
+}
