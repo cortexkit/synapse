@@ -1,0 +1,10 @@
+.build/
+.venv/
+.reference-venv/
+__pycache__/
+artifacts/
+*.mlpackage/
+*.mlmodelc/
+*.npz
+*.jsonl
+*.log

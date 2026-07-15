@@ -1,0 +1,23 @@
+{
+  "model": "LiquidAI/LFM2-350M",
+  "revision": "b3afba27815ee83a64b76162cef4d8a4780d6ca7",
+  "lane": "owned Rust MPSGraph f16",
+  "host": "Apple M1 Max 64 GiB",
+  "prompts": 20,
+  "prompt_tokens": 229,
+  "max_new_tokens": 1,
+  "cache_bucket": 512,
+  "prefill_wall_s": 19.820951038,
+  "prefill_tokens_per_s": 11.553431495843444,
+  "decode_wall_s": 1.712686122,
+  "decode_tokens_per_s": 11.677562948104509,
+  "power_window_s": 21.975798845291138,
+  "power_sample_count": 136,
+  "power_w_mean": {
+    "ane": 0.0,
+    "gpu": 0.980544932624873,
+    "cpu": 1.3960008656277376,
+    "compute_rails_total": 2.376545809647616
+  },
+  "comparison_note": "Same model and prompts, but owned prefill also builds decode caches and evaluates the tied LM head; the Phase A Core ML graph returns final hidden states only."
+}

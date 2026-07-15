@@ -1,0 +1,34 @@
+{
+  "model": "LiquidAI/LFM2-350M",
+  "revision": "b3afba27815ee83a64b76162cef4d8a4780d6ca7",
+  "window": 512,
+  "frontend": "torch.export",
+  "persistent_states": {
+    "conv_states": 10,
+    "conv_state_shape_each": [1, 1024, 3, 1],
+    "key_states": 6,
+    "value_states": 6,
+    "kv_state_shape_each": [1, 8, 512, 64],
+    "total": 22
+  },
+  "export_s": 0.7562847920053173,
+  "conversion_s": 12.760753750000731,
+  "package_size_bytes": 843844763,
+  "conversion_passed": true,
+  "cpu_only_first_step": {
+    "passed": true,
+    "wall_s": 0.030610875008278526,
+    "output_shape": [1, 65536]
+  },
+  "cpu_and_ne_first_step": {
+    "passed": false,
+    "error_domain": "com.apple.appleneuralengine",
+    "error_code": 8,
+    "status": "0x1d",
+    "status_type": "0x9",
+    "message": "ANEProgramProcessRequestDirect() Program Inference error"
+  },
+  "decode_speed_power": null,
+  "token_exactness": null,
+  "failure_boundary": "torch.export and coremltools conversion accept all 22 mutable buffers; the package executes with CPU_ONLY but fails on the first CPU_AND_NE prediction inside ANEProgramProcessRequestDirect"
+}

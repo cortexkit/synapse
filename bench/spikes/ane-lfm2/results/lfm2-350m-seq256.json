@@ -1,0 +1,52 @@
+{
+  "model": "LiquidAI/LFM2-350M",
+  "revision": "b3afba27815ee83a64b76162cef4d8a4780d6ca7",
+  "model_sha256": "387638dc889ff1a1395c3c2ab9605211e4c7e16f2d375361dd4e423b909a254e",
+  "bucket": 256,
+  "parity": {
+    "transformers_fp32_vs_custom_eager_prompt_min_cosine": 0.999999999982194,
+    "custom_eager_vs_torch_export_prompt_min_cosine": 0.9999999999999998,
+    "transformers_fp32_vs_coreml_prompt_min_cosine": 0.9264409437738915,
+    "transformers_fp32_vs_coreml_prompt_mean_cosine": 0.9682762614648149,
+    "transformers_fp32_vs_coreml_token_min_cosine": 0.8120905686812023,
+    "transformers_fp32_vs_coreml_token_mean_cosine": 0.9672681649856049,
+    "transformers_fp32_vs_coreml_max_abs": 18.819507598876953,
+    "gate": 0.999,
+    "passed": false
+  },
+  "placement": {
+    "dispatchable_ops": 730,
+    "neural_engine_ops": 728,
+    "cpu_ops": 2,
+    "neural_engine_share": 0.9972602739726028,
+    "conv_ops_on_neural_engine": 102,
+    "conv_ops_total": 102,
+    "cpu_operator_classes": {"ios18.gather": 1, "ios18.cast": 1}
+  },
+  "speed": {
+    "prompts": 20,
+    "iterations": 10,
+    "active_tokens": 2290,
+    "fixed_bucket_tokens": 51200,
+    "infer_wall_s": 34.753028417006135,
+    "active_tokens_per_s": 65.89353803996562,
+    "fixed_bucket_tokens_per_s": 1473.252902902288,
+    "requests_per_s": 5.754894151962063,
+    "request_latency_p50_ms": 173.90462500043213,
+    "request_latency_p95_ms": 174.23150001559407
+  },
+  "power_w_mean": {
+    "ane": 1.4129141814837403,
+    "gpu": 0.01324196718791923,
+    "cpu": 0.24477399235421962,
+    "compute_rails_total": 1.6709301379593935
+  },
+  "package": {
+    "mlpackage_bytes": 709766171,
+    "mlmodelc_bytes": 709474806,
+    "local_conversion_s": 13.200871459004702,
+    "m1_compile_s": 0.13081687502563,
+    "m1_first_cold_load_s": 7.298707749927416,
+    "m1_warm_process_load_s": 0.092612958047539
+  }
+}

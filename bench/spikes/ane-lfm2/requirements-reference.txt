@@ -1,0 +1,6 @@
+# Transformers 4.51.3 predates model_type=lfm2; use this separate CPU-fp32 reference environment.
+numpy==2.4.6
+safetensors==0.8.0
+tokenizers==0.22.2
+torch==2.12.0
+transformers==5.12.1

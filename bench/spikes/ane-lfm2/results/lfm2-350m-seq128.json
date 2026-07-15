@@ -1,0 +1,72 @@
+{
+  "model": "LiquidAI/LFM2-350M",
+  "revision": "b3afba27815ee83a64b76162cef4d8a4780d6ca7",
+  "model_sha256": "387638dc889ff1a1395c3c2ab9605211e4c7e16f2d375361dd4e423b909a254e",
+  "bucket": 128,
+  "parity": {
+    "transformers_fp32_vs_custom_eager_prompt_min_cosine": 0.9999999999801823,
+    "custom_eager_vs_torch_export_prompt_min_cosine": 0.9999999999999997,
+    "transformers_fp32_vs_coreml_prompt_min_cosine": 0.9247332920362489,
+    "transformers_fp32_vs_coreml_prompt_mean_cosine": 0.9683760650339159,
+    "transformers_fp32_vs_coreml_token_min_cosine": 0.8276615289546543,
+    "transformers_fp32_vs_coreml_token_mean_cosine": 0.9674135171217374,
+    "transformers_fp32_vs_coreml_max_abs": 18.819475173950195,
+    "gate": 0.999,
+    "passed": false
+  },
+  "placement": {
+    "dispatchable_ops": 730,
+    "neural_engine_ops": 728,
+    "cpu_ops": 2,
+    "neural_engine_share": 0.9972602739726028,
+    "conv_ops_on_neural_engine": 102,
+    "conv_ops_total": 102,
+    "cpu_operator_classes": {"ios18.gather": 1, "ios18.cast": 1},
+    "neural_engine_operator_classes": {
+      "ios16.reduce_mean": 45,
+      "ios18.add": 101,
+      "ios18.concat": 12,
+      "ios18.conv": 102,
+      "ios18.expand_dims": 1,
+      "ios18.matmul": 12,
+      "ios18.mul": 224,
+      "ios18.reshape": 50,
+      "ios18.rsqrt": 45,
+      "ios18.silu": 16,
+      "ios18.slice_by_index": 24,
+      "ios18.softmax": 6,
+      "ios18.squeeze": 1,
+      "ios18.sub": 1,
+      "ios18.transpose": 56,
+      "pad": 10,
+      "split": 10,
+      "tile": 12
+    }
+  },
+  "speed": {
+    "prompts": 20,
+    "iterations": 10,
+    "active_tokens": 2290,
+    "fixed_bucket_tokens": 25600,
+    "infer_wall_s": 12.044652875047177,
+    "active_tokens_per_s": 190.1258611399401,
+    "fixed_bucket_tokens_per_s": 2125.4244738788066,
+    "requests_per_s": 16.604878702178176,
+    "request_latency_p50_ms": 60.24545896798372,
+    "request_latency_p95_ms": 60.57295796927065
+  },
+  "power_w_mean": {
+    "ane": 1.631267191527726,
+    "gpu": 0.014866591317241998,
+    "cpu": 0.2751653954967276,
+    "compute_rails_total": 1.9212991750085509
+  },
+  "package": {
+    "mlpackage_bytes": 709635099,
+    "mlmodelc_bytes": 709343734,
+    "local_conversion_s": 12.942068124990328,
+    "m1_compile_s": 0.16775987506844103,
+    "m1_first_cold_load_s": 5.6644859169609845,
+    "m1_warm_process_load_s": 0.08601474994793534
+  }
+}
