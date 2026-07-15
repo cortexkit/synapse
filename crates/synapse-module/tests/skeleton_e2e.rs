@@ -1180,6 +1180,11 @@ async fn probe_report_exposes_blocking_reasons_perf_rows_and_default_assignments
         before["result"]["lanes"][0]["blocking_reason"],
         "probe_required"
     );
+    assert_eq!(before["result"]["lanes"][0]["certification_required"], true);
+    assert_eq!(
+        before["result"]["lanes"][0]["certification_status"],
+        "uncertified"
+    );
     assert_eq!(before["result"]["lanes"][0]["performance"], Value::Null);
 
     let probed = certify_preloaded_models(&mut consumer, route, 86).await;
@@ -1209,6 +1214,9 @@ async fn probe_report_exposes_blocking_reasons_perf_rows_and_default_assignments
     assert_eq!(result["active_assignments"].as_array().unwrap().len(), 1);
     assert_eq!(result["active_assignments"][0]["model_id"], "minilm");
     assert_eq!(result["lanes"][0]["blocking_reason"], Value::Null);
+    assert_eq!(result["lanes"][0]["certification_required"], true);
+    assert_eq!(result["lanes"][0]["certification_status"], "certified");
+    assert_eq!(result["lanes"][0]["certification"]["status"], "certified");
     assert_eq!(result["lanes"][0]["certification_stale"], false);
     assert_eq!(result["lanes"][0]["performance_stale"], false);
     assert_eq!(result["lanes"][0]["performance"]["stale"], false);

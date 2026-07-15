@@ -376,6 +376,13 @@ const MIGRATIONS: &[Migration] = &[
                  CREATE INDEX cert_rows_fingerprint_idx ON cert_rows(fingerprint);
         "#,
     },
+    Migration {
+        version: 8,
+        statements: r#"
+                 ALTER TABLE cert_rows ADD COLUMN status TEXT NOT NULL DEFAULT 'certified'
+                     CHECK (status IN ('certified', 'uncertified'));
+        "#,
+    },
 ];
 
 static JOB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -487,6 +494,32 @@ impl AssuranceClass {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CertificationStatus {
+    Certified,
+    Uncertified,
+}
+
+impl CertificationStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Certified => "certified",
+            Self::Uncertified => "uncertified",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, SynapseStoreError> {
+        match value {
+            "certified" => Ok(Self::Certified),
+            "uncertified" => Ok(Self::Uncertified),
+            other => Err(SynapseStoreError::Decode(format!(
+                "unknown certification status '{other}'"
+            ))),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum CertificationKey {
@@ -528,6 +561,7 @@ impl CertificationKey {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct CertificationRow {
     pub assurance_class: AssuranceClass,
+    pub status: CertificationStatus,
     #[serde(flatten)]
     pub key: CertificationKey,
     pub numeric_profile_id: NumericProfileId,
@@ -774,6 +808,13 @@ impl SynapseStore {
                 "certification assurance class does not match its key variant".to_string(),
             ));
         }
+        if row.assurance_class == AssuranceClass::Declared
+            && row.status != CertificationStatus::Certified
+        {
+            return Err(SynapseStoreError::Decode(
+                "declared certification rows must be certified".to_string(),
+            ));
+        }
         let evidence_json = serde_json::to_string(&row.evidence)?;
         let (machine_profile_hash, remote_profile_hash, identity_revision) = match &row.key {
             CertificationKey::Measured {
@@ -792,11 +833,12 @@ impl SynapseStore {
         self.store.with_conn_fenced(|tx| {
             tx.execute(
                 "INSERT INTO cert_rows (
-                     assurance_class, key_hash, machine_profile_hash, remote_profile_hash,
+                     assurance_class, status, key_hash, machine_profile_hash, remote_profile_hash,
                      identity_revision, numeric_profile_id, fingerprint, certified_at_ms,
                      os_build, module_generation, evidence_json
-                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                   ON CONFLICT(assurance_class, key_hash, fingerprint) DO UPDATE SET
+                     status = excluded.status,
                      numeric_profile_id = excluded.numeric_profile_id,
                      certified_at_ms = excluded.certified_at_ms,
                      os_build = excluded.os_build,
@@ -804,6 +846,7 @@ impl SynapseStore {
                      evidence_json = excluded.evidence_json",
                 params![
                     row.assurance_class.as_str(),
+                    row.status.as_str(),
                     row.key.key_hash(),
                     machine_profile_hash,
                     remote_profile_hash,
@@ -828,7 +871,7 @@ impl SynapseStore {
         let raw = self.store.with_conn(|conn| {
             conn.query_row(
                 &format!(
-                    "{CERT_SELECT_SQL} WHERE assurance_class = 'measured' AND key_hash = ?1 AND fingerprint = ?2"
+                    "{CERT_SELECT_SQL} WHERE assurance_class = 'measured' AND status = 'certified' AND key_hash = ?1 AND fingerprint = ?2"
                 ),
                 params![machine_profile_hash, &fingerprint.0],
                 cert_row_from_row,
@@ -845,7 +888,42 @@ impl SynapseStore {
         let raw = self.store.with_conn(|conn| {
             conn.query_row(
                 &format!(
-                    "{CERT_SELECT_SQL} WHERE fingerprint = ?1 ORDER BY certified_at_ms DESC LIMIT 1"
+                    "{CERT_SELECT_SQL} WHERE status = 'certified' AND fingerprint = ?1 ORDER BY certified_at_ms DESC LIMIT 1"
+                ),
+                params![&fingerprint.0],
+                cert_row_from_row,
+            )
+            .optional()
+        })?;
+        raw.map(decode_cert_row).transpose()
+    }
+
+    pub fn get_probe_row(
+        &self,
+        machine_profile_hash: &str,
+        fingerprint: &Fingerprint,
+    ) -> Result<Option<CertificationRow>, SynapseStoreError> {
+        let raw = self.store.with_conn(|conn| {
+            conn.query_row(
+                &format!(
+                    "{CERT_SELECT_SQL} WHERE assurance_class = 'measured' AND key_hash = ?1 AND fingerprint = ?2"
+                ),
+                params![machine_profile_hash, &fingerprint.0],
+                cert_row_from_row,
+            )
+            .optional()
+        })?;
+        raw.map(decode_cert_row).transpose()
+    }
+
+    pub fn latest_probe_row(
+        &self,
+        fingerprint: &Fingerprint,
+    ) -> Result<Option<CertificationRow>, SynapseStoreError> {
+        let raw = self.store.with_conn(|conn| {
+            conn.query_row(
+                &format!(
+                    "{CERT_SELECT_SQL} WHERE assurance_class = 'measured' AND fingerprint = ?1 ORDER BY certified_at_ms DESC LIMIT 1"
                 ),
                 params![&fingerprint.0],
                 cert_row_from_row,
@@ -863,7 +941,8 @@ impl SynapseStore {
         let count = self.store.with_conn(|conn| {
             conn.query_row(
                 "SELECT COUNT(1) FROM cert_rows
-                 WHERE assurance_class = 'measured' AND fingerprint = ?1 AND key_hash <> ?2",
+                 WHERE assurance_class = 'measured' AND status = 'certified'
+                   AND fingerprint = ?1 AND key_hash <> ?2",
                 params![&fingerprint.0, machine_profile_hash],
                 |row| row.get::<_, i64>(0),
             )
@@ -1929,12 +2008,13 @@ fn unix_now_ms() -> u64 {
         .as_millis() as u64
 }
 
-const CERT_SELECT_SQL: &str = "SELECT assurance_class, machine_profile_hash,
+const CERT_SELECT_SQL: &str = "SELECT assurance_class, status, machine_profile_hash,
         remote_profile_hash, identity_revision, numeric_profile_id, fingerprint,
         certified_at_ms, os_build, module_generation, evidence_json FROM cert_rows";
 
 struct RawCertificationRow {
     assurance_class: String,
+    status: String,
     machine_profile_hash: Option<String>,
     remote_profile_hash: Option<String>,
     identity_revision: Option<String>,
@@ -1980,15 +2060,16 @@ struct RawKnobAssignmentRow {
 fn cert_row_from_row(row: &Row<'_>) -> rusqlite::Result<RawCertificationRow> {
     Ok(RawCertificationRow {
         assurance_class: row.get(0)?,
-        machine_profile_hash: row.get(1)?,
-        remote_profile_hash: row.get(2)?,
-        identity_revision: row.get(3)?,
-        numeric_profile_id: row.get(4)?,
-        fingerprint: row.get(5)?,
-        certified_at_ms: row.get::<_, i64>(6)? as u64,
-        os_build: row.get(7)?,
-        module_generation: row.get::<_, i64>(8)? as u64,
-        evidence_json: row.get(9)?,
+        status: row.get(1)?,
+        machine_profile_hash: row.get(2)?,
+        remote_profile_hash: row.get(3)?,
+        identity_revision: row.get(4)?,
+        numeric_profile_id: row.get(5)?,
+        fingerprint: row.get(6)?,
+        certified_at_ms: row.get::<_, i64>(7)? as u64,
+        os_build: row.get(8)?,
+        module_generation: row.get::<_, i64>(9)? as u64,
+        evidence_json: row.get(10)?,
     })
 }
 
@@ -2057,6 +2138,7 @@ fn decode_cert_row(row: RawCertificationRow) -> Result<CertificationRow, Synapse
     };
     Ok(CertificationRow {
         assurance_class,
+        status: CertificationStatus::parse(&row.status)?,
         key,
         numeric_profile_id: NumericProfileId(row.numeric_profile_id),
         fingerprint: Fingerprint(row.fingerprint),
@@ -2628,6 +2710,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(cert.assurance_class, AssuranceClass::Measured);
+        assert_eq!(cert.status, CertificationStatus::Certified);
         assert_eq!(
             cert.key,
             CertificationKey::Measured {
@@ -2642,12 +2725,66 @@ mod tests {
     }
 
     #[test]
+    fn uncertified_reprobe_demotes_the_machine_fingerprint_pair() {
+        let (root, descriptor) = temp_descriptor("uncertified-reprobe");
+        let store = SynapseStore::open(&descriptor).unwrap();
+        let fingerprint = Fingerprint("decode-fp".to_string());
+        let mut row = CertificationRow {
+            assurance_class: AssuranceClass::Measured,
+            status: CertificationStatus::Certified,
+            key: CertificationKey::Measured {
+                machine_profile_hash: "machine-a".to_string(),
+            },
+            numeric_profile_id: NumericProfileId("decode-np".to_string()),
+            fingerprint: fingerprint.clone(),
+            certified_at_ms: 10,
+            os_build: "os-a".to_string(),
+            module_generation: 1,
+            evidence: serde_json::json!({"gate": "token_exact"}),
+        };
+        store.store_cert_row(&row).unwrap();
+        assert!(store
+            .get_cert_row("machine-a", &fingerprint)
+            .unwrap()
+            .is_some());
+
+        row.status = CertificationStatus::Uncertified;
+        row.certified_at_ms = 20;
+        row.evidence = serde_json::json!({
+            "blocking_reason": "token_mismatch",
+            "mismatches": [{"prompt": "corrupted fixture"}],
+        });
+        store.store_cert_row(&row).unwrap();
+
+        assert!(store
+            .get_cert_row("machine-a", &fingerprint)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store.get_probe_row("machine-a", &fingerprint).unwrap(),
+            Some(row)
+        );
+        let refused = crate::ensure_fingerprint_certified(
+            &store,
+            "machine-a",
+            &fingerprint,
+            "owned-qwen3",
+            false,
+        )
+        .expect_err("an uncertified decode outcome must refuse future owned requests");
+        assert_eq!(refused.code, "not_certified");
+        assert!(refused.message.contains("token_mismatch"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn declared_certifications_use_remote_profile_keys() {
         let (root, descriptor) = temp_descriptor("declared-cert");
         let store = SynapseStore::open(&descriptor).unwrap();
         let fingerprint = Fingerprint("declared-fp".to_string());
         let row = CertificationRow {
             assurance_class: AssuranceClass::Declared,
+            status: CertificationStatus::Certified,
             key: CertificationKey::Declared {
                 machine_profile_hash: "machine-a".to_string(),
                 remote_profile_hash: "remote-profile".to_string(),

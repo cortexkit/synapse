@@ -124,10 +124,9 @@ async fn worker_generates_qwen3_when_cached() {
         .load_model(&gguf_artifact(), &generate_runtime_config(&paths.gguf))
         .await
         .expect("worker LOAD should succeed");
-    let fixture: serde_json::Value = serde_json::from_str(include_str!(
-        "../../synapse-module/src/fixtures/probe_generate_qwen3_0_6b_v1.json"
-    ))
-    .expect("generate fixture should decode");
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/generate_qwen3_labels_v1.json"))
+            .expect("generate fixture should decode");
     let mut matches = 0_usize;
     for item in fixture["items"].as_array().expect("fixture items") {
         let prompt = item["prompt"].as_str().expect("fixture prompt");

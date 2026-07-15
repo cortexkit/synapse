@@ -126,6 +126,8 @@ pub enum WorkerResponse {
         n_prompt: usize,
         n_gen: usize,
         finish_reason: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        generated_token_ids: Vec<u32>,
     },
     Unloaded {
         req_id: String,
@@ -254,16 +256,16 @@ mod tests {
             serde_json::from_slice::<WorkerRequest>(&encoded).unwrap(),
             generate
         );
-        assert_eq!(
-            serde_json::to_value(WorkerResponse::Text {
-                req_id: "generate-1".to_string(),
-                text: "yes".to_string(),
-                n_prompt: 4,
-                n_gen: 1,
-                finish_reason: "stop".to_string(),
-            })
-            .unwrap()["type"],
-            "TEXT"
-        );
+        let generated = serde_json::to_value(WorkerResponse::Text {
+            req_id: "generate-1".to_string(),
+            text: "yes".to_string(),
+            n_prompt: 4,
+            n_gen: 1,
+            finish_reason: "stop".to_string(),
+            generated_token_ids: vec![9693],
+        })
+        .unwrap();
+        assert_eq!(generated["type"], "TEXT");
+        assert_eq!(generated["generated_token_ids"], serde_json::json!([9693]));
     }
 }

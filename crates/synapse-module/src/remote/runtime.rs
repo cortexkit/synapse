@@ -827,6 +827,7 @@ impl SentinelContinuityCheck {
         let calibration = self.calibrate(profile, logical_handle).await?;
         let row = CertificationRow {
             assurance_class: AssuranceClass::Declared,
+            status: crate::store::CertificationStatus::Certified,
             key: CertificationKey::Declared {
                 machine_profile_hash: profile.machine_profile_hash.clone(),
                 remote_profile_hash: profile.remote_profile_hash.clone(),
