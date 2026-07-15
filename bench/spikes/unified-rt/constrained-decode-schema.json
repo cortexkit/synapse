@@ -1,0 +1,14 @@
+{
+  "type": "object",
+  "properties": {
+    "result": {
+      "type": "string",
+      "enum": ["allow", "deny"]
+    },
+    "score": {
+      "type": "number"
+    }
+  },
+  "required": ["result", "score"],
+  "additionalProperties": false
+}
