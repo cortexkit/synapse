@@ -6686,6 +6686,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "synapse-opctl"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "hex",
+ "serde_json",
+ "sha2",
+ "subc-client-rs",
+ "subc-protocol",
+ "tokio",
+]
+
+[[package]]
 name = "synapse-rig"
 version = "0.0.0"
 dependencies = [
