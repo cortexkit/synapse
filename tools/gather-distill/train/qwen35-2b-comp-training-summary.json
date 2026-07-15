@@ -1,0 +1,75 @@
+{
+  "configured_epochs": 3,
+  "reported_final_epoch": 2.984,
+  "steps": 165,
+  "loss_first": 0.858,
+  "loss_last": 0.3751,
+  "loss_first_10_mean": 0.75031,
+  "loss_last_10_mean": 0.38488,
+  "loss_min": 0.3351,
+  "loss_max": 1.074,
+  "per_epoch": [
+    {
+      "epoch": 1,
+      "steps": 55,
+      "loss_mean": 0.6409781818181818,
+      "loss_first": 0.858,
+      "loss_last": 0.6672
+    },
+    {
+      "epoch": 2,
+      "steps": 55,
+      "loss_mean": 0.4557145454545454,
+      "loss_first": 1.074,
+      "loss_last": 0.3908
+    },
+    {
+      "epoch": 3,
+      "steps": 55,
+      "loss_mean": 0.3863399999999999,
+      "loss_first": 0.8653,
+      "loss_last": 0.3751
+    }
+  ],
+  "evaluation": [
+    {
+      "eval_loss": 0.8679,
+      "eval_ppl": 2.382,
+      "epoch": 0.0,
+      "step": 0
+    },
+    {
+      "eval_loss": 0.5944,
+      "eval_ppl": 1.812,
+      "epoch": 0.9843,
+      "step": 55
+    },
+    {
+      "eval_loss": 0.5997,
+      "eval_ppl": 1.822,
+      "epoch": 1.984,
+      "step": 110
+    },
+    {
+      "eval_loss": 0.6154,
+      "eval_ppl": 1.85,
+      "epoch": 2.984,
+      "step": 165
+    }
+  ],
+  "trainer_runtime_seconds": 2187.0,
+  "last_logged_cumulative_input_tokens": 43646976,
+  "last_logged_cumulative_supervised_tokens": 4392934,
+  "aggregate_input_tokens_per_second": 19957.46502057613,
+  "aggregate_supervised_tokens_per_second": 2008.65752171925,
+  "pytorch_peak_allocated_gib": 48.03,
+  "nvidia_smi_peak_used_mib": 53506,
+  "nvidia_smi_peak_power_w": 703.47,
+  "retained_checkpoints": [
+    "checkpoint-160",
+    "checkpoint-165"
+  ],
+  "nan_or_inf": false,
+  "gguf_q8_0_bytes": 2012012672,
+  "gguf_q8_0_sha256": "b91b3dc052c033590b156c4b129286160376ffc58697e96c44b343a1d6873b54"
+}

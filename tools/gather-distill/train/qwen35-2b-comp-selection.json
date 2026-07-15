@@ -1,0 +1,866 @@
+{
+  "method": "Within-stratum SHA-256 ranking with exact-half largest-remainder apportionment",
+  "selection_mode": "complement",
+  "row_index_base": 0,
+  "seed": 8918,
+  "stratification": [
+    "tags.request_class",
+    "tags.language"
+  ],
+  "input": "train/sft-dataset-curated.jsonl",
+  "input_rows": 1864,
+  "input_sha256": "005f0cad5fa3da8a21b448fce6e68a3787a516c090f938616556cbae56094859",
+  "metadata_source": "data/dataset-v1.jsonl",
+  "metadata_source_rows": 1884,
+  "metadata_source_sha256": "d5b49e2c2effa5c171c2040793a35ff8a4ac3ebb5456ce0b52107650bbe6370b",
+  "output": "train/sft-dataset-curated-comp.jsonl",
+  "output_rows": 932,
+  "output_sha256": "05d66a7f7b05e7e5cb58570eeaac8b68d027b719f834605a6fb5a4b611ef45e7",
+  "indices": "train/qwen35-2b-half-indices.txt",
+  "indices_sha256": "fc69db4481c92c234968ebee7a569a59edb4e1df53ada49829811d3d24b385a9",
+  "strata": [
+    {
+      "request_class": "api_usage",
+      "language": "c",
+      "full_rows": 24,
+      "half_rows": 12,
+      "complement_rows": 12
+    },
+    {
+      "request_class": "api_usage",
+      "language": "cc",
+      "full_rows": 5,
+      "half_rows": 3,
+      "complement_rows": 2
+    },
+    {
+      "request_class": "api_usage",
+      "language": "cpp",
+      "full_rows": 26,
+      "half_rows": 13,
+      "complement_rows": 13
+    },
+    {
+      "request_class": "api_usage",
+      "language": "cs",
+      "full_rows": 26,
+      "half_rows": 13,
+      "complement_rows": 13
+    },
+    {
+      "request_class": "api_usage",
+      "language": "csharp",
+      "full_rows": 11,
+      "half_rows": 5,
+      "complement_rows": 6
+    },
+    {
+      "request_class": "api_usage",
+      "language": "elixir",
+      "full_rows": 11,
+      "half_rows": 6,
+      "complement_rows": 5
+    },
+    {
+      "request_class": "api_usage",
+      "language": "go",
+      "full_rows": 30,
+      "half_rows": 15,
+      "complement_rows": 15
+    },
+    {
+      "request_class": "api_usage",
+      "language": "haskell",
+      "full_rows": 10,
+      "half_rows": 5,
+      "complement_rows": 5
+    },
+    {
+      "request_class": "api_usage",
+      "language": "java",
+      "full_rows": 16,
+      "half_rows": 8,
+      "complement_rows": 8
+    },
+    {
+      "request_class": "api_usage",
+      "language": "kotlin",
+      "full_rows": 11,
+      "half_rows": 5,
+      "complement_rows": 6
+    },
+    {
+      "request_class": "api_usage",
+      "language": "kt",
+      "full_rows": 15,
+      "half_rows": 7,
+      "complement_rows": 8
+    },
+    {
+      "request_class": "api_usage",
+      "language": "mixed",
+      "full_rows": 5,
+      "half_rows": 3,
+      "complement_rows": 2
+    },
+    {
+      "request_class": "api_usage",
+      "language": "php",
+      "full_rows": 30,
+      "half_rows": 15,
+      "complement_rows": 15
+    },
+    {
+      "request_class": "api_usage",
+      "language": "py",
+      "full_rows": 10,
+      "half_rows": 5,
+      "complement_rows": 5
+    },
+    {
+      "request_class": "api_usage",
+      "language": "python",
+      "full_rows": 9,
+      "half_rows": 4,
+      "complement_rows": 5
+    },
+    {
+      "request_class": "api_usage",
+      "language": "rb",
+      "full_rows": 20,
+      "half_rows": 10,
+      "complement_rows": 10
+    },
+    {
+      "request_class": "api_usage",
+      "language": "rs",
+      "full_rows": 10,
+      "half_rows": 5,
+      "complement_rows": 5
+    },
+    {
+      "request_class": "api_usage",
+      "language": "ruby",
+      "full_rows": 10,
+      "half_rows": 5,
+      "complement_rows": 5
+    },
+    {
+      "request_class": "api_usage",
+      "language": "rust",
+      "full_rows": 8,
+      "half_rows": 4,
+      "complement_rows": 4
+    },
+    {
+      "request_class": "api_usage",
+      "language": "scala",
+      "full_rows": 30,
+      "half_rows": 15,
+      "complement_rows": 15
+    },
+    {
+      "request_class": "api_usage",
+      "language": "sh",
+      "full_rows": 20,
+      "half_rows": 10,
+      "complement_rows": 10
+    },
+    {
+      "request_class": "api_usage",
+      "language": "swift",
+      "full_rows": 30,
+      "half_rows": 15,
+      "complement_rows": 15
+    },
+    {
+      "request_class": "api_usage",
+      "language": "ts",
+      "full_rows": 19,
+      "half_rows": 9,
+      "complement_rows": 10
+    },
+    {
+      "request_class": "api_usage",
+      "language": "typescript",
+      "full_rows": 10,
+      "half_rows": 5,
+      "complement_rows": 5
+    },
+    {
+      "request_class": "bug_investigation",
+      "language": "c",
+      "full_rows": 25,
+      "half_rows": 12,
+      "complement_rows": 13
+    },
+    {
+      "request_class": "bug_investigation",
+      "language": "cc",
+      "full_rows": 5,
+      "half_rows": 3,
+      "complement_rows": 2
+    },
+    {
+      "request_class": "bug_investigation",
+      "language": "cpp",
+      "full_rows": 26,
+      "half_rows": 13,
+      "complement_rows": 13
+    },
+    {
+      "request_class": "bug_investigation",
+      "language": "cs",
+      "full_rows": 24,
+      "half_rows": 12,
+      "complement_rows": 12
+    },
+    {
+      "request_class": "bug_investigation",
+      "language": "csharp",
+      "full_rows": 10,
+      "half_rows": 5,
+      "complement_rows": 5
+    },
+    {
+      "request_class": "bug_investigation",
+      "language": "elixir",
+      "full_rows": 10,
+      "half_rows": 5,
+      "complement_rows": 5
+    },
+    {
+      "request_class": "bug_investigation",
+      "language": "go",
+      "full_rows": 30,
+      "half_rows": 15,
+      "complement_rows": 15
+    },
+    {
+      "request_class": "bug_investigation",
+      "language": "haskell",
+      "full_rows": 10,
+      "half_rows": 5,
+      "complement_rows": 5
+    },
+    {
+      "request_class": "bug_investigation",
+      "language": "java",
+      "full_rows": 15,
+      "half_rows": 7,
+      "complement_rows": 8
+    },
+    {
+      "request_class": "bug_investigation",
+      "language": "kotlin",
+      "full_rows": 10,
+      "half_rows": 5,
+      "complement_rows": 5
+    },
+    {
+      "request_class": "bug_investigation",
+      "language": "kt",
+      "full_rows": 15,
+      "half_rows": 7,
+      "complement_rows": 8
+    },
+    {
+      "request_class": "bug_investigation",
+      "language": "mixed",
+      "full_rows": 5,
+      "half_rows": 3,
+      "complement_rows": 2
+    },
+    {
+      "request_class": "bug_investigation",
+      "language": "php",
+      "full_rows": 30,
+      "half_rows": 15,
+      "complement_rows": 15
+    },
+    {
+      "request_class": "bug_investigation",
+      "language": "py",
+      "full_rows": 10,
+      "half_rows": 5,
+      "complement_rows": 5
+    },
+    {
+      "request_class": "bug_investigation",
+      "language": "python",
+      "full_rows": 9,
+      "half_rows": 5,
+      "complement_rows": 4
+    },
+    {
+      "request_class": "bug_investigation",
+      "language": "rb",
+      "full_rows": 21,
+      "half_rows": 11,
+      "complement_rows": 10
+    },
+    {
+      "request_class": "bug_investigation",
+      "language": "rs",
+      "full_rows": 11,
+      "half_rows": 5,
+      "complement_rows": 6
+    },
+    {
+      "request_class": "bug_investigation",
+      "language": "ruby",
+      "full_rows": 10,
+      "half_rows": 5,
+      "complement_rows": 5
+    },
+    {
+      "request_class": "bug_investigation",
+      "language": "rust",
+      "full_rows": 9,
+      "half_rows": 5,
+      "complement_rows": 4
+    },
+    {
+      "request_class": "bug_investigation",
+      "language": "scala",
+      "full_rows": 29,
+      "half_rows": 14,
+      "complement_rows": 15
+    },
+    {
+      "request_class": "bug_investigation",
+      "language": "sh",
+      "full_rows": 20,
+      "half_rows": 10,
+      "complement_rows": 10
+    },
+    {
+      "request_class": "bug_investigation",
+      "language": "swift",
+      "full_rows": 31,
+      "half_rows": 16,
+      "complement_rows": 15
+    },
+    {
+      "request_class": "bug_investigation",
+      "language": "ts",
+      "full_rows": 20,
+      "half_rows": 10,
+      "complement_rows": 10
+    },
+    {
+      "request_class": "bug_investigation",
+      "language": "typescript",
+      "full_rows": 8,
+      "half_rows": 4,
+      "complement_rows": 4
+    },
+    {
+      "request_class": "cross_module_trace",
+      "language": "c",
+      "full_rows": 24,
+      "half_rows": 12,
+      "complement_rows": 12
+    },
+    {
+      "request_class": "cross_module_trace",
+      "language": "cc",
+      "full_rows": 5,
+      "half_rows": 3,
+      "complement_rows": 2
+    },
+    {
+      "request_class": "cross_module_trace",
+      "language": "cpp",
+      "full_rows": 23,
+      "half_rows": 12,
+      "complement_rows": 11
+    },
+    {
+      "request_class": "cross_module_trace",
+      "language": "cs",
+      "full_rows": 25,
+      "half_rows": 13,
+      "complement_rows": 12
+    },
+    {
+      "request_class": "cross_module_trace",
+      "language": "csharp",
+      "full_rows": 9,
+      "half_rows": 4,
+      "complement_rows": 5
+    },
+    {
+      "request_class": "cross_module_trace",
+      "language": "elixir",
+      "full_rows": 7,
+      "half_rows": 3,
+      "complement_rows": 4
+    },
+    {
+      "request_class": "cross_module_trace",
+      "language": "go",
+      "full_rows": 28,
+      "half_rows": 14,
+      "complement_rows": 14
+    },
+    {
+      "request_class": "cross_module_trace",
+      "language": "haskell",
+      "full_rows": 11,
+      "half_rows": 6,
+      "complement_rows": 5
+    },
+    {
+      "request_class": "cross_module_trace",
+      "language": "java",
+      "full_rows": 13,
+      "half_rows": 6,
+      "complement_rows": 7
+    },
+    {
+      "request_class": "cross_module_trace",
+      "language": "kotlin",
+      "full_rows": 8,
+      "half_rows": 4,
+      "complement_rows": 4
+    },
+    {
+      "request_class": "cross_module_trace",
+      "language": "kt",
+      "full_rows": 13,
+      "half_rows": 6,
+      "complement_rows": 7
+    },
+    {
+      "request_class": "cross_module_trace",
+      "language": "mixed",
+      "full_rows": 4,
+      "half_rows": 2,
+      "complement_rows": 2
+    },
+    {
+      "request_class": "cross_module_trace",
+      "language": "php",
+      "full_rows": 29,
+      "half_rows": 15,
+      "complement_rows": 14
+    },
+    {
+      "request_class": "cross_module_trace",
+      "language": "py",
+      "full_rows": 9,
+      "half_rows": 5,
+      "complement_rows": 4
+    },
+    {
+      "request_class": "cross_module_trace",
+      "language": "python",
+      "full_rows": 7,
+      "half_rows": 4,
+      "complement_rows": 3
+    },
+    {
+      "request_class": "cross_module_trace",
+      "language": "rb",
+      "full_rows": 19,
+      "half_rows": 9,
+      "complement_rows": 10
+    },
+    {
+      "request_class": "cross_module_trace",
+      "language": "rs",
+      "full_rows": 10,
+      "half_rows": 5,
+      "complement_rows": 5
+    },
+    {
+      "request_class": "cross_module_trace",
+      "language": "ruby",
+      "full_rows": 9,
+      "half_rows": 5,
+      "complement_rows": 4
+    },
+    {
+      "request_class": "cross_module_trace",
+      "language": "rust",
+      "full_rows": 9,
+      "half_rows": 5,
+      "complement_rows": 4
+    },
+    {
+      "request_class": "cross_module_trace",
+      "language": "scala",
+      "full_rows": 26,
+      "half_rows": 13,
+      "complement_rows": 13
+    },
+    {
+      "request_class": "cross_module_trace",
+      "language": "sh",
+      "full_rows": 19,
+      "half_rows": 9,
+      "complement_rows": 10
+    },
+    {
+      "request_class": "cross_module_trace",
+      "language": "swift",
+      "full_rows": 28,
+      "half_rows": 14,
+      "complement_rows": 14
+    },
+    {
+      "request_class": "cross_module_trace",
+      "language": "ts",
+      "full_rows": 16,
+      "half_rows": 8,
+      "complement_rows": 8
+    },
+    {
+      "request_class": "cross_module_trace",
+      "language": "typescript",
+      "full_rows": 8,
+      "half_rows": 4,
+      "complement_rows": 4
+    },
+    {
+      "request_class": "feature_orientation",
+      "language": "c",
+      "full_rows": 24,
+      "half_rows": 12,
+      "complement_rows": 12
+    },
+    {
+      "request_class": "feature_orientation",
+      "language": "cc",
+      "full_rows": 5,
+      "half_rows": 2,
+      "complement_rows": 3
+    },
+    {
+      "request_class": "feature_orientation",
+      "language": "cpp",
+      "full_rows": 23,
+      "half_rows": 11,
+      "complement_rows": 12
+    },
+    {
+      "request_class": "feature_orientation",
+      "language": "cs",
+      "full_rows": 25,
+      "half_rows": 13,
+      "complement_rows": 12
+    },
+    {
+      "request_class": "feature_orientation",
+      "language": "csharp",
+      "full_rows": 9,
+      "half_rows": 5,
+      "complement_rows": 4
+    },
+    {
+      "request_class": "feature_orientation",
+      "language": "elixir",
+      "full_rows": 10,
+      "half_rows": 5,
+      "complement_rows": 5
+    },
+    {
+      "request_class": "feature_orientation",
+      "language": "go",
+      "full_rows": 28,
+      "half_rows": 14,
+      "complement_rows": 14
+    },
+    {
+      "request_class": "feature_orientation",
+      "language": "haskell",
+      "full_rows": 9,
+      "half_rows": 5,
+      "complement_rows": 4
+    },
+    {
+      "request_class": "feature_orientation",
+      "language": "java",
+      "full_rows": 16,
+      "half_rows": 8,
+      "complement_rows": 8
+    },
+    {
+      "request_class": "feature_orientation",
+      "language": "kotlin",
+      "full_rows": 9,
+      "half_rows": 4,
+      "complement_rows": 5
+    },
+    {
+      "request_class": "feature_orientation",
+      "language": "kt",
+      "full_rows": 15,
+      "half_rows": 8,
+      "complement_rows": 7
+    },
+    {
+      "request_class": "feature_orientation",
+      "language": "mixed",
+      "full_rows": 5,
+      "half_rows": 2,
+      "complement_rows": 3
+    },
+    {
+      "request_class": "feature_orientation",
+      "language": "php",
+      "full_rows": 29,
+      "half_rows": 15,
+      "complement_rows": 14
+    },
+    {
+      "request_class": "feature_orientation",
+      "language": "py",
+      "full_rows": 10,
+      "half_rows": 5,
+      "complement_rows": 5
+    },
+    {
+      "request_class": "feature_orientation",
+      "language": "python",
+      "full_rows": 8,
+      "half_rows": 4,
+      "complement_rows": 4
+    },
+    {
+      "request_class": "feature_orientation",
+      "language": "rb",
+      "full_rows": 20,
+      "half_rows": 10,
+      "complement_rows": 10
+    },
+    {
+      "request_class": "feature_orientation",
+      "language": "rs",
+      "full_rows": 9,
+      "half_rows": 4,
+      "complement_rows": 5
+    },
+    {
+      "request_class": "feature_orientation",
+      "language": "ruby",
+      "full_rows": 10,
+      "half_rows": 5,
+      "complement_rows": 5
+    },
+    {
+      "request_class": "feature_orientation",
+      "language": "rust",
+      "full_rows": 9,
+      "half_rows": 4,
+      "complement_rows": 5
+    },
+    {
+      "request_class": "feature_orientation",
+      "language": "scala",
+      "full_rows": 28,
+      "half_rows": 14,
+      "complement_rows": 14
+    },
+    {
+      "request_class": "feature_orientation",
+      "language": "sh",
+      "full_rows": 18,
+      "half_rows": 9,
+      "complement_rows": 9
+    },
+    {
+      "request_class": "feature_orientation",
+      "language": "swift",
+      "full_rows": 29,
+      "half_rows": 14,
+      "complement_rows": 15
+    },
+    {
+      "request_class": "feature_orientation",
+      "language": "ts",
+      "full_rows": 19,
+      "half_rows": 10,
+      "complement_rows": 9
+    },
+    {
+      "request_class": "feature_orientation",
+      "language": "typescript",
+      "full_rows": 10,
+      "half_rows": 5,
+      "complement_rows": 5
+    },
+    {
+      "request_class": "refactor_prep",
+      "language": "c",
+      "full_rows": 22,
+      "half_rows": 11,
+      "complement_rows": 11
+    },
+    {
+      "request_class": "refactor_prep",
+      "language": "cc",
+      "full_rows": 4,
+      "half_rows": 2,
+      "complement_rows": 2
+    },
+    {
+      "request_class": "refactor_prep",
+      "language": "cpp",
+      "full_rows": 20,
+      "half_rows": 10,
+      "complement_rows": 10
+    },
+    {
+      "request_class": "refactor_prep",
+      "language": "cs",
+      "full_rows": 18,
+      "half_rows": 9,
+      "complement_rows": 9
+    },
+    {
+      "request_class": "refactor_prep",
+      "language": "csharp",
+      "full_rows": 8,
+      "half_rows": 4,
+      "complement_rows": 4
+    },
+    {
+      "request_class": "refactor_prep",
+      "language": "elixir",
+      "full_rows": 9,
+      "half_rows": 4,
+      "complement_rows": 5
+    },
+    {
+      "request_class": "refactor_prep",
+      "language": "go",
+      "full_rows": 28,
+      "half_rows": 14,
+      "complement_rows": 14
+    },
+    {
+      "request_class": "refactor_prep",
+      "language": "haskell",
+      "full_rows": 8,
+      "half_rows": 4,
+      "complement_rows": 4
+    },
+    {
+      "request_class": "refactor_prep",
+      "language": "java",
+      "full_rows": 14,
+      "half_rows": 7,
+      "complement_rows": 7
+    },
+    {
+      "request_class": "refactor_prep",
+      "language": "kotlin",
+      "full_rows": 10,
+      "half_rows": 5,
+      "complement_rows": 5
+    },
+    {
+      "request_class": "refactor_prep",
+      "language": "kt",
+      "full_rows": 14,
+      "half_rows": 7,
+      "complement_rows": 7
+    },
+    {
+      "request_class": "refactor_prep",
+      "language": "mixed",
+      "full_rows": 5,
+      "half_rows": 3,
+      "complement_rows": 2
+    },
+    {
+      "request_class": "refactor_prep",
+      "language": "php",
+      "full_rows": 25,
+      "half_rows": 12,
+      "complement_rows": 13
+    },
+    {
+      "request_class": "refactor_prep",
+      "language": "py",
+      "full_rows": 8,
+      "half_rows": 4,
+      "complement_rows": 4
+    },
+    {
+      "request_class": "refactor_prep",
+      "language": "python",
+      "full_rows": 7,
+      "half_rows": 4,
+      "complement_rows": 3
+    },
+    {
+      "request_class": "refactor_prep",
+      "language": "rb",
+      "full_rows": 16,
+      "half_rows": 8,
+      "complement_rows": 8
+    },
+    {
+      "request_class": "refactor_prep",
+      "language": "rs",
+      "full_rows": 8,
+      "half_rows": 4,
+      "complement_rows": 4
+    },
+    {
+      "request_class": "refactor_prep",
+      "language": "ruby",
+      "full_rows": 9,
+      "half_rows": 4,
+      "complement_rows": 5
+    },
+    {
+      "request_class": "refactor_prep",
+      "language": "rust",
+      "full_rows": 8,
+      "half_rows": 4,
+      "complement_rows": 4
+    },
+    {
+      "request_class": "refactor_prep",
+      "language": "scala",
+      "full_rows": 28,
+      "half_rows": 14,
+      "complement_rows": 14
+    },
+    {
+      "request_class": "refactor_prep",
+      "language": "sh",
+      "full_rows": 19,
+      "half_rows": 10,
+      "complement_rows": 9
+    },
+    {
+      "request_class": "refactor_prep",
+      "language": "swift",
+      "full_rows": 26,
+      "half_rows": 13,
+      "complement_rows": 13
+    },
+    {
+      "request_class": "refactor_prep",
+      "language": "ts",
+      "full_rows": 17,
+      "half_rows": 8,
+      "complement_rows": 9
+    },
+    {
+      "request_class": "refactor_prep",
+      "language": "typescript",
+      "full_rows": 8,
+      "half_rows": 4,
+      "complement_rows": 4
+    }
+  ],
+  "selection_rows": 932,
+  "selection_output_intersection_rows": 0,
+  "selection_output_union_rows": 1864
+}
