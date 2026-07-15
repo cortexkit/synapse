@@ -1,0 +1,14 @@
+{
+  "steps": 30,
+  "loss_first": 0.858021080493927,
+  "loss_last": 0.6554707884788513,
+  "loss_first_5_mean": 0.7965919256210328,
+  "loss_last_5_mean": 0.6182172894477844,
+  "loss_min": 0.557256281375885,
+  "loss_max": 0.8657207489013672,
+  "nan_or_inf": false,
+  "checkpoints": [
+    "checkpoint-20",
+    "checkpoint-30"
+  ]
+}

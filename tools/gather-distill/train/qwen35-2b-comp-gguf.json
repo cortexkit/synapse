@@ -1,0 +1,26 @@
+{
+  "llama_cpp_revision": "b4e3dc613baa92a3884d4151e3d631395c81934a",
+  "source": "train/outputs/qwen35-2b-comp-full/model.safetensors",
+  "source_sha256": "87bf70e5b8cd5f4f7205e02aa44930797c2755f3f884da0bb7494aacec04c260",
+  "text_only": true,
+  "conversion_fix": "Set mtp_num_hidden_layers=0 in a conversion-only config copy because Qwen3_5ForCausalLM contains no MTP tensors; this corrects GGUF block_count from 25 to 24.",
+  "gguf": [
+    {
+      "name": "qwen35-2b-comp-v1-f16.gguf",
+      "quantization": "F16",
+      "bytes": 3775709312,
+      "sha256": "cb775ae2623f37bc3dc55352d8d026cc31fe817f362b9e0cdd7ce47e4216e9ca"
+    },
+    {
+      "name": "qwen35-2b-comp-v1-q8_0.gguf",
+      "quantization": "Q8_0",
+      "bytes": 2012012672,
+      "sha256": "b91b3dc052c033590b156c4b129286160376ffc58697e96c44b343a1d6873b54"
+    }
+  ],
+  "gguf_architecture": "qwen35",
+  "gguf_block_count": 24,
+  "tensor_count": 320,
+  "served_context": 131072,
+  "training_context": 262144
+}
