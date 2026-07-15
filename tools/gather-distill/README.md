@@ -193,6 +193,44 @@ bun run src/cli.ts score \
 
 The scorer re-runs `validateBankedRow` for every latest candidate row, then pairs rows by repository, pinned SHA, and request. It uses only `final_json.snippets[].path` for file F1; `scope` is context rather than a citation. It reports inclusive line-range Jaccard overlap for shared files, clamped to the pinned file length, candidate-to-gold tool-call ratio, budget outcomes, output and thinking-token statistics, and a flattened `summary_row` for comparison tables. It never calls an LLM.
 
+### Student checkpoint evaluation
+
+`./scripts/eval-student.sh CHECKPOINT_OR_GGUF MODEL_LABEL` turns a fine-tuned checkpoint into one comparable ladder row. An HF safetensors directory is converted through the text-only `convert_hf_to_gguf.py` path, quantized to Q8_0, served with `-ngl 99 --jinja -fa on`, gathered over all 40 fixed jobs, and mechanically scored against Opus gold. The script is pinned to llama.cpp build `9580` / revision `b4e3dc613`; keep that revision or an equivalent current build because Qwen3.5 and Gemma 4 text conversion support is required.
+
+For a standalone GGUF, provide its adjacent `config.json` or set `EVAL_CONFIG_JSON`; the script clamps the normal `131072` context request to the trained maximum in that config. A file named like `*Q8_0.gguf` is used directly; use an F16/BF16 GGUF for fresh quantization. Results are written under ignored `data/students/` as `<label>-scores.json`, resumable rows/ledger/status files, and `LADDER.md`. The ladder uses the same columns as the zero-shot bake-off, including natural-only F1/Jaccard and whole-run validity, API, tool, budget, context, and timing measurements.
+
+```sh
+cd tools/gather-distill
+./scripts/eval-student.sh ~/checkpoints/student-merged student-sft-v1
+
+# Existing Q8 GGUF: config is needed only to apply the trained-context clamp.
+EVAL_CONFIG_JSON=~/checkpoints/LFM2.5/config.json \
+  ./scripts/eval-student.sh ~/models/LFM2.5-Q8_0.gguf student-sft-v1
+```
+
+The local default is a Metal server at `127.0.0.1:8090`. On a CUDA host, run the same command there with `LLAMA_CPP_DIR` (or explicit `LLAMA_SERVER` and `LLAMA_QUANTIZE`) set to that host's llama.cpp build. For the intended GPU-host server / Mac harness topology, start the remote server first and run the harness with a tunnel:
+
+```sh
+# The remote model is already converted, quantized, and listening on port 8090.
+EVAL_REMOTE_ENDPOINT=root@gpu.example EVAL_REMOTE_SSH_PORT=22 \
+  ./scripts/eval-student.sh remote-serving-checkpoint student-sft-v1
+```
+
+`EVAL_REMOTE_ENDPOINT` makes the script open `ssh -L` to the remote `llama-server`; it does not inspect or copy the positional checkpoint path in tunnel mode. The harness machine must have the ignored eval data, `~/Work/OSS/gather-corpus-eval` clones, and `GATHER_DISTILL_AFT_BINARY` (normally `bin/aft-dev-7cabfdd0`). A remote all-in-one run needs those same assets staged on the GPU host.
+
+### TRACE reward bridge
+
+`train_reward/reward.py` exposes `reward(trajectory_or_final_package, job_id) -> {"reward": float, "diagnostics": {...}}` without depending on a training framework. It writes the candidate to a temporary JSON file and calls the reusable score-one lane:
+
+```sh
+bun run src/cli.ts score-one \
+  --job JOB_ID \
+  --candidate-file candidate.json \
+  --gold data/eval-gold-rows.jsonl
+```
+
+`candidate.json` may be a final package, a BankedRow, or a trajectory whose final assistant text contains the package. Score-one uses the selected gold row's identity and returns exactly one JSON verdict line. Reward shaping v1 is intentionally narrow: a **natural**, schema-valid completion receives its cited-file F1; an invalid or non-natural completion receives `0`. Diagnostics include `line_jaccard`, `contract_valid`, and candidate `tool_calls` for later TRACE shaping work. The committed TRACE fixtures retain the final packages and tool-call counts from two scrubbed real Opus eval rows while omitting prompts, tool results, account data, and timing metadata.
+
 ## Useful controls
 
 - `--account-inflight 2` and `--auth-cooldown-ms 300000` for the Anthropic lane
