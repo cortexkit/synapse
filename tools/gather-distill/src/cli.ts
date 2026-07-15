@@ -6,12 +6,12 @@ import { updateBurnRate } from "./meter.ts";
 import { balanceJobs, pendingJobsAfterCrash } from "./queue.ts";
 import { discoverRepos, expandHome } from "./repo.ts";
 import { generateQuestions } from "./qgen.ts";
-import type { BankedRow, GatherJob, LedgerEntry } from "./types.ts";
-import { readJsonl, stableJobId, writeJsonAtomic, writeJsonl } from "./utils.ts";
+import type { BankedRow, GatherJob, LedgerEntry, TrajectoryMessage } from "./types.ts";
+import { isRecord, parseJsonText, readJsonl, stableJobId, writeJsonAtomic, writeJsonl } from "./utils.ts";
 import { repoDirForRow, validateBankedRow } from "./validate.ts";
 import { citationLineCapsForScore, scoreRows, validateCandidateRowsForScore } from "./scorer.ts";
 import { AftClientPool, AftWarmupCoordinator, AFT_WARMUP_TIMEOUT_MS } from "./tools.ts";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -295,6 +295,142 @@ async function scoreCommand(args: ParsedArgs): Promise<void> {
   );
 }
 
+function isBudgetOutcome(value: unknown): value is BankedRow["budget_outcome"] {
+  return value === "natural" || value === "budget_finalize" || value === "api_error" || value === "invalid_final";
+}
+
+function normalizeTrajectory(value: unknown): TrajectoryMessage[] {
+  if (!Array.isArray(value)) return [];
+  const messages: TrajectoryMessage[] = [];
+  for (const candidate of value) {
+    if (!isRecord(candidate)) continue;
+    const role = candidate.role;
+    if (role !== "user" && role !== "assistant") continue;
+    if (typeof candidate.content === "string") {
+      messages.push({ role, content: candidate.content });
+      continue;
+    }
+    if (!Array.isArray(candidate.content)) continue;
+    const blocks: Exclude<TrajectoryMessage["content"], string> = [];
+    for (const block of candidate.content) {
+      if (!isRecord(block)) continue;
+      if (block.type === "text" && typeof block.text === "string") {
+        blocks.push({ type: "text", text: block.text });
+      } else if (block.type === "tool_use" && typeof block.id === "string" && typeof block.name === "string") {
+        blocks.push({ type: "tool_use", id: block.id, name: block.name, input: block.input });
+      } else if (block.type === "tool_result" && typeof block.tool_use_id === "string" && typeof block.content === "string") {
+        blocks.push({
+          type: "tool_result",
+          tool_use_id: block.tool_use_id,
+          content: block.content,
+          ...(typeof block.is_error === "boolean" ? { is_error: block.is_error } : {}),
+        });
+      }
+    }
+    messages.push({ role, content: blocks });
+  }
+  return messages;
+}
+
+function trajectoryFromCandidate(payload: unknown): TrajectoryMessage[] {
+  if (Array.isArray(payload)) return normalizeTrajectory(payload);
+  if (!isRecord(payload)) return [];
+  return normalizeTrajectory(payload.full_trajectory ?? payload.trajectory);
+}
+
+function finalPackageFromTrajectory(trajectory: TrajectoryMessage[]): unknown {
+  for (const message of [...trajectory].reverse()) {
+    const texts =
+      typeof message.content === "string"
+        ? [message.content]
+        : message.content.flatMap((block) => (block.type === "text" ? [block.text] : []));
+    for (const text of texts.reverse()) {
+      try {
+        return parseJsonText(text);
+      } catch {
+        // Earlier assistant text can be commentary rather than the final package.
+      }
+    }
+  }
+  return null;
+}
+
+function finalPackageFromCandidate(payload: unknown, trajectory: TrajectoryMessage[]): BankedRow["final_json"] {
+  if (isRecord(payload)) {
+    if ("final_json" in payload) return payload.final_json as BankedRow["final_json"];
+    if ("final_package" in payload) return payload.final_package as BankedRow["final_json"];
+    if (Array.isArray(payload.full_trajectory) || Array.isArray(payload.trajectory)) {
+      return finalPackageFromTrajectory(trajectory) as BankedRow["final_json"];
+    }
+  }
+  if (Array.isArray(payload)) return finalPackageFromTrajectory(trajectory) as BankedRow["final_json"];
+  return payload as BankedRow["final_json"];
+}
+
+function candidateRowForScoreOne(payload: unknown, gold: BankedRow): BankedRow {
+  const source = isRecord(payload) ? payload : {};
+  const trajectory = trajectoryFromCandidate(payload);
+  return {
+    ...gold,
+    full_trajectory: trajectory,
+    final_json: finalPackageFromCandidate(payload, trajectory),
+    budget_outcome: isBudgetOutcome(source.budget_outcome) ? source.budget_outcome : "natural",
+    model: typeof source.model === "string" && source.model.length > 0 ? source.model : "trace-candidate",
+    account: typeof source.account === "string" && source.account.length > 0 ? source.account : "trace",
+    valid: false,
+  };
+}
+
+async function readCandidateFile(path: string): Promise<unknown> {
+  let text: string;
+  try {
+    text = await readFile(path, "utf8");
+  } catch (error) {
+    throw new Error(`cannot read candidate file ${path}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  try {
+    return JSON.parse(text);
+  } catch (error) {
+    throw new Error(`candidate file ${path} must contain one JSON value: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+async function scoreOneCommand(args: ParsedArgs): Promise<void> {
+  const jobId = required(args, "job");
+  const candidatePath = required(args, "candidate-file");
+  const goldPath = required(args, "gold");
+  const goldRows = await readJsonl<BankedRow>(goldPath);
+  const gold = goldRows.filter((row) => row.job_id === jobId);
+  if (gold.length !== 1) {
+    throw new Error(`--job ${jobId} matched ${gold.length} gold rows; score-one requires one uniquely identified gold row`);
+  }
+
+  const candidate = candidateRowForScoreOne(await readCandidateFile(candidatePath), gold[0]!);
+  // Distributed trainers often mount gold rows without their pinned source clones.
+  // scoreRows then applies the production final-package schema as its contract check;
+  // the batch score command still performs clone-backed citation validation.
+  const report = scoreRows([candidate], [gold[0]!]);
+  const score = report.jobs[0];
+  if (!score) throw new Error(`score-one could not pair candidate with gold job ${jobId}`);
+  const naturalCompletion = candidate.budget_outcome === "natural";
+  const reward = score.contract_valid && naturalCompletion ? score.file_f1 : 0;
+  console.log(
+    JSON.stringify({
+      lane: "score-one",
+      job_id: jobId,
+      reward,
+      diagnostics: {
+        file_f1: score.file_f1,
+        line_jaccard: score.line_overlap,
+        contract_valid: score.contract_valid,
+        tool_calls: score.candidate_tool_calls,
+        budget_outcome: candidate.budget_outcome,
+        natural_completion: naturalCompletion,
+      },
+    }),
+  );
+}
+
 function help(): void {
   console.log(`gather-distill
 
@@ -304,7 +440,8 @@ Subcommands:
            [--rows PATH --ledger PATH --status PATH] [--inline-validate]
   validate --rows data/rows.jsonl [--output PATH --corpus-root DIR]
   score    --candidate data/model-rows.jsonl --gold data/eval-gold.jsonl --output data/model-scores.json
-           [--corpus-root DIR]
+            [--corpus-root DIR]
+  score-one --job JOB_ID --candidate-file candidate.json --gold data/eval-gold-rows.jsonl
 
 Anthropic qgen and gather use GATHER_DISTILL_API_KEY or GATHER_DISTILL_ACCOUNTS_FILE/--accounts-file.
 OpenAI-compatible gather is local-only and never reads account credentials or OAuth settings.`);
@@ -316,6 +453,7 @@ async function main(): Promise<void> {
   else if (args.command === "gather") await gatherCommand(args);
   else if (args.command === "validate") await validateCommand(args);
   else if (args.command === "score") await scoreCommand(args);
+  else if (args.command === "score-one") await scoreOneCommand(args);
   else help();
 }
 
