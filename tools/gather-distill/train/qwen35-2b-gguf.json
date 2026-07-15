@@ -1,0 +1,31 @@
+{
+  "llama_cpp_revision": "b4e3dc613baa92a3884d4151e3d631395c81934a",
+  "llama_cpp_build": 9580,
+  "source": "train/outputs/qwen35-2b-full/model.safetensors",
+  "source_sha256": "8e448d11ef6d71cbc3c489df26f5e590b2dab62e239125da18a877d76cf49815",
+  "text_only": true,
+  "conversion_fix": "Set mtp_num_hidden_layers=0 in a conversion-only config copy because Qwen3_5ForCausalLM contains no MTP tensors; this corrected GGUF block_count from 25 to 24.",
+  "gguf": [
+    {
+      "name": "qwen35-2b-sft-v1-f16.gguf",
+      "quantization": "F16",
+      "bytes": 3775708704,
+      "sha256": "3c7eb04f8f31660635e8afc73522ef0ab96445aef4e8c7655e61171abd6370de"
+    },
+    {
+      "name": "qwen35-2b-sft-v1-q8_0.gguf",
+      "quantization": "Q8_0",
+      "bytes": 2012012064,
+      "sha256": "d63ed1ca210afbd84c5507ae1a312e7520a3b7344042655ccce3562764ef849a"
+    }
+  ],
+  "gguf_architecture": "qwen35",
+  "gguf_block_count": 24,
+  "tensor_count": 320,
+  "served_context": 131072,
+  "training_context": 262144,
+  "server_model_class": "Qwen3_5ForCausalLM",
+  "server_parameter_count": 1881825088,
+  "server_health": "ok",
+  "server_gpu_memory_mib": 4253
+}

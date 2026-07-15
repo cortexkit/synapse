@@ -1,0 +1,14 @@
+{
+  "path": "train/prepared/qwen35-2b-full/ad6f215dff36b5433c0022b19349ad5d",
+  "splits": {
+    "pre_split": {
+      "rows": 1864,
+      "input_tokens": 28096989,
+      "supervised_tokens": 3015230,
+      "max_tokens": 32411,
+      "over_32768": 0
+    }
+  },
+  "all_input_tokens": 28096989,
+  "all_supervised_tokens": 3015230
+}

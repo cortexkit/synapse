@@ -1,0 +1,3184 @@
+{
+  "generated_at": "2026-07-15T10:02:12.898219+00:00",
+  "method": "Direct invocation of Axolotl ChatTemplateStrategy with the curated dataset and the independently instrumented Qwen3.5 generation mask.",
+  "chat_template": "train/axolotl/templates/qwen35-aft.jinja",
+  "chat_template_sha256": "fef15c2f760736e14982abe133807eae881eaf6c585becaedc190663642e40e8",
+  "full_render_byte_equal_to_tokenizer_template": true,
+  "model": "Qwen/Qwen3.5-2B",
+  "revision": "15852e8c16360a2fea060d615a32b45270f8a8fc",
+  "versions": {
+    "axolotl": "0.17.0.dev0",
+    "transformers": "5.9.0",
+    "trl": "1.5.1",
+    "peft": "0.19.1",
+    "torch": "2.9.1"
+  },
+  "config_contract": {
+    "dataset_type": "chat_template",
+    "field_messages": "messages",
+    "field_tools": "tools",
+    "roles_to_train": [
+      "assistant"
+    ],
+    "train_on_eos": "turn",
+    "sequence_len": 32768
+  },
+  "samples": [
+    {
+      "row_index": 155,
+      "tokens": 19046,
+      "trained_tokens": 2074,
+      "masked_tokens": 16972,
+      "assistant_tool_calls_present": true,
+      "final_assistant_trained": true,
+      "user_and_tool_turns_masked": true,
+      "full_render_byte_equal_to_tokenizer_template": true,
+      "semantic_assistant_tokens": 2081,
+      "masked_separator_newlines": 7,
+      "turn_checks": [
+        {
+          "turn": 0,
+          "role": "system",
+          "start": 5383,
+          "end_exclusive": 5859,
+          "span_tokens": 476,
+          "trained_tokens": 0,
+          "masked_tokens": 476,
+          "content_excerpt": "You are a sidekick to a powerful coding agent. The agent is busy reasoning about a hard problem and sent you ahead into this repository to find the code it will need, so it does no",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 1,
+          "role": "user",
+          "start": 5864,
+          "end_exclusive": 6015,
+          "span_tokens": 151,
+          "trained_tokens": 0,
+          "masked_tokens": 151,
+          "content_excerpt": "Request:\nWhere in the codebase is the tun2socks or core binary selected/loaded, and how does the app decide which native binary (per ABI) to invoke at runtime?\n\nScope:\n(caller did ",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 2,
+          "role": "assistant",
+          "start": 6024,
+          "end_exclusive": 6114,
+          "span_tokens": 90,
+          "trained_tokens": 90,
+          "masked_tokens": 0,
+          "content_excerpt": "I'll explore the codebase to find where tun2socks or core binaries are selected and loaded per ABI.",
+          "has_tool_calls": true
+        },
+        {
+          "turn": 3,
+          "role": "tool",
+          "start": 6121,
+          "end_exclusive": 6157,
+          "span_tokens": 36,
+          "trained_tokens": 0,
+          "masked_tokens": 36,
+          "content_excerpt": "Semantic search is not enabled.\nSemantic search unavailable; lexical-only fallback returned 0 result(s). [semantic: unavailable]\nSearch status: fully degraded; partial/incomplete.",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 4,
+          "role": "tool",
+          "start": 6162,
+          "end_exclusive": 6198,
+          "span_tokens": 36,
+          "trained_tokens": 0,
+          "masked_tokens": 36,
+          "content_excerpt": "Semantic search is not enabled.\nSemantic search unavailable; lexical-only fallback returned 0 result(s). [semantic: unavailable]\nSearch status: fully degraded; partial/incomplete.",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 5,
+          "role": "assistant",
+          "start": 6209,
+          "end_exclusive": 6312,
+          "span_tokens": 103,
+          "trained_tokens": 103,
+          "masked_tokens": 0,
+          "content_excerpt": "Semantic search unavailable. Let me use grep and glob instead.",
+          "has_tool_calls": true
+        },
+        {
+          "turn": 6,
+          "role": "tool",
+          "start": 6319,
+          "end_exclusive": 6755,
+          "span_tokens": 436,
+          "trained_tokens": 0,
+          "masked_tokens": 436,
+          "content_excerpt": "docs/AGENTS.md\n82: - **hev-socks5-tunnel**: Optional tun2socks binary. Build with `./compile-hevtun.sh` (requires `NDK_HOME`).\n\nV2rayNG/app/src/main/java/com/v2ray/ang/service/TPro",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 7,
+          "role": "tool",
+          "start": 6760,
+          "end_exclusive": 8869,
+          "span_tokens": 2109,
+          "trained_tokens": 0,
+          "masked_tokens": 2109,
+          "content_excerpt": "docs/AGENTS.md\n81: - **Flavors**: `fdroid` (suffix `.fdroid`) and `playstore` (no suffix). ABI version codes differ per flavor.\n\ncompile-hevtun.sh\n19: ABIS=\"armeabi-v7a arm64-v8a x",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 8,
+          "role": "tool",
+          "start": 8874,
+          "end_exclusive": 8885,
+          "span_tokens": 11,
+          "trained_tokens": 0,
+          "masked_tokens": 11,
+          "content_excerpt": "0 files matching **/*tun2socks*",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 9,
+          "role": "assistant",
+          "start": 8896,
+          "end_exclusive": 9044,
+          "span_tokens": 148,
+          "trained_tokens": 148,
+          "masked_tokens": 0,
+          "content_excerpt": "The key files are TProxyService.kt and CoreVpnService.kt. Let me look at how the native binary is loaded per ABI.",
+          "has_tool_calls": true
+        },
+        {
+          "turn": 10,
+          "role": "tool",
+          "start": 9051,
+          "end_exclusive": 9633,
+          "span_tokens": 582,
+          "trained_tokens": 0,
+          "masked_tokens": 582,
+          "content_excerpt": "V2rayNG/app/src/main/java/com/v2ray/ang/viewmodel/MainViewModel.kt\n364:         serverDelays.sortBy { it.testDelayMillis }\n\nV2rayNG/app/src/main/java/com/v2ray/ang/util/HttpUtil.kt",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 11,
+          "role": "tool",
+          "start": 9638,
+          "end_exclusive": 11155,
+          "span_tokens": 1517,
+          "trained_tokens": 0,
+          "masked_tokens": 1517,
+          "content_excerpt": "  1: package com.v2ray.ang.service\n  2: \n  3: import android.content.Context\n  4: import android.os.ParcelFileDescriptor\n  5: import com.v2ray.ang.AppConfig\n  6: import com.v2ray.a",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 12,
+          "role": "assistant",
+          "start": 11166,
+          "end_exclusive": 11451,
+          "span_tokens": 285,
+          "trained_tokens": 285,
+          "masked_tokens": 0,
+          "content_excerpt": "Two mechanisms: (1) JNI `System.loadLibrary(\"hev-socks5-tunnel\")` in TProxyService (in-VPN mode), and (2) RootProxyManager which invokes the binary from `nativeLibraryDir` directly",
+          "has_tool_calls": true
+        },
+        {
+          "turn": 13,
+          "role": "tool",
+          "start": 11458,
+          "end_exclusive": 12936,
+          "span_tokens": 1478,
+          "trained_tokens": 0,
+          "masked_tokens": 1478,
+          "content_excerpt": " 95:      * @param captureDeviceTraffic when true (Root mode) the device's own OUTPUT traffic is\n 96:      *   marked into the tun. When false (VPN-mode LAN sharing) the device kee",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 14,
+          "role": "tool",
+          "start": 12941,
+          "end_exclusive": 13757,
+          "span_tokens": 816,
+          "trained_tokens": 0,
+          "masked_tokens": 816,
+          "content_excerpt": "320:                 if (bypassApps) {\n321:                     // In bypass mode, disallow the selected apps\n322:                     builder.addDisallowedApplication(it)\n323:    ",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 15,
+          "role": "tool",
+          "start": 13762,
+          "end_exclusive": 14210,
+          "span_tokens": 448,
+          "trained_tokens": 0,
+          "masked_tokens": 448,
+          "content_excerpt": "205:     const val ROOT_MARK_ROUTE = 1          // packets we want pushed into the tun device\n206:     const val ROOT_ROUTE_TABLE = 2024\n207:     const val ROOT_RULE_PRIORITY = 100",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 16,
+          "role": "assistant",
+          "start": 14221,
+          "end_exclusive": 14447,
+          "span_tokens": 226,
+          "trained_tokens": 226,
+          "masked_tokens": 0,
+          "content_excerpt": "Now I understand both mechanisms. Let me check the build/compile script for how per-ABI binaries are staged, and confirm `isUsingHevTun`. Let me also look at the compile script and",
+          "has_tool_calls": true
+        },
+        {
+          "turn": 17,
+          "role": "tool",
+          "start": 14454,
+          "end_exclusive": 16032,
+          "span_tokens": 1578,
+          "trained_tokens": 0,
+          "masked_tokens": 1578,
+          "content_excerpt": "  1: #!/bin/bash\n  2: set -o errexit\n  3: set -o pipefail\n  4: set -o nounset\n  5: # Set magic variables for current file & dir\n  6: __dir=\"$(cd \"$(dirname \"${BASH_SOURCE[0]}\")\" &&",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 18,
+          "role": "tool",
+          "start": 16037,
+          "end_exclusive": 16577,
+          "span_tokens": 540,
+          "trained_tokens": 0,
+          "masked_tokens": 540,
+          "content_excerpt": "V2rayNG/app/src/main/java/com/v2ray/ang/service/CoreVpnService.kt\n338:         if (SettingsManager.isUsingHevTun()) {\n\nV2rayNG/app/src/main/java/com/v2ray/ang/handler/SettingsManag",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 19,
+          "role": "tool",
+          "start": 16582,
+          "end_exclusive": 16891,
+          "span_tokens": 309,
+          "trained_tokens": 0,
+          "masked_tokens": 309,
+          "content_excerpt": "15:         versionCode = 736\n16:         versionName = \"2.2.6\"\n17:         multiDexEnabled = true\n18: \n19:         val abiFilterList = (properties[\"ABI_FILTERS\"] as? String)?.spli",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 20,
+          "role": "assistant",
+          "start": 16902,
+          "end_exclusive": 17090,
+          "span_tokens": 188,
+          "trained_tokens": 188,
+          "masked_tokens": 0,
+          "content_excerpt": "I now have a complete picture. Let me quickly confirm `isUsingHevTun` logic and how the core (libv2ray) is initialized in CoreNativeManager to round out the \"core binary\" part.",
+          "has_tool_calls": true
+        },
+        {
+          "turn": 21,
+          "role": "tool",
+          "start": 17097,
+          "end_exclusive": 17545,
+          "span_tokens": 448,
+          "trained_tokens": 0,
+          "masked_tokens": 448,
+          "content_excerpt": "477:     fun isUsingHevTun(): Boolean {\n478:         return MmkvManager.decodeSettingsBool(AppConfig.PREF_USE_HEV_TUNNEL, true)\n479:     }\n480: \n481:     /**\n482:      * Check if V",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 22,
+          "role": "tool",
+          "start": 17550,
+          "end_exclusive": 18006,
+          "span_tokens": 456,
+          "trained_tokens": 0,
+          "masked_tokens": 456,
+          "content_excerpt": " 1: package com.v2ray.ang.core\n 2: \n 3: import android.content.Context\n 4: import com.v2ray.ang.AppConfig\n 5: import com.v2ray.ang.util.LogUtil\n 6: import com.v2ray.ang.util.Utils\n",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 23,
+          "role": "assistant",
+          "start": 18017,
+          "end_exclusive": 19044,
+          "span_tokens": 1027,
+          "trained_tokens": 1027,
+          "masked_tokens": 0,
+          "content_excerpt": "I have a complete picture now.\n\n```json\n{\n  \"interpretation\": \"Where the tun2socks/core native binary is selected/loaded and how the app picks the per-ABI native binary at runtime.",
+          "has_tool_calls": false
+        }
+      ],
+      "rendered_prefix": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence \u2014 the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and exec",
+      "rendered_suffix": " 28, \"endLine\": 40, \"why\": \"The V2Ray/Xray core itself is a Go AAR (libv2ray) initialized via Libv2ray.initCoreEnv, not a per-ABI exec \u2014 clarifies 'core binary' loading vs the tun2socks binary.\" }\n  ],\n  \"omissions\": [\n    { \"what\": \"CoreConfigManager references to isUsingHevTun (lines ~446-598) that gate tun config generation\", \"why\": \"budget\", \"detail\": \"These shape the config passed to whichever tun path is chosen but are not where the binary itself is selected/loaded.\" }\n  ]\n}\n```<|im_end|>\n",
+      "label_runs": [
+        {
+          "start": 0,
+          "end_exclusive": 6024,
+          "tokens": 6024,
+          "label": "MASK",
+          "decoded_excerpt": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence \u2014 the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and exec",
+          "excerpt_truncated": true
+        },
+        {
+          "start": 6024,
+          "end_exclusive": 6115,
+          "tokens": 91,
+          "label": "TRAIN",
+          "decoded_excerpt": "I'll explore the codebase to find where tun2socks or core binaries are selected and loaded per ABI.\n\n<tool_call>\n<function=search>\n<parameter=query>\ntun2socks binary selection per ABI native library load\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=search>\n<parameter=query>\nselect native binary by CPU ABI architecture at runtime\n</parameter>\n</function>\n</tool_call><|im_end|>",
+          "excerpt_truncated": false
+        },
+        {
+          "start": 6115,
+          "end_exclusive": 6209,
+          "tokens": 94,
+          "label": "MASK",
+          "decoded_excerpt": "\n<|im_start|>user\n<tool_response>\nSemantic search is not enabled.\nSemantic search unavailable; lexical-only fallback returned 0 result(s). [semantic: unavailable]\nSearch status: fully degraded; partial/incomplete.\n</tool_response>\n<tool_response>\nSemantic search is not enabled.\nSemantic search unavailable; lexical-only fallback returned 0 result(s). [semantic: unavailable]\nSearch status: fully degraded; partial/incomplete.\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+          "excerpt_truncated": false
+        },
+        {
+          "start": 6209,
+          "end_exclusive": 6313,
+          "tokens": 104,
+          "label": "TRAIN",
+          "decoded_excerpt": "Semantic search unavailable. Let me use grep and glob instead.\n\n<tool_call>\n<function=grep>\n<parameter=pattern>\ntun2socks\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=grep>\n<parameter=pattern>\nABI|abi\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=glob>\n<parameter=pattern>\n**/*tun2socks*\n</parameter>\n</function>\n</tool_call><|im_end|>",
+          "excerpt_truncated": false
+        },
+        {
+          "start": 6313,
+          "end_exclusive": 8896,
+          "tokens": 2583,
+          "label": "MASK",
+          "decoded_excerpt": "\n<|im_start|>user\n<tool_response>\ndocs/AGENTS.md\n82: - **hev-socks5-tunnel**: Optional tun2socks binary. Build with `./compile-hevtun.sh` (requires `NDK_HOME`).\n\nV2rayNG/app/src/main/java/com/v2ray/ang/service/TProxyService.kt\n13:  * Manages the tun2socks process that handles VPN traffic\n40:      * Starts the tun2socks process with the appropriate parameters.\n101:      * Stops the tun2socks process\n\nV2rayNG/app/src/main/java/com/v2ray/ang/service/CoreVpnService.kt\n334:      * Runs the tun2socks ",
+          "excerpt_truncated": true
+        },
+        {
+          "start": 8896,
+          "end_exclusive": 9045,
+          "tokens": 149,
+          "label": "TRAIN",
+          "decoded_excerpt": "The key files are TProxyService.kt and CoreVpnService.kt. Let me look at how the native binary is loaded per ABI.\n\n<tool_call>\n<function=grep>\n<parameter=pattern>\nlibhevsockstun|nativeLibraryDir|applicationInfo.nativeLibraryDir|libtun2socks|\\.so\n</parameter>\n<parameter=path>\nV2rayNG/app/src/main/java/com/v2ray/ang\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=read>\n<parameter=filePath>\nV2rayNG/app/src/main/java/com/v2ray/ang/service/TProxyService.kt\n</parameter>\n</function>\n</tool_",
+          "excerpt_truncated": true
+        },
+        {
+          "start": 9045,
+          "end_exclusive": 11166,
+          "tokens": 2121,
+          "label": "MASK",
+          "decoded_excerpt": "\n<|im_start|>user\n<tool_response>\nV2rayNG/app/src/main/java/com/v2ray/ang/viewmodel/MainViewModel.kt\n364:         serverDelays.sortBy { it.testDelayMillis }\n\nV2rayNG/app/src/main/java/com/v2ray/ang/util/HttpUtil.kt\n87:                 addresses.sortedWith(compareByDescending { it is Inet6Address })\n89:                 addresses.sortedWith(compareBy { it is Inet6Address })\n\nV2rayNG/app/src/main/java/com/v2ray/ang/ui/PerAppProxyActivity.kt\n79:                         appsList.sortedWith { p1, p2 -",
+          "excerpt_truncated": true
+        },
+        {
+          "start": 11166,
+          "end_exclusive": 11452,
+          "tokens": 286,
+          "label": "TRAIN",
+          "decoded_excerpt": "Two mechanisms: (1) JNI `System.loadLibrary(\"hev-socks5-tunnel\")` in TProxyService (in-VPN mode), and (2) RootProxyManager which invokes the binary from `nativeLibraryDir` directly. Let me look at the RootProxyManager binary selection and how CoreVpnService chooses which path.\n\n<tool_call>\n<function=read>\n<parameter=filePath>\nV2rayNG/app/src/main/java/com/v2ray/ang/root/RootProxyManager.kt\n</parameter>\n<parameter=startLine>\n95\n</parameter>\n<parameter=endLine>\n160\n</parameter>\n</function>\n</tool_",
+          "excerpt_truncated": true
+        },
+        {
+          "start": 11452,
+          "end_exclusive": 14221,
+          "tokens": 2769,
+          "label": "MASK",
+          "decoded_excerpt": "\n<|im_start|>user\n<tool_response>\n95:      * @param captureDeviceTraffic when true (Root mode) the device's own OUTPUT traffic is\n 96:      *   marked into the tun. When false (VPN-mode LAN sharing) the device keeps using the\n 97:      *   VpnService and only forwarded clients are routed into this tun.\n 98:      * @param forceLanShare force the LAN/tethering forward rules on regardless of the pref\n 99:      *   (used by VPN-mode sharing, where the whole point is forwarding clients).\n100:      */",
+          "excerpt_truncated": true
+        },
+        {
+          "start": 14221,
+          "end_exclusive": 14448,
+          "tokens": 227,
+          "label": "TRAIN",
+          "decoded_excerpt": "Now I understand both mechanisms. Let me check the build/compile script for how per-ABI binaries are staged, and confirm `isUsingHevTun`. Let me also look at the compile script and how the \"core\" (V2Ray/Xray) is loaded \u2014 it may be a Go AAR (Libv2ray).\n\n<tool_call>\n<function=read>\n<parameter=filePath>\ncompile-hevtun.sh\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=grep>\n<parameter=pattern>\nisUsingHevTun|libv2ray|Libv2ray|libcore\n</parameter>\n<parameter=path>\nV2rayNG/app/src/main/jav",
+          "excerpt_truncated": true
+        },
+        {
+          "start": 14448,
+          "end_exclusive": 16902,
+          "tokens": 2454,
+          "label": "MASK",
+          "decoded_excerpt": "\n<|im_start|>user\n<tool_response>\n1: #!/bin/bash\n  2: set -o errexit\n  3: set -o pipefail\n  4: set -o nounset\n  5: # Set magic variables for current file & dir\n  6: __dir=\"$(cd \"$(dirname \"${BASH_SOURCE[0]}\")\" && pwd)\"\n  7: __file=\"${__dir}/$(basename \"${BASH_SOURCE[0]}\")\"\n  8: __base=\"$(basename ${__file} .sh)\"\n  9: if [[ ! -d $NDK_HOME ]]; then\n 10:   echo \"Android NDK: NDK_HOME not found. please set env \\$NDK_HOME\"\n 11:   exit 1\n 12: fi\n 13: TMPDIR=$(mktemp -d)\n 14: clear_tmp () {\n 15:   rm -",
+          "excerpt_truncated": true
+        },
+        {
+          "start": 16902,
+          "end_exclusive": 17091,
+          "tokens": 189,
+          "label": "TRAIN",
+          "decoded_excerpt": "I now have a complete picture. Let me quickly confirm `isUsingHevTun` logic and how the core (libv2ray) is initialized in CoreNativeManager to round out the \"core binary\" part.\n\n<tool_call>\n<function=read>\n<parameter=filePath>\nV2rayNG/app/src/main/java/com/v2ray/ang/handler/SettingsManager.kt\n</parameter>\n<parameter=startLine>\n477\n</parameter>\n<parameter=endLine>\n515\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=read>\n<parameter=filePath>\nV2rayNG/app/src/main/java/com/v2ray/ang/cor",
+          "excerpt_truncated": true
+        },
+        {
+          "start": 17091,
+          "end_exclusive": 18017,
+          "tokens": 926,
+          "label": "MASK",
+          "decoded_excerpt": "\n<|im_start|>user\n<tool_response>\n477:     fun isUsingHevTun(): Boolean {\n478:         return MmkvManager.decodeSettingsBool(AppConfig.PREF_USE_HEV_TUNNEL, true)\n479:     }\n480: \n481:     /**\n482:      * Check if VPN mode is enabled.\n483:      * @return True if VPN mode is enabled, false otherwise.\n484:      */\n485:     fun isVpnMode(): Boolean {\n486:         val mode = MmkvManager.decodeSettingsString(AppConfig.PREF_MODE)\n487:         return mode == null || mode == VPN\n488:     }\n489: \n490:    ",
+          "excerpt_truncated": true
+        },
+        {
+          "start": 18017,
+          "end_exclusive": 19045,
+          "tokens": 1028,
+          "label": "TRAIN",
+          "decoded_excerpt": "I have a complete picture now.\n\n```json\n{\n  \"interpretation\": \"Where the tun2socks/core native binary is selected/loaded and how the app picks the per-ABI native binary at runtime.\",\n  \"scope\": [\n    \"V2rayNG/app/src/main/java/com/v2ray/ang/service/TProxyService.kt\",\n    \"V2rayNG/app/src/main/java/com/v2ray/ang/service/CoreVpnService.kt\",\n    \"V2rayNG/app/src/main/java/com/v2ray/ang/root/RootProxyManager.kt\",\n    \"V2rayNG/app/src/main/java/com/v2ray/ang/core/CoreNativeManager.kt\",\n    \"V2rayNG/a",
+          "excerpt_truncated": true
+        },
+        {
+          "start": 19045,
+          "end_exclusive": 19046,
+          "tokens": 1,
+          "label": "MASK",
+          "decoded_excerpt": "\n",
+          "excerpt_truncated": false
+        }
+      ],
+      "token_windows": {
+        "first_assistant_tool_call": {
+          "span_start": 6024,
+          "span_end_exclusive": 6114,
+          "start_boundary": [
+            {
+              "index": 6018,
+              "token_id": 74455,
+              "token": "assistant",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6019,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6020,
+              "token_id": 248068,
+              "token": "<think>",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6021,
+              "token_id": 271,
+              "token": "\u010a\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6022,
+              "token_id": 248069,
+              "token": "</think>",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6023,
+              "token_id": 271,
+              "token": "\u010a\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6024,
+              "token_id": 40,
+              "token": "I",
+              "label": 40,
+              "trained": true
+            },
+            {
+              "index": 6025,
+              "token_id": 3172,
+              "token": "'ll",
+              "label": 3172,
+              "trained": true
+            },
+            {
+              "index": 6026,
+              "token_id": 12804,
+              "token": "\u0120explore",
+              "label": 12804,
+              "trained": true
+            },
+            {
+              "index": 6027,
+              "token_id": 279,
+              "token": "\u0120the",
+              "label": 279,
+              "trained": true
+            },
+            {
+              "index": 6028,
+              "token_id": 1970,
+              "token": "\u0120code",
+              "label": 1970,
+              "trained": true
+            },
+            {
+              "index": 6029,
+              "token_id": 3051,
+              "token": "base",
+              "label": 3051,
+              "trained": true
+            },
+            {
+              "index": 6030,
+              "token_id": 310,
+              "token": "\u0120to",
+              "label": 310,
+              "trained": true
+            },
+            {
+              "index": 6031,
+              "token_id": 1423,
+              "token": "\u0120find",
+              "label": 1423,
+              "trained": true
+            },
+            {
+              "index": 6032,
+              "token_id": 1332,
+              "token": "\u0120where",
+              "label": 1332,
+              "trained": true
+            },
+            {
+              "index": 6033,
+              "token_id": 11131,
+              "token": "\u0120tun",
+              "label": 11131,
+              "trained": true
+            },
+            {
+              "index": 6034,
+              "token_id": 17,
+              "token": "2",
+              "label": 17,
+              "trained": true
+            },
+            {
+              "index": 6035,
+              "token_id": 12817,
+              "token": "sock",
+              "label": 12817,
+              "trained": true
+            }
+          ],
+          "end_boundary": [
+            {
+              "index": 6102,
+              "token_id": 506,
+              "token": "\u0120at",
+              "label": 506,
+              "trained": true
+            },
+            {
+              "index": 6103,
+              "token_id": 15135,
+              "token": "\u0120runtime",
+              "label": 15135,
+              "trained": true
+            },
+            {
+              "index": 6104,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": 198,
+              "trained": true
+            },
+            {
+              "index": 6105,
+              "token_id": 510,
+              "token": "</",
+              "label": 510,
+              "trained": true
+            },
+            {
+              "index": 6106,
+              "token_id": 15704,
+              "token": "parameter",
+              "label": 15704,
+              "trained": true
+            },
+            {
+              "index": 6107,
+              "token_id": 29,
+              "token": ">",
+              "label": 29,
+              "trained": true
+            },
+            {
+              "index": 6108,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": 198,
+              "trained": true
+            },
+            {
+              "index": 6109,
+              "token_id": 510,
+              "token": "</",
+              "label": 510,
+              "trained": true
+            },
+            {
+              "index": 6110,
+              "token_id": 1628,
+              "token": "function",
+              "label": 1628,
+              "trained": true
+            },
+            {
+              "index": 6111,
+              "token_id": 29,
+              "token": ">",
+              "label": 29,
+              "trained": true
+            },
+            {
+              "index": 6112,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": 198,
+              "trained": true
+            },
+            {
+              "index": 6113,
+              "token_id": 248059,
+              "token": "</tool_call>",
+              "label": 248059,
+              "trained": true
+            },
+            {
+              "index": 6114,
+              "token_id": 248046,
+              "token": "<|im_end|>",
+              "label": 248046,
+              "trained": true
+            },
+            {
+              "index": 6115,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6116,
+              "token_id": 248045,
+              "token": "<|im_start|>",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6117,
+              "token_id": 846,
+              "token": "user",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6118,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6119,
+              "token_id": 248066,
+              "token": "<tool_response>",
+              "label": -100,
+              "trained": false
+            }
+          ],
+          "omitted_interior_tokens": 66
+        },
+        "first_tool_result": {
+          "span_start": 6121,
+          "span_end_exclusive": 6157,
+          "start_boundary": [
+            {
+              "index": 6115,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6116,
+              "token_id": 248045,
+              "token": "<|im_start|>",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6117,
+              "token_id": 846,
+              "token": "user",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6118,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6119,
+              "token_id": 248066,
+              "token": "<tool_response>",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6120,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6121,
+              "token_id": 94553,
+              "token": "Semantic",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6122,
+              "token_id": 2624,
+              "token": "\u0120search",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6123,
+              "token_id": 369,
+              "token": "\u0120is",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6124,
+              "token_id": 524,
+              "token": "\u0120not",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6125,
+              "token_id": 8699,
+              "token": "\u0120enabled",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6126,
+              "token_id": 13,
+              "token": ".",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6127,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6128,
+              "token_id": 94553,
+              "token": "Semantic",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6129,
+              "token_id": 2624,
+              "token": "\u0120search",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6130,
+              "token_id": 33829,
+              "token": "\u0120unavailable",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6131,
+              "token_id": 26,
+              "token": ";",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6132,
+              "token_id": 74931,
+              "token": "\u0120lexical",
+              "label": -100,
+              "trained": false
+            }
+          ],
+          "end_boundary": [
+            {
+              "index": 6145,
+              "token_id": 60,
+              "token": "]",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6146,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6147,
+              "token_id": 5708,
+              "token": "Search",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6148,
+              "token_id": 2552,
+              "token": "\u0120status",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6149,
+              "token_id": 25,
+              "token": ":",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6150,
+              "token_id": 6999,
+              "token": "\u0120fully",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6151,
+              "token_id": 87749,
+              "token": "\u0120degraded",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6152,
+              "token_id": 26,
+              "token": ";",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6153,
+              "token_id": 6907,
+              "token": "\u0120partial",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6154,
+              "token_id": 17458,
+              "token": "/in",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6155,
+              "token_id": 14311,
+              "token": "complete",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6156,
+              "token_id": 13,
+              "token": ".",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6157,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6158,
+              "token_id": 248067,
+              "token": "</tool_response>",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6159,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6160,
+              "token_id": 248066,
+              "token": "<tool_response>",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6161,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6162,
+              "token_id": 94553,
+              "token": "Semantic",
+              "label": -100,
+              "trained": false
+            }
+          ],
+          "omitted_interior_tokens": 12
+        },
+        "final_assistant_answer": {
+          "span_start": 18017,
+          "span_end_exclusive": 19044,
+          "start_boundary": [
+            {
+              "index": 18011,
+              "token_id": 74455,
+              "token": "assistant",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 18012,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 18013,
+              "token_id": 248068,
+              "token": "<think>",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 18014,
+              "token_id": 271,
+              "token": "\u010a\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 18015,
+              "token_id": 248069,
+              "token": "</think>",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 18016,
+              "token_id": 271,
+              "token": "\u010a\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 18017,
+              "token_id": 40,
+              "token": "I",
+              "label": 40,
+              "trained": true
+            },
+            {
+              "index": 18018,
+              "token_id": 599,
+              "token": "\u0120have",
+              "label": 599,
+              "trained": true
+            },
+            {
+              "index": 18019,
+              "token_id": 264,
+              "token": "\u0120a",
+              "label": 264,
+              "trained": true
+            },
+            {
+              "index": 18020,
+              "token_id": 4434,
+              "token": "\u0120complete",
+              "label": 4434,
+              "trained": true
+            },
+            {
+              "index": 18021,
+              "token_id": 6588,
+              "token": "\u0120picture",
+              "label": 6588,
+              "trained": true
+            },
+            {
+              "index": 18022,
+              "token_id": 1381,
+              "token": "\u0120now",
+              "label": 1381,
+              "trained": true
+            },
+            {
+              "index": 18023,
+              "token_id": 13,
+              "token": ".",
+              "label": 13,
+              "trained": true
+            },
+            {
+              "index": 18024,
+              "token_id": 271,
+              "token": "\u010a\u010a",
+              "label": 271,
+              "trained": true
+            },
+            {
+              "index": 18025,
+              "token_id": 71093,
+              "token": "```",
+              "label": 71093,
+              "trained": true
+            },
+            {
+              "index": 18026,
+              "token_id": 2164,
+              "token": "json",
+              "label": 2164,
+              "trained": true
+            },
+            {
+              "index": 18027,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": 198,
+              "trained": true
+            },
+            {
+              "index": 18028,
+              "token_id": 90,
+              "token": "{",
+              "label": 90,
+              "trained": true
+            }
+          ],
+          "end_boundary": [
+            {
+              "index": 19032,
+              "token_id": 3955,
+              "token": "\u0120selected",
+              "label": 3955,
+              "trained": true
+            },
+            {
+              "index": 19033,
+              "token_id": 14,
+              "token": "/",
+              "label": 14,
+              "trained": true
+            },
+            {
+              "index": 19034,
+              "token_id": 15132,
+              "token": "loaded",
+              "label": 15132,
+              "trained": true
+            },
+            {
+              "index": 19035,
+              "token_id": 1149,
+              "token": ".\"",
+              "label": 1149,
+              "trained": true
+            },
+            {
+              "index": 19036,
+              "token_id": 333,
+              "token": "\u0120}",
+              "label": 333,
+              "trained": true
+            },
+            {
+              "index": 19037,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": 198,
+              "trained": true
+            },
+            {
+              "index": 19038,
+              "token_id": 220,
+              "token": "\u0120",
+              "label": 220,
+              "trained": true
+            },
+            {
+              "index": 19039,
+              "token_id": 2205,
+              "token": "\u0120]",
+              "label": 2205,
+              "trained": true
+            },
+            {
+              "index": 19040,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": 198,
+              "trained": true
+            },
+            {
+              "index": 19041,
+              "token_id": 92,
+              "token": "}",
+              "label": 92,
+              "trained": true
+            },
+            {
+              "index": 19042,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": 198,
+              "trained": true
+            },
+            {
+              "index": 19043,
+              "token_id": 71093,
+              "token": "```",
+              "label": 71093,
+              "trained": true
+            },
+            {
+              "index": 19044,
+              "token_id": 248046,
+              "token": "<|im_end|>",
+              "label": 248046,
+              "trained": true
+            },
+            {
+              "index": 19045,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            }
+          ],
+          "omitted_interior_tokens": 1003
+        }
+      }
+    },
+    {
+      "row_index": 340,
+      "tokens": 13371,
+      "trained_tokens": 1011,
+      "masked_tokens": 12360,
+      "assistant_tool_calls_present": true,
+      "final_assistant_trained": true,
+      "user_and_tool_turns_masked": true,
+      "full_render_byte_equal_to_tokenizer_template": true,
+      "semantic_assistant_tokens": 1017,
+      "masked_separator_newlines": 6,
+      "turn_checks": [
+        {
+          "turn": 0,
+          "role": "system",
+          "start": 5383,
+          "end_exclusive": 5859,
+          "span_tokens": 476,
+          "trained_tokens": 0,
+          "masked_tokens": 476,
+          "content_excerpt": "You are a sidekick to a powerful coding agent. The agent is busy reasoning about a hard problem and sent you ahead into this repository to find the code it will need, so it does no",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 1,
+          "role": "user",
+          "start": 5864,
+          "end_exclusive": 6011,
+          "span_tokens": 147,
+          "trained_tokens": 0,
+          "masked_tokens": 147,
+          "content_excerpt": "Request:\nHow does ContainerDNSHandler differ in intended use from LocalhostDNSHandler \u2014 what feature or scenario does each one specifically address based on their implementations?\n",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 2,
+          "role": "assistant",
+          "start": 6020,
+          "end_exclusive": 6086,
+          "span_tokens": 66,
+          "trained_tokens": 66,
+          "masked_tokens": 0,
+          "content_excerpt": "I'll explore the codebase to understand these two DNS handlers.",
+          "has_tool_calls": true
+        },
+        {
+          "turn": 3,
+          "role": "tool",
+          "start": 6093,
+          "end_exclusive": 6280,
+          "span_tokens": 187,
+          "trained_tokens": 0,
+          "masked_tokens": 187,
+          "content_excerpt": "Semantic search is not enabled.\nSemantic search unavailable; returning lexical-only fallback results.\n\nSources/APIServer/ContainerDNSHandler.swift [lexical match]\n\nSources/DNSServe",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 4,
+          "role": "tool",
+          "start": 6285,
+          "end_exclusive": 6470,
+          "span_tokens": 185,
+          "trained_tokens": 0,
+          "masked_tokens": 185,
+          "content_excerpt": "Semantic search is not enabled.\nSemantic search unavailable; returning lexical-only fallback results.\n\nSources/APIServer/LocalhostDNSHandler.swift [lexical match]\n\nSources/APIServe",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 5,
+          "role": "assistant",
+          "start": 6481,
+          "end_exclusive": 6547,
+          "span_tokens": 66,
+          "trained_tokens": 66,
+          "masked_tokens": 0,
+          "content_excerpt": "",
+          "has_tool_calls": true
+        },
+        {
+          "turn": 6,
+          "role": "tool",
+          "start": 6554,
+          "end_exclusive": 7872,
+          "span_tokens": 1318,
+          "trained_tokens": 0,
+          "masked_tokens": 1318,
+          "content_excerpt": "  1: //===----------------------------------------------------------------------===//\n  2: // Copyright \u00a9 2025-2026 Apple Inc. and the container project authors.\n  3: //\n  4: // Li",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 7,
+          "role": "tool",
+          "start": 7877,
+          "end_exclusive": 9283,
+          "span_tokens": 1406,
+          "trained_tokens": 0,
+          "masked_tokens": 1406,
+          "content_excerpt": "  1: //===----------------------------------------------------------------------===//\n  2: // Copyright \u00a9 2026 Apple Inc. and the container project authors.\n  3: //\n  4: // License",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 8,
+          "role": "assistant",
+          "start": 9294,
+          "end_exclusive": 9420,
+          "span_tokens": 126,
+          "trained_tokens": 126,
+          "masked_tokens": 0,
+          "content_excerpt": "Both handlers are clear. Let me check how they're wired up in APIServer+Start and the HostDNSResolver for context on the localhost feature.",
+          "has_tool_calls": true
+        },
+        {
+          "turn": 9,
+          "role": "tool",
+          "start": 9427,
+          "end_exclusive": 9496,
+          "span_tokens": 69,
+          "trained_tokens": 0,
+          "masked_tokens": 69,
+          "content_excerpt": "Sources/APIServer/APIServer+Start.swift\n112:                         let hostsResolver = ContainerDNSHandler(networkService: networkService)\n136:                             let lo",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 10,
+          "role": "tool",
+          "start": 9501,
+          "end_exclusive": 11617,
+          "span_tokens": 2116,
+          "trained_tokens": 0,
+          "masked_tokens": 2116,
+          "content_excerpt": "  1: //===----------------------------------------------------------------------===//\n  2: // Copyright \u00a9 2026 Apple Inc. and the container project authors.\n  3: //\n  4: // License",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 11,
+          "role": "assistant",
+          "start": 11628,
+          "end_exclusive": 11713,
+          "span_tokens": 85,
+          "trained_tokens": 85,
+          "masked_tokens": 0,
+          "content_excerpt": "Let me look at the surrounding context in APIServer+Start.swift to understand how each handler is registered/served.",
+          "has_tool_calls": true
+        },
+        {
+          "turn": 12,
+          "role": "tool",
+          "start": 11720,
+          "end_exclusive": 12499,
+          "span_tokens": 779,
+          "trained_tokens": 0,
+          "masked_tokens": 779,
+          "content_excerpt": " 95:                         {\n 96:                             $0[$1.key.rawValue] = $1.value\n 97:                         }), log: log)\n 98: \n 99:                 await withTaskG",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 13,
+          "role": "assistant",
+          "start": 12510,
+          "end_exclusive": 12577,
+          "span_tokens": 67,
+          "trained_tokens": 67,
+          "masked_tokens": 0,
+          "content_excerpt": "I have a complete picture. Let me check the port constants to confirm the two-server distinction.",
+          "has_tool_calls": true
+        },
+        {
+          "turn": 14,
+          "role": "tool",
+          "start": 12584,
+          "end_exclusive": 12763,
+          "span_tokens": 179,
+          "trained_tokens": 0,
+          "masked_tokens": 179,
+          "content_excerpt": "Sources/APIServer/APIServer+Start.swift\n38:         static let listenAddress = \"127.0.0.1\"\n39:         static let localhostDNSPort = 1053\n40:         static let dnsPort = 2053\n120:",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 15,
+          "role": "assistant",
+          "start": 12774,
+          "end_exclusive": 13369,
+          "span_tokens": 595,
+          "trained_tokens": 595,
+          "masked_tokens": 0,
+          "content_excerpt": "I have everything needed to answer the question.\n\n```json\n{\n  \"interpretation\": \"How ContainerDNSHandler and LocalhostDNSHandler differ in intended use and which scenario each addr",
+          "has_tool_calls": false
+        }
+      ],
+      "rendered_prefix": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence \u2014 the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and exec",
+      "rendered_suffix": "Validator) shared by both handlers\", \"why\": \"skipped_candidate\", \"detail\": \"Both handlers are wrapped by the same resolver chain, which is common infrastructure rather than a point of difference between them.\" },\n    { \"what\": \"ContainerCommands System/DNS create/list/delete commands\", \"why\": \"skipped_candidate\", \"detail\": \"CLI surface that drives HostDNSResolver domain files; relevant to the localhost feature's user workflow but not to handler implementation differences.\" }\n  ]\n}\n```<|im_end|>\n",
+      "label_runs": [
+        {
+          "start": 0,
+          "end_exclusive": 6020,
+          "tokens": 6020,
+          "label": "MASK",
+          "decoded_excerpt": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence \u2014 the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and exec",
+          "excerpt_truncated": true
+        },
+        {
+          "start": 6020,
+          "end_exclusive": 6087,
+          "tokens": 67,
+          "label": "TRAIN",
+          "decoded_excerpt": "I'll explore the codebase to understand these two DNS handlers.\n\n<tool_call>\n<function=search>\n<parameter=query>\nContainerDNSHandler\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=search>\n<parameter=query>\nLocalhostDNSHandler\n</parameter>\n</function>\n</tool_call><|im_end|>",
+          "excerpt_truncated": false
+        },
+        {
+          "start": 6087,
+          "end_exclusive": 6481,
+          "tokens": 394,
+          "label": "MASK",
+          "decoded_excerpt": "\n<|im_start|>user\n<tool_response>\nSemantic search is not enabled.\nSemantic search unavailable; returning lexical-only fallback results.\n\nSources/APIServer/ContainerDNSHandler.swift [lexical match]\n\nSources/DNSServer/DNSHandler.swift [lexical match]\n\nSources/DNSServer/Handlers/CompositeResolver.swift [lexical match]\n\nSources/DNSServer/Handlers/NxDomainResolver.swift [lexical match]\n\nTests/DNSServerTests/MockHandlers.swift [lexical match]\n\nSources/APIServer/APIServer+Start.swift [lexical match]\n\nS",
+          "excerpt_truncated": true
+        },
+        {
+          "start": 6481,
+          "end_exclusive": 6548,
+          "tokens": 67,
+          "label": "TRAIN",
+          "decoded_excerpt": "<tool_call>\n<function=read>\n<parameter=filePath>\nSources/APIServer/ContainerDNSHandler.swift\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=read>\n<parameter=filePath>\nSources/APIServer/LocalhostDNSHandler.swift\n</parameter>\n</function>\n</tool_call><|im_end|>",
+          "excerpt_truncated": false
+        },
+        {
+          "start": 6548,
+          "end_exclusive": 9294,
+          "tokens": 2746,
+          "label": "MASK",
+          "decoded_excerpt": "\n<|im_start|>user\n<tool_response>\n1: //===----------------------------------------------------------------------===//\n  2: // Copyright \u00a9 2025-2026 Apple Inc. and the container project authors.\n  3: //\n  4: // Licensed under the Apache License, Version 2.0 (the \"License\");\n  5: // you may not use this file except in compliance with the License.\n  6: // You may obtain a copy of the License at\n  7: //\n  8: //   https://www.apache.org/licenses/LICENSE-2.0\n  9: //\n 10: // Unless required by applicab",
+          "excerpt_truncated": true
+        },
+        {
+          "start": 9294,
+          "end_exclusive": 9421,
+          "tokens": 127,
+          "label": "TRAIN",
+          "decoded_excerpt": "Both handlers are clear. Let me check how they're wired up in APIServer+Start and the HostDNSResolver for context on the localhost feature.\n\n<tool_call>\n<function=grep>\n<parameter=pattern>\nContainerDNSHandler|LocalhostDNSHandler|monitorResolvers\n</parameter>\n<parameter=path>\nSources/APIServer/APIServer+Start.swift\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=read>\n<parameter=filePath>\nSources/Services/ContainerAPIService/Client/HostDNSResolver.swift\n</parameter>\n</function>\n</tool",
+          "excerpt_truncated": true
+        },
+        {
+          "start": 9421,
+          "end_exclusive": 11628,
+          "tokens": 2207,
+          "label": "MASK",
+          "decoded_excerpt": "\n<|im_start|>user\n<tool_response>\nSources/APIServer/APIServer+Start.swift\n112:                         let hostsResolver = ContainerDNSHandler(networkService: networkService)\n136:                             let localhostResolver = LocalhostDNSHandler(log: log)\n137:                             await localhostResolver.monitorResolvers()\n\nFound 3 match across 1 file\n</tool_response>\n<tool_response>\n1: //===----------------------------------------------------------------------===//\n  2: // Copyrigh",
+          "excerpt_truncated": true
+        },
+        {
+          "start": 11628,
+          "end_exclusive": 11714,
+          "tokens": 86,
+          "label": "TRAIN",
+          "decoded_excerpt": "Let me look at the surrounding context in APIServer+Start.swift to understand how each handler is registered/served.\n\n<tool_call>\n<function=read>\n<parameter=filePath>\nSources/APIServer/APIServer+Start.swift\n</parameter>\n<parameter=startLine>\n95\n</parameter>\n<parameter=endLine>\n160\n</parameter>\n</function>\n</tool_call><|im_end|>",
+          "excerpt_truncated": false
+        },
+        {
+          "start": 11714,
+          "end_exclusive": 12510,
+          "tokens": 796,
+          "label": "MASK",
+          "decoded_excerpt": "\n<|im_start|>user\n<tool_response>\n95:                         {\n 96:                             $0[$1.key.rawValue] = $1.value\n 97:                         }), log: log)\n 98: \n 99:                 await withTaskGroup(of: Result<Void, Error>.self) { group in\n100:                     group.addTask {\n101:                         log.info(\"starting XPC server\")\n102:                         do {\n103:                             try await server.listen()\n104:                             return .succe",
+          "excerpt_truncated": true
+        },
+        {
+          "start": 12510,
+          "end_exclusive": 12578,
+          "tokens": 68,
+          "label": "TRAIN",
+          "decoded_excerpt": "I have a complete picture. Let me check the port constants to confirm the two-server distinction.\n\n<tool_call>\n<function=grep>\n<parameter=pattern>\ndnsPort|localhostDNSPort|listenAddress\n</parameter>\n<parameter=path>\nSources/APIServer\n</parameter>\n</function>\n</tool_call><|im_end|>",
+          "excerpt_truncated": false
+        },
+        {
+          "start": 12578,
+          "end_exclusive": 12774,
+          "tokens": 196,
+          "label": "MASK",
+          "decoded_excerpt": "\n<|im_start|>user\n<tool_response>\nSources/APIServer/APIServer+Start.swift\n38:         static let listenAddress = \"127.0.0.1\"\n39:         static let localhostDNSPort = 1053\n40:         static let dnsPort = 2053\n120:                                 \"host\": \"\\(Self.listenAddress)\",\n121:                                 \"port\": \"\\(Self.dnsPort)\",\n125:                             try await dnsServer.run(host: Self.listenAddress, port: Self.dnsPort)\n146:                                     \"host\": \"\\(S",
+          "excerpt_truncated": true
+        },
+        {
+          "start": 12774,
+          "end_exclusive": 13370,
+          "tokens": 596,
+          "label": "TRAIN",
+          "decoded_excerpt": "I have everything needed to answer the question.\n\n```json\n{\n  \"interpretation\": \"How ContainerDNSHandler and LocalhostDNSHandler differ in intended use and which scenario each addresses.\",\n  \"scope\": [\"Sources/APIServer/ContainerDNSHandler.swift\", \"Sources/APIServer/LocalhostDNSHandler.swift\", \"Sources/APIServer/APIServer+Start.swift\", \"Sources/Services/ContainerAPIService/Client/HostDNSResolver.swift\"],\n  \"snippets\": [\n    { \"path\": \"Sources/APIServer/ContainerDNSHandler.swift\", \"startLine\": 21",
+          "excerpt_truncated": true
+        },
+        {
+          "start": 13370,
+          "end_exclusive": 13371,
+          "tokens": 1,
+          "label": "MASK",
+          "decoded_excerpt": "\n",
+          "excerpt_truncated": false
+        }
+      ],
+      "token_windows": {
+        "first_assistant_tool_call": {
+          "span_start": 6020,
+          "span_end_exclusive": 6086,
+          "start_boundary": [
+            {
+              "index": 6014,
+              "token_id": 74455,
+              "token": "assistant",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6015,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6016,
+              "token_id": 248068,
+              "token": "<think>",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6017,
+              "token_id": 271,
+              "token": "\u010a\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6018,
+              "token_id": 248069,
+              "token": "</think>",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6019,
+              "token_id": 271,
+              "token": "\u010a\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6020,
+              "token_id": 40,
+              "token": "I",
+              "label": 40,
+              "trained": true
+            },
+            {
+              "index": 6021,
+              "token_id": 3172,
+              "token": "'ll",
+              "label": 3172,
+              "trained": true
+            },
+            {
+              "index": 6022,
+              "token_id": 12804,
+              "token": "\u0120explore",
+              "label": 12804,
+              "trained": true
+            },
+            {
+              "index": 6023,
+              "token_id": 279,
+              "token": "\u0120the",
+              "label": 279,
+              "trained": true
+            },
+            {
+              "index": 6024,
+              "token_id": 1970,
+              "token": "\u0120code",
+              "label": 1970,
+              "trained": true
+            },
+            {
+              "index": 6025,
+              "token_id": 3051,
+              "token": "base",
+              "label": 3051,
+              "trained": true
+            },
+            {
+              "index": 6026,
+              "token_id": 310,
+              "token": "\u0120to",
+              "label": 310,
+              "trained": true
+            },
+            {
+              "index": 6027,
+              "token_id": 3418,
+              "token": "\u0120understand",
+              "label": 3418,
+              "trained": true
+            },
+            {
+              "index": 6028,
+              "token_id": 1439,
+              "token": "\u0120these",
+              "label": 1439,
+              "trained": true
+            },
+            {
+              "index": 6029,
+              "token_id": 1330,
+              "token": "\u0120two",
+              "label": 1330,
+              "trained": true
+            },
+            {
+              "index": 6030,
+              "token_id": 26703,
+              "token": "\u0120DNS",
+              "label": 26703,
+              "trained": true
+            },
+            {
+              "index": 6031,
+              "token_id": 23329,
+              "token": "\u0120handlers",
+              "label": 23329,
+              "trained": true
+            }
+          ],
+          "end_boundary": [
+            {
+              "index": 6074,
+              "token_id": 59030,
+              "token": "DNS",
+              "label": 59030,
+              "trained": true
+            },
+            {
+              "index": 6075,
+              "token_id": 2952,
+              "token": "Handler",
+              "label": 2952,
+              "trained": true
+            },
+            {
+              "index": 6076,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": 198,
+              "trained": true
+            },
+            {
+              "index": 6077,
+              "token_id": 510,
+              "token": "</",
+              "label": 510,
+              "trained": true
+            },
+            {
+              "index": 6078,
+              "token_id": 15704,
+              "token": "parameter",
+              "label": 15704,
+              "trained": true
+            },
+            {
+              "index": 6079,
+              "token_id": 29,
+              "token": ">",
+              "label": 29,
+              "trained": true
+            },
+            {
+              "index": 6080,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": 198,
+              "trained": true
+            },
+            {
+              "index": 6081,
+              "token_id": 510,
+              "token": "</",
+              "label": 510,
+              "trained": true
+            },
+            {
+              "index": 6082,
+              "token_id": 1628,
+              "token": "function",
+              "label": 1628,
+              "trained": true
+            },
+            {
+              "index": 6083,
+              "token_id": 29,
+              "token": ">",
+              "label": 29,
+              "trained": true
+            },
+            {
+              "index": 6084,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": 198,
+              "trained": true
+            },
+            {
+              "index": 6085,
+              "token_id": 248059,
+              "token": "</tool_call>",
+              "label": 248059,
+              "trained": true
+            },
+            {
+              "index": 6086,
+              "token_id": 248046,
+              "token": "<|im_end|>",
+              "label": 248046,
+              "trained": true
+            },
+            {
+              "index": 6087,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6088,
+              "token_id": 248045,
+              "token": "<|im_start|>",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6089,
+              "token_id": 846,
+              "token": "user",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6090,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6091,
+              "token_id": 248066,
+              "token": "<tool_response>",
+              "label": -100,
+              "trained": false
+            }
+          ],
+          "omitted_interior_tokens": 42
+        },
+        "first_tool_result": {
+          "span_start": 6093,
+          "span_end_exclusive": 6280,
+          "start_boundary": [
+            {
+              "index": 6087,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6088,
+              "token_id": 248045,
+              "token": "<|im_start|>",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6089,
+              "token_id": 846,
+              "token": "user",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6090,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6091,
+              "token_id": 248066,
+              "token": "<tool_response>",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6092,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6093,
+              "token_id": 94553,
+              "token": "Semantic",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6094,
+              "token_id": 2624,
+              "token": "\u0120search",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6095,
+              "token_id": 369,
+              "token": "\u0120is",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6096,
+              "token_id": 524,
+              "token": "\u0120not",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6097,
+              "token_id": 8699,
+              "token": "\u0120enabled",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6098,
+              "token_id": 13,
+              "token": ".",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6099,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6100,
+              "token_id": 94553,
+              "token": "Semantic",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6101,
+              "token_id": 2624,
+              "token": "\u0120search",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6102,
+              "token_id": 33829,
+              "token": "\u0120unavailable",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6103,
+              "token_id": 26,
+              "token": ";",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6104,
+              "token_id": 13064,
+              "token": "\u0120returning",
+              "label": -100,
+              "trained": false
+            }
+          ],
+          "end_boundary": [
+            {
+              "index": 6268,
+              "token_id": 46262,
+              "token": "semantic",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6269,
+              "token_id": 25,
+              "token": ":",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6270,
+              "token_id": 33829,
+              "token": "\u0120unavailable",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6271,
+              "token_id": 60,
+              "token": "]",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6272,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6273,
+              "token_id": 5708,
+              "token": "Search",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6274,
+              "token_id": 2552,
+              "token": "\u0120status",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6275,
+              "token_id": 25,
+              "token": ":",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6276,
+              "token_id": 6907,
+              "token": "\u0120partial",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6277,
+              "token_id": 17458,
+              "token": "/in",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6278,
+              "token_id": 14311,
+              "token": "complete",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6279,
+              "token_id": 13,
+              "token": ".",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6280,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6281,
+              "token_id": 248067,
+              "token": "</tool_response>",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6282,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6283,
+              "token_id": 248066,
+              "token": "<tool_response>",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6284,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6285,
+              "token_id": 94553,
+              "token": "Semantic",
+              "label": -100,
+              "trained": false
+            }
+          ],
+          "omitted_interior_tokens": 163
+        },
+        "final_assistant_answer": {
+          "span_start": 12774,
+          "span_end_exclusive": 13369,
+          "start_boundary": [
+            {
+              "index": 12768,
+              "token_id": 74455,
+              "token": "assistant",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 12769,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 12770,
+              "token_id": 248068,
+              "token": "<think>",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 12771,
+              "token_id": 271,
+              "token": "\u010a\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 12772,
+              "token_id": 248069,
+              "token": "</think>",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 12773,
+              "token_id": 271,
+              "token": "\u010a\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 12774,
+              "token_id": 40,
+              "token": "I",
+              "label": 40,
+              "trained": true
+            },
+            {
+              "index": 12775,
+              "token_id": 599,
+              "token": "\u0120have",
+              "label": 599,
+              "trained": true
+            },
+            {
+              "index": 12776,
+              "token_id": 4156,
+              "token": "\u0120everything",
+              "label": 4156,
+              "trained": true
+            },
+            {
+              "index": 12777,
+              "token_id": 4221,
+              "token": "\u0120needed",
+              "label": 4221,
+              "trained": true
+            },
+            {
+              "index": 12778,
+              "token_id": 310,
+              "token": "\u0120to",
+              "label": 310,
+              "trained": true
+            },
+            {
+              "index": 12779,
+              "token_id": 4087,
+              "token": "\u0120answer",
+              "label": 4087,
+              "trained": true
+            },
+            {
+              "index": 12780,
+              "token_id": 279,
+              "token": "\u0120the",
+              "label": 279,
+              "trained": true
+            },
+            {
+              "index": 12781,
+              "token_id": 3296,
+              "token": "\u0120question",
+              "label": 3296,
+              "trained": true
+            },
+            {
+              "index": 12782,
+              "token_id": 13,
+              "token": ".",
+              "label": 13,
+              "trained": true
+            },
+            {
+              "index": 12783,
+              "token_id": 271,
+              "token": "\u010a\u010a",
+              "label": 271,
+              "trained": true
+            },
+            {
+              "index": 12784,
+              "token_id": 71093,
+              "token": "```",
+              "label": 71093,
+              "trained": true
+            },
+            {
+              "index": 12785,
+              "token_id": 2164,
+              "token": "json",
+              "label": 2164,
+              "trained": true
+            }
+          ],
+          "end_boundary": [
+            {
+              "index": 13357,
+              "token_id": 6795,
+              "token": "\u0120handler",
+              "label": 6795,
+              "trained": true
+            },
+            {
+              "index": 13358,
+              "token_id": 7873,
+              "token": "\u0120implementation",
+              "label": 7873,
+              "trained": true
+            },
+            {
+              "index": 13359,
+              "token_id": 11461,
+              "token": "\u0120differences",
+              "label": 11461,
+              "trained": true
+            },
+            {
+              "index": 13360,
+              "token_id": 1149,
+              "token": ".\"",
+              "label": 1149,
+              "trained": true
+            },
+            {
+              "index": 13361,
+              "token_id": 333,
+              "token": "\u0120}",
+              "label": 333,
+              "trained": true
+            },
+            {
+              "index": 13362,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": 198,
+              "trained": true
+            },
+            {
+              "index": 13363,
+              "token_id": 220,
+              "token": "\u0120",
+              "label": 220,
+              "trained": true
+            },
+            {
+              "index": 13364,
+              "token_id": 2205,
+              "token": "\u0120]",
+              "label": 2205,
+              "trained": true
+            },
+            {
+              "index": 13365,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": 198,
+              "trained": true
+            },
+            {
+              "index": 13366,
+              "token_id": 92,
+              "token": "}",
+              "label": 92,
+              "trained": true
+            },
+            {
+              "index": 13367,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": 198,
+              "trained": true
+            },
+            {
+              "index": 13368,
+              "token_id": 71093,
+              "token": "```",
+              "label": 71093,
+              "trained": true
+            },
+            {
+              "index": 13369,
+              "token_id": 248046,
+              "token": "<|im_end|>",
+              "label": 248046,
+              "trained": true
+            },
+            {
+              "index": 13370,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            }
+          ],
+          "omitted_interior_tokens": 571
+        }
+      }
+    },
+    {
+      "row_index": 677,
+      "tokens": 11041,
+      "trained_tokens": 858,
+      "masked_tokens": 10183,
+      "assistant_tool_calls_present": true,
+      "final_assistant_trained": true,
+      "user_and_tool_turns_masked": true,
+      "full_render_byte_equal_to_tokenizer_template": true,
+      "semantic_assistant_tokens": 861,
+      "masked_separator_newlines": 3,
+      "turn_checks": [
+        {
+          "turn": 0,
+          "role": "system",
+          "start": 5383,
+          "end_exclusive": 5859,
+          "span_tokens": 476,
+          "trained_tokens": 0,
+          "masked_tokens": 476,
+          "content_excerpt": "You are a sidekick to a powerful coding agent. The agent is busy reasoning about a hard problem and sent you ahead into this repository to find the code it will need, so it does no",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 1,
+          "role": "user",
+          "start": 5864,
+          "end_exclusive": 6040,
+          "span_tokens": 176,
+          "trained_tokens": 0,
+          "masked_tokens": 176,
+          "content_excerpt": "Request:\nWhat is the purpose of the vtchmodm64e binary alongside vtchmod32, vtchmod64, vtchmod64_musl, and vtchmodaa64 -- which target architecture/ABI does the 'm64e' suffix corre",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 2,
+          "role": "assistant",
+          "start": 6049,
+          "end_exclusive": 6143,
+          "span_tokens": 94,
+          "trained_tokens": 94,
+          "masked_tokens": 0,
+          "content_excerpt": "I'll investigate the vtchmod binaries and their architecture/ABI suffixes.",
+          "has_tool_calls": true
+        },
+        {
+          "turn": 3,
+          "role": "tool",
+          "start": 6150,
+          "end_exclusive": 8522,
+          "span_tokens": 2372,
+          "trained_tokens": 0,
+          "masked_tokens": 2372,
+          "content_excerpt": "vtoygpt/build.sh\n11: mips64el-linux-musl-gcc -mips64r2 -mabi=64 -static -Os -D_FILE_OFFSET_BITS=64 vtoygpt.c crc32.c -o  vtoygpt_m64e\n17: if [ -e vtoygpt_64 ] && [ -e vtoygpt_32 ] ",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 4,
+          "role": "tool",
+          "start": 8527,
+          "end_exclusive": 8704,
+          "span_tokens": 177,
+          "trained_tokens": 0,
+          "masked_tokens": 177,
+          "content_excerpt": "11 files matching **/vtchmod*\n\nBUSYBOX/chmod/vtchmod.c\nBUSYBOX/chmod/vtchmod32\nBUSYBOX/chmod/vtchmod64\nBUSYBOX/chmod/vtchmod64_musl\nBUSYBOX/chmod/vtchmodaa64\nBUSYBOX/chmod/vtchmodm",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 5,
+          "role": "assistant",
+          "start": 8715,
+          "end_exclusive": 8858,
+          "span_tokens": 143,
+          "trained_tokens": 143,
+          "masked_tokens": 0,
+          "content_excerpt": "The key file is the build script. Let me read it fully along with the vtchmod source and the init usage.",
+          "has_tool_calls": true
+        },
+        {
+          "turn": 6,
+          "role": "tool",
+          "start": 8865,
+          "end_exclusive": 9438,
+          "span_tokens": 573,
+          "trained_tokens": 0,
+          "masked_tokens": 573,
+          "content_excerpt": " 1: #!/bin/sh\n 2: \n 3: DSTDIR1=../../IMG/cpio_x86/ventoy/busybox\n 4: DSTDIR2=../../IMG/cpio_arm64/ventoy/busybox\n 5: DSTDIR3=../../IMG/cpio_mips64/ventoy/busybox\n 6: \n 7: rm -f vtc",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 7,
+          "role": "tool",
+          "start": 9443,
+          "end_exclusive": 9748,
+          "span_tokens": 305,
+          "trained_tokens": 0,
+          "masked_tokens": 305,
+          "content_excerpt": " 1: #include <stdio.h>\n 2: #include <string.h>\n 3: #include <sys/types.h>  \n 4: #include <sys/stat.h>\n 5: #include <sys/utsname.h>\n 6: \n 7: int main(int argc, char **argv)\n 8: {\n 9",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 8,
+          "role": "tool",
+          "start": 9753,
+          "end_exclusive": 10410,
+          "span_tokens": 657,
+          "trained_tokens": 0,
+          "masked_tokens": 657,
+          "content_excerpt": "38: \n39: if [ -e $BUSYBOX_PATH/busyboxaa64.xz ]; then\n40:     export VTOY_ARCH=aarch64\n41: elif [ -e $BUSYBOX_PATH/busyboxm64e.xz ]; then\n42:     export VTOY_ARCH=mips64el\n43: else",
+          "has_tool_calls": false
+        },
+        {
+          "turn": 9,
+          "role": "assistant",
+          "start": 10421,
+          "end_exclusive": 11039,
+          "span_tokens": 618,
+          "trained_tokens": 618,
+          "masked_tokens": 0,
+          "content_excerpt": "I have everything I need. The evidence is conclusive.\n\n```json\n{\n  \"interpretation\": \"Purpose of vtchmodm64e vs the other vtchmod* binaries, and the arch/ABI the 'm64e' suffix deno",
+          "has_tool_calls": false
+        }
+      ],
+      "rendered_prefix": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence \u2014 the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and exec",
+      "rendered_suffix": " \"why\": \"DSTDIR3=cpio_mips64; vtchmodm64e is deployed to the mips64 initramfs, tying the 'm64e' suffix to the mips64 image dir.\" }\n  ],\n  \"omissions\": [\n    { \"what\": \"Other *_m64e / *m64e artifacts (vtoytool, vtoyfat, vtoycli, dmsetup, xzminidec, lz4cat, Ventoy2Disk)\", \"why\": \"skipped_candidate\", \"detail\": \"All use the identical mips64el-linux-musl-gcc -mips64r2 -mabi=64 recipe and target mips64el, corroborating the suffix meaning but not central to the vtchmod question.\" }\n  ]\n}\n```<|im_end|>\n",
+      "label_runs": [
+        {
+          "start": 0,
+          "end_exclusive": 6049,
+          "tokens": 6049,
+          "label": "MASK",
+          "decoded_excerpt": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence \u2014 the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and exec",
+          "excerpt_truncated": true
+        },
+        {
+          "start": 6049,
+          "end_exclusive": 6144,
+          "tokens": 95,
+          "label": "TRAIN",
+          "decoded_excerpt": "I'll investigate the vtchmod binaries and their architecture/ABI suffixes.\n\n<tool_call>\n<function=grep>\n<parameter=pattern>\nvtchmodm64e|vtchmodaa64|vtchmod64_musl|m64e\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=glob>\n<parameter=pattern>\n**/vtchmod*\n</parameter>\n</function>\n</tool_call><|im_end|>",
+          "excerpt_truncated": false
+        },
+        {
+          "start": 6144,
+          "end_exclusive": 8715,
+          "tokens": 2571,
+          "label": "MASK",
+          "decoded_excerpt": "\n<|im_start|>user\n<tool_response>\nvtoygpt/build.sh\n11: mips64el-linux-musl-gcc -mips64r2 -mabi=64 -static -Os -D_FILE_OFFSET_BITS=64 vtoygpt.c crc32.c -o  vtoygpt_m64e\n17: if [ -e vtoygpt_64 ] && [ -e vtoygpt_32 ] && [ -e vtoygpt_aa64 ] && [ -e vtoygpt_m64e ]; then\n25:     mips64el-linux-musl-strip --strip-all vtoygpt_m64e\n26:     mv vtoygpt_m64e ../INSTALL/tool/mips64el/vtoygpt\n\nvtoyfat/fat_io_lib/buildlib.sh\n31: ar -rc libfat_io_m64e.a *.o\n\nvtoyfat/build.sh\n6: rm -f vtoyfat_m64e\n12: mips64el-l",
+          "excerpt_truncated": true
+        },
+        {
+          "start": 8715,
+          "end_exclusive": 8859,
+          "tokens": 144,
+          "label": "TRAIN",
+          "decoded_excerpt": "The key file is the build script. Let me read it fully along with the vtchmod source and the init usage.\n\n<tool_call>\n<function=read>\n<parameter=filePath>\nBUSYBOX/chmod/build.sh\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=read>\n<parameter=filePath>\nBUSYBOX/chmod/vtchmod.c\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=read>\n<parameter=filePath>\nIMG/cpio/sbin/init\n</parameter>\n<parameter=startLine>\n38\n</parameter>\n<parameter=endLine>\n75\n</parameter>\n</function>\n</tool",
+          "excerpt_truncated": true
+        },
+        {
+          "start": 8859,
+          "end_exclusive": 10421,
+          "tokens": 1562,
+          "label": "MASK",
+          "decoded_excerpt": "\n<|im_start|>user\n<tool_response>\n1: #!/bin/sh\n 2: \n 3: DSTDIR1=../../IMG/cpio_x86/ventoy/busybox\n 4: DSTDIR2=../../IMG/cpio_arm64/ventoy/busybox\n 5: DSTDIR3=../../IMG/cpio_mips64/ventoy/busybox\n 6: \n 7: rm -f vtchmod32 vtchmod64 vtchmod64_musl vtchmodaa64\n 8: rm -f $DSTDIR1/vtchmod32 $DSTDIR1/vtchmod64 $DSTDIR2/vtchmodaa64 $DSTDIR3/vtchmodm64e\n 9: \n10: /opt/diet32/bin/diet  gcc  -Os -m32  vtchmod.c -o  vtchmod32\n11: /opt/diet64/bin/diet  gcc  -Os       vtchmod.c -o  vtchmod64\n12: aarch64-linux-",
+          "excerpt_truncated": true
+        },
+        {
+          "start": 10421,
+          "end_exclusive": 11040,
+          "tokens": 619,
+          "label": "TRAIN",
+          "decoded_excerpt": "I have everything I need. The evidence is conclusive.\n\n```json\n{\n  \"interpretation\": \"Purpose of vtchmodm64e vs the other vtchmod* binaries, and the arch/ABI the 'm64e' suffix denotes.\",\n  \"scope\": [\"BUSYBOX/chmod/\", \"IMG/cpio/sbin/init\", \"IMG/cpio_mips64/\"],\n  \"snippets\": [\n    { \"path\": \"BUSYBOX/chmod/build.sh\", \"startLine\": 10, \"endLine\": 32, \"why\": \"Each suffix's compiler: vtchmod32=diet x86 -m32, vtchmod64=diet x86_64, vtchmodaa64=aarch64, vtchmod64_musl=x86_64 musl, and vtchmodm64e built w",
+          "excerpt_truncated": true
+        },
+        {
+          "start": 11040,
+          "end_exclusive": 11041,
+          "tokens": 1,
+          "label": "MASK",
+          "decoded_excerpt": "\n",
+          "excerpt_truncated": false
+        }
+      ],
+      "token_windows": {
+        "first_assistant_tool_call": {
+          "span_start": 6049,
+          "span_end_exclusive": 6143,
+          "start_boundary": [
+            {
+              "index": 6043,
+              "token_id": 74455,
+              "token": "assistant",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6044,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6045,
+              "token_id": 248068,
+              "token": "<think>",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6046,
+              "token_id": 271,
+              "token": "\u010a\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6047,
+              "token_id": 248069,
+              "token": "</think>",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6048,
+              "token_id": 271,
+              "token": "\u010a\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6049,
+              "token_id": 40,
+              "token": "I",
+              "label": 40,
+              "trained": true
+            },
+            {
+              "index": 6050,
+              "token_id": 3172,
+              "token": "'ll",
+              "label": 3172,
+              "trained": true
+            },
+            {
+              "index": 6051,
+              "token_id": 18730,
+              "token": "\u0120investigate",
+              "label": 18730,
+              "trained": true
+            },
+            {
+              "index": 6052,
+              "token_id": 279,
+              "token": "\u0120the",
+              "label": 279,
+              "trained": true
+            },
+            {
+              "index": 6053,
+              "token_id": 37809,
+              "token": "\u0120vt",
+              "label": 37809,
+              "trained": true
+            },
+            {
+              "index": 6054,
+              "token_id": 54383,
+              "token": "chmod",
+              "label": 54383,
+              "trained": true
+            },
+            {
+              "index": 6055,
+              "token_id": 67375,
+              "token": "\u0120binaries",
+              "label": 67375,
+              "trained": true
+            },
+            {
+              "index": 6056,
+              "token_id": 321,
+              "token": "\u0120and",
+              "label": 321,
+              "trained": true
+            },
+            {
+              "index": 6057,
+              "token_id": 836,
+              "token": "\u0120their",
+              "label": 836,
+              "trained": true
+            },
+            {
+              "index": 6058,
+              "token_id": 17120,
+              "token": "\u0120architecture",
+              "label": 17120,
+              "trained": true
+            },
+            {
+              "index": 6059,
+              "token_id": 14,
+              "token": "/",
+              "label": 14,
+              "trained": true
+            },
+            {
+              "index": 6060,
+              "token_id": 61768,
+              "token": "ABI",
+              "label": 61768,
+              "trained": true
+            }
+          ],
+          "end_boundary": [
+            {
+              "index": 6131,
+              "token_id": 54383,
+              "token": "chmod",
+              "label": 54383,
+              "trained": true
+            },
+            {
+              "index": 6132,
+              "token_id": 9,
+              "token": "*",
+              "label": 9,
+              "trained": true
+            },
+            {
+              "index": 6133,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": 198,
+              "trained": true
+            },
+            {
+              "index": 6134,
+              "token_id": 510,
+              "token": "</",
+              "label": 510,
+              "trained": true
+            },
+            {
+              "index": 6135,
+              "token_id": 15704,
+              "token": "parameter",
+              "label": 15704,
+              "trained": true
+            },
+            {
+              "index": 6136,
+              "token_id": 29,
+              "token": ">",
+              "label": 29,
+              "trained": true
+            },
+            {
+              "index": 6137,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": 198,
+              "trained": true
+            },
+            {
+              "index": 6138,
+              "token_id": 510,
+              "token": "</",
+              "label": 510,
+              "trained": true
+            },
+            {
+              "index": 6139,
+              "token_id": 1628,
+              "token": "function",
+              "label": 1628,
+              "trained": true
+            },
+            {
+              "index": 6140,
+              "token_id": 29,
+              "token": ">",
+              "label": 29,
+              "trained": true
+            },
+            {
+              "index": 6141,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": 198,
+              "trained": true
+            },
+            {
+              "index": 6142,
+              "token_id": 248059,
+              "token": "</tool_call>",
+              "label": 248059,
+              "trained": true
+            },
+            {
+              "index": 6143,
+              "token_id": 248046,
+              "token": "<|im_end|>",
+              "label": 248046,
+              "trained": true
+            },
+            {
+              "index": 6144,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6145,
+              "token_id": 248045,
+              "token": "<|im_start|>",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6146,
+              "token_id": 846,
+              "token": "user",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6147,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6148,
+              "token_id": 248066,
+              "token": "<tool_response>",
+              "label": -100,
+              "trained": false
+            }
+          ],
+          "omitted_interior_tokens": 70
+        },
+        "first_tool_result": {
+          "span_start": 6150,
+          "span_end_exclusive": 8522,
+          "start_boundary": [
+            {
+              "index": 6144,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6145,
+              "token_id": 248045,
+              "token": "<|im_start|>",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6146,
+              "token_id": 846,
+              "token": "user",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6147,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6148,
+              "token_id": 248066,
+              "token": "<tool_response>",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6149,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6150,
+              "token_id": 85,
+              "token": "v",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6151,
+              "token_id": 951,
+              "token": "to",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6152,
+              "token_id": 47133,
+              "token": "yg",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6153,
+              "token_id": 409,
+              "token": "pt",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6154,
+              "token_id": 29594,
+              "token": "/build",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6155,
+              "token_id": 2318,
+              "token": ".sh",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6156,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6157,
+              "token_id": 16,
+              "token": "1",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6158,
+              "token_id": 16,
+              "token": "1",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6159,
+              "token_id": 25,
+              "token": ":",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6160,
+              "token_id": 295,
+              "token": "\u0120m",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 6161,
+              "token_id": 2978,
+              "token": "ips",
+              "label": -100,
+              "trained": false
+            }
+          ],
+          "end_boundary": [
+            {
+              "index": 8510,
+              "token_id": 8798,
+              "token": "\u0120matches",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 8511,
+              "token_id": 271,
+              "token": "\u010a\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 8512,
+              "token_id": 6441,
+              "token": "Found",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 8513,
+              "token_id": 220,
+              "token": "\u0120",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 8514,
+              "token_id": 23,
+              "token": "8",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 8515,
+              "token_id": 16,
+              "token": "1",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 8516,
+              "token_id": 2353,
+              "token": "\u0120match",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 8517,
+              "token_id": 3808,
+              "token": "\u0120across",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 8518,
+              "token_id": 220,
+              "token": "\u0120",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 8519,
+              "token_id": 16,
+              "token": "1",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 8520,
+              "token_id": 24,
+              "token": "9",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 8521,
+              "token_id": 999,
+              "token": "\u0120file",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 8522,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 8523,
+              "token_id": 248067,
+              "token": "</tool_response>",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 8524,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 8525,
+              "token_id": 248066,
+              "token": "<tool_response>",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 8526,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 8527,
+              "token_id": 16,
+              "token": "1",
+              "label": -100,
+              "trained": false
+            }
+          ],
+          "omitted_interior_tokens": 2348
+        },
+        "final_assistant_answer": {
+          "span_start": 10421,
+          "span_end_exclusive": 11039,
+          "start_boundary": [
+            {
+              "index": 10415,
+              "token_id": 74455,
+              "token": "assistant",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 10416,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 10417,
+              "token_id": 248068,
+              "token": "<think>",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 10418,
+              "token_id": 271,
+              "token": "\u010a\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 10419,
+              "token_id": 248069,
+              "token": "</think>",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 10420,
+              "token_id": 271,
+              "token": "\u010a\u010a",
+              "label": -100,
+              "trained": false
+            },
+            {
+              "index": 10421,
+              "token_id": 40,
+              "token": "I",
+              "label": 40,
+              "trained": true
+            },
+            {
+              "index": 10422,
+              "token_id": 599,
+              "token": "\u0120have",
+              "label": 599,
+              "trained": true
+            },
+            {
+              "index": 10423,
+              "token_id": 4156,
+              "token": "\u0120everything",
+              "label": 4156,
+              "trained": true
+            },
+            {
+              "index": 10424,
+              "token_id": 353,
+              "token": "\u0120I",
+              "label": 353,
+              "trained": true
+            },
+            {
+              "index": 10425,
+              "token_id": 1144,
+              "token": "\u0120need",
+              "label": 1144,
+              "trained": true
+            },
+            {
+              "index": 10426,
+              "token_id": 13,
+              "token": ".",
+              "label": 13,
+              "trained": true
+            },
+            {
+              "index": 10427,
+              "token_id": 561,
+              "token": "\u0120The",
+              "label": 561,
+              "trained": true
+            },
+            {
+              "index": 10428,
+              "token_id": 5721,
+              "token": "\u0120evidence",
+              "label": 5721,
+              "trained": true
+            },
+            {
+              "index": 10429,
+              "token_id": 369,
+              "token": "\u0120is",
+              "label": 369,
+              "trained": true
+            },
+            {
+              "index": 10430,
+              "token_id": 94123,
+              "token": "\u0120conclusive",
+              "label": 94123,
+              "trained": true
+            },
+            {
+              "index": 10431,
+              "token_id": 13,
+              "token": ".",
+              "label": 13,
+              "trained": true
+            },
+            {
+              "index": 10432,
+              "token_id": 271,
+              "token": "\u010a\u010a",
+              "label": 271,
+              "trained": true
+            }
+          ],
+          "end_boundary": [
+            {
+              "index": 11027,
+              "token_id": 37809,
+              "token": "\u0120vt",
+              "label": 37809,
+              "trained": true
+            },
+            {
+              "index": 11028,
+              "token_id": 54383,
+              "token": "chmod",
+              "label": 54383,
+              "trained": true
+            },
+            {
+              "index": 11029,
+              "token_id": 3296,
+              "token": "\u0120question",
+              "label": 3296,
+              "trained": true
+            },
+            {
+              "index": 11030,
+              "token_id": 1149,
+              "token": ".\"",
+              "label": 1149,
+              "trained": true
+            },
+            {
+              "index": 11031,
+              "token_id": 333,
+              "token": "\u0120}",
+              "label": 333,
+              "trained": true
+            },
+            {
+              "index": 11032,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": 198,
+              "trained": true
+            },
+            {
+              "index": 11033,
+              "token_id": 220,
+              "token": "\u0120",
+              "label": 220,
+              "trained": true
+            },
+            {
+              "index": 11034,
+              "token_id": 2205,
+              "token": "\u0120]",
+              "label": 2205,
+              "trained": true
+            },
+            {
+              "index": 11035,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": 198,
+              "trained": true
+            },
+            {
+              "index": 11036,
+              "token_id": 92,
+              "token": "}",
+              "label": 92,
+              "trained": true
+            },
+            {
+              "index": 11037,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": 198,
+              "trained": true
+            },
+            {
+              "index": 11038,
+              "token_id": 71093,
+              "token": "```",
+              "label": 71093,
+              "trained": true
+            },
+            {
+              "index": 11039,
+              "token_id": 248046,
+              "token": "<|im_end|>",
+              "label": 248046,
+              "trained": true
+            },
+            {
+              "index": 11040,
+              "token_id": 198,
+              "token": "\u010a",
+              "label": -100,
+              "trained": false
+            }
+          ],
+          "omitted_interior_tokens": 594
+        }
+      }
+    }
+  ],
+  "passed": true
+}

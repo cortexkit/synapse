@@ -1,0 +1,29 @@
+{
+  "steps": 30,
+  "passed": true,
+  "loss_first": 0.8221,
+  "loss_last": 0.5971,
+  "loss_first_5_mean": 0.7990800000000001,
+  "loss_last_5_mean": 0.65176,
+  "loss_min": 0.5971,
+  "loss_max": 0.892,
+  "optimizer_step_runtime_seconds": 457.7,
+  "wall_seconds": 587.0,
+  "input_tokens": 7864320,
+  "supervised_tokens": 770696,
+  "aggregate_input_tokens_per_second": 17182.259121695435,
+  "aggregate_supervised_tokens_per_second": 1683.8453135241425,
+  "pytorch_peak_allocated_gib": 63.19,
+  "nvidia_smi_peak_used_mib": 67623,
+  "checkpoints": [
+    "checkpoint-20",
+    "checkpoint-30"
+  ],
+  "checkpoint_interval_steps": 10,
+  "nan_or_inf": false,
+  "oom_attempt_before_chunked_loss": {
+    "failed_at_step": 0,
+    "peak_used_mib": 55099,
+    "reason": "full-vocabulary 32k cross-entropy requested an additional 30.31 GiB"
+  }
+}

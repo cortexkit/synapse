@@ -1,0 +1,27 @@
+{
+  "source": "Qwen/Qwen3.5-2B",
+  "revision": "15852e8c16360a2fea060d615a32b45270f8a8fc",
+  "auto_class": "AutoModelForCausalLM",
+  "loaded_class": "Qwen3_5ForCausalLM",
+  "composite_config_class": "Qwen3_5Config",
+  "text_config_class": "Qwen3_5TextConfig",
+  "declared_architectures": [
+    "Qwen3_5ForConditionalGeneration"
+  ],
+  "parameter_count": 1881825088,
+  "trainable_parameter_count": 1881825088,
+  "parameter_tensor_count": 320,
+  "vision_parameter_names": [],
+  "vision_parameter_count": 0,
+  "missing_keys_count": 0,
+  "unexpected_keys_count": 0,
+  "mismatched_keys_count": 0,
+  "unexpected_key_samples": [],
+  "forward_logits_shape": [
+    1,
+    4,
+    248320
+  ],
+  "cuda_peak_allocated_bytes": 3799341568,
+  "passed": true
+}

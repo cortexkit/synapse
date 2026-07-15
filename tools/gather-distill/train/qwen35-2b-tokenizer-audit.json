@@ -1,0 +1,260 @@
+{
+  "generated_at": "2026-07-15T09:13:17.567054+00:00",
+  "dataset": "train/sft-dataset-curated.jsonl",
+  "dataset_sha256": "005f0cad5fa3da8a21b448fce6e68a3787a516c090f938616556cbae56094859",
+  "rows": 1864,
+  "transformers_version": "5.12.1",
+  "percentile_method": "nearest-rank; rank=max(1, ceil(p*N))",
+  "truncation": "disabled",
+  "tools_included": true,
+  "models": [
+    {
+      "label": "Qwen3.5 2B",
+      "repo_id": "Qwen/Qwen3.5-2B",
+      "revision": "15852e8c16360a2fea060d615a32b45270f8a8fc",
+      "argument_mode": "hf_object",
+      "instrumentation": "qwen",
+      "resolved": true,
+      "tokenizer_class": "Qwen2Tokenizer",
+      "config_class": "Qwen3_5Config",
+      "model_type": "qwen3_5",
+      "architectures": [
+        "Qwen3_5ForConditionalGeneration"
+      ],
+      "chat_template_sha256": "273d8e0e683b885071fb17e08d71e5f2a5ddfb5309756181681de4f5a1822d80",
+      "rows": 1864,
+      "raw_openai_argument_strings": {
+        "supported": false,
+        "error": "TypeError: Can only get item pairs from a mapping."
+      },
+      "hf_argument_objects_parsed": 24225,
+      "argument_adapter_note": "The official template calls Jinja |items on function.arguments. Each OpenAI JSON string was parsed to an equivalent object in memory before rendering; the committed JSONL remains OpenAI-shaped.",
+      "total_tokens": {
+        "p50": 14394,
+        "p90": 21879,
+        "p95": 24949,
+        "p99": 29766,
+        "max": 32411,
+        "sum": 28096989
+      },
+      "loss_bearing_assistant_tokens": {
+        "p50": 1553,
+        "p90": 2554,
+        "p95": 2792,
+        "p99": 3358,
+        "max": 4982,
+        "sum": 3033397
+      },
+      "masked_context_tokens": {
+        "p50": 12684,
+        "p90": 19858,
+        "p95": 22589,
+        "p99": 27335,
+        "max": 29685,
+        "sum": 25063592
+      },
+      "aggregate_loss_share": 0.10796163959063372,
+      "over_32768": 0,
+      "over_32768_rate": 0.0,
+      "over_40960": 0,
+      "over_40960_rate": 0.0,
+      "overflow_records": [],
+      "render_checks": [
+        {
+          "row_index": 0,
+          "render_sha256": "719cae911e6aed3c910b9fa87a35ddf176fbd00cc171c6ed3ff8d969d7f05084",
+          "characters": 44728,
+          "tokens": 13140,
+          "assistant_tokens": 1061,
+          "context_tokens": 12079,
+          "render_prefix": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search code with one tool: concepts, identifiers, error strings, regex, literals, and filen",
+          "render_suffix": "ontent, resolveImageSource, formatWebSearchToolResultContent, EstimateInputTokens\", \"why\": \"budget\", \"detail\": \"Supporting content/image/token helpers used by convertMessage; not the primary translation entry points.\" }\n  ]\n}\n```<|im_end|>\n",
+          "instrumented_render_byte_identical": true
+        },
+        {
+          "row_index": 155,
+          "render_sha256": "0e877b8bce0df5321293a58333a075078fc8da2a884f604adf62f3e2b6d42bb9",
+          "characters": 66240,
+          "tokens": 19046,
+          "assistant_tokens": 2081,
+          "context_tokens": 16965,
+          "render_prefix": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search code with one tool: concepts, identifiers, error strings, regex, literals, and filen",
+          "render_suffix": "es to isUsingHevTun (lines ~446-598) that gate tun config generation\", \"why\": \"budget\", \"detail\": \"These shape the config passed to whichever tun path is chosen but are not where the binary itself is selected/loaded.\" }\n  ]\n}\n```<|im_end|>\n",
+          "instrumented_render_byte_identical": true
+        },
+        {
+          "row_index": 340,
+          "render_sha256": "a6520a3e920bfeab38391539178795bda8058fa1e0401feae22fa4dee74fb9af",
+          "characters": 52021,
+          "tokens": 13371,
+          "assistant_tokens": 1017,
+          "context_tokens": 12354,
+          "render_prefix": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search code with one tool: concepts, identifiers, error strings, regex, literals, and filen",
+          "render_suffix": "ate/list/delete commands\", \"why\": \"skipped_candidate\", \"detail\": \"CLI surface that drives HostDNSResolver domain files; relevant to the localhost feature's user workflow but not to handler implementation differences.\" }\n  ]\n}\n```<|im_end|>\n",
+          "instrumented_render_byte_identical": true
+        },
+        {
+          "row_index": 677,
+          "render_sha256": "8afaf91a4044053ae4584901adff102e169d171b80508047abec862740219854",
+          "characters": 36104,
+          "tokens": 11041,
+          "assistant_tokens": 861,
+          "context_tokens": 10180,
+          "render_prefix": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search code with one tool: concepts, identifiers, error strings, regex, literals, and filen",
+          "render_suffix": "oy2Disk)\", \"why\": \"skipped_candidate\", \"detail\": \"All use the identical mips64el-linux-musl-gcc -mips64r2 -mabi=64 recipe and target mips64el, corroborating the suffix meaning but not central to the vtchmod question.\" }\n  ]\n}\n```<|im_end|>\n",
+          "instrumented_render_byte_identical": true
+        },
+        {
+          "row_index": 1863,
+          "render_sha256": "4bda6c2d82a6977dc9341990ca1cd1407af30010cb0c455afe7e0e1707d578ba",
+          "characters": 52364,
+          "tokens": 14470,
+          "assistant_tokens": 2061,
+          "context_tokens": 12409,
+          "render_prefix": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search code with one tool: concepts, identifiers, error strings, regex, literals, and filen",
+          "render_suffix": "ngential to the request.\" },\n    { \"what\": \"DraggingDetect.swift setting shouldAutoLoadFiles=true for drag-drop opens\", \"why\": \"budget\", \"detail\": \"An alternate trigger path (line 216) feeding the same autoload flag.\" }\n  ]\n}\n```<|im_end|>\n",
+          "instrumented_render_byte_identical": true
+        }
+      ],
+      "mask_method": "No-output Jinja generation tags instrument the official template. The script proves byte-identical rendered text on the five conversion samples, then uses Transformers assistant_masks. Assistant payload and turn-ending branches are marked while role headers remain context; Gemma marks assistant tool-call/content branches separately so forward-scanned tool results remain context."
+    }
+  ],
+  "stop_threshold_triggered": false,
+  "stop_threshold_models": [],
+  "comparison": {
+    "purpose": "Verify the curated 2B audit against the prepared 9B lane. Token vocabulary is byte-identical; their pinned revisions carry different chat templates, so rendered length percentiles are compared rather than assumed equal.",
+    "tokenizer_vocab_identical": true,
+    "qwen35_2b_vocab_sha256": "420ab4b96193b4325156f56cd7c3876a8a0d46f515fe4f711a7a6bf5553bf8fa",
+    "qwen35_9b_vocab_sha256": "420ab4b96193b4325156f56cd7c3876a8a0d46f515fe4f711a7a6bf5553bf8fa",
+    "qwen35_2b_chat_template_sha256": "273d8e0e683b885071fb17e08d71e5f2a5ddfb5309756181681de4f5a1822d80",
+    "qwen35_9b_chat_template_sha256": "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715",
+    "qwen35_2b_total_tokens": {
+      "p50": 14394,
+      "p90": 21879,
+      "p95": 24949,
+      "p99": 29766,
+      "max": 32411,
+      "sum": 28096989
+    },
+    "qwen35_9b_total_tokens": {
+      "p50": 14394,
+      "p90": 21879,
+      "p95": 24949,
+      "p99": 29766,
+      "max": 32411,
+      "sum": 28096989
+    },
+    "qwen35_2b_over_32768": 0,
+    "qwen35_9b_over_32768": 0
+  },
+  "comparison_model": {
+    "label": "Qwen3.5 9B curated comparison",
+    "repo_id": "Qwen/Qwen3.5-9B",
+    "revision": "c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+    "argument_mode": "hf_object",
+    "instrumentation": "qwen",
+    "resolved": true,
+    "tokenizer_class": "Qwen2Tokenizer",
+    "config_class": "Qwen3_5Config",
+    "model_type": "qwen3_5",
+    "architectures": [
+      "Qwen3_5ForConditionalGeneration"
+    ],
+    "chat_template_sha256": "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715",
+    "rows": 1864,
+    "raw_openai_argument_strings": {
+      "supported": false,
+      "error": "TypeError: Can only get item pairs from a mapping."
+    },
+    "hf_argument_objects_parsed": 24225,
+    "argument_adapter_note": "The official template calls Jinja |items on function.arguments. Each OpenAI JSON string was parsed to an equivalent object in memory before rendering; the committed JSONL remains OpenAI-shaped.",
+    "total_tokens": {
+      "p50": 14394,
+      "p90": 21879,
+      "p95": 24949,
+      "p99": 29766,
+      "max": 32411,
+      "sum": 28096989
+    },
+    "loss_bearing_assistant_tokens": {
+      "p50": 1553,
+      "p90": 2554,
+      "p95": 2792,
+      "p99": 3358,
+      "max": 4982,
+      "sum": 3033397
+    },
+    "masked_context_tokens": {
+      "p50": 12684,
+      "p90": 19858,
+      "p95": 22589,
+      "p99": 27335,
+      "max": 29685,
+      "sum": 25063592
+    },
+    "aggregate_loss_share": 0.10796163959063372,
+    "over_32768": 0,
+    "over_32768_rate": 0.0,
+    "over_40960": 0,
+    "over_40960_rate": 0.0,
+    "overflow_records": [],
+    "render_checks": [
+      {
+        "row_index": 0,
+        "render_sha256": "719cae911e6aed3c910b9fa87a35ddf176fbd00cc171c6ed3ff8d969d7f05084",
+        "characters": 44728,
+        "tokens": 13140,
+        "assistant_tokens": 1061,
+        "context_tokens": 12079,
+        "render_prefix": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search code with one tool: concepts, identifiers, error strings, regex, literals, and filen",
+        "render_suffix": "ontent, resolveImageSource, formatWebSearchToolResultContent, EstimateInputTokens\", \"why\": \"budget\", \"detail\": \"Supporting content/image/token helpers used by convertMessage; not the primary translation entry points.\" }\n  ]\n}\n```<|im_end|>\n",
+        "instrumented_render_byte_identical": true
+      },
+      {
+        "row_index": 155,
+        "render_sha256": "0e877b8bce0df5321293a58333a075078fc8da2a884f604adf62f3e2b6d42bb9",
+        "characters": 66240,
+        "tokens": 19046,
+        "assistant_tokens": 2081,
+        "context_tokens": 16965,
+        "render_prefix": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search code with one tool: concepts, identifiers, error strings, regex, literals, and filen",
+        "render_suffix": "es to isUsingHevTun (lines ~446-598) that gate tun config generation\", \"why\": \"budget\", \"detail\": \"These shape the config passed to whichever tun path is chosen but are not where the binary itself is selected/loaded.\" }\n  ]\n}\n```<|im_end|>\n",
+        "instrumented_render_byte_identical": true
+      },
+      {
+        "row_index": 340,
+        "render_sha256": "a6520a3e920bfeab38391539178795bda8058fa1e0401feae22fa4dee74fb9af",
+        "characters": 52021,
+        "tokens": 13371,
+        "assistant_tokens": 1017,
+        "context_tokens": 12354,
+        "render_prefix": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search code with one tool: concepts, identifiers, error strings, regex, literals, and filen",
+        "render_suffix": "ate/list/delete commands\", \"why\": \"skipped_candidate\", \"detail\": \"CLI surface that drives HostDNSResolver domain files; relevant to the localhost feature's user workflow but not to handler implementation differences.\" }\n  ]\n}\n```<|im_end|>\n",
+        "instrumented_render_byte_identical": true
+      },
+      {
+        "row_index": 677,
+        "render_sha256": "8afaf91a4044053ae4584901adff102e169d171b80508047abec862740219854",
+        "characters": 36104,
+        "tokens": 11041,
+        "assistant_tokens": 861,
+        "context_tokens": 10180,
+        "render_prefix": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search code with one tool: concepts, identifiers, error strings, regex, literals, and filen",
+        "render_suffix": "oy2Disk)\", \"why\": \"skipped_candidate\", \"detail\": \"All use the identical mips64el-linux-musl-gcc -mips64r2 -mabi=64 recipe and target mips64el, corroborating the suffix meaning but not central to the vtchmod question.\" }\n  ]\n}\n```<|im_end|>\n",
+        "instrumented_render_byte_identical": true
+      },
+      {
+        "row_index": 1863,
+        "render_sha256": "4bda6c2d82a6977dc9341990ca1cd1407af30010cb0c455afe7e0e1707d578ba",
+        "characters": 52364,
+        "tokens": 14470,
+        "assistant_tokens": 2061,
+        "context_tokens": 12409,
+        "render_prefix": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search code with one tool: concepts, identifiers, error strings, regex, literals, and filen",
+        "render_suffix": "ngential to the request.\" },\n    { \"what\": \"DraggingDetect.swift setting shouldAutoLoadFiles=true for drag-drop opens\", \"why\": \"budget\", \"detail\": \"An alternate trigger path (line 216) feeding the same autoload flag.\" }\n  ]\n}\n```<|im_end|>\n",
+        "instrumented_render_byte_identical": true
+      }
+    ],
+    "mask_method": "No-output Jinja generation tags instrument the official template. The script proves byte-identical rendered text on the five conversion samples, then uses Transformers assistant_masks. Assistant payload and turn-ending branches are marked while role headers remain context; Gemma marks assistant tool-call/content branches separately so forward-scanned tool results remain context."
+  }
+}
