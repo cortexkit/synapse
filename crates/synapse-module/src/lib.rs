@@ -76,6 +76,7 @@ const DEFAULT_MAX_QUEUE_MS: u64 = 5_000;
 const DEFAULT_DEADLINE_MS: u64 = 30_000;
 const DEFAULT_ESTIMATED_EXECUTION_MS: u64 = 25;
 const DEFAULT_MAX_CONCURRENT_WORKERS: usize = 2;
+const DEFAULT_TRANSIENT_RETRY_AFTER_MS: u64 = 100;
 const DEFAULT_JOB_EXECUTION_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
 const DEFAULT_JOB_RESULT_RETENTION_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
 const DEFAULT_RESUME_DEADLINE_MS: u64 = 24 * 60 * 60 * 1_000;
@@ -274,6 +275,14 @@ struct WireOperationError {
 
 impl WireOperationError {
     fn from_stable(error: StableError, message: impl Into<String>) -> Self {
+        let retry_after_ms = match error.class {
+            ErrorClass::Transient => Some(
+                error
+                    .retry_after_ms
+                    .unwrap_or(DEFAULT_TRANSIENT_RETRY_AFTER_MS),
+            ),
+            ErrorClass::Permanent => error.retry_after_ms,
+        };
         Self {
             code: serde_json::to_value(error.code)
                 .expect("stable error code serializes")
@@ -281,7 +290,7 @@ impl WireOperationError {
                 .expect("stable error code is a string")
                 .to_string(),
             class: error.class,
-            retry_after_ms: error.retry_after_ms,
+            retry_after_ms,
             safe_to_retry_same_request: error.safe_to_retry_same_request,
             message: message.into(),
         }
@@ -5468,6 +5477,9 @@ async fn execute_generate(
 }
 
 fn engine_error_to_wire(error: EngineError) -> WireOperationError {
+    if error.stage == EngineErrorStage::Load {
+        return artifact_invalid_error(error.message);
+    }
     if error.stage == EngineErrorStage::WorkerCrash && error.retry_after_ms.is_none() {
         return WireOperationError::from_stable(StableError::probe_required(), error.message);
     }
@@ -7735,6 +7747,41 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn engine_load_failures_are_permanent_artifact_errors() {
+        let error = engine_error_to_wire(EngineError {
+            stage: EngineErrorStage::Load,
+            risk_class: synapse_core::EngineRiskClass::AbortSafe,
+            message: "missing tensor; tried classifier.weight".to_string(),
+            retry_after_ms: None,
+            safe_to_retry_same_request: false,
+        });
+
+        assert_eq!(error.code, "artifact_invalid");
+        assert_eq!(error.class, ErrorClass::Permanent);
+        assert_eq!(error.retry_after_ms, None);
+        assert!(!error.safe_to_retry_same_request);
+    }
+
+    #[test]
+    fn transient_model_load_errors_always_include_retry_delay() {
+        let explicit = transient_model_load_error("cache lease is contended");
+        assert_eq!(explicit.class, ErrorClass::Transient);
+        assert_eq!(explicit.retry_after_ms, Some(1_000));
+        assert!(explicit.safe_to_retry_same_request);
+
+        let normalized = WireOperationError::from_stable(
+            StableError::model_loading(None),
+            "model artifact is still downloading",
+        );
+        assert_eq!(normalized.class, ErrorClass::Transient);
+        assert_eq!(
+            normalized.retry_after_ms,
+            Some(DEFAULT_TRANSIENT_RETRY_AFTER_MS)
+        );
+        assert!(normalized.safe_to_retry_same_request);
+    }
 
     #[test]
     fn module_config_rejects_unknown_fields() {

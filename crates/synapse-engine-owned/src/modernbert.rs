@@ -219,7 +219,11 @@ impl ModernBertModel {
             });
         }
 
-        let classification_head = if let Some(pooling) = &config.classifier_pooling {
+        let classification_head = if has_classification_head_tensors(&tensors) {
+            let pooling = config
+                .classifier_pooling
+                .as_deref()
+                .context("ModernBERT classifier tensors require classifier_pooling")?;
             ensure!(
                 pooling == "mean",
                 "unsupported ModernBERT classifier pooling {pooling}; rerank reference requires mean"
@@ -349,12 +353,15 @@ impl ModernBertModel {
     fn forward_rerank(
         &self,
         provider: &mut dyn KernelProvider,
-        head: &ClassificationHead,
         input_ids: &[u32],
         attention_mask: &[u8],
         batch: usize,
         seq: usize,
     ) -> Result<Vec<f32>> {
+        let head = self
+            .classification_head
+            .as_ref()
+            .context("this ModernBERT checkpoint has no sequence-classification head")?;
         let mut current = self.initial_hidden(input_ids)?;
         let mut metal_scores = None;
         let mut run = |context: &mut dyn Any| {
@@ -711,6 +718,28 @@ fn add_in_place(destination: &mut [f32], source: &[f32]) {
     for (destination, source) in destination.iter_mut().zip(source) {
         *destination += *source;
     }
+}
+
+fn has_classification_head_tensors(tensors: &HashMap<String, Tensor>) -> bool {
+    [
+        "head.dense.weight",
+        "head.norm.weight",
+        "classifier.weight",
+        "classifier.bias",
+    ]
+    .iter()
+    .any(|name| has_tensor(tensors, name))
+}
+
+fn has_tensor(tensors: &HashMap<String, Tensor>, base_name: &str) -> bool {
+    [
+        base_name.to_string(),
+        format!("bert.{base_name}"),
+        format!("model.{base_name}"),
+        format!("model.bert.{base_name}"),
+    ]
+    .iter()
+    .any(|candidate| tensors.contains_key(candidate))
 }
 
 fn vector(tensors: &HashMap<String, Tensor>, name: &str, expected: usize) -> Result<Vec<f32>> {
@@ -1197,4 +1226,164 @@ fn rope_tables(seq: usize, head_dim: usize, theta: f32) -> (Vec<f32>, Vec<f32>) 
         }
     }
     (cos, sin)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
+    use serde_json::json;
+
+    use super::*;
+    use crate::runtime::CpuProvider;
+
+    static NEXT_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
+
+    #[derive(Clone, Copy)]
+    enum HeadFixture {
+        None,
+        Complete,
+        MissingClassifierWeight,
+    }
+
+    struct ModelFixture {
+        path: PathBuf,
+    }
+
+    impl ModelFixture {
+        fn new(head: HeadFixture, classifier_activation: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "synapse-modernbert-loader-{}-{}",
+                std::process::id(),
+                NEXT_FIXTURE_ID.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&path).expect("create ModernBERT fixture directory");
+            fs::write(
+                path.join("config.json"),
+                serde_json::to_vec(&json!({
+                    "model_type": "modernbert",
+                    "hidden_size": 2,
+                    "intermediate_size": 2,
+                    "num_hidden_layers": 1,
+                    "num_attention_heads": 1,
+                    "vocab_size": 3,
+                    "max_position_embeddings": 4,
+                    "pad_token_id": 0,
+                    "classifier_pooling": "mean",
+                    "classifier_activation": classifier_activation
+                }))
+                .expect("serialize ModernBERT fixture config"),
+            )
+            .expect("write ModernBERT fixture config");
+
+            let mut tensors = vec![
+                tensor(
+                    "embeddings.tok_embeddings.weight",
+                    &[3, 2],
+                    &[0.0, 0.0, 1.0, -1.0, 0.5, 1.0],
+                ),
+                tensor("embeddings.norm.weight", &[2], &[1.0, 1.0]),
+                tensor("final_norm.weight", &[2], &[1.0, 1.0]),
+                tensor("layers.0.attn.Wqkv.weight", &[6, 2], &[0.0; 12]),
+                tensor("layers.0.attn.Wo.weight", &[2, 2], &[0.0; 4]),
+                tensor("layers.0.mlp.Wi.weight", &[4, 2], &[0.0; 8]),
+                tensor("layers.0.mlp.Wo.weight", &[2, 2], &[0.0; 4]),
+                tensor("layers.0.mlp_norm.weight", &[2], &[1.0, 1.0]),
+            ];
+            if !matches!(head, HeadFixture::None) {
+                tensors.extend([
+                    tensor("head.dense.weight", &[2, 2], &[1.0, 0.0, 0.0, 1.0]),
+                    tensor("head.norm.weight", &[2], &[1.0, 1.0]),
+                    tensor("classifier.bias", &[1], &[0.0]),
+                ]);
+            }
+            if matches!(head, HeadFixture::Complete) {
+                tensors.push(tensor("classifier.weight", &[1, 2], &[1.0, -1.0]));
+            }
+            let views = tensors
+                .iter()
+                .map(|(name, shape, data)| {
+                    (
+                        name.as_str(),
+                        TensorView::new(Dtype::F32, shape.clone(), data)
+                            .expect("create ModernBERT fixture tensor"),
+                    )
+                })
+                .collect::<Vec<_>>();
+            serialize_to_file(views, None, &path.join("model.safetensors"))
+                .expect("write ModernBERT fixture tensors");
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for ModelFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn tensor(name: &str, shape: &[usize], values: &[f32]) -> (String, Vec<usize>, Vec<u8>) {
+        assert_eq!(shape.iter().product::<usize>(), values.len());
+        (
+            name.to_string(),
+            shape.to_vec(),
+            values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn classifier_pooling_without_head_tensors_loads_embed_only() {
+        let fixture = ModelFixture::new(HeadFixture::None, "gelu");
+        let model = ModernBertModel::load(fixture.path(), Precision::F32)
+            .expect("embed checkpoint should load without classifier tensors");
+        assert!(model.classification_head.is_none());
+
+        let mut provider = CpuProvider;
+        let vectors = model
+            .embed_ids(&mut provider, &[vec![1]], None)
+            .expect("embed-only checkpoint should embed");
+        assert_eq!(vectors.len(), 1);
+        assert!((vectors[0].iter().map(|value| value * value).sum::<f32>() - 1.0).abs() < 1e-5);
+
+        let error = model
+            .forward_rerank(&mut provider, &[1], &[1], 1, 1)
+            .expect_err("embed-only checkpoint must refuse reranking");
+        assert!(error
+            .to_string()
+            .contains("no sequence-classification head"));
+    }
+
+    #[test]
+    fn classifier_tensors_load_head_and_enforce_config() {
+        let fixture = ModelFixture::new(HeadFixture::Complete, "gelu");
+        let model = ModernBertModel::load(fixture.path(), Precision::F32)
+            .expect("reranker checkpoint should load its classifier head");
+        assert!(model.classification_head.is_some());
+
+        let invalid = ModelFixture::new(HeadFixture::Complete, "relu");
+        let error = ModernBertModel::load(invalid.path(), Precision::F32)
+            .err()
+            .expect("classifier config mismatch must fail loading");
+        assert!(error.to_string().contains("classifier activation relu"));
+    }
+
+    #[test]
+    fn partial_classifier_tensors_fail_loading() {
+        let fixture = ModelFixture::new(HeadFixture::MissingClassifierWeight, "gelu");
+        let error = ModernBertModel::load(fixture.path(), Precision::F32)
+            .err()
+            .expect("partial reranker head must fail loading");
+        assert!(error
+            .to_string()
+            .contains("missing tensor; tried classifier.weight"));
+    }
 }
