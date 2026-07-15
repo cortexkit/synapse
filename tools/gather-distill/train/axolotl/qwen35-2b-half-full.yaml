@@ -1,0 +1,53 @@
+base_model: Qwen/Qwen3.5-2B
+model_revision: 15852e8c16360a2fea060d615a32b45270f8a8fc
+# Force the nested causal-LM config so Axolotl never selects the image-text auto class.
+model_type: Qwen3_5ForCausalLM
+cls_model_config: Qwen3_5TextConfig
+tokenizer_type: AutoTokenizer
+trust_remote_code: false
+
+# Full renders match the tokenizer template; this patch only permits Axolotl's system-only prefix probe.
+chat_template: jinja
+chat_template_jinja: train/axolotl/templates/qwen35-aft.jinja
+datasets:
+  - path: train/sft-dataset-curated-half.jsonl
+    type: chat_template
+    field_messages: messages
+    field_tools: tools
+    roles_to_train:
+      - assistant
+    train_on_eos: turn
+
+dataset_prepared_path: train/prepared/qwen35-2b-half-full
+output_dir: train/outputs/qwen35-2b-half-full
+val_set_size: 0.02
+
+sequence_len: 32768
+sample_packing: true
+eval_sample_packing: false
+
+micro_batch_size: 1
+gradient_accumulation_steps: 8
+num_epochs: 3
+learning_rate: 0.00002
+lr_scheduler: cosine
+warmup_ratio: 0.03
+weight_decay: 0.1
+optimizer: adamw_torch_fused
+
+bf16: true
+tf32: true
+attn_implementation: flash_attention_2
+# Avoid materializing a 32k x 248k full-vocabulary loss tensor at once.
+chunked_cross_entropy: true
+chunked_cross_entropy_num_chunks: 16
+gradient_checkpointing: true
+gradient_checkpointing_kwargs:
+  use_reentrant: false
+
+logging_steps: 1
+evals_per_epoch: 1
+save_steps: 10
+save_total_limit: 2
+save_safetensors: true
+seed: 8918
