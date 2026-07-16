@@ -610,6 +610,7 @@ export interface CalibrationGate {
   empty_mean_topup_calls: number | null;
   mismatch_none: number;
   mismatch_rows: number;
+  gold_empty_ratio: number | null;
   reasons: string[];
 }
 
@@ -625,9 +626,13 @@ export function evaluateCalibrationGate(rows: JudgeVerdictRow[]): CalibrationGat
   const goldPhase1Invalid = gold.filter((row) => row.phase1_sufficiency === "not_answerable").length;
   const emptyPhase1None = empty.filter((row) => row.phase1_sufficiency === "not_answerable").length;
   const mismatchNone = mismatch.filter((row) => row.phase1_sufficiency === "not_answerable").length;
+  const goldEmptyRatio = goldMean !== null && emptyMean !== null && emptyMean > 0 ? goldMean / emptyMean : null;
   const reasons: string[] = [];
-  if (gold.length === 0 || goldMean === null || goldMean >= 2 || goldPhase1Invalid > 0) {
-    reasons.push("gold phase 1 must be answerable and average fewer than 2 top-up calls");
+  if (gold.length === 0 || goldMean === null || goldMean > 4 || goldPhase1Invalid > 0) {
+    reasons.push("gold phase 1 must be answerable and average at most 4 top-up calls");
+  }
+  if (goldEmptyRatio === null || goldEmptyRatio > 0.5) {
+    reasons.push("gold mean top-up must be at most half the empty mean");
   }
   if (empty.length === 0 || emptyPhase1None !== empty.length) reasons.push("empty packages must be not_answerable in phase 1");
   if (mismatch.length === 0 || mismatchNone < Math.ceil(mismatch.length * 0.6)) {
@@ -639,6 +644,7 @@ export function evaluateCalibrationGate(rows: JudgeVerdictRow[]): CalibrationGat
     empty_mean_topup_calls: emptyMean,
     mismatch_none: mismatchNone,
     mismatch_rows: mismatch.length,
+    gold_empty_ratio: goldEmptyRatio,
     reasons,
   };
 }
