@@ -1,0 +1,45 @@
+{
+  "recorded_at": "2026-07-15T23:15:26.071996+00:00",
+  "base_image": "pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel",
+  "base_image_digest": "sha256:14611869895df612b7b07227d5925f30ec3cd6673bad58ce3d84ed107950e014",
+  "axolotl_commit": "09d325b4fd1288b1473c8a330dd19e3c91b1ac32",
+  "llama_cpp_commit": "b4e3dc613baa92a3884d4151e3d631395c81934a",
+  "packages": {
+    "axolotl": "0.17.0.dev0",
+    "torch": "2.9.1+cu128",
+    "torchvision": "0.24.1+cu128",
+    "transformers": "5.9.0",
+    "accelerate": "1.13.0",
+    "trl": "1.5.1",
+    "peft": "0.19.1",
+    "flash-attn": "2.8.3",
+    "flash-linear-attention": "0.4.1",
+    "fla-core": "0.4.1",
+    "causal-conv1d": "1.6.2.post1",
+    "xformers": "0.0.33.post2"
+  },
+  "torch_cuda": "12.8",
+  "nvidia_smi": "NVIDIA H100 80GB HBM3, 560.35.03",
+  "system_nvcc": "Build cuda_12.4.r12.4/compiler.34097967_0",
+  "accelerate_full_output_upcast_disabled": true,
+  "vast_contract": 45028752,
+  "vast_rate_per_hour": 1.9811111111111113,
+  "country": "India",
+  "model": "Qwen/Qwen3.5-4B",
+  "model_revision": "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
+  "model_weight_files": [
+    {
+      "file": "model.safetensors-00001-of-00002.safetensors",
+      "bytes": 5329398688,
+      "sha256": "26a93f066e1916adb13453dae5a0c707c0fbc71299ed98779571a907b8e74c61"
+    },
+    {
+      "file": "model.safetensors-00002-of-00002.safetensors",
+      "bytes": 3990429408,
+      "sha256": "cb544bd9bfae93dc59b0f22b292f5933573854a7f9b97835c67060d7d910e188"
+    }
+  ],
+  "config_sha256": "d387e65b4c2d9f76b3b154219d478bade54f2929960b0cf2d3e07b859f91275a",
+  "template_sha256": "fef15c2f760736e14982abe133807eae881eaf6c585becaedc190663642e40e8",
+  "dataset_sha256": "005f0cad5fa3da8a21b448fce6e68a3787a516c090f938616556cbae56094859"
+}

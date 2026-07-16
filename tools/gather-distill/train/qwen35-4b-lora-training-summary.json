@@ -1,0 +1,79 @@
+{
+  "configured_epochs": 3,
+  "reported_final_epoch": 2.986666666666667,
+  "steps": 336,
+  "trainable_parameters": 42467328,
+  "total_parameters": 4248218624,
+  "loss_first": 0.7343236207962036,
+  "loss_last": 0.46112126111984253,
+  "loss_first_10_mean": 0.7133874595165253,
+  "loss_last_10_mean": 0.48006907403469085,
+  "loss_min": 0.42459040880203247,
+  "loss_max": 1.042186975479126,
+  "per_epoch": [
+    {
+      "epoch": 1,
+      "steps": 112,
+      "loss_mean": 0.5610459127596447,
+      "loss_first": 0.7343236207962036,
+      "loss_last": 0.5140602588653564
+    },
+    {
+      "epoch": 2,
+      "steps": 112,
+      "loss_mean": 0.49911318932260784,
+      "loss_first": 1.042186975479126,
+      "loss_last": 0.4852304458618164
+    },
+    {
+      "epoch": 3,
+      "steps": 112,
+      "loss_mean": 0.4787077254482678,
+      "loss_first": 0.5482769012451172,
+      "loss_last": 0.46112126111984253
+    }
+  ],
+  "evaluation": [
+    {
+      "eval_loss": 0.736373782157898,
+      "eval_ppl": 2.08835,
+      "epoch": 0,
+      "step": 0
+    },
+    {
+      "eval_loss": 0.49979856610298157,
+      "eval_ppl": 1.64839,
+      "epoch": 0.9955555555555555,
+      "step": 112
+    },
+    {
+      "eval_loss": 0.4856744110584259,
+      "eval_ppl": 1.62527,
+      "epoch": 1.9955555555555555,
+      "step": 224
+    },
+    {
+      "eval_loss": 0.48406481742858887,
+      "eval_ppl": 1.62266,
+      "epoch": 2.986666666666667,
+      "step": 336
+    }
+  ],
+  "trainer_runtime_seconds": 8936.0,
+  "input_tokens": 88014848,
+  "supervised_tokens": 8821337,
+  "aggregate_input_tokens_per_second": 9849.468218442256,
+  "aggregate_supervised_tokens_per_second": 987.1684198746643,
+  "pytorch_peak_allocated_gib": 44.31,
+  "retained_checkpoints": [
+    "checkpoint-330",
+    "checkpoint-336"
+  ],
+  "nan_or_inf": false,
+  "adapter_bytes": 169903320,
+  "adapter_sha256": "088e5c7640d46401621147bb0ba90eade776d63f6ce88f675bd2bdf2a5a8613d",
+  "merged_model_bytes": 8411558400,
+  "merged_model_sha256": "5f20d3315b8f4887101a7f53709054b05f8c95bc7e0dc07ea3e1635d65a2fcd7",
+  "gguf_q8_0_bytes": 4482402624,
+  "gguf_q8_0_sha256": "b4bd287f23c797576e6662e35a298c07d8e7b94963f6ac5763ed9d3be81eaac3"
+}
