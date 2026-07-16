@@ -197,7 +197,7 @@ The scorer re-runs `validateBankedRow` for every latest candidate row, then pair
 
 `./scripts/eval-student.sh CHECKPOINT_OR_GGUF MODEL_LABEL` turns a fine-tuned checkpoint into one comparable ladder row. An HF safetensors directory is converted through the text-only `convert_hf_to_gguf.py` path, quantized to Q8_0, served with `-ngl 99 --jinja -fa on`, gathered over all 40 fixed jobs, and mechanically scored against Opus gold. The script is pinned to llama.cpp build `9580` / revision `b4e3dc613`; keep that revision or an equivalent current build because Qwen3.5 and Gemma 4 text conversion support is required.
 
-For a standalone GGUF, provide its adjacent `config.json` or set `EVAL_CONFIG_JSON`; the script clamps the normal `131072` context request to the trained maximum in that config. A file named like `*Q8_0.gguf` is used directly; use an F16/BF16 GGUF for fresh quantization. Results are written under ignored `data/students/` as `<label>-scores.json`, resumable rows/ledger/status files, and `LADDER.md`. The ladder uses the same columns as the zero-shot bake-off, including natural-only F1/Jaccard and whole-run validity, API, tool, budget, context, and timing measurements.
+For a standalone GGUF, provide its adjacent `config.json` or set `EVAL_CONFIG_JSON`; the script clamps the normal `131072` context request to the trained maximum in that config. A file named like `*Q8_0.gguf` is used directly; use an F16/BF16 GGUF for fresh quantization. Results are written under ignored `data/students/` as `<label>-scores.json`, resumable rows/ledger/status files, and `LADDER.md`. Set `EVAL_PUBLISH_DIR` to copy the completed rows and score report to a durable artifact directory after scoring. The ladder uses the same columns as the zero-shot bake-off, including natural-only F1/Jaccard and whole-run validity, API, tool, budget, context, and timing measurements.
 
 ```sh
 cd tools/gather-distill
@@ -216,7 +216,7 @@ EVAL_REMOTE_ENDPOINT=root@gpu.example EVAL_REMOTE_SSH_PORT=22 \
   ./scripts/eval-student.sh remote-serving-checkpoint student-sft-v1
 ```
 
-`EVAL_REMOTE_ENDPOINT` makes the script open `ssh -L` to the remote `llama-server`; it does not inspect or copy the positional checkpoint path in tunnel mode. The harness machine must have the ignored eval data, `~/Work/OSS/gather-corpus-eval` clones, and `GATHER_DISTILL_AFT_BINARY` (normally `bin/aft-dev-7cabfdd0`). A remote all-in-one run needs those same assets staged on the GPU host.
+`EVAL_REMOTE_ENDPOINT` makes the script open `ssh -L` to the remote `llama-server`; it does not inspect or copy the positional checkpoint path in tunnel mode. `EVAL_SERVER_MODE=external` instead uses a pre-running OpenAI-compatible endpoint at `EVAL_BASE_URL`, which is useful for a loopback authentication proxy. The harness machine must have the ignored eval data, `~/Work/OSS/gather-corpus-eval` clones, and `GATHER_DISTILL_AFT_BINARY` (normally `bin/aft-dev-7cabfdd0`). A remote all-in-one run needs those same assets staged on the GPU host.
 
 ### TRACE reward bridge
 

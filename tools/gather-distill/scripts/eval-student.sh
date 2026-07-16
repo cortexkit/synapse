@@ -26,11 +26,13 @@
 # Common overrides:
 #   EVAL_DATA_DIR               directory containing eval-jobs.jsonl and gold
 #   EVAL_OUTPUT_DIR             default: $EVAL_DATA_DIR/students
+#   EVAL_PUBLISH_DIR            optional directory for completed rows and scores copies
 #   EVAL_CONFIG_JSON            required beside a standalone GGUF to clamp ctx
 #   EVAL_CONTEXT_SIZE           request a smaller serving context deliberately
 #   EVAL_CHAT_TEMPLATE_KWARGS   JSON passed to llama-server --chat-template-kwargs
 #   EVAL_RESET=1                discard this label's resumable run artifacts
 #   EVAL_REMOTE_ENDPOINT        ssh destination for a pre-running remote server
+#   EVAL_SERVER_MODE             local, tunnel, or external (requires EVAL_BASE_URL)
 #   GATHER_DISTILL_AFT_BINARY   pinned AFT executable used by the harness
 #   LLAMA_CPP_DIR               source/build root for converter and binaries
 
@@ -58,6 +60,7 @@ EVAL_DATA_DIR="${EVAL_DATA_DIR:-$ROOT/data}"
 EVAL_JOBS="${EVAL_JOBS:-$EVAL_DATA_DIR/eval-jobs.jsonl}"
 EVAL_GOLD="${EVAL_GOLD:-$EVAL_DATA_DIR/eval-gold-rows.jsonl}"
 EVAL_OUTPUT_DIR="${EVAL_OUTPUT_DIR:-$EVAL_DATA_DIR/students}"
+EVAL_PUBLISH_DIR="${EVAL_PUBLISH_DIR:-}"
 EVAL_CORPUS_ROOT="${EVAL_CORPUS_ROOT:-~/Work/OSS/gather-corpus-eval}"
 EVAL_TARGET_CONTEXT="${EVAL_TARGET_CONTEXT:-131072}"
 EVAL_REQUEST_TIMEOUT="${EVAL_REQUEST_TIMEOUT:-600}"
@@ -253,8 +256,14 @@ case "$SERVER_MODE" in
     SERVED_CONTEXT="${EVAL_CONTEXT_SIZE:-remote-unknown}"
     wait_for_server "$BASE_URL"
     ;;
+  external)
+    [[ -n "${EVAL_BASE_URL:-}" ]] || die "external mode requires EVAL_BASE_URL"
+    BASE_URL="${EVAL_BASE_URL%/}"
+    SERVED_CONTEXT="${EVAL_CONTEXT_SIZE:-external-unknown}"
+    wait_for_server "$BASE_URL"
+    ;;
   *)
-    die "EVAL_SERVER_MODE must be local or tunnel"
+    die "EVAL_SERVER_MODE must be local, tunnel, or external"
     ;;
 esac
 
@@ -278,6 +287,18 @@ bun run src/cli.ts score \
   --gold "$EVAL_GOLD" \
   --output "$SCORES" \
   --corpus-root "$EVAL_CORPUS_ROOT"
+
+if [[ -n "$EVAL_PUBLISH_DIR" ]]; then
+  mkdir -p "$EVAL_PUBLISH_DIR"
+  for artifact in "$ROWS" "$SCORES"; do
+    published="$EVAL_PUBLISH_DIR/$(basename "$artifact")"
+    if [[ -e "$published" && "$artifact" -ef "$published" ]]; then
+      continue
+    fi
+    cp "$artifact" "$published"
+  done
+  echo "eval-student: published rows and scores to $EVAL_PUBLISH_DIR"
+fi
 
 python3 - "$SCORES" "$LEDGER" "$LADDER" "$LABEL" "$SERVED_CONTEXT" <<'PY'
 import json

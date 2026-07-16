@@ -583,7 +583,7 @@ export interface JudgeSummary {
 }
 
 export function summarizeJudgeRows(rows: JudgeVerdictRow[]): JudgeSummary {
-  const validRows = rows.filter((row) => row.status !== "error" && row.sufficiency !== null);
+  const validRows = rows.filter((row) => row.status === "completed" && row.sufficiency !== null);
   const calls = validRows.map((row) => row.topup_tool_calls);
   const tokens = validRows.map((row) => row.topup_tokens);
   const scores = validRows.flatMap((row) => (row.package_score === null ? [] : [row.package_score]));
