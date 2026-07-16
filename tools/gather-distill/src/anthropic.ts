@@ -22,6 +22,7 @@ export interface MessageRequest {
   messages: TrajectoryMessage[];
   tools?: ToolDeclaration[];
   tool_choice?: { type: "none" };
+  temperature?: number;
   effort?: "low" | "medium" | "high";
 }
 

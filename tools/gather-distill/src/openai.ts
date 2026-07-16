@@ -36,6 +36,10 @@ export interface OpenAiRequestOptions {
   baseUrl?: string;
   requestTimeoutMs?: number;
   transientRetries?: number;
+  /** Optional API-key authentication for hosted OpenAI-compatible endpoints. */
+  apiKey?: string;
+  /** Header name used for apiKey; authorization uses the Bearer scheme. */
+  apiKeyHeader?: string;
 }
 
 export class OpenAiRequestTimeoutError extends Error {
@@ -242,13 +246,13 @@ function isTransientOpenAiError(error: unknown): boolean {
   return error instanceof TypeError || (error instanceof Error && error.name === "AbortError");
 }
 
-async function fetchWithTimeout(url: string, body: string, timeoutMs: number): Promise<Response> {
+async function fetchWithTimeout(url: string, body: string, timeoutMs: number, headers: Headers): Promise<Response> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
     return await fetch(url, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers,
       body,
       signal: controller.signal,
     });
@@ -261,8 +265,8 @@ async function fetchWithTimeout(url: string, body: string, timeoutMs: number): P
 }
 
 /**
- * Send one local OpenAI-compatible chat completion. This lane intentionally
- * sends no credentials, prompt-cache controls, or Claude Code metadata.
+ * Send one OpenAI-compatible chat completion. Credentials are optional so the
+ * same transport serves local servers and explicitly configured hosted lanes.
  */
 export async function sendOpenAiMessage(request: MessageRequest, options: OpenAiRequestOptions = {}): Promise<MessageResponse> {
   const timeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
@@ -275,6 +279,7 @@ export async function sendOpenAiMessage(request: MessageRequest, options: OpenAi
     max_tokens: request.max_tokens,
     messages: toOpenAiMessages(request.system, request.messages),
   };
+  if (request.temperature !== undefined) body.temperature = request.temperature;
   if (request.tools !== undefined) body.tools = toOpenAiTools(request.tools);
   if (request.tool_choice) body.tool_choice = "none";
   const bodyText = JSON.stringify(body);
@@ -282,7 +287,12 @@ export async function sendOpenAiMessage(request: MessageRequest, options: OpenAi
 
   for (let attempt = 0; ; attempt += 1) {
     try {
-      const response = await fetchWithTimeout(url, bodyText, timeoutMs);
+      const headers = new Headers({ "content-type": "application/json" });
+      if (options.apiKey) {
+        const header = options.apiKeyHeader?.trim().toLowerCase() || "authorization";
+        headers.set(header, header === "authorization" ? `Bearer ${options.apiKey}` : options.apiKey);
+      }
+      const response = await fetchWithTimeout(url, bodyText, timeoutMs, headers);
       if (!response.ok) throw new OpenAiHttpError(response.status, await response.text());
       return openAiResponseShape(await response.json());
     } catch (error) {
