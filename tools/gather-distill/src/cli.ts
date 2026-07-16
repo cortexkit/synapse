@@ -29,6 +29,7 @@ import {
   type JudgeVerdictRow,
 } from "./judge.ts";
 import { AftClientPool, AftWarmupCoordinator, AFT_WARMUP_TIMEOUT_MS } from "./tools.ts";
+import { OPENAI_CODEX_RESPONSES_URL } from "./openai-oauth.ts";
 import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -525,7 +526,7 @@ function judgeErrorRow(
     score_rationale: "",
     judge_model: settings.model ?? JUDGE_MODEL_DEFAULT,
     judge_prompt_sha: prompt.sha,
-    judge_temperature: settings.temperature ?? JUDGE_TEMPERATURE,
+    judge_temperature: settings.oauth ? null : settings.temperature ?? JUDGE_TEMPERATURE,
     judge_topup_budget: settings.topupBudget ?? JUDGE_TOPUP_BUDGET,
     error: error instanceof Error ? error.message : String(error),
   };
@@ -579,7 +580,7 @@ async function runJudgeTasks(tasks: JudgeTask[], settings: JudgeRequestOptions, 
           topup_trace: evaluation.topup_calls,
           judge_model: settings.model ?? JUDGE_MODEL_DEFAULT,
           judge_prompt_sha: (settings.prompt ?? judgePromptForIteration(1)).sha,
-          judge_temperature: settings.temperature ?? JUDGE_TEMPERATURE,
+          judge_temperature: settings.oauth ? null : settings.temperature ?? JUDGE_TEMPERATURE,
           judge_topup_budget: settings.topupBudget ?? JUDGE_TOPUP_BUDGET,
           judge_input_tokens: evaluation.judge_input_tokens,
           judge_output_tokens: evaluation.judge_output_tokens,
@@ -761,10 +762,24 @@ async function judgeCommand(args: ParsedArgs): Promise<void> {
   const jobsPath = required(args, "jobs");
   const goldPath = required(args, "gold");
   const outputDir = one(args, "output-dir", "data/students/judge")!;
-  const baseUrl = one(args, "base-url", process.env.JUDGE_BASE_URL ?? process.env.GATHER_DISTILL_JUDGE_BASE_URL);
-  if (!baseUrl) throw new Error("--base-url (or JUDGE_BASE_URL) is required for the GPT judge");
-  const apiKey = one(args, "api-key", process.env.JUDGE_API_KEY ?? process.env.GATHER_DISTILL_JUDGE_API_KEY ?? process.env.OPENAI_API_KEY);
-  if (!apiKey) throw new Error("--api-key (or JUDGE_API_KEY) is required for the GPT judge");
+  const oauthMode = one(args, "oauth", process.env.JUDGE_OAUTH);
+  if (oauthMode !== undefined && oauthMode !== "opencode") {
+    throw new Error("--oauth (or JUDGE_OAUTH) must be opencode when enabled");
+  }
+  const oauth = oauthMode === "opencode"
+    ? {
+        authFile: one(args, "oauth-auth-file", process.env.JUDGE_OAUTH_AUTH_FILE),
+        sessionId: one(args, "session-id", process.env.JUDGE_SESSION_ID),
+      }
+    : undefined;
+  const baseUrl = oauth
+    ? undefined
+    : one(args, "base-url", process.env.JUDGE_BASE_URL ?? process.env.GATHER_DISTILL_JUDGE_BASE_URL);
+  if (!oauth && !baseUrl) throw new Error("--base-url (or JUDGE_BASE_URL) is required unless --oauth opencode is enabled");
+  const apiKey = oauth
+    ? undefined
+    : one(args, "api-key", process.env.JUDGE_API_KEY ?? process.env.GATHER_DISTILL_JUDGE_API_KEY ?? process.env.OPENAI_API_KEY);
+  if (!oauth && !apiKey) throw new Error("--api-key (or JUDGE_API_KEY) is required unless --oauth opencode is enabled");
   const jobs = await readJsonl<GatherJob>(jobsPath);
   const goldRows = await readJsonl<BankedRow>(goldPath);
   if (jobs.length === 0) throw new Error("judge found no jobs");
@@ -787,8 +802,9 @@ async function judgeCommand(args: ParsedArgs): Promise<void> {
   const settings: JudgeRequestOptions = {
     baseUrl,
     apiKey,
+    oauth,
     apiKeyHeader: one(args, "api-key-header", process.env.JUDGE_KEY_HEADER ?? "authorization"),
-    model: one(args, "judge-model", process.env.JUDGE_MODEL ?? JUDGE_MODEL_DEFAULT),
+    model: one(args, "judge-model", process.env.JUDGE_MODEL ?? (oauth ? "gpt-5.6-luna" : JUDGE_MODEL_DEFAULT)),
     temperature: Number(one(args, "temperature", String(JUDGE_TEMPERATURE))),
     topupBudget: JUDGE_TOPUP_BUDGET,
     maxResponseTokens: numberFlag(args, "max-response-tokens", 4_000),
@@ -870,7 +886,10 @@ async function judgeCommand(args: ParsedArgs): Promise<void> {
       prompt_sha: prompt.sha,
       prompt_change: prompt.change,
       model: settings.model,
-      temperature: settings.temperature,
+      transport: oauth ? "opencode-oauth-responses" : "openai-compatible-chat-completions",
+      endpoint: oauth ? OPENAI_CODEX_RESPONSES_URL : baseUrl,
+      temperature_requested: settings.temperature,
+      temperature_pinned: oauth ? null : settings.temperature,
       topup_budget: settings.topupBudget,
       gate,
       cost,
@@ -925,14 +944,16 @@ Subcommands:
   score    --candidate data/model-rows.jsonl --gold data/eval-gold.jsonl --output data/model-scores.json
             [--corpus-root DIR]
    score-one --job JOB_ID --candidate-file candidate.json --gold data/eval-gold-rows.jsonl
-   judge --phase calibration|full --jobs data/eval-jobs.jsonl --gold data/eval-gold-rows.jsonl
-         --base-url URL --api-key KEY [--candidate LABEL=rows.jsonl ...] [--score LABEL=scores.json]
-         [--output-dir data/students/judge --prompt-iteration 1|2|3]
+  judge --phase calibration|full --jobs data/eval-jobs.jsonl --gold data/eval-gold-rows.jsonl
+          --base-url URL --api-key KEY | --oauth opencode [--oauth-auth-file PATH]
+          [--candidate LABEL=rows.jsonl ...] [--score LABEL=scores.json]
+          [--output-dir data/students/judge --prompt-iteration 1|2|3]
 
-The judge uses a pinned GPT model through the explicitly supplied OpenAI-compatible endpoint.
-Calibration runs gold, empty, and mismatched controls on the first five jobs; full runs gold controls plus candidates.
-Judge API keys are never written to verdict rows. Anthropic qgen and gather use GATHER_DISTILL_API_KEY or GATHER_DISTILL_ACCOUNTS_FILE/--accounts-file.
-OpenAI-compatible gather is local-only and never reads account credentials or OAuth settings.`);
+  The judge uses a pinned GPT model through either an explicitly supplied OpenAI-compatible endpoint or
+  OpenCode's read-only OAuth access token at ${OPENAI_CODEX_RESPONSES_URL}. OAuth never refreshes auth.json.
+  Calibration runs gold, empty, and mismatched controls on the first five jobs; full runs gold controls plus candidates.
+  Judge credentials are never written to verdict rows. Anthropic qgen and gather use GATHER_DISTILL_API_KEY or GATHER_DISTILL_ACCOUNTS_FILE/--accounts-file.
+  OpenAI-compatible gather is local-only and never reads account credentials or OAuth settings.`);
 }
 
 async function main(): Promise<void> {

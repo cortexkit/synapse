@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { assistantText, type MessageResponse } from "./anthropic.ts";
+import { sendOpenAiOAuthMessage, type OpenAiOAuthRequestOptions } from "./openai-oauth.ts";
 import { sendOpenAiMessage } from "./openai.ts";
 import { readLineRange } from "./repo.ts";
 import { validateFinalJson } from "./schema.ts";
@@ -7,7 +8,7 @@ import { executeTool, GATHER_TOOLS, type AftClient } from "./tools.ts";
 import type { BankedRow, GatherFinalJson, GatherJob, AnthropicContentBlock, TrajectoryMessage } from "./types.ts";
 import { isRecord, parseJsonText, stableJobId } from "./utils.ts";
 
-export const JUDGE_MODEL_DEFAULT = "gpt-5.6";
+export const JUDGE_MODEL_DEFAULT = "gpt-5.6-luna";
 export const JUDGE_TEMPERATURE = 0;
 export const JUDGE_TOPUP_BUDGET = 15;
 
@@ -120,9 +121,10 @@ export interface JudgeEvaluation {
 }
 
 export interface JudgeRequestOptions {
-  baseUrl: string;
-  apiKey: string;
+  baseUrl?: string;
+  apiKey?: string;
   apiKeyHeader?: string;
+  oauth?: OpenAiOAuthRequestOptions;
   model?: string;
   temperature?: number;
   topupBudget?: number;
@@ -160,7 +162,7 @@ export interface JudgeVerdictRow {
   topup_trace: JudgeToolCallRecord[];
   judge_model: string;
   judge_prompt_sha: string;
-  judge_temperature: number;
+  judge_temperature: number | null;
   judge_topup_budget: number;
   judge_input_tokens: number;
   judge_output_tokens: number;
@@ -383,7 +385,7 @@ function skippedEvaluation(
   label: string,
   kind: JudgePackageKind,
   row: BankedRow,
-  options: Required<Pick<JudgeRequestOptions, "model" | "temperature" | "topupBudget">> & { prompt: JudgePrompt },
+  options: Required<Pick<JudgeRequestOptions, "model" | "topupBudget">> & { temperature: number | null; prompt: JudgePrompt },
   reason: string,
 ): JudgeVerdictRow {
   return {
@@ -421,8 +423,8 @@ export async function runJudgeEvaluation(
   options: JudgeRequestOptions,
   aftClient?: AftClient,
 ): Promise<JudgeEvaluation> {
-  if (!options.baseUrl.trim()) throw new Error("judge base URL is required");
-  if (!options.apiKey.trim()) throw new Error("judge API key is required");
+  if (!options.oauth && !options.baseUrl?.trim()) throw new Error("judge base URL is required unless OpenAI OAuth is enabled");
+  if (!options.oauth && !options.apiKey?.trim()) throw new Error("judge API key is required unless OpenAI OAuth is enabled");
   const model = options.model ?? JUDGE_MODEL_DEFAULT;
   const temperature = options.temperature ?? JUDGE_TEMPERATURE;
   const topupBudget = options.topupBudget ?? JUDGE_TOPUP_BUDGET;
@@ -438,23 +440,23 @@ export async function runJudgeEvaluation(
   const topupCalls: JudgeToolCallRecord[] = [];
 
   const callModel = async (withTools: boolean, finalize: boolean): Promise<MessageResponse> => {
-    const response = await sendOpenAiMessage(
-      {
-        model,
-        max_tokens: maxResponseTokens,
-        system: prompt.text,
-        messages: trajectory,
-        ...(withTools ? { tools: GATHER_TOOLS } : {}),
-        ...(finalize ? { tool_choice: { type: "none" } as const } : {}),
-        temperature,
-      },
-      {
-        baseUrl: options.baseUrl,
-        apiKey: options.apiKey,
-        apiKeyHeader: options.apiKeyHeader,
-        requestTimeoutMs: options.requestTimeoutMs,
-      },
-    );
+    const request = {
+      model,
+      max_tokens: maxResponseTokens,
+      system: prompt.text,
+      messages: trajectory,
+      ...(withTools ? { tools: GATHER_TOOLS } : {}),
+      ...(finalize ? { tool_choice: { type: "none" } as const } : {}),
+      temperature,
+    };
+    const response = options.oauth
+      ? await sendOpenAiOAuthMessage(request, { ...options.oauth, requestTimeoutMs: options.requestTimeoutMs })
+      : await sendOpenAiMessage(request, {
+          baseUrl: options.baseUrl,
+          apiKey: options.apiKey,
+          apiKeyHeader: options.apiKeyHeader,
+          requestTimeoutMs: options.requestTimeoutMs,
+        });
     inputTokens += response.usage.input_tokens;
     outputTokens += response.usage.output_tokens;
     return response;
@@ -497,9 +499,9 @@ export async function runJudgeEvaluation(
     const forceFinal = topupCalls.length >= topupBudget;
     const response = await callModel(true, forceFinal);
     topupTokens += tokenTotal(response);
-    trajectory.push({ role: "assistant", content: response.content });
     const calls = toolUses(response.content);
     if (calls.length === 0) {
+      trajectory.push({ role: "assistant", content: response.content });
       verdict = parseJudgeVerdict(assistantText(response.content));
       break;
     }
@@ -509,6 +511,13 @@ export async function runJudgeEvaluation(
 
     const remaining = topupBudget - topupCalls.length;
     const allowedCalls = calls.slice(0, remaining);
+    const allowedIds = new Set(allowedCalls.map((call) => call.id));
+    // Responses requires one function_call_output for every function_call in the prior input item.
+    // If the model asks for more calls than remain in the budget, omit the unexecuted calls before continuing.
+    trajectory.push({
+      role: "assistant",
+      content: response.content.filter((block) => block.type !== "tool_use" || allowedIds.has(block.id)),
+    });
     const results: AnthropicContentBlock[] = [];
     for (const call of allowedCalls) {
       let result: { ok: boolean; output: string };
@@ -601,6 +610,7 @@ export interface CalibrationGate {
   empty_mean_topup_calls: number | null;
   mismatch_none: number;
   mismatch_rows: number;
+  gold_empty_ratio: number | null;
   reasons: string[];
 }
 
@@ -611,17 +621,30 @@ export function evaluateCalibrationGate(rows: JudgeVerdictRow[]): CalibrationGat
   const mismatch = control("mismatched");
   const goldMean = mean(gold.map((row) => row.topup_tool_calls));
   const emptyMean = mean(empty.map((row) => row.topup_tool_calls));
-  const mismatchNone = mismatch.filter((row) => row.sufficiency === "none").length;
+  // Package utility is determined before repository top-ups. Final sufficiency remains
+  // the candidate headline metric, but it must not grant credit to a mismatched control.
+  const goldPhase1Invalid = gold.filter((row) => row.phase1_sufficiency === "not_answerable").length;
+  const emptyPhase1None = empty.filter((row) => row.phase1_sufficiency === "not_answerable").length;
+  const mismatchNone = mismatch.filter((row) => row.phase1_sufficiency === "not_answerable").length;
+  const goldEmptyRatio = goldMean !== null && emptyMean !== null && emptyMean > 0 ? goldMean / emptyMean : null;
   const reasons: string[] = [];
-  if (gold.length === 0 || goldMean === null || goldMean >= 2) reasons.push("gold mean top-up must be below 2 calls");
-  if (empty.length === 0 || emptyMean === null || emptyMean <= 8) reasons.push("empty mean top-up must be above 8 calls");
-  if (mismatch.length === 0 || mismatchNone < Math.ceil(mismatch.length * 0.6)) reasons.push("mismatched packages must be flagged as none on at least 60% of jobs");
+  if (gold.length === 0 || goldMean === null || goldMean > 4 || goldPhase1Invalid > 0) {
+    reasons.push("gold phase 1 must be answerable and average at most 4 top-up calls");
+  }
+  if (goldEmptyRatio === null || goldEmptyRatio > 0.5) {
+    reasons.push("gold mean top-up must be at most half the empty mean");
+  }
+  if (empty.length === 0 || emptyPhase1None !== empty.length) reasons.push("empty packages must be not_answerable in phase 1");
+  if (mismatch.length === 0 || mismatchNone < Math.ceil(mismatch.length * 0.6)) {
+    reasons.push("mismatched packages must be not_answerable in phase 1 on at least 60% of jobs");
+  }
   return {
     pass: reasons.length === 0,
     gold_mean_topup_calls: goldMean,
     empty_mean_topup_calls: emptyMean,
     mismatch_none: mismatchNone,
     mismatch_rows: mismatch.length,
+    gold_empty_ratio: goldEmptyRatio,
     reasons,
   };
 }
@@ -679,7 +702,7 @@ export function skippedJudgeRow(
     row,
     {
       model: options.model ?? JUDGE_MODEL_DEFAULT,
-      temperature: options.temperature ?? JUDGE_TEMPERATURE,
+      temperature: options.oauth ? null : options.temperature ?? JUDGE_TEMPERATURE,
       topupBudget: options.topupBudget ?? JUDGE_TOPUP_BUDGET,
       prompt,
     },
