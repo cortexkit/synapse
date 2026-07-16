@@ -12,8 +12,21 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <time.h>
 
 static char modernbert_mps_error[1024];
+
+static BOOL modernbert_profile_enabled(void) {
+    const char *value = getenv("SYNAPSE_EMBED_PROFILE");
+    return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+}
+
+static double modernbert_profile_now(void) {
+    struct timespec time;
+    clock_gettime(CLOCK_MONOTONIC, &time);
+    return (double)time.tv_sec + (double)time.tv_nsec / 1e9;
+}
 
 typedef struct ModernBertLayerParams {
     const void *qkv_weight;
@@ -573,14 +586,24 @@ int32_t synapse_modernbert_mps_forward(
                 modernbert_set_error("ModernBERT forward received invalid dimensions");
                 return -2;
             }
+            const BOOL profile = modernbert_profile_enabled();
+            const double call_started = modernbert_profile_now();
+            const double plan_started = modernbert_profile_now();
             ModernBertPlan *plan = modernbert_get_plan(context, batch, seq, hidden, heads, intermediate, layer_count, epsilon, params, dtype, rerank);
             if (plan == NULL) {
                 return -3;
+            }
+            if (profile) {
+                fprintf(stderr, "[synapse-embed-profile] modernbert_plan batch=%llu seq=%llu plan_ms=%.3f\n",
+                        (unsigned long long)batch, (unsigned long long)seq,
+                        (modernbert_profile_now() - plan_started) * 1000.0);
             }
             NSUInteger rows = (NSUInteger)(batch * seq);
             NSUInteger hidden_count = rows * (NSUInteger)hidden;
             MPSDataType data_type = dtype == 1 ? MPSDataTypeFloat16 : MPSDataTypeFloat32;
             NSUInteger element_size = dtype == 1 ? sizeof(uint16_t) : sizeof(float);
+            const BOOL executable_cached = plan->executable != nil;
+            const double executable_started = modernbert_profile_now();
             if (explicit_execution && plan->executable == nil) {
                 plan->executable = synapse_mps_explicit_executable(
                     plan->graph, context->runtime.device, plan->output_tensor, package_path,
@@ -590,6 +613,12 @@ int32_t synapse_modernbert_mps_forward(
                     modernbert_set_error("failed to compile or load ModernBERT executable");
                     return -7;
                 }
+            }
+            if (profile) {
+                fprintf(stderr, "[synapse-embed-profile] modernbert_executable batch=%llu seq=%llu cached=%d select_ms=%.3f\n",
+                        (unsigned long long)batch, (unsigned long long)seq,
+                        executable_cached ? 1 : 0,
+                        (modernbert_profile_now() - executable_started) * 1000.0);
             }
             NSUInteger mask_count = (NSUInteger)(batch * seq * seq);
             NSUInteger rope_count = (NSUInteger)(seq * (hidden / heads));
@@ -646,6 +675,7 @@ int32_t synapse_modernbert_mps_forward(
                 status = -5;
             } else {
                 MPSGraphTensorData *result = nil;
+                const double execute_started = modernbert_profile_now();
                 if (plan->executable != nil) {
                     NSArray<MPSGraphTensorData *> *inputs = synapse_mps_executable_inputs(plan->executable_feed_tensors, feeds);
                     result = [[plan->executable runWithMTLCommandQueue:context->runtime.queue inputsArray:inputs resultsArray:nil executionDescriptor:nil] firstObject];
@@ -683,12 +713,24 @@ int32_t synapse_modernbert_mps_forward(
                         free(dump_bytes);
                     }
                 }
+                if (profile) {
+                    fprintf(stderr, "[synapse-embed-profile] modernbert_execute batch=%llu seq=%llu execute_ms=%.3f\n",
+                            (unsigned long long)batch, (unsigned long long)seq,
+                            (modernbert_profile_now() - execute_started) * 1000.0);
+                }
                 MPSNDArray *array = [result mpsndarray];
                 if (array == nil) {
                     modernbert_set_error("MPSGraph did not return ModernBERT output");
                     status = -6;
                 } else {
+                    const double readback_started = modernbert_profile_now();
                     [array readBytes:output strideBytes:NULL];
+                    if (profile) {
+                        fprintf(stderr, "[synapse-embed-profile] modernbert_readback batch=%llu seq=%llu readback_ms=%.3f total_ms=%.3f\n",
+                                (unsigned long long)batch, (unsigned long long)seq,
+                                (modernbert_profile_now() - readback_started) * 1000.0,
+                                (modernbert_profile_now() - call_started) * 1000.0);
+                    }
                 }
             }
             [feeds release];

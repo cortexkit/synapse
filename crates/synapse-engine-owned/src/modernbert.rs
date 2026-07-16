@@ -4,6 +4,7 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::time::Instant;
 
 use anyhow::{bail, ensure, Context, Result};
 use serde::Deserialize;
@@ -281,6 +282,8 @@ impl ModernBertModel {
         sequences: &[Vec<u32>],
         shape: Option<BatchShape>,
     ) -> Result<Vec<Vec<f32>>> {
+        let profile = crate::embed_profile_enabled();
+        let started = Instant::now();
         let real_batch = sequences.len();
         ensure!(real_batch > 0, "ModernBERT batch must not be empty");
         ensure!(
@@ -316,13 +319,31 @@ impl ModernBertModel {
             }
         }
 
+        let forward_started = Instant::now();
         let hidden = self.forward(provider, &input_ids, &attention_mask, batch, seq)?;
+        if profile {
+            eprintln!(
+                "[synapse-embed-profile] modernbert_forward batch={} seq={} forward_ms={:.3}",
+                batch,
+                seq,
+                forward_started.elapsed().as_secs_f64() * 1_000.0
+            );
+        }
         let mut vectors = Vec::with_capacity(real_batch);
         for row in 0..real_batch {
             let start = row * seq * self.config.hidden_size;
             let mut vector = hidden[start..start + self.config.hidden_size].to_vec();
             normalize_l2(&mut vector);
             vectors.push(vector);
+        }
+        if profile {
+            eprintln!(
+                "[synapse-embed-profile] modernbert_embed_ids items={} shape={}x{} total_ms={:.3}",
+                real_batch,
+                batch,
+                seq,
+                started.elapsed().as_secs_f64() * 1_000.0
+            );
         }
         Ok(vectors)
     }
