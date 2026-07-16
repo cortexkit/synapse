@@ -666,6 +666,51 @@ async fn embed_query_preloaded_minilm_returns_vectors_and_envelope() {
     assert_eq!(result["fingerprint"], second["result"]["fingerprint"]);
 }
 
+#[tokio::test]
+async fn probe_refuses_lane_without_matching_reference_fixture() {
+    let Some(preloads) = minilm_preload_config() else {
+        eprintln!("skipping missing-reference probe e2e: local HF ONNX snapshot is missing");
+        return;
+    };
+    let mut models: Value = serde_json::from_str(&preloads).expect("preload config is json");
+    models[0]["model_id"] = Value::String("unreferenced-embed-model".to_string());
+    let config = serde_json::json!({ "preload_models": models }).to_string();
+    let _lock = acquire_minilm_e2e_lock();
+    let (_daemon, _module, mut consumer, route) = open_route_with_config(&config).await;
+
+    let body = poll_probe_job(
+        &mut consumer,
+        route,
+        30,
+        serde_json::json!({ "models": ["unreferenced-embed-model"] }),
+    )
+    .await;
+    let lane = body["result"]["lanes"]
+        .as_array()
+        .and_then(|lanes| lanes.first())
+        .expect("probe returns the selected lane");
+    assert_eq!(lane["status"], "uncertified");
+    assert_eq!(lane["blocking_reason"], "reference_fixture_missing");
+    assert_eq!(
+        lane["evidence"]["blocking_reason"],
+        "reference_fixture_missing"
+    );
+    assert!(lane["evidence"].get("metrics").is_none());
+    assert!(lane["evidence"].get("mean_cosine").is_none());
+
+    let report = route_request(
+        &mut consumer,
+        route,
+        31,
+        serde_json::json!({ "method": "probe.report", "params": {} }),
+    )
+    .await;
+    assert_eq!(
+        report["result"]["lanes"][0]["blocking_reason"],
+        "reference_fixture_missing"
+    );
+}
+
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn embed_query_loaded_owned_metal_carries_distinct_provenance_and_content_hash() {
@@ -814,6 +859,100 @@ async fn embed_query_loaded_owned_metal_carries_distinct_provenance_and_content_
     .await;
     assert_eq!(rejected["result"]["error"]["code"], "substitution_rejected");
     let _ = std::fs::remove_dir_all(cache);
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn probe_owned_gte_modernbert_certifies_against_family_reference() {
+    let Some(snapshot) = gte_safetensors_snapshot() else {
+        eprintln!("skipping owned-metal GTE probe e2e: local HF snapshot is missing");
+        return;
+    };
+    for required in ["model.safetensors", "tokenizer.json", "config.json"] {
+        if !snapshot.join(required).exists() {
+            eprintln!(
+                "skipping owned-metal GTE probe e2e: {} is missing from {}",
+                required,
+                snapshot.display()
+            );
+            return;
+        }
+    }
+    let _lock = acquire_minilm_e2e_lock();
+    let (_daemon, _module, mut consumer, route) = open_route().await;
+    let accepted = route_request(
+        &mut consumer,
+        route,
+        80,
+        serde_json::json!({
+            "method": "model.load",
+            "params": {
+                "source": "file",
+                "path": snapshot,
+                "files": {
+                    "model": {
+                        "url": "model.safetensors",
+                        "sha256": test_sha256(snapshot.join("model.safetensors"))
+                    },
+                    "tokenizer": {
+                        "url": "tokenizer.json",
+                        "sha256": test_sha256(snapshot.join("tokenizer.json"))
+                    },
+                    "config": {
+                        "url": "config.json",
+                        "sha256": test_sha256(snapshot.join("config.json"))
+                    }
+                },
+                "engine": "owned-metal",
+                "family": "gte-modernbert",
+                "dtype": "f16",
+                "execution": "explicit",
+                "model_id": "gte-modernbert-base-f16",
+                "task": "embed",
+                "pooling": "mean",
+                "normalize": true,
+                "max_tokens": 512,
+                "pin": true,
+                "request_key": "owned-gte-probe-e2e"
+            }
+        }),
+    )
+    .await;
+    let job_id = accepted["result"]["job_id"]
+        .as_str()
+        .expect("owned GTE model.load returns job id");
+    let ready = poll_model_load_job(&mut consumer, route, 81, job_id).await;
+    assert_eq!(
+        ready["result"]["state"], "ready",
+        "GTE load failed: {ready:?}"
+    );
+
+    let body = run_probe_job(
+        &mut consumer,
+        route,
+        90,
+        serde_json::json!({ "models": ["gte-modernbert-base-f16"] }),
+    )
+    .await;
+    let lane = body["result"]["lanes"]
+        .as_array()
+        .and_then(|lanes| lanes.first())
+        .expect("GTE probe returns a lane");
+    assert_eq!(lane["status"], "certified", "GTE probe failed: {lane:?}");
+    eprintln!("owned GTE probe evidence: {}", lane["evidence"]);
+    assert_eq!(lane["evidence"]["items"], 64);
+    assert!(
+        lane["evidence"]["mean_cosine"]
+            .as_f64()
+            .expect("mean cosine is numeric")
+            >= 0.999
+    );
+    assert!(
+        lane["evidence"]["rank_overlap"]
+            .as_f64()
+            .expect("rank overlap is numeric")
+            >= 0.999
+    );
 }
 
 #[tokio::test]
@@ -1471,6 +1610,7 @@ async fn model_load_file_source_reaches_ready_and_lazy_reload_after_unload() {
                 "engine": "ort",
                 "pooling": "mean",
                 "task": "embed",
+                "model_id": "minilm-loaded",
                 "pin": true,
                 "request_key": "model-load-file-e2e"
             }
@@ -1690,7 +1830,7 @@ async fn certify_preloaded_models(
     run_probe_job(consumer, route, start_corr, serde_json::json!({})).await
 }
 
-async fn run_probe_job(
+async fn poll_probe_job(
     consumer: &mut tokio::net::TcpStream,
     route: TestRoute,
     start_corr: u64,
@@ -1721,14 +1861,7 @@ async fn run_probe_job(
         )
         .await;
         match body["result"]["state"].as_str() {
-            Some("done") => {
-                let lanes = body["result"]["lanes"].as_array().expect("probe lanes");
-                assert!(!lanes.is_empty(), "probe should certify at least one lane");
-                for lane in lanes {
-                    assert_eq!(lane["status"], "certified", "probe lane failed: {lane:?}");
-                }
-                return body;
-            }
+            Some("done") => return body,
             Some("failed_transient" | "failed_permanent") => panic!("probe failed: {body:?}"),
             Some("queued" | "running") => {
                 assert!(
@@ -1741,6 +1874,21 @@ async fn run_probe_job(
             other => panic!("unexpected probe.status state {other:?}: {body:?}"),
         }
     }
+}
+
+async fn run_probe_job(
+    consumer: &mut tokio::net::TcpStream,
+    route: TestRoute,
+    start_corr: u64,
+    params: Value,
+) -> Value {
+    let body = poll_probe_job(consumer, route, start_corr, params).await;
+    let lanes = body["result"]["lanes"].as_array().expect("probe lanes");
+    assert!(!lanes.is_empty(), "probe should certify at least one lane");
+    for lane in lanes {
+        assert_eq!(lane["status"], "certified", "probe lane failed: {lane:?}");
+    }
+    body
 }
 
 async fn poll_model_load_job(
@@ -2019,6 +2167,16 @@ fn minilm_safetensors_snapshot() -> Option<PathBuf> {
     }
     let snapshots = PathBuf::from(std::env::var("HOME").ok()?)
         .join(".cache/huggingface/hub/models--sentence-transformers--all-MiniLM-L6-v2/snapshots");
+    first_snapshot_with(&snapshots, "model.safetensors")
+}
+
+#[cfg(target_os = "macos")]
+fn gte_safetensors_snapshot() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("SYNAPSE_GTE_MODERNBERT_SAFETENSORS_SNAPSHOT") {
+        return Some(PathBuf::from(path));
+    }
+    let snapshots = PathBuf::from(std::env::var("HOME").ok()?)
+        .join(".cache/huggingface/hub/models--Alibaba-NLP--gte-modernbert-base/snapshots");
     first_snapshot_with(&snapshots, "model.safetensors")
 }
 
