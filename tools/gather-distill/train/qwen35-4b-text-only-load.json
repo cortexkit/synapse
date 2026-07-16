@@ -1,0 +1,39 @@
+{
+  "source": "Qwen/Qwen3.5-4B",
+  "revision": "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
+  "auto_class": "Qwen3_5ForCausalLM",
+  "loaded_class": "Qwen3_5ForCausalLM",
+  "composite_config_class": "Qwen3_5Config",
+  "text_config_class": "Qwen3_5TextConfig",
+  "declared_architectures": [
+    "Qwen3_5ForConditionalGeneration"
+  ],
+  "parameter_count": 4205751296,
+  "trainable_parameter_count": 4205751296,
+  "parameter_tensor_count": 426,
+  "vision_parameter_names": [],
+  "vision_parameter_count": 0,
+  "missing_keys_count": 0,
+  "unexpected_keys_count": 0,
+  "mismatched_keys_count": 0,
+  "unexpected_key_samples": [],
+  "forward_logits_shape": [
+    1,
+    4,
+    248320
+  ],
+  "cuda_peak_allocated_bytes": 8575242240,
+  "weight_files": [
+    {
+      "file": "model.safetensors-00001-of-00002.safetensors",
+      "bytes": 5329398688,
+      "sha256": "26a93f066e1916adb13453dae5a0c707c0fbc71299ed98779571a907b8e74c61"
+    },
+    {
+      "file": "model.safetensors-00002-of-00002.safetensors",
+      "bytes": 3990429408,
+      "sha256": "cb544bd9bfae93dc59b0f22b292f5933573854a7f9b97835c67060d7d910e188"
+    }
+  ],
+  "passed": true
+}

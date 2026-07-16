@@ -44,12 +44,24 @@ Run commands from `tools/gather-distill` only after the overflow gate and after 
 |---|---|---|---|
 | `train/axolotl/qwen3-1.7b-full.yaml` | Full fine-tune | 1x H100 80 GB | `axolotl train train/axolotl/qwen3-1.7b-full.yaml` |
 | `train/axolotl/gemma4-e4b-lora.yaml` | LoRA r32/alpha64 | 1x H100 80 GB | `axolotl train train/axolotl/gemma4-e4b-lora.yaml` |
+| `train/axolotl/qwen35-4b-lora.yaml` | LoRA r32/alpha64 | 1x H100 80 GB | `axolotl train train/axolotl/qwen35-4b-lora.yaml` |
 | `train/axolotl/qwen35-9b-lora.yaml` | LoRA r32/alpha64 | 1x H100 80 GB | `axolotl train train/axolotl/qwen35-9b-lora.yaml` |
 | `train/axolotl/qwen36-27b-lora-fsdp2.yaml` | LoRA r32/alpha64 + FSDP2 | 2x H100 80 GB with NVLink | `CUDA_VISIBLE_DEVICES=0,1 axolotl train train/axolotl/qwen36-27b-lora-fsdp2.yaml --launcher torchrun -- --nproc_per_node=2 --nnodes=1` |
 
-All four preserve the tokenizer's full-conversation rendering, per-record `tools`, assistant-only roles, per-assistant-turn EOS training, 32,768-token packed sequences, BF16, FlashAttention 2, gradient checkpointing, and safetensors. The 1.7B Jinja file is a mask-boundary patch whose full render is byte-identical to Qwen3's pinned tokenizer template; the other configs use `tokenizer_default` directly. The 27B wrap class is `Qwen3_5DecoderLayer`: the Qwen3.6 checkpoint declares `model_type: qwen3_5` and Transformers 5.13.1 implements it with the Qwen3.5 family classes.
+All configs preserve full-conversation rendering, per-record `tools`, assistant-only roles, per-assistant-turn EOS training, 32,768-token packed sequences, BF16, FlashAttention 2, gradient checkpointing, and safetensors. The Qwen3.5 configs use the audited `templates/qwen35-aft.jinja` mask-boundary template and explicitly select `Qwen3_5ForCausalLM` with `Qwen3_5TextConfig` so Transformers never loads the repositories' multimodal conditional-generation class. The 1.7B Jinja file applies the equivalent mask-boundary fix for Qwen3. The 27B wrap class is `Qwen3_5DecoderLayer`: the Qwen3.6 checkpoint declares `model_type: qwen3_5` and Transformers implements it with the Qwen3.5 family classes.
 
 Qwen3.5/Qwen3.6 also contain Gated DeltaNet projections. The requested seven-target LoRA survey block covers `q/k/v/o/gate/up/down_proj`; it does not target the separate linear-attention projections. Keep that scope explicit when comparing the ladder runs.
+
+For a launch-specific tokenizer gate, select one model and point the audit at the curated dataset:
+
+```bash
+python train/audit_tokenizers.py \
+  --model Qwen/Qwen3.5-4B \
+  --dataset train/sft-dataset-curated.jsonl \
+  --output train/qwen35-4b-tokenizer-audit.json
+```
+
+Repeat `--model` to audit multiple selected repositories. Without selectors, the original preparation matrix is audited.
 
 ## Launch-time pin record
 

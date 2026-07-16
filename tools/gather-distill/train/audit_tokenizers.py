@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Render the complete SFT dataset with each pinned student tokenizer."""
+"""Render the complete SFT dataset with pinned student tokenizers."""
 
 from __future__ import annotations
 
+import argparse
 import copy
 import hashlib
 import json
@@ -36,6 +37,13 @@ MODELS = [
         "revision": "a4c2d58be94dda072b918d9db64ee85c8ed34e3f",
         "argument_mode": "openai_string",
         "instrumentation": "gemma4",
+    },
+    {
+        "label": "Qwen3.5 4B",
+        "repo_id": "Qwen/Qwen3.5-4B",
+        "revision": "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
+        "argument_mode": "hf_object",
+        "instrumentation": "qwen",
     },
     {
         "label": "Qwen3.5 9B",
@@ -275,8 +283,16 @@ def proposed_disposition(length: int, assistant_messages: int) -> dict[str, str]
     }
 
 
-def line_pairs() -> Iterable[tuple[int, dict[str, Any], dict[str, Any]]]:
-    with DATASET.open() as converted_file, SOURCE_DATASET.open() as source_file:
+def line_pairs(
+    dataset: Path, source_dataset: Path | None
+) -> Iterable[tuple[int, dict[str, Any], dict[str, Any]]]:
+    if source_dataset is None:
+        with dataset.open() as converted_file:
+            for index, converted_line in enumerate(converted_file):
+                yield index, json.loads(converted_line), {}
+        return
+
+    with dataset.open() as converted_file, source_dataset.open() as source_file:
         converted_lines = iter(converted_file)
         source_lines = iter(source_file)
         index = 0
@@ -294,7 +310,10 @@ def line_pairs() -> Iterable[tuple[int, dict[str, Any], dict[str, Any]]]:
 
 
 def audit_model(
-    model: dict[str, str], verification_indices: set[int]
+    model: dict[str, str],
+    verification_indices: set[int],
+    dataset: Path,
+    source_dataset: Path | None,
 ) -> dict[str, Any]:
     tokenizer = AutoTokenizer.from_pretrained(
         model["repo_id"], revision=model["revision"]
@@ -317,7 +336,7 @@ def audit_model(
     normalized_argument_count = 0
     raw_argument_probe: dict[str, Any] | None = None
 
-    for index, example, source in line_pairs():
+    for index, example, source in line_pairs(dataset, source_dataset):
         messages, parsed = normalize_messages(
             example["messages"], model["argument_mode"]
         )
@@ -399,8 +418,8 @@ def audit_model(
             )
             overflow = {
                 "row_index": index,
-                "repo_full": source["repo_full"],
-                "request": source["request"],
+                "repo_full": source.get("repo_full"),
+                "request": source.get("request"),
                 "tokens": total,
                 "assistant_tokens": assistant,
                 "context_tokens": context,
@@ -448,14 +467,69 @@ def audit_model(
 
 
 def main() -> int:
-    conversion = json.loads(CONVERSION_REPORT.read_text())
-    verification_indices = {
-        sample["row_index"] for sample in conversion["random_verification"]["samples"]
-    }
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--model",
+        action="append",
+        dest="model_selectors",
+        help="Audit only this model label or Hugging Face repo ID; repeat for multiple models.",
+    )
+    parser.add_argument("--dataset", type=Path, default=DATASET)
+    parser.add_argument(
+        "--source-dataset",
+        type=Path,
+        help="Optional source rows used to annotate overflow records.",
+    )
+    parser.add_argument("--conversion-report", type=Path, default=CONVERSION_REPORT)
+    parser.add_argument("--output", type=Path, default=OUTPUT)
+    parser.add_argument(
+        "--verification-indices",
+        type=int,
+        nargs="+",
+        help="Zero-based rows whose instrumented render must match the official template.",
+    )
+    args = parser.parse_args()
+
+    if args.model_selectors:
+        selected = [
+            model
+            for model in MODELS
+            if model["label"] in args.model_selectors
+            or model["repo_id"] in args.model_selectors
+        ]
+        matched = {model["label"] for model in selected} | {
+            model["repo_id"] for model in selected
+        }
+        unknown = set(args.model_selectors) - matched
+        if unknown:
+            parser.error(f"unknown model selector(s): {', '.join(sorted(unknown))}")
+    else:
+        selected = MODELS
+
+    dataset = args.dataset.resolve()
+    source_dataset = args.source_dataset
+    if source_dataset is None and dataset == DATASET.resolve():
+        source_dataset = SOURCE_DATASET
+    if source_dataset is not None:
+        source_dataset = source_dataset.resolve()
+
+    conversion: dict[str, Any] | None = None
+    if args.conversion_report.exists():
+        conversion = json.loads(args.conversion_report.read_text())
+    if args.verification_indices is not None:
+        verification_indices = set(args.verification_indices)
+    elif conversion is not None and dataset == DATASET.resolve():
+        verification_indices = {
+            sample["row_index"]
+            for sample in conversion["random_verification"]["samples"]
+        }
+    else:
+        verification_indices = {0, 155, 340, 677}
+
     models = []
-    for model in MODELS:
+    for model in selected:
         print(f"Auditing {model['repo_id']} at {model['revision']}...", flush=True)
-        result = audit_model(model, verification_indices)
+        result = audit_model(model, verification_indices, dataset, source_dataset)
         models.append(result)
         print(
             f"  rows={result['rows']} p95={result['total_tokens']['p95']} "
@@ -464,11 +538,19 @@ def main() -> int:
         )
 
     stopped = [model for model in models if model["over_32768_rate"] > 0.10]
+    digest = hashlib.sha256()
+    with dataset.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    try:
+        dataset_label = str(dataset.relative_to(TRAIN_DIR.parent))
+    except ValueError:
+        dataset_label = str(dataset)
     report = {
         "generated_at": datetime.now(UTC).isoformat(),
-        "dataset": str(DATASET.relative_to(TRAIN_DIR.parent)),
-        "dataset_sha256": conversion["output_sha256"],
-        "rows": conversion["rows_out"],
+        "dataset": dataset_label,
+        "dataset_sha256": digest.hexdigest(),
+        "rows": models[0]["rows"] if models else 0,
         "transformers_version": transformers.__version__,
         "percentile_method": "nearest-rank; rank=max(1, ceil(p*N))",
         "truncation": "disabled",
@@ -477,11 +559,12 @@ def main() -> int:
         "stop_threshold_triggered": bool(stopped),
         "stop_threshold_models": [model["repo_id"] for model in stopped],
     }
-    OUTPUT.write_text(json.dumps(report, indent=2) + "\n")
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(json.dumps(report, indent=2) + "\n")
     if stopped:
         print(
             "STOP: at least one tokenizer has more than 10% of rows above 32,768 tokens; "
-            "inspect tokenizer-audit.json before proposing record drops.",
+            f"inspect {args.output} before proposing record drops.",
             file=sys.stderr,
         )
         return 2

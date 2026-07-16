@@ -1,5 +1,5 @@
-base_model: Qwen/Qwen3.5-9B
-model_revision: c202236235762e1c871ad0ccb60c8ee5ba337b9a
+base_model: Qwen/Qwen3.5-4B
+model_revision: 851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a
 # Force the nested causal-LM config so Axolotl never selects the image-text auto class.
 model_type: Qwen3_5ForCausalLM
 cls_model_config: Qwen3_5TextConfig
@@ -18,8 +18,8 @@ datasets:
       - assistant
     train_on_eos: turn
 
-dataset_prepared_path: train/prepared/qwen35-9b-lora
-output_dir: train/outputs/qwen35-9b-lora
+dataset_prepared_path: train/prepared/qwen35-4b-lora
+output_dir: train/outputs/qwen35-4b-lora
 val_set_size: 0.02
 
 sequence_len: 32768

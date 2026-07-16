@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify Qwen3.5-2B assistant-only labels with Axolotl's real strategy."""
+"""Verify Qwen3.5 assistant-only labels with Axolotl's real strategy."""
 
 from __future__ import annotations
 
@@ -41,6 +41,8 @@ def load_samples(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--model", default=MODEL)
+    parser.add_argument("--revision", default=REVISION)
     parser.add_argument(
         "--dataset", type=Path, default=TRAIN_DIR / "sft-dataset-curated.jsonl"
     )
@@ -63,12 +65,12 @@ def main() -> None:
     if len(args.sample_indices) != len(set(args.sample_indices)):
         raise ValueError("sample indices must be unique")
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL, revision=REVISION)
+    tokenizer = AutoTokenizer.from_pretrained(args.model, revision=args.revision)
     chat_template = (
         args.template.read_text() if args.template else tokenizer.chat_template
     )
     if not isinstance(chat_template, str) or not chat_template:
-        raise ValueError("Qwen3.5-2B tokenizer has no chat template")
+        raise ValueError(f"{args.model} tokenizer has no chat template")
 
     prompter = ChatTemplatePrompter(
         tokenizer=tokenizer,
@@ -101,8 +103,8 @@ def main() -> None:
         "chat_template": template_label,
         "chat_template_sha256": hashlib.sha256(chat_template.encode()).hexdigest(),
         "full_render_byte_equal_to_tokenizer_template": True,
-        "model": MODEL,
-        "revision": REVISION,
+        "model": args.model,
+        "revision": args.revision,
         "versions": {
             package: importlib.metadata.version(package)
             for package in ["axolotl", "transformers", "trl", "peft", "torch"]

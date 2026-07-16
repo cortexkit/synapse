@@ -1,0 +1,23 @@
+{
+  "label": "qwen35-9b-lora-v1",
+  "merge_method": "legacy",
+  "merged_model": {
+    "file": "model.safetensors",
+    "bytes": 17907663008,
+    "sha256": "a4756fe5b6a2d3a3b8e49081a72bafe863e43396874d9fd934d70bfc5e8b0969"
+  },
+  "conversion_config_override": {
+    "mtp_num_hidden_layers": 0
+  },
+  "llama_cpp_commit": "b4e3dc613baa92a3884d4151e3d631395c81934a",
+  "f16": {
+    "file": "qwen35-9b-lora-v1-f16.gguf",
+    "bytes": 17920696704,
+    "sha256": "986a7719f45f06ae240ab24192946cf010c518da55722367e1a2a33c3a5ddde2"
+  },
+  "q8_0": {
+    "file": "qwen35-9b-lora-v1-q8_0.gguf",
+    "bytes": 9527501184,
+    "sha256": "dbadd7a4490832a88b7910e8a112ff6885a0c43e2be2c8310e6c79bd13f9e8a4"
+  }
+}

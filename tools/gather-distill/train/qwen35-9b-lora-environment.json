@@ -1,0 +1,55 @@
+{
+  "recorded_at": "2026-07-15T23:19:23.280263+00:00",
+  "base_image": "pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel",
+  "base_image_digest": "sha256:14611869895df612b7b07227d5925f30ec3cd6673bad58ce3d84ed107950e014",
+  "axolotl_commit": "09d325b4fd1288b1473c8a330dd19e3c91b1ac32",
+  "llama_cpp_commit": "b4e3dc613baa92a3884d4151e3d631395c81934a",
+  "packages": {
+    "axolotl": "0.17.0.dev0",
+    "torch": "2.9.1+cu128",
+    "torchvision": "0.24.1+cu128",
+    "transformers": "5.9.0",
+    "accelerate": "1.13.0",
+    "trl": "1.5.1",
+    "peft": "0.19.1",
+    "flash-attn": "2.8.3",
+    "flash-linear-attention": "0.4.1",
+    "fla-core": "0.4.1",
+    "causal-conv1d": "1.6.2.post1",
+    "xformers": "0.0.33.post2"
+  },
+  "torch_cuda": "12.8",
+  "nvidia_smi": "NVIDIA H100 80GB HBM3, 555.58.02",
+  "system_nvcc": "Build cuda_12.4.r12.4/compiler.34097967_0",
+  "accelerate_full_output_upcast_disabled": true,
+  "vast_contract": 45028751,
+  "vast_rate_per_hour": 2.286666666666666,
+  "country": "Czechia",
+  "model": "Qwen/Qwen3.5-9B",
+  "model_revision": "c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+  "model_weight_files": [
+    {
+      "file": "model.safetensors-00001-of-00004.safetensors",
+      "bytes": 5276436216,
+      "sha256": "db6f444b43d318c92f360a13a25561a6a65b10c0631b8ed305a426dbaa6c380e"
+    },
+    {
+      "file": "model.safetensors-00002-of-00004.safetensors",
+      "bytes": 5335161512,
+      "sha256": "31c7d7e2dd5d207840b31cc59083c8f4c4718959149e0358c0364052bb9a0330"
+    },
+    {
+      "file": "model.safetensors-00003-of-00004.safetensors",
+      "bytes": 5368717440,
+      "sha256": "7ec36ba3a4176a44c3c0876ad80c56a2f70c84bf008d82e9501df642f17dadec"
+    },
+    {
+      "file": "model.safetensors-00004-of-00004.safetensors",
+      "bytes": 3325995712,
+      "sha256": "b62b0c4cd7e44edee103ee8f4fe225f246d5e768e07bfd5f25b63a8aa1fdd0c6"
+    }
+  ],
+  "config_sha256": "ad04d9dcf35f4586cbe811b0d4a134f604a2947c7b7139d36652d3706fe3ba19",
+  "template_sha256": "fef15c2f760736e14982abe133807eae881eaf6c585becaedc190663642e40e8",
+  "dataset_sha256": "005f0cad5fa3da8a21b448fce6e68a3787a516c090f938616556cbae56094859"
+}
