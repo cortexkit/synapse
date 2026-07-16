@@ -38,7 +38,7 @@ const JUDGE_PROMPT_BASE = [
 
 const JUDGE_PROMPT_ADDENDA = [
   "Calibration discipline: classify a package as full only when its supplied bytes support a reliable answer, not merely because its interpretation sounds plausible. Be explicit about unanswered parts.",
-  "Calibration discipline: hydrated snippet bytes are direct evidence. If those bytes reliably answer the original question, mark phase 1 fully answerable and do not browse merely to find every related file. If a non-empty package omits every file or symbol explicitly named in the original question, treat it as unrelated for calibration: classify it as none and do not use repository tools to replace that absent package evidence. Use top-up tools for genuinely missing evidence only when the supplied package is otherwise on-topic; an entirely empty package is the exception and should be explored.",
+  "Calibration discipline: paths and summaries are not evidence by themselves. Treat absent snippet bytes as missing evidence, and use top-up tools only when the package cannot support a reliable answer.",
 ] as const;
 
 export interface JudgePrompt {
@@ -620,11 +620,19 @@ export function evaluateCalibrationGate(rows: JudgeVerdictRow[]): CalibrationGat
   const mismatch = control("mismatched");
   const goldMean = mean(gold.map((row) => row.topup_tool_calls));
   const emptyMean = mean(empty.map((row) => row.topup_tool_calls));
-  const mismatchNone = mismatch.filter((row) => row.sufficiency === "none").length;
+  // Package utility is determined before repository top-ups. Final sufficiency remains
+  // the candidate headline metric, but it must not grant credit to a mismatched control.
+  const goldPhase1Invalid = gold.filter((row) => row.phase1_sufficiency === "not_answerable").length;
+  const emptyPhase1None = empty.filter((row) => row.phase1_sufficiency === "not_answerable").length;
+  const mismatchNone = mismatch.filter((row) => row.phase1_sufficiency === "not_answerable").length;
   const reasons: string[] = [];
-  if (gold.length === 0 || goldMean === null || goldMean >= 2) reasons.push("gold mean top-up must be below 2 calls");
-  if (empty.length === 0 || emptyMean === null || emptyMean <= 8) reasons.push("empty mean top-up must be above 8 calls");
-  if (mismatch.length === 0 || mismatchNone < Math.ceil(mismatch.length * 0.6)) reasons.push("mismatched packages must be flagged as none on at least 60% of jobs");
+  if (gold.length === 0 || goldMean === null || goldMean >= 2 || goldPhase1Invalid > 0) {
+    reasons.push("gold phase 1 must be answerable and average fewer than 2 top-up calls");
+  }
+  if (empty.length === 0 || emptyPhase1None !== empty.length) reasons.push("empty packages must be not_answerable in phase 1");
+  if (mismatch.length === 0 || mismatchNone < Math.ceil(mismatch.length * 0.6)) {
+    reasons.push("mismatched packages must be not_answerable in phase 1 on at least 60% of jobs");
+  }
   return {
     pass: reasons.length === 0,
     gold_mean_topup_calls: goldMean,
