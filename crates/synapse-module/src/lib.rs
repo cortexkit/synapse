@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     env, fs,
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -534,6 +534,7 @@ struct RuntimeState {
     cache_max_bytes: u64,
     scheduler: Arc<Mutex<InlineScheduler>>,
     execution: Arc<Semaphore>,
+    execution_stats: Arc<Mutex<InlineExecutionStats>>,
     control_loads: Arc<Semaphore>,
     ort_engine: Arc<Mutex<OrtEmbedEngine>>,
     catalog: Arc<Mutex<BTreeMap<String, ModelSlot>>>,
@@ -572,6 +573,27 @@ enum ModelRuntimeState {
 
 struct InlineScheduler {
     in_flight_bytes: u64,
+}
+
+const EXECUTION_WAIT_SAMPLE_LIMIT: usize = 256;
+
+struct InlineExecutionStats {
+    waiters: u64,
+    in_flight: u64,
+    wait_samples_ms: VecDeque<f64>,
+}
+
+struct InlineExecutionPermit {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    stats: Arc<Mutex<InlineExecutionStats>>,
+}
+
+impl Drop for InlineExecutionPermit {
+    fn drop(&mut self) {
+        if let Ok(mut stats) = self.stats.lock() {
+            stats.in_flight = stats.in_flight.saturating_sub(1);
+        }
+    }
 }
 
 struct InlineAdmission {
@@ -1177,6 +1199,11 @@ impl RuntimeState {
         let cache_max_bytes = config.cache_max_bytes;
         let scheduler = Arc::new(Mutex::new(InlineScheduler { in_flight_bytes: 0 }));
         let execution = Arc::new(Semaphore::new(inline.max_concurrent_workers.max(1)));
+        let execution_stats = Arc::new(Mutex::new(InlineExecutionStats {
+            waiters: 0,
+            in_flight: 0,
+            wait_samples_ms: VecDeque::new(),
+        }));
         let catalog = models
             .into_iter()
             .map(|spec| {
@@ -1203,6 +1230,7 @@ impl RuntimeState {
             cache_max_bytes,
             scheduler,
             execution,
+            execution_stats,
             control_loads: Arc::new(Semaphore::new(1)),
             ort_engine: Arc::new(Mutex::new(OrtEmbedEngine::new())),
             catalog: Arc::new(Mutex::new(catalog)),
@@ -5436,23 +5464,65 @@ fn apply_owned_tokenizer_policy(model: &EmbeddingModel, tokenized: &mut Tokenize
     }
 }
 
+async fn acquire_execution_permit(
+    runtime: &RuntimeState,
+) -> Result<InlineExecutionPermit, WireOperationError> {
+    if let Ok(mut stats) = runtime.execution_stats.lock() {
+        stats.waiters = stats.waiters.saturating_add(1);
+    }
+    let started = Instant::now();
+    let permit = runtime.execution.clone().acquire_owned().await;
+    let wait_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    match permit {
+        Ok(permit) => {
+            let mut stats = runtime.execution_stats.lock().map_err(|_| {
+                WireOperationError::from_stable(
+                    StableError::queue_full(Some(100)),
+                    "inline execution statistics are unavailable",
+                )
+            })?;
+            stats.waiters = stats.waiters.saturating_sub(1);
+            stats.in_flight = stats.in_flight.saturating_add(1);
+            if stats.wait_samples_ms.len() == EXECUTION_WAIT_SAMPLE_LIMIT {
+                stats.wait_samples_ms.pop_front();
+            }
+            stats.wait_samples_ms.push_back(wait_ms);
+            Ok(InlineExecutionPermit {
+                _permit: permit,
+                stats: Arc::clone(&runtime.execution_stats),
+            })
+        }
+        Err(_) => {
+            if let Ok(mut stats) = runtime.execution_stats.lock() {
+                stats.waiters = stats.waiters.saturating_sub(1);
+            }
+            Err(WireOperationError::from_stable(
+                StableError::queue_full(Some(100)),
+                "inline embedding executor is closed",
+            ))
+        }
+    }
+}
+
+fn execution_wait_percentile(stats: &InlineExecutionStats, quantile: f64) -> f64 {
+    if stats.wait_samples_ms.is_empty() {
+        return 0.0;
+    }
+    let mut samples = stats.wait_samples_ms.iter().copied().collect::<Vec<_>>();
+    samples.sort_by(f64::total_cmp);
+    let index = ((samples.len() as f64 * quantile).ceil() as usize)
+        .saturating_sub(1)
+        .min(samples.len() - 1);
+    samples[index]
+}
+
 async fn execute_embedding(
     runtime: &RuntimeState,
     model: &EmbeddingModel,
     batch: TokenBatch,
 ) -> Result<Vectors, WireOperationError> {
     let profile = embedding_profile_enabled();
-    let permit = runtime
-        .execution
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(|_| {
-            WireOperationError::from_stable(
-                StableError::queue_full(Some(100)),
-                "inline embedding executor is closed",
-            )
-        })?;
+    let permit = acquire_execution_permit(runtime).await?;
     match &model.backend {
         EmbedBackend::Ort(engine) => {
             let engine = Arc::clone(engine);
@@ -5603,17 +5673,7 @@ async fn execute_rerank(
     model: &EmbeddingModel,
     request: RerankRequest,
 ) -> Result<synapse_core::RerankScores, WireOperationError> {
-    let permit = runtime
-        .execution
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(|_| {
-            WireOperationError::from_stable(
-                StableError::queue_full(Some(100)),
-                "inline rerank executor is closed",
-            )
-        })?;
+    let permit = acquire_execution_permit(runtime).await?;
     match &model.backend {
         EmbedBackend::Ort(_) | EmbedBackend::Owned(_) => Err(WireOperationError::from_stable(
             StableError::artifact_invalid(),
@@ -5650,17 +5710,7 @@ async fn execute_generate(
     model: &EmbeddingModel,
     request: GenerateRequest,
 ) -> Result<GenerateOutput, WireOperationError> {
-    let permit = runtime
-        .execution
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(|_| {
-            WireOperationError::from_stable(
-                StableError::queue_full(Some(100)),
-                "inline generate executor is closed",
-            )
-        })?;
+    let permit = acquire_execution_permit(runtime).await?;
     match &model.backend {
         EmbedBackend::Ort(_) | EmbedBackend::Owned(_) => Err(WireOperationError::from_stable(
             StableError::artifact_invalid(),
@@ -7790,6 +7840,22 @@ async fn admission_status(state: Arc<ModuleState>) -> HandlerOutcome {
     } else {
         0
     };
+    let execution_stats = match state.runtime.execution_stats.lock() {
+        Ok(stats) => stats,
+        Err(_) => {
+            return result_outcome(error_payload(
+                &state,
+                WireOperationError::from_stable(
+                    StableError::queue_full(Some(100)),
+                    "inline execution statistics are unavailable",
+                ),
+            ))
+        }
+    };
+    let execution_waiters = execution_stats.waiters;
+    let execution_in_flight = execution_stats.in_flight;
+    let execution_wait_p50_ms = execution_wait_percentile(&execution_stats, 0.50);
+    let execution_wait_p95_ms = execution_wait_percentile(&execution_stats, 0.95);
     let lanes = state
         .runtime
         .loaded_models()
@@ -7801,6 +7867,10 @@ async fn admission_status(state: Arc<ModuleState>) -> HandlerOutcome {
                 "fingerprint": model.fingerprint,
                 "meeting_deadlines": predicted_start_delay_ms <= state.runtime.inline.max_queue_ms,
                 "p50_start_delay_ms": predicted_start_delay_ms,
+                "execution_waiters": execution_waiters,
+                "inline_in_flight_executions": execution_in_flight,
+                "execution_wait_p50_ms": execution_wait_p50_ms,
+                "execution_wait_p95_ms": execution_wait_p95_ms,
                 "certified": measurements.current_certification.is_some(),
                 "certification_stale": measurements.certification_stale,
                 "performance_stale": measurements.performance_stale,
@@ -7818,6 +7888,10 @@ async fn admission_status(state: Arc<ModuleState>) -> HandlerOutcome {
         "machine_profile_hash": state.machine_profile_hash,
         "current_knob": state.runtime.knob,
         "inline_in_flight_bytes": scheduler.in_flight_bytes,
+        "execution_waiters": execution_waiters,
+        "inline_in_flight_executions": execution_in_flight,
+        "execution_wait_p50_ms": execution_wait_p50_ms,
+        "execution_wait_p95_ms": execution_wait_p95_ms,
         "lanes": lanes,
         "certification_stale": certification_stale,
         "performance_stale": performance_stale,
