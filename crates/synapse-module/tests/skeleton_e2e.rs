@@ -1301,7 +1301,10 @@ async fn over_budget_embed_batch_returns_job_and_pages_results() {
         done["result"]["page_count"]
     );
     let page_count = done["result"]["page_count"].as_u64().unwrap();
-    assert!(page_count >= 1);
+    assert!(
+        page_count > 1,
+        "regression batch must straddle the configured result page boundary"
+    );
     let mut vectors = done["result"]["vectors"].as_array().unwrap().clone();
     for page in 1..page_count {
         let body = route_request(
@@ -1327,6 +1330,103 @@ async fn over_budget_embed_batch_returns_job_and_pages_results() {
         assert_eq!(vector["id"], format!("item-{index}"));
         assert_vectors_close(&vector["vector"], &inline_vectors[index]);
     }
+}
+
+#[tokio::test]
+async fn admission_status_reports_execution_waiters_during_concurrent_batches() {
+    let Some(preloads) = minilm_preload_config() else {
+        eprintln!("skipping execution admission e2e: local HF ONNX snapshot is missing");
+        return;
+    };
+    let preload_models: Value = serde_json::from_str(&preloads).expect("preload config is json");
+    let config = serde_json::json!({
+        "preload_models": preload_models,
+        "inline": {
+            "max_items": 64,
+            "max_tokens": 100_000,
+            "max_concurrent_workers": 1
+        }
+    })
+    .to_string();
+    let _lock = acquire_minilm_e2e_lock();
+    let (daemon, _module, mut first_consumer, first_route) = open_route_with_config(&config).await;
+    certify_preloaded_models(&mut first_consumer, first_route, 400).await;
+
+    let mut second_consumer = connect_consumer(&daemon.connection_file_path).await;
+    wait_for_catalog(&mut second_consumer, MODULE_ID, SETUP_TIMEOUT).await;
+    let second_project = unique_temp_dir("synapse-admission-second");
+    std::fs::create_dir_all(&second_project).unwrap();
+    let second_route = route_open(&mut second_consumer, &second_project, 2).await;
+
+    let mut status_consumer = connect_consumer(&daemon.connection_file_path).await;
+    wait_for_catalog(&mut status_consumer, MODULE_ID, SETUP_TIMEOUT).await;
+    let status_project = unique_temp_dir("synapse-admission-status");
+    std::fs::create_dir_all(&status_project).unwrap();
+    let status_route = route_open(&mut status_consumer, &status_project, 3).await;
+
+    let text = "admission semaphore hold ".repeat(512);
+    let make_items = || {
+        (0..64)
+            .map(|index| {
+                serde_json::json!({
+                    "id": format!("admission-{index}"),
+                    "text": text.clone()
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    let first_items = make_items();
+    let second_items = make_items();
+    let first_task = tokio::spawn(async move {
+        route_request(
+            &mut first_consumer,
+            first_route,
+            401,
+            serde_json::json!({
+                "method": "embed.batch",
+                "params": { "items": first_items }
+            }),
+        )
+        .await
+    });
+    sleep(Duration::from_millis(5)).await;
+    let second_task = tokio::spawn(async move {
+        route_request(
+            &mut second_consumer,
+            second_route,
+            402,
+            serde_json::json!({
+                "method": "embed.batch",
+                "params": { "items": second_items }
+            }),
+        )
+        .await
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut observed_waiter = false;
+    while Instant::now() < deadline {
+        let status = route_request(
+            &mut status_consumer,
+            status_route,
+            403,
+            serde_json::json!({ "method": "admission.status", "params": {} }),
+        )
+        .await;
+        let result = &status["result"];
+        if result["execution_waiters"].as_u64().unwrap_or(0) > 0 {
+            assert!(result["inline_in_flight_executions"].as_u64().unwrap_or(0) >= 1);
+            observed_waiter = true;
+            break;
+        }
+        sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        observed_waiter,
+        "admission.status never exposed the semaphore waiter"
+    );
+    let _ = first_task.await.unwrap();
+    let _ = second_task.await.unwrap();
 }
 
 #[tokio::test]

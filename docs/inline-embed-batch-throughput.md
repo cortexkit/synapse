@@ -41,7 +41,10 @@ The local exerciser is the `synapse-module` test
 `owned_gte_inline_embed_batch_throughput_sweep`; the standalone binary is
 `inline_embed_throughput`. It warms once outside timing, sends one
 `embed.batch` per row, uses approximately 300-token texts, and measures
-`embed.query` p50 separately.
+`embed.query` p50 separately. Each invocation salts every text and request key
+with a timestamp-plus-process nonce because the request store replays identical
+idempotent requests. Job-shaped responses follow every `embed.result` page and
+assert the complete id set instead of timing only page zero.
 
 Measured run on the local M5, warm `gte-modernbert-base-f16`:
 
@@ -57,6 +60,21 @@ Measured run on the local M5, warm `gte-modernbert-base-f16`:
 The sweep has no local-minimum cliff; every batch at 64 or larger exceeds
 10k tok/s. The same run measured `embed.query` p50 at 131.2 ms, with samples
 130.0–132.9 ms. `docs/wire-contract-v1.md` was not changed.
+
+## Live post-deploy verification
+
+A release-build invocation was attempted against the shared daemon with the
+rotated deployment fingerprint and `--concurrent`. It was stopped after the
+shared daemon's 256-item job remained queued for the exerciser's 300-second job
+timeout; therefore no live latency or throughput number is recorded here. The
+failed attempt is not a performance measurement. The required paired quiet-box
+run must be performed after the shared TimeMachine/load activity clears.
+
+The exerciser's `--concurrent` mode starts a salted 256-item job and runs 50
+`embed.query` samples while polling that job, reporting p50 and p95 alongside
+idle p50/p95. `admission.status` exposes the execution semaphore waiter count,
+in-flight execution count, and rolling acquire-wait p50/p95 so the concurrent
+latency result can be correlated with queue depth.
 
 ## Fairness and preemption math
 
