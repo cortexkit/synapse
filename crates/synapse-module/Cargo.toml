@@ -18,6 +18,7 @@ name = "ck-synapse"
 path = "src/main.rs"
 
 [dependencies]
+anyhow = { workspace = true }
 synapse-core = { path = "../synapse-core" }
 synapse-engine-ort = { path = "../synapse-engine-ort" }
 synapse-engine-owned = { path = "../synapse-engine-owned" }

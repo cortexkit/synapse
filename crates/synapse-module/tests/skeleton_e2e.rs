@@ -955,6 +955,187 @@ async fn probe_owned_gte_modernbert_certifies_against_family_reference() {
     );
 }
 
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn owned_gte_inline_embed_batch_throughput_sweep() {
+    let snapshot = gte_safetensors_snapshot().expect("local GTE ModernBERT snapshot is required");
+    for required in ["model.safetensors", "tokenizer.json", "config.json"] {
+        assert!(
+            snapshot.join(required).exists(),
+            "GTE snapshot is missing {}",
+            required
+        );
+    }
+    let config = serde_json::json!({
+        "inline": { "max_items": 256, "max_tokens": 200_000 },
+        "jobs": { "bulk_quantum_tokens": 3_072 }
+    })
+    .to_string();
+    let (_daemon, _module, mut consumer, route) = open_route_with_config(&config).await;
+    let accepted = route_request(
+        &mut consumer,
+        route,
+        70_000,
+        serde_json::json!({
+            "method": "model.load",
+            "params": {
+                "source": "file",
+                "path": snapshot,
+                "files": {
+                    "model": {
+                        "url": "model.safetensors",
+                        "sha256": test_sha256(snapshot.join("model.safetensors"))
+                    },
+                    "tokenizer": {
+                        "url": "tokenizer.json",
+                        "sha256": test_sha256(snapshot.join("tokenizer.json"))
+                    },
+                    "config": {
+                        "url": "config.json",
+                        "sha256": test_sha256(snapshot.join("config.json"))
+                    }
+                },
+                "engine": "owned-metal",
+                "family": "gte-modernbert",
+                "dtype": "f16",
+                "execution": "explicit",
+                "model_id": "gte-modernbert-base-f16",
+                "task": "embed",
+                "pooling": "mean",
+                "normalize": true,
+                "max_tokens": 512,
+                "pin": true,
+                "request_key": "owned-gte-throughput-load-v2"
+            }
+        }),
+    )
+    .await;
+    let load_job = accepted["result"]["job_id"]
+        .as_str()
+        .expect("throughput model.load returns job id");
+    let ready = poll_model_load_job(&mut consumer, route, 70_001, load_job).await;
+    assert_eq!(
+        ready["result"]["state"], "ready",
+        "GTE load failed: {ready:?}"
+    );
+    run_probe_job(
+        &mut consumer,
+        route,
+        70_002,
+        serde_json::json!({ "models": ["gte-modernbert-base-f16"] }),
+    )
+    .await;
+
+    let fixture_text = |index: usize| {
+        (0..45)
+            .map(|word| format!("retrieval fixture item {index} token {word}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let make_items = |count: usize| {
+        (0..count)
+            .map(|index| {
+                serde_json::json!({
+                    "id": format!("item-{index}"),
+                    "text": fixture_text(index)
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    let warmup = route_request(
+        &mut consumer,
+        route,
+        70_010,
+        serde_json::json!({
+            "method": "embed.batch",
+            "params": {
+                "model": "gte-modernbert-base-f16",
+                "items": make_items(1),
+                "accept_declared": true
+            }
+        }),
+    )
+    .await;
+    assert_eq!(
+        warmup["result"]["vectors"].as_array().map(Vec::len),
+        Some(1),
+        "warmup response: {warmup:?}"
+    );
+
+    let mut rows = Vec::new();
+    for (offset, batch_size) in [8_usize, 16, 32, 64, 128, 256].into_iter().enumerate() {
+        let started = Instant::now();
+        let response = route_request(
+            &mut consumer,
+            route,
+            70_100 + offset as u64,
+            serde_json::json!({
+                "method": "embed.batch",
+                "params": {
+                    "model": "gte-modernbert-base-f16",
+                    "items": make_items(batch_size),
+                    "accept_declared": true
+                }
+            }),
+        )
+        .await;
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
+        let vectors = response["result"]["vectors"].as_array().unwrap();
+        assert_eq!(vectors.len(), batch_size);
+        let tokens = response["result"]["real_token_counts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_u64().unwrap())
+            .sum::<u64>();
+        let ms_per_item = elapsed_ms / batch_size as f64;
+        let throughput = tokens as f64 / (elapsed_ms / 1_000.0);
+        eprintln!(
+            "owned GTE throughput row batch={batch_size} tokens={tokens} elapsed_ms={elapsed_ms:.3} ms_per_item={ms_per_item:.3} tok_per_s={throughput:.1}"
+        );
+        if let Some(previous) = rows.last() {
+            assert!(
+                ms_per_item <= previous * 1.4,
+                "batch={batch_size} has a local throughput cliff: {ms_per_item:.3}ms/item after {previous:.3}ms/item"
+            );
+        }
+        if batch_size >= 64 {
+            assert!(
+                throughput >= 10_000.0,
+                "batch={batch_size} throughput {throughput:.1} tok/s is below 10k gate"
+            );
+        }
+        rows.push(ms_per_item);
+    }
+
+    let mut query_samples = Vec::new();
+    for index in 0..5 {
+        let started = Instant::now();
+        let response = route_request(
+            &mut consumer,
+            route,
+            70_200 + index,
+            serde_json::json!({
+                "method": "embed.query",
+                "params": {
+                    "model": "gte-modernbert-base-f16",
+                    "id": "query",
+                    "text": fixture_text(0),
+                    "accept_declared": true
+                }
+            }),
+        )
+        .await;
+        assert_eq!(response["result"]["vectors"].as_array().unwrap().len(), 1);
+        query_samples.push(started.elapsed().as_secs_f64() * 1_000.0);
+    }
+    query_samples.sort_by(f64::total_cmp);
+    eprintln!(
+        "owned GTE embed.query p50_ms={:.3} samples={query_samples:?}",
+        query_samples[query_samples.len() / 2]
+    );
+}
+
 #[tokio::test]
 async fn embed_batch_preloaded_minilm_preserves_order_and_envelope() {
     let Some(preloads) = minilm_preload_config() else {

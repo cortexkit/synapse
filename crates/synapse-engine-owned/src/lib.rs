@@ -1,8 +1,10 @@
 #![cfg_attr(not(target_os = "macos"), forbid(unsafe_code))]
 
 use std::collections::{BTreeMap, HashMap};
+use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use synapse_core::{
@@ -17,6 +19,11 @@ pub const ENGINE_VERSION: &str = "owned-metal-v1";
 pub const GRAPH_REVISION: u32 = 3;
 pub const BUCKET_POLICY_VERSION: u32 = 1;
 pub const DEFAULT_ATTENTION_UNITS: usize = 4_000_000;
+const EMBED_PROFILE_ENV: &str = "SYNAPSE_EMBED_PROFILE";
+
+pub(crate) fn embed_profile_enabled() -> bool {
+    env::var_os(EMBED_PROFILE_ENV).is_some_and(|value| value.to_string_lossy() != "0")
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -523,6 +530,8 @@ impl EmbedEngine for OwnedMetalEmbedEngine {
 
 #[cfg(target_os = "macos")]
 fn run_bucketed(loaded: &mut OwnedLoadedModel, batch: TokenBatch) -> Result<Vectors, EngineError> {
+    let profile = embed_profile_enabled();
+    let started = Instant::now();
     if batch.items.is_empty() {
         return Ok(Vec::new());
     }
@@ -548,8 +557,10 @@ fn run_bucketed(loaded: &mut OwnedLoadedModel, batch: TokenBatch) -> Result<Vect
     order.sort_by_key(|&index| batch.items[index].len());
     let mut vectors = vec![Vec::new(); batch.items.len()];
     let mut start = 0;
+    let mut bucket_calls = 0_usize;
     while start < order.len() {
         let mut end = start;
+        let bucket_started = Instant::now();
         while end < order.len() {
             let length = batch.items[order[end]].len();
             let bucket = runtime::covering_bucket(length, &loaded.buckets).ok_or_else(|| {
@@ -566,20 +577,48 @@ fn run_bucketed(loaded: &mut OwnedLoadedModel, batch: TokenBatch) -> Result<Vect
         let length = batch.items[order[end - 1]].len();
         let shape =
             runtime::covering_bucket(length, &loaded.buckets).expect("bucket checked above");
+        bucket_calls += 1;
         let sequences = order[start..end]
             .iter()
             .map(|&index| batch.items[index].clone())
             .collect::<Vec<_>>();
+        if profile {
+            eprintln!(
+                "[synapse-embed-profile] bucket_select call={} items={} max_tokens={} shape={}x{} select_ms={:.3}",
+                bucket_calls,
+                sequences.len(),
+                length,
+                shape.batch,
+                shape.seq,
+                bucket_started.elapsed().as_secs_f64() * 1_000.0
+            );
+        }
+        let inference_started = Instant::now();
         let produced = loaded
             .family
             .embed_batch(&mut loaded.provider, &sequences, Some(shape))
             .map_err(|error| {
                 OwnedMetalEmbedEngine::error(EngineErrorStage::Inference, error.to_string())
             })?;
+        if profile {
+            eprintln!(
+                "[synapse-embed-profile] family_return call={} inference_ms={:.3}",
+                bucket_calls,
+                inference_started.elapsed().as_secs_f64() * 1_000.0
+            );
+        }
         for (&original, vector) in order[start..end].iter().zip(produced) {
             vectors[original] = vector;
         }
         start = end;
+    }
+    if profile {
+        eprintln!(
+            "[synapse-embed-profile] bucket_total items={} bucket_calls={} total_ms={:.3}",
+            batch.items.len(),
+            bucket_calls,
+            started.elapsed().as_secs_f64() * 1_000.0
+        );
     }
     Ok(vectors)
 }

@@ -6662,6 +6662,7 @@ dependencies = [
 name = "synapse-module"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
  "cortexkit-lease",
  "cortexkit-store",
  "cortexkit-store-types",

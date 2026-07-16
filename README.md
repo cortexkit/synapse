@@ -48,7 +48,7 @@ Example `~/.config/cortexkit/synapse.jsonc` (or project `.cortexkit/synapse.json
   "jobs": {
     "ttl_ms": 86400000,
     "result_page_bytes": 524288,
-    "bulk_quantum_tokens": 2048
+    "bulk_quantum_tokens": 3072
   },
   "probe": {
     "mean_cosine_threshold": 0.999,

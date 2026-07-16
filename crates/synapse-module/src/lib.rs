@@ -6,7 +6,7 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 // Provider adapters stay module-private so credentials and remote identity checks
@@ -81,7 +81,9 @@ const DEFAULT_JOB_EXECUTION_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
 const DEFAULT_JOB_RESULT_RETENTION_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
 const DEFAULT_RESUME_DEADLINE_MS: u64 = 24 * 60 * 60 * 1_000;
 const DEFAULT_JOB_RESULT_PAGE_BYTES: usize = 512 * 1024;
-const DEFAULT_JOB_BULK_QUANTUM_TOKENS: u64 = 2_048;
+const DEFAULT_JOB_BULK_QUANTUM_TOKENS: u64 = 3_072;
+const DEFAULT_ENGINE_BATCH_TOKEN_BUDGET: u64 = 3_072;
+const MAX_ENGINE_BATCH_ITEMS: usize = 8;
 const DEFAULT_PROBE_MEAN_COSINE_THRESHOLD: f64 = 0.999;
 const DEFAULT_PROBE_WORST_DECILE_RANK_OVERLAP_THRESHOLD: f64 = 0.9;
 const DEFAULT_PROBE_ANE_PLACEMENT_THRESHOLD: f64 = 0.9;
@@ -93,6 +95,7 @@ const PROBE_PERF_MIN_BATCH_SAMPLES: usize = 3;
 const PROBE_PERF_SINGLE_SAMPLES: usize = 20;
 const SYNAPSE_OS_BUILD_OVERRIDE_ENV: &str = "SYNAPSE_OS_BUILD_OVERRIDE";
 const SYNAPSE_CONFIG_PATH_ENV: &str = "SYNAPSE_CONFIG_PATH";
+const SYNAPSE_EMBED_PROFILE_ENV: &str = "SYNAPSE_EMBED_PROFILE";
 const DEFAULT_MICROLLM_MAX_TOKENS: u32 = 512;
 const DEFAULT_CACHE_MAX_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 const SYNAPSE_SINGLETON_LEASE_SCOPE: &str = "singleton";
@@ -321,6 +324,10 @@ pub(crate) struct ModuleConfig {
     dev: DevConfig,
     #[serde(default)]
     remote_providers: Vec<RemoteProviderConfig>,
+}
+
+fn embedding_profile_enabled() -> bool {
+    env::var_os(SYNAPSE_EMBED_PROFILE_ENV).is_some_and(|value| value.to_string_lossy() != "0")
 }
 
 fn default_microllm_max_tokens() -> u32 {
@@ -3467,7 +3474,16 @@ async fn embed_query(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
     };
     apply_owned_tokenizer_policy(&model, &mut tokenized);
     let ids = vec![params.id.unwrap_or_else(|| "query".to_string())];
-    embed_tokenized(state, model, ids, tokenized, alias_table).await
+    embed_tokenized(
+        state,
+        model,
+        ids,
+        tokenized,
+        alias_table,
+        false,
+        request_bytes,
+    )
+    .await
 }
 
 async fn remote_embed_query(state: Arc<ModuleState>, params: EmbedQueryParams) -> HandlerOutcome {
@@ -3786,7 +3802,16 @@ async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         Ok(admission) => admission,
         Err(error) => return result_outcome(error_payload(&state, error)),
     };
-    embed_tokenized(state, model, ids, tokenized, alias_table).await
+    embed_tokenized(
+        state,
+        model,
+        ids,
+        tokenized,
+        alias_table,
+        true,
+        request_bytes,
+    )
+    .await
 }
 
 async fn remote_embed_batch(state: Arc<ModuleState>, params: EmbedBatchParams) -> HandlerOutcome {
@@ -4880,14 +4905,26 @@ async fn execute_embedding_quanta(
     _total_tokens: u64,
     request_bytes: u64,
 ) -> Result<Vectors, WireOperationError> {
+    let profile = embedding_profile_enabled();
+    let started = Instant::now();
+    let item_count = batch.items.len();
+    let scheduler_quantum_tokens = runtime.jobs.bulk_quantum_tokens.max(1);
+    let engine_batch_tokens = scheduler_quantum_tokens
+        .min(DEFAULT_ENGINE_BATCH_TOKEN_BUDGET)
+        .max(1);
+    let engine_batches = plan_embedding_engine_batches(&batch, engine_batch_tokens);
     let mut scheduler = LaneScheduler::new(SchedulerConfig {
         byte_budget: request_bytes.max(1),
-        bulk_quantum_tokens: runtime.jobs.bulk_quantum_tokens.max(1),
+        bulk_quantum_tokens: scheduler_quantum_tokens,
         max_concurrent_workers: 1,
         default_execution_ms: runtime.inline.estimated_execution_ms,
         ..SchedulerConfig::default()
     });
-    let scheduled_tokens = batch_token_cost(&batch);
+    // One scheduler dispatch represents one bounded engine batch. Accounting is
+    // deliberately independent of item lengths so length sorting can improve
+    // padding without causing the scheduler to finish before all items run.
+    let scheduled_tokens =
+        scheduler_quantum_tokens.saturating_mul(engine_batches.len().max(1) as u64);
     scheduler
         .admit(
             &SystemClock,
@@ -4903,26 +4940,31 @@ async fn execute_embedding_quanta(
         )
         .map_err(|rejection| WireOperationError::from_stable(rejection.error, rejection.reason))?;
 
-    let mut all_vectors = Vec::new();
-    let mut cursor = 0_usize;
-    while cursor < batch.items.len() {
+    let mut all_vectors = vec![Vec::new(); batch.items.len()];
+    let mut batch_cursor = 0_usize;
+    let mut dispatch_count = 0_usize;
+    let mut scheduler_wait_ms = 0.0_f64;
+    while batch_cursor < engine_batches.len() {
+        let wait_started = Instant::now();
         let Some(dispatch) = scheduler.next_dispatch(&SystemClock) else {
+            scheduler_wait_ms += wait_started.elapsed().as_secs_f64() * 1_000.0;
             tokio::task::yield_now().await;
             continue;
         };
-        let mut quantum_tokens = 0_u64;
-        let mut quantum_items = Vec::new();
-        while cursor < batch.items.len() {
-            let item_tokens = batch.items[cursor].len().max(1) as u64;
-            if !quantum_items.is_empty()
-                && quantum_tokens.saturating_add(item_tokens) > dispatch.quantum_tokens
-            {
-                break;
-            }
-            quantum_tokens = quantum_tokens.saturating_add(item_tokens);
-            quantum_items.push(batch.items[cursor].clone());
-            cursor += 1;
-        }
+        scheduler_wait_ms += wait_started.elapsed().as_secs_f64() * 1_000.0;
+        dispatch_count += 1;
+        let indices = &engine_batches[batch_cursor];
+        batch_cursor += 1;
+        let quantum_tokens = indices
+            .iter()
+            .map(|&index| batch.items[index].len().max(1) as u64)
+            .sum::<u64>();
+        let quantum_items = indices
+            .iter()
+            .map(|&index| batch.items[index].clone())
+            .collect::<Vec<_>>();
+        let call_started = Instant::now();
+        let quantum_item_count = quantum_items.len();
         let mut vectors = execute_embedding(
             runtime,
             model,
@@ -4931,12 +4973,63 @@ async fn execute_embedding_quanta(
             },
         )
         .await?;
+        if profile {
+            eprintln!(
+                "[synapse-embed-profile] quanta dispatch={} items={} tokens={} scheduler_quantum={} engine_ms={:.3}",
+                dispatch_count,
+                quantum_item_count,
+                quantum_tokens,
+                dispatch.quantum_tokens,
+                call_started.elapsed().as_secs_f64() * 1_000.0
+            );
+        }
+        for (&index, vector) in indices.iter().zip(vectors.drain(..)) {
+            all_vectors[index] = vector;
+        }
         scheduler.complete_dispatch(&dispatch);
-        all_vectors.append(&mut vectors);
+        // Give the async runtime a boundary between bounded engine calls. The
+        // scheduler remains the source of class ordering and quantum fairness.
+        tokio::task::yield_now().await;
+    }
+    if profile {
+        eprintln!(
+            "[synapse-embed-profile] quanta total_items={} dispatches={} scheduler_wait_ms={:.3} total_ms={:.3}",
+            item_count,
+            dispatch_count,
+            scheduler_wait_ms,
+            started.elapsed().as_secs_f64() * 1_000.0
+        );
     }
     Ok(all_vectors)
 }
 
+fn plan_embedding_engine_batches(batch: &TokenBatch, token_budget: u64) -> Vec<Vec<usize>> {
+    let mut order = (0..batch.items.len()).collect::<Vec<_>>();
+    order.sort_by_key(|&index| batch.items[index].len());
+    let token_budget = token_budget.max(1);
+    let mut batches = Vec::new();
+    let mut start = 0_usize;
+    while start < order.len() {
+        let mut end = start;
+        let mut tokens = 0_u64;
+        while end < order.len() {
+            let item_tokens = batch.items[order[end]].len().max(1) as u64;
+            if end > start
+                && (end - start >= MAX_ENGINE_BATCH_ITEMS
+                    || tokens.saturating_add(item_tokens) > token_budget)
+            {
+                break;
+            }
+            tokens = tokens.saturating_add(item_tokens);
+            end += 1;
+        }
+        batches.push(order[start..end].to_vec());
+        start = end;
+    }
+    batches
+}
+
+#[cfg(test)]
 fn batch_token_cost(batch: &TokenBatch) -> u64 {
     batch
         .items
@@ -5248,8 +5341,26 @@ async fn embed_tokenized(
     ids: Vec<String>,
     tokenized: TokenizedBatch,
     alias_table: AliasTable,
+    use_bulk_quanta: bool,
+    request_bytes: u64,
 ) -> HandlerOutcome {
-    let vectors = match execute_embedding(&state.runtime, &model, tokenized.batch).await {
+    let total_tokens = tokenized
+        .real_token_counts
+        .iter()
+        .map(|&tokens| u64::from(tokens))
+        .sum::<u64>();
+    let vectors = match if use_bulk_quanta {
+        execute_embedding_quanta(
+            &state.runtime,
+            &model,
+            tokenized.batch,
+            total_tokens,
+            request_bytes,
+        )
+        .await
+    } else {
+        execute_embedding(&state.runtime, &model, tokenized.batch).await
+    } {
         Ok(vectors) => vectors,
         Err(error) => return result_outcome(error_payload(&state, error)),
     };
@@ -5330,6 +5441,7 @@ async fn execute_embedding(
     model: &EmbeddingModel,
     batch: TokenBatch,
 ) -> Result<Vectors, WireOperationError> {
+    let profile = embedding_profile_enabled();
     let permit = runtime
         .execution
         .clone()
@@ -5345,8 +5457,17 @@ async fn execute_embedding(
         EmbedBackend::Ort(engine) => {
             let engine = Arc::clone(engine);
             let loaded_model = model.loaded_model.clone();
+            let submitted_at = Instant::now();
             tokio::task::spawn_blocking(move || {
+                let entered_at = Instant::now();
+                if profile {
+                    eprintln!(
+                        "[synapse-embed-profile] spawn_entry backend=ort wait_ms={:.3}",
+                        submitted_at.elapsed().as_secs_f64() * 1_000.0
+                    );
+                }
                 let _permit = permit;
+                let mutex_started = Instant::now();
                 let engine = engine.lock().map_err(|_| EngineError {
                     stage: EngineErrorStage::Inference,
                     risk_class: synapse_core::EngineRiskClass::AbortSafe,
@@ -5354,7 +5475,22 @@ async fn execute_embedding(
                     retry_after_ms: Some(100),
                     safe_to_retry_same_request: true,
                 })?;
-                engine.embed_batch(&loaded_model, batch)
+                if profile {
+                    eprintln!(
+                        "[synapse-embed-profile] mutex_acquired backend=ort wait_ms={:.3}",
+                        mutex_started.elapsed().as_secs_f64() * 1_000.0
+                    );
+                }
+                let inference_started = Instant::now();
+                let result = engine.embed_batch(&loaded_model, batch);
+                if profile {
+                    eprintln!(
+                        "[synapse-embed-profile] engine_return backend=ort inference_ms={:.3} worker_ms={:.3}",
+                        inference_started.elapsed().as_secs_f64() * 1_000.0,
+                        entered_at.elapsed().as_secs_f64() * 1_000.0
+                    );
+                }
+                result
             })
             .await
             .map_err(|error| {
@@ -5368,8 +5504,17 @@ async fn execute_embedding(
         EmbedBackend::Owned(engine) => {
             let engine = Arc::clone(engine);
             let loaded_model = model.loaded_model.clone();
+            let submitted_at = Instant::now();
             tokio::task::spawn_blocking(move || {
+                let entered_at = Instant::now();
+                if profile {
+                    eprintln!(
+                        "[synapse-embed-profile] spawn_entry backend=owned wait_ms={:.3}",
+                        submitted_at.elapsed().as_secs_f64() * 1_000.0
+                    );
+                }
                 let _permit = permit;
+                let mutex_started = Instant::now();
                 let engine = engine.lock().map_err(|_| EngineError {
                     stage: EngineErrorStage::Inference,
                     risk_class: synapse_core::EngineRiskClass::AbortSafe,
@@ -5377,7 +5522,22 @@ async fn execute_embedding(
                     retry_after_ms: Some(100),
                     safe_to_retry_same_request: true,
                 })?;
-                engine.embed_batch(&loaded_model, batch)
+                if profile {
+                    eprintln!(
+                        "[synapse-embed-profile] mutex_acquired backend=owned wait_ms={:.3}",
+                        mutex_started.elapsed().as_secs_f64() * 1_000.0
+                    );
+                }
+                let inference_started = Instant::now();
+                let result = engine.embed_batch(&loaded_model, batch);
+                if profile {
+                    eprintln!(
+                        "[synapse-embed-profile] engine_return backend=owned inference_ms={:.3} worker_ms={:.3}",
+                        inference_started.elapsed().as_secs_f64() * 1_000.0,
+                        entered_at.elapsed().as_secs_f64() * 1_000.0
+                    );
+                }
+                result
             })
             .await
             .map_err(|error| {
@@ -5391,8 +5551,17 @@ async fn execute_embedding(
         EmbedBackend::Worker(engine) => {
             let engine = Arc::clone(engine);
             let loaded_model = model.loaded_model.clone();
+            let submitted_at = Instant::now();
             tokio::task::spawn_blocking(move || {
+                let entered_at = Instant::now();
+                if profile {
+                    eprintln!(
+                        "[synapse-embed-profile] spawn_entry backend=worker wait_ms={:.3}",
+                        submitted_at.elapsed().as_secs_f64() * 1_000.0
+                    );
+                }
                 let _permit = permit;
+                let mutex_started = Instant::now();
                 let engine = engine.lock().map_err(|_| EngineError {
                     stage: EngineErrorStage::Inference,
                     risk_class: synapse_core::EngineRiskClass::AbortCapable,
@@ -5400,7 +5569,22 @@ async fn execute_embedding(
                     retry_after_ms: Some(100),
                     safe_to_retry_same_request: true,
                 })?;
-                engine.embed_batch(&loaded_model, batch)
+                if profile {
+                    eprintln!(
+                        "[synapse-embed-profile] mutex_acquired backend=worker wait_ms={:.3}",
+                        mutex_started.elapsed().as_secs_f64() * 1_000.0
+                    );
+                }
+                let inference_started = Instant::now();
+                let result = engine.embed_batch(&loaded_model, batch);
+                if profile {
+                    eprintln!(
+                        "[synapse-embed-profile] engine_return backend=worker inference_ms={:.3} worker_ms={:.3}",
+                        inference_started.elapsed().as_secs_f64() * 1_000.0,
+                        entered_at.elapsed().as_secs_f64() * 1_000.0
+                    );
+                }
+                result
             })
             .await
             .map_err(|error| {
@@ -8349,6 +8533,28 @@ mod tests {
         };
 
         assert_eq!(batch_token_cost(&batch), 6);
+    }
+
+    #[test]
+    fn engine_batch_plan_sorts_and_caps_uninterruptible_work() {
+        let batch = TokenBatch {
+            items: (0..16).map(|index| vec![index as u32; 300]).collect(),
+        };
+        let planned = plan_embedding_engine_batches(&batch, DEFAULT_ENGINE_BATCH_TOKEN_BUDGET);
+
+        assert_eq!(planned.iter().map(Vec::len).collect::<Vec<_>>(), [8, 8]);
+        let flattened = planned.into_iter().flatten().collect::<Vec<_>>();
+        assert_eq!(flattened, (0..16).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn engine_batch_plan_respects_token_budget_before_row_cap() {
+        let batch = TokenBatch {
+            items: (0..8).map(|index| vec![index as u32; 512]).collect(),
+        };
+        let planned = plan_embedding_engine_batches(&batch, DEFAULT_ENGINE_BATCH_TOKEN_BUDGET);
+
+        assert_eq!(planned.iter().map(Vec::len).collect::<Vec<_>>(), [6, 2]);
     }
 
     #[test]
