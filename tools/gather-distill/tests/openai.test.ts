@@ -120,3 +120,32 @@ test("sends a local OpenAI request without authentication and preserves tool_cho
     globalThis.fetch = originalFetch;
   }
 });
+
+
+test("supports explicit hosted-endpoint authentication and temperature pinning", async () => {
+  const originalFetch = globalThis.fetch;
+  let request: RequestInit | undefined;
+  globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+    request = init;
+    return Response.json({
+      choices: [{ finish_reason: "stop", message: { content: '{"ok":true}' } }],
+      usage: { prompt_tokens: 1, completion_tokens: 1 },
+    });
+  }) as typeof fetch;
+  try {
+    await sendOpenAiMessage(
+      {
+        model: "gpt-5.6",
+        max_tokens: 32,
+        temperature: 0,
+        system: "judge",
+        messages: [{ role: "user", content: "test" }],
+      },
+      { baseUrl: "https://judge.example.invalid/v1", apiKey: "secret", transientRetries: 0 },
+    );
+    expect(new Headers(request?.headers).get("authorization")).toBe("Bearer secret");
+    expect(JSON.parse(String(request?.body))).toMatchObject({ model: "gpt-5.6", temperature: 0 });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

@@ -9,9 +9,27 @@ import { generateQuestions } from "./qgen.ts";
 import type { BankedRow, GatherJob, LedgerEntry, TrajectoryMessage } from "./types.ts";
 import { isRecord, parseJsonText, readJsonl, stableJobId, writeJsonAtomic, writeJsonl } from "./utils.ts";
 import { repoDirForRow, validateBankedRow } from "./validate.ts";
-import { citationLineCapsForScore, scoreRows, validateCandidateRowsForScore } from "./scorer.ts";
+import { citationLineCapsForScore, scoreRows, validateCandidateRowsForScore, type ScoreReport } from "./scorer.ts";
+import {
+  buildControlPackages,
+  evaluateCalibrationGate,
+  estimateJudgeCost,
+  hydrateJudgePackage,
+  isJudgeableRow,
+  judgePromptForIteration,
+  JUDGE_MODEL_DEFAULT,
+  JUDGE_TEMPERATURE,
+  JUDGE_TOPUP_BUDGET,
+  runJudgeEvaluation,
+  skippedJudgeRow,
+  summarizeJudgeRows,
+  type ControlPackageSpec,
+  type JudgePackageKind,
+  type JudgeRequestOptions,
+  type JudgeVerdictRow,
+} from "./judge.ts";
 import { AftClientPool, AftWarmupCoordinator, AFT_WARMUP_TIMEOUT_MS } from "./tools.ts";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -431,6 +449,471 @@ async function scoreOneCommand(args: ParsedArgs): Promise<void> {
   );
 }
 
+interface JudgeAssignment {
+  label: string;
+  path: string;
+}
+
+function assignments(args: ParsedArgs, name: string): JudgeAssignment[] {
+  return (args.flags.get(name) ?? []).map((value) => {
+    const separator = value.indexOf("=");
+    if (separator <= 0 || separator === value.length - 1) {
+      throw new Error(`--${name} values must use LABEL=PATH`);
+    }
+    const label = value.slice(0, separator);
+    const path = value.slice(separator + 1);
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(label)) {
+      throw new Error(`--${name} label must contain only letters, digits, dot, underscore, and dash`);
+    }
+    return { label, path };
+  });
+}
+
+function optionalRate(args: ParsedArgs, name: string): number | undefined {
+  const raw = one(args, name);
+  if (raw === undefined) return undefined;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 0) throw new Error(`--${name} must be a non-negative number`);
+  return value;
+}
+
+function judgeRowForJob(rows: BankedRow[], job: GatherJob): BankedRow | undefined {
+  const id = stableJobId(job.dir, job.request);
+  return rows.find((row) => row.job_id === id) ?? rows.find((row) => row.request.trim() === job.request.trim());
+}
+
+function judgePlaceholderRow(job: GatherJob): BankedRow {
+  return {
+    job_id: stableJobId(job.dir, job.request),
+    request: job.request,
+    repo_full: "unknown",
+    repo_sha: "unknown",
+    tags: job.tags,
+    full_trajectory: [],
+    final_json: null,
+    budget_outcome: "invalid_final",
+    input_tokens: 0,
+    output_tokens: 0,
+    cache_creation_input_tokens: 0,
+    cache_read_input_tokens: 0,
+    thinking_tokens: 0,
+    model: "unknown",
+    account: "unknown",
+    ts: new Date().toISOString(),
+    valid: false,
+  };
+}
+
+function judgeErrorRow(
+  job: GatherJob,
+  label: string,
+  kind: JudgePackageKind,
+  settings: JudgeRequestOptions,
+  error: unknown,
+): JudgeVerdictRow {
+  const prompt = settings.prompt ?? judgePromptForIteration(1);
+  return {
+    ...skippedJudgeRow(label, kind, judgePlaceholderRow(job), settings, "judge call failed"),
+    job_id: stableJobId(job.dir, job.request),
+    repo_full: "unknown",
+    repo_sha: "unknown",
+    status: "error",
+    phase1_sufficiency: null,
+    sufficiency: null,
+    missing_evidence: [],
+    package_score: null,
+    score_rationale: "",
+    judge_model: settings.model ?? JUDGE_MODEL_DEFAULT,
+    judge_prompt_sha: prompt.sha,
+    judge_temperature: settings.temperature ?? JUDGE_TEMPERATURE,
+    judge_topup_budget: settings.topupBudget ?? JUDGE_TOPUP_BUDGET,
+    error: error instanceof Error ? error.message : String(error),
+  };
+}
+
+interface JudgeTask {
+  question: GatherJob;
+  label: string;
+  kind: JudgePackageKind;
+  package: import("./types.ts").GatherFinalJson | null;
+  sourceRepoDir: string;
+  row: BankedRow;
+  skipReason?: string;
+}
+
+async function runJudgeTasks(tasks: JudgeTask[], settings: JudgeRequestOptions, concurrency: number): Promise<JudgeVerdictRow[]> {
+  const pool = new AftClientPool(concurrency);
+  const output: Array<JudgeVerdictRow | undefined> = Array.from({ length: tasks.length });
+  let cursor = 0;
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const index = cursor++;
+      const task = tasks[index];
+      if (!task) return;
+      if (task.skipReason || !task.package) {
+        output[index] = skippedJudgeRow(task.label, task.kind, task.row, settings, task.skipReason ?? "package was not supplied");
+        continue;
+      }
+      try {
+        const package_ = await hydrateJudgePackage(task.sourceRepoDir, task.package);
+        const evaluation = await pool.withClient(task.question.dir, (client) =>
+          runJudgeEvaluation(task.question.request, task.question.dir, package_, settings, client),
+        );
+        output[index] = {
+          job_id: stableJobId(task.question.dir, task.question.request),
+          request: task.question.request,
+          repo_full: task.row.repo_full,
+          repo_sha: task.row.repo_sha,
+          label: task.label,
+          package_kind: task.kind,
+          status: evaluation.status,
+          phase1_sufficiency: evaluation.phase1.phase1_sufficiency,
+          answer_draft: evaluation.phase1.answer_draft,
+          sufficiency: evaluation.verdict.sufficiency,
+          topup_tool_calls: evaluation.topup_calls.length,
+          topup_tokens: evaluation.topup_tokens_measured,
+          missing_evidence: evaluation.verdict.missing_evidence,
+          package_score: evaluation.verdict.package_score,
+          score_rationale: evaluation.verdict.score_rationale,
+          answer: evaluation.verdict.answer,
+          topup_trace: evaluation.topup_calls,
+          judge_model: settings.model ?? JUDGE_MODEL_DEFAULT,
+          judge_prompt_sha: (settings.prompt ?? judgePromptForIteration(1)).sha,
+          judge_temperature: settings.temperature ?? JUDGE_TEMPERATURE,
+          judge_topup_budget: settings.topupBudget ?? JUDGE_TOPUP_BUDGET,
+          judge_input_tokens: evaluation.judge_input_tokens,
+          judge_output_tokens: evaluation.judge_output_tokens,
+          phase1_tokens: evaluation.phase1_tokens,
+        };
+      } catch (error) {
+        output[index] = judgeErrorRow(task.question, task.label, task.kind, settings, error);
+      }
+    }
+  };
+  try {
+    await Promise.all(Array.from({ length: Math.max(1, concurrency) }, () => worker()));
+  } finally {
+    await pool.close();
+  }
+  return output.filter((row): row is JudgeVerdictRow => row !== undefined);
+}
+
+function controlTaskFor(
+  question: GatherJob,
+  spec: ControlPackageSpec,
+  goldRows: BankedRow[],
+  jobs: GatherJob[],
+): JudgeTask {
+  const questionRow = judgeRowForJob(goldRows, question) ?? judgePlaceholderRow(question);
+  const sourceJob = spec.package_job_id
+    ? jobs.find((job) => stableJobId(job.dir, job.request) === spec.package_job_id)
+    : spec.package_request
+      ? jobs.find((job) => job.request.trim() === spec.package_request?.trim())
+      : question;
+  return {
+    question,
+    label: "gold-control",
+    kind: spec.kind,
+    package: spec.package,
+    sourceRepoDir: sourceJob?.dir ?? question.dir,
+    row: questionRow,
+  };
+}
+
+function candidateTasksFor(
+  question: GatherJob,
+  label: string,
+  rows: BankedRow[],
+): JudgeTask {
+  const row = judgeRowForJob(rows, question) ?? judgePlaceholderRow(question);
+  let skipReason: string | undefined;
+  if (!row.final_json) skipReason = "candidate has no final package";
+  else if (row.budget_outcome !== "natural") skipReason = `candidate completion was ${row.budget_outcome}, not natural`;
+  else if (!row.valid) skipReason = "candidate package failed pinned-repository validation";
+  else if (!isJudgeableRow(row)) skipReason = "candidate package failed final-package validation";
+  return {
+    question,
+    label,
+    kind: "candidate",
+    package: row.final_json,
+    sourceRepoDir: question.dir,
+    row,
+    skipReason,
+  };
+}
+
+function f1ForScore(report: ScoreReport | undefined): number | null {
+  if (!report) return null;
+  const natural = report.jobs.filter((job) => job.budget_outcome === "natural");
+  const values = natural.map((job) => job.file_f1);
+  return values.length === 0 ? report.summary_row.file_f1_mean : values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+function numberText(value: number | null, digits = 2): string {
+  return value === null ? "n/a" : value.toFixed(digits);
+}
+
+function renderUtilityJudgeReport(
+  rowsByLabel: Map<string, JudgeVerdictRow[]>,
+  scores: Map<string, ScoreReport>,
+  calibration: {
+    gate: ReturnType<typeof evaluateCalibrationGate>;
+    cost: ReturnType<typeof estimateJudgeCost>;
+    prompt_iteration?: number;
+    prompt_sha?: string;
+    prompt_change?: string;
+  },
+  calibrationRows: JudgeVerdictRow[],
+  jobs: GatherJob[],
+): string {
+  const labels = [...rowsByLabel.keys()].sort();
+  const summaries = labels.map((label) => ({ label, summary: summarizeJudgeRows(rowsByLabel.get(label)!), f1: label === "gold-control" ? 1 : f1ForScore(scores.get(label)) }));
+  const rankedSummaries = summaries.filter((item) => item.label !== "gold-control");
+  const ranked = rankedSummaries.length > 0 ? rankedSummaries : summaries;
+  const utilityOrder = [...ranked].sort((left, right) => (left.summary.topup_calls_mean ?? Number.POSITIVE_INFINITY) - (right.summary.topup_calls_mean ?? Number.POSITIVE_INFINITY));
+  const f1Order = [...ranked].sort((left, right) => (right.f1 ?? Number.NEGATIVE_INFINITY) - (left.f1 ?? Number.NEGATIVE_INFINITY));
+  const utilityRanking = utilityOrder.map((item) => item.label).join(" < ");
+  const f1Ranking = f1Order.map((item) => item.label).join(" > ");
+  const rankingAgrees = utilityOrder.map((item) => item.label).join("\0") === f1Order.map((item) => item.label).join("\0");
+
+  const examples: string[] = [];
+  for (let index = 0; index < ranked.length && examples.length < 2; index += 1) {
+    for (let next = index + 1; next < ranked.length && examples.length < 2; next += 1) {
+      const left = ranked[index]!.label;
+      const right = ranked[next]!.label;
+      const leftScoreJobs = scores.get(left)?.jobs ?? [];
+      const rightScoreJobs = scores.get(right)?.jobs ?? [];
+      const leftRows = rowsByLabel.get(left) ?? [];
+      const rightRows = rowsByLabel.get(right) ?? [];
+      const sharedJobIds = leftRows.map((row) => row.job_id).filter((jobId) => rightRows.some((row) => row.job_id === jobId));
+      for (const jobId of sharedJobIds) {
+        const leftScore = leftScoreJobs.find((job) => job.job_id === jobId);
+        const rightScore = rightScoreJobs.find((job) => job.job_id === jobId);
+        const leftVerdict = leftRows.find((row) => row.job_id === jobId);
+        const rightVerdict = rightRows.find((row) => row.job_id === jobId);
+        if (!leftScore || !rightScore || !leftVerdict || !rightVerdict) continue;
+        if ((leftScore.file_f1 - rightScore.file_f1) * (leftVerdict.topup_tool_calls - rightVerdict.topup_tool_calls) < 0) {
+          const job = jobs.find((candidate) => stableJobId(candidate.dir, candidate.request) === jobId);
+          examples.push(`${left} vs ${right} on ${jobId}${job ? ` (${job.request})` : ""}: ${left} F1 ${leftScore.file_f1.toFixed(2)} with ${leftVerdict.topup_tool_calls} top-up calls versus ${right} F1 ${rightScore.file_f1.toFixed(2)} with ${rightVerdict.topup_tool_calls} calls.`);
+          break;
+        }
+      }
+    }
+  }
+  if (examples.length === 0) {
+    examples.push("No pairwise ranking reversal was found in the available aggregate data.", "The per-job verdict files remain the source for concrete package-level comparisons.");
+  }
+
+  const lines = [
+    "# Utility judge evaluation",
+    "",
+    "The judge is blind to candidate labels and receives hydrated snippet bytes. Top-up calls are the headline utility cost; package score is secondary. F1 is the existing gold-overlap file F1, restricted to natural completions when a score report is available.",
+    "",
+    `Calibration gate: **${calibration.gate.pass ? "PASS" : "FAIL"}** (gold mean top-up ${numberText(calibration.gate.gold_mean_topup_calls)}, empty mean ${numberText(calibration.gate.empty_mean_topup_calls)}, mismatched none ${calibration.gate.mismatch_none}/${calibration.gate.mismatch_rows}).`,
+    calibration.gate.reasons.length > 0 ? `Gate reasons: ${calibration.gate.reasons.join("; ")}.` : "",
+    `Calibration prompt: iteration ${calibration.prompt_iteration ?? "unknown"}, SHA ${calibration.prompt_sha ?? "unknown"}; ${calibration.prompt_change ?? "change not recorded"}.`,
+    `Calibration cost projection: ${calibration.cost.projected_usd === null ? "unpriced; provide endpoint-specific token rates" : `$${calibration.cost.projected_usd.toFixed(2)}`} for ${calibration.cost.projected_packages} full-matrix packages (sample rows: ${calibration.cost.sample_rows}).`,
+    "",
+    "## Calibration evidence",
+    "| control | rows | full / partial / none | top-up calls mean |",
+    "| --- | ---: | ---: | ---: |",
+    ...(["gold", "empty", "mismatched"] as const).map((kind) => {
+      const summary = summarizeJudgeRows(calibrationRows.filter((row) => row.package_kind === kind));
+      return `| ${kind} | ${summary.rows} | ${summary.sufficiency.full} / ${summary.sufficiency.partial} / ${summary.sufficiency.none} | ${numberText(summary.topup_calls_mean)} |`;
+    }),
+    "",
+    "| system | full / partial / none | top-up calls mean | top-up calls median | top-up tokens mean | score mean | F1 | skipped invalid | errors |",
+    "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+  ];
+  for (const item of summaries) {
+    const summary = item.summary;
+    lines.push(`| ${item.label} | ${summary.sufficiency.full} / ${summary.sufficiency.partial} / ${summary.sufficiency.none} | ${numberText(summary.topup_calls_mean)} | ${numberText(summary.topup_calls_median)} | ${numberText(summary.topup_tokens_mean, 0)} | ${numberText(summary.package_score_mean)} | ${numberText(item.f1)} | ${summary.skipped_invalid} | ${summary.errors} |`);
+  }
+  lines.push(
+    "",
+    `## Ranking conclusion\nUtility ranking (lower top-up is better): **${utilityRanking}**. F1 ranking (higher is better): **${f1Ranking}**. The rankings ${rankingAgrees ? "agree" : "diverge"}.`,
+    "",
+    "## Two concrete divergence examples",
+    ...examples.map((example) => `- ${example}`),
+    "",
+    "Invalid or forced rows are recorded as `sufficiency=none` with zero judge calls and are reported separately as skipped; they are not evidence of a cheap sufficient package.",
+    "",
+  );
+  return lines.filter((line, index) => !(line === "" && lines[index - 1] === "")).join("\n");
+}
+
+async function discoverStudentAssignments(directory: string): Promise<JudgeAssignment[]> {
+  try {
+    const entries = await readdir(directory, { withFileTypes: true });
+    return entries
+      .filter((entry) => entry.isFile() && entry.name.endsWith("-rows.jsonl"))
+      .map((entry) => ({ label: entry.name.slice(0, -"-rows.jsonl".length), path: join(directory, entry.name) }))
+      .sort((left, right) => left.label.localeCompare(right.label));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
+  }
+}
+
+async function judgeCommand(args: ParsedArgs): Promise<void> {
+  const phase = one(args, "phase", "calibration");
+  if (phase !== "calibration" && phase !== "full") throw new Error("--phase must be calibration or full");
+  const jobsPath = required(args, "jobs");
+  const goldPath = required(args, "gold");
+  const outputDir = one(args, "output-dir", "data/students/judge")!;
+  const baseUrl = one(args, "base-url", process.env.JUDGE_BASE_URL ?? process.env.GATHER_DISTILL_JUDGE_BASE_URL);
+  if (!baseUrl) throw new Error("--base-url (or JUDGE_BASE_URL) is required for the GPT judge");
+  const apiKey = one(args, "api-key", process.env.JUDGE_API_KEY ?? process.env.GATHER_DISTILL_JUDGE_API_KEY ?? process.env.OPENAI_API_KEY);
+  if (!apiKey) throw new Error("--api-key (or JUDGE_API_KEY) is required for the GPT judge");
+  const jobs = await readJsonl<GatherJob>(jobsPath);
+  const goldRows = await readJsonl<BankedRow>(goldPath);
+  if (jobs.length === 0) throw new Error("judge found no jobs");
+  const explicitCandidates = assignments(args, "candidate");
+  const candidates = explicitCandidates.length > 0
+    ? explicitCandidates
+    : phase === "full"
+      ? await discoverStudentAssignments(one(args, "students-dir", "data/students")!)
+      : [];
+  if (phase === "full" && candidates.length === 0) {
+    throw new Error("full judge phase found no candidate rows; pass --candidate LABEL=ROWS.jsonl or stage data/students/*-rows.jsonl");
+  }
+  if (phase === "full" && explicitCandidates.length === 0 && !candidates.some((candidate) => candidate.label.includes("deepseek"))) {
+    console.warn("judge: no deepseek student rows found under data/students; skipping that optional lane");
+  }
+  const candidateRows = new Map<string, BankedRow[]>();
+  for (const candidate of candidates) candidateRows.set(candidate.label, await readJsonl<BankedRow>(candidate.path));
+
+  const prompt = judgePromptForIteration(Number(one(args, "prompt-iteration", "1")));
+  const settings: JudgeRequestOptions = {
+    baseUrl,
+    apiKey,
+    apiKeyHeader: one(args, "api-key-header", process.env.JUDGE_KEY_HEADER ?? "authorization"),
+    model: one(args, "judge-model", process.env.JUDGE_MODEL ?? JUDGE_MODEL_DEFAULT),
+    temperature: Number(one(args, "temperature", String(JUDGE_TEMPERATURE))),
+    topupBudget: JUDGE_TOPUP_BUDGET,
+    maxResponseTokens: numberFlag(args, "max-response-tokens", 4_000),
+    requestTimeoutMs: numberFlag(args, "request-timeout", 300) * 1_000,
+    prompt,
+  };
+  if (settings.temperature === undefined || !Number.isFinite(settings.temperature) || settings.temperature < 0) {
+    throw new Error("--temperature must be a non-negative number");
+  }
+  const concurrency = Math.floor(numberFlag(args, "concurrency", 2));
+  const selectedJobs = phase === "calibration" ? jobs.slice(0, Math.min(5, jobs.length)) : jobs;
+  if (phase === "calibration" && selectedJobs.length < 5) console.warn(`judge calibration has only ${selectedJobs.length} jobs; expected 5`);
+
+  let calibrationRows: JudgeVerdictRow[] = [];
+  let calibrationReport: {
+    gate: ReturnType<typeof evaluateCalibrationGate>;
+    cost: ReturnType<typeof estimateJudgeCost>;
+    prompt_iteration?: number;
+    prompt_sha?: string;
+    prompt_change?: string;
+  } | undefined;
+  if (phase === "full") {
+    const calibrationPath = one(args, "calibration-report", join(outputDir, "calibration-report.json"))!;
+    const parsed = JSON.parse(await readFile(calibrationPath, "utf8")) as {
+      gate?: ReturnType<typeof evaluateCalibrationGate>;
+      cost?: ReturnType<typeof estimateJudgeCost>;
+      prompt_iteration?: number;
+      prompt_sha?: string;
+      prompt_change?: string;
+      rows?: JudgeVerdictRow[];
+    };
+    if (!parsed.gate?.pass) throw new Error(`calibration gate is not passing in ${calibrationPath}; run calibration first and fix the judge prompt`);
+    calibrationRows = parsed.rows ?? await readJsonl<JudgeVerdictRow>(join(outputDir, "calibration-verdicts.jsonl"));
+    calibrationReport = {
+      gate: parsed.gate,
+      cost: parsed.cost ?? estimateJudgeCost([], jobs.length * (candidates.length + 1)),
+      prompt_iteration: parsed.prompt_iteration,
+      prompt_sha: parsed.prompt_sha,
+      prompt_change: parsed.prompt_change,
+    };
+  }
+
+  const tasks: JudgeTask[] = [];
+  for (const job of selectedJobs) {
+    if (phase === "calibration") {
+      const controls = buildControlPackages(job, goldRows, jobs);
+      tasks.push(...controls.map((control) => controlTaskFor(job, control, goldRows, jobs)));
+      for (const candidate of candidates) tasks.push(candidateTasksFor(job, candidate.label, candidateRows.get(candidate.label)!));
+    } else {
+      const goldRow = judgeRowForJob(goldRows, job) ?? judgePlaceholderRow(job);
+      tasks.push({
+        question: job,
+        label: "gold-control",
+        kind: "gold",
+        package: goldRow.final_json,
+        sourceRepoDir: job.dir,
+        row: goldRow,
+        skipReason: isJudgeableRow(goldRow) ? undefined : "gold control package is invalid or did not complete naturally",
+      });
+      for (const candidate of candidates) tasks.push(candidateTasksFor(job, candidate.label, candidateRows.get(candidate.label)!));
+    }
+  }
+
+  const rows = await runJudgeTasks(tasks, settings, concurrency);
+  const calibrationPath = join(outputDir, "calibration-verdicts.jsonl");
+  if (phase === "calibration") {
+    const gate = evaluateCalibrationGate(rows);
+    const projectedPackages = jobs.length * (candidates.length + 1 || 1);
+    const cost = estimateJudgeCost(
+      rows,
+      projectedPackages,
+      optionalRate(args, "input-usd-per-million"),
+      optionalRate(args, "output-usd-per-million"),
+    );
+    await writeJsonl(calibrationPath, rows);
+    await writeJsonAtomic(join(outputDir, "calibration-report.json"), {
+      phase: "calibration",
+      prompt_iteration: prompt.iteration,
+      prompt_sha: prompt.sha,
+      prompt_change: prompt.change,
+      model: settings.model,
+      temperature: settings.temperature,
+      topup_budget: settings.topupBudget,
+      gate,
+      cost,
+      rows,
+    });
+    console.log(JSON.stringify({ lane: "judge", phase, output: calibrationPath, gate, cost, prompt_sha: prompt.sha }));
+    if (!gate.pass) process.exitCode = 1;
+    return;
+  }
+
+  const quota = Number(one(args, "quota-usd", "30"));
+  if (!Number.isFinite(quota) || quota <= 0) throw new Error("--quota-usd must be positive");
+  const inputRate = optionalRate(args, "input-usd-per-million");
+  const outputRate = optionalRate(args, "output-usd-per-million");
+  const projectedCost = estimateJudgeCost([], jobs.length * (candidates.length + 1), inputRate, outputRate);
+  if (calibrationReport && calibrationReport.cost.projected_usd !== null && calibrationReport.cost.projected_usd > quota) {
+    throw new Error(`projected calibration-based judge spend $${calibrationReport.cost.projected_usd.toFixed(2)} exceeds --quota-usd ${quota.toFixed(2)}; full matrix stopped`);
+  }
+  if (projectedCost.projected_usd !== null && projectedCost.projected_usd > quota) {
+    throw new Error(`full-matrix judge spend $${projectedCost.projected_usd.toFixed(2)} exceeds --quota-usd ${quota.toFixed(2)}; full matrix stopped`);
+  }
+
+  const rowsByLabel = new Map<string, JudgeVerdictRow[]>();
+  rowsByLabel.set("gold-control", rows.filter((row) => row.label === "gold-control"));
+  for (const candidate of candidates) rowsByLabel.set(candidate.label, rows.filter((row) => row.label === candidate.label));
+  await mkdir(outputDir, { recursive: true });
+  await writeJsonl(join(outputDir, "gold-control-verdicts.jsonl"), rowsByLabel.get("gold-control")!);
+  for (const candidate of candidates) await writeJsonl(join(outputDir, `${candidate.label}-verdicts.jsonl`), rowsByLabel.get(candidate.label)!);
+  const scoreReports = new Map<string, ScoreReport>();
+  for (const score of assignments(args, "score")) {
+    scoreReports.set(score.label, JSON.parse(await readFile(score.path, "utf8")) as ScoreReport);
+  }
+  const report = renderUtilityJudgeReport(rowsByLabel, scoreReports, {
+    gate: calibrationReport!.gate,
+    cost: calibrationReport!.cost,
+    prompt_iteration: calibrationReport!.prompt_iteration,
+    prompt_sha: calibrationReport!.prompt_sha,
+    prompt_change: calibrationReport!.prompt_change,
+  }, calibrationRows, jobs);
+  await writeFile(join("train", "UTILITY-JUDGE.md"), report, "utf8");
+  console.log(JSON.stringify({ lane: "judge", phase, output: outputDir, projected_cost: projectedCost, prompt_sha: prompt.sha }));
+}
+
 function help(): void {
   console.log(`gather-distill
 
@@ -441,9 +924,14 @@ Subcommands:
   validate --rows data/rows.jsonl [--output PATH --corpus-root DIR]
   score    --candidate data/model-rows.jsonl --gold data/eval-gold.jsonl --output data/model-scores.json
             [--corpus-root DIR]
-  score-one --job JOB_ID --candidate-file candidate.json --gold data/eval-gold-rows.jsonl
+   score-one --job JOB_ID --candidate-file candidate.json --gold data/eval-gold-rows.jsonl
+   judge --phase calibration|full --jobs data/eval-jobs.jsonl --gold data/eval-gold-rows.jsonl
+         --base-url URL --api-key KEY [--candidate LABEL=rows.jsonl ...] [--score LABEL=scores.json]
+         [--output-dir data/students/judge --prompt-iteration 1|2|3]
 
-Anthropic qgen and gather use GATHER_DISTILL_API_KEY or GATHER_DISTILL_ACCOUNTS_FILE/--accounts-file.
+The judge uses a pinned GPT model through the explicitly supplied OpenAI-compatible endpoint.
+Calibration runs gold, empty, and mismatched controls on the first five jobs; full runs gold controls plus candidates.
+Judge API keys are never written to verdict rows. Anthropic qgen and gather use GATHER_DISTILL_API_KEY or GATHER_DISTILL_ACCOUNTS_FILE/--accounts-file.
 OpenAI-compatible gather is local-only and never reads account credentials or OAuth settings.`);
 }
 
@@ -454,6 +942,7 @@ async function main(): Promise<void> {
   else if (args.command === "validate") await validateCommand(args);
   else if (args.command === "score") await scoreCommand(args);
   else if (args.command === "score-one") await scoreOneCommand(args);
+  else if (args.command === "judge") await judgeCommand(args);
   else help();
 }
 
