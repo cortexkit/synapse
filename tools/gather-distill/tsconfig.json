@@ -8,5 +8,5 @@
     "skipLibCheck": true,
     "allowImportingTsExtensions": true
   },
-  "include": ["src/**/*.ts", "prompts/**/*.ts", "train/**/*.ts", "tests/**/*.ts"]
+  "include": ["src/**/*.ts", "prompts/**/*.ts", "scripts/**/*.ts", "train/**/*.ts", "tests/**/*.ts"]
 }
