@@ -1,65 +1,62 @@
 # Utility judge evaluation
 
-The judge used the operator's OpenCode OpenAI OAuth subscription account through the Codex/ChatGPT Responses route. No platform API key was used, and no OAuth token material was written to logs, verdicts, or this report.
+The judge is blind to candidate labels and receives hydrated snippet bytes. Top-up calls are the headline utility cost; package score is secondary. F1 is the existing gold-overlap file F1, restricted to natural completions when a score report is available.
 
-## Wire verification
+Calibration gate: **PASS** (gold mean top-up 0.40, empty mean 4.60, mismatched none 3/5).
 
-The implementation was source-checked against `~/Work/OSS/opencode`:
+Calibration prompt: iteration 1, SHA 2c27195db8c467edaa9f464bc92297d6b5478accc311f26b056ce8d76047af39; base blind two-phase protocol.
+Calibration cost projection: $6.37 for 280 full-matrix packages (sample rows: 38).
 
-- `packages/opencode/src/plugin/openai/codex.ts:12` defines `https://chatgpt.com/backend-api/codex/responses`.
-- `packages/opencode/src/plugin/openai/codex.ts:405-408` adds bearer access and `ChatGPT-Account-Id`; the harness derives the account ID from JWT claims without refreshing.
-- `packages/opencode/src/plugin/openai/codex.ts:415-425` routes Responses requests to Codex, while `:549-553` adds `originator: opencode`, the OpenCode user agent, and `session-id`.
-- `packages/core/src/github-copilot/responses/openai-responses-language-model.ts:253-305` and `:372-389` establish the Responses body and function-tool shape. The harness maps all nine AFT tools and round-trips `function_call`/`function_call_output` items.
-- `packages/core/src/github-copilot/responses/openai-responses-language-model.ts:311-320` removes temperature for reasoning models. The judge requested temperature `0`, but the OAuth wire pins it as omitted (`null` in verdict rows).
-- `packages/opencode/src/plugin/openai/codex.ts:559-563` removes `maxOutputTokens`; the live endpoint rejected `max_output_tokens`, so the adapter omits it. Streaming follows `packages/core/src/github-copilot/responses/openai-responses-language-model.ts:777-792`.
-- OpenCode excludes bare `gpt-5.6` at `packages/opencode/src/plugin/openai/codex.ts:289-291`; the selected non-mini route was `gpt-5.6-luna`.
+## Calibration evidence
+| control | rows | full / partial / none | top-up calls mean |
+| --- | ---: | ---: | ---: |
+| gold | 5 | 4 / 1 / 0 | 0.40 |
+| empty | 5 | 0 / 1 / 4 | 4.60 |
+| mismatched | 5 | 0 / 3 / 2 | 5.20 |
 
-One `read` tool-call round-trip returned `PROBE_OK`, and one gold-package phase-1 smoke call returned `answerable_fully`. The initial non-streaming probe was rejected with `Stream must be set to true`; the source-verified SSE adapter then succeeded.
+## Gold-anchor difficulty spread
 
-## Phase-1 calibration semantics
+12 of 40 gold packages needed repository top-ups after phase 1.
 
-The gate measures package utility from `phase1_sufficiency` while preserving candidate final-sufficiency semantics; exploration of mismatches remains enabled. Gold must have zero `not_answerable` phase-1 results, mean top-up at most 4, and mean top-up at most half the empty mean. Empty packages must be `not_answerable` in phase 1. Mismatched packages must be `not_answerable` in phase 1 on at least 60% of jobs, regardless of their final post-exploration sufficiency. The absolute thresholds are operator-owned; the load-bearing property is gold-versus-empty separation, not forcing gold browsing to zero.
+| top-up calls | gold jobs |
+| ---: | ---: |
+| 0 | 28 |
+| 2 | 2 |
+| 3 | 4 |
+| 5 | 1 |
+| 6 | 4 |
+| 7 | 1 |
 
-Final calibration rerun: prompt iteration 1, SHA `2c27195db8c4…`, model `gpt-5.6-luna`, concurrency 2.
+| job ID | request | phase-1 result | top-up calls | final result |
+| --- | --- | --- | ---: | --- |
+| 65567dba33519d5763f654c7bd977142039ef3360025ea47bc5f632ab30123a0 | Trace how a query processed through the ANE/CoreML spike path (coreml_spike.rs) differs from the standard CPU/Vulkan retrieval path — what shared interfaces or traits, if any, unify these backends in the core crate? | partial | 7 | partial |
+| 4c5242d395e4a403cd198420bb5b3bad1527dd7fe43a3d3c76b87552c36bf30a | If storage.test.ts fails against clients/store/tests/golden/storage_vectors.json after a change to derivation.ts, which functions in derivation.ts and descriptor.ts are most likely responsible for the mismatch, and how would you locate the exact diverging byte offset? | partial | 6 | full |
+| c9698dc46fd4c75ad5777b23014a84234bbaa77d51208e1ea033fc21995eeef9 | Which Rust workspace members (as declared in the top-level Cargo.toml) would need coordinated version bumps if the derivation logic mirrored in clients/store/src/derivation.ts were changed? | partial | 6 | partial |
+| e52e6f3e8412a697a991bc6faebc02488a08ee50ee5f3860717fc1806dedb712 | Based on current import relationships between source modules, which files violate the boundaries described in the modular-code-enforcement rule, and what would need to change to bring them into compliance? | partial | 6 | partial |
+| e67b5506e53355bf6eabb81d1a12a77ffb681aa0c99dd64aabef69fc6aa6a637 | What public functions or types does the core crate defined in Cargo.toml export from its crate root (lib.rs), and which of these are consumed by the TypeScript layer? | partial | 6 | partial |
+| 85a1585b1aaa733b9901471d4926ae802f6d4191fe0f911352c2d7dc00d32ea5 | Trace the data flow from the Rust retrieval/embedding code in the main crate through to the Python scripts in bench/eval-coir — what intermediate file formats or serialization boundaries connect them? | partial | 5 | partial |
+| 283bcb6fe5d96907a88829309f6672b196651f2a1ba58cc60a1155e8d4751aba | What is the entry point that registers the `publish` and `get-unpublished-changes` commands with the CLI dispatcher, and what module owns the command routing table? | partial | 3 | partial |
+| 7889d0261c394decbcd3194318a6a8eea839b6f9b3ccca0ede3ea96c2bf33635 | What is the purpose of .cortexkit/magic-context.jsonc, and which part of the codebase loads or interprets its 'magic-context' entries? | partial | 3 | partial |
+| 8218929b0d5299e445a9dc390b443f61dce8c77542873d4fde0829688c18fec9 | What frame-to-progress or duration calculation logic is duplicated between text-animations-typewriter.tsx and text-animations-word-highlight.tsx that could be extracted into a shared timing utility? | partial | 3 | partial |
+| e40ecde09b35ad037ab65b87da3a9cd313602f7aff3832cb06dd255441f3d589 | Before restructuring the .cortexkit directory, which source files import or reference paths under .cortexkit/ (e.g. aft.jsonc, magic-context.jsonc) that would break if those files moved? | partial | 3 | partial |
+| 254f0d586b454438e39f69480dbdeaf281d129cf112b0f4965e3285cb4a564e2 | What API or CLI command consumes .bg-shell/manifest.json, and what shape of object does it expect the manifest to expose? | not answerable | 2 | none |
+| 9000662d93304f5f9601d2b6ba7f972631e10ceacc46ca3f1001e9dece0c4766 | In charts-bar-chart.tsx, what interpolation/easing function drives bar height animation, and could it return negative or NaN heights for frame values before the animation's declared start frame? | partial | 2 | full |
 
-| control | rows | phase-1 distribution | final full / partial / none | top-up calls mean | gate |
-| --- | ---: | --- | --- | ---: | --- |
-| gold | 5 | full 5 / partial 0 / not_answerable 0 | 5 / 0 / 0 | 3.00 | PASS |
-| empty | 5 | full 0 / partial 0 / not_answerable 5 | 4 / 1 / 0 | 9.80 | PASS |
-| mismatched | 5 | full 0 / partial 2 / not_answerable 3 | 4 / 1 / 0 | 10.00 | PASS |
-
-Gold/empty mean ratio was `0.3061`, satisfying the separation criterion. Mismatched packages were allowed to explore after phase 1; their post-exploration success did not grant package credit.
-
-## Cost projection
-
-The calibration command printed this projection before the matrix launch:
-
-- sample rows: 15
-- calibration projected packages: 40
-- mean input tokens: 29,431.4
-- mean output tokens: 1,098.5
-- projected input tokens: 1,177,256
-- projected output tokens: 43,939
-- projected USD: unpriced on the subscription route
-
-The available full matrix contained 40 gold-control packages plus 40 available-candidate packages (80 total); the full command printed an unpriced 80-package projection before execution.
-
-## Utility versus F1
-
-The full matrix ran all 40 gold controls and the only candidate present on disk. The requested 4B, 9B, and DeepSeek artifacts were absent from `/Users/[owner]/Work/Projects/CortexKit/synapse/tools/gather-distill/data/students/` at run time:
-
-- `qwen35-4b-lora-v1-rows.jsonl` and `qwen35-4b-lora-v1-scores.json`
-- `qwen35-9b-lora-v1-rows.jsonl` and `qwen35-9b-lora-v1-scores.json`
-- `deepseek-v4-flash-zeroshot*-rows.jsonl` and matching scores
-- `deepseek-v4-flash-nothink*-rows.jsonl` and matching scores
-
-The available `qwen35-2b-sft-v1` artifacts were copied read-only (40 row lines; 586 score lines). All 40 candidate rows failed pinned-package validation and were recorded as skipped invalid, so they did not consume judge calls and are not evidence of a cheap sufficient package.
-
-| system | full / partial / none | top-up calls mean | top-up calls median | top-up tokens mean | score mean | F1 | skipped invalid | errors |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| gold-control | 36 / 4 / 0 | 3.48 | 0.00 | 25,152 | 8.90 | 1.00 | 0 | 0 |
-| qwen35-2b-sft-v1 | 0 / 0 / 40 | 0.00 | 0.00 | 0 | 1.00 | 0.00 | 40 | 0 |
+| system | phase-1 full / partial / none | final full / partial / none | top-up calls mean | top-up calls median | top-up tokens mean | score mean | F1 | skipped invalid | errors |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| codegraph-explore | 1 / 10 / 29 | 1 / 12 / 27 | 4.33 | 4.00 | 35049 | 2.25 | 0.06 | 0 | 0 |
+| deepseek-v4-flash-nothink | 18 / 2 / 0 | 17 / 3 / 0 | 0.25 | 0.00 | 8036 | 8.90 | 0.85 | 20 | 0 |
+| deepseek-v4-flash-zeroshot | 16 / 3 / 0 | 18 / 1 / 0 | 0.95 | 0.00 | 8900 | 9.00 | 0.89 | 21 | 0 |
+| gold-control | 28 / 11 / 1 | 28 / 11 / 1 | 1.30 | 0.00 | 13442 | 8.53 | 1.00 | 0 | 0 |
+| qwen35-2b-sft-v1-fixed | 15 / 19 / 0 | 14 / 20 / 0 | 2.59 | 3.00 | 17049 | 7.35 | 0.60 | 6 | 0 |
+| qwen35-4b-lora-v1 | 21 / 13 / 0 | 22 / 12 / 0 | 2.18 | 0.00 | 15279 | 8.38 | 0.64 | 6 | 0 |
+| qwen35-9b-lora-v1 | 20 / 9 / 1 | 22 / 7 / 1 | 1.70 | 0.00 | 12422 | 8.33 | 0.69 | 10 | 0 |
 
 ## Ranking conclusion
+Utility ranking (lower top-up is better): **deepseek-v4-flash-nothink < deepseek-v4-flash-zeroshot < qwen35-9b-lora-v1 < qwen35-4b-lora-v1 < qwen35-2b-sft-v1-fixed < codegraph-explore**. F1 ranking (higher is better): **deepseek-v4-flash-zeroshot > deepseek-v4-flash-nothink > qwen35-9b-lora-v1 > qwen35-4b-lora-v1 > qwen35-2b-sft-v1-fixed > codegraph-explore**. The rankings diverge.
 
-No valid student candidate was available, so a meaningful utility-versus-F1 ranking agreement verdict is **not assessable**. The available 2B row's zero-call result is entirely skipped-invalid and must not be ranked as a successful package. No pairwise divergence examples are reported because there are no valid candidate verdicts; the ignored per-job verdict files remain the source for future comparisons.
+## Two concrete divergence examples
+- codegraph-explore vs deepseek-v4-flash-nothink on c18b34685a21fb678a019fd32a58b502c0d85d96e23b841a3051d0ec29cac21b (What public functions or types does clients/store/src/index.ts re-export from derivation.ts and descriptor.ts, and are there any internal-only symbols excluded from the public API?): codegraph-explore F1 0.29 with 4 top-up calls versus deepseek-v4-flash-nothink F1 1.00 with 0 calls.
+- codegraph-explore vs deepseek-v4-flash-zeroshot on c18b34685a21fb678a019fd32a58b502c0d85d96e23b841a3051d0ec29cac21b (What public functions or types does clients/store/src/index.ts re-export from derivation.ts and descriptor.ts, and are there any internal-only symbols excluded from the public API?): codegraph-explore F1 0.29 with 4 top-up calls versus deepseek-v4-flash-zeroshot F1 1.00 with 0 calls.
+
+Invalid or forced rows are recorded as `sufficiency=none` with zero judge calls and are reported separately as skipped; they are not evidence of a cheap sufficient package.

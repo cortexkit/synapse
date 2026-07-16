@@ -30,7 +30,7 @@ import {
 } from "./judge.ts";
 import { AftClientPool, AftWarmupCoordinator, AFT_WARMUP_TIMEOUT_MS } from "./tools.ts";
 import { OPENAI_CODEX_RESPONSES_URL } from "./openai-oauth.ts";
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -542,17 +542,26 @@ interface JudgeTask {
   skipReason?: string;
 }
 
-async function runJudgeTasks(tasks: JudgeTask[], settings: JudgeRequestOptions, concurrency: number): Promise<JudgeVerdictRow[]> {
+async function runJudgeTasks(
+  tasks: JudgeTask[],
+  settings: JudgeRequestOptions,
+  concurrency: number,
+  onRow?: (row: JudgeVerdictRow) => Promise<void>,
+): Promise<JudgeVerdictRow[]> {
   const pool = new AftClientPool(concurrency);
   const output: Array<JudgeVerdictRow | undefined> = Array.from({ length: tasks.length });
   let cursor = 0;
+  const record = async (index: number, row: JudgeVerdictRow): Promise<void> => {
+    output[index] = row;
+    await onRow?.(row);
+  };
   const worker = async (): Promise<void> => {
     for (;;) {
       const index = cursor++;
       const task = tasks[index];
       if (!task) return;
       if (task.skipReason || !task.package) {
-        output[index] = skippedJudgeRow(task.label, task.kind, task.row, settings, task.skipReason ?? "package was not supplied");
+        await record(index, skippedJudgeRow(task.label, task.kind, task.row, settings, task.skipReason ?? "package was not supplied"));
         continue;
       }
       try {
@@ -560,7 +569,7 @@ async function runJudgeTasks(tasks: JudgeTask[], settings: JudgeRequestOptions, 
         const evaluation = await pool.withClient(task.question.dir, (client) =>
           runJudgeEvaluation(task.question.request, task.question.dir, package_, settings, client),
         );
-        output[index] = {
+        await record(index, {
           job_id: stableJobId(task.question.dir, task.question.request),
           request: task.question.request,
           repo_full: task.row.repo_full,
@@ -585,9 +594,9 @@ async function runJudgeTasks(tasks: JudgeTask[], settings: JudgeRequestOptions, 
           judge_input_tokens: evaluation.judge_input_tokens,
           judge_output_tokens: evaluation.judge_output_tokens,
           phase1_tokens: evaluation.phase1_tokens,
-        };
+        });
       } catch (error) {
-        output[index] = judgeErrorRow(task.question, task.label, task.kind, settings, error);
+        await record(index, judgeErrorRow(task.question, task.label, task.kind, settings, error));
       }
     }
   };
@@ -597,6 +606,33 @@ async function runJudgeTasks(tasks: JudgeTask[], settings: JudgeRequestOptions, 
     await pool.close();
   }
   return output.filter((row): row is JudgeVerdictRow => row !== undefined);
+}
+
+function judgeRowKey(row: Pick<JudgeVerdictRow, "job_id" | "label" | "package_kind">): string {
+  return `${row.label}\0${row.package_kind}\0${row.job_id}`;
+}
+
+function judgeTaskKey(task: JudgeTask): string {
+  return `${task.label}\0${task.kind}\0${stableJobId(task.question.dir, task.question.request)}`;
+}
+
+async function readJudgeRowsIfPresent(path: string): Promise<JudgeVerdictRow[]> {
+  try {
+    return await readJsonl<JudgeVerdictRow>(path);
+  } catch (error) {
+    if ((error as { code?: unknown }).code === "ENOENT") return [];
+    throw error;
+  }
+}
+
+async function readFullJudgeProgress(outputDir: string, candidates: JudgeAssignment[]): Promise<JudgeVerdictRow[]> {
+  const paths = [
+    join(outputDir, "full-progress.jsonl"),
+    join(outputDir, "gold-control-verdicts.jsonl"),
+    ...candidates.map((candidate) => join(outputDir, `${candidate.label}-verdicts.jsonl`)),
+  ];
+  const rows = await Promise.all(paths.map((path) => readJudgeRowsIfPresent(path)));
+  return rows.flat();
 }
 
 function controlTaskFor(
@@ -654,6 +690,55 @@ function numberText(value: number | null, digits = 2): string {
   return value === null ? "n/a" : value.toFixed(digits);
 }
 
+function summarizePhase1Sufficiency(rows: JudgeVerdictRow[]): { full: number; partial: number; none: number } {
+  const completed = rows.filter((row) => row.status === "completed");
+  return {
+    full: completed.filter((row) => row.phase1_sufficiency === "answerable_fully").length,
+    partial: completed.filter((row) => row.phase1_sufficiency === "answerable_partially").length,
+    none: completed.filter((row) => row.phase1_sufficiency === "not_answerable").length,
+  };
+}
+
+function markdownCell(value: string): string {
+  return value.replace(/\s+/g, " ").replace(/\|/g, "\\|").trim();
+}
+
+function goldAnchorDifficultyLines(rows: JudgeVerdictRow[]): string[] {
+  const completed = rows.filter((row) => row.status === "completed");
+  if (completed.length === 0) {
+    return ["## Gold-anchor difficulty spread", "", "No completed gold-control verdicts were available.", ""];
+  }
+  const needingTopups = completed
+    .filter((row) => row.topup_tool_calls > 0)
+    .sort((left, right) => right.topup_tool_calls - left.topup_tool_calls || left.job_id.localeCompare(right.job_id));
+  const byCalls = new Map<number, number>();
+  for (const row of completed) byCalls.set(row.topup_tool_calls, (byCalls.get(row.topup_tool_calls) ?? 0) + 1);
+  const lines = [
+    "## Gold-anchor difficulty spread",
+    "",
+    `${needingTopups.length} of ${completed.length} gold packages needed repository top-ups after phase 1.`,
+    "",
+    "| top-up calls | gold jobs |",
+    "| ---: | ---: |",
+    ...[...byCalls.entries()].sort(([left], [right]) => left - right).map(([calls, count]) => `| ${calls} | ${count} |`),
+  ];
+  if (needingTopups.length === 0) {
+    lines.push("", "Every completed gold package was answerable without repository top-ups.", "");
+    return lines;
+  }
+  lines.push("", "| job ID | request | phase-1 result | top-up calls | final result |", "| --- | --- | --- | ---: | --- |");
+  for (const row of needingTopups) {
+    const phase1 = row.phase1_sufficiency === "answerable_fully"
+      ? "full"
+      : row.phase1_sufficiency === "answerable_partially"
+        ? "partial"
+        : "not answerable";
+    lines.push(`| ${row.job_id} | ${markdownCell(row.request)} | ${phase1} | ${row.topup_tool_calls} | ${row.sufficiency ?? "n/a"} |`);
+  }
+  lines.push("");
+  return lines;
+}
+
 function renderUtilityJudgeReport(
   rowsByLabel: Map<string, JudgeVerdictRow[]>,
   scores: Map<string, ScoreReport>,
@@ -669,13 +754,12 @@ function renderUtilityJudgeReport(
 ): string {
   const labels = [...rowsByLabel.keys()].sort();
   const summaries = labels.map((label) => ({ label, summary: summarizeJudgeRows(rowsByLabel.get(label)!), f1: label === "gold-control" ? 1 : f1ForScore(scores.get(label)) }));
-  const rankedSummaries = summaries.filter((item) => item.label !== "gold-control");
-  const ranked = rankedSummaries.length > 0 ? rankedSummaries : summaries;
+  const ranked = summaries.filter((item) => item.label !== "gold-control" && item.summary.completed > 0);
   const utilityOrder = [...ranked].sort((left, right) => (left.summary.topup_calls_mean ?? Number.POSITIVE_INFINITY) - (right.summary.topup_calls_mean ?? Number.POSITIVE_INFINITY));
   const f1Order = [...ranked].sort((left, right) => (right.f1 ?? Number.NEGATIVE_INFINITY) - (left.f1 ?? Number.NEGATIVE_INFINITY));
   const utilityRanking = utilityOrder.map((item) => item.label).join(" < ");
   const f1Ranking = f1Order.map((item) => item.label).join(" > ");
-  const rankingAgrees = utilityOrder.map((item) => item.label).join("\0") === f1Order.map((item) => item.label).join("\0");
+  const rankingAgrees = ranked.length > 0 && utilityOrder.map((item) => item.label).join("\0") === f1Order.map((item) => item.label).join("\0");
 
   const examples: string[] = [];
   for (let index = 0; index < ranked.length && examples.length < 2; index += 1) {
@@ -723,16 +807,21 @@ function renderUtilityJudgeReport(
       return `| ${kind} | ${summary.rows} | ${summary.sufficiency.full} / ${summary.sufficiency.partial} / ${summary.sufficiency.none} | ${numberText(summary.topup_calls_mean)} |`;
     }),
     "",
-    "| system | full / partial / none | top-up calls mean | top-up calls median | top-up tokens mean | score mean | F1 | skipped invalid | errors |",
-    "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ...goldAnchorDifficultyLines(rowsByLabel.get("gold-control") ?? []),
+    "| system | phase-1 full / partial / none | final full / partial / none | top-up calls mean | top-up calls median | top-up tokens mean | score mean | F1 | skipped invalid | errors |",
+    "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
   ];
   for (const item of summaries) {
     const summary = item.summary;
-    lines.push(`| ${item.label} | ${summary.sufficiency.full} / ${summary.sufficiency.partial} / ${summary.sufficiency.none} | ${numberText(summary.topup_calls_mean)} | ${numberText(summary.topup_calls_median)} | ${numberText(summary.topup_tokens_mean, 0)} | ${numberText(summary.package_score_mean)} | ${numberText(item.f1)} | ${summary.skipped_invalid} | ${summary.errors} |`);
+    const phase1 = summarizePhase1Sufficiency(rowsByLabel.get(item.label) ?? []);
+    lines.push(`| ${item.label} | ${phase1.full} / ${phase1.partial} / ${phase1.none} | ${summary.sufficiency.full} / ${summary.sufficiency.partial} / ${summary.sufficiency.none} | ${numberText(summary.topup_calls_mean)} | ${numberText(summary.topup_calls_median)} | ${numberText(summary.topup_tokens_mean, 0)} | ${numberText(summary.package_score_mean)} | ${numberText(item.f1)} | ${summary.skipped_invalid} | ${summary.errors} |`);
   }
+  const rankingConclusion = ranked.length === 0
+    ? "## Ranking conclusion\nNo candidate package completed judging, so utility-versus-F1 ranking agreement is not assessable."
+    : `## Ranking conclusion\nUtility ranking (lower top-up is better): **${utilityRanking}**. F1 ranking (higher is better): **${f1Ranking}**. The rankings ${rankingAgrees ? "agree" : "diverge"}.`;
   lines.push(
     "",
-    `## Ranking conclusion\nUtility ranking (lower top-up is better): **${utilityRanking}**. F1 ranking (higher is better): **${f1Ranking}**. The rankings ${rankingAgrees ? "agree" : "diverge"}.`,
+    rankingConclusion,
     "",
     "## Two concrete divergence examples",
     ...examples.map((example) => `- ${example}`),
@@ -868,7 +957,61 @@ async function judgeCommand(args: ParsedArgs): Promise<void> {
     }
   }
 
-  const rows = await runJudgeTasks(tasks, settings, concurrency);
+  let projectedCost: ReturnType<typeof estimateJudgeCost> | undefined;
+  let reusedRows: JudgeVerdictRow[] = [];
+  let pendingTasks = tasks;
+  let persistRow: ((row: JudgeVerdictRow) => Promise<void>) | undefined;
+  if (phase === "full") {
+    await mkdir(outputDir, { recursive: true });
+    const priorByKey = new Map<string, JudgeVerdictRow>();
+    for (const row of await readFullJudgeProgress(outputDir, candidates)) priorByKey.set(judgeRowKey(row), row);
+    const expectedModel = settings.model ?? JUDGE_MODEL_DEFAULT;
+    const remaining: JudgeTask[] = [];
+    for (const task of tasks) {
+      const prior = priorByKey.get(judgeTaskKey(task));
+      if (
+        prior
+        && (prior.status === "completed" || prior.status === "skipped_invalid")
+        && prior.judge_model === expectedModel
+        && prior.judge_prompt_sha === prompt.sha
+      ) {
+        reusedRows.push(prior);
+      } else {
+        remaining.push(task);
+      }
+    }
+    pendingTasks = remaining;
+    const progressPath = join(outputDir, "full-progress.jsonl");
+    let progressWrite: Promise<void> = Promise.resolve();
+    persistRow = async (row) => {
+      progressWrite = progressWrite.then(() => appendFile(progressPath, `${JSON.stringify(row)}\n`, "utf8"));
+      await progressWrite;
+    };
+
+    const quota = Number(one(args, "quota-usd", "30"));
+    if (!Number.isFinite(quota) || quota <= 0) throw new Error("--quota-usd must be positive");
+    const inputRate = optionalRate(args, "input-usd-per-million");
+    const outputRate = optionalRate(args, "output-usd-per-million");
+    projectedCost = estimateJudgeCost(calibrationRows, tasks.length, inputRate, outputRate);
+    if (projectedCost.projected_usd === null && calibrationReport && calibrationReport.cost.projected_usd !== null) {
+      projectedCost = calibrationReport.cost;
+    }
+    if (projectedCost.projected_usd !== null && projectedCost.projected_usd > quota) {
+      throw new Error(`projected judge spend $${projectedCost.projected_usd.toFixed(2)} exceeds --quota-usd ${quota.toFixed(2)}; full matrix stopped`);
+    }
+    console.log(JSON.stringify({
+      lane: "judge",
+      phase,
+      event: "preflight",
+      projected_cost: projectedCost,
+      quota_usd: quota,
+      tasks: tasks.length,
+      reused_rows: reusedRows.length,
+      pending_tasks: pendingTasks.length,
+    }));
+  }
+
+  const rows = [...reusedRows, ...await runJudgeTasks(pendingTasks, settings, concurrency, persistRow)];
   const calibrationPath = join(outputDir, "calibration-verdicts.jsonl");
   if (phase === "calibration") {
     const gate = evaluateCalibrationGate(rows);
@@ -898,18 +1041,6 @@ async function judgeCommand(args: ParsedArgs): Promise<void> {
     console.log(JSON.stringify({ lane: "judge", phase, output: calibrationPath, gate, cost, prompt_sha: prompt.sha }));
     if (!gate.pass) process.exitCode = 1;
     return;
-  }
-
-  const quota = Number(one(args, "quota-usd", "30"));
-  if (!Number.isFinite(quota) || quota <= 0) throw new Error("--quota-usd must be positive");
-  const inputRate = optionalRate(args, "input-usd-per-million");
-  const outputRate = optionalRate(args, "output-usd-per-million");
-  const projectedCost = estimateJudgeCost([], jobs.length * (candidates.length + 1), inputRate, outputRate);
-  if (calibrationReport && calibrationReport.cost.projected_usd !== null && calibrationReport.cost.projected_usd > quota) {
-    throw new Error(`projected calibration-based judge spend $${calibrationReport.cost.projected_usd.toFixed(2)} exceeds --quota-usd ${quota.toFixed(2)}; full matrix stopped`);
-  }
-  if (projectedCost.projected_usd !== null && projectedCost.projected_usd > quota) {
-    throw new Error(`full-matrix judge spend $${projectedCost.projected_usd.toFixed(2)} exceeds --quota-usd ${quota.toFixed(2)}; full matrix stopped`);
   }
 
   const rowsByLabel = new Map<string, JudgeVerdictRow[]>();
