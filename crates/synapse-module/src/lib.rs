@@ -956,7 +956,27 @@ impl AliasPairParams {
 #[derive(Debug, Deserialize)]
 struct ProbeFixture {
     #[serde(default)]
+    comment: Option<String>,
+    #[serde(default)]
     generation_command: Option<String>,
+    #[serde(default)]
+    family: Option<String>,
+    #[serde(default)]
+    reference_model: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    dims: Option<usize>,
+    #[serde(default)]
+    pooling: Option<String>,
+    #[serde(default)]
+    normalize: Option<bool>,
+    #[serde(default)]
+    ort_version: Option<String>,
+    #[serde(default)]
+    model_sha256: Option<String>,
+    #[serde(default)]
+    tokenizer_sha256: Option<String>,
     items: Vec<ProbeFixtureItem>,
 }
 
@@ -1032,6 +1052,12 @@ struct ProbeLaneVectors {
 struct ProbeModelResult {
     lane_result: Value,
     certified_vectors: Option<Vec<Vec<f32>>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProbeReferenceKey {
+    family: String,
+    model: String,
 }
 
 struct LaneMeasurementRows {
@@ -5765,8 +5791,8 @@ async fn execute_probe_job(state: Arc<ModuleState>, job_id: String, model_filter
         return;
     }
 
-    let embed_fixture = match probe_fixture() {
-        Ok(fixture) => fixture,
+    let embed_fixtures = match probe_fixtures() {
+        Ok(fixtures) => fixtures,
         Err(error) => {
             fail_job_with_wire_error(&state, &job_id, false, error);
             return;
@@ -5858,7 +5884,7 @@ async fn execute_probe_job(state: Arc<ModuleState>, job_id: String, model_filter
     for model in selected_models {
         let probe_result = match model.task {
             ModelTask::Embed => {
-                execute_embed_probe_for_model(&state, Arc::clone(&model), &embed_fixture).await
+                execute_embed_probe_for_model(&state, Arc::clone(&model), &embed_fixtures).await
             }
             ModelTask::Rerank => {
                 execute_rerank_probe_for_model(&state, Arc::clone(&model), &rerank_fixture).await
@@ -6013,15 +6039,33 @@ async fn execute_probe_job(state: Arc<ModuleState>, job_id: String, model_filter
         "machine_profile": state.machine_profile,
         "current_knob": state.runtime.knob,
         "fixture": {
-            "items": embed_fixture.items.len(),
-            "first_id": embed_fixture.items.first().map(|item| item.id.clone()),
-            "generation_command": embed_fixture.generation_command,
+            "items": embed_fixtures.first().map_or(0, |fixture| fixture.items.len()),
+            "first_id": embed_fixtures
+                .first()
+                .and_then(|fixture| fixture.items.first())
+                .map(|item| item.id.clone()),
+            "generation_command": embed_fixtures
+                .first()
+                .and_then(|fixture| fixture.generation_command.clone()),
+            "sets": embed_fixtures
+                .iter()
+                .map(probe_fixture_provenance)
+                .collect::<Vec<_>>(),
         },
         "fixtures": {
             "embed": {
-                "items": embed_fixture.items.len(),
-                "first_id": embed_fixture.items.first().map(|item| item.id.clone()),
-                "generation_command": embed_fixture.generation_command,
+                "items": embed_fixtures.first().map_or(0, |fixture| fixture.items.len()),
+                "first_id": embed_fixtures
+                    .first()
+                    .and_then(|fixture| fixture.items.first())
+                    .map(|item| item.id.clone()),
+                "generation_command": embed_fixtures
+                    .first()
+                    .and_then(|fixture| fixture.generation_command.clone()),
+                "sets": embed_fixtures
+                    .iter()
+                    .map(probe_fixture_provenance)
+                    .collect::<Vec<_>>(),
             },
             "rerank": {
                 "items": rerank_fixture.items.len(),
@@ -6051,9 +6095,44 @@ async fn execute_probe_job(state: Arc<ModuleState>, job_id: String, model_filter
 async fn execute_embed_probe_for_model(
     state: &ModuleState,
     model: Arc<EmbeddingModel>,
-    fixture: &ProbeFixture,
+    fixtures: &[ProbeFixture],
 ) -> Result<ProbeModelResult, WireOperationError> {
-    let texts = fixture
+    let reference_key = probe_reference_key(&model);
+    let reference_candidates = fixtures
+        .iter()
+        .filter(|fixture| probe_fixture_matches_key(fixture, &reference_key))
+        .collect::<Vec<_>>();
+    let Some(text_fixture) = reference_candidates.first().copied() else {
+        let evidence = json!({
+            "task": "embed",
+            "gate": "reference_fixture",
+            "blocking_reason": "reference_fixture_missing",
+            "reference": {
+                "family": reference_key.family.clone(),
+                "model": reference_key.model.clone(),
+            },
+        });
+        store_probe_outcome_row(
+            state,
+            &model,
+            CertificationStatus::Uncertified,
+            evidence.clone(),
+        )?;
+        return Ok(ProbeModelResult {
+            lane_result: json!({
+                "model_id": model.model_id,
+                "task": "embed",
+                "fingerprint": model.fingerprint,
+                "numeric_profile_id": model.numeric_profile_id,
+                "status": "uncertified",
+                "blocking_reason": "reference_fixture_missing",
+                "evidence": evidence,
+                "performance": Value::Null,
+            }),
+            certified_vectors: None,
+        });
+    };
+    let texts = text_fixture
         .items
         .iter()
         .map(|item| item.text.as_str())
@@ -6090,6 +6169,53 @@ async fn execute_embed_probe_for_model(
                 certified_vectors: None,
             })
         }
+    };
+    let actual_dims = vectors.first().map(Vec::len);
+    let actual_item_count = vectors.len();
+    let vectors_have_one_dimension = vectors
+        .iter()
+        .all(|vector| Some(vector.len()) == actual_dims);
+    let fixture = reference_candidates.into_iter().find(|fixture| {
+        vectors_have_one_dimension
+            && actual_item_count == fixture.items.len()
+            && fixture_reference_dims(fixture) == actual_dims
+    });
+    let Some(fixture) = fixture else {
+        let evidence = json!({
+            "task": "embed",
+            "gate": "reference_fixture",
+            "blocking_reason": "reference_fixture_missing",
+            "reference": {
+                "family": reference_key.family.clone(),
+                "model": reference_key.model.clone(),
+                "available_dims": fixtures
+                    .iter()
+                    .filter(|fixture| probe_fixture_matches_key(fixture, &reference_key))
+                    .filter_map(fixture_reference_dims)
+                    .collect::<Vec<_>>(),
+            },
+            "actual_dims": actual_dims,
+            "actual_items": actual_item_count,
+        });
+        store_probe_outcome_row(
+            state,
+            &model,
+            CertificationStatus::Uncertified,
+            evidence.clone(),
+        )?;
+        return Ok(ProbeModelResult {
+            lane_result: json!({
+                "model_id": model.model_id,
+                "task": "embed",
+                "fingerprint": model.fingerprint,
+                "numeric_profile_id": model.numeric_profile_id,
+                "status": "uncertified",
+                "blocking_reason": "reference_fixture_missing",
+                "evidence": evidence,
+                "performance": Value::Null,
+            }),
+            certified_vectors: None,
+        });
     };
     let evidence = probe_evidence(&vectors, &fixture.items);
     let placement_share = ane_placement_share_for_model(&model)?;
@@ -6905,15 +7031,91 @@ fn probe_status_payload(state: &ModuleState, record: &JobRecord) -> Value {
     payload
 }
 
-fn probe_fixture() -> Result<ProbeFixture, WireOperationError> {
-    serde_json::from_str(include_str!("fixtures/probe_corpus_minilm_ort_fp32.json")).map_err(
-        |error| {
-            WireOperationError::from_stable(
-                StableError::artifact_invalid(),
-                format!("decode built-in probe fixture: {error}"),
-            )
-        },
-    )
+fn probe_fixtures() -> Result<Vec<ProbeFixture>, WireOperationError> {
+    let mut minilm: ProbeFixture = serde_json::from_str(include_str!(
+        "fixtures/probe_corpus_minilm_ort_fp32.json"
+    ))
+    .map_err(|error| {
+        WireOperationError::from_stable(
+            StableError::artifact_invalid(),
+            format!("decode built-in MiniLM probe fixture: {error}"),
+        )
+    })?;
+    // Keep the original MiniLM fixture bytes unchanged while assigning its
+    // reference identity at load time for family-safe fixture selection.
+    minilm.family = Some("minilm".to_string());
+    minilm.reference_model = Some("minilm".to_string());
+    minilm.dims = fixture_reference_dims(&minilm);
+
+    let gte: ProbeFixture = serde_json::from_str(include_str!(
+        "fixtures/probe_corpus_gte_modernbert_ort_fp32.json"
+    ))
+    .map_err(|error| {
+        WireOperationError::from_stable(
+            StableError::artifact_invalid(),
+            format!("decode built-in GTE ModernBERT probe fixture: {error}"),
+        )
+    })?;
+    Ok(vec![minilm, gte])
+}
+
+fn probe_reference_key(model: &EmbeddingModel) -> ProbeReferenceKey {
+    let model_id = model.model_id.to_ascii_lowercase();
+    let family = model
+        .engine_identity
+        .build_flags
+        .get("family")
+        .cloned()
+        .or_else(|| {
+            if model_id.contains("gte-modernbert") || model_id.contains("modernbert") {
+                Some("gte-modernbert".to_string())
+            } else if model_id.contains("minilm") {
+                Some("minilm".to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+    let reference_model = if model_id.contains("gte-modernbert-base") {
+        "gte-modernbert-base".to_string()
+    } else if model_id.contains("minilm") {
+        "minilm".to_string()
+    } else {
+        model.model_id.clone()
+    };
+    ProbeReferenceKey {
+        family,
+        model: reference_model,
+    }
+}
+
+fn probe_fixture_matches_key(fixture: &ProbeFixture, key: &ProbeReferenceKey) -> bool {
+    fixture.family.as_deref() == Some(key.family.as_str())
+        && fixture.reference_model.as_deref() == Some(key.model.as_str())
+}
+
+fn fixture_reference_dims(fixture: &ProbeFixture) -> Option<usize> {
+    fixture
+        .dims
+        .or_else(|| fixture.items.first().map(|item| item.vector.len()))
+}
+
+fn probe_fixture_provenance(fixture: &ProbeFixture) -> Value {
+    json!({
+        "comment": fixture.comment,
+        "family": fixture.family,
+        "reference_model": fixture.reference_model,
+        "model": fixture.model,
+        "dims": fixture_reference_dims(fixture),
+        "pooling": fixture.pooling,
+        "normalize": fixture.normalize,
+        "ort_version": fixture.ort_version,
+        "model_sha256": fixture.model_sha256,
+        "tokenizer_sha256": fixture.tokenizer_sha256,
+        "items": fixture.items.len(),
+        "first_id": fixture.items.first().map(|item| item.id.clone()),
+        "generation_command": fixture.generation_command,
+    })
 }
 
 fn rerank_probe_fixture() -> Result<RerankProbeFixture, WireOperationError> {
@@ -7218,6 +7420,7 @@ fn lane_blocking_reason(
             "fixture_unavailable" => "fixture_unavailable",
             "tokenization_failed" => "tokenization_failed",
             "generation_failed" => "generation_failed",
+            "reference_fixture_missing" => "reference_fixture_missing",
             _ => "probe_failed",
         });
     }
