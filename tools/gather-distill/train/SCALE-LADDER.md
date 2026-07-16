@@ -121,6 +121,7 @@ The 4B evaluation was already 34/40 jobs complete when the operator redirected r
 | Ornith-9B | zero-shot | 0.563 | 65.0% | Stock baseline at the 9B scale |
 | Qwen3.5-9B | LoRA | 0.615 | 87.5% | Controlled trained rung |
 | Qwen3.6-27B | zero-shot | 0.818 | 80.0% | Larger-model reference line |
+| DeepSeek v4 Flash, reasoning off | zero-shot | **0.862** | **97.5%** | Hosted reference; 18/40 natural, 22 budget-finalized, 0 reasoning tokens/trajectory |
 
 ### Scale-curve verdict
 
