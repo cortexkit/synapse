@@ -204,13 +204,20 @@ def model_content_digest(root: Path) -> str:
 
 
 def candidate_environment(target_dir: Path) -> List[str]:
-    return [
+    environment = [
         "/usr/bin/env",
         "HF_HUB_OFFLINE=1",
         "TRANSFORMERS_OFFLINE=1",
         "CARGO_NET_OFFLINE=true",
         f"CARGO_TARGET_DIR={target_dir}",
     ]
+    # The candidate runner starts commands with env -i. Forward the prewarmed
+    # Rust homes explicitly so the cargo shim can find the installed toolchain.
+    for name in ("RUSTUP_HOME", "CARGO_HOME"):
+        value = os.environ.get(name)
+        if value:
+            environment.append(f"{name}={value}")
+    return environment
 
 
 def configured_sibling_sources() -> List[Path]:
@@ -380,20 +387,67 @@ def read_runner_output(log_path: Path) -> str:
     return "\n".join(parts)
 
 
+def create_candidate_output_dirs(
+    temp_root: Path, runner: Path
+) -> Tuple[Path, Path, Path]:
+    output_root = temp_root / "candidate-output"
+    target_dir = output_root / "target"
+    package_cache = output_root / "packages"
+    mkdir_log = temp_root / "candidate-output-mkdir.log"
+    mkdir_status = run_through_runner(
+        runner,
+        ["/bin/mkdir", "-p", str(output_root), str(target_dir), str(package_cache)],
+        mkdir_log,
+    )
+    if mkdir_status != 0:
+        raise HarnessError(
+            f"could not create candidate output directories: runner exited {mkdir_status}"
+        )
+
+    # The runner may apply a restrictive umask. Make the controller-readable
+    # directories explicit while keeping their candidate ownership for writes.
+    chmod_log = temp_root / "candidate-output-chmod.log"
+    chmod_status = run_through_runner(
+        runner,
+        [
+            "/bin/chmod",
+            "755",
+            str(output_root),
+            str(target_dir),
+            str(package_cache),
+        ],
+        chmod_log,
+    )
+    if chmod_status != 0:
+        raise HarnessError(
+            f"could not make candidate output directories readable: "
+            f"runner exited {chmod_status}"
+        )
+    return output_root, target_dir, package_cache
+
+
 def preserve_failure_scene(
     temp_root: Path, result_path: Path, workspace: Path, runner: Path
 ) -> None:
     # The temp root is deleted on exit and the rig tears the campaign workspace
-    # down after a failure, so the staging logs are the only forensics that can
-    # survive. The results directory is the one location that persists across
-    # teardown; copy every staging log there together with the environment
-    # facts a post-mortem needs.
+    # down after a failure, so the staging and build logs are the only forensics
+    # that can survive. The results directory is the one location that persists
+    # across teardown; copy controller logs and candidate-output logs there
+    # together with the environment facts a post-mortem needs.
     try:
         scene_dir = result_path.parent / "failure-scene"
         scene_dir.mkdir(parents=True, exist_ok=True)
         for log in sorted(temp_root.glob("*.log*")):
             try:
                 shutil.copy2(log, scene_dir / log.name)
+            except OSError:
+                pass
+        candidate_output = temp_root / "candidate-output"
+        for log in sorted(candidate_output.glob("*.log*")):
+            try:
+                destination = scene_dir / "candidate-output" / log.name
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(log, destination)
             except OSError:
                 pass
         runner_digest = ""
@@ -633,12 +687,12 @@ def run_harness(workspace_arg: str, runner_arg: str, result_arg: str) -> int:
                 f"model snapshot digest mismatch: expected {expected_digest}, got {actual_digest}"
             )
 
-        output_root = temp_root / "candidate-output"
-        output_root.mkdir(mode=0o777)
-        target_dir = output_root / "target"
-        target_dir.mkdir(mode=0o777)
-        package_cache = output_root / "packages"
-        package_cache.mkdir(mode=0o777)
+        # The runner creates these directories so Cargo can write as the
+        # candidate identity. The controller only needs read/traverse access.
+        temp_root.chmod(0o777)
+        output_root, target_dir, package_cache = create_candidate_output_dirs(
+            temp_root, runner
+        )
         cargo = os.environ.get("SYNAPSE_CAMPAIGN_CARGO") or shutil.which("cargo")
         if not cargo:
             raise HarnessError("cargo is not available to build the candidate")
@@ -804,6 +858,7 @@ def run_harness(workspace_arg: str, runner_arg: str, result_arg: str) -> int:
             result_payload(gate_passed, hooks_passed, [], None, workspace_commit, note)
         )
         print(f"decode campaign candidate rejected: {error}", file=sys.stderr)
+        preserve_failure_scene(temp_root, result_path, workspace, runner)
         # The campaign gate reads only the exit code and the numeric sample
         # field; a zero exit here would surface as an invalid measurement
         # instead of a rejected proposal.
@@ -972,6 +1027,8 @@ def self_test() -> int:
         original_model_content_digest = model_content_digest
         previous_model = os.environ.get("SYNAPSE_CAMPAIGN_MODEL")
         previous_cargo = os.environ.get("SYNAPSE_CAMPAIGN_CARGO")
+        previous_rustup_home = os.environ.get("RUSTUP_HOME")
+        previous_cargo_home = os.environ.get("CARGO_HOME")
 
         def fake_run_through_runner(
             _runner: Path, argv: Sequence[str], log_path: Path
@@ -980,7 +1037,7 @@ def self_test() -> int:
             if list(argv) == ["/bin/sh", "-c", "echo runner-ok"]:
                 log_path.write_text("runner-ok\n")
                 return 0
-            if argv and argv[0] in {"/bin/cp", "/bin/mkdir", "/bin/rm"}:
+            if argv and argv[0] in {"/bin/cp", "/bin/chmod", "/bin/mkdir", "/bin/rm"}:
                 return original_run_through_runner(fake_runner, argv, log_path)
             if (
                 len(argv) >= 3
@@ -997,7 +1054,10 @@ def self_test() -> int:
                 return 1
             if "build" in argv:
                 fake_build_manifests.append(argv[argv.index("--manifest-path") + 1])
-                log_path.write_text("")
+                candidate_log = log_path.parent / "candidate-output" / "candidate-build.log"
+                candidate_log.write_text("candidate cargo diagnostics\n")
+                log_path.write_text("cargo build failed\n")
+                log_path.with_name(log_path.name + ".stderr").write_text("cargo stderr\n")
                 return 1
             raise AssertionError(f"unexpected self-test runner command: {argv}")
 
@@ -1006,6 +1066,8 @@ def self_test() -> int:
             run_through_runner = fake_run_through_runner
             os.environ["SYNAPSE_CAMPAIGN_MODEL"] = str(root / "fake-model")
             os.environ["SYNAPSE_CAMPAIGN_CARGO"] = "/bin/false"
+            os.environ["RUSTUP_HOME"] = str(root / "fake-rustup")
+            os.environ["CARGO_HOME"] = str(root / "fake-cargo")
             fake_result = root / "fake-result.json"
             assert (
                 run_harness(str(mini_workspace), str(fake_runner), str(fake_result))
@@ -1036,6 +1098,28 @@ def self_test() -> int:
                 for call in fake_runner_calls
             )
             assert any(
+                call[:2] == ("/bin/mkdir", "-p")
+                and len(call) == 5
+                and Path(call[2]).name == "candidate-output"
+                and Path(call[3]).name == "target"
+                and Path(call[4]).name == "packages"
+                for call in fake_runner_calls
+            )
+            assert any(
+                call[:2] == ("/bin/chmod", "755")
+                and len(call) == 5
+                and Path(call[2]).name == "candidate-output"
+                and Path(call[3]).name == "target"
+                and Path(call[4]).name == "packages"
+                for call in fake_runner_calls
+            )
+            assert any(
+                "RUSTUP_HOME=" + str(root / "fake-rustup") in call
+                and "CARGO_HOME=" + str(root / "fake-cargo") in call
+                and "build" in call
+                for call in fake_runner_calls
+            )
+            assert any(
                 len(call) >= 3
                 and call[:2] == ("/bin/sh", "-c")
                 and call[2].startswith("test -d ")
@@ -1046,6 +1130,12 @@ def self_test() -> int:
                 and Path(call[2]).name == "build"
                 for call in fake_runner_calls
             )
+            failure_scene = fake_result.parent / "failure-scene"
+            assert (failure_scene / "build.log").read_text() == "cargo build failed\n"
+            assert (failure_scene / "build.log.stderr").read_text() == "cargo stderr\n"
+            assert (
+                failure_scene / "candidate-output" / "candidate-build.log"
+            ).read_text() == "candidate cargo diagnostics\n"
             assert "Sibling HEADs: subconscious=non-git, commons=non-git." in fake_result.read_text()
         finally:
             model_content_digest = original_model_content_digest
@@ -1058,6 +1148,14 @@ def self_test() -> int:
                 os.environ.pop("SYNAPSE_CAMPAIGN_CARGO", None)
             else:
                 os.environ["SYNAPSE_CAMPAIGN_CARGO"] = previous_cargo
+            if previous_rustup_home is None:
+                os.environ.pop("RUSTUP_HOME", None)
+            else:
+                os.environ["RUSTUP_HOME"] = previous_rustup_home
+            if previous_cargo_home is None:
+                os.environ.pop("CARGO_HOME", None)
+            else:
+                os.environ["CARGO_HOME"] = previous_cargo_home
 
         _, _, _, references = extract_and_verify_fixtures(root / "fixtures")
         expected = references[0]
