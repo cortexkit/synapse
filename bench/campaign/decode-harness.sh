@@ -204,13 +204,20 @@ def model_content_digest(root: Path) -> str:
 
 
 def candidate_environment(target_dir: Path) -> List[str]:
-    return [
+    environment = [
         "/usr/bin/env",
         "HF_HUB_OFFLINE=1",
         "TRANSFORMERS_OFFLINE=1",
         "CARGO_NET_OFFLINE=true",
         f"CARGO_TARGET_DIR={target_dir}",
     ]
+    # The candidate runner starts commands with env -i. Forward the prewarmed
+    # Rust homes explicitly so the cargo shim can find the installed toolchain.
+    for name in ("RUSTUP_HOME", "CARGO_HOME"):
+        value = os.environ.get(name)
+        if value:
+            environment.append(f"{name}={value}")
+    return environment
 
 
 def configured_sibling_sources() -> List[Path]:
@@ -1020,6 +1027,8 @@ def self_test() -> int:
         original_model_content_digest = model_content_digest
         previous_model = os.environ.get("SYNAPSE_CAMPAIGN_MODEL")
         previous_cargo = os.environ.get("SYNAPSE_CAMPAIGN_CARGO")
+        previous_rustup_home = os.environ.get("RUSTUP_HOME")
+        previous_cargo_home = os.environ.get("CARGO_HOME")
 
         def fake_run_through_runner(
             _runner: Path, argv: Sequence[str], log_path: Path
@@ -1057,6 +1066,8 @@ def self_test() -> int:
             run_through_runner = fake_run_through_runner
             os.environ["SYNAPSE_CAMPAIGN_MODEL"] = str(root / "fake-model")
             os.environ["SYNAPSE_CAMPAIGN_CARGO"] = "/bin/false"
+            os.environ["RUSTUP_HOME"] = str(root / "fake-rustup")
+            os.environ["CARGO_HOME"] = str(root / "fake-cargo")
             fake_result = root / "fake-result.json"
             assert (
                 run_harness(str(mini_workspace), str(fake_runner), str(fake_result))
@@ -1103,6 +1114,12 @@ def self_test() -> int:
                 for call in fake_runner_calls
             )
             assert any(
+                "RUSTUP_HOME=" + str(root / "fake-rustup") in call
+                and "CARGO_HOME=" + str(root / "fake-cargo") in call
+                and "build" in call
+                for call in fake_runner_calls
+            )
+            assert any(
                 len(call) >= 3
                 and call[:2] == ("/bin/sh", "-c")
                 and call[2].startswith("test -d ")
@@ -1131,6 +1148,14 @@ def self_test() -> int:
                 os.environ.pop("SYNAPSE_CAMPAIGN_CARGO", None)
             else:
                 os.environ["SYNAPSE_CAMPAIGN_CARGO"] = previous_cargo
+            if previous_rustup_home is None:
+                os.environ.pop("RUSTUP_HOME", None)
+            else:
+                os.environ["RUSTUP_HOME"] = previous_rustup_home
+            if previous_cargo_home is None:
+                os.environ.pop("CARGO_HOME", None)
+            else:
+                os.environ["CARGO_HOME"] = previous_cargo_home
 
         _, _, _, references = extract_and_verify_fixtures(root / "fixtures")
         expected = references[0]
