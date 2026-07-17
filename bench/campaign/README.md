@@ -52,8 +52,11 @@ oracle input.
 The controller performs these stages in order:
 
 1. Build `spike-unified-rt` in release mode through the runner with
-   `cargo build --locked --offline`. A controller-created `CARGO_TARGET_DIR`
-   prevents reuse of a candidate-supplied binary.
+   `cargo build --locked --offline`. The runner creates the temporary output,
+   target, and package-cache directories as the candidate identity; the harness
+   sets them to mode `0755` so Cargo can write while the controller can read the
+   resulting binary. A controller-selected `CARGO_TARGET_DIR` prevents reuse of
+   a candidate-supplied binary.
 2. Run all 20 prompts against the embedded references. The controller compares
    every token itself; a near-tie exemption, missing row, early stop, malformed
    output, or any token mismatch is a hard failure.
