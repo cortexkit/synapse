@@ -242,6 +242,26 @@ def remove_copy_destination(destination: Path) -> None:
         shutil.rmtree(destination)
 
 
+def verify_copy_destination(
+    runner: Path, destination: Path, log_path: Path
+) -> None:
+    verification_status = run_through_runner(
+        runner,
+        [
+            "/bin/sh",
+            "-c",
+            f"test -d {destination} && ls {destination} | head -1",
+        ],
+        log_path,
+    )
+    try:
+        verification_output = log_path.read_text(errors="replace")
+    except OSError:
+        verification_output = ""
+    if verification_status != 0 or not verification_output.strip():
+        raise HarnessError(f"copy reported success but destination is empty: {destination}")
+
+
 def copy_candidate_tree(
     runner: Path, source: Path, destination: Path, log_path: Path
 ) -> None:
@@ -252,6 +272,7 @@ def copy_candidate_tree(
         log_path,
     )
     if clone_status == 0:
+        verify_copy_destination(runner, destination, log_path)
         return
 
     if destination.exists() or destination.is_symlink():
@@ -279,12 +300,14 @@ def copy_candidate_tree(
             except OSError:
                 pass
         raise HarnessError(f"could not stage candidate source {source}: {detail}")
+    verify_copy_destination(runner, destination, log_path)
 
 
 def stage_candidate_sources(
     workspace: Path, temp_root: Path, runner: Path
 ) -> Tuple[Path, List[Tuple[str, Path]]]:
     temp_root.mkdir(parents=True, exist_ok=True)
+    temp_root.chmod(0o777)
     probe_log = temp_root / "runner-probe.log"
     probe_status = run_through_runner(
         runner, ["/bin/sh", "-c", "echo runner-ok"], probe_log
@@ -304,8 +327,16 @@ def stage_candidate_sources(
 
     sources = configured_sibling_sources()
     build_root = temp_root / "build"
-    build_root.mkdir(parents=True, mode=0o777)
-    build_root.chmod(0o777)
+    build_status = run_through_runner(
+        runner,
+        ["/bin/mkdir", "-p", str(build_root)],
+        temp_root / "build-mkdir.log",
+    )
+    if build_status != 0:
+        raise HarnessError(
+            f"could not create candidate staging directory {build_root}: "
+            f"runner exited {build_status}"
+        )
     staged_workspace = build_root / "workspace"
     copy_candidate_tree(runner, workspace, staged_workspace, temp_root / "workspace-copy.log")
 
@@ -331,6 +362,24 @@ def run_through_runner(
             check=False,
         )
     return completed.returncode
+
+
+def cleanup_staging_tree(temp_root: Path, runner: Path) -> None:
+    cleanup_log = temp_root / "staging-cleanup.log"
+    try:
+        cleanup_status = run_through_runner(
+            runner,
+            ["/bin/rm", "-rf", str(temp_root / "build")],
+            cleanup_log,
+        )
+    except OSError as error:
+        print(f"warning: candidate staging cleanup could not run: {error}", file=sys.stderr)
+        return
+    if cleanup_status != 0:
+        print(
+            f"warning: candidate staging cleanup exited with status {cleanup_status}",
+            file=sys.stderr,
+        )
 
 
 def runner_stdout(runner: Path, argv: Sequence[str], log_path: Path, limit: int = 4096) -> str:
@@ -709,6 +758,7 @@ def run_harness(workspace_arg: str, runner_arg: str, result_arg: str) -> int:
         print(f"decode campaign harness refused to run: {error}", file=sys.stderr)
         return 1
     finally:
+        cleanup_staging_tree(temp_root, runner)
         shutil.rmtree(temp_root, ignore_errors=True)
         writer.close()
 
@@ -805,6 +855,56 @@ def self_test() -> int:
             ("/bin/cp", "-cR", str(sibling_sources[1].resolve()), str(root / "with-siblings/build/commons")),
         }
         assert expected_copy_commands.issubset(set(initial_runner_records))
+        assert ("/bin/mkdir", "-p", str(root / "with-siblings/build")) in initial_runner_records
+        expected_verification_commands = {
+            (
+                "/bin/sh",
+                "-c",
+                f"test -d {destination} && ls {destination} | head -1",
+            )
+            for destination in (
+                root / "with-siblings/build/workspace",
+                root / "with-siblings/build/subconscious",
+                root / "with-siblings/build/commons",
+            )
+        }
+        assert expected_verification_commands.issubset(set(initial_runner_records))
+
+        empty_copy_records: List[Tuple[str, ...]] = []
+
+        def empty_copy_runner(
+            _runner: Path, argv: Sequence[str], log_path: Path
+        ) -> int:
+            empty_copy_records.append(tuple(argv))
+            if list(argv) == ["/bin/sh", "-c", "echo runner-ok"]:
+                log_path.write_text("runner-ok\n")
+                return 0
+            if argv and argv[0] in {"/bin/mkdir", "/bin/cp"}:
+                log_path.write_text("")
+                return 0
+            if (
+                len(argv) >= 3
+                and list(argv[:2]) == ["/bin/sh", "-c"]
+                and argv[2].startswith("test -d ")
+            ):
+                log_path.write_text("")
+                return 0
+            raise AssertionError(f"unexpected empty-copy runner command: {argv}")
+
+        run_through_runner = empty_copy_runner
+        try:
+            stage_candidate_sources(mini_workspace, root / "empty-copy", fake_runner)
+        except HarnessError as error:
+            assert "copy reported success but destination is empty" in str(error)
+        else:
+            raise AssertionError("expected an empty successful copy to fail verification")
+        assert ("/bin/mkdir", "-p", str(root / "empty-copy/build")) in empty_copy_records
+        assert any(
+            len(call) >= 3
+            and call[:2] == ("/bin/sh", "-c")
+            and call[2].startswith("test -d ")
+            for call in empty_copy_records
+        )
         run_through_runner = original_run_through_runner
 
         fake_build_manifests: List[str] = []
@@ -821,7 +921,13 @@ def self_test() -> int:
             if list(argv) == ["/bin/sh", "-c", "echo runner-ok"]:
                 log_path.write_text("runner-ok\n")
                 return 0
-            if argv and argv[0] == "/bin/cp":
+            if argv and argv[0] in {"/bin/cp", "/bin/mkdir", "/bin/rm"}:
+                return original_run_through_runner(fake_runner, argv, log_path)
+            if (
+                len(argv) >= 3
+                and list(argv[:2]) == ["/bin/sh", "-c"]
+                and argv[2].startswith("test -d ")
+            ):
                 return original_run_through_runner(fake_runner, argv, log_path)
             if "rev-parse" in argv:
                 checkout = Path(argv[argv.index("-C") + 1])
@@ -863,6 +969,22 @@ def self_test() -> int:
             assert any(
                 call[:3] == ("/bin/cp", "-cR", str(sibling_sources[1].resolve()))
                 and Path(call[3]).name == "commons"
+                for call in fake_runner_calls
+            )
+            assert any(
+                call[:2] == ("/bin/mkdir", "-p")
+                and Path(call[2]).name == "build"
+                for call in fake_runner_calls
+            )
+            assert any(
+                len(call) >= 3
+                and call[:2] == ("/bin/sh", "-c")
+                and call[2].startswith("test -d ")
+                for call in fake_runner_calls
+            )
+            assert any(
+                call[:2] == ("/bin/rm", "-rf")
+                and Path(call[2]).name == "build"
                 for call in fake_runner_calls
             )
             assert "Sibling HEADs: subconscious=non-git, commons=non-git." in fake_result.read_text()
