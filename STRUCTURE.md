@@ -7,6 +7,7 @@
 ├── .alfonso/               # Alfonso AI spikes and planning artifacts
 ├── .cortexkit/             # Prompts, configurations, and historian logs
 ├── bench/                  # Main benchmarking workspace containing harness and lanes
+│   ├── campaign/           # Verification harness and campaign fixtures for decode models
 │   ├── data/               # Evaluation prompt datasets and corpus targets
 │   ├── eval-coir/          # CoIR retrieval evaluation harness and tools
 │   ├── harness/            # Core benchmark metrics and telemetry runner library
@@ -28,6 +29,7 @@
 │   ├── synapse-engine-ort/ # In-process ONNX Runtime inference engine
 │   ├── synapse-engine-owned/ # Primary owned Metal MPSGraph engine (macOS)
 │   ├── synapse-module/     # Main SubC module host, job queue, and worker manager
+│   ├── synapse-opctl/      # CLI operator control surface driving SubC commands
 │   ├── synapse-worker-ane/ # Apple Neural Engine supervised worker (Swift/CoreML)
 │   ├── synapse-worker-llama/ # llama.cpp supervised worker (GGUF)
 │   └── synapse-worker-mlx/ # Apple Silicon MLX supervised worker
@@ -71,6 +73,12 @@
 - Contains: SQLite store initialization, SubC `ModuleHandler` implementation, UNIX socket / Windows pipe worker spawning, and the remote gateway client.
 - Key files: `crates/synapse-module/src/lib.rs`, `crates/synapse-module/src/worker_host/mod.rs`, `crates/synapse-module/src/remote/gateway.rs`
 
+**crates/synapse-opctl/:**
+- Purpose: Command-line operator control surface driving SubC commands.
+- Contains: Commands to query model statuses, run/inspect certification probes, monitor scheduler stats, submit batches, and fetch job pages.
+- Key files: `crates/synapse-opctl/src/main.rs`
+
+
 **crates/synapse-worker-*/:**
 - Purpose: Specialized out-of-process inference engines built for specific hardware (ANE, MLX, llama.cpp).
 - Contains: Binaries that speak the `worker_protocol` over a local socket.
@@ -81,6 +89,12 @@
 - Purpose: Contains all performance evaluation execution infrastructure.
 - Contains: Shell scripts, configuration folders, and cargo workspace members.
 - Key files: `bench/run-matrix.sh`, `bench/NOTES.md`
+
+**bench/campaign/:**
+- Purpose: Verification harness and campaign fixtures for decode models.
+- Contains: Locked sandboxed campaign controller script, prompt/reference fixtures, and signature validation checks.
+- Key files: `bench/campaign/decode-harness.sh`, `bench/campaign/README.md`
+
 
 **bench/harness/:**
 - Purpose: Acts as the core telemetry library and dataset builder.
@@ -123,7 +137,7 @@
 
 **tools/gather-distill/:**
 - Purpose: Standalone external harness for generating QA datasets and collecting model tool-use trajectories.
-- Contains: Bun workspaces, Anthropic/OpenAI API adapters, AFT child process pools, validation scripts, and scoring modules.
+- Contains: Bun workspaces, Anthropic/OpenAI API adapters (supporting OpenAI OAuth transports), AFT child process pools, validation scripts, scoring modules, and utility judge matrix evaluation engines.
 - Key files: `tools/gather-distill/src/cli.ts`, `tools/gather-distill/README.md`, `tools/gather-distill/BAKEOFF-ZEROSHOT.md`
 
 ## Key File Locations
@@ -131,8 +145,12 @@
 **Entry Points:**
 - `crates/synapse-module/src/main.rs`: The main production SubC module entry point.
 - `crates/synapse-worker-*/src/main.rs`: Executables for hardware-specific supervised workers.
+- `crates/synapse-opctl/src/main.rs`: Operator command line control surface (`ck-synapse-opctl`).
+- `crates/synapse-module/src/bin/subc_call.rs`: Management surface call utility.
+- `crates/synapse-module/src/bin/inline_embed_throughput.rs`: Batch throughput execution client.
 - `bench/harness/src/main.rs`: CLI runner for corpus generation, power wrapper execution, and parity check.
 - `bench/lanes/*/src/main.rs` (Rust), `bench/lanes/mlx-minilm/main.py` (Python), `bench/lanes/ts-embed/main.mjs` (JS), `bench/lanes/potion/main.py` (Python): Main executables for each specific runtime lane.
+- `bench/campaign/decode-harness.sh`: Campaign controller script.
 - `bench/eval-coir/prepare.py`: Downloads and structures datasets for retrieval tasks.
 - `bench/eval-coir/score.py`: Computes retrieval quality metrics on generated vectors.
 - `bench/run-matrix.sh`: Global benchmark suite runner.
@@ -162,6 +180,8 @@
 - `tools/gather-distill/src/gather.ts`: Work queue execution loop driving model tool interactions.
 - `tools/gather-distill/src/validate.ts`: Citation verification, SHA-checking, and path bounds checker.
 - `tools/gather-distill/src/scorer.ts`: Offline gold-standard Jaccard and file F1 overlap quality scorer.
+- `tools/gather-distill/src/judge.ts`: OpenAI OAuth validation and judge scoring loop.
+- `bench/spikes/unified-rt/src/json_constraint.rs`: Constrained JSON schema grammar state machine and token mask generator.
 - `bench/spikes/unified-rt/src/lfm2.rs`: LFM2 model family, short-convolution, and full-attention mixer logic.
 - `bench/spikes/unified-rt/src/lfm2_audio.rs`: Mel-spectrogram DSP frontend, FastConformer speech encoder, and audio projector.
 - `bench/spikes/unified-rt/src/lfm2_decode.rs`: Causal decoding logic for LFM2 hybrid backbone models.

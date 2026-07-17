@@ -12,6 +12,7 @@
 - **Self-Contained Execution Lanes (Bench Harness):** Separate binaries or runtime environments for each target evaluate hardware backends before promoting them to production workers.
 - **Numerical Parity Auditing (Bench Harness):** Quantify accuracy drift across acceleration targets by calculating the mean cosine similarity of generated embeddings against a CPU-based `ort` (ONNX Runtime) reference lane.
 - **Retrieval Quality and Reranking Parity Auditing:** Assess retrieval quality using offline evaluation datasets (COSQA, CodeSearchNet-Python) from the CoIR suite. Reranking workloads compare candidate scores against reference Alibaba-NLP/gte-reranker-modernbert-base scores to evaluate score drift and rank stability.
+- **Native Constrained Decoding (Spike):** Restrict causal generation sequences to a schema/grammar (e.g. JSON or JSON Schema) using a vocabulary-specific bitset mask on logits, ensuring token-by-token structural compliance before token commitment.
 
 ## Layers
 
@@ -95,18 +96,49 @@
 - Depends on: Bun, pinned `aft-v0.46.0` binary, and `@cortexkit/anthropic-auth-core`.
 - Used by: Developers running qgen, gather, validate, or score campaigns.
 
+**Synapse Operator CLI (`synapse-opctl`):**
+- Purpose: Drive Synapse operations (models catalog, probe runs, scheduling, batch embedding, and jobs paging) through the fleet subc daemon connection.
+- Location: `crates/synapse-opctl`
+- Contains: CLI command parsing and formatting logic for operator management.
+- Depends on: `subc-client-rs`, `clap`, `serde_json`, `tokio`.
+- Used by: Operators and deployment scripts monitoring or triggering runtime actions.
+
+**Management Call Utility (`subc-call`):**
+- Purpose: Send raw method calls and JSON params to any module over the fleet daemon.
+- Location: `crates/synapse-module/src/bin/subc_call.rs`
+- Contains: Direct IPC client call wrapping and formatted envelope printing.
+- Depends on: `subc-client-rs`, `tokio`, `serde_json`.
+- Used by: Developers and scripts executing low-level management surface functions.
+
+**Decode Campaign Harness:**
+- Purpose: Execute and coordinate the sandboxed Athena V3 single-stream decode campaign.
+- Location: `bench/campaign`
+- Contains: Integrity validation of model snapshots, fixtures, and target runners, plus deterministic verification of intervention hooks.
+- Depends on: `spike-unified-rt` runner.
+- Used by: Automated evaluation gates to confirm decode performance and correctness.
+
+
 ## Data Flow
 
 **Production Inference Flow:**
 
 1. Initialize layered configuration from `SYNAPSE_CONFIG_PATH` (`synapse.jsonc`), rejecting unknown fields and applying `microllm` ceilings — `crates/synapse-module/src/remote/config.rs`
 2. Route request received via SubC — `crates/synapse-module/src/lib.rs`
-3. Validate alias surfaces, apply machine capability profiles (Perf/Quiet tiers), or map user-tier `remote_providers` profiles — `crates/synapse-module/src/store.rs`
-4. Admit job to the DB (checking active attempt ID CAS, request-digest idempotency) — `crates/synapse-module/src/store.rs`
+3. Validate alias surfaces, apply machine capability profiles (Perf/Quiet tiers), verify microLLM certifications (refusing execution on uncertified fingerprints), or map user-tier `remote_providers` profiles — `crates/synapse-module/src/store.rs`
+4. Admit job to the DB (checking active attempt ID CAS, request-digest idempotency, and page counts of existing results to resume from checkpoints) — `crates/synapse-module/src/store.rs`
 5. Dispatch based on route:
    - **Local:** Download/Verify models through content-addressed cache (shared leases), admit to 3-class Aging Scheduler, spawn/handshake Worker lane (UNIX sockets / Windows pipes), submit binary frames.
    - **Remote:** Forward through `ProviderRuntime` pools, passing circuit breakers and p90 estimators, fetching credentials via vault trait, executing strict loopback-validated HTTP calls — `crates/synapse-module/src/remote/runtime.rs`
-6. Commit checkpointed pages as the job runs (allowing page-while-running for snapshots and continuity hooks), mark job complete (applying execution/retention TTL split), and return envelope — `crates/synapse-module/src/store.rs`
+6. Commit checkpointed pages sequentially according to byte size limits (`result_page_bytes`) as the job runs (allowing page-while-running for snapshots and continuity hooks), mark job complete (applying execution/retention TTL split), and return envelope. If the client queries a job, they can follow pages via `page` parameters — `crates/synapse-module/src/store.rs`
+
+**Constrained Decoding Flow:**
+
+1. Extract logit values for the next token from the causal decode execution.
+2. Query the constraint state machine (such as the JSON schema `JsonParser`) to determine valid byte sequences.
+3. Compute the vocabulary-wide bitset `TokenMask` by matching allowed byte sequences against the token vocabulary trie.
+4. Apply the `TokenMask` to the logits (forcing unallowed token logits to negative infinity).
+5. Select the next token from the masked logits, notify the pre-commit tap hooks, advance the constraint parser state, and commit the token.
+
 
 **Corpus Generation Flow (Bench):**
 
@@ -232,6 +264,22 @@
 - Location: `bench/spikes/unified-rt/src/vulkan_backend.rs`
 - Pattern: Isolated memory placement.
 
+**DecodeConstraint / JsonParser:**
+- Purpose: Enforce grammars and JSON Schema specifications during causal decoding.
+- Location: `bench/spikes/unified-rt/src/json_constraint.rs`
+- Pattern: Incremental state-based byte recognizer returning cached token bitsets (`TokenMask`).
+
+**Admission Semaphore:**
+- Purpose: Guard inline execution pools, tracking waiters and recording percentile wait statistics.
+- Location: `crates/synapse-module/src/lib.rs`
+- Pattern: Concurrency Semaphore with observable stats wrapper.
+
+**Certification Status and Demotion:**
+- Purpose: Track local hardware engine capability status, storing whether a measured fingerprint is `certified` or `uncertified`.
+- Location: `crates/synapse-module/src/store.rs`
+- Pattern: SQLite-backed schema with automatic demotion upon failed re-certification.
+
+
 ## Entry Points
 
 **Synapse Module Main (`ck-synapse`):**
@@ -283,6 +331,27 @@
 - Location: `tools/gather-distill/src/cli.ts`
 - Triggers: Invocation of Bun running the CLI commands.
 - Responsibilities: Routes commands to qgen (question generation with optional `--avoid-from` to avoid duplicating question lists), gather (trajectory collection), validate (trajectory inspection), and score (gold-overlap performance comparison and zero-shot bake-off evaluation).
+
+**Synapse Operator CLI (`synapse-opctl`):**
+- Location: `crates/synapse-opctl/src/main.rs`
+- Triggers: Execution of the `ck-synapse-opctl` binary.
+- Responsibilities: Routes commands to list models, view scheduler stats, start probes, run batches, and fetch paged job results.
+
+**Management Surface SubC Caller (`subc-call`):**
+- Location: `crates/synapse-module/src/bin/subc_call.rs`
+- Triggers: Execution of the `subc_call` binary.
+- Responsibilities: Connects to fleet daemon and sends management calls directly to target modules.
+
+**Inline Embedding Throughput Client (`inline_embed_throughput`):**
+- Location: `crates/synapse-module/src/bin/inline_embed_throughput.rs`
+- Triggers: Execution of `inline_embed_throughput` binary.
+- Responsibilities: Evaluates local batch throughput and query concurrency/latencies under load.
+
+**Athena V3 Decode Campaign Harness:**
+- Location: `bench/campaign/decode-harness.sh`
+- Triggers: Invocation of `decode-harness.sh` by an evaluation runner.
+- Responsibilities: Manages snapshot validation, locked execution sandbox, correctness verification, and performance evaluation.
+
 
 ## Error Handling
 
