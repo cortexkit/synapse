@@ -268,13 +268,40 @@ def copy_candidate_tree(
             detail = ""
         if len(detail) > 4096:
             detail = detail[-4096:]
-        detail = detail or "copy command failed"
+        if not detail:
+            detail = (
+                f"runner exited {fallback_status} with no output; its preamble exits "
+                "silently when the action deadline is already expired or argv is malformed"
+            )
+            try:
+                with log_path.open("a") as log:
+                    log.write(detail + "\n")
+            except OSError:
+                pass
         raise HarnessError(f"could not stage candidate source {source}: {detail}")
 
 
 def stage_candidate_sources(
     workspace: Path, temp_root: Path, runner: Path
 ) -> Tuple[Path, List[Tuple[str, Path]]]:
+    temp_root.mkdir(parents=True, exist_ok=True)
+    probe_log = temp_root / "runner-probe.log"
+    probe_status = run_through_runner(
+        runner, ["/bin/sh", "-c", "echo runner-ok"], probe_log
+    )
+    try:
+        probe_output = probe_log.read_text(errors="replace")
+    except OSError as error:
+        probe_output = f"<unable to read runner output: {error}>"
+    if len(probe_output) > 4096:
+        probe_output = probe_output[-4096:]
+    if probe_status != 0 or probe_output.strip() != "runner-ok":
+        display_output = probe_output.strip() or "<empty>"
+        raise HarnessError(
+            f"candidate runner probe failed with status {probe_status}; "
+            f"output: {display_output}"
+        )
+
     sources = configured_sibling_sources()
     build_root = temp_root / "build"
     build_root.mkdir(parents=True, mode=0o777)
@@ -712,17 +739,45 @@ def self_test() -> int:
         mini_manifest = mini_workspace / "bench/spikes/unified-rt/Cargo.toml"
         mini_manifest.parent.mkdir(parents=True)
         mini_manifest.write_text("[package]\\nname = \\\"self-test\\\"\\n")
-        fake_runner = root / "fake-runner"
-        fake_runner_log = root / "fake-runner-argv.log"
-        fake_runner.write_text(
-            "#!/bin/sh\n"
-            "set -eu\n"
-            "{ printf '%s\n' \"$@\"; printf '%s\n' '--END-ARGV--'; } >> \"$FAKE_RUNNER_LOG\"\n"
-            "exec \"$@\"\n"
-        )
-        fake_runner.chmod(0o755)
-        previous_runner_log = os.environ.get("FAKE_RUNNER_LOG")
-        os.environ["FAKE_RUNNER_LOG"] = str(fake_runner_log)
+        # Use a pass-through binary for successful runner calls; Python's local macOS
+        # runtime does not reliably reap temporary shell-script runners.
+        fake_runner = Path("/usr/bin/env")
+        silent_runner = Path("/usr/bin/false")
+        try:
+            copy_candidate_tree(
+                silent_runner,
+                mini_workspace,
+                root / "silent-copy",
+                root / "silent-copy.log",
+            )
+        except HarnessError as error:
+            message = str(error)
+            assert "runner exited 1 with no output" in message
+            assert (
+                "preamble exits silently when the action deadline is already expired "
+                "or argv is malformed"
+            ) in message
+        else:
+            raise AssertionError("expected empty runner log to produce a HarnessError")
+        try:
+            stage_candidate_sources(mini_workspace, root / "probe-failure", silent_runner)
+        except HarnessError as error:
+            message = str(error)
+            assert "candidate runner probe failed with status 1" in message
+            assert "output: <empty>" in message
+        else:
+            raise AssertionError("expected a silent runner probe to fail")
+
+        original_run_through_runner = run_through_runner
+        initial_runner_records: List[Tuple[str, ...]] = []
+
+        def record_initial_runner(
+            _runner: Path, argv: Sequence[str], log_path: Path
+        ) -> int:
+            initial_runner_records.append(tuple(argv))
+            return original_run_through_runner(fake_runner, argv, log_path)
+
+        run_through_runner = record_initial_runner
         os.environ.pop("SYNAPSE_CAMPAIGN_SIBLINGS", None)
         expect_harness_error(
             lambda: stage_candidate_sources(mini_workspace, root / "without-siblings", fake_runner)
@@ -744,17 +799,13 @@ def self_test() -> int:
         assert (staged_workspace / "bench/spikes/unified-rt/Cargo.toml").is_file()
         assert [name for name, _ in staged_siblings] == ["subconscious", "commons"]
         assert all((path / "marker.txt").read_text() == name for name, path in staged_siblings)
-        runner_records = [
-            tuple(line for line in block.splitlines() if line)
-            for block in fake_runner_log.read_text().split("--END-ARGV--\n")
-            if block.strip()
-        ]
         expected_copy_commands = {
             ("/bin/cp", "-cR", str(mini_workspace), str(root / "with-siblings/build/workspace")),
             ("/bin/cp", "-cR", str(sibling_sources[0].resolve()), str(root / "with-siblings/build/subconscious")),
             ("/bin/cp", "-cR", str(sibling_sources[1].resolve()), str(root / "with-siblings/build/commons")),
         }
-        assert expected_copy_commands.issubset(set(runner_records))
+        assert expected_copy_commands.issubset(set(initial_runner_records))
+        run_through_runner = original_run_through_runner
 
         fake_build_manifests: List[str] = []
         fake_runner_calls: List[Tuple[str, ...]] = []
@@ -767,6 +818,9 @@ def self_test() -> int:
             _runner: Path, argv: Sequence[str], log_path: Path
         ) -> int:
             fake_runner_calls.append(tuple(argv))
+            if list(argv) == ["/bin/sh", "-c", "echo runner-ok"]:
+                log_path.write_text("runner-ok\n")
+                return 0
             if argv and argv[0] == "/bin/cp":
                 return original_run_through_runner(fake_runner, argv, log_path)
             if "rev-parse" in argv:
@@ -823,10 +877,6 @@ def self_test() -> int:
                 os.environ.pop("SYNAPSE_CAMPAIGN_CARGO", None)
             else:
                 os.environ["SYNAPSE_CAMPAIGN_CARGO"] = previous_cargo
-            if previous_runner_log is None:
-                os.environ.pop("FAKE_RUNNER_LOG", None)
-            else:
-                os.environ["FAKE_RUNNER_LOG"] = previous_runner_log
 
         _, _, _, references = extract_and_verify_fixtures(root / "fixtures")
         expected = references[0]
