@@ -245,6 +245,10 @@ def remove_copy_destination(destination: Path) -> None:
 def verify_copy_destination(
     runner: Path, destination: Path, log_path: Path
 ) -> None:
+    # A dedicated log keeps the verification read clean: the copy log is opened
+    # in append mode, so reusing it here would let a prior attempt's error text
+    # satisfy the nonzero-output requirement.
+    verification_log = log_path.with_name(log_path.name + ".verify")
     verification_status = run_through_runner(
         runner,
         [
@@ -252,12 +256,9 @@ def verify_copy_destination(
             "-c",
             f"test -d {destination} && ls {destination} | head -1",
         ],
-        log_path,
+        verification_log,
     )
-    try:
-        verification_output = log_path.read_text(errors="replace")
-    except OSError:
-        verification_output = ""
+    verification_output = read_runner_output(verification_log)
     if verification_status != 0 or not verification_output.strip():
         raise HarnessError(f"copy reported success but destination is empty: {destination}")
 
@@ -283,10 +284,7 @@ def copy_candidate_tree(
         log_path,
     )
     if fallback_status != 0:
-        try:
-            detail = log_path.read_text(errors="replace").strip()
-        except OSError:
-            detail = ""
+        detail = read_runner_output(log_path)
         if len(detail) > 4096:
             detail = detail[-4096:]
         if not detail:
@@ -353,15 +351,33 @@ def run_through_runner(
     argv: Sequence[str],
     log_path: Path,
 ) -> int:
-    with log_path.open("wb") as log:
+    # Streams are captured separately so a mute stdout cannot hide a named
+    # stderr line (or the reverse), and both files are opened in append mode so
+    # a retry through the same log path preserves the first attempt's output
+    # instead of truncating the evidence.
+    stderr_path = log_path.with_name(log_path.name + ".stderr")
+    with log_path.open("ab") as log, stderr_path.open("ab") as errors:
         completed = subprocess.run(
             [str(runner), *argv],
             stdin=subprocess.DEVNULL,
             stdout=log,
-            stderr=subprocess.STDOUT,
+            stderr=errors,
             check=False,
         )
     return completed.returncode
+
+
+def read_runner_output(log_path: Path) -> str:
+    # Merge both captured streams for callers that report or parse output.
+    parts = []
+    for path in (log_path, log_path.with_name(log_path.name + ".stderr")):
+        try:
+            text = path.read_text(errors="replace").strip()
+        except OSError:
+            continue
+        if text:
+            parts.append(text)
+    return "\n".join(parts)
 
 
 def preserve_failure_scene(
@@ -375,7 +391,7 @@ def preserve_failure_scene(
     try:
         scene_dir = result_path.parent / "failure-scene"
         scene_dir.mkdir(parents=True, exist_ok=True)
-        for log in sorted(temp_root.glob("*.log")):
+        for log in sorted(temp_root.glob("*.log*")):
             try:
                 shutil.copy2(log, scene_dir / log.name)
             except OSError:
