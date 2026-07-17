@@ -242,45 +242,50 @@ def remove_copy_destination(destination: Path) -> None:
         shutil.rmtree(destination)
 
 
-def copy_candidate_tree(source: Path, destination: Path) -> None:
-    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
-    clone = subprocess.run(
+def copy_candidate_tree(
+    runner: Path, source: Path, destination: Path, log_path: Path
+) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o777)
+    clone_status = run_through_runner(
+        runner,
         ["/bin/cp", "-cR", str(source), str(destination)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-        text=True,
+        log_path,
     )
-    if clone.returncode == 0:
+    if clone_status == 0:
         return
 
     if destination.exists() or destination.is_symlink():
         remove_copy_destination(destination)
-    fallback = subprocess.run(
+    fallback_status = run_through_runner(
+        runner,
         ["/bin/cp", "-R", str(source), str(destination)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-        text=True,
+        log_path,
     )
-    if fallback.returncode != 0:
-        detail = fallback.stderr.strip() or clone.stderr.strip() or "copy command failed"
+    if fallback_status != 0:
+        try:
+            detail = log_path.read_text(errors="replace").strip()
+        except OSError:
+            detail = ""
+        if len(detail) > 4096:
+            detail = detail[-4096:]
+        detail = detail or "copy command failed"
         raise HarnessError(f"could not stage candidate source {source}: {detail}")
 
 
 def stage_candidate_sources(
-    workspace: Path, temp_root: Path
+    workspace: Path, temp_root: Path, runner: Path
 ) -> Tuple[Path, List[Tuple[str, Path]]]:
     sources = configured_sibling_sources()
     build_root = temp_root / "build"
-    build_root.mkdir(parents=True, mode=0o755)
+    build_root.mkdir(parents=True, mode=0o777)
+    build_root.chmod(0o777)
     staged_workspace = build_root / "workspace"
-    copy_candidate_tree(workspace, staged_workspace)
+    copy_candidate_tree(runner, workspace, staged_workspace, temp_root / "workspace-copy.log")
 
     staged_siblings: List[Tuple[str, Path]] = []
     for source in sources:
         destination = build_root / source.name
-        copy_candidate_tree(source, destination)
+        copy_candidate_tree(runner, source, destination, temp_root / f"{source.name}-copy.log")
         staged_siblings.append((source.name, destination))
     return staged_workspace, staged_siblings
 
@@ -504,7 +509,7 @@ def run_harness(workspace_arg: str, runner_arg: str, result_arg: str) -> int:
         if not cargo:
             raise HarnessError("cargo is not available to build the candidate")
 
-        staged_workspace, staged_siblings = stage_candidate_sources(workspace, temp_root)
+        staged_workspace, staged_siblings = stage_candidate_sources(workspace, temp_root, runner)
         sibling_heads = [
             (
                 name,
@@ -707,8 +712,20 @@ def self_test() -> int:
         mini_manifest = mini_workspace / "bench/spikes/unified-rt/Cargo.toml"
         mini_manifest.parent.mkdir(parents=True)
         mini_manifest.write_text("[package]\\nname = \\\"self-test\\\"\\n")
+        fake_runner = root / "fake-runner"
+        fake_runner_log = root / "fake-runner-argv.log"
+        fake_runner.write_text(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            "{ printf '%s\n' \"$@\"; printf '%s\n' '--END-ARGV--'; } >> \"$FAKE_RUNNER_LOG\"\n"
+            "exec \"$@\"\n"
+        )
+        fake_runner.chmod(0o755)
+        previous_runner_log = os.environ.get("FAKE_RUNNER_LOG")
+        os.environ["FAKE_RUNNER_LOG"] = str(fake_runner_log)
+        os.environ.pop("SYNAPSE_CAMPAIGN_SIBLINGS", None)
         expect_harness_error(
-            lambda: stage_candidate_sources(mini_workspace, root / "without-siblings")
+            lambda: stage_candidate_sources(mini_workspace, root / "without-siblings", fake_runner)
         )
 
         sibling_sources = []
@@ -721,17 +738,26 @@ def self_test() -> int:
             str(source) for source in sibling_sources
         )
         staged_workspace, staged_siblings = stage_candidate_sources(
-            mini_workspace, root / "with-siblings"
+            mini_workspace, root / "with-siblings", fake_runner
         )
         assert staged_workspace == root / "with-siblings/build/workspace"
         assert (staged_workspace / "bench/spikes/unified-rt/Cargo.toml").is_file()
         assert [name for name, _ in staged_siblings] == ["subconscious", "commons"]
         assert all((path / "marker.txt").read_text() == name for name, path in staged_siblings)
+        runner_records = [
+            tuple(line for line in block.splitlines() if line)
+            for block in fake_runner_log.read_text().split("--END-ARGV--\n")
+            if block.strip()
+        ]
+        expected_copy_commands = {
+            ("/bin/cp", "-cR", str(mini_workspace), str(root / "with-siblings/build/workspace")),
+            ("/bin/cp", "-cR", str(sibling_sources[0].resolve()), str(root / "with-siblings/build/subconscious")),
+            ("/bin/cp", "-cR", str(sibling_sources[1].resolve()), str(root / "with-siblings/build/commons")),
+        }
+        assert expected_copy_commands.issubset(set(runner_records))
 
-        fake_runner = root / "fake-runner"
-        fake_runner.write_text("#!/bin/sh\\nexit 0\\n")
-        fake_runner.chmod(0o755)
         fake_build_manifests: List[str] = []
+        fake_runner_calls: List[Tuple[str, ...]] = []
         original_run_through_runner = run_through_runner
         original_model_content_digest = model_content_digest
         previous_model = os.environ.get("SYNAPSE_CAMPAIGN_MODEL")
@@ -740,6 +766,9 @@ def self_test() -> int:
         def fake_run_through_runner(
             _runner: Path, argv: Sequence[str], log_path: Path
         ) -> int:
+            fake_runner_calls.append(tuple(argv))
+            if argv and argv[0] == "/bin/cp":
+                return original_run_through_runner(fake_runner, argv, log_path)
             if "rev-parse" in argv:
                 checkout = Path(argv[argv.index("-C") + 1])
                 if "/build/workspace" in checkout.as_posix():
@@ -767,6 +796,21 @@ def self_test() -> int:
             assert fake_build_manifests[0].endswith(
                 "/build/workspace/bench/spikes/unified-rt/Cargo.toml"
             )
+            assert any(
+                call[:3] == ("/bin/cp", "-cR", str(mini_workspace.resolve()))
+                and Path(call[3]).name == "workspace"
+                for call in fake_runner_calls
+            )
+            assert any(
+                call[:3] == ("/bin/cp", "-cR", str(sibling_sources[0].resolve()))
+                and Path(call[3]).name == "subconscious"
+                for call in fake_runner_calls
+            )
+            assert any(
+                call[:3] == ("/bin/cp", "-cR", str(sibling_sources[1].resolve()))
+                and Path(call[3]).name == "commons"
+                for call in fake_runner_calls
+            )
             assert "Sibling HEADs: subconscious=non-git, commons=non-git." in fake_result.read_text()
         finally:
             model_content_digest = original_model_content_digest
@@ -779,6 +823,10 @@ def self_test() -> int:
                 os.environ.pop("SYNAPSE_CAMPAIGN_CARGO", None)
             else:
                 os.environ["SYNAPSE_CAMPAIGN_CARGO"] = previous_cargo
+            if previous_runner_log is None:
+                os.environ.pop("FAKE_RUNNER_LOG", None)
+            else:
+                os.environ["FAKE_RUNNER_LOG"] = previous_runner_log
 
         _, _, _, references = extract_and_verify_fixtures(root / "fixtures")
         expected = references[0]
