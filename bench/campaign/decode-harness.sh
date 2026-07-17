@@ -364,6 +364,48 @@ def run_through_runner(
     return completed.returncode
 
 
+def preserve_failure_scene(
+    temp_root: Path, result_path: Path, workspace: Path, runner: Path
+) -> None:
+    # The temp root is deleted on exit and the rig tears the campaign workspace
+    # down after a failure, so the staging logs are the only forensics that can
+    # survive. The results directory is the one location that persists across
+    # teardown; copy every staging log there together with the environment
+    # facts a post-mortem needs.
+    try:
+        scene_dir = result_path.parent / "failure-scene"
+        scene_dir.mkdir(parents=True, exist_ok=True)
+        for log in sorted(temp_root.glob("*.log")):
+            try:
+                shutil.copy2(log, scene_dir / log.name)
+            except OSError:
+                pass
+        runner_digest = ""
+        try:
+            runner_digest = hashlib.sha256(runner.read_bytes()).hexdigest()
+        except OSError:
+            pass
+        listing: Dict[str, Any] = {
+            "workspace": str(workspace),
+            "workspace_exists": workspace.is_dir(),
+            "runner": str(runner),
+            "runner_sha256": runner_digest,
+            "euid": os.geteuid(),
+            "cwd": os.getcwd(),
+            "env_deadline_ms": os.environ.get("ALFONSO_CANDIDATE_DEADLINE_MS", ""),
+        }
+        try:
+            listing["workspace_stat"] = repr(os.stat(workspace))
+            listing["workspace_entries"] = sorted(
+                entry.name for entry in workspace.iterdir()
+            )[:20]
+        except OSError as error:
+            listing["workspace_stat_error"] = str(error)
+        (scene_dir / "scene.json").write_text(json.dumps(listing, indent=1))
+    except OSError:
+        pass
+
+
 def cleanup_staging_tree(temp_root: Path, runner: Path) -> None:
     cleanup_log = temp_root / "staging-cleanup.log"
     try:
@@ -756,6 +798,7 @@ def run_harness(workspace_arg: str, runner_arg: str, result_arg: str) -> int:
             result_payload(gate_passed, hooks_passed, [], None, workspace_commit, note)
         )
         print(f"decode campaign harness refused to run: {error}", file=sys.stderr)
+        preserve_failure_scene(temp_root, result_path, workspace, runner)
         return 1
     finally:
         cleanup_staging_tree(temp_root, runner)
