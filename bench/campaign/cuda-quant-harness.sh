@@ -20,8 +20,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 BASELINE_TOK_S = 343.8
-QUALITY_BASELINE_EXACT = 13
-QUALITY_BASELINE_MEDIAN_DEPTH = 54.5
+# Frozen Qwen3-0.6B Q8_0 quality profile from QUANT-DECODE.md; the 13/20 and
+# 54.5 profile belongs to the separate LFM2-1.2B row.
+QUALITY_BASELINE_EXACT = 10
+QUALITY_BASELINE_MEDIAN_DEPTH = 59.0
 EXPECTED_MODEL_DIGEST = "0d7d1359007f579fba9f6eceef44c87b947362da893cc565d27656284e4d6f86"
 MODEL_REVISION = "c1899de289a04d12100db370d81485cdf75e47ca"
 DEFAULT_MODEL = (
@@ -841,7 +843,7 @@ def decode_command(
         str(output),
     ]
     if references is not None:
-        command[8:8] = ["--decode-reference", str(references)]
+        command[9:9] = ["--decode-reference", str(references)]
     if schema is not None:
         command.extend(["--decode-json-schema", str(schema)])
     return command
@@ -1402,6 +1404,16 @@ def self_test() -> int:
         _, _, _, references = extract_and_verify_fixtures(root / "fixtures")
         _, constrained_schema, constrained_prompts = extract_constrained_fixtures(root / "constrained-fixtures")
         assert len(constrained_prompts) == 15
+        reference_command = decode_command(
+            Path("/bin/true"),
+            root / "model",
+            root / "prompts.jsonl",
+            root / "references.jsonl",
+            root / "packages",
+            root / "output.json",
+        )
+        assert reference_command[reference_command.index("--max-new-tokens") + 1] == str(MAX_NEW_TOKENS)
+        assert reference_command[reference_command.index("--decode-reference") + 1] == str(root / "references.jsonl")
         assert json.loads(constrained_schema.read_text())["required"] == ["result", "score"]
         expected = references[0]
         wall = 1.6
