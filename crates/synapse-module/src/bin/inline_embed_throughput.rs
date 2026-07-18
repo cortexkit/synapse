@@ -16,7 +16,7 @@ const DEFAULT_SUBC: &str = "/Users/[owner]/.local/share/cortexkit/run/subc-conne
 const DEFAULT_MODEL: &str = "gte-modernbert-base-f16";
 const DEFAULT_BATCHES: &[usize] = &[8, 16, 32, 64, 128, 256];
 const QUERY_SAMPLES: usize = 50;
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[tokio::main]
 async fn main() -> Result<()> {
