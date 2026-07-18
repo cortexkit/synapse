@@ -184,3 +184,41 @@ were destroyed after their container images stalled during startup; their
 combined charge was about $0.10. The measurement rental cost about $0.30, for
 approximately **$0.40 total spend**, well below the $25 cap. All three
 `owned-quant-decode` instances were destroyed after evidence capture.
+
+
+## Campaign baseline: CUDA Q8_0 single-stream decode
+
+The second campaign targets the owned Qwen3-0.6B Q8_0 CUDA decode path on an RTX
+4090. The frozen throughput baseline is **343.8 tok/s** for one stream and 64
+new tokens (`217.8 GB/s` effective weight bandwidth); llama.cpp's `521.4 tok/s`
+comparison is a competitor reference, not an acceptance gate. The rented rig must
+be an RTX 4090 with reliability above `0.99` and driver `>=570`.
+
+`bench/campaign/cuda-quant-harness.sh` is a self-contained controller. It embeds
+and hashes the raw-completion fixtures (`decode-prompts.jsonl` SHA-256
+`6f1ee1ce17fbc3ca34ebc316bc93d44db7c8840a6d4a05906b13bc0ef8901e60` and
+`reference-tokens.jsonl` SHA-256
+`b2d11f2aaf92cdce0fc906dc7ef0468308bce43bf5661b490f336cc1215b1ee9`) plus the
+15-prompt constrained-JSON fixture (`56fee1844e5a8991c28b81e46018c42a0e811dc07233538048b32df9b11e5ed3`) and schema (`7b691bb9ce46f8ab3fcce415ba9d28129924fa8bd1a0b4d5475895eff7837394`).
+Candidate staging, build, tests, and decode processes all go through ALF's copied
+candidate runner; the result writer is controller-owned and reclaim-safe.
+
+The quality gate is quantization-aware rather than token-exact: every prompt's
+reported `match_depth` is recomputed against the pinned fp32 oracle. The frozen
+campaign floor is at least `13/20` exact prompts and median match depth at least
+`54.5`; near-tie exemptions are not accepted. The constrained fixture must also
+produce `15/15` schema-valid `{result: "allow"|"deny", score: number}` objects.
+The hook gate runs `cargo test -p spike-unified-rt` with the CUDA feature. Only
+after both gates pass does the harness start `N=12` fresh single-stream processes
+with varied prompts and report median `decode_tok_per_s` in the same result JSON
+schema as the Metal campaign (`gate_passed`, `hooks_passed`, `median_tok_s`,
+`samples`, `workspace_commit`, and `baseline_note`).
+
+The rented-box preflight records `nvidia-smi` driver, P-state, SM clock, power,
+and compute-process state in `scene.json` and in `baseline_note`; a foreign GPU
+compute process rejects the run. Battery checks are not applicable. The
+provisioning script additionally installs the candidate scheduler denials and
+fenced sudo verbs for identity drops, process reaping, candidate-only
+iptables/ip6tables egress denial, and ownership repair. It leaves the rig alive
+for the overnight campaign and does not edit `campaign-lab.jsonc` or start
+Athena.
