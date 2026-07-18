@@ -17,6 +17,13 @@
 #include <utility>
 #include <vector>
 
+extern "C" {
+typedef struct SynapseCudaWeight {
+    const float *fp32;
+    const uint8_t *q8_0;
+} SynapseCudaWeight;
+}
+
 namespace synapse_cuda_family {
 
 inline void cuda_check(cudaError_t status, const char *call, const char *file, int line) {
@@ -71,6 +78,112 @@ struct DeviceAllocation {
         count = 0;
     }
 };
+
+inline __device__ float warp_sum(float value);
+
+constexpr int Q8_0_BLOCK_ELEMENTS = 32;
+constexpr int Q8_0_BLOCK_BYTES = 34;
+
+struct DeviceMatrix {
+    DeviceAllocation<float> fp32;
+    DeviceAllocation<uint8_t> q8_0;
+    bool quantized = false;
+};
+
+static __global__ void dequantize_q8_0(
+    const uint8_t *weights,
+    float *output,
+    size_t elements
+) {
+    size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= elements) return;
+    size_t block_index = index / Q8_0_BLOCK_ELEMENTS;
+    int lane = index % Q8_0_BLOCK_ELEMENTS;
+    const uint8_t *block = weights + block_index * Q8_0_BLOCK_BYTES;
+    half scale = *reinterpret_cast<const half *>(block);
+    int8_t quantized = reinterpret_cast<const int8_t *>(block + sizeof(half))[lane];
+    output[index] = __half2float(scale) * static_cast<float>(quantized);
+}
+
+static __global__ void q8_0_matvec(
+    const uint8_t *weights,
+    const float *input,
+    float *output,
+    int rows,
+    int columns
+) {
+    int row = blockIdx.x;
+    if (row >= rows) return;
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int warps = blockDim.x >> 5;
+    int blocks_per_row = columns / Q8_0_BLOCK_ELEMENTS;
+    float partial = 0.0f;
+    for (int column_block = warp; column_block < blocks_per_row; column_block += warps) {
+        const uint8_t *block = weights
+            + (static_cast<size_t>(row) * blocks_per_row + column_block) * Q8_0_BLOCK_BYTES;
+        half scale = *reinterpret_cast<const half *>(block);
+        int8_t quantized = reinterpret_cast<const int8_t *>(block + sizeof(half))[lane];
+        partial += __half2float(scale) * static_cast<float>(quantized)
+            * input[column_block * Q8_0_BLOCK_ELEMENTS + lane];
+    }
+    partial = warp_sum(partial);
+    __shared__ float warp_sums[32];
+    if (lane == 0) warp_sums[warp] = partial;
+    __syncthreads();
+    if (warp == 0) {
+        float sum = lane < warps ? warp_sums[lane] : 0.0f;
+        sum = warp_sum(sum);
+        if (lane == 0) output[row] = sum;
+    }
+}
+
+inline void copy_matrix(DeviceMatrix &target, const SynapseCudaWeight &source, size_t elements) {
+    if (!source.fp32) throw std::runtime_error("CUDA matrix is missing its fp32 source");
+    target.quantized = source.q8_0 != nullptr;
+    target.fp32.allocate(elements);
+    if (target.quantized) {
+        if (elements % Q8_0_BLOCK_ELEMENTS != 0) {
+            throw std::runtime_error("Q8_0 CUDA matrix element count is not block aligned");
+        }
+        size_t bytes = elements / Q8_0_BLOCK_ELEMENTS * Q8_0_BLOCK_BYTES;
+        target.q8_0.allocate(bytes);
+        FAMILY_CUDA_CHECK(cudaMemcpy(
+            target.q8_0.pointer,
+            source.q8_0,
+            bytes,
+            cudaMemcpyHostToDevice
+        ));
+        int threads = 256;
+        dequantize_q8_0<<<(elements + threads - 1) / threads, threads>>>(
+            target.q8_0.pointer,
+            target.fp32.pointer,
+            elements
+        );
+        FAMILY_CUDA_CHECK(cudaGetLastError());
+    } else {
+        FAMILY_CUDA_CHECK(cudaMemcpy(
+            target.fp32.pointer,
+            source.fp32,
+            elements * sizeof(float),
+            cudaMemcpyHostToDevice
+        ));
+    }
+}
+
+inline void launch_decode_matvec(
+    const DeviceMatrix &weight,
+    const float *input,
+    float *output,
+    int rows,
+    int columns,
+    cudaStream_t stream
+) {
+    if (!weight.quantized) {
+        throw std::runtime_error("fused decode matvec was requested for an fp32 matrix");
+    }
+    q8_0_matvec<<<rows, 256, 0, stream>>>(weight.q8_0.pointer, input, output, rows, columns);
+}
 
 inline std::vector<half> to_half(const float *values, size_t count) {
     std::vector<half> converted(count);

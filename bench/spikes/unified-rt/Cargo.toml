@@ -26,6 +26,7 @@ faer = { version = "=0.22.6", default-features = false, features = ["std", "rayo
 rayon = "1.10"
 rustfft = "6.2"
 hound = "3.5"
+sha2 = { workspace = true }
 ash = { version = "0.38", optional = true }
 
 [build-dependencies]

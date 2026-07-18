@@ -5,7 +5,7 @@ mod enabled {
 
     use anyhow::{bail, ensure, Result};
 
-    use super::super::{encode_f16_bits, EncoderLayer, Precision};
+    use super::super::{encode_f16_bits, quant::CudaWeight, EncoderLayer, Precision};
 
     #[repr(C)]
     struct SynapseCudaEncoderLayerParams {
@@ -61,18 +61,18 @@ mod enabled {
         pub mixer_type: i32,
         pub operator_norm: *const f32,
         pub ffn_norm: *const f32,
-        pub conv_in_weight: *const f32,
+        pub conv_in_weight: CudaWeight,
         pub conv_weight: *const f32,
-        pub conv_out_weight: *const f32,
-        pub q_weight: *const f32,
+        pub conv_out_weight: CudaWeight,
+        pub q_weight: CudaWeight,
         pub q_norm: *const f32,
-        pub k_weight: *const f32,
+        pub k_weight: CudaWeight,
         pub k_norm: *const f32,
-        pub v_weight: *const f32,
-        pub attention_out_weight: *const f32,
-        pub w1_weight: *const f32,
-        pub w2_weight: *const f32,
-        pub w3_weight: *const f32,
+        pub v_weight: CudaWeight,
+        pub attention_out_weight: CudaWeight,
+        pub w1_weight: CudaWeight,
+        pub w2_weight: CudaWeight,
+        pub w3_weight: CudaWeight,
     }
 
     pub fn ensure_available() -> Result<()> {
@@ -355,7 +355,7 @@ mod enabled {
             rope_theta: f32,
             layers: &[Lfm2LayerParams],
             final_norm: &[f32],
-            lm_head: &[f32],
+            lm_head: CudaWeight,
         ) -> Result<()> {
             ensure!(
                 hidden_states.len() == seq * hidden,
@@ -383,7 +383,7 @@ mod enabled {
                     attention_mask.as_ptr(),
                     layers.as_ptr(),
                     final_norm.as_ptr(),
-                    lm_head.as_ptr(),
+                    &lm_head,
                     hidden_states.as_mut_ptr(),
                 )
             };
@@ -407,7 +407,7 @@ mod enabled {
             rope_theta: f32,
             layers: &[Lfm2LayerParams],
             final_norm: &[f32],
-            lm_head: &[f32],
+            lm_head: CudaWeight,
         ) -> Result<Vec<f32>> {
             ensure!(
                 embeddings.len() == seq * hidden,
@@ -432,7 +432,7 @@ mod enabled {
                     embeddings.as_ptr(),
                     layers.as_ptr(),
                     final_norm.as_ptr(),
-                    lm_head.as_ptr(),
+                    &lm_head,
                     logits.as_mut_ptr(),
                 )
             };
@@ -457,7 +457,7 @@ mod enabled {
             rope_theta: f32,
             layers: &[Lfm2LayerParams],
             final_norm: &[f32],
-            lm_head: &[f32],
+            lm_head: CudaWeight,
         ) -> Result<(Vec<f32>, Vec<f32>)> {
             ensure!(
                 embedding.len() == hidden,
@@ -483,7 +483,7 @@ mod enabled {
                     embedding.as_ptr(),
                     layers.as_ptr(),
                     final_norm.as_ptr(),
-                    lm_head.as_ptr(),
+                    &lm_head,
                     output.as_mut_ptr(),
                     logits.as_mut_ptr(),
                 )
@@ -654,7 +654,7 @@ mod enabled {
             mask: *const u8,
             layers: *const Lfm2LayerParams,
             final_norm: *const f32,
-            lm_head: *const f32,
+            lm_head: *const CudaWeight,
             output: *mut f32,
         ) -> i32;
         fn synapse_cuda_lfm2_prefill(
@@ -674,7 +674,7 @@ mod enabled {
             input: *const f32,
             layers: *const Lfm2LayerParams,
             final_norm: *const f32,
-            lm_head: *const f32,
+            lm_head: *const CudaWeight,
             logits: *mut f32,
         ) -> i32;
         fn synapse_cuda_lfm2_decode(
@@ -694,7 +694,7 @@ mod enabled {
             embedding: *const f32,
             layers: *const Lfm2LayerParams,
             final_norm: *const f32,
-            lm_head: *const f32,
+            lm_head: *const CudaWeight,
             output_hidden: *mut f32,
             logits: *mut f32,
         ) -> i32;
@@ -720,7 +720,7 @@ mod enabled {
 mod enabled {
     use anyhow::{bail, Result};
 
-    use super::super::{EncoderLayer, Precision};
+    use super::super::{quant::CudaWeight, EncoderLayer, Precision};
 
     #[allow(dead_code)]
     pub struct ModernBertLayerParams {
@@ -753,18 +753,18 @@ mod enabled {
         pub mixer_type: i32,
         pub operator_norm: *const f32,
         pub ffn_norm: *const f32,
-        pub conv_in_weight: *const f32,
+        pub conv_in_weight: CudaWeight,
         pub conv_weight: *const f32,
-        pub conv_out_weight: *const f32,
-        pub q_weight: *const f32,
+        pub conv_out_weight: CudaWeight,
+        pub q_weight: CudaWeight,
         pub q_norm: *const f32,
-        pub k_weight: *const f32,
+        pub k_weight: CudaWeight,
         pub k_norm: *const f32,
-        pub v_weight: *const f32,
-        pub attention_out_weight: *const f32,
-        pub w1_weight: *const f32,
-        pub w2_weight: *const f32,
-        pub w3_weight: *const f32,
+        pub v_weight: CudaWeight,
+        pub attention_out_weight: CudaWeight,
+        pub w1_weight: CudaWeight,
+        pub w2_weight: CudaWeight,
+        pub w3_weight: CudaWeight,
     }
 
     pub fn ensure_available() -> Result<()> {
@@ -868,7 +868,7 @@ mod enabled {
             _rope_theta: f32,
             _layers: &[Lfm2LayerParams],
             _final_norm: &[f32],
-            _lm_head: &[f32],
+            _lm_head: CudaWeight,
         ) -> Result<()> {
             bail!("CUDA provider requires Linux and cargo feature `cuda`")
         }
@@ -890,7 +890,7 @@ mod enabled {
             _rope_theta: f32,
             _layers: &[Lfm2LayerParams],
             _final_norm: &[f32],
-            _lm_head: &[f32],
+            _lm_head: CudaWeight,
         ) -> Result<Vec<f32>> {
             bail!("CUDA provider requires Linux and cargo feature `cuda`")
         }
@@ -912,7 +912,7 @@ mod enabled {
             _rope_theta: f32,
             _layers: &[Lfm2LayerParams],
             _final_norm: &[f32],
-            _lm_head: &[f32],
+            _lm_head: CudaWeight,
         ) -> Result<(Vec<f32>, Vec<f32>)> {
             bail!("CUDA provider requires Linux and cargo feature `cuda`")
         }
