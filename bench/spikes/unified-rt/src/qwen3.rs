@@ -12,9 +12,10 @@ use serde::Deserialize;
 use tokenizers::Tokenizer;
 
 use super::{
-    get_tensor, load_safetensor_map, normalize_l2, resolve_model_root, BLayout, BatchShape,
-    BlockBackend, BlockForwardRequest, KernelProvider, MetalExecutionConfig, ModelFamily,
-    Precision, Tensor,
+    get_tensor, load_safetensor_map, normalize_l2,
+    quant::{quantized_sha256, Q8_0Tensor, WeightQuantization},
+    resolve_model_root, BLayout, BatchShape, BlockBackend, BlockForwardRequest, KernelProvider,
+    MetalExecutionConfig, ModelFamily, Precision, Tensor,
 };
 
 #[derive(Debug, Deserialize)]
@@ -53,6 +54,8 @@ pub(crate) struct Model {
     pub(crate) layers: Vec<Layer>,
     pub(crate) final_norm: RmsNorm,
     pub(crate) lm_head: Option<Weight>,
+    pub(crate) tied_lm_head_q8_0: Option<Q8_0Tensor>,
+    pub(crate) weight_quantization: WeightQuantization,
 }
 
 pub(crate) struct Layer {
@@ -71,6 +74,7 @@ pub(crate) struct Layer {
 
 pub(crate) struct Weight {
     pub(crate) tensor: Tensor,
+    pub(crate) q8_0: Option<Q8_0Tensor>,
 }
 
 pub(crate) struct RmsNorm {
@@ -78,8 +82,37 @@ pub(crate) struct RmsNorm {
     pub(crate) eps: f32,
 }
 
+fn layer_weights(layer: &Layer) -> [&Weight; 7] {
+    [
+        &layer.q_proj,
+        &layer.k_proj,
+        &layer.v_proj,
+        &layer.o_proj,
+        &layer.gate_proj,
+        &layer.up_proj,
+        &layer.down_proj,
+    ]
+}
+
+fn active_weight_bytes(weight: &Weight) -> usize {
+    weight
+        .q8_0
+        .as_ref()
+        .map_or(weight.tensor.data.len() * 4, |quantized| {
+            quantized.as_bytes().len()
+        })
+}
+
 impl Model {
     pub(crate) fn load(path: &Path, precision: super::Precision) -> Result<Self> {
+        Self::load_with_quant(path, precision, WeightQuantization::None)
+    }
+
+    pub(crate) fn load_with_quant(
+        path: &Path,
+        precision: super::Precision,
+        weight_quantization: WeightQuantization,
+    ) -> Result<Self> {
         let root = resolve_model_root(path)?;
         let config_path = root.join("config.json");
         let config: Config = serde_json::from_str(
@@ -122,23 +155,51 @@ impl Model {
                     &format!("{prefix}.post_attention_layernorm"),
                     config.rms_norm_eps,
                 )?,
-                q_proj: load_weight(&tensors, &format!("{prefix}.self_attn.q_proj"))?,
+                q_proj: load_weight(
+                    &tensors,
+                    &format!("{prefix}.self_attn.q_proj"),
+                    weight_quantization,
+                )?,
                 q_norm: load_norm(
                     &tensors,
                     &format!("{prefix}.self_attn.q_norm"),
                     config.rms_norm_eps,
                 )?,
-                k_proj: load_weight(&tensors, &format!("{prefix}.self_attn.k_proj"))?,
+                k_proj: load_weight(
+                    &tensors,
+                    &format!("{prefix}.self_attn.k_proj"),
+                    weight_quantization,
+                )?,
                 k_norm: load_norm(
                     &tensors,
                     &format!("{prefix}.self_attn.k_norm"),
                     config.rms_norm_eps,
                 )?,
-                v_proj: load_weight(&tensors, &format!("{prefix}.self_attn.v_proj"))?,
-                o_proj: load_weight(&tensors, &format!("{prefix}.self_attn.o_proj"))?,
-                gate_proj: load_weight(&tensors, &format!("{prefix}.mlp.gate_proj"))?,
-                up_proj: load_weight(&tensors, &format!("{prefix}.mlp.up_proj"))?,
-                down_proj: load_weight(&tensors, &format!("{prefix}.mlp.down_proj"))?,
+                v_proj: load_weight(
+                    &tensors,
+                    &format!("{prefix}.self_attn.v_proj"),
+                    weight_quantization,
+                )?,
+                o_proj: load_weight(
+                    &tensors,
+                    &format!("{prefix}.self_attn.o_proj"),
+                    weight_quantization,
+                )?,
+                gate_proj: load_weight(
+                    &tensors,
+                    &format!("{prefix}.mlp.gate_proj"),
+                    weight_quantization,
+                )?,
+                up_proj: load_weight(
+                    &tensors,
+                    &format!("{prefix}.mlp.up_proj"),
+                    weight_quantization,
+                )?,
+                down_proj: load_weight(
+                    &tensors,
+                    &format!("{prefix}.mlp.down_proj"),
+                    weight_quantization,
+                )?,
             });
         }
         validate_layers(&config, &layers)?;
@@ -147,7 +208,7 @@ impl Model {
         let mut lm_head = if config.tie_word_embeddings {
             None
         } else {
-            load_weight(&tensors, "lm_head").ok()
+            load_weight(&tensors, "lm_head", weight_quantization).ok()
         };
         if let Some(weight) = &lm_head {
             ensure!(
@@ -212,6 +273,13 @@ impl Model {
         if matches!(precision, super::Precision::F16) {
             final_norm.weight.prepare_metal_f16();
         }
+        let tied_lm_head_q8_0 = if config.tie_word_embeddings
+            && matches!(weight_quantization, WeightQuantization::Q8_0)
+        {
+            Some(Q8_0Tensor::quantize(&embeddings.data, config.hidden_size)?)
+        } else {
+            None
+        };
         Ok(Self {
             config,
             eos_token_id,
@@ -220,6 +288,8 @@ impl Model {
             layers,
             final_norm,
             lm_head,
+            tied_lm_head_q8_0,
+            weight_quantization,
         })
     }
 
@@ -260,6 +330,54 @@ impl Model {
                 .map(|weight| &weight.tensor)
                 .context("untied Qwen3 causal LM is missing lm_head.weight")
         }
+    }
+
+    pub(crate) fn lm_head_q8_0(&self) -> Option<&Q8_0Tensor> {
+        if self.config.tie_word_embeddings {
+            self.tied_lm_head_q8_0.as_ref()
+        } else {
+            self.lm_head
+                .as_ref()
+                .and_then(|weight| weight.q8_0.as_ref())
+        }
+    }
+
+    pub(crate) fn decode_weight_bytes(&self) -> usize {
+        let matrix_bytes = self
+            .layers
+            .iter()
+            .flat_map(layer_weights)
+            .map(active_weight_bytes)
+            .sum::<usize>()
+            + self.lm_head_q8_0().map_or_else(
+                || self.lm_head().map_or(0, |head| head.data.len() * 4),
+                |head| head.as_bytes().len(),
+            );
+        let norm_bytes = self.final_norm.weight.data.len() * 4
+            + self
+                .layers
+                .iter()
+                .map(|layer| {
+                    (layer.input_norm.weight.data.len()
+                        + layer.post_attention_norm.weight.data.len()
+                        + layer.q_norm.weight.data.len()
+                        + layer.k_norm.weight.data.len())
+                        * 4
+                })
+                .sum::<usize>();
+        matrix_bytes + norm_bytes
+    }
+
+    pub(crate) fn quantized_weight_sha256(&self) -> Option<String> {
+        self.weight_quantization.is_quantized().then(|| {
+            quantized_sha256(
+                self.layers
+                    .iter()
+                    .flat_map(layer_weights)
+                    .filter_map(|weight| weight.q8_0.as_ref())
+                    .chain(self.lm_head_q8_0()),
+            )
+        })
     }
 
     pub(crate) fn encode(
@@ -594,10 +712,16 @@ fn get_qwen_tensor(
 fn load_weight(
     tensors: &std::collections::HashMap<String, Tensor>,
     prefix: &str,
+    weight_quantization: WeightQuantization,
 ) -> Result<Weight> {
-    Ok(Weight {
-        tensor: get_qwen_tensor(tensors, &format!("{prefix}.weight"))?,
-    })
+    let tensor = get_qwen_tensor(tensors, &format!("{prefix}.weight"))?;
+    let q8_0 = if matches!(weight_quantization, WeightQuantization::Q8_0) {
+        let (_, row_width) = tensor.matrix_shape()?;
+        Some(Q8_0Tensor::quantize(&tensor.data, row_width)?)
+    } else {
+        None
+    };
+    Ok(Weight { tensor, q8_0 })
 }
 
 fn load_norm(

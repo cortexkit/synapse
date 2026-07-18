@@ -10,18 +10,18 @@ typedef struct Lfm2LayerParams {
     int32_t mixer_type;
     const float *operator_norm;
     const float *ffn_norm;
-    const float *conv_in_weight;
+    SynapseCudaWeight conv_in_weight;
     const float *conv_weight;
-    const float *conv_out_weight;
-    const float *q_weight;
+    SynapseCudaWeight conv_out_weight;
+    SynapseCudaWeight q_weight;
     const float *q_norm;
-    const float *k_weight;
+    SynapseCudaWeight k_weight;
     const float *k_norm;
-    const float *v_weight;
-    const float *attention_out_weight;
-    const float *w1_weight;
-    const float *w2_weight;
-    const float *w3_weight;
+    SynapseCudaWeight v_weight;
+    SynapseCudaWeight attention_out_weight;
+    SynapseCudaWeight w1_weight;
+    SynapseCudaWeight w2_weight;
+    SynapseCudaWeight w3_weight;
 } Lfm2LayerParams;
 }
 
@@ -30,9 +30,11 @@ namespace {
 struct DeviceLayer {
     int mixer_type = 0;
     DeviceAllocation<float> operator_norm, ffn_norm;
-    DeviceAllocation<float> conv_in_weight, conv_weight, conv_out_weight;
-    DeviceAllocation<float> q_weight, q_norm, k_weight, k_norm, v_weight, attention_out_weight;
-    DeviceAllocation<float> w1_weight, w2_weight, w3_weight;
+    DeviceMatrix conv_in_weight, conv_out_weight;
+    DeviceAllocation<float> conv_weight;
+    DeviceMatrix q_weight, k_weight, v_weight, attention_out_weight;
+    DeviceAllocation<float> q_norm, k_norm;
+    DeviceMatrix w1_weight, w2_weight, w3_weight;
     DeviceAllocation<float> conv_state, key_cache, value_cache;
 };
 
@@ -373,7 +375,8 @@ struct Lfm2Context {
     int decode_position = 0;
     float epsilon = 0.0f, theta = 0.0f;
     std::vector<DeviceLayer> layers;
-    DeviceAllocation<float> final_norm, lm_head;
+    DeviceAllocation<float> final_norm;
+    DeviceMatrix lm_head;
     DeviceAllocation<unsigned char> workspace;
     Workspace buffers;
     std::unordered_map<std::string, std::unique_ptr<MatmulPlan>> matmuls;
@@ -405,6 +408,14 @@ struct Lfm2Context {
         launch_matmul(lt, matmul(m, n, k), a, b, c, workspace.pointer, stream);
     }
 
+    void decode_matvec(int rows, int columns, const float *input, const DeviceMatrix &weight, float *output) {
+        if (weight.quantized) {
+            launch_decode_matvec(weight, input, output, rows, columns, stream);
+        } else {
+            gemm(1, rows, columns, input, weight.fp32.pointer, output);
+        }
+    }
+
     void load_model(
         int h,
         int qh,
@@ -418,7 +429,7 @@ struct Lfm2Context {
         float rope_theta,
         const Lfm2LayerParams *params,
         const float *host_final_norm,
-        const float *host_lm_head
+        const SynapseCudaWeight *host_lm_head
     ) {
         if (weights_loaded) {
             if (hidden != h || query_heads != qh || kv_heads != kvh || head_dim != hd ||
@@ -446,23 +457,24 @@ struct Lfm2Context {
             copy_float(target.operator_norm, source.operator_norm, hidden);
             copy_float(target.ffn_norm, source.ffn_norm, hidden);
             if (target.mixer_type == 0) {
-                copy_float(target.conv_in_weight, source.conv_in_weight, static_cast<size_t>(3) * hidden * hidden);
+                copy_matrix(target.conv_in_weight, source.conv_in_weight, static_cast<size_t>(3) * hidden * hidden);
                 copy_float(target.conv_weight, source.conv_weight, static_cast<size_t>(hidden) * kernel);
-                copy_float(target.conv_out_weight, source.conv_out_weight, static_cast<size_t>(hidden) * hidden);
+                copy_matrix(target.conv_out_weight, source.conv_out_weight, static_cast<size_t>(hidden) * hidden);
             } else {
-                copy_float(target.q_weight, source.q_weight, static_cast<size_t>(hidden) * hidden);
+                copy_matrix(target.q_weight, source.q_weight, static_cast<size_t>(hidden) * hidden);
                 copy_float(target.q_norm, source.q_norm, head_dim);
-                copy_float(target.k_weight, source.k_weight, static_cast<size_t>(kv_width) * hidden);
+                copy_matrix(target.k_weight, source.k_weight, static_cast<size_t>(kv_width) * hidden);
                 copy_float(target.k_norm, source.k_norm, head_dim);
-                copy_float(target.v_weight, source.v_weight, static_cast<size_t>(kv_width) * hidden);
-                copy_float(target.attention_out_weight, source.attention_out_weight, static_cast<size_t>(hidden) * hidden);
+                copy_matrix(target.v_weight, source.v_weight, static_cast<size_t>(kv_width) * hidden);
+                copy_matrix(target.attention_out_weight, source.attention_out_weight, static_cast<size_t>(hidden) * hidden);
             }
-            copy_float(target.w1_weight, source.w1_weight, static_cast<size_t>(intermediate) * hidden);
-            copy_float(target.w2_weight, source.w2_weight, static_cast<size_t>(hidden) * intermediate);
-            copy_float(target.w3_weight, source.w3_weight, static_cast<size_t>(intermediate) * hidden);
+            copy_matrix(target.w1_weight, source.w1_weight, static_cast<size_t>(intermediate) * hidden);
+            copy_matrix(target.w2_weight, source.w2_weight, static_cast<size_t>(hidden) * intermediate);
+            copy_matrix(target.w3_weight, source.w3_weight, static_cast<size_t>(intermediate) * hidden);
         }
         copy_float(final_norm, host_final_norm, hidden);
-        copy_float(lm_head, host_lm_head, static_cast<size_t>(vocab) * hidden);
+        if (!host_lm_head) throw std::runtime_error("LFM2 CUDA received a null LM head");
+        copy_matrix(lm_head, *host_lm_head, static_cast<size_t>(vocab) * hidden);
         // Weight uploads use the default stream; synchronize the device before the
         // nonblocking inference stream can consume the final upload.
         FAMILY_CUDA_CHECK(cudaDeviceSynchronize());
@@ -471,10 +483,11 @@ struct Lfm2Context {
         for (const DeviceLayer &layer : layers) attention_layers += layer.mixer_type == 1;
         std::fprintf(
             stderr,
-            "CUDA LFM2 persistent weights: layers=%d conv=%d attention=%d dtype=fp32 accum=fp32 graphs=%s\n",
+            "CUDA LFM2 persistent weights: layers=%d conv=%d attention=%d dtype=%s accum=fp32 graphs=%s\n",
             layer_count,
             layer_count - attention_layers,
             attention_layers,
+            lm_head.quantized ? "q8_0" : "fp32",
             graphs_enabled ? "requested-decode-uncaptured" : "disabled"
         );
     }
@@ -518,7 +531,7 @@ struct Lfm2Context {
         for (DeviceLayer &layer : layers) {
             rms_norm<<<rows, threads, 0, stream>>>(buffers.x0.pointer, layer.operator_norm.pointer, buffers.normed.pointer, rows, hidden, epsilon);
             if (layer.mixer_type == 0) {
-                gemm(rows, 3 * hidden, hidden, buffers.normed.pointer, layer.conv_in_weight.pointer, buffers.mixer_raw.pointer);
+                gemm(rows, 3 * hidden, hidden, buffers.normed.pointer, layer.conv_in_weight.fp32.pointer, buffers.mixer_raw.pointer);
                 full_conv_mix<<<(hidden_values + threads - 1) / threads, threads, 0, stream>>>(
                     buffers.mixer_raw.pointer,
                     layer.conv_weight.pointer,
@@ -538,11 +551,11 @@ struct Lfm2Context {
                         kernel
                     );
                 }
-                gemm(rows, hidden, hidden, buffers.attention.pointer, layer.conv_out_weight.pointer, buffers.projected.pointer);
+                gemm(rows, hidden, hidden, buffers.attention.pointer, layer.conv_out_weight.fp32.pointer, buffers.projected.pointer);
             } else {
-                gemm(rows, hidden, hidden, buffers.normed.pointer, layer.q_weight.pointer, buffers.mixer_raw.pointer);
-                gemm(rows, kv_width, hidden, buffers.normed.pointer, layer.k_weight.pointer, buffers.k.pointer);
-                gemm(rows, kv_width, hidden, buffers.normed.pointer, layer.v_weight.pointer, buffers.v.pointer);
+                gemm(rows, hidden, hidden, buffers.normed.pointer, layer.q_weight.fp32.pointer, buffers.mixer_raw.pointer);
+                gemm(rows, kv_width, hidden, buffers.normed.pointer, layer.k_weight.fp32.pointer, buffers.k.pointer);
+                gemm(rows, kv_width, hidden, buffers.normed.pointer, layer.v_weight.fp32.pointer, buffers.v.pointer);
                 head_norm_rope<<<rows * query_heads, threads, 0, stream>>>(
                     buffers.mixer_raw.pointer, layer.q_norm.pointer, buffers.q.pointer,
                     rows, query_heads, head_dim, 0, epsilon, theta
@@ -566,19 +579,19 @@ struct Lfm2Context {
                     kv_heads,
                     head_dim
                 );
-                gemm(rows, hidden, hidden, buffers.attention.pointer, layer.attention_out_weight.pointer, buffers.projected.pointer);
+                gemm(rows, hidden, hidden, buffers.attention.pointer, layer.attention_out_weight.fp32.pointer, buffers.projected.pointer);
             }
             add_residual<<<hidden_blocks, threads, 0, stream>>>(buffers.projected.pointer, buffers.x0.pointer, buffers.x1.pointer, hidden_values);
             rms_norm<<<rows, threads, 0, stream>>>(buffers.x1.pointer, layer.ffn_norm.pointer, buffers.normed.pointer, rows, hidden, epsilon);
-            gemm(rows, intermediate, hidden, buffers.normed.pointer, layer.w1_weight.pointer, buffers.gate.pointer);
-            gemm(rows, intermediate, hidden, buffers.normed.pointer, layer.w3_weight.pointer, buffers.up.pointer);
+            gemm(rows, intermediate, hidden, buffers.normed.pointer, layer.w1_weight.fp32.pointer, buffers.gate.pointer);
+            gemm(rows, intermediate, hidden, buffers.normed.pointer, layer.w3_weight.fp32.pointer, buffers.up.pointer);
             swiglu<<<intermediate_blocks, threads, 0, stream>>>(buffers.gate.pointer, buffers.up.pointer, buffers.activated.pointer, intermediate_values);
-            gemm(rows, hidden, intermediate, buffers.activated.pointer, layer.w2_weight.pointer, buffers.projected.pointer);
+            gemm(rows, hidden, intermediate, buffers.activated.pointer, layer.w2_weight.fp32.pointer, buffers.projected.pointer);
             add_residual<<<hidden_blocks, threads, 0, stream>>>(buffers.projected.pointer, buffers.x1.pointer, buffers.x0.pointer, hidden_values);
         }
         rms_norm<<<rows, threads, 0, stream>>>(buffers.x0.pointer, final_norm.pointer, buffers.x1.pointer, rows, hidden, epsilon);
         if (host_logits) {
-            gemm(1, vocab, hidden, buffers.x1.pointer + static_cast<size_t>(seq - 1) * hidden, lm_head.pointer, buffers.logits.pointer);
+            decode_matvec(vocab, hidden, buffers.x1.pointer + static_cast<size_t>(seq - 1) * hidden, lm_head, buffers.logits.pointer);
             FAMILY_CUDA_CHECK(cudaMemcpyAsync(host_logits, buffers.logits.pointer, static_cast<size_t>(vocab) * sizeof(float), cudaMemcpyDeviceToHost, stream));
         }
         if (host_hidden) {
@@ -606,7 +619,7 @@ struct Lfm2Context {
         for (DeviceLayer &layer : layers) {
             rms_norm<<<1, threads, 0, stream>>>(buffers.x0.pointer, layer.operator_norm.pointer, buffers.normed.pointer, 1, hidden, epsilon);
             if (layer.mixer_type == 0) {
-                gemm(1, 3 * hidden, hidden, buffers.normed.pointer, layer.conv_in_weight.pointer, buffers.mixer_raw.pointer);
+                decode_matvec(3 * hidden, hidden, buffers.normed.pointer, layer.conv_in_weight, buffers.mixer_raw.pointer);
                 decode_conv_mix<<<hidden_blocks, threads, 0, stream>>>(
                     buffers.mixer_raw.pointer,
                     layer.conv_weight.pointer,
@@ -615,11 +628,11 @@ struct Lfm2Context {
                     hidden,
                     kernel
                 );
-                gemm(1, hidden, hidden, buffers.attention.pointer, layer.conv_out_weight.pointer, buffers.projected.pointer);
+                decode_matvec(hidden, hidden, buffers.attention.pointer, layer.conv_out_weight, buffers.projected.pointer);
             } else {
-                gemm(1, hidden, hidden, buffers.normed.pointer, layer.q_weight.pointer, buffers.mixer_raw.pointer);
-                gemm(1, kv_width, hidden, buffers.normed.pointer, layer.k_weight.pointer, buffers.k.pointer);
-                gemm(1, kv_width, hidden, buffers.normed.pointer, layer.v_weight.pointer, buffers.v.pointer);
+                decode_matvec(hidden, hidden, buffers.normed.pointer, layer.q_weight, buffers.mixer_raw.pointer);
+                decode_matvec(kv_width, hidden, buffers.normed.pointer, layer.k_weight, buffers.k.pointer);
+                decode_matvec(kv_width, hidden, buffers.normed.pointer, layer.v_weight, buffers.v.pointer);
                 head_norm_rope<<<query_heads, threads, 0, stream>>>(
                     buffers.mixer_raw.pointer, layer.q_norm.pointer, buffers.q.pointer,
                     1, query_heads, head_dim, position, epsilon, theta
@@ -640,18 +653,18 @@ struct Lfm2Context {
                     kv_heads,
                     head_dim
                 );
-                gemm(1, hidden, hidden, buffers.attention.pointer, layer.attention_out_weight.pointer, buffers.projected.pointer);
+                decode_matvec(hidden, hidden, buffers.attention.pointer, layer.attention_out_weight, buffers.projected.pointer);
             }
             add_residual<<<hidden_blocks, threads, 0, stream>>>(buffers.projected.pointer, buffers.x0.pointer, buffers.x1.pointer, hidden);
             rms_norm<<<1, threads, 0, stream>>>(buffers.x1.pointer, layer.ffn_norm.pointer, buffers.normed.pointer, 1, hidden, epsilon);
-            gemm(1, intermediate, hidden, buffers.normed.pointer, layer.w1_weight.pointer, buffers.gate.pointer);
-            gemm(1, intermediate, hidden, buffers.normed.pointer, layer.w3_weight.pointer, buffers.up.pointer);
+            decode_matvec(intermediate, hidden, buffers.normed.pointer, layer.w1_weight, buffers.gate.pointer);
+            decode_matvec(intermediate, hidden, buffers.normed.pointer, layer.w3_weight, buffers.up.pointer);
             swiglu<<<intermediate_blocks, threads, 0, stream>>>(buffers.gate.pointer, buffers.up.pointer, buffers.activated.pointer, intermediate);
-            gemm(1, hidden, intermediate, buffers.activated.pointer, layer.w2_weight.pointer, buffers.projected.pointer);
+            decode_matvec(hidden, intermediate, buffers.activated.pointer, layer.w2_weight, buffers.projected.pointer);
             add_residual<<<hidden_blocks, threads, 0, stream>>>(buffers.projected.pointer, buffers.x1.pointer, buffers.x0.pointer, hidden);
         }
         rms_norm<<<1, threads, 0, stream>>>(buffers.x0.pointer, final_norm.pointer, buffers.x1.pointer, 1, hidden, epsilon);
-        gemm(1, vocab, hidden, buffers.x1.pointer, lm_head.pointer, buffers.logits.pointer);
+        decode_matvec(vocab, hidden, buffers.x1.pointer, lm_head, buffers.logits.pointer);
         FAMILY_CUDA_CHECK(cudaMemcpyAsync(host_hidden, buffers.x1.pointer, static_cast<size_t>(hidden) * sizeof(float), cudaMemcpyDeviceToHost, stream));
         FAMILY_CUDA_CHECK(cudaMemcpyAsync(host_logits, buffers.logits.pointer, static_cast<size_t>(vocab) * sizeof(float), cudaMemcpyDeviceToHost, stream));
         FAMILY_CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -672,7 +685,7 @@ void validate_common(
     uint64_t vocab,
     const Lfm2LayerParams *layers,
     const float *final_norm,
-    const float *lm_head
+    const SynapseCudaWeight *lm_head
 ) {
     if (!raw_context || !layers || !final_norm || !lm_head) throw std::runtime_error("LFM2 CUDA received a null model pointer");
     if (!hidden || !query_heads || !kv_heads || query_heads % kv_heads || !head_dim ||
@@ -716,7 +729,7 @@ int32_t synapse_cuda_lfm2_full_forward(
     const uint8_t *mask,
     const Lfm2LayerParams *layers,
     const float *final_norm,
-    const float *lm_head,
+    const SynapseCudaWeight *lm_head,
     float *output
 ) {
     try {
@@ -749,7 +762,7 @@ int32_t synapse_cuda_lfm2_prefill(
     const float *input,
     const Lfm2LayerParams *layers,
     const float *final_norm,
-    const float *lm_head,
+    const SynapseCudaWeight *lm_head,
     float *logits
 ) {
     try {
@@ -783,7 +796,7 @@ int32_t synapse_cuda_lfm2_decode(
     const float *embedding,
     const Lfm2LayerParams *layers,
     const float *final_norm,
-    const float *lm_head,
+    const SynapseCudaWeight *lm_head,
     float *output_hidden,
     float *logits
 ) {

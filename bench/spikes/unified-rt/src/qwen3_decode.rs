@@ -11,7 +11,11 @@ use anyhow::{ensure, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::json_constraint::{DecodeConstraint, TokenMask};
-use crate::{qwen3::Model, Tensor};
+use crate::{
+    quant::Q8_0Tensor,
+    qwen3::{Model, Weight},
+    Tensor,
+};
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub(crate) struct TopLogit {
@@ -51,6 +55,13 @@ pub(crate) trait DecodeKernel {
     fn stage_timings(&self) -> DecodeStageTimings {
         DecodeStageTimings::default()
     }
+}
+
+pub(crate) trait DecodeRuntime: DecodeKernel {
+    fn lane(&self) -> &'static str;
+    fn kv_update_path(&self) -> &'static str;
+    fn weight_feed_path(&self) -> &'static str;
+    fn optimization_level(&self) -> u8;
 }
 
 /// A paused session owns all logical state needed to resume generation exactly.
@@ -162,7 +173,10 @@ impl<'a, K: DecodeKernel> DecodeSession<'a, K> {
             } else {
                 top_logits(&self.next_logits, top_k)
             };
-            ensure!(top.len() > 0, "decode constraint masked every model token");
+            ensure!(
+                !top.is_empty(),
+                "decode constraint masked every model token"
+            );
             let token = top[0].token_id;
             self.sample_wall_s += sample_started.elapsed().as_secs_f64();
             tap.before_commit(TokenTapEvent {
@@ -313,7 +327,7 @@ pub(crate) struct WeightRegionKey {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct WeightRegion {
-    /// Stable for the lifetime of one loaded model and used by the Metal buffer cache.
+    /// Address of active host storage, valid until model drop; quantized regions span whole GGUF blocks.
     pub(crate) buffer_handle: usize,
     pub(crate) byte_len: usize,
     pub(crate) checksum: u64,
@@ -325,26 +339,55 @@ impl Model {
         insert_region(&mut regions, None, "embed_tokens.weight", &self.embeddings);
         insert_region(&mut regions, None, "norm.weight", &self.final_norm.weight);
         if let Some(lm_head) = &self.lm_head {
-            insert_region(&mut regions, None, "lm_head.weight", &lm_head.tensor);
+            insert_weight_region(&mut regions, None, "lm_head.weight", lm_head);
+        } else if let Some(lm_head) = &self.tied_lm_head_q8_0 {
+            insert_q8_region(&mut regions, None, "lm_head.weight", lm_head);
         }
         for (index, layer) in self.layers.iter().enumerate() {
-            for (name, tensor) in [
-                ("input_layernorm.weight", &layer.input_norm.weight),
-                (
-                    "post_attention_layernorm.weight",
-                    &layer.post_attention_norm.weight,
-                ),
-                ("self_attn.q_proj.weight", &layer.q_proj.tensor),
-                ("self_attn.q_norm.weight", &layer.q_norm.weight),
-                ("self_attn.k_proj.weight", &layer.k_proj.tensor),
-                ("self_attn.k_norm.weight", &layer.k_norm.weight),
-                ("self_attn.v_proj.weight", &layer.v_proj.tensor),
-                ("self_attn.o_proj.weight", &layer.o_proj.tensor),
-                ("mlp.gate_proj.weight", &layer.gate_proj.tensor),
-                ("mlp.up_proj.weight", &layer.up_proj.tensor),
-                ("mlp.down_proj.weight", &layer.down_proj.tensor),
+            insert_region(
+                &mut regions,
+                Some(index),
+                "input_layernorm.weight",
+                &layer.input_norm.weight,
+            );
+            insert_region(
+                &mut regions,
+                Some(index),
+                "post_attention_layernorm.weight",
+                &layer.post_attention_norm.weight,
+            );
+            insert_weight_region(
+                &mut regions,
+                Some(index),
+                "self_attn.q_proj.weight",
+                &layer.q_proj,
+            );
+            insert_region(
+                &mut regions,
+                Some(index),
+                "self_attn.q_norm.weight",
+                &layer.q_norm.weight,
+            );
+            insert_weight_region(
+                &mut regions,
+                Some(index),
+                "self_attn.k_proj.weight",
+                &layer.k_proj,
+            );
+            insert_region(
+                &mut regions,
+                Some(index),
+                "self_attn.k_norm.weight",
+                &layer.k_norm.weight,
+            );
+            for (name, weight) in [
+                ("self_attn.v_proj.weight", &layer.v_proj),
+                ("self_attn.o_proj.weight", &layer.o_proj),
+                ("mlp.gate_proj.weight", &layer.gate_proj),
+                ("mlp.up_proj.weight", &layer.up_proj),
+                ("mlp.down_proj.weight", &layer.down_proj),
             ] {
-                insert_region(&mut regions, Some(index), name, tensor);
+                insert_weight_region(&mut regions, Some(index), name, weight);
             }
         }
         regions
@@ -352,28 +395,77 @@ impl Model {
 
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn weight_region_bytes(&self, key: &WeightRegionKey) -> Option<Vec<u8>> {
-        let tensor = match (key.layer, key.tensor_name) {
-            (None, "embed_tokens.weight") => Some(&self.embeddings),
-            (None, "norm.weight") => Some(&self.final_norm.weight),
-            (None, "lm_head.weight") => self.lm_head.as_ref().map(|head| &head.tensor),
+        match (key.layer, key.tensor_name) {
+            (None, "embed_tokens.weight") => Some(active_tensor_bytes(&self.embeddings)),
+            (None, "norm.weight") => Some(active_tensor_bytes(&self.final_norm.weight)),
+            (None, "lm_head.weight") => {
+                self.lm_head.as_ref().map(active_weight_bytes).or_else(|| {
+                    self.tied_lm_head_q8_0
+                        .as_ref()
+                        .map(|weight| weight.as_bytes().to_vec())
+                })
+            }
             (Some(index), name) => self.layers.get(index).and_then(|layer| match name {
-                "input_layernorm.weight" => Some(&layer.input_norm.weight),
-                "post_attention_layernorm.weight" => Some(&layer.post_attention_norm.weight),
-                "self_attn.q_proj.weight" => Some(&layer.q_proj.tensor),
-                "self_attn.q_norm.weight" => Some(&layer.q_norm.weight),
-                "self_attn.k_proj.weight" => Some(&layer.k_proj.tensor),
-                "self_attn.k_norm.weight" => Some(&layer.k_norm.weight),
-                "self_attn.v_proj.weight" => Some(&layer.v_proj.tensor),
-                "self_attn.o_proj.weight" => Some(&layer.o_proj.tensor),
-                "mlp.gate_proj.weight" => Some(&layer.gate_proj.tensor),
-                "mlp.up_proj.weight" => Some(&layer.up_proj.tensor),
-                "mlp.down_proj.weight" => Some(&layer.down_proj.tensor),
+                "input_layernorm.weight" => Some(active_tensor_bytes(&layer.input_norm.weight)),
+                "post_attention_layernorm.weight" => {
+                    Some(active_tensor_bytes(&layer.post_attention_norm.weight))
+                }
+                "self_attn.q_proj.weight" => Some(active_weight_bytes(&layer.q_proj)),
+                "self_attn.q_norm.weight" => Some(active_tensor_bytes(&layer.q_norm.weight)),
+                "self_attn.k_proj.weight" => Some(active_weight_bytes(&layer.k_proj)),
+                "self_attn.k_norm.weight" => Some(active_tensor_bytes(&layer.k_norm.weight)),
+                "self_attn.v_proj.weight" => Some(active_weight_bytes(&layer.v_proj)),
+                "self_attn.o_proj.weight" => Some(active_weight_bytes(&layer.o_proj)),
+                "mlp.gate_proj.weight" => Some(active_weight_bytes(&layer.gate_proj)),
+                "mlp.up_proj.weight" => Some(active_weight_bytes(&layer.up_proj)),
+                "mlp.down_proj.weight" => Some(active_weight_bytes(&layer.down_proj)),
                 _ => None,
             }),
             _ => None,
-        }?;
-        Some(active_tensor_bytes(tensor))
+        }
     }
+}
+
+fn insert_weight_region(
+    regions: &mut BTreeMap<WeightRegionKey, WeightRegion>,
+    layer: Option<usize>,
+    tensor_name: &'static str,
+    weight: &Weight,
+) {
+    if let Some(quantized) = &weight.q8_0 {
+        insert_q8_region(regions, layer, tensor_name, quantized);
+    } else {
+        insert_region(regions, layer, tensor_name, &weight.tensor);
+    }
+}
+
+fn insert_q8_region(
+    regions: &mut BTreeMap<WeightRegionKey, WeightRegion>,
+    layer: Option<usize>,
+    tensor_name: &'static str,
+    quantized: &Q8_0Tensor,
+) {
+    let checksum = quantized
+        .as_bytes()
+        .iter()
+        .copied()
+        .fold(1469598103934665603u64, checksum_byte);
+    regions.insert(
+        WeightRegionKey { layer, tensor_name },
+        WeightRegion {
+            buffer_handle: quantized.as_bytes().as_ptr() as usize,
+            byte_len: quantized.as_bytes().len(),
+            checksum,
+        },
+    );
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn active_weight_bytes(weight: &Weight) -> Vec<u8> {
+    weight.q8_0.as_ref().map_or_else(
+        || active_tensor_bytes(&weight.tensor),
+        |quantized| quantized.as_bytes().to_vec(),
+    )
 }
 
 fn insert_region(
@@ -421,6 +513,7 @@ fn checksum_byte(hash: u64, byte: u8) -> u64 {
     (hash ^ u64::from(byte)).wrapping_mul(1099511628211)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn active_tensor_bytes(tensor: &Tensor) -> Vec<u8> {
     tensor.metal_f16_bits.as_ref().map_or_else(
         || {
@@ -828,6 +921,24 @@ mod metal {
         }
     }
 
+    impl super::DecodeRuntime for MetalDecoder<'_> {
+        fn lane(&self) -> &'static str {
+            "owned-rt-metal"
+        }
+
+        fn kv_update_path(&self) -> &'static str {
+            MetalDecoder::kv_update_path(self)
+        }
+
+        fn weight_feed_path(&self) -> &'static str {
+            MetalDecoder::weight_feed_path(self)
+        }
+
+        fn optimization_level(&self) -> u8 {
+            MetalDecoder::optimization_level(self)
+        }
+    }
+
     impl Drop for MetalDecoder<'_> {
         fn drop(&mut self) {
             unsafe { synapse_qwen3_decode_context_free(self.raw.as_ptr()) }
@@ -927,6 +1038,296 @@ mod metal {
     }
 }
 
+#[cfg(all(target_os = "linux", feature = "cuda"))]
+mod cuda {
+    use std::ffi::{c_char, c_void, CStr};
+    use std::ptr::NonNull;
+
+    use anyhow::{bail, ensure, Result};
+
+    use super::{DecodeKernel, DecodeRuntime, Model};
+    use crate::quant::{CudaWeight, WeightQuantization};
+
+    #[repr(C)]
+    struct LayerParams {
+        input_norm: *const f32,
+        post_attention_norm: *const f32,
+        q_weight: CudaWeight,
+        q_norm: *const f32,
+        k_weight: CudaWeight,
+        k_norm: *const f32,
+        v_weight: CudaWeight,
+        o_weight: CudaWeight,
+        gate_weight: CudaWeight,
+        up_weight: CudaWeight,
+        down_weight: CudaWeight,
+    }
+
+    pub(crate) struct CudaKvCache {
+        position: usize,
+    }
+
+    pub(crate) struct CudaDecoder<'a> {
+        raw: NonNull<c_void>,
+        model: &'a Model,
+        bucket: usize,
+    }
+
+    impl<'a> CudaDecoder<'a> {
+        pub(crate) fn new(model: &'a Model, bucket: usize) -> Result<Self> {
+            ensure!(
+                bucket > 0,
+                "Qwen3 CUDA decode cache bucket must be positive"
+            );
+            let raw = NonNull::new(unsafe { synapse_cuda_qwen3_decode_context_new(bucket as u64) })
+                .ok_or_else(last_error)?;
+            let decoder = Self { raw, model, bucket };
+            let layers = decoder.layer_params();
+            let head = model.lm_head()?;
+            let lm_head = CudaWeight::new(&head.data, model.lm_head_q8_0());
+            let status = unsafe {
+                synapse_cuda_qwen3_decode_prepare(
+                    raw.as_ptr(),
+                    model.config.hidden_size as u64,
+                    model.config.num_attention_heads as u64,
+                    model.config.num_key_value_heads as u64,
+                    model.config.head_dim as u64,
+                    model.config.intermediate_size as u64,
+                    model.layers.len() as u64,
+                    model.config.vocab_size as u64,
+                    model.config.rms_norm_eps,
+                    model.config.rope_theta,
+                    layers.as_ptr(),
+                    model.final_norm.weight.data.as_ptr(),
+                    &lm_head,
+                )
+            };
+            if status != 0 {
+                bail!("Qwen3 CUDA decode preparation failed: {}", last_error());
+            }
+            Ok(decoder)
+        }
+
+        fn layer_params(&self) -> Vec<LayerParams> {
+            self.model
+                .layers
+                .iter()
+                .map(|layer| LayerParams {
+                    input_norm: layer.input_norm.weight.data.as_ptr(),
+                    post_attention_norm: layer.post_attention_norm.weight.data.as_ptr(),
+                    q_weight: CudaWeight::new(
+                        &layer.q_proj.tensor.data,
+                        layer.q_proj.q8_0.as_ref(),
+                    ),
+                    q_norm: layer.q_norm.weight.data.as_ptr(),
+                    k_weight: CudaWeight::new(
+                        &layer.k_proj.tensor.data,
+                        layer.k_proj.q8_0.as_ref(),
+                    ),
+                    k_norm: layer.k_norm.weight.data.as_ptr(),
+                    v_weight: CudaWeight::new(
+                        &layer.v_proj.tensor.data,
+                        layer.v_proj.q8_0.as_ref(),
+                    ),
+                    o_weight: CudaWeight::new(
+                        &layer.o_proj.tensor.data,
+                        layer.o_proj.q8_0.as_ref(),
+                    ),
+                    gate_weight: CudaWeight::new(
+                        &layer.gate_proj.tensor.data,
+                        layer.gate_proj.q8_0.as_ref(),
+                    ),
+                    up_weight: CudaWeight::new(
+                        &layer.up_proj.tensor.data,
+                        layer.up_proj.q8_0.as_ref(),
+                    ),
+                    down_weight: CudaWeight::new(
+                        &layer.down_proj.tensor.data,
+                        layer.down_proj.q8_0.as_ref(),
+                    ),
+                })
+                .collect()
+        }
+
+        fn embedding(&self, token: u32) -> Result<&[f32]> {
+            let token = token as usize;
+            ensure!(
+                token < self.model.config.vocab_size,
+                "token id outside Qwen3 vocab"
+            );
+            let hidden = self.model.config.hidden_size;
+            Ok(&self.model.embeddings.data[token * hidden..(token + 1) * hidden])
+        }
+    }
+
+    impl DecodeKernel for CudaDecoder<'_> {
+        type Cache = CudaKvCache;
+
+        fn capacity(&self) -> usize {
+            self.bucket
+        }
+
+        fn prefill(&mut self, tokens: &[u32]) -> Result<(Self::Cache, Vec<f32>)> {
+            ensure!(!tokens.is_empty(), "decode prompt must not be empty");
+            ensure!(
+                tokens.len() <= self.bucket,
+                "decode prompt exceeds cache bucket"
+            );
+            let hidden = self.model.config.hidden_size;
+            let mut embeddings = Vec::with_capacity(tokens.len() * hidden);
+            for &token in tokens {
+                embeddings.extend_from_slice(self.embedding(token)?);
+            }
+            let mut logits = vec![0.0; self.model.config.vocab_size];
+            let status = unsafe {
+                synapse_cuda_qwen3_decode_prefill(
+                    self.raw.as_ptr(),
+                    tokens.len() as u64,
+                    embeddings.as_ptr(),
+                    logits.as_mut_ptr(),
+                )
+            };
+            if status != 0 {
+                bail!("Qwen3 CUDA prefill failed: {}", last_error());
+            }
+            Ok((
+                CudaKvCache {
+                    position: tokens.len(),
+                },
+                logits,
+            ))
+        }
+
+        fn advance(&mut self, cache: &mut Self::Cache, token: u32) -> Result<Vec<f32>> {
+            ensure!(
+                cache.position < self.bucket,
+                "decode cache capacity exhausted"
+            );
+            let mut logits = vec![0.0; self.model.config.vocab_size];
+            let status = unsafe {
+                synapse_cuda_qwen3_decode_step(
+                    self.raw.as_ptr(),
+                    cache.position as u64,
+                    self.embedding(token)?.as_ptr(),
+                    logits.as_mut_ptr(),
+                )
+            };
+            if status != 0 {
+                bail!("Qwen3 CUDA decode step failed: {}", last_error());
+            }
+            cache.position += 1;
+            Ok(logits)
+        }
+
+        fn cache_position(&self, cache: &Self::Cache) -> usize {
+            cache.position
+        }
+
+        fn inspect_cache_layer(&self, _cache: &Self::Cache, layer: usize) -> Result<Vec<f32>> {
+            ensure!(
+                layer < self.model.layers.len(),
+                "KV cache layer out of range"
+            );
+            let elements = 2
+                * self.bucket
+                * self.model.config.num_key_value_heads
+                * self.model.config.head_dim;
+            let mut values = vec![0.0; elements];
+            let status = unsafe {
+                synapse_cuda_qwen3_decode_cache_copy(
+                    self.raw.as_ptr(),
+                    layer as u64,
+                    values.as_mut_ptr(),
+                    elements as u64,
+                )
+            };
+            if status != 0 {
+                bail!("Qwen3 CUDA cache inspection failed: {}", last_error());
+            }
+            Ok(values)
+        }
+    }
+
+    impl DecodeRuntime for CudaDecoder<'_> {
+        fn lane(&self) -> &'static str {
+            "owned-rt-cuda"
+        }
+
+        fn kv_update_path(&self) -> &'static str {
+            "cuda-resident-fp32-kv-cache"
+        }
+
+        fn weight_feed_path(&self) -> &'static str {
+            match self.model.weight_quantization {
+                WeightQuantization::None => "cuda-persistent-fp32-matvec",
+                WeightQuantization::Q8_0 => "cuda-persistent-q8_0-fused-dequant-matvec",
+            }
+        }
+
+        fn optimization_level(&self) -> u8 {
+            1
+        }
+    }
+
+    impl Drop for CudaDecoder<'_> {
+        fn drop(&mut self) {
+            unsafe { synapse_cuda_qwen3_decode_context_free(self.raw.as_ptr()) }
+        }
+    }
+
+    fn last_error() -> anyhow::Error {
+        unsafe {
+            let raw = synapse_cuda_last_error();
+            if raw.is_null() {
+                anyhow::anyhow!("unknown Qwen3 CUDA decode error")
+            } else {
+                anyhow::anyhow!(CStr::from_ptr(raw).to_string_lossy().into_owned())
+            }
+        }
+    }
+
+    unsafe extern "C" {
+        fn synapse_cuda_qwen3_decode_context_new(capacity: u64) -> *mut c_void;
+        fn synapse_cuda_qwen3_decode_context_free(context: *mut c_void);
+        fn synapse_cuda_qwen3_decode_prepare(
+            context: *mut c_void,
+            hidden: u64,
+            query_heads: u64,
+            kv_heads: u64,
+            head_dim: u64,
+            intermediate: u64,
+            layer_count: u64,
+            vocab: u64,
+            epsilon: f32,
+            rope_theta: f32,
+            layers: *const LayerParams,
+            final_norm: *const f32,
+            lm_head: *const CudaWeight,
+        ) -> i32;
+        fn synapse_cuda_qwen3_decode_prefill(
+            context: *mut c_void,
+            sequence: u64,
+            embeddings: *const f32,
+            logits: *mut f32,
+        ) -> i32;
+        fn synapse_cuda_qwen3_decode_step(
+            context: *mut c_void,
+            position: u64,
+            embedding: *const f32,
+            logits: *mut f32,
+        ) -> i32;
+        fn synapse_cuda_qwen3_decode_cache_copy(
+            context: *mut c_void,
+            layer: u64,
+            output: *mut f32,
+            elements: u64,
+        ) -> i32;
+        fn synapse_cuda_last_error() -> *const c_char;
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "cuda"))]
+pub(crate) use cuda::CudaDecoder;
 #[cfg(target_os = "macos")]
 pub(crate) use metal::MetalDecoder;
 
@@ -1128,12 +1529,12 @@ mod tests {
             r#"{
                 "model_type":"qwen3",
                 "architectures":["Qwen3ForCausalLM"],
-                "hidden_size":4,
-                "intermediate_size":6,
+                "hidden_size":32,
+                "intermediate_size":32,
                 "num_attention_heads":2,
                 "num_hidden_layers":1,
                 "num_key_value_heads":1,
-                "head_dim":2,
+                "head_dim":16,
                 "rms_norm_eps":0.000001,
                 "rope_theta":1000000.0,
                 "vocab_size":8,
@@ -1143,19 +1544,19 @@ mod tests {
         )
         .unwrap();
         let shapes = [
-            ("embed_tokens.weight", vec![8, 4]),
-            ("layers.0.input_layernorm.weight", vec![4]),
-            ("layers.0.post_attention_layernorm.weight", vec![4]),
-            ("layers.0.self_attn.q_proj.weight", vec![4, 4]),
-            ("layers.0.self_attn.q_norm.weight", vec![2]),
-            ("layers.0.self_attn.k_proj.weight", vec![2, 4]),
-            ("layers.0.self_attn.k_norm.weight", vec![2]),
-            ("layers.0.self_attn.v_proj.weight", vec![2, 4]),
-            ("layers.0.self_attn.o_proj.weight", vec![4, 4]),
-            ("layers.0.mlp.gate_proj.weight", vec![6, 4]),
-            ("layers.0.mlp.up_proj.weight", vec![6, 4]),
-            ("layers.0.mlp.down_proj.weight", vec![4, 6]),
-            ("norm.weight", vec![4]),
+            ("embed_tokens.weight", vec![8, 32]),
+            ("layers.0.input_layernorm.weight", vec![32]),
+            ("layers.0.post_attention_layernorm.weight", vec![32]),
+            ("layers.0.self_attn.q_proj.weight", vec![32, 32]),
+            ("layers.0.self_attn.q_norm.weight", vec![16]),
+            ("layers.0.self_attn.k_proj.weight", vec![16, 32]),
+            ("layers.0.self_attn.k_norm.weight", vec![16]),
+            ("layers.0.self_attn.v_proj.weight", vec![16, 32]),
+            ("layers.0.self_attn.o_proj.weight", vec![32, 32]),
+            ("layers.0.mlp.gate_proj.weight", vec![32, 32]),
+            ("layers.0.mlp.up_proj.weight", vec![32, 32]),
+            ("layers.0.mlp.down_proj.weight", vec![32, 32]),
+            ("norm.weight", vec![32]),
         ];
         let mut header = serde_json::Map::new();
         let mut payload = Vec::new();
@@ -1208,6 +1609,40 @@ mod tests {
                 second.weight_region_bytes(key)
             );
         }
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn quantized_regions_address_complete_q8_0_blocks() {
+        let path = tiny_qwen_snapshot();
+        let baseline = Model::load(&path, crate::Precision::F32).unwrap();
+        let model = Model::load_with_quant(
+            &path,
+            crate::Precision::F32,
+            crate::quant::WeightQuantization::Q8_0,
+        )
+        .unwrap();
+        assert_eq!(
+            baseline.layers[0].q_proj.tensor.data,
+            model.layers[0].q_proj.tensor.data
+        );
+        let key = WeightRegionKey {
+            layer: Some(0),
+            tensor_name: "self_attn.q_proj.weight",
+        };
+        let region = &model.weight_regions()[&key];
+        assert_eq!(region.byte_len, 32 * 34);
+        assert_eq!(region.byte_len % 34, 0);
+        assert_eq!(
+            model.weight_region_bytes(&key).unwrap().len(),
+            region.byte_len
+        );
+        assert_eq!(model.quantized_weight_sha256().unwrap().len(), 64);
+        let lm_head = WeightRegionKey {
+            layer: None,
+            tensor_name: "lm_head.weight",
+        };
+        assert_eq!(model.weight_regions()[&lm_head].byte_len, 8 * 34);
         std::fs::remove_dir_all(path).unwrap();
     }
 }

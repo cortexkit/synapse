@@ -27,6 +27,7 @@ mod lfm2;
 mod lfm2_audio;
 mod lfm2_decode;
 mod modernbert;
+mod quant;
 mod qwen3;
 mod qwen3_decode;
 mod vulkan_backend;
@@ -121,9 +122,12 @@ struct Args {
     /// Kernel provider to use.
     #[arg(long, value_enum, default_value_t = DeviceArg::Cpu)]
     device: DeviceArg,
-    /// Precision for the resident encoder path.
+    /// Precision for activations and non-quantized resident weights.
     #[arg(long, value_enum, default_value_t = Precision::F32)]
     dtype: Precision,
+    /// Block format for CUDA decode matrix weights; embeddings and state remain fp32.
+    #[arg(long, value_enum, default_value_t = quant::WeightQuantization::None)]
+    weight_quant: quant::WeightQuantization,
     /// GEMM substrate used by the CPU provider.
     #[arg(long, value_enum, default_value_t = cpu_backend::CpuGemm::Platform)]
     cpu_gemm: cpu_backend::CpuGemm,
@@ -319,6 +323,8 @@ struct DecodePromptResult {
     id: String,
     prompt_tokens: usize,
     tokens: Vec<u32>,
+    /// Number of leading generated tokens equal to the supplied fp32 reference.
+    match_depth: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     text: Option<String>,
     exact_reference: Option<bool>,
@@ -352,6 +358,10 @@ struct DecodeServingResult {
     weight_feed_path: &'static str,
     optimization_level: u8,
     weight_regions: usize,
+    weight_quantization: quant::WeightQuantization,
+    weight_bytes_per_token: usize,
+    achieved_weight_gb_s: f64,
+    quantized_weight_sha256: Option<String>,
     results: Vec<DecodePromptResult>,
 }
 
@@ -888,281 +898,327 @@ fn run_decode_cli(args: &Args, started: Instant) -> Result<()> {
         qwen3::detect_config(&config),
         "decode mode supports only Qwen3 and LFM2 causal language models"
     );
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (args, started);
-        bail!("Qwen3 owned-runtime decode is only available on macOS");
-    }
+
     #[cfg(target_os = "macos")]
     {
-        use qwen3_decode::{DecodeSession, MetalDecoder, TokenTapEvent};
-
+        use qwen3_decode::MetalDecoder;
         ensure!(
             matches!(args.device, DeviceArg::Metal),
-            "Qwen3 decode requires --device metal"
+            "Qwen3 decode requires --device metal on macOS"
         );
         ensure!(
             matches!(args.dtype, Precision::F16),
-            "Qwen3 decode requires --dtype f16"
+            "Qwen3 Metal decode requires --dtype f16"
         );
-        ensure!(args.max_new_tokens > 0, "--max-new-tokens must be positive");
-        ensure!(args.decode_top_k > 0, "--decode-top-k must be positive");
-        let prompts_path = args
-            .generate_prompts
-            .as_ref()
-            .context("decode mode requires --generate-prompts")?;
-        let mut prompts: Vec<DecodePrompt> = load_rerank_rows(prompts_path)?;
-        if let Some(limit) = args.limit {
-            prompts.truncate(limit);
-        }
-        ensure!(!prompts.is_empty(), "decode prompt set must not be empty");
-        let references = args
-            .decode_reference
-            .as_ref()
-            .map(|path| load_rerank_rows::<DecodeReference>(path))
-            .transpose()?
-            .map(|rows| {
-                rows.into_iter()
-                    .map(|row| (row.id.clone(), row))
-                    .collect::<HashMap<_, _>>()
-            });
-
-        let model = qwen3::Model::load(&args.model, args.dtype)?;
-        let mut tokenizer = Tokenizer::from_file(&args.tokenizer)
-            .map_err(|error| anyhow::anyhow!("tokenizer: {error}"))?;
-        tokenizer.with_padding(None);
-        tokenizer
-            .with_truncation(None)
-            .map_err(|error| anyhow::anyhow!("disable generation truncation: {error}"))?;
+        ensure!(
+            !args.weight_quant.is_quantized(),
+            "quantized Qwen3 decode is currently CUDA-only"
+        );
+        let model = qwen3::Model::load_with_quant(&args.model, args.dtype, args.weight_quant)?;
         let execution = MetalExecutionConfig::from_args(args, "qwen3-0.6b-decode")?;
         let mut decoder =
             MetalDecoder::new(&model, args.dtype, &execution, args.decode_cache_bucket)?;
-        let load_stages = decoder.stage_timings();
-        let stop_tokens = model
-            .generation_stop_ids()
-            .iter()
-            .copied()
-            .collect::<HashSet<_>>();
-        let constraint_config = load_json_constraint_config(args, &tokenizer)?;
-        let cold_load_s = started.elapsed().as_secs_f64();
-        let mut tap_rows = Vec::new();
-        let mut results = Vec::with_capacity(prompts.len());
-        let mut prefill_wall_s = 0.0;
-        let mut decode_wall_s = 0.0;
-        let mut sample_wall_s = 0.0;
-        let mut constraint_wall_s = 0.0;
-        let mut constraint_valid_prompts = 0usize;
-        let mut prefill_stages = qwen3_decode::DecodeStageTimings::default();
-        let mut decode_stages = qwen3_decode::DecodeStageTimings::default();
-        let mut prefill_tokens = 0usize;
-        let mut generated_tokens = 0usize;
-        let mut exact_prompts = 0usize;
-        let mut accepted_near_ties = 0usize;
-        let mut hard_divergences = Vec::new();
-
-        for prompt in &prompts {
-            let prompt_ids =
-                model.encode_generation(&tokenizer, &prompt.prompt, args.decode_cache_bucket)?;
-            ensure!(
-                prompt_ids.len() + args.max_new_tokens <= args.decode_cache_bucket,
-                "prompt {} plus {} generated tokens exceeds cache bucket {}",
-                prompt.id,
-                args.max_new_tokens,
-                args.decode_cache_bucket
-            );
-            prefill_tokens += prompt_ids.len();
-            let before_prefill = decoder.stage_timings();
-            let prefill_started = Instant::now();
-            let mut session = DecodeSession::prefill(&mut decoder, &prompt_ids)?;
-            prefill_wall_s += prefill_started.elapsed().as_secs_f64();
-            let after_prefill = session.stage_timings();
-            prefill_stages.accumulate(after_prefill.delta(before_prefill));
-            let mut prompt_top_logits = Vec::new();
-            let decode_started = Instant::now();
-            let mut tap = |event: TokenTapEvent<'_>| {
-                prompt_top_logits.push(event.top_logits.to_vec());
-                tap_rows.push(DecodeTapRow {
-                    id: prompt.id.clone(),
-                    step: event.step,
-                    token_id: event.token_id,
-                    top_logits: event.top_logits.to_vec(),
-                });
-            };
-            let tokens = if let Some(config) = &constraint_config {
-                let mut constraint = json_constraint::JsonConstraint::new(
-                    config.vocabulary.clone(),
-                    config.schema.as_ref(),
-                    &stop_tokens,
-                );
-                session.generate_constrained(
-                    args.max_new_tokens,
-                    &stop_tokens,
-                    args.decode_top_k,
-                    &mut constraint,
-                    &mut tap,
-                )?
-            } else {
-                session.generate(
-                    args.max_new_tokens,
-                    &stop_tokens,
-                    args.decode_top_k,
-                    &mut tap,
-                )?
-            };
-            decode_wall_s += decode_started.elapsed().as_secs_f64();
-            decode_stages.accumulate(session.stage_timings().delta(after_prefill));
-            sample_wall_s += session.sample_wall_s();
-            constraint_wall_s += session.constraint_wall_s();
-            generated_tokens += tokens.len();
-            let text = constraint_config
-                .as_ref()
-                .map(|config| {
-                    validate_constrained_output(&tokenizer, &tokens, config.schema.as_ref())
-                })
-                .transpose()?;
-            if text.is_some() {
-                constraint_valid_prompts += 1;
-            }
-
-            let mut exact_reference = None;
-            let mut prompt_near_ties = Vec::new();
-            if let Some(reference) = references
-                .as_ref()
-                .and_then(|references| references.get(&prompt.id))
-            {
-                let exact = tokens == reference.tokens;
-                exact_reference = Some(exact);
-                if exact {
-                    exact_prompts += 1;
-                } else {
-                    let divergences_before_prompt = hard_divergences.len();
-                    for (step, (&owned_token, &reference_token)) in
-                        tokens.iter().zip(&reference.tokens).enumerate()
-                    {
-                        if owned_token == reference_token {
-                            continue;
-                        }
-                        let owned_top = prompt_top_logits.get(step).cloned().unwrap_or_default();
-                        let reference_top =
-                            reference.top_logits.get(step).cloned().unwrap_or_default();
-                        let owned_gap = top_two_gap(&owned_top);
-                        let reference_gap = top_two_gap(&reference_top);
-                        if owned_gap.is_some_and(|gap| gap < 1e-3)
-                            || reference_gap.is_some_and(|gap| gap < 1e-3)
-                        {
-                            prompt_near_ties.push(step);
-                            accepted_near_ties += 1;
-                        } else {
-                            hard_divergences.push(format!(
-                                "{} step {}: owned token {}, reference token {}, owned top-5 {:?}, reference top-5 {:?}",
-                                prompt.id,
-                                step,
-                                owned_token,
-                                reference_token,
-                                owned_top,
-                                reference_top
-                            ));
-                            break;
-                        }
-                    }
-                    if tokens.len() != reference.tokens.len()
-                        && hard_divergences.len() == divergences_before_prompt
-                    {
-                        hard_divergences.push(format!(
-                            "{}: owned generated {} tokens, reference generated {} tokens",
-                            prompt.id,
-                            tokens.len(),
-                            reference.tokens.len()
-                        ));
-                    }
-                }
-            } else if references.is_some() {
-                hard_divergences.push(format!("{}: missing decode reference row", prompt.id));
-            }
-            results.push(DecodePromptResult {
-                id: prompt.id.clone(),
-                prompt_tokens: prompt_ids.len(),
-                tokens,
-                text,
-                exact_reference,
-                accepted_near_ties: prompt_near_ties,
-            });
-        }
-
-        if let Some(path) = &args.decode_tap_out {
-            write_jsonl(path, &tap_rows)?;
-        }
-        let weight_regions = model.weight_regions();
-        ensure!(
-            weight_regions
-                .values()
-                .all(|region| region.buffer_handle != 0),
-            "Qwen3 weight registry contains a null buffer handle"
-        );
-        let result = DecodeServingResult {
-            lane: "owned-rt-metal",
-            workload: if constraint_config.is_some() {
-                "qwen3-greedy-json"
-            } else {
-                "qwen3-greedy-raw-completion"
-            },
-            model: args
-                .model_label
-                .clone()
-                .unwrap_or_else(|| "Qwen3-0.6B@owned-rt-f16".to_owned()),
-            cache_bucket: args.decode_cache_bucket,
-            max_new_tokens: args.max_new_tokens,
-            prompts: prompts.len(),
-            exact_prompts: references.as_ref().map(|_| exact_prompts),
-            accepted_near_ties,
-            prefill_wall_s,
-            decode_wall_s,
-            prefill_tok_per_s: prefill_tokens as f64 / prefill_wall_s,
-            decode_tok_per_s: generated_tokens as f64 / decode_wall_s,
-            load_stages,
-            prefill_stages,
-            decode_stages,
-            sample_wall_s,
-            constraint: constraint_config.as_ref().map(|config| {
-                if config.schema.is_some() {
-                    "json-schema"
-                } else {
-                    "json"
-                }
-            }),
-            constraint_vocab_size: constraint_config
-                .as_ref()
-                .map(|config| config.vocabulary.len()),
-            constraint_valid_prompts: constraint_config.as_ref().map(|_| constraint_valid_prompts),
-            constraint_wall_s,
-            constraint_ms_per_token: 1_000.0 * constraint_wall_s / generated_tokens.max(1) as f64,
-            kv_update_path: decoder.kv_update_path(),
-            weight_feed_path: decoder.weight_feed_path(),
-            optimization_level: decoder.optimization_level(),
-            weight_regions: weight_regions.len(),
-            results,
-        };
-        let out = args.out.as_ref().context("decode mode requires --out")?;
-        if let Some(parent) = out.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(out, serde_json::to_string_pretty(&result)?)?;
-        println!("{}", serde_json::to_string_pretty(&result)?);
-        eprintln!(
-            "decode cold load {:.3}s, prefill {:.1} tok/s, decode {:.1} tok/s, exact {:?}/{}",
-            cold_load_s,
-            result.prefill_tok_per_s,
-            result.decode_tok_per_s,
-            result.exact_prompts,
-            result.prompts
-        );
-        ensure!(
-            hard_divergences.is_empty(),
-            "token-exact decode gate failed:\n{}",
-            hard_divergences.join("\n")
-        );
-        Ok(())
+        run_qwen_decode_with_runtime(args, started, &model, &mut decoder)
     }
+
+    #[cfg(all(target_os = "linux", feature = "cuda"))]
+    {
+        use qwen3_decode::CudaDecoder;
+        ensure!(
+            matches!(args.device, DeviceArg::Cuda),
+            "Qwen3 CUDA decode requires --device cuda"
+        );
+        ensure!(
+            matches!(args.dtype, Precision::F32),
+            "Qwen3 CUDA decode keeps activations and KV state in fp32"
+        );
+        let model = qwen3::Model::load_with_quant(&args.model, args.dtype, args.weight_quant)?;
+        let mut decoder = CudaDecoder::new(&model, args.decode_cache_bucket)?;
+        run_qwen_decode_with_runtime(args, started, &model, &mut decoder)
+    }
+
+    #[cfg(not(any(target_os = "macos", all(target_os = "linux", feature = "cuda"))))]
+    bail!("Qwen3 owned-runtime decode requires macOS Metal or Linux with feature `cuda`");
+}
+
+fn run_qwen_decode_with_runtime<K: qwen3_decode::DecodeRuntime>(
+    args: &Args,
+    started: Instant,
+    model: &qwen3::Model,
+    decoder: &mut K,
+) -> Result<()> {
+    use qwen3_decode::{DecodeSession, TokenTapEvent};
+
+    ensure!(args.max_new_tokens > 0, "--max-new-tokens must be positive");
+    ensure!(args.decode_top_k > 0, "--decode-top-k must be positive");
+    let prompts_path = args
+        .generate_prompts
+        .as_ref()
+        .context("decode mode requires --generate-prompts")?;
+    let mut prompts: Vec<DecodePrompt> = load_rerank_rows(prompts_path)?;
+    if let Some(limit) = args.limit {
+        prompts.truncate(limit);
+    }
+    ensure!(!prompts.is_empty(), "decode prompt set must not be empty");
+    let references = args
+        .decode_reference
+        .as_ref()
+        .map(|path| load_rerank_rows::<DecodeReference>(path))
+        .transpose()?
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| (row.id.clone(), row))
+                .collect::<HashMap<_, _>>()
+        });
+
+    let mut tokenizer = Tokenizer::from_file(&args.tokenizer)
+        .map_err(|error| anyhow::anyhow!("tokenizer: {error}"))?;
+    tokenizer.with_padding(None);
+    tokenizer
+        .with_truncation(None)
+        .map_err(|error| anyhow::anyhow!("disable generation truncation: {error}"))?;
+    let load_stages = decoder.stage_timings();
+    let stop_tokens = model
+        .generation_stop_ids()
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    let constraint_config = load_json_constraint_config(args, &tokenizer)?;
+    let cold_load_s = started.elapsed().as_secs_f64();
+    let mut tap_rows = Vec::new();
+    let mut results = Vec::with_capacity(prompts.len());
+    let mut prefill_wall_s = 0.0;
+    let mut decode_wall_s = 0.0;
+    let mut sample_wall_s = 0.0;
+    let mut constraint_wall_s = 0.0;
+    let mut constraint_valid_prompts = 0usize;
+    let mut prefill_stages = qwen3_decode::DecodeStageTimings::default();
+    let mut decode_stages = qwen3_decode::DecodeStageTimings::default();
+    let mut prefill_tokens = 0usize;
+    let mut generated_tokens = 0usize;
+    let mut exact_prompts = 0usize;
+    let mut accepted_near_ties = 0usize;
+    let mut hard_divergences = Vec::new();
+
+    for prompt in &prompts {
+        let prompt_ids =
+            model.encode_generation(&tokenizer, &prompt.prompt, args.decode_cache_bucket)?;
+        ensure!(
+            prompt_ids.len() + args.max_new_tokens <= args.decode_cache_bucket,
+            "prompt {} plus {} generated tokens exceeds cache bucket {}",
+            prompt.id,
+            args.max_new_tokens,
+            args.decode_cache_bucket
+        );
+        prefill_tokens += prompt_ids.len();
+        let before_prefill = decoder.stage_timings();
+        let prefill_started = Instant::now();
+        let mut session = DecodeSession::prefill(decoder, &prompt_ids)?;
+        prefill_wall_s += prefill_started.elapsed().as_secs_f64();
+        let after_prefill = session.stage_timings();
+        prefill_stages.accumulate(after_prefill.delta(before_prefill));
+        let mut prompt_top_logits = Vec::new();
+        let decode_started = Instant::now();
+        let mut tap = |event: TokenTapEvent<'_>| {
+            prompt_top_logits.push(event.top_logits.to_vec());
+            tap_rows.push(DecodeTapRow {
+                id: prompt.id.clone(),
+                step: event.step,
+                token_id: event.token_id,
+                top_logits: event.top_logits.to_vec(),
+            });
+        };
+        let tokens = if let Some(config) = &constraint_config {
+            let mut constraint = json_constraint::JsonConstraint::new(
+                config.vocabulary.clone(),
+                config.schema.as_ref(),
+                &stop_tokens,
+            );
+            session.generate_constrained(
+                args.max_new_tokens,
+                &stop_tokens,
+                args.decode_top_k,
+                &mut constraint,
+                &mut tap,
+            )?
+        } else {
+            session.generate(
+                args.max_new_tokens,
+                &stop_tokens,
+                args.decode_top_k,
+                &mut tap,
+            )?
+        };
+        decode_wall_s += decode_started.elapsed().as_secs_f64();
+        decode_stages.accumulate(session.stage_timings().delta(after_prefill));
+        sample_wall_s += session.sample_wall_s();
+        constraint_wall_s += session.constraint_wall_s();
+        generated_tokens += tokens.len();
+        let text = constraint_config
+            .as_ref()
+            .map(|config| validate_constrained_output(&tokenizer, &tokens, config.schema.as_ref()))
+            .transpose()?;
+        if text.is_some() {
+            constraint_valid_prompts += 1;
+        }
+
+        let mut exact_reference = None;
+        let mut match_depth = None;
+        let mut prompt_near_ties = Vec::new();
+        if let Some(reference) = references
+            .as_ref()
+            .and_then(|references| references.get(&prompt.id))
+        {
+            let depth = tokens
+                .iter()
+                .zip(&reference.tokens)
+                .take_while(|(owned, oracle)| owned == oracle)
+                .count();
+            match_depth = Some(depth);
+            let exact = tokens == reference.tokens;
+            exact_reference = Some(exact);
+            if exact {
+                exact_prompts += 1;
+            } else if !args.weight_quant.is_quantized() {
+                let divergences_before_prompt = hard_divergences.len();
+                for (step, (&owned_token, &reference_token)) in
+                    tokens.iter().zip(&reference.tokens).enumerate()
+                {
+                    if owned_token == reference_token {
+                        continue;
+                    }
+                    let owned_top = prompt_top_logits.get(step).cloned().unwrap_or_default();
+                    let reference_top = reference.top_logits.get(step).cloned().unwrap_or_default();
+                    let owned_gap = top_two_gap(&owned_top);
+                    let reference_gap = top_two_gap(&reference_top);
+                    if owned_gap.is_some_and(|gap| gap < 1e-3)
+                        || reference_gap.is_some_and(|gap| gap < 1e-3)
+                    {
+                        prompt_near_ties.push(step);
+                        accepted_near_ties += 1;
+                    } else {
+                        hard_divergences.push(format!(
+                            "{} step {}: owned token {}, reference token {}, owned top-5 {:?}, reference top-5 {:?}",
+                            prompt.id,
+                            step,
+                            owned_token,
+                            reference_token,
+                            owned_top,
+                            reference_top
+                        ));
+                        break;
+                    }
+                }
+                if tokens.len() != reference.tokens.len()
+                    && hard_divergences.len() == divergences_before_prompt
+                {
+                    hard_divergences.push(format!(
+                        "{}: owned generated {} tokens, reference generated {} tokens",
+                        prompt.id,
+                        tokens.len(),
+                        reference.tokens.len()
+                    ));
+                }
+            }
+        } else if references.is_some() {
+            hard_divergences.push(format!("{}: missing decode reference row", prompt.id));
+        }
+        results.push(DecodePromptResult {
+            id: prompt.id.clone(),
+            prompt_tokens: prompt_ids.len(),
+            tokens,
+            match_depth,
+            text,
+            exact_reference,
+            accepted_near_ties: prompt_near_ties,
+        });
+    }
+
+    if let Some(path) = &args.decode_tap_out {
+        write_jsonl(path, &tap_rows)?;
+    }
+    let weight_regions = model.weight_regions();
+    ensure!(
+        weight_regions
+            .values()
+            .all(|region| region.buffer_handle != 0),
+        "Qwen3 weight registry contains a null buffer handle"
+    );
+    let weight_bytes = model.decode_weight_bytes();
+    let achieved_weight_gb_s = weight_bytes as f64 * generated_tokens as f64
+        / decode_wall_s.max(f64::MIN_POSITIVE)
+        / 1.0e9;
+    let result = DecodeServingResult {
+        lane: decoder.lane(),
+        workload: if constraint_config.is_some() {
+            "qwen3-greedy-json"
+        } else {
+            "qwen3-greedy-raw-completion"
+        },
+        model: args.model_label.clone().unwrap_or_else(|| {
+            format!(
+                "Qwen3-0.6B@owned-rt-{}-{}",
+                args.dtype.as_str(),
+                args.weight_quant.as_str()
+            )
+        }),
+        cache_bucket: args.decode_cache_bucket,
+        max_new_tokens: args.max_new_tokens,
+        prompts: prompts.len(),
+        exact_prompts: references.as_ref().map(|_| exact_prompts),
+        accepted_near_ties,
+        prefill_wall_s,
+        decode_wall_s,
+        prefill_tok_per_s: prefill_tokens as f64 / prefill_wall_s.max(f64::MIN_POSITIVE),
+        decode_tok_per_s: generated_tokens as f64 / decode_wall_s.max(f64::MIN_POSITIVE),
+        load_stages,
+        prefill_stages,
+        decode_stages,
+        sample_wall_s,
+        constraint: constraint_config.as_ref().map(|config| {
+            if config.schema.is_some() {
+                "json-schema"
+            } else {
+                "json"
+            }
+        }),
+        constraint_vocab_size: constraint_config
+            .as_ref()
+            .map(|config| config.vocabulary.len()),
+        constraint_valid_prompts: constraint_config.as_ref().map(|_| constraint_valid_prompts),
+        constraint_wall_s,
+        constraint_ms_per_token: 1_000.0 * constraint_wall_s / generated_tokens.max(1) as f64,
+        kv_update_path: decoder.kv_update_path(),
+        weight_feed_path: decoder.weight_feed_path(),
+        optimization_level: decoder.optimization_level(),
+        weight_regions: weight_regions.len(),
+        weight_quantization: args.weight_quant,
+        weight_bytes_per_token: weight_bytes,
+        achieved_weight_gb_s,
+        quantized_weight_sha256: model.quantized_weight_sha256(),
+        results,
+    };
+    let out = args.out.as_ref().context("decode mode requires --out")?;
+    if let Some(parent) = out.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(out, serde_json::to_string_pretty(&result)?)?;
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    eprintln!(
+        "decode cold load {:.3}s, prefill {:.1} tok/s, decode {:.1} tok/s, effective weight bandwidth {:.1} GB/s, exact {:?}/{}",
+        cold_load_s,
+        result.prefill_tok_per_s,
+        result.decode_tok_per_s,
+        result.achieved_weight_gb_s,
+        result.exact_prompts,
+        result.prompts
+    );
+    ensure!(
+        hard_divergences.is_empty(),
+        "token-exact fp32/f16 decode gate failed:\n{}",
+        hard_divergences.join("\n")
+    );
+    Ok(())
 }
 
 fn run_lfm2_decode_cli(args: &Args, started: Instant) -> Result<()> {
@@ -1181,6 +1237,10 @@ fn run_lfm2_decode_cli(args: &Args, started: Instant) -> Result<()> {
     );
     ensure!(args.max_new_tokens > 0, "--max-new-tokens must be positive");
     ensure!(args.decode_top_k > 0, "--decode-top-k must be positive");
+    ensure!(
+        !args.weight_quant.is_quantized() || matches!(args.device, DeviceArg::Cuda),
+        "quantized LFM2 decode is currently CUDA-only"
+    );
     let prompts_path = args
         .generate_prompts
         .as_ref()
@@ -1211,7 +1271,7 @@ fn run_lfm2_decode_cli(args: &Args, started: Instant) -> Result<()> {
                 .collect::<HashMap<_, _>>()
         });
 
-    let model = lfm2::Model::load(&args.model, args.dtype)?;
+    let model = lfm2::Model::load_with_quant(&args.model, args.dtype, args.weight_quant)?;
     let mut tokenizer = Tokenizer::from_file(&args.tokenizer)
         .map_err(|error| anyhow::anyhow!("tokenizer: {error}"))?;
     tokenizer.with_padding(None);
@@ -1388,15 +1448,22 @@ fn run_lfm2_decode_cli(args: &Args, started: Instant) -> Result<()> {
         }
 
         let mut exact_reference = None;
+        let mut match_depth = None;
         if let Some(reference) = references
             .as_ref()
             .and_then(|references| references.get(&prompt.id))
         {
+            let depth = tokens
+                .iter()
+                .zip(&reference.tokens)
+                .take_while(|(owned, oracle)| owned == oracle)
+                .count();
+            match_depth = Some(depth);
             let exact = tokens == reference.tokens;
             exact_reference = Some(exact);
             if exact {
                 exact_prompts += 1;
-            } else {
+            } else if !args.weight_quant.is_quantized() {
                 let shared = tokens.len().min(reference.tokens.len());
                 let first_difference =
                     (0..shared).find(|&step| tokens[step] != reference.tokens[step]);
@@ -1433,6 +1500,7 @@ fn run_lfm2_decode_cli(args: &Args, started: Instant) -> Result<()> {
             id: prompt.id.clone(),
             prompt_tokens: prompt_ids.len(),
             tokens,
+            match_depth,
             text,
             exact_reference,
             accepted_near_ties: Vec::new(),
@@ -1445,7 +1513,17 @@ fn run_lfm2_decode_cli(args: &Args, started: Instant) -> Result<()> {
     if let Some(path) = &args.decode_hidden_out {
         write_jsonl(path, &hidden_rows)?;
     }
-    let weight_count = decoder.weight_count();
+    let weight_regions = model.weight_regions();
+    ensure!(
+        weight_regions
+            .values()
+            .all(|region| region.buffer_handle != 0),
+        "LFM2 weight registry contains a null buffer handle"
+    );
+    let weight_bytes = model.decode_weight_bytes();
+    let achieved_weight_gb_s = weight_bytes as f64 * generated_tokens as f64
+        / decode_wall_s.max(f64::MIN_POSITIVE)
+        / 1.0e9;
     let result = DecodeServingResult {
         lane: provider_name,
         workload: if constraint_config.is_some() {
@@ -1453,10 +1531,13 @@ fn run_lfm2_decode_cli(args: &Args, started: Instant) -> Result<()> {
         } else {
             "lfm2-greedy-raw-completion"
         },
-        model: args
-            .model_label
-            .clone()
-            .unwrap_or_else(|| format!("LFM2-1.2B@owned-rt-{}", args.dtype.as_str())),
+        model: args.model_label.clone().unwrap_or_else(|| {
+            format!(
+                "LFM2-1.2B@owned-rt-{}-{}",
+                args.dtype.as_str(),
+                args.weight_quant.as_str()
+            )
+        }),
         cache_bucket: args.decode_cache_bucket,
         max_new_tokens: args.max_new_tokens,
         prompts: prompts.len(),
@@ -1489,12 +1570,20 @@ fn run_lfm2_decode_cli(args: &Args, started: Instant) -> Result<()> {
             "owned-rust-hybrid-cache"
         },
         weight_feed_path: if matches!(args.device, DeviceArg::Cuda) {
-            "cuda-persistent-fp32"
+            if args.weight_quant.is_quantized() {
+                "cuda-persistent-q8_0-fused-dequant-matvec"
+            } else {
+                "cuda-persistent-fp32"
+            }
         } else {
             "provider-static-rhs"
         },
         optimization_level: u8::from(matches!(args.device, DeviceArg::Cuda)),
-        weight_regions: weight_count,
+        weight_regions: weight_regions.len(),
+        weight_quantization: args.weight_quant,
+        weight_bytes_per_token: weight_bytes,
+        achieved_weight_gb_s,
+        quantized_weight_sha256: model.quantized_weight_sha256(),
         results,
     };
     let out = args.out.as_ref().context("decode mode requires --out")?;
@@ -1504,10 +1593,11 @@ fn run_lfm2_decode_cli(args: &Args, started: Instant) -> Result<()> {
     fs::write(out, serde_json::to_string_pretty(&result)?)?;
     println!("{}", serde_json::to_string_pretty(&result)?);
     eprintln!(
-        "LFM2 decode cold load {:.3}s, prefill {:.1} tok/s, decode {:.2} tok/s, exact {:?}/{}, hidden min cosine {:.8}, cache verified {}/{}",
+        "LFM2 decode cold load {:.3}s, prefill {:.1} tok/s, decode {:.2} tok/s, effective weight bandwidth {:.1} GB/s, exact {:?}/{}, hidden min cosine {:.8}, cache verified {}/{}",
         cold_load_s,
         result.prefill_tok_per_s,
         result.decode_tok_per_s,
+        result.achieved_weight_gb_s,
         result.exact_prompts,
         result.prompts,
         minimum_hidden_cosine,

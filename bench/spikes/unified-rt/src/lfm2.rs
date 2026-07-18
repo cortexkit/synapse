@@ -5,7 +5,7 @@
 //! remain explicit so the CPU and Metal paths share one architecture definition.
 
 use std::any::Any;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{bail, ensure, Context, Result};
@@ -13,8 +13,11 @@ use serde::Deserialize;
 use tokenizers::Tokenizer;
 
 use super::{
-    get_tensor, load_safetensor_map, resolve_model_root, BLayout, BatchShape, BlockBackend,
-    BlockForwardRequest, KernelProvider, MetalExecutionConfig, ModelFamily, Precision, Tensor,
+    get_tensor, load_safetensor_map,
+    quant::{quantized_sha256, CudaWeight, Q8_0Tensor, WeightQuantization},
+    qwen3_decode::{WeightRegion, WeightRegionKey},
+    resolve_model_root, BLayout, BatchShape, BlockBackend, BlockForwardRequest, KernelProvider,
+    MetalExecutionConfig, ModelFamily, Precision, Tensor,
 };
 
 #[derive(Debug, Deserialize)]
@@ -110,6 +113,8 @@ pub(crate) struct Model {
     pub(crate) layers: Vec<Layer>,
     pub(crate) final_norm: RmsNorm,
     pub(crate) lm_head: Option<Weight>,
+    tied_lm_head_q8_0: Option<Q8_0Tensor>,
+    weight_quantization: WeightQuantization,
     generation_stop_ids: Vec<u32>,
 }
 
@@ -145,11 +150,88 @@ pub(crate) struct AttentionMixer {
 
 pub(crate) struct Weight {
     pub(crate) tensor: Tensor,
+    pub(crate) q8_0: Option<Q8_0Tensor>,
 }
 
 pub(crate) struct RmsNorm {
     pub(crate) weight: Tensor,
     pub(crate) eps: f32,
+}
+
+fn active_weight_bytes(weight: &Weight) -> usize {
+    weight
+        .q8_0
+        .as_ref()
+        .map_or(weight.tensor.data.len() * 4, |quantized| {
+            quantized.as_bytes().len()
+        })
+}
+
+fn insert_weight_region(
+    regions: &mut BTreeMap<WeightRegionKey, WeightRegion>,
+    layer: Option<usize>,
+    tensor_name: &'static str,
+    weight: &Weight,
+) {
+    if let Some(quantized) = &weight.q8_0 {
+        insert_quantized_region(regions, layer, tensor_name, quantized);
+    } else {
+        insert_tensor_region(regions, layer, tensor_name, &weight.tensor);
+    }
+}
+
+fn insert_quantized_region(
+    regions: &mut BTreeMap<WeightRegionKey, WeightRegion>,
+    layer: Option<usize>,
+    tensor_name: &'static str,
+    quantized: &Q8_0Tensor,
+) {
+    insert_bytes_region(regions, layer, tensor_name, quantized.as_bytes());
+}
+
+fn insert_tensor_region(
+    regions: &mut BTreeMap<WeightRegionKey, WeightRegion>,
+    layer: Option<usize>,
+    tensor_name: &'static str,
+    tensor: &Tensor,
+) {
+    let bytes = std::mem::size_of_val(tensor.data.as_slice());
+    let checksum = tensor
+        .data
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .fold(1469598103934665603u64, checksum_byte);
+    regions.insert(
+        WeightRegionKey { layer, tensor_name },
+        WeightRegion {
+            buffer_handle: tensor.data.as_ptr() as usize,
+            byte_len: bytes,
+            checksum,
+        },
+    );
+}
+
+fn insert_bytes_region(
+    regions: &mut BTreeMap<WeightRegionKey, WeightRegion>,
+    layer: Option<usize>,
+    tensor_name: &'static str,
+    bytes: &[u8],
+) {
+    regions.insert(
+        WeightRegionKey { layer, tensor_name },
+        WeightRegion {
+            buffer_handle: bytes.as_ptr() as usize,
+            byte_len: bytes.len(),
+            checksum: bytes
+                .iter()
+                .copied()
+                .fold(1469598103934665603u64, checksum_byte),
+        },
+    );
+}
+
+fn checksum_byte(hash: u64, byte: u8) -> u64 {
+    (hash ^ u64::from(byte)).wrapping_mul(1099511628211)
 }
 
 pub(crate) struct DecodeCache {
@@ -303,7 +385,15 @@ fn parse_layer_type(name: &str) -> Result<LayerType> {
 }
 
 impl Model {
-    pub(crate) fn load(path: &Path, _precision: Precision) -> Result<Self> {
+    pub(crate) fn load(path: &Path, precision: Precision) -> Result<Self> {
+        Self::load_with_quant(path, precision, WeightQuantization::None)
+    }
+
+    pub(crate) fn load_with_quant(
+        path: &Path,
+        _precision: Precision,
+        weight_quantization: WeightQuantization,
+    ) -> Result<Self> {
         let root = resolve_model_root(path)?;
         let config_path = root.join("config.json");
         let config_json: serde_json::Value = serde_json::from_str(
@@ -327,9 +417,21 @@ impl Model {
         let mut actual_intermediate_size = None;
         for (index, layer_type) in config.layer_types.iter().copied().enumerate() {
             let prefix = format!("layers.{index}");
-            let w1 = load_weight(&tensors, &format!("{prefix}.feed_forward.w1"))?;
-            let w2 = load_weight(&tensors, &format!("{prefix}.feed_forward.w2"))?;
-            let w3 = load_weight(&tensors, &format!("{prefix}.feed_forward.w3"))?;
+            let w1 = load_weight(
+                &tensors,
+                &format!("{prefix}.feed_forward.w1"),
+                weight_quantization,
+            )?;
+            let w2 = load_weight(
+                &tensors,
+                &format!("{prefix}.feed_forward.w2"),
+                weight_quantization,
+            )?;
+            let w3 = load_weight(
+                &tensors,
+                &format!("{prefix}.feed_forward.w3"),
+                weight_quantization,
+            )?;
             let layer_intermediate = w1
                 .tensor
                 .shape
@@ -349,10 +451,14 @@ impl Model {
                     &prefix,
                     config.hidden_size,
                     config.conv_kernel_size,
+                    weight_quantization,
                 )?)),
-                LayerType::FullAttention => {
-                    Mixer::Attention(Box::new(load_attention_mixer(&tensors, &prefix, &config)?))
-                }
+                LayerType::FullAttention => Mixer::Attention(Box::new(load_attention_mixer(
+                    &tensors,
+                    &prefix,
+                    &config,
+                    weight_quantization,
+                )?)),
             };
             layers.push(Layer {
                 operator_norm: load_norm(
@@ -374,7 +480,7 @@ impl Model {
         let lm_head = if config.tie_word_embeddings {
             None
         } else {
-            Some(load_weight(&tensors, "lm_head")?)
+            Some(load_weight(&tensors, "lm_head", weight_quantization)?)
         };
         if let Some(head) = &lm_head {
             ensure!(
@@ -420,12 +526,21 @@ impl Model {
         generation_stop_ids.sort_unstable();
         generation_stop_ids.dedup();
 
+        let tied_lm_head_q8_0 = if config.tie_word_embeddings
+            && matches!(weight_quantization, WeightQuantization::Q8_0)
+        {
+            Some(Q8_0Tensor::quantize(&embeddings.data, config.hidden_size)?)
+        } else {
+            None
+        };
         Ok(Self {
             config,
             embeddings,
             layers,
             final_norm,
             lm_head,
+            tied_lm_head_q8_0,
+            weight_quantization,
             generation_stop_ids,
         })
     }
@@ -471,6 +586,161 @@ impl Model {
         }
     }
 
+    fn lm_head_q8_0(&self) -> Option<&Q8_0Tensor> {
+        if self.config.tie_word_embeddings {
+            self.tied_lm_head_q8_0.as_ref()
+        } else {
+            self.lm_head.as_ref().and_then(|head| head.q8_0.as_ref())
+        }
+    }
+
+    pub(crate) fn decode_weight_bytes(&self) -> usize {
+        let mut bytes = self.final_norm.weight.data.len() * 4;
+        for layer in &self.layers {
+            bytes += (layer.operator_norm.weight.data.len() + layer.ffn_norm.weight.data.len()) * 4;
+            for weight in [&layer.w1, &layer.w2, &layer.w3] {
+                bytes += active_weight_bytes(weight);
+            }
+            match &layer.mixer {
+                Mixer::Conv(mixer) => {
+                    bytes += active_weight_bytes(&mixer.in_proj)
+                        + mixer.conv_weight.data.len() * 4
+                        + active_weight_bytes(&mixer.out_proj);
+                }
+                Mixer::Attention(mixer) => {
+                    bytes += (mixer.q_norm.weight.data.len() + mixer.k_norm.weight.data.len()) * 4;
+                    for weight in [&mixer.q_proj, &mixer.k_proj, &mixer.v_proj, &mixer.out_proj] {
+                        bytes += active_weight_bytes(weight);
+                    }
+                }
+            }
+        }
+        bytes
+            + self.lm_head_q8_0().map_or_else(
+                || self.lm_head().map_or(0, |head| head.data.len() * 4),
+                |head| head.as_bytes().len(),
+            )
+    }
+
+    pub(crate) fn quantized_weight_sha256(&self) -> Option<String> {
+        self.weight_quantization.is_quantized().then(|| {
+            let mut weights = Vec::new();
+            for layer in &self.layers {
+                weights.extend(
+                    [&layer.w1, &layer.w2, &layer.w3]
+                        .into_iter()
+                        .filter_map(|weight| weight.q8_0.as_ref()),
+                );
+                match &layer.mixer {
+                    Mixer::Conv(mixer) => weights.extend(
+                        [&mixer.in_proj, &mixer.out_proj]
+                            .into_iter()
+                            .filter_map(|weight| weight.q8_0.as_ref()),
+                    ),
+                    Mixer::Attention(mixer) => weights.extend(
+                        [&mixer.q_proj, &mixer.k_proj, &mixer.v_proj, &mixer.out_proj]
+                            .into_iter()
+                            .filter_map(|weight| weight.q8_0.as_ref()),
+                    ),
+                }
+            }
+            weights.extend(self.lm_head_q8_0());
+            quantized_sha256(weights)
+        })
+    }
+
+    pub(crate) fn weight_regions(&self) -> BTreeMap<WeightRegionKey, WeightRegion> {
+        let mut regions = BTreeMap::new();
+        insert_tensor_region(&mut regions, None, "embed_tokens.weight", &self.embeddings);
+        insert_tensor_region(
+            &mut regions,
+            None,
+            "embedding_norm.weight",
+            &self.final_norm.weight,
+        );
+        if let Some(head) = &self.lm_head {
+            insert_weight_region(&mut regions, None, "lm_head.weight", head);
+        } else if let Some(head) = &self.tied_lm_head_q8_0 {
+            insert_quantized_region(&mut regions, None, "lm_head.weight", head);
+        }
+        for (index, layer) in self.layers.iter().enumerate() {
+            insert_tensor_region(
+                &mut regions,
+                Some(index),
+                "operator_norm.weight",
+                &layer.operator_norm.weight,
+            );
+            insert_tensor_region(
+                &mut regions,
+                Some(index),
+                "ffn_norm.weight",
+                &layer.ffn_norm.weight,
+            );
+            for (name, weight) in [
+                ("feed_forward.w1.weight", &layer.w1),
+                ("feed_forward.w2.weight", &layer.w2),
+                ("feed_forward.w3.weight", &layer.w3),
+            ] {
+                insert_weight_region(&mut regions, Some(index), name, weight);
+            }
+            match &layer.mixer {
+                Mixer::Conv(mixer) => {
+                    insert_weight_region(
+                        &mut regions,
+                        Some(index),
+                        "conv.in_proj.weight",
+                        &mixer.in_proj,
+                    );
+                    insert_tensor_region(
+                        &mut regions,
+                        Some(index),
+                        "conv.conv.weight",
+                        &mixer.conv_weight,
+                    );
+                    insert_weight_region(
+                        &mut regions,
+                        Some(index),
+                        "conv.out_proj.weight",
+                        &mixer.out_proj,
+                    );
+                }
+                Mixer::Attention(mixer) => {
+                    insert_weight_region(
+                        &mut regions,
+                        Some(index),
+                        "self_attn.q_proj.weight",
+                        &mixer.q_proj,
+                    );
+                    insert_tensor_region(
+                        &mut regions,
+                        Some(index),
+                        "self_attn.q_layernorm.weight",
+                        &mixer.q_norm.weight,
+                    );
+                    insert_weight_region(
+                        &mut regions,
+                        Some(index),
+                        "self_attn.k_proj.weight",
+                        &mixer.k_proj,
+                    );
+                    insert_tensor_region(
+                        &mut regions,
+                        Some(index),
+                        "self_attn.k_layernorm.weight",
+                        &mixer.k_norm.weight,
+                    );
+                    for (name, weight) in [
+                        ("self_attn.v_proj.weight", &mixer.v_proj),
+                        ("self_attn.out_proj.weight", &mixer.out_proj),
+                    ] {
+                        insert_weight_region(&mut regions, Some(index), name, weight);
+                    }
+                }
+            }
+        }
+        regions
+    }
+
     fn cuda_layer_params(&self) -> Vec<super::cuda_backend::Lfm2LayerParams> {
         self.layers
             .iter()
@@ -479,33 +749,45 @@ impl Model {
                     mixer_type: 0,
                     operator_norm: layer.operator_norm.weight.data.as_ptr(),
                     ffn_norm: layer.ffn_norm.weight.data.as_ptr(),
-                    conv_in_weight: std::ptr::null(),
+                    conv_in_weight: CudaWeight::null(),
                     conv_weight: std::ptr::null(),
-                    conv_out_weight: std::ptr::null(),
-                    q_weight: std::ptr::null(),
+                    conv_out_weight: CudaWeight::null(),
+                    q_weight: CudaWeight::null(),
                     q_norm: std::ptr::null(),
-                    k_weight: std::ptr::null(),
+                    k_weight: CudaWeight::null(),
                     k_norm: std::ptr::null(),
-                    v_weight: std::ptr::null(),
-                    attention_out_weight: std::ptr::null(),
-                    w1_weight: layer.w1.tensor.data.as_ptr(),
-                    w2_weight: layer.w2.tensor.data.as_ptr(),
-                    w3_weight: layer.w3.tensor.data.as_ptr(),
+                    v_weight: CudaWeight::null(),
+                    attention_out_weight: CudaWeight::null(),
+                    w1_weight: CudaWeight::new(&layer.w1.tensor.data, layer.w1.q8_0.as_ref()),
+                    w2_weight: CudaWeight::new(&layer.w2.tensor.data, layer.w2.q8_0.as_ref()),
+                    w3_weight: CudaWeight::new(&layer.w3.tensor.data, layer.w3.q8_0.as_ref()),
                 };
                 match &layer.mixer {
                     Mixer::Conv(mixer) => {
-                        params.conv_in_weight = mixer.in_proj.tensor.data.as_ptr();
+                        params.conv_in_weight = CudaWeight::new(
+                            &mixer.in_proj.tensor.data,
+                            mixer.in_proj.q8_0.as_ref(),
+                        );
                         params.conv_weight = mixer.conv_weight.data.as_ptr();
-                        params.conv_out_weight = mixer.out_proj.tensor.data.as_ptr();
+                        params.conv_out_weight = CudaWeight::new(
+                            &mixer.out_proj.tensor.data,
+                            mixer.out_proj.q8_0.as_ref(),
+                        );
                     }
                     Mixer::Attention(mixer) => {
                         params.mixer_type = 1;
-                        params.q_weight = mixer.q_proj.tensor.data.as_ptr();
+                        params.q_weight =
+                            CudaWeight::new(&mixer.q_proj.tensor.data, mixer.q_proj.q8_0.as_ref());
                         params.q_norm = mixer.q_norm.weight.data.as_ptr();
-                        params.k_weight = mixer.k_proj.tensor.data.as_ptr();
+                        params.k_weight =
+                            CudaWeight::new(&mixer.k_proj.tensor.data, mixer.k_proj.q8_0.as_ref());
                         params.k_norm = mixer.k_norm.weight.data.as_ptr();
-                        params.v_weight = mixer.v_proj.tensor.data.as_ptr();
-                        params.attention_out_weight = mixer.out_proj.tensor.data.as_ptr();
+                        params.v_weight =
+                            CudaWeight::new(&mixer.v_proj.tensor.data, mixer.v_proj.q8_0.as_ref());
+                        params.attention_out_weight = CudaWeight::new(
+                            &mixer.out_proj.tensor.data,
+                            mixer.out_proj.q8_0.as_ref(),
+                        );
                     }
                 }
                 params
@@ -542,7 +824,7 @@ impl Model {
                 config.rope_theta,
                 &params,
                 &self.final_norm.weight.data,
-                &lm_head.data,
+                CudaWeight::new(&lm_head.data, self.lm_head_q8_0()),
             )
         };
         provider.lfm2_forward(BlockForwardRequest {
@@ -587,7 +869,7 @@ impl Model {
                 config.rope_theta,
                 &params,
                 &self.final_norm.weight.data,
-                &lm_head.data,
+                CudaWeight::new(&lm_head.data, self.lm_head_q8_0()),
             )?);
             Ok(())
         };
@@ -635,7 +917,7 @@ impl Model {
                 config.rope_theta,
                 &params,
                 &self.final_norm.weight.data,
-                &lm_head.data,
+                CudaWeight::new(&lm_head.data, self.lm_head_q8_0()),
             )?);
             Ok(())
         };
@@ -955,10 +1237,19 @@ fn get_lfm2_tensor(tensors: &HashMap<String, Tensor>, name: &str) -> Result<Tens
     get_tensor(tensors, name).or_else(|_| get_tensor(tensors, &format!("lfm.{name}")))
 }
 
-fn load_weight(tensors: &HashMap<String, Tensor>, prefix: &str) -> Result<Weight> {
-    Ok(Weight {
-        tensor: get_lfm2_tensor(tensors, &format!("{prefix}.weight"))?,
-    })
+fn load_weight(
+    tensors: &HashMap<String, Tensor>,
+    prefix: &str,
+    weight_quantization: WeightQuantization,
+) -> Result<Weight> {
+    let tensor = get_lfm2_tensor(tensors, &format!("{prefix}.weight"))?;
+    let q8_0 = if matches!(weight_quantization, WeightQuantization::Q8_0) {
+        let (_, row_width) = tensor.matrix_shape()?;
+        Some(Q8_0Tensor::quantize(&tensor.data, row_width)?)
+    } else {
+        None
+    };
+    Ok(Weight { tensor, q8_0 })
 }
 
 fn load_norm(tensors: &HashMap<String, Tensor>, prefix: &str, eps: f32) -> Result<RmsNorm> {
@@ -973,6 +1264,7 @@ fn load_conv_mixer(
     prefix: &str,
     hidden: usize,
     configured_kernel: usize,
+    weight_quantization: WeightQuantization,
 ) -> Result<ConvMixer> {
     for name in ["in_proj.bias", "conv.bias", "out_proj.bias"] {
         let full_name = format!("model.{prefix}.conv.{name}");
@@ -993,9 +1285,17 @@ fn load_conv_mixer(
         "LFM2 {prefix} convolution kernel {kernel_size} differs from conv_L_cache {configured_kernel}"
     );
     Ok(ConvMixer {
-        in_proj: load_weight(tensors, &format!("{prefix}.conv.in_proj"))?,
+        in_proj: load_weight(
+            tensors,
+            &format!("{prefix}.conv.in_proj"),
+            weight_quantization,
+        )?,
         conv_weight,
-        out_proj: load_weight(tensors, &format!("{prefix}.conv.out_proj"))?,
+        out_proj: load_weight(
+            tensors,
+            &format!("{prefix}.conv.out_proj"),
+            weight_quantization,
+        )?,
         kernel_size,
     })
 }
@@ -1004,22 +1304,39 @@ fn load_attention_mixer(
     tensors: &HashMap<String, Tensor>,
     prefix: &str,
     config: &Config,
+    weight_quantization: WeightQuantization,
 ) -> Result<AttentionMixer> {
     Ok(AttentionMixer {
-        q_proj: load_weight(tensors, &format!("{prefix}.self_attn.q_proj"))?,
+        q_proj: load_weight(
+            tensors,
+            &format!("{prefix}.self_attn.q_proj"),
+            weight_quantization,
+        )?,
         q_norm: load_norm(
             tensors,
             &format!("{prefix}.self_attn.q_layernorm"),
             config.rms_norm_eps,
         )?,
-        k_proj: load_weight(tensors, &format!("{prefix}.self_attn.k_proj"))?,
+        k_proj: load_weight(
+            tensors,
+            &format!("{prefix}.self_attn.k_proj"),
+            weight_quantization,
+        )?,
         k_norm: load_norm(
             tensors,
             &format!("{prefix}.self_attn.k_layernorm"),
             config.rms_norm_eps,
         )?,
-        v_proj: load_weight(tensors, &format!("{prefix}.self_attn.v_proj"))?,
-        out_proj: load_weight(tensors, &format!("{prefix}.self_attn.out_proj"))?,
+        v_proj: load_weight(
+            tensors,
+            &format!("{prefix}.self_attn.v_proj"),
+            weight_quantization,
+        )?,
+        out_proj: load_weight(
+            tensors,
+            &format!("{prefix}.self_attn.out_proj"),
+            weight_quantization,
+        )?,
     })
 }
 
@@ -1640,6 +1957,7 @@ pub(crate) fn tiny_test_model() -> Model {
     fn weight(output: usize, input: usize, seed: usize) -> Weight {
         Weight {
             tensor: tensor(vec![output, input], seed),
+            q8_0: None,
         }
     }
 
@@ -1709,6 +2027,8 @@ pub(crate) fn tiny_test_model() -> Model {
         layers: vec![conv, attention],
         final_norm: norm(4),
         lm_head: None,
+        tied_lm_head_q8_0: None,
+        weight_quantization: WeightQuantization::None,
         generation_stop_ids: vec![7],
     }
 }
@@ -1856,6 +2176,21 @@ mod tests {
         for (actual, expected) in actual.iter().zip(expected) {
             assert!((actual - expected).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn weight_registry_addresses_the_active_lfm2_storage() {
+        let model = tiny_test_model();
+        let regions = model.weight_regions();
+        let key = WeightRegionKey {
+            layer: Some(0),
+            tensor_name: "feed_forward.w1.weight",
+        };
+        assert_ne!(regions[&key].buffer_handle, 0);
+        assert_eq!(regions[&key].byte_len, 6 * 4 * std::mem::size_of::<f32>());
+        assert!(regions
+            .keys()
+            .any(|key| { key.layer == Some(1) && key.tensor_name == "self_attn.q_proj.weight" }));
     }
 
     #[test]

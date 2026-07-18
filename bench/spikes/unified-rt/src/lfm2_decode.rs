@@ -93,6 +93,7 @@ impl<'model, 'provider> Decoder<'model, 'provider> {
         Ok(generated)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn weight_count(&self) -> usize {
         self.model.weight_count()
     }
