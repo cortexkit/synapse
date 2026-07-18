@@ -109,6 +109,12 @@ impl<'model, 'provider> Decoder<'model, 'provider> {
             embeddings.len() <= self.capacity,
             "decode prefill embeddings exceed cache capacity"
         );
+        if let Some(prefilled) =
+            self.model
+                .prefill_embeddings(self.provider, embeddings, self.capacity)?
+        {
+            return Ok(prefilled);
+        }
         let mut cache = self.model.empty_decode_cache(self.capacity);
         let mut logits = None;
         for embedding in embeddings {
@@ -147,6 +153,16 @@ impl DecodeKernel for Decoder<'_, '_> {
             tokens.len() <= self.capacity,
             "decode prompt exceeds cache capacity"
         );
+        let embeddings = tokens
+            .iter()
+            .map(|&token| self.model.token_embedding(token).map(<[f32]>::to_vec))
+            .collect::<Result<Vec<_>>>()?;
+        if let Some(prefilled) =
+            self.model
+                .prefill_embeddings(self.provider, &embeddings, self.capacity)?
+        {
+            return Ok(prefilled);
+        }
         let mut cache = self.model.empty_decode_cache(self.capacity);
         let mut logits = None;
         for &token in tokens {
