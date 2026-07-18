@@ -30,6 +30,8 @@ DEFAULT_MODEL = (
 SAMPLE_COUNT = 12
 MAX_NEW_TOKENS = 64
 SAMPLE_PROMPT_INDICES = tuple((index * 7) % 20 for index in range(SAMPLE_COUNT))
+POWER_STATE_COMMAND = ("/usr/bin/pmset", "-g", "batt")
+LOW_BATTERY_THRESHOLD_PERCENT = 20
 HOOK_TESTS = (
     "token_stream_tap_observes_before_commit_without_changing_tokens",
     "paused_state_resumes_to_uninterrupted_tokens",
@@ -129,6 +131,81 @@ def load_jsonl_bytes(data: bytes, label: str) -> List[Dict[str, Any]]:
     if not rows:
         raise HarnessError(f"{label}: fixture is empty")
     return rows
+
+
+def parse_power_state(output: str) -> Dict[str, Any]:
+    """Parse the source and charge percentage reported by pmset."""
+    normalized = output.strip()
+    if not normalized:
+        raise HarnessError("POWER_STATE_PARSE_ERROR: pmset -g batt returned no output")
+
+    lines = normalized.splitlines()
+    source_match = re.fullmatch(r"Now drawing from '([^']+)'", lines[0].strip())
+    if source_match is None:
+        raise HarnessError(
+            "POWER_STATE_PARSE_ERROR: pmset -g batt did not report its power source"
+        )
+    percentage_match = re.search(r"(?<!\d)(\d{1,3})%", normalized)
+    if percentage_match is None:
+        raise HarnessError(
+            "POWER_STATE_PARSE_ERROR: pmset -g batt did not report a battery percentage"
+        )
+    battery_percent = int(percentage_match.group(1))
+    if battery_percent > 100:
+        raise HarnessError(
+            f"POWER_STATE_PARSE_ERROR: battery percentage is out of range: {battery_percent}%"
+        )
+    return {
+        "command": "pmset -g batt",
+        "output": normalized,
+        "power_source": source_match.group(1),
+        "battery_percent": battery_percent,
+    }
+
+
+def capture_power_state() -> Dict[str, Any]:
+    try:
+        completed = subprocess.run(
+            POWER_STATE_COMMAND,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as error:
+        raise HarnessError(f"POWER_STATE_PREFLIGHT_FAILED: could not run pmset: {error}") from error
+    output = "\n".join(
+        part for part in (completed.stdout, completed.stderr) if part
+    )
+    if completed.returncode != 0:
+        raise HarnessError(
+            f"POWER_STATE_PREFLIGHT_FAILED: pmset exited with status {completed.returncode}: "
+            f"{output.strip() or '<empty>'}"
+        )
+    return parse_power_state(output)
+
+
+def power_state_note(power_state: Mapping[str, Any]) -> str:
+    return (
+        "Power state (`pmset -g batt`): "
+        f"{power_state['power_source']}, {power_state['battery_percent']}% battery; "
+        f"output={power_state['output']!r}."
+    )
+
+
+def is_low_battery_power(power_state: Mapping[str, Any]) -> bool:
+    return (
+        str(power_state.get("power_source", "")).casefold() == "battery power"
+        and int(power_state.get("battery_percent", 100)) < LOW_BATTERY_THRESHOLD_PERCENT
+    )
+
+
+def enforce_power_preflight(power_state: Mapping[str, Any]) -> None:
+    if is_low_battery_power(power_state):
+        raise HarnessError(
+            "LOW_BATTERY_POWER_PREFLIGHT: refusing measurement with "
+            f"{power_state['battery_percent']}% remaining on battery power"
+        )
 
 
 def parse_manifest(text: str) -> Dict[str, str]:
@@ -438,7 +515,11 @@ def create_candidate_output_dirs(
 
 
 def preserve_failure_scene(
-    temp_root: Path, result_path: Path, workspace: Path, runner: Path
+    temp_root: Path,
+    result_path: Path,
+    workspace: Path,
+    runner: Path,
+    power_state: Mapping[str, Any],
 ) -> None:
     # The temp root is deleted on exit and the rig tears the campaign workspace
     # down after a failure, so the staging and build logs are the only forensics
@@ -474,6 +555,7 @@ def preserve_failure_scene(
             "euid": os.geteuid(),
             "cwd": os.getcwd(),
             "env_deadline_ms": os.environ.get("ALFONSO_CANDIDATE_DEADLINE_MS", ""),
+            "power_state": dict(power_state),
         }
         try:
             listing["workspace_stat"] = repr(os.stat(workspace))
@@ -682,14 +764,31 @@ def run_harness(workspace_arg: str, runner_arg: str, result_arg: str) -> int:
     gate_passed = False
     hooks_passed = False
     sibling_note = ""
+    power_state: Dict[str, Any] = {
+        "command": "pmset -g batt",
+        "output": "<preflight not completed>",
+        "power_source": "unknown",
+        "battery_percent": None,
+    }
+    power_note = "Power state: preflight not completed."
     baseline_note = (
-        f"Frozen master baseline: {baseline:.2f} tok/s on locked M1; measurement not completed."
+        f"Frozen master baseline: {baseline:.2f} tok/s on locked M1; measurement not completed. "
+        f"{power_note}"
     )
     writer.write(result_payload(False, False, [], None, "", baseline_note))
 
     temp_root = Path(tempfile.mkdtemp(prefix="synapse-decode-campaign-", dir="/tmp"))
     temp_root.chmod(0o755)
     try:
+        power_state = capture_power_state()
+        power_note = power_state_note(power_state)
+        baseline_note = (
+            f"Frozen master baseline: {baseline:.2f} tok/s on locked M1; measurement not completed. "
+            f"{power_note}"
+        )
+        writer.write(result_payload(False, False, [], None, "", baseline_note))
+        enforce_power_preflight(power_state)
+
         fixture_root = temp_root / "fixtures"
         prompts_path, references_path, prompts, references = extract_and_verify_fixtures(fixture_root)
         actual_digest = model_content_digest(model)
@@ -719,7 +818,7 @@ def run_harness(workspace_arg: str, runner_arg: str, result_arg: str) -> int:
         sibling_note = sibling_provenance(sibling_heads)
         baseline_note = (
             f"Frozen master baseline: {baseline:.2f} tok/s on locked M1; "
-            f"measurement not completed. {sibling_note}"
+            f"measurement not completed. {power_note} {sibling_note}"
         )
         writer.write(result_payload(False, False, [], None, "", baseline_note))
 
@@ -847,7 +946,7 @@ def run_harness(workspace_arg: str, runner_arg: str, result_arg: str) -> int:
         baseline_note = (
             f"Frozen master baseline: {baseline:.2f} tok/s on locked M1 "
             f"(DECODE-WAVE1.md); N={SAMPLE_COUNT} fresh processes with varied prompts. "
-            f"{sibling_note}"
+            f"{power_note} {sibling_note}"
         )
         writer.write(
             result_payload(
@@ -863,24 +962,27 @@ def run_harness(workspace_arg: str, runner_arg: str, result_arg: str) -> int:
     except CandidateRejected as error:
         note = (
             f"Frozen master baseline: {baseline:.2f} tok/s on locked M1. "
-            f"{sibling_note} Candidate rejected: {error}"
+            f"{power_note} {sibling_note} Candidate rejected: {error}"
         )
         writer.write(
             result_payload(gate_passed, hooks_passed, [], None, workspace_commit, note)
         )
         print(f"decode campaign candidate rejected: {error}", file=sys.stderr)
-        preserve_failure_scene(temp_root, result_path, workspace, runner)
+        preserve_failure_scene(temp_root, result_path, workspace, runner, power_state)
         # The campaign gate reads only the exit code and the numeric sample
         # field; a zero exit here would surface as an invalid measurement
         # instead of a rejected proposal.
         return 3
     except Exception as error:
-        note = f"Frozen master baseline: {baseline:.2f} tok/s on locked M1. Harness refused: {error}"
+        note = (
+            f"Frozen master baseline: {baseline:.2f} tok/s on locked M1. "
+            f"{power_note} Harness refused: {error}"
+        )
         writer.write(
             result_payload(gate_passed, hooks_passed, [], None, workspace_commit, note)
         )
         print(f"decode campaign harness refused to run: {error}", file=sys.stderr)
-        preserve_failure_scene(temp_root, result_path, workspace, runner)
+        preserve_failure_scene(temp_root, result_path, workspace, runner, power_state)
         return 1
     finally:
         cleanup_staging_tree(temp_root, runner)
@@ -905,7 +1007,7 @@ def expect_harness_error(action: Any) -> None:
 
 
 def self_test() -> int:
-    global model_content_digest, run_through_runner
+    global capture_power_state, model_content_digest, run_through_runner
 
     root = Path(tempfile.mkdtemp(prefix="synapse-decode-self-test-", dir="/tmp"))
     previous_siblings = os.environ.get("SYNAPSE_CAMPAIGN_SIBLINGS")
@@ -1035,6 +1137,7 @@ def self_test() -> int:
         fake_build_manifests: List[str] = []
         fake_runner_calls: List[Tuple[str, ...]] = []
         original_run_through_runner = run_through_runner
+        original_capture_power_state = capture_power_state
         original_model_content_digest = model_content_digest
         previous_model = os.environ.get("SYNAPSE_CAMPAIGN_MODEL")
         previous_cargo = os.environ.get("SYNAPSE_CAMPAIGN_CARGO")
@@ -1072,7 +1175,16 @@ def self_test() -> int:
                 return 1
             raise AssertionError(f"unexpected self-test runner command: {argv}")
 
+        def fake_capture_power_state() -> Dict[str, Any]:
+            return {
+                "command": "pmset -g batt",
+                "output": "Now drawing from 'AC Power'\n -InternalBattery-0\t42%; charging; present: true",
+                "power_source": "AC Power",
+                "battery_percent": 42,
+            }
+
         try:
+            capture_power_state = fake_capture_power_state
             model_content_digest = lambda _model: EXPECTED_MODEL_DIGEST
             run_through_runner = fake_run_through_runner
             os.environ["SYNAPSE_CAMPAIGN_MODEL"] = str(root / "fake-model")
@@ -1147,8 +1259,15 @@ def self_test() -> int:
             assert (
                 failure_scene / "candidate-output" / "candidate-build.log"
             ).read_text() == "candidate cargo diagnostics\n"
-            assert "Sibling HEADs: subconscious=non-git, commons=non-git." in fake_result.read_text()
+            scene = json.loads((failure_scene / "scene.json").read_text())
+            assert scene["power_state"]["power_source"] == "AC Power"
+            assert scene["power_state"]["battery_percent"] == 42
+            assert "Now drawing from 'AC Power'" in scene["power_state"]["output"]
+            result_text = fake_result.read_text()
+            assert "Power state (`pmset -g batt`): AC Power, 42% battery" in result_text
+            assert "Sibling HEADs: subconscious=non-git, commons=non-git." in result_text
         finally:
+            capture_power_state = original_capture_power_state
             model_content_digest = original_model_content_digest
             run_through_runner = original_run_through_runner
             if previous_model is None:
@@ -1193,6 +1312,29 @@ def self_test() -> int:
         dishonest_speed = json.loads(json.dumps(payload))
         dishonest_speed["decode_tok_per_s"] += 1
         expect_rejection(lambda: validate_decode_result(dishonest_speed, [expected]))
+
+        ac_power = parse_power_state(
+            "Now drawing from 'AC Power'\n"
+            " -InternalBattery-0\t(id=1)\t42%; charging; 1:00 remaining present: true"
+        )
+        assert ac_power["power_source"] == "AC Power"
+        assert ac_power["battery_percent"] == 42
+        assert not is_low_battery_power(ac_power)
+        battery_power = parse_power_state(
+            "Now drawing from 'Battery Power'\n"
+            " -InternalBattery-0\t(id=1)\t19%; discharging; 0:30 remaining present: true"
+        )
+        assert battery_power["power_source"] == "Battery Power"
+        assert battery_power["battery_percent"] == 19
+        assert is_low_battery_power(battery_power)
+        try:
+            enforce_power_preflight(battery_power)
+        except HarnessError as error:
+            assert str(error).startswith("LOW_BATTERY_POWER_PREFLIGHT:")
+        else:
+            raise AssertionError("expected low battery power preflight to refuse measurement")
+        expect_harness_error(lambda: parse_power_state("Battery Power\n19%"))
+        expect_harness_error(lambda: parse_power_state("Now drawing from 'Battery Power'"))
 
         complete_log = "\n".join(
             f"test qwen3_decode::tests::{name} ... ok" for name in HOOK_TESTS
