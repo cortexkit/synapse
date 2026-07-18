@@ -10,6 +10,8 @@ fn main() {
     println!("cargo:rerun-if-changed=src/cuda_family_common.cuh");
     println!("cargo:rerun-if-changed=src/cuda_modernbert.cu");
     println!("cargo:rerun-if-changed=src/cuda_qwen3.cu");
+    println!("cargo:rerun-if-changed=src/cuda_lfm2.cu");
+    println!("cargo:rerun-if-changed=src/cuda_ops.cu");
     println!("cargo:rerun-if-changed=src/cpu_hand_kernel.c");
 
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
@@ -46,6 +48,8 @@ fn main() {
             .file("src/cuda_minilm.cu")
             .file("src/cuda_modernbert.cu")
             .file("src/cuda_qwen3.cu")
+            .file("src/cuda_lfm2.cu")
+            .file("src/cuda_ops.cu")
             .include(format!("{cuda_root}/include"))
             .flag("-O3")
             .flag("-Wno-deprecated-gpu-targets");

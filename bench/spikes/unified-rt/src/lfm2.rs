@@ -4,6 +4,7 @@
 //! the provider's depthwise primitive, while norms, RoPE, residuals, and gating
 //! remain explicit so the CPU and Metal paths share one architecture definition.
 
+use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -12,8 +13,8 @@ use serde::Deserialize;
 use tokenizers::Tokenizer;
 
 use super::{
-    get_tensor, load_safetensor_map, resolve_model_root, BLayout, BatchShape, KernelProvider,
-    ModelFamily, Precision, Tensor,
+    get_tensor, load_safetensor_map, resolve_model_root, BLayout, BatchShape, BlockBackend,
+    BlockForwardRequest, KernelProvider, MetalExecutionConfig, ModelFamily, Precision, Tensor,
 };
 
 #[derive(Debug, Deserialize)]
@@ -160,6 +161,23 @@ pub(crate) struct DecodeCache {
 pub(crate) enum LayerCache {
     Conv { state: Vec<f32> },
     Attention { keys: Vec<f32>, values: Vec<f32> },
+}
+
+fn new_cuda_block_context(
+    precision: Precision,
+    _execution: MetalExecutionConfig,
+    backend: BlockBackend,
+) -> Result<Box<dyn Any>> {
+    let BlockBackend::Cuda { graphs } = backend else {
+        bail!("LFM2 resident block context is only implemented for CUDA")
+    };
+    Ok(Box::new(CudaBlockContext {
+        backend: super::cuda_backend::Lfm2Context::new(graphs, precision)?,
+    }))
+}
+
+struct CudaBlockContext {
+    backend: super::cuda_backend::Lfm2Context,
 }
 
 impl RawConfig {
@@ -453,6 +471,186 @@ impl Model {
         }
     }
 
+    fn cuda_layer_params(&self) -> Vec<super::cuda_backend::Lfm2LayerParams> {
+        self.layers
+            .iter()
+            .map(|layer| {
+                let mut params = super::cuda_backend::Lfm2LayerParams {
+                    mixer_type: 0,
+                    operator_norm: layer.operator_norm.weight.data.as_ptr(),
+                    ffn_norm: layer.ffn_norm.weight.data.as_ptr(),
+                    conv_in_weight: std::ptr::null(),
+                    conv_weight: std::ptr::null(),
+                    conv_out_weight: std::ptr::null(),
+                    q_weight: std::ptr::null(),
+                    q_norm: std::ptr::null(),
+                    k_weight: std::ptr::null(),
+                    k_norm: std::ptr::null(),
+                    v_weight: std::ptr::null(),
+                    attention_out_weight: std::ptr::null(),
+                    w1_weight: layer.w1.tensor.data.as_ptr(),
+                    w2_weight: layer.w2.tensor.data.as_ptr(),
+                    w3_weight: layer.w3.tensor.data.as_ptr(),
+                };
+                match &layer.mixer {
+                    Mixer::Conv(mixer) => {
+                        params.conv_in_weight = mixer.in_proj.tensor.data.as_ptr();
+                        params.conv_weight = mixer.conv_weight.data.as_ptr();
+                        params.conv_out_weight = mixer.out_proj.tensor.data.as_ptr();
+                    }
+                    Mixer::Attention(mixer) => {
+                        params.mixer_type = 1;
+                        params.q_weight = mixer.q_proj.tensor.data.as_ptr();
+                        params.q_norm = mixer.q_norm.weight.data.as_ptr();
+                        params.k_weight = mixer.k_proj.tensor.data.as_ptr();
+                        params.k_norm = mixer.k_norm.weight.data.as_ptr();
+                        params.v_weight = mixer.v_proj.tensor.data.as_ptr();
+                        params.attention_out_weight = mixer.out_proj.tensor.data.as_ptr();
+                    }
+                }
+                params
+            })
+            .collect()
+    }
+
+    fn cuda_full_forward(
+        &self,
+        provider: &mut dyn KernelProvider,
+        hidden_states: &mut [f32],
+        attention_mask: &[u8],
+        seq: usize,
+    ) -> Result<bool> {
+        let params = self.cuda_layer_params();
+        let lm_head = self.lm_head()?;
+        let config = &self.config;
+        let mut run = |context: &mut dyn Any| {
+            let context = context
+                .downcast_mut::<CudaBlockContext>()
+                .context("LFM2 CUDA block context type mismatch")?;
+            context.backend.full_forward(
+                hidden_states,
+                attention_mask,
+                seq,
+                config.hidden_size,
+                config.num_attention_heads,
+                config.num_key_value_heads,
+                config.head_dim,
+                config.intermediate_size,
+                config.conv_kernel_size,
+                config.vocab_size,
+                config.rms_norm_eps,
+                config.rope_theta,
+                &params,
+                &self.final_norm.weight.data,
+                &lm_head.data,
+            )
+        };
+        provider.lfm2_forward(BlockForwardRequest {
+            family: "lfm2-causal",
+            create_context: new_cuda_block_context,
+            run: &mut run,
+        })
+    }
+
+    pub(crate) fn prefill_embeddings(
+        &self,
+        provider: &mut dyn KernelProvider,
+        embeddings: &[Vec<f32>],
+        capacity: usize,
+    ) -> Result<Option<(DecodeCache, Vec<f32>)>> {
+        let hidden = self.config.hidden_size;
+        ensure!(
+            embeddings.iter().all(|embedding| embedding.len() == hidden),
+            "LFM2 prefill embedding width mismatch"
+        );
+        let flattened = embeddings.concat();
+        let params = self.cuda_layer_params();
+        let lm_head = self.lm_head()?;
+        let config = &self.config;
+        let mut logits = None;
+        let mut run = |context: &mut dyn Any| {
+            let context = context
+                .downcast_mut::<CudaBlockContext>()
+                .context("LFM2 CUDA block context type mismatch")?;
+            logits = Some(context.backend.prefill(
+                &flattened,
+                embeddings.len(),
+                capacity,
+                config.hidden_size,
+                config.num_attention_heads,
+                config.num_key_value_heads,
+                config.head_dim,
+                config.intermediate_size,
+                config.conv_kernel_size,
+                config.vocab_size,
+                config.rms_norm_eps,
+                config.rope_theta,
+                &params,
+                &self.final_norm.weight.data,
+                &lm_head.data,
+            )?);
+            Ok(())
+        };
+        if !provider.lfm2_forward(BlockForwardRequest {
+            family: "lfm2-causal",
+            create_context: new_cuda_block_context,
+            run: &mut run,
+        })? {
+            return Ok(None);
+        }
+        let mut cache = self.empty_decode_cache(capacity);
+        cache.position = embeddings.len();
+        Ok(Some((
+            cache,
+            logits.context("LFM2 CUDA prefill did not return logits")?,
+        )))
+    }
+
+    fn cuda_decode_embedding(
+        &self,
+        provider: &mut dyn KernelProvider,
+        cache: &DecodeCache,
+        embedding: &[f32],
+    ) -> Result<Option<(Vec<f32>, Vec<f32>)>> {
+        let params = self.cuda_layer_params();
+        let lm_head = self.lm_head()?;
+        let config = &self.config;
+        let mut output = None;
+        let mut run = |context: &mut dyn Any| {
+            let context = context
+                .downcast_mut::<CudaBlockContext>()
+                .context("LFM2 CUDA block context type mismatch")?;
+            output = Some(context.backend.decode(
+                embedding,
+                cache.position,
+                cache.capacity,
+                config.hidden_size,
+                config.num_attention_heads,
+                config.num_key_value_heads,
+                config.head_dim,
+                config.intermediate_size,
+                config.conv_kernel_size,
+                config.vocab_size,
+                config.rms_norm_eps,
+                config.rope_theta,
+                &params,
+                &self.final_norm.weight.data,
+                &lm_head.data,
+            )?);
+            Ok(())
+        };
+        if !provider.lfm2_forward(BlockForwardRequest {
+            family: "lfm2-causal",
+            create_context: new_cuda_block_context,
+            run: &mut run,
+        })? {
+            return Ok(None);
+        }
+        output
+            .map(Some)
+            .context("LFM2 CUDA decode did not return an output")
+    }
+
     pub(crate) fn empty_decode_cache(&self, capacity: usize) -> DecodeCache {
         let hidden = self.config.hidden_size;
         let kv_width = self.config.num_key_value_heads * self.config.head_dim;
@@ -512,6 +710,10 @@ impl Model {
             "LFM2 input embedding width {} does not match hidden size {hidden}",
             embedding.len()
         );
+        if let Some(result) = self.cuda_decode_embedding(provider, cache, embedding)? {
+            cache.position += 1;
+            return Ok(result);
+        }
         let mut current = embedding.to_vec();
 
         for (layer, layer_cache) in self.layers.iter().zip(&mut cache.layers) {
@@ -566,16 +768,18 @@ impl Model {
                 .copy_from_slice(&self.embeddings.data[token * hidden..(token + 1) * hidden]);
         }
         let attention_mask = vec![1u8; tokens.len()];
-        scalar_forward(
-            provider,
-            &mut hidden_states,
-            &attention_mask,
-            1,
-            tokens.len(),
-            &self.config,
-            &self.layers,
-            &self.final_norm,
-        )?;
+        if !self.cuda_full_forward(provider, &mut hidden_states, &attention_mask, tokens.len())? {
+            scalar_forward(
+                provider,
+                &mut hidden_states,
+                &attention_mask,
+                1,
+                tokens.len(),
+                &self.config,
+                &self.layers,
+                &self.final_norm,
+            )?;
+        }
         Ok(hidden_states
             .chunks_exact(hidden)
             .map(<[f32]>::to_vec)

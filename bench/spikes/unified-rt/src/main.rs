@@ -1169,8 +1169,11 @@ fn run_lfm2_decode_cli(args: &Args, started: Instant) -> Result<()> {
     use qwen3_decode::{DecodeSession, TokenTapEvent};
 
     ensure!(
-        matches!(args.device, DeviceArg::Cpu | DeviceArg::Metal),
-        "LFM2 decode supports CPU/Accelerate and Metal MPSGraph providers"
+        matches!(
+            args.device,
+            DeviceArg::Cpu | DeviceArg::Metal | DeviceArg::Cuda
+        ),
+        "LFM2 decode supports CPU/Accelerate, Metal MPSGraph, and CUDA providers"
     );
     ensure!(
         !(matches!(args.device, DeviceArg::Cpu) && matches!(args.dtype, Precision::F16)),
@@ -1216,13 +1219,17 @@ fn run_lfm2_decode_cli(args: &Args, started: Instant) -> Result<()> {
         .with_truncation(None)
         .map_err(|error| anyhow::anyhow!("disable generation truncation: {error}"))?;
     let execution = MetalExecutionConfig::from_args(args, "lfm2-decode")?;
+    let cuda_graphs = args.cuda_graphs && !matches!(args.device, DeviceArg::Cuda);
+    if args.cuda_graphs && matches!(args.device, DeviceArg::Cuda) {
+        eprintln!("LFM2 CUDA graph capture is not implemented; using uncaptured launches");
+    }
     let mut provider = make_provider(
         args.device,
         args.dtype,
         args.cpu_gemm,
         args.cpu_threads,
         execution,
-        args.cuda_graphs,
+        cuda_graphs,
         args.vulkan_gemm,
         args.vulkan_pipeline_cache.clone(),
     )?;
@@ -1476,9 +1483,17 @@ fn run_lfm2_decode_cli(args: &Args, started: Instant) -> Result<()> {
         constraint_valid_prompts: constraint_config.as_ref().map(|_| constraint_valid_prompts),
         constraint_wall_s,
         constraint_ms_per_token: 1_000.0 * constraint_wall_s / generated_tokens.max(1) as f64,
-        kv_update_path: "owned-rust-hybrid-cache",
-        weight_feed_path: "provider-static-rhs",
-        optimization_level: 0,
+        kv_update_path: if matches!(args.device, DeviceArg::Cuda) {
+            "cuda-resident-hybrid-conv-kv-cache"
+        } else {
+            "owned-rust-hybrid-cache"
+        },
+        weight_feed_path: if matches!(args.device, DeviceArg::Cuda) {
+            "cuda-persistent-fp32"
+        } else {
+            "provider-static-rhs"
+        },
+        optimization_level: u8::from(matches!(args.device, DeviceArg::Cuda)),
         weight_regions: weight_count,
         results,
     };
@@ -1520,8 +1535,11 @@ fn run_lfm2_decode_cli(args: &Args, started: Instant) -> Result<()> {
 
 fn run_lfm2_audio_asr_cli(args: &Args, started: Instant) -> Result<()> {
     ensure!(
-        matches!(args.device, DeviceArg::Cpu | DeviceArg::Metal),
-        "LFM2-Audio ASR supports CPU/Accelerate and Metal MPSGraph providers"
+        matches!(
+            args.device,
+            DeviceArg::Cpu | DeviceArg::Metal | DeviceArg::Cuda
+        ),
+        "LFM2-Audio ASR supports CPU/Accelerate, Metal MPSGraph, and CUDA providers"
     );
     ensure!(
         matches!(args.dtype, Precision::F32),
@@ -1564,13 +1582,17 @@ fn run_lfm2_audio_asr_cli(args: &Args, started: Instant) -> Result<()> {
         .with_truncation(None)
         .map_err(|error| anyhow::anyhow!("disable ASR truncation: {error}"))?;
     let execution = MetalExecutionConfig::from_args(args, "lfm2-audio-asr")?;
+    let cuda_graphs = args.cuda_graphs && !matches!(args.device, DeviceArg::Cuda);
+    if args.cuda_graphs && matches!(args.device, DeviceArg::Cuda) {
+        eprintln!("LFM2-Audio CUDA graph capture is not implemented; using uncaptured launches");
+    }
     let mut provider = make_provider(
         args.device,
         args.dtype,
         args.cpu_gemm,
         args.cpu_threads,
         execution,
-        args.cuda_graphs,
+        cuda_graphs,
         args.vulkan_gemm,
         args.vulkan_pipeline_cache.clone(),
     )?;
@@ -2988,6 +3010,10 @@ trait KernelProvider {
         Ok(false)
     }
 
+    fn lfm2_forward(&mut self, _request: BlockForwardRequest<'_>) -> Result<bool> {
+        Ok(false)
+    }
+
     fn eager_shape_preload(&self) -> bool {
         false
     }
@@ -3255,6 +3281,7 @@ impl MetalProvider {
 
 struct CudaProvider {
     block_contexts: HashMap<&'static str, Box<dyn Any>>,
+    ops: cuda_backend::OpsContext,
     dtype: Precision,
     execution: MetalExecutionConfig,
     graphs: bool,
@@ -3273,6 +3300,7 @@ impl CudaProvider {
         cuda_backend::ensure_available()?;
         Ok(Self {
             block_contexts: HashMap::new(),
+            ops: cuda_backend::OpsContext::new()?,
             dtype,
             execution,
             graphs,
@@ -3370,15 +3398,46 @@ impl KernelProvider for CudaProvider {
 
     fn matmul(
         &mut self,
-        _m: usize,
-        _n: usize,
-        _k: usize,
-        _a: &[f32],
-        _b: &[f32],
-        _b_layout: BLayout,
-        _c: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+        a: &[f32],
+        b: &[f32],
+        b_layout: BLayout,
+        c: &mut [f32],
     ) -> Result<()> {
-        bail!("CUDA requires a family-resident block path")
+        self.ops.matmul(
+            m,
+            n,
+            k,
+            a,
+            b,
+            matches!(b_layout, BLayout::RowMajorNkTransposed),
+            false,
+            c,
+        )
+    }
+
+    fn matmul_static_rhs(
+        &mut self,
+        m: usize,
+        n: usize,
+        k: usize,
+        a: &[f32],
+        b: &[f32],
+        b_layout: BLayout,
+        c: &mut [f32],
+    ) -> Result<()> {
+        self.ops.matmul(
+            m,
+            n,
+            k,
+            a,
+            b,
+            matches!(b_layout, BLayout::RowMajorNkTransposed),
+            true,
+            c,
+        )
     }
 
     fn block_forward(&mut self, request: BlockForwardRequest<'_>) -> Result<bool> {
@@ -3398,6 +3457,10 @@ impl KernelProvider for CudaProvider {
             .expect("block context inserted above");
         (request.run)(context.as_mut())?;
         Ok(true)
+    }
+
+    fn lfm2_forward(&mut self, request: BlockForwardRequest<'_>) -> Result<bool> {
+        self.block_forward(request)
     }
 
     fn eager_shape_preload(&self) -> bool {
