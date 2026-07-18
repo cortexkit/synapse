@@ -289,9 +289,19 @@ private func handleEmbedBatch(state: WorkerState, request: [String: Any], reqId:
         guard let value = output.featureValue(for: bucket.outputName)?.multiArrayValue else {
             throw WorkerError.invalid("prediction output is missing feature \(bucket.outputName)")
         }
-        var vector = try poolAndNormalize(hiddenStates: value, attentionMask: rows[index].mask)
-        if !normalize {
-            vector = try poolOnly(hiddenStates: value, attentionMask: rows[index].mask)
+        let shape = value.shape.map { $0.intValue }
+        let vector: [Float]
+        if shape.count == 2, shape[0] == 1, shape[1] == bucket.dims {
+            var pooled: [Float] = []
+            try readFloatArray(value) { values in pooled = values }
+            if normalize { normalizeVector(&pooled) }
+            vector = pooled
+        } else {
+            var pooled = try poolAndNormalize(hiddenStates: value, attentionMask: rows[index].mask)
+            if !normalize {
+                pooled = try poolOnly(hiddenStates: value, attentionMask: rows[index].mask)
+            }
+            vector = pooled
         }
         guard vector.count == bucket.dims else {
             throw WorkerError.invalid("vector dims \(vector.count) did not match loaded dims \(bucket.dims)")
@@ -349,7 +359,8 @@ private func materializeCoreMLArtifact(sourceURL: URL, format: String) throws ->
         var candidateIsDirectory: ObjCBool = false
         return FileManager.default.fileExists(atPath: url.path, isDirectory: &candidateIsDirectory)
             && candidateIsDirectory.boolValue
-            && FileManager.default.fileExists(atPath: url.appendingPathComponent("model.mlmodel").path)
+            && (FileManager.default.fileExists(atPath: url.appendingPathComponent("model.mil").path)
+                || FileManager.default.fileExists(atPath: url.appendingPathComponent("model.mlmodel").path))
     }
     guard let modelURL = candidates.first else {
         try? FileManager.default.removeItem(at: root)
@@ -387,11 +398,13 @@ private func inferBucket(model: MLModel) throws -> Int {
 
 private func inferOutputDims(model: MLModel, outputName: String, bucket: Int) throws -> Int {
     if let output = model.modelDescription.outputDescriptionsByName[outputName],
-       let shape = output.multiArrayConstraint?.shape.map({ $0.intValue }),
-       shape.count == 3,
-       shape[1] == bucket,
-       shape[2] > 0 {
-        return shape[2]
+       let shape = output.multiArrayConstraint?.shape.map({ $0.intValue }) {
+        if shape.count == 2, shape[0] == 1, shape[1] > 0 {
+            return shape[1]
+        }
+        if shape.count == 3, shape[1] == bucket, shape[2] > 0 {
+            return shape[2]
+        }
     }
     let zeroIds = [Int](repeating: 0, count: bucket)
     var mask = [Int](repeating: 0, count: bucket)
@@ -401,8 +414,11 @@ private func inferOutputDims(model: MLModel, outputName: String, bucket: Int) th
         throw WorkerError.invalid("prediction output is missing feature \(outputName)")
     }
     let shape = value.shape.map { $0.intValue }
+    if shape.count == 2, shape[0] == 1, shape[1] > 0 {
+        return shape[1]
+    }
     guard shape.count == 3, shape[2] > 0 else {
-        throw WorkerError.invalid("expected output shape [1, bucket, hidden], got \(shape)")
+        throw WorkerError.invalid("expected output shape [1, bucket, hidden] or [1, hidden], got \(shape)")
     }
     return shape[2]
 }
@@ -432,6 +448,15 @@ private func makeMultiArray(values: [Int]) throws -> MLMultiArray {
 
 private func poolOnly(hiddenStates: MLMultiArray, attentionMask: [Int]) throws -> [Float] {
     try pool(hiddenStates: hiddenStates, attentionMask: attentionMask, normalize: false)
+}
+
+private func normalizeVector(_ values: inout [Float]) {
+    var normSquared: Float = 0
+    for value in values { normSquared += value * value }
+    let norm = sqrt(normSquared)
+    if norm > 0 {
+        for index in values.indices { values[index] /= norm }
+    }
 }
 
 private func poolAndNormalize(hiddenStates: MLMultiArray, attentionMask: [Int]) throws -> [Float] {
