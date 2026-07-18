@@ -17,6 +17,11 @@ path = "src/lib.rs"
 name = "ck-synapse"
 path = "src/main.rs"
 
+[[bin]]
+name = "synapse-worker-timeout-mock"
+path = "src/bin/timeout_worker.rs"
+test = false
+
 [dependencies]
 anyhow = { workspace = true }
 synapse-core = { path = "../synapse-core" }

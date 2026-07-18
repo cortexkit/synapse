@@ -1,0 +1,145 @@
+#![forbid(unsafe_code)]
+
+#[cfg(unix)]
+fn main() -> anyhow::Result<()> {
+    use std::io;
+    use std::os::unix::net::UnixStream;
+    use std::path::PathBuf;
+    use std::thread;
+    use std::time::Duration;
+
+    use anyhow::{bail, Context, Result};
+    use synapse_core::worker_framing_sync::{
+        read_frame, read_json_frame, write_frame, write_json_frame,
+    };
+    use synapse_core::{
+        encode_f32_frame, EngineIdentity, WorkerHello, WorkerHelloAck, WorkerRequest,
+        WorkerResponse, DEFAULT_MAX_FRAME_BYTES, WORKER_PROTOCOL_VERSION,
+    };
+
+    fn argument(name: &str) -> Result<String> {
+        let mut args = std::env::args().skip(1);
+        while let Some(arg) = args.next() {
+            if arg == name {
+                return args
+                    .next()
+                    .with_context(|| format!("{name} requires a value"));
+            }
+        }
+        bail!("missing required argument {name}")
+    }
+
+    fn milliseconds(name: &str) -> Result<u64> {
+        argument(name)?
+            .parse()
+            .with_context(|| format!("invalid {name}"))
+    }
+
+    fn run() -> Result<()> {
+        let socket = PathBuf::from(argument("--socket")?);
+        let nonce = argument("--nonce")?;
+        let load_sleep_ms = milliseconds("--load-sleep-ms")?;
+        let embed_sleep_ms = milliseconds("--embed-sleep-ms")?;
+        let mut stream = UnixStream::connect(&socket)
+            .with_context(|| format!("connect mock worker socket {}", socket.display()))?;
+        let hello = WorkerHello {
+            v: WORKER_PROTOCOL_VERSION,
+            nonce,
+            engine: EngineIdentity {
+                engine: "timeout-mock".to_string(),
+                version: "test".to_string(),
+                build_flags: Default::default(),
+            },
+            pid: std::process::id(),
+            max_frame: DEFAULT_MAX_FRAME_BYTES,
+        };
+        write_json_frame(&mut stream, &hello, DEFAULT_MAX_FRAME_BYTES)?;
+        let ack: WorkerHelloAck = read_json_frame(&mut stream, DEFAULT_MAX_FRAME_BYTES)?;
+        if !ack.accept {
+            bail!("mock worker handshake rejected");
+        }
+        let max_frame = ack.max_frame.min(DEFAULT_MAX_FRAME_BYTES);
+
+        loop {
+            let frame = match read_frame(&mut stream, max_frame) {
+                Ok(frame) => frame,
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+                Err(error) => return Err(error).context("read mock worker request"),
+            };
+            let request: WorkerRequest =
+                serde_json::from_slice(&frame).context("decode request")?;
+            match request {
+                WorkerRequest::Load { req_id, .. } => {
+                    thread::sleep(Duration::from_millis(load_sleep_ms));
+                    write_json_frame(
+                        &mut stream,
+                        &WorkerResponse::Loaded {
+                            req_id,
+                            model_ref: "mock-model-0".to_string(),
+                            dims: 1,
+                            cold_load_ms: load_sleep_ms,
+                        },
+                        max_frame,
+                    )?;
+                }
+                WorkerRequest::EmbedBatch { req_id, .. } => {
+                    let _ = read_frame(&mut stream, max_frame).context("read embed ids")?;
+                    thread::sleep(Duration::from_millis(embed_sleep_ms));
+                    write_json_frame(
+                        &mut stream,
+                        &WorkerResponse::Vectors {
+                            req_id,
+                            dims: 1,
+                            n: 1,
+                        },
+                        max_frame,
+                    )?;
+                    write_frame(&mut stream, &encode_f32_frame(&[1.0]), max_frame)?;
+                }
+                WorkerRequest::Shutdown {} => return Ok(()),
+                WorkerRequest::Ping { req_id } => {
+                    write_json_frame(
+                        &mut stream,
+                        &WorkerResponse::Pong {
+                            req_id,
+                            rss_mb: 0,
+                            models_loaded: 1,
+                            placement_share: None,
+                        },
+                        max_frame,
+                    )?;
+                }
+                WorkerRequest::Unload { req_id, .. } => {
+                    write_json_frame(&mut stream, &WorkerResponse::Unloaded { req_id }, max_frame)?;
+                }
+                other => {
+                    let req_id = match other {
+                        WorkerRequest::Rerank { req_id, .. }
+                        | WorkerRequest::Generate { req_id, .. } => Some(req_id),
+                        WorkerRequest::Load { .. }
+                        | WorkerRequest::EmbedBatch { .. }
+                        | WorkerRequest::Unload { .. }
+                        | WorkerRequest::Ping { .. }
+                        | WorkerRequest::Shutdown {} => None,
+                    };
+                    write_json_frame(
+                        &mut stream,
+                        &WorkerResponse::Err {
+                            req_id,
+                            code: "unsupported".to_string(),
+                            msg: "timeout mock only supports LOAD and EMBED_BATCH".to_string(),
+                        },
+                        max_frame,
+                    )?;
+                }
+            }
+        }
+    }
+
+    run()
+}
+
+#[cfg(not(unix))]
+fn main() {
+    eprintln!("timeout mock worker requires Unix sockets");
+}
