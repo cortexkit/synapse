@@ -29,17 +29,31 @@ fn main() -> anyhow::Result<()> {
         bail!("missing required argument {name}")
     }
 
-    fn milliseconds(name: &str) -> Result<u64> {
-        argument(name)?
-            .parse()
-            .with_context(|| format!("invalid {name}"))
+    fn optional_milliseconds(name: &str) -> Result<u64> {
+        match argument(name) {
+            Ok(value) => value.parse().with_context(|| format!("invalid {name}")),
+            Err(_) => Ok(0),
+        }
     }
 
     fn run() -> Result<()> {
         let socket = PathBuf::from(argument("--socket")?);
         let nonce = argument("--nonce")?;
-        let load_sleep_ms = milliseconds("--load-sleep-ms")?;
-        let embed_sleep_ms = milliseconds("--embed-sleep-ms")?;
+        let load_sleep_ms = optional_milliseconds("--load-sleep-ms")?;
+        let embed_sleep_ms = optional_milliseconds("--embed-sleep-ms")?;
+        let embed_dims = std::env::var("SYNAPSE_TIMEOUT_WORKER_EMBED_DIMS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1)
+            .max(1);
+        let embed_n = std::env::var("SYNAPSE_TIMEOUT_WORKER_EMBED_N")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1)
+            .max(1);
+        let abort_on_embed = std::env::var("SYNAPSE_TIMEOUT_WORKER_ABORT_ON_EMBED")
+            .ok()
+            .is_some_and(|value| value == "1");
         let mut stream = UnixStream::connect(&socket)
             .with_context(|| format!("connect mock worker socket {}", socket.display()))?;
         let hello = WorkerHello {
@@ -84,17 +98,21 @@ fn main() -> anyhow::Result<()> {
                 }
                 WorkerRequest::EmbedBatch { req_id, .. } => {
                     let _ = read_frame(&mut stream, max_frame).context("read embed ids")?;
+                    if abort_on_embed {
+                        return Ok(());
+                    }
                     thread::sleep(Duration::from_millis(embed_sleep_ms));
                     write_json_frame(
                         &mut stream,
                         &WorkerResponse::Vectors {
                             req_id,
-                            dims: 1,
-                            n: 1,
+                            dims: embed_dims,
+                            n: embed_n,
                         },
                         max_frame,
                     )?;
-                    write_frame(&mut stream, &encode_f32_frame(&[1.0]), max_frame)?;
+                    let values = vec![1.0_f32; embed_dims.saturating_mul(embed_n)];
+                    write_frame(&mut stream, &encode_f32_frame(&values), max_frame)?;
                 }
                 WorkerRequest::Shutdown {} => return Ok(()),
                 WorkerRequest::Ping { req_id } => {

@@ -260,6 +260,7 @@ async fn crash_budget_quarantines_llama_without_affecting_ort_lane() {
         )
         .await;
         let probe_id = accepted["result"]["job_id"].as_str().unwrap().to_string();
+        let started = Instant::now();
         let done = poll_probe_status(
             &mut control,
             control_route,
@@ -267,21 +268,31 @@ async fn crash_budget_quarantines_llama_without_affecting_ort_lane() {
             &probe_id,
         )
         .await;
-        assert_eq!(done["result"]["state"], "done");
-        let lane = &done["result"]["lanes"][0];
-        assert_eq!(lane["status"], "uncertified");
-        let code = lane["error"]["code"].as_str().unwrap_or("");
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "probe crash should settle within the worker request timeout: {done:?}"
+        );
+        let state = done["result"]["state"].as_str().unwrap_or("");
+        let error = &done["result"]["error"];
         if attempt < 2 {
             assert_eq!(
-                code, "engine_crashed",
-                "probe should expose typed crash: {lane:?}"
+                state, "failed_transient",
+                "probe should fail on worker crash"
+            );
+            assert_eq!(
+                error["code"], "engine_crashed",
+                "probe should expose typed crash: {done:?}"
             );
         } else {
             assert_eq!(
-                code, "probe_required",
-                "quarantine should require a fresh probe: {lane:?}"
+                state, "failed_permanent",
+                "quarantine should fail the probe permanently"
             );
-            assert!(lane["error"]["message"]
+            assert_eq!(
+                error["code"], "probe_required",
+                "quarantine should require a fresh probe: {done:?}"
+            );
+            assert!(error["message"]
                 .as_str()
                 .unwrap_or("")
                 .contains("quarantined"));

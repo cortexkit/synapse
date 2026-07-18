@@ -2277,11 +2277,33 @@ mod tests {
         execution_ttl_ms: u64,
         retention_ttl_ms: u64,
     ) -> JobAdmission {
+        admit_kind(
+            store,
+            request_key,
+            request_digest,
+            "embed.batch",
+            generation,
+            now_ms,
+            execution_ttl_ms,
+            retention_ttl_ms,
+        )
+    }
+
+    fn admit_kind(
+        store: &SynapseStore,
+        request_key: &str,
+        request_digest: &str,
+        kind: &str,
+        generation: u64,
+        now_ms: u64,
+        execution_ttl_ms: u64,
+        retention_ttl_ms: u64,
+    ) -> JobAdmission {
         store
             .admit_job(
                 request_key,
                 request_digest,
-                "embed.batch",
+                kind,
                 generation,
                 None,
                 &serde_json::json!({"items": 2}),
@@ -2350,6 +2372,20 @@ mod tests {
         assert!(store
             .pause_job_needs_reauth(&paused, "vault/provider", 15, 1_000)
             .unwrap());
+        let probe = admit_kind(
+            &store,
+            "probe-key",
+            "probe-digest",
+            "probe",
+            generation,
+            16,
+            1_000,
+            500,
+        )
+        .record()
+        .job_id
+        .clone();
+        assert!(store.mark_job_running(&probe, generation, 17).unwrap());
 
         let failed = store
             .fail_prior_generation_incomplete_jobs(
@@ -2358,8 +2394,8 @@ mod tests {
                 20,
             )
             .unwrap();
-        assert_eq!(failed, 3);
-        for job_id in [queued, running.clone(), paused] {
+        assert_eq!(failed, 4);
+        for job_id in [queued, running.clone(), paused, probe] {
             let job = store
                 .get_job_at(&job_id, 21)
                 .unwrap()

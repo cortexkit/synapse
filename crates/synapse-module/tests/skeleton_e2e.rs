@@ -425,6 +425,128 @@ async fn models_list_round_trips_and_opens_the_daemon_delivered_store() {
     assert_eq!(module_generation, 1);
 }
 
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn probe_worker_death_fails_the_durable_job_with_engine_crashed() {
+    let root = unique_temp_dir("synapse-probe-worker-crash");
+    let config = timeout_ane_probe_config(&root);
+    let daemon = start_daemon().await;
+    let module = spawn_synapse_module_with_env(
+        &daemon.connection_file_path,
+        None,
+        Some(&config),
+        &[("SYNAPSE_TIMEOUT_WORKER_ABORT_ON_EMBED", "1")],
+    );
+    let (_daemon, _module, mut consumer, route) =
+        open_route_for_started_module(daemon, module).await;
+
+    let accepted = route_request(
+        &mut consumer,
+        route,
+        3_000,
+        serde_json::json!({
+            "method": "probe.start",
+            "params": {
+                "request_key": "probe-worker-crash",
+                "models": ["minilm-ane-timeout"]
+            }
+        }),
+    )
+    .await;
+    let job_id = accepted["result"]["job_id"].as_str().unwrap().to_string();
+    let started = Instant::now();
+    let body = poll_probe_status(&mut consumer, route, 3_001, &job_id).await;
+
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "worker death must settle within the short request timeout: {body:?}"
+    );
+    assert_eq!(
+        body["result"]["state"], "failed_transient",
+        "probe worker crash response: {body:?}"
+    );
+    assert_eq!(body["result"]["error"]["code"], "engine_crashed");
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn ane_probe_placement_ping_runs_outside_the_module_runtime() {
+    let root = unique_temp_dir("synapse-probe-placement-ping");
+    let config = timeout_ane_probe_config(&root);
+    let daemon = start_daemon().await;
+    let module = spawn_synapse_module_with_env(
+        &daemon.connection_file_path,
+        None,
+        Some(&config),
+        &[
+            ("SYNAPSE_TIMEOUT_WORKER_EMBED_DIMS", "384"),
+            ("SYNAPSE_TIMEOUT_WORKER_EMBED_N", "64"),
+        ],
+    );
+    let (_daemon, _module, mut consumer, route) =
+        open_route_for_started_module(daemon, module).await;
+
+    let accepted = route_request(
+        &mut consumer,
+        route,
+        3_100,
+        serde_json::json!({
+            "method": "probe.start",
+            "params": {
+                "request_key": "probe-placement-ping",
+                "models": ["minilm-ane-timeout"]
+            }
+        }),
+    )
+    .await;
+    let job_id = accepted["result"]["job_id"].as_str().unwrap().to_string();
+    let body = poll_probe_status(&mut consumer, route, 3_101, &job_id).await;
+
+    assert_eq!(body["result"]["state"], "done");
+    assert_eq!(body["result"]["lanes"][0]["status"], "uncertified");
+}
+
+fn timeout_ane_probe_config(root: &Path) -> String {
+    std::fs::create_dir_all(root).unwrap();
+    let model_path = root.join("model.mock");
+    let tokenizer_path = root.join("tokenizer.json");
+    std::fs::write(&model_path, b"timeout-worker-model").unwrap();
+    std::fs::write(
+        &tokenizer_path,
+        r#"{
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [],
+            "normalizer": null,
+            "pre_tokenizer": {"type": "Whitespace"},
+            "post_processor": null,
+            "decoder": null,
+            "model": {"type": "WordLevel", "vocab": {"[UNK]": 0}, "unk_token": "[UNK]"}
+        }"#,
+    )
+    .unwrap();
+    let worker_runtime_dir = PathBuf::from(format!(
+        "/tmp/synp-{}",
+        root.file_name().unwrap().to_string_lossy()
+    ));
+    serde_json::json!({
+        "preload_models": [{
+            "model_id": "minilm-ane-timeout",
+            "engine": "ane",
+            "task": "embed",
+            "model_path": model_path,
+            "tokenizer_path": tokenizer_path,
+            "format": "mock",
+            "pooling": "mean",
+            "normalize": true,
+            "worker_bin": env!("CARGO_BIN_EXE_synapse-worker-timeout-mock"),
+            "worker_runtime_dir": worker_runtime_dir
+        }]
+    })
+    .to_string()
+}
+
 #[tokio::test]
 async fn remote_gateway_declares_calibrates_checkpoints_trips_and_recovers() {
     let provider = RemoteMockProvider::start().await;
@@ -2109,6 +2231,40 @@ async fn certify_preloaded_models(
     start_corr: u64,
 ) -> Value {
     run_probe_job(consumer, route, start_corr, serde_json::json!({})).await
+}
+
+async fn poll_probe_status(
+    consumer: &mut tokio::net::TcpStream,
+    route: TestRoute,
+    start_corr: u64,
+    job_id: &str,
+) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let mut corr = start_corr;
+    loop {
+        let body = route_request(
+            consumer,
+            route,
+            corr,
+            serde_json::json!({
+                "method": "probe.status",
+                "params": { "job_id": job_id }
+            }),
+        )
+        .await;
+        match body["result"]["state"].as_str() {
+            Some("done" | "failed_transient" | "failed_permanent") => return body,
+            Some("queued" | "running") => {
+                assert!(
+                    Instant::now() < deadline,
+                    "probe did not complete before timeout: {body:?}"
+                );
+                corr += 1;
+                sleep(Duration::from_millis(100)).await;
+            }
+            other => panic!("unexpected probe.status state {other:?}: {body:?}"),
+        }
+    }
 }
 
 async fn poll_probe_job(
