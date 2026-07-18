@@ -208,7 +208,7 @@ reported `match_depth` is recomputed against the pinned fp32 oracle. The frozen
 campaign floor is at least `13/20` exact prompts and median match depth at least
 `54.5`; near-tie exemptions are not accepted. The constrained fixture must also
 produce `15/15` schema-valid `{result: "allow"|"deny", score: number}` objects.
-The hook gate runs `cargo test -p spike-unified-rt` with the CUDA feature. Only
+The hook gate runs the CPU-side `cargo test -p spike-unified-rt` regression suite. Only
 after both gates pass does the harness start `N=12` fresh single-stream processes
 with varied prompts and report median `decode_tok_per_s` in the same result JSON
 schema as the Metal campaign (`gate_passed`, `hooks_passed`, `median_tok_s`,

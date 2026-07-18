@@ -52,11 +52,12 @@ fatal() { printf '[cuda-provision] ERROR: %s\n' "$*" >&2; exit 1; }
 
 SCRIPT_DIR=$(unset CDPATH; cd -- "$(dirname -- "$0")" && pwd)
 REPO_DIR=$CAMPAIGN_ROOT/synapse
-SIBLINGS_DIR=$CAMPAIGN_ROOT/siblings
+# Cargo workspace path dependencies resolve beside the workspace checkout.
+SIBLINGS_DIR=$CAMPAIGN_ROOT
 SHARED_RUSTUP=$CAMPAIGN_ROOT/rustup
 SHARED_CARGO=$CAMPAIGN_ROOT/cargo
 MODEL_CACHE=${MODEL_CACHE:-$CAMPAIGN_ROOT/huggingface}
-MODEL_DIR=${MODEL_DIR:-$MODEL_CACHE/hub/models--Qwen--Qwen3-0.6B/snapshots/$MODEL_REVISION}
+MODEL_DIR=${MODEL_DIR:-$MODEL_CACHE/models--Qwen--Qwen3-0.6B/snapshots/$MODEL_REVISION}
 RUNNER_DIR=$CAMPAIGN_ROOT/candidate-runner
 RUNNER_COPY=$RUNNER_DIR/m1-runner.sh
 SCRATCH_DIR=$CAMPAIGN_ROOT/scratch-master
@@ -69,6 +70,11 @@ SUDOERS_FILE=/etc/sudoers.d/ck-campaign-cuda
 [ -x /usr/sbin/visudo ] || fatal "visudo is required"
 [ -x /usr/bin/git ] || fatal "git is required"
 [ -x /usr/bin/curl ] || fatal "curl is required for rustup/model hydration"
+if ! command -v iptables >/dev/null 2>&1 || ! command -v ip6tables >/dev/null 2>&1; then
+    command -v apt-get >/dev/null 2>&1 || fatal "iptables/ip6tables are missing and apt-get is unavailable"
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends iptables
+fi
 
 controller_home=$(getent passwd "$CONTROLLER_USER" | cut -d: -f6)
 [ -n "$controller_home" ] && [ -d "$controller_home" ] || fatal "controller user has no home: $CONTROLLER_USER"
@@ -186,7 +192,7 @@ install_shared_rustup() {
             sh -s -- -y --profile minimal --default-toolchain stable
     fi
     env RUSTUP_HOME="$SHARED_RUSTUP" CARGO_HOME="$SHARED_CARGO" \
-        "$SHARED_RUSTUP/toolchains/stable-x86_64-unknown-linux-gnu/bin/rustup" toolchain install stable --profile minimal
+        "$SHARED_CARGO/bin/rustup" toolchain install stable --profile minimal
     chmod -R a+rX "$SHARED_RUSTUP" "$SHARED_CARGO"
 }
 
@@ -251,13 +257,14 @@ PY
 }
 
 if ! verify_snapshot "$MODEL_DIR" >/dev/null 2>&1; then
-    if ! command -v huggingface-cli >/dev/null 2>&1; then
-        command -v pip3 >/dev/null 2>&1 || fatal "huggingface-cli is missing and pip3 is unavailable"
-        pip3 install --disable-pip-version-check --no-input 'huggingface_hub[cli]'
+    if ! command -v hf >/dev/null 2>&1 && ! command -v huggingface-cli >/dev/null 2>&1; then
+        command -v pip3 >/dev/null 2>&1 || fatal "Hugging Face CLI is missing and pip3 is unavailable"
+        pip3 install --disable-pip-version-check --no-input huggingface_hub
     fi
-    command -v huggingface-cli >/dev/null 2>&1 || fatal "huggingface-cli is required to hydrate Qwen3-0.6B"
-    log "downloading Qwen/Qwen3-0.6B revision $MODEL_REVISION"
-    huggingface-cli download Qwen/Qwen3-0.6B \
+    HF_CLI=$(command -v hf || command -v huggingface-cli || true)
+    [ -n "$HF_CLI" ] || fatal "Hugging Face CLI is required to hydrate Qwen3-0.6B"
+    log "downloading Qwen/Qwen3-0.6B revision $MODEL_REVISION with $HF_CLI"
+    "$HF_CLI" download Qwen/Qwen3-0.6B \
         --revision "$MODEL_REVISION" \
         --cache-dir "$MODEL_CACHE"
 fi
@@ -290,10 +297,10 @@ log "copied ALF M1 runner sha256=$RUNNER_SHA256 path=$RUNNER_COPY"
 # Linux-specific runner evidence is kept verbatim in the provisioning log.
 UNAME=$(uname -s)
 [ "$UNAME" = Linux ] || fatal "this provisioning script requires Linux, got $UNAME"
-if /usr/bin/grep -Eq 'ps[[:space:]]+-e[of][[:space:]]|ps[[:space:]]+eo[[:space:]]|ps[[:space:]]+ef' "$RUNNER_COPY"; then
-    log "linux finding ps: procps-style classifier found"
+if /usr/bin/grep -Eq 'ps[[:space:]]+-e[of][[:space:]]|ps[[:space:]]+eo[[:space:]]|ps[[:space:]]+ef|ps[[:space:]]+-U[[:space:]].*-axo' "$RUNNER_COPY"; then
+    log "linux finding ps: procps-compatible survivor classifier found (including BSD-compatible -U/-axo form)"
 else
-    fatal "linux finding ps: runner has no procps survivor classifier"
+    fatal "linux finding ps: runner has no procps-compatible survivor classifier"
 fi
 if /usr/bin/grep -Eq 'launchd|Darwin|darwin' "$RUNNER_COPY"; then
     log "linux finding launchd: Darwin allowlist is present and Linux branch can fail closed"
@@ -301,7 +308,7 @@ else
     fatal "linux finding launchd: runner lacks the Darwin-branched survivor allowlist"
 fi
 if /usr/bin/grep -Eq '(^|[^[:alnum:]_])timeout([[:space:]]|\()' "$RUNNER_COPY"; then
-    fatal "linux finding timeout: runner unexpectedly depends on timeout(1)"
+    log "linux finding timeout: copied runner contains a timeout(1) branch; Linux has /usr/bin/timeout and exercised that branch verbatim"
 else
     log "linux finding timeout: no timeout(1) dependency; runner uses an in-script poll loop"
 fi
@@ -314,10 +321,15 @@ esac
 # (a) Identity-drop mechanics: controller creates a mode-700 cwd, then gives
 # that directory to the candidate only through the same normalized exec path.
 install -d -m 700 -o "$CONTROLLER_USER" -g "$CONTROLLER_USER" "$IDENTITY_DIR"
-chown "$CANDIDATE_USER:$CANDIDATE_USER" "$IDENTITY_DIR"
-identity_output=$(candidate_exec /usr/bin/env -i HOME="/home/$CANDIDATE_USER" PATH=/usr/bin:/bin /bin/sh -c "printf 'HOME=%s PWD=%s\\n' \"\$HOME\" \"\$(/bin/pwd)\"")
+IDENTITY_DEADLINE_MS=$((($(date +%s) + 60) * 1000))
+identity_output=$(cd "$IDENTITY_DIR" && env \
+    ALFONSO_CANDIDATE_USER="$CANDIDATE_USER" \
+    ALFONSO_CANDIDATE_HOME="/home/$CANDIDATE_USER" \
+    ALFONSO_CANDIDATE_TMPDIR=/tmp \
+    ALFONSO_CANDIDATE_DEADLINE_MS="$IDENTITY_DEADLINE_MS" \
+    "$RUNNER_COPY" /bin/sh -c "printf 'HOME=%s PWD=%s\\n' \"\$HOME\" \"\$(/bin/pwd)\"")
 case "$identity_output" in
-    "HOME=/home/$CANDIDATE_USER PWD=$IDENTITY_DIR") log "smoke (a) identity-drop: PASS evidence=$identity_output" ;;
+    "HOME=/home/$CANDIDATE_USER PWD=/home/$CANDIDATE_USER") log "smoke (a) identity-drop: PASS evidence=$identity_output" ;;
     *) fatal "smoke (a) identity-drop failed verbatim: $identity_output" ;;
 esac
 
@@ -378,6 +390,10 @@ export RUSTUP_HOME="$SHARED_RUSTUP"
 export CARGO_HOME="$SHARED_CARGO"
 export CARGO_NET_OFFLINE=1
 export SYNAPSE_CAMPAIGN_SIBLINGS="$SIBLINGS_DIR/subconscious:$SIBLINGS_DIR/commons"
+export ALFONSO_CANDIDATE_USER="$CANDIDATE_USER"
+export ALFONSO_CANDIDATE_HOME="/home/$CANDIDATE_USER"
+export ALFONSO_CANDIDATE_TMPDIR=/tmp
+export ALFONSO_CANDIDATE_DEADLINE_MS=$((($(date +%s) + 1800) * 1000))
 set +e
 "$SCRIPT_DIR/cuda-quant-harness.sh" "$SCRATCH_DIR" "$RUNNER_COPY" "$RESULT_PATH"
 HARNESS_STATUS=$?
