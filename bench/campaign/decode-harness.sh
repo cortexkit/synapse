@@ -58,6 +58,17 @@ class CandidateRejected(HarnessError):
 class ResultWriter:
     def __init__(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # A leftover result file is expected when the controller re-runs an
+        # action after a lost SSH channel: the previous run's file is residue,
+        # not a tamper signal. Remove it (refusing symlinks) so the exclusive
+        # create below still guarantees this process owns a fresh inode.
+        try:
+            existing = os.lstat(str(path))
+            if not stat.S_ISREG(existing.st_mode):
+                raise HarnessError(f"result path exists and is not a regular file: {path}")
+            os.unlink(str(path))
+        except FileNotFoundError:
+            pass
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
