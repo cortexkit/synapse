@@ -46,6 +46,7 @@ pub struct WorkerHostConfig {
     pub max_frame: u32,
     pub handshake_timeout: Duration,
     pub request_timeout: Duration,
+    pub load_timeout: Duration,
     pub crash_budget: CrashBudget,
     pub extra_args: Vec<String>,
     pub pooling: WorkerPooling,
@@ -61,6 +62,7 @@ impl WorkerHostConfig {
             max_frame: DEFAULT_MAX_FRAME_BYTES,
             handshake_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(30),
+            load_timeout: Duration::from_secs(180),
             crash_budget: CrashBudget::default(),
             extra_args: Vec::new(),
             pooling: WorkerPooling::Mean,
@@ -605,7 +607,7 @@ impl WorkerHost {
     ) -> Result<(WorkerResponse, Option<Vec<u8>>), WorkerHostError> {
         self.ensure_worker().await?;
         let max_frame = self.config.max_frame;
-        let request_timeout = self.config.request_timeout;
+        let request_timeout = request_timeout(&self.config, &request);
         let result = timeout(request_timeout, async {
             let connection = self
                 .connection
@@ -978,6 +980,14 @@ fn decode_vectors(raw: &[u8], n: usize, dims: usize) -> Result<Vectors, WorkerHo
         .chunks(dims)
         .map(|chunk| chunk.to_vec())
         .collect::<Vec<_>>())
+}
+
+fn request_timeout(config: &WorkerHostConfig, request: &WorkerRequest) -> Duration {
+    if matches!(request, WorkerRequest::Load { .. }) {
+        config.load_timeout
+    } else {
+        config.request_timeout
+    }
 }
 
 fn request_stage(request: &WorkerRequest) -> &'static str {

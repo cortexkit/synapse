@@ -35,6 +35,9 @@ Example `~/.config/cortexkit/synapse.jsonc` (or project `.cortexkit/synapse.json
   "grammar_enabled": false,
   "cache_max_bytes": 34359738368,
   "alias_admin_enabled": false,
+  "worker": {
+    "load_timeout_ms": 180000
+  },
   "preload_models": [],
   "inline": {
     "max_items": 64,

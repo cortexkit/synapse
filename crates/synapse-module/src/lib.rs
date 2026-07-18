@@ -76,6 +76,7 @@ const DEFAULT_MAX_QUEUE_MS: u64 = 5_000;
 const DEFAULT_DEADLINE_MS: u64 = 30_000;
 const DEFAULT_ESTIMATED_EXECUTION_MS: u64 = 25;
 const DEFAULT_MAX_CONCURRENT_WORKERS: usize = 2;
+const DEFAULT_WORKER_LOAD_TIMEOUT_MS: u64 = 180_000;
 const DEFAULT_TRANSIENT_RETRY_AFTER_MS: u64 = 100;
 const DEFAULT_JOB_EXECUTION_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
 const DEFAULT_JOB_RESULT_RETENTION_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
@@ -307,6 +308,8 @@ pub(crate) struct ModuleConfig {
     #[serde(default)]
     inline: InlineConfig,
     #[serde(default)]
+    worker: WorkerConfig,
+    #[serde(default)]
     jobs: JobConfig,
     #[serde(default)]
     probe: ProbeConfig,
@@ -336,6 +339,25 @@ fn default_microllm_max_tokens() -> u32 {
 
 fn default_cache_max_bytes() -> u64 {
     DEFAULT_CACHE_MAX_BYTES
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerConfig {
+    #[serde(default = "default_worker_load_timeout_ms")]
+    load_timeout_ms: u64,
+}
+
+impl Default for WorkerConfig {
+    fn default() -> Self {
+        Self {
+            load_timeout_ms: default_worker_load_timeout_ms(),
+        }
+    }
+}
+
+fn default_worker_load_timeout_ms() -> u64 {
+    DEFAULT_WORKER_LOAD_TIMEOUT_MS
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -527,6 +549,7 @@ struct RuntimeState {
     inline: InlineConfig,
     jobs: JobConfig,
     probe: ProbeConfig,
+    worker_load_timeout: Duration,
     knob: PerfKnob,
     alias_admin_enabled: bool,
     microllm_max_tokens: u32,
@@ -1192,6 +1215,7 @@ impl RuntimeState {
         let inline = config.inline;
         let jobs = config.jobs;
         let probe = config.probe;
+        let worker_load_timeout = Duration::from_millis(config.worker.load_timeout_ms);
         let knob = config.knob;
         let alias_admin_enabled = config.alias_admin_enabled || config.dev.alias_admin_enabled;
         let microllm_max_tokens = config.microllm_max_tokens;
@@ -1223,6 +1247,7 @@ impl RuntimeState {
             inline,
             jobs,
             probe,
+            worker_load_timeout,
             knob,
             alias_admin_enabled,
             microllm_max_tokens,
@@ -2439,8 +2464,15 @@ async fn load_catalog_model_task(
     let model_cache = Arc::clone(&state.model_cache);
     let load_started = std::time::Instant::now();
     let microllm_max_tokens = state.runtime.microllm_max_tokens;
+    let worker_load_timeout = state.runtime.worker_load_timeout;
     let loaded = tokio::task::spawn_blocking(move || {
-        load_catalog_model_blocking(spec, ort_engine, model_cache, microllm_max_tokens)
+        load_catalog_model_blocking(
+            spec,
+            ort_engine,
+            model_cache,
+            microllm_max_tokens,
+            worker_load_timeout,
+        )
     })
     .await
     .map_err(|error| {
@@ -2564,6 +2596,7 @@ fn load_catalog_model_blocking(
     ort_engine: Arc<Mutex<OrtEmbedEngine>>,
     model_cache: Arc<ModelCache>,
     microllm_max_tokens: u32,
+    worker_load_timeout: Duration,
 ) -> Result<EmbeddingModel, WireOperationError> {
     let task = parse_model_task(Some(&spec.task), &spec.engine, &spec.model_id)
         .map_err(|error| artifact_invalid_error(error.to_string()))?;
@@ -2646,8 +2679,12 @@ fn load_catalog_model_blocking(
             )
         }
         "llama" | "mlx" | "ane" => {
-            let (backend, loaded) =
-                load_worker_backend_blocking(&spec, &artifact, &runtime_config)?;
+            let (backend, loaded) = load_worker_backend_blocking(
+                &spec,
+                &artifact,
+                &runtime_config,
+                worker_load_timeout,
+            )?;
             (backend, loaded, None)
         }
         other => {
@@ -2674,6 +2711,7 @@ fn load_worker_backend_blocking(
     spec: &StoredModelConfig,
     artifact: &ValidatedArtifact,
     runtime_config: &RuntimeConfig,
+    worker_load_timeout: Duration,
 ) -> Result<(EmbedBackend, LoadedModel), WireOperationError> {
     use worker_host::{WorkerEngine, WorkerHostConfig};
 
@@ -2703,6 +2741,7 @@ fn load_worker_backend_blocking(
         .or_else(|| env::var_os(&worker_runtime_dir_var).map(PathBuf::from))
         .unwrap_or_else(|| env::temp_dir().join("synapse-workers"));
     let mut config = WorkerHostConfig::new(worker_bin, runtime_dir);
+    config.load_timeout = worker_load_timeout;
     config.worker_id = format!("synapse-{}-{}", spec.engine, spec.model_id);
     config.pooling =
         parse_pooling(&spec.pooling).map_err(|error| artifact_invalid_error(error.to_string()))?;
@@ -8582,6 +8621,32 @@ mod tests {
         )
         .expect("user tier may configure remote providers");
         assert_eq!(config.remote_providers.len(), 1);
+    }
+
+    #[test]
+    fn module_config_parses_worker_load_timeout() {
+        let default = parse_module_config_json(r#"{}"#, "test", ConfigTier::User)
+            .expect("default worker config should parse");
+        assert_eq!(
+            default.worker.load_timeout_ms,
+            DEFAULT_WORKER_LOAD_TIMEOUT_MS
+        );
+
+        let configured = parse_module_config_json(
+            r#"{"worker":{"load_timeout_ms":240000}}"#,
+            "test",
+            ConfigTier::User,
+        )
+        .expect("worker load timeout should parse");
+        assert_eq!(configured.worker.load_timeout_ms, 240_000);
+
+        let error = parse_module_config_json(
+            r#"{"worker":{"load_timeout_mss":240000}}"#,
+            "test",
+            ConfigTier::User,
+        )
+        .expect_err("unknown worker fields should fail");
+        assert!(error.to_string().contains("load_timeout_mss"));
     }
 
     #[test]
