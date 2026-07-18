@@ -2,11 +2,11 @@
 
 ## Verdict
 
-The owned Qwen3-0.6B f16 Metal decoder reaches **40.55 tok/s** for one 64-token stream on the locked M1 Max. The final 20-prompt gate remains token-exact against Transformers CPU fp32: **20/20 prompts, 1,280/1,280 tokens, zero near-tie exemptions**.
+The owned Qwen3-0.6B f16 Metal decoder reaches **59.03 tok/s median** for one 64-token stream across N=12 fresh varied prompts on AC power on the locked M1 Max. The final 20-prompt gate remains token-exact against Transformers CPU fp32: **20/20 prompts, 1,280/1,280 tokens, zero near-tie exemptions**.
 
 The foundations report's 3.2 tok/s result used a debug binary on a contended M5, so it is context rather than a locked release baseline. Instrumented release controls on the M1 showed that the step graph was already cached, but executable preparation and a very slow package-miss first dispatch occurred inside the first timed generation call. Wave 1 now prepares both bucket executables at model load, uses O1 for this large decode graph, keeps KV updates on the GPU, and avoids most rejected-candidate work in the CPU top-k tap.
 
-This clears the `>=40 tok/s` bar narrowly. It does not approach llama.cpp: the same-day llama.cpp Metal control produced 190.36 and 203.45 tok/s, so owned decode is 21.3% and 19.9% of that control. The available control was `llama-server` with the official Q8_0 GGUF, not the requested `llama-cli` f16 cell; see the comparison caveat below.
+This clears the `>=40 tok/s` bar with margin. It does not approach llama.cpp: the same-day llama.cpp Metal control produced 190.36 and 203.45 tok/s, so the winner is 31.0% and 29.0% of that control. The available control was `llama-server` with the official Q8_0 GGUF, not the requested `llama-cli` f16 cell; see the comparison caveat below.
 
 ## Locked-M1 setup
 
@@ -20,7 +20,13 @@ This clears the `>=40 tok/s` bar narrowly. It does not approach llama.cpp: the s
 | Compilation | `MPSGraphOptimizationLevel1`, one package per pass/bucket |
 | Lock | `mkdir [bench-user-home]/bench.lock`; `/tmp/aft-measure.lock` absent; no `Runner.Worker` |
 
-The release binary was built locally and rsynced to `[bench-user-home]/bench-tools/decode-wave1/bin/`. Timed cells ran only while the benchmark lock was held.
+The release binary was built locally and rsynced to `[bench-user-home]/bench-tools/decode-wave1/bin/`. The hardened campaign harness SHA-256 was `8b199af51bfec87d7ccb2492f209a82d4fd68129bdff9fcac8c7faca74857ea0`. Timed cells ran only while the benchmark lock was held. AC power was confirmed before admission with `pmset -g batt`: `Now drawing from 'AC Power'`, internal battery **12%**, charging. The correctness gate later admitted at 16% charging; the N=12 throughput cell admitted at 24% charging.
+
+## Winner provenance
+
+Campaign `[consult-id]` banked the winner patch (`3ecb11f6...`). The patch applied cleanly to the current file; no hand port was needed. Its mechanism is the removal of the fp32 cast-matmul-cast round trip in the decode step graph's `linear`: the MPSGraph matrix multiplication now transposes the f16 weight and runs natively with the f16 input.
+
+The campaign's battery samples were **58.65-58.77 tok/s**. The AC N=12 median below is **59.03 tok/s**, about 0.5% higher, so this confirmation found no material battery-vs-AC delta. The battery caveat remains important because those samples ended with the rig at 3% charge.
 
 ## Attribution before changing the path
 
@@ -65,22 +71,18 @@ Pause-time inspection still works: it performs an explicit, synchronized blit of
 
 The token tap still receives the same sorted top-k logits before commitment. Once the top-k list is full, a candidate that cannot beat the current worst entry is rejected with one comparison instead of scanning all five entries. On the 20-prompt M1 gate, sampling fell from 0.588 to 0.173 ms/token without changing tie ordering or any generated token.
 
-## After: locked-M1 stage data
+## After: AC locked-M1 winner data
 
-Final single-stream result (`o1-eager-sampler-r3.json`):
+The steady winner measurement used the fixed stride-seven schedule over 12 fresh processes, one varied prompt per process. Each result was token-exact against its pinned reference.
 
-| Decode stage | Total | Per token |
-|---|---:|---:|
-| Graph/package preparation at model load | 187.32 ms | outside decode |
-| Host input preparation | 1.05 ms | 0.016 ms |
-| Feed construction | 37.16 ms | 0.581 ms |
-| Execute | 1,503.31 ms | 23.489 ms |
-| Logits readback | 4.00 ms | 0.063 ms |
-| Device KV export + blit | 13.21 ms | 0.206 ms |
-| Greedy top-5 | 10.65 ms | 0.166 ms |
-| **End-to-end decode** | **1,578.16 ms** | **24.659 ms, 40.55 tok/s** |
+| Cell | Result |
+|---|---:|
+| AC admission | `AC Power`, internal battery 24%, charging |
+| N=12 varied-prompt median | **59.0313 tok/s** |
+| N=12 exact prompts | **12/12** |
+| 20-prompt correctness gate decode rate | 56.8023 tok/s |
 
-The immediately preceding repeats were 39.56 and 40.00 tok/s. The 20-prompt correctness run was 39.84 tok/s. The honest conclusion is therefore a roughly **40 tok/s** MPSGraph path, not a stable mid-40s path. Execute consumes 95.3% of the final single-stream wall time and sets a raw ceiling near 42.6 tok/s before feed, tap, and update overhead.
+The AC median is within 5% of the campaign's battery winner samples (58.65-58.77 tok/s), and is approximately 0.5% higher than their midpoint. The 20-prompt gate's aggregate rate is lower because it includes all 1,280 tokens in one correctness process; it is not the steady single-stream number used for the throughput result. Package preparation remained outside `decode_wall_s`.
 
 The package-miss O1 prime reached 26.5 tok/s while compiling both packages at model load; its generation loop itself contained no compilation. Subsequent package loads took about 185-194 ms total for both executables.
 
@@ -97,14 +99,15 @@ uv run --python 3.12 \
   --out target/qwen3-reference-20x64.jsonl --max-new-tokens 64 --top-k-logits 5
 ```
 
-Candidate result on the locked M1:
+Candidate result on the locked M1 with `--verify-decode-cache`:
 
 - exact prompts: **20/20**;
 - exact generated tokens: **1,280/1,280**;
 - accepted near ties: **0**;
 - token-tap rows: **1,280**;
 - cache path: `device-resident-blit`;
-- optimization level: `1`.
+- optimization level: `1`;
+- correctness-gate decode rate: **56.8023 tok/s** on AC power.
 
 Hook tests:
 
@@ -118,24 +121,26 @@ qwen3_decode::tests::greedy_argmax_uses_lowest_token_id_for_exact_ties — passe
 
 The token tap, pause/resume state, forced splice, addressable weights, and on-demand cache inspection remain intact. O1 and the GPU cache path produced the same 64-token first-prompt sequence as the O0 CPU-update control before the full oracle gate was run.
 
+Regression gates on AC power also passed: `cargo test -p spike-unified-rt` reported **54 passed, 4 ignored, 0 failed**, and the pinned constrained-decode fixtures reported **15/15 valid prompts and 647 generated tokens** with `--verify-decode-cache`. The unconstrained 20-prompt gate remained byte-for-byte token exact.
+
 ## Same-day llama.cpp comparison
 
 The M1 had llama.cpp's Metal-enabled `llama-server` and the official `Qwen3-0.6B-Q8_0.gguf`, but no `llama-cli` binary and no f16 generation GGUF. The official repository URL for `Qwen3-0.6B-F16.gguf` returned 404, so a same-precision cell could not be fabricated. The server used the same llama.cpp Metal backend and a five-token raw prompt, with `n_predict=64`, temperature zero, and no prompt cache request.
 
 | Runtime | Storage | Run 1 | Run 2 |
 |---|---|---:|---:|
-| owned MPSGraph | f16 | 40.55 tok/s | preceding repeat 40.00 tok/s |
+| owned MPSGraph winner | f16 | 59.03 tok/s median (N=12, AC) | 56.80 tok/s 20-prompt gate |
 | llama.cpp Metal (`llama-server`) | Q8_0 | 190.36 tok/s | 203.45 tok/s |
-| owned / llama.cpp | mixed precision | 21.3% | 19.9% |
+| owned / llama.cpp | mixed precision | 31.0% | 29.0% |
 
 This is a useful same-day backend ceiling but not the requested f16-to-f16 `llama-cli` ratio. A future certification should add an f16 GGUF and `llama-cli` to the locked image rather than relabeling the available Q8 server result.
 
 ## Next levers
 
-1. **Replace the large MPSGraph step with a lower-dispatch Metal path.** Execute is 95% of wall time; removing every measured host-side cost would only move throughput from 40.55 to about 42.6 tok/s.
+1. **Replace the large MPSGraph step with a lower-dispatch Metal path.** Graph execution remains the dominant measured cost; the native f16 linear removed a major conversion round trip, but a lower-dispatch path is still the next architectural lever.
 2. **Persist dynamic feed wrappers and small input buffers.** Feed construction costs about 0.58 ms/token, but this is secondary to execution.
 3. **Device-side top-k with a small tap readback.** Full logits readback plus CPU top-5 costs about 0.23 ms/token. Any device sampler must still expose immutable top-k values before commitment.
 4. **Write step K/V directly into addressed cache slices.** The current GPU export-plus-blit path costs about 0.21 ms/token. A custom kernel or supported aliasing output could remove staging without weakening inspection/splice semantics.
 5. **Re-run a true f16 llama-cli cell.** Install the matching binary and f16 GGUF on the M1 before using the comparison as a graduation ratio.
 
-The measured ceiling is now architectural rather than hidden graph rebuilding or CPU/GPU cache traffic. Further large gains require reducing MPSGraph execution cost or replacing the step graph, not tuning the controller hooks away.
+The measured ceiling is now architectural rather than hidden graph rebuilding, fp32 linear conversion, or CPU/GPU cache traffic. Further large gains require reducing MPSGraph execution cost or replacing the step graph, not tuning the controller hooks away.

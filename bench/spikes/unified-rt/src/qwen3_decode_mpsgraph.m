@@ -128,14 +128,8 @@ static MPSGraphTensor *cast_tensor(MPSGraph *graph, MPSGraphTensor *tensor, MPSD
 }
 
 static MPSGraphTensor *linear(MPSGraph *graph, MPSGraphTensor *input, MPSGraphTensor *weight) {
-    MPSGraphTensor *input32 = cast_tensor(graph, input, MPSDataTypeFloat32);
-    MPSGraphTensor *weight32 = cast_tensor(graph, weight, MPSDataTypeFloat32);
-    MPSGraphTensor *transposed = [graph transposeTensor:weight32 dimension:0 withDimension:1 name:nil];
-    return cast_tensor(
-        graph,
-        [graph matrixMultiplicationWithPrimaryTensor:input32 secondaryTensor:transposed name:nil],
-        MPSDataTypeFloat16
-    );
+    MPSGraphTensor *transposed = [graph transposeTensor:weight dimension:0 withDimension:1 name:nil];
+    return [graph matrixMultiplicationWithPrimaryTensor:input secondaryTensor:transposed name:nil];
 }
 
 static MPSGraphTensor *rms_norm(
