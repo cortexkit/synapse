@@ -26,12 +26,17 @@ private struct Args {
     let testAbortOnRequest: Bool
 }
 
-private struct LoadedModel {
+private struct LoadedBucket {
     let model: MLModel
     let modelURL: URL
     let outputName: String
     let bucket: Int
     let dims: Int
+    let temporaryRoot: URL?
+}
+
+private struct LoadedModel {
+    let buckets: [LoadedBucket]
 }
 
 private struct WorkerState {
@@ -111,7 +116,9 @@ private struct Main {
                 case "UNLOAD":
                     let reqId = stringField(request, "req_id")
                     let modelRef = stringField(request, "model_ref")
-                    state.models.removeValue(forKey: modelRef)
+                    if let loaded = state.models.removeValue(forKey: modelRef) {
+                        removeTemporaryRoots(loaded.buckets)
+                    }
                     try writeJSONFrame(fd: fd, value: ["type": "UNLOADED", "req_id": reqId])
                 case "PING":
                     let reqId = stringField(request, "req_id")
@@ -166,31 +173,64 @@ private func handleLoad(state: inout WorkerState, request: [String: Any], reqId:
     guard format == "mlmodelc" || format == "coreml" else {
         throw WorkerError.invalid("ANE worker only loads compiled .mlmodelc artifacts, got \(format)")
     }
-    let modelURL = URL(fileURLWithPath: artifactPath).standardizedFileURL
-    try verifyDigest(url: modelURL, digest: artifactDigest)
+
+    let runtimeConfig = request["runtime_config"] as? [String: Any] ?? [:]
+    let paths = jsonStringArray(runtimeConfig["artifact_paths"] as? String) ?? [artifactPath]
+    let digests = jsonStringArray(runtimeConfig["artifact_digests"] as? String) ?? [artifactDigest]
+    guard paths.count == digests.count else {
+        throw WorkerError.invalid("ANE artifact_paths and artifact_digests must have the same length")
+    }
 
     let started = monotonicTime()
     let configuration = MLModelConfiguration()
-    configuration.computeUnits = .all
+    configuration.computeUnits = .cpuAndNeuralEngine
     if #available(macOS 14.4, *) {
         configuration.optimizationHints.reshapeFrequency = .infrequent
     }
-    let model = try MLModel(contentsOf: modelURL, configuration: configuration)
-    let outputName = try selectOutputName(model: model)
-    let bucket = try inferBucket(model: model)
-    let dims = try inferOutputDims(model: model, outputName: outputName, bucket: bucket)
-    let placement = await placementShare(modelURL: modelURL, configuration: configuration)
-    state.lastPlacementShare = placement
+
+    var temporaryRoots: [URL] = []
+    var buckets: [LoadedBucket] = []
+    do {
+        for (path, digest) in zip(paths, digests) {
+            let sourceURL = URL(fileURLWithPath: path).standardizedFileURL
+            try verifyDigest(url: sourceURL, digest: digest)
+            let (modelURL, temporaryRoot) = try materializeCoreMLArtifact(
+                sourceURL: sourceURL,
+                format: format
+            )
+            if let temporaryRoot {
+                temporaryRoots.append(temporaryRoot)
+            }
+            let model = try MLModel(contentsOf: modelURL, configuration: configuration)
+            let outputName = try selectOutputName(model: model)
+            let bucket = try inferBucket(model: model)
+            let dims = try inferOutputDims(model: model, outputName: outputName, bucket: bucket)
+            buckets.append(LoadedBucket(
+                model: model,
+                modelURL: modelURL,
+                outputName: outputName,
+                bucket: bucket,
+                dims: dims,
+                temporaryRoot: temporaryRoot
+            ))
+        }
+    } catch {
+        removeTemporaryRoots(temporaryRoots)
+        throw error
+    }
+    guard let dims = buckets.first?.dims else {
+        throw WorkerError.invalid("ANE model load received no Core ML packages")
+    }
+    buckets.sort { $0.bucket < $1.bucket }
+    var placements: [Double?] = []
+    for bucket in buckets {
+        placements.append(await placementShare(modelURL: bucket.modelURL, configuration: configuration))
+    }
+    state.lastPlacementShare = placements.compactMap { $0 }.min()
 
     let modelRef = "ane:\(state.nextModel)"
     state.nextModel += 1
-    state.models[modelRef] = LoadedModel(
-        model: model,
-        modelURL: modelURL,
-        outputName: outputName,
-        bucket: bucket,
-        dims: dims
-    )
+    state.models[modelRef] = LoadedModel(buckets: buckets)
     return [
         "type": "LOADED",
         "req_id": reqId,
@@ -214,45 +254,47 @@ private func handleEmbedBatch(state: WorkerState, request: [String: Any], reqId:
         throw WorkerError.invalid("EMBED_BATCH requires at least one item")
     }
     let ids = try decodeI32Frame(raw)
-    let expected = itemDicts.reduce(0) { total, item in total + (item["n_tokens"] as? Int ?? 0) }
+    let tokenCounts = itemDicts.map { $0["n_tokens"] as? Int ?? 0 }
+    let expected = tokenCounts.reduce(0, +)
     guard ids.count == expected else {
         throw WorkerError.invalid("raw id frame has \(ids.count) tokens, expected \(expected)")
+    }
+    guard let maxTokens = tokenCounts.max(),
+          let bucket = loaded.buckets.first(where: { $0.bucket >= maxTokens }) else {
+        let available = loaded.buckets.map { $0.bucket }.map(String.init).joined(separator: ",")
+        throw WorkerError.invalid("batch requires \(tokenCounts.max() ?? 0) tokens but ANE buckets are [\(available)]")
     }
 
     var rows: [(ids: [Int], mask: [Int])] = []
     rows.reserveCapacity(itemDicts.count)
     var offset = 0
-    for (index, item) in itemDicts.enumerated() {
-        let nTokens = item["n_tokens"] as? Int ?? 0
+    for (index, nTokens) in tokenCounts.enumerated() {
         guard nTokens > 0 else { throw WorkerError.invalid("item \(index) has zero tokens") }
-        guard nTokens <= loaded.bucket else {
-            throw WorkerError.invalid("item \(index) has \(nTokens) tokens, exceeds fixed ANE bucket \(loaded.bucket)")
-        }
         var rowIds = ids[offset ..< offset + nTokens].map(Int.init)
         var mask = [Int](repeating: 1, count: nTokens)
-        if nTokens < loaded.bucket {
-            rowIds.append(contentsOf: repeatElement(0, count: loaded.bucket - nTokens))
-            mask.append(contentsOf: repeatElement(0, count: loaded.bucket - nTokens))
+        if nTokens < bucket.bucket {
+            rowIds.append(contentsOf: repeatElement(0, count: bucket.bucket - nTokens))
+            mask.append(contentsOf: repeatElement(0, count: bucket.bucket - nTokens))
         }
         rows.append((rowIds, mask))
         offset += nTokens
     }
 
     let providers = try rows.map { row in try featureProvider(inputIds: row.ids, attentionMask: row.mask) }
-    let predictions = try loaded.model.predictions(fromBatch: MLArrayBatchProvider(array: providers))
+    let predictions = try bucket.model.predictions(fromBatch: MLArrayBatchProvider(array: providers))
     var flat: [Float] = []
-    flat.reserveCapacity(rows.count * loaded.dims)
+    flat.reserveCapacity(rows.count * bucket.dims)
     for index in 0 ..< predictions.count {
         let output = predictions.features(at: index)
-        guard let value = output.featureValue(for: loaded.outputName)?.multiArrayValue else {
-            throw WorkerError.invalid("prediction output is missing feature \(loaded.outputName)")
+        guard let value = output.featureValue(for: bucket.outputName)?.multiArrayValue else {
+            throw WorkerError.invalid("prediction output is missing feature \(bucket.outputName)")
         }
         var vector = try poolAndNormalize(hiddenStates: value, attentionMask: rows[index].mask)
         if !normalize {
             vector = try poolOnly(hiddenStates: value, attentionMask: rows[index].mask)
         }
-        guard vector.count == loaded.dims else {
-            throw WorkerError.invalid("vector dims \(vector.count) did not match loaded dims \(loaded.dims)")
+        guard vector.count == bucket.dims else {
+            throw WorkerError.invalid("vector dims \(vector.count) did not match loaded dims \(bucket.dims)")
         }
         flat.append(contentsOf: vector)
     }
@@ -260,9 +302,70 @@ private func handleEmbedBatch(state: WorkerState, request: [String: Any], reqId:
     return ([
         "type": "VECTORS",
         "req_id": reqId,
-        "dims": loaded.dims,
+        "dims": bucket.dims,
         "n": rows.count
     ], encodeF32Frame(flat))
+}
+
+private func jsonStringArray(_ encoded: String?) -> [String]? {
+    guard let encoded, let data = encoded.data(using: .utf8) else { return nil }
+    guard let value = try? JSONSerialization.jsonObject(with: data),
+          let values = value as? [Any] else { return nil }
+    let strings = values.compactMap { $0 as? String }
+    return strings.count == values.count ? strings : nil
+}
+
+private func materializeCoreMLArtifact(sourceURL: URL, format: String) throws -> (URL, URL?) {
+    var isDirectory: ObjCBool = false
+    guard FileManager.default.fileExists(atPath: sourceURL.path, isDirectory: &isDirectory) else {
+        throw WorkerError.invalid("artifact path does not exist: \(sourceURL.path)")
+    }
+    if isDirectory.boolValue {
+        return (sourceURL, nil)
+    }
+    guard format == "mlmodelc" || format == "coreml" else {
+        throw WorkerError.invalid("unsupported Core ML artifact format \(format)")
+    }
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("synapse-ane-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
+    process.arguments = ["-q", "-o", sourceURL.path, "-d", root.path]
+    let errorPipe = Pipe()
+    process.standardError = errorPipe
+    try process.run()
+    process.waitUntilExit()
+    guard process.terminationStatus == 0 else {
+        let message = String(data: errorPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? "unknown unzip error"
+        try? FileManager.default.removeItem(at: root)
+        throw WorkerError.invalid("unzip Core ML artifact failed: \(message.trimmingCharacters(in: .whitespacesAndNewlines))")
+    }
+    let candidates = ([root] + (FileManager.default.enumerator(
+        at: root,
+        includingPropertiesForKeys: [.isDirectoryKey],
+        options: [.skipsHiddenFiles]
+    )?.compactMap { $0 as? URL } ?? [])).filter { url in
+        var candidateIsDirectory: ObjCBool = false
+        return FileManager.default.fileExists(atPath: url.path, isDirectory: &candidateIsDirectory)
+            && candidateIsDirectory.boolValue
+            && FileManager.default.fileExists(atPath: url.appendingPathComponent("model.mlmodel").path)
+    }
+    guard let modelURL = candidates.first else {
+        try? FileManager.default.removeItem(at: root)
+        throw WorkerError.invalid("unzipped Core ML artifact did not contain a compiled .mlmodelc bundle")
+    }
+    return (modelURL, root)
+}
+
+private func removeTemporaryRoots(_ roots: [URL]) {
+    for root in roots {
+        try? FileManager.default.removeItem(at: root)
+    }
+}
+
+private func removeTemporaryRoots(_ buckets: [LoadedBucket]) {
+    removeTemporaryRoots(buckets.compactMap { $0.temporaryRoot })
 }
 
 private func selectOutputName(model: MLModel) throws -> String {
@@ -484,12 +587,20 @@ private func sha256Path(url: URL) throws -> String {
             let rel = file.path.replacingOccurrences(of: url.path + "/", with: "")
             hasher.update(data: Data(rel.utf8))
             hasher.update(data: Data([0]))
-            hasher.update(data: try Data(contentsOf: file))
+            try updateHasher(&hasher, from: file)
         }
     } else {
-        hasher.update(data: try Data(contentsOf: url))
+        try updateHasher(&hasher, from: url)
     }
     return SHA256DigestToHex(hasher.finalize())
+}
+
+private func updateHasher(_ hasher: inout SHA256, from url: URL) throws {
+    let handle = try FileHandle(forReadingFrom: url)
+    defer { try? handle.close() }
+    while let chunk = try handle.read(upToCount: 4 * 1024 * 1024), !chunk.isEmpty {
+        hasher.update(data: chunk)
+    }
 }
 
 private func SHA256DigestToHex(_ digest: SHA256.Digest) -> String {

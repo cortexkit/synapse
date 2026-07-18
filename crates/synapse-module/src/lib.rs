@@ -1450,6 +1450,7 @@ fn build_preload_catalog_model(
         false,
         preload.worker_bin.clone(),
         preload.worker_runtime_dir.clone(),
+        Vec::new(),
         owned,
         inline,
         jobs,
@@ -1505,6 +1506,7 @@ fn normalize_catalog_model(
         model.pin,
         model.worker_bin,
         model.worker_runtime_dir,
+        model.extra_locators,
         owned,
         inline,
         jobs,
@@ -1540,6 +1542,7 @@ fn build_stored_model_config(
     pin: bool,
     worker_bin: Option<PathBuf>,
     worker_runtime_dir: Option<PathBuf>,
+    extra_locators: Vec<ModelAssetLocator>,
     owned: Option<OwnedCatalogConfig>,
     inline: &InlineConfig,
     jobs: &JobConfig,
@@ -1615,10 +1618,14 @@ fn build_stored_model_config(
         config_locator: owned
             .as_ref()
             .and_then(|profile| profile.config_locator.clone()),
-        extra_locators: owned
-            .as_ref()
-            .map(|profile| profile.extra_locators.clone())
-            .unwrap_or_default(),
+        extra_locators: if extra_locators.is_empty() {
+            owned
+                .as_ref()
+                .map(|profile| profile.extra_locators.clone())
+                .unwrap_or_default()
+        } else {
+            extra_locators
+        },
         engine_identity,
         numeric_profile_id: numeric_profile.numeric_profile_id(),
         fingerprint: numeric_profile.fingerprint(),
@@ -2568,6 +2575,11 @@ fn load_catalog_model_blocking(
     } else {
         model_path.path.clone()
     };
+    let extra_assets = spec
+        .extra_locators
+        .iter()
+        .map(|locator| locator_path(locator, &model_cache))
+        .collect::<Result<Vec<_>, _>>()?;
     let tokenizer = SanitizedTokenizer::from_file(
         &tokenizer_path.path,
         TokenizerConfig {
@@ -2585,6 +2597,7 @@ fn load_catalog_model_blocking(
     let runtime_config = model_runtime_config(
         &spec,
         &effective_model_path,
+        &extra_assets,
         model_cache.root(),
         microllm_max_tokens,
     );
@@ -2752,6 +2765,7 @@ fn unload_embedding_model_blocking(model: Arc<EmbeddingModel>) -> Result<(), Wir
 fn model_runtime_config(
     spec: &StoredModelConfig,
     model_path: &Path,
+    extra_assets: &[LocatedAsset],
     model_cache_root: &Path,
     microllm_max_tokens: u32,
 ) -> RuntimeConfig {
@@ -2764,6 +2778,31 @@ fn model_runtime_config(
         "artifact_path".to_string(),
         model_path.to_string_lossy().to_string(),
     );
+    if spec.engine == "ane" {
+        let mut paths = vec![model_path.to_string_lossy().to_string()];
+        paths.extend(
+            extra_assets
+                .iter()
+                .map(|asset| asset.path.to_string_lossy().to_string()),
+        );
+        let mut digests = vec![model_asset_digest(
+            &spec.model_locator,
+            &spec.artifact_digest,
+        )];
+        digests.extend(
+            spec.extra_locators
+                .iter()
+                .map(|locator| model_asset_digest(locator, &spec.artifact_digest)),
+        );
+        runtime_config.values.insert(
+            "artifact_paths".to_string(),
+            serde_json::to_string(&paths).expect("ANE artifact paths serialize"),
+        );
+        runtime_config.values.insert(
+            "artifact_digests".to_string(),
+            serde_json::to_string(&digests).expect("ANE artifact digests serialize"),
+        );
+    }
     runtime_config
         .values
         .insert("pooling".to_string(), spec.pooling.clone());
@@ -2805,6 +2844,13 @@ fn model_runtime_config(
 struct LocatedAsset {
     path: PathBuf,
     _guard: Option<synapse_core::ModelCacheReadGuard>,
+}
+
+fn model_asset_digest(locator: &ModelAssetLocator, fallback: &str) -> String {
+    match locator {
+        ModelAssetLocator::CacheDigest { digest } => digest.clone(),
+        ModelAssetLocator::LocalPath { .. } => fallback.to_string(),
+    }
 }
 
 fn locator_path(
@@ -2898,7 +2944,7 @@ async fn execute_model_load_job(state: Arc<ModuleState>, job_id: String, params:
             .extra
             .iter()
             .enumerate()
-            .map(|(index, _)| temp_dir.join(format!("extra-{index}.safetensors")))
+            .map(|(index, _)| temp_dir.join(format!("extra-{index}.artifact")))
             .collect::<Vec<_>>();
 
         set_job_progress(
@@ -2934,6 +2980,9 @@ async fn execute_model_load_job(state: Arc<ModuleState>, job_id: String, params:
         set_job_progress(&state.runtime, &job_id, ModelRuntimeState::Validating);
         let engine_name = canonical_engine_name(&params.engine);
         validate_artifact_file(&model_path, &engine_name)?;
+        for extra_path in &extra_paths {
+            validate_artifact_file(extra_path, &engine_name)?;
+        }
 
         let pin_module_id = params.pin.then(|| state.module_id.clone());
         let tokenizer_meta = state
@@ -2983,7 +3032,11 @@ async fn execute_model_load_job(state: Arc<ModuleState>, job_id: String, params:
                 state.model_cache.ingest(ModelCacheIngest {
                     source_url: local_file_url(path),
                     expected_digest: source.expected_digest.clone(),
-                    format: "safetensors".to_string(),
+                    format: if engine_name == "owned-metal" {
+                        "safetensors".to_string()
+                    } else {
+                        default_artifact_format(&engine_name)
+                    },
                     tokenizer_path: None,
                     pin_module_id: pin_module_id.clone(),
                 })
@@ -3033,6 +3086,12 @@ async fn execute_model_load_job(state: Arc<ModuleState>, job_id: String, params:
             &model_meta,
             &tokenizer_meta,
             package_digest,
+            extra_metas
+                .iter()
+                .map(|meta| ModelAssetLocator::CacheDigest {
+                    digest: meta.digest.clone(),
+                })
+                .collect(),
             owned,
             &state.runtime.inline,
             &state.runtime.jobs,
@@ -3229,6 +3288,7 @@ fn build_loaded_catalog_model(
     model_meta: &ModelCacheMeta,
     tokenizer_meta: &ModelCacheMeta,
     package_digest: String,
+    extra_locators: Vec<ModelAssetLocator>,
     owned: Option<OwnedCatalogConfig>,
     inline: &InlineConfig,
     jobs: &JobConfig,
@@ -3251,7 +3311,7 @@ fn build_loaded_catalog_model(
         model_id,
         engine_name,
         task,
-        if owned.is_some() {
+        if owned.is_some() || engine_name == "ane" {
             package_digest
         } else {
             model_meta.digest.clone()
@@ -3278,6 +3338,7 @@ fn build_loaded_catalog_model(
         params.pin,
         params.worker_bin.clone(),
         params.worker_runtime_dir.clone(),
+        extra_locators,
         owned,
         inline,
         jobs,
@@ -3353,6 +3414,11 @@ fn validate_artifact_file(path: &Path, engine_name: &str) -> Result<(), WireOper
                 )))
             }
         }
+        "mlmodelc" if read >= 4 && &header[..4] == b"PK\x03\x04" => Ok(()),
+        "mlmodelc" => Err(artifact_invalid_error(format!(
+            "expected a zipped .mlmodelc bundle at {}",
+            path.display()
+        ))),
         other => Err(artifact_invalid_error(format!(
             "unsupported artifact format '{other}' for {}",
             path.display()

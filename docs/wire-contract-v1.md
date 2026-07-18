@@ -83,6 +83,23 @@ certified-equivalent profile, else substitution_rejected/not_certified).
   (`not_certified`/`probe_required`) until the (machine, fingerprint) pair is
   certified. Lane-1 worker-backed `microllm.oneshot` routes retain their existing
   dispatch path and do not acquire the owned-lane certification gate.
+
+### Fixed-bucket ANE package sets
+
+An ANE `model.load` manifest may put the primary compiled Core ML package in
+`files.model` and additional fixed-sequence packages in ordered `files.extra`
+entries. Each entry is a detailed `{url, sha256}` file specification. The
+module caches every file separately, then derives one composite artifact digest
+from the ordered role set before minting the model fingerprint. The ANE worker
+loads all packages and selects the smallest bucket that can hold the longest
+item in an `embed.batch`; it never silently truncates an item to a smaller
+bucket. `files.tokenizer` remains required because Synapse owns tokenization.
+
+The production worker accepts a zipped `.mlmodelc` bundle for each package.
+The archive is only a transport/cache representation; the worker verifies its
+per-file digest, materializes it into a temporary compiled-model directory,
+and loads it with `CPU_AND_NE`. A package set's placement gate is the minimum
+reported Neural Engine share across its buckets.
 - **aliases.check_index** {index_fingerprint, provenance_set[]} → valid |
   migration_required {retracted_pair, rebuild_target} + table_epoch. Call at
   write-commit when your index holds mixed provenance. Revocation is never
