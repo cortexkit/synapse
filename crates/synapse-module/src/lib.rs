@@ -6087,10 +6087,25 @@ async fn probe_start(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
     };
     let record = admission.record().clone();
     if matches!(admission, JobAdmission::Admitted(_)) {
+        let supervisor_state = Arc::clone(&state);
+        let supervisor_job_id = record.job_id.clone();
         let task_state = Arc::clone(&state);
         let task_job_id = record.job_id.clone();
         tokio::spawn(async move {
-            execute_probe_job(task_state, task_job_id, model_filter).await;
+            let task = tokio::spawn(async move {
+                execute_probe_job(task_state, task_job_id, model_filter).await;
+            });
+            if let Err(error) = task.await {
+                fail_job_with_wire_error(
+                    &supervisor_state,
+                    &supervisor_job_id,
+                    true,
+                    WireOperationError::from_stable(
+                        StableError::engine_crashed(Some(100)),
+                        format!("probe execution task failed: {error}"),
+                    ),
+                );
+            }
         });
     }
     result_outcome(json!({
@@ -6236,7 +6251,12 @@ async fn execute_probe_job(state: Arc<ModuleState>, job_id: String, model_filter
         let probe_result = match probe_result {
             Ok(result) => result,
             Err(error) => {
-                fail_job_with_wire_error(&state, &job_id, true, error);
+                fail_job_with_wire_error(
+                    &state,
+                    &job_id,
+                    error.class == ErrorClass::Transient,
+                    error,
+                );
                 return;
             }
         };
@@ -6495,19 +6515,7 @@ async fn execute_embed_probe_for_model(
     apply_owned_tokenizer_policy(&model, &mut tokenized);
     let vectors = match execute_embedding(&state.runtime, &model, tokenized.batch.clone()).await {
         Ok(vectors) => vectors,
-        Err(error) => {
-            return Ok(ProbeModelResult {
-                lane_result: json!({
-                    "model_id": model.model_id,
-                    "task": "embed",
-                    "fingerprint": model.fingerprint,
-                    "numeric_profile_id": model.numeric_profile_id,
-                    "status": "uncertified",
-                    "error": error,
-                }),
-                certified_vectors: None,
-            })
-        }
+        Err(error) => return Err(error),
     };
     let actual_dims = vectors.first().map(Vec::len);
     let actual_item_count = vectors.len();
@@ -6557,7 +6565,7 @@ async fn execute_embed_probe_for_model(
         });
     };
     let evidence = probe_evidence(&vectors, &fixture.items);
-    let placement_share = ane_placement_share_for_model(&model)?;
+    let placement_share = ane_placement_share_for_model(&model).await?;
     let quality_passed = evidence.mean_cosine >= state.runtime.probe.mean_cosine_threshold
         && evidence.worst_decile >= state.runtime.probe.worst_decile_rank_overlap_threshold;
     let placement_passed = if model.engine_identity.engine == "ane-coreml-worker" {
@@ -6610,7 +6618,7 @@ async fn execute_embed_probe_for_model(
     })
 }
 
-fn ane_placement_share_for_model(
+async fn ane_placement_share_for_model(
     model: &EmbeddingModel,
 ) -> Result<Option<f64>, WireOperationError> {
     if model.engine_identity.engine != "ane-coreml-worker" {
@@ -6618,17 +6626,26 @@ fn ane_placement_share_for_model(
     }
     match &model.backend {
         EmbedBackend::Worker(engine) => {
-            let engine = engine.lock().map_err(|_| {
+            // WorkerEngine::ping bridges to its private runtime with block_on;
+            // keep that synchronous bridge off the module's async runtime.
+            let engine = Arc::clone(engine);
+            let ping = tokio::task::spawn_blocking(move || {
+                let engine = engine.lock().map_err(|_| {
+                    worker_host::WorkerHostError::Protocol(
+                        "worker engine mutex was poisoned during ANE placement ping".to_string(),
+                    )
+                })?;
+                engine.ping()
+            })
+            .await
+            .map_err(|error| {
                 WireOperationError::from_stable(
                     StableError::engine_crashed(Some(100)),
-                    "worker engine mutex was poisoned during ANE placement ping",
+                    format!("ANE placement ping join failed: {error}"),
                 )
-            })?;
-            let ping = engine.ping().map_err(|error| {
-                WireOperationError::from_stable(
-                    StableError::engine_crashed(Some(100)),
-                    format!("ANE placement ping failed: {error}"),
-                )
+            })?
+            .map_err(|error| {
+                engine_error_to_wire(error.to_engine_error(EngineErrorStage::Inference))
             })?;
             Ok(ping.placement_share)
         }
@@ -6689,19 +6706,7 @@ async fn execute_rerank_probe_for_model(
         .await
         {
             Ok(scores) => scores,
-            Err(error) => {
-                return Ok(ProbeModelResult {
-                    lane_result: json!({
-                        "model_id": model.model_id,
-                        "task": "rerank",
-                        "fingerprint": model.fingerprint,
-                        "numeric_profile_id": model.numeric_profile_id,
-                        "status": "uncertified",
-                        "error": error,
-                    }),
-                    certified_vectors: None,
-                })
-            }
+            Err(error) => return Err(error),
         };
         actual.extend(scores.scores.into_iter().map(f64::from));
         reference.extend(item.scores.iter().copied().map(f64::from));
@@ -6834,15 +6839,7 @@ async fn execute_generate_probe_for_model(
         .await
         {
             Ok(output) => output,
-            Err(error) => {
-                return store_generate_probe_error(
-                    state,
-                    &model,
-                    fixture,
-                    "generation_failed",
-                    error.message,
-                )
-            }
+            Err(error) => return Err(error),
         };
         let elapsed_secs = started.elapsed().as_secs_f64().max(f64::EPSILON);
         latency_samples.push(elapsed_secs * 1_000.0);

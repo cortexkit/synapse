@@ -402,7 +402,7 @@ impl WorkerHost {
 
     pub async fn ping(&mut self) -> Result<WorkerPing, WorkerHostError> {
         let req_id = self.next_req_id("ping");
-        match self
+        let response = self
             .send_request(
                 WorkerRequest::Ping {
                     req_id: req_id.clone(),
@@ -410,17 +410,32 @@ impl WorkerHost {
                 None,
                 false,
             )
-            .await?
-        {
-            (
-                WorkerResponse::Pong {
-                    req_id: got,
-                    rss_mb,
-                    models_loaded,
-                    placement_share,
-                },
-                _,
-            ) => {
+            .await;
+        let (response, _) = match response {
+            Ok(response) => response,
+            Err(error @ WorkerHostError::EngineCrashed { .. }) => {
+                // A placement ping is part of ANE probe execution. Treat a
+                // dead worker like any other supervised request so its crash
+                // budget and lazy restart state stay consistent.
+                let crash_keys = self
+                    .loaded_models
+                    .values()
+                    .map(|model| model.crash_key.clone())
+                    .collect::<Vec<_>>();
+                for key in crash_keys {
+                    self.record_crash_and_maybe_restart(key).await;
+                }
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+        match response {
+            WorkerResponse::Pong {
+                req_id: got,
+                rss_mb,
+                models_loaded,
+                placement_share,
+            } => {
                 ensure_req_id(&req_id, &got)?;
                 self.last_placement_share = placement_share;
                 Ok(WorkerPing {
@@ -429,10 +444,8 @@ impl WorkerHost {
                     placement_share,
                 })
             }
-            (WorkerResponse::Err { code, msg, .. }, _) => {
-                Err(WorkerHostError::WorkerErr { code, msg })
-            }
-            (other, _) => Err(WorkerHostError::Protocol(format!(
+            WorkerResponse::Err { code, msg, .. } => Err(WorkerHostError::WorkerErr { code, msg }),
+            other => Err(WorkerHostError::Protocol(format!(
                 "PING returned unexpected response {other:?}"
             ))),
         }
