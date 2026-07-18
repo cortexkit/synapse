@@ -113,7 +113,7 @@
 **Decode Campaign Harness:**
 - Purpose: Execute and coordinate the sandboxed Athena V3 single-stream decode campaign.
 - Location: `bench/campaign`
-- Contains: Integrity validation of model snapshots, fixtures, and target runners, plus deterministic verification of intervention hooks.
+- Contains: Integrity validation of model snapshots, fixtures, and target runners; deterministic verification of intervention hooks; candidate-owned temporary workspace staging and build output/target directories; toolchain environment forwarding (`RUSTUP_HOME`, `CARGO_HOME`); split-stream append-mode logging (`.log` and `.log.stderr`); and failure scene preservation.
 - Depends on: `spike-unified-rt` runner.
 - Used by: Automated evaluation gates to confirm decode performance and correctness.
 
@@ -350,7 +350,7 @@
 **Athena V3 Decode Campaign Harness:**
 - Location: `bench/campaign/decode-harness.sh`
 - Triggers: Invocation of `decode-harness.sh` by an evaluation runner.
-- Responsibilities: Manages snapshot validation, locked execution sandbox, correctness verification, and performance evaluation.
+- Responsibilities: Manages snapshot validation, locked candidate execution sandbox, candidate-owned workspace staging, toolchain environment forwarding, correctness verification, split-stream append-mode logging, failure scene preservation, and performance evaluation.
 
 
 ## Error Handling
@@ -364,6 +364,7 @@
 **Bench Harness Strategy:** Fail-fast utilizing `anyhow::Result` error propagation with contextual layers (`.context()`).
 - **Child Supervision:** Spawned subprocesses (`llama-server`) are tracked via PID. If a child dies or fails to bind to its designated port within `HEALTH_TIMEOUT` (120s), the lane runner fails immediately rather than silently hanging. Platform-specific process control signals (such as SIGTERM on Unix) are gated appropriately so subprocess lifecycles function seamlessly on both Windows and Unix platforms.
 - **HTTP Resiliency:** Requests to external wrapping endpoints (`wrap-embed`) implement read timeouts, connect timeouts, and bounded retry loops with backoff to recover from transient rate limits or cold-load stalls.
+- **Campaign Failure Preservation:** The decode campaign harness separates standard output and standard error streams into append-only logs (`.log` and `.log.stderr`) to avoid truncating diagnostics. If a candidate build, verification, or run fails, the harness dumps logs and staging details to the results directory as a preserved failure scene before cleaning up.
 
 ## Cross-Cutting Concerns
 

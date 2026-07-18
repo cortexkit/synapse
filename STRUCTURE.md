@@ -92,7 +92,7 @@
 
 **bench/campaign/:**
 - Purpose: Verification harness and campaign fixtures for decode models.
-- Contains: Locked sandboxed campaign controller script, prompt/reference fixtures, and signature validation checks.
+- Contains: Locked sandboxed campaign controller script, prompt/reference fixtures, signature validation checks, and diagnostic logs/failure scenes.
 - Key files: `bench/campaign/decode-harness.sh`, `bench/campaign/README.md`
 
 
@@ -129,7 +129,7 @@
 **docs/:**
 - Purpose: Stores contextual architectural studies and decision analyses.
 - Contains: Markdown documents.
-- Key files: `docs/decision-1-runtime.md`
+- Key files: `docs/decision-1-runtime.md`, `docs/campaign-context-repro.md`
 
 **tools/:**
 - Purpose: Houses shared development tools, utilities, and datasets generation/distillation harnesses.
