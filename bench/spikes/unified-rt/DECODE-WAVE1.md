@@ -2,9 +2,9 @@
 
 ## Verdict
 
-The owned Qwen3-0.6B f16 Metal decoder reaches **59.03 tok/s median** for one 64-token stream across N=12 fresh varied prompts on AC power on the locked M1 Max. The final 20-prompt gate remains token-exact against Transformers CPU fp32: **20/20 prompts, 1,280/1,280 tokens, zero near-tie exemptions**.
+The owned Qwen3-0.6B f16 Metal decoder reaches **73.81 tok/s median** for one 64-token stream across N=12 fresh varied prompts on AC power on the locked M1 Max. The final 20-prompt gate remains token-exact against Transformers CPU fp32: **20/20 prompts, 1,280/1,280 tokens, zero near-tie exemptions**.
 
-The foundations report's 3.2 tok/s result used a debug binary on a contended M5, so it is context rather than a locked release baseline. Instrumented release controls on the M1 showed that the step graph was already cached, but executable preparation and a very slow package-miss first dispatch occurred inside the first timed generation call. Wave 1 now prepares both bucket executables at model load, uses O1 for this large decode graph, keeps KV updates on the GPU, and avoids most rejected-candidate work in the CPU top-k tap.
+The foundations report's 3.2 tok/s result used a debug binary on a contended M5, so it is context rather than a locked release baseline. Instrumented release controls on the M1 showed that the step graph was already cached, but executable preparation and a very slow package-miss first dispatch occurred inside the first timed generation call. Wave 1 now prepares both bucket executables at model load, uses O1 for this large decode graph, keeps KV updates on the GPU, and avoids most rejected-candidate work in the CPU top-k tap. Winner 2 keeps the lm-head logits matmul in f16 and casts only its result to fp32.
 
 This clears the `>=40 tok/s` bar with margin. It does not approach llama.cpp: the same-day llama.cpp Metal control produced 190.36 and 203.45 tok/s, so the winner is 31.0% and 29.0% of that control. The available control was `llama-server` with the official Q8_0 GGUF, not the requested `llama-cli` f16 cell; see the comparison caveat below.
 
@@ -20,13 +20,13 @@ This clears the `>=40 tok/s` bar with margin. It does not approach llama.cpp: th
 | Compilation | `MPSGraphOptimizationLevel1`, one package per pass/bucket |
 | Lock | `mkdir [bench-user-home]/bench.lock`; `/tmp/aft-measure.lock` absent; no `Runner.Worker` |
 
-The release binary was built locally and rsynced to `[bench-user-home]/bench-tools/decode-wave1/bin/`. The hardened campaign harness SHA-256 was `8b199af51bfec87d7ccb2492f209a82d4fd68129bdff9fcac8c7faca74857ea0`. Timed cells ran only while the benchmark lock was held. AC power was confirmed before admission with `pmset -g batt`: `Now drawing from 'AC Power'`, internal battery **12%**, charging. The correctness gate later admitted at 16% charging; the N=12 throughput cell admitted at 24% charging.
+The release binary was built in `[bench-user-home]/ck-campaign/workspaces/mason-winner-2/target/release/spike-unified-rt`. The hardened campaign harness SHA-256 was `008d43490e9504bd420bee96823b950e387ea90a1a81f46e20e9890980741a9c`. Timed cells ran only while the benchmark lock was held. AC power was confirmed before admission with `pmset -g batt`: `Now drawing from 'AC Power'`, internal battery **98%**, charging.
 
 ## Winner provenance
 
-Campaign `[consult-id]` banked the winner patch (`3ecb11f6...`). The patch applied cleanly to the current file; no hand port was needed. Its mechanism is the removal of the fp32 cast-matmul-cast round trip in the decode step graph's `linear`: the MPSGraph matrix multiplication now transposes the f16 weight and runs natively with the f16 input.
+Campaign `[consult-id]` banked winner-2 patch (`8c6da25c9dd5431acc8e632d9cc675520e75ae5cf85b0931d613f867896d9740`). It applied cleanly to the current file, which already contains winner 1; no hand port was needed. Its mechanism is **lm-head logits fp32 cast round-trip removal**: the f16 `linear` result is cast to fp32 only after the matmul, rather than casting the selected activations and lm-head weights to fp32 before the matmul.
 
-The campaign's battery samples were **58.65-58.77 tok/s**. The AC N=12 median below is **59.03 tok/s**, about 0.5% higher, so this confirmation found no material battery-vs-AC delta. The battery caveat remains important because those samples ended with the rig at 3% charge.
+The cumulative decode arc is **40.55 -> 59.03 -> 73.81 tok/s**: the first number is the frozen pre-wave baseline, the second is winner 1's AC confirmation, and the third is this winner-2 AC confirmation. The campaign's battery winner was approximately **73.68 tok/s**; this AC N=12 median is **73.81 tok/s**, +0.18%, so it does not exceed the 5% battery-vs-AC delta threshold.
 
 ## Attribution before changing the path
 
@@ -71,18 +71,22 @@ Pause-time inspection still works: it performs an explicit, synchronized blit of
 
 The token tap still receives the same sorted top-k logits before commitment. Once the top-k list is full, a candidate that cannot beat the current worst entry is rejected with one comparison instead of scanning all five entries. On the 20-prompt M1 gate, sampling fell from 0.588 to 0.173 ms/token without changing tie ordering or any generated token.
 
+### LM-head logits stay native f16
+
+The second campaign winner replaces the lm-head's fp32 cast-matmul-cast round trip with the shared f16 `linear` path. The logits are converted to fp32 only after the f16 matmul, preserving the existing sampler input while removing two large conversion operations from every decode step.
+
 ## After: AC locked-M1 winner data
 
 The steady winner measurement used the fixed stride-seven schedule over 12 fresh processes, one varied prompt per process. Each result was token-exact against its pinned reference.
 
 | Cell | Result |
 |---|---:|
-| AC admission | `AC Power`, internal battery 24%, charging |
-| N=12 varied-prompt median | **59.0313 tok/s** |
+| AC admission | `AC Power`, internal battery 98%, charging |
+| N=12 varied-prompt median | **73.8137 tok/s** |
 | N=12 exact prompts | **12/12** |
-| 20-prompt correctness gate decode rate | 56.8023 tok/s |
+| 20-prompt correctness gate decode rate | 72.5642 tok/s |
 
-The AC median is within 5% of the campaign's battery winner samples (58.65-58.77 tok/s), and is approximately 0.5% higher than their midpoint. The 20-prompt gate's aggregate rate is lower because it includes all 1,280 tokens in one correctness process; it is not the steady single-stream number used for the throughput result. Package preparation remained outside `decode_wall_s`.
+The AC median is within 5% of the campaign's approximate battery winner (**73.68 tok/s**), and is **0.18% higher**. The 20-prompt gate's aggregate rate is lower because it includes all 1,280 tokens in one correctness process; it is not the steady single-stream number used for the throughput result. Package preparation remained outside `decode_wall_s`.
 
 The package-miss O1 prime reached 26.5 tok/s while compiling both packages at model load; its generation loop itself contained no compilation. Subsequent package loads took about 185-194 ms total for both executables.
 
@@ -99,7 +103,7 @@ uv run --python 3.12 \
   --out target/qwen3-reference-20x64.jsonl --max-new-tokens 64 --top-k-logits 5
 ```
 
-Candidate result on the locked M1 with `--verify-decode-cache`:
+Candidate result on the locked M1 through the hardened campaign gate:
 
 - exact prompts: **20/20**;
 - exact generated tokens: **1,280/1,280**;
@@ -107,7 +111,7 @@ Candidate result on the locked M1 with `--verify-decode-cache`:
 - token-tap rows: **1,280**;
 - cache path: `device-resident-blit`;
 - optimization level: `1`;
-- correctness-gate decode rate: **56.8023 tok/s** on AC power.
+- correctness-gate decode rate: **72.5642 tok/s** on AC power.
 
 Hook tests:
 
@@ -129,7 +133,7 @@ The M1 had llama.cpp's Metal-enabled `llama-server` and the official `Qwen3-0.6B
 
 | Runtime | Storage | Run 1 | Run 2 |
 |---|---|---:|---:|
-| owned MPSGraph winner | f16 | 59.03 tok/s median (N=12, AC) | 56.80 tok/s 20-prompt gate |
+| owned MPSGraph winner | f16 | 73.81 tok/s median (N=12, AC) | 72.56 tok/s 20-prompt gate |
 | llama.cpp Metal (`llama-server`) | Q8_0 | 190.36 tok/s | 203.45 tok/s |
 | owned / llama.cpp | mixed precision | 31.0% | 29.0% |
 

@@ -381,11 +381,8 @@ static Qwen3DecodePlan *new_plan(
                                                                   secondaryTensor:plan->selector
                                                                              name:nil];
     selected = [plan->graph transposeTensor:selected dimension:0 withDimension:1 name:nil];
-    MPSGraphTensor *selected32 = cast_tensor(plan->graph, selected, MPSDataTypeFloat32);
-    MPSGraphTensor *lm_head32 = cast_tensor(plan->graph, plan->lm_head, MPSDataTypeFloat32);
-    plan->logits = [[plan->graph matrixMultiplicationWithPrimaryTensor:selected32
-                                                       secondaryTensor:[plan->graph transposeTensor:lm_head32 dimension:0 withDimension:1 name:nil]
-                                                                  name:@"decode_logits_fp32"] retain];
+    MPSGraphTensor *logits16 = linear(plan->graph, selected, plan->lm_head);
+    plan->logits = [[plan->graph castTensor:logits16 toType:MPSDataTypeFloat32 name:@"decode_logits_fp32"] retain];
     [targets insertObject:plan->logits atIndex:0];
     plan->targets = [targets copy];
     if (plan->input == nil || plan->logits == nil || plan->targets.count != 1 + layer_count * 2) {
