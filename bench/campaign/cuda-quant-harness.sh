@@ -316,7 +316,9 @@ def verify_copy_destination(
         ],
         verification_log,
     )
-    verification_output = read_runner_output(verification_log)
+    # Stdout only: a runner stderr disclosure line must not satisfy the
+    # nonzero-output requirement for an actually-empty destination.
+    verification_output = read_runner_stdout(verification_log)
     if verification_status != 0 or not verification_output.strip():
         raise HarnessError(f"copy reported success but destination is empty: {destination}")
 
@@ -463,8 +465,12 @@ def cuda_preflight(runner: Path, log_dir: Path) -> str:
     )
     if process_status != 0:
         raise HarnessError(f"nvidia-smi process preflight failed with status {process_status}: {read_runner_output(process_log)}")
-    processes = read_runner_output(process_log)
-    state = read_runner_output(state_log)
+    # Parse stdout only: the candidate runner is allowed to print disclosure
+    # notes on stderr (e.g. the dash multi-digit-fd skip), and merging streams
+    # here would turn those notes into phantom foreign processes. Merged output
+    # stays reserved for error reporting above.
+    processes = read_runner_stdout(process_log)
+    state = read_runner_stdout(state_log)
     (log_dir / "cuda-preflight.json").write_text(
         json.dumps({"nvidia_smi": state, "compute_processes": processes.splitlines()}, indent=1) + "\n"
     )
@@ -475,8 +481,16 @@ def cuda_preflight(runner: Path, log_dir: Path) -> str:
     return state
 
 
+def read_runner_stdout(log_path: Path) -> str:
+    # Stdout only, for callers that PARSE runner output as data.
+    try:
+        return log_path.read_text(errors="replace").strip()
+    except OSError:
+        return ""
+
+
 def read_runner_output(log_path: Path) -> str:
-    # Merge both captured streams for callers that report or parse output.
+    # Merge both captured streams for callers that REPORT errors.
     parts = []
     for path in (log_path, log_path.with_name(log_path.name + ".stderr")):
         try:
