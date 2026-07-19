@@ -2,7 +2,7 @@
 
 ## Verdict
 
-The owned Qwen3-0.6B f16 Metal decoder reaches **78.31 tok/s** for one 64-token stream on the locked M1 Max after the winner-3 attention change. The campaign's final 20-prompt gate remains token-exact against Transformers CPU fp32: **20/20 prompts, 1,280/1,280 tokens, zero near-tie exemptions**.
+Winner 3's prior locked-M1 campaign measured **78.31 tok/s** in its controlled single-prompt cell and **78.18 tok/s** as its N=12 steady median. That campaign's final 20-prompt gate was token-exact against Transformers CPU fp32: **20/20 prompts, 1,280/1,280 tokens, zero near-tie exemptions**. This integration branch has not repeated those gates because the M1 reload investigation contaminated its MPSGraph process state; see the package-reload finding below.
 
 The foundations report's 3.2 tok/s result used a debug binary on a contended M5, so it is context rather than a locked release baseline. Instrumented release controls on the M1 showed that the step graph was already cached, but executable preparation and a very slow package-miss first dispatch occurred inside the first timed generation call. Wave 1 now prepares both bucket executables at model load, uses O1 for this large decode graph, keeps KV updates on the GPU, and avoids most rejected-candidate work in the CPU top-k tap. Winner 2 keeps the lm-head logits matmul in f16 and casts only its result to fp32. Winner 3 also keeps QK^T and PV attention matmuls in f16 while retaining the scale, mask, and softmax island in fp32.
 
@@ -17,7 +17,7 @@ This clears the `>=40 tok/s` bar with margin. It does not approach llama.cpp: th
 | Cache | one stream, bucket 512 |
 | Decode | greedy raw completion, 64 generated tokens |
 | Graph | one full-bucket prefill executable and one query-length-1 step executable |
-| Compilation | `MPSGraphOptimizationLevel1`, two eager decode executables per bucket; decode-package serialization disabled |
+| Candidate compilation | `MPSGraphOptimizationLevel1`, two eager decode executables per bucket; decode-package serialization disabled pending clean-M1 confirmation |
 | Lock | `mkdir [bench-user-home]/bench.lock`; `/tmp/aft-measure.lock` absent; no `Runner.Worker` |
 
 The release binary was built in `[bench-user-home]/ck-campaign/workspaces/mason-winner-2/target/release/spike-unified-rt`. The hardened campaign harness SHA-256 was `008d43490e9504bd420bee96823b950e387ea90a1a81f46e20e9890980741a9c`. Timed cells ran only while the benchmark lock was held. AC power was confirmed before admission with `pmset -g batt`: `Now drawing from 'AC Power'`, internal battery **98%**, charging.
@@ -28,7 +28,7 @@ Campaign `[consult-id]` banked winner-2 patch (`8c6da25c9dd5431acc8e632d9cc67552
 
 Campaign `[consult-id]` banked winner 3. Its attention change leaves QK^T and PV matmuls in f16, casts QK^T scores up before scale/mask/softmax, then casts probabilities down before PV. The campaign reported **78.31 tok/s** for the controlled single-prompt cell and preserved the 20-prompt token-exact gate.
 
-The cumulative decode arc is **40.55 -> 59.03 -> 73.81 -> 78.31 tok/s**: the first number is the frozen pre-wave baseline, the second is winner 1's AC confirmation, the third is winner 2's AC confirmation, and the fourth is campaign `[consult-id]` winner 3. The prior campaign's battery winner was approximately **73.68 tok/s**; the 73.81 AC confirmation remained within 5%.
+The cumulative steady-decode arc is **40.55 -> 59.03 -> 73.81 -> 78.18 tok/s**: the first number is the frozen pre-wave baseline, the second is winner 1's AC confirmation, the third is winner 2's AC confirmation, and the fourth is campaign `[consult-id]` winner 3 N=12 median. The separately measured 78.31 tok/s figure is winner 3's controlled single-prompt cell, not the campaign baseline. The prior campaign's battery winner was approximately **73.68 tok/s**; the 73.81 AC confirmation remained within 5%.
 
 ## Attribution before changing the path
 
@@ -59,7 +59,7 @@ The other suspects were ruled in or out directly:
 
 ### Executables are ready before generation
 
-`MetalDecoder::new` now prepares both prefill and step plans. Preparation remains cached per bucket, but no graph build, package load, compile, or specialization occurs in `DecodeSession::generate`. Both winner-3 decode plans deliberately compile eagerly at load because their serialized packages can wedge during deserialization. Package roots include a canonical graph digest, and the graph revision is now v10.
+`MetalDecoder::new` now prepares both prefill and step plans. Preparation remains cached per bucket, but no graph build, package load, compile, or specialization occurs in `DecodeSession::generate`. The candidate disables decode-package I/O so both plans compile eagerly at load. That mitigation remains unconfirmed on a clean M1 because a subsequent no-package process also wedged during this investigation. Package roots include a canonical graph digest, and the graph revision is now v10.
 
 O1 is the default for decode. On this large graph, O1 removes the pathological first-dispatch behavior seen after a package miss. O0 remains an attribution control through `SYNAPSE_QWEN3_DECODE_OPT_LEVEL=0`.
 
@@ -83,15 +83,15 @@ Winner 3 applies f16 only to the two attention matmuls. Scores are converted to 
 
 ### Serialized decode-package guard
 
-On the locked M1 running macOS 26.5.2 (build 25F84), freshly built O1 packages from both the baseline fp32 attention graph and the full winner-3 f16 QK^T/PV graph blocked the next process during MPSGraph package deserialization and required a hard kill after 60 seconds. The failure therefore is not stale cache identity or unique to the winner topology: it is a Qwen3 decode-package deserializer failure on this M1 configuration. The M5 Max running the same OS build successfully reloaded the serialized winner package, so the failure is hardware-specific or another M1 runtime distinction. QK-only and PV-only variants are no longer needed to decide the integration guard.
+On the locked M1 running macOS 26.5.2 (build 25F84), freshly built O1 packages from both the baseline fp32 attention graph and the full winner-3 f16 QK^T/PV graph blocked the next process and required a hard kill after 60 seconds. An O0 baseline package also timed out. After killing leftovers, attempting to bounce the per-user Metal compiler service, and deleting every temporary test cache, a fresh O1 baseline package still timed out on reload. A no-package eager-compile candidate also timed out in its second process. This run therefore cannot distinguish a package deserializer defect from MPSGraph state contamination that outlives the killed process, and it cannot certify eager compilation as an integration fix. The M5 Max running the same OS build successfully reloaded the serialized winner package, which makes this an M1-specific or M1-state-specific failure.
 
-`MetalExecutionConfig::decode_package_path` returns no package path for either Qwen3 decode pass. The Objective-C builder therefore compiles both plans eagerly at model load and never reads or writes decode packages. This moves decode compilation to cold load without changing steady decode execution. The package-root graph digest is a hash of the model family and graph-builder revision, so a future graph change necessarily creates a cache miss instead of reusing a package built for another topology.
+`MetalExecutionConfig::decode_package_path` currently returns no package path for either Qwen3 decode pass. The Objective-C builder consequently compiles both plans eagerly at model load and never reads or writes decode packages. This is a conservative candidate mitigation, not a confirmed M1 resolution. The package-root graph digest is a hash of the model family and graph-builder revision, so a future graph change necessarily creates a cache miss instead of reusing a package built for another topology.
 
-The affected production package infrastructure is `crates/synapse-engine-owned/src/mpsgraph_runtime.m`, which also reads and writes one package per shape. The engine-owned Qwen3 graph in `crates/synapse-engine-owned/src/qwen3_mpsgraph.m` does not yet share this decode-step topology. If production adopts this f16 QK^T/PV decode graph, it must disable its decode-package I/O and retain the graph-digest discipline before enabling serialization.
+The affected production package infrastructure is `crates/synapse-engine-owned/src/mpsgraph_runtime.m`, which also reads and writes one package per shape. The engine-owned Qwen3 graph in `crates/synapse-engine-owned/src/qwen3_mpsgraph.m` does not yet share this decode-step topology. Production must not adopt this f16 QK^T/PV decode graph or its package policy until an operator restores a clean M1 state and validates a reload-safe path.
 
-## After: AC locked-M1 winner data
+## Historical AC locked-M1 winner data
 
-The table preserves the winner-2 AC control that established the former 73.81 tok/s baseline. Winner 3's measured locked-M1 confirmation and cold-load comparison are recorded with the campaign evidence; its serialized-decode reload safeguard is described above.
+The table preserves the winner-2 AC control that established the former 73.81 tok/s baseline. Winner 3's historical campaign evidence is 78.31 tok/s for the controlled single-prompt cell and 78.18 tok/s for the N=12 steady median. No new N=12 result or cold-load comparison is reported for the candidate because the M1 reload test ended in the contamination blocker described above.
 
 | Cell | Result |
 |---|---:|
