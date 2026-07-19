@@ -216,8 +216,21 @@ enum Shapes {
     Bucketed,
 }
 
-const GRAPH_REVISION: u32 = 9;
+// Package roots hash the model family and this graph-builder revision. Increment
+// GRAPH_REVISION whenever graph construction changes so older topologies are cache misses.
+const GRAPH_REVISION: u32 = 10;
 const BUCKET_POLICY_VERSION: u32 = 2;
+
+fn stable_cache_hash(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(1469598103934665603u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(1099511628211)
+    })
+}
+
+fn graph_cache_digest(family: &str) -> u64 {
+    let canonical = format!("{family}:mpsgraph-builder-v{GRAPH_REVISION}");
+    stable_cache_hash(canonical.as_bytes())
+}
 const BUCKET_V1_MAX_BATCH_ROWS: usize = 8;
 const BUCKET_V2_BATCH_ROW_LADDER: &[usize] = &[16, 16, 16, 16, 16, 16, 12, 12, 8, 8];
 const BUCKET_SEQUENCE_LADDER: &[usize] = &[64, 96, 128, 160, 192, 256, 320, 384, 448, 512];
@@ -523,9 +536,8 @@ impl MetalExecutionConfig {
         let package_root = args.package_cache.as_ref().map(|root| {
             let model = fs::canonicalize(&args.model).unwrap_or_else(|_| args.model.clone());
             let identity = format!("{}", model.display());
-            let hash = identity.bytes().fold(1469598103934665603u64, |hash, byte| {
-                (hash ^ u64::from(byte)).wrapping_mul(1099511628211)
-            });
+            let hash = stable_cache_hash(identity.as_bytes());
+            let graph_digest = graph_cache_digest(family);
             let os_build = std::process::Command::new("sw_vers")
                 .arg("-buildVersion")
                 .output()
@@ -536,8 +548,7 @@ impl MetalExecutionConfig {
                 .unwrap_or_else(|| "unknown-os-build".to_owned());
             let shape_key = shape_cache_key(args.shapes, args.bucket_policy);
             root.join(format!(
-                "{family}-graph-v{GRAPH_REVISION}-{shape_key}-{:016x}-{}-{os_build}",
-                hash,
+                "{family}-graph-v{GRAPH_REVISION}-g{graph_digest:016x}-{shape_key}-{hash:016x}-{}-{os_build}",
                 args.dtype.as_str()
             ))
         });
@@ -560,6 +571,11 @@ impl MetalExecutionConfig {
 
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn decode_package_path(&self, pass: &str, bucket: usize) -> Option<PathBuf> {
+        // MPSGraph can wedge while deserializing the f16 Qwen3 step package. A
+        // missing path makes preparation compile it eagerly without reading or writing a package.
+        if pass == "step" {
+            return None;
+        }
         let optimization_level = std::env::var_os("SYNAPSE_QWEN3_DECODE_OPT_LEVEL")
             .filter(|value| value == "0")
             .map_or(1, |_| 0);
@@ -5469,6 +5485,35 @@ mod tests {
             ))
         );
         assert_ne!(config.package_path(8, 128), config.package_path(4, 256));
+    }
+
+    #[test]
+    fn graph_cache_digest_includes_graph_family_and_builder_revision() {
+        assert_eq!(
+            graph_cache_digest("qwen3-0.6b-decode"),
+            stable_cache_hash(
+                format!("qwen3-0.6b-decode:mpsgraph-builder-v{GRAPH_REVISION}").as_bytes()
+            )
+        );
+        assert_ne!(
+            graph_cache_digest("qwen3-0.6b-decode"),
+            graph_cache_digest("modernbert")
+        );
+    }
+
+    #[test]
+    fn qwen3_decode_step_package_serialization_is_disabled() {
+        let config = MetalExecutionConfig {
+            execution: Execution::Explicit,
+            package_root: Some(PathBuf::from("cache/model-graph-v10-f16-os")),
+        };
+        assert_eq!(config.decode_package_path("step", 512), None);
+        assert_eq!(
+            config.decode_package_path("prefill", 512),
+            Some(PathBuf::from(
+                "cache/model-graph-v10-f16-os/decode-prefill-512-o1.mpsgraphpackage"
+            ))
+        );
     }
 
     #[test]
