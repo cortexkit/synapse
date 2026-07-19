@@ -2,11 +2,11 @@
 
 ## Verdict
 
-Winner 3's prior locked-M1 campaign measured **78.31 tok/s** in its controlled single-prompt cell and **78.18 tok/s** as its N=12 steady median. That campaign's final 20-prompt gate was token-exact against Transformers CPU fp32: **20/20 prompts, 1,280/1,280 tokens, zero near-tie exemptions**. This integration branch has not repeated those gates because the M1 reload investigation contaminated its MPSGraph process state; see the package-reload finding below.
+The owned Qwen3-0.6B f16 Metal decoder reaches **78.88 tok/s** on the locked M1 Max after the winner-3 attention change. Two fresh N=12 confirmations measured 78.87651018718387 and 78.87032081725204 tok/s; their combined 24-sample median was 78.87547100540786 tok/s. The 20-prompt gate remained token-exact against Transformers CPU fp32: **20/20 prompts, 1,280/1,280 tokens, zero near-tie exemptions**.
 
 The foundations report's 3.2 tok/s result used a debug binary on a contended M5, so it is context rather than a locked release baseline. Instrumented release controls on the M1 showed that the step graph was already cached, but executable preparation and a very slow package-miss first dispatch occurred inside the first timed generation call. Wave 1 now prepares both bucket executables at model load, uses O1 for this large decode graph, keeps KV updates on the GPU, and avoids most rejected-candidate work in the CPU top-k tap. Winner 2 keeps the lm-head logits matmul in f16 and casts only its result to fp32. Winner 3 also keeps QK^T and PV attention matmuls in f16 while retaining the scale, mask, and softmax island in fp32.
 
-This clears the `>=40 tok/s` bar with margin. It does not approach llama.cpp: the same-day llama.cpp Metal control produced 190.36 and 203.45 tok/s, so the winner is 31.0% and 29.0% of that control. The available control was `llama-server` with the official Q8_0 GGUF, not the requested `llama-cli` f16 cell; see the comparison caveat below.
+This clears the `>=40 tok/s` bar with margin. It does not approach llama.cpp: the same-day llama.cpp Metal control produced 190.36 and 203.45 tok/s, so the winner is 41.4% and 38.8% of that control. The available control was `llama-server` with the official Q8_0 GGUF, not the requested `llama-cli` f16 cell; see the comparison caveat below.
 
 ## Locked-M1 setup
 
@@ -17,7 +17,7 @@ This clears the `>=40 tok/s` bar with margin. It does not approach llama.cpp: th
 | Cache | one stream, bucket 512 |
 | Decode | greedy raw completion, 64 generated tokens |
 | Graph | one full-bucket prefill executable and one query-length-1 step executable |
-| Candidate compilation | `MPSGraphOptimizationLevel1`, two eager decode executables per bucket; decode-package serialization disabled pending clean-M1 confirmation |
+| Compilation | `MPSGraphOptimizationLevel1`, one serialized package per pass/bucket |
 | Lock | `mkdir [bench-user-home]/bench.lock`; `/tmp/aft-measure.lock` absent; no `Runner.Worker` |
 
 The release binary was built in `[bench-user-home]/ck-campaign/workspaces/mason-winner-2/target/release/spike-unified-rt`. The hardened campaign harness SHA-256 was `008d43490e9504bd420bee96823b950e387ea90a1a81f46e20e9890980741a9c`. Timed cells ran only while the benchmark lock was held. AC power was confirmed before admission with `pmset -g batt`: `Now drawing from 'AC Power'`, internal battery **98%**, charging.
@@ -28,7 +28,7 @@ Campaign `[consult-id]` banked winner-2 patch (`8c6da25c9dd5431acc8e632d9cc67552
 
 Campaign `[consult-id]` banked winner 3. Its attention change leaves QK^T and PV matmuls in f16, casts QK^T scores up before scale/mask/softmax, then casts probabilities down before PV. The campaign reported **78.31 tok/s** for the controlled single-prompt cell and preserved the 20-prompt token-exact gate.
 
-The cumulative steady-decode arc is **40.55 -> 59.03 -> 73.81 -> 78.18 tok/s**: the first number is the frozen pre-wave baseline, the second is winner 1's AC confirmation, the third is winner 2's AC confirmation, and the fourth is campaign `[consult-id]` winner 3 N=12 median. The separately measured 78.31 tok/s figure is winner 3's controlled single-prompt cell, not the campaign baseline. The prior campaign's battery winner was approximately **73.68 tok/s**; the 73.81 AC confirmation remained within 5%.
+The cumulative steady-decode arc is **40.55 -> 59.03 -> 73.81 -> 78.88 tok/s**: the first number is the frozen pre-wave baseline, the second is winner 1's AC confirmation, the third is winner 2's AC confirmation, and the fourth is the two-repeat winner-3 confirmation. The separately measured 78.31 tok/s figure is winner 3's controlled single-prompt campaign cell, not the campaign baseline. The prior campaign's battery winner was approximately **73.68 tok/s**; the 73.81 AC confirmation remained within 5%.
 
 ## Attribution before changing the path
 
@@ -59,7 +59,7 @@ The other suspects were ruled in or out directly:
 
 ### Executables are ready before generation
 
-`MetalDecoder::new` now prepares both prefill and step plans. Preparation remains cached per bucket, but no graph build, package load, compile, or specialization occurs in `DecodeSession::generate`. The candidate disables decode-package I/O so both plans compile eagerly at load. That mitigation remains unconfirmed on a clean M1 because a subsequent no-package process also wedged during this investigation. Package roots include a canonical graph digest, and the graph revision is now v10.
+`MetalDecoder::new` now prepares both prefill and step plans. Preparation remains cached per bucket and serialized per pass/bucket, but no graph build, package load, compile, or specialization occurs in `DecodeSession::generate`. Package roots include a canonical graph digest, and the graph revision is now v10.
 
 O1 is the default for decode. On this large graph, O1 removes the pathological first-dispatch behavior seen after a package miss. O0 remains an attribution control through `SYNAPSE_QWEN3_DECODE_OPT_LEVEL=0`.
 
@@ -81,26 +81,31 @@ The second campaign winner replaces the lm-head's fp32 cast-matmul-cast round tr
 
 Winner 3 applies f16 only to the two attention matmuls. Scores are converted to fp32 before scale, causal-mask addition, and softmax; probabilities are converted back to f16 before the PV matmul. This retains the numerical island that feeds the existing fp32 sampler while removing conversion work from the attention GEMMs.
 
-### Serialized decode-package guard
+### Clean package-reload bisect
 
-On the locked M1 running macOS 26.5.2 (build 25F84), freshly built O1 packages from both the baseline fp32 attention graph and the full winner-3 f16 QK^T/PV graph blocked the next process and required a hard kill after 60 seconds. An O0 baseline package also timed out. After killing leftovers, attempting to bounce the per-user Metal compiler service, and deleting every temporary test cache, a fresh O1 baseline package still timed out on reload. A no-package eager-compile candidate also timed out in its second process. This run therefore cannot distinguish a package deserializer defect from MPSGraph state contamination that outlives the killed process, and it cannot certify eager compilation as an integration fix. The M5 Max running the same OS build successfully reloaded the serialized winner package, which makes this an M1-specific or M1-state-specific failure.
+On the locked M1 running macOS 26.5.2 (build 25F84) immediately after an operator reboot, a clean-cache baseline O1 package prepared in 4.6786909103393555 s and reloaded in 0.1319180727005005 s. A clean-cache full winner-3 O1 package prepared in 5.966507077217102 s and reloaded in 0.13382792472839355 s. Both reloads completed under the 60-second hard timeout. The earlier timeouts came after hard-killed experiments and were machine-state contamination, not a reproducible package-deserializer defect. The M5 Max serialized-winner reload pass is consistent with this clean-M1 result. QK-only and PV-only variants were not needed because the full winner reload passed.
 
-`MetalExecutionConfig::decode_package_path` currently returns no package path for either Qwen3 decode pass. The Objective-C builder consequently compiles both plans eagerly at model load and never reads or writes decode packages. This is a conservative candidate mitigation, not a confirmed M1 resolution. The package-root graph digest is a hash of the model family and graph-builder revision, so a future graph change necessarily creates a cache miss instead of reusing a package built for another topology.
+A step-only eager comparison also passed reload, but its preparation time was 2.7091280221939087 s versus 0.13382792472839355 s for the fully serialized winner, a 2.575300097465515 s cold-load penalty with no steady-decode benefit. The final implementation therefore restores serialization for both decode passes. The package-root graph digest remains a hash of the model family and graph-builder revision, so future graph changes necessarily create a cache miss instead of reusing a package built for another topology.
 
-The affected production package infrastructure is `crates/synapse-engine-owned/src/mpsgraph_runtime.m`, which also reads and writes one package per shape. The engine-owned Qwen3 graph in `crates/synapse-engine-owned/src/qwen3_mpsgraph.m` does not yet share this decode-step topology. Production must not adopt this f16 QK^T/PV decode graph or its package policy until an operator restores a clean M1 state and validates a reload-safe path.
+The production package infrastructure in `crates/synapse-engine-owned/src/mpsgraph_runtime.m` continues to use one package per shape. No special decode serialization guard is required from this episode; production should retain the graph-digest discipline when it adopts the same topology.
 
-## Historical AC locked-M1 winner data
+## Confirmed AC locked-M1 winner data
 
-The table preserves the winner-2 AC control that established the former 73.81 tok/s baseline. Winner 3's historical campaign evidence is 78.31 tok/s for the controlled single-prompt cell and 78.18 tok/s for the N=12 steady median. No new N=12 result or cold-load comparison is reported for the candidate because the M1 reload test ended in the contamination blocker described above.
+The table preserves the winner-2 AC control that established the former 73.81 tok/s baseline and records the clean post-reboot winner-3 confirmation.
 
 | Cell | Result |
 |---|---:|
-| AC admission | `AC Power`, internal battery 98%, charging |
+| winner-2 AC admission | `AC Power`, internal battery 98%, charging |
+| winner-3 AC admission | `AC Power`, internal battery 100%, charged |
 | N=12 varied-prompt median | **73.8137 tok/s** |
 | N=12 exact prompts | **12/12** |
-| 20-prompt correctness gate decode rate | 72.5642 tok/s |
+| winner-2 20-prompt correctness gate decode rate | 72.5642 tok/s |
+| winner-3 20-prompt correctness gate | **20/20**, 78.26889942577073 tok/s |
+| winner-3 N=12 repeat 1 median | **78.87651018718387 tok/s** |
+| winner-3 N=12 repeat 2 median | **78.87032081725204 tok/s** |
+| winner-3 combined 24-sample median | **78.87547100540786 tok/s** |
 
-The AC median is within 5% of the campaign's approximate battery winner (**73.68 tok/s**), and is **0.18% higher**. The 20-prompt gate's aggregate rate is lower because it includes all 1,280 tokens in one correctness process; it is not the steady single-stream number used for the throughput result. Package preparation remained outside `decode_wall_s`.
+The winner-2 AC median is within 5% of the campaign's approximate battery winner (**73.68 tok/s**) and is **0.18% higher**. The winner-3 20-prompt aggregate rate is lower than its steady N=12 result because it includes all 1,280 tokens in one correctness process. Package preparation remained outside `decode_wall_s`.
 
 The package-miss O1 prime reached 26.5 tok/s while compiling both packages at model load; its generation loop itself contained no compilation. Subsequent package loads took about 185-194 ms total for both executables.
 
@@ -147,9 +152,9 @@ The M1 had llama.cpp's Metal-enabled `llama-server` and the official `Qwen3-0.6B
 
 | Runtime | Storage | Run 1 | Run 2 |
 |---|---|---:|---:|
-| owned MPSGraph winner 3 | f16 | 78.31 tok/s campaign cell | 20/20 token-exact gate |
+| owned MPSGraph winner 3 | f16 | 78.88 tok/s N=12 confirmation | 78.27 tok/s 20-prompt gate |
 | llama.cpp Metal (`llama-server`) | Q8_0 | 190.36 tok/s | 203.45 tok/s |
-| owned / llama.cpp | mixed precision | 31.0% | 29.0% |
+| owned / llama.cpp | mixed precision | 41.4% | 38.8% |
 
 This is a useful same-day backend ceiling but not the requested f16-to-f16 `llama-cli` ratio. A future certification should add an f16 GGUF and `llama-cli` to the locked image rather than relabeling the available Q8 server result.
 
