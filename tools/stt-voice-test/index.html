@@ -1,0 +1,565 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>STT voice test — baseline vs trie δ6</title>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --panel: #1a2332;
+      --border: #2d3a4d;
+      --text: #e7ecf3;
+      --muted: #8b9bb4;
+      --accent: #5b9fd4;
+      --good: #3d9a6a;
+      --warn: #c9a227;
+      --bad: #c45c5c;
+      --hi-a: rgba(91, 159, 212, 0.35);
+      --hi-b: rgba(61, 154, 106, 0.4);
+      font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.45;
+      min-height: 100vh;
+    }
+    header {
+      padding: 1rem 1.25rem;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.75rem;
+      align-items: baseline;
+      justify-content: space-between;
+    }
+    header h1 {
+      margin: 0;
+      font-size: 1.05rem;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+    }
+    header p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 0.8rem;
+    }
+    main {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 1.25rem;
+      display: grid;
+      gap: 1.25rem;
+    }
+    .row {
+      display: grid;
+      gap: 1rem;
+      grid-template-columns: 1fr 1fr;
+    }
+    @media (max-width: 800px) {
+      .row { grid-template-columns: 1fr; }
+    }
+    label {
+      display: block;
+      font-size: 0.75rem;
+      color: var(--muted);
+      margin-bottom: 0.35rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+    textarea, input[type="text"] {
+      width: 100%;
+      background: var(--panel);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.65rem 0.75rem;
+      font: inherit;
+      font-size: 0.85rem;
+      resize: vertical;
+    }
+    textarea:focus, input:focus {
+      outline: 1px solid var(--accent);
+      border-color: var(--accent);
+    }
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.75rem;
+      align-items: center;
+    }
+    button {
+      font: inherit;
+      font-size: 0.85rem;
+      border: 1px solid var(--border);
+      background: var(--panel);
+      color: var(--text);
+      border-radius: 6px;
+      padding: 0.55rem 1rem;
+      cursor: pointer;
+    }
+    button:hover:not(:disabled) { border-color: var(--accent); color: #fff; }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+    button.primary {
+      background: #1e3a5f;
+      border-color: var(--accent);
+    }
+    button.recording {
+      background: #4a1e1e;
+      border-color: var(--bad);
+      animation: pulse 1.2s ease-in-out infinite;
+    }
+    @keyframes pulse {
+      50% { opacity: 0.75; }
+    }
+    .status {
+      font-size: 0.8rem;
+      color: var(--muted);
+      min-height: 1.2em;
+    }
+    .status.warn { color: var(--warn); }
+    .status.err { color: var(--bad); }
+    .status.ok { color: var(--good); }
+    .spinner {
+      display: inline-block;
+      width: 0.85em;
+      height: 0.85em;
+      border: 2px solid var(--border);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+      vertical-align: -0.1em;
+      margin-right: 0.4em;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.9rem 1rem;
+      min-height: 8rem;
+    }
+    .panel h2 {
+      margin: 0 0 0.5rem;
+      font-size: 0.8rem;
+      font-weight: 600;
+      color: var(--muted);
+      display: flex;
+      justify-content: space-between;
+      gap: 0.5rem;
+    }
+    .panel h2 .ms { color: var(--accent); font-weight: 500; }
+    .transcript {
+      font-size: 0.95rem;
+      white-space: pre-wrap;
+      word-break: break-word;
+      min-height: 3rem;
+    }
+    .transcript mark {
+      background: var(--hi-a);
+      color: inherit;
+      border-radius: 2px;
+      padding: 0 0.15em;
+    }
+    .transcript mark.only-here {
+      background: var(--hi-b);
+    }
+    .meta {
+      margin-top: 0.65rem;
+      font-size: 0.75rem;
+      color: var(--muted);
+    }
+    #history {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+      display: grid;
+      gap: 0.5rem;
+    }
+    #history li {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.55rem 0.75rem;
+      font-size: 0.78rem;
+      cursor: pointer;
+    }
+    #history li:hover { border-color: var(--accent); }
+    #history li .ts { color: var(--muted); }
+    #history li .snip { color: var(--text); margin-top: 0.25rem; }
+    .hint { font-size: 0.78rem; color: var(--muted); }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>STT voice test — baseline vs trie δ6</h1>
+    <p>Local only · audio never leaves this machine · first request pays model cold load</p>
+  </header>
+  <main>
+    <section>
+      <label for="biasTerms">Bias terms (one per line)</label>
+      <textarea id="biasTerms" rows="8" spellcheck="false"></textarea>
+    </section>
+    <section>
+      <label for="biasPrompt">Optional bias prompt (maps to bias_prompt; unused by trie-only arm)</label>
+      <input id="biasPrompt" type="text" placeholder="Transcribe faithfully; use vocabulary only when spoken." />
+      <p class="hint" style="margin-top:0.4rem">Trie arm uses per-row bias_terms only. Prompt is stored for future prompt/combined experiments.</p>
+    </section>
+    <section class="controls">
+      <button type="button" id="recBtn" class="primary">Record</button>
+      <button type="button" id="stopBtn" disabled>Stop &amp; transcribe</button>
+      <button type="button" id="clearHistBtn">Clear history</button>
+      <span id="status" class="status">Idle — click Record, speak a phrase with a bias term, then Stop.</span>
+    </section>
+    <section class="row" id="results">
+      <div class="panel">
+        <h2>BASELINE <span class="ms" id="baseMs"></span></h2>
+        <div class="transcript" id="baseText">—</div>
+      </div>
+      <div class="panel">
+        <h2>TRIE δ6 <span class="ms" id="biasMs"></span></h2>
+        <div class="transcript" id="biasText">—</div>
+      </div>
+    </section>
+    <p class="meta" id="runMeta"></p>
+    <section>
+      <label>Session history (client-side only)</label>
+      <ul id="history"></ul>
+    </section>
+  </main>
+  <script>
+(function () {
+  "use strict";
+
+  const DEFAULT_TERMS = [
+    "memcpy", "MPSGraph", "cuBLASLt", "PAQ", "subc", "RMSNorm", "GGUF", "mlx",
+    "RoPE", "KV cache", "Qwen3", "ModernBERT", "MiniLM", "llama.cpp", "fp16",
+    "rerank", "embedder", "tok/s", "safetensors", "MPSGraph package",
+    "Synapse", "Alfonso", "CortexKit",
+  ];
+
+  const biasTermsEl = document.getElementById("biasTerms");
+  const biasPromptEl = document.getElementById("biasPrompt");
+  const recBtn = document.getElementById("recBtn");
+  const stopBtn = document.getElementById("stopBtn");
+  const clearHistBtn = document.getElementById("clearHistBtn");
+  const statusEl = document.getElementById("status");
+  const baseTextEl = document.getElementById("baseText");
+  const biasTextEl = document.getElementById("biasText");
+  const baseMsEl = document.getElementById("baseMs");
+  const biasMsEl = document.getElementById("biasMs");
+  const runMetaEl = document.getElementById("runMeta");
+  const historyEl = document.getElementById("history");
+
+  biasTermsEl.value = DEFAULT_TERMS.join("\n");
+
+  let mediaStream = null;
+  let audioCtx = null;
+  let processor = null;
+  let sourceNode = null;
+  let pcmChunks = [];
+  let inputSampleRate = 48000;
+  let recording = false;
+  let busy = false;
+  const history = [];
+
+  function setStatus(msg, kind) {
+    statusEl.textContent = msg;
+    statusEl.className = "status" + (kind ? " " + kind : "");
+  }
+
+  function parseTerms() {
+    return biasTermsEl.value.split(/\r?\n/).map((t) => t.trim()).filter(Boolean);
+  }
+
+  /** Linear resample Float32 mono PCM to 16 kHz. */
+  function resampleTo16k(input, fromRate) {
+    const targetRate = 16000;
+    if (fromRate === targetRate) return input;
+    const ratio = fromRate / targetRate;
+    const outLen = Math.max(1, Math.round(input.length / ratio));
+    const out = new Float32Array(outLen);
+    for (let i = 0; i < outLen; i++) {
+      const src = i * ratio;
+      const i0 = Math.floor(src);
+      const i1 = Math.min(i0 + 1, input.length - 1);
+      const frac = src - i0;
+      out[i] = input[i0] * (1 - frac) + input[i1] * frac;
+    }
+    return out;
+  }
+
+  /** Assemble 16-bit little-endian mono WAV from Float32 samples @ sampleRate. */
+  function encodeWavS16le(floatSamples, sampleRate) {
+    const n = floatSamples.length;
+    const dataBytes = n * 2;
+    const buffer = new ArrayBuffer(44 + dataBytes);
+    const view = new DataView(buffer);
+    const writeStr = (offset, str) => {
+      for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+    };
+    writeStr(0, "RIFF");
+    view.setUint32(4, 36 + dataBytes, true);
+    writeStr(8, "WAVE");
+    writeStr(12, "fmt ");
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true); // PCM
+    view.setUint16(22, 1, true); // mono
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    writeStr(36, "data");
+    view.setUint32(40, dataBytes, true);
+    let o = 44;
+    for (let i = 0; i < n; i++) {
+      let s = Math.max(-1, Math.min(1, floatSamples[i]));
+      s = s < 0 ? s * 0x8000 : s * 0x7fff;
+      view.setInt16(o, s, true);
+      o += 2;
+    }
+    return new Blob([buffer], { type: "audio/wav" });
+  }
+
+  // Expose for node/bun sanity checks when this file is eval'd outside the browser.
+  window.__sttVoiceTest = { resampleTo16k, encodeWavS16le, DEFAULT_TERMS };
+
+  function mergePcm(chunks) {
+    let total = 0;
+    for (const c of chunks) total += c.length;
+    const out = new Float32Array(total);
+    let o = 0;
+    for (const c of chunks) {
+      out.set(c, o);
+      o += c.length;
+    }
+    return out;
+  }
+
+  async function startRecording() {
+    if (busy || recording) return;
+    try {
+      mediaStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true,
+        },
+      });
+    } catch (err) {
+      setStatus("Microphone permission denied: " + err.message, "err");
+      return;
+    }
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    inputSampleRate = audioCtx.sampleRate;
+    sourceNode = audioCtx.createMediaStreamSource(mediaStream);
+    // ScriptProcessor is deprecated but universal; fine for a test bench.
+    const bufferSize = 4096;
+    processor = audioCtx.createScriptProcessor(bufferSize, 1, 1);
+    pcmChunks = [];
+    processor.onaudioprocess = (ev) => {
+      if (!recording) return;
+      const input = ev.inputBuffer.getChannelData(0);
+      pcmChunks.push(new Float32Array(input));
+    };
+    sourceNode.connect(processor);
+    processor.connect(audioCtx.destination);
+    recording = true;
+    recBtn.disabled = true;
+    recBtn.classList.add("recording");
+    stopBtn.disabled = false;
+    setStatus("Recording @ " + inputSampleRate + " Hz — speak, then Stop & transcribe.", "warn");
+  }
+
+  function stopCapture() {
+    recording = false;
+    if (processor) {
+      processor.onaudioprocess = null;
+      try { processor.disconnect(); } catch (_) {}
+      processor = null;
+    }
+    if (sourceNode) {
+      try { sourceNode.disconnect(); } catch (_) {}
+      sourceNode = null;
+    }
+    if (audioCtx) {
+      audioCtx.close().catch(() => {});
+      audioCtx = null;
+    }
+    if (mediaStream) {
+      mediaStream.getTracks().forEach((t) => t.stop());
+      mediaStream = null;
+    }
+    recBtn.classList.remove("recording");
+    recBtn.disabled = false;
+    stopBtn.disabled = true;
+  }
+
+  function escapeHtml(s) {
+    return s
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+
+  /** Highlight bias terms; mark terms present only in this arm. */
+  function highlightTranscript(text, terms, onlyHere) {
+    if (!text) return "—";
+    const sorted = terms.slice().sort((a, b) => b.length - a.length);
+    // Build match ranges without overlapping.
+    const ranges = [];
+    const lower = text.toLowerCase();
+    for (const term of sorted) {
+      if (!term) continue;
+      const t = term.toLowerCase();
+      let from = 0;
+      while (from < lower.length) {
+        const idx = lower.indexOf(t, from);
+        if (idx < 0) break;
+        const end = idx + term.length;
+        const overlaps = ranges.some((r) => !(end <= r.start || idx >= r.end));
+        if (!overlaps) {
+          const only = onlyHere.some((o) => o.toLowerCase() === t);
+          ranges.push({ start: idx, end, only });
+        }
+        from = idx + 1;
+      }
+    }
+    ranges.sort((a, b) => a.start - b.start);
+    let html = "";
+    let cursor = 0;
+    for (const r of ranges) {
+      html += escapeHtml(text.slice(cursor, r.start));
+      const cls = r.only ? ' class="only-here"' : "";
+      html += "<mark" + cls + ">" + escapeHtml(text.slice(r.start, r.end)) + "</mark>";
+      cursor = r.end;
+    }
+    html += escapeHtml(text.slice(cursor));
+    return html || "—";
+  }
+
+  function termsInText(text, terms) {
+    const lower = (text || "").toLowerCase();
+    return terms.filter((t) => lower.includes(t.toLowerCase()));
+  }
+
+  function showResult(payload, terms) {
+    const base = payload.baseline || {};
+    const bias = payload.biased || {};
+    const baseText = base.text || "";
+    const biasText = bias.text || "";
+    const inBase = termsInText(baseText, terms);
+    const inBias = termsInText(biasText, terms);
+    const onlyBase = inBase.filter((t) => !inBias.some((x) => x.toLowerCase() === t.toLowerCase()));
+    const onlyBias = inBias.filter((t) => !inBase.some((x) => x.toLowerCase() === t.toLowerCase()));
+
+    baseTextEl.innerHTML = highlightTranscript(baseText, terms, onlyBase);
+    biasTextEl.innerHTML = highlightTranscript(biasText, terms, onlyBias);
+    baseMsEl.textContent = base.ms != null ? base.ms.toFixed(0) + " ms decode" : "";
+    biasMsEl.textContent = bias.ms != null ? bias.ms.toFixed(0) + " ms decode" : "";
+    const cold = Math.max(base.cold_load_ms || 0, bias.cold_load_ms || 0);
+    runMetaEl.textContent =
+      "device: " + (payload.device || "?") +
+      " · baseline wall " + (base.wall_ms != null ? base.wall_ms.toFixed(0) + " ms" : "?") +
+      " · trie wall " + (bias.wall_ms != null ? bias.wall_ms.toFixed(0) + " ms" : "?") +
+      (cold > 2000 ? " · cold load ~" + cold.toFixed(0) + " ms (first run is slow)" : "");
+  }
+
+  function pushHistory(entry) {
+    history.unshift(entry);
+    if (history.length > 30) history.pop();
+    renderHistory();
+  }
+
+  function renderHistory() {
+    historyEl.innerHTML = "";
+    history.forEach((h, idx) => {
+      const li = document.createElement("li");
+      li.innerHTML =
+        '<div class="ts">' + escapeHtml(h.when) + " · " + escapeHtml(h.device || "") + "</div>" +
+        '<div class="snip">B: ' + escapeHtml((h.baseline || "").slice(0, 80)) + "</div>" +
+        '<div class="snip">T: ' + escapeHtml((h.biased || "").slice(0, 80)) + "</div>";
+      li.addEventListener("click", () => {
+        showResult(h.payload, h.terms);
+        setStatus("Restored history entry #" + (idx + 1), "ok");
+      });
+      historyEl.appendChild(li);
+    });
+  }
+
+  async function transcribeBlob(wavBlob) {
+    const terms = parseTerms();
+    if (!terms.length) {
+      setStatus("Add at least one bias term.", "err");
+      return;
+    }
+    busy = true;
+    recBtn.disabled = true;
+    stopBtn.disabled = true;
+    statusEl.innerHTML =
+      '<span class="spinner"></span>Transcribing… first request pays model cold load (can take many seconds).';
+    statusEl.className = "status warn";
+
+    const form = new FormData();
+    form.append("wav", wavBlob, "clip.wav");
+    form.append("bias_terms", terms.join("\n"));
+    const prompt = biasPromptEl.value.trim();
+    if (prompt) form.append("bias_prompt", prompt);
+
+    try {
+      const res = await fetch("/transcribe", { method: "POST", body: form });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data.error || ("HTTP " + res.status));
+      }
+      showResult(data, terms);
+      pushHistory({
+        when: new Date().toLocaleTimeString(),
+        device: data.device,
+        baseline: (data.baseline && data.baseline.text) || "",
+        biased: (data.biased && data.biased.text) || "",
+        terms,
+        payload: data,
+      });
+      setStatus("Done on " + (data.device || "?") + ".", "ok");
+    } catch (err) {
+      setStatus("Transcribe failed: " + err.message, "err");
+    } finally {
+      busy = false;
+      recBtn.disabled = false;
+    }
+  }
+
+  async function stopAndTranscribe() {
+    if (!recording && pcmChunks.length === 0) return;
+    stopCapture();
+    if (!pcmChunks.length) {
+      setStatus("No audio captured.", "err");
+      return;
+    }
+    const merged = mergePcm(pcmChunks);
+    pcmChunks = [];
+    const resampled = resampleTo16k(merged, inputSampleRate);
+    if (resampled.length < 1600) {
+      setStatus("Clip too short (<0.1s). Hold longer.", "err");
+      return;
+    }
+    const wav = encodeWavS16le(resampled, 16000);
+    await transcribeBlob(wav);
+  }
+
+  recBtn.addEventListener("click", () => startRecording());
+  stopBtn.addEventListener("click", () => stopAndTranscribe());
+  clearHistBtn.addEventListener("click", () => {
+    history.length = 0;
+    renderHistory();
+    setStatus("History cleared.", "ok");
+  });
+})();
+  </script>
+</body>
+</html>
