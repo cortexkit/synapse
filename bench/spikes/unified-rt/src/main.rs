@@ -570,20 +570,10 @@ impl MetalExecutionConfig {
     }
 
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    fn decode_package_path(&self, pass: &str, bucket: usize) -> Option<PathBuf> {
-        // MPSGraph can wedge while deserializing the f16 Qwen3 step package. A
-        // missing path makes preparation compile it eagerly without reading or writing a package.
-        if pass == "step" {
-            return None;
-        }
-        let optimization_level = std::env::var_os("SYNAPSE_QWEN3_DECODE_OPT_LEVEL")
-            .filter(|value| value == "0")
-            .map_or(1, |_| 0);
-        self.package_root.as_ref().map(|root| {
-            root.join(format!(
-                "decode-{pass}-{bucket}-o{optimization_level}.mpsgraphpackage"
-            ))
-        })
+    fn decode_package_path(&self, _pass: &str, _bucket: usize) -> Option<PathBuf> {
+        // MPSGraph can wedge while deserializing Qwen3 decode packages. A missing
+        // path makes preparation compile each decode plan eagerly without package I/O.
+        None
     }
 }
 
@@ -5502,18 +5492,13 @@ mod tests {
     }
 
     #[test]
-    fn qwen3_decode_step_package_serialization_is_disabled() {
+    fn qwen3_decode_package_serialization_is_disabled() {
         let config = MetalExecutionConfig {
             execution: Execution::Explicit,
             package_root: Some(PathBuf::from("cache/model-graph-v10-f16-os")),
         };
+        assert_eq!(config.decode_package_path("prefill", 512), None);
         assert_eq!(config.decode_package_path("step", 512), None);
-        assert_eq!(
-            config.decode_package_path("prefill", 512),
-            Some(PathBuf::from(
-                "cache/model-graph-v10-f16-os/decode-prefill-512-o1.mpsgraphpackage"
-            ))
-        );
     }
 
     #[test]

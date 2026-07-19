@@ -17,7 +17,7 @@ This clears the `>=40 tok/s` bar with margin. It does not approach llama.cpp: th
 | Cache | one stream, bucket 512 |
 | Decode | greedy raw completion, 64 generated tokens |
 | Graph | one full-bucket prefill executable and one query-length-1 step executable |
-| Compilation | `MPSGraphOptimizationLevel1`, one serialized prefill package plus one eager step executable per bucket |
+| Compilation | `MPSGraphOptimizationLevel1`, two eager decode executables per bucket; decode-package serialization disabled |
 | Lock | `mkdir [bench-user-home]/bench.lock`; `/tmp/aft-measure.lock` absent; no `Runner.Worker` |
 
 The release binary was built in `[bench-user-home]/ck-campaign/workspaces/mason-winner-2/target/release/spike-unified-rt`. The hardened campaign harness SHA-256 was `008d43490e9504bd420bee96823b950e387ea90a1a81f46e20e9890980741a9c`. Timed cells ran only while the benchmark lock was held. AC power was confirmed before admission with `pmset -g batt`: `Now drawing from 'AC Power'`, internal battery **98%**, charging.
@@ -59,7 +59,7 @@ The other suspects were ruled in or out directly:
 
 ### Executables are ready before generation
 
-`MetalDecoder::new` now prepares both prefill and step plans. Preparation remains cached per bucket, but no graph build, package load, compile, or specialization occurs in `DecodeSession::generate`. Prefill packages retain one package per pass/bucket and O0/O1 level; the winner-3 step graph deliberately compiles eagerly at load because its serialized package can wedge during deserialization. Package roots include a canonical graph digest, and the graph revision is now v10.
+`MetalDecoder::new` now prepares both prefill and step plans. Preparation remains cached per bucket, but no graph build, package load, compile, or specialization occurs in `DecodeSession::generate`. Both winner-3 decode plans deliberately compile eagerly at load because their serialized packages can wedge during deserialization. Package roots include a canonical graph digest, and the graph revision is now v10.
 
 O1 is the default for decode. On this large graph, O1 removes the pathological first-dispatch behavior seen after a package miss. O0 remains an attribution control through `SYNAPSE_QWEN3_DECODE_OPT_LEVEL=0`.
 
@@ -81,17 +81,17 @@ The second campaign winner replaces the lm-head's fp32 cast-matmul-cast round tr
 
 Winner 3 applies f16 only to the two attention matmuls. Scores are converted to fp32 before scale, causal-mask addition, and softmax; probabilities are converted back to f16 before the PV matmul. This retains the numerical island that feeds the existing fp32 sampler while removing conversion work from the attention GEMMs.
 
-### Serialized step-package guard
+### Serialized decode-package guard
 
-On the locked M1, a clean-cache baseline package built by the fp32 attention graph reloaded in a second process. A package built fresh by the full winner-3 f16 QK^T/PV step graph instead hung during the next process's MPSGraph package deserialization and required a hard kill after 60 seconds. Reproducing the failure with a newly built package ruled out stale cache identity. The available M1 evidence therefore isolates the failure to the serialized full winner step graph; separate QK-only and PV-only variants remain a framework follow-up rather than a reason to delay the safe integration.
+On the locked M1 running macOS 26.5.2 (build 25F84), freshly built O1 packages from both the baseline fp32 attention graph and the full winner-3 f16 QK^T/PV graph blocked the next process during MPSGraph package deserialization and required a hard kill after 60 seconds. The failure therefore is not stale cache identity or unique to the winner topology: it is a Qwen3 decode-package deserializer failure on this M1 configuration. The M5 Max running the same OS build successfully reloaded the serialized winner package, so the failure is hardware-specific or another M1 runtime distinction. QK-only and PV-only variants are no longer needed to decide the integration guard.
 
-`MetalExecutionConfig::decode_package_path` returns no package path for the Qwen3 `step` pass. The Objective-C builder therefore compiles that plan eagerly at model load and never reads or writes its package; prefill packages remain serialized. This moves the step compilation cost to cold load without changing steady decode execution. On the M5 development host, one-token package reload preparation increased from 0.060 s with a serialized step to 1.959 s with the eager step, a 1.900 s cold-load cost; this is not a substitute for the required locked-M1 measurement. The package-root graph digest is a hash of the model family and graph-builder revision, so a future graph change necessarily creates a cache miss instead of reusing a package built for another topology.
+`MetalExecutionConfig::decode_package_path` returns no package path for either Qwen3 decode pass. The Objective-C builder therefore compiles both plans eagerly at model load and never reads or writes decode packages. This moves decode compilation to cold load without changing steady decode execution. The package-root graph digest is a hash of the model family and graph-builder revision, so a future graph change necessarily creates a cache miss instead of reusing a package built for another topology.
 
-The affected production package infrastructure is `crates/synapse-engine-owned/src/mpsgraph_runtime.m`, which also reads and writes one package per shape. The engine-owned Qwen3 graph in `crates/synapse-engine-owned/src/qwen3_mpsgraph.m` does not yet share this decode-step topology. If production adopts this f16 QK^T/PV step graph, it must carry the same no-step-package guard and graph-digest discipline before enabling serialization.
+The affected production package infrastructure is `crates/synapse-engine-owned/src/mpsgraph_runtime.m`, which also reads and writes one package per shape. The engine-owned Qwen3 graph in `crates/synapse-engine-owned/src/qwen3_mpsgraph.m` does not yet share this decode-step topology. If production adopts this f16 QK^T/PV decode graph, it must disable its decode-package I/O and retain the graph-digest discipline before enabling serialization.
 
 ## After: AC locked-M1 winner data
 
-The table preserves the winner-2 AC control that established the former 73.81 tok/s baseline. Winner 3 supersedes that campaign baseline at 78.31 tok/s; its serialized-step reload safeguard is described above.
+The table preserves the winner-2 AC control that established the former 73.81 tok/s baseline. Winner 3's measured locked-M1 confirmation and cold-load comparison are recorded with the campaign evidence; its serialized-decode reload safeguard is described above.
 
 | Cell | Result |
 |---|---:|
