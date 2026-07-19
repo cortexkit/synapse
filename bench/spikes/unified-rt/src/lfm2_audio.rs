@@ -285,6 +285,8 @@ impl AudioModel {
         &self,
         tokenizer: &Tokenizer,
         audio_frames: usize,
+        vocabulary: &[String],
+        extra_system_prompt: Option<&str>,
     ) -> Result<(Vec<u32>, Vec<bool>)> {
         let mut tokens = vec![1];
         let mut modality = vec![false];
@@ -294,7 +296,29 @@ impl AudioModel {
             &mut tokens,
             &mut modality,
         )?;
+        // Keep requests without bias context identical to the baseline ASR
+        // prompt so tokenization and decoding behavior remain unchanged. Add
+        // context as system text before the out-of-band audio splice.
         append_text(tokenizer, "Perform ASR.", &mut tokens, &mut modality)?;
+        if !vocabulary.is_empty() {
+            append_text(
+                tokenizer,
+                "\nVocabulary that may occur: ",
+                &mut tokens,
+                &mut modality,
+            )?;
+            append_text(
+                tokenizer,
+                &vocabulary.join(", "),
+                &mut tokens,
+                &mut modality,
+            )?;
+            append_text(tokenizer, ".", &mut tokens, &mut modality)?;
+        }
+        if let Some(prompt) = extra_system_prompt.filter(|prompt| !prompt.trim().is_empty()) {
+            append_text(tokenizer, "\n", &mut tokens, &mut modality)?;
+            append_text(tokenizer, prompt.trim(), &mut tokens, &mut modality)?;
+        }
         append_text(tokenizer, "<|im_end|>\n", &mut tokens, &mut modality)?;
         append_text(tokenizer, "<|im_start|>user\n", &mut tokens, &mut modality)?;
         modality.extend(std::iter::repeat_n(true, audio_frames));

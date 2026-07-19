@@ -1,0 +1,3 @@
+# Full two-voice corpus is roughly 70 MB; regenerate it deterministically on macOS.
+audio/
+__pycache__/

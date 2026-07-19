@@ -30,6 +30,7 @@ mod modernbert;
 mod quant;
 mod qwen3;
 mod qwen3_decode;
+mod stt_bias;
 mod vulkan_backend;
 
 #[derive(Parser)]
@@ -59,6 +60,21 @@ struct Args {
     /// Optional JSONL destination containing owned mel and projected embeddings.
     #[arg(long, requires = "asr_audio")]
     asr_artifacts_out: Option<PathBuf>,
+    /// Optional JSONL vocabulary rows ({term: "..."}) added to every ASR request's bias context.
+    #[arg(long, requires = "asr_audio")]
+    asr_bias_terms: Option<PathBuf>,
+    /// Extra system text added to every ASR request when --asr-prompt-bias is enabled.
+    #[arg(long, requires = "asr_audio")]
+    asr_bias_prompt: Option<String>,
+    /// Put each request's bias vocabulary and prompt into the ASR system message before audio.
+    #[arg(long, requires = "asr_audio")]
+    asr_prompt_bias: bool,
+    /// Add this finite bonus to token-trie continuations before greedy ASR commits them.
+    #[arg(long, requires = "asr_audio")]
+    asr_trie_delta: Option<f32>,
+    /// Maximum number of committed transcript tokens that may keep a trie path active.
+    #[arg(long, default_value_t = 16, requires = "asr_audio")]
+    asr_trie_window: usize,
     /// Transformers token/logit reference JSONL for greedy decode.
     #[arg(long, requires = "generate_prompts")]
     decode_reference: Option<PathBuf>,
@@ -414,6 +430,17 @@ fn validate_constrained_output(
 struct AsrInput {
     id: String,
     path: PathBuf,
+    /// Optional per-request vocabulary. Existing parity fixtures omit this field.
+    #[serde(default)]
+    bias_terms: Vec<String>,
+    /// Optional per-request system text paired with `bias_terms`.
+    #[serde(default)]
+    bias_prompt: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AsrBiasTerm {
+    term: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -447,12 +474,25 @@ struct AsrPromptResult {
     audio_samples: usize,
     mel_frames: usize,
     encoder_frames: usize,
+    /// Text-token count before audio is spliced into the modality stream.
+    text_prompt_tokens: usize,
+    /// Additional text tokens attributable to the optional prompt-prefix context.
+    bias_prompt_tokens: usize,
+    context_terms: usize,
     prefill_positions: usize,
     tokens: Vec<u32>,
     text: String,
     exact_reference: Option<bool>,
     mel_max_abs: Option<f32>,
     encoder_min_cosine: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+struct AsrBiasConfig {
+    prompt_prefix: bool,
+    trie_delta: Option<f32>,
+    trie_window: Option<usize>,
+    global_terms: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -467,7 +507,13 @@ struct AsrServingResult {
     encoder_min_cosine: Option<f64>,
     cold_load_s: f64,
     frontend_encoder_wall_s: f64,
+    /// Combined prefill-and-decode duration under the legacy field name so
+    /// existing ASR result readers can continue to parse the output.
     prefill_decode_wall_s: f64,
+    prefill_wall_s: f64,
+    decode_wall_s: f64,
+    trie_bias_wall_s: f64,
+    bias: Option<AsrBiasConfig>,
     results: Vec<AsrPromptResult>,
 }
 
@@ -1652,6 +1698,17 @@ fn run_lfm2_audio_asr_cli(args: &Args, started: Instant) -> Result<()> {
         inputs.truncate(limit);
     }
     ensure!(!inputs.is_empty(), "ASR input set must not be empty");
+    ensure!(
+        args.asr_bias_prompt.is_none() || args.asr_prompt_bias,
+        "--asr-bias-prompt requires --asr-prompt-bias"
+    );
+    if args.asr_trie_delta.is_some() {
+        ensure!(
+            args.asr_trie_window > 0,
+            "--asr-trie-window must be positive when trie bias is enabled"
+        );
+    }
+    let global_bias_terms = load_asr_bias_terms(args.asr_bias_terms.as_deref())?;
     let input_root = inputs_path.parent().unwrap_or_else(|| Path::new("."));
     let references = args
         .asr_reference
@@ -1693,12 +1750,31 @@ fn run_lfm2_audio_asr_cli(args: &Args, started: Instant) -> Result<()> {
     let mut results = Vec::with_capacity(inputs.len());
     let mut frontend_encoder_wall_s = 0.0;
     let mut prefill_decode_wall_s = 0.0;
+    let mut prefill_wall_s = 0.0;
+    let mut decode_wall_s = 0.0;
+    let mut trie_bias_wall_s = 0.0;
     let mut overall_mel_max = None::<f32>;
     let mut overall_encoder_min = None::<f64>;
     let mut exact_prompts = 0usize;
     let mut failures = Vec::new();
 
     for input in &inputs {
+        let (context_terms, context_prompt) =
+            asr_bias_context(&global_bias_terms, args.asr_bias_prompt.as_deref(), input);
+        if args.asr_prompt_bias {
+            ensure!(
+                !context_terms.is_empty() || context_prompt.is_some(),
+                "{}: --asr-prompt-bias needs vocabulary terms or a prompt",
+                input.id
+            );
+        }
+        if args.asr_trie_delta.is_some() {
+            ensure!(
+                !context_terms.is_empty(),
+                "{}: --asr-trie-delta needs vocabulary terms",
+                input.id
+            );
+        }
         let audio_path = if input.path.is_absolute() {
             input.path.clone()
         } else {
@@ -1781,7 +1857,28 @@ fn run_lfm2_audio_asr_cli(args: &Args, started: Instant) -> Result<()> {
             }
         }
 
-        let (text_tokens, modality) = model.asr_prompt(&tokenizer, projection.embeddings.len())?;
+        let prompt_vocabulary = if args.asr_prompt_bias {
+            context_terms.as_slice()
+        } else {
+            &[]
+        };
+        let prompt_text = args
+            .asr_prompt_bias
+            .then_some(context_prompt.as_deref())
+            .flatten();
+        let (text_tokens, modality) = model.asr_prompt(
+            &tokenizer,
+            projection.embeddings.len(),
+            prompt_vocabulary,
+            prompt_text,
+        )?;
+        let bias_prompt_tokens = if args.asr_prompt_bias {
+            let (baseline_tokens, _) =
+                model.asr_prompt(&tokenizer, projection.embeddings.len(), &[], None)?;
+            text_tokens.len().saturating_sub(baseline_tokens.len())
+        } else {
+            0
+        };
         let prefill = model.splice_prefill(&text_tokens, &modality, &projection.embeddings)?;
         ensure!(
             prefill.len() + args.max_new_tokens <= args.decode_cache_bucket,
@@ -1791,15 +1888,29 @@ fn run_lfm2_audio_asr_cli(args: &Args, started: Instant) -> Result<()> {
             args.max_new_tokens,
             args.decode_cache_bucket
         );
-        let decode_started = Instant::now();
+        let prefill_started = Instant::now();
         let mut decoder = lfm2_decode::Decoder::new(
             &model.backbone,
             provider.as_mut(),
             args.decode_cache_bucket,
         )?;
         let (mut cache, mut logits) = decoder.prefill_embeddings(&prefill)?;
+        let prompt_prefill_elapsed = prefill_started.elapsed().as_secs_f64();
+        prefill_wall_s += prompt_prefill_elapsed;
+        let mut trie_bias = args
+            .asr_trie_delta
+            .map(|delta| {
+                stt_bias::SoftTrieBias::new(&tokenizer, &context_terms, delta, args.asr_trie_window)
+            })
+            .transpose()?;
+        let decode_started = Instant::now();
         let mut tokens = Vec::new();
         for _ in 0..args.max_new_tokens {
+            if let Some(trie_bias) = &trie_bias {
+                let bias_started = Instant::now();
+                trie_bias.apply(&mut logits);
+                trie_bias_wall_s += bias_started.elapsed().as_secs_f64();
+            }
             let top = qwen3_decode::top_logits(&logits, args.decode_top_k);
             let token = top[0].token_id;
             ensure!(
@@ -1808,11 +1919,17 @@ fn run_lfm2_audio_asr_cli(args: &Args, started: Instant) -> Result<()> {
                 input.id
             );
             tokens.push(token);
+            if let Some(trie_bias) = &mut trie_bias {
+                trie_bias.commit(token);
+            }
             if token == 7 || token == lfm2_audio::TEXT_END_TOKEN {
                 break;
             }
             logits = decoder.advance_token(&mut cache, token)?;
         }
+        let prompt_decode_elapsed = decode_started.elapsed().as_secs_f64();
+        decode_wall_s += prompt_decode_elapsed;
+        prefill_decode_wall_s += prompt_prefill_elapsed + prompt_decode_elapsed;
         ensure!(
             tokens
                 .last()
@@ -1821,7 +1938,6 @@ fn run_lfm2_audio_asr_cli(args: &Args, started: Instant) -> Result<()> {
             input.id,
             args.max_new_tokens
         );
-        prefill_decode_wall_s += decode_started.elapsed().as_secs_f64();
         let transcript_tokens = tokens
             .iter()
             .copied()
@@ -1881,6 +1997,9 @@ fn run_lfm2_audio_asr_cli(args: &Args, started: Instant) -> Result<()> {
             audio_samples: projection.samples,
             mel_frames: projection.mel.frames,
             encoder_frames: projection.embeddings.len(),
+            text_prompt_tokens: text_tokens.len(),
+            bias_prompt_tokens,
+            context_terms: context_terms.len(),
             prefill_positions: prefill.len(),
             tokens,
             text,
@@ -1908,6 +2027,15 @@ fn run_lfm2_audio_asr_cli(args: &Args, started: Instant) -> Result<()> {
         cold_load_s,
         frontend_encoder_wall_s,
         prefill_decode_wall_s,
+        prefill_wall_s,
+        decode_wall_s,
+        trie_bias_wall_s,
+        bias: (args.asr_prompt_bias || args.asr_trie_delta.is_some()).then_some(AsrBiasConfig {
+            prompt_prefix: args.asr_prompt_bias,
+            trie_delta: args.asr_trie_delta,
+            trie_window: args.asr_trie_delta.map(|_| args.asr_trie_window),
+            global_terms: global_bias_terms.len(),
+        }),
         results,
     };
     let out = args.out.as_ref().context("ASR mode requires --out")?;
@@ -1922,6 +2050,49 @@ fn run_lfm2_audio_asr_cli(args: &Args, started: Instant) -> Result<()> {
         failures.join("\n")
     );
     Ok(())
+}
+
+fn load_asr_bias_terms(path: Option<&Path>) -> Result<Vec<String>> {
+    let Some(path) = path else {
+        return Ok(Vec::new());
+    };
+    let rows: Vec<AsrBiasTerm> = load_rerank_rows(path)
+        .with_context(|| format!("load ASR bias vocabulary {}", path.display()))?;
+    Ok(normalize_asr_bias_terms(
+        rows.into_iter().map(|row| row.term),
+    ))
+}
+
+fn asr_bias_context(
+    global_terms: &[String],
+    global_prompt: Option<&str>,
+    input: &AsrInput,
+) -> (Vec<String>, Option<String>) {
+    let terms = normalize_asr_bias_terms(
+        global_terms
+            .iter()
+            .cloned()
+            .chain(input.bias_terms.iter().cloned()),
+    );
+    let prompt = [global_prompt, input.bias_prompt.as_deref()]
+        .into_iter()
+        .flatten()
+        .filter_map(|prompt| {
+            let prompt = prompt.trim();
+            (!prompt.is_empty()).then_some(prompt)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    (terms, (!prompt.is_empty()).then_some(prompt))
+}
+
+fn normalize_asr_bias_terms(terms: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    terms
+        .into_iter()
+        .map(|term| term.trim().to_owned())
+        .filter(|term| !term.is_empty() && seen.insert(term.clone()))
+        .collect()
 }
 
 fn read_model_config(path: &Path) -> Result<serde_json::Value> {
