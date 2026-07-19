@@ -735,7 +735,7 @@ mod metal {
         }
 
         pub(crate) fn weight_feed_path(&self) -> &'static str {
-            "f16-static-feeds-with-fp32-matmul-casts"
+            "f16-static-feeds-with-f16-attention-matmuls"
         }
 
         pub(crate) fn optimization_level(&self) -> u8 {

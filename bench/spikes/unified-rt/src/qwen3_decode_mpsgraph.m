@@ -345,18 +345,17 @@ static Qwen3DecodePlan *new_plan(
             : v;
         attention_k = repeat_kv(plan->graph, attention_k, kv_heads, groups, keys, head_dim);
         attention_v = repeat_kv(plan->graph, attention_v, kv_heads, groups, keys, head_dim);
-        MPSGraphTensor *q32 = cast_tensor(plan->graph, q, MPSDataTypeFloat32);
-        MPSGraphTensor *attention_k32 = cast_tensor(plan->graph, attention_k, MPSDataTypeFloat32);
-        MPSGraphTensor *scores = [plan->graph matrixMultiplicationWithPrimaryTensor:q32
-                                                                    secondaryTensor:[plan->graph transposeTensor:attention_k32 dimension:2 withDimension:3 name:nil]
+        MPSGraphTensor *scores16 = [plan->graph matrixMultiplicationWithPrimaryTensor:q
+                                                                    secondaryTensor:[plan->graph transposeTensor:attention_k dimension:2 withDimension:3 name:nil]
                                                                                name:nil];
+        MPSGraphTensor *scores = cast_tensor(plan->graph, scores16, MPSDataTypeFloat32);
         MPSGraphTensor *scale = [plan->graph constantWithScalar:1.0 / sqrt((double)head_dim) dataType:MPSDataTypeFloat32];
         scores = [plan->graph multiplicationWithPrimaryTensor:scores secondaryTensor:scale name:nil];
         scores = [plan->graph additionWithPrimaryTensor:scores secondaryTensor:plan->mask name:nil];
         scores = [plan->graph softMaxWithTensor:scores axis:3 name:nil];
-        MPSGraphTensor *attention_v32 = cast_tensor(plan->graph, attention_v, MPSDataTypeFloat32);
-        MPSGraphTensor *context = [plan->graph matrixMultiplicationWithPrimaryTensor:scores
-                                                                     secondaryTensor:attention_v32
+        MPSGraphTensor *probs16 = cast_tensor(plan->graph, scores, MPSDataTypeFloat16);
+        MPSGraphTensor *context = [plan->graph matrixMultiplicationWithPrimaryTensor:probs16
+                                                                     secondaryTensor:attention_v
                                                                                 name:nil];
         context = cast_tensor(plan->graph, context, MPSDataTypeFloat16);
         context = [plan->graph transposeTensor:context permutation:@[ @0, @2, @1, @3 ] name:nil];
