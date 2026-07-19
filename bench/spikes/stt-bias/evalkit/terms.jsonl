@@ -1,0 +1,120 @@
+{"term":"memcpy","class":"technical","source":"synapse","excluded":false}
+{"term":"cuBLASLt","class":"technical","source":"synapse","excluded":true,"exclusion_reason":"macOS say spells the mixed-case CUDA library name rather than producing a stable spoken form."}
+{"term":"MPSGraph","class":"technical","source":"synapse","excluded":true,"exclusion_reason":"macOS say expands the acronym and camel-case suffix inconsistently across voices."}
+{"term":"subc","class":"technical","source":"cortexkit-sibling","excluded":true,"exclusion_reason":"The four-letter abbreviation is pronounced as ordinary speech rather than the project name."}
+{"term":"PAQ","class":"technical","source":"synapse","excluded":true,"exclusion_reason":"The acronym's letter-by-letter pronunciation is not stable enough for a text-targeted TTS oracle."}
+{"term":"tok/s","class":"technical","source":"synapse","excluded":true,"exclusion_reason":"The slash unit is spoken differently by Samantha and Daniel."}
+{"term":"RMSNorm","class":"technical","source":"synapse","excluded":true,"exclusion_reason":"macOS say does not preserve the intended acronym-plus-word pronunciation."}
+{"term":"GGUF","class":"technical","source":"synapse","excluded":true,"exclusion_reason":"The all-caps model format is read as an unstable sequence of letters."}
+{"term":"safetensors","class":"technical","source":"synapse","excluded":false}
+{"term":"mlx","class":"technical","source":"synapse","excluded":true,"exclusion_reason":"The lowercase acronym is pronounced as an ordinary word by one bootstrap voice."}
+{"term":"rerank","class":"technical","source":"synapse","excluded":false}
+{"term":"embedder","class":"technical","source":"synapse","excluded":false}
+{"term":"fp16","class":"technical","source":"synapse","excluded":true,"exclusion_reason":"The alphanumeric precision label is expanded inconsistently by macOS say."}
+{"term":"RoPE","class":"technical","source":"synapse","excluded":true,"exclusion_reason":"The intended acronym pronunciation conflicts with the common word rope."}
+{"term":"KV cache","class":"technical","source":"synapse","excluded":true,"exclusion_reason":"The initialism is not pronounced consistently enough for exact text scoring."}
+{"term":"FastConformer","class":"technical","source":"synapse","excluded":false}
+{"term":"LFM2","class":"technical","source":"synapse","excluded":true,"exclusion_reason":"The model identifier is read as a variable alphanumeric sequence by macOS say."}
+{"term":"liquid-audio","class":"technical","source":"synapse","excluded":false}
+{"term":"HuggingFace","class":"technical","source":"synapse","excluded":false}
+{"term":"tokenizer","class":"technical","source":"synapse","excluded":false}
+{"term":"tokenization","class":"technical","source":"synapse","excluded":false}
+{"term":"prefill","class":"technical","source":"synapse","excluded":false}
+{"term":"logits","class":"technical","source":"synapse","excluded":false}
+{"term":"trie","class":"technical","source":"synapse","excluded":false}
+{"term":"JSONL","class":"technical","source":"synapse","excluded":true,"exclusion_reason":"The all-caps file format is spelled out rather than spoken as a stable lexical form."}
+{"term":"ASR","class":"technical","source":"synapse","excluded":true,"exclusion_reason":"The initialism is voice-dependent in the bootstrap TTS output."}
+{"term":"WAV","class":"technical","source":"synapse","excluded":true,"exclusion_reason":"The file extension is spoken as letters, so audio and text targets disagree."}
+{"term":"AIFF","class":"technical","source":"synapse","excluded":true,"exclusion_reason":"The file extension is spoken as letters, so audio and text targets disagree."}
+{"term":"afconvert","class":"technical","source":"synapse","excluded":false}
+{"term":"Metal","class":"technical","source":"synapse","excluded":false}
+{"term":"CUDA","class":"technical","source":"synapse","excluded":true,"exclusion_reason":"The uppercase accelerator name is pronounced inconsistently by the bootstrap voices."}
+{"term":"Vulkan","class":"technical","source":"synapse","excluded":false}
+{"term":"MPS","class":"technical","source":"synapse","excluded":true,"exclusion_reason":"The acronym is read as letters and has no reliable exact-text pronunciation."}
+{"term":"M1","class":"technical","source":"synapse","excluded":true,"exclusion_reason":"The hardware label is pronounced as an alphanumeric sequence rather than a lexical term."}
+{"term":"CoreML","class":"technical","source":"cortexkit-sibling","excluded":false}
+{"term":"ONNX Runtime","class":"technical","source":"synapse","excluded":true,"exclusion_reason":"The ONNX initialism is pronounced differently by the bootstrap voices."}
+{"term":"llama.cpp","class":"technical","source":"synapse","excluded":true,"exclusion_reason":"The dotted project name is not rendered consistently by macOS say."}
+{"term":"GGML","class":"technical","source":"synapse","excluded":true,"exclusion_reason":"The all-caps format name is read as an unstable sequence of letters."}
+{"term":"Qwen3","class":"technical","source":"synapse","excluded":true,"exclusion_reason":"The mixed alphanumeric model name has no stable macOS say pronunciation."}
+{"term":"ModernBERT","class":"technical","source":"synapse","excluded":true,"exclusion_reason":"The camel-case acronym suffix is spoken inconsistently by macOS say."}
+{"term":"MiniLM","class":"technical","source":"synapse","excluded":true,"exclusion_reason":"The mixed-case acronym is pronounced as varying letter sequences."}
+{"term":"FAISS","class":"technical","source":"synapse","excluded":true,"exclusion_reason":"The acronym's intended pronunciation is not preserved by macOS say."}
+{"term":"cosine","class":"technical","source":"synapse","excluded":false}
+{"term":"embedding","class":"technical","source":"synapse","excluded":false}
+{"term":"quantization","class":"technical","source":"synapse","excluded":false}
+{"term":"Q8_0","class":"technical","source":"synapse","excluded":true,"exclusion_reason":"Underscore-separated numeric notation is not spoken consistently by macOS say."}
+{"term":"BF16","class":"technical","source":"synapse","excluded":true,"exclusion_reason":"The alphanumeric precision label is expanded inconsistently by macOS say."}
+{"term":"F16","class":"technical","source":"synapse","excluded":true,"exclusion_reason":"The alphanumeric precision label is expanded inconsistently by macOS say."}
+{"term":"Float32","class":"technical","source":"synapse","excluded":true,"exclusion_reason":"The numeric type suffix is rendered inconsistently by macOS say."}
+{"term":"SIMD","class":"technical","source":"synapse","excluded":true,"exclusion_reason":"The acronym is spoken as letters, which makes exact lexical scoring unreliable."}
+{"term":"GEMM","class":"technical","source":"synapse","excluded":true,"exclusion_reason":"The acronym is not rendered as a stable lexical term by the bootstrap voices."}
+{"term":"matmul","class":"technical","source":"synapse","excluded":false}
+{"term":"softmax","class":"technical","source":"synapse","excluded":false}
+{"term":"SwiGLU","class":"technical","source":"synapse","excluded":true,"exclusion_reason":"The camel-case acronym is pronounced inconsistently by macOS say."}
+{"term":"SiLU","class":"technical","source":"synapse","excluded":true,"exclusion_reason":"The acronym is not rendered as a stable lexical term by the bootstrap voices."}
+{"term":"GELU","class":"technical","source":"synapse","excluded":true,"exclusion_reason":"The acronym is not rendered as a stable lexical term by the bootstrap voices."}
+{"term":"LayerNorm","class":"technical","source":"synapse","excluded":false}
+{"term":"Conformer","class":"technical","source":"synapse","excluded":false}
+{"term":"mel spectrogram","class":"technical","source":"synapse","excluded":false}
+{"term":"Slaney","class":"technical","source":"synapse","excluded":false}
+{"term":"STFT","class":"technical","source":"synapse","excluded":true,"exclusion_reason":"The all-caps signal-processing acronym is read as letters by macOS say."}
+{"term":"dither","class":"technical","source":"synapse","excluded":false}
+{"term":"RustFFT","class":"technical","source":"synapse","excluded":true,"exclusion_reason":"The camel-case acronym suffix is pronounced inconsistently by macOS say."}
+{"term":"safetensor","class":"technical","source":"synapse","excluded":false}
+{"term":"token-exact","class":"technical","source":"synapse","excluded":false}
+{"term":"greedy decode","class":"technical","source":"synapse","excluded":false}
+{"term":"cache bucket","class":"technical","source":"synapse","excluded":false}
+{"term":"MPSGraphContext","class":"technical","source":"synapse","excluded":true,"exclusion_reason":"The compound camel-case API name is not intelligible in the bootstrap TTS voices."}
+{"term":"safetensors index","class":"technical","source":"synapse","excluded":false}
+{"term":"Hugging Face","class":"technical","source":"synapse","excluded":false}
+{"term":"rayon","class":"technical","source":"synapse","excluded":false}
+{"term":"Rust","class":"technical","source":"synapse","excluded":false}
+{"term":"Cargo","class":"technical","source":"synapse","excluded":false}
+{"term":"serde","class":"technical","source":"synapse","excluded":false}
+{"term":"clap","class":"technical","source":"synapse","excluded":false}
+{"term":"safetensors file","class":"technical","source":"synapse","excluded":false}
+{"term":"FastConformer encoder","class":"technical","source":"synapse","excluded":false}
+{"term":"audio projector","class":"technical","source":"synapse","excluded":false}
+{"term":"RMS","class":"technical","source":"synapse","excluded":true,"exclusion_reason":"The acronym is pronounced letter-by-letter and does not support a stable word target."}
+{"term":"Candle","class":"technical","source":"synapse","excluded":false}
+{"term":"schedule","class":"control","source":"general","excluded":false}
+{"term":"memory","class":"control","source":"general","excluded":false}
+{"term":"launch","class":"control","source":"general","excluded":false}
+{"term":"buffer","class":"control","source":"general","excluded":false}
+{"term":"project","class":"control","source":"general","excluded":false}
+{"term":"system","class":"control","source":"general","excluded":false}
+{"term":"update","class":"control","source":"general","excluded":false}
+{"term":"compile","class":"control","source":"general","excluded":false}
+{"term":"testing","class":"control","source":"general","excluded":false}
+{"term":"result","class":"control","source":"general","excluded":false}
+{"term":"model","class":"control","source":"general","excluded":false}
+{"term":"prompt","class":"control","source":"general","excluded":false}
+{"term":"language","class":"control","source":"general","excluded":false}
+{"term":"notebook","class":"control","source":"general","excluded":false}
+{"term":"library","class":"control","source":"general","excluded":false}
+{"term":"weather","class":"control","source":"general","excluded":false}
+{"term":"meeting","class":"control","source":"general","excluded":false}
+{"term":"documentation","class":"control","source":"general","excluded":false}
+{"term":"service","class":"control","source":"general","excluded":false}
+{"term":"request","class":"control","source":"general","excluded":false}
+{"term":"response","class":"control","source":"general","excluded":false}
+{"term":"session","class":"control","source":"general","excluded":false}
+{"term":"release","class":"control","source":"general","excluded":false}
+{"term":"version","class":"control","source":"general","excluded":false}
+{"term":"branch","class":"control","source":"general","excluded":false}
+{"term":"review","class":"control","source":"general","excluded":false}
+{"term":"storage","class":"control","source":"general","excluded":false}
+{"term":"network","class":"control","source":"general","excluded":false}
+{"term":"monitor","class":"control","source":"general","excluded":false}
+{"term":"process","class":"control","source":"general","excluded":false}
+{"term":"feature","class":"control","source":"general","excluded":false}
+{"term":"message","class":"control","source":"general","excluded":false}
+{"term":"report","class":"control","source":"general","excluded":false}
+{"term":"design","class":"control","source":"general","excluded":false}
+{"term":"sample","class":"control","source":"general","excluded":false}
+{"term":"signal","class":"control","source":"general","excluded":false}
+{"term":"record","class":"control","source":"general","excluded":false}
+{"term":"source","class":"control","source":"general","excluded":false}
+{"term":"output","class":"control","source":"general","excluded":false}
+{"term":"input","class":"control","source":"general","excluded":false}

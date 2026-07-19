@@ -1,0 +1,90 @@
+{
+  "dataset": {
+    "requests": 120,
+    "technical_scored": 41,
+    "control_scored": 40,
+    "tts_excluded_rows": 39,
+    "carrier_sentences_per_term": 3,
+    "measured_carriers_per_term": 1,
+    "voices": ["Samantha", "Daniel"],
+    "voice_selection": "alternating per term"
+  },
+  "arms": [
+    {
+      "arm": "baseline",
+      "term_exact_accuracy": 0.4878048780487805,
+      "false_insertion_rate": 0.0,
+      "wer": 0.06871345029239766,
+      "case_fidelity": 0.2682926829268293,
+      "prefill_wall_s": 339.46477671700006,
+      "decode_wall_s": 66.07271720800003,
+      "added_prompt_tokens": 0
+    },
+    {
+      "arm": "prompt",
+      "term_exact_accuracy": 0.6829268292682927,
+      "false_insertion_rate": 0.0,
+      "wer": 0.6944444444444444,
+      "case_fidelity": 0.5365853658536586,
+      "prefill_wall_s": 739.6152842910001,
+      "decode_wall_s": 81.46598558599995,
+      "added_prompt_tokens": 9097
+    },
+    {
+      "arm": "trie-delta-6",
+      "term_exact_accuracy": 0.9024390243902439,
+      "false_insertion_rate": 0.0,
+      "wer": 0.04678362573099415,
+      "case_fidelity": 0.3902439024390244,
+      "prefill_wall_s": 352.3477788729999,
+      "decode_wall_s": 70.00852357999997,
+      "trie_bias_wall_s": 0.009141077999999999,
+      "added_prompt_tokens": 0
+    },
+    {
+      "arm": "combined-delta-2",
+      "term_exact_accuracy": 0.9024390243902439,
+      "false_insertion_rate": 0.0,
+      "wer": 1.0614035087719298,
+      "case_fidelity": 0.6829268292682927,
+      "prefill_wall_s": 584.1718655430001,
+      "decode_wall_s": 75.49913987300002,
+      "trie_bias_wall_s": 0.011946412000000012,
+      "added_prompt_tokens": 9097
+    }
+  ],
+  "dev_delta_sweep": [
+    {
+      "delta": 2.0,
+      "technical_scored": 12,
+      "control_scored": 12,
+      "term_exact_accuracy": 0.5,
+      "false_insertion_rate": 0.0,
+      "wer": 0.09359605911330049,
+      "case_fidelity": 0.3333333333333333
+    },
+    {
+      "delta": 4.0,
+      "technical_scored": 12,
+      "control_scored": 12,
+      "term_exact_accuracy": 0.75,
+      "false_insertion_rate": 0.0,
+      "wer": 0.07881773399014778,
+      "case_fidelity": 0.25
+    },
+    {
+      "delta": 6.0,
+      "technical_scored": 12,
+      "control_scored": 12,
+      "term_exact_accuracy": 0.8333333333333334,
+      "false_insertion_rate": 0.0,
+      "wer": 0.06896551724137931,
+      "case_fidelity": 0.25
+    }
+  ],
+  "unsafe_settings": [
+    "Trie delta 12 did not emit EOS within 64 tokens on the first evaluation request.",
+    "Prompt plus trie delta 4 did not emit EOS within 64 tokens; the same run still failed at 128 tokens.",
+    "Prompt plus trie delta 6 did not emit EOS within 64 tokens."
+  ]
+}
