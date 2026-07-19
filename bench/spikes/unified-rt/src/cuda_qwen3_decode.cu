@@ -355,29 +355,15 @@ struct Qwen3DecodeContext {
             decode_rms_norm<<<1, threads, 0, stream>>>(x0.pointer, layer.input_norm.pointer, normed.pointer, hidden, epsilon);
             matvec(layer.q_weight, normed.pointer, q_raw.pointer, query_width, hidden);
             matvec(layer.k_weight, normed.pointer, k_raw.pointer, kv_width, hidden);
-            matvec(layer.v_weight, normed.pointer, v_raw.pointer, kv_width, hidden);
+            matvec(layer.v_weight, normed.pointer, layer.value_cache.pointer + static_cast<size_t>(token_position) * kv_width, kv_width, hidden);
             decode_head_norm_rope<<<query_heads, threads, 0, stream>>>(
                 q_raw.pointer, layer.q_norm.pointer, q.pointer,
                 query_heads, head_dim, token_position, epsilon, theta
             );
             decode_head_norm_rope<<<kv_heads, threads, 0, stream>>>(
-                k_raw.pointer, layer.k_norm.pointer, k.pointer,
+                k_raw.pointer, layer.k_norm.pointer, layer.key_cache.pointer + static_cast<size_t>(token_position) * kv_width,
                 kv_heads, head_dim, token_position, epsilon, theta
             );
-            FAMILY_CUDA_CHECK(cudaMemcpyAsync(
-                layer.key_cache.pointer + static_cast<size_t>(token_position) * kv_width,
-                k.pointer,
-                static_cast<size_t>(kv_width) * sizeof(float),
-                cudaMemcpyDeviceToDevice,
-                stream
-            ));
-            FAMILY_CUDA_CHECK(cudaMemcpyAsync(
-                layer.value_cache.pointer + static_cast<size_t>(token_position) * kv_width,
-                v_raw.pointer,
-                static_cast<size_t>(kv_width) * sizeof(float),
-                cudaMemcpyDeviceToDevice,
-                stream
-            ));
             decode_attention<<<query_heads, threads, static_cast<size_t>(token_position + 1) * sizeof(float), stream>>>(
                 q.pointer,
                 layer.key_cache.pointer,

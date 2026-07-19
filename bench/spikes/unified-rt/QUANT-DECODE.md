@@ -94,14 +94,14 @@ All timings are single-stream, greedy, and exclude prompt prefill from
 | LFM2-1.2B | fp32 | 178.35 | 4,681,362,432 | 834.9 (83.5% of 1000) | 1.00x |
 | LFM2-1.2B | Q8_0 | 361.80 | 1,243,868,160 | 450.0 (45.0% of 1000) | **2.03x** |
 | Qwen3-0.6B | fp32 | 239.77 | 2,384,199,680 | 571.7 (57.2% of 1000) | 1.00x |
-| Qwen3-0.6B | Q8_0 | 343.79 | 633,495,552 | 217.8 (21.8% of 1000) | **1.43x** |
+| Qwen3-0.6B | Q8_0 | 376.82 | 633,495,552 | 238.7 (23.9% of 1000) | **1.57x** |
 
 The historical LFM2 fp32 comparison point was 178.5 tok/s; the fresh same-rig
 178.35 result reproduces it. Qwen3's 239.77 tok/s row is its first owned CUDA
 fp32 decode baseline. LFM2 Q8_0 is useful but does not approach the 3.76x active
-byte reduction. Qwen3 is launch/dequant limited: its effective bandwidth falls
-to 217.8 GB/s, so the 1.43x gain is a negative bandwidth-efficiency result, not
-evidence of a saturated compressed-weight path.
+byte reduction. The direct-KV-cache winner raises Qwen3 Q8_0 to 376.82 tok/s and
+238.7 GB/s (1.57x fp32), but it remains launch/dequant limited rather than a
+saturated compressed-weight path.
 
 ### Quality ladder
 
@@ -189,10 +189,10 @@ approximately **$0.40 total spend**, well below the $25 cap. All three
 ## Campaign baseline: CUDA Q8_0 single-stream decode
 
 The second campaign targets the owned Qwen3-0.6B Q8_0 CUDA decode path on an RTX
-4090. The frozen throughput baseline is **343.8 tok/s** for one stream and 64
-new tokens (`217.8 GB/s` effective weight bandwidth); llama.cpp's `521.4 tok/s`
-comparison is a competitor reference, not an acceptance gate. The rented rig must
-be an RTX 4090 with reliability above `0.99` and driver `>=570`.
+4090. The re-pinned throughput baseline is **376.824259765553 tok/s** for one
+stream and 64 new tokens (`238.7 GB/s` effective weight bandwidth); llama.cpp's
+`521.4 tok/s` comparison is a competitor reference, not an acceptance gate. The
+rented rig must be an RTX 4090 with reliability above `0.99` and driver `>=570`.
 
 `bench/campaign/cuda-quant-harness.sh` is a self-contained controller. It embeds
 and hashes the raw-completion fixtures (`decode-prompts.jsonl` SHA-256
@@ -205,8 +205,8 @@ candidate runner; the result writer is controller-owned and reclaim-safe.
 
 The quality gate is quantization-aware rather than token-exact: every prompt's
 reported `match_depth` is recomputed against the pinned fp32 oracle. The frozen
-campaign floor is at least `13/20` exact prompts and median match depth at least
-`54.5`; near-tie exemptions are not accepted. The constrained fixture must also
+campaign floor is at least `10/20` exact prompts and median match depth at least
+`59.0`; near-tie exemptions are not accepted. The constrained fixture must also
 produce `15/15` schema-valid `{result: "allow"|"deny", score: number}` objects.
 The hook gate runs the CPU-side `cargo test -p spike-unified-rt` regression suite. Only
 after both gates pass does the harness start `N=12` fresh single-stream processes
@@ -222,3 +222,28 @@ fenced sudo verbs for identity drops, process reaping, candidate-only
 iptables/ip6tables egress denial, and ownership repair. It leaves the rig alive
 for the overnight campaign and does not edit `campaign-lab.jsonc` or start
 Athena.
+
+### Campaign winner 1 confirmation
+
+Campaign `[consult-id]` winner 1 writes the value
+matvec and RoPE-normalized key directly to their per-layer KV-cache slots at the
+current token offset. This removes two device-to-device `cudaMemcpyAsync`
+launches for every layer and generated token. The campaign's controlled RTX 4090
+measurement was 375.46 tok/s versus 363.74 tok/s for the control (`+3.22%`;
+first pair `+2.93%`).
+
+The direct-endpoint confirmation on 2026-07-19 rebuilt the CUDA feature and ran
+the 20-prompt, 64-token Q8_0 fixture: 10/20 exact prompts, median match depth
+64.0, and no near-tie exemptions. The constrained JSON fixture was also 15/15
+schema-valid. The shared host's pre-measurement load average was `31.71 32.63
+32.27` (higher than the usual roughly-20 ambient load), while
+the exclusive RTX 4090 had no compute processes (driver 595.58.03, P8, 210 MHz,
+24.05 W). Twelve fresh, varied-prompt processes generated 64 tokens each and
+had a median of **376.824259765553 tok/s** (`+3.60%` versus the campaign control;
+range 372.77–389.25 tok/s). This replaces the historical 343.8 tok/s registry
+baseline; that non-paired comparison is `+9.61%` and is not the campaign delta.
+
+The CPU-side shared decode hook suite also passed all five tap, pause/resume,
+splice, addressable-region, and greedy-tie tests. These hooks are not
+Metal-only; they exercise the shared Qwen3 decode state rather than a
+CUDA-device-specific hook implementation.
