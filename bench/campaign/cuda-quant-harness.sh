@@ -427,6 +427,38 @@ def run_through_runner(
     return completed.returncode
 
 
+def tail_of_log(log_path: Path, lines: int) -> str:
+    """Combined tail of a runner log pair (stdout + stderr), newest last.
+
+    Cargo writes errors to stderr, but candidate builds may also die with
+    stdout-only output (e.g. a build-script panic), so both halves are read.
+    """
+    pieces: List[str] = []
+    for path in (log_path, log_path.with_name(log_path.name + ".stderr")):
+        try:
+            text = path.read_text(errors="replace")
+        except OSError:
+            continue
+        if text.strip():
+            pieces.append(text)
+    combined = "\n".join(pieces).splitlines()
+    return "\n".join(combined[-lines:]) if combined else "(build log is empty)"
+
+
+def preserve_build_log(log_path: Path, result_dir: Path) -> None:
+    """Copy the build log pair into the persistent results directory.
+
+    The staged workspace is torn down after a rejection; without this copy the
+    only build evidence would be the stderr tail in the rejection message.
+    """
+    for path in (log_path, log_path.with_name(log_path.name + ".stderr")):
+        try:
+            if path.exists():
+                shutil.copy2(path, result_dir / path.name)
+        except OSError:
+            pass
+
+
 def write_cuda_scene(result_dir: Path, state: str) -> None:
     scene = {
         "platform": "linux-cuda-rented-rig",
@@ -977,7 +1009,15 @@ def run_harness(workspace_arg: str, runner_arg: str, result_arg: str) -> int:
             temp_root / "build.log",
         )
         if build_status != 0:
-            raise CandidateRejected(f"candidate release build failed with status {build_status}")
+            # Surface the build failure itself: without this tail the driver
+            # spool only ever sees the one-line verdict, and the actual cargo
+            # error is unrecoverable after workspace teardown.
+            build_tail = tail_of_log(temp_root / "build.log", 100)
+            preserve_build_log(temp_root / "build.log", result_path.parent)
+            raise CandidateRejected(
+                "candidate release build failed with status "
+                f"{build_status}; cargo stderr tail:\n{build_tail}"
+            )
         binary = target_dir / "release/spike-unified-rt"
 
         gate_output = output_root / "gate.json"
