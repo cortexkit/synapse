@@ -64,7 +64,27 @@ jobs:
         with:
           components: clippy, rustfmt
 
-      - uses: taiki-e/install-action@nextest
+      # Direct prebuilt-binary install instead of taiki-e/install-action: the
+      # action's bootstrap script is broken by a runner-image bash regression
+      # (actions/partner-runner-images#169) and took every lane down with it.
+      # get.nexte.st serves the same prebuilt archives without a bootstrap layer.
+      - name: Install cargo-nextest (linux)
+        if: matrix.name == 'linux'
+        shell: bash
+        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
+
+      - name: Install cargo-nextest (macos)
+        if: matrix.name == 'macos-metal'
+        shell: bash
+        run: curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
+
+      - name: Install cargo-nextest (windows)
+        if: matrix.name == 'windows'
+        shell: pwsh
+        run: |
+          curl.exe -LsSf https://get.nexte.st/latest/windows-tar -o nextest.tar.gz
+          tar zxf nextest.tar.gz -C "$env:USERPROFILE\.cargo\bin"
+          Remove-Item nextest.tar.gz
 
       - uses: Swatinem/rust-cache@v2
         with:
