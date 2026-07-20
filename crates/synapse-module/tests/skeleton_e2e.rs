@@ -592,6 +592,10 @@ async fn remote_gateway_declares_calibrates_checkpoints_trips_and_recovers() {
         .expect("declared remote model appears in catalog");
     assert_eq!(remote["assurance"], "declared");
     assert_eq!(remote["identity_revision"], "r1");
+    assert!(
+        remote.get("recommended_batch").is_none(),
+        "remote lanes without a measured batch policy omit the advisory"
+    );
 
     let before_probe = route_request(
         &mut consumer,
@@ -1074,6 +1078,26 @@ async fn probe_owned_gte_modernbert_certifies_against_family_reference() {
             .as_f64()
             .expect("rank overlap is numeric")
             >= 0.999
+    );
+
+    let listed = route_request(
+        &mut consumer,
+        route,
+        91,
+        serde_json::json!({ "method": "models.list", "params": {} }),
+    )
+    .await;
+    let owned = listed["result"]["models"]
+        .as_array()
+        .and_then(|models| {
+            models
+                .iter()
+                .find(|model| model["model_id"] == "gte-modernbert-base-f16")
+        })
+        .expect("certified owned-metal model appears in catalog");
+    assert_eq!(
+        owned["recommended_batch"],
+        serde_json::json!({ "rows": 8, "token_budget": 3_072 })
     );
 }
 

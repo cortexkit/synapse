@@ -32,9 +32,9 @@ use sha2::{Digest, Sha256};
 use store::{
     AssuranceClass, CatalogSnapshot, CertificationKey, CertificationRow, CertificationStatus,
     CheckpointItem, JobAdmission, JobAttemptClaim, JobRecord, KnobAssignmentRow, ModelAssetLocator,
-    ModelCatalogEntry, PerfRow, StoredModelConfig, SynapseStore, SynapseStoreError, JOB_STATE_DONE,
-    JOB_STATE_FAILED_PERMANENT, JOB_STATE_FAILED_TRANSIENT, JOB_STATE_PAUSED_NEEDS_REAUTH,
-    JOB_STATE_QUEUED, JOB_STATE_RUNNING,
+    ModelCatalogEntry, PerfRow, RecommendedBatch, StoredModelConfig, SynapseStore,
+    SynapseStoreError, JOB_STATE_DONE, JOB_STATE_FAILED_PERMANENT, JOB_STATE_FAILED_TRANSIENT,
+    JOB_STATE_PAUSED_NEEDS_REAUTH, JOB_STATE_QUEUED, JOB_STATE_RUNNING,
 };
 use subc_client_rs::{
     async_trait, BindDecision, HandlerOutcome, HealthReport, ModuleHandler, RequestCtx,
@@ -1132,6 +1132,28 @@ struct PerfBenchResult {
 
 struct SystemClock;
 
+/// Use eight rows for ANE because the paired-sweep benchmark identified eight
+/// as the recommended fixed batch size. With fixed sequence buckets, the
+/// corresponding token budget is the row count multiplied by the model's
+/// maximum sequence length; see `bench/results/mc-paired-sweep-20260720.md`
+/// for the measurements.
+fn recommended_batch_for_engine(engine: &str, max_tokens: usize) -> Option<RecommendedBatch> {
+    match engine {
+        "owned-metal" => Some(RecommendedBatch {
+            rows: MAX_ENGINE_BATCH_ITEMS,
+            token_budget: DEFAULT_ENGINE_BATCH_TOKEN_BUDGET,
+        }),
+        "ane" | "ane-coreml-worker" => {
+            let rows = MAX_ENGINE_BATCH_ITEMS;
+            Some(RecommendedBatch {
+                rows,
+                token_budget: (max_tokens.max(1) as u64).saturating_mul(rows as u64),
+            })
+        }
+        _ => None,
+    }
+}
+
 impl Clock for SystemClock {
     fn now_ms(&self) -> u64 {
         now_ms()
@@ -1304,6 +1326,10 @@ impl RuntimeState {
                         model_id: slot.spec.model_id.clone(),
                         state: model_runtime_state_name(&slot.state).to_string(),
                         fingerprints: vec![slot.spec.fingerprint.clone()],
+                        recommended_batch: recommended_batch_for_engine(
+                            &slot.spec.engine,
+                            slot.spec.max_tokens,
+                        ),
                     })
                     .collect::<Vec<_>>()
             })
@@ -8784,6 +8810,20 @@ mod tests {
             Some("neural-engine")
         );
         assert_ne!(mlx, ane);
+    }
+
+    #[test]
+    fn recommended_batch_policy_uses_engine_constants_and_omits_unknown_advice() {
+        let owned = recommended_batch_for_engine("owned-metal", 512).unwrap();
+        assert_eq!(owned.rows, MAX_ENGINE_BATCH_ITEMS);
+        assert_eq!(owned.token_budget, DEFAULT_ENGINE_BATCH_TOKEN_BUDGET);
+
+        let ane = recommended_batch_for_engine("ane", 512).unwrap();
+        assert_eq!(ane.rows, MAX_ENGINE_BATCH_ITEMS);
+        assert_eq!(ane.token_budget, 512 * MAX_ENGINE_BATCH_ITEMS as u64);
+
+        assert!(recommended_batch_for_engine("ort", 512).is_none());
+        assert!(recommended_batch_for_engine("llama", 512).is_none());
     }
 
     #[test]

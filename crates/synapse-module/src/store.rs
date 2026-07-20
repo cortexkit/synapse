@@ -410,10 +410,18 @@ pub enum SynapseStoreError {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct RecommendedBatch {
+    pub rows: usize,
+    pub token_budget: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ModelCatalogEntry {
     pub model_id: String,
     pub state: String,
     pub fingerprints: Vec<Fingerprint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommended_batch: Option<RecommendedBatch>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -711,6 +719,7 @@ impl SynapseStore {
                 model_id: model.model_id,
                 state: "unloaded".to_string(),
                 fingerprints: vec![model.fingerprint],
+                recommended_batch: None,
             })
             .collect();
         Ok(CatalogSnapshot {
