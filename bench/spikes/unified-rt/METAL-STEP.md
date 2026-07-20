@@ -1,6 +1,6 @@
 # Metal custom decode step
 
-Status: **spike implementation; correctness and locked-M1 measurement gates are pending**.
+Status: **wave 1 kernels are correctness-gated and measured; the custom path remains a spike and is not the default backend**.
 The default Qwen3 decode backend remains `mpsgraph`. Select the custom path with
 `--decode-backend metal-step`.
 
@@ -15,11 +15,13 @@ our command buffer and Metal functions; no MPSGraph executable is called by the
 step path.
 
 The custom context keeps activations, logits, weights, and KV handles alive
-across calls. It submits one command buffer per token, waits once, and reads the
-shared logits buffer for the existing CPU greedy argmax and hook loop. Cache
-inspection uses the same layer/concatenated-KV interface as the MPSGraph path,
-so pause, splice, token taps, and addressable weight regions remain host-side
-protocols rather than backend-specific behavior.
+across calls. Dense weights are uploaded once through a shared staging buffer
+into private Metal buffers; the step path never reads model-owned host memory.
+It submits one command buffer per token, waits once, and reads the shared logits
+buffer for the existing CPU greedy argmax and hook loop. Cache inspection uses
+the same layer/concatenated-KV interface as the MPSGraph path, so pause, splice,
+token taps, and addressable weight regions remain host-side protocols rather
+than backend-specific behavior.
 
 ## Kernel list
 
@@ -37,8 +39,9 @@ The per-token command buffer encodes these kernels for each of the 28 layers:
 3. `metal_step_qk_norm_rope` — Q/K head RMSNorm and Qwen rotary embedding;
    normalized K writes directly into the addressed KV cache slot.
 4. `metal_step_attention` — stable two-pass softmax and P/V accumulation
-   over the resident cache (the current correctness candidate uses one query-head
-   thread; simdgroup reduction work remains gated behind parity).
+    over the resident cache. One 32-wide simdgroup owns each query head: lane
+    zero keeps the reference QK/softmax order, while all lanes cooperate over
+    the independent value dimensions.
 5. `metal_step_matvec_residual` — O projection.
 6. `metal_step_residual_rmsnorm` — fused attention residual add and pre-MLP RMSNorm.
 7. `metal_step_gate_up_swiglu` — fused gate/up matvec and SiLU product.
@@ -46,9 +49,12 @@ The per-token command buffer encodes these kernels for each of the 28 layers:
 9. A final `metal_step_rmsnorm` and `metal_step_lm_head` produce f32 logits.
 
 The same matvec kernels select either resident f16 weights or GGUF-compatible
-Q8_0 blocks. Q8_0 uses the existing 34-byte layout: little-endian f16 scale
-followed by 32 signed int8 values. Dequantization occurs inside the dot product;
-no dequantized matrix is materialized.
+Q8_0 blocks. F16 dots use four-element half-vector loads while adding each
+half-rounded product to the f32 accumulator in the original order. Q8_0 uses
+the existing 34-byte layout: little-endian f16 scale followed by 32 signed int8
+values. Q8_0 rows use one simdgroup per output row, loading one quant from each
+32-element block per lane; dequantization occurs inside the dot product and no
+dequantized matrix is materialized.
 
 ## Correctness gate transcripts
 
@@ -95,8 +101,10 @@ The metallib was transferred beside the executable and loaded executable-relativ
 | Backend | Weights | Prompts / repeats | Decode tok/s | Encode / GPU / host per token | Status |
 | --- | --- | --- | ---: | --- | --- |
 | MPSGraph reference | f16 | 12 x 2 | 84.32 baseline | pending fresh breakdown | prior baseline |
-| Metal step | f16 | 12 x 2 | **5.8080 median** | 0.1025 ms / 171.8693 ms / 0.0146 ms | gates green |
-| Metal step | Q8_0 | 12 x 2 | **5.0405 median** | 0.1021 ms / 198.0879 ms / 0.0141 ms | gates green |
+| Metal step baseline | f16 | 12 x 2 | **5.8080 median** | 0.1025 ms / 171.8693 ms / 0.0146 ms | parity-first baseline |
+| Metal step baseline | Q8_0 | 12 x 2 | **5.0405 median** | 0.1021 ms / 198.0879 ms / 0.0141 ms | parity-first baseline |
+| Metal step wave 1 | f16 | 12 x 2 | **17.7992 median** | 0.1021 ms / 55.8754 ms / 0.0340 ms | 20/20 exact; AC |
+| Metal step wave 1 | Q8_0 | 12 x 2 | **29.2656 median** | 0.1018 ms / 33.8624 ms / 0.0327 ms | 14/20 exact; median depth 64.0; AC |
 | llama.cpp Metal | Q8_0 | 12 x 2 | not run | not run | `llama-cli` unavailable on locked M1 |
 
 The owned-step host column excludes GPU command-buffer wait, logits readback,
@@ -107,11 +115,44 @@ stale server result is relabeled as the requested control.
 
 ## Campaign targets
 
-The first correctness-green implementation is intentionally a parity-first
-candidate, not a throughput winner: the single-thread attention kernel and
-28-layer dispatch count make GPU execution the dominant stage. The next campaign
-should restore the 32-wide simdgroup score reduction only after preserving the
-20/20 gate, then fuse or batch the remaining per-layer dispatches. Q8_0 currently
-has lower throughput than f16 on this implementation despite its lower weight
-traffic, so its dequant matvec and launch overhead need a separate profile before
-claiming a bandwidth win.
+Wave 1 keeps the MPSGraph backend as the default. On the locked M1, the
+correctness-preserving attention P/V parallelism and f16 dot unrolling lifted
+f16 from 5.8080 to 17.7992 tok/s; Q8_0 cooperative dequant matvec lifted Q8_0
+from 5.0405 to 29.2656 tok/s, making Q8_0 faster than f16. GPU execution still
+accounts for 55.8754 ms/token f16 and 33.8624 ms/token Q8_0, while encode/feed
+is 0.1021/0.1018 ms/token, so dispatch consolidation is not yet the limiting
+stage. The remaining gap to the 84.32 tok/s MPSGraph baseline is a kernel-level
+profile problem, not host dispatch overhead.
+
+
+## Wave 1 progression log
+
+The local M5 runs below were correctness/performance probes, not substitutes for
+locked-M1 results. Every kernel probe was followed by the f16 20-prompt gate;
+Q8_0 rows were reported only after a fresh Q8_0 quality gate.
+
+| Change | f16 gate | Local probe | Locked-M1 result | Decision |
+| --- | --- | --- | --- | --- |
+| 32-wide QK reduction and fully cooperative attention prototype | 19/20, 0 near ties; completion-06 diverged at step 7 | 33.9162 tok/s | not timed | Reverted: reduction order changed logits |
+| Lane-zero reference-order scores plus 32-wide P/V attention | 20/20, 0 near ties | 28.2297 tok/s first passing run | included in final | Kept: exact score order, parallel value dimensions |
+| Cooperative f16 matvec with `simd_sum` | 19/20, 0 near ties; completion-06 diverged at step 25 | 68.6494 tok/s combined probe | not timed | Reverted: f16 parity is a hard gate |
+| Four-product f16 dot unroll, then half4 loads | 20/20, 0 near ties after each probe | 43.6843 then 43.9977 tok/s | **17.7992 tok/s** | Kept: same f32 accumulation order, materially faster than baseline |
+| Fuse f16 QK-norm+RoPE into QKV epilogue | 20/20, 0 near ties | 43.5677 tok/s | not timed | Reverted: command fusion was slower than the unfused half4 candidate |
+| Q8_0 block-row cooperative matvec | 20/20 f16 gate | final Q8_0: 14/20 exact, median depth 64.0, 55.2564 tok/s | **29.2656 tok/s** after 14/20, median depth 64.0 gate | Kept: Q8_0 is now faster than f16 |
+| Shared-to-private weight upload | 20/20 f16 gate; Q8_0 gate remained 14/20, median depth 64.0 | no material isolated delta on M5; residency verified | included in final | Kept: private residency removes repeated host-visible weight access |
+
+The locked-M1 final f16 sweep used AC power, `[bench-user-home]/bench.lock`, 12
+varied prompts selected by the house stride-seven schedule, two fresh-process
+repeats, and 24 samples total. The median stage breakdown was 55.8754 ms GPU
+execution, 0.1021 ms feed/encode, and 0.0340 ms logits readback per token.
+The locked-M1 Q8_0 quality gate was 14/20 exact with median match depth 64.0
+and zero near-tie exemptions; its 12 x 2 timed median was 29.2656 tok/s with
+33.8624 ms GPU execution, 0.1018 ms feed/encode, and 0.0327 ms readback per
+token. The local final f16 gate was 20/20 exact and the local final Q8_0 gate
+was 14/20 exact with median depth 64.0.
+
+A fresh llama.cpp control was not available on the locked host: neither
+`llama-cli` nor `llama-server` was installed, and no source checkout or archived
+MANIFEST was present under `[bench-user-home]/bench-tools`. The historical Q8_0
+control remains 190.36--203.45 tok/s from `DECODE-WAVE1.md`; it is not relabeled
+as a fresh wave-1 measurement.

@@ -87,6 +87,7 @@ typedef struct Qwen3MetalStepContext {
     id<MTLBuffer> query;
     id<MTLBuffer> key;
     id<MTLBuffer> context;
+    id<MTLBuffer> attention_scores;
     id<MTLBuffer> mlp;
     id<MTLBuffer> final_norm;
     id<MTLBuffer> logits;
@@ -112,12 +113,37 @@ static id<MTLBuffer> new_zero_buffer(id<MTLDevice> device, NSUInteger length, MT
     return [device newBufferWithLength:length options:options];
 }
 
-static StepWeight new_weight(id<MTLDevice> device, const void *fp16, const void *q8, NSUInteger elements) {
+static id<MTLBuffer> new_private_buffer(
+    id<MTLDevice> device,
+    id<MTLBlitCommandEncoder> blit,
+    const void *bytes,
+    NSUInteger length
+) {
+    if (bytes == NULL || length == 0 || blit == nil) return nil;
+    id<MTLBuffer> source = new_buffer(device, bytes, length, MTLResourceStorageModeShared);
+    id<MTLBuffer> destination = new_zero_buffer(device, length, MTLResourceStorageModePrivate);
+    if (source == nil || destination == nil) {
+        [source release];
+        [destination release];
+        return nil;
+    }
+    [blit copyFromBuffer:source sourceOffset:0 toBuffer:destination destinationOffset:0 size:length];
+    [source release];
+    return destination;
+}
+
+static StepWeight new_weight(
+    id<MTLDevice> device,
+    id<MTLBlitCommandEncoder> blit,
+    const void *fp16,
+    const void *q8,
+    NSUInteger elements
+) {
     StepWeight weight = { nil, nil };
     if (q8 != NULL) {
-        weight.q8 = new_buffer(device, q8, elements / 32 * 34, MTLResourceStorageModeShared);
+        weight.q8 = new_private_buffer(device, blit, q8, elements / 32 * 34);
     } else {
-        weight.fp16 = new_buffer(device, fp16, elements * sizeof(uint16_t), MTLResourceStorageModeShared);
+        weight.fp16 = new_private_buffer(device, blit, fp16, elements * sizeof(uint16_t));
     }
     return weight;
 }
@@ -256,6 +282,12 @@ int32_t synapse_qwen3_metal_step_prepare(
             }
             context->layer_count = layer_count;
             context->quantized = quantized;
+            id<MTLCommandBuffer> upload_command = [context->queue commandBuffer];
+            id<MTLBlitCommandEncoder> upload_blit = [upload_command blitCommandEncoder];
+            if (upload_command == nil || upload_blit == nil) {
+                set_error(@"failed to create private weight upload command");
+                return -3;
+            }
             for (uint64_t i = 0; i < layer_count; ++i) {
                 const Qwen3MetalStepLayerParams *source = &params[i];
                 StepLayerBuffers *target = &context->layers[i];
@@ -266,27 +298,27 @@ int32_t synapse_qwen3_metal_step_prepare(
                     set_error(@"quantized Metal step is missing a Q8_0 weight buffer");
                     return -3;
                 }
-                target->input_norm = new_buffer(context->device, source->input_norm,
-                                                context->hidden * sizeof(uint16_t), MTLResourceStorageModeShared);
-                target->post_attention_norm = new_buffer(context->device, source->post_attention_norm,
-                                                         context->hidden * sizeof(uint16_t), MTLResourceStorageModeShared);
-                target->q_norm = new_buffer(context->device, source->q_norm,
-                                            context->head_dim * sizeof(uint16_t), MTLResourceStorageModeShared);
-                target->k_norm = new_buffer(context->device, source->k_norm,
-                                            context->head_dim * sizeof(uint16_t), MTLResourceStorageModeShared);
-                target->q_weight = new_weight(context->device, source->q_weight, source->q_weight_q8,
+                target->input_norm = new_private_buffer(context->device, upload_blit, source->input_norm,
+                                                        context->hidden * sizeof(uint16_t));
+                target->post_attention_norm = new_private_buffer(context->device, upload_blit, source->post_attention_norm,
+                                                                 context->hidden * sizeof(uint16_t));
+                target->q_norm = new_private_buffer(context->device, upload_blit, source->q_norm,
+                                                    context->head_dim * sizeof(uint16_t));
+                target->k_norm = new_private_buffer(context->device, upload_blit, source->k_norm,
+                                                    context->head_dim * sizeof(uint16_t));
+                target->q_weight = new_weight(context->device, upload_blit, source->q_weight, source->q_weight_q8,
                                               (NSUInteger)(query_width * context->hidden));
-                target->k_weight = new_weight(context->device, source->k_weight, source->k_weight_q8,
+                target->k_weight = new_weight(context->device, upload_blit, source->k_weight, source->k_weight_q8,
                                               (NSUInteger)(kv_width * context->hidden));
-                target->v_weight = new_weight(context->device, source->v_weight, source->v_weight_q8,
+                target->v_weight = new_weight(context->device, upload_blit, source->v_weight, source->v_weight_q8,
                                               (NSUInteger)(kv_width * context->hidden));
-                target->o_weight = new_weight(context->device, source->o_weight, source->o_weight_q8,
+                target->o_weight = new_weight(context->device, upload_blit, source->o_weight, source->o_weight_q8,
                                               (NSUInteger)(context->hidden * query_width));
-                target->gate_weight = new_weight(context->device, source->gate_weight, source->gate_weight_q8,
+                target->gate_weight = new_weight(context->device, upload_blit, source->gate_weight, source->gate_weight_q8,
                                                  (NSUInteger)(context->intermediate * context->hidden));
-                target->up_weight = new_weight(context->device, source->up_weight, source->up_weight_q8,
+                target->up_weight = new_weight(context->device, upload_blit, source->up_weight, source->up_weight_q8,
                                                (NSUInteger)(context->intermediate * context->hidden));
-                target->down_weight = new_weight(context->device, source->down_weight, source->down_weight_q8,
+                target->down_weight = new_weight(context->device, upload_blit, source->down_weight, source->down_weight_q8,
                                                  (NSUInteger)(context->hidden * context->intermediate));
                 target->key_cache = new_zero_buffer(context->device, cache_elements * sizeof(uint16_t), MTLResourceStorageModePrivate);
                 target->value_cache = new_zero_buffer(context->device, cache_elements * sizeof(uint16_t), MTLResourceStorageModePrivate);
@@ -302,9 +334,9 @@ int32_t synapse_qwen3_metal_step_prepare(
                     return -4;
                 }
             }
-            context->final_norm_weight = new_buffer(context->device, final_norm_weight,
-                                                    context->hidden * sizeof(uint16_t), MTLResourceStorageModeShared);
-            context->lm_head_weight = new_weight(context->device, lm_head_weight, lm_head_q8,
+            context->final_norm_weight = new_private_buffer(context->device, upload_blit, final_norm_weight,
+                                                            context->hidden * sizeof(uint16_t));
+            context->lm_head_weight = new_weight(context->device, upload_blit, lm_head_weight, lm_head_q8,
                                                  (NSUInteger)(context->vocab * context->hidden));
             NSUInteger hidden_bytes = (NSUInteger)context->hidden * sizeof(uint16_t);
             NSUInteger query_bytes = (NSUInteger)query_width * sizeof(uint16_t);
@@ -315,13 +347,26 @@ int32_t synapse_qwen3_metal_step_prepare(
             context->query = new_zero_buffer(context->device, query_bytes, MTLResourceStorageModePrivate);
             context->key = new_zero_buffer(context->device, (NSUInteger)kv_width * sizeof(uint16_t), MTLResourceStorageModePrivate);
             context->context = new_zero_buffer(context->device, query_bytes, MTLResourceStorageModePrivate);
+            context->attention_scores = new_zero_buffer(
+                context->device,
+                (NSUInteger)context->query_heads * context->bucket * sizeof(float),
+                MTLResourceStorageModePrivate
+            );
             context->mlp = new_zero_buffer(context->device, intermediate_bytes, MTLResourceStorageModePrivate);
             context->final_norm = new_zero_buffer(context->device, hidden_bytes, MTLResourceStorageModePrivate);
             context->logits = new_zero_buffer(context->device, (NSUInteger)context->vocab * sizeof(float), MTLResourceStorageModeShared);
+            [upload_blit endEncoding];
+            [upload_command commit];
+            [upload_command waitUntilCompleted];
+            if (upload_command.status == MTLCommandBufferStatusError) {
+                set_error(upload_command.error.localizedDescription ?: @"private weight upload failed");
+                return -6;
+            }
             if (context->final_norm_weight == nil ||
                 (context->lm_head_weight.fp16 == nil && context->lm_head_weight.q8 == nil) ||
                 context->x_a == nil || context->x_b == nil || context->normalized == nil || context->query == nil ||
-                context->key == nil || context->context == nil || context->mlp == nil || context->final_norm == nil ||
+                context->key == nil || context->context == nil || context->attention_scores == nil ||
+                context->mlp == nil || context->final_norm == nil ||
                 context->logits == nil) {
                 set_error(@"failed to allocate Metal step activation buffers");
                 return -5;
@@ -390,7 +435,11 @@ static void encode_qkv(
         (uint32_t)context->bucket, position, context->quantized
     };
     [encoder setBytes:&config length:sizeof(config) atIndex:10];
-    [encoder dispatchThreads:grid_size(MAX(query_width, kv_width)) threadsPerThreadgroup:group_size(MAX(query_width, kv_width))];
+    NSUInteger qkv_rows = context->quantized
+        ? (NSUInteger)query_width + (NSUInteger)kv_width * 2
+        : (NSUInteger)MAX(query_width, kv_width);
+    NSUInteger qkv_threads = context->quantized ? qkv_rows * 32 : qkv_rows;
+    [encoder dispatchThreads:grid_size(qkv_threads) threadsPerThreadgroup:group_size(context->quantized ? 256 : qkv_rows)];
     [encoder endEncoding];
 }
 
@@ -432,12 +481,13 @@ static void encode_attention(
     [encoder setBuffer:layer->key_cache offset:0 atIndex:1];
     [encoder setBuffer:layer->value_cache offset:0 atIndex:2];
     [encoder setBuffer:context->context offset:0 atIndex:3];
+    [encoder setBuffer:context->attention_scores offset:0 atIndex:4];
     struct { uint32_t query_heads; uint32_t kv_heads; uint32_t head_dim; uint32_t capacity; uint32_t position; } config = {
         (uint32_t)context->query_heads, (uint32_t)context->kv_heads, (uint32_t)context->head_dim,
         (uint32_t)context->bucket, position
     };
-    [encoder setBytes:&config length:sizeof(config) atIndex:4];
-    [encoder dispatchThreads:grid_size(context->query_heads) threadsPerThreadgroup:group_size(context->query_heads)];
+    [encoder setBytes:&config length:sizeof(config) atIndex:5];
+    [encoder dispatchThreads:grid_size(context->query_heads * 32) threadsPerThreadgroup:group_size(256)];
     [encoder endEncoding];
 }
 
@@ -462,7 +512,8 @@ static void encode_matvec_residual(
         input_width, output_width, context->quantized, (uint32_t)add_residual
     };
     [encoder setBytes:&config length:sizeof(config) atIndex:5];
-    [encoder dispatchThreads:grid_size(output_width) threadsPerThreadgroup:group_size(output_width)];
+    NSUInteger matvec_threads = context->quantized ? (NSUInteger)output_width * 32 : output_width;
+    [encoder dispatchThreads:grid_size(matvec_threads) threadsPerThreadgroup:group_size(context->quantized ? 256 : output_width)];
     [encoder endEncoding];
 }
 
@@ -504,7 +555,8 @@ static void encode_gate_up(
         (uint32_t)context->hidden, (uint32_t)context->intermediate, context->quantized, 0
     };
     [encoder setBytes:&config length:sizeof(config) atIndex:6];
-    [encoder dispatchThreads:grid_size(context->intermediate) threadsPerThreadgroup:group_size(context->intermediate)];
+    NSUInteger gate_threads = context->quantized ? context->intermediate * 32 : context->intermediate;
+    [encoder dispatchThreads:grid_size(gate_threads) threadsPerThreadgroup:group_size(context->quantized ? 256 : context->intermediate)];
     [encoder endEncoding];
 }
 
@@ -518,7 +570,8 @@ static void encode_lm_head(Qwen3MetalStepContext *context, id<MTLCommandBuffer> 
         (uint32_t)context->hidden, (uint32_t)context->vocab, context->quantized, 0
     };
     [encoder setBytes:&config length:sizeof(config) atIndex:4];
-    [encoder dispatchThreads:grid_size(context->vocab) threadsPerThreadgroup:group_size(context->vocab)];
+    NSUInteger lm_head_threads = context->quantized ? context->vocab * 32 : context->vocab;
+    [encoder dispatchThreads:grid_size(lm_head_threads) threadsPerThreadgroup:group_size(context->quantized ? 256 : context->vocab)];
     [encoder endEncoding];
 }
 
@@ -701,6 +754,7 @@ void synapse_qwen3_metal_step_context_free(void *raw) {
     [context->query release];
     [context->key release];
     [context->context release];
+    [context->attention_scores release];
     [context->mlp release];
     [context->final_norm release];
     [context->logits release];
