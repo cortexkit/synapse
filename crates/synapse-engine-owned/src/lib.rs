@@ -1,9 +1,12 @@
 #![cfg_attr(not(target_os = "macos"), forbid(unsafe_code))]
 
 use std::collections::{BTreeMap, HashMap};
+#[cfg(target_os = "macos")]
 use std::env;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
 use std::sync::{Arc, Mutex};
+#[cfg(target_os = "macos")]
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
@@ -19,8 +22,10 @@ pub const ENGINE_VERSION: &str = "owned-metal-v1";
 pub const GRAPH_REVISION: u32 = 3;
 pub const BUCKET_POLICY_VERSION: u32 = 1;
 pub const DEFAULT_ATTENTION_UNITS: usize = 4_000_000;
+#[cfg(target_os = "macos")]
 const EMBED_PROFILE_ENV: &str = "SYNAPSE_EMBED_PROFILE";
 
+#[cfg(target_os = "macos")]
 pub(crate) fn embed_profile_enabled() -> bool {
     env::var_os(EMBED_PROFILE_ENV).is_some_and(|value| value.to_string_lossy() != "0")
 }
@@ -247,6 +252,9 @@ pub struct OwnedMetalEmbedEngine {
     family: ModelFamily,
     dtype: OwnedDType,
     models: HashMap<String, OwnedModelHandle>,
+    // Only the macOS runtime mints model handles; other targets keep the field
+    // for struct-shape parity but never read it.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     next_model: u64,
 }
 
@@ -631,6 +639,7 @@ fn precision(dtype: OwnedDType) -> runtime::Precision {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn required_path(cfg: &RuntimeConfig, key: &str) -> Result<PathBuf, EngineError> {
     cfg.values
         .get(key)
@@ -644,6 +653,7 @@ fn required_path(cfg: &RuntimeConfig, key: &str) -> Result<PathBuf, EngineError>
         })
 }
 
+#[cfg(target_os = "macos")]
 fn parse_usize(cfg: &RuntimeConfig, key: &str, default: usize) -> Result<usize, EngineError> {
     cfg.values.get(key).map_or(Ok(default), |value| {
         value.parse::<usize>().map_err(|error| {

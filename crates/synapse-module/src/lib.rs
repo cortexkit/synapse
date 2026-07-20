@@ -5068,9 +5068,7 @@ async fn execute_embedding_quanta(
     let started = Instant::now();
     let item_count = batch.items.len();
     let scheduler_quantum_tokens = runtime.jobs.bulk_quantum_tokens.max(1);
-    let engine_batch_tokens = scheduler_quantum_tokens
-        .min(DEFAULT_ENGINE_BATCH_TOKEN_BUDGET)
-        .max(1);
+    let engine_batch_tokens = scheduler_quantum_tokens.clamp(1, DEFAULT_ENGINE_BATCH_TOKEN_BUDGET);
     let engine_batches = plan_embedding_engine_batches(&batch, engine_batch_tokens);
     let mut scheduler = LaneScheduler::new(SchedulerConfig {
         byte_budget: request_bytes.max(1),

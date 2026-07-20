@@ -2299,6 +2299,10 @@ mod tests {
         )
     }
 
+    // The admission tuple is inherently wide (idempotency key, digest, kind,
+    // generation, clock, TTL pair); bundling them into a one-off struct would
+    // only rename the width.
+    #[allow(clippy::too_many_arguments)]
     fn admit_kind(
         store: &SynapseStore,
         request_key: &str,
