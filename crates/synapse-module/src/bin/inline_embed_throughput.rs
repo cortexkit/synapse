@@ -3,6 +3,7 @@
 use std::{
     env,
     path::PathBuf,
+    process::Command,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -19,6 +20,7 @@ const DEFAULT_CLASSES: &[TextClass] = &[TextClass::Memory, TextClass::Chunk];
 const DEFAULT_REPETITIONS: usize = 3;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 const ADMISSION_SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
+const MAX_AMBIENT_LOADAVG_1M: f64 = 8.0;
 
 #[derive(Clone, Copy, Debug)]
 enum TextClass {
@@ -79,6 +81,12 @@ async fn main() -> Result<()> {
     let mut cells = Vec::with_capacity(args.classes.len() * args.batches.len());
     for &class in &args.classes {
         for &batch_size in &args.batches {
+            let cell_loadavg_1m = loadavg_1m()?;
+            ensure!(
+                cell_loadavg_1m < MAX_AMBIENT_LOADAVG_1M,
+                "ambient loadavg-1m {cell_loadavg_1m:.2} exceeds the {MAX_AMBIENT_LOADAVG_1M:.1} sweep gate before {}/batch {batch_size}",
+                class.as_str()
+            );
             let mut repetitions = Vec::with_capacity(args.repetitions);
             for repetition in 0..args.repetitions {
                 let request_nonce = format!(
@@ -116,7 +124,12 @@ async fn main() -> Result<()> {
                     "admission_samples": admission_samples,
                 }));
             }
-            cells.push(aggregate_cell(class, batch_size, repetitions)?);
+            cells.push(aggregate_cell(
+                class,
+                batch_size,
+                cell_loadavg_1m,
+                repetitions,
+            )?);
         }
     }
 
@@ -355,7 +368,12 @@ async fn call(
     Ok(value)
 }
 
-fn aggregate_cell(class: TextClass, batch: usize, repetitions: Vec<Value>) -> Result<Value> {
+fn aggregate_cell(
+    class: TextClass,
+    batch: usize,
+    loadavg_1m: f64,
+    repetitions: Vec<Value>,
+) -> Result<Value> {
     let elapsed = repetitions
         .iter()
         .map(|row| {
@@ -411,11 +429,18 @@ fn aggregate_cell(class: TextClass, batch: usize, repetitions: Vec<Value>) -> Re
     Ok(json!({
         "class": class.as_str(),
         "batch": batch,
+        "loadavg_1m": loadavg_1m,
         "effective_tokens_median": median_u64(&effective_tokens),
         "submitted_tokens_median": median_u64(&submitted_tokens),
+        "elapsed_min_ms": elapsed.iter().copied().fold(f64::INFINITY, f64::min),
         "elapsed_median_ms": median(&elapsed),
+        "elapsed_max_ms": elapsed.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        "items_per_second_min": items_per_second.iter().copied().fold(f64::INFINITY, f64::min),
         "items_per_second_median": median(&items_per_second),
+        "items_per_second_max": items_per_second.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        "tokens_per_second_min": tokens_per_second.iter().copied().fold(f64::INFINITY, f64::min),
         "tokens_per_second_median": median(&tokens_per_second),
+        "tokens_per_second_max": tokens_per_second.iter().copied().fold(f64::NEG_INFINITY, f64::max),
         "single_item_latency_p50_ms": if batch == 1 { Some(latency_p50_ms) } else { None::<f64> },
         "single_item_latency_p95_ms": if batch == 1 { Some(latency_p95_ms) } else { None::<f64> },
         "admission": admission_summary(&all_samples),
@@ -488,7 +513,7 @@ fn fixture_text(index: usize, class: TextClass, nonce: &str) -> String {
         "Small passages describe decisions, observations, and next actions in a deliberately plain style that resembles the notes a production team would actually store.",
     ];
     let repetitions = match class {
-        TextClass::Memory => 8,
+        TextClass::Memory => 4,
         TextClass::Chunk => 120,
     };
     let mut text = (0..repetitions)
@@ -504,6 +529,20 @@ fn fixture_text(index: usize, class: TextClass, nonce: &str) -> String {
         .join(" ");
     text.push_str(&format!(" Run nonce {nonce}."));
     text
+}
+
+fn loadavg_1m() -> Result<f64> {
+    let output = Command::new("sysctl")
+        .args(["-n", "vm.loadavg"])
+        .output()
+        .context("read one-minute load average")?;
+    ensure!(output.status.success(), "sysctl vm.loadavg failed");
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.split(|character: char| !(character.is_ascii_digit() || character == '.'))
+        .find(|value| !value.is_empty())
+        .context("sysctl vm.loadavg omitted one-minute value")?
+        .parse()
+        .context("parse one-minute load average")
 }
 
 fn epoch_ms() -> Result<u128> {
