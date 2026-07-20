@@ -1247,9 +1247,17 @@ async fn owned_gte_inline_embed_batch_throughput_sweep() {
             );
         }
         if batch_size >= 64 {
+            // Regression floor, not a performance target. This sweep exists to
+            // catch the quanta-slicing class where inline batches execute as
+            // serial per-quantum engine calls (observed collapse: ~1.5k tok/s,
+            // a 7-10x drop). The floor must hold on the slowest CI machine:
+            // the M1 Max runner saturates this wire path at ~9.8k tok/s while
+            // an M5 Max does 14-15k, so a 10k gate calibrated on the M5 fails
+            // healthy M1 runs. 6k passes every healthy machine with margin and
+            // still fails the collapse class by 4x.
             assert!(
-                throughput >= 10_000.0,
-                "batch={batch_size} throughput {throughput:.1} tok/s is below 10k gate"
+                throughput >= 6_000.0,
+                "batch={batch_size} throughput {throughput:.1} tok/s is below the 6k regression floor"
             );
         }
         rows.push(ms_per_item);
