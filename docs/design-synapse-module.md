@@ -87,8 +87,21 @@ Certification must prove SHAPE-INVARIANCE across the declared envelope (our own
 bench: batch shape perturbs bf16 numerics — if an engine is not shape-invariant,
 the shape class splits the profile). Certification rows are keyed by
 `machine_profile_hash` = hash(OS build, driver/backend versions, GPU ids, CPU
-features, RAM class, engine build) (Oracle F13); on mismatch the lane demotes
-to uncertified until re-probe (staleness flag in status, never auto-burn).
+features, RAM class, engine build, and the optional `ane_subtype`) (Oracle F13).
+On macOS, `ane_subtype` is included when the static chip-identity mapping
+knows it: M4-family and base M5 use `h16(map)`, while M5 Max uses `h17(map)`. The
+`(map)` suffix records that this is a static mapping rather than a private
+`_ANEDeviceInfo` probe. Public IORegistry inspection on the M5 Max development
+box exposed ANE firmware-function properties but no usable stable subtype
+property, so the daemon does not link private frameworks. On non-macOS, the
+field is `None` and omitted from the stable JSON, preserving existing hashes.
+
+Changing the macOS profile hash deliberately makes older certification and
+performance rows stale: exact-profile lookup misses them, `probe.report` shows
+`certification_stale`/`performance_stale` with `blocking_reason: probe_required`,
+and owned-lane admission fails closed rather than serving the old rows. An
+explicit successful probe writes rows under the new hash; a failed re-probe
+keeps the new profile uncertified.
 
 **Query/batch profile unification (Oracle F10 — the subtle one):** the hot
 single-query path and the bulk path MUST share a numeric profile, or be

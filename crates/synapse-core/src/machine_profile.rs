@@ -11,6 +11,8 @@ pub struct MachineProfileBase {
     pub arch: String,
     pub chip_model: String,
     pub ram_class: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ane_subtype: Option<String>,
 }
 
 pub trait MachineProfileCollector {
@@ -22,11 +24,13 @@ pub struct SystemMachineProfileCollector;
 
 impl MachineProfileCollector for SystemMachineProfileCollector {
     fn collect_base_profile(&self) -> MachineProfileBase {
+        let chip_model = chip_model();
         MachineProfileBase {
             os_build: os_build(),
             arch: std::env::consts::ARCH.to_string(),
-            chip_model: chip_model(),
+            chip_model: chip_model.clone(),
             ram_class: ram_class(),
+            ane_subtype: ane_subtype(&chip_model),
         }
     }
 }
@@ -37,6 +41,8 @@ pub struct MachineProfile {
     pub arch: String,
     pub chip_model: String,
     pub ram_class: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ane_subtype: Option<String>,
     #[serde(default)]
     pub engine_identities: Vec<EngineIdentity>,
 }
@@ -60,6 +66,7 @@ impl MachineProfile {
             arch: base.arch,
             chip_model: base.chip_model,
             ram_class: base.ram_class,
+            ane_subtype: base.ane_subtype,
             engine_identities,
         }
     }
@@ -117,6 +124,37 @@ fn ram_class() -> String {
     }
 }
 
+fn ane_subtype(chip_model: &str) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        // Public IORegistry inspection on current Apple silicon exposes ANE
+        // firmware functions but no stable subtype property. Keep private
+        // _ANEDeviceInfo out of the daemon and use the static chip-identity
+        // mapping until macOS exposes a supported read-only subtype value.
+        mapped_ane_subtype(chip_model)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = chip_model;
+        None
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn mapped_ane_subtype(chip_model: &str) -> Option<String> {
+    let chip_model = chip_model.trim().to_ascii_lowercase();
+    if chip_model == "apple m5 max" {
+        Some("h17(map)".to_string())
+    } else if chip_model == "apple m5"
+        || chip_model == "apple m4"
+        || chip_model.starts_with("apple m4 ")
+    {
+        Some("h16(map)".to_string())
+    } else {
+        None
+    }
+}
+
 #[cfg(any(target_os = "macos", test))]
 fn ram_class_from_bytes(bytes: u64) -> String {
     const GIB: u64 = 1024 * 1024 * 1024;
@@ -150,7 +188,9 @@ mod tests {
 
     use super::*;
 
-    struct FakeCollector;
+    struct FakeCollector {
+        ane_subtype: Option<&'static str>,
+    }
 
     impl MachineProfileCollector for FakeCollector {
         fn collect_base_profile(&self) -> MachineProfileBase {
@@ -159,6 +199,7 @@ mod tests {
                 arch: "aarch64".to_string(),
                 chip_model: "Apple M3".to_string(),
                 ram_class: "le_32_gib".to_string(),
+                ane_subtype: self.ane_subtype.map(str::to_string),
             }
         }
     }
@@ -178,11 +219,51 @@ mod tests {
             build_flags: BTreeMap::new(),
         };
 
-        let left = MachineProfile::collect(&FakeCollector, [ort.clone(), llama.clone()]);
-        let right = MachineProfile::collect(&FakeCollector, [llama, ort]);
+        let collector = FakeCollector { ane_subtype: None };
+        let left = MachineProfile::collect(&collector, [ort.clone(), llama.clone()]);
+        let right = MachineProfile::collect(&collector, [llama, ort]);
         assert_eq!(left, right);
         assert_eq!(left.hash(), right.hash());
         assert_eq!(left.engine_identities[0].engine, "llama.cpp");
+    }
+
+    #[test]
+    fn ane_subtype_mapping_marks_chip_identity_provenance() {
+        assert_eq!(
+            mapped_ane_subtype("Apple M5 Max"),
+            Some("h17(map)".to_string())
+        );
+        assert_eq!(mapped_ane_subtype("Apple M5"), Some("h16(map)".to_string()));
+        assert_eq!(
+            mapped_ane_subtype("Apple M4 Max"),
+            Some("h16(map)".to_string())
+        );
+        assert_eq!(mapped_ane_subtype("Apple M3 Max"), None);
+    }
+
+    #[test]
+    fn ane_subtype_changes_profile_hash_and_none_keeps_legacy_shape() {
+        let without_ane = MachineProfile::collect(
+            &FakeCollector { ane_subtype: None },
+            std::iter::empty::<EngineIdentity>(),
+        );
+        let with_ane = MachineProfile::collect(
+            &FakeCollector {
+                ane_subtype: Some("h17(map)"),
+            },
+            std::iter::empty::<EngineIdentity>(),
+        );
+
+        assert_ne!(without_ane.hash(), with_ane.hash());
+        assert_eq!(
+            without_ane.hash(),
+            "883d3caf3aa4da4277fe8744fefa4829ee9d1c00bde0722c41d6b6ce959427c0"
+        );
+        assert_eq!(without_ane.ane_subtype, None);
+        assert_eq!(with_ane.ane_subtype.as_deref(), Some("h17(map)"));
+        assert!(!String::from_utf8(without_ane.stable_bytes())
+            .unwrap()
+            .contains("ane_subtype"));
     }
 
     #[test]

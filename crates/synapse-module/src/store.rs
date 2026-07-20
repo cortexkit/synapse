@@ -2267,6 +2267,7 @@ mod tests {
 
     use super::*;
     use cortexkit_store_types::{Isolation, StorageBackend};
+    use synapse_core::MachineProfile;
 
     fn admit(
         store: &SynapseStore,
@@ -2757,6 +2758,63 @@ mod tests {
         assert_eq!(job.request_digest, "legacy:legacy-job");
         assert_eq!(job.result_retention_ttl_ms, 100);
         assert!(migrated.get_job_page("legacy-job", 0).unwrap().is_some());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn certification_lookup_distinguishes_profiles_with_ane_subtypes() {
+        let (root, descriptor) = temp_descriptor("ane-subtype-cert");
+        let store = SynapseStore::open(&descriptor).unwrap();
+        let fingerprint = Fingerprint("ane-fingerprint".to_string());
+        let profile_without_ane = MachineProfile {
+            os_build: "23G93".to_string(),
+            arch: "aarch64".to_string(),
+            chip_model: "Apple M5 Max".to_string(),
+            ram_class: "le_64_gib".to_string(),
+            ane_subtype: None,
+            engine_identities: Vec::new(),
+        };
+        let mut profile_with_ane = profile_without_ane.clone();
+        profile_with_ane.ane_subtype = Some("h17(map)".to_string());
+        let without_hash = profile_without_ane.hash();
+        let with_hash = profile_with_ane.hash();
+        assert_ne!(without_hash, with_hash);
+
+        store
+            .store_cert_row(&CertificationRow {
+                assurance_class: AssuranceClass::Measured,
+                status: CertificationStatus::Certified,
+                key: CertificationKey::Measured {
+                    machine_profile_hash: without_hash.clone(),
+                },
+                numeric_profile_id: NumericProfileId("ane-numeric".to_string()),
+                fingerprint: fingerprint.clone(),
+                certified_at_ms: 10,
+                os_build: "23G93".to_string(),
+                module_generation: 1,
+                evidence: serde_json::json!({"ane_subtype": null}),
+            })
+            .unwrap();
+
+        assert!(store
+            .get_cert_row(&without_hash, &fingerprint)
+            .unwrap()
+            .is_some());
+        assert!(store
+            .get_cert_row(&with_hash, &fingerprint)
+            .unwrap()
+            .is_none());
+        assert!(store.has_stale_cert_row(&with_hash, &fingerprint).unwrap());
+        let refused = crate::ensure_fingerprint_certified(
+            &store,
+            &with_hash,
+            &fingerprint,
+            "ane-model",
+            false,
+        )
+        .expect_err("a changed ANE profile must require re-probing");
+        assert_eq!(refused.code, "not_certified");
+        assert!(refused.message.contains("stale certification rows"));
         let _ = std::fs::remove_dir_all(root);
     }
 
