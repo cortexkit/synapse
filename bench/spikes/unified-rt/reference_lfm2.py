@@ -25,6 +25,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hidden-out", required=True, type=Path)
     parser.add_argument("--max-new-tokens", type=int, default=64)
     parser.add_argument("--top-k-logits", type=int, default=5)
+    parser.add_argument(
+        "--model-revision",
+        default=PINNED_MODEL_REVISION,
+        help="Hub commit to validate; defaults to the pinned LFM2-1.2B reference",
+    )
     parser.add_argument("--allow-download", action="store_true")
     parser.add_argument(
         "--allow-version-drift",
@@ -52,12 +57,12 @@ def top_logits(scores: torch.Tensor, count: int) -> list[dict[str, Any]]:
     ]
 
 
-def checked_revision(model_ref: str) -> str:
+def checked_revision(model_ref: str, expected_revision: str) -> str:
     path = Path(model_ref).expanduser()
     if path.exists():
-        if path.name != PINNED_MODEL_REVISION:
+        if path.name != expected_revision:
             raise RuntimeError(
-                f"local model path must be the pinned snapshot {PINNED_MODEL_REVISION}, "
+                f"local model path must be snapshot {expected_revision}, "
                 f"found leaf {path.name!r}"
             )
         return str(path)
@@ -76,10 +81,10 @@ def main() -> None:
     if args.max_new_tokens <= 0 or args.top_k_logits <= 0:
         raise ValueError("generation and top-k sizes must be positive")
 
-    model_ref = checked_revision(args.model)
+    model_ref = checked_revision(args.model, args.model_revision)
     local_only = not args.allow_download
     common = {
-        "revision": PINNED_MODEL_REVISION,
+        "revision": args.model_revision,
         "local_files_only": local_only,
     }
     # A local snapshot path is already revision-addressed; passing a revision for
@@ -97,7 +102,7 @@ def main() -> None:
     args.tokens_out.parent.mkdir(parents=True, exist_ok=True)
     args.hidden_out.parent.mkdir(parents=True, exist_ok=True)
     metadata = {
-        "model_revision": PINNED_MODEL_REVISION,
+        "model_revision": args.model_revision,
         "transformers": transformers.__version__,
         "torch": torch.__version__,
         "torch_dtype": "float32",
