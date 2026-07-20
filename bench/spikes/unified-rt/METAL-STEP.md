@@ -23,6 +23,39 @@ the same layer/concatenated-KV interface as the MPSGraph path, so pause, splice,
 token taps, and addressable weight regions remain host-side protocols rather
 than backend-specific behavior.
 
+## Wave 3 kernel attribution
+
+The step has an opt-in attribution mode controlled by
+`SYNAPSE_METAL_STEP_PROFILE=1`. In that mode each kernel invocation is encoded
+in its own command buffer, waited to completion, and attributed from
+`GPUStartTime`/`GPUEndTime`. This is deliberately a profiling mode, not a
+throughput mode: the extra command-buffer synchronization makes its wall time
+invalid for the headline cells, while the GPU spans identify where the normal
+single-command-buffer step spends time.
+
+The decode result JSON exposes aggregate seconds in
+`decode_stages.kernel_gpu` (and `prefill_stages.kernel_gpu` remains zero for the
+custom step). The fields are `rmsnorm_s`, `qkv_matvec_s`, `qk_norm_rope_s`,
+`attention_s`, `o_proj_s`, `residual_rmsnorm_s`, `down_proj_s`,
+`gate_up_swiglu_s`, and `lm_head_s`; `samples` counts command buffers with
+valid GPU timestamps. Divide each field by `decode_stages.step_calls` and
+multiply by 1,000 for the per-token attribution table. A full step has 226
+profiled command buffers (eight layer kernels x 28 layers plus final norm and
+LM head), so `samples` should be close to `226 * step_calls`.
+
+Example, with a short single-prompt profile:
+
+```text
+SYNAPSE_METAL_STEP_PROFILE=1 \\
+  DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \\
+  target/release/spike-unified-rt ... --decode-backend metal-step --limit 1
+```
+
+Keep this profile separate from the locked-M1 timing cells. It is also suitable
+for a synthetic 512-position prompt: compare the attention field at a short
+prompt and at position 511 to make the context-growth curve explicit before
+choosing an attention or matvec optimization.
+
 ## Kernel list
 
 The build script compiles `src/qwen3_decode_metal_step.metal` with `xcrun metal`
@@ -53,9 +86,10 @@ The same matvec kernels select either resident f16 weights or GGUF-compatible
 Q8_0 blocks. F16 rows use one lane per output row, with two adjacent half4
 loads unrolled while the f32 accumulator remains serial. Q8_0 uses the existing
 34-byte layout: little-endian f16 scale followed by 32 signed int8 values. Q8_0
-rows use one simdgroup per output row, loading one quant from each 32-element
-block per lane; four block iterations are unrolled without changing per-lane
-accumulation order. Dequantization occurs inside the dot product and no
+rows use one simdgroup per output row; eight lanes each issue an aligned char4
+load for a disjoint slice of every block, and four block iterations are
+unrolled. The Q8 lane grouping and reduction are intentionally subject to the
+existing depth gate. Dequantization occurs inside the dot product and no
 dequantized matrix is materialized.
 
 ## Correctness gate transcripts
@@ -126,6 +160,8 @@ The metallib was transferred beside the executable and loaded executable-relativ
 | Metal step wave 1 | Q8_0 | 12 x 2 | **29.2656 median** | 0.1018 ms / 33.8624 ms / 0.0327 ms | 14/20 exact; median depth 64.0; AC |
 | Metal step wave 2 | f16 | 12 x 2 | **32.3296 median** | 0.1022 ms / 30.6257 ms / 0.0324 ms | 20/20 exact; AC; +81.6% vs wave 1 |
 | Metal step wave 2 | Q8_0 | 12 x 2 | **49.9470 median** | 0.1022 ms / 19.7155 ms / 0.0328 ms | 14/20 exact; median depth 64.0; AC; +70.6% vs wave 1 |
+| Metal step wave 3 | f16 | 12 x 2 | **42.3634 median** | 0.1020 ms / 23.2997 ms / 0.0323 ms | 20/20 exact local gate; AC; +31.1% vs wave 2 |
+| Metal step wave 3 | Q8_0 | 12 x 2 | **67.6920 median** | 0.1023 ms / 14.4657 ms / 0.0332 ms | 11/20 exact local gate; median depth 64.0; AC; +35.5% vs wave 2 |
 | llama.cpp Metal | Q8_0 | 12 x 2 | not run | not run | `llama-cli` unavailable on locked M1 |
 
 The owned-step host column excludes GPU command-buffer wait, logits readback,
@@ -204,3 +240,57 @@ A fresh llama.cpp control was not available on the locked host: neither
 MANIFEST was present under `[bench-user-home]/bench-tools`. The historical Q8_0
 control remains 190.36--203.45 tok/s from `DECODE-WAVE1.md`; it is not relabeled
 as a fresh wave-1 measurement.
+
+## Wave 3 profiler attribution
+
+The Xcode Metal build produced a 51,570-byte executable-relative metallib with
+no `cargo:warning`. The opt-in profiler ran on the local M5 with one short
+prompt (`completion-01`, two decode steps) and a synthetic 469-token prompt
+(one decode step, position 469). Values below are GPU milliseconds per decode
+token; they are not throughput timings because profiling serializes one command
+buffer per kernel invocation.
+
+| Kernel class | f16 short | f16 position 469 | Q8_0 short | Q8_0 position 469 |
+| --- | ---: | ---: | ---: | ---: |
+| RMSNorm | 1.020 | 1.017 | 1.012 | 1.024 |
+| QKV matvec | 1.577 | 1.578 | 0.450 | 0.456 |
+| QK norm + RoPE | 0.621 | 0.624 | 0.619 | 0.621 |
+| Attention | 0.484 | **17.930** | 0.480 | **17.927** |
+| O projection | 1.038 | 1.039 | 0.297 | 0.302 |
+| Residual RMSNorm | 1.079 | 1.075 | 1.078 | 1.086 |
+| Gate/up/SwiGLU | 1.379 | 1.397 | 0.642 | 0.640 |
+| Down projection | 1.543 | 1.552 | 0.407 | 0.413 |
+| LM head | 0.695 | 0.690 | 0.416 | 0.415 |
+
+The short-context f16 kernel total fell from 13.2532 to 9.4342 ms/token after
+half4 vector loads were added to both norm kernels; Q8 fell from 9.3482 to
+5.4007 ms/token in the same local profile. At position 469, attention is the
+wall: it grows from 0.484 to 17.930 ms/token for f16 and from 0.480 to 17.927
+for Q8. The attempted probability-cache attention change was reverted because
+it measured 18.197/18.301 ms at position 469. The synthetic run therefore
+records the growth curve without claiming a regressed optimization.
+
+## Wave 3 progression log
+
+Every retained wave-3 change passed the local f16 exactness gate and the fresh
+Q8 depth gate before timing. The locked-M1 cells used AC power, an exclusive
+`[bench-user-home]/bench.lock`, no active `Runner.Worker`, the fixed stride-seven
+schedule (`completion-01,08,15,02,09,16,03,10,17,04,11,18`), 12 fresh processes
+per weight mode, and the executable-relative 51,570-byte metallib.
+
+| Change | f16 gate | Q8 gate | Local profile/probe | Locked-M1 result | Decision |
+| --- | --- | --- | --- | --- | --- |
+| Per-kernel GPU timestamp attribution | 20/20 exact | 11/20 exact; median depth 64.0 | table above | profile-only | Kept; opt-in and excluded from throughput cells |
+| Q8 char4 block slices with four-block unroll | 20/20 exact | 11/20 exact; median depth 64.0 | retained candidate | included below | Kept; Q8 M1 +35.5% vs wave 2 |
+| Half4 vector loads in RMSNorm and residual RMSNorm | 20/20 exact | 11/20 exact; median depth 64.0 | f16 total 13.2532 -> 9.4342 ms/token | included below | Kept; short-context norm bottleneck removed |
+| F16 threadgroup size 256 -> 512 | 20/20 exact | 11/20 exact; median depth 64.0 | f16 profile regressed 9.4342 -> 9.5368 ms/token | not timed | Reverted: slower on M5 |
+| Attention probability cache before P/V | 20/20 exact | 11/20 exact; median depth 64.0 | long attention regressed 17.930 -> 18.197 ms/token | not timed | Reverted: slower on M5 |
+| Four Q8 rows per simdgroup with subgroup reduction | 20/20 exact | **0/20; median depth 1.0** | failed hard Q8 depth gate | not timed | Reverted immediately |
+
+The locked-M1 wave-3 medians were 42.3634 tok/s f16 and 67.6920 tok/s Q8_0.
+The Q8 goal of 84.32 tok/s was not reached. Effective active-weight
+bandwidth was approximately 101.0 GB/s f16 (`2,384,199,680` bytes/token) and
+42.8 GB/s Q8 (`633,495,552` bytes/token), below the M1 Max theoretical ~400
+GB/s. The profiler identifies short-context norm/projection work and long-
+context attention growth as the remaining measured headroom; no unsupported
+bandwidth saturation claim is made.

@@ -34,6 +34,16 @@ typedef struct Qwen3MetalStepTimings {
     double execute_wall_s;
     double logits_readback_wall_s;
     double kv_update_wall_s;
+    double kernel_rmsnorm_s;
+    double kernel_qkv_matvec_s;
+    double kernel_qk_norm_rope_s;
+    double kernel_attention_s;
+    double kernel_o_proj_s;
+    double kernel_residual_rmsnorm_s;
+    double kernel_down_proj_s;
+    double kernel_gate_up_swiglu_s;
+    double kernel_lm_head_s;
+    uint64_t kernel_samples;
     uint64_t step_calls;
 } Qwen3MetalStepTimings;
 
@@ -93,6 +103,7 @@ typedef struct Qwen3MetalStepContext {
     id<MTLBuffer> logits;
     id<MTLBuffer> final_norm_weight;
     StepWeight lm_head_weight;
+    BOOL profile_kernels;
     Qwen3MetalStepTimings timings;
 } Qwen3MetalStepContext;
 
@@ -251,6 +262,11 @@ void *synapse_qwen3_metal_step_context_new(
         context->intermediate = intermediate;
         context->vocab = vocab;
         context->epsilon = epsilon;
+        // Profiling uses one command buffer per kernel invocation so each GPU
+        // start/end pair identifies a single kernel class. It is opt-in because
+        // the synchronization required for attribution is intentionally slow.
+        const char *profile = getenv("SYNAPSE_METAL_STEP_PROFILE");
+        context->profile_kernels = profile != NULL && profile[0] != '\0' && strcmp(profile, "0") != 0;
         return context;
     }
 }
@@ -385,6 +401,28 @@ static MTLSize grid_size(NSUInteger count) {
 
 static MTLSize group_size(NSUInteger count) {
     return MTLSizeMake(MIN((NSUInteger)256, MAX((NSUInteger)1, count)), 1, 1);
+}
+
+static BOOL finish_profiled_command(
+    Qwen3MetalStepContext *context,
+    id<MTLCommandBuffer> command_buffer,
+    double *gpu_seconds
+) {
+    [command_buffer commit];
+    [command_buffer waitUntilCompleted];
+    if (command_buffer.status == MTLCommandBufferStatusError) {
+        set_error(command_buffer.error.localizedDescription ?: @"Metal step profiled command buffer failed");
+        return NO;
+    }
+    // GPUStartTime and GPUEndTime are populated after completion and use the
+    // same host-clock domain, so their difference is the encoder's GPU span.
+    double start = command_buffer.GPUStartTime;
+    double end = command_buffer.GPUEndTime;
+    if (start > 0.0 && end >= start) {
+        *gpu_seconds += end - start;
+        context->timings.kernel_samples += 1;
+    }
+    return YES;
 }
 
 static void set_weight(id<MTLComputeCommandEncoder> encoder, StepWeight *weight, NSUInteger fp16_index, NSUInteger q8_index) {
@@ -646,8 +684,9 @@ int32_t synapse_qwen3_metal_step(
             // RoPE is indexed by head dimension, not hidden dimension.
             id<MTLBuffer> cosine_buffer = [context->device newBufferWithBytes:rope_cos length:(NSUInteger)context->head_dim * sizeof(uint16_t) options:MTLResourceStorageModeShared];
             id<MTLBuffer> sine_buffer = [context->device newBufferWithBytes:rope_sin length:(NSUInteger)context->head_dim * sizeof(uint16_t) options:MTLResourceStorageModeShared];
-            id<MTLCommandBuffer> command_buffer = [context->queue commandBuffer];
-            if (input_buffer == nil || cosine_buffer == nil || sine_buffer == nil || command_buffer == nil) {
+            id<MTLCommandBuffer> command_buffer = context->profile_kernels ? nil : [context->queue commandBuffer];
+            if (input_buffer == nil || cosine_buffer == nil || sine_buffer == nil ||
+                (!context->profile_kernels && command_buffer == nil)) {
                 [input_buffer release];
                 [cosine_buffer release];
                 [sine_buffer release];
@@ -656,40 +695,92 @@ int32_t synapse_qwen3_metal_step(
             }
             id<MTLBuffer> current = input_buffer;
             id<MTLBuffer> next = context->x_a;
-            for (uint64_t index = 0; index < context->layer_count; ++index) {
-                StepLayerBuffers *layer = &context->layers[index];
-                encode_rmsnorm(context, command_buffer, current, context->normalized, layer->input_norm,
-                               (uint32_t)context->hidden, epsilon);
-                encode_qkv(context, command_buffer, layer, context->normalized, (uint32_t)position);
-                encode_qk_norm_rope(context, command_buffer, layer, cosine_buffer, sine_buffer, (uint32_t)position);
-                encode_attention(context, command_buffer, layer, (uint32_t)position);
-                encode_matvec_residual(context, command_buffer, context->context, current, next,
-                                       &layer->o_weight, (uint32_t)context->query_heads * (uint32_t)context->head_dim,
-                                       (uint32_t)context->hidden, NO);
-                encode_residual_rmsnorm(
-                    context,
-                    command_buffer,
-                    next,
-                    current,
-                    context->normalized,
-                    layer->post_attention_norm
-                );
-                encode_gate_up(context, command_buffer, layer, context->normalized);
-                encode_matvec_residual(context, command_buffer, context->mlp, next, current,
-                                        &layer->down_weight, (uint32_t)context->intermediate, (uint32_t)context->hidden, YES);
-            }
-            encode_rmsnorm(context, command_buffer, current, context->final_norm, context->final_norm_weight,
-                           (uint32_t)context->hidden, epsilon);
-            encode_lm_head(context, command_buffer);
-            context->timings.feed_wall_s += [NSDate timeIntervalSinceReferenceDate] - feed_started;
-            double started = [NSDate timeIntervalSinceReferenceDate];
-            [command_buffer commit];
-            [command_buffer waitUntilCompleted];
-            context->timings.execute_wall_s += [NSDate timeIntervalSinceReferenceDate] - started;
-            BOOL ok = command_buffer.status != MTLCommandBufferStatusError;
-            if (!ok) {
-                set_error(command_buffer.error.localizedDescription ?: @"Metal step command buffer failed");
+            BOOL ok = YES;
+            double profile_started = context->profile_kernels ? [NSDate timeIntervalSinceReferenceDate] : 0.0;
+            if (context->profile_kernels) {
+                // A profiled invocation deliberately serializes each kernel
+                // class behind its predecessor. That makes the command-buffer
+                // GPU span attributable without perturbing normal execution.
+#define PROFILE_KERNEL(FIELD, ...) do { \
+                    if (ok) { \
+                        id<MTLCommandBuffer> profiled_command = [context->queue commandBuffer]; \
+                        if (profiled_command == nil) { \
+                            set_error(@"failed to allocate profiled Metal step command buffer"); \
+                            ok = NO; \
+                        } else { \
+                            __VA_ARGS__; \
+                            ok = finish_profiled_command(context, profiled_command, &context->timings.FIELD); \
+                        } \
+                    } \
+                } while (0)
+                for (uint64_t index = 0; index < context->layer_count; ++index) {
+                    StepLayerBuffers *layer = &context->layers[index];
+                    PROFILE_KERNEL(kernel_rmsnorm_s, encode_rmsnorm(context, profiled_command, current, context->normalized,
+                                                                    layer->input_norm, (uint32_t)context->hidden, epsilon));
+                    PROFILE_KERNEL(kernel_qkv_matvec_s, encode_qkv(context, profiled_command, layer, context->normalized,
+                                                                   (uint32_t)position));
+                    PROFILE_KERNEL(kernel_qk_norm_rope_s, encode_qk_norm_rope(context, profiled_command, layer,
+                                                                               cosine_buffer, sine_buffer, (uint32_t)position));
+                    PROFILE_KERNEL(kernel_attention_s, encode_attention(context, profiled_command, layer,
+                                                                        (uint32_t)position));
+                    PROFILE_KERNEL(kernel_o_proj_s, encode_matvec_residual(
+                        context, profiled_command, context->context, current, next, &layer->o_weight,
+                        (uint32_t)context->query_heads * (uint32_t)context->head_dim,
+                        (uint32_t)context->hidden, NO));
+                    PROFILE_KERNEL(kernel_residual_rmsnorm_s, encode_residual_rmsnorm(
+                        context, profiled_command, next, current, context->normalized, layer->post_attention_norm));
+                    PROFILE_KERNEL(kernel_gate_up_swiglu_s, encode_gate_up(context, profiled_command, layer,
+                                                                           context->normalized));
+                    PROFILE_KERNEL(kernel_down_proj_s, encode_matvec_residual(
+                        context, profiled_command, context->mlp, next, current, &layer->down_weight,
+                        (uint32_t)context->intermediate, (uint32_t)context->hidden, YES));
+                }
+                PROFILE_KERNEL(kernel_rmsnorm_s, encode_rmsnorm(context, profiled_command, current, context->final_norm,
+                                                                context->final_norm_weight, (uint32_t)context->hidden,
+                                                                epsilon));
+                PROFILE_KERNEL(kernel_lm_head_s, encode_lm_head(context, profiled_command));
+#undef PROFILE_KERNEL
             } else {
+                for (uint64_t index = 0; index < context->layer_count; ++index) {
+                    StepLayerBuffers *layer = &context->layers[index];
+                    encode_rmsnorm(context, command_buffer, current, context->normalized, layer->input_norm,
+                                   (uint32_t)context->hidden, epsilon);
+                    encode_qkv(context, command_buffer, layer, context->normalized, (uint32_t)position);
+                    encode_qk_norm_rope(context, command_buffer, layer, cosine_buffer, sine_buffer, (uint32_t)position);
+                    encode_attention(context, command_buffer, layer, (uint32_t)position);
+                    encode_matvec_residual(context, command_buffer, context->context, current, next,
+                                           &layer->o_weight, (uint32_t)context->query_heads * (uint32_t)context->head_dim,
+                                           (uint32_t)context->hidden, NO);
+                    encode_residual_rmsnorm(
+                        context,
+                        command_buffer,
+                        next,
+                        current,
+                        context->normalized,
+                        layer->post_attention_norm
+                    );
+                    encode_gate_up(context, command_buffer, layer, context->normalized);
+                    encode_matvec_residual(context, command_buffer, context->mlp, next, current,
+                                           &layer->down_weight, (uint32_t)context->intermediate, (uint32_t)context->hidden, YES);
+                }
+                encode_rmsnorm(context, command_buffer, current, context->final_norm, context->final_norm_weight,
+                               (uint32_t)context->hidden, epsilon);
+                encode_lm_head(context, command_buffer);
+            }
+            context->timings.feed_wall_s += [NSDate timeIntervalSinceReferenceDate] - feed_started;
+            if (context->profile_kernels) {
+                context->timings.execute_wall_s += [NSDate timeIntervalSinceReferenceDate] - profile_started;
+            } else {
+                double started = [NSDate timeIntervalSinceReferenceDate];
+                [command_buffer commit];
+                [command_buffer waitUntilCompleted];
+                context->timings.execute_wall_s += [NSDate timeIntervalSinceReferenceDate] - started;
+                ok = command_buffer.status != MTLCommandBufferStatusError;
+                if (!ok) {
+                    set_error(command_buffer.error.localizedDescription ?: @"Metal step command buffer failed");
+                }
+            }
+            if (ok) {
                 double readback_started = [NSDate timeIntervalSinceReferenceDate];
                 memcpy(logits, context->logits.contents, (NSUInteger)context->vocab * sizeof(float));
                 context->timings.logits_readback_wall_s += [NSDate timeIntervalSinceReferenceDate] - readback_started;

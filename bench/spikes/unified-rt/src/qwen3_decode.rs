@@ -221,6 +221,60 @@ impl<'a, K: DecodeKernel> DecodeSession<'a, K> {
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize)]
+pub(crate) struct DecodeKernelTimings {
+    /// GPU seconds attributed to the RMSNorm kernels.
+    pub(crate) rmsnorm_s: f64,
+    /// GPU seconds attributed to Q/K/V projection matvecs.
+    pub(crate) qkv_matvec_s: f64,
+    /// GPU seconds attributed to Q/K normalization and RoPE.
+    pub(crate) qk_norm_rope_s: f64,
+    /// GPU seconds attributed to attention score, softmax, and P/V work.
+    pub(crate) attention_s: f64,
+    /// GPU seconds attributed to the attention output projection.
+    pub(crate) o_proj_s: f64,
+    /// GPU seconds attributed to the fused residual RMSNorm.
+    pub(crate) residual_rmsnorm_s: f64,
+    /// GPU seconds attributed to the MLP down projection.
+    pub(crate) down_proj_s: f64,
+    /// GPU seconds attributed to the fused gate/up/SiLU product.
+    pub(crate) gate_up_swiglu_s: f64,
+    /// GPU seconds attributed to the vocabulary projection.
+    pub(crate) lm_head_s: f64,
+    /// Number of profiled command buffers contributing to these totals.
+    pub(crate) samples: u64,
+}
+
+impl DecodeKernelTimings {
+    pub(crate) fn delta(self, earlier: Self) -> Self {
+        Self {
+            rmsnorm_s: self.rmsnorm_s - earlier.rmsnorm_s,
+            qkv_matvec_s: self.qkv_matvec_s - earlier.qkv_matvec_s,
+            qk_norm_rope_s: self.qk_norm_rope_s - earlier.qk_norm_rope_s,
+            attention_s: self.attention_s - earlier.attention_s,
+            o_proj_s: self.o_proj_s - earlier.o_proj_s,
+            residual_rmsnorm_s: self.residual_rmsnorm_s - earlier.residual_rmsnorm_s,
+            down_proj_s: self.down_proj_s - earlier.down_proj_s,
+            gate_up_swiglu_s: self.gate_up_swiglu_s - earlier.gate_up_swiglu_s,
+            lm_head_s: self.lm_head_s - earlier.lm_head_s,
+            samples: self.samples - earlier.samples,
+        }
+    }
+
+    pub(crate) fn accumulate(&mut self, other: Self) {
+        self.rmsnorm_s += other.rmsnorm_s;
+        self.qkv_matvec_s += other.qkv_matvec_s;
+        self.qk_norm_rope_s += other.qk_norm_rope_s;
+        self.attention_s += other.attention_s;
+        self.o_proj_s += other.o_proj_s;
+        self.residual_rmsnorm_s += other.residual_rmsnorm_s;
+        self.down_proj_s += other.down_proj_s;
+        self.gate_up_swiglu_s += other.gate_up_swiglu_s;
+        self.lm_head_s += other.lm_head_s;
+        self.samples += other.samples;
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize)]
 pub(crate) struct DecodeStageTimings {
     pub(crate) graph_prepare_wall_s: f64,
     pub(crate) host_prepare_wall_s: f64,
@@ -228,6 +282,7 @@ pub(crate) struct DecodeStageTimings {
     pub(crate) execute_wall_s: f64,
     pub(crate) logits_readback_wall_s: f64,
     pub(crate) kv_update_wall_s: f64,
+    pub(crate) kernel_gpu: DecodeKernelTimings,
     pub(crate) prefill_calls: u64,
     pub(crate) step_calls: u64,
 }
@@ -241,6 +296,7 @@ impl DecodeStageTimings {
             execute_wall_s: self.execute_wall_s - earlier.execute_wall_s,
             logits_readback_wall_s: self.logits_readback_wall_s - earlier.logits_readback_wall_s,
             kv_update_wall_s: self.kv_update_wall_s - earlier.kv_update_wall_s,
+            kernel_gpu: self.kernel_gpu.delta(earlier.kernel_gpu),
             prefill_calls: self.prefill_calls - earlier.prefill_calls,
             step_calls: self.step_calls - earlier.step_calls,
         }
@@ -253,6 +309,7 @@ impl DecodeStageTimings {
         self.execute_wall_s += other.execute_wall_s;
         self.logits_readback_wall_s += other.logits_readback_wall_s;
         self.kv_update_wall_s += other.kv_update_wall_s;
+        self.kernel_gpu.accumulate(other.kernel_gpu);
         self.prefill_calls += other.prefill_calls;
         self.step_calls += other.step_calls;
     }
@@ -536,7 +593,7 @@ mod metal {
 
     use anyhow::{bail, ensure, Result};
 
-    use super::{DecodeKernel, DecodeStageTimings, Model};
+    use super::{DecodeKernel, DecodeKernelTimings, DecodeStageTimings, Model};
     use crate::{encode_f16_bits, Execution, MetalExecutionConfig, Precision};
 
     #[repr(C)]
@@ -752,6 +809,7 @@ mod metal {
                 execute_wall_s: native.execute_wall_s,
                 logits_readback_wall_s: native.logits_readback_wall_s,
                 kv_update_wall_s: native.kv_update_wall_s,
+                kernel_gpu: DecodeKernelTimings::default(),
                 prefill_calls: native.prefill_calls,
                 step_calls: native.step_calls,
             }
