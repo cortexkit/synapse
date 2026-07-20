@@ -1,6 +1,6 @@
 # Metal custom decode step
 
-Status: **wave 2 kernels are correctness-gated and measured; the custom path remains a spike and is not the default backend**.
+Status: **wave 4 norm kernels are correctness-gated and locally profiled; the custom path remains a spike and is not the default backend**.
 The default Qwen3 decode backend remains `mpsgraph`. Select the custom path with
 `--decode-backend metal-step`.
 
@@ -66,7 +66,7 @@ Metal source.
 
 The per-token command buffer encodes these kernels for each of the 28 layers:
 
-1. `metal_step_rmsnorm` — pre-attention RMSNorm.
+1. `metal_step_rmsnorm` — pre-attention RMSNorm; one simdgroup owns the short vector and uses lane-strided reduction.
 2. `metal_step_qkv_matvec` — one grid for Q, K, and V. V writes directly to
    the layer's `kv_heads * bucket * head_dim` cache slot.
 3. `metal_step_qk_norm_rope` — Q/K head RMSNorm and Qwen rotary embedding;
@@ -269,6 +269,55 @@ wall: it grows from 0.484 to 17.930 ms/token for f16 and from 0.480 to 17.927
 for Q8. The attempted probability-cache attention change was reverted because
 it measured 18.197/18.301 ms at position 469. The synthetic run therefore
 records the growth curve without claiming a regressed optimization.
+
+## Wave 4 profiler attribution
+
+Wave 4 retained the full-simdgroup RMSNorm change after the profiler showed that the
+one-thread dispatch was the fixed cost. The profile below is from the local M5,
+with one short prompt and two decode steps, plus a 470-token prefill and one step
+at position 470. Values are GPU milliseconds per decode token; profiled command
+buffers are serialized and are not throughput measurements.
+
+| Kernel class | f16 short | f16 position 470 | Q8_0 short | Q8_0 position 470 |
+| --- | ---: | ---: | ---: | ---: |
+| RMSNorm | 0.490 | 0.489 | 0.485 | 0.478 |
+| QKV matvec | 1.552 | 1.561 | 0.447 | 0.451 |
+| QK norm + RoPE | 0.633 | 0.637 | 0.632 | 0.632 |
+| Attention | 0.485 | **17.977** | 0.485 | **17.968** |
+| O projection | 1.027 | 1.032 | 0.301 | 0.302 |
+| Residual RMSNorm | 1.078 | 1.075 | 1.080 | 1.073 |
+| Gate/up/SwiGLU | 1.361 | 1.345 | 0.639 | 0.645 |
+| Down projection | 1.533 | 1.530 | 0.410 | 0.411 |
+| LM head | 0.676 | 0.692 | 0.417 | 0.415 |
+
+The retained kernel reduced the profiled short total from 9.4342 to 8.8331
+ms/token for f16 and from 5.4007 to 4.8966 ms/token for Q8_0. The long-context
+attention wall is unchanged, so this wave makes no unsupported claim about
+solving the serving-depth bottleneck. A multi-simdgroup attention prototype was
+measured at 23.851 ms (four simdgroups per head) and 34.448 ms (packed 1,024-
+thread groups) at position 470; both were reverted as slower than the 17.930 ms
+wave-3 reference.
+
+## Wave 4 progression log
+
+Every retained wave-4 change passed the local f16 20-prompt exactness gate. The
+fresh Q8 quality gate passed before reporting its local result. Reduction-order
+changes that did not pass the hard f16 gate were reverted rather than hidden.
+
+| Change | f16 gate | Q8 gate | Local profile/probe | Decision |
+| --- | --- | --- | --- | --- |
+| Full-simdgroup pre-attention RMSNorm | 20/20 exact | 13/20 exact; median depth 64.0 | f16 1.020 -> 0.490 ms; Q8 1.012 -> 0.485 ms | Kept |
+| Full-simdgroup QK norm + RoPE | 19/20; first mismatch completion-06 | not measured after rejection | 0.621 -> 0.261 ms | Reverted: hard f16 gate |
+| Full-simdgroup residual RMSNorm | 19/20; first mismatch completion-06 | not measured after rejection | no retained result | Reverted: hard f16 gate |
+| Four-simdgroup attention head | not gated after local regression | not gated | 17.930 -> 23.851 ms at position 470 | Reverted: slower |
+| Packed 1,024-thread attention groups | not gated after local regression | not gated | 17.930 -> 34.448 ms at position 470 | Reverted: slower |
+
+The retained local f16 run was 20/20 exact across 1,280 generated tokens. The
+retained Q8 run was 13/20 exact with median match depth 64.0 and zero near-tie
+exemptions. A separate long-context parity spot-check used the 470-token prompt,
+a 1,024 cache bucket, and 64 generated tokens: MPSGraph and Metal step were
+identical for 64/64 tokens. No locked-M1 throughput cell is claimed by this local
+wave log; the existing locked-M1 rows above remain unchanged.
 
 ## Wave 3 progression log
 

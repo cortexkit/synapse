@@ -150,42 +150,25 @@ inline float matrix_dot_f16(
     return sum;
 }
 
-inline void rmsnorm_body(
+// One simdgroup owns the short vector: each lane keeps its local products
+// serial, then simd_sum combines the fixed lane partitions. This removes the
+// one-thread dispatch while keeping the elementwise output work disjoint;
+// generation exactness is still checked because the reduction tree changed.
+inline void rmsnorm_body_simd(
     const device half *input,
     device half *output,
     const device half *weight,
-    constant NormConfig &config
+    constant NormConfig &config,
+    uint lane
 ) {
-    float sum = 0.0f;
-    uint i = 0;
-    // Wider aligned reads reduce address-generation overhead while scalar
-    // component accumulation preserves the reference order exactly.
-    for (; i + 4 <= config.width; i += 4) {
-        half4 input_values = *(const device half4 *)(input + i);
-        float value0 = (float)input_values[0];
-        float value1 = (float)input_values[1];
-        float value2 = (float)input_values[2];
-        float value3 = (float)input_values[3];
-        sum += value0 * value0;
-        sum += value1 * value1;
-        sum += value2 * value2;
-        sum += value3 * value3;
-    }
-    for (; i < config.width; ++i) {
+    float partial = 0.0f;
+    for (uint i = lane; i < config.width; i += METAL_STEP_SIMD_WIDTH) {
         float value = (float)input[i];
-        sum += value * value;
+        partial += value * value;
     }
+    float sum = simd_sum(partial);
     float inv = rsqrt(sum / (float)config.width + config.epsilon);
-    i = 0;
-    for (; i + 4 <= config.width; i += 4) {
-        half4 input_values = *(const device half4 *)(input + i);
-        half4 weight_values = *(const device half4 *)(weight + i);
-        output[i] = (half)((float)input_values[0] * inv * (float)weight_values[0]);
-        output[i + 1] = (half)((float)input_values[1] * inv * (float)weight_values[1]);
-        output[i + 2] = (half)((float)input_values[2] * inv * (float)weight_values[2]);
-        output[i + 3] = (half)((float)input_values[3] * inv * (float)weight_values[3]);
-    }
-    for (; i < config.width; ++i) {
+    for (uint i = lane; i < config.width; i += METAL_STEP_SIMD_WIDTH) {
         output[i] = (half)((float)input[i] * inv * (float)weight[i]);
     }
 }
@@ -195,9 +178,10 @@ kernel void metal_step_rmsnorm(
     device half *output [[buffer(1)]],
     const device half *weight [[buffer(2)]],
     constant NormConfig &config [[buffer(3)]],
-    uint tid [[thread_position_in_grid]]) {
-    if (tid != 0) return;
-    rmsnorm_body(input, output, weight, config);
+    uint tid [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    if (tid >= METAL_STEP_SIMD_WIDTH) return;
+    rmsnorm_body_simd(input, output, weight, config, lane);
 }
 
 kernel void metal_step_qkv_matvec(
