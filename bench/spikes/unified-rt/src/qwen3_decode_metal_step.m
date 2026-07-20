@@ -487,6 +487,8 @@ static void encode_attention(
         (uint32_t)context->bucket, position
     };
     [encoder setBytes:&config length:sizeof(config) atIndex:5];
+    // One simdgroup owns a query head. Its 32 lanes split independent KV
+    // positions for the serial-order QK dots, then split value dimensions.
     [encoder dispatchThreads:grid_size(context->query_heads * 32) threadsPerThreadgroup:group_size(256)];
     [encoder endEncoding];
 }
@@ -512,6 +514,8 @@ static void encode_matvec_residual(
         input_width, output_width, context->quantized, (uint32_t)add_residual
     };
     [encoder setBytes:&config length:sizeof(config) atIndex:5];
+    // F16 uses one lane per independent output row; the row dot itself stays
+    // serial. Q8 uses all 32 lanes per row for its explicitly allowed reduction.
     NSUInteger matvec_threads = context->quantized ? (NSUInteger)output_width * 32 : output_width;
     [encoder dispatchThreads:grid_size(matvec_threads) threadsPerThreadgroup:group_size(context->quantized ? 256 : output_width)];
     [encoder endEncoding];
@@ -570,6 +574,8 @@ static void encode_lm_head(Qwen3MetalStepContext *context, id<MTLCommandBuffer> 
         (uint32_t)context->hidden, (uint32_t)context->vocab, context->quantized, 0
     };
     [encoder setBytes:&config length:sizeof(config) atIndex:4];
+    // The large f16 vocabulary projection is row-parallel: each physical
+    // lane owns one full serial dot, avoiding any accumulation reordering.
     NSUInteger lm_head_threads = context->quantized ? context->vocab * 32 : context->vocab;
     [encoder dispatchThreads:grid_size(lm_head_threads) threadsPerThreadgroup:group_size(context->quantized ? 256 : context->vocab)];
     [encoder endEncoding];

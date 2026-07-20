@@ -39,9 +39,10 @@ The per-token command buffer encodes these kernels for each of the 28 layers:
 3. `metal_step_qk_norm_rope` — Q/K head RMSNorm and Qwen rotary embedding;
    normalized K writes directly into the addressed KV cache slot.
 4. `metal_step_attention` — stable two-pass softmax and P/V accumulation
-    over the resident cache. One 32-wide simdgroup owns each query head: lane
-    zero keeps the reference QK/softmax order, while all lanes cooperate over
-    the independent value dimensions.
+   over the resident cache. One 32-wide simdgroup owns each query head: lanes
+   split independent KV positions while keeping each QK dot serial, lane zero
+   performs the reference-order softmax reductions, and all lanes cooperate
+   over the independent value dimensions.
 5. `metal_step_matvec_residual` — O projection.
 6. `metal_step_residual_rmsnorm` — fused attention residual add and pre-MLP RMSNorm.
 7. `metal_step_gate_up_swiglu` — fused gate/up matvec and SiLU product.
@@ -49,11 +50,12 @@ The per-token command buffer encodes these kernels for each of the 28 layers:
 9. A final `metal_step_rmsnorm` and `metal_step_lm_head` produce f32 logits.
 
 The same matvec kernels select either resident f16 weights or GGUF-compatible
-Q8_0 blocks. F16 dots use four-element half-vector loads while adding each
-half-rounded product to the f32 accumulator in the original order. Q8_0 uses
-the existing 34-byte layout: little-endian f16 scale followed by 32 signed int8
-values. Q8_0 rows use one simdgroup per output row, loading one quant from each
-32-element block per lane; dequantization occurs inside the dot product and no
+Q8_0 blocks. F16 rows use one lane per output row, with two adjacent half4
+loads unrolled while the f32 accumulator remains serial. Q8_0 uses the existing
+34-byte layout: little-endian f16 scale followed by 32 signed int8 values. Q8_0
+rows use one simdgroup per output row, loading one quant from each 32-element
+block per lane; four block iterations are unrolled without changing per-lane
+accumulation order. Dequantization occurs inside the dot product and no
 dequantized matrix is materialized.
 
 ## Correctness gate transcripts
@@ -124,6 +126,13 @@ is 0.1021/0.1018 ms/token, so dispatch consolidation is not yet the limiting
 stage. The remaining gap to the 84.32 tok/s MPSGraph baseline is a kernel-level
 profile problem, not host dispatch overhead.
 
+Wave 2 keeps MPSGraph as the default and applies only order-preserving
+parallelism. Attention lanes now split KV positions rather than splitting a
+single QK reduction; f16 rows remain independent serial reductions; and Q8
+keeps its one-simdgroup-per-row reduction while exposing four block iterations
+per lane. The wave-2 gate and locked-M1 timing cells must be refreshed before
+any throughput claim is made.
+
 
 ## Wave 1 progression log
 
@@ -150,6 +159,18 @@ and zero near-tie exemptions; its 12 x 2 timed median was 29.2656 tok/s with
 33.8624 ms GPU execution, 0.1018 ms feed/encode, and 0.0327 ms readback per
 token. The local final f16 gate was 20/20 exact and the local final Q8_0 gate
 was 14/20 exact with median depth 64.0.
+
+## Wave 2 progression log
+
+The wave-2 implementation rows below intentionally remain unmeasured until
+the full f16 exactness gate and fresh Q8_0 quality gate run on the target
+Metal toolchain. No probe or locked-M1 number is inferred from the source diff.
+
+| Change | f16 gate | Local probe | Locked-M1 result | Decision |
+| --- | --- | --- | --- | --- |
+| KV-position-parallel QK dots with lane-zero reference-order softmax | pending | pending | pending | Candidate: each dot keeps serial accumulation order |
+| F16 row-parallel path with two-half4 dot unroll | pending | pending | pending | Candidate: independent output rows, no reduction reorder |
+| Q8 one-simdgroup-per-row four-block unroll | pending | pending | pending | Candidate: Q8 reduction order remains explicitly allowed |
 
 A fresh llama.cpp control was not available on the locked host: neither
 `llama-cli` nor `llama-server` was installed, and no source checkout or archived
