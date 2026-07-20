@@ -171,25 +171,6 @@ static MPSGraphTensor *rope(
                                           name:nil];
 }
 
-static MPSGraphTensor *repeat_kv(
-    MPSGraph *graph,
-    MPSGraphTensor *input,
-    uint64_t kv_heads,
-    uint64_t groups,
-    uint64_t sequence,
-    uint64_t head_dim
-) {
-    MPSGraphTensor *grouped = [graph reshapeTensor:input
-                                         withShape:@[ @1, @(kv_heads), @1, @(sequence), @(head_dim) ]
-                                              name:nil];
-    MPSGraphTensor *broadcast = [graph broadcastTensor:grouped
-                                               toShape:@[ @1, @(kv_heads), @(groups), @(sequence), @(head_dim) ]
-                                                  name:nil];
-    return [graph reshapeTensor:broadcast
-                      withShape:@[ @1, @(kv_heads * groups), @(sequence), @(head_dim) ]
-                           name:nil];
-}
-
 static void release_layer(Qwen3DecodeLayerTensors *layer) {
     [layer->new_value release];
     [layer->new_key release];
@@ -343,20 +324,33 @@ static Qwen3DecodePlan *new_plan(
         MPSGraphTensor *attention_v = step
             ? [plan->graph concatTensors:@[ layer->value_cache, v ] dimension:2 name:nil]
             : v;
-        attention_k = repeat_kv(plan->graph, attention_k, kv_heads, groups, keys, head_dim);
-        attention_v = repeat_kv(plan->graph, attention_v, kv_heads, groups, keys, head_dim);
-        MPSGraphTensor *scores16 = [plan->graph matrixMultiplicationWithPrimaryTensor:q
-                                                                    secondaryTensor:[plan->graph transposeTensor:attention_k dimension:2 withDimension:3 name:nil]
+        MPSGraphTensor *q_grouped = [plan->graph reshapeTensor:q
+                                                     withShape:@[ @1, @(kv_heads), @(groups), @(sequence), @(head_dim) ]
+                                                          name:nil];
+        MPSGraphTensor *k_grouped = [plan->graph reshapeTensor:attention_k
+                                                     withShape:@[ @1, @(kv_heads), @1, @(keys), @(head_dim) ]
+                                                          name:nil];
+        MPSGraphTensor *v_grouped = [plan->graph reshapeTensor:attention_v
+                                                     withShape:@[ @1, @(kv_heads), @1, @(keys), @(head_dim) ]
+                                                          name:nil];
+        MPSGraphTensor *mask5 = [plan->graph reshapeTensor:plan->mask
+                                                  withShape:@[ @1, @1, @1, @(sequence), @(keys) ]
+                                                       name:nil];
+        MPSGraphTensor *scores16 = [plan->graph matrixMultiplicationWithPrimaryTensor:q_grouped
+                                                                    secondaryTensor:[plan->graph transposeTensor:k_grouped dimension:3 withDimension:4 name:nil]
                                                                                name:nil];
         MPSGraphTensor *scores = cast_tensor(plan->graph, scores16, MPSDataTypeFloat32);
         MPSGraphTensor *scale = [plan->graph constantWithScalar:1.0 / sqrt((double)head_dim) dataType:MPSDataTypeFloat32];
         scores = [plan->graph multiplicationWithPrimaryTensor:scores secondaryTensor:scale name:nil];
-        scores = [plan->graph additionWithPrimaryTensor:scores secondaryTensor:plan->mask name:nil];
-        scores = [plan->graph softMaxWithTensor:scores axis:3 name:nil];
+        scores = [plan->graph additionWithPrimaryTensor:scores secondaryTensor:mask5 name:nil];
+        scores = [plan->graph softMaxWithTensor:scores axis:4 name:nil];
         MPSGraphTensor *probs16 = cast_tensor(plan->graph, scores, MPSDataTypeFloat16);
-        MPSGraphTensor *context = [plan->graph matrixMultiplicationWithPrimaryTensor:probs16
-                                                                     secondaryTensor:attention_v
+        MPSGraphTensor *context5 = [plan->graph matrixMultiplicationWithPrimaryTensor:probs16
+                                                                     secondaryTensor:v_grouped
                                                                                 name:nil];
+        MPSGraphTensor *context = [plan->graph reshapeTensor:context5
+                                                   withShape:@[ @1, @(query_heads), @(sequence), @(head_dim) ]
+                                                        name:nil];
         context = cast_tensor(plan->graph, context, MPSDataTypeFloat16);
         context = [plan->graph transposeTensor:context permutation:@[ @0, @2, @1, @3 ] name:nil];
         context = [plan->graph reshapeTensor:context withShape:@[ @(sequence), @(q_width) ] name:nil];

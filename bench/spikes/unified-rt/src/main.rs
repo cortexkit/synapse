@@ -234,7 +234,7 @@ enum Shapes {
 
 // Package roots hash the model family and this graph-builder revision. Increment
 // GRAPH_REVISION whenever graph construction changes so older topologies are cache misses.
-const GRAPH_REVISION: u32 = 10;
+const GRAPH_REVISION: u32 = 11;
 const BUCKET_POLICY_VERSION: u32 = 2;
 
 fn stable_cache_hash(bytes: &[u8]) -> u64 {
