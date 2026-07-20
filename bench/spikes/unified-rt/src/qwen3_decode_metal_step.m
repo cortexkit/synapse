@@ -446,7 +446,8 @@ static void encode_rmsnorm(
     [encoder setBuffer:weight offset:0 atIndex:2];
     struct { uint32_t width; float epsilon; } config = { width, epsilon };
     [encoder setBytes:&config length:sizeof(config) atIndex:3];
-    [encoder dispatchThreads:grid_size(1) threadsPerThreadgroup:group_size(1)];
+    // A full simdgroup hides the fixed launch cost of the 1,024-element norm.
+    [encoder dispatchThreads:grid_size(32) threadsPerThreadgroup:group_size(32)];
     [encoder endEncoding];
 }
 
