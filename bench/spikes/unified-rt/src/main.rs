@@ -162,6 +162,9 @@ struct Args {
     /// Metal graph execution strategy. Explicit O0 compilation is the serving default.
     #[arg(long, value_enum, default_value_t = Execution::Explicit)]
     execution: Execution,
+    /// Qwen3 decode execution path. MPSGraph remains the default reference path.
+    #[arg(long, value_enum, default_value_t = DecodeBackend::Mpsgraph)]
+    decode_backend: DecodeBackend,
     /// Optional directory for one compiled MPSGraph package per batch/sequence shape.
     #[arg(long)]
     package_cache: Option<PathBuf>,
@@ -223,6 +226,12 @@ enum Precision {
 enum Execution {
     Explicit,
     Lazy,
+}
+
+#[derive(Copy, Clone, Eq, PartialEq, Debug, ValueEnum)]
+enum DecodeBackend {
+    Mpsgraph,
+    MetalStep,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug, ValueEnum, Serialize)]
@@ -949,6 +958,10 @@ fn main() -> Result<()> {
 fn run_decode_cli(args: &Args, started: Instant) -> Result<()> {
     let config = read_model_config(&args.model)?;
     if lfm2::detect_config(&config) {
+        ensure!(
+            matches!(args.decode_backend, DecodeBackend::Mpsgraph),
+            "--decode-backend metal-step currently supports Qwen3 only"
+        );
         return run_lfm2_decode_cli(args, started);
     }
     ensure!(
@@ -958,7 +971,6 @@ fn run_decode_cli(args: &Args, started: Instant) -> Result<()> {
 
     #[cfg(target_os = "macos")]
     {
-        use qwen3_decode::MetalDecoder;
         ensure!(
             matches!(args.device, DeviceArg::Metal),
             "Qwen3 decode requires --device metal on macOS"
@@ -967,15 +979,31 @@ fn run_decode_cli(args: &Args, started: Instant) -> Result<()> {
             matches!(args.dtype, Precision::F16),
             "Qwen3 Metal decode requires --dtype f16"
         );
-        ensure!(
-            !args.weight_quant.is_quantized(),
-            "quantized Qwen3 decode is currently CUDA-only"
-        );
         let model = qwen3::Model::load_with_quant(&args.model, args.dtype, args.weight_quant)?;
         let execution = MetalExecutionConfig::from_args(args, "qwen3-0.6b-decode")?;
-        let mut decoder =
-            MetalDecoder::new(&model, args.dtype, &execution, args.decode_cache_bucket)?;
-        run_qwen_decode_with_runtime(args, started, &model, &mut decoder)
+        match args.decode_backend {
+            DecodeBackend::Mpsgraph => {
+                use qwen3_decode::MetalDecoder;
+                ensure!(
+                    !args.weight_quant.is_quantized(),
+                    "quantized Qwen3 decode requires --decode-backend metal-step on Metal"
+                );
+                let mut decoder =
+                    MetalDecoder::new(&model, args.dtype, &execution, args.decode_cache_bucket)?;
+                run_qwen_decode_with_runtime(args, started, &model, &mut decoder)
+            }
+            DecodeBackend::MetalStep => {
+                use qwen3_decode::MetalStepDecoder;
+                let mut decoder = MetalStepDecoder::new(
+                    &model,
+                    args.dtype,
+                    &execution,
+                    args.decode_cache_bucket,
+                    args.weight_quant,
+                )?;
+                run_qwen_decode_with_runtime(args, started, &model, &mut decoder)
+            }
+        }
     }
 
     #[cfg(all(target_os = "linux", feature = "cuda"))]
@@ -5570,9 +5598,14 @@ mod tests {
         ];
         let default = Args::try_parse_from(base).expect("parse default serving arguments");
         assert_eq!(default.execution, Execution::Explicit);
+        assert_eq!(default.decode_backend, DecodeBackend::Mpsgraph);
         assert_eq!(default.shapes, Shapes::Bucketed);
         assert_eq!(default.bucket_policy, 1);
         assert_eq!(default.passes, 1);
+        let metal_step =
+            Args::try_parse_from(base.into_iter().chain(["--decode-backend", "metal-step"]))
+                .expect("parse Metal step decode backend");
+        assert_eq!(metal_step.decode_backend, DecodeBackend::MetalStep);
         let v2 = Args::try_parse_from(base.into_iter().chain(["--bucket-policy", "2"]))
             .expect("parse policy v2 override");
         assert_eq!(v2.bucket_policy, 2);

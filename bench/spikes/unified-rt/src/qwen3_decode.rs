@@ -567,7 +567,7 @@ mod metal {
     }
 
     pub(crate) struct MetalKvCache {
-        position: usize,
+        pub(crate) position: usize,
     }
 
     pub(crate) struct MetalDecoder<'a> {
@@ -756,6 +756,33 @@ mod metal {
                 step_calls: native.step_calls,
             }
         }
+
+        pub(crate) fn inspect_cache_bits(&self, layer: usize) -> Result<Vec<u16>> {
+            ensure!(
+                layer < self.model.layers.len(),
+                "KV cache layer {layer} out of range"
+            );
+            let elements = 2
+                * self.model.config.num_key_value_heads
+                * self.bucket
+                * self.model.config.head_dim;
+            let mut bits = vec![0u16; elements];
+            let status = unsafe {
+                synapse_qwen3_decode_cache_copy(
+                    self.raw.as_ptr(),
+                    layer as u64,
+                    bits.as_mut_ptr(),
+                    elements as u64,
+                )
+            };
+            if status != 0 {
+                bail!(
+                    "Qwen3 Metal cache inspection failed: {status}: {}",
+                    last_error()
+                );
+            }
+            Ok(bits)
+        }
     }
 
     impl DecodeKernel for MetalDecoder<'_> {
@@ -890,30 +917,8 @@ mod metal {
         }
 
         fn inspect_cache_layer(&self, _cache: &Self::Cache, layer: usize) -> Result<Vec<f32>> {
-            ensure!(
-                layer < self.model.layers.len(),
-                "KV cache layer {layer} out of range"
-            );
-            let elements = 2
-                * self.model.config.num_key_value_heads
-                * self.bucket
-                * self.model.config.head_dim;
-            let mut bits = vec![0u16; elements];
-            let status = unsafe {
-                synapse_qwen3_decode_cache_copy(
-                    self.raw.as_ptr(),
-                    layer as u64,
-                    bits.as_mut_ptr(),
-                    elements as u64,
-                )
-            };
-            if status != 0 {
-                bail!(
-                    "Qwen3 Metal cache inspection failed with status {status}: {}",
-                    last_error()
-                );
-            }
-            Ok(bits
+            Ok(self
+                .inspect_cache_bits(layer)?
                 .into_iter()
                 .map(half::f16::from_bits)
                 .map(f32::from)
@@ -1037,6 +1042,12 @@ mod metal {
         fn synapse_qwen3_decode_last_error() -> *const c_char;
     }
 }
+
+#[cfg(target_os = "macos")]
+#[path = "qwen3_decode_metal_step.rs"]
+mod metal_step;
+#[cfg(target_os = "macos")]
+pub(crate) use metal_step::MetalStepDecoder;
 
 #[cfg(all(target_os = "linux", feature = "cuda"))]
 mod cuda {
