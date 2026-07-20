@@ -2,16 +2,16 @@
 
 **Assessment date:** 2026-07-20  
 **Reference checkout:** `~/Work/OSS/leap-finetune`, `4dbf17b11542f6c167ac032d4b2dd0a3f8961542`  
-**Decision status:** environment and dense SFT/resume smoke passed; the physical ladder hit a hard GGUF-export blocker at step 2, so later GRPO/LoRA steps were not run.
+**Decision status:** environment, dense SFT/resume, independent dense GRPO/vLLM, and LoRA adapter-save smokes passed. The GGUF exporter remains blocked by a first-party tensor-mapping bug.
 
 ## Executive result
 
-The physical run confirms that the environment and dense SFT/resume path work on
-a Linux CUDA host. It does **not** confirm the train-to-serve path: the bundled
-GGUF converter fails on a standard LFM2-350M checkpoint before `llama-cli` can
-run. GRPO and LoRA were not run after that hard blocker, per the requested
-stop-at-first-blocker rule. Source review still supports the dense GRPO and
-custom-reward verdicts below, but they remain unmeasured.
+The physical runs confirm that the environment, dense SFT/resume path, dense
+GRPO with colocated vLLM, and LoRA adapter saving work on a Linux CUDA host. The
+train-to-serve path remains blocked: the bundled GGUF converter fails on a
+standard LFM2-350M checkpoint before `llama-cli` can run. GGUF is independent
+of GRPO and LoRA, so those two decision-critical paths were run after recording
+the exporter failure.
 
 The gatherer-tier **LFM2-8B-A1B cannot use GRPO in this checkout**. Although a
 `MOE_GRPO` defaults dictionary exists, the actual text GRPO runner rejects MoE
@@ -33,24 +33,25 @@ an RTX 4090 with 24,564 MiB. The final box used
 `pytorch/pytorch:2.7.1-cuda12.8-cudnn9-devel`; the leap environment itself
 resolved the pinned CUDA 13 stack.
 
-The ladder stopped at the GGUF exporter. Two earlier rentals on one host failed
-to leave the SSH proxy in a usable state and were destroyed; the final rental
-ran the environment and SFT successfully. Final labeled-instance destruction
-was verified with `vastai show instances-v1 --label leap-finetune-smoke`, which
-returned zero instances.
+The first rental run stopped at the GGUF exporter, while two earlier rentals on
+one host failed to leave the SSH proxy in a usable state and were destroyed. A
+second qualifying rental then ran the independent GRPO and LoRA paths. Final
+labeled-instance destruction was verified with `vastai show instances-v1
+--label leap-finetune-smoke`, which returned zero instances.
 
 | Step | Requested proof | Physical result | Wall time / peak VRAM |
 |---|---|---|---|
 | 0 | Driver gate and `uv sync` | **Passed**; FA2 usable | `uv sync` 50.73 s; driver gate passed |
 | 1 | Dense 350M SFT, checkpoint, falling loss, resume | **Passed**; checkpoint, optimizer/scheduler state, falling loss, and resume to step 30 | initial SFT 92.71 s / 3,964 MiB; resume 76.60 s / VRAM sample not retained |
 | 2 | F16/Q8_0 GGUF and `llama-cli` prompt | **Hard blocker**; bundled converter cannot map `model.layers.0.feed_forward.w1.weight` | exporter did not complete; `llama-cli` not reached |
-| 3 | 350M GRPO, custom reward, vLLM, finite update | Not run after step-2 blocker | Not measured |
-| 4 | 350M LoRA SFT and adapter export | Not run after step-2 blocker | Not measured |
+| 3 | 350M GRPO, custom reward, vLLM, finite update | **Passed**; reward flowed, finite metrics, nonzero policy gradients on steps 1–3 | 135.58 s / 7,723 MiB |
+| 4 | 350M LoRA SFT and adapter save | **Passed**; adapter config and safetensors written | 96.00 s / 1,803 MiB |
 
-Campaign spend was **$0.083** for the three rentals used by this task: $0.017
-storage charges for the two failed startup attempts and $0.066 for the final
-SFT host (GPU, storage, and 5.320 GB download charges). This is below the $6
-cap. The unrelated instances visible in the account invoice were not touched.
+Campaign spend is **$0.200** across the five rentals used by this task: $0.017
+for the two failed startup attempts, $0.073 for the first successful SFT/GGUF
+host, and $0.110 for the second GRPO/LoRA host (GPU, storage, and download
+charges). This remains below the $6 cap. The account invoice also contains
+unrelated instances that were not touched.
 
 The commands below remain the exact smoke recipe and include the deviations and
 measured outcomes from this run.
@@ -130,9 +131,12 @@ if torch.cuda.is_available():
 PY
 ```
 
-`uv sync` may spend most of its time resolving or downloading the pinned
-accelerator wheels, especially FlashAttention. If the FlashAttention wheel
-cannot be resolved, the README documents a deliberate fallback:
+The first successful rental resolved 284 packages and completed `uv sync` in
+50.73 s. The repeat rental, with an empty package cache, completed it in 66.07 s;
+there was no resolution or wheel-build failure. `uv sync` may spend most of its
+time resolving or downloading the pinned accelerator wheels, especially
+FlashAttention. If the FlashAttention wheel cannot be resolved, the README
+documents a deliberate fallback:
 
 ```bash
 uv sync --no-group flash-attn
@@ -541,9 +545,10 @@ the adapter into the base model first, then exporting the merged checkpoint.
 
 ## Capacity and timing expectations
 
-The following are the measurements retained from the final rental. Peak VRAM
-was sampled every 500 ms with `nvidia-smi`; the resume sampler file was not
-retrieved before destroying the host, so that cell is explicitly not reported.
+The following are the measurements retained from the two successful rentals.
+Peak VRAM was sampled every 500 ms with `nvidia-smi`; the resume sampler file
+was not retrieved before destroying the first host, so that cell is explicitly
+not reported.
 
 | Operation | Configuration | Wall time | Peak VRAM |
 |---|---|---:|---:|
@@ -551,8 +556,8 @@ retrieved before destroying the host, so that cell is explicitly not reported.
 | Dense SFT | LFM2-350M, 200 rows, 20 steps, BF16, full weights | 92.71 s | 3,964 MiB |
 | Resume | Same run, `latest`, continued to step 30 | 76.60 s | Not retained |
 | GGUF export | Resumed checkpoint, F16 first | Blocked | Not applicable |
-| GRPO / vLLM | Not run after GGUF blocker | Not measured | Not measured |
-| LoRA / adapter export | Not run after GGUF blocker | Not measured | Not measured |
+| GRPO / vLLM | LFM2-350M base, 4 steps, 2 generations, colocated | 135.58 s | 7,723 MiB |
+| LoRA / adapter save | LFM2-350M base, 20 steps, `DEFAULT_LORA` | 96.00 s | 1,803 MiB |
 
 The SFT sampler reported a 1 MiB idle baseline and a 3,964 MiB maximum. The
 training log reported loss falling from `6.8755846` to `0.2050134`; the resumed
@@ -560,14 +565,32 @@ checkpoint contained `optimizer.pt`, `scheduler.pt`, `rng_state.pth`, and
 `trainer_state.json` at global step 30. Ray emitted repeated metrics-exporter
 connection warnings, but they did not affect training or checkpointing.
 
+GRPO reached global step 4 and started the colocated vLLM path successfully at
+TRL `1.2.0` / vLLM `0.22.0`. The custom metric was
+`rewards/keyword_reward/mean`; steps 1–3 had reward mean `0.5`, reward std
+`0.7071`, and gradient norms `45.25`, `69.5`, and `50.25`, proving policy
+updates. Step 4 had all-positive completions and therefore zero reward
+variance, zero gradient, and zero loss; it was finite but not an additional
+policy update. The recorded GRPO loss history was
+`[-0.70595, 0.06616, 0.21946, 0.0]`, with no NaN or Inf.
+
+The LoRA run reached global step 20, wrote `adapter_config.json` and
+`adapter_model.safetensors` plus optimizer/scheduler state, and saved the
+merged `-lora_m-` model as a separate artifact. Its loss fell from `6.87558` to
+`4.95767`. Adapter GGUF export was intentionally skipped because the same
+first-party converter mapping blocker applies to the adapter train-to-serve
+path.
+
 For scale planning only, the unmeasured model-state floor remains approximately
 2 bytes per parameter for BF16 weights and 12 bytes per parameter for BF16
 weights + BF16 gradients + two FP32 Adam moments, before activations and
 workspaces. That gives approximately 0.7/2.4/5.2 GB of weights and
 4.2/14.4/31.2 GB of full-update state at 350M/1.2B/2.6B respectively. These
 are floors, not measured VRAM; the requested run did not execute at 1.2B+.
-Colocated GRPO would add vLLM execution and KV/cache memory, so its 350M VRAM
-and any 1.2B/2.6B extrapolation remain unmeasured after the exporter blocker.
+The measured colocated GRPO peak was 7,723 MiB with
+`vllm_gpu_memory_utilization: 0.2`, `num_generations: 2`, and
+`max_completion_length: 64`. Its 1.2B/2.6B extrapolation remains unmeasured;
+GGUF failure does not invalidate this independent GRPO result.
 
 ## Custom-reward seam verdict
 
@@ -731,5 +754,6 @@ contracts at the revision recorded above:
   Axolotl configs/templates.
 
 Claims requiring a GPU are marked passed only where the retained run evidence
-supports them. GGUF load, vLLM startup, reward metrics, and LoRA adapter export
-remain explicitly unmeasured because the ladder stopped at the exporter blocker.
+supports them. GGUF load remains explicitly unmeasured because the first-party
+exporter failed before producing a file; GRPO/vLLM and LoRA adapter-save evidence
+is recorded above.
