@@ -3,6 +3,7 @@
 use std::{
     env,
     path::PathBuf,
+    process::Command,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -10,13 +11,39 @@ use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
 use subc_client_rs::{CallOptions, ConsumerOptions, SubcConsumer};
 use subc_protocol::{BindIdentity, RouteTarget};
-use tokio::time::sleep;
+use tokio::time::{interval, sleep, MissedTickBehavior};
 
 const DEFAULT_SUBC: &str = "/Users/[owner]/.local/share/cortexkit/run/subc-connection.json";
 const DEFAULT_MODEL: &str = "gte-modernbert-base-f16";
-const DEFAULT_BATCHES: &[usize] = &[8, 16, 32, 64, 128, 256];
-const QUERY_SAMPLES: usize = 50;
+const DEFAULT_BATCHES: &[usize] = &[1, 2, 4, 8, 16, 32, 64, 128, 256];
+const DEFAULT_CLASSES: &[TextClass] = &[TextClass::Memory, TextClass::Chunk];
+const DEFAULT_REPETITIONS: usize = 3;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
+const ADMISSION_SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
+const MAX_AMBIENT_LOADAVG_1M: f64 = 8.0;
+
+#[derive(Clone, Copy, Debug)]
+enum TextClass {
+    Memory,
+    Chunk,
+}
+
+impl TextClass {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "memory" => Ok(Self::Memory),
+            "chunk" => Ok(Self::Chunk),
+            other => bail!("unknown text class {other}; expected memory or chunk"),
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Memory => "MEMORY",
+            Self::Chunk => "CHUNK",
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -29,9 +56,6 @@ async fn main() -> Result<()> {
         harness: "inline-embed-throughput".to_string(),
         session: format!("inline-embed-throughput-{}", std::process::id()),
     };
-    // Add a timestamp-plus-process nonce so each invocation measures actual
-    // inference instead of receiving a cached idempotent response for the same
-    // request key and digest.
     let nonce = format!(
         "{}-{}",
         SystemTime::now()
@@ -41,59 +65,84 @@ async fn main() -> Result<()> {
         std::process::id()
     );
 
-    let warmup = embedding_batch(&consumer, &identity, &args.model, 1, &nonce).await?;
+    let warmup_class = args.classes.first().copied().unwrap_or(TextClass::Memory);
+    let warmup = embedding_batch(
+        &consumer,
+        &identity,
+        &args.model,
+        1,
+        warmup_class,
+        &format!("{nonce}-warmup"),
+    )
+    .await?;
     ensure_response_vectors(&warmup, 1)?;
     ensure_response_ids(&warmup, 1)?;
 
-    let mut rows = Vec::with_capacity(args.batches.len());
-    for &batch_size in &args.batches {
-        let started = Instant::now();
-        let response =
-            embedding_batch(&consumer, &identity, &args.model, batch_size, &nonce).await?;
-        let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
-        let token_count = response_token_count(&response).max(batch_size as u64);
-        ensure_response_vectors(&response, batch_size)?;
-        ensure_response_ids(&response, batch_size)?;
-        rows.push(json!({
-            "batch": batch_size,
-            "tokens": token_count,
-            "elapsed_ms": elapsed_ms,
-            "ms_per_item": elapsed_ms / batch_size as f64,
-            "tokens_per_second": token_count as f64 / (elapsed_ms / 1_000.0),
-        }));
+    let mut cells = Vec::with_capacity(args.classes.len() * args.batches.len());
+    for &class in &args.classes {
+        for &batch_size in &args.batches {
+            let cell_loadavg_1m = loadavg_1m()?;
+            ensure!(
+                cell_loadavg_1m < MAX_AMBIENT_LOADAVG_1M,
+                "ambient loadavg-1m {cell_loadavg_1m:.2} exceeds the {MAX_AMBIENT_LOADAVG_1M:.1} sweep gate before {}/batch {batch_size}",
+                class.as_str()
+            );
+            let mut repetitions = Vec::with_capacity(args.repetitions);
+            for repetition in 0..args.repetitions {
+                let request_nonce = format!(
+                    "{nonce}-{}-{batch_size}-{repetition}",
+                    class.as_str().to_ascii_lowercase()
+                );
+                let started_at_ms = epoch_ms()?;
+                let started = Instant::now();
+                let (response, admission_samples) = timed_embedding_batch(
+                    &consumer,
+                    &identity,
+                    &args.model,
+                    batch_size,
+                    class,
+                    &request_nonce,
+                )
+                .await?;
+                let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
+                let finished_at_ms = epoch_ms()?;
+                let token_count = response_token_count(&response);
+                let submitted_token_count = response_submitted_token_count(&response);
+                ensure_response_vectors(&response, batch_size)?;
+                ensure_response_ids(&response, batch_size)?;
+                repetitions.push(json!({
+                    "repetition": repetition + 1,
+                    "started_at_ms": started_at_ms,
+                    "finished_at_ms": finished_at_ms,
+                    "batch": batch_size,
+                    "submitted_tokens": submitted_token_count,
+                    "effective_tokens": token_count,
+                    "elapsed_ms": elapsed_ms,
+                    "items_per_second": batch_size as f64 / (elapsed_ms / 1_000.0),
+                    "tokens_per_second": token_count as f64 / (elapsed_ms / 1_000.0),
+                    "admission": admission_summary(&admission_samples),
+                    "admission_samples": admission_samples,
+                }));
+            }
+            cells.push(aggregate_cell(
+                class,
+                batch_size,
+                cell_loadavg_1m,
+                repetitions,
+            )?);
+        }
     }
-
-    let query_warmup = query_embedding(&consumer, &identity, &args.model, &nonce).await?;
-    ensure_response_vectors(&query_warmup, 1)?;
-    let idle_query_samples_ms = query_samples(&consumer, &identity, &args.model, &nonce).await?;
-    let idle_query_p50_ms = percentile(&idle_query_samples_ms, 0.50);
-    let idle_query_p95_ms = percentile(&idle_query_samples_ms, 0.95);
-
-    let concurrent_query = if args.concurrent {
-        Some(
-            run_concurrent_batch_and_queries(
-                &consumer,
-                &identity,
-                &args.model,
-                &format!("{nonce}-concurrent"),
-            )
-            .await?,
-        )
-    } else {
-        None
-    };
 
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
             "model": args.model,
-            "concurrent": args.concurrent,
-            "warmup": "one embed.batch outside timing",
-            "rows": rows,
-            "embed_query_idle_p50_ms": idle_query_p50_ms,
-            "embed_query_idle_p95_ms": idle_query_p95_ms,
-            "query_samples": idle_query_samples_ms,
-            "concurrent": concurrent_query,
+            "input_type": "document",
+            "batches": args.batches,
+            "classes": args.classes.iter().map(|class| class.as_str()).collect::<Vec<_>>(),
+            "repetitions": args.repetitions,
+            "warmup": "one throwaway embed.batch outside timing",
+            "cells": cells,
         }))?
     );
     consumer.close().await;
@@ -104,7 +153,8 @@ struct Args {
     subc: PathBuf,
     model: String,
     batches: Vec<usize>,
-    concurrent: bool,
+    classes: Vec<TextClass>,
+    repetitions: usize,
 }
 
 impl Args {
@@ -114,7 +164,8 @@ impl Args {
             .unwrap_or_else(|| PathBuf::from(DEFAULT_SUBC));
         let mut model = DEFAULT_MODEL.to_string();
         let mut batches = DEFAULT_BATCHES.to_vec();
-        let mut concurrent = false;
+        let mut classes = DEFAULT_CLASSES.to_vec();
+        let mut repetitions = DEFAULT_REPETITIONS;
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--subc" => {
@@ -123,7 +174,6 @@ impl Args {
                 "--model" => {
                     model = args.next().context("--model requires a model id")?;
                 }
-                "--concurrent" => concurrent = true,
                 "--batches" => {
                     batches = args
                         .next()
@@ -132,9 +182,24 @@ impl Args {
                         .map(|value| value.parse::<usize>().context("invalid batch size"))
                         .collect::<Result<Vec<_>>>()?;
                 }
+                "--classes" => {
+                    classes = args
+                        .next()
+                        .context("--classes requires comma-separated classes")?
+                        .split(',')
+                        .map(TextClass::parse)
+                        .collect::<Result<Vec<_>>>()?;
+                }
+                "--repetitions" => {
+                    repetitions = args
+                        .next()
+                        .context("--repetitions requires a positive integer")?
+                        .parse()
+                        .context("invalid repetitions")?;
+                }
                 "-h" | "--help" => {
                     println!(
-                        "Usage: inline_embed_throughput [--subc PATH] [--model ID] [--batches 8,16,32,64,128,256] [--concurrent]"
+                        "Usage: inline_embed_throughput [--subc PATH] [--model ID] [--batches 1,2,4,8,16,32,64,128,256] [--classes memory,chunk] [--repetitions 3]"
                     );
                     std::process::exit(0);
                 }
@@ -142,11 +207,14 @@ impl Args {
             }
         }
         ensure!(!batches.is_empty() && batches.iter().all(|&size| size > 0));
+        ensure!(!classes.is_empty());
+        ensure!(repetitions > 0);
         Ok(Self {
             subc,
             model,
             batches,
-            concurrent,
+            classes,
+            repetitions,
         })
     }
 }
@@ -156,10 +224,16 @@ async fn start_embedding_batch(
     identity: &BindIdentity,
     model: &str,
     batch_size: usize,
+    class: TextClass,
     nonce: &str,
 ) -> Result<Value> {
     let items = (0..batch_size)
-        .map(|index| json!({ "id": format!("item-{index}"), "text": fixture_text(index, nonce) }))
+        .map(|index| {
+            json!({
+                "id": format!("item-{index}"),
+                "text": fixture_text(index, class, nonce),
+            })
+        })
         .collect::<Vec<_>>();
     call(
         consumer,
@@ -167,6 +241,7 @@ async fn start_embedding_batch(
         "embed.batch",
         json!({
             "model": model,
+            "input_type": "document",
             "items": items,
             "accept_declared": true,
             "request_key": format!("inline-throughput-{nonce}-{batch_size}"),
@@ -180,9 +255,11 @@ async fn embedding_batch(
     identity: &BindIdentity,
     model: &str,
     batch_size: usize,
+    class: TextClass,
     nonce: &str,
 ) -> Result<Value> {
-    let response = start_embedding_batch(consumer, identity, model, batch_size, nonce).await?;
+    let response =
+        start_embedding_batch(consumer, identity, model, batch_size, class, nonce).await?;
     if let Some(job_id) = response["result"]["job_id"].as_str() {
         poll_job(consumer, identity, job_id).await
     } else {
@@ -190,76 +267,28 @@ async fn embedding_batch(
     }
 }
 
-async fn query_embedding(
+async fn timed_embedding_batch(
     consumer: &SubcConsumer,
     identity: &BindIdentity,
     model: &str,
+    batch_size: usize,
+    class: TextClass,
     nonce: &str,
-) -> Result<Value> {
-    call(
-        consumer,
-        identity,
-        "embed.query",
-        json!({
-            "model": model,
-            "id": "query",
-            "text": fixture_text(0, nonce),
-            "accept_declared": true,
-        }),
-    )
-    .await
-}
-
-async fn query_samples(
-    consumer: &SubcConsumer,
-    identity: &BindIdentity,
-    model: &str,
-    nonce: &str,
-) -> Result<Vec<f64>> {
-    let mut samples = Vec::with_capacity(QUERY_SAMPLES);
-    for _ in 0..QUERY_SAMPLES {
-        let started = Instant::now();
-        let response = query_embedding(consumer, identity, model, nonce).await?;
-        ensure_response_vectors(&response, 1)?;
-        samples.push(started.elapsed().as_secs_f64() * 1_000.0);
-    }
-    samples.sort_by(f64::total_cmp);
-    Ok(samples)
-}
-
-fn percentile(samples: &[f64], quantile: f64) -> f64 {
-    let index = ((samples.len() as f64 * quantile).ceil() as usize)
-        .saturating_sub(1)
-        .min(samples.len().saturating_sub(1));
-    samples[index]
-}
-
-async fn run_concurrent_batch_and_queries(
-    consumer: &SubcConsumer,
-    identity: &BindIdentity,
-    model: &str,
-    nonce: &str,
-) -> Result<Value> {
-    let accepted = start_embedding_batch(consumer, identity, model, 256, nonce).await?;
-    let job_id = accepted["result"]["job_id"]
-        .as_str()
-        .context("--concurrent requires batch=256 to be job-shaped")?
-        .to_string();
-    let (batch, query) = tokio::join!(
-        poll_job(consumer, identity, &job_id),
-        query_samples(consumer, identity, model, nonce),
-    );
-    let batch = batch?;
-    let query = query?;
-    ensure_response_vectors(&batch, 256)?;
-    ensure_response_ids(&batch, 256)?;
-    Ok(json!({
-        "batch": 256,
-        "query_p50_ms": percentile(&query, 0.50),
-        "query_p95_ms": percentile(&query, 0.95),
-        "query_samples": query,
-        "vectors": batch["result"]["vectors"].as_array().map(Vec::len),
-    }))
+) -> Result<(Value, Vec<Value>)> {
+    let mut admission_samples = Vec::new();
+    let mut sampler = interval(ADMISSION_SAMPLE_INTERVAL);
+    sampler.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let request = embedding_batch(consumer, identity, model, batch_size, class, nonce);
+    tokio::pin!(request);
+    let response = loop {
+        tokio::select! {
+            response = &mut request => break response?,
+            _ = sampler.tick() => {
+                admission_samples.push(call(consumer, identity, "admission.status", json!({})).await?);
+            }
+        }
+    };
+    Ok((response, admission_samples))
 }
 
 async fn poll_job(consumer: &SubcConsumer, identity: &BindIdentity, job_id: &str) -> Result<Value> {
@@ -334,16 +363,193 @@ async fn call(
         .with_context(|| format!("call {method}"))?;
     let value: Value = serde_json::from_slice(&response).context("decode Synapse response")?;
     if value["result"]["error"].is_object() {
-        bail!("{method} returned an error: {value}")
+        bail!("{method} returned an error: {value}");
     }
     Ok(value)
 }
 
-fn fixture_text(index: usize, nonce: &str) -> String {
-    (0..45)
-        .map(|word| format!("retrieval fixture item {index} token {word} run {nonce}"))
+fn aggregate_cell(
+    class: TextClass,
+    batch: usize,
+    loadavg_1m: f64,
+    repetitions: Vec<Value>,
+) -> Result<Value> {
+    let elapsed = repetitions
+        .iter()
+        .map(|row| {
+            row["elapsed_ms"]
+                .as_f64()
+                .context("repetition omitted elapsed_ms")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let items_per_second = repetitions
+        .iter()
+        .map(|row| {
+            row["items_per_second"]
+                .as_f64()
+                .context("repetition omitted items_per_second")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let tokens_per_second = repetitions
+        .iter()
+        .map(|row| {
+            row["tokens_per_second"]
+                .as_f64()
+                .context("repetition omitted tokens_per_second")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let effective_tokens = repetitions
+        .iter()
+        .map(|row| {
+            row["effective_tokens"]
+                .as_u64()
+                .context("repetition omitted tokens")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let submitted_tokens = repetitions
+        .iter()
+        .map(|row| {
+            row["submitted_tokens"]
+                .as_u64()
+                .context("repetition omitted submitted_tokens")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let all_samples = repetitions
+        .iter()
+        .flat_map(|row| {
+            row["admission_samples"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .cloned()
+        })
+        .collect::<Vec<_>>();
+    let latency_p50_ms = percentile(&elapsed, 0.50);
+    let latency_p95_ms = percentile(&elapsed, 0.95);
+    Ok(json!({
+        "class": class.as_str(),
+        "batch": batch,
+        "loadavg_1m": loadavg_1m,
+        "effective_tokens_median": median_u64(&effective_tokens),
+        "submitted_tokens_median": median_u64(&submitted_tokens),
+        "elapsed_min_ms": elapsed.iter().copied().fold(f64::INFINITY, f64::min),
+        "elapsed_median_ms": median(&elapsed),
+        "elapsed_max_ms": elapsed.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        "items_per_second_min": items_per_second.iter().copied().fold(f64::INFINITY, f64::min),
+        "items_per_second_median": median(&items_per_second),
+        "items_per_second_max": items_per_second.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        "tokens_per_second_min": tokens_per_second.iter().copied().fold(f64::INFINITY, f64::min),
+        "tokens_per_second_median": median(&tokens_per_second),
+        "tokens_per_second_max": tokens_per_second.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        "single_item_latency_p50_ms": if batch == 1 { Some(latency_p50_ms) } else { None::<f64> },
+        "single_item_latency_p95_ms": if batch == 1 { Some(latency_p95_ms) } else { None::<f64> },
+        "admission": admission_summary(&all_samples),
+        "repetitions": repetitions,
+    }))
+}
+
+fn admission_summary(samples: &[Value]) -> Value {
+    let waiters = samples
+        .iter()
+        .filter_map(|sample| sample["result"]["execution_waiters"].as_u64())
+        .collect::<Vec<_>>();
+    let in_flight = samples
+        .iter()
+        .filter_map(|sample| sample["result"]["inline_in_flight_executions"].as_u64())
+        .collect::<Vec<_>>();
+    let acquire_p50 = samples
+        .iter()
+        .filter_map(|sample| sample["result"]["execution_wait_p50_ms"].as_f64())
+        .collect::<Vec<_>>();
+    let acquire_p95 = samples
+        .iter()
+        .filter_map(|sample| sample["result"]["execution_wait_p95_ms"].as_f64())
+        .collect::<Vec<_>>();
+    json!({
+        "samples": samples.len(),
+        "execution_waiters_max": waiters.iter().copied().max().unwrap_or(0),
+        "inline_in_flight_executions_max": in_flight.iter().copied().max().unwrap_or(0),
+        "acquire_wait_p50_ms_p95": percentile(&acquire_p50, 0.95),
+        "acquire_wait_p95_ms_p95": percentile(&acquire_p95, 0.95),
+        "acquire_wait_p50_ms_max": acquire_p50.iter().copied().fold(0.0, f64::max),
+        "acquire_wait_p95_ms_max": acquire_p95.iter().copied().fold(0.0, f64::max),
+    })
+}
+
+fn percentile(samples: &[f64], quantile: f64) -> f64 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let index = ((sorted.len() as f64 * quantile).ceil() as usize)
+        .saturating_sub(1)
+        .min(sorted.len() - 1);
+    sorted[index]
+}
+
+fn median(samples: &[f64]) -> f64 {
+    percentile(samples, 0.50)
+}
+
+fn median_u64(samples: &[u64]) -> u64 {
+    if samples.is_empty() {
+        return 0;
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    sorted[(sorted.len() - 1) / 2]
+}
+
+fn fixture_text(index: usize, class: TextClass, nonce: &str) -> String {
+    const PROSE: &[&str] = &[
+        "The archive team records each decision beside the evidence that justified it, so later readers can distinguish a stable rule from a temporary workaround.",
+        "A useful memory names the actors, the constraint, and the consequence without pretending that an uncertain observation is a measured fact.",
+        "During review, engineers compare neighboring reports and preserve the smallest reproducible example because concise context makes future retrieval reliable.",
+        "The service accepts ordinary prose, follows the request through admission, and returns an envelope whose fingerprint identifies the exact serving lane.",
+        "When a queue is quiet, a caller can attribute latency to the selected engine rather than to another consumer competing for the same execution permit.",
+        "Operators keep the original wording of an incident, then add a short synthesis that explains what changed and which assumptions remain open.",
+        "A durable record links measurements to the machine profile, model artifact, and software generation so that comparisons do not mix incompatible runs.",
+        "Small passages describe decisions, observations, and next actions in a deliberately plain style that resembles the notes a production team would actually store.",
+    ];
+    let repetitions = match class {
+        TextClass::Memory => 4,
+        TextClass::Chunk => 120,
+    };
+    let mut text = (0..repetitions)
+        .map(|part| {
+            format!(
+                "{} Passage {} belongs to item {}.",
+                PROSE[part % PROSE.len()],
+                part + 1,
+                index
+            )
+        })
         .collect::<Vec<_>>()
-        .join(" ")
+        .join(" ");
+    text.push_str(&format!(" Run nonce {nonce}."));
+    text
+}
+
+fn loadavg_1m() -> Result<f64> {
+    let output = Command::new("sysctl")
+        .args(["-n", "vm.loadavg"])
+        .output()
+        .context("read one-minute load average")?;
+    ensure!(output.status.success(), "sysctl vm.loadavg failed");
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.split(|character: char| !(character.is_ascii_digit() || character == '.'))
+        .find(|value| !value.is_empty())
+        .context("sysctl vm.loadavg omitted one-minute value")?
+        .parse()
+        .context("parse one-minute load average")
+}
+
+fn epoch_ms() -> Result<u128> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("read wall clock")?
+        .as_millis())
 }
 
 fn response_token_count(response: &Value) -> u64 {
@@ -351,6 +557,18 @@ fn response_token_count(response: &Value) -> u64 {
         .as_array()
         .map(|counts| counts.iter().filter_map(Value::as_u64).sum())
         .unwrap_or(0)
+}
+
+fn response_submitted_token_count(response: &Value) -> u64 {
+    response["result"]["truncation_disclosures"]
+        .as_array()
+        .map(|disclosures| {
+            disclosures
+                .iter()
+                .filter_map(|disclosure| disclosure["submitted_tokens"].as_u64())
+                .sum()
+        })
+        .unwrap_or_else(|| response_token_count(response))
 }
 
 fn ensure_response_vectors(response: &Value, expected: usize) -> Result<()> {
