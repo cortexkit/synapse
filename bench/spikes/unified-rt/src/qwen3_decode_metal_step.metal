@@ -49,6 +49,22 @@ struct AttentionConfig {
     uint position;
 };
 
+inline float matrix_dot_q8_chunk(
+    const device half *input,
+    const device uchar *q8,
+    uint row_start,
+    uint block_start,
+    uint lane_start
+) {
+    const device half *scale = (const device half *)(q8 +
+        (row_start + block_start) / Q8_BLOCK_ELEMENTS * Q8_BLOCK_BYTES);
+    const device char *values = (const device char *)((const device uchar *)scale + 2);
+    half4 input_values = *(const device half4 *)(input + block_start + lane_start);
+    char4 quant_values = *(const device char4 *)(values + lane_start);
+    float4 products = float4(input_values) * float4(quant_values) * (float)scale[0];
+    return (float)products[0] + (float)products[1] + (float)products[2] + (float)products[3];
+}
+
 inline float matrix_dot_q8_simd(
     const device half *input,
     const device uchar *q8,
@@ -57,46 +73,34 @@ inline float matrix_dot_q8_simd(
     uint lane
 ) {
     float partial = 0.0f;
-    uint row_start = row * input_width;
-    uint block_count = input_width / Q8_BLOCK_ELEMENTS;
-    uint block = 0;
-
-    // Four block addresses are independent, so unroll them without changing
-    // the per-lane accumulation order. This keeps the one-simdgroup-per-row
-    // reduction while giving the compiler more weight-load latency to hide.
-    for (; block + 4 <= block_count; block += 4) {
-        uint block0 = block * Q8_BLOCK_ELEMENTS;
-        uint block1 = block0 + Q8_BLOCK_ELEMENTS;
-        uint block2 = block1 + Q8_BLOCK_ELEMENTS;
-        uint block3 = block2 + Q8_BLOCK_ELEMENTS;
-        const device half *scale0 = (const device half *)(q8 +
-            (row_start + block0) / Q8_BLOCK_ELEMENTS * Q8_BLOCK_BYTES);
-        const device half *scale1 = (const device half *)(q8 +
-            (row_start + block1) / Q8_BLOCK_ELEMENTS * Q8_BLOCK_BYTES);
-        const device half *scale2 = (const device half *)(q8 +
-            (row_start + block2) / Q8_BLOCK_ELEMENTS * Q8_BLOCK_BYTES);
-        const device half *scale3 = (const device half *)(q8 +
-            (row_start + block3) / Q8_BLOCK_ELEMENTS * Q8_BLOCK_BYTES);
-        const device char *value0 = (const device char *)((const device uchar *)scale0 + 2);
-        const device char *value1 = (const device char *)((const device uchar *)scale1 + 2);
-        const device char *value2 = (const device char *)((const device uchar *)scale2 + 2);
-        const device char *value3 = (const device char *)((const device uchar *)scale3 + 2);
-        float dequantized0 = (float)scale0[0] * (float)value0[lane];
-        float dequantized1 = (float)scale1[0] * (float)value1[lane];
-        float dequantized2 = (float)scale2[0] * (float)value2[lane];
-        float dequantized3 = (float)scale3[0] * (float)value3[lane];
-        partial += (float)input[block0 + lane] * dequantized0;
-        partial += (float)input[block1 + lane] * dequantized1;
-        partial += (float)input[block2 + lane] * dequantized2;
-        partial += (float)input[block3 + lane] * dequantized3;
-    }
-    for (; block < block_count; ++block) {
-        uint block_start = block * Q8_BLOCK_ELEMENTS;
-        const device half *scale_ptr = (const device half *)(q8 +
-            (row_start + block_start) / Q8_BLOCK_ELEMENTS * Q8_BLOCK_BYTES);
-        const device char *value_ptr = (const device char *)((const device uchar *)scale_ptr + 2);
-        float dequantized = (float)scale_ptr[0] * (float)value_ptr[lane];
-        partial += (float)input[block_start + lane] * dequantized;
+    // Eight lanes each consume a contiguous char4/half4 slice. The remaining
+    // lanes stay active with zero partials so simd_sum remains well-defined.
+    if (lane < 8) {
+        uint row_start = row * input_width;
+        uint lane_start = lane * 4;
+        uint block_count = input_width / Q8_BLOCK_ELEMENTS;
+        uint block = 0;
+        // Four block addresses remain independent, while each lane now issues
+        // wider aligned loads from its block slice.
+        for (; block + 4 <= block_count; block += 4) {
+            uint block0 = block * Q8_BLOCK_ELEMENTS;
+            uint block1 = block0 + Q8_BLOCK_ELEMENTS;
+            uint block2 = block1 + Q8_BLOCK_ELEMENTS;
+            uint block3 = block2 + Q8_BLOCK_ELEMENTS;
+            partial += matrix_dot_q8_chunk(input, q8, row_start, block0, lane_start);
+            partial += matrix_dot_q8_chunk(input, q8, row_start, block1, lane_start);
+            partial += matrix_dot_q8_chunk(input, q8, row_start, block2, lane_start);
+            partial += matrix_dot_q8_chunk(input, q8, row_start, block3, lane_start);
+        }
+        for (; block < block_count; ++block) {
+            partial += matrix_dot_q8_chunk(
+                input,
+                q8,
+                row_start,
+                block * Q8_BLOCK_ELEMENTS,
+                lane_start
+            );
+        }
     }
     return simd_sum(partial);
 }

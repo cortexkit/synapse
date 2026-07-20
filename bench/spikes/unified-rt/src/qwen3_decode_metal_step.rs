@@ -7,7 +7,9 @@ use std::time::Instant;
 
 use anyhow::{bail, ensure, Context, Result};
 
-use super::{DecodeKernel, DecodeRuntime, DecodeStageTimings, MetalDecoder, Model};
+use super::{
+    DecodeKernel, DecodeKernelTimings, DecodeRuntime, DecodeStageTimings, MetalDecoder, Model,
+};
 use crate::quant::WeightQuantization;
 use crate::{encode_f16_bits, Execution, MetalExecutionConfig, Precision};
 
@@ -40,6 +42,16 @@ struct NativeTimings {
     execute_wall_s: f64,
     logits_readback_wall_s: f64,
     kv_update_wall_s: f64,
+    kernel_rmsnorm_s: f64,
+    kernel_qkv_matvec_s: f64,
+    kernel_qk_norm_rope_s: f64,
+    kernel_attention_s: f64,
+    kernel_o_proj_s: f64,
+    kernel_residual_rmsnorm_s: f64,
+    kernel_down_proj_s: f64,
+    kernel_gate_up_swiglu_s: f64,
+    kernel_lm_head_s: f64,
+    kernel_samples: u64,
     step_calls: u64,
 }
 
@@ -248,6 +260,18 @@ impl<'a> MetalStepDecoder<'a> {
             execute_wall_s: prefill.execute_wall_s + native.execute_wall_s,
             logits_readback_wall_s: prefill.logits_readback_wall_s + native.logits_readback_wall_s,
             kv_update_wall_s: prefill.kv_update_wall_s + native.kv_update_wall_s,
+            kernel_gpu: DecodeKernelTimings {
+                rmsnorm_s: native.kernel_rmsnorm_s,
+                qkv_matvec_s: native.kernel_qkv_matvec_s,
+                qk_norm_rope_s: native.kernel_qk_norm_rope_s,
+                attention_s: native.kernel_attention_s,
+                o_proj_s: native.kernel_o_proj_s,
+                residual_rmsnorm_s: native.kernel_residual_rmsnorm_s,
+                down_proj_s: native.kernel_down_proj_s,
+                gate_up_swiglu_s: native.kernel_gate_up_swiglu_s,
+                lm_head_s: native.kernel_lm_head_s,
+                samples: native.kernel_samples,
+            },
             prefill_calls: prefill.prefill_calls,
             step_calls: native.step_calls,
         }

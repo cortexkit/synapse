@@ -23,6 +23,39 @@ the same layer/concatenated-KV interface as the MPSGraph path, so pause, splice,
 token taps, and addressable weight regions remain host-side protocols rather
 than backend-specific behavior.
 
+## Wave 3 kernel attribution
+
+The step has an opt-in attribution mode controlled by
+`SYNAPSE_METAL_STEP_PROFILE=1`. In that mode each kernel invocation is encoded
+in its own command buffer, waited to completion, and attributed from
+`GPUStartTime`/`GPUEndTime`. This is deliberately a profiling mode, not a
+throughput mode: the extra command-buffer synchronization makes its wall time
+invalid for the headline cells, while the GPU spans identify where the normal
+single-command-buffer step spends time.
+
+The decode result JSON exposes aggregate seconds in
+`decode_stages.kernel_gpu` (and `prefill_stages.kernel_gpu` remains zero for the
+custom step). The fields are `rmsnorm_s`, `qkv_matvec_s`, `qk_norm_rope_s`,
+`attention_s`, `o_proj_s`, `residual_rmsnorm_s`, `down_proj_s`,
+`gate_up_swiglu_s`, and `lm_head_s`; `samples` counts command buffers with
+valid GPU timestamps. Divide each field by `decode_stages.step_calls` and
+multiply by 1,000 for the per-token attribution table. A full step has 226
+profiled command buffers (eight layer kernels x 28 layers plus final norm and
+LM head), so `samples` should be close to `226 * step_calls`.
+
+Example, with a short single-prompt profile:
+
+```text
+SYNAPSE_METAL_STEP_PROFILE=1 \\
+  DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \\
+  target/release/spike-unified-rt ... --decode-backend metal-step --limit 1
+```
+
+Keep this profile separate from the locked-M1 timing cells. It is also suitable
+for a synthetic 512-position prompt: compare the attention field at a short
+prompt and at position 511 to make the context-growth curve explicit before
+choosing an attention or matvec optimization.
+
 ## Kernel list
 
 The build script compiles `src/qwen3_decode_metal_step.metal` with `xcrun metal`
@@ -53,9 +86,10 @@ The same matvec kernels select either resident f16 weights or GGUF-compatible
 Q8_0 blocks. F16 rows use one lane per output row, with two adjacent half4
 loads unrolled while the f32 accumulator remains serial. Q8_0 uses the existing
 34-byte layout: little-endian f16 scale followed by 32 signed int8 values. Q8_0
-rows use one simdgroup per output row, loading one quant from each 32-element
-block per lane; four block iterations are unrolled without changing per-lane
-accumulation order. Dequantization occurs inside the dot product and no
+rows use one simdgroup per output row; eight lanes each issue an aligned char4
+load for a disjoint slice of every block, and four block iterations are
+unrolled. The Q8 lane grouping and reduction are intentionally subject to the
+existing depth gate. Dequantization occurs inside the dot product and no
 dequantized matrix is materialized.
 
 ## Correctness gate transcripts
@@ -204,3 +238,20 @@ A fresh llama.cpp control was not available on the locked host: neither
 MANIFEST was present under `[bench-user-home]/bench-tools`. The historical Q8_0
 control remains 190.36--203.45 tok/s from `DECODE-WAVE1.md`; it is not relabeled
 as a fresh wave-1 measurement.
+
+## Wave 3 progression log
+
+Wave 3 adds the measurement seam before making a headline claim. The profiler
+is opt-in and does not alter the normal command-buffer path when the environment
+variable is absent. The char4 Q8 candidate changes only the per-simdgroup work
+partition; it must use the existing fresh Q8 exactness/depth gate before any
+throughput number is reported.
+
+| Change | f16 gate | Q8 gate | Locked-M1 result | Decision |
+| --- | --- | --- | --- | --- |
+| Per-kernel `GPUStartTime`/`GPUEndTime` attribution mode | required; not run in this checkout | required; not run in this checkout | pending profiler table | Measurement seam kept; profile wall excluded from headline cells |
+| Q8_0 char4 block slices, four-block unroll retained | required; not run in this checkout | pending fresh 10/20 exact + median depth 59.0 | pending | Candidate only; no throughput claim until the depth gate passes |
+
+No locked-M1 wave-3 throughput or per-kernel table is claimed by this checkout;
+the next measurement pass should run the profiler first, record its table, then
+apply or revert the Q8 candidate based on the hard quality gate.
