@@ -148,23 +148,26 @@ __global__ void decode_attention(
     int groups = query_heads / kv_heads;
     int kv_head = query_head / groups;
     extern __shared__ float scores[];
-    float maximum = -FLT_MAX;
-    for (int key = threadIdx.x; key < sequence; key += blockDim.x) {
-        float score = 0.0f;
-        int query_base = query_head * head_dim;
-        int key_base = (key * kv_heads + kv_head) * head_dim;
-        for (int dimension = 0; dimension < head_dim; ++dimension) {
-            score += query[query_base + dimension] * key_cache[key_base + dimension];
-        }
-        score /= sqrtf(static_cast<float>(head_dim));
-        scores[key] = score;
-        maximum = fmaxf(maximum, score);
-    }
-    maximum = warp_max(maximum);
-    __shared__ float reductions[32];
     int lane = threadIdx.x & 31;
     int warp = threadIdx.x >> 5;
     int warps = blockDim.x >> 5;
+    int query_base = query_head * head_dim;
+    float inverse_scale = rsqrtf(static_cast<float>(head_dim));
+    float maximum = -FLT_MAX;
+    for (int key = warp; key < sequence; key += warps) {
+        float partial = 0.0f;
+        int key_base = (key * kv_heads + kv_head) * head_dim;
+        for (int dimension = lane; dimension < head_dim; dimension += 32) {
+            partial += query[query_base + dimension] * key_cache[key_base + dimension];
+        }
+        float score = warp_sum(partial) * inverse_scale;
+        if (lane == 0) {
+            scores[key] = score;
+            maximum = fmaxf(maximum, score);
+        }
+    }
+    maximum = warp_max(maximum);
+    __shared__ float reductions[32];
     if (lane == 0) reductions[warp] = maximum;
     __syncthreads();
     if (warp == 0) {
@@ -213,11 +216,88 @@ __global__ void decode_add_residual(
     if (index < count) output[index] = update[index] + residual[index];
 }
 
+__global__ void decode_add_residual_rms_norm(
+    const float *update,
+    const float *residual,
+    const float *weight,
+    float *output,
+    float *norm_output,
+    int width,
+    float epsilon
+) {
+    float square = 0.0f;
+    for (int column = threadIdx.x; column < width; column += blockDim.x) {
+        float value = update[column] + residual[column];
+        output[column] = value;
+        square += value * value;
+    }
+    square = warp_sum(square);
+    __shared__ float reductions[32];
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int warps = blockDim.x >> 5;
+    if (lane == 0) reductions[warp] = square;
+    __syncthreads();
+    if (warp == 0) {
+        float sum = lane < warps ? reductions[lane] : 0.0f;
+        sum = warp_sum(sum);
+        if (lane == 0) reductions[0] = rsqrtf(sum / width + epsilon);
+    }
+    __syncthreads();
+    float inverse = reductions[0];
+    for (int column = threadIdx.x; column < width; column += blockDim.x) {
+        norm_output[column] = output[column] * inverse * weight[column];
+    }
+}
+
 __global__ void decode_swiglu(const float *gate, const float *up, float *output, int count) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
     if (index >= count) return;
     float value = gate[index];
     output[index] = value / (1.0f + expf(-value)) * up[index];
+}
+
+__global__ void decode_fused_gate_up_swiglu_q8_0(
+    const uint8_t *gate_weights,
+    const uint8_t *up_weights,
+    const float *input,
+    float *output,
+    int rows,
+    int columns
+) {
+    int row = blockIdx.x;
+    if (row >= rows) return;
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int warps = blockDim.x >> 5;
+    int blocks_per_row = columns / Q8_0_BLOCK_ELEMENTS;
+    float gate_partial = 0.0f;
+    float up_partial = 0.0f;
+    for (int column_block = warp; column_block < blocks_per_row; column_block += warps) {
+        size_t offset = (static_cast<size_t>(row) * blocks_per_row + column_block) * Q8_0_BLOCK_BYTES;
+        const uint8_t *gate_block = gate_weights + offset;
+        const uint8_t *up_block = up_weights + offset;
+        half gate_scale = *reinterpret_cast<const half *>(gate_block);
+        half up_scale = *reinterpret_cast<const half *>(up_block);
+        int8_t gate_q = reinterpret_cast<const int8_t *>(gate_block + sizeof(half))[lane];
+        int8_t up_q = reinterpret_cast<const int8_t *>(up_block + sizeof(half))[lane];
+        float in = input[column_block * Q8_0_BLOCK_ELEMENTS + lane];
+        gate_partial += __half2float(gate_scale) * static_cast<float>(gate_q) * in;
+        up_partial += __half2float(up_scale) * static_cast<float>(up_q) * in;
+    }
+    gate_partial = warp_sum(gate_partial);
+    up_partial = warp_sum(up_partial);
+    __shared__ float gate_sums[32];
+    __shared__ float up_sums[32];
+    if (lane == 0) { gate_sums[warp] = gate_partial; up_sums[warp] = up_partial; }
+    __syncthreads();
+    if (warp == 0) {
+        float g = lane < warps ? gate_sums[lane] : 0.0f;
+        float u = lane < warps ? up_sums[lane] : 0.0f;
+        g = warp_sum(g);
+        u = warp_sum(u);
+        if (lane == 0) output[row] = (g / (1.0f + expf(-g))) * u;
+    }
 }
 
 struct Qwen3DecodeContext {
@@ -351,8 +431,11 @@ struct Qwen3DecodeContext {
             cudaMemcpyHostToDevice,
             stream
         ));
-        for (DecodeLayer &layer : layers) {
-            decode_rms_norm<<<1, threads, 0, stream>>>(x0.pointer, layer.input_norm.pointer, normed.pointer, hidden, epsilon);
+        decode_rms_norm<<<1, threads, 0, stream>>>(
+            x0.pointer, layers.front().input_norm.pointer, normed.pointer, hidden, epsilon
+        );
+        for (size_t layer_index = 0; layer_index < layers.size(); ++layer_index) {
+            DecodeLayer &layer = layers[layer_index];
             matvec(layer.q_weight, normed.pointer, q_raw.pointer, query_width, hidden);
             matvec(layer.k_weight, normed.pointer, k_raw.pointer, kv_width, hidden);
             matvec(layer.v_weight, normed.pointer, layer.value_cache.pointer + static_cast<size_t>(token_position) * kv_width, kv_width, hidden);
@@ -375,26 +458,59 @@ struct Qwen3DecodeContext {
                 head_dim
             );
             matvec(layer.o_weight, attention.pointer, projected.pointer, hidden, query_width);
-            decode_add_residual<<<(hidden + threads - 1) / threads, threads, 0, stream>>>(
-                projected.pointer, x0.pointer, x1.pointer, hidden
+            decode_add_residual_rms_norm<<<1, threads, 0, stream>>>(
+                projected.pointer,
+                x0.pointer,
+                layer.post_attention_norm.pointer,
+                x1.pointer,
+                normed.pointer,
+                hidden,
+                epsilon
             );
-            decode_rms_norm<<<1, threads, 0, stream>>>(
-                x1.pointer, layer.post_attention_norm.pointer, normed.pointer, hidden, epsilon
-            );
-            matvec(layer.gate_weight, normed.pointer, gate.pointer, intermediate, hidden);
-            matvec(layer.up_weight, normed.pointer, up.pointer, intermediate, hidden);
-            decode_swiglu<<<(intermediate + threads - 1) / threads, threads, 0, stream>>>(
-                gate.pointer, up.pointer, activated.pointer, intermediate
-            );
+            if (layer.gate_weight.quantized && layer.up_weight.quantized) {
+                decode_fused_gate_up_swiglu_q8_0<<<intermediate, threads, 0, stream>>>(
+                    layer.gate_weight.q8_0.pointer,
+                    layer.up_weight.q8_0.pointer,
+                    normed.pointer,
+                    activated.pointer,
+                    intermediate,
+                    hidden
+                );
+            } else {
+                matvec(layer.gate_weight, normed.pointer, gate.pointer, intermediate, hidden);
+                matvec(layer.up_weight, normed.pointer, up.pointer, intermediate, hidden);
+                decode_swiglu<<<(intermediate + threads - 1) / threads, threads, 0, stream>>>(
+                    gate.pointer, up.pointer, activated.pointer, intermediate
+                );
+            }
             matvec(layer.down_weight, activated.pointer, projected.pointer, hidden, intermediate);
-            decode_add_residual<<<(hidden + threads - 1) / threads, threads, 0, stream>>>(
-                projected.pointer, x1.pointer, x0.pointer, hidden
-            );
+            if (layer_index + 1 < layers.size()) {
+                decode_add_residual_rms_norm<<<1, threads, 0, stream>>>(
+                    projected.pointer,
+                    x1.pointer,
+                    layers[layer_index + 1].input_norm.pointer,
+                    x0.pointer,
+                    normed.pointer,
+                    hidden,
+                    epsilon
+                );
+            } else if (produce_logits) {
+                decode_add_residual_rms_norm<<<1, threads, 0, stream>>>(
+                    projected.pointer,
+                    x1.pointer,
+                    final_norm.pointer,
+                    x0.pointer,
+                    x1.pointer,
+                    hidden,
+                    epsilon
+                );
+            } else {
+                decode_add_residual<<<(hidden + threads - 1) / threads, threads, 0, stream>>>(
+                    projected.pointer, x1.pointer, x0.pointer, hidden
+                );
+            }
         }
         if (produce_logits) {
-            decode_rms_norm<<<1, threads, 0, stream>>>(
-                x0.pointer, final_norm.pointer, x1.pointer, hidden, epsilon
-            );
             matvec(lm_head, x1.pointer, logits.pointer, vocab, hidden);
         }
         FAMILY_CUDA_CHECK(cudaGetLastError());
