@@ -73,7 +73,10 @@ certified-equivalent profile, else substitution_rejected/not_certified).
   support, grammar requests fail with reason `grammar_unavailable_in_build`.
 - **models.list** — catalog + per-model state, fingerprints, alias rows,
   recommended_batch (ADVISORY batch sizing per model; admission remains the
-  enforcement — consumers should not carry their own batch knobs).
+  enforcement — consumers should not carry their own batch knobs). When present,
+  `recommended_batch` is `{ "rows": positive_integer, "token_budget": positive_integer }`;
+  `rows` is the advised request-row cap and `token_budget` is the corresponding
+  aggregate token cap. The field is omitted when an engine has no measured policy.
 - **model.load / model.status, probe.start / probe.status / probe.report** —
   load and probe start/status are job-shaped (poll-first); `probe.report` is a
   query. Probe is EXPLICIT, never auto-triggered; certification + perf rows are
