@@ -88,18 +88,35 @@ __global__ void decode_rms_norm(
     }
 }
 
-__global__ void decode_head_norm_rope(
-    const float *input,
-    const float *weight,
-    float *output,
-    int heads,
+__global__ void decode_fused_qk_head_norm_rope(
+    const float *q_input,
+    const float *q_weight,
+    float *q_output,
+    const float *k_input,
+    const float *k_weight,
+    float *k_output,
+    int query_heads,
+    int kv_heads,
     int head_dim,
     int position,
     float epsilon,
     float theta
 ) {
     int head = blockIdx.x;
-    if (head >= heads) return;
+    const float *input;
+    const float *weight;
+    float *output;
+    if (head < query_heads) {
+        input = q_input;
+        weight = q_weight;
+        output = q_output;
+    } else {
+        head -= query_heads;
+        if (head >= kv_heads) return;
+        input = k_input;
+        weight = k_weight;
+        output = k_output;
+    }
     int base = head * head_dim;
     float square = 0.0f;
     for (int dimension = threadIdx.x; dimension < head_dim; dimension += blockDim.x) {
@@ -507,13 +524,10 @@ struct Qwen3DecodeContext {
                 matvec(layer.k_weight, normed.pointer, k_raw.pointer, kv_width, hidden);
                 matvec(layer.v_weight, normed.pointer, layer.value_cache.pointer + static_cast<size_t>(token_position) * kv_width, kv_width, hidden);
             }
-            decode_head_norm_rope<<<query_heads, threads, 0, stream>>>(
+            decode_fused_qk_head_norm_rope<<<query_heads + kv_heads, threads, 0, stream>>>(
                 q_raw.pointer, layer.q_norm.pointer, q.pointer,
-                query_heads, head_dim, token_position, epsilon, theta
-            );
-            decode_head_norm_rope<<<kv_heads, threads, 0, stream>>>(
                 k_raw.pointer, layer.k_norm.pointer, layer.key_cache.pointer + static_cast<size_t>(token_position) * kv_width,
-                kv_heads, head_dim, token_position, epsilon, theta
+                query_heads, kv_heads, head_dim, token_position, epsilon, theta
             );
             decode_attention<<<query_heads, threads, static_cast<size_t>(token_position + 1) * sizeof(float), stream>>>(
                 q.pointer,

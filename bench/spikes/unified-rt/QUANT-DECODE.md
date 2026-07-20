@@ -94,14 +94,15 @@ All timings are single-stream, greedy, and exclude prompt prefill from
 | LFM2-1.2B | fp32 | 178.35 | 4,681,362,432 | 834.9 (83.5% of 1000) | 1.00x |
 | LFM2-1.2B | Q8_0 | 361.80 | 1,243,868,160 | 450.0 (45.0% of 1000) | **2.03x** |
 | Qwen3-0.6B | fp32 | 239.77 | 2,384,199,680 | 571.7 (57.2% of 1000) | 1.00x |
-| Qwen3-0.6B | Q8_0 | 475.33 | 633,495,552 | 301.1 (30.1% of 1000) | **1.98x** |
+| Qwen3-0.6B | Q8_0 | 490.15 | 633,495,552 | 310.5 (31.1% of 1000) | **2.04x** |
 
 The historical LFM2 fp32 comparison point was 178.5 tok/s; the fresh same-rig
 178.35 result reproduces it. Qwen3's 239.77 tok/s row is its first owned CUDA
 fp32 decode baseline. LFM2 Q8_0 is useful but does not approach the 3.76x active
-byte reduction. The direct-KV-cache winner, the stacked CUDA winners, and the batched-QKV winner
-raise Qwen3 Q8_0 to 475.33 tok/s and 301.1 GB/s (1.98x fp32), but it remains
-launch/dequant limited rather than a saturated compressed-weight path.
+byte reduction. The direct-KV-cache winner, the stacked CUDA winners, the batched-QKV winner, and
+winner 6's fused QK head-norm/RoPE launch raise Qwen3 Q8_0 to 490.15 tok/s and
+310.5 GB/s (2.04x fp32), but it remains launch/dequant limited rather than a
+saturated compressed-weight path.
 
 ### Quality ladder
 
@@ -189,9 +190,10 @@ approximately **$0.40 total spend**, well below the $25 cap. All three
 ## Campaign baseline: CUDA Q8_0 single-stream decode
 
 The second campaign targets the owned Qwen3-0.6B Q8_0 CUDA decode path on an RTX
-4090. The re-pinned throughput baseline is **475.33051605283094 tok/s** for one
-stream and 64 new tokens (`301.1 GB/s` effective weight bandwidth); llama.cpp's
-`521.4 tok/s` comparison is a competitor reference, not an acceptance gate. The
+4090. After winner 6, the re-pinned throughput baseline is
+**490.14609753769247 tok/s** for one stream and 64 new tokens (`310.5 GB/s`
+effective weight bandwidth); llama.cpp's `521.4 tok/s` comparison is a
+competitor reference, not an acceptance gate. The
 rented rig must be an RTX 4090 with reliability above `0.99` and driver `>=570`.
 
 `bench/campaign/cuda-quant-harness.sh` is a self-contained controller. It embeds
@@ -301,14 +303,43 @@ exact prompts, median match depth `59.0`, `accepted_near_ties=0`, constrained
 JSON `15/15`, and the CPU-side hook suite was green. Two independent `N=12`
 repeats of 64-token, fresh varied-prompt decode reported medians of
 `475.70490396191275` and `474.7860938299272` tok/s; the combined median across
-all 24 samples was **`475.33051605283094` tok/s**, which is the re-pinned baseline.
-With the unchanged `633,495,552` active bytes/token, that is
-`301,119,767,649` bytes/s, or `301.1 GB/s` effective weight bandwidth, and
-`+6.53%` versus the winner-4 baseline. The rig reported driver `595.58.03`,
+all 24 samples was **`475.33051605283094` tok/s**, which was the winner-5
+baseline before winner 6. With the unchanged `633,495,552` active bytes/token,
+that was `301,119,767,649` bytes/s, or `301.1 GB/s` effective weight bandwidth,
+and `+6.53%` versus the winner-4 baseline. The rig reported driver `595.58.03`,
 P8, 210 MHz SM clock, and 22.83/23.04 W during the two preflights.
 
-The remaining next-campaign targets are per-step capture/megakernel fusion,
-online-softmax attention, and a fused QK-norm+RoPE kernel. The round-2
-RoPE-tables experiment is banked as a negative sub-gate, not a promoted
-mechanism; future proposals should keep it as a sub-gate while pursuing those
-three targets.
+### Campaign winner 6 confirmation
+
+Campaign `[consult-id]` promoted winner 6,
+proposal `c10004d6e5d172718b3811a3d63a0f1f8a00570c9cb044c6630c11721ab5e202`,
+which fuses each layer's query and key head-RMSNorm plus half-split RoPE into
+one launch. A block selects a query head or KV head, performs the same norm and
+rotation as the two former kernels, and writes the result to the selected
+output. The K output remains the current token's in-slot KV pointer, so winner
+1's direct K write is preserved; winner 5's V output remains a direct write to
+its current-token value slot.
+
+The launch arithmetic is explicit: before winner 6, Q head norm/RoPE plus K
+head norm/RoPE cost `2` launches per layer/token; the fused kernel costs `1`,
+saving one launch (50% for this stage). Including winner 5's batched Q/K/V
+projection, the projection-plus-head stage is now `3 + 2 = 5` launches in the
+pre-winner tree, `1 + 2 = 3` after winner 5, and `1 + 1 = 2` after winner 6:
+three launches removed versus the original stage and one versus winner 5.
+
+On the exclusive RTX 4090, two independent full harness runs both passed the
+quality and hook gates: `10/20` exact prompts, median match depth `59.0`,
+`accepted_near_ties=0`, constrained JSON `15/15`, and all five required hook
+tests. The two `N=12` medians were `489.8380553784001` and
+`490.27491117248616` tok/s; the combined median across all 24 samples was
+**`490.14609753769247` tok/s** (`+3.12%` versus winner 5). With unchanged active
+bytes, that is `310,505,372,620` bytes/s, or `310.5 GB/s` effective weight
+bandwidth. The rig reported driver `595.58.03`, P8, 210 MHz SM clock, and
+22.96/22.41 W during the two preflights.
+
+The remaining-structure guidance is unchanged but now explicit: capture/
+megakernel fusion remains the **STILL-UNMEASURED prize**. The two capture-prize
+`patch_invalid` deaths are process failures, not merit evidence. Online-softmax
+attention has one `parity_failed` result, so it is risky-but-open rather than
+closed. RoPE tables are a banked double-negative and should remain closed as a
+mechanism; they are not a reason to relax the capture or online-softmax gates.
