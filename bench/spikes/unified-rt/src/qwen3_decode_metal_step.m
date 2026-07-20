@@ -342,10 +342,6 @@ static MTLSize group_size(NSUInteger count) {
     return MTLSizeMake(MIN((NSUInteger)256, MAX((NSUInteger)1, count)), 1, 1);
 }
 
-static MTLSize attention_grid(Qwen3MetalStepContext *context) {
-    return grid_size((NSUInteger)context->query_heads * 32);
-}
-
 static void set_weight(id<MTLComputeCommandEncoder> encoder, StepWeight *weight, NSUInteger fp16_index, NSUInteger q8_index) {
     [encoder setBuffer:weight->fp16 offset:0 atIndex:fp16_index];
     [encoder setBuffer:weight->q8 offset:0 atIndex:q8_index];
@@ -403,7 +399,8 @@ static void encode_qk_norm_rope(
     id<MTLCommandBuffer> command_buffer,
     StepLayerBuffers *layer,
     id<MTLBuffer> rope_cos,
-    id<MTLBuffer> rope_sin
+    id<MTLBuffer> rope_sin,
+    uint32_t position
 ) {
     id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
     [encoder setComputePipelineState:context->qk_norm_rope];
@@ -413,10 +410,12 @@ static void encode_qk_norm_rope(
     [encoder setBuffer:layer->k_norm offset:0 atIndex:3];
     [encoder setBuffer:rope_cos offset:0 atIndex:4];
     [encoder setBuffer:rope_sin offset:0 atIndex:5];
-    struct { uint32_t query_heads; uint32_t kv_heads; uint32_t head_dim; float epsilon; } config = {
-        (uint32_t)context->query_heads, (uint32_t)context->kv_heads, (uint32_t)context->head_dim, context->epsilon
+    [encoder setBuffer:layer->key_cache offset:0 atIndex:6];
+    struct { uint32_t query_heads; uint32_t kv_heads; uint32_t head_dim; float epsilon; uint32_t capacity; uint32_t position; } config = {
+        (uint32_t)context->query_heads, (uint32_t)context->kv_heads, (uint32_t)context->head_dim, context->epsilon,
+        (uint32_t)context->bucket, (uint32_t)position
     };
-    [encoder setBytes:&config length:sizeof(config) atIndex:6];
+    [encoder setBytes:&config length:sizeof(config) atIndex:7];
     [encoder dispatchThreads:grid_size(MAX(context->query_heads, context->kv_heads)) threadsPerThreadgroup:group_size(MAX(context->query_heads, context->kv_heads))];
     [encoder endEncoding];
 }
@@ -438,7 +437,7 @@ static void encode_attention(
         (uint32_t)context->bucket, position
     };
     [encoder setBytes:&config length:sizeof(config) atIndex:4];
-    [encoder dispatchThreads:attention_grid(context) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    [encoder dispatchThreads:grid_size(context->query_heads) threadsPerThreadgroup:group_size(context->query_heads)];
     [encoder endEncoding];
 }
 
@@ -450,7 +449,8 @@ static void encode_matvec_residual(
     id<MTLBuffer> output,
     StepWeight *weight,
     uint32_t input_width,
-    uint32_t output_width
+    uint32_t output_width,
+    BOOL add_residual
 ) {
     id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
     [encoder setComputePipelineState:context->matvec_residual];
@@ -458,8 +458,8 @@ static void encode_matvec_residual(
     [encoder setBuffer:residual offset:0 atIndex:1];
     [encoder setBuffer:output offset:0 atIndex:2];
     set_weight(encoder, weight, 3, 4);
-    struct { uint32_t input_width; uint32_t output_width; uint32_t quantized; } config = {
-        input_width, output_width, context->quantized
+    struct { uint32_t input_width; uint32_t output_width; uint32_t quantized; uint32_t add_residual; } config = {
+        input_width, output_width, context->quantized, (uint32_t)add_residual
     };
     [encoder setBytes:&config length:sizeof(config) atIndex:5];
     [encoder dispatchThreads:grid_size(output_width) threadsPerThreadgroup:group_size(output_width)];
@@ -500,8 +500,8 @@ static void encode_gate_up(
     [encoder setBuffer:context->mlp offset:0 atIndex:1];
     set_weight(encoder, &layer->gate_weight, 2, 3);
     set_weight(encoder, &layer->up_weight, 4, 5);
-    struct { uint32_t input_width; uint32_t output_width; uint32_t quantized; } config = {
-        (uint32_t)context->hidden, (uint32_t)context->intermediate, context->quantized
+    struct { uint32_t input_width; uint32_t output_width; uint32_t quantized; uint32_t add_residual; } config = {
+        (uint32_t)context->hidden, (uint32_t)context->intermediate, context->quantized, 0
     };
     [encoder setBytes:&config length:sizeof(config) atIndex:6];
     [encoder dispatchThreads:grid_size(context->intermediate) threadsPerThreadgroup:group_size(context->intermediate)];
@@ -514,8 +514,8 @@ static void encode_lm_head(Qwen3MetalStepContext *context, id<MTLCommandBuffer> 
     [encoder setBuffer:context->final_norm offset:0 atIndex:0];
     [encoder setBuffer:context->logits offset:0 atIndex:1];
     set_weight(encoder, &context->lm_head_weight, 2, 3);
-    struct { uint32_t input_width; uint32_t output_width; uint32_t quantized; } config = {
-        (uint32_t)context->hidden, (uint32_t)context->vocab, context->quantized
+    struct { uint32_t input_width; uint32_t output_width; uint32_t quantized; uint32_t add_residual; } config = {
+        (uint32_t)context->hidden, (uint32_t)context->vocab, context->quantized, 0
     };
     [encoder setBytes:&config length:sizeof(config) atIndex:4];
     [encoder dispatchThreads:grid_size(context->vocab) threadsPerThreadgroup:group_size(context->vocab)];
@@ -602,11 +602,11 @@ int32_t synapse_qwen3_metal_step(
                 encode_rmsnorm(context, command_buffer, current, context->normalized, layer->input_norm,
                                (uint32_t)context->hidden, epsilon);
                 encode_qkv(context, command_buffer, layer, context->normalized, (uint32_t)position);
-                encode_qk_norm_rope(context, command_buffer, layer, cosine_buffer, sine_buffer);
+                encode_qk_norm_rope(context, command_buffer, layer, cosine_buffer, sine_buffer, (uint32_t)position);
                 encode_attention(context, command_buffer, layer, (uint32_t)position);
                 encode_matvec_residual(context, command_buffer, context->context, current, next,
                                        &layer->o_weight, (uint32_t)context->query_heads * (uint32_t)context->head_dim,
-                                       (uint32_t)context->hidden);
+                                       (uint32_t)context->hidden, NO);
                 encode_residual_rmsnorm(
                     context,
                     command_buffer,
@@ -617,7 +617,7 @@ int32_t synapse_qwen3_metal_step(
                 );
                 encode_gate_up(context, command_buffer, layer, context->normalized);
                 encode_matvec_residual(context, command_buffer, context->mlp, next, current,
-                                       &layer->down_weight, (uint32_t)context->intermediate, (uint32_t)context->hidden);
+                                        &layer->down_weight, (uint32_t)context->intermediate, (uint32_t)context->hidden, YES);
                 id<MTLBuffer> old_next = next;
                 current = old_next;
                 next = old_next == context->x_a ? context->x_b : context->x_a;

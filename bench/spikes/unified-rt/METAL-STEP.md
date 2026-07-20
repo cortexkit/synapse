@@ -34,10 +34,11 @@ The per-token command buffer encodes these kernels for each of the 28 layers:
 1. `metal_step_rmsnorm` — pre-attention RMSNorm.
 2. `metal_step_qkv_matvec` — one grid for Q, K, and V. V writes directly to
    the layer's `kv_heads * bucket * head_dim` cache slot.
-3. `metal_step_qk_norm_rope` — Q/K head RMSNorm and Qwen rotary embedding.
-4. `metal_step_attention` — one 32-wide simdgroup per query head,
-   `simd_sum`/`simd_max` reductions, stable two-pass softmax, and P/V
-   accumulation over the resident cache.
+3. `metal_step_qk_norm_rope` — Q/K head RMSNorm and Qwen rotary embedding;
+   normalized K writes directly into the addressed KV cache slot.
+4. `metal_step_attention` — stable two-pass softmax and P/V accumulation
+   over the resident cache (the current correctness candidate uses one query-head
+   thread; simdgroup reduction work remains gated behind parity).
 5. `metal_step_matvec_residual` — O projection plus attention residual.
 6. `metal_step_rmsnorm` — pre-MLP RMSNorm.
 7. `metal_step_gate_up_swiglu` — fused gate/up matvec and SiLU product.
@@ -51,49 +52,43 @@ no dequantized matrix is materialized.
 
 ## Correctness gate transcripts
 
-The local source/type gate passed:
+The Xcode toolchain was explicitly selected after the CLT-only build failed:
 
 ```text
-$ cargo fmt --all -- --check
-$ cargo check -p spike-unified-rt
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.90s
+$ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun -sdk macosx --find metal
+/var/run/com.apple.security.cryptexd/mnt/com.apple.MobileAsset.MetalToolchain-v17.6.109.0.yr6fBk/Metal.xctoolchain/usr/bin/metal
+$ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer cargo build -p spike-unified-rt --release --bin spike-unified-rt
+Finished `release` profile [optimized]
+$ stat target/release/qwen3_decode_metal_step.metallib
+41282 bytes
 ```
 
-The local machine has Metal framework headers but no `metal` developer-tool
-utility, so build.rs reports the following and defers metallib generation to a
-full Xcode toolchain:
+Gate 1 was run against the committed 20-prompt, 64-token fixture and stopped on
+failure. The first implementation exposed NaN logits; the in-slot key-write and
+residual-add fixes removed the NaNs, but the parity gate still diverges at the
+second generated token:
 
 ```text
-cargo:warning=Metal developer tools unavailable; Metal step metallib will be built by a macOS toolchain
+$ target/release/spike-unified-rt ... --decode-backend metal-step ... --max-new-tokens 64
+owned-rt-metal-step: exact prompts 0/20
+completion-01 step 1: owned token 11, reference token 13
+completion-02 step 1: owned token 220, reference token 23
+...
+Error: token-exact fp32/f16 decode gate failed
 ```
 
-The model-backed gates below have not been claimed without the locked checkpoint
-and fixture run. They must be run in order before any throughput number is
-reported:
+The MPSGraph control produces `completion-01` tokens `12095, 13`; the custom
+step produces `12095, 11`. The first generated token is correct on all 20 rows,
+but Gate 1 is **not green**, so Q8_0, hook/prefill gates, and all timing cells
+were not run. No threshold or near-tie exemption was applied.
 
 ```text
-# 1. f16: 20/20 prompts x 64 tokens, token exact vs the MPSGraph reference
-cargo run -p spike-unified-rt --release -- \
-  --model "$QWEN3" --tokenizer "$TOKENIZER" \
-  --generate-prompts bench/spikes/unified-rt/decode-prompts.jsonl \
-  --decode-reference "$DECODE_REFERENCE" --dtype f16 --device metal \
-  --decode-backend metal-step --max-new-tokens 64 --out /tmp/metal-step-f16.json
-
-# 2. Q8_0: established quant protocol; no near-tie exemptions
-cargo run -p spike-unified-rt --release -- \
-  --model "$QWEN3" --tokenizer "$TOKENIZER" \
-  --generate-prompts bench/spikes/unified-rt/decode-prompts.jsonl \
-  --decode-reference "$DECODE_REFERENCE" --dtype f16 --weight-quant q8-0 \
-  --device metal --decode-backend metal-step --max-new-tokens 64 \
-  --out /tmp/metal-step-q8.json
-
-# 3. CPU hook suite and 4. real-prefill handoff fixture
-cargo test -p spike-unified-rt qwen3_decode
+Gate 1: FAIL (0/20 exact; stopped here)
+Gate 2: NOT RUN (ordered gate stop)
+Gate 3: NOT RUN (ordered gate stop)
+Gate 4: NOT RUN (ordered gate stop)
+Timing: NOT RUN (ordered gate stop)
 ```
-
-Expected gate records are **20/20 exact** for f16; for Q8_0, at least 10/20
-exact prompts and median match depth at least 59.0. The Q8 gate has no near-tie
-exception. A failed gate stops the campaign; thresholds are not relaxed.
 
 ## Measurement table
 
@@ -103,11 +98,10 @@ iteration.
 
 | Backend | Weights | Prompts / repeats | Decode tok/s | Encode / GPU / host per token | Status |
 | --- | --- | --- | ---: | --- | --- |
-| MPSGraph reference | f16 | 12 x 2 | 84.32 baseline | pending fresh breakdown | recorded baseline |
-| Metal step | f16 | 12 x 2 | pending | pending | gate pending |
-| Metal step | Q8_0 | 12 x 2 | pending | pending | gate pending |
-| llama.cpp Metal | Q8_0 | 12 x 2 | pending fresh reference | pending | re-measure required |
-
+| MPSGraph reference | f16 | 12 x 2 | 84.32 baseline | pending fresh breakdown | prior baseline |
+| Metal step | f16 | 20 x 1 gate | not reported | not reported | **Gate 1 failed** |
+| Metal step | Q8_0 | — | not run | not run | ordered gate stop |
+| llama.cpp Metal | Q8_0 | — | not run | not run | ordered gate stop |
 Do not use prefix-cache replay for this table. Report encode, GPU command-buffer
 wait, logits readback/host, and total per-token wall time separately.
 
