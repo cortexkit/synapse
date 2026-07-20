@@ -94,14 +94,14 @@ All timings are single-stream, greedy, and exclude prompt prefill from
 | LFM2-1.2B | fp32 | 178.35 | 4,681,362,432 | 834.9 (83.5% of 1000) | 1.00x |
 | LFM2-1.2B | Q8_0 | 361.80 | 1,243,868,160 | 450.0 (45.0% of 1000) | **2.03x** |
 | Qwen3-0.6B | fp32 | 239.77 | 2,384,199,680 | 571.7 (57.2% of 1000) | 1.00x |
-| Qwen3-0.6B | Q8_0 | 446.21 | 633,495,552 | 282.7 (28.1% of 1000) | **1.86x** |
+| Qwen3-0.6B | Q8_0 | 475.33 | 633,495,552 | 301.1 (30.1% of 1000) | **1.98x** |
 
 The historical LFM2 fp32 comparison point was 178.5 tok/s; the fresh same-rig
 178.35 result reproduces it. Qwen3's 239.77 tok/s row is its first owned CUDA
 fp32 decode baseline. LFM2 Q8_0 is useful but does not approach the 3.76x active
-byte reduction. The direct-KV-cache winner and the stacked CUDA winners raise Qwen3 Q8_0 to
-446.21 tok/s and 282.7 GB/s (1.86x fp32), but it remains launch/dequant limited
-rather than a saturated compressed-weight path.
+byte reduction. The direct-KV-cache winner, the stacked CUDA winners, and the batched-QKV winner
+raise Qwen3 Q8_0 to 475.33 tok/s and 301.1 GB/s (1.98x fp32), but it remains
+launch/dequant limited rather than a saturated compressed-weight path.
 
 ### Quality ladder
 
@@ -189,8 +189,8 @@ approximately **$0.40 total spend**, well below the $25 cap. All three
 ## Campaign baseline: CUDA Q8_0 single-stream decode
 
 The second campaign targets the owned Qwen3-0.6B Q8_0 CUDA decode path on an RTX
-4090. The re-pinned throughput baseline is **446.21439926190544 tok/s** for one
-stream and 64 new tokens (`282.7 GB/s` effective weight bandwidth); llama.cpp's
+4090. The re-pinned throughput baseline is **475.33051605283094 tok/s** for one
+stream and 64 new tokens (`301.1 GB/s` effective weight bandwidth); llama.cpp's
 `521.4 tok/s` comparison is a competitor reference, not an acceptance gate. The
 rented rig must be an RTX 4090 with reliability above `0.99` and driver `>=570`.
 
@@ -269,7 +269,7 @@ CPU-side suite passed `48` tests with `2` ignored, including all five required
 decode hook tests. Two repeats of `N=12` fresh varied prompts, 64 new tokens,
 reported medians of `445.7626019334018` and `446.6215646524347` tok/s; the
 combined median across all 24 samples was `446.21439926190544` tok/s. That
-combined median is the re-pinned baseline below, while the campaign-final
+combined median was the re-pinned baseline for winner 4, while the campaign-final
 steady figure is the rounded `446.7` tok/s used for the controlled comparison;
 that is `+18.5%` versus the `376.824259765553` registry baseline.
 
@@ -278,9 +278,37 @@ The shared host load average was `16.77 15.79 14.54` before the run and
 exclusive RTX 4090 reported driver `595.58.03`, P8, 210 MHz, 21.95 W before
 and 21.05 W after, with 1 MiB used of 24564 MiB and no compute processes in
 both snapshots. At the campaign-final steady figure, effective weight
-bandwidth is `446.7 tok/s * 633,495,552 bytes = 282,982,463,078 bytes/s`, or
-approximately `283 GB/s`. This is still launch-limited territory rather than
-memory-bandwidth saturation: the next campaign should target launch fusion,
-persistent decode, or other per-layer scheduling overhead before pursuing
-more compressed bytes. The composed result is `446.7 / 521.4 = 85.67%` of the
-llama.cpp reference, approximately `86%`.
+bandwidth was `446.7 tok/s * 633,495,552 bytes = 282,982,463,078 bytes/s`, or
+approximately `283 GB/s`; winner 5 raises the re-pinned measurement to
+`301.1 GB/s` while leaving model bytes unchanged. This remains launch-limited
+territory rather than memory-bandwidth saturation. The winner-5 result is
+`475.33 / 521.4 = 91.16%` of the llama.cpp reference, approximately `91%`.
+
+### Campaign winner 5 confirmation
+
+Campaign `[consult-id]` winner 5 batches the Q8_0
+Q/K/V GEMVs for each layer into one decode launch. The kernel walks the query
+rows, key rows, and value rows in one grid, reusing the same normalized input
+while selecting each matrix's quantized row range. Q and raw K still feed the
+existing head-norm/RoPE kernels, and V is written directly into winner 1's
+current-token KV slot; the subsequent K head-norm/RoPE kernel still writes the
+normalized key into that slot. The per-layer, per-token Q/K/V matvec launch
+count therefore falls from three to one, a reduction of two launches (66.7%),
+without changing the bytes moved or KV-cache layout.
+
+On the exclusive RTX 4090, the composed tree passed the quality floors: `10/20`
+exact prompts, median match depth `59.0`, `accepted_near_ties=0`, constrained
+JSON `15/15`, and the CPU-side hook suite was green. Two independent `N=12`
+repeats of 64-token, fresh varied-prompt decode reported medians of
+`475.70490396191275` and `474.7860938299272` tok/s; the combined median across
+all 24 samples was **`475.33051605283094` tok/s**, which is the re-pinned baseline.
+With the unchanged `633,495,552` active bytes/token, that is
+`301,119,767,649` bytes/s, or `301.1 GB/s` effective weight bandwidth, and
+`+6.53%` versus the winner-4 baseline. The rig reported driver `595.58.03`,
+P8, 210 MHz SM clock, and 22.83/23.04 W during the two preflights.
+
+The remaining next-campaign targets are per-step capture/megakernel fusion,
+online-softmax attention, and a fused QK-norm+RoPE kernel. The round-2
+RoPE-tables experiment is banked as a negative sub-gate, not a promoted
+mechanism; future proposals should keep it as a sub-gate while pursuing those
+three targets.

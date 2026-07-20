@@ -300,6 +300,59 @@ __global__ void decode_fused_gate_up_swiglu_q8_0(
     }
 }
 
+__global__ void decode_fused_qkv_matvec_q8_0(
+    const uint8_t *q_weights,
+    const uint8_t *k_weights,
+    const uint8_t *v_weights,
+    const float *input,
+    float *q_output,
+    float *k_output,
+    float *v_output,
+    int query_rows,
+    int kv_rows,
+    int columns
+) {
+    int row = blockIdx.x;
+    const uint8_t *weights;
+    float *output;
+    int local_row;
+    if (row < query_rows) {
+        weights = q_weights;
+        output = q_output;
+        local_row = row;
+    } else if (row < query_rows + kv_rows) {
+        weights = k_weights;
+        output = k_output;
+        local_row = row - query_rows;
+    } else {
+        weights = v_weights;
+        output = v_output;
+        local_row = row - query_rows - kv_rows;
+    }
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int warps = blockDim.x >> 5;
+    int blocks_per_row = columns / Q8_0_BLOCK_ELEMENTS;
+    float partial = 0.0f;
+    for (int column_block = warp; column_block < blocks_per_row; column_block += warps) {
+        const uint8_t *block = weights
+            + (static_cast<size_t>(local_row) * blocks_per_row + column_block) * Q8_0_BLOCK_BYTES;
+        half scale = *reinterpret_cast<const half *>(block);
+        int8_t quantized = reinterpret_cast<const int8_t *>(block + sizeof(half))[lane];
+        partial += __half2float(scale) * static_cast<float>(quantized)
+            * input[column_block * Q8_0_BLOCK_ELEMENTS + lane];
+    }
+    partial = warp_sum(partial);
+    __shared__ float warp_sums[32];
+    if (lane == 0) warp_sums[warp] = partial;
+    __syncthreads();
+    if (warp == 0) {
+        float sum = lane < warps ? warp_sums[lane] : 0.0f;
+        sum = warp_sum(sum);
+        if (lane == 0) output[local_row] = sum;
+    }
+}
+
 struct Qwen3DecodeContext {
     cudaStream_t stream = nullptr;
     bool weights_loaded = false;
@@ -436,9 +489,24 @@ struct Qwen3DecodeContext {
         );
         for (size_t layer_index = 0; layer_index < layers.size(); ++layer_index) {
             DecodeLayer &layer = layers[layer_index];
-            matvec(layer.q_weight, normed.pointer, q_raw.pointer, query_width, hidden);
-            matvec(layer.k_weight, normed.pointer, k_raw.pointer, kv_width, hidden);
-            matvec(layer.v_weight, normed.pointer, layer.value_cache.pointer + static_cast<size_t>(token_position) * kv_width, kv_width, hidden);
+            if (layer.q_weight.quantized && layer.k_weight.quantized && layer.v_weight.quantized) {
+                decode_fused_qkv_matvec_q8_0<<<query_width + 2 * kv_width, threads, 0, stream>>>(
+                    layer.q_weight.q8_0.pointer,
+                    layer.k_weight.q8_0.pointer,
+                    layer.v_weight.q8_0.pointer,
+                    normed.pointer,
+                    q_raw.pointer,
+                    k_raw.pointer,
+                    layer.value_cache.pointer + static_cast<size_t>(token_position) * kv_width,
+                    query_width,
+                    kv_width,
+                    hidden
+                );
+            } else {
+                matvec(layer.q_weight, normed.pointer, q_raw.pointer, query_width, hidden);
+                matvec(layer.k_weight, normed.pointer, k_raw.pointer, kv_width, hidden);
+                matvec(layer.v_weight, normed.pointer, layer.value_cache.pointer + static_cast<size_t>(token_position) * kv_width, kv_width, hidden);
+            }
             decode_head_norm_rope<<<query_heads, threads, 0, stream>>>(
                 q_raw.pointer, layer.q_norm.pointer, q.pointer,
                 query_heads, head_dim, token_position, epsilon, theta
