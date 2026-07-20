@@ -157,12 +157,35 @@ inline void rmsnorm_body(
     constant NormConfig &config
 ) {
     float sum = 0.0f;
-    for (uint i = 0; i < config.width; ++i) {
+    uint i = 0;
+    // Wider aligned reads reduce address-generation overhead while scalar
+    // component accumulation preserves the reference order exactly.
+    for (; i + 4 <= config.width; i += 4) {
+        half4 input_values = *(const device half4 *)(input + i);
+        float value0 = (float)input_values[0];
+        float value1 = (float)input_values[1];
+        float value2 = (float)input_values[2];
+        float value3 = (float)input_values[3];
+        sum += value0 * value0;
+        sum += value1 * value1;
+        sum += value2 * value2;
+        sum += value3 * value3;
+    }
+    for (; i < config.width; ++i) {
         float value = (float)input[i];
         sum += value * value;
     }
     float inv = rsqrt(sum / (float)config.width + config.epsilon);
-    for (uint i = 0; i < config.width; ++i) {
+    i = 0;
+    for (; i + 4 <= config.width; i += 4) {
+        half4 input_values = *(const device half4 *)(input + i);
+        half4 weight_values = *(const device half4 *)(weight + i);
+        output[i] = (half)((float)input_values[0] * inv * (float)weight_values[0]);
+        output[i + 1] = (half)((float)input_values[1] * inv * (float)weight_values[1]);
+        output[i + 2] = (half)((float)input_values[2] * inv * (float)weight_values[2]);
+        output[i + 3] = (half)((float)input_values[3] * inv * (float)weight_values[3]);
+    }
+    for (; i < config.width; ++i) {
         output[i] = (half)((float)input[i] * inv * (float)weight[i]);
     }
 }
@@ -366,13 +389,41 @@ kernel void metal_step_residual_rmsnorm(
     uint tid [[thread_position_in_grid]]) {
     if (tid != 0) return;
     float sum = 0.0f;
-    for (uint i = 0; i < config.width; ++i) {
+    uint i = 0;
+    // Keep the residual add and sum in element order, but fetch both inputs
+    // with aligned half4 loads to reduce scalar memory instructions.
+    for (; i + 4 <= config.width; i += 4) {
+        half4 projection_values = *(const device half4 *)(projection + i);
+        half4 residual_values = *(const device half4 *)(residual + i);
+        float value0 = (float)projection_values[0] + (float)residual_values[0];
+        float value1 = (float)projection_values[1] + (float)residual_values[1];
+        float value2 = (float)projection_values[2] + (float)residual_values[2];
+        float value3 = (float)projection_values[3] + (float)residual_values[3];
+        projection[i] = (half)value0;
+        projection[i + 1] = (half)value1;
+        projection[i + 2] = (half)value2;
+        projection[i + 3] = (half)value3;
+        sum += value0 * value0;
+        sum += value1 * value1;
+        sum += value2 * value2;
+        sum += value3 * value3;
+    }
+    for (; i < config.width; ++i) {
         float value = (float)projection[i] + (float)residual[i];
         projection[i] = (half)value;
         sum += value * value;
     }
     float inv = rsqrt(sum / (float)config.width + config.epsilon);
-    for (uint i = 0; i < config.width; ++i) {
+    i = 0;
+    for (; i + 4 <= config.width; i += 4) {
+        half4 projection_values = *(const device half4 *)(projection + i);
+        half4 weight_values = *(const device half4 *)(weight + i);
+        normalized[i] = (half)((float)projection_values[0] * inv * (float)weight_values[0]);
+        normalized[i + 1] = (half)((float)projection_values[1] * inv * (float)weight_values[1]);
+        normalized[i + 2] = (half)((float)projection_values[2] * inv * (float)weight_values[2]);
+        normalized[i + 3] = (half)((float)projection_values[3] * inv * (float)weight_values[3]);
+    }
+    for (; i < config.width; ++i) {
         normalized[i] = (half)((float)projection[i] * inv * (float)weight[i]);
     }
 }
