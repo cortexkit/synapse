@@ -506,6 +506,7 @@ async fn ane_probe_placement_ping_runs_outside_the_module_runtime() {
     assert_eq!(body["result"]["lanes"][0]["status"], "uncertified");
 }
 
+#[cfg(target_os = "macos")]
 fn timeout_ane_probe_config(root: &Path) -> String {
     std::fs::create_dir_all(root).unwrap();
     let model_path = root.join("model.mock");
@@ -2257,6 +2258,7 @@ async fn certify_preloaded_models(
     run_probe_job(consumer, route, start_corr, serde_json::json!({})).await
 }
 
+#[cfg(target_os = "macos")]
 async fn poll_probe_status(
     consumer: &mut tokio::net::TcpStream,
     route: TestRoute,
@@ -2535,6 +2537,7 @@ fn overwrite_knob_assignment(
     assert_eq!(changed, 1, "expected one knob assignment row to update");
 }
 
+#[cfg(target_os = "macos")]
 fn assert_vector_cosine_at_least(actual: &Value, expected: &Value, minimum: f64) {
     let actual = actual.as_array().expect("actual vector is an array");
     let expected = expected.as_array().expect("expected vector is an array");
