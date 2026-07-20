@@ -3,6 +3,7 @@ using namespace metal;
 
 constant uint Q8_BLOCK_BYTES = 34;
 constant uint Q8_BLOCK_ELEMENTS = 32;
+constant uint METAL_STEP_SIMD_WIDTH = 32;
 
 struct NormConfig {
     uint width;
@@ -48,23 +49,71 @@ struct AttentionConfig {
     uint position;
 };
 
-inline float matrix_value(
-    const device half *fp16,
+inline float matrix_dot_q8(
+    const device half *input,
     const device uchar *q8,
-    uint quantized,
     uint row,
-    uint col,
     uint input_width
 ) {
-    if (quantized == 0) {
-        return (float)fp16[row * input_width + col];
+    float sum = 0.0f;
+    uint row_start = row * input_width;
+    for (uint block = 0; block < input_width / Q8_BLOCK_ELEMENTS; ++block) {
+        uint block_start = block * Q8_BLOCK_ELEMENTS;
+        const device half *scale_ptr = (const device half *)(q8 +
+            (row_start + block_start) / Q8_BLOCK_ELEMENTS * Q8_BLOCK_BYTES);
+        const device char *value_ptr = (const device char *)((const device uchar *)scale_ptr + 2);
+        float scale = (float)scale_ptr[0];
+        for (uint lane = 0; lane < Q8_BLOCK_ELEMENTS; ++lane) {
+            float dequantized = scale * (float)value_ptr[lane];
+            sum += (float)input[block_start + lane] * dequantized;
+        }
     }
-    uint linear = row * input_width + col;
-    uint block = linear / Q8_BLOCK_ELEMENTS;
-    uint lane = linear % Q8_BLOCK_ELEMENTS;
-    const device half *scale_ptr = (const device half *)(q8 + block * Q8_BLOCK_BYTES);
-    const device char *value_ptr = (const device char *)(q8 + block * Q8_BLOCK_BYTES + 2);
-    return (float)scale_ptr[0] * (float)value_ptr[lane];
+    return sum;
+}
+
+inline float matrix_dot_q8_simd(
+    const device half *input,
+    const device uchar *q8,
+    uint row,
+    uint input_width,
+    uint lane
+) {
+    float partial = 0.0f;
+    uint row_start = row * input_width;
+    for (uint block = 0; block < input_width / Q8_BLOCK_ELEMENTS; ++block) {
+        uint block_start = block * Q8_BLOCK_ELEMENTS;
+        const device half *scale_ptr = (const device half *)(q8 +
+            (row_start + block_start) / Q8_BLOCK_ELEMENTS * Q8_BLOCK_BYTES);
+        const device char *value_ptr = (const device char *)((const device uchar *)scale_ptr + 2);
+        float dequantized = (float)scale_ptr[0] * (float)value_ptr[lane];
+        partial += (float)input[block_start + lane] * dequantized;
+    }
+    return simd_sum(partial);
+}
+
+inline float matrix_dot_f16(
+    const device half *input,
+    const device half *fp16,
+    uint row,
+    uint input_width
+) {
+    float sum = 0.0f;
+    const device half *weight = fp16 + row * input_width;
+    uint col = 0;
+    for (; col + 4 <= input_width; col += 4) {
+        half4 input_values = *(const device half4 *)(input + col);
+        half4 weight_values = *(const device half4 *)(weight + col);
+        half4 products = input_values * weight_values;
+        sum += (float)products[0];
+        sum += (float)products[1];
+        sum += (float)products[2];
+        sum += (float)products[3];
+    }
+    for (; col < input_width; ++col) {
+        half product = (half)((half)input[col] * weight[col]);
+        sum += (float)product;
+    }
+    return sum;
 }
 
 inline float matrix_dot(
@@ -75,16 +124,8 @@ inline float matrix_dot(
     uint row,
     uint input_width
 ) {
-    float sum = 0.0f;
-    for (uint col = 0; col < input_width; ++col) {
-        if (quantized == 0) {
-            half product = (half)((half)input[col] * fp16[row * input_width + col]);
-            sum += (float)product;
-        } else {
-            sum += (float)input[col] * matrix_value(fp16, q8, quantized, row, col, input_width);
-        }
-    }
-    return sum;
+    if (quantized != 0) return matrix_dot_q8(input, q8, row, input_width);
+    return matrix_dot_f16(input, fp16, row, input_width);
 }
 
 inline void rmsnorm_body(
@@ -127,15 +168,40 @@ kernel void metal_step_qkv_matvec(
     const device uchar *v_q8 [[buffer(9)]],
     constant QkvConfig &config [[buffer(10)]],
     uint gid [[thread_position_in_grid]]) {
-    if (gid < config.query_width) {
-        query[gid] = (half)matrix_dot(input, q_fp16, q_q8, config.quantized, gid, config.input_width);
+    if (config.quantized == 0) {
+        if (gid < config.query_width) {
+            query[gid] = (half)matrix_dot(input, q_fp16, q_q8, 0, gid, config.input_width);
+        }
+        if (gid < config.kv_width) {
+            key[gid] = (half)matrix_dot(input, k_fp16, k_q8, 0, gid, config.input_width);
+            uint head = gid / config.head_dim;
+            uint dimension = gid % config.head_dim;
+            value_cache[(head * config.capacity + config.position) * config.head_dim + dimension] =
+                (half)matrix_dot(input, v_fp16, v_q8, 0, gid, config.input_width);
+        }
+        return;
     }
-    if (gid < config.kv_width) {
-        key[gid] = (half)matrix_dot(input, k_fp16, k_q8, config.quantized, gid, config.input_width);
-        uint head = gid / config.head_dim;
-        uint dimension = gid % config.head_dim;
-        value_cache[(head * config.capacity + config.position) * config.head_dim + dimension] =
-            (half)matrix_dot(input, v_fp16, v_q8, config.quantized, gid, config.input_width);
+    uint lane = gid % METAL_STEP_SIMD_WIDTH;
+    uint row = gid / METAL_STEP_SIMD_WIDTH;
+    uint total_rows = config.query_width + 2 * config.kv_width;
+    if (row >= total_rows) return;
+    if (row < config.query_width) {
+        float result = matrix_dot_q8_simd(input, q_q8, row, config.input_width, lane);
+        if (lane == 0) query[row] = (half)result;
+        return;
+    }
+    row -= config.query_width;
+    if (row < config.kv_width) {
+        float result = matrix_dot_q8_simd(input, k_q8, row, config.input_width, lane);
+        if (lane == 0) key[row] = (half)result;
+        return;
+    }
+    row -= config.kv_width;
+    float result = matrix_dot_q8_simd(input, v_q8, row, config.input_width, lane);
+    if (lane == 0) {
+        uint head = row / config.head_dim;
+        uint dimension = row % config.head_dim;
+        value_cache[(head * config.capacity + config.position) * config.head_dim + dimension] = (half)result;
     }
 }
 
@@ -196,34 +262,53 @@ kernel void metal_step_attention(
     const device half *key_cache [[buffer(1)]],
     const device half *value_cache [[buffer(2)]],
     device half *output [[buffer(3)]],
-    constant AttentionConfig &config [[buffer(4)]],
-    uint query_head [[thread_position_in_grid]]) {
+    device float *scores [[buffer(4)]],
+    constant AttentionConfig &config [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]) {
+    uint query_head = gid / METAL_STEP_SIMD_WIDTH;
+    uint lane = gid % METAL_STEP_SIMD_WIDTH;
     if (query_head >= config.query_heads) return;
     uint head_dim = config.head_dim;
     uint group = config.query_heads / config.kv_heads;
     uint kv_head = query_head / group;
     uint q_start = query_head * head_dim;
+    uint score_start = query_head * config.capacity;
     float scale = 1.0f / sqrt((float)head_dim);
-    float scores[2048];
-    float maximum = -3.402823466e+38f;
-    for (uint position = 0; position <= config.position; ++position) {
-        float score = 0.0f;
-        uint key_start = (kv_head * config.capacity + position) * head_dim;
-        for (uint i = 0; i < head_dim; ++i) {
-            score += (float)query[q_start + i] * (float)key_cache[key_start + i];
+
+    // Lane zero preserves the reference score and softmax order. The other
+    // lanes cooperate on the value projection, which is independent per head
+    // dimension and therefore does not need a reduction.
+    if (lane == 0) {
+        float maximum = -3.402823466e+38f;
+        for (uint position = 0; position <= config.position; ++position) {
+            float score = 0.0f;
+            uint key_start = (kv_head * config.capacity + position) * head_dim;
+            for (uint i = 0; i < head_dim; ++i) {
+                score += (float)query[q_start + i] * (float)key_cache[key_start + i];
+            }
+            scores[score_start + position] = score * scale;
+            maximum = max(maximum, scores[score_start + position]);
         }
-        scores[position] = score * scale;
-        maximum = max(maximum, scores[position]);
     }
+    simdgroup_barrier(mem_flags::mem_device);
+
+    float maximum = -3.402823466e+38f;
     float denominator = 0.0f;
-    for (uint position = 0; position <= config.position; ++position) {
-        denominator += exp(scores[position] - maximum);
+    if (lane == 0) {
+        for (uint position = 0; position <= config.position; ++position) {
+            maximum = max(maximum, scores[score_start + position]);
+        }
+        for (uint position = 0; position <= config.position; ++position) {
+            denominator += exp(scores[score_start + position] - maximum);
+        }
     }
-    for (uint i = 0; i < head_dim; ++i) {
+    maximum = simd_broadcast(maximum, 0);
+    denominator = simd_broadcast(denominator, 0);
+    for (uint i = lane; i < head_dim; i += METAL_STEP_SIMD_WIDTH) {
         float result = 0.0f;
         for (uint position = 0; position <= config.position; ++position) {
             uint value_index = (kv_head * config.capacity + position) * head_dim + i;
-            half probability = (half)(exp(scores[position] - maximum) / denominator);
+            half probability = (half)(exp(scores[score_start + position] - maximum) / denominator);
             result += (float)probability * (float)value_cache[value_index];
         }
         output[q_start + i] = (half)result;
@@ -238,9 +323,19 @@ kernel void metal_step_matvec_residual(
     const device uchar *q8 [[buffer(4)]],
     constant MatvecConfig &config [[buffer(5)]],
     uint gid [[thread_position_in_grid]]) {
-    if (gid >= config.output_width) return;
-    float value = matrix_dot(input, fp16, q8, config.quantized, gid, config.input_width);
-    output[gid] = (half)(value + (config.add_residual != 0 ? (float)residual[gid] : 0.0f));
+    if (config.quantized == 0) {
+        if (gid >= config.output_width) return;
+        float value = matrix_dot(input, fp16, q8, 0, gid, config.input_width);
+        output[gid] = (half)(value + (config.add_residual != 0 ? (float)residual[gid] : 0.0f));
+        return;
+    }
+    uint lane = gid % METAL_STEP_SIMD_WIDTH;
+    uint row = gid / METAL_STEP_SIMD_WIDTH;
+    if (row >= config.output_width) return;
+    float value = matrix_dot_q8_simd(input, q8, row, config.input_width, lane);
+    if (lane == 0) {
+        output[row] = (half)(value + (config.add_residual != 0 ? (float)residual[row] : 0.0f));
+    }
 }
 
 kernel void metal_step_residual_rmsnorm(
@@ -272,10 +367,19 @@ kernel void metal_step_gate_up_swiglu(
     const device uchar *up_q8 [[buffer(5)]],
     constant MatvecConfig &config [[buffer(6)]],
     uint gid [[thread_position_in_grid]]) {
-    if (gid >= config.output_width) return;
-    float gate = matrix_dot(input, gate_fp16, gate_q8, config.quantized, gid, config.input_width);
-    float up = matrix_dot(input, up_fp16, up_q8, config.quantized, gid, config.input_width);
-    output[gid] = (half)((gate / (1.0f + exp(-gate))) * up);
+    if (config.quantized == 0) {
+        if (gid >= config.output_width) return;
+        float gate = matrix_dot(input, gate_fp16, gate_q8, 0, gid, config.input_width);
+        float up = matrix_dot(input, up_fp16, up_q8, 0, gid, config.input_width);
+        output[gid] = (half)((gate / (1.0f + exp(-gate))) * up);
+        return;
+    }
+    uint lane = gid % METAL_STEP_SIMD_WIDTH;
+    uint row = gid / METAL_STEP_SIMD_WIDTH;
+    if (row >= config.output_width) return;
+    float gate = matrix_dot_q8_simd(input, gate_q8, row, config.input_width, lane);
+    float up = matrix_dot_q8_simd(input, up_q8, row, config.input_width, lane);
+    if (lane == 0) output[row] = (half)((gate / (1.0f + exp(-gate))) * up);
 }
 
 kernel void metal_step_lm_head(
@@ -285,6 +389,14 @@ kernel void metal_step_lm_head(
     const device uchar *q8 [[buffer(3)]],
     constant MatvecConfig &config [[buffer(4)]],
     uint gid [[thread_position_in_grid]]) {
-    if (gid >= config.output_width) return;
-    logits[gid] = matrix_dot(input, fp16, q8, config.quantized, gid, config.input_width);
+    if (config.quantized == 0) {
+        if (gid >= config.output_width) return;
+        logits[gid] = matrix_dot(input, fp16, q8, 0, gid, config.input_width);
+        return;
+    }
+    uint lane = gid % METAL_STEP_SIMD_WIDTH;
+    uint row = gid / METAL_STEP_SIMD_WIDTH;
+    if (row >= config.output_width) return;
+    float value = matrix_dot_q8_simd(input, q8, row, config.input_width, lane);
+    if (lane == 0) logits[row] = value;
 }
