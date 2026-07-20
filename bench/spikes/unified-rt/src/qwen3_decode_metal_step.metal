@@ -98,7 +98,7 @@ inline void rmsnorm_body(
         float value = (float)input[i];
         sum += value * value;
     }
-    float inv = 1.0f / sqrt(sum / (float)config.width + config.epsilon);
+    float inv = rsqrt(sum / (float)config.width + config.epsilon);
     for (uint i = 0; i < config.width; ++i) {
         output[i] = (half)((float)input[i] * inv * (float)weight[i]);
     }
@@ -157,16 +157,14 @@ kernel void metal_step_qk_norm_rope(
             float value = (float)query[start + i];
             sum += value * value;
         }
-        float denominator = sqrt(sum / (float)config.head_dim + config.epsilon);
+        float inv = rsqrt(sum / (float)config.head_dim + config.epsilon);
         for (uint i = 0; i < half_dim; ++i) {
-            half normalized_first = (half)(((float)query[start + i] / denominator) * (float)query_weight[i]);
-            half normalized_second = (half)(((float)query[start + half_dim + i] / denominator) * (float)query_weight[half_dim + i]);
-            float first = (float)normalized_first;
-            float second = (float)normalized_second;
-            float cosine = (float)rope_cos[i];
-            float sine = (float)rope_sin[i];
-            query[start + i] = (half)(first * cosine - second * sine);
-            query[start + half_dim + i] = (half)(second * cosine + first * sine);
+            half first = (half)((float)query[start + i] * inv * (float)query_weight[i]);
+            half second = (half)((float)query[start + half_dim + i] * inv * (float)query_weight[half_dim + i]);
+            half cosine = rope_cos[i];
+            half sine = rope_sin[i];
+            query[start + i] = (half)((half)(first * cosine) - (half)(second * sine));
+            query[start + half_dim + i] = (half)((half)(second * cosine) + (half)(first * sine));
         }
     }
     if (head < config.kv_heads) {
@@ -176,14 +174,12 @@ kernel void metal_step_qk_norm_rope(
             float value = (float)key[start + i];
             sum += value * value;
         }
-        float denominator = sqrt(sum / (float)config.head_dim + config.epsilon);
+        float inv = rsqrt(sum / (float)config.head_dim + config.epsilon);
         for (uint i = 0; i < half_dim; ++i) {
-            half normalized_first = (half)(((float)key[start + i] / denominator) * (float)key_weight[i]);
-            half normalized_second = (half)(((float)key[start + half_dim + i] / denominator) * (float)key_weight[half_dim + i]);
-            float first = (float)normalized_first;
-            float second = (float)normalized_second;
-            float cosine = (float)rope_cos[i];
-            float sine = (float)rope_sin[i];
+            half first = (half)((float)key[start + i] * inv * (float)key_weight[i]);
+            half second = (half)((float)key[start + half_dim + i] * inv * (float)key_weight[half_dim + i]);
+            half cosine = rope_cos[i];
+            half sine = rope_sin[i];
             half first_rotated = (half)((half)(first * cosine) - (half)(second * sine));
             half second_rotated = (half)((half)(second * cosine) + (half)(first * sine));
             key[start + i] = first_rotated;
@@ -216,7 +212,7 @@ kernel void metal_step_attention(
         for (uint i = 0; i < head_dim; ++i) {
             score += (float)query[q_start + i] * (float)key_cache[key_start + i];
         }
-        scores[position] = (float)(half)score * scale;
+        scores[position] = score * scale;
         maximum = max(maximum, scores[position]);
     }
     float denominator = 0.0f;
@@ -227,8 +223,8 @@ kernel void metal_step_attention(
         float result = 0.0f;
         for (uint position = 0; position <= config.position; ++position) {
             uint value_index = (kv_head * config.capacity + position) * head_dim + i;
-            float probability = exp(scores[position] - maximum) / denominator;
-            result += (float)(half)probability * (float)value_cache[value_index];
+            half probability = (half)(exp(scores[position] - maximum) / denominator);
+            result += (float)probability * (float)value_cache[value_index];
         }
         output[q_start + i] = (half)result;
     }
@@ -261,7 +257,7 @@ kernel void metal_step_residual_rmsnorm(
         projection[i] = (half)value;
         sum += value * value;
     }
-    float inv = 1.0f / sqrt(sum / (float)config.width + config.epsilon);
+    float inv = rsqrt(sum / (float)config.width + config.epsilon);
     for (uint i = 0; i < config.width; ++i) {
         normalized[i] = (half)((float)projection[i] * inv * (float)weight[i]);
     }

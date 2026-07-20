@@ -618,9 +618,6 @@ int32_t synapse_qwen3_metal_step(
                 encode_gate_up(context, command_buffer, layer, context->normalized);
                 encode_matvec_residual(context, command_buffer, context->mlp, next, current,
                                         &layer->down_weight, (uint32_t)context->intermediate, (uint32_t)context->hidden, YES);
-                id<MTLBuffer> old_next = next;
-                current = old_next;
-                next = old_next == context->x_a ? context->x_b : context->x_a;
             }
             encode_rmsnorm(context, command_buffer, current, context->final_norm, context->final_norm_weight,
                            (uint32_t)context->hidden, epsilon);

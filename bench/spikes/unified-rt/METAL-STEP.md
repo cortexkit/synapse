@@ -39,8 +39,8 @@ The per-token command buffer encodes these kernels for each of the 28 layers:
 4. `metal_step_attention` — stable two-pass softmax and P/V accumulation
    over the resident cache (the current correctness candidate uses one query-head
    thread; simdgroup reduction work remains gated behind parity).
-5. `metal_step_matvec_residual` — O projection plus attention residual.
-6. `metal_step_rmsnorm` — pre-MLP RMSNorm.
+5. `metal_step_matvec_residual` — O projection.
+6. `metal_step_residual_rmsnorm` — fused attention residual add and pre-MLP RMSNorm.
 7. `metal_step_gate_up_swiglu` — fused gate/up matvec and SiLU product.
 8. `metal_step_matvec_residual` — down projection plus MLP residual.
 9. A final `metal_step_rmsnorm` and `metal_step_lm_head` produce f32 logits.
@@ -60,57 +60,58 @@ $ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun -sdk macosx --f
 $ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer cargo build -p spike-unified-rt --release --bin spike-unified-rt
 Finished `release` profile [optimized]
 $ stat target/release/qwen3_decode_metal_step.metallib
-41282 bytes
+40914 bytes; no cargo:warning emitted
 ```
 
-Gate 1 was run against the committed 20-prompt, 64-token fixture and stopped on
-failure. The first implementation exposed NaN logits; the in-slot key-write and
-residual-add fixes removed the NaNs, but the parity gate still diverges at the
-second generated token:
+The ordered model and hook gates are green:
 
 ```text
-$ target/release/spike-unified-rt ... --decode-backend metal-step ... --max-new-tokens 64
-owned-rt-metal-step: exact prompts 0/20
-completion-01 step 1: owned token 11, reference token 13
-completion-02 step 1: owned token 220, reference token 23
-...
-Error: token-exact fp32/f16 decode gate failed
+Gate 1 f16:
+  20/20 exact prompts, 1,280/1,280 tokens, 0 near-tie exemptions
+Gate 2 Q8_0:
+  15/20 exact prompts, median match depth 64.0, 0 near-tie exemptions
+  quantized_weight_sha256=4c774c188ec089ac1e9b30e9797b364993d5c2445d3e479d5d1b94f6d10969d0
+Gate 3 hooks:
+  cargo test -p spike-unified-rt qwen3_decode — 8 passed, 0 failed
+  token tap, pause/resume, splice, addressable regions, and deterministic ties passed
+Gate 4 prefill handoff:
+  all-MPSGraph and metal-step outputs equal for completion-01, 64/64 tokens
 ```
 
-The MPSGraph control produces `completion-01` tokens `12095, 13`; the custom
-step produces `12095, 11`. The first generated token is correct on all 20 rows,
-but Gate 1 is **not green**, so Q8_0, hook/prefill gates, and all timing cells
-were not run. No threshold or near-tie exemption was applied.
-
-```text
-Gate 1: FAIL (0/20 exact; stopped here)
-Gate 2: NOT RUN (ordered gate stop)
-Gate 3: NOT RUN (ordered gate stop)
-Gate 4: NOT RUN (ordered gate stop)
-Timing: NOT RUN (ordered gate stop)
-```
+The parity failure was localized by dumping every layer's new cache slot: all
+pre-existing slots were byte-identical, while the new slot differed only in the
+K/V values produced by the broken state ping-pong. The down projection wrote into
+the old current buffer, but the host loop then advanced `current` to the O
+projection buffer, dropping the MLP output before layer 1. Removing that swap
+made the current-state buffer persistent and produced the gate results above.
 
 ## Measurement table
 
-Numbers belong here only after gates 1–4 pass on the locked M1 Max using
-`mkdir [bench-user-home]/bench.lock` for timed cells and varied prompt text for every
-iteration.
+Timed on `[bench-host]` (M1 Max), AC power, while holding and then
+promptly releasing `[bench-user-home]/bench.lock`. Each cell used 12 distinct prompts
+from the fixed stride-seven schedule, repeated twice (24 fresh processes total).
+The metallib was transferred beside the executable and loaded executable-relative.
 
 | Backend | Weights | Prompts / repeats | Decode tok/s | Encode / GPU / host per token | Status |
 | --- | --- | --- | ---: | --- | --- |
 | MPSGraph reference | f16 | 12 x 2 | 84.32 baseline | pending fresh breakdown | prior baseline |
-| Metal step | f16 | 20 x 1 gate | not reported | not reported | **Gate 1 failed** |
-| Metal step | Q8_0 | — | not run | not run | ordered gate stop |
-| llama.cpp Metal | Q8_0 | — | not run | not run | ordered gate stop |
-Do not use prefix-cache replay for this table. Report encode, GPU command-buffer
-wait, logits readback/host, and total per-token wall time separately.
+| Metal step | f16 | 12 x 2 | **5.8080 median** | 0.1025 ms / 171.8693 ms / 0.0146 ms | gates green |
+| Metal step | Q8_0 | 12 x 2 | **5.0405 median** | 0.1021 ms / 198.0879 ms / 0.0141 ms | gates green |
+| llama.cpp Metal | Q8_0 | 12 x 2 | not run | not run | `llama-cli` unavailable on locked M1 |
+
+The owned-step host column excludes GPU command-buffer wait, logits readback,
+and sampler time; median readback was 0.033 ms/token and median sampling was
+0.158 ms/token. A fresh llama.cpp comparison could not be made because neither
+`llama-cli` nor `llama-server` is installed on the locked host; no substitute or
+stale server result is relabeled as the requested control.
 
 ## Campaign targets
 
-After certification, the next campaign should first measure whether shared-mode
-persistent weights are limiting bandwidth; if so, copy the static feeds into
-private buffers during preparation. The attention kernel currently favors a
-simple parity-safe two-pass softmax. A simdgroup score/reduction variant is the
-next controlled experiment, keeping the current kernel as the hard parity
-fallback. Only after the f16 and Q8_0 gates remain green should command-buffer
-pipelining or online softmax be evaluated.
+The first correctness-green implementation is intentionally a parity-first
+candidate, not a throughput winner: the single-thread attention kernel and
+28-layer dispatch count make GPU execution the dominant stage. The next campaign
+should restore the 32-wide simdgroup score reduction only after preserving the
+20/20 gate, then fuse or batch the remaining per-layer dispatches. Q8_0 currently
+has lower throughput than f16 on this implementation despite its lower weight
+traffic, so its dequant matvec and launch overhead need a separate profile before
+claiming a bandwidth win.
