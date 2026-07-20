@@ -19,7 +19,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
-BASELINE_TOK_S = 376.824259765553
+BASELINE_TOK_S = 446.21439926190544
 # Frozen Qwen3-0.6B Q8_0 quality profile from QUANT-DECODE.md; the 13/20 and
 # 54.5 profile belongs to the separate LFM2-1.2B row.
 QUALITY_BASELINE_EXACT = 10
