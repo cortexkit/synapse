@@ -2,7 +2,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use cortexkit_lease::{FileLeaseStore, LeaseHandle, LeaseKey, LeaseStore};
@@ -15,6 +15,7 @@ use crate::{SanitizedTokenizer, TokenizationError, TokenizerConfig};
 const CACHE_MODULE_ID: &str = "models-cache";
 const CACHE_LEASE_BACKEND: &str = "file";
 const TMP_DIR: &str = "tmp";
+const TMP_CLEANUP_MIN_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const BLOBS_DIR: &str = "blobs";
 const META_DIR: &str = "meta";
 
@@ -166,6 +167,17 @@ impl ModelCache {
     }
 
     pub fn ingest(&self, request: ModelCacheIngest) -> Result<ModelCacheMeta, ModelCacheError> {
+        self.ingest_with_duplicate_cleanup_hook(request, |_| {})
+    }
+
+    fn ingest_with_duplicate_cleanup_hook<F>(
+        &self,
+        request: ModelCacheIngest,
+        before_duplicate_cleanup: F,
+    ) -> Result<ModelCacheMeta, ModelCacheError>
+    where
+        F: FnOnce(&Path),
+    {
         self.ensure_layout()?;
         self.cleanup_tmp()?;
         let temp_path = self.root.join(TMP_DIR).join(format!(
@@ -195,11 +207,8 @@ impl ModelCache {
             })?;
             sync_parent(&blob_path);
         } else {
-            fs::remove_file(&temp_path).map_err(|source| ModelCacheError::Io {
-                action: "remove duplicate temp blob",
-                path: temp_path.display().to_string(),
-                source,
-            })?;
+            before_duplicate_cleanup(&temp_path);
+            remove_file_if_absent(&temp_path, "remove duplicate temp blob")?;
         }
 
         let sanitized_tokenizer_digest = request
@@ -337,29 +346,9 @@ impl ModelCache {
         }
 
         let blob_path = self.blob_path(&normalized);
-        match fs::remove_file(&blob_path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(source) => {
-                return Err(ModelCacheError::Io {
-                    action: "delete cache blob",
-                    path: blob_path.display().to_string(),
-                    source,
-                });
-            }
-        }
+        remove_file_if_absent(&blob_path, "delete cache blob")?;
         let meta_path = self.meta_path(&normalized);
-        match fs::remove_file(&meta_path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(source) => {
-                return Err(ModelCacheError::Io {
-                    action: "delete cache metadata",
-                    path: meta_path.display().to_string(),
-                    source,
-                });
-            }
-        }
+        remove_file_if_absent(&meta_path, "delete cache metadata")?;
         sync_parent(&blob_path);
         sync_parent(&meta_path);
         Ok(CacheGcOutcome::Deleted { digest: normalized })
@@ -491,6 +480,9 @@ impl ModelCache {
         if !tmp_dir.exists() {
             return Ok(());
         }
+        // The cache is machine-wide, so a concurrent ingest may own a fresh file here.
+        // Only remove files old enough to be abandoned by a crashed process.
+        let now = SystemTime::now();
         for entry in fs::read_dir(&tmp_dir).map_err(|source| ModelCacheError::Io {
             action: "list temp cache directory",
             path: tmp_dir.display().to_string(),
@@ -502,13 +494,30 @@ impl ModelCache {
                 source,
             })?;
             let path = entry.path();
-            if path.is_file() {
-                fs::remove_file(&path).map_err(|source| ModelCacheError::Io {
-                    action: "remove stale temp cache file",
-                    path: path.display().to_string(),
-                    source,
-                })?;
+            let metadata = match fs::metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(source) => {
+                    return Err(ModelCacheError::Io {
+                        action: "stat temp cache entry",
+                        path: path.display().to_string(),
+                        source,
+                    });
+                }
+            };
+            if !metadata.is_file() {
+                continue;
             }
+            let Ok(modified) = metadata.modified() else {
+                continue;
+            };
+            let Ok(age) = now.duration_since(modified) else {
+                continue;
+            };
+            if age < TMP_CLEANUP_MIN_AGE {
+                continue;
+            }
+            remove_file_if_absent(&path, "remove stale temp cache file")?;
         }
         Ok(())
     }
@@ -669,6 +678,18 @@ fn normalize_for_lease(digest: &str) -> String {
     digest.strip_prefix("sha256:").unwrap_or(digest).to_string()
 }
 
+fn remove_file_if_absent(path: &Path, action: &'static str) -> Result<(), ModelCacheError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(ModelCacheError::Io {
+            action,
+            path: path.display().to_string(),
+            source,
+        }),
+    }
+}
+
 fn sync_parent(path: &Path) {
     if let Some(parent) = path.parent() {
         if let Ok(dir) = File::open(parent) {
@@ -686,6 +707,8 @@ fn now_nanos() -> u128 {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::FileTimes;
+
     use super::*;
 
     #[test]
@@ -710,12 +733,23 @@ mod tests {
     }
 
     #[test]
-    fn ingest_cleans_stale_temp_and_publishes_atomically() {
+    fn ingest_cleans_stale_temp_and_preserves_fresh_foreign_temp() {
         let root = temp_root("crash-safe-ingest");
         let tmp = root.join(TMP_DIR);
         fs::create_dir_all(&tmp).unwrap();
         let stale = tmp.join("left-behind.tmp");
         fs::write(&stale, b"partial").unwrap();
+        let stale_modified = SystemTime::now()
+            .checked_sub(TMP_CLEANUP_MIN_AGE + Duration::from_secs(1))
+            .expect("current time should be after stale time");
+        File::options()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(stale_modified))
+            .unwrap();
+        let fresh_foreign = tmp.join("ingest-foreign-123-456.tmp");
+        fs::write(&fresh_foreign, b"active").unwrap();
         let source = root.join("source.bin");
         fs::write(&source, b"artifact-b").unwrap();
 
@@ -730,9 +764,37 @@ mod tests {
             })
             .expect("ingest should publish final blob");
 
-        assert!(!stale.exists(), "orphaned temp files should be removed");
+        assert!(!stale.exists(), "old orphaned temp files should be removed");
+        assert!(
+            fresh_foreign.exists(),
+            "fresh foreign temp files must not be removed during ingest"
+        );
         assert!(cache.blob_path(&meta.digest).exists());
         assert!(cache.meta_path(&meta.digest).exists());
+    }
+
+    #[test]
+    fn ingest_duplicate_cleanup_tolerates_pre_removed_temp() {
+        let (cache, first) = ingest_fixture("duplicate-cleanup-race", b"artifact-e", None);
+
+        let second = cache
+            .ingest_with_duplicate_cleanup_hook(
+                ModelCacheIngest {
+                    source_url: format!("file://{}/source.bin", cache.root().display()),
+                    expected_digest: None,
+                    format: "bin".to_string(),
+                    tokenizer_path: None,
+                    pin_module_id: None,
+                },
+                |temp_path| {
+                    assert!(temp_path.exists());
+                    fs::remove_file(temp_path).expect("test should remove loser temp first");
+                },
+            )
+            .expect("pre-removed duplicate temp should be treated as cleaned up");
+
+        assert_eq!(second.digest, first.digest);
+        assert!(cache.blob_path(&second.digest).exists());
     }
 
     #[test]
