@@ -2,14 +2,16 @@
 
 **Assessment date:** 2026-07-20  
 **Reference checkout:** `~/Work/OSS/leap-finetune`, `4dbf17b11542f6c167ac032d4b2dd0a3f8961542`  
-**Decision status:** recipe and source-level contract review complete; the physical CUDA ladder is **blocked before step 1**.
+**Decision status:** environment and dense SFT/resume smoke passed; the physical ladder hit a hard GGUF-export blocker at step 2, so later GRPO/LoRA steps were not run.
 
 ## Executive result
 
-`leap-finetune` is a good fit for the voice BRIDGE SFT student and for a
-single-GPU dense GRPO experiment, subject to running the smoke on a Linux CUDA
-host. It has a first-party LFM2 data/template path, checkpoint/resume handling,
-GGUF export, and TRL v1 GRPO with colocated vLLM rollouts.
+The physical run confirms that the environment and dense SFT/resume path work on
+a Linux CUDA host. It does **not** confirm the train-to-serve path: the bundled
+GGUF converter fails on a standard LFM2-350M checkpoint before `llama-cli` can
+run. GRPO and LoRA were not run after that hard blocker, per the requested
+stop-at-first-blocker rule. Source review still supports the dense GRPO and
+custom-reward verdicts below, but they remain unmeasured.
 
 The gatherer-tier **LFM2-8B-A1B cannot use GRPO in this checkout**. Although a
 `MOE_GRPO` defaults dictionary exists, the actual text GRPO runner rejects MoE
@@ -25,26 +27,33 @@ names and `**kwargs`.
 
 ## Execution boundary and spend
 
-No Vast instance was rented from this worktree. The attached host has no
-`nvidia-smi` CUDA device, and no driver, wheel-resolution, checkpoint, GGUF, or
-vLLM measurements can honestly be reported as completed. The Vast CLI is
-installed locally, but using it to create a paid instance is intentionally left
-to the campaign owner. **Spend: $0.00. Destruction: not applicable; no instance
-was created.**
+A qualifying RTX 4090 was rented and the physical run started. The admission gate
+passed: driver `580.159.03`, CUDA capability 13.0, reliability `99.8246%`, and
+an RTX 4090 with 24,564 MiB. The final box used
+`pytorch/pytorch:2.7.1-cuda12.8-cudnn9-devel`; the leap environment itself
+resolved the pinned CUDA 13 stack.
 
-Consequently, the status of the requested ladder is:
+The ladder stopped at the GGUF exporter. Two earlier rentals on one host failed
+to leave the SSH proxy in a usable state and were destroyed; the final rental
+ran the environment and SFT successfully. Final labeled-instance destruction
+was verified with `vastai show instances-v1 --label leap-finetune-smoke`, which
+returned zero instances.
 
-| Step | Requested proof | Result in this assessment | Wall time / VRAM |
+| Step | Requested proof | Physical result | Wall time / peak VRAM |
 |---|---|---|---|
-| 0 | Driver gate and `uv sync` | Not run: no rented Linux CUDA host | Not measured |
-| 1 | Dense 350M SFT, checkpoint, falling loss, resume | Not run | Not measured |
-| 2 | F16/Q8_0 GGUF and `llama-cli` prompt | Not run | Not measured |
-| 3 | 350M GRPO, custom reward, vLLM, finite update | Not run | Not measured |
-| 4 | 350M LoRA SFT and adapter export | Not run | Not measured |
+| 0 | Driver gate and `uv sync` | **Passed**; FA2 usable | `uv sync` 50.73 s; driver gate passed |
+| 1 | Dense 350M SFT, checkpoint, falling loss, resume | **Passed**; checkpoint, optimizer/scheduler state, falling loss, and resume to step 30 | initial SFT 92.71 s / 3,964 MiB; resume 76.60 s / VRAM sample not retained |
+| 2 | F16/Q8_0 GGUF and `llama-cli` prompt | **Hard blocker**; bundled converter cannot map `model.layers.0.feed_forward.w1.weight` | exporter did not complete; `llama-cli` not reached |
+| 3 | 350M GRPO, custom reward, vLLM, finite update | Not run after step-2 blocker | Not measured |
+| 4 | 350M LoRA SFT and adapter export | Not run after step-2 blocker | Not measured |
 
-The commands below are the exact smoke recipe to run once a qualifying box is
-available. The capacity table is an engineering estimate, not a substitute for
-those measurements.
+Campaign spend was **$0.083** for the three rentals used by this task: $0.017
+storage charges for the two failed startup attempts and $0.066 for the final
+SFT host (GPU, storage, and 5.320 GB download charges). This is below the $6
+cap. The unrelated instances visible in the account invoice were not touched.
+
+The commands below remain the exact smoke recipe and include the deviations and
+measured outcomes from this run.
 
 ## Working recipe for the CUDA box
 
@@ -231,7 +240,8 @@ only for model weights:
 
 ```bash
 cd "$LEAP_ROOT"
-CHECKPOINT=$(realpath outputs/lfm2_350m_sft_smoke/latest)
+RUN_DIR=$(dirname "$(find outputs/lfm2_350m_sft_smoke -type l -name latest -print -quit)")
+CHECKPOINT=$(realpath "$RUN_DIR/latest")
 test -f "$CHECKPOINT/config.json"
 test -f "$CHECKPOINT/trainer_state.json"
 test -f "$CHECKPOINT/optimizer.pt" || test -f "$CHECKPOINT/optimizer.bin"
@@ -273,8 +283,9 @@ path.write_text(yaml.safe_dump(config, sort_keys=False))
 PY
 set -o pipefail
 uv run leap-finetune smoke/sft-350m-resume.yaml 2>&1 | tee smoke/sft-resume.log
-CHECKPOINT=$(realpath outputs/lfm2_350m_sft_smoke/latest)
-python - "$CHECKPOINT/trainer_state.json" <<'PY'
+RUN_DIR=$(dirname "$(find outputs/lfm2_350m_sft_smoke -type l -name latest -print -quit)")
+CHECKPOINT=$(realpath "$RUN_DIR/latest")
+python - "$CHECKPOINT/trainer_state.json" <<'PY
 import json
 import sys
 state = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -296,7 +307,8 @@ checkpoint:
 
 ```bash
 cd "$LEAP_ROOT"
-CHECKPOINT=$(realpath outputs/lfm2_350m_sft_smoke/latest)
+RUN_DIR=$(dirname "$(find outputs/lfm2_350m_sft_smoke -type l -name latest -print -quit)")
+CHECKPOINT=$(realpath "$RUN_DIR/latest")
 uv run leap-export-gguf "$CHECKPOINT" \
   --quant F16 \
   --quant Q8_0 \
@@ -334,9 +346,18 @@ for quant in F16 Q8_0; do
 done
 ```
 
-The command must exit successfully for both files and emit a completion, not
-just a file header. Record the two file sizes, the llama.cpp revision, and the
-prompt output. A converter-only pass is not a train-to-serve pass.
+On the physical run, this command stopped during the first F16 conversion:
+
+```text
+ValueError: Can not map tensor 'model.layers.0.feed_forward.w1.weight'
+```
+
+The bundled converter's LFM2 mapping does not recognize the model's standard
+`feed_forward.w1` tensor, so neither F16 nor Q8_0 was produced and `llama-cli`
+was not reached. This is a first-party exporter blocker, not a CUDA or
+llama.cpp load failure. Do not claim the train-to-serve loop is closed until
+Liquid fixes the mapping (or documents an unmodified supported checkpoint
+shape).
 
 ### 5. Dense GRPO with a custom callable
 
@@ -520,30 +541,33 @@ the adapter into the base model first, then exporting the merged checkpoint.
 
 ## Capacity and timing expectations
 
-These are planning estimates only. The requested physical run was not made, so
-there is no measured 350M wall time or peak VRAM. Measure wall time with the
-`/usr/bin/time` wrappers above and capture peak VRAM with a concurrent
-`nvidia-smi --query-gpu=timestamp,memory.used --format=csv -lms 500` sampler.
+The following are the measurements retained from the final rental. Peak VRAM
+was sampled every 500 ms with `nvidia-smi`; the resume sampler file was not
+retrieved before destroying the host, so that cell is explicitly not reported.
 
-### Memory floor and scale extrapolation
+| Operation | Configuration | Wall time | Peak VRAM |
+|---|---|---:|---:|
+| Environment | Python 3.12.13, Torch 2.11.0+cu130, FA2 2.8.3 | 50.73 s | N/A |
+| Dense SFT | LFM2-350M, 200 rows, 20 steps, BF16, full weights | 92.71 s | 3,964 MiB |
+| Resume | Same run, `latest`, continued to step 30 | 76.60 s | Not retained |
+| GGUF export | Resumed checkpoint, F16 first | Blocked | Not applicable |
+| GRPO / vLLM | Not run after GGUF blocker | Not measured | Not measured |
+| LoRA / adapter export | Not run after GGUF blocker | Not measured | Not measured |
 
-For BF16 weights, the weight-only floor is approximately 2 bytes per parameter.
-A full Adam-style update has a rough model-state floor of 12 bytes per
-parameter (BF16 weights + BF16 gradients + two FP32 optimizer moments), before
-activations, CUDA workspaces, Ray, and vLLM. The following is therefore a
-planning range, not a benchmark:
+The SFT sampler reported a 1 MiB idle baseline and a 3,964 MiB maximum. The
+training log reported loss falling from `6.8755846` to `0.2050134`; the resumed
+checkpoint contained `optimizer.pt`, `scheduler.pt`, `rng_state.pth`, and
+`trainer_state.json` at global step 30. Ray emitted repeated metrics-exporter
+connection warnings, but they did not affect training or checkpointing.
 
-| Model | BF16 weights only | Full-update model-state floor | 350M-calibrated smoke expectation |
-|---|---:|---:|---|
-| LFM2-350M | ~0.7 GB | ~4.2 GB | Dense SFT roughly 6–8 GB; LoRA roughly 3–5 GB; colocated GRPO roughly 8–12 GB |
-| LFM2-1.2B | ~2.4 GB | ~14.4 GB | Dense SFT may fit a 24 GB 4090 at short context with checkpointing; GRPO/vLLM and long context need a measured run |
-| LFM2-2.6B | ~5.2 GB | ~31.2 GB | Full SFT is not a 24 GB 4090 plan; LoRA may fit with short context, while GRPO needs a separate memory budget |
-
-The GRPO range includes a second copy of model execution in colocated vLLM and
-its KV/cache/workspace allocation. Sequence length, generations, batch size,
-and vLLM utilization dominate the range; do not extrapolate the 350M range
-linearly to a production 1.2B or 2.6B run. The user-requested smoke bound is
-respected here: no 1.2B+ run is proposed or claimed.
+For scale planning only, the unmeasured model-state floor remains approximately
+2 bytes per parameter for BF16 weights and 12 bytes per parameter for BF16
+weights + BF16 gradients + two FP32 Adam moments, before activations and
+workspaces. That gives approximately 0.7/2.4/5.2 GB of weights and
+4.2/14.4/31.2 GB of full-update state at 350M/1.2B/2.6B respectively. These
+are floors, not measured VRAM; the requested run did not execute at 1.2B+.
+Colocated GRPO would add vLLM execution and KV/cache memory, so its 350M VRAM
+and any 1.2B/2.6B extrapolation remain unmeasured after the exporter blocker.
 
 ## Custom-reward seam verdict
 
@@ -706,6 +730,6 @@ contracts at the revision recorded above:
 - the existing repository's `tools/gather-distill/train/README.md` and
   Axolotl configs/templates.
 
-No claim in this document that requires a GPU—wall time, peak VRAM, checkpoint
-creation, GGUF load, vLLM startup, reward metrics, or instance destruction—is
-marked as passed until the ladder is run on the qualifying host.
+Claims requiring a GPU are marked passed only where the retained run evidence
+supports them. GGUF load, vLLM startup, reward metrics, and LoRA adapter export
+remain explicitly unmeasured because the ladder stopped at the exporter blocker.
