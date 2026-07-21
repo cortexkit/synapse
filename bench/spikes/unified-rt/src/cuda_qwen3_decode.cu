@@ -2,6 +2,7 @@
 
 #include <cfloat>
 #include <cstdio>
+#include <cstdlib>
 
 using namespace synapse_cuda_family;
 
@@ -94,15 +95,16 @@ __global__ void decode_fused_qk_head_norm_rope(
     float *q_output,
     const float *k_input,
     const float *k_weight,
-    float *k_output,
+    float *key_cache,
     int query_heads,
     int kv_heads,
     int head_dim,
-    int position,
+    const int *position_pointer,
     float epsilon,
     float theta
 ) {
     int head = blockIdx.x;
+    int position = *position_pointer;
     const float *input;
     const float *weight;
     float *output;
@@ -115,7 +117,8 @@ __global__ void decode_fused_qk_head_norm_rope(
         if (head >= kv_heads) return;
         input = k_input;
         weight = k_weight;
-        output = k_output;
+        output = key_cache
+            + static_cast<size_t>(position) * kv_heads * head_dim;
     }
     int base = head * head_dim;
     float square = 0.0f;
@@ -155,13 +158,14 @@ __global__ void decode_attention(
     const float *key_cache,
     const float *value_cache,
     float *output,
-    int sequence,
+    const int *position_pointer,
     int query_heads,
     int kv_heads,
     int head_dim
 ) {
     int query_head = blockIdx.x;
     if (query_head >= query_heads) return;
+    int sequence = *position_pointer + 1;
     int groups = query_heads / kv_heads;
     int kv_head = query_head / groups;
     extern __shared__ float scores[];
@@ -317,6 +321,18 @@ __global__ void decode_fused_gate_up_swiglu_q8_0(
     }
 }
 
+__global__ void decode_store_cache(
+    const float *values,
+    float *cache,
+    int count,
+    const int *position_pointer
+) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < count) {
+        cache[static_cast<size_t>(*position_pointer) * count + index] = values[index];
+    }
+}
+
 __global__ void decode_fused_qkv_matvec_q8_0(
     const uint8_t *q_weights,
     const uint8_t *k_weights,
@@ -324,10 +340,11 @@ __global__ void decode_fused_qkv_matvec_q8_0(
     const float *input,
     float *q_output,
     float *k_output,
-    float *v_output,
+    float *value_cache,
     int query_rows,
     int kv_rows,
-    int columns
+    int columns,
+    const int *position_pointer
 ) {
     int row = blockIdx.x;
     const uint8_t *weights;
@@ -343,7 +360,8 @@ __global__ void decode_fused_qkv_matvec_q8_0(
         local_row = row - query_rows;
     } else {
         weights = v_weights;
-        output = v_output;
+        output = value_cache
+            + static_cast<size_t>(*position_pointer) * kv_rows;
         local_row = row - query_rows - kv_rows;
     }
     int lane = threadIdx.x & 31;
@@ -372,6 +390,8 @@ __global__ void decode_fused_qkv_matvec_q8_0(
 
 struct Qwen3DecodeContext {
     cudaStream_t stream = nullptr;
+    cudaGraph_t decode_graph = nullptr;
+    cudaGraphExec_t decode_graph_exec = nullptr;
     bool weights_loaded = false;
     int capacity;
     int position = 0;
@@ -383,14 +403,20 @@ struct Qwen3DecodeContext {
     DeviceMatrix lm_head;
     DeviceAllocation<float> x0, x1, normed, q_raw, k_raw, v_raw, q, k;
     DeviceAllocation<float> attention, projected, gate, up, activated, logits;
+    DeviceAllocation<int> device_position;
+    bool verify_graph_once = false;
 
     explicit Qwen3DecodeContext(int cache_capacity) : capacity(cache_capacity) {
         if (capacity <= 0) throw std::runtime_error("Qwen3 CUDA decode capacity must be positive");
         FAMILY_CUDA_CHECK(cudaFree(nullptr));
         FAMILY_CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        const char *verify_graph = std::getenv("SYNAPSE_CUDA_GRAPH_VERIFY");
+        verify_graph_once = verify_graph && std::strcmp(verify_graph, "1") == 0;
     }
 
     ~Qwen3DecodeContext() {
+        if (decode_graph_exec) cudaGraphExecDestroy(decode_graph_exec);
+        if (decode_graph) cudaGraphDestroy(decode_graph);
         if (stream) cudaStreamDestroy(stream);
     }
 
@@ -463,6 +489,7 @@ struct Qwen3DecodeContext {
         up.allocate(intermediate);
         activated.allocate(intermediate);
         logits.allocate(vocab);
+        device_position.allocate(1);
         FAMILY_CUDA_CHECK(cudaDeviceSynchronize());
         weights_loaded = true;
         std::fprintf(
@@ -487,20 +514,10 @@ struct Qwen3DecodeContext {
         }
     }
 
-    void run_token(const float *host_embedding, int token_position, bool produce_logits) {
-        if (token_position < 0 || token_position >= capacity) {
-            throw std::runtime_error("Qwen3 CUDA decode position exceeds cache capacity");
-        }
+    void run_token_compute(bool produce_logits) {
         int query_width = query_heads * head_dim;
         int kv_width = kv_heads * head_dim;
         int threads = 256;
-        FAMILY_CUDA_CHECK(cudaMemcpyAsync(
-            x0.pointer,
-            host_embedding,
-            static_cast<size_t>(hidden) * sizeof(float),
-            cudaMemcpyHostToDevice,
-            stream
-        ));
         decode_rms_norm<<<1, threads, 0, stream>>>(
             x0.pointer, layers.front().input_norm.pointer, normed.pointer, hidden, epsilon
         );
@@ -514,27 +531,31 @@ struct Qwen3DecodeContext {
                     normed.pointer,
                     q_raw.pointer,
                     k_raw.pointer,
-                    layer.value_cache.pointer + static_cast<size_t>(token_position) * kv_width,
+                    layer.value_cache.pointer,
                     query_width,
                     kv_width,
-                    hidden
+                    hidden,
+                    device_position.pointer
                 );
             } else {
                 matvec(layer.q_weight, normed.pointer, q_raw.pointer, query_width, hidden);
                 matvec(layer.k_weight, normed.pointer, k_raw.pointer, kv_width, hidden);
-                matvec(layer.v_weight, normed.pointer, layer.value_cache.pointer + static_cast<size_t>(token_position) * kv_width, kv_width, hidden);
+                matvec(layer.v_weight, normed.pointer, v_raw.pointer, kv_width, hidden);
+                decode_store_cache<<<(kv_width + threads - 1) / threads, threads, 0, stream>>>(
+                    v_raw.pointer, layer.value_cache.pointer, kv_width, device_position.pointer
+                );
             }
             decode_fused_qk_head_norm_rope<<<query_heads + kv_heads, threads, 0, stream>>>(
                 q_raw.pointer, layer.q_norm.pointer, q.pointer,
-                k_raw.pointer, layer.k_norm.pointer, layer.key_cache.pointer + static_cast<size_t>(token_position) * kv_width,
-                query_heads, kv_heads, head_dim, token_position, epsilon, theta
+                k_raw.pointer, layer.k_norm.pointer, layer.key_cache.pointer,
+                query_heads, kv_heads, head_dim, device_position.pointer, epsilon, theta
             );
-            decode_attention<<<query_heads, threads, static_cast<size_t>(token_position + 1) * sizeof(float), stream>>>(
+            decode_attention<<<query_heads, threads, static_cast<size_t>(capacity) * sizeof(float), stream>>>(
                 q.pointer,
                 layer.key_cache.pointer,
                 layer.value_cache.pointer,
                 attention.pointer,
-                token_position + 1,
+                device_position.pointer,
                 query_heads,
                 kv_heads,
                 head_dim
@@ -598,6 +619,27 @@ struct Qwen3DecodeContext {
         FAMILY_CUDA_CHECK(cudaGetLastError());
     }
 
+    void run_token(const float *host_embedding, int token_position, bool produce_logits) {
+        if (token_position < 0 || token_position >= capacity) {
+            throw std::runtime_error("Qwen3 CUDA decode position exceeds cache capacity");
+        }
+        FAMILY_CUDA_CHECK(cudaMemcpyAsync(
+            x0.pointer,
+            host_embedding,
+            static_cast<size_t>(hidden) * sizeof(float),
+            cudaMemcpyHostToDevice,
+            stream
+        ));
+        FAMILY_CUDA_CHECK(cudaMemcpyAsync(
+            device_position.pointer,
+            &token_position,
+            sizeof(token_position),
+            cudaMemcpyHostToDevice,
+            stream
+        ));
+        run_token_compute(produce_logits);
+    }
+
     void prefill(const float *host_embeddings, int sequence, float *host_logits) {
         if (!weights_loaded || !host_embeddings || !host_logits || sequence <= 0 || sequence > capacity) {
             throw std::runtime_error("Qwen3 CUDA prefill received invalid inputs");
@@ -621,11 +663,144 @@ struct Qwen3DecodeContext {
         position = sequence;
     }
 
+    void verify_captured_step(const float *host_embedding, int requested_position) {
+        const size_t cache_slot = static_cast<size_t>(kv_heads) * head_dim;
+        const size_t cache_bytes = cache_slot * sizeof(float);
+        std::vector<float> uncaptured_logits(logits.count);
+        std::vector<float> captured_logits(logits.count);
+        std::vector<float> uncaptured_cache(2 * layers.size() * cache_slot);
+        std::vector<float> captured_cache(uncaptured_cache.size());
+
+        // The uncaptured and captured launches start from the same cache state. Each
+        // pass overwrites only the current slot, so no large cache snapshot is needed.
+        FAMILY_CUDA_CHECK(cudaStreamSynchronize(stream));
+        FAMILY_CUDA_CHECK(cudaGraphLaunch(decode_graph_exec, stream));
+        FAMILY_CUDA_CHECK(cudaStreamSynchronize(stream));
+        int captured_position = -1;
+        FAMILY_CUDA_CHECK(cudaMemcpy(
+            &captured_position, device_position.pointer, sizeof(captured_position), cudaMemcpyDeviceToHost
+        ));
+        FAMILY_CUDA_CHECK(cudaMemcpy(
+            captured_logits.data(), logits.pointer, logits.count * sizeof(float), cudaMemcpyDeviceToHost
+        ));
+        for (size_t index = 0; index < layers.size(); ++index) {
+            const size_t offset = static_cast<size_t>(requested_position) * cache_slot;
+            FAMILY_CUDA_CHECK(cudaMemcpy(
+                captured_cache.data() + 2 * index * cache_slot,
+                layers[index].key_cache.pointer + offset,
+                cache_bytes,
+                cudaMemcpyDeviceToHost
+            ));
+            FAMILY_CUDA_CHECK(cudaMemcpy(
+                captured_cache.data() + (2 * index + 1) * cache_slot,
+                layers[index].value_cache.pointer + offset,
+                cache_bytes,
+                cudaMemcpyDeviceToHost
+            ));
+        }
+
+        FAMILY_CUDA_CHECK(cudaMemcpyAsync(
+            x0.pointer,
+            host_embedding,
+            static_cast<size_t>(hidden) * sizeof(float),
+            cudaMemcpyHostToDevice,
+            stream
+        ));
+        FAMILY_CUDA_CHECK(cudaMemcpyAsync(
+            device_position.pointer,
+            &requested_position,
+            sizeof(requested_position),
+            cudaMemcpyHostToDevice,
+            stream
+        ));
+        run_token_compute(true);
+        FAMILY_CUDA_CHECK(cudaStreamSynchronize(stream));
+        int uncaptured_position = -1;
+        FAMILY_CUDA_CHECK(cudaMemcpy(
+            &uncaptured_position, device_position.pointer, sizeof(uncaptured_position), cudaMemcpyDeviceToHost
+        ));
+        FAMILY_CUDA_CHECK(cudaMemcpy(
+            uncaptured_logits.data(), logits.pointer, logits.count * sizeof(float), cudaMemcpyDeviceToHost
+        ));
+        for (size_t index = 0; index < layers.size(); ++index) {
+            const size_t offset = static_cast<size_t>(requested_position) * cache_slot;
+            FAMILY_CUDA_CHECK(cudaMemcpy(
+                uncaptured_cache.data() + 2 * index * cache_slot,
+                layers[index].key_cache.pointer + offset,
+                cache_bytes,
+                cudaMemcpyDeviceToHost
+            ));
+            FAMILY_CUDA_CHECK(cudaMemcpy(
+                uncaptured_cache.data() + (2 * index + 1) * cache_slot,
+                layers[index].value_cache.pointer + offset,
+                cache_bytes,
+                cudaMemcpyDeviceToHost
+            ));
+        }
+        const bool logits_equal = std::memcmp(
+            uncaptured_logits.data(), captured_logits.data(), logits.count * sizeof(float)
+        ) == 0;
+        const bool cache_equal = std::memcmp(
+            uncaptured_cache.data(), captured_cache.data(), uncaptured_cache.size() * sizeof(float)
+        ) == 0;
+        if (!logits_equal || !cache_equal) {
+            auto maximum_difference = [](const std::vector<float> &left, const std::vector<float> &right) {
+                float maximum = 0.0f;
+                for (size_t index = 0; index < left.size(); ++index) {
+                    maximum = std::max(maximum, std::fabs(left[index] - right[index]));
+                }
+                return maximum;
+            };
+            std::ostringstream message;
+            message << "CUDA Qwen3 captured step differs byte-for-byte from uncaptured step"
+                    << " (requested_position=" << requested_position
+                    << ", uncaptured_position=" << uncaptured_position
+                    << ", captured_position=" << captured_position
+                    << ", logits_equal=" << logits_equal
+                    << ", cache_equal=" << cache_equal
+                    << ", max_logits_abs=" << maximum_difference(uncaptured_logits, captured_logits)
+                    << ", max_cache_abs=" << maximum_difference(uncaptured_cache, captured_cache) << ')';
+            throw std::runtime_error(message.str());
+        }
+        std::fprintf(stderr, "CUDA Qwen3 decode graph verification: captured_exact=true\n");
+        verify_graph_once = false;
+    }
+
     void step(const float *host_embedding, int requested_position, float *host_logits) {
         if (!weights_loaded || !host_embedding || !host_logits || requested_position != position) {
             throw std::runtime_error("Qwen3 CUDA decode cache position mismatch");
         }
-        run_token(host_embedding, requested_position, true);
+        FAMILY_CUDA_CHECK(cudaMemcpyAsync(
+            x0.pointer,
+            host_embedding,
+            static_cast<size_t>(hidden) * sizeof(float),
+            cudaMemcpyHostToDevice,
+            stream
+        ));
+        FAMILY_CUDA_CHECK(cudaMemcpyAsync(
+            device_position.pointer,
+            &requested_position,
+            sizeof(requested_position),
+            cudaMemcpyHostToDevice,
+            stream
+        ));
+        if (!decode_graph_exec) {
+            FAMILY_CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+            run_token_compute(true);
+            FAMILY_CUDA_CHECK(cudaStreamEndCapture(stream, &decode_graph));
+            FAMILY_CUDA_CHECK(cudaGraphInstantiate(
+                &decode_graph_exec,
+                decode_graph,
+                nullptr,
+                nullptr,
+                0
+            ));
+        }
+        if (verify_graph_once) {
+            verify_captured_step(host_embedding, requested_position);
+        } else {
+            FAMILY_CUDA_CHECK(cudaGraphLaunch(decode_graph_exec, stream));
+        }
         FAMILY_CUDA_CHECK(cudaMemcpyAsync(
             host_logits,
             logits.pointer,
