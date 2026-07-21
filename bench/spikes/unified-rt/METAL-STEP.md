@@ -146,10 +146,26 @@ made the current-state buffer persistent and produced the gate results above.
 
 ## Measurement table
 
-Timed on `[bench-host]` (M1 Max), AC power, while holding and then
-promptly releasing `[bench-user-home]/bench.lock`. Each cell used 12 distinct prompts
+Timed on `[bench-host]` (M1 Max), AC power, while holding and then promptly releasing `[bench-user-home]/bench.lock`. Each cell used 12 distinct prompts
 from the fixed stride-seven schedule, repeated twice (24 fresh processes total).
 The metallib was transferred beside the executable and loaded executable-relative.
+The fresh competitor controls used the M1-native `llama-cli` at
+`[bench-user-home]/bench-tools/llama-b9580/llama-cli`, built from llama.cpp tag `b9580`
+(commit `b4e3dc613baa92a3884d4151e3d631395c81934a`) with Xcode/AppleClang 21,
+CMake 4.4.0, and `GGML_METAL=ON`; the installed `llama-cli` SHA-256 is `02590612ba30c89133d656b7c1300028f345ec6c1cb879fb8f750a3626c02491`. The official Q8_0 GGUF came from
+`Qwen/Qwen3-0.6B-GGUF` snapshot `23749fefcc72300e3a2ad315e1317431b06b590a`
+(SHA-256 `9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031`).
+The f16 GGUF was converted on the M1 from the cached
+`Qwen/Qwen3-0.6B` snapshot `c1899de289a04d12100db370d81485cdf75e47ca` with
+that tag's `convert_hf_to_gguf.py --outtype f16` (SHA-256
+`c81c7c27b35225376a52387800c5eca0748a93b46db885a1dbad370a318f55bb`).
+
+The llama command used `-n 64 -ngl 99 -c 512 --single-turn --temp 0
+--top-k 1 --top-p 1 --seed 0 --simple-io --no-display-prompt`; its default
+single sequence (`-np 1`) provided the single-stream cell. `--single-turn` was
+needed because this Qwen GGUF carries a chat template and llama-cli otherwise
+auto-enters its interactive loop. Admission was AC Power, no `Runner.Worker`,
+no pre-existing bench lock, and 1-minute load averages from 1.09 to 1.21.
 
 | Backend | Weights | Prompts / repeats | Decode tok/s | Encode / GPU / host per token | Status |
 | --- | --- | --- | ---: | --- | --- |
@@ -162,13 +178,15 @@ The metallib was transferred beside the executable and loaded executable-relativ
 | Metal step wave 2 | Q8_0 | 12 x 2 | **49.9470 median** | 0.1022 ms / 19.7155 ms / 0.0328 ms | 14/20 exact; median depth 64.0; AC; +70.6% vs wave 1 |
 | Metal step wave 3 | f16 | 12 x 2 | **42.3634 median** | 0.1020 ms / 23.2997 ms / 0.0323 ms | 20/20 exact local gate; AC; +31.1% vs wave 2 |
 | Metal step wave 3 | Q8_0 | 12 x 2 | **67.6920 median** | 0.1023 ms / 14.4657 ms / 0.0332 ms | 11/20 exact local gate; median depth 64.0; AC; +35.5% vs wave 2 |
-| llama.cpp Metal | Q8_0 | 12 x 2 | not run | not run | `llama-cli` unavailable on locked M1 |
+| llama.cpp Metal | Q8_0 | 12 x 2 | **207.40 median (200.40–208.20)** | — | fresh `llama-cli` b9580; AC |
 
+The fresh llama.cpp Q8_0 repeat medians were **207.45 tok/s** (spread
+201.60–208.20) and **207.40 tok/s** (spread 200.40–207.80); the combined
+24-sample median was **207.40 tok/s**, with a 200.40–208.20 per-cell range.
 The owned-step host column excludes GPU command-buffer wait, logits readback,
 and sampler time; median readback was 0.033 ms/token and median sampling was
-0.158 ms/token. A fresh llama.cpp comparison could not be made because neither
-`llama-cli` nor `llama-server` is installed on the locked host; no substitute or
-stale server result is relabeled as the requested control.
+0.158 ms/token. A same-machine f16 llama-cli row is recorded in
+`DECODE-WAVE1.md`.
 
 ## Campaign targets
 

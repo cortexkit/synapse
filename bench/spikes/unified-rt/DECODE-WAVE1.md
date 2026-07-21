@@ -6,7 +6,7 @@ The owned Qwen3-0.6B f16 Metal decoder reaches **84.32 tok/s** on the locked M1 
 
 The foundations report's 3.2 tok/s result used a debug binary on a contended M5, so it is context rather than a locked release baseline. Instrumented release controls on the M1 showed that the step graph was already cached, but executable preparation and a very slow package-miss first dispatch occurred inside the first timed generation call. Wave 1 now prepares both bucket executables at model load, uses O1 for this large decode graph, keeps KV updates on the GPU, and avoids most rejected-candidate work in the CPU top-k tap. Winner 2 keeps the lm-head logits matmul in f16 and casts only its result to fp32. Winner 3 also keeps QK^T and PV attention matmuls in f16 while retaining the scale, mask, and softmax island in fp32. Winner 4 is the first structural winner: rather than eliminating a cast, it removes the materialized `repeat_kv` KV-head expansion from the decode graph and broadcasts the KV heads inside the attention matmuls (GQA grouping), so attention moves less data.
 
-This clears the `>=40 tok/s` bar with margin. It does not approach llama.cpp: the same-day llama.cpp Metal control produced 190.36 and 203.45 tok/s, so the winner is 44.3% and 41.4% of that control. The available control was `llama-server` with the official Q8_0 GGUF, not the requested `llama-cli` f16 cell; see the comparison caveat below.
+This clears the `>=40 tok/s` bar with margin. The fresh same-machine llama.cpp Metal `llama-cli` controls measured **207.40 tok/s Q8_0** and **180.15 tok/s f16** (combined 24-sample medians), so the owned winner is 40.7% of the Q8_0 control and 46.8% of the f16 control. The historical 190.36–203.45 band was from the earlier `llama-server` Q8_0 control; it remains recorded as historical context, not as the fresh `llama-cli` result.
 
 ## Locked-M1 setup
 
@@ -21,6 +21,8 @@ This clears the `>=40 tok/s` bar with margin. It does not approach llama.cpp: th
 | Lock | `mkdir [bench-user-home]/bench.lock`; `/tmp/aft-measure.lock` absent; no `Runner.Worker` |
 
 The release binary was built in `[bench-user-home]/ck-campaign/workspaces/mason-winner-2/target/release/spike-unified-rt`. The hardened campaign harness SHA-256 was `008d43490e9504bd420bee96823b950e387ea90a1a81f46e20e9890980741a9c`. Timed cells ran only while the benchmark lock was held. AC power was confirmed before admission with `pmset -g batt`: `Now drawing from 'AC Power'`, internal battery **98%**, charging.
+
+The fresh llama.cpp controls used the M1-native `[bench-user-home]/bench-tools/llama-b9580/llama-cli`, built from llama.cpp tag `b9580` at commit `b4e3dc613baa92a3884d4151e3d631395c81934a` with Xcode/AppleClang 21, CMake 4.4.0, and `GGML_METAL=ON`; the installed `llama-cli` SHA-256 is `02590612ba30c89133d656b7c1300028f345ec6c1cb879fb8f750a3626c02491`; the companion libraries remain installed beside the binary. Fresh competitor admissions showed `AC Power`, internal battery **100%**, charged, with no active `Runner.Worker`. The Q8_0 model is the official `Qwen/Qwen3-0.6B-GGUF` snapshot `23749fefcc72300e3a2ad315e1317431b06b590a`, SHA-256 `9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031`. The f16 GGUF was converted on the M1 from the cached `Qwen/Qwen3-0.6B` snapshot `c1899de289a04d12100db370d81485cdf75e47ca` with that tag's `convert_hf_to_gguf.py --outtype f16`, SHA-256 `c81c7c27b35225376a52387800c5eca0748a93b46db885a1dbad370a318f55bb`. The install path is intentionally retained for later campaign lanes.
 
 ## Winner provenance
 
@@ -157,17 +159,29 @@ The token tap, pause/resume state, forced splice, addressable weights, and on-de
 
 Regression gates on AC power also passed: `cargo test -p spike-unified-rt` reported **54 passed, 4 ignored, 0 failed**, and the pinned constrained-decode fixtures reported **15/15 valid prompts and 647 generated tokens** with `--verify-decode-cache`. The unconstrained 20-prompt gate remained byte-for-byte token exact.
 
-## Same-day llama.cpp comparison
+## llama.cpp Metal comparison
 
-The M1 had llama.cpp's Metal-enabled `llama-server` and the official `Qwen3-0.6B-Q8_0.gguf`, but no `llama-cli` binary and no f16 generation GGUF. The official repository URL for `Qwen3-0.6B-F16.gguf` returned 404, so a same-precision cell could not be fabricated. The server used the same llama.cpp Metal backend and a five-token raw prompt, with `n_predict=64`, temperature zero, and no prompt cache request.
+The refresh closes both comparison gaps. On the locked M1, the M1-native `llama-cli`
+used 12 prompts from the fixed stride-seven schedule, repeated twice with a
+fresh process per prompt. Prompt text changed on every iteration; generation
+was greedy (`--temp 0 --top-k 1 --top-p 1`), single stream, `-n 64`, `-ngl 99`,
+`-c 512`, and `--single-turn`. Each repeat acquired and promptly released
+`[bench-user-home]/bench.lock` after AC-power and no-`Runner.Worker` admission.
+The values below are llama-cli's generation-rate timings, not process wall time.
 
-| Runtime | Storage | Run 1 | Run 2 |
-|---|---|---:|---:|
-| owned MPSGraph winner 4 | f16 | 84.32 tok/s N=12 confirmation | 82.79 tok/s 20-prompt gate |
-| llama.cpp Metal (`llama-server`) | Q8_0 | 190.36 tok/s | 203.45 tok/s |
-| owned / llama.cpp | mixed precision | 44.3% | 41.4% |
+| Runtime | Storage | Repeat 1 median (spread) | Repeat 2 median (spread) | Combined 24-sample median (range) |
+|---|---|---:|---:|---:|
+| owned MPSGraph winner 4 | f16 | 84.32 tok/s N=12 confirmation | 82.79 tok/s 20-prompt gate | — |
+| llama.cpp Metal (`llama-cli` b9580) | Q8_0 | **207.45 tok/s (201.60–208.20)** | **207.40 tok/s (200.40–207.80)** | **207.40 tok/s (200.40–208.20)** |
+| llama.cpp Metal (`llama-cli` b9580) | f16 | **180.30 tok/s (176.60–180.50)** | **180.05 tok/s (177.50–181.90)** | **180.15 tok/s (176.60–181.90)** |
+| owned / llama.cpp | f16 vs f16 | — | — | **46.8%** |
+| owned / llama.cpp | f16 vs Q8_0 | — | — | **40.7%** |
 
-This is a useful same-day backend ceiling but not the requested f16-to-f16 `llama-cli` ratio. A future certification should add an f16 GGUF and `llama-cli` to the locked image rather than relabeling the available Q8 server result.
+The earlier `llama-server` Q8_0 control remains useful historical context at
+190.36 and 203.45 tok/s, but it is not substituted for either fresh CLI row.
+The f16 cell is now a like-for-like storage-precision reference for the owned
+f16 decoder, and the installed CLI/model paths are retained for future campaign
+lanes.
 
 ## Next levers
 
@@ -175,6 +189,6 @@ This is a useful same-day backend ceiling but not the requested f16-to-f16 `llam
 2. **Persist dynamic feed wrappers and small input buffers.** Feed construction costs about 0.58 ms/token, but this is secondary to execution.
 3. **Device-side top-k with a small tap readback.** Full logits readback plus CPU top-5 costs about 0.23 ms/token. Any device sampler must still expose immutable top-k values before commitment.
 4. **Write step K/V directly into addressed cache slices.** The current GPU export-plus-blit path costs about 0.21 ms/token. A custom kernel or supported aliasing output could remove staging without weakening inspection/splice semantics.
-5. **Re-run a true f16 llama-cli cell.** Install the matching binary and f16 GGUF on the M1 before using the comparison as a graduation ratio.
+5. **Use the fresh llama-cli controls as the comparison baseline.** The f16-to-f16 cell is now measured at 180.15 tok/s, while the Q8_0 control is 207.40 tok/s; neither should be mixed with the historical server-only row.
 
 The measured ceiling is now architectural rather than hidden graph rebuilding, fp32 linear conversion, or CPU/GPU cache traffic. Further large gains require reducing MPSGraph execution cost or replacing the step graph, not tuning the controller hooks away.
