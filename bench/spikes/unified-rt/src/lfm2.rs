@@ -32,6 +32,14 @@ struct GenerationConfig {
     eos_token_id: Option<OneOrManyTokenIds>,
 }
 
+/// Nested `rope_parameters` object carried by newer LFM2 checkpoints (e.g.
+/// LFM2.5-350M) instead of a top-level `rope_theta` field.
+#[derive(Debug, Deserialize)]
+struct RopeParameters {
+    #[serde(default)]
+    rope_theta: Option<f32>,
+}
+
 #[derive(Debug, Deserialize)]
 struct RawConfig {
     hidden_size: usize,
@@ -39,7 +47,10 @@ struct RawConfig {
     num_hidden_layers: usize,
     num_key_value_heads: usize,
     vocab_size: usize,
-    rope_theta: f32,
+    #[serde(default)]
+    rope_theta: Option<f32>,
+    #[serde(default)]
+    rope_parameters: Option<RopeParameters>,
     #[serde(default)]
     head_dim: Option<usize>,
     #[serde(default)]
@@ -364,7 +375,14 @@ impl RawConfig {
             num_key_value_heads: self.num_key_value_heads,
             head_dim,
             rms_norm_eps,
-            rope_theta: self.rope_theta,
+            rope_theta: self
+                .rope_theta
+                .or_else(|| {
+                    self.rope_parameters
+                        .as_ref()
+                        .and_then(|params| params.rope_theta)
+                })
+                .unwrap_or(1_000_000.0),
             vocab_size: self.vocab_size,
             layer_types,
             conv_kernel_size,
@@ -2083,6 +2101,57 @@ mod tests {
             ]
         );
         assert!(config.tie_word_embeddings);
+    }
+
+    /// LFM2.5 small configs (230M/350M) omit the top-level `rope_theta` field.
+    /// The 350M checkpoint carries it inside `rope_parameters` instead; when both
+    /// are absent the LFM2 architecture default (1 000 000.0, matching
+    /// transformers' `Lfm2Config.default_theta`) must apply.
+    #[test]
+    fn rope_theta_defaults_when_absent_from_config() {
+        let base = serde_json::json!({
+            "hidden_size": 1024,
+            "num_attention_heads": 16,
+            "num_hidden_layers": 16,
+            "num_key_value_heads": 8,
+            "vocab_size": 65536,
+            "norm_eps": 1e-5,
+            "block_ff_dim": 6656,
+            "block_auto_adjust_ff_dim": true,
+            "block_ffn_dim_multiplier": 1.0,
+            "block_multiple_of": 256,
+            "full_attn_idxs": [2, 5, 8, 10, 12, 14],
+            "conv_L_cache": 3,
+            "conv_bias": false,
+            "bos_token_id": 1,
+            "eos_token_id": 7,
+            "pad_token_id": 0
+        });
+
+        // Neither rope_theta nor rope_parameters → architecture default.
+        let raw: RawConfig = serde_json::from_value(base.clone()).unwrap();
+        let config = raw.into_config().unwrap();
+        assert_eq!(config.rope_theta, 1_000_000.0);
+
+        // rope_parameters.rope_theta present, no top-level field → nested value wins.
+        let mut nested = base.clone();
+        nested["rope_parameters"] = serde_json::json!({
+            "rope_theta": 500_000.0,
+            "rope_type": "default"
+        });
+        let raw: RawConfig = serde_json::from_value(nested).unwrap();
+        let config = raw.into_config().unwrap();
+        assert_eq!(config.rope_theta, 500_000.0);
+
+        // Explicit top-level rope_theta takes priority over rope_parameters.
+        let mut both = base;
+        both["rope_theta"] = serde_json::json!(2_000_000.0);
+        both["rope_parameters"] = serde_json::json!({
+            "rope_theta": 500_000.0
+        });
+        let raw: RawConfig = serde_json::from_value(both).unwrap();
+        let config = raw.into_config().unwrap();
+        assert_eq!(config.rope_theta, 2_000_000.0);
     }
 
     #[test]
