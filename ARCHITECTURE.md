@@ -43,9 +43,9 @@
 - Used by: The `synapse-module` host spawning them dynamically based on user requests and capability tiers.
 
 **Synapse Core Abstractions (`synapse-core`):**
-- Purpose: Core vocabulary structs, engine traits, and error contracts shared between the host and its workers.
+- Purpose: Core vocabulary structs, engine traits, machine capability profiles, and error contracts shared between the host and its workers.
 - Location: `crates/synapse-core`
-- Contains: `WorkerHello` handshake and binary framing logic, `EngineError` contract, `RuntimeConfig`, `TokenBatch`, and scheduling traits.
+- Contains: `WorkerHello` handshake and binary framing logic, `EngineError` contract, `MachineProfile` with `ane_subtype` chip-identity mapping, `RuntimeConfig`, `TokenBatch`, and scheduling traits.
 
 **Benchmark Harness Core:**
 - Purpose: Provides CLI commands for corpus generation, power-monitored process wrapping, result schema definition, and numerical parity functions.
@@ -64,7 +64,7 @@
 **Native Engine Inference Lanes:**
 - Purpose: Execute in-memory tokenization, tensor forward passes, and pooling over target platforms.
 - Location: `bench/lanes/ort-embed`, `bench/lanes/mlx`, `bench/lanes/burn`, `bench/lanes/mlx-minilm`, `bench/lanes/ts-embed`, `bench/lanes/potion`, `bench/spikes/unified-rt`
-- Contains: Bounded-thread ONNX Runtime embedding logic, Metal-accelerated MLX custom model implementations, unified-rt candidate implementations (Vulkan cooperative-matrix/plain shaders on RDNA3 with device-local memory staging and budget validation, CUDA cuBLASLt fused graphs on NVIDIA, Metal graph execution optimization levels O0/O1 and package caching), LFM2 hybrid causal backbone, LFM2-Audio ASR speech encoder (FastConformer and Slaney mel filterbank frontend), Qwen3-0.6B f16 Metal decode throughput optimizations, WGPU-based Burn ONNX imports, python-based MLX community/source loading, Model2Vec static embedding (`potion-code-16M`), and TypeScript setups.
+- Contains: Bounded-thread ONNX Runtime embedding logic, Metal-accelerated MLX custom model implementations, unified-rt candidate implementations (Vulkan cooperative-matrix/plain shaders on RDNA3 with device-local memory staging and budget validation, CUDA cuBLASLt fused graphs and fused QK norm RoPE single-launch kernels on NVIDIA, Metal graph execution optimization levels O0/O1, package caching, and custom direct Metal decode step kernels in `bench/spikes/unified-rt/src/qwen3_decode_metal_step.rs`), LFM2 hybrid causal backbone, LFM2-Audio ASR speech encoder (FastConformer and Slaney mel filterbank frontend), Qwen3-0.6B f16 Metal decode throughput optimizations, WGPU-based Burn ONNX imports, python-based MLX community/source loading, Model2Vec static embedding (`potion-code-16M`), and TypeScript setups.
 - Depends on: `bench/harness` or `bench/rig`, target runtime libraries (`ort`, `mlx-rs`, `vulkano`, `cudarc`), and `tokenizers`.
 - Used by: The benchmark suite runners `bench/run-matrix.sh` and `bench/run-night.sh`.
 
@@ -124,11 +124,11 @@
 
 1. Initialize layered configuration from `SYNAPSE_CONFIG_PATH` (`synapse.jsonc`), rejecting unknown fields and applying `microllm` ceilings — `crates/synapse-module/src/remote/config.rs`
 2. Route request received via SubC — `crates/synapse-module/src/lib.rs`
-3. Validate alias surfaces, apply machine capability profiles (Perf/Quiet tiers), verify microLLM certifications (refusing execution on uncertified fingerprints), or map user-tier `remote_providers` profiles — `crates/synapse-module/src/store.rs`
+3. Validate alias surfaces, apply machine capability profiles with `ane_subtype` chip identity (Perf/Quiet tiers), verify microLLM certifications (refusing execution on uncertified fingerprints), or map user-tier `remote_providers` profiles — `crates/synapse-module/src/store.rs`
 4. Admit job to the DB (checking active attempt ID CAS, request-digest idempotency, and page counts of existing results to resume from checkpoints) — `crates/synapse-module/src/store.rs`
 5. Dispatch based on route:
-   - **Local:** Download/Verify models through content-addressed cache (shared leases), admit to 3-class Aging Scheduler, spawn/handshake Worker lane (UNIX sockets / Windows pipes), submit binary frames.
-   - **Remote:** Forward through `ProviderRuntime` pools, passing circuit breakers and p90 estimators, fetching credentials via vault trait, executing strict loopback-validated HTTP calls — `crates/synapse-module/src/remote/runtime.rs`
+   - **Local:** Download/Verify models through content-addressed cache with shared leases and 24-hour age-floored temporary blob cleanup, admit to 3-class Aging Scheduler, spawn/handshake Worker lane (UNIX sockets / Windows pipes), submit binary frames.
+   - **Remote:** Forward through `ProviderRuntime` pools, passing circuit breakers and p90 estimators, fetching credentials via vault trait, executing strict loopback-validated HTTP calls, and serializing `recommended_batch` policies in model listings — `crates/synapse-module/src/remote/runtime.rs`
 6. Commit checkpointed pages sequentially according to byte size limits (`result_page_bytes`) as the job runs (allowing page-while-running for snapshots and continuity hooks), mark job complete (applying execution/retention TTL split), and return envelope. If the client queries a job, they can follow pages via `page` parameters — `crates/synapse-module/src/store.rs`
 
 **Constrained Decoding Flow:**
@@ -278,6 +278,16 @@
 - Purpose: Track local hardware engine capability status, storing whether a measured fingerprint is `certified` or `uncertified`.
 - Location: `crates/synapse-module/src/store.rs`
 - Pattern: SQLite-backed schema with automatic demotion upon failed re-certification.
+
+**Machine Profile:**
+- Purpose: Capture machine hardware and engine runtime identities (OS build, arch, chip model, RAM class, `ane_subtype` chip mapping, sorted engine identities) into a stable hash for fingerprinting and certification.
+- Location: `crates/synapse-core/src/machine_profile.rs`
+- Pattern: Serializable Identity Profile with SHA-256 fingerprinting.
+
+**Metal Custom Step Engine:**
+- Purpose: Execute single-token Qwen3 decode steps bypassing MPSGraph via direct Metal compute kernels (`qwen3_decode_metal_step.rs`, `qwen3_decode_metal_step.m`, `qwen3_decode_metal_step.metal`), leveraging SIMDgroup RMSNorm, position-parallel attention, and Q8 GEMV routines.
+- Location: `bench/spikes/unified-rt/src/qwen3_decode_metal_step.rs`
+- Pattern: Direct Metal Compute Kernel Pipeline.
 
 
 ## Entry Points

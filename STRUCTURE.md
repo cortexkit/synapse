@@ -59,9 +59,9 @@
 - Key files: `crates/synapse-module/src/main.rs`, `crates/synapse-core/src/lib.rs`
 
 **crates/synapse-core/:**
-- Purpose: Defines shared abstractions for engines, worker protocol, caching, and scheduling.
+- Purpose: Defines shared abstractions for engines, worker protocol, caching, machine capability profiles, and scheduling.
 - Contains: Envelopes, machine profile structs, engine traits, and error contracts.
-- Key files: `crates/synapse-core/src/worker_protocol.rs`, `crates/synapse-core/src/scheduler.rs`
+- Key files: `crates/synapse-core/src/worker_protocol.rs`, `crates/synapse-core/src/scheduler.rs`, `crates/synapse-core/src/machine_profile.rs`
 
 **crates/synapse-engine-owned/:**
 - Purpose: The primary in-process execution engine for Apple Silicon (macOS).
@@ -108,8 +108,8 @@
 
 **bench/spikes/:**
 - Purpose: Holds discrete architecture experimentation paths and new backend developments.
-- Contains: `unified-rt` (CUDA/Vulkan/M1 exact-match execution) and `ane-minilm` (Apple Neural Engine CoreML conversion) spikes.
-- Key files: `bench/spikes/unified-rt/src/main.rs`, `bench/spikes/unified-rt/src/vulkan_backend.rs`, `bench/spikes/unified-rt/src/cuda_backend.rs`, `bench/spikes/unified-rt/src/lfm2.rs`, `bench/spikes/unified-rt/src/lfm2_audio.rs`, `bench/spikes/unified-rt/src/lfm2_decode.rs`, `bench/spikes/unified-rt/src/qwen3_decode.rs`
+- Contains: `unified-rt` (CUDA/Vulkan/M1 exact-match execution, including direct Metal step kernels) and `ane-minilm` (Apple Neural Engine CoreML conversion) spikes.
+- Key files: `bench/spikes/unified-rt/src/main.rs`, `bench/spikes/unified-rt/src/vulkan_backend.rs`, `bench/spikes/unified-rt/src/cuda_backend.rs`, `bench/spikes/unified-rt/src/lfm2.rs`, `bench/spikes/unified-rt/src/lfm2_audio.rs`, `bench/spikes/unified-rt/src/lfm2_decode.rs`, `bench/spikes/unified-rt/src/qwen3_decode.rs`, `bench/spikes/unified-rt/src/qwen3_decode_metal_step.rs`
 
 **bench/eval-coir/:**
 - Purpose: Hosts the CoIR retrieval and rerank quality evaluation harness.
@@ -167,6 +167,7 @@
 - `crates/synapse-module/src/worker_host/mod.rs`: Spawns and manages worker lifecycles over Unix domain sockets or Windows named pipes using a binary framing protocol.
 - `crates/synapse-module/src/store.rs`: SQLite-backed state for content-addressed model cache, durable jobs, active attempts, and performance tier capabilities.
 - `crates/synapse-core/src/scheduler.rs`: 3-class fair-share aging scheduler for managing concurrent inference requests.
+- `crates/synapse-core/src/machine_profile.rs`: Defines `MachineProfile` hardware identity structures and static `ane_subtype` chip mapping.
 - `bench/harness/src/metrics.rs`: Macmon power metrics execution, parsing, and system idle gating.
 - `bench/harness/src/parity.rs`: Numerical calculation of cosine similarity, rank stability/overlap checks, and file parsing functions.
 - `bench/lanes/mlx/src/main.rs`: Qwen3 model architecture implementation and custom forward passes in MLX.
@@ -186,6 +187,7 @@
 - `bench/spikes/unified-rt/src/lfm2_audio.rs`: Mel-spectrogram DSP frontend, FastConformer speech encoder, and audio projector.
 - `bench/spikes/unified-rt/src/lfm2_decode.rs`: Causal decoding logic for LFM2 hybrid backbone models.
 - `bench/spikes/unified-rt/src/qwen3_decode.rs`: Fast Metal decode optimizations for Qwen3-0.6B f16.
+- `bench/spikes/unified-rt/src/qwen3_decode_metal_step.rs`: Custom direct Metal Qwen3 single-token decode step execution bypassing MPSGraph.
 
 **Tests:**
 - Standalone nextest-compatible test suites are managed via library configurations and workspace flags.
