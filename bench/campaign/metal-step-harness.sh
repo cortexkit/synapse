@@ -21,7 +21,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
-BASELINE_TOK_S = 67.6920
+BASELINE_TOK_S = 75.0938
 QUALITY_MIN_EXACT = 10
 QUALITY_MIN_MEDIAN_DEPTH = 59.0
 EXPECTED_MODEL_DIGEST = "0d7d1359007f579fba9f6eceef44c87b947362da893cc565d27656284e4d6f86"
