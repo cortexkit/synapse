@@ -24,6 +24,7 @@ export interface MessageRequest {
   tool_choice?: { type: "none" };
   temperature?: number;
   effort?: "low" | "medium" | "high";
+  signal?: AbortSignal;
 }
 
 export interface MessageResponse {
@@ -158,6 +159,7 @@ export async function sendMessage(credential: Credential, request: MessageReques
     method: "POST",
     headers,
     body: bodyText,
+    signal: request.signal,
   });
   if (response.status === 401 || response.status === 429) throw new AccountRejectedError(response.status);
   if (!response.ok) {
