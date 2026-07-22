@@ -94,15 +94,16 @@ All timings are single-stream, greedy, and exclude prompt prefill from
 | LFM2-1.2B | fp32 | 178.35 | 4,681,362,432 | 834.9 (83.5% of 1000) | 1.00x |
 | LFM2-1.2B | Q8_0 | 361.80 | 1,243,868,160 | 450.0 (45.0% of 1000) | **2.03x** |
 | Qwen3-0.6B | fp32 | 239.77 | 2,384,199,680 | 571.7 (57.2% of 1000) | 1.00x |
-| Qwen3-0.6B | Q8_0 | 524.03 | 633,495,552 | 332.0 (33.2% of 1000) | **2.19x** |
+| Qwen3-0.6B | Q8_0 | 592.87 | 633,495,552 | 375.6 (37.6% of 1000) | **2.47x** |
 
 The historical LFM2 fp32 comparison point was 178.5 tok/s; the fresh same-rig
 178.35 result reproduces it. Qwen3's 239.77 tok/s row is its first owned CUDA
 fp32 decode baseline. LFM2 Q8_0 is useful but does not approach the 3.76x active
 byte reduction. The direct-KV-cache winner, the stacked CUDA winners, the batched-QKV winner, winner
-6's fused QK head-norm/RoPE launch, and winner 7's decode graph raise Qwen3 Q8_0
-to 524.03 tok/s and 332.0 GB/s (2.19x fp32), crossing the same-day llama.cpp
-reference while remaining launch/dequant limited rather than bandwidth saturated.
+6's fused QK head-norm/RoPE launch, winner 7's decode graph, and the shipped
+round-5 row-paired GEMV winner raise Qwen3 Q8_0 to 592.87 tok/s and 375.6 GB/s
+(2.47x fp32). This is 1.14x the same-day llama.cpp reference while remaining
+launch/dequant limited rather than bandwidth saturated.
 
 ### Quality ladder
 
@@ -190,13 +191,12 @@ approximately **$0.40 total spend**, well below the $25 cap. All three
 ## Campaign baseline: CUDA Q8_0 single-stream decode
 
 The second campaign targets the owned Qwen3-0.6B Q8_0 CUDA decode path on an RTX
-4090. After winner 7, the re-pinned throughput baseline is
-**524.0289724489505 tok/s** for one stream and 64 new tokens (`332.0 GB/s`
-effective weight bandwidth). This crosses llama.cpp's `521.4 tok/s` competitor
-reference by 0.50%; that reference was measured on this rig under the same-day
-protocol earlier, not in the winner-7 run, and remains a comparison rather than
-an acceptance gate. The
-rented rig must be an RTX 4090 with reliability above `0.99` and driver `>=570`.
+4090. After the shipped round-5 winner, the re-pinned throughput baseline is
+**592.8694799258782 tok/s** for one stream and 64 new tokens (`375.6 GB/s`
+effective weight bandwidth). This is 1.14x llama.cpp's `521.4 tok/s` competitor
+reference; that reference was measured on this rig under the same-day protocol
+earlier and remains a comparison rather than an acceptance gate. The rented rig
+must be an RTX 4090 with reliability above `0.99` and driver `>=570`.
 
 `bench/campaign/cuda-quant-harness.sh` is a self-contained controller. It embeds
 and hashes the raw-completion fixtures (`decode-prompts.jsonl` SHA-256
@@ -378,3 +378,43 @@ The remaining-structure guidance is unchanged: online-softmax attention has one
 `parity_failed` result, so it is risky-but-open rather than closed. RoPE tables are
 a banked double-negative and should remain closed as a mechanism; they are not a
 reason to relax the online-softmax gate.
+
+
+### Campaign #14 winners 8+9: overlapping round-5 mechanisms
+
+Campaign `[consult-id]` promoted two round-5
+proposals. The authoritative store provenance is winner 8,
+`proposal_2f092e7671c295704f2ba115f494bce68dce0162044b480bf5302be1d9d51059`
+(claude), followed by winner 9,
+`proposal_50f2b03cbc1a73e1658ffa08b964cddaa296ba2d2332e5992d5c19af91165ec6`
+(alibaba). The campaign prompt's winner labels named the proposal IDs in the
+opposite order; the store's member, title, patch digest, and round queue are the
+source of truth.
+
+Winner 8's dual-row Q8_0 GEMV assigns two output rows to each Qwen3 decode block
+and issues independent row loads to hide memory latency. Winner 9's row-paired
+GEMV uses the same activation vector while computing two adjacent output rows in
+the shared family matvec path. These are the same row-level memory-parallelism
+axis, not independent optimizations: both round-5 estimates were measured in
+parallel against the same `524.0289724489505` tok/s control, not as a stacked
+sequence. The predicted compound result, `524.0289724489505 * 1.1284 * 1.1340 =
+670.5504077079228` tok/s, therefore does not describe the shipped tree.
+
+The standing RTX 4090 rerun used two independent `N=12` batteries per tree and
+selected the worse median from each pair as the `N=24` result. Every tree passed
+`10/20` exact prompts, median match depth `59.0`, `accepted_near_ties=0`,
+constrained JSON `15/15`, all five hook tests, and
+`SYNAPSE_CUDA_GRAPH_VERIFY=1` byte-exact replay:
+
+| Tree | Patch set | Repeat medians (tok/s) | N=24 worse-of-two (tok/s) | Versus fresh control |
+|---|---|---:|---:|---:|
+| A-only | winner 8 / claude dual-row | 590.847875596791; 589.2987126160701 | **589.2987126160701** | +12.38% |
+| B-only | winner 9 / alibaba row-paired | 594.5900806795532; 592.8694799258782 | **592.8694799258782** | +13.06% |
+| A+B | both patches applied in promotion order | 590.6283085492648; 590.4832909403555 | **590.4832909403555** | +12.61% |
+
+Winner 9's B-only tree is the highest passing configuration and is the one
+shipped. Its `633,495,552` active bytes/token produce `375.5801784495971`
+GB/s effective weight bandwidth and a `1.137x` ratio to the vintage llama.cpp
+`521.4` tok/s reference. The A+B tree is recorded as a banked negative,
+**superseded by an overlapping mechanism**, rather than as a loss; winner 8's
+A-only result remains banked evidence for the same reason.

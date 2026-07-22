@@ -138,6 +138,55 @@ static __global__ void q8_0_matvec(
     }
 }
 
+static __global__ void q8_0_matvec_2row(
+    const uint8_t *weights,
+    const float *input,
+    float *output,
+    int rows,
+    int columns
+) {
+    int row0 = blockIdx.x * 2;
+    int row1 = row0 + 1;
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int warps = blockDim.x >> 5;
+    int blocks_per_row = columns / Q8_0_BLOCK_ELEMENTS;
+    float partial0 = 0.0f;
+    float partial1 = 0.0f;
+    for (int column_block = warp; column_block < blocks_per_row; column_block += warps) {
+        float in = input[column_block * Q8_0_BLOCK_ELEMENTS + lane];
+        const uint8_t *block0 = weights
+            + (static_cast<size_t>(row0) * blocks_per_row + column_block) * Q8_0_BLOCK_BYTES;
+        half scale0 = *reinterpret_cast<const half *>(block0);
+        int8_t quantized0 = reinterpret_cast<const int8_t *>(block0 + sizeof(half))[lane];
+        partial0 += __half2float(scale0) * static_cast<float>(quantized0) * in;
+        const uint8_t *block1 = weights
+            + (static_cast<size_t>(row1) * blocks_per_row + column_block) * Q8_0_BLOCK_BYTES;
+        half scale1 = *reinterpret_cast<const half *>(block1);
+        int8_t quantized1 = reinterpret_cast<const int8_t *>(block1 + sizeof(half))[lane];
+        partial1 += __half2float(scale1) * static_cast<float>(quantized1) * in;
+    }
+    partial0 = warp_sum(partial0);
+    partial1 = warp_sum(partial1);
+    __shared__ float warp_sums0[32];
+    __shared__ float warp_sums1[32];
+    if (lane == 0) {
+        warp_sums0[warp] = partial0;
+        warp_sums1[warp] = partial1;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float sum0 = lane < warps ? warp_sums0[lane] : 0.0f;
+        float sum1 = lane < warps ? warp_sums1[lane] : 0.0f;
+        sum0 = warp_sum(sum0);
+        sum1 = warp_sum(sum1);
+        if (lane == 0) {
+            output[row0] = sum0;
+            output[row1] = sum1;
+        }
+    }
+}
+
 inline void copy_matrix(DeviceMatrix &target, const SynapseCudaWeight &source, size_t elements) {
     if (!source.fp32) throw std::runtime_error("CUDA matrix is missing its fp32 source");
     target.quantized = source.q8_0 != nullptr;
@@ -182,7 +231,12 @@ inline void launch_decode_matvec(
     if (!weight.quantized) {
         throw std::runtime_error("fused decode matvec was requested for an fp32 matrix");
     }
-    q8_0_matvec<<<rows, 256, 0, stream>>>(weight.q8_0.pointer, input, output, rows, columns);
+    if (rows >= 2 && (rows & 1) == 0) {
+        int blocks = rows / 2;
+        q8_0_matvec_2row<<<blocks, 256, 0, stream>>>(weight.q8_0.pointer, input, output, rows, columns);
+    } else {
+        q8_0_matvec<<<rows, 256, 0, stream>>>(weight.q8_0.pointer, input, output, rows, columns);
+    }
 }
 
 inline std::vector<half> to_half(const float *values, size_t count) {
