@@ -170,6 +170,8 @@ no pre-existing bench lock, and 1-minute load averages from 1.09 to 1.21.
 | Backend | Weights | Prompts / repeats | Decode tok/s | Encode / GPU / host per token | Status |
 | --- | --- | --- | ---: | --- | --- |
 | MPSGraph reference | f16 | 12 x 2 | 84.32 baseline | pending fresh breakdown | prior baseline |
+| Metal step winners 5+6 | f16 | 12 x 2 | **48.6506 median** | timed on locked M1; 20/20 exact | campaign-2 confirmation |
+| Metal step winners 5+6 | Q8_0 | 12 x 2 | **85.2589 median** | timed on locked M1; 13/20 exact; median depth 64.0 | **above the 84.32 MPSGraph reference; new Q8 baseline** |
 | Metal step baseline | f16 | 12 x 2 | **5.8080 median** | 0.1025 ms / 171.8693 ms / 0.0146 ms | parity-first baseline |
 | Metal step baseline | Q8_0 | 12 x 2 | **5.0405 median** | 0.1021 ms / 198.0879 ms / 0.0141 ms | parity-first baseline |
 | Metal step wave 1 | f16 | 12 x 2 | **17.7992 median** | 0.1021 ms / 55.8754 ms / 0.0340 ms | 20/20 exact; AC |
@@ -187,6 +189,53 @@ The owned-step host column excludes GPU command-buffer wait, logits readback,
 and sampler time; median readback was 0.033 ms/token and median sampling was
 0.158 ms/token. A same-machine f16 llama-cli row is recorded in
 `DECODE-WAVE1.md`.
+
+The fresh locked-M1 Q8 control was **74.2507 tok/s**; the round-1 winner
+measured **81.3764 tok/s**, and winners 5+6 measured **85.2589 tok/s** under
+the same 12-prompt, two-fresh-process, worse-of-two protocol. The campaign
+projection from its 75.0938 control and reported +9.54%/+4.90% gains was
+86.3 tok/s; the confirmed run was 85.2589 tok/s because this fresh control was
+1.1% below the historical control, still inside the 2% control-drift gate.
+
+## Campaign 2 winners 5+6
+
+Campaign `[consult-id]` promoted two attention
+micro-optimizations in order:
+
+1. **Winner 5 — attention value-phase softmax reuse** (proposal
+   `proposal_c84e5170d4a944db966218f9428c100c9c9fdf62fb9b18aff403c7a47f8ff8c6`,
+   Claude, round 1). For Qwen3's `head_dim=128`, each lane owns four value
+   dimensions. The specialized path computes the half-rounded softmax
+   probability once per KV position and reuses it across four serial f32
+   accumulators; non-128 dimensions keep the original fallback. The campaign
+   measured **+9.54%** over its control; the fresh M1 confirmation was 81.3764
+   tok/s versus 74.2507 tok/s for the control.
+2. **Winner 6 — half4 QK vector loads with serial f32 accumulation** (proposal
+   `proposal_c0900e5f37c1360274a8ed5a6b304374f2910d7d4f550480c9edb03cd0b57c70`,
+   Kimi, round 3). The score phase loads four adjacent half values at once but
+   performs the same four half-to-f32 products and ascending serial additions,
+   preserving the exactness contract. The campaign measured **+4.90%** on the
+   round-1 tree. The combined M1 tree passed f16 20/20, Q8 13/20 with median
+   depth 64.0 and zero near-ties, all hooks, and 470-token/64-token long-context
+   parity.
+
+The attention-micro seam is now mined out for this campaign. Four exactness-
+gated follow-ups are banked negatives rather than retained changes: query-head
+threadgroup caching (+0.45%) and paired QK-position query reuse (-0.42%) did
+not clear the promotion bar; pairwise KV-position value-loop unrolling
+(+1.43%) remained below the 3% objective; and the softmax/occupancy sub-gates
+(max reduction +0.75%, pairwise denominator exp scheduling +0.81%, and the
+smaller attention threadgroup +1.20%) were likewise below promotion value.
+These are follow-ups to revisit only with a new gate hypothesis, not claims of
+available throughput.
+
+## Cross-machine exactness note
+
+Completion-06 f16 near-tie resolves differently on M5-current Metal stack as
+of 2026-07-22 (both backends self-consistent, 13079 vs fixture 61686 at step
+7); fixtures remain M1-homed; M5 local gates use the remaining 19 prompts +
+mutual MPSGraph/step agreement until re-cut. The M1 control and both winner
+trees passed the full 20/20 fixture gate; no threshold was changed.
 
 ## Campaign targets
 

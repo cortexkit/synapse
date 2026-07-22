@@ -311,8 +311,22 @@ kernel void metal_step_attention(
     for (uint position = lane; position <= config.position; position += METAL_STEP_SIMD_WIDTH) {
         float score = 0.0f;
         uint key_start = (kv_head * config.capacity + position) * head_dim;
-        for (uint i = 0; i < head_dim; ++i) {
-            score += (float)query[q_start + i] * (float)key_cache[key_start + i];
+        if ((head_dim & 3u) == 0u) {
+            // One wide half4 load per four elements; the f32 accumulation
+            // still adds each product in the original ascending serial order,
+            // so the dot result is bit-identical to the scalar loop.
+            for (uint i = 0; i < head_dim; i += 4) {
+                half4 q4 = *reinterpret_cast<const device half4 *>(query + q_start + i);
+                half4 k4 = *reinterpret_cast<const device half4 *>(key_cache + key_start + i);
+                score += (float)q4.x * (float)k4.x;
+                score += (float)q4.y * (float)k4.y;
+                score += (float)q4.z * (float)k4.z;
+                score += (float)q4.w * (float)k4.w;
+            }
+        } else {
+            for (uint i = 0; i < head_dim; ++i) {
+                score += (float)query[q_start + i] * (float)key_cache[key_start + i];
+            }
         }
         scores[score_start + position] = score * scale;
     }
@@ -330,14 +344,33 @@ kernel void metal_step_attention(
     }
     maximum = simd_broadcast(maximum, 0);
     denominator = simd_broadcast(denominator, 0);
-    for (uint i = lane; i < head_dim; i += METAL_STEP_SIMD_WIDTH) {
-        float result = 0.0f;
+    if (head_dim == METAL_STEP_SIMD_WIDTH * 4) {
+        float result0 = 0.0f;
+        float result1 = 0.0f;
+        float result2 = 0.0f;
+        float result3 = 0.0f;
         for (uint position = 0; position <= config.position; ++position) {
-            uint value_index = (kv_head * config.capacity + position) * head_dim + i;
+            uint value_start = (kv_head * config.capacity + position) * head_dim + lane;
             half probability = (half)(exp(scores[score_start + position] - maximum) / denominator);
-            result += (float)probability * (float)value_cache[value_index];
+            result0 += (float)probability * (float)value_cache[value_start];
+            result1 += (float)probability * (float)value_cache[value_start + METAL_STEP_SIMD_WIDTH];
+            result2 += (float)probability * (float)value_cache[value_start + METAL_STEP_SIMD_WIDTH * 2];
+            result3 += (float)probability * (float)value_cache[value_start + METAL_STEP_SIMD_WIDTH * 3];
         }
-        output[q_start + i] = (half)result;
+        output[q_start + lane] = (half)result0;
+        output[q_start + lane + METAL_STEP_SIMD_WIDTH] = (half)result1;
+        output[q_start + lane + METAL_STEP_SIMD_WIDTH * 2] = (half)result2;
+        output[q_start + lane + METAL_STEP_SIMD_WIDTH * 3] = (half)result3;
+    } else {
+        for (uint i = lane; i < head_dim; i += METAL_STEP_SIMD_WIDTH) {
+            float result = 0.0f;
+            for (uint position = 0; position <= config.position; ++position) {
+                uint value_index = (kv_head * config.capacity + position) * head_dim + i;
+                half probability = (half)(exp(scores[score_start + position] - maximum) / denominator);
+                result += (float)probability * (float)value_cache[value_index];
+            }
+            output[q_start + i] = (half)result;
+        }
     }
 }
 
