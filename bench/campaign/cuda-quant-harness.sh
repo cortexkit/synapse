@@ -33,7 +33,32 @@ DEFAULT_MODEL = (
 )
 SAMPLE_COUNT = 12
 MAX_NEW_TOKENS = 64
+DEEP_470_TOKENS = 470
+DEEP_900_TOKENS = 900
+DEEP_CACHE_BUCKET = 1024
+DEEP_SAMPLE_COUNT = 6
+DEEP_REPEAT_COUNT = 2
 SAMPLE_PROMPT_INDICES = tuple((index * 7) % 20 for index in range(SAMPLE_COUNT))
+DEEP_PROMPT_RECIPES = (
+    (470, (398, 398, 398, 398, 37, 40), (63, 63, 63, 63, 55, 61)),
+    (900, (828, 828, 828, 828, 76, 83), (63, 63, 63, 63, 56, 61)),
+)
+DEEP_PROMPT_PATTERNS = (
+    "a ",
+    "b ",
+    "context ",
+    "attention ",
+    "0123456789 ",
+    "The quick brown fox jumps over the lazy dog. ",
+)
+DEEP_FIXTURE_MANIFEST = """\
+d117537e10fc37c26f4705bf52f54743e270a2d38f9e4161766507ba6607e07e  deep-prompts.jsonl
+f5b458102ca8e267549a51c2fec6b698c8561593f9c5c8c7bb24507b8012e3b8  deep-reference-tokens.jsonl
+"""
+# The current-master oracle emits token 264 for all 64 steps on these deterministic
+# filler prompts; the serialized rows remain hash-pinned below.
+DEEP_REFERENCE_TOKENS = (264,) * MAX_NEW_TOKENS
+
 HOOK_TESTS = (
     "token_stream_tap_observes_before_commit_without_changing_tokens",
     "paused_state_resumes_to_uninterrupted_tokens",
@@ -116,12 +141,33 @@ def result_payload(
     median_tok_s: Optional[float],
     workspace_commit: str,
     note: str,
+    *,
+    deep470_samples: Sequence[float] = (),
+    deep470_median_tok_s: Optional[float] = None,
+    deep900_samples: Sequence[float] = (),
+    deep900_median_tok_s: Optional[float] = None,
+    deep470_baseline_tok_s: Optional[float] = None,
+    deep900_baseline_tok_s: Optional[float] = None,
+    short_delta_fraction: Optional[float] = None,
+    deep470_delta_fraction: Optional[float] = None,
+    deep900_delta_fraction: Optional[float] = None,
+    deep_shipping_rule_passed: Optional[bool] = None,
 ) -> Dict[str, Any]:
     return {
         "gate_passed": gate_passed,
         "hooks_passed": hooks_passed,
         "samples": list(samples),
         "median_tok_s": median_tok_s,
+        "deep470_samples": list(deep470_samples),
+        "deep470_median_tok_s": deep470_median_tok_s,
+        "deep900_samples": list(deep900_samples),
+        "deep900_median_tok_s": deep900_median_tok_s,
+        "deep470_baseline_tok_s": deep470_baseline_tok_s,
+        "deep900_baseline_tok_s": deep900_baseline_tok_s,
+        "short_delta_fraction": short_delta_fraction,
+        "deep470_delta_fraction": deep470_delta_fraction,
+        "deep900_delta_fraction": deep900_delta_fraction,
+        "deep_shipping_rule_passed": deep_shipping_rule_passed,
         "baseline_note": note,
         "workspace_commit": workspace_commit,
     }
@@ -202,6 +248,95 @@ def extract_and_verify_fixtures(root: Path) -> Tuple[Path, Path, List[Dict[str, 
         ):
             raise HarnessError("every reference must contain exactly 64 nonnegative token IDs")
     return root / "decode-prompts.jsonl", root / "reference-tokens.jsonl", prompts, references
+
+
+def deep_reference_data() -> bytes:
+    rows = [
+        {
+            "id": f"deep-{tier}-{index:02d}",
+            "tokens": list(DEEP_REFERENCE_TOKENS),
+        }
+        for tier, _, _ in DEEP_PROMPT_RECIPES
+        for index in range(1, len(DEEP_PROMPT_PATTERNS) + 1)
+    ]
+    return b"".join(
+        (json.dumps(row, separators=(",", ":")) + "\n").encode()
+        for row in rows
+    )
+
+
+def deep_prompt_data() -> bytes:
+    rows = []
+    for tier, repeats, pads in DEEP_PROMPT_RECIPES:
+        for index, (pattern, repeat, pad) in enumerate(
+            zip(DEEP_PROMPT_PATTERNS, repeats, pads), start=1
+        ):
+            rows.append(
+                {
+                    "id": f"deep-{tier}-{index:02d}",
+                    "prompt": pattern * repeat
+                    + f"depth-fixture-{tier}-{index}"
+                    + " a" * pad,
+                }
+            )
+    return b"".join(
+        (json.dumps(row, separators=(",", ":")) + "\n").encode()
+        for row in rows
+    )
+
+
+def extract_deep_fixtures(
+    root: Path,
+) -> Tuple[Path, Path, List[Dict[str, Any]], List[Dict[str, Any]]]:
+    entries = parse_manifest(
+        DEEP_FIXTURE_MANIFEST,
+        expected_names=("deep-prompts.jsonl", "deep-reference-tokens.jsonl"),
+    )
+    root.mkdir(mode=0o755)
+    prompt_data = deep_prompt_data()
+    reference_data = deep_reference_data()
+    for name, data in (
+        ("deep-prompts.jsonl", prompt_data),
+        ("deep-reference-tokens.jsonl", reference_data),
+    ):
+        actual = hashlib.sha256(data).hexdigest()
+        if actual != entries[name]:
+            raise HarnessError(
+                f"embedded deep fixture {name} hash mismatch: expected {entries[name]}, got {actual}"
+            )
+        path = root / name
+        path.write_bytes(data)
+        path.chmod(0o444)
+    (root / "SHA256SUMS").write_text(DEEP_FIXTURE_MANIFEST)
+    (root / "SHA256SUMS").chmod(0o444)
+
+    prompts = load_jsonl_bytes(prompt_data, "deep-prompts.jsonl")
+    references = load_jsonl_bytes(reference_data, "deep-reference-tokens.jsonl")
+    expected_ids = [
+        f"deep-{tier}-{index:02d}"
+        for tier, _, _ in DEEP_PROMPT_RECIPES
+        for index in range(1, len(DEEP_PROMPT_PATTERNS) + 1)
+    ]
+    if len(prompts) != len(expected_ids) or [row.get("id") for row in prompts] != expected_ids:
+        raise HarnessError("deep prompt fixture IDs are not unique and ordered by depth tier")
+    if [row.get("id") for row in references] != expected_ids:
+        raise HarnessError("deep reference IDs do not match the deep prompt fixture")
+    if any(not isinstance(row.get("prompt"), str) for row in prompts):
+        raise HarnessError("every deep prompt must contain a string prompt")
+    for row in references:
+        tokens = row.get("tokens")
+        if (
+            not isinstance(tokens, list)
+            or len(tokens) != MAX_NEW_TOKENS
+            or any(not isinstance(token, int) or isinstance(token, bool) or token < 0 for token in tokens)
+        ):
+            raise HarnessError("every deep reference must contain exactly 64 nonnegative token IDs")
+    return (
+        root / "deep-prompts.jsonl",
+        root / "deep-reference-tokens.jsonl",
+        prompts,
+        references,
+    )
 
 
 def extract_constrained_fixtures(root: Path) -> Tuple[Path, Path, List[Dict[str, Any]]]:
@@ -739,6 +874,36 @@ def validate_decode_result(payload: Mapping[str, Any], references: Sequence[Mapp
     return computed_tok_s
 
 
+def validate_deep_decode_result(
+    payload: Mapping[str, Any],
+    references: Sequence[Mapping[str, Any]],
+) -> float:
+    """Require exact master-oracle tokens and the intended prefill depths."""
+    throughput = validate_decode_result(payload, references)
+    if payload.get("cache_bucket") != DEEP_CACHE_BUCKET:
+        raise CandidateRejected("deep correctness run did not use the 1024-token cache bucket")
+    results = payload.get("results")
+    if not isinstance(results, list):
+        raise CandidateRejected("deep correctness output has no result rows")
+    expected_depths = {
+        f"deep-{tier}-{index:02d}": tier
+        for tier, _, _ in DEEP_PROMPT_RECIPES
+        for index in range(1, len(DEEP_PROMPT_PATTERNS) + 1)
+    }
+    for index, actual in enumerate(results, start=1):
+        if not isinstance(actual, dict):
+            raise CandidateRejected(f"deep prompt result {index} is not an object")
+        prompt_id = actual.get("id")
+        expected_tokens = expected_depths.get(prompt_id)
+        if expected_tokens is None or actual.get("prompt_tokens") != expected_tokens:
+            raise CandidateRejected(
+                f"deep prompt {prompt_id!r} did not prefill at its pinned depth"
+            )
+        if actual.get("match_depth") != MAX_NEW_TOKENS:
+            raise CandidateRejected(f"deep prompt {prompt_id!r} was not token-exact for all 64 steps")
+    return throughput
+
+
 def validate_quant_decode_result(
     payload: Mapping[str, Any], references: Sequence[Mapping[str, Any]]
 ) -> Tuple[int, float]:
@@ -780,7 +945,13 @@ def validate_quant_decode_result(
     return exact_count, float(median_depth)
 
 
-def validate_quant_sample_result(payload: Mapping[str, Any], expected: Mapping[str, Any]) -> float:
+def validate_quant_sample_result(
+    payload: Mapping[str, Any],
+    expected: Mapping[str, Any],
+    *,
+    expected_prompt_tokens: Optional[int] = None,
+    require_exact: bool = False,
+) -> float:
     results = payload.get("results")
     if payload.get("prompts") != 1 or payload.get("max_new_tokens") != MAX_NEW_TOKENS:
         raise CandidateRejected("candidate changed the measurement prompt or generation count")
@@ -800,6 +971,10 @@ def validate_quant_sample_result(payload: Mapping[str, Any], expected: Mapping[s
         depth += 1
     if row.get("match_depth") != depth:
         raise CandidateRejected("measurement output lied about match depth")
+    if expected_prompt_tokens is not None and row.get("prompt_tokens") != expected_prompt_tokens:
+        raise CandidateRejected("measurement output used the wrong prefill depth")
+    if require_exact and (tokens != oracle or row.get("exact_reference") is not True):
+        raise CandidateRejected("deep measurement output was not token-exact against the pinned oracle")
     wall = payload.get("decode_wall_s")
     reported = payload.get("decode_tok_per_s")
     token_count = len(tokens)
@@ -860,6 +1035,7 @@ def decode_command(
     output: Path,
     max_new_tokens: int = MAX_NEW_TOKENS,
     schema: Optional[Path] = None,
+    cache_bucket: int = 512,
 ) -> List[str]:
     command = [
         str(binary),
@@ -872,7 +1048,7 @@ def decode_command(
         "--max-new-tokens",
         str(max_new_tokens),
         "--decode-cache-bucket",
-        "512",
+        str(cache_bucket),
         "--decode-top-k",
         "5",
         "--device",
@@ -895,18 +1071,30 @@ def decode_command(
     return command
 
 
-def configured_constants() -> Tuple[float, str]:
+def configured_constants() -> Tuple[float, float, float, str]:
     baseline_text = os.environ.get("SYNAPSE_CAMPAIGN_BASELINE_TOK_S", str(BASELINE_TOK_S))
+    deep470_text = os.environ.get("SYNAPSE_CAMPAIGN_DEEP470_TOK_S")
+    deep900_text = os.environ.get("SYNAPSE_CAMPAIGN_DEEP900_TOK_S")
     digest = os.environ.get("SYNAPSE_CAMPAIGN_MODEL_SHA256", EXPECTED_MODEL_DIGEST)
+    if deep470_text is None or deep900_text is None:
+        raise HarnessError(
+            "deep campaign baselines are pending; set both "
+            "SYNAPSE_CAMPAIGN_DEEP470_TOK_S and SYNAPSE_CAMPAIGN_DEEP900_TOK_S "
+            "before running the harness; depth gating is refused without controls"
+        )
     try:
         baseline = float(baseline_text)
+        deep470 = float(deep470_text)
+        deep900 = float(deep900_text)
     except ValueError as error:
-        raise HarnessError("configured baseline is not numeric") from error
+        raise HarnessError("configured campaign baseline is not numeric") from error
     if baseline != BASELINE_TOK_S:
         raise HarnessError("campaign registration baseline disagrees with the pinned harness")
+    if not math.isfinite(deep470) or deep470 <= 0 or not math.isfinite(deep900) or deep900 <= 0:
+        raise HarnessError("deep campaign baselines must be finite and positive")
     if digest != EXPECTED_MODEL_DIGEST:
         raise HarnessError("campaign registration model digest disagrees with the pinned harness")
-    return baseline, digest
+    return baseline, deep470, deep900, digest
 
 
 def run_harness(workspace_arg: str, runner_arg: str, result_arg: str) -> int:
@@ -918,7 +1106,7 @@ def run_harness(workspace_arg: str, runner_arg: str, result_arg: str) -> int:
     if not runner.is_file() or not os.access(str(runner), os.X_OK):
         raise HarnessError(f"candidate runner is not executable: {runner}")
 
-    baseline, expected_digest = configured_constants()
+    baseline, deep470_baseline, deep900_baseline, expected_digest = configured_constants()
     model = Path(os.environ.get("SYNAPSE_CAMPAIGN_MODEL", str(DEFAULT_MODEL))).resolve()
     writer = ResultWriter(result_path)
     workspace_commit = ""
@@ -927,7 +1115,9 @@ def run_harness(workspace_arg: str, runner_arg: str, result_arg: str) -> int:
     sibling_note = ""
     cuda_note = ""
     baseline_note = (
-        f"Frozen master baseline: {baseline:.1f} tok/s on RTX 4090 Q8_0; measurement not completed."
+        f"Frozen master baseline: {baseline:.1f} tok/s on RTX 4090 Q8_0; "
+        f"deep controls: 470={deep470_baseline:.3f}, 900={deep900_baseline:.3f} tok/s; "
+        "measurement not completed."
     )
     writer.write(result_payload(False, False, [], None, "", baseline_note))
 
@@ -936,6 +1126,8 @@ def run_harness(workspace_arg: str, runner_arg: str, result_arg: str) -> int:
     try:
         fixture_root = temp_root / "fixtures"
         prompts_path, references_path, prompts, references = extract_and_verify_fixtures(fixture_root)
+        deep_root = temp_root / "deep-fixtures"
+        deep_prompts_path, deep_references_path, deep_prompts, deep_references = extract_deep_fixtures(deep_root)
         constrained_root = temp_root / "constrained-fixtures"
         constrained_prompts_path, constrained_schema_path, constrained_prompts = extract_constrained_fixtures(constrained_root)
         cuda_state = cuda_preflight(runner, temp_root)
@@ -968,6 +1160,7 @@ def run_harness(workspace_arg: str, runner_arg: str, result_arg: str) -> int:
         sibling_note = sibling_provenance(sibling_heads)
         baseline_note = (
             f"Frozen master baseline: {baseline:.1f} tok/s on RTX 4090 Q8_0; "
+            f"deep controls: 470={deep470_baseline:.3f}, 900={deep900_baseline:.3f} tok/s; "
             f"measurement not completed. {sibling_note} {cuda_note}"
         )
         writer.write(result_payload(False, False, [], None, "", baseline_note))
@@ -1060,8 +1253,32 @@ def run_harness(workspace_arg: str, runner_arg: str, result_arg: str) -> int:
         if constrained_status != 0:
             raise CandidateRejected(f"15-prompt constrained JSON gate failed with status {constrained_status}")
         validate_constrained_result(load_result(constrained_output), constrained_prompts)
+
+        deep_gate_output = output_root / "deep-gate.json"
+        deep_gate_status = run_through_runner(
+            runner,
+            [
+                *candidate_env,
+                *decode_command(
+                    binary,
+                    model,
+                    deep_prompts_path,
+                    deep_references_path,
+                    package_cache,
+                    deep_gate_output,
+                    cache_bucket=DEEP_CACHE_BUCKET,
+                ),
+            ],
+            temp_root / "deep-gate.log",
+        )
+        if deep_gate_status != 0:
+            raise CandidateRejected(f"12-prompt deep correctness gate failed with status {deep_gate_status}")
+        validate_deep_decode_result(load_result(deep_gate_output), deep_references)
         gate_passed = True
-        baseline_note += f" Quality gate: {exact_count}/20 exact, median match depth {median_depth:.1f}; constrained JSON 15/15 schema-valid."
+        baseline_note += (
+            f" Quality gate: {exact_count}/20 exact, median match depth {median_depth:.1f}; "
+            "constrained JSON 15/15 schema-valid; deep 470/900 fixtures 12/12 exact."
+        )
         writer.write(
             result_payload(True, False, [], None, workspace_commit, baseline_note)
         )
@@ -1125,9 +1342,85 @@ def run_harness(workspace_arg: str, runner_arg: str, result_arg: str) -> int:
         median_tok_s = statistics.median(samples)
         if not math.isfinite(median_tok_s) or median_tok_s <= 0:
             raise CandidateRejected("measurement median is not finite and positive")
+
+        deep_samples_by_tier: Dict[int, List[float]] = {}
+        deep_sample_root = temp_root / "deep-samples"
+        deep_sample_root.mkdir(mode=0o755)
+        for tier_offset, (tier, _, _) in enumerate(DEEP_PROMPT_RECIPES):
+            tier_samples: List[float] = []
+            tier_rows = deep_prompts[
+                tier_offset * DEEP_SAMPLE_COUNT : (tier_offset + 1) * DEEP_SAMPLE_COUNT
+            ]
+            tier_references = deep_references[
+                tier_offset * DEEP_SAMPLE_COUNT : (tier_offset + 1) * DEEP_SAMPLE_COUNT
+            ]
+            for sample_number, (prompt_row, reference_row) in enumerate(
+                zip(tier_rows, tier_references), start=1
+            ):
+                repeats: List[float] = []
+                for repeat_number in range(1, DEEP_REPEAT_COUNT + 1):
+                    sample_prompt = deep_sample_root / f"deep-{tier}-{sample_number:02d}-prompt.jsonl"
+                    sample_reference = deep_sample_root / f"deep-{tier}-{sample_number:02d}-reference.jsonl"
+                    write_sample_fixture(sample_prompt, prompt_row)
+                    write_sample_fixture(sample_reference, reference_row)
+                    sample_output = output_root / f"deep-{tier}-{sample_number:02d}-repeat-{repeat_number}.json"
+                    sample_status = run_through_runner(
+                        runner,
+                        [
+                            *candidate_env,
+                            *decode_command(
+                                binary,
+                                model,
+                                sample_prompt,
+                                sample_reference,
+                                package_cache,
+                                sample_output,
+                                cache_bucket=DEEP_CACHE_BUCKET,
+                            ),
+                        ],
+                        temp_root / f"deep-{tier}-{sample_number:02d}-repeat-{repeat_number}.log",
+                    )
+                    if sample_status != 0:
+                        raise CandidateRejected(
+                            f"deep {tier}-token measurement sample {sample_number} repeat {repeat_number} "
+                            f"failed with status {sample_status}"
+                        )
+                    sample_payload = load_result(sample_output)
+                    if sample_payload.get("cache_bucket") != DEEP_CACHE_BUCKET:
+                        raise CandidateRejected(f"deep {tier}-token sample used the wrong cache bucket")
+                    repeats.append(
+                        validate_quant_sample_result(
+                            sample_payload,
+                            reference_row,
+                            expected_prompt_tokens=tier,
+                            require_exact=True,
+                        )
+                    )
+                tier_samples.append(min(repeats))
+            tier_median = statistics.median(tier_samples)
+            if not math.isfinite(tier_median) or tier_median <= 0:
+                raise CandidateRejected(f"deep {tier}-token measurement median is not finite and positive")
+            deep_samples_by_tier[tier] = tier_samples
+
+        deep470_samples = deep_samples_by_tier[DEEP_470_TOKENS]
+        deep900_samples = deep_samples_by_tier[DEEP_900_TOKENS]
+        deep470_median = statistics.median(deep470_samples)
+        deep900_median = statistics.median(deep900_samples)
+        short_delta_fraction = median_tok_s / baseline - 1.0
+        deep470_delta_fraction = deep470_median / deep470_baseline - 1.0
+        deep900_delta_fraction = deep900_median / deep900_baseline - 1.0
+        deep_shipping_rule_passed = (
+            short_delta_fraction >= -0.01
+            and deep470_delta_fraction >= 0.03
+            and deep900_delta_fraction >= 0.03
+        )
         baseline_note = (
             f"Frozen master baseline: {baseline:.1f} tok/s on RTX 4090 Q8_0 "
-            f"(QUANT-DECODE.md); N={SAMPLE_COUNT} fresh processes with varied prompts. "
+            f"(QUANT-DECODE.md); short N={SAMPLE_COUNT} fresh processes with varied prompts; "
+            f"deep N={DEEP_SAMPLE_COUNT} x {DEEP_REPEAT_COUNT} worse-of-two per tier, "
+            f"470={deep470_median:.3f} tok/s (control {deep470_baseline:.3f}), "
+            f"900={deep900_median:.3f} tok/s (control {deep900_baseline:.3f}); "
+            f"shipping_rule={deep_shipping_rule_passed}. "
             f"{sibling_note} {cuda_note}"
         )
         writer.write(
@@ -1138,12 +1431,23 @@ def run_harness(workspace_arg: str, runner_arg: str, result_arg: str) -> int:
                 median_tok_s,
                 workspace_commit,
                 baseline_note,
+                deep470_samples=deep470_samples,
+                deep470_median_tok_s=deep470_median,
+                deep900_samples=deep900_samples,
+                deep900_median_tok_s=deep900_median,
+                deep470_baseline_tok_s=deep470_baseline,
+                deep900_baseline_tok_s=deep900_baseline,
+                short_delta_fraction=short_delta_fraction,
+                deep470_delta_fraction=deep470_delta_fraction,
+                deep900_delta_fraction=deep900_delta_fraction,
+                deep_shipping_rule_passed=deep_shipping_rule_passed,
             )
         )
         return 0
     except CandidateRejected as error:
         note = (
-            f"Frozen master baseline: {baseline:.1f} tok/s on RTX 4090 Q8_0. "
+            f"Frozen master baseline: {baseline:.1f} tok/s on RTX 4090 Q8_0; "
+            f"deep controls: 470={deep470_baseline:.3f}, 900={deep900_baseline:.3f} tok/s. "
             f"{sibling_note} {cuda_note} Candidate rejected: {error}"
         )
         writer.write(
@@ -1156,7 +1460,11 @@ def run_harness(workspace_arg: str, runner_arg: str, result_arg: str) -> int:
         # instead of a rejected proposal.
         return 3
     except Exception as error:
-        note = f"Frozen master baseline: {baseline:.1f} tok/s on RTX 4090 Q8_0. {cuda_note} Harness refused: {error}"
+        note = (
+            f"Frozen master baseline: {baseline:.1f} tok/s on RTX 4090 Q8_0; "
+            f"deep controls: 470={deep470_baseline:.3f}, 900={deep900_baseline:.3f} tok/s. "
+            f"{cuda_note} Harness refused: {error}"
+        )
         writer.write(
             result_payload(gate_passed, hooks_passed, [], None, workspace_commit, note)
         )
@@ -1321,7 +1629,8 @@ def self_test() -> int:
         previous_cargo = os.environ.get("SYNAPSE_CAMPAIGN_CARGO")
         previous_rustup_home = os.environ.get("RUSTUP_HOME")
         previous_cargo_home = os.environ.get("CARGO_HOME")
-
+        previous_deep470_baseline = os.environ.get("SYNAPSE_CAMPAIGN_DEEP470_TOK_S")
+        previous_deep900_baseline = os.environ.get("SYNAPSE_CAMPAIGN_DEEP900_TOK_S")
         def fake_run_through_runner(
             _runner: Path, argv: Sequence[str], log_path: Path
         ) -> int:
@@ -1366,6 +1675,8 @@ def self_test() -> int:
             os.environ["SYNAPSE_CAMPAIGN_CARGO"] = "/bin/false"
             os.environ["RUSTUP_HOME"] = str(root / "fake-rustup")
             os.environ["CARGO_HOME"] = str(root / "fake-cargo")
+            os.environ["SYNAPSE_CAMPAIGN_DEEP470_TOK_S"] = "100.0"
+            os.environ["SYNAPSE_CAMPAIGN_DEEP900_TOK_S"] = "90.0"
             fake_result = root / "fake-result.json"
             assert (
                 run_harness(str(mini_workspace), str(fake_runner), str(fake_result))
@@ -1454,8 +1765,19 @@ def self_test() -> int:
                 os.environ.pop("CARGO_HOME", None)
             else:
                 os.environ["CARGO_HOME"] = previous_cargo_home
+            if previous_deep470_baseline is None:
+                os.environ.pop("SYNAPSE_CAMPAIGN_DEEP470_TOK_S", None)
+            else:
+                os.environ["SYNAPSE_CAMPAIGN_DEEP470_TOK_S"] = previous_deep470_baseline
+            if previous_deep900_baseline is None:
+                os.environ.pop("SYNAPSE_CAMPAIGN_DEEP900_TOK_S", None)
+            else:
+                os.environ["SYNAPSE_CAMPAIGN_DEEP900_TOK_S"] = previous_deep900_baseline
 
         _, _, _, references = extract_and_verify_fixtures(root / "fixtures")
+        _, _, deep_prompts, deep_references = extract_deep_fixtures(root / "deep-fixtures")
+        assert len(deep_prompts) == 12
+        assert len(deep_references) == 12
         _, constrained_schema, constrained_prompts = extract_constrained_fixtures(root / "constrained-fixtures")
         assert len(constrained_prompts) == 15
         reference_command = decode_command(
@@ -1468,6 +1790,16 @@ def self_test() -> int:
         )
         assert reference_command[reference_command.index("--max-new-tokens") + 1] == str(MAX_NEW_TOKENS)
         assert reference_command[reference_command.index("--decode-reference") + 1] == str(root / "references.jsonl")
+        deep_command = decode_command(
+            Path("/bin/true"),
+            root / "model",
+            root / "deep-prompts.jsonl",
+            root / "deep-references.jsonl",
+            root / "packages",
+            root / "deep-output.json",
+            cache_bucket=DEEP_CACHE_BUCKET,
+        )
+        assert deep_command[deep_command.index("--decode-cache-bucket") + 1] == str(DEEP_CACHE_BUCKET)
         assert json.loads(constrained_schema.read_text())["required"] == ["result", "score"]
         expected = references[0]
         wall = 1.6
@@ -1487,6 +1819,27 @@ def self_test() -> int:
             ],
         }
         assert validate_decode_result(payload, [expected]) == MAX_NEW_TOKENS / wall
+        deep_wall = 12.0
+        deep_payload: Dict[str, Any] = {
+            "prompts": len(deep_references),
+            "max_new_tokens": MAX_NEW_TOKENS,
+            "cache_bucket": DEEP_CACHE_BUCKET,
+            "exact_prompts": len(deep_references),
+            "accepted_near_ties": 0,
+            "decode_wall_s": deep_wall,
+            "decode_tok_per_s": len(deep_references) * MAX_NEW_TOKENS / deep_wall,
+            "results": [
+                {
+                    "id": row["id"],
+                    "prompt_tokens": DEEP_470_TOKENS if "deep-470-" in row["id"] else DEEP_900_TOKENS,
+                    "tokens": list(row["tokens"]),
+                    "match_depth": MAX_NEW_TOKENS,
+                    "exact_reference": True,
+                }
+                for row in deep_references
+            ],
+        }
+        assert validate_deep_decode_result(deep_payload, deep_references) == len(deep_references) * MAX_NEW_TOKENS / deep_wall
         wrong_token = json.loads(json.dumps(payload))
         wrong_token["results"][0]["tokens"][0] += 1
         expect_rejection(lambda: validate_decode_result(wrong_token, [expected]))
