@@ -410,3 +410,38 @@ bandwidth was approximately 101.0 GB/s f16 (`2,384,199,680` bytes/token) and
 GB/s. The profiler identifies short-context norm/projection work and long-
 context attention growth as the remaining measured headroom; no unsupported
 bandwidth saturation claim is made.
+
+
+## Wave 5 row-level memory-parallelism probe (banked negative)
+
+Wave 5 tested the row-level memory-parallelism mechanism that CUDA campaign #14
+winner 9 measured at **+13.06%** over its fresh `524.0289724489505` tok/s
+control. The Metal candidate assigned adjacent output rows to each active lane
+pair inside a simdgroup. Each pair loaded the activation half4 once, applied it
+to both rows' Q8_0 weight streams, and kept one serial ascending f32 accumulator
+per row. The same shape was applied to QKV, O projection, fused gate/up, down
+projection, and the 151k-row LM head; f16 used the same row-pair layout where
+its exactness gate remained green. No attention, norm, or MPSGraph code was
+changed.
+
+The local M5 gates were green under the cross-machine exactness rule: f16 was
+19/20 against the M1-homed fixture with mutual MPSGraph/step agreement, Q8 was
+11/20 exact with median depth 64.0 and zero near-tie exemptions, all 8 decode
+hook tests passed, and the 470-token prefill plus 64-token long-context outputs
+matched 64/64. The M1 authority gate was also green for the candidate: f16
+20/20, Q8 11/20 with median depth 64.0 and zero near-tie exemptions. The M1
+fresh control reproduced the expected cells before the candidate timing.
+
+| Tree | f16 tok/s | Q8_0 tok/s | Protocol | Decision |
+| --- | ---: | ---: | --- | --- |
+| Fresh winners 5+6 control | **48.6530** | **85.2449** | 12 prompts x 2 fresh processes; worse repeat per prompt | fresh control |
+| Wave 5 exact row-paired candidate | 36.9881 | 30.5319 | same locked-M1 protocol | **Reverted: banked negative** |
+
+The candidate was **-64.19%** versus the fresh Q8 control (and -23.98% for
+f16), so it missed the 3% shipping bar by a wide margin despite passing the
+quality gates. The Metal source was reverted and neither the campaign baseline
+nor `campaign-lab.jsonc` registration was changed. This is evidence that the
+CUDA row axis does not transfer to this Metal step shape: preserving serial
+per-row accumulation left too little useful intra-row parallelism for the
+Metal scheduler, even though the candidate exposed more independent row
+streams.
