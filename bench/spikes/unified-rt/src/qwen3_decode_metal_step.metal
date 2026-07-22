@@ -49,6 +49,15 @@ struct AttentionConfig {
     uint position;
 };
 
+struct ArgmaxConfig {
+    uint vocab;
+    uint partials;
+};
+
+struct EmbeddingConfig {
+    uint hidden;
+};
+
 inline float matrix_dot_q8_chunk(
     const device half *input,
     const device uchar *q8,
@@ -486,4 +495,103 @@ kernel void metal_step_lm_head(
     if (row >= config.output_width) return;
     float value = matrix_dot_q8_simd(input, q8, row, config.input_width, lane);
     if (lane == 0) logits[row] = value;
+}
+
+// Map a float to a strictly increasing UNSIGNED integer key so a plain unsigned
+// `>` reproduces the host sampler's f32::total_cmp ordering exactly, including
+// the sign of zero. This is the canonical IEEE-754 radix-order transform: for a
+// non-negative float set the top bit (keys sit in the upper half, larger float
+// = larger key); for a negative float flip every bit (keys sit in the lower
+// half, more-negative float = smaller key). Larger float always yields a larger
+// unsigned key, and -0.0 sorts just below +0.0 exactly as total_cmp requires.
+inline uint total_order_key(float value) {
+    uint bits = as_type<uint>(value);
+    return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
+}
+
+// The host greedy sampler picks the highest logit and breaks ties toward the
+// LOWEST token id (see logit_precedes in qwen3_decode.rs). A candidate beats
+// the incumbent when its ordered key is strictly greater, or the keys tie and
+// its token id is strictly smaller. Both stages of the reduction use this rule
+// so the chained decode's device-side token selection is byte-identical to the
+// per-token host argmax.
+inline bool argmax_candidate_wins(int candidate_key, uint candidate_id, int best_key, uint best_id) {
+    return candidate_key > best_key || (candidate_key == best_key && candidate_id < best_id);
+}
+
+// Stage one: one thread per threadgroup scans a contiguous vocab slice in
+// ascending id order and writes one (key, id) partial. A serial ascending scan
+// makes the lowest-id tie rule exact without depending on cross-lane shuffle
+// semantics; the two-stage split keeps each scan short. Sentinel key INT_MIN
+// with id UINT_MAX loses to every real candidate, so an empty slice is inert.
+kernel void metal_step_argmax_partial(
+    const device float *logits [[buffer(0)]],
+    device uint *partial_keys [[buffer(1)]],
+    device uint *partial_ids [[buffer(2)]],
+    constant ArgmaxConfig &config [[buffer(3)]],
+    uint group_id [[threadgroup_position_in_grid]],
+    uint lane [[thread_position_in_threadgroup]]) {
+    if (group_id >= config.partials || lane != 0) return;
+    // Even slices across the vocabulary; the final slice absorbs the remainder.
+    uint slice = (config.vocab + config.partials - 1) / config.partials;
+    uint start = group_id * slice;
+    uint end = min(start + slice, config.vocab);
+    uint best_key = 0u;
+    uint best_id = 0xffffffffu;
+    bool have = false;
+    for (uint index = start; index < end; ++index) {
+        uint key = total_order_key(logits[index]);
+        // Ascending index scan with strict-greater wins: the first (lowest) id
+        // holding the maximum key is kept, matching the host lowest-id tie rule.
+        if (!have || key > best_key) {
+            best_key = key;
+            best_id = index;
+            have = true;
+        }
+    }
+    partial_keys[group_id] = best_key;
+    partial_ids[group_id] = best_id;
+}
+
+// Stage two: one thread folds the partials into a single token id with the same
+// ascending-scan / strict-greater rule, so partial boundaries never change the
+// selected id.
+kernel void metal_step_argmax_final(
+    const device uint *partial_keys [[buffer(0)]],
+    const device uint *partial_ids [[buffer(1)]],
+    device uint *token_out [[buffer(2)]],
+    constant ArgmaxConfig &config [[buffer(3)]],
+    uint lane [[thread_position_in_threadgroup]]) {
+    if (lane != 0) return;
+    uint best_key = 0u;
+    uint best_id = 0xffffffffu;
+    bool have = false;
+    for (uint index = 0; index < config.partials; ++index) {
+        uint key = partial_keys[index];
+        uint id = partial_ids[index];
+        // Partials are emitted in ascending vocab order; strict-greater on the
+        // key with a lowest-id tie-break keeps the lowest id among equal maxima.
+        if (!have || key > best_key || (key == best_key && id < best_id)) {
+            best_key = key;
+            best_id = id;
+            have = true;
+        }
+    }
+    token_out[0] = best_id;
+}
+
+// Gather one row of the tied f16 embedding table into the step's input buffer,
+// indexed by the previous step's argmax output. This lets a chained step read
+// its input token device-side without a host round trip. The embedding row and
+// the host embedding() slice are the same f16 bits, so the fed activation is
+// identical to the per-token path.
+kernel void metal_step_embedding_gather(
+    const device half *embeddings [[buffer(0)]],
+    const device uint *token_in [[buffer(1)]],
+    device half *input [[buffer(2)]],
+    constant EmbeddingConfig &config [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= config.hidden) return;
+    uint token = token_in[0];
+    input[gid] = embeddings[(ulong)token * config.hidden + gid];
 }

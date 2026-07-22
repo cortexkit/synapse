@@ -55,6 +55,22 @@ pub(crate) trait DecodeKernel {
     fn stage_timings(&self) -> DecodeStageTimings {
         DecodeStageTimings::default()
     }
+
+    /// The GPU-chained decode span, or 1 when the backend has no chained path.
+    /// A backend returning > 1 must make `advance_chain` produce exactly the
+    /// same tokens as the same number of per-token `advance`/argmax steps.
+    fn chain_span(&self) -> usize {
+        1
+    }
+
+    /// Advance `steps` tokens in one fused submission, returning the argmax
+    /// token id of every step. `seed` feeds the first step. The final element
+    /// is the token committed at the caller's newest position; earlier elements
+    /// are the intermediate tokens. Backends without a chained path (the
+    /// default) must not be asked for this — `chain_span` returns 1 for them.
+    fn advance_chain(&mut self, _cache: &mut Self::Cache, _seed: u32, _steps: usize) -> Result<Vec<u32>> {
+        anyhow::bail!("this decode backend has no chained multi-token path")
+    }
 }
 
 pub(crate) trait DecodeRuntime: DecodeKernel {
@@ -124,6 +140,11 @@ impl<'a, K: DecodeKernel> DecodeSession<'a, K> {
 
     pub(crate) fn stage_timings(&self) -> DecodeStageTimings {
         self.kernel.stage_timings()
+    }
+
+    /// The backend's GPU-chained decode span (1 when it has no chained path).
+    pub(crate) fn chain_span(&self) -> usize {
+        self.kernel.chain_span()
     }
 
     pub(crate) fn generate(
@@ -202,6 +223,98 @@ impl<'a, K: DecodeKernel> DecodeSession<'a, K> {
                 "JSON constraint did not complete within {max_tokens} generated tokens: {}",
                 constraint.describe()
             );
+        }
+        Ok(self.generated[first_generated..].to_vec())
+    }
+
+    /// GPU-chained greedy generation. Produces the same tokens as `generate`
+    /// with the same `top_k=1` argmax, but decodes in spans of `chain_span()`:
+    /// the host takes one argmax to seed a span, the backend runs the whole span
+    /// device-side and returns its token ids, and the host commits them and
+    /// checks stop tokens. Because the backend's chained argmax and embedding
+    /// gather are byte-exact with the per-token path, the committed stream is
+    /// identical to `generate`.
+    ///
+    /// This path intentionally emits no per-token top-logit tap and accepts no
+    /// constraint: the requirement that the k=1 path stay fully instrumented
+    /// (tap, pause, splice, JSON constraint) is met by `generate` at chain span
+    /// 1, and callers needing any of those must use `generate`. Up to
+    /// `chain_span - 1` tokens can
+    /// be produced past a stop token within a span; they are truncated here so
+    /// the returned stream stops exactly at the first stop token, matching
+    /// `generate`.
+    pub(crate) fn generate_chained(
+        &mut self,
+        max_tokens: usize,
+        stop_tokens: &HashSet<u32>,
+        tap: &mut dyn TokenStreamTap,
+    ) -> Result<Vec<u32>> {
+        let span = self.kernel.chain_span();
+        ensure!(span >= 1, "chain span must be at least 1");
+        let first_generated = self.generated.len();
+        let mut produced = 0usize;
+        'outer: while produced < max_tokens {
+            // Seed the span with the host argmax of the pending logits, exactly
+            // as `generate` selects its next token.
+            let sample_started = Instant::now();
+            let top = top_logits(&self.next_logits, 1);
+            ensure!(!top.is_empty(), "decode produced empty logits");
+            let seed = top[0].token_id;
+            self.sample_wall_s += sample_started.elapsed().as_secs_f64();
+
+            // The span may not exceed the remaining budget or the cache.
+            let remaining = max_tokens - produced;
+            let capacity_left = self.kernel.capacity().saturating_sub(self.position());
+            ensure!(capacity_left > 0, "decode cache capacity exhausted");
+            // advance_chain(seed, steps) advances the cache `steps` positions and
+            // returns the `steps` tokens that follow the seed. Together with the
+            // host-selected seed that yields `steps + 1` committed tokens, so cap
+            // the chain steps to keep the total within budget and capacity.
+            let max_follow = remaining.saturating_sub(1);
+            let steps = span.saturating_sub(1).min(max_follow).min(capacity_left - 1);
+
+            // Commit the seed first (it occupies one cache position via the
+            // chain's step 0), tapping it like `generate` does before commit.
+            tap.before_commit(TokenTapEvent {
+                step: self.generated.len(),
+                token_id: seed,
+                top_logits: &top,
+            });
+            self.sequence.push(seed);
+            self.generated.push(seed);
+            produced += 1;
+            if stop_tokens.contains(&seed) {
+                break;
+            }
+            if steps == 0 {
+                // No room for a follow-on span; refresh logits per token so the
+                // loop can select the next seed.
+                self.next_logits = self.kernel.advance(&mut self.cache, seed)?;
+                continue;
+            }
+
+            let followers = self.kernel.advance_chain(&mut self.cache, seed, steps)?;
+            ensure!(
+                followers.len() == steps,
+                "chained decode returned the wrong number of tokens"
+            );
+            for (offset, &token) in followers.iter().enumerate() {
+                tap.before_commit(TokenTapEvent {
+                    step: self.generated.len(),
+                    token_id: token,
+                    top_logits: &[],
+                });
+                self.sequence.push(token);
+                self.generated.push(token);
+                produced += 1;
+                if stop_tokens.contains(&token) {
+                    break 'outer;
+                }
+                // The final follower's logits are needed to seed the next span.
+                if offset + 1 == steps {
+                    self.next_logits = self.kernel.advance(&mut self.cache, token)?;
+                }
+            }
         }
         Ok(self.generated[first_generated..].to_vec())
     }
@@ -1451,6 +1564,117 @@ mod tests {
 
     fn no_stops() -> HashSet<u32> {
         HashSet::new()
+    }
+
+    /// A MockKernel that also exposes a chained multi-token path, modelling the
+    /// real Metal backend's contract: `advance_chain` runs `steps` deterministic
+    /// advances and returns each step's greedy argmax (highest logit, lowest id
+    /// on ties). It lets the chained==per-token invariant be proved with no GPU.
+    struct ChainedMockKernel {
+        inner: MockKernel,
+        span: usize,
+    }
+
+    impl DecodeKernel for ChainedMockKernel {
+        type Cache = Vec<u32>;
+
+        fn capacity(&self) -> usize {
+            self.inner.capacity()
+        }
+
+        fn prefill(&mut self, tokens: &[u32]) -> Result<(Self::Cache, Vec<f32>)> {
+            self.inner.prefill(tokens)
+        }
+
+        fn advance(&mut self, cache: &mut Self::Cache, token: u32) -> Result<Vec<f32>> {
+            self.inner.advance(cache, token)
+        }
+
+        fn cache_position(&self, cache: &Self::Cache) -> usize {
+            self.inner.cache_position(cache)
+        }
+
+        fn inspect_cache_layer(&self, cache: &Self::Cache, layer: usize) -> Result<Vec<f32>> {
+            self.inner.inspect_cache_layer(cache, layer)
+        }
+
+        fn chain_span(&self) -> usize {
+            self.span
+        }
+
+        fn advance_chain(
+            &mut self,
+            cache: &mut Self::Cache,
+            seed: u32,
+            steps: usize,
+        ) -> Result<Vec<u32>> {
+            // Mirror the device chain: feed the seed, argmax its logits into the
+            // first follower, feed that, and so on. The last follower's logits
+            // are not consumed here (the session refreshes them per span).
+            let mut followers = Vec::with_capacity(steps);
+            let mut current = seed;
+            for _ in 0..steps {
+                let logits = self.inner.advance(cache, current)?;
+                let token = top_logits(&logits, 1)[0].token_id;
+                followers.push(token);
+                current = token;
+            }
+            Ok(followers)
+        }
+    }
+
+    #[test]
+    fn chained_generation_matches_per_token_generation() {
+        // The chained path must produce the exact token stream the fully
+        // instrumented per-token path produces; only the submission shape
+        // differs. Proven here across several spans and a stop token, so a
+        // regression that changes tokens under chaining fails in CI without a
+        // GPU. This is the machine-independent half of the chained-decode
+        // exactness check; the Metal backend adds the same check on real logits.
+        for span in [2usize, 3, 5, 8] {
+            let mut per_token_kernel = MockKernel { capacity: 128 };
+            let mut per_token = DecodeSession::prefill(&mut per_token_kernel, &[3, 1, 4]).unwrap();
+            let expected = per_token
+                .generate(40, &no_stops(), 1, &mut |_: TokenTapEvent<'_>| {})
+                .unwrap();
+
+            let mut chained_kernel = ChainedMockKernel {
+                inner: MockKernel { capacity: 128 },
+                span,
+            };
+            let mut chained = DecodeSession::prefill(&mut chained_kernel, &[3, 1, 4]).unwrap();
+            let actual = chained
+                .generate_chained(40, &no_stops(), &mut |_: TokenTapEvent<'_>| {})
+                .unwrap();
+            assert_eq!(actual, expected, "chained span {span} diverged from per-token");
+        }
+    }
+
+    #[test]
+    fn chained_generation_truncates_at_stop_token_like_per_token() {
+        // A stop token reached mid-span must truncate the returned stream at the
+        // stop, exactly as per-token generation does, even though the device may
+        // produce up to span-1 tokens past it within the fused submission.
+        let stops = HashSet::from([0u32]);
+        let mut per_token_kernel = MockKernel { capacity: 128 };
+        let mut per_token = DecodeSession::prefill(&mut per_token_kernel, &[2, 2]).unwrap();
+        let expected = per_token
+            .generate(40, &stops, 1, &mut |_: TokenTapEvent<'_>| {})
+            .unwrap();
+
+        let mut chained_kernel = ChainedMockKernel {
+            inner: MockKernel { capacity: 128 },
+            span: 8,
+        };
+        let mut chained = DecodeSession::prefill(&mut chained_kernel, &[2, 2]).unwrap();
+        let actual = chained
+            .generate_chained(40, &stops, &mut |_: TokenTapEvent<'_>| {})
+            .unwrap();
+        assert_eq!(actual, expected);
+        assert!(
+            expected.last().is_none_or(|last| stops.contains(last) || expected.len() == 40),
+            "test fixture should exercise a stop-token truncation"
+        );
     }
 
     struct ConstraintKernel;

@@ -65,6 +65,11 @@ pub(crate) struct MetalStepDecoder<'a> {
     model: &'a Model,
     bucket: usize,
     host_prepare_wall_s: f64,
+    // Chained-decode span. k=1 preserves the fully instrumented per-token path
+    // byte-for-byte; k>1 encodes k forward passes plus on-GPU argmax into one
+    // command buffer with a single readback. Runtime-tunable via
+    // SYNAPSE_METAL_STEP_CHAIN_K (default 8).
+    chain_k: usize,
 }
 
 impl<'a> MetalStepDecoder<'a> {
@@ -116,10 +121,15 @@ impl<'a> MetalStepDecoder<'a> {
             model,
             bucket,
             host_prepare_wall_s: started.elapsed().as_secs_f64(),
+            chain_k: read_chain_k(),
         };
         let params = decoder.layer_params()?;
         let final_norm = decoder.model.final_norm.weight.metal_f16_bits()?;
         let lm_head = decoder.model.lm_head()?.metal_f16_bits()?;
+        // The chained-decode embedding gather reads this resident f16 table.
+        // These are the same bits encode_f16_bits(embedding) produces on the
+        // per-token host path, so the fed activation is byte-identical.
+        let embeddings = decoder.model.embeddings.metal_f16_bits()?;
         let status = unsafe {
             synapse_qwen3_metal_step_prepare(
                 decoder.raw.as_ptr(),
@@ -133,6 +143,7 @@ impl<'a> MetalStepDecoder<'a> {
                     .lm_head_q8_0()
                     .map_or(std::ptr::null(), |weight| weight.as_bytes().as_ptr())
                     .cast(),
+                embeddings.as_ptr().cast(),
             )
         };
         if status != 0 {
@@ -249,6 +260,63 @@ impl<'a> MetalStepDecoder<'a> {
         (encode_f16_bits(&cosine), encode_f16_bits(&sine))
     }
 
+    /// Concatenated rope tables for `steps` consecutive positions starting at
+    /// `start`. Each position's head_dim block is produced by the exact same
+    /// per-index formula as `rope`, so the chain's step S reads a block that is
+    /// byte-identical to what the per-token path would compute for `start + S`.
+    fn rope_chain(&self, start: usize, steps: usize) -> (Vec<u16>, Vec<u16>) {
+        let head_dim = self.model.config.head_dim;
+        let mut cosine = Vec::with_capacity(head_dim * steps);
+        let mut sine = Vec::with_capacity(head_dim * steps);
+        for step in 0..steps {
+            let (cos_bits, sin_bits) = self.rope(start + step);
+            cosine.extend_from_slice(&cos_bits);
+            sine.extend_from_slice(&sin_bits);
+        }
+        (cosine, sine)
+    }
+
+    /// Encode `steps` chained decode passes into one command buffer and return
+    /// the `steps` argmax token ids. `seed` is the token whose embedding feeds
+    /// step 0 (the last committed token); each later step gathers its input from
+    /// the prior step's device-side argmax. Because the gather and argmax are
+    /// byte-exact with the per-token path, the returned ids are identical to
+    /// calling `advance` `steps` times and taking each host argmax.
+    pub(crate) fn advance_chain(
+        &mut self,
+        cache: &mut MetalStepKvCache,
+        seed: u32,
+        steps: usize,
+    ) -> Result<Vec<u32>> {
+        ensure!(steps > 0, "chain step count must be positive");
+        ensure!(
+            cache.position + steps <= self.bucket,
+            "chained decode exceeds cache capacity"
+        );
+        let (rope_cos, rope_sin) = self.rope_chain(cache.position, steps);
+        let mut token_ids = vec![0u32; steps];
+        let status = unsafe {
+            synapse_qwen3_metal_step_chain(
+                self.raw.as_ptr(),
+                cache.position as u64,
+                steps as u32,
+                seed,
+                rope_cos.as_ptr(),
+                rope_sin.as_ptr(),
+                token_ids.as_mut_ptr(),
+                self.model.config.rms_norm_eps,
+            )
+        };
+        if status != 0 {
+            bail!(
+                "Qwen3 Metal step chain failed with status {status}: {}",
+                last_error()
+            );
+        }
+        cache.position += steps;
+        Ok(token_ids)
+    }
+
     fn timings(&self) -> DecodeStageTimings {
         let mut native = NativeTimings::default();
         unsafe { synapse_qwen3_metal_step_timings(self.raw.as_ptr(), &mut native) };
@@ -352,6 +420,19 @@ impl DecodeKernel for MetalStepDecoder<'_> {
         cache.position
     }
 
+    fn chain_span(&self) -> usize {
+        self.chain_k
+    }
+
+    fn advance_chain(
+        &mut self,
+        cache: &mut Self::Cache,
+        seed: u32,
+        steps: usize,
+    ) -> Result<Vec<u32>> {
+        MetalStepDecoder::advance_chain(self, cache, seed, steps)
+    }
+
     fn inspect_cache_layer(&self, _cache: &Self::Cache, layer: usize) -> Result<Vec<f32>> {
         ensure!(
             layer < self.model.layers.len(),
@@ -434,6 +515,17 @@ fn metal_step_library_path() -> Result<PathBuf> {
     Ok(build_path.to_owned())
 }
 
+/// Chain span from SYNAPSE_METAL_STEP_CHAIN_K (default 8). Values are clamped
+/// to at least 1 so an out-of-range or unparseable setting degrades to the
+/// fully instrumented per-token path rather than failing.
+fn read_chain_k() -> usize {
+    std::env::var("SYNAPSE_METAL_STEP_CHAIN_K")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .map(|value| value.max(1))
+        .unwrap_or(8)
+}
+
 fn last_error() -> anyhow::Error {
     unsafe {
         let raw = synapse_qwen3_metal_step_last_error();
@@ -466,6 +558,17 @@ unsafe extern "C" {
         final_norm_weight: *const c_void,
         lm_head_weight: *const c_void,
         lm_head_q8: *const u8,
+        embeddings: *const c_void,
+    ) -> i32;
+    fn synapse_qwen3_metal_step_chain(
+        context: *mut c_void,
+        position: u64,
+        steps: u32,
+        token_in_first: u32,
+        rope_cos: *const u16,
+        rope_sin: *const u16,
+        token_ids_out: *mut u32,
+        epsilon: f32,
     ) -> i32;
     fn synapse_qwen3_metal_step_import_caches(
         context: *mut c_void,

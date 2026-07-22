@@ -1,8 +1,9 @@
 # Metal custom decode step
 
-Status: **wave 4 norm kernels are correctness-gated and locally profiled; the custom path remains a spike and is not the default backend**.
+Status: **wave 6 GPU-chained multi-token decode is implemented and token-exact on the locked M1 (f16 20/20 at k=1 and k=8; Q8 quality and long-context parity unchanged; all hooks green), but its locked-M1 best-k Q8 throughput is +2.58%, below the 3% shipping bar — it is a banked correctness win, not shipped, and no baseline was changed**.
 The default Qwen3 decode backend remains `mpsgraph`. Select the custom path with
-`--decode-backend metal-step`.
+`--decode-backend metal-step`. The chained span is `SYNAPSE_METAL_STEP_CHAIN_K`
+(default 8; set 1 for the fully instrumented per-token path).
 
 ## Scope and handoff
 
@@ -228,6 +229,148 @@ not clear the promotion bar; pairwise KV-position value-loop unrolling
 smaller attention threadgroup +1.20%) were likewise below promotion value.
 These are follow-ups to revisit only with a new gate hypothesis, not claims of
 available throughput.
+
+## Wave 6 GPU-chained multi-token decode
+
+Wave 6 removes the per-token host round trip. Before this wave every decode token
+cost one command buffer, one `waitUntilCompleted`, and a 604KB fp32 logits
+readback (151,936 vocab x 4 bytes) before the host argmax could pick the next
+input token. On the M1 that serialized wait plus readback is a first-order slice
+of the ~11.7ms/token budget; the CUDA twin measured the equivalent readback
+immaterial at 1.9ms/token, but Metal's serialized-per-token shape makes it
+material here.
+
+### Mechanism
+
+1. **On-GPU argmax** (`metal_step_argmax_partial` + `metal_step_argmax_final` in
+   `qwen3_decode_metal_step.metal`): a two-stage reduction over the 151,936 vocab
+   logits writes one int32 token id. Each float logit is mapped to an unsigned
+   radix key via the canonical IEEE-754 total-order transform (set the top bit of
+   non-negatives, flip all bits of negatives), so a plain `>` reproduces the host
+   sampler's `f32::total_cmp` order exactly, including the sign of zero. Ties
+   resolve to the LOWEST token id, byte-identical to `logit_precedes` in
+   `qwen3_decode.rs`. Stage one is one thread per ~4,096-entry slice scanning in
+   ascending id order; stage two folds the partials with the same rule.
+2. **On-GPU embedding gather** (`metal_step_embedding_gather`): a chained step
+   reads its input token device-side from the previous step's argmax output and
+   gathers that row of the resident f16 embedding table. Those bits are exactly
+   what `encode_f16_bits(embedding(token))` produces on the per-token path, so the
+   fed activation is identical.
+3. **Chained encode** (`synapse_qwen3_metal_step_chain`): k full forward passes
+   plus argmax are encoded into one command buffer. Position advances per step and
+   the per-step rope block is selected by offset into a host-supplied k-position
+   table (each block is byte-identical to what the per-token path computes for
+   that position). Only the first step's input token is host-seeded; the rest are
+   produced device-side.
+4. **Readback every k tokens** (4*k bytes) replaces the per-token 604KB logits
+   readback. Logits are only read back on the per-token path (k=1).
+5. **Runtime k**: `SYNAPSE_METAL_STEP_CHAIN_K` (default 8). Plain generation uses
+   the chained path; k=1 forces the fully instrumented per-token path.
+
+### Hook contract (D-009)
+
+k=1 is byte-for-byte the pre-wave per-token path — verified 0/20 token
+differences against the pre-change tree on M5. `generate_chained` intentionally
+carries no per-token top-logit tap and accepts no JSON constraint, pause, or
+splice; those product invariants are served by the fully instrumented `generate`
+at chain span 1, and any constrained run is routed there automatically. Stop
+tokens are honoured by truncation: the fused submission may produce up to k-1
+tokens past a stop, and the host truncates the returned stream at the first stop,
+matching per-token generation. Two unit tests
+(`chained_generation_matches_per_token_generation`,
+`chained_generation_truncates_at_stop_token_like_per_token`) lock this on every
+CI run without a GPU.
+
+### The nine process deaths
+
+This mechanism was proposed nine times across three campaigns and never survived
+patch application — it had never been measured on Metal. Every prior attempt died
+in the automated patch step (context-window or apply failures on the large
+`.m`/`.metal`/`.rs` edit set), not on its merits. This wave was built directly
+with full file access, which is why it exists as a coherent, gated tree rather
+than a tenth banked patch failure. The externally validated precedent is BaseRT
+(arXiv:2607.00501): 321 tok/s on Qwen3-0.6B Q8 on an M4 Pro — less bandwidth than
+our M1 Max — using exactly this GPU-chained design.
+
+### Local M5 correctness gates (green)
+
+Built with the Xcode Metal toolchain
+(`DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer`), Qwen3-0.6B snapshot
+`c1899de289a04d12100db370d81485cdf75e47ca`, the campaign 20-prompt fixture, 64
+new tokens, bucket 512.
+
+- **Chaining changes no token** (the core invariant): k=1 vs k=4, k=8, and k=16
+  are token-for-token identical across all 20 prompts, for both f16 (0/20 diffs at
+  every k) and Q8_0 (0/20 diffs at every k). This is the machine-independent proof
+  that the whole gate rests on; it does not depend on which Apple GPU runs it.
+- **k=1 == pre-change master**: 0/20 token differences, so the per-token hook path
+  is unchanged.
+- **f16 fixture gate**: 19/20 exact at k=1 and at k=8, median match depth 64.0.
+  The single miss is completion-06 at step 7, the documented M5 cross-machine
+  near-tie (13079 at 16.744871 vs fixture 61686 at 16.741877, gap 0.003). The M1
+  is the fixture authority and there it is the full 20/20 at both k=1 and k=8
+  (below). No threshold was changed.
+- **Q8_0 quality gate**: 13/20 exact, median match depth 64.0 at k=1, k=8, and
+  k=16 — above the campaign floor (>= 10/20 exact, median depth >= 59.0), and
+  unchanged by chaining.
+- **Hooks**: `cargo test -p spike-unified-rt qwen3_decode` — 10 passed, 0 failed,
+  including the 5 harness hook tests and the 2 new chained-invariant tests.
+
+An earlier M5-local throughput probe was +29.7% (Q8 k=16 vs k=1) and predicted a
+comfortable clear. It did not transfer: the M1 timing below is the authority, and
+it clears only +2.58%. The M5 indicative is not repeated here to avoid implying a
+result the authority machine did not confirm.
+
+### Locked-M1 authority gates (green) and timing (measured, below bar)
+
+Locked M1 Max, `[bench-host]`, exclusive `[bench-user-home]/bench.lock` held
+then released, AC power 100% charged, no `Runner.Worker`, 1-minute load average
+1.07--1.33. Built with the M1's own cargo (`[bench-user-home]/.cargo/bin/cargo`, full
+Xcode default), Qwen3-0.6B snapshot `c1899de289a04d12100db370d81485cdf75e47ca`,
+executable-relative 64,591-byte metallib beside the binary.
+
+Correctness (fixture authority):
+
+- **f16 fixture gate: 20/20 exact at k=1 AND k=8**, median match depth 64.0.
+  completion-06 is exact here — it was the M5-only cross-machine near-tie.
+- **Q8_0 quality: 13/20 exact, median match depth 64.0 at k=1, k=8, and k=16**,
+  zero near-tie exemptions.
+- **Chaining changes no token on the authority machine**: k=1 == k=8 (f16) and
+  k=1 == k=8 == k=16 (Q8), token-for-token across all 20 prompts.
+- **Long-context fixture**: the 470-token prompt at bucket 1024 produced 64/64
+  tokens identical between metal-step (k=8) and the MPSGraph reference.
+- **Hooks**: `cargo test qwen3_decode` on the M1 — 10 passed, 0 failed.
+
+Timing (N=12 stride-seven prompts x 2 fresh processes, worse-of-two per prompt,
+median across the 12):
+
+| Weights | k=1 (fresh control) | k=4 | k=8 | k=16 | best-k vs control |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Q8_0 | **85.2192** | 86.1610 | 86.9541 | 87.4162 | **+2.58% at k=16** |
+| f16 | **48.6168** | — | 49.1345 | 49.2656 | +1.33% at k=16 |
+
+The fresh control reproduced the winners-5+6 baseline within drift: Q8 85.2192
+tok/s vs the pinned 85.2589 (-0.05%), f16 48.6168 vs 48.6530 (-0.07%), both well
+inside the 2% control-drift gate.
+
+### Decision: banked correctness win, not shipped
+
+Best-k Q8 is **+2.58%**, below the **+3%** shipping bar, so per the wave rules the
+change is **not shipped as the throughput win**: the pinned Q8 baseline
+(85.2589 tok/s), the `campaign-lab.jsonc` blocks, the harness `BASELINE_TOK_S`,
+and every threshold are **left untouched**. The mechanism is nonetheless retained
+in-tree as a correct, token-exact, fully gated implementation (k=1 preserves the
+per-token hook path byte-for-byte), because it finally converts a mechanism that
+died nine times in patch application into a measured M1 result.
+
+Why the M1 clears only +2.58% while the physics motivated the wave: on the M1 the
+per-token `waitUntilCompleted` plus 604KB logits readback that chaining removes is
+a smaller fraction of the ~11.7ms Q8 token than the motivating estimate assumed.
+Q8 decode is close to bandwidth-bound here (~54 GB/s effective active-weight rate
+at 85 tok/s), so amortizing the host round trip over k tokens recovers only about
+2.6%, not the double-digit figure the M4-Pro BaseRT precedent and the M5 probe
+suggested. This is a real, honestly-measured ceiling for this mechanism on this
+machine, not a gate failure — no tokens changed at any k.
 
 ## Cross-machine exactness note
 

@@ -80,6 +80,9 @@ typedef struct Qwen3MetalStepContext {
     id<MTLComputePipelineState> residual_rmsnorm;
     id<MTLComputePipelineState> gate_up_swiglu;
     id<MTLComputePipelineState> lm_head;
+    id<MTLComputePipelineState> argmax_partial;
+    id<MTLComputePipelineState> argmax_final;
+    id<MTLComputePipelineState> embedding_gather;
     StepLayerBuffers *layers;
     uint64_t layer_count;
     uint64_t bucket;
@@ -103,6 +106,17 @@ typedef struct Qwen3MetalStepContext {
     id<MTLBuffer> logits;
     id<MTLBuffer> final_norm_weight;
     StepWeight lm_head_weight;
+    // Chained-decode resources. The tied f16 embedding table lives resident so a
+    // chained step can gather its input row device-side from the previous step's
+    // argmax output, and the argmax scratch buffers turn the vocab logits into a
+    // single token id without a host round trip. These are only encoded on the
+    // chained path; the per-token path never touches them.
+    id<MTLBuffer> embeddings;
+    uint64_t argmax_partials;
+    id<MTLBuffer> argmax_partial_keys;
+    id<MTLBuffer> argmax_partial_ids;
+    id<MTLBuffer> chain_token_ids;
+    id<MTLBuffer> chain_input;
     BOOL profile_kernels;
     Qwen3MetalStepTimings timings;
 } Qwen3MetalStepContext;
@@ -244,10 +258,14 @@ void *synapse_qwen3_metal_step_context_new(
         context->residual_rmsnorm = pipeline(context->device, context->library, @"metal_step_residual_rmsnorm");
         context->gate_up_swiglu = pipeline(context->device, context->library, @"metal_step_gate_up_swiglu");
         context->lm_head = pipeline(context->device, context->library, @"metal_step_lm_head");
+        context->argmax_partial = pipeline(context->device, context->library, @"metal_step_argmax_partial");
+        context->argmax_final = pipeline(context->device, context->library, @"metal_step_argmax_final");
+        context->embedding_gather = pipeline(context->device, context->library, @"metal_step_embedding_gather");
         if (context->rmsnorm == nil || context->qkv_matvec == nil || context->qk_norm_rope == nil ||
             context->attention == nil || context->matvec_residual == nil || context->residual_rmsnorm == nil ||
             context->gate_up_swiglu == nil ||
-            context->lm_head == nil) {
+            context->lm_head == nil || context->argmax_partial == nil || context->argmax_final == nil ||
+            context->embedding_gather == nil) {
             [context->library release];
             [context->queue release];
             [context->device release];
@@ -278,7 +296,8 @@ int32_t synapse_qwen3_metal_step_prepare(
     const Qwen3MetalStepLayerParams *params,
     const void *final_norm_weight,
     const void *lm_head_weight,
-    const void *lm_head_q8
+    const void *lm_head_q8,
+    const void *embeddings
 ) {
     @autoreleasepool {
         @try {
@@ -371,6 +390,26 @@ int32_t synapse_qwen3_metal_step_prepare(
             context->mlp = new_zero_buffer(context->device, intermediate_bytes, MTLResourceStorageModePrivate);
             context->final_norm = new_zero_buffer(context->device, hidden_bytes, MTLResourceStorageModePrivate);
             context->logits = new_zero_buffer(context->device, (NSUInteger)context->vocab * sizeof(float), MTLResourceStorageModeShared);
+            // Chained-decode residents. Embeddings are uploaded once into a
+            // private buffer so the gather kernel reads them without host-visible
+            // access. One threadgroup argmax partial per 4,096 vocab entries keeps
+            // the two-stage reduction's final fold within a single simdgroup.
+            if (embeddings != NULL) {
+                context->embeddings = new_private_buffer(context->device, upload_blit, embeddings,
+                                                         (NSUInteger)(context->vocab * context->hidden) * sizeof(uint16_t));
+                context->argmax_partials = (context->vocab + 4095) / 4096;
+                if (context->argmax_partials == 0) context->argmax_partials = 1;
+                context->argmax_partial_keys = new_zero_buffer(context->device,
+                                                               (NSUInteger)context->argmax_partials * sizeof(int32_t),
+                                                               MTLResourceStorageModePrivate);
+                context->argmax_partial_ids = new_zero_buffer(context->device,
+                                                              (NSUInteger)context->argmax_partials * sizeof(uint32_t),
+                                                              MTLResourceStorageModePrivate);
+                // Token-id scratch is host-visible so the host reads back the k
+                // ids after a chain and seeds the first step of the next chain.
+                context->chain_token_ids = new_zero_buffer(context->device, sizeof(uint32_t), MTLResourceStorageModeShared);
+                context->chain_input = new_zero_buffer(context->device, hidden_bytes, MTLResourceStorageModePrivate);
+            }
             [upload_blit endEncoding];
             [upload_command commit];
             [upload_command waitUntilCompleted];
@@ -386,6 +425,13 @@ int32_t synapse_qwen3_metal_step_prepare(
                 context->logits == nil) {
                 set_error(@"failed to allocate Metal step activation buffers");
                 return -5;
+            }
+            if (embeddings != NULL &&
+                (context->embeddings == nil || context->argmax_partial_keys == nil ||
+                 context->argmax_partial_ids == nil || context->chain_token_ids == nil ||
+                 context->chain_input == nil)) {
+                set_error(@"failed to allocate Metal step chained-decode buffers");
+                return -7;
             }
             return 0;
         } @catch (NSException *exception) {
@@ -482,12 +528,16 @@ static void encode_qkv(
     [encoder endEncoding];
 }
 
-static void encode_qk_norm_rope(
+// Rope-offset-aware form. The per-token wrapper below passes offset 0, so its
+// generated command stream is byte-identical to the previous single-block code;
+// the chain path passes a per-step head_dim block offset into a shared buffer.
+static void encode_qk_norm_rope_offset(
     Qwen3MetalStepContext *context,
     id<MTLCommandBuffer> command_buffer,
     StepLayerBuffers *layer,
     id<MTLBuffer> rope_cos,
     id<MTLBuffer> rope_sin,
+    NSUInteger rope_offset,
     uint32_t position
 ) {
     id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
@@ -496,8 +546,8 @@ static void encode_qk_norm_rope(
     [encoder setBuffer:context->key offset:0 atIndex:1];
     [encoder setBuffer:layer->q_norm offset:0 atIndex:2];
     [encoder setBuffer:layer->k_norm offset:0 atIndex:3];
-    [encoder setBuffer:rope_cos offset:0 atIndex:4];
-    [encoder setBuffer:rope_sin offset:0 atIndex:5];
+    [encoder setBuffer:rope_cos offset:rope_offset atIndex:4];
+    [encoder setBuffer:rope_sin offset:rope_offset atIndex:5];
     [encoder setBuffer:layer->key_cache offset:0 atIndex:6];
     struct { uint32_t query_heads; uint32_t kv_heads; uint32_t head_dim; float epsilon; uint32_t capacity; uint32_t position; } config = {
         (uint32_t)context->query_heads, (uint32_t)context->kv_heads, (uint32_t)context->head_dim, context->epsilon,
@@ -506,6 +556,18 @@ static void encode_qk_norm_rope(
     [encoder setBytes:&config length:sizeof(config) atIndex:7];
     [encoder dispatchThreads:grid_size(MAX(context->query_heads, context->kv_heads)) threadsPerThreadgroup:group_size(MAX(context->query_heads, context->kv_heads))];
     [encoder endEncoding];
+}
+
+// Per-token wrapper: rope tables are a single head_dim block, so offset is 0.
+static void encode_qk_norm_rope(
+    Qwen3MetalStepContext *context,
+    id<MTLCommandBuffer> command_buffer,
+    StepLayerBuffers *layer,
+    id<MTLBuffer> rope_cos,
+    id<MTLBuffer> rope_sin,
+    uint32_t position
+) {
+    encode_qk_norm_rope_offset(context, command_buffer, layer, rope_cos, rope_sin, 0, position);
 }
 
 static void encode_attention(
@@ -618,6 +680,186 @@ static void encode_lm_head(Qwen3MetalStepContext *context, id<MTLCommandBuffer> 
     NSUInteger lm_head_threads = context->quantized ? context->vocab * 32 : context->vocab;
     [encoder dispatchThreads:grid_size(lm_head_threads) threadsPerThreadgroup:group_size(context->quantized ? 256 : context->vocab)];
     [encoder endEncoding];
+}
+
+// Argmax the resident logits into `token_out[out_offset]`, matching the host
+// greedy sampler's highest-logit / lowest-id rule (see the Metal kernels).
+static void encode_argmax_offset(
+    Qwen3MetalStepContext *context,
+    id<MTLCommandBuffer> command_buffer,
+    id<MTLBuffer> token_out,
+    NSUInteger out_offset
+) {
+    struct { uint32_t vocab; uint32_t partials; } config = {
+        (uint32_t)context->vocab, (uint32_t)context->argmax_partials
+    };
+    id<MTLComputeCommandEncoder> partial = [command_buffer computeCommandEncoder];
+    [partial setComputePipelineState:context->argmax_partial];
+    [partial setBuffer:context->logits offset:0 atIndex:0];
+    [partial setBuffer:context->argmax_partial_keys offset:0 atIndex:1];
+    [partial setBuffer:context->argmax_partial_ids offset:0 atIndex:2];
+    [partial setBytes:&config length:sizeof(config) atIndex:3];
+    // One thread per partial: each threadgroup owns exactly one vocab slice and
+    // scans it serially. The grid is one thread per partial with a single-thread
+    // group so threadgroup_position_in_grid indexes the slice.
+    [partial dispatchThreadgroups:MTLSizeMake((NSUInteger)context->argmax_partials, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+    [partial endEncoding];
+
+    id<MTLComputeCommandEncoder> final = [command_buffer computeCommandEncoder];
+    [final setComputePipelineState:context->argmax_final];
+    [final setBuffer:context->argmax_partial_keys offset:0 atIndex:0];
+    [final setBuffer:context->argmax_partial_ids offset:0 atIndex:1];
+    [final setBuffer:token_out offset:out_offset atIndex:2];
+    [final setBytes:&config length:sizeof(config) atIndex:3];
+    [final dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+    [final endEncoding];
+}
+
+// Gather the embedding row named by `token_in[in_offset]` into `input_out`.
+static void encode_embedding_gather_offset(
+    Qwen3MetalStepContext *context,
+    id<MTLCommandBuffer> command_buffer,
+    id<MTLBuffer> token_in,
+    NSUInteger in_offset,
+    id<MTLBuffer> input_out
+) {
+    id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+    [encoder setComputePipelineState:context->embedding_gather];
+    [encoder setBuffer:context->embeddings offset:0 atIndex:0];
+    [encoder setBuffer:token_in offset:in_offset atIndex:1];
+    [encoder setBuffer:input_out offset:0 atIndex:2];
+    struct { uint32_t hidden; } config = { (uint32_t)context->hidden };
+    [encoder setBytes:&config length:sizeof(config) atIndex:3];
+    [encoder dispatchThreads:grid_size(context->hidden) threadsPerThreadgroup:group_size(context->hidden)];
+    [encoder endEncoding];
+}
+
+// Encode the full transformer forward pass for one chained step, reading `input`
+// and advancing every layer's KV cache at `position`. This mirrors the per-token
+// encode order exactly; the only difference is that `position`, `input`, and the
+// per-step rope block (selected by `rope_offset` bytes) vary within the chain
+// instead of across command buffers.
+static void encode_forward(
+    Qwen3MetalStepContext *context,
+    id<MTLCommandBuffer> command_buffer,
+    id<MTLBuffer> input,
+    id<MTLBuffer> rope_cos,
+    id<MTLBuffer> rope_sin,
+    NSUInteger rope_offset,
+    uint32_t position,
+    float epsilon
+) {
+    id<MTLBuffer> current = input;
+    id<MTLBuffer> next = context->x_a;
+    for (uint64_t index = 0; index < context->layer_count; ++index) {
+        StepLayerBuffers *layer = &context->layers[index];
+        encode_rmsnorm(context, command_buffer, current, context->normalized, layer->input_norm,
+                       (uint32_t)context->hidden, epsilon);
+        encode_qkv(context, command_buffer, layer, context->normalized, position);
+        encode_qk_norm_rope_offset(context, command_buffer, layer, rope_cos, rope_sin, rope_offset, position);
+        encode_attention(context, command_buffer, layer, position);
+        encode_matvec_residual(context, command_buffer, context->context, current, next,
+                               &layer->o_weight, (uint32_t)context->query_heads * (uint32_t)context->head_dim,
+                               (uint32_t)context->hidden, NO);
+        encode_residual_rmsnorm(context, command_buffer, next, current, context->normalized,
+                                layer->post_attention_norm);
+        encode_gate_up(context, command_buffer, layer, context->normalized);
+        encode_matvec_residual(context, command_buffer, context->mlp, next, current,
+                               &layer->down_weight, (uint32_t)context->intermediate, (uint32_t)context->hidden, YES);
+    }
+    encode_rmsnorm(context, command_buffer, current, context->final_norm, context->final_norm_weight,
+                   (uint32_t)context->hidden, epsilon);
+    encode_lm_head(context, command_buffer);
+}
+
+// Chained multi-token decode: encode `steps` full forward passes plus an
+// on-GPU argmax into a single command buffer, gathering each step's input token
+// from the previous step's device-side argmax output. Position advances per
+// step; rope tables are supplied host-side for the whole span (one head_dim
+// block per step). The first step's input token is seeded by the host in
+// token_in_first; subsequent steps read the id the argmax wrote. After the
+// chain completes the host reads the `steps` token ids back at once (4*steps
+// bytes) instead of a 604KB logits readback per token. This is only correct
+// because the embedding gather and argmax are byte-exact with the per-token
+// host path, so the produced token stream is identical to k=1.
+int32_t synapse_qwen3_metal_step_chain(
+    void *raw,
+    uint64_t position,
+    uint32_t steps,
+    uint32_t token_in_first,
+    const uint16_t *rope_cos,
+    const uint16_t *rope_sin,
+    uint32_t *token_ids_out,
+    float epsilon
+) {
+    @autoreleasepool {
+        @try {
+            metal_step_error[0] = '\0';
+            double feed_started = [NSDate timeIntervalSinceReferenceDate];
+            Qwen3MetalStepContext *context = raw;
+            if (context == NULL || rope_cos == NULL || rope_sin == NULL || token_ids_out == NULL ||
+                context->layers == NULL || context->embeddings == nil || steps == 0 ||
+                position + steps > context->bucket) {
+                set_error(@"invalid Metal step chain arguments");
+                return -1;
+            }
+            NSUInteger rope_span = (NSUInteger)steps * (NSUInteger)context->head_dim;
+            id<MTLBuffer> cosine_buffer = [context->device newBufferWithBytes:rope_cos
+                length:rope_span * sizeof(uint16_t) options:MTLResourceStorageModeShared];
+            id<MTLBuffer> sine_buffer = [context->device newBufferWithBytes:rope_sin
+                length:rope_span * sizeof(uint16_t) options:MTLResourceStorageModeShared];
+            // A host-visible id buffer holds the seed token and each step's argmax
+            // output; the host reads all `steps` ids back after completion.
+            id<MTLBuffer> ids_buffer = [context->device newBufferWithLength:(NSUInteger)steps * sizeof(uint32_t)
+                options:MTLResourceStorageModeShared];
+            id<MTLCommandBuffer> command_buffer = [context->queue commandBuffer];
+            if (cosine_buffer == nil || sine_buffer == nil || ids_buffer == nil || command_buffer == nil) {
+                [cosine_buffer release];
+                [sine_buffer release];
+                [ids_buffer release];
+                set_error(@"failed to allocate Metal step chain buffers");
+                return -2;
+            }
+            // Seed step 0's token; steps > 0 read the id the prior argmax wrote.
+            *(uint32_t *)context->chain_token_ids.contents = token_in_first;
+            NSUInteger head_dim_bytes = (NSUInteger)context->head_dim * sizeof(uint16_t);
+            for (uint32_t step = 0; step < steps; ++step) {
+                id<MTLBuffer> step_ids = (step == 0) ? context->chain_token_ids : ids_buffer;
+                NSUInteger id_offset = (step == 0) ? 0 : (NSUInteger)(step - 1) * sizeof(uint32_t);
+                // Gather this step's input from the token produced upstream: the
+                // seed for step 0, or step-1's argmax output otherwise.
+                encode_embedding_gather_offset(context, command_buffer, step_ids, id_offset, context->chain_input);
+                // Select this step's head_dim rope block from the shared buffers.
+                encode_forward(context, command_buffer, context->chain_input,
+                               cosine_buffer, sine_buffer, (NSUInteger)step * head_dim_bytes,
+                               (uint32_t)position + step, epsilon);
+                // Argmax this step's logits into slot `step` of the id buffer.
+                encode_argmax_offset(context, command_buffer, ids_buffer, (NSUInteger)step * sizeof(uint32_t));
+            }
+            context->timings.feed_wall_s += [NSDate timeIntervalSinceReferenceDate] - feed_started;
+            double started = [NSDate timeIntervalSinceReferenceDate];
+            [command_buffer commit];
+            [command_buffer waitUntilCompleted];
+            context->timings.execute_wall_s += [NSDate timeIntervalSinceReferenceDate] - started;
+            BOOL ok = command_buffer.status != MTLCommandBufferStatusError;
+            if (!ok) {
+                set_error(command_buffer.error.localizedDescription ?: @"Metal step chain command buffer failed");
+            } else {
+                double readback_started = [NSDate timeIntervalSinceReferenceDate];
+                memcpy(token_ids_out, ids_buffer.contents, (NSUInteger)steps * sizeof(uint32_t));
+                context->timings.logits_readback_wall_s += [NSDate timeIntervalSinceReferenceDate] - readback_started;
+                context->timings.step_calls += steps;
+            }
+            [cosine_buffer release];
+            [sine_buffer release];
+            [ids_buffer release];
+            return ok ? 0 : -3;
+        } @catch (NSException *exception) {
+            set_error(exception.reason);
+            return -100;
+        }
+    }
 }
 
 int32_t synapse_qwen3_metal_step_import_caches(
@@ -856,6 +1098,14 @@ void synapse_qwen3_metal_step_context_free(void *raw) {
     [context->mlp release];
     [context->final_norm release];
     [context->logits release];
+    [context->embeddings release];
+    [context->argmax_partial_keys release];
+    [context->argmax_partial_ids release];
+    [context->chain_token_ids release];
+    [context->chain_input release];
+    [context->embedding_gather release];
+    [context->argmax_final release];
+    [context->argmax_partial release];
     [context->lm_head release];
     [context->gate_up_swiglu release];
     [context->matvec_residual release];

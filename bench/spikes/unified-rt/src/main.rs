@@ -1126,6 +1126,14 @@ fn run_qwen_decode_with_runtime<K: qwen3_decode::DecodeRuntime>(
                 &mut constraint,
                 &mut tap,
             )?
+        } else if session.chain_span() > 1 {
+            // Plain generation with a GPU-chained backend: decode in spans with a
+            // single readback per span. The chained argmax and embedding gather
+            // are byte-exact with the per-token path, so the tokens match
+            // `generate`; the fully instrumented hook path stays available at
+            // chain span 1 (SYNAPSE_METAL_STEP_CHAIN_K=1) and for any constrained
+            // run above.
+            session.generate_chained(args.max_new_tokens, &stop_tokens, &mut tap)?
         } else {
             session.generate(
                 args.max_new_tokens,
