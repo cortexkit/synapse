@@ -1,0 +1,63 @@
+base_model: fdtn-ai/antares-350m
+model_revision: cdf6d054fa5f491553ccb1704269cbd1954c6c6e
+# Granite 4.0 is a hybrid attention/Mamba decoder. Leave model_type unset so
+# Transformers resolves GraniteMoeHybridForCausalLM from the pinned config.
+tokenizer_type: AutoTokenizer
+trust_remote_code: false
+
+chat_template: jinja
+chat_template_jinja: train/axolotl/templates/granite-aft.jinja
+datasets:
+  - path: train/sft-dataset-curated.jsonl
+    type: chat_template
+    field_messages: messages
+    field_tools: tools
+    roles_to_train:
+      - assistant
+    train_on_eos: turn
+
+dataset_prepared_path: train/prepared/antares-350m-lora
+output_dir: train/outputs/antares-350m-lora
+val_set_size: 0.02
+
+sequence_len: 32768
+sample_packing: true
+eval_sample_packing: false
+
+adapter: lora
+lora_r: 32
+lora_alpha: 64
+lora_dropout: 0.05
+lora_target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj
+
+micro_batch_size: 1
+gradient_accumulation_steps: 8
+num_epochs: 3
+learning_rate: 0.00002
+lr_scheduler: cosine
+warmup_ratio: 0.03
+weight_decay: 0.1
+optimizer: adamw_torch_fused
+
+bf16: true
+tf32: true
+attn_implementation: flash_attention_2
+chunked_cross_entropy: true
+chunked_cross_entropy_num_chunks: 16
+gradient_checkpointing: true
+gradient_checkpointing_kwargs:
+  use_reentrant: false
+
+logging_steps: 1
+evals_per_epoch: 1
+save_steps: 10
+save_total_limit: 2
+save_safetensors: true
+seed: 8918

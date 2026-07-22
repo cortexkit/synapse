@@ -1,0 +1,16 @@
+{
+  "label": "antares-1b-lora-v1",
+  "merge_method": "legacy_peft_merge_and_unload",
+  "base_model": "fdtn-ai/antares-1b",
+  "base_revision": "10417eb35641b32e7141157db19c76eb545193b6",
+  "adapter": "train/outputs/antares-1b-lora",
+  "merged": "train/outputs/antares-1b-merged",
+  "merged_safetensors": [
+    {
+      "file": "model.safetensors",
+      "bytes": 3263538464,
+      "sha256": "3e5faaeca87cc3cf39f3022af5d43dd35d9c724cb84df336eca751c693a51135"
+    }
+  ],
+  "parameter_count": 1631750144
+}
