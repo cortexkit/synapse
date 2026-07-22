@@ -68,7 +68,7 @@ pub(crate) struct MetalStepDecoder<'a> {
     // Chained-decode span. k=1 preserves the fully instrumented per-token path
     // byte-for-byte; k>1 encodes k forward passes plus on-GPU argmax into one
     // command buffer with a single readback. Runtime-tunable via
-    // SYNAPSE_METAL_STEP_CHAIN_K (default 8).
+    // SYNAPSE_METAL_STEP_CHAIN_K (default 1; chaining is opt-in).
     chain_k: usize,
 }
 
@@ -515,7 +515,12 @@ fn metal_step_library_path() -> Result<PathBuf> {
     Ok(build_path.to_owned())
 }
 
-/// Chain span from SYNAPSE_METAL_STEP_CHAIN_K (default 8). Values are clamped
+/// Chain span from SYNAPSE_METAL_STEP_CHAIN_K (default 1: the fully
+/// instrumented per-token path, byte-identical to the pre-wave-6 tree and to
+/// the pinned campaign baseline). Chaining is opt-in because its measured M1
+/// win (+2.58% Q8 at k=16) is below the 3% ship bar there, while faster
+/// machines (M5 indicative +29.7%) benefit substantially: the right span is a
+/// per-machine serving decision, not a build default. Values are clamped
 /// to at least 1 so an out-of-range or unparseable setting degrades to the
 /// fully instrumented per-token path rather than failing.
 fn read_chain_k() -> usize {
@@ -523,7 +528,7 @@ fn read_chain_k() -> usize {
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
         .map(|value| value.max(1))
-        .unwrap_or(8)
+        .unwrap_or(1)
 }
 
 fn last_error() -> anyhow::Error {

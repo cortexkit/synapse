@@ -3,7 +3,9 @@
 Status: **wave 6 GPU-chained multi-token decode is implemented and token-exact on the locked M1 (f16 20/20 at k=1 and k=8; Q8 quality and long-context parity unchanged; all hooks green), but its locked-M1 best-k Q8 throughput is +2.58%, below the 3% shipping bar — it is a banked correctness win, not shipped, and no baseline was changed**.
 The default Qwen3 decode backend remains `mpsgraph`. Select the custom path with
 `--decode-backend metal-step`. The chained span is `SYNAPSE_METAL_STEP_CHAIN_K`
-(default 8; set 1 for the fully instrumented per-token path).
+(default 1 = the fully instrumented per-token path, byte-identical to the
+pinned baseline; chaining is opt-in because its M1 win is sub-bar while faster
+machines benefit substantially — the span is a per-machine serving decision).
 
 ## Scope and handoff
 
@@ -264,8 +266,9 @@ material here.
    produced device-side.
 4. **Readback every k tokens** (4*k bytes) replaces the per-token 604KB logits
    readback. Logits are only read back on the per-token path (k=1).
-5. **Runtime k**: `SYNAPSE_METAL_STEP_CHAIN_K` (default 8). Plain generation uses
-   the chained path; k=1 forces the fully instrumented per-token path.
+5. **Runtime k**: `SYNAPSE_METAL_STEP_CHAIN_K` (default 1, the fully
+   instrumented per-token path). Setting k>1 opts plain generation into the
+   chained path; constrained or hook-armed runs always use the per-token path.
 
 ### Hook contract (D-009)
 
