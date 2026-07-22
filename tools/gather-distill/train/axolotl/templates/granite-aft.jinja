@@ -1,0 +1,81 @@
+{# Granite's native template emits Antares' terminal <think>/<tool_call> surface. #}
+{%- macro render_content(content) -%}
+    {%- if content is string -%}
+        {{- content -}}
+    {%- elif content is iterable and content is not mapping -%}
+        {%- for item in content -%}
+            {%- if item.type == 'text' or 'text' in item -%}
+                {{- item.text -}}
+            {%- else -%}
+                {{- raise_exception('Unexpected content item type.') -}}
+            {%- endif -%}
+        {%- endfor -%}
+    {%- elif content is none or content is undefined -%}
+        {{- '' -}}
+    {%- else -%}
+        {{- raise_exception('Unexpected content type.') -}}
+    {%- endif -%}
+{%- endmacro -%}
+{%- set tools = tools | default([]) -%}
+{%- if not messages -%}
+    {{- raise_exception('No messages provided.') -}}
+{%- endif -%}
+{%- if tools -%}
+    {{- '<|start_of_role|>system<|end_of_role|>' -}}
+    {{- '# Tools\n\nYou have access to the following functions:\n\n<tools>' -}}
+    {%- for tool in tools -%}
+        {{- '\n' + (tool | tojson) -}}
+    {%- endfor -%}
+    {{- '\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- If there is no function call available, answer the question normally.\n</IMPORTANT>' -}}
+    {%- if messages[0].role == 'system' -%}
+        {{- '\n\n' + render_content(messages[0].content) -}}
+    {%- endif -%}
+    {{- '<|end_of_text|>\n' -}}
+{%- elif messages[0].role == 'system' -%}
+    {{- '<|start_of_role|>system<|end_of_role|>' + render_content(messages[0].content) + '<|end_of_text|>\n' -}}
+{%- endif -%}
+{%- for message in messages -%}
+    {%- if message.role == 'system' -%}
+        {%- if not loop.first -%}
+            {{- raise_exception('System message must be at the beginning.') -}}
+        {%- endif -%}
+    {%- elif message.role == 'user' -%}
+        {{- '<|start_of_role|>user<|end_of_role|>' + render_content(message.content) + '<|end_of_text|>\n' -}}
+    {%- elif message.role == 'assistant' -%}
+        {{- '<|start_of_role|>assistant<|end_of_role|>' + render_content(message.content) -}}
+        {%- if message.tool_calls -%}
+            {%- for tool_call in message.tool_calls -%}
+                {%- if tool_call.function is defined -%}
+                    {%- set tool_call = tool_call.function -%}
+                {%- endif -%}
+                {%- if render_content(message.content)|trim or not loop.first -%}
+                    {{- '\n\n' -}}
+                {%- endif -%}
+                {{- '<tool_call>\n<function=' + tool_call.name + '>\n' -}}
+                {%- if tool_call.arguments is string -%}
+                    {{- '<parameter=arguments>\n' + tool_call.arguments + '\n</parameter>\n' -}}
+                {%- else -%}
+                    {%- for args_name, args_value in tool_call.arguments | items -%}
+                        {{- '<parameter=' + args_name + '>\n' -}}
+                        {{- args_value | tojson -}}
+                        {{- '\n</parameter>\n' -}}
+                    {%- endfor -%}
+                {%- endif -%}
+                {{- '</function>\n</tool_call>' -}}
+            {%- endfor -%}
+        {%- endif -%}
+        {{- '<|end_of_text|>\n' -}}
+    {%- elif message.role == 'tool' -%}
+        {{- '<|start_of_role|>user<|end_of_role|>\n<tool_response>\n' + render_content(message.content) + '\n</tool_response><|end_of_text|>\n' -}}
+    {%- else -%}
+        {{- raise_exception('Unexpected message role.') -}}
+    {%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    {{- '<|start_of_role|>assistant<|end_of_role|>' -}}
+    {%- if enable_thinking is defined and enable_thinking -%}
+        {{- '<think>\n' -}}
+    {%- else -%}
+        {{- '<think>\n\n</think>\n\n' -}}
+    {%- endif -%}
+{%- endif -%}

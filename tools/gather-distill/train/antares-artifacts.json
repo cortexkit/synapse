@@ -1,0 +1,43 @@
+{
+  "dataset": {
+    "path": "train/sft-dataset-curated.jsonl",
+    "rows": 1864,
+    "sha256": "005f0cad5fa3da8a21b448fce6e68a3787a516c090f938616556cbae56094859"
+  },
+  "template": {
+    "path": "train/axolotl/templates/granite-aft.jinja",
+    "sha256": "8a800be71a8c5b10cc83539a93649967e9904b0dd00017ec15f20fc0308b837a"
+  },
+  "models": {
+    "antares-1b-lora-v1": {
+      "base": "fdtn-ai/antares-1b",
+      "revision": "10417eb35641b32e7141157db19c76eb545193b6",
+      "q8_0": {
+        "path": "data/students/models/antares-1b-lora-v1-Q8_0.gguf",
+        "sha256": "69a9a4bee4029eb9995223359ef5a97e5a73f06ed70b613b0fa7829537f81670"
+      },
+      "f16_sha256": "65f98c26c9a0fbb4acc88bb1df948c45731b23bf17e732c16e506cfe7a9e42e4",
+      "merged_safetensors_sha256": "3e5faaeca87cc3cf39f3022af5d43dd35d9c724cb84df336eca751c693a51135"
+    },
+    "antares-350m-lora-v1": {
+      "base": "fdtn-ai/antares-350m",
+      "revision": "cdf6d054fa5f491553ccb1704269cbd1954c6c6e",
+      "q8_0": {
+        "path": "data/students/models/antares-350m-lora-v1-Q8_0.gguf",
+        "sha256": "92038da6c96cb1119806b1c559ff5a69a0655b5a0fce11308e07f029b3cee03d"
+      },
+      "f16_sha256": "f3dcd91cc8f0864477c84d46015d146503f7ba8a0913df0a5b5a049fe6d8a804",
+      "merged_safetensors_sha256": "8c816c59e4560d0ba6fcf59440740556418c09c0c99fd25d8cc9b73130663f96"
+    },
+    "antares-1b-stock": {
+      "base": "fdtn-ai/antares-1b",
+      "revision": "10417eb35641b32e7141157db19c76eb545193b6",
+      "q8_0": {
+        "path": "data/students/models/antares-1b-stock-Q8_0.gguf",
+        "sha256": "fe17e63bffda8a9cc500b2c4f14adb73bbd51e93c6d75c9352a807b4ca85e8de"
+      },
+      "f16_sha256": "4b368333dc41690d4e0eeabf55a2e6facf9e235a83509ce07ff959bf2d30639e"
+    }
+  },
+  "llama_cpp_commit": "b4e3dc613baa92a3884d4151e3d631395c81934a"
+}

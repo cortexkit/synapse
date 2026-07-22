@@ -1,0 +1,36 @@
+{
+  "dataset_rows": 1864,
+  "dataset_sha256": "005f0cad5fa3da8a21b448fce6e68a3787a516c090f938616556cbae56094859",
+  "template_sha256": "8a800be71a8c5b10cc83539a93649967e9904b0dd00017ec15f20fc0308b837a",
+  "thinking_knob": "enable_thinking=false",
+  "models": {
+    "antares-1b": {
+      "model_id": "fdtn-ai/antares-1b",
+      "revision": "10417eb35641b32e7141157db19c76eb545193b6",
+      "vocab_size": 100352,
+      "eos_token": "<|end_of_text|>",
+      "eos_token_id": 100257,
+      "rows": 1864,
+      "token_p50": 14322,
+      "token_max": 32298,
+      "over_32768": 0,
+      "assistant_marker": "<|start_of_role|>assistant<|end_of_role|>",
+      "eos_marker": "<|end_of_text|>\n",
+      "generation_suffix": "<think>\\n\\n</think>\\n\\n"
+    },
+    "antares-350m": {
+      "model_id": "fdtn-ai/antares-350m",
+      "revision": "cdf6d054fa5f491553ccb1704269cbd1954c6c6e",
+      "vocab_size": 100352,
+      "eos_token": "<|end_of_text|>",
+      "eos_token_id": 100257,
+      "rows": 1864,
+      "token_p50": 14322,
+      "token_max": 32298,
+      "over_32768": 0,
+      "assistant_marker": "<|start_of_role|>assistant<|end_of_role|>",
+      "eos_marker": "<|end_of_text|>\n",
+      "generation_suffix": "<think>\\n\\n</think>\\n\\n"
+    }
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "recorded_at": "2026-07-22T16:03:38.127435+00:00",
+  "base_image": "pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel",
+  "base_image_digest": "sha256:14611869895df612b7b07227d5925f30ec3cd6673bad58ce3d84ed107950e014",
+  "axolotl_commit": "09d325b4fd1288b1473c8a330dd19e3c91b1ac32",
+  "llama_cpp_commit": "b4e3dc613baa92a3884d4151e3d631395c81934a",
+  "packages": {
+    "axolotl": "0.17.0.dev0",
+    "torch": "2.9.1+cu128",
+    "torchvision": "0.24.1+cu128",
+    "transformers": "5.9.0",
+    "accelerate": "1.13.0",
+    "trl": "1.5.1",
+    "peft": "0.19.1",
+    "flash-attn": "2.8.3",
+    "flash-linear-attention": "0.4.1",
+    "fla-core": "0.4.1",
+    "causal-conv1d": "1.6.2.post1",
+    "xformers": "0.0.33.post2"
+  },
+  "torch_cuda": "12.8",
+  "nvidia_smi": "NVIDIA H100 80GB HBM3, 595.71.05",
+  "system_nvcc": "Build cuda_12.4.r12.4/compiler.34097967_0",
+  "accelerate_full_output_upcast_disabled": true
+}
