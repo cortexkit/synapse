@@ -35,6 +35,7 @@
 │   └── synapse-worker-mlx/ # Apple Silicon MLX supervised worker
 ├── docs/                   # Design logs and decisions documentation
 ├── tools/                  # Shared system tools and distillation harnesses
+│   ├── classify-distill/   # Athena classify distillation harness
 │   └── gather-distill/     # External gather-distillation data generation harness
 ├── Cargo.toml              # Cargo workspace definition
 ├── DECISIONS.md            # Log of architecture design decisions
@@ -93,7 +94,7 @@
 **bench/campaign/:**
 - Purpose: Verification harness and campaign fixtures for decode models.
 - Contains: Locked sandboxed campaign controller script, prompt/reference fixtures, signature validation checks, and diagnostic logs/failure scenes.
-- Key files: `bench/campaign/decode-harness.sh`, `bench/campaign/README.md`
+- Key files: `bench/campaign/decode-harness.sh`, `bench/campaign/metal-step-harness.sh`, `bench/campaign/cuda-quant-harness.sh`, `bench/campaign/README.md`
 
 
 **bench/harness/:**
@@ -133,7 +134,12 @@
 
 **tools/:**
 - Purpose: Houses shared development tools, utilities, and datasets generation/distillation harnesses.
-- Contains: The `gather-distill` TypeScript project workspace.
+- Contains: The `gather-distill` and `classify-distill` TypeScript project workspaces, and `stt-voice-test` utility.
+
+**tools/classify-distill/:**
+- Purpose: Standalone Bun/TypeScript dataset generation and classification runner for the `Athena-classify` student model.
+- Contains: Vendored ALF rust/ts contracts, real export importer, histogram-driven qgen, Anthropic Claude OAuth/API runner with dry-run/mock gates, mechanical validator port, and parity checks.
+- Key files: `tools/classify-distill/src/cli.ts`, `tools/classify-distill/src/importer.ts`, `tools/classify-distill/src/qgen.ts`, `tools/classify-distill/src/runner.ts`, `tools/classify-distill/src/validator.ts`, `tools/classify-distill/README.md`
 
 **tools/gather-distill/:**
 - Purpose: Standalone external harness for generating QA datasets and collecting model tool-use trajectories.
@@ -150,11 +156,12 @@
 - `crates/synapse-module/src/bin/inline_embed_throughput.rs`: Batch throughput execution client.
 - `bench/harness/src/main.rs`: CLI runner for corpus generation, power wrapper execution, and parity check.
 - `bench/lanes/*/src/main.rs` (Rust), `bench/lanes/mlx-minilm/main.py` (Python), `bench/lanes/ts-embed/main.mjs` (JS), `bench/lanes/potion/main.py` (Python): Main executables for each specific runtime lane.
-- `bench/campaign/decode-harness.sh`: Campaign controller script.
+- `bench/campaign/decode-harness.sh`, `bench/campaign/metal-step-harness.sh`, `bench/campaign/cuda-quant-harness.sh`: Campaign controller scripts.
 - `bench/eval-coir/prepare.py`: Downloads and structures datasets for retrieval tasks.
 - `bench/eval-coir/score.py`: Computes retrieval quality metrics on generated vectors.
 - `bench/run-matrix.sh`: Global benchmark suite runner.
 - `bench/run-night.sh`: Nightly full-corpus multi-lane orchestrator.
+- `tools/classify-distill/src/cli.ts`: Entry point for the classify-distill harness commands (`import`, `qgen`, `run`, `parity`).
 - `tools/gather-distill/src/cli.ts`: Entry point for the gather-distillation harness commands (`qgen`, `gather`, `validate`, `score`).
 - `bench/spikes/unified-rt/src/bin/vulkan_probe.rs`: Vulkan memory type and budget capability prober.
 
@@ -182,6 +189,10 @@
 - `tools/gather-distill/src/validate.ts`: Citation verification, SHA-checking, and path bounds checker.
 - `tools/gather-distill/src/scorer.ts`: Offline gold-standard Jaccard and file F1 overlap quality scorer.
 - `tools/gather-distill/src/judge.ts`: OpenAI OAuth validation and judge scoring loop.
+- `tools/classify-distill/src/importer.ts`: Real ALF export attempt parser and gold/reject extractor.
+- `tools/classify-distill/src/qgen.ts`: Sonnet-5 synthetic request prose generator driven by consult class histograms.
+- `tools/classify-distill/src/runner.ts`: Classification execution loop supporting Anthropic OAuth rotation, prompt caching, and dry-run/mock gates.
+- `tools/classify-distill/src/validator.ts`: Mechanical validator port enforcing vendored ALF rust/ts contracts.
 - `bench/spikes/unified-rt/src/json_constraint.rs`: Constrained JSON schema grammar state machine and token mask generator.
 - `bench/spikes/unified-rt/src/lfm2.rs`: LFM2 model family, short-convolution, and full-attention mixer logic.
 - `bench/spikes/unified-rt/src/lfm2_audio.rs`: Mel-spectrogram DSP frontend, FastConformer speech encoder, and audio projector.
