@@ -64,7 +64,7 @@
 **Native Engine Inference Lanes:**
 - Purpose: Execute in-memory tokenization, tensor forward passes, and pooling over target platforms.
 - Location: `bench/lanes/ort-embed`, `bench/lanes/mlx`, `bench/lanes/burn`, `bench/lanes/mlx-minilm`, `bench/lanes/ts-embed`, `bench/lanes/potion`, `bench/spikes/unified-rt`
-- Contains: Bounded-thread ONNX Runtime embedding logic, Metal-accelerated MLX custom model implementations, unified-rt candidate implementations (Vulkan cooperative-matrix/plain shaders on RDNA3 with device-local memory staging and budget validation, CUDA cuBLASLt fused graphs and fused QK norm RoPE single-launch kernels on NVIDIA, Metal graph execution optimization levels O0/O1, package caching, and custom direct Metal decode step kernels in `bench/spikes/unified-rt/src/qwen3_decode_metal_step.rs`), LFM2 hybrid causal backbone, LFM2-Audio ASR speech encoder (FastConformer and Slaney mel filterbank frontend), Qwen3-0.6B f16 Metal decode throughput optimizations, WGPU-based Burn ONNX imports, python-based MLX community/source loading, Model2Vec static embedding (`potion-code-16M`), and TypeScript setups.
+- Contains: Bounded-thread ONNX Runtime embedding logic, Metal-accelerated MLX custom model implementations, unified-rt candidate implementations (Vulkan cooperative-matrix/plain shaders on RDNA3 with device-local memory staging and budget validation, CUDA cuBLASLt fused graphs and fused QK norm RoPE single-launch kernels on NVIDIA, Metal graph execution optimization levels O0/O1, package caching, and custom direct Metal decode step kernels with opt-in multi-token GPU command buffer chaining in `bench/spikes/unified-rt/src/qwen3_decode_metal_step.rs`), LFM2 hybrid causal backbone, LFM2-Audio ASR speech encoder (FastConformer and Slaney mel filterbank frontend), Qwen3-0.6B f16 Metal decode throughput optimizations, WGPU-based Burn ONNX imports, python-based MLX community/source loading, Model2Vec static embedding (`potion-code-16M`), and TypeScript setups.
 - Depends on: `bench/harness` or `bench/rig`, target runtime libraries (`ort`, `mlx-rs`, `vulkano`, `cudarc`), and `tokenizers`.
 - Used by: The benchmark suite runners `bench/run-matrix.sh` and `bench/run-night.sh`.
 
@@ -90,11 +90,11 @@
 - Used by: The benchmark suite runner `bench/run-matrix.sh`.
 
 **External Gather-Distillation Harness:**
-- Purpose: Standalone Bun/TypeScript data generation for the production gatherer contract, supporting both Anthropic API (with multi-account OAuth rotation) and local OpenAI-compatible endpoints.
+- Purpose: Standalone Bun/TypeScript data generation and SFT training pipeline for the production gatherer contract, supporting both Anthropic API (with multi-account OAuth rotation) and local OpenAI-compatible endpoints.
 - Location: `tools/gather-distill`
-- Contains: Trajectory generation, work queue handling, `AftClientPool` process wrapping, validation, gold-overlap scoring, and zero-shot gatherer bake-off evaluation leaderboards (`tools/gather-distill/BAKEOFF-ZEROSHOT.md`).
+- Contains: Trajectory generation, work queue handling, `AftClientPool` process wrapping, validation, gold-overlap scoring, zero-shot gatherer bake-off evaluation leaderboards (`tools/gather-distill/BAKEOFF-ZEROSHOT.md`), Axolotl SFT training configs/rungs (`tools/gather-distill/train/`), and student evaluation ladder metrics (`tools/gather-distill/data/students/LADDER.md`).
 - Depends on: Bun, pinned `aft-v0.46.0` binary, and `@cortexkit/anthropic-auth-core`.
-- Used by: Developers running qgen, gather, validate, or score campaigns.
+- Used by: Developers running qgen, gather, validate, score, or model distillation and SFT evaluation campaigns.
 
 **Athena Classify Distillation Harness:**
 - Purpose: Standalone Bun/TypeScript dataset generation and classification runner for the local `Athena-classify` student model.
@@ -304,7 +304,7 @@
 - Pattern: Serializable Identity Profile with SHA-256 fingerprinting.
 
 **Metal Custom Step Engine:**
-- Purpose: Execute single-token Qwen3 decode steps bypassing MPSGraph via direct Metal compute kernels (`qwen3_decode_metal_step.rs`, `qwen3_decode_metal_step.m`, `qwen3_decode_metal_step.metal`), leveraging SIMDgroup RMSNorm, position-parallel attention, and Q8 GEMV routines.
+- Purpose: Execute single-token or GPU-chained multi-token Qwen3 decode steps bypassing MPSGraph via direct Metal compute kernels (`qwen3_decode_metal_step.rs`, `qwen3_decode_metal_step.m`, `qwen3_decode_metal_step.metal`), leveraging SIMDgroup RMSNorm, position-parallel attention, GPU-side token argmax gathering, and Q8 GEMV routines. Supports opt-in multi-token command buffer chaining via `SYNAPSE_METAL_STEP_CHAIN_K` (default 1).
 - Location: `bench/spikes/unified-rt/src/qwen3_decode_metal_step.rs`
 - Pattern: Direct Metal Compute Kernel Pipeline.
 

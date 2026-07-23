@@ -142,9 +142,9 @@
 - Key files: `tools/classify-distill/src/cli.ts`, `tools/classify-distill/src/importer.ts`, `tools/classify-distill/src/qgen.ts`, `tools/classify-distill/src/runner.ts`, `tools/classify-distill/src/validator.ts`, `tools/classify-distill/README.md`
 
 **tools/gather-distill/:**
-- Purpose: Standalone external harness for generating QA datasets and collecting model tool-use trajectories.
-- Contains: Bun workspaces, Anthropic/OpenAI API adapters (supporting OpenAI OAuth transports), AFT child process pools, validation scripts, scoring modules, and utility judge matrix evaluation engines.
-- Key files: `tools/gather-distill/src/cli.ts`, `tools/gather-distill/README.md`, `tools/gather-distill/BAKEOFF-ZEROSHOT.md`
+- Purpose: Standalone external harness for generating QA datasets, collecting model tool-use trajectories, and orchestrating student model SFT training/evaluation.
+- Contains: Bun workspaces, Anthropic/OpenAI API adapters (supporting OpenAI OAuth transports), AFT child process pools, validation scripts, scoring modules, utility judge matrix evaluation engines, Axolotl SFT training configs (`train/axolotl/`), Antares gather-SFT rungs (`train/ANTARES-RUNG.md`), and student ladder evaluation results (`data/students/LADDER.md`).
+- Key files: `tools/gather-distill/src/cli.ts`, `tools/gather-distill/README.md`, `tools/gather-distill/BAKEOFF-ZEROSHOT.md`, `tools/gather-distill/train/ANTARES-RUNG.md`, `tools/gather-distill/data/students/LADDER.md`
 
 ## Key File Locations
 
