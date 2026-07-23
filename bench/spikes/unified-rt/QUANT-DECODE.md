@@ -497,3 +497,72 @@ GB/s effective weight bandwidth and a `1.137x` ratio to the vintage llama.cpp
 `521.4` tok/s reference. The A+B tree is recorded as a banked negative,
 **superseded by an overlapping mechanism**, rather than as a loss; winner 8's
 A-only result remains banked evidence for the same reason.
+
+
+## Campaign baseline: LFM2-1.2B Q8_0 CUDA single-stream decode
+
+The next CUDA campaign is registered as `lfm2-1.2b-q8-cuda-decode` on the
+exclusive `cuda-4090-vast` RTX 4090 machine. Its frozen owned baseline is
+**361.80 tok/s** for LFM2-1.2B Q8_0, one stream, greedy decode, 64 new tokens,
+with the headline short cell using `N=12` varied prompts and the worse of two
+repeat medians. The pinned owned snapshot is
+`LiquidAI/LFM2-1.2B@933cee00d754fb3bfe06c644c0cb95453f2d8bb2`; its safetensors
+weight SHA-256 is
+`60fef6ef4481c533ce7427793bed50200b55b3c68d0d00c52bc56f207a9acecd`, and the
+full snapshot-content digest used by the controller is
+`afd99d6cc2a5a6ff6c57ceca2d03f1f73d58d31f3528eadca3035f4164a2009d`.
+
+The same-day CUDA competitor sweep recorded a llama.cpp Q8_0 reference cell of
+**546.90 tok/s** for `LFM2.5-1.2B-Instruct` (2026-07-20, one slot, raw
+completion, 64-token cap, two repeats), making the owned result approximately
+`0.66x` that directional reference (`1.51x` slower). This is the available
+same-session llama.cpp vintage from the sweep, not a new acceptance gate: it is
+a neighboring LFM2.5 checkpoint, and the captured raw-completion quality spot
+check marked the competitor row DQ. The campaign therefore compares throughput
+against it while keeping the owned LFM2-1.2B token fixtures authoritative.
+
+`bench/campaign/lfm2-cuda-harness.sh` embeds the port's 20-prompt LFM2 CPU-fp32
+oracle (`decode-prompts.jsonl` SHA-256
+`6f1ee1ce17fbc3ca34ebc316bc93d44db7c8840a6d4a05906b13bc0ef8901e60`; token
+reference SHA-256
+`b5834aad7c6b92a4ff57cd9385a756ad3f24d153db71e74e2c47892b5f1fb8d6`) and the
+shared 15-prompt constrained-JSON fixture. Its quality gate is the LFM2 row,
+not Qwen3's: at least **13/20 exact prompts** and median match depth at least
+**54.5**, with zero near-tie exemptions, plus **15/15** schema-valid JSON
+results. LFM2's current decode module has cached-hybrid-layer tests but no
+family-neutral tap/pause fixture suite; the Qwen3-only intervention hooks are
+therefore explicitly skipped rather than reported as LFM2 evidence.
+
+Deep tiers are intentionally skipped in v1. CUDA has no measured depth wall
+(`d0fb39c`); the harness stays short-cell-only and spends its budget on the
+quality gate and two N=12 timing repeats. The initial rental plan is one
+reliability-`>0.995` RTX 4090 in the `$0.35`–`$0.50`/hour mid band, a ten-minute
+SSH deadline, and an **$8 total cap**. The rig must be destroyed after either
+success or failure. The 361.80 control itself is already covered by the
+qualifying Q8 capture ledger above (approximately `$0.40` across the retired
+rentals); the same-day 546.90 competitor sweep used retired contract `45369168`
+and closed at `$0.314`. This worktree's controller self-test is local and adds
+no cloud spend. The campaign seed is the Qwen3 CUDA winner inventory,
+classified for LFM2 as follows:
+
+| Mechanism | LFM2 CUDA status / seed decision |
+|---|---|
+| In-slot KV writes | **Unported**; inspect the six attention-layer cache writes before promotion. |
+| Fused residual + RMSNorm | **Unported**; applies around both short-conv and attention residual boundaries. |
+| Fused MLP / SwiGLU | **Unported**; measure only after preserving LFM2's hybrid ordering. |
+| Warp-per-key attention | **Unported**, eligible only for attention layers `[2, 5, 8, 10, 12, 14]`. |
+| Batched QKV projection | **Unported**; the current LFM2 CUDA path keeps separate projection launches. |
+| Fused QK-norm + RoPE | **Unported**; keep normalized K's cache destination explicit. |
+| CUDA graph capture | **Unavailable** in the current LFM2 path; the CLI explicitly selects uncaptured launches. |
+| Row-paired GEMV | **Unported**; Q8_0 row-level memory parallelism is the direct next candidate. |
+
+Ten of LFM2's sixteen layers are short-convolution layers, not attention layers.
+Their rolling state update and explicit ordering are the unexplored territory:
+attention-only winners must not be applied to those ten layers, and any fused
+residual or GEMV change must retain the conv-state boundary. The provision
+self-test was covered by the existing candidate-runner pin, but no fresh
+post-fix provision bytes were available for this registration: the documented
+`e9e048...` provision-script runner pin is stale under Ubuntu `dash`; ALF's
+current runner begins `bf5b5bad2b8b...`. Capture-from-provision remains the
+authoritative update path, so the runner pin is intentionally deferred to the
+next campaign fire.
