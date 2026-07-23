@@ -1,0 +1,30 @@
+#version 460
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_scalar_block_layout : require
+
+// One invocation owns the full width so the square-sum and scale stay in a
+// fixed left-to-right f32 order. Parallel lane reductions reassociate that sum
+// and have been observed to flip near-tied greedy tokens on Qwen3 decode.
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0, scalar) readonly buffer Input { float16_t values[]; } input_values;
+layout(set = 0, binding = 1, scalar) readonly buffer Weight { float values[]; } weight_values;
+layout(set = 0, binding = 2, scalar) writeonly buffer Output { float16_t values[]; } output_values;
+layout(push_constant) uniform Params { uint rows; uint width; float epsilon; uint unused; } p;
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= p.rows) return;
+    uint base = row * p.width;
+    float square = 0.0;
+    for (uint column = 0; column < p.width; ++column) {
+        float value = float(input_values.values[base + column]);
+        square += value * value;
+    }
+    float inverse = inversesqrt(square / float(p.width) + p.epsilon);
+    for (uint column = 0; column < p.width; ++column) {
+        uint index = base + column;
+        output_values.values[index] = float16_t(
+            float(input_values.values[index]) * inverse * weight_values.values[column]
+        );
+    }
+}
