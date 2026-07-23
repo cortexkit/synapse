@@ -8,6 +8,70 @@ The runtime now accepts `--dtype f16` for MiniLM, gte-modernbert, and Qwen3-Embe
 
 This assembly is certified against ORT fp32 for all three families. MiniLM was re-certified on the locked M1 against the frozen evidence pack's original reference; ModernBERT and Qwen3 also pass the full 400-vector gate. The locked-machine matrix and reference provenance are recorded in [M1-SERVING-MATRIX.md](M1-SERVING-MATRIX.md).
 
+## Embedding campaign baseline
+
+The first embedding-throughput lane is registered as
+`gte-modernbert-f16-metal-embed` on the locked M1. It measures the owned
+`Alibaba-NLP/gte-modernbert-base` snapshot at revision
+`e7f32e3c00f91d699e8c43b53106206bcc72bb22`, f16 weights, Metal, bucket policy v1,
+`max_length=512`, and a 4,000,000 attention-unit budget. The objective is the
+median steady-state batch-embedding rate in tok/s. Each of six folds runs two
+fresh processes; each process performs seven passes, discards pass one as the
+load/warmup pass, and the fold scores the worse of the two remaining steady
+observations. The campaign controller also requires finite, nonzero 768-wide
+vectors and a same-process repeated-input determinism probe.
+
+The fixture is a deterministic 2,000-row stratified selection from
+`bench/data/corpus-v2.jsonl`: seed `metal-embed-corpus-v1:20260723`, rows grouped
+by the first path component, each group and row ordered by SHA-256 of the seed
+plus its label, then selected round-robin until 2,000 rows. The committed fixture
+contains only `{id,text}` rows and is pinned by corpus SHA-256
+`25d1d54427030d94c882dd96a5f5d26bfda426d902028e75aa8c3d527e34a7a7`.
+Reference vectors are the current master's own owned-runtime output on exactly
+that slice (source `056487f508693ff3539c71c32874bf32fad7aa00`, CLS pooling plus
+L2 normalization), encoded as pinned float32 rows with SHA-256
+`d55221d41098aa293507c734ebedbf2df7f095c5e7c767943167403bbb520afd`. The hard
+quality floor is mean cosine `>= 0.9999` and worst-decile top-10 rank overlap
+`>= 0.97`; any parity, dimensionality, finite/nonzero, or determinism failure
+rejects the speed result.
+
+The fresh locked-M1 campaign baseline is **18,500.3485 tok/s** (median of the
+36 worse-of-two steady samples), recorded in
+`results/metal-embed-campaign/m1-baseline.json`. The run used
+`[bench-host]` (Apple M1 Max), acquired and released
+`[bench-user-home]/bench.lock`, and rejected an active `Runner.Worker`. Its minimum
+mean cosine was `0.999999022` and minimum worst-decile top-10 overlap was
+`0.97400`. The fleet's ordinary coalesced observation remains about 14--15k
+tok/s, and the earlier
+local M5 serving note recorded 19,740.1 tok/s; neither substitutes for this
+locked-M1 campaign bar. The same-session MLX Python cell was skipped because
+`/tmp/synapse-mlx-minilm-venv/bin/python` was absent on the M1. The optional
+llama-server cell was also skipped because no lane-specific command/model was
+configured.
+
+### First-campaign steering inventory
+
+The first campaign should spend its search budget on the following untried or
+unmeasured levers, without changing the vector fingerprint:
+
+1. **Fused/flash-style encoder prefill attention.** TEI's CUDA advantage points
+to fused attention plus dynamic batching. The owned Metal encoder has never had
+that fused/flash-style prefill pass; this is the primary Metal hypothesis.
+2. **Bucket-policy v3 shapes.** Policy v1 is the serving baseline and v2 is
+retained as a rejected A/B experiment. A v3 shape/row ladder must be a new
+policy identity and must re-run the padding and parity gates rather than reuse
+v1 packages.
+3. **Norm fusion.** Norm fusion is proven on the CUDA decode path but has not
+been tried on the owned ModernBERT encoder. It is valid only if the pinned
+fingerprint remains inside both quality thresholds.
+4. **Batched-layer dispatch consolidation.** The embedding path's per-batch
+Metal dispatch count is not measured in the unified runner. Production inline
+hooks (`SYNAPSE_EMBED_PROFILE=1`) already attribute scheduler dispatch, engine
+mutex, bucket/executable selection, MPSGraph execution, and readback; they do
+not yet expose the unified runner's layer-dispatch table. The first profiling
+ask is therefore a per-batch attribution table for those layer dispatches, with
+an explicit `unmeasured` cell until the hook exists.
+
 ## f16 parity
 
 Certification thresholds are mean cosine `>= 0.9999` and mean top-10 overlap `>= 0.995` against ORT fp32.
