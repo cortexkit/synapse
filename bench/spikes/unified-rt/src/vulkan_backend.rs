@@ -842,6 +842,7 @@ mod enabled {
         swiglu: vk::Pipeline,
         decode_matvec: vk::Pipeline,
         decode_matvec_q8_0: Option<vk::Pipeline>,
+        decode_rms_norm: vk::Pipeline,
         decode_head_norm_rope: vk::Pipeline,
         decode_value_cache: vk::Pipeline,
         decode_attention: vk::Pipeline,
@@ -914,6 +915,10 @@ mod enabled {
                         create_pipeline(state, include_bytes!("vulkan_spv/decode_matvec_q8_0.spv"))
                     })
                     .transpose()?,
+                decode_rms_norm: create_pipeline(
+                    state,
+                    include_bytes!("vulkan_spv/decode_rms_norm.spv"),
+                )?,
                 decode_head_norm_rope: create_pipeline(
                     state,
                     include_bytes!("vulkan_spv/decode_head_norm_rope.spv"),
@@ -952,6 +957,7 @@ mod enabled {
                 Some(self.swiglu),
                 Some(self.decode_matvec),
                 self.decode_matvec_q8_0,
+                Some(self.decode_rms_norm),
                 Some(self.decode_head_norm_rope),
                 Some(self.decode_value_cache),
                 Some(self.decode_attention),
@@ -3859,7 +3865,7 @@ mod enabled {
                     let intermediate = self.model.config.intermediate_size;
                     for (layer_index, layer) in self.layers.iter().enumerate() {
                         recorder.dispatch(
-                            self.pipelines.rms_norm,
+                            self.pipelines.decode_rms_norm,
                             &[
                                 &self.activations.x0,
                                 &layer.input_norm,
@@ -4020,7 +4026,7 @@ mod enabled {
                             StageClass::Pointwise,
                         )?;
                         recorder.dispatch(
-                            self.pipelines.rms_norm,
+                            self.pipelines.decode_rms_norm,
                             &[
                                 &self.activations.x1,
                                 &layer.post_attention_norm,
@@ -4106,7 +4112,7 @@ mod enabled {
                     }
                     if produce_logits {
                         recorder.dispatch(
-                            self.pipelines.rms_norm,
+                            self.pipelines.decode_rms_norm,
                             &[&self.activations.x0, &self.final_norm, &self.activations.x1],
                             &FamilyNormParams {
                                 rows: 1,

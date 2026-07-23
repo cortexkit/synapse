@@ -22,7 +22,7 @@ tie handling, token taps, pause/resume, and splice protocols remain unchanged.
 
 Each token records a Vulkan command buffer containing, for every Qwen3 layer:
 
-1. RMSNorm;
+1. RMSNorm (serial left-to-right square sum — see parity fix below);
 2. Q/K/V serial f32-accumulating matvecs;
 3. Q/K head RMSNorm plus RoPE, with K written directly to its in-slot cache;
 4. V conversion and direct in-slot cache write;
@@ -47,61 +47,109 @@ existing feature requirements.
 Prefill currently advances prompt tokens through the same decode graph to
 establish the resident cache. This is correct but is not a Vulkan-prefill
 throughput claim. It supports a 470-token prompt when `--decode-cache-bucket`
-is at least 534; that depth cell still requires Linux-rig parity validation.
+is at least 534.
 
-## Gate status
+## Parity fix (Ally RDNA3)
 
-The implementation and SPIR-V were built locally, but this worktree has no
-Vulkan loader or Linux 4090. No parity or throughput figure below is inferred
-from a different backend.
+The first f16 gate on the Ally failed only at `completion-06` step 7 (near-tied
+tokens `13079` vs reference `61686`) — the same prompt Metal hit in
+`DECODE-FOUNDATIONS.md` before its f32-accumulation repair. Decode was still
+using the embedding-lane `rms_norm` shader, whose 256-lane tree reduction
+reassociates the square sum. Replacing decode RMSNorm (input, post-attention,
+and final) with `decode_rms_norm.comp` — one workgroup, left-to-right f32 square
+sum and scale — restored **20/20 token-exact** with **zero near-tie exemptions**.
+No fixture or threshold was changed.
+
+## Gate status (Ally RDNA3, 2026-07-23)
+
+Rig: ASUS ROG Ally X, AMD Radeon Graphics (RDNA3 iGPU), Vulkan API 1.4.334,
+driver_raw 8388981, Turbo power scheme. Checkout `C:\bench\synapse-decode` at
+`2b1741e` plus the serial-RMSNorm fix. Chat weights:
+`C:\bench\model-qwen3-chat` SHA-256 `f47f71177f32bcd101b7573ec9171e6a57f4f4d31148d38e382306f42996874b`
+(Qwen3-0.6B snapshot `c1899de2…`). Fixtures verified on-box:
+prompts `6f1ee1ce…`, references `b2d11f2a…`.
 
 | Gate | Status | Evidence |
 |---|---|---|
-| Vulkan feature build | PASS | `cargo build --features vulkan --bin spike-unified-rt --bin vulkan_probe` |
-| Shader compilation | PASS | `glslc --target-env=vulkan1.3` compiled the five decode shaders |
-| `vulkan_probe` runtime | BLOCKED locally | macOS could not load `libvulkan.dylib` |
-| f16 20x64 token parity | PENDING Linux 4090 | frozen fixture checksums retained: prompts `6f1ee1ce…`, references `b2d11f2a…` |
-| Q8_0 quality ladder | PENDING Linux 4090 | no threshold or fixture change |
-| 470+64 depth parity | PENDING Linux 4090 | decode-prefill path supports the capacity; not measured |
-| f16/Q8 indicative tok/s | PENDING Linux 4090 | parity wave, not estimated |
+| Vulkan feature build | PASS | Ally `cargo build --release --features vulkan --bin spike-unified-rt --bin vulkan_probe` (target dir under `%USERPROFILE%` — WDAC blocks build-scripts under `C:\bench\`) |
+| Shader compilation | PASS | `glslc --target-env=vulkan1.3` including `decode_rms_norm.comp` |
+| `vulkan_probe` runtime | PASS | `AMD Radeon Graphics`, not llvmpipe; coop-matrix + memory heaps match day-1 |
+| f16 20x64 token parity | **PASS** | **20/20 exact**, 1,280/1,280 tokens, **0 near-ties**; decode **4.044 tok/s**, prefill 5.541 tok/s |
+| Q8_0 quality ladder | **PASS (floor)** | process exit 0; log line `exact Some(10)/20` meets `>= 10/20`; decode **5.2 tok/s**, prefill 7.3 tok/s. Full JSON (median depth / near-tie count) remained on the Ally after SSH dropped mid-wave — re-pull when the box is reachable to confirm median depth `>= 59.0` and zero near-ties from the result file |
+| 470+64 depth cell | PENDING re-run | first attempt failed on a BOM/encoding issue in the long-prompt JSONL writer; Ally SSH became unreachable before the corrected fixture ran |
+| f16/Q8 indicative tok/s | **NON-authoritative** | single fresh process each after parity: f16 decode **~4.1 tok/s**, Q8 decode **~5.2 tok/s** (same 20×64 protocol, no reference). Not a campaign N=12×2 median |
+| llama.cpp-Vulkan ratio | PENDING | Ally has `C:\bench\bin\llama-vulkan\` (b9580-era) and `qwen3-0.6b-q8.gguf`; no f16 chat GGUF staged. SSH dropped before the reference cells finished |
 
-The required Linux commands are:
+### Ally commands
 
-```sh
-cargo build --release --features vulkan --manifest-path bench/spikes/unified-rt/Cargo.toml \
-  --bin spike-unified-rt --bin vulkan_probe
-./target/release/vulkan_probe
-./target/release/spike-unified-rt \
-  --model /models/Qwen3-0.6B --tokenizer /models/Qwen3-0.6B/tokenizer.json \
-  --generate-prompts bench/campaign/decode-fixtures/decode-prompts.jsonl \
-  --decode-reference bench/campaign/decode-fixtures/reference-tokens.jsonl \
-  --device vulkan --decode-backend vulkan --dtype f16 --vulkan-gemm plain \
-  --decode-cache-bucket 512 --max-new-tokens 64 --limit 20 --out /tmp/vulkan-f16.json
+```bat
+set EXE=%USERPROFILE%\cargo-target-decode\release\spike-unified-rt.exe
+set MODEL=C:\bench\model-qwen3-chat
+
+%EXE% --model %MODEL% --tokenizer %MODEL%\tokenizer.json ^
+  --generate-prompts C:\bench\data\decode-prompts.jsonl ^
+  --decode-reference C:\bench\data\reference-tokens.jsonl ^
+  --device vulkan --decode-backend vulkan --dtype f16 --vulkan-gemm plain ^
+  --decode-cache-bucket 512 --max-new-tokens 64 --limit 20 ^
+  --out C:\bench\results-ally\vulkan-decode\vulkan-f16-20x64.json
+
+%EXE% ... --weight-quant q8-0 --out ...\vulkan-q8-20x64.json
 ```
 
-Repeat the command with `--weight-quant q8-0` for the standard quantized
-profile. Run the 470-token depth prompt with a cache bucket of at least 534,
-then record the one-run f16 and Q8 throughput as `NON-authoritative` after
-parity is green. A Linux 4090 rig was not rented from this development
-worktree, so there is no spend or destruction ledger entry to report.
+Build note: Application Control (os error 4551) blocks cargo build-scripts when
+`CARGO_TARGET_DIR` lives under `C:\bench\`. Use
+`CARGO_TARGET_DIR=%USERPROFILE%\cargo-target-decode` with a slim workspace
+(`bench/harness` + `bench/spikes/unified-rt` only), matching prior Ally waves.
 
-## Wave 2 plan
+## RDNA3 indicative numbers (NON-authoritative)
 
-1. Run the ordered parity gates on the target NVIDIA Vulkan driver, then repeat
-   the same cells on Ally RDNA3 before performance work.
-2. Add llama.cpp-Vulkan reference cells with the same prompts, cache bucket,
-   and measurement protocol.
-3. Profile decode stages. The embedding attribution points to deep GEMM and
-   memory placement, but decode is GEMV/bandwidth dominated and must be
-   measured separately.
-4. Preserve one-output-row ownership while improving memory access: vectorize
-   f16/Q8 loads, stage row slices, and tune workgroup occupancy without
-   reassociating a row's f32 sum.
-5. For Q8_0, keep the 34-byte block stride, fuse dequantization into GEMV, and
-   test projection-pair fusion only after the standard Q8 depth gates stay
-   green. These are the transferable lessons from `METAL-STEP.md` and
-   `QUANT-DECODE.md`.
+| Path | decode tok/s | prefill tok/s | notes |
+|---|---:|---:|---|
+| owned f16 plain serial GEMV | 4.04 | 5.54 | parity cell (with reference) |
+| owned f16 plain (throughput rerun) | ~4.1 | ~5.5 | no reference |
+| owned Q8_0 plain serial GEMV | ~5.2 | ~7.3 | parity + throughput reruns |
 
+These are single-process wall rates over the 20-prompt / 64-token fixture with
+decode-as-prefill. They are **not** campaign medians and must not be compared to
+Metal's N=12×2 worse-of-two headline without re-running that protocol.
+
+## llama.cpp-Vulkan ratio
+
+Not measured in this session. Staged on the Ally from the embedding waves:
+
+- binary: `C:\bench\bin\llama-vulkan\llama-cli.exe` / `llama-server.exe` (campaign
+  build ~b9580)
+- Q8 GGUF: `C:\bench\models\qwen3-0.6b-q8.gguf`
+- f16 chat GGUF: **absent** (only embedding f16 GGUFs were present)
+
+When SSH returns, run the same prompts/protocol and record owned/llama decode
+tok/s with binary provenance. Until then the ratio row is intentionally blank.
+
+## Wave-3 optimization seam list
+
+Transferable lessons from Metal (`METAL-STEP.md`, `QUANT-DECODE.md`) that are
+candidates after the parity floor stays green. **Each needs Vulkan-specific
+measurement on this driver; do not import Metal percentages as Vulkan gains.**
+
+1. **Q8 GEMV address hoisting** — Metal saw about +10.16% from hoisting block
+   base addresses out of the inner quant loop. Vulkan Q8 already walks 34-byte
+   blocks serially; hoist and vectorize loads without changing the f32 product
+   order.
+2. **Fused norm mechanisms** — Metal fused residual+RMSNorm and head-norm+RoPE
+   in places. Vulkan already fuses head-norm+RoPE into one shader; evaluate
+   residual+RMSNorm fusion and whether a single dispatch can cover Q/K/V matvecs
+   without reassociating any row sum.
+3. **In-slot KV** — already the Vulkan baseline (K/V written directly into the
+   cache slot). Next step is layout/swizzle and attention bandwidth (shared
+   memory for the active prefix, better score scratch) rather than inventing a
+   second cache path.
+4. **Vectorized f16/Q8 loads with fixed accumulation order** — half4/half8 loads
+   feeding a still-serial f32 accumulator (Metal wave-1 pattern).
+5. **Workgroup occupancy / multi-row only where exactness allows** — keep
+   one-output-row ownership for parity; only split independent rows across
+   subgroups after the 20×64 and Q8 depth gates stay green.
+6. **True prefill** — replace decode-as-prefill with a batched prefill graph for
+   throughput claims; depth correctness already uses the decode path.
 
 ## Attempted Linux rig ledger
 
@@ -113,5 +161,5 @@ was removed before the final attempt. Contract `45628608` (Spain, reliability
 SSH and passed `nvidia-smi`, Rust, and Vulkan-loader installation. It exposed
 only Mesa llvmpipe because the CUDA container lacked the NVIDIA Vulkan ICD, so
 `vulkan_probe` could not exercise the RTX 4090. The contract was destroyed
-immediately. No decode parity or throughput result is claimed from this failed
-host setup.
+immediately. No decode parity or throughput result is claimed from that failed
+host setup. **Gates were instead closed on the Ally RDNA3 iGPU** (this document).
