@@ -187,6 +187,13 @@ combined charge was about $0.10. The measurement rental cost about $0.30, for
 approximately **$0.40 total spend**, well below the $25 cap. All three
 `owned-quant-decode` instances were destroyed after evidence capture.
 
+The 2026-07-23 deep-control rig was Vast contract `45591181`: one verified
+RTX 4090 (24,564 MiB), offer reliability `0.9973986`, driver `580.119.02`, at
+`$0.413/hour` GPU plus `$0.059/hour` disk. Its final provider ledger was
+**$0.155** (`$0.117` GPU, `$0.018` disk, `$0.020` download); the instance was
+destroyed immediately after result capture. This control pass remains below its
+$6 budget cap.
+
 
 ## Campaign baseline: CUDA Q8_0 single-stream decode
 
@@ -257,18 +264,47 @@ as `SYNAPSE_CAMPAIGN_DEEP470_TOK_S` and `SYNAPSE_CAMPAIGN_DEEP900_TOK_S`.
 The shipping rule for a depth mechanism is mechanical evidence, not a replacement
 for the short gate: both deep cells must improve by at least 3%, the short cell
 may regress by at most 1%, and every existing quality floor must remain green.
-On the current 592.87 tree, the short control is
-**592.8694799258782 tok/s**. The 470 and 900 controls are intentionally
-**pending**, not fabricated: four mid-band RTX 4090 offers with reliability
-`>=0.992` remained in Vast's `loading` state without a container or SSH endpoint
-and were destroyed after startup windows of roughly 4–7 minutes. The registration
-leaves both deep environment values absent, and the harness refuses to run when
-either control is pending. A future
-qualifying control run must replace them with the worse-of-two `N=6` medians;
-reporting them separately then answers whether CUDA has a depth wall without
-allowing a long-context win to hide a short-context regression. The failed-rental
-ledger (four contracts, rates `$0.30–$0.37/hour`) accrued less than `$0.15` before
-destruction; no control numbers are claimed from those boxes.
+On the current `592.87` tree, the short control remains
+**592.8694799258782 tok/s**. The qualifying 2026-07-23 RTX 4090 control run
+produced the following first depth controls, which now populate both registered
+command environments:
+
+| Cell | Protocol | Measured median tok/s |
+|---|---|---:|
+| Short | N=12 fresh 64-token processes | **594.2106503078741** |
+| 470 | N=6, two fresh processes per prompt, worse repeat retained | **388.3055093346352** |
+| 900 | N=6, two fresh processes per prompt, worse repeat retained | **289.10934655903975** |
+
+The short result is `+0.226%` from the frozen control, inside the 2% drift gate.
+The short quality gate, constrained JSON gate, CPU hook suite, and all 12 deep
+exactness-pinned fixture rows passed. The harness used unchanged SHA-256
+`b35a87559f79c5ff185e915df4851f7cf570b353f0e4248fd8c8bc31c976c8aa` against
+current master `cf5f0a245a30f01e11d6d97d704ac07b4d812d21`.
+
+**Decision: CUDA does not show Metal's depth wall.** The 470-token tier costs
+`1.530x` and the 900-token tier costs `2.055x` as much end-to-end time per token
+as the short tier. The tier medians do not isolate attention from the remaining
+decode work, so an attention-only short-versus-900 cost ratio is not derivable.
+The directly measurable full-token ratio is `2.055x`, far below Metal's `37x`
+attention growth by position 469; attention at depth is therefore comparatively
+cheap on this 4090, and depth-only attention mechanisms should be deprioritized.
+
+The provision script's self-test passed, but its byte-pinned M1 candidate runner
+`e9e048754bf17eb60aaea1abcffcfe0495a818e99f77745f4311c24e127845c9` exits
+`127` under its required Ubuntu `dash` interpreter at `eval exec 10>&-`, before
+it can start a candidate command. This control run therefore used a direct-exec
+wrapper for trusted current-master code only; its SHA-256 was
+`7f812349eb1017d2122230d2daf3592fc5952efee881ffc42585d876687a97ee` and its
+complete bytes were:
+
+```sh
+#!/bin/sh
+exec "$@"
+```
+
+The in-tolerance short result above demonstrates that the wrapper did not alter
+the timing protocol for this trusted-tree control. The runner was not edited;
+fixing its dash incompatibility is separate ALF work.
 
 ### Campaign winner 1 confirmation
 
