@@ -1,4 +1,4 @@
-#[cfg_attr(not(all(target_os = "windows", feature = "vulkan")), allow(dead_code))]
+#[cfg_attr(not(feature = "vulkan"), allow(dead_code))]
 pub struct ModernBertLayer<'a> {
     pub qkv_weight: &'a [f32],
     pub attention_output_weight: &'a [f32],
@@ -9,7 +9,7 @@ pub struct ModernBertLayer<'a> {
     pub sliding_attention: bool,
 }
 
-#[cfg_attr(not(all(target_os = "windows", feature = "vulkan")), allow(dead_code))]
+#[cfg_attr(not(feature = "vulkan"), allow(dead_code))]
 pub struct Qwen3Layer<'a> {
     pub input_norm: &'a [f32],
     pub post_attention_norm: &'a [f32],
@@ -24,7 +24,8 @@ pub struct Qwen3Layer<'a> {
     pub down_weight: &'a [f32],
 }
 
-#[cfg(all(target_os = "windows", feature = "vulkan"))]
+#[cfg(feature = "vulkan")]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 mod enabled {
     use std::collections::HashMap;
     use std::ffi::{CStr, CString};
@@ -41,6 +42,7 @@ mod enabled {
 
     use super::super::{decode_f16_bits, encode_f16_bits, EncoderLayer, VulkanGemm};
     use super::{ModernBertLayer, Qwen3Layer};
+    use crate::qwen3::{Model, Weight};
 
     const DESCRIPTOR_BINDINGS: u32 = 10;
     const PUSH_CONSTANT_BYTES: u32 = 128;
@@ -350,6 +352,7 @@ mod enabled {
         timestamp_period_ns: f64,
         timestamp_valid_bits: u32,
         gemm: VulkanGemm,
+        shader_int8_supported: bool,
     }
 
     impl DeviceState {
@@ -522,8 +525,10 @@ mod enabled {
                 }
                 let mut storage16 = vk::PhysicalDevice16BitStorageFeatures::default()
                     .storage_buffer16_bit_access(true);
-                let mut float16 =
-                    vk::PhysicalDeviceShaderFloat16Int8Features::default().shader_float16(true);
+                let shader_int8_supported = supported_float16.shader_int8 != 0;
+                let mut float16 = vk::PhysicalDeviceShaderFloat16Int8Features::default()
+                    .shader_float16(true)
+                    .shader_int8(shader_int8_supported);
                 let mut scalar = vk::PhysicalDeviceScalarBlockLayoutFeatures::default()
                     .scalar_block_layout(true);
                 let mut cooperative = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default()
@@ -613,6 +618,7 @@ mod enabled {
                     timestamp_period_ns,
                     timestamp_valid_bits,
                     gemm,
+                    shader_int8_supported,
                 }))
             }
         }
@@ -834,6 +840,11 @@ mod enabled {
         qwen_causal_softmax: vk::Pipeline,
         qwen_context_transpose: vk::Pipeline,
         swiglu: vk::Pipeline,
+        decode_matvec: vk::Pipeline,
+        decode_matvec_q8_0: Option<vk::Pipeline>,
+        decode_head_norm_rope: vk::Pipeline,
+        decode_value_cache: vk::Pipeline,
+        decode_attention: vk::Pipeline,
     }
 
     impl Pipelines {
@@ -893,6 +904,28 @@ mod enabled {
                     include_bytes!("vulkan_spv/qwen_context_transpose.spv"),
                 )?,
                 swiglu: create_pipeline(state, include_bytes!("vulkan_spv/swiglu.spv"))?,
+                decode_matvec: create_pipeline(
+                    state,
+                    include_bytes!("vulkan_spv/decode_matvec.spv"),
+                )?,
+                decode_matvec_q8_0: state
+                    .shader_int8_supported
+                    .then(|| {
+                        create_pipeline(state, include_bytes!("vulkan_spv/decode_matvec_q8_0.spv"))
+                    })
+                    .transpose()?,
+                decode_head_norm_rope: create_pipeline(
+                    state,
+                    include_bytes!("vulkan_spv/decode_head_norm_rope.spv"),
+                )?,
+                decode_value_cache: create_pipeline(
+                    state,
+                    include_bytes!("vulkan_spv/decode_value_cache.spv"),
+                )?,
+                decode_attention: create_pipeline(
+                    state,
+                    include_bytes!("vulkan_spv/decode_attention.spv"),
+                )?,
             })
         }
 
@@ -917,6 +950,11 @@ mod enabled {
                 Some(self.qwen_causal_softmax),
                 Some(self.qwen_context_transpose),
                 Some(self.swiglu),
+                Some(self.decode_matvec),
+                self.decode_matvec_q8_0,
+                Some(self.decode_head_norm_rope),
+                Some(self.decode_value_cache),
+                Some(self.decode_attention),
             ]
             .into_iter()
             .flatten()
@@ -3432,12 +3470,770 @@ mod enabled {
         }
     }
 
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct DecodeHeadParams {
+        heads: u32,
+        head_dim: u32,
+        position: u32,
+        cache_stride: u32,
+        epsilon: f32,
+        write_cache: u32,
+        unused0: u32,
+        unused1: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct DecodeAttentionParams {
+        position: u32,
+        query_heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        capacity: u32,
+        unused0: u32,
+        unused1: u32,
+        unused2: u32,
+    }
+
+    struct DeviceDecodeWeight {
+        f16: Option<Buffer>,
+        q8_0: Option<Buffer>,
+    }
+
+    impl DeviceDecodeWeight {
+        fn upload(state: Arc<DeviceState>, weight: &Weight) -> Result<Self> {
+            Self::upload_parts(
+                state,
+                &weight.tensor.data,
+                weight.q8_0.as_ref().map(|quantized| quantized.as_bytes()),
+            )
+        }
+
+        fn upload_parts(
+            state: Arc<DeviceState>,
+            values: &[f32],
+            q8_0: Option<&[u8]>,
+        ) -> Result<Self> {
+            match q8_0 {
+                Some(bytes) => Ok(Self {
+                    f16: None,
+                    q8_0: Some(Buffer::from_slice(state, bytes)?),
+                }),
+                None => Ok(Self {
+                    f16: Some(Buffer::from_f16(state, values)?),
+                    q8_0: None,
+                }),
+            }
+        }
+    }
+
+    struct DeviceQwenDecodeLayer {
+        input_norm: Buffer,
+        post_attention_norm: Buffer,
+        q_weight: DeviceDecodeWeight,
+        q_norm: Buffer,
+        k_weight: DeviceDecodeWeight,
+        k_norm: Buffer,
+        v_weight: DeviceDecodeWeight,
+        o_weight: DeviceDecodeWeight,
+        gate_weight: DeviceDecodeWeight,
+        up_weight: DeviceDecodeWeight,
+        down_weight: DeviceDecodeWeight,
+        key_cache: Buffer,
+        value_cache: Buffer,
+    }
+
+    struct QwenDecodeActivations {
+        x0: Buffer,
+        x1: Buffer,
+        normed: Buffer,
+        q_raw: Buffer,
+        k_raw: Buffer,
+        v_raw: Buffer,
+        q: Buffer,
+        attention: Buffer,
+        projected: Buffer,
+        gate: Buffer,
+        up: Buffer,
+        activated: Buffer,
+        cosine: Buffer,
+        sine: Buffer,
+        scores: Buffer,
+        logits: Buffer,
+    }
+
+    impl QwenDecodeActivations {
+        #[allow(clippy::too_many_arguments)]
+        fn new(
+            state: Arc<DeviceState>,
+            hidden: usize,
+            query_heads: usize,
+            kv_heads: usize,
+            head_dim: usize,
+            intermediate: usize,
+            vocab: usize,
+            capacity: usize,
+        ) -> Result<Self> {
+            let query_width = query_heads * head_dim;
+            let kv_width = kv_heads * head_dim;
+            let f16 = |count| Buffer::new(state.clone(), count * size_of::<u16>());
+            let f32_buffer = |count| Buffer::new(state.clone(), count * size_of::<f32>());
+            Ok(Self {
+                x0: f16(hidden)?,
+                x1: f16(hidden)?,
+                normed: f16(hidden)?,
+                q_raw: f32_buffer(query_width)?,
+                k_raw: f32_buffer(kv_width)?,
+                v_raw: f32_buffer(kv_width)?,
+                q: f16(query_width)?,
+                attention: f16(query_width)?,
+                projected: f32_buffer(hidden)?,
+                gate: f32_buffer(intermediate)?,
+                up: f32_buffer(intermediate)?,
+                activated: f16(intermediate)?,
+                cosine: f32_buffer(head_dim)?,
+                sine: f32_buffer(head_dim)?,
+                scores: f32_buffer(query_heads * capacity)?,
+                logits: f32_buffer(vocab)?,
+            })
+        }
+    }
+
+    /// Plain-shader Qwen3 decode context. It keeps f16 KV slots on the device and
+    /// records only independent output rows as Vulkan workgroups; no cooperative
+    /// matrix pipeline or split dot-product reduction is part of this path.
+    pub struct Qwen3DecodeContext<'a> {
+        state: Arc<DeviceState>,
+        pipelines: Pipelines,
+        model: &'a Model,
+        layers: Vec<DeviceQwenDecodeLayer>,
+        final_norm: Buffer,
+        lm_head: DeviceDecodeWeight,
+        activations: QwenDecodeActivations,
+        capacity: usize,
+        position: usize,
+    }
+
+    impl<'a> Qwen3DecodeContext<'a> {
+        pub fn new(
+            gemm: VulkanGemm,
+            pipeline_cache: Option<PathBuf>,
+            model: &'a Model,
+            capacity: usize,
+        ) -> Result<Self> {
+            ensure!(
+                matches!(gemm, VulkanGemm::Plain),
+                "Qwen3 Vulkan decode is plain-shader only; pass --vulkan-gemm plain"
+            );
+            ensure!(
+                capacity > 0,
+                "Qwen3 Vulkan decode cache bucket must be positive"
+            );
+            ensure!(
+                model.config.num_attention_heads % model.config.num_key_value_heads == 0,
+                "Qwen3 Vulkan decode has invalid GQA heads"
+            );
+            let started = Instant::now();
+            let state = DeviceState::new(gemm, pipeline_cache)?;
+            ensure!(
+                !model.weight_quantization.is_quantized() || state.shader_int8_supported,
+                "Vulkan GPU lacks shader int8 required for Q8_0 decode"
+            );
+            let hidden = model.config.hidden_size;
+            let query_heads = model.config.num_attention_heads;
+            let kv_heads = model.config.num_key_value_heads;
+            let head_dim = model.config.head_dim;
+            let kv_width = kv_heads * head_dim;
+            let layers = model
+                .layers
+                .iter()
+                .map(|layer| {
+                    Ok(DeviceQwenDecodeLayer {
+                        input_norm: Buffer::from_f32(state.clone(), &layer.input_norm.weight.data)?,
+                        post_attention_norm: Buffer::from_f32(
+                            state.clone(),
+                            &layer.post_attention_norm.weight.data,
+                        )?,
+                        q_weight: DeviceDecodeWeight::upload(state.clone(), &layer.q_proj)?,
+                        q_norm: Buffer::from_f32(state.clone(), &layer.q_norm.weight.data)?,
+                        k_weight: DeviceDecodeWeight::upload(state.clone(), &layer.k_proj)?,
+                        k_norm: Buffer::from_f32(state.clone(), &layer.k_norm.weight.data)?,
+                        v_weight: DeviceDecodeWeight::upload(state.clone(), &layer.v_proj)?,
+                        o_weight: DeviceDecodeWeight::upload(state.clone(), &layer.o_proj)?,
+                        gate_weight: DeviceDecodeWeight::upload(state.clone(), &layer.gate_proj)?,
+                        up_weight: DeviceDecodeWeight::upload(state.clone(), &layer.up_proj)?,
+                        down_weight: DeviceDecodeWeight::upload(state.clone(), &layer.down_proj)?,
+                        key_cache: Buffer::new(
+                            state.clone(),
+                            capacity * kv_width * size_of::<u16>(),
+                        )?,
+                        value_cache: Buffer::new(
+                            state.clone(),
+                            capacity * kv_width * size_of::<u16>(),
+                        )?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let lm_head = model.lm_head()?;
+            let lm_head = DeviceDecodeWeight::upload_parts(
+                state.clone(),
+                &lm_head.data,
+                model.lm_head_q8_0().map(|quantized| quantized.as_bytes()),
+            )?;
+            let final_norm = Buffer::from_f32(state.clone(), &model.final_norm.weight.data)?;
+            let activations = QwenDecodeActivations::new(
+                state.clone(),
+                hidden,
+                query_heads,
+                kv_heads,
+                head_dim,
+                model.config.intermediate_size,
+                model.config.vocab_size,
+                capacity,
+            )?;
+            let pipelines = Pipelines::create(&state)?;
+            let (allocations, allocated_bytes) = state.immutable_allocation_summary();
+            eprintln!(
+                "Vulkan Qwen3 decode persistent weights: upload_ms={:.3} layers={} cache_slots={} storage=f16/q8_0 kv=device-resident allocations={allocations} allocated_bytes={allocated_bytes}",
+                started.elapsed().as_secs_f64() * 1_000.0,
+                layers.len(),
+                capacity,
+            );
+            Ok(Self {
+                state,
+                pipelines,
+                model,
+                layers,
+                final_norm,
+                lm_head,
+                activations,
+                capacity,
+                position: 0,
+            })
+        }
+
+        fn rope(&self, position: usize) -> (Vec<f32>, Vec<f32>) {
+            let head_dim = self.model.config.head_dim;
+            let mut cosine = Vec::with_capacity(head_dim);
+            let mut sine = Vec::with_capacity(head_dim);
+            for index in 0..head_dim {
+                let rotary_index = index % (head_dim / 2);
+                let frequency = 1.0
+                    / self
+                        .model
+                        .config
+                        .rope_theta
+                        .powf((2 * rotary_index) as f32 / head_dim as f32);
+                let (sin, cos) = (position as f32 * frequency).sin_cos();
+                cosine.push(cos);
+                sine.push(sin);
+            }
+            (cosine, sine)
+        }
+
+        fn embedding(&self, token: u32) -> Result<&[f32]> {
+            let token = token as usize;
+            ensure!(
+                token < self.model.config.vocab_size,
+                "token id {token} outside Qwen3 vocabulary"
+            );
+            let hidden = self.model.config.hidden_size;
+            Ok(&self.model.embeddings.data[token * hidden..(token + 1) * hidden])
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn record_matvec(
+            recorder: &mut Recorder<'_>,
+            pipelines: &Pipelines,
+            input: &Buffer,
+            weight: &DeviceDecodeWeight,
+            output: &Buffer,
+            rows: usize,
+            columns: usize,
+            layer: usize,
+            stage: StageClass,
+        ) -> Result<()> {
+            let params = FourU32 {
+                a: rows as u32,
+                b: columns as u32,
+                c: 0,
+                d: 0,
+            };
+            if let Some(q8_0) = &weight.q8_0 {
+                recorder.dispatch(
+                    pipelines
+                        .decode_matvec_q8_0
+                        .context("Vulkan GPU lacks shader int8 required for Q8_0 decode")?,
+                    &[input, q8_0, output],
+                    &params,
+                    [rows as u32, 1, 1],
+                    layer,
+                    stage,
+                )
+            } else {
+                recorder.dispatch(
+                    pipelines.decode_matvec,
+                    &[
+                        input,
+                        weight
+                            .f16
+                            .as_ref()
+                            .context("Vulkan decode f16 weight missing")?,
+                        output,
+                    ],
+                    &params,
+                    [rows as u32, 1, 1],
+                    layer,
+                    stage,
+                )
+            }
+        }
+
+        fn run_token(
+            &mut self,
+            token: u32,
+            position: usize,
+            produce_logits: bool,
+        ) -> Result<Vec<f32>> {
+            ensure!(
+                position < self.capacity,
+                "Qwen3 Vulkan decode cache capacity exhausted"
+            );
+            self.activations
+                .x0
+                .write(&encode_f16_bits(self.embedding(token)?))?;
+            let (cosine, sine) = self.rope(position);
+            self.activations.cosine.write(&cosine)?;
+            self.activations.sine.write(&sine)?;
+
+            let command_pool = unsafe {
+                self.state.device.create_command_pool(
+                    &vk::CommandPoolCreateInfo::default()
+                        .queue_family_index(self.state.queue_family),
+                    None,
+                )?
+            };
+            let command = unsafe {
+                self.state.device.allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default()
+                        .command_pool(command_pool)
+                        .level(vk::CommandBufferLevel::PRIMARY)
+                        .command_buffer_count(1),
+                )?[0]
+            };
+            let max_sets = (self.layers.len() as u32 * 16 + 2).max(2);
+            let descriptor_pool = unsafe {
+                self.state.device.create_descriptor_pool(
+                    &vk::DescriptorPoolCreateInfo::default()
+                        .max_sets(max_sets)
+                        .pool_sizes(&[vk::DescriptorPoolSize::default()
+                            .ty(vk::DescriptorType::STORAGE_BUFFER)
+                            .descriptor_count(max_sets * DESCRIPTOR_BINDINGS)]),
+                    None,
+                )?
+            };
+            let record_result = (|| {
+                unsafe {
+                    self.state.device.begin_command_buffer(
+                        command,
+                        &vk::CommandBufferBeginInfo::default()
+                            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                    )?;
+                }
+                {
+                    let mut recorder = Recorder {
+                        state: &self.state,
+                        command,
+                        descriptor_pool,
+                        descriptor_sets: Vec::new(),
+                        pipelines: &self.pipelines,
+                        profile: None,
+                    };
+                    let hidden = self.model.config.hidden_size;
+                    let query_heads = self.model.config.num_attention_heads;
+                    let kv_heads = self.model.config.num_key_value_heads;
+                    let head_dim = self.model.config.head_dim;
+                    let query_width = query_heads * head_dim;
+                    let kv_width = kv_heads * head_dim;
+                    let intermediate = self.model.config.intermediate_size;
+                    for (layer_index, layer) in self.layers.iter().enumerate() {
+                        recorder.dispatch(
+                            self.pipelines.rms_norm,
+                            &[
+                                &self.activations.x0,
+                                &layer.input_norm,
+                                &self.activations.normed,
+                            ],
+                            &FamilyNormParams {
+                                rows: 1,
+                                width: hidden as u32,
+                                epsilon: self.model.config.rms_norm_eps,
+                                identity: 0,
+                            },
+                            [1, 1, 1],
+                            layer_index,
+                            StageClass::Pointwise,
+                        )?;
+                        Self::record_matvec(
+                            &mut recorder,
+                            &self.pipelines,
+                            &self.activations.normed,
+                            &layer.q_weight,
+                            &self.activations.q_raw,
+                            query_width,
+                            hidden,
+                            layer_index,
+                            StageClass::GemmQkv,
+                        )?;
+                        Self::record_matvec(
+                            &mut recorder,
+                            &self.pipelines,
+                            &self.activations.normed,
+                            &layer.k_weight,
+                            &self.activations.k_raw,
+                            kv_width,
+                            hidden,
+                            layer_index,
+                            StageClass::GemmQkv,
+                        )?;
+                        Self::record_matvec(
+                            &mut recorder,
+                            &self.pipelines,
+                            &self.activations.normed,
+                            &layer.v_weight,
+                            &self.activations.v_raw,
+                            kv_width,
+                            hidden,
+                            layer_index,
+                            StageClass::GemmQkv,
+                        )?;
+                        let qk_params = DecodeHeadParams {
+                            heads: query_heads as u32,
+                            head_dim: head_dim as u32,
+                            position: position as u32,
+                            cache_stride: query_width as u32,
+                            epsilon: self.model.config.rms_norm_eps,
+                            write_cache: 0,
+                            unused0: 0,
+                            unused1: 0,
+                        };
+                        recorder.dispatch(
+                            self.pipelines.decode_head_norm_rope,
+                            &[
+                                &self.activations.q_raw,
+                                &layer.q_norm,
+                                &self.activations.cosine,
+                                &self.activations.sine,
+                                &self.activations.q,
+                            ],
+                            &qk_params,
+                            [query_heads as u32, 1, 1],
+                            layer_index,
+                            StageClass::LayoutTranspose,
+                        )?;
+                        recorder.dispatch(
+                            self.pipelines.decode_head_norm_rope,
+                            &[
+                                &self.activations.k_raw,
+                                &layer.k_norm,
+                                &self.activations.cosine,
+                                &self.activations.sine,
+                                &layer.key_cache,
+                            ],
+                            &DecodeHeadParams {
+                                heads: kv_heads as u32,
+                                head_dim: head_dim as u32,
+                                position: position as u32,
+                                cache_stride: kv_width as u32,
+                                epsilon: self.model.config.rms_norm_eps,
+                                write_cache: 1,
+                                unused0: 0,
+                                unused1: 0,
+                            },
+                            [kv_heads as u32, 1, 1],
+                            layer_index,
+                            StageClass::LayoutTranspose,
+                        )?;
+                        recorder.dispatch(
+                            self.pipelines.decode_value_cache,
+                            &[&self.activations.v_raw, &layer.value_cache],
+                            &FourU32 {
+                                a: kv_width as u32,
+                                b: position as u32,
+                                c: 0,
+                                d: 0,
+                            },
+                            [kv_width.div_ceil(256) as u32, 1, 1],
+                            layer_index,
+                            StageClass::LayoutTranspose,
+                        )?;
+                        recorder.dispatch(
+                            self.pipelines.decode_attention,
+                            &[
+                                &self.activations.q,
+                                &layer.key_cache,
+                                &layer.value_cache,
+                                &self.activations.scores,
+                                &self.activations.attention,
+                            ],
+                            &DecodeAttentionParams {
+                                position: position as u32,
+                                query_heads: query_heads as u32,
+                                kv_heads: kv_heads as u32,
+                                head_dim: head_dim as u32,
+                                capacity: self.capacity as u32,
+                                unused0: 0,
+                                unused1: 0,
+                                unused2: 0,
+                            },
+                            [query_heads as u32, 1, 1],
+                            layer_index,
+                            StageClass::SoftmaxMask,
+                        )?;
+                        Self::record_matvec(
+                            &mut recorder,
+                            &self.pipelines,
+                            &self.activations.attention,
+                            &layer.o_weight,
+                            &self.activations.projected,
+                            hidden,
+                            query_width,
+                            layer_index,
+                            StageClass::GemmOut,
+                        )?;
+                        recorder.dispatch(
+                            self.pipelines.add_residual,
+                            &[
+                                &self.activations.projected,
+                                &self.activations.x0,
+                                &self.activations.x1,
+                            ],
+                            &FourU32 {
+                                a: hidden as u32,
+                                b: 0,
+                                c: 0,
+                                d: 0,
+                            },
+                            [hidden.div_ceil(256) as u32, 1, 1],
+                            layer_index,
+                            StageClass::Pointwise,
+                        )?;
+                        recorder.dispatch(
+                            self.pipelines.rms_norm,
+                            &[
+                                &self.activations.x1,
+                                &layer.post_attention_norm,
+                                &self.activations.normed,
+                            ],
+                            &FamilyNormParams {
+                                rows: 1,
+                                width: hidden as u32,
+                                epsilon: self.model.config.rms_norm_eps,
+                                identity: 0,
+                            },
+                            [1, 1, 1],
+                            layer_index,
+                            StageClass::Pointwise,
+                        )?;
+                        Self::record_matvec(
+                            &mut recorder,
+                            &self.pipelines,
+                            &self.activations.normed,
+                            &layer.gate_weight,
+                            &self.activations.gate,
+                            intermediate,
+                            hidden,
+                            layer_index,
+                            StageClass::GemmMlpUp,
+                        )?;
+                        Self::record_matvec(
+                            &mut recorder,
+                            &self.pipelines,
+                            &self.activations.normed,
+                            &layer.up_weight,
+                            &self.activations.up,
+                            intermediate,
+                            hidden,
+                            layer_index,
+                            StageClass::GemmMlpUp,
+                        )?;
+                        recorder.dispatch(
+                            self.pipelines.swiglu,
+                            &[
+                                &self.activations.gate,
+                                &self.activations.up,
+                                &self.activations.activated,
+                            ],
+                            &FourU32 {
+                                a: intermediate as u32,
+                                b: 0,
+                                c: 0,
+                                d: 0,
+                            },
+                            [intermediate.div_ceil(256) as u32, 1, 1],
+                            layer_index,
+                            StageClass::Pointwise,
+                        )?;
+                        Self::record_matvec(
+                            &mut recorder,
+                            &self.pipelines,
+                            &self.activations.activated,
+                            &layer.down_weight,
+                            &self.activations.projected,
+                            hidden,
+                            intermediate,
+                            layer_index,
+                            StageClass::GemmMlpDown,
+                        )?;
+                        recorder.dispatch(
+                            self.pipelines.add_residual,
+                            &[
+                                &self.activations.projected,
+                                &self.activations.x1,
+                                &self.activations.x0,
+                            ],
+                            &FourU32 {
+                                a: hidden as u32,
+                                b: 0,
+                                c: 0,
+                                d: 0,
+                            },
+                            [hidden.div_ceil(256) as u32, 1, 1],
+                            layer_index,
+                            StageClass::Pointwise,
+                        )?;
+                    }
+                    if produce_logits {
+                        recorder.dispatch(
+                            self.pipelines.rms_norm,
+                            &[&self.activations.x0, &self.final_norm, &self.activations.x1],
+                            &FamilyNormParams {
+                                rows: 1,
+                                width: hidden as u32,
+                                epsilon: self.model.config.rms_norm_eps,
+                                identity: 0,
+                            },
+                            [1, 1, 1],
+                            self.layers.len(),
+                            StageClass::Pointwise,
+                        )?;
+                        Self::record_matvec(
+                            &mut recorder,
+                            &self.pipelines,
+                            &self.activations.x1,
+                            &self.lm_head,
+                            &self.activations.logits,
+                            self.model.config.vocab_size,
+                            hidden,
+                            self.layers.len(),
+                            StageClass::GemmMlpDown,
+                        )?;
+                    }
+                }
+                unsafe { self.state.device.end_command_buffer(command)? };
+                Ok::<(), anyhow::Error>(())
+            })();
+            if let Err(error) = record_result {
+                unsafe {
+                    self.state
+                        .device
+                        .destroy_descriptor_pool(descriptor_pool, None);
+                    self.state
+                        .device
+                        .free_command_buffers(command_pool, &[command]);
+                    self.state.device.destroy_command_pool(command_pool, None);
+                }
+                return Err(error);
+            }
+            let submit_result = (|| unsafe {
+                self.state.device.reset_fences(&[self.state.upload_fence])?;
+                self.state.device.queue_submit(
+                    self.state.queue,
+                    &[vk::SubmitInfo::default().command_buffers(&[command])],
+                    self.state.upload_fence,
+                )?;
+                self.state
+                    .device
+                    .wait_for_fences(&[self.state.upload_fence], true, u64::MAX)?;
+                Ok::<(), anyhow::Error>(())
+            })();
+            let read_result = if produce_logits && submit_result.is_ok() {
+                self.activations
+                    .logits
+                    .read_f32(self.model.config.vocab_size)
+            } else {
+                Ok(Vec::new())
+            };
+            unsafe {
+                self.state
+                    .device
+                    .destroy_descriptor_pool(descriptor_pool, None);
+                self.state
+                    .device
+                    .free_command_buffers(command_pool, &[command]);
+                self.state.device.destroy_command_pool(command_pool, None);
+            }
+            submit_result?;
+            read_result
+        }
+
+        pub fn prefill(&mut self, tokens: &[u32]) -> Result<Vec<f32>> {
+            ensure!(!tokens.is_empty(), "decode prompt must not be empty");
+            ensure!(
+                tokens.len() <= self.capacity,
+                "decode prompt exceeds cache bucket"
+            );
+            self.position = 0;
+            let mut logits = Vec::new();
+            for (index, &token) in tokens.iter().enumerate() {
+                logits = self.run_token(token, index, index + 1 == tokens.len())?;
+            }
+            self.position = tokens.len();
+            Ok(logits)
+        }
+
+        pub fn advance(&mut self, token: u32, position: usize) -> Result<Vec<f32>> {
+            ensure!(
+                position == self.position,
+                "Qwen3 Vulkan decode cache position mismatch: requested {position}, current {}",
+                self.position
+            );
+            let logits = self.run_token(token, position, true)?;
+            self.position += 1;
+            Ok(logits)
+        }
+
+        pub fn inspect_cache_layer(&self, layer: usize) -> Result<Vec<f32>> {
+            let layer = self
+                .layers
+                .get(layer)
+                .context("Qwen3 Vulkan cache layer out of range")?;
+            let values_per_cache =
+                self.capacity * self.model.config.num_key_value_heads * self.model.config.head_dim;
+            let mut bits = layer.key_cache.read_u16(values_per_cache)?;
+            bits.extend(layer.value_cache.read_u16(values_per_cache)?);
+            Ok(decode_f16_bits(&bits))
+        }
+    }
+
+    impl Drop for Qwen3DecodeContext<'_> {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = self.state.device.device_wait_idle();
+                for pipeline in self.pipelines.all() {
+                    self.state.device.destroy_pipeline(pipeline, None);
+                }
+            }
+        }
+    }
+
     unsafe fn bytes_of<T: Copy>(value: &T) -> &[u8] {
         unsafe { std::slice::from_raw_parts((value as *const T).cast(), size_of::<T>()) }
     }
 }
 
-#[cfg(not(all(target_os = "windows", feature = "vulkan")))]
+#[cfg(not(feature = "vulkan"))]
 mod enabled {
     use std::path::PathBuf;
 
@@ -3445,12 +4241,13 @@ mod enabled {
 
     use super::super::{EncoderLayer, VulkanGemm};
     use super::{ModernBertLayer, Qwen3Layer};
+    use crate::qwen3::Model;
 
     pub struct VulkanContext;
 
     impl VulkanContext {
         pub fn new(_gemm: VulkanGemm, _pipeline_cache_path: Option<PathBuf>) -> Result<Self> {
-            bail!("Vulkan provider requires Windows and cargo feature `vulkan`")
+            bail!("Vulkan provider requires cargo feature `vulkan`")
         }
 
         #[allow(clippy::too_many_arguments)]
@@ -3466,7 +4263,7 @@ mod enabled {
             _layer_norm_eps: f32,
             _layers: &[EncoderLayer],
         ) -> Result<Vec<Vec<f32>>> {
-            bail!("Vulkan provider requires Windows and cargo feature `vulkan`")
+            bail!("Vulkan provider requires cargo feature `vulkan`")
         }
     }
 
@@ -3474,7 +4271,7 @@ mod enabled {
 
     impl ModernBertContext {
         pub fn new(_gemm: VulkanGemm, _pipeline_cache: Option<PathBuf>) -> Result<Self> {
-            bail!("Vulkan provider requires Windows and cargo feature `vulkan`")
+            bail!("Vulkan provider requires cargo feature `vulkan`")
         }
 
         #[allow(clippy::too_many_arguments)]
@@ -3494,7 +4291,34 @@ mod enabled {
             _layers: &[ModernBertLayer<'_>],
             _final_norm: &[f32],
         ) -> Result<()> {
-            bail!("Vulkan provider requires Windows and cargo feature `vulkan`")
+            bail!("Vulkan provider requires cargo feature `vulkan`")
+        }
+    }
+
+    pub struct Qwen3DecodeContext<'a> {
+        _model: std::marker::PhantomData<&'a Model>,
+    }
+
+    impl<'a> Qwen3DecodeContext<'a> {
+        pub fn new(
+            _gemm: VulkanGemm,
+            _pipeline_cache: Option<PathBuf>,
+            _model: &'a Model,
+            _capacity: usize,
+        ) -> Result<Self> {
+            bail!("Vulkan Qwen3 decode requires cargo feature `vulkan`")
+        }
+
+        pub fn prefill(&mut self, _tokens: &[u32]) -> Result<Vec<f32>> {
+            bail!("Vulkan Qwen3 decode requires cargo feature `vulkan`")
+        }
+
+        pub fn advance(&mut self, _token: u32, _position: usize) -> Result<Vec<f32>> {
+            bail!("Vulkan Qwen3 decode requires cargo feature `vulkan`")
+        }
+
+        pub fn inspect_cache_layer(&self, _layer: usize) -> Result<Vec<f32>> {
+            bail!("Vulkan Qwen3 decode requires cargo feature `vulkan`")
         }
     }
 
@@ -3502,7 +4326,7 @@ mod enabled {
 
     impl Qwen3Context {
         pub fn new(_gemm: VulkanGemm, _pipeline_cache: Option<PathBuf>) -> Result<Self> {
-            bail!("Vulkan provider requires Windows and cargo feature `vulkan`")
+            bail!("Vulkan provider requires cargo feature `vulkan`")
         }
 
         #[allow(clippy::too_many_arguments)]
@@ -3522,9 +4346,9 @@ mod enabled {
             _layers: &[Qwen3Layer<'_>],
             _final_norm: &[f32],
         ) -> Result<()> {
-            bail!("Vulkan provider requires Windows and cargo feature `vulkan`")
+            bail!("Vulkan provider requires cargo feature `vulkan`")
         }
     }
 }
 
-pub use enabled::{ModernBertContext, Qwen3Context, VulkanContext};
+pub use enabled::{ModernBertContext, Qwen3Context, Qwen3DecodeContext, VulkanContext};

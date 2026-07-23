@@ -206,7 +206,7 @@ enum VulkanGemm {
 }
 
 impl VulkanGemm {
-    #[cfg(all(target_os = "windows", feature = "vulkan"))]
+    #[cfg(feature = "vulkan")]
     fn as_str(self) -> &'static str {
         match self {
             Self::Plain => "plain",
@@ -232,6 +232,7 @@ enum Execution {
 enum DecodeBackend {
     Mpsgraph,
     MetalStep,
+    Vulkan,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug, ValueEnum, Serialize)]
@@ -969,6 +970,28 @@ fn run_decode_cli(args: &Args, started: Instant) -> Result<()> {
         "decode mode supports only Qwen3 and LFM2 causal language models"
     );
 
+    #[cfg(feature = "vulkan")]
+    if matches!(args.decode_backend, DecodeBackend::Vulkan) {
+        use qwen3_decode::VulkanDecoder;
+        ensure!(
+            matches!(args.device, DeviceArg::Vulkan),
+            "Qwen3 Vulkan decode requires --device vulkan"
+        );
+        ensure!(
+            matches!(args.dtype, Precision::F16),
+            "Qwen3 Vulkan decode requires --dtype f16"
+        );
+        let model = qwen3::Model::load_with_quant(&args.model, args.dtype, args.weight_quant)?;
+        let mut decoder = VulkanDecoder::new(
+            &model,
+            args.dtype,
+            args.vulkan_gemm,
+            args.vulkan_pipeline_cache.clone(),
+            args.decode_cache_bucket,
+        )?;
+        return run_qwen_decode_with_runtime(args, started, &model, &mut decoder);
+    }
+
     #[cfg(target_os = "macos")]
     {
         ensure!(
@@ -1003,6 +1026,9 @@ fn run_decode_cli(args: &Args, started: Instant) -> Result<()> {
                 )?;
                 run_qwen_decode_with_runtime(args, started, &model, &mut decoder)
             }
+            DecodeBackend::Vulkan => bail!(
+                "Qwen3 Vulkan decode is available on non-macOS targets built with feature `vulkan`"
+            ),
         }
     }
 
@@ -5614,6 +5640,9 @@ mod tests {
             Args::try_parse_from(base.into_iter().chain(["--decode-backend", "metal-step"]))
                 .expect("parse Metal step decode backend");
         assert_eq!(metal_step.decode_backend, DecodeBackend::MetalStep);
+        let vulkan = Args::try_parse_from(base.into_iter().chain(["--decode-backend", "vulkan"]))
+            .expect("parse Vulkan decode backend");
+        assert_eq!(vulkan.decode_backend, DecodeBackend::Vulkan);
         let v2 = Args::try_parse_from(base.into_iter().chain(["--bucket-policy", "2"]))
             .expect("parse policy v2 override");
         assert_eq!(v2.bucket_policy, 2);

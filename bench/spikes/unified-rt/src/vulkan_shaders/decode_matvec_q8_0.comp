@@ -1,0 +1,30 @@
+#version 460
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+// Q8_0 blocks are [f16 scale, 32 signed bytes]. Keeping one invocation per
+// row preserves a deterministic f32 accumulation order for quantized decode.
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0, scalar) readonly buffer Input { float16_t values[]; } input_values;
+layout(set = 0, binding = 1, scalar) readonly buffer Weight { uint8_t values[]; } weight_values;
+layout(set = 0, binding = 2, scalar) writeonly buffer Output { float values[]; } output_values;
+layout(push_constant) uniform Params { uint rows; uint columns; uint unused0; uint unused1; } p;
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= p.rows) return;
+    float sum = 0.0;
+    uint blocks = p.columns / 32;
+    for (uint block = 0; block < blocks; ++block) {
+        uint offset = (row * blocks + block) * 34;
+        uint scale_bits = uint(weight_values.values[offset]) | (uint(weight_values.values[offset + 1]) << 8);
+        float scale = unpackHalf2x16(scale_bits).x;
+        for (uint lane = 0; lane < 32; ++lane) {
+            int quantized = int(weight_values.values[offset + 2 + lane]);
+            if (quantized >= 128) quantized -= 256;
+            sum += scale * float(quantized) * float(input_values.values[block * 32 + lane]);
+        }
+    }
+    output_values.values[row] = sum;
+}

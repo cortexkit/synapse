@@ -1,0 +1,23 @@
+#version 460
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_scalar_block_layout : require
+
+// One invocation owns one output row so every f32 dot-product accumulation
+// follows a fixed left-to-right order. Decode parity must not use reductions
+// that reassociate a single row's sum.
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0, scalar) readonly buffer Input { float16_t values[]; } input_values;
+layout(set = 0, binding = 1, scalar) readonly buffer Weight { float16_t values[]; } weight_values;
+layout(set = 0, binding = 2, scalar) writeonly buffer Output { float values[]; } output_values;
+layout(push_constant) uniform Params { uint rows; uint columns; uint unused0; uint unused1; } p;
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= p.rows) return;
+    float sum = 0.0;
+    uint base = row * p.columns;
+    for (uint column = 0; column < p.columns; ++column) {
+        sum += float(weight_values.values[base + column]) * float(input_values.values[column]);
+    }
+    output_values.values[row] = sum;
+}

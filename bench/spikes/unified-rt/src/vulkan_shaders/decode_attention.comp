@@ -1,0 +1,59 @@
+#version 460
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_scalar_block_layout : require
+
+// One invocation owns one query head and its complete attention reduction.
+// Positions are independent; splitting the inner dot or softmax sum would make
+// the accumulation order driver- and subgroup-dependent.
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0, scalar) readonly buffer Query { float16_t values[]; } query_values;
+layout(set = 0, binding = 1, scalar) readonly buffer Keys { float16_t values[]; } key_values;
+layout(set = 0, binding = 2, scalar) readonly buffer Values { float16_t values[]; } value_values;
+layout(set = 0, binding = 3, scalar) buffer Scores { float values[]; } scores_values;
+layout(set = 0, binding = 4, scalar) writeonly buffer Output { float16_t values[]; } output_values;
+layout(push_constant) uniform Params {
+    uint position;
+    uint query_heads;
+    uint kv_heads;
+    uint head_dim;
+    uint capacity;
+    uint unused0;
+    uint unused1;
+    uint unused2;
+} p;
+
+void main() {
+    uint query_head = gl_WorkGroupID.x;
+    if (query_head >= p.query_heads) return;
+    uint groups = p.query_heads / p.kv_heads;
+    uint kv_head = query_head / groups;
+    uint query_base = query_head * p.head_dim;
+    uint score_base = query_head * p.capacity;
+    float maximum = -3.402823e38;
+    float scale = inversesqrt(float(p.head_dim));
+    for (uint key = 0; key <= p.position; ++key) {
+        uint key_base = (key * p.kv_heads + kv_head) * p.head_dim;
+        float score = 0.0;
+        for (uint dimension = 0; dimension < p.head_dim; ++dimension) {
+            score += float(query_values.values[query_base + dimension]) * float(key_values.values[key_base + dimension]);
+        }
+        score *= scale;
+        scores_values.values[score_base + key] = score;
+        maximum = max(maximum, score);
+    }
+    float total = 0.0;
+    for (uint key = 0; key <= p.position; ++key) {
+        float probability = exp(scores_values.values[score_base + key] - maximum);
+        scores_values.values[score_base + key] = probability;
+        total += probability;
+    }
+    float inverse = 1.0 / max(total, 1e-20);
+    for (uint dimension = 0; dimension < p.head_dim; ++dimension) {
+        float value = 0.0;
+        for (uint key = 0; key <= p.position; ++key) {
+            uint value_base = (key * p.kv_heads + kv_head) * p.head_dim;
+            value += scores_values.values[score_base + key] * inverse * float(value_values.values[value_base + dimension]);
+        }
+        output_values.values[query_base + dimension] = float16_t(value);
+    }
+}

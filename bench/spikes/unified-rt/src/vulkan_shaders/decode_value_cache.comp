@@ -1,0 +1,13 @@
+#version 460
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0, scalar) readonly buffer Input { float values[]; } input_values;
+layout(set = 0, binding = 1, scalar) writeonly buffer Cache { float16_t values[]; } cache_values;
+layout(push_constant) uniform Params { uint count; uint position; uint unused0; uint unused1; } p;
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index < p.count) cache_values.values[p.position * p.count + index] = float16_t(input_values.values[index]);
+}

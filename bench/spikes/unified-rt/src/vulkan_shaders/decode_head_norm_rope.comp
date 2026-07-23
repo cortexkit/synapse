@@ -1,0 +1,47 @@
+#version 460
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_scalar_block_layout : require
+
+// Each workgroup handles one independent Q or K head. The head RMS reduction
+// is intentionally serial so decoding does not reassociate one head's f32 sum.
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0, scalar) readonly buffer Input { float values[]; } input_values;
+layout(set = 0, binding = 1, scalar) readonly buffer Weight { float values[]; } weight_values;
+layout(set = 0, binding = 2, scalar) readonly buffer Cosine { float values[]; } cosine_values;
+layout(set = 0, binding = 3, scalar) readonly buffer Sine { float values[]; } sine_values;
+layout(set = 0, binding = 4, scalar) writeonly buffer Output { float16_t values[]; } output_values;
+layout(push_constant) uniform Params {
+    uint heads;
+    uint head_dim;
+    uint position;
+    uint cache_stride;
+    float epsilon;
+    uint write_cache;
+    uint unused0;
+    uint unused1;
+} p;
+
+void main() {
+    uint head = gl_WorkGroupID.x;
+    if (head >= p.heads) return;
+    uint source = head * p.head_dim;
+    float square = 0.0;
+    for (uint dimension = 0; dimension < p.head_dim; ++dimension) {
+        float value = input_values.values[source + dimension];
+        square += value * value;
+    }
+    float inverse = inversesqrt(square / float(p.head_dim) + p.epsilon);
+    uint destination = p.write_cache != 0
+        ? p.position * p.cache_stride + source
+        : source;
+    uint half_dim = p.head_dim / 2;
+    for (uint dimension = 0; dimension < p.head_dim; ++dimension) {
+        uint pair = dimension < half_dim ? dimension + half_dim : dimension - half_dim;
+        float value = input_values.values[source + dimension] * inverse * weight_values.values[dimension];
+        float pair_value = input_values.values[source + pair] * inverse * weight_values.values[pair];
+        float sign_value = dimension < half_dim ? -1.0 : 1.0;
+        output_values.values[destination + dimension] = float16_t(
+            value * cosine_values.values[dimension] + sign_value * pair_value * sine_values.values[dimension]
+        );
+    }
+}

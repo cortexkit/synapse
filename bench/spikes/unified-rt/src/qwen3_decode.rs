@@ -68,7 +68,12 @@ pub(crate) trait DecodeKernel {
     /// is the token committed at the caller's newest position; earlier elements
     /// are the intermediate tokens. Backends without a chained path (the
     /// default) must not be asked for this — `chain_span` returns 1 for them.
-    fn advance_chain(&mut self, _cache: &mut Self::Cache, _seed: u32, _steps: usize) -> Result<Vec<u32>> {
+    fn advance_chain(
+        &mut self,
+        _cache: &mut Self::Cache,
+        _seed: u32,
+        _steps: usize,
+    ) -> Result<Vec<u32>> {
         anyhow::bail!("this decode backend has no chained multi-token path")
     }
 }
@@ -271,7 +276,10 @@ impl<'a, K: DecodeKernel> DecodeSession<'a, K> {
             // host-selected seed that yields `steps + 1` committed tokens, so cap
             // the chain steps to keep the total within budget and capacity.
             let max_follow = remaining.saturating_sub(1);
-            let steps = span.saturating_sub(1).min(max_follow).min(capacity_left - 1);
+            let steps = span
+                .saturating_sub(1)
+                .min(max_follow)
+                .min(capacity_left - 1);
 
             // Commit the seed first (it occupies one cache position via the
             // chain's step 0), tapping it like `generate` does before commit.
@@ -696,6 +704,11 @@ fn active_tensor_bytes(tensor: &Tensor) -> Vec<u8> {
         |bits| bits.iter().flat_map(|value| value.to_le_bytes()).collect(),
     )
 }
+
+#[cfg(feature = "vulkan")]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+#[path = "qwen3_decode_vulkan.rs"]
+mod vulkan;
 
 #[cfg(target_os = "macos")]
 mod metal {
@@ -1512,6 +1525,9 @@ mod cuda {
 pub(crate) use cuda::CudaDecoder;
 #[cfg(target_os = "macos")]
 pub(crate) use metal::MetalDecoder;
+#[cfg(feature = "vulkan")]
+#[cfg_attr(target_os = "macos", allow(unused_imports))]
+pub(crate) use vulkan::VulkanDecoder;
 
 #[cfg(test)]
 mod tests {
@@ -1646,7 +1662,10 @@ mod tests {
             let actual = chained
                 .generate_chained(40, &no_stops(), &mut |_: TokenTapEvent<'_>| {})
                 .unwrap();
-            assert_eq!(actual, expected, "chained span {span} diverged from per-token");
+            assert_eq!(
+                actual, expected,
+                "chained span {span} diverged from per-token"
+            );
         }
     }
 
@@ -1672,7 +1691,9 @@ mod tests {
             .unwrap();
         assert_eq!(actual, expected);
         assert!(
-            expected.last().is_none_or(|last| stops.contains(last) || expected.len() == 40),
+            expected
+                .last()
+                .is_none_or(|last| stops.contains(last) || expected.len() == 40),
             "test fixture should exercise a stop-token truncation"
         );
     }
