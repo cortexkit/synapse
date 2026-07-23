@@ -454,12 +454,24 @@ def verify_copy(runner: Path, destination: Path, log_path: Path) -> None:
 
 def copy_tree(runner: Path, source: Path, destination: Path, log_path: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True, mode=0o777)
-    status = run_through_runner(runner, ["/bin/cp", "-cR", str(source), str(destination)], log_path)
+    # The staged workspace contains the driver-protected fixtures directory,
+    # which the candidate identity cannot traverse; a plain recursive cp dies
+    # on it. Fixtures are consumed from SYNAPSE_CAMPAIGN_FIXTURES (an external
+    # digest-verified copy), so staging excludes that directory entirely.
+    pipeline = (
+        f"tar -C '{source.parent}' --exclude '*metal-embed-fixtures*' -cf - '{source.name}' "
+        f"| tar -C '{destination.parent}' -xf -"
+    )
+    status = run_through_runner(runner, ["/bin/sh", "-c", pipeline], log_path)
+    if status == 0 and source.name != destination.name:
+        status = run_through_runner(
+            runner,
+            ["/bin/mv", str(destination.parent / source.name), str(destination)],
+            log_path,
+        )
     if status != 0:
         if destination.exists() or destination.is_symlink():
             shutil.rmtree(destination, ignore_errors=True)
-        status = run_through_runner(runner, ["/bin/cp", "-R", str(source), str(destination)], log_path)
-    if status != 0:
         raise HarnessError(f"could not stage {source}: {runner_output(log_path)[-4096:]}")
     verify_copy(runner, destination, log_path.with_name(log_path.name + ".verify"))
 
