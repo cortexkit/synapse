@@ -806,7 +806,13 @@ def read_exact(stream: Any, size: int) -> bytes:
     while len(chunks) < size:
         chunk = stream.read(size - len(chunks))
         if not chunk:
-            raise CandidateRejected("candidate stdio process closed before a complete protocol frame")
+            # Include what actually arrived: a text preamble here means some
+            # layer wrote non-frame bytes onto the protocol channel, while an
+            # empty capture means the process died before writing at all.
+            raise CandidateRejected(
+                "candidate stdio process closed before a complete protocol frame; "
+                f"partial bytes ({len(chunks)} of {size}): {bytes(chunks[:200])!r}"
+            )
         chunks.extend(chunk)
     return bytes(chunks)
 
