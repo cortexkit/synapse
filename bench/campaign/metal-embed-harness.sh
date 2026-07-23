@@ -458,7 +458,6 @@ def copy_tree(runner: Path, source: Path, destination: Path, log_path: Path) -> 
     # The fixtures directory must not be driver-protected in the registration:
     # a permission-blocked subtree fails both copies, and fixture integrity is
     # already enforced by the harness's pinned SHA-256 verification.
-    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o777)
     status = run_through_runner(runner, ["/bin/cp", "-cR", str(source), str(destination)], log_path)
     if status != 0:
         if destination.exists() or destination.is_symlink():
@@ -476,7 +475,10 @@ def stage_sources(workspace: Path, temp_root: Path, runner: Path) -> Tuple[Path,
         raise HarnessError(f"candidate runner probe failed: {runner_output(probe_log) or '<empty>'}")
     sources = configured_sibling_sources()
     build_root = temp_root / "build"
-    build_root.mkdir(parents=True, exist_ok=True, mode=0o777)
+    # The RUNNER (candidate identity) must create the build root so it owns it;
+    # a harness-side mkdir leaves a controller-owned directory the candidate
+    # cannot write into, and the pre-created path turns the runner's mkdir -p
+    # into a silent no-op that defers the failure to the copy step.
     if run_through_runner(runner, ["/bin/mkdir", "-p", str(build_root)], temp_root / "build-mkdir.log") != 0:
         raise HarnessError("candidate runner could not create its build staging directory")
     staged_workspace = build_root / "workspace"
@@ -1055,7 +1057,10 @@ def run_harness(workspace_arg: str, runner_arg: str, result_arg: str) -> int:
     model = Path(os.environ.get("SYNAPSE_CAMPAIGN_MODEL", str(DEFAULT_MODEL))).expanduser().resolve()
     writer = ResultWriter(result_path)
     temp_root = Path(tempfile.mkdtemp(prefix="synapse-metal-embed-campaign-", dir="/tmp"))
-    temp_root.chmod(0o755)
+    # World-writable on purpose: the candidate identity must create and write
+    # the build staging tree under here (mkdtemp defaults to 0o700, and a
+    # 0o755 root silently breaks every candidate-side copy with empty logs).
+    temp_root.chmod(0o777)
     lock: Optional[Path] = None
     power: Dict[str, Any] = {"power_source": "unknown", "battery_percent": None, "output": "<not run>"}
     toolchain: Dict[str, Any] = {"developer_dir": DEVELOPER_DIR, "metal_compiler": "<not run>"}
