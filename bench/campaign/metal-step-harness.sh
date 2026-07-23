@@ -21,7 +21,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
-BASELINE_TOK_S = 85.2589
+BASELINE_TOK_S = 103.62924130858343
 QUALITY_MIN_EXACT = 10
 QUALITY_MIN_MEDIAN_DEPTH = 59.0
 EXPECTED_MODEL_DIGEST = "0d7d1359007f579fba9f6eceef44c87b947362da893cc565d27656284e4d6f86"
@@ -993,7 +993,7 @@ def run_harness(workspace_arg: str, runner_arg: str, result_arg: str) -> int:
     power_note = "Power state: preflight not completed."
     metal_note = "Metal toolchain: preflight not completed."
     baseline_note = (
-        f"Confirmed campaign-2 winners 5+6 locked-M1 Q8_0 baseline: {baseline:.4f} tok/s; "
+        f"Confirmed campaign-4b three-winner locked-M1 Q8_0 baseline: {baseline:.4f} tok/s; "
         f"N={SAMPLE_COUNT} x {REPEAT_COUNT} worse-of-two protocol; measurement not completed."
     )
     writer.write(result_payload(False, False, [], None, "", baseline_note))
@@ -1010,7 +1010,7 @@ def run_harness(workspace_arg: str, runner_arg: str, result_arg: str) -> int:
             f"xcrun metal={metal_toolchain['metal_compiler']}."
         )
         baseline_note = (
-            f"Confirmed campaign-2 winners 5+6 locked-M1 Q8_0 baseline: {baseline:.4f} tok/s; "
+            f"Confirmed campaign-4b three-winner locked-M1 Q8_0 baseline: {baseline:.4f} tok/s; "
             f"N={SAMPLE_COUNT} x {REPEAT_COUNT} worse-of-two protocol; measurement not completed. "
             f"{power_note} {metal_note}"
         )
@@ -1218,7 +1218,7 @@ def run_harness(workspace_arg: str, runner_arg: str, result_arg: str) -> int:
 
         gate_passed = True
         baseline_note = (
-            f"Confirmed campaign-2 winners 5+6 locked-M1 Q8_0 baseline: {baseline:.4f} tok/s; "
+            f"Confirmed campaign-4b three-winner locked-M1 Q8_0 baseline: {baseline:.4f} tok/s; "
             f"f16 20/20 exact vs pinned oracle and MPSGraph; Q8_0 {exact_count}/20 exact, "
             f"median depth {median_depth:.1f}, zero near-ties; qwen3_decode hooks green; "
             "long-context parity 470-token prefill + 64/64; "
@@ -1254,7 +1254,7 @@ def run_harness(workspace_arg: str, runner_arg: str, result_arg: str) -> int:
         if not math.isfinite(median_tok_s) or median_tok_s <= 0:
             raise CandidateRejected("measurement median is not finite and positive")
         baseline_note = (
-            f"Confirmed campaign-2 winners 5+6 locked-M1 Q8_0 baseline: {baseline:.4f} tok/s; "
+            f"Confirmed campaign-4b three-winner locked-M1 Q8_0 baseline: {baseline:.4f} tok/s; "
             f"f16 20/20 exact, Q8_0 {exact_count}/20 exact with median depth {median_depth:.1f}, "
             "zero near-ties, hooks green, and long-context parity 64/64. "
             f"N={SAMPLE_COUNT} varied prompts x {REPEAT_COUNT} fresh processes; samples are "
@@ -1274,7 +1274,7 @@ def run_harness(workspace_arg: str, runner_arg: str, result_arg: str) -> int:
         return 0
     except CandidateRejected as error:
         note = (
-            f"Confirmed campaign-2 winners 5+6 locked-M1 Q8_0 baseline: {baseline:.4f} tok/s. "
+            f"Confirmed campaign-4b three-winner locked-M1 Q8_0 baseline: {baseline:.4f} tok/s. "
             f"{power_note} {metal_note} {sibling_note} Candidate rejected: {error}"
         )
         writer.write(result_payload(gate_passed, hooks_passed, [], None, workspace_commit, note))
@@ -1285,7 +1285,7 @@ def run_harness(workspace_arg: str, runner_arg: str, result_arg: str) -> int:
         return 3
     except Exception as error:
         note = (
-            f"Confirmed campaign-2 winners 5+6 locked-M1 Q8_0 baseline: {baseline:.4f} tok/s. "
+            f"Confirmed campaign-4b three-winner locked-M1 Q8_0 baseline: {baseline:.4f} tok/s. "
             f"{power_note} {metal_note} Harness refused: {error}"
         )
         writer.write(result_payload(gate_passed, hooks_passed, [], None, workspace_commit, note))

@@ -1,6 +1,6 @@
 # Metal custom decode step
 
-Status: **wave 6 GPU-chained multi-token decode is implemented and token-exact on the locked M1 (f16 20/20 at k=1 and k=8; Q8 quality and long-context parity unchanged; all hooks green), but its locked-M1 best-k Q8 throughput is +2.58%, below the 3% shipping bar — it is a banked correctness win, not shipped, and no baseline was changed**.
+Status: **wave 6 GPU-chained multi-token decode remains a token-exact banked correctness win below its 3% shipping bar; campaign 4b now ships three order-preserving Q8 winners at 103.6292 tok/s on the locked M1, with the Q8 baseline re-pinned accordingly**.
 The default Qwen3 decode backend remains `mpsgraph`. Select the custom path with
 `--decode-backend metal-step`. The chained span is `SYNAPSE_METAL_STEP_CHAIN_K`
 (default 1 = the fully instrumented per-token path, byte-identical to the
@@ -174,7 +174,9 @@ no pre-existing bench lock, and 1-minute load averages from 1.09 to 1.21.
 | --- | --- | --- | ---: | --- | --- |
 | MPSGraph reference | f16 | 12 x 2 | 84.32 baseline | pending fresh breakdown | prior baseline |
 | Metal step winners 5+6 | f16 | 12 x 2 | **48.6506 median** | timed on locked M1; 20/20 exact | campaign-2 confirmation |
-| Metal step winners 5+6 | Q8_0 | 12 x 2 | **85.2589 median** | timed on locked M1; 13/20 exact; median depth 64.0 | **above the 84.32 MPSGraph reference; new Q8 baseline** |
+| Metal step winners 5+6 | Q8_0 | 12 x 2 | **85.2589 median** | timed on locked M1; 13/20 exact; median depth 64.0 | campaign-2 control for campaign 4b |
+| Metal step campaign 4b ABC | f16 | 12 x 2 | **51.2478 median** | locked M1; 20/20 exact; 470-token parity 64/64 | **shipped three-winner tree** |
+| Metal step campaign 4b ABC | Q8_0 | 12 x 2 | **103.6292 median** | locked M1; 13/20 exact; median depth 64.0; zero near-ties; hooks green | **new Q8 baseline** |
 | Metal step baseline | f16 | 12 x 2 | **5.8080 median** | 0.1025 ms / 171.8693 ms / 0.0146 ms | parity-first baseline |
 | Metal step baseline | Q8_0 | 12 x 2 | **5.0405 median** | 0.1021 ms / 198.0879 ms / 0.0141 ms | parity-first baseline |
 | Metal step wave 1 | f16 | 12 x 2 | **17.7992 median** | 0.1021 ms / 55.8754 ms / 0.0340 ms | 20/20 exact; AC |
@@ -194,11 +196,14 @@ and sampler time; median readback was 0.033 ms/token and median sampling was
 `DECODE-WAVE1.md`.
 
 The fresh locked-M1 Q8 control was **74.2507 tok/s**; the round-1 winner
-measured **81.3764 tok/s**, and winners 5+6 measured **85.2589 tok/s** under
-the same 12-prompt, two-fresh-process, worse-of-two protocol. The campaign
+measured **81.3764 tok/s**, and winners 5+6 measured **85.2589 tok/s** under the
+same 12-prompt, two-fresh-process, worse-of-two protocol. The campaign
 projection from its 75.0938 control and reported +9.54%/+4.90% gains was
 86.3 tok/s; the confirmed run was 85.2589 tok/s because this fresh control was
 1.1% below the historical control, still inside the 2% control-drift gate.
+Campaign 4b subsequently used that 85.2589 winners-5+6 tree as its pinned
+control and shipped a separately gated ABC tree at 103.6292 tok/s; the newer
+baseline is recorded in the campaign-4b section below.
 
 ## Campaign 2 winners 5+6
 
@@ -229,8 +234,85 @@ not clear the promotion bar; pairwise KV-position value-loop unrolling
 (+1.43%) remained below the 3% objective; and the softmax/occupancy sub-gates
 (max reduction +0.75%, pairwise denominator exp scheduling +0.81%, and the
 smaller attention threadgroup +1.20%) were likewise below promotion value.
-These are follow-ups to revisit only with a new gate hypothesis, not claims of
-available throughput.
+These are follow-ups to revisit only with a new gate hypothesis, not claims of available throughput.
+
+## Campaign 4b: three composition-honest winners
+
+Campaign `[consult-id]` closed
+`consecutive_dry_rounds` with three promoted winners. Its control was the
+campaign-2 winners-5+6 tree at **85.2589 tok/s Q8_0**, and all three promotion
+patches were pulled from the campaign store by proposal ID and applied in
+promotion order. The M1 authority run used AC power, an exclusive
+`[bench-user-home]/bench.lock`, no `Runner.Worker`, 12 stride-seven prompts, two fresh
+processes per prompt, and the worse repeat per prompt.
+
+### Promoted mechanisms and provenance
+
+1. **R1a — order-preserving QK-norm half4 sum-of-squares** (Claude,
+   proposal `proposal_ccfb167d9893ec22ebddf1948abb35e78b76669246d6b47130145e78575c8202`,
+   patch digest `944bfd19e6f435676f46d11064a853c76a0b02067ad7fdaf53d79afd3754b981`).
+   The query and key norm sums load adjacent four-value groups, cast each
+   component to f32, and add the four products in the original ascending
+   order. The campaign estimate was **+4.31%**, measured in parallel against
+   the campaign control.
+2. **R1b — parallel QK-norm output with serial-order reductions** (Sol,
+   proposal `proposal_1241479e1962747279de00ffd0c70abca3b763d751a435ebf17356d766bace67`,
+   patch digest `28bf79d7af6e0614caf9bfb4091b00dd08958884acff3e84aea73c752e8c286f`).
+   One simdgroup owns each independent Q/K head; lane zero keeps the exact
+   ascending f32 norm reduction while the other lanes split the independent
+   normalize, RoPE, and cache writes. The campaign estimate was **+4.80%**,
+   measured in parallel against the campaign control.
+3. **R2 — Q8 block-address hoisting in GEMV inner loops** (Sol,
+   proposal `proposal_fffabfdfe1867b0d660d2f79bca2ea842af5dfebc41568f68f97eeacc202114d`,
+   patch digest `b1cc2024cff09e111c7bb39e9a390290b4321cbfc4c541016d4105e21d903c60`).
+   Each Q8 row now computes its row base once and walks input and weight block
+   pointers through the unrolled dot-product loop instead of regenerating the
+   row/block address for every chunk. Its campaign estimate was **+10.16%**,
+   measured against the promoted R1 tree.
+
+R1a and R1b touch the same QK-norm seam, so their estimates are not multiplied
+or treated as independent additive evidence. The measured AB tree composes both
+mechanisms: R1b supplies the head-parallel dispatch and lane split, while R1a's
+half4 sum-of-squares loop remains inside lane zero. R2 is then applied to that
+AB tree, as the campaign protocol requires.
+
+### Locked-M1 composition table
+
+All measured trees passed the complete battery: f16 **20/20** exact against the
+pinned oracle and MPSGraph, Q8 **13/20** exact with median match depth **64.0**
+and zero near-ties, all five hook tests, and 470-token prefill parity **64/64**.
+The Q8 medians below are the worse-of-two fold over 12 fresh processes; the f16
+cells use the same 12 x 2 protocol and are recorded for comparison.
+
+| Tree | f16 tok/s | Q8_0 tok/s | Q8 vs fresh control | Decision |
+| --- | ---: | ---: | ---: | --- |
+| CONTROL (master + winners 5+6) | 48.6392 | **85.2813** | —; +0.03% vs pinned 85.2589 | fresh control; drift inside 2% |
+| A-only (R1a) | not measured | not measured | — | AB composed well above the single-winner branch threshold |
+| B-only (R1b) | not measured | not measured | — | AB composed well above the single-winner branch threshold |
+| AB (R1a + R1b) | **51.2484** | **93.5819** | **+9.73%** | passed; retained as the R2 base |
+| ABC (AB + R2) | **51.2478** | **103.6292** | **+21.51%** | **shipped; new Q8 baseline** |
+| llama.cpp Metal reference | — | **207.40** | ABC is **49.97%** of the fresh reference | b9580, AC, same 12 x 2 protocol |
+
+AB's +9.73% gain is more than one percentage point above the better R1 single
+estimate (+4.80%), so the protocol's A-only/B-only branch was not triggered.
+R2 adds **+10.74%** over AB in the integrated tree. The fresh control was
+**85.2813 tok/s**, below the 2% drift stop rail; the ABC result is therefore an
+authority-machine measurement rather than a compound estimate.
+
+The campaign's parity-failed R3 proposal — threadgroup-sharing Q8 activations
+across the eight packed rows (proposal
+`proposal_85983b7ef8c60b126a8e57b1eea435a38bb497edf624ae9efe8f6dd736473ebd`) —
+is a banked negative: it changed the f16 parity stream and was not timed. The
+R1 dispatch-shape proposal (proposal
+`proposal_80e2cdb313d47112592ec5ee92cc2c6cd0f7cbc3e2496a989e5698e92624c4b2`)
+was also banked negative: its full-simdgroup dispatch measured **85.9164**
+against an **86.1638** control (**-0.29%**) and did not promote. These are
+negative evidence, not omitted wins.
+
+R2 opens the address-arithmetic seam for the next measured pass. The obvious
+follow-up is LM-head stride hoisting: apply the same row-base/pointer-walk
+analysis to the 151k-row LM head, with its own exactness and depth gates rather
+than assuming the GEMV result transfers.
 
 ## Wave 6 GPU-chained multi-token decode
 

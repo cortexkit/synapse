@@ -59,16 +59,13 @@ struct EmbeddingConfig {
 };
 
 inline float matrix_dot_q8_chunk(
-    const device half *input,
-    const device uchar *q8,
-    uint row_start,
-    uint block_start,
+    const device half *input_block,
+    const device uchar *block_q8,
     uint lane_start
 ) {
-    const device half *scale = (const device half *)(q8 +
-        (row_start + block_start) / Q8_BLOCK_ELEMENTS * Q8_BLOCK_BYTES);
+    const device half *scale = (const device half *)block_q8;
     const device char *values = (const device char *)((const device uchar *)scale + 2);
-    half4 input_values = *(const device half4 *)(input + block_start + lane_start);
+    half4 input_values = *(const device half4 *)(input_block + lane_start);
     char4 quant_values = *(const device char4 *)(values + lane_start);
     float4 products = float4(input_values) * float4(quant_values) * (float)scale[0];
     return (float)products[0] + (float)products[1] + (float)products[2] + (float)products[3];
@@ -85,30 +82,25 @@ inline float matrix_dot_q8_simd(
     // Eight lanes each consume a contiguous char4/half4 slice. The remaining
     // lanes stay active with zero partials so simd_sum remains well-defined.
     if (lane < 8) {
-        uint row_start = row * input_width;
         uint lane_start = lane * 4;
         uint block_count = input_width / Q8_BLOCK_ELEMENTS;
+        const device uchar *row_q8 = q8 + row * block_count * Q8_BLOCK_BYTES;
+        const device half *input_block = input;
         uint block = 0;
         // Four block addresses remain independent, while each lane now issues
         // wider aligned loads from its block slice.
         for (; block + 4 <= block_count; block += 4) {
-            uint block0 = block * Q8_BLOCK_ELEMENTS;
-            uint block1 = block0 + Q8_BLOCK_ELEMENTS;
-            uint block2 = block1 + Q8_BLOCK_ELEMENTS;
-            uint block3 = block2 + Q8_BLOCK_ELEMENTS;
-            partial += matrix_dot_q8_chunk(input, q8, row_start, block0, lane_start);
-            partial += matrix_dot_q8_chunk(input, q8, row_start, block1, lane_start);
-            partial += matrix_dot_q8_chunk(input, q8, row_start, block2, lane_start);
-            partial += matrix_dot_q8_chunk(input, q8, row_start, block3, lane_start);
+            partial += matrix_dot_q8_chunk(input_block, row_q8, lane_start);
+            partial += matrix_dot_q8_chunk(input_block + Q8_BLOCK_ELEMENTS, row_q8 + Q8_BLOCK_BYTES, lane_start);
+            partial += matrix_dot_q8_chunk(input_block + Q8_BLOCK_ELEMENTS * 2, row_q8 + Q8_BLOCK_BYTES * 2, lane_start);
+            partial += matrix_dot_q8_chunk(input_block + Q8_BLOCK_ELEMENTS * 3, row_q8 + Q8_BLOCK_BYTES * 3, lane_start);
+            input_block += Q8_BLOCK_ELEMENTS * 4;
+            row_q8 += Q8_BLOCK_BYTES * 4;
         }
         for (; block < block_count; ++block) {
-            partial += matrix_dot_q8_chunk(
-                input,
-                q8,
-                row_start,
-                block * Q8_BLOCK_ELEMENTS,
-                lane_start
-            );
+            partial += matrix_dot_q8_chunk(input_block, row_q8, lane_start);
+            input_block += Q8_BLOCK_ELEMENTS;
+            row_q8 += Q8_BLOCK_BYTES;
         }
     }
     return simd_sum(partial);
@@ -252,17 +244,30 @@ kernel void metal_step_qk_norm_rope(
     const device half *rope_sin [[buffer(5)]],
     device half *key_cache [[buffer(6)]],
     constant QkConfig &config [[buffer(7)]],
-    uint head [[thread_position_in_grid]]) {
+    uint gid [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    uint head = gid / METAL_STEP_SIMD_WIDTH;
     uint half_dim = config.head_dim / 2;
     if (head < config.query_heads) {
         uint start = head * config.head_dim;
-        float sum = 0.0f;
-        for (uint i = 0; i < config.head_dim; ++i) {
-            float value = (float)query[start + i];
-            sum += value * value;
+        float inv = 0.0f;
+        if (lane == 0) {
+            float sum = 0.0f;
+            for (uint i = 0; i < config.head_dim; i += 4) {
+                half4 q4 = *reinterpret_cast<const device half4 *>(query + start + i);
+                float v0 = (float)q4.x;
+                float v1 = (float)q4.y;
+                float v2 = (float)q4.z;
+                float v3 = (float)q4.w;
+                sum += v0 * v0;
+                sum += v1 * v1;
+                sum += v2 * v2;
+                sum += v3 * v3;
+            }
+            inv = rsqrt(sum / (float)config.head_dim + config.epsilon);
         }
-        float inv = rsqrt(sum / (float)config.head_dim + config.epsilon);
-        for (uint i = 0; i < half_dim; ++i) {
+        inv = simd_broadcast(inv, 0);
+        for (uint i = lane; i < half_dim; i += METAL_STEP_SIMD_WIDTH) {
             half first = (half)((float)query[start + i] * inv * (float)query_weight[i]);
             half second = (half)((float)query[start + half_dim + i] * inv * (float)query_weight[half_dim + i]);
             half cosine = rope_cos[i];
@@ -273,13 +278,24 @@ kernel void metal_step_qk_norm_rope(
     }
     if (head < config.kv_heads) {
         uint start = head * config.head_dim;
-        float sum = 0.0f;
-        for (uint i = 0; i < config.head_dim; ++i) {
-            float value = (float)key[start + i];
-            sum += value * value;
+        float inv = 0.0f;
+        if (lane == 0) {
+            float sum = 0.0f;
+            for (uint i = 0; i < config.head_dim; i += 4) {
+                half4 k4 = *reinterpret_cast<const device half4 *>(key + start + i);
+                float v0 = (float)k4.x;
+                float v1 = (float)k4.y;
+                float v2 = (float)k4.z;
+                float v3 = (float)k4.w;
+                sum += v0 * v0;
+                sum += v1 * v1;
+                sum += v2 * v2;
+                sum += v3 * v3;
+            }
+            inv = rsqrt(sum / (float)config.head_dim + config.epsilon);
         }
-        float inv = rsqrt(sum / (float)config.head_dim + config.epsilon);
-        for (uint i = 0; i < half_dim; ++i) {
+        inv = simd_broadcast(inv, 0);
+        for (uint i = lane; i < half_dim; i += METAL_STEP_SIMD_WIDTH) {
             half first = (half)((float)key[start + i] * inv * (float)key_weight[i]);
             half second = (half)((float)key[start + half_dim + i] * inv * (float)key_weight[half_dim + i]);
             half cosine = rope_cos[i];

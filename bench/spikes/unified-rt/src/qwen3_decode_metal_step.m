@@ -554,7 +554,9 @@ static void encode_qk_norm_rope_offset(
         (uint32_t)context->bucket, (uint32_t)position
     };
     [encoder setBytes:&config length:sizeof(config) atIndex:7];
-    [encoder dispatchThreads:grid_size(MAX(context->query_heads, context->kv_heads)) threadsPerThreadgroup:group_size(MAX(context->query_heads, context->kv_heads))];
+    // One simdgroup owns each independent head; lane zero preserves the exact
+    // ascending norm reduction while all lanes split independent output pairs.
+    [encoder dispatchThreads:grid_size(MAX(context->query_heads, context->kv_heads) * 32) threadsPerThreadgroup:group_size(256)];
     [encoder endEncoding];
 }
 
