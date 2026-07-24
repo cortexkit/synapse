@@ -19,7 +19,11 @@ use synapse_core::{
 mod runtime;
 
 pub const ENGINE_VERSION: &str = "owned-metal-v1";
-pub const GRAPH_REVISION: u32 = 3;
+// Bump whenever a compiled MPSGraph changes structure (ops added, removed, or reordered).
+// The revision is part of both the explicit-executable package cache key and the engine
+// identity, so raising it invalidates stale cached executables that still encode the old
+// graph and moves the provenance fingerprint to match the new one.
+pub const GRAPH_REVISION: u32 = 4;
 pub const BUCKET_POLICY_VERSION: u32 = 1;
 pub const DEFAULT_ATTENTION_UNITS: usize = 4_000_000;
 #[cfg(target_os = "macos")]

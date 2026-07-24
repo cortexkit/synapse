@@ -14,7 +14,7 @@ mod modernbert;
 #[path = "qwen3.rs"]
 mod qwen3;
 
-pub(crate) const GRAPH_REVISION: u32 = 3;
+pub(crate) const GRAPH_REVISION: u32 = 4;
 pub(crate) const BUCKET_POLICY_VERSION: u32 = 1;
 const BUCKET_MAX_BATCH_ROWS: usize = 8;
 const BUCKET_SEQUENCE_LADDER: &[usize] = &[64, 96, 128, 160, 192, 256, 320, 384, 448, 512];

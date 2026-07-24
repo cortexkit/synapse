@@ -385,16 +385,37 @@ static ModernBertPlan *modernbert_plan_new(
         query = modernbert_rope(plan->graph, query, cosine, sine, data_type);
         key = modernbert_rope(plan->graph, key, cosine, sine, data_type);
         if (index == 0) { [debug_outputs addObject:query]; [debug_names addObject:@"query-rope"]; }
-        key = [plan->graph transposeTensor:key dimension:2 withDimension:3 name:nil];
-        MPSGraphTensor *scores = modernbert_matmul(plan->graph, query, key, data_type);
-        scores = modernbert_cast(plan->graph, scores, MPSDataTypeFloat32);
-        scores = [plan->graph multiplicationWithPrimaryTensor:scores secondaryTensor:scale name:nil];
         MPSGraphTensor *mask = sliding ? plan->local_mask_tensor : plan->full_mask_tensor;
-        scores = [plan->graph additionWithPrimaryTensor:scores secondaryTensor:mask name:nil];
-        scores = [plan->graph softMaxWithTensor:scores axis:3 name:nil];
-        if (index == 0) { [debug_outputs addObject:scores]; [debug_names addObject:@"softmax"]; }
-        scores = modernbert_cast(plan->graph, scores, data_type);
-        MPSGraphTensor *context = modernbert_matmul(plan->graph, scores, value, data_type);
+        MPSGraphTensor *context = nil;
+        if (@available(macOS 15.0, *)) {
+            // Fused scaled-dot-product attention: MPSGraph merges scale, mask add, softmax and
+            // the value matmul into one kernel instead of materializing the [B,H,S,S] score
+            // tensor. Q/K/V are cast to f32 for the fused op and the context is cast back to the
+            // graph dtype, so downstream ops are unchanged. The additive mask (full or local
+            // sliding-window) feeds the fused op directly, preserving ModernBERT's alternating
+            // global/local attention; layer 0 has no attention norm in either branch.
+            MPSGraphTensor *sdpa_query = modernbert_cast(plan->graph, query, MPSDataTypeFloat32);
+            MPSGraphTensor *sdpa_key = modernbert_cast(plan->graph, key, MPSDataTypeFloat32);
+            MPSGraphTensor *sdpa_value = modernbert_cast(plan->graph, value, MPSDataTypeFloat32);
+            context = [plan->graph scaledDotProductAttentionWithQueryTensor:sdpa_query
+                                                                  keyTensor:sdpa_key
+                                                                valueTensor:sdpa_value
+                                                                 maskTensor:mask
+                                                                      scale:(float)attention_scale
+                                                                       name:nil];
+            context = modernbert_cast(plan->graph, context, data_type);
+            if (index == 0) { [debug_outputs addObject:context]; [debug_names addObject:@"softmax"]; }
+        } else {
+            key = [plan->graph transposeTensor:key dimension:2 withDimension:3 name:nil];
+            MPSGraphTensor *scores = modernbert_matmul(plan->graph, query, key, data_type);
+            scores = modernbert_cast(plan->graph, scores, MPSDataTypeFloat32);
+            scores = [plan->graph multiplicationWithPrimaryTensor:scores secondaryTensor:scale name:nil];
+            scores = [plan->graph additionWithPrimaryTensor:scores secondaryTensor:mask name:nil];
+            scores = [plan->graph softMaxWithTensor:scores axis:3 name:nil];
+            if (index == 0) { [debug_outputs addObject:scores]; [debug_names addObject:@"softmax"]; }
+            scores = modernbert_cast(plan->graph, scores, data_type);
+            context = modernbert_matmul(plan->graph, scores, value, data_type);
+        }
         context = [plan->graph transposeTensor:context permutation:@[ @0, @2, @1, @3 ] name:nil];
         context = [plan->graph reshapeTensor:context withShape:plan->hidden_2d_shape name:nil];
         if (index == 0) { [debug_outputs addObject:context]; [debug_names addObject:@"context"]; }

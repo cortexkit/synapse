@@ -942,7 +942,7 @@ async fn embed_query_loaded_owned_metal_carries_distinct_provenance_and_content_
     );
     assert_eq!(
         result["provenance"]["engine"]["build_flags"]["graph_revision"],
-        "3"
+        "4"
     );
     assert_eq!(
         result["provenance"]["engine"]["build_flags"]["bucket_policy"],
