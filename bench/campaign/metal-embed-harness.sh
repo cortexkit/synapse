@@ -26,7 +26,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
-BASELINE_TOK_S = 18_500.348537591875
+BASELINE_TOK_S = 19_683.000545618823
 CORPUS_SHA256 = "25d1d54427030d94c882dd96a5f5d26bfda426d902028e75aa8c3d527e34a7a7"
 REFERENCE_VECTORS_SHA256 = "d55221d41098aa293507c734ebedbf2df7f095c5e7c767943167403bbb520afd"
 MODEL_REVISION = "e7f32e3c00f91d699e8c43b53106206bcc72bb22"
@@ -1071,7 +1071,7 @@ def run_harness(workspace_arg: str, runner_arg: str, result_arg: str) -> int:
     power: Dict[str, Any] = {"power_source": "unknown", "battery_percent": None, "output": "<not run>"}
     toolchain: Dict[str, Any] = {"developer_dir": DEVELOPER_DIR, "metal_compiler": "<not run>"}
     baseline_note = (
-        f"gte-modernbert-base f16 Metal fresh locked-M1 baseline: {BASELINE_TOK_S:.4f} tok/s. "
+        f"gte-modernbert-base f16 Metal fused-SDPA (campaign #1 winner) locked-M1 baseline: {BASELINE_TOK_S:.4f} tok/s. "
         f"Protocol: N={PROCESS_RUNS} runs x {FRESH_PROCESSES_PER_RUN} fresh processes, "
         f"{PASSES_PER_PROCESS - WARMUP_PASSES} timed passes after one discarded warmup per process, "
         "worse-of-two per run."

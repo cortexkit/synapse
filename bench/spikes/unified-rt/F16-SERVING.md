@@ -35,7 +35,9 @@ quality floor is mean cosine `>= 0.9999` and worst-decile top-10 rank overlap
 `>= 0.97`; any parity, dimensionality, finite/nonzero, or determinism failure
 rejects the speed result.
 
-The fresh locked-M1 campaign baseline is **18,500.3485 tok/s** (median of the
+The original fresh locked-M1 campaign baseline (the pre-winner bar; see the
+campaign #1 result below for the current baseline) is **18,500.3485 tok/s**
+(median of the
 36 worse-of-two steady samples), recorded in
 `results/metal-embed-campaign/m1-baseline.json`. The run used
 `[bench-host]` (Apple M1 Max), acquired and released
@@ -48,6 +50,69 @@ locked-M1 campaign bar. The same-session MLX Python cell was skipped because
 `/tmp/synapse-mlx-minilm-venv/bin/python` was absent on the M1. The optional
 llama-server cell was also skipped because no lane-specific command/model was
 configured.
+
+### Campaign #1 result: fused scaled-dot-product attention (integrated)
+
+Embedding campaign #1 (`[consult-id]`, harness
+`gte-modernbert-f16-metal-embed`) hit `time_budget_exhausted` mid-round-1, but
+its one fully-measured proposal was a clean gated WIN, promoted inside the round
+before the clock ran out. The winner is **proposal_bcc9cf06** "Fused
+scaled-dot-product attention for ModernBERT Metal encoder prefill"
+(slot0:anthropic/claude-fable-5).
+
+Mechanism: the encoder's materialized-score attention chain (transpose -> matmul
+-> cast f32 -> scale -> mask add -> softmax -> cast back -> PV matmul) is
+replaced with MPSGraph's fused `scaledDotProductAttentionWithQueryTensor:...`
+op. The fused path is `@available(macOS 15.0, *)`-guarded; Q, K, and V are cast
+to f32 for the fused op and the context is cast back to the graph dtype. The
+additive mask (full or local sliding-window) feeds the fused op directly, so
+ModernBERT's alternating global/local attention is preserved. The pre-macOS-15
+materialized-score chain is retained verbatim in the `else` branch as the safety
+net, and both branches compile against the current SDK.
+
+In-block measurement on the locked M1 (full 6x2 interleaved block, harness
+quality battery run per sample side): candidate median **19,677.8 tok/s** vs
+paired control median **18,533.1 tok/s** = **+6.2%** (bootstrap CI
+[+6.12%, +6.32%], `target_met: true`, `promoted: true`).
+
+M1 confirmation for this integration (this branch, harness
+`17dd612a...`-pinned, fixtures digest-pinned, AC power, no `Runner.Worker`,
+one-minute load < 2.5): baseline tree at `a2d4fdf` median **18,502.5549 tok/s**
+vs patched tree median **19,683.0005 tok/s** = **+6.38%** (36 worse-of-two steady
+samples per side). The full quality battery passed on the patched tree: mean
+cosine floor `0.999999071` (>= 0.9999), worst-decile top-10 rank overlap floor
+`0.97500` (>= 0.97), byte-identical same-process determinism repeat, and
+finite/nonzero 768-wide vectors. The baseline tree reproduced the frozen
+18,500.3485 tok/s bar to 0.01%, evidencing a drift-free box. The fused path is
+confirmed executing at runtime (macOS 26.5 on the M1) by the reproduced speedup.
+
+The new locked-M1 campaign baseline is therefore **19,683.000545618823 tok/s**
+(the M1-confirmed patched median). The registration baseline in
+`.cortexkit/campaign-lab.jsonc` is bumped to this value, and the harness
+`BASELINE_TOK_S` constant plus its `harness_sha256` pin move together with it
+(harness `41e1ba34e7bc02860b39cff1d68241244367a7d6406f41a7f5fd5d90ff3dc118`),
+keeping the harness's pinned-baseline consistency check satisfied.
+
+The campaign's other four proposals died unmeasured when the budget exhausted;
+they are the seed material for the next embedding campaign:
+
+1. **Compile encoder MPSGraph executables at optimization level 1 instead of O0**
+   (slot1:anthropic/claude-opus-4-8) — raise the explicit-executable compile
+   level so MPSGraph fuses/reduces the 22-layer graph; watch the package-cache
+   reuse branch that can silently keep an O0 package.
+2. **Compile explicit MPSGraph executables at O1 with a separate cache identity**
+   (slot4:alibaba-token-plan/qwen3.8-max-preview) — the same O1 lever with a
+   distinct package suffix to avoid stale O0 executables (forces a one-time
+   recompile).
+3. **Cache bucket-owned RoPE feeds and accelerate additive mask construction**
+   (slot2:openai/gpt-5.6-sol) — reuse the lifetime-stable bucket RoPE storage
+   through the static Metal-buffer cache and stop reallocating/copying the four
+   immutable RoPE tables per batch; mask/RoPE bytes unchanged (low parity risk).
+4. **Broadcast reformulation of the attention masks**
+   (slot3:kimi-for-coding/k3) — kill the O(batch*seq^2) CPU mask build and the
+   16.8MB/batch mask feeds by deriving the key-padding mask from key position
+   alone; estimated 2-6%, needs a package-cache clear / GRAPH_REVISION bump for
+   the changed placeholder shapes.
 
 ### First-campaign steering inventory
 
