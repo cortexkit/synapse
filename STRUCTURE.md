@@ -92,9 +92,9 @@
 - Key files: `bench/run-matrix.sh`, `bench/NOTES.md`
 
 **bench/campaign/:**
-- Purpose: Verification harness and campaign fixtures for decode models.
-- Contains: Locked sandboxed campaign controller script, prompt/reference fixtures, signature validation checks, and diagnostic logs/failure scenes.
-- Key files: `bench/campaign/decode-harness.sh`, `bench/campaign/metal-step-harness.sh`, `bench/campaign/cuda-quant-harness.sh`, `bench/campaign/README.md`
+- Purpose: Verification harness and campaign fixtures for decode models and embedding backends.
+- Contains: Locked sandboxed campaign controller scripts, prompt/reference fixtures, signature validation checks, and diagnostic logs/failure scenes.
+- Key files: `bench/campaign/decode-harness.sh`, `bench/campaign/metal-step-harness.sh`, `bench/campaign/cuda-quant-harness.sh`, `bench/campaign/lfm2-cuda-harness.sh`, `bench/campaign/metal-embed-harness.sh`, `bench/campaign/README.md`
 
 
 **bench/harness/:**
@@ -109,8 +109,8 @@
 
 **bench/spikes/:**
 - Purpose: Holds discrete architecture experimentation paths and new backend developments.
-- Contains: `unified-rt` (CUDA/Vulkan/M1 exact-match execution, including direct Metal step kernels) and `ane-minilm` (Apple Neural Engine CoreML conversion) spikes.
-- Key files: `bench/spikes/unified-rt/src/main.rs`, `bench/spikes/unified-rt/src/vulkan_backend.rs`, `bench/spikes/unified-rt/src/cuda_backend.rs`, `bench/spikes/unified-rt/src/lfm2.rs`, `bench/spikes/unified-rt/src/lfm2_audio.rs`, `bench/spikes/unified-rt/src/lfm2_decode.rs`, `bench/spikes/unified-rt/src/qwen3_decode.rs`, `bench/spikes/unified-rt/src/qwen3_decode_metal_step.rs`
+- Contains: `unified-rt` (CUDA/Vulkan/M1 exact-match execution, including direct Metal step kernels and Vulkan Qwen3 decode) and `ane-minilm` (Apple Neural Engine CoreML conversion) spikes.
+- Key files: `bench/spikes/unified-rt/src/main.rs`, `bench/spikes/unified-rt/src/vulkan_backend.rs`, `bench/spikes/unified-rt/src/cuda_backend.rs`, `bench/spikes/unified-rt/src/lfm2.rs`, `bench/spikes/unified-rt/src/lfm2_audio.rs`, `bench/spikes/unified-rt/src/lfm2_decode.rs`, `bench/spikes/unified-rt/src/qwen3_decode.rs`, `bench/spikes/unified-rt/src/qwen3_decode_vulkan.rs`, `bench/spikes/unified-rt/src/qwen3_decode_metal_step.rs`
 
 **bench/eval-coir/:**
 - Purpose: Hosts the CoIR retrieval and rerank quality evaluation harness.
@@ -156,7 +156,7 @@
 - `crates/synapse-module/src/bin/inline_embed_throughput.rs`: Batch throughput execution client.
 - `bench/harness/src/main.rs`: CLI runner for corpus generation, power wrapper execution, and parity check.
 - `bench/lanes/*/src/main.rs` (Rust), `bench/lanes/mlx-minilm/main.py` (Python), `bench/lanes/ts-embed/main.mjs` (JS), `bench/lanes/potion/main.py` (Python): Main executables for each specific runtime lane.
-- `bench/campaign/decode-harness.sh`, `bench/campaign/metal-step-harness.sh`, `bench/campaign/cuda-quant-harness.sh`: Campaign controller scripts.
+- `bench/campaign/decode-harness.sh`, `bench/campaign/metal-step-harness.sh`, `bench/campaign/cuda-quant-harness.sh`, `bench/campaign/lfm2-cuda-harness.sh`, `bench/campaign/metal-embed-harness.sh`: Campaign controller scripts.
 - `bench/eval-coir/prepare.py`: Downloads and structures datasets for retrieval tasks.
 - `bench/eval-coir/score.py`: Computes retrieval quality metrics on generated vectors.
 - `bench/run-matrix.sh`: Global benchmark suite runner.
@@ -198,6 +198,7 @@
 - `bench/spikes/unified-rt/src/lfm2_audio.rs`: Mel-spectrogram DSP frontend, FastConformer speech encoder, and audio projector.
 - `bench/spikes/unified-rt/src/lfm2_decode.rs`: Causal decoding logic for LFM2 hybrid backbone models.
 - `bench/spikes/unified-rt/src/qwen3_decode.rs`: Fast Metal decode optimizations for Qwen3-0.6B f16.
+- `bench/spikes/unified-rt/src/qwen3_decode_vulkan.rs`: Vulkan Qwen3 decode backend implementation using serial RMSNorm reduction and SPIR-V compute shaders.
 - `bench/spikes/unified-rt/src/qwen3_decode_metal_step.rs`: Custom direct Metal Qwen3 single-token decode step execution bypassing MPSGraph.
 
 **Tests:**

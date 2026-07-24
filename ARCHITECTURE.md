@@ -64,7 +64,7 @@
 **Native Engine Inference Lanes:**
 - Purpose: Execute in-memory tokenization, tensor forward passes, and pooling over target platforms.
 - Location: `bench/lanes/ort-embed`, `bench/lanes/mlx`, `bench/lanes/burn`, `bench/lanes/mlx-minilm`, `bench/lanes/ts-embed`, `bench/lanes/potion`, `bench/spikes/unified-rt`
-- Contains: Bounded-thread ONNX Runtime embedding logic, Metal-accelerated MLX custom model implementations, unified-rt candidate implementations (Vulkan cooperative-matrix/plain shaders on RDNA3 with device-local memory staging and budget validation, CUDA cuBLASLt fused graphs and fused QK norm RoPE single-launch kernels on NVIDIA, Metal graph execution optimization levels O0/O1, package caching, and custom direct Metal decode step kernels with opt-in multi-token GPU command buffer chaining in `bench/spikes/unified-rt/src/qwen3_decode_metal_step.rs`), LFM2 hybrid causal backbone, LFM2-Audio ASR speech encoder (FastConformer and Slaney mel filterbank frontend), Qwen3-0.6B f16 Metal decode throughput optimizations, WGPU-based Burn ONNX imports, python-based MLX community/source loading, Model2Vec static embedding (`potion-code-16M`), and TypeScript setups.
+- Contains: Bounded-thread ONNX Runtime embedding logic, Metal-accelerated MLX custom model implementations, unified-rt candidate implementations (Vulkan cooperative-matrix/plain shaders on RDNA3 with device-local memory staging, budget validation, and Qwen3 Vulkan decode execution with serial RMSNorm reduction in `bench/spikes/unified-rt/src/qwen3_decode_vulkan.rs`, CUDA cuBLASLt fused graphs and fused QK norm RoPE single-launch kernels on NVIDIA, Metal graph execution optimization levels O0/O1, package caching, and custom direct Metal decode step kernels with opt-in multi-token GPU command buffer chaining in `bench/spikes/unified-rt/src/qwen3_decode_metal_step.rs`), LFM2 hybrid causal backbone, LFM2-Audio ASR speech encoder (FastConformer and Slaney mel filterbank frontend), Qwen3-0.6B f16 Metal decode throughput optimizations, WGPU-based Burn ONNX imports, python-based MLX community/source loading, Model2Vec static embedding (`potion-code-16M`), and TypeScript setups.
 - Depends on: `bench/harness` or `bench/rig`, target runtime libraries (`ort`, `mlx-rs`, `vulkano`, `cudarc`), and `tokenizers`.
 - Used by: The benchmark suite runners `bench/run-matrix.sh` and `bench/run-night.sh`.
 
@@ -113,16 +113,16 @@
 **Management Call Utility (`subc-call`):**
 - Purpose: Send raw method calls and JSON params to any module over the fleet daemon.
 - Location: `crates/synapse-module/src/bin/subc_call.rs`
-- Contains: Direct IPC client call wrapping and formatted envelope printing.
+- Contains: Direct IPC client call wrapping, `--identity` override flag support for stamping chair-verb credentials on consumer binds, and formatted envelope printing.
 - Depends on: `subc-client-rs`, `tokio`, `serde_json`.
 - Used by: Developers and scripts executing low-level management surface functions.
 
-**Decode Campaign Harness:**
-- Purpose: Execute and coordinate the sandboxed Athena V3 single-stream decode campaign.
+**Campaign Harnesses:**
+- Purpose: Execute and coordinate sandboxed evaluation campaigns (single-stream decode, Metal direct step, CUDA quantization, LFM2 CUDA Q8, and Metal embedding).
 - Location: `bench/campaign`
 - Contains: Integrity validation of model snapshots, fixtures, and target runners; deterministic verification of intervention hooks; candidate-owned temporary workspace staging and build output/target directories; toolchain environment forwarding (`RUSTUP_HOME`, `CARGO_HOME`); split-stream append-mode logging (`.log` and `.log.stderr`); and failure scene preservation.
 - Depends on: `spike-unified-rt` runner.
-- Used by: Automated evaluation gates to confirm decode performance and correctness.
+- Used by: Automated evaluation gates to confirm decode and embedding performance and correctness.
 
 
 ## Data Flow
@@ -374,17 +374,17 @@
 **Management Surface SubC Caller (`subc-call`):**
 - Location: `crates/synapse-module/src/bin/subc_call.rs`
 - Triggers: Execution of the `subc_call` binary.
-- Responsibilities: Connects to fleet daemon and sends management calls directly to target modules.
+- Responsibilities: Connects to fleet daemon and sends management calls directly to target modules (supporting `--identity` override for chair-only wire ops).
 
 **Inline Embedding Throughput Client (`inline_embed_throughput`):**
 - Location: `crates/synapse-module/src/bin/inline_embed_throughput.rs`
 - Triggers: Execution of `inline_embed_throughput` binary.
 - Responsibilities: Evaluates local batch throughput and query concurrency/latencies under load.
 
-**Athena V3 Decode Campaign Harness:**
-- Location: `bench/campaign/decode-harness.sh`
-- Triggers: Invocation of `decode-harness.sh` by an evaluation runner.
-- Responsibilities: Manages snapshot validation, locked candidate execution sandbox, candidate-owned workspace staging, toolchain environment forwarding, correctness verification, split-stream append-mode logging, failure scene preservation, and performance evaluation.
+**Campaign Harnesses:**
+- Location: `bench/campaign/decode-harness.sh`, `bench/campaign/metal-step-harness.sh`, `bench/campaign/lfm2-cuda-harness.sh`, `bench/campaign/metal-embed-harness.sh`
+- Triggers: Invocation of campaign harness scripts by evaluation runners.
+- Responsibilities: Manage snapshot validation, locked candidate execution sandbox, candidate-owned workspace staging, toolchain environment forwarding, correctness verification, split-stream append-mode logging, failure scene preservation, and performance evaluation.
 
 
 ## Error Handling
