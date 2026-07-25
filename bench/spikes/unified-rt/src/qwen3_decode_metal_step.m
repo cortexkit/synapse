@@ -618,8 +618,10 @@ static void encode_matvec_residual(
     };
     [encoder setBytes:&config length:sizeof(config) atIndex:5];
     // F16 uses one lane per independent output row; the row dot itself stays
-    // serial. Q8 uses all 32 lanes per row for its explicitly allowed reduction.
-    NSUInteger matvec_threads = context->quantized ? (NSUInteger)output_width * 32 : output_width;
+    // serial. Q8 packs four independent rows into each 32-lane simdgroup,
+    // eight sub-lanes per row, each row still reduced by its own simd_sum.
+    NSUInteger matvec_threads =
+        context->quantized ? (NSUInteger)((output_width + 3) / 4) * 32 : output_width;
     [encoder dispatchThreads:grid_size(matvec_threads) threadsPerThreadgroup:group_size(context->quantized ? 256 : output_width)];
     [encoder endEncoding];
 }
@@ -642,7 +644,9 @@ static void encode_residual_rmsnorm(
         (uint32_t)context->hidden, context->epsilon
     };
     [encoder setBytes:&config length:sizeof(config) atIndex:4];
-    [encoder dispatchThreads:grid_size(1) threadsPerThreadgroup:group_size(1)];
+    // One simdgroup: lane zero keeps the exact serial norm reduction while the
+    // remaining lanes split the independent residual and normalize writes.
+    [encoder dispatchThreads:grid_size(32) threadsPerThreadgroup:group_size(32)];
     [encoder endEncoding];
 }
 
@@ -662,7 +666,8 @@ static void encode_gate_up(
         (uint32_t)context->hidden, (uint32_t)context->intermediate, context->quantized, 0
     };
     [encoder setBytes:&config length:sizeof(config) atIndex:6];
-    NSUInteger gate_threads = context->quantized ? context->intermediate * 32 : context->intermediate;
+    NSUInteger gate_threads =
+        context->quantized ? ((context->intermediate + 3) / 4) * 32 : context->intermediate;
     [encoder dispatchThreads:grid_size(gate_threads) threadsPerThreadgroup:group_size(context->quantized ? 256 : context->intermediate)];
     [encoder endEncoding];
 }
@@ -679,7 +684,9 @@ static void encode_lm_head(Qwen3MetalStepContext *context, id<MTLCommandBuffer> 
     [encoder setBytes:&config length:sizeof(config) atIndex:4];
     // The large f16 vocabulary projection is row-parallel: each physical
     // lane owns one full serial dot, avoiding any accumulation reordering.
-    NSUInteger lm_head_threads = context->quantized ? context->vocab * 32 : context->vocab;
+    // Q8 packs four vocabulary rows per simdgroup, eight sub-lanes each.
+    NSUInteger lm_head_threads =
+        context->quantized ? ((context->vocab + 3) / 4) * 32 : context->vocab;
     [encoder dispatchThreads:grid_size(lm_head_threads) threadsPerThreadgroup:group_size(context->quantized ? 256 : context->vocab)];
     [encoder endEncoding];
 }

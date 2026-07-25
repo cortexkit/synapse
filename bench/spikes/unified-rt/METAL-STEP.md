@@ -1,6 +1,6 @@
 # Metal custom decode step
 
-Status: **wave 6 GPU-chained multi-token decode remains a token-exact banked correctness win below its 3% shipping bar; campaign 4b now ships three order-preserving Q8 winners at 103.6292 tok/s on the locked M1, with the Q8 baseline re-pinned accordingly**.
+Status: **wave 6 GPU-chained multi-token decode remains a token-exact banked correctness win below its 3% shipping bar; decode campaign 5 now ships two order-preserving Q8 winners (simdgroup RMSNorm + pack-four-rows) at 149.4006 tok/s on the locked M1, with the Q8 baseline re-pinned accordingly. The faster full-simdgroup Q8-dot variant was measured but held back: it reorders one row's serial f32 accumulation and is exact only by sample luck, not by the proven construction invariant.**
 The default Qwen3 decode backend remains `mpsgraph`. Select the custom path with
 `--decode-backend metal-step`. The chained span is `SYNAPSE_METAL_STEP_CHAIN_K`
 (default 1 = the fully instrumented per-token path, byte-identical to the
@@ -313,6 +313,119 @@ R2 opens the address-arithmetic seam for the next measured pass. The obvious
 follow-up is LM-head stride hoisting: apply the same row-base/pointer-walk
 analysis to the 151k-row LM head, with its own exactness and depth gates rather
 than assuming the GEMV result transfers.
+
+## Campaign 5 (decode-5): two composition-verified winners
+
+Campaign `[consult-id]` (harness
+`qwen3-0.6b-q8-metal-step-decode`) closed with three promoted proposals but a
+messy terminal: "exploration failed after round 3: rig_unstable; winner from
+round 1 stands." Round 3 hit `invalid_control_drift` / `rig_unstable`, so the
+driver could no longer trust its round-3 control and fell back to the round-1
+winner. That fallback reflects the driver's loss of confidence in the round-3
+control, **not** a refutation of the round-2 measurements, which ran under a
+valid control. This integration therefore re-measured every relevant tree from
+scratch on the M1 authority box to settle what actually ships.
+
+The control was the campaign-4b three-winner tree at **103.6292 tok/s Q8_0**
+(the frozen base; the two decode source files were untouched on master since
+that pin). The M1 authority run used AC power (100% charged), an exclusive
+`[bench-user-home]/bench.lock`, no `Runner.Worker`, loadavg under 2.5, 12 stride-seven
+prompts, two fresh processes per prompt, and the worse repeat per prompt — the
+same harness protocol as campaign 4b. The fresh base control reproduced
+**103.6363 tok/s** (+0.007% vs the pinned 103.6292), so the box was stable and
+the campaign's round-3 drift was a transient rig condition, not a persistent
+bias.
+
+### Promoted mechanisms and provenance
+
+1. **R1 — simdgroup-parallel residual RMSNorm** (round-1 winner,
+   proposal `proposal_51be1c7e34f98431ad43b70fd6c27853dab5e3e9b4fb9033d877dbbb12489eea`,
+   patch digest `2d39878b390a8561acdb3e46d653cb0c6ca79c5699fb907b8b71a89ad4350251`).
+   Lane zero keeps the exact serial ascending sum-of-squares for the residual
+   add; the inverse norm is then broadcast with `simd_max` (an exact bit-preserving
+   broadcast because every other lane holds zero), and the 32 lanes split the
+   independent per-element residual store and normalize writes. No single
+   reduction is split, so every stored half is bit-identical to the one-thread
+   form. The campaign measured **+17.23%** vs the frozen base; the fresh M1 tree
+   measured **+16.95%** (121.2064 tok/s).
+2. **R2A — full-simdgroup Q8 dot** (round-2 winner A,
+   proposal `proposal_cc0b68ad682efca05520a250cd9ce56e9ca793ed92094399a71f885d4928de02`,
+   patch digest `df9956d88d64a1e68d250be2ae62b4e2d92a1ba8548fd03641ea94d2ea593722`).
+   Spreads four consecutive blocks of the *same* row across all 32 lanes per
+   GEMV iteration (lanes `8*b..8*b+7` own block `b`'s eight char4 slices), then
+   recombines with `simd_sum`. The campaign measured **+34.85%** vs the round-2
+   control (base + R1); the fresh M1 tree measured **+34.7%** over A (163.3018
+   tok/s). **Held back — see the composition verdict below.**
+3. **R2B — pack four independent Q8 rows per simdgroup** (round-2 promoted B,
+   proposal `proposal_6551db5af8474f98cf79e7e80f3a3f3def65f7648ac97c82cc909de5aa8ba44e`,
+   patch digest `4dda94d3ed9d40035299adb66a16e9f1d71953f206128a4a4a68276665670959`).
+   Fills the 24 idle lanes with three more independent rows: lanes `[8g, 8g+8)`
+   own row `row_base + g`, each row still reduced by its own `simd_sum` over a
+   32-lane vector whose other 24 entries are exactly zero. Because the nonzero
+   window only shifts by whole aligned octets, each row's reduction network and
+   f32 addition order are identical to the single-row-per-simdgroup form. The
+   campaign measured **+23.28%** vs the same round-2 control; the fresh M1 tree
+   measured **+23.3%** over A (149.4006 tok/s). **Shipped.**
+
+### Locked-M1 composition table
+
+All four measured trees passed the complete battery: f16 **20/20** exact against
+the pinned oracle and MPSGraph, Q8 **13/20** exact with median match depth
+**64.0** and zero near-ties, all five hook tests, and 470-token prefill parity
+**64/64**. The Q8 medians below are the worse-of-two fold over 12 fresh
+processes.
+
+| Tree | Mechanism | Q8_0 tok/s | vs fresh base | vs A | Decision |
+| --- | --- | ---: | ---: | ---: | --- |
+| BASE (master, frozen control) | campaign-4b three-winner tree | **103.6363** | — (+0.007% vs pinned 103.6292) | — | fresh control; rig stable |
+| A (BASE + R1) | simdgroup RMSNorm | **121.2064** | **+16.95%** | — | passed; sound by construction |
+| AB (A + R2A) | + full-simdgroup Q8 dot | **163.3018** | **+57.6%** | **+34.7%** | passed the sample gate but **held back: not exact by construction** |
+| AC (A + R2B) | + pack four rows | **149.4006** | **+44.2%** | **+23.3%** | **shipped; new Q8 baseline** (confirmation run 149.3123, −0.06%) |
+
+### Composition verdict
+
+R2A and R2B are **overlapping mechanisms**: both restructure the Q8 GEMV inner
+loop's lane utilization, and they were measured against the same round-2 control
+in parallel. Their percentages are alternatives, not additive — AB and AC each
+replace the same idle-lane gap with a different strategy, so AB+C was never
+attempted (the two patches rewrite the same inner loop and would collide).
+
+The deciding factor is exactness **by construction**, not the sample gate. The
+three-backend-proven invariant is: never reorder one dot product's serial f32
+accumulation.
+
+- **R2B (shipped)** keeps every row's accumulation intact. Each row is still
+  reduced by one `simd_sum` over its own eight lane partials (each a serial
+  ascending walk over all blocks, byte-identical to the base loop); packing four
+  rows per simdgroup only moves that nonzero eight-lane window to a different
+  aligned octet, with zeros filling the rest. The reduction order is unchanged,
+  so the result is bit-exact for every input, not just the fixture sample.
+- **R2A (held back)** splits one row's blocks across four lane-groups (lane
+  `(b,s)` accumulates blocks `{b, b+4, b+8, …}` of slice `s`) and then reduces
+  the 32 regrouped partials with `simd_sum`. That is a different per-lane
+  grouping **and** a different cross-lane reduction than the base, so it
+  reorders one row's serial f32 accumulation. It passed the 20/20 + 470-depth
+  sample gate here, but only because those particular prompts never flip an
+  argmax under the reordered rounding — empirical luck, not the proven
+  guarantee. A different prompt, depth, or model could diverge. It is therefore
+  held back as a banked negative despite being the fastest measured tree.
+
+The shipped tree is **AC**: the best gated tree that preserves the exactness
+invariant by construction. The new pinned Q8 baseline is **149.4006 tok/s**
+(149.40055088500486), re-pinned in the harness, `campaign-lab.jsonc`, and
+`harness_sha256` together.
+
+### Round-3 rig note (for the record)
+
+Round 3 died to `invalid_control_drift` / `rig_unstable`. The fresh base control
+here reproduced the pinned 103.6292 to +0.007%, so the round-3 drift was a
+transient rig condition (the box had absorbed ~4h of campaign hammering; this
+integration waited for loadavg to fall below 2.5 and confirmed AC power and no
+thermal warnings before measuring). The round-2 measurements — which ran under a
+valid control — are corroborated by these fresh runs: R1 +16.95% (campaign
++17.23%), R2A +34.7% over A (campaign +34.85%), R2B +23.3% over A (campaign
++23.28%). The driver's "winner from round 1 stands" line understated the
+available, sound win: R1 + R2B composes to **+44.2%** and is what now ships.
 
 ## Wave 6 GPU-chained multi-token decode
 
