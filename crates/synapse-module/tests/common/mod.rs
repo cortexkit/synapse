@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
     process,
     sync::atomic::{AtomicU64, Ordering},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use serde_json::Value;
@@ -24,7 +24,15 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub fn unique_temp_dir(label: &str) -> PathBuf {
     let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("{label}-{}-{n}", process::id()))
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is before the Unix epoch")
+        .as_nanos();
+    // Windows can keep a child process's SQLite handles open after its test
+    // harness has started termination, so cleanup may leave the old directory.
+    // Include a wall-clock nonce to prevent a later process-ID reuse from
+    // reopening that stale test store.
+    std::env::temp_dir().join(format!("{label}-{}-{n}-{timestamp}", process::id()))
 }
 
 pub async fn connect_consumer(connection_file_path: &Path) -> TcpStream {

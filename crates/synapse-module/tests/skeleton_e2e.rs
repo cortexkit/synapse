@@ -1965,7 +1965,11 @@ async fn quiet_knob_restart_uses_persisted_assignment() {
     )
     .await;
     let lanes = report["result"]["lanes"].as_array().unwrap();
-    assert_eq!(lanes.len(), 2);
+    assert_eq!(
+        lanes.len(),
+        2,
+        "unexpected probe lanes (model_id/engine/fingerprint): {lanes:?}"
+    );
     let current_model_id = report["result"]["active_assignments"][0]["model_id"]
         .as_str()
         .unwrap();
