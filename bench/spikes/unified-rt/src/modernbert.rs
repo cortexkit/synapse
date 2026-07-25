@@ -281,8 +281,7 @@ impl ModernBertModel {
         texts: &[&str],
         shape: Option<BatchShape>,
     ) -> Result<Vec<Vec<f32>>> {
-        let attribution = std::env::var_os("SYNAPSE_EMBED_ATTRIBUTION")
-            .map_or(false, |v| v == "1");
+        let attribution = std::env::var_os("SYNAPSE_EMBED_ATTRIBUTION").map_or(false, |v| v == "1");
         let tokenize_started = std::time::Instant::now();
         let encodings = tokenizer
             .encode_batch(texts.to_vec(), true)
@@ -331,14 +330,18 @@ impl ModernBertModel {
         }
         let mask_ms = mask_started.elapsed().as_secs_f64() * 1000.0;
         if attribution {
-            eprintln!("[synapse-embed-attribution] mask_build batch={batch} seq={seq} ms={mask_ms:.3}");
+            eprintln!(
+                "[synapse-embed-attribution] mask_build batch={batch} seq={seq} ms={mask_ms:.3}"
+            );
         }
 
         let forward_started = std::time::Instant::now();
         let hidden = self.forward(provider, &input_ids, &attention_mask, batch, seq)?;
         let forward_ms = forward_started.elapsed().as_secs_f64() * 1000.0;
         if attribution {
-            eprintln!("[synapse-embed-attribution] forward batch={batch} seq={seq} ms={forward_ms:.3}");
+            eprintln!(
+                "[synapse-embed-attribution] forward batch={batch} seq={seq} ms={forward_ms:.3}"
+            );
         }
 
         let pool_started = std::time::Instant::now();
@@ -351,7 +354,9 @@ impl ModernBertModel {
         }
         let pool_ms = pool_started.elapsed().as_secs_f64() * 1000.0;
         if attribution {
-            eprintln!("[synapse-embed-attribution] pool batch={real_batch} seq={seq} ms={pool_ms:.3}");
+            eprintln!(
+                "[synapse-embed-attribution] pool batch={real_batch} seq={seq} ms={pool_ms:.3}"
+            );
         }
         Ok(vectors)
     }
