@@ -622,6 +622,19 @@ impl Drop for InlineExecutionPermit {
 struct InlineAdmission {
     scheduler: Arc<Mutex<InlineScheduler>>,
     request_bytes: u64,
+    deadline: tokio::time::Instant,
+}
+
+impl InlineAdmission {
+    fn deadline(&self) -> tokio::time::Instant {
+        self.deadline
+    }
+}
+
+#[derive(Clone, Copy)]
+struct InlineWorkBudget {
+    request_bytes: u64,
+    deadline: Option<tokio::time::Instant>,
 }
 
 impl Drop for InlineAdmission {
@@ -803,7 +816,7 @@ enum EmbedBatchItemParam {
     Text(String),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize)]
 struct EmbedBatchItem {
     id: String,
     text: String,
@@ -899,6 +912,8 @@ struct ModelLoadParams {
     #[serde(default)]
     request_key: Option<String>,
     #[serde(default)]
+    deadline_ms: Option<u64>,
+    #[serde(default)]
     model_id: Option<String>,
     #[serde(default)]
     normalize: Option<bool>,
@@ -961,6 +976,8 @@ struct CacheGcParams {
 struct ProbeStartParams {
     #[serde(default)]
     request_key: Option<String>,
+    #[serde(default)]
+    deadline_ms: Option<u64>,
     #[serde(default)]
     models: Vec<String>,
 }
@@ -1345,7 +1362,9 @@ impl RuntimeState {
     ) -> Result<InlineAdmission, WireOperationError> {
         let clock = SystemClock;
         let now = clock.now_ms();
-        let deadline_at = Some(now.saturating_add(deadline_ms.unwrap_or(self.inline.deadline_ms)));
+        let request_budget_ms = deadline_ms.unwrap_or(self.inline.deadline_ms);
+        let deadline_at = Some(now.saturating_add(request_budget_ms));
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(request_budget_ms);
         let max_queue_ms = max_queue_ms.unwrap_or(self.inline.max_queue_ms);
         let predicted_start_delay_ms = if self.execution.available_permits() == 0 {
             self.inline.estimated_execution_ms
@@ -1380,6 +1399,7 @@ impl RuntimeState {
                 Ok(InlineAdmission {
                     scheduler: Arc::clone(&self.scheduler),
                     request_bytes,
+                    deadline,
                 })
             }
             AdmissionDecision::Reject(rejection) => Err(WireOperationError::from_stable(
@@ -1834,6 +1854,28 @@ fn machine_profile_with_overrides(mut machine_profile: MachineProfile) -> Machin
     machine_profile
 }
 
+/// Run storage maintenance from the host's periodic health cadence. Keeping
+/// this work on an existing heartbeat avoids a second timer loop in the module.
+fn run_background_maintenance(state: &ModuleState) {
+    let now = now_ms();
+    if let Err(error) = state.store.purge_expired_jobs(now) {
+        eprintln!("[synapse-maintenance] job purge sweep failed: {error}");
+    }
+    let active_hashes = state
+        .remote_gateway
+        .profiles()
+        .iter()
+        .map(|profile| profile.remote_profile_hash.clone())
+        .collect::<Vec<_>>();
+    if let Err(error) =
+        state
+            .store
+            .sweep_remote_url_bindings(&active_hashes, now, 7 * 24 * 60 * 60 * 1_000)
+    {
+        eprintln!("[synapse-maintenance] URL binding sweep failed: {error}");
+    }
+}
+
 #[async_trait]
 impl ModuleHandler for SynapseHandler {
     async fn on_hello_ack(&self, ack: &ModuleHelloAckBody) {
@@ -1861,6 +1903,7 @@ impl ModuleHandler for SynapseHandler {
         let Some(state) = self.state() else {
             return HealthReport::ok();
         };
+        run_background_maintenance(&state);
         let health = module_health(&state);
         let mut detail_parts = Vec::new();
         if health.certification_stale {
@@ -2433,12 +2476,41 @@ fn begin_background_catalog_load(state: Arc<ModuleState>, model_id: String) {
     }
 }
 
+/// Timeout ceiling for control-path model-load waits. Matches the worker
+/// load timeout (DEFAULT_WORKER_LOAD_TIMEOUT_MS) as the ANE precedent.
+const MODEL_LOAD_CONTROL_TIMEOUT_MS: u64 = DEFAULT_WORKER_LOAD_TIMEOUT_MS;
+
 async fn ensure_model_loaded_for_control(
     state: Arc<ModuleState>,
     model_id: &str,
+    request_deadline_ms: Option<u64>,
+) -> Result<Arc<EmbeddingModel>, WireOperationError> {
+    let timeout_ms = request_deadline_ms.unwrap_or(MODEL_LOAD_CONTROL_TIMEOUT_MS);
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+    let Some(snapshot) = model_slot_snapshot(&state.runtime, model_id) else {
+        return Err(WireOperationError::from_stable(
+            StableError::artifact_invalid(),
+            format!("unknown model_id '{model_id}'"),
+        ));
+    };
+    match (&snapshot.state, snapshot.loaded.clone()) {
+        (ModelRuntimeState::Ready, Some(model)) => Ok(model),
+        (ModelRuntimeState::Failed(error), _) => Err(error.clone()),
+        _ => {
+            begin_background_catalog_load(Arc::clone(&state), model_id.to_string());
+            wait_for_model_loaded(&state.runtime, model_id, deadline, timeout_ms).await
+        }
+    }
+}
+
+async fn wait_for_model_loaded(
+    runtime: &RuntimeState,
+    model_id: &str,
+    deadline: tokio::time::Instant,
+    timeout_ms: u64,
 ) -> Result<Arc<EmbeddingModel>, WireOperationError> {
     loop {
-        let Some(snapshot) = model_slot_snapshot(&state.runtime, model_id) else {
+        let Some(snapshot) = model_slot_snapshot(runtime, model_id) else {
             return Err(WireOperationError::from_stable(
                 StableError::artifact_invalid(),
                 format!("unknown model_id '{model_id}'"),
@@ -2447,19 +2519,24 @@ async fn ensure_model_loaded_for_control(
         match (&snapshot.state, snapshot.loaded.clone()) {
             (ModelRuntimeState::Ready, Some(model)) => return Ok(model),
             (ModelRuntimeState::Failed(error), _) => return Err(error.clone()),
-            (
-                ModelRuntimeState::Resolving
-                | ModelRuntimeState::Downloading { .. }
-                | ModelRuntimeState::Validating
-                | ModelRuntimeState::Loading,
-                _,
-            ) => snapshot.notify.notified().await,
-            _ => {
-                begin_background_catalog_load(Arc::clone(&state), model_id.to_string());
-                snapshot.notify.notified().await;
-            }
+            _ => {}
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero()
+            || tokio::time::timeout(remaining, snapshot.notify.notified())
+                .await
+                .is_err()
+        {
+            return Err(model_load_timeout_error(model_id, timeout_ms));
         }
     }
+}
+
+fn model_load_timeout_error(model_id: &str, timeout_ms: u64) -> WireOperationError {
+    WireOperationError::from_stable(
+        StableError::model_loading(Some(timeout_ms)),
+        format!("timed out waiting for model '{model_id}' to load after {timeout_ms}ms"),
+    )
 }
 
 async fn load_catalog_model_task(
@@ -3169,7 +3246,9 @@ async fn execute_model_load_job(state: Arc<ModuleState>, job_id: String, params:
             ))
         })?;
         set_job_progress(&state.runtime, &job_id, ModelRuntimeState::Loading);
-        let loaded = ensure_model_loaded_for_control(Arc::clone(&state), &spec.model_id).await?;
+        let loaded =
+            ensure_model_loaded_for_control(Arc::clone(&state), &spec.model_id, params.deadline_ms)
+                .await?;
         let result = json!({
             "model_id": loaded.model_id,
             "fingerprint": loaded.fingerprint,
@@ -3613,7 +3692,7 @@ async fn embed_query(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
     }
 
     let request_bytes = request_bytes_for_texts([params.text.as_str()]);
-    let _admission = match state.runtime.admit_inline(
+    let admission = match state.runtime.admit_inline(
         QueueClass::Interactive,
         request_bytes,
         params.deadline_ms,
@@ -3640,7 +3719,10 @@ async fn embed_query(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         tokenized,
         alias_table,
         false,
-        request_bytes,
+        InlineWorkBudget {
+            request_bytes,
+            deadline: Some(admission.deadline()),
+        },
     )
     .await
 }
@@ -3952,7 +4034,7 @@ async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         .await;
     }
 
-    let _admission = match state.runtime.admit_inline(
+    let admission = match state.runtime.admit_inline(
         QueueClass::Bulk,
         request_bytes,
         params.deadline_ms,
@@ -3968,7 +4050,10 @@ async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         tokenized,
         alias_table,
         true,
-        request_bytes,
+        InlineWorkBudget {
+            request_bytes,
+            deadline: Some(admission.deadline()),
+        },
     )
     .await
 }
@@ -4149,13 +4234,19 @@ async fn submit_remote_embed_batch_job(
     };
     let record = admission.record().clone();
     if matches!(admission, JobAdmission::Admitted(_)) {
-        let task_state = Arc::clone(&state);
-        let task_job_id = record.job_id.clone();
-        tokio::spawn(async move {
-            execute_remote_embed_batch_job(task_state, task_job_id, work).await;
-        });
+        spawn_remote_embed_batch_job(Arc::clone(&state), record.job_id.clone(), work);
     }
     result_outcome(job_status_payload(&state, &record))
+}
+
+fn spawn_remote_embed_batch_job(
+    state: Arc<ModuleState>,
+    job_id: String,
+    work: RemoteEmbedBatchJobWork,
+) {
+    tokio::spawn(async move {
+        execute_remote_embed_batch_job(state, job_id, work).await;
+    });
 }
 
 async fn execute_remote_embed_batch_job(
@@ -4477,7 +4568,7 @@ async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
     } else {
         QueueClass::Bulk
     };
-    let _admission = match state.runtime.admit_inline(
+    let admission = match state.runtime.admit_inline(
         queue_class,
         request_bytes,
         params.deadline_ms,
@@ -4494,6 +4585,7 @@ async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
             query,
             candidates: token_items,
         },
+        Some(admission.deadline()),
     )
     .await
     {
@@ -4577,6 +4669,10 @@ async fn microllm_oneshot(state: Arc<ModuleState>, params: Value) -> HandlerOutc
             );
         }
         Some(_) => {
+            // Grammar is intentionally rejected until the worker handshake can
+            // distinguish builds that safely support GBNF. Some older llama.cpp
+            // builds can terminate the worker while loading a grammar, so this
+            // fail-closed response is safer than forwarding a request blindly.
             return channel_error("invalid_request", "grammar_unavailable_in_build");
         }
     }
@@ -4651,7 +4747,7 @@ async fn microllm_oneshot(state: Arc<ModuleState>, params: Value) -> HandlerOutc
             ),
         ));
     }
-    let _admission = match state.runtime.admit_inline(
+    let admission = match state.runtime.admit_inline(
         QueueClass::Interactive,
         request_bytes,
         params.deadline_ms,
@@ -4669,8 +4765,9 @@ async fn microllm_oneshot(state: Arc<ModuleState>, params: Value) -> HandlerOutc
         GenerateRequest {
             prompt,
             max_tokens: params.max_tokens,
-            grammar: None,
+            grammar: None, // grammar requests are rejected before worker dispatch
         },
+        Some(admission.deadline()),
     )
     .await
     {
@@ -4920,6 +5017,7 @@ async fn execute_embed_batch_job(
         work.tokenized.batch.clone(),
         work.total_tokens,
         work.request_bytes,
+        None,
     )
     .await
     {
@@ -5063,6 +5161,7 @@ async fn execute_embedding_quanta(
     batch: TokenBatch,
     _total_tokens: u64,
     request_bytes: u64,
+    deadline: Option<tokio::time::Instant>,
 ) -> Result<Vectors, WireOperationError> {
     let profile = embedding_profile_enabled();
     let started = Instant::now();
@@ -5128,6 +5227,7 @@ async fn execute_embedding_quanta(
             TokenBatch {
                 items: quantum_items,
             },
+            deadline,
         )
         .await?;
         if profile {
@@ -5406,19 +5506,112 @@ async fn job_resume(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         }
     };
     let now = now_ms();
-    match state.store.resume_paused_job(
+    let resumed = match state.store.resume_paused_job(
         &params.job_id,
         state.module_generation,
         now,
         state.runtime.jobs.execution_ttl_ms,
     ) {
-        Ok(_) => match state.store.get_job(&params.job_id) {
-            Ok(Some(record)) => result_outcome(job_status_payload(&state, &record)),
-            Ok(None) => channel_error("invalid_request", "unknown or expired job_id"),
-            Err(error) => channel_error("store_failure", error.to_string()),
-        },
-        Err(error) => channel_error("store_failure", error.to_string()),
+        Ok(resumed) => resumed,
+        Err(error) => return channel_error("store_failure", error.to_string()),
+    };
+    let record = match state.store.get_job(&params.job_id) {
+        Ok(Some(record)) => record,
+        Ok(None) => return channel_error("invalid_request", "unknown or expired job_id"),
+        Err(error) => return channel_error("store_failure", error.to_string()),
+    };
+    // Re-spawn execution for the resumed job. Only remote jobs pause for
+    // re-authentication (vault_locked / needs_reauth), so only remote batch
+    // jobs need re-dispatch here.
+    if resumed
+        && record.kind == "embed.batch"
+        && record
+            .params_json
+            .as_ref()
+            .and_then(|params| params.get("model"))
+            .and_then(Value::as_str)
+            .is_some_and(|model_id| state.remote_gateway.is_remote(model_id))
+    {
+        if let Err(error) =
+            respawn_resumed_remote_job(&state, &record, record.logical_handle.as_deref())
+        {
+            fail_job_with_wire_error(&state, &record.job_id, false, error);
+        }
     }
+    let record = match state.store.get_job(&params.job_id) {
+        Ok(Some(record)) => record,
+        Ok(None) => return channel_error("store_failure", "resumed job disappeared"),
+        Err(error) => return channel_error("store_failure", error.to_string()),
+    };
+    result_outcome(job_status_payload(&state, &record))
+}
+
+/// Re-dispatch a resumed remote job from its stored request parameters. Paused
+/// jobs are not selected by a background queue consumer, so resumption must
+/// explicitly start the same execution task used for initial admission.
+fn respawn_resumed_remote_job(
+    state: &Arc<ModuleState>,
+    record: &JobRecord,
+    logical_handle: Option<&str>,
+) -> Result<(), WireOperationError> {
+    let params_json = record.params_json.as_ref().ok_or_else(|| {
+        WireOperationError::from_stable(
+            StableError::artifact_invalid(),
+            "resumed remote job has no stored request parameters",
+        )
+    })?;
+    let model_id = params_json
+        .get("model")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            WireOperationError::from_stable(
+                StableError::artifact_invalid(),
+                "resumed remote job parameters are missing model",
+            )
+        })?;
+    let profile = state.remote_gateway.profile(model_id).ok_or_else(|| {
+        WireOperationError::from_stable(
+            StableError::artifact_invalid(),
+            format!("remote profile not found for model '{model_id}'"),
+        )
+    })?;
+    if let Some(logical_handle) = logical_handle {
+        let gateway_handle = state.remote_gateway.logical_handle(&profile);
+        if gateway_handle.as_deref() != Some(logical_handle) {
+            return Err(WireOperationError::from_stable(
+                StableError::artifact_invalid(),
+                "resumed job credential handle no longer matches the configured provider",
+            ));
+        }
+    }
+    let items_value = params_json.get("items").ok_or_else(|| {
+        WireOperationError::from_stable(
+            StableError::artifact_invalid(),
+            "resumed remote job parameters are missing items",
+        )
+    })?;
+    let items: Vec<EmbedBatchItem> =
+        serde_json::from_value(items_value.clone()).map_err(|error| {
+            WireOperationError::from_stable(
+                StableError::artifact_invalid(),
+                format!("resumed remote job items are invalid: {error}"),
+            )
+        })?;
+    let deadline_ms = params_json
+        .get("deadline_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(state.runtime.inline.deadline_ms);
+    spawn_remote_embed_batch_job(
+        Arc::clone(state),
+        record.job_id.clone(),
+        RemoteEmbedBatchJobWork {
+            profile,
+            request_digest: record.request_digest.clone(),
+            items,
+            deadline_ms,
+        },
+    );
+    Ok(())
 }
 
 async fn embed_result(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
@@ -5499,7 +5692,7 @@ async fn embed_tokenized(
     tokenized: TokenizedBatch,
     alias_table: AliasTable,
     use_bulk_quanta: bool,
-    request_bytes: u64,
+    budget: InlineWorkBudget,
 ) -> HandlerOutcome {
     let total_tokens = tokenized
         .real_token_counts
@@ -5512,11 +5705,12 @@ async fn embed_tokenized(
             &model,
             tokenized.batch,
             total_tokens,
-            request_bytes,
+            budget.request_bytes,
+            budget.deadline,
         )
         .await
     } else {
-        execute_embedding(&state.runtime, &model, tokenized.batch).await
+        execute_embedding(&state.runtime, &model, tokenized.batch, budget.deadline).await
     } {
         Ok(vectors) => vectors,
         Err(error) => return result_outcome(error_payload(&state, error)),
@@ -5595,15 +5789,22 @@ fn apply_owned_tokenizer_policy(model: &EmbeddingModel, tokenized: &mut Tokenize
 
 async fn acquire_execution_permit(
     runtime: &RuntimeState,
+    deadline: Option<tokio::time::Instant>,
 ) -> Result<InlineExecutionPermit, WireOperationError> {
     if let Ok(mut stats) = runtime.execution_stats.lock() {
         stats.waiters = stats.waiters.saturating_add(1);
     }
     let started = Instant::now();
-    let permit = runtime.execution.clone().acquire_owned().await;
+    let permit_result = match deadline {
+        Some(deadline) => {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            tokio::time::timeout(remaining, runtime.execution.clone().acquire_owned()).await
+        }
+        None => Ok(runtime.execution.clone().acquire_owned().await),
+    };
     let wait_ms = started.elapsed().as_secs_f64() * 1_000.0;
-    match permit {
-        Ok(permit) => {
+    match permit_result {
+        Ok(Ok(permit)) => {
             let mut stats = runtime.execution_stats.lock().map_err(|_| {
                 WireOperationError::from_stable(
                     StableError::queue_full(Some(100)),
@@ -5622,6 +5823,15 @@ async fn acquire_execution_permit(
             })
         }
         Err(_) => {
+            if let Ok(mut stats) = runtime.execution_stats.lock() {
+                stats.waiters = stats.waiters.saturating_sub(1);
+            }
+            Err(WireOperationError::from_stable(
+                StableError::deadline_exceeded(),
+                "deadline exceeded waiting for inline execution permit",
+            ))
+        }
+        Ok(Err(_)) => {
             if let Ok(mut stats) = runtime.execution_stats.lock() {
                 stats.waiters = stats.waiters.saturating_sub(1);
             }
@@ -5649,9 +5859,10 @@ async fn execute_embedding(
     runtime: &RuntimeState,
     model: &EmbeddingModel,
     batch: TokenBatch,
+    deadline: Option<tokio::time::Instant>,
 ) -> Result<Vectors, WireOperationError> {
     let profile = embedding_profile_enabled();
-    let permit = acquire_execution_permit(runtime).await?;
+    let permit = acquire_execution_permit(runtime, deadline).await?;
     match &model.backend {
         EmbedBackend::Ort(engine) => {
             let engine = Arc::clone(engine);
@@ -5801,8 +6012,9 @@ async fn execute_rerank(
     runtime: &RuntimeState,
     model: &EmbeddingModel,
     request: RerankRequest,
+    deadline: Option<tokio::time::Instant>,
 ) -> Result<synapse_core::RerankScores, WireOperationError> {
-    let permit = acquire_execution_permit(runtime).await?;
+    let permit = acquire_execution_permit(runtime, deadline).await?;
     match &model.backend {
         EmbedBackend::Ort(_) | EmbedBackend::Owned(_) => Err(WireOperationError::from_stable(
             StableError::artifact_invalid(),
@@ -5838,8 +6050,9 @@ async fn execute_generate(
     runtime: &RuntimeState,
     model: &EmbeddingModel,
     request: GenerateRequest,
+    deadline: Option<tokio::time::Instant>,
 ) -> Result<GenerateOutput, WireOperationError> {
-    let permit = acquire_execution_permit(runtime).await?;
+    let permit = acquire_execution_permit(runtime, deadline).await?;
     match &model.backend {
         EmbedBackend::Ort(_) | EmbedBackend::Owned(_) => Err(WireOperationError::from_stable(
             StableError::artifact_invalid(),
@@ -6083,7 +6296,10 @@ async fn probe_start(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         .request_key
         .filter(|key| !key.trim().is_empty())
         .unwrap_or_else(|| format!("probe:{}:{now}", state.module_generation));
-    let params_json = json!({ "models": model_filter.clone() });
+    let params_json = json!({
+        "models": model_filter.clone(),
+        "deadline_ms": params.deadline_ms,
+    });
     let request_digest =
         compute_request_digest("probe", "management", None, None, &params_json, &[]);
     let admission = match state.store.admit_job(
@@ -6115,9 +6331,10 @@ async fn probe_start(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         let supervisor_job_id = record.job_id.clone();
         let task_state = Arc::clone(&state);
         let task_job_id = record.job_id.clone();
+        let deadline_ms = params.deadline_ms;
         tokio::spawn(async move {
             let task = tokio::spawn(async move {
-                execute_probe_job(task_state, task_job_id, model_filter).await;
+                execute_probe_job(task_state, task_job_id, model_filter, deadline_ms).await;
             });
             if let Err(error) = task.await {
                 fail_job_with_wire_error(
@@ -6159,7 +6376,12 @@ async fn probe_status(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
     }
 }
 
-async fn execute_probe_job(state: Arc<ModuleState>, job_id: String, model_filter: Vec<String>) {
+async fn execute_probe_job(
+    state: Arc<ModuleState>,
+    job_id: String,
+    model_filter: Vec<String>,
+    deadline_ms: Option<u64>,
+) {
     if !matches!(
         state
             .store
@@ -6206,18 +6428,20 @@ async fn execute_probe_job(state: Arc<ModuleState>, job_id: String, model_filter
         .unwrap_or_default();
     let mut selected_models = Vec::new();
     for model_id in selected_model_ids {
-        let model = match ensure_model_loaded_for_control(Arc::clone(&state), &model_id).await {
-            Ok(model) => model,
-            Err(error) => {
-                fail_job_with_wire_error(
-                    &state,
-                    &job_id,
-                    error.class == ErrorClass::Transient,
-                    error,
-                );
-                return;
-            }
-        };
+        let model =
+            match ensure_model_loaded_for_control(Arc::clone(&state), &model_id, deadline_ms).await
+            {
+                Ok(model) => model,
+                Err(error) => {
+                    fail_job_with_wire_error(
+                        &state,
+                        &job_id,
+                        error.class == ErrorClass::Transient,
+                        error,
+                    );
+                    return;
+                }
+            };
         selected_models.push(model);
     }
 
@@ -6537,10 +6761,11 @@ async fn execute_embed_probe_for_model(
         }
     };
     apply_owned_tokenizer_policy(&model, &mut tokenized);
-    let vectors = match execute_embedding(&state.runtime, &model, tokenized.batch.clone()).await {
-        Ok(vectors) => vectors,
-        Err(error) => return Err(error),
-    };
+    let vectors =
+        match execute_embedding(&state.runtime, &model, tokenized.batch.clone(), None).await {
+            Ok(vectors) => vectors,
+            Err(error) => return Err(error),
+        };
     let actual_dims = vectors.first().map(Vec::len);
     let actual_item_count = vectors.len();
     let vectors_have_one_dimension = vectors
@@ -6726,6 +6951,7 @@ async fn execute_rerank_probe_for_model(
                 query,
                 candidates: token_items,
             },
+            None,
         )
         .await
         {
@@ -6857,8 +7083,9 @@ async fn execute_generate_probe_for_model(
             GenerateRequest {
                 prompt,
                 max_tokens: item.max_new_tokens,
-                grammar: None,
+                grammar: None, // grammar requests are rejected before worker dispatch
             },
+            None,
         )
         .await
         {
@@ -7142,7 +7369,7 @@ async fn measure_embed_perf(
                 break;
             }
         }
-        execute_embedding(runtime, model, TokenBatch { items: batch_items }).await?;
+        execute_embedding(runtime, model, TokenBatch { items: batch_items }, None).await?;
         batch_samples += 1;
     }
     let elapsed_secs = started.elapsed().as_secs_f64().max(f64::EPSILON);
@@ -7157,6 +7384,7 @@ async fn measure_embed_perf(
             TokenBatch {
                 items: vec![tokenized.batch.items[index].clone()],
             },
+            None,
         )
         .await?;
         latency_samples.push(started.elapsed().as_secs_f64() * 1_000.0);
@@ -7229,7 +7457,7 @@ async fn measure_rerank_perf(
         let mut batch_tokens = 0_usize;
         while batch_tokens < PROBE_PERF_BATCH_TOKEN_BUDGET || batch_tokens == 0 {
             let (request, token_cost) = &requests[cursor % requests.len()];
-            execute_rerank(runtime, model, request.clone()).await?;
+            execute_rerank(runtime, model, request.clone(), None).await?;
             batch_tokens = batch_tokens.saturating_add(*token_cost as usize);
             total_tokens = total_tokens.saturating_add(*token_cost);
             cursor += 1;
@@ -7245,7 +7473,7 @@ async fn measure_rerank_perf(
     for sample in 0..PROBE_PERF_SINGLE_SAMPLES {
         let (request, _) = &requests[sample % requests.len()];
         let started = std::time::Instant::now();
-        execute_rerank(runtime, model, request.clone()).await?;
+        execute_rerank(runtime, model, request.clone(), None).await?;
         latency_samples.push(started.elapsed().as_secs_f64() * 1_000.0);
     }
     let single_item_latency_p50_ms = median_ms(&mut latency_samples);
@@ -8521,6 +8749,131 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stuck_model_spec() -> StoredModelConfig {
+        StoredModelConfig {
+            model_id: "stuck-model".to_string(),
+            engine: "ort".to_string(),
+            task: "embed".to_string(),
+            artifact_digest: "artifact".to_string(),
+            artifact_format: "onnx".to_string(),
+            tokenizer_sanitized_digest: "tokenizer".to_string(),
+            model_locator: ModelAssetLocator::LocalPath {
+                path: PathBuf::from("/tmp/stuck-model.onnx"),
+            },
+            tokenizer_locator: ModelAssetLocator::LocalPath {
+                path: PathBuf::from("/tmp/stuck-tokenizer.json"),
+            },
+            model_source_url: "file:///tmp/stuck-model.onnx".to_string(),
+            tokenizer_source_url: "file:///tmp/stuck-tokenizer.json".to_string(),
+            pooling: "mean".to_string(),
+            normalize: true,
+            max_tokens: 128,
+            quant: "fp32".to_string(),
+            pin: false,
+            owned_family: None,
+            owned_dtype: None,
+            owned_execution: None,
+            owned_attention_units: None,
+            config_locator: None,
+            extra_locators: Vec::new(),
+            engine_identity: EngineIdentity {
+                engine: "ort".to_string(),
+                version: "test".to_string(),
+                build_flags: BTreeMap::new(),
+            },
+            numeric_profile_id: NumericProfileId("test-profile".to_string()),
+            fingerprint: Fingerprint("test-fingerprint".to_string()),
+            worker_bin: None,
+            worker_runtime_dir: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn model_load_wait_timeout_fires_for_never_notified_slot() {
+        let runtime = RuntimeState::from_catalog(ModuleConfig::default(), vec![stuck_model_spec()])
+            .expect("test runtime should initialize");
+        runtime
+            .catalog
+            .lock()
+            .expect("catalog lock")
+            .get_mut("stuck-model")
+            .expect("stuck model is registered")
+            .state = ModelRuntimeState::Loading;
+
+        let start = Instant::now();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(20);
+        let error = match wait_for_model_loaded(&runtime, "stuck-model", deadline, 20).await {
+            Ok(_) => panic!("a never-notified loading slot must time out"),
+            Err(error) => error,
+        };
+        let elapsed = start.elapsed();
+        assert_eq!(error.code, "model_loading");
+        assert_eq!(error.class, ErrorClass::Transient);
+        assert!(
+            (Duration::from_millis(10)..=Duration::from_millis(500)).contains(&elapsed),
+            "model-load timeout fired outside its bound: {elapsed:?}"
+        );
+
+        let zero_start = Instant::now();
+        let zero_error =
+            match wait_for_model_loaded(&runtime, "stuck-model", tokio::time::Instant::now(), 0)
+                .await
+            {
+                Ok(_) => panic!("a zero deadline must still reject the stuck slot"),
+                Err(error) => error,
+            };
+        assert_eq!(zero_error.code, "model_loading");
+        assert!(
+            zero_start.elapsed() <= Duration::from_millis(500),
+            "zero-deadline model-load timeout took too long: {:?}",
+            zero_start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn execution_permit_timeout_fires_when_all_permits_are_held() {
+        let runtime = RuntimeState::from_catalog(ModuleConfig::default(), Vec::new())
+            .expect("test runtime should initialize");
+        let permit_count = runtime.execution.available_permits();
+        let mut held = Vec::with_capacity(permit_count);
+        for _ in 0..permit_count {
+            held.push(
+                runtime
+                    .execution
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("test should hold an execution permit"),
+            );
+        }
+        let start = Instant::now();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(20);
+        let error = acquire_execution_permit(&runtime, Some(deadline))
+            .await
+            .err()
+            .expect("a saturated execution semaphore must time out");
+        let elapsed = start.elapsed();
+        assert_eq!(error.code, "deadline_exceeded");
+        assert_eq!(error.class, ErrorClass::Transient);
+        assert!(
+            (Duration::from_millis(10)..=Duration::from_millis(500)).contains(&elapsed),
+            "execution-permit timeout fired outside its bound: {elapsed:?}"
+        );
+
+        let zero_start = Instant::now();
+        let zero_error = acquire_execution_permit(&runtime, Some(tokio::time::Instant::now()))
+            .await
+            .err()
+            .expect("a saturated execution semaphore must reject a zero deadline");
+        assert_eq!(zero_error.code, "deadline_exceeded");
+        assert!(
+            zero_start.elapsed() <= Duration::from_millis(500),
+            "zero-deadline execution-permit timeout took too long: {:?}",
+            zero_start.elapsed()
+        );
+        drop(held);
+    }
 
     #[test]
     fn decode_certification_fixture_is_the_pinned_twenty_by_sixty_four_oracle() {

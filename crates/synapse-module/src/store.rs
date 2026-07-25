@@ -641,6 +641,8 @@ pub struct JobRecord {
     pub result_json: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_json: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params_json: Option<Value>,
 }
 
 impl JobRecord {
@@ -1046,7 +1048,6 @@ impl SynapseStore {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub fn sweep_remote_url_bindings(
         &self,
         active_remote_profile_hashes: &[String],
@@ -2008,7 +2009,7 @@ fn job_by_id_tx(
 const JOB_SELECT_SQL: &str = "SELECT job_id, request_key, request_digest, kind,
         module_generation, state, created_ms, updated_ms, execution_expires_ms,
         result_retention_ttl_ms, terminal_at_ms, active_attempt_id, logical_handle,
-        paused_at_ms, resume_deadline_ms, page_count, result_json, error_json FROM jobs";
+        paused_at_ms, resume_deadline_ms, page_count, result_json, error_json, params_json FROM jobs";
 
 fn unix_now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -2236,6 +2237,7 @@ fn row_to_job(row: &Row<'_>) -> rusqlite::Result<JobRecord> {
         page_count: row.get::<_, i64>(15)? as u32,
         result_json: decode_optional_json(row.get(16)?, 16)?,
         error_json: decode_optional_json(row.get(17)?, 17)?,
+        params_json: decode_optional_json(row.get(18)?, 18)?,
     })
 }
 

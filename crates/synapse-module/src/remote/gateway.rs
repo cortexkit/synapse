@@ -491,7 +491,10 @@ async fn execute_embedding_request(
                     message: format!("remote provider '{}' has no runtime pool", profile.provider),
                     provider_request_id: None,
                 })?;
-        let _permit = pool.acquire(class).await;
+        let _permit = pool
+            .acquire(class, Some(remaining_deadline_ms))
+            .await
+            .map_err(RemoteGatewayError::from)?;
 
         let token = match &connection.config.auth {
             ConfiguredAuth::None => None,
