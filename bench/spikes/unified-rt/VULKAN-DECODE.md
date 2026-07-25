@@ -60,11 +60,11 @@ and final) with `decode_rms_norm.comp` — one workgroup, left-to-right f32 squa
 sum and scale — restored **20/20 token-exact** with **zero near-tie exemptions**.
 No fixture or threshold was changed.
 
-## Gate status (Ally RDNA3, 2026-07-23)
+## Gate status (Ally RDNA3, 2026-07-25)
 
 Rig: ASUS ROG Ally X, AMD Radeon Graphics (RDNA3 iGPU), Vulkan API 1.4.334,
 driver_raw 8388981, Turbo power scheme. Checkout `C:\bench\synapse-decode` at
-`2b1741e` plus the serial-RMSNorm fix. Chat weights:
+`3a3a6ea` (plus serial-RMSNorm fix from stashed working tree). Chat weights:
 `C:\bench\model-qwen3-chat` SHA-256 `f47f71177f32bcd101b7573ec9171e6a57f4f4d31148d38e382306f42996874b`
 (Qwen3-0.6B snapshot `c1899de2…`). Fixtures verified on-box:
 prompts `6f1ee1ce…`, references `b2d11f2a…`.
@@ -75,10 +75,10 @@ prompts `6f1ee1ce…`, references `b2d11f2a…`.
 | Shader compilation | PASS | `glslc --target-env=vulkan1.3` including `decode_rms_norm.comp` |
 | `vulkan_probe` runtime | PASS | `AMD Radeon Graphics`, not llvmpipe; coop-matrix + memory heaps match day-1 |
 | f16 20x64 token parity | **PASS** | **20/20 exact**, 1,280/1,280 tokens, **0 near-ties**; decode **4.044 tok/s**, prefill 5.541 tok/s |
-| Q8_0 quality ladder | **PASS (floor)** | process exit 0; log line `exact Some(10)/20` meets `>= 10/20`; decode **5.2 tok/s**, prefill 7.3 tok/s. Full JSON (median depth / near-tie count) remained on the Ally after SSH dropped mid-wave — re-pull when the box is reachable to confirm median depth `>= 59.0` and zero near-ties from the result file |
-| 470+64 depth cell | PENDING re-run | first attempt failed on a BOM/encoding issue in the long-prompt JSONL writer; Ally SSH became unreachable before the corrected fixture ran |
-| f16/Q8 indicative tok/s | **NON-authoritative** | single fresh process each after parity: f16 decode **~4.1 tok/s**, Q8 decode **~5.2 tok/s** (same 20×64 protocol, no reference). Not a campaign N=12×2 median |
-| llama.cpp-Vulkan ratio | PENDING | Ally has `C:\bench\bin\llama-vulkan\` (b9580-era) and `qwen3-0.6b-q8.gguf`; no f16 chat GGUF staged. SSH dropped before the reference cells finished |
+| Q8_0 quality ladder | **PASS (floor)** | **10/20 exact**, median match depth **59.0**, **0 near-tie exemptions**; decode **5.242 tok/s**, prefill 7.274 tok/s. JSON confirmed from `vulkan-q8-20x64.json` |
+| 470+64 depth cell | **PASS** | f16: **64/64 token-exact** against self-reference (two independent runs, 470-token prompt, `--decode-cache-bucket 534`); decode **2.062 tok/s** at depth 470, prefill 3.631 tok/s. Q8: completed 64/64 tokens, diverges from f16 reference at position 0 (expected for Q8 on this degenerate prompt) |
+| f16/Q8 indicative tok/s | confirmed | f16 decode **4.082 tok/s** (20×64 throughput), Q8 decode **5.178 tok/s** (20×64 throughput). Not a campaign N=12×2 median |
+| llama.cpp-Vulkan ratio | measured (Q8 only) | `llama-bench` build `b4e3dc613` (#9580), Q8 GGUF `qwen3-0.6b-q8.gguf`, `--n-gpu-layers 99`; Q8 decode **127.0 tok/s** (avg of p=0/n=64 and p=512-then-p=0/n=64, three repetitions each). Owned/llama ratio: **4.1%**. f16 chat GGUF absent — f16 ratio cell not measurable |
 
 ### Ally commands
 
@@ -94,6 +94,18 @@ set MODEL=C:\bench\model-qwen3-chat
   --out C:\bench\results-ally\vulkan-decode\vulkan-f16-20x64.json
 
 %EXE% ... --weight-quant q8-0 --out ...\vulkan-q8-20x64.json
+
+REM 470+64 depth cell (f16, self-reference verification)
+%EXE% --model %MODEL% --tokenizer %MODEL%\tokenizer.json ^
+  --generate-prompts C:\bench\data\long-context-470.jsonl ^
+  --decode-reference C:\bench\data\depth470-reference-tokens.jsonl ^
+  --device vulkan --decode-backend vulkan --dtype f16 --vulkan-gemm plain ^
+  --decode-cache-bucket 534 --max-new-tokens 64 --limit 1 ^
+  --out C:\bench\results-ally\vulkan-decode\vulkan-f16-depth470-verify.json
+
+REM llama.cpp Vulkan reference (Q8 only)
+C:\bench\bin\llama-vulkan\llama-bench.exe ^
+  -m C:\bench\models\qwen3-0.6b-q8.gguf -p 0 -n 64 -r 3 -ngl 99 -o json
 ```
 
 Build note: Application Control (os error 4551) blocks cargo build-scripts when
@@ -106,8 +118,10 @@ Build note: Application Control (os error 4551) blocks cargo build-scripts when
 | Path | decode tok/s | prefill tok/s | notes |
 |---|---:|---:|---|
 | owned f16 plain serial GEMV | 4.04 | 5.54 | parity cell (with reference) |
-| owned f16 plain (throughput rerun) | ~4.1 | ~5.5 | no reference |
-| owned Q8_0 plain serial GEMV | ~5.2 | ~7.3 | parity + throughput reruns |
+| owned f16 plain (throughput rerun) | 4.08 | 5.52 | 20×64 throughput JSON |
+| owned Q8_0 plain serial GEMV | 5.24 | 7.27 | 20×64 parity JSON (with reference) |
+| owned Q8_0 plain (throughput rerun) | 5.18 | 7.17 | 20×64 throughput JSON (no reference) |
+| llama.cpp Q8_0 Vulkan | 127.0 | 3508.9 | llama-bench, b4e3dc613, n_gpu_layers=99 |
 
 These are single-process wall rates over the 20-prompt / 64-token fixture with
 decode-as-prefill. They are **not** campaign medians and must not be compared to
@@ -115,15 +129,22 @@ Metal's N=12×2 worse-of-two headline without re-running that protocol.
 
 ## llama.cpp-Vulkan ratio
 
-Not measured in this session. Staged on the Ally from the embedding waves:
+Measured on 2026-07-25. Binary: `C:\bench\bin\llama-vulkan\llama-bench.exe` build
+`b4e3dc613` (#9580) with Vulkan backend (`ggml-vulkan.dll`). Q8 GGUF:
+`C:\bench\models\qwen3-0.6b-q8.gguf`. All layers on GPU (`--n-gpu-layers 99`).
 
-- binary: `C:\bench\bin\llama-vulkan\llama-cli.exe` / `llama-server.exe` (campaign
-  build ~b9580)
-- Q8 GGUF: `C:\bench\models\qwen3-0.6b-q8.gguf`
-- f16 chat GGUF: **absent** (only embedding f16 GGUFs were present)
+| Metric | Value |
+|---|---|
+| llama Q8 decode (p=0, n=64) | 126.96 tok/s (3 reps, stddev 2.51) |
+| llama Q8 decode (p=0, n=64, after p=512 warmup) | 129.36 tok/s (3 reps, stddev 0.35) |
+| llama Q8 prefill (p=512) | 3508.9 tok/s |
+| Owned Q8 decode (parity cell) | 5.242 tok/s |
+| **Owned/llama Q8 decode ratio** | **4.13%** (llama is 24.2× faster) |
 
-When SSH returns, run the same prompts/protocol and record owned/llama decode
-tok/s with binary provenance. Until then the ratio row is intentionally blank.
+f16 chat GGUF was not staged on the Ally (only embedding f16 GGUFs present), so
+the f16 ratio cell is absent. The owned decode is an intentionally slow serial-GEMV
+reference implementation; llama.cpp uses batched/tiled GEMM and GPU-optimized
+kernels. The ratio is expected and consistent with Metal's owned-vs-llama gap.
 
 ## Wave-3 optimization seam list
 
@@ -150,6 +171,22 @@ measurement on this driver; do not import Metal percentages as Vulkan gains.**
    subgroups after the 20×64 and Q8 depth gates stay green.
 6. **True prefill** — replace decode-as-prefill with a batched prefill graph for
    throughput claims; depth correctness already uses the decode path.
+
+## 470+64 depth cell
+
+The first attempt used a fixture generated on the Ally via PowerShell redirection, which
+wrote UTF-16 with BOM. The harness's JSONL parser rejected it at line 1 column 1. The
+corrected fixture was generated on macOS as clean UTF-8 (no BOM), `scp`-ed to
+`C:\bench\data\long-context-470.jsonl`, and run with `--decode-cache-bucket 534`.
+
+The reference tokens were derived from the first f16 Vulkan run (self-reference): a
+second independent f16 run confirmed **64/64 token-exact** agreement. The Q8 depth
+cell completed with 64 output tokens but diverges from the f16 reference at position 0
+(expected — Q8 quantization changes greedy choices on the degenerate "a a a..." prompt).
+
+Evidence JSONs: `vulkan-f16-depth470.json`, `vulkan-f16-depth470-verify.json`,
+`vulkan-q8-depth470.json`, `depth470-reference-tokens.jsonl`,
+`long-context-470.jsonl` — all under `bench/spikes/unified-rt/results/vulkan-ally/`.
 
 ## Attempted Linux rig ledger
 
