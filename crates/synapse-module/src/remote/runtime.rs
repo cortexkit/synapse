@@ -66,7 +66,19 @@ impl ProviderPool {
         })
     }
 
-    pub(super) async fn acquire(&self, class: RemoteClass) -> ProviderPermit {
+    /// Acquire a concurrency permit, bounded by `remaining_deadline_ms`.
+    ///
+    /// If `remaining_deadline_ms` is `Some(ms)`, the wait is bounded by that
+    /// deadline; on expiry, returns a `provider_unavailable` error instead of
+    /// hanging silently. If `None`, waits indefinitely (backward-compatible).
+    pub(super) async fn acquire(
+        &self,
+        class: RemoteClass,
+        remaining_deadline_ms: Option<u64>,
+    ) -> Result<ProviderPermit, RuntimeError> {
+        let deadline = remaining_deadline_ms.map(|ms| {
+            tokio::time::Instant::now() + std::time::Duration::from_millis(ms)
+        });
         let mut waiter = InteractiveWaiter::new(self, class);
         loop {
             let notified = self.inner.turnover.notified();
@@ -93,13 +105,23 @@ impl ProviderPool {
                         state.active_bulk += 1;
                     }
                     waiter.finish(&mut state);
-                    return ProviderPermit {
+                    return Ok(ProviderPermit {
                         pool: Arc::clone(&self.inner),
                         class,
-                    };
+                    });
                 }
             }
-            notified.await;
+            if let Some(dl) = deadline {
+                let remaining = dl.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(RuntimeError::deadline_exceeded(
+                        "provider pool acquire timed out before permit became available",
+                    ));
+                }
+                let _ = tokio::time::timeout(remaining, notified).await;
+            } else {
+                notified.await;
+            }
         }
     }
 
@@ -1115,6 +1137,16 @@ impl RuntimeError {
         }
     }
 
+    /// Deadline exceeded while waiting for a pool permit or credential.
+    /// Maps to the `provider_unavailable` stable error (transient) since
+    /// callers should retry after a backoff.
+    fn deadline_exceeded(message: impl Into<String>) -> Self {
+        Self {
+            stable: StableError::provider_unavailable(Some(1_000)),
+            message: message.into(),
+        }
+    }
+
     fn identity_drift(model: &str) -> Self {
         Self {
             stable: StableError::remote_identity_drift(),
@@ -1306,7 +1338,7 @@ mod tests {
     #[tokio::test]
     async fn interactive_turnover_precedes_bulk_and_wait_is_one_subbatch() {
         let pool = ProviderPool::new(1).unwrap();
-        let first = pool.acquire(RemoteClass::Bulk).await;
+        let first = pool.acquire(RemoteClass::Bulk, None).await.unwrap();
         let start = Instant::now();
         let barrier = Arc::new(Barrier::new(3));
         let order = Arc::new(Mutex::new(Vec::new()));
@@ -1316,7 +1348,7 @@ mod tests {
         let interactive_order = Arc::clone(&order);
         let interactive = tokio::spawn(async move {
             interactive_barrier.wait().await;
-            let permit = interactive_pool.acquire(RemoteClass::Interactive).await;
+            let permit = interactive_pool.acquire(RemoteClass::Interactive, None).await.unwrap();
             interactive_order.lock().unwrap().push("interactive");
             drop(permit);
         });
@@ -1325,7 +1357,7 @@ mod tests {
         let bulk_order = Arc::clone(&order);
         let bulk = tokio::spawn(async move {
             bulk_barrier.wait().await;
-            let permit = bulk_pool.acquire(RemoteClass::Bulk).await;
+            let permit = bulk_pool.acquire(RemoteClass::Bulk, None).await.unwrap();
             bulk_order.lock().unwrap().push("bulk");
             drop(permit);
         });

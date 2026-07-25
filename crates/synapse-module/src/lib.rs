@@ -1844,6 +1844,38 @@ impl ModuleHandler for SynapseHandler {
             .initialize(ack)
             .unwrap_or_else(|error| panic!("synapse boot failed after HELLO_ACK: {error}"));
         let _ = self.inner.state.set(state);
+        // Spawn background maintenance: periodic job purging and URL binding
+        // sweeps. This is the only maintenance daemon; there is no pre-existing
+        // timer loop to piggyback on.
+        let maint_state = self.state().unwrap();
+        let maint_store = Arc::clone(&maint_state.store);
+        let maint_remote_gateway = Arc::clone(&maint_state.remote_gateway);
+        let maint_interval = Duration::from_secs(300); // 5 minutes
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(maint_interval);
+            // Skip the first immediate tick so we don't sweep during the
+            // boot burst.
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let now = now_ms();
+                if let Err(error) = maint_store.purge_expired_jobs(now) {
+                    tracing::warn!("job purge sweep failed: {error}");
+                }
+                let active_hashes = maint_remote_gateway
+                    .profiles()
+                    .iter()
+                    .map(|p| p.remote_profile_hash.clone())
+                    .collect::<Vec<_>>();
+                if let Err(error) = maint_store.sweep_remote_url_bindings(
+                    &active_hashes,
+                    now,
+                    7 * 24 * 60 * 60 * 1_000,
+                ) {
+                    tracing::warn!("URL binding sweep failed: {error}");
+                }
+            }
+        });
     }
 
     async fn on_bind(&self, _req: &RouteBindRequest) -> BindDecision {
@@ -2433,10 +2465,16 @@ fn begin_background_catalog_load(state: Arc<ModuleState>, model_id: String) {
     }
 }
 
+/// Timeout ceiling for control-path model-load waits. Matches the worker
+/// load timeout (DEFAULT_WORKER_LOAD_TIMEOUT_MS) as the ANE precedent.
+const MODEL_LOAD_CONTROL_TIMEOUT_MS: u64 = DEFAULT_WORKER_LOAD_TIMEOUT_MS;
+
 async fn ensure_model_loaded_for_control(
     state: Arc<ModuleState>,
     model_id: &str,
 ) -> Result<Arc<EmbeddingModel>, WireOperationError> {
+    let deadline = tokio::time::Instant::now()
+        + Duration::from_millis(MODEL_LOAD_CONTROL_TIMEOUT_MS);
     loop {
         let Some(snapshot) = model_slot_snapshot(&state.runtime, model_id) else {
             return Err(WireOperationError::from_stable(
@@ -2453,10 +2491,32 @@ async fn ensure_model_loaded_for_control(
                 | ModelRuntimeState::Validating
                 | ModelRuntimeState::Loading,
                 _,
-            ) => snapshot.notify.notified().await,
+            ) => {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(WireOperationError::from_stable(
+                        StableError::model_loading(Some(MODEL_LOAD_CONTROL_TIMEOUT_MS)),
+                        format!(
+                            "timed out waiting for model '{model_id}' to load after \
+                             {MODEL_LOAD_CONTROL_TIMEOUT_MS}ms"
+                        ),
+                    ));
+                }
+                let _ = tokio::time::timeout(remaining, snapshot.notify.notified()).await;
+            }
             _ => {
                 begin_background_catalog_load(Arc::clone(&state), model_id.to_string());
-                snapshot.notify.notified().await;
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(WireOperationError::from_stable(
+                        StableError::model_loading(Some(MODEL_LOAD_CONTROL_TIMEOUT_MS)),
+                        format!(
+                            "timed out waiting for model '{model_id}' to load after \
+                             {MODEL_LOAD_CONTROL_TIMEOUT_MS}ms"
+                        ),
+                    ));
+                }
+                let _ = tokio::time::timeout(remaining, snapshot.notify.notified()).await;
             }
         }
     }
@@ -4577,6 +4637,17 @@ async fn microllm_oneshot(state: Arc<ModuleState>, params: Value) -> HandlerOutc
             );
         }
         Some(_) => {
+            // DELIBERATE REFUSAL: grammar (GBNF constrained decoding) is gated
+            // behind `grammar_enabled` above. When the gate is open but the llama
+            // worker build lacks GBNF support, this branch rejects before the
+            // request reaches the worker. The llama worker DOES implement GBNF
+            // (LlamaSampler::grammar, runner.rs:1045) and the protocol round-
+            // trips grammar (worker_protocol.rs:94), but the module dispatch
+            // currently hardcodes `grammar: None` (lib.rs ~4672) instead of
+            // forwarding `params.grammar`. Forwarding grammar is a design
+            // decision parked as audit finding S2 — Qwen3's GBNF template is
+            // process-fatal on older llama.cpp builds, so the refusal must stay
+            // until a safe forwarding path is validated.
             return channel_error("invalid_request", "grammar_unavailable_in_build");
         }
     }
@@ -4669,7 +4740,7 @@ async fn microllm_oneshot(state: Arc<ModuleState>, params: Value) -> HandlerOutc
         GenerateRequest {
             prompt,
             max_tokens: params.max_tokens,
-            grammar: None,
+            grammar: None, // SEE audit S2: parked until safe forwarding is validated
         },
     )
     .await
@@ -5406,19 +5477,93 @@ async fn job_resume(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         }
     };
     let now = now_ms();
-    match state.store.resume_paused_job(
+    let resumed = match state.store.resume_paused_job(
         &params.job_id,
         state.module_generation,
         now,
         state.runtime.jobs.execution_ttl_ms,
     ) {
-        Ok(_) => match state.store.get_job(&params.job_id) {
-            Ok(Some(record)) => result_outcome(job_status_payload(&state, &record)),
-            Ok(None) => channel_error("invalid_request", "unknown or expired job_id"),
-            Err(error) => channel_error("store_failure", error.to_string()),
-        },
-        Err(error) => channel_error("store_failure", error.to_string()),
+        Ok(resumed) => resumed,
+        Err(error) => return channel_error("store_failure", error.to_string()),
+    };
+    let record = match state.store.get_job(&params.job_id) {
+        Ok(Some(record)) => record,
+        Ok(None) => return channel_error("invalid_request", "unknown or expired job_id"),
+        Err(error) => return channel_error("store_failure", error.to_string()),
+    };
+    // Re-spawn execution for the resumed job. Only remote jobs pause for
+    // re-authentication (vault_locked / needs_reauth), so only remote batch
+    // jobs need re-dispatch here.
+    if resumed {
+        if let Some(logical_handle) = &record.logical_handle {
+            if let Err(error) = respawn_resumed_remote_job(&state, &record, logical_handle) {
+                // The state transition already succeeded — log the failure but
+                // still return the status so the consumer can retry.
+                tracing::warn!(
+                    job_id = %record.job_id,
+                    error = %error,
+                    "job.resume: could not re-dispatch resumed remote job; \
+                     the job is queued but not executing"
+                );
+            }
+        }
     }
+    result_outcome(job_status_payload(&state, &record))
+}
+
+/// Re-dispatch a resumed remote job by reconstructing its work from the stored
+/// params and spawning the execution task. This bridges the composition gap
+/// identified in the wire audit (finding S1): `resume_paused_job` sets
+/// state=`queued` but nothing drained queued jobs — this function is the drain.
+fn respawn_resumed_remote_job(
+    state: &Arc<ModuleState>,
+    record: &JobRecord,
+    logical_handle: &str,
+) -> Result<(), String> {
+    let params_json = record
+        .params_json
+        .as_ref()
+        .ok_or_else(|| "resumed job has no stored params_json".to_string())?;
+    let model_id = params_json
+        .get("model")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "resumed job params_json missing model".to_string())?;
+    let profile = state
+        .remote_gateway
+        .profile(model_id)
+        .ok_or_else(|| format!("remote profile not found for model '{model_id}'"))?;
+    // The logical_handle in the job record may include a provider prefix
+    // (e.g. "vault:provider") that differs from the gateway's logical_handle
+    // format, so we verify it matches.
+    let gateway_handle = state.remote_gateway.logical_handle(&profile);
+    if gateway_handle.as_deref() != Some(logical_handle) {
+        tracing::warn!(
+            job_id = %record.job_id,
+            stored_handle = %logical_handle,
+            gateway_handle = ?gateway_handle,
+            "job.resume: logical_handle mismatch on re-dispatch, using stored handle"
+        );
+    }
+    let items: Vec<EmbedBatchItem> = params_json
+        .get("items")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .map_err(|e: serde_json::Error| format!("resumed job items deserialization failed: {e}"))?;
+    let deadline_ms = params_json
+        .get("deadline_ms")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(state.runtime.inline.deadline_ms);
+    let work = RemoteEmbedBatchJobWork {
+        profile,
+        request_digest: record.request_digest.clone(),
+        items,
+        deadline_ms,
+    };
+    let task_state = Arc::clone(state);
+    let task_job_id = record.job_id.clone();
+    tokio::spawn(async move {
+        execute_remote_embed_batch_job(task_state, task_job_id, work).await;
+    });
+    Ok(())
 }
 
 async fn embed_result(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
@@ -5595,15 +5740,23 @@ fn apply_owned_tokenizer_policy(model: &EmbeddingModel, tokenized: &mut Tokenize
 
 async fn acquire_execution_permit(
     runtime: &RuntimeState,
+    remaining_deadline_ms: Option<u64>,
 ) -> Result<InlineExecutionPermit, WireOperationError> {
     if let Ok(mut stats) = runtime.execution_stats.lock() {
         stats.waiters = stats.waiters.saturating_add(1);
     }
     let started = Instant::now();
-    let permit = runtime.execution.clone().acquire_owned().await;
+    let permit_result = match remaining_deadline_ms {
+        Some(ms) => {
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(ms);
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            tokio::time::timeout(remaining, runtime.execution.clone().acquire_owned()).await
+        }
+        None => runtime.execution.clone().acquire_owned().await,
+    };
     let wait_ms = started.elapsed().as_secs_f64() * 1_000.0;
-    match permit {
-        Ok(permit) => {
+    match permit_result {
+        Ok(Ok(permit)) => {
             let mut stats = runtime.execution_stats.lock().map_err(|_| {
                 WireOperationError::from_stable(
                     StableError::queue_full(Some(100)),
@@ -5621,13 +5774,17 @@ async fn acquire_execution_permit(
                 stats: Arc::clone(&runtime.execution_stats),
             })
         }
-        Err(_) => {
+        Ok(Err(_)) | Err(_) => {
             if let Ok(mut stats) = runtime.execution_stats.lock() {
                 stats.waiters = stats.waiters.saturating_sub(1);
             }
             Err(WireOperationError::from_stable(
                 StableError::queue_full(Some(100)),
-                "inline embedding executor is closed",
+                if permit_result.is_err() {
+                    "deadline exceeded waiting for inline execution permit"
+                } else {
+                    "inline embedding executor is closed"
+                },
             ))
         }
     }
@@ -5651,7 +5808,7 @@ async fn execute_embedding(
     batch: TokenBatch,
 ) -> Result<Vectors, WireOperationError> {
     let profile = embedding_profile_enabled();
-    let permit = acquire_execution_permit(runtime).await?;
+    let permit = acquire_execution_permit(runtime, None).await?;
     match &model.backend {
         EmbedBackend::Ort(engine) => {
             let engine = Arc::clone(engine);
@@ -5802,7 +5959,7 @@ async fn execute_rerank(
     model: &EmbeddingModel,
     request: RerankRequest,
 ) -> Result<synapse_core::RerankScores, WireOperationError> {
-    let permit = acquire_execution_permit(runtime).await?;
+    let permit = acquire_execution_permit(runtime, None).await?;
     match &model.backend {
         EmbedBackend::Ort(_) | EmbedBackend::Owned(_) => Err(WireOperationError::from_stable(
             StableError::artifact_invalid(),
@@ -5839,7 +5996,7 @@ async fn execute_generate(
     model: &EmbeddingModel,
     request: GenerateRequest,
 ) -> Result<GenerateOutput, WireOperationError> {
-    let permit = acquire_execution_permit(runtime).await?;
+    let permit = acquire_execution_permit(runtime, None).await?;
     match &model.backend {
         EmbedBackend::Ort(_) | EmbedBackend::Owned(_) => Err(WireOperationError::from_stable(
             StableError::artifact_invalid(),
@@ -6857,7 +7014,7 @@ async fn execute_generate_probe_for_model(
             GenerateRequest {
                 prompt,
                 max_tokens: item.max_new_tokens,
-                grammar: None,
+                grammar: None, // SEE audit S2: parked until safe forwarding is validated
             },
         )
         .await
