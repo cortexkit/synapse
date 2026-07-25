@@ -71,18 +71,19 @@ inline float matrix_dot_q8_chunk(
     return (float)products[0] + (float)products[1] + (float)products[2] + (float)products[3];
 }
 
-inline float matrix_dot_q8_simd(
+inline float matrix_dot_q8_partial(
     const device half *input,
     const device uchar *q8,
     uint row,
     uint input_width,
-    uint lane
+    uint sub_lane
 ) {
     float partial = 0.0f;
-    // Eight lanes each consume a contiguous char4/half4 slice. The remaining
-    // lanes stay active with zero partials so simd_sum remains well-defined.
-    if (lane < 8) {
-        uint lane_start = lane * 4;
+    // Eight sub-lanes each consume a contiguous char4/half4 slice of this row,
+    // in exactly the same ascending block order as before. Only the reduction
+    // moved to the caller so four independent rows can share one simdgroup.
+    {
+        uint lane_start = sub_lane * 4;
         uint block_count = input_width / Q8_BLOCK_ELEMENTS;
         const device uchar *row_q8 = q8 + row * block_count * Q8_BLOCK_BYTES;
         const device half *input_block = input;
@@ -102,6 +103,36 @@ inline float matrix_dot_q8_simd(
             input_block += Q8_BLOCK_ELEMENTS;
             row_q8 += Q8_BLOCK_BYTES;
         }
+    }
+    return partial;
+}
+
+// Four independent rows per simdgroup: lanes [8g, 8g+8) own row_base + g.
+// Each row is still reduced by one simd_sum over a 32-lane vector whose other
+// 24 entries are exactly zero; the nonzero window only shifts by whole groups
+// of eight lanes, so every row's reduction network and f32 addition order are
+// identical to the single-row-per-simdgroup form.
+inline float metal_step_pack_sum(float partial, uint group) {
+    float value = 0.0f;
+    for (uint target = 0; target < 4; ++target) {
+        float summed = simd_sum(group == target ? partial : 0.0f);
+        if (group == target) value = summed;
+    }
+    return value;
+}
+
+inline float matrix_dot_q8_simd(
+    const device half *input,
+    const device uchar *q8,
+    uint row,
+    uint input_width,
+    uint lane
+) {
+    float partial = 0.0f;
+    // Eight lanes each consume a contiguous char4/half4 slice. The remaining
+    // lanes stay active with zero partials so simd_sum remains well-defined.
+    if (lane < 8) {
+        partial = matrix_dot_q8_partial(input, q8, row, input_width, lane);
     }
     return simd_sum(partial);
 }
@@ -414,10 +445,17 @@ kernel void metal_step_matvec_residual(
         return;
     }
     uint lane = gid % METAL_STEP_SIMD_WIDTH;
-    uint row = gid / METAL_STEP_SIMD_WIDTH;
-    if (row >= config.output_width) return;
-    float value = matrix_dot_q8_simd(input, q8, row, config.input_width, lane);
-    if (lane == 0) {
+    uint group = lane / 8;
+    uint sub_lane = lane % 8;
+    uint row_base = (gid / METAL_STEP_SIMD_WIDTH) * 4;
+    if (row_base >= config.output_width) return;
+    uint row = row_base + group;
+    float partial = 0.0f;
+    if (row < config.output_width) {
+        partial = matrix_dot_q8_partial(input, q8, row, config.input_width, sub_lane);
+    }
+    float value = metal_step_pack_sum(partial, group);
+    if (sub_lane == 0 && row < config.output_width) {
         output[row] = (half)(value + (config.add_residual != 0 ? (float)residual[row] : 0.0f));
     }
 }
@@ -428,45 +466,63 @@ kernel void metal_step_residual_rmsnorm(
     device half *normalized [[buffer(2)]],
     const device half *weight [[buffer(3)]],
     constant ResidualNormConfig &config [[buffer(4)]],
-    uint tid [[thread_position_in_grid]]) {
-    if (tid != 0) return;
-    float sum = 0.0f;
-    uint i = 0;
-    // Keep the residual add and sum in element order, but fetch both inputs
-    // with aligned half4 loads to reduce scalar memory instructions.
-    for (; i + 4 <= config.width; i += 4) {
+    uint tid [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    if (tid >= METAL_STEP_SIMD_WIDTH) return;
+    // Lane zero keeps the residual-add sum-of-squares in the original
+    // ascending element order; no single reduction is split. The independent
+    // per-element residual store and normalize outputs are then divided across
+    // the simdgroup, and every stored half is bit-identical to the one-thread
+    // version because the same float expression produces it.
+    float inv = 0.0f;
+    if (lane == 0) {
+        float sum = 0.0f;
+        uint i = 0;
+        for (; i + 4 <= config.width; i += 4) {
+            half4 projection_values = *(const device half4 *)(projection + i);
+            half4 residual_values = *(const device half4 *)(residual + i);
+            float value0 = (float)projection_values[0] + (float)residual_values[0];
+            float value1 = (float)projection_values[1] + (float)residual_values[1];
+            float value2 = (float)projection_values[2] + (float)residual_values[2];
+            float value3 = (float)projection_values[3] + (float)residual_values[3];
+            sum += value0 * value0;
+            sum += value1 * value1;
+            sum += value2 * value2;
+            sum += value3 * value3;
+        }
+        for (; i < config.width; ++i) {
+            float value = (float)projection[i] + (float)residual[i];
+            sum += value * value;
+        }
+        inv = rsqrt(sum / (float)config.width + config.epsilon);
+    }
+    // Lane zero's reads all retire before any lane republishes projection.
+    threadgroup_barrier(mem_flags::mem_device);
+    // Only lane zero holds a non-zero inverse norm, so the maximum is an exact
+    // bit-preserving broadcast.
+    inv = simd_max(inv);
+    uint vector_width = config.width & ~3u;
+    for (uint i = lane * 4; i + 4 <= config.width; i += METAL_STEP_SIMD_WIDTH * 4) {
         half4 projection_values = *(const device half4 *)(projection + i);
         half4 residual_values = *(const device half4 *)(residual + i);
-        float value0 = (float)projection_values[0] + (float)residual_values[0];
-        float value1 = (float)projection_values[1] + (float)residual_values[1];
-        float value2 = (float)projection_values[2] + (float)residual_values[2];
-        float value3 = (float)projection_values[3] + (float)residual_values[3];
-        projection[i] = (half)value0;
-        projection[i + 1] = (half)value1;
-        projection[i + 2] = (half)value2;
-        projection[i + 3] = (half)value3;
-        sum += value0 * value0;
-        sum += value1 * value1;
-        sum += value2 * value2;
-        sum += value3 * value3;
-    }
-    for (; i < config.width; ++i) {
-        float value = (float)projection[i] + (float)residual[i];
-        projection[i] = (half)value;
-        sum += value * value;
-    }
-    float inv = rsqrt(sum / (float)config.width + config.epsilon);
-    i = 0;
-    for (; i + 4 <= config.width; i += 4) {
-        half4 projection_values = *(const device half4 *)(projection + i);
         half4 weight_values = *(const device half4 *)(weight + i);
-        normalized[i] = (half)((float)projection_values[0] * inv * (float)weight_values[0]);
-        normalized[i + 1] = (half)((float)projection_values[1] * inv * (float)weight_values[1]);
-        normalized[i + 2] = (half)((float)projection_values[2] * inv * (float)weight_values[2]);
-        normalized[i + 3] = (half)((float)projection_values[3] * inv * (float)weight_values[3]);
+        half4 updated;
+        updated[0] = (half)((float)projection_values[0] + (float)residual_values[0]);
+        updated[1] = (half)((float)projection_values[1] + (float)residual_values[1]);
+        updated[2] = (half)((float)projection_values[2] + (float)residual_values[2]);
+        updated[3] = (half)((float)projection_values[3] + (float)residual_values[3]);
+        *(device half4 *)(projection + i) = updated;
+        half4 normalized_values;
+        normalized_values[0] = (half)((float)updated[0] * inv * (float)weight_values[0]);
+        normalized_values[1] = (half)((float)updated[1] * inv * (float)weight_values[1]);
+        normalized_values[2] = (half)((float)updated[2] * inv * (float)weight_values[2]);
+        normalized_values[3] = (half)((float)updated[3] * inv * (float)weight_values[3]);
+        *(device half4 *)(normalized + i) = normalized_values;
     }
-    for (; i < config.width; ++i) {
-        normalized[i] = (half)((float)projection[i] * inv * (float)weight[i]);
+    for (uint i = vector_width + lane; i < config.width; i += METAL_STEP_SIMD_WIDTH) {
+        half value = (half)((float)projection[i] + (float)residual[i]);
+        projection[i] = value;
+        normalized[i] = (half)((float)value * inv * (float)weight[i]);
     }
 }
 
@@ -487,11 +543,22 @@ kernel void metal_step_gate_up_swiglu(
         return;
     }
     uint lane = gid % METAL_STEP_SIMD_WIDTH;
-    uint row = gid / METAL_STEP_SIMD_WIDTH;
-    if (row >= config.output_width) return;
-    float gate = matrix_dot_q8_simd(input, gate_q8, row, config.input_width, lane);
-    float up = matrix_dot_q8_simd(input, up_q8, row, config.input_width, lane);
-    if (lane == 0) output[row] = (half)((gate / (1.0f + exp(-gate))) * up);
+    uint group = lane / 8;
+    uint sub_lane = lane % 8;
+    uint row_base = (gid / METAL_STEP_SIMD_WIDTH) * 4;
+    if (row_base >= config.output_width) return;
+    uint row = row_base + group;
+    float gate_partial = 0.0f;
+    float up_partial = 0.0f;
+    if (row < config.output_width) {
+        gate_partial = matrix_dot_q8_partial(input, gate_q8, row, config.input_width, sub_lane);
+        up_partial = matrix_dot_q8_partial(input, up_q8, row, config.input_width, sub_lane);
+    }
+    float gate = metal_step_pack_sum(gate_partial, group);
+    float up = metal_step_pack_sum(up_partial, group);
+    if (sub_lane == 0 && row < config.output_width) {
+        output[row] = (half)((gate / (1.0f + exp(-gate))) * up);
+    }
 }
 
 kernel void metal_step_lm_head(
@@ -507,10 +574,17 @@ kernel void metal_step_lm_head(
         return;
     }
     uint lane = gid % METAL_STEP_SIMD_WIDTH;
-    uint row = gid / METAL_STEP_SIMD_WIDTH;
-    if (row >= config.output_width) return;
-    float value = matrix_dot_q8_simd(input, q8, row, config.input_width, lane);
-    if (lane == 0) logits[row] = value;
+    uint group = lane / 8;
+    uint sub_lane = lane % 8;
+    uint row_base = (gid / METAL_STEP_SIMD_WIDTH) * 4;
+    if (row_base >= config.output_width) return;
+    uint row = row_base + group;
+    float partial = 0.0f;
+    if (row < config.output_width) {
+        partial = matrix_dot_q8_partial(input, q8, row, config.input_width, sub_lane);
+    }
+    float value = metal_step_pack_sum(partial, group);
+    if (sub_lane == 0 && row < config.output_width) logits[row] = value;
 }
 
 // Map a float to a strictly increasing UNSIGNED integer key so a plain unsigned
