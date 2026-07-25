@@ -127,26 +127,6 @@ impl ProviderPool {
             }
         }
     }
-
-    /// Sizes a bulk sub-batch so its estimated latency does not exceed the turnover target.
-    pub(super) fn subbatch_tokens(
-        &self,
-        total_tokens: u64,
-        estimated_ms: u64,
-        target_subbatch_ms: u64,
-    ) -> u64 {
-        if total_tokens == 0 {
-            return 0;
-        }
-        if estimated_ms == 0 || estimated_ms <= target_subbatch_ms {
-            return total_tokens;
-        }
-        let numerator = u128::from(total_tokens) * u128::from(target_subbatch_ms.max(1));
-        let sized = numerator / u128::from(estimated_ms);
-        u64::try_from(sized)
-            .unwrap_or(u64::MAX)
-            .clamp(1, total_tokens)
-    }
 }
 
 struct InteractiveWaiter<'a> {
@@ -226,13 +206,6 @@ impl Default for BreakerConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum BreakerStateSnapshot {
-    Closed,
-    Open { retry_after_ms: u64 },
-    HalfOpen,
-}
-
 #[derive(Clone, Copy, Debug)]
 enum BreakerState {
     Closed { consecutive_failures: u32 },
@@ -250,13 +223,6 @@ struct BreakerEntry {
 pub(super) struct BreakerLease {
     key: BreakerKey,
     epoch: u64,
-    half_open_probe: bool,
-}
-
-impl BreakerLease {
-    pub(super) fn is_half_open_probe(&self) -> bool {
-        self.half_open_probe
-    }
 }
 
 #[derive(Debug)]
@@ -290,8 +256,8 @@ impl CircuitBreaker {
                 consecutive_failures: 0,
             },
         });
-        let half_open_probe = match entry.state {
-            BreakerState::Closed { .. } => false,
+        match entry.state {
+            BreakerState::Closed { .. } => {}
             BreakerState::Open { opened_at_ms } => {
                 let elapsed = now_ms.saturating_sub(opened_at_ms);
                 if elapsed < self.config.cooldown_ms {
@@ -304,7 +270,6 @@ impl CircuitBreaker {
                 entry.state = BreakerState::HalfOpen {
                     probe_in_flight: true,
                 };
-                true
             }
             BreakerState::HalfOpen {
                 probe_in_flight: true,
@@ -320,13 +285,11 @@ impl CircuitBreaker {
                 entry.state = BreakerState::HalfOpen {
                     probe_in_flight: true,
                 };
-                true
             }
-        };
+        }
         Ok(BreakerLease {
             key: key.clone(),
             epoch: entry.epoch,
-            half_open_probe,
         })
     }
 
@@ -379,20 +342,6 @@ impl CircuitBreaker {
                 consecutive_failures: failures,
             }
         };
-    }
-
-    pub(super) fn state(&self, key: &BreakerKey, now_ms: u64) -> BreakerStateSnapshot {
-        let entries = self.entries.lock().expect("breaker lock poisoned");
-        match entries.get(key).map(|entry| entry.state) {
-            None | Some(BreakerState::Closed { .. }) => BreakerStateSnapshot::Closed,
-            Some(BreakerState::Open { opened_at_ms }) => BreakerStateSnapshot::Open {
-                retry_after_ms: self
-                    .config
-                    .cooldown_ms
-                    .saturating_sub(now_ms.saturating_sub(opened_at_ms)),
-            },
-            Some(BreakerState::HalfOpen { .. }) => BreakerStateSnapshot::HalfOpen,
-        }
     }
 }
 
@@ -1298,9 +1247,8 @@ mod tests {
         let mut probes = probes.lock().unwrap();
         assert_eq!(probes.len(), 1);
         let probe = probes.pop().unwrap();
-        assert!(probe.is_half_open_probe());
         breaker.record_success(&probe);
-        assert_eq!(breaker.state(&key, 101), BreakerStateSnapshot::Closed);
+        assert!(breaker.admit(&key, 101).is_ok());
     }
 
     #[test]
@@ -1319,7 +1267,7 @@ mod tests {
             },
             0,
         );
-        assert_eq!(breaker.state(&key, 0), BreakerStateSnapshot::Closed);
+        assert!(breaker.admit(&key, 0).is_ok());
     }
 
     #[test]
@@ -1406,7 +1354,6 @@ mod tests {
         bulk.await.unwrap();
         assert_eq!(*order.lock().unwrap(), ["interactive", "bulk"]);
         assert!(start.elapsed() < Duration::from_millis(100));
-        assert_eq!(pool.subbatch_tokens(10_000, 20_000, 10_000), 5_000);
     }
 
     struct ScriptedVault {
