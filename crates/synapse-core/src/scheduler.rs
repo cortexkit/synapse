@@ -169,17 +169,6 @@ struct RunningQuantum {
     until_ms: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SchedulerStateSnapshot {
-    pub queued_bytes: u64,
-    pub in_flight_bytes: u64,
-    pub byte_budget: u64,
-    pub interactive_depth: usize,
-    pub bulk_depth: usize,
-    pub control_depth: usize,
-    pub in_flight_workers: usize,
-}
-
 #[derive(Clone, Debug)]
 pub struct LaneScheduler<T> {
     config: SchedulerConfig,
@@ -220,18 +209,6 @@ impl<T> LaneScheduler<T> {
             running_quantum: None,
             in_flight_workers: 0,
             in_flight_requests: Vec::new(),
-        }
-    }
-
-    pub fn snapshot(&self) -> SchedulerStateSnapshot {
-        SchedulerStateSnapshot {
-            queued_bytes: self.queued_bytes,
-            in_flight_bytes: self.in_flight_bytes,
-            byte_budget: self.config.byte_budget,
-            interactive_depth: self.interactive.len(),
-            bulk_depth: self.bulk.len(),
-            control_depth: self.control.len(),
-            in_flight_workers: self.in_flight_workers,
         }
     }
 

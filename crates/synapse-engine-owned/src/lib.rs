@@ -95,33 +95,11 @@ impl OwnedDType {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ExecutionMode {
-    #[default]
-    Explicit,
-    Lazy,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct OwnedExecutionConfig {
-    pub package_cache_root: PathBuf,
-    pub max_length: usize,
-    pub attention_units: usize,
-    pub execution: ExecutionMode,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TokenizerPolicy {
     pub add_special_tokens: bool,
     pub pad_token_id: u32,
     pub terminal_token_id: Option<u32>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Capability {
-    pub family: ModelFamily,
-    pub dtype: OwnedDType,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -134,39 +112,6 @@ pub enum OwnedEngineError {
     UnsupportedPlatform,
     #[error("owned-metal model package: {0}")]
     InvalidPackage(String),
-}
-
-#[must_use]
-pub fn capabilities() -> Vec<Capability> {
-    if !cfg!(target_os = "macos") {
-        return Vec::new();
-    }
-    vec![
-        Capability {
-            family: ModelFamily::MiniLm,
-            dtype: OwnedDType::F16,
-        },
-        Capability {
-            family: ModelFamily::MiniLm,
-            dtype: OwnedDType::F32,
-        },
-        Capability {
-            family: ModelFamily::GteModernBert,
-            dtype: OwnedDType::F32,
-        },
-        Capability {
-            family: ModelFamily::GteModernBert,
-            dtype: OwnedDType::F16,
-        },
-        Capability {
-            family: ModelFamily::Qwen3,
-            dtype: OwnedDType::F16,
-        },
-        Capability {
-            family: ModelFamily::Qwen3,
-            dtype: OwnedDType::F32,
-        },
-    ]
 }
 
 pub fn detect_family(model_dir: impl AsRef<Path>) -> Result<ModelFamily, OwnedEngineError> {
@@ -184,38 +129,6 @@ pub fn detect_family(model_dir: impl AsRef<Path>) -> Result<ModelFamily, OwnedEn
     } else {
         Err(OwnedEngineError::UnsupportedFamily(model_type.to_string()))
     }
-}
-
-pub fn tokenizer_policy_for_package(
-    model_dir: impl AsRef<Path>,
-    family: ModelFamily,
-) -> Result<TokenizerPolicy, OwnedEngineError> {
-    let config = read_model_config(model_dir.as_ref())?;
-    let pad_token_id = config
-        .get("pad_token_id")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0)
-        .min(u64::from(u32::MAX)) as u32;
-    let terminal_token_id = if family == ModelFamily::Qwen3 {
-        Some(
-            config
-                .get("eos_token_id")
-                .and_then(serde_json::Value::as_u64)
-                .ok_or_else(|| {
-                    OwnedEngineError::InvalidPackage(
-                        "Qwen3 config is missing eos_token_id".to_string(),
-                    )
-                })?
-                .min(u64::from(u32::MAX)) as u32,
-        )
-    } else {
-        None
-    };
-    Ok(TokenizerPolicy {
-        add_special_tokens: true,
-        pad_token_id,
-        terminal_token_id,
-    })
 }
 
 fn read_model_config(model_dir: &Path) -> Result<serde_json::Value, OwnedEngineError> {
@@ -294,51 +207,6 @@ impl OwnedMetalEmbedEngine {
     #[must_use]
     pub const fn dtype(&self) -> OwnedDType {
         self.dtype
-    }
-
-    pub fn load_from_dir(
-        &mut self,
-        model_dir: impl AsRef<Path>,
-        execution: OwnedExecutionConfig,
-    ) -> Result<LoadedModel, EngineError> {
-        let mut runtime = RuntimeConfig::default();
-        runtime.values.insert(
-            "model_path".to_string(),
-            model_dir.as_ref().to_string_lossy().to_string(),
-        );
-        runtime.values.insert(
-            "package_cache_root".to_string(),
-            execution.package_cache_root.to_string_lossy().to_string(),
-        );
-        runtime.values.insert(
-            "execution".to_string(),
-            match execution.execution {
-                ExecutionMode::Explicit => "explicit".to_string(),
-                ExecutionMode::Lazy => "lazy".to_string(),
-            },
-        );
-        runtime
-            .values
-            .insert("max_tokens".to_string(), execution.max_length.to_string());
-        runtime.values.insert(
-            "attention_units".to_string(),
-            execution.attention_units.to_string(),
-        );
-        self.load(
-            &ValidatedArtifact {
-                digest: String::new(),
-                format: "safetensors-package".to_string(),
-            },
-            &runtime,
-        )
-    }
-
-    pub fn embed_tokens(
-        &self,
-        model: &LoadedModel,
-        sequences: Vec<Vec<u32>>,
-    ) -> Result<Vec<Vec<f32>>, EngineError> {
-        self.embed_batch(model, TokenBatch { items: sequences })
     }
 
     fn error(stage: EngineErrorStage, message: impl Into<String>) -> EngineError {
@@ -732,12 +600,5 @@ mod tests {
             OwnedDType::F32
         );
         assert_eq!(ModelFamily::Qwen3.recommended_dtype(), OwnedDType::F16);
-    }
-
-    #[test]
-    fn non_macos_capability_probe_is_empty() {
-        if !cfg!(target_os = "macos") {
-            assert!(capabilities().is_empty());
-        }
     }
 }
