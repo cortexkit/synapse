@@ -76,9 +76,8 @@ impl ProviderPool {
         class: RemoteClass,
         remaining_deadline_ms: Option<u64>,
     ) -> Result<ProviderPermit, RuntimeError> {
-        let deadline = remaining_deadline_ms.map(|ms| {
-            tokio::time::Instant::now() + std::time::Duration::from_millis(ms)
-        });
+        let deadline = remaining_deadline_ms
+            .map(|ms| tokio::time::Instant::now() + std::time::Duration::from_millis(ms));
         let mut waiter = InteractiveWaiter::new(self, class);
         loop {
             let notified = self.inner.turnover.notified();
@@ -118,7 +117,11 @@ impl ProviderPool {
                         "provider pool acquire timed out before permit became available",
                     ));
                 }
-                let _ = tokio::time::timeout(remaining, notified).await;
+                if tokio::time::timeout(remaining, notified).await.is_err() {
+                    return Err(RuntimeError::deadline_exceeded(
+                        "provider pool acquire timed out before permit became available",
+                    ));
+                }
             } else {
                 notified.await;
             }
@@ -1235,6 +1238,7 @@ mod tests {
 
     use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
     use reqwest::{Method, Url};
+    use synapse_core::StableErrorCode;
     use tokio::{sync::Barrier, time::sleep};
 
     use super::*;
@@ -1336,6 +1340,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_pool_timeout_fires_when_turnover_never_arrives() {
+        let pool = ProviderPool::new(1).unwrap();
+        let held = pool.acquire(RemoteClass::Bulk, None).await.unwrap();
+        let start = Instant::now();
+        let error = pool
+            .acquire(RemoteClass::Interactive, Some(20))
+            .await
+            .expect_err("a held provider permit must time out");
+        let elapsed = start.elapsed();
+        assert_eq!(error.stable.code, StableErrorCode::ProviderUnavailable);
+        assert_eq!(error.stable.class, synapse_core::ErrorClass::Transient);
+        assert!(
+            (Duration::from_millis(10)..=Duration::from_millis(500)).contains(&elapsed),
+            "provider-pool timeout fired outside its bound: {elapsed:?}"
+        );
+
+        let zero_start = Instant::now();
+        let zero_error = pool
+            .acquire(RemoteClass::Interactive, Some(0))
+            .await
+            .expect_err("a held provider permit must reject a zero deadline");
+        assert_eq!(zero_error.stable.code, StableErrorCode::ProviderUnavailable);
+        assert!(
+            zero_start.elapsed() <= Duration::from_millis(500),
+            "zero-deadline provider-pool timeout took too long: {:?}",
+            zero_start.elapsed()
+        );
+        drop(held);
+    }
+
+    #[tokio::test]
     async fn interactive_turnover_precedes_bulk_and_wait_is_one_subbatch() {
         let pool = ProviderPool::new(1).unwrap();
         let first = pool.acquire(RemoteClass::Bulk, None).await.unwrap();
@@ -1348,7 +1383,10 @@ mod tests {
         let interactive_order = Arc::clone(&order);
         let interactive = tokio::spawn(async move {
             interactive_barrier.wait().await;
-            let permit = interactive_pool.acquire(RemoteClass::Interactive, None).await.unwrap();
+            let permit = interactive_pool
+                .acquire(RemoteClass::Interactive, None)
+                .await
+                .unwrap();
             interactive_order.lock().unwrap().push("interactive");
             drop(permit);
         });

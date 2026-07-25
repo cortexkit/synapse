@@ -62,6 +62,7 @@ impl Drop for ModuleProcess {
 struct RemoteMockProvider {
     port: u16,
     failures_remaining: Arc<AtomicUsize>,
+    requests: Arc<AtomicUsize>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -70,21 +71,25 @@ impl RemoteMockProvider {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let failures_remaining = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(AtomicUsize::new(0));
         let task_failures = Arc::clone(&failures_remaining);
+        let task_requests = Arc::clone(&requests);
         let task = tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
                     return;
                 };
                 let failures = Arc::clone(&task_failures);
+                let requests = Arc::clone(&task_requests);
                 tokio::spawn(async move {
-                    serve_remote_mock_request(stream, failures).await;
+                    serve_remote_mock_request(stream, failures, requests).await;
                 });
             }
         });
         Self {
             port,
             failures_remaining,
+            requests,
             task,
         }
     }
@@ -96,6 +101,10 @@ impl RemoteMockProvider {
     fn fail_next(&self, count: usize) {
         self.failures_remaining.store(count, Ordering::SeqCst);
     }
+
+    fn request_count(&self) -> usize {
+        self.requests.load(Ordering::SeqCst)
+    }
 }
 
 impl Drop for RemoteMockProvider {
@@ -104,7 +113,11 @@ impl Drop for RemoteMockProvider {
     }
 }
 
-async fn serve_remote_mock_request(mut stream: TcpStream, failures_remaining: Arc<AtomicUsize>) {
+async fn serve_remote_mock_request(
+    mut stream: TcpStream,
+    failures_remaining: Arc<AtomicUsize>,
+    requests: Arc<AtomicUsize>,
+) {
     let mut request = Vec::new();
     let mut buffer = [0_u8; 4096];
     let header_end = loop {
@@ -139,6 +152,7 @@ async fn serve_remote_mock_request(mut stream: TcpStream, failures_remaining: Ar
         }
         request.extend_from_slice(&buffer[..read]);
     }
+    requests.fetch_add(1, Ordering::SeqCst);
     if failures_remaining
         .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
             remaining.checked_sub(1)
@@ -715,6 +729,141 @@ async fn remote_gateway_declares_calibrates_checkpoints_trips_and_recovers() {
     )
     .await;
     assert_eq!(recovered["result"]["assurance"], "declared");
+}
+
+#[tokio::test]
+async fn job_resume_respawns_remote_job_and_pages_are_readable() {
+    let provider = RemoteMockProvider::start().await;
+    let config = serde_json::json!({
+        "inline": {"max_items": 1, "max_tokens": 8192},
+        "jobs": {
+            "execution_ttl_ms": 60_000,
+            "result_retention_ttl_ms": 60_000,
+            "resume_deadline_ms": 60_000,
+            "result_page_bytes": 4_096
+        },
+        "remote_providers": [{
+            "name": "mock",
+            "base_url": provider.base_url(),
+            "adapter": {"kind": "openai_compatible"},
+            "auth": {"kind": "none"},
+            "models": [{
+                "synapse_model_id": "remote-embed",
+                "task": "embed",
+                "model": "mock-embed",
+                "identity_revision": "r1",
+                "dims": 3,
+                "input_profile_id": "whitespace-v1",
+                "sentinel_texts": ["alpha", "beta", "gamma"]
+            }],
+            "connect_timeout_ms": 1_000,
+            "read_timeout_ms": 1_000
+        }]
+    })
+    .to_string();
+    let (daemon, mut module, mut consumer, route) = open_route_with_config(&config).await;
+    run_probe_job(
+        &mut consumer,
+        route,
+        10,
+        serde_json::json!({"models":["remote-embed"],"request_key":"resume-probe"}),
+    )
+    .await;
+    let accepted = route_request(
+        &mut consumer,
+        route,
+        11,
+        serde_json::json!({
+            "method": "embed.batch",
+            "params": {
+                "model": "remote-embed",
+                "request_key": "resume-wire",
+                "accept_declared": true,
+                "items": [
+                    {"id": "first", "text": "first resumed item"},
+                    {"id": "second", "text": "second resumed item"}
+                ]
+            }
+        }),
+    )
+    .await;
+    let job_id = accepted["result"]["job_id"]
+        .as_str()
+        .expect("job-shaped remote batch returns a job id")
+        .to_string();
+    let requests_before_restart = provider.request_count();
+
+    // Stop the original execution owner before representing a vault pause in
+    // the durable row. The e2e daemon has no vault fixture, so this preserves
+    // the same paused boundary without allowing the first task to race resume.
+    drop(consumer);
+    module
+        .child
+        .kill()
+        .await
+        .expect("original module should stop");
+    let _ = module.child.wait().await;
+    sleep(Duration::from_millis(100)).await;
+
+    let module = spawn_synapse_module_with_config(&daemon.connection_file_path, &config);
+    let (daemon, _module, mut consumer, route) =
+        open_route_for_started_module(daemon, module).await;
+    let store_path = expected_store_path(&daemon.data_home);
+    let connection = Connection::open(store_path).expect("open durable test store");
+    let generation: i64 = connection
+        .query_row(
+            "SELECT module_generation FROM module_meta WHERE id = 0",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read current module generation");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("read test clock")
+        .as_millis() as i64;
+    let changed = connection
+        .execute(
+            "UPDATE jobs SET state = 'paused_needs_reauth', module_generation = ?1,
+                 updated_ms = ?2, execution_expires_ms = NULL, active_attempt_id = NULL,
+                 logical_handle = NULL, paused_at_ms = ?2, resume_deadline_ms = ?3,
+                 error_json = NULL, terminal_at_ms = NULL WHERE job_id = ?4",
+            params![generation, now, now + 60_000, job_id],
+        )
+        .expect("represent a durable vault pause");
+    assert_eq!(changed, 1, "the submitted job must be paused before resume");
+
+    let resumed = route_request(
+        &mut consumer,
+        route,
+        12,
+        serde_json::json!({"method":"job.resume","params":{"job_id":job_id}}),
+    )
+    .await;
+    assert!(
+        matches!(
+            resumed["result"]["state"].as_str(),
+            Some("queued" | "running" | "done")
+        ),
+        "job.resume should return a live job status: {resumed}"
+    );
+    let done = poll_embed_result(&mut consumer, route, 13, &job_id).await;
+    assert_eq!(done["result"]["state"], "done");
+    assert_eq!(done["result"]["page_count"], 2);
+    assert!(
+        provider.request_count() > requests_before_restart,
+        "resume must issue a new provider request rather than only flipping state"
+    );
+    let second_page = route_request(
+        &mut consumer,
+        route,
+        14,
+        serde_json::json!({"method":"embed.result","params":{"job_id":job_id,"page":1}}),
+    )
+    .await;
+    assert_eq!(
+        second_page["result"]["payload"]["vectors"][0]["id"], "second",
+        "second page should expose the resumed job's second item: {second_page}"
+    );
 }
 
 #[tokio::test]
