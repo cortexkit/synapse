@@ -200,3 +200,89 @@ only Mesa llvmpipe because the CUDA container lacked the NVIDIA Vulkan ICD, so
 `vulkan_probe` could not exercise the RTX 4090. The contract was destroyed
 immediately. No decode parity or throughput result is claimed from that failed
 host setup. **Gates were instead closed on the Ally RDNA3 iGPU** (this document).
+
+
+## Wave 3 decode mechanisms: subgroup parallelism on Ally RDNA3
+
+Wave 3 ports the two exactness-safe mechanisms proven in the Metal step path. The
+Ally is an ASUS ROG Ally X with AMD Radeon Graphics (RDNA3), Vulkan 1.4.334,
+driver_raw `8388981`; its queried subgroup size was **64**. The shaders do not
+assume that value: both use a fixed 64-invocation workgroup and derive the number
+of subgroups and subgroup-local row from `gl_SubgroupSize`, so wave32 (two
+subgroups) and wave64 (one subgroup) use the same vendored SPIR-V.
+
+### Ladder
+
+The numbers below are single-process 20x64 wall rates and are **NON-authoritative**
+at this maturity. The baseline is the wave-1 serial decode cell in this document;
+M1 and M2 were each measured from a fresh Ally process using the same fixtures and
+command-line protocol.
+
+| Step | Mechanism | f16 decode tok/s | Q8 decode tok/s | Q8 exact / 20 | Q8 median depth | near-ties |
+|---|---|---:|---:|---:|---:|---:|
+| baseline | serial one-invocation rows | 4.044 | 5.242 | 10/20 | 59.0 | 0 |
+| M1 | subgroup RMSNorm broadcast + lane-split scale/store | 4.261 | 5.573 | 10/20 | 59.0 | 0 |
+| M2 | four independent serial Q8 rows per subgroup | 4.213 (control) | **13.407** | 10/20 | 59.0 | 0 |
+
+M1 is `+5.4%` f16 and `+6.3%` Q8 versus baseline. M2 is `+140.5%` versus
+M1 Q8 and `+155.8%` versus baseline Q8. The small M2 f16 movement is normal
+single-process variation; M2 does not change the f16 matvec shader.
+
+### M1 gate: subgroup-parallel RMSNorm
+
+`decode_rms_norm.comp` now gives one subgroup exclusive ownership of a row.
+Invocation 0 alone walks the complete square-sum left-to-right in f32, then
+`subgroupBroadcast` publishes only the inverse norm. Lanes split the independent
+per-element stores; no row reduction or accumulation reassociation was introduced.
+The host records the physical subgroup size and dispatches the corresponding
+number of 64-invocation workgroups.
+
+| Gate | Result | Evidence |
+|---|---|---|
+| f16 20x64 pinned parity | **PASS** | 20/20 prompts, 1,280/1,280 tokens exact, 0 near-ties; 4.261 tok/s |
+| Q8 quality floor | **PASS** | 10/20 prompts exact, median match depth 59.0, 0 near-ties; 5.573 tok/s |
+| f16 470+64 depth | **PASS** | 64/64 tokens exact, 0 near-ties; 2.066 tok/s decode |
+| Vulkan build and shader | **PASS** | `cargo build --release --features vulkan --bin spike-unified-rt`; `glslc --target-env=vulkan1.3`; runtime queried subgroup 64 |
+
+Raw M1 results are committed under
+`results/vulkan-ally/wave3/m1-f16-20x64.json`,
+`m1-q8-20x64.json`, and `m1-f16-depth470.json`.
+
+### M2 gate: four independent serial Q8 rows per subgroup
+
+`decode_matvec_q8_0.comp` uses four active subgroup invocations, one per output
+row; every active invocation retains the original block and element loops and
+its complete left-to-right f32 sum. The remaining subgroup lanes are no longer
+idle across separate workgroups, but no subgroup reduction combines partials.
+The host dispatches four rows per subgroup and accounts for both wave32 and
+wave64 when calculating workgroup counts.
+
+| Gate | Result | Evidence |
+|---|---|---|
+| f16 20x64 pinned parity | **PASS** | 20/20 prompts, 1,280/1,280 tokens exact, 0 near-ties; 4.213 tok/s control |
+| Q8 quality floor | **PASS** | 10/20 prompts exact, median match depth 59.0, 0 near-ties; **13.407 tok/s** |
+| f16 470+64 depth | **PASS** | 64/64 tokens exact, 0 near-ties; 2.069 tok/s decode |
+| Vulkan build and shader | **PASS** | Ally release build passed and the vendored Q8 SPIR-V loaded on AMD Radeon Graphics, subgroup 64 |
+
+Raw M2 results are committed under
+`results/vulkan-ally/wave3/m2-f16-20x64.json`,
+`m2-q8-20x64.json`, and `m2-f16-depth470.json`.
+
+The optional vectorized f16 loads and Q8 block-address hoisting were not ported
+in this wave; the two requested mechanisms were gated first and the Q8 pack-four
+result already cleared the wave's measurement target without changing a dot
+product's reduction order.
+
+### Final llama-Vulkan ratio
+
+The incumbent llama.cpp-Vulkan Q8 decode cell remains `127.0 tok/s` from the
+wave-1 Ally measurement. Recomputing the ratio with the final M2 owned result:
+
+| Metric | Value |
+|---|---:|
+| owned Q8 decode after M2 | **13.407 tok/s** |
+| llama.cpp-Vulkan Q8 decode | 127.0 tok/s |
+| **owned / llama ratio** | **10.56%** (llama is 9.47x faster) |
+
+This is a throughput ratio only; the exactness and Q8 quality gates above remain
+the acceptance criteria for the owned decode path.
