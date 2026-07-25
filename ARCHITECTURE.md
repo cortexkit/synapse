@@ -31,7 +31,7 @@
 **Synapse Owned Engine (`synapse-engine-owned`):**
 - Purpose: Primary in-process execution engine for Apple Silicon (macOS), providing exact-match Metal MPSGraph inference for ModernBERT, Qwen3, and MiniLM models. 
 - Location: `crates/synapse-engine-owned`
-- Contains: Rust-to-Objective-C bindings, Metal shader graphs, and tensor operations for embedding and reranking. The module stays the sole tokenizer owner; this engine strictly consumes canonical token IDs and executes tensor logic.
+- Contains: Rust-to-Objective-C bindings, Metal shader graphs (including macOS 15+ `@available`-guarded fused scaled-dot-product attention for ModernBERT with `GRAPH_REVISION` package cache invalidation), and tensor operations for embedding and reranking. The module stays the sole tokenizer owner; this engine strictly consumes canonical token IDs and executes tensor logic.
 - Depends on: `synapse-core`, `safetensors`, `half`, Apple's `Metal` and `MPSGraph` frameworks.
 - Used by: `synapse-module` as the primary local engine.
 

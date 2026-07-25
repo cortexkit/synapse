@@ -67,7 +67,7 @@
 **crates/synapse-engine-owned/:**
 - Purpose: The primary in-process execution engine for Apple Silicon (macOS).
 - Contains: Metal MPSGraph inference layers for ModernBERT, Qwen3, and MiniLM models.
-- Key files: `crates/synapse-engine-owned/src/lib.rs`, `crates/synapse-engine-owned/src/metal_mpsgraph.m`
+- Key files: `crates/synapse-engine-owned/src/lib.rs`, `crates/synapse-engine-owned/src/modernbert_mpsgraph.m`, `crates/synapse-engine-owned/src/metal_mpsgraph.m`
 
 **crates/synapse-module/:**
 - Purpose: The primary SubC service module. Handles the content-addressed model cache, durable jobs, worker hosting, remote provider dispatch, and route binding.
