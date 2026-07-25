@@ -67,7 +67,7 @@ impl MetalExecutionConfig {
 
     #[allow(dead_code)]
     fn optimization_level(&self) -> i32 {
-        if std::env::var_os("SYNAPSE_MPS_COMPILE_O1").map_or(false, |v| v == "1") {
+        if std::env::var_os("SYNAPSE_MPS_COMPILE_O1").is_some_and(|v| v == "1") {
             1
         } else {
             0
