@@ -65,6 +65,15 @@ impl MetalExecutionConfig {
         })
     }
 
+    #[allow(dead_code)]
+    fn optimization_level(&self) -> i32 {
+        if std::env::var_os("SYNAPSE_MPS_COMPILE_O1").map_or(false, |v| v == "1") {
+            1
+        } else {
+            0
+        }
+    }
+
     fn package_path(&self, batch: usize, seq: usize) -> Option<PathBuf> {
         self.package_root
             .as_ref()

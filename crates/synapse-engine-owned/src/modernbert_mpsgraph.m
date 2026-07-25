@@ -574,6 +574,7 @@ int32_t synapse_modernbert_mps_forward(
     float epsilon,
     int32_t dtype,
     int32_t explicit_execution,
+    int32_t optimization_level,
     const char *package_path,
     const void *input,
     const float *full_mask,
@@ -627,7 +628,8 @@ int32_t synapse_modernbert_mps_forward(
             const double executable_started = modernbert_profile_now();
             if (explicit_execution && plan->executable == nil) {
                 plan->executable = synapse_mps_explicit_executable(
-                    plan->graph, context->runtime.device, plan->output_tensor, package_path,
+                    plan->graph, context->runtime.device, plan->output_tensor,
+                    optimization_level, package_path,
                     &plan->executable_feed_tensors
                 );
                 if (plan->executable == nil) {
