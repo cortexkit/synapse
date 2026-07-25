@@ -353,6 +353,7 @@ mod enabled {
         timestamp_valid_bits: u32,
         gemm: VulkanGemm,
         shader_int8_supported: bool,
+        subgroup_size: u32,
     }
 
     impl DeviceState {
@@ -525,6 +526,11 @@ mod enabled {
                 }
                 let mut storage16 = vk::PhysicalDevice16BitStorageFeatures::default()
                     .storage_buffer16_bit_access(true);
+                ensure!(
+                    subgroup.subgroup_size > 0 && 64 % subgroup.subgroup_size == 0,
+                    "Vulkan decode requires a subgroup size that divides the 64-invocation workgroup, got {}",
+                    subgroup.subgroup_size
+                );
                 let shader_int8_supported = supported_float16.shader_int8 != 0;
                 let mut float16 = vk::PhysicalDeviceShaderFloat16Int8Features::default()
                     .shader_float16(true)
@@ -619,8 +625,17 @@ mod enabled {
                     timestamp_valid_bits,
                     gemm,
                     shader_int8_supported,
+                    subgroup_size: subgroup.subgroup_size,
                 }))
             }
+        }
+
+        // Decode shaders use a fixed 64-invocation workgroup so one binary
+        // handles both RDNA3 wave32 and wave64. This computes the workgroups
+        // needed when each subgroup owns a fixed number of independent rows.
+        fn subgroup_groups(&self, rows: usize, rows_per_subgroup: u32) -> u32 {
+            let subgroups_per_workgroup = 64 / self.subgroup_size;
+            rows.div_ceil((subgroups_per_workgroup * rows_per_subgroup) as usize) as u32
         }
 
         fn memory_type(
@@ -3877,7 +3892,7 @@ mod enabled {
                                 epsilon: self.model.config.rms_norm_eps,
                                 identity: 0,
                             },
-                            [1, 1, 1],
+                            [self.state.subgroup_groups(1, 1), 1, 1],
                             layer_index,
                             StageClass::Pointwise,
                         )?;
@@ -4038,7 +4053,7 @@ mod enabled {
                                 epsilon: self.model.config.rms_norm_eps,
                                 identity: 0,
                             },
-                            [1, 1, 1],
+                            [self.state.subgroup_groups(1, 1), 1, 1],
                             layer_index,
                             StageClass::Pointwise,
                         )?;
@@ -4120,7 +4135,7 @@ mod enabled {
                                 epsilon: self.model.config.rms_norm_eps,
                                 identity: 0,
                             },
-                            [1, 1, 1],
+                            [self.state.subgroup_groups(1, 1), 1, 1],
                             self.layers.len(),
                             StageClass::Pointwise,
                         )?;

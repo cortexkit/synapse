@@ -1,27 +1,41 @@
 #version 460
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_scalar_block_layout : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
 
-// One invocation owns the full width so the square-sum and scale stay in a
-// fixed left-to-right f32 order. Parallel lane reductions reassociate that sum
-// and have been observed to flip near-tied greedy tokens on Qwen3 decode.
-layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+// One subgroup owns one row. Invocation 0 keeps the exact serial sum-of-squares
+// while the subgroup broadcasts the inverse norm and splits only the
+// independent per-element scale/store work. The fixed 64-invocation workgroup
+// handles both RDNA3 wave32 (two subgroups) and wave64 (one subgroup).
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 layout(set = 0, binding = 0, scalar) readonly buffer Input { float16_t values[]; } input_values;
 layout(set = 0, binding = 1, scalar) readonly buffer Weight { float values[]; } weight_values;
 layout(set = 0, binding = 2, scalar) writeonly buffer Output { float16_t values[]; } output_values;
 layout(push_constant) uniform Params { uint rows; uint width; float epsilon; uint unused; } p;
 
 void main() {
-    uint row = gl_WorkGroupID.x;
+    uint rows_per_workgroup = 64u / gl_SubgroupSize;
+    uint row = gl_WorkGroupID.x * rows_per_workgroup + gl_SubgroupID;
     if (row >= p.rows) return;
     uint base = row * p.width;
-    float square = 0.0;
-    for (uint column = 0; column < p.width; ++column) {
-        float value = float(input_values.values[base + column]);
-        square += value * value;
+    uint lane = gl_SubgroupInvocationID;
+
+    // Invocation 0 keeps the exact serial sum-of-squares in ascending order.
+    float inverse = 0.0;
+    if (lane == 0) {
+        float square = 0.0;
+        for (uint column = 0; column < p.width; ++column) {
+            float value = float(input_values.values[base + column]);
+            square += value * value;
+        }
+        inverse = inversesqrt(square / float(p.width) + p.epsilon);
     }
-    float inverse = inversesqrt(square / float(p.width) + p.epsilon);
-    for (uint column = 0; column < p.width; ++column) {
+
+    // Only the independent per-element work is parallel. No reduction of a
+    // row's f32 accumulation is introduced, preserving the decode parity fix.
+    inverse = subgroupBroadcast(inverse, 0);
+    for (uint column = lane; column < p.width; column += gl_SubgroupSize) {
         uint index = base + column;
         output_values.values[index] = float16_t(
             float(input_values.values[index]) * inverse * weight_values.values[column]
