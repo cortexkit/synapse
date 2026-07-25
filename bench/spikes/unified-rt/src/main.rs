@@ -602,9 +602,14 @@ impl MetalExecutionConfig {
                 .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
                 .filter(|build| !build.is_empty())
                 .unwrap_or_else(|| "unknown-os-build".to_owned());
+            let o1_suffix = if std::env::var_os("SYNAPSE_MPS_COMPILE_O1").map_or(false, |v| v == "1") {
+                "-o1"
+            } else {
+                ""
+            };
             let shape_key = shape_cache_key(args.shapes, args.bucket_policy);
             root.join(format!(
-                "{family}-graph-v{GRAPH_REVISION}-g{graph_digest:016x}-{shape_key}-{hash:016x}-{}-{os_build}",
+                "{family}-graph-v{GRAPH_REVISION}-g{graph_digest:016x}-{shape_key}-{hash:016x}-{}-{os_build}{o1_suffix}",
                 args.dtype.as_str()
             ))
         });
@@ -616,6 +621,15 @@ impl MetalExecutionConfig {
             execution: args.execution,
             package_root,
         })
+    }
+
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    fn optimization_level(&self) -> i32 {
+        if std::env::var_os("SYNAPSE_MPS_COMPILE_O1").map_or(false, |v| v == "1") {
+            1
+        } else {
+            0
+        }
     }
 
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]

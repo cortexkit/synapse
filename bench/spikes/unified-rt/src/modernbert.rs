@@ -281,6 +281,9 @@ impl ModernBertModel {
         texts: &[&str],
         shape: Option<BatchShape>,
     ) -> Result<Vec<Vec<f32>>> {
+        let attribution = std::env::var_os("SYNAPSE_EMBED_ATTRIBUTION")
+            .map_or(false, |v| v == "1");
+        let tokenize_started = std::time::Instant::now();
         let encodings = tokenizer
             .encode_batch(texts.to_vec(), true)
             .map_err(|error| anyhow::anyhow!("encode_batch: {error}"))?;
@@ -292,6 +295,10 @@ impl ModernBertModel {
             .max()
             .unwrap_or(1)
             .max(1);
+        let tokenize_ms = tokenize_started.elapsed().as_secs_f64() * 1000.0;
+        if attribution {
+            eprintln!("[synapse-embed-attribution] tokenize batch={real_batch} real_seq={real_seq} ms={tokenize_ms:.3}");
+        }
         let target = shape.unwrap_or(BatchShape {
             batch: real_batch,
             seq: real_seq,
@@ -311,6 +318,7 @@ impl ModernBertModel {
             self.config.max_position_embeddings
         );
 
+        let mask_started = std::time::Instant::now();
         let mut input_ids = vec![self.config.pad_token_id; batch * seq];
         let mut attention_mask = vec![0u8; batch * seq];
         for (row, encoding) in encodings.iter().enumerate() {
@@ -321,14 +329,29 @@ impl ModernBertModel {
                 );
             }
         }
+        let mask_ms = mask_started.elapsed().as_secs_f64() * 1000.0;
+        if attribution {
+            eprintln!("[synapse-embed-attribution] mask_build batch={batch} seq={seq} ms={mask_ms:.3}");
+        }
 
+        let forward_started = std::time::Instant::now();
         let hidden = self.forward(provider, &input_ids, &attention_mask, batch, seq)?;
+        let forward_ms = forward_started.elapsed().as_secs_f64() * 1000.0;
+        if attribution {
+            eprintln!("[synapse-embed-attribution] forward batch={batch} seq={seq} ms={forward_ms:.3}");
+        }
+
+        let pool_started = std::time::Instant::now();
         let mut vectors = Vec::with_capacity(real_batch);
         for row in 0..real_batch {
             let start = row * seq * self.config.hidden_size;
             let mut vector = hidden[start..start + self.config.hidden_size].to_vec();
             normalize_l2(&mut vector);
             vectors.push(vector);
+        }
+        let pool_ms = pool_started.elapsed().as_secs_f64() * 1000.0;
+        if attribution {
+            eprintln!("[synapse-embed-attribution] pool batch={real_batch} seq={seq} ms={pool_ms:.3}");
         }
         Ok(vectors)
     }
@@ -1190,6 +1213,7 @@ impl MetalContext {
                 model.config.norm_eps,
                 i32::from(f16),
                 i32::from(matches!(self.execution.execution, Execution::Explicit)),
+                self.execution.optimization_level(),
                 package_c
                     .as_ref()
                     .map_or(std::ptr::null(), |path| path.as_ptr()),
@@ -1303,6 +1327,7 @@ impl MetalContext {
                 model.config.norm_eps,
                 0,
                 i32::from(matches!(self.execution.execution, Execution::Explicit)),
+                self.execution.optimization_level(),
                 package_c
                     .as_ref()
                     .map_or(std::ptr::null(), |path| path.as_ptr()),
@@ -1382,6 +1407,7 @@ unsafe extern "C" {
         epsilon: f32,
         dtype: i32,
         explicit_execution: i32,
+        optimization_level: i32,
         package_path: *const std::ffi::c_char,
         input: *const std::ffi::c_void,
         full_mask: *const f32,

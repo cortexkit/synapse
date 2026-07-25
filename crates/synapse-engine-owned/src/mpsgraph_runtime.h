@@ -56,6 +56,7 @@ MPSGraphExecutable *synapse_mps_explicit_executable(
     MPSGraph *graph,
     id<MTLDevice> device,
     MPSGraphTensor *output,
+    int32_t optimization_level,
     const char *package_path,
     NSArray<MPSGraphTensor *> **feed_tensors
 );

@@ -179,11 +179,14 @@ MPSGraphExecutable *synapse_mps_explicit_executable(
     MPSGraph *graph,
     id<MTLDevice> device,
     MPSGraphTensor *output,
+    int32_t optimization_level,
     const char *package_path,
     NSArray<MPSGraphTensor *> **feed_tensors
 ) {
     MPSGraphCompilationDescriptor *descriptor = [[MPSGraphCompilationDescriptor alloc] init];
-    descriptor.optimizationLevel = MPSGraphOptimizationLevel0;
+    descriptor.optimizationLevel = optimization_level == 1
+        ? MPSGraphOptimizationLevel1
+        : MPSGraphOptimizationLevel0;
     descriptor.waitForCompilationCompletion = YES;
     MPSGraphExecutable *executable = nil;
     NSString *path = package_path == NULL ? nil : [NSString stringWithUTF8String:package_path];

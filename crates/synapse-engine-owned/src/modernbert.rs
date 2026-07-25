@@ -940,6 +940,7 @@ impl MetalContext {
                 model.config.norm_eps,
                 i32::from(f16),
                 i32::from(matches!(self.execution.execution, Execution::Explicit)),
+                self.execution.optimization_level(),
                 package_c
                     .as_ref()
                     .map_or(std::ptr::null(), |path| path.as_ptr()),
@@ -1053,6 +1054,7 @@ impl MetalContext {
                 model.config.norm_eps,
                 0,
                 i32::from(matches!(self.execution.execution, Execution::Explicit)),
+                self.execution.optimization_level(),
                 package_c
                     .as_ref()
                     .map_or(std::ptr::null(), |path| path.as_ptr()),
@@ -1132,6 +1134,7 @@ unsafe extern "C" {
         epsilon: f32,
         dtype: i32,
         explicit_execution: i32,
+        optimization_level: i32,
         package_path: *const std::ffi::c_char,
         input: *const std::ffi::c_void,
         full_mask: *const f32,

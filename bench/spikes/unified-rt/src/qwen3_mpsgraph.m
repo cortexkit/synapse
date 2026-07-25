@@ -403,7 +403,8 @@ int32_t synapse_qwen3_forward(
             NSUInteger element_size = dtype == 1 ? sizeof(uint16_t) : sizeof(float);
             if (explicit_execution && plan->executable == nil) {
                 plan->executable = synapse_mps_explicit_executable(
-                    plan->graph, context->runtime.device, plan->output, package_path,
+                    plan->graph, context->runtime.device, plan->output,
+                    /* optimization_level */ 0, package_path,
                     &plan->executable_feed_tensors
                 );
                 if (plan->executable == nil) {

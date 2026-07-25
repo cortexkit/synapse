@@ -277,3 +277,84 @@ SYNAPSE_MODERNBERT_DUMP_DIR=target/mb-dump-f16 $BIN ... --limit 1 --dtype f16 --
 ## Bucket-policy follow-up
 
 The three serving-shape open items are implemented by [BUCKET-POLICY.md](BUCKET-POLICY.md): the main harness supports in-process `--passes`, accelerator bucket shapes are pre-discovered during cold load, and bucket policy v1 replaces corpus-dependent shapes by default. `--shapes exact` remains available for A/B measurements. The locked-M1 rerun described there is still pending.
+
+### O1 steady-state measurement + dispatch attribution
+
+Two open questions from the embedding campaigns are measured directly:
+
+1. **O1 steady-state throughput** — the O0 compile choice was made on cold-compile cost
+   (10.97s/shape at O1 vs 88ms at O0, see below), but O1's steady-state throughput
+   delta had never been measured. MPSGraph O1 optimization produces no meaningful
+   speedup for the 22-layer ModernBERT encoder graph.
+
+2. **Dispatch/boundary attribution** — a coarse time split of the embed batch path
+   was missing. Attribution instrumentation now exists (env-gated, default-off) and
+   the first measurement is recorded below.
+
+Both measurements used the locked M1 (same `[bench-host]`, AC power, no
+`Runner.Worker`, load < 2.5), the harness's own 2,000-chunk fixture (corpus SHA-256
+`25d1d544...`, reference vectors `d55221d4...`), and `max_length=512`, f16, bucket
+policy v1, explicit execution.
+
+#### O1 steady-state throughput
+
+| Variant | Median tok/s | Mean tok/s | N | Deterministic | Mean cosine | Worst cosine |
+|---------|-------------:|-----------:|---:|:-------------:|------------:|------------:|
+| O0 (baseline) | 5,088.2 | 5,084.8 | 7 | yes | 0.999999 | 0.999999 |
+| O1 | 5,088.5 | 5,089.7 | 7 | yes | 0.999999 | 0.999999 |
+| **Delta** | **+0.01%** | | | | | |
+
+O1 does **not** clear +3%. The O1 steady-state speedup is effectively zero
+(+0.01%); MPSGraph's optimizer does not fuse or reduce the 22-layer graph in a
+way that translates to wall-clock improvement. The O1 path is deterministic and
+parity-identical to O0 (byte-identical vectors on same-input determinism probe,
+mean cosine 0.999999 against the pinned reference).
+
+#### Cold-compile cost
+
+| Variant | Cold compile + first embed | Compile overhead vs O0 |
+|---------|--------------------------:|----------------------:|
+| O0 | 0.670s | — |
+| O1 | 2.389s | +1.719s |
+
+The O1 compile overhead is +1.72s per shape vs O0, confirming the original serving
+policy rationale for choosing O0: the compile penalty is substantial and the
+steady-state gain is nil.
+
+#### Dispatch attribution
+
+Attribution for a single 8×512 batch (SYNAPSE_EMBED_ATTRIBUTION=1,
+SYNAPSE_EMBED_PROFILE=1):
+
+| Stage | Time (ms) | % of forward | Notes |
+|-------|----------:|-------------:|-------|
+| Tokenize | 1.04 | 0.36% | HuggingFace tokenizers encode_batch |
+| Mask build | 0.003 | ~0% | CPU padding + attention mask construction |
+| MPSGraph plan | 37.55 | — | Graph topology lookup (cached after first call) |
+| Executable select (cold) | 10.05 | — | First-call package load; 0 on cache hit |
+| Buffer feed | 23.28 | 11.6% | Host→GPU memcpy for inputs, masks, RoPE tables |
+| Graph execute | 200.04 | 70.1% | MPSGraph kernel execution on GPU |
+| Readback | 0.55 | 0.19% | GPU→host result copy |
+| Pool (L2 norm) | 0.01 | ~0% | CLS extraction + L2 normalize |
+| **Total forward** | **285.3** | **100%** | Rust-side wall time for `MetalContext::forward` |
+
+The dispatch attribution shows that **GPU execution dominates** (70% of forward wall
+time), with buffer feed at 12% and all other stages negligible. This confirms the
+host-side seam (tokenize + mask + pool) is already thin; future embed campaigns
+should focus on GPU kernel efficiency, not host-side optimization.
+
+#### Implementation details
+
+- **`SYNAPSE_MPS_COMPILE_O1=1`** — env switch to compile MPSGraph executables at
+  optimization level 1. Adds `-o1` suffix to the package cache directory identity
+  (the `GRAPH_REVISION` constant is not changed). When unset, the default is O0
+  (byte-identical to the previous behavior).
+- **`SYNAPSE_EMBED_ATTRIBUTION=1`** — env switch to emit per-stage timing to
+  stderr (tokenize, mask_build, forward, pool from Rust; buffer_feed, execute,
+  readback from Obj-C). When unset, no timing output is produced (zero overhead,
+  no `Instant::now` calls on the default path).
+- **`SYNAPSE_EMBED_PROFILE=1`** — existing Obj-C profiling hook; extended with
+  attribution output for buffer_feed, execute, and readback stages.
+
+Both env switches are default-off, zero-effect when unset, and additive-only
+(no code path changes when disabled).
