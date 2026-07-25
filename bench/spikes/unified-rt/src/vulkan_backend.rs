@@ -3788,7 +3788,9 @@ mod enabled {
                         .context("Vulkan GPU lacks shader int8 required for Q8_0 decode")?,
                     &[input, q8_0, output],
                     &params,
-                    [rows as u32, 1, 1],
+                    // Four lanes in each subgroup own four independent rows;
+                    // each active lane still performs its row's full serial dot.
+                    [recorder.state.subgroup_groups(rows, 4), 1, 1],
                     layer,
                     stage,
                 )
