@@ -103,8 +103,18 @@ jobs:
         shell: pwsh
         run: |
           # Blacksmith's windows image does not ship LLVM (unlike GitHub-hosted).
+          # choco's CDN has failed this install with a bare exit 1 before (red on
+          # d58029a2, green on same-sha rerun) — retry so a red here means the
+          # failure survived three attempts, not one bad CDN draw.
           if (!(Test-Path "C:\Program Files\LLVM\bin\libclang.dll")) {
-            choco install llvm -y --no-progress | Out-Null
+            $attempts = 0
+            while ($true) {
+              $attempts++
+              choco install llvm -y --no-progress | Out-Null
+              if ($LASTEXITCODE -eq 0) { break }
+              if ($attempts -ge 3) { throw "choco install llvm failed after $attempts attempts" }
+              Start-Sleep -Seconds 20
+            }
           }
           echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
 
