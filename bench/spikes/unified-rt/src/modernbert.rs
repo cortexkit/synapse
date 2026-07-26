@@ -281,7 +281,7 @@ impl ModernBertModel {
         texts: &[&str],
         shape: Option<BatchShape>,
     ) -> Result<Vec<Vec<f32>>> {
-        let attribution = std::env::var_os("SYNAPSE_EMBED_ATTRIBUTION").map_or(false, |v| v == "1");
+        let attribution = std::env::var_os("SYNAPSE_EMBED_ATTRIBUTION").is_some_and(|v| v == "1");
         let tokenize_started = std::time::Instant::now();
         let encodings = tokenizer
             .encode_batch(texts.to_vec(), true)

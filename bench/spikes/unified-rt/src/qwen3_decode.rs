@@ -5,9 +5,11 @@
 //! Qwen3 implementation and keeps its KV buffers alive across calls.
 
 use std::collections::{BTreeMap, HashSet};
+use std::io::{BufRead, BufReader, Write};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::time::Instant;
 
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::json_constraint::{DecodeConstraint, TokenMask};
@@ -52,6 +54,34 @@ pub(crate) trait DecodeKernel {
     fn advance(&mut self, cache: &mut Self::Cache, token: u32) -> Result<Vec<f32>>;
     fn cache_position(&self, cache: &Self::Cache) -> usize;
     fn inspect_cache_layer(&self, cache: &Self::Cache, layer: usize) -> Result<Vec<f32>>;
+
+    /// Runs the draft tokens through the verifier and returns the greedy argmax
+    /// after each token. The first proposal is compared with the session's
+    /// pending logits; element `i - 1` verifies proposal `i`.
+    fn verify_tokens(&mut self, cache: &mut Self::Cache, tokens: &[u32]) -> Result<Vec<u32>> {
+        ensure!(
+            !tokens.is_empty(),
+            "verification requires at least one token"
+        );
+        let mut argmaxes = Vec::with_capacity(tokens.len());
+        for &token in tokens {
+            let logits = self.advance(cache, token)?;
+            let next = top_logits(&logits, 1)
+                .first()
+                .context("verifier produced empty logits")?
+                .token_id;
+            argmaxes.push(next);
+        }
+        Ok(argmaxes)
+    }
+
+    /// Restores the logical cache length after speculative verification. A
+    /// backend must guarantee that reads at later positions are excluded after
+    /// this call; overwritten in-slot data may remain physically allocated.
+    fn rewind(&mut self, _cache: &mut Self::Cache, _position: usize) -> Result<()> {
+        anyhow::bail!("this decode backend cannot rewind a speculative verification")
+    }
+
     fn stage_timings(&self) -> DecodeStageTimings {
         DecodeStageTimings::default()
     }
@@ -85,6 +115,214 @@ pub(crate) trait DecodeRuntime: DecodeKernel {
     fn optimization_level(&self) -> u8;
 }
 
+/// A proposed token span and the latency split reported by its draft source.
+#[derive(Debug, Default)]
+pub(crate) struct DraftProposal {
+    pub(crate) tokens: Vec<u32>,
+    pub(crate) compute_wall_s: f64,
+    pub(crate) transport_wall_s: f64,
+}
+
+/// Supplies greedy proposal spans without owning verifier state.
+pub(crate) trait DraftSource {
+    fn propose(&mut self, context: &[u32], max_tokens: usize) -> Result<DraftProposal>;
+}
+
+/// A correctness-control drafter backed by a separate invocation of the target
+/// model. The closure boundary lets the caller choose the target backend while
+/// keeping the acceptance loop independent of any particular runtime.
+#[allow(dead_code)]
+pub(crate) struct SelfDraft<F> {
+    propose_target: F,
+}
+
+#[allow(dead_code)]
+impl<F> SelfDraft<F> {
+    pub(crate) fn new(propose_target: F) -> Self {
+        Self { propose_target }
+    }
+}
+
+impl<F> DraftSource for SelfDraft<F>
+where
+    F: FnMut(&[u32], usize) -> Result<Vec<u32>>,
+{
+    fn propose(&mut self, context: &[u32], max_tokens: usize) -> Result<DraftProposal> {
+        Ok(DraftProposal {
+            tokens: (self.propose_target)(context, max_tokens)?,
+            ..DraftProposal::default()
+        })
+    }
+}
+
+/// A scripted negative-control drafter. Positions are absolute sequence
+/// positions, so tests can force a rejection after any accepted prefix.
+#[allow(dead_code)]
+pub(crate) struct MockDraft<F> {
+    propose_target: F,
+    replacements: BTreeMap<usize, u32>,
+}
+
+#[allow(dead_code)]
+impl<F> MockDraft<F> {
+    pub(crate) fn new(propose_target: F, replacements: BTreeMap<usize, u32>) -> Self {
+        Self {
+            propose_target,
+            replacements,
+        }
+    }
+}
+
+impl<F> DraftSource for MockDraft<F>
+where
+    F: FnMut(&[u32], usize) -> Result<Vec<u32>>,
+{
+    fn propose(&mut self, context: &[u32], max_tokens: usize) -> Result<DraftProposal> {
+        let mut tokens = (self.propose_target)(context, max_tokens)?;
+        for (offset, token) in tokens.iter_mut().enumerate() {
+            if let Some(&replacement) = self.replacements.get(&(context.len() + offset)) {
+                *token = replacement;
+            }
+        }
+        Ok(DraftProposal {
+            tokens,
+            ..DraftProposal::default()
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct AneDraftResponse {
+    draft_ids: Vec<u32>,
+    compute_wall_s: f64,
+}
+
+#[derive(Serialize)]
+struct AneDraftRequest<'a> {
+    token_ids: &'a [u32],
+}
+
+/// Persistent JSONL adapter for the Swift draft runner. It performs sequential
+/// stateless calls internally: its K4 model contributes only the final-position
+/// logits from each call, never four unrelated input positions.
+pub(crate) struct AneDraft {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<std::process::ChildStdout>,
+    window: usize,
+    draft_k: usize,
+}
+
+impl AneDraft {
+    pub(crate) fn spawn(
+        runner: &std::path::Path,
+        model: &std::path::Path,
+        window: usize,
+        draft_k: usize,
+    ) -> Result<Self> {
+        ensure!(window > 0, "ANE draft window must be positive");
+        ensure!(draft_k > 0, "ANE draft span must be positive");
+        let mut child = Command::new(runner)
+            .arg("serve")
+            .arg("--model")
+            .arg(model)
+            .arg("--window")
+            .arg(window.to_string())
+            .arg("--draft-tokens")
+            .arg(draft_k.to_string())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .with_context(|| format!("start ANE draft runner {}", runner.display()))?;
+        let stdin = child
+            .stdin
+            .take()
+            .context("ANE draft runner has no stdin")?;
+        let stdout = BufReader::new(
+            child
+                .stdout
+                .take()
+                .context("ANE draft runner has no stdout")?,
+        );
+        Ok(Self {
+            child,
+            stdin,
+            stdout,
+            window,
+            draft_k,
+        })
+    }
+}
+
+impl DraftSource for AneDraft {
+    fn propose(&mut self, context: &[u32], max_tokens: usize) -> Result<DraftProposal> {
+        let requested = self.draft_k.min(max_tokens);
+        ensure!(requested > 0, "ANE draft requested zero tokens");
+        let start = context.len().saturating_sub(self.window);
+        let request = serde_json::to_string(&AneDraftRequest {
+            token_ids: &context[start..],
+        })?;
+        let wall_started = Instant::now();
+        writeln!(self.stdin, "{request}").context("write ANE draft request")?;
+        self.stdin.flush().context("flush ANE draft request")?;
+        let mut line = String::new();
+        let bytes = self
+            .stdout
+            .read_line(&mut line)
+            .context("read ANE draft response")?;
+        ensure!(bytes > 0, "ANE draft runner exited without a response");
+        let response: AneDraftResponse =
+            serde_json::from_str(&line).context("parse ANE draft response")?;
+        ensure!(
+            response.draft_ids.len() == requested,
+            "ANE draft returned {} tokens, expected {requested}",
+            response.draft_ids.len()
+        );
+        let wall_s = wall_started.elapsed().as_secs_f64();
+        ensure!(
+            response.compute_wall_s >= 0.0 && response.compute_wall_s <= wall_s + 0.001,
+            "ANE draft reported an invalid compute duration"
+        );
+        Ok(DraftProposal {
+            tokens: response.draft_ids,
+            compute_wall_s: response.compute_wall_s,
+            transport_wall_s: (wall_s - response.compute_wall_s).max(0.0),
+        })
+    }
+}
+
+impl Drop for AneDraft {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Per-prompt counters and latency partitions for speculative greedy decode.
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub(crate) struct SpeculativeDecodeMetrics {
+    pub(crate) proposal_calls: usize,
+    pub(crate) proposed_tokens: usize,
+    pub(crate) verified_tokens: usize,
+    pub(crate) accepted_tokens: usize,
+    pub(crate) rejection_count: usize,
+    pub(crate) verifier_wall_s: f64,
+    pub(crate) rollback_wall_s: f64,
+    pub(crate) draft_compute_wall_s: f64,
+    pub(crate) draft_transport_wall_s: f64,
+}
+
+impl SpeculativeDecodeMetrics {
+    pub(crate) fn acceptance_rate(self) -> f64 {
+        self.accepted_tokens as f64 / self.proposed_tokens.max(1) as f64
+    }
+
+    pub(crate) fn mean_accepted_run_length(self) -> f64 {
+        self.accepted_tokens as f64 / self.proposal_calls.max(1) as f64
+    }
+}
+
 /// A paused session owns all logical state needed to resume generation exactly.
 pub(crate) struct DecodeSession<'a, K: DecodeKernel> {
     kernel: &'a mut K,
@@ -92,6 +330,9 @@ pub(crate) struct DecodeSession<'a, K: DecodeKernel> {
     sequence: Vec<u32>,
     generated: Vec<u32>,
     next_logits: Vec<f32>,
+    // A fully accepted device verification returns only the next greedy id, not
+    // a logits vector. It is sufficient for the next speculative iteration.
+    pending_greedy: Option<u32>,
     sample_wall_s: f64,
     constraint_wall_s: f64,
 }
@@ -114,6 +355,7 @@ impl<'a, K: DecodeKernel> DecodeSession<'a, K> {
             sequence: prompt.to_vec(),
             generated: Vec::new(),
             next_logits,
+            pending_greedy: None,
             sample_wall_s: 0.0,
             constraint_wall_s: 0.0,
         })
@@ -159,6 +401,10 @@ impl<'a, K: DecodeKernel> DecodeSession<'a, K> {
         top_k: usize,
         tap: &mut dyn TokenStreamTap,
     ) -> Result<Vec<u32>> {
+        ensure!(
+            self.pending_greedy.is_none(),
+            "cannot switch from speculative decode to logits-based decode without reprefill"
+        );
         self.generate_inner(max_tokens, stop_tokens, top_k, None, tap)
     }
 
@@ -170,7 +416,145 @@ impl<'a, K: DecodeKernel> DecodeSession<'a, K> {
         constraint: &mut dyn DecodeConstraint,
         tap: &mut dyn TokenStreamTap,
     ) -> Result<Vec<u32>> {
+        ensure!(
+            self.pending_greedy.is_none(),
+            "cannot switch from speculative decode to constrained decode without reprefill"
+        );
         self.generate_inner(max_tokens, stop_tokens, top_k, Some(constraint), tap)
+    }
+
+    /// Greedy Leviathan acceptance over a batched verifier. The verifier always
+    /// evaluates the proposed tokens from the current committed prefix. At a
+    /// mismatch, its argmax was computed from that exact prefix, so committing
+    /// it after a logical rewind produces the same continuation as target-only
+    /// greedy decode.
+    pub(crate) fn generate_speculative<D: DraftSource>(
+        &mut self,
+        draft: &mut D,
+        max_tokens: usize,
+        stop_tokens: &HashSet<u32>,
+        draft_span: usize,
+        tap: &mut dyn TokenStreamTap,
+    ) -> Result<(Vec<u32>, SpeculativeDecodeMetrics)> {
+        ensure!(draft_span > 0, "speculative draft span must be positive");
+        let first_generated = self.generated.len();
+        let mut produced = 0usize;
+        let mut metrics = SpeculativeDecodeMetrics::default();
+
+        while produced < max_tokens {
+            let capacity_left = self.kernel.capacity().saturating_sub(self.position());
+            ensure!(capacity_left > 0, "decode cache capacity exhausted");
+            let requested = draft_span.min(max_tokens - produced).min(capacity_left);
+            let proposal = draft.propose(&self.sequence, requested)?;
+            ensure!(
+                !proposal.tokens.is_empty(),
+                "draft source returned no proposed tokens"
+            );
+            ensure!(
+                proposal.tokens.len() <= requested,
+                "draft source returned {} tokens for a {requested}-token request",
+                proposal.tokens.len()
+            );
+            metrics.proposal_calls += 1;
+            metrics.proposed_tokens += proposal.tokens.len();
+            metrics.draft_compute_wall_s += proposal.compute_wall_s;
+            metrics.draft_transport_wall_s += proposal.transport_wall_s;
+
+            let initial_argmax = match self.pending_greedy.take() {
+                Some(token) => token,
+                None => {
+                    top_logits(&self.next_logits, 1)
+                        .first()
+                        .context("decode produced empty logits")?
+                        .token_id
+                }
+            };
+            let start_position = self.position();
+            let verify_started = Instant::now();
+            let post_token_argmaxes = self
+                .kernel
+                .verify_tokens(&mut self.cache, &proposal.tokens)?;
+            metrics.verifier_wall_s += verify_started.elapsed().as_secs_f64();
+            metrics.verified_tokens += proposal.tokens.len();
+            ensure!(
+                post_token_argmaxes.len() == proposal.tokens.len(),
+                "verifier returned {} argmaxes for {} proposed tokens",
+                post_token_argmaxes.len(),
+                proposal.tokens.len()
+            );
+
+            let mut accepted = 0usize;
+            let mut stopped = false;
+            let mut mismatch = None;
+            for (index, &proposed) in proposal.tokens.iter().enumerate() {
+                let expected = if index == 0 {
+                    initial_argmax
+                } else {
+                    post_token_argmaxes[index - 1]
+                };
+                if expected != proposed {
+                    mismatch = Some(expected);
+                    break;
+                }
+                accepted += 1;
+                if stop_tokens.contains(&proposed) {
+                    stopped = true;
+                    break;
+                }
+            }
+
+            metrics.accepted_tokens += accepted;
+            for &token in &proposal.tokens[..accepted] {
+                tap.before_commit(TokenTapEvent {
+                    step: self.generated.len(),
+                    token_id: token,
+                    top_logits: &[],
+                });
+                self.sequence.push(token);
+                self.generated.push(token);
+                produced += 1;
+            }
+            if stopped {
+                // KV is in-slot by position. The transformer reads only through
+                // the logical position, while RoPE is derived from that position
+                // and activations/argmax buffers are overwritten on the next call.
+                // Resetting the counter therefore excludes every overrun slot.
+                let rewind_started = Instant::now();
+                self.kernel
+                    .rewind(&mut self.cache, start_position + accepted)?;
+                metrics.rollback_wall_s += rewind_started.elapsed().as_secs_f64();
+                self.pending_greedy = Some(post_token_argmaxes[accepted - 1]);
+                break;
+            }
+            if let Some(correct) = mismatch {
+                metrics.rejection_count += 1;
+                let rewind_started = Instant::now();
+                self.kernel
+                    .rewind(&mut self.cache, start_position + accepted)?;
+                metrics.rollback_wall_s += rewind_started.elapsed().as_secs_f64();
+                // The verifier argmax is exact at this prefix. Re-advance it so
+                // its K/V slot replaces the rejected proposal before continuing.
+                self.next_logits = self.kernel.advance(&mut self.cache, correct)?;
+                self.pending_greedy = None;
+                tap.before_commit(TokenTapEvent {
+                    step: self.generated.len(),
+                    token_id: correct,
+                    top_logits: &[],
+                });
+                self.sequence.push(correct);
+                self.generated.push(correct);
+                produced += 1;
+                if stop_tokens.contains(&correct) {
+                    break;
+                }
+            } else {
+                debug_assert_eq!(accepted, proposal.tokens.len());
+                // All proposals were committed in the chain. Its final argmax is
+                // the next exact greedy token, so no logits readback is needed.
+                self.pending_greedy = post_token_argmaxes.last().copied();
+            }
+        }
+        Ok((self.generated[first_generated..].to_vec(), metrics))
     }
 
     fn generate_inner(
@@ -1576,6 +1960,12 @@ mod tests {
             ensure!(layer == 0, "mock has one cache layer");
             Ok(cache.iter().map(|token| *token as f32).collect())
         }
+
+        fn rewind(&mut self, cache: &mut Self::Cache, position: usize) -> Result<()> {
+            ensure!(position <= cache.len(), "mock rewind exceeds cache length");
+            cache.truncate(position);
+            Ok(())
+        }
     }
 
     fn no_stops() -> HashSet<u32> {
@@ -1637,6 +2027,82 @@ mod tests {
             }
             Ok(followers)
         }
+    }
+
+    fn mock_greedy_proposal(context: &[u32], max_tokens: usize) -> Result<Vec<u32>> {
+        let mut prefix = context.to_vec();
+        let mut tokens = Vec::with_capacity(max_tokens);
+        for _ in 0..max_tokens {
+            let token = top_logits(&MockKernel::logits(&prefix), 1)[0].token_id;
+            prefix.push(token);
+            tokens.push(token);
+        }
+        Ok(tokens)
+    }
+
+    #[test]
+    fn speculative_self_draft_accepts_every_token_and_matches_target_only() {
+        let prompt = [3, 1, 4];
+        let mut baseline_kernel = MockKernel { capacity: 128 };
+        let mut baseline = DecodeSession::prefill(&mut baseline_kernel, &prompt).unwrap();
+        let expected = baseline
+            .generate(40, &no_stops(), 1, &mut |_: TokenTapEvent<'_>| {})
+            .unwrap();
+
+        let mut speculative_kernel = MockKernel { capacity: 128 };
+        let mut speculative = DecodeSession::prefill(&mut speculative_kernel, &prompt).unwrap();
+        let mut self_draft = SelfDraft::new(mock_greedy_proposal);
+        let (actual, metrics) = speculative
+            .generate_speculative(
+                &mut self_draft,
+                40,
+                &no_stops(),
+                4,
+                &mut |_: TokenTapEvent<'_>| {},
+            )
+            .unwrap();
+
+        assert_eq!(actual, expected);
+        assert_eq!(metrics.accepted_tokens, metrics.proposed_tokens);
+        assert_eq!(metrics.rejection_count, 0);
+        assert_eq!(metrics.acceptance_rate(), 1.0);
+        assert_eq!(metrics.mean_accepted_run_length(), 4.0);
+    }
+
+    #[test]
+    fn speculative_forced_rejection_rolls_back_and_preserves_full_continuation() {
+        let prompt = [2, 7];
+        let mut baseline_kernel = MockKernel { capacity: 128 };
+        let mut baseline = DecodeSession::prefill(&mut baseline_kernel, &prompt).unwrap();
+        let expected = baseline
+            .generate(40, &no_stops(), 1, &mut |_: TokenTapEvent<'_>| {})
+            .unwrap();
+        let expected_cache = baseline.inspect_cache_layer(0).unwrap();
+        let rejected_position = prompt.len() + 3;
+        let wrong_token = (expected[3] + 1) % 11;
+
+        let mut speculative_kernel = MockKernel { capacity: 128 };
+        let mut speculative = DecodeSession::prefill(&mut speculative_kernel, &prompt).unwrap();
+        let mut draft = MockDraft::new(
+            mock_greedy_proposal,
+            BTreeMap::from([(rejected_position, wrong_token)]),
+        );
+        let (actual, metrics) = speculative
+            .generate_speculative(&mut draft, 40, &no_stops(), 4, &mut |_: TokenTapEvent<
+                '_,
+            >| {})
+            .unwrap();
+
+        assert_eq!(actual, expected);
+        assert!(
+            metrics.rejection_count >= 1,
+            "scripted token did not reject"
+        );
+        assert_eq!(
+            speculative.inspect_cache_layer(0).unwrap(),
+            expected_cache,
+            "rejected KV slots leaked into the continuation"
+        );
     }
 
     #[test]

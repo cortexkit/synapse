@@ -3624,6 +3624,7 @@ mod enabled {
     /// Plain-shader Qwen3 decode context. It keeps f16 KV slots on the device and
     /// records only independent output rows as Vulkan workgroups; no cooperative
     /// matrix pipeline or split dot-product reduction is part of this path.
+    #[allow(dead_code)]
     pub struct Qwen3DecodeContext<'a> {
         state: Arc<DeviceState>,
         pipelines: Pipelines,
@@ -3636,6 +3637,7 @@ mod enabled {
         position: usize,
     }
 
+    #[allow(dead_code)]
     impl<'a> Qwen3DecodeContext<'a> {
         pub fn new(
             gemm: VulkanGemm,
@@ -4318,10 +4320,12 @@ mod enabled {
         }
     }
 
+    #[allow(dead_code)]
     pub struct Qwen3DecodeContext<'a> {
         _model: std::marker::PhantomData<&'a Model>,
     }
 
+    #[allow(dead_code)]
     impl<'a> Qwen3DecodeContext<'a> {
         pub fn new(
             _gemm: VulkanGemm,
@@ -4374,4 +4378,5 @@ mod enabled {
     }
 }
 
+#[cfg_attr(not(feature = "vulkan"), allow(unused_imports))]
 pub use enabled::{ModernBertContext, Qwen3Context, Qwen3DecodeContext, VulkanContext};

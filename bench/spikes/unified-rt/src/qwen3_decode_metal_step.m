@@ -782,6 +782,92 @@ static void encode_forward(
     encode_lm_head(context, command_buffer);
 }
 
+// Verification is the proposal-fed mode of the existing chained-step encoder.
+// The host supplies every draft id, but each full forward pass, rope selection,
+// in-slot KV write, and on-GPU argmax is shared with the greedy chain below.
+// Outputs are the greedy ids after each supplied token; the Rust session aligns
+// them with the pending logits that predict the first supplied token.
+int32_t synapse_qwen3_metal_step_verify(
+    void *raw,
+    uint64_t position,
+    const uint32_t *token_ids,
+    uint32_t steps,
+    const uint16_t *rope_cos,
+    const uint16_t *rope_sin,
+    uint32_t *argmaxes_out,
+    float epsilon
+) {
+    @autoreleasepool {
+        @try {
+            metal_step_error[0] = '\0';
+            double feed_started = [NSDate timeIntervalSinceReferenceDate];
+            Qwen3MetalStepContext *context = raw;
+            if (context == NULL || token_ids == NULL || rope_cos == NULL || rope_sin == NULL ||
+                argmaxes_out == NULL || context->layers == NULL || context->embeddings == nil ||
+                steps == 0 || position + steps > context->bucket) {
+                set_error(@"invalid Metal step verification arguments");
+                return -1;
+            }
+            NSUInteger rope_span = (NSUInteger)steps * (NSUInteger)context->head_dim;
+            id<MTLBuffer> cosine_buffer = [context->device newBufferWithBytes:rope_cos
+                length:rope_span * sizeof(uint16_t) options:MTLResourceStorageModeShared];
+            id<MTLBuffer> sine_buffer = [context->device newBufferWithBytes:rope_sin
+                length:rope_span * sizeof(uint16_t) options:MTLResourceStorageModeShared];
+            id<MTLBuffer> proposal_buffer = [context->device newBufferWithBytes:token_ids
+                length:(NSUInteger)steps * sizeof(uint32_t) options:MTLResourceStorageModeShared];
+            id<MTLBuffer> argmax_buffer = [context->device newBufferWithLength:(NSUInteger)steps * sizeof(uint32_t)
+                options:MTLResourceStorageModeShared];
+            id<MTLCommandBuffer> command_buffer = [context->queue commandBuffer];
+            if (cosine_buffer == nil || sine_buffer == nil || proposal_buffer == nil ||
+                argmax_buffer == nil || command_buffer == nil) {
+                [cosine_buffer release];
+                [sine_buffer release];
+                [proposal_buffer release];
+                [argmax_buffer release];
+                set_error(@"failed to allocate Metal step verification buffers");
+                return -2;
+            }
+            NSUInteger head_dim_bytes = (NSUInteger)context->head_dim * sizeof(uint16_t);
+            for (uint32_t step = 0; step < steps; ++step) {
+                encode_embedding_gather_offset(
+                    context,
+                    command_buffer,
+                    proposal_buffer,
+                    (NSUInteger)step * sizeof(uint32_t),
+                    context->chain_input
+                );
+                encode_forward(context, command_buffer, context->chain_input,
+                               cosine_buffer, sine_buffer, (NSUInteger)step * head_dim_bytes,
+                               (uint32_t)position + step, epsilon);
+                encode_argmax_offset(context, command_buffer, argmax_buffer,
+                                     (NSUInteger)step * sizeof(uint32_t));
+            }
+            context->timings.feed_wall_s += [NSDate timeIntervalSinceReferenceDate] - feed_started;
+            double started = [NSDate timeIntervalSinceReferenceDate];
+            [command_buffer commit];
+            [command_buffer waitUntilCompleted];
+            context->timings.execute_wall_s += [NSDate timeIntervalSinceReferenceDate] - started;
+            BOOL ok = command_buffer.status != MTLCommandBufferStatusError;
+            if (!ok) {
+                set_error(command_buffer.error.localizedDescription ?: @"Metal step verification command buffer failed");
+            } else {
+                double readback_started = [NSDate timeIntervalSinceReferenceDate];
+                memcpy(argmaxes_out, argmax_buffer.contents, (NSUInteger)steps * sizeof(uint32_t));
+                context->timings.logits_readback_wall_s += [NSDate timeIntervalSinceReferenceDate] - readback_started;
+                context->timings.step_calls += steps;
+            }
+            [cosine_buffer release];
+            [sine_buffer release];
+            [proposal_buffer release];
+            [argmax_buffer release];
+            return ok ? 0 : -3;
+        } @catch (NSException *exception) {
+            set_error(exception.reason);
+            return -100;
+        }
+    }
+}
+
 // Chained multi-token decode: encode `steps` full forward passes plus an
 // on-GPU argmax into a single command buffer, gathering each step's input token
 // from the previous step's device-side argmax output. Position advances per

@@ -22,6 +22,9 @@ stateful retry.
 - `build_runner.sh` — builds the Swift runner for macOS 14.4+.
 - `measure_spec_decode.py` — runs the 200-call warm latency matrix, 30-second
   macmon power windows, and 20-prompt x 8-step CPU-fp32 greedy parity check.
+- `measure_phase_b.py` — drives the Metal-step verifier with the persistent
+  ANE JSONL draft server, checks the 20 pinned fixtures plus depth-470, and
+  emits baseline/speculative latency and break-even metrics.
 - `SPIKE-A.md` — decision table and Phase B/C recommendation.
 - `results/phase-a-raw.json` — compact committed raw matrix, placement
   summaries, power aggregates, and parity counts. Detailed MLComputePlan
@@ -69,3 +72,24 @@ approximately 30 seconds per cell:
 `measure_spec_decode.py` records a failed conversion, compile, runtime, or
 missing power sample as a hole. It never turns a failed cell into a zero rate.
 The `CPU_ONLY` rows intentionally report zero ANE share and zero ANE watts.
+
+## Phase B composition measurement
+
+Build the Swift runner, compile the W32/K4 package from Phase A, then use the
+owned Metal-step binary and the local M5 only:
+
+```bash
+python3 measure_phase_b.py \
+  --target /path/to/spike-unified-rt \
+  --model "$HOME/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/<revision>" \
+  --ane-model artifacts/models/qwen3-w32-k4.mlmodelc \
+  --out results/phase-b-raw.json
+```
+
+The ANE `serve` command consumes one JSONL request containing up to 32 recent
+token IDs and returns four drafts. It performs four sequential stateless calls,
+using only the final-position argmax of the K4 package on each call. The K4
+package's other output positions are logits for already-supplied input tokens,
+not independent future proposals. This preserves correctness but makes the
+Phase A 465 tok/s scheduled-K figure inapplicable to autoregressive drafting;
+the report records the measured compute and IPC portions separately.

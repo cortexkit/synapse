@@ -51,6 +51,15 @@ private struct ArgmaxRow: Encodable {
     let argmax: Int
 }
 
+private struct ServeRequest: Decodable {
+    let token_ids: [Int]
+}
+
+private struct ServeResponse: Encodable {
+    let draft_ids: [Int]
+    let compute_wall_s: Double
+}
+
 private struct PlacementOperation: Encodable {
     let operator_index: Int
     let operator_name: String
@@ -93,6 +102,8 @@ private enum Main {
                 try await run(arguments)
             case "predict":
                 try await predict(arguments)
+            case "serve":
+                try await serve(arguments)
             default:
                 throw CLIError.invalid("unknown command \(command)\n\(usage)")
             }
@@ -261,6 +272,68 @@ private func predict(_ arguments: [String]) async throws {
         outputs.append(ArgmaxRow(id: row.id, argmax: try argmaxLastPosition(multiArray)))
     }
     try writeJSONLines(outputs, to: outputPath)
+}
+
+/// Keeps one Core ML model resident and serves JSONL draft requests. A K4
+/// package still contributes only its final-position argmax per inference; the
+/// remaining draft tokens are produced by sequential stateless re-encodes.
+private func serve(_ arguments: [String]) async throws {
+    let modelURL = URL(fileURLWithPath: try option("--model", in: arguments)).standardizedFileURL
+    guard let window = Int(try option("--window", in: arguments, default: "32")), window > 0 else {
+        throw CLIError.invalid("--window must be positive")
+    }
+    guard let draftTokens = Int(try option("--draft-tokens", in: arguments, default: "4")), draftTokens > 0 else {
+        throw CLIError.invalid("--draft-tokens must be positive")
+    }
+    let computeUnits = try parseComputeUnits(try option("--compute-units", in: arguments, default: "CPU_AND_NE"))
+    let configuration = MLModelConfiguration()
+    configuration.computeUnits = computeUnits
+    let model = try MLModel(contentsOf: modelURL, configuration: configuration)
+    let outputNames = Array(model.modelDescription.outputDescriptionsByName.keys)
+    guard outputNames.count == 1, let outputName = outputNames.first else {
+        throw CLIError.invalid("expected exactly one output, found \(outputNames)")
+    }
+
+    while let line = readLine() {
+        let request = try JSONDecoder().decode(ServeRequest.self, from: Data(line.utf8))
+        guard !request.token_ids.isEmpty else {
+            throw CLIError.invalid("draft request has no token ids")
+        }
+        var context = request.token_ids
+        var draftIDs: [Int] = []
+        draftIDs.reserveCapacity(draftTokens)
+        let started = monotonicTime()
+        for _ in 0 ..< draftTokens {
+            let row = try leftPaddedRow(tokens: context, window: window)
+            let prediction = try await model.prediction(from: try featureProvider(row))
+            guard let multiArray = prediction.featureValue(for: outputName)?.multiArrayValue else {
+                throw CLIError.invalid("output \(outputName) is not a multi-array")
+            }
+            let token = try argmaxLastPosition(multiArray)
+            draftIDs.append(token)
+            context.append(token)
+            if context.count > window {
+                context.removeFirst(context.count - window)
+            }
+        }
+        let response = ServeResponse(
+            draft_ids: draftIDs,
+            compute_wall_s: monotonicTime() - started
+        )
+        let data = try JSONEncoder().encode(response)
+        FileHandle.standardOutput.write(data)
+        FileHandle.standardOutput.write(Data([0x0A]))
+    }
+}
+
+private func leftPaddedRow(tokens: [Int], window: Int) throws -> TokenizedRow {
+    let suffix = Array(tokens.suffix(window))
+    let padding = window - suffix.count
+    return TokenizedRow(
+        id: "serve",
+        input_ids: Array(repeating: 0, count: padding) + suffix,
+        attention_mask: Array(repeating: 0, count: padding) + Array(repeating: 1, count: suffix.count)
+    )
 }
 
 private func loadRows(_ path: String) throws -> [TokenizedRow] {
@@ -566,6 +639,8 @@ usage:
   ane-spec-decode run --model MODEL.mlmodelc --input ROWS.jsonl --stats FILE
       [--placement FILE] [--compute-units CPU_AND_NE|CPU_ONLY]
       [--calls N] [--warmup N] [--duration-s N]
-  ane-spec-decode predict --model MODEL.mlmodelc --input ROWS.jsonl --output TOKENS.jsonl
-      [--compute-units CPU_AND_NE|CPU_ONLY]
+   ane-spec-decode predict --model MODEL.mlmodelc --input ROWS.jsonl --output TOKENS.jsonl
+       [--compute-units CPU_AND_NE|CPU_ONLY]
+   ane-spec-decode serve --model MODEL.mlmodelc [--window 32] [--draft-tokens 4]
+       [--compute-units CPU_AND_NE|CPU_ONLY]
 """

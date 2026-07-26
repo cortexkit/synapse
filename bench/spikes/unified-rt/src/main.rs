@@ -90,6 +90,18 @@ struct Args {
     /// Optional JSONL destination for pre-commit token tap events.
     #[arg(long, requires = "generate_prompts")]
     decode_tap_out: Option<PathBuf>,
+    /// Optional greedy draft source for token-exact speculative decoding.
+    #[arg(long, value_enum, requires = "generate_prompts")]
+    speculative_draft: Option<SpeculativeDraftArg>,
+    /// Path to the persistent Swift runner when --speculative-draft ane is selected.
+    #[arg(long, requires = "speculative_draft")]
+    ane_draft_runner: Option<PathBuf>,
+    /// Compiled W32/K4 Core ML package consumed by the persistent Swift ANE draft runner.
+    #[arg(long, requires = "speculative_draft")]
+    ane_draft_model: Option<PathBuf>,
+    /// Number of sequential stateless ANE draft tokens proposed per verifier call.
+    #[arg(long, default_value_t = 4, requires = "speculative_draft")]
+    speculative_draft_k: usize,
     /// Constrain generation to one complete JSON value.
     #[arg(long, requires = "generate_prompts")]
     decode_json: bool,
@@ -235,6 +247,11 @@ enum DecodeBackend {
     Vulkan,
 }
 
+#[derive(Copy, Clone, Eq, PartialEq, Debug, ValueEnum)]
+enum SpeculativeDraftArg {
+    Ane,
+}
+
 #[derive(Copy, Clone, Eq, PartialEq, Debug, ValueEnum, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum Shapes {
@@ -358,6 +375,15 @@ struct DecodeTapRow {
 }
 
 #[derive(Serialize)]
+struct SpeculativePromptMetrics {
+    acceptance_rate: f64,
+    mean_accepted_run_length: f64,
+    proposed_tokens: usize,
+    accepted_tokens: usize,
+    rejection_count: usize,
+}
+
+#[derive(Serialize)]
 struct DecodePromptResult {
     id: String,
     prompt_tokens: usize,
@@ -368,6 +394,66 @@ struct DecodePromptResult {
     text: Option<String>,
     exact_reference: Option<bool>,
     accepted_near_ties: Vec<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    speculative: Option<SpeculativePromptMetrics>,
+}
+
+#[derive(Clone, Copy, Default, Serialize)]
+struct SpeculativeServingMetrics {
+    proposal_calls: usize,
+    proposed_tokens: usize,
+    verified_tokens: usize,
+    accepted_tokens: usize,
+    emitted_tokens: usize,
+    rejection_count: usize,
+    verifier_wall_s: f64,
+    rollback_wall_s: f64,
+    draft_compute_wall_s: f64,
+    draft_transport_wall_s: f64,
+}
+
+impl SpeculativeServingMetrics {
+    fn accumulate(
+        &mut self,
+        metrics: qwen3_decode::SpeculativeDecodeMetrics,
+        emitted_tokens: usize,
+    ) {
+        self.proposal_calls += metrics.proposal_calls;
+        self.proposed_tokens += metrics.proposed_tokens;
+        self.verified_tokens += metrics.verified_tokens;
+        self.accepted_tokens += metrics.accepted_tokens;
+        self.emitted_tokens += emitted_tokens;
+        self.rejection_count += metrics.rejection_count;
+        self.verifier_wall_s += metrics.verifier_wall_s;
+        self.rollback_wall_s += metrics.rollback_wall_s;
+        self.draft_compute_wall_s += metrics.draft_compute_wall_s;
+        self.draft_transport_wall_s += metrics.draft_transport_wall_s;
+    }
+
+    fn acceptance_rate(self) -> f64 {
+        self.accepted_tokens as f64 / self.proposed_tokens.max(1) as f64
+    }
+
+    fn mean_accepted_run_length(self) -> f64 {
+        self.accepted_tokens as f64 / self.proposal_calls.max(1) as f64
+    }
+}
+
+#[derive(Serialize)]
+struct SpeculativeDecodeReport {
+    draft_source: &'static str,
+    draft_span: usize,
+    baseline_decode_wall_s: f64,
+    baseline_decode_tok_per_s: f64,
+    speculative_decode_tok_per_s: f64,
+    acceptance_rate: f64,
+    mean_accepted_run_length: f64,
+    verify_chain_ms_per_call: f64,
+    draft_compute_ms_per_call: f64,
+    draft_transport_ms_per_call: f64,
+    /// Conservative threshold: accepted-token fraction must exceed proposal latency divided by the cost of K accepted target tokens.
+    break_even_acceptance_rate: f64,
+    metrics: SpeculativeServingMetrics,
 }
 
 #[derive(Serialize)]
@@ -401,6 +487,8 @@ struct DecodeServingResult {
     weight_bytes_per_token: usize,
     achieved_weight_gb_s: f64,
     quantized_weight_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    speculative: Option<SpeculativeDecodeReport>,
     results: Vec<DecodePromptResult>,
 }
 
@@ -602,7 +690,7 @@ impl MetalExecutionConfig {
                 .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
                 .filter(|build| !build.is_empty())
                 .unwrap_or_else(|| "unknown-os-build".to_owned());
-            let o1_suffix = if std::env::var_os("SYNAPSE_MPS_COMPILE_O1").map_or(false, |v| v == "1") {
+            let o1_suffix = if std::env::var_os("SYNAPSE_MPS_COMPILE_O1").is_some_and(|v| v == "1") {
                 "-o1"
             } else {
                 ""
@@ -625,7 +713,7 @@ impl MetalExecutionConfig {
 
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn optimization_level(&self) -> i32 {
-        if std::env::var_os("SYNAPSE_MPS_COMPILE_O1").map_or(false, |v| v == "1") {
+        if std::env::var_os("SYNAPSE_MPS_COMPILE_O1").is_some_and(|v| v == "1") {
             1
         } else {
             0
@@ -1072,7 +1160,7 @@ fn run_qwen_decode_with_runtime<K: qwen3_decode::DecodeRuntime>(
     model: &qwen3::Model,
     decoder: &mut K,
 ) -> Result<()> {
-    use qwen3_decode::{DecodeSession, TokenTapEvent};
+    use qwen3_decode::{AneDraft, DecodeSession, TokenTapEvent};
 
     ensure!(args.max_new_tokens > 0, "--max-new-tokens must be positive");
     ensure!(args.decode_top_k > 0, "--decode-top-k must be positive");
@@ -1109,11 +1197,41 @@ fn run_qwen_decode_with_runtime<K: qwen3_decode::DecodeRuntime>(
         .copied()
         .collect::<HashSet<_>>();
     let constraint_config = load_json_constraint_config(args, &tokenizer)?;
+    if args.speculative_draft.is_some() {
+        ensure!(
+            matches!(args.decode_backend, DecodeBackend::MetalStep),
+            "speculative decode requires --decode-backend metal-step"
+        );
+        ensure!(
+            constraint_config.is_none(),
+            "speculative decode does not support JSON constraints"
+        );
+        ensure!(
+            args.decode_top_k == 1,
+            "speculative decode requires --decode-top-k 1"
+        );
+    }
+    let mut ane_draft = match args.speculative_draft {
+        Some(SpeculativeDraftArg::Ane) => Some(AneDraft::spawn(
+            args.ane_draft_runner
+                .as_deref()
+                .context("--speculative-draft ane requires --ane-draft-runner")?,
+            args.ane_draft_model
+                .as_deref()
+                .context("--speculative-draft ane requires --ane-draft-model")?,
+            32,
+            args.speculative_draft_k,
+        )?),
+        None => None,
+    };
     let cold_load_s = started.elapsed().as_secs_f64();
     let mut tap_rows = Vec::new();
     let mut results = Vec::with_capacity(prompts.len());
     let mut prefill_wall_s = 0.0;
     let mut decode_wall_s = 0.0;
+    let mut baseline_decode_wall_s = 0.0;
+    let mut baseline_generated_tokens = 0usize;
+    let mut speculative_metrics = SpeculativeServingMetrics::default();
     let mut sample_wall_s = 0.0;
     let mut constraint_wall_s = 0.0;
     let mut constraint_valid_prompts = 0usize;
@@ -1136,6 +1254,27 @@ fn run_qwen_decode_with_runtime<K: qwen3_decode::DecodeRuntime>(
             args.decode_cache_bucket
         );
         prefill_tokens += prompt_ids.len();
+        let baseline_tokens = if ane_draft.is_some() {
+            // Measure target-only greedy decode beside the speculative result on
+            // the same prompt. The fresh prefill prevents either cache from
+            // contaminating the other measurement.
+            let tokens = {
+                let mut baseline = DecodeSession::prefill(decoder, &prompt_ids)?;
+                let baseline_started = Instant::now();
+                let tokens = baseline.generate(
+                    args.max_new_tokens,
+                    &stop_tokens,
+                    1,
+                    &mut |_: TokenTapEvent<'_>| {},
+                )?;
+                baseline_decode_wall_s += baseline_started.elapsed().as_secs_f64();
+                tokens
+            };
+            baseline_generated_tokens += tokens.len();
+            Some(tokens)
+        } else {
+            None
+        };
         let before_prefill = decoder.stage_timings();
         let prefill_started = Instant::now();
         let mut session = DecodeSession::prefill(decoder, &prompt_ids)?;
@@ -1153,19 +1292,31 @@ fn run_qwen_decode_with_runtime<K: qwen3_decode::DecodeRuntime>(
                 top_logits: event.top_logits.to_vec(),
             });
         };
-        let tokens = if let Some(config) = &constraint_config {
+        let (tokens, prompt_speculative) = if let Some(draft) = ane_draft.as_mut() {
+            let (tokens, metrics) = session.generate_speculative(
+                draft,
+                args.max_new_tokens,
+                &stop_tokens,
+                args.speculative_draft_k,
+                &mut tap,
+            )?;
+            (Some(tokens), Some(metrics))
+        } else if let Some(config) = &constraint_config {
             let mut constraint = json_constraint::JsonConstraint::new(
                 config.vocabulary.clone(),
                 config.schema.as_ref(),
                 &stop_tokens,
             );
-            session.generate_constrained(
-                args.max_new_tokens,
-                &stop_tokens,
-                args.decode_top_k,
-                &mut constraint,
-                &mut tap,
-            )?
+            (
+                Some(session.generate_constrained(
+                    args.max_new_tokens,
+                    &stop_tokens,
+                    args.decode_top_k,
+                    &mut constraint,
+                    &mut tap,
+                )?),
+                None,
+            )
         } else if session.chain_span() > 1 {
             // Plain generation with a GPU-chained backend: decode in spans with a
             // single readback per span. The chained argmax and embedding gather
@@ -1173,20 +1324,44 @@ fn run_qwen_decode_with_runtime<K: qwen3_decode::DecodeRuntime>(
             // `generate`; the fully instrumented hook path stays available at
             // chain span 1 (SYNAPSE_METAL_STEP_CHAIN_K=1) and for any constrained
             // run above.
-            session.generate_chained(args.max_new_tokens, &stop_tokens, &mut tap)?
+            (
+                Some(session.generate_chained(args.max_new_tokens, &stop_tokens, &mut tap)?),
+                None,
+            )
         } else {
-            session.generate(
-                args.max_new_tokens,
-                &stop_tokens,
-                args.decode_top_k,
-                &mut tap,
-            )?
+            (
+                Some(session.generate(
+                    args.max_new_tokens,
+                    &stop_tokens,
+                    args.decode_top_k,
+                    &mut tap,
+                )?),
+                None,
+            )
         };
+        let tokens = tokens.context("decode produced no token stream")?;
         decode_wall_s += decode_started.elapsed().as_secs_f64();
         decode_stages.accumulate(session.stage_timings().delta(after_prefill));
         sample_wall_s += session.sample_wall_s();
         constraint_wall_s += session.constraint_wall_s();
         generated_tokens += tokens.len();
+        let prompt_speculative = prompt_speculative.map(|metrics| {
+            speculative_metrics.accumulate(metrics, tokens.len());
+            SpeculativePromptMetrics {
+                acceptance_rate: metrics.acceptance_rate(),
+                mean_accepted_run_length: metrics.mean_accepted_run_length(),
+                proposed_tokens: metrics.proposed_tokens,
+                accepted_tokens: metrics.accepted_tokens,
+                rejection_count: metrics.rejection_count,
+            }
+        });
+        if let Some(baseline_tokens) = baseline_tokens {
+            ensure!(
+                tokens == baseline_tokens,
+                "speculative greedy decode diverged from target-only decode for {}",
+                prompt.id
+            );
+        }
         let text = constraint_config
             .as_ref()
             .map(|config| validate_constrained_output(&tokenizer, &tokens, config.schema.as_ref()))
@@ -1264,6 +1439,7 @@ fn run_qwen_decode_with_runtime<K: qwen3_decode::DecodeRuntime>(
             text,
             exact_reference,
             accepted_near_ties: prompt_near_ties,
+            speculative: prompt_speculative,
         });
     }
 
@@ -1281,6 +1457,35 @@ fn run_qwen_decode_with_runtime<K: qwen3_decode::DecodeRuntime>(
     let achieved_weight_gb_s = weight_bytes as f64 * generated_tokens as f64
         / decode_wall_s.max(f64::MIN_POSITIVE)
         / 1.0e9;
+    let speculative = args.speculative_draft.map(|source| {
+        let calls = speculative_metrics.proposal_calls.max(1) as f64;
+        let verifier_per_call_s = speculative_metrics.verifier_wall_s / calls;
+        let draft_per_call_s = (speculative_metrics.draft_compute_wall_s
+            + speculative_metrics.draft_transport_wall_s)
+            / calls;
+        let baseline_per_token_s = baseline_decode_wall_s / baseline_generated_tokens.max(1) as f64;
+        let draft_source = match source {
+            SpeculativeDraftArg::Ane => "ane-stateless-w32-k4-final-position",
+        };
+        SpeculativeDecodeReport {
+            draft_source,
+            draft_span: args.speculative_draft_k,
+            baseline_decode_wall_s,
+            baseline_decode_tok_per_s: baseline_generated_tokens as f64
+                / baseline_decode_wall_s.max(f64::MIN_POSITIVE),
+            speculative_decode_tok_per_s: generated_tokens as f64
+                / decode_wall_s.max(f64::MIN_POSITIVE),
+            acceptance_rate: speculative_metrics.acceptance_rate(),
+            mean_accepted_run_length: speculative_metrics.mean_accepted_run_length(),
+            verify_chain_ms_per_call: verifier_per_call_s * 1_000.0,
+            draft_compute_ms_per_call: speculative_metrics.draft_compute_wall_s / calls * 1_000.0,
+            draft_transport_ms_per_call: speculative_metrics.draft_transport_wall_s / calls
+                * 1_000.0,
+            break_even_acceptance_rate: (verifier_per_call_s + draft_per_call_s)
+                / (args.speculative_draft_k as f64 * baseline_per_token_s.max(f64::MIN_POSITIVE)),
+            metrics: speculative_metrics,
+        }
+    });
     let result = DecodeServingResult {
         lane: decoder.lane(),
         workload: if constraint_config.is_some() {
@@ -1329,6 +1534,7 @@ fn run_qwen_decode_with_runtime<K: qwen3_decode::DecodeRuntime>(
         weight_bytes_per_token: weight_bytes,
         achieved_weight_gb_s,
         quantized_weight_sha256: model.quantized_weight_sha256(),
+        speculative,
         results,
     };
     let out = args.out.as_ref().context("decode mode requires --out")?;
@@ -1637,6 +1843,7 @@ fn run_lfm2_decode_cli(args: &Args, started: Instant) -> Result<()> {
             text,
             exact_reference,
             accepted_near_ties: Vec::new(),
+            speculative: None,
         });
     }
 
@@ -1717,6 +1924,7 @@ fn run_lfm2_decode_cli(args: &Args, started: Instant) -> Result<()> {
         weight_bytes_per_token: weight_bytes,
         achieved_weight_gb_s,
         quantized_weight_sha256: model.quantized_weight_sha256(),
+        speculative: None,
         results,
     };
     let out = args.out.as_ref().context("decode mode requires --out")?;

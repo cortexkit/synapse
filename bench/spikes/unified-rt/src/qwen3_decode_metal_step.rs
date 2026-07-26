@@ -276,6 +276,54 @@ impl<'a> MetalStepDecoder<'a> {
         (cosine, sine)
     }
 
+    /// Verifies a proposed token span in the existing chained-step command
+    /// buffer. Each proposal is gathered from the supplied device-side token
+    /// list; the returned argmax follows that proposal. The session compares its
+    /// pending argmax to the first proposal and shifts these results for later
+    /// proposals, leaving the full span resident for either commit or rewind.
+    pub(crate) fn verify_tokens(
+        &mut self,
+        cache: &mut MetalStepKvCache,
+        tokens: &[u32],
+    ) -> Result<Vec<u32>> {
+        ensure!(
+            !tokens.is_empty(),
+            "verification requires at least one token"
+        );
+        ensure!(
+            cache.position + tokens.len() <= self.bucket,
+            "speculative verification exceeds cache capacity"
+        );
+        ensure!(
+            tokens
+                .iter()
+                .all(|&token| (token as usize) < self.model.config.vocab_size),
+            "speculative verification received a token outside the Qwen3 vocabulary"
+        );
+        let (rope_cos, rope_sin) = self.rope_chain(cache.position, tokens.len());
+        let mut argmaxes = vec![0u32; tokens.len()];
+        let status = unsafe {
+            synapse_qwen3_metal_step_verify(
+                self.raw.as_ptr(),
+                cache.position as u64,
+                tokens.as_ptr(),
+                tokens.len() as u32,
+                rope_cos.as_ptr(),
+                rope_sin.as_ptr(),
+                argmaxes.as_mut_ptr(),
+                self.model.config.rms_norm_eps,
+            )
+        };
+        if status != 0 {
+            bail!(
+                "Qwen3 Metal step verification failed with status {status}: {}",
+                last_error()
+            );
+        }
+        cache.position += tokens.len();
+        Ok(argmaxes)
+    }
+
     /// Encode `steps` chained decode passes into one command buffer and return
     /// the `steps` argmax token ids. `seed` is the token whose embedding feeds
     /// step 0 (the last committed token); each later step gathers its input from
@@ -418,6 +466,25 @@ impl DecodeKernel for MetalStepDecoder<'_> {
 
     fn cache_position(&self, cache: &Self::Cache) -> usize {
         cache.position
+    }
+
+    fn verify_tokens(&mut self, cache: &mut Self::Cache, tokens: &[u32]) -> Result<Vec<u32>> {
+        MetalStepDecoder::verify_tokens(self, cache, tokens)
+    }
+
+    fn rewind(&mut self, cache: &mut Self::Cache, position: usize) -> Result<()> {
+        ensure!(
+            position <= cache.position,
+            "cannot rewind Metal step cache forward from {} to {position}",
+            cache.position
+        );
+        // Key/value data is addressed by [layer, head, position, dimension].
+        // Attention reads only positions <= cache.position, RoPE is recomputed
+        // from that position, and every activation/argmax scratch buffer is
+        // overwritten by the next command buffer. No auxiliary decode state
+        // advances with a chain, so changing this logical bound is sufficient.
+        cache.position = position;
+        Ok(())
     }
 
     fn chain_span(&self) -> usize {
@@ -564,6 +631,16 @@ unsafe extern "C" {
         lm_head_weight: *const c_void,
         lm_head_q8: *const u8,
         embeddings: *const c_void,
+    ) -> i32;
+    fn synapse_qwen3_metal_step_verify(
+        context: *mut c_void,
+        position: u64,
+        token_ids: *const u32,
+        steps: u32,
+        rope_cos: *const u16,
+        rope_sin: *const u16,
+        argmaxes_out: *mut u32,
+        epsilon: f32,
     ) -> i32;
     fn synapse_qwen3_metal_step_chain(
         context: *mut c_void,

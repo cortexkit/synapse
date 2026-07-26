@@ -609,7 +609,6 @@ int32_t synapse_modernbert_mps_forward(
             }
             const BOOL profile = modernbert_profile_enabled();
             const BOOL attribution = modernbert_attribution_enabled();
-            const double call_started = modernbert_profile_now();
             const double plan_started = modernbert_profile_now();
             ModernBertPlan *plan = modernbert_get_plan(context, batch, seq, hidden, heads, intermediate, layer_count, epsilon, params, dtype, rerank);
             if (plan == NULL) {
