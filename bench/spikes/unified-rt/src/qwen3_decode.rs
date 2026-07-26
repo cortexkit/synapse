@@ -272,13 +272,17 @@ impl DraftSource for AneDraft {
             .read_line(&mut line)
             .context("read ANE draft response")?;
         ensure!(bytes > 0, "ANE draft runner exited without a response");
-        let response: AneDraftResponse =
+        let mut response: AneDraftResponse =
             serde_json::from_str(&line).context("parse ANE draft response")?;
+        // The serve loop always emits its configured draft count; the request
+        // wire format carries no per-call k. Near the generation tail we may
+        // need fewer, so accept over-delivery and truncate to the request.
         ensure!(
-            response.draft_ids.len() == requested,
-            "ANE draft returned {} tokens, expected {requested}",
+            response.draft_ids.len() >= requested,
+            "ANE draft returned {} tokens, expected at least {requested}",
             response.draft_ids.len()
         );
+        response.draft_ids.truncate(requested);
         let wall_s = wall_started.elapsed().as_secs_f64();
         ensure!(
             response.compute_wall_s >= 0.0 && response.compute_wall_s <= wall_s + 0.001,
