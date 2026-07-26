@@ -15,7 +15,7 @@
 # - LMStudio serving on :1234 with the qwen3 embedding model (optional lane)
 # - ts-embed deps installed (bun install ran)
 # - mlx-minilm venv at /tmp/synapse-mlx-minilm-venv
-set -uo pipefail
+set -euo pipefail
 cd "$(dirname "$0")/.." || exit 1
 
 BENCH=./target/release/synapse-bench
@@ -32,11 +32,16 @@ mkdir -p "$RESULTS"
 find_snapshot() {
   local pattern="$1"
   local found
-  found=$(ls -d $pattern 2>/dev/null | head -n 1 || true)
-  if [ -z "$found" ]; then
-    return 1
-  fi
-  printf '%s\n' "$found"
+  # Expand the caller-supplied glob so a missing snapshot remains distinguishable.
+  shopt -s nullglob
+  # shellcheck disable=SC2086
+  for found in $pattern; do
+    printf '%s\n' "$found"
+    shopt -u nullglob
+    return 0
+  done
+  shopt -u nullglob
+  return 1
 }
 
 # --- Preconditions -----------------------------------------------------------

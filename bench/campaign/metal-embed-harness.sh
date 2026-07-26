@@ -1,5 +1,5 @@
-#!/bin/sh
-set -eu
+#!/usr/bin/env bash
+set -euo pipefail
 
 # Trusted controller for the gte-modernbert f16 Metal embedding campaign.
 # The shell wrapper keeps the campaign entry point portable; all policy and
@@ -445,7 +445,13 @@ def runner_output(log_path: Path) -> str:
 def verify_copy(runner: Path, destination: Path, log_path: Path) -> None:
     status = run_through_runner(
         runner,
-        ["/bin/sh", "-c", f"test -d {destination} && ls {destination} | head -1"],
+        [
+            "/bin/sh",
+            "-c",
+            "test -d \"$1\" && for entry in \"$1\"/* \"$1\"/.[!.]* \"$1\"/..?*; do if test -e \"$entry\"; then printf '%s\\n' \"$entry\"; exit 0; fi; done; exit 1",
+            "verify-copy",
+            str(destination),
+        ],
         log_path,
     )
     if status != 0 or not log_path.read_text(errors="replace").strip():

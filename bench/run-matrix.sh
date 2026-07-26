@@ -32,11 +32,16 @@ wait_for_idle_and_run() {
 find_snapshot() {
   local pattern="$1"
   local found
-  found=$(ls -d $pattern 2>/dev/null | head -n 1 || true)
-  if [ -z "$found" ]; then
-    return 1
-  fi
-  printf '%s\n' "$found"
+  # Expand the caller-supplied glob so a missing snapshot remains distinguishable.
+  shopt -s nullglob
+  # shellcheck disable=SC2086
+  for found in $pattern; do
+    printf '%s\n' "$found"
+    shopt -u nullglob
+    return 0
+  done
+  shopt -u nullglob
+  return 1
 }
 
 SNAP_ONNX=$HOME/.cache/huggingface/hub/models--onnx-community--Qwen3-Embedding-0.6B-ONNX/snapshots/c25a394dd583836952667c12f008335071b3f43d

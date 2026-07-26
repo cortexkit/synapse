@@ -1,5 +1,5 @@
-#!/bin/sh
-set -eu
+#!/usr/bin/env bash
+set -euo pipefail
 
 # Trusted M1 controller for the Qwen3 Metal step campaign lane.
 
@@ -411,7 +411,9 @@ def verify_copy_destination(
         [
             "/bin/sh",
             "-c",
-            f"test -d {destination} && ls {destination} | head -1",
+            "test -d \"$1\" && for entry in \"$1\"/* \"$1\"/.[!.]* \"$1\"/..?*; do if test -e \"$entry\"; then printf '%s\\n' \"$entry\"; exit 0; fi; done; exit 1",
+            "verify-copy",
+            str(destination),
         ],
         verification_log,
     )
@@ -1397,7 +1399,9 @@ def self_test() -> int:
             (
                 "/bin/sh",
                 "-c",
-                f"test -d {destination} && ls {destination} | head -1",
+                "test -d \"$1\" && for entry in \"$1\"/* \"$1\"/.[!.]* \"$1\"/..?*; do if test -e \"$entry\"; then printf '%s\\n' \"$entry\"; exit 0; fi; done; exit 1",
+                "verify-copy",
+                str(destination),
             )
             for destination in (
                 root / "with-siblings/build/workspace",
