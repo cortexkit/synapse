@@ -2,8 +2,10 @@
 """Convert Qwen3-0.6B causal decoding windows to fixed-shape Core ML.
 
 The graph re-encodes a left-padded token window and returns logits for the final
-K positions.  It deliberately has no mutable KV state: Phase A measures the
-known-good stateless workaround for the Core ML 8.3 stateful ANE failure.
+K positions.  In ``--unroll-k`` mode it explicitly repeats the greedy pass K
+times inside the exported graph, returning the K generated token IDs.  It
+deliberately has no mutable KV state: Phase A measures the known-good stateless
+workaround for the Core ML 8.3 stateful ANE failure.
 """
 
 from __future__ import annotations
@@ -80,6 +82,11 @@ class ParityReport:
     eager_export_mean_cosine: float
     eager_coreml_max_abs: float
     eager_coreml_mean_cosine: float
+    mode: str = "last_k"
+    token_count: int = 0
+    wrapper_hf_token_agreements: int = 0
+    eager_export_token_agreements: int = 0
+    eager_coreml_token_agreements: int = 0
 
 
 @dataclass(frozen=True)
@@ -88,8 +95,11 @@ class ConversionReport:
     source_model_sha256: str
     window: int
     last_k: int
+    unroll_k: int | None
+    mode: str
     output_path: str
     output_name: str
+    output_kind: str
     frontend: str
     compute_precision: str
     compute_units: str
@@ -295,6 +305,49 @@ class Qwen3SpeculativeDrafter(torch.nn.Module):
         return logits.squeeze(2).transpose(1, 2)
 
 
+class Qwen3AutoregressiveUnrolledDrafter(torch.nn.Module):
+    """Run a fixed number of greedy draft steps inside one exported graph."""
+
+    def __init__(self, drafter: Qwen3SpeculativeDrafter, unroll_k: int) -> None:
+        super().__init__()
+        if unroll_k <= 0:
+            raise ValueError(f"unroll_k must be positive, got {unroll_k}")
+        self.drafter = drafter
+        self.unroll_k = unroll_k
+        self.config = drafter.config
+        self.window = drafter.window
+
+    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        current_ids = input_ids
+        current_mask = attention_mask
+        logits = self.drafter(current_ids, current_mask)
+        next_token = torch.argmax(logits[:, -1, :], dim=-1)
+        next_token_ids = next_token.to(dtype=current_ids.dtype)
+        token_rows = next_token_ids.unsqueeze(1)
+        current_ids = torch.cat((current_ids[:, 1:], next_token_ids.unsqueeze(1)), dim=1)
+        current_mask = torch.cat(
+            (
+                current_mask[:, 1:],
+                torch.ones_like(next_token_ids, dtype=current_mask.dtype).unsqueeze(1),
+            ),
+            dim=1,
+        )
+        for _ in range(1, self.unroll_k):
+            logits = self.drafter(current_ids, current_mask)
+            next_token = torch.argmax(logits[:, -1, :], dim=-1)
+            next_token_ids = next_token.to(dtype=current_ids.dtype)
+            token_rows = torch.cat((token_rows, next_token_ids.unsqueeze(1)), dim=1)
+            current_ids = torch.cat((current_ids[:, 1:], next_token_ids.unsqueeze(1)), dim=1)
+            current_mask = torch.cat(
+                (
+                    current_mask[:, 1:],
+                    torch.ones_like(next_token_ids, dtype=current_mask.dtype).unsqueeze(1),
+                ),
+                dim=1,
+            )
+        return token_rows
+
+
 def apply_rope(hidden: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     half = hidden.shape[-1] // 2
     rotated = torch.cat((-hidden[..., half:], hidden[..., :half]), dim=-1)
@@ -316,7 +369,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=MODEL_ID, help="HF repo id or local snapshot directory")
     parser.add_argument("--window", type=int, required=True, choices=(32, 64, 128))
-    parser.add_argument("--last-k", type=int, required=True, choices=(1, 4, 8))
+    output_mode = parser.add_mutually_exclusive_group(required=True)
+    output_mode.add_argument("--last-k", type=int, choices=(1, 4, 8), help="Return logits for the final K positions")
+    output_mode.add_argument("--unroll-k", type=int, help="Greedily unroll K fixed-window passes inside one graph")
     parser.add_argument("--out", type=Path, required=True, help="Destination .mlpackage path")
     parser.add_argument("--report-json", type=Path, required=True)
     parser.add_argument("--allow-download", action="store_true")
@@ -394,10 +449,18 @@ def tensor_for(tensors: dict[str, torch.Tensor], suffix: str) -> torch.Tensor:
     raise KeyError(f"checkpoint has no tensor named {suffix!r} or {('model.' + suffix)!r}")
 
 
-def build_drafter(model_ref: str, window: int, last_k: int) -> tuple[Qwen3SpeculativeDrafter, ModelConfig]:
+def build_drafter(
+    model_ref: str, window: int, last_k: int, unroll_k: int | None = None
+) -> tuple[torch.nn.Module, ModelConfig]:
     config = read_config(model_ref)
-    model = Qwen3SpeculativeDrafter(config, load_tensors(model_ref), window, last_k).eval()
-    return model, config
+    tensors = load_tensors(model_ref)
+    if unroll_k is not None:
+        model: torch.nn.Module = Qwen3AutoregressiveUnrolledDrafter(
+            Qwen3SpeculativeDrafter(config, tensors, window, 1), unroll_k
+        )
+    else:
+        model = Qwen3SpeculativeDrafter(config, tensors, window, last_k)
+    return model.eval(), config
 
 
 def prepare_input(
@@ -454,13 +517,35 @@ def hf_logits(
     return output[:, -last_k:, :].float()
 
 
+def hf_unrolled_tokens(
+    model: torch.nn.Module,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    unroll_k: int,
+) -> torch.Tensor:
+    current_ids = input_ids.to(dtype=torch.long)
+    current_mask = attention_mask.to(dtype=torch.long)
+    tokens: list[torch.Tensor] = []
+    with torch.inference_mode():
+        for _ in range(unroll_k):
+            logits = hf_logits(model, current_ids, current_mask, 1)
+            token = torch.argmax(logits[:, -1, :], dim=-1)
+            tokens.append(token)
+            current_ids = torch.cat((current_ids[:, 1:], token.unsqueeze(1)), dim=1)
+            current_mask = torch.cat(
+                (current_mask[:, 1:], torch.ones_like(token).unsqueeze(1)), dim=1
+            )
+    return torch.stack(tokens, dim=1)
+
+
 def convert_and_verify(
-    wrapper: Qwen3SpeculativeDrafter,
+    wrapper: torch.nn.Module,
     model_ref: str,
     window: int,
     last_k: int,
+    unroll_k: int | None,
     allow_download: bool,
-) -> tuple[ct.models.MLModel, ParityReport, TokenizerPolicy]:
+) -> tuple[ct.models.MLModel, ParityReport, TokenizerPolicy, str]:
     tokenizer = AutoTokenizer.from_pretrained(model_ref, local_files_only=not allow_download)
     examples: list[tuple[torch.Tensor, torch.Tensor]] = []
     tokenizer_policy: TokenizerPolicy | None = None
@@ -477,7 +562,10 @@ def convert_and_verify(
     ).eval()
     with torch.inference_mode():
         eager_rows = [tensor_rows(wrapper(*inputs)) for inputs in examples]
-        hf_rows = [tensor_rows(hf_logits(hf_model, *inputs, last_k)) for inputs in examples]
+        if unroll_k is None:
+            hf_rows = [tensor_rows(hf_logits(hf_model, *inputs, last_k)) for inputs in examples]
+        else:
+            hf_rows = [tensor_rows(hf_unrolled_tokens(hf_model, *inputs, unroll_k)) for inputs in examples]
         exported = torch.export.export(wrapper, examples[0], strict=False)
         exported_rows = [tensor_rows(exported.module()(*inputs)) for inputs in examples]
     del hf_model
@@ -496,7 +584,7 @@ def convert_and_verify(
     if len(existing_outputs) != 1:
         raise RuntimeError(f"expected one model output, found {existing_outputs!r}")
     converted_output = existing_outputs[0]
-    output_name = "logits"
+    output_name = "token_ids" if unroll_k is not None else "logits"
     if converted_output != output_name:
         ct.utils.rename_feature(mlmodel._spec, converted_output, output_name)
 
@@ -512,28 +600,49 @@ def convert_and_verify(
         if value is None and len(prediction) == 1:
             value = next(iter(prediction.values()))
         if value is None:
-            raise RuntimeError(f"Core ML prediction has no logits output: {list(prediction)}")
+            raise RuntimeError(f"Core ML prediction has no {output_name} output: {list(prediction)}")
         coreml_rows.append(tensor_rows(value))
 
     eager = np.concatenate(eager_rows, axis=0)
     hf = np.concatenate(hf_rows, axis=0)
     exported_output = np.concatenate(exported_rows, axis=0)
     coreml = np.concatenate(coreml_rows, axis=0)
+    mode = "autoregressive_unroll" if unroll_k is not None else "last_k"
+    token_count = int(eager.size) if unroll_k is not None else 0
+    token_agreements = (
+        {
+            "wrapper_hf": int(np.sum(eager == hf)),
+            "eager_export": int(np.sum(eager == exported_output)),
+            "eager_coreml": int(np.sum(eager == coreml)),
+        }
+        if unroll_k is not None
+        else {"wrapper_hf": 0, "eager_export": 0, "eager_coreml": 0}
+    )
     report = ParityReport(
         rows=eager.shape[0],
-        last_k=last_k,
+        last_k=unroll_k if unroll_k is not None else last_k,
         wrapper_hf_max_abs=float(np.max(np.abs(eager - hf))),
         wrapper_hf_mean_cosine=mean_cosine(hf, eager),
         eager_export_max_abs=float(np.max(np.abs(eager - exported_output))),
         eager_export_mean_cosine=mean_cosine(eager, exported_output),
         eager_coreml_max_abs=float(np.max(np.abs(eager - coreml))),
         eager_coreml_mean_cosine=mean_cosine(eager, coreml),
+        mode=mode,
+        token_count=token_count,
+        wrapper_hf_token_agreements=token_agreements["wrapper_hf"],
+        eager_export_token_agreements=token_agreements["eager_export"],
+        eager_coreml_token_agreements=token_agreements["eager_coreml"],
     )
-    if report.wrapper_hf_mean_cosine < 0.99999:
+    if unroll_k is None and report.wrapper_hf_mean_cosine < 0.99999:
         raise RuntimeError(f"custom Qwen3 wrapper disagrees with HF: {report.wrapper_hf_mean_cosine}")
+    if unroll_k is not None and report.wrapper_hf_token_agreements != token_count:
+        raise RuntimeError(
+            "autoregressive wrapper disagrees with HF: "
+            f"{report.wrapper_hf_token_agreements}/{token_count} token ids"
+        )
     if report.eager_export_max_abs > 1e-5:
         raise RuntimeError(f"torch.export parity failed: max_abs={report.eager_export_max_abs}")
-    return mlmodel, report, tokenizer_policy
+    return mlmodel, report, tokenizer_policy, output_name
 
 
 def environment_report() -> EnvironmentReport:
@@ -574,7 +683,7 @@ def directory_size(path: Path) -> int:
 
 
 def ensure_metadata(mlmodel: ct.models.MLModel, report: ConversionReport) -> None:
-    mlmodel.short_description = "Stateless fixed-window Qwen3-0.6B draft logits for Apple Neural Engine."
+    mlmodel.short_description = "Stateless fixed-window Qwen3-0.6B greedy draft unroll for Apple Neural Engine."
     mlmodel.author = "Synapse bench/spikes/ane-spec-decode"
     mlmodel.license = "Source model license follows the referenced Hugging Face checkpoint."
     metadata = mlmodel.user_defined_metadata
@@ -582,8 +691,11 @@ def ensure_metadata(mlmodel: ct.models.MLModel, report: ConversionReport) -> Non
     metadata["synapse.source_model_sha256"] = report.source_model_sha256
     metadata["synapse.window"] = str(report.window)
     metadata["synapse.last_k"] = str(report.last_k)
+    metadata["synapse.unroll_k"] = str(report.unroll_k or 0)
+    metadata["synapse.mode"] = report.mode
     metadata["synapse.frontend"] = report.frontend
     metadata["synapse.output_name"] = report.output_name
+    metadata["synapse.output_kind"] = report.output_kind
     metadata["synapse.tokenizer_policy"] = json.dumps(asdict(report.tokenizer_policy), sort_keys=True)
     metadata["synapse.torch_version"] = report.environment.torch
     metadata["synapse.coremltools_version"] = report.environment.coremltools
@@ -599,8 +711,13 @@ def remove_path(path: Path) -> None:
 
 def main() -> int:
     args = parse_args()
-    if args.last_k > args.window:
+    if args.last_k is not None and args.last_k > args.window:
         raise ValueError("--last-k cannot exceed --window")
+    if args.unroll_k is not None and args.unroll_k <= 0:
+        raise ValueError("--unroll-k must be positive")
+    effective_last_k = args.last_k if args.last_k is not None else 1
+    mode = "autoregressive_unroll" if args.unroll_k is not None else "last_k"
+    output_kind = "token_ids" if args.unroll_k is not None else "logits"
     environment = environment_report()
     require_environment(environment)
     model_ref, report_model_ref = resolve_model_ref(args.model)
@@ -616,23 +733,26 @@ def main() -> int:
             remove_path(path)
 
     started = time.monotonic()
-    wrapper, config = build_drafter(model_ref, args.window, args.last_k)
-    mlmodel, parity, tokenizer_policy = convert_and_verify(
-        wrapper, model_ref, args.window, args.last_k, args.allow_download
+    wrapper, config = build_drafter(model_ref, args.window, effective_last_k, args.unroll_k)
+    mlmodel, parity, tokenizer_policy, output_name = convert_and_verify(
+        wrapper, model_ref, args.window, effective_last_k, args.unroll_k, args.allow_download
     )
     conversion_s = time.monotonic() - started
     report = ConversionReport(
         source_model=report_model_ref,
         source_model_sha256=sha256(model_path / "model.safetensors"),
         window=args.window,
-        last_k=args.last_k,
+        last_k=int(args.unroll_k) if args.unroll_k is not None else effective_last_k,
+        unroll_k=args.unroll_k,
+        mode=mode,
         output_path=str(args.out),
-        output_name="logits",
+        output_name=output_name,
         frontend="torch.export",
         compute_precision="float16",
         compute_units="CPU_AND_NE",
         minimum_deployment_target="macOS14",
         package_size_bytes=0,
+        output_kind=output_kind,
         model_config=config,
         tokenizer_policy=tokenizer_policy,
         parity=parity,

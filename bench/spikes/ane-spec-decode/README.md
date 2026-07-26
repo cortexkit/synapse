@@ -17,6 +17,9 @@ stateful retry.
 - `convert_qwen3_to_coreml.py` — `torch.export`-only conversion for windows
   32/64/128 and `K` 1/4/8. The Qwen3 decoder body, final RMSNorm, and tied
   `lm_head` are included; the hidden state is sliced before the final matmul.
+  `--unroll-k K` instead exports K explicit greedy passes, shifts the fixed
+  window, and appends each argmax token inside one graph; its output is a
+  `[1, K]` `token_ids` array.
 - `ane_spec_decode.swift` — Core ML compile, timed-run, placement, and greedy
   argmax commands.
 - `build_runner.sh` — builds the Swift runner for macOS 14.4+.
@@ -43,7 +46,7 @@ uv pip install --python .venv/bin/python -r requirements.txt
 ./build_runner.sh
 ```
 
-Convert the complete matrix (each package is about 1.5 GB):
+Convert the complete last-K matrix (each package is about 1.5 GB):
 
 ```bash
 MODEL="$HOME/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/<revision>"
@@ -55,6 +58,15 @@ for W in 32 64 128; do
       --report-json "artifacts/conversion-w${W}-k${K}.json"
   done
 done
+```
+
+Convert the Phase-C W32/K4 autoregressive package:
+
+```bash
+.venv/bin/python convert_qwen3_to_coreml.py \
+  --model "$MODEL" --window 32 --unroll-k 4 \
+  --out artifacts/models/qwen3-w32-unroll-k4.mlpackage \
+  --report-json artifacts/conversion-w32-unroll-k4.json
 ```
 
 Run 200 warm calls for both compute-unit settings and sample ANE rails for
@@ -69,9 +81,20 @@ approximately 30 seconds per cell:
   --calls 200 --warmup 20 --power-seconds 30
 ```
 
-`measure_spec_decode.py` records a failed conversion, compile, runtime, or
-missing power sample as a hole. It never turns a failed cell into a zero rate.
-The `CPU_ONLY` rows intentionally report zero ANE share and zero ANE watts.
+For the Phase-C timing cell, use the same harness with the unrolled package:
+
+```bash
+.venv/bin/python measure_spec_decode.py \
+  --model "$MODEL" --windows 32 --unroll-k 4 \
+  --models-dir artifacts/models --out results/phase-c-raw.json \
+  --calls 200 --warmup 20 --power-seconds 30
+```
+
+This also compares the unrolled K4 output with four resident K1 calls on 20
+initial windows. `measure_spec_decode.py` records a failed conversion, compile,
+runtime, or missing power sample as a hole. It never turns a failed cell into a
+zero rate. The `CPU_ONLY` rows intentionally report zero ANE share and zero ANE
+watts.
 
 ## Phase B composition measurement
 

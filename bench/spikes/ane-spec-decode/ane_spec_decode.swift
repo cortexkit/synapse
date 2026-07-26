@@ -49,6 +49,7 @@ private struct CompileStats: Encodable {
 private struct ArgmaxRow: Encodable {
     let id: String
     let argmax: Int
+    let token_ids: [Int]?
 }
 
 private struct ServeRequest: Decodable {
@@ -226,7 +227,7 @@ private func run(_ arguments: [String]) async throws {
         model_path: modelURL.path,
         output_name: outputName,
         window: window,
-        last_k: outputLastK(model: model),
+        last_k: outputLastK(model: model, outputName: outputName),
         compute_units: computeUnitsLabel(computeUnits),
         prompts: rows.count,
         calls: requestCount,
@@ -269,7 +270,14 @@ private func predict(_ arguments: [String]) async throws {
         guard let multiArray = prediction.featureValue(for: outputName)?.multiArrayValue else {
             throw CLIError.invalid("output \(outputName) is not a multi-array")
         }
-        outputs.append(ArgmaxRow(id: row.id, argmax: try argmaxLastPosition(multiArray)))
+        let tokenIDs = outputName == "token_ids" ? try tokenIDs(from: multiArray) : nil
+        let argmax: Int
+        if let tokenIDs {
+            argmax = tokenIDs[tokenIDs.count - 1]
+        } else {
+            argmax = try argmaxLastPosition(multiArray)
+        }
+        outputs.append(ArgmaxRow(id: row.id, argmax: argmax, token_ids: tokenIDs))
     }
     try writeJSONLines(outputs, to: outputPath)
 }
@@ -281,6 +289,9 @@ private func serve(_ arguments: [String]) async throws {
     let modelURL = URL(fileURLWithPath: try option("--model", in: arguments)).standardizedFileURL
     guard let window = Int(try option("--window", in: arguments, default: "32")), window > 0 else {
         throw CLIError.invalid("--window must be positive")
+    }
+    guard let padTokenID = Int(try option("--pad-token-id", in: arguments, default: "0")), padTokenID >= 0 else {
+        throw CLIError.invalid("--pad-token-id must be nonnegative")
     }
     guard let draftTokens = Int(try option("--draft-tokens", in: arguments, default: "4")), draftTokens > 0 else {
         throw CLIError.invalid("--draft-tokens must be positive")
@@ -304,7 +315,7 @@ private func serve(_ arguments: [String]) async throws {
         draftIDs.reserveCapacity(draftTokens)
         let started = monotonicTime()
         for _ in 0 ..< draftTokens {
-            let row = try leftPaddedRow(tokens: context, window: window)
+            let row = try leftPaddedRow(tokens: context, window: window, padTokenID: padTokenID)
             let prediction = try await model.prediction(from: try featureProvider(row))
             guard let multiArray = prediction.featureValue(for: outputName)?.multiArrayValue else {
                 throw CLIError.invalid("output \(outputName) is not a multi-array")
@@ -326,12 +337,12 @@ private func serve(_ arguments: [String]) async throws {
     }
 }
 
-private func leftPaddedRow(tokens: [Int], window: Int) throws -> TokenizedRow {
+private func leftPaddedRow(tokens: [Int], window: Int, padTokenID: Int = 0) throws -> TokenizedRow {
     let suffix = Array(tokens.suffix(window))
     let padding = window - suffix.count
     return TokenizedRow(
         id: "serve",
-        input_ids: Array(repeating: 0, count: padding) + suffix,
+        input_ids: Array(repeating: padTokenID, count: padding) + suffix,
         attention_mask: Array(repeating: 0, count: padding) + Array(repeating: 1, count: suffix.count)
     )
 }
@@ -388,6 +399,14 @@ private func outputChecksum(_ prediction: MLFeatureProvider, outputName: String)
         throw CLIError.invalid("output \(outputName) is empty")
     }
     return output[output.count - 1].doubleValue
+}
+
+private func tokenIDs(from output: MLMultiArray) throws -> [Int] {
+    let shape = output.shape.map { $0.intValue }
+    guard shape.count == 2, shape[0] == 1, shape[1] > 0 else {
+        throw CLIError.invalid("token id output has invalid shape \(shape)")
+    }
+    return (0 ..< shape[1]).map { output[$0].intValue }
 }
 
 private func argmaxLastPosition(_ output: MLMultiArray) throws -> Int {
@@ -512,12 +531,15 @@ private func summarizePlacement(_ operations: [PlacementOperation]) -> Placement
     )
 }
 
-private func outputLastK(model: MLModel) -> Int {
-    guard let description = model.modelDescription.outputDescriptionsByName.values.first,
+private func outputLastK(model: MLModel, outputName: String) -> Int {
+    guard let description = model.modelDescription.outputDescriptionsByName[outputName],
           let constraint = description.multiArrayConstraint else {
         return 0
     }
     let shape = constraint.shape.map { $0.intValue }
+    if outputName == "token_ids" {
+        return shape.count == 2 ? shape[1] : 0
+    }
     return shape.count >= 2 ? shape[shape.count - 2] : 0
 }
 
@@ -641,6 +663,7 @@ usage:
       [--calls N] [--warmup N] [--duration-s N]
    ane-spec-decode predict --model MODEL.mlmodelc --input ROWS.jsonl --output TOKENS.jsonl
        [--compute-units CPU_AND_NE|CPU_ONLY]
-   ane-spec-decode serve --model MODEL.mlmodelc [--window 32] [--draft-tokens 4]
-       [--compute-units CPU_AND_NE|CPU_ONLY]
+       (token_ids outputs also include the complete token_ids array)
+    ane-spec-decode serve --model MODEL.mlmodelc [--window 32] [--draft-tokens 4]
+        [--pad-token-id ID] [--compute-units CPU_AND_NE|CPU_ONLY]
 """

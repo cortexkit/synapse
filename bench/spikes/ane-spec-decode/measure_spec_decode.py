@@ -57,7 +57,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--models-dir", type=Path, default=Path("artifacts/models"))
     parser.add_argument("--out", type=Path, default=Path("results/phase-a-raw.json"))
     parser.add_argument("--windows", type=int, nargs="+", default=[32, 64, 128], choices=(32, 64, 128))
-    parser.add_argument("--last-k", type=int, nargs="+", default=[1, 4, 8], choices=(1, 4, 8))
+    output_mode = parser.add_mutually_exclusive_group()
+    output_mode.add_argument("--last-k", type=int, nargs="+", choices=(1, 4, 8))
+    output_mode.add_argument("--unroll-k", type=int, nargs="+", help="Measure fixed-K autoregressive packages")
     parser.add_argument("--calls", type=int, default=200)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--power-seconds", type=float, default=30.0)
@@ -92,9 +94,13 @@ def resolve_model_ref(requested: str) -> str:
     return str(cached.resolve()) if cached is not None else requested
 
 
-def run_command(command: list[str], log_path: Path) -> tuple[int, str]:
+def run_command(
+    command: list[str], log_path: Path, input_text: str | None = None
+) -> tuple[int, str]:
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    completed = subprocess.run(command, text=True, capture_output=True, check=False)
+    completed = subprocess.run(
+        command, input=input_text, text=True, capture_output=True, check=False
+    )
     log_path.write_text(
         "$ " + " ".join(command) + "\n\nSTDOUT\n" + completed.stdout + "\nSTDERR\n" + completed.stderr,
         encoding="utf-8",
@@ -259,19 +265,24 @@ def measurement_variant(
     tokenizer: Any,
     window: int,
     last_k: int,
+    unroll_k: int | None,
     compute_units: str,
     work_dir: Path,
 ) -> dict[str, Any]:
-    package = args.models_dir / f"qwen3-w{window}-k{last_k}.mlpackage"
-    compiled = args.models_dir / f"qwen3-w{window}-k{last_k}.mlmodelc"
-    input_path = work_dir / f"input-w{window}-k{last_k}.jsonl"
-    stats_path = work_dir / f"stats-w{window}-k{last_k}-{compute_units}.json"
-    placement_path = work_dir / f"placement-w{window}-k{last_k}-{compute_units}.json"
-    log_path = work_dir / f"run-w{window}-k{last_k}-{compute_units}.log"
+    output_k = unroll_k if unroll_k is not None else last_k
+    label = f"unroll-k{output_k}" if unroll_k is not None else f"k{output_k}"
+    package = args.models_dir / f"qwen3-w{window}-{label}.mlpackage"
+    compiled = args.models_dir / f"qwen3-w{window}-{label}.mlmodelc"
+    input_path = work_dir / f"input-w{window}-{label}.jsonl"
+    stats_path = work_dir / f"stats-w{window}-{label}-{compute_units}.json"
+    placement_path = work_dir / f"placement-w{window}-{label}-{compute_units}.json"
+    log_path = work_dir / f"run-w{window}-{label}-{compute_units}.log"
     write_rows(input_path, [prepare_row(tokenizer, PROMPTS[0], window)])
     result: dict[str, Any] = {
         "window": window,
-        "last_k": last_k,
+        "last_k": output_k,
+        "mode": "autoregressive_unroll" if unroll_k is not None else "last_k",
+        "unroll_k": unroll_k,
         "compute_unit": compute_units,
         "package_path": str(package),
         "compiled_path": str(compiled),
@@ -285,7 +296,7 @@ def measurement_variant(
         if not package.exists():
             result["error"] = f"Core ML package is missing: {package}"
             return result
-        compile_stats = work_dir / f"compile-w{window}-k{last_k}.json"
+        compile_stats = work_dir / f"compile-w{window}-{label}.json"
         code, output = run_command(
             [
                 str(runner),
@@ -297,7 +308,7 @@ def measurement_variant(
                 "--stats",
                 str(compile_stats),
             ],
-            work_dir / f"compile-w{window}-k{last_k}.log",
+            work_dir / f"compile-w{window}-{label}.log",
         )
         result["compile_exit_code"] = code
         if code != 0:
@@ -342,11 +353,11 @@ def measurement_variant(
             "placement_summary": compact_placement_summary(placement),
             "ane_share_pct": placement_share(placement),
             "draft_tokens_per_s": 1000.0 / p50 if p50 > 0 else None,
-            "effective_draft_tokens_per_s": last_k * 1000.0 / p50 if p50 > 0 else None,
+            "effective_draft_tokens_per_s": output_k * 1000.0 / p50 if p50 > 0 else None,
         }
     )
     if not args.skip_power:
-        power_stats_path = work_dir / f"power-stats-w{window}-k{last_k}-{compute_units}.json"
+        power_stats_path = work_dir / f"power-stats-w{window}-{label}-{compute_units}.json"
         result["power"] = run_power_window(
             runner,
             compiled,
@@ -355,8 +366,8 @@ def measurement_variant(
             args.power_seconds,
             args.warmup,
             power_stats_path,
-            work_dir / f"macmon-w{window}-k{last_k}-{compute_units}.jsonl",
-            work_dir / f"power-w{window}-k{last_k}-{compute_units}.log",
+            work_dir / f"macmon-w{window}-{label}-{compute_units}.jsonl",
+            work_dir / f"power-w{window}-{label}-{compute_units}.log",
         )
     else:
         result["power"] = {"status": "skipped", "reason": "--skip-power"}
@@ -509,6 +520,180 @@ def run_parity(
     }
 
 
+def unroll_test_windows(
+    tokenizer: Any, window: int, pad_id: int
+) -> tuple[list[dict[str, Any]], list[list[int]]]:
+    rows: list[dict[str, Any]] = []
+    contexts: list[list[int]] = []
+    for prompt_index, prompt in enumerate(PROMPTS):
+        encoded = tokenizer(
+            prompt,
+            add_special_tokens=True,
+            truncation=True,
+            max_length=max(1, window - 8),
+            padding=False,
+            return_attention_mask=False,
+        )
+        context = [int(value) for value in encoded["input_ids"]][-window:]
+        padding = window - len(context)
+        rows.append(
+            {
+                "id": f"prompt-{prompt_index:02d}-initial",
+                "input_ids": [pad_id] * padding + context,
+                "attention_mask": [0] * padding + [1] * len(context),
+            }
+        )
+        contexts.append(context)
+    return rows, contexts
+
+
+def ensure_compiled_model(
+    args: argparse.Namespace,
+    runner: Path,
+    package: Path,
+    compiled: Path,
+    work_dir: Path,
+    label: str,
+) -> None:
+    if compiled.exists():
+        return
+    if args.no_compile or not package.exists():
+        raise FileNotFoundError(f"compiled model is missing: {compiled}")
+    code, output = run_command(
+        [
+            str(runner),
+            "compile",
+            "--model",
+            str(package),
+            "--out",
+            str(compiled),
+            "--stats",
+            str(work_dir / f"parity-compile-{label}.json"),
+        ],
+        work_dir / f"parity-compile-{label}.log",
+    )
+    if code != 0:
+        raise RuntimeError(output[-2000:])
+
+
+def run_unroll_parity(
+    args: argparse.Namespace,
+    runner: Path,
+    tokenizer: Any,
+    windows: list[int],
+    unroll_k: int,
+    work_dir: Path,
+) -> dict[str, Any]:
+    pad_id = tokenizer.pad_token_id
+    if pad_id is None:
+        pad_id = tokenizer.eos_token_id
+    if pad_id is None:
+        return {"status": "blocked", "error": "tokenizer has no pad or eos token"}
+
+    reports: list[dict[str, Any]] = []
+    for window in windows:
+        try:
+            rows, contexts = unroll_test_windows(tokenizer, window, int(pad_id))
+            unroll_package = args.models_dir / f"qwen3-w{window}-unroll-k{unroll_k}.mlpackage"
+            unroll_compiled = args.models_dir / f"qwen3-w{window}-unroll-k{unroll_k}.mlmodelc"
+            k1_package = args.models_dir / f"qwen3-w{window}-k1.mlpackage"
+            k1_compiled = args.models_dir / f"qwen3-w{window}-k1.mlmodelc"
+            ensure_compiled_model(
+                args, runner, unroll_package, unroll_compiled, work_dir, f"w{window}-unroll-k{unroll_k}"
+            )
+            ensure_compiled_model(args, runner, k1_package, k1_compiled, work_dir, f"w{window}-k1")
+
+            input_path = work_dir / f"parity-w{window}-unroll-k{unroll_k}.jsonl"
+            output_path = work_dir / f"parity-w{window}-unroll-k{unroll_k}-coreml.jsonl"
+            write_rows(input_path, rows)
+            code, output = run_command(
+                [
+                    str(runner),
+                    "predict",
+                    "--model",
+                    str(unroll_compiled),
+                    "--input",
+                    str(input_path),
+                    "--output",
+                    str(output_path),
+                    "--compute-units",
+                    "CPU_AND_NE",
+                ],
+                work_dir / f"parity-run-w{window}-unroll-k{unroll_k}.log",
+            )
+            if code != 0:
+                raise RuntimeError(output[-2000:])
+            observed_unroll = [
+                json.loads(line)["token_ids"]
+                for line in output_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            serve_input = "".join(json.dumps({"token_ids": context}) + "\n" for context in contexts)
+            code, output = run_command(
+                [
+                    str(runner),
+                    "serve",
+                    "--model",
+                    str(k1_compiled),
+                    "--window",
+                    str(window),
+                    "--draft-tokens",
+                    str(unroll_k),
+                    "--pad-token-id",
+                    str(pad_id),
+                    "--compute-units",
+                    "CPU_AND_NE",
+                ],
+                work_dir / f"parity-run-w{window}-k1-serve.log",
+                input_text=serve_input,
+            )
+            if code != 0:
+                raise RuntimeError(output[-2000:])
+            observed_k1 = [
+                json.loads(line)["draft_ids"] for line in output.splitlines() if line.strip()
+            ]
+            if len(observed_unroll) != len(observed_k1):
+                raise RuntimeError(
+                    f"parity output count mismatch: unroll={len(observed_unroll)} k1={len(observed_k1)}"
+                )
+            agreements = sum(
+                actual == expected
+                for actual, expected in zip(observed_unroll, observed_k1, strict=True)
+            )
+            token_agreements = sum(
+                actual_token == expected_token
+                for actual, expected in zip(observed_unroll, observed_k1, strict=True)
+                for actual_token, expected_token in zip(actual, expected, strict=True)
+            )
+            reports.append(
+                {
+                    "window": window,
+                    "windows": len(contexts),
+                    "tokens_per_window": unroll_k,
+                    "window_agreements": agreements,
+                    "token_agreements": token_agreements,
+                    "token_count": len(contexts) * unroll_k,
+                    "agreement_rate": token_agreements / (len(contexts) * unroll_k),
+                    "status": "complete",
+                }
+            )
+        except Exception as exc:
+            reports.append({"window": window, "status": "blocked", "error": str(exc)})
+    complete = [row for row in reports if row["status"] == "complete"]
+    total_tokens = sum(int(row["token_count"]) for row in complete)
+    total_agreements = sum(int(row["token_agreements"]) for row in complete)
+    return {
+        "status": "complete" if complete and len(complete) == len(windows) else "partial",
+        "windows": 20,
+        "tokens_per_window": unroll_k,
+        "total_tokens": total_tokens,
+        "total_agreements": total_agreements,
+        "agreement_rate": total_agreements / total_tokens if total_tokens else None,
+        "per_window_size": reports,
+        "reference": "same W-token inputs; Core ML autoregressive K-token output vs resident K1 serve",
+    }
+
+
 def toolchain_report() -> dict[str, Any]:
     report: dict[str, Any] = {
         "python": sys.version.split()[0],
@@ -534,8 +719,12 @@ def main() -> int:
         raise ValueError("--calls must be positive and --warmup must be nonnegative")
     if args.power_seconds < 0:
         raise ValueError("--power-seconds must be nonnegative")
+    if args.last_k is None and args.unroll_k is None:
+        args.last_k = [1, 4, 8]
     if args.last_k and any(k > max(args.windows) for k in args.last_k):
         raise ValueError("a --last-k value cannot exceed the largest selected window")
+    if args.unroll_k and any(k <= 0 for k in args.unroll_k):
+        raise ValueError("--unroll-k values must be positive")
     runner = args.runner or Path(__file__).resolve().parent / ".build" / "ane-spec-decode"
     model_ref = resolve_model_ref(args.model)
     args.models_dir = args.models_dir.expanduser().resolve()
@@ -554,6 +743,7 @@ def main() -> int:
         "parameters": {
             "windows": args.windows,
             "last_k": args.last_k,
+            "unroll_k": args.unroll_k,
             "calls": args.calls,
             "warmup": args.warmup,
             "power_seconds": args.power_seconds,
@@ -582,18 +772,37 @@ def main() -> int:
         return 2
 
     for window in args.windows:
-        for last_k in args.last_k:
-            if last_k > window:
-                continue
-            for compute_units in ("CPU_AND_NE", "CPU_ONLY"):
-                report["variants"].append(
-                    measurement_variant(args, runner, tokenizer, window, last_k, compute_units, work_dir)
-                )
+        if args.unroll_k is not None:
+            for unroll_k in args.unroll_k:
+                for compute_units in ("CPU_AND_NE", "CPU_ONLY"):
+                    report["variants"].append(
+                        measurement_variant(
+                            args, runner, tokenizer, window, unroll_k, unroll_k, compute_units, work_dir
+                        )
+                    )
+        else:
+            assert args.last_k is not None
+            for last_k in args.last_k:
+                if last_k > window:
+                    continue
+                for compute_units in ("CPU_AND_NE", "CPU_ONLY"):
+                    report["variants"].append(
+                        measurement_variant(
+                            args, runner, tokenizer, window, last_k, None, compute_units, work_dir
+                        )
+                    )
 
     if args.skip_parity:
         report["parity"] = {"status": "skipped", "reason": "--skip-parity"}
     else:
-        report["parity"] = run_parity(args, runner, tokenizer, model_ref, args.windows, work_dir)
+        if args.unroll_k is not None:
+            if len(args.unroll_k) != 1:
+                raise ValueError("unroll parity requires exactly one --unroll-k value")
+            report["parity"] = run_unroll_parity(
+                args, runner, tokenizer, args.windows, args.unroll_k[0], work_dir
+            )
+        else:
+            report["parity"] = run_parity(args, runner, tokenizer, model_ref, args.windows, work_dir)
     complete_variants = [row for row in report["variants"] if row.get("status") == "complete"]
     report["status"] = "complete" if complete_variants else "blocked"
     report["finished_at"] = datetime.now().astimezone().isoformat()
