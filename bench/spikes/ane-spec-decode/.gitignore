@@ -1,0 +1,11 @@
+.build/
+.venv/
+__pycache__/
+artifacts/
+results/phase-a-work/
+results/phase-a-w32-k1.json
+results/phase-a-w32-k1-power.json
+*.mlpackage/
+*.mlmodelc/
+*.jsonl
+*.log

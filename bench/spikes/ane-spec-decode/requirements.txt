@@ -1,0 +1,7 @@
+# Qwen3 support starts in transformers 4.51; this is the Wave-2 export stack.
+coremltools==8.3.0
+numpy==2.3.2
+safetensors==0.5.3
+tokenizers==0.21.0
+torch==2.5.1
+transformers==4.51.3
