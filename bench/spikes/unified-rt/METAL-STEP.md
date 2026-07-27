@@ -570,6 +570,21 @@ at 85 tok/s), so amortizing the host round trip over k tokens recovers only abou
 suggested. This is a real, honestly-measured ceiling for this mechanism on this
 machine, not a gate failure — no tokens changed at any k.
 
+## Batched speculative verification (true prefill-style verify)
+
+Wave 6's chained decode verifies/generates K tokens as K SEQUENTIAL single-token
+steps in one command buffer (weights re-streamed K times). The batched
+verification path goes further: it runs K already-known draft tokens through the
+transformer in ONE prefill-style forward (a mat-mat with K columns) so each layer's
+weights stream once for all K positions. It is byte-identical to K sequential
+steps by construction, additive behind `synapse_qwen3_metal_step_verify_batch`
+(opt-in via `SYNAPSE_METAL_STEP_BATCHED_VERIFY=1`), and measured on the locked M1
+at up to 200.8 tok/s-equivalent verify throughput (Q8, K=8) — 1.34x the 149.40
+single-token baseline. Full mechanism, exactness proof, gates, the per-token
+verify cost curve, and the recomputed 4B break-even table are in
+`BATCHED-VERIFY.md`. The campaign single-token baseline (149.3952 tok/s) is
+unchanged; the batched curve is a separate protocol.
+
 ## Cross-machine exactness note
 
 Completion-06 f16 near-tie resolves differently on M5-current Metal stack as
