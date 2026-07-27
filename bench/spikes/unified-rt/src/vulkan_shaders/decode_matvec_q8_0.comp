@@ -15,12 +15,16 @@
 // (its int8 payload starts at byte 2), so the weight is viewed as uint16 rather
 // than uvec4: each block is exactly 17 uint16 words (one f16 scale word plus 16
 // words that each pack two little-endian int8). uint16 needs only 2-byte
-// alignment, which the byte-2 payload always satisfies, so no unsafe misaligned
-// wide load and no layout repack. Activations are viewed as uvec2 (four halves
-// per 8-byte load) and expanded with unpackHalf2x16, which widens each half to
-// f32 exactly like the scalar float(half) conversion. Every quantized byte is
-// still sign extended, widened to f32, and accumulated as scale*q*x in ascending
-// column order, so the dot stays bit-identical to the scalar wave-3 kernel.
+// alignment, which the byte-2 payload always satisfies. Activations are viewed
+// as uvec2 (four halves per 8-byte load) and expanded with unpackHalf2x16, which
+// widens each half to f32 exactly like the scalar float(half) conversion.
+//
+// Wave 4 seam 2: block-address hoisting. The per-row block stride is computed
+// once before the block loop, and the weight/input addresses inside a block are
+// walked with running increments (wptr += 2, iptr += 1) instead of recomputing
+// base16 + 1 + 2*group for every element. The accumulation order is unchanged:
+// every quantized byte is still sign extended, widened to f32, and added as
+// scale*q*x in ascending column order, so the dot stays bit-identical.
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 layout(set = 0, binding = 0, scalar) readonly buffer Input { uvec2 values[]; } input_values;
 layout(set = 0, binding = 1, scalar) readonly buffer Weight { uint16_t values[]; } weight_values;
@@ -37,15 +41,16 @@ void main() {
     if (row >= p.rows) return;
     float sum = 0.0;
     uint blocks = p.columns / 32;
+    // Hoist the per-row block stride: each block is 17 uint16 words, so the
+    // row's first block base is row*blocks*17 and each block advances by 17.
+    uint block_base = row * blocks * 17;
+    uint input_vec = 0;
     for (uint block = 0; block < blocks; ++block) {
-        // 17 uint16 words per block: word 0 is the f16 scale, words 1..16 pack
-        // the 32 int8 payloads two per word.
-        uint base16 = (row * blocks + block) * 17;
-        float scale = unpackHalf2x16(uint(weight_values.values[base16])).x;
-        uint input_vec = block * 8;
+        float scale = unpackHalf2x16(uint(weight_values.values[block_base])).x;
+        uint wptr = block_base + 1;
         for (uint group = 0; group < 8; ++group) {
-            uint packed0 = uint(weight_values.values[base16 + 1 + 2 * group]);
-            uint packed1 = uint(weight_values.values[base16 + 2 + 2 * group]);
+            uint packed0 = uint(weight_values.values[wptr]);
+            uint packed1 = uint(weight_values.values[wptr + 1]);
             int q0 = int(packed0 & 0xFFu);
             if (q0 >= 128) q0 -= 256;
             int q1 = int((packed0 >> 8) & 0xFFu);
@@ -54,14 +59,17 @@ void main() {
             if (q2 >= 128) q2 -= 256;
             int q3 = int((packed1 >> 8) & 0xFFu);
             if (q3 >= 128) q3 -= 256;
-            uvec2 xv = input_values.values[input_vec + group];
+            uvec2 xv = input_values.values[input_vec];
             vec2 x01 = unpackHalf2x16(xv.x);
             vec2 x23 = unpackHalf2x16(xv.y);
             sum += scale * float(q0) * x01.x;
             sum += scale * float(q1) * x01.y;
             sum += scale * float(q2) * x23.x;
             sum += scale * float(q3) * x23.y;
+            wptr += 2;
+            input_vec += 1;
         }
+        block_base += 17;
     }
     output_values.values[row] = sum;
 }
