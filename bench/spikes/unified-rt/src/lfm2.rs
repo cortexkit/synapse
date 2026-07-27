@@ -1050,6 +1050,67 @@ impl Model {
         Ok((final_hidden, logits))
     }
 
+    /// Test-only decode step that mirrors `decode_embedding` but rounds the
+    /// running activation vector to IEEE f16 at every layer boundary (on entry,
+    /// and after each residual addition), emulating a step engine that keeps its
+    /// inter-layer activations in f16 the way the reused Qwen3 kernels do. The
+    /// f16 rounding-policy probe uses it to measure whether f16 activations
+    /// change the greedy token sequence relative to the f32 CPU reference, which
+    /// decides whether the f16-activation kernels can be reused for a token-exact
+    /// LFM2 decode or whether an f32-activation path is required.
+    #[cfg(test)]
+    pub(crate) fn decode_token_f16_activations(
+        &self,
+        provider: &mut dyn KernelProvider,
+        cache: &mut DecodeCache,
+        token: u32,
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        fn round_f16(values: &mut [f32]) {
+            let bits = crate::encode_f16_bits(values);
+            let rounded = crate::decode_f16_bits(&bits);
+            values.copy_from_slice(&rounded);
+        }
+        let embedding = self.token_embedding(token)?;
+        ensure!(cache.position < cache.capacity, "LFM2 decode cache is full");
+        let hidden = self.config.hidden_size;
+        let mut current = embedding.to_vec();
+        round_f16(&mut current);
+        for (layer, layer_cache) in self.layers.iter().zip(&mut cache.layers) {
+            let residual = current.clone();
+            rms_norm_rows(&mut current, 1, hidden, &layer.operator_norm)?;
+            current = match (&layer.mixer, layer_cache) {
+                (Mixer::Conv(mixer), LayerCache::Conv { state }) => {
+                    decode_conv(provider, &current, state, mixer, hidden)?
+                }
+                (Mixer::Attention(mixer), LayerCache::Attention { keys, values }) => {
+                    decode_attention(
+                        provider,
+                        &current,
+                        keys,
+                        values,
+                        mixer,
+                        &self.config,
+                        cache.position,
+                    )?
+                }
+                _ => bail!("LFM2 decode cache type does not match layer layout"),
+            };
+            add_residual(&mut current, &residual);
+            round_f16(&mut current);
+
+            let residual = current.clone();
+            rms_norm_rows(&mut current, 1, hidden, &layer.ffn_norm)?;
+            current = feed_forward(provider, &current, 1, hidden, layer)?;
+            add_residual(&mut current, &residual);
+            round_f16(&mut current);
+        }
+        rms_norm_rows(&mut current, 1, hidden, &self.final_norm)?;
+        let final_hidden = current.clone();
+        let logits = linear_tensor(provider, &current, 1, hidden, self.lm_head()?, "LM head")?;
+        cache.position += 1;
+        Ok((final_hidden, logits))
+    }
+
     pub(crate) fn forward_hidden(
         &self,
         provider: &mut dyn KernelProvider,

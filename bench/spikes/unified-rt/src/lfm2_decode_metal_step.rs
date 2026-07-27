@@ -506,13 +506,20 @@ mod tests {
         prompt: &[u32],
         max_tokens: usize,
         stop_tokens: &HashSet<u32>,
+        f16_activations: bool,
     ) -> Vec<u32> {
         let mut cache = model.empty_decode_cache(prompt.len() + max_tokens);
         let mut logits = Vec::new();
         for &token in prompt {
-            let (_, next_logits) = model
-                .decode_token(provider, &mut cache, token)
-                .expect("cpu prefill step");
+            let (_, next_logits) = if f16_activations {
+                model
+                    .decode_token_f16_activations(provider, &mut cache, token)
+                    .expect("cpu prefill step (f16 activations)")
+            } else {
+                model
+                    .decode_token(provider, &mut cache, token)
+                    .expect("cpu prefill step")
+            };
             logits = next_logits;
         }
         let mut generated = Vec::with_capacity(max_tokens);
@@ -522,9 +529,15 @@ mod tests {
             if stop_tokens.contains(&next) {
                 break;
             }
-            let (_, next_logits) = model
-                .decode_token(provider, &mut cache, next)
-                .expect("cpu decode step");
+            let (_, next_logits) = if f16_activations {
+                model
+                    .decode_token_f16_activations(provider, &mut cache, next)
+                    .expect("cpu decode step (f16 activations)")
+            } else {
+                model
+                    .decode_token(provider, &mut cache, next)
+                    .expect("cpu decode step")
+            };
             logits = next_logits;
             next = top_logits(&logits, 1)[0].token_id;
         }
@@ -627,6 +640,7 @@ mod tests {
                 &prompt_ids,
                 max_tokens,
                 &stop_tokens,
+                false,
             );
             println!("[native] {id}: {} tokens", tokens.len());
             native_rows.push((id.clone(), tokens));
@@ -649,10 +663,34 @@ mod tests {
                 &prompt_ids,
                 max_tokens,
                 &stop_tokens,
+                false,
             );
             f16_rows.push((id.clone(), tokens));
         }
         let f16_secs = f16_started.elapsed().as_secs_f64();
+
+        // f16-activation CPU reference (native weights, activations rounded to f16
+        // at every layer boundary). This emulates a step engine that reuses the
+        // f16-activation Qwen3 kernels and measures whether that reuse can stay
+        // token-exact against the f32 CPU reference.
+        let mut f16act_provider = CpuProvider::platform_for_test();
+        let mut f16act_rows = Vec::new();
+        let f16act_started = std::time::Instant::now();
+        for (id, prompt) in &prompts {
+            let prompt_ids = native_model
+                .encode_generation(&tokenizer, prompt, 2048)
+                .expect("encode prompt");
+            let tokens = greedy_decode_cpu(
+                &native_model,
+                &mut f16act_provider,
+                &prompt_ids,
+                max_tokens,
+                &stop_tokens,
+                true,
+            );
+            f16act_rows.push((id.clone(), tokens));
+        }
+        let f16act_secs = f16act_started.elapsed().as_secs_f64();
 
         // Compare the two CPU references prompt-by-prompt.
         let mut identical = 0usize;
@@ -674,16 +712,38 @@ mod tests {
         println!("=== LFM2 f16 rounding-policy probe ===");
         println!("prompts: {}, max_tokens: {}", prompts.len(), max_tokens);
         println!(
-            "native cpu decode: {:.1}s, f16-weight cpu decode: {:.1}s",
-            native_secs, f16_secs
+            "native cpu decode: {:.1}s, f16-weight cpu decode: {:.1}s, f16-activation cpu decode: {:.1}s",
+            native_secs, f16_secs, f16act_secs
         );
         let native_sha = fixture_sha256(&native_rows);
         let f16_sha = fixture_sha256(&f16_rows);
+        let f16act_sha = fixture_sha256(&f16act_rows);
         println!("native fixture sha256: {native_sha}");
         println!("f16-weight fixture sha256: {f16_sha}");
+        println!("f16-activation fixture sha256: {f16act_sha}");
         println!(
-            "POLICY: f16-weight CPU reference is token-identical to the native CPU reference on {}/{} prompts",
+            "POLICY (weights): f16-weight CPU reference is token-identical to the native CPU reference on {}/{} prompts",
             identical,
+            prompts.len()
+        );
+        let mut act_identical = 0usize;
+        for ((id, native_tokens), (_, act_tokens)) in native_rows.iter().zip(&f16act_rows) {
+            if native_tokens == act_tokens {
+                act_identical += 1;
+            } else {
+                let shared = native_tokens.len().min(act_tokens.len());
+                let first_diff = (0..shared).find(|&i| native_tokens[i] != act_tokens[i]);
+                println!(
+                    "[policy] ACTIVATION DIVERGENCE {id}: native {} tok, f16-act {} tok, first diff at step {:?}",
+                    native_tokens.len(),
+                    act_tokens.len(),
+                    first_diff
+                );
+            }
+        }
+        println!(
+            "POLICY (activations): f16-activation CPU reference is token-identical to the native CPU reference on {}/{} prompts",
+            act_identical,
             prompts.len()
         );
 
