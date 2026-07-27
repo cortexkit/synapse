@@ -120,9 +120,39 @@ fn main() {
                 lfm2_metal_status.success(),
                 "xcrun metal failed for LFM2 step kernels"
             );
+            // The hybrid LFM2 step engine reuses the proven Qwen3 step kernels
+            // (RMSNorm, QKV matvec, QK-norm+RoPE, GQA attention, matvec+residual,
+            // SwiGLU, LM head, argmax, embedding gather) for its six attention
+            // layers and shared MLP/head stages. They are compiled a second time,
+            // IEEE-strict, into the LFM2 metallib so the whole LFM2 forward runs
+            // under the same fast-math discipline the conv step requires for
+            // bit-exactness vs the CPU reference. The Qwen3 source file is not
+            // modified and the Qwen3 metallib compile line above is untouched;
+            // this only adds an IEEE-strict copy of those kernels to the LFM2 lib.
+            let lfm2_reused_air_path = out_dir.join("lfm2_reused_qwen3_step.air");
+            let lfm2_reused_metal_status = std::process::Command::new("xcrun")
+                .args([
+                    "-sdk",
+                    "macosx",
+                    "metal",
+                    "-std=macos-metal2.3",
+                    "-fno-fast-math",
+                    "-ffp-contract=off",
+                    "-c",
+                    "src/qwen3_decode_metal_step.metal",
+                    "-o",
+                ])
+                .arg(&lfm2_reused_air_path)
+                .status()
+                .expect("run xcrun metal for the reused Qwen3 step kernels (LFM2 lib)");
+            assert!(
+                lfm2_reused_metal_status.success(),
+                "xcrun metal failed for the reused Qwen3 step kernels (LFM2 lib)"
+            );
             let lfm2_metallib_status = std::process::Command::new("xcrun")
                 .args(["-sdk", "macosx", "metallib"])
                 .arg(&lfm2_air_path)
+                .arg(&lfm2_reused_air_path)
                 .arg("-o")
                 .arg(&lfm2_metallib_path)
                 .status()

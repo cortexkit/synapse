@@ -282,3 +282,180 @@ Reference cells and protocol: `LFM2-DECODE-BASELINES.md`. Qwen3 step engine this
 port reuses: `METAL-STEP.md`, `src/qwen3_decode_metal_step.{rs,m,metal}`. LFM2
 reference semantics: `src/lfm2.rs` (`decode_conv`, `decode_attention`,
 `empty_decode_cache`) and `src/lfm2_decode.rs`.
+
+
+---
+
+## 9. Stage B — f16 oracle settled, fixture pinned, reused kernels wired (engine assembly is the remaining increment)
+
+Stage B's job is the end-to-end hybrid step decoder and its token-exactness gate.
+Before any Metal orchestration is written, two questions must be settled because
+they decide what "token-exact vs the CPU reference" even means for an f16 engine
+and therefore how much new Metal the engine needs. This increment settles both
+with evidence on the real checkpoint, pins the fixture the engine will match, and
+wires the reused kernels into the LFM2 metallib under the required math
+discipline. The hybrid engine assembly itself, the 20×64 Metal-vs-fixture gate,
+and the M1 timing remain as the precise continuation specified at the bottom of
+this section.
+
+### 9.1 The two precision questions, settled
+
+The `lfm2.rs` CPU reference — the token-exactness contract — runs **f32
+activations** with the checkpoint weights loaded as **bf16→f32** (`load_with_quant`
+ignores its precision argument; there is no f16 rounding on the CPU path). A Metal
+step engine that reuses the Qwen3 kernels differs in two ways:
+
+1. **Weights.** The reused kernels read IEEE **f16** weight bits
+   (`encode_f16_bits` = `half::f16::from_f32`), not the bf16→f32 the CPU uses.
+2. **Activations.** The Qwen3 step kernels keep inter-layer activations in **f16**
+   (their scratch buffers are `uint16_t`), whereas the CPU reference keeps them
+   f32.
+
+Either difference could flip a greedy argmax and break token-exactness. The
+stage-A note flagged this as the open "f16 vs f32 anchor … the end-to-end gate
+must settle the f16 policy," and the prior owned f16 diagnostic was only 17/20
+token-exact. Both are now measured directly.
+
+**Probe.** A checkpoint-gated test
+(`lfm2_decode_metal_step::tests::f16_weight_rounding_policy_probe`, `#[ignore]` +
+`SYNAPSE_UNIFIED_RT_LFM2_1_2B` like the other real-model gates) runs the CPU
+reference greedy decode three ways over the pinned twenty-prompt × 64-token set
+(`decode-prompts.jsonl`), each with the deterministic one-thread platform gemm:
+
+- **native** — the literal `Model::decode_token` contract (bf16→f32 weights, f32
+  activations);
+- **f16-weight** — every weight replaced by its `decode_f16_bits(encode_f16_bits)`
+  round-trip, activations still f32;
+- **f16-activation** — native weights, but the running activation vector rounded
+  to f16 at every layer boundary (via a test-only
+  `Model::decode_token_f16_activations` that mirrors `decode_embedding`).
+
+```
+$ SYNAPSE_UNIFIED_RT_LFM2_1_2B=<snapshot> cargo test -p spike-unified-rt \
+    f16_weight_rounding_policy -- --ignored --nocapture
+=== LFM2 f16 rounding-policy probe ===
+prompts: 20, max_tokens: 64
+native cpu decode: 58.1s, f16-weight cpu decode: 57.4s, f16-activation cpu decode: 56.3s
+native fixture sha256:         49ee80e8ba5d4940854fdbcd044406f5f3af4d5f6d35456eb247cfd506bd307b
+f16-weight fixture sha256:     49ee80e8ba5d4940854fdbcd044406f5f3af4d5f6d35456eb247cfd506bd307b
+f16-activation fixture sha256: 49ee80e8ba5d4940854fdbcd044406f5f3af4d5f6d35456eb247cfd506bd307b
+POLICY (weights):     f16-weight CPU reference is token-identical to the native CPU reference on 20/20 prompts
+POLICY (activations): f16-activation CPU reference is token-identical to the native CPU reference on 20/20 prompts
+test result: ok. 1 passed; 0 failed
+```
+
+(Timings are the M5 Max build host, debug profile, one-thread CPU decode —
+advisory only; they are the cost of generating the fixture, not a decode
+benchmark.)
+
+**Finding.** Rounding the weights to f16 changes **zero** greedy tokens across
+20×64, and rounding the activations to f16 at every layer boundary also changes
+**zero** greedy tokens — all three references produce the byte-identical fixture
+(same sha256). Consequences:
+
+- The literal `lfm2.rs` CPU reference **is** a valid 20/20 oracle for the f16
+  step engine. No separate f16-weight oracle is needed.
+- The f16-activation Qwen3 kernels are valid for a token-exact LFM2 decode; an
+  f32-activation rewrite is **not** required. This was the precision ambiguity
+  the brief said to stop and ask about; it is resolved empirically, so no
+  decision is outstanding.
+
+**Residual caveat (honest).** The activation probe rounds at **layer boundaries**
+(after each residual add), which is a lower bound on the rounding the real engine
+does — the Qwen3 attention kernels also round **inside** the layer (Q/K/V and the
+attention context are f16), and the conv path keeps its internals f32. Boundary
+rounding being harmless is strong evidence but not a proof that the finer
+in-kernel rounding flips no token; only assembling the engine and running the
+Metal-vs-fixture gate certifies that. The gate's pinned target is the fixture
+below, so the certification is mechanical once the engine exists.
+
+### 9.2 Pinned fixture
+
+The native CPU-reference greedy tokens for all twenty prompts × 64 tokens are cut
+to `fixtures/lfm2-f16-step-reference.jsonl` (one `{"id","tokens"}` row per prompt,
+stop-token truncation included — e.g. `completion-10` stops after 1 token,
+`completion-12` after 22). The pinned digest the Metal step engine must reproduce
+20/20 is:
+
+```
+49ee80e8ba5d4940854fdbcd044406f5f3af4d5f6d35456eb247cfd506bd307b
+```
+
+It is pinned in `PINNED_DECODE_FIXTURE_SHA256` and asserted (with the 20/20 policy)
+by the probe on the full set. Regenerate the file with
+`LFM2_F16_FIXTURE_OUT=fixtures/lfm2-f16-step-reference.jsonl`.
+
+### 9.3 Reused kernels wired into the LFM2 metallib (IEEE-strict)
+
+`build.rs` now compiles `qwen3_decode_metal_step.metal` a **second time** with
+`-fno-fast-math -ffp-contract=off` and links that air alongside the LFM2 conv
+kernel into `lfm2_decode_metal_step.metallib`. The LFM2 metallib therefore exports
+both `lfm2_conv_step` and the full reused set (`metal_step_rmsnorm`,
+`metal_step_qkv_matvec`, `metal_step_qk_norm_rope`, `metal_step_attention`,
+`metal_step_matvec_residual`, `metal_step_residual_rmsnorm`,
+`metal_step_gate_up_swiglu`, `metal_step_lm_head`, `metal_step_argmax_*`,
+`metal_step_embedding_gather`), all under the IEEE-strict discipline the conv step
+needs for bit-exactness vs the CPU reference. Verified the linked metallib exports
+both kernel families and the stage-A conv gates still pass.
+
+This is strictly additive: the Qwen3 source file is unmodified and the Qwen3
+metallib compile line (default fast-math) is untouched.
+
+### 9.4 Qwen3 unperturbed (gate 3, satisfied by diff scope)
+
+No shared Qwen3 kernel or `.m`/`.rs` surface changed. `git diff --stat` against
+the stage-B base touches only `build.rs` (the additive compile line above),
+`fixtures/lfm2-f16-step-reference.jsonl` (new), `src/lfm2.rs` (a `#[cfg(test)]`
+probe method), and `src/lfm2_decode_metal_step.rs` (tests). The three Qwen3 step
+files are byte-identical to base:
+
+```
+$ for f in src/qwen3_decode_metal_step.{m,metal,rs}; do
+    git diff --quiet <base> HEAD -- "bench/spikes/unified-rt/$f" && echo "UNCHANGED: $f"
+  done
+UNCHANGED: src/qwen3_decode_metal_step.m
+UNCHANGED: src/qwen3_decode_metal_step.metal
+UNCHANGED: src/qwen3_decode_metal_step.rs
+```
+
+Because nothing shared changed, the Qwen3 fixture battery and the 149.40 tok/s
+baseline do not need re-running for this increment.
+
+### 9.5 Continuation — assembling the hybrid engine (follow-up B, de-risked)
+
+The two questions that made follow-up B open are settled; what remains is
+mechanical orchestration plus the certification gate. Exact entry points:
+
+- **Native context.** Write `lfm2_decode_metal_step.m`'s hybrid context by
+  adapting `qwen3_decode_metal_step.m`'s `encode_*` dispatch helpers (they are
+  dimension-parameterized and take LFM2's dims directly: `hidden 2048`,
+  `query_heads 32`, `kv_heads 8`, `head_dim 64`, `intermediate 12288`,
+  `vocab 65536`, `epsilon 1e-5`). Generalize the per-layer params to a conv/attn
+  variant: attention layers carry q/k/v/o weights + q/k norms + KV-cache handles
+  (reuse as-is); conv layers carry `in_proj`/`out_proj` weights + the depthwise
+  `conv_weight` + a conv-cache handle (the stage-A `lfm2_conv_step`). Do **not**
+  mutate the Qwen3 context.
+- **Conv layer dispatch.** `operator_norm` → `in_proj` matvec (`hidden→3·hidden`,
+  reuse `metal_step_matvec_residual` with `add_residual=0`) → split
+  `product[c]=proj[c]*proj[2h+c]`, `gate[c]=proj[h+c]` (one small new kernel) →
+  `lfm2_conv_step` (proven) → `out_proj` matvec + residual. Match
+  `lfm2.rs::decode_conv` operand order exactly.
+- **Attention layer dispatch.** `operator_norm` → `metal_step_qkv_matvec` →
+  `metal_step_qk_norm_rope` (LFM2 **does** apply q/k layernorm before RoPE —
+  `rope_theta = 1e6`, so generate the rope cos/sin tables with LFM2's theta, not
+  Qwen3's) → `metal_step_attention` → `metal_step_matvec_residual` (o_proj).
+- **Shared tail (all layers).** `residual_rmsnorm` (ffn_norm) →
+  `gate_up_swiglu` → `matvec_residual` (down_proj); then `final_norm` →
+  `lm_head` (tied embeddings) → `argmax`.
+- **Gate.** Greedy-decode the twenty prompts × 64 tokens, hash the token rows with
+  the same `fixture_sha256` ordering, and assert equality with
+  `49ee80e8…307b` for 20/20 prompts; plus a two-runs-byte-identical determinism
+  gate. This certifies the in-kernel rounding the §9.1 caveat leaves open.
+
+**Proven here:** f16 weight rounding (20/20), f16 boundary-activation rounding
+(20/20), the pinned fixture, and the IEEE-strict reused-kernel metallib.
+**Assumed / to certify:** that the reused kernels compose correctly at LFM2 dims
+inside a full forward, and that the finer in-kernel f16 rounding flips no greedy
+token (expected yes from §9.1, certified only by the gate). **Not started:** the
+Q8 path (follow-up C) and the authoritative M1 timing (follow-up D) — the latter
+has nothing new to time until the engine is assembled.

@@ -423,4 +423,362 @@ mod tests {
             "real-weight conv cache diverged from the CPU rolling state"
         );
     }
+
+    // ---------------------------------------------------------------------
+    // f16 rounding-policy probe (stage B).
+    //
+    // The Metal step engine stores every weight as IEEE f16 bits
+    // (`encode_f16_bits`), while the `lfm2.rs` CPU reference decodes with the
+    // checkpoint weights loaded as bf16->f32 (no f16 rounding; `load_with_quant`
+    // ignores the precision argument). Before assembling the hybrid engine we
+    // must settle which oracle the f16 engine is expected to match: does rounding
+    // the weights to f16 change the greedy token sequence at all?
+    //
+    // This probe runs the CPU reference greedy decode twice over the pinned
+    // twenty-prompt set -- once with the native loaded weights, once with every
+    // weight replaced by its f16 round-trip -- and reports per-prompt
+    // token-exactness. If the two agree on every prompt, the literal CPU
+    // reference is a valid 20/20 oracle for the f16 engine; if they diverge, the
+    // f16 engine's oracle must be the f16-weight CPU reference and the divergent
+    // prompts are listed. The result is printed (run with `--nocapture`) and
+    // recorded in LFM2-METAL-STEP.md; it is the f16 policy the end-to-end gate
+    // builds on.
+    // ---------------------------------------------------------------------
+
+    use crate::lfm2::{Mixer, Model};
+    use crate::qwen3_decode::top_logits;
+    use crate::{decode_f16_bits, encode_f16_bits, Precision};
+    use sha2::{Digest, Sha256};
+    use std::collections::HashSet;
+
+    /// Round one f32 buffer to IEEE f16 and back, in place. After this every
+    /// value equals `decode_f16_bits(encode_f16_bits(value))`, i.e. the exact f32
+    /// value the Metal engine obtains from its stored f16 weight bits.
+    fn round_to_f16_in_place(data: &mut [f32]) {
+        let bits = encode_f16_bits(data);
+        let rounded = decode_f16_bits(&bits);
+        data.copy_from_slice(&rounded);
+    }
+
+    /// Replace every weight in the model with its f16 round-trip so the CPU
+    /// reference decodes from the same weight bits the Metal engine uses. Walks
+    /// the full hybrid layout: embeddings (tied LM head), per-layer norms, the
+    /// SwiGLU FFN weights, and the conv- or attention-mixer weights.
+    fn round_model_weights_to_f16(model: &mut Model) {
+        round_to_f16_in_place(&mut model.embeddings.data);
+        round_to_f16_in_place(&mut model.final_norm.weight.data);
+        if let Some(head) = model.lm_head.as_mut() {
+            round_to_f16_in_place(&mut head.tensor.data);
+        }
+        for layer in &mut model.layers {
+            round_to_f16_in_place(&mut layer.operator_norm.weight.data);
+            round_to_f16_in_place(&mut layer.ffn_norm.weight.data);
+            round_to_f16_in_place(&mut layer.w1.tensor.data);
+            round_to_f16_in_place(&mut layer.w2.tensor.data);
+            round_to_f16_in_place(&mut layer.w3.tensor.data);
+            match &mut layer.mixer {
+                Mixer::Conv(conv) => {
+                    round_to_f16_in_place(&mut conv.in_proj.tensor.data);
+                    round_to_f16_in_place(&mut conv.conv_weight.data);
+                    round_to_f16_in_place(&mut conv.out_proj.tensor.data);
+                }
+                Mixer::Attention(attn) => {
+                    round_to_f16_in_place(&mut attn.q_proj.tensor.data);
+                    round_to_f16_in_place(&mut attn.q_norm.weight.data);
+                    round_to_f16_in_place(&mut attn.k_proj.tensor.data);
+                    round_to_f16_in_place(&mut attn.k_norm.weight.data);
+                    round_to_f16_in_place(&mut attn.v_proj.tensor.data);
+                    round_to_f16_in_place(&mut attn.out_proj.tensor.data);
+                }
+            }
+        }
+    }
+
+    /// Greedy decode through the CPU reference (`Model::decode_token`), the
+    /// decode contract the Metal step engine must match. Prefills the prompt
+    /// token-by-token
+    /// into a fresh cache, then emits up to `max_tokens` argmax tokens (highest
+    /// logit, lowest id on tie via `top_logits`), stopping after a stop token is
+    /// emitted -- the same rule as `lfm2_decode.rs::Decoder`.
+    fn greedy_decode_cpu(
+        model: &Model,
+        provider: &mut dyn KernelProvider,
+        prompt: &[u32],
+        max_tokens: usize,
+        stop_tokens: &HashSet<u32>,
+        f16_activations: bool,
+    ) -> Vec<u32> {
+        let mut cache = model.empty_decode_cache(prompt.len() + max_tokens);
+        let mut logits = Vec::new();
+        for &token in prompt {
+            let (_, next_logits) = if f16_activations {
+                model
+                    .decode_token_f16_activations(provider, &mut cache, token)
+                    .expect("cpu prefill step (f16 activations)")
+            } else {
+                model
+                    .decode_token(provider, &mut cache, token)
+                    .expect("cpu prefill step")
+            };
+            logits = next_logits;
+        }
+        let mut generated = Vec::with_capacity(max_tokens);
+        let mut next = top_logits(&logits, 1)[0].token_id;
+        for _ in 0..max_tokens {
+            generated.push(next);
+            if stop_tokens.contains(&next) {
+                break;
+            }
+            let (_, next_logits) = if f16_activations {
+                model
+                    .decode_token_f16_activations(provider, &mut cache, next)
+                    .expect("cpu decode step (f16 activations)")
+            } else {
+                model
+                    .decode_token(provider, &mut cache, next)
+                    .expect("cpu decode step")
+            };
+            logits = next_logits;
+            next = top_logits(&logits, 1)[0].token_id;
+        }
+        generated
+    }
+
+    /// The pinned twenty-prompt decode set (`decode-prompts.jsonl`), parsed to
+    /// (id, prompt text) pairs in file order.
+    fn decode_prompt_set() -> Vec<(String, String)> {
+        let raw = include_str!("../decode-prompts.jsonl");
+        raw.lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                let value: serde_json::Value =
+                    serde_json::from_str(line).expect("decode-prompts.jsonl row parses");
+                let id = value["id"].as_str().expect("prompt id").to_string();
+                let prompt = value["prompt"].as_str().expect("prompt text").to_string();
+                (id, prompt)
+            })
+            .collect()
+    }
+
+    /// Stable sha256 over a token fixture so a generated oracle can be pinned and
+    /// later compared byte-for-byte. Serialises each prompt's tokens as a line of
+    /// space-separated ids; the digest covers the whole set in file order.
+    fn fixture_sha256(rows: &[(String, Vec<u32>)]) -> String {
+        let mut digest = Sha256::new();
+        for (id, tokens) in rows {
+            digest.update(id.as_bytes());
+            digest.update(b"\n");
+            for token in tokens {
+                digest.update(token.to_le_bytes());
+            }
+            digest.update(b"\n");
+        }
+        format!("{:x}", digest.finalize())
+    }
+
+    /// Pinned sha256 of the 20-prompt x 64-token greedy fixture generated from
+    /// the native `lfm2.rs` CPU reference (bf16->f32 weights, one-thread
+    /// deterministic gemm) on the LFM2-1.2B snapshot
+    /// `933cee00d754fb3bfe06c644c0cb95453f2d8bb2`. The f16-weight CPU reference
+    /// produces the byte-identical fixture (see the gate below), so this single
+    /// digest is the oracle the Metal step engine must reproduce 20/20.
+    const PINNED_DECODE_FIXTURE_SHA256: &str =
+        "49ee80e8ba5d4940854fdbcd044406f5f3af4d5f6d35456eb247cfd506bd307b";
+
+    /// f16 rounding-policy probe on the real LFM2-1.2B checkpoint. See the block
+    /// comment above for what it settles. Run with:
+    ///
+    /// ```text
+    /// SYNAPSE_UNIFIED_RT_LFM2_1_2B=<snapshot> cargo test -p spike-unified-rt \
+    ///     f16_weight_rounding_policy -- --ignored --nocapture
+    /// ```
+    ///
+    /// `LFM2_F16_PROBE_LIMIT` / `LFM2_F16_PROBE_MAX_TOKENS` cap the prompt count
+    /// and tokens-per-prompt for a fast calibration run; unset, they default to
+    /// the full 20x64 fixture set.
+    #[test]
+    #[ignore]
+    fn f16_weight_rounding_policy_probe() {
+        use tokenizers::Tokenizer;
+
+        let path = std::path::PathBuf::from(
+            std::env::var_os("SYNAPSE_UNIFIED_RT_LFM2_1_2B")
+                .expect("set SYNAPSE_UNIFIED_RT_LFM2_1_2B to the LFM2-1.2B snapshot directory"),
+        );
+        let limit: usize = std::env::var("LFM2_F16_PROBE_LIMIT")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(usize::MAX);
+        let max_tokens: usize = std::env::var("LFM2_F16_PROBE_MAX_TOKENS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(64);
+
+        let mut tokenizer =
+            Tokenizer::from_file(path.join("tokenizer.json")).expect("load tokenizer");
+        tokenizer.with_padding(None);
+        tokenizer.with_truncation(None).expect("disable truncation");
+
+        let prompts = decode_prompt_set();
+        let prompts: Vec<_> = prompts.into_iter().take(limit).collect();
+        assert!(!prompts.is_empty(), "decode prompt set is empty");
+
+        // Native CPU reference (bf16->f32 weights, the literal lfm2.rs contract).
+        let native_model = Model::load(&path, Precision::F16).expect("load LFM2-1.2B");
+        let stop_tokens: HashSet<u32> =
+            native_model.generation_stop_ids().iter().copied().collect();
+        let mut native_provider = CpuProvider::platform_for_test();
+        let mut native_rows = Vec::new();
+        let native_started = std::time::Instant::now();
+        for (id, prompt) in &prompts {
+            let prompt_ids = native_model
+                .encode_generation(&tokenizer, prompt, 2048)
+                .expect("encode prompt");
+            let tokens = greedy_decode_cpu(
+                &native_model,
+                &mut native_provider,
+                &prompt_ids,
+                max_tokens,
+                &stop_tokens,
+                false,
+            );
+            println!("[native] {id}: {} tokens", tokens.len());
+            native_rows.push((id.clone(), tokens));
+        }
+        let native_secs = native_started.elapsed().as_secs_f64();
+
+        // f16-weight CPU reference (every weight replaced by its f16 round-trip).
+        let mut f16_model = Model::load(&path, Precision::F16).expect("load LFM2-1.2B");
+        round_model_weights_to_f16(&mut f16_model);
+        let mut f16_provider = CpuProvider::platform_for_test();
+        let mut f16_rows = Vec::new();
+        let f16_started = std::time::Instant::now();
+        for (id, prompt) in &prompts {
+            let prompt_ids = f16_model
+                .encode_generation(&tokenizer, prompt, 2048)
+                .expect("encode prompt");
+            let tokens = greedy_decode_cpu(
+                &f16_model,
+                &mut f16_provider,
+                &prompt_ids,
+                max_tokens,
+                &stop_tokens,
+                false,
+            );
+            f16_rows.push((id.clone(), tokens));
+        }
+        let f16_secs = f16_started.elapsed().as_secs_f64();
+
+        // f16-activation CPU reference (native weights, activations rounded to f16
+        // at every layer boundary). This emulates a step engine that reuses the
+        // f16-activation Qwen3 kernels and measures whether that reuse can stay
+        // token-exact against the f32 CPU reference.
+        let mut f16act_provider = CpuProvider::platform_for_test();
+        let mut f16act_rows = Vec::new();
+        let f16act_started = std::time::Instant::now();
+        for (id, prompt) in &prompts {
+            let prompt_ids = native_model
+                .encode_generation(&tokenizer, prompt, 2048)
+                .expect("encode prompt");
+            let tokens = greedy_decode_cpu(
+                &native_model,
+                &mut f16act_provider,
+                &prompt_ids,
+                max_tokens,
+                &stop_tokens,
+                true,
+            );
+            f16act_rows.push((id.clone(), tokens));
+        }
+        let f16act_secs = f16act_started.elapsed().as_secs_f64();
+
+        // Compare the two CPU references prompt-by-prompt.
+        let mut identical = 0usize;
+        for ((id, native_tokens), (_, f16_tokens)) in native_rows.iter().zip(&f16_rows) {
+            if native_tokens == f16_tokens {
+                identical += 1;
+            } else {
+                let shared = native_tokens.len().min(f16_tokens.len());
+                let first_diff = (0..shared).find(|&i| native_tokens[i] != f16_tokens[i]);
+                println!(
+                    "[policy] DIVERGENCE {id}: native {} tok, f16 {} tok, first diff at step {:?}",
+                    native_tokens.len(),
+                    f16_tokens.len(),
+                    first_diff
+                );
+            }
+        }
+
+        println!("=== LFM2 f16 rounding-policy probe ===");
+        println!("prompts: {}, max_tokens: {}", prompts.len(), max_tokens);
+        println!(
+            "native cpu decode: {:.1}s, f16-weight cpu decode: {:.1}s, f16-activation cpu decode: {:.1}s",
+            native_secs, f16_secs, f16act_secs
+        );
+        let native_sha = fixture_sha256(&native_rows);
+        let f16_sha = fixture_sha256(&f16_rows);
+        let f16act_sha = fixture_sha256(&f16act_rows);
+        println!("native fixture sha256: {native_sha}");
+        println!("f16-weight fixture sha256: {f16_sha}");
+        println!("f16-activation fixture sha256: {f16act_sha}");
+        println!(
+            "POLICY (weights): f16-weight CPU reference is token-identical to the native CPU reference on {}/{} prompts",
+            identical,
+            prompts.len()
+        );
+        let mut act_identical = 0usize;
+        for ((id, native_tokens), (_, act_tokens)) in native_rows.iter().zip(&f16act_rows) {
+            if native_tokens == act_tokens {
+                act_identical += 1;
+            } else {
+                let shared = native_tokens.len().min(act_tokens.len());
+                let first_diff = (0..shared).find(|&i| native_tokens[i] != act_tokens[i]);
+                println!(
+                    "[policy] ACTIVATION DIVERGENCE {id}: native {} tok, f16-act {} tok, first diff at step {:?}",
+                    native_tokens.len(),
+                    act_tokens.len(),
+                    first_diff
+                );
+            }
+        }
+        println!(
+            "POLICY (activations): f16-activation CPU reference is token-identical to the native CPU reference on {}/{} prompts",
+            act_identical,
+            prompts.len()
+        );
+
+        // Optional fixture cut: write the native CPU-reference tokens as JSONL so
+        // the Metal step gate can load a pinned oracle instead of re-running the
+        // (slow) CPU decode. Enable with LFM2_F16_FIXTURE_OUT=<path>.
+        if let Some(out) = std::env::var_os("LFM2_F16_FIXTURE_OUT") {
+            let mut body = String::new();
+            for (id, tokens) in &native_rows {
+                let tokens_json = serde_json::to_string(tokens).expect("serialize tokens");
+                body.push_str(&format!(
+                    "{{\"id\":{},\"tokens\":{tokens_json}}}\n",
+                    serde_json::to_string(id).expect("serialize id")
+                ));
+            }
+            std::fs::write(&out, body).expect("write fixture");
+            println!("wrote fixture to {}", out.display());
+        }
+
+        // Gate assertions (only meaningful on the full 20x64 set; a calibration run
+        // with a reduced limit/tokens skips the pin so it cannot false-fail).
+        if limit >= prompts.len() && max_tokens == 64 {
+            assert_eq!(
+                identical,
+                prompts.len(),
+                "f16 weight rounding changed the greedy token sequence"
+            );
+            assert_eq!(
+                native_sha, PINNED_DECODE_FIXTURE_SHA256,
+                "native CPU-reference decode fixture drifted from the pinned oracle"
+            );
+            assert_eq!(
+                f16_sha, PINNED_DECODE_FIXTURE_SHA256,
+                "f16-weight CPU-reference decode fixture differs from the native oracle"
+            );
+        }
+    }
 }
