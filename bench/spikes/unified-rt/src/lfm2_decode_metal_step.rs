@@ -446,7 +446,9 @@ impl Lfm2HybridStepEngine {
                             holder.q_norm.as_ptr().cast(),
                             holder.k_norm.as_ptr().cast(),
                         ),
-                        Mixer::Conv(_) => (null, null, null, null, null, null, null, null, null, null),
+                        Mixer::Conv(_) => {
+                            (null, null, null, null, null, null, null, null, null, null)
+                        }
                     };
                 Lfm2HybridLayerParams {
                     operator_norm: holder.operator_norm.as_ptr().cast(),
@@ -1297,7 +1299,7 @@ mod tests {
     // ---------------------------------------------------------------------
 
     use crate::lfm2::Weight;
-    use crate::quant::{Q8_0Tensor, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_ELEMENTS, WeightQuantization};
+    use crate::quant::{Q8_0Tensor, WeightQuantization, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_ELEMENTS};
     use half::f16;
 
     /// Dequantize GGUF Q8_0 block bytes back to f32 (each 34-byte block is an f16
@@ -1305,8 +1307,7 @@ mod tests {
     /// of `Q8_0Tensor::quantize` and reproduces, on the CPU, the exact weight
     /// values the Metal Q8 GEMV kernels multiply against.
     fn dequantize_q8_0(bytes: &[u8]) -> Vec<f32> {
-        let mut values =
-            Vec::with_capacity(bytes.len() / Q8_0_BLOCK_BYTES * Q8_0_BLOCK_ELEMENTS);
+        let mut values = Vec::with_capacity(bytes.len() / Q8_0_BLOCK_BYTES * Q8_0_BLOCK_ELEMENTS);
         for block in bytes.chunks_exact(Q8_0_BLOCK_BYTES) {
             let scale = f32::from(f16::from_bits(u16::from_le_bytes([block[0], block[1]])));
             for quant in &block[2..] {
@@ -1392,7 +1393,11 @@ mod tests {
         for &token in prompt {
             let start = token as usize * hidden;
             let (_, next_logits) = model
-                .decode_embedding(provider, &mut cache, &input_embeddings[start..start + hidden])
+                .decode_embedding(
+                    provider,
+                    &mut cache,
+                    &input_embeddings[start..start + hidden],
+                )
                 .expect("q8 cpu prefill step");
             logits = next_logits;
         }
@@ -1405,7 +1410,11 @@ mod tests {
             }
             let start = next as usize * hidden;
             let (_, next_logits) = model
-                .decode_embedding(provider, &mut cache, &input_embeddings[start..start + hidden])
+                .decode_embedding(
+                    provider,
+                    &mut cache,
+                    &input_embeddings[start..start + hidden],
+                )
                 .expect("q8 cpu decode step");
             logits = next_logits;
             next = top_logits(&logits, 1)[0].token_id;
@@ -1564,9 +1573,8 @@ mod tests {
         tokenizer.with_truncation(None).expect("disable truncation");
 
         // Engine: a Q8-loaded model drives the quantized hybrid step engine.
-        let engine_model =
-            Model::load_with_quant(&path, Precision::F16, WeightQuantization::Q8_0)
-                .expect("load LFM2-1.2B (Q8_0) for the engine");
+        let engine_model = Model::load_with_quant(&path, Precision::F16, WeightQuantization::Q8_0)
+            .expect("load LFM2-1.2B (Q8_0) for the engine");
         let hidden = engine_model.config.hidden_size;
         let stop_tokens: HashSet<u32> =
             engine_model.generation_stop_ids().iter().copied().collect();
@@ -1623,7 +1631,10 @@ mod tests {
                 prompt_max = prompt_max.max(max_delta);
                 global_max = global_max.max(max_delta);
             }
-            println!("[q8-band] {id}: max|dlogit| over {} positions = {prompt_max:.6}", stream.len());
+            println!(
+                "[q8-band] {id}: max|dlogit| over {} positions = {prompt_max:.6}",
+                stream.len()
+            );
         }
         println!("[q8-band] global max|dlogit| over the full vocabulary = {global_max:.6}");
     }
@@ -1667,14 +1678,22 @@ mod tests {
         for &token in prompt_ids {
             let start = token as usize * hidden;
             let (_, next) = model
-                .decode_embedding(&mut provider, &mut cache, &input_embeddings[start..start + hidden])
+                .decode_embedding(
+                    &mut provider,
+                    &mut cache,
+                    &input_embeddings[start..start + hidden],
+                )
                 .expect("q8 cpu prefill step");
             logits = next;
         }
         for &token in &pinned_tokens[..step] {
             let start = token as usize * hidden;
             let (_, next) = model
-                .decode_embedding(&mut provider, &mut cache, &input_embeddings[start..start + hidden])
+                .decode_embedding(
+                    &mut provider,
+                    &mut cache,
+                    &input_embeddings[start..start + hidden],
+                )
                 .expect("q8 cpu decode step");
             logits = next;
         }
@@ -1735,9 +1754,8 @@ mod tests {
         tokenizer.with_truncation(None).expect("disable truncation");
 
         // Engine: Q8-loaded model driving the quantized hybrid step engine.
-        let engine_model =
-            Model::load_with_quant(&path, Precision::F16, WeightQuantization::Q8_0)
-                .expect("load LFM2-1.2B (Q8_0)");
+        let engine_model = Model::load_with_quant(&path, Precision::F16, WeightQuantization::Q8_0)
+            .expect("load LFM2-1.2B (Q8_0)");
         let stop_tokens: HashSet<u32> =
             engine_model.generation_stop_ids().iter().copied().collect();
         let mut engine =
@@ -1770,7 +1788,10 @@ mod tests {
                     divergent.push((id.clone(), step, tokens[step], pinned_tokens[step]));
                 }
                 None if tokens.len() == pinned_tokens.len() => {
-                    println!("[q8] {id}: {} tokens, byte-exact vs Q8 oracle", tokens.len());
+                    println!(
+                        "[q8] {id}: {} tokens, byte-exact vs Q8 oracle",
+                        tokens.len()
+                    );
                 }
                 _ => {
                     panic!(
