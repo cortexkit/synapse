@@ -816,17 +816,16 @@ mod tests {
     //! drifts on other machines' Metal compilers.
 
     use super::{MetalStepDecoder, MetalStepKvCache};
-    use crate::qwen3_decode::DecodeKernel;
     use crate::quant::WeightQuantization;
+    use crate::qwen3_decode::DecodeKernel;
     use crate::{Execution, MetalExecutionConfig, Precision};
 
     const BUCKET: usize = 1024;
 
     fn model_path() -> std::path::PathBuf {
         std::path::PathBuf::from(
-            std::env::var_os("SYNAPSE_UNIFIED_RT_QWEN3_0_6B").expect(
-                "set SYNAPSE_UNIFIED_RT_QWEN3_0_6B to the Qwen3-0.6B snapshot directory",
-            ),
+            std::env::var_os("SYNAPSE_UNIFIED_RT_QWEN3_0_6B")
+                .expect("set SYNAPSE_UNIFIED_RT_QWEN3_0_6B to the Qwen3-0.6B snapshot directory"),
         )
     }
 
@@ -843,14 +842,9 @@ mod tests {
             execution: Execution::Explicit,
             package_root: None,
         };
-        let mut decoder = MetalStepDecoder::new(
-            &model,
-            Precision::F16,
-            &execution,
-            BUCKET,
-            weight_quant,
-        )
-        .expect("construct Metal step decoder");
+        let mut decoder =
+            MetalStepDecoder::new(&model, Precision::F16, &execution, BUCKET, weight_quant)
+                .expect("construct Metal step decoder");
         body(&model, &mut decoder)
     }
 
@@ -912,8 +906,7 @@ mod tests {
                 assert_eq!(base_position, prompt_len);
 
                 // Sequential reference: greedy draft tokens and their logits.
-                let (draft, seq_logits) =
-                    sequential_greedy(decoder, &mut cache, &seed_logits, 16);
+                let (draft, seq_logits) = sequential_greedy(decoder, &mut cache, &seed_logits, 16);
 
                 for k in [1usize, 2, 4, 8, 16] {
                     let draft = &draft[..k];
@@ -1079,12 +1072,12 @@ mod tests {
             // Warmup so GPU clocks and pipeline caches are steady before timing.
             for _ in 0..5 {
                 decoder.rewind(&mut cache, base_position).expect("rewind");
-                decoder.verify_batch(&mut cache, &draft[..8]).expect("warmup");
+                decoder
+                    .verify_batch(&mut cache, &draft[..8])
+                    .expect("warmup");
             }
 
-            println!(
-                "BATCHED_VERIFY_PROBE quant={weight_quant:?} prompt_len={base_position}"
-            );
+            println!("BATCHED_VERIFY_PROBE quant={weight_quant:?} prompt_len={base_position}");
             // Single-token reference: sequential greedy `advance` (the unchanged
             // per-token decode path). Running it in this same harness and build
             // gives a direct baseline beside the batched numbers and confirms the
@@ -1119,7 +1112,9 @@ mod tests {
                 for _ in 0..iterations {
                     decoder.rewind(&mut cache, base_position).expect("rewind");
                     let started = std::time::Instant::now();
-                    decoder.verify_batch(&mut cache, draft).expect("verify_batch");
+                    decoder
+                        .verify_batch(&mut cache, draft)
+                        .expect("verify_batch");
                     samples.push(started.elapsed().as_secs_f64());
                 }
                 samples.sort_by(|a, b| a.total_cmp(b));
