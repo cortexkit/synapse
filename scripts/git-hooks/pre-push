@@ -1,0 +1,10 @@
+#!/bin/sh
+# Pre-push gate: rustfmt drift has reached CI three times from merge pushes whose
+# verification ran tests but not the linters (84efc86, 263464e, 6050540). The check
+# is mechanical and belongs on the push itself, not on remembering to run it.
+set -e
+cd "$(git rev-parse --show-toplevel)"
+if ! cargo fmt --check >/dev/null 2>&1; then
+  echo "pre-push: cargo fmt --check failed — run 'cargo fmt', amend/commit, then push." >&2
+  exit 1
+fi
