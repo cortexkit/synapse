@@ -201,8 +201,8 @@ unsafe extern "C" {
 // not Qwen3's theta. This is the engine the 20x64 token-exactness gate drives.
 // ===========================================================================
 
-use crate::lfm2::{Mixer, Model};
 use crate::encode_f16_bits;
+use crate::lfm2::{Mixer, Model};
 
 #[repr(C)]
 struct Lfm2HybridLayerParams {
@@ -460,8 +460,10 @@ impl Lfm2HybridStepEngine {
         let mut sine = Vec::with_capacity(head_dim);
         for index in 0..head_dim {
             let rotary_index = index % (head_dim / 2);
-            let frequency =
-                1.0 / self.rope_theta.powf((2 * rotary_index) as f32 / head_dim as f32);
+            let frequency = 1.0
+                / self
+                    .rope_theta
+                    .powf((2 * rotary_index) as f32 / head_dim as f32);
             let (sin, cos) = (position as f32 * frequency).sin_cos();
             cosine.push(cos);
             sine.push(sin);
@@ -524,7 +526,12 @@ impl Lfm2HybridStepEngine {
     /// on device with on-GPU argmax, starting at `position`. Returns the `steps`
     /// tokens produced AFTER `first_token` (i.e. token k is the argmax obtained
     /// once token k-1 has been decoded).
-    pub(crate) fn chain(&mut self, position: usize, steps: usize, first_token: u32) -> Result<Vec<u32>> {
+    pub(crate) fn chain(
+        &mut self,
+        position: usize,
+        steps: usize,
+        first_token: u32,
+    ) -> Result<Vec<u32>> {
         if steps == 0 {
             return Ok(Vec::new());
         }
@@ -1341,7 +1348,11 @@ mod tests {
         if let Ok(value) = std::env::var("SYNAPSE_LFM2_STEP_AUTHORITY") {
             return value == "m1" || value == "1";
         }
-        match std::process::Command::new("sysctl").arg("-n").arg("hw.model").output() {
+        match std::process::Command::new("sysctl")
+            .arg("-n")
+            .arg("hw.model")
+            .output()
+        {
             Ok(output) if output.status.success() => {
                 String::from_utf8_lossy(&output.stdout).contains("MacBookPro18,2")
             }
@@ -1443,7 +1454,10 @@ mod tests {
                     divergent.push((id.clone(), step, tokens[step], pinned_tokens[step]));
                 }
                 None if tokens.len() == pinned_tokens.len() => {
-                    println!("[metal] {id}: {} tokens, byte-exact vs oracle", tokens.len());
+                    println!(
+                        "[metal] {id}: {} tokens, byte-exact vs oracle",
+                        tokens.len()
+                    );
                 }
                 _ => {
                     // A length mismatch is never a certified near-tie.
@@ -1477,7 +1491,8 @@ mod tests {
                 .find(|(pinned_id, _)| pinned_id == id)
                 .map(|(_, tokens)| tokens.clone())
                 .expect("pinned tokens");
-            let fork_logits = cpu_logits_predicting_step(&model, &prompt_ids, &pinned_tokens, *step);
+            let fork_logits =
+                cpu_logits_predicting_step(&model, &prompt_ids, &pinned_tokens, *step);
             let (best, second, gap) = top2_gap(&fork_logits);
             println!(
                 "[metal] fork {id} step {step}: CPU top-2 = ({best}, {second}), gap {gap:.6} (band {NEAR_TIE_BAND})"
@@ -1506,8 +1521,14 @@ mod tests {
             let (id, step, engine_token, cpu_token) = &divergent[0];
             assert_eq!(id, M1_FORK_PROMPT, "M1 authority: fork prompt drifted");
             assert_eq!(*step, M1_FORK_STEP, "M1 authority: fork step drifted");
-            assert_eq!(*cpu_token, M1_FORK_CPU_TOKEN, "M1 authority: oracle token at the fork drifted");
-            assert_eq!(*engine_token, M1_FORK_ENGINE_TOKEN, "M1 authority: engine token at the fork drifted");
+            assert_eq!(
+                *cpu_token, M1_FORK_CPU_TOKEN,
+                "M1 authority: oracle token at the fork drifted"
+            );
+            assert_eq!(
+                *engine_token, M1_FORK_ENGINE_TOKEN,
+                "M1 authority: engine token at the fork drifted"
+            );
             println!(
                 "[metal] M1 AUTHORITY: pinned fork signature confirmed ({M1_FORK_PROMPT} step {M1_FORK_STEP}, engine {M1_FORK_ENGINE_TOKEN} vs oracle {M1_FORK_CPU_TOKEN})"
             );
@@ -1643,10 +1664,14 @@ mod tests {
 
         // CPU greedy sequence (prompt ++ generated), the shared token stream.
         let mut provider = CpuProvider::platform_for_test();
-        let generated = greedy_decode_cpu(&model, &mut provider, &prompt_ids, 64, &stop_tokens, false);
+        let generated =
+            greedy_decode_cpu(&model, &mut provider, &prompt_ids, 64, &stop_tokens, false);
         let mut seq = prompt_ids.clone();
         seq.extend_from_slice(&generated);
-        println!("prompt {want_id}: prompt_len {n}, generated {}", generated.len());
+        println!(
+            "prompt {want_id}: prompt_len {n}, generated {}",
+            generated.len()
+        );
 
         fn argmax(logits: &[f32]) -> u32 {
             let mut best = 0u32;
@@ -1661,8 +1686,15 @@ mod tests {
         }
         fn top3(logits: &[f32]) -> Vec<(u32, f32)> {
             let mut idx: Vec<u32> = (0..logits.len() as u32).collect();
-            idx.sort_by(|&a, &b| logits[b as usize].total_cmp(&logits[a as usize]).then(a.cmp(&b)));
-            idx.iter().take(3).map(|&i| (i, logits[i as usize])).collect()
+            idx.sort_by(|&a, &b| {
+                logits[b as usize]
+                    .total_cmp(&logits[a as usize])
+                    .then(a.cmp(&b))
+            });
+            idx.iter()
+                .take(3)
+                .map(|&i| (i, logits[i as usize]))
+                .collect()
         }
 
         // CPU per-position logits feeding the shared sequence.
