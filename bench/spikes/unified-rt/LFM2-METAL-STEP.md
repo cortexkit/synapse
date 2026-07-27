@@ -647,3 +647,264 @@ SYNAPSE_UNIFIED_RT_LFM2_1_2B=<snapshot> cargo test --release -p spike-unified-rt
 SYNAPSE_UNIFIED_RT_LFM2_1_2B=<snapshot> cargo test -p spike-unified-rt \
     hybrid_step_localize_divergence -- --ignored --nocapture
 ```
+
+
+---
+
+## 11. Stage D — Q8_0 port: quantized step engine certified (build-host advisory; M1 authority pending)
+
+Stage D wires the GGUF Q8_0 path into the LFM2 hybrid step engine, reusing the
+Qwen3 campaign's pack-4-rows Q8 GEMV kernels for every quantized matmul, cuts the
+Q8 CPU-reference oracle and pins its fixture, and certifies the Q8 engine against
+that oracle with the same two-tier model stage C used for f16. The genuinely new
+finding is that, because the engine and the oracle share the *exact same
+quantized bytes*, the large Q8 quantization error cancels in their comparison and
+the Q8 engine lands **20/20 byte-exact** against the Q8 oracle on the build host —
+cleaner than the f16 engine's single near-tie fork — with a measured vocab-wide
+engine-vs-oracle logit error of ~0.051.
+
+### 11.1 Quant decisions (per tensor)
+
+The spike's proven Q8_0 pipeline (`src/quant.rs`, `Q8_0Tensor::quantize`: each
+matrix row split into 32-element GGUF `block_q8_0` blocks — little-endian f16
+scale + 32 i8 quants, 34 bytes/block) is reused verbatim; no new quant format is
+invented. LFM2-1.2B's Q8 weights are produced by the existing
+`Model::load_with_quant(path, precision, WeightQuantization::Q8_0)`, which
+populates each `Weight.q8_0` and the tied `tied_lm_head_q8_0`. The per-tensor
+decisions follow the CUDA Q8 spike (`QUANT-DECODE.md`) exactly:
+
+| Tensor | LFM2-1.2B shape | Storage | Kernel |
+|---|---|---|---|
+| Attention Q/K/V/O projections (×6 layers) | `[2048/512 × 2048]` | **Q8_0** | reused `metal_step_qkv_matvec` / `metal_step_matvec_residual` (pack-4) |
+| Conv `in_proj` (×10 layers) | `[6144 × 2048]` | **Q8_0** | reused `metal_step_matvec_residual` (pack-4) |
+| Conv `out_proj` (×10 layers) | `[2048 × 2048]` | **Q8_0** | reused `metal_step_matvec_residual` (pack-4) |
+| MLP gate/up `w1`/`w3` (×16 layers) | `[12288 × 2048]` | **Q8_0** | reused `metal_step_gate_up_swiglu` (pack-4) |
+| MLP down `w2` (×16 layers) | `[2048 × 12288]` | **Q8_0** | reused `metal_step_matvec_residual` (pack-4) |
+| Tied LM head | `[65536 × 2048]` | **Q8_0** (quantized separately) | reused `metal_step_lm_head` (pack-4) |
+| Embedding gather table | `[65536 × 2048]` | **f16** (not quantized) | `metal_step_embedding_gather` |
+| RMSNorm weights (`operator_norm`, `ffn_norm`, `q_norm`, `k_norm`) | `[hidden]`/`[head_dim]` | **f16** | reused norm kernels |
+| Depthwise conv taps `conv_weight` (×10 layers) | `[hidden × kernel_size]` | **f32** (never quantized) | `lfm2_conv_step` (stage A, bit-exact) |
+
+The tied embedding is quantized **separately** for LM-head use while the gather
+table stays f16 (`QUANT-DECODE.md` trap #2): the engine uploads two distinct
+buffers from the same source table — an f16 gather table and a Q8 head — exactly
+as the CUDA spike did. No tail path was needed: every LFM2 matmul column dimension
+is a multiple of 32 (`hidden 2048`, `intermediate 12288`, `query_width 2048`,
+`kv_width 512`, `in_proj 6144`, `vocab 65536`), so the pack-4 no-tail convention
+holds and no weights are padded.
+
+**Wiring.** `lfm2_decode_metal_step.m` gains an `Lfm2StepWeight { fp16, q8 }`
+pair per quantizable matmul (mirroring the Qwen3 context's `StepWeight`), a
+`quantized` mode flag threaded into every matmul kernel config, and the Q8
+dispatch sizing the reused kernels require (four rows per 32-lane simdgroup:
+`((output+3)/4)*32` threads for the residual/gate/down/head matvecs;
+`(query_width + 2·kv_width)·32` for QKV). The Qwen3 kernels themselves are
+**not** modified — they already carry both an f16 and a Q8 path selected by their
+`quantized` config flag, and stage B already links them IEEE-strict into the LFM2
+metallib. `lfm2_decode_metal_step.rs` extracts each weight's `q8_0` block bytes
+from the Q8-loaded model and hands them to the native prepare; the f16 path is
+unchanged and selected by a `quantized=false` engine. `lfm2.rs` is untouched.
+
+### 11.2 The Q8 oracle (pinned CPU-reference fixture)
+
+The Q8 engine's oracle is the `lfm2.rs` CPU reference running the
+**Q8-dequantized** weights — *not* the f16 fixture — cut with the same 20×64
+protocol and the deterministic one-thread platform gemm. The oracle mirrors the
+engine's weight representation so their comparison isolates only the irreducible
+gap: every Q8 matmul weight is replaced in place by the dequantized values of the
+model's `q8_0` blocks (the same bytes the engine uploads), the norms and the input
+embedding table are f16-rounded (the engine stores them f16), and the tied LM head
+is Q8-dequantized **separately** from the f16 input table (the engine gathers f16
+input but multiplies a Q8 head; the CPU model ties both to `embeddings.data`, so
+the oracle feeds the f16 input table through `decode_embedding` while the head
+matmul reads the Q8-dequantized table). What remains between engine and oracle is
+the f16 inter-layer activations, the matmul accumulation rounding, and the
+transcendentals — the same gap stage C certified for f16.
+
+The pinned Q8 oracle digest (`PINNED_Q8_DECODE_FIXTURE_SHA256`, fixture
+`fixtures/lfm2-q8-step-reference.jsonl`) is:
+
+```
+1b0918c70a3b173275106a439aaf2dda3e74746d081a94e6e9b5c39e040a3cbf
+```
+
+The Q8 oracle differs from the f16 oracle on **7/20** prompts (median match depth
+61) — the expected Q8 quantization drift, and a close reproduction of the CUDA
+spike's independent LFM2 Q8 ladder (`QUANT-DECODE.md`: 13/20 exact, median depth
+54.5; the per-prompt depths align prompt-by-prompt), which cross-validates that
+this port quantizes the same tensors the same way the spike did.
+
+### 11.3 The two-tier Q8 exactness gate
+
+`q8_hybrid_step_engine_matches_pinned_fixture_within_certified_near_tie` mirrors
+stage C's gate against the Q8 oracle:
+
+1. **Structural invariant (every machine):** at most `MAX_CERTIFIED_FORKS_Q8 = 2`
+   prompts diverge, and each divergence is a **top-2 swap** whose Q8-oracle top-2
+   logit gap is below `NEAR_TIE_BAND_Q8 = 0.12`. The band is derived from the
+   measured Q8 engine-vs-oracle error (below): a per-logit error of ≤ ~0.051 on
+   each of the top two can flip their order, so coin-flip forks are possible up to
+   ~2×0.051 ≈ 0.10; 0.12 leaves margin above that flip threshold while a real
+   regression (a wrong token at a decisive gap, or many forks) cannot hide inside
+   it. A length mismatch is never certified.
+2. **Primary gate (M1 authority only):** the exact M1 Q8 fork signature, asserted
+   once the `Q8_M1_FORK_*` constants are filled from the locked M1 run. Until then
+   the M1 branch *records* the observed signature rather than asserting a
+   placeholder (sentinel detection), so the gate is safe on the M1 before the pin
+   is measured — exactly the discipline stage C followed before its M1 constants
+   were filled.
+
+**Measured Q8 engine-vs-oracle logit error** (`q8_hybrid_step_logit_error_probe`,
+feeding both sides the identical token stream and taking `max|Δlogit|` over all
+65536 logits at every position): the global worst case across all 20 prompts is
+**0.0509** (completion-15); most prompts sit at ~0.029–0.045. This is wider than
+the f16 engine's ~0.03 (Q8's coarser weights amplify the f16-activation and
+transcendental rounding slightly) but still small, and — crucially — the Q8
+quantization itself cancels because engine and oracle share the same bytes.
+
+Gate transcript (build host `Mac17,6`, advisory; checkpoint
+`933cee00…`):
+
+```
+$ SYNAPSE_UNIFIED_RT_LFM2_1_2B=<snapshot> cargo test -p spike-unified-rt \
+    q8_hybrid_step_engine -- --ignored --nocapture
+[q8] completion-01 .. completion-20: byte-exact vs Q8 oracle   (20/20)
+[q8] advisory (non-M1): 0 Q8 fork(s) within band; observed []
+q8 determinism: two runs byte-identical, sha 1b0918c70a3b173275106a439aaf2dda3e74746d081a94e6e9b5c39e040a3cbf
+test result: ok. 2 passed; 0 failed
+```
+
+The Q8 engine is **20/20 byte-exact** against the Q8 oracle on the build host —
+zero forks — and deterministic, with its output fixture sha equal to the pinned
+oracle sha. The engine therefore reproduces the Q8 CPU reference *exactly* here;
+the ~0.051 logit error never flips a greedy token on this 20×64 set. (The M1 may
+resolve a near-tie differently, as it did for f16; the M1 pin records that on the
+authority run.)
+
+### 11.4 Qwen3 unperturbed (gate, satisfied by diff scope)
+
+No shared Qwen3 kernel or `.m`/`.rs` surface changed. `git diff --stat` against
+the stage-D base touches only `src/lfm2_decode_metal_step.{m,rs}` (the Q8 wiring
+and the Q8 oracle/gates) and adds `fixtures/lfm2-q8-step-reference.jsonl`. The
+three Qwen3 step files are byte-identical to base:
+
+```
+$ for f in src/qwen3_decode_metal_step.{m,metal,rs}; do
+    git diff --quiet <base> HEAD -- "bench/spikes/unified-rt/$f" && echo "UNCHANGED: $f"
+  done
+UNCHANGED: src/qwen3_decode_metal_step.m
+UNCHANGED: src/qwen3_decode_metal_step.metal
+UNCHANGED: src/qwen3_decode_metal_step.rs
+```
+
+Because nothing shared changed, the Qwen3 fixture battery and the 149.40 tok/s
+baseline need no re-run for this increment.
+
+### 11.5 f16 LFM2 gates still green (gate, re-run after the shared-context change)
+
+The hybrid context changed (it now carries Q8 weight slots and a `quantized`
+flag), so stage C's f16 gate was re-run. The f16 engine is byte-identical to
+stage C: 19/20 byte-exact with the same single near-tie fork
+(`completion-15` / step 17, engine 523 vs oracle 518, CPU top-2 gap 0.000362 — the
+documented build-host canary), and deterministic with the stage-C fixture sha:
+
+```
+$ SYNAPSE_UNIFIED_RT_LFM2_1_2B=<snapshot> cargo test -p spike-unified-rt \
+    hybrid_step_engine -- --ignored --nocapture
+[metal] DIVERGENCE completion-15: first diff at step 17: engine 523 vs oracle 518
+[metal] fork completion-15 step 17: CPU top-2 = (518, 523), gap 0.000362 (band 0.05)
+[metal] advisory (non-M1): 1 fork(s) within band; M5 canary reference is completion-15 step 17
+determinism: two runs byte-identical, sha 4356ac40ae5b1d30094899afcd2e8d9864570c601133bee5d30dcb1e0b60f30c
+test result: ok. 2 passed; 0 failed
+```
+
+### 11.6 Timed cells (build-host advisory; M1 authority pending)
+
+Timed on the build host (`Mac17,6`), release build, the stage-C protocol (prefill
+untimed, then one chained 64-token greedy decode per prompt, median of 20 prompts
+× 2 repeats plus an uncounted warmup). Per project discipline these are
+**advisory**: the authoritative single-stream number belongs on the locked M1
+(`[bench-host]`, `[bench-user-home]/bench.lock`, load < 8, AC), which this
+increment does not have access to. The M1 Q8 cell and the M1 fork pin are the
+remaining follow-up.
+
+| LFM2-1.2B stack | Decode tok/s | ms/token (warm) | vs f16 step (same machine) | Provenance |
+|---|---:|---:|---:|---|
+| **Owned Metal step Q8_0 (this work)** | **163.29** | **6.12** | **1.59×** | build-host advisory, 40 samples, min 158.60 / max 167.42 |
+| Owned Metal step f16 (stage C) | 102.98 | 9.71 | 1.00× | build-host advisory, 40 samples (M1 authority: 50.09) |
+| llama.cpp Metal F16 (b9580) | 130.74 | ~7.65 | — | LFM2-DECODE-BASELINES.md (M1) |
+| llama.cpp Metal Q8_0 (b9580) | 203.65 | ~4.91 | — | LFM2-DECODE-BASELINES.md (M1) |
+
+The headline machine-independent result is the **Q8/f16 ratio**: the Q8 port is
+**1.59×** the f16 step engine on the same machine, closely tracking llama.cpp's
+own F16→Q8 jump on LFM2 (`130.74 → 203.65` = **1.56×**). Q8 is the lever the
+stage-C gap analysis predicted: it recovers the bandwidth the f16 engine leaves on
+the table. The absolute build-host numbers (163.29 Q8 / 102.98 f16) run on a
+faster chip than the M1 (the build host's f16 is ~2.06× the M1's 50.09), so the
+authoritative comparison against llama's M1 Q8_0 `203.65` awaits the M1 run.
+
+### 11.7 Gap analysis and the persona-plane warm envelope
+
+Against llama on the same (M1) machine, the f16 step engine sat at ~38% of llama
+F16 (stage C). The Q8 port closes the *internal* f16→Q8 gap almost exactly as
+llama's does (1.59× vs 1.56×), so the owned-vs-llama ratio is expected to be
+roughly preserved across the quantization on the M1 — i.e. if the M1 Q8 cell lands
+near the build-host ratio applied to the M1 f16 authority (`50.09 × 1.59 ≈ 80`
+tok/s, **~12.5 ms/token warm**), the persona fast-brain would decode Q8 at roughly
+~80 tok/s on the M1. This is an extrapolation from the measured build-host ratio
+and the M1 f16 authority, **not a measurement**; the authoritative M1 Q8 number is
+the follow-up. Either way, Q8 moves the persona-plane warm envelope from the f16
+step's ~20 ms/token (M1) to roughly ~12–13 ms/token — comfortably real-time for
+voice/bridge — while the ~25× improvement over the 157 ms MPSGraph baseline holds
+and widens.
+
+The residual owned-vs-llama gap (the f16 engine's ~38%-of-llama, expected to
+carry into Q8) is unchanged in character by this increment: the f32 conv path
+(ten layers, the stage-A exactness contract), LFM2's ~2× model size vs Qwen3-0.6B,
+and the absence of residual+RMSNorm fusion. Q8 attacks the bandwidth term — the
+largest single lever — and the measured 1.59× confirms it lands.
+
+### 11.8 Follow-up seed
+
+- **M1 authority (the remaining increment).** Run the Q8 two-tier gate and the
+  `--release q8_hybrid_step_timing_probe` on the locked M1
+  (`[bench-host]`, `[bench-user-home]/bench.lock`, load < 8, AC). Fill
+  `Q8_M1_FORK_*` from the observed fork signature (or confirm 0 forks, as on the
+  build host) and record the authoritative Q8 tok/s vs llama Q8_0 `203.65` and our
+  f16 `50.09`. The gate is structured to *record* the M1 signature until those
+  constants are set, so the M1 run cannot false-fail before the pin is measured.
+- **Fused residual+RMSNorm** and an f16/warp-per-key attention+conv redesign
+  remain the structural levers for the owned-vs-llama gap (unchanged from stage C;
+  Q8 does not address them).
+- **Reducing the Q8 logit error band** (the f16-activation rounding inside the
+  reused kernels is now the dominant source, ~0.051) would shrink the set of
+  flippable near-ties; banked as a future seam — the band invariant already bounds
+  it and the build host shows 0 forks.
+
+### 11.9 Reproduction
+
+```sh
+# Build (compiles the .m and the LFM2 metallib; Qwen3 line untouched)
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/developer cargo build -p spike-unified-rt
+
+# Q8 oracle fixture cut + pin (checkpoint required)
+SYNAPSE_UNIFIED_RT_LFM2_1_2B=<snapshot> cargo test -p spike-unified-rt \
+    q8_weight_oracle_probe -- --ignored --nocapture
+#   regenerate the fixture with LFM2_Q8_FIXTURE_OUT=fixtures/lfm2-q8-step-reference.jsonl
+
+# Q8 engine-vs-oracle vocab-wide logit error (derives the band)
+SYNAPSE_UNIFIED_RT_LFM2_1_2B=<snapshot> cargo test -p spike-unified-rt \
+    q8_hybrid_step_logit_error_probe -- --ignored --nocapture
+
+# Q8 two-tier exactness + determinism gates (M1 = authority)
+SYNAPSE_UNIFIED_RT_LFM2_1_2B=<snapshot> cargo test -p spike-unified-rt \
+    q8_hybrid_step_engine -- --ignored --nocapture
+
+# f16 gates re-run (shared context changed)
+SYNAPSE_UNIFIED_RT_LFM2_1_2B=<snapshot> cargo test -p spike-unified-rt \
+    hybrid_step_engine -- --ignored --nocapture
+
+# Timed cells (release; advisory off-M1)
+SYNAPSE_UNIFIED_RT_LFM2_1_2B=<snapshot> cargo test --release -p spike-unified-rt \
+    hybrid_step_timing_probe -- --ignored --nocapture   # matches both f16 and Q8 probes
+```
