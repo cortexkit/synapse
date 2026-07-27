@@ -26,6 +26,8 @@ mod json_constraint;
 mod lfm2;
 mod lfm2_audio;
 mod lfm2_decode;
+#[cfg(target_os = "macos")]
+mod lfm2_decode_metal_step;
 mod modernbert;
 mod quant;
 mod qwen3;
