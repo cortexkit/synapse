@@ -79,3 +79,54 @@ kernel void lfm2_conv_step(
     }
     out[channel] = gate[channel] * accumulator;
 }
+
+struct Lfm2ConvSplitParams {
+    uint hidden;
+};
+
+// Split the in_proj output into the short-convolution operands, matching
+// lfm2.rs::decode_conv exactly. in_proj maps hidden -> 3*hidden and the result
+// is laid out as [x | gate | y]; the conv path consumes product = x * y and the
+// gate row. The surrounding projection kernels keep activations in f16, while
+// the conv step itself runs f32 internally (the stage-A exactness contract), so
+// this kernel widens the two f16 slices to f32 as it forms them.
+//
+//   proj:    [3 * hidden] f16, the in_proj output.
+//   product: [hidden] f32, product[c] = proj[c] * proj[2*hidden + c]   (x * y).
+//   gate:    [hidden] f32, gate[c]    = proj[hidden + c].
+kernel void lfm2_conv_split(
+    const device half *proj [[buffer(0)]],
+    device float *product [[buffer(1)]],
+    device float *gate [[buffer(2)]],
+    constant Lfm2ConvSplitParams &params [[buffer(3)]],
+    uint channel [[thread_position_in_grid]]
+) {
+    const uint hidden = params.hidden;
+    if (channel >= hidden) {
+        return;
+    }
+    float x = (float)proj[channel];
+    float y = (float)proj[2 * hidden + channel];
+    product[channel] = x * y;
+    gate[channel] = (float)proj[hidden + channel];
+}
+
+// Widen the f32 conv-step output back to the f16 activations the reused
+// out_proj matvec kernel consumes. The conv step keeps its rolling cache and
+// its per-position output in f32 (bit-exact with the CPU reference); only the
+// value handed to the next projection is rounded to f16, the same boundary
+// rounding the rest of the hybrid engine applies between layers.
+//
+//   in:  [hidden] f32, gate * conv(newest position) from lfm2_conv_step.
+//   out: [hidden] f16, fed to the conv out_proj matvec.
+kernel void lfm2_conv_f32_to_f16(
+    const device float *in [[buffer(0)]],
+    device half *out [[buffer(1)]],
+    constant Lfm2ConvSplitParams &params [[buffer(2)]],
+    uint channel [[thread_position_in_grid]]
+) {
+    if (channel >= params.hidden) {
+        return;
+    }
+    out[channel] = (half)in[channel];
+}
