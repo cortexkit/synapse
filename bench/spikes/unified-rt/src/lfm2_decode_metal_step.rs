@@ -1694,15 +1694,15 @@ mod tests {
     /// as f16: the engine-oracle gap is a small rounding effect, so forks are rare).
     const MAX_CERTIFIED_FORKS_Q8: usize = 2;
 
-    /// M1 authority exact Q8 fork signature (the primary gate). PENDING the locked
-    /// M1 run: these are sentinel values; on the M1 the gate records the observed
-    /// fork to pin rather than asserting a not-yet-measured signature (see the gate
-    /// body). Fill these from the M1 transcript, exactly as stage C pinned its
-    /// M1_FORK_* constants from the M1 run.
-    const Q8_M1_FORK_PROMPT: &str = "";
-    const Q8_M1_FORK_STEP: usize = 0;
-    const Q8_M1_FORK_CPU_TOKEN: u32 = 0;
-    const Q8_M1_FORK_ENGINE_TOKEN: u32 = 0;
+    /// M1 authority Q8 fork signature (the primary gate), pinned from the locked
+    /// M1 run on 2026-07-27 (MacBookPro18,2, [bench-host], bench.lock
+    /// held, load ~1.1, AC): the Q8 engine is **20/20 byte-exact** against the Q8
+    /// CPU-reference oracle -- **zero forks** -- so the pinned M1 signature is
+    /// "no divergence" and the gate asserts an empty fork set on the M1. (Unlike
+    /// the f16 engine, whose M1 run forked one near-tie, the Q8 engine's shared
+    /// quantized bytes leave no sub-band near-tie to flip on this fixture set.)
+    /// Set to false to revert to record-the-observed-signature mode.
+    const Q8_M1_PINNED: bool = true;
 
     /// Q8 token-exactness gate, two-tier (mirrors the f16 certification model).
     ///
@@ -1712,10 +1712,11 @@ mod tests {
     /// NEAR_TIE_BAND_Q8 -- a rounding coin-flip inside the engine's measured ~0.051
     /// Q8 error band, not a real divergence. A length mismatch is never certified.
     ///
-    /// PRIMARY GATE (M1 authority only): the exact M1 Q8 fork signature, once
-    /// measured, is pinned and asserted. Until the Q8_M1_FORK_* constants are
-    /// filled from the locked M1 run, the M1 branch records the observed fork to
-    /// pin (sentinel detection) instead of asserting a placeholder. Run with:
+    /// PRIMARY GATE (M1 authority only): the M1 Q8 fork signature is pinned and
+    /// asserted. The locked 2026-07-27 M1 run measured the Q8 engine at 20/20
+    /// byte-exact vs the Q8 oracle (zero forks), so with Q8_M1_PINNED set the M1
+    /// branch asserts an empty fork set; clearing Q8_M1_PINNED reverts to
+    /// recording the observed signature. Run with:
     ///
     /// ```text
     /// SYNAPSE_UNIFIED_RT_LFM2_1_2B=<snapshot> cargo test -p spike-unified-rt \
@@ -1833,30 +1834,19 @@ mod tests {
         }
 
         if is_m1_authority() {
-            if Q8_M1_FORK_PROMPT.is_empty() {
-                // M1 pin pending: record the observed fork signature to pin.
+            if !Q8_M1_PINNED {
+                // Pin pending: record the observed fork signature to pin.
                 println!(
-                    "[q8] M1 AUTHORITY: Q8 fork signature to pin (fill Q8_M1_FORK_* constants): {divergent:?}"
+                    "[q8] M1 AUTHORITY: Q8 fork signature to pin (set Q8_M1_PINNED): {divergent:?}"
                 );
             } else {
-                assert_eq!(
-                    divergent.len(),
-                    1,
-                    "M1 authority: expected exactly the one pinned Q8 fork, got {divergent:?}"
-                );
-                let (id, step, engine_token, cpu_token) = &divergent[0];
-                assert_eq!(id, Q8_M1_FORK_PROMPT, "M1 authority: Q8 fork prompt drifted");
-                assert_eq!(*step, Q8_M1_FORK_STEP, "M1 authority: Q8 fork step drifted");
-                assert_eq!(
-                    *cpu_token, Q8_M1_FORK_CPU_TOKEN,
-                    "M1 authority: Q8 oracle token at the fork drifted"
-                );
-                assert_eq!(
-                    *engine_token, Q8_M1_FORK_ENGINE_TOKEN,
-                    "M1 authority: Q8 engine token at the fork drifted"
+                // Pinned 2026-07-27: the M1 Q8 engine is 20/20 byte-exact, zero forks.
+                assert!(
+                    divergent.is_empty(),
+                    "M1 authority: pinned Q8 signature is 20/20 byte-exact (zero forks), got {divergent:?}"
                 );
                 println!(
-                    "[q8] M1 AUTHORITY: pinned Q8 fork signature confirmed ({Q8_M1_FORK_PROMPT} step {Q8_M1_FORK_STEP}, engine {Q8_M1_FORK_ENGINE_TOKEN} vs oracle {Q8_M1_FORK_CPU_TOKEN})"
+                    "[q8] M1 AUTHORITY: pinned Q8 signature confirmed (20/20 byte-exact vs Q8 oracle, zero forks)"
                 );
             }
         } else {
