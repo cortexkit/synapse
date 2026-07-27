@@ -651,17 +651,21 @@ SYNAPSE_UNIFIED_RT_LFM2_1_2B=<snapshot> cargo test -p spike-unified-rt \
 
 ---
 
-## 11. Stage D — Q8_0 port: quantized step engine certified (build-host advisory; M1 authority pending)
+## 11. Stage D — Q8_0 port: quantized step engine certified on the M1 authority
 
 Stage D wires the GGUF Q8_0 path into the LFM2 hybrid step engine, reusing the
 Qwen3 campaign's pack-4-rows Q8 GEMV kernels for every quantized matmul, cuts the
 Q8 CPU-reference oracle and pins its fixture, and certifies the Q8 engine against
-that oracle with the same two-tier model stage C used for f16. The genuinely new
-finding is that, because the engine and the oracle share the *exact same
-quantized bytes*, the large Q8 quantization error cancels in their comparison and
-the Q8 engine lands **20/20 byte-exact** against the Q8 oracle on the build host —
-cleaner than the f16 engine's single near-tie fork — with a measured vocab-wide
-engine-vs-oracle logit error of ~0.051.
+that oracle with the same two-tier model stage C used for f16 — now on the locked
+M1 authority. The genuinely new finding is that, because the engine and the oracle
+share the *exact same quantized bytes*, the large Q8 quantization error cancels in
+their comparison and the Q8 engine lands **20/20 byte-exact** against the Q8
+oracle — **zero forks on both the M1 authority and the build host**, cleaner than
+the f16 engine's single near-tie fork — with a measured vocab-wide engine-vs-oracle
+logit error of ~0.051. On the M1 the Q8 engine decodes at **146.08 tok/s**
+(6.85 ms/token warm), **71.7% of llama.cpp's Q8_0 203.65** and 2.93× the owned f16
+step engine — landing in the ~70%-of-llama band the Qwen3 step engine achieved and
+retiring the §5 envelope estimate for the persona fast-brain's Q8 path.
 
 ### 11.1 Quant decisions (per tensor)
 
@@ -747,12 +751,10 @@ stage C's gate against the Q8 oracle:
    ~2×0.051 ≈ 0.10; 0.12 leaves margin above that flip threshold while a real
    regression (a wrong token at a decisive gap, or many forks) cannot hide inside
    it. A length mismatch is never certified.
-2. **Primary gate (M1 authority only):** the exact M1 Q8 fork signature, asserted
-   once the `Q8_M1_FORK_*` constants are filled from the locked M1 run. Until then
-   the M1 branch *records* the observed signature rather than asserting a
-   placeholder (sentinel detection), so the gate is safe on the M1 before the pin
-   is measured — exactly the discipline stage C followed before its M1 constants
-   were filled.
+2. **Primary gate (M1 authority only):** the M1 Q8 fork signature is pinned and
+   asserted. The locked 2026-07-27 M1 run measured the Q8 engine at **20/20
+   byte-exact, zero forks**, so `Q8_M1_PINNED` is set and the M1 branch asserts an
+   empty fork set (clearing it reverts to recording the observed signature).
 
 **Measured Q8 engine-vs-oracle logit error** (`q8_hybrid_step_logit_error_probe`,
 feeding both sides the identical token stream and taking `max|Δlogit|` over all
@@ -762,24 +764,28 @@ the f16 engine's ~0.03 (Q8's coarser weights amplify the f16-activation and
 transcendental rounding slightly) but still small, and — crucially — the Q8
 quantization itself cancels because engine and oracle share the same bytes.
 
-Gate transcript (build host `Mac17,6`, advisory; checkpoint
-`933cee00…`):
+Gate transcript — **M1 authority** (`MacBookPro18,2`, `[bench-host]`,
+`[bench-user-home]/bench.lock`, load ~0.7, AC; checkpoint `933cee00…`):
 
 ```
-$ SYNAPSE_UNIFIED_RT_LFM2_1_2B=<snapshot> cargo test -p spike-unified-rt \
+$ SYNAPSE_UNIFIED_RT_LFM2_1_2B=<snapshot> cargo test --release -p spike-unified-rt \
     q8_hybrid_step_engine -- --ignored --nocapture
 [q8] completion-01 .. completion-20: byte-exact vs Q8 oracle   (20/20)
-[q8] advisory (non-M1): 0 Q8 fork(s) within band; observed []
+[q8] M1 AUTHORITY: pinned Q8 signature confirmed (20/20 byte-exact vs Q8 oracle, zero forks)
 q8 determinism: two runs byte-identical, sha 1b0918c70a3b173275106a439aaf2dda3e74746d081a94e6e9b5c39e040a3cbf
 test result: ok. 2 passed; 0 failed
 ```
 
-The Q8 engine is **20/20 byte-exact** against the Q8 oracle on the build host —
-zero forks — and deterministic, with its output fixture sha equal to the pinned
-oracle sha. The engine therefore reproduces the Q8 CPU reference *exactly* here;
-the ~0.051 logit error never flips a greedy token on this 20×64 set. (The M1 may
-resolve a near-tie differently, as it did for f16; the M1 pin records that on the
-authority run.)
+(The build host `Mac17,6` runs the same gate advisory: also 20/20 byte-exact,
+`[q8] advisory (non-M1): 0 Q8 fork(s) within band; observed []`, same
+determinism sha.)
+
+The Q8 engine is **20/20 byte-exact** against the Q8 oracle on **both the M1
+authority and the build host** — zero forks — and deterministic, with its output
+fixture sha equal to the pinned oracle sha. The engine therefore reproduces the Q8
+CPU reference *exactly*; the ~0.051 logit error never flips a greedy token on this
+20×64 set on either machine. (The f16 engine forked one near-tie on the M1; the Q8
+engine's shared quantized bytes leave no sub-band near-tie to flip here.)
 
 ### 11.4 Qwen3 unperturbed (gate, satisfied by diff scope)
 
@@ -803,83 +809,100 @@ baseline need no re-run for this increment.
 ### 11.5 f16 LFM2 gates still green (gate, re-run after the shared-context change)
 
 The hybrid context changed (it now carries Q8 weight slots and a `quantized`
-flag), so stage C's f16 gate was re-run. The f16 engine is byte-identical to
-stage C: 19/20 byte-exact with the same single near-tie fork
-(`completion-15` / step 17, engine 523 vs oracle 518, CPU top-2 gap 0.000362 — the
-documented build-host canary), and deterministic with the stage-C fixture sha:
+flag, and the prepare argument validation was fixed for the Q8 LM head), so stage
+C's f16 gate was re-run **on both the M1 authority and the build host**. The f16
+engine is byte-identical to stage C on both: the M1 re-confirms the pinned fork
+(`completion-05` / step 8, engine 7693 vs oracle 1827, gap 0.007268) with the
+stage-C M1 determinism sha, and the build host re-confirms its canary fork
+(`completion-15` / step 17, engine 523 vs oracle 518, gap 0.000362):
 
 ```
-$ SYNAPSE_UNIFIED_RT_LFM2_1_2B=<snapshot> cargo test -p spike-unified-rt \
-    hybrid_step_engine -- --ignored --nocapture
-[metal] DIVERGENCE completion-15: first diff at step 17: engine 523 vs oracle 518
+# M1 authority (MacBookPro18,2)
+[metal] DIVERGENCE completion-05: first diff at step 8: engine 7693 vs oracle 1827
+[metal] fork completion-05 step 8: CPU top-2 = (1827, 7693), gap 0.007268 (band 0.05)
+[metal] M1 AUTHORITY: pinned fork signature confirmed (completion-05 step 8, engine 7693 vs oracle 1827)
+determinism: two runs byte-identical, sha 7e52432f7cea385e21298cf8f9cc4e5ec8ddb7098f960a79a8fd8436adb688a7
+test result: ok. 2 passed; 0 failed
+
+# Build host (Mac17,6, advisory)
 [metal] fork completion-15 step 17: CPU top-2 = (518, 523), gap 0.000362 (band 0.05)
-[metal] advisory (non-M1): 1 fork(s) within band; M5 canary reference is completion-15 step 17
 determinism: two runs byte-identical, sha 4356ac40ae5b1d30094899afcd2e8d9864570c601133bee5d30dcb1e0b60f30c
 test result: ok. 2 passed; 0 failed
 ```
 
-### 11.6 Timed cells (build-host advisory; M1 authority pending)
+The shared-context change (including the prepare arg-check fix) therefore leaves
+the f16 path bit-for-bit unchanged on the authority machine.
 
-Timed on the build host (`Mac17,6`), release build, the stage-C protocol (prefill
-untimed, then one chained 64-token greedy decode per prompt, median of 20 prompts
-× 2 repeats plus an uncounted warmup). Per project discipline these are
-**advisory**: the authoritative single-stream number belongs on the locked M1
-(`[bench-host]`, `[bench-user-home]/bench.lock`, load < 8, AC), which this
-increment does not have access to. The M1 Q8 cell and the M1 fork pin are the
-remaining follow-up.
+### 11.6 Timed cells (M1 authority)
 
-| LFM2-1.2B stack | Decode tok/s | ms/token (warm) | vs f16 step (same machine) | Provenance |
-|---|---:|---:|---:|---|
-| **Owned Metal step Q8_0 (this work)** | **163.29** | **6.12** | **1.59×** | build-host advisory, 40 samples, min 158.60 / max 167.42 |
-| Owned Metal step f16 (stage C) | 102.98 | 9.71 | 1.00× | build-host advisory, 40 samples (M1 authority: 50.09) |
-| llama.cpp Metal F16 (b9580) | 130.74 | ~7.65 | — | LFM2-DECODE-BASELINES.md (M1) |
-| llama.cpp Metal Q8_0 (b9580) | 203.65 | ~4.91 | — | LFM2-DECODE-BASELINES.md (M1) |
+Timed on the locked M1 (`MacBookPro18,2`, `[bench-host]`), exclusive
+`[bench-user-home]/bench.lock` held, AC, one-minute load 0.65. Release build, the
+stage-C protocol: prefill untimed, then one chained 64-token greedy decode per
+prompt, median of 20 prompts × 2 repeats (40 samples) plus an uncounted warmup.
+The Q8 spread is tight (144.34–149.23, <3.4%).
 
-The headline machine-independent result is the **Q8/f16 ratio**: the Q8 port is
-**1.59×** the f16 step engine on the same machine, closely tracking llama.cpp's
-own F16→Q8 jump on LFM2 (`130.74 → 203.65` = **1.56×**). Q8 is the lever the
-stage-C gap analysis predicted: it recovers the bandwidth the f16 engine leaves on
-the table. The absolute build-host numbers (163.29 Q8 / 102.98 f16) run on a
-faster chip than the M1 (the build host's f16 is ~2.06× the M1's 50.09), so the
-authoritative comparison against llama's M1 Q8_0 `203.65` awaits the M1 run.
+| LFM2-1.2B stack | Decode tok/s | ms/token (warm) | vs llama Q8_0 | vs owned f16 step | Provenance |
+|---|---:|---:|---:|---:|---|
+| **Owned Metal step Q8_0 (this work)** | **146.08** | **6.85** | **71.7%** | **2.93×** | **M1 authority**, 40 samples, min 144.34 / max 149.23 |
+| Owned Metal step f16 (stage C, re-confirmed) | 49.89 | 20.05 | 24.5% | 1.00× | M1 authority, 40 samples (stage C pinned 50.09) |
+| llama.cpp Metal F16 (b9580) | 130.74 | ~7.65 | 64.2% | 2.62× | LFM2-DECODE-BASELINES.md (M1) |
+| llama.cpp Metal Q8_0 (b9580) | 203.65 | ~4.91 | 100% | 4.08× | LFM2-DECODE-BASELINES.md (M1) |
+
+(Build-host `Mac17,6` advisory cells, same protocol: Q8 **163.29** tok/s,
+6.12 ms/token, 40 samples min 158.60 / max 167.42; f16 **102.98** tok/s,
+9.71 ms/token. The build host is a faster chip — its f16 is ~2.06× the M1's — so
+its absolute numbers are not comparable to the M1 llama cells; its Q8/f16 ratio of
+1.59× is reported only as a machine-local sanity check.)
+
+The authoritative result: the Q8 port lifts the owned step engine from **49.89 to
+146.08 tok/s (2.93×)** on the M1 and from **24.5% to 71.7% of llama.cpp Q8_0** —
+landing in the ~70%-of-llama band the Qwen3 step engine achieved (72%) and exactly
+where the §5 envelope estimate predicted the persona fast-brain's Q8 path would
+land. The owned Q8/f16 ratio (2.93×) is well above llama's own F16→Q8 jump
+(1.56×) because the f16 step engine sat far below peak (38% of llama F16): Q8's
+halved matmul weight bytes recover bandwidth the f16 engine left on the table,
+while the f32 conv path (unchanged by quantization) bounds the absolute ceiling.
 
 ### 11.7 Gap analysis and the persona-plane warm envelope
 
-Against llama on the same (M1) machine, the f16 step engine sat at ~38% of llama
-F16 (stage C). The Q8 port closes the *internal* f16→Q8 gap almost exactly as
-llama's does (1.59× vs 1.56×), so the owned-vs-llama ratio is expected to be
-roughly preserved across the quantization on the M1 — i.e. if the M1 Q8 cell lands
-near the build-host ratio applied to the M1 f16 authority (`50.09 × 1.59 ≈ 80`
-tok/s, **~12.5 ms/token warm**), the persona fast-brain would decode Q8 at roughly
-~80 tok/s on the M1. This is an extrapolation from the measured build-host ratio
-and the M1 f16 authority, **not a measurement**; the authoritative M1 Q8 number is
-the follow-up. Either way, Q8 moves the persona-plane warm envelope from the f16
-step's ~20 ms/token (M1) to roughly ~12–13 ms/token — comfortably real-time for
-voice/bridge — while the ~25× improvement over the 157 ms MPSGraph baseline holds
-and widens.
+Against llama on the same M1 machine, the f16 step engine sat at ~38% of llama
+F16 (stage C). The Q8 port more than closes that gap on the Q8 column: the owned
+Q8 engine reaches **146.08 tok/s = 71.7% of llama Q8_0 (203.65)** — essentially
+the ~70%-of-llama band the Qwen3 step engine achieved (72%) and the §5 envelope
+estimate predicted. The owned Q8/f16 ratio on the M1 is **2.93×**, far above
+llama's own F16→Q8 jump (1.56×) for the reason named in §11.6: the f16 engine sat
+so far below peak (38% of llama F16) that halving the dominant matmul weight
+bytes recovers proportionally more.
 
-The residual owned-vs-llama gap (the f16 engine's ~38%-of-llama, expected to
-carry into Q8) is unchanged in character by this increment: the f32 conv path
-(ten layers, the stage-A exactness contract), LFM2's ~2× model size vs Qwen3-0.6B,
-and the absence of residual+RMSNorm fusion. Q8 attacks the bandwidth term — the
-largest single lever — and the measured 1.59× confirms it lands.
+**Persona-plane warm envelope (now measured, M1).** The persona fast-brain decodes
+LFM2-1.2B Q8 at **146.08 tok/s ≈ 6.85 ms/token warm** on the M1 — a ~23×
+improvement over the 157.6 ms MPSGraph baseline and ~2.9× over the f16 step
+engine's 20.05 ms/token — comfortably inside a real-time voice/bridge budget. This
+retires the §5 envelope estimate for the Q8 path with an authoritative number.
+
+The residual owned-vs-llama gap (28% below llama Q8_0) is unchanged in character
+by this increment: the f32 conv path (ten layers, the stage-A exactness contract),
+LFM2's ~2× model size vs Qwen3-0.6B, and the absence of residual+RMSNorm fusion.
+Q8 attacked the bandwidth term — the largest single lever — and the measured
+2.93× / 71.7%-of-llama confirms it landed; the remaining levers are new-kernel
+work, not quantization.
 
 ### 11.8 Follow-up seed
 
-- **M1 authority (the remaining increment).** Run the Q8 two-tier gate and the
-  `--release q8_hybrid_step_timing_probe` on the locked M1
-  (`[bench-host]`, `[bench-user-home]/bench.lock`, load < 8, AC). Fill
-  `Q8_M1_FORK_*` from the observed fork signature (or confirm 0 forks, as on the
-  build host) and record the authoritative Q8 tok/s vs llama Q8_0 `203.65` and our
-  f16 `50.09`. The gate is structured to *record* the M1 signature until those
-  constants are set, so the M1 run cannot false-fail before the pin is measured.
+- **M1 authority — DONE this increment.** The Q8 two-tier gate and the
+  `--release q8_hybrid_step_timing_probe` ran on the locked M1
+  (`[bench-host]`, `[bench-user-home]/bench.lock`, load 0.65, AC): the M1
+  fork signature is pinned (`Q8_M1_PINNED`, 20/20 byte-exact, zero forks) and the
+  authoritative Q8 cell is **146.08 tok/s** vs llama Q8_0 `203.65` and our f16
+  `49.89` (re-confirmed; stage C pinned 50.09). The f16 M1 gate was re-run green
+  after the shared-context change.
 - **Fused residual+RMSNorm** and an f16/warp-per-key attention+conv redesign
-  remain the structural levers for the owned-vs-llama gap (unchanged from stage C;
-  Q8 does not address them).
+  remain the structural levers for the residual 28%-below-llama gap (unchanged
+  from stage C; Q8 does not address them).
 - **Reducing the Q8 logit error band** (the f16-activation rounding inside the
   reused kernels is now the dominant source, ~0.051) would shrink the set of
   flippable near-ties; banked as a future seam — the band invariant already bounds
-  it and the build host shows 0 forks.
+  it and both the M1 and the build host show 0 forks.
 
 ### 11.9 Reproduction
 
@@ -904,7 +927,10 @@ SYNAPSE_UNIFIED_RT_LFM2_1_2B=<snapshot> cargo test -p spike-unified-rt \
 SYNAPSE_UNIFIED_RT_LFM2_1_2B=<snapshot> cargo test -p spike-unified-rt \
     hybrid_step_engine -- --ignored --nocapture
 
-# Timed cells (release; advisory off-M1)
+# Timed cells (release; the filter matches both the f16 and Q8 probes).
+# Authoritative only on the locked M1 under the bench lock:
+#   mkdir [bench-user-home]/bench.lock   # acquire (fails if held); load < 8; AC
+#   ... run ...; rmdir [bench-user-home]/bench.lock
 SYNAPSE_UNIFIED_RT_LFM2_1_2B=<snapshot> cargo test --release -p spike-unified-rt \
     hybrid_step_timing_probe -- --ignored --nocapture   # matches both f16 and Q8 probes
 ```
