@@ -202,22 +202,43 @@ unsafe extern "C" {
 // ===========================================================================
 
 use crate::encode_f16_bits;
-use crate::lfm2::{Mixer, Model};
+use crate::lfm2::{Mixer, Model, Weight};
+use crate::quant::Q8_0Tensor;
+
+/// The Q8_0 block bytes of a weight as a raw pointer, or null when the weight
+/// is not quantized. The bytes are owned by the loaded model and stay alive
+/// across the synchronous native prepare upload.
+fn q8_ptr(weight: &Weight) -> *const c_void {
+    weight
+        .q8_0
+        .as_ref()
+        .map_or(std::ptr::null(), |quantized| quantized.as_bytes().as_ptr())
+        .cast()
+}
 
 #[repr(C)]
 struct Lfm2HybridLayerParams {
     operator_norm: *const c_void,
     ffn_norm: *const c_void,
     gate_weight: *const c_void,
+    gate_weight_q8: *const c_void,
     up_weight: *const c_void,
+    up_weight_q8: *const c_void,
     down_weight: *const c_void,
+    down_weight_q8: *const c_void,
     in_proj_weight: *const c_void,
+    in_proj_weight_q8: *const c_void,
     conv_weight: *const c_void,
     out_proj_weight: *const c_void,
+    out_proj_weight_q8: *const c_void,
     q_weight: *const c_void,
+    q_weight_q8: *const c_void,
     k_weight: *const c_void,
+    k_weight_q8: *const c_void,
     v_weight: *const c_void,
+    v_weight_q8: *const c_void,
     o_weight: *const c_void,
+    o_weight_q8: *const c_void,
     q_norm: *const c_void,
     k_norm: *const c_void,
     is_attention: u64,
@@ -239,9 +260,11 @@ unsafe extern "C" {
     fn synapse_lfm2_hybrid_step_prepare(
         context: *mut c_void,
         layer_count: u64,
+        quantized: u32,
         params: *const Lfm2HybridLayerParams,
         final_norm_weight: *const c_void,
         lm_head_weight: *const c_void,
+        lm_head_q8: *const c_void,
         embeddings: *const c_void,
     ) -> i32;
     fn synapse_lfm2_hybrid_step_chain(
@@ -308,7 +331,7 @@ pub(crate) struct Lfm2HybridStepEngine {
 }
 
 impl Lfm2HybridStepEngine {
-    pub(crate) fn new(model: &Model, bucket: usize) -> Result<Self> {
+    pub(crate) fn new(model: &Model, bucket: usize, quantized: bool) -> Result<Self> {
         let config = &model.config;
         let hidden = config.hidden_size;
         let head_dim = config.head_dim;
@@ -339,17 +362,21 @@ impl Lfm2HybridStepEngine {
             epsilon: config.rms_norm_eps,
         };
 
-        // Build owned f16 mirrors for every layer, then a parallel params array
-        // pointing into them. Unused per-layer-type fields stay null; the native
-        // prepare only dereferences the fields matching each layer's mixer.
+        // Build owned f16 mirrors for the weights the engine stores as f16 in
+        // BOTH modes (the two per-layer norms and, for attention layers, the q/k
+        // head norms), plus -- only in f16 mode -- the matmul weights. In Q8 mode
+        // the matmul weights are handed to the native prepare as the model's
+        // Q8_0 block bytes (referenced directly below), so their f16 mirrors stay
+        // empty. Unused per-layer-type fields stay null/empty; the native prepare
+        // only dereferences the fields matching each layer's mixer.
         let mut weights: Vec<HybridLayerWeights> = Vec::with_capacity(model.layers.len());
         for layer in &model.layers {
             let mut holder = HybridLayerWeights {
                 operator_norm: encode_f16_bits(&layer.operator_norm.weight.data),
                 ffn_norm: encode_f16_bits(&layer.ffn_norm.weight.data),
-                gate: encode_f16_bits(&layer.w1.tensor.data),
-                up: encode_f16_bits(&layer.w3.tensor.data),
-                down: encode_f16_bits(&layer.w2.tensor.data),
+                gate: Vec::new(),
+                up: Vec::new(),
+                down: Vec::new(),
                 in_proj: Vec::new(),
                 out_proj: Vec::new(),
                 q: Vec::new(),
@@ -359,18 +386,27 @@ impl Lfm2HybridStepEngine {
                 q_norm: Vec::new(),
                 k_norm: Vec::new(),
             };
+            if !quantized {
+                holder.gate = encode_f16_bits(&layer.w1.tensor.data);
+                holder.up = encode_f16_bits(&layer.w3.tensor.data);
+                holder.down = encode_f16_bits(&layer.w2.tensor.data);
+            }
             match &layer.mixer {
                 Mixer::Conv(conv) => {
-                    holder.in_proj = encode_f16_bits(&conv.in_proj.tensor.data);
-                    holder.out_proj = encode_f16_bits(&conv.out_proj.tensor.data);
+                    if !quantized {
+                        holder.in_proj = encode_f16_bits(&conv.in_proj.tensor.data);
+                        holder.out_proj = encode_f16_bits(&conv.out_proj.tensor.data);
+                    }
                 }
                 Mixer::Attention(attn) => {
-                    holder.q = encode_f16_bits(&attn.q_proj.tensor.data);
-                    holder.k = encode_f16_bits(&attn.k_proj.tensor.data);
-                    holder.v = encode_f16_bits(&attn.v_proj.tensor.data);
-                    holder.o = encode_f16_bits(&attn.out_proj.tensor.data);
                     holder.q_norm = encode_f16_bits(&attn.q_norm.weight.data);
                     holder.k_norm = encode_f16_bits(&attn.k_norm.weight.data);
+                    if !quantized {
+                        holder.q = encode_f16_bits(&attn.q_proj.tensor.data);
+                        holder.k = encode_f16_bits(&attn.k_proj.tensor.data);
+                        holder.v = encode_f16_bits(&attn.v_proj.tensor.data);
+                        holder.o = encode_f16_bits(&attn.out_proj.tensor.data);
+                    }
                 }
             }
             weights.push(holder);
@@ -382,38 +418,58 @@ impl Lfm2HybridStepEngine {
             .zip(&weights)
             .map(|(layer, holder)| {
                 let is_attention = matches!(layer.mixer, Mixer::Attention(_));
-                let (in_proj, conv_weight, out_proj) = match &layer.mixer {
-                    Mixer::Conv(conv) => (
-                        holder.in_proj.as_ptr().cast(),
-                        conv.conv_weight.data.as_ptr().cast(),
-                        holder.out_proj.as_ptr().cast(),
-                    ),
-                    Mixer::Attention(_) => (null, null, null),
-                };
-                let (q, k, v, o, q_norm, k_norm) = match &layer.mixer {
-                    Mixer::Attention(_) => (
-                        holder.q.as_ptr().cast(),
-                        holder.k.as_ptr().cast(),
-                        holder.v.as_ptr().cast(),
-                        holder.o.as_ptr().cast(),
-                        holder.q_norm.as_ptr().cast(),
-                        holder.k_norm.as_ptr().cast(),
-                    ),
-                    Mixer::Conv(_) => (null, null, null, null, null, null),
-                };
+                // Conv projections (conv layers) or nulls (attention layers). The
+                // f16 pointer is the owned mirror (f16 mode) and the q8 pointer is
+                // the model's block bytes (Q8 mode); the unused slot is null/empty.
+                let (in_proj_f16, in_proj_q8, conv_weight, out_proj_f16, out_proj_q8) =
+                    match &layer.mixer {
+                        Mixer::Conv(conv) => (
+                            holder.in_proj.as_ptr().cast(),
+                            q8_ptr(&conv.in_proj),
+                            conv.conv_weight.data.as_ptr().cast(),
+                            holder.out_proj.as_ptr().cast(),
+                            q8_ptr(&conv.out_proj),
+                        ),
+                        Mixer::Attention(_) => (null, null, null, null, null),
+                    };
+                let (q_f16, q_q8, k_f16, k_q8, v_f16, v_q8, o_f16, o_q8, q_norm, k_norm) =
+                    match &layer.mixer {
+                        Mixer::Attention(attn) => (
+                            holder.q.as_ptr().cast(),
+                            q8_ptr(&attn.q_proj),
+                            holder.k.as_ptr().cast(),
+                            q8_ptr(&attn.k_proj),
+                            holder.v.as_ptr().cast(),
+                            q8_ptr(&attn.v_proj),
+                            holder.o.as_ptr().cast(),
+                            q8_ptr(&attn.out_proj),
+                            holder.q_norm.as_ptr().cast(),
+                            holder.k_norm.as_ptr().cast(),
+                        ),
+                        Mixer::Conv(_) => (null, null, null, null, null, null, null, null, null, null),
+                    };
                 Lfm2HybridLayerParams {
                     operator_norm: holder.operator_norm.as_ptr().cast(),
                     ffn_norm: holder.ffn_norm.as_ptr().cast(),
                     gate_weight: holder.gate.as_ptr().cast(),
+                    gate_weight_q8: q8_ptr(&layer.w1),
                     up_weight: holder.up.as_ptr().cast(),
+                    up_weight_q8: q8_ptr(&layer.w3),
                     down_weight: holder.down.as_ptr().cast(),
-                    in_proj_weight: in_proj,
+                    down_weight_q8: q8_ptr(&layer.w2),
+                    in_proj_weight: in_proj_f16,
+                    in_proj_weight_q8: in_proj_q8,
                     conv_weight,
-                    out_proj_weight: out_proj,
-                    q_weight: q,
-                    k_weight: k,
-                    v_weight: v,
-                    o_weight: o,
+                    out_proj_weight: out_proj_f16,
+                    out_proj_weight_q8: out_proj_q8,
+                    q_weight: q_f16,
+                    q_weight_q8: q_q8,
+                    k_weight: k_f16,
+                    k_weight_q8: k_q8,
+                    v_weight: v_f16,
+                    v_weight_q8: v_q8,
+                    o_weight: o_f16,
+                    o_weight_q8: o_q8,
                     q_norm,
                     k_norm,
                     is_attention: u64::from(is_attention),
@@ -422,21 +478,43 @@ impl Lfm2HybridStepEngine {
             .collect();
         let final_norm = encode_f16_bits(&model.final_norm.weight.data);
         // Tied embeddings: when there is no separate LM head the head weight is
-        // the embedding table itself (LFM2-1.2B ties them), so fall back to the
-        // embedding data. Mirrors Model::lm_head, which is private to lfm2.rs.
+        // the embedding table itself (LFM2-1.2B ties them). The f16 engine feeds
+        // the f16 embedding bits as the head; the Q8 engine quantizes the table
+        // separately for head use while the gather table stays f16. Mirrors
+        // Model::lm_head / lm_head_q8_0, which are private to lfm2.rs.
         let lm_head_data = match &model.lm_head {
             Some(head) => &head.tensor.data,
             None => &model.embeddings.data,
         };
-        let lm_head = encode_f16_bits(lm_head_data);
         let embeddings = encode_f16_bits(&model.embeddings.data);
+        let lm_head_f16;
+        let mut tied_lm_head_q8: Option<Q8_0Tensor> = None;
+        let (lm_head_fp16_ptr, lm_head_q8_ptr): (*const c_void, *const c_void) = if quantized {
+            let q8: *const c_void = match &model.lm_head {
+                Some(head) => q8_ptr(head),
+                None => {
+                    let quantized_head = Q8_0Tensor::quantize(lm_head_data, hidden)?;
+                    let ptr = quantized_head.as_bytes().as_ptr().cast();
+                    // Moving the tensor into the owner keeps its heap buffer (and
+                    // therefore `ptr`) alive across the synchronous upload below.
+                    tied_lm_head_q8 = Some(quantized_head);
+                    ptr
+                }
+            };
+            (null, q8)
+        } else {
+            lm_head_f16 = encode_f16_bits(lm_head_data);
+            (lm_head_f16.as_ptr().cast(), null)
+        };
         let status = unsafe {
             synapse_lfm2_hybrid_step_prepare(
                 engine.raw.as_ptr(),
                 params.len() as u64,
+                u32::from(quantized),
                 params.as_ptr(),
                 final_norm.as_ptr().cast(),
-                lm_head.as_ptr().cast(),
+                lm_head_fp16_ptr,
+                lm_head_q8_ptr,
                 embeddings.as_ptr().cast(),
             )
         };
@@ -446,8 +524,10 @@ impl Lfm2HybridStepEngine {
             return Err(error)
                 .with_context(|| format!("LFM2 hybrid step prepare failed ({status})"));
         }
-        // Keep the mirrors alive until after the synchronous upload above.
+        // Keep the mirrors and the tied Q8 head alive until after the synchronous
+        // upload above.
         drop(weights);
+        drop(tied_lm_head_q8);
         Ok(engine)
     }
 
@@ -990,6 +1070,15 @@ mod tests {
     const PINNED_DECODE_FIXTURE_SHA256: &str =
         "49ee80e8ba5d4940854fdbcd044406f5f3af4d5f6d35456eb247cfd506bd307b";
 
+    /// Pinned sha256 of the 20-prompt x 64-token greedy fixture generated from
+    /// the Q8-dequantized `lfm2.rs` CPU reference (the Q8 oracle) on the LFM2-1.2B
+    /// snapshot `933cee00d754fb3bfe06c644c0cb95453f2d8bb2`. This -- not the f16
+    /// fixture -- is the oracle the Q8 Metal step engine must reproduce within the
+    /// certified near-tie band. The Q8 oracle differs from the f16 oracle on 7/20
+    /// prompts (median match depth 61), the expected Q8 quantization drift.
+    const PINNED_Q8_DECODE_FIXTURE_SHA256: &str =
+        "1b0918c70a3b173275106a439aaf2dda3e74746d081a94e6e9b5c39e040a3cbf";
+
     /// f16 rounding-policy probe on the real LFM2-1.2B checkpoint. See the block
     /// comment above for what it settles. Run with:
     ///
@@ -1185,6 +1274,696 @@ mod tests {
                 "f16-weight CPU-reference decode fixture differs from the native oracle"
             );
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // Stage D: Q8_0 oracle and certification.
+    //
+    // The Q8 engine stores every dense decode matmul (attention Q/K/V/O, the
+    // SwiGLU gate/up/down projections, the conv in_proj/out_proj, and the tied
+    // LM head) as GGUF Q8_0 blocks, reusing the Qwen3 pack-4 GEMV kernels; the
+    // norms, the f32 depthwise conv taps, and the f16 embedding gather table are
+    // unchanged. Its oracle is the lfm2.rs CPU reference running the
+    // Q8-dequantized weights -- NOT the f16 fixture -- cut with the same 20x64
+    // protocol. Because the engine and the oracle share the exact same quantized
+    // bytes, the large Q8 quantization error cancels in their comparison; what
+    // remains is the f16-activation / matmul-rounding / transcendental gap the
+    // f16 engine already certified at ~0.03 vocab-wide (stage C). The oracle
+    // mirrors the engine's weight representation so that gap stays tight:
+    // matmul weights are Q8-dequantized from the model's Q8_0 blocks, the norms
+    // and the input embedding table are f16-rounded (the engine stores them f16),
+    // and the tied LM head is Q8-dequantized separately from the f16 input table
+    // (the engine gathers f16 input but multiplies a Q8 head).
+    // ---------------------------------------------------------------------
+
+    use crate::lfm2::Weight;
+    use crate::quant::{Q8_0Tensor, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_ELEMENTS, WeightQuantization};
+    use half::f16;
+
+    /// Dequantize GGUF Q8_0 block bytes back to f32 (each 34-byte block is an f16
+    /// scale followed by 32 i8 quants; value = quant * scale). This is the inverse
+    /// of `Q8_0Tensor::quantize` and reproduces, on the CPU, the exact weight
+    /// values the Metal Q8 GEMV kernels multiply against.
+    fn dequantize_q8_0(bytes: &[u8]) -> Vec<f32> {
+        let mut values =
+            Vec::with_capacity(bytes.len() / Q8_0_BLOCK_BYTES * Q8_0_BLOCK_ELEMENTS);
+        for block in bytes.chunks_exact(Q8_0_BLOCK_BYTES) {
+            let scale = f32::from(f16::from_bits(u16::from_le_bytes([block[0], block[1]])));
+            for quant in &block[2..] {
+                values.push((*quant as i8) as f32 * scale);
+            }
+        }
+        values
+    }
+
+    /// Replace a weight's f32 tensor data with the dequantized values of its Q8_0
+    /// blocks, so the CPU reference matmul reads exactly the quantized weight the
+    /// engine uses. No-op when the weight is not quantized.
+    fn dequantize_weight_q8_in_place(weight: &mut Weight) {
+        if let Some(quantized) = &weight.q8_0 {
+            let values = dequantize_q8_0(quantized.as_bytes());
+            weight.tensor.data.copy_from_slice(&values);
+        }
+    }
+
+    /// Turn a Q8-loaded model into the Q8 CPU-reference oracle in place, returning
+    /// the f16-rounded embedding table the decode uses for INPUT lookup. After
+    /// this call every dense matmul weight holds its Q8-dequantized values, the
+    /// norms are f16-rounded, and `model.embeddings.data` holds the Q8-dequantized
+    /// tied LM head (what `Model::lm_head` reads for the head matmul). The
+    /// returned input table is kept separate so the input gather stays f16 while
+    /// the head is Q8 -- the same separation the engine makes.
+    fn prepare_q8_oracle_model(model: &mut Model) -> Vec<f32> {
+        let hidden = model.config.hidden_size;
+        // f16 input embedding table (matches the engine's f16 gather table).
+        let input_embeddings = decode_f16_bits(&encode_f16_bits(&model.embeddings.data));
+        // Tied LM head: quantize the native embedding table to the same Q8_0 bytes
+        // the engine uploads for the head, then dequantize them back into
+        // embeddings.data for the CPU head matmul.
+        let native_embeddings = model.embeddings.data.clone();
+        let head_q8 =
+            Q8_0Tensor::quantize(&native_embeddings, hidden).expect("quantize tied LM head");
+        model
+            .embeddings
+            .data
+            .copy_from_slice(&dequantize_q8_0(head_q8.as_bytes()));
+        round_to_f16_in_place(&mut model.final_norm.weight.data);
+        for layer in &mut model.layers {
+            round_to_f16_in_place(&mut layer.operator_norm.weight.data);
+            round_to_f16_in_place(&mut layer.ffn_norm.weight.data);
+            dequantize_weight_q8_in_place(&mut layer.w1);
+            dequantize_weight_q8_in_place(&mut layer.w2);
+            dequantize_weight_q8_in_place(&mut layer.w3);
+            match &mut layer.mixer {
+                Mixer::Conv(conv) => {
+                    dequantize_weight_q8_in_place(&mut conv.in_proj);
+                    // conv_weight stays native f32 (the engine keeps the depthwise
+                    // taps in f32, never quantized).
+                    dequantize_weight_q8_in_place(&mut conv.out_proj);
+                }
+                Mixer::Attention(attn) => {
+                    round_to_f16_in_place(&mut attn.q_norm.weight.data);
+                    round_to_f16_in_place(&mut attn.k_norm.weight.data);
+                    dequantize_weight_q8_in_place(&mut attn.q_proj);
+                    dequantize_weight_q8_in_place(&mut attn.k_proj);
+                    dequantize_weight_q8_in_place(&mut attn.v_proj);
+                    dequantize_weight_q8_in_place(&mut attn.out_proj);
+                }
+            }
+        }
+        input_embeddings
+    }
+
+    /// Greedy decode through the Q8 CPU reference (`Model::decode_embedding` fed
+    /// the f16 input table), the contract the Q8 Metal engine must match. Mirrors
+    /// `greedy_decode_cpu` but looks the input embedding up in the separate f16
+    /// table (the model's embeddings.data now holds the Q8 tied head).
+    fn greedy_decode_q8_cpu(
+        model: &Model,
+        provider: &mut dyn KernelProvider,
+        input_embeddings: &[f32],
+        prompt: &[u32],
+        max_tokens: usize,
+        stop_tokens: &HashSet<u32>,
+    ) -> Vec<u32> {
+        let hidden = model.config.hidden_size;
+        let mut cache = model.empty_decode_cache(prompt.len() + max_tokens);
+        let mut logits = Vec::new();
+        for &token in prompt {
+            let start = token as usize * hidden;
+            let (_, next_logits) = model
+                .decode_embedding(provider, &mut cache, &input_embeddings[start..start + hidden])
+                .expect("q8 cpu prefill step");
+            logits = next_logits;
+        }
+        let mut generated = Vec::with_capacity(max_tokens);
+        let mut next = top_logits(&logits, 1)[0].token_id;
+        for _ in 0..max_tokens {
+            generated.push(next);
+            if stop_tokens.contains(&next) {
+                break;
+            }
+            let start = next as usize * hidden;
+            let (_, next_logits) = model
+                .decode_embedding(provider, &mut cache, &input_embeddings[start..start + hidden])
+                .expect("q8 cpu decode step");
+            logits = next_logits;
+            next = top_logits(&logits, 1)[0].token_id;
+        }
+        generated
+    }
+
+    /// Q8 oracle fixture probe on the real LFM2-1.2B checkpoint. Cuts the
+    //  Q8-dequantized CPU-reference greedy fixture (20x64) and pins its sha256;
+    /// this is the oracle the Q8 Metal engine is certified against. Run with:
+    ///
+    /// ```text
+    /// SYNAPSE_UNIFIED_RT_LFM2_1_2B=<snapshot> cargo test -p spike-unified-rt \
+    ///     q8_weight_oracle_probe -- --ignored --nocapture
+    /// ```
+    ///
+    /// Write the fixture with `LFM2_Q8_FIXTURE_OUT=fixtures/lfm2-q8-step-reference.jsonl`.
+    #[test]
+    #[ignore]
+    fn q8_weight_oracle_probe() {
+        use tokenizers::Tokenizer;
+
+        let path = std::path::PathBuf::from(
+            std::env::var_os("SYNAPSE_UNIFIED_RT_LFM2_1_2B")
+                .expect("set SYNAPSE_UNIFIED_RT_LFM2_1_2B to the LFM2-1.2B snapshot directory"),
+        );
+        let limit: usize = std::env::var("LFM2_Q8_PROBE_LIMIT")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(usize::MAX);
+        let max_tokens: usize = std::env::var("LFM2_Q8_PROBE_MAX_TOKENS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(64);
+
+        let mut tokenizer =
+            Tokenizer::from_file(path.join("tokenizer.json")).expect("load tokenizer");
+        tokenizer.with_padding(None);
+        tokenizer.with_truncation(None).expect("disable truncation");
+
+        let prompts = decode_prompt_set();
+        let prompts: Vec<_> = prompts.into_iter().take(limit).collect();
+        assert!(!prompts.is_empty(), "decode prompt set is empty");
+
+        let mut model = Model::load_with_quant(&path, Precision::F16, WeightQuantization::Q8_0)
+            .expect("load LFM2-1.2B (Q8_0)");
+        let stop_tokens: HashSet<u32> = model.generation_stop_ids().iter().copied().collect();
+        let input_embeddings = prepare_q8_oracle_model(&mut model);
+        let mut provider = CpuProvider::platform_for_test();
+        let mut rows = Vec::new();
+        let started = std::time::Instant::now();
+        for (id, prompt) in &prompts {
+            let prompt_ids = model
+                .encode_generation(&tokenizer, prompt, 2048)
+                .expect("encode prompt");
+            let tokens = greedy_decode_q8_cpu(
+                &model,
+                &mut provider,
+                &input_embeddings,
+                &prompt_ids,
+                max_tokens,
+                &stop_tokens,
+            );
+            println!("[q8-oracle] {id}: {} tokens", tokens.len());
+            rows.push((id.clone(), tokens));
+        }
+        let secs = started.elapsed().as_secs_f64();
+        let q8_sha = fixture_sha256(&rows);
+        println!("=== LFM2 Q8 oracle probe ===");
+        println!("prompts: {}, max_tokens: {}", prompts.len(), max_tokens);
+        println!("q8 cpu decode: {secs:.1}s");
+        println!("q8 fixture sha256: {q8_sha}");
+
+        // Match-depth context vs the native f16 fixture (descriptive only; the Q8
+        // engine's oracle is the Q8 fixture, not this).
+        let native = pinned_fixture_rows();
+        if native.len() == rows.len() {
+            let mut exact = 0usize;
+            let mut depths = Vec::new();
+            for ((id, tokens), (_, native_tokens)) in rows.iter().zip(&native) {
+                let shared = tokens.len().min(native_tokens.len());
+                let depth = (0..shared)
+                    .find(|&i| tokens[i] != native_tokens[i])
+                    .unwrap_or(shared);
+                let full = depth == tokens.len() && tokens.len() == native_tokens.len();
+                if full {
+                    exact += 1;
+                }
+                depths.push(depth);
+                println!(
+                    "[q8-vs-f16] {id}: depth {depth}/{}{}",
+                    tokens.len(),
+                    if full { "*" } else { "" }
+                );
+            }
+            depths.sort_unstable();
+            println!(
+                "[q8-vs-f16] {exact}/{} exact prompts, median depth {}",
+                rows.len(),
+                depths[depths.len() / 2]
+            );
+        }
+
+        if let Some(out) = std::env::var_os("LFM2_Q8_FIXTURE_OUT") {
+            let mut body = String::new();
+            for (id, tokens) in &rows {
+                let tokens_json = serde_json::to_string(tokens).expect("serialize tokens");
+                body.push_str(&format!(
+                    "{{\"id\":{},\"tokens\":{tokens_json}}}\n",
+                    serde_json::to_string(id).expect("serialize id")
+                ));
+            }
+            std::fs::write(&out, body).expect("write fixture");
+            println!("wrote fixture to {}", out.display());
+        }
+
+        // Pin the oracle (only on the full 20x64 set; a calibration run with a
+        // reduced limit/tokens skips the pin so it cannot false-fail).
+        if limit >= prompts.len() && max_tokens == 64 {
+            assert_eq!(
+                q8_sha, PINNED_Q8_DECODE_FIXTURE_SHA256,
+                "Q8 CPU-reference decode fixture drifted from the pinned oracle"
+            );
+        }
+    }
+
+    /// Measure the vocab-wide logit error between the Q8 Metal engine and the Q8
+    /// CPU-reference oracle, feeding both the identical token stream. This is the
+    /// quantity the certified near-tie band is derived from (stage C measured the
+    /// f16 engine at ~0.03 and set the band to 0.05). Because the engine and the
+    /// oracle share the same quantized weight bytes, the Q8 quantization error
+    /// cancels here; what is measured is the residual f16-activation / matmul /
+    /// transcendental gap. Run with:
+    ///
+    /// ```text
+    /// SYNAPSE_UNIFIED_RT_LFM2_1_2B=<snapshot> cargo test -p spike-unified-rt \
+    ///     q8_hybrid_step_logit_error_probe -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn q8_hybrid_step_logit_error_probe() {
+        use tokenizers::Tokenizer;
+
+        let path = std::path::PathBuf::from(
+            std::env::var_os("SYNAPSE_UNIFIED_RT_LFM2_1_2B")
+                .expect("set SYNAPSE_UNIFIED_RT_LFM2_1_2B to the LFM2-1.2B snapshot directory"),
+        );
+        let limit: usize = std::env::var("LFM2_Q8_BAND_LIMIT")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(3);
+
+        let mut tokenizer =
+            Tokenizer::from_file(path.join("tokenizer.json")).expect("load tokenizer");
+        tokenizer.with_padding(None);
+        tokenizer.with_truncation(None).expect("disable truncation");
+
+        // Engine: a Q8-loaded model drives the quantized hybrid step engine.
+        let engine_model =
+            Model::load_with_quant(&path, Precision::F16, WeightQuantization::Q8_0)
+                .expect("load LFM2-1.2B (Q8_0) for the engine");
+        let hidden = engine_model.config.hidden_size;
+        let stop_tokens: HashSet<u32> =
+            engine_model.generation_stop_ids().iter().copied().collect();
+        let mut engine =
+            Lfm2HybridStepEngine::new(&engine_model, 2048, true).expect("q8 hybrid engine");
+
+        // Oracle: a separately loaded Q8 model, dequantized in place.
+        let mut oracle_model =
+            Model::load_with_quant(&path, Precision::F16, WeightQuantization::Q8_0)
+                .expect("load LFM2-1.2B (Q8_0) for the oracle");
+        let input_embeddings = prepare_q8_oracle_model(&mut oracle_model);
+        let mut provider = CpuProvider::platform_for_test();
+
+        let prompts = decode_prompt_set();
+        let mut global_max = 0.0f32;
+        for (id, prompt) in prompts.iter().take(limit) {
+            let prompt_ids = oracle_model
+                .encode_generation(&tokenizer, prompt, 2048)
+                .expect("encode prompt");
+            // Token stream = prompt then the oracle's own greedy continuation, so
+            // both sides are compared on identical positions.
+            let generated = greedy_decode_q8_cpu(
+                &oracle_model,
+                &mut provider,
+                &input_embeddings,
+                &prompt_ids,
+                64,
+                &stop_tokens,
+            );
+            let stream: Vec<u32> = prompt_ids
+                .iter()
+                .copied()
+                .chain(generated.iter().copied())
+                .collect();
+
+            engine.reset().expect("reset engine caches");
+            let mut oracle_cache = oracle_model.empty_decode_cache(stream.len() + 1);
+            let mut prompt_max = 0.0f32;
+            for (position, &token) in stream.iter().enumerate() {
+                let start = token as usize * hidden;
+                let input_row = &input_embeddings[start..start + hidden];
+                let f16_row = encode_f16_bits(input_row);
+                let engine_logits = engine
+                    .step_logits(position, &f16_row)
+                    .expect("engine step logits");
+                let (_, oracle_logits) = oracle_model
+                    .decode_embedding(&mut provider, &mut oracle_cache, input_row)
+                    .expect("oracle decode step");
+                let max_delta = engine_logits
+                    .iter()
+                    .zip(&oracle_logits)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                prompt_max = prompt_max.max(max_delta);
+                global_max = global_max.max(max_delta);
+            }
+            println!("[q8-band] {id}: max|dlogit| over {} positions = {prompt_max:.6}", stream.len());
+        }
+        println!("[q8-band] global max|dlogit| over the full vocabulary = {global_max:.6}");
+    }
+
+    /// Load the pinned Q8 fixture rows ({"id","tokens"} per line) cut from the
+    /// Q8-dequantized CPU reference, for row-by-row diagnostics alongside the sha.
+    fn q8_pinned_fixture_rows() -> Vec<(String, Vec<u32>)> {
+        let raw = include_str!("../fixtures/lfm2-q8-step-reference.jsonl");
+        raw.lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                let value: serde_json::Value =
+                    serde_json::from_str(line).expect("q8 fixture row parses");
+                let id = value["id"].as_str().expect("q8 fixture id").to_string();
+                let tokens = value["tokens"]
+                    .as_array()
+                    .expect("q8 fixture tokens")
+                    .iter()
+                    .map(|token| token.as_u64().expect("q8 fixture token id") as u32)
+                    .collect();
+                (id, tokens)
+            })
+            .collect()
+    }
+
+    /// Run the Q8 CPU reference for one prompt, feeding the prompt then the first
+    /// `step` pinned generated tokens, and return the logits that predict generated
+    /// token `step`. Used to certify a fork is a near-tie: the Q8-oracle top-2 there
+    /// must be the two fork tokens separated by less than the band.
+    fn q8_cpu_logits_predicting_step(
+        model: &Model,
+        input_embeddings: &[f32],
+        prompt_ids: &[u32],
+        pinned_tokens: &[u32],
+        step: usize,
+    ) -> Vec<f32> {
+        let hidden = model.config.hidden_size;
+        let mut provider = CpuProvider::platform_for_test();
+        let mut cache = model.empty_decode_cache(prompt_ids.len() + step + 1);
+        let mut logits = Vec::new();
+        for &token in prompt_ids {
+            let start = token as usize * hidden;
+            let (_, next) = model
+                .decode_embedding(&mut provider, &mut cache, &input_embeddings[start..start + hidden])
+                .expect("q8 cpu prefill step");
+            logits = next;
+        }
+        for &token in &pinned_tokens[..step] {
+            let start = token as usize * hidden;
+            let (_, next) = model
+                .decode_embedding(&mut provider, &mut cache, &input_embeddings[start..start + hidden])
+                .expect("q8 cpu decode step");
+            logits = next;
+        }
+        logits
+    }
+
+    /// Structural-invariant ceiling on the Q8-oracle top-2 logit gap at a certified
+    /// fork. Derived from the measured ~0.051 vocab-wide Q8 engine-vs-oracle logit
+    /// error (see q8_hybrid_step_logit_error_probe and LFM2-METAL-STEP.md stage D):
+    /// a fork whose oracle top-2 gap is below this band is a rounding coin-flip
+    /// (the engine's per-logit error of <= ~0.051 on each of the top two can flip
+    /// the order, so flips are possible up to ~2x0.051 ~= 0.10), not a real
+    /// divergence. 0.12 leaves margin above that flip threshold.
+    const NEAR_TIE_BAND_Q8: f32 = 0.12;
+
+    /// Structural-invariant ceiling on the number of divergent prompts (same bound
+    /// as f16: the engine-oracle gap is a small rounding effect, so forks are rare).
+    const MAX_CERTIFIED_FORKS_Q8: usize = 2;
+
+    /// M1 authority exact Q8 fork signature (the primary gate). PENDING the locked
+    /// M1 run: these are sentinel values; on the M1 the gate records the observed
+    /// fork to pin rather than asserting a not-yet-measured signature (see the gate
+    /// body). Fill these from the M1 transcript, exactly as stage C pinned its
+    /// M1_FORK_* constants from the M1 run.
+    const Q8_M1_FORK_PROMPT: &str = "";
+    const Q8_M1_FORK_STEP: usize = 0;
+    const Q8_M1_FORK_CPU_TOKEN: u32 = 0;
+    const Q8_M1_FORK_ENGINE_TOKEN: u32 = 0;
+
+    /// Q8 token-exactness gate, two-tier (mirrors the f16 certification model).
+    ///
+    /// STRUCTURAL INVARIANT (asserted on every machine): at most
+    /// MAX_CERTIFIED_FORKS_Q8 prompts diverge from the Q8 CPU-reference oracle,
+    /// and each divergence is a top-2 swap whose Q8-oracle top-2 logit gap is below
+    /// NEAR_TIE_BAND_Q8 -- a rounding coin-flip inside the engine's measured ~0.051
+    /// Q8 error band, not a real divergence. A length mismatch is never certified.
+    ///
+    /// PRIMARY GATE (M1 authority only): the exact M1 Q8 fork signature, once
+    /// measured, is pinned and asserted. Until the Q8_M1_FORK_* constants are
+    /// filled from the locked M1 run, the M1 branch records the observed fork to
+    /// pin (sentinel detection) instead of asserting a placeholder. Run with:
+    ///
+    /// ```text
+    /// SYNAPSE_UNIFIED_RT_LFM2_1_2B=<snapshot> cargo test -p spike-unified-rt \
+    ///     q8_hybrid_step_engine_matches_pinned_fixture -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn q8_hybrid_step_engine_matches_pinned_fixture_within_certified_near_tie() {
+        let path = std::path::PathBuf::from(
+            std::env::var_os("SYNAPSE_UNIFIED_RT_LFM2_1_2B")
+                .expect("set SYNAPSE_UNIFIED_RT_LFM2_1_2B to the LFM2-1.2B snapshot directory"),
+        );
+        let mut tokenizer =
+            Tokenizer::from_file(path.join("tokenizer.json")).expect("load tokenizer");
+        tokenizer.with_padding(None);
+        tokenizer.with_truncation(None).expect("disable truncation");
+
+        // Engine: Q8-loaded model driving the quantized hybrid step engine.
+        let engine_model =
+            Model::load_with_quant(&path, Precision::F16, WeightQuantization::Q8_0)
+                .expect("load LFM2-1.2B (Q8_0)");
+        let stop_tokens: HashSet<u32> =
+            engine_model.generation_stop_ids().iter().copied().collect();
+        let mut engine =
+            Lfm2HybridStepEngine::new(&engine_model, 2048, true).expect("q8 hybrid engine");
+
+        let prompts = decode_prompt_set();
+        assert_eq!(prompts.len(), 20, "expected the twenty-prompt decode set");
+        let rows = run_metal_fixture(
+            &mut engine,
+            &engine_model,
+            &tokenizer,
+            &prompts,
+            &stop_tokens,
+            64,
+        );
+
+        // Compare every prompt to the pinned Q8 oracle, collecting divergences.
+        let pinned = q8_pinned_fixture_rows();
+        let mut divergent: Vec<(String, usize, u32, u32)> = Vec::new(); // (id, step, engine, cpu)
+        for ((id, tokens), (pinned_id, pinned_tokens)) in rows.iter().zip(&pinned) {
+            assert_eq!(id, pinned_id, "q8 fixture prompt order mismatch");
+            let shared = tokens.len().min(pinned_tokens.len());
+            let first_diff = (0..shared).find(|&i| tokens[i] != pinned_tokens[i]);
+            match first_diff {
+                Some(step) if tokens.len() == pinned_tokens.len() => {
+                    println!(
+                        "[q8] DIVERGENCE {id}: first diff at step {step}: engine {} vs oracle {}",
+                        tokens[step], pinned_tokens[step]
+                    );
+                    divergent.push((id.clone(), step, tokens[step], pinned_tokens[step]));
+                }
+                None if tokens.len() == pinned_tokens.len() => {
+                    println!("[q8] {id}: {} tokens, byte-exact vs Q8 oracle", tokens.len());
+                }
+                _ => {
+                    panic!(
+                        "uncertified Q8 divergence on {id}: engine {} tok vs oracle {} tok (first diff {first_diff:?})",
+                        tokens.len(),
+                        pinned_tokens.len()
+                    );
+                }
+            }
+        }
+
+        // STRUCTURAL INVARIANT: bound the fork count, and certify each fork is a
+        // top-2 swap within the band by running the Q8 CPU reference to the fork.
+        assert!(
+            divergent.len() <= MAX_CERTIFIED_FORKS_Q8,
+            "too many Q8 divergent prompts ({}) vs the certified-fork ceiling {MAX_CERTIFIED_FORKS_Q8}: {divergent:?}",
+            divergent.len()
+        );
+        // Oracle model for fork certification (dequantized weights + f16 input).
+        let mut oracle_model =
+            Model::load_with_quant(&path, Precision::F16, WeightQuantization::Q8_0)
+                .expect("load LFM2-1.2B (Q8_0) for oracle");
+        let input_embeddings = prepare_q8_oracle_model(&mut oracle_model);
+        for (id, step, engine_token, cpu_token) in &divergent {
+            let prompt_text = prompts
+                .iter()
+                .find(|(prompt_id, _)| prompt_id == id)
+                .map(|(_, text)| text.clone())
+                .expect("divergent prompt text");
+            let prompt_ids = oracle_model
+                .encode_generation(&tokenizer, &prompt_text, 2048)
+                .expect("encode prompt");
+            let pinned_tokens = pinned
+                .iter()
+                .find(|(pinned_id, _)| pinned_id == id)
+                .map(|(_, tokens)| tokens.clone())
+                .expect("pinned tokens");
+            let fork_logits = q8_cpu_logits_predicting_step(
+                &oracle_model,
+                &input_embeddings,
+                &prompt_ids,
+                &pinned_tokens,
+                *step,
+            );
+            let (best, second, gap) = top2_gap(&fork_logits);
+            println!(
+                "[q8] fork {id} step {step}: Q8-oracle top-2 = ({best}, {second}), gap {gap:.6} (band {NEAR_TIE_BAND_Q8})"
+            );
+            assert_eq!(
+                best, *cpu_token,
+                "Q8 oracle top-1 at the fork on {id} is not the pinned token (not a top-2 swap)"
+            );
+            assert_eq!(
+                second, *engine_token,
+                "the Q8 engine's fork token on {id} is not the oracle's runner-up (not a top-2 swap)"
+            );
+            assert!(
+                gap < NEAR_TIE_BAND_Q8,
+                "fork Q8-oracle top-2 gap {gap} on {id} exceeds band {NEAR_TIE_BAND_Q8}: a real divergence, not a certified near-tie"
+            );
+        }
+
+        if is_m1_authority() {
+            if Q8_M1_FORK_PROMPT.is_empty() {
+                // M1 pin pending: record the observed fork signature to pin.
+                println!(
+                    "[q8] M1 AUTHORITY: Q8 fork signature to pin (fill Q8_M1_FORK_* constants): {divergent:?}"
+                );
+            } else {
+                assert_eq!(
+                    divergent.len(),
+                    1,
+                    "M1 authority: expected exactly the one pinned Q8 fork, got {divergent:?}"
+                );
+                let (id, step, engine_token, cpu_token) = &divergent[0];
+                assert_eq!(id, Q8_M1_FORK_PROMPT, "M1 authority: Q8 fork prompt drifted");
+                assert_eq!(*step, Q8_M1_FORK_STEP, "M1 authority: Q8 fork step drifted");
+                assert_eq!(
+                    *cpu_token, Q8_M1_FORK_CPU_TOKEN,
+                    "M1 authority: Q8 oracle token at the fork drifted"
+                );
+                assert_eq!(
+                    *engine_token, Q8_M1_FORK_ENGINE_TOKEN,
+                    "M1 authority: Q8 engine token at the fork drifted"
+                );
+                println!(
+                    "[q8] M1 AUTHORITY: pinned Q8 fork signature confirmed ({Q8_M1_FORK_PROMPT} step {Q8_M1_FORK_STEP}, engine {Q8_M1_FORK_ENGINE_TOKEN} vs oracle {Q8_M1_FORK_CPU_TOKEN})"
+                );
+            }
+        } else {
+            println!(
+                "[q8] advisory (non-M1): {} Q8 fork(s) within band; observed {divergent:?}",
+                divergent.len()
+            );
+        }
+    }
+
+    /// Q8 determinism gate: two full twenty-prompt Q8 decodes through the engine
+    /// must be byte-identical (same token rows, same sha).
+    #[test]
+    #[ignore]
+    fn q8_hybrid_step_engine_is_deterministic() {
+        let path = std::path::PathBuf::from(
+            std::env::var_os("SYNAPSE_UNIFIED_RT_LFM2_1_2B")
+                .expect("set SYNAPSE_UNIFIED_RT_LFM2_1_2B to the LFM2-1.2B snapshot directory"),
+        );
+        let mut tokenizer =
+            Tokenizer::from_file(path.join("tokenizer.json")).expect("load tokenizer");
+        tokenizer.with_padding(None);
+        tokenizer.with_truncation(None).expect("disable truncation");
+        let model = Model::load_with_quant(&path, Precision::F16, WeightQuantization::Q8_0)
+            .expect("load LFM2-1.2B (Q8_0)");
+        let stop_tokens: HashSet<u32> = model.generation_stop_ids().iter().copied().collect();
+        let prompts = decode_prompt_set();
+        let mut engine = Lfm2HybridStepEngine::new(&model, 2048, true).expect("q8 hybrid engine");
+        let first = run_metal_fixture(&mut engine, &model, &tokenizer, &prompts, &stop_tokens, 64);
+        let second = run_metal_fixture(&mut engine, &model, &tokenizer, &prompts, &stop_tokens, 64);
+        for ((id, first_tokens), (_, second_tokens)) in first.iter().zip(&second) {
+            assert_eq!(
+                first_tokens, second_tokens,
+                "Q8 hybrid step decode is not deterministic for {id}"
+            );
+        }
+        assert_eq!(
+            fixture_sha256(&first),
+            fixture_sha256(&second),
+            "Q8 hybrid step decode fixture sha is not deterministic across runs"
+        );
+        println!(
+            "q8 determinism: two runs byte-identical, sha {}",
+            fixture_sha256(&first)
+        );
+    }
+
+    /// Q8 single-stream decode throughput cell (run in `--release`). Mirrors the f16
+    /// timing probe but on the quantized engine: prefill (untimed) then time one
+    /// chained 64-token greedy decode per prompt, median of 20 prompts x 2 repeats.
+    /// Authoritative only on the locked M1; advisory on the build host. Run with:
+    ///
+    /// ```text
+    /// SYNAPSE_UNIFIED_RT_LFM2_1_2B=<snapshot> cargo test -p spike-unified-rt \
+    ///     --release q8_hybrid_step_timing_probe -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn q8_hybrid_step_timing_probe() {
+        let path = std::path::PathBuf::from(
+            std::env::var_os("SYNAPSE_UNIFIED_RT_LFM2_1_2B")
+                .expect("set SYNAPSE_UNIFIED_RT_LFM2_1_2B to the LFM2-1.2B snapshot directory"),
+        );
+        let mut tokenizer =
+            Tokenizer::from_file(path.join("tokenizer.json")).expect("load tokenizer");
+        tokenizer.with_padding(None);
+        tokenizer.with_truncation(None).expect("disable truncation");
+        let model = Model::load_with_quant(&path, Precision::F16, WeightQuantization::Q8_0)
+            .expect("load LFM2-1.2B (Q8_0)");
+        let prompts = decode_prompt_set();
+        let mut engine = Lfm2HybridStepEngine::new(&model, 2048, true).expect("q8 hybrid engine");
+        const MAX_TOKENS: usize = 64;
+        const REPEATS: usize = 2;
+
+        let mut sample = |prompt: &str| -> f64 {
+            engine.reset().expect("reset");
+            let prompt_ids = model
+                .encode_generation(&tokenizer, prompt, 2048)
+                .expect("encode prompt");
+            let first = engine.prefill(&prompt_ids).expect("prefill");
+            let position = prompt_ids.len();
+            let started = std::time::Instant::now();
+            let tokens = engine.chain(position, MAX_TOKENS, first).expect("chain");
+            let elapsed = started.elapsed().as_secs_f64();
+            assert_eq!(tokens.len(), MAX_TOKENS, "chain produced a partial decode");
+            MAX_TOKENS as f64 / elapsed
+        };
+
+        let _ = sample(&prompts[0].1);
+
+        let mut rates = Vec::with_capacity(prompts.len() * REPEATS);
+        for repeat in 0..REPEATS {
+            for (id, prompt) in &prompts {
+                let rate = sample(prompt);
+                println!("[q8-timing] repeat {repeat} {id}: {rate:.2} tok/s");
+                rates.push(rate);
+            }
+        }
+        rates.sort_by(|a, b| a.partial_cmp(b).expect("finite rate"));
+        let median = rates[rates.len() / 2];
+        let min = rates[0];
+        let max = rates[rates.len() - 1];
+        println!(
+            "[q8-timing] LFM2-1.2B owned Metal step Q8_0: median {median:.2} tok/s (min {min:.2}, max {max:.2}), {:.2} ms/token warm, {} samples",
+            1000.0 / median,
+            rates.len()
+        );
     }
 
     // ---------------------------------------------------------------------
@@ -1435,7 +2214,7 @@ mod tests {
         let stop_tokens: HashSet<u32> = model.generation_stop_ids().iter().copied().collect();
         let prompts = decode_prompt_set();
         assert_eq!(prompts.len(), 20, "expected the twenty-prompt decode set");
-        let mut engine = Lfm2HybridStepEngine::new(&model, 2048).expect("hybrid engine");
+        let mut engine = Lfm2HybridStepEngine::new(&model, 2048, false).expect("hybrid engine");
         let rows = run_metal_fixture(&mut engine, &model, &tokenizer, &prompts, &stop_tokens, 64);
 
         // Compare every prompt to the pinned f32 oracle, collecting divergences.
@@ -1550,7 +2329,7 @@ mod tests {
         let (_path, model, tokenizer) = load_lfm2_checkpoint();
         let stop_tokens: HashSet<u32> = model.generation_stop_ids().iter().copied().collect();
         let prompts = decode_prompt_set();
-        let mut engine = Lfm2HybridStepEngine::new(&model, 2048).expect("hybrid engine");
+        let mut engine = Lfm2HybridStepEngine::new(&model, 2048, false).expect("hybrid engine");
         let first = run_metal_fixture(&mut engine, &model, &tokenizer, &prompts, &stop_tokens, 64);
         let second = run_metal_fixture(&mut engine, &model, &tokenizer, &prompts, &stop_tokens, 64);
         for ((id, first_tokens), (_, second_tokens)) in first.iter().zip(&second) {
@@ -1588,7 +2367,7 @@ mod tests {
     fn hybrid_step_timing_probe() {
         let (_path, model, tokenizer) = load_lfm2_checkpoint();
         let prompts = decode_prompt_set();
-        let mut engine = Lfm2HybridStepEngine::new(&model, 2048).expect("hybrid engine");
+        let mut engine = Lfm2HybridStepEngine::new(&model, 2048, false).expect("hybrid engine");
         const MAX_TOKENS: usize = 64;
         const REPEATS: usize = 2;
 
@@ -1711,7 +2490,7 @@ mod tests {
         }
 
         // Metal per-position logits feeding the SAME sequence.
-        let mut engine = Lfm2HybridStepEngine::new(&model, 2048).expect("hybrid engine");
+        let mut engine = Lfm2HybridStepEngine::new(&model, 2048, false).expect("hybrid engine");
         engine.reset().expect("reset");
         let mut metal_argmaxes = Vec::with_capacity(seq.len());
         let mut metal_top = Vec::with_capacity(seq.len());

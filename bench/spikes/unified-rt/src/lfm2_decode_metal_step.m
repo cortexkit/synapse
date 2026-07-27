@@ -357,39 +357,58 @@ void synapse_lfm2_metal_step_context_free(void *raw) {
 // ===========================================================================
 
 typedef struct Lfm2HybridLayerParams {
-    const void *operator_norm;    // f16 [hidden]
-    const void *ffn_norm;         // f16 [hidden]
-    const void *gate_weight;      // f16 [intermediate * hidden]   (w1)
-    const void *up_weight;        // f16 [intermediate * hidden]   (w3)
-    const void *down_weight;      // f16 [hidden * intermediate]   (w2)
-    const void *in_proj_weight;   // conv: f16 [3*hidden * hidden]
-    const void *conv_weight;      // conv: f32 [hidden * kernel_size]
-    const void *out_proj_weight;  // conv: f16 [hidden * hidden]
-    const void *q_weight;         // attn: f16 [query_width * hidden]
-    const void *k_weight;         // attn: f16 [kv_width * hidden]
-    const void *v_weight;         // attn: f16 [kv_width * hidden]
-    const void *o_weight;         // attn: f16 [hidden * query_width]
-    const void *q_norm;           // attn: f16 [head_dim]
-    const void *k_norm;           // attn: f16 [head_dim]
-    uint64_t is_attention;        // 1 = full attention, 0 = short conv
+    const void *operator_norm;       // f16 [hidden]
+    const void *ffn_norm;            // f16 [hidden]
+    const void *gate_weight;         // f16 [intermediate * hidden]   (w1)
+    const void *gate_weight_q8;      // Q8_0 blocks for gate_weight (or NULL)
+    const void *up_weight;           // f16 [intermediate * hidden]   (w3)
+    const void *up_weight_q8;        // Q8_0 blocks for up_weight (or NULL)
+    const void *down_weight;         // f16 [hidden * intermediate]   (w2)
+    const void *down_weight_q8;      // Q8_0 blocks for down_weight (or NULL)
+    const void *in_proj_weight;      // conv: f16 [3*hidden * hidden]
+    const void *in_proj_weight_q8;   // Q8_0 blocks for in_proj_weight (or NULL)
+    const void *conv_weight;         // conv: f32 [hidden * kernel_size] (never quantized)
+    const void *out_proj_weight;     // conv: f16 [hidden * hidden]
+    const void *out_proj_weight_q8;  // Q8_0 blocks for out_proj_weight (or NULL)
+    const void *q_weight;            // attn: f16 [query_width * hidden]
+    const void *q_weight_q8;         // Q8_0 blocks for q_weight (or NULL)
+    const void *k_weight;            // attn: f16 [kv_width * hidden]
+    const void *k_weight_q8;         // Q8_0 blocks for k_weight (or NULL)
+    const void *v_weight;            // attn: f16 [kv_width * hidden]
+    const void *v_weight_q8;         // Q8_0 blocks for v_weight (or NULL)
+    const void *o_weight;            // attn: f16 [hidden * query_width]
+    const void *o_weight_q8;         // Q8_0 blocks for o_weight (or NULL)
+    const void *q_norm;              // attn: f16 [head_dim]
+    const void *k_norm;              // attn: f16 [head_dim]
+    uint64_t is_attention;           // 1 = full attention, 0 = short conv
 } Lfm2HybridLayerParams;
+
+// One matmul weight slot. The reused Qwen3 kernels read either the f16 buffer
+// (quantized == 0) or the Q8_0 block buffer (quantized != 0); exactly one of the
+// two is resident for a given engine, matching the Qwen3 step context's
+// StepWeight. The f16 and Q8 buffers are never both allocated: an f16 engine
+// leaves q8 nil, a Q8 engine leaves fp16 nil.
+typedef struct Lfm2StepWeight {
+    id<MTLBuffer> fp16;
+    id<MTLBuffer> q8;
+} Lfm2StepWeight;
 
 typedef struct Lfm2HybridLayerBuffers {
     id<MTLBuffer> operator_norm;
     id<MTLBuffer> ffn_norm;
-    id<MTLBuffer> gate_weight;
-    id<MTLBuffer> up_weight;
-    id<MTLBuffer> down_weight;
+    Lfm2StepWeight gate_weight;
+    Lfm2StepWeight up_weight;
+    Lfm2StepWeight down_weight;
     // Conv layers.
-    id<MTLBuffer> in_proj_weight;
+    Lfm2StepWeight in_proj_weight;
     id<MTLBuffer> conv_weight;
-    id<MTLBuffer> out_proj_weight;
+    Lfm2StepWeight out_proj_weight;
     id<MTLBuffer> conv_cache;     // f32 [kernel_size * hidden], rolling window.
     // Attention layers.
-    id<MTLBuffer> q_weight;
-    id<MTLBuffer> k_weight;
-    id<MTLBuffer> v_weight;
-    id<MTLBuffer> o_weight;
+    Lfm2StepWeight q_weight;
+    Lfm2StepWeight k_weight;
+    Lfm2StepWeight v_weight;
+    Lfm2StepWeight o_weight;
     id<MTLBuffer> q_norm;
     id<MTLBuffer> k_norm;
     id<MTLBuffer> key_cache;      // f16 [kv_heads * bucket * head_dim].
@@ -428,6 +447,10 @@ typedef struct Lfm2HybridStepContext {
     uint64_t vocab;
     uint64_t kernel_size;
     float epsilon;
+    // Quantization mode for the whole engine: 0 = f16 matmuls, 1 = Q8_0 matmuls.
+    // Set once at prepare; every matmul encode helper threads it into its kernel
+    // config so the reused kernels select the matching weight path and dispatch.
+    uint32_t quantized;
     // Per-step activation scratch (f16 unless noted), sized so a step allocates
     // nothing. current/next ping-pong the running residual across layers.
     id<MTLBuffer> x_a;
@@ -448,7 +471,7 @@ typedef struct Lfm2HybridStepContext {
     id<MTLBuffer> conv_out_f16;       // f16 [hidden]
     // Shared tail / chained-decode residents.
     id<MTLBuffer> final_norm_weight;
-    id<MTLBuffer> lm_head_weight;
+    Lfm2StepWeight lm_head_weight;    // tied head: f16 or Q8_0.
     id<MTLBuffer> embeddings;         // f16 [vocab * hidden], tied table.
     uint64_t argmax_partials;
     id<MTLBuffer> argmax_partial_keys;
@@ -491,6 +514,23 @@ static id<MTLBuffer> hybrid_weight_f16(id<MTLDevice> device, id<MTLBlitCommandEn
 static id<MTLBuffer> hybrid_weight_f32(id<MTLDevice> device, id<MTLBlitCommandEncoder> blit, const void *fp32, NSUInteger elements) {
     if (fp32 == NULL) return nil;
     return hybrid_private(device, blit, fp32, elements * sizeof(float));
+}
+
+// Upload one matmul weight as EITHER f16 or Q8_0, mirroring the Qwen3 step
+// context's new_weight. When `q8` is non-NULL the weight is stored as
+// `elements / 32 * 34` Q8_0 block bytes (each 32-element row block is the GGUF
+// 34-byte layout: f16 scale + 32 i8 quants) and the f16 slot stays nil;
+// otherwise the f16 buffer is uploaded and the Q8 slot stays nil. `elements` is
+// the matrix element count (rows * cols); it is a multiple of 32 because every
+// LFM2 matmul column dimension is a multiple of 32.
+static Lfm2StepWeight hybrid_weight(id<MTLDevice> device, id<MTLBlitCommandEncoder> blit, const void *fp16, const void *q8, NSUInteger elements) {
+    Lfm2StepWeight weight = { nil, nil };
+    if (q8 != NULL) {
+        weight.q8 = hybrid_private(device, blit, q8, elements / 32 * 34);
+    } else {
+        weight.fp16 = hybrid_weight_f16(device, blit, fp16, elements);
+    }
+    return weight;
 }
 
 static id<MTLBuffer> hybrid_zero(id<MTLDevice> device, NSUInteger length, MTLResourceOptions options) {
@@ -582,16 +622,20 @@ void *synapse_lfm2_hybrid_step_context_new(
 int32_t synapse_lfm2_hybrid_step_prepare(
     void *raw,
     uint64_t layer_count,
+    uint32_t quantized,
     const Lfm2HybridLayerParams *params,
     const void *final_norm_weight,
     const void *lm_head_weight,
+    const void *lm_head_q8,
     const void *embeddings
 ) {
     @autoreleasepool {
         @try {
             Lfm2HybridStepContext *context = raw;
+            // The tied LM head is f16 in an f16 engine and Q8_0 in a quantized
+            // engine; require the slot matching the mode (the other is null).
             if (context == NULL || layer_count == 0 || params == NULL || final_norm_weight == NULL ||
-                lm_head_weight == NULL || embeddings == NULL) {
+                (quantized ? lm_head_q8 == NULL : lm_head_weight == NULL) || embeddings == NULL) {
                 set_error(@"invalid LFM2 hybrid step preparation arguments");
                 return -1;
             }
@@ -610,6 +654,7 @@ int32_t synapse_lfm2_hybrid_step_prepare(
                 return -3;
             }
             context->layer_count = layer_count;
+            context->quantized = quantized;
 
             id<MTLCommandBuffer> upload_command = [context->queue commandBuffer];
             id<MTLBlitCommandEncoder> upload_blit = [upload_command blitCommandEncoder];
@@ -622,41 +667,61 @@ int32_t synapse_lfm2_hybrid_step_prepare(
                 const Lfm2HybridLayerParams *source = &params[i];
                 Lfm2HybridLayerBuffers *target = &context->layers[i];
                 target->is_attention = source->is_attention != 0;
-                // Weights shared by every layer: the two norms and the SwiGLU FFN.
+                // A quantized engine must be handed a Q8_0 buffer for every matmul
+                // it runs; a missing block buffer would make the kernel dereference
+                // a nil weight slot. Conv and attention layers quantize different
+                // projections, so the required set depends on the layer type.
+                if (quantized && (source->gate_weight_q8 == NULL || source->up_weight_q8 == NULL ||
+                                  source->down_weight_q8 == NULL ||
+                                  (target->is_attention
+                                       ? (source->q_weight_q8 == NULL || source->k_weight_q8 == NULL ||
+                                          source->v_weight_q8 == NULL || source->o_weight_q8 == NULL)
+                                       : (source->in_proj_weight_q8 == NULL || source->out_proj_weight_q8 == NULL)))) {
+                    set_error(@"quantized LFM2 hybrid step is missing a Q8_0 weight buffer");
+                    alloc_ok = NO;
+                    break;
+                }
+                // Weights shared by every layer: the two norms (always f16) and the
+                // SwiGLU FFN projections (f16 or Q8_0).
                 target->operator_norm = hybrid_weight_f16(context->device, upload_blit, source->operator_norm, context->hidden);
                 target->ffn_norm = hybrid_weight_f16(context->device, upload_blit, source->ffn_norm, context->hidden);
-                target->gate_weight = hybrid_weight_f16(context->device, upload_blit, source->gate_weight, context->intermediate * context->hidden);
-                target->up_weight = hybrid_weight_f16(context->device, upload_blit, source->up_weight, context->intermediate * context->hidden);
-                target->down_weight = hybrid_weight_f16(context->device, upload_blit, source->down_weight, context->hidden * context->intermediate);
-                if (target->operator_norm == nil || target->ffn_norm == nil || target->gate_weight == nil ||
-                    target->up_weight == nil || target->down_weight == nil) {
+                target->gate_weight = hybrid_weight(context->device, upload_blit, source->gate_weight, source->gate_weight_q8, context->intermediate * context->hidden);
+                target->up_weight = hybrid_weight(context->device, upload_blit, source->up_weight, source->up_weight_q8, context->intermediate * context->hidden);
+                target->down_weight = hybrid_weight(context->device, upload_blit, source->down_weight, source->down_weight_q8, context->hidden * context->intermediate);
+                if (target->operator_norm == nil || target->ffn_norm == nil ||
+                    (quantized ? (target->gate_weight.q8 == nil || target->up_weight.q8 == nil || target->down_weight.q8 == nil)
+                               : (target->gate_weight.fp16 == nil || target->up_weight.fp16 == nil || target->down_weight.fp16 == nil))) {
                     alloc_ok = NO;
                     break;
                 }
                 if (target->is_attention) {
-                    target->q_weight = hybrid_weight_f16(context->device, upload_blit, source->q_weight, query_width * context->hidden);
-                    target->k_weight = hybrid_weight_f16(context->device, upload_blit, source->k_weight, kv_width * context->hidden);
-                    target->v_weight = hybrid_weight_f16(context->device, upload_blit, source->v_weight, kv_width * context->hidden);
-                    target->o_weight = hybrid_weight_f16(context->device, upload_blit, source->o_weight, context->hidden * query_width);
+                    target->q_weight = hybrid_weight(context->device, upload_blit, source->q_weight, source->q_weight_q8, query_width * context->hidden);
+                    target->k_weight = hybrid_weight(context->device, upload_blit, source->k_weight, source->k_weight_q8, kv_width * context->hidden);
+                    target->v_weight = hybrid_weight(context->device, upload_blit, source->v_weight, source->v_weight_q8, kv_width * context->hidden);
+                    target->o_weight = hybrid_weight(context->device, upload_blit, source->o_weight, source->o_weight_q8, context->hidden * query_width);
                     target->q_norm = hybrid_weight_f16(context->device, upload_blit, source->q_norm, context->head_dim);
                     target->k_norm = hybrid_weight_f16(context->device, upload_blit, source->k_norm, context->head_dim);
                     target->key_cache = hybrid_zero(context->device, kv_cache_elements * sizeof(uint16_t), MTLResourceStorageModePrivate);
                     target->value_cache = hybrid_zero(context->device, kv_cache_elements * sizeof(uint16_t), MTLResourceStorageModePrivate);
-                    if (target->q_weight == nil || target->k_weight == nil || target->v_weight == nil ||
-                        target->o_weight == nil || target->q_norm == nil || target->k_norm == nil ||
+                    if ((quantized ? (target->q_weight.q8 == nil || target->k_weight.q8 == nil ||
+                                      target->v_weight.q8 == nil || target->o_weight.q8 == nil)
+                                   : (target->q_weight.fp16 == nil || target->k_weight.fp16 == nil ||
+                                      target->v_weight.fp16 == nil || target->o_weight.fp16 == nil)) ||
+                        target->q_norm == nil || target->k_norm == nil ||
                         target->key_cache == nil || target->value_cache == nil) {
                         alloc_ok = NO;
                         break;
                     }
                 } else {
-                    target->in_proj_weight = hybrid_weight_f16(context->device, upload_blit, source->in_proj_weight, 3 * context->hidden * context->hidden);
+                    target->in_proj_weight = hybrid_weight(context->device, upload_blit, source->in_proj_weight, source->in_proj_weight_q8, 3 * context->hidden * context->hidden);
                     target->conv_weight = hybrid_weight_f32(context->device, upload_blit, source->conv_weight, context->hidden * context->kernel_size);
-                    target->out_proj_weight = hybrid_weight_f16(context->device, upload_blit, source->out_proj_weight, context->hidden * context->hidden);
+                    target->out_proj_weight = hybrid_weight(context->device, upload_blit, source->out_proj_weight, source->out_proj_weight_q8, context->hidden * context->hidden);
                     // Rolling conv cache: shared so the reset path can zero it from
                     // the host, matching empty_decode_cache's all-zero conv state.
                     target->conv_cache = hybrid_zero(context->device, conv_cache_elements * sizeof(float), MTLResourceStorageModeShared);
-                    if (target->in_proj_weight == nil || target->conv_weight == nil ||
-                        target->out_proj_weight == nil || target->conv_cache == nil) {
+                    if ((quantized ? (target->in_proj_weight.q8 == nil || target->out_proj_weight.q8 == nil)
+                                   : (target->in_proj_weight.fp16 == nil || target->out_proj_weight.fp16 == nil)) ||
+                        target->conv_weight == nil || target->conv_cache == nil) {
                         alloc_ok = NO;
                         break;
                     }
@@ -669,8 +734,9 @@ int32_t synapse_lfm2_hybrid_step_prepare(
                 return -5;
             }
             context->final_norm_weight = hybrid_weight_f16(context->device, upload_blit, final_norm_weight, context->hidden);
-            context->lm_head_weight = hybrid_weight_f16(context->device, upload_blit, lm_head_weight, context->vocab * context->hidden);
+            context->lm_head_weight = hybrid_weight(context->device, upload_blit, lm_head_weight, lm_head_q8, context->vocab * context->hidden);
             context->embeddings = hybrid_weight_f16(context->device, upload_blit, embeddings, context->vocab * context->hidden);
+
 
             const NSUInteger hidden_bytes = (NSUInteger)context->hidden * sizeof(uint16_t);
             const NSUInteger query_bytes = (NSUInteger)query_width * sizeof(uint16_t);
@@ -711,7 +777,9 @@ int32_t synapse_lfm2_hybrid_step_prepare(
                 set_error(upload_command.error.localizedDescription ?: @"LFM2 hybrid weight upload failed");
                 return -6;
             }
-            if (context->final_norm_weight == nil || context->lm_head_weight == nil || context->embeddings == nil ||
+            if (context->final_norm_weight == nil ||
+                (quantized ? context->lm_head_weight.q8 == nil : context->lm_head_weight.fp16 == nil) ||
+                context->embeddings == nil ||
                 context->x_a == nil || context->x_b == nil || context->normalized == nil || context->query == nil ||
                 context->key == nil || context->attention_context == nil || context->attention_scores == nil ||
                 context->mlp == nil || context->final_norm == nil || context->logits == nil ||
@@ -730,12 +798,14 @@ int32_t synapse_lfm2_hybrid_step_prepare(
     }
 }
 
-// Bind an f16 weight at its fp16 index and leave the Q8 slot empty. The reused
-// kernels only read the Q8 buffer when quantized != 0; this engine is f16-only
-// (the Q8 path is a later increment), so a nil Q8 binding is never dereferenced.
-static void hybrid_set_weight(id<MTLComputeCommandEncoder> encoder, id<MTLBuffer> fp16, NSUInteger fp16_index, NSUInteger q8_index) {
-    [encoder setBuffer:fp16 offset:0 atIndex:fp16_index];
-    [encoder setBuffer:nil offset:0 atIndex:q8_index];
+// Bind a matmul weight's f16 buffer at its fp16 index and its Q8_0 buffer at
+// its q8 index. The reused kernels read only the slot selected by their
+// `quantized` config flag, so the unused slot may be nil and is never
+// dereferenced. A given engine populates exactly one slot per weight (see
+// hybrid_weight), so one of the two bindings is always nil.
+static void hybrid_set_weight(id<MTLComputeCommandEncoder> encoder, Lfm2StepWeight *weight, NSUInteger fp16_index, NSUInteger q8_index) {
+    [encoder setBuffer:weight->fp16 offset:0 atIndex:fp16_index];
+    [encoder setBuffer:weight->q8 offset:0 atIndex:q8_index];
 }
 
 static void hybrid_encode_rmsnorm(
@@ -773,16 +843,22 @@ static void hybrid_encode_qkv(
     [encoder setBuffer:context->query offset:0 atIndex:1];
     [encoder setBuffer:context->key offset:0 atIndex:2];
     [encoder setBuffer:layer->value_cache offset:0 atIndex:3];
-    hybrid_set_weight(encoder, layer->q_weight, 4, 5);
-    hybrid_set_weight(encoder, layer->k_weight, 6, 7);
-    hybrid_set_weight(encoder, layer->v_weight, 8, 9);
+    hybrid_set_weight(encoder, &layer->q_weight, 4, 5);
+    hybrid_set_weight(encoder, &layer->k_weight, 6, 7);
+    hybrid_set_weight(encoder, &layer->v_weight, 8, 9);
     struct { uint32_t input_width; uint32_t query_width; uint32_t kv_width; uint32_t head_dim; uint32_t capacity; uint32_t position; uint32_t quantized; } config = {
         (uint32_t)context->hidden, query_width, kv_width, (uint32_t)context->head_dim,
-        (uint32_t)context->bucket, position, 0
+        (uint32_t)context->bucket, position, context->quantized
     };
     [encoder setBytes:&config length:sizeof(config) atIndex:10];
-    NSUInteger qkv_rows = (NSUInteger)MAX(query_width, kv_width);
-    [encoder dispatchThreads:hybrid_grid(qkv_rows) threadsPerThreadgroup:hybrid_group(qkv_rows)];
+    // F16 dispatches one thread per output row (the row dot is serial). Q8 packs
+    // the query rows plus both KV projections into the grid and gives each row a
+    // full 32-lane simdgroup, mirroring the Qwen3 step engine's Q8 QKV dispatch.
+    NSUInteger qkv_rows = context->quantized
+        ? (NSUInteger)query_width + (NSUInteger)kv_width * 2
+        : (NSUInteger)MAX(query_width, kv_width);
+    NSUInteger qkv_threads = context->quantized ? qkv_rows * 32 : qkv_rows;
+    [encoder dispatchThreads:hybrid_grid(qkv_threads) threadsPerThreadgroup:hybrid_group(context->quantized ? 256 : qkv_rows)];
     [encoder endEncoding];
 }
 
@@ -841,7 +917,7 @@ static void hybrid_encode_matvec_residual(
     id<MTLBuffer> input,
     id<MTLBuffer> residual,
     id<MTLBuffer> output,
-    id<MTLBuffer> weight,
+    Lfm2StepWeight *weight,
     uint32_t input_width,
     uint32_t output_width,
     BOOL add_residual
@@ -853,10 +929,15 @@ static void hybrid_encode_matvec_residual(
     [encoder setBuffer:output offset:0 atIndex:2];
     hybrid_set_weight(encoder, weight, 3, 4);
     struct { uint32_t input_width; uint32_t output_width; uint32_t quantized; uint32_t add_residual; } config = {
-        input_width, output_width, 0, (uint32_t)add_residual
+        input_width, output_width, context->quantized, (uint32_t)add_residual
     };
     [encoder setBytes:&config length:sizeof(config) atIndex:5];
-    [encoder dispatchThreads:hybrid_grid(output_width) threadsPerThreadgroup:hybrid_group(output_width)];
+    // F16 uses one lane per independent output row; the row dot itself stays
+    // serial. Q8 packs four independent rows into each 32-lane simdgroup, eight
+    // sub-lanes per row, each row still reduced by its own simd_sum.
+    NSUInteger matvec_threads =
+        context->quantized ? (NSUInteger)((output_width + 3) / 4) * 32 : output_width;
+    [encoder dispatchThreads:hybrid_grid(matvec_threads) threadsPerThreadgroup:hybrid_group(context->quantized ? 256 : output_width)];
     [encoder endEncoding];
 }
 
@@ -890,13 +971,15 @@ static void hybrid_encode_gate_up(
     [encoder setComputePipelineState:context->gate_up_swiglu];
     [encoder setBuffer:input offset:0 atIndex:0];
     [encoder setBuffer:context->mlp offset:0 atIndex:1];
-    hybrid_set_weight(encoder, layer->gate_weight, 2, 3);
-    hybrid_set_weight(encoder, layer->up_weight, 4, 5);
+    hybrid_set_weight(encoder, &layer->gate_weight, 2, 3);
+    hybrid_set_weight(encoder, &layer->up_weight, 4, 5);
     struct { uint32_t input_width; uint32_t output_width; uint32_t quantized; uint32_t add_residual; } config = {
-        (uint32_t)context->hidden, (uint32_t)context->intermediate, 0, 0
+        (uint32_t)context->hidden, (uint32_t)context->intermediate, context->quantized, 0
     };
     [encoder setBytes:&config length:sizeof(config) atIndex:6];
-    [encoder dispatchThreads:hybrid_grid(context->intermediate) threadsPerThreadgroup:hybrid_group(context->intermediate)];
+    NSUInteger gate_threads =
+        context->quantized ? (NSUInteger)((context->intermediate + 3) / 4) * 32 : (NSUInteger)context->intermediate;
+    [encoder dispatchThreads:hybrid_grid(gate_threads) threadsPerThreadgroup:hybrid_group(context->quantized ? 256 : context->intermediate)];
     [encoder endEncoding];
 }
 
@@ -905,12 +988,17 @@ static void hybrid_encode_lm_head(Lfm2HybridStepContext *context, id<MTLCommandB
     [encoder setComputePipelineState:context->lm_head];
     [encoder setBuffer:context->final_norm offset:0 atIndex:0];
     [encoder setBuffer:context->logits offset:0 atIndex:1];
-    hybrid_set_weight(encoder, context->lm_head_weight, 2, 3);
+    hybrid_set_weight(encoder, &context->lm_head_weight, 2, 3);
     struct { uint32_t input_width; uint32_t output_width; uint32_t quantized; uint32_t add_residual; } config = {
-        (uint32_t)context->hidden, (uint32_t)context->vocab, 0, 0
+        (uint32_t)context->hidden, (uint32_t)context->vocab, context->quantized, 0
     };
     [encoder setBytes:&config length:sizeof(config) atIndex:4];
-    [encoder dispatchThreads:hybrid_grid(context->vocab) threadsPerThreadgroup:hybrid_group(context->vocab)];
+    // The large vocabulary projection is row-parallel in f16 (one lane per full
+    // serial dot); Q8 packs four vocabulary rows per simdgroup, eight sub-lanes
+    // each, mirroring the Qwen3 step engine's Q8 LM-head dispatch.
+    NSUInteger lm_head_threads =
+        context->quantized ? (NSUInteger)((context->vocab + 3) / 4) * 32 : (NSUInteger)context->vocab;
+    [encoder dispatchThreads:hybrid_grid(lm_head_threads) threadsPerThreadgroup:hybrid_group(context->quantized ? 256 : context->vocab)];
     [encoder endEncoding];
 }
 
@@ -1044,13 +1132,13 @@ static void hybrid_encode_forward(
             hybrid_encode_qk_norm_rope(context, command_buffer, layer, rope_cos, rope_sin, rope_offset, position);
             hybrid_encode_attention(context, command_buffer, layer, position);
             hybrid_encode_matvec_residual(context, command_buffer, context->attention_context, current, next,
-                                          layer->o_weight, (uint32_t)(context->query_heads * context->head_dim),
+                                          &layer->o_weight, (uint32_t)(context->query_heads * context->head_dim),
                                           (uint32_t)context->hidden, NO);
         } else {
             // in_proj: hidden -> 3*hidden, no residual. The residual slot is bound
             // (not read) because add_residual is false.
             hybrid_encode_matvec_residual(context, command_buffer, context->normalized, current, context->conv_proj,
-                                          layer->in_proj_weight, (uint32_t)context->hidden,
+                                          &layer->in_proj_weight, (uint32_t)context->hidden,
                                           (uint32_t)(3 * context->hidden), NO);
             hybrid_encode_conv_split(context, command_buffer);
             hybrid_encode_conv_step(context, command_buffer, layer);
@@ -1058,13 +1146,13 @@ static void hybrid_encode_forward(
             // out_proj: hidden -> hidden, no residual (the residual add happens in
             // the residual_rmsnorm below, matching decode_conv + add_residual).
             hybrid_encode_matvec_residual(context, command_buffer, context->conv_out_f16, current, next,
-                                          layer->out_proj_weight, (uint32_t)context->hidden,
+                                          &layer->out_proj_weight, (uint32_t)context->hidden,
                                           (uint32_t)context->hidden, NO);
         }
         hybrid_encode_residual_rmsnorm(context, command_buffer, next, current, context->normalized, layer->ffn_norm);
         hybrid_encode_gate_up(context, command_buffer, layer, context->normalized);
         hybrid_encode_matvec_residual(context, command_buffer, context->mlp, next, current,
-                                      layer->down_weight, (uint32_t)context->intermediate,
+                                      &layer->down_weight, (uint32_t)context->intermediate,
                                       (uint32_t)context->hidden, YES);
     }
     hybrid_encode_rmsnorm(context, command_buffer, current, context->final_norm, context->final_norm_weight,
@@ -1317,20 +1405,27 @@ int32_t synapse_lfm2_hybrid_step_reset(void *raw) {
     }
 }
 
+static void hybrid_release_weight(Lfm2StepWeight *weight) {
+    [weight->fp16 release];
+    [weight->q8 release];
+    weight->fp16 = nil;
+    weight->q8 = nil;
+}
+
 static void hybrid_release_layer(Lfm2HybridLayerBuffers *layer) {
     [layer->operator_norm release];
     [layer->ffn_norm release];
-    [layer->gate_weight release];
-    [layer->up_weight release];
-    [layer->down_weight release];
-    [layer->in_proj_weight release];
+    hybrid_release_weight(&layer->gate_weight);
+    hybrid_release_weight(&layer->up_weight);
+    hybrid_release_weight(&layer->down_weight);
+    hybrid_release_weight(&layer->in_proj_weight);
     [layer->conv_weight release];
-    [layer->out_proj_weight release];
+    hybrid_release_weight(&layer->out_proj_weight);
     [layer->conv_cache release];
-    [layer->q_weight release];
-    [layer->k_weight release];
-    [layer->v_weight release];
-    [layer->o_weight release];
+    hybrid_release_weight(&layer->q_weight);
+    hybrid_release_weight(&layer->k_weight);
+    hybrid_release_weight(&layer->v_weight);
+    hybrid_release_weight(&layer->o_weight);
     [layer->q_norm release];
     [layer->k_norm release];
     [layer->key_cache release];
@@ -1361,7 +1456,7 @@ void synapse_lfm2_hybrid_step_context_free(void *raw) {
     [context->conv_out release];
     [context->conv_out_f16 release];
     [context->final_norm_weight release];
-    [context->lm_head_weight release];
+    hybrid_release_weight(&context->lm_head_weight);
     [context->embeddings release];
     [context->argmax_partial_keys release];
     [context->argmax_partial_ids release];
