@@ -286,3 +286,176 @@ wave-1 Ally measurement. Recomputing the ratio with the final M2 owned result:
 
 This is a throughput ratio only; the exactness and Q8 quality gates above remain
 the acceptance criteria for the owned decode path.
+
+
+## Wave 4 decode mechanisms: vectorized loads, address hoisting, f16 pack-four
+
+Wave 4 works the three exactness-safe seams that wave 3 deliberately skipped,
+one mechanism at a time, each behind its own gate battery on the Ally. The
+rig is unchanged from wave 3: ASUS ROG Ally X, AMD Radeon Graphics (RDNA3),
+Vulkan 1.4.334, driver_raw `8388981`, queried subgroup size 64. The shaders
+remain wave32/64-agnostic via `gl_SubgroupSize`.
+
+**Exactness law (held throughout).** Only INDEPENDENT reductions are
+parallelized: different rows, with each row's partial product kept in its serial
+position. No dot product's f32 accumulation is split or reordered across lanes;
+subgroup ops only broadcast finalized values. Every wave-4 mechanism changes how
+data is LOADED or how addresses are computed, never how a row's f32 sum is
+associated. The f16 gate (20/20 token-exact against the pinned reference) and
+the Q8 quality floor (>= 10/20 exact, median depth >= 59.0, zero near-ties)
+stayed green after every mechanism, which is the bit-level proof that the law
+held.
+
+### Baseline reproduction
+
+The wave-3 tree was re-measured before any shader change. Quality fingerprints
+matched wave 3 exactly; the small tok/s differences are single-process
+variation (note the opposite signs — f16 slightly down, Q8 slightly up — which
+rules out a systematic box-state change).
+
+| Path | wave-3 doc | wave-4 reproduced | exact | median depth | near-ties |
+|---|---:|---:|---|---:|---:|
+| f16 decode | 4.261 | **4.221** tok/s | 20/20 | 64.0 | 0 |
+| Q8 decode | 13.407 | **13.988** tok/s | 10/20 | 59.0 | 0 |
+
+### Ladder
+
+Single-process 20x64 wall rates, NON-authoritative. Each row is the cumulative
+tree (seam 2 builds on seam 1, seam 3 on seam 2); the delta column is versus the
+previous mechanism's tree. Run-to-run spread on this box is about ±3% (Q8 ranged
+13.32-13.99 across all repeats; f16 4.10-4.22), so sub-3% movements are noise.
+
+| Step | Mechanism | f16 decode tok/s | Q8 decode tok/s | Q8 exact / 20 | Q8 median depth | near-ties |
+|---|---|---:|---:|---:|---:|---:|
+| baseline | wave-3 tree (subgroup RMSNorm + Q8 pack-four) | 4.221 | 13.988 | 10/20 | 59.0 | 0 |
+| seam 1 | vectorized loads (uvec2 + unpackHalf2x16; Q8 uint16 view) | 4.120 | 13.687 / 13.889 | 10/20 | 59.0 | 0 |
+| seam 2 | Q8 block-address hoisting | 4.097 (control) | 13.832 / 13.316 | 10/20 | 59.0 | 0 |
+| seam 3 | f16 pack-four rows per subgroup (+ seam-1 loads) | 4.104 / 4.189 | 13.482 (control) | 10/20 | 59.0 | 0 |
+
+All three mechanisms are exactness-clean and **throughput-neutral within
+single-process noise**. None is reverted: each passed its gates and is a correct
+implementation of the requested mechanism; the deltas are recorded honestly as
+neutral rather than dressed up as gains.
+
+### Seam 1 gate: vectorized loads
+
+`decode_matvec.comp` and `decode_matvec_q8_0.comp` now read weights and
+activations as `uvec2` (two uint32 = four halves per 8-byte load) and expand
+each uint32 with `unpackHalf2x16`, which widens a half's bits to f32 exactly as
+the scalar `float(half)` conversion does. The products are still formed in f32
+and added in ascending column order, so both dots stay bit-identical.
+
+The Q8 weight is viewed as `uint16` rather than `uvec4`: a 34-byte block does not
+align to 4 or 16 (its int8 payload starts at byte 2), so a uvec4 load would be
+misaligned (undefined on Vulkan). Each block is exactly 17 uint16 words — one
+f16 scale word plus 16 words that each pack two little-endian int8 — and uint16
+needs only the 2-byte alignment the byte-2 payload always satisfies. This handles
+the scale/payload split explicitly without repacking the weight layout.
+
+| Gate | Result | Evidence |
+|---|---|---|
+| f16 20x64 pinned parity | **PASS** | 20/20 prompts, 1,280/1,280 tokens exact, 0 near-ties; 4.120 tok/s |
+| Q8 quality floor | **PASS** | 10/20 exact, median depth 59.0, 0 near-ties; 13.687 / 13.889 tok/s |
+| f16 470+64 depth | **PASS** | 64/64 tokens exact, 0 near-ties; 2.053 tok/s decode |
+| Determinism | **PASS** | token-identical across two runs of both the f16 and Q8 cells |
+
+### Seam 2 gate: Q8 block-address hoisting
+
+`decode_matvec_q8_0.comp` hoists the per-row block stride out of the block loop
+(`row*blocks*17` computed once, advanced by 17 per block) and walks the in-block
+weight/input addresses with running increments (`wptr += 2`, `iptr += 1`) instead
+of recomputing `base16 + 1 + 2*group` for every element. The accumulation order
+is unchanged. The f16 SPIR-V is byte-identical to seam 1, so the f16 cell is a
+control.
+
+| Gate | Result | Evidence |
+|---|---|---|
+| Q8 quality floor | **PASS** | 10/20 exact, median depth 59.0, 0 near-ties; 13.832 / 13.316 tok/s |
+| Determinism | **PASS** | token-identical across two Q8 runs |
+| f16 20x64 control | **PASS** | 20/20 exact, 0 near-ties; 4.097 tok/s (f16 SPIR-V unchanged) |
+
+### Seam 3 gate: f16 pack-four rows per subgroup
+
+`decode_matvec.comp` adopts the Q8 pack-four structure: a fixed 64-invocation
+workgroup with four active subgroup lanes, each owning one output row and keeping
+its full serial left-to-right f32 dot (no subgroup reduction of a single dot).
+`vulkan_backend.rs` dispatches `subgroup_groups(rows, 4)` workgroups for the f16
+matvec, mirroring the Q8 path; the dispatch stays wave32/64-agnostic. The seam-1
+uvec2 loads are retained.
+
+| Gate | Result | Evidence |
+|---|---|---|
+| f16 20x64 pinned parity | **PASS** | 20/20 prompts, 1,280/1,280 tokens exact, 0 near-ties; 4.104 / 4.189 tok/s |
+| f16 470+64 depth | **PASS** | 64/64 tokens exact, 0 near-ties; 2.006 tok/s decode |
+| Determinism | **PASS** | token-identical across two f16 runs |
+| Q8 20x64 control | **PASS** | 10/20 exact, median depth 59.0, 0 near-ties; 13.482 tok/s (Q8 SPIR-V unchanged) |
+
+### Why the seams did not move throughput (measured, not assumed)
+
+The kernels are not saturating memory: achieved weight bandwidth was about
+9.8 GB/s (f16) and 8.5-8.9 GB/s (Q8), far below the Ally's LPDDR5 peak. The
+limiting factor is the per-lane serial f32 accumulation — a long dependent
+load-multiply-add chain — combined with the low active-lane count the exactness
+law mandates (one complete dot per lane; no partial-dot reduction).
+
+- Seam 1 cuts load-instruction count, but the kernel is not load-instruction
+  bound; the serial accumulator dependency chain still serializes each lane.
+- Seam 2 cuts address arithmetic, which the compiler already strength-reduces;
+  the result is within noise of seam 1.
+- Seam 3 raises rows-per-wavefront from 1 to 4 (the mechanism that gave Q8
+  +140% in wave-3 M2). For f16 it is neutral: the f16 serial shader already
+  dispatched one workgroup per output row (up to 151,936 for the LM head), so
+  latency was already hidden by multi-wavefront occupancy; packing four rows per
+  wavefront cuts workgroup count without adding independent work per lane.
+
+The binding constraint is the exactness law itself. llama.cpp-Vulkan's
+127.0 tok/s comes from splitting each dot product across many lanes and reducing
+the partials — a different f32 accumulation order this lane forbids by design.
+Closing that gap would require either relaxing the bit-exact accumulation
+constraint or a layout/algorithm change (e.g. cooperative-matrix GEMM) that is
+out of scope for this shader-only wave.
+
+### Final llama-Vulkan ratio
+
+The incumbent llama.cpp-Vulkan Q8 decode cell remains 127.0 tok/s from the
+wave-1 Ally measurement. The final wave-4 tree's Q8 decode (seam-1 + seam-2
+shader; seam 3 does not change Q8) measured 13.32-13.83 tok/s across three
+fresh-process repeats (mean 13.54):
+
+| Metric | Value |
+|---|---:|
+| owned Q8 decode after wave 4 (mean of 3 repeats) | **13.54 tok/s** |
+| llama.cpp-Vulkan Q8 decode | 127.0 tok/s |
+| **owned / llama ratio** | **10.66%** (llama is 9.38x faster) |
+
+The ratio is unchanged from wave 3's 10.56% within single-process noise,
+consistent with the three seams being throughput-neutral. f16 ratio remains
+unmeasurable (no f16 chat GGUF staged on the Ally). The exactness and Q8 quality
+gates above remain the acceptance criteria for the owned decode path.
+
+### Wave-4 evidence and commands
+
+Raw result JSONs are committed under `results/vulkan-ally/wave4/`:
+`baseline-{f16,q8}-20x64.json`, `seam{1,2,3}-*` per-mechanism cells, `*-rerun.json`
+determinism repeats, and `seam{1,3}-f16-depth470.json`. Cells were run detached
+via a scheduled-task launcher so each result survived Wi-Fi drops; the Ally
+checkout `C:\bench\synapse-decode` was synced from this branch by git bundle with
+the box-local slim-workspace `Cargo.toml`/`Cargo.lock` preserved.
+
+```bat
+set EXE=%USERPROFILE%\cargo-target-decode\release\spike-unified-rt.exe
+set MODEL=C:\bench\model-qwen3-chat
+
+REM f16 / Q8 20x64 gate cell (Q8 adds --weight-quant q8-0)
+%EXE% --model %MODEL% --tokenizer %MODEL%\tokenizer.json ^
+  --generate-prompts C:\bench\data\decode-prompts.jsonl ^
+  --decode-reference C:\bench\data\reference-tokens.jsonl ^
+  --device vulkan --decode-backend vulkan --dtype f16 --vulkan-gemm plain ^
+  --decode-cache-bucket 512 --max-new-tokens 64 --limit 20 ^
+  --out C:\bench\results-ally\vulkan-decode\wave4\<cell>.json
+
+REM 470+64 depth cell (f16 self-reference)
+%EXE% ... --generate-prompts C:\bench\data\long-context-470.jsonl ^
+  --decode-reference C:\bench\data\depth470-reference-tokens.jsonl ^
+  --decode-cache-bucket 534 --max-new-tokens 64 --limit 1 --out ...
+```
