@@ -3808,7 +3808,10 @@ mod enabled {
                         output,
                     ],
                     &params,
-                    [rows as u32, 1, 1],
+                    // Wave 4 seam 3: four lanes in each subgroup own four
+                    // independent rows, each still performing its row's full
+                    // serial f32 dot (mirrors the Q8 pack-four dispatch).
+                    [recorder.state.subgroup_groups(rows, 4), 1, 1],
                     layer,
                     stage,
                 )

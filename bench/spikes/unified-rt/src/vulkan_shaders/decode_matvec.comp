@@ -2,26 +2,34 @@
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_scalar_block_layout : require
 
-// One invocation owns one output row so every f32 dot-product accumulation
-// follows a fixed left-to-right order. Decode parity must not use reductions
-// that reassociate a single row's sum.
+#extension GL_KHR_shader_subgroup_basic : require
+
+// Wave 4 seam 3: four independent serial f16 rows per subgroup, mirroring the
+// Q8 pack-four mechanism that wave 3 measured at +140% Q8. One invocation owns
+// one output row, so every f32 dot-product accumulation still follows a fixed
+// left-to-right order; no subgroup reduction combines partials of a single dot.
+// The fixed 64-invocation workgroup handles both RDNA3 wave32 (two four-row
+// subgroups) and wave64 (one four-row subgroup) via gl_SubgroupSize.
 //
-// Wave 4 seam 1: vectorized loads. The f16 weight and activation buffers are
-// viewed as uvec2 (two uint32 = four halves per 8-byte load) and each uint32 is
-// expanded with unpackHalf2x16, which widens a half's bits to f32 exactly as the
-// scalar float(half) conversion does. The products are still formed in f32 and
-// added in ascending column order, so the dot stays bit-identical to the scalar
-// wave-1 kernel; only the load width changes. Columns are a multiple of four for
-// every Qwen3 matvec (hidden 1024, intermediate 3072), matching the Q8 shader's
-// no-tail convention.
-layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+// Weights and activations are read as uvec2 (four halves per 8-byte load) and
+// expanded with unpackHalf2x16, which widens each half to f32 exactly like the
+// scalar float(half) conversion. Products are formed in f32 and added in
+// ascending column order, so the dot stays bit-identical to the scalar wave-1
+// kernel. Columns are a multiple of four for every Qwen3 matvec (hidden 1024,
+// intermediate 3072), matching the Q8 shader's no-tail convention.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 layout(set = 0, binding = 0, scalar) readonly buffer Input { uvec2 values[]; } input_values;
 layout(set = 0, binding = 1, scalar) readonly buffer Weight { uvec2 values[]; } weight_values;
 layout(set = 0, binding = 2, scalar) writeonly buffer Output { float values[]; } output_values;
 layout(push_constant) uniform Params { uint rows; uint columns; uint unused0; uint unused1; } p;
 
 void main() {
-    uint row = gl_WorkGroupID.x;
+    uint subgroups_per_workgroup = 64u / gl_SubgroupSize;
+    uint subgroup = gl_WorkGroupID.x * subgroups_per_workgroup + gl_SubgroupID;
+    uint lane = gl_SubgroupInvocationID;
+    if (lane >= 4u) return;
+
+    uint row = subgroup * 4u + lane;
     if (row >= p.rows) return;
     float sum = 0.0;
     uint vecs = p.columns >> 2;          // four halves per uvec2
