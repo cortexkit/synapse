@@ -1,0 +1,56 @@
+#version 460
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_scalar_block_layout : require
+
+// Wave 5 batched head RMSNorm + RoPE. Each workgroup handles one independent
+// (head, column) pair. The head RMS reduction is intentionally serial so the
+// batched path does not reassociate one head's f32 sum. The column index k is
+// derived from gl_WorkGroupID.y; the head index from gl_WorkGroupID.x. The
+// RoPE angle comes from the per-column position (base_position + k), supplied
+// as a per-column cosine/sine table laid out as [K][head_dim].
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0, scalar) readonly buffer Input { float values[]; } input_values;
+layout(set = 0, binding = 1, scalar) readonly buffer Weight { float values[]; } weight_values;
+layout(set = 0, binding = 2, scalar) readonly buffer Cosine { float values[]; } cosine_values;
+layout(set = 0, binding = 3, scalar) readonly buffer Sine { float values[]; } sine_values;
+layout(set = 0, binding = 4, scalar) writeonly buffer Output { float16_t values[]; } output_values;
+layout(push_constant) uniform Params {
+    uint heads;
+    uint head_dim;
+    uint position;
+    uint cache_stride;
+    float epsilon;
+    uint write_cache;
+    uint batch;
+    uint unused;
+} p;
+
+void main() {
+    uint head = gl_WorkGroupID.x;
+    uint k = gl_WorkGroupID.y;
+    if (head >= p.heads) return;
+    if (k >= p.batch) return;
+    uint source = (k * p.heads + head) * p.head_dim;
+    float square = 0.0;
+    for (uint dimension = 0; dimension < p.head_dim; ++dimension) {
+        float value = input_values.values[source + dimension];
+        square += value * value;
+    }
+    float inverse = inversesqrt(square / float(p.head_dim) + p.epsilon);
+    // The cache slot for column k is at absolute position (p.position + k).
+    uint destination = p.write_cache != 0
+        ? (p.position + k) * p.cache_stride + head * p.head_dim
+        : source;
+    uint half_dim = p.head_dim / 2;
+    uint rope_base = k * p.head_dim;
+    for (uint dimension = 0; dimension < p.head_dim; ++dimension) {
+        uint pair = dimension < half_dim ? dimension + half_dim : dimension - half_dim;
+        float value = input_values.values[source + dimension] * inverse * weight_values.values[dimension];
+        float pair_value = input_values.values[source + pair] * inverse * weight_values.values[pair];
+        float sign_value = dimension < half_dim ? -1.0 : 1.0;
+        output_values.values[destination + dimension] = float16_t(
+            value * cosine_values.values[rope_base + dimension] +
+            sign_value * pair_value * sine_values.values[rope_base + dimension]
+        );
+    }
+}

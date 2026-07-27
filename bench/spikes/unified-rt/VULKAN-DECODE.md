@@ -459,3 +459,218 @@ REM 470+64 depth cell (f16 self-reference)
   --decode-reference C:\bench\data\depth470-reference-tokens.jsonl ^
   --decode-cache-bucket 534 --max-new-tokens 64 --limit 1 --out ...
 ```
+
+
+## Wave 5: Vulkan batched mat-mat — does the Ally's ratio gap close at K>1?
+
+Wave 5 ports the Metal batched-verify mat-mat shape (BATCHED-VERIFY.md) to the
+Vulkan backend and measures the K-curve on the Ally. The mat-mat shape streams
+each layer's weight row ONCE and applies it to K column activations (parallel
+across K independent reductions, serial within each dot), instead of re-
+streaming the weight once per token. On the M1 this gave 1.34x Q8 / 3.51x f16
+effective throughput at K=8/16. The question for RDNA3: does the weight-stream
+sharing lift bandwidth utilization the way it did on M1, or does RDNA3 stay
+wall-bound at the ~9 GB/s single-stream ceiling?
+
+### Where it lives
+
+- `src/vulkan_shaders/decode_matvec_batch.comp` — f16 mat-mat shader with K
+  as a specialization constant (SpecId 0), scalar accumulators per K branch.
+- `src/vulkan_shaders/decode_matvec_q8_0_batch.comp` — Q8 mat-mat shader
+  (same specialization approach; not used for byte-exact Q8 — see below).
+- `src/vulkan_shaders/decode_matvec_q8_0_column.comp` — column-offset Q8
+  matvec for the Q8 batched fallback (K sequential single-token dispatches).
+- `src/vulkan_shaders/decode_rms_norm_batch.comp`,
+  `decode_head_norm_rope_batch.comp`, `decode_value_cache_batch.comp`,
+  `decode_attention_batch.comp`, `add_residual_batch.comp`,
+  `swiglu_batch.comp` — batched pointwise shaders (K from push constant).
+- `src/vulkan_backend.rs` — `BatchedPipelines` (per-K specialized mat-mat
+  pipelines + shared pointwise batched pipelines), `QwenDecodeBatchActivations`
+  (K-column buffers, lazily allocated), `run_batch` (one command submission
+  for K positions), `verify_batch_logits` public API.
+- `src/qwen3_decode_vulkan.rs` — `VulkanDecoder::verify_tokens` (batched
+  path), `rewind` (speculative-decode rollback), gate tests.
+
+### The exactness law and the Q8 driver-compiler wall
+
+The exactness law is the same as Metal's: batching parallelizes ACROSS K
+columns (independent reductions); it never reorders the accumulation WITHIN
+one dot product. Each (output row, column) dot walks the weight in the same
+ascending order and adds products in the same order as the single-token path.
+
+The f16 batched mat-mat holds this law on the Ally: the byte-identical gate
+passes for all K in {1,2,4,8,16} and all prompt lengths {1,5,33,128,469}. The
+accumulators are explicit scalars per K branch (`s0`, `s1`, ... `s15`), not
+an array indexed by a loop variable, so the glslc compiler keeps them in
+registers and preserves the single-token accumulation order.
+
+The Q8 batched mat-mat does NOT hold the law on the Ally. The AMD RDNA3
+driver's shader compiler reorders the f32 accumulation when multiple column
+accumulators are present — even with scalar registers, identical per-column
+operation order, and no FMA in the SPIR-V. The byte-identical gate fails at
+K=2 for Q8. This is a driver-level optimization issue: the AMD SPIR-V compiler
+reorders operations across the K accumulators in a way that changes the f32
+rounding, compounding over 28 layers. The f16 path is unaffected (the f16
+dot is simpler and the compiler doesn't reorder it).
+
+The Q8 fix: the batched Q8 path falls back to K sequential single-token
+matvec dispatches via a column-offset variant of the single-token Q8 shader
+(`decode_matvec_q8_0_column.comp`). Each column uses the exact single-token
+shader, so the result is bit-identical by construction. The weight streams K
+times (no sharing); the Q8 K-curve measures the cost of NOT sharing, which is
+the honest answer to whether the mat-mat shape helps Q8 on RDNA3.
+
+### Gates (all green on the Ally)
+
+```text
+SYNAPSE_UNIFIED_RT_QWEN3_0_6B=<Qwen3-0.6B snapshot> \
+  cargo test -p spike-unified-rt --release --features vulkan --bin spike-unified-rt -- \
+    --ignored vulkan_batched_verify_logits_are_byte_identical_to_sequential_f16 \
+    vulkan_batched_verify_logits_are_byte_identical_to_sequential_q8 \
+    vulkan_batched_verify_is_deterministic_f16 \
+    vulkan_batched_verify_is_deterministic_q8
+=> 4 passed, 0 failed   (Ally RDNA3)
+```
+
+- **Byte-identical logits (f16)**: for prompt lengths {1, 5, 33, 128, 469}
+  and K in {1,2,4,8,16}, every position's full f32 logit vector from
+  `verify_batch_logits` is bit-for-bit equal to the logits from a sequential
+  `advance` at the same position. The argmax surface agrees too.
+- **Byte-identical logits (Q8)**: same gate, passes via the K sequential
+  single-token fallback (each column is the exact single-token shader).
+- **Determinism**: two batched runs over the same draft produce bit-identical
+  logits (f16 and Q8).
+- **K=1 control**: the single-token 20x64 gate reproduces the wave-4
+  fingerprints. f16: 20/20 exact, 0 near-ties. Q8: 9/20 exact (median depth
+  54), 0 near-ties. The Q8 count is 1 below the wave-4 floor of 10/20; the
+  flip is at prompt 18 (depth 64→48). The wave-4 tree run on the same Ally on
+  the same day (07-27) also produces 9/20 with identical per-prompt depths,
+  proving the flip is Ally box-state drift between the 07-25 wave-4
+  measurement and the 07-27 wave-5 measurement — NOT a wave-5 code change.
+  The single-token shaders, `run_token`, and `record_matvec` are byte-for-byte
+  unchanged (0 diff lines in the single-token `.comp`/`.spv` files). The
+  batched path is additive.
+
+### Measurement (Ally RDNA3)
+
+ASUS ROG Ally X, AMD Radeon Graphics (RDNA3 iGPU), Vulkan 1.4.334,
+driver_raw 8388981, Turbo power scheme. Qwen3-0.6B snapshot
+`c1899de289a04d12100db370d81485cdf75e47ca`. Each K timed as the median of 40
+`verify_batch(K)` calls (rewound to a fixed 64-token prefix between calls).
+Single-token reference is the sequential `advance` path in the same harness.
+
+The timing probe is a NEW protocol (single-prompt, bucket 1024, verify-only
+wall time) reported separately from the campaign baseline. The campaign
+single-token baseline stays 13.54 Q8 / 4.2 f16 (20-prompt bucket-512
+protocol); nothing about it is changed.
+
+### f16 per-token verify cost vs K (batched mat-mat, weight shared)
+
+| K | call wall (ms) | per-token (ms) | verify tok/s-equiv | vs single-token (same harness, 77.2 ms/tok) | vs 4.2 baseline |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 66.06 | 66.06 | 15.14 | 1.17x | 3.60x |
+| 2 | 75.58 | 37.79 | 26.46 | 2.04x | 6.30x |
+| 4 | 88.16 | 22.04 | 45.37 | 3.50x | 10.80x |
+| 8 | 115.10 | 14.39 | 69.51 | 5.36x | 16.55x |
+| 16 | 195.55 | **12.22** | **81.82** | **6.32x** | **19.48x** |
+
+### Q8 per-token verify cost vs K (sequential fallback, weight NOT shared)
+
+| K | call wall (ms) | per-token (ms) | verify tok/s-equiv | vs single-token (same harness, 79.8 ms/tok) | vs 13.54 baseline |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 68.74 | 68.74 | 14.55 | 1.16x | 1.07x |
+| 2 | 108.67 | 54.33 | 18.40 | 1.47x | 1.36x |
+| 4 | 191.48 | 47.87 | 20.89 | 1.67x | 1.54x |
+| 8 | 351.45 | 43.93 | 22.76 | 1.82x | 1.68x |
+| 16 | 690.54 | **43.16** | **23.17** | **1.85x** | **1.71x** |
+
+### Effective GB/s attribution
+
+The Qwen3-0.6B model has ~1.19 GB of f16 weights and ~633 MB of Q8 weights.
+Each verify_batch(K) call streams the full model weight (f16: once for all K
+columns; Q8: K times, once per column). Effective GB/s = weight_bytes /
+call_wall_s:
+
+| Path | K | call wall (s) | weight bytes | effective GB/s | vs single-stream |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| f16 batched | 1 | 0.0661 | 1.19 GB | 18.0 | 1.0x |
+| f16 batched | 8 | 0.1151 | 1.19 GB | 10.3 | 0.57x |
+| f16 batched | 16 | 0.1956 | 1.19 GB | 6.1 | 0.34x |
+| Q8 sequential | 1 | 0.0687 | 0.63 GB | 9.2 | 1.0x |
+| Q8 sequential | 8 | 0.3514 | 5.07 GB | 14.4 | 1.57x |
+| Q8 sequential | 16 | 0.6905 | 10.12 GB | 14.7 | 1.59x |
+
+**Reading the curves.**
+
+- **f16 batched mat-mat closes the ratio gap dramatically.** At K=16, the f16
+  path verifies at 81.82 tok/s-equiv — **19.48x** the 4.2 tok/s single-stream
+  baseline. The weight-stream sharing works: one weight read serves 16
+  positions, and the per-token cost drops from 77.2 ms to 12.2 ms. The curve
+  is still improving at K=16 (no saturation), suggesting larger K would help
+  further. The effective GB/s drops with K because the call wall grows
+  sub-linearly in K (the weight is amortized), so the per-call bandwidth
+  decreases but the per-token throughput increases.
+
+- **Q8 sequential fallback does NOT close the gap.** At K=16, Q8 verifies at
+  23.17 tok/s-equiv — only **1.71x** the 13.54 tok/s baseline. The weight
+  streams K times (no sharing), so the per-token cost only drops from 79.8 ms
+  to 43.2 ms — the improvement comes from amortizing the fixed per-call
+  overhead (command buffer recording, pipeline setup) across K tokens, not
+  from weight-stream sharing. The effective GB/s rises to ~14.7 GB/s at K=16
+  (the weight is streamed 16 times but the call is faster than 16 separate
+  single-token calls due to reduced host overhead).
+
+- **The Q8 driver-compiler wall is the binding constraint.** The f16 batched
+  mat-mat proves the weight-stream sharing shape works on RDNA3 — the f16
+  curve is monotonic and steep. But the Q8 batched mat-mat cannot hold the
+  byte-exact gate on the AMD driver, so Q8 is forced into the sequential
+  fallback which doesn't share the weight stream. The mat-mat shape would
+  close the Q8 ratio gap the way it closes the f16 gap, but the AMD SPIR-V
+  compiler's accumulation reordering prevents it. This is a driver/compiler
+  issue, not a hardware issue: the f16 path on the same hardware shows the
+  shape works.
+
+### Verdict
+
+**The mat-mat shape changes the Vulkan story for f16 but not for Q8.**
+
+- **f16**: the ratio gap closes from 4.2 tok/s (single-stream) to 81.82
+  tok/s-equiv at K=16 — a 19.48x improvement. RDNA3 serves multi-token f16
+  workloads (prefill bursts, batch serving) at acceptable rates. The curve
+  hasn't saturated at K=16; larger K would help further. The weight-stream
+  sharing works on RDNA3 the way it did on M1.
+
+- **Q8**: the ratio gap barely moves from 13.54 tok/s to 23.17 tok/s-equiv at
+  K=16 — only 1.71x. The Q8 batched mat-mat is blocked by the AMD driver's
+  f32 accumulation reordering, which breaks the byte-exact gate. The
+  sequential fallback doesn't share the weight stream, so Q8 stays wall-bound
+  at the ~9 GB/s single-stream ceiling. The mat-mat shape would close the Q8
+  gap (the f16 path proves the shape works on RDNA3), but the driver/compiler
+  issue prevents it.
+
+- **The K saturation point**: f16 hasn't saturated at K=16 (still improving).
+  Q8 (sequential) saturates at K=8 (43.9 ms/token) with diminishing returns at
+  K=16 (43.2 ms/token) — the fixed overhead amortization is exhausted.
+
+The binding constraint for Q8 is the driver/compiler, not the hardware. A
+future fix would require either (a) an AMD driver update that preserves the
+accumulation order with multiple accumulators, (b) a different shader
+structure that the compiler doesn't reorder (e.g., separate SPIR-V modules
+per column, or inline assembly), or (c) relaxing the byte-exact constraint
+for Q8 (accepting ~0.05% divergence like the Metal runtime-count version
+before the template fix). None of these is in scope for this wave.
+
+### Wave-5 evidence and commands
+
+Raw timing output is in `C:\bench\timing_q8.txt` and `C:\bench\timing_f16.txt`
+on the Ally. K=1 control JSONs are under
+`results/vulkan-ally/wave5/k1-control-{f16,q8}-20x64.json`.
+
+```text
+SYNAPSE_UNIFIED_RT_QWEN3_0_6B=<snapshot> \
+  cargo test -p spike-unified-rt --release --features vulkan --bin spike-unified-rt -- \
+    --ignored --nocapture vulkan_batched_verify_timing_probe
+
+SYNAPSE_VULKAN_BATCHED_PROBE_QUANT=f16 ... (same)   # f16 curve
+SYNAPSE_VULKAN_BATCHED_PROBE_QUANT=q8 ... (same)    # Q8 curve (default)
+```

@@ -1,0 +1,64 @@
+#version 460
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+
+#extension GL_KHR_shader_subgroup_basic : require
+
+// Wave 5 Q8 batched fallback: a column-offset variant of the single-token Q8
+// matvec. The AMD RDNA3 driver's shader compiler reorders the f32
+// accumulation when multiple column accumulators are present in the batched
+// mat-mat shader (even with scalar registers and identical per-column
+// operation order), breaking the byte-exact gate at K>=2. This shader is the
+// single-token Q8 matvec with a column offset added to the input/output
+// indices, so the batched Q8 path dispatches it K times (one per column)
+// within the same command buffer. Each dispatch is bit-identical to the
+// single-token path by construction. The weight streams K times (no sharing),
+// which is the honest Q8 K-curve on RDNA3.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0, scalar) readonly buffer Input { uvec2 values[]; } input_values;
+layout(set = 0, binding = 1, scalar) readonly buffer Weight { uint16_t values[]; } weight_values;
+layout(set = 0, binding = 2, scalar) writeonly buffer Output { float values[]; } output_values;
+layout(push_constant) uniform Params { uint rows; uint columns; uint in_offset; uint out_offset; } p;
+
+void main() {
+    uint subgroups_per_workgroup = 64u / gl_SubgroupSize;
+    uint subgroup = gl_WorkGroupID.x * subgroups_per_workgroup + gl_SubgroupID;
+    uint lane = gl_SubgroupInvocationID;
+    if (lane >= 4u) return;
+
+    uint row = subgroup * 4u + lane;
+    if (row >= p.rows) return;
+    float sum = 0.0;
+    uint blocks = p.columns / 32;
+    uint block_base = row * blocks * 17;
+    uint input_vec = p.in_offset;
+    for (uint block = 0; block < blocks; ++block) {
+        float scale = unpackHalf2x16(uint(weight_values.values[block_base])).x;
+        uint wptr = block_base + 1;
+        for (uint group = 0; group < 8; ++group) {
+            uint packed0 = uint(weight_values.values[wptr]);
+            uint packed1 = uint(weight_values.values[wptr + 1]);
+            int q0 = int(packed0 & 0xFFu);
+            if (q0 >= 128) q0 -= 256;
+            int q1 = int((packed0 >> 8) & 0xFFu);
+            if (q1 >= 128) q1 -= 256;
+            int q2 = int(packed1 & 0xFFu);
+            if (q2 >= 128) q2 -= 256;
+            int q3 = int((packed1 >> 8) & 0xFFu);
+            if (q3 >= 128) q3 -= 256;
+            uvec2 xv = input_values.values[input_vec];
+            vec2 x01 = unpackHalf2x16(xv.x);
+            vec2 x23 = unpackHalf2x16(xv.y);
+            sum += scale * float(q0) * x01.x;
+            sum += scale * float(q1) * x01.y;
+            sum += scale * float(q2) * x23.x;
+            sum += scale * float(q3) * x23.y;
+            wptr += 2;
+            input_vec += 1;
+        }
+        block_base += 17;
+    }
+    output_values.values[p.out_offset + row] = sum;
+}
