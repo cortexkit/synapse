@@ -1549,6 +1549,68 @@ mod tests {
         );
     }
 
+    /// Single-stream decode throughput cell (run in `--release`). For each prompt
+    /// it prefills (untimed) then times one chained 64-token greedy decode -- the
+    /// sustained step-engine decode rate, comparable to the `Decode tok/s` column
+    /// of LFM2-DECODE-BASELINES.md (owned MPSGraph f16 6.345, llama.cpp Metal F16
+    /// 130.74, Q8_0 203.65 on this rig). Reports the median over the twenty
+    /// prompts x two repeats plus min/max and warm ms/token. This is the
+    /// authoritative number only on the locked M1 (see LFM2-METAL-STEP.md stage
+    /// C); on the M5 build host it is advisory. Run with:
+    ///
+    /// ```text
+    /// SYNAPSE_UNIFIED_RT_LFM2_1_2B=<snapshot> cargo test -p spike-unified-rt \
+    ///     --release hybrid_step_timing_probe -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn hybrid_step_timing_probe() {
+        let (_path, model, tokenizer) = load_lfm2_checkpoint();
+        let prompts = decode_prompt_set();
+        let mut engine = Lfm2HybridStepEngine::new(&model, 2048).expect("hybrid engine");
+        const MAX_TOKENS: usize = 64;
+        const REPEATS: usize = 2;
+
+        // One timed sample: reset caches, prefill the prompt (untimed), then time
+        // a chained 64-token greedy decode. The rate is the chained-step decode
+        // rate (MAX_TOKENS decode steps), excluding prefill, matching the
+        // baselines' decode column.
+        let mut sample = |prompt: &str| -> f64 {
+            engine.reset().expect("reset");
+            let prompt_ids = model
+                .encode_generation(&tokenizer, prompt, 2048)
+                .expect("encode prompt");
+            let first = engine.prefill(&prompt_ids).expect("prefill");
+            let position = prompt_ids.len();
+            let started = std::time::Instant::now();
+            let tokens = engine.chain(position, MAX_TOKENS, first).expect("chain");
+            let elapsed = started.elapsed().as_secs_f64();
+            assert_eq!(tokens.len(), MAX_TOKENS, "chain produced a partial decode");
+            MAX_TOKENS as f64 / elapsed
+        };
+
+        // Uncounted warmup so pipeline setup and thermals are steady before timing.
+        let _ = sample(&prompts[0].1);
+
+        let mut rates = Vec::with_capacity(prompts.len() * REPEATS);
+        for repeat in 0..REPEATS {
+            for (id, prompt) in &prompts {
+                let rate = sample(prompt);
+                println!("[timing] repeat {repeat} {id}: {rate:.2} tok/s");
+                rates.push(rate);
+            }
+        }
+        rates.sort_by(|a, b| a.partial_cmp(b).expect("finite rate"));
+        let median = rates[rates.len() / 2];
+        let min = rates[0];
+        let max = rates[rates.len() - 1];
+        println!(
+            "[timing] LFM2-1.2B owned Metal step f16: median {median:.2} tok/s (min {min:.2}, max {max:.2}), {:.2} ms/token warm, {} samples",
+            1000.0 / median,
+            rates.len()
+        );
+    }
+
     /// Bisection probe for a divergent prompt: feed BOTH the Metal engine and the
     /// lfm2.rs CPU reference the SAME token sequence (the CPU greedy sequence)
     /// position by position, and compare the per-position logits/argmax. The
