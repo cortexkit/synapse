@@ -138,6 +138,20 @@ Regression guard: the existing CPU-reference test
 `lfm2::tests::causal_conv_uses_unflipped_cross_correlation_taps` still passes,
 and the Qwen3 metallib compile line is unchanged.
 
+**Real production weights.** A fourth, checkpoint-gated test
+(`conv_step_matches_cpu_on_real_lfm2_1_2b_conv_weights`, `#[ignore]` + env var
+like the Qwen3 real-model gates) loads the actual LFM2-1.2B snapshot, takes a
+real conv layer's depthwise weights, and re-runs the bit-exact comparison against
+the CPU reference. It passes, confirming the production weights flow through the
+kernel identically (not just synthetic values at real dims):
+
+```
+$ SYNAPSE_UNIFIED_RT_LFM2_1_2B=<snapshot> cargo test -p spike-unified-rt \
+    conv_step_matches_cpu_on_real -- --ignored
+test lfm2_decode_metal_step::tests::conv_step_matches_cpu_on_real_lfm2_1_2b_conv_weights ... ok
+test result: ok. 1 passed; 0 failed
+```
+
 ### The fast-math / FMA finding (important for all follow-up Metal work)
 
 The first cut of the gate failed at step 1 (step 0 passed). Metal compiles with
@@ -192,6 +206,8 @@ measurement**; the authoritative number comes from follow-up D on the M1.
   gate) is bit-identical to `lfm2.rs::decode_conv` and deterministic at the
   production dims, with a device-resident rolling cache that matches the CPU
   state after a multi-step run.
+- The same bit-identity holds for the **actual LFM2-1.2B conv weights** loaded
+  from the production snapshot (checkpoint-gated test), not only synthetic values.
 - The conv-cache model (resident rolling window, in-place advance, read/write
   hooks) is in place and does not preclude rewind.
 - The build wiring is additive; the Qwen3 path is untouched and still compiles.

@@ -358,4 +358,69 @@ mod tests {
             "conv cache round-trip mismatch"
         );
     }
+
+    /// Real-checkpoint gate: the actual LFM2-1.2B convolution weights flow through
+    /// the step kernel bit-exactly. It loads the production snapshot, takes a real
+    /// conv layer's depthwise weights, and runs the kernel against the lfm2.rs CPU
+    /// reference with deterministic synthetic activations. This validates the
+    /// real-weight path (and the model-load plumbing) that the end-to-end decoder
+    /// builds on. Gated on the checkpoint like the Qwen3 real-model gates, so the
+    /// default suite stays checkpoint-free.
+    #[test]
+    #[ignore]
+    fn conv_step_matches_cpu_on_real_lfm2_1_2b_conv_weights() {
+        use crate::lfm2::{Mixer, Model};
+        use crate::Precision;
+        let path = std::path::PathBuf::from(
+            std::env::var_os("SYNAPSE_UNIFIED_RT_LFM2_1_2B")
+                .expect("set SYNAPSE_UNIFIED_RT_LFM2_1_2B to the LFM2-1.2B snapshot directory"),
+        );
+        let model = Model::load(&path, Precision::F16).expect("load LFM2-1.2B");
+        assert_eq!(
+            model.config.hidden_size, HIDDEN,
+            "real LFM2-1.2B hidden size"
+        );
+        let conv = model
+            .layers
+            .iter()
+            .find_map(|layer| match &layer.mixer {
+                Mixer::Conv(conv) => Some(conv),
+                _ => None,
+            })
+            .expect("LFM2-1.2B has a convolution layer");
+        assert_eq!(
+            conv.kernel_size, KERNEL_SIZE,
+            "real LFM2-1.2B conv kernel size"
+        );
+        let conv_weight = conv.conv_weight.data.clone();
+        assert_eq!(
+            conv_weight.len(),
+            HIDDEN * KERNEL_SIZE,
+            "real conv weight length"
+        );
+
+        let mut rng = Rng(0x9e37_79b9);
+        let mut cpu = CpuProvider::platform_for_test();
+        let mut engine = Lfm2ConvStepEngine::new(HIDDEN, KERNEL_SIZE, &[conv_weight.as_slice()])
+            .expect("engine");
+        let mut cpu_state = vec![0.0f32; KERNEL_SIZE * HIDDEN];
+        let steps = 8;
+        for step in 0..steps {
+            let product = rng.fill(HIDDEN);
+            let gate = rng.fill(HIDDEN);
+            let expected = cpu_conv_step(&mut cpu, &mut cpu_state, &product, &gate, &conv_weight);
+            let actual = engine.step(0, &product, &gate).expect("metal step");
+            assert_eq!(
+                f32_bits(&actual),
+                f32_bits(&expected),
+                "real-weight conv step {step} diverged from the CPU reference"
+            );
+        }
+        let metal_cache = engine.read_cache(0).expect("read cache");
+        assert_eq!(
+            f32_bits(&metal_cache),
+            f32_bits(&cpu_state),
+            "real-weight conv cache diverged from the CPU rolling state"
+        );
+    }
 }
