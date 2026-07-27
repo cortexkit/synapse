@@ -2,6 +2,7 @@
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
 
 #extension GL_KHR_shader_subgroup_basic : require
 
@@ -9,9 +10,20 @@
 // in each subgroup own four complete rows; every row's f32 dot remains one
 // serial left-to-right accumulation. The fixed 64-invocation workgroup handles
 // both RDNA3 wave32 (two four-row subgroups) and wave64 (one four-row subgroup).
+//
+// Wave 4 seam 1: vectorized loads. A 34-byte block does not align to 4 or 16
+// (its int8 payload starts at byte 2), so the weight is viewed as uint16 rather
+// than uvec4: each block is exactly 17 uint16 words (one f16 scale word plus 16
+// words that each pack two little-endian int8). uint16 needs only 2-byte
+// alignment, which the byte-2 payload always satisfies, so no unsafe misaligned
+// wide load and no layout repack. Activations are viewed as uvec2 (four halves
+// per 8-byte load) and expanded with unpackHalf2x16, which widens each half to
+// f32 exactly like the scalar float(half) conversion. Every quantized byte is
+// still sign extended, widened to f32, and accumulated as scale*q*x in ascending
+// column order, so the dot stays bit-identical to the scalar wave-3 kernel.
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
-layout(set = 0, binding = 0, scalar) readonly buffer Input { float16_t values[]; } input_values;
-layout(set = 0, binding = 1, scalar) readonly buffer Weight { uint8_t values[]; } weight_values;
+layout(set = 0, binding = 0, scalar) readonly buffer Input { uvec2 values[]; } input_values;
+layout(set = 0, binding = 1, scalar) readonly buffer Weight { uint16_t values[]; } weight_values;
 layout(set = 0, binding = 2, scalar) writeonly buffer Output { float values[]; } output_values;
 layout(push_constant) uniform Params { uint rows; uint columns; uint unused0; uint unused1; } p;
 
@@ -26,13 +38,29 @@ void main() {
     float sum = 0.0;
     uint blocks = p.columns / 32;
     for (uint block = 0; block < blocks; ++block) {
-        uint offset = (row * blocks + block) * 34;
-        uint scale_bits = uint(weight_values.values[offset]) | (uint(weight_values.values[offset + 1]) << 8);
-        float scale = unpackHalf2x16(scale_bits).x;
-        for (uint column = 0; column < 32; ++column) {
-            int quantized = int(weight_values.values[offset + 2 + column]);
-            if (quantized >= 128) quantized -= 256;
-            sum += scale * float(quantized) * float(input_values.values[block * 32 + column]);
+        // 17 uint16 words per block: word 0 is the f16 scale, words 1..16 pack
+        // the 32 int8 payloads two per word.
+        uint base16 = (row * blocks + block) * 17;
+        float scale = unpackHalf2x16(uint(weight_values.values[base16])).x;
+        uint input_vec = block * 8;
+        for (uint group = 0; group < 8; ++group) {
+            uint packed0 = uint(weight_values.values[base16 + 1 + 2 * group]);
+            uint packed1 = uint(weight_values.values[base16 + 2 + 2 * group]);
+            int q0 = int(packed0 & 0xFFu);
+            if (q0 >= 128) q0 -= 256;
+            int q1 = int((packed0 >> 8) & 0xFFu);
+            if (q1 >= 128) q1 -= 256;
+            int q2 = int(packed1 & 0xFFu);
+            if (q2 >= 128) q2 -= 256;
+            int q3 = int((packed1 >> 8) & 0xFFu);
+            if (q3 >= 128) q3 -= 256;
+            uvec2 xv = input_values.values[input_vec + group];
+            vec2 x01 = unpackHalf2x16(xv.x);
+            vec2 x23 = unpackHalf2x16(xv.y);
+            sum += scale * float(q0) * x01.x;
+            sum += scale * float(q1) * x01.y;
+            sum += scale * float(q2) * x23.x;
+            sum += scale * float(q3) * x23.y;
         }
     }
     output_values.values[row] = sum;

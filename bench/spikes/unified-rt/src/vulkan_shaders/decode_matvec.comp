@@ -5,9 +5,18 @@
 // One invocation owns one output row so every f32 dot-product accumulation
 // follows a fixed left-to-right order. Decode parity must not use reductions
 // that reassociate a single row's sum.
+//
+// Wave 4 seam 1: vectorized loads. The f16 weight and activation buffers are
+// viewed as uvec2 (two uint32 = four halves per 8-byte load) and each uint32 is
+// expanded with unpackHalf2x16, which widens a half's bits to f32 exactly as the
+// scalar float(half) conversion does. The products are still formed in f32 and
+// added in ascending column order, so the dot stays bit-identical to the scalar
+// wave-1 kernel; only the load width changes. Columns are a multiple of four for
+// every Qwen3 matvec (hidden 1024, intermediate 3072), matching the Q8 shader's
+// no-tail convention.
 layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
-layout(set = 0, binding = 0, scalar) readonly buffer Input { float16_t values[]; } input_values;
-layout(set = 0, binding = 1, scalar) readonly buffer Weight { float16_t values[]; } weight_values;
+layout(set = 0, binding = 0, scalar) readonly buffer Input { uvec2 values[]; } input_values;
+layout(set = 0, binding = 1, scalar) readonly buffer Weight { uvec2 values[]; } weight_values;
 layout(set = 0, binding = 2, scalar) writeonly buffer Output { float values[]; } output_values;
 layout(push_constant) uniform Params { uint rows; uint columns; uint unused0; uint unused1; } p;
 
@@ -15,9 +24,19 @@ void main() {
     uint row = gl_WorkGroupID.x;
     if (row >= p.rows) return;
     float sum = 0.0;
-    uint base = row * p.columns;
-    for (uint column = 0; column < p.columns; ++column) {
-        sum += float(weight_values.values[base + column]) * float(input_values.values[column]);
+    uint vecs = p.columns >> 2;          // four halves per uvec2
+    uint base = row * vecs;
+    for (uint v = 0; v < vecs; ++v) {
+        uvec2 weight = weight_values.values[base + v];
+        uvec2 xv = input_values.values[v];
+        vec2 w01 = unpackHalf2x16(weight.x);
+        vec2 w23 = unpackHalf2x16(weight.y);
+        vec2 x01 = unpackHalf2x16(xv.x);
+        vec2 x23 = unpackHalf2x16(xv.y);
+        sum += w01.x * x01.x;
+        sum += w01.y * x01.y;
+        sum += w23.x * x23.x;
+        sum += w23.y * x23.y;
     }
     output_values.values[row] = sum;
 }
