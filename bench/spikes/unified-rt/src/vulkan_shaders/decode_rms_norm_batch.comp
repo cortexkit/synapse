@@ -1,0 +1,48 @@
+#version 460
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+
+// Wave 5 batched RMSNorm: one subgroup owns one (row, column) pair. Each
+// column's square-sum is computed serially by invocation 0 (the exact
+// ascending order of decode_rms_norm), the inverse norm is broadcast, and
+// the independent per-element scale/store is split across the subgroup. The
+// column count K is a specialization constant so the per-column work is
+// unrolled at pipeline creation. The fixed 64-invocation workgroup handles
+// both RDNA3 wave32 and wave64.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0, scalar) readonly buffer Input { float16_t values[]; } input_values;
+layout(set = 0, binding = 1, scalar) readonly buffer Weight { float values[]; } weight_values;
+layout(set = 0, binding = 2, scalar) writeonly buffer Output { float16_t values[]; } output_values;
+layout(push_constant) uniform Params { uint rows; uint width; float epsilon; uint batch; } p;
+
+layout(constant_id = 0) const uint K = 1;
+
+void main() {
+    uint rows_per_workgroup = 64u / gl_SubgroupSize;
+    uint row = gl_WorkGroupID.x * rows_per_workgroup + gl_SubgroupID;
+    if (row >= p.rows) return;
+    uint lane = gl_SubgroupInvocationID;
+
+    for (uint k = 0; k < K; ++k) {
+        if (k >= p.batch) continue;
+        uint base = (k * p.rows + row) * p.width;
+        float inverse = 0.0;
+        if (lane == 0) {
+            float square = 0.0;
+            for (uint column = 0; column < p.width; ++column) {
+                float value = float(input_values.values[base + column]);
+                square += value * value;
+            }
+            inverse = inversesqrt(square / float(p.width) + p.epsilon);
+        }
+        inverse = subgroupBroadcast(inverse, 0);
+        for (uint column = lane; column < p.width; column += gl_SubgroupSize) {
+            uint index = base + column;
+            output_values.values[index] = float16_t(
+                float(input_values.values[index]) * inverse * weight_values.values[column]
+            );
+        }
+    }
+}

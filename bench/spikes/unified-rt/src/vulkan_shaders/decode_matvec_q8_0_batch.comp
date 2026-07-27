@@ -1,0 +1,254 @@
+#version 460
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+
+#extension GL_KHR_shader_subgroup_basic : require
+
+// Wave 5 batched mat-mat (Q8_0): one weight-row read feeds K column dot
+// products. This is the Vulkan port of the Metal batched-verify Q8 mat-mat
+// kernels (BATCHED-VERIFY.md). The column count K is a SPECIALIZATION
+// CONSTANT so the driver specializes it at pipeline creation; the K
+// accumulators stay register-resident and each column's accumulation keeps
+// the exact ascending block/element order of the K=1 decode_matvec_q8_0
+// shader. A runtime column count would spill the accumulators and let the
+// compiler fold products before adding them to the running sum — the same
+// reordering that broke the Metal byte-exact gate before the template fix.
+//
+// The accumulators are declared as explicit scalars per K branch (not an
+// array indexed by a loop variable) so the glslc compiler keeps them in
+// registers and preserves the single-token accumulation order.
+//
+// Q8_0 blocks are [f16 scale, 32 signed bytes] = 17 uint16 words. The weight
+// is viewed as uint16 (2-byte alignment, satisfied by the byte-2 payload).
+// Activations are viewed as uvec2 (four halves per 8-byte load) and expanded
+// with unpackHalf2x16, which widens each half to f32 exactly like the scalar
+// float(half) conversion. Products are formed in f32 and added in ascending
+// column order, so each column's dot stays bit-identical to the K=1 path.
+//
+// The fixed 64-invocation workgroup handles both RDNA3 wave32 (two four-row
+// subgroups) and wave64 (one four-row subgroup). Four independent
+// invocations in each subgroup own four complete output rows; every row's K
+// dot products remain serial left-to-right f32 accumulations.
+//
+// Exactness law: batching parallelizes ACROSS K columns (independent
+// reductions); it never reorders the accumulation WITHIN one dot product.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0, scalar) readonly buffer Input { uvec2 values[]; } input_values;
+layout(set = 0, binding = 1, scalar) readonly buffer Weight { uint16_t values[]; } weight_values;
+layout(set = 0, binding = 2, scalar) writeonly buffer Output { float values[]; } output_values;
+layout(push_constant) uniform Params { uint rows; uint columns; uint batch; uint unused; } p;
+
+layout(constant_id = 0) const uint K = 1;
+
+void main() {
+    uint subgroups_per_workgroup = 64u / gl_SubgroupSize;
+    uint subgroup = gl_WorkGroupID.x * subgroups_per_workgroup + gl_SubgroupID;
+    uint lane = gl_SubgroupInvocationID;
+    if (lane >= 4u) return;
+
+    uint row = subgroup * 4u + lane;
+    if (row >= p.rows) return;
+
+    float s0 = 0.0;
+    float s1 = 0.0;
+    float s2 = 0.0;
+    float s3 = 0.0;
+    float s4 = 0.0;
+    float s5 = 0.0;
+    float s6 = 0.0;
+    float s7 = 0.0;
+    float s8 = 0.0;
+    float s9 = 0.0;
+    float s10 = 0.0;
+    float s11 = 0.0;
+    float s12 = 0.0;
+    float s13 = 0.0;
+    float s14 = 0.0;
+    float s15 = 0.0;
+
+    uint blocks = p.columns / 32;
+    uint block_base = row * blocks * 17;
+    for (uint block = 0; block < blocks; ++block) {
+        float scale = unpackHalf2x16(uint(weight_values.values[block_base])).x;
+        uint wptr = block_base + 1;
+        uint input_vec = 0;
+        for (uint group = 0; group < 8; ++group) {
+            uint packed0 = uint(weight_values.values[wptr]);
+            uint packed1 = uint(weight_values.values[wptr + 1]);
+            int q0 = int(packed0 & 0xFFu);
+            if (q0 >= 128) q0 -= 256;
+            int q1 = int((packed0 >> 8) & 0xFFu);
+            if (q1 >= 128) q1 -= 256;
+            int q2 = int(packed1 & 0xFFu);
+            if (q2 >= 128) q2 -= 256;
+            int q3 = int((packed1 >> 8) & 0xFFu);
+            if (q3 >= 128) q3 -= 256;
+            if (K >= 1) {
+                uvec2 xv = input_values.values[0 * blocks * 8 + input_vec];
+                vec2 x01 = unpackHalf2x16(xv.x);
+                vec2 x23 = unpackHalf2x16(xv.y);
+                s0 += scale * float(q0) * x01.x;
+                s0 += scale * float(q1) * x01.y;
+                s0 += scale * float(q2) * x23.x;
+                s0 += scale * float(q3) * x23.y;
+            }
+            if (K >= 2) {
+                uvec2 xv = input_values.values[1 * blocks * 8 + input_vec];
+                vec2 x01 = unpackHalf2x16(xv.x);
+                vec2 x23 = unpackHalf2x16(xv.y);
+                s1 += scale * float(q0) * x01.x;
+                s1 += scale * float(q1) * x01.y;
+                s1 += scale * float(q2) * x23.x;
+                s1 += scale * float(q3) * x23.y;
+            }
+            if (K >= 3) {
+                uvec2 xv = input_values.values[2 * blocks * 8 + input_vec];
+                vec2 x01 = unpackHalf2x16(xv.x);
+                vec2 x23 = unpackHalf2x16(xv.y);
+                s2 += scale * float(q0) * x01.x;
+                s2 += scale * float(q1) * x01.y;
+                s2 += scale * float(q2) * x23.x;
+                s2 += scale * float(q3) * x23.y;
+            }
+            if (K >= 4) {
+                uvec2 xv = input_values.values[3 * blocks * 8 + input_vec];
+                vec2 x01 = unpackHalf2x16(xv.x);
+                vec2 x23 = unpackHalf2x16(xv.y);
+                s3 += scale * float(q0) * x01.x;
+                s3 += scale * float(q1) * x01.y;
+                s3 += scale * float(q2) * x23.x;
+                s3 += scale * float(q3) * x23.y;
+            }
+            if (K >= 5) {
+                uvec2 xv = input_values.values[4 * blocks * 8 + input_vec];
+                vec2 x01 = unpackHalf2x16(xv.x);
+                vec2 x23 = unpackHalf2x16(xv.y);
+                s4 += scale * float(q0) * x01.x;
+                s4 += scale * float(q1) * x01.y;
+                s4 += scale * float(q2) * x23.x;
+                s4 += scale * float(q3) * x23.y;
+            }
+            if (K >= 6) {
+                uvec2 xv = input_values.values[5 * blocks * 8 + input_vec];
+                vec2 x01 = unpackHalf2x16(xv.x);
+                vec2 x23 = unpackHalf2x16(xv.y);
+                s5 += scale * float(q0) * x01.x;
+                s5 += scale * float(q1) * x01.y;
+                s5 += scale * float(q2) * x23.x;
+                s5 += scale * float(q3) * x23.y;
+            }
+            if (K >= 7) {
+                uvec2 xv = input_values.values[6 * blocks * 8 + input_vec];
+                vec2 x01 = unpackHalf2x16(xv.x);
+                vec2 x23 = unpackHalf2x16(xv.y);
+                s6 += scale * float(q0) * x01.x;
+                s6 += scale * float(q1) * x01.y;
+                s6 += scale * float(q2) * x23.x;
+                s6 += scale * float(q3) * x23.y;
+            }
+            if (K >= 8) {
+                uvec2 xv = input_values.values[7 * blocks * 8 + input_vec];
+                vec2 x01 = unpackHalf2x16(xv.x);
+                vec2 x23 = unpackHalf2x16(xv.y);
+                s7 += scale * float(q0) * x01.x;
+                s7 += scale * float(q1) * x01.y;
+                s7 += scale * float(q2) * x23.x;
+                s7 += scale * float(q3) * x23.y;
+            }
+            if (K >= 9) {
+                uvec2 xv = input_values.values[8 * blocks * 8 + input_vec];
+                vec2 x01 = unpackHalf2x16(xv.x);
+                vec2 x23 = unpackHalf2x16(xv.y);
+                s8 += scale * float(q0) * x01.x;
+                s8 += scale * float(q1) * x01.y;
+                s8 += scale * float(q2) * x23.x;
+                s8 += scale * float(q3) * x23.y;
+            }
+            if (K >= 10) {
+                uvec2 xv = input_values.values[9 * blocks * 8 + input_vec];
+                vec2 x01 = unpackHalf2x16(xv.x);
+                vec2 x23 = unpackHalf2x16(xv.y);
+                s9 += scale * float(q0) * x01.x;
+                s9 += scale * float(q1) * x01.y;
+                s9 += scale * float(q2) * x23.x;
+                s9 += scale * float(q3) * x23.y;
+            }
+            if (K >= 11) {
+                uvec2 xv = input_values.values[10 * blocks * 8 + input_vec];
+                vec2 x01 = unpackHalf2x16(xv.x);
+                vec2 x23 = unpackHalf2x16(xv.y);
+                s10 += scale * float(q0) * x01.x;
+                s10 += scale * float(q1) * x01.y;
+                s10 += scale * float(q2) * x23.x;
+                s10 += scale * float(q3) * x23.y;
+            }
+            if (K >= 12) {
+                uvec2 xv = input_values.values[11 * blocks * 8 + input_vec];
+                vec2 x01 = unpackHalf2x16(xv.x);
+                vec2 x23 = unpackHalf2x16(xv.y);
+                s11 += scale * float(q0) * x01.x;
+                s11 += scale * float(q1) * x01.y;
+                s11 += scale * float(q2) * x23.x;
+                s11 += scale * float(q3) * x23.y;
+            }
+            if (K >= 13) {
+                uvec2 xv = input_values.values[12 * blocks * 8 + input_vec];
+                vec2 x01 = unpackHalf2x16(xv.x);
+                vec2 x23 = unpackHalf2x16(xv.y);
+                s12 += scale * float(q0) * x01.x;
+                s12 += scale * float(q1) * x01.y;
+                s12 += scale * float(q2) * x23.x;
+                s12 += scale * float(q3) * x23.y;
+            }
+            if (K >= 14) {
+                uvec2 xv = input_values.values[13 * blocks * 8 + input_vec];
+                vec2 x01 = unpackHalf2x16(xv.x);
+                vec2 x23 = unpackHalf2x16(xv.y);
+                s13 += scale * float(q0) * x01.x;
+                s13 += scale * float(q1) * x01.y;
+                s13 += scale * float(q2) * x23.x;
+                s13 += scale * float(q3) * x23.y;
+            }
+            if (K >= 15) {
+                uvec2 xv = input_values.values[14 * blocks * 8 + input_vec];
+                vec2 x01 = unpackHalf2x16(xv.x);
+                vec2 x23 = unpackHalf2x16(xv.y);
+                s14 += scale * float(q0) * x01.x;
+                s14 += scale * float(q1) * x01.y;
+                s14 += scale * float(q2) * x23.x;
+                s14 += scale * float(q3) * x23.y;
+            }
+            if (K >= 16) {
+                uvec2 xv = input_values.values[15 * blocks * 8 + input_vec];
+                vec2 x01 = unpackHalf2x16(xv.x);
+                vec2 x23 = unpackHalf2x16(xv.y);
+                s15 += scale * float(q0) * x01.x;
+                s15 += scale * float(q1) * x01.y;
+                s15 += scale * float(q2) * x23.x;
+                s15 += scale * float(q3) * x23.y;
+            }
+            wptr += 2;
+            input_vec += 1;
+        }
+        block_base += 17;
+    }
+
+    if (K >= 1 && 0 < p.batch) output_values.values[0 * p.rows + row] = s0;
+    if (K >= 2 && 1 < p.batch) output_values.values[1 * p.rows + row] = s1;
+    if (K >= 3 && 2 < p.batch) output_values.values[2 * p.rows + row] = s2;
+    if (K >= 4 && 3 < p.batch) output_values.values[3 * p.rows + row] = s3;
+    if (K >= 5 && 4 < p.batch) output_values.values[4 * p.rows + row] = s4;
+    if (K >= 6 && 5 < p.batch) output_values.values[5 * p.rows + row] = s5;
+    if (K >= 7 && 6 < p.batch) output_values.values[6 * p.rows + row] = s6;
+    if (K >= 8 && 7 < p.batch) output_values.values[7 * p.rows + row] = s7;
+    if (K >= 9 && 8 < p.batch) output_values.values[8 * p.rows + row] = s8;
+    if (K >= 10 && 9 < p.batch) output_values.values[9 * p.rows + row] = s9;
+    if (K >= 11 && 10 < p.batch) output_values.values[10 * p.rows + row] = s10;
+    if (K >= 12 && 11 < p.batch) output_values.values[11 * p.rows + row] = s11;
+    if (K >= 13 && 12 < p.batch) output_values.values[12 * p.rows + row] = s12;
+    if (K >= 14 && 13 < p.batch) output_values.values[13 * p.rows + row] = s13;
+    if (K >= 15 && 14 < p.batch) output_values.values[14 * p.rows + row] = s14;
+    if (K >= 16 && 15 < p.batch) output_values.values[15 * p.rows + row] = s15;
+}

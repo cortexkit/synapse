@@ -1,0 +1,21 @@
+#version 460
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_scalar_block_layout : require
+
+// Wave 5 batched residual add. Each invocation handles one (column, element)
+// pair. The projected buffer is laid out [K][count] of f32; the residual
+// buffer is [K][count] of f16; the output is [K][count] of f16.
+layout(local_size_x = 256) in;
+layout(set=0,binding=0,scalar) readonly buffer Projected { float values[]; } projected;
+layout(set=0,binding=1,scalar) readonly buffer Residual { float16_t values[]; } residual;
+layout(set=0,binding=2,scalar) writeonly buffer Output { float16_t values[]; } output_values;
+layout(push_constant) uniform Params { uint count; uint batch; uint unused0; uint unused1; } p;
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= p.count) return;
+    for (uint k = 0; k < p.batch; ++k) {
+        uint offset = k * p.count + index;
+        output_values.values[offset] = float16_t(projected.values[offset] + float(residual.values[offset]));
+    }
+}

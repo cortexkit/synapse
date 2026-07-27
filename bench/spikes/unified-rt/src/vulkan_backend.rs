@@ -835,6 +835,121 @@ mod enabled {
         }
     }
 
+    /// Wave-5 batched mat-mat pipelines. The four mat-mat shaders (f16 and Q8)
+    /// are specialized per K in {1,2,4,8,16} so the K accumulators stay
+    /// register-resident; the pointwise batched shaders (RMSNorm, head-norm+
+    /// RoPE, value-cache, attention, add_residual, swiglu) read K from a push
+    /// constant and are shared across K. `decode_matvec_q8_0_batch` is only
+    /// created when the device supports shader int8.
+    struct BatchedPipelines {
+        matvec_f16: [vk::Pipeline; 5],          // K in {1,2,4,8,16}
+        matvec_q8_0: Option<[vk::Pipeline; 5]>, // K in {1,2,4,8,16}
+        /// Column-offset Q8 matvec for the batched fallback (K sequential
+        /// single-token dispatches). Only created when shader int8 is
+        /// supported.
+        matvec_q8_0_column: Option<vk::Pipeline>,
+        rms_norm: vk::Pipeline,
+        head_norm_rope: vk::Pipeline,
+        value_cache: vk::Pipeline,
+        attention: vk::Pipeline,
+        add_residual: vk::Pipeline,
+        swiglu: vk::Pipeline,
+    }
+
+    impl BatchedPipelines {
+        fn create(state: &DeviceState) -> Result<Self> {
+            // Specialize the mat-mat shaders for K in {1,2,4,8,16}. The index
+            // maps to the power-of-two column count: 0->1, 1->2, 2->4, 3->8,
+            // 4->16. The host rounds the requested batch up to the next power
+            // of two and dispatches only the first `batch` columns.
+            let ks = [1u32, 2, 4, 8, 16];
+            let matvec_f16 = ks
+                .iter()
+                .map(|&k| {
+                    create_pipeline_specialized(
+                        state,
+                        include_bytes!("vulkan_spv/decode_matvec_batch.spv"),
+                        k,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("expected 5 f16 batched pipelines"))?;
+            let matvec_q8_0 = if state.shader_int8_supported {
+                let pipelines = ks
+                    .iter()
+                    .map(|&k| {
+                        create_pipeline_specialized(
+                            state,
+                            include_bytes!("vulkan_spv/decode_matvec_q8_0_batch.spv"),
+                            k,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("expected 5 q8 batched pipelines"))?;
+                Some(pipelines)
+            } else {
+                None
+            };
+            let matvec_q8_0_column = state
+                .shader_int8_supported
+                .then(|| {
+                    create_pipeline(
+                        state,
+                        include_bytes!("vulkan_spv/decode_matvec_q8_0_column.spv"),
+                    )
+                })
+                .transpose()?;
+            Ok(Self {
+                matvec_f16,
+                matvec_q8_0,
+                matvec_q8_0_column,
+                rms_norm: create_pipeline(
+                    state,
+                    include_bytes!("vulkan_spv/decode_rms_norm_batch.spv"),
+                )?,
+                head_norm_rope: create_pipeline(
+                    state,
+                    include_bytes!("vulkan_spv/decode_head_norm_rope_batch.spv"),
+                )?,
+                value_cache: create_pipeline(
+                    state,
+                    include_bytes!("vulkan_spv/decode_value_cache_batch.spv"),
+                )?,
+                attention: create_pipeline(
+                    state,
+                    include_bytes!("vulkan_spv/decode_attention_batch.spv"),
+                )?,
+                add_residual: create_pipeline(
+                    state,
+                    include_bytes!("vulkan_spv/add_residual_batch.spv"),
+                )?,
+                swiglu: create_pipeline(state, include_bytes!("vulkan_spv/swiglu_batch.spv"))?,
+            })
+        }
+
+        fn all(&self) -> impl Iterator<Item = vk::Pipeline> + '_ {
+            self.matvec_f16
+                .iter()
+                .copied()
+                .chain(
+                    self.matvec_q8_0
+                        .iter()
+                        .flat_map(|pipelines| pipelines.iter().copied()),
+                )
+                .chain(self.matvec_q8_0_column)
+                .chain([
+                    self.rms_norm,
+                    self.head_norm_rope,
+                    self.value_cache,
+                    self.attention,
+                    self.add_residual,
+                    self.swiglu,
+                ])
+        }
+    }
+
     struct Pipelines {
         plain: vk::Pipeline,
         cooperative: Option<vk::Pipeline>,
@@ -861,6 +976,7 @@ mod enabled {
         decode_head_norm_rope: vk::Pipeline,
         decode_value_cache: vk::Pipeline,
         decode_attention: vk::Pipeline,
+        batched: BatchedPipelines,
     }
 
     impl Pipelines {
@@ -946,6 +1062,7 @@ mod enabled {
                     state,
                     include_bytes!("vulkan_spv/decode_attention.spv"),
                 )?,
+                batched: BatchedPipelines::create(state)?,
             })
         }
 
@@ -979,6 +1096,7 @@ mod enabled {
             ]
             .into_iter()
             .flatten()
+            .chain(self.batched.all())
         }
     }
 
@@ -994,6 +1112,52 @@ mod enabled {
             .stage(vk::ShaderStageFlags::COMPUTE)
             .module(module)
             .name(main);
+        let create = vk::ComputePipelineCreateInfo::default()
+            .stage(stage)
+            .layout(state.pipeline_layout);
+        let pipeline = unsafe {
+            state
+                .device
+                .create_compute_pipelines(state.pipeline_cache, &[create], None)
+                .map_err(|(_, error)| error)?[0]
+        };
+        unsafe { state.device.destroy_shader_module(module, None) };
+        Ok(pipeline)
+    }
+
+    /// Create a compute pipeline with a single u32 specialization constant at
+    /// SpecId 0. The wave-5 batched mat-mat shaders specialize the column count
+    /// K so the K accumulators stay register-resident and each column's
+    /// accumulation keeps the exact ascending order of the K=1 path. A runtime
+    /// column count would spill the accumulators to memory and let the compiler
+    /// fold products before adding them to the running sum, which reorders the
+    /// f32 rounding and breaks the byte-exact gate.
+    fn create_pipeline_specialized(
+        state: &DeviceState,
+        spirv: &[u8],
+        constant_value: u32,
+    ) -> Result<vk::Pipeline> {
+        let words = ash::util::read_spv(&mut Cursor::new(spirv))?;
+        let module = unsafe {
+            state
+                .device
+                .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None)?
+        };
+        let main = c"main";
+        let spec_data = constant_value.to_ne_bytes();
+        let map_entry = vk::SpecializationMapEntry::default()
+            .constant_id(0)
+            .size(size_of::<u32>())
+            .offset(0);
+        let map_entries = [map_entry];
+        let specialization = vk::SpecializationInfo::default()
+            .map_entries(&map_entries)
+            .data(&spec_data);
+        let stage = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::COMPUTE)
+            .module(module)
+            .name(main)
+            .specialization_info(&specialization);
         let create = vk::ComputePipelineCreateInfo::default()
             .stage(stage)
             .layout(state.pipeline_layout);
@@ -3621,6 +3785,69 @@ mod enabled {
         }
     }
 
+    /// Wave-5 batched (mat-mat) activation buffers, sized for the maximum
+    /// column count K=16. Each buffer holds K columns laid out as
+    /// `[K][width]`. The per-column layout matches the single-token buffers so
+    /// column k's slice is bit-identical to a standalone single-token step.
+    /// These are allocated lazily on first `verify_batch` and never on the
+    /// default single-token path, so the existing decode path is unperturbed.
+    struct QwenDecodeBatchActivations {
+        x0: Buffer,
+        x1: Buffer,
+        normed: Buffer,
+        q_raw: Buffer,
+        k_raw: Buffer,
+        v_raw: Buffer,
+        q: Buffer,
+        attention: Buffer,
+        projected: Buffer,
+        gate: Buffer,
+        up: Buffer,
+        activated: Buffer,
+        cosine: Buffer,
+        sine: Buffer,
+        scores: Buffer,
+        logits: Buffer,
+    }
+
+    impl QwenDecodeBatchActivations {
+        #[allow(clippy::too_many_arguments)]
+        fn new(
+            state: Arc<DeviceState>,
+            hidden: usize,
+            query_heads: usize,
+            kv_heads: usize,
+            head_dim: usize,
+            intermediate: usize,
+            vocab: usize,
+            capacity: usize,
+            max_k: usize,
+        ) -> Result<Self> {
+            let query_width = query_heads * head_dim;
+            let kv_width = kv_heads * head_dim;
+            let f16 = |count| Buffer::new(state.clone(), count * size_of::<u16>());
+            let f32_buffer = |count| Buffer::new(state.clone(), count * size_of::<f32>());
+            Ok(Self {
+                x0: f16(max_k * hidden)?,
+                x1: f16(max_k * hidden)?,
+                normed: f16(max_k * hidden)?,
+                q_raw: f32_buffer(max_k * query_width)?,
+                k_raw: f32_buffer(max_k * kv_width)?,
+                v_raw: f32_buffer(max_k * kv_width)?,
+                q: f16(max_k * query_width)?,
+                attention: f16(max_k * query_width)?,
+                projected: f32_buffer(max_k * hidden)?,
+                gate: f32_buffer(max_k * intermediate)?,
+                up: f32_buffer(max_k * intermediate)?,
+                activated: f16(max_k * intermediate)?,
+                cosine: f32_buffer(max_k * head_dim)?,
+                sine: f32_buffer(max_k * head_dim)?,
+                scores: f32_buffer(max_k * query_heads * capacity)?,
+                logits: f32_buffer(max_k * vocab)?,
+            })
+        }
+    }
+
     /// Plain-shader Qwen3 decode context. It keeps f16 KV slots on the device and
     /// records only independent output rows as Vulkan workgroups; no cooperative
     /// matrix pipeline or split dot-product reduction is part of this path.
@@ -3633,6 +3860,9 @@ mod enabled {
         final_norm: Buffer,
         lm_head: DeviceDecodeWeight,
         activations: QwenDecodeActivations,
+        /// Lazily allocated on first `verify_batch`; `None` on the single-token
+        /// path so the existing decode buffers and pipeline set are unperturbed.
+        batch_activations: Option<QwenDecodeBatchActivations>,
         capacity: usize,
         position: usize,
     }
@@ -3731,6 +3961,7 @@ mod enabled {
                 final_norm,
                 lm_head,
                 activations,
+                batch_activations: None,
                 capacity,
                 position: 0,
             })
@@ -4206,6 +4437,625 @@ mod enabled {
             read_result
         }
 
+        /// Index into the per-K specialized mat-mat pipeline arrays for K in
+        /// {1,2,4,8,16} (index 0->1, 1->2, 2->4, 3->8, 4->16). The host rounds
+        /// the requested batch up to the next power of two and dispatches only
+        /// the first `batch` columns; columns >= batch are computed but not
+        /// written, so any batch <= 16 is exact while the common power-of-two
+        /// spans use a tight specialization.
+        fn batched_pipeline_index(batch: usize) -> usize {
+            match batch {
+                1 => 0,
+                2 => 1,
+                3..=4 => 2,
+                5..=8 => 3,
+                _ => 4,
+            }
+        }
+
+        /// Per-column RoPE tables for a batched forward. Column k uses the
+        /// angle at absolute position `base_position + k`. Returns flattened
+        /// `[K][head_dim]` cosine and sine tables.
+        fn rope_batch(&self, base_position: usize, k: usize) -> (Vec<f32>, Vec<f32>) {
+            let head_dim = self.model.config.head_dim;
+            let mut cosine = Vec::with_capacity(k * head_dim);
+            let mut sine = Vec::with_capacity(k * head_dim);
+            for column in 0..k {
+                let position = base_position + column;
+                for index in 0..head_dim {
+                    let rotary_index = index % (head_dim / 2);
+                    let frequency = 1.0
+                        / self
+                            .model
+                            .config
+                            .rope_theta
+                            .powf((2 * rotary_index) as f32 / head_dim as f32);
+                    let (sin, cos) = (position as f32 * frequency).sin_cos();
+                    cosine.push(cos);
+                    sine.push(sin);
+                }
+            }
+            (cosine, sine)
+        }
+
+        /// Record a batched mat-mat dispatch (f16 or Q8) using the per-K
+        /// specialized pipeline. The input/output buffers are laid out as
+        /// `[K][width]`; the weight is the single-token weight (shared across
+        /// all K columns). `rows` is the output width, `columns` is the input
+        /// width (the K dimension of the mat-mat).
+        #[allow(clippy::too_many_arguments)]
+        fn record_matvec_batch(
+            recorder: &mut Recorder<'_>,
+            pipelines: &Pipelines,
+            input: &Buffer,
+            weight: &DeviceDecodeWeight,
+            output: &Buffer,
+            rows: usize,
+            columns: usize,
+            batch: usize,
+            layer: usize,
+            stage: StageClass,
+        ) -> Result<()> {
+            // K=1 uses the single-token matvec shader directly: the batched
+            // mat-mat shader's K=1 specialization still wraps the accumulation
+            // in a column loop that the glslc compiler optimizes differently
+            // than the scalar single-token path on the Q8 shader, breaking the
+            // byte-exact gate. The single-token matvec is bit-identical by
+            // construction, so K=1 dispatches through it and only K>=2 uses
+            // the batched mat-mat kernels.
+            if batch == 1 {
+                return Self::record_matvec(
+                    recorder, pipelines, input, weight, output, rows, columns, layer, stage,
+                );
+            }
+            // Q8 at K>=2: the AMD RDNA3 driver's shader compiler reorders the
+            // f32 accumulation when multiple column accumulators are present
+            // in the batched mat-mat shader (even with scalar registers and
+            // identical per-column operation order), breaking the byte-exact
+            // gate. Fall back to K sequential single-token dispatches via the
+            // column-offset Q8 matvec — each column uses the exact single-
+            // token shader, so the result is bit-identical by construction.
+            // The weight streams K times (no sharing); the Q8 K-curve measures
+            // the cost of NOT sharing, which is the honest answer to whether
+            // the mat-mat shape helps Q8 on RDNA3.
+            if let Some(q8_0) = &weight.q8_0 {
+                let pipeline = pipelines
+                    .batched
+                    .matvec_q8_0_column
+                    .context("Vulkan GPU lacks shader int8 required for Q8_0 batched decode")?;
+                let vecs = columns / 4; // uvec2 elements per column
+                for k in 0..batch {
+                    let params = FourU32 {
+                        a: rows as u32,
+                        b: columns as u32,
+                        c: (k * vecs) as u32, // input offset (uvec2 elements)
+                        d: (k * rows) as u32, // output offset (f32 elements)
+                    };
+                    recorder.dispatch(
+                        pipeline,
+                        &[input, q8_0, output],
+                        &params,
+                        [recorder.state.subgroup_groups(rows, 4), 1, 1],
+                        layer,
+                        stage,
+                    )?;
+                }
+                return Ok(());
+            }
+            let params = FourU32 {
+                a: rows as u32,
+                b: columns as u32,
+                c: batch as u32,
+                d: 0,
+            };
+            let index = Self::batched_pipeline_index(batch);
+            if let Some(q8_0) = &weight.q8_0 {
+                let pipeline = pipelines
+                    .batched
+                    .matvec_q8_0
+                    .as_ref()
+                    .context("Vulkan GPU lacks shader int8 required for Q8_0 batched decode")?
+                    [index];
+                recorder.dispatch(
+                    pipeline,
+                    &[input, q8_0, output],
+                    &params,
+                    // Four lanes in each subgroup own four independent rows;
+                    // each active lane still performs its row's full serial dot
+                    // for all K columns.
+                    [recorder.state.subgroup_groups(rows, 4), 1, 1],
+                    layer,
+                    stage,
+                )
+            } else {
+                let pipeline = pipelines.batched.matvec_f16[index];
+                recorder.dispatch(
+                    pipeline,
+                    &[
+                        input,
+                        weight
+                            .f16
+                            .as_ref()
+                            .context("Vulkan decode f16 weight missing")?,
+                        output,
+                    ],
+                    &params,
+                    [recorder.state.subgroup_groups(rows, 4), 1, 1],
+                    layer,
+                    stage,
+                )
+            }
+        }
+
+        /// Run K token positions through the transformer in ONE command
+        /// submission (mat-mat with K columns), mirroring the Metal
+        /// `verify_batch` contract. All K KV slots are written before any
+        /// column's attention runs, so column k's causal prefix (positions
+        /// <= base_position + k) is fully resident and identical to the
+        /// sequential path. Returns the K*vocab f32 logits (row k is the logits
+        /// after position base_position + k).
+        fn run_batch(&mut self, tokens: &[u32], base_position: usize) -> Result<Vec<f32>> {
+            let k = tokens.len();
+            ensure!(k >= 1, "batched decode requires at least one token");
+            ensure!(
+                k <= 16,
+                "batched decode supports at most 16 tokens, got {k}"
+            );
+            ensure!(
+                base_position + k <= self.capacity,
+                "batched decode exceeds cache capacity"
+            );
+            ensure!(
+                tokens
+                    .iter()
+                    .all(|&token| (token as usize) < self.model.config.vocab_size),
+                "batched decode received a token outside the Qwen3 vocabulary"
+            );
+
+            // Lazily allocate the batched activation buffers on first use.
+            if self.batch_activations.is_none() {
+                self.batch_activations = Some(QwenDecodeBatchActivations::new(
+                    self.state.clone(),
+                    self.model.config.hidden_size,
+                    self.model.config.num_attention_heads,
+                    self.model.config.num_key_value_heads,
+                    self.model.config.head_dim,
+                    self.model.config.intermediate_size,
+                    self.model.config.vocab_size,
+                    self.capacity,
+                    16,
+                )?);
+            }
+            let batch_act = self
+                .batch_activations
+                .as_ref()
+                .expect("batch activations allocated above");
+
+            // Upload the K embedding rows and per-column RoPE tables.
+            let hidden = self.model.config.hidden_size;
+            let mut input_f16 = Vec::with_capacity(k * hidden);
+            for &token in tokens {
+                input_f16.extend(encode_f16_bits(self.embedding(token)?));
+            }
+            batch_act.x0.write(&input_f16)?;
+            let (cosine, sine) = self.rope_batch(base_position, k);
+            batch_act.cosine.write(&cosine)?;
+            batch_act.sine.write(&sine)?;
+
+            let command_pool = unsafe {
+                self.state.device.create_command_pool(
+                    &vk::CommandPoolCreateInfo::default()
+                        .queue_family_index(self.state.queue_family),
+                    None,
+                )?
+            };
+            let command = unsafe {
+                self.state.device.allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default()
+                        .command_pool(command_pool)
+                        .level(vk::CommandBufferLevel::PRIMARY)
+                        .command_buffer_count(1),
+                )?[0]
+            };
+            // Each layer records: RMSNorm, Q/K/V mat-mat, head-norm+RoPE (Q and
+            // K), value-cache write, attention, O mat-mat, residual add,
+            // post-attention RMSNorm, gate/up mat-mat, SwiGLU, down mat-mat,
+            // MLP residual add. Plus final RMSNorm + LM-head mat-mat. The Q8
+            // path dispatches K single-token matvecs per mat-mat stage (the
+            // column-offset fallback), so the worst case is 6 mat-mat stages
+            // * K dispatches + 10 non-mat-mat stages per layer, plus the final
+            // RMSNorm and K-dispatch LM-head. Use a generous upper bound to
+            // avoid OUT_OF_POOL_MEMORY.
+            let q8 = self.lm_head.q8_0.is_some();
+            let matmat_stages = 6u32; // Q, K, V, O, gate/up (2), down
+            let non_matmat_stages = 10u32;
+            let dispatches_per_layer = if q8 {
+                matmat_stages * k as u32 + non_matmat_stages
+            } else {
+                16
+            };
+            let final_dispatches = if q8 { 1 + k as u32 } else { 2 };
+            let max_sets =
+                (self.layers.len() as u32 * dispatches_per_layer + final_dispatches).max(2);
+            // The Q8 column-offset fallback dispatches K matvecs per mat-mat
+            // stage, which can require thousands of descriptor sets for K=16.
+            // Use a generous pool size to avoid OUT_OF_POOL_MEMORY.
+            let max_sets = max_sets.max(4096);
+            let descriptor_pool = unsafe {
+                self.state.device.create_descriptor_pool(
+                    &vk::DescriptorPoolCreateInfo::default()
+                        .max_sets(max_sets)
+                        .pool_sizes(&[vk::DescriptorPoolSize::default()
+                            .ty(vk::DescriptorType::STORAGE_BUFFER)
+                            .descriptor_count(max_sets * DESCRIPTOR_BINDINGS)]),
+                    None,
+                )?
+            };
+            let record_result = (|| {
+                unsafe {
+                    self.state.device.begin_command_buffer(
+                        command,
+                        &vk::CommandBufferBeginInfo::default()
+                            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                    )?;
+                }
+                {
+                    let mut recorder = Recorder {
+                        state: &self.state,
+                        command,
+                        descriptor_pool,
+                        descriptor_sets: Vec::new(),
+                        pipelines: &self.pipelines,
+                        profile: None,
+                    };
+                    let query_heads = self.model.config.num_attention_heads;
+                    let kv_heads = self.model.config.num_key_value_heads;
+                    let head_dim = self.model.config.head_dim;
+                    let query_width = query_heads * head_dim;
+                    let kv_width = kv_heads * head_dim;
+                    let intermediate = self.model.config.intermediate_size;
+                    for (layer_index, layer) in self.layers.iter().enumerate() {
+                        // Input RMSNorm (K columns).
+                        recorder.dispatch(
+                            self.pipelines.batched.rms_norm,
+                            &[&batch_act.x0, &layer.input_norm, &batch_act.normed],
+                            &FamilyNormParams {
+                                rows: k as u32,
+                                width: hidden as u32,
+                                epsilon: self.model.config.rms_norm_eps,
+                                identity: k as u32,
+                            },
+                            [self.state.subgroup_groups(k, 1), 1, 1],
+                            layer_index,
+                            StageClass::Pointwise,
+                        )?;
+                        // Q/K/V mat-mat (K columns, shared weight).
+                        Self::record_matvec_batch(
+                            &mut recorder,
+                            &self.pipelines,
+                            &batch_act.normed,
+                            &layer.q_weight,
+                            &batch_act.q_raw,
+                            query_width,
+                            hidden,
+                            k,
+                            layer_index,
+                            StageClass::GemmQkv,
+                        )?;
+                        Self::record_matvec_batch(
+                            &mut recorder,
+                            &self.pipelines,
+                            &batch_act.normed,
+                            &layer.k_weight,
+                            &batch_act.k_raw,
+                            kv_width,
+                            hidden,
+                            k,
+                            layer_index,
+                            StageClass::GemmQkv,
+                        )?;
+                        Self::record_matvec_batch(
+                            &mut recorder,
+                            &self.pipelines,
+                            &batch_act.normed,
+                            &layer.v_weight,
+                            &batch_act.v_raw,
+                            kv_width,
+                            hidden,
+                            k,
+                            layer_index,
+                            StageClass::GemmQkv,
+                        )?;
+                        // Q head-norm+RoPE (no cache write).
+                        recorder.dispatch(
+                            self.pipelines.batched.head_norm_rope,
+                            &[
+                                &batch_act.q_raw,
+                                &layer.q_norm,
+                                &batch_act.cosine,
+                                &batch_act.sine,
+                                &batch_act.q,
+                            ],
+                            &DecodeHeadParams {
+                                heads: query_heads as u32,
+                                head_dim: head_dim as u32,
+                                position: base_position as u32,
+                                cache_stride: query_width as u32,
+                                epsilon: self.model.config.rms_norm_eps,
+                                write_cache: 0,
+                                unused0: k as u32,
+                                unused1: 0,
+                            },
+                            [query_heads as u32, k as u32, 1],
+                            layer_index,
+                            StageClass::LayoutTranspose,
+                        )?;
+                        // K head-norm+RoPE (writes K cache slots).
+                        recorder.dispatch(
+                            self.pipelines.batched.head_norm_rope,
+                            &[
+                                &batch_act.k_raw,
+                                &layer.k_norm,
+                                &batch_act.cosine,
+                                &batch_act.sine,
+                                &layer.key_cache,
+                            ],
+                            &DecodeHeadParams {
+                                heads: kv_heads as u32,
+                                head_dim: head_dim as u32,
+                                position: base_position as u32,
+                                cache_stride: kv_width as u32,
+                                epsilon: self.model.config.rms_norm_eps,
+                                write_cache: 1,
+                                unused0: k as u32,
+                                unused1: 0,
+                            },
+                            [kv_heads as u32, k as u32, 1],
+                            layer_index,
+                            StageClass::LayoutTranspose,
+                        )?;
+                        // V value-cache write (K slots).
+                        recorder.dispatch(
+                            self.pipelines.batched.value_cache,
+                            &[&batch_act.v_raw, &layer.value_cache],
+                            &FourU32 {
+                                a: kv_width as u32,
+                                b: base_position as u32,
+                                c: k as u32,
+                                d: 0,
+                            },
+                            [kv_width.div_ceil(256) as u32, 1, 1],
+                            layer_index,
+                            StageClass::LayoutTranspose,
+                        )?;
+                        // Attention (K columns, causal mask inside window).
+                        recorder.dispatch(
+                            self.pipelines.batched.attention,
+                            &[
+                                &batch_act.q,
+                                &layer.key_cache,
+                                &layer.value_cache,
+                                &batch_act.scores,
+                                &batch_act.attention,
+                            ],
+                            &DecodeAttentionParams {
+                                position: base_position as u32,
+                                query_heads: query_heads as u32,
+                                kv_heads: kv_heads as u32,
+                                head_dim: head_dim as u32,
+                                capacity: self.capacity as u32,
+                                unused0: k as u32,
+                                unused1: 0,
+                                unused2: 0,
+                            },
+                            [query_heads as u32, k as u32, 1],
+                            layer_index,
+                            StageClass::SoftmaxMask,
+                        )?;
+                        // O projection mat-mat.
+                        Self::record_matvec_batch(
+                            &mut recorder,
+                            &self.pipelines,
+                            &batch_act.attention,
+                            &layer.o_weight,
+                            &batch_act.projected,
+                            hidden,
+                            query_width,
+                            k,
+                            layer_index,
+                            StageClass::GemmOut,
+                        )?;
+                        // Residual add -> x1.
+                        recorder.dispatch(
+                            self.pipelines.batched.add_residual,
+                            &[&batch_act.projected, &batch_act.x0, &batch_act.x1],
+                            &FourU32 {
+                                a: hidden as u32,
+                                b: k as u32,
+                                c: 0,
+                                d: 0,
+                            },
+                            [hidden.div_ceil(256) as u32, 1, 1],
+                            layer_index,
+                            StageClass::Pointwise,
+                        )?;
+                        // Post-attention RMSNorm.
+                        recorder.dispatch(
+                            self.pipelines.batched.rms_norm,
+                            &[&batch_act.x1, &layer.post_attention_norm, &batch_act.normed],
+                            &FamilyNormParams {
+                                rows: k as u32,
+                                width: hidden as u32,
+                                epsilon: self.model.config.rms_norm_eps,
+                                identity: k as u32,
+                            },
+                            [self.state.subgroup_groups(k, 1), 1, 1],
+                            layer_index,
+                            StageClass::Pointwise,
+                        )?;
+                        // Gate / Up mat-mat.
+                        Self::record_matvec_batch(
+                            &mut recorder,
+                            &self.pipelines,
+                            &batch_act.normed,
+                            &layer.gate_weight,
+                            &batch_act.gate,
+                            intermediate,
+                            hidden,
+                            k,
+                            layer_index,
+                            StageClass::GemmMlpUp,
+                        )?;
+                        Self::record_matvec_batch(
+                            &mut recorder,
+                            &self.pipelines,
+                            &batch_act.normed,
+                            &layer.up_weight,
+                            &batch_act.up,
+                            intermediate,
+                            hidden,
+                            k,
+                            layer_index,
+                            StageClass::GemmMlpUp,
+                        )?;
+                        // SwiGLU.
+                        recorder.dispatch(
+                            self.pipelines.batched.swiglu,
+                            &[&batch_act.gate, &batch_act.up, &batch_act.activated],
+                            &FourU32 {
+                                a: intermediate as u32,
+                                b: k as u32,
+                                c: 0,
+                                d: 0,
+                            },
+                            [intermediate.div_ceil(256) as u32, 1, 1],
+                            layer_index,
+                            StageClass::Pointwise,
+                        )?;
+                        // Down mat-mat.
+                        Self::record_matvec_batch(
+                            &mut recorder,
+                            &self.pipelines,
+                            &batch_act.activated,
+                            &layer.down_weight,
+                            &batch_act.projected,
+                            hidden,
+                            intermediate,
+                            k,
+                            layer_index,
+                            StageClass::GemmMlpDown,
+                        )?;
+                        // MLP residual add -> x0.
+                        recorder.dispatch(
+                            self.pipelines.batched.add_residual,
+                            &[&batch_act.projected, &batch_act.x1, &batch_act.x0],
+                            &FourU32 {
+                                a: hidden as u32,
+                                b: k as u32,
+                                c: 0,
+                                d: 0,
+                            },
+                            [hidden.div_ceil(256) as u32, 1, 1],
+                            layer_index,
+                            StageClass::Pointwise,
+                        )?;
+                    }
+                    // Final RMSNorm + LM-head mat-mat.
+                    recorder.dispatch(
+                        self.pipelines.batched.rms_norm,
+                        &[&batch_act.x0, &self.final_norm, &batch_act.x1],
+                        &FamilyNormParams {
+                            rows: k as u32,
+                            width: hidden as u32,
+                            epsilon: self.model.config.rms_norm_eps,
+                            identity: k as u32,
+                        },
+                        [self.state.subgroup_groups(k, 1), 1, 1],
+                        self.layers.len(),
+                        StageClass::Pointwise,
+                    )?;
+                    Self::record_matvec_batch(
+                        &mut recorder,
+                        &self.pipelines,
+                        &batch_act.x1,
+                        &self.lm_head,
+                        &batch_act.logits,
+                        self.model.config.vocab_size,
+                        hidden,
+                        k,
+                        self.layers.len(),
+                        StageClass::GemmMlpDown,
+                    )?;
+                }
+                unsafe { self.state.device.end_command_buffer(command)? };
+                Ok::<(), anyhow::Error>(())
+            })();
+            if let Err(error) = record_result {
+                unsafe {
+                    self.state
+                        .device
+                        .destroy_descriptor_pool(descriptor_pool, None);
+                    self.state
+                        .device
+                        .free_command_buffers(command_pool, &[command]);
+                    self.state.device.destroy_command_pool(command_pool, None);
+                }
+                return Err(error);
+            }
+            let submit_result = (|| unsafe {
+                self.state.device.reset_fences(&[self.state.upload_fence])?;
+                self.state.device.queue_submit(
+                    self.state.queue,
+                    &[vk::SubmitInfo::default().command_buffers(&[command])],
+                    self.state.upload_fence,
+                )?;
+                self.state
+                    .device
+                    .wait_for_fences(&[self.state.upload_fence], true, u64::MAX)?;
+                Ok::<(), anyhow::Error>(())
+            })();
+            let read_result = if submit_result.is_ok() {
+                batch_act.logits.read_f32(k * self.model.config.vocab_size)
+            } else {
+                Ok(Vec::new())
+            };
+            unsafe {
+                self.state
+                    .device
+                    .destroy_descriptor_pool(descriptor_pool, None);
+                self.state
+                    .device
+                    .free_command_buffers(command_pool, &[command]);
+                self.state.device.destroy_command_pool(command_pool, None);
+            }
+            submit_result?;
+            read_result
+        }
+
+        /// Batched verification: runs `tokens.len()` positions through one
+        /// batched forward and returns the full per-position f32 logits,
+        /// flattened as `tokens.len()` contiguous `vocab_size` rows (row `i` is
+        /// the logits after position `self.position + i`). By construction each
+        /// row is bit-identical to a sequential `advance` at that position.
+        pub fn verify_batch_logits(&mut self, tokens: &[u32]) -> Result<Vec<f32>> {
+            let base = self.position;
+            // K=1 dispatches through the single-token path: the batched mat-mat
+            // shader's K=1 specialization still wraps the accumulation in a
+            // column loop that the glslc compiler optimizes differently than
+            // the scalar single-token path on the Q8 shader, breaking the
+            // byte-exact gate. The single-token `run_token` is bit-identical by
+            // construction, so K=1 uses it directly and only K>=2 uses the
+            // batched mat-mat kernels.
+            if tokens.len() == 1 {
+                let logits = self.run_token(tokens[0], base, true)?;
+                self.position = base + 1;
+                return Ok(logits);
+            }
+            let logits = self.run_batch(tokens, base)?;
+            self.position = base + tokens.len();
+            Ok(logits)
+        }
+
         pub fn prefill(&mut self, tokens: &[u32]) -> Result<Vec<f32>> {
             ensure!(!tokens.is_empty(), "decode prompt must not be empty");
             ensure!(
@@ -4230,6 +5080,13 @@ mod enabled {
             let logits = self.run_token(token, position, true)?;
             self.position += 1;
             Ok(logits)
+        }
+
+        /// Sets the logical cache position for speculative-decode rewind. KV
+        /// data is addressed by position; attention reads only positions <= the
+        /// logical length, and the next forward overwrites later slots.
+        pub fn set_position(&mut self, position: usize) {
+            self.position = position;
         }
 
         pub fn inspect_cache_layer(&self, layer: usize) -> Result<Vec<f32>> {
