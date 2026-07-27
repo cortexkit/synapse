@@ -70,6 +70,11 @@ pub(crate) struct MetalStepDecoder<'a> {
     // command buffer with a single readback. Runtime-tunable via
     // SYNAPSE_METAL_STEP_CHAIN_K (default 1; chaining is opt-in).
     chain_k: usize,
+    // Opt-in batched speculative verification (SYNAPSE_METAL_STEP_BATCHED_VERIFY).
+    // When set, the verifier runs K draft tokens through one batched forward
+    // (weights streamed once per layer) instead of K sequential single-token
+    // steps. Default off: the speculative path keeps its prior sequential shape.
+    batched_verify: bool,
 }
 
 impl<'a> MetalStepDecoder<'a> {
@@ -122,6 +127,7 @@ impl<'a> MetalStepDecoder<'a> {
             bucket,
             host_prepare_wall_s: started.elapsed().as_secs_f64(),
             chain_k: read_chain_k(),
+            batched_verify: read_batched_verify(),
         };
         let params = decoder.layer_params()?;
         let final_norm = decoder.model.final_norm.weight.metal_f16_bits()?;
@@ -324,6 +330,93 @@ impl<'a> MetalStepDecoder<'a> {
         Ok(argmaxes)
     }
 
+    /// Verifies a draft span in ONE batched forward pass: all `tokens.len()`
+    /// positions run through the transformer as a batch (mat-mat with K columns)
+    /// so each layer's weights stream once instead of once per token. Returns the
+    /// greedy argmax after each supplied token, aligned exactly as `verify_tokens`.
+    /// By construction the per-position logits are bit-identical to K sequential
+    /// single-token `advance` steps at the same positions; the batch only shares
+    /// the weight read across positions, never reordering one dot's accumulation.
+    pub(crate) fn verify_batch(
+        &mut self,
+        cache: &mut MetalStepKvCache,
+        tokens: &[u32],
+    ) -> Result<Vec<u32>> {
+        self.verify_batch_inner(cache, tokens, None)
+    }
+
+    /// Batched verification that also reads back the full per-position f32 logits,
+    /// flattened as `tokens.len()` contiguous `vocab_size` rows (row `i` is the
+    /// logits after position `cache.position + i`). This is the byte-exact gate
+    /// surface: row `i` must equal the logits from a sequential `advance` at that
+    /// position. The serving path uses `verify_batch` (argmax-only readback).
+    #[allow(dead_code)]
+    pub(crate) fn verify_batch_logits(
+        &mut self,
+        cache: &mut MetalStepKvCache,
+        tokens: &[u32],
+    ) -> Result<Vec<f32>> {
+        let mut logits = vec![0.0f32; tokens.len() * self.model.config.vocab_size];
+        self.verify_batch_inner(cache, tokens, Some(&mut logits))?;
+        Ok(logits)
+    }
+
+    fn verify_batch_inner(
+        &mut self,
+        cache: &mut MetalStepKvCache,
+        tokens: &[u32],
+        logits_out: Option<&mut [f32]>,
+    ) -> Result<Vec<u32>> {
+        ensure!(
+            !tokens.is_empty(),
+            "batched verification requires at least one token"
+        );
+        ensure!(
+            tokens.len() <= 16,
+            "batched verification supports at most 16 draft tokens, got {}",
+            tokens.len()
+        );
+        ensure!(
+            cache.position + tokens.len() <= self.bucket,
+            "batched speculative verification exceeds cache capacity"
+        );
+        ensure!(
+            tokens
+                .iter()
+                .all(|&token| (token as usize) < self.model.config.vocab_size),
+            "batched speculative verification received a token outside the Qwen3 vocabulary"
+        );
+        if let Some(logits) = &logits_out {
+            ensure!(
+                logits.len() == tokens.len() * self.model.config.vocab_size,
+                "batched verification logits output has the wrong length"
+            );
+        }
+        let (rope_cos, rope_sin) = self.rope_chain(cache.position, tokens.len());
+        let mut argmaxes = vec![0u32; tokens.len()];
+        let status = unsafe {
+            synapse_qwen3_metal_step_verify_batch(
+                self.raw.as_ptr(),
+                cache.position as u64,
+                tokens.as_ptr(),
+                tokens.len() as u32,
+                rope_cos.as_ptr(),
+                rope_sin.as_ptr(),
+                argmaxes.as_mut_ptr(),
+                logits_out.map_or(std::ptr::null_mut(), |logits| logits.as_mut_ptr()),
+                self.model.config.rms_norm_eps,
+            )
+        };
+        if status != 0 {
+            bail!(
+                "Qwen3 Metal step batched verification failed with status {status}: {}",
+                last_error()
+            );
+        }
+        cache.position += tokens.len();
+        Ok(argmaxes)
+    }
+
     /// Encode `steps` chained decode passes into one command buffer and return
     /// the `steps` argmax token ids. `seed` is the token whose embedding feeds
     /// step 0 (the last committed token); each later step gathers its input from
@@ -469,7 +562,11 @@ impl DecodeKernel for MetalStepDecoder<'_> {
     }
 
     fn verify_tokens(&mut self, cache: &mut Self::Cache, tokens: &[u32]) -> Result<Vec<u32>> {
-        MetalStepDecoder::verify_tokens(self, cache, tokens)
+        if self.batched_verify {
+            MetalStepDecoder::verify_batch(self, cache, tokens)
+        } else {
+            MetalStepDecoder::verify_tokens(self, cache, tokens)
+        }
     }
 
     fn rewind(&mut self, cache: &mut Self::Cache, position: usize) -> Result<()> {
@@ -598,6 +695,18 @@ fn read_chain_k() -> usize {
         .unwrap_or(1)
 }
 
+/// Batched speculative verification is opt-in via
+/// SYNAPSE_METAL_STEP_BATCHED_VERIFY=1. Off by default so the speculative path
+/// keeps its prior sequential single-token verification shape; the batched path
+/// is byte-identical (it only shares the per-layer weight read across the K
+/// proposed positions), so enabling it changes latency, not output.
+fn read_batched_verify() -> bool {
+    std::env::var("SYNAPSE_METAL_STEP_BATCHED_VERIFY")
+        .ok()
+        .map(|value| value.trim() == "1")
+        .unwrap_or(false)
+}
+
 fn last_error() -> anyhow::Error {
     unsafe {
         let raw = synapse_qwen3_metal_step_last_error();
@@ -642,6 +751,17 @@ unsafe extern "C" {
         argmaxes_out: *mut u32,
         epsilon: f32,
     ) -> i32;
+    fn synapse_qwen3_metal_step_verify_batch(
+        context: *mut c_void,
+        position: u64,
+        token_ids: *const u32,
+        steps: u32,
+        rope_cos: *const u16,
+        rope_sin: *const u16,
+        argmaxes_out: *mut u32,
+        logits_out: *mut f32,
+        epsilon: f32,
+    ) -> i32;
     fn synapse_qwen3_metal_step_chain(
         context: *mut c_void,
         position: u64,
@@ -674,4 +794,356 @@ unsafe extern "C" {
         elements: u64,
     ) -> i32;
     fn synapse_qwen3_metal_step_last_error() -> *const c_char;
+}
+
+#[cfg(test)]
+mod tests {
+    //! Real-model gates for the batched verification path. These require a Metal
+    //! GPU and the Qwen3-0.6B weights, so they are `#[ignore]` and run explicitly:
+    //!
+    //! ```text
+    //! SYNAPSE_UNIFIED_RT_QWEN3_0_6B=<snapshot dir> \
+    //!   cargo test -p spike-unified-rt --release batched_verify -- --ignored --nocapture
+    //! ```
+    //!
+    //! The central invariant is machine-independent: batched verification must
+    //! produce logits bit-identical to K sequential single-token steps, because
+    //! batching only shares the per-layer weight read across the K positions and
+    //! never reorders one dot product's accumulation. These tests prove that on
+    //! whatever GPU runs them. Performance is measured separately on the project's
+    //! M1 reference machine (the decode timing authority documented in
+    //! METAL-STEP.md), which also settles the completion-06 fixture canary that
+    //! drifts on other machines' Metal compilers.
+
+    use super::{MetalStepDecoder, MetalStepKvCache};
+    use crate::qwen3_decode::DecodeKernel;
+    use crate::quant::WeightQuantization;
+    use crate::{Execution, MetalExecutionConfig, Precision};
+
+    const BUCKET: usize = 1024;
+
+    fn model_path() -> std::path::PathBuf {
+        std::path::PathBuf::from(
+            std::env::var_os("SYNAPSE_UNIFIED_RT_QWEN3_0_6B").expect(
+                "set SYNAPSE_UNIFIED_RT_QWEN3_0_6B to the Qwen3-0.6B snapshot directory",
+            ),
+        )
+    }
+
+    /// Build a Metal step decoder over the real model and hand it to `body`.
+    /// The model outlives the decoder borrow within the closure scope.
+    fn with_decoder<R>(
+        weight_quant: WeightQuantization,
+        body: impl FnOnce(&crate::qwen3::Model, &mut MetalStepDecoder) -> R,
+    ) -> R {
+        let model =
+            crate::qwen3::Model::load_with_quant(&model_path(), Precision::F16, weight_quant)
+                .expect("load Qwen3-0.6B");
+        let execution = MetalExecutionConfig {
+            execution: Execution::Explicit,
+            package_root: None,
+        };
+        let mut decoder = MetalStepDecoder::new(
+            &model,
+            Precision::F16,
+            &execution,
+            BUCKET,
+            weight_quant,
+        )
+        .expect("construct Metal step decoder");
+        body(&model, &mut decoder)
+    }
+
+    /// Host greedy argmax matching the sampler rule: highest logit, lowest id on
+    /// tie (replace only on strictly greater under total_cmp).
+    fn greedy_argmax(logits: &[f32]) -> u32 {
+        let mut best = 0usize;
+        for (id, value) in logits.iter().enumerate().skip(1) {
+            if value.total_cmp(&logits[best]) == std::cmp::Ordering::Greater {
+                best = id;
+            }
+        }
+        best as u32
+    }
+
+    fn logits_bits(logits: &[f32]) -> Vec<u32> {
+        logits.iter().map(|value| value.to_bits()).collect()
+    }
+
+    /// Deterministic synthetic prompt of a given length. The exact tokens do not
+    /// matter because the batched and sequential paths must produce identical
+    /// logits for ANY input; varied lengths exercise short, medium, and deep-
+    /// context attention prefixes.
+    fn synthetic_prompt(length: usize) -> Vec<u32> {
+        (0..length)
+            .map(|index| (1000 + index * 7919 % 5000) as u32)
+            .collect()
+    }
+
+    /// Greedy continuation tokens and the per-position logits that produced them,
+    /// via sequential single-token advances starting from `cache` (already
+    /// prefilled). Returns (tokens, logits) where logits[i] is the logits after
+    /// feeding tokens[i]; the seed logits (before any feed) are returned too.
+    fn sequential_greedy(
+        decoder: &mut MetalStepDecoder,
+        cache: &mut MetalStepKvCache,
+        seed_logits: &[f32],
+        count: usize,
+    ) -> (Vec<u32>, Vec<Vec<f32>>) {
+        let mut tokens = Vec::with_capacity(count);
+        let mut logits = Vec::with_capacity(count);
+        let mut next = greedy_argmax(seed_logits);
+        for _ in 0..count {
+            tokens.push(next);
+            let step_logits = decoder.advance(cache, next).expect("sequential advance");
+            next = greedy_argmax(&step_logits);
+            logits.push(step_logits);
+        }
+        (tokens, logits)
+    }
+
+    fn byte_identical_gate_for(weight_quant: WeightQuantization) {
+        with_decoder(weight_quant, |_model, decoder| {
+            for prompt_len in [1usize, 5, 33, 128, 469] {
+                let prompt = synthetic_prompt(prompt_len);
+                let (cache, seed_logits) = decoder.prefill(&prompt).expect("prefill");
+                let mut cache = cache;
+                let base_position = decoder.cache_position(&cache);
+                assert_eq!(base_position, prompt_len);
+
+                // Sequential reference: greedy draft tokens and their logits.
+                let (draft, seq_logits) =
+                    sequential_greedy(decoder, &mut cache, &seed_logits, 16);
+
+                for k in [1usize, 2, 4, 8, 16] {
+                    let draft = &draft[..k];
+                    // Rewind to the prefix and run one batched forward over K tokens.
+                    decoder.rewind(&mut cache, base_position).expect("rewind");
+                    let batch_logits = decoder
+                        .verify_batch_logits(&mut cache, draft)
+                        .expect("batched verify logits");
+                    let vocab = seq_logits[0].len();
+                    assert_eq!(batch_logits.len(), k * vocab);
+                    for i in 0..k {
+                        let batch_row = &batch_logits[i * vocab..(i + 1) * vocab];
+                        assert_eq!(
+                            logits_bits(batch_row),
+                            logits_bits(&seq_logits[i]),
+                            "batched logits diverge from sequential at prompt_len={prompt_len} k={k} position {i} ({weight_quant:?})"
+                        );
+                    }
+                    // Argmax surface agrees too (this is what the session consumes).
+                    decoder.rewind(&mut cache, base_position).expect("rewind");
+                    let batch_argmaxes = decoder
+                        .verify_batch(&mut cache, draft)
+                        .expect("batched verify argmaxes");
+                    for i in 0..k {
+                        assert_eq!(
+                            batch_argmaxes[i],
+                            greedy_argmax(&seq_logits[i]),
+                            "batched argmax diverges at prompt_len={prompt_len} k={k} position {i}"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    #[ignore]
+    fn batched_verify_logits_are_byte_identical_to_sequential_f16() {
+        byte_identical_gate_for(WeightQuantization::None);
+    }
+
+    #[test]
+    #[ignore]
+    fn batched_verify_logits_are_byte_identical_to_sequential_q8() {
+        byte_identical_gate_for(WeightQuantization::Q8_0);
+    }
+
+    fn determinism_gate_for(weight_quant: WeightQuantization) {
+        with_decoder(weight_quant, |_model, decoder| {
+            let prompt = synthetic_prompt(64);
+            let (cache, seed_logits) = decoder.prefill(&prompt).expect("prefill");
+            let mut cache = cache;
+            let base_position = decoder.cache_position(&cache);
+            let (draft, _) = sequential_greedy(decoder, &mut cache, &seed_logits, 8);
+
+            decoder.rewind(&mut cache, base_position).expect("rewind");
+            let first = decoder
+                .verify_batch_logits(&mut cache, &draft)
+                .expect("first batched run");
+            decoder.rewind(&mut cache, base_position).expect("rewind");
+            let second = decoder
+                .verify_batch_logits(&mut cache, &draft)
+                .expect("second batched run");
+            assert_eq!(
+                logits_bits(&first),
+                logits_bits(&second),
+                "batched verification is not deterministic ({weight_quant:?})"
+            );
+        });
+    }
+
+    #[test]
+    #[ignore]
+    fn batched_verify_is_deterministic_f16() {
+        determinism_gate_for(WeightQuantization::None);
+    }
+
+    #[test]
+    #[ignore]
+    fn batched_verify_is_deterministic_q8() {
+        determinism_gate_for(WeightQuantization::Q8_0);
+    }
+
+    /// Forced-rejection rollback: verify a K-token draft whose token at index
+    /// `wrong` is corrupted, accept the correct prefix, rewind to it, and confirm
+    /// the greedy continuation is byte-exact with the target-only stream. Run for
+    /// every rejection position so each KV slot in the batch window is exercised
+    /// as the rollback boundary.
+    fn forced_rejection_gate_for(weight_quant: WeightQuantization) {
+        with_decoder(weight_quant, |_model, decoder| {
+            let prompt = synthetic_prompt(48);
+            let (cache, seed_logits) = decoder.prefill(&prompt).expect("prefill");
+            let mut cache = cache;
+            let base_position = decoder.cache_position(&cache);
+            // Target-only greedy reference, long enough to cover the continuation.
+            let (target, _) = sequential_greedy(decoder, &mut cache, &seed_logits, 32);
+            let vocab = {
+                decoder.rewind(&mut cache, base_position).expect("rewind");
+                let probe = decoder.advance(&mut cache, target[0]).expect("probe");
+                decoder.rewind(&mut cache, base_position).expect("rewind");
+                probe.len()
+            };
+
+            for k in [4usize, 8] {
+                for wrong in 0..k {
+                    // Corrupt one draft token; the prefix before it stays correct.
+                    let mut draft = target[..k].to_vec();
+                    draft[wrong] = (target[wrong] + 1) % vocab as u32;
+
+                    decoder.rewind(&mut cache, base_position).expect("rewind");
+                    decoder
+                        .verify_batch(&mut cache, &draft)
+                        .expect("batched verify");
+                    // Accept the `wrong` correct tokens, discard the rest.
+                    decoder
+                        .rewind(&mut cache, base_position + wrong)
+                        .expect("rewind to acceptance boundary");
+                    // Re-advance the correct token and follow greedy; every step
+                    // must match the target-only continuation.
+                    let mut next = target[wrong];
+                    for step in 0..8 {
+                        let logits = decoder.advance(&mut cache, next).expect("continue");
+                        let argmax = greedy_argmax(&logits);
+                        assert_eq!(
+                            argmax,
+                            target[wrong + 1 + step],
+                            "continuation diverged after rejection: k={k} wrong={wrong} step={step} ({weight_quant:?})"
+                        );
+                        next = argmax;
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    #[ignore]
+    fn batched_verify_forced_rejection_preserves_continuation_f16() {
+        forced_rejection_gate_for(WeightQuantization::None);
+    }
+
+    #[test]
+    #[ignore]
+    fn batched_verify_forced_rejection_preserves_continuation_q8() {
+        forced_rejection_gate_for(WeightQuantization::Q8_0);
+    }
+
+    /// Per-token batched-verify cost curve. Prints the median wall time per
+    /// verify_batch(K) call and the per-token (wall/K) figure for K in
+    /// {1,2,4,8,16}. The authoritative numbers are taken on the project's M1
+    /// reference machine (the decode timing authority; see METAL-STEP.md and
+    /// BATCHED-VERIFY.md); on any other GPU this still works as a functional
+    /// timing harness. Select weights with SYNAPSE_METAL_STEP_BATCHED_PROBE_QUANT
+    /// =f16|q8 (default q8).
+    fn timing_probe(weight_quant: WeightQuantization) {
+        with_decoder(weight_quant, |_model, decoder| {
+            let prompt = synthetic_prompt(64);
+            let (cache, seed_logits) = decoder.prefill(&prompt).expect("prefill");
+            let mut cache = cache;
+            let base_position = decoder.cache_position(&cache);
+            let (draft, _) = sequential_greedy(decoder, &mut cache, &seed_logits, 16);
+
+            // Warmup so GPU clocks and pipeline caches are steady before timing.
+            for _ in 0..5 {
+                decoder.rewind(&mut cache, base_position).expect("rewind");
+                decoder.verify_batch(&mut cache, &draft[..8]).expect("warmup");
+            }
+
+            println!(
+                "BATCHED_VERIFY_PROBE quant={weight_quant:?} prompt_len={base_position}"
+            );
+            // Single-token reference: sequential greedy `advance` (the unchanged
+            // per-token decode path). Running it in this same harness and build
+            // gives a direct baseline beside the batched numbers and confirms the
+            // additive batched path does not perturb the existing per-token path
+            // (it reproduces the documented f16 decode rate; see BATCHED-VERIFY.md).
+            {
+                let steps = 64;
+                let iterations = 8;
+                let mut samples = Vec::with_capacity(iterations);
+                for _ in 0..iterations {
+                    decoder.rewind(&mut cache, base_position).expect("rewind");
+                    let mut next = greedy_argmax(&seed_logits);
+                    let started = std::time::Instant::now();
+                    for _ in 0..steps {
+                        let logits = decoder.advance(&mut cache, next).expect("advance");
+                        next = greedy_argmax(&logits);
+                    }
+                    samples.push(started.elapsed().as_secs_f64() / steps as f64);
+                }
+                samples.sort_by(|a, b| a.total_cmp(b));
+                let median = samples[iterations / 2];
+                println!(
+                    "SINGLE_TOKEN_REFERENCE per_token_ms={:.4} decode_tok_per_s={:.2}",
+                    median * 1e3,
+                    1.0 / median
+                );
+            }
+            for k in [1usize, 2, 4, 8, 16] {
+                let draft = &draft[..k];
+                let iterations = 40;
+                let mut samples = Vec::with_capacity(iterations);
+                for _ in 0..iterations {
+                    decoder.rewind(&mut cache, base_position).expect("rewind");
+                    let started = std::time::Instant::now();
+                    decoder.verify_batch(&mut cache, draft).expect("verify_batch");
+                    samples.push(started.elapsed().as_secs_f64());
+                }
+                samples.sort_by(|a, b| a.total_cmp(b));
+                let median = samples[iterations / 2];
+                println!(
+                    "BATCHED_VERIFY_PROBE k={k:>2} median_call_ms={:.4} per_token_ms={:.4} verify_tok_per_s={:.2}",
+                    median * 1e3,
+                    median * 1e3 / k as f64,
+                    k as f64 / median
+                );
+            }
+        });
+    }
+
+    #[test]
+    #[ignore]
+    fn batched_verify_timing_probe() {
+        let quant = match std::env::var("SYNAPSE_METAL_STEP_BATCHED_PROBE_QUANT")
+            .ok()
+            .as_deref()
+        {
+            Some("f16") => WeightQuantization::None,
+            _ => WeightQuantization::Q8_0,
+        };
+        timing_probe(quant);
+    }
 }

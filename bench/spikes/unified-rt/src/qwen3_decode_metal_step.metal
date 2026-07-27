@@ -685,3 +685,470 @@ kernel void metal_step_embedding_gather(
     uint token = token_in[0];
     input[gid] = embeddings[(ulong)token * config.hidden + gid];
 }
+
+// ---------------------------------------------------------------------------
+// Batched verification kernels.
+//
+// Speculative verification feeds K already-known draft tokens through the
+// transformer in ONE forward pass instead of K dependent single-token steps.
+// The bandwidth win comes from streaming each projection weight row once and
+// applying it to all K position activations (a mat-mat with K columns), rather
+// than re-streaming it once per token.
+//
+// Exactness law: batching parallelizes ACROSS positions (independent
+// reductions); it never reorders the accumulation WITHIN one dot product. Each
+// (output row, position) dot below walks the weight in the same ascending
+// column/block order and adds products in the same order as the single-token
+// kernels above, so every position's logits are bit-identical to a sequential
+// single-token step at that position. The K columns simply share the weight
+// load. K is bounded by 16 (METAL_STEP_MAX_BATCH_K on the host) and rounded up
+// to a power-of-two template instantiation in each kernel's entry below.
+// ---------------------------------------------------------------------------
+
+struct BatchQkvConfig {
+    uint input_width;
+    uint query_width;
+    uint kv_width;
+    uint head_dim;
+    uint capacity;
+    uint position;   // position of batch column 0
+    uint quantized;
+    uint batch;      // K columns
+};
+
+struct BatchMatvecConfig {
+    uint input_width;
+    uint output_width;
+    uint quantized;
+    uint add_residual;
+    uint batch;
+};
+
+// F16 mat-mat dot for a COMPILE-TIME column count N. The weight row is streamed
+// once and applied to all N column activations. Crucially, N is a template
+// parameter so the column loop unrolls and the N accumulators stay in registers
+// indexed by constants; each column's `sums[k] += p0; sums[k] += p1; ...` chain
+// is then preserved in the exact ascending order of matrix_dot_f16. (A runtime
+// column count spills the accumulators to memory and lets the compiler fold the
+// eight products before adding, which changes the rounding and breaks the
+// byte-exact gate.) Column k is therefore bit-identical to
+// matrix_dot_f16(inputs + k*input_width, fp16, row, input_width).
+template <uint N>
+inline void matrix_dot_f16_batch_n(
+    const device half *inputs,
+    const device half *fp16,
+    uint row,
+    uint input_width,
+    thread float (&sums)[N]
+) {
+    const device half *weight = fp16 + row * input_width;
+    for (uint k = 0; k < N; ++k) sums[k] = 0.0f;
+    uint col = 0;
+    for (; col + 8 <= input_width; col += 8) {
+        half4 weight_values0 = *(const device half4 *)(weight + col);
+        half4 weight_values1 = *(const device half4 *)(weight + col + 4);
+        for (uint k = 0; k < N; ++k) {
+            const device half *input = inputs + (uint64_t)k * input_width + col;
+            half4 input_values0 = *(const device half4 *)(input);
+            half4 input_values1 = *(const device half4 *)(input + 4);
+            half4 products0 = input_values0 * weight_values0;
+            half4 products1 = input_values1 * weight_values1;
+            sums[k] += (float)products0[0];
+            sums[k] += (float)products0[1];
+            sums[k] += (float)products0[2];
+            sums[k] += (float)products0[3];
+            sums[k] += (float)products1[0];
+            sums[k] += (float)products1[1];
+            sums[k] += (float)products1[2];
+            sums[k] += (float)products1[3];
+        }
+    }
+    for (; col + 4 <= input_width; col += 4) {
+        half4 weight_values = *(const device half4 *)(weight + col);
+        for (uint k = 0; k < N; ++k) {
+            const device half *input = inputs + (uint64_t)k * input_width + col;
+            half4 input_values = *(const device half4 *)(input);
+            half4 products = input_values * weight_values;
+            sums[k] += (float)products[0];
+            sums[k] += (float)products[1];
+            sums[k] += (float)products[2];
+            sums[k] += (float)products[3];
+        }
+    }
+    for (; col < input_width; ++col) {
+        half weight_value = weight[col];
+        for (uint k = 0; k < N; ++k) {
+            half product = (half)((half)inputs[(uint64_t)k * input_width + col] * weight_value);
+            sums[k] += (float)product;
+        }
+    }
+}
+
+// Q8 mat-mat chunk for N columns: dequantize one weight block slice ONCE (scale
+// + char4 read a single time) and apply it to every column's half4. Per column
+// this is the same four-product ascending sum as matrix_dot_q8_chunk.
+template <uint N>
+inline void matrix_dot_q8_chunk_batch_n(
+    const device half *inputs,
+    uint input_width,
+    uint col,
+    const device uchar *block_q8,
+    uint lane_start,
+    thread float (&partials)[N]
+) {
+    const device half *scale = (const device half *)block_q8;
+    const device char *values = (const device char *)((const device uchar *)scale + 2);
+    char4 quant_values = *(const device char4 *)(values + lane_start);
+    float dequant_scale = (float)scale[0];
+    float4 quant_float = float4(quant_values);
+    for (uint k = 0; k < N; ++k) {
+        half4 input_values = *(const device half4 *)(inputs + (uint64_t)k * input_width + col + lane_start);
+        float4 products = float4(input_values) * quant_float * dequant_scale;
+        partials[k] += (float)products[0] + (float)products[1] + (float)products[2] + (float)products[3];
+    }
+}
+
+// Q8 mat-mat partial for one (row, sub-lane) across N columns: walk the row's
+// blocks once in the same ascending order as matrix_dot_q8_partial. N is a
+// template parameter so the column accumulators stay register-resident and keep
+// the single-token reduction order (see matrix_dot_f16_batch_n).
+template <uint N>
+inline void matrix_dot_q8_partial_batch_n(
+    const device half *inputs,
+    uint input_width,
+    const device uchar *q8,
+    uint row,
+    uint sub_lane,
+    thread float (&partials)[N]
+) {
+    for (uint k = 0; k < N; ++k) partials[k] = 0.0f;
+    uint lane_start = sub_lane * 4;
+    uint block_count = input_width / Q8_BLOCK_ELEMENTS;
+    const device uchar *row_q8 = q8 + row * block_count * Q8_BLOCK_BYTES;
+    uint col = 0;
+    uint block = 0;
+    for (; block + 4 <= block_count; block += 4) {
+        matrix_dot_q8_chunk_batch_n<N>(inputs, input_width, col, row_q8, lane_start, partials);
+        matrix_dot_q8_chunk_batch_n<N>(inputs, input_width, col + Q8_BLOCK_ELEMENTS, row_q8 + Q8_BLOCK_BYTES, lane_start, partials);
+        matrix_dot_q8_chunk_batch_n<N>(inputs, input_width, col + Q8_BLOCK_ELEMENTS * 2, row_q8 + Q8_BLOCK_BYTES * 2, lane_start, partials);
+        matrix_dot_q8_chunk_batch_n<N>(inputs, input_width, col + Q8_BLOCK_ELEMENTS * 3, row_q8 + Q8_BLOCK_BYTES * 3, lane_start, partials);
+        col += Q8_BLOCK_ELEMENTS * 4;
+        row_q8 += Q8_BLOCK_BYTES * 4;
+    }
+    for (; block < block_count; ++block) {
+        matrix_dot_q8_chunk_batch_n<N>(inputs, input_width, col, row_q8, lane_start, partials);
+        col += Q8_BLOCK_ELEMENTS;
+        row_q8 += Q8_BLOCK_BYTES;
+    }
+}
+
+// Each batched projection kernel is templated on the compile-time column count
+// N and dispatched through a runtime switch that rounds config.batch up to the
+// next power of two in {1,2,4,8,16}. Columns k >= config.batch are computed but
+// not written, so any batch <= 16 is exact while the common power-of-two spans
+// use a tight instantiation.
+
+template <uint N>
+inline void metal_step_qkv_matvec_batch_body(
+    const device half *input,
+    device half *query,
+    device half *key,
+    device half *value_cache,
+    const device half *q_fp16,
+    const device uchar *q_q8,
+    const device half *k_fp16,
+    const device uchar *k_q8,
+    const device half *v_fp16,
+    const device uchar *v_q8,
+    constant BatchQkvConfig &config,
+    uint gid
+) {
+    uint batch = config.batch;
+    if (config.quantized == 0) {
+        if (gid < config.query_width) {
+            float sums[N];
+            matrix_dot_f16_batch_n<N>(input, q_fp16, gid, config.input_width, sums);
+            for (uint k = 0; k < N; ++k) {
+                if (k < batch) query[(uint64_t)k * config.query_width + gid] = (half)sums[k];
+            }
+        }
+        if (gid < config.kv_width) {
+            float key_sums[N];
+            float value_sums[N];
+            matrix_dot_f16_batch_n<N>(input, k_fp16, gid, config.input_width, key_sums);
+            matrix_dot_f16_batch_n<N>(input, v_fp16, gid, config.input_width, value_sums);
+            uint head = gid / config.head_dim;
+            uint dimension = gid % config.head_dim;
+            for (uint k = 0; k < N; ++k) {
+                if (k >= batch) continue;
+                key[(uint64_t)k * config.kv_width + gid] = (half)key_sums[k];
+                value_cache[(head * config.capacity + config.position + k) * config.head_dim + dimension] =
+                    (half)value_sums[k];
+            }
+        }
+        return;
+    }
+    uint lane = gid % METAL_STEP_SIMD_WIDTH;
+    uint row = gid / METAL_STEP_SIMD_WIDTH;
+    uint group = lane / 8;
+    uint sub_lane = lane % 8;
+    uint total_rows = config.query_width + 2 * config.kv_width;
+    if (row >= total_rows) return;
+    if (row < config.query_width) {
+        float partials[N];
+        matrix_dot_q8_partial_batch_n<N>(input, config.input_width, q_q8, row, sub_lane, partials);
+        for (uint k = 0; k < N; ++k) {
+            float result = metal_step_pack_sum(partials[k], group);
+            if (sub_lane == 0 && k < batch) query[(uint64_t)k * config.query_width + row] = (half)result;
+        }
+        return;
+    }
+    row -= config.query_width;
+    if (row < config.kv_width) {
+        float partials[N];
+        matrix_dot_q8_partial_batch_n<N>(input, config.input_width, k_q8, row, sub_lane, partials);
+        for (uint k = 0; k < N; ++k) {
+            float result = metal_step_pack_sum(partials[k], group);
+            if (sub_lane == 0 && k < batch) key[(uint64_t)k * config.kv_width + row] = (half)result;
+        }
+        return;
+    }
+    row -= config.kv_width;
+    float partials[N];
+    matrix_dot_q8_partial_batch_n<N>(input, config.input_width, v_q8, row, sub_lane, partials);
+    uint head = row / config.head_dim;
+    uint dimension = row % config.head_dim;
+    for (uint k = 0; k < N; ++k) {
+        float result = metal_step_pack_sum(partials[k], group);
+        if (sub_lane == 0 && k < batch) {
+            value_cache[(head * config.capacity + config.position + k) * config.head_dim + dimension] = (half)result;
+        }
+    }
+}
+
+kernel void metal_step_qkv_matvec_batch(
+    const device half *input [[buffer(0)]],
+    device half *query [[buffer(1)]],
+    device half *key [[buffer(2)]],
+    device half *value_cache [[buffer(3)]],
+    const device half *q_fp16 [[buffer(4)]],
+    const device uchar *q_q8 [[buffer(5)]],
+    const device half *k_fp16 [[buffer(6)]],
+    const device uchar *k_q8 [[buffer(7)]],
+    const device half *v_fp16 [[buffer(8)]],
+    const device uchar *v_q8 [[buffer(9)]],
+    constant BatchQkvConfig &config [[buffer(10)]],
+    uint gid [[thread_position_in_grid]]) {
+    uint b = config.batch;
+    if (b <= 1) {
+        metal_step_qkv_matvec_batch_body<1>(input, query, key, value_cache, q_fp16, q_q8, k_fp16, k_q8, v_fp16, v_q8, config, gid);
+    } else if (b <= 2) {
+        metal_step_qkv_matvec_batch_body<2>(input, query, key, value_cache, q_fp16, q_q8, k_fp16, k_q8, v_fp16, v_q8, config, gid);
+    } else if (b <= 4) {
+        metal_step_qkv_matvec_batch_body<4>(input, query, key, value_cache, q_fp16, q_q8, k_fp16, k_q8, v_fp16, v_q8, config, gid);
+    } else if (b <= 8) {
+        metal_step_qkv_matvec_batch_body<8>(input, query, key, value_cache, q_fp16, q_q8, k_fp16, k_q8, v_fp16, v_q8, config, gid);
+    } else {
+        metal_step_qkv_matvec_batch_body<16>(input, query, key, value_cache, q_fp16, q_q8, k_fp16, k_q8, v_fp16, v_q8, config, gid);
+    }
+}
+
+template <uint N>
+inline void metal_step_matvec_residual_batch_body(
+    const device half *input,
+    const device half *residual,
+    device half *output,
+    const device half *fp16,
+    const device uchar *q8,
+    constant BatchMatvecConfig &config,
+    uint gid
+) {
+    uint batch = config.batch;
+    if (config.quantized == 0) {
+        if (gid >= config.output_width) return;
+        float sums[N];
+        matrix_dot_f16_batch_n<N>(input, fp16, gid, config.input_width, sums);
+        for (uint k = 0; k < N; ++k) {
+            if (k >= batch) continue;
+            float value = sums[k] + (config.add_residual != 0 ? (float)residual[(uint64_t)k * config.output_width + gid] : 0.0f);
+            output[(uint64_t)k * config.output_width + gid] = (half)value;
+        }
+        return;
+    }
+    uint lane = gid % METAL_STEP_SIMD_WIDTH;
+    uint group = lane / 8;
+    uint sub_lane = lane % 8;
+    uint row_base = (gid / METAL_STEP_SIMD_WIDTH) * 4;
+    if (row_base >= config.output_width) return;
+    uint row = row_base + group;
+    float partials[N];
+    if (row < config.output_width) {
+        matrix_dot_q8_partial_batch_n<N>(input, config.input_width, q8, row, sub_lane, partials);
+    } else {
+        for (uint k = 0; k < N; ++k) partials[k] = 0.0f;
+    }
+    for (uint k = 0; k < N; ++k) {
+        float value = metal_step_pack_sum(partials[k], group);
+        if (sub_lane == 0 && row < config.output_width && k < batch) {
+            float with_residual = value + (config.add_residual != 0 ? (float)residual[(uint64_t)k * config.output_width + row] : 0.0f);
+            output[(uint64_t)k * config.output_width + row] = (half)with_residual;
+        }
+    }
+}
+
+kernel void metal_step_matvec_residual_batch(
+    const device half *input [[buffer(0)]],
+    const device half *residual [[buffer(1)]],
+    device half *output [[buffer(2)]],
+    const device half *fp16 [[buffer(3)]],
+    const device uchar *q8 [[buffer(4)]],
+    constant BatchMatvecConfig &config [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]) {
+    uint b = config.batch;
+    if (b <= 1) {
+        metal_step_matvec_residual_batch_body<1>(input, residual, output, fp16, q8, config, gid);
+    } else if (b <= 2) {
+        metal_step_matvec_residual_batch_body<2>(input, residual, output, fp16, q8, config, gid);
+    } else if (b <= 4) {
+        metal_step_matvec_residual_batch_body<4>(input, residual, output, fp16, q8, config, gid);
+    } else if (b <= 8) {
+        metal_step_matvec_residual_batch_body<8>(input, residual, output, fp16, q8, config, gid);
+    } else {
+        metal_step_matvec_residual_batch_body<16>(input, residual, output, fp16, q8, config, gid);
+    }
+}
+
+template <uint N>
+inline void metal_step_gate_up_swiglu_batch_body(
+    const device half *input,
+    device half *output,
+    const device half *gate_fp16,
+    const device uchar *gate_q8,
+    const device half *up_fp16,
+    const device uchar *up_q8,
+    constant BatchMatvecConfig &config,
+    uint gid
+) {
+    uint batch = config.batch;
+    if (config.quantized == 0) {
+        if (gid >= config.output_width) return;
+        float gate_sums[N];
+        float up_sums[N];
+        matrix_dot_f16_batch_n<N>(input, gate_fp16, gid, config.input_width, gate_sums);
+        matrix_dot_f16_batch_n<N>(input, up_fp16, gid, config.input_width, up_sums);
+        for (uint k = 0; k < N; ++k) {
+            if (k >= batch) continue;
+            float gate = gate_sums[k];
+            float up = up_sums[k];
+            output[(uint64_t)k * config.output_width + gid] = (half)((gate / (1.0f + exp(-gate))) * up);
+        }
+        return;
+    }
+    uint lane = gid % METAL_STEP_SIMD_WIDTH;
+    uint group = lane / 8;
+    uint sub_lane = lane % 8;
+    uint row_base = (gid / METAL_STEP_SIMD_WIDTH) * 4;
+    if (row_base >= config.output_width) return;
+    uint row = row_base + group;
+    float gate_partials[N];
+    float up_partials[N];
+    if (row < config.output_width) {
+        matrix_dot_q8_partial_batch_n<N>(input, config.input_width, gate_q8, row, sub_lane, gate_partials);
+        matrix_dot_q8_partial_batch_n<N>(input, config.input_width, up_q8, row, sub_lane, up_partials);
+    } else {
+        for (uint k = 0; k < N; ++k) {
+            gate_partials[k] = 0.0f;
+            up_partials[k] = 0.0f;
+        }
+    }
+    for (uint k = 0; k < N; ++k) {
+        float gate = metal_step_pack_sum(gate_partials[k], group);
+        float up = metal_step_pack_sum(up_partials[k], group);
+        if (sub_lane == 0 && row < config.output_width && k < batch) {
+            output[(uint64_t)k * config.output_width + row] = (half)((gate / (1.0f + exp(-gate))) * up);
+        }
+    }
+}
+
+kernel void metal_step_gate_up_swiglu_batch(
+    const device half *input [[buffer(0)]],
+    device half *output [[buffer(1)]],
+    const device half *gate_fp16 [[buffer(2)]],
+    const device uchar *gate_q8 [[buffer(3)]],
+    const device half *up_fp16 [[buffer(4)]],
+    const device uchar *up_q8 [[buffer(5)]],
+    constant BatchMatvecConfig &config [[buffer(6)]],
+    uint gid [[thread_position_in_grid]]) {
+    uint b = config.batch;
+    if (b <= 1) {
+        metal_step_gate_up_swiglu_batch_body<1>(input, output, gate_fp16, gate_q8, up_fp16, up_q8, config, gid);
+    } else if (b <= 2) {
+        metal_step_gate_up_swiglu_batch_body<2>(input, output, gate_fp16, gate_q8, up_fp16, up_q8, config, gid);
+    } else if (b <= 4) {
+        metal_step_gate_up_swiglu_batch_body<4>(input, output, gate_fp16, gate_q8, up_fp16, up_q8, config, gid);
+    } else if (b <= 8) {
+        metal_step_gate_up_swiglu_batch_body<8>(input, output, gate_fp16, gate_q8, up_fp16, up_q8, config, gid);
+    } else {
+        metal_step_gate_up_swiglu_batch_body<16>(input, output, gate_fp16, gate_q8, up_fp16, up_q8, config, gid);
+    }
+}
+
+template <uint N>
+inline void metal_step_lm_head_batch_body(
+    const device half *input,
+    device float *logits,
+    const device half *fp16,
+    const device uchar *q8,
+    constant BatchMatvecConfig &config,
+    uint gid
+) {
+    uint batch = config.batch;
+    if (config.quantized == 0) {
+        if (gid >= config.output_width) return;
+        float sums[N];
+        matrix_dot_f16_batch_n<N>(input, fp16, gid, config.input_width, sums);
+        for (uint k = 0; k < N; ++k) {
+            if (k < batch) logits[(uint64_t)k * config.output_width + gid] = sums[k];
+        }
+        return;
+    }
+    uint lane = gid % METAL_STEP_SIMD_WIDTH;
+    uint group = lane / 8;
+    uint sub_lane = lane % 8;
+    uint row_base = (gid / METAL_STEP_SIMD_WIDTH) * 4;
+    if (row_base >= config.output_width) return;
+    uint row = row_base + group;
+    float partials[N];
+    if (row < config.output_width) {
+        matrix_dot_q8_partial_batch_n<N>(input, config.input_width, q8, row, sub_lane, partials);
+    } else {
+        for (uint k = 0; k < N; ++k) partials[k] = 0.0f;
+    }
+    for (uint k = 0; k < N; ++k) {
+        float value = metal_step_pack_sum(partials[k], group);
+        if (sub_lane == 0 && row < config.output_width && k < batch) {
+            logits[(uint64_t)k * config.output_width + row] = value;
+        }
+    }
+}
+
+kernel void metal_step_lm_head_batch(
+    const device half *input [[buffer(0)]],
+    device float *logits [[buffer(1)]],
+    const device half *fp16 [[buffer(2)]],
+    const device uchar *q8 [[buffer(3)]],
+    constant BatchMatvecConfig &config [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]) {
+    uint b = config.batch;
+    if (b <= 1) {
+        metal_step_lm_head_batch_body<1>(input, logits, fp16, q8, config, gid);
+    } else if (b <= 2) {
+        metal_step_lm_head_batch_body<2>(input, logits, fp16, q8, config, gid);
+    } else if (b <= 4) {
+        metal_step_lm_head_batch_body<4>(input, logits, fp16, q8, config, gid);
+    } else if (b <= 8) {
+        metal_step_lm_head_batch_body<8>(input, logits, fp16, q8, config, gid);
+    } else {
+        metal_step_lm_head_batch_body<16>(input, logits, fp16, q8, config, gid);
+    }
+}

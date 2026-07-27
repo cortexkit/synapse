@@ -8,6 +8,12 @@
 
 static char metal_step_error[1024];
 
+// Maximum number of draft tokens one batched verification forward can carry.
+// The mat-mat kernels size their per-column accumulator arrays to this bound
+// (MAX_BATCH_K in the Metal source) and the lazy batch buffers are allocated
+// for exactly this many columns. Keep the two in sync.
+#define METAL_STEP_MAX_BATCH_K 16
+
 typedef struct Qwen3MetalStepLayerParams {
     const void *input_norm;
     const void *post_attention_norm;
@@ -117,6 +123,29 @@ typedef struct Qwen3MetalStepContext {
     id<MTLBuffer> argmax_partial_ids;
     id<MTLBuffer> chain_token_ids;
     id<MTLBuffer> chain_input;
+    // Batched-verification resources. These are allocated lazily on the first
+    // verify_batch call (for METAL_STEP_MAX_BATCH_K columns) so the per-token
+    // and chained paths never pay for them and their behavior is unchanged.
+    // The batched path reuses the single-token norm/RoPE/attention/argmax/
+    // gather kernels via per-column buffer offsets, and adds four mat-mat
+    // projection pipelines that stream each weight row once across all columns.
+    id<MTLComputePipelineState> qkv_matvec_batch;
+    id<MTLComputePipelineState> matvec_residual_batch;
+    id<MTLComputePipelineState> gate_up_swiglu_batch;
+    id<MTLComputePipelineState> lm_head_batch;
+    uint64_t batch_capacity;
+    id<MTLBuffer> batch_input;
+    id<MTLBuffer> batch_x_b;
+    id<MTLBuffer> batch_normalized;
+    id<MTLBuffer> batch_query;
+    id<MTLBuffer> batch_key;
+    id<MTLBuffer> batch_context;
+    id<MTLBuffer> batch_attention_scores;
+    id<MTLBuffer> batch_mlp;
+    id<MTLBuffer> batch_final_norm;
+    id<MTLBuffer> batch_logits;
+    id<MTLBuffer> batch_argmax_partial_keys;
+    id<MTLBuffer> batch_argmax_partial_ids;
     BOOL profile_kernels;
     Qwen3MetalStepTimings timings;
 } Qwen3MetalStepContext;
@@ -744,6 +773,490 @@ static void encode_embedding_gather_offset(
     [encoder endEncoding];
 }
 
+// Lazily create the four mat-mat pipelines and the column-sized scratch buffers
+// used by batched verification. Called once on the first verify_batch; the
+// per-token and chained paths never invoke it, so their behavior and resident
+// memory are unchanged. Buffers are sized for METAL_STEP_MAX_BATCH_K columns and
+// reused for any smaller batch.
+static BOOL ensure_batch_resources(Qwen3MetalStepContext *context) {
+    if (context->batch_capacity >= METAL_STEP_MAX_BATCH_K) return YES;
+    if (context->qkv_matvec_batch == nil) {
+        context->qkv_matvec_batch = pipeline(context->device, context->library, @"metal_step_qkv_matvec_batch");
+        context->matvec_residual_batch = pipeline(context->device, context->library, @"metal_step_matvec_residual_batch");
+        context->gate_up_swiglu_batch = pipeline(context->device, context->library, @"metal_step_gate_up_swiglu_batch");
+        context->lm_head_batch = pipeline(context->device, context->library, @"metal_step_lm_head_batch");
+        if (context->qkv_matvec_batch == nil || context->matvec_residual_batch == nil ||
+            context->gate_up_swiglu_batch == nil || context->lm_head_batch == nil) {
+            set_error(@"failed to compile batched Metal step verification pipelines");
+            return NO;
+        }
+    }
+    uint64_t query_width = context->query_heads * context->head_dim;
+    uint64_t kv_width = context->kv_heads * context->head_dim;
+    NSUInteger k = METAL_STEP_MAX_BATCH_K;
+    NSUInteger hidden_bytes = (NSUInteger)context->hidden * sizeof(uint16_t);
+    NSUInteger query_bytes = (NSUInteger)query_width * sizeof(uint16_t);
+    NSUInteger kv_bytes = (NSUInteger)kv_width * sizeof(uint16_t);
+    NSUInteger intermediate_bytes = (NSUInteger)context->intermediate * sizeof(uint16_t);
+    context->batch_input = new_zero_buffer(context->device, k * hidden_bytes, MTLResourceStorageModePrivate);
+    context->batch_x_b = new_zero_buffer(context->device, k * hidden_bytes, MTLResourceStorageModePrivate);
+    context->batch_normalized = new_zero_buffer(context->device, k * hidden_bytes, MTLResourceStorageModePrivate);
+    context->batch_final_norm = new_zero_buffer(context->device, k * hidden_bytes, MTLResourceStorageModePrivate);
+    context->batch_query = new_zero_buffer(context->device, k * query_bytes, MTLResourceStorageModePrivate);
+    context->batch_key = new_zero_buffer(context->device, k * kv_bytes, MTLResourceStorageModePrivate);
+    context->batch_context = new_zero_buffer(context->device, k * query_bytes, MTLResourceStorageModePrivate);
+    context->batch_mlp = new_zero_buffer(context->device, k * intermediate_bytes, MTLResourceStorageModePrivate);
+    context->batch_attention_scores = new_zero_buffer(
+        context->device,
+        k * (NSUInteger)context->query_heads * (NSUInteger)context->bucket * sizeof(float),
+        MTLResourceStorageModePrivate
+    );
+    // Shared so the host can read back every column's logits for the byte-exact
+    // verification gate without a per-column blit.
+    context->batch_logits = new_zero_buffer(
+        context->device,
+        k * (NSUInteger)context->vocab * sizeof(float),
+        MTLResourceStorageModeShared
+    );
+    context->batch_argmax_partial_keys = new_zero_buffer(
+        context->device, k * (NSUInteger)context->argmax_partials * sizeof(int32_t), MTLResourceStorageModePrivate);
+    context->batch_argmax_partial_ids = new_zero_buffer(
+        context->device, k * (NSUInteger)context->argmax_partials * sizeof(uint32_t), MTLResourceStorageModePrivate);
+    if (context->batch_input == nil || context->batch_x_b == nil || context->batch_normalized == nil ||
+        context->batch_final_norm == nil || context->batch_query == nil || context->batch_key == nil ||
+        context->batch_context == nil || context->batch_mlp == nil || context->batch_attention_scores == nil ||
+        context->batch_logits == nil || context->batch_argmax_partial_keys == nil ||
+        context->batch_argmax_partial_ids == nil) {
+        set_error(@"failed to allocate batched Metal step verification buffers");
+        return NO;
+    }
+    context->batch_capacity = METAL_STEP_MAX_BATCH_K;
+    return YES;
+}
+
+// Offset-addressed wrappers around the single-token kernels. They dispatch the
+// exact same pipelines as the per-token path, pointing each at one batch column
+// through a buffer offset, so every column's norm/RoPE/attention/argmax/gather
+// is bit-identical to a standalone single-token step. Only the heavy projections
+// use the new mat-mat kernels below.
+static void encode_rmsnorm_to(
+    Qwen3MetalStepContext *context,
+    id<MTLCommandBuffer> command_buffer,
+    id<MTLBuffer> input,
+    NSUInteger input_offset,
+    id<MTLBuffer> output,
+    NSUInteger output_offset,
+    id<MTLBuffer> weight,
+    uint32_t width,
+    float epsilon
+) {
+    id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+    [encoder setComputePipelineState:context->rmsnorm];
+    [encoder setBuffer:input offset:input_offset atIndex:0];
+    [encoder setBuffer:output offset:output_offset atIndex:1];
+    [encoder setBuffer:weight offset:0 atIndex:2];
+    struct { uint32_t width; float epsilon; } config = { width, epsilon };
+    [encoder setBytes:&config length:sizeof(config) atIndex:3];
+    [encoder dispatchThreads:grid_size(32) threadsPerThreadgroup:group_size(32)];
+    [encoder endEncoding];
+}
+
+static void encode_qk_norm_rope_to(
+    Qwen3MetalStepContext *context,
+    id<MTLCommandBuffer> command_buffer,
+    id<MTLBuffer> query,
+    NSUInteger query_offset,
+    id<MTLBuffer> key,
+    NSUInteger key_offset,
+    StepLayerBuffers *layer,
+    id<MTLBuffer> rope_cos,
+    id<MTLBuffer> rope_sin,
+    NSUInteger rope_offset,
+    uint32_t position
+) {
+    id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+    [encoder setComputePipelineState:context->qk_norm_rope];
+    [encoder setBuffer:query offset:query_offset atIndex:0];
+    [encoder setBuffer:key offset:key_offset atIndex:1];
+    [encoder setBuffer:layer->q_norm offset:0 atIndex:2];
+    [encoder setBuffer:layer->k_norm offset:0 atIndex:3];
+    [encoder setBuffer:rope_cos offset:rope_offset atIndex:4];
+    [encoder setBuffer:rope_sin offset:rope_offset atIndex:5];
+    [encoder setBuffer:layer->key_cache offset:0 atIndex:6];
+    struct { uint32_t query_heads; uint32_t kv_heads; uint32_t head_dim; float epsilon; uint32_t capacity; uint32_t position; } config = {
+        (uint32_t)context->query_heads, (uint32_t)context->kv_heads, (uint32_t)context->head_dim, context->epsilon,
+        (uint32_t)context->bucket, position
+    };
+    [encoder setBytes:&config length:sizeof(config) atIndex:7];
+    [encoder dispatchThreads:grid_size(MAX(context->query_heads, context->kv_heads) * 32) threadsPerThreadgroup:group_size(256)];
+    [encoder endEncoding];
+}
+
+static void encode_attention_to(
+    Qwen3MetalStepContext *context,
+    id<MTLCommandBuffer> command_buffer,
+    id<MTLBuffer> query,
+    NSUInteger query_offset,
+    StepLayerBuffers *layer,
+    id<MTLBuffer> output,
+    NSUInteger output_offset,
+    id<MTLBuffer> scores,
+    NSUInteger scores_offset,
+    uint32_t position
+) {
+    id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+    [encoder setComputePipelineState:context->attention];
+    [encoder setBuffer:query offset:query_offset atIndex:0];
+    [encoder setBuffer:layer->key_cache offset:0 atIndex:1];
+    [encoder setBuffer:layer->value_cache offset:0 atIndex:2];
+    [encoder setBuffer:output offset:output_offset atIndex:3];
+    [encoder setBuffer:scores offset:scores_offset atIndex:4];
+    struct { uint32_t query_heads; uint32_t kv_heads; uint32_t head_dim; uint32_t capacity; uint32_t position; } config = {
+        (uint32_t)context->query_heads, (uint32_t)context->kv_heads, (uint32_t)context->head_dim,
+        (uint32_t)context->bucket, position
+    };
+    [encoder setBytes:&config length:sizeof(config) atIndex:5];
+    [encoder dispatchThreads:grid_size(context->query_heads * 32) threadsPerThreadgroup:group_size(256)];
+    [encoder endEncoding];
+}
+
+static void encode_residual_rmsnorm_to(
+    Qwen3MetalStepContext *context,
+    id<MTLCommandBuffer> command_buffer,
+    id<MTLBuffer> projection,
+    NSUInteger projection_offset,
+    id<MTLBuffer> residual,
+    NSUInteger residual_offset,
+    id<MTLBuffer> normalized,
+    NSUInteger normalized_offset,
+    id<MTLBuffer> weight
+) {
+    id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+    [encoder setComputePipelineState:context->residual_rmsnorm];
+    [encoder setBuffer:projection offset:projection_offset atIndex:0];
+    [encoder setBuffer:residual offset:residual_offset atIndex:1];
+    [encoder setBuffer:normalized offset:normalized_offset atIndex:2];
+    [encoder setBuffer:weight offset:0 atIndex:3];
+    struct { uint32_t width; float epsilon; } config = { (uint32_t)context->hidden, context->epsilon };
+    [encoder setBytes:&config length:sizeof(config) atIndex:4];
+    [encoder dispatchThreads:grid_size(32) threadsPerThreadgroup:group_size(32)];
+    [encoder endEncoding];
+}
+
+static void encode_embedding_gather_to(
+    Qwen3MetalStepContext *context,
+    id<MTLCommandBuffer> command_buffer,
+    id<MTLBuffer> token_in,
+    NSUInteger in_offset,
+    id<MTLBuffer> input_out,
+    NSUInteger out_offset
+) {
+    id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+    [encoder setComputePipelineState:context->embedding_gather];
+    [encoder setBuffer:context->embeddings offset:0 atIndex:0];
+    [encoder setBuffer:token_in offset:in_offset atIndex:1];
+    [encoder setBuffer:input_out offset:out_offset atIndex:2];
+    struct { uint32_t hidden; } config = { (uint32_t)context->hidden };
+    [encoder setBytes:&config length:sizeof(config) atIndex:3];
+    [encoder dispatchThreads:grid_size(context->hidden) threadsPerThreadgroup:group_size(context->hidden)];
+    [encoder endEncoding];
+}
+
+static void encode_argmax_to(
+    Qwen3MetalStepContext *context,
+    id<MTLCommandBuffer> command_buffer,
+    id<MTLBuffer> logits,
+    NSUInteger logits_offset,
+    id<MTLBuffer> partial_keys,
+    NSUInteger keys_offset,
+    id<MTLBuffer> partial_ids,
+    NSUInteger ids_offset,
+    id<MTLBuffer> token_out,
+    NSUInteger out_offset
+) {
+    struct { uint32_t vocab; uint32_t partials; } config = {
+        (uint32_t)context->vocab, (uint32_t)context->argmax_partials
+    };
+    id<MTLComputeCommandEncoder> partial = [command_buffer computeCommandEncoder];
+    [partial setComputePipelineState:context->argmax_partial];
+    [partial setBuffer:logits offset:logits_offset atIndex:0];
+    [partial setBuffer:partial_keys offset:keys_offset atIndex:1];
+    [partial setBuffer:partial_ids offset:ids_offset atIndex:2];
+    [partial setBytes:&config length:sizeof(config) atIndex:3];
+    [partial dispatchThreadgroups:MTLSizeMake((NSUInteger)context->argmax_partials, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+    [partial endEncoding];
+
+    id<MTLComputeCommandEncoder> final = [command_buffer computeCommandEncoder];
+    [final setComputePipelineState:context->argmax_final];
+    [final setBuffer:partial_keys offset:keys_offset atIndex:0];
+    [final setBuffer:partial_ids offset:ids_offset atIndex:1];
+    [final setBuffer:token_out offset:out_offset atIndex:2];
+    [final setBytes:&config length:sizeof(config) atIndex:3];
+    [final dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+    [final endEncoding];
+}
+
+// Batched projection encoders: one dispatch runs all `batch` columns through a
+// weight, streaming each weight row once across the columns.
+static void encode_qkv_batch(
+    Qwen3MetalStepContext *context,
+    id<MTLCommandBuffer> command_buffer,
+    StepLayerBuffers *layer,
+    id<MTLBuffer> input,
+    uint32_t base_position,
+    uint32_t batch
+) {
+    uint32_t query_width = (uint32_t)(context->query_heads * context->head_dim);
+    uint32_t kv_width = (uint32_t)(context->kv_heads * context->head_dim);
+    id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+    [encoder setComputePipelineState:context->qkv_matvec_batch];
+    [encoder setBuffer:input offset:0 atIndex:0];
+    [encoder setBuffer:context->batch_query offset:0 atIndex:1];
+    [encoder setBuffer:context->batch_key offset:0 atIndex:2];
+    [encoder setBuffer:layer->value_cache offset:0 atIndex:3];
+    set_weight(encoder, &layer->q_weight, 4, 5);
+    set_weight(encoder, &layer->k_weight, 6, 7);
+    set_weight(encoder, &layer->v_weight, 8, 9);
+    struct { uint32_t input_width; uint32_t query_width; uint32_t kv_width; uint32_t head_dim; uint32_t capacity; uint32_t position; uint32_t quantized; uint32_t batch; } config = {
+        (uint32_t)context->hidden, query_width, kv_width, (uint32_t)context->head_dim,
+        (uint32_t)context->bucket, base_position, context->quantized, batch
+    };
+    [encoder setBytes:&config length:sizeof(config) atIndex:10];
+    NSUInteger qkv_rows = (NSUInteger)query_width + (NSUInteger)kv_width * 2;
+    NSUInteger qkv_threads = context->quantized ? qkv_rows * 32 : (NSUInteger)MAX(query_width, kv_width);
+    [encoder dispatchThreads:grid_size(qkv_threads) threadsPerThreadgroup:group_size(context->quantized ? 256 : qkv_threads)];
+    [encoder endEncoding];
+}
+
+static void encode_matvec_residual_batch(
+    Qwen3MetalStepContext *context,
+    id<MTLCommandBuffer> command_buffer,
+    id<MTLBuffer> input,
+    id<MTLBuffer> residual,
+    id<MTLBuffer> output,
+    StepWeight *weight,
+    uint32_t input_width,
+    uint32_t output_width,
+    BOOL add_residual,
+    uint32_t batch
+) {
+    id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+    [encoder setComputePipelineState:context->matvec_residual_batch];
+    [encoder setBuffer:input offset:0 atIndex:0];
+    [encoder setBuffer:residual offset:0 atIndex:1];
+    [encoder setBuffer:output offset:0 atIndex:2];
+    set_weight(encoder, weight, 3, 4);
+    struct { uint32_t input_width; uint32_t output_width; uint32_t quantized; uint32_t add_residual; uint32_t batch; } config = {
+        input_width, output_width, context->quantized, (uint32_t)add_residual, batch
+    };
+    [encoder setBytes:&config length:sizeof(config) atIndex:5];
+    NSUInteger threads = context->quantized ? (NSUInteger)((output_width + 3) / 4) * 32 : output_width;
+    [encoder dispatchThreads:grid_size(threads) threadsPerThreadgroup:group_size(context->quantized ? 256 : output_width)];
+    [encoder endEncoding];
+}
+
+static void encode_gate_up_batch(
+    Qwen3MetalStepContext *context,
+    id<MTLCommandBuffer> command_buffer,
+    StepLayerBuffers *layer,
+    id<MTLBuffer> input,
+    uint32_t batch
+) {
+    id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+    [encoder setComputePipelineState:context->gate_up_swiglu_batch];
+    [encoder setBuffer:input offset:0 atIndex:0];
+    [encoder setBuffer:context->batch_mlp offset:0 atIndex:1];
+    set_weight(encoder, &layer->gate_weight, 2, 3);
+    set_weight(encoder, &layer->up_weight, 4, 5);
+    struct { uint32_t input_width; uint32_t output_width; uint32_t quantized; uint32_t add_residual; uint32_t batch; } config = {
+        (uint32_t)context->hidden, (uint32_t)context->intermediate, context->quantized, 0, batch
+    };
+    [encoder setBytes:&config length:sizeof(config) atIndex:6];
+    NSUInteger threads = context->quantized ? ((context->intermediate + 3) / 4) * 32 : context->intermediate;
+    [encoder dispatchThreads:grid_size(threads) threadsPerThreadgroup:group_size(context->quantized ? 256 : context->intermediate)];
+    [encoder endEncoding];
+}
+
+static void encode_lm_head_batch(
+    Qwen3MetalStepContext *context,
+    id<MTLCommandBuffer> command_buffer,
+    uint32_t batch
+) {
+    id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+    [encoder setComputePipelineState:context->lm_head_batch];
+    [encoder setBuffer:context->batch_final_norm offset:0 atIndex:0];
+    [encoder setBuffer:context->batch_logits offset:0 atIndex:1];
+    set_weight(encoder, &context->lm_head_weight, 2, 3);
+    struct { uint32_t input_width; uint32_t output_width; uint32_t quantized; uint32_t add_residual; uint32_t batch; } config = {
+        (uint32_t)context->hidden, (uint32_t)context->vocab, context->quantized, 0, batch
+    };
+    [encoder setBytes:&config length:sizeof(config) atIndex:4];
+    NSUInteger threads = context->quantized ? ((context->vocab + 3) / 4) * 32 : context->vocab;
+    [encoder dispatchThreads:grid_size(threads) threadsPerThreadgroup:group_size(context->quantized ? 256 : context->vocab)];
+    [encoder endEncoding];
+}
+
+// One batched forward pass for `batch` draft columns starting at `base_position`.
+// Column k feeds batch_input row k (already gathered from the proposal tokens)
+// and produces logits row k plus an argmax in argmax_out[k]. Weights stream once
+// per layer across all columns; per-column norm/RoPE/attention reuse the
+// single-token kernels through buffer offsets. KV slots base_position..+batch-1
+// are written before any column's attention runs, so column k's causal prefix
+// (positions <= base_position+k) is fully resident and identical to the
+// sequential path.
+static void encode_forward_batch(
+    Qwen3MetalStepContext *context,
+    id<MTLCommandBuffer> command_buffer,
+    id<MTLBuffer> rope_cos,
+    id<MTLBuffer> rope_sin,
+    uint32_t base_position,
+    uint32_t batch,
+    float epsilon,
+    id<MTLBuffer> argmax_out
+) {
+    id<MTLBuffer> current = context->batch_input;
+    id<MTLBuffer> next = context->batch_x_b;
+    NSUInteger hidden_bytes = (NSUInteger)context->hidden * sizeof(uint16_t);
+    NSUInteger query_bytes = (NSUInteger)(context->query_heads * context->head_dim) * sizeof(uint16_t);
+    NSUInteger kv_bytes = (NSUInteger)(context->kv_heads * context->head_dim) * sizeof(uint16_t);
+    NSUInteger head_dim_bytes = (NSUInteger)context->head_dim * sizeof(uint16_t);
+    NSUInteger score_stride = (NSUInteger)context->query_heads * (NSUInteger)context->bucket * sizeof(float);
+    NSUInteger partial_stride = (NSUInteger)context->argmax_partials * sizeof(uint32_t);
+    NSUInteger vocab_bytes = (NSUInteger)context->vocab * sizeof(float);
+    uint32_t query_width = (uint32_t)(context->query_heads * context->head_dim);
+    for (uint64_t index = 0; index < context->layer_count; ++index) {
+        StepLayerBuffers *layer = &context->layers[index];
+        for (uint32_t k = 0; k < batch; ++k) {
+            encode_rmsnorm_to(context, command_buffer, current, k * hidden_bytes,
+                              context->batch_normalized, k * hidden_bytes, layer->input_norm,
+                              (uint32_t)context->hidden, epsilon);
+        }
+        encode_qkv_batch(context, command_buffer, layer, context->batch_normalized, base_position, batch);
+        for (uint32_t k = 0; k < batch; ++k) {
+            encode_qk_norm_rope_to(context, command_buffer, context->batch_query, k * query_bytes,
+                                   context->batch_key, k * kv_bytes, layer, rope_cos, rope_sin,
+                                   k * head_dim_bytes, base_position + k);
+        }
+        for (uint32_t k = 0; k < batch; ++k) {
+            encode_attention_to(context, command_buffer, context->batch_query, k * query_bytes, layer,
+                                context->batch_context, k * query_bytes, context->batch_attention_scores,
+                                k * score_stride, base_position + k);
+        }
+        encode_matvec_residual_batch(context, command_buffer, context->batch_context, current, next,
+                                     &layer->o_weight, query_width, (uint32_t)context->hidden, NO, batch);
+        for (uint32_t k = 0; k < batch; ++k) {
+            encode_residual_rmsnorm_to(context, command_buffer, next, k * hidden_bytes, current,
+                                       k * hidden_bytes, context->batch_normalized, k * hidden_bytes,
+                                       layer->post_attention_norm);
+        }
+        encode_gate_up_batch(context, command_buffer, layer, context->batch_normalized, batch);
+        encode_matvec_residual_batch(context, command_buffer, context->batch_mlp, next, current,
+                                     &layer->down_weight, (uint32_t)context->intermediate,
+                                     (uint32_t)context->hidden, YES, batch);
+    }
+    for (uint32_t k = 0; k < batch; ++k) {
+        encode_rmsnorm_to(context, command_buffer, current, k * hidden_bytes,
+                          context->batch_final_norm, k * hidden_bytes, context->final_norm_weight,
+                          (uint32_t)context->hidden, epsilon);
+    }
+    encode_lm_head_batch(context, command_buffer, batch);
+    for (uint32_t k = 0; k < batch; ++k) {
+        encode_argmax_to(context, command_buffer, context->batch_logits, k * vocab_bytes,
+                         context->batch_argmax_partial_keys, k * partial_stride,
+                         context->batch_argmax_partial_ids, k * partial_stride,
+                         argmax_out, k * sizeof(uint32_t));
+    }
+}
+
+// Batched speculative verification: run `steps` draft tokens through the
+// transformer in ONE forward pass (weights streamed once per layer) instead of
+// `steps` dependent single-token steps. Outputs are the greedy id after each
+// supplied token (argmaxes_out) and, when logits_out is non-null, the full
+// per-column f32 logits for the byte-exact gate. Produces results identical to
+// `steps` sequential single-token steps at the same positions.
+int32_t synapse_qwen3_metal_step_verify_batch(
+    void *raw,
+    uint64_t position,
+    const uint32_t *token_ids,
+    uint32_t steps,
+    const uint16_t *rope_cos,
+    const uint16_t *rope_sin,
+    uint32_t *argmaxes_out,
+    float *logits_out,
+    float epsilon
+) {
+    @autoreleasepool {
+        @try {
+            metal_step_error[0] = '\0';
+            double feed_started = [NSDate timeIntervalSinceReferenceDate];
+            Qwen3MetalStepContext *context = raw;
+            if (context == NULL || token_ids == NULL || rope_cos == NULL || rope_sin == NULL ||
+                argmaxes_out == NULL || context->layers == NULL || context->embeddings == nil ||
+                steps == 0 || steps > METAL_STEP_MAX_BATCH_K || position + steps > context->bucket) {
+                set_error(@"invalid Metal step batched verification arguments");
+                return -1;
+            }
+            if (!ensure_batch_resources(context)) {
+                return -2;
+            }
+            NSUInteger rope_span = (NSUInteger)steps * (NSUInteger)context->head_dim;
+            id<MTLBuffer> cosine_buffer = [context->device newBufferWithBytes:rope_cos
+                length:rope_span * sizeof(uint16_t) options:MTLResourceStorageModeShared];
+            id<MTLBuffer> sine_buffer = [context->device newBufferWithBytes:rope_sin
+                length:rope_span * sizeof(uint16_t) options:MTLResourceStorageModeShared];
+            id<MTLBuffer> proposal_buffer = [context->device newBufferWithBytes:token_ids
+                length:(NSUInteger)steps * sizeof(uint32_t) options:MTLResourceStorageModeShared];
+            id<MTLBuffer> argmax_buffer = [context->device newBufferWithLength:(NSUInteger)steps * sizeof(uint32_t)
+                options:MTLResourceStorageModeShared];
+            id<MTLCommandBuffer> command_buffer = [context->queue commandBuffer];
+            if (cosine_buffer == nil || sine_buffer == nil || proposal_buffer == nil ||
+                argmax_buffer == nil || command_buffer == nil) {
+                [cosine_buffer release];
+                [sine_buffer release];
+                [proposal_buffer release];
+                [argmax_buffer release];
+                set_error(@"failed to allocate Metal step batched verification buffers");
+                return -2;
+            }
+            NSUInteger hidden_bytes = (NSUInteger)context->hidden * sizeof(uint16_t);
+            for (uint32_t step = 0; step < steps; ++step) {
+                encode_embedding_gather_to(context, command_buffer, proposal_buffer,
+                                           (NSUInteger)step * sizeof(uint32_t),
+                                           context->batch_input, (NSUInteger)step * hidden_bytes);
+            }
+            encode_forward_batch(context, command_buffer, cosine_buffer, sine_buffer,
+                                 (uint32_t)position, steps, epsilon, argmax_buffer);
+            context->timings.feed_wall_s += [NSDate timeIntervalSinceReferenceDate] - feed_started;
+            double started = [NSDate timeIntervalSinceReferenceDate];
+            [command_buffer commit];
+            [command_buffer waitUntilCompleted];
+            context->timings.execute_wall_s += [NSDate timeIntervalSinceReferenceDate] - started;
+            BOOL ok = command_buffer.status != MTLCommandBufferStatusError;
+            if (!ok) {
+                set_error(command_buffer.error.localizedDescription ?: @"Metal step batched verification command buffer failed");
+            } else {
+                double readback_started = [NSDate timeIntervalSinceReferenceDate];
+                memcpy(argmaxes_out, argmax_buffer.contents, (NSUInteger)steps * sizeof(uint32_t));
+                if (logits_out != NULL) {
+                    memcpy(logits_out, context->batch_logits.contents,
+                           (NSUInteger)steps * (NSUInteger)context->vocab * sizeof(float));
+                }
+                context->timings.logits_readback_wall_s += [NSDate timeIntervalSinceReferenceDate] - readback_started;
+                context->timings.step_calls += steps;
+            }
+            [cosine_buffer release];
+            [sine_buffer release];
+            [proposal_buffer release];
+            [argmax_buffer release];
+            return ok ? 0 : -3;
+        } @catch (NSException *exception) {
+            set_error(exception.reason);
+            return -100;
+        }
+    }
+}
+
 // Encode the full transformer forward pass for one chained step, reading `input`
 // and advancing every layer's KV cache at `position`. This mirrors the per-token
 // encode order exactly; the only difference is that `position`, `input`, and the
@@ -1198,6 +1711,22 @@ void synapse_qwen3_metal_step_context_free(void *raw) {
     [context->argmax_partial_ids release];
     [context->chain_token_ids release];
     [context->chain_input release];
+    [context->batch_input release];
+    [context->batch_x_b release];
+    [context->batch_normalized release];
+    [context->batch_final_norm release];
+    [context->batch_query release];
+    [context->batch_key release];
+    [context->batch_context release];
+    [context->batch_attention_scores release];
+    [context->batch_mlp release];
+    [context->batch_logits release];
+    [context->batch_argmax_partial_keys release];
+    [context->batch_argmax_partial_ids release];
+    [context->qkv_matvec_batch release];
+    [context->matvec_residual_batch release];
+    [context->gate_up_swiglu_batch release];
+    [context->lm_head_batch release];
     [context->embedding_gather release];
     [context->argmax_final release];
     [context->argmax_partial release];
