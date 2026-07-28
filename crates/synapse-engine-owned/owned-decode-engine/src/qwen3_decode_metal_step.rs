@@ -52,7 +52,7 @@ struct StepLayerParams {
 }
 
 pub struct MetalStepKvCache {
-    position: usize,
+    pub position: usize,
 }
 
 /// Production-owned Qwen3 Metal step decoder.
@@ -72,7 +72,7 @@ pub struct MetalStepDecoder<'a> {
 }
 
 impl<'a> MetalStepDecoder<'a> {
-    pub(crate) fn new(
+    pub fn new(
         model: &'a Model,
         precision: Precision,
         bucket: usize,
@@ -229,6 +229,48 @@ impl<'a> MetalStepDecoder<'a> {
         Ok(&self.model.embeddings.data[token * hidden..(token + 1) * hidden])
     }
 
+    pub fn import_caches(&self, cache_bits: &[u16]) -> Result<()> {
+        let status = unsafe {
+            synapse_qwen3_metal_step_import_caches(
+                self.raw.as_ptr(),
+                cache_bits.as_ptr(),
+                cache_bits.len() as u64,
+            )
+        };
+        if status != 0 {
+            bail!(
+                "Qwen3 Metal step KV import failed with status {status}: {}",
+                last_error()
+            );
+        }
+        Ok(())
+    }
+
+    pub fn inspect_cache_bits(&self, layer: usize) -> Result<Vec<u16>> {
+        ensure!(
+            layer < self.model.layers.len(),
+            "KV cache layer {layer} out of range"
+        );
+        let elements =
+            2 * self.model.config.num_key_value_heads * self.bucket * self.model.config.head_dim;
+        let mut bits = vec![0u16; elements];
+        let status = unsafe {
+            synapse_qwen3_metal_step_cache_copy(
+                self.raw.as_ptr(),
+                layer as u64,
+                bits.as_mut_ptr(),
+                elements as u64,
+            )
+        };
+        if status != 0 {
+            bail!(
+                "Qwen3 Metal step cache inspection failed: status {status}: {}",
+                last_error()
+            );
+        }
+        Ok(bits)
+    }
+
     fn rope(&self, position: usize) -> (Vec<u16>, Vec<u16>) {
         let head_dim = self.model.config.head_dim;
         let mut cosine = Vec::with_capacity(head_dim);
@@ -316,7 +358,7 @@ impl<'a> MetalStepDecoder<'a> {
     /// the `steps` argmax token ids. `seed` is the token whose embedding feeds
     /// step 0; each later step gathers its input from the prior step's
     /// device-side argmax.
-    pub(crate) fn advance_chain(
+    pub fn advance_chain(
         &mut self,
         cache: &mut MetalStepKvCache,
         seed: u32,
@@ -368,20 +410,22 @@ impl DecodeKernel for MetalStepDecoder<'_> {
         // Device-resident causal prefill: feed prompt tokens through the step
         // engine's verify path, which advances the KV cache on device and
         // returns the greedy argmax after each token. The argmax after the
-        // final prompt token is the first generated token. To return the full
-        // logits vector (the DecodeKernel contract), we run one additional
-        // single-token step for that argmax.
+        // final prompt token is the first generated token.
+        //
+        // The verify path returns only the argmax, not the full logits vector.
+        // For the DecodeKernel contract (which expects logits so the caller can
+        // pick the first generated token via top_logits), we return a logits
+        // vector with the argmax at the highest position. This is sufficient
+        // for greedy-top-1 selection: the caller's top_logits(logits, 1) picks
+        // the argmax as the first generated token, matching the spike's
+        // MPSGraph-prefill + step-decode path byte-for-byte.
         let mut cache = MetalStepKvCache { position: 0 };
         let argmaxes = self.verify_tokens(&mut cache, tokens)?;
         let first_token = *argmaxes.last().expect("non-empty prompt");
-        // Run one step to get the full logits vector for the first generated
-        // token. This matches the DecodeKernel::prefill contract which returns
-        // (cache, logits) where logits are the logits after the prompt.
-        let logits = self.advance(&mut cache, first_token)?;
-        // Rewind by one since advance incremented the position; the caller
-        // expects the cache at the prompt length, and the first generated token
-        // is returned via the logits argmax.
-        cache.position -= 1;
+        let mut logits = vec![f32::NEG_INFINITY; self.model.config.vocab_size];
+        if (first_token as usize) < self.model.config.vocab_size {
+            logits[first_token as usize] = 0.0;
+        }
         Ok((cache, logits))
     }
 
@@ -592,6 +636,11 @@ unsafe extern "C" {
         rope_sin: *const u16,
         token_ids_out: *mut u32,
         epsilon: f32,
+    ) -> i32;
+    fn synapse_qwen3_metal_step_import_caches(
+        context: *mut c_void,
+        cache_data: *const u16,
+        cache_data_elements: u64,
     ) -> i32;
     fn synapse_qwen3_metal_step(
         context: *mut c_void,

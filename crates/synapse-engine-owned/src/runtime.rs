@@ -20,7 +20,7 @@ const BUCKET_MAX_BATCH_ROWS: usize = 8;
 const BUCKET_SEQUENCE_LADDER: &[usize] = &[64, 96, 128, 160, 192, 256, 320, 384, 448, 512];
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(crate) enum Precision {
+pub enum Precision {
     F32,
     F16,
 }

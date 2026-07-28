@@ -282,11 +282,11 @@ pub(crate) struct RmsNorm {
 }
 
 impl Model {
-    pub(crate) fn load(path: &Path, precision: Precision) -> Result<Self> {
+    pub fn load(path: &Path, precision: Precision) -> Result<Self> {
         Self::load_with_quant(path, precision, WeightQuantization::None)
     }
 
-    pub(crate) fn load_with_quant(
+    pub fn load_with_quant(
         path: &Path,
         _precision: Precision,
         weight_quantization: WeightQuantization,
@@ -442,7 +442,7 @@ impl Model {
         })
     }
 
-    pub(crate) fn generation_stop_ids(&self) -> &[u32] {
+    pub fn generation_stop_ids(&self) -> &[u32] {
         &self.generation_stop_ids
     }
 

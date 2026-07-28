@@ -27,6 +27,10 @@ mod runtime;
 #[path = "../owned-decode-engine/src/lib.rs"]
 pub mod owned_decode_engine;
 
+/// Precision enum re-exported for decode engine consumers.
+#[cfg(target_os = "macos")]
+pub use runtime::Precision;
+
 pub const ENGINE_VERSION: &str = "owned-metal-v1";
 // Bump whenever a compiled MPSGraph changes structure (ops added, removed, or reordered).
 // The revision is part of both the explicit-executable package cache key and the engine

@@ -107,7 +107,7 @@ pub struct Lfm2HybridStepEngine {
 }
 
 impl Lfm2HybridStepEngine {
-    pub(crate) fn new(
+    pub fn new(
         model: &Model,
         precision: Precision,
         bucket: usize,
@@ -355,7 +355,7 @@ impl Lfm2HybridStepEngine {
     }
 
     /// Zero every layer's conv and KV caches (start-of-sequence state).
-    pub(crate) fn reset(&mut self) -> Result<()> {
+    pub fn reset(&mut self) -> Result<()> {
         let status = unsafe { synapse_lfm2_hybrid_step_reset(self.raw.as_ptr()) };
         if status != 0 {
             bail!("LFM2 hybrid step reset failed ({status}): {}", last_error());
@@ -366,7 +366,7 @@ impl Lfm2HybridStepEngine {
     /// Prefill a prompt token-by-token on device, returning the greedy argmax
     /// after the final prompt token (the first generated token). Advances all
     /// caches to `prompt.len()`.
-    pub(crate) fn prefill(&mut self, prompt: &[u32]) -> Result<u32> {
+    pub fn prefill(&mut self, prompt: &[u32]) -> Result<u32> {
         ensure!(!prompt.is_empty(), "LFM2 hybrid prefill needs a prompt");
         ensure!(
             prompt.len() <= self.bucket,
@@ -395,12 +395,7 @@ impl Lfm2HybridStepEngine {
     /// Chained greedy generation: feed `first_token` and decode `steps` tokens
     /// on device with on-GPU argmax, starting at `position`. Returns the `steps`
     /// tokens produced AFTER `first_token`.
-    pub(crate) fn chain(
-        &mut self,
-        position: usize,
-        steps: usize,
-        first_token: u32,
-    ) -> Result<Vec<u32>> {
+    pub fn chain(&mut self, position: usize, steps: usize, first_token: u32) -> Result<Vec<u32>> {
         if steps == 0 {
             return Ok(Vec::new());
         }

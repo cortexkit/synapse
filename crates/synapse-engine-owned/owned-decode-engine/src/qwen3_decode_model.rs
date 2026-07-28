@@ -35,13 +35,13 @@ struct GenerationConfig {
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct Config {
+pub struct Config {
     pub(crate) hidden_size: usize,
     pub(crate) intermediate_size: usize,
     pub(crate) num_attention_heads: usize,
     pub(crate) num_hidden_layers: usize,
-    pub(crate) num_key_value_heads: usize,
-    pub(crate) head_dim: usize,
+    pub num_key_value_heads: usize,
+    pub head_dim: usize,
     pub(crate) rms_norm_eps: f32,
     pub(crate) rope_theta: f32,
     pub(crate) vocab_size: usize,
@@ -51,18 +51,18 @@ pub(crate) struct Config {
 }
 
 pub struct Model {
-    pub(crate) config: Config,
+    pub config: Config,
     pub(crate) eos_token_id: u32,
     pub(crate) generation_stop_ids: Vec<u32>,
     pub(crate) embeddings: Tensor,
-    pub(crate) layers: Vec<Layer>,
+    pub layers: Vec<Layer>,
     pub(crate) final_norm: RmsNorm,
     pub(crate) lm_head: Option<Weight>,
     pub(crate) tied_lm_head_q8_0: Option<Q8_0Tensor>,
     pub(crate) weight_quantization: WeightQuantization,
 }
 
-pub(crate) struct Layer {
+pub struct Layer {
     pub(crate) input_norm: RmsNorm,
     pub(crate) post_attention_norm: RmsNorm,
     pub(crate) q_proj: Weight,
@@ -99,11 +99,11 @@ fn layer_weights(layer: &Layer) -> [&Weight; 7] {
 }
 
 impl Model {
-    pub(crate) fn load(path: &Path, precision: Precision) -> Result<Self> {
+    pub fn load(path: &Path, precision: Precision) -> Result<Self> {
         Self::load_with_quant(path, precision, WeightQuantization::None)
     }
 
-    pub(crate) fn load_with_quant(
+    pub fn load_with_quant(
         path: &Path,
         precision: Precision,
         weight_quantization: WeightQuantization,
@@ -288,7 +288,7 @@ impl Model {
         })
     }
 
-    pub(crate) fn generation_stop_ids(&self) -> &[u32] {
+    pub fn generation_stop_ids(&self) -> &[u32] {
         &self.generation_stop_ids
     }
 

@@ -39,7 +39,12 @@ pub use json_constraint::{DecodeConstraint, JsonConstraint, TokenMask, TokenVoca
 pub use lfm2_decode_metal_step::{Lfm2HybridStepCache, Lfm2HybridStepEngine};
 pub use lfm2_decode_model::Model as Lfm2DecodeModel;
 pub use quant::{Q8_0Tensor, WeightQuantization};
-pub use qwen3_decode_metal_step::{MetalStepDecoder, MetalStepKvCache as Qwen3StepCache};
+
+/// Re-export of the runtime precision enum for decode engine consumers.
+pub use crate::Precision;
+pub use qwen3_decode_metal_step::{
+    MetalStepDecoder, MetalStepKvCache, MetalStepKvCache as Qwen3StepCache,
+};
 pub use qwen3_decode_model::Model as Qwen3DecodeModel;
 
 /// Decode lane identity for the owned-metal-decode engine.
