@@ -1,0 +1,112 @@
+{
+  "manifest_revision": "decode-ownership-manifest-v1",
+  "schema_revision": "owned-decode-contracts-v1",
+  "fault_sites": [
+    {
+      "id": "alloc-kv-cache",
+      "group": "allocation",
+      "description": "Attention KV-cache allocation on worker startup",
+      "ownership_rule": "Rust owns allocation; Objective-C receives an opaque handle and must not free it",
+      "asan_test_name": "ownership::alloc_kv_cache_no_leak",
+      "run_record": "macos-metal/ownership/alloc-kv-cache.json"
+    },
+    {
+      "id": "transfer-kv-cache",
+      "group": "ownership_transfer",
+      "description": "KV-cache ownership transfer across the FFI boundary on generate_start",
+      "ownership_rule": "Transfer is atomic: the Rust side drops its reference before the Objective-C side assumes it",
+      "asan_test_name": "ownership::transfer_kv_cache_no_double_free",
+      "run_record": "macos-metal/ownership/transfer-kv-cache.json"
+    },
+    {
+      "id": "partial-init-cleanup",
+      "group": "partial_initialization",
+      "description": "Cleanup after a partial model-cache initialization failure",
+      "ownership_rule": "The allocating side releases every sub-allocation; the receiver never sees a partially initialized object",
+      "asan_test_name": "ownership::partial_init_cleanup_no_invalid_free",
+      "run_record": "macos-metal/ownership/partial-init-cleanup.json"
+    },
+    {
+      "id": "generation-resident-state",
+      "group": "generation",
+      "description": "Resident generation state (KV-cache, LFM2 conv rolling cache, constraint automaton) across quanta",
+      "ownership_rule": "Worker owns resident state between authorized quanta; module owns the permit and destroys state on cleanup",
+      "asan_test_name": "ownership::generation_resident_state_no_use_after_free",
+      "run_record": "macos-metal/ownership/generation-resident-state.json"
+    },
+    {
+      "id": "cancellation-cleanup",
+      "group": "cancellation",
+      "description": "Acknowledged cancellation cleanup before worker timeout",
+      "ownership_rule": "Clean cancellation consumes no crash budget; resident state is destroyed and the worker returns no authoritative text",
+      "asan_test_name": "ownership::cancellation_cleanup_no_leak",
+      "run_record": "macos-metal/ownership/cancellation-cleanup.json"
+    },
+    {
+      "id": "timeout-cleanup",
+      "group": "timeout",
+      "description": "Timeout cleanup and worker kill after failed cancellation",
+      "ownership_rule": "Timeout cleanup charges one crash-budget strike and destroys all resident state",
+      "asan_test_name": "ownership::timeout_cleanup_no_use_after_free",
+      "run_record": "macos-metal/ownership/timeout-cleanup.json"
+    },
+    {
+      "id": "unload-model",
+      "group": "unload",
+      "description": "Model unload on worker shutdown",
+      "ownership_rule": "The Rust side drops the loaded-model reference; the Objective-C side releases Metal resources it allocated",
+      "asan_test_name": "ownership::unload_model_no_leak",
+      "run_record": "macos-metal/ownership/unload-model.json"
+    },
+    {
+      "id": "shutdown-worker",
+      "group": "shutdown",
+      "description": "Supervised worker shutdown and transport session close",
+      "ownership_rule": "The module closes the transport session; the worker drains in-flight command buffers before exit",
+      "asan_test_name": "ownership::shutdown_worker_no_leak",
+      "run_record": "macos-metal/ownership/shutdown-worker.json"
+    },
+    {
+      "id": "lfm2-conv-cache",
+      "group": "lfm2_conv_cache",
+      "description": "LFM2 short-convolution rolling cache ownership across the FFI boundary",
+      "ownership_rule": "The Rust side allocates the fixed-size conv cache; the Objective-C side reads and updates it in place and never frees it",
+      "asan_test_name": "ownership::lfm2_conv_cache_no_double_free",
+      "run_record": "macos-metal/ownership/lfm2-conv-cache.json"
+    }
+  ],
+  "concrete_writable_arrays": [
+    {
+      "id": "kv-cache-qwen3",
+      "owner": "rust",
+      "start_offset": 0,
+      "end_offset": 4194303,
+      "element_type": "f16",
+      "length": 2097152
+    },
+    {
+      "id": "kv-cache-lfm2",
+      "owner": "rust",
+      "start_offset": 4194304,
+      "end_offset": 8388607,
+      "element_type": "f16",
+      "length": 2097152
+    },
+    {
+      "id": "lfm2-conv-rolling",
+      "owner": "rust",
+      "start_offset": 8388608,
+      "end_offset": 8421375,
+      "element_type": "f32",
+      "length": 8192
+    },
+    {
+      "id": "constraint-automaton",
+      "owner": "rust",
+      "start_offset": 8421376,
+      "end_offset": 8454143,
+      "element_type": "u32",
+      "length": 8192
+    }
+  ]
+}

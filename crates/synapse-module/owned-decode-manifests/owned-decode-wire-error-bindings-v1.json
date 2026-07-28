@@ -1,0 +1,15 @@
+{
+  "manifest_revision": "owned-decode-wire-error-bindings-v1",
+  "schema_revision": "owned-decode-contracts-v1",
+  "request_contract_revision": "wire-contract-v1",
+  "deadline_error_id": "deadline_exceeded",
+  "cancellation_error_id": "cancelled",
+  "wire_changelog": [
+    {
+      "retired_id": "grammar_unavailable_in_build",
+      "replacement_id": "grammar_disabled",
+      "affected_consumers": ["microllm.oneshot"],
+      "notes": "grammar_unavailable_in_build is retired in favor of grammar_disabled; finish-reason normalization preserves lane_finish_reason as additive provenance. Changing either literal or the authoritative request-contract revision requires a new binding-manifest revision and reruns G-DEC-03, G-DEC-07, and G-DEC-12."
+    }
+  ]
+}

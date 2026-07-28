@@ -1,0 +1,26 @@
+{
+  "manifest_revision": "ci-lane-manifest-v1",
+  "schema_revision": "owned-decode-contracts-v1",
+  "normal_targets": [
+    "linux-x86_64",
+    "windows-x86_64",
+    "macos-arm64"
+  ],
+  "mandatory_targets": [
+    "macos-metal"
+  ],
+  "mandatory_lane_gates": [
+    "G-DEC-01",
+    "G-DEC-02",
+    "G-DEC-03",
+    "G-DEC-04",
+    "G-DEC-05",
+    "G-DEC-06",
+    "G-DEC-07",
+    "G-DEC-08",
+    "G-DEC-09",
+    "G-DEC-10",
+    "G-DEC-11",
+    "G-DEC-12"
+  ]
+}

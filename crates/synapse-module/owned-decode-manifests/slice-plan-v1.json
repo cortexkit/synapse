@@ -1,0 +1,22 @@
+{
+  "manifest_revision": "slice-plan-v1",
+  "schema_revision": "owned-decode-contracts-v1",
+  "slice_id": "S1-contract-manifests",
+  "work_item": "wi:[consult-id]:4:s1",
+  "file_fence": [
+    "crates/synapse-module/owned-decode-contracts/**",
+    "crates/synapse-module/owned-decode-manifests/**"
+  ],
+  "artifacts": [
+    "crates/synapse-module/owned-decode-manifests/decode-context-buckets-v1.json",
+    "crates/synapse-module/owned-decode-manifests/decode-sched-manifest-v1.json",
+    "crates/synapse-module/owned-decode-manifests/decode-ownership-manifest-v1.json",
+    "crates/synapse-module/owned-decode-manifests/decode-fixture-registry-v1.json",
+    "crates/synapse-module/owned-decode-manifests/structural-band-v1.json",
+    "crates/synapse-module/owned-decode-manifests/owned-decode-wire-error-bindings-v1.json",
+    "crates/synapse-module/owned-decode-manifests/grammar-cost-corpus-v1.json",
+    "crates/synapse-module/owned-decode-manifests/ci-lane-manifest-v1.json",
+    "crates/synapse-module/owned-decode-manifests/slice-plan-v1.json",
+    "crates/synapse-module/src/owned_decode_contracts/mod.rs"
+  ]
+}

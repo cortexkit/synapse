@@ -1,0 +1,15 @@
+{
+  "manifest_revision": "decode-context-buckets-v1",
+  "schema_revision": "owned-decode-contracts-v1",
+  "families": [
+    {
+      "family": "qwen3-0.6b",
+      "verified_buckets": [512, 1024, 2048]
+    },
+    {
+      "family": "lfm2-1.2b",
+      "verified_buckets": [512, 1024, 2048]
+    }
+  ],
+  "removed_buckets": []
+}

@@ -1,0 +1,266 @@
+{
+  "manifest_revision": "decode-fixture-registry-v1",
+  "schema_revision": "owned-decode-contracts-v1",
+  "groups": [
+    {
+      "id": "decode-parity",
+      "description": "20-prompt-by-64-token parity batteries for both families and both formats"
+    },
+    {
+      "id": "request-processing",
+      "description": "Module-owned tokenization, templating, and detokenization identity for both families"
+    },
+    {
+      "id": "constrained-positive",
+      "description": "Accepted grammar forms and valid constrained output"
+    },
+    {
+      "id": "constrained-negative",
+      "description": "Rejected keywords, numeric limits, identity mismatches, and typed grammar errors"
+    },
+    {
+      "id": "scheduler-continuity",
+      "description": "Parity and protocol-behavior fixtures crossing quantum boundaries"
+    }
+  ],
+  "entries": [
+    {
+      "id": "parity-qwen3-0.6b-f16-20x64",
+      "group": "decode-parity",
+      "kind": "decode_parity",
+      "details": {
+        "family": "qwen3-0.6b",
+        "activation_dtype": "f16",
+        "weight_quant": "f16",
+        "prompt_count": 20,
+        "max_tokens": 64,
+        "oracle_provenance": "bench/campaign/decode-fixtures"
+      }
+    },
+    {
+      "id": "parity-qwen3-0.6b-q8_0-20x64",
+      "group": "decode-parity",
+      "kind": "decode_parity",
+      "details": {
+        "family": "qwen3-0.6b",
+        "activation_dtype": "f16",
+        "weight_quant": "q8_0",
+        "prompt_count": 20,
+        "max_tokens": 64,
+        "oracle_provenance": "bench/campaign/decode-fixtures"
+      }
+    },
+    {
+      "id": "parity-lfm2-1.2b-f16-20x64",
+      "group": "decode-parity",
+      "kind": "decode_parity",
+      "details": {
+        "family": "lfm2-1.2b",
+        "activation_dtype": "f16",
+        "weight_quant": "f16",
+        "prompt_count": 20,
+        "max_tokens": 64,
+        "oracle_provenance": "bench/campaign/decode-fixtures"
+      }
+    },
+    {
+      "id": "parity-lfm2-1.2b-q8_0-20x64",
+      "group": "decode-parity",
+      "kind": "decode_parity",
+      "details": {
+        "family": "lfm2-1.2b",
+        "activation_dtype": "f16",
+        "weight_quant": "q8_0",
+        "prompt_count": 20,
+        "max_tokens": 64,
+        "oracle_provenance": "bench/campaign/decode-fixtures"
+      }
+    },
+    {
+      "id": "request-processing-qwen3-0.6b",
+      "group": "request-processing",
+      "kind": "request_processing",
+      "details": {
+        "family": "qwen3-0.6b",
+        "tokenizer_sanitized_digest": "pending-registration",
+        "prompt_template_revision": "qwen3-chat-v1",
+        "special_token_policy_revision": "qwen3-special-v1",
+        "stop_token_policy_revision": "qwen3-stop-v1",
+        "detokenizer_revision": "qwen3-detok-v1"
+      }
+    },
+    {
+      "id": "request-processing-lfm2-1.2b",
+      "group": "request-processing",
+      "kind": "request_processing",
+      "details": {
+        "family": "lfm2-1.2b",
+        "tokenizer_sanitized_digest": "pending-registration",
+        "prompt_template_revision": "lfm2-chat-v1",
+        "special_token_policy_revision": "lfm2-special-v1",
+        "stop_token_policy_revision": "lfm2-stop-v1",
+        "detokenizer_revision": "lfm2-detok-v1"
+      }
+    },
+    {
+      "id": "constrained-positive-object-required",
+      "group": "constrained-positive",
+      "kind": "constrained_positive",
+      "details": {
+        "schema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "type": "object",
+          "properties": {
+            "name": { "type": "string" }
+          },
+          "required": ["name"],
+          "additionalProperties": false
+        },
+        "validator": "independent-json-schema-validator"
+      }
+    },
+    {
+      "id": "constrained-positive-array-items",
+      "group": "constrained-positive",
+      "kind": "constrained_positive",
+      "details": {
+        "schema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "type": "array",
+          "items": { "type": "integer" }
+        },
+        "validator": "independent-json-schema-validator"
+      }
+    },
+    {
+      "id": "constrained-positive-enum-string",
+      "group": "constrained-positive",
+      "kind": "constrained_positive",
+      "details": {
+        "schema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "type": "string",
+          "enum": ["red", "green", "blue"]
+        },
+        "validator": "independent-json-schema-validator"
+      }
+    },
+    {
+      "id": "constrained-negative-allOf-rejected",
+      "group": "constrained-negative",
+      "kind": "constrained_negative",
+      "details": {
+        "rejected_keyword": "allOf",
+        "expected_error": "grammar_feature_unsupported"
+      }
+    },
+    {
+      "id": "constrained-negative-tuple-items-rejected",
+      "group": "constrained-negative",
+      "kind": "constrained_negative",
+      "details": {
+        "rejected_keyword": "items-tuple-form",
+        "expected_error": "grammar_feature_unsupported"
+      }
+    },
+    {
+      "id": "constrained-negative-additionalProperties-true-rejected",
+      "group": "constrained-negative",
+      "kind": "constrained_negative",
+      "details": {
+        "rejected_keyword": "additionalProperties-true",
+        "expected_error": "grammar_feature_unsupported"
+      }
+    },
+    {
+      "id": "constrained-negative-identity-mismatch",
+      "group": "constrained-negative",
+      "kind": "constrained_negative",
+      "details": {
+        "mismatch": "constraint_runtime_identity",
+        "expected_error": "owned_decode_constraint_version_mismatch"
+      }
+    },
+    {
+      "id": "constrained-negative-refusal-mapping",
+      "group": "constrained-negative",
+      "kind": "constrained_negative",
+      "details": {
+        "owned_refusal": "owned_decode_not_certified",
+        "mapped_error": "grammar_disabled",
+        "underlying_owned_decode_refusal_id": "owned_decode_not_certified"
+      }
+    },
+    {
+      "id": "sched-continuity-parity-n8",
+      "group": "scheduler-continuity",
+      "kind": "scheduler_continuity",
+      "details": {
+        "fixture_kind": "parity",
+        "candidate_n": 8,
+        "boundaries_crossed": 2
+      }
+    },
+    {
+      "id": "sched-continuity-parity-n16",
+      "group": "scheduler-continuity",
+      "kind": "scheduler_continuity",
+      "details": {
+        "fixture_kind": "parity",
+        "candidate_n": 16,
+        "boundaries_crossed": 2
+      }
+    },
+    {
+      "id": "sched-continuity-parity-n32",
+      "group": "scheduler-continuity",
+      "kind": "scheduler_continuity",
+      "details": {
+        "fixture_kind": "parity",
+        "candidate_n": 32,
+        "boundaries_crossed": 2
+      }
+    },
+    {
+      "id": "sched-continuity-protocol-mid-quantum-cancel",
+      "group": "scheduler-continuity",
+      "kind": "scheduler_continuity",
+      "details": {
+        "fixture_kind": "protocol_behavior",
+        "event": "mid-quantum cancellation deferral",
+        "expected_outcome": "acknowledged cancellation with committed-token count"
+      }
+    },
+    {
+      "id": "sched-continuity-protocol-deadline-boundary",
+      "group": "scheduler-continuity",
+      "kind": "scheduler_continuity",
+      "details": {
+        "fixture_kind": "protocol_behavior",
+        "event": "deadline at a boundary",
+        "expected_outcome": "literal deadline error from wire_error_bindings"
+      }
+    },
+    {
+      "id": "sched-continuity-protocol-crash-redispatch",
+      "group": "scheduler-continuity",
+      "kind": "scheduler_continuity",
+      "details": {
+        "fixture_kind": "protocol_behavior",
+        "event": "crash-qualified redispatch",
+        "expected_outcome": "token-zero reexecution, attempt-local sequence reset, at most one redispatch"
+      }
+    },
+    {
+      "id": "sched-continuity-protocol-stale-session",
+      "group": "scheduler-continuity",
+      "kind": "scheduler_continuity",
+      "details": {
+        "fixture_kind": "protocol_behavior",
+        "event": "stale worker session or generation",
+        "expected_outcome": "owned_decode_protocol_mismatch"
+      }
+    }
+  ],
+  "grammar_cost_corpus_revision": "grammar-cost-corpus-v1"
+}

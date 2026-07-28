@@ -1,0 +1,30 @@
+{
+  "manifest_revision": "structural-band-v1",
+  "schema_revision": "owned-decode-contracts-v1",
+  "rules": [
+    {
+      "family": "qwen3-0.6b",
+      "weight_quant": "f16",
+      "max_top2_swaps": 2,
+      "fork_signature_recertification": "recertification requires the stored signature exactly; no cross-profile f16 equality is promised"
+    },
+    {
+      "family": "qwen3-0.6b",
+      "weight_quant": "q8_0",
+      "max_top2_swaps": 0,
+      "fork_signature_recertification": "Q8 requires zero forks; recertification requires the stored signature exactly"
+    },
+    {
+      "family": "lfm2-1.2b",
+      "weight_quant": "f16",
+      "max_top2_swaps": 2,
+      "fork_signature_recertification": "recertification requires the stored signature exactly; no cross-profile f16 equality is promised"
+    },
+    {
+      "family": "lfm2-1.2b",
+      "weight_quant": "q8_0",
+      "max_top2_swaps": 0,
+      "fork_signature_recertification": "Q8 requires zero forks; recertification requires the stored signature exactly"
+    }
+  ]
+}

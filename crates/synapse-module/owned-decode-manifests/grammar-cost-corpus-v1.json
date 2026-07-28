@@ -1,0 +1,73 @@
+{
+  "manifest_revision": "grammar-cost-corpus-v1",
+  "schema_revision": "owned-decode-contracts-v1",
+  "model_identity": {
+    "family": "qwen3-0.6b",
+    "activation_dtype": "f16",
+    "weight_quant": "f16"
+  },
+  "fixtures": [
+    {
+      "id": "grammar-cost-object-small",
+      "prompt": "Generate a small JSON object with name and age fields",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "age": { "type": "integer" }
+        },
+        "required": ["name", "age"],
+        "additionalProperties": false
+      },
+      "output_count": 1
+    },
+    {
+      "id": "grammar-cost-array-strings",
+      "prompt": "Generate a JSON array of three strings",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "array",
+        "items": { "type": "string" }
+      },
+      "output_count": 1
+    },
+    {
+      "id": "grammar-cost-nested-object",
+      "prompt": "Generate a JSON object with a nested address object",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "address": {
+            "type": "object",
+            "properties": {
+              "city": { "type": "string" }
+            },
+            "required": ["city"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["name", "address"],
+        "additionalProperties": false
+      },
+      "output_count": 1
+    },
+    {
+      "id": "grammar-cost-enum",
+      "prompt": "Generate a JSON string from an enum of colors",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "string",
+        "enum": ["red", "green", "blue"]
+      },
+      "output_count": 1
+    }
+  ],
+  "warmup": 10,
+  "sampling": "greedy_top1",
+  "repetitions": 50,
+  "timing_boundaries": "per-token step, per-quantum boundary, end-to-end",
+  "percentile_calculation": "nearest-rank p50 and p95 over constrained masking time per token and constrained throughput tokens/sec"
+}

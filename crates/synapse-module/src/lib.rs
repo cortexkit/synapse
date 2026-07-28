@@ -11,6 +11,11 @@ use std::{
 
 // Provider adapters stay module-private so credentials and remote identity checks
 // cannot be bypassed by a second public call path.
+/// Module-owned schemas and checked-in records for the production owned-decode
+/// lane. Loaded by catalog validation, CI probes, and the production cutover
+/// predicate that gates enabling the owned-metal-decode lane per machine
+/// profile. See `owned_decode_contracts::load_manifest_dir`.
+pub mod owned_decode_contracts;
 #[allow(dead_code)]
 mod remote;
 mod store;

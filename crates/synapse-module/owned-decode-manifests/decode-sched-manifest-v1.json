@@ -1,0 +1,42 @@
+{
+  "manifest_revision": "decode-sched-manifest-v1",
+  "schema_revision": "owned-decode-contracts-v1",
+  "runtime": {
+    "production_n": 16,
+    "yield_policy_revision": "yield-on-contention-v1",
+    "decode_weight": 4,
+    "decode_aging_window_ms": 250,
+    "progress_protocol_revision": "generate-progress-v1"
+  },
+  "workload": {
+    "family": "qwen3-0.6b",
+    "format": "f16",
+    "context_bucket": 2048,
+    "prompt_length": 128,
+    "output_length": 64,
+    "embedding_concurrency": 4,
+    "arrival_process": "closed-loop",
+    "warmup": 20,
+    "duration_ms": 60000,
+    "embed_query_p95_slo_ms": 45.0,
+    "baseline_calculation": "same-session embed-only p95 before decode admission",
+    "regression_calculation": "same-session embed-only p95 after decode admission, percent delta",
+    "cancellation_latency_bound_ms": 400,
+    "cancellation_observations": [],
+    "deadline_observations": [],
+    "timing_boundaries": "per-quantum boundary, per-token step, end-to-end",
+    "percentile_method": "nearest-rank"
+  },
+  "evidence": {
+    "committed_n": null,
+    "max_uninterruptible_gpu_time_ms": null,
+    "observed_n": null,
+    "continuation_count": null,
+    "sequence_traces": [],
+    "permit_events": [],
+    "queue_depth": [],
+    "per_operation_waiting_ms": [],
+    "cancellation_latency_ms": [],
+    "deadline_latency_ms": []
+  }
+}
