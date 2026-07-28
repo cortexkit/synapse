@@ -98,8 +98,10 @@ impl DecodeError {
     }
 
     /// Whether this error is eligible for llama fallback during pre-dispatch
-    /// lane selection. Exactly the six IDs listed by `lane_selection_and_fallback`
-    /// are eligible; every other error returns directly.
+    /// lane selection. The fallback-eligible refusals are exactly the six
+    /// matched below (uncertified, failed certification, quarantined, poisoned
+    /// artifact, unavailable, unsupported); every other error returns directly
+    /// to the caller.
     #[must_use]
     pub const fn is_fallback_eligible(self) -> bool {
         matches!(
@@ -114,9 +116,10 @@ impl DecodeError {
     }
 
     /// Whether a constrained request maps this pre-dispatch owned refusal to
-    /// `grammar_disabled`. The same six fallback-eligible IDs are the mappable
-    /// set; protocol, runtime, constraint, sampling, context, fingerprint, and
-    /// grammar errors return directly.
+    /// `grammar_disabled`. Constrained requests never fall back to llama, so
+    /// the same six refusals that would have been fallback-eligible surface as
+    /// `grammar_disabled` instead; protocol, runtime, constraint, sampling,
+    /// context, fingerprint, and grammar errors return directly.
     #[must_use]
     pub const fn maps_to_grammar_disabled_for_constrained(self) -> bool {
         self.is_fallback_eligible()
