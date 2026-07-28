@@ -16,6 +16,15 @@ use std::{
 /// predicate that gates enabling the owned-metal-decode lane per machine
 /// profile. See `owned_decode_contracts::load_manifest_dir`.
 pub mod owned_decode_contracts;
+/// Grammar compilation and the dedicated DECODE scheduler for the owned-decode
+/// lane: JSON-schema-subset parsing and validation, checked-in grammar limits,
+/// the byte-level constrained automaton, the `token-id-json-constraint-v1`
+/// representation, and the `QueueClass::Decode` scheduler with quantum
+/// sequencing. The source lives under
+/// `crates/synapse-module/owned-decode-grammar-scheduler/`; the `#[path]`
+/// attribute wires that directory into the crate as a module.
+#[path = "../owned-decode-grammar-scheduler/mod.rs"]
+pub mod owned_decode_grammar_scheduler;
 /// Module-side request processing and lane routing for the owned-metal-decode
 /// lane: catalog validation, family registration, identity computation, Q8
 /// ingest orchestration, certification access, lane selection and fallback, the
