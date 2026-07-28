@@ -109,8 +109,8 @@
 
 **bench/spikes/:**
 - Purpose: Holds discrete architecture experimentation paths and new backend developments.
-- Contains: `unified-rt` (CUDA/Vulkan/M1 exact-match execution, including direct Metal step kernels and Vulkan Qwen3 decode) and `ane-minilm` (Apple Neural Engine CoreML conversion) spikes.
-- Key files: `bench/spikes/unified-rt/src/main.rs`, `bench/spikes/unified-rt/src/vulkan_backend.rs`, `bench/spikes/unified-rt/src/cuda_backend.rs`, `bench/spikes/unified-rt/src/lfm2.rs`, `bench/spikes/unified-rt/src/lfm2_audio.rs`, `bench/spikes/unified-rt/src/lfm2_decode.rs`, `bench/spikes/unified-rt/src/qwen3_decode.rs`, `bench/spikes/unified-rt/src/qwen3_decode_vulkan.rs`, `bench/spikes/unified-rt/src/qwen3_decode_metal_step.rs`
+- Contains: `unified-rt` (CUDA/Vulkan/M1 exact-match execution, including direct Metal step kernels, LFM2 Metal step engine, and Vulkan Qwen3 decode) and `ane-minilm` (Apple Neural Engine CoreML conversion) spikes.
+- Key files: `bench/spikes/unified-rt/src/main.rs`, `bench/spikes/unified-rt/src/vulkan_backend.rs`, `bench/spikes/unified-rt/src/cuda_backend.rs`, `bench/spikes/unified-rt/src/lfm2.rs`, `bench/spikes/unified-rt/src/lfm2_audio.rs`, `bench/spikes/unified-rt/src/lfm2_decode.rs`, `bench/spikes/unified-rt/src/qwen3_decode.rs`, `bench/spikes/unified-rt/src/qwen3_decode_vulkan.rs`, `bench/spikes/unified-rt/src/qwen3_decode_metal_step.rs`, `bench/spikes/unified-rt/src/lfm2_decode_metal_step.rs`
 
 **bench/eval-coir/:**
 - Purpose: Hosts the CoIR retrieval and rerank quality evaluation harness.
@@ -199,7 +199,8 @@
 - `bench/spikes/unified-rt/src/lfm2_decode.rs`: Causal decoding logic for LFM2 hybrid backbone models.
 - `bench/spikes/unified-rt/src/qwen3_decode.rs`: Fast Metal decode optimizations for Qwen3-0.6B f16.
 - `bench/spikes/unified-rt/src/qwen3_decode_vulkan.rs`: Vulkan Qwen3 decode backend implementation using serial RMSNorm reduction and SPIR-V compute shaders.
-- `bench/spikes/unified-rt/src/qwen3_decode_metal_step.rs`: Custom direct Metal Qwen3 single-token decode step execution bypassing MPSGraph.
+- `bench/spikes/unified-rt/src/qwen3_decode_metal_step.rs`: Custom direct Metal Qwen3 single-token and batched speculative decode step execution bypassing MPSGraph.
+- `bench/spikes/unified-rt/src/lfm2_decode_metal_step.rs`: Custom direct Metal LFM2 hybrid decode step execution with device-resident short-conv rolling cache and Q8_0 GEMV.
 
 **Tests:**
 - Standalone nextest-compatible test suites are managed via library configurations and workspace flags.

@@ -22,7 +22,7 @@
 - Contains: A 3-class aging scheduler, SQLite durable job and cache lease state, machine probe certification logic, socket/pipe-based worker host, the remote gateway client, and direct bindings to `synapse-engine-owned`.
 - Depends on: `synapse-core`, `synapse-engine-owned`, `subc-client-rs`, `rusqlite`, `tokio`.
 
-**Remote Gateway (`synapse-module/src/remote`):**
+**Remote Gateway (`crates/synapse-module/src/remote`):**
 - Purpose: Executes remote provider dispatch through interactive-first turnover pools, circuit breakers, and loopback-verified clients.
 - Location: `crates/synapse-module/src/remote`
 - Contains: `ProviderRuntime`, client dispatch, vault credential management via `cortexkit-credentials` SubC route, HTTP validators, mock provider e2e, and checkpoint-driven continuity logic.
@@ -57,14 +57,14 @@
 **Benchmark Measurement Rig (`synapse-rig`):**
 - Purpose: A hash-pinned external measurement harness split out of the candidate tree. Drives candidate inference as a subprocess to guarantee strict execution walls, exact tokenizer application, canonical token accounting, and un-tampered semantic parity metrics.
 - Location: `bench/rig`
-- Contains: Length-prefixed JSON stdio framing protocol (`rig_protocol.rs`), exact-shape tokenizer constraints, canonical throughput calculation, and result schema enforcement.
+- Contains: Length-prefixed JSON stdio framing protocol (`bench/harness/src/rig_protocol.rs`), exact-shape tokenizer constraints, canonical throughput calculation, and result schema enforcement.
 - Depends on: `synapse-core`, `tokenizers`, `serde_json`.
 - Used by: All modern lane runners evaluating throughput, correctness, or parity on candidate backends.
 
 **Native Engine Inference Lanes:**
 - Purpose: Execute in-memory tokenization, tensor forward passes, and pooling over target platforms.
 - Location: `bench/lanes/ort-embed`, `bench/lanes/mlx`, `bench/lanes/burn`, `bench/lanes/mlx-minilm`, `bench/lanes/ts-embed`, `bench/lanes/potion`, `bench/spikes/unified-rt`
-- Contains: Bounded-thread ONNX Runtime embedding logic, Metal-accelerated MLX custom model implementations, unified-rt candidate implementations (Vulkan cooperative-matrix/plain shaders on RDNA3 with device-local memory staging, budget validation, and Qwen3 Vulkan decode execution with serial RMSNorm reduction in `bench/spikes/unified-rt/src/qwen3_decode_vulkan.rs`, CUDA cuBLASLt fused graphs and fused QK norm RoPE single-launch kernels on NVIDIA, Metal graph execution optimization levels O0/O1, package caching, and custom direct Metal decode step kernels with opt-in multi-token GPU command buffer chaining in `bench/spikes/unified-rt/src/qwen3_decode_metal_step.rs`), LFM2 hybrid causal backbone, LFM2-Audio ASR speech encoder (FastConformer and Slaney mel filterbank frontend), Qwen3-0.6B f16 Metal decode throughput optimizations, WGPU-based Burn ONNX imports, python-based MLX community/source loading, Model2Vec static embedding (`potion-code-16M`), and TypeScript setups.
+- Contains: Bounded-thread ONNX Runtime embedding logic, Metal-accelerated MLX custom model implementations, unified-rt candidate implementations (Vulkan cooperative-matrix/plain shaders on RDNA3 with device-local memory staging, budget validation, subgroup-parallel RMSNorm, vectorized loads, Q8 block-address hoisting, f16/Q8 pack-four subgroup rows, and batched mat-mat compute shaders in `bench/spikes/unified-rt/src/qwen3_decode_vulkan.rs`, CUDA cuBLASLt fused graphs and fused QK norm RoPE single-launch kernels on NVIDIA, Metal graph execution optimization levels O0/O1, package caching, true batched speculative verification on `bench/spikes/unified-rt/src/qwen3_decode_metal_step.rs`, and custom direct Metal step kernels for Qwen3 and LFM2 with device-resident conv-cache and Q8_0 hybrid engine in `bench/spikes/unified-rt/src/lfm2_decode_metal_step.rs`), LFM2 hybrid causal backbone, LFM2-Audio ASR speech encoder (FastConformer and Slaney mel filterbank frontend), Qwen3-0.6B f16 Metal decode throughput optimizations, WGPU-based Burn ONNX imports, python-based MLX community/source loading, Model2Vec static embedding (`potion-code-16M`), and TypeScript setups.
 - Depends on: `bench/harness` or `bench/rig`, target runtime libraries (`ort`, `mlx-rs`, `vulkano`, `cudarc`), and `tokenizers`.
 - Used by: The benchmark suite runners `bench/run-matrix.sh` and `bench/run-night.sh`.
 
@@ -99,7 +99,7 @@
 **Athena Classify Distillation Harness:**
 - Purpose: Standalone Bun/TypeScript dataset generation and classification runner for the local `Athena-classify` student model.
 - Location: `tools/classify-distill`
-- Contains: Vendored ALF rust/ts contracts (sha-pinned provenance), real-export importer (`importer.ts`), histogram-driven synthetic qgen (`qgen.ts`), mechanical validator port (`validator.ts`), multi-account OAuth Anthropic runner with dry-run/mock gates (`runner.ts`), and contract parity verification (`parity.ts`).
+- Contains: Vendored ALF rust/ts contracts (sha-pinned provenance), real-export importer (`tools/classify-distill/src/importer.ts`), histogram-driven synthetic qgen (`tools/classify-distill/src/qgen.ts`), mechanical validator port (`tools/classify-distill/src/validator.ts`), multi-account OAuth Anthropic runner with dry-run/mock gates (`tools/classify-distill/src/runner.ts`), and contract parity verification (`tools/classify-distill/src/parity.ts`).
 - Depends on: Bun, `claude-sonnet-5` (qgen), `claude-opus-4-8` (run default), and `@cortexkit/anthropic-auth-core`.
 - Used by: Developers running Athena classify dataset generation, real attempt importing, parity auditing, or distillation campaigns.
 
@@ -304,9 +304,14 @@
 - Pattern: Serializable Identity Profile with SHA-256 fingerprinting.
 
 **Metal Custom Step Engine:**
-- Purpose: Execute single-token or GPU-chained multi-token Qwen3 decode steps bypassing MPSGraph via direct Metal compute kernels (`qwen3_decode_metal_step.rs`, `qwen3_decode_metal_step.m`, `qwen3_decode_metal_step.metal`), leveraging SIMDgroup RMSNorm, position-parallel attention, GPU-side token argmax gathering, and Q8 GEMV routines. Supports opt-in multi-token command buffer chaining via `SYNAPSE_METAL_STEP_CHAIN_K` (default 1).
+- Purpose: Execute single-token, batched speculative verification (`verify_batch`), or GPU-chained multi-token Qwen3 decode steps bypassing MPSGraph via direct Metal compute kernels (`bench/spikes/unified-rt/src/qwen3_decode_metal_step.rs`, `bench/spikes/unified-rt/src/qwen3_decode_metal_step.m`, `bench/spikes/unified-rt/src/qwen3_decode_metal_step.metal`), leveraging SIMDgroup RMSNorm, position-parallel attention, GPU-side token argmax gathering, and Q8 GEMV routines. Supports opt-in multi-token command buffer chaining via `SYNAPSE_METAL_STEP_CHAIN_K` (default 1) and batched verification via `SYNAPSE_METAL_STEP_BATCHED_VERIFY=1`.
 - Location: `bench/spikes/unified-rt/src/qwen3_decode_metal_step.rs`
 - Pattern: Direct Metal Compute Kernel Pipeline.
+
+**LFM2 Metal Step Engine:**
+- Purpose: Execute LFM2-1.2B hybrid decode steps bypassing MPSGraph via direct Metal compute kernels (`bench/spikes/unified-rt/src/lfm2_decode_metal_step.rs`, `bench/spikes/unified-rt/src/lfm2_decode_metal_step.m`, `bench/spikes/unified-rt/src/lfm2_decode_metal_step.metal`), combining a device-resident short-convolution rolling conv-cache kernel (`lfm2_conv_step`) with reused Qwen3 attention/matvec/RMSNorm kernels and Q8_0 GEMV routines. Gated via two-tier M1 authority signature and structural band invariants.
+- Location: `bench/spikes/unified-rt/src/lfm2_decode_metal_step.rs`
+- Pattern: Direct Metal Compute Kernel Pipeline with Rolling Conv-Cache.
 
 
 ## Entry Points
@@ -318,7 +323,7 @@
 
 **Worker Binaries (`ck-synapse-worker-*`):**
 - Location: `crates/synapse-worker-*/src/main.rs`
-- Triggers: Spawned directly by `synapse-module/src/worker_host/mod.rs`.
+- Triggers: Spawned directly by `crates/synapse-module/src/worker_host/mod.rs`.
 - Responsibilities: Initializing accelerator graphs/sessions (MLX, ANE, Llama), pipe/socket handshaking, loop listening for compute requests, returning tensors.
 
 **Bench Harness CLI (`synapse-bench`):**
