@@ -373,17 +373,17 @@ fn parity_qwen3_q8() {
     report.assert_byte_identical();
 }
 
-/// LFM2 f16 lane: production engine vs spike reference fixture.
+/// LFM2 f16 lane: compare the production engine against the CPU reference
+/// fixture (the oracle).
 ///
-/// The spike's reference fixture is the CPU oracle. The spike's Metal step
-/// engine itself forks at completion-15/step17 on the M5 (a certified near-tie
-/// within the structural band, gap 0.0004). The production engine produces the
-/// exact same fork as the spike's Metal step engine on this machine — they are
-/// byte-identical vs each other. This test verifies that the production engine
-/// matches the spike's Metal step engine behavior: at most MAX_CERTIFIED_FORKS
-/// prompts diverge from the CPU oracle, each divergence is a top-2 swap within
-/// the near-tie band, and the fork signature matches the spike's observed M5
-/// canary.
+/// GPU f16 execution may legitimately pick the second-best token when the top
+/// two logits are nearly tied; on this hardware both the spike engine and this
+/// port diverge from the oracle at exactly one such near-tie (prompt
+/// completion-15, step 17, top-2 logit gap ~0.0004). The gate accepts at most
+/// MAX_CERTIFIED_FORKS such divergences, requires each to be a top-2 swap
+/// inside the measured near-tie gap, and requires the divergence set to match
+/// the spike engine's observed set on the same machine — any other divergence
+/// is a parity failure.
 #[test]
 #[ignore]
 fn parity_lfm2_f16() {
@@ -436,10 +436,12 @@ fn parity_lfm2_f16() {
         byte_identical,
         forks,
     };
-    // The spike's Metal step engine also forks at completion-15/step17 on the
-    // M5 (a certified near-tie, gap 0.0004). The production engine produces the
-    // exact same fork — they are byte-identical vs each other. Accept at most
-    // 2 forks (the structural band ceiling) as matching the spike's behavior.
+    // The spike's Metal engine is known to diverge from the CPU oracle on
+    // prompt completion-15 at step 17, where the top-two logit gap is only
+    // ~0.0004 — a hardware rounding coin-flip, not an arithmetic bug. The
+    // production engine must reproduce the spike's behavior, so accept at most
+    // 2 near-tie divergences (the certified ceiling); any additional fork is a
+    // parity failure.
     if report.forks.len() <= 2 {
         println!(
             "[parity] lfm2-f16 {}/{} byte-identical vs CPU oracle; {} fork(s) within structural band — matches spike Metal step engine",
