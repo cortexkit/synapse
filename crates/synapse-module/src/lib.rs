@@ -11,6 +11,15 @@ use std::{
 
 // Provider adapters stay module-private so credentials and remote identity checks
 // cannot be bypassed by a second public call path.
+/// Certification probes, immutable fixture batteries and oracles, scheduler
+/// evidence ingestion, the checked-in D-009 per-machine-profile cutover
+/// records (the spec's explicit routing-change record that enables the owned
+/// lane), and the runner for the spec's twelve acceptance gates G-DEC-01..12,
+/// all for the owned-metal-decode lane. The source lives under
+/// `crates/synapse-module/owned-decode-certification/`; the `#[path]`
+/// attribute wires that directory into the crate as a module.
+#[path = "../owned-decode-certification/mod.rs"]
+pub mod owned_decode_certification;
 /// Module-owned schemas and checked-in records for the production owned-decode
 /// lane. Loaded by catalog validation, CI probes, and the production cutover
 /// predicate that gates enabling the owned-metal-decode lane per machine

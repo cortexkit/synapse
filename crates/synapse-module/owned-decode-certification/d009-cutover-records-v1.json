@@ -1,0 +1,44 @@
+{
+  "manifest_revision": "d009-cutover-records-v1",
+  "schema_revision": "owned-decode-contracts-v1",
+  "records": [
+    {
+      "record": {
+        "machine_profile_hash": "m5-validation-machine",
+        "enabled_catalog_entry_ids": [],
+        "decode_fingerprints": [],
+        "processing_fingerprints": [],
+        "constrained_runtime_identities": [],
+        "runtime_config_digest": "pending-certification",
+        "fixture_registry_revision": "decode-fixture-registry-v1",
+        "context_bucket_manifest_revision": "decode-context-buckets-v1",
+        "scheduler_manifest_revision": "decode-sched-manifest-v1",
+        "certification_evidence_ids": [],
+        "wire_error_binding_revision": "owned-decode-wire-error-bindings-v1",
+        "acceptance_gate_evidence": [],
+        "grammar_enabled": false
+      },
+      "enabled": false,
+      "disabled_reason": "Production cutover stays disabled until decode-sched-manifest-v1 carries committed numeric evidence (OQ-DEC-SCHED-01) and every applicable G-DEC-01..G-DEC-12 gate passes. G-DEC-11 and the scheduler-dependent portion of G-DEC-12 are currently blocked, so no D-009 enablement record may be published."
+    },
+    {
+      "record": {
+        "machine_profile_hash": "fleet-daemon-profile-1",
+        "enabled_catalog_entry_ids": [],
+        "decode_fingerprints": [],
+        "processing_fingerprints": [],
+        "constrained_runtime_identities": [],
+        "runtime_config_digest": "pending-certification",
+        "fixture_registry_revision": "decode-fixture-registry-v1",
+        "context_bucket_manifest_revision": "decode-context-buckets-v1",
+        "scheduler_manifest_revision": "decode-sched-manifest-v1",
+        "certification_evidence_ids": [],
+        "wire_error_binding_revision": "owned-decode-wire-error-bindings-v1",
+        "acceptance_gate_evidence": [],
+        "grammar_enabled": false
+      },
+      "enabled": false,
+      "disabled_reason": "Production cutover stays disabled until decode-sched-manifest-v1 carries committed numeric evidence (OQ-DEC-SCHED-01) and every applicable G-DEC-01..G-DEC-12 gate passes. G-DEC-11 and the scheduler-dependent portion of G-DEC-12 are currently blocked, so no D-009 enablement record may be published."
+    }
+  ]
+}
