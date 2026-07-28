@@ -971,16 +971,16 @@ fn matmul_impl(
 }
 
 #[derive(Clone, Debug)]
-struct Tensor {
-    dtype: TensorDType,
-    shape: Vec<usize>,
-    strides: Vec<usize>,
-    data: Vec<f32>,
-    metal_f16_bits: Option<Vec<u16>>,
+pub(crate) struct Tensor {
+    pub(crate) dtype: TensorDType,
+    pub(crate) shape: Vec<usize>,
+    pub(crate) strides: Vec<usize>,
+    pub(crate) data: Vec<f32>,
+    pub(crate) metal_f16_bits: Option<Vec<u16>>,
 }
 
 #[derive(Copy, Clone, Debug)]
-enum TensorDType {
+pub(crate) enum TensorDType {
     F32,
 }
 
@@ -1021,7 +1021,7 @@ impl ParamVector {
 }
 
 impl Tensor {
-    fn new(shape: Vec<usize>, data: Vec<f32>) -> Result<Self> {
+    pub(crate) fn new(shape: Vec<usize>, data: Vec<f32>) -> Result<Self> {
         let expected = shape.iter().product::<usize>();
         ensure!(
             expected == data.len(),
@@ -1038,7 +1038,7 @@ impl Tensor {
         })
     }
 
-    fn zeros(shape: Vec<usize>) -> Self {
+    pub(crate) fn zeros(shape: Vec<usize>) -> Self {
         let len = shape.iter().product::<usize>();
         Self {
             dtype: TensorDType::F32,
@@ -1049,24 +1049,24 @@ impl Tensor {
         }
     }
 
-    fn dim(&self, index: usize) -> usize {
+    pub(crate) fn dim(&self, index: usize) -> usize {
         self.shape[index]
     }
 
-    fn prepare_metal_f16(&mut self) {
+    pub(crate) fn prepare_metal_f16(&mut self) {
         if self.metal_f16_bits.is_none() {
             self.metal_f16_bits = Some(encode_f16_bits(&self.data));
         }
     }
 
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    fn metal_f16_bits(&self) -> Result<&[u16]> {
+    pub(crate) fn metal_f16_bits(&self) -> Result<&[u16]> {
         self.metal_f16_bits
             .as_deref()
             .context("f16 mirror missing for Metal tensor")
     }
 
-    fn as_vector(&self) -> Result<&[f32]> {
+    pub(crate) fn as_vector(&self) -> Result<&[f32]> {
         self.ensure_f32_contiguous()?;
         ensure!(
             self.shape.len() == 1,
@@ -1076,7 +1076,7 @@ impl Tensor {
         Ok(&self.data)
     }
 
-    fn matrix_shape(&self) -> Result<(usize, usize)> {
+    pub(crate) fn matrix_shape(&self) -> Result<(usize, usize)> {
         self.ensure_f32_contiguous()?;
         ensure!(
             self.shape.len() == 2,
@@ -1086,7 +1086,7 @@ impl Tensor {
         Ok((self.shape[0], self.shape[1]))
     }
 
-    fn ensure_f32_contiguous(&self) -> Result<()> {
+    pub(crate) fn ensure_f32_contiguous(&self) -> Result<()> {
         ensure!(
             matches!(self.dtype, TensorDType::F32),
             "only f32 tensors are executable"
@@ -1099,7 +1099,7 @@ impl Tensor {
     }
 }
 
-fn row_major_strides(shape: &[usize]) -> Vec<usize> {
+pub(crate) fn row_major_strides(shape: &[usize]) -> Vec<usize> {
     let mut strides = vec![1; shape.len()];
     let mut stride = 1usize;
     for i in (0..shape.len()).rev() {
@@ -1109,7 +1109,7 @@ fn row_major_strides(shape: &[usize]) -> Vec<usize> {
     strides
 }
 
-fn encode_f16_bits(values: &[f32]) -> Vec<u16> {
+pub(crate) fn encode_f16_bits(values: &[f32]) -> Vec<u16> {
     values
         .iter()
         .map(|&value| half::f16::from_f32(value).to_bits())
@@ -1117,7 +1117,7 @@ fn encode_f16_bits(values: &[f32]) -> Vec<u16> {
 }
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn decode_f16_bits(values: &[u16]) -> Vec<f32> {
+pub(crate) fn decode_f16_bits(values: &[u16]) -> Vec<f32> {
     values
         .iter()
         .map(|&value| half::f16::from_bits(value).to_f32())
@@ -1780,7 +1780,7 @@ fn mean_pool_l2(
     vectors
 }
 
-fn normalize_l2(vector: &mut [f32]) {
+pub(crate) fn normalize_l2(vector: &mut [f32]) {
     let norm = vector
         .iter()
         .map(|value| value * value)
@@ -1792,7 +1792,10 @@ fn normalize_l2(vector: &mut [f32]) {
     }
 }
 
-fn load_safetensor_map(model_root: &Path, original_path: &Path) -> Result<HashMap<String, Tensor>> {
+pub(crate) fn load_safetensor_map(
+    model_root: &Path,
+    original_path: &Path,
+) -> Result<HashMap<String, Tensor>> {
     if original_path.is_file()
         && original_path.extension().and_then(|value| value.to_str()) == Some("safetensors")
     {
@@ -1890,7 +1893,7 @@ fn tensor_from_view(dtype: SafeDtype, shape: &[usize], bytes: &[u8]) -> Result<T
     Ok(tensor)
 }
 
-fn resolve_model_root(path: &Path) -> Result<PathBuf> {
+pub(crate) fn resolve_model_root(path: &Path) -> Result<PathBuf> {
     if path.is_dir() {
         return Ok(path.to_path_buf());
     }
@@ -1906,7 +1909,7 @@ fn resolve_model_root(path: &Path) -> Result<PathBuf> {
     )
 }
 
-fn get_tensor(tensors: &HashMap<String, Tensor>, base_name: &str) -> Result<Tensor> {
+pub(crate) fn get_tensor(tensors: &HashMap<String, Tensor>, base_name: &str) -> Result<Tensor> {
     let candidates = [
         base_name.to_string(),
         format!("bert.{base_name}"),

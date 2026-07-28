@@ -20,6 +20,13 @@ use synapse_core::{
 #[cfg(target_os = "macos")]
 mod runtime;
 
+/// Production-owned Metal decode engines for Qwen3-0.6B and LFM2-1.2B.
+/// Ported from `bench/spikes/unified-rt/` into production-owned code.
+/// See `owned_decode_engine` module docs for scope and byte-identity contract.
+#[cfg(target_os = "macos")]
+#[path = "../owned-decode-engine/src/lib.rs"]
+pub mod owned_decode_engine;
+
 pub const ENGINE_VERSION: &str = "owned-metal-v1";
 // Bump whenever a compiled MPSGraph changes structure (ops added, removed, or reordered).
 // The revision is part of both the explicit-executable package cache key and the engine

@@ -16,6 +16,8 @@ safetensors = "0.6.2"
 half = "2"
 libm = "0.2"
 thiserror = { workspace = true }
+sha2 = { workspace = true }
+tokenizers = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 tokenizers = { workspace = true }
