@@ -247,7 +247,7 @@ impl Automaton {
                     }
                     // The closing quote is permitted only when the buffer exactly
                     // matches a member's inner content.
-                    if members.iter().any(|member| *member == *buf) {
+                    if members.contains(buf) {
                         out.insert(b'"');
                     }
                 }
@@ -260,7 +260,7 @@ impl Automaton {
                 for byte in permitted_restricted_next(buf, &allowed_bytes, false) {
                     out.insert(byte);
                 }
-                if allowed_bytes.iter().any(|name| *name == *buf) {
+                if allowed_bytes.contains(buf) {
                     out.insert(b'"');
                 }
             }
@@ -552,7 +552,7 @@ impl Automaton {
                         members: members.clone(),
                     }))
                 } else if byte == b'"' {
-                    if members.iter().any(|member| *member == buf) {
+                    if members.contains(&buf) {
                         Ok(ScalarStep::Closed)
                     } else {
                         Err(StepError {
@@ -579,7 +579,7 @@ impl Automaton {
                     let key = String::from_utf8(buf.clone()).map_err(|_| StepError {
                         message: "object key is not valid UTF-8".to_string(),
                     })?;
-                    if allowed.iter().any(|name| *name == key) {
+                    if allowed.contains(&key) {
                         Ok(ScalarStep::Closed)
                     } else {
                         Err(StepError {
