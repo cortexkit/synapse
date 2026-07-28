@@ -16,6 +16,15 @@ use std::{
 /// predicate that gates enabling the owned-metal-decode lane per machine
 /// profile. See `owned_decode_contracts::load_manifest_dir`.
 pub mod owned_decode_contracts;
+/// Module-side request processing and lane routing for the owned-metal-decode
+/// lane: catalog validation, family registration, identity computation, Q8
+/// ingest orchestration, certification access, lane selection and fallback, the
+/// machine-profile predicate that decides when to cut over to this lane,
+/// provenance, and end-to-end `microllm.oneshot` orchestration. The source lives
+/// under `crates/synapse-module/owned-decode-routing/`; the `#[path]` attribute
+/// wires that directory into the crate as a module.
+#[path = "../owned-decode-routing/mod.rs"]
+pub mod owned_decode_routing;
 #[allow(dead_code)]
 mod remote;
 mod store;
