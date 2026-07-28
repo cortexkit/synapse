@@ -909,8 +909,7 @@ impl Automaton {
                         _ => None,
                     })
                     .collect();
-                let mut buf = Vec::new();
-                buf.push(byte);
+                let buf = vec![byte];
                 if !any_member_has_prefix_str(&buf, &members) {
                     return Err(StepError {
                         message: "number enum has no member with this prefix".to_string(),
@@ -1123,9 +1122,9 @@ fn any_member_has_prefix(buf: &[u8], members: &[Vec<u8>]) -> bool {
 }
 
 fn any_member_has_prefix_str(buf: &[u8], members: &[String]) -> bool {
-    members.iter().any(|member| {
-        member.as_bytes().len() >= buf.len() && &member.as_bytes()[..buf.len()] == buf
-    })
+    members
+        .iter()
+        .any(|member| member.len() >= buf.len() && &member.as_bytes()[..buf.len()] == buf)
 }
 
 /// The set of bytes that keep at least one member reachable as a continuation of

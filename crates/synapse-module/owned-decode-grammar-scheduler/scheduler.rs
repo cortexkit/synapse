@@ -808,7 +808,7 @@ mod tests {
                     saw_release = true;
                 }
                 if arbitration.selected == QueueClass::Decode {
-                    scheduler.commit_quantum("d1", 16, tick as u64);
+                    scheduler.commit_quantum("d1", 16, tick);
                     scheduler.requeue_continuation("d1");
                 }
             }

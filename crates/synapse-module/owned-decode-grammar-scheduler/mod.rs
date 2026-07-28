@@ -275,7 +275,7 @@ mod integration_tests {
 
             // Unconstrained run commits the same document with no masking; the
             // constrained token count equals it, so throughput ratio is 1.0 >= 0.90.
-            let unconstrained_tokens = document.as_bytes().len() as u32;
+            let unconstrained_tokens = document.len() as u32;
             let ratio = constrained_tokens as f64 / unconstrained_tokens as f64;
             assert!(
                 ratio >= 0.90,
@@ -291,7 +291,11 @@ mod integration_tests {
     #[derive(Debug)]
     enum GenOutcome {
         Complete(Vec<u8>),
-        StopBeforeCompletion,
+        // The real worker can return grammar_stop_before_completion when a stop
+        // token wins greedy selection while the automaton is incomplete; this
+        // deterministic model always prefers a permitted content token, so that
+        // outcome is unreachable here. Stop-vs-content selection-order fixtures
+        // live in the owned-decode-worker crate.
         Unsatisfiable,
         MaxTokensExhausted(Vec<u8>),
     }
