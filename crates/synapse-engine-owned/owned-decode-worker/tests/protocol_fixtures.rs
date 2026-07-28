@@ -246,14 +246,17 @@ fn fixture_terminal_completion_beats_deadline_and_cancellation() {
 }
 
 #[test]
-fn fixture_deadline_beats_cancellation_at_non_terminal_boundary() {
+fn fixture_cancellation_beats_deadline_at_non_terminal_boundary() {
+    // Binding precedence (spec resolutions round 2, #4): terminal completion >
+    // cancellation > deadline. A caller who abandoned the operation receives
+    // `cancelled` even though the deadline also expired during the quantum.
     let decision = evaluate_boundary(BoundaryInputs {
         completion: None,
         cancel_recorded_at: Some(10),
         deadline_at: Some(20),
         observed_at: 100,
     });
-    assert_eq!(decision, BoundaryDecision::DeadlineExceeded);
+    assert_eq!(decision, BoundaryDecision::Cancelled);
 }
 
 #[test]

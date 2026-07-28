@@ -78,17 +78,22 @@ pub fn evaluate_boundary(inputs: BoundaryInputs) -> BoundaryDecision {
         }
     }
 
-    // 2. Deadline first at a non-terminal boundary: it wins when both are pending.
-    if let Some(deadline) = inputs.deadline_at {
-        if deadline <= inputs.observed_at {
-            return BoundaryDecision::DeadlineExceeded;
-        }
-    }
-
-    // 3. Cancellation recorded before or at the boundary.
+    // 2. Cancellation recorded before or at the boundary. The binding
+    //    precedence order is terminal completion > cancellation > deadline
+    //    (spec resolutions round 2, #4): a caller who already asked to abandon
+    //    the operation receives `cancelled` even when the deadline also expired
+    //    during the same quantum — the deadline error is reserved for
+    //    operations that ran out of time without the caller abandoning them.
     if let Some(cancelled_at) = inputs.cancel_recorded_at {
         if cancelled_at <= inputs.observed_at {
             return BoundaryDecision::Cancelled;
+        }
+    }
+
+    // 3. Deadline expiry at a non-terminal boundary with no pending cancellation.
+    if let Some(deadline) = inputs.deadline_at {
+        if deadline <= inputs.observed_at {
+            return BoundaryDecision::DeadlineExceeded;
         }
     }
 
@@ -130,11 +135,11 @@ mod tests {
     }
 
     #[test]
-    fn deadline_wins_over_cancellation_when_both_pending() {
+    fn cancellation_wins_over_deadline_when_both_pending() {
         let mut i = inputs();
         i.cancel_recorded_at = Some(60);
         i.deadline_at = Some(90); // both before observed_at=100
-        assert_eq!(evaluate_boundary(i), BoundaryDecision::DeadlineExceeded);
+        assert_eq!(evaluate_boundary(i), BoundaryDecision::Cancelled);
     }
 
     #[test]
