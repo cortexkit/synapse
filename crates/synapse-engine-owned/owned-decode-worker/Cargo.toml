@@ -1,0 +1,32 @@
+[package]
+name = "owned-decode-worker"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+description = "Supervised owned-metal-decode worker protocol, crash budget, quarantine, and ownership manifest."
+publish = false
+
+# This crate is nested inside the synapse workspace tree but is intentionally its
+# own workspace root. It is developed and tested independently of the parent
+# workspace and is not registered as a member there, so the empty `[workspace]`
+# table opts this package out of the parent workspace and `cargo` treats it as
+# standalone. The parent workspace ignores it entirely.
+#
+# The layer is pure Rust: it models the module-side supervisor for the
+# `owned-metal-decode-worker-v1` protocol (framing, start validation, residency,
+# terminal-control boundaries, crash budget, quarantine, ownership). It does not
+# link Metal and does not depend on `synapse-engine-owned`, so its fixtures run
+# on any host without a GPU. The real Metal worker satisfies the `DecodeWorker`
+# transport trait defined here.
+[workspace]
+
+[dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "1.0.69"
+
+[lib]
+name = "owned_decode_worker"
+path = "src/lib.rs"

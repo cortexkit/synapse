@@ -1,0 +1,5 @@
+# Build artifacts for this standalone crate (it is its own cargo workspace, so
+# it builds into a local target/ rather than the repository root target/).
+/target
+# Library crate: the lockfile is not committed.
+/Cargo.lock
