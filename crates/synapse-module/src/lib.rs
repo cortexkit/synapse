@@ -512,9 +512,14 @@ impl Default for ProbeConfig {
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DevConfig {
     #[serde(default, alias = "enable_alias_admin")]
     alias_admin_enabled: bool,
+    /// Debug builds honor this field so wire integration tests can enable owned
+    /// decode. Release builds ignore it and use the production cutover record.
+    #[serde(default)]
+    owned_decode_cutover_for_test: bool,
 }
 
 fn default_inline_max_items() -> usize {
@@ -586,6 +591,7 @@ struct RuntimeState {
     alias_admin_enabled: bool,
     microllm_max_tokens: u32,
     grammar_enabled: bool,
+    owned_decode_cutover_for_test: bool,
     cache_max_bytes: u64,
     scheduler: Arc<Mutex<InlineScheduler>>,
     execution: Arc<Semaphore>,
@@ -594,6 +600,8 @@ struct RuntimeState {
     ort_engine: Arc<Mutex<OrtEmbedEngine>>,
     catalog: Arc<Mutex<BTreeMap<String, ModelSlot>>>,
     job_progress: Arc<Mutex<BTreeMap<String, ModelRuntimeState>>>,
+    owned_decode_dispatches:
+        Arc<Mutex<BTreeMap<String, Arc<Mutex<worker_host::SupervisedDecodeDispatch>>>>>,
 }
 
 struct ModelSlot {
@@ -686,6 +694,7 @@ struct EmbeddingModel {
     tokenizer: SanitizedTokenizer,
     numeric_profile_id: NumericProfileId,
     fingerprint: Fingerprint,
+    certification_fingerprint: Fingerprint,
     engine_identity: EngineIdentity,
     owned_tokenizer_policy: Option<OwnedTokenizerPolicy>,
 }
@@ -711,6 +720,9 @@ impl ModelTask {
 enum EmbedBackend {
     Ort(Arc<Mutex<OrtEmbedEngine>>),
     Owned(Arc<Mutex<OwnedMetalEmbedEngine>>),
+    /// Owned decode is loaded for each supervised generation so its generation
+    /// supervisor, rather than the generic worker host, enforces the crash limit.
+    OwnedDecode,
     Worker(Arc<Mutex<worker_host::WorkerEngine>>),
 }
 
@@ -808,6 +820,7 @@ struct RerankScorePayload {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MicroLlmOneshotParams {
     #[serde(default, alias = "model_id")]
     model: Option<String>,
@@ -1291,6 +1304,7 @@ impl RuntimeState {
         let alias_admin_enabled = config.alias_admin_enabled || config.dev.alias_admin_enabled;
         let microllm_max_tokens = config.microllm_max_tokens;
         let grammar_enabled = config.grammar_enabled;
+        let owned_decode_cutover_for_test = config.dev.owned_decode_cutover_for_test;
         let cache_max_bytes = config.cache_max_bytes;
         let scheduler = Arc::new(Mutex::new(InlineScheduler { in_flight_bytes: 0 }));
         let execution = Arc::new(Semaphore::new(inline.max_concurrent_workers.max(1)));
@@ -1323,6 +1337,7 @@ impl RuntimeState {
             alias_admin_enabled,
             microllm_max_tokens,
             grammar_enabled,
+            owned_decode_cutover_for_test,
             cache_max_bytes,
             scheduler,
             execution,
@@ -1331,6 +1346,7 @@ impl RuntimeState {
             ort_engine: Arc::new(Mutex::new(OrtEmbedEngine::new())),
             catalog: Arc::new(Mutex::new(catalog)),
             job_progress: Arc::new(Mutex::new(BTreeMap::new())),
+            owned_decode_dispatches: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 
@@ -2429,6 +2445,9 @@ async fn model_unload(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
             }
         }
     }
+    if let Ok(mut dispatches) = state.runtime.owned_decode_dispatches.lock() {
+        dispatches.remove(&params.model_id);
+    }
     set_model_slot_state(
         &state.runtime,
         &params.model_id,
@@ -2856,6 +2875,21 @@ fn load_catalog_model_blocking(
                 Some(policy),
             )
         }
+        "owned-metal-decode" => {
+            if !cfg!(target_os = "macos") {
+                return Err(artifact_invalid_error(format!(
+                    "owned-metal-decode model '{}' is only supported on macOS",
+                    spec.model_id
+                )));
+            }
+            (
+                EmbedBackend::OwnedDecode,
+                LoadedModel {
+                    model_id: format!("owned-decode:{}", spec.model_id),
+                },
+                None,
+            )
+        }
         "llama" | "mlx" | "ane" => {
             let (backend, loaded) = load_worker_backend_blocking(
                 &spec,
@@ -2872,6 +2906,13 @@ fn load_catalog_model_blocking(
             )))
         }
     };
+    let certification_fingerprint = if spec.engine == "owned-metal-decode" {
+        owned_decode_catalog_entry(&spec)
+            .and_then(|entry| entry.decode_identity_inputs().decode_fingerprint())
+            .map_err(|error| artifact_invalid_error(error.as_str()))?
+    } else {
+        spec.fingerprint.clone()
+    };
     Ok(EmbeddingModel {
         model_id: spec.model_id.clone(),
         task,
@@ -2880,6 +2921,7 @@ fn load_catalog_model_blocking(
         tokenizer,
         numeric_profile_id: spec.numeric_profile_id.clone(),
         fingerprint: spec.fingerprint.clone(),
+        certification_fingerprint,
         engine_identity: spec.engine_identity.clone(),
         owned_tokenizer_policy,
     })
@@ -2966,6 +3008,7 @@ fn unload_embedding_model_blocking(model: Arc<EmbeddingModel>) -> Result<(), Wir
             engine.unload(&model.loaded_model);
             Ok(())
         }
+        EmbedBackend::OwnedDecode => Ok(()),
         EmbedBackend::Worker(engine) => {
             let mut engine = engine.lock().map_err(|_| {
                 WireOperationError::from_stable(
@@ -4736,8 +4779,14 @@ async fn microllm_oneshot(state: Arc<ModuleState>, params: Value) -> HandlerOutc
         );
     }
     if let Some(model_id) = params.model.as_deref() {
-        if let Some(outcome) = route_owned_decode_preflight(&state, &params, model_id, None) {
-            return outcome;
+        let owned_decode = state.runtime.catalog.lock().ok().is_some_and(|catalog| {
+            catalog.get(model_id).is_some_and(|slot| {
+                slot.spec.engine == "owned-metal-decode"
+                    || slot.spec.engine_identity.engine == "owned-metal-decode"
+            })
+        });
+        if owned_decode {
+            return route_owned_decode_wire(Arc::clone(&state), &params, model_id).await;
         }
     }
     match params.grammar.as_deref() {
@@ -4820,14 +4869,6 @@ async fn microllm_oneshot(state: Arc<ModuleState>, params: Value) -> HandlerOutc
         .first()
         .copied()
         .unwrap_or_default() as u64;
-    if let Some(outcome) = route_owned_decode_preflight(
-        &state,
-        &params,
-        &model.model_id,
-        Some(prompt_tokens.min(u64::from(u32::MAX)) as u32),
-    ) {
-        return outcome;
-    }
     let total_tokens = prompt_tokens.saturating_add(u64::from(params.max_tokens));
     if total_tokens > state.runtime.inline.max_tokens {
         return result_outcome(error_payload(
@@ -4893,106 +4934,139 @@ async fn microllm_oneshot(state: Arc<ModuleState>, params: Value) -> HandlerOutc
     result_outcome(serde_json::to_value(envelope).expect("microllm envelope should serialize"))
 }
 
-struct WirePreflightDispatch;
+#[derive(Clone)]
+struct PersistentDecodeCertification {
+    store: Arc<SynapseStore>,
+}
 
-impl owned_decode_routing::DecodeDispatch for WirePreflightDispatch {
-    fn dispatch(
-        &mut self,
-        _command: &owned_decode_routing::DispatchedCommand,
-    ) -> Result<owned_decode_routing::ExecutionSuccess, owned_decode_routing::error::OwnedDecodeError>
-    {
-        // Dispatch requires a version-controlled record that certifies this
-        // machine's owned-decode configuration and approves production cutover.
-        // Return Unavailable so this path cannot bypass that eligibility check.
-        Err(owned_decode_routing::error::OwnedDecodeError::Unavailable)
+impl owned_decode_routing::certification::CertificationAccess for PersistentDecodeCertification {
+    fn is_unconstrained_certified(
+        &self,
+        key: &owned_decode_routing::certification::UnconstrainedCertKey,
+    ) -> bool {
+        self.store
+            .get_cert_row(&key.machine_profile_hash, &key.decode_fingerprint)
+            .ok()
+            .flatten()
+            .is_some_and(|row| worker_path_certification(&row.evidence))
+    }
+
+    fn is_constrained_certified(
+        &self,
+        key: &owned_decode_routing::certification::ConstrainedCertKey,
+    ) -> bool {
+        self.store
+            .get_cert_row(&key.machine_profile_hash, &key.decode_fingerprint)
+            .ok()
+            .flatten()
+            .is_some_and(|row| {
+                worker_path_certification(&row.evidence)
+                    && row.evidence["worker_path"]["constrained_runtime_identities"]
+                        .as_array()
+                        .is_some_and(|identities| {
+                            identities.iter().any(|identity| {
+                                identity.as_str() == Some(&key.constraint_runtime_identity)
+                            })
+                        })
+            })
     }
 }
 
-fn route_owned_decode_preflight(
-    state: &ModuleState,
-    params: &MicroLlmOneshotParams,
-    model_id: &str,
-    prompt_token_count: Option<u32>,
-) -> Option<HandlerOutcome> {
-    let spec = state
-        .runtime
-        .catalog
-        .lock()
-        .ok()
-        .and_then(|catalog| catalog.get(model_id).map(|slot| slot.spec.clone()))?;
-    if spec.engine != "owned-metal-decode" && spec.engine_identity.engine != "owned-metal-decode" {
-        return None;
-    }
-    let prompt_token_count = match prompt_token_count {
-        Some(count) => count,
-        None => {
-            let located = match locator_path(&spec.tokenizer_locator, &state.model_cache) {
-                Ok(located) => located,
-                Err(error) => return Some(result_outcome(error_payload(state, error))),
-            };
-            let tokenizer = match SanitizedTokenizer::from_file(
-                &located.path,
-                TokenizerConfig {
-                    max_tokens: spec.max_tokens,
-                },
-            ) {
-                Ok(tokenizer) => tokenizer,
-                Err(error) => {
-                    return Some(channel_error(
-                        "artifact_invalid",
-                        format!("owned-decode tokenizer is invalid: {error}"),
-                    ))
-                }
-            };
-            match tokenizer.tokenize(&params.prompt) {
-                Ok(tokenized) => tokenized.ids.len().min(u32::MAX as usize) as u32,
-                Err(error) => {
-                    return Some(channel_error(
-                        "invalid_request",
-                        format!("owned-decode prompt tokenization failed: {error}"),
-                    ))
-                }
-            }
+fn worker_path_certification(evidence: &Value) -> bool {
+    evidence["worker_path"]["transport"].as_str() == Some(worker_catalog_transport())
+        && evidence["worker_path"]["protocol"].as_str()
+            == Some(owned_decode_worker::identity::WORKER_PROTOCOL_ID)
+        && evidence["worker_path"]["fixture_battery"].as_str() == Some("20x64-token-exact")
+}
+
+struct WireDecodeDispatch {
+    owned: Option<Arc<Mutex<worker_host::SupervisedDecodeDispatch>>>,
+    prompt: Vec<u32>,
+    constraint: Option<owned_decode_worker::protocol::TokenIdJsonConstraint>,
+    deadline_ms: u64,
+    llama: Option<Arc<EmbeddingModel>>,
+    llama_output: Option<GenerateOutput>,
+}
+
+impl owned_decode_routing::DecodeDispatch for WireDecodeDispatch {
+    fn dispatch(
+        &mut self,
+        command: &owned_decode_routing::DispatchedCommand,
+    ) -> Result<owned_decode_routing::ExecutionSuccess, owned_decode_routing::error::OwnedDecodeError>
+    {
+        use owned_decode_routing::lane::LaneKind;
+        use owned_decode_routing::provenance::FinishReason;
+
+        if command.lane == LaneKind::OwnedDecode {
+            let mut dispatch = self
+                .owned
+                .as_ref()
+                .ok_or(owned_decode_routing::error::OwnedDecodeError::Unavailable)?
+                .lock()
+                .map_err(|_| owned_decode_routing::error::OwnedDecodeError::Unavailable)?;
+            dispatch.set_request(
+                self.prompt.clone(),
+                self.constraint.clone(),
+                self.deadline_ms,
+            );
+            return owned_decode_routing::DecodeDispatch::dispatch(&mut *dispatch, command);
         }
-    };
+
+        let model = self
+            .llama
+            .as_ref()
+            .ok_or(owned_decode_routing::error::OwnedDecodeError::Unavailable)?;
+        let EmbedBackend::Worker(engine) = &model.backend else {
+            return Err(owned_decode_routing::error::OwnedDecodeError::Unsupported);
+        };
+        let engine = engine
+            .lock()
+            .map_err(|_| owned_decode_routing::error::OwnedDecodeError::Unavailable)?;
+        let output = engine
+            .generate(
+                &model.loaded_model,
+                GenerateRequest {
+                    prompt: self.prompt.clone(),
+                    max_tokens: command.max_tokens,
+                    grammar: None,
+                },
+            )
+            .map_err(|_| owned_decode_routing::error::OwnedDecodeError::Unavailable)?;
+        let (finish_reason, lane_finish_reason) = match output.finish_reason.as_str() {
+            "stop" | "stop_token" => (FinishReason::StopToken, None),
+            "length" | "max_tokens" => (FinishReason::MaxTokens, None),
+            "cancelled" => (FinishReason::Cancelled, None),
+            other => (FinishReason::StopToken, Some(other.to_string())),
+        };
+        let success = owned_decode_routing::ExecutionSuccess {
+            generated_token_ids: output.generated_token_ids.clone(),
+            finish_reason,
+            lane_finish_reason,
+            worker_generation: 0,
+            last_completed_quantum_sequence: 0,
+            crash_retry_count: 0,
+            failure_classifications: Vec::new(),
+        };
+        self.llama_output = Some(output);
+        Ok(success)
+    }
+}
+
+fn owned_decode_catalog_entry(
+    spec: &StoredModelConfig,
+) -> Result<owned_decode_routing::CatalogEntry, owned_decode_routing::error::OwnedDecodeError> {
+    use owned_decode_routing::identity::{ActivationDType, Q8Identity, WeightQuant};
 
     let family_name = spec.owned_family.as_deref().unwrap_or_default();
-    let family = match owned_decode_routing::family::Family::parse(family_name) {
-        Ok(family) => family,
-        Err(error) => {
-            return Some(channel_error(
-                error.as_str(),
-                format!("owned-decode catalog family '{family_name}' is unsupported"),
-            ))
-        }
-    };
-    let weight_quant = match owned_decode_routing::identity::WeightQuant::parse(&spec.quant) {
-        Ok(quant) => quant,
-        Err(error) => {
-            return Some(channel_error(
-                error.as_str(),
-                format!("owned-decode catalog quant '{}' is unsupported", spec.quant),
-            ))
-        }
-    };
+    let family = owned_decode_routing::family::Family::parse(family_name)?;
+    let weight_quant = WeightQuant::parse(&spec.quant)?;
     let flag = |name: &str| spec.engine_identity.build_flags.get(name).cloned();
-    let arithmetic_identity_revision = flag("arithmetic_identity_revision")
-        .unwrap_or_else(|| "owned-decode-arithmetic-v1".to_string());
-    let metallib_revision =
-        flag("metallib_revision").unwrap_or_else(|| "owned-decode-metallib-v1".to_string());
-    let max_context_tokens = flag("max_context_tokens")
-        .and_then(|value| value.parse::<u32>().ok())
-        .unwrap_or_else(|| spec.max_tokens.min(u32::MAX as usize) as u32);
-    let q8 = if weight_quant.is_q8() {
-        Some(owned_decode_routing::identity::Q8Identity {
-            quantizer_revision: flag("quantizer_revision")
-                .unwrap_or_else(|| "q8-ingest-v1".to_string()),
-            derived_digest: flag("derived_digest").unwrap_or_else(|| spec.artifact_digest.clone()),
-        })
-    } else {
-        None
-    };
-    let entry = owned_decode_routing::CatalogEntry {
+    let q8 = weight_quant.is_q8().then(|| Q8Identity {
+        quantizer_revision: flag("quantizer_revision")
+            .unwrap_or_else(|| "q8-ingest-v1".to_string()),
+        derived_digest: flag("derived_digest").unwrap_or_else(|| spec.artifact_digest.clone()),
+    });
+    Ok(owned_decode_routing::CatalogEntry {
         entry_id: spec.model_id.clone(),
         engine: owned_decode_routing::CATALOG_ENGINE.to_string(),
         task: owned_decode_routing::CATALOG_TASK.to_string(),
@@ -5000,17 +5074,628 @@ fn route_owned_decode_preflight(
         worker: owned_decode_routing::CATALOG_WORKER.to_string(),
         risk_class: owned_decode_routing::CATALOG_RISK_CLASS.to_string(),
         family,
-        activation_dtype: owned_decode_routing::identity::ActivationDType::F16,
+        activation_dtype: ActivationDType::F16,
         weight_quant,
-        arithmetic_identity_revision,
-        metallib_revision,
-        max_context_tokens,
+        arithmetic_identity_revision: flag("arithmetic_identity_revision")
+            .unwrap_or_else(|| "owned-decode-arithmetic-v1".to_string()),
+        metallib_revision: flag("metallib_revision")
+            .unwrap_or_else(|| "owned-decode-metallib-v1".to_string()),
+        max_context_tokens: flag("max_context_tokens")
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or_else(|| spec.max_tokens.min(u32::MAX as usize) as u32),
         artifact_source_digest: spec.artifact_digest.clone(),
         q8,
         owned_family: spec.owned_family.clone(),
         owned_dtype: Some("f16".to_string()),
         quant: Some(spec.quant.clone()),
+    })
+}
+
+fn owned_decode_processing_fingerprint(
+    entry: &owned_decode_routing::CatalogEntry,
+) -> Result<Fingerprint, owned_decode_routing::error::OwnedDecodeError> {
+    use owned_decode_routing::identity::ProcessingIdentityInputs;
+
+    let decode_fingerprint = entry.decode_identity_inputs().decode_fingerprint()?;
+    let families = owned_decode_routing::family::FamilyRegistry::production();
+    let registration = families.get(entry.family)?;
+    Ok(ProcessingIdentityInputs {
+        decode_fingerprint,
+        tokenizer_sanitized_digest: registration.tokenizer_sanitized_digest.clone(),
+        prompt_template_revision: registration.prompt_template_revision.clone(),
+        special_token_policy_revision: registration.special_token_policy_revision.clone(),
+        stop_token_policy_revision: registration.stop_token_policy_revision.clone(),
+        detokenizer_revision: registration.detokenizer_revision.clone(),
+    }
+    .processing_fingerprint())
+}
+
+fn owned_decode_runtime_identity(
+    spec: &StoredModelConfig,
+    entry: &owned_decode_routing::CatalogEntry,
+) -> (String, u32) {
+    use owned_decode_routing::identity::RuntimeConfigManifest;
+
+    let scheduler: owned_decode_contracts::SchedulerManifest = serde_json::from_str(include_str!(
+        "../owned-decode-manifests/decode-sched-manifest-v1.json"
+    ))
+    .expect("checked-in decode scheduler manifest parses");
+    let flag = |name: &str| spec.engine_identity.build_flags.get(name);
+    let manifest = RuntimeConfigManifest {
+        worker_revision: spec.engine_identity.version.clone(),
+        protocol_revision: owned_decode_worker::identity::WORKER_PROTOCOL_ID.to_string(),
+        metallib_revision: entry.metallib_revision.clone(),
+        chain_k: flag("chain_k")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1),
+        batched_verification: flag("batched_verification").is_some_and(|value| value == "true"),
+        resident_limit: 1,
+        attention_kv_reservation_units: spec
+            .owned_attention_units
+            .unwrap_or(entry.max_context_tokens as usize)
+            as u64,
+        lfm2_conv_cache_reservation_bytes: flag("lfm2_conv_cache_reservation_bytes")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0),
+        context_manifest_revision: "decode-context-buckets-v1".to_string(),
+        crash_policy_revision: "two-strike-crash-budget-v1".to_string(),
+        quarantine_duration_ms: owned_decode_worker::budget::BudgetPolicy::default()
+            .quarantine_duration_ms,
+        scheduler: scheduler.runtime.clone(),
     };
+    (manifest.digest(), scheduler.runtime.production_n)
+}
+
+fn owned_decode_worker_runtime_dir(spec: &StoredModelConfig) -> PathBuf {
+    spec.worker_runtime_dir
+        .clone()
+        .or_else(|| env::var_os("SYNAPSE_OWNED_DECODE_WORKER_RUNTIME_DIR").map(PathBuf::from))
+        .unwrap_or_else(|| env::temp_dir().join("synapse-owned-decode-workers"))
+}
+
+fn owned_decode_budget_store_path(spec: &StoredModelConfig) -> PathBuf {
+    owned_decode_worker_runtime_dir(spec).join(format!("{}-crash-budget.json", spec.model_id))
+}
+
+fn owned_decode_quarantined(
+    state: &ModuleState,
+    spec: &StoredModelConfig,
+    decode_fingerprint: &Fingerprint,
+    runtime_config_digest: &str,
+) -> bool {
+    use owned_decode_worker::budget::{CrashBudget as OwnedCrashBudget, FileBudgetStore};
+    use owned_decode_worker::identity::QuarantineKey;
+
+    let Ok(store) = FileBudgetStore::open(owned_decode_budget_store_path(spec)) else {
+        return true;
+    };
+    let budget = OwnedCrashBudget::new(store, owned_decode_worker::budget::BudgetPolicy::default());
+    let key = QuarantineKey::new(
+        &state.machine_profile_hash,
+        &decode_fingerprint.0,
+        runtime_config_digest,
+    );
+    budget.is_quarantined(&key, 0)
+}
+
+fn owned_decode_vocabulary_digest(
+    tokenizer: &SanitizedTokenizer,
+) -> Result<String, WireOperationError> {
+    use synapse_engine_owned::owned_decode_engine::TokenVocabulary;
+
+    let vocabulary = TokenVocabulary::from_tokenizer(tokenizer.tokenizer())
+        .map_err(|error| artifact_invalid_error(error.to_string()))?;
+    let mut hasher = Sha256::new();
+    for token_id in 0..vocabulary.len() {
+        if let Some(piece) = vocabulary.token_piece(token_id as u32) {
+            hasher.update(piece);
+        }
+        hasher.update([0]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn worker_constraint(
+    compiled: &owned_decode_grammar_scheduler::TokenIdJsonConstraintV1,
+) -> owned_decode_worker::protocol::TokenIdJsonConstraint {
+    owned_decode_worker::protocol::TokenIdJsonConstraint {
+        encoding_id: compiled.representation_revision.clone(),
+        constraint_runtime_identity: compiled.constraint_runtime_identity.digest(),
+        constraint_fingerprint: compiled.constraint_fingerprint.0.clone(),
+        grammar_subset_revision: compiled
+            .constraint_runtime_identity
+            .grammar_subset_revision
+            .clone(),
+        grammar_compiler_revision: compiled
+            .constraint_runtime_identity
+            .grammar_compiler_revision
+            .clone(),
+        tokenizer_vocabulary_digest: compiled.tokenizer_vocabulary_digest.clone(),
+        limits_manifest_id: compiled.limits_manifest_id.clone(),
+        worker_constraint_runtime_revision: compiled
+            .constraint_runtime_identity
+            .worker_constraint_runtime_revision
+            .clone(),
+        canonical_schema_digest: compiled.canonical_schema_digest.clone(),
+        initial_state_encoding: compiled.initial_state_encoding.clone(),
+        initial_state_digest: compiled.initial_state_digest.clone(),
+        compiled_automaton_digest: compiled.compiled_automaton_digest.clone(),
+        automaton_bytes: compiled.automaton_bytes.clone(),
+    }
+}
+
+fn build_supervised_decode_dispatch(
+    state: &ModuleState,
+    spec: &StoredModelConfig,
+    entry: &owned_decode_routing::CatalogEntry,
+    prompt_ids: Vec<u32>,
+    constraint: Option<owned_decode_worker::protocol::TokenIdJsonConstraint>,
+    deadline_ms: u64,
+) -> Result<Option<worker_host::SupervisedDecodeDispatch>, WireOperationError> {
+    use owned_decode_worker::{
+        budget::BudgetPolicy,
+        identity::QuarantineKey,
+        protocol::{GenerateStart, Sampling},
+        supervisor::TerminalControl,
+        validation::WorkerStartContext,
+    };
+    use worker_host::{OwnedDecodeWorkerFactory, SupervisedDecodeDispatch, WorkerHostConfig};
+
+    let worker_bin = spec
+        .worker_bin
+        .clone()
+        .or_else(|| env::var_os("SYNAPSE_OWNED_DECODE_WORKER_BIN").map(PathBuf::from));
+    let Some(worker_bin) = worker_bin else {
+        return Ok(None);
+    };
+    let model_path = locator_path(&spec.model_locator, &state.model_cache)?;
+    let tokenizer_path = locator_path(&spec.tokenizer_locator, &state.model_cache)?;
+    let mut runtime_config = model_runtime_config(
+        spec,
+        &model_path.path,
+        &[],
+        state.model_cache.root(),
+        state.runtime.microllm_max_tokens,
+    );
+    let decode_fingerprint = entry
+        .decode_identity_inputs()
+        .decode_fingerprint()
+        .map_err(|error| artifact_invalid_error(error.as_str()))?;
+    let (runtime_config_digest, production_n) = owned_decode_runtime_identity(spec, entry);
+    for (key, value) in [
+        ("family", entry.family.as_str().to_string()),
+        ("weight_quant", entry.weight_quant.as_str().to_string()),
+        ("context_bucket", entry.max_context_tokens.to_string()),
+        ("production_n", production_n.to_string()),
+        (
+            "tokenizer_path",
+            tokenizer_path.path.to_string_lossy().to_string(),
+        ),
+        ("decode_fingerprint", decode_fingerprint.0.clone()),
+        ("runtime_config_digest", runtime_config_digest.clone()),
+    ] {
+        runtime_config.values.insert(key.to_string(), value);
+    }
+    let artifact = ValidatedArtifact {
+        digest: spec
+            .artifact_digest
+            .strip_prefix("sha256:")
+            .unwrap_or(&spec.artifact_digest)
+            .to_string(),
+        format: spec.artifact_format.clone(),
+    };
+    let runtime_dir = owned_decode_worker_runtime_dir(spec);
+    let mut host_config = WorkerHostConfig::new(worker_bin, runtime_dir);
+    host_config.worker_id = format!("synapse-owned-decode-{}", spec.model_id);
+    host_config.load_timeout = state.runtime.worker_load_timeout;
+    host_config.request_timeout = Duration::from_millis(deadline_ms.max(1));
+    let factory = OwnedDecodeWorkerFactory::new(host_config, artifact, runtime_config);
+    let key = QuarantineKey::new(
+        &state.machine_profile_hash,
+        &decode_fingerprint.0,
+        &runtime_config_digest,
+    );
+    let start = GenerateStart {
+        generation_id: String::new(),
+        loaded_model_ref: String::new(),
+        decode_fingerprint: decode_fingerprint.0.clone(),
+        runtime_config_digest: runtime_config_digest.clone(),
+        prompt_ids,
+        stop_ids: Vec::new(),
+        max_tokens: 1,
+        sampling: Sampling::greedy_top1(),
+        constraint: constraint.clone(),
+    };
+    let context = WorkerStartContext {
+        loaded_model_ref: String::new(),
+        decode_fingerprint: decode_fingerprint.0,
+        runtime_config_digest,
+        expected_constraint: constraint,
+    };
+    SupervisedDecodeDispatch::new(
+        factory,
+        owned_decode_budget_store_path(spec),
+        BudgetPolicy::default(),
+        production_n,
+        key,
+        start,
+        context,
+        TerminalControl {
+            deadline_at: Some(deadline_ms),
+            cancel_at: None,
+        },
+    )
+    .map(Some)
+    .map_err(|error| {
+        WireOperationError::from_stable(
+            StableError::engine_crashed(Some(100)),
+            format!("open owned-decode crash budget: {error}"),
+        )
+    })
+}
+
+fn cached_supervised_decode_dispatch(
+    state: &ModuleState,
+    spec: &StoredModelConfig,
+    entry: &owned_decode_routing::CatalogEntry,
+    prompt: Vec<u32>,
+    constraint: Option<owned_decode_worker::protocol::TokenIdJsonConstraint>,
+    deadline_ms: u64,
+) -> Result<Option<Arc<Mutex<worker_host::SupervisedDecodeDispatch>>>, WireOperationError> {
+    if let Some(dispatch) = state
+        .runtime
+        .owned_decode_dispatches
+        .lock()
+        .map_err(|_| {
+            WireOperationError::from_stable(
+                StableError::engine_crashed(Some(100)),
+                "owned-decode dispatch cache is unavailable",
+            )
+        })?
+        .get(&spec.model_id)
+        .cloned()
+    {
+        return Ok(Some(dispatch));
+    }
+    let Some(created) =
+        build_supervised_decode_dispatch(state, spec, entry, prompt, constraint, deadline_ms)?
+    else {
+        return Ok(None);
+    };
+    let mut dispatches = state.runtime.owned_decode_dispatches.lock().map_err(|_| {
+        WireOperationError::from_stable(
+            StableError::engine_crashed(Some(100)),
+            "owned-decode dispatch cache is unavailable",
+        )
+    })?;
+    Ok(Some(
+        dispatches
+            .entry(spec.model_id.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(created)))
+            .clone(),
+    ))
+}
+
+struct OwnedDecodeEnvironmentInputs {
+    processing_fingerprint: Fingerprint,
+    runtime_config_digest: String,
+    constraint_runtime_identity: Option<String>,
+    llama: Option<owned_decode_routing::lane::LlamaLane>,
+    equivalent_fingerprints: BTreeSet<Fingerprint>,
+}
+
+fn owned_decode_environment(
+    state: &ModuleState,
+    spec: &StoredModelConfig,
+    entry: &owned_decode_routing::CatalogEntry,
+    decode_fingerprint: &Fingerprint,
+    inputs: OwnedDecodeEnvironmentInputs,
+) -> owned_decode_routing::RoutingEnvironment {
+    use owned_decode_routing::certification::{
+        CertificationAccess, ConstrainedCertKey, UnconstrainedCertKey,
+    };
+
+    let OwnedDecodeEnvironmentInputs {
+        processing_fingerprint,
+        runtime_config_digest,
+        constraint_runtime_identity,
+        llama,
+        equivalent_fingerprints,
+    } = inputs;
+    let certification = PersistentDecodeCertification {
+        store: Arc::clone(&state.store),
+    };
+    let quarantined =
+        owned_decode_quarantined(state, spec, decode_fingerprint, &runtime_config_digest);
+    let checked_in = owned_decode_certification::load_checked_in_cutover_records();
+    let matching_record = checked_in.records.iter().find(|candidate| {
+        let record = &candidate.record;
+        candidate.enabled
+            && record.machine_profile_hash == state.machine_profile_hash
+            && record.enabled_catalog_entry_ids.contains(&entry.entry_id)
+            && record.decode_fingerprints.contains(decode_fingerprint)
+            && record
+                .processing_fingerprints
+                .contains(&processing_fingerprint)
+            && record.runtime_config_digest == runtime_config_digest
+            && constraint_runtime_identity
+                .as_ref()
+                .is_none_or(|identity| record.constrained_runtime_identities.contains(identity))
+    });
+    if let Some(candidate) = matching_record {
+        let scheduler: owned_decode_contracts::SchedulerManifest = serde_json::from_str(
+            include_str!("../owned-decode-manifests/decode-sched-manifest-v1.json"),
+        )
+        .expect("checked-in scheduler manifest parses");
+        let wire_bindings = owned_decode_contracts::WireErrorBindingsManifest {
+            manifest_revision: "owned-decode-wire-error-bindings-v1".to_string(),
+            schema_revision: "owned-decode-contracts-v1".to_string(),
+            request_contract_revision: "wire-contract-v1".to_string(),
+            deadline_error_id: "deadline_exceeded".to_string(),
+            cancellation_error_id: "cancelled".to_string(),
+            wire_changelog: Vec::new(),
+        };
+        let unconstrained_certified =
+            certification.is_unconstrained_certified(&UnconstrainedCertKey {
+                machine_profile_hash: state.machine_profile_hash.clone(),
+                decode_fingerprint: decode_fingerprint.clone(),
+            });
+        let constrained_certified = constraint_runtime_identity.as_ref().is_none_or(|identity| {
+            certification.is_constrained_certified(&ConstrainedCertKey {
+                machine_profile_hash: state.machine_profile_hash.clone(),
+                decode_fingerprint: decode_fingerprint.clone(),
+                constraint_runtime_identity: identity.clone(),
+            })
+        });
+        let gates_passed = (1..=12).all(|gate| {
+            candidate
+                .record
+                .acceptance_gate_evidence
+                .iter()
+                .any(|evidence| evidence.contains(&format!("G-DEC-{gate:02}")))
+        });
+        let scheduler_status = owned_decode_certification::ingest_scheduler_evidence(&scheduler);
+        let scheduler_evidence_committed =
+            owned_decode_certification::scheduler_evidence_committed(&scheduler_status);
+        let inputs = owned_decode_routing::lane::CutoverInputs {
+            artifacts_trusted: unconstrained_certified,
+            identities_installed: true,
+            unconstrained_certified,
+            constrained_certified,
+            quarantined,
+            wire_bindings_literal: owned_decode_certification::wire_bindings_are_literal(
+                &wire_bindings,
+            ),
+            gates_passed,
+            scheduler_evidence_committed,
+        };
+        return owned_decode_routing::RoutingEnvironment::with_cutover_evaluated(
+            state.machine_profile_hash.clone(),
+            state.runtime.grammar_enabled,
+            quarantined,
+            llama,
+            equivalent_fingerprints,
+            constraint_runtime_identity,
+            &candidate.record,
+            &inputs,
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    if state.runtime.owned_decode_cutover_for_test {
+        return owned_decode_routing::RoutingEnvironment::with_cutover_flag_for_test(
+            state.machine_profile_hash.clone(),
+            state.runtime.grammar_enabled,
+            true,
+            quarantined,
+            llama,
+            equivalent_fingerprints,
+            constraint_runtime_identity,
+        );
+    }
+
+    owned_decode_routing::RoutingEnvironment::without_cutover_record(
+        state.machine_profile_hash.clone(),
+        state.runtime.grammar_enabled,
+        quarantined,
+        llama,
+        equivalent_fingerprints,
+        constraint_runtime_identity,
+    )
+}
+
+async fn route_owned_decode_wire(
+    state: Arc<ModuleState>,
+    params: &MicroLlmOneshotParams,
+    model_id: &str,
+) -> HandlerOutcome {
+    use owned_decode_routing::certification::{CertificationAccess, UnconstrainedCertKey};
+    use owned_decode_routing::lane::{LaneKind, LlamaLane};
+    use owned_decode_routing::request::{OneshotRequest, SamplingMode};
+
+    let spec = match state
+        .runtime
+        .catalog
+        .lock()
+        .ok()
+        .and_then(|catalog| catalog.get(model_id).map(|slot| slot.spec.clone()))
+    {
+        Some(spec) => spec,
+        None => return channel_error("invalid_request", format!("unknown model '{model_id}'")),
+    };
+    let entry = match owned_decode_catalog_entry(&spec) {
+        Ok(entry) => entry,
+        Err(error) => {
+            return channel_error(
+                error.as_str(),
+                format!("owned-decode catalog entry '{model_id}' is unsupported"),
+            )
+        }
+    };
+    let alias_table = match state.store.alias_table() {
+        Ok(table) => table,
+        Err(error) => return channel_error("store_failure", error.to_string()),
+    };
+    if params
+        .required_epoch
+        .is_some_and(|required| required > alias_table.table_epoch)
+    {
+        return result_outcome(error_payload(
+            &state,
+            WireOperationError::from_stable(
+                StableError::migration_required(),
+                "requested alias table epoch is newer than the module table",
+            ),
+        ));
+    }
+    let tokenizer_path = match locator_path(&spec.tokenizer_locator, &state.model_cache) {
+        Ok(path) => path,
+        Err(error) => return result_outcome(error_payload(&state, error)),
+    };
+    let tokenizer = match SanitizedTokenizer::from_file(
+        &tokenizer_path.path,
+        TokenizerConfig {
+            max_tokens: spec.max_tokens,
+        },
+    ) {
+        Ok(tokenizer) => tokenizer,
+        Err(error) => return channel_error("artifact_invalid", error.to_string()),
+    };
+    let tokenized = match tokenizer.tokenize_batch([params.prompt.as_str()]) {
+        Ok(tokenized) => tokenized,
+        Err(error) => return channel_error("invalid_request", error.to_string()),
+    };
+    let prompt = tokenized.batch.items.first().cloned().unwrap_or_default();
+    let decode_fingerprint = match entry.decode_identity_inputs().decode_fingerprint() {
+        Ok(fingerprint) => fingerprint,
+        Err(error) => return channel_error(error.as_str(), "invalid decode identity"),
+    };
+    let processing_fingerprint = match owned_decode_processing_fingerprint(&entry) {
+        Ok(fingerprint) => fingerprint,
+        Err(error) => return channel_error(error.as_str(), "invalid processing identity"),
+    };
+    let constrained = params
+        .grammar
+        .as_deref()
+        .is_some_and(|grammar| !grammar.trim().is_empty());
+    let certification = PersistentDecodeCertification {
+        store: Arc::clone(&state.store),
+    };
+    if constrained
+        && !owned_decode_routing::certification::CertificationAccess::is_unconstrained_certified(
+            &certification,
+            &owned_decode_routing::certification::UnconstrainedCertKey {
+                machine_profile_hash: state.machine_profile_hash.clone(),
+                decode_fingerprint: decode_fingerprint.clone(),
+            },
+        )
+    {
+        return channel_error(
+            "grammar_disabled",
+            "no certified owned-decode lane is available (underlying owned_decode_not_certified)",
+        );
+    }
+    let compiled_constraint = match params
+        .grammar
+        .as_deref()
+        .filter(|grammar| !grammar.trim().is_empty())
+    {
+        Some(grammar) => {
+            let vocabulary_digest = match owned_decode_vocabulary_digest(&tokenizer) {
+                Ok(digest) => digest,
+                Err(error) => return result_outcome(error_payload(&state, error)),
+            };
+            match owned_decode_grammar_scheduler::compile_grammar(
+                grammar,
+                &owned_decode_grammar_scheduler::CompileContext {
+                    base_decode_fingerprint: decode_fingerprint.clone(),
+                    tokenizer_vocabulary_digest: vocabulary_digest,
+                },
+                &owned_decode_grammar_scheduler::GrammarSubsetManifest::default(),
+            ) {
+                Ok(compiled) => Some(compiled),
+                Err(error) => return channel_error(error.wire_error().as_str(), error.message),
+            }
+        }
+        None => None,
+    };
+    let constraint_runtime_identity = compiled_constraint
+        .as_ref()
+        .map(|compiled| compiled.constraint.constraint_runtime_identity.digest());
+    let worker_constraint = compiled_constraint
+        .as_ref()
+        .map(|compiled| worker_constraint(&compiled.constraint));
+    let (runtime_config_digest, _) = owned_decode_runtime_identity(&spec, &entry);
+
+    let llama_spec = if compiled_constraint.is_none() {
+        state.runtime.catalog.lock().ok().and_then(|catalog| {
+            catalog
+                .values()
+                .map(|slot| &slot.spec)
+                .find(|candidate| {
+                    candidate.model_id != model_id
+                        && candidate.engine == "llama"
+                        && candidate.task == ModelTask::Generate.as_str()
+                })
+                .cloned()
+        })
+    } else {
+        None
+    };
+    let llama_model = if let Some(fallback) = llama_spec.as_ref() {
+        ensure_model_loaded_for_control(Arc::clone(&state), &fallback.model_id, params.deadline_ms)
+            .await
+            .ok()
+    } else {
+        None
+    };
+    let llama_lane = llama_spec.as_ref().map(|fallback| LlamaLane {
+        decode_fingerprint: fallback.fingerprint.clone(),
+        processing_fingerprint: fallback.fingerprint.clone(),
+    });
+    let equivalent_fingerprints = alias_table
+        .equivalent_fingerprints_at(&decode_fingerprint, now_ms())
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let environment = owned_decode_environment(
+        &state,
+        &spec,
+        &entry,
+        &decode_fingerprint,
+        OwnedDecodeEnvironmentInputs {
+            processing_fingerprint: processing_fingerprint.clone(),
+            runtime_config_digest: runtime_config_digest.clone(),
+            constraint_runtime_identity: constraint_runtime_identity.clone(),
+            llama: llama_lane,
+            equivalent_fingerprints,
+        },
+    );
+
+    let certification = PersistentDecodeCertification {
+        store: Arc::clone(&state.store),
+    };
+    let mut q8 = owned_decode_routing::q8ingest::Q8IngestRegistry::new();
+    if let Some(q8_identity) = entry.q8.as_ref() {
+        let certified = certification.is_unconstrained_certified(&UnconstrainedCertKey {
+            machine_profile_hash: state.machine_profile_hash.clone(),
+            decode_fingerprint: decode_fingerprint.clone(),
+        });
+        if certified {
+            q8.register_expected_digest(
+                &entry.artifact_source_digest,
+                &q8_identity.quantizer_revision,
+                &q8_identity.derived_digest,
+            );
+            let derived = q8_identity.derived_digest.clone();
+            let _ = q8.load_or_ingest(
+                &entry.artifact_source_digest,
+                &q8_identity.quantizer_revision,
+                "q8_0",
+                &[],
+                |_| derived,
+            );
+        }
+    }
     let context_buckets: owned_decode_contracts::ContextBucketsManifest = serde_json::from_str(
         include_str!("../owned-decode-manifests/decode-context-buckets-v1.json"),
     )
@@ -5018,56 +5703,199 @@ fn route_owned_decode_preflight(
     let router = owned_decode_routing::OwnedDecodeRouter::new(
         owned_decode_routing::family::FamilyRegistry::production(),
         context_buckets,
-        owned_decode_routing::q8ingest::Q8IngestRegistry::new(),
-        Box::new(owned_decode_routing::certification::CertificationStore::new()),
+        q8,
+        Box::new(certification),
     );
-    let grammar = params
-        .grammar
-        .as_deref()
-        .filter(|raw| !raw.trim().is_empty())
-        .map(|raw| serde_json::from_str(raw).unwrap_or(Value::Null));
-    let request = owned_decode_routing::request::OneshotRequest {
-        family,
-        weight_quant,
-        prompt_token_count,
+    let request = OneshotRequest {
+        family: entry.family,
+        weight_quant: entry.weight_quant,
+        prompt_token_count: prompt.len().min(u32::MAX as usize) as u32,
         max_tokens: params.max_tokens,
-        sampling: owned_decode_routing::request::SamplingMode::GreedyTop1,
-        grammar,
+        sampling: SamplingMode::GreedyTop1,
+        grammar: params
+            .grammar
+            .as_deref()
+            .filter(|grammar| !grammar.trim().is_empty())
+            .and_then(|grammar| serde_json::from_str(grammar).ok()),
         required_fingerprint: params.required_fingerprint.clone().map(Fingerprint),
         allow_equivalent: params.allow_equivalent,
         target_fingerprint: params.target_fingerprint.clone().map(Fingerprint),
         required_processing_fingerprint: None,
-        owned_only: true,
+        owned_only: false,
     };
-    let env = owned_decode_routing::RoutingEnvironment::without_cutover_record(
-        state.machine_profile_hash.clone(),
-        state.runtime.grammar_enabled,
-        false,
-        None,
-        BTreeSet::new(),
-        None,
-    );
-    let mut dispatch = WirePreflightDispatch;
-    match router.route_oneshot(
-        &env,
-        &entry,
-        &request,
-        &format!("{}-{}", state.module_generation, now_ms()),
-        &mut dispatch,
-    ) {
-        Err(failure) => Some(channel_error(
-            failure.wire_id(),
-            match failure.underlying_owned_decode_refusal_id {
-                Some(underlying) => format!(
-                    "owned-decode request refused: {} (underlying {})",
-                    failure.wire_id(),
-                    underlying.as_str()
+    let total_tokens = u64::from(request.prompt_token_count) + u64::from(params.max_tokens);
+    if total_tokens > state.runtime.inline.max_tokens {
+        return result_outcome(error_payload(
+            &state,
+            WireOperationError::from_stable(
+                StableError::queue_full(Some(state.runtime.inline.max_queue_ms)),
+                format!(
+                    "microllm.oneshot token budget {total_tokens} exceeds inline budget {}",
+                    state.runtime.inline.max_tokens
                 ),
-                None => format!("owned-decode request refused: {}", failure.wire_id()),
-            },
-        )),
-        Ok(_) => None,
+            ),
+        ));
     }
+    let admission = match state.runtime.admit_inline(
+        QueueClass::Interactive,
+        request_bytes_for_texts([params.prompt.as_str()]),
+        params.deadline_ms,
+        params.max_queue_ms,
+    ) {
+        Ok(admission) => admission,
+        Err(error) => return result_outcome(error_payload(&state, error)),
+    };
+    let permit = match acquire_execution_permit(&state.runtime, Some(admission.deadline())).await {
+        Ok(permit) => permit,
+        Err(error) => return result_outcome(error_payload(&state, error)),
+    };
+    let deadline_ms = params
+        .deadline_ms
+        .unwrap_or(state.runtime.inline.deadline_ms)
+        .max(1);
+    let owned = cached_supervised_decode_dispatch(
+        &state,
+        &spec,
+        &entry,
+        prompt.clone(),
+        worker_constraint.clone(),
+        deadline_ms,
+    )
+    .ok()
+    .flatten();
+    let dispatch = WireDecodeDispatch {
+        owned,
+        prompt,
+        constraint: worker_constraint,
+        deadline_ms,
+        llama: llama_model.clone(),
+        llama_output: None,
+    };
+    let generation_id = format!("{}-{}", state.module_generation, now_ms());
+    let n_prompt = request.prompt_token_count as usize;
+    let routed = tokio::task::spawn_blocking(move || {
+        let mut dispatch = dispatch;
+        let routed = router.route_oneshot(
+            &environment,
+            &entry,
+            &request,
+            &generation_id,
+            &mut dispatch,
+        );
+        (routed, dispatch)
+    })
+    .await;
+    drop(permit);
+    drop(admission);
+    let (routed, dispatch) = match routed {
+        Ok(result) => result,
+        Err(error) => {
+            return result_outcome(error_payload(
+                &state,
+                WireOperationError::from_stable(
+                    StableError::engine_crashed(Some(100)),
+                    format!("owned-decode dispatch join failed: {error}"),
+                ),
+            ))
+        }
+    };
+    let mut routed = match routed {
+        Ok(response) => response,
+        Err(failure) => {
+            return channel_error(
+                failure.wire_id(),
+                match failure.underlying_owned_decode_refusal_id {
+                    Some(underlying) => format!(
+                        "owned-decode request refused: {} (underlying {})",
+                        failure.wire_id(),
+                        underlying.as_str()
+                    ),
+                    None => format!("owned-decode request refused: {}", failure.wire_id()),
+                },
+            )
+        }
+    };
+    if let Some(compiled) = compiled_constraint.as_ref() {
+        routed.provenance = routed.provenance.clone().with_constraint(
+            compiled.constraint.constraint_runtime_identity.digest(),
+            compiled.constraint.constraint_fingerprint.clone(),
+            compiled
+                .constraint
+                .constraint_runtime_identity
+                .grammar_compiler_revision
+                .clone(),
+        );
+    }
+    let text = if routed.lane == LaneKind::Llama {
+        dispatch
+            .llama_output
+            .as_ref()
+            .map(|output| output.text.clone())
+            .unwrap_or_default()
+    } else {
+        match tokenizer.decode(&routed.generated_token_ids) {
+            Ok(text) => text,
+            Err(error) => return channel_error("artifact_invalid", error.to_string()),
+        }
+    };
+    let selected_model = if routed.lane == LaneKind::Llama {
+        llama_model.as_deref()
+    } else {
+        None
+    };
+    let fingerprint = selected_model
+        .map(|model| model.fingerprint.clone())
+        .unwrap_or_else(|| spec.fingerprint.clone());
+    let engine = selected_model
+        .map(|model| model.engine_identity.clone())
+        .unwrap_or_else(|| spec.engine_identity.clone());
+    let equivalent_to = alias_table
+        .equivalent_fingerprints_at(&fingerprint, now_ms())
+        .into_iter()
+        .collect();
+    let provenance = &routed.provenance;
+    let payload = MicroLlmOneshotPayload {
+        text,
+        finish_reason: routed.finish_reason.as_str().to_string(),
+        n_prompt,
+        n_gen: routed.generated_token_ids.len(),
+        real_token_counts: tokenized.real_token_counts,
+        truncation_disclosures: tokenized.disclosures,
+    };
+    let envelope = ResponseEnvelope {
+        fingerprint,
+        table_epoch: alias_table.table_epoch,
+        dims: 0,
+        provenance: ResponseProvenance {
+            engine,
+            remote: None,
+            owned_decode: synapse_core::OwnedDecodeResponseProvenance {
+                lane: Some(provenance.lane.clone()),
+                worker: Some(provenance.worker.clone()),
+                risk_class: Some(provenance.risk_class.clone()),
+                decode_fingerprint: Some(provenance.decode_fingerprint.clone()),
+                processing_fingerprint: Some(provenance.processing_fingerprint.clone()),
+                fallback_reason: provenance.fallback_reason.clone(),
+                lane_finish_reason: provenance.lane_finish_reason.clone(),
+                worker_generation: (provenance.worker_generation != 0)
+                    .then_some(provenance.worker_generation),
+                last_completed_quantum_sequence: (provenance.last_completed_quantum_sequence != 0)
+                    .then_some(provenance.last_completed_quantum_sequence),
+                crash_retry_count: provenance.crash_retry_count,
+                failure_classifications: provenance.failure_classifications.clone(),
+                constraint_runtime_identity: provenance.constraint_runtime_identity.clone(),
+                constraint_fingerprint: provenance.constraint_fingerprint.clone(),
+                grammar_compiler_revision: provenance.grammar_compiler_revision.clone(),
+                underlying_owned_decode_refusal_id: provenance
+                    .underlying_owned_decode_refusal_id
+                    .clone(),
+            },
+        },
+        module_generation: state.module_generation,
+        equivalent_to,
+        payload,
+    };
+    result_outcome(serde_json::to_value(envelope).expect("microllm envelope should serialize"))
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -6232,6 +7060,10 @@ async fn execute_embedding(
             })?
             .map_err(engine_error_to_wire)
         }
+        EmbedBackend::OwnedDecode => Err(WireOperationError::from_stable(
+            StableError::artifact_invalid(),
+            format!("model '{}' does not support embedding", model.model_id),
+        )),
         EmbedBackend::Worker(engine) => {
             let engine = Arc::clone(engine);
             let loaded_model = model.loaded_model.clone();
@@ -6290,10 +7122,12 @@ async fn execute_rerank(
 ) -> Result<synapse_core::RerankScores, WireOperationError> {
     let permit = acquire_execution_permit(runtime, deadline).await?;
     match &model.backend {
-        EmbedBackend::Ort(_) | EmbedBackend::Owned(_) => Err(WireOperationError::from_stable(
-            StableError::artifact_invalid(),
-            format!("model '{}' does not support rerank.score", model.model_id),
-        )),
+        EmbedBackend::Ort(_) | EmbedBackend::Owned(_) | EmbedBackend::OwnedDecode => {
+            Err(WireOperationError::from_stable(
+                StableError::artifact_invalid(),
+                format!("model '{}' does not support rerank.score", model.model_id),
+            ))
+        }
         EmbedBackend::Worker(engine) => {
             let engine = Arc::clone(engine);
             let loaded_model = model.loaded_model.clone();
@@ -6328,13 +7162,15 @@ async fn execute_generate(
 ) -> Result<GenerateOutput, WireOperationError> {
     let permit = acquire_execution_permit(runtime, deadline).await?;
     match &model.backend {
-        EmbedBackend::Ort(_) | EmbedBackend::Owned(_) => Err(WireOperationError::from_stable(
-            StableError::artifact_invalid(),
-            format!(
-                "model '{}' does not support microllm.oneshot",
-                model.model_id
-            ),
-        )),
+        EmbedBackend::Ort(_) | EmbedBackend::Owned(_) | EmbedBackend::OwnedDecode => {
+            Err(WireOperationError::from_stable(
+                StableError::artifact_invalid(),
+                format!(
+                    "model '{}' does not support the legacy microllm.oneshot path",
+                    model.model_id
+                ),
+            ))
+        }
         EmbedBackend::Worker(engine) => {
             let engine = Arc::clone(engine);
             let loaded_model = model.loaded_model.clone();
@@ -6459,7 +7295,7 @@ fn ensure_model_certified(
     ensure_fingerprint_certified(
         &state.store,
         &state.machine_profile_hash,
-        &model.fingerprint,
+        &model.certification_fingerprint,
         &model.model_id,
         accept_declared,
     )
@@ -7172,7 +8008,7 @@ async fn ane_placement_share_for_model(
             })?;
             Ok(ping.placement_share)
         }
-        EmbedBackend::Ort(_) | EmbedBackend::Owned(_) => Ok(None),
+        EmbedBackend::Ort(_) | EmbedBackend::Owned(_) | EmbedBackend::OwnedDecode => Ok(None),
     }
 }
 
@@ -7285,6 +8121,8 @@ async fn execute_generate_probe_for_model(
     model: Arc<EmbeddingModel>,
     fixture: &GenerateProbeFixture,
 ) -> Result<ProbeModelResult, WireOperationError> {
+    use owned_decode_routing::lane::LaneKind;
+
     if !microllm_certification_required(&model) {
         return Ok(ProbeModelResult {
             lane_result: json!({
@@ -7300,18 +8138,41 @@ async fn execute_generate_probe_for_model(
         });
     }
 
-    if !generate_fixture_matches_model(fixture, &model) {
+    let spec = state
+        .runtime
+        .catalog
+        .lock()
+        .ok()
+        .and_then(|catalog| catalog.get(&model.model_id).map(|slot| slot.spec.clone()))
+        .ok_or_else(|| {
+            WireOperationError::from_stable(
+                StableError::artifact_invalid(),
+                format!("missing catalog entry for '{}'", model.model_id),
+            )
+        })?;
+    let entry = owned_decode_catalog_entry(&spec)
+        .map_err(|error| artifact_invalid_error(error.as_str()))?;
+    let decode_fingerprint = entry
+        .decode_identity_inputs()
+        .decode_fingerprint()
+        .map_err(|error| artifact_invalid_error(error.as_str()))?;
+    let processing_fingerprint = owned_decode_processing_fingerprint(&entry)
+        .map_err(|error| artifact_invalid_error(error.as_str()))?;
+    let fixture_matches = spec.owned_family.as_deref() == Some(fixture.family.as_str())
+        && spec.owned_dtype.as_deref() == Some(fixture.dtype.as_str());
+    if !fixture_matches {
         let evidence = json!({
             "task": "generate",
             "gate": "token_exact",
             "blocking_reason": "fixture_unavailable",
             "fixture": generate_fixture_provenance(fixture),
-            "model_family": model.engine_identity.build_flags.get("family"),
-            "model_dtype": model.engine_identity.build_flags.get("dtype"),
+            "model_family": spec.owned_family,
+            "model_dtype": spec.owned_dtype,
         });
-        store_probe_outcome_row(
+        store_probe_outcome_for_fingerprint(
             state,
             &model,
+            &decode_fingerprint,
             CertificationStatus::Uncertified,
             evidence.clone(),
         )?;
@@ -7319,7 +8180,7 @@ async fn execute_generate_probe_for_model(
             lane_result: json!({
                 "model_id": model.model_id,
                 "task": "generate",
-                "fingerprint": model.fingerprint,
+                "fingerprint": decode_fingerprint,
                 "numeric_profile_id": model.numeric_profile_id,
                 "status": "uncertified",
                 "certification_required": true,
@@ -7336,36 +8197,64 @@ async fn execute_generate_probe_for_model(
     let mut mismatches = Vec::new();
     let mut throughput_samples = Vec::with_capacity(fixture.items.len());
     let mut latency_samples = Vec::with_capacity(fixture.items.len());
-    for item in &fixture.items {
-        let tokenized = match model.tokenizer.tokenize_batch([item.prompt.as_str()]) {
-            Ok(tokenized) => tokenized,
-            Err(error) => {
-                return store_generate_probe_error(
-                    state,
-                    &model,
-                    fixture,
-                    "tokenization_failed",
-                    error.to_string(),
+    let mut worker_dispatch: Option<Arc<Mutex<worker_host::SupervisedDecodeDispatch>>> = None;
+    for (index, item) in fixture.items.iter().enumerate() {
+        let tokenized = model
+            .tokenizer
+            .tokenize_batch([item.prompt.as_str()])
+            .map_err(|error| {
+                WireOperationError::from_stable(
+                    StableError::artifact_invalid(),
+                    format!("owned-decode probe tokenization failed: {error}"),
                 )
-            }
-        };
+            })?;
         let prompt = tokenized.batch.items.into_iter().next().unwrap_or_default();
+        let prompt_token_count = prompt.len().min(u32::MAX as usize) as u32;
+        if worker_dispatch.is_none() {
+            worker_dispatch = cached_supervised_decode_dispatch(
+                state,
+                &spec,
+                &entry,
+                prompt.clone(),
+                None,
+                180_000,
+            )?;
+        }
+        let mut dispatch = worker_dispatch
+            .as_ref()
+            .ok_or_else(|| {
+                WireOperationError::from_stable(
+                    StableError::artifact_invalid(),
+                    "owned-decode certification requires a supervised worker binary",
+                )
+            })?
+            .lock()
+            .map_err(|_| {
+                WireOperationError::from_stable(
+                    StableError::engine_crashed(Some(100)),
+                    "owned-decode dispatch cache is unavailable",
+                )
+            })?;
+        dispatch.set_request(prompt, None, 180_000);
         let started = std::time::Instant::now();
-        let output = match execute_generate(
-            &state.runtime,
-            &model,
-            GenerateRequest {
-                prompt,
+        let output = owned_decode_routing::DecodeDispatch::dispatch(
+            &mut *dispatch,
+            &owned_decode_routing::DispatchedCommand {
+                lane: LaneKind::OwnedDecode,
+                decode_fingerprint: decode_fingerprint.clone(),
+                processing_fingerprint: processing_fingerprint.clone(),
+                prompt_token_count,
                 max_tokens: item.max_new_tokens,
-                grammar: None, // grammar requests are rejected before worker dispatch
+                generation_id: format!("probe-{}-{index}", state.module_generation),
+                constrained: false,
             },
-            None,
         )
-        .await
-        {
-            Ok(output) => output,
-            Err(error) => return Err(error),
-        };
+        .map_err(|error| {
+            WireOperationError::from_stable(
+                StableError::engine_crashed(Some(100)),
+                format!("owned-decode worker-path probe failed: {}", error.as_str()),
+            )
+        })?;
         let elapsed_secs = started.elapsed().as_secs_f64().max(f64::EPSILON);
         latency_samples.push(elapsed_secs * 1_000.0);
         throughput_samples.push(output.generated_token_ids.len() as f64 / elapsed_secs);
@@ -7377,23 +8266,102 @@ async fn execute_generate_probe_for_model(
         }
     }
 
+    let vocabulary_digest = owned_decode_vocabulary_digest(&model.tokenizer)?;
+    let constrained_schema = r#"{"type":"string","enum":["red","green","blue"]}"#;
+    let compiled = owned_decode_grammar_scheduler::compile_grammar(
+        constrained_schema,
+        &owned_decode_grammar_scheduler::CompileContext {
+            base_decode_fingerprint: decode_fingerprint.clone(),
+            tokenizer_vocabulary_digest: vocabulary_digest,
+        },
+        &owned_decode_grammar_scheduler::GrammarSubsetManifest::default(),
+    )
+    .map_err(|error| {
+        WireOperationError::from_stable(
+            StableError::artifact_invalid(),
+            format!(
+                "compile owned-decode certification constraint: {}",
+                error.message
+            ),
+        )
+    })?;
+    let constrained_runtime_identity = compiled.constraint.constraint_runtime_identity.digest();
+    let constrained_prompt = model
+        .tokenizer
+        .tokenize("Return one color as JSON.")
+        .map_err(|error| artifact_invalid_error(error.to_string()))?
+        .ids;
+    let constrained_dispatch = worker_dispatch.expect("fixture battery is non-empty");
+    let mut constrained_dispatch = constrained_dispatch.lock().map_err(|_| {
+        WireOperationError::from_stable(
+            StableError::engine_crashed(Some(100)),
+            "owned-decode dispatch cache is unavailable",
+        )
+    })?;
+    constrained_dispatch.set_request(
+        constrained_prompt.clone(),
+        Some(worker_constraint(&compiled.constraint)),
+        180_000,
+    );
+    let constrained = owned_decode_routing::DecodeDispatch::dispatch(
+        &mut *constrained_dispatch,
+        &owned_decode_routing::DispatchedCommand {
+            lane: LaneKind::OwnedDecode,
+            decode_fingerprint: decode_fingerprint.clone(),
+            processing_fingerprint,
+            prompt_token_count: constrained_prompt.len().min(u32::MAX as usize) as u32,
+            max_tokens: 64,
+            generation_id: format!("probe-{}-constrained", state.module_generation),
+            constrained: true,
+        },
+    );
+    let constrained_schema_valid = constrained
+        .as_ref()
+        .ok()
+        .and_then(|output| model.tokenizer.decode(&output.generated_token_ids).ok())
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .is_some_and(|value| {
+            value
+                .as_str()
+                .is_some_and(|color| matches!(color, "red" | "green" | "blue"))
+        });
+
     let evidence = GenerateProbeEvidence {
         token_exact_matches: exact_matches,
         items: fixture.items.len(),
         tokens_compared,
     };
-    let passed = exact_matches == fixture.items.len();
+    let passed = exact_matches == fixture.items.len() && constrained_schema_valid;
     let certification_evidence = json!({
         "task": "generate",
         "gate": "token_exact",
-        "blocking_reason": if passed { Value::Null } else { json!("token_mismatch") },
+        "blocking_reason": if passed {
+            Value::Null
+        } else if exact_matches != fixture.items.len() {
+            json!("token_mismatch")
+        } else {
+            json!("constrained_worker_path_failed")
+        },
         "metrics": evidence,
         "mismatches": mismatches,
         "fixture": generate_fixture_provenance(fixture),
+        "worker_path": {
+            "transport": worker_catalog_transport(),
+            "protocol": owned_decode_worker::identity::WORKER_PROTOCOL_ID,
+            "fixture_battery": "20x64-token-exact",
+            "prompt_count": fixture.items.len(),
+            "constrained_schema_valid": constrained_schema_valid,
+            "constrained_runtime_identities": if constrained_schema_valid {
+                vec![constrained_runtime_identity]
+            } else {
+                Vec::<String>::new()
+            },
+        },
     });
-    store_probe_outcome_row(
+    store_probe_outcome_for_fingerprint(
         state,
         &model,
+        &decode_fingerprint,
         if passed {
             CertificationStatus::Certified
         } else {
@@ -7415,7 +8383,7 @@ async fn execute_generate_probe_for_model(
             cold_load_ms,
             single_item_latency_p50_ms: median_value(&mut latency_samples),
             details: json!({
-                "mode": "single_stream",
+                "mode": "supervised_worker_socket_single_stream",
                 "statistic": "median_over_fixtures",
                 "fixture_samples": fixture.items.len(),
                 "generated_tokens_per_fixture": fixture.items.first().map(|item| item.expected_token_ids.len()),
@@ -7435,11 +8403,11 @@ async fn execute_generate_probe_for_model(
         lane_result: json!({
             "model_id": model.model_id,
             "task": "generate",
-            "fingerprint": model.fingerprint,
+            "fingerprint": decode_fingerprint,
             "numeric_profile_id": model.numeric_profile_id,
             "status": if passed { "certified" } else { "uncertified" },
             "certification_required": true,
-            "blocking_reason": if passed { Value::Null } else { json!("token_mismatch") },
+            "blocking_reason": certification_evidence["blocking_reason"],
             "evidence": certification_evidence,
             "performance": performance,
         }),
@@ -7452,20 +8420,7 @@ fn microllm_certification_required(model: &EmbeddingModel) -> bool {
 }
 
 fn engine_requires_microllm_certification(engine: &str) -> bool {
-    engine == "owned-metal"
-}
-
-fn generate_fixture_matches_model(fixture: &GenerateProbeFixture, model: &EmbeddingModel) -> bool {
-    model
-        .engine_identity
-        .build_flags
-        .get("family")
-        .is_some_and(|family| family == &fixture.family)
-        && model
-            .engine_identity
-            .build_flags
-            .get("dtype")
-            .is_some_and(|dtype| dtype == &fixture.dtype)
+    engine == "owned-metal-decode"
 }
 
 fn generate_fixture_provenance(fixture: &GenerateProbeFixture) -> Value {
@@ -7498,42 +8453,6 @@ fn decode_token_mismatch(item: &GenerateProbeItem, actual: &[u32]) -> Value {
     })
 }
 
-fn store_generate_probe_error(
-    state: &ModuleState,
-    model: &EmbeddingModel,
-    fixture: &GenerateProbeFixture,
-    blocking_reason: &str,
-    error: String,
-) -> Result<ProbeModelResult, WireOperationError> {
-    let evidence = json!({
-        "task": "generate",
-        "gate": "token_exact",
-        "blocking_reason": blocking_reason,
-        "error": error,
-        "fixture": generate_fixture_provenance(fixture),
-    });
-    store_probe_outcome_row(
-        state,
-        model,
-        CertificationStatus::Uncertified,
-        evidence.clone(),
-    )?;
-    Ok(ProbeModelResult {
-        lane_result: json!({
-            "model_id": model.model_id,
-            "task": "generate",
-            "fingerprint": model.fingerprint,
-            "numeric_profile_id": model.numeric_profile_id,
-            "status": "uncertified",
-            "certification_required": true,
-            "blocking_reason": blocking_reason,
-            "evidence": evidence,
-            "performance": Value::Null,
-        }),
-        certified_vectors: None,
-    })
-}
-
 fn store_probe_cert_row(
     state: &ModuleState,
     model: &EmbeddingModel,
@@ -7548,6 +8467,16 @@ fn store_probe_outcome_row(
     status: CertificationStatus,
     evidence: Value,
 ) -> Result<(), WireOperationError> {
+    store_probe_outcome_for_fingerprint(state, model, &model.fingerprint, status, evidence)
+}
+
+fn store_probe_outcome_for_fingerprint(
+    state: &ModuleState,
+    model: &EmbeddingModel,
+    fingerprint: &Fingerprint,
+    status: CertificationStatus,
+    evidence: Value,
+) -> Result<(), WireOperationError> {
     let row = CertificationRow {
         assurance_class: AssuranceClass::Measured,
         status,
@@ -7555,7 +8484,7 @@ fn store_probe_outcome_row(
             machine_profile_hash: state.machine_profile_hash.clone(),
         },
         numeric_profile_id: model.numeric_profile_id.clone(),
-        fingerprint: model.fingerprint.clone(),
+        fingerprint: fingerprint.clone(),
         certified_at_ms: now_ms(),
         os_build: state.machine_profile.os_build.clone(),
         module_generation: state.module_generation,
@@ -8260,7 +9189,11 @@ fn worker_health_from_slot(slot: &ModelSlotSnapshot) -> Option<worker_host::Work
 }
 
 fn lane_requires_certification(slot: &ModelSlotSnapshot) -> bool {
-    slot.spec.task != ModelTask::Generate.as_str() || slot.spec.engine == "owned-metal"
+    slot.spec.task != ModelTask::Generate.as_str()
+        || matches!(
+            slot.spec.engine.as_str(),
+            "owned-metal" | "owned-metal-decode"
+        )
 }
 
 fn lane_blocking_reason(
@@ -8381,7 +9314,18 @@ async fn probe_report(state: Arc<ModuleState>) -> HandlerOutcome {
     let mut certification_stale = false;
     let mut performance_stale = false;
     for slot in slots {
-        let measurements = lane_measurement_rows(&state, &slot.spec.fingerprint);
+        let certification_fingerprint = slot
+            .loaded
+            .as_ref()
+            .map(|model| model.certification_fingerprint.clone())
+            .or_else(|| {
+                (slot.spec.engine == "owned-metal-decode")
+                    .then(|| owned_decode_catalog_entry(&slot.spec).ok())
+                    .flatten()
+                    .and_then(|entry| entry.decode_identity_inputs().decode_fingerprint().ok())
+            })
+            .unwrap_or_else(|| slot.spec.fingerprint.clone());
+        let measurements = lane_measurement_rows(&state, &certification_fingerprint);
         certification_stale |= measurements.certification_stale;
         performance_stale |= measurements.performance_stale;
         let worker = worker_health_from_slot(&slot);
@@ -8422,7 +9366,7 @@ async fn probe_report(state: Arc<ModuleState>) -> HandlerOutcome {
             "model_id": slot.spec.model_id,
             "task": slot.spec.task,
             "engine": slot.spec.engine,
-            "fingerprint": slot.spec.fingerprint,
+            "fingerprint": certification_fingerprint,
             "numeric_profile_id": slot.spec.numeric_profile_id,
             "state": model_runtime_state_name(&slot.state),
             "certification_required": certification_required,
@@ -8489,7 +9433,7 @@ async fn admission_status(state: Arc<ModuleState>) -> HandlerOutcome {
         .loaded_models()
         .into_iter()
         .map(|model| {
-            let measurements = lane_measurement_rows(&state, &model.fingerprint);
+            let measurements = lane_measurement_rows(&state, &model.certification_fingerprint);
             json!({
                 "model_id": model.model_id,
                 "fingerprint": model.fingerprint,
@@ -8532,7 +9476,7 @@ fn worker_health_for_model(model: &EmbeddingModel) -> Option<worker_host::Worker
             .lock()
             .ok()
             .and_then(|engine| engine.health_snapshot().ok()),
-        EmbedBackend::Ort(_) | EmbedBackend::Owned(_) => None,
+        EmbedBackend::Ort(_) | EmbedBackend::Owned(_) | EmbedBackend::OwnedDecode => None,
     }
 }
 
@@ -8542,7 +9486,7 @@ fn module_health(state: &ModuleState) -> ModuleHealth {
         .loaded_models()
         .into_iter()
         .map(|model| {
-            let measurements = lane_measurement_rows(state, &model.fingerprint);
+            let measurements = lane_measurement_rows(state, &model.certification_fingerprint);
             LaneHealth {
                 model_id: model.model_id.clone(),
                 fingerprint: model.fingerprint.clone(),
@@ -9183,7 +10127,8 @@ mod tests {
 
     #[test]
     fn only_owned_microllm_lanes_require_decode_certification() {
-        assert!(engine_requires_microllm_certification("owned-metal"));
+        assert!(engine_requires_microllm_certification("owned-metal-decode"));
+        assert!(!engine_requires_microllm_certification("owned-metal"));
         assert!(!engine_requires_microllm_certification("llama"));
         assert!(!engine_requires_microllm_certification("mlx"));
     }

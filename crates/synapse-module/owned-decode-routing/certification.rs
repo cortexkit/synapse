@@ -40,7 +40,7 @@ pub struct ConstrainedCertKey {
 
 /// Read access to certification rows. Routing depends on this trait so the
 /// authoritative store can live elsewhere while routing stays testable.
-pub trait CertificationAccess {
+pub trait CertificationAccess: Send {
     /// Whether an unconstrained row certifies this fingerprint on this profile.
     fn is_unconstrained_certified(&self, key: &UnconstrainedCertKey) -> bool;
     /// Whether a constrained row certifies this runtime identity on this profile.

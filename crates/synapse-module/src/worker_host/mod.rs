@@ -1078,10 +1078,18 @@ impl GenerateEngine for WorkerEngine {
 /// a fresh transport session and reloads the immutable model key. The generic
 /// host's rolling crash window is disabled, leaving the S3 store-backed budget
 /// as the single quarantine authority.
+#[derive(Clone)]
 pub struct OwnedDecodeWorkerFactory {
     config: WorkerHostConfig,
     artifact: ValidatedArtifact,
     runtime_config: RuntimeConfig,
+    idle: Arc<Mutex<Option<ReusableOwnedDecodeWorker>>>,
+}
+
+struct ReusableOwnedDecodeWorker {
+    engine: WorkerEngine,
+    model: LoadedModel,
+    worker_generation: u64,
 }
 
 impl OwnedDecodeWorkerFactory {
@@ -1095,6 +1103,7 @@ impl OwnedDecodeWorkerFactory {
             config,
             artifact,
             runtime_config,
+            idle: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -1153,6 +1162,32 @@ impl SupervisedDecodeDispatch {
                 started: Instant::now(),
             },
         })
+    }
+
+    /// Replace the request-local inputs while retaining the supervised worker
+    /// pool and persistent crash-budget authority.
+    pub fn set_request(
+        &mut self,
+        prompt_ids: Vec<u32>,
+        constraint: Option<owned_decode_worker::protocol::TokenIdJsonConstraint>,
+        deadline_ms: u64,
+    ) {
+        self.start.prompt_ids = prompt_ids;
+        self.start.constraint.clone_from(&constraint);
+        self.context.expected_constraint = constraint;
+        self.control.deadline_at = Some(deadline_ms);
+    }
+
+    #[must_use]
+    pub fn crash_budget_remaining(&self) -> u32 {
+        self.supervisor.budget().remaining(&self.key)
+    }
+
+    #[must_use]
+    pub fn is_quarantined(&self) -> bool {
+        self.supervisor
+            .budget()
+            .is_quarantined(&self.key, self.clock.now())
     }
 }
 
@@ -1246,23 +1281,37 @@ fn map_decode_error(error: DecodeError) -> crate::owned_decode_routing::error::O
 }
 
 struct OwnedDecodeWorkerSession {
-    engine: WorkerEngine,
+    engine: Option<WorkerEngine>,
     model: LoadedModel,
     worker_generation: u64,
     pending: Option<owned_decode_worker::protocol::WorkerFrame>,
+    idle: Arc<Mutex<Option<ReusableOwnedDecodeWorker>>>,
+    reusable: bool,
 }
 
 impl WorkerFactory for OwnedDecodeWorkerFactory {
     fn spawn(&mut self) -> Result<Box<dyn DecodeWorker>, WorkerFault> {
+        if let Some(worker) = self.idle.lock().ok().and_then(|mut idle| idle.take()) {
+            return Ok(Box::new(OwnedDecodeWorkerSession {
+                engine: Some(worker.engine),
+                model: worker.model,
+                worker_generation: worker.worker_generation,
+                pending: None,
+                idle: Arc::clone(&self.idle),
+                reusable: true,
+            }));
+        }
         let mut engine =
             WorkerEngine::new(self.config.clone()).map_err(|_| WorkerFault::StartupFailure)?;
         let model = GenerateEngine::load(&mut engine, &self.artifact, &self.runtime_config)
             .map_err(|_| WorkerFault::StartupFailure)?;
         Ok(Box::new(OwnedDecodeWorkerSession {
-            engine,
+            engine: Some(engine),
             model,
             worker_generation: 0,
             pending: None,
+            idle: Arc::clone(&self.idle),
+            reusable: true,
         }))
     }
 }
@@ -1281,10 +1330,18 @@ impl DecodeWorker for OwnedDecodeWorkerSession {
         let authorization =
             owned_decode_worker::validation::validate_start(start, context, production_n)
                 .map_err(WorkerStartFailure::from)?;
-        let (worker_generation, envelope) = self
+        let response = self
             .engine
-            .owned_decode_start(&self.model, start.clone())
-            .map_err(|error| WorkerStartFailure::Fault(owned_host_fault(&error)))?;
+            .as_ref()
+            .ok_or(WorkerStartFailure::Fault(WorkerFault::Crash))?
+            .owned_decode_start(&self.model, start.clone());
+        let (worker_generation, envelope) = match response {
+            Ok(response) => response,
+            Err(error) => {
+                self.reusable = false;
+                return Err(WorkerStartFailure::Fault(owned_host_fault(&error)));
+            }
+        };
         owned_decode_worker::protocol::validate_frame_structure(&envelope)?;
         self.worker_generation = worker_generation;
         self.pending = Some(envelope.frame);
@@ -1300,10 +1357,18 @@ impl DecodeWorker for OwnedDecodeWorkerSession {
     }
 
     fn send_continue(&mut self, continuation: &GenerateContinue) -> Result<(), WorkerFault> {
-        let envelope = self
+        let response = self
             .engine
-            .owned_decode_continue(continuation.clone())
-            .map_err(|error| owned_host_fault(&error))?;
+            .as_ref()
+            .ok_or(WorkerFault::Crash)?
+            .owned_decode_continue(continuation.clone());
+        let envelope = match response {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                self.reusable = false;
+                return Err(owned_host_fault(&error));
+            }
+        };
         owned_decode_worker::protocol::validate_frame_structure(&envelope)
             .map_err(|_| WorkerFault::Crash)?;
         self.pending = Some(envelope.frame);
@@ -1311,18 +1376,47 @@ impl DecodeWorker for OwnedDecodeWorkerSession {
     }
 
     fn send_cancel(&mut self, cancellation: &GenerateCancel) -> Result<CancelAck, WorkerFault> {
-        let committed_token_count = self
+        let response = self
             .engine
-            .owned_decode_cancel(cancellation.clone())
-            .map_err(|_| WorkerFault::FailedCancellation)?;
+            .as_ref()
+            .ok_or(WorkerFault::FailedCancellation)?
+            .owned_decode_cancel(cancellation.clone());
+        let committed_token_count = match response {
+            Ok(committed_token_count) => committed_token_count,
+            Err(_) => {
+                self.reusable = false;
+                return Err(WorkerFault::FailedCancellation);
+            }
+        };
         Ok(CancelAck::Acknowledged {
             committed_token_count,
         })
     }
 
     fn kill(&mut self) {
-        self.engine.owned_decode_kill();
+        self.reusable = false;
+        if let Some(engine) = self.engine.as_ref() {
+            engine.owned_decode_kill();
+        }
         self.pending = None;
+    }
+}
+
+impl Drop for OwnedDecodeWorkerSession {
+    fn drop(&mut self) {
+        let Some(engine) = self.engine.take() else {
+            return;
+        };
+        if !self.reusable {
+            return;
+        }
+        if let Ok(mut idle) = self.idle.lock() {
+            *idle = Some(ReusableOwnedDecodeWorker {
+                engine,
+                model: self.model.clone(),
+                worker_generation: self.worker_generation,
+            });
+        }
     }
 }
 

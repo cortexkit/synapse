@@ -60,6 +60,10 @@ struct Args {
     nonce: String,
     #[arg(long, hide = true)]
     test_abort_on_request: bool,
+    #[arg(long, hide = true)]
+    test_abort_after_progress: bool,
+    #[arg(long, hide = true)]
+    test_abort_after_progress_once: Option<PathBuf>,
 }
 
 enum DecodeEngine {
@@ -521,7 +525,14 @@ pub fn main() -> Result<()> {
         ) {
             let request: DecodeTransportRequest =
                 serde_json::from_value(value).context("decode owned worker request")?;
-            handle_decode_request(&mut stream, max_frame, &mut state, request)?;
+            handle_decode_request(
+                &mut stream,
+                max_frame,
+                &mut state,
+                request,
+                args.test_abort_after_progress,
+                args.test_abort_after_progress_once.as_deref(),
+            )?;
             continue;
         }
         let request: WorkerRequest =
@@ -610,6 +621,8 @@ fn handle_decode_request(
     max_frame: u32,
     state: &mut WorkerState,
     request: DecodeTransportRequest,
+    abort_after_progress: bool,
+    abort_after_progress_once: Option<&Path>,
 ) -> Result<()> {
     let response = match request {
         DecodeTransportRequest::GenerateStart { req_id, start } => DecodeTransportResponse::Frame {
@@ -638,6 +651,27 @@ fn handle_decode_request(
             },
         },
     };
+    let emitted_progress = matches!(
+        &response,
+        DecodeTransportResponse::Frame {
+            envelope: FrameEnvelope {
+                frame: WorkerFrame::Progress(_),
+                ..
+            },
+            ..
+        }
+    );
+    let abort_once = emitted_progress
+        && abort_after_progress_once.is_some_and(|marker| {
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(marker)
+                .is_ok()
+        });
+    if emitted_progress && (abort_after_progress || abort_once) {
+        std::process::abort();
+    }
     write_json_frame(stream, &response, max_frame)?;
     Ok(())
 }

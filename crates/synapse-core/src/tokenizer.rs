@@ -88,6 +88,25 @@ impl SanitizedTokenizer {
         self.max_tokens
     }
 
+    /// Decode generated token IDs with the same sanitized tokenizer that encoded
+    /// the prompt. Owned decode returns IDs over the worker boundary so response
+    /// text remains module-owned.
+    pub fn decode(&self, ids: &[u32]) -> Result<String, TokenizationError> {
+        self.tokenizer
+            .decode(ids, true)
+            .map_err(|error| TokenizationError::Encode {
+                index: 0,
+                message: format!("decode generated ids: {error}"),
+            })
+    }
+
+    /// Read-only access for deriving the exact byte-level vocabulary identity
+    /// used by constrained owned decode.
+    #[must_use]
+    pub fn tokenizer(&self) -> &Tokenizer {
+        &self.tokenizer
+    }
+
     pub fn tokenize(&self, text: &str) -> Result<TokenizedItem, TokenizationError> {
         self.tokenize_one(0, text, true)
     }

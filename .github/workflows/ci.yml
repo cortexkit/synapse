@@ -199,3 +199,34 @@ jobs:
             echo "::error::fixture e2e silently skipped — fixture staging is broken on this runner"
             exit 1
           fi
+
+      - name: Build supervised decode worker (macos-metal)
+        if: matrix.name == 'macos-metal'
+        working-directory: synapse
+        env:
+          DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
+        run: cargo build -p synapse-worker-decode
+
+      - name: Checkpoint-gated owned decode batteries (macos-metal)
+        if: matrix.name == 'macos-metal'
+        working-directory: synapse
+        shell: bash
+        env:
+          DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
+          SYNAPSE_OWNED_DECODE_WORKER_BIN: ${{ github.workspace }}/synapse/target/debug/ck-synapse-worker-decode
+        run: |
+          : "${SYNAPSE_OWNED_DECODE_QWEN3_0_6B:?Qwen3 checkpoint is required}"
+          : "${SYNAPSE_OWNED_DECODE_LFM2_1_2B:?LFM2 checkpoint is required}"
+          test -f "$SYNAPSE_OWNED_DECODE_QWEN3_0_6B/model.safetensors"
+          test -f "$SYNAPSE_OWNED_DECODE_LFM2_1_2B/model.safetensors"
+          python3 - <<'PY'
+          import os
+          load = os.getloadavg()[0]
+          if load >= 8:
+              raise SystemExit(f"1-minute loadavg {load:.2f} is not below 8")
+          print(f"1-minute loadavg {load:.2f} is below 8")
+          PY
+          cargo nextest run -p synapse-engine-owned --test owned_decode_parity --run-ignored ignored-only --retries 0 --no-capture
+          cargo nextest run -p synapse-module --lib -E 'test(metal_certification_probe_four_lanes)' --run-ignored ignored-only --retries 0 --no-capture
+          cargo nextest run -p synapse-worker-decode --test worker_transport --run-ignored ignored-only --retries 0 --no-capture
+          cargo nextest run -p synapse-module --test skeleton_e2e -E 'test(certified_owned_oneshot_and_constraint_serve_after_real_worker_probe)' --run-ignored ignored-only --retries 0 --no-capture

@@ -3026,6 +3026,212 @@ async fn uncertified_owned_target_refuses_and_maps_grammar_over_the_wire() {
     let _ = std::fs::remove_dir_all(fixture_dir);
 }
 
+#[tokio::test]
+async fn substitutable_owned_refusal_falls_back_to_llama_with_lane_provenance() {
+    let fixture_dir = unique_temp_dir("owned-decode-fallback");
+    std::fs::create_dir_all(&fixture_dir).unwrap();
+    let owned_model = fixture_dir.join("owned.safetensors");
+    let llama_model = fixture_dir.join("fallback.gguf");
+    std::fs::write(&owned_model, b"owned decode fallback fixture").unwrap();
+    std::fs::write(&llama_model, b"llama fallback fixture").unwrap();
+    let tokenizer_path = fixture_dir.join("tokenizer.json");
+    let vocabulary = [
+        ("[UNK]".to_string(), 0),
+        ("hello".to_string(), 1),
+        ("fallback".to_string(), 2),
+    ]
+    .into_iter()
+    .collect();
+    let word_level = WordLevel::builder()
+        .vocab(vocabulary)
+        .unk_token("[UNK]".to_string())
+        .build()
+        .unwrap();
+    let mut tokenizer = Tokenizer::new(word_level);
+    tokenizer.with_pre_tokenizer(Some(Whitespace));
+    tokenizer.save(&tokenizer_path, false).unwrap();
+    let llama_runtime = std::env::temp_dir().join(format!("syn-llama-{}", process::id()));
+    let config = serde_json::json!({
+        "dev": { "owned_decode_cutover_for_test": true },
+        "preload_models": [
+            {
+                "model_id": "owned-qwen",
+                "engine": "owned-metal-decode",
+                "task": "generate",
+                "model_path": owned_model,
+                "tokenizer_path": tokenizer_path,
+                "format": "owned-safetensors",
+                "max_tokens": 512,
+                "quant": "f16",
+                "family": "qwen3-0.6b",
+                "dtype": "f16",
+                "execution": "supervised"
+            },
+            {
+                "model_id": "llama-fallback",
+                "engine": "llama",
+                "task": "generate",
+                "model_path": llama_model,
+                "tokenizer_path": tokenizer_path,
+                "format": "gguf",
+                "max_tokens": 512,
+                "worker_bin": env!("CARGO_BIN_EXE_synapse-worker-timeout-mock"),
+                "worker_runtime_dir": llama_runtime
+            }
+        ]
+    })
+    .to_string();
+    let (_daemon, _module, mut consumer, route) = open_route_with_config(&config).await;
+
+    let fallback = route_request(
+        &mut consumer,
+        route,
+        90_005,
+        serde_json::json!({
+            "method": "microllm.oneshot",
+            "params": {
+                "model": "owned-qwen",
+                "prompt": "hello",
+                "max_tokens": 4
+            }
+        }),
+    )
+    .await;
+    let result = &fallback["result"];
+    assert_eq!(result["text"], "fallback");
+    assert_eq!(result["provenance"]["lane"], "llama");
+    assert_eq!(
+        result["provenance"]["fallback_reason"],
+        if cfg!(debug_assertions) {
+            "owned_decode_not_certified"
+        } else {
+            "cutover_disabled"
+        }
+    );
+    assert!(result["provenance"]["decode_fingerprint"].is_string());
+    assert!(result["provenance"]["processing_fingerprint"].is_string());
+    assert_ne!(
+        result["provenance"]["decode_fingerprint"],
+        Value::String(String::new())
+    );
+
+    let llama_only = route_request(
+        &mut consumer,
+        route,
+        90_006,
+        serde_json::json!({
+            "method": "microllm.oneshot",
+            "params": {
+                "model": "llama-fallback",
+                "prompt": "hello",
+                "max_tokens": 4
+            }
+        }),
+    )
+    .await;
+    let llama_provenance = &llama_only["result"]["provenance"];
+    assert!(llama_provenance.get("fallback_reason").is_none());
+    assert!(llama_provenance.get("decode_fingerprint").is_none());
+    assert!(llama_provenance.get("processing_fingerprint").is_none());
+    let _ = std::fs::remove_dir_all(fixture_dir);
+}
+
+#[tokio::test]
+#[ignore]
+async fn certified_owned_oneshot_and_constraint_serve_after_real_worker_probe() {
+    let Some(snapshot) = std::env::var_os("SYNAPSE_OWNED_DECODE_QWEN3_0_6B").map(PathBuf::from)
+    else {
+        eprintln!("skipping certified owned wire e2e: set SYNAPSE_OWNED_DECODE_QWEN3_0_6B");
+        return;
+    };
+    let Some(worker_bin) = std::env::var_os("SYNAPSE_OWNED_DECODE_WORKER_BIN").map(PathBuf::from)
+    else {
+        eprintln!("skipping certified owned wire e2e: set SYNAPSE_OWNED_DECODE_WORKER_BIN");
+        return;
+    };
+    let model_path = snapshot.join("model.safetensors");
+    let tokenizer_path = snapshot.join("tokenizer.json");
+    if !model_path.is_file() || !tokenizer_path.is_file() || !worker_bin.is_file() {
+        eprintln!("skipping certified owned wire e2e: checkpoint or worker binary is missing");
+        return;
+    }
+    let worker_runtime = std::env::temp_dir().join(format!("syn-owned-{}", process::id()));
+    let config = serde_json::json!({
+        "grammar_enabled": true,
+        "dev": { "owned_decode_cutover_for_test": true },
+        "preload_models": [{
+            "model_id": "owned-qwen",
+            "engine": "owned-metal-decode",
+            "task": "generate",
+            "model_path": model_path,
+            "tokenizer_path": tokenizer_path,
+            "format": "owned-safetensors",
+            "max_tokens": 512,
+            "quant": "f16",
+            "family": "qwen3-0.6b",
+            "dtype": "f16",
+            "execution": "supervised",
+            "worker_bin": worker_bin,
+            "worker_runtime_dir": worker_runtime
+        }]
+    })
+    .to_string();
+    let (_daemon, _module, mut consumer, route) = open_route_with_config(&config).await;
+    certify_preloaded_models(&mut consumer, route, 91_000).await;
+
+    let owned = route_request(
+        &mut consumer,
+        route,
+        91_001,
+        serde_json::json!({
+            "method": "microllm.oneshot",
+            "params": {
+                "model": "owned-qwen",
+                "prompt": "The capital of France is",
+                "max_tokens": 64
+            }
+        }),
+    )
+    .await;
+    let result = &owned["result"];
+    assert_eq!(
+        result["provenance"]["engine"]["engine"],
+        "owned-metal-decode"
+    );
+    assert_eq!(result["provenance"]["lane"], "decode");
+    assert_eq!(result["provenance"]["worker"], "supervised");
+    assert!(result["provenance"]["worker_generation"].as_u64().is_some());
+    assert_eq!(result["n_gen"], 64);
+
+    let constrained = route_request(
+        &mut consumer,
+        route,
+        91_002,
+        serde_json::json!({
+            "method": "microllm.oneshot",
+            "params": {
+                "model": "owned-qwen",
+                "prompt": "Return one color as JSON.",
+                "max_tokens": 64,
+                "grammar": r#"{"type":"string","enum":["red","green","blue"]}"#
+            }
+        }),
+    )
+    .await;
+    let constrained_result = &constrained["result"];
+    let value: Value = serde_json::from_str(
+        constrained_result["text"]
+            .as_str()
+            .expect("constrained response text"),
+    )
+    .expect("constrained response is JSON");
+    assert!(value
+        .as_str()
+        .is_some_and(|color| matches!(color, "red" | "green" | "blue")));
+    assert!(constrained_result["provenance"]["constraint_runtime_identity"].is_string());
+    assert!(constrained_result["provenance"]["constraint_fingerprint"].is_string());
+}
+
 #[test]
 fn production_binary_carries_owned_decode_errors_and_retires_legacy_grammar_literal() {
     let binary = std::fs::read(env!("CARGO_BIN_EXE_ck-synapse")).unwrap();

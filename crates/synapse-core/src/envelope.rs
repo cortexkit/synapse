@@ -44,6 +44,14 @@ pub struct OwnedDecodeResponseProvenance {
     pub crash_retry_count: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failure_classifications: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constraint_runtime_identity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constraint_fingerprint: Option<Fingerprint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grammar_compiler_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub underlying_owned_decode_refusal_id: Option<String>,
 }
 
 fn is_zero(value: &u32) -> bool {

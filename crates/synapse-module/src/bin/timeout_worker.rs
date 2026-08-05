@@ -114,6 +114,24 @@ fn main() -> anyhow::Result<()> {
                     let values = vec![1.0_f32; embed_dims.saturating_mul(embed_n)];
                     write_frame(&mut stream, &encode_f32_frame(&values), max_frame)?;
                 }
+                WorkerRequest::Generate {
+                    req_id, max_tokens, ..
+                } => {
+                    let prompt = read_frame(&mut stream, max_frame).context("read generate ids")?;
+                    let generated_token_ids = (max_tokens > 0).then_some(2).into_iter().collect();
+                    write_json_frame(
+                        &mut stream,
+                        &WorkerResponse::Text {
+                            req_id,
+                            text: "fallback".to_string(),
+                            n_prompt: prompt.len() / std::mem::size_of::<i32>(),
+                            n_gen: usize::from(max_tokens > 0),
+                            finish_reason: "stop".to_string(),
+                            generated_token_ids,
+                        },
+                        max_frame,
+                    )?;
+                }
                 WorkerRequest::Shutdown {} => return Ok(()),
                 WorkerRequest::Ping { req_id } => {
                     write_json_frame(
@@ -132,12 +150,12 @@ fn main() -> anyhow::Result<()> {
                 }
                 other => {
                     let req_id = match other {
-                        WorkerRequest::Rerank { req_id, .. }
-                        | WorkerRequest::Generate { req_id, .. } => Some(req_id),
+                        WorkerRequest::Rerank { req_id, .. } => Some(req_id),
                         WorkerRequest::Load { .. }
                         | WorkerRequest::EmbedBatch { .. }
                         | WorkerRequest::Unload { .. }
                         | WorkerRequest::Ping { .. }
+                        | WorkerRequest::Generate { .. }
                         | WorkerRequest::Shutdown {} => None,
                     };
                     write_json_frame(
