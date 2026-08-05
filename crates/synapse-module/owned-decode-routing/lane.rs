@@ -146,7 +146,25 @@ pub fn select_lane(ctx: &LaneSelectionContext<'_>) -> LaneOutcome {
         }
     }
 
-    // 3. Constrained requests are owned-only.
+    // 3. Advisory target fingerprint. `target_fingerprint` is advisory: for a
+    //    substitutable request, a lane whose fingerprint differs from the
+    //    advisory target is still eligible and fallback may proceed (the
+    //    response provenance already carries the actual fingerprint). For a
+    //    non-substitutable request — one whose contract does not permit
+    //    substitution (constrained, exact-pinned, or explicit owned-only) —
+    //    the owned lane is the only allowed lane, so an advisory target that
+    //    does not match it must refuse with the existing fingerprint-mismatch
+    //    error rather than silently serving a different fingerprint.
+    if let Some(target) = &request.target_fingerprint {
+        if target != &ctx.owned_decode_fingerprint && !request.is_substitutable() {
+            return LaneOutcome::Refused {
+                error: RoutingRefusal::FingerprintMismatch,
+                underlying_owned_decode_refusal_id: None,
+            };
+        }
+    }
+
+    // 4. Constrained requests are owned-only.
     if request.is_constrained() {
         return match &ctx.owned {
             OwnedEvaluation::Selectable => LaneOutcome::Owned,
@@ -170,7 +188,7 @@ pub fn select_lane(ctx: &LaneSelectionContext<'_>) -> LaneOutcome {
         };
     }
 
-    // 4. Unconstrained, non-substitutable requests (exact pin or explicit
+    // 5. Unconstrained, non-substitutable requests (exact pin or explicit
     //    owned-only selection) never substitute a different model.
     if !request.is_substitutable() {
         return match &ctx.owned {
@@ -186,7 +204,7 @@ pub fn select_lane(ctx: &LaneSelectionContext<'_>) -> LaneOutcome {
         };
     }
 
-    // 5. Substitutable unconstrained requests.
+    // 6. Substitutable unconstrained requests.
     match &ctx.owned {
         OwnedEvaluation::Selectable => LaneOutcome::Owned,
         OwnedEvaluation::NotPreferred => match &ctx.llama {
@@ -228,6 +246,7 @@ pub fn select_lane(ctx: &LaneSelectionContext<'_>) -> LaneOutcome {
 
 /// The checked-in D-009 cutover record for one machine profile.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CutoverRecord {
     pub machine_profile_hash: String,
     pub enabled_catalog_entry_ids: Vec<String>,
@@ -497,6 +516,114 @@ mod tests {
     }
 
     #[test]
+    fn advisory_target_fingerprint_match_selects_owned() {
+        // An advisory target that matches the owned lane's decode fingerprint
+        // is satisfied; the owned lane is selected.
+        let mut request = unconstrained_request();
+        request.target_fingerprint = Some(fp("owned-decode"));
+        let outcome = select_lane(&ctx(&request, OwnedEvaluation::Selectable, Some(llama())));
+        assert_eq!(outcome, LaneOutcome::Owned);
+    }
+
+    #[test]
+    fn advisory_target_fingerprint_substituted_when_substitution_permitted() {
+        // A substitutable request with an advisory target that does NOT match
+        // the owned lane: the advisory target allows substitution, so the
+        // owned lane is still eligible. When the owned lane is selectable, it
+        // is chosen; the response provenance carries the actual fingerprint
+        // (verified end-to-end elsewhere). The advisory mismatch never
+        // refuses for a substitutable request.
+        let mut request = unconstrained_request();
+        request.target_fingerprint = Some(fp("some-other-fp"));
+        let outcome = select_lane(&ctx(&request, OwnedEvaluation::Selectable, Some(llama())));
+        assert_eq!(outcome, LaneOutcome::Owned);
+
+        // When the owned lane refuses with a fallback-eligible error, a
+        // substitutable request still falls back to llama despite the advisory
+        // target mismatch.
+        let outcome = select_lane(&ctx(
+            &request,
+            OwnedEvaluation::Refused(OwnedDecodeError::NotCertified),
+            Some(llama()),
+        ));
+        assert_eq!(
+            outcome,
+            LaneOutcome::Llama {
+                fallback_reason: FallbackReason::OwnedRefusal(OwnedDecodeError::NotCertified)
+            }
+        );
+    }
+
+    #[test]
+    fn advisory_target_fingerprint_mismatch_refuses_when_substitution_not_permitted() {
+        // A non-substitutable request (explicit owned-only) with an advisory
+        // target that does not match the owned lane: substitution is not
+        // permitted, so the mismatch refuses with the existing
+        // fingerprint-mismatch error rather than serving silently.
+        let mut request = unconstrained_request();
+        request.target_fingerprint = Some(fp("some-other-fp"));
+        request.owned_only = true;
+        let outcome = select_lane(&ctx(&request, OwnedEvaluation::Selectable, Some(llama())));
+        assert_eq!(
+            outcome,
+            LaneOutcome::Refused {
+                error: RoutingRefusal::FingerprintMismatch,
+                underlying_owned_decode_refusal_id: None,
+            }
+        );
+        assert_eq!(outcome_wire(&outcome), "substitution_rejected");
+    }
+
+    #[test]
+    fn advisory_target_fingerprint_mismatch_refuses_for_constrained_request() {
+        // A constrained request is owned-only (substitution not permitted), so
+        // an advisory target mismatch refuses.
+        let mut request = unconstrained_request();
+        request.grammar = Some(serde_json::json!({"type": "object"}));
+        request.target_fingerprint = Some(fp("some-other-fp"));
+        let outcome = select_lane(&ctx(&request, OwnedEvaluation::Selectable, Some(llama())));
+        assert_eq!(
+            outcome,
+            LaneOutcome::Refused {
+                error: RoutingRefusal::FingerprintMismatch,
+                underlying_owned_decode_refusal_id: None,
+            }
+        );
+    }
+
+    #[test]
+    fn advisory_target_fingerprint_does_not_weaken_exact_required_pin() {
+        // required_fingerprint (exact) is unchanged: an exact pin that
+        // mismatches still refuses regardless of target_fingerprint.
+        let mut request = unconstrained_request();
+        request.required_fingerprint = Some(fp("not-the-owned-fp"));
+        request.target_fingerprint = Some(fp("owned-decode"));
+        let outcome = select_lane(&ctx(&request, OwnedEvaluation::Selectable, Some(llama())));
+        assert_eq!(
+            outcome,
+            LaneOutcome::Refused {
+                error: RoutingRefusal::FingerprintMismatch,
+                underlying_owned_decode_refusal_id: None,
+            }
+        );
+
+        // And when the exact pin matches, an advisory target mismatch on a
+        // non-substitutable request still refuses (exact pin makes it
+        // non-substitutable).
+        let mut request = unconstrained_request();
+        request.required_fingerprint = Some(fp("owned-decode"));
+        request.target_fingerprint = Some(fp("some-other-fp"));
+        let outcome = select_lane(&ctx(&request, OwnedEvaluation::Selectable, Some(llama())));
+        assert_eq!(
+            outcome,
+            LaneOutcome::Refused {
+                error: RoutingRefusal::FingerprintMismatch,
+                underlying_owned_decode_refusal_id: None,
+            }
+        );
+    }
+
+    #[test]
     fn owned_only_selection_never_substitutes_llama() {
         let mut request = unconstrained_request();
         request.owned_only = true;
@@ -618,5 +745,28 @@ mod tests {
 
         inputs.constrained_certified = true;
         assert!(cutover_enabled(&record, &inputs));
+    }
+
+    #[test]
+    fn cutover_record_rejects_unknown_field() {
+        // fail-closed posture: an unknown field in a cutover record is
+        // rejected at parse time rather than silently dropped.
+        let json = serde_json::json!({
+            "machine_profile_hash": "profile-a",
+            "enabled_catalog_entry_ids": ["qwen3-f16"],
+            "decode_fingerprints": ["owned-decode"],
+            "processing_fingerprints": ["owned-proc"],
+            "constrained_runtime_identities": [],
+            "runtime_config_digest": "rcd",
+            "fixture_registry_revision": "decode-fixture-registry-v1",
+            "context_bucket_manifest_revision": "decode-context-buckets-v1",
+            "scheduler_manifest_revision": "decode-sched-manifest-v1",
+            "certification_evidence_ids": ["cert-1"],
+            "wire_error_binding_revision": "owned-decode-wire-error-bindings-v1",
+            "acceptance_gate_evidence": ["G-DEC-01"],
+            "grammar_enabled": false,
+            "unknown_field": "should be rejected",
+        });
+        assert!(serde_json::from_value::<CutoverRecord>(json).is_err());
     }
 }

@@ -73,6 +73,7 @@ pub const CATALOG_RISK_CLASS: &str = "abort_capable";
 /// authoritative; the mirrored `owned_*`/`quant` aliases are readable migration
 /// aliases that must agree with the canonical values.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CatalogEntry {
     pub entry_id: String,
     pub engine: String,
@@ -297,6 +298,29 @@ impl OwnedDecodeRouter {
 
     /// Evaluate the owned lane before dispatch, failing closed on the first
     /// applicable pre-dispatch refusal.
+    ///
+    /// Refusal production sites (for the next audit): `evaluate_owned` only
+    /// ever returns `Refused(NotCertified)`, `Refused(Quarantined)`, or
+    /// `Refused(ArtifactPoisoned)` on the production path. The other three
+    /// fallback-eligible refusals are produced elsewhere and are expected to
+    /// be absent here at this stage of the port:
+    /// - `Unsupported` is produced by `CatalogEntry::validate` (step 3 of
+    ///   `route_oneshot`) before `evaluate_owned` runs, so it never reaches
+    ///   lane selection as an `OwnedEvaluation::Refused`.
+    /// - `CertificationFailed` is produced by `StructuralBandChecker::check`
+    ///   in the certification crate, which is wired into the certification
+    ///   runtime integration (a later port slice), not into routing's
+    ///   pre-dispatch evaluation. Routing reads certification rows via
+    ///   `CertificationAccess`; a failed structural-band check turns into a
+    ///   missing row, which surfaces here as `Refused(NotCertified)`.
+    /// - `Unavailable` (reservation failure) is not modeled by
+    ///   `evaluate_owned`; it arises from the worker/dispatch path after
+    ///   admission, which is also part of the certification runtime
+    ///   integration.
+    ///
+    /// The `select_lane` unit tests exercise all six refusals directly, so
+    /// the routing logic is correct for the full set; the production wiring
+    /// only produces three of the six today.
     fn evaluate_owned(
         &self,
         env: &RoutingEnvironment,
@@ -1030,5 +1054,28 @@ mod tests {
             dispatched.borrow().is_empty(),
             "exact pin never silently falls back"
         );
+    }
+
+    #[test]
+    fn catalog_entry_rejects_unknown_field() {
+        // fail-closed posture: an unknown field in a caller-supplied catalog
+        // entry is rejected at parse time rather than silently dropped.
+        let json = serde_json::json!({
+            "entry_id": "qwen3-0.6b-f16",
+            "engine": CATALOG_ENGINE,
+            "task": CATALOG_TASK,
+            "lane": CATALOG_LANE,
+            "worker": CATALOG_WORKER,
+            "risk_class": CATALOG_RISK_CLASS,
+            "family": "qwen3-0.6b",
+            "activation_dtype": "f16",
+            "weight_quant": "f16",
+            "arithmetic_identity_revision": "arith-v1",
+            "metallib_revision": "metallib-v1",
+            "max_context_tokens": 2048,
+            "artifact_source_digest": "sha256:source",
+            "unknown_field": "should be rejected",
+        });
+        assert!(serde_json::from_value::<CatalogEntry>(json).is_err());
     }
 }

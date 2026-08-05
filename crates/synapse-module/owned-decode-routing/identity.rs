@@ -92,6 +92,7 @@ impl WeightQuant {
 /// artifact, decode fingerprint, and transaction key, and never overwrites the
 /// prior object.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Q8Identity {
     pub quantizer_revision: String,
     pub derived_digest: String,
@@ -100,6 +101,7 @@ pub struct Q8Identity {
 /// Inputs to `decode_fingerprint`. `q8` must be present exactly when
 /// `weight_quant` is `q8_0`; any other combination is rejected.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DecodeIdentityInputs {
     pub family: Family,
     pub activation_dtype: ActivationDType,
@@ -163,6 +165,7 @@ impl DecodeIdentityInputs {
 /// Inputs to `processing_fingerprint`: the decode fingerprint plus the
 /// module-owned processing-asset revisions.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProcessingIdentityInputs {
     pub decode_fingerprint: Fingerprint,
     pub tokenizer_sanitized_digest: String,
@@ -208,6 +211,7 @@ impl ProcessingIdentityInputs {
 /// `SchedulerRuntimeRecord` does not derive `PartialEq`/`Eq`, so this manifest
 /// intentionally omits those derives too; identity comparisons use `digest()`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeConfigManifest {
     pub worker_revision: String,
     pub protocol_revision: String,
@@ -244,6 +248,7 @@ impl RuntimeConfigManifest {
 /// grammar-compiler revision, tokenizer-vocabulary digest, limits-manifest ID,
 /// and worker constraint-runtime revision.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConstraintRuntimeIdentity {
     pub base_decode_fingerprint: Fingerprint,
     pub representation_revision: String,
@@ -266,6 +271,7 @@ impl ConstraintRuntimeIdentity {
 /// schema digest, initial-state encoding and digest, and compiled automaton
 /// digest. This is an exact substitution check, not a certification key.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConstraintFingerprintInputs {
     pub runtime_identity_digest: String,
     pub canonical_schema_digest: String,
@@ -505,5 +511,88 @@ mod tests {
         let mut changed_runtime = runtime.clone();
         changed_runtime.grammar_compiler_revision = "compiler-v2".to_string();
         assert_ne!(changed_runtime.digest(), runtime_digest);
+    }
+
+    #[test]
+    fn identity_structs_reject_unknown_fields() {
+        // fail-closed posture: every deserializable identity-bearing struct
+        // rejects an unknown field at parse time. One representative per
+        // struct family: DecodeIdentityInputs, ProcessingIdentityInputs,
+        // RuntimeConfigManifest, ConstraintRuntimeIdentity,
+        // ConstraintFingerprintInputs, and Q8Identity.
+        let bad_decode = serde_json::json!({
+            "family": "qwen3-0.6b",
+            "activation_dtype": "f16",
+            "weight_quant": "f16",
+            "artifact_source_digest": "sha256:w",
+            "arithmetic_identity_revision": "arith-v1",
+            "unknown": "x",
+        });
+        assert!(serde_json::from_value::<DecodeIdentityInputs>(bad_decode).is_err());
+
+        let bad_proc = serde_json::json!({
+            "decode_fingerprint": "fp",
+            "tokenizer_sanitized_digest": "d",
+            "prompt_template_revision": "r",
+            "special_token_policy_revision": "r",
+            "stop_token_policy_revision": "r",
+            "detokenizer_revision": "r",
+            "unknown": "x",
+        });
+        assert!(serde_json::from_value::<ProcessingIdentityInputs>(bad_proc).is_err());
+
+        let bad_runtime = serde_json::json!({
+            "worker_revision": "w",
+            "protocol_revision": "p",
+            "metallib_revision": "m",
+            "chain_k": 1,
+            "batched_verification": false,
+            "resident_limit": 1,
+            "attention_kv_reservation_units": 2048,
+            "lfm2_conv_cache_reservation_bytes": 0,
+            "context_manifest_revision": "c",
+            "crash_policy_revision": "cr",
+            "quarantine_duration_ms": 60000,
+            "scheduler": {
+                "production_n": 16,
+                "yield_policy_revision": "y",
+                "decode_weight": 4,
+                "decode_aging_window_ms": 250,
+                "progress_protocol_revision": "p"
+            },
+            "unknown": "x",
+        });
+        assert!(serde_json::from_value::<RuntimeConfigManifest>(bad_runtime).is_err());
+
+        let bad_constraint_runtime = serde_json::json!({
+            "base_decode_fingerprint": "fp",
+            "representation_revision": "r",
+            "grammar_subset_revision": "r",
+            "grammar_compiler_revision": "r",
+            "tokenizer_vocabulary_digest": "d",
+            "limits_manifest_id": "l",
+            "worker_constraint_runtime_revision": "r",
+            "unknown": "x",
+        });
+        assert!(
+            serde_json::from_value::<ConstraintRuntimeIdentity>(bad_constraint_runtime).is_err()
+        );
+
+        let bad_constraint_fp = serde_json::json!({
+            "runtime_identity_digest": "d",
+            "canonical_schema_digest": "d",
+            "initial_state_encoding": "e",
+            "initial_state_digest": "d",
+            "compiled_automaton_digest": "d",
+            "unknown": "x",
+        });
+        assert!(serde_json::from_value::<ConstraintFingerprintInputs>(bad_constraint_fp).is_err());
+
+        let bad_q8 = serde_json::json!({
+            "quantizer_revision": "q",
+            "derived_digest": "d",
+            "unknown": "x",
+        });
+        assert!(serde_json::from_value::<Q8Identity>(bad_q8).is_err());
     }
 }

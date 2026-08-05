@@ -102,7 +102,7 @@ pub enum ManifestError {
     SpikeReference {
         manifest: &'static str,
         path: PathBuf,
-        field: &'static str,
+        field: String,
         spike_root: &'static str,
     },
     #[error("owned-decode wire error binding at {path} carries unresolved symbolic literal `{literal}`; only concrete wire IDs are permitted")]
@@ -498,46 +498,70 @@ pub struct SlicePlanManifest {
 /// Returns the parsed and cross-validated manifests, or the first validation
 /// error.
 pub fn load_manifest_dir(manifest_dir: &Path) -> Result<ManifestDir, ManifestError> {
-    // Reject paths outside the production root before canonicalizing, so a
-    // non-existent spike-only directory is rejected with OutsideProductionRoot
-    // rather than an I/O error.
-    ensure_raw_path_inside_production_root(manifest_dir)?;
-    let root = manifest_dir
-        .canonicalize()
-        .map_err(|source| ManifestError::Io {
-            path: manifest_dir.to_path_buf(),
-            source,
-        })?;
-    ensure_inside_production_root(&root)?;
+    // Resolve the manifest directory. When the path exists, canonicalize it
+    // and verify the canonicalized path sits under the production root (this
+    // catches symlink escapes into the spike tree). When the path does NOT
+    // exist, canonicalization would fail with an I/O error; instead, check
+    // the raw path with component-wise prefix semantics so a non-existent
+    // spike-only directory is rejected with the typed `OutsideProductionRoot`
+    // error rather than an opaque I/O error.
+    let root = match manifest_dir.canonicalize() {
+        Ok(resolved) => {
+            ensure_inside_production_root(&resolved)?;
+            resolved
+        }
+        Err(source) => {
+            // The path does not exist (or is unreadable). If the raw path is
+            // outside the production root, fail with the typed
+            // `OutsideProductionRoot` error; otherwise surface the original
+            // I/O error so a genuine filesystem failure is not mislabeled.
+            ensure_raw_path_inside_production_root(manifest_dir)?;
+            return Err(ManifestError::Io {
+                path: manifest_dir.to_path_buf(),
+                source,
+            });
+        }
+    };
 
-    let context_buckets = load_one::<ContextBucketsManifest>(
+    let context_buckets = load_one_with_spike_scan::<ContextBucketsManifest>(
         &root,
         "decode-context-buckets-v1.json",
         "context_buckets",
     )?;
-    let scheduler =
-        load_one::<SchedulerManifest>(&root, "decode-sched-manifest-v1.json", "scheduler")?;
-    let ownership =
-        load_one::<OwnershipManifest>(&root, "decode-ownership-manifest-v1.json", "ownership")?;
-    let fixture_registry = load_one::<FixtureRegistryManifest>(
+    let scheduler = load_one_with_spike_scan::<SchedulerManifest>(
+        &root,
+        "decode-sched-manifest-v1.json",
+        "scheduler",
+    )?;
+    let ownership = load_one_with_spike_scan::<OwnershipManifest>(
+        &root,
+        "decode-ownership-manifest-v1.json",
+        "ownership",
+    )?;
+    let fixture_registry = load_one_with_spike_scan::<FixtureRegistryManifest>(
         &root,
         "decode-fixture-registry-v1.json",
         "fixture_registry",
     )?;
-    let structural_band =
-        load_one::<StructuralBandManifest>(&root, "structural-band-v1.json", "structural_band")?;
-    let wire_bindings = load_one::<WireErrorBindingsManifest>(
+    let structural_band = load_one_with_spike_scan::<StructuralBandManifest>(
+        &root,
+        "structural-band-v1.json",
+        "structural_band",
+    )?;
+    let wire_bindings = load_one_with_spike_scan::<WireErrorBindingsManifest>(
         &root,
         "owned-decode-wire-error-bindings-v1.json",
         "wire_bindings",
     )?;
-    let grammar_cost = load_one::<GrammarCostCorpusManifest>(
+    let grammar_cost = load_one_with_spike_scan::<GrammarCostCorpusManifest>(
         &root,
         "grammar-cost-corpus-v1.json",
         "grammar_cost",
     )?;
-    let ci_lane = load_one::<CiLaneManifest>(&root, "ci-lane-manifest-v1.json", "ci_lane")?;
-    let slice_plan = load_one::<SlicePlanManifest>(&root, "slice-plan-v1.json", "slice_plan")?;
+    let ci_lane =
+        load_one_with_spike_scan::<CiLaneManifest>(&root, "ci-lane-manifest-v1.json", "ci_lane")?;
+    let slice_plan =
+        load_one_with_spike_scan::<SlicePlanManifest>(&root, "slice-plan-v1.json", "slice_plan")?;
 
     validate_context_buckets(
         &context_buckets,
@@ -572,7 +596,19 @@ pub fn load_manifest_dir(manifest_dir: &Path) -> Result<ManifestDir, ManifestErr
     })
 }
 
-fn load_one<T: for<'de> Deserialize<'de>>(
+/// Load and parse one manifest, then scan its raw JSON value for any string
+/// field that references the spike tree (`bench/spikes/`). The spike-reference
+/// invariant is binding (spec resolutions r2 #10): no production manifest may
+/// reference a path under `bench/spikes/`. Scanning at load time — rather than
+/// only in a test — means a checked-in manifest that gained a
+/// `"run_record": "bench/spikes/..."` field fails at the production load
+/// entrypoint with the existing `SpikeReference` error, not just in CI.
+///
+/// The typed parse and the spike scan run on the same bytes, so a field that
+/// serde drops (e.g. an unknown field under `deny_unknown_fields` would already
+/// have failed the parse) is still scanned in the raw value before the typed
+/// value is trusted.
+fn load_one_with_spike_scan<T: for<'de> Deserialize<'de>>(
     root: &Path,
     file: &str,
     manifest: &'static str,
@@ -582,6 +618,23 @@ fn load_one<T: for<'de> Deserialize<'de>>(
         path: path.clone(),
         source,
     })?;
+    let value: Value = serde_json::from_slice(&bytes).map_err(|source| ManifestError::Parse {
+        manifest,
+        path: path.clone(),
+        source,
+    })?;
+    let hits = find_spike_references(&value);
+    if let Some(hit) = hits.first() {
+        // The field name is not recoverable from the raw-value walk without
+        // threading path state; the offending string value is reported as the
+        // `field` so the operator can locate it.
+        return Err(ManifestError::SpikeReference {
+            manifest,
+            path: path.clone(),
+            field: hit.clone(),
+            spike_root: SPIKE_REFERENCE_ROOT,
+        });
+    }
     serde_json::from_slice::<T>(&bytes).map_err(|source| ManifestError::Parse {
         manifest,
         path: path.clone(),
@@ -590,77 +643,152 @@ fn load_one<T: for<'de> Deserialize<'de>>(
 }
 
 /// Reject a raw (pre-canonicalization) manifest directory path that does not
-/// reference the production root. This catches a spike-only path before the
+/// sit under the production root. This catches a spike-only path before the
 /// canonicalization I/O error and keeps the rejection typed as
 /// `OutsideProductionRoot`.
+///
+/// The production root (`crates/synapse-module`) must be a *leading* component
+/// sequence of the path, not merely a subsequence of its components. A path
+/// like `bench/spikes/crates/synapse-module/x` contains the root segments in
+/// order but not as a prefix, so it is rejected. Non-existent paths (the
+/// common case for a typo or a spike-only directory) are handled here by
+/// component-wise comparison, since `canonicalize` would fail on them.
 fn ensure_raw_path_inside_production_root(raw: &Path) -> Result<(), ManifestError> {
-    let normal_components: Vec<String> = raw
-        .components()
-        .filter_map(|c| match c {
-            Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
-            _ => None,
-        })
-        .collect();
-    let expected_segments: Vec<&str> = PRODUCTION_MANIFEST_ROOT.split('/').collect();
-    let mut idx = 0usize;
-    for expected in &expected_segments {
-        let mut found = false;
-        while idx < normal_components.len() {
-            if normal_components[idx].as_str() == *expected {
-                idx += 1;
-                found = true;
-                break;
-            }
-            idx += 1;
-        }
-        if !found {
-            return Err(ManifestError::OutsideProductionRoot {
-                manifest: "manifest_dir",
-                path: raw.to_path_buf(),
-                expected_root: PRODUCTION_MANIFEST_ROOT,
-            });
-        }
+    if !path_leads_with_production_root(raw) {
+        return Err(ManifestError::OutsideProductionRoot {
+            manifest: "manifest_dir",
+            path: raw.to_path_buf(),
+            expected_root: PRODUCTION_MANIFEST_ROOT,
+        });
     }
     Ok(())
 }
 
-/// Reject a manifest directory that resolves outside the production root. This
-/// prevents a spike-only artifact under `bench/spikes/` from posing as a
-/// deployed record.
+/// Reject a canonicalized manifest directory that resolves outside the
+/// production root. This is the backstop for symlink escapes: the raw check
+/// confirms the requested path leads with `crates/synapse-module`, but a
+/// symlink could redirect it into the spike tree. The canonicalized path is
+/// absolute (e.g. `/Users/.../worktree/crates/synapse-module/owned-decode-manifests`),
+/// so the worktree root precedes the production-root segments; we require
+/// `crates/synapse-module` to appear as a *contiguous* component sequence and
+/// reject any canonicalized path that passes through `bench/spikes` before
+/// reaching it.
 fn ensure_inside_production_root(resolved: &Path) -> Result<(), ManifestError> {
-    // The canonicalized path is absolute (e.g. /Users/.../worktree/crates/
-    // synapse-module/owned-decode-manifests). Walk its normal components and
-    // require the production root segments to appear in order, so an absolute
-    // path under a worktree still matches while a path under bench/spikes/
-    // does not.
-    let normal_components: Vec<String> = resolved
+    if !path_contains_production_root_not_via_spikes(resolved) {
+        return Err(ManifestError::OutsideProductionRoot {
+            manifest: "manifest_dir",
+            path: resolved.to_path_buf(),
+            expected_root: PRODUCTION_MANIFEST_ROOT,
+        });
+    }
+    Ok(())
+}
+
+/// Whether `path` begins with the production-root component sequence
+/// `crates/synapse-module`. The root segments must appear as a *contiguous
+/// leading* run of normal components, after skipping any `CurDir`/`RootDir`/
+/// prefix components that do not name a path element. A path that contains
+/// the segments in order but not as a prefix (e.g.
+/// `bench/spikes/crates/synapse-module/x`) returns false.
+///
+/// `ParentDir` components are treated as ordinary non-matching components:
+/// they break any in-progress prefix match and can never satisfy the root
+/// prefix. This rejects `../crates/synapse-module/y` even though it textually
+/// contains the prefix, because the `..` component precedes it.
+fn path_leads_with_production_root(path: &Path) -> bool {
+    let expected: Vec<&str> = PRODUCTION_MANIFEST_ROOT.split('/').collect();
+    let mut matched = 0usize;
+    // Whether we have seen any normal/parent component before completing the
+    // prefix. A leading prefix must match from the first path element, so any
+    // non-matching normal component before the prefix completes means the
+    // root is not leading (even if it appears contiguously later).
+    let mut seen_non_prefix_element = false;
+    for component in path.components() {
+        // Once the full prefix is matched, later components do not matter.
+        if matched == expected.len() {
+            return true;
+        }
+        match component {
+            // Skip directory separators and platform prefixes (e.g. `C:` on
+            // Windows, `/` on POSIX) without advancing or resetting the match.
+            Component::Prefix(_) | Component::RootDir | Component::CurDir => continue,
+            // A parent component is a real path element that is not the next
+            // expected root segment, so it breaks an in-progress match.
+            Component::ParentDir => {
+                seen_non_prefix_element = true;
+                matched = 0;
+                continue;
+            }
+            Component::Normal(s) => {
+                if !seen_non_prefix_element && s == expected[matched] {
+                    matched += 1;
+                } else {
+                    // A non-matching normal component means the root is not a
+                    // leading prefix. Once this happens, the prefix can never
+                    // be satisfied even if the sequence appears later.
+                    seen_non_prefix_element = true;
+                    matched = 0;
+                }
+            }
+        }
+    }
+    matched == expected.len()
+}
+
+/// Whether `path` contains the production-root component sequence
+/// `crates/synapse-module` as a *contiguous* run of normal components and does
+/// not pass through the spike tree (`bench/spikes`) before reaching it. Used
+/// for canonicalized absolute paths, where the worktree root legitimately
+/// precedes the production root.
+fn path_contains_production_root_not_via_spikes(path: &Path) -> bool {
+    let expected: Vec<&str> = PRODUCTION_MANIFEST_ROOT.split('/').collect();
+    let spike: Vec<&str> = SPIKE_REFERENCE_ROOT
+        .trim_end_matches('/')
+        .split('/')
+        .collect();
+    let components: Vec<String> = path
         .components()
         .filter_map(|c| match c {
             Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
             _ => None,
         })
         .collect();
-    let expected_segments: Vec<&str> = PRODUCTION_MANIFEST_ROOT.split('/').collect();
-    let mut idx = 0usize;
-    for expected in &expected_segments {
-        let mut found = false;
-        while idx < normal_components.len() {
-            if normal_components[idx].as_str() == *expected {
-                idx += 1;
-                found = true;
-                break;
+    // Reject if the spike tree appears as a contiguous component sequence
+    // before the production root. A symlink that redirects into
+    // `bench/spikes/crates/synapse-module/...` would canonicalize to a path
+    // whose components include `bench`, `spikes`, `crates`, `synapse-module`
+    // in order; the contiguous production-root check below would still pass,
+    // so this spike-prefix scan is what catches the escape.
+    let mut spike_matched = 0usize;
+    let mut root_matched = 0usize;
+    let mut root_found = false;
+    let mut spike_seen_before_root = false;
+    for component in &components {
+        // Track the spike-tree prefix only until the production root is found.
+        if !root_found {
+            if spike_matched < spike.len() && component.as_str() == spike[spike_matched] {
+                spike_matched += 1;
+                if spike_matched == spike.len() {
+                    spike_seen_before_root = true;
+                }
+            } else {
+                spike_matched = 0;
             }
-            idx += 1;
         }
-        if !found {
-            return Err(ManifestError::OutsideProductionRoot {
-                manifest: "manifest_dir",
-                path: resolved.to_path_buf(),
-                expected_root: PRODUCTION_MANIFEST_ROOT,
-            });
+        // Track the contiguous production-root sequence. Once found, stop
+        // scanning for it.
+        if !root_found {
+            if root_matched < expected.len() && component.as_str() == expected[root_matched] {
+                root_matched += 1;
+                if root_matched == expected.len() {
+                    root_found = true;
+                }
+            } else {
+                root_matched = 0;
+            }
         }
     }
-    Ok(())
+    root_found && !spike_seen_before_root
 }
 
 fn validate_context_buckets(
@@ -979,7 +1107,7 @@ fn validate_slice_plan(manifest: &SlicePlanManifest, path: &Path) -> Result<(), 
             return Err(ManifestError::SpikeReference {
                 manifest: "slice_plan",
                 path: path.to_path_buf(),
-                field: "file_fence",
+                field: "file_fence".to_string(),
                 spike_root: SPIKE_REFERENCE_ROOT,
             });
         }
@@ -1144,13 +1272,111 @@ mod tests {
     #[test]
     fn reject_manifest_dir_outside_production_root() {
         // A spike-only manifest directory must be rejected even if its files
-        // are well-formed.
+        // are well-formed. This path lacks the production-root segments
+        // entirely.
         let spike_dir = PathBuf::from("bench/spikes/unified-rt/owned-decode-manifests");
         let result = load_manifest_dir(&spike_dir);
         assert!(matches!(
             result,
             Err(ManifestError::OutsideProductionRoot { .. })
         ));
+    }
+
+    #[test]
+    fn reject_path_with_production_root_as_subsequence_not_prefix() {
+        // `bench/spikes/crates/synapse-module/evil.jsonc` contains the
+        // production-root segments in order but not as a leading prefix. The
+        // old subsequence check accepted this; the prefix check must reject it.
+        let evil = PathBuf::from("bench/spikes/crates/synapse-module/evil.jsonc");
+        assert!(matches!(
+            load_manifest_dir(&evil),
+            Err(ManifestError::OutsideProductionRoot { .. })
+        ));
+    }
+
+    #[test]
+    fn reject_path_with_production_root_after_unrelated_component() {
+        // `x/crates/synapse-module/y` has the root segments contiguous but
+        // not leading; the root must be a prefix, not a substring.
+        let path = PathBuf::from("x/crates/synapse-module/y");
+        assert!(matches!(
+            load_manifest_dir(&path),
+            Err(ManifestError::OutsideProductionRoot { .. })
+        ));
+    }
+
+    #[test]
+    fn reject_absolute_path_outside_repo() {
+        // An absolute path that does not pass through the production root is
+        // rejected. (This path does not exist, so canonicalization would also
+        // fail, but the raw check fires first with the typed error.)
+        let path = PathBuf::from("/tmp/owned-decode-manifests");
+        assert!(matches!(
+            load_manifest_dir(&path),
+            Err(ManifestError::OutsideProductionRoot { .. })
+        ));
+    }
+
+    #[test]
+    fn reject_parent_traversal_that_textually_contains_prefix() {
+        // `../crates/synapse-module/y` textually contains the prefix, but the
+        // `..` component precedes it so it is not a leading prefix of normal
+        // components.
+        let path = PathBuf::from("../crates/synapse-module/y");
+        assert!(matches!(
+            load_manifest_dir(&path),
+            Err(ManifestError::OutsideProductionRoot { .. })
+        ));
+    }
+
+    #[test]
+    fn raw_path_check_accepts_leading_production_root() {
+        // A relative path whose normal components begin with the production
+        // root is accepted by the raw check (it may still fail later on I/O
+        // or canonicalization, but it passes the prefix guard).
+        let ok = PathBuf::from("crates/synapse-module/owned-decode-manifests");
+        assert!(ensure_raw_path_inside_production_root(&ok).is_ok());
+    }
+
+    #[test]
+    fn load_path_rejects_manifest_with_spike_reference() {
+        // The spike-reference invariant is enforced at load time, not only in
+        // a test. A manifest whose raw JSON value references `bench/spikes/`
+        // in any string field fails with the existing SpikeReference error.
+        let dir = std::env::temp_dir().join("synapse-module-spike-scan-test");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        // Write a slice-plan manifest whose `artifacts` array references the
+        // spike tree. The typed struct would parse fine, but the raw-value
+        // scan must reject it first.
+        let spike_json = serde_json::json!({
+            "manifest_revision": "slice-plan-v1",
+            "schema_revision": CONTRACT_SCHEMA_REVISION,
+            "slice_id": "s1",
+            "work_item": "w",
+            "file_fence": ["crates/synapse-module/"],
+            "artifacts": ["bench/spikes/unified-rt/evil.jsonc"],
+        });
+        let path = dir.join("slice-plan-v1.json");
+        std::fs::write(&path, spike_json.to_string()).expect("write manifest");
+        let result =
+            load_one_with_spike_scan::<SlicePlanManifest>(&dir, "slice-plan-v1.json", "slice_plan");
+        assert!(
+            matches!(result, Err(ManifestError::SpikeReference { .. })),
+            "spike reference must be rejected at load: {result:?}"
+        );
+        // A clean manifest with no spike reference parses successfully.
+        let clean_json = serde_json::json!({
+            "manifest_revision": "slice-plan-v1",
+            "schema_revision": CONTRACT_SCHEMA_REVISION,
+            "slice_id": "s1",
+            "work_item": "w",
+            "file_fence": ["crates/synapse-module/"],
+            "artifacts": ["crates/synapse-module/owned-decode-manifests/slice-plan-v1.json"],
+        });
+        std::fs::write(&path, clean_json.to_string()).expect("write clean manifest");
+        load_one_with_spike_scan::<SlicePlanManifest>(&dir, "slice-plan-v1.json", "slice_plan")
+            .expect("clean manifest parses");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

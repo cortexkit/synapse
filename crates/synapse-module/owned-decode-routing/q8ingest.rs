@@ -46,6 +46,7 @@ pub enum TrustState {
 
 /// A published Q8 artifact entry with its lineage and trust metadata.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Q8ArtifactEntry {
     pub source_manifest_digest: String,
     pub quantizer_revision: String,
@@ -551,5 +552,25 @@ mod tests {
             registry.load_or_ingest(SOURCE, QUANT, "q8_0", b"weights", quantizer),
             Err(OwnedDecodeError::ArtifactPoisoned)
         );
+    }
+
+    #[test]
+    fn q8_artifact_entry_rejects_unknown_field() {
+        // fail-closed posture: an unknown field in a Q8 artifact entry is
+        // rejected at parse time rather than silently dropped.
+        let json = serde_json::json!({
+            "source_manifest_digest": "sha256:src",
+            "quantizer_revision": "quant-v1",
+            "derived_digest": "sha256:derived",
+            "format": "q8_0",
+            "lineage": "line",
+            "trust_state": "trusted",
+            "reproducible": true,
+            "derivable": true,
+            "evictable": false,
+            "loadable": true,
+            "unknown_field": "should be rejected",
+        });
+        assert!(serde_json::from_value::<Q8ArtifactEntry>(json).is_err());
     }
 }

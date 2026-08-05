@@ -40,6 +40,7 @@ impl SamplingMode {
 
 /// A `microllm.oneshot` generation request as seen by the routing layer.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OneshotRequest {
     /// Requested model family.
     pub family: Family,
@@ -283,5 +284,20 @@ mod tests {
         pinned.allow_equivalent = true;
         assert!(!pinned.requires_exact_fingerprint());
         assert!(pinned.is_substitutable());
+    }
+
+    #[test]
+    fn oneshot_request_rejects_unknown_field() {
+        // fail-closed posture: a typo or forward-incompatible field addition
+        // is rejected at parse time rather than silently dropped.
+        let json = serde_json::json!({
+            "family": "qwen3-0.6b",
+            "weight_quant": "f16",
+            "prompt_token_count": 100,
+            "max_tokens": 64,
+            "sampling": {"mode": "greedy_top1"},
+            "unknown_field": "should be rejected",
+        });
+        assert!(serde_json::from_value::<OneshotRequest>(json).is_err());
     }
 }

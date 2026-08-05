@@ -21,6 +21,7 @@ use crate::owned_decode_routing::error::OwnedDecodeError;
 
 /// Unconstrained certification key.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UnconstrainedCertKey {
     pub machine_profile_hash: String,
     pub decode_fingerprint: Fingerprint,
@@ -30,6 +31,7 @@ pub struct UnconstrainedCertKey {
 /// runtime identity digest (shared across requests), not the per-request
 /// constraint fingerprint.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConstrainedCertKey {
     pub machine_profile_hash: String,
     pub decode_fingerprint: Fingerprint,
@@ -345,5 +347,25 @@ mod tests {
             checker.check("llama-3", "f16", 0, "sig", None),
             Err(OwnedDecodeError::Unsupported)
         );
+    }
+
+    #[test]
+    fn certification_keys_reject_unknown_fields() {
+        // fail-closed posture: an unknown field in a certification key is
+        // rejected at parse time rather than silently dropped.
+        let bad_unconstrained = serde_json::json!({
+            "machine_profile_hash": "profile-a",
+            "decode_fingerprint": "fp",
+            "unknown": "x",
+        });
+        assert!(serde_json::from_value::<UnconstrainedCertKey>(bad_unconstrained).is_err());
+
+        let bad_constrained = serde_json::json!({
+            "machine_profile_hash": "profile-a",
+            "decode_fingerprint": "fp",
+            "constraint_runtime_identity": "cri",
+            "unknown": "x",
+        });
+        assert!(serde_json::from_value::<ConstrainedCertKey>(bad_constrained).is_err());
     }
 }
