@@ -1493,8 +1493,10 @@ mod tests {
         );
 
         // G-DEC-01..10 pass with the synthetic evidence; G-DEC-11 and the
-        // scheduler-dependent portion of G-DEC-12 stay blocked until the
-        // numeric scheduler manifest commits.
+        // scheduler-dependent portion of G-DEC-12 stay blocked: the
+        // OQ-DEC-SCHED-01 measurement recorded its facts but no candidate
+        // met the committed embed.query p95 SLO, so no numeric N is
+        // committed yet.
         for gate in &ALL_GATES[..10] {
             let status = &evidence.gate_statuses[gate];
             assert!(

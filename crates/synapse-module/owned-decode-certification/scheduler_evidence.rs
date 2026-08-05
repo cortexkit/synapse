@@ -157,6 +157,7 @@ mod tests {
             per_operation_waiting_ms: vec![3.0],
             cancellation_latency_ms: vec![5.0],
             deadline_latency_ms: vec![6.0],
+            ..Default::default()
         }
     }
 
@@ -182,10 +183,12 @@ mod tests {
 
     #[test]
     fn checked_in_manifest_is_blocked_until_measurement_commits() {
-        // The checked-in manifest carries candidate runtime values but an
-        // entirely empty evidence record: the numeric commitment (OQ-DEC-SCHED-01)
-        // is still outstanding, so ingestion must report blocked and cutover
-        // must stay disabled.
+        // The checked-in manifest carries the complete OQ-DEC-SCHED-01
+        // factual record (per-candidate table, SLO, loadavg records,
+        // machine profile, date, protocol id), but no candidate met the
+        // committed embed.query p95 SLO on the M5 validation machine, so
+        // committed_n stays null pending review: ingestion must report
+        // blocked and cutover must stay disabled.
         let manifest_dir =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("owned-decode-manifests");
         let manifests = crate::owned_decode_contracts::load_manifest_dir(&manifest_dir)

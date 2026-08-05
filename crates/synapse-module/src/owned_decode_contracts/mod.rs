@@ -243,6 +243,43 @@ pub struct SchedulerWorkloadRecord {
     pub percentile_method: String,
 }
 
+/// One measured candidate quantum from the OQ-DEC-SCHED-01 mixed-load run.
+/// The evidence table must cover every candidate N in `{8,16,32}`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SchedulerCandidateEvidence {
+    /// The candidate quantum measured by this cell.
+    pub n: u32,
+    /// Embed.query latency percentiles (nearest-rank) under mixed load.
+    pub embed_p50_ms: f64,
+    pub embed_p95_ms: f64,
+    pub embed_p99_ms: f64,
+    /// Effective decode throughput under mixed load, including yield time and
+    /// generation restarts.
+    pub decode_tokens_per_sec: f64,
+    /// Quantum boundary count observed in the measured window.
+    pub quantum_boundaries: u64,
+    /// Continuation count (non-final boundaries followed by another quantum).
+    pub continuations: u64,
+    /// Longest single quantum observed in the cell (bounds cancellation
+    /// deferral, which is evaluated at quantum boundaries).
+    pub max_quantum_ms: f64,
+    /// 1/5/15-minute loadavg recorded before and after the cell.
+    pub loadavg_before: [f64; 3],
+    pub loadavg_after: [f64; 3],
+    /// True when the cell started with a 1-minute loadavg above 4 on the
+    /// shared measurement machine.
+    pub ran_above_load4: bool,
+    /// Whether this candidate's embed.query p95 met the committed SLO.
+    pub meets_slo: bool,
+    /// Measured window length and completed embed queries.
+    pub window_ms: u64,
+    pub embed_queries: u64,
+    /// Same-session embed.query p95 regression versus the embed-only
+    /// baseline, in percent.
+    pub embed_regression_pct: f64,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SchedulerEvidenceRecord {
@@ -266,6 +303,34 @@ pub struct SchedulerEvidenceRecord {
     pub cancellation_latency_ms: Vec<f64>,
     #[serde(default)]
     pub deadline_latency_ms: Vec<f64>,
+    /// Per-candidate mixed-load measurement table covering `{8,16,32}`.
+    #[serde(default)]
+    pub candidates: Vec<SchedulerCandidateEvidence>,
+    /// The embed.query p95 SLO the candidates were judged against (mirrors
+    /// the workload record's committed SLO).
+    #[serde(default)]
+    pub embed_query_p95_slo_ms: Option<f64>,
+    /// Same-session embed-only baseline measured before decode admission.
+    #[serde(default)]
+    pub baseline_embed_only_p50_ms: Option<f64>,
+    #[serde(default)]
+    pub baseline_embed_only_p95_ms: Option<f64>,
+    /// Uninterrupted decode throughput baseline (no embed load), tok/s.
+    #[serde(default)]
+    pub decode_only_tokens_per_sec: Option<f64>,
+    /// The machine the measurement ran on (chip, model, RAM, OS).
+    #[serde(default)]
+    pub machine_profile_note: Option<String>,
+    /// UTC timestamp of the measurement run.
+    #[serde(default)]
+    pub measured_at_utc: Option<String>,
+    /// The measurement protocol revision executed.
+    #[serde(default)]
+    pub protocol_id: Option<String>,
+    /// Boundary-crossing bit-exactness spot check lines: chunked N streams
+    /// versus the uninterrupted greedy stream.
+    #[serde(default)]
+    pub parity_spot_check: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1213,6 +1278,164 @@ mod tests {
     fn scheduler_runtime_n_is_candidate() {
         let dir = load_manifest_dir(&manifest_dir()).expect("checked-in manifests must validate");
         assert!(CANDIDATE_PRODUCTION_N.contains(&dir.scheduler.runtime.production_n));
+    }
+
+    #[test]
+    fn scheduler_evidence_record_is_complete_and_consistent() {
+        // The OQ-DEC-SCHED-01 mixed-load measurement has executed on the
+        // validation machine: the checked-in evidence record must carry the
+        // complete factual record — a per-candidate table covering every
+        // candidate exactly once, the committed SLO, loadavg records, machine
+        // profile, measurement date, and protocol identity — and the
+        // commitment must be consistent with the selection rule: the
+        // committed N is the LARGEST candidate meeting the SLO, or null when
+        // no candidate met it (facts recorded, commitment pending review).
+        let dir = load_manifest_dir(&manifest_dir()).expect("checked-in manifests must validate");
+        let scheduler = &dir.scheduler;
+        let evidence = &scheduler.evidence;
+        let workload = &scheduler.workload;
+
+        // SLO recorded and mirrored between workload and evidence.
+        assert!(
+            workload.embed_query_p95_slo_ms > 0.0,
+            "workload SLO must be positive"
+        );
+        assert_eq!(
+            evidence.embed_query_p95_slo_ms,
+            Some(workload.embed_query_p95_slo_ms),
+            "evidence SLO must mirror the workload SLO"
+        );
+        let slo = workload.embed_query_p95_slo_ms;
+
+        // The per-candidate table covers every candidate exactly once, with
+        // finite measurements and honest loadavg records.
+        let mut covered: Vec<u32> = evidence.candidates.iter().map(|c| c.n).collect();
+        covered.sort_unstable();
+        assert_eq!(
+            covered,
+            vec![8, 16, 32],
+            "evidence candidates must cover {{8,16,32}} exactly once each"
+        );
+        for candidate in &evidence.candidates {
+            assert!(
+                candidate.embed_p50_ms.is_finite()
+                    && candidate.embed_p95_ms.is_finite()
+                    && candidate.embed_p99_ms.is_finite(),
+                "candidate {} must record finite embed percentiles",
+                candidate.n
+            );
+            assert!(
+                candidate.window_ms >= workload.duration_ms,
+                "candidate {} window {} ms must cover the workload duration {} ms",
+                candidate.n,
+                candidate.window_ms,
+                workload.duration_ms
+            );
+            assert!(
+                candidate.embed_queries > 0,
+                "candidate {} must record completed embed queries",
+                candidate.n
+            );
+            assert!(
+                candidate.loadavg_before.iter().all(|v| v.is_finite())
+                    && candidate.loadavg_after.iter().all(|v| v.is_finite()),
+                "candidate {} must record loadavg before and after",
+                candidate.n
+            );
+            // The meets_slo flag must agree with the recorded p95 and SLO.
+            assert_eq!(
+                candidate.meets_slo,
+                candidate.embed_p95_ms <= slo,
+                "candidate {} meets_slo flag must match its p95 vs the SLO",
+                candidate.n
+            );
+        }
+
+        // Selection rule: committed_n is the largest candidate meeting the
+        // SLO, or null when none met it. A committed N additionally equals
+        // the runtime production_n and the observed N.
+        let meeting: Vec<u32> = evidence
+            .candidates
+            .iter()
+            .filter(|c| c.meets_slo)
+            .map(|c| c.n)
+            .collect();
+        let expected_commit = meeting.iter().copied().max();
+        assert_eq!(
+            evidence.committed_n, expected_commit,
+            "committed_n must be the largest SLO-meeting candidate, or null when none met it"
+        );
+        if let Some(committed_n) = evidence.committed_n {
+            assert!(CANDIDATE_PRODUCTION_N.contains(&committed_n));
+            assert_eq!(
+                committed_n, scheduler.runtime.production_n,
+                "committed_n must equal the runtime production_n"
+            );
+            assert_eq!(
+                evidence.observed_n,
+                Some(committed_n),
+                "observed_n must match committed_n"
+            );
+            assert!(evidence.continuation_count.is_some());
+        }
+
+        // Baselines and machine context recorded.
+        assert!(
+            evidence.baseline_embed_only_p95_ms.is_some(),
+            "same-session embed-only baseline p95 must be recorded"
+        );
+        assert!(
+            evidence.decode_only_tokens_per_sec.is_some(),
+            "uninterrupted decode throughput baseline must be recorded"
+        );
+        assert!(
+            evidence
+                .machine_profile_note
+                .as_deref()
+                .is_some_and(|note| !note.is_empty()),
+            "machine profile note must be recorded"
+        );
+        assert!(
+            evidence
+                .measured_at_utc
+                .as_deref()
+                .is_some_and(|stamp| !stamp.is_empty()),
+            "measurement date must be recorded"
+        );
+        assert!(
+            evidence
+                .protocol_id
+                .as_deref()
+                .is_some_and(|id| !id.is_empty()),
+            "measurement protocol id must be recorded"
+        );
+
+        // Executed-evidence fields: maximum uninterruptible GPU time,
+        // sequence traces, permit events, queue depth, per-operation
+        // waiting, cancellation observations, and the boundary-crossing
+        // bit-exactness spot check must all be present.
+        assert!(evidence.max_uninterruptible_gpu_time_ms.is_some());
+        assert!(!evidence.sequence_traces.is_empty());
+        assert!(!evidence.permit_events.is_empty());
+        assert!(!evidence.queue_depth.is_empty());
+        assert!(!evidence.per_operation_waiting_ms.is_empty());
+        assert!(!evidence.cancellation_latency_ms.is_empty());
+        assert!(!evidence.parity_spot_check.is_empty());
+        assert!(!workload.cancellation_observations.is_empty());
+
+        // Recorded cancellation observations (quantum-deferral samples)
+        // stay inside the workload bound.
+        let bound = workload.cancellation_latency_bound_ms as f64;
+        for observation in workload
+            .cancellation_observations
+            .iter()
+            .chain(evidence.cancellation_latency_ms.iter())
+        {
+            assert!(
+                *observation <= bound,
+                "cancellation observation {observation} ms exceeds the {bound} ms bound"
+            );
+        }
     }
 
     #[test]
