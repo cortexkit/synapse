@@ -224,6 +224,13 @@ pub trait DecodeDispatch {
 
 /// Per-request routing environment: the machine-profile-local state that is not
 /// derivable from the catalog entry alone.
+///
+/// The `cutover_enabled` flag is deliberately not settable by struct literal:
+/// the only production construction path is [`RoutingEnvironment::with_cutover_evaluated`],
+/// which derives the flag by evaluating the D-009 predicate
+/// ([`crate::owned_decode_routing::lane::cutover_enabled`]) over the checked-in
+/// record and evidence-derived inputs. Tests may use the clearly named
+/// [`RoutingEnvironment::with_cutover_flag_for_test`].
 #[derive(Clone, Debug)]
 pub struct RoutingEnvironment {
     pub machine_profile_hash: String,
@@ -231,8 +238,9 @@ pub struct RoutingEnvironment {
     /// constrained request returns `grammar_disabled` before lane selection.
     pub grammar_enabled: bool,
     /// Whether the D-009 cutover is enabled for this profile (the preferred-lane
-    /// predicate; see `lane::cutover_enabled`).
-    pub cutover_enabled: bool,
+    /// predicate; see `lane::cutover_enabled`). Private: only the constructors
+    /// below can set it.
+    cutover_enabled: bool,
     /// Whether the quarantine key is currently quarantined.
     pub quarantined: bool,
     /// The configured llama fallback lane, if any.
@@ -241,6 +249,68 @@ pub struct RoutingEnvironment {
     pub equivalent_fingerprints: BTreeSet<Fingerprint>,
     /// Constraint runtime identity digest for a constrained request, if applicable.
     pub constraint_runtime_identity: Option<String>,
+}
+
+impl RoutingEnvironment {
+    /// Construct a routing environment whose cutover flag is mechanically
+    /// derived from the checked-in D-009 record and evidence-derived inputs:
+    /// the flag is exactly [`crate::owned_decode_routing::lane::cutover_enabled`]
+    /// evaluated over them. This is the only production construction path, so
+    /// a true flag cannot exist without a record-and-evidence evaluation.
+    // Every environment field plus the record-and-evidence pair must be
+    // explicit at the single construction site; splitting them would only
+    // hide the coupling this constructor exists to enforce.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_cutover_evaluated(
+        machine_profile_hash: impl Into<String>,
+        grammar_enabled: bool,
+        quarantined: bool,
+        llama: Option<LlamaLane>,
+        equivalent_fingerprints: BTreeSet<Fingerprint>,
+        constraint_runtime_identity: Option<String>,
+        record: &crate::owned_decode_routing::lane::CutoverRecord,
+        inputs: &crate::owned_decode_routing::lane::CutoverInputs,
+    ) -> Self {
+        Self {
+            machine_profile_hash: machine_profile_hash.into(),
+            grammar_enabled,
+            cutover_enabled: crate::owned_decode_routing::lane::cutover_enabled(record, inputs),
+            quarantined,
+            llama,
+            equivalent_fingerprints,
+            constraint_runtime_identity,
+        }
+    }
+
+    /// Test-only constructor: sets the cutover flag directly without a
+    /// record-and-evidence evaluation. Named so it is never mistaken for a
+    /// production path; production code must use
+    /// [`RoutingEnvironment::with_cutover_evaluated`].
+    pub fn with_cutover_flag_for_test(
+        machine_profile_hash: impl Into<String>,
+        grammar_enabled: bool,
+        cutover_enabled: bool,
+        quarantined: bool,
+        llama: Option<LlamaLane>,
+        equivalent_fingerprints: BTreeSet<Fingerprint>,
+        constraint_runtime_identity: Option<String>,
+    ) -> Self {
+        Self {
+            machine_profile_hash: machine_profile_hash.into(),
+            grammar_enabled,
+            cutover_enabled,
+            quarantined,
+            llama,
+            equivalent_fingerprints,
+            constraint_runtime_identity,
+        }
+    }
+
+    /// Whether the D-009 cutover is enabled for this profile.
+    #[must_use]
+    pub fn cutover_enabled(&self) -> bool {
+        self.cutover_enabled
+    }
 }
 
 /// A terminal routing failure with its wire ID and any mapped-refusal underlying.
@@ -622,15 +692,15 @@ mod tests {
     }
 
     fn env(cutover_enabled: bool, llama: Option<LlamaLane>) -> RoutingEnvironment {
-        RoutingEnvironment {
-            machine_profile_hash: "profile-a".to_string(),
-            grammar_enabled: true,
+        RoutingEnvironment::with_cutover_flag_for_test(
+            "profile-a",
+            true,
             cutover_enabled,
-            quarantined: false,
+            false,
             llama,
-            equivalent_fingerprints: BTreeSet::new(),
-            constraint_runtime_identity: None,
-        }
+            BTreeSet::new(),
+            None,
+        )
     }
 
     fn llama_lane() -> LlamaLane {

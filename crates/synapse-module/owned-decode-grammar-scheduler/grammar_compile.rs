@@ -119,6 +119,19 @@ pub fn compile_grammar(
     let limits = manifest.limits;
     let schema = parse_schema(raw_grammar, &limits)?;
 
+    // Compiled-state limit, enforced pre-dispatch like the other checked-in
+    // limits. The v1 compiler emits a push-down automaton whose control state
+    // is exactly the schema arena (one schema node per addressable state), so
+    // the schema node count is the honest v1 compiled-state measure; a future
+    // compiler that expands states must compare its real state count here.
+    if schema.node_count() > limits.max_compiled_state_count {
+        return Err(SchemaError::feature(format!(
+            "compiled automaton state count {} exceeds the {} limit",
+            schema.node_count(),
+            limits.max_compiled_state_count
+        )));
+    }
+
     let canonical_schema_digest = sha256_hex(&canonical_schema_bytes(&schema));
 
     let compiled = CompiledAutomaton {
@@ -353,6 +366,30 @@ mod tests {
             error.wire_error(),
             OwnedDecodeError::GrammarFeatureUnsupported
         );
+    }
+
+    #[test]
+    fn compile_enforces_compiled_state_count_limit() {
+        // The test schema compiles to two nodes (object root + one property).
+        // Lowering the compiled-state limit below that count rejects the
+        // schema pre-dispatch with the typed feature error.
+        let mut manifest = GrammarSubsetManifest::default();
+        manifest.limits.max_compiled_state_count = 1;
+        let error = compile_grammar(SCHEMA, &context(), &manifest)
+            .expect_err("over-state-limit schema rejected");
+        assert_eq!(
+            error.wire_error(),
+            OwnedDecodeError::GrammarFeatureUnsupported
+        );
+        assert!(
+            error.message.contains("state count"),
+            "reason should name the state-count limit: {}",
+            error.message
+        );
+
+        // The same schema compiles when the limit admits its state count.
+        manifest.limits.max_compiled_state_count = 2;
+        compile_grammar(SCHEMA, &context(), &manifest).expect("within limit compiles");
     }
 
     #[test]

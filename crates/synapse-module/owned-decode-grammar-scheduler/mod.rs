@@ -230,14 +230,32 @@ mod integration_tests {
     #[test]
     fn four_grammar_performance_lanes_compile_and_mask_under_bound() {
         // Each grammar-cost lane compiles, generates its document with per-step
-        // masking, and stays under the 0.50 ms/token p95 ship bound. Constrained
-        // decoding commits the same token count as unconstrained (throughput ratio
-        // 1.0 >= 0.90) because masking changes which tokens are selectable, not how
-        // many are generated for a fixed valid document.
+        // masking, and measures its masking latency. Every committed byte must
+        // be permitted by the mask at its step.
+        //
+        // The constrained-throughput ratio is deliberately NOT asserted here:
+        // both arms of this test commit the same fixed document, so any ratio
+        // computed between them is 1.0 by construction and could never fail.
+        // The real ratio gate is G-DEC-09: the `grammar-cost-corpus-v1`
+        // manifest fixes fixtures, warmup, repetitions, sampling, and
+        // percentile calculation, and a machine run records constrained vs
+        // unconstrained owned-worker throughput there (see certification
+        // `gate_09_grammar_cost`).
+        //
+        // The latency half is likewise a pre-check, not the gate: the
+        // authoritative 0.50 ms/token p95 ship bound lives in the G-DEC-09
+        // grammar-cost-corpus measurement protocol. A wall-clock p95 asserted
+        // in a unit test on a shared runner conflates machine load with
+        // regression, so the strict ship bound is asserted only when this
+        // test runs explicitly as the measurement gate
+        // (SYNAPSE_GRAMMAR_LATENCY_GATE=1); the default CI run asserts a
+        // loose sanity ceiling (10x the ship bound) that catches algorithmic
+        // blowups but not scheduler noise.
         let vocabulary: Vec<String> = (0x20u8..=0x7e)
             .map(|byte| (byte as char).to_string())
             .collect();
         let ship_bound_ms = 0.50_f64;
+        let latency_gate = std::env::var("SYNAPSE_GRAMMAR_LATENCY_GATE").as_deref() == Ok("1");
 
         for &(fixture_id, schema, document) in FOUR_LANES {
             let automaton = automaton(schema);
@@ -245,7 +263,6 @@ mod integration_tests {
             // Constrained run: mask the vocabulary at each step before committing.
             let mut state = automaton.initial();
             let mut masking_samples_ms: Vec<f64> = Vec::new();
-            let mut constrained_tokens = 0u32;
             for &byte in document.as_bytes() {
                 let start = Instant::now();
                 let permitted = mask_tokens(&automaton, &state, &vocabulary);
@@ -257,30 +274,33 @@ mod integration_tests {
                     "fixture {fixture_id}: committed byte must be permitted by masking"
                 );
                 state = automaton.step(&state, byte).expect("commit permitted byte");
-                constrained_tokens += 1;
             }
             assert!(
                 automaton.has_complete_value(&state),
                 "fixture {fixture_id} completes"
             );
 
-            // Nearest-rank p95 masking latency stays under the ship bound.
+            // Nearest-rank p95 masking latency, reported for every run.
             masking_samples_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
             let rank = ((masking_samples_ms.len() as f64) * 0.95).ceil() as usize;
             let p95 = masking_samples_ms[(rank.max(1) - 1).min(masking_samples_ms.len() - 1)];
-            assert!(
-                p95 < ship_bound_ms,
-                "fixture {fixture_id}: p95 masking {p95}ms exceeded {ship_bound_ms}ms"
+            println!(
+                "fixture {fixture_id}: p95 masking latency {p95:.4} ms/token (ship bound {ship_bound_ms} ms)"
             );
-
-            // Unconstrained run commits the same document with no masking; the
-            // constrained token count equals it, so throughput ratio is 1.0 >= 0.90.
-            let unconstrained_tokens = document.len() as u32;
-            let ratio = constrained_tokens as f64 / unconstrained_tokens as f64;
-            assert!(
-                ratio >= 0.90,
-                "fixture {fixture_id}: constrained throughput ratio {ratio} below 0.90"
-            );
+            if latency_gate {
+                assert!(
+                    p95 < ship_bound_ms,
+                    "fixture {fixture_id}: p95 masking {p95}ms exceeded the {ship_bound_ms}ms ship bound"
+                );
+            } else {
+                let sanity_ceiling_ms = ship_bound_ms * 10.0;
+                assert!(
+                    p95 < sanity_ceiling_ms,
+                    "fixture {fixture_id}: p95 masking {p95}ms suggests an algorithmic blowup \
+                     (sanity ceiling {sanity_ceiling_ms}ms; the ship bound is enforced by the \
+                     G-DEC-09 grammar-cost-corpus gate)"
+                );
+            }
         }
     }
 
@@ -290,24 +310,31 @@ mod integration_tests {
     /// union of permitted content tokens and stop-token control candidates.
     #[derive(Debug)]
     enum GenOutcome {
+        /// The automaton completed a value: `finish_reason=grammar_complete`.
         Complete(Vec<u8>),
-        // The real worker can return grammar_stop_before_completion when a stop
-        // token wins greedy selection while the automaton is incomplete; this
-        // deterministic model always prefers a permitted content token, so that
-        // outcome is unreachable here. Stop-vs-content selection-order fixtures
-        // live in the owned-decode-worker crate.
+        /// A stop candidate won greedy selection while the automaton was
+        /// incomplete: `grammar_stop_before_completion`. The stop token is a
+        /// non-committed control candidate, so it never appears in the
+        /// committed bytes.
+        StopBeforeCompletion(Vec<u8>),
+        /// No content token and no stop candidate selectable.
         Unsatisfiable,
         MaxTokensExhausted(Vec<u8>),
     }
 
-    /// Generate by greedily committing the lowest-index permitted content token.
-    /// `stop_bytes` are non-committed control candidates; if no content token is
-    /// permitted but a stop candidate is selectable while the automaton is
-    /// incomplete, the worker returns `grammar_stop_before_completion`.
+    /// Generate by greedily committing the lowest-index permitted content token,
+    /// modeling the worker's greedy selection over the union of permitted content
+    /// tokens and stop-token control candidates. `stop_bytes` are the configured
+    /// stop IDs as non-committed control candidates: they are selectable at any
+    /// step but never committed. When a stop candidate wins a step, the outcome
+    /// is `grammar_complete` if the automaton already completed a value and
+    /// `grammar_stop_before_completion` otherwise. Content tokens win the steps
+    /// whose plan byte is not a stop candidate.
     fn greedy_generate(
         automaton: &grammar_automaton::Automaton,
         vocabulary: &[String],
         plan: &[u8],
+        stop_bytes: &[u8],
         max_tokens: usize,
     ) -> GenOutcome {
         let mut state = automaton.initial();
@@ -315,6 +342,16 @@ mod integration_tests {
         for &byte in plan {
             if committed.len() >= max_tokens {
                 return GenOutcome::MaxTokensExhausted(committed);
+            }
+            // Stop candidates are control candidates in the greedy union: when
+            // one wins, it is never committed.
+            if stop_bytes.contains(&byte) {
+                return if automaton.has_complete_value(&state) {
+                    // Stop winning after completion is a clean grammar_complete.
+                    GenOutcome::Complete(committed)
+                } else {
+                    GenOutcome::StopBeforeCompletion(committed)
+                };
             }
             let permitted = mask_tokens(automaton, &state, vocabulary);
             if permitted.is_empty() {
@@ -332,9 +369,6 @@ mod integration_tests {
                 .step(&state, byte)
                 .expect("planned byte permitted");
             committed.push(byte);
-            if automaton.has_complete_value(&state) {
-                return GenOutcome::Complete(committed);
-            }
         }
         if automaton.has_complete_value(&state) {
             GenOutcome::Complete(committed)
@@ -358,7 +392,7 @@ mod integration_tests {
             .map(|byte| (byte as char).to_string())
             .collect();
         let plan = br#"{"name":"ada"}"#.to_vec();
-        match greedy_generate(&automaton, &vocabulary, &plan, 64) {
+        match greedy_generate(&automaton, &vocabulary, &plan, &[], 64) {
             GenOutcome::Complete(committed) => assert_eq!(committed, plan),
             other => panic!("expected grammar_complete, got {other:?}"),
         }
@@ -378,7 +412,7 @@ mod integration_tests {
             .collect();
         let plan = br#"{"name":"adelaide"}"#.to_vec();
         // A budget shorter than the document exhausts before the value completes.
-        match greedy_generate(&automaton, &vocabulary, &plan, 5) {
+        match greedy_generate(&automaton, &vocabulary, &plan, &[], 5) {
             GenOutcome::MaxTokensExhausted(committed) => assert_eq!(committed.len(), 5),
             other => panic!("expected grammar_max_tokens_exhausted, got {other:?}"),
         }
@@ -392,7 +426,7 @@ mod integration_tests {
         // at the start, so the constrained path is unsatisfiable.
         let vocabulary = vec!["{".to_string(), "[".to_string(), "1".to_string()];
         let plan = br#""hello""#.to_vec();
-        match greedy_generate(&automaton, &vocabulary, &plan, 64) {
+        match greedy_generate(&automaton, &vocabulary, &plan, &[], 64) {
             GenOutcome::Unsatisfiable => {}
             other => panic!("expected grammar_unsatisfiable, got {other:?}"),
         }
@@ -424,15 +458,81 @@ mod integration_tests {
             .collect();
         // A plan spelling a non-member is rejected by masking (unsatisfiable path).
         let bad_plan = br#""yellow""#.to_vec();
-        match greedy_generate(&automaton, &vocabulary, &bad_plan, 64) {
+        match greedy_generate(&automaton, &vocabulary, &bad_plan, &[], 64) {
             GenOutcome::Unsatisfiable => {}
             other => panic!("expected non-member to be masked out, got {other:?}"),
         }
         // A member plan completes.
         let good_plan = br#""blue""#.to_vec();
-        match greedy_generate(&automaton, &vocabulary, &good_plan, 64) {
+        match greedy_generate(&automaton, &vocabulary, &good_plan, &[], 64) {
             GenOutcome::Complete(committed) => assert_eq!(committed, good_plan),
             other => panic!("expected member to complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stop_winning_while_incomplete_is_stop_before_completion() {
+        // A stop candidate winning greedy selection while the automaton is
+        // incomplete surfaces grammar_stop_before_completion, and the stop
+        // candidate is never committed.
+        let schema = r#"{ "type": "string" }"#;
+        let automaton = automaton(schema);
+        let vocabulary: Vec<String> = (0x20u8..=0x7e)
+            .map(|byte| (byte as char).to_string())
+            .collect();
+        // Commit only the opening quote (incomplete value), then the stop
+        // candidate wins the next selection.
+        let plan = vec![b'"', b'~'];
+        match greedy_generate(&automaton, &vocabulary, &plan, b"~", 64) {
+            GenOutcome::StopBeforeCompletion(committed) => {
+                assert_eq!(committed, vec![b'"'], "stop token is not committed");
+                assert!(!committed.contains(&b'~'));
+            }
+            other => panic!("expected grammar_stop_before_completion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stop_winning_after_completion_is_clean_grammar_complete() {
+        // A stop candidate winning after the value completed is a clean
+        // grammar_complete, not grammar_stop_before_completion; the stop
+        // candidate is still never committed.
+        let schema = r#"{ "type": "string" }"#;
+        let automaton = automaton(schema);
+        let vocabulary: Vec<String> = (0x20u8..=0x7e)
+            .map(|byte| (byte as char).to_string())
+            .collect();
+        let document = br#""hi""#;
+        let mut plan = document.to_vec();
+        plan.push(b'~'); // stop candidate wins the selection after completion
+        match greedy_generate(&automaton, &vocabulary, &plan, b"~", 64) {
+            GenOutcome::Complete(committed) => {
+                assert_eq!(committed, document, "only content is committed");
+            }
+            other => panic!("expected clean grammar_complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn content_wins_while_stop_candidate_is_selectable() {
+        // With a stop candidate configured, content tokens keep winning the
+        // steps before the stop is selected: the document completes normally.
+        let schema = r#"{
+            "type": "object",
+            "properties": { "name": { "type": "string" } },
+            "required": ["name"],
+            "additionalProperties": false
+        }"#;
+        let automaton = automaton(schema);
+        let vocabulary: Vec<String> = (0x20u8..=0x7e)
+            .map(|byte| (byte as char).to_string())
+            .collect();
+        let plan = br#"{"name":"ada"}"#.to_vec();
+        // The stop byte `~` never appears in the plan, so content wins every
+        // step even though the stop candidate is selectable at each one.
+        match greedy_generate(&automaton, &vocabulary, &plan, b"~", 64) {
+            GenOutcome::Complete(committed) => assert_eq!(committed, plan),
+            other => panic!("expected content to win and complete, got {other:?}"),
         }
     }
 

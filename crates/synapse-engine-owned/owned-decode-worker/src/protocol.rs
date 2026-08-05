@@ -11,6 +11,19 @@
 //! Frames are wrapped in a [`FrameEnvelope`] tagged with the protocol ID so a
 //! legacy llama frame (or any foreign frame) is rejected as a protocol mismatch
 //! before its body is interpreted.
+//!
+//! ## Stop-token selection obligation
+//!
+//! The grammar contract requires the worker to compute the permitted content
+//! tokens from the compiled automaton, treat the configured stop IDs as
+//! non-committed control candidates, run greedy selection over the union, and
+//! end with `grammar_stop_before_completion` when a stop candidate wins while
+//! the automaton is incomplete. The real Metal worker owns this production
+//! selection; the S5 grammar-scheduler module's `greedy_generate`
+//! (`owned-decode-grammar-scheduler`) is the reference semantics its fixtures
+//! must match. The scripted worker in this crate models the observable
+//! outcomes of that selection (stop omission from generated IDs, the
+//! `stop_token` finish) but not production logits.
 
 use serde::{Deserialize, Serialize};
 

@@ -23,12 +23,14 @@ use std::rc::Rc;
 
 /// A shared log the scripted workers write to so fixtures can assert what the
 /// supervisor sent: continuation budgets (for remaining-budget truncation),
-/// continuation sequences, and cancellation count.
+/// continuation sequences, cancellation count, and kill count.
 #[derive(Default, Clone, Debug)]
 pub struct ScriptedLog {
     pub continue_budgets: Vec<u32>,
     pub continue_sequences: Vec<u32>,
     pub cancels: u32,
+    /// Forced worker kills (unacknowledged-cancellation escalation).
+    pub kills: u32,
 }
 
 /// A transport-level worker fault. These are the chargeable failure modes that
@@ -84,6 +86,11 @@ pub trait DecodeWorker {
 
     /// Request cancellation. The worker destroys resident state and acknowledges.
     fn send_cancel(&mut self, cancel: &GenerateCancel) -> Result<CancelAck, WorkerFault>;
+
+    /// Forcibly terminate the worker process. This is the escalation for a
+    /// cancellation the worker fails to acknowledge; resident state is
+    /// destroyed with the process.
+    fn kill(&mut self);
 }
 
 /// Process supervision: spawn a fresh worker process for an attempt.
@@ -122,6 +129,17 @@ pub enum ScriptedEvent {
     Crash,
     /// Stall past the deadline without emitting.
     Timeout,
+    /// The next cancellation request is never acknowledged (the worker hangs
+    /// past the cancel timeout). Consumed by `send_cancel`, not by `step`, so
+    /// a script places it where the supervisor's boundary cancel will hit it.
+    CancelFailure,
+    /// Model the worker's greedy union selection (reference semantics: the S5
+    /// grammar-scheduler `greedy_generate` stop union; production selection is
+    /// owned by the real Metal worker): the content IDs are committed, then a
+    /// stop candidate wins the selection. The winning stop token is a
+    /// non-committed control candidate: it never enters generated IDs or the
+    /// committed count, and the final finishes with `stop_token`.
+    StopSelectionWins { content_ids: Vec<u32>, stop_id: u32 },
 }
 
 /// A scripted worker for one attempt.
@@ -263,6 +281,42 @@ impl DecodeWorker for ScriptedWorker {
             }),
             ScriptedEvent::Crash => Err(WorkerFault::Crash),
             ScriptedEvent::Timeout => Err(WorkerFault::Timeout),
+            ScriptedEvent::CancelFailure => {
+                // Consumed by send_cancel, never by step; if the script reaches
+                // it through step the worker is unresponsive: a crash.
+                Err(WorkerFault::Crash)
+            }
+            ScriptedEvent::StopSelectionWins {
+                content_ids,
+                stop_id: _,
+            } => {
+                // The stop candidate wins the final selection. It is a
+                // non-committed control candidate, so the final carries only
+                // the content IDs and counts, exactly as the reference
+                // selection semantics require.
+                let committed = content_ids.len() as u32;
+                self.committed = committed;
+                let last_sequence = self.next_sequence.saturating_sub(1).max(1);
+                Ok(SteppedFrame {
+                    worker_generation: generation,
+                    frame: WorkerFrame::Final(FinalResponse {
+                        generation_id: self.generation_id.clone(),
+                        generated_ids: content_ids,
+                        committed_token_count: committed,
+                        decode_fingerprint: self.context.decode_fingerprint.clone(),
+                        runtime_config_digest: self.context.runtime_config_digest.clone(),
+                        worker_generation: generation,
+                        finish_reason: FinishReason::StopToken,
+                        constraint_identity: self
+                            .context
+                            .expected_constraint
+                            .as_ref()
+                            .map(|c| c.constraint_runtime_identity.clone()),
+                        constraint_complete: false,
+                        last_completed_sequence: last_sequence,
+                    }),
+                })
+            }
         }
     }
 
@@ -284,9 +338,22 @@ impl DecodeWorker for ScriptedWorker {
 
     fn send_cancel(&mut self, _cancel: &GenerateCancel) -> Result<CancelAck, WorkerFault> {
         self.log.borrow_mut().cancels += 1;
+        // A scripted CancelFailure event makes this cancellation
+        // unacknowledged: the worker hangs past the cancel timeout.
+        if matches!(
+            self.events.get(self.cursor),
+            Some(ScriptedEvent::CancelFailure)
+        ) {
+            self.cursor += 1;
+            return Err(WorkerFault::FailedCancellation);
+        }
         Ok(CancelAck::Acknowledged {
             committed_token_count: self.committed,
         })
+    }
+
+    fn kill(&mut self) {
+        self.log.borrow_mut().kills += 1;
     }
 }
 

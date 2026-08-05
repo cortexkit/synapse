@@ -28,6 +28,12 @@ fn is_whitespace(byte: u8) -> bool {
     WHITESPACE.contains(&byte)
 }
 
+/// Whether a byte is a JSON hex digit (`0-9`, `a-f`, `A-F`). The four bytes
+/// following a `\u` escape must all be hex digits per RFC 8259.
+const fn is_hex_digit(byte: u8) -> bool {
+    byte.is_ascii_hexdigit()
+}
+
 /// The incremental automaton state. Clone to fork a candidate continuation.
 #[derive(Clone, Debug, PartialEq)]
 pub struct State {
@@ -85,13 +91,20 @@ enum ArrPhase {
 /// An active scalar read.
 #[derive(Clone, Debug, PartialEq)]
 enum Scalar {
-    /// A general JSON string (no enum restriction).
-    String { buf: Vec<u8>, escape: bool },
+    /// A general JSON string (no enum restriction). `unicode_remaining` counts
+    /// the hex digits still owed to an in-progress `\u` escape (zero outside
+    /// one).
+    String {
+        buf: Vec<u8>,
+        escape: bool,
+        unicode_remaining: u8,
+    },
     /// A string restricted to a set of enum members. `members` holds the exact
     /// inner-content bytes (between the quotes, JSON-escaped) of each member.
     EnumString {
         buf: Vec<u8>,
         escape: bool,
+        unicode_remaining: u8,
         members: Vec<Vec<u8>>,
     },
     /// An object key restricted to the not-yet-emitted property names.
@@ -215,8 +228,17 @@ impl Automaton {
 
     fn permitted_scalar_bytes(&self, state: &State, scalar: &Scalar, out: &mut BTreeSet<u8>) {
         match scalar {
-            Scalar::String { escape, .. } => {
-                if *escape {
+            Scalar::String {
+                escape,
+                unicode_remaining,
+                ..
+            } => {
+                if *unicode_remaining > 0 {
+                    // Inside a `\u` escape only the owed hex digits are legal.
+                    out.extend(b'0'..=b'9');
+                    out.extend(b'a'..=b'f');
+                    out.extend(b'A'..=b'F');
+                } else if *escape {
                     out.extend(b"\"\\/bfnrtu".iter().copied());
                 } else {
                     // Any printable byte except quote and backslash continues the
@@ -233,9 +255,18 @@ impl Automaton {
             Scalar::EnumString {
                 buf,
                 escape,
+                unicode_remaining,
                 members,
             } => {
-                if *escape {
+                if *unicode_remaining > 0 {
+                    // Hex digits owed to the escape, restricted to those that
+                    // keep at least one member reachable.
+                    for byte in permitted_restricted_next(buf, members, true) {
+                        if is_hex_digit(byte) {
+                            out.insert(byte);
+                        }
+                    }
+                } else if *escape {
                     // Within an escape, permit only escape continuations that keep
                     // at least one member reachable.
                     for byte in permitted_restricted_next(buf, members, true) {
@@ -500,15 +531,44 @@ impl Automaton {
 
     fn step_scalar(&self, scalar: &Scalar, byte: u8) -> Result<ScalarStep, StepError> {
         match scalar {
-            Scalar::String { buf, escape } => {
+            Scalar::String {
+                buf,
+                escape,
+                unicode_remaining,
+            } => {
                 let mut buf = buf.clone();
-                if *escape {
+                if *unicode_remaining > 0 {
+                    // A `\u` escape owes exactly four hex digits (RFC 8259).
+                    // Anything else is invalid JSON byte syntax. Surrogate
+                    // ranges are not rejected: a lone high-surrogate escape is
+                    // legal JSON syntax, and this layer validates hex digits
+                    // only, not code-point semantics.
+                    if !is_hex_digit(byte) {
+                        return Err(StepError {
+                            message: "\\u escape must be followed by four hex digits".to_string(),
+                        });
+                    }
+                    buf.push(byte);
+                    Ok(ScalarStep::Consumed(Scalar::String {
+                        buf,
+                        escape: false,
+                        unicode_remaining: unicode_remaining - 1,
+                    }))
+                } else if *escape {
                     Self::validate_escape_byte(byte)?;
                     buf.push(byte);
-                    Ok(ScalarStep::Consumed(Scalar::String { buf, escape: false }))
+                    Ok(ScalarStep::Consumed(Scalar::String {
+                        buf,
+                        escape: false,
+                        unicode_remaining: if byte == b'u' { 4 } else { 0 },
+                    }))
                 } else if byte == b'\\' {
                     buf.push(byte);
-                    Ok(ScalarStep::Consumed(Scalar::String { buf, escape: true }))
+                    Ok(ScalarStep::Consumed(Scalar::String {
+                        buf,
+                        escape: true,
+                        unicode_remaining: 0,
+                    }))
                 } else if byte == b'"' {
                     Ok(ScalarStep::Closed)
                 } else if byte < 0x20 {
@@ -517,16 +577,42 @@ impl Automaton {
                     })
                 } else {
                     buf.push(byte);
-                    Ok(ScalarStep::Consumed(Scalar::String { buf, escape: false }))
+                    Ok(ScalarStep::Consumed(Scalar::String {
+                        buf,
+                        escape: false,
+                        unicode_remaining: 0,
+                    }))
                 }
             }
             Scalar::EnumString {
                 buf,
                 escape,
+                unicode_remaining,
                 members,
             } => {
                 let mut buf = buf.clone();
-                if *escape {
+                if *unicode_remaining > 0 {
+                    // A `\u` escape owes exactly four hex digits (RFC 8259);
+                    // hex validation only (see the general string arm for the
+                    // surrogate note).
+                    if !is_hex_digit(byte) {
+                        return Err(StepError {
+                            message: "\\u escape must be followed by four hex digits".to_string(),
+                        });
+                    }
+                    buf.push(byte);
+                    if !any_member_has_prefix(&buf, members) {
+                        return Err(StepError {
+                            message: "string enum escape leads to no member".to_string(),
+                        });
+                    }
+                    Ok(ScalarStep::Consumed(Scalar::EnumString {
+                        buf,
+                        escape: false,
+                        unicode_remaining: unicode_remaining - 1,
+                        members: members.clone(),
+                    }))
+                } else if *escape {
                     Self::validate_escape_byte(byte)?;
                     buf.push(byte);
                     if !any_member_has_prefix(&buf, members) {
@@ -537,6 +623,7 @@ impl Automaton {
                     Ok(ScalarStep::Consumed(Scalar::EnumString {
                         buf,
                         escape: false,
+                        unicode_remaining: if byte == b'u' { 4 } else { 0 },
                         members: members.clone(),
                     }))
                 } else if byte == b'\\' {
@@ -549,6 +636,7 @@ impl Automaton {
                     Ok(ScalarStep::Consumed(Scalar::EnumString {
                         buf,
                         escape: true,
+                        unicode_remaining: 0,
                         members: members.clone(),
                     }))
                 } else if byte == b'"' {
@@ -569,6 +657,7 @@ impl Automaton {
                     Ok(ScalarStep::Consumed(Scalar::EnumString {
                         buf,
                         escape: false,
+                        unicode_remaining: 0,
                         members: members.clone(),
                     }))
                 }
@@ -670,8 +759,9 @@ impl Automaton {
     }
 
     fn validate_escape_byte(byte: u8) -> Result<(), StepError> {
-        // `u` is accepted here; the four hex digits that follow are ordinary
-        // string content bytes and are validated by the general string path.
+        // `u` is accepted here; the four hex digits that follow are validated
+        // by the `unicode_remaining` counter in the string arms (RFC 8259
+        // requires exactly four).
         if b"\"\\/bfnrtu".contains(&byte) {
             Ok(())
         } else {
@@ -881,12 +971,14 @@ impl Automaton {
                 Scalar::EnumString {
                     buf: Vec::new(),
                     escape: false,
+                    unicode_remaining: 0,
                     members,
                 }
             }
             _ => Scalar::String {
                 buf: Vec::new(),
                 escape: false,
+                unicode_remaining: 0,
             },
         }
     }
@@ -1379,5 +1471,47 @@ mod tests {
     fn string_escapes_are_accepted() {
         accept(r#"{ "type": "string" }"#, r#""a\"b\\c""#);
         accept(r#"{ "type": "string" }"#, r#""line\nbreak""#);
+    }
+
+    #[test]
+    fn unicode_escape_requires_four_hex_digits() {
+        // RFC 8259: `\u` must be followed by exactly four hex digits.
+        // Audit probes: non-hex digits and a short sequence are rejected.
+        reject(r#"{ "type": "string" }"#, r#""a\uZZZZb""#);
+        reject(r#"{ "type": "string" }"#, r#""\u41""#);
+        reject(r#"{ "type": "string" }"#, r#""a\u00ZZ""#);
+        // A quote where a hex digit is owed is rejected too.
+        reject(r#"{ "type": "string" }"#, r#""\u""#);
+    }
+
+    #[test]
+    fn valid_unicode_escapes_are_accepted_including_lone_surrogates() {
+        // Exactly four hex digits is valid JSON escape syntax...
+        accept(r#"{ "type": "string" }"#, r#""a\u0041b""#);
+        accept(r#"{ "type": "string" }"#, r#""\u00e9""#);
+        // ...and a lone high-surrogate escape is legal JSON syntax as well:
+        // the automaton validates hex digits only, never code-point semantics,
+        // so it must not over-reject surrogate ranges.
+        accept(r#"{ "type": "string" }"#, r#""\ud800""#);
+        accept(r#"{ "type": "string" }"#, r#""\uD83D\uDE00""#);
+    }
+
+    #[test]
+    fn masking_permits_only_hex_digits_inside_unicode_escape() {
+        // After `\u`, the permitted set is exactly the hex digits; a wrong
+        // implementation that kept the general string continuations would
+        // permit quotes and letters like `z` and fail here.
+        let automaton = automaton(r#"{ "type": "string" }"#);
+        let state = drain_bytes(&automaton, br#""\u"#).expect("escape start accepted");
+        let permitted = automaton.permitted_bytes(&state);
+        assert!(!permitted.is_empty());
+        for byte in &permitted {
+            assert!(
+                byte.is_ascii_hexdigit(),
+                "only hex digits are permitted inside a \\u escape, got {:?}",
+                *byte as char
+            );
+        }
+        assert_eq!(permitted.len(), 22, "ten digits plus twelve a-f/A-F");
     }
 }

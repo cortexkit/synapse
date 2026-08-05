@@ -14,7 +14,7 @@
 //!   `owned_decode_sampling_unsupported`.
 //! - One-generation residency and progress/continuation framing with sequence
 //!   and session validation ([`protocol`], [`supervisor`]).
-//! - Terminal-control boundary precedence: completion > deadline > cancellation
+//! - Terminal-control boundary precedence: completion > cancellation > deadline
 //!   at a non-terminal boundary ([`boundary`]).
 //! - Crash-budget persistence, quarantine, and the single permitted worker-crash
 //!   redispatch ([`budget`], [`supervisor`]).
@@ -49,7 +49,8 @@ pub use identity::{
     WORKER_PROTOCOL_ID,
 };
 pub use ownership::{
-    OwnershipFaultSite, OwnershipLedger, ResidentStateKind, OWNERSHIP_MANIFEST_REVISION,
+    OwnershipFaultSite, OwnershipLedger, OwnershipViolation, ResidentStateKind,
+    OWNERSHIP_MANIFEST_REVISION,
 };
 pub use protocol::{
     FinalResponse, FinishReason, FrameEnvelope, GenerateCancel, GenerateContinue, GenerateProgress,

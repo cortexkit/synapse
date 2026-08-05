@@ -185,7 +185,7 @@ impl SchemaError {
         }
     }
 
-    fn feature(message: impl Into<String>) -> Self {
+    pub(super) fn feature(message: impl Into<String>) -> Self {
         Self {
             kind: OwnedDecodeError::GrammarFeatureUnsupported,
             message: message.into(),
@@ -313,6 +313,17 @@ impl<'a> SchemaBuilder<'a> {
         object: &serde_json::Map<String, Value>,
         depth: usize,
     ) -> Result<NodeKind, SchemaError> {
+        // Keywords that are only meaningful on other node types must not leak
+        // onto an object node: the subset rejects them rather than silently
+        // ignoring them (a silently dropped `enum` would enforce nothing).
+        for key in ["items", "enum"] {
+            if object.contains_key(key) {
+                return Err(SchemaError::feature(format!(
+                    "keyword '{key}' is not valid on an object node"
+                )));
+            }
+        }
+
         // Objects must explicitly close themselves: additionalProperties must be
         // present and false. Absent or true is rejected.
         match object.get("additionalProperties") {
@@ -378,6 +389,16 @@ impl<'a> SchemaBuilder<'a> {
         object: &serde_json::Map<String, Value>,
         depth: usize,
     ) -> Result<NodeKind, SchemaError> {
+        // Keywords that are only meaningful on other node types must not leak
+        // onto an array node; the subset rejects them rather than ignoring them.
+        for key in ["properties", "required", "additionalProperties", "enum"] {
+            if object.contains_key(key) {
+                return Err(SchemaError::feature(format!(
+                    "keyword '{key}' is not valid on an array node"
+                )));
+            }
+        }
+
         let items_value = object
             .get("items")
             .ok_or_else(|| SchemaError::feature("array schemas must contain one 'items' schema"))?;
@@ -643,6 +664,66 @@ mod tests {
         assert_eq!(
             error.wire_error(),
             OwnedDecodeError::GrammarFeatureUnsupported
+        );
+    }
+
+    #[test]
+    fn rejects_cross_node_keywords_on_object_and_array() {
+        // In-subset keywords that are not meaningful on the node type are
+        // rejected rather than silently dropped (audit probes).
+        let probes = [
+            // `enum` on an object node: previously compiled and enforced
+            // nothing, letting non-member documents through.
+            r#"{
+                "type": "object",
+                "properties": { "a": { "type": "integer" } },
+                "required": ["a"],
+                "additionalProperties": false,
+                "enum": [{"a": 1}]
+            }"#,
+            // `enum` on an array node.
+            r#"{ "type": "array", "items": { "type": "string" }, "enum": [["a"]] }"#,
+            // `items` on an object node.
+            r#"{
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false,
+                "items": { "type": "string" }
+            }"#,
+            // Object keywords on an array node.
+            r#"{
+                "type": "array",
+                "items": { "type": "string" },
+                "properties": {},
+                "required": [],
+                "additionalProperties": false
+            }"#,
+        ];
+        for raw in probes {
+            let error = parse_schema(raw, &limits()).expect_err("cross-node keyword rejected");
+            assert_eq!(
+                error.wire_error(),
+                OwnedDecodeError::GrammarFeatureUnsupported,
+                "raw: {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn object_enum_rejection_prevents_non_member_documents() {
+        // The object-enum shape the subset cannot enforce is rejected at parse
+        // time, so no automaton ever exists that could accept a non-member
+        // document like {"a":2} for enum [{"a":1}].
+        let raw = r#"{
+            "type": "object",
+            "properties": { "a": { "type": "integer" } },
+            "required": ["a"],
+            "additionalProperties": false,
+            "enum": [{"a": 1}]
+        }"#;
+        assert!(
+            parse_schema(raw, &limits()).is_err(),
+            "object enum must be rejected so it cannot fail open"
         );
     }
 

@@ -26,7 +26,7 @@ use crate::protocol::{
     FinalResponse, FinishReason, GenerateCancel, GenerateContinue, GenerateStart, WorkerFrame,
 };
 use crate::validation::{validate_start, WorkerStartContext};
-use crate::worker::{CancelAck, WorkerFactory, WorkerFault};
+use crate::worker::{CancelAck, DecodeWorker, WorkerFactory, WorkerFault};
 
 /// A monotonic clock the supervisor reads at each boundary.
 pub trait Clock {
@@ -199,6 +199,17 @@ impl<S: CrashBudgetStore> Supervisor<S> {
             };
         }
 
+        // Fail-closed persistence: a key whose latest crash-budget record
+        // could not be persisted refuses dispatch (typed unavailable) until a
+        // save succeeds, so a disk failure can never silently reset
+        // quarantine state across restarts.
+        if self.budget.persistence_failed(&request.key) {
+            return GenerationOutcome {
+                result: Err(DecodeError::Unavailable),
+                provenance,
+            };
+        }
+
         // Module-side start validation. Clean typed errors here consume no budget
         // and never redispatch.
         if let Err(error) = validate_start(&request.start, context, self.production_n) {
@@ -221,7 +232,17 @@ impl<S: CrashBudgetStore> Supervisor<S> {
                 provenance.last_completed_quantum_sequence = accounting.last_completed_sequence;
 
                 let now = clock.now();
-                let outcome = self.budget.charge(&request.key, classification, now);
+                let outcome = match self.budget.charge(&request.key, classification, now) {
+                    Ok(outcome) => outcome,
+                    Err(_) => {
+                        // The strike could not be persisted: fail closed. The
+                        // key refuses further dispatch until a save succeeds.
+                        return GenerationOutcome {
+                            result: Err(DecodeError::Unavailable),
+                            provenance,
+                        };
+                    }
+                };
 
                 // Only a worker-crash classification permits exactly one redispatch.
                 let can_redispatch = classification == FailureClassification::Crash
@@ -255,8 +276,19 @@ impl<S: CrashBudgetStore> Supervisor<S> {
                         provenance.last_completed_quantum_sequence =
                             accounting2.last_completed_sequence;
                         let outcome2 =
-                            self.budget
-                                .charge(&request.key, classification2, clock.now());
+                            match self
+                                .budget
+                                .charge(&request.key, classification2, clock.now())
+                            {
+                                Ok(outcome) => outcome,
+                                Err(_) => {
+                                    // Unpersisted strike: fail closed as above.
+                                    return GenerationOutcome {
+                                        result: Err(DecodeError::Unavailable),
+                                        provenance,
+                                    };
+                                }
+                            };
                         let error = if outcome2.exhausted {
                             DecodeError::Quarantined
                         } else {
@@ -305,6 +337,9 @@ impl<S: CrashBudgetStore> Supervisor<S> {
         let generation_id = request.start.generation_id.clone();
         let max_tokens = request.start.max_tokens;
         let mut expected_sequence = 1u32;
+        // Attempt-local cumulative committed tokens; progress frames must
+        // advance this (a non-advancing count is a protocol fault).
+        let mut last_committed = 0u32;
 
         loop {
             let stepped = match worker.step() {
@@ -364,6 +399,18 @@ impl<S: CrashBudgetStore> Supervisor<S> {
                     expected_sequence += 1;
                     accounting.last_completed_sequence = progress.quantum_sequence;
 
+                    // Committed-count strictness: the cumulative count must
+                    // advance. A non-advancing count is a protocol fault, the
+                    // same reading the S5 module-side validator
+                    // (GenerationProtocol::receive_progress) applies.
+                    if progress.committed_token_count <= last_committed {
+                        return AttemptResult::Chargeable(
+                            FailureClassification::ProtocolFatal,
+                            accounting,
+                        );
+                    }
+                    last_committed = progress.committed_token_count;
+
                     let decision = evaluate_boundary(BoundaryInputs {
                         completion: None,
                         cancel_recorded_at: control.cancel_at,
@@ -399,21 +446,24 @@ impl<S: CrashBudgetStore> Supervisor<S> {
                             }
                         }
                         BoundaryDecision::DeadlineExceeded => {
-                            // Deadline cleanup before timeout: cancel and charge none.
-                            let _ = worker.send_cancel(&GenerateCancel {
-                                generation_id: generation_id.clone(),
-                            });
-                            return AttemptResult::Clean(
-                                Err(DecodeError::DeadlineExceeded),
+                            // Deadline cleanup before timeout: cancel and charge
+                            // none — unless the worker fails to acknowledge.
+                            return cancel_at_boundary(
+                                &mut worker,
+                                &generation_id,
+                                DecodeError::DeadlineExceeded,
                                 accounting,
                             );
                         }
                         BoundaryDecision::Cancelled => {
-                            // Acknowledged cancellation charges none.
-                            let _ = worker.send_cancel(&GenerateCancel {
-                                generation_id: generation_id.clone(),
-                            });
-                            return AttemptResult::Clean(Err(DecodeError::Cancelled), accounting);
+                            // Acknowledged cancellation charges none; an
+                            // unacknowledged one escalates and charges.
+                            return cancel_at_boundary(
+                                &mut worker,
+                                &generation_id,
+                                DecodeError::Cancelled,
+                                accounting,
+                            );
                         }
                         BoundaryDecision::AcceptCompletion(_) => {
                             // A progress frame cannot be a terminal completion.
@@ -457,19 +507,20 @@ impl<S: CrashBudgetStore> Supervisor<S> {
                             );
                         }
                         BoundaryDecision::DeadlineExceeded => {
-                            let _ = worker.send_cancel(&GenerateCancel {
-                                generation_id: generation_id.clone(),
-                            });
-                            return AttemptResult::Clean(
-                                Err(DecodeError::DeadlineExceeded),
+                            return cancel_at_boundary(
+                                &mut worker,
+                                &generation_id,
+                                DecodeError::DeadlineExceeded,
                                 accounting,
                             );
                         }
                         BoundaryDecision::Cancelled => {
-                            let _ = worker.send_cancel(&GenerateCancel {
-                                generation_id: generation_id.clone(),
-                            });
-                            return AttemptResult::Clean(Err(DecodeError::Cancelled), accounting);
+                            return cancel_at_boundary(
+                                &mut worker,
+                                &generation_id,
+                                DecodeError::Cancelled,
+                                accounting,
+                            );
                         }
                         BoundaryDecision::AcceptProgress => {
                             // A final response is always a terminal boundary.
@@ -481,6 +532,31 @@ impl<S: CrashBudgetStore> Supervisor<S> {
                     }
                 }
             }
+        }
+    }
+}
+
+/// Cancel the worker at a boundary and interpret the acknowledgment.
+///
+/// An acknowledged cancellation is clean: the boundary's own error is returned
+/// and nothing is charged. A cancellation the worker fails to acknowledge is a
+/// worker fault (error_contract, resolution r2 #8): it escalates to a worker
+/// kill and charges one crash-budget strike under `FailedCancellation`.
+fn cancel_at_boundary(
+    worker: &mut Box<dyn DecodeWorker>,
+    generation_id: &str,
+    boundary_error: DecodeError,
+    accounting: AttemptAccounting,
+) -> AttemptResult {
+    match worker.send_cancel(&GenerateCancel {
+        generation_id: generation_id.to_string(),
+    }) {
+        Ok(_ack) => AttemptResult::Clean(Err(boundary_error), accounting),
+        Err(_) => {
+            // Unacknowledged cancellation: kill the worker. Resident state is
+            // destroyed with the process; the fault is charged by the caller.
+            worker.kill();
+            AttemptResult::Chargeable(FailureClassification::FailedCancellation, accounting)
         }
     }
 }
@@ -540,7 +616,7 @@ pub const fn acknowledged_committed_count(ack: CancelAck) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::budget::{BudgetPolicy, InMemoryBudgetStore};
+    use crate::budget::{BudgetPolicy, BudgetRecord, BudgetStoreError, InMemoryBudgetStore};
     use crate::protocol::Sampling;
     use crate::worker::ScriptedEvent;
     use crate::worker::ScriptedWorkerFactory;
@@ -696,8 +772,12 @@ mod tests {
         let mut sup = supervisor();
         // Exhaust and quarantine the key directly.
         let key = request().key.clone();
-        sup.budget.charge(&key, FailureClassification::Crash, 0);
-        sup.budget.charge(&key, FailureClassification::Crash, 0);
+        sup.budget
+            .charge(&key, FailureClassification::Crash, 0)
+            .expect("in-memory save succeeds");
+        sup.budget
+            .charge(&key, FailureClassification::Crash, 0)
+            .expect("in-memory save succeeds");
         let mut factory = ScriptedWorkerFactory::new(vec![], context());
         let clock = ManualClock::new(0);
         let outcome = sup.run_generation(
@@ -710,5 +790,157 @@ mod tests {
         assert_eq!(outcome.result, Err(DecodeError::Quarantined));
         // Nothing was dispatched and nothing further was charged.
         assert_eq!(factory.spawn_count(), 0);
+    }
+
+    #[test]
+    fn failed_cancellation_at_deadline_boundary_charges_and_kills() {
+        // The deadline expires at the boundary; the supervisor cancels during
+        // cleanup, but the worker never acknowledges. The fault escalates to a
+        // kill and charges one FailedCancellation strike.
+        let mut sup = supervisor();
+        let mut factory = ScriptedWorkerFactory::new(
+            vec![vec![
+                ScriptedEvent::Progress { committed: 16 },
+                ScriptedEvent::CancelFailure,
+            ]],
+            context(),
+        );
+        let clock = ManualClock::new(100);
+        let control = TerminalControl {
+            deadline_at: Some(50), // expired before the boundary at 100
+            cancel_at: None,
+        };
+        let outcome = sup.run_generation(&request(), &mut factory, &context(), &control, &clock);
+        // Failed cancellation is terminal (no redispatch) and surfaces per the
+        // error contract: budget not exhausted -> owned_decode_unavailable.
+        assert_eq!(outcome.result, Err(DecodeError::Unavailable));
+        assert_eq!(
+            outcome.provenance.failure_classifications,
+            vec![FailureClassification::FailedCancellation]
+        );
+        assert_eq!(outcome.provenance.crash_retry_count, 0);
+        // The worker was killed and exactly one strike charged.
+        assert_eq!(factory.log().kills, 1);
+        assert_eq!(sup.budget().remaining(&request().key), 1);
+        assert_eq!(factory.spawn_count(), 1);
+    }
+
+    #[test]
+    fn failed_cancellation_at_cancel_boundary_charges_and_kills() {
+        // Cancellation was recorded before the boundary; the worker fails to
+        // acknowledge the supervisor's cancel. Same escalation and charge as
+        // the deadline variant, even though an acknowledged cancellation would
+        // have charged nothing.
+        let mut sup = supervisor();
+        let mut factory = ScriptedWorkerFactory::new(
+            vec![vec![
+                ScriptedEvent::Progress { committed: 16 },
+                ScriptedEvent::CancelFailure,
+            ]],
+            context(),
+        );
+        let clock = ManualClock::new(100);
+        let control = TerminalControl {
+            deadline_at: Some(500), // not expired
+            cancel_at: Some(50),    // recorded before the boundary
+        };
+        let outcome = sup.run_generation(&request(), &mut factory, &context(), &control, &clock);
+        assert_eq!(outcome.result, Err(DecodeError::Unavailable));
+        assert_eq!(
+            outcome.provenance.failure_classifications,
+            vec![FailureClassification::FailedCancellation]
+        );
+        assert_eq!(factory.log().kills, 1);
+        assert_eq!(sup.budget().remaining(&request().key), 1);
+    }
+
+    #[test]
+    fn failed_cancellation_exhausting_budget_quarantines() {
+        let mut sup = Supervisor::new(
+            CrashBudget::new(InMemoryBudgetStore::default(), BudgetPolicy::new(1, 60_000)),
+            16,
+        );
+        let mut factory = ScriptedWorkerFactory::new(
+            vec![vec![
+                ScriptedEvent::Progress { committed: 16 },
+                ScriptedEvent::CancelFailure,
+            ]],
+            context(),
+        );
+        let clock = ManualClock::new(100);
+        let control = TerminalControl {
+            deadline_at: Some(50),
+            cancel_at: None,
+        };
+        let outcome = sup.run_generation(&request(), &mut factory, &context(), &control, &clock);
+        // The single strike exhausts the budget: quarantined.
+        assert_eq!(outcome.result, Err(DecodeError::Quarantined));
+        assert!(sup.budget().is_quarantined(&request().key, 100));
+        assert_eq!(factory.log().kills, 1);
+    }
+
+    /// A store whose save fails while `fail` is set.
+    #[derive(Default)]
+    struct FailingStore {
+        records: std::collections::BTreeMap<String, BudgetRecord>,
+        fail: bool,
+    }
+
+    impl crate::budget::CrashBudgetStore for FailingStore {
+        fn load(&self, key: &QuarantineKey) -> Option<BudgetRecord> {
+            self.records.get(&key.storage_id()).cloned()
+        }
+
+        fn save(
+            &mut self,
+            key: &QuarantineKey,
+            record: &BudgetRecord,
+        ) -> Result<(), BudgetStoreError> {
+            // Models FileBudgetStore: the in-memory record updates first;
+            // the flush to disk is what fails.
+            self.records.insert(key.storage_id(), record.clone());
+            if self.fail {
+                return Err(BudgetStoreError {
+                    message: "disk failure".to_string(),
+                });
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn budget_persistence_failure_fails_closed() {
+        // A crash whose strike cannot be persisted surfaces the typed
+        // unavailable error, and the key refuses further dispatch until a
+        // save succeeds.
+        let store = FailingStore {
+            records: std::collections::BTreeMap::new(),
+            fail: true,
+        };
+        let mut sup = Supervisor::new(CrashBudget::new(store, BudgetPolicy::default()), 16);
+        let mut factory = ScriptedWorkerFactory::new(vec![vec![ScriptedEvent::Crash]], context());
+        let clock = ManualClock::new(0);
+        let outcome = sup.run_generation(
+            &request(),
+            &mut factory,
+            &context(),
+            &TerminalControl::default(),
+            &clock,
+        );
+        assert_eq!(outcome.result, Err(DecodeError::Unavailable));
+        assert_eq!(factory.spawn_count(), 1);
+
+        // Next generation for the same key: refused pre-dispatch, no spawn,
+        // no charge.
+        let mut factory2 = ScriptedWorkerFactory::new(vec![vec![ScriptedEvent::Crash]], context());
+        let outcome2 = sup.run_generation(
+            &request(),
+            &mut factory2,
+            &context(),
+            &TerminalControl::default(),
+            &clock,
+        );
+        assert_eq!(outcome2.result, Err(DecodeError::Unavailable));
+        assert_eq!(factory2.spawn_count(), 0, "refused before dispatch");
     }
 }
