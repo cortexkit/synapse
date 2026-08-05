@@ -32,7 +32,7 @@ MC); on any disagreement, the e2e tests win and this doc gets fixed.
 Every error: {code, class: transient|permanent, retry_after_ms?,
 safe_to_retry_same_request}. Codes: queue_full, deadline_exceeded,
 model_loading, not_certified, substitution_rejected, artifact_invalid,
-engine_crashed, probe_required, migration_required, module_restarted.
+engine_crashed, probe_required, migration_required, module_restarted, grammar_disabled.
 Transient carries retry_after_ms. Never poll-hammer a permanent code.
 
 ## Common request fields (acceptance constraints)
@@ -67,10 +67,12 @@ certified-equivalent profile, else substitution_rejected/not_certified).
 - **microllm.oneshot** {model, prompt, max_tokens, grammar?, …} — greedy.
   `max_tokens` is capped by module config `microllm_max_tokens` (default 512);
   requests above the ceiling are rejected with both numbers in the error.
-  `grammar` (GBNF): unset or empty = free-text. When set, constrained decoding
-  runs only if module config `grammar_enabled` is true (default false); otherwise
-  typed `invalid_request` naming the gate. If the llama worker build lacks GBNF
-  support, grammar requests fail with reason `grammar_unavailable_in_build`.
+  `grammar` (GBNF): unset or empty = free-text. When set, constrained
+  decoding is permitted only if module config `grammar_enabled` is true (default
+  false); otherwise grammar requests fail closed with typed `grammar_disabled`.
+  When the constrained runtime is unavailable or not certified, grammar requests
+  fail closed with the same reason; the retired `grammar_unavailable_in_build` code
+  is not emitted.
 - **models.list** — catalog + per-model state, fingerprints, alias rows,
   recommended_batch (ADVISORY batch sizing per model; admission remains the
   enforcement — consumers should not carry their own batch knobs). When present,
@@ -288,3 +290,18 @@ Credential mapping is exact: vault `not_found` or malformed data maps to
 maps to transient `provider_unavailable`; `vault_locked` or `needs_reauth`
 enters the pause path for jobs and returns inline `needs_reauth` for inline
 operations.
+
+## Changelog
+
+### Grammar refusal retirement
+
+`grammar_unavailable_in_build` is retired in favor of `grammar_disabled`. For a
+constrained `microllm.oneshot` request on a platform or machine without a
+certified owned-decode lane, the stable `grammar_disabled` refusal is returned;
+when applicable, the original owned-decode refusal remains available as additive
+`underlying_owned_decode_refusal_id` provenance. Constrained requests remain
+owned-only: they never fall back to llama GBNF or retry unconstrained.
+
+**Consumer notice:** consumers matching the legacy
+`grammar_unavailable_in_build` string (ALF sidekicks and the persona plane) must
+switch to `grammar_disabled` before deploy; the legacy code is no longer emitted.
