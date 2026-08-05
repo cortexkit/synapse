@@ -15,6 +15,16 @@
 //! engine's `verify` path feeds prompt tokens one-by-one through the same
 //! device-resident forward pass, producing the same KV cache state and the
 //! same greedy argmax after the final prompt token.
+//!
+//! Prefill is quantum-bounded by chunking it at the scheduler layer: each
+//! `verify_tokens` / `verify_tokens_batch` call processes one prompt span and
+//! ends its command buffer at the span boundary, so the scheduler can release
+//! the decode permit between spans (yield-on-contention). `verify_tokens_batch`
+//! runs a span of up to 16 tokens through the mat-mat batched kernels with the
+//! weights streamed once per layer; its per-position logits are bit-identical
+//! to sequential single-token steps (campaign exactness law, re-gated in
+//! `tests/owned_decode_prefill_chunking.rs`), so batched prefill chunks
+//! preserve the prefill arithmetic identity.
 
 #![cfg(target_os = "macos")]
 
@@ -306,11 +316,17 @@ impl<'a> MetalStepDecoder<'a> {
         (cosine, sine)
     }
 
+    /// Maximum tokens in one batched verification span. The mat-mat kernels
+    /// are templated on column counts up to 16 (`METAL_STEP_MAX_BATCH_K`).
+    pub const MAX_BATCH_VERIFY_TOKENS: usize = 16;
+
     /// Verifies a proposed token span on device, returning the greedy argmax
     /// after each token. This is the device-resident causal prefill path: prompt
     /// tokens are fed one-by-one through the same forward pass, advancing the KV
     /// cache to the prompt length and producing the first generated token's
-    /// argmax after the final prompt token.
+    /// argmax after the final prompt token. One call is one command buffer
+    /// ending at the span boundary, so callers can chunk a long prompt into
+    /// several calls and yield between them.
     pub(crate) fn verify_tokens(
         &mut self,
         cache: &mut MetalStepKvCache,
@@ -347,6 +363,96 @@ impl<'a> MetalStepDecoder<'a> {
         if status != 0 {
             bail!(
                 "Qwen3 Metal step verification failed with status {status}: {}",
+                last_error()
+            );
+        }
+        cache.position += tokens.len();
+        Ok(argmaxes)
+    }
+
+    /// Verifies a span of at most 16 tokens in ONE batched forward pass: all
+    /// positions run through the transformer as a batch (mat-mat with K
+    /// columns) so each layer's weights stream once instead of once per token.
+    /// Returns the greedy argmax after each supplied token, aligned exactly as
+    /// `verify_tokens`. By construction the per-position logits are
+    /// bit-identical to sequential single-token steps at the same positions:
+    /// batching parallelizes across positions and never reorders the
+    /// accumulation within one dot product (campaign exactness law; gated by
+    /// `tests/owned_decode_prefill_chunking.rs`). This is the fast prefill
+    /// chunk primitive: one bounded command buffer per span.
+    pub fn verify_tokens_batch(
+        &mut self,
+        cache: &mut MetalStepKvCache,
+        tokens: &[u32],
+    ) -> Result<Vec<u32>> {
+        self.verify_tokens_batch_inner(cache, tokens, None)
+    }
+
+    /// Batched verification that also reads back the full per-position f32
+    /// logits, flattened as `tokens.len()` contiguous `vocab_size` rows (row
+    /// `i` is the logits after position `cache.position + i`). This is the
+    /// byte-exact gate surface: row `i` must equal the logits from a
+    /// sequential `advance` at that position.
+    pub fn verify_tokens_batch_logits(
+        &mut self,
+        cache: &mut MetalStepKvCache,
+        tokens: &[u32],
+    ) -> Result<Vec<f32>> {
+        let mut logits = vec![0.0f32; tokens.len() * self.model.config.vocab_size];
+        self.verify_tokens_batch_inner(cache, tokens, Some(&mut logits))?;
+        Ok(logits)
+    }
+
+    fn verify_tokens_batch_inner(
+        &mut self,
+        cache: &mut MetalStepKvCache,
+        tokens: &[u32],
+        logits_out: Option<&mut [f32]>,
+    ) -> Result<Vec<u32>> {
+        ensure!(
+            !tokens.is_empty(),
+            "batched verification requires at least one token"
+        );
+        ensure!(
+            tokens.len() <= Self::MAX_BATCH_VERIFY_TOKENS,
+            "batched verification supports at most {} tokens, got {}",
+            Self::MAX_BATCH_VERIFY_TOKENS,
+            tokens.len()
+        );
+        ensure!(
+            cache.position + tokens.len() <= self.bucket,
+            "batched verification exceeds cache capacity"
+        );
+        ensure!(
+            tokens
+                .iter()
+                .all(|&token| (token as usize) < self.model.config.vocab_size),
+            "batched verification received a token outside the Qwen3 vocabulary"
+        );
+        if let Some(logits) = &logits_out {
+            ensure!(
+                logits.len() == tokens.len() * self.model.config.vocab_size,
+                "batched verification logits output has the wrong length"
+            );
+        }
+        let (rope_cos, rope_sin) = self.rope_chain(cache.position, tokens.len());
+        let mut argmaxes = vec![0u32; tokens.len()];
+        let status = unsafe {
+            synapse_qwen3_metal_step_verify_batch(
+                self.raw.as_ptr(),
+                cache.position as u64,
+                tokens.as_ptr(),
+                tokens.len() as u32,
+                rope_cos.as_ptr(),
+                rope_sin.as_ptr(),
+                argmaxes.as_mut_ptr(),
+                logits_out.map_or(std::ptr::null_mut(), |logits| logits.as_mut_ptr()),
+                self.model.config.rms_norm_eps,
+            )
+        };
+        if status != 0 {
+            bail!(
+                "Qwen3 Metal step batched verification failed with status {status}: {}",
                 last_error()
             );
         }
@@ -615,6 +721,17 @@ unsafe extern "C" {
         rope_cos: *const u16,
         rope_sin: *const u16,
         argmaxes_out: *mut u32,
+        epsilon: f32,
+    ) -> i32;
+    fn synapse_qwen3_metal_step_verify_batch(
+        context: *mut c_void,
+        position: u64,
+        token_ids: *const u32,
+        steps: u32,
+        rope_cos: *const u16,
+        rope_sin: *const u16,
+        argmaxes_out: *mut u32,
+        logits_out: *mut f32,
         epsilon: f32,
     ) -> i32;
     fn synapse_qwen3_metal_step_chain(

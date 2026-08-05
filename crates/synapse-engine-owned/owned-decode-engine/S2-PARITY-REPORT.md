@@ -39,3 +39,25 @@ The LFM2 metallib includes a reused IEEE-strict copy of the Qwen3 step kernels f
 ## M5 advisory fork signature (LFM2 f16)
 
 The M5 build host forks at completion-15/step17: engine emits 523 where the CPU oracle emits 518 (CPU top-2 gap 0.000362). This is the documented M5 canary fork (LFM2-METAL-STEP.md). The M1 authority's fork signature is pinned at completion-05/step8 (different near-tie, different machine). This M5 run is advisory; M1 constants are not re-pinned.
+
+## Addendum: batched-verify Rust exposure for quantum-bounded prefill
+
+The S2 port shipped the `.metal` and `.m` files byte-identical to the spike,
+including the mat-mat batched-verify kernels and the
+`synapse_qwen3_metal_step_verify_batch` entry point; the Rust path initially
+exposed only the per-token verify. The prefill quantum-bounding work added
+the missing Rust exposure — `MetalStepDecoder::verify_tokens_batch` (argmax
+readback) and `verify_tokens_batch_logits` (full-logits gate surface) plus
+the FFI declaration — without touching the byte-identical kernel surface.
+This is additive: the default `prefill`/`verify_tokens` routing and every
+pinned fixture battery are unchanged (re-verified: four-lane parity battery
+20/20 on both Qwen3 lanes, certified near-tie fork on LFM2 f16).
+
+The batched path's arithmetic identity is re-gated in production by
+`tests/owned_decode_prefill_chunking.rs` (port of the spike campaign's
+byte-identical/determinism/forced-rejection battery: f16 and Q8_0, K in
+{1,2,4,8,16}, prompt depths {1,5,33,128,469}), plus the chunked-prefill
+bit-exactness gate (per-token spans 8/16/32 and batched spans 16 must leave
+the KV cache byte-identical and the first-token argmax unchanged versus the
+uninterrupted single-command-buffer prefill). The serving prefill uses the
+batched spans by default on the strength of that fixture evidence.

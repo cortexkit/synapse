@@ -1492,30 +1492,22 @@ mod tests {
             "zero applicable skips"
         );
 
-        // G-DEC-01..10 pass with the synthetic evidence; G-DEC-11 and the
-        // scheduler-dependent portion of G-DEC-12 stay blocked: the
-        // OQ-DEC-SCHED-01 measurement recorded its facts but no candidate
-        // met the committed embed.query p95 SLO, so no numeric N is
-        // committed yet.
-        for gate in &ALL_GATES[..10] {
+        // G-DEC-01..10 pass with the synthetic evidence; G-DEC-11 and
+        // G-DEC-12 pass from the checked-in scheduler manifest: the
+        // OQ-DEC-SCHED-01 protocol v2 measurement committed N=16 (largest
+        // candidate meeting the embed.query p95 SLO), so the release gate
+        // set is fully green with zero skips.
+        for gate in &ALL_GATES {
             let status = &evidence.gate_statuses[gate];
             assert!(
                 matches!(status, GateStatus::Passed { .. }),
                 "{gate:?} must pass, got {status:?}"
             );
         }
-        assert!(matches!(
-            evidence.gate_statuses[&GateId::GDec11],
-            GateStatus::Blocked { .. }
-        ));
-        assert!(matches!(
-            evidence.gate_statuses[&GateId::GDec12],
-            GateStatus::Blocked { .. }
-        ));
 
-        // Release is not ready and cutover stays disabled while blocked.
-        assert!(!release_ready(&evidence));
-        assert!(!scheduler_evidence_committed(&evidence.scheduler_status));
+        // Release is ready and the scheduler evidence is committed.
+        assert!(release_ready(&evidence));
+        assert!(scheduler_evidence_committed(&evidence.scheduler_status));
 
         // Evidence records the registry revision, executed parity fixtures for
         // both families and both formats, and certification evidence IDs.
@@ -1678,19 +1670,23 @@ mod tests {
         let throughput = four_lane_throughput();
         let grammar_cost = passing_grammar_cost();
         let mut evidence = runner.run_all(&oracle, &mut probe, &throughput, Some(&grammar_cost));
-        assert!(!release_ready(&evidence));
+        // The checked-in scheduler manifest is committed (protocol v2), so
+        // the full synthetic evidence set is shippable as-is.
+        assert!(release_ready(&evidence));
 
-        // With the two blocked gates satisfied, the evidence set is shippable.
+        // Demoting any single gate defeats release: the predicate requires
+        // EVERY gate to pass, never a subset.
+        evidence.gate_statuses.insert(
+            GateId::GDec11,
+            GateStatus::Blocked {
+                reason: "numeric scheduler commitment outstanding".to_string(),
+            },
+        );
+        assert!(!release_ready(&evidence));
         evidence.gate_statuses.insert(
             GateId::GDec11,
             GateStatus::Passed {
                 evidence: vec!["committed".to_string()],
-            },
-        );
-        evidence.gate_statuses.insert(
-            GateId::GDec12,
-            GateStatus::Passed {
-                evidence: vec!["ci lane verified".to_string()],
             },
         );
         assert!(release_ready(&evidence));

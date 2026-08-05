@@ -328,9 +328,19 @@ pub struct SchedulerEvidenceRecord {
     #[serde(default)]
     pub protocol_id: Option<String>,
     /// Boundary-crossing bit-exactness spot check lines: chunked N streams
-    /// versus the uninterrupted greedy stream.
+    /// versus the uninterrupted greedy stream, and (from protocol v2)
+    /// chunked-prefill KV/first-token comparisons versus the uninterrupted
+    /// prefill.
     #[serde(default)]
     pub parity_spot_check: Vec<String>,
+    /// Prior evidence records for this workload, oldest first. A protocol
+    /// re-run appends the record it replaces instead of overwriting it, so an
+    /// honest negative is never lost: the v1 record (protocol
+    /// oq-dec-sched-01-mixed-load-v1, no candidate met the SLO) stays in the
+    /// tree behind the current record. Empty for records that have never
+    /// been superseded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history: Vec<SchedulerEvidenceRecord>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1409,6 +1419,33 @@ mod tests {
                 .is_some_and(|id| !id.is_empty()),
             "measurement protocol id must be recorded"
         );
+
+        // Evidence history preserves superseded records instead of
+        // overwriting them: every history entry carries a protocol id
+        // distinct from the current record's, and the checked-in v1 honest
+        // negative (no candidate met the SLO, committed_n null) must still
+        // be present behind the current record.
+        let current_protocol = evidence.protocol_id.clone().unwrap_or_default();
+        for entry in &evidence.history {
+            let entry_protocol = entry.protocol_id.clone().unwrap_or_default();
+            assert!(
+                !entry_protocol.is_empty() && entry_protocol != current_protocol,
+                "history entries must carry their own protocol id, got {entry_protocol:?}"
+            );
+            assert!(
+                !entry.candidates.is_empty(),
+                "history entries must keep their per-candidate table"
+            );
+        }
+        if let Some(committed) = evidence.committed_n {
+            assert!(
+                evidence
+                    .history
+                    .iter()
+                    .any(|entry| entry.committed_n.is_none() && !entry.candidates.is_empty()),
+                "the superseded honest negative (committed_n null) must remain in the evidence history behind committed N={committed}"
+            );
+        }
 
         // Executed-evidence fields: maximum uninterruptible GPU time,
         // sequence traces, permit events, queue depth, per-operation

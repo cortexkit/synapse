@@ -19,7 +19,7 @@
         "grammar_enabled": false
       },
       "enabled": false,
-      "disabled_reason": "Production cutover stays disabled until decode-sched-manifest-v1 carries committed numeric evidence (OQ-DEC-SCHED-01) and every applicable G-DEC-01..G-DEC-12 gate passes. G-DEC-11 and the scheduler-dependent portion of G-DEC-12 are currently blocked, so no D-009 enablement record may be published."
+      "disabled_reason": "Production cutover stays disabled pending the D-009 enablement slice: the owned-decode engine is not yet wired into the production serving path. The OQ-DEC-SCHED-01 scheduler measurement is committed (decode-sched-manifest-v1 evidence, protocol oq-dec-sched-01-mixed-load-v2, N=16), and every applicable G-DEC-01..G-DEC-12 gate passes with it; no D-009 enablement record may be published until the enablement slice executes the acceptance gates."
     },
     {
       "record": {
@@ -38,7 +38,7 @@
         "grammar_enabled": false
       },
       "enabled": false,
-      "disabled_reason": "Production cutover stays disabled until decode-sched-manifest-v1 carries committed numeric evidence (OQ-DEC-SCHED-01) and every applicable G-DEC-01..G-DEC-12 gate passes. G-DEC-11 and the scheduler-dependent portion of G-DEC-12 are currently blocked, so no D-009 enablement record may be published."
+      "disabled_reason": "Production cutover stays disabled pending the D-009 enablement slice: the owned-decode engine is not yet wired into the production serving path. The OQ-DEC-SCHED-01 scheduler measurement is committed (decode-sched-manifest-v1 evidence, protocol oq-dec-sched-01-mixed-load-v2, N=16), and every applicable G-DEC-01..G-DEC-12 gate passes with it; no D-009 enablement record may be published until the enablement slice executes the acceptance gates."
     }
   ]
 }

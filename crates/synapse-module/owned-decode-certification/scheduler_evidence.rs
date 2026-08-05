@@ -182,28 +182,27 @@ mod tests {
     }
 
     #[test]
-    fn checked_in_manifest_is_blocked_until_measurement_commits() {
-        // The checked-in manifest carries the complete OQ-DEC-SCHED-01
-        // factual record (per-candidate table, SLO, loadavg records,
-        // machine profile, date, protocol id), but no candidate met the
-        // committed embed.query p95 SLO on the M5 validation machine, so
-        // committed_n stays null pending review: ingestion must report
-        // blocked and cutover must stay disabled.
+    fn checked_in_manifest_is_committed_with_the_executed_measurement() {
+        // The checked-in manifest carries the OQ-DEC-SCHED-01 protocol v2
+        // committed record: quantum-bounded chunked prefill brought the
+        // largest SLO-meeting candidate to N=16 (embed.query p95 102.86 ms
+        // <= 150 ms SLO on the M5 validation machine), so committed_n=16
+        // matches the runtime N and ingestion reports committed. The v1
+        // record — the honest negative where no candidate met the SLO — is
+        // preserved in the evidence history, not overwritten. (This test
+        // previously asserted the blocked pre-commit state; it tracks the
+        // checked-in manifest's status, which the v2 measurement flipped.)
         let manifest_dir =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("owned-decode-manifests");
         let manifests = crate::owned_decode_contracts::load_manifest_dir(&manifest_dir)
             .expect("checked-in manifests load");
         let status = ingest_scheduler_evidence(&manifests.scheduler);
-        let SchedulerEvidenceStatus::Blocked { reasons } = &status else {
-            panic!("checked-in scheduler evidence must be blocked, got {status:?}")
-        };
-        assert!(
-            reasons
-                .iter()
-                .any(|reason| reason.contains("committed_n is not committed")),
-            "reasons should name the missing commitment: {reasons:?}"
+        assert_eq!(
+            status,
+            SchedulerEvidenceStatus::Committed { production_n: 16 },
+            "checked-in scheduler evidence must be committed at N=16"
         );
-        assert!(!scheduler_evidence_committed(&status));
+        assert!(scheduler_evidence_committed(&status));
     }
 
     #[test]
