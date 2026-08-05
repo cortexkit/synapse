@@ -13,7 +13,9 @@
 //! - `SYNAPSE_OWNED_DECODE_LFM2_1_2B`: LFM2-1.2B snapshot directory
 //! - `SYNAPSE_OWNED_DECODE_SPIKE_REFERENCES`: spike reference fixture directory
 //!   (defaults to `bench/spikes/unified-rt/fixtures`)
-//! - `SYNAPSE_OWNED_DECODE_SPIKE_QWEN3_REFERENCES`: spike Qwen3 CLI output dir
+//! - `SYNAPSE_OWNED_DECODE_SPIKE_QWEN3_REFERENCES`: optional override for the
+//!   directory holding the pinned Qwen3 spike fixtures (defaults to the spike
+//!   fixtures directory; the engine parity test pins the fixture sha256)
 //!
 //! Run with:
 //! ```text
@@ -34,8 +36,8 @@ use synapse_core::Fingerprint;
 use tokenizers::Tokenizer;
 
 use synapse_engine_owned::owned_decode_engine::{
-    top_logits, DecodeKernel, Lfm2DecodeModel, Lfm2HybridStepEngine, MetalStepDecoder,
-    MetalStepKvCache, Qwen3DecodeModel, WeightQuantization,
+    DecodeKernel, Lfm2DecodeModel, Lfm2HybridStepEngine, MetalStepDecoder, MetalStepKvCache,
+    Qwen3DecodeModel, WeightQuantization,
 };
 use synapse_engine_owned::Precision;
 
@@ -108,11 +110,13 @@ fn load_reference_fixture(name: &str) -> HashMap<String, Vec<u32>> {
         .collect()
 }
 
-/// Load a spike Qwen3 CLI output JSON keyed by prompt ID.
+/// Load a pinned spike Qwen3 reference JSON keyed by prompt ID. The fixtures
+/// live in the spike fixtures directory; the engine parity test pins their
+/// sha256 so the reference cannot drift silently.
 fn load_spike_qwen3_output(name: &str) -> HashMap<String, Vec<u32>> {
     let dir = std::env::var_os("SYNAPSE_OWNED_DECODE_SPIKE_QWEN3_REFERENCES")
         .map(PathBuf::from)
-        .expect("set SYNAPSE_OWNED_DECODE_SPIKE_QWEN3_REFERENCES to the spike CLI output dir");
+        .unwrap_or_else(spike_fixtures_dir);
     let path = dir.join(name);
     let raw = std::fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("read {name} at {}: {error}", path.display()));
@@ -257,8 +261,7 @@ fn qwen3_greedy_decode(
 
     let (first, mut cache) = if weight_quant.is_quantized() {
         let f16 = f16_decoder.as_mut().expect("f16 decoder for Q8 prefill");
-        let (f16_cache, logits) = f16.prefill(&prompt_ids).expect("f16 prefill");
-        let first = top_logits(&logits, 1)[0].token_id;
+        let (f16_cache, first) = f16.prefill(&prompt_ids).expect("f16 prefill");
         let one_layer_elements = 2 * model.config.num_key_value_heads * 512 * model.config.head_dim;
         let mut cache_bits = Vec::with_capacity(model.layers.len() * one_layer_elements);
         for layer in 0..model.layers.len() {
@@ -274,8 +277,8 @@ fn qwen3_greedy_decode(
             },
         )
     } else {
-        let (cache, logits) = step_decoder.prefill(&prompt_ids).expect("f16 prefill");
-        (top_logits(&logits, 1)[0].token_id, cache)
+        let (cache, first) = step_decoder.prefill(&prompt_ids).expect("f16 prefill");
+        (first, cache)
     };
 
     let mut generated = Vec::with_capacity(max_tokens);

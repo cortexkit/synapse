@@ -2,7 +2,8 @@
 //!
 //! These tests verify the acceptance criteria that are checkable without a
 //! Metal GPU or model checkpoint:
-//! - No production path under `owned-decode-engine/` references `bench/spikes/`.
+//! - No production source under `owned-decode-engine/` (Rust, Objective-C,
+//!   Metal) or the crate `build.rs` references `bench/spikes/`.
 //! - Q8 execution consumes only the complete ingest-published tensor inventory
 //!   (the Q8_0Tensor quantizer is deterministic and reproducible).
 //! - The four decode lanes (Qwen3 f16, Qwen3 Q8_0, LFM2 f16, LFM2 Q8_0) are
@@ -22,19 +23,23 @@ use synapse_engine_owned::owned_decode_engine::{
 /// No source file under the production owned-decode-engine module may reference
 /// the spike tree (`bench/spikes/`). The spike tree is read-only reference
 /// material; production code must be self-contained. This is the acceptance
-/// criterion: "no production path loads `bench/spikes/`."
+/// criterion: "no production path loads `bench/spikes/`. The scan covers every
+/// source kind the metallib build consumes — Rust (`.rs`), Objective-C (`.m`),
+/// and Metal (`.metal`) — plus the crate `build.rs` that drives that build.
 #[test]
 fn no_production_path_references_bench_spikes() {
-    let module_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("owned-decode-engine/src");
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let module_root = manifest_dir.join("owned-decode-engine/src");
     let mut violations = Vec::new();
-    visit_rust_files(&module_root, &mut |path, content| {
+    let mut scan = |path: &Path, content: &str| {
         // Check for any reference to the spike tree in source code.
         // Comments explaining the port provenance ("Ported from
         // bench/spikes/...") are allowed; actual code dependencies are not.
         for (line_number, line) in content.lines().enumerate() {
             let trimmed = line.trim_start();
-            // Skip comments that document provenance.
-            if trimmed.starts_with("//") || trimmed.starts_with("//!") {
+            // Skip comments that document provenance. Rust, Objective-C, and
+            // Metal all use `//` line comments.
+            if trimmed.starts_with("//") {
                 continue;
             }
             if line.contains("bench/spikes/") {
@@ -46,7 +51,14 @@ fn no_production_path_references_bench_spikes() {
                 ));
             }
         }
-    });
+    };
+    visit_source_files(&module_root, &mut scan);
+    // The crate build script compiles the Metal kernels and is part of the
+    // production surface even though it lives outside the module directory.
+    let build_rs = manifest_dir.join("build.rs");
+    if let Ok(content) = std::fs::read_to_string(&build_rs) {
+        scan(&build_rs, &content);
+    }
     assert!(
         violations.is_empty(),
         "production owned-decode-engine references the spike tree:\n{}",
@@ -140,13 +152,18 @@ fn q8_0_block_layout_matches_gguf_spec() {
     assert_eq!(quantized.as_bytes().len(), 34, "block is 2 + 32 bytes");
 }
 
-fn visit_rust_files(root: &Path, callback: &mut dyn FnMut(&Path, &str)) {
+/// Visit every source kind the owned-decode-engine build consumes: Rust
+/// (`.rs`), Objective-C (`.m`), and Metal (`.metal`).
+fn visit_source_files(root: &Path, callback: &mut dyn FnMut(&Path, &str)) {
     if let Ok(entries) = std::fs::read_dir(root) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                visit_rust_files(&path, callback);
-            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                visit_source_files(&path, callback);
+            } else if path
+                .extension()
+                .is_some_and(|ext| ext == "rs" || ext == "m" || ext == "metal")
+            {
                 if let Ok(content) = std::fs::read_to_string(&path) {
                     callback(&path, &content);
                 }

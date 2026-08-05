@@ -23,14 +23,30 @@ pub trait DecodeKernel {
     type Cache;
 
     fn capacity(&self) -> usize;
-    fn prefill(&mut self, tokens: &[u32]) -> Result<(Self::Cache, Vec<f32>)>;
+
+    /// Device-resident causal prefill of `tokens`. Returns the advanced cache
+    /// and the greedy argmax token id after the final prompt token (the first
+    /// generated token). The step engines compute this argmax on device and
+    /// expose no host-visible logits vector for it, so the contract returns
+    /// the token id itself rather than a logits vector a caller could mistake
+    /// for real logits. Callers that need per-token logits after prefill use
+    /// `advance`; callers that only need greedy tokens use `advance_chain`.
+    fn prefill(&mut self, tokens: &[u32]) -> Result<(Self::Cache, u32)>;
+
+    /// Feed `token` and return the full f32 logits for the token after it.
+    /// Backends whose single-token path is implemented correctly return real
+    /// logits; a backend without a correct single-token logits path must not
+    /// return placeholder values here (see the LFM2 engine's host embedding
+    /// gather for the production solution).
     fn advance(&mut self, cache: &mut Self::Cache, token: u32) -> Result<Vec<f32>>;
     fn cache_position(&self, cache: &Self::Cache) -> usize;
     fn inspect_cache_layer(&self, cache: &Self::Cache, layer: usize) -> Result<Vec<f32>>;
 
     /// Runs the draft tokens through the verifier and returns the greedy argmax
     /// after each token. The first proposal is compared with the session's
-    /// pending logits; element `i - 1` verifies proposal `i`.
+    /// pending logits; element `i - 1` verifies proposal `i`. The default
+    /// implementation loops over `advance`; engines with a device-resident
+    /// verify path override it.
     fn verify_tokens(&mut self, cache: &mut Self::Cache, tokens: &[u32]) -> Result<Vec<u32>> {
         ensure!(
             !tokens.is_empty(),

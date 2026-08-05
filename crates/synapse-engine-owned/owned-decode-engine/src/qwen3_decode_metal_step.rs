@@ -401,7 +401,7 @@ impl DecodeKernel for MetalStepDecoder<'_> {
         self.bucket
     }
 
-    fn prefill(&mut self, tokens: &[u32]) -> Result<(Self::Cache, Vec<f32>)> {
+    fn prefill(&mut self, tokens: &[u32]) -> Result<(Self::Cache, u32)> {
         ensure!(!tokens.is_empty(), "decode prompt must not be empty");
         ensure!(
             tokens.len() <= self.bucket,
@@ -410,23 +410,13 @@ impl DecodeKernel for MetalStepDecoder<'_> {
         // Device-resident causal prefill: feed prompt tokens through the step
         // engine's verify path, which advances the KV cache on device and
         // returns the greedy argmax after each token. The argmax after the
-        // final prompt token is the first generated token.
-        //
-        // The verify path returns only the argmax, not the full logits vector.
-        // For the DecodeKernel contract (which expects logits so the caller can
-        // pick the first generated token via top_logits), we return a logits
-        // vector with the argmax at the highest position. This is sufficient
-        // for greedy-top-1 selection: the caller's top_logits(logits, 1) picks
-        // the argmax as the first generated token, matching the spike's
-        // MPSGraph-prefill + step-decode path byte-for-byte.
+        // final prompt token is the first generated token. The verify path
+        // computes argmaxes on device and never materializes a host-visible
+        // logits vector, so the contract returns the token id directly.
         let mut cache = MetalStepKvCache { position: 0 };
         let argmaxes = self.verify_tokens(&mut cache, tokens)?;
         let first_token = *argmaxes.last().expect("non-empty prompt");
-        let mut logits = vec![f32::NEG_INFINITY; self.model.config.vocab_size];
-        if (first_token as usize) < self.model.config.vocab_size {
-            logits[first_token as usize] = 0.0;
-        }
-        Ok((cache, logits))
+        Ok((cache, first_token))
     }
 
     fn advance(&mut self, cache: &mut Self::Cache, token: u32) -> Result<Vec<f32>> {
