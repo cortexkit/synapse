@@ -104,6 +104,11 @@ pub struct Lfm2HybridStepEngine {
     rope_theta: f32,
     epsilon: f32,
     weight_quantization: WeightQuantization,
+    /// Host copy of the f16 embedding gather table uploaded at prepare time.
+    /// Kept so `DecodeKernel::advance` can gather a token's embedding row on
+    /// the host and feed the exact same f16 bits the device-resident chain and
+    /// verify kernels gather internally (vocab x hidden x 2 bytes).
+    embedding_table: Vec<u16>,
 }
 
 impl Lfm2HybridStepEngine {
@@ -145,7 +150,11 @@ impl Lfm2HybridStepEngine {
             )
         })
         .ok_or_else(last_error)?;
-        let mut engine = Self {
+        // The f16 embedding gather table is uploaded by prepare and also kept
+        // on the host so single-token `advance` steps can gather the token's
+        // embedding row (the native step FFI takes an f16 row, not a token id).
+        let embedding_table = encode_f16_bits(&model.embeddings.data);
+        let engine = Self {
             raw,
             hidden,
             head_dim,
@@ -154,6 +163,7 @@ impl Lfm2HybridStepEngine {
             rope_theta: config.rope_theta,
             epsilon: config.rms_norm_eps,
             weight_quantization,
+            embedding_table,
         };
 
         let quantized = weight_quantization.is_quantized();
@@ -279,7 +289,6 @@ impl Lfm2HybridStepEngine {
             Some(head) => &head.tensor.data,
             None => &model.embeddings.data,
         };
-        let embeddings = encode_f16_bits(&model.embeddings.data);
         let lm_head_f16;
         let mut tied_lm_head_q8: Option<Q8_0Tensor> = None;
         let (lm_head_fp16_ptr, lm_head_q8_ptr): (*const c_void, *const c_void) = if quantized {
@@ -306,13 +315,15 @@ impl Lfm2HybridStepEngine {
                 final_norm.as_ptr().cast(),
                 lm_head_fp16_ptr,
                 lm_head_q8_ptr,
-                embeddings.as_ptr().cast(),
+                engine.embedding_table.as_ptr().cast(),
             )
         };
         if status != 0 {
-            let error = last_error();
-            engine.release();
-            return Err(error)
+            // Release ownership belongs to Drop exclusively: returning Err drops
+            // `engine`, whose Drop frees the native context exactly once. A
+            // manual release here would free it a second time (double-free).
+            // This matches the Qwen3 step engine's prepare-failure path.
+            return Err(last_error())
                 .with_context(|| format!("LFM2 hybrid step prepare failed ({status})"));
         }
         // Keep the mirrors and the tied Q8 head alive until after the synchronous
@@ -457,50 +468,21 @@ impl DecodeKernel for Lfm2HybridStepEngine {
         self.bucket
     }
 
-    fn prefill(&mut self, tokens: &[u32]) -> Result<(Self::Cache, Vec<f32>)> {
+    fn prefill(&mut self, tokens: &[u32]) -> Result<(Self::Cache, u32)> {
         ensure!(!tokens.is_empty(), "decode prompt must not be empty");
         ensure!(
             tokens.len() <= self.bucket,
             "decode prompt exceeds cache bucket"
         );
-        // Device-resident causal prefill via the verify path.
+        // Device-resident causal prefill via the verify path, which computes
+        // the argmax on device and returns only the argmax (no host-visible
+        // logits vector exists to hand back). Continue generation with
+        // `advance` (full logits per token) or `chain` (fused greedy stepping).
         let first_token = Lfm2HybridStepEngine::prefill(self, tokens)?;
-        let mut cache = Lfm2HybridStepCache {
+        let cache = Lfm2HybridStepCache {
             position: tokens.len(),
         };
-        // Run one step to get the full logits vector for the first generated
-        // token, matching the DecodeKernel::prefill contract.
-        let hidden = self.hidden;
-        let embedding = vec![0u16; hidden]; // placeholder; the native step gathers internally
-        let _ = embedding;
-        // The hybrid step's `step_logits` expects an f16 embedding row; for the
-        // prefill contract we need the logits after the prompt. The verify path
-        // already computed the argmax; we run one forward step for that token to
-        // get the full logits. The native step kernel gathers the embedding
-        // internally from the resident table, so we pass the token's position.
-        // Actually, step_logits takes an f16 input row, not a token id. For the
-        // prefill contract, the argmax after the prompt IS the first generated
-        // token; the logits we need are the logits that produced that argmax.
-        // The verify path computed them on device but only returned the argmax.
-        // To get the full logits, we re-run the last prompt token's forward
-        // step. But that would double-advance the cache. Instead, we rewind,
-        // re-run the last prompt token to get logits, then re-advance.
-        // Simpler: just return a zero logits vector and let the caller use
-        // verify_tokens for prefill. But the DecodeKernel contract requires
-        // logits. The cleanest approach: the caller uses verify_tokens directly
-        // for prefill, and prefill() is a convenience that returns the argmax
-        // as a one-hot-ish logits vector. For production, the decode controller
-        // will use verify_tokens + advance, not prefill(). So we return a
-        // minimal logits vector with the argmax at the highest position.
-        let mut logits = vec![f32::NEG_INFINITY; self.vocab];
-        if (first_token as usize) < self.vocab {
-            logits[first_token as usize] = 0.0;
-        }
-        // The cache is at the prompt length; the first generated token is
-        // available via the argmax. The decode controller will call advance()
-        // with this token to continue generation.
-        let _ = &mut cache;
-        Ok((cache, logits))
+        Ok((cache, first_token))
     }
 
     fn advance(&mut self, cache: &mut Self::Cache, token: u32) -> Result<Vec<f32>> {
@@ -508,48 +490,18 @@ impl DecodeKernel for Lfm2HybridStepEngine {
             cache.position < self.bucket,
             "decode cache capacity exhausted"
         );
-        // Gather the token's embedding on the host, encode to f16, and run the
-        // single-token forward pass. The native step kernel reads the f16
-        // embedding row from the input buffer.
-        let hidden = self.hidden;
-        let vocab = self.vocab;
         let token_idx = token as usize;
         ensure!(
-            token_idx < vocab,
+            token_idx < self.vocab,
             "token id {token} outside LFM2 vocabulary"
         );
-        // The hybrid step engine's native step expects an f16 embedding input.
-        // We encode the token's embedding row from the model's embedding table.
-        // But we don't have access to the model here (the engine owns its own
-        // copy after prepare). The native step kernel can gather internally if
-        // we pass the token id via a special path, but the FFI takes an f16
-        // input buffer. For the production path, the decode controller uses
-        // chain() for greedy stepping (which gathers on device), and advance()
-        // is used for single-token logits when needed. We construct the f16
-        // embedding by gathering from the resident table via a zero buffer and
-        // the token id — but the native kernel doesn't support that directly.
-        //
-        // For now, advance() is supported via the chain path with steps=1,
-        // which gathers the embedding on device and returns the argmax. To get
-        // full logits, we use step_logits with a zero embedding (the native
-        // kernel will produce logits from the zero input, which is not what we
-        // want). The correct approach is to have the native kernel accept a
-        // token id for single-token steps, but that's a kernel change.
-        //
-        // Production path: the decode controller uses verify_tokens for prefill
-        // and chain for greedy stepping. advance() is used only when full logits
-        // are needed (e.g., constrained decoding). For constrained decoding, the
-        // controller runs step_logits with the correct embedding. The embedding
-        // gather is done by the native chain/verify kernels; for advance(), we
-        // need the embedding on the host. Since the engine doesn't retain the
-        // embedding table after prepare, we use a placeholder and document that
-        // advance() requires the caller to provide the embedding via step_logits.
-        //
-        // For the K=1 constrained stepping path, the controller will use
-        // step_logits with a host-gathered embedding. This is the path the
-        // spike's constrained decode uses (top_logits_masked on the full logits
-        // vector). The production port supports this via step_logits.
-        let input = vec![0u16; hidden];
+        // Gather the token's embedding row from the host copy of the f16 table
+        // uploaded at prepare. These are the exact bits the device-resident
+        // chain/verify kernels gather for the same token, so a single-token
+        // advance is bit-identical to one chained step. The row is copied out
+        // of the table so the gather does not hold a borrow across the step.
+        let row_start = token_idx * self.hidden;
+        let input = self.embedding_table[row_start..row_start + self.hidden].to_vec();
         let logits = self.step_logits(cache.position, &input)?;
         cache.position += 1;
         Ok(logits)
@@ -754,4 +706,101 @@ unsafe extern "C" {
     ) -> i32;
     fn synapse_lfm2_hybrid_step_reset(context: *mut c_void) -> i32;
     fn synapse_lfm2_hybrid_step_context_free(context: *mut c_void);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::lfm2_decode_model::{Config, RmsNorm};
+    use super::*;
+    use crate::runtime::{Tensor, TensorDType};
+
+    fn tensor(shape: Vec<usize>, data: Vec<f32>) -> Tensor {
+        let strides = shape
+            .iter()
+            .rev()
+            .scan(1usize, |stride, &dim| {
+                let current = *stride;
+                *stride *= dim;
+                Some(current)
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        Tensor {
+            dtype: TensorDType::F32,
+            shape,
+            strides,
+            data,
+            metal_f16_bits: None,
+        }
+    }
+
+    /// A minimal LFM2 model with zero layers. It passes the Rust-side checks
+    /// in `Lfm2HybridStepEngine::new` (precision, bucket, quantization match)
+    /// and creates a native context, but the native prepare call rejects a
+    /// zero layer count — exactly the prepare-failure error path that used to
+    /// double-free the context.
+    fn layerless_model() -> Model {
+        let hidden = 64usize;
+        let vocab = 128usize;
+        Model {
+            config: Config {
+                hidden_size: hidden,
+                intermediate_size: 128,
+                serialized_intermediate_size: 128,
+                num_attention_heads: 2,
+                num_hidden_layers: 0,
+                num_key_value_heads: 1,
+                head_dim: 32,
+                rms_norm_eps: 1e-6,
+                rope_theta: 1_000_000.0,
+                vocab_size: vocab,
+                layer_types: Vec::new(),
+                conv_kernel_size: 3,
+                tie_word_embeddings: true,
+                bos_token_id: None,
+                eos_token_id: 0,
+                pad_token_id: None,
+            },
+            embeddings: tensor(vec![vocab, hidden], vec![0.0; vocab * hidden]),
+            layers: Vec::new(),
+            final_norm: RmsNorm {
+                weight: tensor(vec![hidden], vec![1.0; hidden]),
+                eps: 1e-6,
+            },
+            lm_head: None,
+            tied_lm_head_q8_0: None,
+            weight_quantization: WeightQuantization::None,
+            generation_stop_ids: vec![0],
+        }
+    }
+
+    /// Fault site `lfm2-hybrid-step-prepare-failure` in
+    /// `decode-ownership-manifest-v1`: when `prepare` fails after the native
+    /// context was created, the context must be released exactly once. The
+    /// historical defect released it in the error path AND again in `Drop`.
+    /// Under a normal `cargo test` run this exercises the full error path
+    /// (context creation, failed prepare, error return, `Drop`); under an
+    /// AddressSanitizer build a regression to the double release aborts the
+    /// process, which is what makes this the ASan regression gate for the
+    /// fault site. Requires a Metal device (macOS engine crate contract).
+    #[test]
+    fn prepare_failure_releases_context_exactly_once() {
+        let model = layerless_model();
+        let result =
+            Lfm2HybridStepEngine::new(&model, Precision::F16, 512, WeightQuantization::None);
+        let error = match result {
+            Ok(_) => panic!("prepare must reject a model with zero layers"),
+            Err(error) => error,
+        };
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("prepare failed"),
+            "expected the prepare-failure path (context created, prepare rejected), got: {message}"
+        );
+        // `engine` was dropped on the error return above. If the context were
+        // released twice, an ASan build would have aborted before reaching
+        // this assertion.
+    }
 }

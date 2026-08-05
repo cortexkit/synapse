@@ -73,6 +73,14 @@
       "ownership_rule": "The Rust side allocates the fixed-size conv cache; the Objective-C side reads and updates it in place and never frees it",
       "asan_test_name": "ownership::lfm2_conv_cache_no_double_free",
       "run_record": "macos-metal/ownership/lfm2-conv-cache.json"
+    },
+    {
+      "id": "lfm2-hybrid-step-prepare-failure",
+      "group": "partial_initialization",
+      "description": "LFM2 hybrid step native context teardown when weight preparation fails after the context was created",
+      "ownership_rule": "The Rust engine struct owns the native context release exclusively through Drop; the prepare-failure error path must not release the context itself",
+      "asan_test_name": "lfm2_decode_metal_step::tests::prepare_failure_releases_context_exactly_once",
+      "run_record": "macos-metal/ownership/lfm2-hybrid-step-prepare-failure.json"
     }
   ],
   "concrete_writable_arrays": [
