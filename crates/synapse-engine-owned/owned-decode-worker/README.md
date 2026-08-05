@@ -61,8 +61,8 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-All gates pass: 45 library unit tests, 27 protocol-behavior fixtures, and 12
-ownership-safety fixtures (84 total).
+All gates pass: 43 library unit tests, 30 protocol-behavior fixtures, and 12
+ownership-safety fixtures (85 total).
 
 ## Fixture coverage
 

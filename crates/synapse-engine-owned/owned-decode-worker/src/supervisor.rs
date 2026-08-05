@@ -202,8 +202,13 @@ impl<S: CrashBudgetStore> Supervisor<S> {
         // Fail-closed persistence: a key whose latest crash-budget record
         // could not be persisted refuses dispatch (typed unavailable) until a
         // save succeeds, so a disk failure can never silently reset
-        // quarantine state across restarts.
-        if self.budget.persistence_failed(&request.key) {
+        // quarantine state across restarts. Each dispatch retries the save
+        // first: if the store has recovered, the in-memory record (strikes
+        // included) is persisted and dispatch proceeds; while the store keeps
+        // failing, dispatch stays refused and nothing is spawned.
+        if self.budget.persistence_failed(&request.key)
+            && self.budget.retry_persist(&request.key).is_err()
+        {
             return GenerationOutcome {
                 result: Err(DecodeError::Unavailable),
                 provenance,
@@ -792,98 +797,13 @@ mod tests {
         assert_eq!(factory.spawn_count(), 0);
     }
 
-    #[test]
-    fn failed_cancellation_at_deadline_boundary_charges_and_kills() {
-        // The deadline expires at the boundary; the supervisor cancels during
-        // cleanup, but the worker never acknowledges. The fault escalates to a
-        // kill and charges one FailedCancellation strike.
-        let mut sup = supervisor();
-        let mut factory = ScriptedWorkerFactory::new(
-            vec![vec![
-                ScriptedEvent::Progress { committed: 16 },
-                ScriptedEvent::CancelFailure,
-            ]],
-            context(),
-        );
-        let clock = ManualClock::new(100);
-        let control = TerminalControl {
-            deadline_at: Some(50), // expired before the boundary at 100
-            cancel_at: None,
-        };
-        let outcome = sup.run_generation(&request(), &mut factory, &context(), &control, &clock);
-        // Failed cancellation is terminal (no redispatch) and surfaces per the
-        // error contract: budget not exhausted -> owned_decode_unavailable.
-        assert_eq!(outcome.result, Err(DecodeError::Unavailable));
-        assert_eq!(
-            outcome.provenance.failure_classifications,
-            vec![FailureClassification::FailedCancellation]
-        );
-        assert_eq!(outcome.provenance.crash_retry_count, 0);
-        // The worker was killed and exactly one strike charged.
-        assert_eq!(factory.log().kills, 1);
-        assert_eq!(sup.budget().remaining(&request().key), 1);
-        assert_eq!(factory.spawn_count(), 1);
-    }
 
-    #[test]
-    fn failed_cancellation_at_cancel_boundary_charges_and_kills() {
-        // Cancellation was recorded before the boundary; the worker fails to
-        // acknowledge the supervisor's cancel. Same escalation and charge as
-        // the deadline variant, even though an acknowledged cancellation would
-        // have charged nothing.
-        let mut sup = supervisor();
-        let mut factory = ScriptedWorkerFactory::new(
-            vec![vec![
-                ScriptedEvent::Progress { committed: 16 },
-                ScriptedEvent::CancelFailure,
-            ]],
-            context(),
-        );
-        let clock = ManualClock::new(100);
-        let control = TerminalControl {
-            deadline_at: Some(500), // not expired
-            cancel_at: Some(50),    // recorded before the boundary
-        };
-        let outcome = sup.run_generation(&request(), &mut factory, &context(), &control, &clock);
-        assert_eq!(outcome.result, Err(DecodeError::Unavailable));
-        assert_eq!(
-            outcome.provenance.failure_classifications,
-            vec![FailureClassification::FailedCancellation]
-        );
-        assert_eq!(factory.log().kills, 1);
-        assert_eq!(sup.budget().remaining(&request().key), 1);
-    }
-
-    #[test]
-    fn failed_cancellation_exhausting_budget_quarantines() {
-        let mut sup = Supervisor::new(
-            CrashBudget::new(InMemoryBudgetStore::default(), BudgetPolicy::new(1, 60_000)),
-            16,
-        );
-        let mut factory = ScriptedWorkerFactory::new(
-            vec![vec![
-                ScriptedEvent::Progress { committed: 16 },
-                ScriptedEvent::CancelFailure,
-            ]],
-            context(),
-        );
-        let clock = ManualClock::new(100);
-        let control = TerminalControl {
-            deadline_at: Some(50),
-            cancel_at: None,
-        };
-        let outcome = sup.run_generation(&request(), &mut factory, &context(), &control, &clock);
-        // The single strike exhausts the budget: quarantined.
-        assert_eq!(outcome.result, Err(DecodeError::Quarantined));
-        assert!(sup.budget().is_quarantined(&request().key, 100));
-        assert_eq!(factory.log().kills, 1);
-    }
-
-    /// A store whose save fails while `fail` is set.
+    /// A store whose save fails while `fail` is set. The flag is shared so a
+    /// test can toggle the disk's health after the supervisor owns the store.
     #[derive(Default)]
     struct FailingStore {
         records: std::collections::BTreeMap<String, BudgetRecord>,
-        fail: bool,
+        fail: std::rc::Rc<std::cell::Cell<bool>>,
     }
 
     impl crate::budget::CrashBudgetStore for FailingStore {
@@ -899,7 +819,7 @@ mod tests {
             // Models FileBudgetStore: the in-memory record updates first;
             // the flush to disk is what fails.
             self.records.insert(key.storage_id(), record.clone());
-            if self.fail {
+            if self.fail.get() {
                 return Err(BudgetStoreError {
                     message: "disk failure".to_string(),
                 });
@@ -909,13 +829,15 @@ mod tests {
     }
 
     #[test]
-    fn budget_persistence_failure_fails_closed() {
+    fn budget_persistence_failure_fails_closed_until_a_save_succeeds() {
         // A crash whose strike cannot be persisted surfaces the typed
-        // unavailable error, and the key refuses further dispatch until a
-        // save succeeds.
+        // unavailable error, and the key refuses further dispatch while the
+        // store keeps failing. Once the store recovers, the pre-dispatch
+        // retry persists the strike and dispatch resumes.
+        let fail = std::rc::Rc::new(std::cell::Cell::new(true));
         let store = FailingStore {
             records: std::collections::BTreeMap::new(),
-            fail: true,
+            fail: fail.clone(),
         };
         let mut sup = Supervisor::new(CrashBudget::new(store, BudgetPolicy::default()), 16);
         let mut factory = ScriptedWorkerFactory::new(vec![vec![ScriptedEvent::Crash]], context());
@@ -930,8 +852,8 @@ mod tests {
         assert_eq!(outcome.result, Err(DecodeError::Unavailable));
         assert_eq!(factory.spawn_count(), 1);
 
-        // Next generation for the same key: refused pre-dispatch, no spawn,
-        // no charge.
+        // Next generation for the same key: the save retry fails again, so
+        // dispatch is refused pre-dispatch — no spawn, no charge.
         let mut factory2 = ScriptedWorkerFactory::new(vec![vec![ScriptedEvent::Crash]], context());
         let outcome2 = sup.run_generation(
             &request(),
@@ -942,5 +864,22 @@ mod tests {
         );
         assert_eq!(outcome2.result, Err(DecodeError::Unavailable));
         assert_eq!(factory2.spawn_count(), 0, "refused before dispatch");
+
+        // The disk recovers: the pre-dispatch retry persists the unpersisted
+        // strike, clears the fail-closed mark, and dispatch resumes. The new
+        // crash charges the second strike, exhausting the default budget.
+        fail.set(false);
+        let mut factory3 = ScriptedWorkerFactory::new(vec![vec![ScriptedEvent::Crash]], context());
+        let outcome3 = sup.run_generation(
+            &request(),
+            &mut factory3,
+            &context(),
+            &TerminalControl::default(),
+            &clock,
+        );
+        assert_eq!(factory3.spawn_count(), 1, "dispatch resumes after recovery");
+        assert!(!sup.budget().persistence_failed(&request().key));
+        assert_eq!(outcome3.result, Err(DecodeError::Quarantined));
+        assert_eq!(sup.budget().remaining(&request().key), 0);
     }
 }

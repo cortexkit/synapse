@@ -754,6 +754,97 @@ fn fixture_replacement_startup_failure_is_terminal() {
     assert_eq!(outcome.provenance.crash_retry_count, 0);
 }
 
+#[test]
+fn fixture_failed_cancellation_at_deadline_boundary_charges_and_kills() {
+    // The deadline expires at the boundary; the supervisor cancels during
+    // cleanup, but the worker never acknowledges (CancelFailure). Per the
+    // error contract, a cancellation the worker fails to acknowledge is a
+    // worker fault: it escalates to a worker kill and charges exactly one
+    // FailedCancellation strike (resolution r2 #8).
+    let mut sup = supervisor();
+    let mut factory = ScriptedWorkerFactory::new(
+        vec![vec![
+            ScriptedEvent::Progress { committed: 16 },
+            ScriptedEvent::CancelFailure,
+        ]],
+        context(),
+    );
+    let clock = ManualClock::new(100);
+    let control = TerminalControl {
+        deadline_at: Some(50), // expired before the boundary at 100
+        cancel_at: None,
+    };
+    let outcome = sup.run_generation(&request(), &mut factory, &context(), &control, &clock);
+    // Failed cancellation is terminal (no redispatch) and surfaces per the
+    // error contract: budget not exhausted -> owned_decode_unavailable.
+    assert_eq!(outcome.result, Err(DecodeError::Unavailable));
+    assert_eq!(
+        outcome.provenance.failure_classifications,
+        vec![FailureClassification::FailedCancellation]
+    );
+    assert_eq!(outcome.provenance.crash_retry_count, 0);
+    // The worker was killed and exactly one strike charged.
+    assert_eq!(factory.log().kills, 1);
+    assert_eq!(sup.budget().remaining(&request().key), 1);
+    assert_eq!(factory.spawn_count(), 1);
+}
+
+#[test]
+fn fixture_failed_cancellation_at_cancel_boundary_charges_and_kills() {
+    // Cancellation was recorded before the boundary; the worker fails to
+    // acknowledge the supervisor's cancel. Same escalation and charge as the
+    // deadline variant, even though an acknowledged cancellation would have
+    // charged nothing.
+    let mut sup = supervisor();
+    let mut factory = ScriptedWorkerFactory::new(
+        vec![vec![
+            ScriptedEvent::Progress { committed: 16 },
+            ScriptedEvent::CancelFailure,
+        ]],
+        context(),
+    );
+    let clock = ManualClock::new(100);
+    let control = TerminalControl {
+        deadline_at: Some(500), // not expired
+        cancel_at: Some(50),    // recorded before the boundary
+    };
+    let outcome = sup.run_generation(&request(), &mut factory, &context(), &control, &clock);
+    assert_eq!(outcome.result, Err(DecodeError::Unavailable));
+    assert_eq!(
+        outcome.provenance.failure_classifications,
+        vec![FailureClassification::FailedCancellation]
+    );
+    assert_eq!(factory.log().kills, 1);
+    assert_eq!(sup.budget().remaining(&request().key), 1);
+}
+
+#[test]
+fn fixture_failed_cancellation_exhausting_budget_quarantines() {
+    // With a single-unit budget, the one FailedCancellation strike exhausts
+    // the budget and quarantines the key.
+    let mut sup = Supervisor::new(
+        CrashBudget::new(InMemoryBudgetStore::default(), BudgetPolicy::new(1, 60_000)),
+        N,
+    );
+    let mut factory = ScriptedWorkerFactory::new(
+        vec![vec![
+            ScriptedEvent::Progress { committed: 16 },
+            ScriptedEvent::CancelFailure,
+        ]],
+        context(),
+    );
+    let clock = ManualClock::new(100);
+    let control = TerminalControl {
+        deadline_at: Some(50),
+        cancel_at: None,
+    };
+    let outcome = sup.run_generation(&request(), &mut factory, &context(), &control, &clock);
+    // The single strike exhausts the budget: quarantined.
+    assert_eq!(outcome.result, Err(DecodeError::Quarantined));
+    assert!(sup.budget().is_quarantined(&request().key, 100));
+    assert_eq!(factory.log().kills, 1);
+}
+
 // ---------------------------------------------------------------------------
 // Wire-error binding literal guard.
 // ---------------------------------------------------------------------------

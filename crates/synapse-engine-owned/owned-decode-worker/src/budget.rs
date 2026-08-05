@@ -261,6 +261,26 @@ impl<S: CrashBudgetStore> CrashBudget<S> {
         self.unpersisted.contains(&key.storage_id())
     }
 
+    /// Retry persisting the key's current in-memory record. The supervisor
+    /// calls this before refusing a fail-closed key: if the store has
+    /// recovered, the retry saves the record (strikes included, so a restart
+    /// can no longer lose them) and clears the fail-closed mark, letting
+    /// dispatch resume. While the store keeps failing, the error is returned
+    /// and the mark stays. Keys that are not marked are unaffected.
+    pub fn retry_persist(&mut self, key: &QuarantineKey) -> Result<(), BudgetStoreError> {
+        if !self.unpersisted.contains(&key.storage_id()) {
+            return Ok(());
+        }
+        let record = self.record(key);
+        match self.store.save(key, &record) {
+            Ok(()) => {
+                self.unpersisted.remove(&key.storage_id());
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Whether a worker-crash redispatch is permitted: after the first failure
     /// has been charged, at least one budget unit must remain and the key must
     /// not be quarantined. The caller separately checks that the request is not
@@ -399,6 +419,29 @@ mod tests {
         assert_eq!(error.message, "disk failure");
         assert!(budget.persistence_failed(&key()));
         // The strike is still held in memory for this process.
+        assert_eq!(budget.remaining(&key()), 1);
+    }
+
+    #[test]
+    fn retry_persist_clears_the_mark_only_when_the_save_succeeds() {
+        let store = FailingStore {
+            records: BTreeMap::new(),
+            fail: true,
+        };
+        let mut budget = CrashBudget::new(store, BudgetPolicy::default());
+        assert!(budget
+            .charge(&key(), FailureClassification::Crash, 0)
+            .is_err());
+        // While the store fails, the retry keeps failing and the mark stays.
+        assert!(budget.retry_persist(&key()).is_err());
+        assert!(budget.persistence_failed(&key()));
+        // Once the store recovers, the retry persists the strike and clears
+        // the fail-closed mark.
+        budget.store.fail = false;
+        budget
+            .retry_persist(&key())
+            .expect("recovered save succeeds");
+        assert!(!budget.persistence_failed(&key()));
         assert_eq!(budget.remaining(&key()), 1);
     }
 
