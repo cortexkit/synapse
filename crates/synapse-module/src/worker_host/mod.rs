@@ -941,6 +941,18 @@ impl WorkerEngine {
             .block_on(host.owned_decode_cancel(cancellation))
     }
 
+    fn owned_decode_worker_generation(&self) -> Result<u64, WorkerHostError> {
+        self.lock_host()?
+            .connection
+            .as_ref()
+            .map(|connection| connection.worker_generation)
+            .ok_or_else(|| {
+                WorkerHostError::Protocol(
+                    "owned-decode worker is not connected after model load".to_string(),
+                )
+            })
+    }
+
     fn owned_decode_kill(&self) {
         if let Ok(mut host) = self.lock_host() {
             let _ = self.runtime.block_on(host.kill_current());
@@ -1175,7 +1187,7 @@ impl SupervisedDecodeDispatch {
         self.start.prompt_ids = prompt_ids;
         self.start.constraint.clone_from(&constraint);
         self.context.expected_constraint = constraint;
-        self.control.deadline_at = Some(deadline_ms);
+        self.control.deadline_at = Some(self.clock.now().saturating_add(deadline_ms));
     }
 
     #[must_use]
@@ -1305,10 +1317,13 @@ impl WorkerFactory for OwnedDecodeWorkerFactory {
             WorkerEngine::new(self.config.clone()).map_err(|_| WorkerFault::StartupFailure)?;
         let model = GenerateEngine::load(&mut engine, &self.artifact, &self.runtime_config)
             .map_err(|_| WorkerFault::StartupFailure)?;
+        let worker_generation = engine
+            .owned_decode_worker_generation()
+            .map_err(|_| WorkerFault::StartupFailure)?;
         Ok(Box::new(OwnedDecodeWorkerSession {
             engine: Some(engine),
             model,
-            worker_generation: 0,
+            worker_generation,
             pending: None,
             idle: Arc::clone(&self.idle),
             reusable: true,
@@ -1343,7 +1358,10 @@ impl DecodeWorker for OwnedDecodeWorkerSession {
             }
         };
         owned_decode_worker::protocol::validate_frame_structure(&envelope)?;
-        self.worker_generation = worker_generation;
+        if worker_generation != self.worker_generation {
+            self.reusable = false;
+            return Err(WorkerStartFailure::Fault(WorkerFault::Crash));
+        }
         self.pending = Some(envelope.frame);
         Ok(authorization)
     }

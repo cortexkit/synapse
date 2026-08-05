@@ -5376,6 +5376,40 @@ fn cached_supervised_decode_dispatch(
     ))
 }
 
+async fn dispatch_supervised_decode(
+    dispatch: Arc<Mutex<worker_host::SupervisedDecodeDispatch>>,
+    prompt: Vec<u32>,
+    constraint: Option<owned_decode_worker::protocol::TokenIdJsonConstraint>,
+    deadline_ms: u64,
+    command: owned_decode_routing::DispatchedCommand,
+) -> Result<owned_decode_routing::ExecutionSuccess, WireOperationError> {
+    tokio::task::spawn_blocking(move || {
+        let mut dispatch = dispatch.lock().map_err(|_| {
+            WireOperationError::from_stable(
+                StableError::engine_crashed(Some(100)),
+                "owned-decode dispatch cache is unavailable",
+            )
+        })?;
+        dispatch.set_request(prompt, constraint, deadline_ms);
+        owned_decode_routing::DecodeDispatch::dispatch(&mut *dispatch, &command).map_err(|error| {
+            WireOperationError::from_stable(
+                StableError::engine_crashed(Some(100)),
+                format!(
+                    "owned-decode worker-path dispatch failed: {}",
+                    error.as_str()
+                ),
+            )
+        })
+    })
+    .await
+    .map_err(|error| {
+        WireOperationError::from_stable(
+            StableError::engine_crashed(Some(100)),
+            format!("owned-decode worker-path task failed: {error}"),
+        )
+    })?
+}
+
 struct OwnedDecodeEnvironmentInputs {
     processing_fingerprint: Fingerprint,
     runtime_config_digest: String,
@@ -8220,7 +8254,7 @@ async fn execute_generate_probe_for_model(
                 180_000,
             )?;
         }
-        let mut dispatch = worker_dispatch
+        let dispatch = worker_dispatch
             .as_ref()
             .ok_or_else(|| {
                 WireOperationError::from_stable(
@@ -8228,18 +8262,14 @@ async fn execute_generate_probe_for_model(
                     "owned-decode certification requires a supervised worker binary",
                 )
             })?
-            .lock()
-            .map_err(|_| {
-                WireOperationError::from_stable(
-                    StableError::engine_crashed(Some(100)),
-                    "owned-decode dispatch cache is unavailable",
-                )
-            })?;
-        dispatch.set_request(prompt, None, 180_000);
+            .clone();
         let started = std::time::Instant::now();
-        let output = owned_decode_routing::DecodeDispatch::dispatch(
-            &mut *dispatch,
-            &owned_decode_routing::DispatchedCommand {
+        let output = dispatch_supervised_decode(
+            dispatch,
+            prompt,
+            None,
+            180_000,
+            owned_decode_routing::DispatchedCommand {
                 lane: LaneKind::OwnedDecode,
                 decode_fingerprint: decode_fingerprint.clone(),
                 processing_fingerprint: processing_fingerprint.clone(),
@@ -8249,12 +8279,7 @@ async fn execute_generate_probe_for_model(
                 constrained: false,
             },
         )
-        .map_err(|error| {
-            WireOperationError::from_stable(
-                StableError::engine_crashed(Some(100)),
-                format!("owned-decode worker-path probe failed: {}", error.as_str()),
-            )
-        })?;
+        .await?;
         let elapsed_secs = started.elapsed().as_secs_f64().max(f64::EPSILON);
         latency_samples.push(elapsed_secs * 1_000.0);
         throughput_samples.push(output.generated_token_ids.len() as f64 / elapsed_secs);
@@ -8267,7 +8292,7 @@ async fn execute_generate_probe_for_model(
     }
 
     let vocabulary_digest = owned_decode_vocabulary_digest(&model.tokenizer)?;
-    let constrained_schema = r#"{"type":"string","enum":["red","green","blue"]}"#;
+    let constrained_schema = r#"{"type":"null"}"#;
     let compiled = owned_decode_grammar_scheduler::compile_grammar(
         constrained_schema,
         &owned_decode_grammar_scheduler::CompileContext {
@@ -8288,24 +8313,16 @@ async fn execute_generate_probe_for_model(
     let constrained_runtime_identity = compiled.constraint.constraint_runtime_identity.digest();
     let constrained_prompt = model
         .tokenizer
-        .tokenize("Return one color as JSON.")
+        .tokenize("Respond with exactly the JSON literal null and nothing else:\n")
         .map_err(|error| artifact_invalid_error(error.to_string()))?
         .ids;
     let constrained_dispatch = worker_dispatch.expect("fixture battery is non-empty");
-    let mut constrained_dispatch = constrained_dispatch.lock().map_err(|_| {
-        WireOperationError::from_stable(
-            StableError::engine_crashed(Some(100)),
-            "owned-decode dispatch cache is unavailable",
-        )
-    })?;
-    constrained_dispatch.set_request(
+    let constrained = dispatch_supervised_decode(
+        constrained_dispatch,
         constrained_prompt.clone(),
         Some(worker_constraint(&compiled.constraint)),
         180_000,
-    );
-    let constrained = owned_decode_routing::DecodeDispatch::dispatch(
-        &mut *constrained_dispatch,
-        &owned_decode_routing::DispatchedCommand {
+        owned_decode_routing::DispatchedCommand {
             lane: LaneKind::OwnedDecode,
             decode_fingerprint: decode_fingerprint.clone(),
             processing_fingerprint,
@@ -8314,17 +8331,14 @@ async fn execute_generate_probe_for_model(
             generation_id: format!("probe-{}-constrained", state.module_generation),
             constrained: true,
         },
-    );
+    )
+    .await;
     let constrained_schema_valid = constrained
         .as_ref()
         .ok()
         .and_then(|output| model.tokenizer.decode(&output.generated_token_ids).ok())
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-        .is_some_and(|value| {
-            value
-                .as_str()
-                .is_some_and(|color| matches!(color, "red" | "green" | "blue"))
-        });
+        .is_some_and(|value| value.is_null());
 
     let evidence = GenerateProbeEvidence {
         token_exact_matches: exact_matches,
@@ -10096,9 +10110,9 @@ mod tests {
     #[test]
     fn decode_certification_fixture_is_the_pinned_twenty_by_sixty_four_oracle() {
         let fixture = generate_probe_fixture().expect("shipped decode fixture should parse");
-        assert_eq!(fixture.family, "qwen3");
+        assert_eq!(fixture.family, "qwen3-0.6b");
         assert_eq!(fixture.dtype, "f16");
-        assert_eq!(fixture.model, "Qwen/Qwen3-0.6B");
+        assert_eq!(fixture.model, "Qwen/Qwen3-Embedding-0.6B");
         assert_eq!(fixture.items.len(), 20);
         assert!(fixture
             .items
@@ -10106,7 +10120,7 @@ mod tests {
             .all(|item| item.max_new_tokens == 64 && item.expected_token_ids.len() == 64));
         assert_eq!(
             fixture.provenance["source_tokens_sha256"],
-            "b2d11f2aaf92cdce0fc906dc7ef0468308bce43bf5661b490f336cc1215b1ee9"
+            "c3080813c45c364a73cbb6dce122afbba20e761b2189a31d0055ecf435232af1"
         );
     }
 

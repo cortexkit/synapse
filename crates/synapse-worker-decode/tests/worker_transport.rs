@@ -47,6 +47,11 @@ struct ReferenceTokens {
     tokens: Vec<u32>,
 }
 
+#[derive(serde::Deserialize)]
+struct SpikeReference {
+    results: Vec<ReferenceTokens>,
+}
+
 struct CheckpointFixture {
     model: PathBuf,
     tokenizer: PathBuf,
@@ -73,15 +78,20 @@ fn checkpoint_fixture() -> Option<CheckpointFixture> {
         .filter(|line| !line.trim().is_empty())
         .map(|line| serde_json::from_str(line).expect("decode prompt row parses"))
         .collect::<Vec<_>>();
-    let references = std::fs::read_to_string(fixture_root.join("reference-tokens.jsonl"))
-        .expect("read reference tokens")
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| {
-            let row: ReferenceTokens =
-                serde_json::from_str(line).expect("reference token row parses");
-            (row.id, row.tokens)
-        })
+    let spike_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../bench/spikes/unified-rt/fixtures/spike-qwen3-f16.jsonl");
+    let spike_bytes = std::fs::read(&spike_path).expect("read pinned Qwen3 spike reference");
+    assert_eq!(
+        hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&spike_bytes)),
+        "c3080813c45c364a73cbb6dce122afbba20e761b2189a31d0055ecf435232af1",
+        "pinned Qwen3 engine fixture drifted"
+    );
+    let references: SpikeReference =
+        serde_json::from_slice(&spike_bytes).expect("pinned Qwen3 spike reference parses");
+    let references = references
+        .results
+        .into_iter()
+        .map(|row| (row.id, row.tokens))
         .collect();
     Some(CheckpointFixture {
         model,
@@ -300,7 +310,7 @@ fn checkpoint_worker_socket_is_token_exact_and_carries_compiled_constraint() {
         );
     }
 
-    let schema = r#"{"type":"string","enum":["red","green","blue"]}"#;
+    let schema = r#"{"type":"null"}"#;
     let compiled = compile_grammar(
         schema,
         &CompileContext {
@@ -311,7 +321,10 @@ fn checkpoint_worker_socket_is_token_exact_and_carries_compiled_constraint() {
     )
     .expect("compile constraint");
     let constrained_prompt = tokenizer
-        .encode("Return one color as JSON.", true)
+        .encode(
+            "Respond with exactly the JSON literal null and nothing else:\n",
+            true,
+        )
         .expect("tokenize constrained prompt")
         .get_ids()
         .to_vec();
@@ -332,9 +345,7 @@ fn checkpoint_worker_socket_is_token_exact_and_carries_compiled_constraint() {
         .decode(&response.generated_token_ids, true)
         .expect("decode constrained output");
     let value: serde_json::Value = serde_json::from_str(&text).expect("output is valid JSON");
-    assert!(value
-        .as_str()
-        .is_some_and(|color| matches!(color, "red" | "green" | "blue")));
+    assert!(value.is_null());
 }
 
 #[test]

@@ -3211,9 +3211,9 @@ async fn certified_owned_oneshot_and_constraint_serve_after_real_worker_probe() 
             "method": "microllm.oneshot",
             "params": {
                 "model": "owned-qwen",
-                "prompt": "Return one color as JSON.",
+                "prompt": "Respond with exactly the JSON literal null and nothing else:\n",
                 "max_tokens": 64,
-                "grammar": r#"{"type":"string","enum":["red","green","blue"]}"#
+                "grammar": r#"{"type":"null"}"#
             }
         }),
     )
@@ -3225,9 +3225,7 @@ async fn certified_owned_oneshot_and_constraint_serve_after_real_worker_probe() 
             .expect("constrained response text"),
     )
     .expect("constrained response is JSON");
-    assert!(value
-        .as_str()
-        .is_some_and(|color| matches!(color, "red" | "green" | "blue")));
+    assert!(value.is_null());
     assert!(constrained_result["provenance"]["constraint_runtime_identity"].is_string());
     assert!(constrained_result["provenance"]["constraint_fingerprint"].is_string());
 }

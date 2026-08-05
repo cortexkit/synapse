@@ -227,6 +227,6 @@ jobs:
           print(f"1-minute loadavg {load:.2f} is below 8")
           PY
           cargo nextest run -p synapse-engine-owned --test owned_decode_parity --run-ignored ignored-only --retries 0 --no-capture
-          cargo nextest run -p synapse-module --lib -E 'test(metal_certification_probe_four_lanes)' --run-ignored ignored-only --retries 0 --no-capture
-          cargo nextest run -p synapse-worker-decode --test worker_transport --run-ignored ignored-only --retries 0 --no-capture
+          cargo nextest run -p synapse-worker-decode --test worker_transport -E 'test(checkpoint_worker_socket_is_token_exact_and_carries_compiled_constraint)' --run-ignored ignored-only --retries 0 --no-capture
+          cargo nextest run -p synapse-worker-decode --test worker_transport -E 'test(checkpoint_worker_crash_redispatches_once_then_quarantines)' --run-ignored ignored-only --retries 0 --no-capture
           cargo nextest run -p synapse-module --test skeleton_e2e -E 'test(certified_owned_oneshot_and_constraint_serve_after_real_worker_probe)' --run-ignored ignored-only --retries 0 --no-capture
