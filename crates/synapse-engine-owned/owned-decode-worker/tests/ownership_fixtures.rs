@@ -10,7 +10,8 @@
 //! at every manifest fault site.
 
 use owned_decode_worker::{
-    OwnershipFaultSite, OwnershipLedger, ResidentStateKind, OWNERSHIP_MANIFEST_REVISION,
+    OwnershipFaultSite, OwnershipLedger, OwnershipViolation, ResidentStateKind,
+    OWNERSHIP_MANIFEST_REVISION,
 };
 
 /// Allocate the full resident set for one generation.
@@ -64,16 +65,37 @@ fn fixture_ownership_transfer_across_ffi_is_safe() {
 
 #[test]
 fn fixture_partial_initialization_teardown_is_safe() {
-    // A partial initialization that fails halfway must tear down exactly what it
-    // allocated, leaving no leak and no double free.
+    // A partial initialization where the third allocation fails: teardown must
+    // free exactly the two resources that were actually allocated. The failed
+    // allocation created no ledger entry, so there is no id to free for it —
+    // the never-allocated resource is neither leaked nor freed.
     let mut ledger = OwnershipLedger::new();
-    let kv = ledger.allocate(ResidentStateKind::AttentionKv);
-    let conv = ledger.allocate(ResidentStateKind::Lfm2ConvCache);
-    // The constraint-automaton allocation "fails"; tear down the two that
-    // succeeded.
+    let kv = ledger
+        .attempt_allocate(ResidentStateKind::AttentionKv, true)
+        .expect("first allocation succeeds");
+    let conv = ledger
+        .attempt_allocate(ResidentStateKind::Lfm2ConvCache, true)
+        .expect("second allocation succeeds");
+    // The constraint-automaton allocation fails: no id, nothing to free.
+    let automaton = ledger.attempt_allocate(ResidentStateKind::ConstraintAutomaton, false);
+    assert!(automaton.is_none(), "the third allocation fails");
+    assert_eq!(ledger.failed_allocation_attempts(), 1);
+    assert_eq!(
+        ledger.live_count(),
+        2,
+        "only two resources exist to tear down"
+    );
+
+    // Teardown frees exactly what was allocated.
     ledger.release(kv);
     ledger.release(conv);
     ledger.assert_safe(true);
+
+    // Negative control: the never-allocated third resource has no id; tearing
+    // it down anyway is an invalid free, which the ledger catches. A teardown
+    // that wrongly "frees" the failed allocation would not be safe.
+    ledger.release(999);
+    assert_eq!(ledger.violations(), &[OwnershipViolation::InvalidFree(999)]);
 }
 
 #[test]
@@ -163,19 +185,30 @@ fn fixture_every_fault_site_has_a_clean_lifecycle() {
     // lifecycle satisfies all four ownership-safety properties.
     for site in OwnershipFaultSite::all() {
         let mut ledger = OwnershipLedger::new();
-        let resources = allocate_resident_set(&mut ledger);
+        let resources = if *site == OwnershipFaultSite::PartialInitialization {
+            // The third allocation fails in this partial scenario, so only two
+            // resources ever exist; teardown frees exactly those two.
+            let kv = ledger
+                .attempt_allocate(ResidentStateKind::AttentionKv, true)
+                .expect("first allocation succeeds");
+            let conv = ledger
+                .attempt_allocate(ResidentStateKind::Lfm2ConvCache, true)
+                .expect("second allocation succeeds");
+            assert!(
+                ledger
+                    .attempt_allocate(ResidentStateKind::ConstraintAutomaton, false)
+                    .is_none(),
+                "the third allocation never happens"
+            );
+            vec![kv, conv]
+        } else {
+            allocate_resident_set(&mut ledger)
+        };
         match site {
             OwnershipFaultSite::OwnershipTransfer | OwnershipFaultSite::Lfm2ConvCacheFfi => {
                 for &id in &resources {
                     assert!(ledger.transfer(id), "{site:?} transfer of live state");
                 }
-            }
-            OwnershipFaultSite::PartialInitialization => {
-                // Tear down only the first two; the third was never allocated in
-                // this partial scenario, so release the two that exist.
-                ledger.release(resources[0]);
-                ledger.release(resources[1]);
-                ledger.release(resources[2]);
             }
             _ => {}
         }

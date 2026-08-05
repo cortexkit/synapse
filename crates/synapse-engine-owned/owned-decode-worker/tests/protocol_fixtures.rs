@@ -6,7 +6,7 @@
 //! - dedicated, non-overlapping mismatch mappings (runtime, constraint, protocol,
 //!   sampling);
 //! - timeout classifications and their crash-budget consequences;
-//! - terminal-control precedence (completion > deadline > cancellation);
+//! - terminal-control precedence (completion > cancellation > deadline);
 //! - literal cleanup-timeout and cancellation wire errors (no symbolic
 //!   placeholders);
 //! - sequence and session violations, malformed frames, and stop controls;
@@ -364,6 +364,34 @@ fn fixture_unknown_generation_id_is_protocol_fatal() {
 }
 
 #[test]
+fn fixture_non_advancing_committed_count_is_protocol_fatal() {
+    // The cumulative committed count must advance (parity with the S5
+    // GenerationProtocol validator): a repeated count is a protocol fault,
+    // charged as protocol-fatal.
+    let mut sup = supervisor();
+    let mut factory = ScriptedWorkerFactory::new(
+        vec![vec![
+            ScriptedEvent::Progress { committed: 16 },
+            ScriptedEvent::Progress { committed: 16 }, // does not advance
+        ]],
+        context(),
+    );
+    let clock = ManualClock::new(0);
+    let outcome = sup.run_generation(
+        &request(),
+        &mut factory,
+        &context(),
+        &TerminalControl::default(),
+        &clock,
+    );
+    assert_eq!(outcome.result, Err(DecodeError::Unavailable));
+    assert_eq!(
+        outcome.provenance.failure_classifications,
+        vec![FailureClassification::ProtocolFatal]
+    );
+}
+
+#[test]
 fn fixture_skipped_sequence_is_protocol_fatal() {
     let mut sup = supervisor();
     let mut factory = ScriptedWorkerFactory::new(
@@ -466,11 +494,19 @@ fn fixture_every_finish_reason_is_accepted() {
 
 #[test]
 fn fixture_stop_controls_are_omitted_from_generated_ids() {
-    // The stop id is 2. A stop_token finish carries only content tokens; the stop
-    // control that ended generation is not committed to generated_ids.
+    // Stop-token omission is worker-side selection behavior, not pass-through:
+    // the scripted double models the greedy union of content tokens and stop
+    // control candidates (reference semantics: the S5 grammar-scheduler
+    // `greedy_generate` stop union; production selection is owned by the real
+    // Metal worker). The stop candidate wins the final selection here, so it
+    // must be omitted from generated_ids and from the committed count. A
+    // double that committed the winning stop would fail this fixture.
     let mut sup = supervisor();
     let mut factory = ScriptedWorkerFactory::new(
-        vec![vec![final_event(FinishReason::StopToken, vec![100, 101])]],
+        vec![vec![ScriptedEvent::StopSelectionWins {
+            content_ids: vec![100, 101],
+            stop_id: 2,
+        }]],
         context(),
     );
     let clock = ManualClock::new(0);
@@ -482,9 +518,19 @@ fn fixture_stop_controls_are_omitted_from_generated_ids() {
         &clock,
     );
     let success = outcome.result.expect("success");
+    assert_eq!(success.finish_reason, FinishReason::StopToken);
     assert!(
         !success.generated_ids.contains(&2),
         "stop control must be omitted from generated ids"
+    );
+    assert_eq!(
+        success.generated_ids,
+        vec![100, 101],
+        "only content tokens are committed"
+    );
+    assert_eq!(
+        success.committed_token_count, 2,
+        "the winning stop token is not counted as committed"
     );
 }
 

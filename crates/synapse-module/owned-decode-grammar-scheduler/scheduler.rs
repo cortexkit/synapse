@@ -564,6 +564,13 @@ impl DecodeScheduler {
             // A terminal completion always wins; pending cancellation is a no-op and
             // a deadline that expired during the final quantum does not retroactively
             // fail the completed result.
+            //
+            // A worker-reported `Final(Cancelled)` is recorded here as
+            // `Completed(Cancelled)` for measurement. Intentional cross-crate
+            // divergence: the S3 supervisor classifies the same frame as its
+            // cancellation decision with payload suppression. The observable
+            // outcome is identical in both (finish reason `cancelled`, no
+            // payload); only the internal classification differs.
             BoundaryKind::Final(reason) => BoundaryOutcome::Completed(reason),
             BoundaryKind::Progress => {
                 if let Some(cancelled_at) = op.cancelled_at_ms {

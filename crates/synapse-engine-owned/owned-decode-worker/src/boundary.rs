@@ -7,17 +7,19 @@
 //! error.
 //!
 //! Precedence (resolution r2 #4 reconciled with `error_contract` and
-//! `worker_protocol_contract`):
+//! `worker_protocol_contract`): terminal completion > cancellation > deadline.
 //! 1. A natural terminal completion (`stop_token`, `max_tokens`,
 //!    `grammar_complete`) wins outright. A pending cancellation is acknowledged
 //!    as a no-op and a deadline that expired during that final quantum does not
 //!    retroactively fail it.
-//! 2. At a boundary with no terminal completion, the deadline is evaluated first:
-//!    if it expired before or at the boundary, the payload is suppressed and the
-//!    bound deadline error is returned. "Deadline therefore wins when both are
-//!    pending at the same boundary."
-//! 3. Otherwise, if cancellation was recorded before or at the boundary, the
-//!    payload is suppressed and `cancelled` is returned after state cleanup.
+//! 2. At a boundary with no terminal completion, cancellation is evaluated
+//!    first: if it was recorded before or at the boundary, the payload is
+//!    suppressed and `cancelled` is returned after state cleanup. Cancellation
+//!    therefore wins when both cancellation and deadline are pending at the
+//!    same boundary — the deadline error is reserved for operations that ran
+//!    out of time without the caller abandoning them.
+//! 3. Otherwise, if the deadline expired before or at the boundary, the
+//!    payload is suppressed and the bound deadline error is returned.
 //! 4. Otherwise the payload is accepted.
 //!
 //! Timestamps are monotonic milliseconds; fixtures drive them deterministically.
@@ -73,6 +75,12 @@ pub fn evaluate_boundary(inputs: BoundaryInputs) -> BoundaryDecision {
             return BoundaryDecision::AcceptCompletion(reason);
         }
         // A worker-reported cancelled finish is a cancellation outcome.
+        // Intentional cross-crate divergence: the S5 module-side model records
+        // the same boundary as `Completed(Cancelled)` for measurement, while
+        // this supervisor classifies it as the cancellation decision with
+        // payload suppression. The observable outcome is identical in both
+        // (finish reason `cancelled`, no payload exposed); only the internal
+        // classification differs.
         if reason == FinishReason::Cancelled {
             return BoundaryDecision::Cancelled;
         }

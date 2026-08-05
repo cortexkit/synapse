@@ -16,6 +16,10 @@ use synapse_core::Fingerprint;
 use crate::owned_decode_certification::cutover::{
     cutover_inputs_from_evidence, CutoverEvidenceInputs,
 };
+use crate::owned_decode_certification::fixture_groups::{
+    GroupOutcome, CONSTRAINED_NEGATIVE_GROUP, CONSTRAINED_POSITIVE_GROUP, REQUEST_PROCESSING_GROUP,
+    SCHEDULER_CONTINUITY_GROUP,
+};
 use crate::owned_decode_certification::fixtures::{
     parity_battery, OracleStore, ParityFixture, PARITY_GROUP,
 };
@@ -35,7 +39,7 @@ use crate::owned_decode_routing::identity::{
     ActivationDType, ConstraintRuntimeIdentity, DecodeIdentityInputs, ProcessingIdentityInputs,
     Q8Identity, RuntimeConfigManifest, WeightQuant,
 };
-use crate::owned_decode_routing::lane::{cutover_enabled, CutoverRecord};
+use crate::owned_decode_routing::lane::{cutover_enabled, CutoverInputs, CutoverRecord};
 use crate::owned_decode_routing::q8ingest::{Q8IngestRegistry, TrustState};
 use crate::owned_decode_routing::{
     CatalogEntry, DecodeDispatch, DispatchedCommand, ExecutionSuccess, OwnedDecodeRouter,
@@ -225,7 +229,42 @@ impl GateRunner {
         let mut gate_statuses = BTreeMap::new();
         let mut executed_fixtures: BTreeMap<String, Vec<String>> = BTreeMap::new();
 
-        gate_statuses.insert(GateId::GDec01, self.gate_01_catalog());
+        // Execute the non-parity fixture-registry groups from the checked-in
+        // registry JSON; every executed entry ID is recorded per group.
+        let request_processing =
+            crate::owned_decode_certification::fixture_groups::run_request_processing(
+                &self.manifests,
+            );
+        let constrained_positive =
+            crate::owned_decode_certification::fixture_groups::run_constrained_positive(
+                &self.manifests,
+            );
+        let constrained_negative =
+            crate::owned_decode_certification::fixture_groups::run_constrained_negative(
+                &self.manifests,
+            );
+        let scheduler_continuity =
+            crate::owned_decode_certification::fixture_groups::run_scheduler_continuity(
+                &self.manifests,
+            );
+        executed_fixtures.insert(
+            REQUEST_PROCESSING_GROUP.to_string(),
+            request_processing.executed_ids.clone(),
+        );
+        executed_fixtures.insert(
+            CONSTRAINED_POSITIVE_GROUP.to_string(),
+            constrained_positive.executed_ids.clone(),
+        );
+        executed_fixtures.insert(
+            CONSTRAINED_NEGATIVE_GROUP.to_string(),
+            constrained_negative.executed_ids.clone(),
+        );
+        executed_fixtures.insert(
+            SCHEDULER_CONTINUITY_GROUP.to_string(),
+            scheduler_continuity.executed_ids.clone(),
+        );
+
+        gate_statuses.insert(GateId::GDec01, self.gate_01_catalog(request_processing));
         gate_statuses.insert(GateId::GDec02, self.gate_02_q8_ingest());
         gate_statuses.insert(GateId::GDec03, self.gate_03_ownership());
 
@@ -238,11 +277,17 @@ impl GateRunner {
 
         gate_statuses.insert(GateId::GDec06, self.gate_06_identity());
         gate_statuses.insert(GateId::GDec07, self.gate_07_oneshot());
-        gate_statuses.insert(GateId::GDec08, self.gate_08_grammar());
+        gate_statuses.insert(
+            GateId::GDec08,
+            self.gate_08_grammar(constrained_positive, constrained_negative),
+        );
         gate_statuses.insert(GateId::GDec09, self.gate_09_grammar_cost(grammar_cost));
         gate_statuses.insert(GateId::GDec10, self.gate_10_throughput(throughput));
         gate_statuses.insert(GateId::GDec11, Self::gate_11_scheduler(&scheduler_status));
-        gate_statuses.insert(GateId::GDec12, self.gate_12_ci(&gate_statuses));
+        gate_statuses.insert(
+            GateId::GDec12,
+            self.gate_12_ci(&gate_statuses, scheduler_continuity),
+        );
 
         ReleaseEvidence {
             fixture_registry_revision: self.manifests.fixture_registry.manifest_revision.clone(),
@@ -257,8 +302,9 @@ impl GateRunner {
 
     /// G-DEC-01: catalog, processing identity, and load. Both families under
     /// canonical identity, shippable context buckets from the checked-in
-    /// manifest, and per-family processing-asset registration.
-    pub fn gate_01_catalog(&self) -> GateStatus {
+    /// manifest, per-family processing-asset registration, and the registry's
+    /// request-processing fixture group executed.
+    pub fn gate_01_catalog(&self, request_processing: GroupOutcome) -> GateStatus {
         let mut evidence = Vec::new();
 
         let canonical_ok = CATALOG_ENGINE == "owned-metal-decode"
@@ -319,6 +365,18 @@ impl GateRunner {
             }
         }
         evidence.push("both families register tokenizer/template/special/stop/detok".to_string());
+
+        // The registry's request-processing group executes against the
+        // module's family registrations.
+        if let Err(reason) = request_processing.result {
+            return GateStatus::Failed {
+                reason: format!("request-processing fixture group: {reason}"),
+            };
+        }
+        evidence.push(format!(
+            "request-processing fixture group executed: {}",
+            request_processing.executed_ids.join(", ")
+        ));
 
         GateStatus::Passed { evidence }
     }
@@ -841,15 +899,48 @@ impl GateRunner {
             Q8IngestRegistry::new(),
             Box::new(store),
         );
-        let env = RoutingEnvironment {
+        // The cutover flag is not set directly: it is evaluated from a D-009
+        // record and predicate inputs whose conditions all hold, modeling a
+        // profile legitimately enabled for the owned lane.
+        let record = CutoverRecord {
             machine_profile_hash: profile.to_string(),
+            enabled_catalog_entry_ids: vec![entry.entry_id.clone()],
+            decode_fingerprints: vec![fp.clone()],
+            processing_fingerprints: Vec::new(),
+            constrained_runtime_identities: Vec::new(),
+            runtime_config_digest: "gate-runner-runtime".to_string(),
+            fixture_registry_revision: self.manifests.fixture_registry.manifest_revision.clone(),
+            context_bucket_manifest_revision: self
+                .manifests
+                .context_buckets
+                .manifest_revision
+                .clone(),
+            scheduler_manifest_revision: self.manifests.scheduler.manifest_revision.clone(),
+            certification_evidence_ids: Vec::new(),
+            wire_error_binding_revision: self.manifests.wire_bindings.manifest_revision.clone(),
+            acceptance_gate_evidence: vec!["G-DEC-07 cutover evaluation".to_string()],
             grammar_enabled: false,
-            cutover_enabled: true,
-            quarantined: false,
-            llama: None,
-            equivalent_fingerprints: BTreeSet::new(),
-            constraint_runtime_identity: None,
         };
+        let inputs = CutoverInputs {
+            artifacts_trusted: true,
+            identities_installed: true,
+            unconstrained_certified: true,
+            constrained_certified: true,
+            quarantined: false,
+            wire_bindings_literal: true,
+            gates_passed: true,
+            scheduler_evidence_committed: true,
+        };
+        let env = RoutingEnvironment::with_cutover_evaluated(
+            profile,
+            false,
+            false,
+            None,
+            BTreeSet::new(),
+            None,
+            &record,
+            &inputs,
+        );
         let request: crate::owned_decode_routing::request::OneshotRequest =
             serde_json::from_value(serde_json::json!({
                 "family": "qwen3-0.6b",
@@ -903,8 +994,14 @@ impl GateRunner {
 
     /// G-DEC-08: grammar. Accepted forms compile into the versioned wire
     /// constraint; rejected keywords, open objects, and untyped enums fail
-    /// with the typed grammar errors; the compiled automaton loads.
-    pub fn gate_08_grammar(&self) -> GateStatus {
+    /// with the typed grammar errors; the compiled automaton loads; and the
+    /// registry's constrained-positive and constrained-negative fixture
+    /// groups execute data-driven from the checked-in registry JSON.
+    pub fn gate_08_grammar(
+        &self,
+        constrained_positive: GroupOutcome,
+        constrained_negative: GroupOutcome,
+    ) -> GateStatus {
         let manifest = GrammarSubsetManifest::default();
         let context = CompileContext {
             base_decode_fingerprint: Fingerprint("gate-base-fp".to_string()),
@@ -980,15 +1077,36 @@ impl GateRunner {
             }
         }
 
-        GateStatus::Passed {
-            evidence: vec![
-                "accepted object schema compiles to token-id-json-constraint-v1".to_string(),
-                "compiled automaton loads through the worker-side path".to_string(),
-                "combinator keywords, open objects, and untyped enums are rejected typed"
-                    .to_string(),
-                "malformed JSON returns grammar_parse_failed".to_string(),
-            ],
+        // The registry's constrained groups execute data-driven: positive
+        // entries compile and accept their valid documents; negative entries
+        // (plus the grammar-audit rejection probes) reject with the typed
+        // errors the registry names.
+        let mut evidence = vec![
+            "accepted object schema compiles to token-id-json-constraint-v1".to_string(),
+            "compiled automaton loads through the worker-side path".to_string(),
+            "combinator keywords, open objects, and untyped enums are rejected typed".to_string(),
+            "malformed JSON returns grammar_parse_failed".to_string(),
+        ];
+        if let Err(reason) = constrained_positive.result {
+            return GateStatus::Failed {
+                reason: format!("constrained-positive fixture group: {reason}"),
+            };
         }
+        evidence.push(format!(
+            "constrained-positive fixture group executed: {}",
+            constrained_positive.executed_ids.join(", ")
+        ));
+        if let Err(reason) = constrained_negative.result {
+            return GateStatus::Failed {
+                reason: format!("constrained-negative fixture group: {reason}"),
+            };
+        }
+        evidence.push(format!(
+            "constrained-negative fixture group executed: {}",
+            constrained_negative.executed_ids.join(", ")
+        ));
+
+        GateStatus::Passed { evidence }
     }
 
     /// G-DEC-09: grammar cost. The corpus manifest fixes the measurement
@@ -1134,9 +1252,14 @@ impl GateRunner {
 
     /// G-DEC-12: regression and CI. The lane manifest names the mandatory
     /// `macos-metal` target and all twelve gates; the gate set carries zero
-    /// skips; and the scheduler-dependent release portion stays blocked while
-    /// G-DEC-11 is blocked.
-    pub fn gate_12_ci(&self, statuses: &BTreeMap<GateId, GateStatus>) -> GateStatus {
+    /// skips; the registry's scheduler-continuity fixture group executes; and
+    /// the scheduler-dependent release portion stays blocked while G-DEC-11
+    /// is blocked.
+    pub fn gate_12_ci(
+        &self,
+        statuses: &BTreeMap<GateId, GateStatus>,
+        scheduler_continuity: GroupOutcome,
+    ) -> GateStatus {
         let ci = &self.manifests.ci_lane;
         if !ci.mandatory_targets.iter().any(|t| t == "macos-metal") {
             return GateStatus::Failed {
@@ -1171,6 +1294,19 @@ impl GateRunner {
             };
         }
 
+        // The registry's scheduler-continuity group executes everywhere
+        // (hardware-independent); a failure is a CI regression and takes
+        // precedence over the blocked state below.
+        if let Err(reason) = scheduler_continuity.result {
+            return GateStatus::Failed {
+                reason: format!("scheduler-continuity fixture group: {reason}"),
+            };
+        }
+        let continuity_evidence = format!(
+            "scheduler-continuity fixture group executed: {}",
+            scheduler_continuity.executed_ids.join(", ")
+        );
+
         match statuses.get(&GateId::GDec11) {
             Some(GateStatus::Blocked { .. }) | None => GateStatus::Blocked {
                 reason: "scheduler-dependent release gate: G-DEC-11 is blocked, so D-009 and release claims remain blocked".to_string(),
@@ -1186,6 +1322,7 @@ impl GateRunner {
                     "ci-lane-manifest-v1 names macos-metal mandatory and all twelve gates"
                         .to_string(),
                     "gate set executed with zero applicable skips".to_string(),
+                    continuity_evidence,
                 ],
             },
         }
@@ -1387,6 +1524,31 @@ mod tests {
         let parity_ids = &evidence.executed_fixtures[PARITY_GROUP];
         assert_eq!(parity_ids.len(), 4);
         assert_eq!(evidence.certification_evidence_ids.len(), 2);
+
+        // Every non-parity registry group executed and recorded its entry IDs:
+        // request-processing x2, constrained-positive x3, constrained-negative
+        // x5, scheduler-continuity x7 (the checked-in registry counts).
+        let request_processing = &evidence.executed_fixtures[REQUEST_PROCESSING_GROUP];
+        assert_eq!(request_processing.len(), 2, "{request_processing:?}");
+        let constrained_positive = &evidence.executed_fixtures[CONSTRAINED_POSITIVE_GROUP];
+        assert_eq!(constrained_positive.len(), 3, "{constrained_positive:?}");
+        let constrained_negative = &evidence.executed_fixtures[CONSTRAINED_NEGATIVE_GROUP];
+        assert_eq!(constrained_negative.len(), 5, "{constrained_negative:?}");
+        let scheduler_continuity = &evidence.executed_fixtures[SCHEDULER_CONTINUITY_GROUP];
+        assert_eq!(scheduler_continuity.len(), 7, "{scheduler_continuity:?}");
+        // Every non-parity registry entry ID appears in the executed evidence.
+        let manifests = manifest_dir();
+        for entry in &manifests.fixture_registry.entries {
+            if entry.group == PARITY_GROUP {
+                continue;
+            }
+            let group_ids = &evidence.executed_fixtures[&entry.group];
+            assert!(
+                group_ids.iter().any(|id| id == &entry.id),
+                "registry entry {} missing from executed evidence",
+                entry.id
+            );
+        }
     }
 
     #[test]

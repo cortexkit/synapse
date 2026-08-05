@@ -12,7 +12,7 @@
 //! [`CrashBudgetStore`]; [`InMemoryBudgetStore`] backs fixtures and
 //! [`FileBudgetStore`] backs production persistence.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -71,10 +71,28 @@ impl BudgetRecord {
     }
 }
 
+/// A failure to persist crash-budget state. The supervisor treats these
+/// fail-closed: a key whose latest record could not be persisted refuses
+/// further dispatch with a typed unavailable error until a save succeeds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BudgetStoreError {
+    pub message: String,
+}
+
+impl From<std::io::Error> for BudgetStoreError {
+    fn from(error: std::io::Error) -> Self {
+        Self {
+            message: error.to_string(),
+        }
+    }
+}
+
 /// Persistence for crash-budget and quarantine state.
 pub trait CrashBudgetStore {
     fn load(&self, key: &QuarantineKey) -> Option<BudgetRecord>;
-    fn save(&mut self, key: &QuarantineKey, record: &BudgetRecord);
+    /// Persist the record for a key. A failure is surfaced to the caller and
+    /// fails dispatch closed; it must never be swallowed.
+    fn save(&mut self, key: &QuarantineKey, record: &BudgetRecord) -> Result<(), BudgetStoreError>;
 }
 
 /// An in-memory store. Fixtures use it to assert accounting without touching
@@ -89,8 +107,9 @@ impl CrashBudgetStore for InMemoryBudgetStore {
         self.records.get(&key.storage_id()).cloned()
     }
 
-    fn save(&mut self, key: &QuarantineKey, record: &BudgetRecord) {
+    fn save(&mut self, key: &QuarantineKey, record: &BudgetRecord) -> Result<(), BudgetStoreError> {
         self.records.insert(key.storage_id(), record.clone());
+        Ok(())
     }
 }
 
@@ -134,16 +153,13 @@ impl CrashBudgetStore for FileBudgetStore {
         self.records.get(&key.storage_id()).cloned()
     }
 
-    fn save(&mut self, key: &QuarantineKey, record: &BudgetRecord) {
+    fn save(&mut self, key: &QuarantineKey, record: &BudgetRecord) -> Result<(), BudgetStoreError> {
         self.records.insert(key.storage_id(), record.clone());
-        // Persistence failures are surfaced rather than swallowed: a budget that
-        // cannot be persisted must fail closed, not silently forget strikes.
-        if let Err(error) = self.flush() {
-            eprintln!(
-                "owned-decode-worker: failed to persist crash budget to {}: {error}",
-                self.path.display()
-            );
-        }
+        // Persistence failures are surfaced rather than swallowed: a budget
+        // that cannot be persisted fails closed (the supervisor refuses
+        // further dispatch for the key) instead of silently forgetting
+        // strikes across a restart.
+        self.flush().map_err(BudgetStoreError::from)
     }
 }
 
@@ -161,12 +177,19 @@ pub struct ChargeOutcome {
 pub struct CrashBudget<S: CrashBudgetStore> {
     store: S,
     policy: BudgetPolicy,
+    /// Keys whose latest record failed to persist. Dispatch for these keys is
+    /// refused fail-closed until a save succeeds.
+    unpersisted: BTreeSet<String>,
 }
 
 impl<S: CrashBudgetStore> CrashBudget<S> {
     #[must_use]
     pub fn new(store: S, policy: BudgetPolicy) -> Self {
-        Self { store, policy }
+        Self {
+            store,
+            policy,
+            unpersisted: BTreeSet::new(),
+        }
     }
 
     #[must_use]
@@ -196,13 +219,15 @@ impl<S: CrashBudgetStore> CrashBudget<S> {
 
     /// Charge exactly one unit for a single failure classification. Records the
     /// classification in order, and quarantines the key if the charge exhausts
-    /// the budget. Returns the post-charge state.
+    /// the budget. Returns the post-charge state, or the persistence failure:
+    /// a record that cannot be persisted marks the key so the supervisor
+    /// refuses further dispatch for it fail-closed until a save succeeds.
     pub fn charge(
         &mut self,
         key: &QuarantineKey,
         classification: FailureClassification,
         now: Timestamp,
-    ) -> ChargeOutcome {
+    ) -> Result<ChargeOutcome, BudgetStoreError> {
         let mut record = self.record(key);
         record.strikes = record.strikes.saturating_add(1);
         record.failure_classifications.push(classification);
@@ -210,12 +235,30 @@ impl<S: CrashBudgetStore> CrashBudget<S> {
         if exhausted {
             record.quarantined_until = Some(now + self.policy.quarantine_duration_ms);
         }
-        self.store.save(key, &record);
-        ChargeOutcome {
+        match self.store.save(key, &record) {
+            Ok(()) => {
+                self.unpersisted.remove(&key.storage_id());
+            }
+            Err(error) => {
+                // The strike stays in memory for this process; the key is
+                // marked unpersisted so dispatch fails closed.
+                self.unpersisted.insert(key.storage_id());
+                return Err(error);
+            }
+        }
+        Ok(ChargeOutcome {
             strikes_after: record.strikes,
             exhausted,
             quarantined: exhausted,
-        }
+        })
+    }
+
+    /// Whether the key's latest budget record failed to persist. The
+    /// supervisor refuses dispatch for such keys (typed unavailable) until a
+    /// save succeeds.
+    #[must_use]
+    pub fn persistence_failed(&self, key: &QuarantineKey) -> bool {
+        self.unpersisted.contains(&key.storage_id())
     }
 
     /// Whether a worker-crash redispatch is permitted: after the first failure
@@ -239,7 +282,9 @@ mod tests {
     #[test]
     fn first_crash_leaves_one_unit_and_permits_redispatch() {
         let mut budget = CrashBudget::new(InMemoryBudgetStore::default(), BudgetPolicy::default());
-        let outcome = budget.charge(&key(), FailureClassification::Crash, 0);
+        let outcome = budget
+            .charge(&key(), FailureClassification::Crash, 0)
+            .expect("in-memory save succeeds");
         assert_eq!(outcome.strikes_after, 1);
         assert!(!outcome.exhausted);
         assert!(!outcome.quarantined);
@@ -250,8 +295,12 @@ mod tests {
     #[test]
     fn second_crash_exhausts_and_quarantines() {
         let mut budget = CrashBudget::new(InMemoryBudgetStore::default(), BudgetPolicy::default());
-        budget.charge(&key(), FailureClassification::Crash, 0);
-        let outcome = budget.charge(&key(), FailureClassification::Crash, 10);
+        budget
+            .charge(&key(), FailureClassification::Crash, 0)
+            .expect("in-memory save succeeds");
+        let outcome = budget
+            .charge(&key(), FailureClassification::Crash, 10)
+            .expect("in-memory save succeeds");
         assert_eq!(outcome.strikes_after, 2);
         assert!(outcome.exhausted);
         assert!(outcome.quarantined);
@@ -264,8 +313,12 @@ mod tests {
     #[test]
     fn classifications_are_recorded_in_order() {
         let mut budget = CrashBudget::new(InMemoryBudgetStore::default(), BudgetPolicy::default());
-        budget.charge(&key(), FailureClassification::Crash, 0);
-        budget.charge(&key(), FailureClassification::StartupFailure, 5);
+        budget
+            .charge(&key(), FailureClassification::Crash, 0)
+            .expect("in-memory save succeeds");
+        budget
+            .charge(&key(), FailureClassification::StartupFailure, 5)
+            .expect("in-memory save succeeds");
         assert_eq!(
             budget.record(&key()).failure_classifications,
             vec![
@@ -289,7 +342,9 @@ mod tests {
         {
             let store = FileBudgetStore::open(&file).expect("open");
             let mut budget = CrashBudget::new(store, BudgetPolicy::default());
-            budget.charge(&key(), FailureClassification::Timeout, 0);
+            budget
+                .charge(&key(), FailureClassification::Timeout, 0)
+                .expect("file save succeeds");
         }
         // Reopen: the strike survived.
         let store = FileBudgetStore::open(&file).expect("reopen");
@@ -300,5 +355,70 @@ mod tests {
             vec![FailureClassification::Timeout]
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A store whose save can be toggled to fail, for fail-closed tests.
+    #[derive(Default)]
+    struct FailingStore {
+        records: BTreeMap<String, BudgetRecord>,
+        fail: bool,
+    }
+
+    impl CrashBudgetStore for FailingStore {
+        fn load(&self, key: &QuarantineKey) -> Option<BudgetRecord> {
+            self.records.get(&key.storage_id()).cloned()
+        }
+
+        fn save(
+            &mut self,
+            key: &QuarantineKey,
+            record: &BudgetRecord,
+        ) -> Result<(), BudgetStoreError> {
+            // Models FileBudgetStore: the in-memory record updates first;
+            // the flush to disk is what fails.
+            self.records.insert(key.storage_id(), record.clone());
+            if self.fail {
+                return Err(BudgetStoreError {
+                    message: "disk failure".to_string(),
+                });
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn save_failure_surfaces_and_marks_the_key_unpersisted() {
+        let store = FailingStore {
+            records: BTreeMap::new(),
+            fail: true,
+        };
+        let mut budget = CrashBudget::new(store, BudgetPolicy::default());
+        let error = budget
+            .charge(&key(), FailureClassification::Crash, 0)
+            .expect_err("persistence failure is surfaced, not swallowed");
+        assert_eq!(error.message, "disk failure");
+        assert!(budget.persistence_failed(&key()));
+        // The strike is still held in memory for this process.
+        assert_eq!(budget.remaining(&key()), 1);
+    }
+
+    #[test]
+    fn a_later_successful_save_clears_the_unpersisted_mark() {
+        let store = FailingStore {
+            records: BTreeMap::new(),
+            fail: true,
+        };
+        let mut budget = CrashBudget::new(store, BudgetPolicy::default());
+        assert!(budget
+            .charge(&key(), FailureClassification::Crash, 0)
+            .is_err());
+        assert!(budget.persistence_failed(&key()));
+        // The disk recovers; the next charge persists both strikes and clears
+        // the fail-closed mark.
+        budget.store.fail = false;
+        budget
+            .charge(&key(), FailureClassification::Crash, 1)
+            .expect("recovered save succeeds");
+        assert!(!budget.persistence_failed(&key()));
     }
 }

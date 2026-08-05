@@ -35,6 +35,7 @@
 //! `owned-decode-grammar-scheduler` precedent.
 
 pub mod cutover;
+pub mod fixture_groups;
 pub mod fixtures;
 pub mod gates;
 pub mod probe;
@@ -49,6 +50,11 @@ mod metal_probe;
 pub use cutover::{
     cutover_inputs_from_evidence, disable_profile, load_checked_in_cutover_records,
     wire_bindings_are_literal, CutoverEvidenceInputs, D009CutoverRecord, D009CutoverRecords,
+};
+pub use fixture_groups::{
+    run_constrained_negative, run_constrained_positive, run_request_processing,
+    run_scheduler_continuity, GroupOutcome, CONSTRAINED_NEGATIVE_GROUP, CONSTRAINED_POSITIVE_GROUP,
+    REQUEST_PROCESSING_GROUP, SCHEDULER_CONTINUITY_GROUP,
 };
 pub use fixtures::{
     battery_digest, parity_battery, spike_reference_stream, token_stream_digest, FixtureError,

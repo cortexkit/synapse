@@ -18,9 +18,10 @@ A pure-Rust state machine that supervises the owned Metal decode worker:
   sequence and session validation. Frames from closed or superseded sessions are
   rejected; repeated or skipped sequences are protocol-fatal.
 - **Terminal-control boundary** precedence: a natural terminal completion
-  (`stop_token`, `max_tokens`, `grammar_complete`) wins outright; otherwise the
-  deadline is evaluated before cancellation, so the deadline wins when both are
-  pending at the same boundary (resolution r2 #4 reconciled with `error_contract`).
+  (`stop_token`, `max_tokens`, `grammar_complete`) wins outright; otherwise
+  cancellation is evaluated before the deadline, so cancellation wins when
+  both are pending at the same boundary (resolution r2 #4 reconciled with
+  `error_contract`).
 - **Crash-budget persistence and quarantine.** Crashes, protocol-fatal responses,
   startup failures, timeouts, and failed cancellations each charge one unit;
   acknowledged cancellation and deadline cleanup before timeout charge nothing.
@@ -60,8 +61,8 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-All gates pass: 39 library unit tests, 26 protocol-behavior fixtures, and 12
-ownership-safety fixtures (77 total).
+All gates pass: 45 library unit tests, 27 protocol-behavior fixtures, and 12
+ownership-safety fixtures (84 total).
 
 ## Fixture coverage
 
@@ -69,11 +70,14 @@ ownership-safety fixtures (77 total).
 
 - dedicated mismatch mappings (runtime, every constraint field, protocol, sampling);
 - timeout classification and crash-budget consequences (terminal, no redispatch);
-- terminal-control precedence (completion > deadline > cancellation);
+- terminal-control precedence (completion > cancellation > deadline);
 - literal cleanup-timeout and cancellation wire errors (`deadline_exceeded`,
   `cancelled`) — never the symbolic placeholders;
 - repeated/skipped sequences, stale-session rejection, malformed frames;
-- every successful finish reason and stop-control omission;
+- every successful finish reason and stop-control omission (asserted against
+  the modeled greedy union selection, not pass-through);
+- failed cancellation at the deadline and cancellation boundaries: kill
+  escalation, one `failed_cancellation` strike, and budget exhaustion;
 - multi-quantum progress/continuation with an exact sequence trace and
   remaining-budget truncation;
 - the single crash redispatch: token-zero restart, sequence reset, delayed

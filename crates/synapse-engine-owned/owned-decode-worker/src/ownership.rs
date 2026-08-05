@@ -112,6 +112,8 @@ pub struct OwnershipLedger {
     /// Freed resource ids (kept to detect use-after-free and double free).
     freed: std::collections::BTreeSet<u64>,
     violations: Vec<OwnershipViolation>,
+    /// Allocation attempts that failed and created no live entry.
+    failed_allocation_attempts: usize,
 }
 
 impl OwnershipLedger {
@@ -127,6 +129,26 @@ impl OwnershipLedger {
         self.next_id += 1;
         self.live.insert(id, kind);
         id
+    }
+
+    /// Model an allocation attempt with a fallible allocator (e.g. the Metal
+    /// buffer allocation returns null). When `succeeds` is false the attempt
+    /// is recorded but creates no live entry: there is no id and nothing to
+    /// free for it, which is exactly what partial-initialization teardown
+    /// must handle. Returns the id for a successful allocation.
+    pub fn attempt_allocate(&mut self, kind: ResidentStateKind, succeeds: bool) -> Option<u64> {
+        if succeeds {
+            Some(self.allocate(kind))
+        } else {
+            self.failed_allocation_attempts += 1;
+            None
+        }
+    }
+
+    /// The number of allocation attempts that failed (created no live entry).
+    #[must_use]
+    pub fn failed_allocation_attempts(&self) -> usize {
+        self.failed_allocation_attempts
     }
 
     /// Model an ownership transfer across the FFI boundary. The resource stays
