@@ -591,6 +591,9 @@ struct RuntimeState {
     alias_admin_enabled: bool,
     microllm_max_tokens: u32,
     grammar_enabled: bool,
+    // Read only under cfg(debug_assertions) (the dev-only test-cutover gate);
+    // carried unconditionally so RuntimeState has one shape on every profile.
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
     owned_decode_cutover_for_test: bool,
     cache_max_bytes: u64,
     scheduler: Arc<Mutex<InlineScheduler>>,
@@ -5178,6 +5181,7 @@ fn owned_decode_quarantined(
     budget.is_quarantined(&key, 0)
 }
 
+#[cfg(target_os = "macos")]
 fn owned_decode_vocabulary_digest(
     tokenizer: &SanitizedTokenizer,
 ) -> Result<String, WireOperationError> {
@@ -5193,6 +5197,20 @@ fn owned_decode_vocabulary_digest(
         hasher.update([0]);
     }
     Ok(hex::encode(hasher.finalize()))
+}
+
+/// The owned decode engines are Metal-only; on other platforms the owned lane
+/// refuses before any grammar compilation, so this path is unreachable in
+/// practice — it exists so the wire handler compiles on every target and fails
+/// closed if ever reached.
+#[cfg(not(target_os = "macos"))]
+fn owned_decode_vocabulary_digest(
+    _tokenizer: &SanitizedTokenizer,
+) -> Result<String, WireOperationError> {
+    Err(WireOperationError::from_stable(
+        StableError::artifact_invalid(),
+        "owned decode is unsupported on this platform (owned_decode_unsupported)",
+    ))
 }
 
 fn worker_constraint(
