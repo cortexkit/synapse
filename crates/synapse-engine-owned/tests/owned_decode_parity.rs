@@ -421,14 +421,22 @@ fn parity_qwen3_q8() {
 }
 
 /// Certified near-tie fork signatures for the LFM2 f16 lane:
-/// (prompt id, step, production token, CPU-oracle token). The M5 build host
-/// forks at completion-15/step 17: the engine emits 523 where the CPU oracle
-/// emits 518 — the CPU top-2 pair is exactly (518, 523) with gap 0.000362,
-/// inside the 0.05 structural band, so the fork is a certified top-2 swap.
-/// The spike's Metal step engine produces the same fork on this machine and
-/// the production engine is byte-identical to it. Recertifying on another
-/// machine requires recording that machine's exact signature here.
-const LFM2_F16_CERTIFIED_FORKS: &[(&str, usize, u32, u32)] = &[("completion-15", 17, 523, 518)];
+/// (prompt id, step, production token, CPU-oracle token). GPU transcendental
+/// rounding differs per Apple Silicon generation, so each machine flips a
+/// DIFFERENT near-tie and every certified machine records its exact signature
+/// here (the program's two-tier model: pinned signatures per machine +
+/// structural band everywhere):
+/// - M5 Max (dev box): completion-15/step 17, engine 523 vs oracle 518,
+///   CPU top-2 (518, 523), gap 0.000362.
+/// - M1 Max ([bench-host-alias]-metal CI runner, historical authority): completion-05/
+///   step 8, engine 7693 vs oracle 1827, CPU top-2 (1827, 7693), gap 0.00727
+///   (LFM2-METAL-STEP.md, stage-C certification).
+/// The spike's Metal step engine produces the same fork as the production
+/// engine on each machine. A fork not in this list fails the gate.
+const LFM2_F16_CERTIFIED_FORKS: &[(&str, usize, u32, u32)] = &[
+    ("completion-15", 17, 523, 518),
+    ("completion-05", 8, 7693, 1827),
+];
 
 /// Structural-band ceiling for the LFM2 f16 lane: at most two top-2 swaps
 /// (structural-band-v1 manifest, lfm2-1.2b/f16).
