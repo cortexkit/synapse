@@ -85,7 +85,10 @@ struct HybridLayerWeights {
 }
 
 pub struct Lfm2HybridStepCache {
-    position: usize,
+    /// Number of prompt and generated tokens committed to the resident cache.
+    /// The supervised worker constructs the zero-position cache when constrained
+    /// prefill needs logits for the first permitted token.
+    pub position: usize,
 }
 
 /// Production-owned LFM2 hybrid Metal step engine.

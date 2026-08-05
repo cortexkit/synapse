@@ -5088,6 +5088,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "owned-decode-worker"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "parking"
 version = "2.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6671,6 +6681,7 @@ dependencies = [
  "cortexkit-store-types",
  "hex",
  "httpdate",
+ "owned-decode-worker",
  "reqwest",
  "rusqlite",
  "serde",
@@ -6723,6 +6734,23 @@ name = "synapse-worker-ane"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+]
+
+[[package]]
+name = "synapse-worker-decode"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "hex",
+ "owned-decode-worker",
+ "serde",
+ "serde_json",
+ "sha2",
+ "synapse-core",
+ "synapse-engine-owned",
+ "synapse-module",
+ "tokenizers 0.21.4",
 ]
 
 [[package]]

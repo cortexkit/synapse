@@ -6,6 +6,23 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use owned_decode_worker::{
+    budget::{BudgetPolicy as OwnedBudgetPolicy, CrashBudget as OwnedCrashBudget, FileBudgetStore},
+    error::DecodeError,
+    identity::QuarantineKey,
+    protocol::{
+        DecodeTransportRequest, DecodeTransportResponse, FrameEnvelope, GenerateCancel,
+        GenerateContinue, GenerateStart,
+    },
+    supervisor::{
+        Clock as OwnedClock, GenerationRequest as OwnedGenerationRequest, Supervisor,
+        TerminalControl,
+    },
+    validation::{StartAuthorization, WorkerStartContext},
+    worker::{
+        CancelAck, DecodeWorker, SteppedFrame, WorkerFactory, WorkerFault, WorkerStartFailure,
+    },
+};
 use serde::Serialize;
 use synapse_core::{
     accept_worker_handshake, decode_f32_frame, encode_i32_frame, prepare_listener, read_json,
@@ -38,6 +55,18 @@ impl Default for CrashBudget {
     }
 }
 
+/// Crash/quarantine authority for a worker host.
+///
+/// Legacy workers use the host's per-model rolling window. Owned decode uses
+/// the S3 store-backed `CrashBudget` keyed by machine/decode/runtime identity,
+/// so the generic host must not maintain a second crash book for that worker.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CrashAuthority {
+    #[default]
+    WorkerHost,
+    OwnedDecodeSupervisor,
+}
+
 #[derive(Clone, Debug)]
 pub struct WorkerHostConfig {
     pub worker_bin: PathBuf,
@@ -48,6 +77,7 @@ pub struct WorkerHostConfig {
     pub request_timeout: Duration,
     pub load_timeout: Duration,
     pub crash_budget: CrashBudget,
+    pub crash_authority: CrashAuthority,
     pub extra_args: Vec<String>,
     pub pooling: WorkerPooling,
     pub normalize: bool,
@@ -64,6 +94,7 @@ impl WorkerHostConfig {
             request_timeout: Duration::from_secs(30),
             load_timeout: Duration::from_secs(180),
             crash_budget: CrashBudget::default(),
+            crash_authority: CrashAuthority::WorkerHost,
             extra_args: Vec::new(),
             pooling: WorkerPooling::Mean,
             normalize: true,
@@ -141,6 +172,7 @@ struct WorkerConnection {
     stream: WorkerTransportStream,
     child: Child,
     logs: LogRing,
+    worker_generation: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -366,6 +398,105 @@ impl WorkerHost {
                 Err(error)
             }
             Err(error) => Err(error),
+        }
+    }
+
+    /// Start one resident owned-decode generation. The generic host owns only
+    /// process/nonce/framing supervision; the S3 supervisor remains the sole
+    /// crash-budget and quarantine authority.
+    pub async fn owned_decode_start(
+        &mut self,
+        model: &LoadedModel,
+        mut start: GenerateStart,
+    ) -> Result<(u64, FrameEnvelope), WorkerHostError> {
+        let (worker_model_ref, _) = self.ensure_worker_model(model).await?;
+        start.loaded_model_ref = worker_model_ref;
+        let worker_generation = self
+            .connection
+            .as_ref()
+            .map(|connection| connection.worker_generation)
+            .ok_or_else(|| {
+                WorkerHostError::Protocol("owned worker is not connected".to_string())
+            })?;
+        let req_id = self.next_req_id("generate_start");
+        match self
+            .send_owned_request(DecodeTransportRequest::GenerateStart {
+                req_id: req_id.clone(),
+                start: Box::new(start),
+            })
+            .await?
+        {
+            DecodeTransportResponse::Frame {
+                req_id: got,
+                envelope,
+            } => {
+                ensure_req_id(&req_id, &got)?;
+                Ok((worker_generation, envelope))
+            }
+            other => Err(WorkerHostError::Protocol(format!(
+                "GENERATE_START returned unexpected response {other:?}"
+            ))),
+        }
+    }
+
+    pub async fn owned_decode_continue(
+        &mut self,
+        continuation: GenerateContinue,
+    ) -> Result<FrameEnvelope, WorkerHostError> {
+        let req_id = self.next_req_id("generate_continue");
+        match self
+            .send_owned_request(DecodeTransportRequest::GenerateContinue {
+                req_id: req_id.clone(),
+                continuation,
+            })
+            .await?
+        {
+            DecodeTransportResponse::Frame {
+                req_id: got,
+                envelope,
+            } => {
+                ensure_req_id(&req_id, &got)?;
+                Ok(envelope)
+            }
+            other => Err(WorkerHostError::Protocol(format!(
+                "GENERATE_CONTINUE returned unexpected response {other:?}"
+            ))),
+        }
+    }
+
+    pub async fn owned_decode_cancel(
+        &mut self,
+        cancellation: GenerateCancel,
+    ) -> Result<u32, WorkerHostError> {
+        let req_id = self.next_req_id("generate_cancel");
+        match self
+            .send_owned_request(DecodeTransportRequest::GenerateCancel {
+                req_id: req_id.clone(),
+                cancellation,
+            })
+            .await?
+        {
+            DecodeTransportResponse::Cancelled {
+                req_id: got,
+                committed_token_count,
+                ..
+            } => {
+                ensure_req_id(&req_id, &got)?;
+                Ok(committed_token_count)
+            }
+            DecodeTransportResponse::Frame {
+                req_id: got,
+                envelope,
+            } => {
+                ensure_req_id(&req_id, &got)?;
+                Err(WorkerHostError::WorkerErr {
+                    code: match envelope.frame {
+                        owned_decode_worker::protocol::WorkerFrame::Error { id } => id,
+                        other => format!("unexpected_{other:?}"),
+                    },
+                    msg: "owned worker rejected cancellation".to_string(),
+                })
+            }
         }
     }
 
@@ -608,6 +739,7 @@ impl WorkerHost {
             stream,
             child,
             logs,
+            worker_generation: worker_generation_from_nonce(&nonce)?,
         });
         Ok(())
     }
@@ -663,6 +795,48 @@ impl WorkerHost {
         }
     }
 
+    async fn send_owned_request(
+        &mut self,
+        request: DecodeTransportRequest,
+    ) -> Result<DecodeTransportResponse, WorkerHostError> {
+        self.ensure_worker().await?;
+        let max_frame = self.config.max_frame;
+        let result = timeout(self.config.request_timeout, async {
+            let connection = self
+                .connection
+                .as_mut()
+                .expect("connection exists after ensure_worker");
+            write_json(&mut connection.stream, &request, max_frame).await?;
+            let response: DecodeTransportResponse =
+                read_json(&mut connection.stream, max_frame).await?;
+            Ok::<_, WorkerHostError>(response)
+        })
+        .await;
+        match result {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(error @ WorkerHostError::Protocol(_))) => Err(error),
+            Ok(Err(error)) => {
+                let stderr_tail = self.kill_current().await;
+                Err(WorkerHostError::EngineCrashed {
+                    stage: "owned_decode_transport".to_string(),
+                    detail: error.to_string(),
+                    stderr_tail,
+                })
+            }
+            Err(_) => {
+                let stderr_tail = self.kill_current().await;
+                Err(WorkerHostError::EngineCrashed {
+                    stage: "timeout".to_string(),
+                    detail: format!(
+                        "owned decode request exceeded {} ms",
+                        self.config.request_timeout.as_millis()
+                    ),
+                    stderr_tail,
+                })
+            }
+        }
+    }
+
     async fn kill_current(&mut self) -> String {
         let Some(mut connection) = self.connection.take() else {
             self.forget_worker_model_refs();
@@ -675,6 +849,9 @@ impl WorkerHost {
     }
 
     async fn record_crash_and_maybe_restart(&mut self, key: String) {
+        if self.config.crash_authority == CrashAuthority::OwnedDecodeSupervisor {
+            return;
+        }
         let quarantined = self.record_crash(key);
         if !quarantined {
             let _ = self.start_worker().await;
@@ -738,6 +915,36 @@ impl WorkerEngine {
     pub fn ping(&self) -> Result<WorkerPing, WorkerHostError> {
         let mut host = self.lock_host()?;
         self.runtime.block_on(host.ping())
+    }
+
+    fn owned_decode_start(
+        &self,
+        model: &LoadedModel,
+        start: GenerateStart,
+    ) -> Result<(u64, FrameEnvelope), WorkerHostError> {
+        let mut host = self.lock_host()?;
+        self.runtime.block_on(host.owned_decode_start(model, start))
+    }
+
+    fn owned_decode_continue(
+        &self,
+        continuation: GenerateContinue,
+    ) -> Result<FrameEnvelope, WorkerHostError> {
+        let mut host = self.lock_host()?;
+        self.runtime
+            .block_on(host.owned_decode_continue(continuation))
+    }
+
+    fn owned_decode_cancel(&self, cancellation: GenerateCancel) -> Result<u32, WorkerHostError> {
+        let mut host = self.lock_host()?;
+        self.runtime
+            .block_on(host.owned_decode_cancel(cancellation))
+    }
+
+    fn owned_decode_kill(&self) {
+        if let Ok(mut host) = self.lock_host() {
+            let _ = self.runtime.block_on(host.kill_current());
+        }
     }
 }
 
@@ -864,6 +1071,270 @@ impl GenerateEngine for WorkerEngine {
 
     fn unload(&mut self, model: &LoadedModel) {
         <Self as EmbedEngine>::unload(self, model);
+    }
+}
+
+/// Process factory consumed by the S3 owned-decode supervisor. Each spawn owns
+/// a fresh transport session and reloads the immutable model key. The generic
+/// host's rolling crash window is disabled, leaving the S3 store-backed budget
+/// as the single quarantine authority.
+pub struct OwnedDecodeWorkerFactory {
+    config: WorkerHostConfig,
+    artifact: ValidatedArtifact,
+    runtime_config: RuntimeConfig,
+}
+
+impl OwnedDecodeWorkerFactory {
+    pub fn new(
+        mut config: WorkerHostConfig,
+        artifact: ValidatedArtifact,
+        runtime_config: RuntimeConfig,
+    ) -> Self {
+        config.crash_authority = CrashAuthority::OwnedDecodeSupervisor;
+        Self {
+            config,
+            artifact,
+            runtime_config,
+        }
+    }
+}
+
+struct MonotonicDispatchClock {
+    started: Instant,
+}
+
+impl OwnedClock for MonotonicDispatchClock {
+    fn now(&self) -> u64 {
+        self.started
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX)
+    }
+}
+
+/// Real routing dispatch for the owned lane. Routing fixes the selected lane;
+/// this adapter drives the S3 supervisor, which in turn owns the only crash
+/// budget, one-redispatch rule, and persistent quarantine key.
+pub struct SupervisedDecodeDispatch {
+    supervisor: Supervisor<FileBudgetStore>,
+    factory: OwnedDecodeWorkerFactory,
+    key: QuarantineKey,
+    start: GenerateStart,
+    context: WorkerStartContext,
+    control: TerminalControl,
+    clock: MonotonicDispatchClock,
+}
+
+impl SupervisedDecodeDispatch {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        factory: OwnedDecodeWorkerFactory,
+        budget_store_path: impl AsRef<Path>,
+        budget_policy: OwnedBudgetPolicy,
+        production_n: u32,
+        key: QuarantineKey,
+        start: GenerateStart,
+        context: WorkerStartContext,
+        control: TerminalControl,
+    ) -> io::Result<Self> {
+        let budget_store = FileBudgetStore::open(budget_store_path)?;
+        Ok(Self {
+            supervisor: Supervisor::new(
+                OwnedCrashBudget::new(budget_store, budget_policy),
+                production_n,
+            ),
+            factory,
+            key,
+            start,
+            context,
+            control,
+            clock: MonotonicDispatchClock {
+                started: Instant::now(),
+            },
+        })
+    }
+}
+
+impl crate::owned_decode_routing::DecodeDispatch for SupervisedDecodeDispatch {
+    fn dispatch(
+        &mut self,
+        command: &crate::owned_decode_routing::DispatchedCommand,
+    ) -> Result<
+        crate::owned_decode_routing::ExecutionSuccess,
+        crate::owned_decode_routing::error::OwnedDecodeError,
+    > {
+        if command.lane != crate::owned_decode_routing::lane::LaneKind::OwnedDecode {
+            return Err(crate::owned_decode_routing::error::OwnedDecodeError::Unsupported);
+        }
+        self.start.generation_id.clone_from(&command.generation_id);
+        self.start
+            .decode_fingerprint
+            .clone_from(&command.decode_fingerprint.0);
+        self.start.max_tokens = command.max_tokens;
+        let request = OwnedGenerationRequest {
+            key: self.key.clone(),
+            start: self.start.clone(),
+        };
+        let outcome = self.supervisor.run_generation(
+            &request,
+            &mut self.factory,
+            &self.context,
+            &self.control,
+            &self.clock,
+        );
+        let success = outcome.result.map_err(map_decode_error)?;
+        Ok(crate::owned_decode_routing::ExecutionSuccess {
+            generated_token_ids: success.generated_ids,
+            finish_reason: map_finish_reason(success.finish_reason),
+            lane_finish_reason: None,
+            worker_generation: success.worker_generation,
+            last_completed_quantum_sequence: success.last_completed_sequence,
+            crash_retry_count: outcome.provenance.crash_retry_count,
+            failure_classifications: outcome
+                .provenance
+                .failure_classifications
+                .into_iter()
+                .map(|classification| classification.as_str().to_string())
+                .collect(),
+        })
+    }
+}
+
+fn map_finish_reason(
+    finish_reason: owned_decode_worker::protocol::FinishReason,
+) -> crate::owned_decode_routing::provenance::FinishReason {
+    match finish_reason {
+        owned_decode_worker::protocol::FinishReason::StopToken => {
+            crate::owned_decode_routing::provenance::FinishReason::StopToken
+        }
+        owned_decode_worker::protocol::FinishReason::MaxTokens => {
+            crate::owned_decode_routing::provenance::FinishReason::MaxTokens
+        }
+        owned_decode_worker::protocol::FinishReason::GrammarComplete => {
+            crate::owned_decode_routing::provenance::FinishReason::GrammarComplete
+        }
+        owned_decode_worker::protocol::FinishReason::Cancelled => {
+            crate::owned_decode_routing::provenance::FinishReason::Cancelled
+        }
+    }
+}
+
+fn map_decode_error(error: DecodeError) -> crate::owned_decode_routing::error::OwnedDecodeError {
+    use crate::owned_decode_routing::error::OwnedDecodeError as RoutingError;
+    match error {
+        DecodeError::NotCertified => RoutingError::NotCertified,
+        DecodeError::CertificationFailed => RoutingError::CertificationFailed,
+        DecodeError::Quarantined => RoutingError::Quarantined,
+        DecodeError::ArtifactPoisoned => RoutingError::ArtifactPoisoned,
+        DecodeError::Unavailable => RoutingError::Unavailable,
+        DecodeError::Unsupported => RoutingError::Unsupported,
+        DecodeError::ProtocolMismatch => RoutingError::ProtocolMismatch,
+        DecodeError::RuntimeConfigMismatch => RoutingError::RuntimeConfigMismatch,
+        DecodeError::ConstraintVersionMismatch => RoutingError::ConstraintVersionMismatch,
+        DecodeError::SamplingUnsupported => RoutingError::SamplingUnsupported,
+        DecodeError::ContextCapacityExceeded => RoutingError::ContextCapacityExceeded,
+        DecodeError::GrammarDisabled => RoutingError::GrammarDisabled,
+        DecodeError::GrammarParseFailed => RoutingError::GrammarParseFailed,
+        DecodeError::GrammarFeatureUnsupported => RoutingError::GrammarFeatureUnsupported,
+        DecodeError::GrammarUnsatisfiable => RoutingError::GrammarUnsatisfiable,
+        DecodeError::GrammarStopBeforeCompletion => RoutingError::GrammarStopBeforeCompletion,
+        DecodeError::GrammarMaxTokensExhausted => RoutingError::GrammarMaxTokensExhausted,
+        DecodeError::DeadlineExceeded => RoutingError::DeadlineExceeded,
+        DecodeError::Cancelled => RoutingError::Cancelled,
+    }
+}
+
+struct OwnedDecodeWorkerSession {
+    engine: WorkerEngine,
+    model: LoadedModel,
+    worker_generation: u64,
+    pending: Option<owned_decode_worker::protocol::WorkerFrame>,
+}
+
+impl WorkerFactory for OwnedDecodeWorkerFactory {
+    fn spawn(&mut self) -> Result<Box<dyn DecodeWorker>, WorkerFault> {
+        let mut engine =
+            WorkerEngine::new(self.config.clone()).map_err(|_| WorkerFault::StartupFailure)?;
+        let model = GenerateEngine::load(&mut engine, &self.artifact, &self.runtime_config)
+            .map_err(|_| WorkerFault::StartupFailure)?;
+        Ok(Box::new(OwnedDecodeWorkerSession {
+            engine,
+            model,
+            worker_generation: 0,
+            pending: None,
+        }))
+    }
+}
+
+impl DecodeWorker for OwnedDecodeWorkerSession {
+    fn worker_generation(&self) -> u64 {
+        self.worker_generation
+    }
+
+    fn start(
+        &mut self,
+        start: &GenerateStart,
+        context: &WorkerStartContext,
+        production_n: u32,
+    ) -> Result<StartAuthorization, WorkerStartFailure> {
+        let authorization =
+            owned_decode_worker::validation::validate_start(start, context, production_n)
+                .map_err(WorkerStartFailure::from)?;
+        let (worker_generation, envelope) = self
+            .engine
+            .owned_decode_start(&self.model, start.clone())
+            .map_err(|error| WorkerStartFailure::Fault(owned_host_fault(&error)))?;
+        owned_decode_worker::protocol::validate_frame_structure(&envelope)?;
+        self.worker_generation = worker_generation;
+        self.pending = Some(envelope.frame);
+        Ok(authorization)
+    }
+
+    fn step(&mut self) -> Result<SteppedFrame, WorkerFault> {
+        let frame = self.pending.take().ok_or(WorkerFault::Crash)?;
+        Ok(SteppedFrame {
+            worker_generation: self.worker_generation,
+            frame,
+        })
+    }
+
+    fn send_continue(&mut self, continuation: &GenerateContinue) -> Result<(), WorkerFault> {
+        let envelope = self
+            .engine
+            .owned_decode_continue(continuation.clone())
+            .map_err(|error| owned_host_fault(&error))?;
+        owned_decode_worker::protocol::validate_frame_structure(&envelope)
+            .map_err(|_| WorkerFault::Crash)?;
+        self.pending = Some(envelope.frame);
+        Ok(())
+    }
+
+    fn send_cancel(&mut self, cancellation: &GenerateCancel) -> Result<CancelAck, WorkerFault> {
+        let committed_token_count = self
+            .engine
+            .owned_decode_cancel(cancellation.clone())
+            .map_err(|_| WorkerFault::FailedCancellation)?;
+        Ok(CancelAck::Acknowledged {
+            committed_token_count,
+        })
+    }
+
+    fn kill(&mut self) {
+        self.engine.owned_decode_kill();
+        self.pending = None;
+    }
+}
+
+fn owned_host_fault(error: &WorkerHostError) -> WorkerFault {
+    match error {
+        WorkerHostError::EngineCrashed { stage, .. } if stage == "timeout" => WorkerFault::Timeout,
+        WorkerHostError::EngineCrashed { .. }
+        | WorkerHostError::Io(_)
+        | WorkerHostError::Json(_)
+        | WorkerHostError::Protocol(_)
+        | WorkerHostError::WorkerErr { .. }
+        | WorkerHostError::Quarantined { .. } => WorkerFault::Crash,
     }
 }
 
@@ -1025,6 +1496,16 @@ fn nonce_hex16() -> String {
     format!("{value:016x}")
 }
 
+fn worker_generation_from_nonce(nonce: &str) -> Result<u64, WorkerHostError> {
+    if nonce.len() != 16 || !nonce.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(WorkerHostError::Protocol(
+            "worker nonce must be 8-byte hex".to_string(),
+        ));
+    }
+    u64::from_str_radix(nonce, 16)
+        .map_err(|error| WorkerHostError::Protocol(format!("parse worker generation: {error}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1033,6 +1514,18 @@ mod tests {
         let nonce = nonce_hex16();
         assert_eq!(nonce.len(), 16);
         assert!(nonce.chars().all(|ch| ch.is_ascii_hexdigit()));
+    }
+
+    #[tokio::test]
+    async fn owned_decode_supervisor_is_the_only_crash_budget_authority() {
+        let mut config = WorkerHostConfig::new("unused-worker", std::env::temp_dir());
+        config.crash_authority = CrashAuthority::OwnedDecodeSupervisor;
+        let mut host = WorkerHost::new(config);
+        host.record_crash_and_maybe_restart("owned-key".to_string())
+            .await;
+        assert!(host.crashes.is_empty());
+        assert!(host.quarantined.is_empty());
+        assert!(host.connection.is_none());
     }
 
     #[cfg(unix)]

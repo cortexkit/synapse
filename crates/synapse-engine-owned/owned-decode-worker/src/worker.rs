@@ -47,6 +47,26 @@ pub enum WorkerFault {
     FailedCancellation,
 }
 
+/// Failure to start a resident generation. Typed validation refusals are clean;
+/// transport/process faults are chargeable by the crash-budget supervisor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkerStartFailure {
+    Typed(DecodeError),
+    Fault(WorkerFault),
+}
+
+impl From<DecodeError> for WorkerStartFailure {
+    fn from(error: DecodeError) -> Self {
+        Self::Typed(error)
+    }
+}
+
+impl From<WorkerFault> for WorkerStartFailure {
+    fn from(fault: WorkerFault) -> Self {
+        Self::Fault(fault)
+    }
+}
+
 /// The result of sending a cancellation to the worker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CancelAck {
@@ -76,7 +96,7 @@ pub trait DecodeWorker {
         start: &GenerateStart,
         context: &WorkerStartContext,
         production_n: u32,
-    ) -> Result<StartAuthorization, DecodeError>;
+    ) -> Result<StartAuthorization, WorkerStartFailure>;
 
     /// Drive the current quantum and return the frame the worker emits.
     fn step(&mut self) -> Result<SteppedFrame, WorkerFault>;
@@ -103,6 +123,8 @@ pub trait WorkerFactory {
 /// A single scripted event for one quantum of a worker attempt.
 #[derive(Clone, Debug)]
 pub enum ScriptedEvent {
+    /// Crash while accepting the start frame, before the first quantum exists.
+    StartCrash,
     /// Emit a well-formed progress frame; the worker assigns the next sequence.
     Progress { committed: u32 },
     /// Emit a progress frame with an explicit (typically wrong) sequence, to
@@ -167,12 +189,20 @@ impl DecodeWorker for ScriptedWorker {
         start: &GenerateStart,
         context: &WorkerStartContext,
         production_n: u32,
-    ) -> Result<StartAuthorization, DecodeError> {
+    ) -> Result<StartAuthorization, WorkerStartFailure> {
         // The scripted worker validates against its own loaded context, exactly
         // as the real worker validates the loaded-model reference, decode
         // fingerprint, and runtime digest before the first commit.
         let _ = context;
-        let auth = validate_start(start, &self.context, production_n)?;
+        if matches!(
+            self.events.get(self.cursor),
+            Some(ScriptedEvent::StartCrash)
+        ) {
+            self.cursor += 1;
+            return Err(WorkerStartFailure::Fault(WorkerFault::Crash));
+        }
+        let auth =
+            validate_start(start, &self.context, production_n).map_err(WorkerStartFailure::from)?;
         self.started = true;
         self.next_sequence = 1;
         self.committed = 0;
@@ -190,6 +220,7 @@ impl DecodeWorker for ScriptedWorker {
         self.cursor += 1;
         let generation = self.generation;
         match event {
+            ScriptedEvent::StartCrash => Err(WorkerFault::Crash),
             ScriptedEvent::Progress { committed } => {
                 self.committed = committed;
                 let sequence = self.next_sequence;

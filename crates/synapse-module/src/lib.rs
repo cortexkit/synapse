@@ -1531,7 +1531,7 @@ fn build_preload_catalog_model(
             .map(|profile| profile.dtype.as_str().to_string())
             .unwrap_or_else(|| default_quant(&engine_name))
     });
-    build_stored_model_config(
+    let mut spec = build_stored_model_config(
         model_id,
         &engine_name,
         task,
@@ -1557,7 +1557,19 @@ fn build_preload_catalog_model(
         owned,
         inline,
         jobs,
-    )
+    )?;
+    if engine_name == "owned-metal-decode" {
+        spec.owned_family = Some(preload.family.ok_or_else(|| {
+            ModuleError::Config("owned-metal-decode catalog entry is missing family".to_string())
+        })?);
+        spec.owned_dtype = Some(preload.dtype.unwrap_or_else(|| "f16".to_string()));
+        spec.owned_execution = Some(
+            preload
+                .execution
+                .unwrap_or_else(|| "supervised".to_string()),
+        );
+    }
+    Ok(spec)
 }
 
 fn normalize_catalog_model(
@@ -1568,6 +1580,13 @@ fn normalize_catalog_model(
     let engine_name = canonical_engine_name(&model.engine);
     let task = parse_model_task(Some(&model.task), &engine_name, &model.model_id)?;
     let pooling = parse_pooling(&model.pooling)?;
+    let decode_metadata = (engine_name == "owned-metal-decode").then(|| {
+        (
+            model.owned_family.clone(),
+            model.owned_dtype.clone(),
+            model.owned_execution.clone(),
+        )
+    });
     let owned = if engine_name == "owned-metal" {
         Some(OwnedCatalogConfig {
             family: OwnedFamily::parse(model.owned_family.as_deref().ok_or_else(|| {
@@ -1591,7 +1610,7 @@ fn normalize_catalog_model(
     } else {
         None
     };
-    build_stored_model_config(
+    let mut spec = build_stored_model_config(
         model.model_id,
         &engine_name,
         task,
@@ -1613,7 +1632,13 @@ fn normalize_catalog_model(
         owned,
         inline,
         jobs,
-    )
+    )?;
+    if let Some((family, dtype, execution)) = decode_metadata {
+        spec.owned_family = family;
+        spec.owned_dtype = dtype.or_else(|| Some("f16".to_string()));
+        spec.owned_execution = execution.or_else(|| Some("supervised".to_string()));
+    }
+    Ok(spec)
 }
 
 #[derive(Clone, Debug)]
@@ -1653,6 +1678,11 @@ fn build_stored_model_config(
     if engine_name == "owned-metal" && task != ModelTask::Embed {
         return Err(ModuleError::Config(
             "owned-metal supports embedding models only in wave 1".to_string(),
+        ));
+    }
+    if engine_name == "owned-metal-decode" && task != ModelTask::Generate {
+        return Err(ModuleError::Config(
+            "owned-metal-decode supports generation models only".to_string(),
         ));
     }
     let engine_identity = owned
@@ -1797,6 +1827,9 @@ fn canonical_engine_name(engine: &str) -> String {
         // Catalog entries select this engine explicitly. Future hardware probes can
         // populate the same catalog value without changing request dispatch.
         "owned" | "metal" | "owned_metal" => "owned-metal".to_string(),
+        "owned-decode" | "owned_metal_decode" | "owned-metal-decode" => {
+            "owned-metal-decode".to_string()
+        }
         other => other.to_string(),
     }
 }
@@ -1807,6 +1840,7 @@ fn default_artifact_format(engine_name: &str) -> String {
         "mlx" => "safetensors".to_string(),
         "ane" => "mlmodelc".to_string(),
         "owned-metal" => "safetensors-package".to_string(),
+        "owned-metal-decode" => "owned-safetensors".to_string(),
         _ => "onnx".to_string(),
     }
 }
@@ -1816,7 +1850,7 @@ fn default_quant(engine_name: &str) -> String {
         "llama" => "f16".to_string(),
         "mlx" => "bf16".to_string(),
         "ane" => "fp16".to_string(),
-        "owned-metal" => "f16".to_string(),
+        "owned-metal" | "owned-metal-decode" => "f16".to_string(),
         _ => "fp32".to_string(),
     }
 }
@@ -1843,6 +1877,15 @@ fn catalog_model_engine_identity(engine_name: &str) -> Result<EngineIdentity, Mo
             &[
                 ("transport", worker_catalog_transport()),
                 ("placement_gate", "neural-engine"),
+            ],
+        )),
+        "owned-metal-decode" => Ok(worker_catalog_identity(
+            "owned-metal-decode",
+            "owned-metal-decode-worker-v1",
+            &[
+                ("transport", worker_catalog_transport()),
+                ("lane", "decode"),
+                ("risk_class", "abort_capable"),
             ],
         )),
         other => Err(ModuleError::Config(format!(
@@ -4650,6 +4693,7 @@ async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
         provenance: ResponseProvenance {
             engine: model.engine_identity.clone(),
             remote: None,
+            owned_decode: Default::default(),
         },
         module_generation: state.module_generation,
         equivalent_to,
@@ -4691,21 +4735,29 @@ async fn microllm_oneshot(state: Arc<ModuleState>, params: Value) -> HandlerOutc
             ),
         );
     }
+    if let Some(model_id) = params.model.as_deref() {
+        if let Some(outcome) = route_owned_decode_preflight(&state, &params, model_id, None) {
+            return outcome;
+        }
+    }
     match params.grammar.as_deref() {
         None | Some("") => {}
         Some(raw) if raw.trim().is_empty() => {}
         Some(_) if !state.runtime.grammar_enabled => {
             return channel_error(
-                "invalid_request",
-                "microllm.oneshot grammar requires grammar_enabled=true in module config",
+                "grammar_disabled",
+                "microllm.oneshot constrained decoding is disabled in module config",
             );
         }
         Some(_) => {
-            // Grammar is intentionally rejected until the worker handshake can
-            // distinguish builds that safely support GBNF. Some older llama.cpp
-            // builds can terminate the worker while loading a grammar, so this
-            // fail-closed response is safer than forwarding a request blindly.
-            return channel_error("invalid_request", "grammar_unavailable_in_build");
+            // Constrained requests are owned-decode-only because the legacy
+            // llama worker must never receive raw grammar. Until this machine
+            // has a certified and explicitly enabled owned-decode grammar lane,
+            // fail closed with the routing contract's stable error ID.
+            return channel_error(
+                "grammar_disabled",
+                "no certified and enabled owned-decode grammar lane is available",
+            );
         }
     }
 
@@ -4735,7 +4787,9 @@ async fn microllm_oneshot(state: Arc<ModuleState>, params: Value) -> HandlerOutc
             ),
         ));
     }
-    if microllm_certification_required(&model) {
+    if microllm_certification_required(&model)
+        && model.engine_identity.engine != "owned-metal-decode"
+    {
         if let Err(error) = ensure_model_certified(&state, &model, params.accept_declared) {
             return result_outcome(error_payload(&state, error));
         }
@@ -4766,6 +4820,14 @@ async fn microllm_oneshot(state: Arc<ModuleState>, params: Value) -> HandlerOutc
         .first()
         .copied()
         .unwrap_or_default() as u64;
+    if let Some(outcome) = route_owned_decode_preflight(
+        &state,
+        &params,
+        &model.model_id,
+        Some(prompt_tokens.min(u64::from(u32::MAX)) as u32),
+    ) {
+        return outcome;
+    }
     let total_tokens = prompt_tokens.saturating_add(u64::from(params.max_tokens));
     if total_tokens > state.runtime.inline.max_tokens {
         return result_outcome(error_payload(
@@ -4822,12 +4884,190 @@ async fn microllm_oneshot(state: Arc<ModuleState>, params: Value) -> HandlerOutc
         provenance: ResponseProvenance {
             engine: model.engine_identity.clone(),
             remote: None,
+            owned_decode: Default::default(),
         },
         module_generation: state.module_generation,
         equivalent_to,
         payload,
     };
     result_outcome(serde_json::to_value(envelope).expect("microllm envelope should serialize"))
+}
+
+struct WirePreflightDispatch;
+
+impl owned_decode_routing::DecodeDispatch for WirePreflightDispatch {
+    fn dispatch(
+        &mut self,
+        _command: &owned_decode_routing::DispatchedCommand,
+    ) -> Result<owned_decode_routing::ExecutionSuccess, owned_decode_routing::error::OwnedDecodeError>
+    {
+        // Dispatch requires a version-controlled record that certifies this
+        // machine's owned-decode configuration and approves production cutover.
+        // Return Unavailable so this path cannot bypass that eligibility check.
+        Err(owned_decode_routing::error::OwnedDecodeError::Unavailable)
+    }
+}
+
+fn route_owned_decode_preflight(
+    state: &ModuleState,
+    params: &MicroLlmOneshotParams,
+    model_id: &str,
+    prompt_token_count: Option<u32>,
+) -> Option<HandlerOutcome> {
+    let spec = state
+        .runtime
+        .catalog
+        .lock()
+        .ok()
+        .and_then(|catalog| catalog.get(model_id).map(|slot| slot.spec.clone()))?;
+    if spec.engine != "owned-metal-decode" && spec.engine_identity.engine != "owned-metal-decode" {
+        return None;
+    }
+    let prompt_token_count = match prompt_token_count {
+        Some(count) => count,
+        None => {
+            let located = match locator_path(&spec.tokenizer_locator, &state.model_cache) {
+                Ok(located) => located,
+                Err(error) => return Some(result_outcome(error_payload(state, error))),
+            };
+            let tokenizer = match SanitizedTokenizer::from_file(
+                &located.path,
+                TokenizerConfig {
+                    max_tokens: spec.max_tokens,
+                },
+            ) {
+                Ok(tokenizer) => tokenizer,
+                Err(error) => {
+                    return Some(channel_error(
+                        "artifact_invalid",
+                        format!("owned-decode tokenizer is invalid: {error}"),
+                    ))
+                }
+            };
+            match tokenizer.tokenize(&params.prompt) {
+                Ok(tokenized) => tokenized.ids.len().min(u32::MAX as usize) as u32,
+                Err(error) => {
+                    return Some(channel_error(
+                        "invalid_request",
+                        format!("owned-decode prompt tokenization failed: {error}"),
+                    ))
+                }
+            }
+        }
+    };
+
+    let family_name = spec.owned_family.as_deref().unwrap_or_default();
+    let family = match owned_decode_routing::family::Family::parse(family_name) {
+        Ok(family) => family,
+        Err(error) => {
+            return Some(channel_error(
+                error.as_str(),
+                format!("owned-decode catalog family '{family_name}' is unsupported"),
+            ))
+        }
+    };
+    let weight_quant = match owned_decode_routing::identity::WeightQuant::parse(&spec.quant) {
+        Ok(quant) => quant,
+        Err(error) => {
+            return Some(channel_error(
+                error.as_str(),
+                format!("owned-decode catalog quant '{}' is unsupported", spec.quant),
+            ))
+        }
+    };
+    let flag = |name: &str| spec.engine_identity.build_flags.get(name).cloned();
+    let arithmetic_identity_revision = flag("arithmetic_identity_revision")
+        .unwrap_or_else(|| "owned-decode-arithmetic-v1".to_string());
+    let metallib_revision =
+        flag("metallib_revision").unwrap_or_else(|| "owned-decode-metallib-v1".to_string());
+    let max_context_tokens = flag("max_context_tokens")
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or_else(|| spec.max_tokens.min(u32::MAX as usize) as u32);
+    let q8 = if weight_quant.is_q8() {
+        Some(owned_decode_routing::identity::Q8Identity {
+            quantizer_revision: flag("quantizer_revision")
+                .unwrap_or_else(|| "q8-ingest-v1".to_string()),
+            derived_digest: flag("derived_digest").unwrap_or_else(|| spec.artifact_digest.clone()),
+        })
+    } else {
+        None
+    };
+    let entry = owned_decode_routing::CatalogEntry {
+        entry_id: spec.model_id.clone(),
+        engine: owned_decode_routing::CATALOG_ENGINE.to_string(),
+        task: owned_decode_routing::CATALOG_TASK.to_string(),
+        lane: owned_decode_routing::CATALOG_LANE.to_string(),
+        worker: owned_decode_routing::CATALOG_WORKER.to_string(),
+        risk_class: owned_decode_routing::CATALOG_RISK_CLASS.to_string(),
+        family,
+        activation_dtype: owned_decode_routing::identity::ActivationDType::F16,
+        weight_quant,
+        arithmetic_identity_revision,
+        metallib_revision,
+        max_context_tokens,
+        artifact_source_digest: spec.artifact_digest.clone(),
+        q8,
+        owned_family: spec.owned_family.clone(),
+        owned_dtype: Some("f16".to_string()),
+        quant: Some(spec.quant.clone()),
+    };
+    let context_buckets: owned_decode_contracts::ContextBucketsManifest = serde_json::from_str(
+        include_str!("../owned-decode-manifests/decode-context-buckets-v1.json"),
+    )
+    .expect("checked-in decode context buckets parse");
+    let router = owned_decode_routing::OwnedDecodeRouter::new(
+        owned_decode_routing::family::FamilyRegistry::production(),
+        context_buckets,
+        owned_decode_routing::q8ingest::Q8IngestRegistry::new(),
+        Box::new(owned_decode_routing::certification::CertificationStore::new()),
+    );
+    let grammar = params
+        .grammar
+        .as_deref()
+        .filter(|raw| !raw.trim().is_empty())
+        .map(|raw| serde_json::from_str(raw).unwrap_or(Value::Null));
+    let request = owned_decode_routing::request::OneshotRequest {
+        family,
+        weight_quant,
+        prompt_token_count,
+        max_tokens: params.max_tokens,
+        sampling: owned_decode_routing::request::SamplingMode::GreedyTop1,
+        grammar,
+        required_fingerprint: params.required_fingerprint.clone().map(Fingerprint),
+        allow_equivalent: params.allow_equivalent,
+        target_fingerprint: params.target_fingerprint.clone().map(Fingerprint),
+        required_processing_fingerprint: None,
+        owned_only: true,
+    };
+    let env = owned_decode_routing::RoutingEnvironment::without_cutover_record(
+        state.machine_profile_hash.clone(),
+        state.runtime.grammar_enabled,
+        false,
+        None,
+        BTreeSet::new(),
+        None,
+    );
+    let mut dispatch = WirePreflightDispatch;
+    match router.route_oneshot(
+        &env,
+        &entry,
+        &request,
+        &format!("{}-{}", state.module_generation, now_ms()),
+        &mut dispatch,
+    ) {
+        Err(failure) => Some(channel_error(
+            failure.wire_id(),
+            match failure.underlying_owned_decode_refusal_id {
+                Some(underlying) => format!(
+                    "owned-decode request refused: {} (underlying {})",
+                    failure.wire_id(),
+                    underlying.as_str()
+                ),
+                None => format!("owned-decode request refused: {}", failure.wire_id()),
+            },
+        )),
+        Ok(_) => None,
+    }
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -5388,6 +5628,7 @@ fn embed_result_pages(
             provenance: ResponseProvenance {
                 engine: model.engine_identity.clone(),
                 remote: None,
+                owned_decode: Default::default(),
             },
             module_generation: state.module_generation,
             equivalent_to: equivalent_to.clone(),
@@ -5784,6 +6025,7 @@ async fn embed_tokenized(
         provenance: ResponseProvenance {
             engine: model.engine_identity.clone(),
             remote: None,
+            owned_decode: Default::default(),
         },
         module_generation: state.module_generation,
         equivalent_to,

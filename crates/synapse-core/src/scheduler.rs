@@ -8,6 +8,9 @@ use crate::StableError;
 #[serde(rename_all = "snake_case")]
 pub enum QueueClass {
     Interactive,
+    /// N-token owned-generation work. It participates in weighted arbitration
+    /// at every quantum boundary and never runs as Interactive or Bulk.
+    Decode,
     Bulk,
     Control,
 }
@@ -113,8 +116,14 @@ pub fn decide_admission<C: Clock>(
 pub struct SchedulerConfig {
     pub byte_budget: u64,
     pub bulk_quantum_tokens: u64,
+    /// Maximum Decode tokens that may run before scheduler arbitration runs again.
+    pub decode_quantum_tokens: u64,
     pub interactive_weight: u32,
+    /// Relative Decode turns in each fair cycle; larger values increase its share.
+    pub decode_weight: u32,
     pub bulk_weight: u32,
+    /// Wait before the oldest runnable Decode request is boosted to prevent starvation.
+    pub decode_aging_ms: u64,
     pub bulk_aging_ms: u64,
     pub max_concurrent_workers: usize,
     pub default_execution_ms: u64,
@@ -125,8 +134,11 @@ impl Default for SchedulerConfig {
         Self {
             byte_budget: 64 * 1024 * 1024,
             bulk_quantum_tokens: 2_048,
+            decode_quantum_tokens: 16,
             interactive_weight: 3,
+            decode_weight: 4,
             bulk_weight: 1,
+            decode_aging_ms: 250,
             bulk_aging_ms: 250,
             max_concurrent_workers: 1,
             default_execution_ms: 25,
@@ -173,6 +185,7 @@ struct RunningQuantum {
 pub struct LaneScheduler<T> {
     config: SchedulerConfig,
     interactive: VecDeque<QueuedWork<T>>,
+    decode: VecDeque<QueuedWork<T>>,
     bulk: VecDeque<QueuedWork<T>>,
     control: VecDeque<QueuedWork<T>>,
     queued_bytes: u64,
@@ -193,12 +206,17 @@ impl<T> LaneScheduler<T> {
             config.interactive_weight.max(1) as usize,
         ));
         fair_cycle.extend(std::iter::repeat_n(
+            QueueClass::Decode,
+            config.decode_weight.max(1) as usize,
+        ));
+        fair_cycle.extend(std::iter::repeat_n(
             QueueClass::Bulk,
             config.bulk_weight.max(1) as usize,
         ));
         Self {
             config,
             interactive: VecDeque::new(),
+            decode: VecDeque::new(),
             bulk: VecDeque::new(),
             control: VecDeque::new(),
             queued_bytes: 0,
@@ -251,6 +269,7 @@ impl<T> LaneScheduler<T> {
                 };
                 match queued.request.queue_class {
                     QueueClass::Interactive => self.interactive.push_back(queued),
+                    QueueClass::Decode => self.decode.push_back(queued),
                     QueueClass::Bulk => self.bulk.push_back(queued),
                     QueueClass::Control => self.control.push_back(queued),
                 }
@@ -301,6 +320,8 @@ impl<T> LaneScheduler<T> {
         let boundary_delay = self.quantum_boundary_delay_ms(now_ms);
         match queue_class {
             QueueClass::Interactive => boundary_delay,
+            QueueClass::Decode => boundary_delay
+                .saturating_add(self.decode.len() as u64 * self.config.default_execution_ms),
             QueueClass::Bulk => boundary_delay
                 .saturating_add(self.bulk.len() as u64 * self.config.default_execution_ms),
             QueueClass::Control => boundary_delay,
@@ -318,14 +339,11 @@ impl<T> LaneScheduler<T> {
         if !self.control.is_empty() {
             return Some(QueueClass::Control);
         }
+        if !self.decode.is_empty() && self.decode_has_aged(now_ms) {
+            return Some(QueueClass::Decode);
+        }
         if !self.bulk.is_empty() && self.bulk_has_aged(now_ms) {
             return Some(QueueClass::Bulk);
-        }
-        if self.interactive.is_empty() {
-            return (!self.bulk.is_empty()).then_some(QueueClass::Bulk);
-        }
-        if self.bulk.is_empty() {
-            return Some(QueueClass::Interactive);
         }
 
         for _ in 0..self.fair_cycle.len() {
@@ -333,12 +351,19 @@ impl<T> LaneScheduler<T> {
             self.fair_cursor = (self.fair_cursor + 1) % self.fair_cycle.len();
             match class {
                 QueueClass::Interactive if !self.interactive.is_empty() => return Some(class),
+                QueueClass::Decode if !self.decode.is_empty() => return Some(class),
                 QueueClass::Bulk if !self.bulk.is_empty() => return Some(class),
                 QueueClass::Control => {}
                 _ => {}
             }
         }
         None
+    }
+
+    fn decode_has_aged(&self, now_ms: u64) -> bool {
+        self.decode.front().is_some_and(|decode| {
+            now_ms.saturating_sub(decode.admitted_at_ms) >= self.config.decode_aging_ms
+        })
     }
 
     fn bulk_has_aged(&self, now_ms: u64) -> bool {
@@ -353,19 +378,24 @@ impl<T> LaneScheduler<T> {
     {
         let mut queued = match class {
             QueueClass::Interactive => self.interactive.pop_front()?,
+            QueueClass::Decode => self.decode.pop_front()?,
             QueueClass::Bulk => self.bulk.pop_front()?,
             QueueClass::Control => self.control.pop_front()?,
         };
 
-        let (quantum_tokens, final_quantum) = if class == QueueClass::Bulk {
-            let quantum = queued
-                .remaining_tokens
-                .min(self.config.bulk_quantum_tokens.max(1));
-            queued.remaining_tokens = queued.remaining_tokens.saturating_sub(quantum);
-            (quantum, queued.remaining_tokens == 0)
-        } else {
-            (queued.remaining_tokens, true)
-        };
+        let (quantum_tokens, final_quantum) =
+            if matches!(class, QueueClass::Bulk | QueueClass::Decode) {
+                let configured_quantum = match class {
+                    QueueClass::Decode => self.config.decode_quantum_tokens,
+                    QueueClass::Bulk => self.config.bulk_quantum_tokens,
+                    QueueClass::Interactive | QueueClass::Control => unreachable!(),
+                };
+                let quantum = queued.remaining_tokens.min(configured_quantum.max(1));
+                queued.remaining_tokens = queued.remaining_tokens.saturating_sub(quantum);
+                (quantum, queued.remaining_tokens == 0)
+            } else {
+                (queued.remaining_tokens, true)
+            };
 
         if final_quantum {
             self.queued_bytes = self
@@ -377,7 +407,11 @@ impl<T> LaneScheduler<T> {
             self.in_flight_requests
                 .push((queued.id, queued.request.request_bytes));
         } else {
-            self.bulk.push_back(queued.clone());
+            match class {
+                QueueClass::Decode => self.decode.push_back(queued.clone()),
+                QueueClass::Bulk => self.bulk.push_back(queued.clone()),
+                QueueClass::Interactive | QueueClass::Control => unreachable!(),
+            }
         }
 
         self.in_flight_workers = self.in_flight_workers.saturating_add(1);
@@ -631,6 +665,110 @@ mod tests {
             .expect("control work should start at the quantum boundary");
         assert_eq!(dispatch.queue_class, QueueClass::Control);
         assert_eq!(dispatch.payload, "load");
+    }
+
+    #[test]
+    fn decode_serializes_and_runs_in_committed_sixteen_token_quanta() {
+        assert_eq!(
+            serde_json::to_string(&QueueClass::Decode).unwrap(),
+            "\"decode\""
+        );
+        let mut scheduler = LaneScheduler::new(SchedulerConfig::default());
+        scheduler
+            .admit(
+                &FakeClock { now_ms: 0 },
+                WorkRequest {
+                    queue_class: QueueClass::Decode,
+                    deadline_ms: None,
+                    max_queue_ms: 1_000,
+                    request_bytes: 1,
+                    token_cost: 33,
+                    estimated_execution_ms: 1,
+                    payload: "generation",
+                },
+            )
+            .unwrap();
+
+        let first = scheduler.next_dispatch(&FakeClock { now_ms: 0 }).unwrap();
+        assert_eq!(first.queue_class, QueueClass::Decode);
+        assert_eq!(first.quantum_tokens, 16);
+        assert!(!first.final_quantum);
+        scheduler.complete_dispatch(&first);
+        let second = scheduler.next_dispatch(&FakeClock { now_ms: 0 }).unwrap();
+        assert_eq!(second.quantum_tokens, 16);
+        assert!(!second.final_quantum);
+        scheduler.complete_dispatch(&second);
+        let final_dispatch = scheduler.next_dispatch(&FakeClock { now_ms: 0 }).unwrap();
+        assert_eq!(final_dispatch.quantum_tokens, 1);
+        assert!(final_dispatch.final_quantum);
+    }
+
+    #[test]
+    fn aged_decode_gets_the_next_boundary_under_interactive_pressure() {
+        let mut scheduler = LaneScheduler::new(SchedulerConfig {
+            decode_aging_ms: 10,
+            ..SchedulerConfig::default()
+        });
+        scheduler
+            .admit(
+                &FakeClock { now_ms: 0 },
+                WorkRequest {
+                    queue_class: QueueClass::Decode,
+                    deadline_ms: None,
+                    max_queue_ms: 1_000,
+                    request_bytes: 1,
+                    token_cost: 32,
+                    estimated_execution_ms: 1,
+                    payload: "decode",
+                },
+            )
+            .unwrap();
+        scheduler
+            .admit(
+                &FakeClock { now_ms: 11 },
+                WorkRequest {
+                    queue_class: QueueClass::Interactive,
+                    deadline_ms: None,
+                    max_queue_ms: 1_000,
+                    request_bytes: 1,
+                    token_cost: 1,
+                    estimated_execution_ms: 1,
+                    payload: "embed.query",
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            scheduler
+                .next_dispatch(&FakeClock { now_ms: 11 })
+                .unwrap()
+                .queue_class,
+            QueueClass::Decode
+        );
+    }
+
+    #[test]
+    fn interactive_dispatch_is_immediate_when_no_decode_runs() {
+        let mut scheduler = LaneScheduler::new(SchedulerConfig::default());
+        scheduler
+            .admit(
+                &FakeClock { now_ms: 5 },
+                WorkRequest {
+                    queue_class: QueueClass::Interactive,
+                    deadline_ms: Some(100),
+                    max_queue_ms: 0,
+                    request_bytes: 1,
+                    token_cost: 8,
+                    estimated_execution_ms: 1,
+                    payload: "embed.query",
+                },
+            )
+            .expect("DECODE support must not add idle-path queue delay");
+        let dispatch = scheduler
+            .next_dispatch(&FakeClock { now_ms: 5 })
+            .expect("idle embed.query dispatches immediately");
+        assert_eq!(dispatch.queue_class, QueueClass::Interactive);
+        assert_eq!(dispatch.quantum_tokens, 8);
+        assert!(dispatch.final_quantum);
     }
 
     #[test]

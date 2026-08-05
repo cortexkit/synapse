@@ -26,7 +26,7 @@ use crate::protocol::{
     FinalResponse, FinishReason, GenerateCancel, GenerateContinue, GenerateStart, WorkerFrame,
 };
 use crate::validation::{validate_start, WorkerStartContext};
-use crate::worker::{CancelAck, DecodeWorker, WorkerFactory, WorkerFault};
+use crate::worker::{CancelAck, DecodeWorker, WorkerFactory, WorkerFault, WorkerStartFailure};
 
 /// A monotonic clock the supervisor reads at each boundary.
 pub trait Clock {
@@ -335,8 +335,15 @@ impl<S: CrashBudgetStore> Supervisor<S> {
         };
 
         // Worker-side start validation mirrors the module-side check.
-        if let Err(error) = worker.start(&request.start, context, self.production_n) {
-            return AttemptResult::Clean(Err(error), accounting);
+        match worker.start(&request.start, context, self.production_n) {
+            Ok(_) => {}
+            Err(WorkerStartFailure::Typed(error)) => {
+                return AttemptResult::Clean(Err(error), accounting);
+            }
+            Err(WorkerStartFailure::Fault(fault)) => {
+                worker.kill();
+                return AttemptResult::Chargeable(classify_worker_fault(fault), accounting);
+            }
         }
 
         let generation_id = request.start.generation_id.clone();
@@ -573,6 +580,15 @@ fn cancel_at_boundary(
 /// error. A non-crash terminal failure (timeout, protocol-fatal, startup,
 /// failed-cancellation) returns `owned_decode_quarantined` when the charge
 /// exhausted the budget and `owned_decode_unavailable` otherwise.
+fn classify_worker_fault(fault: WorkerFault) -> FailureClassification {
+    match fault {
+        WorkerFault::Crash => FailureClassification::Crash,
+        WorkerFault::Timeout => FailureClassification::Timeout,
+        WorkerFault::StartupFailure => FailureClassification::StartupFailure,
+        WorkerFault::FailedCancellation => FailureClassification::FailedCancellation,
+    }
+}
+
 fn barred_error(
     classification: FailureClassification,
     outcome: ChargeOutcome,
@@ -720,6 +736,36 @@ mod tests {
     }
 
     #[test]
+    fn crash_while_sending_start_is_charged_and_redispatched() {
+        let mut sup = supervisor();
+        let mut factory = ScriptedWorkerFactory::new(
+            vec![
+                vec![ScriptedEvent::StartCrash],
+                vec![ScriptedEvent::Final {
+                    finish: FinishReason::MaxTokens,
+                    ids: vec![7, 8, 9],
+                    constraint_complete: false,
+                }],
+            ],
+            context(),
+        );
+        let outcome = sup.run_generation(
+            &request(),
+            &mut factory,
+            &context(),
+            &TerminalControl::default(),
+            &ManualClock::new(0),
+        );
+        assert!(outcome.result.is_ok());
+        assert_eq!(outcome.provenance.crash_retry_count, 1);
+        assert_eq!(
+            outcome.provenance.failure_classifications,
+            vec![FailureClassification::Crash]
+        );
+        assert_eq!(factory.spawn_count(), 2);
+    }
+
+    #[test]
     fn second_crash_is_terminal_and_quarantines() {
         let mut sup = supervisor();
         let mut factory = ScriptedWorkerFactory::new(
@@ -796,7 +842,6 @@ mod tests {
         // Nothing was dispatched and nothing further was charged.
         assert_eq!(factory.spawn_count(), 0);
     }
-
 
     /// A store whose save fails while `fail` is set. The flag is shared so a
     /// test can toggle the disk's health after the supervisor owns the store.

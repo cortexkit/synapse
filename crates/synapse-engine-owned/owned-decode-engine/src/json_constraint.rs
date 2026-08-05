@@ -95,7 +95,13 @@ pub struct TokenVocabulary {
 }
 
 impl TokenVocabulary {
-    pub(crate) fn from_tokenizer(tokenizer: &Tokenizer) -> Result<Self> {
+    /// Build the exact token-id-to-emitted-byte table used by owned decode.
+    ///
+    /// The supervised decode worker calls this once while loading a model and
+    /// caches the result. Grammar requests interpret the module-compiled
+    /// automaton against these bytes; no tokenizer logic is re-derived per
+    /// generation and raw schemas never cross the worker boundary.
+    pub fn from_tokenizer(tokenizer: &Tokenizer) -> Result<Self> {
         let serialized = tokenizer
             .to_string(false)
             .map_err(|error| anyhow::anyhow!("serialize tokenizer: {error}"))?;
@@ -161,11 +167,22 @@ impl TokenVocabulary {
         vocabulary
     }
 
-    pub(crate) fn len(&self) -> usize {
+    /// Number of token IDs represented by this vocabulary.
+    #[must_use]
+    pub fn len(&self) -> usize {
         self.pieces.len()
     }
 
-    fn piece(&self, token_id: u32) -> Option<&[u8]> {
+    /// Whether the vocabulary contains no token IDs.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.pieces.is_empty()
+    }
+
+    /// Exact bytes emitted by `token_id`, or `None` for a token with no
+    /// content-byte representation.
+    #[must_use]
+    pub fn token_piece(&self, token_id: u32) -> Option<&[u8]> {
         self.pieces
             .get(token_id as usize)
             .and_then(Option::as_deref)
@@ -1416,7 +1433,7 @@ impl JsonConstraint {
                 let is_optional_whitespace = reject_optional_whitespace
                     && self
                         .vocabulary
-                        .piece(token_id)
+                        .token_piece(token_id)
                         .is_some_and(|piece| piece.iter().copied().all(is_json_whitespace));
                 if !is_optional_whitespace {
                     mask.insert(token_id);
@@ -1466,7 +1483,7 @@ impl DecodeConstraint for JsonConstraint {
         }
         let piece = self
             .vocabulary
-            .piece(token_id)
+            .token_piece(token_id)
             .with_context(|| format!("token {token_id} has no JSON-visible byte sequence"))?;
         ensure!(
             self.parser.advance_bytes(piece),
@@ -1515,6 +1532,20 @@ mod tests {
 
     fn schema(value: Value) -> JsonSchema {
         JsonSchema::from_value(&value).unwrap()
+    }
+
+    #[test]
+    fn public_vocabulary_view_preserves_exact_emitted_bytes() {
+        let vocabulary = TokenVocabulary::from_pieces(vec![
+            None,
+            Some(vec![0, b'{', 0xff]),
+            Some(b"text".to_vec()),
+        ]);
+        assert_eq!(vocabulary.len(), 3);
+        assert!(!vocabulary.is_empty());
+        assert_eq!(vocabulary.token_piece(0), None);
+        assert_eq!(vocabulary.token_piece(1), Some(&[0, b'{', 0xff][..]));
+        assert_eq!(vocabulary.token_piece(2), Some(&b"text"[..]));
     }
 
     #[test]

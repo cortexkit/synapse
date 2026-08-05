@@ -72,6 +72,12 @@ pub enum OwnedDecodeError {
     GrammarStopBeforeCompletion,
     /// Generation reached `max_tokens` without completing a value.
     GrammarMaxTokensExhausted,
+
+    // -- existing request-contract terminal controls --
+    /// The request deadline expired at a non-terminal quantum boundary.
+    DeadlineExceeded,
+    /// Cancellation was observed and acknowledged at a quantum boundary.
+    Cancelled,
 }
 
 impl OwnedDecodeError {
@@ -95,6 +101,8 @@ impl OwnedDecodeError {
             Self::GrammarUnsatisfiable => "grammar_unsatisfiable",
             Self::GrammarStopBeforeCompletion => "grammar_stop_before_completion",
             Self::GrammarMaxTokensExhausted => "grammar_max_tokens_exhausted",
+            Self::DeadlineExceeded => "deadline_exceeded",
+            Self::Cancelled => "cancelled",
         }
     }
 
@@ -125,6 +133,8 @@ impl OwnedDecodeError {
                 | Self::RuntimeConfigMismatch
                 | Self::ConstraintVersionMismatch
                 | Self::SamplingUnsupported
+                | Self::DeadlineExceeded
+                | Self::Cancelled
         )
     }
 

@@ -77,6 +77,7 @@ impl FinishReason {
 /// and automaton digests. Any field mismatch returns
 /// `owned_decode_constraint_version_mismatch` before the first token commit.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TokenIdJsonConstraint {
     pub encoding_id: String,
     pub constraint_runtime_identity: String,
@@ -290,6 +291,7 @@ mod serde_bytes_b64 {
 
 /// Sampling selection. Version 1 accepts only [`GREEDY_TOP1`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Sampling {
     pub mode: String,
     /// Reserved for future stochastic modes; empty for greedy-top-1.
@@ -311,6 +313,7 @@ impl Sampling {
 /// first quantum. Before committing a token the worker validates loaded-model
 /// reference, decode fingerprint, and runtime digest.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GenerateStart {
     pub generation_id: String,
     pub loaded_model_ref: String,
@@ -326,6 +329,7 @@ pub struct GenerateStart {
 
 /// Progress emitted after each non-final quantum. Carries no token IDs or text.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GenerateProgress {
     pub generation_id: String,
     /// First sequence is one; later sequences increment by one.
@@ -336,6 +340,7 @@ pub struct GenerateProgress {
 
 /// Continuation authorizing the next quantum.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GenerateContinue {
     pub generation_id: String,
     /// The next expected quantum sequence (the one after the last progress).
@@ -346,6 +351,7 @@ pub struct GenerateContinue {
 
 /// Cancellation. The worker destroys resident state and acknowledges.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GenerateCancel {
     pub generation_id: String,
 }
@@ -353,6 +359,7 @@ pub struct GenerateCancel {
 /// A successful final response. Contains complete generated IDs for the
 /// successful attempt and accounting, but no authoritative text.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FinalResponse {
     pub generation_id: String,
     pub generated_ids: Vec<u32>,
@@ -370,7 +377,7 @@ pub struct FinalResponse {
 
 /// A frame emitted by the worker over a transport session.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
 pub enum WorkerFrame {
     Progress(GenerateProgress),
     Final(FinalResponse),
@@ -416,6 +423,42 @@ impl FrameEnvelope {
         }
         Ok(envelope)
     }
+}
+
+/// Owned-decode commands carried inside the standard length-prefixed worker
+/// transport after the synapse-core nonce handshake. LOAD, PING, UNLOAD, and
+/// SHUTDOWN retain their standard synapse-core shapes; these commands add only
+/// the resident-generation protocol.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum DecodeTransportRequest {
+    GenerateStart {
+        req_id: String,
+        start: Box<GenerateStart>,
+    },
+    GenerateContinue {
+        req_id: String,
+        continuation: GenerateContinue,
+    },
+    GenerateCancel {
+        req_id: String,
+        cancellation: GenerateCancel,
+    },
+}
+
+/// Response to an owned-decode transport command.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum DecodeTransportResponse {
+    Frame {
+        req_id: String,
+        envelope: FrameEnvelope,
+    },
+    Cancelled {
+        req_id: String,
+        generation_id: String,
+        committed_token_count: u32,
+    },
 }
 
 /// Validate a decoded envelope's structural invariants that are independent of
@@ -506,6 +549,50 @@ mod tests {
         let parsed: TokenIdJsonConstraint = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed.automaton_bytes, vec![1, 2, 3, 4]);
         assert_eq!(parsed, constraint);
+    }
+
+    #[test]
+    fn owned_transport_round_trips_and_rejects_unknown_fields() {
+        let request = DecodeTransportRequest::GenerateCancel {
+            req_id: "r1".into(),
+            cancellation: GenerateCancel {
+                generation_id: "g1".into(),
+            },
+        };
+        let wire = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            serde_json::from_value::<DecodeTransportRequest>(wire).unwrap(),
+            request
+        );
+        let unknown = serde_json::json!({
+            "type": "GENERATE_CANCEL",
+            "req_id": "r1",
+            "cancellation": { "generation_id": "g1" },
+            "grammar": "raw schemas are forbidden"
+        });
+        assert!(serde_json::from_value::<DecodeTransportRequest>(unknown).is_err());
+    }
+
+    #[test]
+    fn start_and_constraint_reject_unknown_wire_fields() {
+        let mut start = serde_json::to_value(GenerateStart {
+            generation_id: "g1".into(),
+            loaded_model_ref: "m1".into(),
+            decode_fingerprint: "d1".into(),
+            runtime_config_digest: "r1".into(),
+            prompt_ids: vec![1],
+            stop_ids: vec![2],
+            max_tokens: 1,
+            sampling: Sampling::greedy_top1(),
+            constraint: Some(sample_constraint()),
+        })
+        .unwrap();
+        start["raw_schema"] = serde_json::json!({});
+        assert!(serde_json::from_value::<GenerateStart>(start).is_err());
+
+        let mut constraint = serde_json::to_value(sample_constraint()).unwrap();
+        constraint["unknown_revision"] = serde_json::json!("v1");
+        assert!(serde_json::from_value::<TokenIdJsonConstraint>(constraint).is_err());
     }
 
     #[test]

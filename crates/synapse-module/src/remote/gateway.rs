@@ -183,6 +183,7 @@ impl RemoteGateway {
                 deployment: profile.deployment.clone(),
                 assurance: "declared".to_string(),
             }),
+            owned_decode: Default::default(),
         }
     }
 

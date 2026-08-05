@@ -10,7 +10,7 @@ env:
   CARGO_TERM_COLOR: always
   # Production crates gated by CI. Bench lanes are excluded on purpose:
   # heavy engine deps (burn, candle, python venvs) with no gate value.
-  SYNAPSE_CRATES: -p synapse-core -p synapse-engine-ort -p synapse-module -p synapse-worker-llama
+  SYNAPSE_CRATES: -p synapse-core -p synapse-engine-ort -p synapse-module -p synapse-worker-llama -p owned-decode-worker -p synapse-worker-decode
 
 jobs:
   test:

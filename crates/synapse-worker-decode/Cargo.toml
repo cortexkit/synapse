@@ -1,0 +1,27 @@
+[package]
+name = "synapse-worker-decode"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Synapse supervised owned Metal decode worker binary."
+publish = false
+
+[[bin]]
+name = "ck-synapse-worker-decode"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+hex = { workspace = true }
+owned-decode-worker = { path = "../synapse-engine-owned/owned-decode-worker" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+synapse-core = { path = "../synapse-core" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+synapse-engine-owned = { path = "../synapse-engine-owned" }
+synapse-module = { path = "../synapse-module" }
+tokenizers = { workspace = true }

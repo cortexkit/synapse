@@ -27,6 +27,7 @@ use subc_protocol::{Flags, FrameType, Priority};
 use subc_transport::{
     generate_daemon_id, generate_key, write_atomic, ConnectionInfo, Endpoint, SCHEMA_VERSION,
 };
+use tokenizers::{models::wordlevel::WordLevel, pre_tokenizers::whitespace::Whitespace, Tokenizer};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -2894,7 +2895,7 @@ async fn singleton_lease_blocks_second_module_on_same_daemon() {
 }
 
 #[tokio::test]
-async fn microllm_grammar_rejects_when_gate_disabled() {
+async fn microllm_grammar_disabled_when_module_gate_is_off() {
     let config = serde_json::json!({ "grammar_enabled": false }).to_string();
     let (_daemon, _module, mut consumer, route) = open_route_with_config(&config).await;
     let frame = raw_route_frame(
@@ -2914,15 +2915,15 @@ async fn microllm_grammar_rejects_when_gate_disabled() {
     .await;
     assert_eq!(frame.header.ty, FrameType::Error);
     let body: Value = serde_json::from_slice(&frame.body).unwrap();
-    assert_eq!(body["code"], "invalid_request");
+    assert_eq!(body["code"], "grammar_disabled");
     assert!(body["message"]
         .as_str()
         .unwrap_or_default()
-        .contains("grammar_enabled"));
+        .contains("disabled in module config"));
 }
 
 #[tokio::test]
-async fn microllm_grammar_unavailable_in_build_when_gate_enabled() {
+async fn microllm_grammar_disabled_without_certified_owned_lane() {
     let config = serde_json::json!({ "grammar_enabled": true }).to_string();
     let (_daemon, _module, mut consumer, route) = open_route_with_config(&config).await;
     let frame = raw_route_frame(
@@ -2942,8 +2943,100 @@ async fn microllm_grammar_unavailable_in_build_when_gate_enabled() {
     .await;
     assert_eq!(frame.header.ty, FrameType::Error);
     let body: Value = serde_json::from_slice(&frame.body).unwrap();
-    assert_eq!(body["code"], "invalid_request");
-    assert_eq!(body["message"], "grammar_unavailable_in_build");
+    assert_eq!(body["code"], "grammar_disabled");
+    assert!(body["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("certified and enabled owned-decode"));
+}
+
+#[tokio::test]
+async fn uncertified_owned_target_refuses_and_maps_grammar_over_the_wire() {
+    let fixture_dir = unique_temp_dir("owned-decode-preflight");
+    std::fs::create_dir_all(&fixture_dir).unwrap();
+    let model_path = fixture_dir.join("model.safetensors");
+    std::fs::write(&model_path, b"owned decode preflight fixture").unwrap();
+    let tokenizer_path = fixture_dir.join("tokenizer.json");
+    let vocabulary = [("[UNK]".to_string(), 0), ("hello".to_string(), 1)]
+        .into_iter()
+        .collect();
+    let word_level = WordLevel::builder()
+        .vocab(vocabulary)
+        .unk_token("[UNK]".to_string())
+        .build()
+        .unwrap();
+    let mut tokenizer = Tokenizer::new(word_level);
+    tokenizer.with_pre_tokenizer(Some(Whitespace));
+    tokenizer.save(&tokenizer_path, false).unwrap();
+    let config = serde_json::json!({
+        "grammar_enabled": true,
+        "preload_models": [{
+            "model_id": "owned-qwen",
+            "engine": "owned-metal-decode",
+            "task": "generate",
+            "model_path": model_path,
+            "tokenizer_path": tokenizer_path,
+            "format": "owned-safetensors",
+            "max_tokens": 512,
+            "quant": "f16",
+            "family": "qwen3-0.6b",
+            "dtype": "f16",
+            "execution": "supervised"
+        }]
+    })
+    .to_string();
+    let (_daemon, _module, mut consumer, route) = open_route_with_config(&config).await;
+
+    let refusal = raw_route_frame(
+        &mut consumer,
+        route,
+        90_003,
+        serde_json::json!({
+            "method": "microllm.oneshot",
+            "params": {
+                "model": "owned-qwen",
+                "prompt": "hello",
+                "max_tokens": 4
+            }
+        }),
+    )
+    .await;
+    assert_eq!(refusal.header.ty, FrameType::Error);
+    let body: Value = serde_json::from_slice(&refusal.body).unwrap();
+    assert_eq!(body["code"], "owned_decode_not_certified");
+
+    let grammar_refusal = raw_route_frame(
+        &mut consumer,
+        route,
+        90_004,
+        serde_json::json!({
+            "method": "microllm.oneshot",
+            "params": {
+                "model": "owned-qwen",
+                "prompt": "hello",
+                "max_tokens": 4,
+                "grammar": r#"{"type":"string"}"#
+            }
+        }),
+    )
+    .await;
+    assert_eq!(grammar_refusal.header.ty, FrameType::Error);
+    let body: Value = serde_json::from_slice(&grammar_refusal.body).unwrap();
+    assert_eq!(body["code"], "grammar_disabled");
+    let _ = std::fs::remove_dir_all(fixture_dir);
+}
+
+#[test]
+fn production_binary_carries_owned_decode_errors_and_retires_legacy_grammar_literal() {
+    let binary = std::fs::read(env!("CARGO_BIN_EXE_ck-synapse")).unwrap();
+    let contains = |literal: &[u8]| {
+        binary
+            .windows(literal.len())
+            .any(|window| window == literal)
+    };
+    assert!(contains(b"grammar_disabled"));
+    assert!(contains(b"owned_decode_not_certified"));
+    assert!(!contains(b"grammar_unavailable_in_build"));
 }
 
 fn acquire_minilm_e2e_lock() -> MinilmE2eLock {

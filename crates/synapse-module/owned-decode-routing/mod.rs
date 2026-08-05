@@ -282,6 +282,30 @@ impl RoutingEnvironment {
         }
     }
 
+    /// Construct the fail-closed production environment when no version-controlled
+    /// record verifies that this machine's owned-decode configuration passed
+    /// certification and is approved for production cutover. In that case,
+    /// owned decode is not preferred; fallback and constrained-request errors
+    /// still use this lane-selection authority.
+    pub fn without_cutover_record(
+        machine_profile_hash: impl Into<String>,
+        grammar_enabled: bool,
+        quarantined: bool,
+        llama: Option<LlamaLane>,
+        equivalent_fingerprints: BTreeSet<Fingerprint>,
+        constraint_runtime_identity: Option<String>,
+    ) -> Self {
+        Self {
+            machine_profile_hash: machine_profile_hash.into(),
+            grammar_enabled,
+            cutover_enabled: false,
+            quarantined,
+            llama,
+            equivalent_fingerprints,
+            constraint_runtime_identity,
+        }
+    }
+
     /// Test-only constructor: sets the cutover flag directly without a
     /// record-and-evidence evaluation. Named so it is never mistaken for a
     /// production path; production code must use
