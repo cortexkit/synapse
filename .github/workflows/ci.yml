@@ -214,6 +214,10 @@ jobs:
         env:
           DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
           SYNAPSE_OWNED_DECODE_WORKER_BIN: ${{ github.workspace }}/synapse/target/debug/ck-synapse-worker-decode
+          # The self-hosted [bench-host-alias]-metal runner carries these snapshots in its HF
+          # cache (provisioned July 2026); pinned revisions match the fixture shas.
+          SYNAPSE_OWNED_DECODE_QWEN3_0_6B: [bench-user-home]/.cache/huggingface/hub/models--Qwen--Qwen3-Embedding-0.6B/snapshots/97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3
+          SYNAPSE_OWNED_DECODE_LFM2_1_2B: [bench-user-home]/.cache/huggingface/hub/models--LiquidAI--LFM2-1.2B/snapshots/933cee00d754fb3bfe06c644c0cb95453f2d8bb2
         run: |
           : "${SYNAPSE_OWNED_DECODE_QWEN3_0_6B:?Qwen3 checkpoint is required}"
           : "${SYNAPSE_OWNED_DECODE_LFM2_1_2B:?LFM2 checkpoint is required}"
