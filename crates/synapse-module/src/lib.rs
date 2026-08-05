@@ -5242,6 +5242,15 @@ fn worker_constraint(
     }
 }
 
+/// A worker-setup outcome before `DecodeDispatch::dispatch` runs. Typed
+/// owned-lane refusals must return through `OwnedDecodeRouter`, while unrelated
+/// setup faults keep their existing wire error.
+#[derive(Debug)]
+enum OwnedDecodeDispatchPreparationError {
+    Refused(owned_decode_routing::error::OwnedDecodeError),
+    Wire(WireOperationError),
+}
+
 fn build_supervised_decode_dispatch(
     state: &ModuleState,
     spec: &StoredModelConfig,
@@ -5249,7 +5258,8 @@ fn build_supervised_decode_dispatch(
     prompt_ids: Vec<u32>,
     constraint: Option<owned_decode_worker::protocol::TokenIdJsonConstraint>,
     deadline_ms: u64,
-) -> Result<Option<worker_host::SupervisedDecodeDispatch>, WireOperationError> {
+) -> Result<worker_host::SupervisedDecodeDispatch, OwnedDecodeDispatchPreparationError> {
+    use owned_decode_routing::error::OwnedDecodeError;
     use owned_decode_worker::{
         budget::BudgetPolicy,
         identity::QuarantineKey,
@@ -5259,15 +5269,31 @@ fn build_supervised_decode_dispatch(
     };
     use worker_host::{OwnedDecodeWorkerFactory, SupervisedDecodeDispatch, WorkerHostConfig};
 
+    // The supervised owned worker is a Metal executable. Classify a non-macOS
+    // setup as an owned-lane refusal before dispatch so selection can choose the
+    // configured llama lane instead of treating its startup failure as terminal.
+    if !cfg!(target_os = "macos") {
+        return Err(OwnedDecodeDispatchPreparationError::Refused(
+            OwnedDecodeError::Unsupported,
+        ));
+    }
+
     let worker_bin = spec
         .worker_bin
         .clone()
-        .or_else(|| env::var_os("SYNAPSE_OWNED_DECODE_WORKER_BIN").map(PathBuf::from));
-    let Some(worker_bin) = worker_bin else {
-        return Ok(None);
-    };
-    let model_path = locator_path(&spec.model_locator, &state.model_cache)?;
-    let tokenizer_path = locator_path(&spec.tokenizer_locator, &state.model_cache)?;
+        .or_else(|| env::var_os("SYNAPSE_OWNED_DECODE_WORKER_BIN").map(PathBuf::from))
+        .ok_or(OwnedDecodeDispatchPreparationError::Refused(
+            OwnedDecodeError::Unavailable,
+        ))?;
+    if !worker_bin.is_file() {
+        return Err(OwnedDecodeDispatchPreparationError::Refused(
+            OwnedDecodeError::Unavailable,
+        ));
+    }
+    let model_path = locator_path(&spec.model_locator, &state.model_cache)
+        .map_err(OwnedDecodeDispatchPreparationError::Wire)?;
+    let tokenizer_path = locator_path(&spec.tokenizer_locator, &state.model_cache)
+        .map_err(OwnedDecodeDispatchPreparationError::Wire)?;
     let mut runtime_config = model_runtime_config(
         spec,
         &model_path.path,
@@ -5278,7 +5304,7 @@ fn build_supervised_decode_dispatch(
     let decode_fingerprint = entry
         .decode_identity_inputs()
         .decode_fingerprint()
-        .map_err(|error| artifact_invalid_error(error.as_str()))?;
+        .map_err(OwnedDecodeDispatchPreparationError::Refused)?;
     let (runtime_config_digest, production_n) = owned_decode_runtime_identity(spec, entry);
     for (key, value) in [
         ("family", entry.family.as_str().to_string()),
@@ -5343,13 +5369,7 @@ fn build_supervised_decode_dispatch(
             cancel_at: None,
         },
     )
-    .map(Some)
-    .map_err(|error| {
-        WireOperationError::from_stable(
-            StableError::engine_crashed(Some(100)),
-            format!("open owned-decode crash budget: {error}"),
-        )
-    })
+    .map_err(|_| OwnedDecodeDispatchPreparationError::Refused(OwnedDecodeError::Unavailable))
 }
 
 fn cached_supervised_decode_dispatch(
@@ -5359,39 +5379,35 @@ fn cached_supervised_decode_dispatch(
     prompt: Vec<u32>,
     constraint: Option<owned_decode_worker::protocol::TokenIdJsonConstraint>,
     deadline_ms: u64,
-) -> Result<Option<Arc<Mutex<worker_host::SupervisedDecodeDispatch>>>, WireOperationError> {
+) -> Result<Arc<Mutex<worker_host::SupervisedDecodeDispatch>>, OwnedDecodeDispatchPreparationError>
+{
     if let Some(dispatch) = state
         .runtime
         .owned_decode_dispatches
         .lock()
         .map_err(|_| {
-            WireOperationError::from_stable(
+            OwnedDecodeDispatchPreparationError::Wire(WireOperationError::from_stable(
                 StableError::engine_crashed(Some(100)),
                 "owned-decode dispatch cache is unavailable",
-            )
+            ))
         })?
         .get(&spec.model_id)
         .cloned()
     {
-        return Ok(Some(dispatch));
+        return Ok(dispatch);
     }
-    let Some(created) =
-        build_supervised_decode_dispatch(state, spec, entry, prompt, constraint, deadline_ms)?
-    else {
-        return Ok(None);
-    };
+    let created =
+        build_supervised_decode_dispatch(state, spec, entry, prompt, constraint, deadline_ms)?;
     let mut dispatches = state.runtime.owned_decode_dispatches.lock().map_err(|_| {
-        WireOperationError::from_stable(
+        OwnedDecodeDispatchPreparationError::Wire(WireOperationError::from_stable(
             StableError::engine_crashed(Some(100)),
             "owned-decode dispatch cache is unavailable",
-        )
+        ))
     })?;
-    Ok(Some(
-        dispatches
-            .entry(spec.model_id.clone())
-            .or_insert_with(|| Arc::new(Mutex::new(created)))
-            .clone(),
-    ))
+    Ok(dispatches
+        .entry(spec.model_id.clone())
+        .or_insert_with(|| Arc::new(Mutex::new(created)))
+        .clone())
 }
 
 async fn dispatch_supervised_decode(
@@ -5805,16 +5821,24 @@ async fn route_owned_decode_wire(
         .deadline_ms
         .unwrap_or(state.runtime.inline.deadline_ms)
         .max(1);
-    let owned = cached_supervised_decode_dispatch(
+    let (owned, pre_dispatch_owned_refusal) = match cached_supervised_decode_dispatch(
         &state,
         &spec,
         &entry,
         prompt.clone(),
         worker_constraint.clone(),
         deadline_ms,
-    )
-    .ok()
-    .flatten();
+    ) {
+        Ok(dispatch) => (Some(dispatch), None),
+        Err(OwnedDecodeDispatchPreparationError::Refused(refusal)) => (None, Some(refusal)),
+        Err(OwnedDecodeDispatchPreparationError::Wire(error)) => {
+            return result_outcome(error_payload(&state, error));
+        }
+    };
+    let environment = match pre_dispatch_owned_refusal {
+        Some(refusal) => environment.with_pre_dispatch_owned_refusal(refusal),
+        None => environment,
+    };
     let dispatch = WireDecodeDispatch {
         owned,
         prompt,
@@ -8263,14 +8287,25 @@ async fn execute_generate_probe_for_model(
         let prompt = tokenized.batch.items.into_iter().next().unwrap_or_default();
         let prompt_token_count = prompt.len().min(u32::MAX as usize) as u32;
         if worker_dispatch.is_none() {
-            worker_dispatch = cached_supervised_decode_dispatch(
-                state,
-                &spec,
-                &entry,
-                prompt.clone(),
-                None,
-                180_000,
-            )?;
+            worker_dispatch = Some(
+                cached_supervised_decode_dispatch(
+                    state,
+                    &spec,
+                    &entry,
+                    prompt.clone(),
+                    None,
+                    180_000,
+                )
+                .map_err(|error| match error {
+                    OwnedDecodeDispatchPreparationError::Refused(refusal) => {
+                        artifact_invalid_error(format!(
+                            "owned-decode certification cannot prepare worker: {}",
+                            refusal.as_str()
+                        ))
+                    }
+                    OwnedDecodeDispatchPreparationError::Wire(error) => error,
+                })?,
+            );
         }
         let dispatch = worker_dispatch
             .as_ref()

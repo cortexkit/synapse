@@ -249,6 +249,10 @@ pub struct RoutingEnvironment {
     pub equivalent_fingerprints: BTreeSet<Fingerprint>,
     /// Constraint runtime identity digest for a constrained request, if applicable.
     pub constraint_runtime_identity: Option<String>,
+    /// A typed refusal discovered while preparing the owned worker before its
+    /// dispatch seam runs. It is considered only after the normal cutover,
+    /// quarantine, artifact, and certification gates have selected the owned lane.
+    pre_dispatch_owned_refusal: Option<OwnedDecodeError>,
 }
 
 impl RoutingEnvironment {
@@ -279,6 +283,7 @@ impl RoutingEnvironment {
             llama,
             equivalent_fingerprints,
             constraint_runtime_identity,
+            pre_dispatch_owned_refusal: None,
         }
     }
 
@@ -303,6 +308,7 @@ impl RoutingEnvironment {
             llama,
             equivalent_fingerprints,
             constraint_runtime_identity,
+            pre_dispatch_owned_refusal: None,
         }
     }
 
@@ -327,7 +333,18 @@ impl RoutingEnvironment {
             llama,
             equivalent_fingerprints,
             constraint_runtime_identity,
+            pre_dispatch_owned_refusal: None,
         }
+    }
+
+    /// Record a pre-dispatch owned-lane refusal discovered by the module's worker
+    /// setup. Lane selection consumes this instead of allowing setup to become an
+    /// execution-phase failure, so eligible refusals can select llama.
+    #[must_use]
+    pub fn with_pre_dispatch_owned_refusal(mut self, refusal: OwnedDecodeError) -> Self {
+        debug_assert!(refusal.is_predispatch_fallback_eligible());
+        self.pre_dispatch_owned_refusal = Some(refusal);
+        self
     }
 
     /// Whether the D-009 cutover is enabled for this profile.
@@ -393,28 +410,10 @@ impl OwnedDecodeRouter {
     /// Evaluate the owned lane before dispatch, failing closed on the first
     /// applicable pre-dispatch refusal.
     ///
-    /// Refusal production sites (for the next audit): `evaluate_owned` only
-    /// ever returns `Refused(NotCertified)`, `Refused(Quarantined)`, or
-    /// `Refused(ArtifactPoisoned)` on the production path. The other three
-    /// fallback-eligible refusals are produced elsewhere and are expected to
-    /// be absent here at this stage of the port:
-    /// - `Unsupported` is produced by `CatalogEntry::validate` (step 3 of
-    ///   `route_oneshot`) before `evaluate_owned` runs, so it never reaches
-    ///   lane selection as an `OwnedEvaluation::Refused`.
-    /// - `CertificationFailed` is produced by `StructuralBandChecker::check`
-    ///   in the certification crate, which is wired into the certification
-    ///   runtime integration (a later port slice), not into routing's
-    ///   pre-dispatch evaluation. Routing reads certification rows via
-    ///   `CertificationAccess`; a failed structural-band check turns into a
-    ///   missing row, which surfaces here as `Refused(NotCertified)`.
-    /// - `Unavailable` (reservation failure) is not modeled by
-    ///   `evaluate_owned`; it arises from the worker/dispatch path after
-    ///   admission, which is also part of the certification runtime
-    ///   integration.
-    ///
-    /// The `select_lane` unit tests exercise all six refusals directly, so
-    /// the routing logic is correct for the full set; the production wiring
-    /// only produces three of the six today.
+    /// Normal certification and artifact gates take precedence over worker setup:
+    /// an unselected owned lane remains `NotPreferred` or `NotCertified`, while a
+    /// selected lane turns a setup refusal into `OwnedEvaluation::Refused` for the
+    /// single lane-selection authority to handle.
     fn evaluate_owned(
         &self,
         env: &RoutingEnvironment,
@@ -466,11 +465,13 @@ impl OwnedDecodeRouter {
                     decode_fingerprint: decode_fingerprint.clone(),
                 }),
         };
-        if certified {
-            OwnedEvaluation::Selectable
-        } else {
-            OwnedEvaluation::Refused(OwnedDecodeError::NotCertified)
+        if !certified {
+            return OwnedEvaluation::Refused(OwnedDecodeError::NotCertified);
         }
+        if let Some(refusal) = env.pre_dispatch_owned_refusal {
+            return OwnedEvaluation::Refused(refusal);
+        }
+        OwnedEvaluation::Selectable
     }
 
     /// Route and execute a `microllm.oneshot` request end to end.
@@ -901,6 +902,28 @@ mod tests {
         assert_eq!(
             response.provenance.fallback_reason.as_deref(),
             Some("owned_decode_not_certified")
+        );
+        assert_eq!(*dispatched.borrow(), vec![LaneKind::Llama]);
+    }
+
+    #[test]
+    fn worker_setup_unavailable_falls_back_before_owned_dispatch() {
+        let entry = catalog_entry(Family::Qwen3_0_6b, WeightQuant::F16);
+        let router = router_with_certified(certified_store(&entry), Q8IngestRegistry::new());
+        let request = request(Family::Qwen3_0_6b, WeightQuant::F16);
+        let environment = env(true, Some(llama_lane()))
+            .with_pre_dispatch_owned_refusal(OwnedDecodeError::Unavailable);
+        let dispatched = Rc::new(RefCell::new(Vec::new()));
+        let mut dispatch = RecordingDispatch::new_succeeding(dispatched.clone());
+
+        let response = router
+            .route_oneshot(&environment, &entry, &request, "gen-1", &mut dispatch)
+            .expect("falls back");
+
+        assert_eq!(response.lane, LaneKind::Llama);
+        assert_eq!(
+            response.provenance.fallback_reason.as_deref(),
+            Some("owned_decode_unavailable")
         );
         assert_eq!(*dispatched.borrow(), vec![LaneKind::Llama]);
     }
