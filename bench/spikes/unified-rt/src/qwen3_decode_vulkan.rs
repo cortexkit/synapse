@@ -274,7 +274,13 @@ mod tests {
         with_decoder(weight_quant, |_model, decoder| {
             decoder.context.set_q8_batch_shape(q8_shape);
             // Twenty synthetic prompts span short, medium, and deep contexts;
-            // the final prompt reaches the 469-token depth cell.
+            // the final prompt reaches the 469-token depth cell. Apply the
+            // timing checks to every K value listed below, including values
+            // greater than 16, so the benchmark validates the full supported
+            // K range rather than stopping at the previous limit of 16.
+            let gate_ks = [
+                1usize, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 24, 32, 48, 64,
+            ];
             for prompt_len in [
                 1usize, 2, 3, 5, 8, 13, 21, 33, 55, 64, 89, 128, 160, 200, 256, 320, 384, 420, 448,
                 469,
@@ -286,9 +292,9 @@ mod tests {
                 assert_eq!(base_position, prompt_len);
 
                 // Sequential reference: greedy draft tokens and their logits.
-                let (draft, seq_logits) = sequential_greedy(decoder, &mut cache, &seed_logits, 16);
+                let (draft, seq_logits) = sequential_greedy(decoder, &mut cache, &seed_logits, 64);
 
-                for k in 1usize..=16 {
+                for &k in &gate_ks {
                     let draft = &draft[..k];
                     // Rewind to the prefix and run one batched forward over K tokens.
                     decoder.rewind(&mut cache, base_position).expect("rewind");

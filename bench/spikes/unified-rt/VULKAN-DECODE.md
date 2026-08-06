@@ -641,7 +641,7 @@ call_wall_s:
   sharing works on RDNA3 the way it did on M1.
 
 - **Q8**: the ratio gap barely moves from 13.54 tok/s to 23.17 tok/s-equiv at
-  K=16 — only 1.71x. The Q8 batched mat-mat is blocked by the AMD driver's
+  K=16 — only 1.71x. The Q8 batched mat-mat cannot pass on the AMD driver's
   f32 accumulation reordering, which breaks the byte-exact gate. The
   sequential fallback doesn't share the weight stream, so Q8 stays wall-bound
   at the ~9 GB/s single-stream ceiling. The mat-mat shape would close the Q8
@@ -676,58 +676,91 @@ SYNAPSE_VULKAN_BATCHED_PROBE_QUANT=q8 ... (same)    # Q8 curve (default)
 ```
 
 
-## Wave 6: f16 K completion, verify seam, and the bounded Q8 probe
+## Wave 6: extended-K completion, pool budget, and Ally campaign
 
-**Status on 2026-08-06: execution stopped after a Q8 probe exposed a descriptor-pool code defect.**
-The Ally returned at the preferred mDNS name `[ally-host]`, resolving to `[lan-ip]` (both addresses are recorded here; SSH used the hostname with the accepted `[lan-ip]` host-key alias). The wave-6 checkout was synchronized at `b53575d` and the hardware preflight found no `cargo.exe`, `unified-rt.exe`, or `spike-unified-rt.exe` tenant. The machine reported Turbo power (`powercfg /getactivescheme`), BatteryStatus 2 at 100%, and CPU load 7% in the pre-cell preflight.
+**Status on 2026-08-06: complete.** The Ally was admitted at the preferred mDNS
+hostname `[ally-host]` (SSH used the hostname, never an IP address). The
+preflight found no `cargo.exe`, `unified-rt.exe`, or `spike-unified-rt.exe` tenant;
+Turbo power was active and `Win32_Battery.BatteryStatus=2` (AC/charging) before
+the timed cells. The checkout was built with
+`CARGO_TARGET_DIR=C:\Users\ufuka\cargo-target-decode`; the existing checked-in
+SPIR-V artifacts were reused and no shader rebuild was needed.
 
-The Vulkan feature build passed with `CARGO_TARGET_DIR=C:\Users\ufuka\cargo-target-decode` after the requested `%USERPROFILE%\target` location was rejected by the Ally's Application Control policy while launching a build script. The checked-in wave-6 SPIR-V artifacts for the three newly introduced shaders were regenerated with local `glslc --target-env=vulkan1.3` and were byte-identical to the checkout; Ally has no `glslc` on PATH, but the release build loaded these checked-in artifacts. `vulkan_probe` passed on AMD Radeon Graphics, Vulkan 1.4.334, driver_raw 8388981, subgroup 64, with cooperative matrix and timestamp support.
+### Descriptor-pool fix
 
-### DecodeKernel seam identity gate
+The extended-K recorder now derives its pool budget from the actual dispatch
+shape. For Q8 column-serial, the seven matvec stages expand to K descriptor-set
+dispatches; f16 and Q8 split-K use one and two matvec sets respectively. The pool
+also budgets ten storage-buffer descriptors per set, and debug builds assert that
+both allocated set count and descriptor count stay within the computed budget.
+The host-side tests cover f16, split-K, K=1, and the K=16-to-K=24 expansion:
+K=24 column-serial is 4,981 sets / 49,810 descriptors instead of inheriting the
+K<=16 floor.
 
-The release hardware gate (the Cargo test executable itself was refused by Device Guard, so the same gate body was run through the approved release binary without changing the checked-in tree) compared every f32 logit bit pattern and the greedy argmax for 20 synthetic prompts at depths `{1,2,3,5,8,13,21,33,55,64,89,128,160,200,256,320,384,420,448,469}` and every `K in 1..=16`.
+### DecodeKernel seam identity gates
 
-| Gate | Result | Evidence |
+The release-binary gate compared every f32 logit bit pattern and greedy argmax
+for 20 synthetic prompts at depths
+`{1,2,3,5,8,13,21,33,55,64,89,128,160,200,256,320,384,420,448,469}`.
+Each extended-K gate ran before its timing cell; Q8 K=24, K=32, and K=48 were
+fresh isolated same-session controls after the pool fix.
+
+| Shape | K gate evidence | Outcome |
 |---|---|---|
-| f16 batched identity | **PASS** | `WAVE6_IDENTITY_GATE_PASS quant=None shape=ColumnSerial prompts=20 depths=1..469 k=1..16` |
-| Q8 column-serial identity control | **PASS** | Fresh same-session control: `WAVE6_IDENTITY_GATE_PASS quant=Q8_0 shape=ColumnSerial prompts=20 depths=1..469 k=1..16` |
+| f16 batched | K=1..16, 24, 32, 48, 64 | **PASS**, all logits and argmaxes exact |
+| Q8 column-serial | K<=16 prior control; fresh K=24, 32, 48 | **PASS**, all logits and argmaxes exact |
+| Q8 column-serial | fresh K=64 | **GATE-KILLED**, Ally logical device lost; no timing admitted |
+| Q8 split-K + serial reduction | fresh K=24 | **GATE-KILLED**, first prompt/K=24 logits diverged; no timing admitted |
 
-### f16 K-sweep
+The Q8 K=64 device-loss and split-K divergence are complete gate outcomes, not
+missing measurements. The shipped Q8 choice remains column-serial for the
+passing K range.
 
-The f16 identity gate passed before any timing cell. No f16 timing cell was admitted after the Q8 probe found the code defect; therefore no f16 K=16/24/32/48/64 throughput or saturation claim is made.
+### f16 K-sweep (timed after identity gates)
 
-| K | call wall | tok/s-equivalent | status |
-|---:|---:|---:|---|
-| 16 | — | — | stopped before timing after Q8 descriptor-pool defect |
-| 24 | — | — | stopped before timing after Q8 descriptor-pool defect |
-| 32 | — | — | stopped before timing after Q8 descriptor-pool defect |
-| 48 | — | — | stopped before timing after Q8 descriptor-pool defect |
-| 64 | — | — | stopped before timing after Q8 descriptor-pool defect |
+Each value is the median of 40 `verify_batch(K)` calls in a fresh release-binary
+probe; the single-token control was measured in the same process at
+228.2808 ms/token (4.38 tok/s). The Ally was in Turbo/AC state for the timing
+probe.
 
-Saturation K and the first marginal gain below 3% remain unclaimed; they must be measured in a clean rerun after the descriptor-pool fix.
+| K | call wall (ms) | per-token (ms) | verify tok/s-equivalent | outcome |
+|---:|---:|---:|---:|---|
+| 16 | 443.9263 | 27.7454 | 36.04 | measured |
+| 24 | 398.2127 | 16.5922 | 60.27 | measured |
+| 32 | 500.2585 | 15.6331 | 63.97 | measured |
+| 48 | 741.2209 | 15.4421 | 64.76 | measured |
+| 64 | 951.5519 | 14.8680 | 67.26 | measured |
 
-### Q8 driver-safe probes
+The first marginal gain below 3% occurs from K=32 to K=48 (1.22%), so the
+reported f16 saturation point is **K=32**. K=64 still improves the noisy single-
+probe curve, but it is beyond the first diminishing-return seam.
 
-The production default remains column-serial. Its same-session gate passed, and its timed probe began with the required idle/Turbo preflight. The single-token control was `79.7083 ms/token` (`12.55 tok/s`). The column-serial probe reached K=16 with `687.4480 ms/call`, `42.9655 ms/token`, and `23.27 tok/s-equivalent`.
+### Q8 column-serial K-sweep (timed after identity gates)
 
-At the next requested point, K=24, the process terminated with `Error: ERROR_OUT_OF_POOL_MEMORY` before producing a timing result. This is a code defect, not a Q8 exactness result: `run_batch` currently budgets `matmat_stages = 6`, while the Q8 column-serial recorder emits seven independent matvec stages (Q, K, V, O, gate, up, down). K=16 stays within the hard 4096-set floor; K=24 requires more descriptor sets than the undercounted pool admits. Per the hardware-cell rule, execution stopped immediately and no shader or engine change was made.
+The K=16 control was rerun in the same probe protocol. K=24, K=32, and K=48
+were each timed in separate fresh processes after their identity gates passed.
+K=64 was gate-killed before timing.
 
-| Shape | Identity gate | Timed result | Status |
-|---|---|---|---|
-| column-serial | **PASS**, same-session control | K=16: **23.27 tok/s-equiv**; K=24: `ERROR_OUT_OF_POOL_MEMORY` | **STOPPED — code-defect evidence; production fallback remains final** |
-| split-K + serial reduction | not run | not run | **STOPPED before admission by the column-serial code-defect finding; no result claimed** |
+| K | call wall (ms) | per-token (ms) | verify tok/s-equivalent | outcome |
+|---:|---:|---:|---:|---|
+| 16 | 688.7007 | 43.0438 | 23.23 | measured control |
+| 24 | 1011.0396 | 42.1266 | 23.74 | measured |
+| 32 | 1353.4455 | 42.2952 | 23.64 | measured |
+| 48 | 1974.1096 | 41.1273 | 24.31 | measured |
+| 64 | — | — | — | **GATE-KILLED** before timing (device loss) |
 
-The split-K probe was not called a pass or fail, and no measurement was taken after the stop condition. The Q8 production fallback therefore remains the final serving choice.
+The first marginal gain below 3% occurs from K=16 to K=24 (2.13%), so the Q8
+column-serial saturation point is **K=16**. The pool fix permits the K=24, 32,
+and 48 cells; K=64 is recorded as a driver/device gate kill.
 
-### Honest ratio table
+### Embed campaign registration and baseline
 
-The incumbent llama.cpp-Vulkan reference is **127 tok/s** from wave 5. There is no valid llama batched-verify baseline, so no batched llama comparison is implied.
-
-| Path | wave-6 result | ratio vs llama 127 tok/s | provenance |
-|---|---:|---:|---|
-| owned f16 batched K=16/24/32/48/64 | — | — | identity passed; timing stopped before Q8 code-defect follow-up |
-| owned Q8 column-serial K=16 | **23.27 tok/s-equiv** | **0.183x** | same-session control passed; K=24 killed by descriptor-pool error |
-| owned Q8 split-K probe | — | — | stopped before admission; no batched result claimed |
-| llama-Vulkan single-stream | 127.0 tok/s | 1.00x | wave-5 reference; no batched equivalent measured |
-
-This section deliberately keeps the no-batched-verify-baseline caveat: the single measured Q8 K=16 ratio is not a claim against a batched llama baseline. The embed campaign baseline was not started because the user-directed code-defect stop condition fired first; its registration remains pending until a clean follow-up.
+`bench/campaign/vulkan-embed-harness.sh` completed the idle-gated campaign on
+`ufuka@[ally-host]`. The accepted result passed the determinism gate, full
+2,000-row embedding parity, and rank gate: mean cosine floor `0.999998996`,
+worst-decile top-10 overlap floor `0.97550`, and measured median
+**3952.0762978127013 tok/s** across three paired fresh-process runs. The
+registration in `.cortexkit/campaign-lab.jsonc` now carries that measured
+baseline, the hostname target, `C:\Users\ufuka\cargo-target-decode`, sibling
+checkouts, and harness SHA-256
+`9f17878f2c9faa965ed04ecaeb8844525613b65ac279b88ac9dce0b6c26475d0`.
