@@ -262,6 +262,18 @@ impl OwnedCudaEmbedEngine {
     }
 
     #[must_use]
+    pub fn dimensions(&self, model: &LoadedModel) -> Option<usize> {
+        self.models.get(&model.model_id).and_then(|entry| {
+            let entry = entry.lock().ok()?;
+            Some(match &*entry {
+                LoadedFamily::MiniLm { model, .. } => model.hidden,
+                LoadedFamily::GteModernBert { model, .. } => model.hidden,
+                LoadedFamily::Qwen3 { model, .. } => model.hidden,
+            })
+        })
+    }
+
+    #[must_use]
     pub fn tokenizer_policy(&self, model: &LoadedModel) -> Option<TokenizerPolicy> {
         self.models.get(&model.model_id).and_then(|entry| {
             let entry = entry.lock().ok()?;

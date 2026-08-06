@@ -56,7 +56,7 @@ pub(crate) struct MiniLmLayer {
 }
 
 pub(crate) struct MiniLmModel {
-    hidden: usize,
+    pub(crate) hidden: usize,
     heads: usize,
     intermediate: usize,
     epsilon: f32,
@@ -182,10 +182,15 @@ fn load_safetensors_file(path: &Path) -> Result<HashMap<String, Tensor>> {
         let view = tensors
             .tensor(name)
             .map_err(|error| anyhow::anyhow!("read tensor {name}: {error}"))?;
-        result.insert(
-            name.to_string(),
-            tensor_from_bytes(view.dtype(), view.shape(), view.data())?,
-        );
+        if matches!(
+            view.dtype(),
+            SafeDtype::F32 | SafeDtype::F16 | SafeDtype::BF16
+        ) {
+            result.insert(
+                name.to_string(),
+                tensor_from_bytes(view.dtype(), view.shape(), view.data())?,
+            );
+        }
     }
     Ok(result)
 }
@@ -230,13 +235,17 @@ fn tensor_from_bytes(dtype: SafeDtype, shape: &[usize], bytes: &[u8]) -> Result<
     })
 }
 
-fn get_tensor<'a>(tensors: &'a HashMap<String, Tensor>, name: &str) -> Result<&'a Tensor> {
-    let candidates = [
+fn tensor_candidates(name: &str) -> [String; 4] {
+    [
         name.to_owned(),
         format!("bert.{name}"),
         format!("model.{name}"),
         format!("model.bert.{name}"),
-    ];
+    ]
+}
+
+fn get_tensor<'a>(tensors: &'a HashMap<String, Tensor>, name: &str) -> Result<&'a Tensor> {
+    let candidates = tensor_candidates(name);
     candidates
         .iter()
         .find_map(|candidate| tensors.get(candidate))
@@ -249,6 +258,16 @@ fn take_matrix(tensors: &HashMap<String, Tensor>, name: &str) -> Result<Vec<f32>
 
 fn take_vector(tensors: &HashMap<String, Tensor>, name: &str) -> Result<Vec<f32>> {
     get_tensor(tensors, name)?.clone().vector(name)
+}
+
+const MODERNBERT_EMBEDDINGS: &str = "embeddings.tok_embeddings.weight";
+const MODERNBERT_EMBEDDING_NORM: &str = "embeddings.norm.weight";
+const MODERNBERT_FINAL_NORM: &str = "final_norm.weight";
+const QWEN3_EMBEDDINGS: &str = "embed_tokens.weight";
+const QWEN3_FINAL_NORM: &str = "norm.weight";
+
+fn family_layer_tensor_name(index: usize, name: &str) -> String {
+    format!("layers.{index}.{name}.weight")
 }
 
 #[derive(Deserialize)]
@@ -435,9 +454,9 @@ impl ModernBertModel {
         ensure!(config.model_type == "modernbert");
         ensure!(config.hidden_size % config.num_attention_heads == 0);
         let tensors = load_safetensor_map(&root, path)?;
-        let embeddings = get_tensor(&tensors, "embeddings.tok_embeddings.weight")?.clone();
-        let embedding_norm = take_vector(&tensors, "embeddings.norm.weight")?;
-        let final_norm = take_vector(&tensors, "final_norm.weight")?;
+        let embeddings = get_tensor(&tensors, MODERNBERT_EMBEDDINGS)?.clone();
+        let embedding_norm = take_vector(&tensors, MODERNBERT_EMBEDDING_NORM)?;
+        let final_norm = take_vector(&tensors, MODERNBERT_FINAL_NORM)?;
         let layer_types = config.layer_types.clone().unwrap_or_else(|| {
             (0..config.num_hidden_layers)
                 .map(|index| {
@@ -453,21 +472,32 @@ impl ModernBertModel {
         ensure!(layer_types.len() == config.num_hidden_layers);
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for (index, layer_type) in layer_types.iter().enumerate() {
-            let prefix = format!("layers.{index}");
             let attention = match layer_type.as_str() {
                 "full_attention" => false,
                 "sliding_attention" => true,
                 other => bail!("unsupported ModernBERT attention type {other}"),
             };
             layers.push(ModernBertLayer {
-                qkv_weight: take_matrix(&tensors, &format!("{prefix}.attn.Wqkv"))?,
-                attention_output_weight: take_matrix(&tensors, &format!("{prefix}.attn.Wo"))?,
+                qkv_weight: take_matrix(&tensors, &family_layer_tensor_name(index, "attn.Wqkv"))?,
+                attention_output_weight: take_matrix(
+                    &tensors,
+                    &family_layer_tensor_name(index, "attn.Wo"),
+                )?,
                 attention_norm_weight: (index > 0)
-                    .then(|| take_vector(&tensors, &format!("{prefix}.attn_norm.weight")))
+                    .then(|| take_vector(&tensors, &family_layer_tensor_name(index, "attn_norm")))
                     .transpose()?,
-                mlp_input_weight: take_matrix(&tensors, &format!("{prefix}.mlp.Wi"))?,
-                mlp_output_weight: take_matrix(&tensors, &format!("{prefix}.mlp.Wo"))?,
-                mlp_norm_weight: take_vector(&tensors, &format!("{prefix}.mlp_norm.weight"))?,
+                mlp_input_weight: take_matrix(
+                    &tensors,
+                    &family_layer_tensor_name(index, "mlp.Wi"),
+                )?,
+                mlp_output_weight: take_matrix(
+                    &tensors,
+                    &family_layer_tensor_name(index, "mlp.Wo"),
+                )?,
+                mlp_norm_weight: take_vector(
+                    &tensors,
+                    &family_layer_tensor_name(index, "mlp_norm"),
+                )?,
                 sliding_attention: attention,
             });
         }
@@ -568,13 +598,12 @@ impl Qwen3Model {
         ensure!(config.num_hidden_layers > 0);
         ensure!(config.num_attention_heads % config.num_key_value_heads == 0);
         let tensors = load_safetensor_map(&root, path)?;
-        let embeddings = get_tensor(&tensors, "embed_tokens.weight")?.clone();
+        let embeddings = get_tensor(&tensors, QWEN3_EMBEDDINGS)?.clone();
         ensure!(embeddings.shape == vec![config.vocab_size, config.hidden_size]);
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for index in 0..config.num_hidden_layers {
-            let prefix = format!("layers.{index}");
-            let norm = |name: &str| take_vector(&tensors, &format!("{prefix}.{name}.weight"));
-            let weight = |name: &str| take_matrix(&tensors, &format!("{prefix}.{name}.weight"));
+            let norm = |name: &str| take_vector(&tensors, &family_layer_tensor_name(index, name));
+            let weight = |name: &str| take_matrix(&tensors, &family_layer_tensor_name(index, name));
             layers.push(Qwen3Layer {
                 input_norm: norm("input_layernorm")?,
                 post_attention_norm: norm("post_attention_layernorm")?,
@@ -589,7 +618,7 @@ impl Qwen3Model {
                 down_weight: weight("mlp.down_proj")?,
             });
         }
-        let final_norm = take_vector(&tensors, "norm")?;
+        let final_norm = take_vector(&tensors, QWEN3_FINAL_NORM)?;
         Ok(Self {
             hidden: config.hidden_size,
             query_heads: config.num_attention_heads,
@@ -694,6 +723,116 @@ fn layer_norm(
         let inverse = 1.0 / (variance + epsilon).sqrt();
         for index in 0..hidden {
             values[index] = (values[index] - mean) * inverse * weight[index] + bias[index];
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use serde_json::Value;
+    use sha2::{Digest, Sha256};
+
+    use super::{
+        family_layer_tensor_name, tensor_candidates, MODERNBERT_EMBEDDINGS,
+        MODERNBERT_EMBEDDING_NORM, MODERNBERT_FINAL_NORM, QWEN3_EMBEDDINGS, QWEN3_FINAL_NORM,
+    };
+
+    const GTE_HEADER: &[u8] =
+        include_bytes!("../tests/fixtures/gte-modernbert-e7f32e3c.safetensors.header");
+    const QWEN3_HEADER: &[u8] =
+        include_bytes!("../tests/fixtures/qwen3-embedding-97b0c614.safetensors.header");
+
+    fn header_names(bytes: &[u8]) -> HashSet<String> {
+        let length = u64::from_le_bytes(bytes[..8].try_into().expect("safetensors length"));
+        let end = 8 + usize::try_from(length).expect("header length fits usize");
+        let header: Value =
+            serde_json::from_slice(&bytes[8..end]).expect("safetensors header JSON");
+        header
+            .as_object()
+            .expect("safetensors header object")
+            .keys()
+            .filter(|name| name.as_str() != "__metadata__")
+            .cloned()
+            .collect()
+    }
+
+    fn assert_resolves(names: &HashSet<String>, base: &str) {
+        let candidates = tensor_candidates(base);
+        assert!(
+            candidates.iter().any(|name| names.contains(name)),
+            "real checkpoint header has none of: {}",
+            candidates.join(", ")
+        );
+    }
+
+    #[test]
+    fn loader_ignores_non_weight_integer_tensors() {
+        let mut header = br#"{"float":{"dtype":"F32","shape":[1],"data_offsets":[0,4]},"position_ids":{"dtype":"I64","shape":[1],"data_offsets":[4,12]}}"#.to_vec();
+        while header.len() % 8 != 0 {
+            header.push(b' ');
+        }
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(header);
+        bytes.extend(1.5_f32.to_le_bytes());
+        bytes.extend(0_i64.to_le_bytes());
+        let path = std::env::temp_dir().join(format!(
+            "synapse-owned-cuda-mixed-dtype-{}.safetensors",
+            std::process::id()
+        ));
+        std::fs::write(&path, bytes).unwrap();
+        let tensors = super::load_safetensors_file(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(tensors.len(), 1);
+        assert_eq!(tensors["float"].data, vec![1.5]);
+    }
+
+    #[test]
+    fn pinned_gte_header_resolves_every_production_tensor_name() {
+        assert_eq!(
+            format!("{:x}", Sha256::digest(GTE_HEADER)),
+            "6cb5eb4efd5757d8f4ef3ef789e3d75168568388a5ce7c816e335c2342cbc8fc"
+        );
+        let names = header_names(GTE_HEADER);
+        assert_resolves(&names, MODERNBERT_EMBEDDINGS);
+        assert_resolves(&names, MODERNBERT_EMBEDDING_NORM);
+        assert_resolves(&names, MODERNBERT_FINAL_NORM);
+        for index in 0..22 {
+            for name in ["attn.Wqkv", "attn.Wo", "mlp.Wi", "mlp.Wo", "mlp_norm"] {
+                assert_resolves(&names, &family_layer_tensor_name(index, name));
+            }
+            if index > 0 {
+                assert_resolves(&names, &family_layer_tensor_name(index, "attn_norm"));
+            }
+        }
+    }
+
+    #[test]
+    fn pinned_qwen3_header_resolves_every_production_tensor_name() {
+        assert_eq!(
+            format!("{:x}", Sha256::digest(QWEN3_HEADER)),
+            "1ff013283b0190994f5557f04301841482bcba6c006dd557fcb15563d4f1768b"
+        );
+        let names = header_names(QWEN3_HEADER);
+        assert_resolves(&names, QWEN3_EMBEDDINGS);
+        assert_resolves(&names, QWEN3_FINAL_NORM);
+        for index in 0..28 {
+            for name in [
+                "input_layernorm",
+                "post_attention_layernorm",
+                "self_attn.q_proj",
+                "self_attn.q_norm",
+                "self_attn.k_proj",
+                "self_attn.k_norm",
+                "self_attn.v_proj",
+                "self_attn.o_proj",
+                "mlp.gate_proj",
+                "mlp.up_proj",
+                "mlp.down_proj",
+            ] {
+                assert_resolves(&names, &family_layer_tensor_name(index, name));
+            }
         }
     }
 }

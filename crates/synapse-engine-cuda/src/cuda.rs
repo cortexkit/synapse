@@ -54,20 +54,79 @@ mod enabled {
         down_weight: *const f32,
     }
 
+    struct DeviceBinding {
+        runtime_device: i32,
+        driver_device: i32,
+        context: NonNull<c_void>,
+    }
+
+    impl DeviceBinding {
+        fn capture() -> Result<Self> {
+            cuda_driver_check(unsafe { cuInit(0) }, "cuInit")?;
+            let mut runtime_device = 0;
+            cuda_runtime_check(
+                unsafe { cudaGetDevice(&mut runtime_device) },
+                "cudaGetDevice",
+            )?;
+            cuda_runtime_check(unsafe { cudaSetDevice(runtime_device) }, "cudaSetDevice")?;
+            let mut driver_device = 0;
+            cuda_driver_check(
+                unsafe { cuCtxGetDevice(&mut driver_device) },
+                "cuCtxGetDevice",
+            )?;
+            let mut context = std::ptr::null_mut();
+            cuda_driver_check(
+                unsafe { cuDevicePrimaryCtxRetain(&mut context, driver_device) },
+                "cuDevicePrimaryCtxRetain",
+            )?;
+            let binding = Self {
+                runtime_device,
+                driver_device,
+                context: NonNull::new(context)
+                    .ok_or_else(|| anyhow::anyhow!("CUDA primary context is null"))?,
+            };
+            binding.bind()?;
+            Ok(binding)
+        }
+
+        fn bind(&self) -> Result<()> {
+            cuda_driver_check(
+                unsafe { cuCtxSetCurrent(self.context.as_ptr()) },
+                "cuCtxSetCurrent",
+            )?;
+            cuda_runtime_check(
+                unsafe { cudaSetDevice(self.runtime_device) },
+                "cudaSetDevice",
+            )
+        }
+    }
+
+    impl Drop for DeviceBinding {
+        fn drop(&mut self) {
+            unsafe {
+                cuDevicePrimaryCtxRelease(self.driver_device);
+            }
+        }
+    }
+
     pub fn ensure_available() -> Result<()> {
+        cuda_driver_check(unsafe { cuInit(0) }, "cuInit")?;
         let version = unsafe { synapse_cuda_cublaslt_version() };
         ensure!(version > 0, "cuBLASLt did not report a version");
         Ok(())
     }
 
     pub struct MiniLmContext {
+        binding: DeviceBinding,
         raw: NonNull<c_void>,
     }
 
     impl MiniLmContext {
         pub fn new(graphs: bool) -> Result<Self> {
+            let binding = DeviceBinding::capture()?;
             let raw = unsafe { synapse_cuda_context_new(i32::from(graphs)) };
             Ok(Self {
+                binding,
                 raw: NonNull::new(raw).ok_or_else(last_error)?,
             })
         }
@@ -84,6 +143,7 @@ mod enabled {
             epsilon: f32,
             layers: &[crate::model::MiniLmLayer],
         ) -> Result<Vec<Vec<f32>>> {
+            self.binding.bind()?;
             ensure!(batch > 0 && seq > 0 && hidden > 0 && heads > 0);
             ensure!(hidden_states.len() == batch * seq * hidden);
             ensure!(attention_mask.len() == batch * seq);
@@ -132,21 +192,25 @@ mod enabled {
 
     impl Drop for MiniLmContext {
         fn drop(&mut self) {
+            let _ = self.binding.bind();
             unsafe { synapse_cuda_context_free(self.raw.as_ptr()) }
         }
     }
 
     pub struct ModernBertContext {
+        binding: DeviceBinding,
         raw: NonNull<c_void>,
         precision: Precision,
     }
 
     impl ModernBertContext {
         pub fn new(graphs: bool, precision: Precision) -> Result<Self> {
+            let binding = DeviceBinding::capture()?;
             let raw = unsafe {
                 synapse_cuda_modernbert_context_new(i32::from(graphs), precision_code(precision))
             };
             Ok(Self {
+                binding,
                 raw: NonNull::new(raw).ok_or_else(last_error)?,
                 precision,
             })
@@ -168,6 +232,7 @@ mod enabled {
             layers: &[ModernBertLayer],
             final_norm: &[f32],
         ) -> Result<()> {
+            self.binding.bind()?;
             ensure!(hidden_states.len() == batch * seq * hidden);
             ensure!(attention_mask.len() == batch * seq);
             ensure!(final_norm.len() == hidden);
@@ -217,11 +282,13 @@ mod enabled {
 
     impl Drop for ModernBertContext {
         fn drop(&mut self) {
+            let _ = self.binding.bind();
             unsafe { synapse_cuda_modernbert_context_free(self.raw.as_ptr()) }
         }
     }
 
     pub struct Qwen3Context {
+        binding: DeviceBinding,
         raw: NonNull<c_void>,
     }
 
@@ -231,8 +298,10 @@ mod enabled {
                 matches!(precision, Precision::F16),
                 "Qwen3 CUDA requires f16 storage"
             );
+            let binding = DeviceBinding::capture()?;
             let raw = unsafe { synapse_cuda_qwen3_context_new(i32::from(graphs)) };
             Ok(Self {
+                binding,
                 raw: NonNull::new(raw).ok_or_else(last_error)?,
             })
         }
@@ -253,6 +322,7 @@ mod enabled {
             layers: &[Qwen3Layer],
             final_norm: &[f32],
         ) -> Result<()> {
+            self.binding.bind()?;
             ensure!(hidden_states.len() == batch * seq * hidden);
             ensure!(attention_mask.len() == batch * seq);
             ensure!(final_norm.len() == hidden);
@@ -299,6 +369,7 @@ mod enabled {
 
     impl Drop for Qwen3Context {
         fn drop(&mut self) {
+            let _ = self.binding.bind();
             unsafe { synapse_cuda_qwen3_context_free(self.raw.as_ptr()) }
         }
     }
@@ -317,6 +388,36 @@ mod enabled {
         Ok(())
     }
 
+    fn cuda_driver_check(status: i32, operation: &str) -> Result<()> {
+        if status != 0 {
+            let mut raw = std::ptr::null();
+            let message = unsafe {
+                if cuGetErrorString(status, &mut raw) != 0 || raw.is_null() {
+                    "unknown CUDA driver error".into()
+                } else {
+                    CStr::from_ptr(raw).to_string_lossy()
+                }
+            };
+            bail!("{operation} failed with status {status}: {message}");
+        }
+        Ok(())
+    }
+
+    fn cuda_runtime_check(status: i32, operation: &str) -> Result<()> {
+        if status != 0 {
+            let message = unsafe {
+                let raw = cudaGetErrorString(status);
+                if raw.is_null() {
+                    "unknown CUDA runtime error".into()
+                } else {
+                    CStr::from_ptr(raw).to_string_lossy()
+                }
+            };
+            bail!("{operation} failed with status {status}: {message}");
+        }
+        Ok(())
+    }
+
     fn last_error() -> anyhow::Error {
         unsafe {
             let raw = synapse_cuda_last_error();
@@ -329,6 +430,15 @@ mod enabled {
     }
 
     unsafe extern "C" {
+        fn cuInit(flags: u32) -> i32;
+        fn cuCtxGetDevice(device: *mut i32) -> i32;
+        fn cuCtxSetCurrent(context: *mut c_void) -> i32;
+        fn cuDevicePrimaryCtxRetain(context: *mut *mut c_void, device: i32) -> i32;
+        fn cuDevicePrimaryCtxRelease(device: i32) -> i32;
+        fn cuGetErrorString(status: i32, message: *mut *const c_char) -> i32;
+        fn cudaGetDevice(device: *mut i32) -> i32;
+        fn cudaSetDevice(device: i32) -> i32;
+        fn cudaGetErrorString(status: i32) -> *const c_char;
         fn synapse_cuda_context_new(graphs_enabled: i32) -> *mut c_void;
         fn synapse_cuda_context_free(context: *mut c_void);
         fn synapse_cuda_encoder_forward(
