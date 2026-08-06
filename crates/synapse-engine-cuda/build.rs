@@ -32,9 +32,12 @@ fn main() {
 
     let mut build = cc::Build::new();
     build
-        .cuda(true)
-        .cudart("shared")
+        .compiler(cuda_root.join("bin/nvcc"))
         .cpp(true)
+        .no_default_flags(true)
+        .warnings(false)
+        .extra_warnings(false)
+        .flag("-Xcompiler=-fPIC")
         .include("src/port")
         .include(&include)
         // V1 distributes virtual PTX only. Do not add an sm_* SASS image here.
@@ -55,6 +58,7 @@ fn main() {
         cuda_root.join("lib64")
     };
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
+    println!("cargo:rustc-link-lib=cuda");
     println!("cargo:rustc-link-lib=cublasLt");
     println!("cargo:rustc-link-lib=cublas");
     println!("cargo:rustc-link-lib=cudart");
