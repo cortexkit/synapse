@@ -427,7 +427,8 @@ fn engine_identity() -> EngineIdentity {
     let backend = compiled_backend().to_string();
     let mut build_flags = BTreeMap::new();
     build_flags.insert("risk_class".to_string(), "abort_capable".to_string());
-    build_flags.insert("backend".to_string(), backend);
+    build_flags.insert("backend".to_string(), backend.clone());
+    build_flags.insert("compiled_backend".to_string(), backend);
     EngineIdentity {
         engine: "llama".to_string(),
         version: ENGINE_VERSION.to_string(),
@@ -1150,6 +1151,13 @@ mod tests {
         assert_eq!(identity.engine, "llama");
         assert_eq!(
             identity.build_flags.get("backend").map(String::as_str),
+            Some(compiled_backend())
+        );
+        assert_eq!(
+            identity
+                .build_flags
+                .get("compiled_backend")
+                .map(String::as_str),
             Some(compiled_backend())
         );
     }
