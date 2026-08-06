@@ -348,6 +348,54 @@ impl ModernBertModel {
         Ok(vectors)
     }
 
+    fn rerank_ids(
+        &self,
+        provider: &mut dyn KernelProvider,
+        sequences: &[Vec<u32>],
+        shape: Option<BatchShape>,
+    ) -> Result<Vec<f32>> {
+        ensure!(
+            !sequences.is_empty(),
+            "ModernBERT rerank batch must not be empty"
+        );
+        ensure!(
+            sequences.iter().all(|ids| !ids.is_empty()),
+            "ModernBERT rerank sequences must not be empty"
+        );
+        let real_batch = sequences.len();
+        let real_seq = sequences.iter().map(Vec::len).max().unwrap_or(1).max(1);
+        let target = shape.unwrap_or(BatchShape {
+            batch: real_batch,
+            seq: real_seq,
+        });
+        ensure!(
+            target.batch >= real_batch && target.seq >= real_seq,
+            "ModernBERT rerank target shape {}x{} does not cover input {}x{}",
+            target.batch,
+            target.seq,
+            real_batch,
+            real_seq
+        );
+        ensure!(
+            target.seq <= self.config.max_position_embeddings,
+            "sequence length {} exceeds ModernBERT maximum {}",
+            target.seq,
+            self.config.max_position_embeddings
+        );
+
+        let (batch, seq) = (target.batch, target.seq);
+        let mut input_ids = vec![self.config.pad_token_id; batch * seq];
+        let mut attention_mask = vec![0_u8; batch * seq];
+        for (row, ids) in sequences.iter().enumerate() {
+            for (col, &id) in ids.iter().enumerate() {
+                input_ids[row * seq + col] = id;
+                attention_mask[row * seq + col] = 1;
+            }
+        }
+        let scores = self.forward_rerank(provider, &input_ids, &attention_mask, batch, seq)?;
+        Ok(scores[..real_batch].to_vec())
+    }
+
     fn initial_hidden(&self, input_ids: &[u32]) -> Result<Vec<f32>> {
         let hidden = self.config.hidden_size;
         let rows = input_ids.len();
@@ -794,6 +842,10 @@ impl ModelFamily for ModernBertModel {
         "gte-modernbert"
     }
 
+    fn supports_rerank(&self) -> bool {
+        self.classification_head.is_some()
+    }
+
     fn tokenizer_policy(&self) -> super::FamilyTokenizerPolicy {
         super::FamilyTokenizerPolicy {
             pad_token_id: self.config.pad_token_id,
@@ -808,6 +860,15 @@ impl ModelFamily for ModernBertModel {
         shape: Option<BatchShape>,
     ) -> Result<Vec<Vec<f32>>> {
         self.embed_ids(provider, sequences, shape)
+    }
+
+    fn rerank_batch(
+        &self,
+        provider: &mut dyn KernelProvider,
+        sequences: &[Vec<u32>],
+        shape: Option<BatchShape>,
+    ) -> Result<Vec<f32>> {
+        self.rerank_ids(provider, sequences, shape)
     }
 }
 

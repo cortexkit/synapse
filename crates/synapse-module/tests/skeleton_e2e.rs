@@ -1250,6 +1250,225 @@ async fn probe_owned_gte_modernbert_certifies_against_family_reference() {
         owned["recommended_batch"],
         serde_json::json!({ "rows": 8, "token_budget": 3_072 })
     );
+
+    let rerank_refused = route_request(
+        &mut consumer,
+        route,
+        92,
+        serde_json::json!({
+            "method": "rerank.score",
+            "params": {
+                "model": "gte-modernbert-base-f16",
+                "query": "query",
+                "candidates": ["candidate"]
+            }
+        }),
+    )
+    .await;
+    assert_eq!(
+        rerank_refused["result"]["error"]["code"],
+        "artifact_invalid"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn owned_gte_rerank_loads_certifies_and_serves_deterministically() {
+    let Some(snapshot) = gte_reranker_safetensors_snapshot() else {
+        eprintln!("skipping owned-metal rerank e2e: local GTE reranker snapshot is missing");
+        return;
+    };
+    for required in ["model.safetensors", "tokenizer.json", "config.json"] {
+        assert!(
+            snapshot.join(required).is_file(),
+            "GTE reranker snapshot is missing {required}"
+        );
+    }
+    let _lock = acquire_minilm_e2e_lock();
+    let (_daemon, _module, mut consumer, route) = open_route().await;
+    let load_params = serde_json::json!({
+        "source": "file",
+        "path": snapshot,
+        "files": {
+            "model": {
+                "url": "model.safetensors",
+                "sha256": test_sha256(snapshot.join("model.safetensors"))
+            },
+            "tokenizer": {
+                "url": "tokenizer.json",
+                "sha256": test_sha256(snapshot.join("tokenizer.json"))
+            },
+            "config": {
+                "url": "config.json",
+                "sha256": test_sha256(snapshot.join("config.json"))
+            }
+        },
+        "engine": "owned-metal",
+        "family": "gte-modernbert",
+        "dtype": "f32",
+        "execution": "explicit",
+        "model_id": "gte-reranker-modernbert-base-f32",
+        "task": "rerank",
+        "max_tokens": 8192,
+        "attention_units": 67108864,
+        "pin": true,
+        "request_key": "owned-metal-rerank-e2e"
+    });
+    let accepted = route_request(
+        &mut consumer,
+        route,
+        72_000,
+        serde_json::json!({ "method": "model.load", "params": load_params }),
+    )
+    .await;
+    let job_id = accepted["result"]["job_id"]
+        .as_str()
+        .expect("owned rerank model.load returns job id")
+        .to_string();
+    let ready = poll_model_load_job(&mut consumer, route, 72_001, &job_id).await;
+    assert_eq!(ready["result"]["state"], "ready", "rerank load: {ready:?}");
+
+    let probe = run_probe_job(
+        &mut consumer,
+        route,
+        72_010,
+        serde_json::json!({ "models": ["gte-reranker-modernbert-base-f32"] }),
+    )
+    .await;
+    let lane = probe["result"]["lanes"]
+        .as_array()
+        .and_then(|lanes| {
+            lanes.iter().find(|lane| {
+                lane["model_id"] == "gte-reranker-modernbert-base-f32" && lane["task"] == "rerank"
+            })
+        })
+        .expect("rerank probe returns the owned lane");
+    assert_eq!(lane["status"], "certified", "rerank probe: {lane:?}");
+    assert!(lane["evidence"]["pearson"].as_f64().unwrap() >= 0.999);
+
+    let listed = route_request(
+        &mut consumer,
+        route,
+        72_011,
+        serde_json::json!({ "method": "models.list", "params": {} }),
+    )
+    .await;
+    let model = listed["result"]["models"]
+        .as_array()
+        .and_then(|models| {
+            models
+                .iter()
+                .find(|model| model["model_id"] == "gte-reranker-modernbert-base-f32")
+        })
+        .expect("owned reranker appears in models.list");
+    let fingerprint = model["fingerprints"]
+        .as_array()
+        .and_then(|fingerprints| fingerprints.first())
+        .and_then(Value::as_str)
+        .expect("reranker fingerprint")
+        .to_string();
+    assert_eq!(fingerprint.len(), 64);
+
+    let params = serde_json::json!({
+        "method": "rerank.score",
+        "params": {
+            "model": "gte-reranker-modernbert-base-f32",
+            "query": "Which document is about a cat sitting on a mat?",
+            "candidates": [
+                "A small cat sits on a woven mat near the window.",
+                "The spacecraft entered orbit after a six month flight.",
+                "A dog chased a tennis ball across the park."
+            ]
+        }
+    });
+    let first = route_request(&mut consumer, route, 72_020, params.clone()).await;
+    let second = route_request(&mut consumer, route, 72_021, params).await;
+    assert_eq!(
+        serde_json::to_vec(&first["result"]).unwrap(),
+        serde_json::to_vec(&second["result"]).unwrap(),
+        "identical rerank requests must produce byte-identical results"
+    );
+    let result = &first["result"];
+    assert_eq!(result["dims"], 1);
+    assert_eq!(result["fingerprint"], fingerprint);
+    assert_eq!(result["provenance"]["engine"]["engine"], "owned-metal");
+    let scores = result["scores"].as_array().expect("rerank envelope scores");
+    assert_eq!(scores.len(), 3);
+    assert!(scores
+        .iter()
+        .all(|score| score.as_f64().is_some_and(f64::is_finite)));
+    assert!(scores.windows(2).any(|window| window[0] != window[1]));
+
+    let f16_accepted = route_request(
+        &mut consumer,
+        route,
+        72_030,
+        serde_json::json!({
+            "method": "model.load",
+            "params": {
+                "source": "file",
+                "path": snapshot,
+                "files": {
+                    "model": {"url": "model.safetensors", "sha256": test_sha256(snapshot.join("model.safetensors"))},
+                    "tokenizer": {"url": "tokenizer.json", "sha256": test_sha256(snapshot.join("tokenizer.json"))},
+                    "config": {"url": "config.json", "sha256": test_sha256(snapshot.join("config.json"))}
+                },
+                "engine": "owned-metal",
+                "family": "gte-modernbert",
+                "dtype": "f16",
+                "model_id": "gte-reranker-modernbert-base-f16",
+                "task": "rerank",
+                "max_tokens": 512,
+                "request_key": "owned-metal-rerank-f16-refusal"
+            }
+        }),
+    )
+    .await;
+    let f16_job = f16_accepted["result"]["job_id"].as_str().unwrap();
+    let f16_failed = poll_model_load_job(&mut consumer, route, 72_031, f16_job).await;
+    assert_eq!(f16_failed["result"]["state"], "failed");
+    assert_eq!(f16_failed["result"]["error"]["code"], "artifact_invalid");
+    assert!(f16_failed["result"]["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("fp32-only"));
+
+    let Some(minilm_snapshot) = minilm_safetensors_snapshot() else {
+        return;
+    };
+    let minilm_accepted = route_request(
+        &mut consumer,
+        route,
+        72_040,
+        serde_json::json!({
+            "method": "model.load",
+            "params": {
+                "source": "file",
+                "path": minilm_snapshot,
+                "files": {
+                    "model": {"url": "model.safetensors", "sha256": test_sha256(minilm_snapshot.join("model.safetensors"))},
+                    "tokenizer": {"url": "tokenizer.json", "sha256": test_sha256(minilm_snapshot.join("tokenizer.json"))},
+                    "config": {"url": "config.json", "sha256": test_sha256(minilm_snapshot.join("config.json"))}
+                },
+                "engine": "owned-metal",
+                "family": "minilm",
+                "dtype": "f32",
+                "model_id": "minilm-reranker-no-head",
+                "task": "rerank",
+                "max_tokens": 512,
+                "request_key": "owned-metal-rerank-no-head-refusal"
+            }
+        }),
+    )
+    .await;
+    let minilm_job = minilm_accepted["result"]["job_id"].as_str().unwrap();
+    let minilm_failed = poll_model_load_job(&mut consumer, route, 72_041, minilm_job).await;
+    assert_eq!(minilm_failed["result"]["state"], "failed");
+    assert_eq!(minilm_failed["result"]["error"]["code"], "artifact_invalid");
+    assert!(minilm_failed["result"]["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("sequence-classification head"));
 }
 
 #[cfg(target_os = "macos")]
@@ -2803,6 +3022,16 @@ fn gte_safetensors_snapshot() -> Option<PathBuf> {
     }
     let snapshots = PathBuf::from(std::env::var("HOME").ok()?)
         .join(".cache/huggingface/hub/models--Alibaba-NLP--gte-modernbert-base/snapshots");
+    first_snapshot_with(&snapshots, "model.safetensors")
+}
+
+#[cfg(target_os = "macos")]
+fn gte_reranker_safetensors_snapshot() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("SYNAPSE_GTE_RERANKER_MODERNBERT_SAFETENSORS_SNAPSHOT") {
+        return Some(PathBuf::from(path));
+    }
+    let snapshots = PathBuf::from(std::env::var("HOME").ok()?)
+        .join(".cache/huggingface/hub/models--Alibaba-NLP--gte-reranker-modernbert-base/snapshots");
     first_snapshot_with(&snapshots, "model.safetensors")
 }
 

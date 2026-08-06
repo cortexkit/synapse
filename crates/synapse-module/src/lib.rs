@@ -1697,9 +1697,9 @@ fn build_stored_model_config(
     inline: &InlineConfig,
     jobs: &JobConfig,
 ) -> Result<StoredModelConfig, ModuleError> {
-    if engine_name == "owned-metal" && task != ModelTask::Embed {
+    if engine_name == "owned-metal" && !matches!(task, ModelTask::Embed | ModelTask::Rerank) {
         return Err(ModuleError::Config(
-            "owned-metal supports embedding models only in wave 1".to_string(),
+            "owned-metal supports embedding and rerank models only in wave 1".to_string(),
         ));
     }
     if engine_name == "owned-metal-decode" && task != ModelTask::Generate {
@@ -2869,9 +2869,13 @@ fn load_catalog_model_blocking(
                 artifact_invalid_error("owned-metal catalog entry is missing runtime profile")
             })?;
             let mut engine = OwnedMetalEmbedEngine::new(profile.family, profile.dtype);
-            let loaded_model = engine
-                .load(&artifact, &runtime_config)
+            let loaded_model = EmbedEngine::load(&mut engine, &artifact, &runtime_config)
                 .map_err(engine_error_to_wire)?;
+            if task == ModelTask::Rerank {
+                engine
+                    .validate_rerank(&loaded_model)
+                    .map_err(engine_error_to_wire)?;
+            }
             let policy = engine
                 .tokenizer_policy(&loaded_model)
                 .map_err(engine_error_to_wire)?;
@@ -3007,7 +3011,7 @@ fn unload_embedding_model_blocking(model: Arc<EmbeddingModel>) -> Result<(), Wir
                     "owned-metal engine mutex was poisoned during model unload",
                 )
             })?;
-            engine.unload(&model.loaded_model);
+            EmbedEngine::unload(&mut *engine, &model.loaded_model);
             Ok(())
         }
         EmbedBackend::OwnedDecode => Ok(()),
@@ -4698,6 +4702,10 @@ async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
         Err(error) => return result_outcome(error_payload(&state, error)),
     };
 
+    let owned_pairs = match owned_rerank_pairs(&model, params.query.as_str(), &params.candidates) {
+        Ok(pairs) => pairs,
+        Err(error) => return result_outcome(error_payload(&state, error)),
+    };
     let scores = match execute_rerank(
         &state.runtime,
         &model,
@@ -4705,6 +4713,7 @@ async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
             query,
             candidates: token_items,
         },
+        owned_pairs,
         Some(admission.deadline()),
     )
     .await
@@ -7248,15 +7257,46 @@ async fn execute_rerank(
     runtime: &RuntimeState,
     model: &EmbeddingModel,
     request: RerankRequest,
+    owned_pairs: Option<Vec<Vec<u32>>>,
     deadline: Option<tokio::time::Instant>,
 ) -> Result<synapse_core::RerankScores, WireOperationError> {
     let permit = acquire_execution_permit(runtime, deadline).await?;
     match &model.backend {
-        EmbedBackend::Ort(_) | EmbedBackend::Owned(_) | EmbedBackend::OwnedDecode => {
-            Err(WireOperationError::from_stable(
-                StableError::artifact_invalid(),
-                format!("model '{}' does not support rerank.score", model.model_id),
-            ))
+        EmbedBackend::Ort(_) | EmbedBackend::OwnedDecode => Err(WireOperationError::from_stable(
+            StableError::artifact_invalid(),
+            format!("model '{}' does not support rerank.score", model.model_id),
+        )),
+        EmbedBackend::Owned(engine) => {
+            let pairs = owned_pairs.ok_or_else(|| {
+                WireOperationError::from_stable(
+                    StableError::artifact_invalid(),
+                    format!(
+                        "model '{}' has no module-framed rerank token IDs",
+                        model.model_id
+                    ),
+                )
+            })?;
+            let engine = Arc::clone(engine);
+            let loaded_model = model.loaded_model.clone();
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                let engine = engine.lock().map_err(|_| EngineError {
+                    stage: EngineErrorStage::Inference,
+                    risk_class: synapse_core::EngineRiskClass::AbortCapable,
+                    message: "owned-metal engine mutex was poisoned during rerank".to_string(),
+                    retry_after_ms: Some(100),
+                    safe_to_retry_same_request: true,
+                })?;
+                engine.rerank_pairs(&loaded_model, pairs)
+            })
+            .await
+            .map_err(|error| {
+                WireOperationError::from_stable(
+                    StableError::engine_crashed(Some(100)),
+                    format!("owned-metal rerank join failed: {error}"),
+                )
+            })?
+            .map_err(engine_error_to_wire)
         }
         EmbedBackend::Worker(engine) => {
             let engine = Arc::clone(engine);
@@ -7282,6 +7322,41 @@ async fn execute_rerank(
             .map_err(engine_error_to_wire)
         }
     }
+}
+
+fn owned_rerank_pairs(
+    model: &EmbeddingModel,
+    query: &str,
+    candidates: &[String],
+) -> Result<Option<Vec<Vec<u32>>>, WireOperationError> {
+    if !matches!(&model.backend, EmbedBackend::Owned(_)) {
+        return Ok(None);
+    }
+    let inputs = candidates
+        .iter()
+        .map(|candidate| (query, candidate.as_str()))
+        .collect::<Vec<_>>();
+    let encodings = model
+        .tokenizer
+        .tokenizer()
+        .encode_batch(inputs, true)
+        .map_err(|error| {
+            WireOperationError::from_stable(
+                StableError::artifact_invalid(),
+                format!("encode owned-metal rerank pairs: {error}"),
+            )
+        })?;
+    let pairs = encodings
+        .into_iter()
+        .map(|encoding| encoding.get_ids().to_vec())
+        .collect::<Vec<_>>();
+    if pairs.iter().any(Vec::is_empty) {
+        return Err(WireOperationError::from_stable(
+            StableError::artifact_invalid(),
+            "owned-metal rerank pair tokenization produced an empty sequence",
+        ));
+    }
+    Ok(Some(pairs))
 }
 
 async fn execute_generate(
@@ -8184,6 +8259,7 @@ async fn execute_rerank_probe_for_model(
         };
         let mut token_items = tokenized.batch.items;
         let query = token_items.remove(0);
+        let owned_pairs = owned_rerank_pairs(&model, item.query.as_str(), &item.candidates)?;
         let scores = match execute_rerank(
             &state.runtime,
             &model,
@@ -8191,6 +8267,7 @@ async fn execute_rerank_probe_for_model(
                 query,
                 candidates: token_items,
             },
+            owned_pairs,
             None,
         )
         .await
@@ -8757,12 +8834,14 @@ async fn measure_rerank_perf(
             })
             .sum::<u64>()
             .max(1);
+        let owned_pairs = owned_rerank_pairs(model, item.query.as_str(), &item.candidates)?;
         requests.push((
             RerankRequest {
                 query,
                 candidates: token_items,
             },
             token_cost,
+            owned_pairs,
         ));
     }
     if requests.is_empty() {
@@ -8780,8 +8859,8 @@ async fn measure_rerank_perf(
     {
         let mut batch_tokens = 0_usize;
         while batch_tokens < PROBE_PERF_BATCH_TOKEN_BUDGET || batch_tokens == 0 {
-            let (request, token_cost) = &requests[cursor % requests.len()];
-            execute_rerank(runtime, model, request.clone(), None).await?;
+            let (request, token_cost, owned_pairs) = &requests[cursor % requests.len()];
+            execute_rerank(runtime, model, request.clone(), owned_pairs.clone(), None).await?;
             batch_tokens = batch_tokens.saturating_add(*token_cost as usize);
             total_tokens = total_tokens.saturating_add(*token_cost);
             cursor += 1;
@@ -8795,9 +8874,9 @@ async fn measure_rerank_perf(
     let throughput_tok_s = total_tokens as f64 / elapsed_secs;
     let mut latency_samples = Vec::with_capacity(PROBE_PERF_SINGLE_SAMPLES);
     for sample in 0..PROBE_PERF_SINGLE_SAMPLES {
-        let (request, _) = &requests[sample % requests.len()];
+        let (request, _, owned_pairs) = &requests[sample % requests.len()];
         let started = std::time::Instant::now();
-        execute_rerank(runtime, model, request.clone(), None).await?;
+        execute_rerank(runtime, model, request.clone(), owned_pairs.clone(), None).await?;
         latency_samples.push(started.elapsed().as_secs_f64() * 1_000.0);
     }
     let single_item_latency_p50_ms = median_ms(&mut latency_samples);
@@ -10567,6 +10646,112 @@ mod tests {
 
         assert!(recommended_batch_for_engine("ort", 512).is_none());
         assert!(recommended_batch_for_engine("llama", 512).is_none());
+    }
+
+    #[test]
+    fn owned_rerank_catalog_acceptance_uses_a_distinct_processing_identity() {
+        let owned = || OwnedCatalogConfig {
+            family: OwnedFamily::GteModernBert,
+            dtype: OwnedDType::F32,
+            execution: "explicit".to_string(),
+            attention_units: OWNED_DEFAULT_ATTENTION_UNITS,
+            config_locator: None,
+            extra_locators: Vec::new(),
+        };
+        let make_spec = |model_id: &str, task: ModelTask| {
+            build_stored_model_config(
+                model_id.to_string(),
+                "owned-metal",
+                task,
+                "sha256:model".to_string(),
+                "safetensors-package".to_string(),
+                "sha256:tokenizer".to_string(),
+                ModelAssetLocator::LocalPath {
+                    path: PathBuf::from("/tmp/model"),
+                },
+                ModelAssetLocator::LocalPath {
+                    path: PathBuf::from("/tmp/tokenizer"),
+                },
+                "file:///tmp/model".to_string(),
+                "file:///tmp/tokenizer".to_string(),
+                WorkerPooling::Mean,
+                true,
+                8192,
+                "f32".to_string(),
+                false,
+                None,
+                None,
+                Vec::new(),
+                Some(owned()),
+                &InlineConfig::default(),
+                &JobConfig::default(),
+            )
+        };
+
+        let rerank = make_spec("gte-reranker", ModelTask::Rerank)
+            .expect("owned ModernBERT rerank should be accepted");
+        assert_eq!(rerank.task, "rerank");
+        assert_eq!(
+            rerank.numeric_profile_id,
+            NumericProfile {
+                model_digest: "sha256:model".to_string(),
+                quant: "f32".to_string(),
+                engine: rerank.engine_identity.clone(),
+                sanitized_tokenizer_digest: "sha256:tokenizer".to_string(),
+                pooling: PoolingStrategy::Mean,
+                normalization: NormalizationMode::L2,
+                dtype: NumericDType::F32,
+                flash_attention: FlashAttentionSetting::Disabled,
+                certified_shape: CertifiedShapeEnvelope {
+                    max_context_tokens: 8192,
+                    max_batch_tokens: InlineConfig::default().max_tokens as u32,
+                    max_micro_batch_tokens: JobConfig::default().bulk_quantum_tokens as u32,
+                    max_sequences: InlineConfig::default().max_items as u32,
+                },
+                prompt_template: Some("synapse-rerank-bos-query-sep-doc-eos-v1".to_string()),
+                prefix_template: None,
+                thread_policy: ThreadPolicyClass::Balanced,
+            }
+            .numeric_profile_id()
+        );
+        let embed = make_spec("gte-embed", ModelTask::Embed)
+            .expect("owned ModernBERT embedding should remain accepted");
+        assert_ne!(rerank.fingerprint, embed.fingerprint);
+    }
+
+    #[test]
+    fn owned_metal_still_rejects_generation_tasks_at_catalog_validation() {
+        let error = build_stored_model_config(
+            "owned-generation".to_string(),
+            "owned-metal",
+            ModelTask::Generate,
+            "sha256:model".to_string(),
+            "safetensors-package".to_string(),
+            "sha256:tokenizer".to_string(),
+            ModelAssetLocator::LocalPath {
+                path: PathBuf::from("/tmp/model"),
+            },
+            ModelAssetLocator::LocalPath {
+                path: PathBuf::from("/tmp/tokenizer"),
+            },
+            "file:///tmp/model".to_string(),
+            "file:///tmp/tokenizer".to_string(),
+            WorkerPooling::Mean,
+            true,
+            512,
+            "f32".to_string(),
+            false,
+            None,
+            None,
+            Vec::new(),
+            None,
+            &InlineConfig::default(),
+            &JobConfig::default(),
+        )
+        .expect_err("owned-metal generation must remain outside the embed/rerank lane");
+        assert!(error
+            .to_string()
+            .contains("embedding and rerank models only"));
     }
 
     #[test]

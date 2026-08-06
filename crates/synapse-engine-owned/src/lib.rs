@@ -14,7 +14,8 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use synapse_core::{
     EmbedEngine, EngineError, EngineErrorStage, EngineIdentity, EngineRiskClass, LoadedModel,
-    RuntimeConfig, TokenBatch, TokenIds, ValidatedArtifact, Vector, Vectors,
+    RerankEngine, RerankRequest, RerankScores, RuntimeConfig, TokenBatch, TokenIds,
+    ValidatedArtifact, Vector, Vectors,
 };
 
 #[cfg(target_os = "macos")]
@@ -344,6 +345,74 @@ impl OwnedMetalEmbedEngine {
             OwnedEngineError::UnsupportedPlatform.to_string(),
         ))
     }
+
+    #[cfg(target_os = "macos")]
+    pub fn validate_rerank(&self, model: &LoadedModel) -> Result<(), EngineError> {
+        let loaded = self.models.get(&model.model_id).ok_or_else(|| {
+            Self::error(
+                EngineErrorStage::Load,
+                format!("unknown owned-metal model ref '{}'", model.model_id),
+            )
+        })?;
+        let loaded = loaded.lock().map_err(|_| {
+            Self::error(
+                EngineErrorStage::Load,
+                "owned-metal model mutex was poisoned during rerank validation",
+            )
+        })?;
+        if loaded.family.supports_rerank() {
+            Ok(())
+        } else {
+            Err(Self::error(
+                EngineErrorStage::Load,
+                format!(
+                    "owned-metal family '{}' has no sequence-classification head for reranking",
+                    loaded.family.family_name()
+                ),
+            ))
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn validate_rerank(&self, _model: &LoadedModel) -> Result<(), EngineError> {
+        Err(Self::error(
+            EngineErrorStage::Load,
+            OwnedEngineError::UnsupportedPlatform.to_string(),
+        ))
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn rerank_pairs(
+        &self,
+        model: &LoadedModel,
+        pairs: Vec<TokenIds>,
+    ) -> Result<RerankScores, EngineError> {
+        let loaded = self.models.get(&model.model_id).ok_or_else(|| {
+            Self::error(
+                EngineErrorStage::Inference,
+                format!("unknown owned-metal model ref '{}'", model.model_id),
+            )
+        })?;
+        let mut loaded = loaded.lock().map_err(|_| {
+            Self::error(
+                EngineErrorStage::Inference,
+                "owned-metal model mutex was poisoned during rerank",
+            )
+        })?;
+        run_rerank_bucketed(&mut loaded, pairs)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn rerank_pairs(
+        &self,
+        _model: &LoadedModel,
+        _pairs: Vec<TokenIds>,
+    ) -> Result<RerankScores, EngineError> {
+        Err(Self::error(
+            EngineErrorStage::Inference,
+            OwnedEngineError::UnsupportedPlatform.to_string(),
+        ))
+    }
 }
 
 impl EmbedEngine for OwnedMetalEmbedEngine {
@@ -418,6 +487,38 @@ impl EmbedEngine for OwnedMetalEmbedEngine {
 
     fn unload(&mut self, model: &LoadedModel) {
         self.models.remove(&model.model_id);
+    }
+}
+
+impl RerankEngine for OwnedMetalEmbedEngine {
+    fn identity(&self) -> EngineIdentity {
+        <Self as EmbedEngine>::identity(self)
+    }
+
+    fn load(
+        &mut self,
+        artifact: &ValidatedArtifact,
+        cfg: &RuntimeConfig,
+    ) -> Result<LoadedModel, EngineError> {
+        <Self as EmbedEngine>::load(self, artifact, cfg)
+    }
+
+    fn rerank(
+        &self,
+        model: &LoadedModel,
+        request: RerankRequest,
+    ) -> Result<RerankScores, EngineError> {
+        if !request.query.is_empty() {
+            return Err(Self::error(
+                EngineErrorStage::Inference,
+                "owned-metal rerank requires module-framed token-id pairs",
+            ));
+        }
+        self.rerank_pairs(model, request.candidates)
+    }
+
+    fn unload(&mut self, model: &LoadedModel) {
+        <Self as EmbedEngine>::unload(self, model);
     }
 }
 
@@ -514,6 +615,72 @@ fn run_bucketed(loaded: &mut OwnedLoadedModel, batch: TokenBatch) -> Result<Vect
         );
     }
     Ok(vectors)
+}
+
+#[cfg(target_os = "macos")]
+fn run_rerank_bucketed(
+    loaded: &mut OwnedLoadedModel,
+    pairs: Vec<TokenIds>,
+) -> Result<RerankScores, EngineError> {
+    if pairs.is_empty() {
+        return Ok(RerankScores::default());
+    }
+    for (index, ids) in pairs.iter().enumerate() {
+        if ids.is_empty() {
+            return Err(OwnedMetalEmbedEngine::error(
+                EngineErrorStage::Inference,
+                format!("rerank pair {index} is empty"),
+            ));
+        }
+    }
+    let mut order = (0..pairs.len()).collect::<Vec<_>>();
+    order.sort_by_key(|&index| pairs[index].len());
+    let mut scores = vec![0.0; pairs.len()];
+    let mut start = 0;
+    while start < order.len() {
+        let mut end = start;
+        while end < order.len() {
+            let length = pairs[order[end]].len();
+            let bucket = runtime::covering_bucket(length, &loaded.buckets).ok_or_else(|| {
+                OwnedMetalEmbedEngine::error(
+                    EngineErrorStage::Inference,
+                    format!("sequence length {length} exceeds certified bucket envelope"),
+                )
+            })?;
+            if end - start + 1 > bucket.batch {
+                break;
+            }
+            end += 1;
+        }
+        let length = pairs[order[end - 1]].len();
+        let shape =
+            runtime::covering_bucket(length, &loaded.buckets).expect("rerank bucket checked above");
+        let sequences = order[start..end]
+            .iter()
+            .map(|&index| pairs[index].clone())
+            .collect::<Vec<_>>();
+        let produced = loaded
+            .family
+            .rerank_batch(&mut loaded.provider, &sequences, Some(shape))
+            .map_err(|error| {
+                OwnedMetalEmbedEngine::error(EngineErrorStage::Inference, error.to_string())
+            })?;
+        if produced.len() != sequences.len() {
+            return Err(OwnedMetalEmbedEngine::error(
+                EngineErrorStage::Inference,
+                format!(
+                    "owned-metal rerank returned {} scores for {} pairs",
+                    produced.len(),
+                    sequences.len()
+                ),
+            ));
+        }
+        for (&original, score) in order[start..end].iter().zip(produced) {
+            scores[original] = score;
+        }
+        start = end;
+    }
+    Ok(RerankScores { scores })
 }
 
 #[cfg(target_os = "macos")]
