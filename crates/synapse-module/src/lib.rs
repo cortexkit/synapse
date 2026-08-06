@@ -10627,3 +10627,74 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod routing_identity_dump_tests {
+    use super::*;
+
+    /// Prints routing identities for a complete preload-spec JSON supplied in
+    /// `SYNAPSE_OWNED_DECODE_PRELOAD_SPEC_JSON`. Run this ignored test on the
+    /// target machine before publishing its machine-local routing cutover record,
+    /// so the record contains the identities observed on that machine.
+    #[test]
+    #[ignore = "requires a readable fleet preload spec and tokenizer artifact"]
+    fn dump_owned_decode_routing_identity_from_preload_spec() {
+        let preload_json = env::var("SYNAPSE_OWNED_DECODE_PRELOAD_SPEC_JSON")
+            .expect("set SYNAPSE_OWNED_DECODE_PRELOAD_SPEC_JSON to one preload-model JSON object");
+        let preload: PreloadModelConfig =
+            serde_json::from_str(&preload_json).expect("preload spec must parse");
+        let spec = build_preload_catalog_model(
+            0,
+            preload,
+            &InlineConfig::default(),
+            &JobConfig::default(),
+        )
+        .expect("preload spec must build a catalog model");
+        let entry =
+            owned_decode_catalog_entry(&spec).expect("preload spec must build a decode entry");
+        let decode_fingerprint = entry
+            .decode_identity_inputs()
+            .decode_fingerprint()
+            .expect("decode identity must be valid");
+        let processing_fingerprint =
+            owned_decode_processing_fingerprint(&entry).expect("processing identity must be valid");
+        let (runtime_config_digest, _) = owned_decode_runtime_identity(&spec, &entry);
+        let tokenizer_path = match &spec.tokenizer_locator {
+            ModelAssetLocator::LocalPath { path } => path,
+            ModelAssetLocator::CacheDigest { .. } => {
+                panic!("identity dump requires a local tokenizer path in the preload spec")
+            }
+        };
+        let tokenizer = SanitizedTokenizer::from_file(
+            tokenizer_path,
+            TokenizerConfig {
+                max_tokens: spec.max_tokens,
+            },
+        )
+        .expect("preload tokenizer must load");
+        let tokenizer_vocabulary_digest =
+            owned_decode_vocabulary_digest(&tokenizer).expect("tokenizer vocabulary must load");
+        let constraint = owned_decode_grammar_scheduler::compile_grammar(
+            r#"{"type":"string"}"#,
+            &owned_decode_grammar_scheduler::CompileContext {
+                base_decode_fingerprint: decode_fingerprint.clone(),
+                tokenizer_vocabulary_digest,
+            },
+            &owned_decode_grammar_scheduler::GrammarSubsetManifest::default(),
+        )
+        .expect("default grammar subset must compile a string schema");
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "decode_fingerprint": decode_fingerprint.0,
+                "processing_fingerprint": processing_fingerprint.0,
+                "runtime_config_digest": runtime_config_digest,
+                "constraint_runtime_identity": constraint
+                    .constraint
+                    .constraint_runtime_identity
+                    .digest(),
+            }))
+            .expect("identity tuple serializes")
+        );
+    }
+}

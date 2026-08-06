@@ -23,22 +23,44 @@
     },
     {
       "record": {
-        "machine_profile_hash": "fleet-daemon-profile-1",
-        "enabled_catalog_entry_ids": [],
-        "decode_fingerprints": [],
-        "processing_fingerprints": [],
-        "constrained_runtime_identities": [],
-        "runtime_config_digest": "pending-certification",
+        "machine_profile_hash": "c995e1adb7469990478a845a7f84f560ae7a5f47e186efa8378d731a29a4916b",
+        "enabled_catalog_entry_ids": [
+          "qwen3-0.6b-decode-f16"
+        ],
+        "decode_fingerprints": [
+          "8bcb6dfc1bd55a38a56b5a6931132f428687e064104d106c2cc5efb898f80feb"
+        ],
+        "processing_fingerprints": [
+          "192b3ff6c0cda363e3453582458b2fd0ae5520d7eb5f69f66a678b4b1ed652ee"
+        ],
+        "constrained_runtime_identities": [
+          "5bfaebe3b38833843fd86b43daaf9d6638c3f8c0b55122916b1d56515999144d"
+        ],
+        "runtime_config_digest": "f4127f17e3c1e36bea7127f963e1da299b528d1299b010d4d66739a33753d3b1",
         "fixture_registry_revision": "decode-fixture-registry-v1",
         "context_bucket_manifest_revision": "decode-context-buckets-v1",
         "scheduler_manifest_revision": "decode-sched-manifest-v1",
-        "certification_evidence_ids": [],
+        "certification_evidence_ids": [
+          "cert-row:c995e1adb7469990478a845a7f84f560ae7a5f47e186efa8378d731a29a4916b:8bcb6dfc1bd55a38a56b5a6931132f428687e064104d106c2cc5efb898f80feb:ab2c6768a1c77f36a520db10bf2b6a2185414d9c39ce8a0154a75e9375b02116"
+        ],
         "wire_error_binding_revision": "owned-decode-wire-error-bindings-v1",
-        "acceptance_gate_evidence": [],
-        "grammar_enabled": false
+        "acceptance_gate_evidence": [
+          "fleet-gen-13:GateRunner::run_all:G-DEC-01:passed",
+          "fleet-gen-13:GateRunner::run_all:G-DEC-02:passed",
+          "fleet-gen-13:GateRunner::run_all:G-DEC-03:passed",
+          "fleet-gen-13:GateRunner::run_all:G-DEC-04:passed",
+          "fleet-gen-13:GateRunner::run_all:G-DEC-05:passed",
+          "fleet-gen-13:GateRunner::run_all:G-DEC-06:passed",
+          "fleet-gen-13:GateRunner::run_all:G-DEC-07:passed",
+          "fleet-gen-13:GateRunner::run_all:G-DEC-08:passed",
+          "fleet-gen-13:GateRunner::run_all:G-DEC-09:passed",
+          "fleet-gen-13:GateRunner::run_all:G-DEC-10:passed",
+          "fleet-gen-13:GateRunner::run_all:G-DEC-11:passed",
+          "fleet-gen-13:GateRunner::run_all:G-DEC-12:passed"
+        ],
+        "grammar_enabled": true
       },
-      "enabled": false,
-      "disabled_reason": "Production cutover stays disabled pending the D-009 enablement slice: the owned-decode engine is not yet wired into the production serving path. The OQ-DEC-SCHED-01 scheduler measurement is committed (decode-sched-manifest-v1 evidence, protocol oq-dec-sched-01-mixed-load-v2, N=16), and every applicable G-DEC-01..G-DEC-12 gate passes with it; no D-009 enablement record may be published until the enablement slice executes the acceptance gates."
+      "enabled": true
     }
   ]
 }
