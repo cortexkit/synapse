@@ -3110,12 +3110,14 @@ async fn substitutable_owned_refusal_falls_back_to_llama_with_lane_provenance() 
     assert_eq!(result["provenance"]["lane"], "llama");
     assert_eq!(
         result["provenance"]["fallback_reason"],
-        if cfg!(debug_assertions) {
-            "owned_decode_not_certified"
-        } else if cfg!(target_os = "macos") {
-            "cutover_disabled"
-        } else {
+        if !cfg!(target_os = "macos") {
+            // The platform refusal fires at resolution, before certification
+            // or cutover are consulted, regardless of profile.
             "owned_decode_unsupported"
+        } else if cfg!(debug_assertions) {
+            "owned_decode_not_certified"
+        } else {
+            "cutover_disabled"
         }
     );
     assert!(result["provenance"]["decode_fingerprint"].is_string());
