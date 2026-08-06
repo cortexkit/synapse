@@ -53,7 +53,36 @@ pub async fn accept_worker_handshake(
         .await
         .map_err(|_| TransportError::Protocol("worker handshake timed out".to_string()))?;
     let (mut stream, _) = accept?;
-    handshake_on_stream(&mut stream, expected_nonce, max_frame, handshake_timeout).await?;
+    handshake_on_stream_with_engine(
+        &mut stream,
+        expected_nonce,
+        max_frame,
+        handshake_timeout,
+        None,
+    )
+    .await?;
+    Ok(stream)
+}
+
+pub async fn accept_worker_handshake_with_engine(
+    listener: UnixListener,
+    expected_nonce: &str,
+    max_frame: u32,
+    handshake_timeout: Duration,
+    expected_engine: Option<&str>,
+) -> Result<UnixStream, TransportError> {
+    let accept = timeout(handshake_timeout, listener.accept())
+        .await
+        .map_err(|_| TransportError::Protocol("worker handshake timed out".to_string()))?;
+    let (mut stream, _) = accept?;
+    handshake_on_stream_with_engine(
+        &mut stream,
+        expected_nonce,
+        max_frame,
+        handshake_timeout,
+        expected_engine,
+    )
+    .await?;
     Ok(stream)
 }
 
@@ -66,6 +95,20 @@ pub async fn handshake_on_stream<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    handshake_on_stream_with_engine(stream, expected_nonce, max_frame, handshake_timeout, None)
+        .await
+}
+
+pub async fn handshake_on_stream_with_engine<S>(
+    stream: &mut S,
+    expected_nonce: &str,
+    max_frame: u32,
+    handshake_timeout: Duration,
+    expected_engine: Option<&str>,
+) -> Result<(), TransportError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let hello: WorkerHello = timeout(handshake_timeout, read_json_frame(stream, max_frame))
         .await
         .map_err(|_| TransportError::Protocol("worker HELLO timed out".to_string()))??;
@@ -74,6 +117,13 @@ where
             "rejected worker HELLO v={} nonce_match={}",
             hello.v,
             hello.nonce == expected_nonce
+        )));
+    }
+    if expected_engine.is_some_and(|engine| hello.engine.engine != engine) {
+        return Err(TransportError::Protocol(format!(
+            "rejected worker HELLO engine={}, expected {}",
+            hello.engine.engine,
+            expected_engine.unwrap_or_default()
         )));
     }
     let accepted_frame = max_frame.min(hello.max_frame);

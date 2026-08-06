@@ -80,15 +80,18 @@ use subc_protocol::{
     ModuleHelloAckBody, PROTOCOL_VERSION, SUBC_MODULE_ID_ENV,
 };
 use synapse_core::{
-    AdmissionDecision, AdmissionRequest, AliasTable, CacheGcOutcome, CertifiedShapeEnvelope, Clock,
-    EmbedEngine, EngineError, EngineErrorStage, EngineIdentity, ErrorClass, Fingerprint,
-    FlashAttentionSetting, GenerateEngine, GenerateOutput, GenerateRequest, LaneBudgetSnapshot,
-    LaneScheduler, LoadedModel, MachineProfile, ModelCache, ModelCacheError, ModelCacheIngest,
-    ModelCacheMeta, NormalizationMode, NumericDType, NumericProfile, NumericProfileId,
-    PoolingStrategy, QueueClass, RerankEngine, RerankRequest, ResponseEnvelope, ResponseProvenance,
-    RuntimeConfig, SanitizedTokenizer, SchedulerConfig, StableError, SystemMachineProfileCollector,
-    ThreadPolicyClass, TokenBatch, TokenizationError, TokenizedBatch, TokenizerConfig,
-    TruncationDisclosure, ValidatedArtifact, Vectors, WorkRequest, WorkerPooling,
+    evaluate_cuda_floor, owned_cuda_engine_identity, worker_binary_env_var,
+    worker_runtime_dir_env_var, AdmissionDecision, AdmissionRequest, AliasTable, CacheGcOutcome,
+    CertifiedShapeEnvelope, Clock, CudaFloorDecision, EmbedEngine, EngineError, EngineErrorStage,
+    EngineIdentity, ErrorClass, Fingerprint, FlashAttentionSetting, GenerateEngine, GenerateOutput,
+    GenerateRequest, LaneBudgetSnapshot, LaneScheduler, LoadedModel, MachineProfile, ModelCache,
+    ModelCacheError, ModelCacheIngest, ModelCacheMeta, NormalizationMode, NumericDType,
+    NumericProfile, NumericProfileId, PoolingStrategy, QueueClass, RerankEngine, RerankRequest,
+    ResponseEnvelope, ResponseProvenance, RuntimeConfig, SanitizedTokenizer, SchedulerConfig,
+    StableError, SystemMachineProfileCollector, ThreadPolicyClass, TokenBatch, TokenizationError,
+    TokenizedBatch, TokenizerConfig, TruncationDisclosure, ValidatedArtifact, Vectors, WorkRequest,
+    WorkerPooling, MACHINE_PROFILE_HASH_REVISION, OWNED_CUDA_ENGINE, OWNED_CUDA_MINIMUM_DEVICE_CC,
+    OWNED_CUDA_MINIMUM_DRIVER_API, OWNED_CUDA_PTX_VIRTUAL_ARCH,
 };
 use synapse_engine_ort::OrtEmbedEngine;
 use synapse_engine_owned::{
@@ -425,6 +428,14 @@ struct PreloadModelConfig {
     metallib_revision: Option<String>,
     #[serde(default)]
     quantizer_revision: Option<String>,
+    #[serde(default)]
+    kernel_revision: Option<String>,
+    #[serde(default)]
+    ptx_virtual_arch: Option<String>,
+    #[serde(default)]
+    minimum_device_cc: Option<f32>,
+    #[serde(default)]
+    minimum_cuda_driver_api: Option<u32>,
     #[serde(default)]
     derived_digest: Option<String>,
     #[serde(default)]
@@ -1301,7 +1312,7 @@ impl SynapseHandler {
                 .iter()
                 .map(|model| model.engine_identity.clone()),
         ));
-        let machine_profile_hash = machine_profile.hash();
+        let machine_profile_hash = machine_profile.revisioned_hash();
         let model_cache = Arc::new(ModelCache::new(ModelCache::default_root()?));
         let vault_client = Arc::new(SubcVaultCredentialClient::new(
             self.inner.connection_file.clone(),
@@ -1564,17 +1575,30 @@ fn build_preload_catalog_model(
         Some(digest) => normalize_digest(&digest),
         None => format!("sha256:{}", sha256_file(&preload.model_path)?),
     };
-    let owned = (engine_name == "owned-metal")
+    let owned = (engine_name == "owned-metal" || engine_name == "owned-cuda")
         .then(|| {
-            owned_catalog_config(
-                &preload.model_path,
-                preload.family.as_deref(),
-                preload.dtype.as_deref(),
-                preload.execution.as_deref(),
-                preload.attention_units,
-                None,
-                Vec::new(),
-            )
+            if engine_name == "owned-cuda" {
+                owned_cuda_catalog_config(
+                    preload.family.as_deref(),
+                    preload.dtype.as_deref(),
+                    preload.execution.as_deref(),
+                    preload.attention_units,
+                    preload.kernel_revision.as_deref(),
+                    preload.ptx_virtual_arch.as_deref(),
+                    preload.minimum_device_cc,
+                    preload.minimum_cuda_driver_api,
+                )
+            } else {
+                owned_catalog_config(
+                    &preload.model_path,
+                    preload.family.as_deref(),
+                    preload.dtype.as_deref(),
+                    preload.execution.as_deref(),
+                    preload.attention_units,
+                    None,
+                    Vec::new(),
+                )
+            }
         })
         .transpose()?;
     let tokenizer_max_tokens = owned_tokenizer_max_tokens(max_tokens, owned.as_ref());
@@ -1719,7 +1743,35 @@ fn normalize_catalog_model(
                 .unwrap_or(OWNED_DEFAULT_ATTENTION_UNITS),
             config_locator: model.config_locator.clone(),
             extra_locators: model.extra_locators.clone(),
+            identity_override: None,
         })
+    } else if engine_name == "owned-cuda" {
+        Some(owned_cuda_catalog_config(
+            model.owned_family.as_deref(),
+            model.owned_dtype.as_deref(),
+            model.owned_execution.as_deref(),
+            model.owned_attention_units,
+            model
+                .engine_identity
+                .build_flags
+                .get("kernel_revision")
+                .map(String::as_str),
+            model
+                .engine_identity
+                .build_flags
+                .get("ptx_virtual_arch")
+                .map(String::as_str),
+            model
+                .engine_identity
+                .build_flags
+                .get("minimum_device_cc")
+                .and_then(|value| value.parse().ok()),
+            model
+                .engine_identity
+                .build_flags
+                .get("minimum_cuda_driver_api")
+                .and_then(|value| value.parse().ok()),
+        )?)
     } else {
         None
     };
@@ -1763,6 +1815,9 @@ struct OwnedCatalogConfig {
     attention_units: usize,
     config_locator: Option<ModelAssetLocator>,
     extra_locators: Vec<ModelAssetLocator>,
+    /// CUDA carries a backend-specific identity while reusing the catalog's
+    /// family/dtype storage fields.
+    identity_override: Option<EngineIdentity>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1799,9 +1854,19 @@ fn build_stored_model_config(
             "owned-metal-decode supports generation models only".to_string(),
         ));
     }
+    if engine_name == "owned-cuda" && !matches!(task, ModelTask::Embed | ModelTask::Rerank) {
+        return Err(ModuleError::Config(
+            "owned-cuda supports embedding and rerank models only".to_string(),
+        ));
+    }
     let engine_identity = owned
         .as_ref()
-        .map(|profile| owned_engine_identity(profile.family, profile.dtype))
+        .and_then(|profile| profile.identity_override.clone())
+        .or_else(|| {
+            owned
+                .as_ref()
+                .map(|profile| owned_engine_identity(profile.family, profile.dtype))
+        })
         .map_or_else(|| catalog_model_engine_identity(engine_name), Ok)?;
     let numeric_profile = NumericProfile {
         model_digest: artifact_digest.clone(),
@@ -1930,6 +1995,77 @@ fn owned_catalog_config(
         attention_units,
         config_locator,
         extra_locators,
+        identity_override: None,
+    })
+}
+
+fn owned_cuda_catalog_config(
+    family: Option<&str>,
+    dtype: Option<&str>,
+    execution: Option<&str>,
+    attention_units: Option<usize>,
+    kernel_revision: Option<&str>,
+    ptx_virtual_arch: Option<&str>,
+    minimum_device_cc: Option<f32>,
+    minimum_cuda_driver_api: Option<u32>,
+) -> Result<OwnedCatalogConfig, ModuleError> {
+    let family = family.ok_or_else(|| {
+        ModuleError::Config("owned-cuda catalog entry is missing family".to_string())
+    })?;
+    let family =
+        OwnedFamily::parse(family).map_err(|error| ModuleError::Config(error.to_string()))?;
+    let dtype = dtype.ok_or_else(|| {
+        ModuleError::Config("owned-cuda catalog entry is missing dtype".to_string())
+    })?;
+    let dtype = OwnedDType::parse(dtype).map_err(|error| ModuleError::Config(error.to_string()))?;
+    let execution = execution.unwrap_or("supervised").to_ascii_lowercase();
+    if execution != "supervised" {
+        return Err(ModuleError::Config(
+            "owned-cuda requires supervised worker execution".to_string(),
+        ));
+    }
+    let kernel_revision = kernel_revision.unwrap_or("cuda-kernel-v1");
+    if kernel_revision.trim().is_empty() {
+        return Err(ModuleError::Config(
+            "owned-cuda kernel_revision must not be empty".to_string(),
+        ));
+    }
+    if let Some(ptx_virtual_arch) = ptx_virtual_arch {
+        if ptx_virtual_arch != OWNED_CUDA_PTX_VIRTUAL_ARCH {
+            return Err(ModuleError::Config(format!(
+                "owned-cuda requires PTX virtual architecture {}, got {ptx_virtual_arch}",
+                OWNED_CUDA_PTX_VIRTUAL_ARCH
+            )));
+        }
+    }
+    if let Some(minimum_device_cc) = minimum_device_cc {
+        if (minimum_device_cc - OWNED_CUDA_MINIMUM_DEVICE_CC).abs() > f32::EPSILON {
+            return Err(ModuleError::Config(format!(
+                "owned-cuda requires minimum device compute capability {}, got {minimum_device_cc}",
+                OWNED_CUDA_MINIMUM_DEVICE_CC
+            )));
+        }
+    }
+    if let Some(minimum_cuda_driver_api) = minimum_cuda_driver_api {
+        if minimum_cuda_driver_api != OWNED_CUDA_MINIMUM_DRIVER_API {
+            return Err(ModuleError::Config(format!(
+                "owned-cuda requires minimum CUDA driver API {}, got {minimum_cuda_driver_api}",
+                OWNED_CUDA_MINIMUM_DRIVER_API
+            )));
+        }
+    }
+    Ok(OwnedCatalogConfig {
+        family,
+        dtype,
+        execution,
+        attention_units: attention_units.unwrap_or(OWNED_DEFAULT_ATTENTION_UNITS),
+        config_locator: None,
+        extra_locators: Vec::new(),
+        identity_override: Some(owned_cuda_engine_identity(
+            family.as_str(),
+            dtype.as_str(),
+            kernel_revision,
+        )),
     })
 }
 
@@ -1941,6 +2077,7 @@ fn canonical_engine_name(engine: &str) -> String {
         // Catalog entries select this engine explicitly. Future hardware probes can
         // populate the same catalog value without changing request dispatch.
         "owned" | "metal" | "owned_metal" => "owned-metal".to_string(),
+        "owned-cuda" | "owned_cuda" | "cuda" => "owned-cuda".to_string(),
         "owned-decode" | "owned_metal_decode" | "owned-metal-decode" => {
             "owned-metal-decode".to_string()
         }
@@ -1954,6 +2091,7 @@ fn default_artifact_format(engine_name: &str) -> String {
         "mlx" => "safetensors".to_string(),
         "ane" => "mlmodelc".to_string(),
         "owned-metal" => "safetensors-package".to_string(),
+        "owned-cuda" => "safetensors-package".to_string(),
         "owned-metal-decode" => "owned-safetensors".to_string(),
         _ => "onnx".to_string(),
     }
@@ -1964,7 +2102,7 @@ fn default_quant(engine_name: &str) -> String {
         "llama" => "f16".to_string(),
         "mlx" => "bf16".to_string(),
         "ane" => "fp16".to_string(),
-        "owned-metal" | "owned-metal-decode" => "f16".to_string(),
+        "owned-metal" | "owned-cuda" | "owned-metal-decode" => "f16".to_string(),
         _ => "fp32".to_string(),
     }
 }
@@ -1992,6 +2130,11 @@ fn catalog_model_engine_identity(engine_name: &str) -> Result<EngineIdentity, Mo
                 ("transport", worker_catalog_transport()),
                 ("placement_gate", "neural-engine"),
             ],
+        )),
+        "owned-cuda" => Ok(owned_cuda_engine_identity(
+            "unknown",
+            "f16",
+            "cuda-kernel-v1",
         )),
         "owned-metal-decode" => Ok(worker_catalog_identity(
             "owned-metal-decode",
@@ -2824,6 +2967,7 @@ fn stored_owned_profile(
             .unwrap_or(OWNED_DEFAULT_ATTENTION_UNITS),
         config_locator: spec.config_locator.clone(),
         extra_locators: spec.extra_locators.clone(),
+        identity_override: None,
     }))
 }
 
@@ -2898,6 +3042,15 @@ fn load_catalog_model_blocking(
 ) -> Result<EmbeddingModel, WireOperationError> {
     let task = parse_model_task(Some(&spec.task), &spec.engine, &spec.model_id)
         .map_err(|error| artifact_invalid_error(error.to_string()))?;
+    if spec.engine == OWNED_CUDA_ENGINE {
+        if cfg!(target_os = "macos") {
+            return Err(artifact_invalid_error(format!(
+                "owned-cuda model '{}' is not supported on macOS",
+                spec.model_id
+            )));
+        }
+        ensure_owned_cuda_floor()?;
+    }
     let model_path = locator_path(&spec.model_locator, &model_cache)?;
     let tokenizer_path = locator_path(&spec.tokenizer_locator, &model_cache)?;
     let owned_profile = stored_owned_profile(&spec)?;
@@ -2962,6 +3115,21 @@ fn load_catalog_model_blocking(
                 loaded_model,
                 None,
             )
+        }
+        "owned-cuda" => {
+            if cfg!(target_os = "macos") {
+                return Err(artifact_invalid_error(format!(
+                    "owned-cuda model '{}' is not supported on macOS",
+                    spec.model_id
+                )));
+            }
+            let (backend, loaded) = load_worker_backend_blocking(
+                &spec,
+                &artifact,
+                &runtime_config,
+                worker_load_timeout,
+            )?;
+            (backend, loaded, None)
         }
         "owned-metal" => {
             if !cfg!(target_os = "macos") {
@@ -3101,9 +3269,8 @@ fn load_worker_backend_blocking(
         )));
     }
 
-    let env_prefix = spec.engine.to_ascii_uppercase().replace('.', "_");
-    let worker_bin_var = format!("SYNAPSE_{env_prefix}_WORKER_BIN");
-    let worker_runtime_dir_var = format!("SYNAPSE_{env_prefix}_WORKER_RUNTIME_DIR");
+    let worker_bin_var = worker_binary_env_var(&spec.engine);
+    let worker_runtime_dir_var = worker_runtime_dir_env_var(&spec.engine);
     let worker_bin = spec
         .worker_bin
         .clone()
@@ -3122,6 +3289,8 @@ fn load_worker_backend_blocking(
     let mut config = WorkerHostConfig::new(worker_bin, runtime_dir);
     config.load_timeout = worker_load_timeout;
     config.worker_id = format!("synapse-{}-{}", spec.engine, spec.model_id);
+    config.engine_identity = Some(spec.engine_identity.clone());
+    config.isolate_crash_key_by_worker_id = spec.engine == OWNED_CUDA_ENGINE;
     config.pooling =
         parse_pooling(&spec.pooling).map_err(|error| artifact_invalid_error(error.to_string()))?;
     config.normalize = spec.normalize;
@@ -3233,6 +3402,40 @@ fn model_runtime_config(
         "microllm_max_tokens".to_string(),
         microllm_max_tokens.to_string(),
     );
+    if spec.engine == "owned-cuda" {
+        runtime_config.values.insert(
+            "backend".to_string(),
+            spec.engine_identity
+                .build_flags
+                .get("backend")
+                .cloned()
+                .unwrap_or_else(|| "cuda-ptx".to_string()),
+        );
+        runtime_config.values.insert(
+            "ptx_virtual_arch".to_string(),
+            spec.engine_identity
+                .build_flags
+                .get("ptx_virtual_arch")
+                .cloned()
+                .unwrap_or_else(|| OWNED_CUDA_PTX_VIRTUAL_ARCH.to_string()),
+        );
+        runtime_config.values.insert(
+            "minimum_device_cc".to_string(),
+            spec.engine_identity
+                .build_flags
+                .get("minimum_device_cc")
+                .cloned()
+                .unwrap_or_else(|| OWNED_CUDA_MINIMUM_DEVICE_CC.to_string()),
+        );
+        runtime_config.values.insert(
+            "minimum_cuda_driver_api".to_string(),
+            spec.engine_identity
+                .build_flags
+                .get("minimum_cuda_driver_api")
+                .cloned()
+                .unwrap_or_else(|| OWNED_CUDA_MINIMUM_DRIVER_API.to_string()),
+        );
+    }
     if spec.engine == "owned-metal" {
         runtime_config
             .values
@@ -3291,6 +3494,89 @@ fn locator_path(
             })
         }
     }
+}
+
+fn owned_cuda_floor_decision() -> CudaFloorDecision {
+    let driver_api = ["SYNAPSE_CUDA_DRIVER_API", "CUDA_DRIVER_API"]
+        .into_iter()
+        .find_map(|name| {
+            env::var(name)
+                .ok()
+                .and_then(|value| value.parse::<u32>().ok())
+        });
+    let compute = ["SYNAPSE_CUDA_COMPUTE_CAPABILITY", "CUDA_COMPUTE_CAPABILITY"]
+        .into_iter()
+        .find_map(|name| {
+            env::var(name)
+                .ok()
+                .and_then(|value| parse_compute_capability(&value))
+        });
+    let packaging_driver = env::var("SYNAPSE_CUDA_PACKAGING_DRIVER").ok();
+    let (Some(driver_api), Some((major, minor))) = (driver_api, compute) else {
+        return CudaFloorDecision::Unsupported {
+            reason: synapse_core::CudaUnsupportedReason::HardwareUnavailable,
+            observed: None,
+        };
+    };
+    evaluate_cuda_floor(driver_api, major, minor, packaging_driver)
+}
+
+fn parse_compute_capability(value: &str) -> Option<(u32, u32)> {
+    let mut parts = value.trim().split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().unwrap_or("0").parse().ok()?;
+    parts.next().is_none().then_some((major, minor))
+}
+
+fn ensure_owned_cuda_floor() -> Result<(), WireOperationError> {
+    let decision = owned_cuda_floor_decision();
+    if decision.is_supported() {
+        return Ok(());
+    }
+    let observed = match &decision {
+        CudaFloorDecision::Unsupported { observed, .. } => observed,
+        CudaFloorDecision::Supported { .. } => unreachable!(),
+    };
+    Err(WireOperationError::from_stable(
+        StableError::owned_cuda_unsupported(),
+        format!(
+            "owned-cuda floor refused before worker creation: decision={}, observed={}",
+            decision.refusal_code().unwrap_or("owned_cuda_unsupported"),
+            serde_json::to_string(observed).unwrap_or_else(|_| "null".to_string()),
+        ),
+    ))
+}
+
+fn owned_cuda_evidence(state: &ModuleState, model: &EmbeddingModel) -> Option<Value> {
+    if model.engine_identity.engine != OWNED_CUDA_ENGINE {
+        return None;
+    }
+    let decision = owned_cuda_floor_decision();
+    let observed = match &decision {
+        CudaFloorDecision::Supported { observed }
+        | CudaFloorDecision::Unsupported {
+            observed: Some(observed),
+            ..
+        } => serde_json::to_value(observed).ok(),
+        CudaFloorDecision::Unsupported { observed: None, .. } => None,
+    };
+    Some(json!({
+        "engine": OWNED_CUDA_ENGINE,
+        "backend": model.engine_identity.build_flags.get("backend"),
+        "ptx_virtual_arch": model.engine_identity.build_flags.get("ptx_virtual_arch").cloned().unwrap_or_else(|| OWNED_CUDA_PTX_VIRTUAL_ARCH.to_string()),
+        "minimum_device_cc": model.engine_identity.build_flags.get("minimum_device_cc").cloned().unwrap_or_else(|| OWNED_CUDA_MINIMUM_DEVICE_CC.to_string()),
+        "minimum_cuda_driver_api": model.engine_identity.build_flags.get("minimum_cuda_driver_api").cloned().unwrap_or_else(|| OWNED_CUDA_MINIMUM_DRIVER_API.to_string()),
+        "floor_state": if decision.is_supported() { "supported" } else { "unsupported" },
+        "floor_refusal": decision.refusal_code(),
+        "observed": observed,
+        "cuda_cache_path": env::var("CUDA_CACHE_PATH").ok(),
+        "worker_host_load_timeout_ms": state.runtime.worker_load_timeout.as_millis(),
+        "worker_host_load_timeout_source": "worker.load_timeout_ms",
+        "cold_load_ms": model_cold_load_ms(&state.runtime, &model.model_id),
+        "warm_load_ms": Value::Null,
+        "device_memory": Value::Null,
+        "resident_process_count": 1,
+    }))
 }
 
 fn artifact_invalid_error(message: impl Into<String>) -> WireOperationError {
@@ -7665,6 +7951,27 @@ fn ensure_model_certified(
     model: &EmbeddingModel,
     accept_declared: bool,
 ) -> Result<(), WireOperationError> {
+    // Owned-CUDA has no declared or inherited certification path. A measured
+    // row must match this exact machine-profile hash before serving.
+    if model.engine_identity.engine == OWNED_CUDA_ENGINE {
+        return match state.store.get_cert_row(
+            &state.machine_profile_hash,
+            &model.certification_fingerprint,
+        ) {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => Err(WireOperationError::from_stable(
+                StableError::not_certified(),
+                format!(
+                    "owned-cuda fingerprint {} is not certified on machine profile {}",
+                    model.certification_fingerprint.0, state.machine_profile_hash
+                ),
+            )),
+            Err(error) => Err(WireOperationError::from_stable(
+                StableError::engine_crashed(Some(100)),
+                format!("read owned-cuda certification row: {error}"),
+            )),
+        };
+    }
     ensure_fingerprint_certified(
         &state.store,
         &state.machine_profile_hash,
@@ -7910,25 +8217,40 @@ async fn execute_probe_job(
         })
         .unwrap_or_default();
     let mut selected_models = Vec::new();
+    let mut lane_results = Vec::new();
     for model_id in selected_model_ids {
-        let model =
-            match ensure_model_loaded_for_control(Arc::clone(&state), &model_id, deadline_ms).await
-            {
-                Ok(model) => model,
-                Err(error) => {
-                    fail_job_with_wire_error(
-                        &state,
-                        &job_id,
-                        error.class == ErrorClass::Transient,
-                        error,
-                    );
-                    return;
-                }
-            };
+        let model = match ensure_model_loaded_for_control(
+            Arc::clone(&state),
+            &model_id,
+            deadline_ms,
+        )
+        .await
+        {
+            Ok(model) => model,
+            Err(error) => {
+                let spec = model_slot_snapshot(&state.runtime, &model_id).map(|slot| slot.spec);
+                let blocking_reason = match error.code.as_str() {
+                    "owned_cuda_unsupported" => "owned_cuda_unsupported",
+                    "artifact_invalid" if error.message.contains("macOS") => "backend_unavailable",
+                    "not_certified" => "not_certified",
+                    _ => "load_failed",
+                };
+                lane_results.push(json!({
+                        "model_id": model_id,
+                        "cell_id": spec.as_ref().map(|spec| format!("{}/{}/{}", spec.engine, spec.owned_family.as_deref().unwrap_or("unknown"), spec.quant)),
+                        "engine": spec.as_ref().map(|spec| spec.engine.clone()),
+                        "backend": spec.as_ref().and_then(|spec| spec.engine_identity.build_flags.get("backend").cloned()),
+                        "fingerprint": spec.as_ref().map(|spec| spec.fingerprint.clone()),
+                        "status": if blocking_reason == "owned_cuda_unsupported" || blocking_reason == "backend_unavailable" { "unsupported" } else { "uncertified" },
+                        "blocking_reason": blocking_reason,
+                        "error": error,
+                    }));
+                continue;
+            }
+        };
         selected_models.push(model);
     }
 
-    let mut lane_results = Vec::new();
     for profile in state
         .remote_gateway
         .profiles()
@@ -8126,6 +8448,7 @@ async fn execute_probe_job(
     let result = json!({
         "module_generation": state.module_generation,
         "machine_profile_hash": state.machine_profile_hash,
+        "machine_profile_hash_revision": MACHINE_PROFILE_HASH_REVISION,
         "machine_profile": state.machine_profile,
         "current_knob": state.runtime.knob,
         "fixture": {
@@ -8313,6 +8636,7 @@ async fn execute_embed_probe_for_model(
         "task": "embed",
         "metrics": evidence,
         "ane_placement_share": placement_share,
+        "cuda": owned_cuda_evidence(state, &model),
     });
     let performance = if passed {
         let cold_load_ms =
@@ -8347,6 +8671,7 @@ async fn execute_embed_probe_for_model(
                 "worst_decile": state.runtime.probe.worst_decile_rank_overlap_threshold,
                 "ane_placement_share": state.runtime.probe.ane_placement_threshold,
             },
+            "cuda": owned_cuda_evidence(state, &model),
             "performance": performance,
         }),
         certified_vectors: passed.then_some(vectors),
@@ -9700,8 +10025,18 @@ fn lane_blocking_reason(
             "tokenization_failed" => "tokenization_failed",
             "generation_failed" => "generation_failed",
             "reference_fixture_missing" => "reference_fixture_missing",
+            "owned_cuda_unsupported" => "owned_cuda_unsupported",
+            "insufficient_vram" => "insufficient_vram",
+            "backend_unavailable" => "backend_unavailable",
             _ => "probe_failed",
         });
+    }
+    let failed_cuda_floor = matches!(
+        &slot.state,
+        ModelRuntimeState::Failed(error) if error.message.contains("owned-cuda floor refused")
+    );
+    if failed_cuda_floor {
+        return Some("owned_cuda_unsupported");
     }
     let failed_quarantined = matches!(
         &slot.state,
@@ -9795,6 +10130,7 @@ async fn probe_report(state: Arc<ModuleState>) -> HandlerOutcome {
         .cloned()
         .collect::<Vec<_>>();
     let mut lanes = Vec::with_capacity(slots.len());
+    let mut omission_records = Vec::new();
     let mut certification_stale = false;
     let mut performance_stale = false;
     for slot in slots {
@@ -9846,19 +10182,69 @@ async fn probe_report(state: Arc<ModuleState>) -> HandlerOutcome {
             ),
             _ => None,
         };
+        let backend = slot
+            .spec
+            .engine_identity
+            .build_flags
+            .get("backend")
+            .cloned()
+            .or_else(|| (slot.spec.engine == "ort").then(|| "cpu".to_string()));
+        let support_state = if blocking_reason.is_some_and(|reason| {
+            matches!(
+                reason,
+                "owned_cuda_unsupported" | "backend_unavailable" | "insufficient_vram"
+            )
+        }) {
+            "unsupported"
+        } else if measurements.current_certification.is_some() {
+            "certified"
+        } else {
+            "uncertified"
+        };
+        let selected = active_assignments
+            .iter()
+            .any(|assignment| assignment.model_id == slot.spec.model_id);
+        let recommendation = json!({
+            "selected": selected,
+            "policy": "nonmac-lane-order-v1",
+            "reason": if selected { "active_machine_profile_assignment" } else { "not_selected" },
+            "machine_profile_hash": state.machine_profile_hash,
+        });
+        let omission = blocking_reason.filter(|reason| *reason != "probe_required").map(|reason| {
+            let record = json!({
+                "model_id": slot.spec.model_id,
+                "cell_id": format!("{}/{}/{}", slot.spec.engine, slot.spec.owned_family.as_deref().unwrap_or("unknown"), slot.spec.quant),
+                "reason": reason,
+                "machine_profile_hash": state.machine_profile_hash,
+            });
+            omission_records.push(record.clone());
+            record
+        });
         lanes.push(json!({
             "model_id": slot.spec.model_id,
+            "cell_id": format!("{}/{}/{}", slot.spec.engine, slot.spec.owned_family.as_deref().unwrap_or("unknown"), slot.spec.quant),
             "task": slot.spec.task,
             "engine": slot.spec.engine,
+            "backend": backend,
             "fingerprint": certification_fingerprint,
             "numeric_profile_id": slot.spec.numeric_profile_id,
             "state": model_runtime_state_name(&slot.state),
+            "support_state": support_state,
             "certification_required": certification_required,
             "certification_status": certification_status,
             "certified": measurements.current_certification.is_some(),
             "certification_stale": measurements.certification_stale,
             "performance_stale": measurements.performance_stale,
             "blocking_reason": blocking_reason,
+            "compatibility": {
+                "task": slot.spec.task,
+                "family": slot.spec.owned_family,
+                "fingerprint": certification_fingerprint,
+                "dtype_or_quantization": slot.spec.quant,
+            },
+            "workload_eligibility": { "eligible": support_state != "unsupported" },
+            "recommendation": recommendation,
+            "omission": omission,
             "certification": certification,
             "performance": performance,
             "error": error,
@@ -9868,12 +10254,15 @@ async fn probe_report(state: Arc<ModuleState>) -> HandlerOutcome {
     result_outcome(json!({
         "module_generation": state.module_generation,
         "machine_profile_hash": state.machine_profile_hash,
+        "machine_profile_hash_revision": MACHINE_PROFILE_HASH_REVISION,
         "machine_profile": state.machine_profile,
         "current_knob": state.runtime.knob,
         "certification_stale": certification_stale,
         "performance_stale": performance_stale,
         "knob_assignments": knob_assignments,
         "active_assignments": active_assignments,
+        "omission_records": omission_records,
+        "recommendation_policy": "nonmac-lane-order-v1",
         "lanes": lanes,
     }))
 }
@@ -11018,6 +11407,7 @@ mod tests {
             attention_units: OWNED_DEFAULT_ATTENTION_UNITS,
             config_locator: None,
             extra_locators: Vec::new(),
+            identity_override: None,
         };
         let make_spec = |model_id: &str, task: ModelTask| {
             build_stored_model_config(

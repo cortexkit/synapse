@@ -16,6 +16,7 @@ pub enum StableErrorCode {
     NotCertified,
     SubstitutionRejected,
     ArtifactInvalid,
+    OwnedCudaUnsupported,
     EngineCrashed,
     ProbeRequired,
     MigrationRequired,
@@ -106,6 +107,15 @@ impl StableError {
     pub const fn artifact_invalid() -> Self {
         Self::new(
             StableErrorCode::ArtifactInvalid,
+            ErrorClass::Permanent,
+            None,
+            false,
+        )
+    }
+
+    pub const fn owned_cuda_unsupported() -> Self {
+        Self::new(
+            StableErrorCode::OwnedCudaUnsupported,
             ErrorClass::Permanent,
             None,
             false,

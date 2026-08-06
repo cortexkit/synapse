@@ -11,13 +11,15 @@ pub mod windows_client;
 
 #[cfg(unix)]
 pub use unix::{
-    accept_worker_handshake, bind_listener, handshake_on_stream, prepare_listener, read_json,
-    read_raw, write_json, write_raw, TransportError, WorkerTransportStream,
+    accept_worker_handshake, accept_worker_handshake_with_engine, bind_listener,
+    handshake_on_stream, handshake_on_stream_with_engine, prepare_listener, read_json, read_raw,
+    write_json, write_raw, TransportError, WorkerTransportStream,
 };
 #[cfg(windows)]
 pub use windows::{
-    accept_worker_handshake, bind_listener, handshake_on_stream, prepare_listener, read_json,
-    read_raw, write_json, write_raw, TransportError, WorkerTransportStream,
+    accept_worker_handshake, accept_worker_handshake_with_engine, bind_listener,
+    handshake_on_stream, handshake_on_stream_with_engine, prepare_listener, read_json, read_raw,
+    write_json, write_raw, TransportError, WorkerTransportStream,
 };
 
 /// Short stable digest of `worker_id` for IPC endpoint names (SUN_LEN-safe on Unix).
