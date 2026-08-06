@@ -3003,7 +3003,15 @@ async fn uncertified_owned_target_refuses_and_maps_grammar_over_the_wire() {
     .await;
     assert_eq!(refusal.header.ty, FrameType::Error);
     let body: Value = serde_json::from_slice(&refusal.body).unwrap();
-    assert_eq!(body["code"], "owned_decode_not_certified");
+    // On macOS the owned lane exists but is uncertified; elsewhere the owned
+    // engine is platform-gated out entirely, so resolution attaches the
+    // truthful platform refusal before certification is ever consulted.
+    let expected_refusal = if cfg!(target_os = "macos") {
+        "owned_decode_not_certified"
+    } else {
+        "owned_decode_unsupported"
+    };
+    assert_eq!(body["code"], expected_refusal);
 
     let grammar_refusal = raw_route_frame(
         &mut consumer,

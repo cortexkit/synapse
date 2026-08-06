@@ -27,10 +27,11 @@
 ├── crates/                 # Core Synapse application and worker binaries
 │   ├── synapse-core/       # Shared types, protocol, and scheduler traits
 │   ├── synapse-engine-ort/ # In-process ONNX Runtime inference engine
-│   ├── synapse-engine-owned/ # Primary owned Metal MPSGraph engine (macOS)
-│   ├── synapse-module/     # Main SubC module host, job queue, and worker manager
+│   ├── synapse-engine-owned/ # Primary owned Metal engine, step engines, and decode worker state (macOS)
+│   ├── synapse-module/     # Main SubC module host, job queue, owned decode routing, and scheduler
 │   ├── synapse-opctl/      # CLI operator control surface driving SubC commands
 │   ├── synapse-worker-ane/ # Apple Neural Engine supervised worker (Swift/CoreML)
+│   ├── synapse-worker-decode/ # Supervised owned Metal decode worker binary (macOS)
 │   ├── synapse-worker-llama/ # llama.cpp supervised worker (GGUF)
 │   └── synapse-worker-mlx/ # Apple Silicon MLX supervised worker
 ├── docs/                   # Design logs and decisions documentation
@@ -65,14 +66,14 @@
 - Key files: `crates/synapse-core/src/worker_protocol.rs`, `crates/synapse-core/src/scheduler.rs`, `crates/synapse-core/src/machine_profile.rs`
 
 **crates/synapse-engine-owned/:**
-- Purpose: The primary in-process execution engine for Apple Silicon (macOS).
-- Contains: Metal MPSGraph inference layers for ModernBERT, Qwen3, and MiniLM models.
-- Key files: `crates/synapse-engine-owned/src/lib.rs`, `crates/synapse-engine-owned/src/modernbert_mpsgraph.m`, `crates/synapse-engine-owned/src/metal_mpsgraph.m`
+- Purpose: The primary in-process execution engine for Apple Silicon (macOS), hosting embedding engines, direct Metal step decode engines, and decode worker supervision.
+- Contains: Metal MPSGraph inference layers for ModernBERT, Qwen3, and MiniLM models, direct Metal step decode engines (`owned-decode-engine`), and supervised decode worker state management (`owned-decode-worker`).
+- Key files: `crates/synapse-engine-owned/src/lib.rs`, `crates/synapse-engine-owned/owned-decode-engine/src/lib.rs`, `crates/synapse-engine-owned/owned-decode-worker/src/lib.rs`
 
 **crates/synapse-module/:**
-- Purpose: The primary SubC service module. Handles the content-addressed model cache, durable jobs, worker hosting, remote provider dispatch, and route binding.
-- Contains: SQLite store initialization, SubC `ModuleHandler` implementation, UNIX socket / Windows pipe worker spawning, and the remote gateway client.
-- Key files: `crates/synapse-module/src/lib.rs`, `crates/synapse-module/src/worker_host/mod.rs`, `crates/synapse-module/src/remote/gateway.rs`
+- Purpose: The primary SubC service module. Handles the content-addressed model cache, durable jobs, worker hosting, remote provider dispatch, owned decode routing, grammar compilation, and route binding.
+- Contains: SQLite store initialization, SubC `ModuleHandler` implementation, UNIX socket / Windows pipe worker spawning, remote gateway client, owned decode routing (`owned-decode-routing`), grammar compilation and DECODE scheduler (`owned-decode-grammar-scheduler`), certification gates and probes (`owned-decode-certification`), and manifest schemas (`owned-decode-manifests`).
+- Key files: `crates/synapse-module/src/lib.rs`, `crates/synapse-module/src/worker_host/mod.rs`, `crates/synapse-module/owned-decode-routing/mod.rs`, `crates/synapse-module/owned-decode-grammar-scheduler/mod.rs`
 
 **crates/synapse-opctl/:**
 - Purpose: Command-line operator control surface driving SubC commands.
@@ -81,10 +82,15 @@
 
 
 **crates/synapse-worker-*/:**
-- Purpose: Specialized out-of-process inference engines built for specific hardware (ANE, MLX, llama.cpp).
+- Purpose: Specialized out-of-process inference engines built for specific hardware (ANE, MLX, llama.cpp, supervised Metal decode).
 - Contains: Binaries that speak the `worker_protocol` over a local socket.
 - Key files: `crates/synapse-worker-mlx/src/main.rs`, `crates/synapse-worker-ane/src/main.rs`
 - Build note: `synapse-worker-mlx` requires full Xcode with the Metal toolchain on macOS. If `xcrun` resolves to Command Line Tools only, build with `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer`; the workspace does not auto-set it.
+
+**crates/synapse-worker-decode/:**
+- Purpose: Supervised out-of-process Metal decode worker executing single-token and batched token generation for Qwen3 and LFM2 engines on macOS.
+- Contains: `ck-synapse-worker-decode` binary, protocol framing loop, resident generation state management, and constraint loading.
+- Key files: `crates/synapse-worker-decode/src/main.rs`, `crates/synapse-worker-decode/src/runner.rs`
 
 **bench/:**
 - Purpose: Contains all performance evaluation execution infrastructure.
@@ -150,7 +156,7 @@
 
 **Entry Points:**
 - `crates/synapse-module/src/main.rs`: The main production SubC module entry point.
-- `crates/synapse-worker-*/src/main.rs`: Executables for hardware-specific supervised workers.
+- `crates/synapse-worker-*/src/main.rs`: Executables for hardware-specific supervised workers (including `crates/synapse-worker-decode/src/main.rs`).
 - `crates/synapse-opctl/src/main.rs`: Operator command line control surface (`ck-synapse-opctl`).
 - `crates/synapse-module/src/bin/subc_call.rs`: Management surface call utility.
 - `crates/synapse-module/src/bin/inline_embed_throughput.rs`: Batch throughput execution client.
@@ -171,6 +177,11 @@
 
 **Core Logic:**
 - `crates/synapse-module/src/remote/runtime.rs`: Provider pool routing, circuit breaker enforcement, and telemetry collection for external model execution.
+- `crates/synapse-engine-owned/owned-decode-engine/src/lib.rs`: Production owned Metal decode engine implementations (Qwen3, LFM2).
+- `crates/synapse-engine-owned/owned-decode-worker/src/supervisor.rs`: Supervised owned decode worker protocol, boundary precedence, and crash budget tracking.
+- `crates/synapse-module/owned-decode-grammar-scheduler/mod.rs`: Module-side JSON schema grammar compiler and DECODE quantum scheduler.
+- `crates/synapse-module/owned-decode-routing/mod.rs`: Decode request validation, Q8 ingest orchestration, certification probes, and lane routing.
+- `crates/synapse-worker-decode/src/runner.rs`: Supervised Metal decode worker runner and IPC protocol loop.
 - `crates/synapse-module/src/worker_host/mod.rs`: Spawns and manages worker lifecycles over Unix domain sockets or Windows named pipes using a binary framing protocol.
 - `crates/synapse-module/src/store.rs`: SQLite-backed state for content-addressed model cache, durable jobs, active attempts, and performance tier capabilities.
 - `crates/synapse-core/src/scheduler.rs`: 3-class fair-share aging scheduler for managing concurrent inference requests.

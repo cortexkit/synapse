@@ -6,7 +6,7 @@
 
 **Key Characteristics:**
 - **Local Inference Service:** The primary production system (`synapse-module`) acts as a persistent SubC node that receives embedding, generation, and reranking requests. It routes work via a 3-class fair-share aging scheduler to underlying local hardware engine lanes, or to external provider pools via the remote gateway.
-- **Hardware-Specific Workers:** Local model inference runs outside the host process via supervised binary children (`ck-synapse-worker-mlx`, `ck-synapse-worker-ane`, `ck-synapse-worker-llama`). The host speaks to them over UNIX domain sockets or Windows named pipes using a fast binary framing protocol.
+- **Hardware-Specific Workers:** Local model inference runs outside the host process via supervised binary children (`ck-synapse-worker-mlx`, `ck-synapse-worker-ane`, `ck-synapse-worker-llama`, `ck-synapse-worker-decode`). The host speaks to them over UNIX domain sockets or Windows named pipes using a fast binary framing protocol.
 - **Content-Addressed Cache & Durable Jobs:** Persistent SQLite storage manages model downloading (with concurrent shared-lease readers and a two-phase GC), machine capability probing, alias translation, and restartable generation requests (tracking execution/retention TTLs and checkpointed pages).
 - **Serial Execution under Idle-Gate Constraints (Bench Harness):** Prevent measurement contamination by ensuring the host machine is idle (average CPU <= 15%, GPU <= 5% for 6 seconds) before starting any evaluation run.
 - **Self-Contained Execution Lanes (Bench Harness):** Separate binaries or runtime environments for each target evaluate hardware backends before promoting them to production workers.
@@ -19,7 +19,7 @@
 **Synapse SubC Module (`synapse-module`):**
 - Purpose: The main service listening on the SubC bus. Handles route binding, job admission, the model cache, remote provider dispatch, worker lifecycle supervision, and in-process execution via the owned engine.
 - Location: `crates/synapse-module`
-- Contains: A 3-class aging scheduler, SQLite durable job and cache lease state, machine probe certification logic, socket/pipe-based worker host, the remote gateway client, and direct bindings to `synapse-engine-owned`.
+- Contains: A 3-class aging scheduler, SQLite durable job and cache lease state, machine probe certification logic, socket/pipe-based worker host, the remote gateway client, module-side routing (`owned-decode-routing`), grammar compilation and DECODE scheduler (`owned-decode-grammar-scheduler`), certification gates and probes (`owned-decode-certification`), contract manifests (`owned-decode-manifests`), and direct bindings to `synapse-engine-owned`.
 - Depends on: `synapse-core`, `synapse-engine-owned`, `subc-client-rs`, `rusqlite`, `tokio`.
 
 **Remote Gateway (`crates/synapse-module/src/remote`):**
@@ -29,17 +29,17 @@
 - Depends on: `synapse-core`, `subc-client-rs`, `reqwest`.
 
 **Synapse Owned Engine (`synapse-engine-owned`):**
-- Purpose: Primary in-process execution engine for Apple Silicon (macOS), providing exact-match Metal MPSGraph inference for ModernBERT, Qwen3, and MiniLM models. 
+- Purpose: Primary in-process execution engine for Apple Silicon (macOS), providing exact-match Metal MPSGraph inference for ModernBERT, Qwen3, and MiniLM models, direct Metal step decode engines for Qwen3 and LFM2, and supervised decode worker state management.
 - Location: `crates/synapse-engine-owned`
-- Contains: Rust-to-Objective-C bindings, Metal shader graphs (including macOS 15+ `@available`-guarded fused scaled-dot-product attention for ModernBERT with `GRAPH_REVISION` package cache invalidation), and tensor operations for embedding and reranking. The module stays the sole tokenizer owner; this engine strictly consumes canonical token IDs and executes tensor logic.
+- Contains: Rust-to-Objective-C bindings, Metal shader graphs (including macOS 15+ `@available`-guarded fused scaled-dot-product attention for ModernBERT with `GRAPH_REVISION` package cache invalidation), direct Metal step decode kernels and models (`owned-decode-engine`), supervised decode worker protocol, boundary, crash budget, and supervision state machine (`owned-decode-worker`), and tensor operations for embedding and reranking. The module stays the sole tokenizer owner; this engine strictly consumes canonical token IDs and executes tensor logic.
 - Depends on: `synapse-core`, `safetensors`, `half`, Apple's `Metal` and `MPSGraph` frameworks.
 - Used by: `synapse-module` as the primary local engine.
 
 **Synapse Worker Lanes (`synapse-worker-*`):**
-- Purpose: Execute in-memory tokenization, tensor forward passes, and pooling for specific hardware classes (Apple Silicon MLX, Apple Neural Engine, Llama GGUF).
-- Location: `crates/synapse-worker-mlx`, `crates/synapse-worker-ane`, `crates/synapse-worker-llama`
-- Contains: Metal-accelerated customized MLX models, CoreML graphs (including the `gte-modernbert` embedder and reranker for the ANE quiet-tier), and `llama.cpp` inference processes.
-- Depends on: `synapse-core`, `mlx-rs`, `coreml` (via Swift), `reqwest`.
+- Purpose: Execute in-memory tokenization, tensor forward passes, and token generation for specific hardware classes (Apple Silicon MLX, Apple Neural Engine, Llama GGUF, and supervised Metal decode).
+- Location: `crates/synapse-worker-mlx`, `crates/synapse-worker-ane`, `crates/synapse-worker-llama`, `crates/synapse-worker-decode`
+- Contains: Metal-accelerated customized MLX models, CoreML graphs (including the `gte-modernbert` embedder and reranker for the ANE quiet-tier), `llama.cpp` inference processes, and supervised owned Metal decode runner (`ck-synapse-worker-decode`) executing Qwen3 and LFM2 token generation under progress/continuation framing.
+- Depends on: `synapse-core`, `owned-decode-worker`, `synapse-engine-owned`, `mlx-rs`, `coreml` (via Swift), `reqwest`.
 - Used by: The `synapse-module` host spawning them dynamically based on user requests and capability tiers.
 
 **Synapse Core Abstractions (`synapse-core`):**
@@ -140,11 +140,12 @@
 
 **Constrained Decoding Flow:**
 
-1. Extract logit values for the next token from the causal decode execution.
-2. Query the constraint state machine (such as the JSON schema `JsonParser`) to determine valid byte sequences.
-3. Compute the vocabulary-wide bitset `TokenMask` by matching allowed byte sequences against the token vocabulary trie.
-4. Apply the `TokenMask` to the logits (forcing unallowed token logits to negative infinity).
-5. Select the next token from the masked logits, notify the pre-commit tap hooks, advance the constraint parser state, and commit the token.
+1. Module parses and validates input JSON schemas (`synapse-json-schema-v1`), enforces grammar limits, compiles a byte-level JSON automaton, and converts it into a `TokenIdJsonConstraintV1` structure shipped directly to the worker (`crates/synapse-module/owned-decode-grammar-scheduler/grammar_compile.rs`).
+2. Decode requests enter the dedicated `QueueClass::Decode` scheduler using N-token quantum sequencing (batched 16-token chunks with yield-on-contention release) — `crates/synapse-module/owned-decode-grammar-scheduler/scheduler.rs`.
+3. Worker extracts logit values for the next token from causal decode execution (Qwen3 or LFM2 Metal step engines).
+4. Query constraint state machine (`JsonParser` / automaton) to match allowed byte sequences against the token vocabulary trie and compute the vocabulary-wide bitset `TokenMask`.
+5. Apply the `TokenMask` to the logits (forcing unallowed token logits to negative infinity).
+6. Select the next token from masked logits, advance constraint parser state, and yield progress or final frame.
 
 
 **Corpus Generation Flow (Bench):**
@@ -268,6 +269,21 @@
 - Location: `tools/classify-distill/src/validator.ts`
 - Pattern: Structural schema validator and intent resolver.
 
+**Grammar Compiler & Automaton:**
+- Purpose: Exclusively compiles `synapse-json-schema-v1` JSON schemas into byte-level JSON automata (`TokenIdJsonConstraintV1`) and enforces checked-in structural limits without exposing raw schema structures across the worker boundary.
+- Location: `crates/synapse-module/owned-decode-grammar-scheduler/mod.rs`
+- Pattern: Byte-level automaton compilation and vocabulary bitset indexing.
+
+**Decode Scheduler & Quantum Sequencer:**
+- Purpose: Dedicated DECODE queue scheduler with weighted boundary arbitration, oldest-anchor aging, execution permits with yield-on-contention release, and N-token (N=16) quantum sequencing for owned generation workloads.
+- Location: `crates/synapse-module/owned-decode-grammar-scheduler/scheduler.rs`
+- Pattern: Quantum-bounded state machine scheduler.
+
+**Owned Decode Supervisor & Protocol:**
+- Purpose: Pure-Rust state machine supervising `ck-synapse-worker-decode` over `owned-metal-decode-worker-v1` IPC, managing sequence/session validation, terminal-control boundary precedence, crash-budget persistence/quarantine, and single-crash token-zero restart.
+- Location: `crates/synapse-engine-owned/owned-decode-worker/src/supervisor.rs`
+- Pattern: Worker lifecycle supervisor with crash budget and quarantine state.
+
 **LFM2 Causal Mixer:**
 - Purpose: Alternates 10 short-convolution layers and 6 full-attention layers with tied embeddings and GQA KV cache, supporting modern `layer_types` configurations.
 - Location: `bench/spikes/unified-rt/src/lfm2.rs`
@@ -324,7 +340,7 @@
 **Worker Binaries (`ck-synapse-worker-*`):**
 - Location: `crates/synapse-worker-*/src/main.rs`
 - Triggers: Spawned directly by `crates/synapse-module/src/worker_host/mod.rs`.
-- Responsibilities: Initializing accelerator graphs/sessions (MLX, ANE, Llama), pipe/socket handshaking, loop listening for compute requests, returning tensors.
+- Responsibilities: Initializing accelerator graphs/sessions (MLX, ANE, Llama, supervised Metal decode), pipe/socket handshaking, loop listening for compute requests, returning tensors or generated token frames.
 
 **Bench Harness CLI (`synapse-bench`):**
 - Location: `bench/harness/src/main.rs`
