@@ -249,6 +249,10 @@ pub struct RoutingEnvironment {
     pub equivalent_fingerprints: BTreeSet<Fingerprint>,
     /// Constraint runtime identity digest for a constrained request, if applicable.
     pub constraint_runtime_identity: Option<String>,
+    /// A typed refusal discovered while resolving an owned catalog identity.
+    /// This takes precedence over cutover because it describes whether the
+    /// selected platform can execute the owned lane at all.
+    resolution_owned_refusal: Option<OwnedDecodeError>,
     /// A typed refusal discovered while preparing the owned worker before its
     /// dispatch seam runs. It is considered only after the normal cutover,
     /// quarantine, artifact, and certification gates have selected the owned lane.
@@ -283,6 +287,7 @@ impl RoutingEnvironment {
             llama,
             equivalent_fingerprints,
             constraint_runtime_identity,
+            resolution_owned_refusal: None,
             pre_dispatch_owned_refusal: None,
         }
     }
@@ -308,6 +313,7 @@ impl RoutingEnvironment {
             llama,
             equivalent_fingerprints,
             constraint_runtime_identity,
+            resolution_owned_refusal: None,
             pre_dispatch_owned_refusal: None,
         }
     }
@@ -333,8 +339,19 @@ impl RoutingEnvironment {
             llama,
             equivalent_fingerprints,
             constraint_runtime_identity,
+            resolution_owned_refusal: None,
             pre_dispatch_owned_refusal: None,
         }
+    }
+
+    /// Record a typed refusal found while resolving an owned catalog identity.
+    /// Lane selection receives the refusal before the cutover gate, so a
+    /// substitutable request may choose llama without requiring Metal execution.
+    #[must_use]
+    pub fn with_resolution_owned_refusal(mut self, refusal: OwnedDecodeError) -> Self {
+        debug_assert!(refusal.is_predispatch_fallback_eligible());
+        self.resolution_owned_refusal = Some(refusal);
+        self
     }
 
     /// Record a pre-dispatch owned-lane refusal discovered by the module's worker
@@ -410,16 +427,20 @@ impl OwnedDecodeRouter {
     /// Evaluate the owned lane before dispatch, failing closed on the first
     /// applicable pre-dispatch refusal.
     ///
-    /// Normal certification and artifact gates take precedence over worker setup:
-    /// an unselected owned lane remains `NotPreferred` or `NotCertified`, while a
-    /// selected lane turns a setup refusal into `OwnedEvaluation::Refused` for the
-    /// single lane-selection authority to handle.
+    /// Resolution refusal takes precedence because it describes a platform that
+    /// cannot execute the owned lane. Normal certification and artifact gates then
+    /// take precedence over worker setup: an unselected owned lane remains
+    /// `NotPreferred` or `NotCertified`, while a selected lane turns a setup
+    /// refusal into `OwnedEvaluation::Refused` for lane selection to handle.
     fn evaluate_owned(
         &self,
         env: &RoutingEnvironment,
         entry: &CatalogEntry,
         decode_fingerprint: &Fingerprint,
     ) -> OwnedEvaluation {
+        if let Some(refusal) = env.resolution_owned_refusal {
+            return OwnedEvaluation::Refused(refusal);
+        }
         if !env.cutover_enabled {
             return OwnedEvaluation::NotPreferred;
         }
@@ -904,6 +925,47 @@ mod tests {
             Some("owned_decode_not_certified")
         );
         assert_eq!(*dispatched.borrow(), vec![LaneKind::Llama]);
+    }
+
+    #[test]
+    fn resolution_unsupported_falls_back_before_cutover_evaluation() {
+        let entry = catalog_entry(Family::Qwen3_0_6b, WeightQuant::F16);
+        let router = router_with_certified(CertificationStore::new(), Q8IngestRegistry::new());
+        let request = request(Family::Qwen3_0_6b, WeightQuant::F16);
+        let environment = env(false, Some(llama_lane()))
+            .with_resolution_owned_refusal(OwnedDecodeError::Unsupported);
+        let dispatched = Rc::new(RefCell::new(Vec::new()));
+        let mut dispatch = RecordingDispatch::new_succeeding(dispatched.clone());
+
+        let response = router
+            .route_oneshot(&environment, &entry, &request, "gen-1", &mut dispatch)
+            .expect("resolution refusal falls back");
+
+        assert_eq!(response.lane, LaneKind::Llama);
+        assert_eq!(
+            response.provenance.fallback_reason.as_deref(),
+            Some("owned_decode_unsupported")
+        );
+        assert_eq!(*dispatched.borrow(), vec![LaneKind::Llama]);
+    }
+
+    #[test]
+    fn resolution_refusal_keeps_owned_only_request_typed() {
+        let entry = catalog_entry(Family::Qwen3_0_6b, WeightQuant::F16);
+        let router = router_with_certified(CertificationStore::new(), Q8IngestRegistry::new());
+        let mut request = request(Family::Qwen3_0_6b, WeightQuant::F16);
+        request.owned_only = true;
+        let environment = env(false, Some(llama_lane()))
+            .with_resolution_owned_refusal(OwnedDecodeError::Unsupported);
+        let dispatched = Rc::new(RefCell::new(Vec::new()));
+        let mut dispatch = RecordingDispatch::new_succeeding(dispatched.clone());
+
+        let error = router
+            .route_oneshot(&environment, &entry, &request, "gen-1", &mut dispatch)
+            .expect_err("owned-only request must retain the resolution refusal");
+
+        assert_eq!(error.wire_id(), "owned_decode_unsupported");
+        assert!(dispatched.borrow().is_empty(), "nothing dispatched");
     }
 
     #[test]

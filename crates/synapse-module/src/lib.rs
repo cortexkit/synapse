@@ -700,6 +700,9 @@ struct EmbeddingModel {
     certification_fingerprint: Fingerprint,
     engine_identity: EngineIdentity,
     owned_tokenizer_policy: Option<OwnedTokenizerPolicy>,
+    /// Platform-gated owned-decode execution refusal discovered while resolving
+    /// the catalog identity. Routing consumes this before lane selection.
+    owned_decode_resolution_refusal: Option<owned_decode_routing::error::OwnedDecodeError>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2878,21 +2881,16 @@ fn load_catalog_model_blocking(
                 Some(policy),
             )
         }
-        "owned-metal-decode" => {
-            if !cfg!(target_os = "macos") {
-                return Err(artifact_invalid_error(format!(
-                    "owned-metal-decode model '{}' is only supported on macOS",
-                    spec.model_id
-                )));
-            }
-            (
-                EmbedBackend::OwnedDecode,
-                LoadedModel {
-                    model_id: format!("owned-decode:{}", spec.model_id),
-                },
-                None,
-            )
-        }
+        // An owned-decode catalog entry has platform-independent identity data.
+        // Resolve that identity on every target; the platform gate is a typed
+        // routing refusal so a substitutable request can select llama instead.
+        "owned-metal-decode" => (
+            EmbedBackend::OwnedDecode,
+            LoadedModel {
+                model_id: format!("owned-decode:{}", spec.model_id),
+            },
+            None,
+        ),
         "llama" | "mlx" | "ane" => {
             let (backend, loaded) = load_worker_backend_blocking(
                 &spec,
@@ -2927,6 +2925,7 @@ fn load_catalog_model_blocking(
         certification_fingerprint,
         engine_identity: spec.engine_identity.clone(),
         owned_tokenizer_policy,
+        owned_decode_resolution_refusal: owned_decode_resolution_refusal(&spec),
     })
 }
 
@@ -5055,6 +5054,23 @@ impl owned_decode_routing::DecodeDispatch for WireDecodeDispatch {
     }
 }
 
+/// Classify an owned-decode resolution refusal without discarding the catalog
+/// identity. Metal execution is unavailable off macOS, but its catalog row and
+/// fingerprints remain valid routing data everywhere.
+fn owned_decode_resolution_refusal_for_platform(
+    engine: &str,
+    platform_supports_owned_decode: bool,
+) -> Option<owned_decode_routing::error::OwnedDecodeError> {
+    (engine == "owned-metal-decode" && !platform_supports_owned_decode)
+        .then_some(owned_decode_routing::error::OwnedDecodeError::Unsupported)
+}
+
+fn owned_decode_resolution_refusal(
+    spec: &StoredModelConfig,
+) -> Option<owned_decode_routing::error::OwnedDecodeError> {
+    owned_decode_resolution_refusal_for_platform(&spec.engine, cfg!(target_os = "macos"))
+}
+
 fn owned_decode_catalog_entry(
     spec: &StoredModelConfig,
 ) -> Result<owned_decode_routing::CatalogEntry, owned_decode_routing::error::OwnedDecodeError> {
@@ -5600,6 +5616,14 @@ async fn route_owned_decode_wire(
             )
         }
     };
+    let owned_model =
+        match ensure_model_loaded_for_control(Arc::clone(&state), model_id, params.deadline_ms)
+            .await
+        {
+            Ok(model) => model,
+            Err(error) => return result_outcome(error_payload(&state, error)),
+        };
+    let resolution_owned_refusal = owned_model.owned_decode_resolution_refusal;
     let alias_table = match state.store.alias_table() {
         Ok(table) => table,
         Err(error) => return channel_error("store_failure", error.to_string()),
@@ -5650,6 +5674,7 @@ async fn route_owned_decode_wire(
         store: Arc::clone(&state.store),
     };
     if constrained
+        && resolution_owned_refusal.is_none()
         && !owned_decode_routing::certification::CertificationAccess::is_unconstrained_certified(
             &certification,
             &owned_decode_routing::certification::UnconstrainedCertKey {
@@ -5663,29 +5688,35 @@ async fn route_owned_decode_wire(
             "no certified owned-decode lane is available (underlying owned_decode_not_certified)",
         );
     }
-    let compiled_constraint = match params
-        .grammar
-        .as_deref()
-        .filter(|grammar| !grammar.trim().is_empty())
-    {
-        Some(grammar) => {
-            let vocabulary_digest = match owned_decode_vocabulary_digest(&tokenizer) {
-                Ok(digest) => digest,
-                Err(error) => return result_outcome(error_payload(&state, error)),
-            };
-            match owned_decode_grammar_scheduler::compile_grammar(
-                grammar,
-                &owned_decode_grammar_scheduler::CompileContext {
-                    base_decode_fingerprint: decode_fingerprint.clone(),
-                    tokenizer_vocabulary_digest: vocabulary_digest,
-                },
-                &owned_decode_grammar_scheduler::GrammarSubsetManifest::default(),
-            ) {
-                Ok(compiled) => Some(compiled),
-                Err(error) => return channel_error(error.wire_error().as_str(), error.message),
+    let compiled_constraint = if resolution_owned_refusal.is_some() {
+        // The platform refusal must reach lane selection before Metal-only
+        // grammar setup, which cannot construct a tokenizer vocabulary here.
+        None
+    } else {
+        match params
+            .grammar
+            .as_deref()
+            .filter(|grammar| !grammar.trim().is_empty())
+        {
+            Some(grammar) => {
+                let vocabulary_digest = match owned_decode_vocabulary_digest(&tokenizer) {
+                    Ok(digest) => digest,
+                    Err(error) => return result_outcome(error_payload(&state, error)),
+                };
+                match owned_decode_grammar_scheduler::compile_grammar(
+                    grammar,
+                    &owned_decode_grammar_scheduler::CompileContext {
+                        base_decode_fingerprint: decode_fingerprint.clone(),
+                        tokenizer_vocabulary_digest: vocabulary_digest,
+                    },
+                    &owned_decode_grammar_scheduler::GrammarSubsetManifest::default(),
+                ) {
+                    Ok(compiled) => Some(compiled),
+                    Err(error) => return channel_error(error.wire_error().as_str(), error.message),
+                }
             }
+            None => None,
         }
-        None => None,
     };
     let constraint_runtime_identity = compiled_constraint
         .as_ref()
@@ -5695,7 +5726,7 @@ async fn route_owned_decode_wire(
         .map(|compiled| worker_constraint(&compiled.constraint));
     let (runtime_config_digest, _) = owned_decode_runtime_identity(&spec, &entry);
 
-    let llama_spec = if compiled_constraint.is_none() {
+    let llama_spec = if !constrained {
         state.runtime.catalog.lock().ok().and_then(|catalog| {
             catalog
                 .values()
@@ -5711,9 +5742,16 @@ async fn route_owned_decode_wire(
         None
     };
     let llama_model = if let Some(fallback) = llama_spec.as_ref() {
-        ensure_model_loaded_for_control(Arc::clone(&state), &fallback.model_id, params.deadline_ms)
-            .await
-            .ok()
+        match ensure_model_loaded_for_control(
+            Arc::clone(&state),
+            &fallback.model_id,
+            params.deadline_ms,
+        )
+        .await
+        {
+            Ok(model) => Some(model),
+            Err(error) => return result_outcome(error_payload(&state, error)),
+        }
     } else {
         None
     };
@@ -5738,6 +5776,10 @@ async fn route_owned_decode_wire(
             equivalent_fingerprints,
         },
     );
+    let environment = match resolution_owned_refusal {
+        Some(refusal) => environment.with_resolution_owned_refusal(refusal),
+        None => environment,
+    };
 
     let certification = PersistentDecodeCertification {
         store: Arc::clone(&state.store),
@@ -5780,11 +5822,17 @@ async fn route_owned_decode_wire(
         prompt_token_count: prompt.len().min(u32::MAX as usize) as u32,
         max_tokens: params.max_tokens,
         sampling: SamplingMode::GreedyTop1,
-        grammar: params
-            .grammar
-            .as_deref()
-            .filter(|grammar| !grammar.trim().is_empty())
-            .and_then(|grammar| serde_json::from_str(grammar).ok()),
+        grammar: if resolution_owned_refusal.is_some() && constrained {
+            // Preserve owned-only request shape while the platform refusal is
+            // routed. Grammar compilation above is intentionally skipped.
+            Some(Value::Null)
+        } else {
+            params
+                .grammar
+                .as_deref()
+                .filter(|grammar| !grammar.trim().is_empty())
+                .and_then(|grammar| serde_json::from_str(grammar).ok())
+        },
         required_fingerprint: params.required_fingerprint.clone().map(Fingerprint),
         allow_equivalent: params.allow_equivalent,
         target_fingerprint: params.target_fingerprint.clone().map(Fingerprint),
@@ -5821,18 +5869,24 @@ async fn route_owned_decode_wire(
         .deadline_ms
         .unwrap_or(state.runtime.inline.deadline_ms)
         .max(1);
-    let (owned, pre_dispatch_owned_refusal) = match cached_supervised_decode_dispatch(
-        &state,
-        &spec,
-        &entry,
-        prompt.clone(),
-        worker_constraint.clone(),
-        deadline_ms,
-    ) {
-        Ok(dispatch) => (Some(dispatch), None),
-        Err(OwnedDecodeDispatchPreparationError::Refused(refusal)) => (None, Some(refusal)),
-        Err(OwnedDecodeDispatchPreparationError::Wire(error)) => {
-            return result_outcome(error_payload(&state, error));
+    let (owned, pre_dispatch_owned_refusal) = if resolution_owned_refusal.is_some() {
+        // Resolution already classified this platform's owned lane as unavailable;
+        // do not attempt to construct a Metal worker before lane selection.
+        (None, None)
+    } else {
+        match cached_supervised_decode_dispatch(
+            &state,
+            &spec,
+            &entry,
+            prompt.clone(),
+            worker_constraint.clone(),
+            deadline_ms,
+        ) {
+            Ok(dispatch) => (Some(dispatch), None),
+            Err(OwnedDecodeDispatchPreparationError::Refused(refusal)) => (None, Some(refusal)),
+            Err(OwnedDecodeDispatchPreparationError::Wire(error)) => {
+                return result_outcome(error_payload(&state, error));
+            }
         }
     };
     let environment = match pre_dispatch_owned_refusal {
@@ -10198,6 +10252,58 @@ mod tests {
         assert!(!engine_requires_microllm_certification("owned-metal"));
         assert!(!engine_requires_microllm_certification("llama"));
         assert!(!engine_requires_microllm_certification("mlx"));
+    }
+
+    #[test]
+    fn simulated_non_macos_owned_decode_resolution_routes_through_lane_selection() {
+        use owned_decode_routing::{
+            error::OwnedDecodeError,
+            family::Family,
+            identity::WeightQuant,
+            lane::{
+                select_lane, FallbackReason, LaneOutcome, LaneSelectionContext, LlamaLane,
+                OwnedEvaluation,
+            },
+            request::{OneshotRequest, SamplingMode},
+        };
+
+        let refusal = owned_decode_resolution_refusal_for_platform("owned-metal-decode", false);
+        assert_eq!(refusal, Some(OwnedDecodeError::Unsupported));
+        assert_eq!(
+            owned_decode_resolution_refusal_for_platform("owned-metal-decode", true),
+            None
+        );
+        let request = OneshotRequest {
+            family: Family::Qwen3_0_6b,
+            weight_quant: WeightQuant::F16,
+            prompt_token_count: 1,
+            max_tokens: 1,
+            sampling: SamplingMode::GreedyTop1,
+            grammar: None,
+            required_fingerprint: None,
+            allow_equivalent: false,
+            target_fingerprint: None,
+            required_processing_fingerprint: None,
+            owned_only: false,
+        };
+        let outcome = select_lane(&LaneSelectionContext {
+            request: &request,
+            owned_decode_fingerprint: Fingerprint("owned-decode".to_string()),
+            owned_processing_fingerprint: Fingerprint("owned-processing".to_string()),
+            owned: OwnedEvaluation::Refused(refusal.expect("unsupported platform refusal")),
+            llama: Some(LlamaLane {
+                decode_fingerprint: Fingerprint("llama-decode".to_string()),
+                processing_fingerprint: Fingerprint("llama-processing".to_string()),
+            }),
+            equivalent_fingerprints: BTreeSet::new(),
+        });
+
+        assert_eq!(
+            outcome,
+            LaneOutcome::Llama {
+                fallback_reason: FallbackReason::OwnedRefusal(OwnedDecodeError::Unsupported),
+            }
+        );
     }
 
     #[test]

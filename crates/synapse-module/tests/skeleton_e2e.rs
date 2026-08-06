@@ -3104,8 +3104,10 @@ async fn substitutable_owned_refusal_falls_back_to_llama_with_lane_provenance() 
         result["provenance"]["fallback_reason"],
         if cfg!(debug_assertions) {
             "owned_decode_not_certified"
-        } else {
+        } else if cfg!(target_os = "macos") {
             "cutover_disabled"
+        } else {
+            "owned_decode_unsupported"
         }
     );
     assert!(result["provenance"]["decode_fingerprint"].is_string());
