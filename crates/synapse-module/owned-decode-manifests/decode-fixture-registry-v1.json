@@ -34,7 +34,9 @@
         "weight_quant": "f16",
         "prompt_count": 20,
         "max_tokens": 64,
-        "oracle_provenance": "bench/campaign/decode-fixtures"
+        "oracle_provenance": "bench/campaign/decode-fixtures",
+        "production_fixture": "src/fixtures/probe_decode_qwen3_0_6b_f16_v1.json",
+        "production_fixture_sha256": "2ffc315c31d7ee3a56d61123f63d6673434abb3de138cfa375a8dc5cb62caaaf"
       }
     },
     {
@@ -47,7 +49,9 @@
         "weight_quant": "q8_0",
         "prompt_count": 20,
         "max_tokens": 64,
-        "oracle_provenance": "bench/campaign/decode-fixtures"
+        "oracle_provenance": "bench/campaign/decode-fixtures",
+        "production_fixture": "src/fixtures/probe_decode_qwen3_0_6b_q8_0_v1.json",
+        "production_fixture_sha256": "79a816f3ca742db5bd2722b854643f9c1b979e21f59b3fd81890113c9f268bd8"
       }
     },
     {
@@ -60,7 +64,9 @@
         "weight_quant": "f16",
         "prompt_count": 20,
         "max_tokens": 64,
-        "oracle_provenance": "bench/campaign/decode-fixtures"
+        "oracle_provenance": "bench/campaign/decode-fixtures",
+        "production_fixture": "src/fixtures/probe_decode_lfm2_1_2b_f16_v1.json",
+        "production_fixture_sha256": "4c8a25f322ca157a8949b1f560852b5e9111a8bf78a19b62ea908616da107555"
       }
     },
     {
@@ -73,7 +79,9 @@
         "weight_quant": "q8_0",
         "prompt_count": 20,
         "max_tokens": 64,
-        "oracle_provenance": "bench/campaign/decode-fixtures"
+        "oracle_provenance": "bench/campaign/decode-fixtures",
+        "production_fixture": "src/fixtures/probe_decode_lfm2_1_2b_q8_0_v1.json",
+        "production_fixture_sha256": "d732afd1fb119a621a585082f3a30ca6598faae9997a1df6373e322a14f66a9a"
       }
     },
     {
@@ -111,9 +119,13 @@
           "$schema": "https://json-schema.org/draft/2020-12/schema",
           "type": "object",
           "properties": {
-            "name": { "type": "string" }
+            "name": {
+              "type": "string"
+            }
           },
-          "required": ["name"],
+          "required": [
+            "name"
+          ],
           "additionalProperties": false
         },
         "validator": "independent-json-schema-validator"
@@ -127,7 +139,9 @@
         "schema": {
           "$schema": "https://json-schema.org/draft/2020-12/schema",
           "type": "array",
-          "items": { "type": "integer" }
+          "items": {
+            "type": "integer"
+          }
         },
         "validator": "independent-json-schema-validator"
       }
@@ -140,7 +154,11 @@
         "schema": {
           "$schema": "https://json-schema.org/draft/2020-12/schema",
           "type": "string",
-          "enum": ["red", "green", "blue"]
+          "enum": [
+            "red",
+            "green",
+            "blue"
+          ]
         },
         "validator": "independent-json-schema-validator"
       }

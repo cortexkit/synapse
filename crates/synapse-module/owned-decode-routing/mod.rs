@@ -31,6 +31,7 @@ pub mod family;
 pub mod identity;
 pub mod lane;
 pub mod provenance;
+pub mod q8artifact;
 pub mod q8ingest;
 pub mod request;
 

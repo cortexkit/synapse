@@ -39,6 +39,8 @@ cortexkit-store = { workspace = true }
 cortexkit-store-types = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+half = "2"
+safetensors = "0.6.2"
 reqwest = { workspace = true }
 httpdate = { workspace = true }
 url = { workspace = true }
