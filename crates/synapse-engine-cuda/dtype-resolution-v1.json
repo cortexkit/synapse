@@ -1,0 +1,40 @@
+{
+  "record_id": "owned-cuda-dtype-resolution-v1",
+  "source_revision": "4d0ded67c30286fe2be37cc7413359ad745dd751",
+  "artifact_tensor_dtype": "f32 canonical safetensors; f16 and bf16 are decoded to f32 before the CUDA ABI",
+  "cells": {
+    "C1": {
+      "cell_id": "owned-cuda/minilm/f16",
+      "family": "minilm",
+      "kernel_input_abi": "uint16_t host buffer containing IEEE-754 binary16 bits",
+      "kernel_weight_abi": "const float* host pointers copied to CUDA half resident weights; fp32 norm parameters",
+      "conversion_points": [
+        "Rust f32 embedding state -> encode_f16_bits before synapse_cuda_encoder_forward",
+        "cuda_minilm.cu copy_half converts host f32 weights to half device storage"
+      ],
+      "selected_manifest_storage_dtype": "f16"
+    },
+    "C2": {
+      "cell_id": "owned-cuda/gte-modernbert/f16",
+      "family": "gte-modernbert",
+      "kernel_input_abi": "const void* selecting uint16_t binary16 or float input by precision",
+      "kernel_weight_abi": "const float* host pointers copied to CUDA half resident weights for f16; fp32 norm parameters",
+      "conversion_points": [
+        "Rust f32 hidden state -> encode_f16_bits when precision is f16",
+        "cuda_modernbert.cu copy_weight<half> converts projection weights; copy_float retains norms as fp32"
+      ],
+      "selected_manifest_storage_dtype": "f16"
+    },
+    "C3": {
+      "cell_id": "owned-cuda/qwen3-0.6b/f16",
+      "family": "qwen3-0.6b",
+      "kernel_input_abi": "uint16_t host buffer containing IEEE-754 binary16 bits",
+      "kernel_weight_abi": "const float* host pointers copied to CUDA half resident weights; fp32 RMSNorm parameters",
+      "conversion_points": [
+        "Rust f32 hidden state -> encode_f16_bits before synapse_cuda_qwen3_forward",
+        "cuda_qwen3.cu copy_weight<half> converts projection weights; copy_float retains norms as fp32"
+      ],
+      "selected_manifest_storage_dtype": "f16"
+    }
+  }
+}

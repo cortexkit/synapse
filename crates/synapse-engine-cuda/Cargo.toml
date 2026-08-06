@@ -1,0 +1,29 @@
+[package]
+name = "synapse-engine-cuda"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+description = "Synapse owned CUDA PTX embedding engine."
+publish = false
+
+# This crate is intentionally self-contained until the production worker slice
+# adds it to the top-level workspace.
+[workspace]
+
+[features]
+default = []
+cuda = []
+
+[dependencies]
+synapse-core = { path = "../synapse-core" }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+safetensors = "0.6.2"
+half = "2"
+thiserror = "1"
+sha2 = "0.10"
+
+[build-dependencies]
+cc = "1"
