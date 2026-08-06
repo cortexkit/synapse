@@ -1583,10 +1583,12 @@ fn build_preload_catalog_model(
                     preload.dtype.as_deref(),
                     preload.execution.as_deref(),
                     preload.attention_units,
-                    preload.kernel_revision.as_deref(),
-                    preload.ptx_virtual_arch.as_deref(),
-                    preload.minimum_device_cc,
-                    preload.minimum_cuda_driver_api,
+                    OwnedCudaDeclaredIdentity {
+                        kernel_revision: preload.kernel_revision.as_deref(),
+                        ptx_virtual_arch: preload.ptx_virtual_arch.as_deref(),
+                        minimum_device_cc: preload.minimum_device_cc,
+                        minimum_cuda_driver_api: preload.minimum_cuda_driver_api,
+                    },
                 )
             } else {
                 owned_catalog_config(
@@ -1751,26 +1753,28 @@ fn normalize_catalog_model(
             model.owned_dtype.as_deref(),
             model.owned_execution.as_deref(),
             model.owned_attention_units,
-            model
-                .engine_identity
-                .build_flags
-                .get("kernel_revision")
-                .map(String::as_str),
-            model
-                .engine_identity
-                .build_flags
-                .get("ptx_virtual_arch")
-                .map(String::as_str),
-            model
-                .engine_identity
-                .build_flags
-                .get("minimum_device_cc")
-                .and_then(|value| value.parse().ok()),
-            model
-                .engine_identity
-                .build_flags
-                .get("minimum_cuda_driver_api")
-                .and_then(|value| value.parse().ok()),
+            OwnedCudaDeclaredIdentity {
+                kernel_revision: model
+                    .engine_identity
+                    .build_flags
+                    .get("kernel_revision")
+                    .map(String::as_str),
+                ptx_virtual_arch: model
+                    .engine_identity
+                    .build_flags
+                    .get("ptx_virtual_arch")
+                    .map(String::as_str),
+                minimum_device_cc: model
+                    .engine_identity
+                    .build_flags
+                    .get("minimum_device_cc")
+                    .and_then(|value| value.parse().ok()),
+                minimum_cuda_driver_api: model
+                    .engine_identity
+                    .build_flags
+                    .get("minimum_cuda_driver_api")
+                    .and_then(|value| value.parse().ok()),
+            },
         )?)
     } else {
         None
@@ -1999,16 +2003,30 @@ fn owned_catalog_config(
     })
 }
 
+/// Declared CUDA build/floor identity for an owned-cuda catalog entry. Grouped
+/// because these four values travel together: they are the PTX build identity
+/// and support floors that the entry may declare, and each declared value must
+/// match the compiled-in constant exactly (declaring is optional; lying is not).
+struct OwnedCudaDeclaredIdentity<'a> {
+    kernel_revision: Option<&'a str>,
+    ptx_virtual_arch: Option<&'a str>,
+    minimum_device_cc: Option<f32>,
+    minimum_cuda_driver_api: Option<u32>,
+}
+
 fn owned_cuda_catalog_config(
     family: Option<&str>,
     dtype: Option<&str>,
     execution: Option<&str>,
     attention_units: Option<usize>,
-    kernel_revision: Option<&str>,
-    ptx_virtual_arch: Option<&str>,
-    minimum_device_cc: Option<f32>,
-    minimum_cuda_driver_api: Option<u32>,
+    declared: OwnedCudaDeclaredIdentity<'_>,
 ) -> Result<OwnedCatalogConfig, ModuleError> {
+    let OwnedCudaDeclaredIdentity {
+        kernel_revision,
+        ptx_virtual_arch,
+        minimum_device_cc,
+        minimum_cuda_driver_api,
+    } = declared;
     let family = family.ok_or_else(|| {
         ModuleError::Config("owned-cuda catalog entry is missing family".to_string())
     })?;
