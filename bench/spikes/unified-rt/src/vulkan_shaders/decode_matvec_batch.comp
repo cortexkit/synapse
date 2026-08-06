@@ -15,11 +15,11 @@
 // reordering that breaks the byte-exact gate (the same failure the Metal
 // template instantiation fixed).
 //
-// The accumulators are declared as explicit scalars per K branch (not an
-// array indexed by a loop variable) so the glslc compiler keeps them in
-// registers and preserves the single-token accumulation order. An array
-// `float sums[K]` even with K specialized lets the compiler reorder the
-// products within one uvec2 group before adding them to the running sum.
+// The accumulators are declared as explicit scalars per 16-column chunk (not
+// an array indexed by a loop variable) so glslc keeps each dot's accumulator
+// in a register and preserves the single-token accumulation order. Larger
+// specializations repeat this explicit chunk over K; they trade a second
+// weight-row read for bounded register pressure rather than spilling 64 sums.
 //
 // The fixed 64-invocation workgroup handles both RDNA3 wave32 (two four-row
 // subgroups) and wave64 (one four-row subgroup) via gl_SubgroupSize. Four
@@ -51,32 +51,33 @@ void main() {
     uint vecs = p.columns >> 2;          // four halves per uvec2
     uint base = row * vecs;
 
-    // Declare accumulators as explicit scalars per K branch so the compiler
-    // keeps them in registers indexed by constants (not an array indexed by
-    // a loop variable, which the compiler may spill and reorder).
-    float s0 = 0.0;
-    float s1 = 0.0;
-    float s2 = 0.0;
-    float s3 = 0.0;
-    float s4 = 0.0;
-    float s5 = 0.0;
-    float s6 = 0.0;
-    float s7 = 0.0;
-    float s8 = 0.0;
-    float s9 = 0.0;
-    float s10 = 0.0;
-    float s11 = 0.0;
-    float s12 = 0.0;
-    float s13 = 0.0;
-    float s14 = 0.0;
-    float s15 = 0.0;
+    // K=32 and K=64 use repeated explicit 16-column chunks. The runtime batch
+    // guard prevents a rounded specialization from reading or writing padding.
+    for (uint chunk = 0u; chunk < K; chunk += 16u) {
+      // Reset each chunk's explicit accumulators before walking the weights.
+      float s0 = 0.0;
+      float s1 = 0.0;
+      float s2 = 0.0;
+      float s3 = 0.0;
+      float s4 = 0.0;
+      float s5 = 0.0;
+      float s6 = 0.0;
+      float s7 = 0.0;
+      float s8 = 0.0;
+      float s9 = 0.0;
+      float s10 = 0.0;
+      float s11 = 0.0;
+      float s12 = 0.0;
+      float s13 = 0.0;
+      float s14 = 0.0;
+      float s15 = 0.0;
 
-    for (uint v = 0; v < vecs; ++v) {
+      for (uint v = 0; v < vecs; ++v) {
         uvec2 weight = weight_values.values[base + v];
         vec2 w01 = unpackHalf2x16(weight.x);
         vec2 w23 = unpackHalf2x16(weight.y);
-        if (K >= 1) {
-            uvec2 xv = input_values.values[0 * vecs + v];
+        if (chunk + 0u < p.batch && K >= 1u) {
+            uvec2 xv = input_values.values[(chunk + 0u) * vecs + v];
             vec2 x01 = unpackHalf2x16(xv.x);
             vec2 x23 = unpackHalf2x16(xv.y);
             s0 += w01.x * x01.x;
@@ -84,8 +85,8 @@ void main() {
             s0 += w23.x * x23.x;
             s0 += w23.y * x23.y;
         }
-        if (K >= 2) {
-            uvec2 xv = input_values.values[1 * vecs + v];
+        if (chunk + 1u < p.batch && K >= 2u) {
+            uvec2 xv = input_values.values[(chunk + 1u) * vecs + v];
             vec2 x01 = unpackHalf2x16(xv.x);
             vec2 x23 = unpackHalf2x16(xv.y);
             s1 += w01.x * x01.x;
@@ -93,8 +94,8 @@ void main() {
             s1 += w23.x * x23.x;
             s1 += w23.y * x23.y;
         }
-        if (K >= 3) {
-            uvec2 xv = input_values.values[2 * vecs + v];
+        if (chunk + 2u < p.batch && K >= 3u) {
+            uvec2 xv = input_values.values[(chunk + 2u) * vecs + v];
             vec2 x01 = unpackHalf2x16(xv.x);
             vec2 x23 = unpackHalf2x16(xv.y);
             s2 += w01.x * x01.x;
@@ -102,8 +103,8 @@ void main() {
             s2 += w23.x * x23.x;
             s2 += w23.y * x23.y;
         }
-        if (K >= 4) {
-            uvec2 xv = input_values.values[3 * vecs + v];
+        if (chunk + 3u < p.batch && K >= 4u) {
+            uvec2 xv = input_values.values[(chunk + 3u) * vecs + v];
             vec2 x01 = unpackHalf2x16(xv.x);
             vec2 x23 = unpackHalf2x16(xv.y);
             s3 += w01.x * x01.x;
@@ -111,8 +112,8 @@ void main() {
             s3 += w23.x * x23.x;
             s3 += w23.y * x23.y;
         }
-        if (K >= 5) {
-            uvec2 xv = input_values.values[4 * vecs + v];
+        if (chunk + 4u < p.batch && K >= 5u) {
+            uvec2 xv = input_values.values[(chunk + 4u) * vecs + v];
             vec2 x01 = unpackHalf2x16(xv.x);
             vec2 x23 = unpackHalf2x16(xv.y);
             s4 += w01.x * x01.x;
@@ -120,8 +121,8 @@ void main() {
             s4 += w23.x * x23.x;
             s4 += w23.y * x23.y;
         }
-        if (K >= 6) {
-            uvec2 xv = input_values.values[5 * vecs + v];
+        if (chunk + 5u < p.batch && K >= 6u) {
+            uvec2 xv = input_values.values[(chunk + 5u) * vecs + v];
             vec2 x01 = unpackHalf2x16(xv.x);
             vec2 x23 = unpackHalf2x16(xv.y);
             s5 += w01.x * x01.x;
@@ -129,8 +130,8 @@ void main() {
             s5 += w23.x * x23.x;
             s5 += w23.y * x23.y;
         }
-        if (K >= 7) {
-            uvec2 xv = input_values.values[6 * vecs + v];
+        if (chunk + 6u < p.batch && K >= 7u) {
+            uvec2 xv = input_values.values[(chunk + 6u) * vecs + v];
             vec2 x01 = unpackHalf2x16(xv.x);
             vec2 x23 = unpackHalf2x16(xv.y);
             s6 += w01.x * x01.x;
@@ -138,8 +139,8 @@ void main() {
             s6 += w23.x * x23.x;
             s6 += w23.y * x23.y;
         }
-        if (K >= 8) {
-            uvec2 xv = input_values.values[7 * vecs + v];
+        if (chunk + 7u < p.batch && K >= 8u) {
+            uvec2 xv = input_values.values[(chunk + 7u) * vecs + v];
             vec2 x01 = unpackHalf2x16(xv.x);
             vec2 x23 = unpackHalf2x16(xv.y);
             s7 += w01.x * x01.x;
@@ -147,8 +148,8 @@ void main() {
             s7 += w23.x * x23.x;
             s7 += w23.y * x23.y;
         }
-        if (K >= 9) {
-            uvec2 xv = input_values.values[8 * vecs + v];
+        if (chunk + 8u < p.batch && K >= 9u) {
+            uvec2 xv = input_values.values[(chunk + 8u) * vecs + v];
             vec2 x01 = unpackHalf2x16(xv.x);
             vec2 x23 = unpackHalf2x16(xv.y);
             s8 += w01.x * x01.x;
@@ -156,8 +157,8 @@ void main() {
             s8 += w23.x * x23.x;
             s8 += w23.y * x23.y;
         }
-        if (K >= 10) {
-            uvec2 xv = input_values.values[9 * vecs + v];
+        if (chunk + 9u < p.batch && K >= 10u) {
+            uvec2 xv = input_values.values[(chunk + 9u) * vecs + v];
             vec2 x01 = unpackHalf2x16(xv.x);
             vec2 x23 = unpackHalf2x16(xv.y);
             s9 += w01.x * x01.x;
@@ -165,8 +166,8 @@ void main() {
             s9 += w23.x * x23.x;
             s9 += w23.y * x23.y;
         }
-        if (K >= 11) {
-            uvec2 xv = input_values.values[10 * vecs + v];
+        if (chunk + 10u < p.batch && K >= 11u) {
+            uvec2 xv = input_values.values[(chunk + 10u) * vecs + v];
             vec2 x01 = unpackHalf2x16(xv.x);
             vec2 x23 = unpackHalf2x16(xv.y);
             s10 += w01.x * x01.x;
@@ -174,8 +175,8 @@ void main() {
             s10 += w23.x * x23.x;
             s10 += w23.y * x23.y;
         }
-        if (K >= 12) {
-            uvec2 xv = input_values.values[11 * vecs + v];
+        if (chunk + 11u < p.batch && K >= 12u) {
+            uvec2 xv = input_values.values[(chunk + 11u) * vecs + v];
             vec2 x01 = unpackHalf2x16(xv.x);
             vec2 x23 = unpackHalf2x16(xv.y);
             s11 += w01.x * x01.x;
@@ -183,8 +184,8 @@ void main() {
             s11 += w23.x * x23.x;
             s11 += w23.y * x23.y;
         }
-        if (K >= 13) {
-            uvec2 xv = input_values.values[12 * vecs + v];
+        if (chunk + 12u < p.batch && K >= 13u) {
+            uvec2 xv = input_values.values[(chunk + 12u) * vecs + v];
             vec2 x01 = unpackHalf2x16(xv.x);
             vec2 x23 = unpackHalf2x16(xv.y);
             s12 += w01.x * x01.x;
@@ -192,8 +193,8 @@ void main() {
             s12 += w23.x * x23.x;
             s12 += w23.y * x23.y;
         }
-        if (K >= 14) {
-            uvec2 xv = input_values.values[13 * vecs + v];
+        if (chunk + 13u < p.batch && K >= 14u) {
+            uvec2 xv = input_values.values[(chunk + 13u) * vecs + v];
             vec2 x01 = unpackHalf2x16(xv.x);
             vec2 x23 = unpackHalf2x16(xv.y);
             s13 += w01.x * x01.x;
@@ -201,8 +202,8 @@ void main() {
             s13 += w23.x * x23.x;
             s13 += w23.y * x23.y;
         }
-        if (K >= 15) {
-            uvec2 xv = input_values.values[14 * vecs + v];
+        if (chunk + 14u < p.batch && K >= 15u) {
+            uvec2 xv = input_values.values[(chunk + 14u) * vecs + v];
             vec2 x01 = unpackHalf2x16(xv.x);
             vec2 x23 = unpackHalf2x16(xv.y);
             s14 += w01.x * x01.x;
@@ -210,8 +211,8 @@ void main() {
             s14 += w23.x * x23.x;
             s14 += w23.y * x23.y;
         }
-        if (K >= 16) {
-            uvec2 xv = input_values.values[15 * vecs + v];
+        if (chunk + 15u < p.batch && K >= 16u) {
+            uvec2 xv = input_values.values[(chunk + 15u) * vecs + v];
             vec2 x01 = unpackHalf2x16(xv.x);
             vec2 x23 = unpackHalf2x16(xv.y);
             s15 += w01.x * x01.x;
@@ -221,20 +222,21 @@ void main() {
         }
     }
 
-    if (K >= 1 && 0 < p.batch) output_values.values[0 * p.rows + row] = s0;
-    if (K >= 2 && 1 < p.batch) output_values.values[1 * p.rows + row] = s1;
-    if (K >= 3 && 2 < p.batch) output_values.values[2 * p.rows + row] = s2;
-    if (K >= 4 && 3 < p.batch) output_values.values[3 * p.rows + row] = s3;
-    if (K >= 5 && 4 < p.batch) output_values.values[4 * p.rows + row] = s4;
-    if (K >= 6 && 5 < p.batch) output_values.values[5 * p.rows + row] = s5;
-    if (K >= 7 && 6 < p.batch) output_values.values[6 * p.rows + row] = s6;
-    if (K >= 8 && 7 < p.batch) output_values.values[7 * p.rows + row] = s7;
-    if (K >= 9 && 8 < p.batch) output_values.values[8 * p.rows + row] = s8;
-    if (K >= 10 && 9 < p.batch) output_values.values[9 * p.rows + row] = s9;
-    if (K >= 11 && 10 < p.batch) output_values.values[10 * p.rows + row] = s10;
-    if (K >= 12 && 11 < p.batch) output_values.values[11 * p.rows + row] = s11;
-    if (K >= 13 && 12 < p.batch) output_values.values[12 * p.rows + row] = s12;
-    if (K >= 14 && 13 < p.batch) output_values.values[13 * p.rows + row] = s13;
-    if (K >= 15 && 14 < p.batch) output_values.values[14 * p.rows + row] = s14;
-    if (K >= 16 && 15 < p.batch) output_values.values[15 * p.rows + row] = s15;
+      if (K >= 1 && chunk + 0u < p.batch) output_values.values[(chunk + 0u) * p.rows + row] = s0;
+      if (K >= 2 && chunk + 1u < p.batch) output_values.values[(chunk + 1u) * p.rows + row] = s1;
+      if (K >= 3 && chunk + 2u < p.batch) output_values.values[(chunk + 2u) * p.rows + row] = s2;
+      if (K >= 4 && chunk + 3u < p.batch) output_values.values[(chunk + 3u) * p.rows + row] = s3;
+      if (K >= 5 && chunk + 4u < p.batch) output_values.values[(chunk + 4u) * p.rows + row] = s4;
+      if (K >= 6 && chunk + 5u < p.batch) output_values.values[(chunk + 5u) * p.rows + row] = s5;
+      if (K >= 7 && chunk + 6u < p.batch) output_values.values[(chunk + 6u) * p.rows + row] = s6;
+      if (K >= 8 && chunk + 7u < p.batch) output_values.values[(chunk + 7u) * p.rows + row] = s7;
+      if (K >= 9 && chunk + 8u < p.batch) output_values.values[(chunk + 8u) * p.rows + row] = s8;
+      if (K >= 10 && chunk + 9u < p.batch) output_values.values[(chunk + 9u) * p.rows + row] = s9;
+      if (K >= 11 && chunk + 10u < p.batch) output_values.values[(chunk + 10u) * p.rows + row] = s10;
+      if (K >= 12 && chunk + 11u < p.batch) output_values.values[(chunk + 11u) * p.rows + row] = s11;
+      if (K >= 13 && chunk + 12u < p.batch) output_values.values[(chunk + 12u) * p.rows + row] = s12;
+      if (K >= 14 && chunk + 13u < p.batch) output_values.values[(chunk + 13u) * p.rows + row] = s13;
+      if (K >= 15 && chunk + 14u < p.batch) output_values.values[(chunk + 14u) * p.rows + row] = s14;
+      if (K >= 16 && chunk + 15u < p.batch) output_values.values[(chunk + 15u) * p.rows + row] = s15;
+      }
 }

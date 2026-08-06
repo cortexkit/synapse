@@ -674,3 +674,132 @@ SYNAPSE_UNIFIED_RT_QWEN3_0_6B=<snapshot> \
 SYNAPSE_VULKAN_BATCHED_PROBE_QUANT=f16 ... (same)   # f16 curve
 SYNAPSE_VULKAN_BATCHED_PROBE_QUANT=q8 ... (same)    # Q8 curve (default)
 ```
+
+
+## Wave 6: f16 K completion, verify seam, and the bounded Q8 probe
+
+**Status on 2026-08-06: implementation complete; Ally hardware cells blocked.** The
+Ally at `[lan-ip]` was unreachable over SSH from the execution environment
+(the same eight-second TCP timeout was independently reproduced). No K>16
+throughput number, Q8 gate result, or Q8 throughput number is claimed here. The
+wave-5 values below are historical controls only; they are not wave-6 results and
+must not be used to infer the missing curve.
+
+### Implemented serving seam
+
+`DecodeKernel` now exposes `verify_batch(cache, tokens)`. Its default is the
+existing sequential verifier, so backends without a batched implementation keep
+their prior behavior. `DecodeSession::generate_speculative` calls this capability
+instead of reaching directly for `verify_tokens`. `VulkanDecoder` implements the
+capability with one `verify_batch_logits` submission and retains `verify_tokens` as
+an exact compatibility entry point. The Vulkan batch capacity is now 64.
+
+The f16 mat-mat shader uses explicit scalar accumulators in 16-column chunks.
+K=32 and K=64 therefore do not create a 64-element accumulator array or spill
+one; they reread each weight row for each explicit chunk while preserving the
+single-token left-to-right f32 accumulation order. The host specializes K to
+`{1,2,4,8,16,32,64}` and rounds non-power-of-two requests (24 -> 32, 48 -> 64)
+without reading or writing padded columns. The timing probe now exercises the
+requested serving points `{16,24,32,48,64}`.
+
+The identity gate was widened from power-of-two K values to every `K in 1..=16`
+across 20 synthetic prompts, with the final context at 469 tokens. It compares
+every f32 logit bit pattern and the greedy argmax. The gate is an ignored
+real-GPU test because this repository has no Vulkan model/Ally device in the
+current execution environment; it was not run locally and is recorded as
+blocked rather than marked green.
+
+### f16 curve (Ally: blocked-hardware-unreachable)
+
+| K | call wall per K-token block | tok/s-equivalent | marginal gain vs prior K | status |
+|---:|---:|---:|---:|---|
+| 16 | — | — | — | blocked; wave-5 control was 195.55 ms / 81.82 tok/s-equiv, not a wave-6 result |
+| 24 | — | — | — | blocked-hardware-unreachable |
+| 32 | — | — | — | blocked-hardware-unreachable |
+| 48 | — | — | — | blocked-hardware-unreachable |
+| 64 | — | — | — | blocked-hardware-unreachable |
+
+Saturation K and the first marginal gain below 3% are **undetermined**. The
+wave-6 protocol must calculate marginal gain from the same-day median call wall,
+not from an extrapolation of wave 5.
+
+### Q8 probe: exactly two shapes, gate first
+
+The production default remains **column-serial**. Shape (a) is implemented by
+`decode_matvec_q8_0_column.comp`: one invocation owns one output row for one
+column and accumulates the complete Q8 dot serially; the host dispatches one
+column at a time. It is the existing bit-identical fallback and does not share
+weight reads. Shape (b) is probe-only: `decode_matvec_q8_0_split_k.comp` writes
+two deterministic contiguous partials and `decode_matvec_q8_0_reduce.comp`
+reduces split 0 then split 1 in a second serial dispatch. The split-K shape is
+not promoted automatically because partial grouping can change f32 rounding.
+
+Both shapes are selectable only by the explicit
+`SYNAPSE_VULKAN_Q8_BATCH_SHAPE={column-serial,split-k}` setting. The 20-prompt,
+K=1..=16 identity battery and the timing run are separate commands, with the
+gate command run first. Both wave-6 shape cells are currently
+**blocked-hardware-unreachable**; neither is called pass or fail, and the
+sequential fallback remains final. When the Ally returns, fresh same-day
+column-serial controls must be collected before either shape is measured, per
+the Ally drift rule.
+
+### Honest ratio table
+
+The only available llama-Vulkan reference is the wave-5 single-stream Q8
+measurement, **127 tok/s**. llama has no measured batched-verify equivalent, so
+there is no valid llama K-curve comparison and no claim that any batched number
+beats a batched llama baseline.
+
+| Path | wave-6 result | ratio vs llama 127 tok/s | provenance |
+|---|---:|---:|---|
+| owned f16 single-stream | — | — | wave-6 Ally cell blocked |
+| owned f16 batched K=16/24/32/48/64 | — | — | wave-6 Ally curve blocked |
+| owned Q8 column-serial probe | — | — | wave-6 20-prompt gate/measure blocked |
+| owned Q8 split-K probe | — | — | wave-6 20-prompt gate/measure blocked |
+| llama-Vulkan single-stream | 127.0 tok/s | 1.00x | wave-5 reference; no batched equivalent measured |
+
+For orientation only, wave 5 recorded owned f16 K=16 at 81.82 tok/s-equiv
+(0.644x the 127 reference) and owned Q8 sequential-fallback K=16 at 23.17
+tok/s-equiv (0.182x). Those historical ratios are intentionally excluded from
+the wave-6 result cells.
+
+### Reproduction commands when the Ally returns
+
+Build and compile the exact checked-in shaders first:
+
+```text
+set CARGO_TARGET_DIR=%USERPROFILE%\target
+cargo build -p spike-unified-rt --release --features vulkan --bin spike-unified-rt --bin vulkan_probe
+glslc --target-env=vulkan1.3 bench\spikes\unified-rt\src\vulkan_shaders\decode_matvec_batch.comp -o bench\spikes\unified-rt\src\vulkan_spv\decode_matvec_batch.spv
+glslc --target-env=vulkan1.3 bench\spikes\unified-rt\src\vulkan_shaders\decode_matvec_q8_0_split_k.comp -o bench\spikes\unified-rt\src\vulkan_spv\decode_matvec_q8_0_split_k.spv
+glslc --target-env=vulkan1.3 bench\spikes\unified-rt\src\vulkan_shaders\decode_matvec_q8_0_reduce.comp -o bench\spikes\unified-rt\src\vulkan_spv\decode_matvec_q8_0_reduce.spv
+```
+
+Run the identity gates before timing:
+
+```text
+set "SYNAPSE_UNIFIED_RT_QWEN3_0_6B=C:\bench\model-qwen3-chat"
+cargo test -p spike-unified-rt --release --features vulkan --bin spike-unified-rt -- --ignored --nocapture vulkan_batched_verify_logits_are_byte_identical_to_sequential_f16
+set "SYNAPSE_VULKAN_Q8_BATCH_SHAPE=column-serial"
+cargo test -p spike-unified-rt --release --features vulkan --bin spike-unified-rt -- --ignored --nocapture vulkan_batched_verify_logits_are_byte_identical_to_sequential_q8
+set "SYNAPSE_VULKAN_Q8_BATCH_SHAPE=split-k"
+cargo test -p spike-unified-rt --release --features vulkan --bin spike-unified-rt -- --ignored --nocapture vulkan_q8_split_k_probe_is_byte_identical_to_sequential
+```
+
+Then run the f16 curve (the probe prints call wall, per-token wall, and
+ tok/s-equivalent for K=16/24/32/48/64) and the two Q8 shapes separately:
+
+```text
+set "SYNAPSE_UNIFIED_RT_QWEN3_0_6B=C:\bench\model-qwen3-chat"
+set "SYNAPSE_VULKAN_BATCHED_PROBE_QUANT=f16"
+cargo test -p spike-unified-rt --release --features vulkan --bin spike-unified-rt -- --ignored --nocapture vulkan_batched_verify_timing_probe
+set "SYNAPSE_VULKAN_BATCHED_PROBE_QUANT=q8"
+set "SYNAPSE_VULKAN_Q8_BATCH_SHAPE=column-serial"
+cargo test -p spike-unified-rt --release --features vulkan --bin spike-unified-rt -- --ignored --nocapture vulkan_batched_verify_timing_probe
+set "SYNAPSE_VULKAN_Q8_BATCH_SHAPE=split-k"
+cargo test -p spike-unified-rt --release --features vulkan --bin spike-unified-rt -- --ignored --nocapture vulkan_batched_verify_timing_probe
+```
+
+The two Q8 commands are not a substitute for the 20-prompt same-session gate:
+run the gate first, retain its controls and raw output, and measure only the
+shape whose exactness result is explicitly recorded.

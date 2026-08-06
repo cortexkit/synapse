@@ -75,6 +75,13 @@ pub(crate) trait DecodeKernel {
         Ok(argmaxes)
     }
 
+    /// Provides a batch-verification entry point. Backends without a batched
+    /// implementation use the sequential verifier above, allowing speculative
+    /// decoding to call the same method without changing their behavior.
+    fn verify_batch(&mut self, cache: &mut Self::Cache, tokens: &[u32]) -> Result<Vec<u32>> {
+        self.verify_tokens(cache, tokens)
+    }
+
     /// Restores the logical cache length after speculative verification. A
     /// backend must guarantee that reads at later positions are excluded after
     /// this call; overwritten in-slot data may remain physically allocated.
@@ -477,7 +484,7 @@ impl<'a, K: DecodeKernel> DecodeSession<'a, K> {
             let verify_started = Instant::now();
             let post_token_argmaxes = self
                 .kernel
-                .verify_tokens(&mut self.cache, &proposal.tokens)?;
+                .verify_batch(&mut self.cache, &proposal.tokens)?;
             metrics.verifier_wall_s += verify_started.elapsed().as_secs_f64();
             metrics.verified_tokens += proposal.tokens.len();
             ensure!(

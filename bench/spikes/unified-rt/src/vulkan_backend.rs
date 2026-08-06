@@ -25,6 +25,16 @@ pub struct Qwen3Layer<'a> {
 }
 
 #[cfg(feature = "vulkan")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Q8BatchShape {
+    /// The production fallback dispatches one column at a time, preserving
+    /// the single-token computation exactly.
+    ColumnSerial,
+    /// Probe-only split-K partials followed by a serial reduction dispatch.
+    SplitK,
+}
+
+#[cfg(feature = "vulkan")]
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 mod enabled {
     use std::collections::HashMap;
@@ -37,11 +47,11 @@ mod enabled {
     use std::sync::{Arc, Once};
     use std::time::Instant;
 
-    use anyhow::{ensure, Context, Result};
+    use anyhow::{bail, ensure, Context, Result};
     use ash::{vk, Device, Entry, Instance};
 
     use super::super::{decode_f16_bits, encode_f16_bits, EncoderLayer, VulkanGemm};
-    use super::{ModernBertLayer, Qwen3Layer};
+    use super::{ModernBertLayer, Q8BatchShape, Qwen3Layer};
     use crate::qwen3::{Model, Weight};
 
     const DESCRIPTOR_BINDINGS: u32 = 10;
@@ -835,19 +845,23 @@ mod enabled {
         }
     }
 
-    /// Wave-5 batched mat-mat pipelines. The four mat-mat shaders (f16 and Q8)
-    /// are specialized per K in {1,2,4,8,16} so the K accumulators stay
-    /// register-resident; the pointwise batched shaders (RMSNorm, head-norm+
-    /// RoPE, value-cache, attention, add_residual, swiglu) read K from a push
-    /// constant and are shared across K. `decode_matvec_q8_0_batch` is only
-    /// created when the device supports shader int8.
+    /// Batched mat-mat pipelines. The f16 and Q8 mat-mat shaders are
+    /// specialized per rounded K in {1,2,4,8,16,32,64}; the shader processes
+    /// larger K values in explicit 16-column register chunks so each dot keeps
+    /// the single-token serial order without requiring 64 live accumulators.
+    /// The pointwise batched shaders (RMSNorm, head-norm+RoPE, value-cache,
+    /// attention, add_residual, swiglu) read K from a push constant and are
+    /// shared across K. `decode_matvec_q8_0_batch` is only created when the
+    /// device supports shader int8.
     struct BatchedPipelines {
-        matvec_f16: [vk::Pipeline; 5],          // K in {1,2,4,8,16}
-        matvec_q8_0: Option<[vk::Pipeline; 5]>, // K in {1,2,4,8,16}
+        matvec_f16: [vk::Pipeline; 7],          // K in {1,2,4,8,16,32,64}
+        matvec_q8_0: Option<[vk::Pipeline; 7]>, // K in {1,2,4,8,16,32,64}
         /// Column-offset Q8 matvec for the batched fallback (K sequential
         /// single-token dispatches). Only created when shader int8 is
         /// supported.
         matvec_q8_0_column: Option<vk::Pipeline>,
+        /// Probe-only split-K and deterministic reduction pipelines.
+        matvec_q8_0_split_k: Option<(vk::Pipeline, vk::Pipeline)>,
         rms_norm: vk::Pipeline,
         head_norm_rope: vk::Pipeline,
         value_cache: vk::Pipeline,
@@ -858,11 +872,12 @@ mod enabled {
 
     impl BatchedPipelines {
         fn create(state: &DeviceState) -> Result<Self> {
-            // Specialize the mat-mat shaders for K in {1,2,4,8,16}. The index
-            // maps to the power-of-two column count: 0->1, 1->2, 2->4, 3->8,
-            // 4->16. The host rounds the requested batch up to the next power
-            // of two and dispatches only the first `batch` columns.
-            let ks = [1u32, 2, 4, 8, 16];
+            // Specialize the mat-mat shaders for K in
+            // {1,2,4,8,16,32,64}. The host rounds the requested batch up to
+            // the next supported power of two and dispatches only the first
+            // `batch` columns. The 32- and 64-column variants process the
+            // accumulators in explicit 16-column chunks.
+            let ks = [1u32, 2, 4, 8, 16, 32, 64];
             let matvec_f16 = ks
                 .iter()
                 .map(|&k| {
@@ -874,7 +889,7 @@ mod enabled {
                 })
                 .collect::<Result<Vec<_>>>()?
                 .try_into()
-                .map_err(|_| anyhow::anyhow!("expected 5 f16 batched pipelines"))?;
+                .map_err(|_| anyhow::anyhow!("expected 7 f16 batched pipelines"))?;
             let matvec_q8_0 = if state.shader_int8_supported {
                 let pipelines = ks
                     .iter()
@@ -887,7 +902,7 @@ mod enabled {
                     })
                     .collect::<Result<Vec<_>>>()?
                     .try_into()
-                    .map_err(|_| anyhow::anyhow!("expected 5 q8 batched pipelines"))?;
+                    .map_err(|_| anyhow::anyhow!("expected 7 q8 batched pipelines"))?;
                 Some(pipelines)
             } else {
                 None
@@ -901,10 +916,25 @@ mod enabled {
                     )
                 })
                 .transpose()?;
+            let matvec_q8_0_split_k = if state.shader_int8_supported {
+                Some((
+                    create_pipeline(
+                        state,
+                        include_bytes!("vulkan_spv/decode_matvec_q8_0_split_k.spv"),
+                    )?,
+                    create_pipeline(
+                        state,
+                        include_bytes!("vulkan_spv/decode_matvec_q8_0_reduce.spv"),
+                    )?,
+                ))
+            } else {
+                None
+            };
             Ok(Self {
                 matvec_f16,
                 matvec_q8_0,
                 matvec_q8_0_column,
+                matvec_q8_0_split_k,
                 rms_norm: create_pipeline(
                     state,
                     include_bytes!("vulkan_spv/decode_rms_norm_batch.spv"),
@@ -939,6 +969,11 @@ mod enabled {
                         .flat_map(|pipelines| pipelines.iter().copied()),
                 )
                 .chain(self.matvec_q8_0_column)
+                .chain(
+                    self.matvec_q8_0_split_k
+                        .into_iter()
+                        .flat_map(|(split, reduce)| [split, reduce]),
+                )
                 .chain([
                     self.rms_norm,
                     self.head_norm_rope,
@@ -3785,10 +3820,11 @@ mod enabled {
         }
     }
 
-    /// Wave-5 batched (mat-mat) activation buffers, sized for the maximum
-    /// column count K=16. Each buffer holds K columns laid out as
-    /// `[K][width]`. The per-column layout matches the single-token buffers so
-    /// column k's slice is bit-identical to a standalone single-token step.
+    /// Batched (mat-mat) activation buffers, sized for the maximum column count
+    /// K=64. Each buffer holds K columns laid out as `[K][width]`. The
+    /// per-column layout matches the single-token buffers so column k's slice is
+    /// bit-identical to a standalone single-token step. The Q8 split-K partials
+    /// are probe-only scratch storage; the shipped Q8 path remains column-serial.
     /// These are allocated lazily on first `verify_batch` and never on the
     /// default single-token path, so the existing decode path is unperturbed.
     struct QwenDecodeBatchActivations {
@@ -3808,6 +3844,7 @@ mod enabled {
         sine: Buffer,
         scores: Buffer,
         logits: Buffer,
+        q8_split_partials: Buffer,
     }
 
     impl QwenDecodeBatchActivations {
@@ -3844,6 +3881,9 @@ mod enabled {
                 sine: f32_buffer(max_k * head_dim)?,
                 scores: f32_buffer(max_k * query_heads * capacity)?,
                 logits: f32_buffer(max_k * vocab)?,
+                // Two f32 partials per [column,row] for the probe-only split-K
+                // shape. This buffer is not touched by the shipped fallback.
+                q8_split_partials: f32_buffer(max_k * vocab * 2)?,
             })
         }
     }
@@ -3863,6 +3903,9 @@ mod enabled {
         /// Lazily allocated on first `verify_batch`; `None` on the single-token
         /// path so the existing decode buffers and pipeline set are unperturbed.
         batch_activations: Option<QwenDecodeBatchActivations>,
+        // Probe selection only; production defaults to the exact column-serial
+        // fallback and never selects split-K implicitly.
+        q8_batch_shape: Q8BatchShape,
         capacity: usize,
         position: usize,
     }
@@ -3945,6 +3988,16 @@ mod enabled {
                 model.config.vocab_size,
                 capacity,
             )?;
+            let q8_batch_shape = match std::env::var("SYNAPSE_VULKAN_Q8_BATCH_SHAPE")
+                .ok()
+                .as_deref()
+            {
+                None | Some("column-serial") => Q8BatchShape::ColumnSerial,
+                Some("split-k") => Q8BatchShape::SplitK,
+                Some(other) => bail!(
+                    "unknown SYNAPSE_VULKAN_Q8_BATCH_SHAPE={other:?}; use column-serial or split-k"
+                ),
+            };
             let pipelines = Pipelines::create(&state)?;
             let (allocations, allocated_bytes) = state.immutable_allocation_summary();
             eprintln!(
@@ -3962,6 +4015,7 @@ mod enabled {
                 lm_head,
                 activations,
                 batch_activations: None,
+                q8_batch_shape,
                 capacity,
                 position: 0,
             })
@@ -4438,18 +4492,20 @@ mod enabled {
         }
 
         /// Index into the per-K specialized mat-mat pipeline arrays for K in
-        /// {1,2,4,8,16} (index 0->1, 1->2, 2->4, 3->8, 4->16). The host rounds
-        /// the requested batch up to the next power of two and dispatches only
-        /// the first `batch` columns; columns >= batch are computed but not
-        /// written, so any batch <= 16 is exact while the common power-of-two
-        /// spans use a tight specialization.
+        /// {1,2,4,8,16,32,64}. Non-power-of-two requests round up to the next
+        /// supported specialization, while the shader writes only the requested
+        /// columns. This lets one exact implementation handle every tested
+        /// batch size from 1 through 16 and the larger serving batch sizes.
         fn batched_pipeline_index(batch: usize) -> usize {
             match batch {
                 1 => 0,
                 2 => 1,
                 3..=4 => 2,
                 5..=8 => 3,
-                _ => 4,
+                9..=16 => 4,
+                17..=32 => 5,
+                33..=64 => 6,
+                _ => unreachable!("batched decode validates K <= 64 before pipeline lookup"),
             }
         }
 
@@ -4487,6 +4543,8 @@ mod enabled {
         fn record_matvec_batch(
             recorder: &mut Recorder<'_>,
             pipelines: &Pipelines,
+            q8_shape: Q8BatchShape,
+            q8_split_partials: &Buffer,
             input: &Buffer,
             weight: &DeviceDecodeWeight,
             output: &Buffer,
@@ -4512,13 +4570,56 @@ mod enabled {
             // f32 accumulation when multiple column accumulators are present
             // in the batched mat-mat shader (even with scalar registers and
             // identical per-column operation order), breaking the byte-exact
-            // gate. Fall back to K sequential single-token dispatches via the
-            // column-offset Q8 matvec — each column uses the exact single-
-            // token shader, so the result is bit-identical by construction.
-            // The weight streams K times (no sharing); the Q8 K-curve measures
-            // the cost of NOT sharing, which is the honest answer to whether
-            // the mat-mat shape helps Q8 on RDNA3.
+            // gate. Because multiple column accumulators can change f32 rounding
+            // and fail the byte-for-byte identity check, split-K may be selected
+            // only by the bounded probe. Serving continues to use the column-
+            // offset fallback unless an identity check performed in the current
+            // session proves that another shape produces identical results.
             if let Some(q8_0) = &weight.q8_0 {
+                if matches!(q8_shape, Q8BatchShape::SplitK) {
+                    ensure!(
+                        columns % 32 == 0 && (columns / 32) % 2 == 0,
+                        "Q8 split-K probe requires an even number of 32-value blocks"
+                    );
+                    let (split_pipeline, reduce_pipeline) =
+                        pipelines
+                            .batched
+                            .matvec_q8_0_split_k
+                            .context("Q8 split-K probe pipelines are unavailable")?;
+                    let split_params = FourU32 {
+                        a: rows as u32,
+                        b: columns as u32,
+                        c: batch as u32,
+                        d: 0,
+                    };
+                    recorder.dispatch(
+                        split_pipeline,
+                        &[input, q8_0, q8_split_partials],
+                        &split_params,
+                        [(rows * batch * 2).div_ceil(64) as u32, 1, 1],
+                        layer,
+                        stage,
+                    )?;
+                    let reduce_params = FourU32 {
+                        a: rows as u32,
+                        b: batch as u32,
+                        c: 0,
+                        d: 0,
+                    };
+                    recorder.dispatch(
+                        reduce_pipeline,
+                        &[q8_split_partials, output],
+                        &reduce_params,
+                        [(rows * batch).div_ceil(64) as u32, 1, 1],
+                        layer,
+                        stage,
+                    )?;
+                    return Ok(());
+                }
+                // Column-serial shape (a): each dispatch uses the exact
+                // single-token shader, so it is bit-identical by construction.
+                // The weight streams K times; this is the final fallback until
+                // another shape passes the complete byte-identity test suite.
                 let pipeline = pipelines
                     .batched
                     .matvec_q8_0_column
@@ -4598,8 +4699,8 @@ mod enabled {
             let k = tokens.len();
             ensure!(k >= 1, "batched decode requires at least one token");
             ensure!(
-                k <= 16,
-                "batched decode supports at most 16 tokens, got {k}"
+                k <= 64,
+                "batched decode supports at most 64 tokens, got {k}"
             );
             ensure!(
                 base_position + k <= self.capacity,
@@ -4623,7 +4724,7 @@ mod enabled {
                     self.model.config.intermediate_size,
                     self.model.config.vocab_size,
                     self.capacity,
-                    16,
+                    64,
                 )?);
             }
             let batch_act = self
@@ -4733,6 +4834,8 @@ mod enabled {
                         Self::record_matvec_batch(
                             &mut recorder,
                             &self.pipelines,
+                            self.q8_batch_shape,
+                            &batch_act.q8_split_partials,
                             &batch_act.normed,
                             &layer.q_weight,
                             &batch_act.q_raw,
@@ -4745,6 +4848,8 @@ mod enabled {
                         Self::record_matvec_batch(
                             &mut recorder,
                             &self.pipelines,
+                            self.q8_batch_shape,
+                            &batch_act.q8_split_partials,
                             &batch_act.normed,
                             &layer.k_weight,
                             &batch_act.k_raw,
@@ -4757,6 +4862,8 @@ mod enabled {
                         Self::record_matvec_batch(
                             &mut recorder,
                             &self.pipelines,
+                            self.q8_batch_shape,
+                            &batch_act.q8_split_partials,
                             &batch_act.normed,
                             &layer.v_weight,
                             &batch_act.v_raw,
@@ -4856,6 +4963,8 @@ mod enabled {
                         Self::record_matvec_batch(
                             &mut recorder,
                             &self.pipelines,
+                            self.q8_batch_shape,
+                            &batch_act.q8_split_partials,
                             &batch_act.attention,
                             &layer.o_weight,
                             &batch_act.projected,
@@ -4897,6 +5006,8 @@ mod enabled {
                         Self::record_matvec_batch(
                             &mut recorder,
                             &self.pipelines,
+                            self.q8_batch_shape,
+                            &batch_act.q8_split_partials,
                             &batch_act.normed,
                             &layer.gate_weight,
                             &batch_act.gate,
@@ -4909,6 +5020,8 @@ mod enabled {
                         Self::record_matvec_batch(
                             &mut recorder,
                             &self.pipelines,
+                            self.q8_batch_shape,
+                            &batch_act.q8_split_partials,
                             &batch_act.normed,
                             &layer.up_weight,
                             &batch_act.up,
@@ -4936,6 +5049,8 @@ mod enabled {
                         Self::record_matvec_batch(
                             &mut recorder,
                             &self.pipelines,
+                            self.q8_batch_shape,
+                            &batch_act.q8_split_partials,
                             &batch_act.activated,
                             &layer.down_weight,
                             &batch_act.projected,
@@ -4977,6 +5092,8 @@ mod enabled {
                     Self::record_matvec_batch(
                         &mut recorder,
                         &self.pipelines,
+                        self.q8_batch_shape,
+                        &batch_act.q8_split_partials,
                         &batch_act.x1,
                         &self.lm_head,
                         &batch_act.logits,
@@ -5080,6 +5197,13 @@ mod enabled {
             let logits = self.run_token(token, position, true)?;
             self.position += 1;
             Ok(logits)
+        }
+
+        /// Select one of the two bounded Q8 probe shapes. The default is the
+        /// shipped column-serial fallback; callers must opt into SplitK for a
+        /// measurement so a failed probe cannot change serving behavior.
+        pub fn set_q8_batch_shape(&mut self, shape: Q8BatchShape) {
+            self.q8_batch_shape = shape;
         }
 
         /// Sets the logical cache position for speculative-decode rewind. KV

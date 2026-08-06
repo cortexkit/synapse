@@ -1,0 +1,61 @@
+#version 460
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+
+// Wave-6 Q8 probe shape (b): split the serial K dimension into two partials.
+// Each invocation owns one (output row, batch column, split) and accumulates its
+// contiguous block range left-to-right. A second dispatch reduces the two
+// partials in deterministic split order. This is intentionally a probe-only
+// shape: grouping products into partial sums can change IEEE f32 rounding, so
+// the exactness gate, not a tolerance, decides whether it is usable.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0, scalar) readonly buffer Input { uvec2 values[]; } input_values;
+layout(set = 0, binding = 1, scalar) readonly buffer Weight { uint16_t values[]; } weight_values;
+layout(set = 0, binding = 2, scalar) writeonly buffer Partials { float values[]; } partial_values;
+layout(push_constant) uniform Params { uint rows; uint columns; uint batch; uint unused; } p;
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    uint total = p.rows * p.batch * 2u;
+    if (id >= total) return;
+
+    uint split = id / (p.rows * p.batch);
+    uint within = id - split * p.rows * p.batch;
+    uint column = within / p.rows;
+    uint row = within - column * p.rows;
+    uint blocks = p.columns / 32u;
+    uint split_begin = split * (blocks / 2u);
+    uint split_end = (split == 0u) ? (blocks / 2u) : blocks;
+    uint block_base = row * blocks * 17u;
+    uint input_vec = column * blocks * 8u + split_begin * 8u;
+    float sum = 0.0;
+
+    for (uint block = split_begin; block < split_end; ++block) {
+        float scale = unpackHalf2x16(uint(weight_values.values[block_base + block * 17u])).x;
+        uint wptr = block_base + block * 17u + 1u;
+        for (uint group = 0u; group < 8u; ++group) {
+            uint packed0 = uint(weight_values.values[wptr]);
+            uint packed1 = uint(weight_values.values[wptr + 1u]);
+            int q0 = int(packed0 & 0xFFu);
+            if (q0 >= 128) q0 -= 256;
+            int q1 = int((packed0 >> 8) & 0xFFu);
+            if (q1 >= 128) q1 -= 256;
+            int q2 = int(packed1 & 0xFFu);
+            if (q2 >= 128) q2 -= 256;
+            int q3 = int((packed1 >> 8) & 0xFFu);
+            if (q3 >= 128) q3 -= 256;
+            uvec2 xv = input_values.values[input_vec];
+            vec2 x01 = unpackHalf2x16(xv.x);
+            vec2 x23 = unpackHalf2x16(xv.y);
+            sum += scale * float(q0) * x01.x;
+            sum += scale * float(q1) * x01.y;
+            sum += scale * float(q2) * x23.x;
+            sum += scale * float(q3) * x23.y;
+            wptr += 2u;
+            input_vec += 1u;
+        }
+    }
+    partial_values.values[id] = sum;
+}

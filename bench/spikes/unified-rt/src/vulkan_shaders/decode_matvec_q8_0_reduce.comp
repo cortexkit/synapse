@@ -1,0 +1,21 @@
+#version 460
+#extension GL_EXT_scalar_block_layout : require
+
+// Wave-6 Q8 probe shape (b), deterministic reduction pass. The reduction is
+// deliberately serial and always consumes split 0 before split 1. If the
+// partial sums already changed the arithmetic grouping, the byte-exact gate
+// rejects this shape; no approximate comparison is permitted.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0, scalar) readonly buffer Partials { float values[]; } partial_values;
+layout(set = 0, binding = 1, scalar) writeonly buffer Output { float values[]; } output_values;
+layout(push_constant) uniform Params { uint rows; uint batch; uint unused0; uint unused1; } p;
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    uint total = p.rows * p.batch;
+    if (id >= total) return;
+    float sum = 0.0;
+    sum += partial_values.values[id * 2u + 0u];
+    sum += partial_values.values[id * 2u + 1u];
+    output_values.values[id] = sum;
+}

@@ -94,14 +94,14 @@ impl DecodeKernel for VulkanDecoder<'_> {
     /// logits are bit-identical to K sequential single-token `advance` steps at
     /// the same positions; the batch only shares the weight read across
     /// positions, never reordering one dot's accumulation.
-    fn verify_tokens(&mut self, cache: &mut Self::Cache, tokens: &[u32]) -> Result<Vec<u32>> {
+    fn verify_batch(&mut self, cache: &mut Self::Cache, tokens: &[u32]) -> Result<Vec<u32>> {
         ensure!(
             !tokens.is_empty(),
             "verification requires at least one token"
         );
         ensure!(
-            tokens.len() <= 16,
-            "Vulkan batched verification supports at most 16 draft tokens, got {}",
+            tokens.len() <= 64,
+            "Vulkan batched verification supports at most 64 draft tokens, got {}",
             tokens.len()
         );
         let started = Instant::now();
@@ -124,6 +124,13 @@ impl DecodeKernel for VulkanDecoder<'_> {
             argmaxes.push(best as u32);
         }
         Ok(argmaxes)
+    }
+
+    /// Preserve the original verifier entry point for callers that do not opt
+    /// into the explicit batched capability. Vulkan has the same exact path for
+    /// both interfaces, so there is no sequential fallback hidden here.
+    fn verify_tokens(&mut self, cache: &mut Self::Cache, tokens: &[u32]) -> Result<Vec<u32>> {
+        self.verify_batch(cache, tokens)
     }
 
     /// Restores the logical cache length after speculative verification. KV
@@ -187,6 +194,7 @@ mod tests {
     use super::{VulkanDecoder, VulkanKvCache};
     use crate::quant::WeightQuantization;
     use crate::qwen3_decode::DecodeKernel;
+    use crate::vulkan_backend::Q8BatchShape;
     use crate::{Precision, VulkanGemm};
 
     const BUCKET: usize = 1024;
@@ -262,9 +270,15 @@ mod tests {
         (tokens, logits)
     }
 
-    fn byte_identical_gate_for(weight_quant: WeightQuantization) {
+    fn byte_identical_gate_for(weight_quant: WeightQuantization, q8_shape: Q8BatchShape) {
         with_decoder(weight_quant, |_model, decoder| {
-            for prompt_len in [1usize, 5, 33, 128, 469] {
+            decoder.context.set_q8_batch_shape(q8_shape);
+            // Twenty synthetic prompts span short, medium, and deep contexts;
+            // the final prompt reaches the 469-token depth cell.
+            for prompt_len in [
+                1usize, 2, 3, 5, 8, 13, 21, 33, 55, 64, 89, 128, 160, 200, 256, 320, 384, 420, 448,
+                469,
+            ] {
                 let prompt = synthetic_prompt(prompt_len);
                 let (cache, seed_logits) = decoder.prefill(&prompt).expect("prefill");
                 let mut cache = cache;
@@ -274,7 +288,7 @@ mod tests {
                 // Sequential reference: greedy draft tokens and their logits.
                 let (draft, seq_logits) = sequential_greedy(decoder, &mut cache, &seed_logits, 16);
 
-                for k in [1usize, 2, 4, 8, 16] {
+                for k in 1usize..=16 {
                     let draft = &draft[..k];
                     // Rewind to the prefix and run one batched forward over K tokens.
                     decoder.rewind(&mut cache, base_position).expect("rewind");
@@ -295,7 +309,7 @@ mod tests {
                     // Argmax surface agrees too (this is what the session consumes).
                     decoder.rewind(&mut cache, base_position).expect("rewind");
                     let batch_argmaxes = decoder
-                        .verify_tokens(&mut cache, draft)
+                        .verify_batch(&mut cache, draft)
                         .expect("batched verify argmaxes");
                     assert_eq!(batch_argmaxes.len(), k);
                     for i in 0..k {
@@ -313,13 +327,22 @@ mod tests {
     #[test]
     #[ignore]
     fn vulkan_batched_verify_logits_are_byte_identical_to_sequential_f16() {
-        byte_identical_gate_for(WeightQuantization::None);
+        byte_identical_gate_for(WeightQuantization::None, Q8BatchShape::ColumnSerial);
     }
 
     #[test]
     #[ignore]
     fn vulkan_batched_verify_logits_are_byte_identical_to_sequential_q8() {
-        byte_identical_gate_for(WeightQuantization::Q8_0);
+        byte_identical_gate_for(WeightQuantization::Q8_0, Q8BatchShape::ColumnSerial);
+    }
+
+    /// Probe the split-K shape: compute partial results and combine them with a
+    /// deterministic serial reduction. Keep this as a separate ignored gate so
+    /// a failure cannot change the shipped Q8 column-serial fallback.
+    #[test]
+    #[ignore]
+    fn vulkan_q8_split_k_probe_is_byte_identical_to_sequential() {
+        byte_identical_gate_for(WeightQuantization::Q8_0, Q8BatchShape::SplitK);
     }
 
     fn determinism_gate_for(weight_quant: WeightQuantization) {
@@ -362,9 +385,9 @@ mod tests {
 
     /// Per-token batched-verify cost curve. Prints the median wall time per
     /// verify_batch(K) call and the per-token (wall/K) figure for K in
-    /// {1,2,4,8,16}. The authoritative numbers are taken on the Ally (the
-    /// Vulkan decode timing authority; see VULKAN-DECODE.md); on any other GPU
-    /// this still works as a functional timing harness. Select weights with
+    /// {1,2,4,8,16,24,32,48,64}. The authoritative numbers are measured on the
+    /// project's designated benchmark GPU, the Ally (see VULKAN-DECODE.md); on
+    /// any other GPU this still works as a functional timing harness. Select weights with
     /// SYNAPSE_VULKAN_BATCHED_PROBE_QUANT=f16|q8 (default q8).
     fn timing_probe(weight_quant: WeightQuantization) {
         with_decoder(weight_quant, |_model, decoder| {
@@ -372,13 +395,13 @@ mod tests {
             let (cache, seed_logits) = decoder.prefill(&prompt).expect("prefill");
             let mut cache = cache;
             let base_position = decoder.cache_position(&cache);
-            let (draft, _) = sequential_greedy(decoder, &mut cache, &seed_logits, 16);
+            let (draft, _) = sequential_greedy(decoder, &mut cache, &seed_logits, 64);
 
             // Warmup so GPU clocks and pipeline caches are steady before timing.
             for _ in 0..5 {
                 decoder.rewind(&mut cache, base_position).expect("rewind");
                 decoder
-                    .verify_tokens(&mut cache, &draft[..8])
+                    .verify_batch(&mut cache, &draft[..8])
                     .expect("warmup");
             }
 
@@ -410,7 +433,7 @@ mod tests {
                     1.0 / median
                 );
             }
-            for k in [1usize, 2, 4, 8, 16] {
+            for k in [1usize, 2, 4, 8, 16, 24, 32, 48, 64] {
                 let draft = &draft[..k];
                 let iterations = 40;
                 let mut samples = Vec::with_capacity(iterations);
@@ -418,7 +441,7 @@ mod tests {
                     decoder.rewind(&mut cache, base_position).expect("rewind");
                     let started = std::time::Instant::now();
                     decoder
-                        .verify_tokens(&mut cache, draft)
+                        .verify_batch(&mut cache, draft)
                         .expect("verify_batch");
                     samples.push(started.elapsed().as_secs_f64());
                 }
