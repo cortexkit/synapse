@@ -1,0 +1,903 @@
+{
+  "status": "converted_and_ran",
+  "source_model": "[bench-user-home]/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca",
+  "source_model_sha256": "f47f71177f32bcd101b7573ec9171e6a57f4f4d31148d38e382306f42996874b",
+  "window": 128,
+  "frontend": "torch.export",
+  "compute_precision": "float16",
+  "compute_units": "CPU_AND_NE",
+  "minimum_deployment_target": "macOS14",
+  "output_path": "artifacts/qwen3-prefill-w128.mlpackage",
+  "output_count": 57,
+  "output_names": [
+    "logits",
+    "key_00",
+    "value_00",
+    "key_01",
+    "value_01",
+    "key_02",
+    "value_02",
+    "key_03",
+    "value_03",
+    "key_04",
+    "value_04",
+    "key_05",
+    "value_05",
+    "key_06",
+    "value_06",
+    "key_07",
+    "value_07",
+    "key_08",
+    "value_08",
+    "key_09",
+    "value_09",
+    "key_10",
+    "value_10",
+    "key_11",
+    "value_11",
+    "key_12",
+    "value_12",
+    "key_13",
+    "value_13",
+    "key_14",
+    "value_14",
+    "key_15",
+    "value_15",
+    "key_16",
+    "value_16",
+    "key_17",
+    "value_17",
+    "key_18",
+    "value_18",
+    "key_19",
+    "value_19",
+    "key_20",
+    "value_20",
+    "key_21",
+    "value_21",
+    "key_22",
+    "value_22",
+    "key_23",
+    "value_23",
+    "key_24",
+    "value_24",
+    "key_25",
+    "value_25",
+    "key_26",
+    "value_26",
+    "key_27",
+    "value_27"
+  ],
+  "kv_output_elements": 7340032,
+  "kv_output_bytes_f16": 14680064,
+  "package_size_bytes": 1505006243,
+  "conversion_s": 39.573781416984275,
+  "model_config": {
+    "hidden_size": 1024,
+    "intermediate_size": 3072,
+    "num_attention_heads": 16,
+    "num_hidden_layers": 28,
+    "num_key_value_heads": 8,
+    "head_dim": 128,
+    "rms_norm_eps": 1e-06,
+    "rope_theta": 1000000,
+    "vocab_size": 151936,
+    "eos_token_id": 151645,
+    "pad_token_id": 151645,
+    "tie_word_embeddings": true
+  },
+  "tokenizer_policy": {
+    "add_special_tokens": true,
+    "pad_token_id": 151643,
+    "padding_side": "left",
+    "position_policy": "fixed positions 0..window-1; left padding preserves active relative positions"
+  },
+  "environment": {
+    "python": "3.12.13",
+    "macos": "26.5.2",
+    "machine": "arm64",
+    "torch": "2.5.1",
+    "coremltools": "8.3.0",
+    "transformers": "4.51.3",
+    "numpy": "2.3.2"
+  },
+  "parity": [
+    {
+      "name": "logits",
+      "shape": [
+        1,
+        151936,
+        1
+      ],
+      "eager_hf_max_abs": 2.288818359375e-05,
+      "eager_hf_mean_cosine": 0.9999998807907104,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 0.13219499588012695,
+      "eager_coreml_mean_cosine": 0.9999743700027466
+    },
+    {
+      "name": "key_00",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 1.0,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 0.435821533203125,
+      "eager_coreml_mean_cosine": 1.0000004768371582
+    },
+    {
+      "name": "value_00",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 1.0,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 0.0007278919219970703,
+      "eager_coreml_mean_cosine": 0.9999985694885254
+    },
+    {
+      "name": "key_01",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 0.9999999403953552,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 0.807403564453125,
+      "eager_coreml_mean_cosine": 0.9999973177909851
+    },
+    {
+      "name": "value_01",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 1.0,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 0.010139450430870056,
+      "eager_coreml_mean_cosine": 0.9999135732650757
+    },
+    {
+      "name": "key_02",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 1.0,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 0.8507232666015625,
+      "eager_coreml_mean_cosine": 0.9999967813491821
+    },
+    {
+      "name": "value_02",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 1.0,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 0.015933852642774582,
+      "eager_coreml_mean_cosine": 0.9999265074729919
+    },
+    {
+      "name": "key_03",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 1.0,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 0.4976043701171875,
+      "eager_coreml_mean_cosine": 0.9999918341636658
+    },
+    {
+      "name": "value_03",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 0.9999998807907104,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 0.05709719657897949,
+      "eager_coreml_mean_cosine": 0.9998985528945923
+    },
+    {
+      "name": "key_04",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 1.0,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 0.7083816528320312,
+      "eager_coreml_mean_cosine": 0.9999920725822449
+    },
+    {
+      "name": "value_04",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 1.0,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 0.03288918733596802,
+      "eager_coreml_mean_cosine": 0.9999047517776489
+    },
+    {
+      "name": "key_05",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 0.9999999403953552,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 0.6151351928710938,
+      "eager_coreml_mean_cosine": 0.9999964833259583
+    },
+    {
+      "name": "value_05",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 1.0,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 0.04449179768562317,
+      "eager_coreml_mean_cosine": 0.999921441078186
+    },
+    {
+      "name": "key_06",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 1.0000001192092896,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 0.6435966491699219,
+      "eager_coreml_mean_cosine": 0.9999852776527405
+    },
+    {
+      "name": "value_06",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 1.0000001192092896,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 0.036173075437545776,
+      "eager_coreml_mean_cosine": 0.99989914894104
+    },
+    {
+      "name": "key_07",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 1.0,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 0.6220703125,
+      "eager_coreml_mean_cosine": 0.9999909996986389
+    },
+    {
+      "name": "value_07",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 1.0,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 0.12070512771606445,
+      "eager_coreml_mean_cosine": 0.9998326897621155
+    },
+    {
+      "name": "key_08",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 1.0000001192092896,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 1.2811403274536133,
+      "eager_coreml_mean_cosine": 0.9999293684959412
+    },
+    {
+      "name": "value_08",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 1.0,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 1.4383649826049805,
+      "eager_coreml_mean_cosine": 0.9995368123054504
+    },
+    {
+      "name": "key_09",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 1.0000001192092896,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 1.7239787578582764,
+      "eager_coreml_mean_cosine": 0.9999432563781738
+    },
+    {
+      "name": "value_09",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 1.0,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 0.7108633518218994,
+      "eager_coreml_mean_cosine": 0.9996722936630249
+    },
+    {
+      "name": "key_10",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 1.0,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 4.061820983886719,
+      "eager_coreml_mean_cosine": 0.9999632239341736
+    },
+    {
+      "name": "value_10",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 1.0,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 1.3354530334472656,
+      "eager_coreml_mean_cosine": 0.9993526935577393
+    },
+    {
+      "name": "key_11",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 1.0,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 2.7492189407348633,
+      "eager_coreml_mean_cosine": 0.9997390508651733
+    },
+    {
+      "name": "value_11",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 1.0,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 3.1509833335876465,
+      "eager_coreml_mean_cosine": 0.9987381100654602
+    },
+    {
+      "name": "key_12",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 1.0,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 13.808231353759766,
+      "eager_coreml_mean_cosine": 0.9996718168258667
+    },
+    {
+      "name": "value_12",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 0.9999998807907104,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 9.348180770874023,
+      "eager_coreml_mean_cosine": 0.9927405118942261
+    },
+    {
+      "name": "key_13",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 1.0000001192092896,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 6.101609230041504,
+      "eager_coreml_mean_cosine": 0.9989666938781738
+    },
+    {
+      "name": "value_13",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 0.9999999403953552,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 11.779644012451172,
+      "eager_coreml_mean_cosine": 0.9892618060112
+    },
+    {
+      "name": "key_14",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 1.0,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 8.549055099487305,
+      "eager_coreml_mean_cosine": 0.9989546537399292
+    },
+    {
+      "name": "value_14",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 0.9999998807907104,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 15.592094421386719,
+      "eager_coreml_mean_cosine": 0.9879270792007446
+    },
+    {
+      "name": "key_15",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 0.9999999403953552,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 4.797309875488281,
+      "eager_coreml_mean_cosine": 0.9998927712440491
+    },
+    {
+      "name": "value_15",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 1.0,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 1.226935625076294,
+      "eager_coreml_mean_cosine": 0.9988529086112976
+    },
+    {
+      "name": "key_16",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 1.0,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 2.4436707496643066,
+      "eager_coreml_mean_cosine": 0.9997129440307617
+    },
+    {
+      "name": "value_16",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 1.0,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 1.7705886363983154,
+      "eager_coreml_mean_cosine": 0.9990973472595215
+    },
+    {
+      "name": "key_17",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 1.0,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 3.870410919189453,
+      "eager_coreml_mean_cosine": 0.9998719692230225
+    },
+    {
+      "name": "value_17",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 1.0,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 2.8593251705169678,
+      "eager_coreml_mean_cosine": 0.9988753199577332
+    },
+    {
+      "name": "key_18",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 0.9999999403953552,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 1.4447535276412964,
+      "eager_coreml_mean_cosine": 0.9998009204864502
+    },
+    {
+      "name": "value_18",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 0.9999998807907104,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 2.532562255859375,
+      "eager_coreml_mean_cosine": 0.9994728565216064
+    },
+    {
+      "name": "key_19",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 1.0,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 1.7340621948242188,
+      "eager_coreml_mean_cosine": 0.9998763203620911
+    },
+    {
+      "name": "value_19",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 1.0000001192092896,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 1.8966280221939087,
+      "eager_coreml_mean_cosine": 0.9996505379676819
+    },
+    {
+      "name": "key_20",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 1.0,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 2.307527542114258,
+      "eager_coreml_mean_cosine": 0.9998784065246582
+    },
+    {
+      "name": "value_20",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 1.0000001192092896,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 1.8955330848693848,
+      "eager_coreml_mean_cosine": 0.9996984004974365
+    },
+    {
+      "name": "key_21",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 1.0000001192092896,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 1.8696308135986328,
+      "eager_coreml_mean_cosine": 0.9999170303344727
+    },
+    {
+      "name": "value_21",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 1.0,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 1.8780126571655273,
+      "eager_coreml_mean_cosine": 0.9997860193252563
+    },
+    {
+      "name": "key_22",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 1.0000001192092896,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 0.9932541847229004,
+      "eager_coreml_mean_cosine": 0.9999302625656128
+    },
+    {
+      "name": "value_22",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 1.0,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 2.217421770095825,
+      "eager_coreml_mean_cosine": 0.9998197555541992
+    },
+    {
+      "name": "key_23",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 1.0,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 1.7891664505004883,
+      "eager_coreml_mean_cosine": 0.9999405145645142
+    },
+    {
+      "name": "value_23",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 1.0,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 2.0406758785247803,
+      "eager_coreml_mean_cosine": 0.999828577041626
+    },
+    {
+      "name": "key_24",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 0.9999999403953552,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 1.4356575012207031,
+      "eager_coreml_mean_cosine": 0.9999441504478455
+    },
+    {
+      "name": "value_24",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 0.9999998807907104,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 2.357337474822998,
+      "eager_coreml_mean_cosine": 0.9998422265052795
+    },
+    {
+      "name": "key_25",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 1.0,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 1.5539426803588867,
+      "eager_coreml_mean_cosine": 0.9999404549598694
+    },
+    {
+      "name": "value_25",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 1.0,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 3.7176599502563477,
+      "eager_coreml_mean_cosine": 0.9998307824134827
+    },
+    {
+      "name": "key_26",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 1.0,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 1.1268701553344727,
+      "eager_coreml_mean_cosine": 0.9999333620071411
+    },
+    {
+      "name": "value_26",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 1.0,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 3.6952133178710938,
+      "eager_coreml_mean_cosine": 0.99985271692276
+    },
+    {
+      "name": "key_27",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 0.9999998807907104,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 0.7554225921630859,
+      "eager_coreml_mean_cosine": 0.9999781847000122
+    },
+    {
+      "name": "value_27",
+      "shape": [
+        1,
+        8,
+        128,
+        128
+      ],
+      "eager_hf_max_abs": 0.0,
+      "eager_hf_mean_cosine": 1.0,
+      "eager_export_max_abs": 0.0,
+      "eager_coreml_max_abs": 2.5691568851470947,
+      "eager_coreml_mean_cosine": 0.9997990727424622
+    }
+  ]
+}

@@ -1,0 +1,29 @@
+{
+  "status": "superseded",
+  "authority": "not_for_decision",
+  "measurement_revision": "contiguous-logits-copy-bug",
+  "runner_pause_utc": {
+    "stop": "2026-08-06T16:04:58Z",
+    "start": "2026-08-06T16:11:21Z"
+  },
+  "reason": "The Core ML logits MLMultiArray has a strided vocabulary axis. The first runner read dataPointer[index] instead of dataPointer[index * strides[vocabularyAxis]], so it associated logits with the wrong token IDs. K/V export and cache packing were not affected because that code already used every MLMultiArray stride.",
+  "invalidated": [
+    "all logits argmax and top-2-gap values",
+    "all token-exact and divergence-depth results",
+    "the first run's end-to-end rows, because host logits copy/argmax was not the production handoff"
+  ],
+  "superseded_observation": {
+    "w128_baseline_first_token": 9625,
+    "w128_misindexed_ane_first_token": 35584,
+    "w128_false_token_exact_prompts": 0,
+    "battery_prompts": 20
+  },
+  "correction_check": {
+    "prompt": "completion-01",
+    "tokens_checked": 8,
+    "baseline_tokens": [9625, 374, 576, 6722, 315, 9625, 374, 576],
+    "stride_aware_split_tokens": [9625, 374, 576, 6722, 315, 9625, 374, 576],
+    "token_exact": true
+  },
+  "replacement": "locked-m1.json"
+}
