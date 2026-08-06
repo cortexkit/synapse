@@ -84,12 +84,23 @@ impl MetalExecutionConfig {
 pub(crate) trait ModelFamily: Send {
     fn family_name(&self) -> &'static str;
     fn tokenizer_policy(&self) -> FamilyTokenizerPolicy;
+    fn supports_rerank(&self) -> bool {
+        false
+    }
     fn embed_batch(
         &self,
         provider: &mut dyn KernelProvider,
         sequences: &[Vec<u32>],
         shape: Option<BatchShape>,
     ) -> Result<Vec<Vec<f32>>>;
+    fn rerank_batch(
+        &self,
+        _provider: &mut dyn KernelProvider,
+        _sequences: &[Vec<u32>],
+        _shape: Option<BatchShape>,
+    ) -> Result<Vec<f32>> {
+        bail!("{} does not support reranking", self.family_name())
+    }
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
