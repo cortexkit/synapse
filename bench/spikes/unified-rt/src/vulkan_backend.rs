@@ -56,6 +56,42 @@ mod enabled {
 
     const DESCRIPTOR_BINDINGS: u32 = 10;
     const PUSH_CONSTANT_BYTES: u32 = 128;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct BatchedDescriptorPoolBudget {
+        max_sets: u32,
+        storage_buffer_descriptors: u32,
+    }
+
+    /// Return the descriptor-pool capacity for one batched decode command.
+    ///
+    /// Every dispatch allocates one set from the ten-binding layout. The f16
+    /// shape and Q8 split-K shape use one and two matvec dispatches per output
+    /// stage respectively; Q8 column-serial uses one dispatch per requested
+    /// column. Keep these counts next to the recorder's dispatch plan so a new
+    /// K specialization cannot silently inherit a smaller pool budget.
+    fn batched_descriptor_pool_budget(
+        layers: usize,
+        k: usize,
+        q8: bool,
+        q8_shape: Q8BatchShape,
+    ) -> BatchedDescriptorPoolBudget {
+        let matvec_sets = if k == 1 || !q8 {
+            1u32
+        } else {
+            match q8_shape {
+                Q8BatchShape::ColumnSerial => k as u32,
+                Q8BatchShape::SplitK => 2,
+            }
+        };
+        let layer_sets = 9 + 7 * matvec_sets;
+        let final_sets = 1 + matvec_sets;
+        let max_sets = (layers as u32 * layer_sets + final_sets).max(2);
+        BatchedDescriptorPoolBudget {
+            max_sets,
+            storage_buffer_descriptors: max_sets * DESCRIPTOR_BINDINGS,
+        }
+    }
     static HOST_STORAGE_MEMORY_TYPE_REPORT: Once = Once::new();
     static STAGING_MEMORY_TYPE_REPORT: Once = Once::new();
     static WEIGHT_MEMORY_TYPE_REPORT: Once = Once::new();
@@ -134,6 +170,36 @@ mod enabled {
                 ),
                 None
             );
+        }
+    }
+
+    #[cfg(test)]
+    mod descriptor_pool_tests {
+        use super::*;
+
+        #[test]
+        fn q8_column_serial_budget_scales_with_requested_k() {
+            let k16 = batched_descriptor_pool_budget(28, 16, true, Q8BatchShape::ColumnSerial);
+            let k24 = batched_descriptor_pool_budget(28, 24, true, Q8BatchShape::ColumnSerial);
+
+            assert_eq!(k16.max_sets, 3_405);
+            assert_eq!(k16.storage_buffer_descriptors, 34_050);
+            assert_eq!(k24.max_sets, 4_981);
+            assert_eq!(k24.storage_buffer_descriptors, 49_810);
+            assert!(k24.max_sets > k16.max_sets);
+        }
+
+        #[test]
+        fn budget_matches_f16_and_split_k_dispatch_shapes() {
+            let f16 = batched_descriptor_pool_budget(28, 64, false, Q8BatchShape::ColumnSerial);
+            let split_k = batched_descriptor_pool_budget(28, 24, true, Q8BatchShape::SplitK);
+            let q8_k1 = batched_descriptor_pool_budget(28, 1, true, Q8BatchShape::SplitK);
+
+            assert_eq!(f16.max_sets, 450);
+            assert_eq!(f16.storage_buffer_descriptors, 4_500);
+            assert_eq!(split_k.max_sets, 647);
+            assert_eq!(split_k.storage_buffer_descriptors, 6_470);
+            assert_eq!(q8_k1, f16);
         }
     }
 
@@ -1670,6 +1736,7 @@ mod enabled {
         command: vk::CommandBuffer,
         descriptor_pool: vk::DescriptorPool,
         descriptor_sets: Vec<vk::DescriptorSet>,
+        storage_buffer_descriptors: u32,
         pipelines: &'a Pipelines,
         profile: Option<QueryRecording>,
     }
@@ -1693,6 +1760,7 @@ mod enabled {
                 )?[0]
             };
             self.descriptor_sets.push(set);
+            self.storage_buffer_descriptors += DESCRIPTOR_BINDINGS;
             let infos = buffers
                 .iter()
                 .map(|buffer| {
@@ -1966,6 +2034,7 @@ mod enabled {
                 command,
                 descriptor_pool,
                 descriptor_sets: Vec::new(),
+                storage_buffer_descriptors: 0,
                 pipelines: &pipelines,
                 profile: QueryRecording::new(&state, command, dispatch_count)?,
             };
@@ -2596,6 +2665,7 @@ mod enabled {
                 command,
                 descriptor_pool,
                 descriptor_sets: Vec::new(),
+                storage_buffer_descriptors: 0,
                 pipelines: &pipelines,
                 profile: QueryRecording::new(&state, command, max_sets)?,
             };
@@ -3206,6 +3276,7 @@ mod enabled {
                 command,
                 descriptor_pool,
                 descriptor_sets: Vec::new(),
+                storage_buffer_descriptors: 0,
                 pipelines: &pipelines,
                 profile: QueryRecording::new(&state, command, max_sets)?,
             };
@@ -4160,6 +4231,7 @@ mod enabled {
                         command,
                         descriptor_pool,
                         descriptor_sets: Vec::new(),
+                        storage_buffer_descriptors: 0,
                         pipelines: &self.pipelines,
                         profile: None,
                     };
@@ -4758,37 +4830,20 @@ mod enabled {
                         .command_buffer_count(1),
                 )?[0]
             };
-            // Each layer records: RMSNorm, Q/K/V mat-mat, head-norm+RoPE (Q and
-            // K), value-cache write, attention, O mat-mat, residual add,
-            // post-attention RMSNorm, gate/up mat-mat, SwiGLU, down mat-mat,
-            // MLP residual add. Plus final RMSNorm + LM-head mat-mat. The Q8
-            // path dispatches K single-token matvecs per mat-mat stage (the
-            // column-offset fallback), so the worst case is 6 mat-mat stages
-            // * K dispatches + 10 non-mat-mat stages per layer, plus the final
-            // RMSNorm and K-dispatch LM-head. Use a generous upper bound to
-            // avoid OUT_OF_POOL_MEMORY.
+            // The budget follows every dispatch below: nine fixed pointwise
+            // sets and seven matvec stages per layer, plus final RMSNorm and
+            // LM-head dispatches. Q8 column-serial expands each matvec stage
+            // to K sets, while split-K uses its split and reduction pair.
             let q8 = self.lm_head.q8_0.is_some();
-            let matmat_stages = 6u32; // Q, K, V, O, gate/up (2), down
-            let non_matmat_stages = 10u32;
-            let dispatches_per_layer = if q8 {
-                matmat_stages * k as u32 + non_matmat_stages
-            } else {
-                16
-            };
-            let final_dispatches = if q8 { 1 + k as u32 } else { 2 };
-            let max_sets =
-                (self.layers.len() as u32 * dispatches_per_layer + final_dispatches).max(2);
-            // The Q8 column-offset fallback dispatches K matvecs per mat-mat
-            // stage, which can require thousands of descriptor sets for K=16.
-            // Use a generous pool size to avoid OUT_OF_POOL_MEMORY.
-            let max_sets = max_sets.max(4096);
+            let pool_budget =
+                batched_descriptor_pool_budget(self.layers.len(), k, q8, self.q8_batch_shape);
             let descriptor_pool = unsafe {
                 self.state.device.create_descriptor_pool(
                     &vk::DescriptorPoolCreateInfo::default()
-                        .max_sets(max_sets)
+                        .max_sets(pool_budget.max_sets)
                         .pool_sizes(&[vk::DescriptorPoolSize::default()
                             .ty(vk::DescriptorType::STORAGE_BUFFER)
-                            .descriptor_count(max_sets * DESCRIPTOR_BINDINGS)]),
+                            .descriptor_count(pool_budget.storage_buffer_descriptors)]),
                     None,
                 )?
             };
@@ -4806,6 +4861,7 @@ mod enabled {
                         command,
                         descriptor_pool,
                         descriptor_sets: Vec::new(),
+                        storage_buffer_descriptors: 0,
                         pipelines: &self.pipelines,
                         profile: None,
                     };
@@ -5103,6 +5159,19 @@ mod enabled {
                         self.layers.len(),
                         StageClass::GemmMlpDown,
                     )?;
+                    debug_assert!(
+                        recorder.descriptor_sets.len() as u32 <= pool_budget.max_sets,
+                        "batched decode allocated {} descriptor sets but budgeted {}",
+                        recorder.descriptor_sets.len(),
+                        pool_budget.max_sets
+                    );
+                    debug_assert!(
+                        recorder.storage_buffer_descriptors
+                            <= pool_budget.storage_buffer_descriptors,
+                        "batched decode allocated {} storage descriptors but budgeted {}",
+                        recorder.storage_buffer_descriptors,
+                        pool_budget.storage_buffer_descriptors
+                    );
                 }
                 unsafe { self.state.device.end_command_buffer(command)? };
                 Ok::<(), anyhow::Error>(())

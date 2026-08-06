@@ -42,10 +42,10 @@ DEFAULT_MODEL = (
     / ".cache/huggingface/hub/models--Alibaba-NLP--gte-modernbert-base/snapshots"
     / MODEL_REVISION
 )
-REMOTE_TARGET = "ufuka@[lan-ip]"
+REMOTE_TARGET = "ufuka@[ally-host]"
 REMOTE_MODEL = r"C:\bench\model-modernbert"
 REMOTE_SOURCE_PARENT = r"C:\bench\campaign"
-REMOTE_CARGO_TARGET = r"%USERPROFILE%\target"
+REMOTE_CARGO_TARGET = r"%USERPROFILE%\cargo-target-decode"
 REMOTE_CARGO = "cargo"
 REMOTE_CARGO_HOME = r"%USERPROFILE%\.cargo"
 REMOTE_RUSTUP_HOME = r"%USERPROFILE%\.rustup"
@@ -567,7 +567,7 @@ def remote_env_prefix() -> str:
 
 
 def remote_idle_probe(log_root: Path) -> str:
-    user_profile = remote_stdout("echo %USERPROFILE%", log_root / "ally-userprofile.log")
+    user_profile = remote_stdout("echo %USERPROFILE%", log_root / "ally-userprofile.log").rstrip('"')
     if not re.fullmatch(r"[A-Za-z]:\\[^\r\n]+", user_profile):
         raise HarnessError(f"Ally returned an invalid USERPROFILE: {user_profile!r}")
     process_text = remote_stdout(
@@ -661,6 +661,13 @@ def sync_candidate_to_ally(
     log_root: Path,
 ) -> Dict[str, str]:
     bundle, patch, expected_head = make_candidate_bundle(workspace, temp_root)
+    siblings = configured_sibling_sources()
+    sibling_bundles = []
+    for sibling in siblings:
+        sibling_temp = temp_root / "sibling-bundles" / sibling.name
+        sibling_temp.mkdir(parents=True, exist_ok=True)
+        sibling_bundle, sibling_patch, sibling_head = make_candidate_bundle(sibling, sibling_temp)
+        sibling_bundles.append((sibling.name, sibling_bundle, sibling_patch, sibling_head))
     root = user_profile + "\\" + REMOTE_SESSION_PREFIX + "-" + str(os.getpid())
     remote_workspace = root + "\\workspace"
     remote_fixture = root + "\\fixtures"
@@ -674,6 +681,18 @@ def sync_candidate_to_ally(
     scp_to(bundle, remote_bundle, log_root / "bundle-upload.log")
     if patch.stat().st_size:
         scp_to(patch, remote_patch, log_root / "patch-upload.log")
+    for sibling_name, sibling_bundle, sibling_patch, _sibling_head in sibling_bundles:
+        scp_to(
+            sibling_bundle,
+            root + "\\" + sibling_name + ".bundle",
+            log_root / f"{sibling_name}-bundle-upload.log",
+        )
+        if sibling_patch.stat().st_size:
+            scp_to(
+                sibling_patch,
+                root + "\\" + sibling_name + ".patch",
+                log_root / f"{sibling_name}-patch-upload.log",
+            )
     init = (
         f"mkdir {windows_quote(remote_workspace)}&&"
         f"git -C {windows_quote(remote_workspace)} init&&"
@@ -689,6 +708,25 @@ def sync_candidate_to_ally(
             log_root / "ally-git-patch.log",
         ) != 0:
             raise CandidateRejected("candidate worktree patch could not be applied on the Ally")
+    for sibling_name, _sibling_bundle, sibling_patch, _sibling_head in sibling_bundles:
+        remote_sibling = root + "\\" + sibling_name
+        remote_sibling_bundle = root + "\\" + sibling_name + ".bundle"
+        sibling_init = (
+            f"mkdir {windows_quote(remote_sibling)}&&"
+            f"git -C {windows_quote(remote_sibling)} init&&"
+            f"git -C {windows_quote(remote_sibling)} remote add campaign {windows_quote(remote_sibling_bundle)}&&"
+            f"git -C {windows_quote(remote_sibling)} fetch --no-tags campaign HEAD&&"
+            f"git -C {windows_quote(remote_sibling)} checkout --detach -f FETCH_HEAD"
+        )
+        if run_remote(sibling_init, log_root / f"ally-{sibling_name}-git-sync.log") != 0:
+            raise HarnessError(f"Ally sibling checkout could not be initialized: {sibling_name}")
+        if sibling_patch.stat().st_size:
+            remote_sibling_patch = root + "\\" + sibling_name + ".patch"
+            if run_remote(
+                f"git -C {windows_quote(remote_sibling)} apply --whitespace=nowarn {windows_quote(remote_sibling_patch)}",
+                log_root / f"ally-{sibling_name}-git-patch.log",
+            ) != 0:
+                raise CandidateRejected(f"Ally sibling patch could not be applied: {sibling_name}")
     observed_head = remote_stdout(
         f"git -C {windows_quote(remote_workspace)} rev-parse HEAD",
         log_root / "ally-worktree-head.log",
@@ -1099,9 +1137,11 @@ def validate_vulkan_process_result(
         raise CandidateRejected("candidate changed the pinned real-token count")
     if payload.get("shape_policy") != "bucketed" or payload.get("bucket_policy_version") != BUCKET_POLICY:
         raise CandidateRejected("candidate changed the pinned bucket policy")
-    lane = payload.get("lane")
-    if not isinstance(lane, dict) or lane.get("items") != EXPECTED_ROWS:
-        raise CandidateRejected("candidate changed the pinned corpus size")
+    observed_items = payload.get("items")
+    if observed_items != EXPECTED_ROWS:
+        raise CandidateRejected(
+            f"candidate changed the pinned corpus size: expected {EXPECTED_ROWS}, got {observed_items}"
+        )
     passes = payload.get("passes")
     if not isinstance(passes, list) or len(passes) != PASSES_PER_PROCESS:
         raise CandidateRejected(f"candidate did not emit exactly {PASSES_PER_PROCESS} process passes")
@@ -1482,7 +1522,7 @@ def run_harness(workspace_arg: str, runner_arg: str, result_arg: str) -> int:
         f"gte-modernbert-base f16 Vulkan cooperative embedding baseline: {baseline_label}. "
         f"Protocol: {PROCESS_RUNS} paired fresh-process runs, {PASSES_PER_PROCESS - WARMUP_PASSES} "
         "timed steady passes after one discarded warmup; worse-of-two per run. "
-        "The Mac controller probes ufuka@[lan-ip] over SSH and refuses a cargo/unified-rt tenant."
+        "The Mac controller probes ufuka@[ally-host] over SSH and refuses a cargo/unified-rt tenant."
     )
     writer.write(initial_payload(baseline_note))
     try:
@@ -1523,18 +1563,24 @@ def run_harness(workspace_arg: str, runner_arg: str, result_arg: str) -> int:
         )
 
         manifest = remote_workspace + "\\bench\\spikes\\unified-rt\\Cargo.toml"
+        remote_cargo_target = os.environ.get(
+            "SYNAPSE_CAMPAIGN_REMOTE_CARGO_TARGET", REMOTE_CARGO_TARGET
+        )
+        # Pass the target directory as a Cargo argument. OpenSSH's Windows
+        # command bridge executes the first `cmd /c` token separately when a
+        # compound `set ...&&cargo ...` command is sent as argv pieces, which
+        # otherwise silently falls back to the workspace target directory.
         build_command = (
-            remote_env_prefix()
-            + f"cd /d {windows_quote(remote_workspace)}&&"
-            + f"{windows_quote(os.environ.get('SYNAPSE_CAMPAIGN_REMOTE_CARGO', REMOTE_CARGO))} "
-            "build --locked --offline --release --features vulkan "
+            f"cd /d {windows_quote(remote_workspace)}&&"
+            f"{windows_quote(os.environ.get('SYNAPSE_CAMPAIGN_REMOTE_CARGO', REMOTE_CARGO))} "
+            f"build --target-dir {windows_quote(remote_cargo_target)} --locked --offline --release --features vulkan "
             f"--manifest-path {windows_quote(manifest)} --bin spike-unified-rt"
         )
         if run_remote(build_command, temp_root / "ally-build.log") != 0:
             raise CandidateRejected(
                 f"Ally Vulkan release build failed: {runner_output(temp_root / 'ally-build.log')[-4096:]}"
             )
-        binary = user_profile + "\\target\\release\\spike-unified-rt.exe"
+        binary = remote_cargo_target + "\\release\\spike-unified-rt.exe"
         if run_remote(f"if not exist {windows_quote(binary)} exit /b 1", temp_root / "ally-binary.log") != 0:
             raise CandidateRejected("Ally Vulkan release binary was not produced")
 
