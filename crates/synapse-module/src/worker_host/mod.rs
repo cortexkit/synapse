@@ -887,8 +887,13 @@ impl WorkerHost {
 }
 
 pub struct WorkerEngine {
-    runtime: Runtime,
-    host: Mutex<WorkerHost>,
+    /// Present from construction until [`Drop`], which moves the runtime to a
+    /// teardown thread: both `Runtime::block_on` and `Runtime::drop` panic on
+    /// a thread that is currently driving another tokio runtime, and engine
+    /// values dropped from module state teardown are dropped on exactly such
+    /// a thread.
+    runtime: Option<Runtime>,
+    host: Arc<Mutex<WorkerHost>>,
 }
 
 impl WorkerEngine {
@@ -896,9 +901,17 @@ impl WorkerEngine {
         let runtime = Runtime::new()
             .map_err(|error| WorkerHostError::Protocol(format!("create tokio runtime: {error}")))?;
         Ok(Self {
-            runtime,
-            host: Mutex::new(WorkerHost::new(config)),
+            runtime: Some(runtime),
+            host: Arc::new(Mutex::new(WorkerHost::new(config))),
         })
+    }
+
+    /// The engine runtime. Present until `Drop` takes it; unreachable after,
+    /// since every caller holds `&self` to a live (not-yet-dropped) engine.
+    fn runtime(&self) -> &Runtime {
+        self.runtime
+            .as_ref()
+            .expect("worker engine runtime is present until drop")
     }
 
     fn lock_host(&self) -> Result<std::sync::MutexGuard<'_, WorkerHost>, WorkerHostError> {
@@ -914,7 +927,7 @@ impl WorkerEngine {
 
     pub fn ping(&self) -> Result<WorkerPing, WorkerHostError> {
         let mut host = self.lock_host()?;
-        self.runtime.block_on(host.ping())
+        self.runtime().block_on(host.ping())
     }
 
     fn owned_decode_start(
@@ -923,7 +936,8 @@ impl WorkerEngine {
         start: GenerateStart,
     ) -> Result<(u64, FrameEnvelope), WorkerHostError> {
         let mut host = self.lock_host()?;
-        self.runtime.block_on(host.owned_decode_start(model, start))
+        self.runtime()
+            .block_on(host.owned_decode_start(model, start))
     }
 
     fn owned_decode_continue(
@@ -931,13 +945,13 @@ impl WorkerEngine {
         continuation: GenerateContinue,
     ) -> Result<FrameEnvelope, WorkerHostError> {
         let mut host = self.lock_host()?;
-        self.runtime
+        self.runtime()
             .block_on(host.owned_decode_continue(continuation))
     }
 
     fn owned_decode_cancel(&self, cancellation: GenerateCancel) -> Result<u32, WorkerHostError> {
         let mut host = self.lock_host()?;
-        self.runtime
+        self.runtime()
             .block_on(host.owned_decode_cancel(cancellation))
     }
 
@@ -955,17 +969,32 @@ impl WorkerEngine {
 
     fn owned_decode_kill(&self) {
         if let Ok(mut host) = self.lock_host() {
-            let _ = self.runtime.block_on(host.kill_current());
+            let _ = self.runtime().block_on(host.kill_current());
         }
     }
 }
 
 impl Drop for WorkerEngine {
     fn drop(&mut self) {
-        let Ok(mut host) = self.host.lock() else {
+        let Some(runtime) = self.runtime.take() else {
             return;
         };
-        let _ = self.runtime.block_on(host.kill_current());
+        let host = Arc::clone(&self.host);
+        let teardown = move || {
+            if let Ok(mut host) = host.lock() {
+                let _ = runtime.block_on(host.kill_current());
+            }
+            drop(runtime);
+        };
+        if tokio::runtime::Handle::try_current().is_ok() {
+            // Dropped on a thread that is driving a tokio runtime (module
+            // state teardown): block_on here — or even dropping the engine
+            // runtime — panics, and a panic in Drop aborts the rest of the
+            // state teardown. Hand the blocking kill to a dedicated thread.
+            std::thread::spawn(teardown);
+        } else {
+            teardown();
+        }
     }
 }
 
@@ -992,7 +1021,7 @@ impl EmbedEngine for WorkerEngine {
         let mut host = self
             .lock_host()
             .map_err(|error| error.to_engine_error(EngineErrorStage::Load))?;
-        self.runtime
+        self.runtime()
             .block_on(host.load_model(artifact, cfg))
             .map_err(|error| error.to_engine_error(EngineErrorStage::Load))
     }
@@ -1001,7 +1030,7 @@ impl EmbedEngine for WorkerEngine {
         let mut host = self
             .lock_host()
             .map_err(|error| error.to_engine_error(EngineErrorStage::Inference))?;
-        self.runtime
+        self.runtime()
             .block_on(host.embed_batch(model, batch))
             .map_err(|error| error.to_engine_error(EngineErrorStage::Inference))
     }
@@ -1019,7 +1048,7 @@ impl EmbedEngine for WorkerEngine {
 
     fn unload(&mut self, model: &LoadedModel) {
         if let Ok(mut host) = self.lock_host() {
-            let _ = self.runtime.block_on(host.unload(model));
+            let _ = self.runtime().block_on(host.unload(model));
         }
     }
 }
@@ -1045,7 +1074,7 @@ impl RerankEngine for WorkerEngine {
         let mut host = self
             .lock_host()
             .map_err(|error| error.to_engine_error(EngineErrorStage::Inference))?;
-        self.runtime
+        self.runtime()
             .block_on(host.rerank(model, request))
             .map_err(|error| error.to_engine_error(EngineErrorStage::Inference))
     }
@@ -1076,7 +1105,7 @@ impl GenerateEngine for WorkerEngine {
         let mut host = self
             .lock_host()
             .map_err(|error| error.to_engine_error(EngineErrorStage::Inference))?;
-        self.runtime
+        self.runtime()
             .block_on(host.generate(model, request))
             .map_err(|error| error.to_engine_error(EngineErrorStage::Inference))
     }
@@ -1626,6 +1655,22 @@ mod tests {
         let nonce = nonce_hex16();
         assert_eq!(nonce.len(), 16);
         assert!(nonce.chars().all(|ch| ch.is_ascii_hexdigit()));
+    }
+
+    /// Dropping a `WorkerEngine` from a thread that is driving a tokio
+    /// runtime must not panic. The fleet hit exactly this: module state
+    /// teardown under `serve_with_handle` dropped engine values held in
+    /// collections, and the old Drop called `Runtime::block_on` (and then
+    /// implicitly `Runtime::drop`) on the async worker thread — both panic
+    /// there, and a panic in Drop truncates the rest of state teardown.
+    #[tokio::test]
+    async fn worker_engine_drop_inside_async_context_does_not_panic() {
+        let engine =
+            WorkerEngine::new(WorkerHostConfig::new("unused-worker", std::env::temp_dir()))
+                .expect("engine constructs");
+        // Directly dropping in the async context reproduces the fleet panic
+        // with the old Drop; with the teardown-thread Drop it must succeed.
+        drop(engine);
     }
 
     #[tokio::test]
