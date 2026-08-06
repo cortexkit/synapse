@@ -7,10 +7,6 @@ license = "MIT"
 description = "Synapse owned CUDA PTX embedding engine."
 publish = false
 
-# This crate is intentionally self-contained until the production worker slice
-# adds it to the top-level workspace.
-[workspace]
-
 [features]
 default = []
 cuda = []

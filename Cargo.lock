@@ -6639,6 +6639,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "synapse-engine-cuda"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "cc",
+ "half",
+ "safetensors 0.6.2",
+ "serde",
+ "serde_json",
+ "sha2",
+ "synapse-core",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "synapse-engine-ort"
 version = "0.0.0"
 dependencies = [
@@ -6736,6 +6751,17 @@ name = "synapse-worker-ane"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+]
+
+[[package]]
+name = "synapse-worker-cuda"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "serde",
+ "serde_json",
+ "synapse-core",
 ]
 
 [[package]]
