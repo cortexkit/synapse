@@ -67,8 +67,14 @@ struct Args {
 }
 
 enum DecodeEngine {
-    Qwen { decoder: MetalStepDecoder<'static> },
-    Lfm2 { engine: Lfm2HybridStepEngine },
+    Qwen {
+        decoder: MetalStepDecoder<'static>,
+        f16_prefill: Option<MetalStepDecoder<'static>>,
+        layer_count: usize,
+    },
+    Lfm2 {
+        engine: Lfm2HybridStepEngine,
+    },
 }
 
 enum DecodeCache {
@@ -86,8 +92,22 @@ impl DecodeEngine {
 
     fn prefill_greedy(&mut self, prompt: &[u32]) -> Result<(DecodeCache, u32)> {
         match self {
-            Self::Qwen { decoder } => {
-                let (cache, token) = decoder.prefill(prompt)?;
+            Self::Qwen {
+                decoder,
+                f16_prefill,
+                layer_count,
+            } => {
+                let (cache, token) = if let Some(prefill) = f16_prefill {
+                    // Mirror bench/spikes/unified-rt/src/qwen3_decode_metal_step.rs:
+                    // Q8 keeps prefill at f16 quality, then hands the exact f16 KV
+                    // bits to the bandwidth-oriented Q8 step engine.
+                    let (prefill_cache, token) = prefill.prefill(prompt)?;
+                    let cache =
+                        handoff_qwen_cache(prefill, decoder, *layer_count, prefill_cache.position)?;
+                    (cache, token)
+                } else {
+                    decoder.prefill(prompt)?
+                };
                 Ok((DecodeCache::Qwen(cache), token))
             }
             Self::Lfm2 { engine } => {
@@ -100,11 +120,22 @@ impl DecodeEngine {
     fn prefill_logits(&mut self, prompt: &[u32]) -> Result<(DecodeCache, Vec<f32>)> {
         ensure!(!prompt.is_empty(), "decode prompt must not be empty");
         match self {
-            Self::Qwen { decoder } => {
+            Self::Qwen {
+                decoder,
+                f16_prefill,
+                layer_count,
+            } => {
                 let mut cache = MetalStepKvCache { position: 0 };
                 let mut logits = Vec::new();
-                for &token in prompt {
-                    logits = decoder.advance(&mut cache, token)?;
+                if let Some(prefill) = f16_prefill {
+                    for &token in prompt {
+                        logits = prefill.advance(&mut cache, token)?;
+                    }
+                    cache = handoff_qwen_cache(prefill, decoder, *layer_count, cache.position)?;
+                } else {
+                    for &token in prompt {
+                        logits = decoder.advance(&mut cache, token)?;
+                    }
                 }
                 Ok((DecodeCache::Qwen(cache), logits))
             }
@@ -121,11 +152,25 @@ impl DecodeEngine {
 
     fn advance(&mut self, cache: &mut DecodeCache, token: u32) -> Result<Vec<f32>> {
         match (self, cache) {
-            (Self::Qwen { decoder }, DecodeCache::Qwen(cache)) => decoder.advance(cache, token),
+            (Self::Qwen { decoder, .. }, DecodeCache::Qwen(cache)) => decoder.advance(cache, token),
             (Self::Lfm2 { engine }, DecodeCache::Lfm2(cache)) => engine.advance(cache, token),
             _ => bail!("owned decode engine/cache family mismatch"),
         }
     }
+}
+
+fn handoff_qwen_cache(
+    prefill: &MetalStepDecoder<'_>,
+    decoder: &mut MetalStepDecoder<'_>,
+    layer_count: usize,
+    position: usize,
+) -> Result<MetalStepKvCache> {
+    let mut cache_bits = Vec::new();
+    for layer in 0..layer_count {
+        cache_bits.extend(prefill.inspect_cache_bits(layer)?);
+    }
+    decoder.import_caches(&cache_bits)?;
+    Ok(MetalStepKvCache { position })
 }
 
 struct LoadedRuntime {
@@ -233,8 +278,31 @@ impl WorkerState {
                     quant,
                 )?));
                 let stop_ids = model.generation_stop_ids().to_vec();
+                let layer_count = model.layers.len();
                 let decoder = MetalStepDecoder::new(model, Precision::F16, bucket, quant)?;
-                (DecodeEngine::Qwen { decoder }, stop_ids)
+                let f16_prefill = if quant.is_quantized() {
+                    let model = Box::leak(Box::new(Qwen3DecodeModel::load_with_quant(
+                        path,
+                        Precision::F16,
+                        WeightQuantization::None,
+                    )?));
+                    Some(MetalStepDecoder::new(
+                        model,
+                        Precision::F16,
+                        bucket,
+                        WeightQuantization::None,
+                    )?)
+                } else {
+                    None
+                };
+                (
+                    DecodeEngine::Qwen {
+                        decoder,
+                        f16_prefill,
+                        layer_count,
+                    },
+                    stop_ids,
+                )
             }
             "lfm2-1.2b" => {
                 let model = Lfm2DecodeModel::load_with_quant(path, Precision::F16, quant)?;

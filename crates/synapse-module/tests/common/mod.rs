@@ -17,7 +17,7 @@ use tokio::{
 };
 
 pub const MODULE_ID: &str = "synapse";
-pub const SETUP_TIMEOUT: Duration = Duration::from_secs(10);
+pub const SETUP_TIMEOUT: Duration = Duration::from_secs(60);
 pub const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);

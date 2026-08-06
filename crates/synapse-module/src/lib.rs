@@ -108,7 +108,8 @@ const DEFAULT_MAX_QUEUE_MS: u64 = 5_000;
 const DEFAULT_DEADLINE_MS: u64 = 30_000;
 const DEFAULT_ESTIMATED_EXECUTION_MS: u64 = 25;
 const DEFAULT_MAX_CONCURRENT_WORKERS: usize = 2;
-const DEFAULT_WORKER_LOAD_TIMEOUT_MS: u64 = 180_000;
+const DEFAULT_WORKER_LOAD_TIMEOUT_MS: u64 = 900_000;
+const OWNED_DECODE_PROBE_TIMEOUT_MS: u64 = 900_000;
 const DEFAULT_TRANSIENT_RETRY_AFTER_MS: u64 = 100;
 const DEFAULT_JOB_EXECUTION_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
 const DEFAULT_JOB_RESULT_RETENTION_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
@@ -419,6 +420,14 @@ struct PreloadModelConfig {
     #[serde(default)]
     dtype: Option<String>,
     #[serde(default)]
+    arithmetic_identity_revision: Option<String>,
+    #[serde(default)]
+    metallib_revision: Option<String>,
+    #[serde(default)]
+    quantizer_revision: Option<String>,
+    #[serde(default)]
+    derived_digest: Option<String>,
+    #[serde(default)]
     execution: Option<String>,
     #[serde(default)]
     attention_units: Option<usize>,
@@ -603,6 +612,7 @@ struct RuntimeState {
     ort_engine: Arc<Mutex<OrtEmbedEngine>>,
     catalog: Arc<Mutex<BTreeMap<String, ModelSlot>>>,
     job_progress: Arc<Mutex<BTreeMap<String, ModelRuntimeState>>>,
+    owned_decode_q8: Arc<Mutex<owned_decode_routing::q8ingest::Q8IngestRegistry>>,
     owned_decode_dispatches:
         Arc<Mutex<BTreeMap<String, Arc<Mutex<worker_host::SupervisedDecodeDispatch>>>>>,
 }
@@ -1133,11 +1143,15 @@ struct RerankProbeEvidence {
 struct GenerateProbeFixture {
     family: String,
     dtype: String,
+    quant: String,
     model: String,
     model_revision: String,
     #[serde(default)]
     generation_command: Option<String>,
+    generation_command_sha256: String,
     provenance: Value,
+    #[serde(default)]
+    structural_band: GenerateStructuralBand,
     items: Vec<GenerateProbeItem>,
 }
 
@@ -1149,9 +1163,29 @@ struct GenerateProbeItem {
     max_new_tokens: u32,
 }
 
+#[derive(Clone, Debug, Default, Deserialize)]
+struct GenerateStructuralBand {
+    max_forks: usize,
+    top2_gap_ceiling: f64,
+    #[serde(default)]
+    allowed_forks: Vec<GenerateAllowedFork>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct GenerateAllowedFork {
+    id: String,
+    token_index: usize,
+    oracle_token: u32,
+    alternate_token: u32,
+    oracle_top2: [u32; 2],
+    top2_gap: f64,
+}
+
 #[derive(Clone, Debug, Serialize)]
 struct GenerateProbeEvidence {
     token_exact_matches: usize,
+    accepted_structural_forks: usize,
+    max_certified_forks: usize,
     items: usize,
     tokens_compared: usize,
 }
@@ -1352,6 +1386,9 @@ impl RuntimeState {
             ort_engine: Arc::new(Mutex::new(OrtEmbedEngine::new())),
             catalog: Arc::new(Mutex::new(catalog)),
             job_progress: Arc::new(Mutex::new(BTreeMap::new())),
+            owned_decode_q8: Arc::new(Mutex::new(
+                owned_decode_routing::q8ingest::Q8IngestRegistry::new(),
+            )),
             owned_decode_dispatches: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
@@ -1581,15 +1618,68 @@ fn build_preload_catalog_model(
         jobs,
     )?;
     if engine_name == "owned-metal-decode" {
-        spec.owned_family = Some(preload.family.ok_or_else(|| {
+        use owned_decode_routing::identity::WeightQuant;
+
+        let family = preload.family.ok_or_else(|| {
             ModuleError::Config("owned-metal-decode catalog entry is missing family".to_string())
-        })?);
-        spec.owned_dtype = Some(preload.dtype.unwrap_or_else(|| "f16".to_string()));
+        })?;
+        owned_decode_routing::family::Family::parse(&family)
+            .map_err(|error| ModuleError::Config(error.as_str().to_string()))?;
+        let dtype = preload.dtype.unwrap_or_else(|| "f16".to_string());
+        if dtype != "f16" {
+            return Err(ModuleError::Config(format!(
+                "owned-metal-decode activation dtype '{dtype}' is unsupported"
+            )));
+        }
+        let weight_quant = WeightQuant::parse(&spec.quant)
+            .map_err(|error| ModuleError::Config(error.as_str().to_string()))?;
+        let q8_identity = match weight_quant {
+            WeightQuant::F16 => {
+                if preload.quantizer_revision.is_some() || preload.derived_digest.is_some() {
+                    return Err(ModuleError::Config(
+                        "owned-metal-decode f16 entry must not declare Q8 identity".to_string(),
+                    ));
+                }
+                None
+            }
+            WeightQuant::Q8_0 => Some((
+                preload.quantizer_revision.ok_or_else(|| {
+                    ModuleError::Config(
+                        "owned-metal-decode q8_0 entry is missing quantizer_revision".to_string(),
+                    )
+                })?,
+                preload.derived_digest.ok_or_else(|| {
+                    ModuleError::Config(
+                        "owned-metal-decode q8_0 entry is missing derived_digest".to_string(),
+                    )
+                })?,
+            )),
+        };
+        spec.owned_family = Some(family);
+        spec.owned_dtype = Some(dtype);
         spec.owned_execution = Some(
             preload
                 .execution
                 .unwrap_or_else(|| "supervised".to_string()),
         );
+        if let Some(revision) = preload.arithmetic_identity_revision {
+            spec.engine_identity
+                .build_flags
+                .insert("arithmetic_identity_revision".to_string(), revision);
+        }
+        if let Some(revision) = preload.metallib_revision {
+            spec.engine_identity
+                .build_flags
+                .insert("metallib_revision".to_string(), revision);
+        }
+        if let Some((quantizer_revision, derived_digest)) = q8_identity {
+            spec.engine_identity
+                .build_flags
+                .insert("quantizer_revision".to_string(), quantizer_revision);
+            spec.engine_identity
+                .build_flags
+                .insert("derived_digest".to_string(), derived_digest);
+        }
     }
     Ok(spec)
 }
@@ -1607,6 +1697,7 @@ fn normalize_catalog_model(
             model.owned_family.clone(),
             model.owned_dtype.clone(),
             model.owned_execution.clone(),
+            model.engine_identity.build_flags.clone(),
         )
     });
     let owned = if engine_name == "owned-metal" {
@@ -1655,10 +1746,11 @@ fn normalize_catalog_model(
         inline,
         jobs,
     )?;
-    if let Some((family, dtype, execution)) = decode_metadata {
+    if let Some((family, dtype, execution, build_flags)) = decode_metadata {
         spec.owned_family = family;
         spec.owned_dtype = dtype.or_else(|| Some("f16".to_string()));
         spec.owned_execution = execution.or_else(|| Some("supervised".to_string()));
+        spec.engine_identity.build_flags.extend(build_flags);
     }
     Ok(spec)
 }
@@ -2668,6 +2760,7 @@ async fn load_catalog_model_task(
     let load_started = std::time::Instant::now();
     let microllm_max_tokens = state.runtime.microllm_max_tokens;
     let worker_load_timeout = state.runtime.worker_load_timeout;
+    let owned_decode_q8 = Arc::clone(&state.runtime.owned_decode_q8);
     let loaded = tokio::task::spawn_blocking(move || {
         load_catalog_model_blocking(
             spec,
@@ -2675,6 +2768,7 @@ async fn load_catalog_model_task(
             model_cache,
             microllm_max_tokens,
             worker_load_timeout,
+            owned_decode_q8,
         )
     })
     .await
@@ -2800,6 +2894,7 @@ fn load_catalog_model_blocking(
     model_cache: Arc<ModelCache>,
     microllm_max_tokens: u32,
     worker_load_timeout: Duration,
+    owned_decode_q8: Arc<Mutex<owned_decode_routing::q8ingest::Q8IngestRegistry>>,
 ) -> Result<EmbeddingModel, WireOperationError> {
     let task = parse_model_task(Some(&spec.task), &spec.engine, &spec.model_id)
         .map_err(|error| artifact_invalid_error(error.to_string()))?;
@@ -2829,6 +2924,16 @@ fn load_catalog_model_blocking(
             "tokenizer digest mismatch for '{}': expected {}, got {}",
             spec.model_id, spec.tokenizer_sanitized_digest, actual_tokenizer_digest
         )));
+    }
+    if spec.engine == "owned-metal-decode" {
+        let entry = owned_decode_catalog_entry(&spec)
+            .map_err(|error| artifact_invalid_error(error.as_str()))?;
+        ingest_owned_decode_q8(
+            &entry,
+            &model_path.path,
+            model_cache.root(),
+            &owned_decode_q8,
+        )?;
     }
     let runtime_config = model_runtime_config(
         &spec,
@@ -2931,6 +3036,54 @@ fn load_catalog_model_blocking(
         owned_tokenizer_policy,
         owned_decode_resolution_refusal: owned_decode_resolution_refusal(&spec),
     })
+}
+
+fn ingest_owned_decode_q8(
+    entry: &owned_decode_routing::CatalogEntry,
+    source_path: &Path,
+    cache_root: &Path,
+    registry: &Arc<Mutex<owned_decode_routing::q8ingest::Q8IngestRegistry>>,
+) -> Result<(), WireOperationError> {
+    use owned_decode_routing::{error::OwnedDecodeError, q8artifact::derive_and_cache_q8_blocks};
+
+    let Some(identity) = entry.q8.as_ref() else {
+        return Ok(());
+    };
+    let configured_cache_root = env::var_os("SYNAPSE_OWNED_DECODE_Q8_CACHE_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| cache_root.to_path_buf());
+    let artifact = derive_and_cache_q8_blocks(
+        source_path,
+        &configured_cache_root,
+        entry.family,
+        &entry.artifact_source_digest,
+        &identity.quantizer_revision,
+    )
+    .map_err(|error| artifact_invalid_error(format!("derive Q8 artifact: {error:#}")))?;
+    let mut registry = registry.lock().map_err(|_| {
+        WireOperationError::from_stable(
+            StableError::engine_crashed(Some(100)),
+            "owned-decode Q8 ingest registry mutex was poisoned",
+        )
+    })?;
+    registry.register_expected_digest(
+        &entry.artifact_source_digest,
+        &identity.quantizer_revision,
+        &identity.derived_digest,
+    );
+    match registry.load_or_ingest(
+        &entry.artifact_source_digest,
+        &identity.quantizer_revision,
+        "q8_0",
+        &[],
+        |_| artifact.derived_digest,
+    ) {
+        Ok(_) | Err(OwnedDecodeError::ArtifactPoisoned | OwnedDecodeError::NotCertified) => Ok(()),
+        Err(error) => Err(artifact_invalid_error(format!(
+            "Q8 ingest failed: {}",
+            error.as_str()
+        ))),
+    }
 }
 
 fn load_worker_backend_blocking(
@@ -4984,10 +5137,11 @@ impl owned_decode_routing::certification::CertificationAccess for PersistentDeco
 }
 
 fn worker_path_certification(evidence: &Value) -> bool {
+    let battery = evidence["worker_path"]["fixture_battery"].as_str();
     evidence["worker_path"]["transport"].as_str() == Some(worker_catalog_transport())
         && evidence["worker_path"]["protocol"].as_str()
             == Some(owned_decode_worker::identity::WORKER_PROTOCOL_ID)
-        && evidence["worker_path"]["fixture_battery"].as_str() == Some("20x64-token-exact")
+        && matches!(battery, Some("20x64-token-exact" | "20x64-structural-band"))
 }
 
 struct WireDecodeDispatch {
@@ -5087,13 +5241,21 @@ fn owned_decode_catalog_entry(
 
     let family_name = spec.owned_family.as_deref().unwrap_or_default();
     let family = owned_decode_routing::family::Family::parse(family_name)?;
+    let activation_dtype = ActivationDType::parse(spec.owned_dtype.as_deref().unwrap_or_default())?;
     let weight_quant = WeightQuant::parse(&spec.quant)?;
     let flag = |name: &str| spec.engine_identity.build_flags.get(name).cloned();
-    let q8 = weight_quant.is_q8().then(|| Q8Identity {
-        quantizer_revision: flag("quantizer_revision")
-            .unwrap_or_else(|| "q8-ingest-v1".to_string()),
-        derived_digest: flag("derived_digest").unwrap_or_else(|| spec.artifact_digest.clone()),
-    });
+    let q8 = if weight_quant.is_q8() {
+        Some(Q8Identity {
+            quantizer_revision: flag("quantizer_revision")
+                .filter(|value| !value.trim().is_empty())
+                .ok_or(owned_decode_routing::error::OwnedDecodeError::Unsupported)?,
+            derived_digest: flag("derived_digest")
+                .filter(|value| !value.trim().is_empty())
+                .ok_or(owned_decode_routing::error::OwnedDecodeError::Unsupported)?,
+        })
+    } else {
+        None
+    };
     Ok(owned_decode_routing::CatalogEntry {
         entry_id: spec.model_id.clone(),
         engine: owned_decode_routing::CATALOG_ENGINE.to_string(),
@@ -5102,7 +5264,7 @@ fn owned_decode_catalog_entry(
         worker: owned_decode_routing::CATALOG_WORKER.to_string(),
         risk_class: owned_decode_routing::CATALOG_RISK_CLASS.to_string(),
         family,
-        activation_dtype: ActivationDType::F16,
+        activation_dtype,
         weight_quant,
         arithmetic_identity_revision: flag("arithmetic_identity_revision")
             .unwrap_or_else(|| "owned-decode-arithmetic-v1".to_string()),
@@ -5171,7 +5333,27 @@ fn owned_decode_runtime_identity(
             .quarantine_duration_ms,
         scheduler: scheduler.runtime.clone(),
     };
-    (manifest.digest(), scheduler.runtime.production_n)
+    let manifest_digest = manifest.digest();
+    let runtime_config_digest = if entry.family == owned_decode_routing::family::Family::Qwen3_0_6b
+        && entry.weight_quant == owned_decode_routing::identity::WeightQuant::F16
+    {
+        // Reuse the existing runtime manifest digest for the Qwen3 0.6B F16
+        // lane so its established runtime identity does not change. Other
+        // family/quant combinations include those values in the digest so
+        // every expanded lane has a distinct runtime identity.
+        manifest_digest
+    } else {
+        sha256_hex(
+            &serde_json::to_vec(&json!({
+                "runtime_manifest_digest": manifest_digest,
+                "family": entry.family.as_str(),
+                "activation_dtype": entry.activation_dtype.as_str(),
+                "weight_quant": entry.weight_quant.as_str(),
+            }))
+            .expect("owned-decode lane runtime identity serializes"),
+        )
+    };
+    (runtime_config_digest, scheduler.runtime.production_n)
 }
 
 fn owned_decode_worker_runtime_dir(spec: &StoredModelConfig) -> PathBuf {
@@ -5602,7 +5784,6 @@ async fn route_owned_decode_wire(
     params: &MicroLlmOneshotParams,
     model_id: &str,
 ) -> HandlerOutcome {
-    use owned_decode_routing::certification::{CertificationAccess, UnconstrainedCertKey};
     use owned_decode_routing::lane::{LaneKind, LlamaLane};
     use owned_decode_routing::request::{OneshotRequest, SamplingMode};
 
@@ -5793,28 +5974,15 @@ async fn route_owned_decode_wire(
     let certification = PersistentDecodeCertification {
         store: Arc::clone(&state.store),
     };
-    let mut q8 = owned_decode_routing::q8ingest::Q8IngestRegistry::new();
-    if let Some(q8_identity) = entry.q8.as_ref() {
-        let certified = certification.is_unconstrained_certified(&UnconstrainedCertKey {
-            machine_profile_hash: state.machine_profile_hash.clone(),
-            decode_fingerprint: decode_fingerprint.clone(),
-        });
-        if certified {
-            q8.register_expected_digest(
-                &entry.artifact_source_digest,
-                &q8_identity.quantizer_revision,
-                &q8_identity.derived_digest,
-            );
-            let derived = q8_identity.derived_digest.clone();
-            let _ = q8.load_or_ingest(
-                &entry.artifact_source_digest,
-                &q8_identity.quantizer_revision,
-                "q8_0",
-                &[],
-                |_| derived,
-            );
+    let q8 = match state.runtime.owned_decode_q8.lock() {
+        Ok(registry) => registry.clone(),
+        Err(_) => {
+            return channel_error(
+                "owned_decode_unavailable",
+                "owned-decode Q8 ingest registry is unavailable",
+            )
         }
-    }
+    };
     let context_buckets: owned_decode_contracts::ContextBucketsManifest = serde_json::from_str(
         include_str!("../owned-decode-manifests/decode-context-buckets-v1.json"),
     )
@@ -7720,8 +7888,8 @@ async fn execute_probe_job(
             return;
         }
     };
-    let generate_fixture = match generate_probe_fixture() {
-        Ok(fixture) => fixture,
+    let generate_fixtures = match generate_probe_fixtures() {
+        Ok(fixtures) => fixtures,
         Err(error) => {
             fail_job_with_wire_error(&state, &job_id, false, error);
             return;
@@ -7807,7 +7975,7 @@ async fn execute_probe_job(
                 execute_rerank_probe_for_model(&state, Arc::clone(&model), &rerank_fixture).await
             }
             ModelTask::Generate => {
-                execute_generate_probe_for_model(&state, Arc::clone(&model), &generate_fixture)
+                execute_generate_probe_for_model(&state, Arc::clone(&model), &generate_fixtures)
                     .await
             }
         };
@@ -7994,7 +8162,10 @@ async fn execute_probe_job(
                 "first_id": rerank_fixture.items.first().map(|item| item.id.clone()),
                 "generation_command": rerank_fixture.generation_command,
             },
-            "generate": generate_fixture_provenance(&generate_fixture)
+            "generate": generate_fixtures
+                .iter()
+                .map(generate_fixture_provenance)
+                .collect::<Vec<_>>()
         },
         "lanes": lane_results,
         "aliases": alias_results,
@@ -8326,7 +8497,7 @@ async fn execute_rerank_probe_for_model(
 async fn execute_generate_probe_for_model(
     state: &ModuleState,
     model: Arc<EmbeddingModel>,
-    fixture: &GenerateProbeFixture,
+    fixtures: &[GenerateProbeFixture],
 ) -> Result<ProbeModelResult, WireOperationError> {
     use owned_decode_routing::lane::LaneKind;
 
@@ -8365,16 +8536,22 @@ async fn execute_generate_probe_for_model(
         .map_err(|error| artifact_invalid_error(error.as_str()))?;
     let processing_fingerprint = owned_decode_processing_fingerprint(&entry)
         .map_err(|error| artifact_invalid_error(error.as_str()))?;
-    let fixture_matches = spec.owned_family.as_deref() == Some(fixture.family.as_str())
-        && spec.owned_dtype.as_deref() == Some(fixture.dtype.as_str());
-    if !fixture_matches {
+    let Some(fixture) = fixtures.iter().find(|fixture| {
+        spec.owned_family.as_deref() == Some(fixture.family.as_str())
+            && spec.owned_dtype.as_deref() == Some(fixture.dtype.as_str())
+            && spec.quant == fixture.quant
+    }) else {
         let evidence = json!({
             "task": "generate",
-            "gate": "token_exact",
+            "gate": "structural_band",
             "blocking_reason": "fixture_unavailable",
-            "fixture": generate_fixture_provenance(fixture),
+            "available_fixtures": fixtures
+                .iter()
+                .map(generate_fixture_provenance)
+                .collect::<Vec<_>>(),
             "model_family": spec.owned_family,
             "model_dtype": spec.owned_dtype,
+            "model_quant": spec.quant,
         });
         store_probe_outcome_for_fingerprint(
             state,
@@ -8397,9 +8574,61 @@ async fn execute_generate_probe_for_model(
             }),
             certified_vectors: None,
         });
+    };
+
+    if let Some(q8_identity) = entry.q8.as_ref() {
+        let trust_state = state
+            .runtime
+            .owned_decode_q8
+            .lock()
+            .ok()
+            .and_then(|registry| {
+                registry
+                    .entry(
+                        &entry.artifact_source_digest,
+                        &q8_identity.quantizer_revision,
+                    )
+                    .map(|artifact| artifact.trust_state)
+            });
+        if trust_state != Some(owned_decode_routing::q8ingest::TrustState::Trusted) {
+            let blocking_reason =
+                if trust_state == Some(owned_decode_routing::q8ingest::TrustState::Poisoned) {
+                    "artifact_poisoned"
+                } else {
+                    "owned_decode_not_certified"
+                };
+            let evidence = json!({
+                "task": "generate",
+                "gate": "q8_artifact_trust",
+                "blocking_reason": blocking_reason,
+                "fixture": generate_fixture_provenance(fixture),
+            });
+            store_probe_outcome_for_fingerprint(
+                state,
+                &model,
+                &decode_fingerprint,
+                CertificationStatus::Uncertified,
+                evidence.clone(),
+            )?;
+            return Ok(ProbeModelResult {
+                lane_result: json!({
+                    "model_id": model.model_id,
+                    "task": "generate",
+                    "fingerprint": decode_fingerprint,
+                    "numeric_profile_id": model.numeric_profile_id,
+                    "status": "uncertified",
+                    "certification_required": true,
+                    "blocking_reason": blocking_reason,
+                    "evidence": evidence,
+                    "performance": Value::Null,
+                }),
+                certified_vectors: None,
+            });
+        }
     }
 
     let mut exact_matches = 0_usize;
+    let mut accepted_structural_forks = Vec::new();
     let mut tokens_compared = 0_usize;
     let mut mismatches = Vec::new();
     let mut throughput_samples = Vec::with_capacity(fixture.items.len());
@@ -8425,7 +8654,7 @@ async fn execute_generate_probe_for_model(
                     &entry,
                     prompt.clone(),
                     None,
-                    180_000,
+                    OWNED_DECODE_PROBE_TIMEOUT_MS,
                 )
                 .map_err(|error| match error {
                     OwnedDecodeDispatchPreparationError::Refused(refusal) => {
@@ -8452,7 +8681,7 @@ async fn execute_generate_probe_for_model(
             dispatch,
             prompt,
             None,
-            180_000,
+            OWNED_DECODE_PROBE_TIMEOUT_MS,
             owned_decode_routing::DispatchedCommand {
                 lane: LaneKind::OwnedDecode,
                 decode_fingerprint: decode_fingerprint.clone(),
@@ -8470,6 +8699,14 @@ async fn execute_generate_probe_for_model(
         tokens_compared = tokens_compared.saturating_add(item.expected_token_ids.len());
         if output.generated_token_ids == item.expected_token_ids {
             exact_matches += 1;
+        } else if accepted_structural_forks.len() < fixture.structural_band.max_forks {
+            if let Some(fork) =
+                certified_generate_fork(item, &output.generated_token_ids, &fixture.structural_band)
+            {
+                accepted_structural_forks.push(fork.clone());
+            } else {
+                mismatches.push(decode_token_mismatch(item, &output.generated_token_ids));
+            }
         } else {
             mismatches.push(decode_token_mismatch(item, &output.generated_token_ids));
         }
@@ -8505,7 +8742,7 @@ async fn execute_generate_probe_for_model(
         constrained_dispatch,
         constrained_prompt.clone(),
         Some(worker_constraint(&compiled.constraint)),
-        180_000,
+        OWNED_DECODE_PROBE_TIMEOUT_MS,
         owned_decode_routing::DispatchedCommand {
             lane: LaneKind::OwnedDecode,
             decode_fingerprint: decode_fingerprint.clone(),
@@ -8526,27 +8763,32 @@ async fn execute_generate_probe_for_model(
 
     let evidence = GenerateProbeEvidence {
         token_exact_matches: exact_matches,
+        accepted_structural_forks: accepted_structural_forks.len(),
+        max_certified_forks: fixture.structural_band.max_forks,
         items: fixture.items.len(),
         tokens_compared,
     };
-    let passed = exact_matches == fixture.items.len() && constrained_schema_valid;
+    let fixture_passed = exact_matches + accepted_structural_forks.len() == fixture.items.len()
+        && mismatches.is_empty();
+    let passed = fixture_passed && constrained_schema_valid;
     let certification_evidence = json!({
         "task": "generate",
-        "gate": "token_exact",
+        "gate": "structural_band",
         "blocking_reason": if passed {
             Value::Null
-        } else if exact_matches != fixture.items.len() {
-            json!("token_mismatch")
+        } else if !fixture_passed {
+            json!("token_mismatch_outside_structural_band")
         } else {
             json!("constrained_worker_path_failed")
         },
         "metrics": evidence,
+        "accepted_forks": accepted_structural_forks,
         "mismatches": mismatches,
         "fixture": generate_fixture_provenance(fixture),
         "worker_path": {
             "transport": worker_catalog_transport(),
             "protocol": owned_decode_worker::identity::WORKER_PROTOCOL_ID,
-            "fixture_battery": "20x64-token-exact",
+            "fixture_battery": "20x64-structural-band",
             "prompt_count": fixture.items.len(),
             "constrained_schema_valid": constrained_schema_valid,
             "constrained_runtime_identities": if constrained_schema_valid {
@@ -8625,11 +8867,45 @@ fn generate_fixture_provenance(fixture: &GenerateProbeFixture) -> Value {
     json!({
         "family": fixture.family,
         "dtype": fixture.dtype,
+        "quant": fixture.quant,
         "model": fixture.model,
         "model_revision": fixture.model_revision,
         "generation_command": fixture.generation_command,
+        "generation_command_sha256": fixture.generation_command_sha256,
         "provenance": fixture.provenance,
+        "structural_band": {
+            "max_forks": fixture.structural_band.max_forks,
+            "top2_gap_ceiling": fixture.structural_band.top2_gap_ceiling,
+            "allowed_forks": fixture.structural_band.allowed_forks,
+        },
         "items": fixture.items.len(),
+    })
+}
+
+fn certified_generate_fork<'a>(
+    item: &GenerateProbeItem,
+    actual: &[u32],
+    structural_band: &'a GenerateStructuralBand,
+) -> Option<&'a GenerateAllowedFork> {
+    let token_index = item
+        .expected_token_ids
+        .iter()
+        .zip(actual)
+        .position(|(expected, actual)| expected != actual)
+        .or_else(|| {
+            (item.expected_token_ids.len() != actual.len())
+                .then(|| actual.len().min(item.expected_token_ids.len()))
+        })?;
+    let oracle_token = *item.expected_token_ids.get(token_index)?;
+    let alternate_token = *actual.get(token_index)?;
+    structural_band.allowed_forks.iter().find(|fork| {
+        fork.id == item.id
+            && fork.token_index == token_index
+            && fork.oracle_token == oracle_token
+            && fork.alternate_token == alternate_token
+            && fork.oracle_top2.contains(&oracle_token)
+            && fork.oracle_top2.contains(&alternate_token)
+            && fork.top2_gap <= structural_band.top2_gap_ceiling
     })
 }
 
@@ -9120,15 +9396,23 @@ fn rerank_probe_fixture() -> Result<RerankProbeFixture, WireOperationError> {
     )
 }
 
-fn generate_probe_fixture() -> Result<GenerateProbeFixture, WireOperationError> {
-    serde_json::from_str(include_str!("fixtures/probe_decode_qwen3_0_6b_f16_v1.json")).map_err(
-        |error| {
+fn generate_probe_fixtures() -> Result<Vec<GenerateProbeFixture>, WireOperationError> {
+    [
+        include_str!("fixtures/probe_decode_qwen3_0_6b_f16_v1.json"),
+        include_str!("fixtures/probe_decode_lfm2_1_2b_f16_v1.json"),
+        include_str!("fixtures/probe_decode_qwen3_0_6b_q8_0_v1.json"),
+        include_str!("fixtures/probe_decode_lfm2_1_2b_q8_0_v1.json"),
+    ]
+    .into_iter()
+    .map(|fixture| {
+        serde_json::from_str(fixture).map_err(|error| {
             WireOperationError::from_stable(
                 StableError::artifact_invalid(),
                 format!("decode built-in generate probe fixture: {error}"),
             )
-        },
-    )
+        })
+    })
+    .collect()
 }
 
 fn probe_evidence(vectors: &[Vec<f32>], items: &[ProbeFixtureItem]) -> ProbeEvidence {
@@ -10294,26 +10578,85 @@ mod tests {
     }
 
     #[test]
-    fn decode_certification_fixture_is_the_pinned_twenty_by_sixty_four_oracle() {
-        let fixture = generate_probe_fixture().expect("shipped decode fixture should parse");
-        assert_eq!(fixture.family, "qwen3-0.6b");
-        assert_eq!(fixture.dtype, "f16");
-        assert_eq!(fixture.model, "Qwen/Qwen3-Embedding-0.6B");
-        assert_eq!(fixture.items.len(), 20);
-        assert!(fixture
-            .items
+    fn decode_certification_fixtures_are_the_pinned_twenty_by_sixty_four_oracles() {
+        let fixtures = generate_probe_fixtures().expect("shipped decode fixtures should parse");
+        assert_eq!(fixtures.len(), 4);
+        let lanes = fixtures
             .iter()
-            .all(|item| item.max_new_tokens == 64 && item.expected_token_ids.len() == 64));
+            .map(|fixture| (fixture.family.as_str(), fixture.quant.as_str()))
+            .collect::<BTreeSet<_>>();
         assert_eq!(
-            fixture.provenance["source_tokens_sha256"],
+            lanes,
+            BTreeSet::from([
+                ("qwen3-0.6b", "f16"),
+                ("qwen3-0.6b", "q8_0"),
+                ("lfm2-1.2b", "f16"),
+                ("lfm2-1.2b", "q8_0"),
+            ])
+        );
+        for fixture in &fixtures {
+            assert_eq!(fixture.dtype, "f16");
+            assert_eq!(fixture.items.len(), 20);
+            assert!(fixture
+                .items
+                .iter()
+                .all(|item| { item.max_new_tokens == 64 && item.expected_token_ids.len() <= 64 }));
+            let command = fixture.generation_command.as_deref().unwrap();
+            assert_eq!(
+                fixture.generation_command_sha256,
+                sha256_hex(command.as_bytes())
+            );
+            assert_eq!(
+                fixture.provenance["generation_command_sha256"],
+                fixture.generation_command_sha256
+            );
+        }
+        assert_eq!(
+            fixtures
+                .iter()
+                .find(|fixture| fixture.family == "qwen3-0.6b" && fixture.quant == "f16")
+                .unwrap()
+                .provenance["source_tokens_sha256"],
             "c3080813c45c364a73cbb6dce122afbba20e761b2189a31d0055ecf435232af1"
         );
+        assert_eq!(
+            fixtures
+                .iter()
+                .find(|fixture| fixture.family == "lfm2-1.2b" && fixture.quant == "f16")
+                .unwrap()
+                .structural_band
+                .max_forks,
+            2
+        );
+        assert!(fixtures
+            .iter()
+            .filter(|fixture| fixture.quant == "q8_0")
+            .all(|fixture| fixture.structural_band.max_forks == 0));
+    }
+
+    #[test]
+    fn structural_band_accepts_only_a_pinned_top_two_fork() {
+        let fixtures = generate_probe_fixtures().expect("shipped decode fixtures should parse");
+        let fixture = fixtures
+            .iter()
+            .find(|fixture| fixture.family == "lfm2-1.2b" && fixture.quant == "f16")
+            .unwrap();
+        let item = fixture
+            .items
+            .iter()
+            .find(|item| item.id == "completion-15")
+            .unwrap();
+        let mut accepted = item.expected_token_ids.clone();
+        accepted[17] = 523;
+        assert!(certified_generate_fork(item, &accepted, &fixture.structural_band).is_some());
+        accepted[17] = 524;
+        assert!(certified_generate_fork(item, &accepted, &fixture.structural_band).is_none());
     }
 
     #[test]
     fn corrupted_decode_fixture_records_the_first_diverging_prompt_and_token() {
-        let fixture = generate_probe_fixture().expect("shipped decode fixture should parse");
-        let item = &fixture.items[0];
+        let fixtures = generate_probe_fixtures().expect("shipped decode fixtures should parse");
+        let item = &fixtures[0].items[0];
         let mut corrupted = item.expected_token_ids.clone();
         corrupted[7] = corrupted[7].wrapping_add(1);
 
@@ -10323,6 +10666,24 @@ mod tests {
         assert_eq!(mismatch["divergence_token_index"], 7);
         assert_eq!(mismatch["expected_token_id"], item.expected_token_ids[7]);
         assert_eq!(mismatch["actual_token_id"], corrupted[7]);
+    }
+
+    #[test]
+    fn worker_path_certification_accepts_exact_and_structural_batteries() {
+        let evidence = |battery| {
+            json!({
+                "worker_path": {
+                    "transport": worker_catalog_transport(),
+                    "protocol": owned_decode_worker::identity::WORKER_PROTOCOL_ID,
+                    "fixture_battery": battery,
+                }
+            })
+        };
+        assert!(worker_path_certification(&evidence("20x64-token-exact")));
+        assert!(worker_path_certification(&evidence(
+            "20x64-structural-band"
+        )));
+        assert!(!worker_path_certification(&evidence("unverified")));
     }
 
     #[test]
@@ -10817,69 +11178,87 @@ mod tests {
 mod routing_identity_dump_tests {
     use super::*;
 
-    /// Prints routing identities for a complete preload-spec JSON supplied in
-    /// `SYNAPSE_OWNED_DECODE_PRELOAD_SPEC_JSON`. Run this ignored test on the
-    /// target machine before publishing its machine-local routing cutover record,
-    /// so the record contains the identities observed on that machine.
+    /// Prints routing identities for preload-spec JSON supplied in
+    /// `SYNAPSE_OWNED_DECODE_PRELOAD_SPEC_JSON`. The value may be one preload
+    /// object or an array; fleet certification supplies all four family/quant
+    /// lanes so their independent identities are recorded in one dump.
     #[test]
-    #[ignore = "requires a readable fleet preload spec and tokenizer artifact"]
+    #[ignore = "requires readable fleet preload specs and tokenizer artifacts"]
     fn dump_owned_decode_routing_identity_from_preload_spec() {
         let preload_json = env::var("SYNAPSE_OWNED_DECODE_PRELOAD_SPEC_JSON")
-            .expect("set SYNAPSE_OWNED_DECODE_PRELOAD_SPEC_JSON to one preload-model JSON object");
-        let preload: PreloadModelConfig =
-            serde_json::from_str(&preload_json).expect("preload spec must parse");
-        let spec = build_preload_catalog_model(
-            0,
-            preload,
-            &InlineConfig::default(),
-            &JobConfig::default(),
-        )
-        .expect("preload spec must build a catalog model");
-        let entry =
-            owned_decode_catalog_entry(&spec).expect("preload spec must build a decode entry");
-        let decode_fingerprint = entry
-            .decode_identity_inputs()
-            .decode_fingerprint()
-            .expect("decode identity must be valid");
-        let processing_fingerprint =
-            owned_decode_processing_fingerprint(&entry).expect("processing identity must be valid");
-        let (runtime_config_digest, _) = owned_decode_runtime_identity(&spec, &entry);
-        let tokenizer_path = match &spec.tokenizer_locator {
-            ModelAssetLocator::LocalPath { path } => path,
-            ModelAssetLocator::CacheDigest { .. } => {
-                panic!("identity dump requires a local tokenizer path in the preload spec")
-            }
+            .expect("set SYNAPSE_OWNED_DECODE_PRELOAD_SPEC_JSON to preload-model JSON");
+        let value: Value = serde_json::from_str(&preload_json).expect("preload JSON must parse");
+        let preload_values = match value {
+            Value::Array(values) => values,
+            value @ Value::Object(_) => vec![value],
+            _ => panic!("preload JSON must be one object or an array of objects"),
         };
-        let tokenizer = SanitizedTokenizer::from_file(
-            tokenizer_path,
-            TokenizerConfig {
-                max_tokens: spec.max_tokens,
-            },
-        )
-        .expect("preload tokenizer must load");
-        let tokenizer_vocabulary_digest =
-            owned_decode_vocabulary_digest(&tokenizer).expect("tokenizer vocabulary must load");
-        let constraint = owned_decode_grammar_scheduler::compile_grammar(
-            r#"{"type":"string"}"#,
-            &owned_decode_grammar_scheduler::CompileContext {
-                base_decode_fingerprint: decode_fingerprint.clone(),
-                tokenizer_vocabulary_digest,
-            },
-            &owned_decode_grammar_scheduler::GrammarSubsetManifest::default(),
-        )
-        .expect("default grammar subset must compile a string schema");
+        let identities = preload_values
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| {
+                let preload: PreloadModelConfig =
+                    serde_json::from_value(value).expect("preload spec must parse");
+                let spec = build_preload_catalog_model(
+                    index,
+                    preload,
+                    &InlineConfig::default(),
+                    &JobConfig::default(),
+                )
+                .expect("preload spec must build a catalog model");
+                let entry = owned_decode_catalog_entry(&spec)
+                    .expect("preload spec must build a decode entry");
+                let decode_fingerprint = entry
+                    .decode_identity_inputs()
+                    .decode_fingerprint()
+                    .expect("decode identity must be valid");
+                let processing_fingerprint = owned_decode_processing_fingerprint(&entry)
+                    .expect("processing identity must be valid");
+                let (runtime_config_digest, _) = owned_decode_runtime_identity(&spec, &entry);
+                let tokenizer_path = match &spec.tokenizer_locator {
+                    ModelAssetLocator::LocalPath { path } => path,
+                    ModelAssetLocator::CacheDigest { .. } => {
+                        panic!("identity dump requires a local tokenizer path")
+                    }
+                };
+                let tokenizer = SanitizedTokenizer::from_file(
+                    tokenizer_path,
+                    TokenizerConfig {
+                        max_tokens: spec.max_tokens,
+                    },
+                )
+                .expect("preload tokenizer must load");
+                let tokenizer_vocabulary_digest = owned_decode_vocabulary_digest(&tokenizer)
+                    .expect("tokenizer vocabulary must load");
+                let constraint = owned_decode_grammar_scheduler::compile_grammar(
+                    r#"{"type":"string"}"#,
+                    &owned_decode_grammar_scheduler::CompileContext {
+                        base_decode_fingerprint: decode_fingerprint.clone(),
+                        tokenizer_vocabulary_digest,
+                    },
+                    &owned_decode_grammar_scheduler::GrammarSubsetManifest::default(),
+                )
+                .expect("default grammar subset must compile a string schema");
+                serde_json::json!({
+                    "entry_id": entry.entry_id,
+                    "family": entry.family.as_str(),
+                    "activation_dtype": entry.activation_dtype.as_str(),
+                    "weight_quant": entry.weight_quant.as_str(),
+                    "quantizer_revision": entry.q8.as_ref().map(|q8| q8.quantizer_revision.as_str()),
+                    "derived_digest": entry.q8.as_ref().map(|q8| q8.derived_digest.as_str()),
+                    "decode_fingerprint": decode_fingerprint.0,
+                    "processing_fingerprint": processing_fingerprint.0,
+                    "runtime_config_digest": runtime_config_digest,
+                    "constraint_runtime_identity": constraint
+                        .constraint
+                        .constraint_runtime_identity
+                        .digest(),
+                })
+            })
+            .collect::<Vec<_>>();
         println!(
             "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "decode_fingerprint": decode_fingerprint.0,
-                "processing_fingerprint": processing_fingerprint.0,
-                "runtime_config_digest": runtime_config_digest,
-                "constraint_runtime_identity": constraint
-                    .constraint
-                    .constraint_runtime_identity
-                    .digest(),
-            }))
-            .expect("identity tuple serializes")
+            serde_json::to_string_pretty(&identities).expect("identity tuples serialize")
         );
     }
 }

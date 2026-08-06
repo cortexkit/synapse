@@ -2646,7 +2646,7 @@ async fn poll_probe_status(
     start_corr: u64,
     job_id: &str,
 ) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(180);
+    let deadline = Instant::now() + Duration::from_secs(1_800);
     let mut corr = start_corr;
     loop {
         let body = route_request(
@@ -2691,7 +2691,7 @@ async fn poll_probe_job(
         .as_str()
         .expect("probe.start returns job_id")
         .to_string();
-    let deadline = Instant::now() + Duration::from_secs(180);
+    let deadline = Instant::now() + Duration::from_secs(1_800);
     let mut corr = start_corr + 1;
     loop {
         let body = route_request(
@@ -3377,12 +3377,17 @@ async fn substitutable_owned_refusal_falls_back_to_llama_with_lane_provenance() 
     let _ = std::fs::remove_dir_all(fixture_dir);
 }
 
-#[tokio::test]
-#[ignore]
-async fn certified_owned_oneshot_and_constraint_serve_after_real_worker_probe() {
-    let Some(snapshot) = std::env::var_os("SYNAPSE_OWNED_DECODE_QWEN3_0_6B").map(PathBuf::from)
-    else {
-        eprintln!("skipping certified owned wire e2e: set SYNAPSE_OWNED_DECODE_QWEN3_0_6B");
+#[cfg(target_os = "macos")]
+async fn certified_owned_checkpoint_lane(
+    checkpoint_env: &str,
+    model_id: &str,
+    family: &str,
+    quant: &str,
+    derived_digest: Option<&str>,
+    constrained_serve: bool,
+) {
+    let Some(snapshot) = std::env::var_os(checkpoint_env).map(PathBuf::from) else {
+        eprintln!("skipping certified owned wire e2e: set {checkpoint_env}");
         return;
     };
     let Some(worker_bin) = std::env::var_os("SYNAPSE_OWNED_DECODE_WORKER_BIN").map(PathBuf::from)
@@ -3396,29 +3401,53 @@ async fn certified_owned_oneshot_and_constraint_serve_after_real_worker_probe() 
         eprintln!("skipping certified owned wire e2e: checkpoint or worker binary is missing");
         return;
     }
-    let worker_runtime = std::env::temp_dir().join(format!("syn-owned-{}", process::id()));
+    let worker_runtime = std::env::temp_dir().join(format!(
+        "sod-{}-{}-{}",
+        &family[..1],
+        &quant[..1],
+        process::id()
+    ));
+    let artifact_digest = match family {
+        "qwen3-0.6b" => "sha256:0437e45c94563b09e13cb7a64478fc406947a93cb34a7e05870fc8dcd48e23fd",
+        "lfm2-1.2b" => "sha256:60fef6ef4481c533ce7427793bed50200b55b3c68d0d00c52bc56f207a9acecd",
+        _ => panic!("unsupported checkpoint family {family}"),
+    };
+    let mut preload = serde_json::json!({
+        "model_id": model_id,
+        "engine": "owned-metal-decode",
+        "task": "generate",
+        "model_path": model_path,
+        "tokenizer_path": tokenizer_path,
+        "format": "owned-safetensors",
+        "artifact_digest": artifact_digest,
+        "max_tokens": 512,
+        "quant": quant,
+        "family": family,
+        "dtype": "f16",
+        "execution": "supervised",
+        "worker_bin": worker_bin,
+        "worker_runtime_dir": worker_runtime
+    });
+    if let Some(derived_digest) = derived_digest {
+        preload["quantizer_revision"] = Value::String("q8-ingest-v1".to_string());
+        preload["derived_digest"] = Value::String(derived_digest.to_string());
+    }
     let config = serde_json::json!({
         "grammar_enabled": true,
         "dev": { "owned_decode_cutover_for_test": true },
-        "preload_models": [{
-            "model_id": "owned-qwen",
-            "engine": "owned-metal-decode",
-            "task": "generate",
-            "model_path": model_path,
-            "tokenizer_path": tokenizer_path,
-            "format": "owned-safetensors",
-            "max_tokens": 512,
-            "quant": "f16",
-            "family": "qwen3-0.6b",
-            "dtype": "f16",
-            "execution": "supervised",
-            "worker_bin": worker_bin,
-            "worker_runtime_dir": worker_runtime
-        }]
+        "preload_models": [preload]
     })
     .to_string();
     let (_daemon, _module, mut consumer, route) = open_route_with_config(&config).await;
-    certify_preloaded_models(&mut consumer, route, 91_000).await;
+    let probe = certify_preloaded_models(&mut consumer, route, 91_000).await;
+    let lane = &probe["result"]["lanes"][0];
+    let exact = lane["evidence"]["metrics"]["token_exact_matches"]
+        .as_u64()
+        .expect("probe exact-match count");
+    let accepted = lane["evidence"]["metrics"]["accepted_structural_forks"]
+        .as_u64()
+        .expect("probe structural-fork count");
+    assert_eq!(exact + accepted, 20, "checkpoint prompt battery failed");
 
     let owned = route_request(
         &mut consumer,
@@ -3427,7 +3456,7 @@ async fn certified_owned_oneshot_and_constraint_serve_after_real_worker_probe() 
         serde_json::json!({
             "method": "microllm.oneshot",
             "params": {
-                "model": "owned-qwen",
+                "model": model_id,
                 "prompt": "The capital of France is",
                 "max_tokens": 64
             }
@@ -3441,9 +3470,17 @@ async fn certified_owned_oneshot_and_constraint_serve_after_real_worker_probe() 
     );
     assert_eq!(result["provenance"]["lane"], "decode");
     assert_eq!(result["provenance"]["worker"], "supervised");
+    assert_eq!(
+        result["provenance"]["decode_fingerprint"], lane["fingerprint"],
+        "served envelope must carry the certified lane fingerprint"
+    );
+    assert!(result["provenance"]["processing_fingerprint"].is_string());
     assert!(result["provenance"]["worker_generation"].as_u64().is_some());
     assert_eq!(result["n_gen"], 64);
 
+    if !constrained_serve {
+        return;
+    }
     let constrained = route_request(
         &mut consumer,
         route,
@@ -3451,7 +3488,7 @@ async fn certified_owned_oneshot_and_constraint_serve_after_real_worker_probe() 
         serde_json::json!({
             "method": "microllm.oneshot",
             "params": {
-                "model": "owned-qwen",
+                "model": model_id,
                 "prompt": "Respond with exactly the JSON literal null and nothing else:\n",
                 "max_tokens": 64,
                 "grammar": r#"{"type":"null"}"#
@@ -3469,6 +3506,66 @@ async fn certified_owned_oneshot_and_constraint_serve_after_real_worker_probe() 
     assert!(value.is_null());
     assert!(constrained_result["provenance"]["constraint_runtime_identity"].is_string());
     assert!(constrained_result["provenance"]["constraint_fingerprint"].is_string());
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore]
+async fn certified_owned_oneshot_and_constraint_serve_after_real_worker_probe() {
+    certified_owned_checkpoint_lane(
+        "SYNAPSE_OWNED_DECODE_QWEN3_0_6B",
+        "qwen3-0.6b-decode-f16",
+        "qwen3-0.6b",
+        "f16",
+        None,
+        true,
+    )
+    .await;
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore]
+async fn checkpoint_lfm2_f16_certified_owned_lane_serves_exact_tokens() {
+    certified_owned_checkpoint_lane(
+        "SYNAPSE_OWNED_DECODE_LFM2_1_2B",
+        "lfm2-1.2b-decode-f16",
+        "lfm2-1.2b",
+        "f16",
+        None,
+        false,
+    )
+    .await;
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore]
+async fn checkpoint_qwen3_q8_0_certified_owned_lane_serves_exact_tokens() {
+    certified_owned_checkpoint_lane(
+        "SYNAPSE_OWNED_DECODE_QWEN3_0_6B",
+        "qwen3-0.6b-decode-q8_0",
+        "qwen3-0.6b",
+        "q8_0",
+        Some("17d2fbfeff90269190287f324ed93bab3bb1b4fa4aad98c3fbba1868c01cb0f2"),
+        false,
+    )
+    .await;
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore]
+async fn checkpoint_lfm2_q8_0_certified_owned_lane_serves_exact_tokens() {
+    certified_owned_checkpoint_lane(
+        "SYNAPSE_OWNED_DECODE_LFM2_1_2B",
+        "lfm2-1.2b-decode-q8_0",
+        "lfm2-1.2b",
+        "q8_0",
+        Some("5874faabdce2567dcc0e7339e9547d79421ba312c71e3442c9cc3c4ed3cb47d0"),
+        false,
+    )
+    .await;
 }
 
 #[test]

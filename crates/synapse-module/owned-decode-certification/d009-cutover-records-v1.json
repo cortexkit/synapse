@@ -61,6 +61,87 @@
         "grammar_enabled": true
       },
       "enabled": true
+    },
+    {
+      "record": {
+        "machine_profile_hash": "d2a0f3a69b1202d52fda33a4987b21b7176aaa52b42382cb4ad8e156e710943c",
+        "enabled_catalog_entry_ids": [
+          "lfm2-1.2b-decode-f16"
+        ],
+        "decode_fingerprints": [
+          "741e56178506918edd7ff91b7bf88214f97df974c3b5567196d0ce0cc594a8dd"
+        ],
+        "processing_fingerprints": [
+          "c0c4abf57f55d10cb4cbd8f2a031ccdce7d4c19435a7f96cf9dfb4a31c03d1b3"
+        ],
+        "constrained_runtime_identities": [
+          "3da6a5406be6c8fd2796eb872fc270a9fe75e6bd6bdb0bc92e4be7155f671080"
+        ],
+        "runtime_config_digest": "1a818f6e6a2c1cd4e6c1833f0c36b220181b5e3a87bb5b8aa859b197506b5b2c",
+        "fixture_registry_revision": "decode-fixture-registry-v1",
+        "context_bucket_manifest_revision": "decode-context-buckets-v1",
+        "scheduler_manifest_revision": "decode-sched-manifest-v1",
+        "certification_evidence_ids": [],
+        "wire_error_binding_revision": "owned-decode-wire-error-bindings-v1",
+        "acceptance_gate_evidence": [],
+        "grammar_enabled": true
+      },
+      "enabled": false,
+      "disabled_reason": "pending fleet certification of this lane"
+    },
+    {
+      "record": {
+        "machine_profile_hash": "d2a0f3a69b1202d52fda33a4987b21b7176aaa52b42382cb4ad8e156e710943c",
+        "enabled_catalog_entry_ids": [
+          "qwen3-0.6b-decode-q8_0"
+        ],
+        "decode_fingerprints": [
+          "4d0a846b33fdbbbc9032ead51e5d9c72af48e145f425cc5802b1205e44dc9e00"
+        ],
+        "processing_fingerprints": [
+          "6ed5c2a0b4d9499390810e82397f52ca37679a737e06cf967e1f3e23af8820e2"
+        ],
+        "constrained_runtime_identities": [
+          "3680cf2391bc7176f680d166397af428d7dffc9177ffd276c8561e5579fc07de"
+        ],
+        "runtime_config_digest": "dd82beef57ed82527e003aa4d2a4a2756d57cc935e848e352967756567084563",
+        "fixture_registry_revision": "decode-fixture-registry-v1",
+        "context_bucket_manifest_revision": "decode-context-buckets-v1",
+        "scheduler_manifest_revision": "decode-sched-manifest-v1",
+        "certification_evidence_ids": [],
+        "wire_error_binding_revision": "owned-decode-wire-error-bindings-v1",
+        "acceptance_gate_evidence": [],
+        "grammar_enabled": true
+      },
+      "enabled": false,
+      "disabled_reason": "pending fleet certification of this lane"
+    },
+    {
+      "record": {
+        "machine_profile_hash": "d2a0f3a69b1202d52fda33a4987b21b7176aaa52b42382cb4ad8e156e710943c",
+        "enabled_catalog_entry_ids": [
+          "lfm2-1.2b-decode-q8_0"
+        ],
+        "decode_fingerprints": [
+          "c4f0884cfa99e0c3e7c2403626e5363cb46645b6b51840d720e98539f9577f2f"
+        ],
+        "processing_fingerprints": [
+          "481057624ddba855bf1e961d2c66e995b31e0b95206c0315f0a3b76ba723ddec"
+        ],
+        "constrained_runtime_identities": [
+          "1f72095362e9101772d5a94cf02d88b323f8e2ab7b45da58a598ae2c7669cb71"
+        ],
+        "runtime_config_digest": "a2e380b8a786548c9bd979efcc2e2ca102a3c16bcf82df97704f082992bf8f9f",
+        "fixture_registry_revision": "decode-fixture-registry-v1",
+        "context_bucket_manifest_revision": "decode-context-buckets-v1",
+        "scheduler_manifest_revision": "decode-sched-manifest-v1",
+        "certification_evidence_ids": [],
+        "wire_error_binding_revision": "owned-decode-wire-error-bindings-v1",
+        "acceptance_gate_evidence": [],
+        "grammar_enabled": true
+      },
+      "enabled": false,
+      "disabled_reason": "pending fleet certification of this lane"
     }
   ]
 }
