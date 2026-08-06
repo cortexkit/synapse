@@ -36,6 +36,7 @@ use synapse_core::{
 };
 
 const ENGINE_VERSION: &str = "llama-cpp-2-0.1.151";
+const BACKEND_UNAVAILABLE_REASON: &str = "backend_unavailable";
 const MAX_BATCH_SEQUENCES: usize = 256;
 const DEFAULT_MAX_GENERATE_TOKENS: u32 = 512;
 const LLAMA_TOKEN_NULL: i32 = -1;
@@ -407,20 +408,28 @@ fn worker_request_loop<S: Read + Write>(
     Ok(max_frame)
 }
 
+fn compiled_backend() -> &'static str {
+    if cfg!(feature = "cuda") {
+        "cuda"
+    } else if cfg!(feature = "vulkan") {
+        "vulkan"
+    } else if cfg!(all(feature = "cpu", target_os = "macos")) {
+        // On macOS, the CPU feature selects Metal so the Metal dependency
+        // remains available in the default workspace build. On Linux and
+        // Windows, the CPU feature selects the CPU backend.
+        "metal"
+    } else {
+        "cpu"
+    }
+}
+
 fn engine_identity() -> EngineIdentity {
+    let backend = compiled_backend().to_string();
     let mut build_flags = BTreeMap::new();
     build_flags.insert("risk_class".to_string(), "abort_capable".to_string());
-    build_flags.insert(
-        "backend".to_string(),
-        if cfg!(target_os = "macos") {
-            "metal"
-        } else {
-            "cpu"
-        }
-        .to_string(),
-    );
+    build_flags.insert("backend".to_string(), backend);
     EngineIdentity {
-        engine: "llama.cpp".to_string(),
+        engine: "llama".to_string(),
         version: ENGINE_VERSION.to_string(),
         build_flags,
     }
@@ -438,6 +447,7 @@ fn handle_load(
         format == "gguf",
         "llama worker only loads gguf artifacts, got {format}"
     );
+    validate_requested_backend(runtime_config)?;
     let started = Instant::now();
     let path = Path::new(artifact_path);
     verify_digest(path, artifact_digest)?;
@@ -1061,16 +1071,39 @@ fn default_threads() -> usize {
 }
 
 fn default_gpu_layers() -> usize {
-    if cfg!(target_os = "macos") {
-        99
-    } else {
+    if compiled_backend() == "cpu" {
         0
+    } else {
+        99
     }
+}
+
+fn validate_requested_backend(values: &BTreeMap<String, String>) -> Result<()> {
+    let declared = values
+        .get("backend")
+        .or_else(|| values.get("compiled_backend"))
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let Some(declared) = declared else {
+        bail!("{BACKEND_UNAVAILABLE_REASON}: model manifest does not declare a compiled backend");
+    };
+    let compiled = compiled_backend();
+    ensure!(
+        declared == compiled,
+        "{BACKEND_UNAVAILABLE_REASON}: model requests backend '{declared}', but this worker was compiled with '{compiled}'"
+    );
+    Ok(())
 }
 
 fn classify_load_error(error: &anyhow::Error) -> &'static str {
     let message = error.to_string();
-    if message.contains("digest mismatch") || message.contains("only loads gguf") {
+    if message.contains(BACKEND_UNAVAILABLE_REASON) {
+        // `unsupported` is the wire status; the stable refusal reason remains
+        // in the message so capability reporting can distinguish this from a
+        // malformed artifact or runtime configuration.
+        "unsupported"
+    } else if message.contains("digest mismatch") || message.contains("only loads gguf") {
         "artifact_invalid"
     } else if message.contains("invalid") || message.contains("must be") {
         "config_invalid"
@@ -1105,4 +1138,39 @@ fn sha256_hex(path: &Path) -> io::Result<String> {
         hasher.update(&buffer[..read]);
     }
     Ok(hex::encode(hasher.finalize()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn handshake_identity_uses_canonical_engine_and_compiled_backend() {
+        let identity = engine_identity();
+        assert_eq!(identity.engine, "llama");
+        assert_eq!(
+            identity.build_flags.get("backend").map(String::as_str),
+            Some(compiled_backend())
+        );
+    }
+
+    #[test]
+    fn missing_backend_is_unsupported_and_backend_unavailable() {
+        let error = validate_requested_backend(&BTreeMap::new()).expect_err("backend is required");
+        assert!(error.to_string().contains(BACKEND_UNAVAILABLE_REASON));
+        assert_eq!(classify_load_error(&error), "unsupported");
+    }
+
+    #[test]
+    fn mismatched_backend_is_unsupported_and_backend_unavailable() {
+        let requested = if compiled_backend() == "cpu" {
+            "cuda"
+        } else {
+            "cpu"
+        };
+        let values = BTreeMap::from([(String::from("backend"), String::from(requested))]);
+        let error = validate_requested_backend(&values).expect_err("backend mismatch must refuse");
+        assert!(error.to_string().contains(BACKEND_UNAVAILABLE_REASON));
+        assert_eq!(classify_load_error(&error), "unsupported");
+    }
 }

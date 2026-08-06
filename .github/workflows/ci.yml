@@ -8,6 +8,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  LLAMA_BUILD_GATE_BUDGET_SECONDS: "900"
+  LLAMA_VULKAN_SDK_VERSION: "1.3.296.0"
   # Production crates gated by CI. Bench lanes are excluded on purpose:
   # heavy engine deps (burn, candle, python venvs) with no gate value.
   SYNAPSE_CRATES: -p synapse-core -p synapse-engine-ort -p synapse-module -p synapse-worker-llama -p owned-decode-worker -p synapse-worker-decode
@@ -183,6 +185,102 @@ jobs:
           fi
           cargo nextest run $crates $profile --retries 0
 
+      - name: Linux llama CPU build gate
+        if: matrix.name == 'linux'
+        working-directory: synapse
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p build-gates
+          command='cargo build -p synapse-worker-llama --no-default-features --features cpu --release'
+          log='build-gates/linux-x86_64-gnu-llama-cpu.output'
+          set +e
+          bash -c "$command" 2>&1 | tee "$log"
+          status=${PIPESTATUS[0]}
+          set -e
+          binary='target/release/ck-synapse-worker-llama'
+          digest='unavailable'
+          if [ -f "$binary" ]; then digest=$(sha256sum "$binary" | cut -d ' ' -f1); fi
+          {
+            echo "target_triple=x86_64-unknown-linux-gnu"
+            echo "command=$command"
+            echo "rustc=$(rustc --version)"
+            echo "cargo=$(cargo --version)"
+            echo "machine_image=${ImageOS:-unknown}"
+            echo "budget_seconds=$LLAMA_BUILD_GATE_BUDGET_SECONDS"
+            echo "binary=$binary"
+            echo "sha256=$digest"
+            echo "execution_status=$([ "$status" -eq 0 ] && echo executed_successful || echo failed)"
+            echo "successful_output=$log"
+          } > build-gates/linux-x86_64-gnu-llama-cpu.txt
+          if [ "$status" -ne 0 ]; then exit "$status"; fi
+
+      - name: Linux llama CUDA build gate
+        if: matrix.name == 'linux'
+        working-directory: synapse
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p build-gates
+          command='cargo build -p synapse-worker-llama --no-default-features --features cuda --release'
+          log='build-gates/linux-x86_64-gnu-llama-cuda.output'
+          set +e
+          bash -c "$command" 2>&1 | tee "$log"
+          status=${PIPESTATUS[0]}
+          set -e
+          binary='target/release/ck-synapse-worker-llama'
+          digest='unavailable'
+          if [ -f "$binary" ]; then digest=$(sha256sum "$binary" | cut -d ' ' -f1); fi
+          {
+            echo "target_triple=x86_64-unknown-linux-gnu"
+            echo "command=$command"
+            echo "rustc=$(rustc --version)"
+            echo "cargo=$(cargo --version)"
+            echo "cuda_toolkit=$(nvcc --version 2>&1 || true)"
+            echo "machine_image=${ImageOS:-unknown}"
+            echo "budget_seconds=$LLAMA_BUILD_GATE_BUDGET_SECONDS"
+            echo "binary=$binary"
+            echo "sha256=$digest"
+            echo "execution_status=$([ "$status" -eq 0 ] && echo executed_successful || echo failed)"
+            echo "successful_output=$log"
+          } > build-gates/linux-x86_64-gnu-llama-cuda.txt
+          if [ "$status" -ne 0 ]; then exit "$status"; fi
+
+      - name: Windows llama CPU build gate
+        if: matrix.name == 'windows'
+        working-directory: synapse
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force build-gates | Out-Null
+          $command = 'cargo build -p synapse-worker-llama --no-default-features --features cpu --release'
+          $log = 'build-gates/windows-x86_64-msvc-llama-cpu.output'
+          & cargo build -p synapse-worker-llama --no-default-features --features cpu --release 2>&1 | Tee-Object -FilePath $log
+          $status = $LASTEXITCODE
+          $binary = 'target/release/ck-synapse-worker-llama.exe'
+          $digest = if (Test-Path $binary) { (Get-FileHash $binary -Algorithm SHA256).Hash.ToLowerInvariant() } else { 'unavailable' }
+          $execution = if ($status -eq 0) { 'executed_successful' } else { 'failed' }
+          @"
+          target_triple=x86_64-pc-windows-msvc
+          command=$command
+          rustc=$(rustc --version)
+          cargo=$(cargo --version)
+          machine_image=$env:ImageOS
+          budget_seconds=$env:LLAMA_BUILD_GATE_BUDGET_SECONDS
+          binary=$binary
+          sha256=$digest
+          execution_status=$execution
+          successful_output=$log
+          "@ | Set-Content build-gates/windows-x86_64-msvc-llama-cpu.txt
+          if ($status -ne 0) { exit $status }
+
+      - name: Retain llama build-gate evidence
+        if: always() && (matrix.name == 'linux' || matrix.name == 'windows')
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-build-gates-${{ matrix.name }}-${{ github.run_id }}
+          path: synapse/build-gates
+          if-no-files-found: ignore
+
       # Hollow-green guard: fixture e2e "pass" with a skip message when the
       # snapshot is missing; fail the lane loudly instead of shipping air.
       - name: Assert no silently-skipped e2e
@@ -234,3 +332,90 @@ jobs:
           cargo nextest run -p synapse-worker-decode --test worker_transport -E 'test(checkpoint_worker_socket_is_token_exact_and_carries_compiled_constraint)' --run-ignored ignored-only --retries 0 --no-capture
           cargo nextest run -p synapse-worker-decode --test worker_transport -E 'test(checkpoint_worker_crash_redispatches_once_then_quarantines)' --run-ignored ignored-only --retries 0 --no-capture
           cargo nextest run -p synapse-module --test skeleton_e2e -E 'test(certified_owned_oneshot_and_constraint_serve_after_real_worker_probe)' --run-ignored ignored-only --retries 0 --no-capture
+
+  windows-llama-vulkan-manual:
+    if: github.event_name == 'workflow_dispatch'
+    name: windows-llama-vulkan-manual-gate
+    runs-on: blacksmith-4vcpu-windows-2025
+    steps:
+      - name: Create cross-repo token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.CK_CI_APP_ID }}
+          private-key: ${{ secrets.CK_CI_APP_PRIVATE_KEY }}
+          owner: cortexkit
+          repositories: synapse,subconscious,commons
+
+      - name: Checkout synapse
+        uses: actions/checkout@v4
+        with:
+          path: synapse
+
+      - name: Checkout subconscious (sibling)
+        uses: actions/checkout@v4
+        with:
+          repository: cortexkit/subconscious
+          token: ${{ steps.app-token.outputs.token }}
+          path: subconscious
+
+      - name: Checkout commons (sibling)
+        uses: actions/checkout@v4
+        with:
+          repository: cortexkit/commons
+          token: ${{ steps.app-token.outputs.token }}
+          path: commons
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Require pinned Vulkan SDK
+        shell: pwsh
+        env:
+          EXPECTED_VULKAN_SDK: ${{ env.LLAMA_VULKAN_SDK_VERSION }}
+        run: |
+          if (-not $env:VULKAN_SDK) { throw 'mandatory manual gate requires VULKAN_SDK' }
+          if ($env:VULKAN_SDK -notmatch [regex]::Escape($env:EXPECTED_VULKAN_SDK)) {
+            throw "VULKAN_SDK must contain pinned revision $env:EXPECTED_VULKAN_SDK"
+          }
+          if (-not (Test-Path "$env:VULKAN_SDK\Include\vulkan\vulkan.h")) {
+            throw "Vulkan headers are missing from $env:VULKAN_SDK"
+          }
+
+      - name: Windows llama Vulkan manual build gate
+        working-directory: synapse
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force build-gates | Out-Null
+          $command = 'cargo build -p synapse-worker-llama --no-default-features --features vulkan --release'
+          $log = 'build-gates/windows-x86_64-msvc-llama-vulkan.output'
+          & cargo build -p synapse-worker-llama --no-default-features --features vulkan --release 2>&1 | Tee-Object -FilePath $log
+          $status = $LASTEXITCODE
+          $binary = 'target/release/ck-synapse-worker-llama.exe'
+          $digest = if (Test-Path $binary) { (Get-FileHash $binary -Algorithm SHA256).Hash.ToLowerInvariant() } else { 'unavailable' }
+          $execution = if ($status -eq 0) { 'executed_successful' } else { 'failed' }
+          @"
+          target_triple=x86_64-pc-windows-msvc
+          command=$command
+          rustc=$(rustc --version)
+          cargo=$(cargo --version)
+          vulkan_sdk=$env:VULKAN_SDK
+          vulkan_sdk_revision=$env:LLAMA_VULKAN_SDK_VERSION
+          machine_image=$env:ImageOS
+          budget_seconds=$env:LLAMA_BUILD_GATE_BUDGET_SECONDS
+          binary=$binary
+          sha256=$digest
+          execution_status=$execution
+          successful_output=$log
+          manual_gate=mandatory
+          "@ | Set-Content build-gates/windows-x86_64-msvc-llama-vulkan.txt
+          if ($status -ne 0) { exit $status }
+
+      - name: Retain Windows Vulkan gate evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-build-gates-windows-vulkan-manual-${{ github.run_id }}
+          path: synapse/build-gates
+          if-no-files-found: error
