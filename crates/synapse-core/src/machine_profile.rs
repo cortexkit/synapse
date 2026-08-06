@@ -82,6 +82,13 @@ impl MachineProfile {
         hasher.update(self.stable_bytes());
         hex::encode(hasher.finalize())
     }
+
+    /// Hash used by new certification records. The explicit revision prevents
+    /// future profile-field additions from silently reusing old evidence.
+    #[must_use]
+    pub fn revisioned_hash(&self) -> String {
+        crate::revisioned_machine_profile_hash(&self.stable_bytes())
+    }
 }
 
 fn os_build() -> String {

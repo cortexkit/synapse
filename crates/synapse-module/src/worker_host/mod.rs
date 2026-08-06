@@ -25,10 +25,10 @@ use owned_decode_worker::{
 };
 use serde::Serialize;
 use synapse_core::{
-    accept_worker_handshake, decode_f32_frame, encode_i32_frame, prepare_listener, read_json,
-    read_raw, write_json, write_raw, EmbedEngine, EngineError, EngineErrorStage, EngineIdentity,
-    EngineRiskClass, GenerateEngine, GenerateOutput, GenerateRequest, LoadedModel, RerankEngine,
-    RerankRequest, RerankScores, RuntimeConfig, TokenBatch, TokenIds, TransportError,
+    accept_worker_handshake_with_engine, decode_f32_frame, encode_i32_frame, prepare_listener,
+    read_json, read_raw, write_json, write_raw, EmbedEngine, EngineError, EngineErrorStage,
+    EngineIdentity, EngineRiskClass, GenerateEngine, GenerateOutput, GenerateRequest, LoadedModel,
+    RerankEngine, RerankRequest, RerankScores, RuntimeConfig, TokenBatch, TokenIds, TransportError,
     ValidatedArtifact, Vector, Vectors, WorkerCandidate, WorkerPooling, WorkerRequest,
     WorkerResponse, WorkerTokenItem, WorkerTransportStream, DEFAULT_MAX_FRAME_BYTES,
 };
@@ -81,6 +81,11 @@ pub struct WorkerHostConfig {
     pub extra_args: Vec<String>,
     pub pooling: WorkerPooling,
     pub normalize: bool,
+    /// Optional catalog identity used by engines that share this generic host.
+    pub engine_identity: Option<EngineIdentity>,
+    /// Owned-CUDA has one process per stable model specification. Including
+    /// the worker id in the crash key keeps equal artifacts isolated.
+    pub isolate_crash_key_by_worker_id: bool,
 }
 
 impl WorkerHostConfig {
@@ -98,6 +103,8 @@ impl WorkerHostConfig {
             extra_args: Vec::new(),
             pooling: WorkerPooling::Mean,
             normalize: true,
+            engine_identity: None,
+            isolate_crash_key_by_worker_id: false,
         }
     }
 }
@@ -233,7 +240,13 @@ impl WorkerHost {
         cfg: &RuntimeConfig,
     ) -> Result<LoadedModel, WorkerHostError> {
         let artifact_path = artifact_path(cfg)?;
-        let crash_key = crash_key(&artifact_path, cfg);
+        let crash_key = crash_key(
+            &artifact_path,
+            cfg,
+            self.config
+                .isolate_crash_key_by_worker_id
+                .then_some(self.config.worker_id.as_str()),
+        );
         if self.quarantined.contains(&crash_key) {
             return Err(WorkerHostError::Quarantined { key: crash_key });
         }
@@ -720,11 +733,17 @@ impl WorkerHost {
             spawn_pipe_reader("[stdout] ", stdout, logs.clone());
         }
 
-        let stream = match accept_worker_handshake(
+        let expected_engine = self
+            .config
+            .engine_identity
+            .as_ref()
+            .map(|identity| identity.engine.as_str());
+        let stream = match accept_worker_handshake_with_engine(
             listener,
             &nonce,
             self.config.max_frame,
             self.config.handshake_timeout,
+            expected_engine,
         )
         .await
         {
@@ -998,8 +1017,20 @@ impl Drop for WorkerEngine {
     }
 }
 
+impl WorkerEngine {
+    fn configured_identity(&self) -> Option<EngineIdentity> {
+        self.host
+            .lock()
+            .ok()
+            .and_then(|host| host.config.engine_identity.clone())
+    }
+}
+
 impl EmbedEngine for WorkerEngine {
     fn identity(&self) -> EngineIdentity {
+        if let Some(identity) = self.configured_identity() {
+            return identity;
+        }
         let mut build_flags = BTreeMap::new();
         build_flags.insert("risk_class".to_string(), "abort_capable".to_string());
         build_flags.insert(
@@ -1555,12 +1586,15 @@ fn artifact_path(cfg: &RuntimeConfig) -> Result<PathBuf, WorkerHostError> {
         })
 }
 
-fn crash_key(path: &Path, cfg: &RuntimeConfig) -> String {
+fn crash_key(path: &Path, cfg: &RuntimeConfig, worker_id: Option<&str>) -> String {
     let mut values = cfg.values.clone();
     values.insert(
         "artifact_path".to_string(),
         path.to_string_lossy().to_string(),
     );
+    if let Some(worker_id) = worker_id {
+        values.insert("stable_model_worker_id".to_string(), worker_id.to_string());
+    }
     serde_json::to_string(&values).unwrap_or_else(|_| path.to_string_lossy().to_string())
 }
 
@@ -1713,7 +1747,7 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let error: WorkerHostError = accept_worker_handshake(
+        let error: WorkerHostError = synapse_core::accept_worker_handshake(
             listener,
             "expectednonce000",
             DEFAULT_MAX_FRAME_BYTES,
@@ -1726,6 +1760,19 @@ mod tests {
             matches!(error, WorkerHostError::Protocol(message) if message.contains("rejected worker HELLO"))
         );
         client.await.unwrap();
+    }
+
+    #[test]
+    fn owned_cuda_model_ids_isolate_crash_keys_for_equal_specs() {
+        let path = PathBuf::from("/models/shared.safetensors");
+        let mut runtime = RuntimeConfig::default();
+        runtime
+            .values
+            .insert("runtime_revision".to_string(), "v1".to_string());
+        let first = crash_key(&path, &runtime, Some("synapse-owned-cuda-first"));
+        let second = crash_key(&path, &runtime, Some("synapse-owned-cuda-second"));
+        assert_ne!(first, second);
+        assert!(first.contains("stable_model_worker_id"));
     }
 
     #[test]
