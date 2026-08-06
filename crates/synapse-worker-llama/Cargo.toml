@@ -7,6 +7,14 @@ license.workspace = true
 description = "Synapse supervised llama.cpp worker binary."
 publish = false
 
+[features]
+# Keep the ordinary workspace build on the CPU lane. GPU gates must opt into
+# exactly one backend with --no-default-features.
+default = ["cpu"]
+cpu = []
+cuda = ["llama-cpp-2/cuda", "llama-cpp-sys-2/cuda"]
+vulkan = ["llama-cpp-2/vulkan", "llama-cpp-sys-2/vulkan"]
+
 [[bin]]
 # ck-* prefix: fleet Activity Monitor grouping convention.
 name = "ck-synapse-worker-llama"

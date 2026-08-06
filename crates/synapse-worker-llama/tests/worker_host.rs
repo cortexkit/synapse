@@ -201,6 +201,7 @@ fn worker_runtime_config(gguf: &Path) -> RuntimeConfig {
         "artifact_path".to_string(),
         gguf.to_string_lossy().to_string(),
     );
+    values.insert("backend".to_string(), worker_backend().to_string());
     values.insert("pooling_implementation".to_string(), "manual".to_string());
     values.insert("forward_pass".to_string(), "encode".to_string());
     values.insert("ctx_size".to_string(), "512".to_string());
@@ -209,12 +210,25 @@ fn worker_runtime_config(gguf: &Path) -> RuntimeConfig {
     RuntimeConfig { values }
 }
 
+fn worker_backend() -> &'static str {
+    if cfg!(feature = "cuda") {
+        "cuda"
+    } else if cfg!(feature = "vulkan") {
+        "vulkan"
+    } else if cfg!(target_os = "macos") {
+        "metal"
+    } else {
+        "cpu"
+    }
+}
+
 fn generate_runtime_config(gguf: &Path) -> RuntimeConfig {
     let mut values = BTreeMap::new();
     values.insert(
         "artifact_path".to_string(),
         gguf.to_string_lossy().to_string(),
     );
+    values.insert("backend".to_string(), worker_backend().to_string());
     values.insert("ctx_size".to_string(), "1024".to_string());
     values.insert("batch_size".to_string(), "1024".to_string());
     values.insert("ubatch_size".to_string(), "512".to_string());
