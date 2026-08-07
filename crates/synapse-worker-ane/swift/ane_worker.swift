@@ -56,7 +56,10 @@ private struct Main {
                 "v": protocolVersion,
                 "nonce": args.nonce,
                 "engine": [
-                    "engine": "ane-coreml",
+                    // Must match the host's catalog identity for the ane engine
+                    // (worker_catalog_identity in the module): the HELLO handshake
+                    // validates this name strictly.
+                    "engine": "ane-coreml-worker",
                     "version": engineVersion,
                     "build_flags": [
                         "risk_class": "abort_capable",

@@ -23,7 +23,7 @@
     },
     {
       "record": {
-        "machine_profile_hash": "d2a0f3a69b1202d52fda33a4987b21b7176aaa52b42382cb4ad8e156e710943c",
+        "machine_profile_hash": "8abf42a2f0e34573ba042be75aa13c1b20d159ca7fe11e1d44cd9aeed37530d8",
         "enabled_catalog_entry_ids": [
           "qwen3-0.6b-decode-f16"
         ],
@@ -41,7 +41,7 @@
         "context_bucket_manifest_revision": "decode-context-buckets-v1",
         "scheduler_manifest_revision": "decode-sched-manifest-v1",
         "certification_evidence_ids": [
-          "cert-row:d2a0f3a69b1202d52fda33a4987b21b7176aaa52b42382cb4ad8e156e710943c:8bcb6dfc1bd55a38a56b5a6931132f428687e064104d106c2cc5efb898f80feb:ab2c6768a1c77f36a520db10bf2b6a2185414d9c39ce8a0154a75e9375b02116"
+          "cert-row:8abf42a2f0e34573ba042be75aa13c1b20d159ca7fe11e1d44cd9aeed37530d8:8bcb6dfc1bd55a38a56b5a6931132f428687e064104d106c2cc5efb898f80feb:ab2c6768a1c77f36a520db10bf2b6a2185414d9c39ce8a0154a75e9375b02116"
         ],
         "wire_error_binding_revision": "owned-decode-wire-error-bindings-v1",
         "acceptance_gate_evidence": [
@@ -64,7 +64,7 @@
     },
     {
       "record": {
-        "machine_profile_hash": "d2a0f3a69b1202d52fda33a4987b21b7176aaa52b42382cb4ad8e156e710943c",
+        "machine_profile_hash": "8abf42a2f0e34573ba042be75aa13c1b20d159ca7fe11e1d44cd9aeed37530d8",
         "enabled_catalog_entry_ids": [
           "lfm2-1.2b-decode-f16"
         ],
@@ -91,7 +91,7 @@
     },
     {
       "record": {
-        "machine_profile_hash": "d2a0f3a69b1202d52fda33a4987b21b7176aaa52b42382cb4ad8e156e710943c",
+        "machine_profile_hash": "8abf42a2f0e34573ba042be75aa13c1b20d159ca7fe11e1d44cd9aeed37530d8",
         "enabled_catalog_entry_ids": [
           "qwen3-0.6b-decode-q8_0"
         ],
@@ -118,7 +118,7 @@
     },
     {
       "record": {
-        "machine_profile_hash": "d2a0f3a69b1202d52fda33a4987b21b7176aaa52b42382cb4ad8e156e710943c",
+        "machine_profile_hash": "8abf42a2f0e34573ba042be75aa13c1b20d159ca7fe11e1d44cd9aeed37530d8",
         "enabled_catalog_entry_ids": [
           "lfm2-1.2b-decode-q8_0"
         ],
