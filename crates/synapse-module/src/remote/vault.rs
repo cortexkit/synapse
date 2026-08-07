@@ -7,7 +7,7 @@ use tokio::sync::Mutex;
 
 use super::runtime::{CredentialToken, VaultCredentialClient, VaultError};
 
-const CREDENTIALS_MODULE_ID: &str = "cortexkit-credentials";
+const CREDENTIALS_MODULE_ID: &str = "claustrum";
 const VAULT_MIN_TTL_MS: u64 = 600_000;
 const VAULT_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 const VAULT_ROUTE_READY_TIMEOUT: Duration = Duration::from_secs(1);

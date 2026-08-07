@@ -25,7 +25,7 @@
 **Remote Gateway (`crates/synapse-module/src/remote`):**
 - Purpose: Executes remote provider dispatch through interactive-first turnover pools, circuit breakers, and loopback-verified clients.
 - Location: `crates/synapse-module/src/remote`
-- Contains: `ProviderRuntime`, client dispatch, vault credential management via `cortexkit-credentials` SubC route, HTTP validators, mock provider e2e, and checkpoint-driven continuity logic.
+- Contains: `ProviderRuntime`, client dispatch, vault credential management via the `claustrum` SubC route, HTTP validators, mock provider e2e, and checkpoint-driven continuity logic.
 - Depends on: `synapse-core`, `subc-client-rs`, `reqwest`.
 
 **Synapse Owned Engine (`synapse-engine-owned`):**
