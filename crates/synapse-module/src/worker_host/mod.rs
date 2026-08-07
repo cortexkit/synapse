@@ -719,6 +719,16 @@ impl WorkerHost {
         for arg in &self.config.extra_args {
             command.arg(arg);
         }
+        let expected_engine = self
+            .config
+            .engine_identity
+            .as_ref()
+            .map(|identity| identity.engine.as_str());
+        if let Some(expected_engine) = expected_engine {
+            // The timeout test worker exercises several catalog engines; pass
+            // the expected identity without weakening the host-side handshake.
+            command.env("SYNAPSE_WORKER_EXPECTED_ENGINE", expected_engine);
+        }
         let mut child = command.spawn().map_err(|error| {
             WorkerHostError::Protocol(format!(
                 "spawn worker {}: {error}",
@@ -733,11 +743,6 @@ impl WorkerHost {
             spawn_pipe_reader("[stdout] ", stdout, logs.clone());
         }
 
-        let expected_engine = self
-            .config
-            .engine_identity
-            .as_ref()
-            .map(|identity| identity.engine.as_str());
         let stream = match accept_worker_handshake_with_engine(
             listener,
             &nonce,

@@ -36,12 +36,17 @@ fn optional_milliseconds(name: &str) -> Result<u64> {
     }
 }
 
+/// The timeout worker is shared by tests for several catalog engines. Match
+/// the host's expected identity so the mock exercises request behavior instead
+/// of being rejected during the catalog identity handshake.
 fn worker_hello(nonce: String) -> WorkerHello {
+    let engine = std::env::var("SYNAPSE_WORKER_EXPECTED_ENGINE")
+        .unwrap_or_else(|_| "timeout-mock".to_string());
     WorkerHello {
         v: WORKER_PROTOCOL_VERSION,
         nonce,
         engine: EngineIdentity {
-            engine: "timeout-mock".to_string(),
+            engine,
             version: "test".to_string(),
             build_flags: Default::default(),
         },
