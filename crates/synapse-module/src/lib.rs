@@ -82,7 +82,8 @@ use subc_protocol::{
 use synapse_core::{
     evaluate_cuda_floor, owned_cuda_engine_identity, worker_binary_env_var,
     worker_engine_names::{
-        ANE_WORKER_ENGINE, DECODE_WORKER_ENGINE, LLAMA_WORKER_ENGINE, MLX_WORKER_ENGINE,
+        ANE_WORKER_ENGINE, DECODE_WORKER_ENGINE, LLAMA_ENGINE, LLAMA_WORKER_ENGINE,
+        MLX_WORKER_ENGINE,
     },
     worker_runtime_dir_env_var, AdmissionDecision, AdmissionRequest, AliasTable, CacheGcOutcome,
     CertifiedShapeEnvelope, Clock, CudaFloorDecision, EmbedEngine, EngineError, EngineErrorStage,
@@ -463,6 +464,8 @@ struct PreloadModelConfig {
     max_tokens: Option<usize>,
     #[serde(default)]
     quant: Option<String>,
+    #[serde(default)]
+    backend: Option<String>,
     #[serde(default)]
     family: Option<String>,
     #[serde(default)]
@@ -1665,6 +1668,9 @@ fn build_preload_catalog_model(
             .map(|profile| profile.dtype.as_str().to_string())
             .unwrap_or_else(|| default_quant(&engine_name))
     });
+    let declared_llama_backend = (engine_name == LLAMA_ENGINE)
+        .then(|| preload.backend.clone())
+        .flatten();
     let mut spec = build_stored_model_config(
         model_id,
         &engine_name,
@@ -1692,6 +1698,11 @@ fn build_preload_catalog_model(
         inline,
         jobs,
     )?;
+    if let Some(backend) = declared_llama_backend {
+        spec.engine_identity
+            .build_flags
+            .insert("backend".to_string(), backend);
+    }
     if engine_name == "owned-metal-decode" {
         use owned_decode_routing::identity::WeightQuant;
 
@@ -1828,6 +1839,9 @@ fn normalize_catalog_model(
     } else {
         None
     };
+    let declared_llama_backend = (engine_name == LLAMA_ENGINE)
+        .then(|| model.engine_identity.build_flags.get("backend").cloned())
+        .flatten();
     let mut spec = build_stored_model_config(
         model.model_id,
         &engine_name,
@@ -1851,6 +1865,11 @@ fn normalize_catalog_model(
         inline,
         jobs,
     )?;
+    if let Some(backend) = declared_llama_backend {
+        spec.engine_identity
+            .build_flags
+            .insert("backend".to_string(), backend);
+    }
     if let Some((family, dtype, execution, build_flags)) = decode_metadata {
         spec.owned_family = family;
         spec.owned_dtype = dtype.or_else(|| Some("f16".to_string()));
@@ -1936,7 +1955,7 @@ fn build_stored_model_config(
             Some(OwnedDType::F16) => NumericDType::F16,
             Some(OwnedDType::F32) => NumericDType::F32,
             None => match engine_name {
-                "llama" | "ane" => NumericDType::F16,
+                LLAMA_ENGINE | "ane" => NumericDType::F16,
                 "mlx" => NumericDType::Bf16,
                 _ => NumericDType::F32,
             },
@@ -2155,7 +2174,7 @@ fn canonical_engine_name(engine: &str) -> String {
 
 fn default_artifact_format(engine_name: &str) -> String {
     match engine_name {
-        "llama" => "gguf".to_string(),
+        LLAMA_ENGINE => "gguf".to_string(),
         "mlx" => "safetensors".to_string(),
         "ane" => "mlmodelc".to_string(),
         "owned-metal" => "safetensors-package".to_string(),
@@ -2167,7 +2186,7 @@ fn default_artifact_format(engine_name: &str) -> String {
 
 fn default_quant(engine_name: &str) -> String {
     match engine_name {
-        "llama" => "f16".to_string(),
+        LLAMA_ENGINE => "f16".to_string(),
         "mlx" => "bf16".to_string(),
         "ane" => "fp16".to_string(),
         "owned-metal" | "owned-cuda" | "owned-metal-decode" => "f16".to_string(),
@@ -2178,7 +2197,7 @@ fn default_quant(engine_name: &str) -> String {
 fn catalog_model_engine_identity(engine_name: &str) -> Result<EngineIdentity, ModuleError> {
     match engine_name {
         "ort" => Ok(OrtEmbedEngine::new().identity()),
-        "llama" => Ok(worker_catalog_identity(
+        LLAMA_ENGINE => Ok(worker_catalog_identity(
             LLAMA_WORKER_ENGINE,
             "protocol-v1",
             &[("transport", worker_catalog_transport())],
@@ -3236,7 +3255,7 @@ fn load_catalog_model_blocking(
             },
             None,
         ),
-        "llama" | "mlx" | "ane" => {
+        LLAMA_ENGINE | "mlx" | "ane" => {
             let (backend, loaded) = load_worker_backend_blocking(
                 &spec,
                 &artifact,
@@ -3470,6 +3489,20 @@ fn model_runtime_config(
         "microllm_max_tokens".to_string(),
         microllm_max_tokens.to_string(),
     );
+    if spec.engine == LLAMA_ENGINE {
+        let backend = spec
+            .engine_identity
+            .build_flags
+            .get("backend")
+            .cloned()
+            .unwrap_or_else(|| {
+                // Legacy catalog rows predate backend identity. The default worker
+                // build selects Metal on macOS and CPU elsewhere, so this declaration
+                // cannot mismatch the worker's default build on the same platform.
+                default_llama_backend().to_string()
+            });
+        runtime_config.values.insert("backend".to_string(), backend);
+    }
     if spec.engine == "owned-cuda" {
         runtime_config.values.insert(
             "backend".to_string(),
@@ -3529,6 +3562,50 @@ fn model_runtime_config(
         );
     }
     runtime_config
+}
+
+fn default_llama_backend() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "metal"
+    } else {
+        "cpu"
+    }
+}
+
+/// Build a llama runtime configuration through the same catalog path used by
+/// production preloads, without loading a model artifact.
+#[doc(hidden)]
+pub fn llama_backend_contract_runtime_config(
+    model_path: &Path,
+    tokenizer_path: &Path,
+    declared_backend: Option<&str>,
+) -> Result<RuntimeConfig, String> {
+    let preload: PreloadModelConfig = serde_json::from_value(json!({
+        "model_id": "backend-contract-llama",
+        "engine": LLAMA_ENGINE,
+        "task": "embed",
+        "model_path": model_path,
+        "tokenizer_path": tokenizer_path,
+        "format": "gguf",
+        "pooling": "mean",
+        "normalize": true,
+        "max_tokens": 512,
+        "quant": "f16",
+        "backend": declared_backend
+    }))
+    .map_err(|error| error.to_string())?;
+    let spec =
+        build_preload_catalog_model(0, preload, &InlineConfig::default(), &JobConfig::default())
+            .map_err(|error| error.to_string())?;
+    let spec = normalize_catalog_model(spec, &InlineConfig::default(), &JobConfig::default())
+        .map_err(|error| error.to_string())?;
+    Ok(model_runtime_config(
+        &spec,
+        model_path,
+        &[],
+        Path::new("/tmp/synapse-backend-contract-cache"),
+        DEFAULT_MICROLLM_MAX_TOKENS,
+    ))
 }
 
 struct LocatedAsset {
@@ -6342,7 +6419,7 @@ async fn route_owned_decode_wire(
                 .map(|slot| &slot.spec)
                 .find(|candidate| {
                     candidate.model_id != model_id
-                        && candidate.engine == "llama"
+                        && candidate.engine == LLAMA_ENGINE
                         && candidate.task == ModelTask::Generate.as_str()
                 })
                 .cloned()
@@ -10915,7 +10992,7 @@ fn parse_model_task(
         Some(value) => value,
         None => {
             let lower_model_id = model_id.to_ascii_lowercase();
-            inferred = if engine_name == "llama" || engine_name == "llama.cpp" {
+            inferred = if engine_name == LLAMA_ENGINE || engine_name == "llama.cpp" {
                 if lower_model_id.contains("rerank") {
                     "rerank"
                 } else if lower_model_id.contains("generate")
@@ -11640,7 +11717,7 @@ mod tests {
         assert_eq!(ane.token_budget, 512 * MAX_ENGINE_BATCH_ITEMS as u64);
 
         assert!(recommended_batch_for_engine("ort", 512).is_none());
-        assert!(recommended_batch_for_engine("llama", 512).is_none());
+        assert!(recommended_batch_for_engine(LLAMA_ENGINE, 512).is_none());
     }
 
     #[test]

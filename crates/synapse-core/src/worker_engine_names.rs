@@ -4,6 +4,8 @@
 //! and consumer must use the same constant so a catalog rename cannot leave a
 //! worker announcing a different name than the host expects.
 
+/// The catalog engine name used by llama model specifications.
+pub const LLAMA_ENGINE: &str = "llama";
 /// The HELLO identity announced by the llama.cpp worker.
 pub const LLAMA_WORKER_ENGINE: &str = "llama.cpp-worker";
 /// The HELLO identity announced by the MLX worker.

@@ -1188,4 +1188,81 @@ mod tests {
         assert!(error.to_string().contains(BACKEND_UNAVAILABLE_REASON));
         assert_eq!(classify_load_error(&error), "unsupported");
     }
+
+    #[test]
+    fn module_runtime_config_satisfies_worker_backend_contract_without_assets() {
+        use std::{
+            fs,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+        use tokenizers::{models::bpe::BPE, Tokenizer};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "synapse-llama-backend-contract-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("create contract-test directory");
+        let model_path = root.join("model.gguf");
+        let tokenizer_path = root.join("tokenizer.json");
+        fs::write(
+            &model_path,
+            b"not a model; catalog construction only hashes this file",
+        )
+        .expect("write contract-test model placeholder");
+
+        let tokenizer = Tokenizer::new(BPE::default());
+        tokenizer
+            .save(&tokenizer_path, false)
+            .expect("write contract-test tokenizer");
+
+        let backend = compiled_backend();
+        let config = synapse_module::llama_backend_contract_runtime_config(
+            &model_path,
+            &tokenizer_path,
+            Some(backend),
+        )
+        .expect("module should build the llama runtime config");
+        assert_eq!(
+            config.values.get("backend").map(String::as_str),
+            Some(backend),
+            "the producer must pass the certified backend declaration to the worker"
+        );
+        validate_requested_backend(&config.values)
+            .expect("the worker must accept the module's matching declaration");
+
+        let legacy_config = synapse_module::llama_backend_contract_runtime_config(
+            &model_path,
+            &tokenizer_path,
+            None,
+        )
+        .expect("module should build a legacy llama runtime config");
+        let default_backend = if cfg!(target_os = "macos") {
+            "metal"
+        } else {
+            "cpu"
+        };
+        assert_eq!(
+            legacy_config.values.get("backend").map(String::as_str),
+            Some(default_backend),
+            "legacy rows must use the default worker declaration"
+        );
+
+        let mut missing_declaration = config.values.clone();
+        missing_declaration.remove("backend");
+        missing_declaration.remove("compiled_backend");
+        let error = validate_requested_backend(&missing_declaration)
+            .expect_err("a missing declaration must be refused");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "{BACKEND_UNAVAILABLE_REASON}: model manifest does not declare a compiled backend"
+            )
+        );
+
+        fs::remove_dir_all(root).expect("remove contract-test directory");
+    }
 }
