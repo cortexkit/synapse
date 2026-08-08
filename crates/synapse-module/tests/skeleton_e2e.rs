@@ -14,8 +14,9 @@ use std::{
 };
 
 use common::{
-    connect_consumer, raw_route_frame, read_frame_timeout, route_open, route_request,
-    unique_temp_dir, wait_for_catalog, TestRoute, MODULE_ID, SETUP_TIMEOUT,
+    configure_test_module_command, connect_consumer, raw_route_frame, read_frame_timeout,
+    route_open, route_request, unique_temp_dir, wait_for_catalog, TestRoute, MODULE_ID,
+    SETUP_TIMEOUT,
 };
 use rusqlite::{params, Connection};
 use serde_json::Value;
@@ -301,21 +302,6 @@ fn spawn_synapse_module_with_env(
     config_json: Option<&str>,
     extra_env: &[(&str, &str)],
 ) -> ModuleProcess {
-    let lease_root = unique_temp_dir("synapse-module-lease");
-    std::fs::create_dir_all(&lease_root).unwrap();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_ck-synapse"));
-    command
-        .arg("--subc")
-        .arg(subc_connection_file)
-        .env("SUBC_MODULE_ID", MODULE_ID)
-        .env(
-            "CORTEXKIT_LEASE_ROOT",
-            lease_root.to_string_lossy().to_string(),
-        )
-        .stderr(process::Stdio::inherit())
-        .kill_on_drop(true);
-    // Tests exercise the production config path: write a real file and point
-    // SYNAPSE_CONFIG_PATH at it (the only config env var the module honors).
     let config_contents = if let Some(config_json) = config_json {
         Some(config_json.to_string())
     } else {
@@ -323,14 +309,13 @@ fn spawn_synapse_module_with_env(
             serde_json::json!({ "preload_models": serde_json::from_str::<Value>(preload_models).unwrap_or_else(|_| serde_json::json!([])) }).to_string()
         })
     };
-    if let Some(contents) = config_contents {
-        let config_path = lease_root.join("synapse.jsonc");
-        std::fs::write(&config_path, contents).unwrap();
-        command.env(
-            "SYNAPSE_CONFIG_PATH",
-            config_path.to_string_lossy().to_string(),
-        );
-    }
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ck-synapse"));
+    command
+        .arg("--subc")
+        .arg(subc_connection_file)
+        .env("SUBC_MODULE_ID", MODULE_ID);
+    configure_test_module_command(&mut command, config_contents.as_deref());
+    command.stderr(process::Stdio::inherit()).kill_on_drop(true);
     for (key, value) in extra_env {
         command.env(key, value);
     }
@@ -439,6 +424,39 @@ async fn models_list_round_trips_and_opens_the_daemon_delivered_store() {
         )
         .expect("read module generation");
     assert_eq!(module_generation, 1);
+}
+
+#[tokio::test]
+async fn spawned_module_ignores_operator_config() {
+    let operator_home = unique_temp_dir("synapse-operator-config");
+    let operator_config_dir = operator_home.join(".config").join("cortexkit");
+    std::fs::create_dir_all(&operator_config_dir).unwrap();
+    std::fs::write(
+        operator_config_dir.join("synapse.jsonc"),
+        r#"{"knob":"quiet"}"#,
+    )
+    .unwrap();
+    let operator_home = operator_home.to_string_lossy().into_owned();
+
+    let daemon = start_daemon().await;
+    let module = spawn_synapse_module_with_env(
+        &daemon.connection_file_path,
+        None,
+        None,
+        &[("HOME", &operator_home)],
+    );
+    let (_daemon, _module, mut consumer, route) =
+        open_route_for_started_module(daemon, module).await;
+    let report = route_request(
+        &mut consumer,
+        route,
+        2,
+        serde_json::json!({ "method": "probe.report", "params": {} }),
+    )
+    .await;
+
+    assert_eq!(report["result"]["current_knob"], "balanced");
+    assert_eq!(report["result"]["lanes"], Value::Array(Vec::new()));
 }
 
 #[cfg(target_os = "macos")]

@@ -13,6 +13,7 @@ use subc_protocol::{BindIdentity, Flags, FrameType, Priority, RouteTarget};
 use subc_transport::{authenticate_client, connection_file};
 use tokio::{
     net::TcpStream,
+    process::Command,
     time::{sleep, timeout, Instant},
 };
 
@@ -33,6 +34,23 @@ pub fn unique_temp_dir(label: &str) -> PathBuf {
     // Include a wall-clock nonce to prevent a later process-ID reuse from
     // reopening that stale test store.
     std::env::temp_dir().join(format!("{label}-{}-{n}-{timestamp}", process::id()))
+}
+
+/// Give a spawned module an isolated config and singleton lease scope.
+///
+/// Tests that need production-like settings pass them in `config_json`; all
+/// other children receive an explicit empty config instead of consulting the
+/// operator's HOME. The lease override keeps test modules separate from the
+/// machine-wide fleet lease while preserving the production singleton policy.
+pub fn configure_test_module_command(command: &mut Command, config_json: Option<&str>) {
+    let test_root = unique_temp_dir("synapse-module-test");
+    let config_path = test_root.join("synapse.jsonc");
+    let lease_root = test_root.join("leases");
+    std::fs::create_dir_all(&lease_root).unwrap();
+    std::fs::write(&config_path, config_json.unwrap_or("{}")).unwrap();
+    command
+        .env("SYNAPSE_CONFIG_PATH", config_path)
+        .env("CORTEXKIT_LEASE_ROOT", lease_root);
 }
 
 pub async fn connect_consumer(connection_file_path: &Path) -> TcpStream {

@@ -14,8 +14,9 @@ use std::{
 };
 
 use common::{
-    connect_consumer, raw_route_frame, read_frame_timeout, route_open, route_request,
-    unique_temp_dir, wait_for_catalog, TestRoute, MODULE_ID, SETUP_TIMEOUT,
+    configure_test_module_command, connect_consumer, raw_route_frame, read_frame_timeout,
+    route_open, route_request, unique_temp_dir, wait_for_catalog, TestRoute, MODULE_ID,
+    SETUP_TIMEOUT,
 };
 use serde_json::Value;
 use subc_core::{
@@ -377,10 +378,9 @@ fn spawn_synapse_module_with_config(
     command
         .arg("--subc")
         .arg(subc_connection_file)
-        .env("SUBC_MODULE_ID", MODULE_ID)
-        .env("SYNAPSE_CONFIG_JSON", config_json)
-        .stderr(process::Stdio::inherit())
-        .kill_on_drop(true);
+        .env("SUBC_MODULE_ID", MODULE_ID);
+    configure_test_module_command(&mut command, Some(config_json));
+    command.stderr(process::Stdio::inherit()).kill_on_drop(true);
     let child = command.spawn().expect("spawn synapse-module");
     ModuleProcess { child }
 }
