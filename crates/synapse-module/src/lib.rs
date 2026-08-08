@@ -5963,23 +5963,66 @@ fn cached_supervised_decode_dispatch(
     deadline_ms: u64,
 ) -> Result<Arc<Mutex<worker_host::SupervisedDecodeDispatch>>, OwnedDecodeDispatchPreparationError>
 {
-    if let Some(dispatch) = state
-        .runtime
-        .owned_decode_dispatches
-        .lock()
-        .map_err(|_| {
-            OwnedDecodeDispatchPreparationError::Wire(WireOperationError::from_stable(
-                StableError::engine_crashed(Some(100)),
-                "owned-decode dispatch cache is unavailable",
-            ))
-        })?
-        .get(&spec.model_id)
-        .cloned()
-    {
-        return Ok(dispatch);
+    cached_supervised_decode_dispatch_for_chain_k(
+        state,
+        spec,
+        entry,
+        prompt,
+        constraint,
+        deadline_ms,
+        state.runtime.decode_chain_k,
+    )
+}
+
+fn cached_supervised_decode_dispatch_for_chain_k(
+    state: &ModuleState,
+    spec: &StoredModelConfig,
+    entry: &owned_decode_routing::CatalogEntry,
+    prompt: Vec<u32>,
+    constraint: Option<owned_decode_worker::protocol::TokenIdJsonConstraint>,
+    deadline_ms: u64,
+    decode_chain_k: u32,
+) -> Result<Arc<Mutex<worker_host::SupervisedDecodeDispatch>>, OwnedDecodeDispatchPreparationError>
+{
+    // The shared cache represents the configured production request shape, so
+    // the worker loaded by certification is also available to the first served
+    // request. The K=1 comparison shape for a configured K>1 probe is private:
+    // it has a distinct runtime identity and must not replace production cache.
+    let cache_configured_shape = decode_chain_k == state.runtime.decode_chain_k;
+    if cache_configured_shape {
+        if let Some(dispatch) = state
+            .runtime
+            .owned_decode_dispatches
+            .lock()
+            .map_err(|_| {
+                OwnedDecodeDispatchPreparationError::Wire(WireOperationError::from_stable(
+                    StableError::engine_crashed(Some(100)),
+                    "owned-decode dispatch cache is unavailable",
+                ))
+            })?
+            .get(&spec.model_id)
+            .cloned()
+        {
+            return Ok(dispatch);
+        }
     }
-    let created =
-        build_supervised_decode_dispatch(state, spec, entry, prompt, constraint, deadline_ms)?;
+    let created = if cache_configured_shape {
+        build_supervised_decode_dispatch(state, spec, entry, prompt, constraint, deadline_ms)?
+    } else {
+        build_supervised_decode_dispatch_for_chain_k(
+            state,
+            spec,
+            entry,
+            prompt,
+            constraint,
+            deadline_ms,
+            decode_chain_k,
+        )?
+    };
+    let created = Arc::new(Mutex::new(created));
+    if !cache_configured_shape {
+        return Ok(created);
+    }
     let mut dispatches = state.runtime.owned_decode_dispatches.lock().map_err(|_| {
         OwnedDecodeDispatchPreparationError::Wire(WireOperationError::from_stable(
             StableError::engine_crashed(Some(100)),
@@ -5988,7 +6031,7 @@ fn cached_supervised_decode_dispatch(
     })?;
     Ok(dispatches
         .entry(spec.model_id.clone())
-        .or_insert_with(|| Arc::new(Mutex::new(created)))
+        .or_insert_with(|| created.clone())
         .clone())
 }
 
@@ -9074,25 +9117,26 @@ async fn execute_generate_probe_for_model(
             let prompt = tokenized.batch.items.into_iter().next().unwrap_or_default();
             let prompt_token_count = prompt.len().min(u32::MAX as usize) as u32;
             if worker_dispatch.is_none() {
-                let built = build_supervised_decode_dispatch_for_chain_k(
-                    state,
-                    &spec,
-                    &entry,
-                    prompt.clone(),
-                    None,
-                    OWNED_DECODE_PROBE_TIMEOUT_MS,
-                    chain_k,
-                )
-                .map_err(|error| match error {
-                    OwnedDecodeDispatchPreparationError::Refused(refusal) => {
-                        artifact_invalid_error(format!(
-                            "owned-decode certification cannot prepare worker: {}",
-                            refusal.as_str()
-                        ))
-                    }
-                    OwnedDecodeDispatchPreparationError::Wire(error) => error,
-                })?;
-                worker_dispatch = Some(Arc::new(Mutex::new(built)));
+                worker_dispatch = Some(
+                    cached_supervised_decode_dispatch_for_chain_k(
+                        state,
+                        &spec,
+                        &entry,
+                        prompt.clone(),
+                        None,
+                        OWNED_DECODE_PROBE_TIMEOUT_MS,
+                        chain_k,
+                    )
+                    .map_err(|error| match error {
+                        OwnedDecodeDispatchPreparationError::Refused(refusal) => {
+                            artifact_invalid_error(format!(
+                                "owned-decode certification cannot prepare worker: {}",
+                                refusal.as_str()
+                            ))
+                        }
+                        OwnedDecodeDispatchPreparationError::Wire(error) => error,
+                    })?,
+                );
             }
             let dispatch = worker_dispatch
                 .as_ref()
