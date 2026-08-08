@@ -23,7 +23,7 @@
     },
     {
       "record": {
-        "machine_profile_hash": "c62a7409ef3aa3c8ecde5187c78f0c46f62ef74fd9497fd9505c9c70b818acab",
+        "machine_profile_hash": "ba59320b594cfbed3f17911e6a46541d7fdc954985b72ab0b8ef2cf02d10da4d",
         "enabled_catalog_entry_ids": [
           "qwen3-0.6b-decode-f16"
         ],
@@ -41,7 +41,7 @@
         "context_bucket_manifest_revision": "decode-context-buckets-v1",
         "scheduler_manifest_revision": "decode-sched-manifest-v1",
         "certification_evidence_ids": [
-          "cert-row:c62a7409ef3aa3c8ecde5187c78f0c46f62ef74fd9497fd9505c9c70b818acab:8bcb6dfc1bd55a38a56b5a6931132f428687e064104d106c2cc5efb898f80feb:ab2c6768a1c77f36a520db10bf2b6a2185414d9c39ce8a0154a75e9375b02116"
+          "cert-row:ba59320b594cfbed3f17911e6a46541d7fdc954985b72ab0b8ef2cf02d10da4d:8bcb6dfc1bd55a38a56b5a6931132f428687e064104d106c2cc5efb898f80feb:ab2c6768a1c77f36a520db10bf2b6a2185414d9c39ce8a0154a75e9375b02116"
         ],
         "wire_error_binding_revision": "owned-decode-wire-error-bindings-v1",
         "acceptance_gate_evidence": [
@@ -64,7 +64,7 @@
     },
     {
       "record": {
-        "machine_profile_hash": "c62a7409ef3aa3c8ecde5187c78f0c46f62ef74fd9497fd9505c9c70b818acab",
+        "machine_profile_hash": "ba59320b594cfbed3f17911e6a46541d7fdc954985b72ab0b8ef2cf02d10da4d",
         "enabled_catalog_entry_ids": [
           "lfm2-1.2b-decode-f16"
         ],
@@ -91,7 +91,7 @@
     },
     {
       "record": {
-        "machine_profile_hash": "c62a7409ef3aa3c8ecde5187c78f0c46f62ef74fd9497fd9505c9c70b818acab",
+        "machine_profile_hash": "ba59320b594cfbed3f17911e6a46541d7fdc954985b72ab0b8ef2cf02d10da4d",
         "enabled_catalog_entry_ids": [
           "qwen3-0.6b-decode-q8_0"
         ],
@@ -108,17 +108,31 @@
         "fixture_registry_revision": "decode-fixture-registry-v1",
         "context_bucket_manifest_revision": "decode-context-buckets-v1",
         "scheduler_manifest_revision": "decode-sched-manifest-v1",
-        "certification_evidence_ids": [],
+        "certification_evidence_ids": [
+          "cert-row:ba59320b594cfbed3f17911e6a46541d7fdc954985b72ab0b8ef2cf02d10da4d:4d0a846b33fdbbbc9032ead51e5d9c72af48e145f425cc5802b1205e44dc9e00:970e73c8f3e8990eaabb412122b40821f8db50be79770dd2aaa111e4e30a11c7"
+        ],
         "wire_error_binding_revision": "owned-decode-wire-error-bindings-v1",
-        "acceptance_gate_evidence": [],
+        "acceptance_gate_evidence": [
+          "fleet-gen-16-q8:GateRunner::run_all:G-DEC-01:passed",
+          "fleet-gen-16-q8:GateRunner::run_all:G-DEC-02:passed",
+          "fleet-gen-16-q8:GateRunner::run_all:G-DEC-03:passed",
+          "fleet-gen-16-q8:GateRunner::run_all:G-DEC-04:passed",
+          "fleet-gen-16-q8:GateRunner::run_all:G-DEC-05:passed",
+          "fleet-gen-16-q8:GateRunner::run_all:G-DEC-06:passed",
+          "fleet-gen-16-q8:GateRunner::run_all:G-DEC-07:passed",
+          "fleet-gen-16-q8:GateRunner::run_all:G-DEC-08:passed",
+          "fleet-gen-16-q8:GateRunner::run_all:G-DEC-09:passed",
+          "fleet-gen-16-q8:GateRunner::run_all:G-DEC-10:passed",
+          "fleet-gen-16-q8:GateRunner::run_all:G-DEC-11:passed",
+          "fleet-gen-16-q8:GateRunner::run_all:G-DEC-12:passed"
+        ],
         "grammar_enabled": true
       },
-      "enabled": false,
-      "disabled_reason": "pending fleet certification of this lane"
+      "enabled": true
     },
     {
       "record": {
-        "machine_profile_hash": "c62a7409ef3aa3c8ecde5187c78f0c46f62ef74fd9497fd9505c9c70b818acab",
+        "machine_profile_hash": "ba59320b594cfbed3f17911e6a46541d7fdc954985b72ab0b8ef2cf02d10da4d",
         "enabled_catalog_entry_ids": [
           "lfm2-1.2b-decode-q8_0"
         ],
