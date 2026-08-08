@@ -1636,11 +1636,7 @@ impl SynapseStore {
                     outcome: outcome.to_string(),
                     seed_revision: seed_revision.to_string(),
                     rows: row_count as usize,
-                    marker: if outcome == "already_applied" {
-                        "unchanged".to_string()
-                    } else {
-                        "unchanged".to_string()
-                    },
+                    marker: "unchanged".to_string(),
                 });
             }
             for entry in &entries {
