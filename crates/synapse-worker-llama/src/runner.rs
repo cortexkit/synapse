@@ -31,8 +31,9 @@ use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use synapse_core::WorkerHelloAck;
 use synapse_core::{
-    decode_i32_frame, encode_f32_frame, EngineIdentity, WorkerHello, WorkerPooling, WorkerRequest,
-    WorkerResponse, DEFAULT_MAX_FRAME_BYTES, WORKER_PROTOCOL_VERSION,
+    decode_i32_frame, encode_f32_frame, worker_engine_names::LLAMA_WORKER_ENGINE, EngineIdentity,
+    WorkerHello, WorkerPooling, WorkerRequest, WorkerResponse, DEFAULT_MAX_FRAME_BYTES,
+    WORKER_PROTOCOL_VERSION,
 };
 
 const ENGINE_VERSION: &str = "llama-cpp-2-0.1.151";
@@ -423,14 +424,15 @@ fn compiled_backend() -> &'static str {
     }
 }
 
-fn engine_identity() -> EngineIdentity {
+/// Build the identity announced in the worker HELLO handshake.
+pub fn engine_identity() -> EngineIdentity {
     let backend = compiled_backend().to_string();
     let mut build_flags = BTreeMap::new();
     build_flags.insert("risk_class".to_string(), "abort_capable".to_string());
     build_flags.insert("backend".to_string(), backend.clone());
     build_flags.insert("compiled_backend".to_string(), backend);
     EngineIdentity {
-        engine: "llama".to_string(),
+        engine: LLAMA_WORKER_ENGINE.to_string(),
         version: ENGINE_VERSION.to_string(),
         build_flags,
     }
@@ -1148,7 +1150,7 @@ mod tests {
     #[test]
     fn handshake_identity_uses_canonical_engine_and_compiled_backend() {
         let identity = engine_identity();
-        assert_eq!(identity.engine, "llama");
+        assert_eq!(identity.engine, LLAMA_WORKER_ENGINE);
         assert_eq!(
             identity.build_flags.get("backend").map(String::as_str),
             Some(compiled_backend())

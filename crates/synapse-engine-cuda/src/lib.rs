@@ -10,8 +10,9 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use synapse_core::{
-    EmbedEngine, EngineError, EngineErrorStage, EngineIdentity, EngineRiskClass, LoadedModel,
-    RuntimeConfig, TokenBatch, TokenIds, ValidatedArtifact, Vector, Vectors,
+    worker_engine_names::CUDA_WORKER_ENGINE, EmbedEngine, EngineError, EngineErrorStage,
+    EngineIdentity, EngineRiskClass, LoadedModel, RuntimeConfig, TokenBatch, TokenIds,
+    ValidatedArtifact, Vector, Vectors,
 };
 
 mod cuda;
@@ -405,7 +406,7 @@ impl EmbedEngine for OwnedCudaEmbedEngine {
         );
         build_flags.insert("risk_class".to_owned(), "abort_capable".to_owned());
         EngineIdentity {
-            engine: "owned-cuda".to_owned(),
+            engine: CUDA_WORKER_ENGINE.to_owned(),
             version: ENGINE_VERSION.to_owned(),
             build_flags,
         }

@@ -17,9 +17,9 @@ use mlx_rs::{Array, Dtype};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use synapse_core::{
-    decode_i32_frame, encode_f32_frame, EngineIdentity, WorkerHello, WorkerHelloAck, WorkerPooling,
-    WorkerRequest, WorkerResponse, WorkerTokenItem, DEFAULT_MAX_FRAME_BYTES,
-    WORKER_PROTOCOL_VERSION,
+    decode_i32_frame, encode_f32_frame, worker_engine_names::MLX_WORKER_ENGINE, EngineIdentity,
+    WorkerHello, WorkerHelloAck, WorkerPooling, WorkerRequest, WorkerResponse, WorkerTokenItem,
+    DEFAULT_MAX_FRAME_BYTES, WORKER_PROTOCOL_VERSION,
 };
 
 const ENGINE_VERSION: &str = "mlx-rs-0.25.3";
@@ -1009,13 +1009,14 @@ pub fn main() -> Result<()> {
     Ok(())
 }
 
-fn engine_identity() -> EngineIdentity {
+/// Build the identity announced in the worker HELLO handshake.
+pub fn engine_identity() -> EngineIdentity {
     let mut build_flags = BTreeMap::new();
     build_flags.insert("risk_class".to_string(), "abort_capable".to_string());
     build_flags.insert("backend".to_string(), "metal".to_string());
     build_flags.insert("numeric_profile".to_string(), "bf16-distinct".to_string());
     EngineIdentity {
-        engine: "mlx".to_string(),
+        engine: MLX_WORKER_ENGINE.to_string(),
         version: ENGINE_VERSION.to_string(),
         build_flags,
     }
@@ -1609,6 +1610,11 @@ fn write_frame(stream: &mut UnixStream, bytes: &[u8], max_frame: u32) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_hello_identity_matches_shared_catalog_name() {
+        assert_eq!(engine_identity().engine, MLX_WORKER_ENGINE);
+    }
 
     #[test]
     fn bert_inputs_masks_configured_padding_tokens() {

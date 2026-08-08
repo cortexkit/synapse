@@ -12,8 +12,9 @@ use synapse_core::worker_framing_sync::{
     read_frame, read_json_frame, write_frame, write_json_frame,
 };
 use synapse_core::{
-    decode_i32_frame, encode_f32_frame, owned_cuda_engine_identity, WorkerHello, WorkerHelloAck,
-    WorkerRequest, WorkerResponse, DEFAULT_MAX_FRAME_BYTES, WORKER_PROTOCOL_VERSION,
+    decode_i32_frame, encode_f32_frame, owned_cuda_engine_identity,
+    worker_engine_names::CUDA_WORKER_ENGINE, WorkerHello, WorkerHelloAck, WorkerRequest,
+    WorkerResponse, DEFAULT_MAX_FRAME_BYTES, WORKER_PROTOCOL_VERSION,
 };
 #[cfg(feature = "cuda")]
 use synapse_core::{EmbedEngine, RuntimeConfig, TokenBatch, ValidatedArtifact};
@@ -66,7 +67,8 @@ fn version_probe() -> bool {
     }
 }
 
-fn engine_identity() -> synapse_core::EngineIdentity {
+/// Build the identity announced in the worker HELLO handshake.
+pub fn engine_identity() -> synapse_core::EngineIdentity {
     owned_cuda_engine_identity("worker", "f16", KERNEL_REVISION)
 }
 
@@ -440,12 +442,12 @@ fn error_response(req_id: Option<String>, code: &str, msg: &str) -> WorkerRespon
 #[cfg(test)]
 mod tests {
     use super::*;
-    use synapse_core::{OWNED_CUDA_ENGINE, OWNED_CUDA_PTX_VIRTUAL_ARCH};
+    use synapse_core::{worker_engine_names::CUDA_WORKER_ENGINE, OWNED_CUDA_PTX_VIRTUAL_ARCH};
 
     #[test]
     fn handshake_identity_is_owned_cuda_ptx() {
         let identity = engine_identity();
-        assert_eq!(identity.engine, OWNED_CUDA_ENGINE);
+        assert_eq!(identity.engine, CUDA_WORKER_ENGINE);
         assert_eq!(identity.build_flags["backend"], "cuda-ptx");
         assert_eq!(
             identity.build_flags["ptx_virtual_arch"],

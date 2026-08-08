@@ -6751,6 +6751,7 @@ name = "synapse-worker-ane"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "synapse-core",
 ]
 
 [[package]]

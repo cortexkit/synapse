@@ -9,6 +9,7 @@ pub mod fingerprint;
 pub mod machine_profile;
 pub mod scheduler;
 pub mod tokenizer;
+pub mod worker_engine_names;
 pub mod worker_framing;
 pub mod worker_framing_sync;
 pub mod worker_protocol;
@@ -23,6 +24,7 @@ pub use fingerprint::*;
 pub use machine_profile::*;
 pub use scheduler::*;
 pub use tokenizer::*;
+pub use worker_engine_names::*;
 pub use worker_framing::*;
 pub use worker_protocol::*;
 pub use worker_transport::{

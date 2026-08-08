@@ -3,10 +3,10 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::EngineIdentity;
+use crate::{worker_engine_names::CUDA_WORKER_ENGINE, EngineIdentity};
 
 /// The stable engine name used by the module and every owned-CUDA record.
-pub const OWNED_CUDA_ENGINE: &str = "owned-cuda";
+pub const OWNED_CUDA_ENGINE: &str = CUDA_WORKER_ENGINE;
 /// The backend identity describes PTX executed by the CUDA driver JIT.
 pub const OWNED_CUDA_BACKEND: &str = "cuda-ptx";
 pub const OWNED_CUDA_PTX_VIRTUAL_ARCH: &str = "compute_75";
@@ -131,7 +131,7 @@ pub fn owned_cuda_engine_identity(
         OWNED_CUDA_IDENTITY_REVISION.to_string(),
     );
     EngineIdentity {
-        engine: OWNED_CUDA_ENGINE.to_string(),
+        engine: CUDA_WORKER_ENGINE.to_string(),
         version: kernel_revision.to_string(),
         build_flags,
     }

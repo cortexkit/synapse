@@ -87,12 +87,13 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::worker_engine_names::LLAMA_WORKER_ENGINE;
 
     #[test]
     fn owned_decode_provenance_is_additive_and_legacy_local_shape_stays_unchanged() {
         let provenance = ResponseProvenance {
             engine: EngineIdentity {
-                engine: "llama.cpp-worker".to_string(),
+                engine: LLAMA_WORKER_ENGINE.to_string(),
                 version: "1".to_string(),
                 build_flags: BTreeMap::new(),
             },

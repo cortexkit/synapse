@@ -27,6 +27,7 @@ use subc_protocol::{Flags, FrameType, Priority};
 use subc_transport::{
     generate_daemon_id, generate_key, write_atomic, ConnectionInfo, Endpoint, SCHEMA_VERSION,
 };
+use synapse_core::worker_engine_names::{DECODE_WORKER_ENGINE, LLAMA_WORKER_ENGINE};
 use tokenizers::{models::wordlevel::WordLevel, pre_tokenizers::whitespace::Whitespace, Tokenizer};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -3201,7 +3202,7 @@ async fn uncertified_owned_target_refuses_and_maps_grammar_over_the_wire() {
         "grammar_enabled": true,
         "preload_models": [{
             "model_id": "owned-qwen",
-            "engine": "owned-metal-decode",
+            "engine": DECODE_WORKER_ENGINE,
             "task": "generate",
             "model_path": model_path,
             "tokenizer_path": tokenizer_path,
@@ -3293,7 +3294,7 @@ async fn substitutable_owned_refusal_falls_back_to_llama_with_lane_provenance() 
         "preload_models": [
             {
                 "model_id": "owned-qwen",
-                "engine": "owned-metal-decode",
+                "engine": DECODE_WORKER_ENGINE,
                 "task": "generate",
                 "model_path": owned_model,
                 "tokenizer_path": tokenizer_path,
@@ -3306,7 +3307,7 @@ async fn substitutable_owned_refusal_falls_back_to_llama_with_lane_provenance() 
             },
             {
                 "model_id": "llama-fallback",
-                "engine": "llama",
+                "engine": LLAMA_WORKER_ENGINE,
                 "task": "generate",
                 "model_path": llama_model,
                 "tokenizer_path": tokenizer_path,
@@ -3414,7 +3415,7 @@ async fn certified_owned_checkpoint_lane(
     };
     let mut preload = serde_json::json!({
         "model_id": model_id,
-        "engine": "owned-metal-decode",
+        "engine": DECODE_WORKER_ENGINE,
         "task": "generate",
         "model_path": model_path,
         "tokenizer_path": tokenizer_path,

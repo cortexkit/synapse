@@ -26,11 +26,12 @@ use owned_decode_worker::{
 use serde::Serialize;
 use synapse_core::{
     accept_worker_handshake_with_engine, decode_f32_frame, encode_i32_frame, prepare_listener,
-    read_json, read_raw, write_json, write_raw, EmbedEngine, EngineError, EngineErrorStage,
-    EngineIdentity, EngineRiskClass, GenerateEngine, GenerateOutput, GenerateRequest, LoadedModel,
-    RerankEngine, RerankRequest, RerankScores, RuntimeConfig, TokenBatch, TokenIds, TransportError,
-    ValidatedArtifact, Vector, Vectors, WorkerCandidate, WorkerPooling, WorkerRequest,
-    WorkerResponse, WorkerTokenItem, WorkerTransportStream, DEFAULT_MAX_FRAME_BYTES,
+    read_json, read_raw, worker_engine_names::LLAMA_WORKER_ENGINE, write_json, write_raw,
+    EmbedEngine, EngineError, EngineErrorStage, EngineIdentity, EngineRiskClass, GenerateEngine,
+    GenerateOutput, GenerateRequest, LoadedModel, RerankEngine, RerankRequest, RerankScores,
+    RuntimeConfig, TokenBatch, TokenIds, TransportError, ValidatedArtifact, Vector, Vectors,
+    WorkerCandidate, WorkerPooling, WorkerRequest, WorkerResponse, WorkerTokenItem,
+    WorkerTransportStream, DEFAULT_MAX_FRAME_BYTES,
 };
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -1043,7 +1044,7 @@ impl EmbedEngine for WorkerEngine {
             worker_transport_label().to_string(),
         );
         EngineIdentity {
-            engine: "llama.cpp-worker".to_string(),
+            engine: LLAMA_WORKER_ENGINE.to_string(),
             version: "protocol-v1".to_string(),
             build_flags,
         }

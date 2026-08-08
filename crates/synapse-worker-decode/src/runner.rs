@@ -24,6 +24,7 @@ use owned_decode_worker::{
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use synapse_core::{
+    worker_engine_names::DECODE_WORKER_ENGINE,
     worker_framing_sync::{read_frame, write_json_frame},
     worker_protocol::{
         WorkerHello, WorkerHelloAck, WorkerRequest, WorkerResponse, DEFAULT_MAX_FRAME_BYTES,
@@ -871,7 +872,8 @@ fn error_frame(error: DecodeError) -> FrameEnvelope {
     })
 }
 
-fn engine_identity(worker_generation: u64) -> EngineIdentity {
+/// Build the identity announced in the worker HELLO handshake.
+pub fn engine_identity(worker_generation: u64) -> EngineIdentity {
     let mut build_flags = BTreeMap::new();
     build_flags.insert("backend".to_string(), "metal".to_string());
     build_flags.insert("lane".to_string(), "decode".to_string());
@@ -886,7 +888,7 @@ fn engine_identity(worker_generation: u64) -> EngineIdentity {
         worker_generation.to_string(),
     );
     EngineIdentity {
-        engine: "owned-metal-decode".to_string(),
+        engine: DECODE_WORKER_ENGINE.to_string(),
         version: ENGINE_VERSION.to_string(),
         build_flags,
     }
@@ -1022,7 +1024,7 @@ mod tests {
     #[test]
     fn engine_identity_names_fleet_protocol() {
         let identity = engine_identity(7);
-        assert_eq!(identity.engine, "owned-metal-decode");
+        assert_eq!(identity.engine, DECODE_WORKER_ENGINE);
         assert_eq!(
             identity.build_flags["protocol"],
             "owned-metal-decode-worker-v1"

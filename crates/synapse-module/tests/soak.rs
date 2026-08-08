@@ -26,6 +26,7 @@ use subc_protocol::{Flags, FrameType, Priority};
 use subc_transport::{
     generate_daemon_id, generate_key, write_atomic, ConnectionInfo, Endpoint, SCHEMA_VERSION,
 };
+use synapse_core::worker_engine_names::LLAMA_WORKER_ENGINE;
 use tokio::{
     net::TcpListener,
     process::{Child, Command},
@@ -667,7 +668,7 @@ fn soak_config(assets: &SoakAssets, worker_bin: &Path, temp_dir: &Path) -> Strin
             },
             {
                 "model_id": "minilm-llama",
-                "engine": "llama",
+                "engine": LLAMA_WORKER_ENGINE,
                 "model_path": gguf_model,
                 "tokenizer_path": assets.onnx_snapshot.join("tokenizer.json"),
                 "worker_bin": worker_bin,

@@ -38,7 +38,7 @@ pub mod request;
 use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
-use synapse_core::Fingerprint;
+use synapse_core::{worker_engine_names::DECODE_WORKER_ENGINE, Fingerprint};
 
 use crate::owned_decode_contracts::ContextBucketsManifest;
 use crate::owned_decode_routing::certification::{
@@ -64,7 +64,7 @@ use crate::owned_decode_routing::request::{OneshotRequest, RequestValidationErro
 // ---------------------------------------------------------------------------
 
 /// Canonical identity values every production catalog entry must carry.
-pub const CATALOG_ENGINE: &str = "owned-metal-decode";
+pub const CATALOG_ENGINE: &str = DECODE_WORKER_ENGINE;
 pub const CATALOG_TASK: &str = "generate";
 pub const CATALOG_LANE: &str = "decode";
 pub const CATALOG_WORKER: &str = "supervised";

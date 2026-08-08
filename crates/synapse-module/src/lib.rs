@@ -81,6 +81,9 @@ use subc_protocol::{
 };
 use synapse_core::{
     evaluate_cuda_floor, owned_cuda_engine_identity, worker_binary_env_var,
+    worker_engine_names::{
+        ANE_WORKER_ENGINE, DECODE_WORKER_ENGINE, LLAMA_WORKER_ENGINE, MLX_WORKER_ENGINE,
+    },
     worker_runtime_dir_env_var, AdmissionDecision, AdmissionRequest, AliasTable, CacheGcOutcome,
     CertifiedShapeEnvelope, Clock, CudaFloorDecision, EmbedEngine, EngineError, EngineErrorStage,
     EngineIdentity, ErrorClass, Fingerprint, FlashAttentionSetting, GenerateEngine, GenerateOutput,
@@ -90,7 +93,7 @@ use synapse_core::{
     ResponseEnvelope, ResponseProvenance, RuntimeConfig, SanitizedTokenizer, SchedulerConfig,
     StableError, SystemMachineProfileCollector, ThreadPolicyClass, TokenBatch, TokenizationError,
     TokenizedBatch, TokenizerConfig, TruncationDisclosure, ValidatedArtifact, Vectors, WorkRequest,
-    WorkerPooling, MACHINE_PROFILE_HASH_REVISION, OWNED_CUDA_ENGINE, OWNED_CUDA_MINIMUM_DEVICE_CC,
+    WorkerPooling, CUDA_WORKER_ENGINE, MACHINE_PROFILE_HASH_REVISION, OWNED_CUDA_MINIMUM_DEVICE_CC,
     OWNED_CUDA_MINIMUM_DRIVER_API, OWNED_CUDA_PTX_VIRTUAL_ARCH,
 };
 use synapse_engine_ort::OrtEmbedEngine;
@@ -1256,7 +1259,7 @@ fn recommended_batch_for_engine(engine: &str, max_tokens: usize) -> Option<Recom
             rows: MAX_ENGINE_BATCH_ITEMS,
             token_budget: DEFAULT_ENGINE_BATCH_TOKEN_BUDGET,
         }),
-        "ane" | "ane-coreml-worker" => {
+        "ane" | ANE_WORKER_ENGINE => {
             let rows = MAX_ENGINE_BATCH_ITEMS;
             Some(RecommendedBatch {
                 rows,
@@ -2090,8 +2093,8 @@ fn owned_cuda_catalog_config(
 fn canonical_engine_name(engine: &str) -> String {
     match engine.trim().to_ascii_lowercase().as_str() {
         "onnx" => "ort".to_string(),
-        "llama.cpp" => "llama".to_string(),
-        "coreml" | "neural_engine" => "ane".to_string(),
+        "llama.cpp" | LLAMA_WORKER_ENGINE => "llama".to_string(),
+        "coreml" | "neural_engine" | ANE_WORKER_ENGINE => "ane".to_string(),
         // Catalog entries select this engine explicitly. Future hardware probes can
         // populate the same catalog value without changing request dispatch.
         "owned" | "metal" | "owned_metal" => "owned-metal".to_string(),
@@ -2099,6 +2102,7 @@ fn canonical_engine_name(engine: &str) -> String {
         "owned-decode" | "owned_metal_decode" | "owned-metal-decode" => {
             "owned-metal-decode".to_string()
         }
+        MLX_WORKER_ENGINE => "mlx".to_string(),
         other => other.to_string(),
     }
 }
@@ -2129,12 +2133,12 @@ fn catalog_model_engine_identity(engine_name: &str) -> Result<EngineIdentity, Mo
     match engine_name {
         "ort" => Ok(OrtEmbedEngine::new().identity()),
         "llama" => Ok(worker_catalog_identity(
-            "llama.cpp-worker",
+            LLAMA_WORKER_ENGINE,
             "protocol-v1",
             &[("transport", worker_catalog_transport())],
         )),
         "mlx" => Ok(worker_catalog_identity(
-            "mlx-worker",
+            MLX_WORKER_ENGINE,
             "protocol-v1",
             &[
                 ("transport", worker_catalog_transport()),
@@ -2142,7 +2146,7 @@ fn catalog_model_engine_identity(engine_name: &str) -> Result<EngineIdentity, Mo
             ],
         )),
         "ane" => Ok(worker_catalog_identity(
-            "ane-coreml-worker",
+            ANE_WORKER_ENGINE,
             "protocol-v1",
             &[
                 ("transport", worker_catalog_transport()),
@@ -2155,7 +2159,7 @@ fn catalog_model_engine_identity(engine_name: &str) -> Result<EngineIdentity, Mo
             "cuda-kernel-v1",
         )),
         "owned-metal-decode" => Ok(worker_catalog_identity(
-            "owned-metal-decode",
+            DECODE_WORKER_ENGINE,
             "owned-metal-decode-worker-v1",
             &[
                 ("transport", worker_catalog_transport()),
@@ -3060,7 +3064,7 @@ fn load_catalog_model_blocking(
 ) -> Result<EmbeddingModel, WireOperationError> {
     let task = parse_model_task(Some(&spec.task), &spec.engine, &spec.model_id)
         .map_err(|error| artifact_invalid_error(error.to_string()))?;
-    if spec.engine == OWNED_CUDA_ENGINE {
+    if spec.engine == CUDA_WORKER_ENGINE {
         if cfg!(target_os = "macos") {
             return Err(artifact_invalid_error(format!(
                 "owned-cuda model '{}' is not supported on macOS",
@@ -3308,7 +3312,7 @@ fn load_worker_backend_blocking(
     config.load_timeout = worker_load_timeout;
     config.worker_id = format!("synapse-{}-{}", spec.engine, spec.model_id);
     config.engine_identity = Some(spec.engine_identity.clone());
-    config.isolate_crash_key_by_worker_id = spec.engine == OWNED_CUDA_ENGINE;
+    config.isolate_crash_key_by_worker_id = spec.engine == CUDA_WORKER_ENGINE;
     config.pooling =
         parse_pooling(&spec.pooling).map_err(|error| artifact_invalid_error(error.to_string()))?;
     config.normalize = spec.normalize;
@@ -3566,7 +3570,7 @@ fn ensure_owned_cuda_floor() -> Result<(), WireOperationError> {
 }
 
 fn owned_cuda_evidence(state: &ModuleState, model: &EmbeddingModel) -> Option<Value> {
-    if model.engine_identity.engine != OWNED_CUDA_ENGINE {
+    if model.engine_identity.engine != CUDA_WORKER_ENGINE {
         return None;
     }
     let decision = owned_cuda_floor_decision();
@@ -3579,7 +3583,7 @@ fn owned_cuda_evidence(state: &ModuleState, model: &EmbeddingModel) -> Option<Va
         CudaFloorDecision::Unsupported { observed: None, .. } => None,
     };
     Some(json!({
-        "engine": OWNED_CUDA_ENGINE,
+        "engine": CUDA_WORKER_ENGINE,
         "backend": model.engine_identity.build_flags.get("backend"),
         "ptx_virtual_arch": model.engine_identity.build_flags.get("ptx_virtual_arch").cloned().unwrap_or_else(|| OWNED_CUDA_PTX_VIRTUAL_ARCH.to_string()),
         "minimum_device_cc": model.engine_identity.build_flags.get("minimum_device_cc").cloned().unwrap_or_else(|| OWNED_CUDA_MINIMUM_DEVICE_CC.to_string()),
@@ -7971,7 +7975,7 @@ fn ensure_model_certified(
 ) -> Result<(), WireOperationError> {
     // Owned-CUDA has no declared or inherited certification path. A measured
     // row must match this exact machine-profile hash before serving.
-    if model.engine_identity.engine == OWNED_CUDA_ENGINE {
+    if model.engine_identity.engine == CUDA_WORKER_ENGINE {
         return match state.store.get_cert_row(
             &state.machine_profile_hash,
             &model.certification_fingerprint,
@@ -10859,6 +10863,24 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn catalog_identity_names_match_worker_hello_constants() {
+        let expected = [
+            ("llama", LLAMA_WORKER_ENGINE),
+            ("mlx", MLX_WORKER_ENGINE),
+            ("ane", ANE_WORKER_ENGINE),
+            ("owned-metal-decode", DECODE_WORKER_ENGINE),
+            ("owned-cuda", CUDA_WORKER_ENGINE),
+        ];
+        for (engine_name, expected_engine) in expected {
+            let identity = catalog_model_engine_identity(engine_name).expect("catalog identity");
+            assert_eq!(
+                identity.engine, expected_engine,
+                "catalog engine {engine_name}"
+            );
+        }
+    }
+
     fn stuck_model_spec() -> StoredModelConfig {
         StoredModelConfig {
             model_id: "stuck-model".to_string(),
@@ -11532,7 +11554,7 @@ mod tests {
                 workload: "embed".to_string(),
                 numeric_profile_id: NumericProfileId("np-fast".to_string()),
                 fingerprint: Fingerprint("fp-fast".to_string()),
-                engine: "mlx-worker".to_string(),
+                engine: MLX_WORKER_ENGINE.to_string(),
                 measured_at_ms: 10,
                 os_build: "24A1".to_string(),
                 module_generation: 1,
@@ -11547,7 +11569,7 @@ mod tests {
                 workload: "embed".to_string(),
                 numeric_profile_id: NumericProfileId("np-quiet".to_string()),
                 fingerprint: Fingerprint("fp-quiet".to_string()),
-                engine: "ane-coreml-worker".to_string(),
+                engine: ANE_WORKER_ENGINE.to_string(),
                 measured_at_ms: 11,
                 os_build: "24A1".to_string(),
                 module_generation: 1,
