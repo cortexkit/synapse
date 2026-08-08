@@ -664,6 +664,8 @@ impl AssuranceClass {
         }
     }
 
+    // Staged storage API consumed by the epic's runtime slice; remove this allow there.
+    #[allow(dead_code)]
     fn parse(value: &str) -> Result<Self, SynapseStoreError> {
         match value {
             "measured" => Ok(Self::Measured),
@@ -718,6 +720,8 @@ impl CertificationClass {
     }
 }
 
+// Staged storage API consumed by the epic's runtime slice; remove this allow there.
+#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApprovalIdentity {
@@ -725,6 +729,8 @@ pub struct ApprovalIdentity {
     pub decode_fingerprint: String,
 }
 
+// Staged storage API consumed by the epic's runtime slice; remove this allow there.
+#[allow(dead_code)]
 impl ApprovalIdentity {
     pub fn new(model_id: impl Into<String>, decode_fingerprint: impl Into<String>) -> Self {
         Self {
@@ -734,6 +740,8 @@ impl ApprovalIdentity {
     }
 }
 
+// Staged storage API consumed by the epic's runtime slice; remove this allow there.
+#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApprovalRow {
@@ -753,6 +761,8 @@ pub struct ApprovalRow {
     pub fencing_metadata: Value,
 }
 
+// Staged storage API consumed by the epic's runtime slice; remove this allow there.
+#[allow(dead_code)]
 impl ApprovalRow {
     pub fn expected_digest(&self) -> Result<String, SynapseStoreError> {
         let separator = if self.schema_revision == APPROVAL_SCHEMA_REVISION {
@@ -782,6 +792,8 @@ impl ApprovalRow {
     }
 }
 
+// Staged storage API consumed by the epic's runtime slice; remove this allow there.
+#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ApprovalDigestMismatch {
     pub model_id: String,
@@ -792,6 +804,8 @@ pub struct ApprovalDigestMismatch {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+// Staged storage API consumed by the epic's runtime slice; remove this allow there.
+#[allow(dead_code)]
 pub struct ApprovalMigrationResult {
     pub outcome: String,
     pub seed_revision: String,
@@ -801,6 +815,8 @@ pub struct ApprovalMigrationResult {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+// Staged storage API consumed by the epic's runtime slice; remove this allow there.
+#[allow(dead_code)]
 pub struct ApprovalMigrationSeedEntry {
     pub source_catalog_entry_id: String,
     pub model_id: String,
@@ -810,12 +826,24 @@ pub struct ApprovalMigrationSeedEntry {
     pub disabled_reason: Option<String>,
 }
 
+// Staged storage API consumed by the epic's runtime slice; remove this allow there.
+#[allow(dead_code)]
 pub const APPROVAL_SCHEMA_REVISION: &str = "runtime-bound-records-contracts-v1";
+// Staged storage API consumed by the epic's runtime slice; remove this allow there.
+#[allow(dead_code)]
 pub const APPROVAL_EVIDENCE_REQUIREMENTS_REVISION: &str = "owned-decode-evidence-requirements-v1";
+// Staged storage API consumed by the epic's runtime slice; remove this allow there.
+#[allow(dead_code)]
 pub const APPROVAL_DIGEST_DOMAIN: &str = "owned-decode-approval-row-v1\0";
+// Staged storage API consumed by the epic's runtime slice; remove this allow there.
+#[allow(dead_code)]
 pub const CERT_EVIDENCE_SCHEMA_REVISION: &str = "owned-decode-cert-evidence-v1";
+// Staged storage API consumed by the epic's runtime slice; remove this allow there.
+#[allow(dead_code)]
 pub const G_DEC_MANIFEST_REVISION: &str = "decode-fixture-registry-v1";
 
+// Staged storage API consumed by the epic's runtime slice; remove this allow there.
+#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct OwnedDecodeCertificationRow {
     pub status: CertificationStatus,
@@ -837,6 +865,8 @@ pub struct OwnedDecodeCertificationRow {
     pub evidence: Value,
 }
 
+// Staged storage API consumed by the epic's runtime slice; remove this allow there.
+#[allow(dead_code)]
 impl OwnedDecodeCertificationRow {
     pub fn identity(&self) -> (&str, u64, &str, &str, &str) {
         (
@@ -849,7 +879,25 @@ impl OwnedDecodeCertificationRow {
     }
 }
 
+// Staged storage API consumed by the epic's runtime slice; remove this allow there.
+#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct OwnedDecodeMatchInputs {
+    pub revisioned_machine_profile_hash: String,
+    pub profile_activation_epoch: u64,
+    pub model_id: String,
+    pub decode_fingerprint: String,
+    pub processing_fingerprint: String,
+    pub runtime_config_digest: String,
+    pub constraint_runtime_identities: Vec<String>,
+    pub worker_path_evidence: Value,
+    pub evidence_schema_revision: String,
+    pub g_dec_manifest_revision: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+// Staged storage API consumed by the epic's runtime slice; remove this allow there.
+#[allow(dead_code)]
 pub struct ClassScopedCertificationRow {
     pub certification_class: CertificationClass,
     pub assurance_class: AssuranceClass,
@@ -867,6 +915,8 @@ pub struct ClassScopedCertificationRow {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
+// Staged storage API consumed by the epic's runtime slice; remove this allow there.
+#[allow(dead_code)]
 pub struct ProfileState {
     pub snapshot: Option<MachineProfile>,
     pub revisioned_machine_profile_hash: Option<String>,
@@ -877,6 +927,8 @@ pub struct ProfileState {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
+// Staged storage API consumed by the epic's runtime slice; remove this allow there.
+#[allow(dead_code)]
 pub struct RotationCertificationOutcome {
     pub event_id: String,
     pub model_id: String,
@@ -887,6 +939,8 @@ pub struct RotationCertificationOutcome {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
+// Staged storage API consumed by the epic's runtime slice; remove this allow there.
+#[allow(dead_code)]
 pub struct RotationLedgerEvent {
     pub event_id: String,
     pub old_revisioned_machine_profile_hash: Option<String>,
@@ -903,6 +957,8 @@ pub struct RotationLedgerEvent {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
+// Staged storage API consumed by the epic's runtime slice; remove this allow there.
+#[allow(dead_code)]
 pub struct ProfileActivation {
     pub state: ProfileState,
     pub rotated: bool,
@@ -910,6 +966,8 @@ pub struct ProfileActivation {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+// Staged storage API consumed by the epic's runtime slice; remove this allow there.
+#[allow(dead_code)]
 pub struct EvidenceRequirementsDivergence {
     pub model_id: String,
     pub decode_fingerprint: String,
@@ -917,6 +975,8 @@ pub struct EvidenceRequirementsDivergence {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
+// Staged storage API consumed by the epic's runtime slice; remove this allow there.
+#[allow(dead_code)]
 pub struct ApprovalCertificationHealth {
     pub model_id: String,
     pub decode_fingerprint: String,
@@ -928,6 +988,8 @@ pub struct ApprovalCertificationHealth {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
+// Staged storage API consumed by the epic's runtime slice; remove this allow there.
+#[allow(dead_code)]
 pub struct StorageHealthInputs {
     pub previous_revisioned_machine_profile_hash: Option<String>,
     pub current_revisioned_machine_profile_hash: Option<String>,
@@ -941,6 +1003,8 @@ pub struct StorageHealthInputs {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
+// Staged storage API consumed by the epic's runtime slice; remove this allow there.
+#[allow(dead_code)]
 pub struct OwnedDecodeAdmission {
     pub approval: ApprovalRow,
     pub certification: OwnedDecodeCertificationRow,
@@ -950,6 +1014,8 @@ pub struct OwnedDecodeAdmission {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+// Staged storage API consumed by the epic's runtime slice; remove this allow there.
+#[allow(dead_code)]
 pub enum RotationOutcomeState {
     NotRequired,
     Required,
@@ -958,8 +1024,10 @@ pub enum RotationOutcomeState {
     Failed,
 }
 
+// Staged storage API consumed by the epic's runtime slice; remove this allow there.
+#[allow(dead_code)]
 impl RotationOutcomeState {
-    fn as_str(self) -> &'static str {
+    fn encode(self) -> &'static str {
         match self {
             Self::NotRequired => "not_required",
             Self::Required => "required",
@@ -1170,6 +1238,8 @@ impl SynapseStore {
         Ok(Self { store })
     }
 
+    // Staged storage API consumed by the epic's runtime slice; remove this allow there.
+    #[allow(dead_code)]
     pub fn open_with_profile(
         descriptor: &StorageDescriptor,
         profile: &MachineProfile,
@@ -1301,6 +1371,8 @@ impl SynapseStore {
 
     /// Insert an approval row only through this explicit administrative path,
     /// after validation; serving and certification code never call it.
+    // Staged storage API consumed by the epic's runtime slice; remove this allow there.
+    #[allow(dead_code)]
     pub fn insert_approval(&self, row: &ApprovalRow) -> Result<ApprovalRow, SynapseStoreError> {
         validate_approval(row, false)?;
         let catalog_matches: i64 = self.store.with_conn(|conn| {
@@ -1316,42 +1388,42 @@ impl SynapseStore {
                 row.model_id
             )));
         }
-        let inserted =
-            self.store.with_conn_fenced(|tx| {
-                let mut row = row.clone();
-                row.semantic_digest = row.expected_digest().map_err(to_sql_error)?;
-                validate_approval(&row, true).map_err(to_sql_error)?;
-                let fencing_metadata = serde_json::to_string(&row.fencing_metadata)
-                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-                tx.execute(
-                    "INSERT INTO approvals (
+        let inserted = self.store.with_conn_fenced(|tx| {
+            let mut row = row.clone();
+            row.semantic_digest = row.expected_digest().map_err(to_sql_error)?;
+            validate_approval(&row, true).map_err(to_sql_error)?;
+            let fencing_metadata = serde_json::to_string(&row.fencing_metadata)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+            tx.execute(
+                "INSERT INTO approvals (
                      schema_revision, model_id, decode_fingerprint, enabled, grammar_enabled,
                      disabled_reason, approved_by, approved_at_ms, updated_at_ms,
                      evidence_requirements_revision, semantic_digest, generation, fencing_metadata
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-                    params![
-                        &row.schema_revision,
-                        &row.model_id,
-                        &row.decode_fingerprint,
-                        row.enabled as i64,
-                        row.grammar_enabled as i64,
-                        row.disabled_reason.as_deref(),
-                        row.approved_by.as_deref(),
-                        row.approved_at_ms.map(|value| value as i64),
-                        row.updated_at_ms as i64,
-                        &row.evidence_requirements_revision,
-                        &row.semantic_digest,
-                        row.generation as i64,
-                        fencing_metadata,
-                    ],
-                )?;
-                let row_id = tx.last_insert_rowid();
-                Ok(load_approval_tx(tx, row_id)?
-                    .ok_or_else(|| rusqlite::Error::QueryReturnedNoRows)?)
-            })?;
+                params![
+                    &row.schema_revision,
+                    &row.model_id,
+                    &row.decode_fingerprint,
+                    row.enabled as i64,
+                    row.grammar_enabled as i64,
+                    row.disabled_reason.as_deref(),
+                    row.approved_by.as_deref(),
+                    row.approved_at_ms.map(|value| value as i64),
+                    row.updated_at_ms as i64,
+                    &row.evidence_requirements_revision,
+                    &row.semantic_digest,
+                    row.generation as i64,
+                    fencing_metadata,
+                ],
+            )?;
+            let row_id = tx.last_insert_rowid();
+            load_approval_tx(tx, row_id)?.ok_or_else(|| rusqlite::Error::QueryReturnedNoRows)
+        })?;
         Ok(inserted)
     }
 
+    // Staged storage API consumed by the epic's runtime slice; remove this allow there.
+    #[allow(dead_code)]
     pub fn create_approval(
         &self,
         model_id: &str,
@@ -1381,6 +1453,8 @@ impl SynapseStore {
         self.insert_approval(&row)
     }
 
+    // Staged storage API consumed by the epic's runtime slice; remove this allow there.
+    #[allow(dead_code)]
     pub fn migrate_owned_decode_approvals(
         &self,
         seed_revision: &str,
@@ -1733,6 +1807,8 @@ impl SynapseStore {
         }
     }
 
+    // Staged storage API consumed by the epic's runtime slice; remove this allow there.
+    #[allow(dead_code)]
     pub fn get_approval(
         &self,
         model_id: &str,
@@ -1791,6 +1867,8 @@ impl SynapseStore {
         }
     }
 
+    // Staged storage API consumed by the epic's runtime slice; remove this allow there.
+    #[allow(dead_code)]
     pub fn approvals(&self) -> Result<Vec<ApprovalRow>, SynapseStoreError> {
         let rows = self.store.with_conn(|conn| {
             let mut stmt = conn.prepare(
@@ -1813,6 +1891,8 @@ impl SynapseStore {
             .collect()
     }
 
+    // Staged storage API consumed by the epic's runtime slice; remove this allow there.
+    #[allow(dead_code)]
     pub fn enable_approval(
         &self,
         model_id: &str,
@@ -1829,6 +1909,8 @@ impl SynapseStore {
         })
     }
 
+    // Staged storage API consumed by the epic's runtime slice; remove this allow there.
+    #[allow(dead_code)]
     pub fn disable_approval(
         &self,
         model_id: &str,
@@ -1847,6 +1929,8 @@ impl SynapseStore {
         })
     }
 
+    // Staged storage API consumed by the epic's runtime slice; remove this allow there.
+    #[allow(dead_code)]
     pub fn set_approval_grammar_enabled(
         &self,
         model_id: &str,
@@ -1859,6 +1943,8 @@ impl SynapseStore {
         })
     }
 
+    // Staged storage API consumed by the epic's runtime slice; remove this allow there.
+    #[allow(dead_code)]
     pub fn emergency_rollback(
         &self,
         reason: &str,
@@ -1909,6 +1995,8 @@ impl SynapseStore {
         Ok(changed)
     }
 
+    // Staged storage API consumed by the epic's runtime slice; remove this allow there.
+    #[allow(dead_code)]
     fn mutate_approval<F>(
         &self,
         model_id: &str,
@@ -2035,6 +2123,8 @@ impl SynapseStore {
 
     /// Store a complete measured owned-decode row under its class-scoped key.
     /// This is the only certification write that can create a matchable owned row.
+    // Staged storage API consumed by the epic's runtime slice; remove this allow there.
+    #[allow(dead_code)]
     pub fn store_owned_decode_cert_row(
         &self,
         row: &OwnedDecodeCertificationRow,
@@ -2131,37 +2221,30 @@ impl SynapseStore {
         raw.map(decode_owned_decode_cert_row).transpose()
     }
 
+    // Staged storage API consumed by the epic's runtime slice; remove this allow there.
+    #[allow(dead_code)]
     pub fn get_owned_decode_cert_row_matching(
         &self,
-        revisioned_machine_profile_hash: &str,
-        profile_activation_epoch: u64,
-        model_id: &str,
-        decode_fingerprint: &str,
-        processing_fingerprint: &str,
-        runtime_config_digest: &str,
-        constraint_runtime_identities: &[String],
-        worker_path_evidence: &Value,
-        evidence_schema_revision: &str,
-        g_dec_manifest_revision: &str,
+        inputs: &OwnedDecodeMatchInputs,
     ) -> Result<Option<OwnedDecodeCertificationRow>, SynapseStoreError> {
         let Some(row) = self.get_owned_decode_cert_row(
-            revisioned_machine_profile_hash,
-            profile_activation_epoch,
-            model_id,
-            decode_fingerprint,
-            evidence_schema_revision,
+            &inputs.revisioned_machine_profile_hash,
+            inputs.profile_activation_epoch,
+            &inputs.model_id,
+            &inputs.decode_fingerprint,
+            &inputs.evidence_schema_revision,
         )?
         else {
             return Ok(None);
         };
-        let mut expected_identities = constraint_runtime_identities.to_vec();
+        let mut expected_identities = inputs.constraint_runtime_identities.clone();
         expected_identities.sort();
-        if row.processing_fingerprint != processing_fingerprint
-            || row.runtime_config_digest != runtime_config_digest
+        if row.processing_fingerprint != inputs.processing_fingerprint
+            || row.runtime_config_digest != inputs.runtime_config_digest
             || row.constraint_runtime_identities != expected_identities
-            || row.worker_path_evidence != *worker_path_evidence
-            || row.g_dec_manifest_revision != g_dec_manifest_revision
-            || !complete_g_dec_evidence(&row.evidence, g_dec_manifest_revision)
+            || row.worker_path_evidence != inputs.worker_path_evidence
+            || row.g_dec_manifest_revision != inputs.g_dec_manifest_revision
+            || !complete_g_dec_evidence(&row.evidence, &inputs.g_dec_manifest_revision)
         {
             return Ok(None);
         }
@@ -2171,6 +2254,8 @@ impl SynapseStore {
     /// Read the two independent values that authorize owned-decode admission—the
     /// persisted revisioned profile hash and its positive activation epoch—in one
     /// consistent database read.
+    // Staged storage API consumed by the epic's runtime slice; remove this allow there.
+    #[allow(dead_code)]
     pub fn owned_decode_admission(
         &self,
         model_id: &str,
@@ -2239,6 +2324,8 @@ impl SynapseStore {
         Ok(admission)
     }
 
+    // Staged storage API consumed by the epic's runtime slice; remove this allow there.
+    #[allow(dead_code)]
     pub fn store_class_scoped_cert_row(
         &self,
         row: &ClassScopedCertificationRow,
@@ -2318,6 +2405,8 @@ impl SynapseStore {
         Ok(())
     }
 
+    // Staged storage API consumed by the epic's runtime slice; remove this allow there.
+    #[allow(dead_code)]
     pub fn get_class_scoped_cert_row(
         &self,
         certification_class: CertificationClass,
@@ -2712,6 +2801,8 @@ impl SynapseStore {
         Ok(activation)
     }
 
+    // Staged storage API consumed by the epic's runtime slice; remove this allow there.
+    #[allow(dead_code)]
     pub fn activate_profile(
         &self,
         profile: &MachineProfile,
@@ -2721,6 +2812,8 @@ impl SynapseStore {
         self.observe_profile(profile, observed_at_ms, module_generation)
     }
 
+    // Staged storage API consumed by the epic's runtime slice; remove this allow there.
+    #[allow(dead_code)]
     pub fn rotation_events(&self) -> Result<Vec<RotationLedgerEvent>, SynapseStoreError> {
         let ids = self.store.with_conn(|conn| {
             let mut stmt = conn.prepare(
@@ -2741,6 +2834,8 @@ impl SynapseStore {
             .collect()
     }
 
+    // Staged storage API consumed by the epic's runtime slice; remove this allow there.
+    #[allow(dead_code)]
     pub fn rotation_event(
         &self,
         event_id: &str,
@@ -2750,6 +2845,8 @@ impl SynapseStore {
             .with_conn(|conn| rotation_event_conn(conn, event_id))?)
     }
 
+    // Staged storage API consumed by the epic's runtime slice; remove this allow there.
+    #[allow(dead_code)]
     pub fn set_rotation_certification_outcome(
         &self,
         event_id: &str,
@@ -2778,7 +2875,7 @@ impl SynapseStore {
                  SET outcome_state = ?1, certified_at_ms = ?2, failure_reason = ?3
                  WHERE event_id = ?4 AND model_id = ?5 AND decode_fingerprint = ?6",
                 params![
-                    outcome_state.as_str(),
+                    outcome_state.encode(),
                     certified_at_ms.map(|value| value as i64),
                     failure_reason,
                     event_id,
@@ -2815,6 +2912,8 @@ impl SynapseStore {
     /// Return persisted values used to add storage information to health responses,
     /// without changing the existing machine-profile hash calculation or its
     /// compatibility behavior.
+    // Staged storage API consumed by the epic's runtime slice; remove this allow there.
+    #[allow(dead_code)]
     pub fn storage_health_inputs(&self) -> Result<StorageHealthInputs, SynapseStoreError> {
         let state = self.profile_state()?;
         let latest_event = self.store.with_conn(|conn| {
@@ -4030,6 +4129,8 @@ const CERT_SELECT_SQL: &str = "SELECT assurance_class, status, machine_profile_h
         remote_profile_hash, identity_revision, numeric_profile_id, fingerprint,
         certified_at_ms, os_build, module_generation, evidence_json FROM cert_rows";
 
+// Staged storage API consumed by the epic's runtime slice; remove this allow there.
+#[allow(dead_code)]
 const OWNED_CERT_SELECT_SQL: &str = "SELECT status, revisioned_machine_profile_hash,
         profile_activation_epoch, model_id, decode_fingerprint, numeric_profile_id,
         fingerprint, certified_at_ms, os_build, module_generation,
@@ -4051,6 +4152,8 @@ struct RawCertificationRow {
     evidence_json: String,
 }
 
+// Staged storage API consumed by the epic's runtime slice; remove this allow there.
+#[allow(dead_code)]
 struct RawClassScopedCertificationRow {
     certification_class: String,
     assurance_class: String,
@@ -4067,6 +4170,8 @@ struct RawClassScopedCertificationRow {
     evidence_json: String,
 }
 
+// Staged storage API consumed by the epic's runtime slice; remove this allow there.
+#[allow(dead_code)]
 struct RawOwnedDecodeCertificationRow {
     status: String,
     revisioned_machine_profile_hash: String,
@@ -4134,6 +4239,8 @@ fn cert_row_from_row(row: &Row<'_>) -> rusqlite::Result<RawCertificationRow> {
     })
 }
 
+// Staged storage API consumed by the epic's runtime slice; remove this allow there.
+#[allow(dead_code)]
 fn class_scoped_cert_row_from_row(
     row: &Row<'_>,
 ) -> rusqlite::Result<RawClassScopedCertificationRow> {
@@ -4154,6 +4261,8 @@ fn class_scoped_cert_row_from_row(
     })
 }
 
+// Staged storage API consumed by the epic's runtime slice; remove this allow there.
+#[allow(dead_code)]
 fn owned_decode_cert_row_from_row(
     row: &Row<'_>,
 ) -> rusqlite::Result<RawOwnedDecodeCertificationRow> {
@@ -4254,11 +4363,15 @@ fn decode_cert_row(row: RawCertificationRow) -> Result<CertificationRow, Synapse
     })
 }
 
+// Staged storage API consumed by the epic's runtime slice; remove this allow there.
+#[allow(dead_code)]
 fn digest_text(hasher: &mut Sha256, value: &str) {
     hasher.update((value.len() as u64).to_be_bytes());
     hasher.update(value.as_bytes());
 }
 
+// Staged storage API consumed by the epic's runtime slice; remove this allow there.
+#[allow(dead_code)]
 fn digest_optional_text(hasher: &mut Sha256, value: Option<&str>) {
     match value {
         Some(value) => digest_text(hasher, value),
@@ -4268,6 +4381,8 @@ fn digest_optional_text(hasher: &mut Sha256, value: Option<&str>) {
     }
 }
 
+// Staged storage API consumed by the epic's runtime slice; remove this allow there.
+#[allow(dead_code)]
 fn digest_optional_u64(hasher: &mut Sha256, value: Option<u64>) {
     match value {
         Some(value) => digest_text(hasher, &value.to_string()),
@@ -4277,12 +4392,16 @@ fn digest_optional_u64(hasher: &mut Sha256, value: Option<u64>) {
     }
 }
 
+// Staged storage API consumed by the epic's runtime slice; remove this allow there.
+#[allow(dead_code)]
 fn is_digest(value: &str) -> bool {
     value.len() == 64
         && value.bytes().all(|byte| byte.is_ascii_hexdigit())
         && value.bytes().all(|byte| !byte.is_ascii_uppercase())
 }
 
+// Staged storage API consumed by the epic's runtime slice; remove this allow there.
+#[allow(dead_code)]
 fn has_only_keys(object: &serde_json::Map<String, Value>, allowed: &[&str]) -> bool {
     object
         .keys()
@@ -4290,6 +4409,8 @@ fn has_only_keys(object: &serde_json::Map<String, Value>, allowed: &[&str]) -> b
         && allowed.iter().all(|key| object.contains_key(*key))
 }
 
+// Staged storage API consumed by the epic's runtime slice; remove this allow there.
+#[allow(dead_code)]
 fn is_catalog_model_id(value: &str) -> bool {
     let mut chars = value.chars();
     let Some(first) = chars.next() else {
@@ -4299,6 +4420,8 @@ fn is_catalog_model_id(value: &str) -> bool {
         && chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ".-_".contains(ch))
 }
 
+// Staged storage API consumed by the epic's runtime slice; remove this allow there.
+#[allow(dead_code)]
 fn validate_approval(row: &ApprovalRow, verify_digest: bool) -> Result<(), SynapseStoreError> {
     if row.schema_revision != APPROVAL_SCHEMA_REVISION {
         return Err(SynapseStoreError::Decode(format!(
@@ -4359,6 +4482,8 @@ fn validate_approval(row: &ApprovalRow, verify_digest: bool) -> Result<(), Synap
     Ok(())
 }
 
+// Staged storage API consumed by the epic's runtime slice; remove this allow there.
+#[allow(dead_code)]
 fn approval_from_row(row: &Row<'_>) -> rusqlite::Result<ApprovalRow> {
     let fencing_metadata: String = row.get(13)?;
     let approved_at_ms = row.get::<_, Option<i64>>(8)?.map(|value| value as u64);
@@ -4386,6 +4511,8 @@ fn approval_from_row(row: &Row<'_>) -> rusqlite::Result<ApprovalRow> {
     })
 }
 
+// Staged storage API consumed by the epic's runtime slice; remove this allow there.
+#[allow(dead_code)]
 fn load_approval_tx(
     tx: &rusqlite::Transaction<'_>,
     row_id: i64,
@@ -4402,6 +4529,8 @@ fn load_approval_tx(
     .optional()
 }
 
+// Staged storage API consumed by the epic's runtime slice; remove this allow there.
+#[allow(dead_code)]
 fn load_approval_tx_by_identity(
     tx: &rusqlite::Transaction<'_>,
     model_id: &str,
@@ -4419,6 +4548,8 @@ fn load_approval_tx_by_identity(
     .optional()
 }
 
+// Staged storage API consumed by the epic's runtime slice; remove this allow there.
+#[allow(dead_code)]
 fn validate_owned_decode_cert_row(
     row: &OwnedDecodeCertificationRow,
 ) -> Result<(), SynapseStoreError> {
@@ -4447,6 +4578,8 @@ fn validate_owned_decode_cert_row(
     Ok(())
 }
 
+// Staged storage API consumed by the epic's runtime slice; remove this allow there.
+#[allow(dead_code)]
 fn complete_g_dec_evidence(evidence: &Value, manifest_revision: &str) -> bool {
     let Some(entries) = evidence
         .get("g_dec")
@@ -4476,6 +4609,8 @@ fn complete_g_dec_evidence(evidence: &Value, manifest_revision: &str) -> bool {
     passed == required
 }
 
+// Staged storage API consumed by the epic's runtime slice; remove this allow there.
+#[allow(dead_code)]
 fn decode_class_scoped_cert_row(
     row: RawClassScopedCertificationRow,
 ) -> Result<ClassScopedCertificationRow, SynapseStoreError> {
@@ -4496,6 +4631,8 @@ fn decode_class_scoped_cert_row(
     })
 }
 
+// Staged storage API consumed by the epic's runtime slice; remove this allow there.
+#[allow(dead_code)]
 fn decode_owned_decode_cert_row(
     row: RawOwnedDecodeCertificationRow,
 ) -> Result<OwnedDecodeCertificationRow, SynapseStoreError> {
@@ -4560,6 +4697,8 @@ fn decode_knob_assignment_row(
     })
 }
 
+// Staged storage API consumed by the epic's runtime slice; remove this allow there.
+#[allow(dead_code)]
 fn validate_profile_state(state: &ProfileState) -> Result<(), SynapseStoreError> {
     match (
         state.snapshot.as_ref(),
@@ -4592,6 +4731,8 @@ fn validate_profile_state(state: &ProfileState) -> Result<(), SynapseStoreError>
     Ok(())
 }
 
+// Staged storage API consumed by the epic's runtime slice; remove this allow there.
+#[allow(dead_code)]
 fn profile_state_from_row(row: &Row<'_>) -> rusqlite::Result<ProfileState> {
     let snapshot_json: Option<String> = row.get(0)?;
     let snapshot = snapshot_json
@@ -4622,6 +4763,8 @@ fn profile_state_from_row(row: &Row<'_>) -> rusqlite::Result<ProfileState> {
     })
 }
 
+// Staged storage API consumed by the epic's runtime slice; remove this allow there.
+#[allow(dead_code)]
 fn changed_profile_fields(previous: &MachineProfile, current: &MachineProfile) -> Vec<String> {
     let mut changed = Vec::new();
     if previous.os_build != current.os_build {
@@ -4646,6 +4789,8 @@ fn changed_profile_fields(previous: &MachineProfile, current: &MachineProfile) -
     changed
 }
 
+// Staged storage API consumed by the epic's runtime slice; remove this allow there.
+#[allow(dead_code)]
 fn rotation_event_id(new_hash: &str, epoch: u64) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"rotation-ledger-v1\0");
@@ -4654,6 +4799,8 @@ fn rotation_event_id(new_hash: &str, epoch: u64) -> String {
     hex::encode(hasher.finalize())
 }
 
+// Staged storage API consumed by the epic's runtime slice; remove this allow there.
+#[allow(dead_code)]
 fn rotation_outcome_from_row(row: &Row<'_>) -> rusqlite::Result<RotationCertificationOutcome> {
     Ok(RotationCertificationOutcome {
         event_id: row.get(0)?,
@@ -4665,6 +4812,8 @@ fn rotation_outcome_from_row(row: &Row<'_>) -> rusqlite::Result<RotationCertific
     })
 }
 
+// Staged storage API consumed by the epic's runtime slice; remove this allow there.
+#[allow(dead_code)]
 fn rotation_event_conn(
     conn: &rusqlite::Connection,
     event_id: &str,
@@ -4763,11 +4912,13 @@ fn rotation_event_conn(
     }))
 }
 
+// Staged storage API consumed by the epic's runtime slice; remove this allow there.
+#[allow(dead_code)]
 fn rotation_event_tx(
     tx: &rusqlite::Transaction<'_>,
     event_id: &str,
 ) -> rusqlite::Result<RotationLedgerEvent> {
-    rotation_event_conn(&*tx, event_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
+    rotation_event_conn(tx, event_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
 }
 
 fn to_sql_error(error: SynapseStoreError) -> rusqlite::Error {
@@ -5794,19 +5945,20 @@ mod tests {
             )
             .unwrap()
             .is_some());
+        let match_inputs = OwnedDecodeMatchInputs {
+            revisioned_machine_profile_hash: profile_hash.clone(),
+            profile_activation_epoch: 3,
+            model_id: "owned-model".to_string(),
+            decode_fingerprint: decode_fingerprint.clone(),
+            processing_fingerprint: "processing-a".to_string(),
+            runtime_config_digest: "runtime-a".to_string(),
+            constraint_runtime_identities: vec!["constraint-a".to_string()],
+            worker_path_evidence: serde_json::json!({"worker": "a"}),
+            evidence_schema_revision: CERT_EVIDENCE_SCHEMA_REVISION.to_string(),
+            g_dec_manifest_revision: G_DEC_MANIFEST_REVISION.to_string(),
+        };
         assert!(store
-            .get_owned_decode_cert_row_matching(
-                &profile_hash,
-                3,
-                "owned-model",
-                &decode_fingerprint,
-                "processing-a",
-                "runtime-a",
-                &["constraint-a".to_string()],
-                &serde_json::json!({"worker": "a"}),
-                CERT_EVIDENCE_SCHEMA_REVISION,
-                G_DEC_MANIFEST_REVISION,
-            )
+            .get_owned_decode_cert_row_matching(&match_inputs)
             .unwrap()
             .is_some());
         assert!(store
