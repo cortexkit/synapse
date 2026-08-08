@@ -3564,6 +3564,15 @@ fn model_runtime_config(
     runtime_config
 }
 
+// PREMISE this fallback depends on (not just the conclusion): a legacy catalog
+// row without a declared backend was necessarily loaded by a default-build
+// worker on this same platform, so "the platform default" and "what the
+// artifact ran against" are the same value. That holds only while this mapping
+// mirrors the llama worker's default build selection (metal on macOS, cpu
+// elsewhere). If the worker's default build ever changes, this function must
+// change with it in the same commit — otherwise legacy rows silently declare
+// a backend their artifacts never ran under, and the worker-side equality
+// check turns that drift into hard load refusals.
 fn default_llama_backend() -> &'static str {
     if cfg!(target_os = "macos") {
         "metal"
