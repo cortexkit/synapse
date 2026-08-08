@@ -1,0 +1,58 @@
+{
+  "contract_revision": "rotation-ledger-contract-v1",
+  "schema_revision": "runtime-bound-records-contracts-v1",
+  "contract_kind": "profile_rotation_parent_child_ledger",
+  "parent": {
+    "table": "profile_rotation_events",
+    "ddl": "CREATE TABLE profile_rotation_events (event_id TEXT PRIMARY KEY, old_revisioned_machine_profile_hash TEXT, new_revisioned_machine_profile_hash TEXT NOT NULL, old_profile_activation_epoch INTEGER, new_profile_activation_epoch INTEGER NOT NULL CHECK (new_profile_activation_epoch > 0), changed_fields_json TEXT NOT NULL, previous_snapshot_json TEXT, current_snapshot_json TEXT NOT NULL, observed_at_ms INTEGER NOT NULL, module_generation INTEGER NOT NULL, created_at_ms INTEGER NOT NULL, UNIQUE (new_revisioned_machine_profile_hash, new_profile_activation_epoch))",
+    "fields": [
+      "event_id",
+      "old_revisioned_machine_profile_hash",
+      "new_revisioned_machine_profile_hash",
+      "old_profile_activation_epoch",
+      "new_profile_activation_epoch",
+      "changed_fields_json",
+      "previous_snapshot_json",
+      "current_snapshot_json",
+      "observed_at_ms",
+      "module_generation",
+      "created_at_ms"
+    ],
+    "identity": "one event for each committed activation epoch",
+    "first_store": "no parent event; epoch 1 snapshot is persisted without a rotation event"
+  },
+  "children": {
+    "table": "profile_rotation_certification_outcomes",
+    "ddl": "CREATE TABLE profile_rotation_certification_outcomes (event_id TEXT NOT NULL REFERENCES profile_rotation_events(event_id) ON DELETE CASCADE, model_id TEXT NOT NULL, decode_fingerprint TEXT NOT NULL, outcome_state TEXT NOT NULL CHECK (outcome_state IN ('not_required','required','in_progress','passed','failed')), certified_at_ms INTEGER, failure_reason TEXT, PRIMARY KEY (event_id, model_id, decode_fingerprint))",
+    "identity": ["event_id", "model_id", "decode_fingerprint"],
+    "ordering": "model_id then decode_fingerprint ascending",
+    "states": ["not_required", "required", "in_progress", "passed", "failed"],
+    "terminal_outcomes": ["passed", "failed"]
+  },
+  "atomic_write": {
+    "transaction": [
+      "read persisted hash and positive epoch",
+      "compare-and-set snapshot and next epoch",
+      "insert exactly one parent event",
+      "insert affected approval children with pending and terminal outcomes",
+      "commit all changes together"
+    ],
+    "cas": "UPDATE profile_state SET snapshot_json=?, revisioned_machine_profile_hash=?, profile_activation_epoch=? WHERE revisioned_machine_profile_hash=? AND profile_activation_epoch=?",
+    "loser": "re-read committed snapshot and epoch; emit no event and do not increment",
+    "duplicate_event": "UNIQUE(new_revisioned_machine_profile_hash,new_profile_activation_epoch) causes adoption, never a second event"
+  },
+  "changed_field_rules": {
+    "normal": "top-level persisted MachineProfile field names sorted in ASCII order and joined with commas",
+    "os_build": "WARN",
+    "other_rotations": "INFO",
+    "unknown_previous_snapshot": "permitted only when old hash and epoch are structurally valid but detailed old fields are unavailable",
+    "malformed_state": "corruption and fail closed; never use unknown_previous_snapshot"
+  },
+  "recovery": {
+    "startup": "re-read the last committed parent and adopt it without emitting a duplicate",
+    "child_missing": "health reports required or failed according to durable parent state; recovery may insert missing children only in a fenced transaction",
+    "orphan_child": "reject as corruption; foreign event_id cannot satisfy admission",
+    "partial_commit": "SQLite rollback leaves snapshot, epoch, parent, and children at the prior committed state",
+    "audit_query": "all three observed epochs in A/epoch-1 -> B/epoch-2 -> A/epoch-3 remain queryable"
+  }
+}

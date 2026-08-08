@@ -1,0 +1,90 @@
+{
+  "contract_revision": "catalog-entry-contract-v1",
+  "schema_revision": "runtime-bound-records-contracts-v1",
+  "contract_kind": "catalog_entry_mapping",
+  "authoritative_type": "crates/synapse-module/owned-decode-routing/mod.rs::CatalogEntry",
+  "entry_id": {
+    "meaning": "The canonical production catalog model_id used by routing and stored-model configuration.",
+    "type": "non-empty ASCII string",
+    "canonical_form": "lowercase [a-z0-9][a-z0-9._-]*",
+    "authority": "dedicated CatalogEntry.entry_id; no alias or profile field may override it",
+    "uniqueness": "unique across the production catalog",
+    "stability": "unchanged across machine-profile, processing-fingerprint, runtime-config, constrained-runtime, worker-path, and evidence-manifest changes",
+    "decode_rotation": "a changed decode_fingerprint is a new approval identity and never inherits approval",
+    "forbidden_sources": ["machine_profile_hash", "numeric_profile_id", "certification_evidence_id", "D-009 record ordinal"]
+  },
+  "canonical_fields": [
+    "entry_id",
+    "engine",
+    "task",
+    "lane",
+    "worker",
+    "risk_class",
+    "family",
+    "activation_dtype",
+    "weight_quant",
+    "arithmetic_identity_revision",
+    "metallib_revision",
+    "max_context_tokens",
+    "artifact_source_digest",
+    "q8"
+  ],
+  "required_identity_values": {
+    "engine": "owned-metal-decode",
+    "task": "generate",
+    "lane": "decode",
+    "worker": "supervised",
+    "risk_class": "abort_capable",
+    "family": ["qwen3-0.6b", "lfm2-1.2b"],
+    "activation_dtype": "f16",
+    "weight_quant": ["f16", "q8_0"]
+  },
+  "readable_aliases": {
+    "owned_family": "must equal family when present",
+    "owned_dtype": "must equal activation_dtype when present",
+    "quant": "must equal weight_quant when present",
+    "write_policy": "new records write canonical fields; aliases are migration input only"
+  },
+  "mapping_invariants": [
+    "CatalogEntry.entry_id is copied byte-for-byte to approval.model_id.",
+    "Catalog lookup maps one entry_id to exactly one catalog identity; zero or multiple canonical matches are unmappable_identity.",
+    "Two source records that resolve to the same (entry_id, decode_fingerprint) are a duplicate_identity before any approval write.",
+    "A profile hash, profile activation epoch, processing fingerprint, runtime config digest, constrained identity, worker identity, or manifest revision cannot change model_id.",
+    "The all-empty m5-validation-machine source record is not a catalog mapping and is excluded from the migration seed.",
+    "Canonical field validation and alias agreement happen before decode-fingerprint calculation and before migration writes."
+  ],
+  "pinned_catalog_mapping": [
+    {
+      "source_catalog_entry_id": "qwen3-0.6b-decode-f16",
+      "model_id": "qwen3-0.6b-decode-f16",
+      "family": "qwen3-0.6b",
+      "weight_quant": "f16"
+    },
+    {
+      "source_catalog_entry_id": "lfm2-1.2b-decode-f16",
+      "model_id": "lfm2-1.2b-decode-f16",
+      "family": "lfm2-1.2b",
+      "weight_quant": "f16"
+    },
+    {
+      "source_catalog_entry_id": "qwen3-0.6b-decode-q8_0",
+      "model_id": "qwen3-0.6b-decode-q8_0",
+      "family": "qwen3-0.6b",
+      "weight_quant": "q8_0"
+    },
+    {
+      "source_catalog_entry_id": "lfm2-1.2b-decode-q8_0",
+      "model_id": "lfm2-1.2b-decode-q8_0",
+      "family": "lfm2-1.2b",
+      "weight_quant": "q8_0"
+    }
+  ],
+  "validation_order": [
+    "parse deny-unknown-field CatalogEntry",
+    "validate canonical identity and aliases",
+    "validate unique entry_id",
+    "resolve source_catalog_entry_id to exactly one production CatalogEntry",
+    "derive or verify decode_fingerprint",
+    "construct approval identity from (entry_id, decode_fingerprint)"
+  ]
+}

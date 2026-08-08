@@ -1,10 +1,12 @@
 {
   "manifest_revision": "slice-plan-v1",
-  "schema_revision": "owned-decode-contracts-v1",
-  "slice_id": "S1-contract-manifests",
+  "schema_revision": "runtime-bound-records-contracts-v1",
+  "slice_id": "slice-1-contracts-and-manifests",
   "work_item": "wi:[consult-id]:4:s1",
   "file_fence": [
-    "crates/synapse-module/owned-decode-contracts/**",
+    "**/manifests/**",
+    "**/*-manifest.*",
+    "**/*-contract.*",
     "crates/synapse-module/owned-decode-manifests/**"
   ],
   "artifacts": [
@@ -17,6 +19,20 @@
     "crates/synapse-module/owned-decode-manifests/grammar-cost-corpus-v1.json",
     "crates/synapse-module/owned-decode-manifests/ci-lane-manifest-v1.json",
     "crates/synapse-module/owned-decode-manifests/slice-plan-v1.json",
-    "crates/synapse-module/src/owned_decode_contracts/mod.rs"
+    "crates/synapse-module/owned-decode-manifests/runtime-bound-decode-cutover-epic-manifest-v1.json",
+    "crates/synapse-module/owned-decode-manifests/catalog-entry-contract-v1.json",
+    "crates/synapse-module/owned-decode-manifests/approval-row-contract-v1.json",
+    "crates/synapse-module/owned-decode-manifests/evidence-compatibility-contract-v1.json",
+    "crates/synapse-module/owned-decode-manifests/cert-row-schema-manifest-v1.json",
+    "crates/synapse-module/owned-decode-manifests/owned-decode-error-contract-v1.json",
+    "crates/synapse-module/owned-decode-manifests/rotation-ledger-contract-v1.json",
+    "crates/synapse-module/owned-decode-manifests/migration-contract-v1.json",
+    "crates/synapse-module/owned-decode-manifests/operator-health-contract-v1.json",
+    "crates/synapse-module/owned-decode-manifests/admission-probe-boundary-contract-v1.json",
+    "crates/synapse-module/owned-decode-manifests/machine-profile-hash-boundary-manifest-v1.json",
+    "crates/synapse-module/owned-decode-manifests/supported-trigger-manifest-v1.json",
+    "crates/synapse-module/owned-decode-manifests/owned-decode-test-manifest-v1.json",
+    "crates/synapse-module/owned-decode-manifests/execution-manifest-v1.json",
+    "crates/synapse-module/owned-decode-manifests/migration-seed-manifest-v1.json"
   ]
 }

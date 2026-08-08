@@ -1,0 +1,115 @@
+{
+  "manifest_revision": "migration-seed-v1",
+  "schema_revision": "runtime-bound-records-contracts-v1",
+  "artifact_kind": "migration_only_seed",
+  "source": {
+    "path": "crates/synapse-module/owned-decode-certification/d009-cutover-records-v1.json",
+    "manifest_revision": "d009-cutover-records-v1",
+    "record_selection": [1, 2, 3, 4],
+    "record_numbering": "zero-based records array indexes",
+    "excluded_source_records": [
+      {
+        "index": 0,
+        "reason": "all-empty placeholder has no catalog identity and is not a retired approval decision"
+      }
+    ]
+  },
+  "expansion": {
+    "method": "for each selected retired record, resolve record.enabled_catalog_entry_ids[0] to exactly one CatalogEntry.entry_id, copy the canonical entry_id to model_id, copy the corresponding decode_fingerprint, and retain only enablement, grammar_enabled, disabled_reason, and source provenance",
+    "input_count": 4,
+    "output_count": 4,
+    "output_order": "ascending source record index",
+    "mechanically_expanded": true,
+    "prohibited_output_fields": [
+      "profile",
+      "machine_profile_hash",
+      "numeric_profile_id",
+      "processing_fingerprint",
+      "runtime_config_digest",
+      "certification_evidence_id",
+      "G-DEC evidence",
+      "concrete cert-row evidence",
+      "worker-path evidence"
+    ]
+  },
+  "seed_revision": "owned-decode-approval-migration-v1",
+  "initial_evidence_requirements_revision": "owned-decode-evidence-requirements-v1",
+  "entries": [
+    {
+      "source_catalog_entry_id": "qwen3-0.6b-decode-f16",
+      "model_id": "qwen3-0.6b-decode-f16",
+      "decode_fingerprint": "8bcb6dfc1bd55a38a56b5a6931132f428687e064104d106c2cc5efb898f80feb",
+      "enabled": true,
+      "grammar_enabled": true,
+      "disabled_reason": null,
+      "d009_provenance": {
+        "source_manifest_revision": "d009-cutover-records-v1",
+        "source_record_index": 1
+      }
+    },
+    {
+      "source_catalog_entry_id": "lfm2-1.2b-decode-f16",
+      "model_id": "lfm2-1.2b-decode-f16",
+      "decode_fingerprint": "741e56178506918edd7ff91b7bf88214f97df974c3b5567196d0ce0cc594a8dd",
+      "enabled": false,
+      "grammar_enabled": true,
+      "disabled_reason": "pending fleet certification of this lane",
+      "d009_provenance": {
+        "source_manifest_revision": "d009-cutover-records-v1",
+        "source_record_index": 2
+      }
+    },
+    {
+      "source_catalog_entry_id": "qwen3-0.6b-decode-q8_0",
+      "model_id": "qwen3-0.6b-decode-q8_0",
+      "decode_fingerprint": "4d0a846b33fdbbbc9032ead51e5d9c72af48e145f425cc5802b1205e44dc9e00",
+      "enabled": true,
+      "grammar_enabled": true,
+      "disabled_reason": null,
+      "d009_provenance": {
+        "source_manifest_revision": "d009-cutover-records-v1",
+        "source_record_index": 3
+      }
+    },
+    {
+      "source_catalog_entry_id": "lfm2-1.2b-decode-q8_0",
+      "model_id": "lfm2-1.2b-decode-q8_0",
+      "decode_fingerprint": "c4f0884cfa99e0c3e7c2403626e5363cb46645b6b51840d720e98539f9577f2f",
+      "enabled": false,
+      "grammar_enabled": true,
+      "disabled_reason": "pending fleet certification of this lane",
+      "d009_provenance": {
+        "source_manifest_revision": "d009-cutover-records-v1",
+        "source_record_index": 4
+      }
+    }
+  ],
+  "mechanical_proof": {
+    "expansion_identity": ["model_id", "decode_fingerprint"],
+    "unique_expanded_identities": 4,
+    "duplicate_identity_fixture": {
+      "entries": [
+        {
+          "model_id": "qwen3-0.6b-decode-f16",
+          "decode_fingerprint": "8bcb6dfc1bd55a38a56b5a6931132f428687e064104d106c2cc5efb898f80feb"
+        },
+        {
+          "model_id": "qwen3-0.6b-decode-f16",
+          "decode_fingerprint": "8bcb6dfc1bd55a38a56b5a6931132f428687e064104d106c2cc5efb898f80feb"
+        }
+      ],
+      "repeated_identity": true,
+      "expected_outcome": "duplicate_identity",
+      "writes_or_marker_change": false
+    },
+    "catalog_collision_fixture": {
+      "same_model_id_different_fingerprint": "not a duplicate identity; it requires a distinct explicit approval",
+      "same_model_id_same_fingerprint": "duplicate_identity"
+    }
+  },
+  "reachability": {
+    "reachable_only_from": "the one-shot migration admin operation",
+    "unreachable_from": ["routing", "certification lookup", "health evaluation", "serving admission"],
+    "seed_contains_no_runtime_evidence": true
+  }
+}

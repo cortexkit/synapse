@@ -1,0 +1,103 @@
+{
+  "contract_revision": "migration-contract-v1",
+  "schema_revision": "runtime-bound-records-contracts-v1",
+  "contract_kind": "one_shot_approval_migration",
+  "invocation": {
+    "command": "ck-synapse approvals migrate-owned-decode --seed-revision owned-decode-approval-migration-v1 --schema-revision runtime-bound-records-contracts-v1",
+    "admin_api": "migrate_owned_decode_approvals(seed_revision, schema_revision)",
+    "one_shot": true,
+    "fenced_transaction": true,
+    "ambient_fleet_daemon": "forbidden; use an environment-scoped store"
+  },
+  "inputs": {
+    "seed_path": "crates/synapse-module/owned-decode-manifests/migration-seed-manifest-v1.json",
+    "seed_revision": "owned-decode-approval-migration-v1",
+    "schema_revision": "runtime-bound-records-contracts-v1",
+    "initial_evidence_requirements_revision": "owned-decode-evidence-requirements-v1",
+    "marker_key": "owned-decode-approval-migration-v1"
+  },
+  "outcomes": [
+    {
+      "id": "applied",
+      "rendering": "applied: seed_revision=owned-decode-approval-migration-v1 rows=4 marker=committed",
+      "when": "All semantic validation, catalog mapping, uniqueness checks, row construction, digest verification, writes, and marker commit succeed atomically.",
+      "state_change": "approval rows and marker are committed exactly once"
+    },
+    {
+      "id": "already_applied",
+      "rendering": "already_applied: seed_revision=owned-decode-approval-migration-v1 rows=4 marker=unchanged",
+      "when": "The same revision marker is already committed and the seed is byte-identical to the recorded revision.",
+      "state_change": "nothing changes; no row timestamp or generation is touched"
+    },
+    {
+      "id": "invalid_seed",
+      "rendering": "invalid_seed: reason=<canonical validation reason> marker=unchanged",
+      "when": "Seed revision, schema, fields, policy compatibility, structural values, or pre-commit digest construction or verification is invalid.",
+      "state_change": "approvals and marker remain unchanged"
+    },
+    {
+      "id": "unmappable_identity",
+      "rendering": "unmappable_identity: source_catalog_entry_id=<id> matches=<count> marker=unchanged",
+      "when": "A seed source identity resolves to zero or more than one canonical CatalogEntry.entry_id.",
+      "state_change": "approvals and marker remain unchanged"
+    },
+    {
+      "id": "duplicate_identity",
+      "rendering": "duplicate_identity: model_id=<id> decode_fingerprint=<digest> marker=unchanged",
+      "when": "Two seed rows collide on (model_id, decode_fingerprint), or existing approval state violates the migration uniqueness precondition.",
+      "state_change": "approvals and marker remain unchanged; no winner is selected"
+    },
+    {
+      "id": "transaction_failed",
+      "rendering": "transaction_failed: phase=<fence|sqlite|durability|commit> marker=unchanged",
+      "when": "Fencing, SQLite execution, durability, or commit fails after semantic input validation has succeeded.",
+      "state_change": "the transaction rolls back and approvals and marker remain unchanged"
+    }
+  ],
+  "derived_approval_fields": {
+    "approved_by": "migration:owned-decode-approval-migration-v1",
+    "approved_at_ms": "the fenced migration transaction timestamp; required for enabled rows and never read from the seed",
+    "updated_at_ms": "the same transaction timestamp on first insert; excluded from semantic_digest"
+  },
+  "validation_order": [
+    "check seed and schema revision",
+    "reject unknown fields and forbidden runtime/evidence fields",
+    "resolve every source_catalog_entry_id to exactly one CatalogEntry.entry_id",
+    "verify the four expanded entries and the absence of the placeholder",
+    "check duplicate identities within the seed",
+    "check existing approval uniqueness before selecting any winner",
+    "construct rows and semantic_digest values in memory",
+    "verify every digest before opening the write phase",
+    "acquire store fence and compare the migration marker",
+    "write approvals and marker in one transaction",
+    "commit durability and render exactly one outcome"
+  ],
+  "recovery_semantics": {
+    "pre_commit_failure": "rollback; rerun after correcting the seed; map digest failure to invalid_seed, never transaction_failed",
+    "post_validation_transaction_failure": "rollback; preserve marker and approvals; inspect SQLite/fence/durability before retry",
+    "process_crash_before_commit": "SQLite rollback leaves marker absent or previous; rerun produces applied",
+    "process_crash_after_commit": "marker makes a retry already_applied and the retry is a no-op",
+    "different_seed_same_revision": "invalid_seed; never reinterpret a committed revision",
+    "recovery_operator_procedure": [
+      "back up the environment-scoped store",
+      "record the exact rendered outcome and SQLite durability error if present",
+      "verify the marker and approval rows are unchanged on any non-success",
+      "repair fencing or storage infrastructure without editing approval rows",
+      "rerun the exact pinned invocation",
+      "accept only applied or already_applied"
+    ]
+  },
+  "digest_contract": {
+    "separator": "owned-decode-approval-row-v1\\0",
+    "algorithm": "lowercase SHA-256",
+    "included_fields": ["schema_revision", "model_id", "decode_fingerprint", "enabled", "grammar_enabled", "disabled_reason", "approved_by", "approved_at_ms", "evidence_requirements_revision"],
+    "excluded_fields": ["updated_at_ms", "row_id", "generation", "fencing_metadata", "semantic_digest"],
+    "verification_failure_outcome": "invalid_seed"
+  },
+  "mechanical_duplicate_check": {
+    "fixture_source": "migration-seed-manifest-v1.mechanical_proof.duplicate_identity_fixture",
+    "expected_outcome": "duplicate_identity",
+    "expected_approval_count_after_check": 0,
+    "expected_marker_change": false
+  }
+}

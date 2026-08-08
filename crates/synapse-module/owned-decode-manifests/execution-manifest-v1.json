@@ -1,0 +1,67 @@
+{
+  "manifest_revision": "execution-manifest-v1",
+  "schema_revision": "runtime-bound-records-contracts-v1",
+  "artifact_kind": "release_execution_jobs",
+  "store_policy": {
+    "approval_and_certification_tests": "temporary environment-scoped SQLite store",
+    "store_configuration": "test harness supplies a unique temporary path; ambient fleet daemon and production store are forbidden",
+    "migration_cutover": "backup store, replacement binary once, one-shot migration, probe re-certification, admission verification"
+  },
+  "jobs": [
+    {
+      "id": "authoritative-unit",
+      "kind": "authoritative_unit",
+      "command": "cargo test --workspace --all-targets",
+      "ci_reference": ".github/workflows/ci.yml#test.nextest",
+      "environment": "workspace checkout with sibling subconscious and commons path dependencies; isolated test store",
+      "required": true,
+      "skipped_is_not_pass": true
+    },
+    {
+      "id": "integration",
+      "kind": "integration",
+      "command": "cargo nextest run -p synapse-core -p synapse-module -p owned-decode-worker -p synapse-worker-decode --retries 0",
+      "ci_reference": ".github/workflows/ci.yml#test.nextest",
+      "environment": "isolated temporary store; no ambient fleet daemon",
+      "required": true,
+      "skipped_is_not_pass": true
+    },
+    {
+      "id": "skeleton_e2e",
+      "kind": "skeleton_e2e",
+      "command": "cargo test -p synapse-module --lib skeleton_e2e",
+      "ci_reference": "owned-decode skeleton_e2e job identifier",
+      "environment": "environment-scoped store and fixture registry; no production approvals",
+      "required": true,
+      "release_rule": "the job must exist and pass after downstream storage/runtime slices; an absent or skipped job is not a pass"
+    },
+    {
+      "id": "mandatory-macos-metal",
+      "kind": "mandatory_lane",
+      "command": "cargo nextest run -p synapse-core -p synapse-module -p owned-decode-worker -p synapse-worker-decode -p synapse-worker-mlx -p synapse-worker-ane --retries 0",
+      "ci_reference": ".github/workflows/ci.yml#test.matrix[name=macos-metal]",
+      "runner": "self-hosted macos-metal",
+      "environment": "isolated temporary store; exact fixture and manifest revisions from runtime-bound-decode-cutover-epic-v1",
+      "required": true,
+      "mandatory_gates": ["G-DEC-01", "G-DEC-02", "G-DEC-03", "G-DEC-04", "G-DEC-05", "G-DEC-06", "G-DEC-07", "G-DEC-08", "G-DEC-09", "G-DEC-10", "G-DEC-11", "G-DEC-12"],
+      "skipped_is_not_pass": true
+    },
+    {
+      "id": "m1-arbiter",
+      "kind": "arbiter",
+      "command": "cargo test -p synapse-module --lib m1_arbiter",
+      "ci_reference": "M1-arbiter release job identifier",
+      "runner": "M1 arbiter",
+      "environment": "environment-scoped store, pinned binary and manifest digests, no approval mutation during trigger probe",
+      "required": true,
+      "release_rule": "the arbiter must independently verify the transition report, old/new hashes and epochs, ledger event, approval byte identity, and no-build/no-deploy evidence"
+    }
+  ],
+  "completion": {
+    "all_named_jobs_must_pass": true,
+    "all_mandatory_gate_entries_exactly_once": true,
+    "zero_skips_on_mandatory_lane": true,
+    "no_job_may_connect_to_ambient_fleet_daemon": true,
+    "cargo_fmt_before_commit": "cargo fmt --all"
+  }
+}

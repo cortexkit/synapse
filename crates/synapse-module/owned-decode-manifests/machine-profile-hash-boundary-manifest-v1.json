@@ -1,0 +1,101 @@
+{
+  "manifest_revision": "machine-profile-hash-boundary-v1",
+  "schema_revision": "runtime-bound-records-contracts-v1",
+  "artifact_kind": "hash_boundary_inventory",
+  "hash_revision": "machine-profile-v2",
+  "functions": {
+    "legacy": "MachineProfile::hash() = SHA-256(stable_profile_bytes)",
+    "revisioned": "MachineProfile::revisioned_hash() = SHA-256(ASCII machine-profile-v2 + NUL + stable_profile_bytes)",
+    "stable_bytes": "serde_json::to_vec(MachineProfile) in struct field order; collected engine_identities are sorted before construction"
+  },
+  "boundaries": [
+    {
+      "path": "crates/synapse-core/src/machine_profile.rs",
+      "symbols": ["MachineProfile::stable_bytes", "MachineProfile::hash"],
+      "current_function": "hash",
+      "decision": "retain",
+      "consumers": ["legacy health machine_profile_hash", "legacy remote/profile compatibility", "non-owned historical state"],
+      "migration": "do not reinterpret existing field; it remains a legacy hash"
+    },
+    {
+      "path": "crates/synapse-core/src/machine_profile.rs",
+      "symbols": ["MachineProfile::revisioned_hash"],
+      "current_function": "revisioned_hash",
+      "decision": "change/new-owned-boundary",
+      "consumers": ["owned-decode approval certification", "cert-row logical identity", "profile activation epoch", "rotation ledger", "owned admission"],
+      "migration": "new evidence uses revisioned hash; legacy owned rows are non-matchable until re-probed"
+    },
+    {
+      "path": "crates/synapse-core/src/cuda.rs",
+      "symbols": ["MACHINE_PROFILE_HASH_REVISION", "revisioned_machine_profile_hash"],
+      "current_function": "revisioned_hash",
+      "decision": "retain as canonical implementation",
+      "consumers": ["MachineProfile::revisioned_hash"],
+      "migration": "bump revision only with explicit manifest and evidence invalidation"
+    },
+    {
+      "path": "crates/synapse-module/src/store.rs",
+      "symbols": ["CertificationKey::Measured", "CertificationKey::key_hash", "store_cert_row", "get_cert_row", "latest_cert_row", "latest_probe_row", "has_stale_cert_row", "cert_rows direct SQL"],
+      "current_function": "machine_profile_hash key_hash and shared conflict target",
+      "decision": "change for measured_owned_decode; retain for non-owned classes",
+      "consumers": ["certification reads/writes", "staleness checks", "upsert conflict targets"],
+      "migration": "class-specific rebuild from cert-row-schema-v1; no winner on duplicate replacement identity"
+    },
+    {
+      "path": "crates/synapse-module/owned-decode-routing/lane.rs",
+      "symbols": ["CutoverRecord", "owned admission matching"],
+      "current_function": "machine_profile_hash in profile-keyed cutover record",
+      "decision": "redirect",
+      "consumers": ["owned serving admission"],
+      "migration": "replace profile-keyed record with approval identity plus current revisioned hash and epoch; delete profile-oriented rollback"
+    },
+    {
+      "path": "crates/synapse-module/owned-decode-certification/cutover.rs",
+      "symbols": ["D009CutoverRecord", "CutoverEvidenceInputs", "D009CutoverRecords::validate"],
+      "current_function": "compiled profile-bound evidence and D-009 matching",
+      "decision": "delete serving path; retain only migration provenance input",
+      "consumers": ["one-shot migration seed expansion"],
+      "migration": "exclude placeholder and carry no profile, processing, runtime, concrete evidence, or G-DEC binding"
+    },
+    {
+      "path": "crates/synapse-module/src/lib.rs",
+      "symbols": ["module_health", "ensure_fingerprint_certified", "PersistentDecodeCertification", "owned admission matching"],
+      "current_function": "certification and health use legacy/profile-bound values",
+      "decision": "change owned decode to revisioned hash plus epoch; retain embedding/rerank behavior",
+      "consumers": ["routing", "operator health", "quarantine and worker-start state"],
+      "migration": "additive health fields; old health field remains legacy and new evidence is required"
+    },
+    {
+      "path": "crates/synapse-engine-owned/owned-decode-worker/src/identity.rs",
+      "symbols": ["DecodeIdentity", "quarantine key readers"],
+      "current_function": "worker identity and runtime key",
+      "decision": "change only the owned-decode certification binding",
+      "consumers": ["worker start checks and quarantine"],
+      "migration": "worker-path evidence is serve-time evidence; stale rows do not admit"
+    },
+    {
+      "path": "crates/synapse-module/src/remote/runtime.rs",
+      "symbols": ["remote profile and identity hashes"],
+      "current_function": "remote identity hashing",
+      "decision": "retain",
+      "consumers": ["remote credentials and declared assurance"],
+      "migration": "never satisfy measured_owned_decode admission"
+    }
+  ],
+  "repository_search_guards": [
+    "machine_profile_hash",
+    "revisioned_machine_profile_hash",
+    "MachineProfile::hash()",
+    "MachineProfile::revisioned_hash()",
+    "CertificationKey",
+    "cert_rows",
+    "latest_cert_row",
+    "has_stale_cert_row"
+  ],
+  "invariants": [
+    "Every owned-decode reader and writer is listed above or is rejected by the repository-search guard before downstream implementation.",
+    "Sites retaining MachineProfile::hash() keep their existing behavior and are not silently switched.",
+    "Sites in the owned boundary use MachineProfile::revisioned_hash() and current positive profile_activation_epoch.",
+    "The manifest does not claim physical-machine identity or detect an unobserved A-to-B-to-A transition."
+  ]
+}

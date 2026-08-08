@@ -1,0 +1,61 @@
+{
+  "contract_revision": "admission-probe-boundary-contract-v1",
+  "schema_revision": "runtime-bound-records-contracts-v1",
+  "contract_kind": "terminal_admission_and_probe_boundaries",
+  "owned_admission": {
+    "linearization": "the fenced store transaction that reads approval, matching cert row, current revisioned hash, and current positive profile_activation_epoch",
+    "resolution_context": {
+      "stamped_fields": ["model_id", "decode_fingerprint", "current_revisioned_machine_profile_hash", "profile_activation_epoch", "evidence_schema_revision", "approval_revision"],
+      "approval_write_allowed": false,
+      "certification_write_allowed": false
+    },
+    "dispatch_boundary": "the existing pre-dispatch check immediately before the first worker frame or generated response frame is sent",
+    "last_check": "the dispatch path re-reads persisted profile_activation_epoch and refuses with owned_decode_not_certified when the stamped epoch differs",
+    "interleavings": {
+      "activation_before_admission_commit": "admission resolves the new epoch or fails closed",
+      "admission_before_activation_commit": "the old epoch may dispatch only if it crossed the dispatch boundary before activation committed",
+      "resolved_before_activation_but_not_dispatched": "re-resolve at the dispatch boundary or return the existing fail-closed refusal",
+      "post_activation_old_evidence": "never dispatches"
+    },
+    "fallback": "only the exact six fallback-eligible refusal IDs may select a compatible llama lane for substitutable unconstrained requests"
+  },
+  "probe_snapshot": {
+    "captured_once_at_start": [
+      "revisioned_machine_profile_hash",
+      "profile_activation_epoch",
+      "model_id",
+      "decode_fingerprint",
+      "processing_fingerprint",
+      "runtime_config_digest",
+      "constraint_runtime_identity_set",
+      "worker_path_evidence_identity",
+      "evidence_schema_revision",
+      "exact_g_dec_manifest_revision"
+    ],
+    "terminal_transaction": "re-resolve every runtime-derived member inside the fenced cert-row write transaction",
+    "comparison": "byte-exact for digests, identities, revisions, and ordered identity sets",
+    "changed_member": {
+      "outcome": "probe_stale",
+      "audit_event": "stale_probe",
+      "cert_row_write": "aborted",
+      "old_measurement_matchable": false,
+      "approval_row_changed": false
+    },
+    "unchanged_member": {
+      "outcome": "certified",
+      "write": "one immutable measured row under the complete class-specific identity"
+    }
+  },
+  "release_window": {
+    "between_replacement_deployment_and_first_post_cutover_probe": "no owned admission",
+    "substitutable_unconstrained": "configured llama fallback",
+    "identity_pinned": "owned_decode_not_certified",
+    "constrained": "existing refusal path; no llama fallback",
+    "measurement": "fleet transition report records the unavailable interval"
+  },
+  "proof_requirements": [
+    "barrier-controlled activation and admission tests cover both sides of the dispatch boundary",
+    "barrier-controlled probe mutation tests change each captured tuple member and observe probe_stale",
+    "approval bytes, semantic_digest, updated_at_ms, and deployed binary digest remain unchanged during a supported rotation"
+  ]
+}

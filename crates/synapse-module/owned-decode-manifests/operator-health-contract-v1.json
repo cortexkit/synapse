@@ -1,0 +1,95 @@
+{
+  "contract_revision": "operator-health-contract-v1",
+  "schema_revision": "runtime-bound-records-contracts-v1",
+  "contract_kind": "additive_operator_health",
+  "surface": {
+    "name": "ck-health metrics JSON",
+    "serializer": "crates/synapse-module/src/lib.rs::SynapseHandler::health -> module_health -> serde_json::to_value(ModuleHealth)",
+    "compatibility": "additive-only",
+    "existing_fields_unchanged": [
+      {"name": "status", "type": "string", "meaning": "existing module status"},
+      {"name": "module_generation", "type": "unsigned integer", "meaning": "existing module generation"},
+      {"name": "loaded_models", "type": "unsigned integer", "meaning": "existing loaded model count"},
+      {"name": "machine_profile_hash", "type": "string", "meaning": "legacy MachineProfile::hash() field retained for compatibility"},
+      {"name": "certification_stale", "type": "boolean", "meaning": "existing certification stale flag"},
+      {"name": "performance_stale", "type": "boolean", "meaning": "existing performance stale flag"},
+      {"name": "lanes", "type": "array", "meaning": "existing lane health entries"}
+    ],
+    "forbidden_changes": ["rename existing field", "retype existing field", "reinterpret machine_profile_hash", "delimiter-concatenate approval identity"]
+  },
+  "added_fields": [
+    {
+      "name": "previous_revisioned_machine_profile_hash",
+      "type": "string|null",
+      "fresh_store": null,
+      "encoding": "lowercase 64-character revisioned hash when non-null"
+    },
+    {
+      "name": "current_revisioned_machine_profile_hash",
+      "type": "string",
+      "fresh_store": "lowercase 64-character revisioned hash",
+      "encoding": "MachineProfile::revisioned_hash()"
+    },
+    {
+      "name": "profile_activation_epoch",
+      "type": "positive integer",
+      "fresh_store": 1,
+      "encoding": "epoch 0 is never assigned"
+    },
+    {
+      "name": "last_rotation_at_ms",
+      "type": "unsigned integer|null",
+      "fresh_store": null
+    },
+    {
+      "name": "last_rotation_reason",
+      "type": "string|null",
+      "fresh_store": null,
+      "domain": "ASCII-sorted comma-joined changed top-level MachineProfile field names, or unknown_previous_snapshot"
+    },
+    {
+      "name": "re_certification_state",
+      "type": "string",
+      "domain": ["not_required", "required", "in_progress", "passed", "failed"]
+    },
+    {
+      "name": "evidence_requirements_divergence",
+      "type": "ordered array",
+      "ordering": "(model_id, decode_fingerprint) ascending",
+      "entry": {
+        "model_id": "string",
+        "decode_fingerprint": "lowercase 64-character digest",
+        "result": ["compatible", "evidence_schema_incompatible", "manifest_revision_incompatible", "approval_revision_unsupported"]
+      }
+    },
+    {
+      "name": "approval_certification_outcomes",
+      "type": "ordered array",
+      "ordering": "(model_id, decode_fingerprint) ascending",
+      "entry": {
+        "model_id": "string",
+        "decode_fingerprint": "lowercase 64-character digest",
+        "enabled": "boolean",
+        "admission": ["serving", "no_current_evidence", "digest_mismatch", "disabled"],
+        "state": ["not_required", "required", "in_progress", "passed", "failed"],
+        "certified_at_ms": "unsigned integer|null",
+        "failure_reason": "string|null"
+      }
+    }
+  ],
+  "fresh_store_invariants": {
+    "previous_revisioned_machine_profile_hash": null,
+    "current_revisioned_machine_profile_hash": "present",
+    "profile_activation_epoch": 1,
+    "last_rotation_reason": null,
+    "last_rotation_at_ms": null,
+    "rotation_event_count": 0
+  },
+  "rotation_reason_rules": {
+    "changed_fields": "canonical persisted MachineProfile top-level field names, ASCII sorted and comma joined",
+    "os_build": "log WARN when included",
+    "other_fields": "log INFO",
+    "missing_prior_detail": "unknown_previous_snapshot only when prior hash and epoch are structurally valid",
+    "malformed_persisted_state": "corruption; fail closed"
+  }
+}

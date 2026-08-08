@@ -1,0 +1,78 @@
+{
+  "manifest_revision": "owned-decode-test-manifest-v1",
+  "schema_revision": "runtime-bound-records-contracts-v1",
+  "artifact_kind": "epic_test_disposition",
+  "test_store_policy": {
+    "scope": "environment-scoped temporary store per test process",
+    "ambient_fleet_daemon": "never connect",
+    "required_properties": ["unique path", "0600 database permissions", "cleanup on success and failure", "deterministic seed"]
+  },
+  "dispositions": [
+    {"name": "checked_in_records_are_evidence_shaped_and_reference_manifest_revisions", "disposition": "delete_or_redirect", "replacement": "migration_seed_expansion_and_cert_row_schema_tests", "reason": "compiled D-009 records are migration input, not serving evidence"},
+    {"name": "enabled_record_with_placeholder_digest_or_empty_evidence_fails_validation", "disposition": "retain_as_migration_negative", "replacement": "invalid_seed_and_no_evidence_serve_predicate_tests"},
+    {"name": "disable_profile_is_the_rollback_path", "disposition": "delete", "replacement": "disable_exact_approval_identity_and_emergency_rollback"},
+    {"name": "cutover_enabled_requires_every_condition", "disposition": "redirect", "replacement": "approval_plus_current_certification_serve_predicate"},
+    {"name": "cutover_grammar_enabled_requires_constrained_certification", "disposition": "redirect", "replacement": "effective_grammar_switch_and_exact_constraint_evidence_tests"},
+    {"name": "load_checked_in_cutover_records", "disposition": "delete_serving_loader", "replacement": "load_migration_seed_only_from_one_shot_admin_path"},
+    {"name": "D009CutoverRecords::validate", "disposition": "delete_serving_validation", "replacement": "migration-contract-v1 validation"},
+    {"name": "D009CutoverRecord", "disposition": "delete_serving_type", "replacement": "migration seed entries with D-009 provenance"},
+    {"name": "CutoverRecord", "disposition": "delete_profile_keyed_type", "replacement": "approval identity and current cert-row match"},
+    {"name": "disable_profile", "disposition": "delete", "replacement": "disable_approval(model_id, decode_fingerprint, reason)"},
+    {"name": "PersistentDecodeCertification", "disposition": "redirect", "replacement": "SQLite approval rows plus measured cert-row store"},
+    {"name": "owned_decode_environment_matching_block", "disposition": "redirect", "replacement": "revisioned hash and positive activation epoch serve predicate"},
+    {"name": "RoutingEnvironment constructor 1", "disposition": "redirect", "replacement": "approval-aware environment constructor"},
+    {"name": "RoutingEnvironment constructor 2", "disposition": "redirect", "replacement": "approval-aware environment constructor"},
+    {"name": "RoutingEnvironment constructor 3", "disposition": "redirect", "replacement": "approval-aware environment constructor"},
+    {"name": "owned_decode_cutover_for_test", "disposition": "delete", "replacement": "environment-scoped approval and cert fixtures"},
+    {"name": "store_cert_row", "disposition": "retain_and_change", "replacement": "class-specific insert/upsert target from cert-row-schema-v1"},
+    {"name": "get_cert_row", "disposition": "retain_and_change", "replacement": "current revisioned hash, epoch, model, fingerprint, and evidence revision"},
+    {"name": "latest_cert_row", "disposition": "redirect_audit_only", "replacement": "never an owned-admission source"},
+    {"name": "has_stale_cert_row", "disposition": "retain_and_change", "replacement": "profile hash and epoch staleness"},
+    {"name": "CertificationKey", "disposition": "retain_non_owned_or_replace_owned", "replacement": "explicit row-class logical keys"}
+  ],
+  "mandatory_test_families": [
+    {
+      "id": "approval-integrity",
+      "must_fail_when": ["any included semantic field is mutated without digest recomputation", "structural invalidity is hidden by recomputed digest", "unknown schema revision is loaded"],
+      "must_observe": ["approval_digest_mismatch", "WARN", "health admission=digest_mismatch", "fail-closed routing"]
+    },
+    {
+      "id": "migration",
+      "must_fail_when": ["placeholder is included", "source identity is unmappable", "repeated approval identity is inserted", "pre-commit digest fails", "transaction marker changes on failure"],
+      "expected_repeated_identity": "duplicate_identity"
+    },
+    {
+      "id": "cert-row-rebuild",
+      "must_fail_when": ["replacement partial index is not class scoped", "duplicate logical identity exists", "old shared conflict target is removed before validation", "nullable field is used to infer class"],
+      "must_observe": ["A/epoch-3 remains distinct from A/epoch-1", "declared/remote/embedding/rerank same-key writes upsert"]
+    },
+    {
+      "id": "trigger-rotation",
+      "must_fail_when": ["supported trigger hash proof does not reproduce", "approval bytes change", "probe writes approval", "binary is rebuilt during rotation"],
+      "must_observe": ["old evidence stops matching", "new epoch requires probe", "probe alone restores serving"]
+    },
+    {
+      "id": "admission-probe-concurrency",
+      "must_fail_when": ["post-activation old evidence dispatches", "stale probe commits", "two observers increment twice", "two ledger parents exist for one epoch"],
+      "must_observe": ["dispatch boundary re-check", "probe_stale", "single CAS winner", "loser adopts committed state"]
+    },
+    {
+      "id": "health-compatibility",
+      "must_fail_when": ["existing field is renamed or retyped", "fresh store uses epoch 0", "approval keys are delimiter-concatenated", "ordering is nondeterministic"],
+      "must_observe": ["fresh-store nullability", "revisioned hash semantics", "four divergence values", "multi-approval outcomes"]
+    }
+  ],
+  "required_negative_mutations": [
+    "enabled approval with no current evidence",
+    "enabled approval with stale profile hash",
+    "enabled approval with stale epoch",
+    "enabled approval with wrong model_id",
+    "enabled approval with wrong decode_fingerprint",
+    "enabled approval with incomplete gates"
+  ],
+  "repository_guard": {
+    "deleted_symbols_must_be_absent_from_serving": ["load_checked_in_cutover_records", "D009CutoverRecords::validate", "disable_profile", "owned_decode_cutover_for_test"],
+    "retained_symbols_must_have_disposition": true,
+    "direct_cert_rows_sql_must_be_inventoried": true
+  }
+}

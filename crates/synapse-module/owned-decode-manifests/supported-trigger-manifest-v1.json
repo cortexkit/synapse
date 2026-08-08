@@ -1,0 +1,80 @@
+{
+  "manifest_revision": "supported-trigger-v1",
+  "schema_revision": "runtime-bound-records-contracts-v1",
+  "artifact_kind": "supported_profile_rotation_triggers",
+  "hash_revision": "machine-profile-v2",
+  "status": "non_empty_and_proven",
+  "supported_triggers": [
+    {
+      "id": "synthetic-engine-identity-refresh-v1",
+      "class": "worker_deployment_like",
+      "operation": "replace the collected owned-metal-decode EngineIdentity version with a deterministic next version",
+      "operation_determinism": "fixed collector fixture; no wall-clock, host, or random input",
+      "existing_machine_profile_input": "engine_identities",
+      "qualifies_worker_deployment": true,
+      "qualification_reason": "the collected engine identity changes; os_build is unchanged and is not the sole demonstration",
+      "before": {
+        "snapshot": {
+          "os_build": "23E224",
+          "arch": "aarch64",
+          "chip_model": "Apple M3",
+          "ram_class": "24gb",
+          "engine_identities": [
+            {"engine": "owned-metal-decode", "version": "owned-decode-worker-v1"}
+          ]
+        },
+        "stable_bytes_utf8": "{\"os_build\":\"23E224\",\"arch\":\"aarch64\",\"chip_model\":\"Apple M3\",\"ram_class\":\"24gb\",\"engine_identities\":[{\"engine\":\"owned-metal-decode\",\"version\":\"owned-decode-worker-v1\"}]}",
+        "legacy_hash": "eaf2e6e92acaa931001a0b1376a0924d3029cd24115d262d4664c82c2e10be97",
+        "revisioned_hash": "62e481bf3e3fde61d6633fb807d4ea98256f4ea5368ad76181c6d33ee2e06d7a"
+      },
+      "after": {
+        "snapshot": {
+          "os_build": "23E224",
+          "arch": "aarch64",
+          "chip_model": "Apple M3",
+          "ram_class": "24gb",
+          "engine_identities": [
+            {"engine": "owned-metal-decode", "version": "owned-decode-worker-v1+engine-refresh"}
+          ]
+        },
+        "stable_bytes_utf8": "{\"os_build\":\"23E224\",\"arch\":\"aarch64\",\"chip_model\":\"Apple M3\",\"ram_class\":\"24gb\",\"engine_identities\":[{\"engine\":\"owned-metal-decode\",\"version\":\"owned-decode-worker-v1+engine-refresh\"}]}",
+        "legacy_hash": "170d7a18af8969980a0b0486cfe0047e526bb614b1dc761f9a80023418c58029",
+        "revisioned_hash": "009605a2871a9a3401ca0512eb29db1517b99bd20d0fb5898009902bc51ae5d4"
+      },
+      "proof": {
+        "hash_formula": "SHA-256(machine-profile-v2 + NUL + stable_bytes)",
+        "changed_fields": ["engine_identities"],
+        "legacy_hash_changed": true,
+        "revisioned_hash_changed": true,
+        "before_revisioned_hash_matches": true,
+        "after_revisioned_hash_matches": true,
+        "reproducible_from_snapshots": true,
+        "approval_mutation": false,
+        "required_response": "old evidence stops matching; probe under new hash and epoch restores admission without changing approval bytes"
+      }
+    }
+  ],
+  "conditional_or_unsupported_claims": [
+    {
+      "trigger": "os_build_only",
+      "status": "not_sufficient",
+      "reason": "the frozen set must not use os_build as its sole demonstration"
+    },
+    {
+      "trigger": "reboot_class",
+      "status": "unsupported_pending_proof",
+      "reason": "no canonical before/after snapshot proof is pinned here"
+    },
+    {
+      "trigger": "preload_toggle",
+      "status": "unsupported_pending_proof",
+      "reason": "no canonical before/after snapshot proof is pinned here"
+    },
+    {
+      "trigger": "worker_deployment_without_engine_identity_change",
+      "status": "unsupported",
+      "reason": "deployment alone is not a collected MachineProfile input"
+    }
+  ],
+  "release_rule": "A trigger absent from supported_triggers is not supported. Adding one requires this manifest revision or an intent revision; deleting a failed acceptance case without revision is forbidden."
+}

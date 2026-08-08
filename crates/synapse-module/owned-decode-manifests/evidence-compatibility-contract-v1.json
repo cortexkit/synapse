@@ -1,0 +1,44 @@
+{
+  "contract_revision": "evidence-compatibility-contract-v1",
+  "schema_revision": "runtime-bound-records-contracts-v1",
+  "contract_kind": "approval_evidence_revision_compatibility",
+  "initial_revisions": {
+    "approval_policy": "owned-decode-evidence-requirements-v1",
+    "cert_row_evidence_schema": "owned-decode-cert-evidence-v1",
+    "g_dec_manifest_family": "decode-fixture-registry-v1",
+    "g_dec_manifest_revision": "decode-fixture-registry-v1"
+  },
+  "compiled_compatibility_map": [
+    {
+      "approval_evidence_requirements_revision": "owned-decode-evidence-requirements-v1",
+      "accepted_cert_row_evidence_schema_revisions": ["owned-decode-cert-evidence-v1"],
+      "required_g_dec_manifest_families": ["decode-fixture-registry-v1"],
+      "accepted_g_dec_manifest_revisions": ["decode-fixture-registry-v1"],
+      "current_certification_compatible": true
+    }
+  ],
+  "serve_predicate": {
+    "requires": [
+      "supported approval revision",
+      "compatible evidence_schema_revision",
+      "exact accepted G-DEC manifest revision",
+      "exactly one passed entry for G-DEC-01 through G-DEC-12",
+      "no missing, duplicate, pending, failed, substring-only, foreign-manifest, unknown-manifest, or incompatible entry"
+    ],
+    "unknown_approval_revision": "fail closed",
+    "unknown_evidence_schema": "fail closed",
+    "unknown_manifest_revision": "fail closed",
+    "incompatible_combination": "fail closed"
+  },
+  "change_rules": {
+    "compatible_evidence_schema_or_manifest_change": "requires fresh certification and leaves approval byte-identical",
+    "approval_policy_family_change": "requires explicit migration or re-approval",
+    "runtime_rewrite": "forbidden; runtime never rewrites evidence_requirements_revision",
+    "migration_seed": "uses the initial approval policy revision and does not carry concrete evidence"
+  },
+  "gate_completeness": {
+    "required_ids": ["G-DEC-01", "G-DEC-02", "G-DEC-03", "G-DEC-04", "G-DEC-05", "G-DEC-06", "G-DEC-07", "G-DEC-08", "G-DEC-09", "G-DEC-10", "G-DEC-11", "G-DEC-12"],
+    "multiplicity": "exactly one passed entry per exact ID",
+    "matching": "ID equality, status equality, manifest revision equality; substring-only matches are invalid"
+  }
+}

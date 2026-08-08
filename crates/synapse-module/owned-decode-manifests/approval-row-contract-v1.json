@@ -1,0 +1,58 @@
+{
+  "contract_revision": "approval-row-contract-v1",
+  "schema_revision": "runtime-bound-records-contracts-v1",
+  "contract_kind": "owned_decode_approval_row",
+  "identity": ["model_id", "decode_fingerprint"],
+  "fields": [
+    {"name": "schema_revision", "type": "supported revision string", "semantic": true},
+    {"name": "model_id", "type": "canonical CatalogEntry.entry_id", "semantic": true},
+    {"name": "decode_fingerprint", "type": "lowercase 64-character digest", "semantic": true},
+    {"name": "enabled", "type": "boolean", "semantic": true},
+    {"name": "grammar_enabled", "type": "boolean", "semantic": true},
+    {"name": "disabled_reason", "type": "non-empty string|null", "semantic": true},
+    {"name": "approved_by", "type": "non-empty string|null", "semantic": true},
+    {"name": "approved_at_ms", "type": "unsigned integer|null", "semantic": true},
+    {"name": "updated_at_ms", "type": "unsigned integer", "semantic": false},
+    {"name": "evidence_requirements_revision", "type": "supported policy revision", "semantic": true},
+    {"name": "semantic_digest", "type": "lowercase SHA-256 digest", "semantic": false},
+    {"name": "row_id", "type": "store-generated identifier", "semantic": false},
+    {"name": "generation", "type": "store fencing metadata", "semantic": false},
+    {"name": "fencing_metadata", "type": "store fencing metadata", "semantic": false}
+  ],
+  "structural_rules": [
+    "Unknown schema revisions fail closed.",
+    "Unknown serialized fields fail closed.",
+    "model_id must resolve to exactly one canonical CatalogEntry.entry_id.",
+    "decode_fingerprint must be lowercase hexadecimal SHA-256.",
+    "enabled=true requires non-empty approved_by and approved_at_ms and requires disabled_reason=null.",
+    "enabled=false requires a non-empty disabled_reason.",
+    "A disabled row remains structurally loadable and re-certification cannot enable it.",
+    "Approval rows contain no machine profile, numeric profile, processing, runtime, worker-path, concrete evidence, or G-DEC fields.",
+    "An enabled approval with no evidence may load structurally but cannot satisfy the serve-time predicate."
+  ],
+  "semantic_digest": {
+    "algorithm": "lowercase SHA-256",
+    "domain_separator": "owned-decode-approval-row-v1\\0",
+    "encoding": "each value is unsigned 64-bit big-endian byte length followed by canonical UTF-8 bytes; null is eight 0xff bytes with no payload",
+    "included_in_order": ["schema_revision", "model_id", "decode_fingerprint", "enabled", "grammar_enabled", "disabled_reason", "approved_by", "approved_at_ms", "evidence_requirements_revision"],
+    "integers": "unsigned base 10 with no leading zeroes",
+    "booleans": ["true", "false"],
+    "excluded": ["updated_at_ms", "row_id", "generation", "fencing_metadata", "semantic_digest"],
+    "revision_rule": "every schema revision uses a distinct separator and cannot share the v1 separator"
+  },
+  "load_and_serve": {
+    "load_checks": ["structure", "supported schema revision", "identifier format", "semantic_digest"],
+    "serve_checks": ["enabled", "approval identity", "current measured cert row", "current revisioned hash", "current positive epoch", "evidence schema compatibility", "exact G-DEC manifest revision", "all gates", "processing/runtime/worker/constrained equality", "quarantine and trust state"],
+    "digest_mismatch": {"event": "approval_digest_mismatch", "health_admission": "digest_mismatch", "log": "WARN", "routing": "existing fail-closed outcome"},
+    "recomputed_digest": "does not excuse structural or semantic invalidity"
+  },
+  "mutation_contract": {
+    "explicit_admin_actions": ["create", "enable", "disable", "re-enable", "grammar_enabled change", "emergency rollback", "migration"],
+    "fenced_transaction": true,
+    "serving_writes": false,
+    "certification_writes": false,
+    "every_mutation": ["required provenance or disabled_reason", "semantic_digest recomputed in the same transaction"],
+    "individual_rollback": "disable exactly (model_id, decode_fingerprint) with a non-empty reason",
+    "emergency_rollback": "disable every owned-decode approval atomically with the supplied reason"
+  }
+}

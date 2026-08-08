@@ -1,0 +1,173 @@
+{
+  "manifest_revision": "cert-row-schema-v1",
+  "schema_revision": "runtime-bound-records-contracts-v1",
+  "artifact_kind": "shared_cert_rows_schema",
+  "table": "cert_rows",
+  "starting_schema": {
+    "discriminator": "assurance_class",
+    "classes": ["measured", "declared"],
+    "columns": [
+      "assurance_class",
+      "status",
+      "key_hash",
+      "machine_profile_hash",
+      "remote_profile_hash",
+      "identity_revision",
+      "numeric_profile_id",
+      "fingerprint",
+      "certified_at_ms",
+      "os_build",
+      "module_generation",
+      "evidence_json"
+    ],
+    "shared_conflict_target": "(assurance_class, key_hash, fingerprint)",
+    "writer": "crates/synapse-module/src/store.rs::SynapseStore::store_cert_row",
+    "readers": [
+      "SynapseStore::get_cert_row",
+      "SynapseStore::latest_cert_row",
+      "SynapseStore::get_probe_row",
+      "SynapseStore::latest_probe_row",
+      "SynapseStore::has_stale_cert_row",
+      "SynapseStore::get_declared_cert_row",
+      "SynapseStore::declared_cert_row_for_fingerprint"
+    ],
+    "legacy_key": "CertificationKey::Measured.machine_profile_hash or the canonical hash of CertificationKey::Declared"
+  },
+  "replacement_schema": {
+    "new_explicit_discriminator": "certification_class",
+    "classes": [
+      "measured_owned_decode",
+      "declared",
+      "remote",
+      "embedding",
+      "rerank",
+      "legacy_owned_decode"
+    ],
+    "ddl": [
+      "CREATE TABLE cert_rows_rebuilt (row_id INTEGER PRIMARY KEY, certification_class TEXT NOT NULL, assurance_class TEXT NOT NULL, status TEXT NOT NULL, key_hash TEXT NOT NULL, machine_profile_hash TEXT, revisioned_machine_profile_hash TEXT, profile_activation_epoch INTEGER, model_id TEXT, decode_fingerprint TEXT, remote_profile_hash TEXT, identity_revision TEXT, numeric_profile_id TEXT, fingerprint TEXT NOT NULL, certified_at_ms INTEGER NOT NULL, os_build TEXT NOT NULL, module_generation INTEGER NOT NULL, evidence_schema_revision TEXT, processing_fingerprint TEXT, runtime_config_digest TEXT, constraint_runtime_identities_json TEXT, worker_path_evidence_json TEXT, g_dec_manifest_revision TEXT, evidence_json TEXT NOT NULL, CHECK (certification_class <> 'measured_owned_decode' OR (revisioned_machine_profile_hash IS NOT NULL AND profile_activation_epoch > 0 AND model_id IS NOT NULL AND decode_fingerprint IS NOT NULL AND evidence_schema_revision IS NOT NULL)), CHECK (certification_class <> 'legacy_owned_decode' OR status <> 'certified'))",
+      "CREATE UNIQUE INDEX cert_rows_owned_decode_identity_v1 ON cert_rows_rebuilt (revisioned_machine_profile_hash, profile_activation_epoch, model_id, decode_fingerprint, evidence_schema_revision) WHERE certification_class = 'measured_owned_decode'",
+      "CREATE UNIQUE INDEX cert_rows_declared_identity_v1 ON cert_rows_rebuilt (key_hash, fingerprint) WHERE certification_class = 'declared'",
+      "CREATE UNIQUE INDEX cert_rows_remote_identity_v1 ON cert_rows_rebuilt (key_hash, fingerprint) WHERE certification_class = 'remote'",
+      "CREATE UNIQUE INDEX cert_rows_embedding_identity_v1 ON cert_rows_rebuilt (key_hash, fingerprint) WHERE certification_class = 'embedding'",
+      "CREATE UNIQUE INDEX cert_rows_rerank_identity_v1 ON cert_rows_rebuilt (key_hash, fingerprint) WHERE certification_class = 'rerank'"
+    ],
+    "old_conflict_target_removed_after": "all replacement indexes have been created and duplicate queries have returned zero rows"
+  },
+  "row_classes": [
+    {
+      "id": "measured_owned_decode",
+      "discriminator": "certification_class = 'measured_owned_decode'",
+      "required_columns": ["revisioned_machine_profile_hash", "profile_activation_epoch", "model_id", "decode_fingerprint", "evidence_schema_revision", "processing_fingerprint", "runtime_config_digest", "constraint_runtime_identities_json", "worker_path_evidence_json", "g_dec_manifest_revision"],
+      "nullable_columns": ["machine_profile_hash", "remote_profile_hash", "identity_revision", "numeric_profile_id"],
+      "logical_identity": ["revisioned_machine_profile_hash", "profile_activation_epoch", "model_id", "decode_fingerprint", "evidence_schema_revision"],
+      "partial_unique_index": "cert_rows_owned_decode_identity_v1",
+      "upsert_conflict_target": "ON CONFLICT (revisioned_machine_profile_hash, profile_activation_epoch, model_id, decode_fingerprint, evidence_schema_revision) WHERE certification_class = 'measured_owned_decode'",
+      "lookup": "current revisioned hash + current positive epoch + model_id + decode_fingerprint + compatible evidence_schema_revision",
+      "staleness": "revisioned hash, epoch, processing fingerprint, runtime config, worker path, constrained identities, evidence schema, and exact G-DEC manifest revision",
+      "legacy_rule": "a row missing model_id, positive epoch, complete gates, or supported evidence_schema_revision is legacy and cannot admit until re-probed"
+    },
+    {
+      "id": "declared",
+      "discriminator": "certification_class = 'declared'",
+      "required_columns": ["key_hash", "fingerprint", "remote_profile_hash", "identity_revision"],
+      "nullable_columns": ["revisioned_machine_profile_hash", "profile_activation_epoch", "model_id", "decode_fingerprint", "evidence_schema_revision"],
+      "logical_identity": ["key_hash", "fingerprint"],
+      "partial_unique_index": "cert_rows_declared_identity_v1",
+      "upsert_conflict_target": "ON CONFLICT (key_hash, fingerprint) WHERE certification_class = 'declared'",
+      "lookup": "existing declared-certification wrapper APIs",
+      "staleness": "existing declared row staleness semantics; no owned-decode profile or epoch admission"
+    },
+    {
+      "id": "remote",
+      "discriminator": "certification_class = 'remote'",
+      "required_columns": ["key_hash", "fingerprint", "remote_profile_hash", "identity_revision"],
+      "nullable_columns": ["revisioned_machine_profile_hash", "profile_activation_epoch", "model_id", "decode_fingerprint", "evidence_schema_revision"],
+      "logical_identity": ["key_hash", "fingerprint"],
+      "partial_unique_index": "cert_rows_remote_identity_v1",
+      "upsert_conflict_target": "ON CONFLICT (key_hash, fingerprint) WHERE certification_class = 'remote'",
+      "lookup": "remote certification wrapper and direct cert_rows SQL inventory",
+      "staleness": "existing remote identity behavior; never owned admission"
+    },
+    {
+      "id": "embedding",
+      "discriminator": "certification_class = 'embedding'",
+      "required_columns": ["key_hash", "fingerprint"],
+      "nullable_columns": ["revisioned_machine_profile_hash", "profile_activation_epoch", "model_id", "decode_fingerprint", "evidence_schema_revision"],
+      "logical_identity": ["key_hash", "fingerprint"],
+      "partial_unique_index": "cert_rows_embedding_identity_v1",
+      "upsert_conflict_target": "ON CONFLICT (key_hash, fingerprint) WHERE certification_class = 'embedding'",
+      "lookup": "embedding certification wrapper and direct cert_rows SQL inventory",
+      "staleness": "existing embedding behavior; no approval record and never owned admission"
+    },
+    {
+      "id": "rerank",
+      "discriminator": "certification_class = 'rerank'",
+      "required_columns": ["key_hash", "fingerprint"],
+      "nullable_columns": ["revisioned_machine_profile_hash", "profile_activation_epoch", "model_id", "decode_fingerprint", "evidence_schema_revision"],
+      "logical_identity": ["key_hash", "fingerprint"],
+      "partial_unique_index": "cert_rows_rerank_identity_v1",
+      "upsert_conflict_target": "ON CONFLICT (key_hash, fingerprint) WHERE certification_class = 'rerank'",
+      "lookup": "rerank certification wrapper and direct cert_rows SQL inventory",
+      "staleness": "existing rerank behavior; no approval record and never owned admission"
+    },
+    {
+      "id": "legacy_owned_decode",
+      "discriminator": "certification_class = 'legacy_owned_decode'",
+      "required_columns": ["key_hash", "fingerprint", "evidence_json"],
+      "nullable_columns": ["revisioned_machine_profile_hash", "profile_activation_epoch", "model_id", "decode_fingerprint", "evidence_schema_revision"],
+      "logical_identity": ["row_id"],
+      "partial_unique_index": null,
+      "upsert_conflict_target": "none",
+      "lookup": "audit-only query",
+      "staleness": "always non-matchable for owned admission",
+      "legacy_rule": "retain for audit; re-probe into measured_owned_decode rather than backfilling a guessed profile, epoch, model, or evidence revision"
+    }
+  ],
+  "column_disposition": [
+    {"column": "revisioned_machine_profile_hash", "measured_owned_decode": "added_required", "other_classes": "nullable_null", "legacy": "null"},
+    {"column": "machine_profile_hash", "measured_owned_decode": "retained_legacy_only", "other_classes": "retained_when_existing", "legacy": "retained"},
+    {"column": "model_id", "measured_owned_decode": "added_required", "other_classes": "nullable_null", "legacy": "null"},
+    {"column": "profile_activation_epoch", "measured_owned_decode": "added_required_positive", "other_classes": "nullable_null", "legacy": "null"},
+    {"column": "evidence_schema_revision", "measured_owned_decode": "added_required", "other_classes": "nullable_null", "legacy": "null"},
+    {"column": "decode_fingerprint", "measured_owned_decode": "added_required", "other_classes": "nullable_null", "legacy": "null"},
+    {"column": "key_hash", "measured_owned_decode": "legacy_audit_key", "other_classes": "retained_existing_key", "legacy": "retained"},
+    {"column": "fingerprint", "measured_owned_decode": "retained_for_wire_and_audit", "other_classes": "retained_existing_key", "legacy": "retained"},
+    {"column": "numeric_profile_id", "measured_owned_decode": "not_an_admission_key", "other_classes": "retained_existing_behavior", "legacy": "retained_or_null"}
+  ],
+  "migration_order": [
+    "begin fenced migration transaction",
+    "classify every row with an explicit certification_class; do not infer class from nullable measured-decode columns",
+    "backfill only deterministic legacy values; leave unknown owned bindings null and mark legacy_owned_decode",
+    "create cert_rows_rebuilt",
+    "copy rows and validate class-specific nullability and logical identities",
+    "run every duplicate query below and abort without selecting a winner when any row exists",
+    "create and validate every replacement partial index",
+    "replace cert_rows and matching read/write paths",
+    "remove the old shared conflict target only after replacement indexes validate",
+    "commit; rollback on any semantic or infrastructure failure"
+  ],
+  "duplicate_queries": [
+    "SELECT revisioned_machine_profile_hash, profile_activation_epoch, model_id, decode_fingerprint, evidence_schema_revision, COUNT(*) FROM cert_rows_rebuilt WHERE certification_class = 'measured_owned_decode' GROUP BY 1,2,3,4,5 HAVING COUNT(*) > 1",
+    "SELECT key_hash, fingerprint, COUNT(*) FROM cert_rows_rebuilt WHERE certification_class = 'declared' GROUP BY 1,2 HAVING COUNT(*) > 1",
+    "SELECT key_hash, fingerprint, COUNT(*) FROM cert_rows_rebuilt WHERE certification_class = 'remote' GROUP BY 1,2 HAVING COUNT(*) > 1",
+    "SELECT key_hash, fingerprint, COUNT(*) FROM cert_rows_rebuilt WHERE certification_class = 'embedding' GROUP BY 1,2 HAVING COUNT(*) > 1",
+    "SELECT key_hash, fingerprint, COUNT(*) FROM cert_rows_rebuilt WHERE certification_class = 'rerank' GROUP BY 1,2 HAVING COUNT(*) > 1"
+  ],
+  "repository_search_guard": {
+    "symbols": ["store_cert_row", "get_cert_row", "latest_cert_row", "has_stale_cert_row", "CertificationKey"],
+    "direct_sql_pattern": "cert_rows",
+    "required_disposition": "every wrapper and direct SQL site is classified as changed, retained, or redirected before implementation"
+  },
+  "probe_snapshot_column_set": [
+    "revisioned_machine_profile_hash",
+    "profile_activation_epoch",
+    "model_id",
+    "decode_fingerprint",
+    "processing_fingerprint",
+    "runtime_config_digest",
+    "constraint_runtime_identities_json",
+    "worker_path_evidence_json",
+    "evidence_schema_revision",
+    "g_dec_manifest_revision"
+  ]
+}

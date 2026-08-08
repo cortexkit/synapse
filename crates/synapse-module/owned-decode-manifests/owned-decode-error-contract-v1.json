@@ -1,0 +1,49 @@
+{
+  "contract_revision": "owned-decode-error-contract-v1",
+  "schema_revision": "runtime-bound-records-contracts-v1",
+  "contract_kind": "stable_error_identifiers",
+  "wire_surface": "microllm.oneshot",
+  "identifiers": [
+    {"id": "owned_decode_not_certified", "meaning": "No current matching measured evidence exists", "fallback_eligible": true},
+    {"id": "owned_decode_certification_failed", "meaning": "The current probe failed", "fallback_eligible": true},
+    {"id": "owned_decode_quarantined", "meaning": "The selected worker key is quarantined", "fallback_eligible": true},
+    {"id": "artifact_poisoned", "meaning": "An artifact is corrupt or has a digest mismatch", "fallback_eligible": true},
+    {"id": "owned_decode_unavailable", "meaning": "The required owned worker or capability cannot be reached or loaded", "fallback_eligible": true},
+    {"id": "owned_decode_unsupported", "meaning": "The platform, family, format, or capability is unsupported", "fallback_eligible": true},
+    {"id": "owned_decode_protocol_mismatch", "meaning": "Worker framing or generation protocol is incompatible", "fallback_eligible": false},
+    {"id": "owned_decode_runtime_config_mismatch", "meaning": "Runtime manifest identity does not match the worker", "fallback_eligible": false},
+    {"id": "owned_decode_constraint_version_mismatch", "meaning": "Constraint representation or runtime identity does not match", "fallback_eligible": false},
+    {"id": "owned_decode_sampling_unsupported", "meaning": "The requested sampling selector is unsupported", "fallback_eligible": false},
+    {"id": "context_capacity_exceeded", "meaning": "Prompt plus requested output exceeds the catalog capacity", "fallback_eligible": false},
+    {"id": "grammar_disabled", "meaning": "Grammar was disabled by runtime or approval", "fallback_eligible": false},
+    {"id": "grammar_parse_failed", "meaning": "The submitted grammar cannot be parsed", "fallback_eligible": false},
+    {"id": "grammar_feature_unsupported", "meaning": "The grammar uses a rejected subset feature", "fallback_eligible": false},
+    {"id": "grammar_unsatisfiable", "meaning": "The grammar has no satisfiable completion", "fallback_eligible": false},
+    {"id": "grammar_stop_before_completion", "meaning": "A stop control won before a grammar completed", "fallback_eligible": false},
+    {"id": "grammar_max_tokens_exhausted", "meaning": "The grammar did not complete within max_tokens", "fallback_eligible": false},
+    {"id": "digest_mismatch", "surface": "internal_health_and_audit", "consumer_visible": false, "meaning": "An approval semantic_digest does not match its canonical row values", "fallback_eligible": false},
+    {"id": "stale_probe", "surface": "internal_audit_event", "consumer_visible": false, "meaning": "The terminal probe snapshot changed before certification commit", "fallback_eligible": false},
+    {"id": "probe_stale", "surface": "internal_certification_outcome", "consumer_visible": false, "meaning": "Canonical audit spelling of stale_probe at a certification terminal write", "fallback_eligible": false}
+  ],
+  "fallback_set_exact": [
+    "owned_decode_not_certified",
+    "owned_decode_certification_failed",
+    "owned_decode_quarantined",
+    "artifact_poisoned",
+    "owned_decode_unavailable",
+    "owned_decode_unsupported"
+  ],
+  "behavior": {
+    "substitutable_unconstrained": "Only the six fallback-eligible IDs may select a compatible configured llama lane; provenance records the owned refusal and the selected lane's actual fingerprint.",
+    "identity_pinned": "Returns owned_decode_not_certified or the applicable typed refusal; never substitutes a model.",
+    "constrained": "Never falls back to llama. Grammar-disabled responses retain underlying_owned_decode_refusal_id.",
+    "pre_dispatch_failures": "Perform no worker dispatch and consume no crash budget.",
+    "consumer_compatibility": "No refusal ID, response field, or microllm.oneshot contract is renamed, retyped, or reinterpreted by this slice."
+  },
+  "audit_identifiers": {
+    "approval_corruption_event": "approval_digest_mismatch",
+    "profile_rotation_event": "profile_rotation",
+    "stale_probe_event": "stale_probe",
+    "migration_marker": "owned-decode-approval-migration-v1"
+  }
+}

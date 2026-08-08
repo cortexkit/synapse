@@ -1,0 +1,172 @@
+{
+  "manifest_revision": "runtime-bound-decode-cutover-epic-v1",
+  "schema_revision": "runtime-bound-records-contracts-v1",
+  "artifact_kind": "epic_manifest",
+  "epic_id": "runtime-bound-decode-cutover",
+  "source_spec": {
+    "path": ".cortexkit/alfonso/drafts/2026-08-08-runtime-bound-records-refire2.md",
+    "sha256": "f8e93a5ff083dc76d37db68f3f778da44ce53c6274f0730eea2d58b319a5d03b"
+  },
+  "acceptance_criterion": "33",
+  "slice": {
+    "id": "slice-1-contracts-and-manifests",
+    "work_item": "wi:[consult-id]:4:s1",
+    "file_fence": [
+      "**/manifests/**",
+      "**/*-manifest.*",
+      "**/*-contract.*"
+    ],
+    "actual_repository_fence": "crates/synapse-module/owned-decode-manifests/**"
+  },
+  "status": "pinned",
+  "mandatory_artifacts": [
+    {
+      "id": "epic",
+      "kind": "manifest",
+      "path": "crates/synapse-module/owned-decode-manifests/runtime-bound-decode-cutover-epic-manifest-v1.json",
+      "revision": "runtime-bound-decode-cutover-epic-v1"
+    },
+    {
+      "id": "catalog_entry",
+      "kind": "contract",
+      "path": "crates/synapse-module/owned-decode-manifests/catalog-entry-contract-v1.json",
+      "revision": "catalog-entry-contract-v1"
+    },
+    {
+      "id": "approval",
+      "kind": "contract",
+      "path": "crates/synapse-module/owned-decode-manifests/approval-row-contract-v1.json",
+      "revision": "approval-row-contract-v1"
+    },
+    {
+      "id": "evidence_compatibility",
+      "kind": "contract",
+      "path": "crates/synapse-module/owned-decode-manifests/evidence-compatibility-contract-v1.json",
+      "revision": "evidence-compatibility-contract-v1"
+    },
+    {
+      "id": "cert_rows",
+      "kind": "manifest",
+      "path": "crates/synapse-module/owned-decode-manifests/cert-row-schema-manifest-v1.json",
+      "revision": "cert-row-schema-v1"
+    },
+    {
+      "id": "errors",
+      "kind": "contract",
+      "path": "crates/synapse-module/owned-decode-manifests/owned-decode-error-contract-v1.json",
+      "revision": "owned-decode-error-contract-v1"
+    },
+    {
+      "id": "ledger",
+      "kind": "contract",
+      "path": "crates/synapse-module/owned-decode-manifests/rotation-ledger-contract-v1.json",
+      "revision": "rotation-ledger-contract-v1"
+    },
+    {
+      "id": "migration",
+      "kind": "contract",
+      "path": "crates/synapse-module/owned-decode-manifests/migration-contract-v1.json",
+      "revision": "migration-contract-v1"
+    },
+    {
+      "id": "health",
+      "kind": "contract",
+      "path": "crates/synapse-module/owned-decode-manifests/operator-health-contract-v1.json",
+      "revision": "operator-health-contract-v1"
+    },
+    {
+      "id": "admission_probe",
+      "kind": "contract",
+      "path": "crates/synapse-module/owned-decode-manifests/admission-probe-boundary-contract-v1.json",
+      "revision": "admission-probe-boundary-contract-v1"
+    },
+    {
+      "id": "hash_boundaries",
+      "kind": "manifest",
+      "path": "crates/synapse-module/owned-decode-manifests/machine-profile-hash-boundary-manifest-v1.json",
+      "revision": "machine-profile-hash-boundary-v1"
+    },
+    {
+      "id": "triggers",
+      "kind": "manifest",
+      "path": "crates/synapse-module/owned-decode-manifests/supported-trigger-manifest-v1.json",
+      "revision": "supported-trigger-v1"
+    },
+    {
+      "id": "tests",
+      "kind": "manifest",
+      "path": "crates/synapse-module/owned-decode-manifests/owned-decode-test-manifest-v1.json",
+      "revision": "owned-decode-test-manifest-v1"
+    },
+    {
+      "id": "execution",
+      "kind": "manifest",
+      "path": "crates/synapse-module/owned-decode-manifests/execution-manifest-v1.json",
+      "revision": "execution-manifest-v1"
+    },
+    {
+      "id": "migration_seed",
+      "kind": "manifest",
+      "path": "crates/synapse-module/owned-decode-manifests/migration-seed-manifest-v1.json",
+      "revision": "migration-seed-v1"
+    }
+  ],
+  "retained_compiled_manifests": [
+    "crates/synapse-module/owned-decode-manifests/decode-fixture-registry-v1.json",
+    "crates/synapse-module/owned-decode-manifests/decode-context-buckets-v1.json",
+    "crates/synapse-module/owned-decode-manifests/decode-sched-manifest-v1.json",
+    "crates/synapse-module/owned-decode-manifests/owned-decode-wire-error-bindings-v1.json",
+    "crates/synapse-module/owned-decode-manifests/grammar-cost-corpus-v1.json",
+    "crates/synapse-module/owned-decode-manifests/structural-band-v1.json",
+    "crates/synapse-module/owned-decode-manifests/decode-ownership-manifest-v1.json"
+  ],
+  "frozen_contracts": {
+    "approval_identity": ["model_id", "decode_fingerprint"],
+    "catalog_model_id_source": "CatalogEntry.entry_id",
+    "certification_hash": "MachineProfile::revisioned_hash()",
+    "epoch_start": 1,
+    "epoch_zero_allowed": false,
+    "migration_outcomes": [
+      "applied",
+      "already_applied",
+      "invalid_seed",
+      "unmappable_identity",
+      "duplicate_identity",
+      "transaction_failed"
+    ],
+    "fallback_eligible_refusals": [
+      "owned_decode_not_certified",
+      "owned_decode_certification_failed",
+      "owned_decode_quarantined",
+      "artifact_poisoned",
+      "owned_decode_unavailable",
+      "owned_decode_unsupported"
+    ],
+    "gates": [
+      "G-DEC-01",
+      "G-DEC-02",
+      "G-DEC-03",
+      "G-DEC-04",
+      "G-DEC-05",
+      "G-DEC-06",
+      "G-DEC-07",
+      "G-DEC-08",
+      "G-DEC-09",
+      "G-DEC-10",
+      "G-DEC-11",
+      "G-DEC-12"
+    ]
+  },
+  "release_blocks": [
+    "No storage, runtime, migration, or fleet-cutover slice is plan-ready until every mandatory artifact in this manifest is reviewed at its pinned revision.",
+    "A seed expansion, catalog mapping, duplicate precondition, digest check, or transaction outcome that differs from migration-contract-v1 blocks release.",
+    "A supported trigger must have canonical before/after snapshots and a revisioned-hash proof; otherwise the supported-trigger manifest or the intent must receive a new revision before release.",
+    "The old compiled D-009 serving path and the new SQLite approval path may not coexist in a release."
+  ],
+  "review": {
+    "reviewed_artifacts": "all mandatory_artifacts",
+    "review_method": "cross-reference each path, revision, identity, DDL, outcome, boundary, and job against the refire-2 draft before downstream implementation",
+    "review_status": "pinned-for-downstream-slices",
+    "unknown_values_are_blocking": true
+  }
+}
