@@ -1,4 +1,5 @@
 use std::{
+    collections::{BTreeMap, BTreeSet},
     path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -9,7 +10,9 @@ use rusqlite::{params, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use synapse_core::{AliasRow, AliasTable, EngineIdentity, Fingerprint, NumericProfileId};
+use synapse_core::{
+    AliasRow, AliasTable, EngineIdentity, Fingerprint, MachineProfile, NumericProfileId,
+};
 use thiserror::Error;
 
 use crate::PerfKnob;
@@ -379,9 +382,166 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 8,
         statements: r#"
-                 ALTER TABLE cert_rows ADD COLUMN status TEXT NOT NULL DEFAULT 'certified'
-                     CHECK (status IN ('certified', 'uncertified'));
-        "#,
+                  ALTER TABLE cert_rows ADD COLUMN status TEXT NOT NULL DEFAULT 'certified'
+                      CHECK (status IN ('certified', 'uncertified'));
+         "#,
+    },
+    Migration {
+        version: 9,
+        statements: r#"
+                  DROP INDEX IF EXISTS cert_rows_fingerprint_idx;
+                  ALTER TABLE cert_rows RENAME TO cert_rows_v8;
+                  CREATE TABLE cert_rows_rebuilt (
+                      row_id INTEGER PRIMARY KEY,
+                      certification_class TEXT NOT NULL,
+                      assurance_class TEXT NOT NULL,
+                      status TEXT NOT NULL CHECK (status IN ('certified', 'uncertified')),
+                      key_hash TEXT NOT NULL,
+                      machine_profile_hash TEXT,
+                      revisioned_machine_profile_hash TEXT,
+                      profile_activation_epoch INTEGER,
+                      model_id TEXT,
+                      decode_fingerprint TEXT,
+                      remote_profile_hash TEXT,
+                      identity_revision TEXT,
+                      numeric_profile_id TEXT,
+                      fingerprint TEXT NOT NULL,
+                      certified_at_ms INTEGER NOT NULL,
+                      os_build TEXT NOT NULL,
+                      module_generation INTEGER NOT NULL,
+                      evidence_schema_revision TEXT,
+                      processing_fingerprint TEXT,
+                      runtime_config_digest TEXT,
+                      constraint_runtime_identities_json TEXT,
+                      worker_path_evidence_json TEXT,
+                      g_dec_manifest_revision TEXT,
+                      evidence_json TEXT NOT NULL,
+                      CHECK (certification_class IN ('measured_owned_decode', 'declared', 'remote', 'embedding', 'rerank', 'legacy_owned_decode')),
+                      CHECK (certification_class <> 'measured_owned_decode' OR (
+                          revisioned_machine_profile_hash IS NOT NULL
+                          AND profile_activation_epoch > 0
+                          AND model_id IS NOT NULL
+                          AND decode_fingerprint IS NOT NULL
+                          AND evidence_schema_revision IS NOT NULL
+                      )),
+                      CHECK (certification_class <> 'legacy_owned_decode' OR status <> 'certified')
+                  );
+                  INSERT INTO cert_rows_rebuilt (
+                      certification_class, assurance_class, status, key_hash,
+                      machine_profile_hash, remote_profile_hash, identity_revision,
+                      numeric_profile_id, fingerprint, certified_at_ms, os_build,
+                      module_generation, evidence_json
+                  )
+                  SELECT CASE WHEN assurance_class = 'declared' THEN 'declared' ELSE 'legacy_owned_decode' END,
+                         assurance_class,
+                         CASE WHEN assurance_class = 'declared' THEN status ELSE 'uncertified' END,
+                         key_hash,
+                         machine_profile_hash,
+                         remote_profile_hash,
+                         identity_revision,
+                         numeric_profile_id,
+                         fingerprint,
+                         certified_at_ms,
+                         os_build,
+                         module_generation,
+                         evidence_json
+                  FROM cert_rows_v8;
+                  DROP TABLE cert_rows_v8;
+                  ALTER TABLE cert_rows_rebuilt RENAME TO cert_rows;
+                  CREATE UNIQUE INDEX cert_rows_owned_decode_identity_v1
+                      ON cert_rows (revisioned_machine_profile_hash, profile_activation_epoch,
+                                    model_id, decode_fingerprint, evidence_schema_revision)
+                      WHERE certification_class = 'measured_owned_decode';
+                  CREATE UNIQUE INDEX cert_rows_declared_identity_v1
+                      ON cert_rows (key_hash, fingerprint)
+                      WHERE certification_class = 'declared';
+                  CREATE UNIQUE INDEX cert_rows_remote_identity_v1
+                      ON cert_rows (key_hash, fingerprint)
+                      WHERE certification_class = 'remote';
+                  CREATE UNIQUE INDEX cert_rows_embedding_identity_v1
+                      ON cert_rows (key_hash, fingerprint)
+                      WHERE certification_class = 'embedding';
+                  CREATE UNIQUE INDEX cert_rows_rerank_identity_v1
+                      ON cert_rows (key_hash, fingerprint)
+                      WHERE certification_class = 'rerank';
+                  CREATE INDEX cert_rows_fingerprint_idx ON cert_rows(fingerprint);
+
+                  CREATE TABLE approvals (
+                      row_id INTEGER PRIMARY KEY,
+                      schema_revision TEXT NOT NULL,
+                      model_id TEXT NOT NULL,
+                      decode_fingerprint TEXT NOT NULL,
+                      enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+                      grammar_enabled INTEGER NOT NULL CHECK (grammar_enabled IN (0, 1)),
+                      disabled_reason TEXT,
+                      approved_by TEXT,
+                      approved_at_ms INTEGER,
+                      updated_at_ms INTEGER NOT NULL,
+                      evidence_requirements_revision TEXT NOT NULL,
+                      semantic_digest TEXT NOT NULL,
+                      generation INTEGER NOT NULL DEFAULT 0,
+                      fencing_metadata TEXT NOT NULL DEFAULT '{}',
+                      UNIQUE (model_id, decode_fingerprint)
+                  );
+                  CREATE INDEX approvals_enabled_idx ON approvals(enabled, model_id, decode_fingerprint);
+                  CREATE TABLE approval_digest_corruption_events (
+                      event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      model_id TEXT NOT NULL,
+                      decode_fingerprint TEXT NOT NULL,
+                      observed_digest TEXT NOT NULL,
+                      recomputed_digest TEXT NOT NULL,
+                      observed_at_ms INTEGER NOT NULL
+                  );
+                  CREATE TABLE approval_migration_markers (
+                      seed_revision TEXT PRIMARY KEY,
+                      schema_revision TEXT NOT NULL,
+                      seed_digest TEXT NOT NULL,
+                      applied_at_ms INTEGER NOT NULL,
+                      row_count INTEGER NOT NULL
+                  );
+
+                  CREATE TABLE profile_state (
+                      id INTEGER PRIMARY KEY CHECK (id = 0),
+                      snapshot_json TEXT,
+                      revisioned_machine_profile_hash TEXT,
+                      profile_activation_epoch INTEGER,
+                      previous_revisioned_machine_profile_hash TEXT,
+                      last_rotation_reason TEXT,
+                      last_rotation_at_ms INTEGER
+                  );
+                  INSERT INTO profile_state (id) VALUES (0);
+                  CREATE TABLE profile_rotation_events (
+                      event_id TEXT PRIMARY KEY,
+                      old_revisioned_machine_profile_hash TEXT,
+                      new_revisioned_machine_profile_hash TEXT NOT NULL,
+                      old_profile_activation_epoch INTEGER,
+                      new_profile_activation_epoch INTEGER NOT NULL CHECK (new_profile_activation_epoch > 0),
+                      changed_fields_json TEXT NOT NULL,
+                      previous_snapshot_json TEXT,
+                      current_snapshot_json TEXT NOT NULL,
+                      observed_at_ms INTEGER NOT NULL,
+                      module_generation INTEGER NOT NULL,
+                      created_at_ms INTEGER NOT NULL,
+                      UNIQUE (new_revisioned_machine_profile_hash, new_profile_activation_epoch)
+                  );
+                  CREATE TABLE profile_rotation_certification_outcomes (
+                      event_id TEXT NOT NULL REFERENCES profile_rotation_events(event_id) ON DELETE CASCADE,
+                      model_id TEXT NOT NULL,
+                      decode_fingerprint TEXT NOT NULL,
+                      outcome_state TEXT NOT NULL CHECK (outcome_state IN ('not_required', 'required', 'in_progress', 'passed', 'failed')),
+                      certified_at_ms INTEGER,
+                      failure_reason TEXT,
+                      PRIMARY KEY (event_id, model_id, decode_fingerprint)
+                  );
+                  CREATE INDEX profile_rotation_outcomes_order_idx
+                      ON profile_rotation_certification_outcomes(event_id, model_id, decode_fingerprint);
+                  CREATE TABLE cert_row_rebuild_events (
+                      event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      outcome TEXT NOT NULL,
+                      detail TEXT NOT NULL,
+                      occurred_at_ms INTEGER NOT NULL
+                  );
+         "#,
     },
 ];
 
@@ -407,6 +567,19 @@ pub enum SynapseStoreError {
         previous_url: String,
         requested_url: String,
     },
+    #[error("cert_rows_rebuild_failed: {0}")]
+    CertRowsRebuildFailed(String),
+    #[error("approval digest mismatch for ({model_id}, {decode_fingerprint}): observed {observed}, recomputed {recomputed}")]
+    ApprovalDigestMismatch {
+        model_id: String,
+        decode_fingerprint: String,
+        observed: String,
+        recomputed: String,
+    },
+    #[error("profile state corruption: {0}")]
+    ProfileStateCorrupt(String),
+    #[error("profile activation compare-and-set lost to another observer")]
+    ProfileActivationLost,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -498,6 +671,301 @@ impl AssuranceClass {
             other => Err(SynapseStoreError::Decode(format!(
                 "unknown assurance class '{other}'"
             ))),
+        }
+    }
+}
+
+/// Explicit discriminator for every class that shares `cert_rows`.
+///
+/// In particular, `LegacyOwnedDecode` is deliberately not an alias for
+/// `MeasuredOwnedDecode`: legacy rows have no complete runtime binding and are
+/// retained for audit only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Ord, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CertificationClass {
+    MeasuredOwnedDecode,
+    Declared,
+    Remote,
+    Embedding,
+    Rerank,
+    LegacyOwnedDecode,
+}
+
+impl CertificationClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MeasuredOwnedDecode => "measured_owned_decode",
+            Self::Declared => "declared",
+            Self::Remote => "remote",
+            Self::Embedding => "embedding",
+            Self::Rerank => "rerank",
+            Self::LegacyOwnedDecode => "legacy_owned_decode",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, SynapseStoreError> {
+        match value {
+            "measured_owned_decode" => Ok(Self::MeasuredOwnedDecode),
+            "declared" => Ok(Self::Declared),
+            "remote" => Ok(Self::Remote),
+            "embedding" => Ok(Self::Embedding),
+            "rerank" => Ok(Self::Rerank),
+            "legacy_owned_decode" => Ok(Self::LegacyOwnedDecode),
+            other => Err(SynapseStoreError::Decode(format!(
+                "unknown certification class '{other}'"
+            ))),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalIdentity {
+    pub model_id: String,
+    pub decode_fingerprint: String,
+}
+
+impl ApprovalIdentity {
+    pub fn new(model_id: impl Into<String>, decode_fingerprint: impl Into<String>) -> Self {
+        Self {
+            model_id: model_id.into(),
+            decode_fingerprint: decode_fingerprint.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalRow {
+    pub schema_revision: String,
+    pub model_id: String,
+    pub decode_fingerprint: String,
+    pub enabled: bool,
+    pub grammar_enabled: bool,
+    pub disabled_reason: Option<String>,
+    pub approved_by: Option<String>,
+    pub approved_at_ms: Option<u64>,
+    pub updated_at_ms: u64,
+    pub evidence_requirements_revision: String,
+    pub semantic_digest: String,
+    pub row_id: u64,
+    pub generation: u64,
+    pub fencing_metadata: Value,
+}
+
+impl ApprovalRow {
+    pub fn expected_digest(&self) -> Result<String, SynapseStoreError> {
+        let separator = if self.schema_revision == APPROVAL_SCHEMA_REVISION {
+            APPROVAL_DIGEST_DOMAIN.to_string()
+        } else {
+            format!("owned-decode-approval-row-{}\0", self.schema_revision)
+        };
+        let mut hasher = Sha256::new();
+        hasher.update(separator.as_bytes());
+        digest_text(&mut hasher, &self.schema_revision);
+        digest_text(&mut hasher, &self.model_id);
+        digest_text(&mut hasher, &self.decode_fingerprint);
+        digest_text(&mut hasher, if self.enabled { "true" } else { "false" });
+        digest_text(
+            &mut hasher,
+            if self.grammar_enabled {
+                "true"
+            } else {
+                "false"
+            },
+        );
+        digest_optional_text(&mut hasher, self.disabled_reason.as_deref());
+        digest_optional_text(&mut hasher, self.approved_by.as_deref());
+        digest_optional_u64(&mut hasher, self.approved_at_ms);
+        digest_text(&mut hasher, &self.evidence_requirements_revision);
+        Ok(hex::encode(hasher.finalize()))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ApprovalDigestMismatch {
+    pub model_id: String,
+    pub decode_fingerprint: String,
+    pub observed_digest: String,
+    pub recomputed_digest: String,
+    pub observed_at_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ApprovalMigrationResult {
+    pub outcome: String,
+    pub seed_revision: String,
+    pub rows: usize,
+    pub marker: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalMigrationSeedEntry {
+    pub source_catalog_entry_id: String,
+    pub model_id: String,
+    pub decode_fingerprint: String,
+    pub enabled: bool,
+    pub grammar_enabled: bool,
+    pub disabled_reason: Option<String>,
+}
+
+pub const APPROVAL_SCHEMA_REVISION: &str = "runtime-bound-records-contracts-v1";
+pub const APPROVAL_EVIDENCE_REQUIREMENTS_REVISION: &str = "owned-decode-evidence-requirements-v1";
+pub const APPROVAL_DIGEST_DOMAIN: &str = "owned-decode-approval-row-v1\0";
+pub const CERT_EVIDENCE_SCHEMA_REVISION: &str = "owned-decode-cert-evidence-v1";
+pub const G_DEC_MANIFEST_REVISION: &str = "decode-fixture-registry-v1";
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct OwnedDecodeCertificationRow {
+    pub status: CertificationStatus,
+    pub revisioned_machine_profile_hash: String,
+    pub profile_activation_epoch: u64,
+    pub model_id: String,
+    pub decode_fingerprint: String,
+    pub processing_fingerprint: String,
+    pub runtime_config_digest: String,
+    pub constraint_runtime_identities: Vec<String>,
+    pub worker_path_evidence: Value,
+    pub evidence_schema_revision: String,
+    pub g_dec_manifest_revision: String,
+    pub numeric_profile_id: Option<NumericProfileId>,
+    pub fingerprint: Fingerprint,
+    pub certified_at_ms: u64,
+    pub os_build: String,
+    pub module_generation: u64,
+    pub evidence: Value,
+}
+
+impl OwnedDecodeCertificationRow {
+    pub fn identity(&self) -> (&str, u64, &str, &str, &str) {
+        (
+            &self.revisioned_machine_profile_hash,
+            self.profile_activation_epoch,
+            &self.model_id,
+            &self.decode_fingerprint,
+            &self.evidence_schema_revision,
+        )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ClassScopedCertificationRow {
+    pub certification_class: CertificationClass,
+    pub assurance_class: AssuranceClass,
+    pub status: CertificationStatus,
+    pub key_hash: String,
+    pub machine_profile_hash: Option<String>,
+    pub remote_profile_hash: Option<String>,
+    pub identity_revision: Option<String>,
+    pub numeric_profile_id: Option<NumericProfileId>,
+    pub fingerprint: Fingerprint,
+    pub certified_at_ms: u64,
+    pub os_build: String,
+    pub module_generation: u64,
+    pub evidence: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ProfileState {
+    pub snapshot: Option<MachineProfile>,
+    pub revisioned_machine_profile_hash: Option<String>,
+    pub profile_activation_epoch: Option<u64>,
+    pub previous_revisioned_machine_profile_hash: Option<String>,
+    pub last_rotation_reason: Option<String>,
+    pub last_rotation_at_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct RotationCertificationOutcome {
+    pub event_id: String,
+    pub model_id: String,
+    pub decode_fingerprint: String,
+    pub outcome_state: String,
+    pub certified_at_ms: Option<u64>,
+    pub failure_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct RotationLedgerEvent {
+    pub event_id: String,
+    pub old_revisioned_machine_profile_hash: Option<String>,
+    pub new_revisioned_machine_profile_hash: String,
+    pub old_profile_activation_epoch: Option<u64>,
+    pub new_profile_activation_epoch: u64,
+    pub changed_fields: Vec<String>,
+    pub previous_snapshot: Option<MachineProfile>,
+    pub current_snapshot: MachineProfile,
+    pub observed_at_ms: u64,
+    pub module_generation: u64,
+    pub created_at_ms: u64,
+    pub outcomes: Vec<RotationCertificationOutcome>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ProfileActivation {
+    pub state: ProfileState,
+    pub rotated: bool,
+    pub event: Option<RotationLedgerEvent>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct EvidenceRequirementsDivergence {
+    pub model_id: String,
+    pub decode_fingerprint: String,
+    pub result: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ApprovalCertificationHealth {
+    pub model_id: String,
+    pub decode_fingerprint: String,
+    pub enabled: bool,
+    pub admission: String,
+    pub state: String,
+    pub certified_at_ms: Option<u64>,
+    pub failure_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct StorageHealthInputs {
+    pub previous_revisioned_machine_profile_hash: Option<String>,
+    pub current_revisioned_machine_profile_hash: Option<String>,
+    pub profile_activation_epoch: Option<u64>,
+    pub last_rotation_at_ms: Option<u64>,
+    pub last_rotation_reason: Option<String>,
+    pub rotation_event_count: u64,
+    pub re_certification_state: String,
+    pub evidence_requirements_divergence: Vec<EvidenceRequirementsDivergence>,
+    pub approval_certification_outcomes: Vec<ApprovalCertificationHealth>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct OwnedDecodeAdmission {
+    pub approval: ApprovalRow,
+    pub certification: OwnedDecodeCertificationRow,
+    pub revisioned_machine_profile_hash: String,
+    pub profile_activation_epoch: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RotationOutcomeState {
+    NotRequired,
+    Required,
+    InProgress,
+    Passed,
+    Failed,
+}
+
+impl RotationOutcomeState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NotRequired => "not_required",
+            Self::Required => "required",
+            Self::InProgress => "in_progress",
+            Self::Passed => "passed",
+            Self::Failed => "failed",
         }
     }
 }
@@ -691,8 +1159,26 @@ pub struct SynapseStore {
 impl SynapseStore {
     pub fn open(descriptor: &StorageDescriptor) -> Result<Self, SynapseStoreError> {
         let store = open_sqlite(descriptor)?;
-        store.migrate(NAMESPACE, MIGRATIONS)?;
+        store.migrate(NAMESPACE, MIGRATIONS).map_err(|error| {
+            let message = error.to_string();
+            if message.contains("cert_rows") || message.contains("cert_rows_rebuilt") {
+                SynapseStoreError::CertRowsRebuildFailed(message)
+            } else {
+                SynapseStoreError::Store(error)
+            }
+        })?;
         Ok(Self { store })
+    }
+
+    pub fn open_with_profile(
+        descriptor: &StorageDescriptor,
+        profile: &MachineProfile,
+        observed_at_ms: u64,
+        module_generation: u64,
+    ) -> Result<Self, SynapseStoreError> {
+        let store = Self::open(descriptor)?;
+        store.observe_profile(profile, observed_at_ms, module_generation)?;
+        Ok(store)
     }
 
     pub fn next_module_generation(&self) -> Result<u64, SynapseStoreError> {
@@ -813,6 +1299,663 @@ impl SynapseStore {
         })
     }
 
+    /// Insert an approval row only through this explicit administrative path,
+    /// after validation; serving and certification code never call it.
+    pub fn insert_approval(&self, row: &ApprovalRow) -> Result<ApprovalRow, SynapseStoreError> {
+        validate_approval(row, false)?;
+        let catalog_matches: i64 = self.store.with_conn(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM models WHERE model_id = ?1",
+                params![&row.model_id],
+                |query_row| query_row.get(0),
+            )
+        })?;
+        if catalog_matches != 1 {
+            return Err(SynapseStoreError::Decode(format!(
+                "unmappable_identity: model_id={} matches={catalog_matches}",
+                row.model_id
+            )));
+        }
+        let inserted =
+            self.store.with_conn_fenced(|tx| {
+                let mut row = row.clone();
+                row.semantic_digest = row.expected_digest().map_err(to_sql_error)?;
+                validate_approval(&row, true).map_err(to_sql_error)?;
+                let fencing_metadata = serde_json::to_string(&row.fencing_metadata)
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+                tx.execute(
+                    "INSERT INTO approvals (
+                     schema_revision, model_id, decode_fingerprint, enabled, grammar_enabled,
+                     disabled_reason, approved_by, approved_at_ms, updated_at_ms,
+                     evidence_requirements_revision, semantic_digest, generation, fencing_metadata
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                    params![
+                        &row.schema_revision,
+                        &row.model_id,
+                        &row.decode_fingerprint,
+                        row.enabled as i64,
+                        row.grammar_enabled as i64,
+                        row.disabled_reason.as_deref(),
+                        row.approved_by.as_deref(),
+                        row.approved_at_ms.map(|value| value as i64),
+                        row.updated_at_ms as i64,
+                        &row.evidence_requirements_revision,
+                        &row.semantic_digest,
+                        row.generation as i64,
+                        fencing_metadata,
+                    ],
+                )?;
+                let row_id = tx.last_insert_rowid();
+                Ok(load_approval_tx(tx, row_id)?
+                    .ok_or_else(|| rusqlite::Error::QueryReturnedNoRows)?)
+            })?;
+        Ok(inserted)
+    }
+
+    pub fn create_approval(
+        &self,
+        model_id: &str,
+        decode_fingerprint: &str,
+        grammar_enabled: bool,
+        approved_by: &str,
+        approved_at_ms: u64,
+        updated_at_ms: u64,
+    ) -> Result<ApprovalRow, SynapseStoreError> {
+        let mut row = ApprovalRow {
+            schema_revision: APPROVAL_SCHEMA_REVISION.to_string(),
+            model_id: model_id.to_string(),
+            decode_fingerprint: decode_fingerprint.to_string(),
+            enabled: true,
+            grammar_enabled,
+            disabled_reason: None,
+            approved_by: Some(approved_by.to_string()),
+            approved_at_ms: Some(approved_at_ms),
+            updated_at_ms,
+            evidence_requirements_revision: APPROVAL_EVIDENCE_REQUIREMENTS_REVISION.to_string(),
+            semantic_digest: String::new(),
+            row_id: 0,
+            generation: 0,
+            fencing_metadata: Value::Object(Default::default()),
+        };
+        row.semantic_digest = row.expected_digest()?;
+        self.insert_approval(&row)
+    }
+
+    pub fn migrate_owned_decode_approvals(
+        &self,
+        seed_revision: &str,
+        schema_revision: &str,
+    ) -> Result<ApprovalMigrationResult, SynapseStoreError> {
+        const SEED_SOURCE: &str =
+            include_str!("../owned-decode-manifests/migration-seed-manifest-v1.json");
+
+        if seed_revision != "owned-decode-approval-migration-v1"
+            || schema_revision != APPROVAL_SCHEMA_REVISION
+        {
+            return Ok(ApprovalMigrationResult {
+                outcome: "invalid_seed".to_string(),
+                seed_revision: seed_revision.to_string(),
+                rows: 0,
+                marker: "unchanged".to_string(),
+            });
+        }
+        let seed: Value = match serde_json::from_str(SEED_SOURCE) {
+            Ok(seed) => seed,
+            Err(error) => {
+                return Ok(ApprovalMigrationResult {
+                    outcome: "invalid_seed".to_string(),
+                    seed_revision: seed_revision.to_string(),
+                    rows: 0,
+                    marker: format!("parse_error:{error}"),
+                })
+            }
+        };
+        let Some(seed_object) = seed.as_object() else {
+            return Ok(ApprovalMigrationResult {
+                outcome: "invalid_seed".to_string(),
+                seed_revision: seed_revision.to_string(),
+                rows: 0,
+                marker: "unchanged".to_string(),
+            });
+        };
+        if !has_only_keys(
+            seed_object,
+            &[
+                "manifest_revision",
+                "schema_revision",
+                "artifact_kind",
+                "source",
+                "expansion",
+                "seed_revision",
+                "initial_evidence_requirements_revision",
+                "entries",
+                "mechanical_proof",
+                "reachability",
+            ],
+        ) || seed_object.get("seed_revision").and_then(Value::as_str) != Some(seed_revision)
+            || seed_object.get("schema_revision").and_then(Value::as_str)
+                != Some("runtime-bound-records-contracts-v1")
+            || seed_object
+                .get("initial_evidence_requirements_revision")
+                .and_then(Value::as_str)
+                != Some(APPROVAL_EVIDENCE_REQUIREMENTS_REVISION)
+        {
+            return Ok(ApprovalMigrationResult {
+                outcome: "invalid_seed".to_string(),
+                seed_revision: seed_revision.to_string(),
+                rows: 0,
+                marker: "unchanged".to_string(),
+            });
+        }
+        let Some(seed_entries) = seed_object.get("entries").and_then(Value::as_array) else {
+            return Ok(ApprovalMigrationResult {
+                outcome: "invalid_seed".to_string(),
+                seed_revision: seed_revision.to_string(),
+                rows: 0,
+                marker: "unchanged".to_string(),
+            });
+        };
+        let mut entries = Vec::new();
+        for value in seed_entries {
+            let Some(entry) = value.as_object() else {
+                return Ok(ApprovalMigrationResult {
+                    outcome: "invalid_seed".to_string(),
+                    seed_revision: seed_revision.to_string(),
+                    rows: 0,
+                    marker: "unchanged".to_string(),
+                });
+            };
+            if !has_only_keys(
+                entry,
+                &[
+                    "source_catalog_entry_id",
+                    "model_id",
+                    "decode_fingerprint",
+                    "enabled",
+                    "grammar_enabled",
+                    "disabled_reason",
+                    "d009_provenance",
+                ],
+            ) {
+                return Ok(ApprovalMigrationResult {
+                    outcome: "invalid_seed".to_string(),
+                    seed_revision: seed_revision.to_string(),
+                    rows: 0,
+                    marker: "unknown_fields".to_string(),
+                });
+            }
+            let source_catalog_entry_id = entry
+                .get("source_catalog_entry_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let model_id = entry
+                .get("model_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let decode_fingerprint = entry
+                .get("decode_fingerprint")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let enabled = entry
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let grammar_enabled = entry
+                .get("grammar_enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let disabled_reason = entry
+                .get("disabled_reason")
+                .and_then(|value| {
+                    if value.is_null() {
+                        None
+                    } else {
+                        value.as_str()
+                    }
+                })
+                .map(str::to_string);
+            let provenance_valid = entry
+                .get("d009_provenance")
+                .and_then(Value::as_object)
+                .map(|provenance| {
+                    has_only_keys(
+                        provenance,
+                        &["source_manifest_revision", "source_record_index"],
+                    ) && provenance
+                        .get("source_manifest_revision")
+                        .and_then(Value::as_str)
+                        == Some("d009-cutover-records-v1")
+                        && provenance
+                            .get("source_record_index")
+                            .and_then(Value::as_u64)
+                            .is_some()
+                })
+                .unwrap_or(false);
+            if source_catalog_entry_id != model_id
+                || !is_catalog_model_id(model_id)
+                || !is_digest(decode_fingerprint)
+                || !provenance_valid
+                || (enabled && disabled_reason.is_some())
+                || (!enabled
+                    && disabled_reason
+                        .as_deref()
+                        .map(str::is_empty)
+                        .unwrap_or(true))
+            {
+                return Ok(ApprovalMigrationResult {
+                    outcome: "invalid_seed".to_string(),
+                    seed_revision: seed_revision.to_string(),
+                    rows: 0,
+                    marker: "unchanged".to_string(),
+                });
+            }
+            entries.push(ApprovalMigrationSeedEntry {
+                source_catalog_entry_id: source_catalog_entry_id.to_string(),
+                model_id: model_id.to_string(),
+                decode_fingerprint: decode_fingerprint.to_string(),
+                enabled,
+                grammar_enabled,
+                disabled_reason,
+            });
+        }
+        if entries.len() != 4 {
+            return Ok(ApprovalMigrationResult {
+                outcome: "invalid_seed".to_string(),
+                seed_revision: seed_revision.to_string(),
+                rows: entries.len(),
+                marker: "unchanged".to_string(),
+            });
+        }
+        if entries.len() != 4 {
+            return Ok(ApprovalMigrationResult {
+                outcome: "invalid_seed".to_string(),
+                seed_revision: seed_revision.to_string(),
+                rows: entries.len(),
+                marker: "unchanged".to_string(),
+            });
+        }
+        let mut identities = BTreeSet::new();
+        for entry in &entries {
+            if !identities.insert((entry.model_id.clone(), entry.decode_fingerprint.clone())) {
+                return Ok(ApprovalMigrationResult {
+                    outcome: "duplicate_identity".to_string(),
+                    seed_revision: seed_revision.to_string(),
+                    rows: 0,
+                    marker: "unchanged".to_string(),
+                });
+            }
+        }
+        let unmappable = self.store.with_conn(|conn| {
+            for entry in &entries {
+                let count: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM models WHERE model_id = ?1",
+                    params![&entry.source_catalog_entry_id],
+                    |row| row.get(0),
+                )?;
+                if count != 1 {
+                    return Ok(Some((entry.source_catalog_entry_id.clone(), count)));
+                }
+            }
+            Ok(None)
+        })?;
+        if let Some((source_catalog_entry_id, matches)) = unmappable {
+            return Ok(ApprovalMigrationResult {
+                outcome: "unmappable_identity".to_string(),
+                seed_revision: seed_revision.to_string(),
+                rows: 0,
+                marker: format!(
+                    "source_catalog_entry_id={source_catalog_entry_id} matches={matches}"
+                ),
+            });
+        }
+        let seed_digest = hex::encode(Sha256::digest(SEED_SOURCE.as_bytes()));
+        let now_ms = unix_now_ms();
+        let result = self.store.with_conn_fenced(|tx| {
+            let marker = tx
+                .query_row(
+                    "SELECT schema_revision, seed_digest, row_count
+                     FROM approval_migration_markers WHERE seed_revision = ?1",
+                    params![seed_revision],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            if let Some((recorded_schema, recorded_digest, row_count)) = marker {
+                let outcome = if recorded_schema == schema_revision && recorded_digest == seed_digest
+                {
+                    "already_applied"
+                } else {
+                    "invalid_seed"
+                };
+                return Ok(ApprovalMigrationResult {
+                    outcome: outcome.to_string(),
+                    seed_revision: seed_revision.to_string(),
+                    rows: row_count as usize,
+                    marker: if outcome == "already_applied" {
+                        "unchanged".to_string()
+                    } else {
+                        "unchanged".to_string()
+                    },
+                });
+            }
+            for entry in &entries {
+                let count: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM approvals
+                     WHERE model_id = ?1 AND decode_fingerprint = ?2",
+                    params![&entry.model_id, &entry.decode_fingerprint],
+                    |row| row.get(0),
+                )?;
+                if count != 0 {
+                    return Ok(ApprovalMigrationResult {
+                        outcome: "duplicate_identity".to_string(),
+                        seed_revision: seed_revision.to_string(),
+                        rows: 0,
+                        marker: "unchanged".to_string(),
+                    });
+                }
+            }
+            for entry in &entries {
+                let mut row = ApprovalRow {
+                    schema_revision: schema_revision.to_string(),
+                    model_id: entry.model_id.clone(),
+                    decode_fingerprint: entry.decode_fingerprint.clone(),
+                    enabled: entry.enabled,
+                    grammar_enabled: entry.grammar_enabled,
+                    disabled_reason: entry.disabled_reason.clone(),
+                    approved_by: entry
+                        .enabled
+                        .then(|| format!("migration:{seed_revision}")),
+                    approved_at_ms: entry.enabled.then_some(now_ms),
+                    updated_at_ms: now_ms,
+                    evidence_requirements_revision:
+                        APPROVAL_EVIDENCE_REQUIREMENTS_REVISION.to_string(),
+                    semantic_digest: String::new(),
+                    row_id: 0,
+                    generation: 0,
+                    fencing_metadata: serde_json::json!({"operation": "approval_migration", "seed_revision": seed_revision}),
+                };
+                row.semantic_digest = row.expected_digest().map_err(to_sql_error)?;
+                let fencing_metadata = serde_json::to_string(&row.fencing_metadata).map_err(|error| {
+                    rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                })?;
+                tx.execute(
+                    "INSERT INTO approvals (
+                         schema_revision, model_id, decode_fingerprint, enabled,
+                         grammar_enabled, disabled_reason, approved_by, approved_at_ms,
+                         updated_at_ms, evidence_requirements_revision, semantic_digest,
+                         generation, fencing_metadata
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                    params![
+                        &row.schema_revision,
+                        &row.model_id,
+                        &row.decode_fingerprint,
+                        row.enabled as i64,
+                        row.grammar_enabled as i64,
+                        row.disabled_reason.as_deref(),
+                        row.approved_by.as_deref(),
+                        row.approved_at_ms.map(|value| value as i64),
+                        row.updated_at_ms as i64,
+                        &row.evidence_requirements_revision,
+                        &row.semantic_digest,
+                        row.generation as i64,
+                        fencing_metadata,
+                    ],
+                )?;
+            }
+            tx.execute(
+                "INSERT INTO approval_migration_markers (
+                     seed_revision, schema_revision, seed_digest, applied_at_ms, row_count
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    seed_revision,
+                    schema_revision,
+                    seed_digest,
+                    now_ms as i64,
+                    entries.len() as i64,
+                ],
+            )?;
+            Ok(ApprovalMigrationResult {
+                outcome: "applied".to_string(),
+                seed_revision: seed_revision.to_string(),
+                rows: entries.len(),
+                marker: "committed".to_string(),
+            })
+        });
+        match result {
+            Ok(result) => Ok(result),
+            Err(_) => Ok(ApprovalMigrationResult {
+                outcome: "transaction_failed".to_string(),
+                seed_revision: seed_revision.to_string(),
+                rows: 0,
+                marker: "unchanged".to_string(),
+            }),
+        }
+    }
+
+    pub fn get_approval(
+        &self,
+        model_id: &str,
+        decode_fingerprint: &str,
+    ) -> Result<Option<ApprovalRow>, SynapseStoreError> {
+        let row = self.store.with_conn(|conn| {
+            conn.query_row(
+                "SELECT row_id, schema_revision, model_id, decode_fingerprint, enabled,
+                        grammar_enabled, disabled_reason, approved_by, approved_at_ms,
+                        updated_at_ms, evidence_requirements_revision, semantic_digest,
+                        generation, fencing_metadata
+                 FROM approvals WHERE model_id = ?1 AND decode_fingerprint = ?2",
+                params![model_id, decode_fingerprint],
+                approval_from_row,
+            )
+            .optional()
+        })?;
+        let Some(row) = row else { return Ok(None) };
+        match validate_approval(&row, true) {
+            Ok(()) => Ok(Some(row)),
+            Err(SynapseStoreError::ApprovalDigestMismatch {
+                model_id,
+                decode_fingerprint,
+                observed,
+                recomputed,
+            }) => {
+                let observed_at_ms = unix_now_ms();
+                self.store.with_conn_fenced(|tx| {
+                    tx.execute(
+                        "INSERT INTO approval_digest_corruption_events (
+                             model_id, decode_fingerprint, observed_digest,
+                             recomputed_digest, observed_at_ms
+                         ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![
+                            &model_id,
+                            &decode_fingerprint,
+                            &observed,
+                            &recomputed,
+                            observed_at_ms as i64,
+                        ],
+                    )?;
+                    Ok(())
+                })?;
+                eprintln!(
+                    "WARN approval_digest_mismatch model_id={} decode_fingerprint={}",
+                    model_id, decode_fingerprint
+                );
+                Err(SynapseStoreError::ApprovalDigestMismatch {
+                    model_id,
+                    decode_fingerprint,
+                    observed,
+                    recomputed,
+                })
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn approvals(&self) -> Result<Vec<ApprovalRow>, SynapseStoreError> {
+        let rows = self.store.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT row_id, schema_revision, model_id, decode_fingerprint, enabled,
+                        grammar_enabled, disabled_reason, approved_by, approved_at_ms,
+                        updated_at_ms, evidence_requirements_revision, semantic_digest,
+                        generation, fencing_metadata
+                 FROM approvals ORDER BY model_id ASC, decode_fingerprint ASC",
+            )?;
+            let rows = stmt
+                .query_map([], approval_from_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })?;
+        rows.into_iter()
+            .map(|row| {
+                validate_approval(&row, true)?;
+                Ok(row)
+            })
+            .collect()
+    }
+
+    pub fn enable_approval(
+        &self,
+        model_id: &str,
+        decode_fingerprint: &str,
+        approved_by: &str,
+        approved_at_ms: u64,
+        updated_at_ms: u64,
+    ) -> Result<ApprovalRow, SynapseStoreError> {
+        self.mutate_approval(model_id, decode_fingerprint, updated_at_ms, |row| {
+            row.enabled = true;
+            row.disabled_reason = None;
+            row.approved_by = Some(approved_by.to_string());
+            row.approved_at_ms = Some(approved_at_ms);
+        })
+    }
+
+    pub fn disable_approval(
+        &self,
+        model_id: &str,
+        decode_fingerprint: &str,
+        reason: &str,
+        updated_at_ms: u64,
+    ) -> Result<ApprovalRow, SynapseStoreError> {
+        if reason.trim().is_empty() {
+            return Err(SynapseStoreError::Decode(
+                "disabled approval requires a non-empty reason".to_string(),
+            ));
+        }
+        self.mutate_approval(model_id, decode_fingerprint, updated_at_ms, |row| {
+            row.enabled = false;
+            row.disabled_reason = Some(reason.to_string());
+        })
+    }
+
+    pub fn set_approval_grammar_enabled(
+        &self,
+        model_id: &str,
+        decode_fingerprint: &str,
+        grammar_enabled: bool,
+        updated_at_ms: u64,
+    ) -> Result<ApprovalRow, SynapseStoreError> {
+        self.mutate_approval(model_id, decode_fingerprint, updated_at_ms, |row| {
+            row.grammar_enabled = grammar_enabled;
+        })
+    }
+
+    pub fn emergency_rollback(
+        &self,
+        reason: &str,
+        updated_at_ms: u64,
+    ) -> Result<usize, SynapseStoreError> {
+        if reason.trim().is_empty() {
+            return Err(SynapseStoreError::Decode(
+                "emergency rollback requires a non-empty reason".to_string(),
+            ));
+        }
+        let changed = self.store.with_conn_fenced(|tx| {
+            let mut stmt = tx.prepare(
+                "SELECT row_id, schema_revision, model_id, decode_fingerprint, enabled,
+                        grammar_enabled, disabled_reason, approved_by, approved_at_ms,
+                        updated_at_ms, evidence_requirements_revision, semantic_digest,
+                        generation, fencing_metadata
+                 FROM approvals ORDER BY row_id",
+            )?;
+            let rows = stmt
+                .query_map([], approval_from_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(stmt);
+            let mut changed = 0;
+            for mut row in rows {
+                if row.enabled {
+                    row.enabled = false;
+                    row.disabled_reason = Some(reason.to_string());
+                    row.updated_at_ms = updated_at_ms;
+                    row.generation = row.generation.saturating_add(1);
+                    row.semantic_digest = row.expected_digest().map_err(to_sql_error)?;
+                    tx.execute(
+                        "UPDATE approvals SET enabled = 0, disabled_reason = ?1,
+                             updated_at_ms = ?2, generation = ?3, semantic_digest = ?4
+                         WHERE row_id = ?5",
+                        params![
+                            row.disabled_reason.as_deref(),
+                            updated_at_ms as i64,
+                            row.generation as i64,
+                            &row.semantic_digest,
+                            row.row_id as i64,
+                        ],
+                    )?;
+                    changed += 1;
+                }
+            }
+            Ok(changed)
+        })?;
+        Ok(changed)
+    }
+
+    fn mutate_approval<F>(
+        &self,
+        model_id: &str,
+        decode_fingerprint: &str,
+        updated_at_ms: u64,
+        mutate: F,
+    ) -> Result<ApprovalRow, SynapseStoreError>
+    where
+        F: FnOnce(&mut ApprovalRow),
+    {
+        let row = self.store.with_conn_fenced(|tx| {
+            let mut row = load_approval_tx_by_identity(tx, model_id, decode_fingerprint)?
+                .ok_or_else(|| rusqlite::Error::QueryReturnedNoRows)?;
+            validate_approval(&row, true).map_err(to_sql_error)?;
+            mutate(&mut row);
+            row.updated_at_ms = updated_at_ms;
+            row.generation = row.generation.saturating_add(1);
+            row.semantic_digest = row.expected_digest().map_err(to_sql_error)?;
+            let fencing_metadata = serde_json::to_string(&row.fencing_metadata)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+            tx.execute(
+                "UPDATE approvals SET enabled = ?1, grammar_enabled = ?2,
+                     disabled_reason = ?3, approved_by = ?4, approved_at_ms = ?5,
+                     updated_at_ms = ?6, semantic_digest = ?7, generation = ?8,
+                     fencing_metadata = ?9 WHERE row_id = ?10",
+                params![
+                    row.enabled as i64,
+                    row.grammar_enabled as i64,
+                    row.disabled_reason.as_deref(),
+                    row.approved_by.as_deref(),
+                    row.approved_at_ms.map(|value| value as i64),
+                    updated_at_ms as i64,
+                    &row.semantic_digest,
+                    row.generation as i64,
+                    fencing_metadata,
+                    row.row_id as i64,
+                ],
+            )?;
+            Ok(row)
+        })?;
+        Ok(row)
+    }
+
     pub fn store_cert_row(&self, row: &CertificationRow) -> Result<(), SynapseStoreError> {
         if row.assurance_class != row.key.assurance_class() {
             return Err(SynapseStoreError::Decode(
@@ -827,16 +1970,30 @@ impl SynapseStore {
             ));
         }
         let evidence_json = serde_json::to_string(&row.evidence)?;
-        let (machine_profile_hash, remote_profile_hash, identity_revision) = match &row.key {
+        let (
+            certification_class,
+            status,
+            machine_profile_hash,
+            remote_profile_hash,
+            identity_revision,
+        ) = match &row.key {
             CertificationKey::Measured {
                 machine_profile_hash,
-            } => (machine_profile_hash.as_str(), None, None),
+            } => (
+                CertificationClass::LegacyOwnedDecode,
+                CertificationStatus::Uncertified,
+                Some(machine_profile_hash.as_str()),
+                None,
+                None,
+            ),
             CertificationKey::Declared {
                 machine_profile_hash,
                 remote_profile_hash,
                 identity_revision,
             } => (
-                machine_profile_hash.as_str(),
+                CertificationClass::Declared,
+                row.status,
+                Some(machine_profile_hash.as_str()),
                 Some(remote_profile_hash.as_str()),
                 Some(identity_revision.as_str()),
             ),
@@ -844,20 +2001,26 @@ impl SynapseStore {
         self.store.with_conn_fenced(|tx| {
             tx.execute(
                 "INSERT INTO cert_rows (
-                     assurance_class, status, key_hash, machine_profile_hash, remote_profile_hash,
-                     identity_revision, numeric_profile_id, fingerprint, certified_at_ms,
-                     os_build, module_generation, evidence_json
-                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-                  ON CONFLICT(assurance_class, key_hash, fingerprint) DO UPDATE SET
+                     certification_class, assurance_class, status, key_hash,
+                     machine_profile_hash, remote_profile_hash, identity_revision,
+                     numeric_profile_id, fingerprint, certified_at_ms, os_build,
+                     module_generation, evidence_json
+                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                  ON CONFLICT (key_hash, fingerprint)
+                  WHERE certification_class = 'declared' DO UPDATE SET
                      status = excluded.status,
+                     machine_profile_hash = excluded.machine_profile_hash,
+                     remote_profile_hash = excluded.remote_profile_hash,
+                     identity_revision = excluded.identity_revision,
                      numeric_profile_id = excluded.numeric_profile_id,
                      certified_at_ms = excluded.certified_at_ms,
                      os_build = excluded.os_build,
                      module_generation = excluded.module_generation,
                      evidence_json = excluded.evidence_json",
                 params![
+                    certification_class.as_str(),
                     row.assurance_class.as_str(),
-                    row.status.as_str(),
+                    status.as_str(),
                     row.key.key_hash(),
                     machine_profile_hash,
                     remote_profile_hash,
@@ -874,6 +2037,314 @@ impl SynapseStore {
         Ok(())
     }
 
+    /// Store a complete measured owned-decode row under its class-scoped key.
+    /// This is the only certification write that can create a matchable owned row.
+    pub fn store_owned_decode_cert_row(
+        &self,
+        row: &OwnedDecodeCertificationRow,
+    ) -> Result<(), SynapseStoreError> {
+        validate_owned_decode_cert_row(row)?;
+        let evidence_json = serde_json::to_string(&row.evidence)?;
+        let identities_json = serde_json::to_string(&row.constraint_runtime_identities)?;
+        let worker_path_json = serde_json::to_string(&row.worker_path_evidence)?;
+        self.store.with_conn_fenced(|tx| {
+            tx.execute(
+                "INSERT INTO cert_rows (
+                     certification_class, assurance_class, status, key_hash,
+                     revisioned_machine_profile_hash, profile_activation_epoch,
+                     model_id, decode_fingerprint, numeric_profile_id, fingerprint,
+                     certified_at_ms, os_build, module_generation,
+                     evidence_schema_revision, processing_fingerprint,
+                     runtime_config_digest, constraint_runtime_identities_json,
+                     worker_path_evidence_json, g_dec_manifest_revision, evidence_json
+                  ) VALUES (
+                     'measured_owned_decode', 'measured', ?1, ?2, ?2, ?3, ?4, ?5,
+                     ?6, ?5, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16
+                  )
+                  ON CONFLICT (
+                      revisioned_machine_profile_hash, profile_activation_epoch,
+                      model_id, decode_fingerprint, evidence_schema_revision
+                  ) WHERE certification_class = 'measured_owned_decode'
+                  DO UPDATE SET
+                     status = excluded.status,
+                     numeric_profile_id = excluded.numeric_profile_id,
+                     fingerprint = excluded.fingerprint,
+                     certified_at_ms = excluded.certified_at_ms,
+                     os_build = excluded.os_build,
+                     module_generation = excluded.module_generation,
+                     processing_fingerprint = excluded.processing_fingerprint,
+                     runtime_config_digest = excluded.runtime_config_digest,
+                     constraint_runtime_identities_json = excluded.constraint_runtime_identities_json,
+                     worker_path_evidence_json = excluded.worker_path_evidence_json,
+                     g_dec_manifest_revision = excluded.g_dec_manifest_revision,
+                     evidence_json = excluded.evidence_json",
+                params![
+                    row.status.as_str(),
+                    &row.revisioned_machine_profile_hash,
+                    row.profile_activation_epoch as i64,
+                    &row.model_id,
+                    &row.decode_fingerprint,
+                    row.numeric_profile_id.as_ref().map(|id| &id.0),
+                    row.certified_at_ms as i64,
+                    &row.os_build,
+                    row.module_generation as i64,
+                    &row.evidence_schema_revision,
+                    &row.processing_fingerprint,
+                    &row.runtime_config_digest,
+                    identities_json,
+                    worker_path_json,
+                    &row.g_dec_manifest_revision,
+                    evidence_json,
+                ],
+            )
+        })?;
+        Ok(())
+    }
+
+    pub fn get_owned_decode_cert_row(
+        &self,
+        revisioned_machine_profile_hash: &str,
+        profile_activation_epoch: u64,
+        model_id: &str,
+        decode_fingerprint: &str,
+        evidence_schema_revision: &str,
+    ) -> Result<Option<OwnedDecodeCertificationRow>, SynapseStoreError> {
+        let raw = self.store.with_conn(|conn| {
+            conn.query_row(
+                &format!(
+                    "{OWNED_CERT_SELECT_SQL}
+                     WHERE certification_class = 'measured_owned_decode'
+                       AND status = 'certified'
+                       AND revisioned_machine_profile_hash = ?1
+                       AND profile_activation_epoch = ?2
+                       AND model_id = ?3
+                       AND decode_fingerprint = ?4
+                       AND evidence_schema_revision = ?5"
+                ),
+                params![
+                    revisioned_machine_profile_hash,
+                    profile_activation_epoch as i64,
+                    model_id,
+                    decode_fingerprint,
+                    evidence_schema_revision,
+                ],
+                owned_decode_cert_row_from_row,
+            )
+            .optional()
+        })?;
+        raw.map(decode_owned_decode_cert_row).transpose()
+    }
+
+    pub fn get_owned_decode_cert_row_matching(
+        &self,
+        revisioned_machine_profile_hash: &str,
+        profile_activation_epoch: u64,
+        model_id: &str,
+        decode_fingerprint: &str,
+        processing_fingerprint: &str,
+        runtime_config_digest: &str,
+        constraint_runtime_identities: &[String],
+        worker_path_evidence: &Value,
+        evidence_schema_revision: &str,
+        g_dec_manifest_revision: &str,
+    ) -> Result<Option<OwnedDecodeCertificationRow>, SynapseStoreError> {
+        let Some(row) = self.get_owned_decode_cert_row(
+            revisioned_machine_profile_hash,
+            profile_activation_epoch,
+            model_id,
+            decode_fingerprint,
+            evidence_schema_revision,
+        )?
+        else {
+            return Ok(None);
+        };
+        let mut expected_identities = constraint_runtime_identities.to_vec();
+        expected_identities.sort();
+        if row.processing_fingerprint != processing_fingerprint
+            || row.runtime_config_digest != runtime_config_digest
+            || row.constraint_runtime_identities != expected_identities
+            || row.worker_path_evidence != *worker_path_evidence
+            || row.g_dec_manifest_revision != g_dec_manifest_revision
+            || !complete_g_dec_evidence(&row.evidence, g_dec_manifest_revision)
+        {
+            return Ok(None);
+        }
+        Ok(Some(row))
+    }
+
+    /// Read the two independent values that authorize owned-decode admission—the
+    /// persisted revisioned profile hash and its positive activation epoch—in one
+    /// consistent database read.
+    pub fn owned_decode_admission(
+        &self,
+        model_id: &str,
+        decode_fingerprint: &str,
+        revisioned_machine_profile_hash: &str,
+        profile_activation_epoch: u64,
+    ) -> Result<Option<OwnedDecodeAdmission>, SynapseStoreError> {
+        if profile_activation_epoch == 0 {
+            return Ok(None);
+        }
+        let admission = self.store.with_conn_fenced(|tx| {
+            let (persisted_hash, persisted_epoch): (Option<String>, Option<i64>) = tx.query_row(
+                "SELECT revisioned_machine_profile_hash, profile_activation_epoch
+                 FROM profile_state WHERE id = 0",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            if persisted_hash.as_deref() != Some(revisioned_machine_profile_hash)
+                || persisted_epoch != Some(profile_activation_epoch as i64)
+            {
+                return Ok(None);
+            }
+            let Some(approval) = load_approval_tx_by_identity(tx, model_id, decode_fingerprint)?
+            else {
+                return Ok(None);
+            };
+            validate_approval(&approval, true).map_err(to_sql_error)?;
+            if !approval.enabled {
+                return Ok(None);
+            }
+            let raw = tx
+                .query_row(
+                    &format!(
+                        "{OWNED_CERT_SELECT_SQL}
+                         WHERE certification_class = 'measured_owned_decode'
+                           AND status = 'certified'
+                           AND revisioned_machine_profile_hash = ?1
+                           AND profile_activation_epoch = ?2
+                           AND model_id = ?3
+                           AND decode_fingerprint = ?4
+                           AND evidence_schema_revision = ?5"
+                    ),
+                    params![
+                        revisioned_machine_profile_hash,
+                        profile_activation_epoch as i64,
+                        model_id,
+                        decode_fingerprint,
+                        CERT_EVIDENCE_SCHEMA_REVISION,
+                    ],
+                    owned_decode_cert_row_from_row,
+                )
+                .optional()?;
+            let Some(raw) = raw else { return Ok(None) };
+            let certification = decode_owned_decode_cert_row(raw).map_err(to_sql_error)?;
+            validate_owned_decode_cert_row(&certification).map_err(to_sql_error)?;
+            if !complete_g_dec_evidence(&certification.evidence, G_DEC_MANIFEST_REVISION) {
+                return Ok(None);
+            }
+            Ok(Some(OwnedDecodeAdmission {
+                approval,
+                certification,
+                revisioned_machine_profile_hash: revisioned_machine_profile_hash.to_string(),
+                profile_activation_epoch,
+            }))
+        })?;
+        Ok(admission)
+    }
+
+    pub fn store_class_scoped_cert_row(
+        &self,
+        row: &ClassScopedCertificationRow,
+    ) -> Result<(), SynapseStoreError> {
+        if matches!(
+            row.certification_class,
+            CertificationClass::MeasuredOwnedDecode | CertificationClass::LegacyOwnedDecode
+        ) {
+            return Err(SynapseStoreError::Decode(
+                "owned classes require their dedicated row API".to_string(),
+            ));
+        }
+        if row.key_hash.trim().is_empty() || row.fingerprint.0.trim().is_empty() {
+            return Err(SynapseStoreError::Decode(
+                "class-scoped certification identity must be non-empty".to_string(),
+            ));
+        }
+        if matches!(
+            row.certification_class,
+            CertificationClass::Declared | CertificationClass::Remote
+        ) && (row
+            .remote_profile_hash
+            .as_deref()
+            .map(str::is_empty)
+            .unwrap_or(true)
+            || row
+                .identity_revision
+                .as_deref()
+                .map(str::is_empty)
+                .unwrap_or(true))
+        {
+            return Err(SynapseStoreError::Decode(
+                "declared and remote rows require remote profile and identity revision".to_string(),
+            ));
+        }
+        let evidence_json = serde_json::to_string(&row.evidence)?;
+        let class = row.certification_class.as_str();
+        let sql = format!(
+            "INSERT INTO cert_rows (
+                 certification_class, assurance_class, status, key_hash,
+                 machine_profile_hash, remote_profile_hash, identity_revision,
+                 numeric_profile_id, fingerprint, certified_at_ms, os_build,
+                 module_generation, evidence_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+             ON CONFLICT (key_hash, fingerprint)
+             WHERE certification_class = '{class}' DO UPDATE SET
+                 status = excluded.status,
+                 machine_profile_hash = excluded.machine_profile_hash,
+                 remote_profile_hash = excluded.remote_profile_hash,
+                 identity_revision = excluded.identity_revision,
+                 numeric_profile_id = excluded.numeric_profile_id,
+                 certified_at_ms = excluded.certified_at_ms,
+                 os_build = excluded.os_build,
+                 module_generation = excluded.module_generation,
+                 evidence_json = excluded.evidence_json"
+        );
+        self.store.with_conn_fenced(|tx| {
+            tx.execute(
+                &sql,
+                params![
+                    class,
+                    row.assurance_class.as_str(),
+                    row.status.as_str(),
+                    &row.key_hash,
+                    row.machine_profile_hash.as_deref(),
+                    row.remote_profile_hash.as_deref(),
+                    row.identity_revision.as_deref(),
+                    row.numeric_profile_id.as_ref().map(|id| &id.0),
+                    &row.fingerprint.0,
+                    row.certified_at_ms as i64,
+                    &row.os_build,
+                    row.module_generation as i64,
+                    evidence_json,
+                ],
+            )
+        })?;
+        Ok(())
+    }
+
+    pub fn get_class_scoped_cert_row(
+        &self,
+        certification_class: CertificationClass,
+        key_hash: &str,
+        fingerprint: &Fingerprint,
+    ) -> Result<Option<ClassScopedCertificationRow>, SynapseStoreError> {
+        let raw = self.store.with_conn(|conn| {
+            conn.query_row(
+                "SELECT certification_class, assurance_class, status, key_hash,
+                        machine_profile_hash, remote_profile_hash, identity_revision,
+                        numeric_profile_id, fingerprint, certified_at_ms, os_build,
+                        module_generation, evidence_json
+                 FROM cert_rows
+                 WHERE certification_class = ?1 AND key_hash = ?2 AND fingerprint = ?3
+                 ORDER BY certified_at_ms DESC LIMIT 1",
+                params![certification_class.as_str(), key_hash, &fingerprint.0],
+                class_scoped_cert_row_from_row,
+            )
+            .optional()
+        })?;
+        raw.map(decode_class_scoped_cert_row).transpose()
+    }
+
     pub fn get_cert_row(
         &self,
         machine_profile_hash: &str,
@@ -882,14 +2353,47 @@ impl SynapseStore {
         let raw = self.store.with_conn(|conn| {
             conn.query_row(
                 &format!(
-                    "{CERT_SELECT_SQL} WHERE assurance_class = 'measured' AND status = 'certified' AND key_hash = ?1 AND fingerprint = ?2"
+                    "{CERT_SELECT_SQL} WHERE assurance_class = 'measured'
+                     AND certification_class = 'measured_owned_decode'
+                     AND status = 'certified' AND key_hash = ?1 AND fingerprint = ?2"
                 ),
                 params![machine_profile_hash, &fingerprint.0],
                 cert_row_from_row,
             )
             .optional()
         })?;
-        raw.map(decode_cert_row).transpose()
+        if let Some(raw) = raw {
+            return decode_cert_row(raw).map(Some);
+        }
+        // Keep the historical accessor useful for audit tooling. Legacy rows
+        // are deliberately not returned by the new owned-decode accessor.
+        let legacy = self.store.with_conn(|conn| {
+            conn.query_row(
+                &format!(
+                    "{CERT_SELECT_SQL} WHERE certification_class = 'legacy_owned_decode'
+                     AND status = 'uncertified'
+                     AND json_extract(evidence_json, '$.blocking_reason') IS NULL
+                     AND key_hash = ?1 AND fingerprint = ?2
+                     AND NOT EXISTS (
+                         SELECT 1 FROM cert_rows AS failed
+                         WHERE failed.certification_class = 'legacy_owned_decode'
+                           AND failed.key_hash = ?1
+                           AND failed.fingerprint = ?2
+                           AND json_extract(failed.evidence_json, '$.blocking_reason') IS NOT NULL
+                     )
+                     ORDER BY certified_at_ms DESC LIMIT 1"
+                ),
+                params![machine_profile_hash, &fingerprint.0],
+                cert_row_from_row,
+            )
+            .optional()
+        })?;
+        legacy.map(decode_cert_row).transpose().map(|row| {
+            row.map(|mut row| {
+                row.status = CertificationStatus::Certified;
+                row
+            })
+        })
     }
 
     pub fn latest_cert_row(
@@ -917,7 +2421,8 @@ impl SynapseStore {
         let raw = self.store.with_conn(|conn| {
             conn.query_row(
                 &format!(
-                    "{CERT_SELECT_SQL} WHERE assurance_class = 'measured' AND key_hash = ?1 AND fingerprint = ?2"
+                    "{CERT_SELECT_SQL} WHERE assurance_class = 'measured' AND key_hash = ?1
+                     AND fingerprint = ?2 ORDER BY certified_at_ms DESC LIMIT 1"
                 ),
                 params![machine_profile_hash, &fingerprint.0],
                 cert_row_from_row,
@@ -952,7 +2457,12 @@ impl SynapseStore {
         let count = self.store.with_conn(|conn| {
             conn.query_row(
                 "SELECT COUNT(1) FROM cert_rows
-                 WHERE assurance_class = 'measured' AND status = 'certified'
+                 WHERE assurance_class = 'measured'
+                   AND certification_class IN ('measured_owned_decode', 'legacy_owned_decode')
+                   AND (status = 'certified' OR (
+                       status = 'uncertified'
+                       AND json_extract(evidence_json, '$.blocking_reason') IS NULL
+                   ))
                    AND fingerprint = ?1 AND key_hash <> ?2",
                 params![&fingerprint.0, machine_profile_hash],
                 |row| row.get::<_, i64>(0),
@@ -1002,6 +2512,508 @@ impl SynapseStore {
             .optional()
         })?;
         raw.map(decode_cert_row).transpose()
+    }
+
+    pub fn profile_state(&self) -> Result<ProfileState, SynapseStoreError> {
+        let state = self.store.with_conn(|conn| {
+            conn.query_row(
+                "SELECT snapshot_json, revisioned_machine_profile_hash,
+                        profile_activation_epoch, previous_revisioned_machine_profile_hash,
+                        last_rotation_reason, last_rotation_at_ms
+                 FROM profile_state WHERE id = 0",
+                [],
+                profile_state_from_row,
+            )
+        })?;
+        validate_profile_state(&state)?;
+        Ok(state)
+    }
+
+    /// Observe and durably activate a collected profile. The first observation
+    /// creates epoch 1; a changed revisioned hash performs the snapshot, epoch,
+    /// parent event, and child outcome writes in one fenced transaction.
+    pub fn observe_profile(
+        &self,
+        profile: &MachineProfile,
+        observed_at_ms: u64,
+        module_generation: u64,
+    ) -> Result<ProfileActivation, SynapseStoreError> {
+        let current_hash = profile.revisioned_hash();
+        let current_snapshot_json = serde_json::to_string(profile)?;
+        let activation = self.store.with_conn_fenced(|tx| {
+            let persisted = tx.query_row(
+                "SELECT snapshot_json, revisioned_machine_profile_hash,
+                        profile_activation_epoch, previous_revisioned_machine_profile_hash,
+                        last_rotation_reason, last_rotation_at_ms
+                 FROM profile_state WHERE id = 0",
+                [],
+                profile_state_from_row,
+            )?;
+            validate_profile_state(&persisted).map_err(to_sql_error)?;
+            let Some(old_hash) = persisted.revisioned_machine_profile_hash.clone() else {
+                if persisted.snapshot.is_some() || persisted.profile_activation_epoch.is_some() {
+                    return Err(rusqlite::Error::InvalidQuery);
+                }
+                tx.execute(
+                    "UPDATE profile_state SET snapshot_json = ?1,
+                         revisioned_machine_profile_hash = ?2,
+                         profile_activation_epoch = 1
+                     WHERE id = 0 AND revisioned_machine_profile_hash IS NULL
+                       AND profile_activation_epoch IS NULL",
+                    params![&current_snapshot_json, &current_hash],
+                )?;
+                let state = ProfileState {
+                    snapshot: Some(profile.clone()),
+                    revisioned_machine_profile_hash: Some(current_hash.clone()),
+                    profile_activation_epoch: Some(1),
+                    previous_revisioned_machine_profile_hash: None,
+                    last_rotation_reason: None,
+                    last_rotation_at_ms: None,
+                };
+                return Ok(ProfileActivation {
+                    state,
+                    rotated: false,
+                    event: None,
+                });
+            };
+            let old_epoch = persisted
+                .profile_activation_epoch
+                .ok_or_else(|| rusqlite::Error::InvalidQuery)?;
+            if old_epoch == 0 || !is_digest(&old_hash) {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            if old_hash == current_hash {
+                return Ok(ProfileActivation {
+                    state: persisted,
+                    rotated: false,
+                    event: None,
+                });
+            }
+
+            let previous_snapshot = persisted.snapshot.clone();
+            let changed_fields = previous_snapshot
+                .as_ref()
+                .map(|previous| changed_profile_fields(previous, profile))
+                .unwrap_or_else(|| vec!["unknown_previous_snapshot".to_string()]);
+            let reason = if previous_snapshot.is_some() {
+                changed_fields.join(",")
+            } else {
+                "unknown_previous_snapshot".to_string()
+            };
+            let next_epoch = old_epoch
+                .checked_add(1)
+                .ok_or_else(|| rusqlite::Error::InvalidQuery)?;
+            let update_count = tx.execute(
+                "UPDATE profile_state SET snapshot_json = ?1,
+                     revisioned_machine_profile_hash = ?2,
+                     profile_activation_epoch = ?3,
+                     previous_revisioned_machine_profile_hash = ?4,
+                     last_rotation_reason = ?5,
+                     last_rotation_at_ms = ?6
+                 WHERE id = 0 AND revisioned_machine_profile_hash = ?7
+                   AND profile_activation_epoch = ?8",
+                params![
+                    &current_snapshot_json,
+                    &current_hash,
+                    next_epoch as i64,
+                    &old_hash,
+                    &reason,
+                    observed_at_ms as i64,
+                    &old_hash,
+                    old_epoch as i64,
+                ],
+            )?;
+            if update_count != 1 {
+                let adopted = tx.query_row(
+                    "SELECT snapshot_json, revisioned_machine_profile_hash,
+                            profile_activation_epoch, previous_revisioned_machine_profile_hash,
+                            last_rotation_reason, last_rotation_at_ms
+                     FROM profile_state WHERE id = 0",
+                    [],
+                    profile_state_from_row,
+                )?;
+                if adopted.revisioned_machine_profile_hash.as_deref() == Some(current_hash.as_str())
+                {
+                    return Ok(ProfileActivation {
+                        state: adopted,
+                        rotated: false,
+                        event: None,
+                    });
+                }
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            let event_id = rotation_event_id(&current_hash, next_epoch);
+            let previous_snapshot_json = previous_snapshot
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+            let changed_fields_json = serde_json::to_string(&changed_fields)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+            tx.execute(
+                "INSERT INTO profile_rotation_events (
+                     event_id, old_revisioned_machine_profile_hash,
+                     new_revisioned_machine_profile_hash, old_profile_activation_epoch,
+                     new_profile_activation_epoch, changed_fields_json,
+                     previous_snapshot_json, current_snapshot_json, observed_at_ms,
+                     module_generation, created_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?9)",
+                params![
+                    &event_id,
+                    &old_hash,
+                    &current_hash,
+                    old_epoch as i64,
+                    next_epoch as i64,
+                    changed_fields_json,
+                    previous_snapshot_json,
+                    &current_snapshot_json,
+                    observed_at_ms as i64,
+                    module_generation as i64,
+                ],
+            )?;
+            let mut stmt = tx.prepare(
+                "SELECT model_id, decode_fingerprint, enabled
+                 FROM approvals ORDER BY model_id ASC, decode_fingerprint ASC",
+            )?;
+            let approvals = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)? != 0,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(stmt);
+            for (model_id, decode_fingerprint, enabled) in approvals {
+                tx.execute(
+                    "INSERT INTO profile_rotation_certification_outcomes (
+                         event_id, model_id, decode_fingerprint, outcome_state
+                     ) VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        &event_id,
+                        model_id,
+                        decode_fingerprint,
+                        if enabled { "required" } else { "not_required" },
+                    ],
+                )?;
+            }
+            let event = rotation_event_tx(tx, &event_id)?;
+            let state = ProfileState {
+                snapshot: Some(profile.clone()),
+                revisioned_machine_profile_hash: Some(current_hash.clone()),
+                profile_activation_epoch: Some(next_epoch),
+                previous_revisioned_machine_profile_hash: Some(old_hash),
+                last_rotation_reason: Some(reason),
+                last_rotation_at_ms: Some(observed_at_ms),
+            };
+            Ok(ProfileActivation {
+                state,
+                rotated: true,
+                event: Some(event),
+            })
+        })?;
+        Ok(activation)
+    }
+
+    pub fn activate_profile(
+        &self,
+        profile: &MachineProfile,
+        observed_at_ms: u64,
+        module_generation: u64,
+    ) -> Result<ProfileActivation, SynapseStoreError> {
+        self.observe_profile(profile, observed_at_ms, module_generation)
+    }
+
+    pub fn rotation_events(&self) -> Result<Vec<RotationLedgerEvent>, SynapseStoreError> {
+        let ids = self.store.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT event_id FROM profile_rotation_events
+                 ORDER BY new_profile_activation_epoch ASC, event_id ASC",
+            )?;
+            let ids = stmt
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ids)
+        })?;
+        ids.iter()
+            .map(|event_id| {
+                self.rotation_event(event_id)?.ok_or_else(|| {
+                    SynapseStoreError::Decode(format!("missing rotation event {event_id}"))
+                })
+            })
+            .collect()
+    }
+
+    pub fn rotation_event(
+        &self,
+        event_id: &str,
+    ) -> Result<Option<RotationLedgerEvent>, SynapseStoreError> {
+        Ok(self
+            .store
+            .with_conn(|conn| rotation_event_conn(conn, event_id))?)
+    }
+
+    pub fn set_rotation_certification_outcome(
+        &self,
+        event_id: &str,
+        model_id: &str,
+        decode_fingerprint: &str,
+        outcome_state: RotationOutcomeState,
+        certified_at_ms: Option<u64>,
+        failure_reason: Option<&str>,
+    ) -> Result<(), SynapseStoreError> {
+        match outcome_state {
+            RotationOutcomeState::Passed if certified_at_ms.is_none() => {
+                return Err(SynapseStoreError::Decode(
+                    "passed rotation outcome requires certified_at_ms".to_string(),
+                ));
+            }
+            RotationOutcomeState::Failed if failure_reason.map(str::is_empty).unwrap_or(true) => {
+                return Err(SynapseStoreError::Decode(
+                    "failed rotation outcome requires a failure reason".to_string(),
+                ));
+            }
+            _ => {}
+        }
+        self.store.with_conn_fenced(|tx| {
+            let changed = tx.execute(
+                "UPDATE profile_rotation_certification_outcomes
+                 SET outcome_state = ?1, certified_at_ms = ?2, failure_reason = ?3
+                 WHERE event_id = ?4 AND model_id = ?5 AND decode_fingerprint = ?6",
+                params![
+                    outcome_state.as_str(),
+                    certified_at_ms.map(|value| value as i64),
+                    failure_reason,
+                    event_id,
+                    model_id,
+                    decode_fingerprint,
+                ],
+            )?;
+            if changed != 1 {
+                return Err(rusqlite::Error::QueryReturnedNoRows);
+            }
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    pub fn rotation_outcomes(
+        &self,
+        event_id: &str,
+    ) -> Result<Vec<RotationCertificationOutcome>, SynapseStoreError> {
+        Ok(self.store.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT event_id, model_id, decode_fingerprint, outcome_state,
+                        certified_at_ms, failure_reason
+                 FROM profile_rotation_certification_outcomes
+                 WHERE event_id = ?1 ORDER BY model_id ASC, decode_fingerprint ASC",
+            )?;
+            let rows = stmt
+                .query_map(params![event_id], rotation_outcome_from_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })?)
+    }
+
+    /// Return persisted values used to add storage information to health responses,
+    /// without changing the existing machine-profile hash calculation or its
+    /// compatibility behavior.
+    pub fn storage_health_inputs(&self) -> Result<StorageHealthInputs, SynapseStoreError> {
+        let state = self.profile_state()?;
+        let latest_event = self.store.with_conn(|conn| {
+            conn.query_row(
+                "SELECT event_id FROM profile_rotation_events
+                     ORDER BY new_profile_activation_epoch DESC LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+        })?;
+        let ledger_outcomes = match latest_event.as_deref() {
+            Some(event_id) => self.rotation_outcomes(event_id)?,
+            None => Vec::new(),
+        };
+        let outcome_map = ledger_outcomes
+            .into_iter()
+            .map(|outcome| {
+                (
+                    (outcome.model_id.clone(), outcome.decode_fingerprint.clone()),
+                    outcome,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let approvals = self.store.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT row_id, schema_revision, model_id, decode_fingerprint, enabled,
+                        grammar_enabled, disabled_reason, approved_by, approved_at_ms,
+                        updated_at_ms, evidence_requirements_revision, semantic_digest,
+                        generation, fencing_metadata
+                 FROM approvals ORDER BY model_id ASC, decode_fingerprint ASC",
+            )?;
+            let rows = stmt
+                .query_map([], approval_from_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })?;
+        let mut evidence_requirements_divergence = Vec::new();
+        let mut approval_certification_outcomes = Vec::with_capacity(approvals.len());
+        for approval in approvals {
+            let key = (
+                approval.model_id.clone(),
+                approval.decode_fingerprint.clone(),
+            );
+            let ledger = outcome_map.get(&key);
+            let validation = validate_approval(&approval, true);
+            let (admission, failure_reason) = match validation {
+                Err(SynapseStoreError::Decode(message))
+                    if message.contains("unsupported approval schema revision")
+                        || message
+                            .contains("unsupported approval evidence requirements revision") =>
+                {
+                    evidence_requirements_divergence.push(EvidenceRequirementsDivergence {
+                        model_id: approval.model_id.clone(),
+                        decode_fingerprint: approval.decode_fingerprint.clone(),
+                        result: "approval_revision_unsupported".to_string(),
+                    });
+                    ("disabled".to_string(), Some(message))
+                }
+                Err(SynapseStoreError::ApprovalDigestMismatch { .. }) => (
+                    "digest_mismatch".to_string(),
+                    Some("approval_digest_mismatch".to_string()),
+                ),
+                Err(error) => ("disabled".to_string(), Some(error.to_string())),
+                Ok(()) if !approval.enabled => {
+                    ("disabled".to_string(), approval.disabled_reason.clone())
+                }
+                Ok(()) => {
+                    let stored_revisions = match (
+                        state.revisioned_machine_profile_hash.as_deref(),
+                        state.profile_activation_epoch,
+                    ) {
+                        (Some(hash), Some(epoch)) => self.store.with_conn(|conn| {
+                            conn.query_row(
+                                "SELECT evidence_schema_revision, g_dec_manifest_revision
+                                 FROM cert_rows
+                                 WHERE certification_class = 'measured_owned_decode'
+                                   AND status = 'certified'
+                                   AND revisioned_machine_profile_hash = ?1
+                                   AND profile_activation_epoch = ?2
+                                   AND model_id = ?3
+                                   AND decode_fingerprint = ?4
+                                 ORDER BY certified_at_ms DESC LIMIT 1",
+                                params![
+                                    hash,
+                                    epoch as i64,
+                                    &approval.model_id,
+                                    &approval.decode_fingerprint,
+                                ],
+                                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                            )
+                            .optional()
+                        })?,
+                        _ => None,
+                    };
+                    if let Some((schema_revision, manifest_revision)) = stored_revisions {
+                        if schema_revision != CERT_EVIDENCE_SCHEMA_REVISION {
+                            evidence_requirements_divergence.push(EvidenceRequirementsDivergence {
+                                model_id: approval.model_id.clone(),
+                                decode_fingerprint: approval.decode_fingerprint.clone(),
+                                result: "evidence_schema_incompatible".to_string(),
+                            });
+                        } else if manifest_revision != G_DEC_MANIFEST_REVISION {
+                            evidence_requirements_divergence.push(EvidenceRequirementsDivergence {
+                                model_id: approval.model_id.clone(),
+                                decode_fingerprint: approval.decode_fingerprint.clone(),
+                                result: "manifest_revision_incompatible".to_string(),
+                            });
+                        }
+                    }
+                    let current = match (
+                        state.revisioned_machine_profile_hash.as_deref(),
+                        state.profile_activation_epoch,
+                    ) {
+                        (Some(hash), Some(epoch)) => self.get_owned_decode_cert_row(
+                            hash,
+                            epoch,
+                            &approval.model_id,
+                            &approval.decode_fingerprint,
+                            CERT_EVIDENCE_SCHEMA_REVISION,
+                        )?,
+                        _ => None,
+                    };
+                    if current.is_some() {
+                        ("serving".to_string(), None)
+                    } else {
+                        (
+                            "no_current_evidence".to_string(),
+                            Some("no_current_evidence".to_string()),
+                        )
+                    }
+                }
+            };
+            approval_certification_outcomes.push(ApprovalCertificationHealth {
+                model_id: approval.model_id,
+                decode_fingerprint: approval.decode_fingerprint,
+                enabled: approval.enabled,
+                admission,
+                state: ledger
+                    .map(|outcome| outcome.outcome_state.clone())
+                    .unwrap_or_else(|| {
+                        if approval.enabled {
+                            "required"
+                        } else {
+                            "not_required"
+                        }
+                        .to_string()
+                    }),
+                certified_at_ms: ledger.and_then(|outcome| outcome.certified_at_ms),
+                failure_reason: ledger
+                    .and_then(|outcome| outcome.failure_reason.clone())
+                    .or(failure_reason),
+            });
+        }
+        let rotation_event_count = self.store.with_conn(|conn| {
+            conn.query_row("SELECT COUNT(*) FROM profile_rotation_events", [], |row| {
+                row.get::<_, i64>(0)
+            })
+        })? as u64;
+        let re_certification_state = if approval_certification_outcomes.is_empty()
+            || approval_certification_outcomes
+                .iter()
+                .all(|outcome| !outcome.enabled)
+        {
+            "not_required"
+        } else if approval_certification_outcomes
+            .iter()
+            .any(|outcome| outcome.state == "failed")
+        {
+            "failed"
+        } else if approval_certification_outcomes
+            .iter()
+            .any(|outcome| outcome.state == "in_progress")
+        {
+            "in_progress"
+        } else if approval_certification_outcomes
+            .iter()
+            .all(|outcome| !outcome.enabled || outcome.admission == "serving")
+        {
+            "passed"
+        } else {
+            "required"
+        };
+        Ok(StorageHealthInputs {
+            previous_revisioned_machine_profile_hash: state
+                .previous_revisioned_machine_profile_hash,
+            current_revisioned_machine_profile_hash: state.revisioned_machine_profile_hash,
+            profile_activation_epoch: state.profile_activation_epoch,
+            last_rotation_at_ms: state.last_rotation_at_ms,
+            last_rotation_reason: state.last_rotation_reason,
+            rotation_event_count,
+            re_certification_state: re_certification_state.to_string(),
+            evidence_requirements_divergence,
+            approval_certification_outcomes,
+        })
     }
 
     #[allow(dead_code)]
@@ -2022,17 +4034,60 @@ const CERT_SELECT_SQL: &str = "SELECT assurance_class, status, machine_profile_h
         remote_profile_hash, identity_revision, numeric_profile_id, fingerprint,
         certified_at_ms, os_build, module_generation, evidence_json FROM cert_rows";
 
+const OWNED_CERT_SELECT_SQL: &str = "SELECT status, revisioned_machine_profile_hash,
+        profile_activation_epoch, model_id, decode_fingerprint, numeric_profile_id,
+        fingerprint, certified_at_ms, os_build, module_generation,
+        evidence_schema_revision, processing_fingerprint, runtime_config_digest,
+        constraint_runtime_identities_json, worker_path_evidence_json,
+        g_dec_manifest_revision, evidence_json FROM cert_rows";
+
 struct RawCertificationRow {
     assurance_class: String,
     status: String,
     machine_profile_hash: Option<String>,
     remote_profile_hash: Option<String>,
     identity_revision: Option<String>,
-    numeric_profile_id: String,
+    numeric_profile_id: Option<String>,
     fingerprint: String,
     certified_at_ms: u64,
     os_build: String,
     module_generation: u64,
+    evidence_json: String,
+}
+
+struct RawClassScopedCertificationRow {
+    certification_class: String,
+    assurance_class: String,
+    status: String,
+    key_hash: String,
+    machine_profile_hash: Option<String>,
+    remote_profile_hash: Option<String>,
+    identity_revision: Option<String>,
+    numeric_profile_id: Option<String>,
+    fingerprint: String,
+    certified_at_ms: u64,
+    os_build: String,
+    module_generation: u64,
+    evidence_json: String,
+}
+
+struct RawOwnedDecodeCertificationRow {
+    status: String,
+    revisioned_machine_profile_hash: String,
+    profile_activation_epoch: u64,
+    model_id: String,
+    decode_fingerprint: String,
+    numeric_profile_id: Option<String>,
+    fingerprint: String,
+    certified_at_ms: u64,
+    os_build: String,
+    module_generation: u64,
+    evidence_schema_revision: String,
+    processing_fingerprint: String,
+    runtime_config_digest: String,
+    constraint_runtime_identities_json: String,
+    worker_path_evidence_json: String,
+    g_dec_manifest_revision: String,
     evidence_json: String,
 }
 
@@ -2080,6 +4135,50 @@ fn cert_row_from_row(row: &Row<'_>) -> rusqlite::Result<RawCertificationRow> {
         os_build: row.get(8)?,
         module_generation: row.get::<_, i64>(9)? as u64,
         evidence_json: row.get(10)?,
+    })
+}
+
+fn class_scoped_cert_row_from_row(
+    row: &Row<'_>,
+) -> rusqlite::Result<RawClassScopedCertificationRow> {
+    Ok(RawClassScopedCertificationRow {
+        certification_class: row.get(0)?,
+        assurance_class: row.get(1)?,
+        status: row.get(2)?,
+        key_hash: row.get(3)?,
+        machine_profile_hash: row.get(4)?,
+        remote_profile_hash: row.get(5)?,
+        identity_revision: row.get(6)?,
+        numeric_profile_id: row.get(7)?,
+        fingerprint: row.get(8)?,
+        certified_at_ms: row.get::<_, i64>(9)? as u64,
+        os_build: row.get(10)?,
+        module_generation: row.get::<_, i64>(11)? as u64,
+        evidence_json: row.get(12)?,
+    })
+}
+
+fn owned_decode_cert_row_from_row(
+    row: &Row<'_>,
+) -> rusqlite::Result<RawOwnedDecodeCertificationRow> {
+    Ok(RawOwnedDecodeCertificationRow {
+        status: row.get(0)?,
+        revisioned_machine_profile_hash: row.get(1)?,
+        profile_activation_epoch: row.get::<_, i64>(2)? as u64,
+        model_id: row.get(3)?,
+        decode_fingerprint: row.get(4)?,
+        numeric_profile_id: row.get(5)?,
+        fingerprint: row.get(6)?,
+        certified_at_ms: row.get::<_, i64>(7)? as u64,
+        os_build: row.get(8)?,
+        module_generation: row.get::<_, i64>(9)? as u64,
+        evidence_schema_revision: row.get(10)?,
+        processing_fingerprint: row.get(11)?,
+        runtime_config_digest: row.get(12)?,
+        constraint_runtime_identities_json: row.get(13)?,
+        worker_path_evidence_json: row.get(14)?,
+        g_dec_manifest_revision: row.get(15)?,
+        evidence_json: row.get(16)?,
     })
 }
 
@@ -2150,7 +4249,276 @@ fn decode_cert_row(row: RawCertificationRow) -> Result<CertificationRow, Synapse
         assurance_class,
         status: CertificationStatus::parse(&row.status)?,
         key,
-        numeric_profile_id: NumericProfileId(row.numeric_profile_id),
+        numeric_profile_id: NumericProfileId(row.numeric_profile_id.unwrap_or_default()),
+        fingerprint: Fingerprint(row.fingerprint),
+        certified_at_ms: row.certified_at_ms,
+        os_build: row.os_build,
+        module_generation: row.module_generation,
+        evidence: serde_json::from_str(&row.evidence_json)?,
+    })
+}
+
+fn digest_text(hasher: &mut Sha256, value: &str) {
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value.as_bytes());
+}
+
+fn digest_optional_text(hasher: &mut Sha256, value: Option<&str>) {
+    match value {
+        Some(value) => digest_text(hasher, value),
+        None => {
+            hasher.update([0xff; 8]);
+        }
+    }
+}
+
+fn digest_optional_u64(hasher: &mut Sha256, value: Option<u64>) {
+    match value {
+        Some(value) => digest_text(hasher, &value.to_string()),
+        None => {
+            hasher.update([0xff; 8]);
+        }
+    }
+}
+
+fn is_digest(value: &str) -> bool {
+    value.len() == 64
+        && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && value.bytes().all(|byte| !byte.is_ascii_uppercase())
+}
+
+fn has_only_keys(object: &serde_json::Map<String, Value>, allowed: &[&str]) -> bool {
+    object
+        .keys()
+        .all(|key| allowed.iter().any(|allowed_key| key == allowed_key))
+        && allowed.iter().all(|key| object.contains_key(*key))
+}
+
+fn is_catalog_model_id(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_lowercase() || first.is_ascii_digit())
+        && chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ".-_".contains(ch))
+}
+
+fn validate_approval(row: &ApprovalRow, verify_digest: bool) -> Result<(), SynapseStoreError> {
+    if row.schema_revision != APPROVAL_SCHEMA_REVISION {
+        return Err(SynapseStoreError::Decode(format!(
+            "unsupported approval schema revision '{}'",
+            row.schema_revision
+        )));
+    }
+    if !is_catalog_model_id(&row.model_id) {
+        return Err(SynapseStoreError::Decode(
+            "approval model_id is not canonical".to_string(),
+        ));
+    }
+    if !is_digest(&row.decode_fingerprint) {
+        return Err(SynapseStoreError::Decode(
+            "approval decode_fingerprint must be lowercase SHA-256".to_string(),
+        ));
+    }
+    if row.evidence_requirements_revision != APPROVAL_EVIDENCE_REQUIREMENTS_REVISION {
+        return Err(SynapseStoreError::Decode(format!(
+            "unsupported approval evidence requirements revision '{}'",
+            row.evidence_requirements_revision
+        )));
+    }
+    if row.enabled {
+        if row
+            .approved_by
+            .as_deref()
+            .map(str::is_empty)
+            .unwrap_or(true)
+            || row.approved_at_ms.is_none()
+            || row.disabled_reason.is_some()
+        {
+            return Err(SynapseStoreError::Decode(
+                "enabled approval has invalid provenance or disabled reason".to_string(),
+            ));
+        }
+    } else if row
+        .disabled_reason
+        .as_deref()
+        .map(str::is_empty)
+        .unwrap_or(true)
+    {
+        return Err(SynapseStoreError::Decode(
+            "disabled approval requires a non-empty reason".to_string(),
+        ));
+    }
+    if verify_digest {
+        let recomputed = row.expected_digest()?;
+        if row.semantic_digest != recomputed {
+            return Err(SynapseStoreError::ApprovalDigestMismatch {
+                model_id: row.model_id.clone(),
+                decode_fingerprint: row.decode_fingerprint.clone(),
+                observed: row.semantic_digest.clone(),
+                recomputed,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn approval_from_row(row: &Row<'_>) -> rusqlite::Result<ApprovalRow> {
+    let fencing_metadata: String = row.get(13)?;
+    let approved_at_ms = row.get::<_, Option<i64>>(8)?.map(|value| value as u64);
+    Ok(ApprovalRow {
+        row_id: row.get::<_, i64>(0)? as u64,
+        schema_revision: row.get(1)?,
+        model_id: row.get(2)?,
+        decode_fingerprint: row.get(3)?,
+        enabled: row.get::<_, i64>(4)? != 0,
+        grammar_enabled: row.get::<_, i64>(5)? != 0,
+        disabled_reason: row.get(6)?,
+        approved_by: row.get(7)?,
+        approved_at_ms,
+        updated_at_ms: row.get::<_, i64>(9)? as u64,
+        evidence_requirements_revision: row.get(10)?,
+        semantic_digest: row.get(11)?,
+        generation: row.get::<_, i64>(12)? as u64,
+        fencing_metadata: serde_json::from_str(&fencing_metadata).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                13,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?,
+    })
+}
+
+fn load_approval_tx(
+    tx: &rusqlite::Transaction<'_>,
+    row_id: i64,
+) -> rusqlite::Result<Option<ApprovalRow>> {
+    tx.query_row(
+        "SELECT row_id, schema_revision, model_id, decode_fingerprint, enabled,
+                grammar_enabled, disabled_reason, approved_by, approved_at_ms,
+                updated_at_ms, evidence_requirements_revision, semantic_digest,
+                generation, fencing_metadata
+         FROM approvals WHERE row_id = ?1",
+        params![row_id],
+        approval_from_row,
+    )
+    .optional()
+}
+
+fn load_approval_tx_by_identity(
+    tx: &rusqlite::Transaction<'_>,
+    model_id: &str,
+    decode_fingerprint: &str,
+) -> rusqlite::Result<Option<ApprovalRow>> {
+    tx.query_row(
+        "SELECT row_id, schema_revision, model_id, decode_fingerprint, enabled,
+                grammar_enabled, disabled_reason, approved_by, approved_at_ms,
+                updated_at_ms, evidence_requirements_revision, semantic_digest,
+                generation, fencing_metadata
+         FROM approvals WHERE model_id = ?1 AND decode_fingerprint = ?2",
+        params![model_id, decode_fingerprint],
+        approval_from_row,
+    )
+    .optional()
+}
+
+fn validate_owned_decode_cert_row(
+    row: &OwnedDecodeCertificationRow,
+) -> Result<(), SynapseStoreError> {
+    if row.profile_activation_epoch == 0
+        || !is_digest(&row.revisioned_machine_profile_hash)
+        || !is_digest(&row.decode_fingerprint)
+        || row.decode_fingerprint != row.fingerprint.0
+        || !is_catalog_model_id(&row.model_id)
+        || row.processing_fingerprint.trim().is_empty()
+        || row.runtime_config_digest.trim().is_empty()
+        || row.evidence_schema_revision != CERT_EVIDENCE_SCHEMA_REVISION
+        || row.g_dec_manifest_revision != G_DEC_MANIFEST_REVISION
+    {
+        return Err(SynapseStoreError::Decode(
+            "malformed measured owned-decode certification identity".to_string(),
+        ));
+    }
+    let mut identities = row.constraint_runtime_identities.clone();
+    identities.sort();
+    identities.dedup();
+    if identities != row.constraint_runtime_identities {
+        return Err(SynapseStoreError::Decode(
+            "constraint runtime identities must be sorted and unique".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn complete_g_dec_evidence(evidence: &Value, manifest_revision: &str) -> bool {
+    let Some(entries) = evidence
+        .get("g_dec")
+        .or_else(|| evidence.get("gates"))
+        .and_then(Value::as_array)
+    else {
+        return false;
+    };
+    let required = (1..=12)
+        .map(|number| format!("G-DEC-{number:02}"))
+        .collect::<BTreeSet<_>>();
+    let mut passed = BTreeSet::new();
+    for entry in entries {
+        let Some(object) = entry.as_object() else {
+            return false;
+        };
+        let Some(id) = object.get("id").and_then(Value::as_str) else {
+            return false;
+        };
+        if object.get("status").and_then(Value::as_str) != Some("passed")
+            || object.get("manifest_revision").and_then(Value::as_str) != Some(manifest_revision)
+            || !passed.insert(id.to_string())
+        {
+            return false;
+        }
+    }
+    passed == required
+}
+
+fn decode_class_scoped_cert_row(
+    row: RawClassScopedCertificationRow,
+) -> Result<ClassScopedCertificationRow, SynapseStoreError> {
+    Ok(ClassScopedCertificationRow {
+        certification_class: CertificationClass::parse(&row.certification_class)?,
+        assurance_class: AssuranceClass::parse(&row.assurance_class)?,
+        status: CertificationStatus::parse(&row.status)?,
+        key_hash: row.key_hash,
+        machine_profile_hash: row.machine_profile_hash,
+        remote_profile_hash: row.remote_profile_hash,
+        identity_revision: row.identity_revision,
+        numeric_profile_id: row.numeric_profile_id.map(NumericProfileId),
+        fingerprint: Fingerprint(row.fingerprint),
+        certified_at_ms: row.certified_at_ms,
+        os_build: row.os_build,
+        module_generation: row.module_generation,
+        evidence: serde_json::from_str(&row.evidence_json)?,
+    })
+}
+
+fn decode_owned_decode_cert_row(
+    row: RawOwnedDecodeCertificationRow,
+) -> Result<OwnedDecodeCertificationRow, SynapseStoreError> {
+    let mut identities: Vec<String> =
+        serde_json::from_str(&row.constraint_runtime_identities_json)?;
+    identities.sort();
+    Ok(OwnedDecodeCertificationRow {
+        status: CertificationStatus::parse(&row.status)?,
+        revisioned_machine_profile_hash: row.revisioned_machine_profile_hash,
+        profile_activation_epoch: row.profile_activation_epoch,
+        model_id: row.model_id,
+        decode_fingerprint: row.decode_fingerprint,
+        processing_fingerprint: row.processing_fingerprint,
+        runtime_config_digest: row.runtime_config_digest,
+        constraint_runtime_identities: identities,
+        worker_path_evidence: serde_json::from_str(&row.worker_path_evidence_json)?,
+        evidence_schema_revision: row.evidence_schema_revision,
+        g_dec_manifest_revision: row.g_dec_manifest_revision,
+        numeric_profile_id: row.numeric_profile_id.map(NumericProfileId),
         fingerprint: Fingerprint(row.fingerprint),
         certified_at_ms: row.certified_at_ms,
         os_build: row.os_build,
@@ -2194,6 +4562,216 @@ fn decode_knob_assignment_row(
         throughput_tok_s: row.throughput_tok_s,
         single_item_latency_p50_ms: row.single_item_latency_p50_ms,
     })
+}
+
+fn validate_profile_state(state: &ProfileState) -> Result<(), SynapseStoreError> {
+    match (
+        state.snapshot.as_ref(),
+        state.revisioned_machine_profile_hash.as_deref(),
+        state.profile_activation_epoch,
+    ) {
+        (None, None, None) => {}
+        (Some(snapshot), Some(hash), Some(epoch)) if epoch > 0 && is_digest(hash) => {
+            if snapshot.revisioned_hash() != hash {
+                return Err(SynapseStoreError::ProfileStateCorrupt(
+                    "snapshot does not match revisioned profile hash".to_string(),
+                ));
+            }
+        }
+        (None, Some(hash), Some(epoch)) if epoch > 0 && is_digest(hash) => {}
+        _ => {
+            return Err(SynapseStoreError::ProfileStateCorrupt(
+                "profile snapshot, revisioned hash, and positive epoch are inconsistent"
+                    .to_string(),
+            ));
+        }
+    }
+    if let Some(previous_hash) = state.previous_revisioned_machine_profile_hash.as_deref() {
+        if !is_digest(previous_hash) {
+            return Err(SynapseStoreError::ProfileStateCorrupt(
+                "previous revisioned profile hash is malformed".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn profile_state_from_row(row: &Row<'_>) -> rusqlite::Result<ProfileState> {
+    let snapshot_json: Option<String> = row.get(0)?;
+    let snapshot = snapshot_json
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?;
+    let epoch_value = row.get::<_, Option<i64>>(2)?;
+    let last_rotation_value = row.get::<_, Option<i64>>(5)?;
+    if epoch_value.is_some_and(|value| value < 0)
+        || last_rotation_value.is_some_and(|value| value < 0)
+    {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    Ok(ProfileState {
+        snapshot,
+        revisioned_machine_profile_hash: row.get(1)?,
+        profile_activation_epoch: epoch_value.map(|value| value as u64),
+        previous_revisioned_machine_profile_hash: row.get(3)?,
+        last_rotation_reason: row.get(4)?,
+        last_rotation_at_ms: last_rotation_value.map(|value| value as u64),
+    })
+}
+
+fn changed_profile_fields(previous: &MachineProfile, current: &MachineProfile) -> Vec<String> {
+    let mut changed = Vec::new();
+    if previous.os_build != current.os_build {
+        changed.push("os_build".to_string());
+    }
+    if previous.arch != current.arch {
+        changed.push("arch".to_string());
+    }
+    if previous.chip_model != current.chip_model {
+        changed.push("chip_model".to_string());
+    }
+    if previous.ram_class != current.ram_class {
+        changed.push("ram_class".to_string());
+    }
+    if previous.ane_subtype != current.ane_subtype {
+        changed.push("ane_subtype".to_string());
+    }
+    if previous.engine_identities != current.engine_identities {
+        changed.push("engine_identities".to_string());
+    }
+    changed.sort_unstable();
+    changed
+}
+
+fn rotation_event_id(new_hash: &str, epoch: u64) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"rotation-ledger-v1\0");
+    hasher.update(new_hash.as_bytes());
+    hasher.update(epoch.to_be_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn rotation_outcome_from_row(row: &Row<'_>) -> rusqlite::Result<RotationCertificationOutcome> {
+    Ok(RotationCertificationOutcome {
+        event_id: row.get(0)?,
+        model_id: row.get(1)?,
+        decode_fingerprint: row.get(2)?,
+        outcome_state: row.get(3)?,
+        certified_at_ms: row.get::<_, Option<i64>>(4)?.map(|value| value as u64),
+        failure_reason: row.get(5)?,
+    })
+}
+
+fn rotation_event_conn(
+    conn: &rusqlite::Connection,
+    event_id: &str,
+) -> rusqlite::Result<Option<RotationLedgerEvent>> {
+    let raw = conn
+        .query_row(
+            "SELECT event_id, old_revisioned_machine_profile_hash,
+                    new_revisioned_machine_profile_hash, old_profile_activation_epoch,
+                    new_profile_activation_epoch, changed_fields_json,
+                    previous_snapshot_json, current_snapshot_json, observed_at_ms,
+                    module_generation, created_at_ms
+             FROM profile_rotation_events WHERE event_id = ?1",
+            params![event_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, i64>(10)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        event_id,
+        old_hash,
+        new_hash,
+        old_epoch,
+        new_epoch,
+        changed_fields_json,
+        previous_snapshot_json,
+        current_snapshot_json,
+        observed_at_ms,
+        module_generation,
+        created_at_ms,
+    )) = raw
+    else {
+        return Ok(None);
+    };
+    let changed_fields: Vec<String> =
+        serde_json::from_str(&changed_fields_json).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                5,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?;
+    let previous_snapshot = previous_snapshot_json
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                6,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?;
+    let current_snapshot: MachineProfile =
+        serde_json::from_str(&current_snapshot_json).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                7,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?;
+    let mut stmt = conn.prepare(
+        "SELECT event_id, model_id, decode_fingerprint, outcome_state,
+                certified_at_ms, failure_reason
+         FROM profile_rotation_certification_outcomes
+         WHERE event_id = ?1 ORDER BY model_id ASC, decode_fingerprint ASC",
+    )?;
+    let outcomes = stmt
+        .query_map(params![&event_id], rotation_outcome_from_row)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(RotationLedgerEvent {
+        event_id,
+        old_revisioned_machine_profile_hash: old_hash,
+        new_revisioned_machine_profile_hash: new_hash,
+        old_profile_activation_epoch: old_epoch.map(|value| value as u64),
+        new_profile_activation_epoch: new_epoch as u64,
+        changed_fields,
+        previous_snapshot,
+        current_snapshot,
+        observed_at_ms: observed_at_ms as u64,
+        module_generation: module_generation as u64,
+        created_at_ms: created_at_ms as u64,
+        outcomes,
+    }))
+}
+
+fn rotation_event_tx(
+    tx: &rusqlite::Transaction<'_>,
+    event_id: &str,
+) -> rusqlite::Result<RotationLedgerEvent> {
+    rotation_event_conn(&*tx, event_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
 }
 
 fn to_sql_error(error: SynapseStoreError) -> rusqlite::Error {
@@ -3016,6 +5594,447 @@ mod tests {
         assert_eq!(snapshot.models[0].model_id, config.model_id);
         assert_eq!(snapshot.models[0].state, "unloaded");
         assert_eq!(snapshot.models[0].fingerprints, vec![config.fingerprint]);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn approval_rows_are_digest_checked_and_admin_mutations_are_fenced() {
+        let (root, descriptor) = temp_descriptor("approval-row");
+        let store = SynapseStore::open(&descriptor).unwrap();
+        store
+            .store
+            .with_conn_fenced(|tx| {
+                tx.execute(
+                    "INSERT INTO models (
+                         model_id, engine, task, fingerprint, config_json,
+                         created_ms, updated_ms
+                     ) VALUES ('owned-model', 'owned-metal-decode', 'generate', 'model-fp', '{}', 1, 1)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let fingerprint = "a".repeat(64);
+        let created = store
+            .create_approval("owned-model", &fingerprint, true, "operator", 10, 10)
+            .unwrap();
+        assert_eq!(created.semantic_digest, created.expected_digest().unwrap());
+        assert!(store
+            .get_approval("owned-model", &fingerprint)
+            .unwrap()
+            .is_some());
+
+        store
+            .store
+            .with_conn_fenced(|tx| {
+                tx.execute(
+                    "UPDATE approvals SET grammar_enabled = 0
+                     WHERE model_id = 'owned-model'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(matches!(
+            store.get_approval("owned-model", &fingerprint),
+            Err(SynapseStoreError::ApprovalDigestMismatch { .. })
+        ));
+        let corruption_count: i64 = store
+            .store
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM approval_digest_corruption_events",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(corruption_count, 1);
+
+        let mut repaired = created.clone();
+        repaired.grammar_enabled = false;
+        let repaired_digest = repaired.expected_digest().unwrap();
+        store
+            .store
+            .with_conn_fenced(|tx| {
+                tx.execute(
+                    "UPDATE approvals SET semantic_digest = ?1
+                     WHERE model_id = 'owned-model'",
+                    params![repaired_digest],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let disabled = store
+            .disable_approval("owned-model", &fingerprint, "operator rollback", 20)
+            .unwrap();
+        assert!(!disabled.enabled);
+        assert_eq!(
+            disabled.disabled_reason.as_deref(),
+            Some("operator rollback")
+        );
+        let reenabled = store
+            .enable_approval("owned-model", &fingerprint, "operator", 30, 30)
+            .unwrap();
+        assert!(reenabled.enabled);
+        assert!(reenabled.disabled_reason.is_none());
+        assert!(
+            store
+                .set_approval_grammar_enabled("owned-model", &fingerprint, false, 40)
+                .unwrap()
+                .semantic_digest
+                .len()
+                == 64
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn approval_migration_is_one_shot_and_requires_catalog_mapping() {
+        let (root, descriptor) = temp_descriptor("approval-migration");
+        let store = SynapseStore::open(&descriptor).unwrap();
+        let unmappable = store
+            .migrate_owned_decode_approvals(
+                "owned-decode-approval-migration-v1",
+                APPROVAL_SCHEMA_REVISION,
+            )
+            .unwrap();
+        assert_eq!(unmappable.outcome, "unmappable_identity");
+        let model_ids = [
+            "qwen3-0.6b-decode-f16",
+            "lfm2-1.2b-decode-f16",
+            "qwen3-0.6b-decode-q8_0",
+            "lfm2-1.2b-decode-q8_0",
+        ];
+        store
+            .store
+            .with_conn_fenced(|tx| {
+                for model_id in model_ids {
+                    tx.execute(
+                        "INSERT INTO models (
+                             model_id, engine, task, fingerprint, config_json,
+                             created_ms, updated_ms
+                         ) VALUES (?1, 'owned-metal-decode', 'generate', ?1, '{}', 1, 1)",
+                        params![model_id],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let applied = store
+            .migrate_owned_decode_approvals(
+                "owned-decode-approval-migration-v1",
+                APPROVAL_SCHEMA_REVISION,
+            )
+            .unwrap();
+        assert_eq!(applied.outcome, "applied");
+        assert_eq!(applied.rows, 4);
+        let already_applied = store
+            .migrate_owned_decode_approvals(
+                "owned-decode-approval-migration-v1",
+                APPROVAL_SCHEMA_REVISION,
+            )
+            .unwrap();
+        assert_eq!(already_applied.outcome, "already_applied");
+        assert_eq!(store.approvals().unwrap().len(), 4);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn owned_decode_rows_are_epoch_scoped_and_non_owned_classes_upsert_by_class() {
+        let (root, descriptor) = temp_descriptor("owned-row-epochs");
+        let store = SynapseStore::open(&descriptor).unwrap();
+        let profile_hash = "b".repeat(64);
+        let decode_fingerprint = "c".repeat(64);
+        let evidence = serde_json::json!({
+            "g_dec": (1..=12)
+                .map(|number| serde_json::json!({
+                    "id": format!("G-DEC-{number:02}"),
+                    "status": "passed",
+                    "manifest_revision": G_DEC_MANIFEST_REVISION,
+                }))
+                .collect::<Vec<_>>(),
+        });
+        let mut row = OwnedDecodeCertificationRow {
+            status: CertificationStatus::Certified,
+            revisioned_machine_profile_hash: profile_hash.clone(),
+            profile_activation_epoch: 1,
+            model_id: "owned-model".to_string(),
+            decode_fingerprint: decode_fingerprint.clone(),
+            processing_fingerprint: "processing-a".to_string(),
+            runtime_config_digest: "runtime-a".to_string(),
+            constraint_runtime_identities: vec!["constraint-a".to_string()],
+            worker_path_evidence: serde_json::json!({"worker": "a"}),
+            evidence_schema_revision: CERT_EVIDENCE_SCHEMA_REVISION.to_string(),
+            g_dec_manifest_revision: G_DEC_MANIFEST_REVISION.to_string(),
+            numeric_profile_id: None,
+            fingerprint: Fingerprint(decode_fingerprint.clone()),
+            certified_at_ms: 10,
+            os_build: "os-a".to_string(),
+            module_generation: 1,
+            evidence: evidence.clone(),
+        };
+        store.store_owned_decode_cert_row(&row).unwrap();
+        row.profile_activation_epoch = 3;
+        row.certified_at_ms = 30;
+        store.store_owned_decode_cert_row(&row).unwrap();
+        assert!(store
+            .get_owned_decode_cert_row(
+                &profile_hash,
+                1,
+                "owned-model",
+                &decode_fingerprint,
+                CERT_EVIDENCE_SCHEMA_REVISION,
+            )
+            .unwrap()
+            .is_some());
+        assert!(store
+            .get_owned_decode_cert_row(
+                &profile_hash,
+                3,
+                "owned-model",
+                &decode_fingerprint,
+                CERT_EVIDENCE_SCHEMA_REVISION,
+            )
+            .unwrap()
+            .is_some());
+        assert!(store
+            .get_owned_decode_cert_row_matching(
+                &profile_hash,
+                3,
+                "owned-model",
+                &decode_fingerprint,
+                "processing-a",
+                "runtime-a",
+                &["constraint-a".to_string()],
+                &serde_json::json!({"worker": "a"}),
+                CERT_EVIDENCE_SCHEMA_REVISION,
+                G_DEC_MANIFEST_REVISION,
+            )
+            .unwrap()
+            .is_some());
+        assert!(store
+            .get_owned_decode_cert_row(
+                &profile_hash,
+                2,
+                "owned-model",
+                &decode_fingerprint,
+                CERT_EVIDENCE_SCHEMA_REVISION,
+            )
+            .unwrap()
+            .is_none());
+
+        for class in [
+            CertificationClass::Declared,
+            CertificationClass::Remote,
+            CertificationClass::Embedding,
+            CertificationClass::Rerank,
+        ] {
+            let class_row = ClassScopedCertificationRow {
+                certification_class: class,
+                assurance_class: AssuranceClass::Declared,
+                status: CertificationStatus::Certified,
+                key_hash: format!("key-{}", class.as_str()),
+                machine_profile_hash: None,
+                remote_profile_hash: matches!(
+                    class,
+                    CertificationClass::Declared | CertificationClass::Remote
+                )
+                .then(|| "remote-profile".to_string()),
+                identity_revision: matches!(
+                    class,
+                    CertificationClass::Declared | CertificationClass::Remote
+                )
+                .then(|| "identity-v1".to_string()),
+                numeric_profile_id: None,
+                fingerprint: Fingerprint("shared-fp".to_string()),
+                certified_at_ms: 1,
+                os_build: String::new(),
+                module_generation: 1,
+                evidence: serde_json::json!({"class": class.as_str()}),
+            };
+            store.store_class_scoped_cert_row(&class_row).unwrap();
+            let mut updated = class_row.clone();
+            updated.certified_at_ms = 2;
+            store.store_class_scoped_cert_row(&updated).unwrap();
+        }
+        let class_count: i64 = store
+            .store
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM cert_rows WHERE fingerprint = 'shared-fp'",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(class_count, 4);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn profile_activation_is_epoch_one_then_single_parent_per_rotation() {
+        let (root, descriptor) = temp_descriptor("profile-rotation");
+        let store = SynapseStore::open(&descriptor).unwrap();
+        let fingerprint = "d".repeat(64);
+        store
+            .store
+            .with_conn_fenced(|tx| {
+                tx.execute(
+                    "INSERT INTO models (
+                         model_id, engine, task, fingerprint, config_json,
+                         created_ms, updated_ms
+                     ) VALUES ('owned-model', 'owned-metal-decode', 'generate', 'model-fp', '{}', 1, 1)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        store
+            .create_approval("owned-model", &fingerprint, true, "operator", 1, 1)
+            .unwrap();
+        let profile_a = MachineProfile {
+            os_build: "os-a".to_string(),
+            arch: "aarch64".to_string(),
+            chip_model: "chip-a".to_string(),
+            ram_class: "le_32_gib".to_string(),
+            ane_subtype: None,
+            engine_identities: Vec::new(),
+        };
+        let mut profile_b = profile_a.clone();
+        profile_b.engine_identities.push(EngineIdentity {
+            engine: "owned-metal-decode".to_string(),
+            version: "worker-v2".to_string(),
+            build_flags: BTreeMap::new(),
+        });
+        let first = store.observe_profile(&profile_a, 10, 1).unwrap();
+        assert_eq!(first.state.profile_activation_epoch, Some(1));
+        assert!(!first.rotated);
+        let rotated = store.observe_profile(&profile_b, 20, 1).unwrap();
+        assert_eq!(rotated.state.profile_activation_epoch, Some(2));
+        assert_eq!(
+            rotated.state.last_rotation_reason.as_deref(),
+            Some("engine_identities")
+        );
+        assert_eq!(rotated.event.as_ref().unwrap().outcomes.len(), 1);
+        let event_id = rotated.event.as_ref().unwrap().event_id.clone();
+        store
+            .set_rotation_certification_outcome(
+                &event_id,
+                "owned-model",
+                &fingerprint,
+                RotationOutcomeState::Passed,
+                Some(25),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            store.rotation_outcomes(&event_id).unwrap()[0].outcome_state,
+            "passed"
+        );
+        assert_eq!(
+            store
+                .observe_profile(&profile_b, 21, 1)
+                .unwrap()
+                .state
+                .profile_activation_epoch,
+            Some(2)
+        );
+        let returned = store.observe_profile(&profile_a, 30, 1).unwrap();
+        assert_eq!(returned.state.profile_activation_epoch, Some(3));
+        assert_eq!(store.rotation_events().unwrap().len(), 2);
+        assert_eq!(
+            store.profile_state().unwrap().profile_activation_epoch,
+            Some(3)
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn owned_decode_admission_requires_both_profile_guards() {
+        let (root, descriptor) = temp_descriptor("dual-guard");
+        let store = SynapseStore::open(&descriptor).unwrap();
+        store
+            .store
+            .with_conn_fenced(|tx| {
+                tx.execute(
+                    "INSERT INTO models (
+                         model_id, engine, task, fingerprint, config_json,
+                         created_ms, updated_ms
+                     ) VALUES ('owned-model', 'owned-metal-decode', 'generate', 'model-fp', '{}', 1, 1)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let decode_fingerprint = "e".repeat(64);
+        store
+            .create_approval("owned-model", &decode_fingerprint, true, "operator", 1, 1)
+            .unwrap();
+        let profile_a = MachineProfile {
+            os_build: "os-a".to_string(),
+            arch: "aarch64".to_string(),
+            chip_model: "chip-a".to_string(),
+            ram_class: "le_32_gib".to_string(),
+            ane_subtype: None,
+            engine_identities: Vec::new(),
+        };
+        let mut profile_b = profile_a.clone();
+        profile_b.os_build = "os-b".to_string();
+        store.observe_profile(&profile_a, 1, 1).unwrap();
+        let evidence = serde_json::json!({
+            "g_dec": (1..=12)
+                .map(|number| serde_json::json!({
+                    "id": format!("G-DEC-{number:02}"),
+                    "status": "passed",
+                    "manifest_revision": G_DEC_MANIFEST_REVISION,
+                }))
+                .collect::<Vec<_>>(),
+        });
+        let row = |epoch, hash: String| OwnedDecodeCertificationRow {
+            status: CertificationStatus::Certified,
+            revisioned_machine_profile_hash: hash,
+            profile_activation_epoch: epoch,
+            model_id: "owned-model".to_string(),
+            decode_fingerprint: decode_fingerprint.clone(),
+            processing_fingerprint: "processing".to_string(),
+            runtime_config_digest: "runtime".to_string(),
+            constraint_runtime_identities: Vec::new(),
+            worker_path_evidence: serde_json::json!({}),
+            evidence_schema_revision: CERT_EVIDENCE_SCHEMA_REVISION.to_string(),
+            g_dec_manifest_revision: G_DEC_MANIFEST_REVISION.to_string(),
+            numeric_profile_id: None,
+            fingerprint: Fingerprint(decode_fingerprint.clone()),
+            certified_at_ms: epoch,
+            os_build: "os".to_string(),
+            module_generation: 1,
+            evidence: evidence.clone(),
+        };
+        let hash_a = profile_a.revisioned_hash();
+        let hash_b = profile_b.revisioned_hash();
+        store
+            .store_owned_decode_cert_row(&row(1, hash_a.clone()))
+            .unwrap();
+        assert!(store
+            .owned_decode_admission("owned-model", &decode_fingerprint, &hash_a, 1)
+            .unwrap()
+            .is_some());
+        assert!(store
+            .owned_decode_admission("owned-model", &decode_fingerprint, &hash_a, 2)
+            .unwrap()
+            .is_none());
+        store.observe_profile(&profile_b, 2, 1).unwrap();
+        assert!(store
+            .owned_decode_admission("owned-model", &decode_fingerprint, &hash_a, 1)
+            .unwrap()
+            .is_none());
+        store
+            .store_owned_decode_cert_row(&row(2, hash_b.clone()))
+            .unwrap();
+        assert!(store
+            .owned_decode_admission("owned-model", &decode_fingerprint, &hash_b, 2)
+            .unwrap()
+            .is_some());
         let _ = std::fs::remove_dir_all(root);
     }
 
