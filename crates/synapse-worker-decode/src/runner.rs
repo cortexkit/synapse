@@ -158,6 +158,47 @@ impl DecodeEngine {
             _ => bail!("owned decode engine/cache family mismatch"),
         }
     }
+
+    fn chain_span(&self) -> usize {
+        match self {
+            Self::Qwen { decoder, .. } => decoder.chain_span(),
+            Self::Lfm2 { engine } => engine.chain_span(),
+        }
+    }
+
+    fn set_chain_span(&mut self, span: usize) -> Result<()> {
+        match self {
+            Self::Qwen {
+                decoder,
+                f16_prefill,
+                ..
+            } => {
+                decoder.set_chain_span(span)?;
+                if let Some(prefill) = f16_prefill {
+                    prefill.set_chain_span(span)?;
+                }
+                Ok(())
+            }
+            Self::Lfm2 { engine } => engine.set_chain_span(span),
+        }
+    }
+
+    fn advance_chain(
+        &mut self,
+        cache: &mut DecodeCache,
+        seed: u32,
+        steps: usize,
+    ) -> Result<Vec<u32>> {
+        match (self, cache) {
+            (Self::Qwen { decoder, .. }, DecodeCache::Qwen(cache)) => {
+                decoder.advance_chain(cache, seed, steps)
+            }
+            (Self::Lfm2 { engine }, DecodeCache::Lfm2(cache)) => {
+                engine.advance_chain(cache, seed, steps)
+            }
+            _ => bail!("owned decode engine/cache family mismatch"),
+        }
+    }
 }
 
 fn handoff_qwen_cache(
@@ -179,6 +220,9 @@ struct LoadedRuntime {
     decode_fingerprint: String,
     runtime_config_digest: String,
     production_n: u32,
+    /// Machine-configured free-text chain span. Constraint requests override it
+    /// to one at start because host-side token masking needs per-token logits.
+    decode_chain_k: usize,
     stop_ids: Vec<u32>,
     vocabulary: Arc<TokenVocabulary>,
     vocabulary_digest: String,
@@ -260,6 +304,16 @@ impl WorkerState {
             production_n == PRODUCTION_N,
             "worker requires committed N=16"
         );
+        let decode_chain_k = runtime_config
+            .get("decode_chain_k")
+            .map(String::as_str)
+            .unwrap_or("1")
+            .parse::<usize>()
+            .context("parse owned decode decode_chain_k")?;
+        ensure!(
+            (1..=16).contains(&decode_chain_k),
+            "decode_chain_k must be between 1 and 16"
+        );
 
         let tokenizer_path = runtime_config
             .get("tokenizer_path")
@@ -320,6 +374,7 @@ impl WorkerState {
             runtime_config_digest: required_config(runtime_config, "runtime_config_digest")?
                 .to_string(),
             production_n,
+            decode_chain_k,
             stop_ids,
             vocabulary,
             vocabulary_digest,
@@ -366,6 +421,12 @@ impl WorkerState {
         loaded
             .engine
             .reset()
+            .map_err(|_| DecodeError::Unavailable)?;
+        let effective_chain_k =
+            effective_decode_chain_k(loaded.decode_chain_k, active_constraint.is_some());
+        loaded
+            .engine
+            .set_chain_span(effective_chain_k)
             .map_err(|_| DecodeError::Unavailable)?;
         let (cache, next_logits, next_greedy) = if active_constraint.is_some() {
             let (cache, logits) = loaded
@@ -420,6 +481,21 @@ impl WorkerState {
     }
 
     fn run_quantum(&mut self, token_budget: u32) -> Result<WorkerFrame, DecodeError> {
+        if self
+            .resident
+            .as_ref()
+            .is_some_and(|resident| resident.constraint.is_none())
+            && self
+                .loaded
+                .as_ref()
+                .is_some_and(|loaded| loaded.engine.chain_span() > 1)
+        {
+            return self.run_chained_quantum(token_budget);
+        }
+        self.run_single_quantum(token_budget)
+    }
+
+    fn run_single_quantum(&mut self, token_budget: u32) -> Result<WorkerFrame, DecodeError> {
         for _ in 0..token_budget {
             let loaded = self
                 .loaded
@@ -502,6 +578,95 @@ impl WorkerState {
             quantum_sequence: resident.quantum_sequence,
             committed_token_count: resident.generated_ids.len() as u32,
         }))
+    }
+
+    fn commit_unconstrained_token(
+        &mut self,
+        token: u32,
+    ) -> Result<Option<WorkerFrame>, DecodeError> {
+        let stop_ids = self
+            .loaded
+            .as_ref()
+            .ok_or(DecodeError::RuntimeConfigMismatch)?
+            .stop_ids
+            .clone();
+        let resident = self
+            .resident
+            .as_mut()
+            .ok_or(DecodeError::ProtocolMismatch)?;
+        if stop_ids.contains(&token) {
+            return Ok(Some(self.finish(FinishReason::StopToken)));
+        }
+        resident.generated_ids.push(token);
+        if resident.generated_ids.len() as u32 == resident.max_tokens {
+            return Ok(Some(self.finish(FinishReason::MaxTokens)));
+        }
+        Ok(None)
+    }
+
+    /// Run an unconstrained quantum with fused chain submissions while keeping
+    /// the scheduler-visible budget at exactly `token_budget`. The final chain
+    /// output is retained as the next prediction, just like the single-step
+    /// path's post-token logits, so no extra token is committed at a boundary.
+    fn run_chained_quantum(&mut self, token_budget: u32) -> Result<WorkerFrame, DecodeError> {
+        let chain_k = self
+            .loaded
+            .as_ref()
+            .ok_or(DecodeError::RuntimeConfigMismatch)?
+            .engine
+            .chain_span();
+        let mut seed = self
+            .resident
+            .as_mut()
+            .ok_or(DecodeError::ProtocolMismatch)?
+            .next_greedy
+            .take()
+            .ok_or(DecodeError::ProtocolMismatch)?;
+        if let Some(frame) = self.commit_unconstrained_token(seed)? {
+            return Ok(frame);
+        }
+        let mut committed = 1_u32;
+        let mut forward_steps = 0_u32;
+        while forward_steps < token_budget {
+            let steps = chain_k.min((token_budget - forward_steps) as usize);
+            let tokens = {
+                let loaded = self
+                    .loaded
+                    .as_mut()
+                    .ok_or(DecodeError::RuntimeConfigMismatch)?;
+                let resident = self
+                    .resident
+                    .as_mut()
+                    .ok_or(DecodeError::ProtocolMismatch)?;
+                loaded
+                    .engine
+                    .advance_chain(&mut resident.cache, seed, steps)
+                    .map_err(|_| DecodeError::Unavailable)?
+            };
+            forward_steps += steps as u32;
+            for token in tokens {
+                if committed < token_budget {
+                    if let Some(frame) = self.commit_unconstrained_token(token)? {
+                        return Ok(frame);
+                    }
+                    committed += 1;
+                    seed = token;
+                } else {
+                    let resident = self
+                        .resident
+                        .as_mut()
+                        .ok_or(DecodeError::ProtocolMismatch)?;
+                    resident.next_greedy = Some(token);
+                    resident.quantum_sequence = resident.quantum_sequence.saturating_add(1);
+                    return Ok(WorkerFrame::Progress(GenerateProgress {
+                        generation_id: resident.generation_id.clone(),
+                        quantum_sequence: resident.quantum_sequence,
+                        committed_token_count: resident.generated_ids.len() as u32,
+                    }));
+                }
+            }
+        }
+        Err(DecodeError::ProtocolMismatch)
     }
 
     fn finish(&mut self, finish_reason: FinishReason) -> WorkerFrame {
@@ -903,6 +1068,14 @@ fn standard_req_id(request: &WorkerRequest) -> Option<String> {
     }
 }
 
+fn effective_decode_chain_k(configured: usize, constrained: bool) -> usize {
+    if constrained {
+        1
+    } else {
+        configured
+    }
+}
+
 fn required_config<'a>(config: &'a BTreeMap<String, String>, key: &str) -> Result<&'a str> {
     config
         .get(key)
@@ -1039,5 +1212,17 @@ mod tests {
             identity.build_flags["constraint_encoding"],
             "token-id-json-constraint-v1"
         );
+    }
+}
+
+#[cfg(test)]
+mod chain_policy_tests {
+    use super::effective_decode_chain_k;
+
+    #[test]
+    fn grammar_forces_single_step_and_free_text_uses_machine_shape() {
+        assert_eq!(effective_decode_chain_k(1, false), 1);
+        assert_eq!(effective_decode_chain_k(16, false), 16);
+        assert_eq!(effective_decode_chain_k(16, true), 1);
     }
 }

@@ -76,6 +76,10 @@ pub struct LaneProvenance {
     pub constraint_fingerprint: Option<Fingerprint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grammar_compiler_revision: Option<String>,
+    /// Effective GPU chain span. Additive response provenance; llama and legacy
+    /// responses omit it because no owned chain policy executed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain_k: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub underlying_owned_decode_refusal_id: Option<String>,
 }
@@ -93,6 +97,7 @@ pub struct OwnedProvenanceInputs {
     pub metallib_revision: String,
     pub worker_generation: u64,
     pub last_completed_quantum_sequence: u32,
+    pub chain_k: u32,
 }
 
 impl LaneProvenance {
@@ -121,6 +126,7 @@ impl LaneProvenance {
             constraint_runtime_identity: None,
             constraint_fingerprint: None,
             grammar_compiler_revision: None,
+            chain_k: Some(inputs.chain_k),
             underlying_owned_decode_refusal_id: None,
         }
     }
@@ -154,6 +160,7 @@ impl LaneProvenance {
             constraint_runtime_identity: None,
             constraint_fingerprint: None,
             grammar_compiler_revision: None,
+            chain_k: None,
             underlying_owned_decode_refusal_id: None,
         }
     }
@@ -215,6 +222,7 @@ mod tests {
                 metallib_revision: "metallib-v1".to_string(),
                 worker_generation: 7,
                 last_completed_quantum_sequence: 3,
+                chain_k: 1,
             },
         );
 
@@ -230,6 +238,7 @@ mod tests {
         );
         assert_eq!(provenance.worker_generation, 7);
         assert_eq!(provenance.last_completed_quantum_sequence, 3);
+        assert_eq!(provenance.chain_k, Some(1));
         // Additive fields absent by default.
         assert!(provenance.fallback_reason.is_none());
         assert_eq!(provenance.crash_retry_count, 0);

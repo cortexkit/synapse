@@ -107,6 +107,9 @@ pub struct Lfm2HybridStepEngine {
     rope_theta: f32,
     epsilon: f32,
     weight_quantization: WeightQuantization,
+    /// Request-selected chained decode span. K=1 is the certified baseline
+    /// because it is the shape validated for production parity.
+    chain_k: usize,
     /// Host copy of the f16 embedding gather table uploaded at prepare time.
     /// Kept so `DecodeKernel::advance` can gather a token's embedding row on
     /// the host and feed the exact same f16 bits the device-resident chain and
@@ -166,6 +169,7 @@ impl Lfm2HybridStepEngine {
             rope_theta: config.rope_theta,
             epsilon: config.rms_norm_eps,
             weight_quantization,
+            chain_k: 1,
             embedding_table,
         };
 
@@ -555,7 +559,16 @@ impl DecodeKernel for Lfm2HybridStepEngine {
     }
 
     fn chain_span(&self) -> usize {
-        1
+        self.chain_k
+    }
+
+    fn set_chain_span(&mut self, span: usize) -> Result<()> {
+        ensure!(
+            (1..=16).contains(&span),
+            "chain span must be between 1 and 16"
+        );
+        self.chain_k = span;
+        Ok(())
     }
 
     fn advance_chain(

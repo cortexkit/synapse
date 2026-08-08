@@ -127,6 +127,8 @@ const MAX_ENGINE_BATCH_ITEMS: usize = 8;
 const DEFAULT_PROBE_MEAN_COSINE_THRESHOLD: f64 = 0.999;
 const DEFAULT_PROBE_WORST_DECILE_RANK_OVERLAP_THRESHOLD: f64 = 0.9;
 const DEFAULT_PROBE_ANE_PLACEMENT_THRESHOLD: f64 = 0.9;
+const DEFAULT_DECODE_CHAIN_K: u32 = 1;
+const MAX_DECODE_CHAIN_K: u32 = 16;
 const RERANK_PROBE_PEARSON_THRESHOLD: f64 = 0.999;
 const BALANCED_QUIET_MIN_THROUGHPUT_RATIO: f64 = 0.5;
 const PROBE_PERF_BATCH_TOKEN_BUDGET: usize = 1_024;
@@ -339,7 +341,7 @@ impl WireOperationError {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ModuleConfig {
     #[serde(default)]
@@ -360,12 +362,38 @@ pub(crate) struct ModuleConfig {
     microllm_max_tokens: u32,
     #[serde(default)]
     grammar_enabled: bool,
+    /// Free-text owned decode chain span. Grammar requests always use K=1
+    /// because host-side token masking requires a per-token boundary; values
+    /// above one change free-text execution shape only after certification
+    /// covers the configured span.
+    #[serde(default = "default_decode_chain_k")]
+    decode_chain_k: u32,
     #[serde(default = "default_cache_max_bytes")]
     cache_max_bytes: u64,
     #[serde(default)]
     dev: DevConfig,
     #[serde(default)]
     remote_providers: Vec<RemoteProviderConfig>,
+}
+
+impl Default for ModuleConfig {
+    fn default() -> Self {
+        Self {
+            preload_models: Vec::new(),
+            inline: InlineConfig::default(),
+            worker: WorkerConfig::default(),
+            jobs: JobConfig::default(),
+            probe: ProbeConfig::default(),
+            knob: PerfKnob::default(),
+            alias_admin_enabled: false,
+            microllm_max_tokens: default_microllm_max_tokens(),
+            grammar_enabled: false,
+            decode_chain_k: default_decode_chain_k(),
+            cache_max_bytes: default_cache_max_bytes(),
+            dev: DevConfig::default(),
+            remote_providers: Vec::new(),
+        }
+    }
 }
 
 fn embedding_profile_enabled() -> bool {
@@ -378,6 +406,20 @@ fn default_microllm_max_tokens() -> u32 {
 
 fn default_cache_max_bytes() -> u64 {
     DEFAULT_CACHE_MAX_BYTES
+}
+
+fn default_decode_chain_k() -> u32 {
+    DEFAULT_DECODE_CHAIN_K
+}
+
+fn validate_decode_chain_k(value: u32) -> Result<(), ModuleError> {
+    if (1..=MAX_DECODE_CHAIN_K).contains(&value) {
+        Ok(())
+    } else {
+        Err(ModuleError::Config(format!(
+            "decode_chain_k must be between 1 and {MAX_DECODE_CHAIN_K}, got {value}"
+        )))
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -614,6 +656,7 @@ struct RuntimeState {
     alias_admin_enabled: bool,
     microllm_max_tokens: u32,
     grammar_enabled: bool,
+    decode_chain_k: u32,
     // Read only under cfg(debug_assertions) (the dev-only test-cutover gate);
     // carried unconditionally so RuntimeState has one shape on every profile.
     #[cfg_attr(not(debug_assertions), allow(dead_code))]
@@ -1358,6 +1401,8 @@ impl RuntimeState {
         let alias_admin_enabled = config.alias_admin_enabled || config.dev.alias_admin_enabled;
         let microllm_max_tokens = config.microllm_max_tokens;
         let grammar_enabled = config.grammar_enabled;
+        validate_decode_chain_k(config.decode_chain_k)?;
+        let decode_chain_k = config.decode_chain_k;
         let owned_decode_cutover_for_test = config.dev.owned_decode_cutover_for_test;
         let cache_max_bytes = config.cache_max_bytes;
         let scheduler = Arc::new(Mutex::new(InlineScheduler { in_flight_bytes: 0 }));
@@ -1391,6 +1436,7 @@ impl RuntimeState {
             alias_admin_enabled,
             microllm_max_tokens,
             grammar_enabled,
+            decode_chain_k,
             owned_decode_cutover_for_test,
             cache_max_bytes,
             scheduler,
@@ -5611,6 +5657,7 @@ fn owned_decode_processing_fingerprint(
 fn owned_decode_runtime_identity(
     spec: &StoredModelConfig,
     entry: &owned_decode_routing::CatalogEntry,
+    decode_chain_k: u32,
 ) -> (String, u32) {
     use owned_decode_routing::identity::RuntimeConfigManifest;
 
@@ -5623,9 +5670,7 @@ fn owned_decode_runtime_identity(
         worker_revision: spec.engine_identity.version.clone(),
         protocol_revision: owned_decode_worker::identity::WORKER_PROTOCOL_ID.to_string(),
         metallib_revision: entry.metallib_revision.clone(),
-        chain_k: flag("chain_k")
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(1),
+        chain_k: decode_chain_k,
         batched_verification: flag("batched_verification").is_some_and(|value| value == "true"),
         resident_limit: 1,
         attention_kv_reservation_units: spec
@@ -5766,13 +5811,14 @@ enum OwnedDecodeDispatchPreparationError {
     Wire(WireOperationError),
 }
 
-fn build_supervised_decode_dispatch(
+fn build_supervised_decode_dispatch_for_chain_k(
     state: &ModuleState,
     spec: &StoredModelConfig,
     entry: &owned_decode_routing::CatalogEntry,
     prompt_ids: Vec<u32>,
     constraint: Option<owned_decode_worker::protocol::TokenIdJsonConstraint>,
     deadline_ms: u64,
+    decode_chain_k: u32,
 ) -> Result<worker_host::SupervisedDecodeDispatch, OwnedDecodeDispatchPreparationError> {
     use owned_decode_routing::error::OwnedDecodeError;
     use owned_decode_worker::{
@@ -5820,12 +5866,14 @@ fn build_supervised_decode_dispatch(
         .decode_identity_inputs()
         .decode_fingerprint()
         .map_err(OwnedDecodeDispatchPreparationError::Refused)?;
-    let (runtime_config_digest, production_n) = owned_decode_runtime_identity(spec, entry);
+    let (runtime_config_digest, production_n) =
+        owned_decode_runtime_identity(spec, entry, decode_chain_k);
     for (key, value) in [
         ("family", entry.family.as_str().to_string()),
         ("weight_quant", entry.weight_quant.as_str().to_string()),
         ("context_bucket", entry.max_context_tokens.to_string()),
         ("production_n", production_n.to_string()),
+        ("decode_chain_k", decode_chain_k.to_string()),
         (
             "tokenizer_path",
             tokenizer_path.path.to_string_lossy().to_string(),
@@ -5885,6 +5933,25 @@ fn build_supervised_decode_dispatch(
         },
     )
     .map_err(|_| OwnedDecodeDispatchPreparationError::Refused(OwnedDecodeError::Unavailable))
+}
+
+fn build_supervised_decode_dispatch(
+    state: &ModuleState,
+    spec: &StoredModelConfig,
+    entry: &owned_decode_routing::CatalogEntry,
+    prompt_ids: Vec<u32>,
+    constraint: Option<owned_decode_worker::protocol::TokenIdJsonConstraint>,
+    deadline_ms: u64,
+) -> Result<worker_host::SupervisedDecodeDispatch, OwnedDecodeDispatchPreparationError> {
+    build_supervised_decode_dispatch_for_chain_k(
+        state,
+        spec,
+        entry,
+        prompt_ids,
+        constraint,
+        deadline_ms,
+        state.runtime.decode_chain_k,
+    )
 }
 
 fn cached_supervised_decode_dispatch(
@@ -6222,7 +6289,8 @@ async fn route_owned_decode_wire(
     let worker_constraint = compiled_constraint
         .as_ref()
         .map(|compiled| worker_constraint(&compiled.constraint));
-    let (runtime_config_digest, _) = owned_decode_runtime_identity(&spec, &entry);
+    let (runtime_config_digest, _) =
+        owned_decode_runtime_identity(&spec, &entry, state.runtime.decode_chain_k);
 
     let llama_spec = if !constrained {
         state.runtime.catalog.lock().ok().and_then(|catalog| {
@@ -6273,7 +6341,8 @@ async fn route_owned_decode_wire(
             llama: llama_lane,
             equivalent_fingerprints,
         },
-    );
+    )
+    .with_decode_chain_k(state.runtime.decode_chain_k);
     let environment = match resolution_owned_refusal {
         Some(refusal) => environment.with_resolution_owned_refusal(refusal),
         None => environment,
@@ -6501,6 +6570,7 @@ async fn route_owned_decode_wire(
                 constraint_runtime_identity: provenance.constraint_runtime_identity.clone(),
                 constraint_fingerprint: provenance.constraint_fingerprint.clone(),
                 grammar_compiler_revision: provenance.grammar_compiler_revision.clone(),
+                chain_k: provenance.chain_k,
                 underlying_owned_decode_refusal_id: provenance
                     .underlying_owned_decode_refusal_id
                     .clone(),
@@ -8978,30 +9048,40 @@ async fn execute_generate_probe_for_model(
     let mut accepted_structural_forks = Vec::new();
     let mut tokens_compared = 0_usize;
     let mut mismatches = Vec::new();
+    let mut chain_shape_mismatches = Vec::new();
     let mut throughput_samples = Vec::with_capacity(fixture.items.len());
     let mut latency_samples = Vec::with_capacity(fixture.items.len());
-    let mut worker_dispatch: Option<Arc<Mutex<worker_host::SupervisedDecodeDispatch>>> = None;
-    for (index, item) in fixture.items.iter().enumerate() {
-        let tokenized = model
-            .tokenizer
-            .tokenize_batch([item.prompt.as_str()])
-            .map_err(|error| {
-                WireOperationError::from_stable(
-                    StableError::artifact_invalid(),
-                    format!("owned-decode probe tokenization failed: {error}"),
-                )
-            })?;
-        let prompt = tokenized.batch.items.into_iter().next().unwrap_or_default();
-        let prompt_token_count = prompt.len().min(u32::MAX as usize) as u32;
-        if worker_dispatch.is_none() {
-            worker_dispatch = Some(
-                cached_supervised_decode_dispatch(
+    let chain_shapes = if state.runtime.decode_chain_k > 1 {
+        vec![1, state.runtime.decode_chain_k]
+    } else {
+        vec![1]
+    };
+    let mut baseline_outputs = Vec::with_capacity(fixture.items.len());
+    let mut last_worker_dispatch: Option<Arc<Mutex<worker_host::SupervisedDecodeDispatch>>> = None;
+
+    for (shape_index, chain_k) in chain_shapes.into_iter().enumerate() {
+        let mut worker_dispatch: Option<Arc<Mutex<worker_host::SupervisedDecodeDispatch>>> = None;
+        for (index, item) in fixture.items.iter().enumerate() {
+            let tokenized = model
+                .tokenizer
+                .tokenize_batch([item.prompt.as_str()])
+                .map_err(|error| {
+                    WireOperationError::from_stable(
+                        StableError::artifact_invalid(),
+                        format!("owned-decode probe tokenization failed: {error}"),
+                    )
+                })?;
+            let prompt = tokenized.batch.items.into_iter().next().unwrap_or_default();
+            let prompt_token_count = prompt.len().min(u32::MAX as usize) as u32;
+            if worker_dispatch.is_none() {
+                let built = build_supervised_decode_dispatch_for_chain_k(
                     state,
                     &spec,
                     &entry,
                     prompt.clone(),
                     None,
                     OWNED_DECODE_PROBE_TIMEOUT_MS,
+                    chain_k,
                 )
                 .map_err(|error| match error {
                     OwnedDecodeDispatchPreparationError::Refused(refusal) => {
@@ -9011,53 +9091,80 @@ async fn execute_generate_probe_for_model(
                         ))
                     }
                     OwnedDecodeDispatchPreparationError::Wire(error) => error,
-                })?,
-            );
-        }
-        let dispatch = worker_dispatch
-            .as_ref()
-            .ok_or_else(|| {
-                WireOperationError::from_stable(
-                    StableError::artifact_invalid(),
-                    "owned-decode certification requires a supervised worker binary",
-                )
-            })?
-            .clone();
-        let started = std::time::Instant::now();
-        let output = dispatch_supervised_decode(
-            dispatch,
-            prompt,
-            None,
-            OWNED_DECODE_PROBE_TIMEOUT_MS,
-            owned_decode_routing::DispatchedCommand {
-                lane: LaneKind::OwnedDecode,
-                decode_fingerprint: decode_fingerprint.clone(),
-                processing_fingerprint: processing_fingerprint.clone(),
-                prompt_token_count,
-                max_tokens: item.max_new_tokens,
-                generation_id: format!("probe-{}-{index}", state.module_generation),
-                constrained: false,
-            },
-        )
-        .await?;
-        let elapsed_secs = started.elapsed().as_secs_f64().max(f64::EPSILON);
-        latency_samples.push(elapsed_secs * 1_000.0);
-        throughput_samples.push(output.generated_token_ids.len() as f64 / elapsed_secs);
-        tokens_compared = tokens_compared.saturating_add(item.expected_token_ids.len());
-        if output.generated_token_ids == item.expected_token_ids {
-            exact_matches += 1;
-        } else if accepted_structural_forks.len() < fixture.structural_band.max_forks {
-            if let Some(fork) =
-                certified_generate_fork(item, &output.generated_token_ids, &fixture.structural_band)
-            {
-                accepted_structural_forks.push(fork.clone());
-            } else {
-                mismatches.push(decode_token_mismatch(item, &output.generated_token_ids));
+                })?;
+                worker_dispatch = Some(Arc::new(Mutex::new(built)));
             }
-        } else {
-            mismatches.push(decode_token_mismatch(item, &output.generated_token_ids));
+            let dispatch = worker_dispatch
+                .as_ref()
+                .ok_or_else(|| {
+                    WireOperationError::from_stable(
+                        StableError::artifact_invalid(),
+                        "owned-decode certification requires a supervised worker binary",
+                    )
+                })?
+                .clone();
+            let started = std::time::Instant::now();
+            let output = dispatch_supervised_decode(
+                dispatch,
+                prompt,
+                None,
+                OWNED_DECODE_PROBE_TIMEOUT_MS,
+                owned_decode_routing::DispatchedCommand {
+                    lane: LaneKind::OwnedDecode,
+                    decode_fingerprint: decode_fingerprint.clone(),
+                    processing_fingerprint: processing_fingerprint.clone(),
+                    prompt_token_count,
+                    max_tokens: item.max_new_tokens,
+                    generation_id: format!(
+                        "probe-{}-{shape_index}-{index}",
+                        state.module_generation
+                    ),
+                    constrained: false,
+                    chain_k,
+                },
+            )
+            .await?;
+
+            if shape_index == 0 {
+                let elapsed_secs = started.elapsed().as_secs_f64().max(f64::EPSILON);
+                latency_samples.push(elapsed_secs * 1_000.0);
+                throughput_samples.push(output.generated_token_ids.len() as f64 / elapsed_secs);
+                tokens_compared = tokens_compared.saturating_add(item.expected_token_ids.len());
+                baseline_outputs.push(output.generated_token_ids.clone());
+                if output.generated_token_ids == item.expected_token_ids {
+                    exact_matches += 1;
+                } else if accepted_structural_forks.len() < fixture.structural_band.max_forks {
+                    if let Some(fork) = certified_generate_fork(
+                        item,
+                        &output.generated_token_ids,
+                        &fixture.structural_band,
+                    ) {
+                        accepted_structural_forks.push(fork);
+                    } else {
+                        mismatches.push(decode_token_mismatch(item, &output.generated_token_ids));
+                    }
+                } else {
+                    mismatches.push(decode_token_mismatch(item, &output.generated_token_ids));
+                }
+            } else if baseline_outputs.get(index) != Some(&output.generated_token_ids) {
+                chain_shape_mismatches.push(json!({
+                    "prompt_index": index,
+                    "configured_chain_k": chain_k,
+                    "baseline_k": 1,
+                    "expected_token_ids": baseline_outputs.get(index),
+                    "actual_token_ids": output.generated_token_ids,
+                }));
+            }
         }
+        last_worker_dispatch = worker_dispatch;
     }
+
+    let worker_dispatch = last_worker_dispatch.ok_or_else(|| {
+        WireOperationError::from_stable(
+            StableError::artifact_invalid(),
+            "owned-decode certification requires a supervised worker binary",
+        )
+    })?;
 
     let vocabulary_digest = owned_decode_vocabulary_digest(&model.tokenizer)?;
     let constrained_schema = r#"{"type":"null"}"#;
@@ -9084,7 +9191,7 @@ async fn execute_generate_probe_for_model(
         .tokenize("Respond with exactly the JSON literal null and nothing else:\n")
         .map_err(|error| artifact_invalid_error(error.to_string()))?
         .ids;
-    let constrained_dispatch = worker_dispatch.expect("fixture battery is non-empty");
+    let constrained_dispatch = worker_dispatch;
     let constrained = dispatch_supervised_decode(
         constrained_dispatch,
         constrained_prompt.clone(),
@@ -9098,6 +9205,7 @@ async fn execute_generate_probe_for_model(
             max_tokens: 64,
             generation_id: format!("probe-{}-constrained", state.module_generation),
             constrained: true,
+            chain_k: 1,
         },
     )
     .await;
@@ -9116,22 +9224,31 @@ async fn execute_generate_probe_for_model(
         tokens_compared,
     };
     let fixture_passed = exact_matches + accepted_structural_forks.len() == fixture.items.len()
-        && mismatches.is_empty();
+        && mismatches.is_empty()
+        && chain_shape_mismatches.is_empty();
     let passed = fixture_passed && constrained_schema_valid;
     let certification_evidence = json!({
         "task": "generate",
         "gate": "structural_band",
         "blocking_reason": if passed {
             Value::Null
+        } else if !chain_shape_mismatches.is_empty() {
+            json!("configured_chain_shape_diverged_from_k1")
         } else if !fixture_passed {
             json!("token_mismatch_outside_structural_band")
         } else {
             json!("constrained_worker_path_failed")
         },
         "metrics": evidence,
-        "accepted_forks": accepted_structural_forks,
-        "mismatches": mismatches,
-        "fixture": generate_fixture_provenance(fixture),
+         "accepted_forks": accepted_structural_forks,
+         "mismatches": mismatches,
+         "chain_shape_mismatches": chain_shape_mismatches,
+         "chain_shapes": if state.runtime.decode_chain_k > 1 {
+             vec![1, state.runtime.decode_chain_k]
+         } else {
+             vec![1]
+         },
+         "fixture": generate_fixture_provenance(fixture),
         "worker_path": {
             "transport": worker_catalog_transport(),
             "protocol": owned_decode_worker::identity::WORKER_PROTOCOL_ID,
@@ -10656,6 +10773,16 @@ fn parse_module_config_json(
                 .to_string(),
         ));
     }
+    if matches!(tier, ConfigTier::Project)
+        && value
+            .as_object()
+            .is_some_and(|object| object.contains_key("decode_chain_k"))
+    {
+        return Err(ModuleError::Config(
+            "decode_chain_k is user-tier only and may not appear in project-tier config"
+                .to_string(),
+        ));
+    }
     let config: ModuleConfig = serde_json::from_value(value).map_err(|error| {
         if let Some(field) = unknown_field_from_json_error(&error) {
             eprintln!("synapse config parse error in {source}: unknown field '{field}'");
@@ -10667,6 +10794,7 @@ fn parse_module_config_json(
             ModuleError::Json(error)
         }
     })?;
+    validate_decode_chain_k(config.decode_chain_k)?;
     validate_remote_providers(&config.remote_providers).map_err(ModuleError::Config)?;
     Ok(config)
 }
@@ -11219,6 +11347,17 @@ mod tests {
     }
 
     #[test]
+    fn project_tier_rejects_decode_chain_k_with_security_boundary_error() {
+        let error =
+            parse_module_config_json(r#"{"decode_chain_k": 8}"#, "project", ConfigTier::Project)
+                .expect_err("project tier must not control machine decode shape");
+        assert_eq!(
+            error.to_string(),
+            "config: decode_chain_k is user-tier only and may not appear in project-tier config"
+        );
+    }
+
+    #[test]
     fn project_tier_rejects_remote_providers_with_security_boundary_error() {
         let error = parse_module_config_json(
             r#"{"remote_providers": []}"#,
@@ -11282,6 +11421,28 @@ mod tests {
         )
         .expect_err("unknown worker fields should fail");
         assert!(error.to_string().contains("load_timeout_mss"));
+    }
+
+    #[test]
+    fn module_config_parses_decode_chain_k_with_safe_default_and_bounds() {
+        let default = parse_module_config_json(r#"{}"#, "test", ConfigTier::User)
+            .expect("default chain span should parse");
+        assert_eq!(default.decode_chain_k, DEFAULT_DECODE_CHAIN_K);
+
+        let configured =
+            parse_module_config_json(r#"{"decode_chain_k": 16}"#, "test", ConfigTier::User)
+                .expect("maximum chain span should parse");
+        assert_eq!(configured.decode_chain_k, 16);
+
+        for value in [0, 17] {
+            let error = parse_module_config_json(
+                &format!(r#"{{"decode_chain_k": {value}}}"#),
+                "test",
+                ConfigTier::User,
+            )
+            .expect_err("chain span outside 1..=16 must fail");
+            assert!(error.to_string().contains("decode_chain_k"));
+        }
     }
 
     #[test]
@@ -11644,7 +11805,8 @@ mod routing_identity_dump_tests {
                     .expect("decode identity must be valid");
                 let processing_fingerprint = owned_decode_processing_fingerprint(&entry)
                     .expect("processing identity must be valid");
-                let (runtime_config_digest, _) = owned_decode_runtime_identity(&spec, &entry);
+                let (runtime_config_digest, _) =
+                    owned_decode_runtime_identity(&spec, &entry, DEFAULT_DECODE_CHAIN_K);
                 let tokenizer_path = match &spec.tokenizer_locator {
                     ModelAssetLocator::LocalPath { path } => path,
                     ModelAssetLocator::CacheDigest { .. } => {

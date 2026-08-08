@@ -50,6 +50,10 @@ pub struct OwnedDecodeResponseProvenance {
     pub constraint_fingerprint: Option<Fingerprint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grammar_compiler_revision: Option<String>,
+    /// Effective GPU chain span for an owned decode response. This is additive
+    /// provenance; legacy envelopes omit it and deserialize as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain_k: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub underlying_owned_decode_refusal_id: Option<String>,
 }

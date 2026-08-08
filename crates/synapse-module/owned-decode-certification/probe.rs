@@ -28,6 +28,11 @@ use crate::owned_decode_routing::error::OwnedDecodeError;
 pub trait DecodeProbe {
     /// Generate the greedy-top-1 token stream for one fixture prompt.
     fn generate(&mut self, fixture: &ParityFixture, prompt_index: u32) -> Vec<u32>;
+
+    /// Select the production chain span for subsequent generation. Hardware-free
+    /// doubles intentionally ignore this because their oracle stream is shape
+    /// independent.
+    fn set_chain_k(&mut self, _chain_k: usize) {}
 }
 
 /// A test double that reproduces the registered oracle bytes exactly. Stands
@@ -35,15 +40,25 @@ pub trait DecodeProbe {
 /// oracle is the authority, never the other way around.
 pub struct OracleReproducingProbe<'a> {
     oracle: &'a OracleStore,
+    chain_k: usize,
 }
 
 impl<'a> OracleReproducingProbe<'a> {
     pub fn new(oracle: &'a OracleStore) -> Self {
-        Self { oracle }
+        Self { oracle, chain_k: 1 }
+    }
+
+    #[must_use]
+    pub const fn chain_k(&self) -> usize {
+        self.chain_k
     }
 }
 
 impl DecodeProbe for OracleReproducingProbe<'_> {
+    fn set_chain_k(&mut self, chain_k: usize) {
+        self.chain_k = chain_k;
+    }
+
     fn generate(&mut self, fixture: &ParityFixture, prompt_index: u32) -> Vec<u32> {
         self.oracle
             .stream(&fixture.id, prompt_index)
@@ -175,7 +190,43 @@ impl<'a> CertificationProbe<'a> {
         decode_fingerprint: Fingerprint,
         store: &mut CertificationStore,
     ) -> Result<CertificationEvidence, OwnedDecodeError> {
-        let evidence = self.run_battery(probe, fixture, decode_fingerprint, None, store)?;
+        self.certify_unconstrained_lane_with_chain_k(probe, fixture, decode_fingerprint, 1, store)
+    }
+
+    /// Certify the authoritative K=1 shape and, when configured, the chained
+    /// shape. The chained run must match every K=1 token stream exactly before
+    /// the lane is certified.
+    pub fn certify_unconstrained_lane_with_chain_k(
+        &self,
+        probe: &mut dyn DecodeProbe,
+        fixture: &ParityFixture,
+        decode_fingerprint: Fingerprint,
+        chain_k: usize,
+        store: &mut CertificationStore,
+    ) -> Result<CertificationEvidence, OwnedDecodeError> {
+        if !(1..=16).contains(&chain_k) {
+            return Err(OwnedDecodeError::CertificationFailed);
+        }
+        let (evidence, baseline_streams) = self.run_battery(
+            probe,
+            fixture,
+            decode_fingerprint.clone(),
+            None,
+            store,
+            1,
+            None,
+        )?;
+        if chain_k > 1 {
+            let _ = self.run_battery(
+                probe,
+                fixture,
+                decode_fingerprint.clone(),
+                None,
+                store,
+                chain_k,
+                Some(&baseline_streams),
+            )?;
+        }
         store.certify_unconstrained(
             &self.machine_profile_hash,
             evidence.decode_fingerprint.clone(),
@@ -198,12 +249,14 @@ impl<'a> CertificationProbe<'a> {
         constraint_runtime_identity: &str,
         store: &mut CertificationStore,
     ) -> Result<CertificationEvidence, OwnedDecodeError> {
-        let evidence = self.run_battery(
+        let (evidence, _) = self.run_battery(
             probe,
             fixture,
             decode_fingerprint,
             Some(constraint_runtime_identity.to_string()),
             store,
+            1,
+            None,
         )?;
         store.certify_constrained(
             &self.machine_profile_hash,
@@ -221,6 +274,7 @@ impl<'a> CertificationProbe<'a> {
     /// Run the battery, compare against the oracle, and enforce the structural
     /// band against the signature stored for this profile and fingerprint (if
     /// any). Records nothing; the caller records rows on success.
+    #[allow(clippy::too_many_arguments)]
     fn run_battery(
         &self,
         probe: &mut dyn DecodeProbe,
@@ -228,7 +282,10 @@ impl<'a> CertificationProbe<'a> {
         decode_fingerprint: Fingerprint,
         constraint_runtime_identity: Option<String>,
         store: &CertificationStore,
-    ) -> Result<CertificationEvidence, OwnedDecodeError> {
+        chain_k: usize,
+        expected_streams: Option<&[Vec<u32>]>,
+    ) -> Result<(CertificationEvidence, Vec<Vec<u32>>), OwnedDecodeError> {
+        probe.set_chain_k(chain_k);
         let mut divergences = Vec::new();
         let mut produced_streams = Vec::with_capacity(fixture.prompt_count as usize);
         for prompt_index in 0..fixture.prompt_count {
@@ -237,6 +294,12 @@ impl<'a> CertificationProbe<'a> {
                 .stream(&fixture.id, prompt_index)
                 .ok_or(OwnedDecodeError::CertificationFailed)?;
             let produced = probe.generate(fixture, prompt_index);
+            if expected_streams
+                .and_then(|streams| streams.get(prompt_index as usize))
+                .is_some_and(|expected| expected != &produced)
+            {
+                return Err(OwnedDecodeError::CertificationFailed);
+            }
             divergences.extend(compare_streams(&produced, oracle, prompt_index));
             produced_streams.push(produced);
         }
@@ -258,17 +321,20 @@ impl<'a> CertificationProbe<'a> {
         let mut stream_digests = BTreeMap::new();
         stream_digests.insert(fixture.id.clone(), battery_digest(&produced_streams));
 
-        Ok(CertificationEvidence {
-            machine_profile_hash: self.machine_profile_hash.clone(),
-            decode_fingerprint,
-            constraint_runtime_identity,
-            fixture_registry_revision: self.fixture_registry_revision.clone(),
-            group: PARITY_GROUP.to_string(),
-            executed_fixture_ids: vec![fixture.id.clone()],
-            stream_digests,
-            fork_signature: summary.signature,
-            top2_swaps: summary.top2_swaps,
-        })
+        Ok((
+            CertificationEvidence {
+                machine_profile_hash: self.machine_profile_hash.clone(),
+                decode_fingerprint,
+                constraint_runtime_identity,
+                fixture_registry_revision: self.fixture_registry_revision.clone(),
+                group: PARITY_GROUP.to_string(),
+                executed_fixture_ids: vec![fixture.id.clone()],
+                stream_digests,
+                fork_signature: summary.signature,
+                top2_swaps: summary.top2_swaps,
+            },
+            produced_streams,
+        ))
     }
 }
 
@@ -393,8 +459,15 @@ mod tests {
         let fp = decode_fingerprint("qwen3-0.6b");
 
         let evidence = probe
-            .certify_unconstrained_lane(&mut reproducing, fixture, fp.clone(), &mut store)
-            .expect("byte-identical run certifies");
+            .certify_unconstrained_lane_with_chain_k(
+                &mut reproducing,
+                fixture,
+                fp.clone(),
+                4,
+                &mut store,
+            )
+            .expect("both byte-identical shapes certify");
+        assert_eq!(reproducing.chain_k(), 4);
 
         assert_eq!(evidence.top2_swaps, 0);
         assert_eq!(evidence.group, PARITY_GROUP);

@@ -36,8 +36,8 @@ use synapse_core::Fingerprint;
 use tokenizers::Tokenizer;
 
 use synapse_engine_owned::owned_decode_engine::{
-    DecodeKernel, Lfm2DecodeModel, Lfm2HybridStepEngine, MetalStepDecoder, MetalStepKvCache,
-    Qwen3DecodeModel, WeightQuantization,
+    top_logits, DecodeKernel, Lfm2DecodeModel, Lfm2HybridStepCache, Lfm2HybridStepEngine,
+    MetalStepDecoder, MetalStepKvCache, Qwen3DecodeModel, WeightQuantization,
 };
 use synapse_engine_owned::Precision;
 
@@ -86,6 +86,14 @@ fn load_decode_prompts() -> Vec<DecodePrompt> {
         .filter(|line| !line.trim().is_empty())
         .map(|line| serde_json::from_str(line).expect("decode-prompts.jsonl row parses"))
         .collect()
+}
+
+fn configured_chain_k() -> usize {
+    std::env::var("SYNAPSE_METAL_STEP_CHAIN_K")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| (1..=16).contains(value))
+        .unwrap_or(1)
 }
 
 fn spike_fixtures_dir() -> PathBuf {
@@ -193,6 +201,7 @@ struct Qwen3LaneProbe<'a> {
     stop_tokens: std::collections::HashSet<u32>,
     max_tokens: usize,
     weight_quant: WeightQuantization,
+    chain_k: usize,
 }
 
 impl DecodeProbe for Qwen3LaneProbe<'_> {
@@ -206,7 +215,20 @@ impl DecodeProbe for Qwen3LaneProbe<'_> {
             self.max_tokens,
             &self.stop_tokens,
             self.weight_quant,
+            self.chain_k,
         )
+    }
+
+    fn set_chain_k(&mut self, chain_k: usize) {
+        self.chain_k = chain_k;
+        self.step_decoder
+            .set_chain_span(chain_k)
+            .expect("valid Qwen3 chain span");
+        if let Some(decoder) = self.f16_decoder.as_mut() {
+            decoder
+                .set_chain_span(chain_k)
+                .expect("valid Qwen3 prefill chain span");
+        }
     }
 }
 
@@ -220,6 +242,7 @@ struct Lfm2LaneProbe<'a> {
     prompt_texts: &'a [String],
     stop_tokens: std::collections::HashSet<u32>,
     max_tokens: usize,
+    chain_k: usize,
 }
 
 impl DecodeProbe for Lfm2LaneProbe<'_> {
@@ -230,7 +253,15 @@ impl DecodeProbe for Lfm2LaneProbe<'_> {
             &self.prompt_texts[prompt_index as usize],
             self.max_tokens,
             &self.stop_tokens,
+            self.chain_k,
         )
+    }
+
+    fn set_chain_k(&mut self, chain_k: usize) {
+        self.chain_k = chain_k;
+        self.engine
+            .set_chain_span(chain_k)
+            .expect("valid LFM2 chain span");
     }
 }
 
@@ -254,6 +285,7 @@ fn qwen3_greedy_decode(
     max_tokens: usize,
     stop_tokens: &std::collections::HashSet<u32>,
     weight_quant: WeightQuantization,
+    chain_k: usize,
 ) -> Vec<u32> {
     let encoding = tokenizer.encode(prompt, true).expect("encode Qwen3 prompt");
     let prompt_ids = encoding.get_ids().to_vec();
@@ -286,16 +318,40 @@ fn qwen3_greedy_decode(
     if stop_tokens.contains(&first) || max_tokens <= 1 {
         return generated;
     }
-    let remaining = max_tokens - 1;
-    let chain_steps = remaining.min(step_decoder.capacity() - cache.position);
-    if chain_steps > 0 {
-        let tokens = step_decoder
-            .advance_chain(&mut cache, first, chain_steps)
-            .expect("metal chain");
-        for token in tokens {
+    let mut seed = first;
+    let mut remaining = max_tokens - 1;
+    while remaining > 0 {
+        if chain_k == 1 {
+            let logits = step_decoder
+                .advance(&mut cache, seed)
+                .expect("metal single-step");
+            let token = top_logits(&logits, 1)
+                .first()
+                .expect("single-step logits are non-empty")
+                .token_id;
             generated.push(token);
+            remaining -= 1;
             if stop_tokens.contains(&token) {
                 break;
+            }
+            seed = token;
+            continue;
+        }
+        let steps = chain_k
+            .min(remaining)
+            .min(step_decoder.capacity() - cache.position);
+        if steps == 0 {
+            break;
+        }
+        let tokens = step_decoder
+            .advance_chain(&mut cache, seed, steps)
+            .expect("metal chain");
+        remaining -= tokens.len();
+        for token in tokens {
+            generated.push(token);
+            seed = token;
+            if stop_tokens.contains(&token) {
+                return generated;
             }
         }
     }
@@ -309,6 +365,7 @@ fn lfm2_greedy_decode(
     prompt: &str,
     max_tokens: usize,
     stop_tokens: &std::collections::HashSet<u32>,
+    chain_k: usize,
 ) -> Vec<u32> {
     engine.reset().expect("reset caches");
     let encoding = tokenizer.encode(prompt, true).expect("encode LFM2 prompt");
@@ -321,17 +378,41 @@ fn lfm2_greedy_decode(
     if stop_tokens.contains(&first) || max_tokens <= 1 {
         return generated;
     }
-    let position = prompt_ids.len();
-    let remaining = max_tokens - 1;
-    let chain_steps = remaining.min(engine.capacity() - position);
-    if chain_steps > 0 {
-        let tokens = engine
-            .chain(position, chain_steps, first)
-            .expect("metal chain");
-        for token in tokens {
+    let mut cache = Lfm2HybridStepCache {
+        position: prompt_ids.len(),
+    };
+    let mut seed = first;
+    let mut remaining = max_tokens - 1;
+    while remaining > 0 {
+        if chain_k == 1 {
+            let logits = engine.advance(&mut cache, seed).expect("LFM2 single-step");
+            let token = top_logits(&logits, 1)
+                .first()
+                .expect("single-step logits are non-empty")
+                .token_id;
             generated.push(token);
+            remaining -= 1;
             if stop_tokens.contains(&token) {
                 break;
+            }
+            seed = token;
+            continue;
+        }
+        let steps = chain_k
+            .min(remaining)
+            .min(engine.capacity() - cache.position);
+        if steps == 0 {
+            break;
+        }
+        let tokens = engine
+            .advance_chain(&mut cache, seed, steps)
+            .expect("metal chain");
+        remaining -= tokens.len();
+        for token in tokens {
+            generated.push(token);
+            seed = token;
+            if stop_tokens.contains(&token) {
+                return generated;
             }
         }
     }
@@ -421,11 +502,18 @@ fn metal_certification_probe_four_lanes() {
                     prompt_texts: &prompt_texts,
                     max_tokens,
                     weight_quant,
+                    chain_k: 1,
                 };
                 // `f16_model` stays bound in this arm until after `lane_probe`
                 // drops, so the prefill decoder's borrow stays valid.
                 probe
-                    .certify_unconstrained_lane(&mut lane_probe, fixture, fp, &mut store)
+                    .certify_unconstrained_lane_with_chain_k(
+                        &mut lane_probe,
+                        fixture,
+                        fp,
+                        configured_chain_k(),
+                        &mut store,
+                    )
                     .unwrap_or_else(|error| {
                         panic!("metal certification failed for {}: {error:?}", fixture.id)
                     })
@@ -455,9 +543,16 @@ fn metal_certification_probe_four_lanes() {
                     tokenizer: &tokenizer,
                     prompt_texts: &prompt_texts,
                     max_tokens,
+                    chain_k: 1,
                 };
                 probe
-                    .certify_unconstrained_lane(&mut lane_probe, fixture, fp, &mut store)
+                    .certify_unconstrained_lane_with_chain_k(
+                        &mut lane_probe,
+                        fixture,
+                        fp,
+                        configured_chain_k(),
+                        &mut store,
+                    )
                     .unwrap_or_else(|error| {
                         panic!("metal certification failed for {}: {error:?}", fixture.id)
                     })

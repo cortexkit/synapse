@@ -25,7 +25,7 @@ Do not auto-set `DEVELOPER_DIR` in scripts; configure the host or invocation so 
 
 ### Module config (`synapse.jsonc`)
 
-Example `~/.config/cortexkit/synapse.jsonc` (or project `.cortexkit/synapse.jsonc`):
+Example user-tier `~/.config/cortexkit/synapse.jsonc` (project configs must omit the user-only chain setting):
 
 ```jsonc
 {
@@ -33,6 +33,9 @@ Example `~/.config/cortexkit/synapse.jsonc` (or project `.cortexkit/synapse.json
   "knob": "balanced",
   "microllm_max_tokens": 512,
   "grammar_enabled": false,
+  // Free-text chain span (1..=16); grammar stays at K=1. Values above 1
+  // change free-text execution shape only after certification covers the span.
+  "decode_chain_k": 1,
   "cache_max_bytes": 34359738368,
   "alias_admin_enabled": false,
   "worker": {

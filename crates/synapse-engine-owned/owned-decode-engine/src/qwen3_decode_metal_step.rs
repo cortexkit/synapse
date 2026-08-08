@@ -121,7 +121,7 @@ impl<'a> MetalStepDecoder<'a> {
             raw,
             model,
             bucket,
-            chain_k: read_chain_k(),
+            chain_k: 1,
         };
         let params = decoder.layer_params()?;
         let final_norm = decoder.model.final_norm.weight.metal_f16_bits()?;
@@ -581,6 +581,15 @@ impl DecodeKernel for MetalStepDecoder<'_> {
         self.chain_k
     }
 
+    fn set_chain_span(&mut self, span: usize) -> Result<()> {
+        ensure!(
+            (1..=16).contains(&span),
+            "chain span must be between 1 and 16"
+        );
+        self.chain_k = span;
+        Ok(())
+    }
+
     fn advance_chain(
         &mut self,
         cache: &mut Self::Cache,
@@ -666,17 +675,6 @@ fn metal_step_library_path() -> Result<PathBuf> {
         build_path.display()
     );
     Ok(build_path)
-}
-
-/// Chain span from SYNAPSE_METAL_STEP_CHAIN_K (default 1: the fully
-/// instrumented per-token path, byte-identical to the pinned campaign
-/// baseline). Chaining is opt-in; production baseline is K=1.
-fn read_chain_k() -> usize {
-    std::env::var("SYNAPSE_METAL_STEP_CHAIN_K")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .map(|value| value.max(1))
-        .unwrap_or(1)
 }
 
 fn last_error() -> anyhow::Error {

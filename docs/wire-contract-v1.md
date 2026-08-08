@@ -210,7 +210,9 @@ optional sibling of `engine`:
 
 `build_flags` is a string-keyed object: it is an empty object or is omitted by
 serde when empty, never an array. `remote` is absent for local lanes. No existing
-provenance field changes shape.
+provenance field changes shape. Owned-decode responses may add the optional
+`chain_k` provenance field; legacy readers must ignore additive provenance fields
+and no request wire field is introduced.
 
 For `assurance: "declared"`, `content_sha256` hashes the exact post-truncation
 text Synapse submitted to the provider. In this lane, “embedded” means

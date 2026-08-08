@@ -248,6 +248,7 @@ fn dispatch_command(
         max_tokens,
         generation_id: generation_id.to_string(),
         constrained,
+        chain_k: 1,
     }
 }
 

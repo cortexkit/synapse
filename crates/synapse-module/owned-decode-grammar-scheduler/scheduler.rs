@@ -1087,6 +1087,21 @@ mod tests {
     }
 
     #[test]
+    fn chain_k_16_still_yields_at_the_16_token_quantum_boundary() {
+        // A fused K=16 submission is one scheduler quantum, not two hidden
+        // quanta. The supervisor therefore sees exactly 16 committed tokens and
+        // authorizes the next quantum with the normal N=16 budget.
+        let mut protocol = GenerationProtocol::new("gen-chain-16", 16, 32);
+        protocol.authorize_start(1).expect("starts");
+        protocol
+            .receive_progress(1, 1, 16)
+            .expect("K=16 progress accounts for one quantum");
+        let continuation = protocol.next_continue().expect("second quantum");
+        assert_eq!(continuation.next_token_budget, 16);
+        assert_eq!(continuation.expected_sequence, 2);
+    }
+
+    #[test]
     fn stale_worker_generation_is_a_mismatch() {
         let mut protocol = GenerationProtocol::new("gen-1", 16, 64);
         protocol.authorize_start(7).expect("starts");

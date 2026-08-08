@@ -198,6 +198,8 @@ pub struct DispatchedCommand {
     pub max_tokens: u32,
     pub generation_id: String,
     pub constrained: bool,
+    /// Effective per-request chain span; this is internal policy, not a wire field.
+    pub chain_k: u32,
 }
 
 /// A successful execution outcome returned by the dispatch seam. Contains
@@ -248,6 +250,8 @@ pub struct RoutingEnvironment {
     pub llama: Option<LlamaLane>,
     /// Fingerprints authorized as equivalent aliases of a `required_fingerprint`.
     pub equivalent_fingerprints: BTreeSet<Fingerprint>,
+    /// Configured free-text chain span. Grammar requests override this to K=1.
+    pub decode_chain_k: u32,
     /// Constraint runtime identity digest for a constrained request, if applicable.
     pub constraint_runtime_identity: Option<String>,
     /// A typed refusal discovered while resolving an owned catalog identity.
@@ -287,6 +291,7 @@ impl RoutingEnvironment {
             quarantined,
             llama,
             equivalent_fingerprints,
+            decode_chain_k: 1,
             constraint_runtime_identity,
             resolution_owned_refusal: None,
             pre_dispatch_owned_refusal: None,
@@ -313,6 +318,7 @@ impl RoutingEnvironment {
             quarantined,
             llama,
             equivalent_fingerprints,
+            decode_chain_k: 1,
             constraint_runtime_identity,
             resolution_owned_refusal: None,
             pre_dispatch_owned_refusal: None,
@@ -339,9 +345,33 @@ impl RoutingEnvironment {
             quarantined,
             llama,
             equivalent_fingerprints,
+            decode_chain_k: 1,
             constraint_runtime_identity,
             resolution_owned_refusal: None,
             pre_dispatch_owned_refusal: None,
+        }
+    }
+
+    /// Set the validated per-machine free-text chain span used by owned requests.
+    /// Grammar requests always use K=1 because host-side masking requires a
+    /// per-token boundary.
+    #[must_use]
+    pub fn with_decode_chain_k(mut self, decode_chain_k: u32) -> Self {
+        assert!(
+            (1..=16).contains(&decode_chain_k),
+            "decode_chain_k must be 1..=16"
+        );
+        self.decode_chain_k = decode_chain_k;
+        self
+    }
+
+    /// Return the effective chain span for a request shape.
+    #[must_use]
+    pub const fn effective_decode_chain_k(&self, constrained: bool) -> u32 {
+        if constrained {
+            1
+        } else {
+            self.decode_chain_k
         }
     }
 
@@ -596,6 +626,7 @@ impl OwnedDecodeRouter {
                     max_tokens: request.max_tokens,
                     generation_id: generation_id.to_string(),
                     constrained: false,
+                    chain_k: 1,
                 };
                 // Execution-phase failure returns directly; no re-selection.
                 let success = dispatch.dispatch(&command).map_err(RoutingFailure::owned)?;
@@ -613,6 +644,7 @@ impl OwnedDecodeRouter {
                     max_tokens: request.max_tokens,
                     generation_id: generation_id.to_string(),
                     constrained: request.is_constrained(),
+                    chain_k: env.effective_decode_chain_k(request.is_constrained()),
                 };
                 // Execution-phase failure returns directly; never falls back.
                 let success = dispatch.dispatch(&command).map_err(RoutingFailure::owned)?;
@@ -625,6 +657,7 @@ impl OwnedDecodeRouter {
                         metallib_revision: entry.metallib_revision.clone(),
                         worker_generation: success.worker_generation,
                         last_completed_quantum_sequence: success.last_completed_quantum_sequence,
+                        chain_k: env.effective_decode_chain_k(request.is_constrained()),
                     },
                 );
                 if success.crash_retry_count > 0 {
@@ -755,6 +788,17 @@ mod tests {
             decode_fingerprint: fp("llama-decode"),
             processing_fingerprint: fp("llama-proc"),
         }
+    }
+
+    #[test]
+    fn effective_chain_policy_uses_one_for_grammar_and_configured_k_for_free_text() {
+        let default = env(true, None);
+        assert_eq!(default.effective_decode_chain_k(false), 1);
+        assert_eq!(default.effective_decode_chain_k(true), 1);
+
+        let configured = default.with_decode_chain_k(8);
+        assert_eq!(configured.effective_decode_chain_k(false), 8);
+        assert_eq!(configured.effective_decode_chain_k(true), 1);
     }
 
     /// A dispatch seam that records every lane it was asked to dispatch and
@@ -889,7 +933,7 @@ mod tests {
                 let store = certified_store(&entry);
                 let router = router_with_certified(store, q8);
                 let request = request(family, weight_quant);
-                let environment = env(true, Some(llama_lane()));
+                let environment = env(true, Some(llama_lane())).with_decode_chain_k(8);
                 let dispatched = Rc::new(RefCell::new(Vec::new()));
                 let mut dispatch = RecordingDispatch::new_succeeding(dispatched.clone());
 
@@ -901,6 +945,7 @@ mod tests {
                 assert_eq!(response.finish_reason, FinishReason::StopToken);
                 assert_eq!(response.provenance.engine, "owned-metal-decode");
                 assert_eq!(response.provenance.lane, "decode");
+                assert_eq!(response.provenance.chain_k, Some(8));
                 assert_eq!(*dispatched.borrow(), vec![LaneKind::OwnedDecode]);
             }
         }

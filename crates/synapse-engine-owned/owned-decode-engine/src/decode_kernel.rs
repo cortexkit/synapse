@@ -79,6 +79,14 @@ pub trait DecodeKernel {
         1
     }
 
+    /// Select the request's chained decode span. The module validates the
+    /// per-machine value; this guard keeps engine callers from selecting an
+    /// unsupported span and makes the baseline explicit.
+    fn set_chain_span(&mut self, span: usize) -> Result<()> {
+        ensure!(span == 1, "this decode backend only supports chain span 1");
+        Ok(())
+    }
+
     /// Advance `steps` tokens in one fused submission, returning the argmax
     /// token id of every step. `seed` feeds the first step. Backends without a
     /// chained path (the default) must not be asked for this.

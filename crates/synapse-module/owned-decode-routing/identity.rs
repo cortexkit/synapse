@@ -216,7 +216,7 @@ pub struct RuntimeConfigManifest {
     pub worker_revision: String,
     pub protocol_revision: String,
     pub metallib_revision: String,
-    /// Baseline chain-K is one.
+    /// Effective free-text chain span (grammar requests still run at K=1).
     pub chain_k: u32,
     /// Baseline batched verification is disabled.
     pub batched_verification: bool,
@@ -476,6 +476,14 @@ mod tests {
             changed.digest(),
             base,
             "decode weight enters runtime digest"
+        );
+
+        let mut changed = runtime_manifest();
+        changed.chain_k = 16;
+        assert_ne!(
+            changed.digest(),
+            base,
+            "enabling chained free-text decode rotates runtime identity"
         );
     }
 
