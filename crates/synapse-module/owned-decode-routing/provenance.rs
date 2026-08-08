@@ -8,12 +8,12 @@
 //! the refused owned fingerprint.
 
 use serde::{Deserialize, Serialize};
-use synapse_core::Fingerprint;
+use synapse_core::{worker_engine_names::DECODE_WORKER_ENGINE, Fingerprint};
 
 use crate::owned_decode_routing::family::FamilyRegistration;
 
 /// Canonical identity strings for the production owned-decode lane.
-pub const OWNED_ENGINE: &str = "owned-metal-decode";
+pub const OWNED_ENGINE: &str = DECODE_WORKER_ENGINE;
 pub const OWNED_LANE: &str = "decode";
 pub const OWNED_WORKER: &str = "supervised";
 pub const OWNED_RISK_CLASS: &str = "abort_capable";
@@ -218,7 +218,7 @@ mod tests {
             },
         );
 
-        assert_eq!(provenance.engine, "owned-metal-decode");
+        assert_eq!(provenance.engine, DECODE_WORKER_ENGINE);
         assert_eq!(provenance.lane, "decode");
         assert_eq!(provenance.worker, "supervised");
         assert_eq!(provenance.risk_class, "abort_capable");

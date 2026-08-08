@@ -3467,7 +3467,7 @@ async fn certified_owned_checkpoint_lane(
     let result = &owned["result"];
     assert_eq!(
         result["provenance"]["engine"]["engine"],
-        "owned-metal-decode"
+        DECODE_WORKER_ENGINE
     );
     assert_eq!(result["provenance"]["lane"], "decode");
     assert_eq!(result["provenance"]["worker"], "supervised");

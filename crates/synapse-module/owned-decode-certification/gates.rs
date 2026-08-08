@@ -11,7 +11,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
-use synapse_core::Fingerprint;
+use synapse_core::{worker_engine_names::DECODE_WORKER_ENGINE, Fingerprint};
 
 use crate::owned_decode_certification::cutover::{
     cutover_inputs_from_evidence, CutoverEvidenceInputs,
@@ -307,7 +307,7 @@ impl GateRunner {
     pub fn gate_01_catalog(&self, request_processing: GroupOutcome) -> GateStatus {
         let mut evidence = Vec::new();
 
-        let canonical_ok = CATALOG_ENGINE == "owned-metal-decode"
+        let canonical_ok = CATALOG_ENGINE == DECODE_WORKER_ENGINE
             && CATALOG_TASK == "generate"
             && CATALOG_LANE == "decode"
             && CATALOG_WORKER == "supervised"

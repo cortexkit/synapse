@@ -1011,6 +1011,11 @@ mod tests {
     }
 
     #[test]
+    fn producer_identity_matches_shared_catalog_constant() {
+        assert_eq!(engine_identity(7).engine, DECODE_WORKER_ENGINE);
+    }
+
+    #[test]
     fn custom_transport_rejects_unknown_fields() {
         let value = serde_json::json!({
             "type": "GENERATE_CANCEL",
@@ -1022,7 +1027,7 @@ mod tests {
     }
 
     #[test]
-    fn engine_identity_names_fleet_protocol() {
+    fn producer_identity_matches_catalog_engine_and_fleet_protocol() {
         let identity = engine_identity(7);
         assert_eq!(identity.engine, DECODE_WORKER_ENGINE);
         assert_eq!(

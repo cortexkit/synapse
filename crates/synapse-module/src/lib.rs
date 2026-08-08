@@ -1578,9 +1578,9 @@ fn build_preload_catalog_model(
         Some(digest) => normalize_digest(&digest),
         None => format!("sha256:{}", sha256_file(&preload.model_path)?),
     };
-    let owned = (engine_name == "owned-metal" || engine_name == "owned-cuda")
+    let owned = (engine_name == "owned-metal" || engine_name == CUDA_WORKER_ENGINE)
         .then(|| {
-            if engine_name == "owned-cuda" {
+            if engine_name == CUDA_WORKER_ENGINE {
                 owned_cuda_catalog_config(
                     preload.family.as_deref(),
                     preload.dtype.as_deref(),
@@ -1750,7 +1750,7 @@ fn normalize_catalog_model(
             extra_locators: model.extra_locators.clone(),
             identity_override: None,
         })
-    } else if engine_name == "owned-cuda" {
+    } else if engine_name == CUDA_WORKER_ENGINE {
         Some(owned_cuda_catalog_config(
             model.owned_family.as_deref(),
             model.owned_dtype.as_deref(),
@@ -1861,7 +1861,7 @@ fn build_stored_model_config(
             "owned-metal-decode supports generation models only".to_string(),
         ));
     }
-    if engine_name == "owned-cuda" && !matches!(task, ModelTask::Embed | ModelTask::Rerank) {
+    if engine_name == CUDA_WORKER_ENGINE && !matches!(task, ModelTask::Embed | ModelTask::Rerank) {
         return Err(ModuleError::Config(
             "owned-cuda supports embedding and rerank models only".to_string(),
         ));
@@ -2098,7 +2098,7 @@ fn canonical_engine_name(engine: &str) -> String {
         // Catalog entries select this engine explicitly. Future hardware probes can
         // populate the same catalog value without changing request dispatch.
         "owned" | "metal" | "owned_metal" => "owned-metal".to_string(),
-        "owned-cuda" | "owned_cuda" | "cuda" => "owned-cuda".to_string(),
+        CUDA_WORKER_ENGINE | "owned_cuda" | "cuda" => CUDA_WORKER_ENGINE.to_string(),
         "owned-decode" | "owned_metal_decode" | "owned-metal-decode" => {
             "owned-metal-decode".to_string()
         }

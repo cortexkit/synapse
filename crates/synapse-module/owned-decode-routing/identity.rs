@@ -27,14 +27,14 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use synapse_core::Fingerprint;
+use synapse_core::{worker_engine_names::DECODE_WORKER_ENGINE, Fingerprint};
 
 use crate::owned_decode_contracts::SchedulerRuntimeRecord;
 use crate::owned_decode_routing::error::OwnedDecodeError;
 use crate::owned_decode_routing::family::Family;
 
 /// Canonical engine name for the production owned-decode lane.
-pub const OWNED_DECODE_ENGINE: &str = "owned-metal-decode";
+pub const OWNED_DECODE_ENGINE: &str = DECODE_WORKER_ENGINE;
 
 /// Supported activation dtype. The specification ships exactly `f16`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

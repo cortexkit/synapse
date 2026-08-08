@@ -445,7 +445,7 @@ mod tests {
     use synapse_core::{worker_engine_names::CUDA_WORKER_ENGINE, OWNED_CUDA_PTX_VIRTUAL_ARCH};
 
     #[test]
-    fn handshake_identity_is_owned_cuda_ptx() {
+    fn producer_identity_matches_catalog_engine_and_owned_cuda_ptx() {
         let identity = engine_identity();
         assert_eq!(identity.engine, CUDA_WORKER_ENGINE);
         assert_eq!(identity.build_flags["backend"], "cuda-ptx");
@@ -454,6 +454,11 @@ mod tests {
             OWNED_CUDA_PTX_VIRTUAL_ARCH
         );
         assert_eq!(identity.build_flags["risk_class"], "abort_capable");
+    }
+
+    #[test]
+    fn producer_identity_matches_shared_catalog_constant() {
+        assert_eq!(engine_identity().engine, CUDA_WORKER_ENGINE);
     }
 
     #[test]

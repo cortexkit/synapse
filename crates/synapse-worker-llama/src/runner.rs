@@ -1148,7 +1148,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn handshake_identity_uses_canonical_engine_and_compiled_backend() {
+    fn producer_identity_matches_catalog_engine_and_compiled_backend() {
         let identity = engine_identity();
         assert_eq!(identity.engine, LLAMA_WORKER_ENGINE);
         assert_eq!(
@@ -1162,6 +1162,11 @@ mod tests {
                 .map(String::as_str),
             Some(compiled_backend())
         );
+    }
+
+    #[test]
+    fn producer_identity_matches_shared_catalog_constant() {
+        assert_eq!(engine_identity().engine, LLAMA_WORKER_ENGINE);
     }
 
     #[test]
