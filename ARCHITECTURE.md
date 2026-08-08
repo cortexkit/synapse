@@ -31,7 +31,7 @@
 **Synapse Owned Engine (`synapse-engine-owned`):**
 - Purpose: Primary in-process execution engine for Apple Silicon (macOS), providing exact-match Metal MPSGraph inference for ModernBERT, Qwen3, and MiniLM models, direct Metal step decode engines for Qwen3 and LFM2, supervised decode worker state management, and ModernBERT pair reranking (`rerank_pairs`).
 - Location: `crates/synapse-engine-owned`
-- Contains: Rust-to-Objective-C bindings, Metal shader graphs (including macOS 15+ `@available`-guarded fused scaled-dot-product attention for ModernBERT with `GRAPH_REVISION` package cache invalidation), direct Metal step decode kernels and models (`owned-decode-engine`), supervised decode worker protocol, boundary, crash budget, and supervision state machine (`owned-decode-worker`), and tensor operations for embedding and reranking (`modernbert.rs`). The module stays the sole tokenizer owner; this engine strictly consumes canonical token IDs and executes tensor logic.
+- Contains: Rust-to-Objective-C bindings, Metal shader graphs (including macOS 15+ `@available`-guarded fused scaled-dot-product attention for ModernBERT with `GRAPH_REVISION` package cache invalidation), direct Metal step decode kernels and models (`owned-decode-engine`), supervised decode worker protocol, boundary, crash budget, and supervision state machine (`owned-decode-worker`), and tensor operations for embedding and reranking (`crates/synapse-engine-owned/src/modernbert.rs`). The module stays the sole tokenizer owner; this engine strictly consumes canonical token IDs and executes tensor logic.
 - Depends on: `synapse-core`, `safetensors`, `half`, Apple's `Metal` and `MPSGraph` frameworks.
 - Used by: `synapse-module` as the primary local engine.
 
@@ -45,14 +45,14 @@
 **Synapse Worker Lanes (`synapse-worker-*`):**
 - Purpose: Execute in-memory tokenization, tensor forward passes, and token generation for specific hardware classes (Apple Silicon MLX, Apple Neural Engine, Llama GGUF, NVIDIA CUDA, and supervised Metal decode).
 - Location: `crates/synapse-worker-mlx`, `crates/synapse-worker-ane`, `crates/synapse-worker-llama`, `crates/synapse-worker-cuda`, `crates/synapse-worker-decode`
-- Contains: Metal-accelerated customized MLX models, CoreML graphs (including the `gte-modernbert` embedder and reranker for the ANE quiet-tier), `llama.cpp` inference processes, supervised owned CUDA runner (`ck-synapse-worker-cuda`) executing MiniLM, ModernBERT, and Qwen3 embedding batches over IPC, and supervised owned Metal decode runner (`ck-synapse-worker-decode`) executing Qwen3 and LFM2 token generation under progress/continuation framing.
+- Contains: Metal-accelerated customized MLX models, CoreML graphs (including the `gte-modernbert` embedder and reranker for the ANE quiet-tier via `ane-coreml-worker`), `llama.cpp` inference processes, supervised owned CUDA runner (`ck-synapse-worker-cuda`) executing MiniLM, ModernBERT, and Qwen3 embedding batches over IPC, and supervised owned Metal decode runner (`ck-synapse-worker-decode`) executing Qwen3 and LFM2 token generation under progress/continuation framing.
 - Depends on: `synapse-core`, `owned-decode-worker`, `synapse-engine-owned`, `mlx-rs`, `coreml` (via Swift), `reqwest`.
 - Used by: The `synapse-module` host spawning them dynamically based on user requests and capability tiers.
 
 **Synapse Core Abstractions (`synapse-core`):**
 - Purpose: Core vocabulary structs, engine traits, machine capability profiles, and error contracts shared between the host and its workers.
 - Location: `crates/synapse-core`
-- Contains: `WorkerHello` handshake and binary framing logic, `EngineError` contract, `MachineProfile` with `ane_subtype` chip-identity mapping, `RuntimeConfig`, `TokenBatch`, and scheduling traits.
+- Contains: `WorkerHello` handshake with strict catalog engine identity validation, binary framing logic, `EngineError` contract, `MachineProfile` with `ane_subtype` chip-identity mapping, `RuntimeConfig`, `TokenBatch`, and scheduling traits.
 
 **Benchmark Harness Core:**
 - Purpose: Provides CLI commands for corpus generation, power-monitored process wrapping, result schema definition, and numerical parity functions.
@@ -219,7 +219,7 @@
 **Worker Framing Protocol:**
 - Purpose: A byte-exact IPC mechanism sending dynamic float and integer arrays between the Rust host and worker children over sockets.
 - Location: `crates/synapse-core/src/worker_protocol.rs`
-- Pattern: Binary Serialization (e.g., `decode_f32_frame`, `encode_i32_frame`).
+- Pattern: Binary Serialization (e.g., `decode_f32_frame`, `encode_i32_frame`) with host-side catalog engine identity validation during `WorkerHello` handshake.
 
 **Fair-Share Scheduler:**
 - Purpose: Manage execution time slices across queued, active, and completed jobs, guaranteeing that background operations don't starve foreground priority work.

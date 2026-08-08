@@ -37,6 +37,7 @@
 │   ├── synapse-worker-llama/ # llama.cpp supervised worker (GGUF)
 │   └── synapse-worker-mlx/ # Apple Silicon MLX supervised worker
 ├── docs/                   # Design logs and decisions documentation
+├── evidence/               # Calibration evidence records and certification policies
 ├── tools/                  # Shared system tools and distillation harnesses
 │   ├── classify-distill/   # Athena classify distillation harness
 │   └── gather-distill/     # External gather-distillation data generation harness
@@ -69,7 +70,7 @@
 
 **crates/synapse-engine-cuda/:**
 - Purpose: Primary in-process CUDA execution engine (`owned-cuda-v1`), hosting PTX kernel ports for MiniLM, ModernBERT, and Qwen3 embedding models.
-- Contains: Byte-identical PTX kernel wrappers (`src/port/`), CUDA graph execution, precision-aware embedding engines (`OwnedCudaEmbedEngine`), model family detection, and device compute capability checks (`device_meets_floor`).
+- Contains: Byte-identical PTX kernel wrappers (`crates/synapse-engine-cuda/src/port/`), CUDA graph execution, precision-aware embedding engines (`OwnedCudaEmbedEngine`), model family detection, and device compute capability checks (`device_meets_floor`).
 - Key files: `crates/synapse-engine-cuda/src/lib.rs`, `crates/synapse-engine-cuda/src/cuda.rs`, `crates/synapse-engine-cuda/src/model.rs`
 
 **crates/synapse-engine-owned/:**
@@ -150,6 +151,11 @@
 - Contains: Markdown documents.
 - Key files: `docs/decision-1-runtime.md`, `docs/campaign-context-repro.md`
 
+**evidence/:**
+- Purpose: Contains hardware calibration evidence records and certification policies.
+- Contains: Calibration evidence, SHA256 checksums, and certification policy definitions (e.g., non-Mac certification threshold policies).
+- Key files: `evidence/nonmac/preparation/nonmac-cert-policy-v2.json`
+
 **tools/:**
 - Purpose: Houses shared development tools, utilities, and datasets generation/distillation harnesses.
 - Contains: The `gather-distill` and `classify-distill` TypeScript project workspaces, and `stt-voice-test` utility.
@@ -172,6 +178,7 @@
 - `crates/synapse-opctl/src/main.rs`: Operator command line control surface (`ck-synapse-opctl`).
 - `crates/synapse-module/src/bin/subc_call.rs`: Management surface call utility.
 - `crates/synapse-module/src/bin/inline_embed_throughput.rs`: Batch throughput execution client.
+- `crates/synapse-module/src/bin/timeout_worker.rs`: Shared test mock worker advertising `SYNAPSE_WORKER_EXPECTED_ENGINE` for test timeout and fallback validation.
 - `bench/harness/src/main.rs`: CLI runner for corpus generation, power wrapper execution, and parity check.
 - `bench/lanes/*/src/main.rs` (Rust), `bench/lanes/mlx-minilm/main.py` (Python), `bench/lanes/ts-embed/main.mjs` (JS), `bench/lanes/potion/main.py` (Python): Main executables for each specific runtime lane.
 - `bench/campaign/decode-harness.sh`, `bench/campaign/metal-step-harness.sh`, `bench/campaign/cuda-quant-harness.sh`, `bench/campaign/lfm2-cuda-harness.sh`, `bench/campaign/metal-embed-harness.sh`: Campaign controller scripts.

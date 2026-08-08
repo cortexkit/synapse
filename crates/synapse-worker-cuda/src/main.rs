@@ -12,9 +12,8 @@ use synapse_core::worker_framing_sync::{
     read_frame, read_json_frame, write_frame, write_json_frame,
 };
 use synapse_core::{
-    decode_i32_frame, encode_f32_frame, owned_cuda_engine_identity,
-    worker_engine_names::CUDA_WORKER_ENGINE, WorkerHello, WorkerHelloAck, WorkerRequest,
-    WorkerResponse, DEFAULT_MAX_FRAME_BYTES, WORKER_PROTOCOL_VERSION,
+    decode_i32_frame, encode_f32_frame, owned_cuda_engine_identity, WorkerHello, WorkerHelloAck,
+    WorkerRequest, WorkerResponse, DEFAULT_MAX_FRAME_BYTES, WORKER_PROTOCOL_VERSION,
 };
 #[cfg(feature = "cuda")]
 use synapse_core::{EmbedEngine, RuntimeConfig, TokenBatch, ValidatedArtifact};
