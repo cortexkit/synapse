@@ -62,12 +62,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use store::{
-    ApprovalCertificationHealth, AssuranceClass, CatalogSnapshot, CertificationKey,
-    CertificationRow, CertificationStatus, CheckpointItem, EvidenceRequirementsDivergence,
-    JobAdmission, JobAttemptClaim, JobRecord, KnobAssignmentRow, ModelAssetLocator,
-    ModelCatalogEntry, OwnedDecodeCertificationRow, OwnedDecodeMatchInputs, PerfRow,
-    ProbeWriteOutcome, RecommendedBatch, StorageHealthInputs, StoredModelConfig, SynapseStore,
-    SynapseStoreError, CERT_EVIDENCE_SCHEMA_REVISION, JOB_STATE_DONE, JOB_STATE_FAILED_PERMANENT,
+    ApprovalCertificationHealth, AssuranceClass, CatalogSnapshot, CertificationClass,
+    CertificationKey, CertificationRow, CertificationStatus, CheckpointItem,
+    ClassScopedCertificationRow, EvidenceRequirementsDivergence, JobAdmission, JobAttemptClaim,
+    JobRecord, KnobAssignmentRow, ModelAssetLocator, ModelCatalogEntry,
+    OwnedDecodeCertificationRow, OwnedDecodeMatchInputs, PerfRow, ProbeWriteOutcome,
+    RecommendedBatch, StorageHealthInputs, StoredModelConfig, SynapseStore, SynapseStoreError,
+    CERT_EVIDENCE_SCHEMA_REVISION, JOB_STATE_DONE, JOB_STATE_FAILED_PERMANENT,
     JOB_STATE_FAILED_TRANSIENT, JOB_STATE_PAUSED_NEEDS_REAUTH, JOB_STATE_QUEUED, JOB_STATE_RUNNING,
 };
 use subc_client_rs::{
@@ -9808,25 +9809,40 @@ fn store_probe_outcome_for_fingerprint(
     status: CertificationStatus,
     evidence: Value,
 ) -> Result<(), WireOperationError> {
-    let row = CertificationRow {
+    let certification_class = match model.task {
+        ModelTask::Embed => CertificationClass::Embedding,
+        ModelTask::Rerank => CertificationClass::Rerank,
+        ModelTask::Generate => {
+            return Err(WireOperationError::from_stable(
+                StableError::engine_crashed(Some(100)),
+                "generation probes cannot write embedding or rerank certification rows",
+            ))
+        }
+    };
+    let row = ClassScopedCertificationRow {
+        certification_class,
         assurance_class: AssuranceClass::Measured,
         status,
-        key: CertificationKey::Measured {
-            machine_profile_hash: state.machine_profile_hash.clone(),
-        },
-        numeric_profile_id: model.numeric_profile_id.clone(),
+        key_hash: state.machine_profile_hash.clone(),
+        machine_profile_hash: Some(state.machine_profile_hash.clone()),
+        remote_profile_hash: None,
+        identity_revision: None,
+        numeric_profile_id: Some(model.numeric_profile_id.clone()),
         fingerprint: fingerprint.clone(),
         certified_at_ms: now_ms(),
         os_build: state.machine_profile.os_build.clone(),
         module_generation: state.module_generation,
         evidence,
     };
-    state.store.store_cert_row(&row).map_err(|error| {
-        WireOperationError::from_stable(
-            StableError::engine_crashed(Some(100)),
-            format!("write certification row: {error}"),
-        )
-    })
+    state
+        .store
+        .store_class_scoped_cert_row(&row)
+        .map_err(|error| {
+            WireOperationError::from_stable(
+                StableError::engine_crashed(Some(100)),
+                format!("write certification row: {error}"),
+            )
+        })
 }
 
 fn store_probe_perf_row(

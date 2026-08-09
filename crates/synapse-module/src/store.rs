@@ -2872,7 +2872,7 @@ impl SynapseStore {
             conn.query_row(
                 &format!(
                     "{CERT_SELECT_SQL} WHERE assurance_class = 'measured'
-                     AND certification_class = 'measured_owned_decode'
+                     AND certification_class IN ('measured_owned_decode', 'embedding', 'rerank')
                      AND status = 'certified' AND key_hash = ?1 AND fingerprint = ?2"
                 ),
                 params![machine_profile_hash, &fingerprint.0],
