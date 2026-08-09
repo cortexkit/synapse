@@ -18,6 +18,8 @@ use thiserror::Error;
 use crate::PerfKnob;
 
 const NAMESPACE: &str = "synapse_module";
+const APPROVAL_MIGRATION_SEED_DIGEST: &str =
+    "a799f7e694991b0fd47902f9959c168990d5b0a3ec6ce2e7d6d3ac184bf80103";
 pub const JOB_STATE_QUEUED: &str = "queued";
 pub const JOB_STATE_RUNNING: &str = "running";
 pub const JOB_STATE_PAUSED_NEEDS_REAUTH: &str = "paused_needs_reauth";
@@ -580,6 +582,8 @@ pub enum SynapseStoreError {
     ProfileStateCorrupt(String),
     #[error("profile activation compare-and-set lost to another observer")]
     ProfileActivationLost,
+    #[error("approval migration state corrupt: {0}")]
+    ApprovalMigrationStateCorrupt(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -811,6 +815,33 @@ pub struct ApprovalMigrationResult {
     pub seed_revision: String,
     pub rows: usize,
     pub marker: String,
+}
+
+impl ApprovalMigrationResult {
+    /// Render the stable operator-facing migration result without making the
+    /// marker column carry protocol syntax.
+    pub fn rendering(&self) -> String {
+        match self.outcome.as_str() {
+            "applied" => format!(
+                "applied: seed_revision={} rows={} marker={}",
+                self.seed_revision, self.rows, self.marker
+            ),
+            "already_applied" => format!(
+                "already_applied: seed_revision={} rows={} marker={}",
+                self.seed_revision, self.rows, self.marker
+            ),
+            "invalid_seed" => format!(
+                "invalid_seed: reason={} marker={}",
+                self.marker, "unchanged"
+            ),
+            "unmappable_identity" => {
+                format!("unmappable_identity: {} marker=unchanged", self.marker)
+            }
+            "duplicate_identity" => format!("duplicate_identity: {} marker=unchanged", self.marker),
+            "transaction_failed" => format!("transaction_failed: {} marker=unchanged", self.marker),
+            _ => format!("{}: marker=unchanged", self.outcome),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1654,15 +1685,7 @@ impl SynapseStore {
                 outcome: "invalid_seed".to_string(),
                 seed_revision: seed_revision.to_string(),
                 rows: entries.len(),
-                marker: "unchanged".to_string(),
-            });
-        }
-        if entries.len() != 4 {
-            return Ok(ApprovalMigrationResult {
-                outcome: "invalid_seed".to_string(),
-                seed_revision: seed_revision.to_string(),
-                rows: entries.len(),
-                marker: "unchanged".to_string(),
+                marker: "entry_count_must_equal_four".to_string(),
             });
         }
         let mut identities = BTreeSet::new();
@@ -1672,7 +1695,10 @@ impl SynapseStore {
                     outcome: "duplicate_identity".to_string(),
                     seed_revision: seed_revision.to_string(),
                     rows: 0,
-                    marker: "unchanged".to_string(),
+                    marker: format!(
+                        "model_id={} decode_fingerprint={}",
+                        entry.model_id, entry.decode_fingerprint
+                    ),
                 });
             }
         }
@@ -1699,54 +1725,12 @@ impl SynapseStore {
                 ),
             });
         }
-        let seed_digest = hex::encode(Sha256::digest(SEED_SOURCE.as_bytes()));
+        let seed_digest = APPROVAL_MIGRATION_SEED_DIGEST.to_string();
+        self.validate_migration_state(seed_revision, schema_revision, &seed_digest, &entries)?;
         let now_ms = unix_now_ms();
-        let result = self.store.with_conn_fenced(|tx| {
-            let marker = tx
-                .query_row(
-                    "SELECT schema_revision, seed_digest, row_count
-                     FROM approval_migration_markers WHERE seed_revision = ?1",
-                    params![seed_revision],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, i64>(2)?,
-                        ))
-                    },
-                )
-                .optional()?;
-            if let Some((recorded_schema, recorded_digest, row_count)) = marker {
-                let outcome = if recorded_schema == schema_revision && recorded_digest == seed_digest
-                {
-                    "already_applied"
-                } else {
-                    "invalid_seed"
-                };
-                return Ok(ApprovalMigrationResult {
-                    outcome: outcome.to_string(),
-                    seed_revision: seed_revision.to_string(),
-                    rows: row_count as usize,
-                    marker: "unchanged".to_string(),
-                });
-            }
-            for entry in &entries {
-                let count: i64 = tx.query_row(
-                    "SELECT COUNT(*) FROM approvals
-                     WHERE model_id = ?1 AND decode_fingerprint = ?2",
-                    params![&entry.model_id, &entry.decode_fingerprint],
-                    |row| row.get(0),
-                )?;
-                if count != 0 {
-                    return Ok(ApprovalMigrationResult {
-                        outcome: "duplicate_identity".to_string(),
-                        seed_revision: seed_revision.to_string(),
-                        rows: 0,
-                        marker: "unchanged".to_string(),
-                    });
-                }
-            }
-            for entry in &entries {
+        let prepared_rows = match entries
+            .iter()
+            .map(|entry| {
                 let mut row = ApprovalRow {
                     schema_revision: schema_revision.to_string(),
                     model_id: entry.model_id.clone(),
@@ -1754,22 +1738,71 @@ impl SynapseStore {
                     enabled: entry.enabled,
                     grammar_enabled: entry.grammar_enabled,
                     disabled_reason: entry.disabled_reason.clone(),
-                    approved_by: entry
-                        .enabled
-                        .then(|| format!("migration:{seed_revision}")),
+                    approved_by: entry.enabled.then(|| format!("migration:{seed_revision}")),
                     approved_at_ms: entry.enabled.then_some(now_ms),
                     updated_at_ms: now_ms,
-                    evidence_requirements_revision:
-                        APPROVAL_EVIDENCE_REQUIREMENTS_REVISION.to_string(),
+                    evidence_requirements_revision: APPROVAL_EVIDENCE_REQUIREMENTS_REVISION
+                        .to_string(),
                     semantic_digest: String::new(),
                     row_id: 0,
                     generation: 0,
-                    fencing_metadata: serde_json::json!({"operation": "approval_migration", "seed_revision": seed_revision}),
+                    fencing_metadata: serde_json::json!({
+                        "operation": "approval_migration",
+                        "seed_revision": seed_revision
+                    }),
                 };
-                row.semantic_digest = row.expected_digest().map_err(to_sql_error)?;
-                let fencing_metadata = serde_json::to_string(&row.fencing_metadata).map_err(|error| {
-                    rusqlite::Error::ToSqlConversionFailure(Box::new(error))
-                })?;
+                row.semantic_digest = row.expected_digest()?;
+                validate_approval(&row, true)?;
+                Ok(row)
+            })
+            .collect::<Result<Vec<_>, SynapseStoreError>>()
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                return Ok(ApprovalMigrationResult {
+                    outcome: "invalid_seed".to_string(),
+                    seed_revision: seed_revision.to_string(),
+                    rows: 0,
+                    marker: format!("digest_verification:{error}"),
+                })
+            }
+        };
+        let result = self.store.with_conn_fenced(|tx| {
+            let marker = tx
+                .query_row(
+                    "SELECT 1 FROM approval_migration_markers WHERE seed_revision = ?1",
+                    params![seed_revision],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+            if marker.is_some() {
+                return Ok(ApprovalMigrationResult {
+                    outcome: "already_applied".to_string(),
+                    seed_revision: seed_revision.to_string(),
+                    rows: entries.len(),
+                    marker: "unchanged".to_string(),
+                });
+            }
+            let existing = tx
+                .prepare(
+                    "SELECT model_id, decode_fingerprint FROM approvals
+                     ORDER BY model_id ASC, decode_fingerprint ASC LIMIT 1",
+                )?
+                .query_row([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .optional()?;
+            if let Some((model_id, decode_fingerprint)) = existing {
+                return Ok(ApprovalMigrationResult {
+                    outcome: "duplicate_identity".to_string(),
+                    seed_revision: seed_revision.to_string(),
+                    rows: 0,
+                    marker: format!("model_id={model_id} decode_fingerprint={decode_fingerprint}"),
+                });
+            }
+            for row in &prepared_rows {
+                let fencing_metadata = serde_json::to_string(&row.fencing_metadata)
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
                 tx.execute(
                     "INSERT INTO approvals (
                          schema_revision, model_id, decode_fingerprint, enabled,
@@ -1815,13 +1848,139 @@ impl SynapseStore {
         });
         match result {
             Ok(result) => Ok(result),
-            Err(_) => Ok(ApprovalMigrationResult {
+            Err(_error) => Ok(ApprovalMigrationResult {
                 outcome: "transaction_failed".to_string(),
                 seed_revision: seed_revision.to_string(),
                 rows: 0,
-                marker: "unchanged".to_string(),
+                marker: "phase=commit".to_string(),
             }),
         }
+    }
+
+    fn validate_migration_state(
+        &self,
+        seed_revision: &str,
+        schema_revision: &str,
+        seed_digest: &str,
+        entries: &[ApprovalMigrationSeedEntry],
+    ) -> Result<(), SynapseStoreError> {
+        let marker = self.store.with_conn(|conn| {
+            conn.query_row(
+                "SELECT schema_revision, seed_digest, row_count
+                 FROM approval_migration_markers WHERE seed_revision = ?1",
+                params![seed_revision],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()
+        })?;
+        let Some((recorded_schema, recorded_digest, row_count)) = marker else {
+            return Ok(());
+        };
+        if recorded_schema != schema_revision
+            || recorded_digest != seed_digest
+            || row_count != entries.len() as i64
+            || row_count <= 0
+        {
+            return Err(SynapseStoreError::ApprovalMigrationStateCorrupt(
+                format!(
+                    "seed_revision={seed_revision} schema_revision={recorded_schema} row_count={row_count}"
+                ),
+            ));
+        }
+        let rows = self.store.with_conn(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT row_id, schema_revision, model_id, decode_fingerprint, enabled,
+                        grammar_enabled, disabled_reason, approved_by, approved_at_ms,
+                        updated_at_ms, evidence_requirements_revision, semantic_digest,
+                        generation, fencing_metadata
+                 FROM approvals ORDER BY model_id ASC, decode_fingerprint ASC",
+            )?;
+            let rows = statement
+                .query_map([], approval_from_row)?
+                .collect::<Result<Vec<_>, _>>();
+            rows
+        })?;
+        if rows.len() < entries.len()
+            || entries.iter().any(|entry| {
+                !rows.iter().any(|row| {
+                    row.model_id == entry.model_id
+                        && row.decode_fingerprint == entry.decode_fingerprint
+                })
+            })
+        {
+            return Err(SynapseStoreError::ApprovalMigrationStateCorrupt(
+                "migration marker acknowledges rows that are not present".to_string(),
+            ));
+        }
+        for row in rows {
+            validate_approval(&row, true).map_err(|error| {
+                SynapseStoreError::ApprovalMigrationStateCorrupt(error.to_string())
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Validate the durable acknowledgement before any serving lookup. A
+    /// marker is optional for stores that have not run migration; once present,
+    /// malformed marker metadata or missing acknowledged rows fail closed.
+    fn validate_persisted_migration_state(&self) -> Result<(), SynapseStoreError> {
+        let marker = self.store.with_conn(|conn| {
+            conn.query_row(
+                "SELECT schema_revision, seed_digest, row_count
+                 FROM approval_migration_markers
+                 WHERE seed_revision = 'owned-decode-approval-migration-v1'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()
+        })?;
+        let Some((schema_revision, seed_digest, row_count)) = marker else {
+            return Ok(());
+        };
+        let expected_digest = APPROVAL_MIGRATION_SEED_DIGEST;
+        if schema_revision != APPROVAL_SCHEMA_REVISION
+            || seed_digest != expected_digest
+            || row_count != 4
+        {
+            return Err(SynapseStoreError::ApprovalMigrationStateCorrupt(
+                "migration acknowledgement metadata is invalid".to_string(),
+            ));
+        }
+        let rows = self.approvals_without_migration_check()?;
+        if rows.len() < row_count as usize {
+            return Err(SynapseStoreError::ApprovalMigrationStateCorrupt(
+                "migration acknowledgement rows are missing".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn approvals_without_migration_check(&self) -> Result<Vec<ApprovalRow>, SynapseStoreError> {
+        Ok(self.store.with_conn(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT row_id, schema_revision, model_id, decode_fingerprint, enabled,
+                        grammar_enabled, disabled_reason, approved_by, approved_at_ms,
+                        updated_at_ms, evidence_requirements_revision, semantic_digest,
+                        generation, fencing_metadata
+                 FROM approvals ORDER BY model_id ASC, decode_fingerprint ASC",
+            )?;
+            let rows = statement
+                .query_map([], approval_from_row)?
+                .collect::<Result<Vec<_>, _>>();
+            rows
+        })?)
     }
 
     // Staged storage API consumed by the epic's runtime slice; remove this allow there.
@@ -1831,6 +1990,7 @@ impl SynapseStore {
         model_id: &str,
         decode_fingerprint: &str,
     ) -> Result<Option<ApprovalRow>, SynapseStoreError> {
+        self.validate_persisted_migration_state()?;
         let row = self.store.with_conn(|conn| {
             conn.query_row(
                 "SELECT row_id, schema_revision, model_id, decode_fingerprint, enabled,
@@ -1887,6 +2047,7 @@ impl SynapseStore {
     // Staged storage API consumed by the epic's runtime slice; remove this allow there.
     #[allow(dead_code)]
     pub fn approvals(&self) -> Result<Vec<ApprovalRow>, SynapseStoreError> {
+        self.validate_persisted_migration_state()?;
         let rows = self.store.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT row_id, schema_revision, model_id, decode_fingerprint, enabled,
@@ -1986,7 +2147,7 @@ impl SynapseStore {
             drop(stmt);
             let mut changed = 0;
             for mut row in rows {
-                if row.enabled {
+                if row.enabled || row.disabled_reason.as_deref() != Some(reason) {
                     row.enabled = false;
                     row.disabled_reason = Some(reason.to_string());
                     row.updated_at_ms = updated_at_ms;
@@ -2429,6 +2590,7 @@ impl SynapseStore {
         revisioned_machine_profile_hash: &str,
         profile_activation_epoch: u64,
     ) -> Result<Option<OwnedDecodeAdmission>, SynapseStoreError> {
+        self.validate_persisted_migration_state()?;
         if profile_activation_epoch == 0 {
             return Ok(None);
         }
@@ -2498,6 +2660,7 @@ impl SynapseStore {
         &self,
         inputs: &OwnedDecodeMatchInputs,
     ) -> Result<Option<OwnedDecodeAdmission>, SynapseStoreError> {
+        self.validate_persisted_migration_state()?;
         if inputs.profile_activation_epoch == 0
             || inputs.evidence_schema_revision != CERT_EVIDENCE_SCHEMA_REVISION
             || inputs.g_dec_manifest_revision != G_DEC_MANIFEST_REVISION
@@ -6150,6 +6313,16 @@ mod tests {
                 .len()
                 == 64
         );
+        assert_eq!(store.emergency_rollback("fleet emergency", 50).unwrap(), 1);
+        let rolled_back = store
+            .get_approval("owned-model", &fingerprint)
+            .unwrap()
+            .expect("rollback leaves the row loadable");
+        assert!(!rolled_back.enabled);
+        assert_eq!(
+            rolled_back.disabled_reason.as_deref(),
+            Some("fleet emergency")
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -6201,6 +6374,25 @@ mod tests {
             .unwrap();
         assert_eq!(already_applied.outcome, "already_applied");
         assert_eq!(store.approvals().unwrap().len(), 4);
+
+        store
+            .store
+            .with_conn_fenced(|tx| {
+                tx.execute(
+                    "UPDATE approval_migration_markers SET row_count = 3
+                     WHERE seed_revision = 'owned-decode-approval-migration-v1'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(matches!(
+            store.get_approval(
+                "qwen3-0.6b-decode-f16",
+                "8bcb6dfc1bd55a38a56b5a6931132f428687e064104d106c2cc5efb898f80feb",
+            ),
+            Err(SynapseStoreError::ApprovalMigrationStateCorrupt(_))
+        ));
         let _ = std::fs::remove_dir_all(root);
     }
 

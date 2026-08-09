@@ -5,7 +5,7 @@
 //! outstanding measurement commitments (G-DEC-11, and the scheduler-dependent
 //! portion of G-DEC-12) are reported `Blocked` with the blocker named, never
 //! `Skipped`. [`release_ready`] is false while any gate is blocked or failed,
-//! which keeps production cutover disabled until the committed scheduler
+//! which keeps production owned serving disabled until the committed scheduler
 //! manifest and all required evidence pass.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -13,9 +13,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use synapse_core::{worker_engine_names::DECODE_WORKER_ENGINE, Fingerprint};
 
-use crate::owned_decode_certification::cutover::{
-    cutover_inputs_from_evidence, CutoverEvidenceInputs,
-};
 use crate::owned_decode_certification::fixture_groups::{
     GroupOutcome, CONSTRAINED_NEGATIVE_GROUP, CONSTRAINED_POSITIVE_GROUP, REQUEST_PROCESSING_GROUP,
     SCHEDULER_CONTINUITY_GROUP,
@@ -23,6 +20,7 @@ use crate::owned_decode_certification::fixture_groups::{
 use crate::owned_decode_certification::fixtures::{
     parity_battery, OracleStore, ParityFixture, PARITY_GROUP,
 };
+use crate::owned_decode_certification::migration::wire_bindings_are_literal;
 use crate::owned_decode_certification::probe::{compare_streams, CertificationProbe, DecodeProbe};
 use crate::owned_decode_certification::scheduler_evidence::{
     ingest_scheduler_evidence, scheduler_evidence_committed, SchedulerEvidenceStatus,
@@ -39,7 +37,7 @@ use crate::owned_decode_routing::identity::{
     ActivationDType, ConstraintRuntimeIdentity, DecodeIdentityInputs, ProcessingIdentityInputs,
     Q8Identity, RuntimeConfigManifest, WeightQuant,
 };
-use crate::owned_decode_routing::lane::{cutover_enabled, CutoverInputs, CutoverRecord};
+use crate::owned_decode_routing::lane::{serving_predicate, ServingPredicateInputs};
 use crate::owned_decode_routing::q8ingest::{Q8IngestRegistry, TrustState};
 use crate::owned_decode_routing::{
     CatalogEntry, DecodeDispatch, DispatchedCommand, ExecutionSuccess, OwnedDecodeRouter,
@@ -602,8 +600,8 @@ impl GateRunner {
         ))
     }
 
-    /// G-DEC-05: certification and D-009. Certification rows record for both
-    /// families through the probe; the cutover predicate stays false while the
+    /// G-DEC-05: certification and approval-backed serving. Certification rows record for both
+    /// families through the probe; the serving predicate stays false while the
     /// scheduler evidence is blocked and becomes true when every input holds.
     pub fn gate_05_certification(
         &self,
@@ -659,62 +657,49 @@ impl GateRunner {
             );
         }
 
-        // The cutover predicate must stay false while the scheduler evidence is
+        // The serving predicate must stay false while scheduler evidence is
         // blocked, even with certification and every other input satisfied.
         let bindings = &self.manifests.wire_bindings;
-        let record = CutoverRecord {
-            machine_profile_hash: "gate-runner-profile".to_string(),
-            enabled_catalog_entry_ids: Vec::new(),
-            decode_fingerprints: certified_fingerprints.clone(),
-            processing_fingerprints: Vec::new(),
-            constrained_runtime_identities: Vec::new(),
-            runtime_config_digest: "gate-runner-runtime".to_string(),
-            fixture_registry_revision: self.manifests.fixture_registry.manifest_revision.clone(),
-            context_bucket_manifest_revision: self
-                .manifests
-                .context_buckets
-                .manifest_revision
-                .clone(),
-            scheduler_manifest_revision: self.manifests.scheduler.manifest_revision.clone(),
-            certification_evidence_ids: cert_ids.clone(),
-            wire_error_binding_revision: bindings.manifest_revision.clone(),
-            acceptance_gate_evidence: Vec::new(),
-            grammar_enabled: false,
-        };
-        let inputs = cutover_inputs_from_evidence(&CutoverEvidenceInputs {
-            cert_store: &store,
-            machine_profile_hash: "gate-runner-profile",
-            decode_fingerprint: &certified_fingerprints[0],
-            constraint_runtime_identity: None,
+        let inputs = ServingPredicateInputs {
+            approval_enabled: true,
+            approval_identity_matches: true,
+            current_profile_matches: true,
+            current_epoch_valid: true,
+            certification_matches: true,
+            evidence_revisions_compatible: true,
+            gates_complete: true,
+            processing_fingerprint_matches: true,
+            runtime_config_digest_matches: true,
+            worker_path_matches: true,
+            constrained_identities_match: true,
             artifacts_trusted: true,
             identities_installed: true,
             quarantined: false,
-            wire_bindings: bindings,
-            gates_passed: true,
-            scheduler_status,
-        });
+            wire_bindings_literal: wire_bindings_are_literal(bindings),
+            scheduler_evidence_committed: scheduler_evidence_committed(scheduler_status),
+        };
         if scheduler_evidence_committed(scheduler_status) {
-            if !cutover_enabled(&record, &inputs) {
+            if !serving_predicate(&inputs) {
                 return (
                     GateStatus::Failed {
-                        reason: "cutover predicate must hold when every input is satisfied"
+                        reason: "serving predicate must hold when every input is satisfied"
                             .to_string(),
                     },
                     cert_ids,
                 );
             }
-            evidence.push("cutover predicate holds with committed scheduler evidence".to_string());
-        } else if cutover_enabled(&record, &inputs) {
+            evidence.push("serving predicate holds with committed scheduler evidence".to_string());
+        } else if serving_predicate(&inputs) {
             return (
                 GateStatus::Failed {
-                    reason: "cutover predicate must stay false while scheduler evidence is blocked"
+                    reason: "serving predicate must stay false while scheduler evidence is blocked"
                         .to_string(),
                 },
                 cert_ids,
             );
         } else {
             evidence.push(
-                "cutover predicate stays false while scheduler evidence is blocked".to_string(),
+                "serving predicate stays false while scheduler evidence is blocked".to_string(),
             );
         }
 
@@ -899,47 +884,17 @@ impl GateRunner {
             Q8IngestRegistry::new(),
             Box::new(store),
         );
-        // The cutover flag is not set directly: it is evaluated from a D-009
-        // record and predicate inputs whose conditions all hold, modeling a
-        // profile legitimately enabled for the owned lane.
-        let record = CutoverRecord {
-            machine_profile_hash: profile.to_string(),
-            enabled_catalog_entry_ids: vec![entry.entry_id.clone()],
-            decode_fingerprints: vec![fp.clone()],
-            processing_fingerprints: Vec::new(),
-            constrained_runtime_identities: Vec::new(),
-            runtime_config_digest: "gate-runner-runtime".to_string(),
-            fixture_registry_revision: self.manifests.fixture_registry.manifest_revision.clone(),
-            context_bucket_manifest_revision: self
-                .manifests
-                .context_buckets
-                .manifest_revision
-                .clone(),
-            scheduler_manifest_revision: self.manifests.scheduler.manifest_revision.clone(),
-            certification_evidence_ids: Vec::new(),
-            wire_error_binding_revision: self.manifests.wire_bindings.manifest_revision.clone(),
-            acceptance_gate_evidence: vec!["G-DEC-07 cutover evaluation".to_string()],
-            grammar_enabled: false,
-        };
-        let inputs = CutoverInputs {
-            artifacts_trusted: true,
-            identities_installed: true,
-            unconstrained_certified: true,
-            constrained_certified: true,
-            quarantined: false,
-            wire_bindings_literal: true,
-            gates_passed: true,
-            scheduler_evidence_committed: true,
-        };
-        let env = RoutingEnvironment::with_cutover_evaluated(
+        // The environment consumes the approval-backed serving result. The
+        // fixture store supplies matching evidence; no retired record is loaded.
+        let env = RoutingEnvironment::with_serving_evaluated(
             profile,
             false,
+            false,
+            true,
             false,
             None,
             BTreeSet::new(),
             None,
-            &record,
-            &inputs,
         );
         let request: crate::owned_decode_routing::request::OneshotRequest =
             serde_json::from_value(serde_json::json!({
@@ -961,7 +916,7 @@ impl GateRunner {
         };
         if response.lane != crate::owned_decode_routing::lane::LaneKind::OwnedDecode {
             return GateStatus::Failed {
-                reason: "certified cutover-enabled request must select the owned lane".to_string(),
+                reason: "certified serving-enabled request must select the owned lane".to_string(),
             };
         }
         let provenance = &response.provenance;
@@ -1309,7 +1264,7 @@ impl GateRunner {
 
         match statuses.get(&GateId::GDec11) {
             Some(GateStatus::Blocked { .. }) | None => GateStatus::Blocked {
-                reason: "scheduler-dependent release gate: G-DEC-11 is blocked, so D-009 and release claims remain blocked".to_string(),
+                reason: "scheduler-dependent release gate: G-DEC-11 is blocked, so owned-serving and release claims remain blocked".to_string(),
             },
             Some(GateStatus::Failed { reason }) => GateStatus::Failed {
                 reason: format!("G-DEC-11 failed: {reason}"),

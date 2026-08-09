@@ -2,7 +2,7 @@
 //! lane (`engine=owned-metal-decode`).
 //!
 //! This module is the single source of truth for the manifest shapes that gate
-//! the D-009 cutover. It defines the serde schemas for every checked-in
+//! the owned-decode serving and certification contracts. It defines the serde schemas for every checked-in
 //! artifact under `crates/synapse-module/owned-decode-manifests/` and the
 //! validation rules the specification attaches to them. Production code and CI
 //! probes load manifests through [`load_manifest_dir`], which parses each

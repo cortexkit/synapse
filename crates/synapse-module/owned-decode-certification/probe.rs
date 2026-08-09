@@ -237,7 +237,7 @@ pub struct CertificationEvidence {
 }
 
 impl CertificationEvidence {
-    /// Stable evidence ID used by cutover records and release evidence.
+    /// Stable evidence ID used by serving records and release evidence.
     pub fn evidence_id(&self) -> String {
         let kind = match &self.constraint_runtime_identity {
             Some(cri) => format!("constrained:{cri}"),

@@ -89,7 +89,7 @@ impl CertificationStore {
         });
     }
 
-    /// Remove certification rows for a fingerprint (cutover invalidation).
+    /// Remove certification rows for a fingerprint after an identity change.
     pub fn invalidate(&mut self, machine_profile_hash: &str, decode_fingerprint: &Fingerprint) {
         self.unconstrained.retain(|key| {
             !(key.machine_profile_hash == machine_profile_hash

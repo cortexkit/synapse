@@ -1,4 +1,4 @@
-//! Lane selection, fallback, and the D-009 cutover predicate.
+//! Lane selection, fallback, and the approval-backed serving predicate.
 //!
 //! `lane_selection_and_fallback` is the sole fallback authority. Selection runs
 //! before admission and evaluates fingerprint constraints against the lane
@@ -40,9 +40,9 @@ pub enum LaneKind {
 pub enum FallbackReason {
     /// A pre-dispatch owned-lane refusal from the fallback-eligible six.
     OwnedRefusal(OwnedDecodeError),
-    /// The D-009 cutover is not enabled for this profile, so substitutable
+    /// The approval-backed serving predicate is false, so substitutable
     /// unconstrained requests default to the configured llama lane.
-    CutoverDisabled,
+    ServingDisabled,
 }
 
 /// A refusal that routing can emit. Either an owned-decode/grammar error, the
@@ -75,8 +75,8 @@ pub enum OwnedEvaluation {
     Selectable,
     /// The owned lane refused with a specific pre-dispatch (or other) error.
     Refused(OwnedDecodeError),
-    /// The D-009 cutover is not enabled for this profile; owned is not the
-    /// preferred lane.
+    /// Owned serving is not enabled for this approval and current evidence;
+    /// owned is not the preferred lane.
     NotPreferred,
 }
 
@@ -209,7 +209,7 @@ pub fn select_lane(ctx: &LaneSelectionContext<'_>) -> LaneOutcome {
         OwnedEvaluation::Selectable => LaneOutcome::Owned,
         OwnedEvaluation::NotPreferred => match &ctx.llama {
             Some(_) => LaneOutcome::Llama {
-                fallback_reason: FallbackReason::CutoverDisabled,
+                fallback_reason: FallbackReason::ServingDisabled,
             },
             None => LaneOutcome::Refused {
                 error: RoutingRefusal::Owned(OwnedDecodeError::NotCertified),
@@ -241,55 +241,8 @@ pub fn select_lane(ctx: &LaneSelectionContext<'_>) -> LaneOutcome {
 }
 
 // ---------------------------------------------------------------------------
-// D-009 cutover predicate
+// Approval-backed serving predicate
 // ---------------------------------------------------------------------------
-
-/// The checked-in D-009 cutover record for one machine profile.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CutoverRecord {
-    pub machine_profile_hash: String,
-    pub enabled_catalog_entry_ids: Vec<String>,
-    pub decode_fingerprints: Vec<Fingerprint>,
-    pub processing_fingerprints: Vec<Fingerprint>,
-    /// Constrained runtime identities, present when grammar is enabled.
-    #[serde(default)]
-    pub constrained_runtime_identities: Vec<String>,
-    pub runtime_config_digest: String,
-    pub fixture_registry_revision: String,
-    pub context_bucket_manifest_revision: String,
-    pub scheduler_manifest_revision: String,
-    pub certification_evidence_ids: Vec<String>,
-    pub wire_error_binding_revision: String,
-    /// Completed acceptance-gate evidence set (G-DEC-01..12).
-    pub acceptance_gate_evidence: Vec<String>,
-    /// Whether grammar (constrained decoding) is enabled for this profile.
-    #[serde(default)]
-    pub grammar_enabled: bool,
-}
-
-/// Runtime inputs to the cutover predicate, evaluated immediately before and
-/// after applying the record.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CutoverInputs {
-    /// All listed artifacts are trusted.
-    pub artifacts_trusted: bool,
-    /// The exact runtime and processing identities are installed.
-    pub identities_installed: bool,
-    /// Unconstrained certification rows are valid for this profile.
-    pub unconstrained_certified: bool,
-    /// Applicable constrained certification rows are valid for this profile.
-    pub constrained_certified: bool,
-    /// The quarantine key is currently quarantined.
-    pub quarantined: bool,
-    /// The wire error bindings contain literal IDs (not symbolic placeholders).
-    pub wire_bindings_literal: bool,
-    /// Every applicable G-DEC-01..12 consequence has passed.
-    pub gates_passed: bool,
-    /// The final scheduler numeric manifest is committed and executed
-    /// (G-DEC-11 and the scheduler-dependent portion of G-DEC-12).
-    pub scheduler_evidence_committed: bool,
-}
 
 /// All inputs that are independent of SQLite row loading but still belong to
 /// the owned-decode serving predicate. Keeping these checks in one pure
@@ -346,22 +299,6 @@ pub trait AdmissionEpochReader: Send + Sync {
 #[must_use]
 pub fn effective_grammar_enabled(runtime_enabled: bool, approval_enabled: bool) -> bool {
     runtime_enabled && approval_enabled
-}
-
-/// Evaluate the fail-closed owned-decode cutover predicate. Owned decode may
-/// become the preferred lane only when every required condition holds; if
-/// scheduler evidence or another required certification condition is blocked or
-/// incomplete, owned decode remains disabled.
-pub fn cutover_enabled(record: &CutoverRecord, inputs: &CutoverInputs) -> bool {
-    let constrained_ok = !record.grammar_enabled || inputs.constrained_certified;
-    inputs.artifacts_trusted
-        && inputs.identities_installed
-        && inputs.unconstrained_certified
-        && constrained_ok
-        && !inputs.quarantined
-        && inputs.wire_bindings_literal
-        && inputs.gates_passed
-        && inputs.scheduler_evidence_committed
 }
 
 #[cfg(test)]
@@ -746,19 +683,19 @@ mod tests {
     }
 
     #[test]
-    fn cutover_disabled_routes_substitutable_to_llama() {
+    fn serving_disabled_routes_substitutable_to_llama() {
         let request = unconstrained_request();
         let outcome = select_lane(&ctx(&request, OwnedEvaluation::NotPreferred, Some(llama())));
         assert_eq!(
             outcome,
             LaneOutcome::Llama {
-                fallback_reason: FallbackReason::CutoverDisabled
+                fallback_reason: FallbackReason::ServingDisabled
             }
         );
     }
 
     #[test]
-    fn cutover_disabled_without_llama_refuses_not_certified() {
+    fn serving_disabled_without_llama_refuses_not_certified() {
         let request = unconstrained_request();
         let outcome = select_lane(&ctx(&request, OwnedEvaluation::NotPreferred, None));
         assert_eq!(
@@ -775,102 +712,5 @@ mod tests {
             LaneOutcome::Refused { error, .. } => error.wire_id(),
             _ => panic!("not a refusal"),
         }
-    }
-
-    fn cutover_record() -> CutoverRecord {
-        CutoverRecord {
-            machine_profile_hash: "profile-a".to_string(),
-            enabled_catalog_entry_ids: vec!["qwen3-f16".to_string()],
-            decode_fingerprints: vec![fp("owned-decode")],
-            processing_fingerprints: vec![fp("owned-proc")],
-            constrained_runtime_identities: vec![],
-            runtime_config_digest: "rcd".to_string(),
-            fixture_registry_revision: "decode-fixture-registry-v1".to_string(),
-            context_bucket_manifest_revision: "decode-context-buckets-v1".to_string(),
-            scheduler_manifest_revision: "decode-sched-manifest-v1".to_string(),
-            certification_evidence_ids: vec!["cert-1".to_string()],
-            wire_error_binding_revision: "owned-decode-wire-error-bindings-v1".to_string(),
-            acceptance_gate_evidence: vec!["G-DEC-01".to_string()],
-            grammar_enabled: false,
-        }
-    }
-
-    fn all_true_inputs() -> CutoverInputs {
-        CutoverInputs {
-            artifacts_trusted: true,
-            identities_installed: true,
-            unconstrained_certified: true,
-            constrained_certified: true,
-            quarantined: false,
-            wire_bindings_literal: true,
-            gates_passed: true,
-            scheduler_evidence_committed: true,
-        }
-    }
-
-    #[test]
-    fn cutover_enabled_requires_every_condition() {
-        let record = cutover_record();
-        assert!(cutover_enabled(&record, &all_true_inputs()));
-
-        // Each false condition independently disables cutover.
-        let mut inputs = all_true_inputs();
-        inputs.artifacts_trusted = false;
-        assert!(!cutover_enabled(&record, &inputs));
-
-        let mut inputs = all_true_inputs();
-        inputs.quarantined = true;
-        assert!(!cutover_enabled(&record, &inputs));
-
-        let mut inputs = all_true_inputs();
-        inputs.wire_bindings_literal = false;
-        assert!(!cutover_enabled(&record, &inputs));
-
-        let mut inputs = all_true_inputs();
-        inputs.scheduler_evidence_committed = false;
-        assert!(
-            !cutover_enabled(&record, &inputs),
-            "scheduler gate blocks enablement"
-        );
-
-        let mut inputs = all_true_inputs();
-        inputs.unconstrained_certified = false;
-        assert!(!cutover_enabled(&record, &inputs));
-    }
-
-    #[test]
-    fn cutover_grammar_enabled_requires_constrained_certification() {
-        let mut record = cutover_record();
-        record.grammar_enabled = true;
-
-        let mut inputs = all_true_inputs();
-        inputs.constrained_certified = false;
-        assert!(!cutover_enabled(&record, &inputs));
-
-        inputs.constrained_certified = true;
-        assert!(cutover_enabled(&record, &inputs));
-    }
-
-    #[test]
-    fn cutover_record_rejects_unknown_field() {
-        // fail-closed posture: an unknown field in a cutover record is
-        // rejected at parse time rather than silently dropped.
-        let json = serde_json::json!({
-            "machine_profile_hash": "profile-a",
-            "enabled_catalog_entry_ids": ["qwen3-f16"],
-            "decode_fingerprints": ["owned-decode"],
-            "processing_fingerprints": ["owned-proc"],
-            "constrained_runtime_identities": [],
-            "runtime_config_digest": "rcd",
-            "fixture_registry_revision": "decode-fixture-registry-v1",
-            "context_bucket_manifest_revision": "decode-context-buckets-v1",
-            "scheduler_manifest_revision": "decode-sched-manifest-v1",
-            "certification_evidence_ids": ["cert-1"],
-            "wire_error_binding_revision": "owned-decode-wire-error-bindings-v1",
-            "acceptance_gate_evidence": ["G-DEC-01"],
-            "grammar_enabled": false,
-            "unknown_field": "should be rejected",
-        });
-        assert!(serde_json::from_value::<CutoverRecord>(json).is_err());
     }
 }

@@ -11,19 +11,17 @@ use std::{
 
 // Provider adapters stay module-private so credentials and remote identity checks
 // cannot be bypassed by a second public call path.
-/// Certification probes, immutable fixture batteries and oracles, scheduler
-/// evidence ingestion, the checked-in D-009 per-machine-profile cutover
-/// records (the spec's explicit routing-change record that enables the owned
-/// lane), and the runner for the spec's twelve acceptance gates G-DEC-01..12,
-/// all for the owned-metal-decode lane. The source lives under
+/// Certification probes, immutable fixture batteries and oracles,
+/// scheduler-evidence ingestion, the approval-backed serving predicate, and
+/// validation of all twelve owned-metal-decode release requirements. The source
+/// lives under
 /// `crates/synapse-module/owned-decode-certification/`; the `#[path]`
 /// attribute wires that directory into the crate as a module.
 #[path = "../owned-decode-certification/mod.rs"]
 pub mod owned_decode_certification;
 /// Module-owned schemas and checked-in records for the production owned-decode
-/// lane. Loaded by catalog validation, CI probes, and the production cutover
-/// predicate that gates enabling the owned-metal-decode lane per machine
-/// profile. See `owned_decode_contracts::load_manifest_dir`.
+/// lane. Loaded by catalog validation and CI probes. See
+/// `owned_decode_contracts::load_manifest_dir`.
 pub mod owned_decode_contracts;
 /// Grammar compilation and the dedicated DECODE scheduler for the owned-decode
 /// lane: JSON-schema-subset parsing and validation, checked-in grammar limits,
@@ -36,8 +34,8 @@ pub mod owned_decode_contracts;
 pub mod owned_decode_grammar_scheduler;
 /// Module-side request processing and lane routing for the owned-metal-decode
 /// lane: catalog validation, family registration, identity computation, Q8
-/// ingest orchestration, certification access, lane selection and fallback, the
-/// machine-profile predicate that decides when to cut over to this lane,
+/// ingest orchestration, certification access, approval-backed lane selection
+/// and fallback,
 /// provenance, and end-to-end `microllm.oneshot` orchestration. The source lives
 /// under `crates/synapse-module/owned-decode-routing/`; the `#[path]` attribute
 /// wires that directory into the crate as a module.
@@ -45,6 +43,7 @@ pub mod owned_decode_grammar_scheduler;
 pub mod owned_decode_routing;
 #[allow(dead_code)]
 mod remote;
+mod rollback;
 mod store;
 pub mod worker_host;
 
@@ -332,6 +331,27 @@ struct MethodEnvelope {
     params: Value,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApprovalMigrationParams {
+    seed_revision: String,
+    schema_revision: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApprovalDisableParams {
+    model_id: String,
+    decode_fingerprint: String,
+    reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApprovalEmergencyRollbackParams {
+    reason: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 struct WireOperationError {
     code: String,
@@ -608,10 +628,6 @@ impl Default for ProbeConfig {
 struct DevConfig {
     #[serde(default, alias = "enable_alias_admin")]
     alias_admin_enabled: bool,
-    /// Retained only so older development config files remain decodable. Runtime
-    /// admission ignores this field and requires store-backed evidence.
-    #[serde(default, rename = "owned_decode_cutover_for_test")]
-    _owned_decode_cutover_for_test: bool,
 }
 
 fn default_inline_max_items() -> usize {
@@ -2419,6 +2435,11 @@ async fn dispatch_request(state: Arc<ModuleState>, request: MethodEnvelope) -> H
         "alias.retract" => alias_retract(state, request.params).await,
         "alias.declare" => alias_declare(state, request.params).await,
         "admission.status" => admission_status(state).await,
+        "approvals.migrate_owned_decode" => {
+            approvals_migrate_owned_decode(state, request.params).await
+        }
+        "approvals.disable" => approval_disable(state, request.params).await,
+        "approvals.emergency_rollback" => approvals_emergency_rollback(state, request.params).await,
         "model.status" => model_status(state, request.params).await,
         other => channel_error(
             "unknown_method",
@@ -10397,6 +10418,80 @@ async fn aliases_check_index(state: Arc<ModuleState>, params: Value) -> HandlerO
     }))
 }
 
+async fn approvals_migrate_owned_decode(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
+    let params: ApprovalMigrationParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(error) => {
+            return channel_error(
+                "invalid_request",
+                format!("invalid approval migration params: {error}"),
+            )
+        }
+    };
+    match state
+        .store
+        .migrate_owned_decode_approvals(&params.seed_revision, &params.schema_revision)
+    {
+        Ok(result) => result_outcome(json!({
+            "outcome": result.outcome,
+            "seed_revision": result.seed_revision,
+            "rows": result.rows,
+            "marker": result.marker,
+            "rendering": result.rendering(),
+        })),
+        Err(SynapseStoreError::ApprovalMigrationStateCorrupt(reason)) => {
+            channel_error("approval_migration_state_corrupt", reason)
+        }
+        Err(error) => channel_error("store_failure", error.to_string()),
+    }
+}
+
+async fn approval_disable(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
+    let params: ApprovalDisableParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(error) => {
+            return channel_error(
+                "invalid_request",
+                format!("invalid approval disable params: {error}"),
+            )
+        }
+    };
+    match rollback::disable_exact_approval(
+        &state.store,
+        &params.model_id,
+        &params.decode_fingerprint,
+        &params.reason,
+        now_ms(),
+    ) {
+        Ok(row) => result_outcome(json!({
+            "model_id": row.model_id,
+            "decode_fingerprint": row.decode_fingerprint,
+            "enabled": row.enabled,
+            "disabled_reason": row.disabled_reason,
+        })),
+        Err(error) => channel_error("store_failure", error.to_string()),
+    }
+}
+
+async fn approvals_emergency_rollback(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
+    let params: ApprovalEmergencyRollbackParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(error) => {
+            return channel_error(
+                "invalid_request",
+                format!("invalid emergency rollback params: {error}"),
+            )
+        }
+    };
+    match rollback::disable_all_approvals(&state.store, &params.reason, now_ms()) {
+        Ok(disabled) => result_outcome(json!({
+            "disabled": disabled,
+            "reason": params.reason,
+        })),
+        Err(error) => channel_error("store_failure", error.to_string()),
+    }
+}
+
 async fn alias_retract(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
     mutate_alias_pair(state, params, AliasMutation::Retract).await
 }
@@ -11097,6 +11192,9 @@ fn management_operations() -> Vec<ManagementOperation> {
         op("cache.pin", Mutate),
         op("cache.gc", Mutate),
         op("admission.status", Query),
+        op("approvals.migrate_owned_decode", Mutate),
+        op("approvals.disable", Mutate),
+        op("approvals.emergency_rollback", Mutate),
     ]
 }
 

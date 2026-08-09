@@ -3308,7 +3308,6 @@ async fn substitutable_owned_refusal_falls_back_to_llama_with_lane_provenance() 
     tokenizer.save(&tokenizer_path, false).unwrap();
     let llama_runtime = std::env::temp_dir().join(format!("syn-llama-{}", process::id()));
     let config = serde_json::json!({
-        "dev": { "owned_decode_cutover_for_test": true },
         "preload_models": [
             {
                 "model_id": "owned-qwen",
@@ -3360,7 +3359,7 @@ async fn substitutable_owned_refusal_falls_back_to_llama_with_lane_provenance() 
         result["provenance"]["fallback_reason"],
         if !cfg!(target_os = "macos") {
             // The platform refusal fires at resolution, before certification
-            // or cutover are consulted, regardless of profile.
+            // or the serving predicate are consulted, regardless of profile.
             "owned_decode_unsupported"
         } else if cfg!(debug_assertions) {
             "owned_decode_not_certified"
@@ -3453,7 +3452,6 @@ async fn certified_owned_checkpoint_lane(
     }
     let config = serde_json::json!({
         "grammar_enabled": true,
-        "dev": { "owned_decode_cutover_for_test": true },
         "preload_models": [preload]
     })
     .to_string();

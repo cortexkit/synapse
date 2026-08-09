@@ -1,4 +1,4 @@
-//! Certification, cutover, and acceptance-gate machinery for the production
+//! Certification, serving-predicate, and acceptance-gate machinery for the production
 //! owned-metal-decode lane.
 //!
 //! This module is the evidence layer above routing and the scheduler mechanism:
@@ -13,9 +13,9 @@
 //!   rows (fail closed).
 //! - [`scheduler_evidence`]: ingestion of the `decode-sched-manifest-v1`
 //!   evidence record. Until the numeric scheduler commitment lands
-//!   (OQ-DEC-SCHED-01), the status is blocked and cutover stays disabled.
-//! - [`cutover`]: the checked-in D-009 cutover records (shipped disabled),
-//!   evidence-derived predicate inputs, and the rollback path.
+//!   (OQ-DEC-SCHED-01), the status is blocked and owned serving stays disabled.
+//! - [`migration`]: the one-shot migration seed boundary and retained wire
+//!   binding validation helper. The seed is not part of serving or certification.
 //! - [`gates`]: the G-DEC-01 through G-DEC-12 gate runner and release evidence.
 //!   Every applicable gate executes with zero skips; G-DEC-11 and the
 //!   scheduler-dependent portion of G-DEC-12 report blocked (not skipped) until
@@ -34,10 +34,10 @@
 //! module, matching the `owned-decode-routing` and
 //! `owned-decode-grammar-scheduler` precedent.
 
-pub mod cutover;
 pub mod fixture_groups;
 pub mod fixtures;
 pub mod gates;
+pub mod migration;
 pub mod probe;
 pub mod scheduler_evidence;
 
@@ -47,10 +47,6 @@ mod spike_harness;
 #[cfg(all(test, target_os = "macos"))]
 mod metal_probe;
 
-pub use cutover::{
-    cutover_inputs_from_evidence, disable_profile, load_checked_in_cutover_records,
-    wire_bindings_are_literal, CutoverEvidenceInputs, D009CutoverRecord, D009CutoverRecords,
-};
 pub use fixture_groups::{
     run_constrained_negative, run_constrained_positive, run_request_processing,
     run_scheduler_continuity, GroupOutcome, CONSTRAINED_NEGATIVE_GROUP, CONSTRAINED_POSITIVE_GROUP,
@@ -64,6 +60,7 @@ pub use gates::{
     applicable_skips, release_ready, GateId, GateRunner, GateStatus, GrammarCostEvidence,
     ReleaseEvidence, ThroughputEvidence, ALL_GATES,
 };
+pub use migration::wire_bindings_are_literal;
 pub use probe::{
     compare_streams, fork_summary, CertificationEvidence, CertificationProbe, DecodeProbe,
     ForkDivergence, ForkSummary, OracleReproducingProbe,

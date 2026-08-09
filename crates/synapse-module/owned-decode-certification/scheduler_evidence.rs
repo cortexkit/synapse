@@ -1,11 +1,11 @@
-//! Scheduler evidence ingestion for the D-009 cutover predicate.
+//! Scheduler evidence ingestion for the approval-backed serving predicate.
 //!
 //! `decode-sched-manifest-v1` separates the five runtime-effective scheduler
 //! fields (production N, yield-policy revision, aging window, DECODE weight,
 //! progress-protocol revision) from the workload and evidence records. G-DEC-11
 //! and the scheduler-dependent portion of G-DEC-12 cannot pass until the
 //! evidence record carries committed measured values; until then the scheduler
-//! evidence status is `Blocked` and production cutover stays disabled.
+//! evidence status is `Blocked` and production owned serving stays disabled.
 
 use crate::owned_decode_contracts::SchedulerManifest;
 
@@ -25,7 +25,7 @@ pub enum SchedulerEvidenceStatus {
 }
 
 /// Whether the numeric scheduler manifest is committed and executed. This is
-/// the `scheduler_evidence_committed` input of the D-009 cutover predicate.
+/// the `scheduler_evidence_committed` input of the serving predicate.
 pub fn scheduler_evidence_committed(status: &SchedulerEvidenceStatus) -> bool {
     matches!(status, SchedulerEvidenceStatus::Committed { .. })
 }

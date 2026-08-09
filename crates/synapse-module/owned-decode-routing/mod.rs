@@ -4,8 +4,8 @@
 //! This module is the routing layer that sits above the supervised worker: it
 //! owns catalog validation, family processing-asset registration, request-domain
 //! validation, Q8 ingest orchestration, decode/processing/runtime identity
-//! computation, certification-row access, lane selection and fallback, the D-009
-//! cutover predicate, provenance construction, and the end-to-end
+//! computation, certification-row access, approval-backed lane selection and
+//! fallback, provenance construction, and the end-to-end
 //! `microllm.oneshot` orchestration.
 //!
 //! The worker execution itself lives behind the [`DecodeDispatch`] seam so the
@@ -22,7 +22,7 @@
 //! - [`request`]: request model and boundary validation.
 //! - [`q8ingest`]: Q8 first-load derivation orchestration.
 //! - [`certification`]: certification-row access and structural-band checks.
-//! - [`lane`]: lane selection, fallback, and the cutover predicate.
+//! - [`lane`]: lane selection, fallback, and the serving predicate.
 //! - [`provenance`]: selected-lane response provenance.
 
 pub mod certification;
@@ -237,14 +237,8 @@ pub trait DecodeDispatch {
 }
 
 /// Per-request routing environment: the machine-profile-local state that is not
-/// derivable from the catalog entry alone.
-///
-/// The `cutover_enabled` flag is deliberately not settable by struct literal:
-/// the only production construction path is [`RoutingEnvironment::with_cutover_evaluated`],
-/// which derives the flag by evaluating the D-009 predicate
-/// ([`crate::owned_decode_routing::lane::cutover_enabled`]) over the checked-in
-/// record and evidence-derived inputs. Tests may use the clearly named
-/// [`RoutingEnvironment::with_cutover_flag_for_test`].
+/// derivable from the catalog entry alone. Owned serving is selected only after
+/// the store-backed approval and evidence predicate has passed.
 #[derive(Clone)]
 pub struct RoutingEnvironment {
     pub machine_profile_hash: String,
@@ -254,8 +248,8 @@ pub struct RoutingEnvironment {
     /// The approval-local grammar switch. Constrained requests require both
     /// this switch and the runtime switch above.
     pub approval_grammar_enabled: bool,
-    /// Whether the complete serving predicate selected owned decode.
-    cutover_enabled: bool,
+    /// Whether the complete approval-backed serving predicate selected owned decode.
+    serving_enabled: bool,
     /// Epoch stamped by admission and re-read at the dispatch boundary.
     admission_profile_activation_epoch: Option<u64>,
     /// Persisted epoch reader used for the terminal pre-frame check.
@@ -271,11 +265,11 @@ pub struct RoutingEnvironment {
     /// Constraint runtime identity digest for a constrained request, if applicable.
     pub constraint_runtime_identity: Option<String>,
     /// A typed refusal discovered while resolving an owned catalog identity.
-    /// This takes precedence over cutover because it describes whether the
+    /// This takes precedence over serving admission because it describes whether the
     /// selected platform can execute the owned lane at all.
     resolution_owned_refusal: Option<OwnedDecodeError>,
     /// A typed refusal discovered while preparing the owned worker before its
-    /// dispatch seam runs. It is considered only after the normal cutover,
+    /// dispatch seam runs. It is considered only after the normal serving,
     /// quarantine, artifact, and certification gates have selected the owned lane.
     pre_dispatch_owned_refusal: Option<OwnedDecodeError>,
 }
@@ -287,7 +281,7 @@ impl std::fmt::Debug for RoutingEnvironment {
             .field("machine_profile_hash", &self.machine_profile_hash)
             .field("grammar_enabled", &self.grammar_enabled)
             .field("approval_grammar_enabled", &self.approval_grammar_enabled)
-            .field("cutover_enabled", &self.cutover_enabled)
+            .field("serving_enabled", &self.serving_enabled)
             .field(
                 "admission_profile_activation_epoch",
                 &self.admission_profile_activation_epoch,
@@ -310,42 +304,6 @@ impl std::fmt::Debug for RoutingEnvironment {
 }
 
 impl RoutingEnvironment {
-    /// Construct a routing environment whose cutover flag is mechanically
-    /// derived from the checked-in D-009 record and evidence-derived inputs:
-    /// the flag is exactly [`crate::owned_decode_routing::lane::cutover_enabled`]
-    /// evaluated over them. This is the only production construction path, so
-    /// a true flag cannot exist without a record-and-evidence evaluation.
-    // Every environment field plus the record-and-evidence pair must be
-    // explicit at the single construction site; splitting them would only
-    // hide the coupling this constructor exists to enforce.
-    #[allow(clippy::too_many_arguments)]
-    pub fn with_cutover_evaluated(
-        machine_profile_hash: impl Into<String>,
-        grammar_enabled: bool,
-        quarantined: bool,
-        llama: Option<LlamaLane>,
-        equivalent_fingerprints: BTreeSet<Fingerprint>,
-        constraint_runtime_identity: Option<String>,
-        record: &crate::owned_decode_routing::lane::CutoverRecord,
-        inputs: &crate::owned_decode_routing::lane::CutoverInputs,
-    ) -> Self {
-        Self {
-            machine_profile_hash: machine_profile_hash.into(),
-            grammar_enabled,
-            approval_grammar_enabled: record.grammar_enabled,
-            cutover_enabled: crate::owned_decode_routing::lane::cutover_enabled(record, inputs),
-            admission_profile_activation_epoch: None,
-            admission_epoch_reader: None,
-            quarantined,
-            llama,
-            equivalent_fingerprints,
-            decode_chain_k: 1,
-            constraint_runtime_identity,
-            resolution_owned_refusal: None,
-            pre_dispatch_owned_refusal: None,
-        }
-    }
-
     /// Construct an environment from the store-backed serving predicate. This
     /// is the production constructor for approval-aware runtime admission.
     #[allow(clippy::too_many_arguments)]
@@ -363,67 +321,7 @@ impl RoutingEnvironment {
             machine_profile_hash: machine_profile_hash.into(),
             grammar_enabled,
             approval_grammar_enabled,
-            cutover_enabled: serving,
-            admission_profile_activation_epoch: None,
-            admission_epoch_reader: None,
-            quarantined,
-            llama,
-            equivalent_fingerprints,
-            decode_chain_k: 1,
-            constraint_runtime_identity,
-            resolution_owned_refusal: None,
-            pre_dispatch_owned_refusal: None,
-        }
-    }
-
-    /// Construct the fail-closed production environment when no version-controlled
-    /// record verifies that this machine's owned-decode configuration passed
-    /// certification and is approved for production cutover. In that case,
-    /// owned decode is not preferred; fallback and constrained-request errors
-    /// still use this lane-selection authority.
-    pub fn without_cutover_record(
-        machine_profile_hash: impl Into<String>,
-        grammar_enabled: bool,
-        quarantined: bool,
-        llama: Option<LlamaLane>,
-        equivalent_fingerprints: BTreeSet<Fingerprint>,
-        constraint_runtime_identity: Option<String>,
-    ) -> Self {
-        Self {
-            machine_profile_hash: machine_profile_hash.into(),
-            grammar_enabled,
-            approval_grammar_enabled: false,
-            cutover_enabled: false,
-            admission_profile_activation_epoch: None,
-            admission_epoch_reader: None,
-            quarantined,
-            llama,
-            equivalent_fingerprints,
-            decode_chain_k: 1,
-            constraint_runtime_identity,
-            resolution_owned_refusal: None,
-            pre_dispatch_owned_refusal: None,
-        }
-    }
-
-    /// Test-only constructor: sets the cutover flag directly without a
-    /// record-and-evidence evaluation. Named so it is never mistaken for a
-    /// production path; production code must use
-    /// [`RoutingEnvironment::with_cutover_evaluated`].
-    pub fn with_cutover_flag_for_test(
-        machine_profile_hash: impl Into<String>,
-        grammar_enabled: bool,
-        cutover_enabled: bool,
-        quarantined: bool,
-        llama: Option<LlamaLane>,
-        equivalent_fingerprints: BTreeSet<Fingerprint>,
-        constraint_runtime_identity: Option<String>,
-    ) -> Self {
-        Self {
-            machine_profile_hash: machine_profile_hash.into(),
-            grammar_enabled,
-            approval_grammar_enabled: cutover_enabled,
-            cutover_enabled,
+            serving_enabled: serving,
             admission_profile_activation_epoch: None,
             admission_epoch_reader: None,
             quarantined,
@@ -460,7 +358,7 @@ impl RoutingEnvironment {
     }
 
     /// Record a typed refusal found while resolving an owned catalog identity.
-    /// Lane selection receives the refusal before the cutover gate, so a
+    /// Lane selection receives the refusal before the serving gate, so a
     /// substitutable request may choose llama without requiring Metal execution.
     #[must_use]
     pub fn with_resolution_owned_refusal(mut self, refusal: OwnedDecodeError) -> Self {
@@ -479,10 +377,10 @@ impl RoutingEnvironment {
         self
     }
 
-    /// Whether the D-009 cutover is enabled for this profile.
+    /// Whether the complete approval-backed serving predicate is enabled.
     #[must_use]
-    pub fn cutover_enabled(&self) -> bool {
-        self.cutover_enabled
+    pub fn serving_enabled(&self) -> bool {
+        self.serving_enabled
     }
 
     /// Set the approval-local grammar switch after the approval row has been
@@ -597,7 +495,7 @@ impl OwnedDecodeRouter {
         if let Some(refusal) = env.resolution_owned_refusal {
             return OwnedEvaluation::Refused(refusal);
         }
-        if !env.cutover_enabled {
+        if !env.serving_enabled {
             return OwnedEvaluation::NotPreferred;
         }
         if env.quarantined {
@@ -807,7 +705,7 @@ impl OwnedDecodeRouter {
 fn fallback_reason_wire(reason: FallbackReason) -> &'static str {
     match reason {
         FallbackReason::OwnedRefusal(error) => error.as_str(),
-        FallbackReason::CutoverDisabled => "cutover_disabled",
+        FallbackReason::ServingDisabled => "cutover_disabled",
     }
 }
 
@@ -904,11 +802,12 @@ mod tests {
         }
     }
 
-    fn env(cutover_enabled: bool, llama: Option<LlamaLane>) -> RoutingEnvironment {
-        RoutingEnvironment::with_cutover_flag_for_test(
+    fn env(serving_enabled: bool, llama: Option<LlamaLane>) -> RoutingEnvironment {
+        RoutingEnvironment::with_serving_evaluated(
             "profile-a",
             true,
-            cutover_enabled,
+            serving_enabled,
+            serving_enabled,
             false,
             llama,
             BTreeSet::new(),
@@ -1152,7 +1051,7 @@ mod tests {
     }
 
     #[test]
-    fn resolution_unsupported_falls_back_before_cutover_evaluation() {
+    fn resolution_unsupported_falls_back_before_serving_evaluation() {
         let entry = catalog_entry(Family::Qwen3_0_6b, WeightQuant::F16);
         let router = router_with_certified(CertificationStore::new(), Q8IngestRegistry::new());
         let request = request(Family::Qwen3_0_6b, WeightQuant::F16);
@@ -1419,18 +1318,18 @@ mod tests {
     }
 
     #[test]
-    fn cutover_disabled_routes_substitutable_to_llama() {
+    fn serving_disabled_routes_substitutable_to_llama() {
         let entry = catalog_entry(Family::Qwen3_0_6b, WeightQuant::F16);
         let store = certified_store(&entry);
         let router = router_with_certified(store, Q8IngestRegistry::new());
         let request = request(Family::Qwen3_0_6b, WeightQuant::F16);
-        let environment = env(false, Some(llama_lane())); // cutover disabled
+        let environment = env(false, Some(llama_lane())); // serving disabled
         let dispatched = Rc::new(RefCell::new(Vec::new()));
         let mut dispatch = RecordingDispatch::new_succeeding(dispatched.clone());
 
         let response = router
             .route_oneshot(&environment, &entry, &request, "gen-1", &mut dispatch)
-            .expect("llama before cutover");
+            .expect("llama before serving");
         assert_eq!(response.lane, LaneKind::Llama);
         assert_eq!(
             response.provenance.fallback_reason.as_deref(),
