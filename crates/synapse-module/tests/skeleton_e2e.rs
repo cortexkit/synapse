@@ -3595,11 +3595,14 @@ fn production_binary_carries_owned_decode_errors_and_retires_legacy_grammar_lite
     };
     assert!(contains(b"grammar_disabled"));
     assert!(contains(b"owned_decode_not_certified"));
-    // The legacy literal may appear ONLY as retirement-changelog data: the
-    // baked wire-error-bindings manifest records the retirement (retired_id +
-    // notes). The binary must carry exactly the manifest's occurrences and
-    // not one more — an extra occurrence means an emittable legacy error
-    // string came back.
+    // The legacy literal may appear ONLY as retirement-changelog data. Before
+    // the runtime-bound records epic the compiled cutover path baked the
+    // wire-error-bindings manifest (and with it the changelog's occurrences of
+    // the retired literal) into the binary; retiring that path removed the
+    // baked copy, so the binary now carries ZERO occurrences. The manifest
+    // file must still record the retirement, and any occurrence in the binary
+    // means an emittable legacy error string came back (or the manifest was
+    // baked in again — either way a deliberate decision this pin must force).
     let count = |haystack: &[u8], literal: &[u8]| {
         haystack
             .windows(literal.len())
@@ -3609,12 +3612,14 @@ fn production_binary_carries_owned_decode_errors_and_retires_legacy_grammar_lite
     let legacy = b"grammar_unavailable_in_build";
     let manifest =
         include_bytes!("../owned-decode-manifests/owned-decode-wire-error-bindings-v1.json");
-    let sanctioned = count(manifest, legacy);
-    assert!(sanctioned > 0, "manifest no longer records the retirement");
+    assert!(
+        count(manifest, legacy) > 0,
+        "manifest no longer records the retirement"
+    );
     let in_binary = count(&binary, legacy);
     assert!(
-        in_binary == sanctioned,
-        "legacy grammar literal appears outside the retirement changelog: {in_binary} in binary vs {sanctioned} sanctioned by the bindings manifest"
+        in_binary == 0,
+        "legacy grammar literal is compiled into the binary again: {in_binary} occurrences (the retirement changelog lives only in the on-disk manifest since the compiled cutover path was deleted)"
     );
 }
 
