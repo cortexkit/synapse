@@ -17,9 +17,9 @@
 ## Layers
 
 **Synapse SubC Module (`synapse-module`):**
-- Purpose: The main service listening on the SubC bus. Handles route binding, job admission, the model cache, remote provider dispatch, worker lifecycle supervision (offloading worker engine drops to dedicated threads), owned CUDA evidence and declared identities, and in-process execution via the owned engine.
+- Purpose: The main service listening on the SubC bus. Handles route binding, job admission, the model cache, remote provider dispatch, worker lifecycle supervision (offloading worker engine drops to dedicated threads), approval storage and identity-based rollback (`rollback.rs`), runtime admission probe health, storage epochs and rotation ledgers, owned CUDA evidence and declared identities, and in-process execution via the owned engine.
 - Location: `crates/synapse-module`
-- Contains: A 3-class aging scheduler, SQLite durable job and cache lease state, machine probe certification logic, socket/pipe-based worker host, the remote gateway client, module-side routing (`owned-decode-routing`), grammar compilation and DECODE scheduler (`owned-decode-grammar-scheduler`), certification gates and probes (`owned-decode-certification`), contract manifests (`owned-decode-manifests`), and direct bindings to `synapse-engine-owned` and `synapse-engine-cuda`.
+- Contains: A 3-class aging scheduler, SQLite durable job and cache lease state, machine probe certification logic, socket/pipe-based worker host, the remote gateway client, module-side routing (`owned-decode-routing`), grammar compilation and DECODE scheduler (`owned-decode-grammar-scheduler`), certification gates and probes (`owned-decode-certification`), approval rollback (`rollback.rs`), contract manifests (`owned-decode-manifests`), and direct bindings to `synapse-engine-owned` and `synapse-engine-cuda`.
 - Depends on: `synapse-core`, `synapse-engine-owned`, `synapse-engine-cuda`, `subc-client-rs`, `rusqlite`, `tokio`.
 
 **Remote Gateway (`crates/synapse-module/src/remote`):**
@@ -52,7 +52,7 @@
 **Synapse Core Abstractions (`synapse-core`):**
 - Purpose: Core vocabulary structs, engine traits, machine capability profiles, and error contracts shared between the host and its workers.
 - Location: `crates/synapse-core`
-- Contains: `WorkerHello` handshake with strict catalog engine identity validation, binary framing logic, `EngineError` contract, `MachineProfile` with `ane_subtype` chip-identity mapping, `RuntimeConfig`, `TokenBatch`, and scheduling traits.
+- Contains: `WorkerHello` handshake with strict catalog engine identity validation, shared canonical HELLO engine identities (`worker_engine_names.rs`), binary framing logic, `EngineError` contract, `MachineProfile` with `ane_subtype` chip-identity mapping, `RuntimeConfig`, `TokenBatch`, per-request decode chain policy, and scheduling traits.
 
 **Benchmark Harness Core:**
 - Purpose: Provides CLI commands for corpus generation, power-monitored process wrapping, result schema definition, and numerical parity functions.
@@ -99,7 +99,7 @@
 **External Gather-Distillation Harness:**
 - Purpose: Standalone Bun/TypeScript data generation and SFT training pipeline for the production gatherer contract, supporting both Anthropic API (with multi-account OAuth rotation) and local OpenAI-compatible endpoints.
 - Location: `tools/gather-distill`
-- Contains: Trajectory generation, work queue handling, `AftClientPool` process wrapping, validation, gold-overlap scoring, zero-shot gatherer bake-off evaluation leaderboards (`tools/gather-distill/BAKEOFF-ZEROSHOT.md`), Axolotl SFT training configs/rungs (`tools/gather-distill/train/`), and student evaluation ladder metrics (`tools/gather-distill/data/students/LADDER.md`).
+- Contains: Trajectory generation, work queue handling, `AftClientPool` process wrapping, validation, gold-overlap scoring, zero-shot gatherer bake-off evaluation leaderboards (`tools/gather-distill/BAKEOFF-ZEROSHOT.md`), Axolotl SFT training configs/rungs (`tools/gather-distill/train/`), and student evaluation scale ladder metrics (`tools/gather-distill/train/SCALE-LADDER.md`).
 - Depends on: Bun, pinned `aft-v0.46.0` binary, and `@cortexkit/anthropic-auth-core`.
 - Used by: Developers running qgen, gather, validate, score, or model distillation and SFT evaluation campaigns.
 
@@ -111,9 +111,9 @@
 - Used by: Developers running Athena classify dataset generation, real attempt importing, parity auditing, or distillation campaigns.
 
 **Synapse Operator CLI (`synapse-opctl`):**
-- Purpose: Drive Synapse operations (models catalog, probe runs, scheduling, batch embedding, and jobs paging) through the fleet subc daemon connection.
+- Purpose: Drive Synapse operations (models catalog, probe runs, scheduling admission stats, exact and emergency approval rollbacks, batch embedding, and jobs paging) through the fleet subc daemon connection.
 - Location: `crates/synapse-opctl`
-- Contains: CLI command parsing and formatting logic for operator management.
+- Contains: CLI command parsing and formatting logic for operator management, including model status, probe execution, scheduler admission, approval migration and emergency rollback, batch submission, and paged results.
 - Depends on: `subc-client-rs`, `clap`, `serde_json`, `tokio`.
 - Used by: Operators and deployment scripts monitoring or triggering runtime actions.
 
@@ -148,7 +148,7 @@
 **Constrained Decoding Flow:**
 
 1. Module parses and validates input JSON schemas (`synapse-json-schema-v1`), enforces grammar limits, compiles a byte-level JSON automaton, and converts it into a `TokenIdJsonConstraintV1` structure shipped directly to the worker (`crates/synapse-module/owned-decode-grammar-scheduler/grammar_compile.rs`).
-2. Decode requests enter the dedicated `QueueClass::Decode` scheduler using N-token quantum sequencing (batched 16-token chunks with yield-on-contention release) — `crates/synapse-module/owned-decode-grammar-scheduler/scheduler.rs`.
+2. Decode requests enter the dedicated `QueueClass::Decode` scheduler using N-token quantum sequencing (batched 16-token chunks with yield-on-contention release) — `crates/synapse-module/owned-decode-grammar-scheduler/scheduler.rs`. Decode requests forward optional per-request chain policy (`chain_k`) through execution envelopes.
 3. Worker extracts logit values for the next token from causal decode execution (Qwen3 or LFM2 Metal step engines).
 4. Query constraint state machine (`JsonParser` / automaton) to match allowed byte sequences against the token vocabulary trie and compute the vocabulary-wide bitset `TokenMask`.
 5. Apply the `TokenMask` to the logits (forcing unallowed token logits to negative infinity).
@@ -340,6 +340,16 @@
 - Purpose: Execute CUDA PTX embedding inference for MiniLM, ModernBERT, and Qwen3 in f16 storage dtype across in-process and supervised out-of-process worker configurations.
 - Location: `crates/synapse-engine-cuda/src/lib.rs`, `crates/synapse-worker-cuda/src/main.rs`
 - Pattern: PTX Kernel Dispatch with CUDA Graph Execution and Hardware Capability Floor (`device_meets_floor`).
+
+**Approval & Emergency Rollback:**
+- Purpose: Manages storage approvals, rotation ledgers, exact `(model_id, decode_fingerprint)` disablement, and atomic single-transaction emergency rollbacks to instantly revoke serving approvals across all lanes.
+- Location: `crates/synapse-module/src/rollback.rs`, `crates/synapse-module/src/store.rs`
+- Pattern: Identity-Based Approval Ledger with Atomic Rollback Transaction.
+
+**Worker HELLO Engine Names:**
+- Purpose: Centralized canonical worker identity constants preventing identity drift during worker handshakes.
+- Location: `crates/synapse-core/src/worker_engine_names.rs`
+- Pattern: Shared Identity Constants (`LLAMA_WORKER_ENGINE`, `DECODE_WORKER_ENGINE`, `CUDA_WORKER_ENGINE`, etc.).
 
 
 ## Entry Points

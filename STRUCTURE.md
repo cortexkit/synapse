@@ -65,8 +65,8 @@
 
 **crates/synapse-core/:**
 - Purpose: Defines shared abstractions for engines, worker protocol, caching, machine capability profiles, and scheduling.
-- Contains: Envelopes, machine profile structs, engine traits, and error contracts.
-- Key files: `crates/synapse-core/src/worker_protocol.rs`, `crates/synapse-core/src/scheduler.rs`, `crates/synapse-core/src/machine_profile.rs`
+- Contains: Envelopes, machine profile structs, engine traits, error contracts, and shared canonical worker HELLO handshake identities (`worker_engine_names.rs`).
+- Key files: `crates/synapse-core/src/worker_protocol.rs`, `crates/synapse-core/src/scheduler.rs`, `crates/synapse-core/src/machine_profile.rs`, `crates/synapse-core/src/worker_engine_names.rs`
 
 **crates/synapse-engine-cuda/:**
 - Purpose: Primary in-process CUDA execution engine (`owned-cuda-v1`), hosting PTX kernel ports for MiniLM, ModernBERT, and Qwen3 embedding models.
@@ -79,13 +79,13 @@
 - Key files: `crates/synapse-engine-owned/src/lib.rs`, `crates/synapse-engine-owned/owned-decode-engine/src/lib.rs`, `crates/synapse-engine-owned/owned-decode-worker/src/lib.rs`
 
 **crates/synapse-module/:**
-- Purpose: The primary SubC service module. Handles the content-addressed model cache, durable jobs, worker hosting (offloading worker drop teardown to dedicated threads), remote provider dispatch, owned decode routing, grammar compilation, owned CUDA evidence and declared identities, and route binding.
-- Contains: SQLite store initialization, SubC `ModuleHandler` implementation, UNIX socket / Windows pipe worker spawning, remote gateway client, owned decode routing (`owned-decode-routing`), grammar compilation and DECODE scheduler (`owned-decode-grammar-scheduler`), certification gates and probes (`owned-decode-certification`), and manifest schemas (`owned-decode-manifests`).
-- Key files: `crates/synapse-module/src/lib.rs`, `crates/synapse-module/src/worker_host/mod.rs`, `crates/synapse-module/owned-decode-routing/mod.rs`, `crates/synapse-module/owned-decode-grammar-scheduler/mod.rs`
+- Purpose: The primary SubC service module. Handles the content-addressed model cache, durable jobs, worker hosting (offloading worker drop teardown to dedicated threads), remote provider dispatch, owned decode routing, grammar compilation, approval storage and identity-based rollback (`rollback.rs`), owned CUDA evidence and declared identities, and route binding.
+- Contains: SQLite store initialization, SubC `ModuleHandler` implementation, UNIX socket / Windows pipe worker spawning, remote gateway client, owned decode routing (`owned-decode-routing`), grammar compilation and DECODE scheduler (`owned-decode-grammar-scheduler`), certification gates and probes (`owned-decode-certification`), approval rollback (`rollback.rs`), and contract manifests (`owned-decode-manifests`).
+- Key files: `crates/synapse-module/src/lib.rs`, `crates/synapse-module/src/worker_host/mod.rs`, `crates/synapse-module/src/rollback.rs`, `crates/synapse-module/owned-decode-routing/mod.rs`, `crates/synapse-module/owned-decode-grammar-scheduler/mod.rs`
 
 **crates/synapse-opctl/:**
 - Purpose: Command-line operator control surface driving SubC commands.
-- Contains: Commands to query model statuses, run/inspect certification probes, monitor scheduler stats, submit batches, and fetch job pages.
+- Contains: Commands to query model statuses, run/inspect certification probes, monitor scheduler admission stats, manage approval migrations and emergency rollbacks, submit batches, and fetch job pages.
 - Key files: `crates/synapse-opctl/src/main.rs`
 
 
@@ -167,15 +167,15 @@
 
 **tools/gather-distill/:**
 - Purpose: Standalone external harness for generating QA datasets, collecting model tool-use trajectories, and orchestrating student model SFT training/evaluation.
-- Contains: Bun workspaces, Anthropic/OpenAI API adapters (supporting OpenAI OAuth transports), AFT child process pools, validation scripts, scoring modules, utility judge matrix evaluation engines, Axolotl SFT training configs (`train/axolotl/`), Antares gather-SFT rungs (`train/ANTARES-RUNG.md`), and student ladder evaluation results (`data/students/LADDER.md`).
-- Key files: `tools/gather-distill/src/cli.ts`, `tools/gather-distill/README.md`, `tools/gather-distill/BAKEOFF-ZEROSHOT.md`, `tools/gather-distill/train/ANTARES-RUNG.md`, `tools/gather-distill/data/students/LADDER.md`
+- Contains: Bun workspaces, Anthropic/OpenAI API adapters (supporting OpenAI OAuth transports), AFT child process pools, validation scripts, scoring modules, utility judge matrix evaluation engines, Axolotl SFT training configs (`train/axolotl/`), Antares gather-SFT rungs (`train/ANTARES-RUNG.md`), and student ladder evaluation results (`train/SCALE-LADDER.md`).
+- Key files: `tools/gather-distill/src/cli.ts`, `tools/gather-distill/README.md`, `tools/gather-distill/BAKEOFF-ZEROSHOT.md`, `tools/gather-distill/train/ANTARES-RUNG.md`, `tools/gather-distill/train/SCALE-LADDER.md`
 
 ## Key File Locations
 
 **Entry Points:**
 - `crates/synapse-module/src/main.rs`: The main production SubC module entry point.
 - `crates/synapse-worker-*/src/main.rs`: Executables for hardware-specific supervised workers (including `crates/synapse-worker-cuda/src/main.rs` and `crates/synapse-worker-decode/src/main.rs`).
-- `crates/synapse-opctl/src/main.rs`: Operator command line control surface (`ck-synapse-opctl`).
+- `crates/synapse-opctl/src/main.rs`: Operator command line control surface (`ck-synapse-opctl`) driving catalog, probes, scheduler admission, approval migrations, emergency rollbacks, and paged results.
 - `crates/synapse-module/src/bin/subc_call.rs`: Management surface call utility.
 - `crates/synapse-module/src/bin/inline_embed_throughput.rs`: Batch throughput execution client.
 - `crates/synapse-module/src/bin/timeout_worker.rs`: Shared test mock worker advertising `SYNAPSE_WORKER_EXPECTED_ENGINE` for test timeout and fallback validation.
@@ -195,6 +195,8 @@
 - `bench/lanes/burn/build.rs`: Burn compilation setup for model building.
 
 **Core Logic:**
+- `crates/synapse-core/src/worker_engine_names.rs`: Shared canonical worker HELLO handshake identity definitions (`LLAMA_WORKER_ENGINE`, `DECODE_WORKER_ENGINE`, `CUDA_WORKER_ENGINE`, etc.).
+- `crates/synapse-module/src/rollback.rs`: Exact `(model_id, decode_fingerprint)` approval disablement and single-transaction emergency rollback routines.
 - `crates/synapse-module/src/remote/runtime.rs`: Provider pool routing, circuit breaker enforcement, and telemetry collection for external model execution.
 - `crates/synapse-engine-cuda/src/lib.rs`: Production owned CUDA embed engine, model family detection, and PTX build identity.
 - `crates/synapse-worker-cuda/src/main.rs`: Supervised CUDA worker IPC framing loop.
