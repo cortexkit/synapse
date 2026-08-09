@@ -35,7 +35,7 @@ pub mod q8artifact;
 pub mod q8ingest;
 pub mod request;
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 use synapse_core::{worker_engine_names::DECODE_WORKER_ENGINE, Fingerprint};
@@ -50,8 +50,8 @@ use crate::owned_decode_routing::identity::{
     ActivationDType, DecodeIdentityInputs, ProcessingIdentityInputs, Q8Identity, WeightQuant,
 };
 use crate::owned_decode_routing::lane::{
-    select_lane, FallbackReason, LaneKind, LaneOutcome, LaneSelectionContext, LlamaLane,
-    OwnedEvaluation, RoutingRefusal,
+    effective_grammar_enabled, select_lane, AdmissionEpochReader, FallbackReason, LaneKind,
+    LaneOutcome, LaneSelectionContext, LlamaLane, OwnedEvaluation, RoutingRefusal,
 };
 use crate::owned_decode_routing::provenance::{
     FinishReason, LaneProvenance, OwnedProvenanceInputs,
@@ -102,6 +102,14 @@ pub struct CatalogEntry {
     pub quant: Option<String>,
 }
 
+fn is_canonical_entry_id(value: &str) -> bool {
+    let mut chars = value.chars();
+    matches!(chars.next(), Some(first) if first.is_ascii_lowercase() || first.is_ascii_digit())
+        && chars.all(|ch| {
+            ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '_' | '-')
+        })
+}
+
 /// Whether `bucket` is a verified, shippable bucket for `family` in the manifest.
 fn bucket_is_verified(manifest: &ContextBucketsManifest, family: &str, bucket: u32) -> bool {
     manifest
@@ -122,6 +130,9 @@ impl CatalogEntry {
         &self,
         context_buckets: &ContextBucketsManifest,
     ) -> Result<(), OwnedDecodeError> {
+        if !is_canonical_entry_id(&self.entry_id) {
+            return Err(OwnedDecodeError::Unsupported);
+        }
         if self.engine != CATALOG_ENGINE
             || self.task != CATALOG_TASK
             || self.lane != CATALOG_LANE
@@ -234,16 +245,21 @@ pub trait DecodeDispatch {
 /// ([`crate::owned_decode_routing::lane::cutover_enabled`]) over the checked-in
 /// record and evidence-derived inputs. Tests may use the clearly named
 /// [`RoutingEnvironment::with_cutover_flag_for_test`].
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct RoutingEnvironment {
     pub machine_profile_hash: String,
     /// Whether grammar (constrained decoding) is enabled at all. When false, a
     /// constrained request returns `grammar_disabled` before lane selection.
     pub grammar_enabled: bool,
-    /// Whether the D-009 cutover is enabled for this profile (the preferred-lane
-    /// predicate; see `lane::cutover_enabled`). Private: only the constructors
-    /// below can set it.
+    /// The approval-local grammar switch. Constrained requests require both
+    /// this switch and the runtime switch above.
+    pub approval_grammar_enabled: bool,
+    /// Whether the complete serving predicate selected owned decode.
     cutover_enabled: bool,
+    /// Epoch stamped by admission and re-read at the dispatch boundary.
+    admission_profile_activation_epoch: Option<u64>,
+    /// Persisted epoch reader used for the terminal pre-frame check.
+    admission_epoch_reader: Option<Arc<dyn AdmissionEpochReader>>,
     /// Whether the quarantine key is currently quarantined.
     pub quarantined: bool,
     /// The configured llama fallback lane, if any.
@@ -262,6 +278,35 @@ pub struct RoutingEnvironment {
     /// dispatch seam runs. It is considered only after the normal cutover,
     /// quarantine, artifact, and certification gates have selected the owned lane.
     pre_dispatch_owned_refusal: Option<OwnedDecodeError>,
+}
+
+impl std::fmt::Debug for RoutingEnvironment {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RoutingEnvironment")
+            .field("machine_profile_hash", &self.machine_profile_hash)
+            .field("grammar_enabled", &self.grammar_enabled)
+            .field("approval_grammar_enabled", &self.approval_grammar_enabled)
+            .field("cutover_enabled", &self.cutover_enabled)
+            .field(
+                "admission_profile_activation_epoch",
+                &self.admission_profile_activation_epoch,
+            )
+            .field("quarantined", &self.quarantined)
+            .field("llama", &self.llama)
+            .field("equivalent_fingerprints", &self.equivalent_fingerprints)
+            .field("decode_chain_k", &self.decode_chain_k)
+            .field(
+                "constraint_runtime_identity",
+                &self.constraint_runtime_identity,
+            )
+            .field("resolution_owned_refusal", &self.resolution_owned_refusal)
+            .field(
+                "pre_dispatch_owned_refusal",
+                &self.pre_dispatch_owned_refusal,
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl RoutingEnvironment {
@@ -287,7 +332,40 @@ impl RoutingEnvironment {
         Self {
             machine_profile_hash: machine_profile_hash.into(),
             grammar_enabled,
+            approval_grammar_enabled: record.grammar_enabled,
             cutover_enabled: crate::owned_decode_routing::lane::cutover_enabled(record, inputs),
+            admission_profile_activation_epoch: None,
+            admission_epoch_reader: None,
+            quarantined,
+            llama,
+            equivalent_fingerprints,
+            decode_chain_k: 1,
+            constraint_runtime_identity,
+            resolution_owned_refusal: None,
+            pre_dispatch_owned_refusal: None,
+        }
+    }
+
+    /// Construct an environment from the store-backed serving predicate. This
+    /// is the production constructor for approval-aware runtime admission.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_serving_evaluated(
+        machine_profile_hash: impl Into<String>,
+        grammar_enabled: bool,
+        approval_grammar_enabled: bool,
+        serving: bool,
+        quarantined: bool,
+        llama: Option<LlamaLane>,
+        equivalent_fingerprints: BTreeSet<Fingerprint>,
+        constraint_runtime_identity: Option<String>,
+    ) -> Self {
+        Self {
+            machine_profile_hash: machine_profile_hash.into(),
+            grammar_enabled,
+            approval_grammar_enabled,
+            cutover_enabled: serving,
+            admission_profile_activation_epoch: None,
+            admission_epoch_reader: None,
             quarantined,
             llama,
             equivalent_fingerprints,
@@ -314,7 +392,10 @@ impl RoutingEnvironment {
         Self {
             machine_profile_hash: machine_profile_hash.into(),
             grammar_enabled,
+            approval_grammar_enabled: false,
             cutover_enabled: false,
+            admission_profile_activation_epoch: None,
+            admission_epoch_reader: None,
             quarantined,
             llama,
             equivalent_fingerprints,
@@ -341,7 +422,10 @@ impl RoutingEnvironment {
         Self {
             machine_profile_hash: machine_profile_hash.into(),
             grammar_enabled,
+            approval_grammar_enabled: cutover_enabled,
             cutover_enabled,
+            admission_profile_activation_epoch: None,
+            admission_epoch_reader: None,
             quarantined,
             llama,
             equivalent_fingerprints,
@@ -399,6 +483,47 @@ impl RoutingEnvironment {
     #[must_use]
     pub fn cutover_enabled(&self) -> bool {
         self.cutover_enabled
+    }
+
+    /// Set the approval-local grammar switch after the approval row has been
+    /// loaded and validated from the fenced admission read.
+    #[must_use]
+    pub fn with_approval_grammar_enabled(mut self, enabled: bool) -> Self {
+        self.approval_grammar_enabled = enabled;
+        self
+    }
+
+    /// Stamp the epoch observed by admission and attach the persisted reader
+    /// used immediately before an owned worker frame is sent.
+    #[must_use]
+    pub fn with_admission_epoch(
+        mut self,
+        profile_activation_epoch: u64,
+        reader: Arc<dyn AdmissionEpochReader>,
+    ) -> Self {
+        self.admission_profile_activation_epoch = Some(profile_activation_epoch);
+        self.admission_epoch_reader = Some(reader);
+        self
+    }
+
+    /// Return false when the persisted epoch no longer matches the admission
+    /// snapshot. Missing or failed reads are deliberately fail-closed.
+    #[must_use]
+    pub fn admission_epoch_is_current(&self) -> bool {
+        let Some(expected) = self.admission_profile_activation_epoch else {
+            // Legacy/test environments have no persisted admission snapshot;
+            // production environments that select owned always attach one.
+            return true;
+        };
+        let Some(reader) = self.admission_epoch_reader.as_ref() else {
+            return false;
+        };
+        matches!(reader.current_profile_activation_epoch(), Ok(Some(actual)) if actual == expected)
+    }
+
+    #[must_use]
+    pub fn effective_grammar_enabled(&self) -> bool {
+        effective_grammar_enabled(self.grammar_enabled, self.approval_grammar_enabled)
     }
 }
 
@@ -542,7 +667,7 @@ impl OwnedDecodeRouter {
         dispatch: &mut D,
     ) -> Result<RoutedResponse, RoutingFailure> {
         // 1. Grammar gate: disabled grammar returns before lane selection.
-        if request.is_constrained() && !env.grammar_enabled {
+        if request.is_constrained() && !env.effective_grammar_enabled() {
             return Err(RoutingFailure::owned(OwnedDecodeError::GrammarDisabled));
         }
 
@@ -636,6 +761,13 @@ impl OwnedDecodeRouter {
                 Ok(build_response(LaneKind::Llama, success, provenance))
             }
             LaneOutcome::Owned => {
+                // This is the last point before the first worker frame. The
+                // admission epoch is persisted state, so a rotation committed
+                // after resolution turns this request into the standard
+                // fail-closed refusal instead of dispatching old evidence.
+                if !env.admission_epoch_is_current() {
+                    return Err(RoutingFailure::owned(OwnedDecodeError::NotCertified));
+                }
                 let command = DispatchedCommand {
                     lane: LaneKind::OwnedDecode,
                     decode_fingerprint: decode_fingerprint.clone(),
@@ -702,6 +834,7 @@ mod tests {
     use crate::owned_decode_routing::request::SamplingMode;
     use std::cell::RefCell;
     use std::rc::Rc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     fn fp(s: &str) -> Fingerprint {
         Fingerprint(s.to_string())
@@ -787,6 +920,14 @@ mod tests {
         LlamaLane {
             decode_fingerprint: fp("llama-decode"),
             processing_fingerprint: fp("llama-proc"),
+        }
+    }
+
+    struct EpochReader(AtomicU64);
+
+    impl lane::AdmissionEpochReader for EpochReader {
+        fn current_profile_activation_epoch(&self) -> Result<Option<u64>, String> {
+            Ok(Some(self.0.load(Ordering::SeqCst)))
         }
     }
 
@@ -906,6 +1047,43 @@ mod tests {
             catalog_entry(Family::Lfm2_1_2b, WeightQuant::Q8_0).validate(&buckets),
             Ok(())
         );
+    }
+
+    #[test]
+    fn constrained_request_requires_the_approval_grammar_switch() {
+        let entry = catalog_entry(Family::Qwen3_0_6b, WeightQuant::F16);
+        let router = router_with_certified(certified_store(&entry), Q8IngestRegistry::new());
+        let mut request = request(Family::Qwen3_0_6b, WeightQuant::F16);
+        request.grammar = Some(serde_json::json!({"type": "object"}));
+        let environment = env(true, Some(llama_lane())).with_approval_grammar_enabled(false);
+        let dispatched = Rc::new(RefCell::new(Vec::new()));
+        let mut dispatch = RecordingDispatch::new_succeeding(dispatched.clone());
+        let failure = router
+            .route_oneshot(&environment, &entry, &request, "gen-grammar", &mut dispatch)
+            .expect_err("grammar must fail before lane selection");
+        assert_eq!(failure.wire_id(), "grammar_disabled");
+        assert!(dispatched.borrow().is_empty());
+    }
+
+    #[test]
+    fn owned_dispatch_rechecks_the_persisted_epoch_at_the_frame_boundary() {
+        let entry = catalog_entry(Family::Qwen3_0_6b, WeightQuant::F16);
+        let router = router_with_certified(certified_store(&entry), Q8IngestRegistry::new());
+        let environment = env(true, Some(llama_lane()))
+            .with_admission_epoch(1, Arc::new(EpochReader(AtomicU64::new(2))));
+        let dispatched = Rc::new(RefCell::new(Vec::new()));
+        let mut dispatch = RecordingDispatch::new_succeeding(dispatched.clone());
+        let failure = router
+            .route_oneshot(
+                &environment,
+                &entry,
+                &request(Family::Qwen3_0_6b, WeightQuant::F16),
+                "gen-stale-epoch",
+                &mut dispatch,
+            )
+            .expect_err("activation after admission must refuse");
+        assert_eq!(failure.wire_id(), "owned_decode_not_certified");
+        assert!(dispatched.borrow().is_empty());
     }
 
     #[test]

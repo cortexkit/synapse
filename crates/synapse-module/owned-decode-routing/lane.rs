@@ -19,7 +19,7 @@
 //! Once dispatched, execution-phase failures return directly and never re-enter
 //! selection; that behavior is enforced by the orchestrator, not here.
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, fmt::Debug};
 
 use serde::{Deserialize, Serialize};
 use synapse_core::Fingerprint;
@@ -291,10 +291,67 @@ pub struct CutoverInputs {
     pub scheduler_evidence_committed: bool,
 }
 
-/// Evaluate the D-009 cutover predicate. A profile may enable owned decode as
-/// the preferred lane only when every condition holds. While G-DEC-11 or the
-/// scheduler-dependent portion of G-DEC-12 is blocked or unexecuted, no
-/// enablement is permitted.
+/// All inputs that are independent of SQLite row loading but still belong to
+/// the owned-decode serving predicate. Keeping these checks in one pure
+/// function prevents a caller from treating a partial match as admission.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ServingPredicateInputs {
+    pub approval_enabled: bool,
+    pub approval_identity_matches: bool,
+    pub current_profile_matches: bool,
+    pub current_epoch_valid: bool,
+    pub certification_matches: bool,
+    pub evidence_revisions_compatible: bool,
+    pub gates_complete: bool,
+    pub processing_fingerprint_matches: bool,
+    pub runtime_config_digest_matches: bool,
+    pub worker_path_matches: bool,
+    pub constrained_identities_match: bool,
+    pub artifacts_trusted: bool,
+    pub identities_installed: bool,
+    pub quarantined: bool,
+    pub wire_bindings_literal: bool,
+    pub scheduler_evidence_committed: bool,
+}
+
+/// Evaluate the complete fail-closed owned-decode serving predicate.
+#[must_use]
+pub fn serving_predicate(inputs: &ServingPredicateInputs) -> bool {
+    inputs.approval_enabled
+        && inputs.approval_identity_matches
+        && inputs.current_profile_matches
+        && inputs.current_epoch_valid
+        && inputs.certification_matches
+        && inputs.evidence_revisions_compatible
+        && inputs.gates_complete
+        && inputs.processing_fingerprint_matches
+        && inputs.runtime_config_digest_matches
+        && inputs.worker_path_matches
+        && inputs.constrained_identities_match
+        && inputs.artifacts_trusted
+        && inputs.identities_installed
+        && !inputs.quarantined
+        && inputs.wire_bindings_literal
+        && inputs.scheduler_evidence_committed
+}
+
+/// The epoch reader used at the last owned-dispatch boundary. Implementations
+/// must read the persisted value, not a request-local cache.
+pub trait AdmissionEpochReader: Send + Sync {
+    fn current_profile_activation_epoch(&self) -> Result<Option<u64>, String>;
+}
+
+/// Effective grammar enablement is the conjunction of the runtime switch and
+/// the approval's per-artifact switch.
+#[must_use]
+pub fn effective_grammar_enabled(runtime_enabled: bool, approval_enabled: bool) -> bool {
+    runtime_enabled && approval_enabled
+}
+
+/// Evaluate the fail-closed owned-decode cutover predicate. Owned decode may
+/// become the preferred lane only when every required condition holds; if
+/// scheduler evidence or another required certification condition is blocked or
+/// incomplete, owned decode remains disabled.
 pub fn cutover_enabled(record: &CutoverRecord, inputs: &CutoverInputs) -> bool {
     let constrained_ok = !record.grammar_enabled || inputs.constrained_certified;
     inputs.artifacts_trusted
@@ -354,6 +411,53 @@ mod tests {
             llama,
             equivalent_fingerprints: BTreeSet::new(),
         }
+    }
+
+    #[test]
+    fn serving_predicate_is_fail_closed_for_every_gate() {
+        let mut inputs = ServingPredicateInputs {
+            approval_enabled: true,
+            approval_identity_matches: true,
+            current_profile_matches: true,
+            current_epoch_valid: true,
+            certification_matches: true,
+            evidence_revisions_compatible: true,
+            gates_complete: true,
+            processing_fingerprint_matches: true,
+            runtime_config_digest_matches: true,
+            worker_path_matches: true,
+            constrained_identities_match: true,
+            artifacts_trusted: true,
+            identities_installed: true,
+            quarantined: false,
+            wire_bindings_literal: true,
+            scheduler_evidence_committed: true,
+        };
+        assert!(serving_predicate(&inputs));
+        macro_rules! rejects_when_false {
+            ($field:ident) => {
+                inputs.$field = false;
+                assert!(!serving_predicate(&inputs));
+                inputs.$field = true;
+            };
+        }
+        rejects_when_false!(approval_enabled);
+        rejects_when_false!(approval_identity_matches);
+        rejects_when_false!(current_profile_matches);
+        rejects_when_false!(current_epoch_valid);
+        rejects_when_false!(certification_matches);
+        rejects_when_false!(evidence_revisions_compatible);
+        rejects_when_false!(gates_complete);
+        rejects_when_false!(processing_fingerprint_matches);
+        rejects_when_false!(runtime_config_digest_matches);
+        rejects_when_false!(worker_path_matches);
+        rejects_when_false!(constrained_identities_match);
+        rejects_when_false!(artifacts_trusted);
+        rejects_when_false!(identities_installed);
+        rejects_when_false!(wire_bindings_literal);
+        rejects_when_false!(scheduler_evidence_committed);
+        inputs.quarantined = true;
+        assert!(!serving_predicate(&inputs));
     }
 
     #[test]

@@ -1012,6 +1012,23 @@ pub struct OwnedDecodeAdmission {
     pub profile_activation_epoch: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeWriteOutcome {
+    Certified,
+    ProbeStale,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StaleProbeEvent {
+    pub outcome: String,
+    pub model_id: String,
+    pub decode_fingerprint: String,
+    pub observed_profile_activation_epoch: u64,
+    pub current_profile_activation_epoch: Option<u64>,
+    pub reason: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 // Staged storage API consumed by the epic's runtime slice; remove this allow there.
@@ -2187,6 +2204,155 @@ impl SynapseStore {
         Ok(())
     }
 
+    /// Atomically revalidate a probe snapshot and write terminal evidence. A
+    /// changed tuple records `stale_probe` and commits no cert row.
+    pub fn store_owned_decode_cert_row_if_current(
+        &self,
+        snapshot: &OwnedDecodeMatchInputs,
+        terminal: &OwnedDecodeMatchInputs,
+        row: &OwnedDecodeCertificationRow,
+        observed_at_ms: u64,
+    ) -> Result<ProbeWriteOutcome, SynapseStoreError> {
+        validate_owned_decode_cert_row(row)?;
+        let row_matches_terminal = row.revisioned_machine_profile_hash
+            == terminal.revisioned_machine_profile_hash
+            && row.profile_activation_epoch == terminal.profile_activation_epoch
+            && row.model_id == terminal.model_id
+            && row.decode_fingerprint == terminal.decode_fingerprint
+            && row.processing_fingerprint == terminal.processing_fingerprint
+            && row.runtime_config_digest == terminal.runtime_config_digest
+            && row.constraint_runtime_identities == terminal.constraint_runtime_identities
+            && row.worker_path_evidence == terminal.worker_path_evidence
+            && row.evidence_schema_revision == terminal.evidence_schema_revision
+            && row.g_dec_manifest_revision == terminal.g_dec_manifest_revision;
+        if row.revisioned_machine_profile_hash != snapshot.revisioned_machine_profile_hash
+            || row.profile_activation_epoch != snapshot.profile_activation_epoch
+            || row.model_id != snapshot.model_id
+            || row.decode_fingerprint != snapshot.decode_fingerprint
+            || !owned_decode_match_inputs_equal(snapshot, terminal)
+            || !row_matches_terminal
+        {
+            return self.record_stale_probe(
+                snapshot,
+                terminal,
+                "probe_tuple_changed",
+                observed_at_ms,
+            );
+        }
+        let evidence_json = serde_json::to_string(&row.evidence)?;
+        let identities_json = serde_json::to_string(&row.constraint_runtime_identities)?;
+        let worker_path_json = serde_json::to_string(&row.worker_path_evidence)?;
+        let outcome = self.store.with_conn_fenced(|tx| {
+            let (current_hash, current_epoch): (Option<String>, Option<i64>) = tx.query_row(
+                "SELECT revisioned_machine_profile_hash, profile_activation_epoch
+                 FROM profile_state WHERE id = 0",
+                [],
+                |query_row| Ok((query_row.get(0)?, query_row.get(1)?)),
+            )?;
+            if current_hash.as_deref() != Some(snapshot.revisioned_machine_profile_hash.as_str())
+                || current_epoch != Some(snapshot.profile_activation_epoch as i64)
+            {
+                let detail = serde_json::to_string(&StaleProbeEvent {
+                    outcome: "stale_probe".to_string(),
+                    model_id: snapshot.model_id.clone(),
+                    decode_fingerprint: snapshot.decode_fingerprint.clone(),
+                    observed_profile_activation_epoch: snapshot.profile_activation_epoch,
+                    current_profile_activation_epoch: current_epoch.map(|value| value as u64),
+                    reason: "profile_activation_changed".to_string(),
+                })
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+                tx.execute(
+                    "INSERT INTO cert_row_rebuild_events (outcome, detail, occurred_at_ms)
+                     VALUES (?1, ?2, ?3)",
+                    params!["stale_probe", detail, observed_at_ms as i64],
+                )?;
+                return Ok(ProbeWriteOutcome::ProbeStale);
+            }
+            tx.execute(
+                "INSERT INTO cert_rows (
+                     certification_class, assurance_class, status, key_hash,
+                     revisioned_machine_profile_hash, profile_activation_epoch,
+                     model_id, decode_fingerprint, numeric_profile_id, fingerprint,
+                     certified_at_ms, os_build, module_generation,
+                     evidence_schema_revision, processing_fingerprint,
+                     runtime_config_digest, constraint_runtime_identities_json,
+                     worker_path_evidence_json, g_dec_manifest_revision, evidence_json
+                 ) VALUES (
+                     'measured_owned_decode', 'measured', ?1, ?2, ?2, ?3, ?4, ?5,
+                     ?6, ?5, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16
+                 )
+                 ON CONFLICT (
+                     revisioned_machine_profile_hash, profile_activation_epoch,
+                     model_id, decode_fingerprint, evidence_schema_revision
+                 ) WHERE certification_class = 'measured_owned_decode'
+                 DO UPDATE SET
+                     status = excluded.status,
+                     numeric_profile_id = excluded.numeric_profile_id,
+                     fingerprint = excluded.fingerprint,
+                     certified_at_ms = excluded.certified_at_ms,
+                     os_build = excluded.os_build,
+                     module_generation = excluded.module_generation,
+                     processing_fingerprint = excluded.processing_fingerprint,
+                     runtime_config_digest = excluded.runtime_config_digest,
+                     constraint_runtime_identities_json = excluded.constraint_runtime_identities_json,
+                     worker_path_evidence_json = excluded.worker_path_evidence_json,
+                     g_dec_manifest_revision = excluded.g_dec_manifest_revision,
+                     evidence_json = excluded.evidence_json",
+                params![
+                    row.status.as_str(),
+                    &row.revisioned_machine_profile_hash,
+                    row.profile_activation_epoch as i64,
+                    &row.model_id,
+                    &row.decode_fingerprint,
+                    row.numeric_profile_id.as_ref().map(|id| &id.0),
+                    row.certified_at_ms as i64,
+                    &row.os_build,
+                    row.module_generation as i64,
+                    &row.evidence_schema_revision,
+                    &row.processing_fingerprint,
+                    &row.runtime_config_digest,
+                    identities_json,
+                    worker_path_json,
+                    &row.g_dec_manifest_revision,
+                    evidence_json,
+                ],
+            )?;
+            Ok(ProbeWriteOutcome::Certified)
+        })?;
+        Ok(outcome)
+    }
+
+    fn record_stale_probe(
+        &self,
+        snapshot: &OwnedDecodeMatchInputs,
+        terminal: &OwnedDecodeMatchInputs,
+        reason: &str,
+        observed_at_ms: u64,
+    ) -> Result<ProbeWriteOutcome, SynapseStoreError> {
+        let current_epoch = self.current_profile_activation_epoch()?;
+        let detail = serde_json::to_string(&StaleProbeEvent {
+            outcome: "stale_probe".to_string(),
+            model_id: snapshot.model_id.clone(),
+            decode_fingerprint: snapshot.decode_fingerprint.clone(),
+            observed_profile_activation_epoch: snapshot.profile_activation_epoch,
+            current_profile_activation_epoch: current_epoch,
+            reason: if snapshot.profile_activation_epoch != terminal.profile_activation_epoch {
+                "profile_activation_changed".to_string()
+            } else {
+                reason.to_string()
+            },
+        })?;
+        self.store.with_conn_fenced(|tx| {
+            tx.execute(
+                "INSERT INTO cert_row_rebuild_events (outcome, detail, occurred_at_ms)
+                 VALUES (?1, ?2, ?3)",
+                params!["stale_probe", detail, observed_at_ms as i64],
+            )?;
+            Ok(())
+        })?;
+        Ok(ProbeWriteOutcome::ProbeStale)
+    }
+
     pub fn get_owned_decode_cert_row(
         &self,
         revisioned_machine_profile_hash: &str,
@@ -2319,6 +2485,110 @@ impl SynapseStore {
                 certification,
                 revisioned_machine_profile_hash: revisioned_machine_profile_hash.to_string(),
                 profile_activation_epoch,
+            }))
+        })?;
+        Ok(admission)
+    }
+
+    /// Resolve the complete owned-decode match tuple in one fenced read. The
+    /// caller supplies runtime-derived identities, while this transaction reads
+    /// the approval, current profile epoch, and class-scoped certification row
+    /// without allowing a rotation to interleave with admission.
+    pub fn owned_decode_admission_matching(
+        &self,
+        inputs: &OwnedDecodeMatchInputs,
+    ) -> Result<Option<OwnedDecodeAdmission>, SynapseStoreError> {
+        if inputs.profile_activation_epoch == 0
+            || inputs.evidence_schema_revision != CERT_EVIDENCE_SCHEMA_REVISION
+            || inputs.g_dec_manifest_revision != G_DEC_MANIFEST_REVISION
+        {
+            return Ok(None);
+        }
+        let mut expected_constraints = inputs.constraint_runtime_identities.clone();
+        expected_constraints.sort();
+        if expected_constraints
+            .windows(2)
+            .any(|pair| pair[0] == pair[1])
+        {
+            return Ok(None);
+        }
+        let admission = self.store.with_conn_fenced(|tx| {
+            let (persisted_hash, persisted_epoch): (Option<String>, Option<i64>) = tx.query_row(
+                "SELECT revisioned_machine_profile_hash, profile_activation_epoch
+                 FROM profile_state WHERE id = 0",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            if persisted_hash.as_deref() != Some(inputs.revisioned_machine_profile_hash.as_str())
+                || persisted_epoch != Some(inputs.profile_activation_epoch as i64)
+            {
+                return Ok(None);
+            }
+            let catalog_matches: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM models WHERE model_id = ?1",
+                params![&inputs.model_id],
+                |row| row.get(0),
+            )?;
+            if catalog_matches != 1 || !is_catalog_model_id(&inputs.model_id) {
+                return Ok(None);
+            }
+            let Some(approval) =
+                load_approval_tx_by_identity(tx, &inputs.model_id, &inputs.decode_fingerprint)?
+            else {
+                return Ok(None);
+            };
+            validate_approval(&approval, true).map_err(to_sql_error)?;
+            if !approval.enabled {
+                return Ok(None);
+            }
+            let raw = tx
+                .query_row(
+                    &format!(
+                        "{OWNED_CERT_SELECT_SQL}
+                         WHERE certification_class = 'measured_owned_decode'
+                           AND status = 'certified'
+                           AND revisioned_machine_profile_hash = ?1
+                           AND profile_activation_epoch = ?2
+                           AND model_id = ?3
+                           AND decode_fingerprint = ?4
+                           AND evidence_schema_revision = ?5"
+                    ),
+                    params![
+                        &inputs.revisioned_machine_profile_hash,
+                        inputs.profile_activation_epoch as i64,
+                        &inputs.model_id,
+                        &inputs.decode_fingerprint,
+                        &inputs.evidence_schema_revision,
+                    ],
+                    owned_decode_cert_row_from_row,
+                )
+                .optional()?;
+            let Some(raw) = raw else { return Ok(None) };
+            let certification = decode_owned_decode_cert_row(raw).map_err(to_sql_error)?;
+            validate_owned_decode_cert_row(&certification).map_err(to_sql_error)?;
+            if certification.revisioned_machine_profile_hash
+                != inputs.revisioned_machine_profile_hash
+                || certification.profile_activation_epoch != inputs.profile_activation_epoch
+                || certification.model_id != inputs.model_id
+                || certification.decode_fingerprint != inputs.decode_fingerprint
+                || certification.processing_fingerprint != inputs.processing_fingerprint
+                || certification.runtime_config_digest != inputs.runtime_config_digest
+                || certification.constraint_runtime_identities != expected_constraints
+                || certification.worker_path_evidence != inputs.worker_path_evidence
+                || certification.evidence_schema_revision != inputs.evidence_schema_revision
+                || certification.g_dec_manifest_revision != inputs.g_dec_manifest_revision
+                || !complete_g_dec_evidence(
+                    &certification.evidence,
+                    &inputs.g_dec_manifest_revision,
+                )
+            {
+                return Ok(None);
+            }
+            Ok(Some(OwnedDecodeAdmission {
+                approval,
+                certification,
+                revisioned_machine_profile_hash: inputs.revisioned_machine_profile_hash.clone(),
+                profile_activation_epoch: inputs.profile_activation_epoch,
             }))
         })?;
         Ok(admission)
@@ -2599,6 +2869,17 @@ impl SynapseStore {
         raw.map(decode_cert_row).transpose()
     }
 
+    pub fn current_profile_activation_epoch(&self) -> Result<Option<u64>, SynapseStoreError> {
+        let epoch = self.store.with_conn(|conn| {
+            conn.query_row(
+                "SELECT profile_activation_epoch FROM profile_state WHERE id = 0",
+                [],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+        })?;
+        Ok(epoch.map(|value| value as u64))
+    }
+
     pub fn profile_state(&self) -> Result<ProfileState, SynapseStoreError> {
         let state = self.store.with_conn(|conn| {
             conn.query_row(
@@ -2798,6 +3079,23 @@ impl SynapseStore {
                 event: Some(event),
             })
         })?;
+        if activation.rotated {
+            if let Some(event) = activation.event.as_ref() {
+                if event.changed_fields.iter().any(|field| field == "os_build") {
+                    eprintln!(
+                        "WARN machine profile rotation epoch={} changed_fields={}",
+                        event.new_profile_activation_epoch,
+                        event.changed_fields.join(",")
+                    );
+                } else {
+                    eprintln!(
+                        "INFO machine profile rotation epoch={} changed_fields={}",
+                        event.new_profile_activation_epoch,
+                        event.changed_fields.join(",")
+                    );
+                }
+            }
+        }
         Ok(activation)
     }
 
@@ -3009,21 +3307,24 @@ impl SynapseStore {
                         })?,
                         _ => None,
                     };
-                    if let Some((schema_revision, manifest_revision)) = stored_revisions {
-                        if schema_revision != CERT_EVIDENCE_SCHEMA_REVISION {
-                            evidence_requirements_divergence.push(EvidenceRequirementsDivergence {
-                                model_id: approval.model_id.clone(),
-                                decode_fingerprint: approval.decode_fingerprint.clone(),
-                                result: "evidence_schema_incompatible".to_string(),
-                            });
-                        } else if manifest_revision != G_DEC_MANIFEST_REVISION {
-                            evidence_requirements_divergence.push(EvidenceRequirementsDivergence {
-                                model_id: approval.model_id.clone(),
-                                decode_fingerprint: approval.decode_fingerprint.clone(),
-                                result: "manifest_revision_incompatible".to_string(),
-                            });
+                    let divergence = match stored_revisions {
+                        Some((schema_revision, _))
+                            if schema_revision != CERT_EVIDENCE_SCHEMA_REVISION =>
+                        {
+                            "evidence_schema_incompatible"
                         }
-                    }
+                        Some((_, manifest_revision))
+                            if manifest_revision != G_DEC_MANIFEST_REVISION =>
+                        {
+                            "manifest_revision_incompatible"
+                        }
+                        _ => "compatible",
+                    };
+                    evidence_requirements_divergence.push(EvidenceRequirementsDivergence {
+                        model_id: approval.model_id.clone(),
+                        decode_fingerprint: approval.decode_fingerprint.clone(),
+                        result: divergence.to_string(),
+                    });
                     let current = match (
                         state.revisioned_machine_profile_hash.as_deref(),
                         state.profile_activation_epoch,
@@ -4546,6 +4847,22 @@ fn load_approval_tx_by_identity(
         approval_from_row,
     )
     .optional()
+}
+
+fn owned_decode_match_inputs_equal(
+    left: &OwnedDecodeMatchInputs,
+    right: &OwnedDecodeMatchInputs,
+) -> bool {
+    left.revisioned_machine_profile_hash == right.revisioned_machine_profile_hash
+        && left.profile_activation_epoch == right.profile_activation_epoch
+        && left.model_id == right.model_id
+        && left.decode_fingerprint == right.decode_fingerprint
+        && left.processing_fingerprint == right.processing_fingerprint
+        && left.runtime_config_digest == right.runtime_config_digest
+        && left.constraint_runtime_identities == right.constraint_runtime_identities
+        && left.worker_path_evidence == right.worker_path_evidence
+        && left.evidence_schema_revision == right.evidence_schema_revision
+        && left.g_dec_manifest_revision == right.g_dec_manifest_revision
 }
 
 // Staged storage API consumed by the epic's runtime slice; remove this allow there.
@@ -6160,9 +6477,51 @@ mod tests {
         };
         let hash_a = profile_a.revisioned_hash();
         let hash_b = profile_b.revisioned_hash();
-        store
-            .store_owned_decode_cert_row(&row(1, hash_a.clone()))
+        let row_a = row(1, hash_a.clone());
+        store.store_owned_decode_cert_row(&row_a).unwrap();
+        let snapshot_inputs = OwnedDecodeMatchInputs {
+            revisioned_machine_profile_hash: hash_a.clone(),
+            profile_activation_epoch: 1,
+            model_id: "owned-model".to_string(),
+            decode_fingerprint: decode_fingerprint.clone(),
+            processing_fingerprint: "processing".to_string(),
+            runtime_config_digest: "runtime".to_string(),
+            constraint_runtime_identities: Vec::new(),
+            worker_path_evidence: serde_json::json!({}),
+            evidence_schema_revision: CERT_EVIDENCE_SCHEMA_REVISION.to_string(),
+            g_dec_manifest_revision: G_DEC_MANIFEST_REVISION.to_string(),
+        };
+        let mut changed_terminal = snapshot_inputs.clone();
+        changed_terminal.processing_fingerprint = "processing-changed".to_string();
+        let stale = store
+            .store_owned_decode_cert_row_if_current(&snapshot_inputs, &changed_terminal, &row_a, 2)
             .unwrap();
+        assert_eq!(stale, ProbeWriteOutcome::ProbeStale);
+        assert_eq!(
+            store
+                .get_owned_decode_cert_row(
+                    &hash_a,
+                    1,
+                    "owned-model",
+                    &decode_fingerprint,
+                    CERT_EVIDENCE_SCHEMA_REVISION,
+                )
+                .unwrap()
+                .unwrap()
+                .processing_fingerprint,
+            "processing"
+        );
+        let stale_events: i64 = store
+            .store
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM cert_row_rebuild_events WHERE outcome = 'stale_probe'",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(stale_events, 1);
         assert!(store
             .owned_decode_admission("owned-model", &decode_fingerprint, &hash_a, 1)
             .unwrap()

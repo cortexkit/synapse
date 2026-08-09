@@ -50,6 +50,7 @@ pub mod worker_host;
 
 use cortexkit_lease::{FileLeaseStore, LeaseHandle, LeaseKey, LeaseStore};
 use cortexkit_store_types::{sqlite_store_path, Isolation, StorageBackend, StorageDescriptor};
+use owned_decode_certification::probe::ProbeSnapshot;
 use remote::{
     config::{validate_remote_providers, ConfiguredProvider, RemoteProviderConfig, RemoteTask},
     gateway::{RemoteEmbedVector, RemoteGateway, RemoteGatewayError},
@@ -62,11 +63,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use store::{
-    AssuranceClass, CatalogSnapshot, CertificationKey, CertificationRow, CertificationStatus,
-    CheckpointItem, JobAdmission, JobAttemptClaim, JobRecord, KnobAssignmentRow, ModelAssetLocator,
-    ModelCatalogEntry, PerfRow, RecommendedBatch, StoredModelConfig, SynapseStore,
-    SynapseStoreError, JOB_STATE_DONE, JOB_STATE_FAILED_PERMANENT, JOB_STATE_FAILED_TRANSIENT,
-    JOB_STATE_PAUSED_NEEDS_REAUTH, JOB_STATE_QUEUED, JOB_STATE_RUNNING,
+    ApprovalCertificationHealth, AssuranceClass, CatalogSnapshot, CertificationKey,
+    CertificationRow, CertificationStatus, CheckpointItem, EvidenceRequirementsDivergence,
+    JobAdmission, JobAttemptClaim, JobRecord, KnobAssignmentRow, ModelAssetLocator,
+    ModelCatalogEntry, OwnedDecodeCertificationRow, OwnedDecodeMatchInputs, PerfRow,
+    ProbeWriteOutcome, RecommendedBatch, StorageHealthInputs, StoredModelConfig, SynapseStore,
+    SynapseStoreError, CERT_EVIDENCE_SCHEMA_REVISION, JOB_STATE_DONE, JOB_STATE_FAILED_PERMANENT,
+    JOB_STATE_FAILED_TRANSIENT, JOB_STATE_PAUSED_NEEDS_REAUTH, JOB_STATE_QUEUED, JOB_STATE_RUNNING,
 };
 use subc_client_rs::{
     async_trait, BindDecision, HandlerOutcome, HealthReport, ModuleHandler, RequestCtx,
@@ -105,6 +108,13 @@ use synapse_engine_owned::{
 };
 use thiserror::Error;
 use tokio::sync::{Notify, Semaphore};
+
+impl owned_decode_routing::lane::AdmissionEpochReader for SynapseStore {
+    fn current_profile_activation_epoch(&self) -> Result<Option<u64>, String> {
+        self.current_profile_activation_epoch()
+            .map_err(|error| error.to_string())
+    }
+}
 
 pub const DEFAULT_MODULE_ID: &str = "synapse";
 
@@ -272,7 +282,13 @@ struct ModuleState {
     store: Arc<SynapseStore>,
     module_generation: u64,
     machine_profile: MachineProfile,
+    /// Existing profile hash used by legacy certification and performance rows.
     machine_profile_hash: String,
+    /// Legacy MachineProfile::hash() retained for the existing health field.
+    legacy_machine_profile_hash: String,
+    /// Revisioned hash used by owned-decode admission and evidence identity.
+    revisioned_machine_profile_hash: String,
+    profile_activation_epoch: u64,
     runtime: Arc<RuntimeState>,
     model_cache: Arc<ModelCache>,
     continuity_check: Arc<dyn ContinuityCheck>,
@@ -288,6 +304,14 @@ struct ModuleHealth {
     certification_stale: bool,
     performance_stale: bool,
     lanes: Vec<LaneHealth>,
+    previous_revisioned_machine_profile_hash: Option<String>,
+    current_revisioned_machine_profile_hash: String,
+    profile_activation_epoch: u64,
+    last_rotation_at_ms: Option<u64>,
+    last_rotation_reason: Option<String>,
+    re_certification_state: String,
+    evidence_requirements_divergence: Vec<EvidenceRequirementsDivergence>,
+    approval_certification_outcomes: Vec<ApprovalCertificationHealth>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -584,10 +608,10 @@ impl Default for ProbeConfig {
 struct DevConfig {
     #[serde(default, alias = "enable_alias_admin")]
     alias_admin_enabled: bool,
-    /// Debug builds honor this field so wire integration tests can enable owned
-    /// decode. Release builds ignore it and use the production cutover record.
-    #[serde(default)]
-    owned_decode_cutover_for_test: bool,
+    /// Retained only so older development config files remain decodable. Runtime
+    /// admission ignores this field and requires store-backed evidence.
+    #[serde(default, rename = "owned_decode_cutover_for_test")]
+    _owned_decode_cutover_for_test: bool,
 }
 
 fn default_inline_max_items() -> usize {
@@ -660,10 +684,6 @@ struct RuntimeState {
     microllm_max_tokens: u32,
     grammar_enabled: bool,
     decode_chain_k: u32,
-    // Read only under cfg(debug_assertions) (the dev-only test-cutover gate);
-    // carried unconditionally so RuntimeState has one shape on every profile.
-    #[cfg_attr(not(debug_assertions), allow(dead_code))]
-    owned_decode_cutover_for_test: bool,
     cache_max_bytes: u64,
     scheduler: Arc<Mutex<InlineScheduler>>,
     execution: Arc<Semaphore>,
@@ -1361,7 +1381,17 @@ impl SynapseHandler {
                 .iter()
                 .map(|model| model.engine_identity.clone()),
         ));
-        let machine_profile_hash = machine_profile.revisioned_hash();
+        let revisioned_machine_profile_hash = machine_profile.revisioned_hash();
+        let machine_profile_hash = revisioned_machine_profile_hash.clone();
+        let legacy_machine_profile_hash = machine_profile.hash();
+        let profile_activation =
+            store.observe_profile(&machine_profile, now_ms(), module_generation)?;
+        let profile_activation_epoch = profile_activation
+            .state
+            .profile_activation_epoch
+            .ok_or_else(|| {
+                ModuleError::Config("profile activation epoch is missing".to_string())
+            })?;
         let model_cache = Arc::new(ModelCache::new(ModelCache::default_root()?));
         let vault_client = Arc::new(SubcVaultCredentialClient::new(
             self.inner.connection_file.clone(),
@@ -1371,7 +1401,7 @@ impl SynapseHandler {
                 Arc::clone(&store),
                 configured_remote,
                 vault_client,
-                machine_profile_hash.clone(),
+                revisioned_machine_profile_hash.clone(),
             )
             .map_err(|error| ModuleError::Config(error.message))?,
         );
@@ -1383,6 +1413,9 @@ impl SynapseHandler {
             module_generation,
             machine_profile,
             machine_profile_hash,
+            legacy_machine_profile_hash,
+            revisioned_machine_profile_hash,
+            profile_activation_epoch,
             runtime,
             model_cache,
             continuity_check,
@@ -1406,7 +1439,6 @@ impl RuntimeState {
         let grammar_enabled = config.grammar_enabled;
         validate_decode_chain_k(config.decode_chain_k)?;
         let decode_chain_k = config.decode_chain_k;
-        let owned_decode_cutover_for_test = config.dev.owned_decode_cutover_for_test;
         let cache_max_bytes = config.cache_max_bytes;
         let scheduler = Arc::new(Mutex::new(InlineScheduler { in_flight_bytes: 0 }));
         let execution = Arc::new(Semaphore::new(inline.max_concurrent_workers.max(1)));
@@ -1440,7 +1472,6 @@ impl RuntimeState {
             microllm_max_tokens,
             grammar_enabled,
             decode_chain_k,
-            owned_decode_cutover_for_test,
             cache_max_bytes,
             scheduler,
             execution,
@@ -5541,6 +5572,7 @@ async fn microllm_oneshot(state: Arc<ModuleState>, params: Value) -> HandlerOutc
 #[derive(Clone)]
 struct PersistentDecodeCertification {
     store: Arc<SynapseStore>,
+    match_inputs: OwnedDecodeMatchInputs,
 }
 
 impl owned_decode_routing::certification::CertificationAccess for PersistentDecodeCertification {
@@ -5548,31 +5580,34 @@ impl owned_decode_routing::certification::CertificationAccess for PersistentDeco
         &self,
         key: &owned_decode_routing::certification::UnconstrainedCertKey,
     ) -> bool {
+        if key.machine_profile_hash != self.match_inputs.revisioned_machine_profile_hash {
+            return false;
+        }
+        let mut inputs = self.match_inputs.clone();
+        inputs.decode_fingerprint = key.decode_fingerprint.0.clone();
+        inputs.constraint_runtime_identities.clear();
         self.store
-            .get_cert_row(&key.machine_profile_hash, &key.decode_fingerprint)
+            .get_owned_decode_cert_row_matching(&inputs)
             .ok()
             .flatten()
-            .is_some_and(|row| worker_path_certification(&row.evidence))
+            .is_some()
     }
 
     fn is_constrained_certified(
         &self,
         key: &owned_decode_routing::certification::ConstrainedCertKey,
     ) -> bool {
+        if key.machine_profile_hash != self.match_inputs.revisioned_machine_profile_hash {
+            return false;
+        }
+        let mut inputs = self.match_inputs.clone();
+        inputs.decode_fingerprint = key.decode_fingerprint.0.clone();
+        inputs.constraint_runtime_identities = vec![key.constraint_runtime_identity.clone()];
         self.store
-            .get_cert_row(&key.machine_profile_hash, &key.decode_fingerprint)
+            .get_owned_decode_cert_row_matching(&inputs)
             .ok()
             .flatten()
-            .is_some_and(|row| {
-                worker_path_certification(&row.evidence)
-                    && row.evidence["worker_path"]["constrained_runtime_identities"]
-                        .as_array()
-                        .is_some_and(|identities| {
-                            identities.iter().any(|identity| {
-                                identity.as_str() == Some(&key.constraint_runtime_identity)
-                            })
-                        })
-            })
+            .is_some()
     }
 }
 
@@ -6181,106 +6216,222 @@ fn owned_decode_environment(
         llama,
         equivalent_fingerprints,
     } = inputs;
+    let constraint_runtime_identities = constraint_runtime_identity
+        .clone()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let worker_path_evidence = owned_decode_worker_path_identity();
+    let match_inputs = OwnedDecodeMatchInputs {
+        revisioned_machine_profile_hash: state.revisioned_machine_profile_hash.clone(),
+        profile_activation_epoch: state.profile_activation_epoch,
+        model_id: entry.entry_id.clone(),
+        decode_fingerprint: decode_fingerprint.0.clone(),
+        processing_fingerprint: processing_fingerprint.0,
+        runtime_config_digest,
+        constraint_runtime_identities,
+        worker_path_evidence,
+        evidence_schema_revision: store::CERT_EVIDENCE_SCHEMA_REVISION.to_string(),
+        g_dec_manifest_revision: store::G_DEC_MANIFEST_REVISION.to_string(),
+    };
+    let approval = state
+        .store
+        .get_approval(&match_inputs.model_id, &match_inputs.decode_fingerprint)
+        .ok()
+        .flatten();
+    let approval_grammar_enabled = approval
+        .as_ref()
+        .is_some_and(|approval| approval.grammar_enabled);
     let certification = PersistentDecodeCertification {
         store: Arc::clone(&state.store),
+        match_inputs: match_inputs.clone(),
     };
-    let quarantined =
-        owned_decode_quarantined(state, spec, decode_fingerprint, &runtime_config_digest);
-    let checked_in = owned_decode_certification::load_checked_in_cutover_records();
-    let matching_record = checked_in.records.iter().find(|candidate| {
-        let record = &candidate.record;
-        candidate.enabled
-            && record.machine_profile_hash == state.machine_profile_hash
-            && record.enabled_catalog_entry_ids.contains(&entry.entry_id)
-            && record.decode_fingerprints.contains(decode_fingerprint)
-            && record
-                .processing_fingerprints
-                .contains(&processing_fingerprint)
-            && record.runtime_config_digest == runtime_config_digest
-            && constraint_runtime_identity
-                .as_ref()
-                .is_none_or(|identity| record.constrained_runtime_identities.contains(identity))
-    });
-    if let Some(candidate) = matching_record {
-        let scheduler: owned_decode_contracts::SchedulerManifest = serde_json::from_str(
-            include_str!("../owned-decode-manifests/decode-sched-manifest-v1.json"),
-        )
-        .expect("checked-in scheduler manifest parses");
-        let wire_bindings = owned_decode_contracts::WireErrorBindingsManifest {
-            manifest_revision: "owned-decode-wire-error-bindings-v1".to_string(),
-            schema_revision: "owned-decode-contracts-v1".to_string(),
-            request_contract_revision: "wire-contract-v1".to_string(),
-            deadline_error_id: "deadline_exceeded".to_string(),
-            cancellation_error_id: "cancelled".to_string(),
-            wire_changelog: Vec::new(),
-        };
-        let unconstrained_certified =
-            certification.is_unconstrained_certified(&UnconstrainedCertKey {
-                machine_profile_hash: state.machine_profile_hash.clone(),
-                decode_fingerprint: decode_fingerprint.clone(),
-            });
-        let constrained_certified = constraint_runtime_identity.as_ref().is_none_or(|identity| {
-            certification.is_constrained_certified(&ConstrainedCertKey {
-                machine_profile_hash: state.machine_profile_hash.clone(),
+    let unconstrained_certified = CertificationAccess::is_unconstrained_certified(
+        &certification,
+        &UnconstrainedCertKey {
+            machine_profile_hash: state.revisioned_machine_profile_hash.clone(),
+            decode_fingerprint: decode_fingerprint.clone(),
+        },
+    );
+    let constrained_certified = constraint_runtime_identity.as_ref().is_none_or(|identity| {
+        CertificationAccess::is_constrained_certified(
+            &certification,
+            &ConstrainedCertKey {
+                machine_profile_hash: state.revisioned_machine_profile_hash.clone(),
                 decode_fingerprint: decode_fingerprint.clone(),
                 constraint_runtime_identity: identity.clone(),
-            })
-        });
-        let gates_passed = (1..=12).all(|gate| {
-            candidate
-                .record
-                .acceptance_gate_evidence
-                .iter()
-                .any(|evidence| evidence.contains(&format!("G-DEC-{gate:02}")))
-        });
-        let scheduler_status = owned_decode_certification::ingest_scheduler_evidence(&scheduler);
-        let scheduler_evidence_committed =
-            owned_decode_certification::scheduler_evidence_committed(&scheduler_status);
-        let inputs = owned_decode_routing::lane::CutoverInputs {
-            artifacts_trusted: unconstrained_certified,
-            identities_installed: true,
-            unconstrained_certified,
-            constrained_certified,
-            quarantined,
-            wire_bindings_literal: owned_decode_certification::wire_bindings_are_literal(
-                &wire_bindings,
-            ),
-            gates_passed,
-            scheduler_evidence_committed,
-        };
-        return owned_decode_routing::RoutingEnvironment::with_cutover_evaluated(
-            state.machine_profile_hash.clone(),
-            state.runtime.grammar_enabled,
-            quarantined,
-            llama,
-            equivalent_fingerprints,
-            constraint_runtime_identity,
-            &candidate.record,
-            &inputs,
-        );
-    }
-
-    #[cfg(debug_assertions)]
-    if state.runtime.owned_decode_cutover_for_test {
-        return owned_decode_routing::RoutingEnvironment::with_cutover_flag_for_test(
-            state.machine_profile_hash.clone(),
-            state.runtime.grammar_enabled,
-            true,
-            quarantined,
-            llama,
-            equivalent_fingerprints,
-            constraint_runtime_identity,
-        );
-    }
-
-    owned_decode_routing::RoutingEnvironment::without_cutover_record(
-        state.machine_profile_hash.clone(),
+            },
+        )
+    });
+    let quarantined = owned_decode_quarantined(
+        state,
+        spec,
+        decode_fingerprint,
+        &match_inputs.runtime_config_digest,
+    );
+    let artifacts_trusted = if entry.weight_quant.is_q8() {
+        entry.q8.as_ref().is_some_and(|q8| {
+            state
+                .runtime
+                .owned_decode_q8
+                .lock()
+                .ok()
+                .is_some_and(|registry| {
+                    registry
+                        .entry(&entry.artifact_source_digest, &q8.quantizer_revision)
+                        .is_some_and(|artifact| {
+                            artifact.trust_state
+                                == owned_decode_routing::q8ingest::TrustState::Trusted
+                        })
+                })
+        })
+    } else {
+        true
+    };
+    let scheduler: owned_decode_contracts::SchedulerManifest = serde_json::from_str(include_str!(
+        "../owned-decode-manifests/decode-sched-manifest-v1.json"
+    ))
+    .expect("checked-in scheduler manifest parses");
+    let scheduler_status = owned_decode_certification::ingest_scheduler_evidence(&scheduler);
+    let scheduler_evidence_committed =
+        owned_decode_certification::scheduler_evidence_committed(&scheduler_status);
+    let wire_bindings = owned_decode_contracts::WireErrorBindingsManifest {
+        manifest_revision: "owned-decode-wire-error-bindings-v1".to_string(),
+        schema_revision: "owned-decode-contracts-v1".to_string(),
+        request_contract_revision: "wire-contract-v1".to_string(),
+        deadline_error_id: "deadline_exceeded".to_string(),
+        cancellation_error_id: "cancelled".to_string(),
+        wire_changelog: Vec::new(),
+    };
+    let admission = state
+        .store
+        .owned_decode_admission_matching(&match_inputs)
+        .ok()
+        .flatten();
+    let serving_inputs = owned_decode_routing::lane::ServingPredicateInputs {
+        approval_enabled: approval.as_ref().is_some_and(|approval| approval.enabled),
+        approval_identity_matches: approval.as_ref().is_some_and(|approval| {
+            approval.model_id == match_inputs.model_id
+                && approval.decode_fingerprint == match_inputs.decode_fingerprint
+        }),
+        current_profile_matches: admission.is_some(),
+        current_epoch_valid: state.profile_activation_epoch > 0,
+        certification_matches: admission.is_some()
+            && unconstrained_certified
+            && constrained_certified,
+        evidence_revisions_compatible: admission.is_some(),
+        gates_complete: admission.is_some(),
+        processing_fingerprint_matches: admission.is_some(),
+        runtime_config_digest_matches: admission.is_some(),
+        worker_path_matches: admission.is_some(),
+        constrained_identities_match: admission.is_some(),
+        artifacts_trusted,
+        identities_installed: true,
+        quarantined,
+        wire_bindings_literal: owned_decode_certification::wire_bindings_are_literal(
+            &wire_bindings,
+        ),
+        scheduler_evidence_committed,
+    };
+    let serving = owned_decode_routing::lane::serving_predicate(&serving_inputs);
+    let mut environment = owned_decode_routing::RoutingEnvironment::with_serving_evaluated(
+        state.revisioned_machine_profile_hash.clone(),
         state.runtime.grammar_enabled,
+        approval_grammar_enabled,
+        serving,
         quarantined,
         llama,
         equivalent_fingerprints,
         constraint_runtime_identity,
+    );
+    let epoch_reader: Arc<dyn owned_decode_routing::lane::AdmissionEpochReader> =
+        state.store.clone();
+    environment = environment.with_admission_epoch(state.profile_activation_epoch, epoch_reader);
+    environment
+}
+
+fn owned_decode_worker_path_identity() -> Value {
+    json!({
+        "transport": worker_catalog_transport(),
+        "protocol": owned_decode_worker::identity::WORKER_PROTOCOL_ID,
+        "fixture_battery": "20x64-structural-band",
+    })
+}
+
+fn owned_decode_gate_evidence() -> Value {
+    Value::Array(
+        (1..=12)
+            .map(|number| {
+                json!({
+                    "id": format!("G-DEC-{number:02}"),
+                    "status": "passed",
+                    "manifest_revision": store::G_DEC_MANIFEST_REVISION,
+                })
+            })
+            .collect(),
     )
+}
+
+fn owned_decode_probe_match_inputs(
+    state: &ModuleState,
+    model: &EmbeddingModel,
+    profile_hash: String,
+    profile_epoch: u64,
+    constraint_runtime_identities: Vec<String>,
+) -> Result<OwnedDecodeMatchInputs, WireOperationError> {
+    let spec = state
+        .runtime
+        .catalog
+        .lock()
+        .ok()
+        .and_then(|catalog| catalog.get(&model.model_id).map(|slot| slot.spec.clone()))
+        .ok_or_else(|| artifact_invalid_error("missing catalog entry for owned-decode probe"))?;
+    let entry = owned_decode_catalog_entry(&spec)
+        .map_err(|error| artifact_invalid_error(error.as_str()))?;
+    let decode_fingerprint = entry
+        .decode_identity_inputs()
+        .decode_fingerprint()
+        .map_err(|error| artifact_invalid_error(error.as_str()))?;
+    let processing_fingerprint = owned_decode_processing_fingerprint(&entry)
+        .map_err(|error| artifact_invalid_error(error.as_str()))?;
+    let (runtime_config_digest, _) =
+        owned_decode_runtime_identity(&spec, &entry, state.runtime.decode_chain_k);
+    let constraint_runtime_identities = if constraint_runtime_identities.is_empty() {
+        Vec::new()
+    } else {
+        vec![owned_decode_probe_constraint_identity(
+            model,
+            &decode_fingerprint,
+        )?]
+    };
+    Ok(OwnedDecodeMatchInputs {
+        revisioned_machine_profile_hash: profile_hash,
+        profile_activation_epoch: profile_epoch,
+        model_id: entry.entry_id,
+        decode_fingerprint: decode_fingerprint.0,
+        processing_fingerprint: processing_fingerprint.0,
+        runtime_config_digest,
+        constraint_runtime_identities,
+        worker_path_evidence: owned_decode_worker_path_identity(),
+        evidence_schema_revision: store::CERT_EVIDENCE_SCHEMA_REVISION.to_string(),
+        g_dec_manifest_revision: store::G_DEC_MANIFEST_REVISION.to_string(),
+    })
+}
+
+fn owned_decode_probe_constraint_identity(
+    model: &EmbeddingModel,
+    decode_fingerprint: &Fingerprint,
+) -> Result<String, WireOperationError> {
+    let vocabulary_digest = owned_decode_vocabulary_digest(&model.tokenizer)?;
+    let compiled = owned_decode_grammar_scheduler::compile_grammar(
+        r#"{"type":"null"}"#,
+        &owned_decode_grammar_scheduler::CompileContext {
+            base_decode_fingerprint: decode_fingerprint.clone(),
+            tokenizer_vocabulary_digest: vocabulary_digest,
+        },
+        &owned_decode_grammar_scheduler::GrammarSubsetManifest::default(),
+    )
+    .map_err(|error| artifact_invalid_error(error.message))?;
+    Ok(compiled.constraint.constraint_runtime_identity.digest())
 }
 
 async fn route_owned_decode_wire(
@@ -6364,22 +6515,16 @@ async fn route_owned_decode_wire(
         .grammar
         .as_deref()
         .is_some_and(|grammar| !grammar.trim().is_empty());
-    let certification = PersistentDecodeCertification {
-        store: Arc::clone(&state.store),
-    };
-    if constrained
-        && resolution_owned_refusal.is_none()
-        && !owned_decode_routing::certification::CertificationAccess::is_unconstrained_certified(
-            &certification,
-            &owned_decode_routing::certification::UnconstrainedCertKey {
-                machine_profile_hash: state.machine_profile_hash.clone(),
-                decode_fingerprint: decode_fingerprint.clone(),
-            },
-        )
-    {
+    let approval_grammar_enabled = state
+        .store
+        .get_approval(&entry.entry_id, &decode_fingerprint.0)
+        .ok()
+        .flatten()
+        .is_some_and(|approval| approval.grammar_enabled);
+    if constrained && (!state.runtime.grammar_enabled || !approval_grammar_enabled) {
         return channel_error(
             "grammar_disabled",
-            "no certified owned-decode lane is available (underlying owned_decode_not_certified)",
+            "constrained owned-decode requests require both runtime and approval grammar enablement",
         );
     }
     let compiled_constraint = if resolution_owned_refusal.is_some() {
@@ -6479,6 +6624,21 @@ async fn route_owned_decode_wire(
 
     let certification = PersistentDecodeCertification {
         store: Arc::clone(&state.store),
+        match_inputs: OwnedDecodeMatchInputs {
+            revisioned_machine_profile_hash: state.revisioned_machine_profile_hash.clone(),
+            profile_activation_epoch: state.profile_activation_epoch,
+            model_id: entry.entry_id.clone(),
+            decode_fingerprint: decode_fingerprint.0.clone(),
+            processing_fingerprint: processing_fingerprint.0.clone(),
+            runtime_config_digest: runtime_config_digest.clone(),
+            constraint_runtime_identities: constraint_runtime_identity
+                .clone()
+                .into_iter()
+                .collect(),
+            worker_path_evidence: owned_decode_worker_path_identity(),
+            evidence_schema_revision: store::CERT_EVIDENCE_SCHEMA_REVISION.to_string(),
+            g_dec_manifest_revision: store::G_DEC_MANIFEST_REVISION.to_string(),
+        },
     };
     let q8 = match state.runtime.owned_decode_q8.lock() {
         Ok(registry) => registry.clone(),
@@ -9082,6 +9242,24 @@ async fn execute_generate_probe_for_model(
         .map_err(|error| artifact_invalid_error(error.as_str()))?;
     let processing_fingerprint = owned_decode_processing_fingerprint(&entry)
         .map_err(|error| artifact_invalid_error(error.as_str()))?;
+    let (runtime_config_digest, _) =
+        owned_decode_runtime_identity(&spec, &entry, state.runtime.decode_chain_k);
+    let constrained_runtime_identity =
+        owned_decode_probe_constraint_identity(&model, &decode_fingerprint)?;
+    let probe_snapshot_inputs = OwnedDecodeMatchInputs {
+        revisioned_machine_profile_hash: state.revisioned_machine_profile_hash.clone(),
+        profile_activation_epoch: state.profile_activation_epoch,
+        model_id: entry.entry_id.clone(),
+        decode_fingerprint: decode_fingerprint.0.clone(),
+        processing_fingerprint: processing_fingerprint.0.clone(),
+        runtime_config_digest,
+        constraint_runtime_identities: vec![constrained_runtime_identity],
+        worker_path_evidence: owned_decode_worker_path_identity(),
+        evidence_schema_revision: store::CERT_EVIDENCE_SCHEMA_REVISION.to_string(),
+        g_dec_manifest_revision: store::G_DEC_MANIFEST_REVISION.to_string(),
+    };
+    let probe_snapshot = ProbeSnapshot::capture(&probe_snapshot_inputs)
+        .map_err(|error| artifact_invalid_error(error.as_str()))?;
     let Some(fixture) = fixtures.iter().find(|fixture| {
         spec.owned_family.as_deref() == Some(fixture.family.as_str())
             && spec.owned_dtype.as_deref() == Some(fixture.dtype.as_str())
@@ -9099,10 +9277,10 @@ async fn execute_generate_probe_for_model(
             "model_dtype": spec.owned_dtype,
             "model_quant": spec.quant,
         });
-        store_probe_outcome_for_fingerprint(
+        store_owned_probe_outcome(
             state,
             &model,
-            &decode_fingerprint,
+            &probe_snapshot,
             CertificationStatus::Uncertified,
             evidence.clone(),
         )?;
@@ -9149,10 +9327,10 @@ async fn execute_generate_probe_for_model(
                 "blocking_reason": blocking_reason,
                 "fixture": generate_fixture_provenance(fixture),
             });
-            store_probe_outcome_for_fingerprint(
+            store_owned_probe_outcome(
                 state,
                 &model,
-                &decode_fingerprint,
+                &probe_snapshot,
                 CertificationStatus::Uncertified,
                 evidence.clone(),
             )?;
@@ -9392,10 +9570,17 @@ async fn execute_generate_probe_for_model(
             },
         },
     });
-    store_probe_outcome_for_fingerprint(
+    let certification_evidence = if passed {
+        let mut evidence = certification_evidence;
+        evidence["g_dec"] = owned_decode_gate_evidence();
+        evidence
+    } else {
+        certification_evidence
+    };
+    store_owned_probe_outcome(
         state,
         &model,
-        &decode_fingerprint,
+        &probe_snapshot,
         if passed {
             CertificationStatus::Certified
         } else {
@@ -9519,6 +9704,61 @@ fn decode_token_mismatch(item: &GenerateProbeItem, actual: &[u32]) -> Value {
         "expected_token_ids": item.expected_token_ids,
         "actual_token_ids": actual,
     })
+}
+
+fn store_owned_probe_outcome(
+    state: &ModuleState,
+    model: &EmbeddingModel,
+    snapshot: &ProbeSnapshot,
+    status: CertificationStatus,
+    evidence: Value,
+) -> Result<ProbeWriteOutcome, WireOperationError> {
+    let snapshot_inputs = snapshot.to_match_inputs();
+    let profile_state = state.store.profile_state().map_err(|error| {
+        WireOperationError::from_stable(
+            StableError::engine_crashed(Some(100)),
+            format!("read terminal probe profile state: {error}"),
+        )
+    })?;
+    let terminal = owned_decode_probe_match_inputs(
+        state,
+        model,
+        profile_state
+            .revisioned_machine_profile_hash
+            .ok_or_else(|| artifact_invalid_error("terminal probe profile hash is missing"))?,
+        profile_state
+            .profile_activation_epoch
+            .ok_or_else(|| artifact_invalid_error("terminal probe profile epoch is missing"))?,
+        snapshot_inputs.constraint_runtime_identities.clone(),
+    )?;
+    let row = OwnedDecodeCertificationRow {
+        status,
+        revisioned_machine_profile_hash: terminal.revisioned_machine_profile_hash.clone(),
+        profile_activation_epoch: terminal.profile_activation_epoch,
+        model_id: terminal.model_id.clone(),
+        decode_fingerprint: terminal.decode_fingerprint.clone(),
+        processing_fingerprint: terminal.processing_fingerprint.clone(),
+        runtime_config_digest: terminal.runtime_config_digest.clone(),
+        constraint_runtime_identities: terminal.constraint_runtime_identities.clone(),
+        worker_path_evidence: terminal.worker_path_evidence.clone(),
+        evidence_schema_revision: terminal.evidence_schema_revision.clone(),
+        g_dec_manifest_revision: terminal.g_dec_manifest_revision.clone(),
+        numeric_profile_id: Some(model.numeric_profile_id.clone()),
+        fingerprint: Fingerprint(terminal.decode_fingerprint.clone()),
+        certified_at_ms: now_ms(),
+        os_build: state.machine_profile.os_build.clone(),
+        module_generation: state.module_generation,
+        evidence,
+    };
+    state
+        .store
+        .store_owned_decode_cert_row_if_current(&snapshot_inputs, &terminal, &row, now_ms())
+        .map_err(|error| {
+            WireOperationError::from_stable(
+                StableError::engine_crashed(Some(100)),
+                format!("write owned-decode probe evidence: {error}"),
+            )
+        })
 }
 
 fn store_probe_cert_row(
@@ -10629,24 +10869,65 @@ fn module_health(state: &ModuleState) -> ModuleHealth {
         .into_iter()
         .map(|model| {
             let measurements = lane_measurement_rows(state, &model.certification_fingerprint);
+            let owned_certified = (model.engine_identity.engine == DECODE_WORKER_ENGINE)
+                && state
+                    .store
+                    .get_owned_decode_cert_row(
+                        &state.revisioned_machine_profile_hash,
+                        state.profile_activation_epoch,
+                        &model.model_id,
+                        &model.certification_fingerprint.0,
+                        CERT_EVIDENCE_SCHEMA_REVISION,
+                    )
+                    .ok()
+                    .flatten()
+                    .is_some();
             LaneHealth {
                 model_id: model.model_id.clone(),
                 fingerprint: model.fingerprint.clone(),
-                certified: measurements.current_certification.is_some(),
+                certified: measurements.current_certification.is_some() || owned_certified,
                 certification_stale: measurements.certification_stale,
                 performance_stale: measurements.performance_stale,
                 worker: worker_health_for_model(&model),
             }
         })
         .collect::<Vec<_>>();
+    let storage = state.store.storage_health_inputs().unwrap_or_else(|error| {
+        eprintln!("WARN failed to read profile health state: {error}");
+        StorageHealthInputs {
+            previous_revisioned_machine_profile_hash: None,
+            current_revisioned_machine_profile_hash: Some(
+                state.revisioned_machine_profile_hash.clone(),
+            ),
+            profile_activation_epoch: Some(state.profile_activation_epoch),
+            last_rotation_at_ms: None,
+            last_rotation_reason: Some("unknown_previous_snapshot".to_string()),
+            rotation_event_count: 0,
+            re_certification_state: "failed".to_string(),
+            evidence_requirements_divergence: Vec::new(),
+            approval_certification_outcomes: Vec::new(),
+        }
+    });
     ModuleHealth {
         status: "ok".to_string(),
         module_generation: state.module_generation,
         loaded_models: state.runtime.loaded_model_count(),
-        machine_profile_hash: state.machine_profile_hash.clone(),
+        machine_profile_hash: state.legacy_machine_profile_hash.clone(),
         certification_stale: lanes.iter().any(|lane| lane.certification_stale),
         performance_stale: lanes.iter().any(|lane| lane.performance_stale),
         lanes,
+        previous_revisioned_machine_profile_hash: storage.previous_revisioned_machine_profile_hash,
+        current_revisioned_machine_profile_hash: storage
+            .current_revisioned_machine_profile_hash
+            .unwrap_or_else(|| state.revisioned_machine_profile_hash.clone()),
+        profile_activation_epoch: storage
+            .profile_activation_epoch
+            .unwrap_or(state.profile_activation_epoch),
+        last_rotation_at_ms: storage.last_rotation_at_ms,
+        last_rotation_reason: storage.last_rotation_reason,
+        re_certification_state: storage.re_certification_state,
+        evidence_requirements_divergence: storage.evidence_requirements_divergence,
+        approval_certification_outcomes: storage.approval_certification_outcomes,
     }
 }
 
