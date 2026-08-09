@@ -3361,9 +3361,11 @@ async fn substitutable_owned_refusal_falls_back_to_llama_with_lane_provenance() 
             // The platform refusal fires at resolution, before certification
             // or the serving predicate are consulted, regardless of profile.
             "owned_decode_unsupported"
-        } else if cfg!(debug_assertions) {
-            "owned_decode_not_certified"
         } else {
+            // Approval rows live in the module store now; this test's fresh
+            // store has none, so the serving predicate refuses as disabled
+            // before evidence is consulted — the same reason in debug and
+            // release, since the build type no longer carries a record set.
             "cutover_disabled"
         }
     );
