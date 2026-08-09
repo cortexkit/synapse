@@ -119,6 +119,15 @@ enum ApprovalsCommand {
     /// approval table once; the migration is idempotent and preserves the
     /// records as the initial approval state.
     MigrateOwnedDecode,
+    /// Create or explicitly re-enable one exact approval identity.
+    Enable {
+        #[arg(long)]
+        model_id: String,
+        #[arg(long)]
+        decode_fingerprint: String,
+        #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
+        grammar_enabled: bool,
+    },
     /// Disable one exact (model_id, decode_fingerprint) approval.
     Disable {
         #[arg(long)]
@@ -284,6 +293,23 @@ async fn execute(
                     json!({
                         "seed_revision": "owned-decode-approval-migration-v1",
                         "schema_revision": "runtime-bound-records-contracts-v1",
+                    }),
+                )
+                .await
+            }
+            ApprovalsCommand::Enable {
+                model_id,
+                decode_fingerprint,
+                grammar_enabled,
+            } => {
+                call(
+                    consumer,
+                    identity,
+                    "approvals.enable",
+                    json!({
+                        "model_id": model_id,
+                        "decode_fingerprint": decode_fingerprint,
+                        "grammar_enabled": grammar_enabled,
                     }),
                 )
                 .await

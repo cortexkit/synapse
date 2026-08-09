@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     env, fs,
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -73,14 +73,14 @@ use store::{
 };
 use subc_client_rs::{
     async_trait, BindDecision, HandlerOutcome, HealthReport, ModuleHandler, RequestCtx,
-    RouteBindRequest, SubcModuleError,
+    RouteBindRequest, RouteHandle, SubcModuleError,
 };
 use subc_protocol::{
     manifest::{
         Bindings, IdentityBinding, IdentityScope, ManagementOperation, ManagementOperationKind,
         ModuleManifest, ProviderRole, StorageBinding, StorageKind, StorageScope, TrustTier,
     },
-    ModuleHelloAckBody, PROTOCOL_VERSION, SUBC_MODULE_ID_ENV,
+    ModuleHelloAckBody, Principal, PROTOCOL_VERSION, SUBC_MODULE_ID_ENV,
 };
 use synapse_core::{
     evaluate_cuda_floor, owned_cuda_engine_identity, worker_binary_env_var,
@@ -275,6 +275,7 @@ struct SynapseHandlerInner {
     module_id: String,
     connection_file: PathBuf,
     state: OnceLock<Arc<ModuleState>>,
+    approval_operators: Mutex<HashMap<RouteHandle, String>>,
 }
 
 struct ModuleState {
@@ -337,6 +338,14 @@ struct MethodEnvelope {
 struct ApprovalMigrationParams {
     seed_revision: String,
     schema_revision: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApprovalEnableParams {
+    model_id: String,
+    decode_fingerprint: String,
+    grammar_enabled: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1366,6 +1375,7 @@ impl SynapseHandler {
                 module_id,
                 connection_file,
                 state: OnceLock::new(),
+                approval_operators: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -2355,14 +2365,33 @@ impl ModuleHandler for SynapseHandler {
         let _ = self.inner.state.set(state);
     }
 
-    async fn on_bind(&self, _req: &RouteBindRequest) -> BindDecision {
-        if self.state().is_some() {
-            BindDecision::accept()
-        } else {
-            BindDecision::reject(
+    async fn on_bind(&self, req: &RouteBindRequest) -> BindDecision {
+        if self.state().is_none() {
+            return BindDecision::reject(
                 "module_not_initialized",
                 "synapse has not completed HELLO_ACK initialization",
-            )
+            );
+        }
+        if let Ok(mut operators) = self.inner.approval_operators.lock() {
+            let approved_by = match req.principal.as_ref() {
+                Some(Principal::Direct) => Some("principal:direct".to_string()),
+                Some(Principal::Reserved { module_id }) => {
+                    Some(format!("principal:reserved:{module_id}"))
+                }
+                Some(Principal::Unverified) | None => None,
+            };
+            if let Some(approved_by) = approved_by {
+                operators.insert(req.handle, approved_by);
+            } else {
+                operators.remove(&req.handle);
+            }
+        }
+        BindDecision::accept()
+    }
+
+    async fn on_route_gone(&self, handle: &RouteHandle) {
+        if let Ok(mut operators) = self.inner.approval_operators.lock() {
+            operators.remove(handle);
         }
     }
 
@@ -2391,7 +2420,7 @@ impl ModuleHandler for SynapseHandler {
         }
     }
 
-    async fn handle(&self, _ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
+    async fn handle(&self, ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
         let Some(state) = self.state() else {
             return channel_error(
                 "module_not_initialized",
@@ -2409,11 +2438,21 @@ impl ModuleHandler for SynapseHandler {
             }
         };
 
-        dispatch_request(state, envelope).await
+        let approved_by = self
+            .inner
+            .approval_operators
+            .lock()
+            .ok()
+            .and_then(|operators| operators.get(&ctx.route_handle()).cloned());
+        dispatch_request(state, envelope, approved_by.as_deref()).await
     }
 }
 
-async fn dispatch_request(state: Arc<ModuleState>, request: MethodEnvelope) -> HandlerOutcome {
+async fn dispatch_request(
+    state: Arc<ModuleState>,
+    request: MethodEnvelope,
+    approved_by: Option<&str>,
+) -> HandlerOutcome {
     match request.method.as_str() {
         "models.list" => match state.store.catalog_snapshot() {
             Ok(snapshot) => result_outcome(models_list_payload(&state, snapshot)),
@@ -2439,6 +2478,13 @@ async fn dispatch_request(state: Arc<ModuleState>, request: MethodEnvelope) -> H
         "approvals.migrate_owned_decode" => {
             approvals_migrate_owned_decode(state, request.params).await
         }
+        "approvals.enable" => match approved_by {
+            Some(approved_by) => approval_enable(state, request.params, approved_by).await,
+            None => channel_error(
+                "operator_identity_unavailable",
+                "approvals.enable requires an authenticated operator identity",
+            ),
+        },
         "approvals.disable" => approval_disable(state, request.params).await,
         "approvals.emergency_rollback" => approvals_emergency_rollback(state, request.params).await,
         "model.status" => model_status(state, request.params).await,
@@ -10462,6 +10508,42 @@ async fn approvals_migrate_owned_decode(state: Arc<ModuleState>, params: Value) 
     }
 }
 
+async fn approval_enable(
+    state: Arc<ModuleState>,
+    params: Value,
+    approved_by: &str,
+) -> HandlerOutcome {
+    let params: ApprovalEnableParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(error) => {
+            return channel_error(
+                "invalid_request",
+                format!("invalid approval enable params: {error}"),
+            )
+        }
+    };
+    match state.store.enable_or_create_approval(
+        &params.model_id,
+        &params.decode_fingerprint,
+        params.grammar_enabled,
+        approved_by,
+        now_ms(),
+    ) {
+        Ok(row) => result_outcome(json!({
+            "model_id": row.model_id,
+            "decode_fingerprint": row.decode_fingerprint,
+            "enabled": row.enabled,
+            "grammar_enabled": row.grammar_enabled,
+            "approved_by": row.approved_by,
+            "approved_at_ms": row.approved_at_ms,
+            "semantic_digest": row.semantic_digest,
+            "generation": row.generation,
+        })),
+        Err(SynapseStoreError::Decode(reason)) => channel_error("invalid_request", reason),
+        Err(error) => channel_error("store_failure", error.to_string()),
+    }
+}
+
 async fn approval_disable(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
     let params: ApprovalDisableParams = match serde_json::from_value(params) {
         Ok(params) => params,
@@ -11209,6 +11291,7 @@ fn management_operations() -> Vec<ManagementOperation> {
         op("cache.gc", Mutate),
         op("admission.status", Query),
         op("approvals.migrate_owned_decode", Mutate),
+        op("approvals.enable", Mutate),
         op("approvals.disable", Mutate),
         op("approvals.emergency_rollback", Mutate),
     ]

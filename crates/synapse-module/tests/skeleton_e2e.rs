@@ -3398,6 +3398,25 @@ async fn substitutable_owned_refusal_falls_back_to_llama_with_lane_provenance() 
 }
 
 #[cfg(target_os = "macos")]
+fn migration_seed_decode_fingerprint(model_id: &str) -> &'static str {
+    match model_id {
+        "qwen3-0.6b-decode-f16" => {
+            "8bcb6dfc1bd55a38a56b5a6931132f428687e064104d106c2cc5efb898f80feb"
+        }
+        "lfm2-1.2b-decode-f16" => {
+            "741e56178506918edd7ff91b7bf88214f97df974c3b5567196d0ce0cc594a8dd"
+        }
+        "qwen3-0.6b-decode-q8_0" => {
+            "4d0a846b33fdbbbc9032ead51e5d9c72af48e145f425cc5802b1205e44dc9e00"
+        }
+        "lfm2-1.2b-decode-q8_0" => {
+            "c4f0884cfa99e0c3e7c2403626e5363cb46645b6b51840d720e98539f9577f2f"
+        }
+        other => panic!("missing migration-seed fingerprint for {other}"),
+    }
+}
+
+#[cfg(target_os = "macos")]
 async fn certified_owned_checkpoint_lane(
     checkpoint_env: &str,
     model_id: &str,
@@ -3458,8 +3477,30 @@ async fn certified_owned_checkpoint_lane(
     })
     .to_string();
     let (_daemon, _module, mut consumer, route) = open_route_with_config(&config).await;
+    let decode_fingerprint = migration_seed_decode_fingerprint(model_id);
+    // Use the production operation so this test records the operator's approval
+    // through the real store-backed enablement path instead of test-only setup.
+    let approval = route_request(
+        &mut consumer,
+        route,
+        90_900,
+        serde_json::json!({
+            "method": "approvals.enable",
+            "params": {
+                "model_id": model_id,
+                "decode_fingerprint": decode_fingerprint,
+                "grammar_enabled": true,
+            },
+        }),
+    )
+    .await;
+    assert_eq!(approval["result"]["enabled"], true);
+    assert_eq!(approval["result"]["grammar_enabled"], true);
+
     let probe = certify_preloaded_models(&mut consumer, route, 91_000).await;
     let lane = &probe["result"]["lanes"][0];
+    assert_eq!(lane["model_id"], model_id);
+    assert_eq!(lane["fingerprint"], decode_fingerprint);
     let exact = lane["evidence"]["metrics"]["token_exact_matches"]
         .as_u64()
         .expect("probe exact-match count");

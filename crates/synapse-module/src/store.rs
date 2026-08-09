@@ -1501,6 +1501,112 @@ impl SynapseStore {
         self.insert_approval(&row)
     }
 
+    /// Create or explicitly re-enable one approval identity. The approval stamp,
+    /// grammar switch, semantic digest, and fencing generation commit together.
+    pub fn enable_or_create_approval(
+        &self,
+        model_id: &str,
+        decode_fingerprint: &str,
+        grammar_enabled: bool,
+        approved_by: &str,
+        approved_at_ms: u64,
+    ) -> Result<ApprovalRow, SynapseStoreError> {
+        let mut candidate = ApprovalRow {
+            schema_revision: APPROVAL_SCHEMA_REVISION.to_string(),
+            model_id: model_id.to_string(),
+            decode_fingerprint: decode_fingerprint.to_string(),
+            enabled: true,
+            grammar_enabled,
+            disabled_reason: None,
+            approved_by: Some(approved_by.to_string()),
+            approved_at_ms: Some(approved_at_ms),
+            updated_at_ms: approved_at_ms,
+            evidence_requirements_revision: APPROVAL_EVIDENCE_REQUIREMENTS_REVISION.to_string(),
+            semantic_digest: String::new(),
+            row_id: 0,
+            generation: 0,
+            fencing_metadata: serde_json::json!({
+                "operation": "approval_enable",
+            }),
+        };
+        candidate.semantic_digest = candidate.expected_digest()?;
+        validate_approval(&candidate, true)?;
+
+        let row = self.store.with_conn_fenced(|tx| {
+            let catalog_matches: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM models
+                 WHERE model_id = ?1 AND engine = 'owned-metal-decode' AND task = 'generate'",
+                params![model_id],
+                |row| row.get(0),
+            )?;
+            if catalog_matches != 1 {
+                return Err(to_sql_error(SynapseStoreError::Decode(format!(
+                    "unmappable_identity: model_id={model_id} matches={catalog_matches}"
+                ))));
+            }
+
+            if let Some(mut row) = load_approval_tx_by_identity(tx, model_id, decode_fingerprint)? {
+                validate_approval(&row, true).map_err(to_sql_error)?;
+                row.enabled = true;
+                row.grammar_enabled = grammar_enabled;
+                row.disabled_reason = None;
+                row.approved_by = Some(approved_by.to_string());
+                row.approved_at_ms = Some(approved_at_ms);
+                row.updated_at_ms = approved_at_ms;
+                row.generation = row.generation.saturating_add(1);
+                row.fencing_metadata = serde_json::json!({
+                    "operation": "approval_enable",
+                });
+                row.semantic_digest = row.expected_digest().map_err(to_sql_error)?;
+                validate_approval(&row, true).map_err(to_sql_error)?;
+                let fencing_metadata = serde_json::to_string(&row.fencing_metadata)
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+                tx.execute(
+                    "UPDATE approvals SET enabled = 1, grammar_enabled = ?1,
+                         disabled_reason = NULL, approved_by = ?2, approved_at_ms = ?3,
+                         updated_at_ms = ?4, semantic_digest = ?5, generation = ?6,
+                         fencing_metadata = ?7 WHERE row_id = ?8",
+                    params![
+                        grammar_enabled as i64,
+                        approved_by,
+                        approved_at_ms as i64,
+                        approved_at_ms as i64,
+                        &row.semantic_digest,
+                        row.generation as i64,
+                        fencing_metadata,
+                        row.row_id as i64,
+                    ],
+                )?;
+                return Ok(row);
+            }
+
+            let fencing_metadata = serde_json::to_string(&candidate.fencing_metadata)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+            tx.execute(
+                "INSERT INTO approvals (
+                     schema_revision, model_id, decode_fingerprint, enabled, grammar_enabled,
+                     disabled_reason, approved_by, approved_at_ms, updated_at_ms,
+                     evidence_requirements_revision, semantic_digest, generation, fencing_metadata
+                 ) VALUES (?1, ?2, ?3, 1, ?4, NULL, ?5, ?6, ?7, ?8, ?9, 0, ?10)",
+                params![
+                    &candidate.schema_revision,
+                    model_id,
+                    decode_fingerprint,
+                    grammar_enabled as i64,
+                    approved_by,
+                    approved_at_ms as i64,
+                    approved_at_ms as i64,
+                    &candidate.evidence_requirements_revision,
+                    &candidate.semantic_digest,
+                    fencing_metadata,
+                ],
+            )?;
+            let row_id = tx.last_insert_rowid();
+            load_approval_tx(tx, row_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
+        })?;
+        Ok(row)
+    }
+
     // Staged storage API consumed by the epic's runtime slice; remove this allow there.
     #[allow(dead_code)]
     pub fn migrate_owned_decode_approvals(
@@ -2564,11 +2670,17 @@ impl SynapseStore {
         else {
             return Ok(None);
         };
-        let mut expected_identities = inputs.constraint_runtime_identities.clone();
-        expected_identities.sort();
-        if row.processing_fingerprint != inputs.processing_fingerprint
+        let mut required_identities = inputs.constraint_runtime_identities.clone();
+        required_identities.sort();
+        if required_identities
+            .windows(2)
+            .any(|pair| pair[0] == pair[1])
+            || row.processing_fingerprint != inputs.processing_fingerprint
             || row.runtime_config_digest != inputs.runtime_config_digest
-            || row.constraint_runtime_identities != expected_identities
+            || !applicable_constraint_identities_match(
+                &row.constraint_runtime_identities,
+                &required_identities,
+            )
             || row.worker_path_evidence != inputs.worker_path_evidence
             || row.g_dec_manifest_revision != inputs.g_dec_manifest_revision
             || !complete_g_dec_evidence(&row.evidence, &inputs.g_dec_manifest_revision)
@@ -2736,7 +2848,10 @@ impl SynapseStore {
                 || certification.decode_fingerprint != inputs.decode_fingerprint
                 || certification.processing_fingerprint != inputs.processing_fingerprint
                 || certification.runtime_config_digest != inputs.runtime_config_digest
-                || certification.constraint_runtime_identities != expected_constraints
+                || !applicable_constraint_identities_match(
+                    &certification.constraint_runtime_identities,
+                    &expected_constraints,
+                )
                 || certification.worker_path_evidence != inputs.worker_path_evidence
                 || certification.evidence_schema_revision != inputs.evidence_schema_revision
                 || certification.g_dec_manifest_revision != inputs.g_dec_manifest_revision
@@ -5012,6 +5127,14 @@ fn load_approval_tx_by_identity(
     .optional()
 }
 
+/// Unconstrained requests have no applicable constraint identity. Constrained
+/// requests must name only identities present in the row's certified set.
+fn applicable_constraint_identities_match(certified: &[String], required: &[String]) -> bool {
+    required
+        .iter()
+        .all(|identity| certified.binary_search(identity).is_ok())
+}
+
 fn owned_decode_match_inputs_equal(
     left: &OwnedDecodeMatchInputs,
     right: &OwnedDecodeMatchInputs,
@@ -6323,6 +6446,52 @@ mod tests {
             rolled_back.disabled_reason.as_deref(),
             Some("fleet emergency")
         );
+
+        let explicitly_enabled = store
+            .enable_or_create_approval("owned-model", &fingerprint, true, "principal:direct", 60)
+            .unwrap();
+        assert!(explicitly_enabled.enabled);
+        assert!(explicitly_enabled.grammar_enabled);
+        assert_eq!(
+            explicitly_enabled.approved_by.as_deref(),
+            Some("principal:direct")
+        );
+        assert_eq!(explicitly_enabled.approved_at_ms, Some(60));
+        assert_eq!(explicitly_enabled.updated_at_ms, 60);
+        assert_eq!(explicitly_enabled.generation, rolled_back.generation + 1);
+        assert_eq!(
+            explicitly_enabled.semantic_digest,
+            explicitly_enabled.expected_digest().unwrap()
+        );
+
+        let second_fingerprint = "b".repeat(64);
+        let explicitly_created = store
+            .enable_or_create_approval(
+                "owned-model",
+                &second_fingerprint,
+                false,
+                "principal:direct",
+                70,
+            )
+            .unwrap();
+        assert!(explicitly_created.enabled);
+        assert!(!explicitly_created.grammar_enabled);
+        assert_eq!(explicitly_created.generation, 0);
+        assert_eq!(
+            explicitly_created.semantic_digest,
+            explicitly_created.expected_digest().unwrap()
+        );
+        assert!(matches!(
+            store.enable_or_create_approval(
+                "owned-model",
+                "not-a-digest",
+                false,
+                "principal:direct",
+                80,
+            ),
+            Err(SynapseStoreError::Decode(_))
+        ));
+        assert_eq!(store.approvals().unwrap().len(), 2);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -6470,6 +6639,19 @@ mod tests {
             .get_owned_decode_cert_row_matching(&match_inputs)
             .unwrap()
             .is_some());
+        let mut unconstrained_inputs = match_inputs.clone();
+        unconstrained_inputs.constraint_runtime_identities.clear();
+        assert!(store
+            .get_owned_decode_cert_row_matching(&unconstrained_inputs)
+            .unwrap()
+            .is_some());
+        let mut uncertified_constraint_inputs = match_inputs.clone();
+        uncertified_constraint_inputs.constraint_runtime_identities =
+            vec!["constraint-b".to_string()];
+        assert!(store
+            .get_owned_decode_cert_row_matching(&uncertified_constraint_inputs)
+            .unwrap()
+            .is_none());
         assert!(store
             .get_owned_decode_cert_row(
                 &profile_hash,
@@ -6625,7 +6807,7 @@ mod tests {
             })
             .unwrap();
         let decode_fingerprint = "e".repeat(64);
-        store
+        let approval = store
             .create_approval("owned-model", &decode_fingerprint, true, "operator", 1, 1)
             .unwrap();
         let profile_a = MachineProfile {
@@ -6656,7 +6838,7 @@ mod tests {
             decode_fingerprint: decode_fingerprint.clone(),
             processing_fingerprint: "processing".to_string(),
             runtime_config_digest: "runtime".to_string(),
-            constraint_runtime_identities: Vec::new(),
+            constraint_runtime_identities: vec!["constraint-a".to_string()],
             worker_path_evidence: serde_json::json!({}),
             evidence_schema_revision: CERT_EVIDENCE_SCHEMA_REVISION.to_string(),
             g_dec_manifest_revision: G_DEC_MANIFEST_REVISION.to_string(),
@@ -6678,7 +6860,7 @@ mod tests {
             decode_fingerprint: decode_fingerprint.clone(),
             processing_fingerprint: "processing".to_string(),
             runtime_config_digest: "runtime".to_string(),
-            constraint_runtime_identities: Vec::new(),
+            constraint_runtime_identities: vec!["constraint-a".to_string()],
             worker_path_evidence: serde_json::json!({}),
             evidence_schema_revision: CERT_EVIDENCE_SCHEMA_REVISION.to_string(),
             g_dec_manifest_revision: G_DEC_MANIFEST_REVISION.to_string(),
@@ -6718,6 +6900,23 @@ mod tests {
             .owned_decode_admission("owned-model", &decode_fingerprint, &hash_a, 1)
             .unwrap()
             .is_some());
+        let mut unconstrained_inputs = snapshot_inputs.clone();
+        unconstrained_inputs.constraint_runtime_identities.clear();
+        assert!(store
+            .owned_decode_admission_matching(&unconstrained_inputs)
+            .unwrap()
+            .is_some());
+        assert!(store
+            .owned_decode_admission_matching(&snapshot_inputs)
+            .unwrap()
+            .is_some());
+        let mut uncertified_constraint_inputs = snapshot_inputs.clone();
+        uncertified_constraint_inputs.constraint_runtime_identities =
+            vec!["constraint-b".to_string()];
+        assert!(store
+            .owned_decode_admission_matching(&uncertified_constraint_inputs)
+            .unwrap()
+            .is_none());
         assert!(store
             .owned_decode_admission("owned-model", &decode_fingerprint, &hash_a, 2)
             .unwrap()
@@ -6734,6 +6933,13 @@ mod tests {
             .owned_decode_admission("owned-model", &decode_fingerprint, &hash_b, 2)
             .unwrap()
             .is_some());
+        assert_eq!(
+            store
+                .get_approval("owned-model", &decode_fingerprint)
+                .unwrap(),
+            Some(approval),
+            "certification writes and serving reads must not mutate approvals"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
