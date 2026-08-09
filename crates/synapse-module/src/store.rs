@@ -1154,7 +1154,7 @@ pub struct PerfRow {
 pub struct KnobAssignmentRow {
     pub machine_profile_hash: String,
     pub workload: String,
-    pub knob: PerfKnob,
+    pub(crate) knob: PerfKnob,
     pub model_id: String,
     pub numeric_profile_id: NumericProfileId,
     pub fingerprint: Fingerprint,
@@ -3650,7 +3650,7 @@ impl SynapseStore {
         Ok(())
     }
 
-    pub fn knob_assignment(
+    pub(crate) fn knob_assignment(
         &self,
         machine_profile_hash: &str,
         workload: &str,

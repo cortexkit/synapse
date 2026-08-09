@@ -5611,6 +5611,8 @@ impl owned_decode_routing::certification::CertificationAccess for PersistentDeco
     }
 }
 
+// Staged certification evidence helper retained for migration/fleet reporting; remove this allow when that slice consumes it.
+#[allow(dead_code)]
 fn worker_path_certification(evidence: &Value) -> bool {
     let battery = evidence["worker_path"]["fixture_battery"].as_str();
     evidence["worker_path"]["transport"].as_str() == Some(worker_catalog_transport())
