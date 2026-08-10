@@ -1,0 +1,7 @@
+# Digest-bearing contract files: their SHA-256 is computed over the checked-in
+# bytes (compile-time include_str! / include_bytes!), so the checkout must
+# deliver identical bytes on every platform. Without this, Windows autocrlf
+# rewrites LF to CRLF and every baked digest check fails as tampered.
+crates/synapse-module/owned-decode-manifests/** text eol=lf
+bench/campaign/*-fixtures/** text eol=lf
+evidence/** text eol=lf
