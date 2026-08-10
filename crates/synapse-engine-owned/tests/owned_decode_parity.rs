@@ -431,6 +431,7 @@ fn parity_qwen3_q8() {
 /// - M1 Max ([bench-host-alias]-metal CI runner, historical authority): completion-05/
 ///   step 8, engine 7693 vs oracle 1827, CPU top-2 (1827, 7693), gap 0.00727
 ///   (LFM2-METAL-STEP.md, stage-C certification).
+///
 /// The spike's Metal step engine produces the same fork as the production
 /// engine on each machine. A fork not in this list fails the gate.
 const LFM2_F16_CERTIFIED_FORKS: &[(&str, usize, u32, u32)] = &[
