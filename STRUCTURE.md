@@ -85,7 +85,7 @@
 
 **crates/synapse-opctl/:**
 - Purpose: Command-line operator control surface driving SubC commands.
-- Contains: Commands to query model statuses, run/inspect certification probes, monitor scheduler admission stats, manage approval migrations and emergency rollbacks, submit batches, and fetch job pages.
+- Contains: Commands to query model statuses, run/inspect certification probes, monitor scheduler admission stats, manage approval migrations, explicit enablements, disablements, and emergency rollbacks, submit batches, and fetch job pages.
 - Key files: `crates/synapse-opctl/src/main.rs`
 
 
@@ -167,7 +167,7 @@
 
 **tools/gather-distill/:**
 - Purpose: Standalone external harness for generating QA datasets, collecting model tool-use trajectories, and orchestrating student model SFT training/evaluation.
-- Contains: Bun workspaces, Anthropic/OpenAI API adapters (supporting OpenAI OAuth transports), AFT child process pools, validation scripts, scoring modules, utility judge matrix evaluation engines, Axolotl SFT training configs (`train/axolotl/`), Antares gather-SFT rungs (`train/ANTARES-RUNG.md`), and student ladder evaluation results (`train/SCALE-LADDER.md`).
+- Contains: Bun workspaces, Anthropic/OpenAI API adapters (supporting OpenAI OAuth transports), AFT child process pools, validation scripts, scoring modules, utility judge matrix evaluation engines, Axolotl SFT training configs (`tools/gather-distill/train/axolotl/`), Antares gather-SFT rungs (`tools/gather-distill/train/ANTARES-RUNG.md`), and student ladder evaluation results (`tools/gather-distill/train/SCALE-LADDER.md`).
 - Key files: `tools/gather-distill/src/cli.ts`, `tools/gather-distill/README.md`, `tools/gather-distill/BAKEOFF-ZEROSHOT.md`, `tools/gather-distill/train/ANTARES-RUNG.md`, `tools/gather-distill/train/SCALE-LADDER.md`
 
 ## Key File Locations
@@ -175,7 +175,7 @@
 **Entry Points:**
 - `crates/synapse-module/src/main.rs`: The main production SubC module entry point.
 - `crates/synapse-worker-*/src/main.rs`: Executables for hardware-specific supervised workers (including `crates/synapse-worker-cuda/src/main.rs` and `crates/synapse-worker-decode/src/main.rs`).
-- `crates/synapse-opctl/src/main.rs`: Operator command line control surface (`ck-synapse-opctl`) driving catalog, probes, scheduler admission, approval migrations, emergency rollbacks, and paged results.
+- `crates/synapse-opctl/src/main.rs`: Operator command line control surface (`ck-synapse-opctl`) driving catalog, probes, scheduler admission, approval migrations, explicit enablements, emergency rollbacks, and paged results.
 - `crates/synapse-module/src/bin/subc_call.rs`: Management surface call utility.
 - `crates/synapse-module/src/bin/inline_embed_throughput.rs`: Batch throughput execution client.
 - `crates/synapse-module/src/bin/timeout_worker.rs`: Shared test mock worker advertising `SYNAPSE_WORKER_EXPECTED_ENGINE` for test timeout and fallback validation.

@@ -111,9 +111,9 @@
 - Used by: Developers running Athena classify dataset generation, real attempt importing, parity auditing, or distillation campaigns.
 
 **Synapse Operator CLI (`synapse-opctl`):**
-- Purpose: Drive Synapse operations (models catalog, probe runs, scheduling admission stats, exact and emergency approval rollbacks, batch embedding, and jobs paging) through the fleet subc daemon connection.
+- Purpose: Drive Synapse operations (models catalog, probe runs, scheduling admission stats, approval enablement and rollbacks, batch embedding, and jobs paging) through the fleet subc daemon connection.
 - Location: `crates/synapse-opctl`
-- Contains: CLI command parsing and formatting logic for operator management, including model status, probe execution, scheduler admission, approval migration and emergency rollback, batch submission, and paged results.
+- Contains: CLI command parsing and formatting logic for operator management, including model status, probe execution, scheduler admission, approval migration, explicit enablement, disablement, emergency rollback, batch submission, and paged results.
 - Depends on: `subc-client-rs`, `clap`, `serde_json`, `tokio`.
 - Used by: Operators and deployment scripts monitoring or triggering runtime actions.
 
@@ -342,7 +342,7 @@
 - Pattern: PTX Kernel Dispatch with CUDA Graph Execution and Hardware Capability Floor (`device_meets_floor`).
 
 **Approval & Emergency Rollback:**
-- Purpose: Manages storage approvals, rotation ledgers, exact `(model_id, decode_fingerprint)` disablement, and atomic single-transaction emergency rollbacks to instantly revoke serving approvals across all lanes.
+- Purpose: Manages storage approvals, rotation ledgers, explicit `(model_id, decode_fingerprint)` enablement and disablement, and atomic single-transaction emergency rollbacks to instantly revoke serving approvals across all lanes.
 - Location: `crates/synapse-module/src/rollback.rs`, `crates/synapse-module/src/store.rs`
 - Pattern: Identity-Based Approval Ledger with Atomic Rollback Transaction.
 
@@ -412,7 +412,7 @@
 **Synapse Operator CLI (`synapse-opctl`):**
 - Location: `crates/synapse-opctl/src/main.rs`
 - Triggers: Execution of the `ck-synapse-opctl` binary.
-- Responsibilities: Routes commands to list models, view scheduler stats, start probes, run batches, and fetch paged job results.
+- Responsibilities: Routes commands to list models, view scheduler stats, start probes, manage approval migrations/enablements/disablements, run batches, and fetch paged job results.
 
 **Management Surface SubC Caller (`subc-call`):**
 - Location: `crates/synapse-module/src/bin/subc_call.rs`
