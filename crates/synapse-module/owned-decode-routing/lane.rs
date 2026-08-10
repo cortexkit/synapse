@@ -288,10 +288,23 @@ pub fn serving_predicate(inputs: &ServingPredicateInputs) -> bool {
         && inputs.scheduler_evidence_committed
 }
 
-/// The epoch reader used at the last owned-dispatch boundary. Implementations
-/// must read the persisted value, not a request-local cache.
-pub trait AdmissionEpochReader: Send + Sync {
-    fn current_profile_activation_epoch(&self) -> Result<Option<u64>, String>;
+/// Approval and profile identity stamped by the fenced admission read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdmissionBoundarySnapshot {
+    pub profile_activation_epoch: u64,
+    pub model_id: String,
+    pub decode_fingerprint: String,
+    pub approval_semantic_digest: String,
+    pub approval_generation: u64,
+}
+
+/// Persisted-state reader used at the last owned-dispatch boundary.
+/// Implementations must compare the approval and epoch in one store read.
+pub trait AdmissionBoundaryReader: Send + Sync {
+    fn admission_boundary_matches(
+        &self,
+        snapshot: &AdmissionBoundarySnapshot,
+    ) -> Result<bool, String>;
 }
 
 /// Effective grammar enablement is the conjunction of the runtime switch and

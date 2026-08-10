@@ -5,16 +5,16 @@
   "owned_admission": {
     "linearization": "the fenced store transaction that reads approval, matching cert row, current revisioned hash, and current positive profile_activation_epoch",
     "resolution_context": {
-      "stamped_fields": ["model_id", "decode_fingerprint", "current_revisioned_machine_profile_hash", "profile_activation_epoch", "evidence_schema_revision", "approval_revision"],
+      "stamped_fields": ["model_id", "decode_fingerprint", "current_revisioned_machine_profile_hash", "profile_activation_epoch", "evidence_schema_revision", "approval_semantic_digest", "approval_generation"],
       "approval_write_allowed": false,
       "certification_write_allowed": false
     },
     "dispatch_boundary": "the existing pre-dispatch check immediately before the first worker frame or generated response frame is sent",
-    "last_check": "the dispatch path re-reads persisted profile_activation_epoch and refuses with owned_decode_not_certified when the stamped epoch differs",
+    "last_check": "the dispatch path re-reads persisted profile_activation_epoch plus the approval enabled bit, semantic digest, and generation in one fenced store read, and refuses with owned_decode_not_certified when any stamped value differs or the approval is disabled",
     "interleavings": {
       "activation_before_admission_commit": "admission resolves the new epoch or fails closed",
       "admission_before_activation_commit": "the old epoch may dispatch only if it crossed the dispatch boundary before activation committed",
-      "resolved_before_activation_but_not_dispatched": "re-resolve at the dispatch boundary or return the existing fail-closed refusal",
+      "resolved_before_activation_or_approval_mutation_but_not_dispatched": "re-resolve the epoch and approval stamp at the dispatch boundary or return the existing fail-closed refusal",
       "post_activation_old_evidence": "never dispatches"
     },
     "fallback": "only the exact six fallback-eligible refusal IDs may select a compatible llama lane for substitutable unconstrained requests"

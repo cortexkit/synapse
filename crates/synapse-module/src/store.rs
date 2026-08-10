@@ -545,6 +545,19 @@ const MIGRATIONS: &[Migration] = &[
                   );
          "#,
     },
+    Migration {
+        version: 10,
+        statements: r#"
+                  DROP INDEX IF EXISTS cert_rows_owned_decode_identity_v1;
+                  ALTER TABLE cert_rows
+                      ADD COLUMN constraint_runtime_identities_digest TEXT;
+                  CREATE UNIQUE INDEX cert_rows_owned_decode_identity_v2
+                      ON cert_rows (revisioned_machine_profile_hash, profile_activation_epoch,
+                                    model_id, decode_fingerprint, evidence_schema_revision,
+                                    constraint_runtime_identities_digest)
+                      WHERE certification_class = 'measured_owned_decode';
+         "#,
+    },
 ];
 
 static JOB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1616,7 +1629,24 @@ impl SynapseStore {
     ) -> Result<ApprovalMigrationResult, SynapseStoreError> {
         const SEED_SOURCE: &str =
             include_str!("../owned-decode-manifests/migration-seed-manifest-v1.json");
+        self.migrate_owned_decode_approvals_from_seed(SEED_SOURCE, seed_revision, schema_revision)
+    }
 
+    fn migrate_owned_decode_approvals_from_seed(
+        &self,
+        seed_source: &str,
+        seed_revision: &str,
+        schema_revision: &str,
+    ) -> Result<ApprovalMigrationResult, SynapseStoreError> {
+        let seed_digest = hex::encode(Sha256::digest(seed_source.as_bytes()));
+        if seed_digest != APPROVAL_MIGRATION_SEED_DIGEST {
+            return Ok(ApprovalMigrationResult {
+                outcome: "invalid_seed".to_string(),
+                seed_revision: seed_revision.to_string(),
+                rows: 0,
+                marker: "seed_digest_mismatch".to_string(),
+            });
+        }
         if seed_revision != "owned-decode-approval-migration-v1"
             || schema_revision != APPROVAL_SCHEMA_REVISION
         {
@@ -1627,7 +1657,7 @@ impl SynapseStore {
                 marker: "unchanged".to_string(),
             });
         }
-        let seed: Value = match serde_json::from_str(SEED_SOURCE) {
+        let seed: Value = match serde_json::from_str(seed_source) {
             Ok(seed) => seed,
             Err(error) => {
                 return Ok(ApprovalMigrationResult {
@@ -1808,15 +1838,56 @@ impl SynapseStore {
                 });
             }
         }
+        let context_buckets: crate::owned_decode_contracts::ContextBucketsManifest =
+            serde_json::from_str(include_str!(
+                "../owned-decode-manifests/decode-context-buckets-v1.json"
+            ))
+            .expect("checked-in decode context buckets parse");
         let unmappable = self.store.with_conn(|conn| {
             for entry in &entries {
-                let count: i64 = conn.query_row(
-                    "SELECT COUNT(*) FROM models WHERE model_id = ?1",
-                    params![&entry.source_catalog_entry_id],
-                    |row| row.get(0),
-                )?;
-                if count != 1 {
-                    return Ok(Some((entry.source_catalog_entry_id.clone(), count)));
+                let stored = conn
+                    .query_row(
+                        "SELECT engine, task, config_json FROM models WHERE model_id = ?1",
+                        params![&entry.source_catalog_entry_id],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, rusqlite::types::Value>(2)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                let Some((engine, task, config_value)) = stored else {
+                    return Ok(Some((entry.source_catalog_entry_id.clone(), 0)));
+                };
+                let config_json = match config_value {
+                    rusqlite::types::Value::Blob(bytes) => bytes,
+                    rusqlite::types::Value::Text(text) => text.into_bytes(),
+                    _ => return Ok(Some((entry.source_catalog_entry_id.clone(), 0))),
+                };
+                if engine != "owned-metal-decode" || task != "generate" {
+                    return Ok(Some((entry.source_catalog_entry_id.clone(), 0)));
+                }
+                let Ok(config) = serde_json::from_slice::<StoredModelConfig>(&config_json) else {
+                    return Ok(Some((entry.source_catalog_entry_id.clone(), 0)));
+                };
+                if config.engine != "owned-metal-decode" || config.task != "generate" {
+                    return Ok(Some((entry.source_catalog_entry_id.clone(), 0)));
+                }
+                let Ok(catalog_entry) = crate::owned_decode_catalog_entry(&config) else {
+                    return Ok(Some((entry.source_catalog_entry_id.clone(), 0)));
+                };
+                let decode_fingerprint = catalog_entry
+                    .decode_identity_inputs()
+                    .decode_fingerprint()
+                    .ok();
+                if catalog_entry.entry_id != entry.source_catalog_entry_id
+                    || catalog_entry.validate(&context_buckets).is_err()
+                    || decode_fingerprint.as_ref().map(|value| value.0.as_str())
+                        != Some(entry.decode_fingerprint.as_str())
+                {
+                    return Ok(Some((entry.source_catalog_entry_id.clone(), 0)));
                 }
             }
             Ok(None)
@@ -1831,7 +1902,6 @@ impl SynapseStore {
                 ),
             });
         }
-        let seed_digest = APPROVAL_MIGRATION_SEED_DIGEST.to_string();
         self.validate_migration_state(seed_revision, schema_revision, &seed_digest, &entries)?;
         let now_ms = unix_now_ms();
         let prepared_rows = match entries
@@ -2408,66 +2478,18 @@ impl SynapseStore {
     /// Store a complete measured owned-decode row under its class-scoped key.
     /// This is the only certification write that can create a matchable owned row.
     // Staged storage API consumed by the epic's runtime slice; remove this allow there.
+    /// Store a complete measured owned-decode row under its shape-scoped key.
+    /// This is the only certification write that can create a matchable owned row.
+    // This direct writer is retained for storage tests; production probes use
+    // the fenced multi-row terminal write below.
     #[allow(dead_code)]
     pub fn store_owned_decode_cert_row(
         &self,
         row: &OwnedDecodeCertificationRow,
     ) -> Result<(), SynapseStoreError> {
         validate_owned_decode_cert_row(row)?;
-        let evidence_json = serde_json::to_string(&row.evidence)?;
-        let identities_json = serde_json::to_string(&row.constraint_runtime_identities)?;
-        let worker_path_json = serde_json::to_string(&row.worker_path_evidence)?;
-        self.store.with_conn_fenced(|tx| {
-            tx.execute(
-                "INSERT INTO cert_rows (
-                     certification_class, assurance_class, status, key_hash,
-                     revisioned_machine_profile_hash, profile_activation_epoch,
-                     model_id, decode_fingerprint, numeric_profile_id, fingerprint,
-                     certified_at_ms, os_build, module_generation,
-                     evidence_schema_revision, processing_fingerprint,
-                     runtime_config_digest, constraint_runtime_identities_json,
-                     worker_path_evidence_json, g_dec_manifest_revision, evidence_json
-                  ) VALUES (
-                     'measured_owned_decode', 'measured', ?1, ?2, ?2, ?3, ?4, ?5,
-                     ?6, ?5, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16
-                  )
-                  ON CONFLICT (
-                      revisioned_machine_profile_hash, profile_activation_epoch,
-                      model_id, decode_fingerprint, evidence_schema_revision
-                  ) WHERE certification_class = 'measured_owned_decode'
-                  DO UPDATE SET
-                     status = excluded.status,
-                     numeric_profile_id = excluded.numeric_profile_id,
-                     fingerprint = excluded.fingerprint,
-                     certified_at_ms = excluded.certified_at_ms,
-                     os_build = excluded.os_build,
-                     module_generation = excluded.module_generation,
-                     processing_fingerprint = excluded.processing_fingerprint,
-                     runtime_config_digest = excluded.runtime_config_digest,
-                     constraint_runtime_identities_json = excluded.constraint_runtime_identities_json,
-                     worker_path_evidence_json = excluded.worker_path_evidence_json,
-                     g_dec_manifest_revision = excluded.g_dec_manifest_revision,
-                     evidence_json = excluded.evidence_json",
-                params![
-                    row.status.as_str(),
-                    &row.revisioned_machine_profile_hash,
-                    row.profile_activation_epoch as i64,
-                    &row.model_id,
-                    &row.decode_fingerprint,
-                    row.numeric_profile_id.as_ref().map(|id| &id.0),
-                    row.certified_at_ms as i64,
-                    &row.os_build,
-                    row.module_generation as i64,
-                    &row.evidence_schema_revision,
-                    &row.processing_fingerprint,
-                    &row.runtime_config_digest,
-                    identities_json,
-                    worker_path_json,
-                    &row.g_dec_manifest_revision,
-                    evidence_json,
-                ],
-            )
-        })?;
+        self.store
+            .with_conn_fenced(|tx| upsert_owned_decode_cert_row_tx(tx, row))?;
         Ok(())
     }
 
@@ -2480,25 +2502,63 @@ impl SynapseStore {
         row: &OwnedDecodeCertificationRow,
         observed_at_ms: u64,
     ) -> Result<ProbeWriteOutcome, SynapseStoreError> {
-        validate_owned_decode_cert_row(row)?;
-        let row_matches_terminal = row.revisioned_machine_profile_hash
-            == terminal.revisioned_machine_profile_hash
-            && row.profile_activation_epoch == terminal.profile_activation_epoch
-            && row.model_id == terminal.model_id
-            && row.decode_fingerprint == terminal.decode_fingerprint
-            && row.processing_fingerprint == terminal.processing_fingerprint
-            && row.runtime_config_digest == terminal.runtime_config_digest
-            && row.constraint_runtime_identities == terminal.constraint_runtime_identities
-            && row.worker_path_evidence == terminal.worker_path_evidence
-            && row.evidence_schema_revision == terminal.evidence_schema_revision
-            && row.g_dec_manifest_revision == terminal.g_dec_manifest_revision;
-        if row.revisioned_machine_profile_hash != snapshot.revisioned_machine_profile_hash
-            || row.profile_activation_epoch != snapshot.profile_activation_epoch
-            || row.model_id != snapshot.model_id
-            || row.decode_fingerprint != snapshot.decode_fingerprint
-            || !owned_decode_match_inputs_equal(snapshot, terminal)
-            || !row_matches_terminal
-        {
+        self.store_owned_decode_cert_rows_if_current(
+            snapshot,
+            terminal,
+            std::slice::from_ref(row),
+            observed_at_ms,
+        )
+    }
+
+    /// Commit one row for each request shape exercised by a terminal probe.
+    pub fn store_owned_decode_cert_rows_if_current(
+        &self,
+        snapshot: &OwnedDecodeMatchInputs,
+        terminal: &OwnedDecodeMatchInputs,
+        rows: &[OwnedDecodeCertificationRow],
+        observed_at_ms: u64,
+    ) -> Result<ProbeWriteOutcome, SynapseStoreError> {
+        if rows.is_empty() {
+            return Err(SynapseStoreError::Decode(
+                "terminal probe must write at least one certification row".to_string(),
+            ));
+        }
+        let mut shape_identities = BTreeSet::new();
+        for row in rows {
+            validate_owned_decode_cert_row(row)?;
+            if !shape_identities.insert(row.constraint_runtime_identities.clone()) {
+                return Err(SynapseStoreError::Decode(
+                    "terminal probe contains duplicate request-shape evidence".to_string(),
+                ));
+            }
+            let shape_matches = row.constraint_runtime_identities.is_empty()
+                || row.constraint_runtime_identities == terminal.constraint_runtime_identities;
+            let row_matches_terminal = row.revisioned_machine_profile_hash
+                == terminal.revisioned_machine_profile_hash
+                && row.profile_activation_epoch == terminal.profile_activation_epoch
+                && row.model_id == terminal.model_id
+                && row.decode_fingerprint == terminal.decode_fingerprint
+                && row.processing_fingerprint == terminal.processing_fingerprint
+                && row.runtime_config_digest == terminal.runtime_config_digest
+                && shape_matches
+                && row.worker_path_evidence == terminal.worker_path_evidence
+                && row.evidence_schema_revision == terminal.evidence_schema_revision
+                && row.g_dec_manifest_revision == terminal.g_dec_manifest_revision;
+            if row.revisioned_machine_profile_hash != snapshot.revisioned_machine_profile_hash
+                || row.profile_activation_epoch != snapshot.profile_activation_epoch
+                || row.model_id != snapshot.model_id
+                || row.decode_fingerprint != snapshot.decode_fingerprint
+                || !row_matches_terminal
+            {
+                return self.record_stale_probe(
+                    snapshot,
+                    terminal,
+                    "probe_tuple_changed",
+                    observed_at_ms,
+                );
+            }
+        }
+        if !owned_decode_match_inputs_equal(snapshot, terminal) {
             return self.record_stale_probe(
                 snapshot,
                 terminal,
@@ -2506,9 +2566,6 @@ impl SynapseStore {
                 observed_at_ms,
             );
         }
-        let evidence_json = serde_json::to_string(&row.evidence)?;
-        let identities_json = serde_json::to_string(&row.constraint_runtime_identities)?;
-        let worker_path_json = serde_json::to_string(&row.worker_path_evidence)?;
         let outcome = self.store.with_conn_fenced(|tx| {
             let (current_hash, current_epoch): (Option<String>, Option<i64>) = tx.query_row(
                 "SELECT revisioned_machine_profile_hash, profile_activation_epoch
@@ -2535,55 +2592,9 @@ impl SynapseStore {
                 )?;
                 return Ok(ProbeWriteOutcome::ProbeStale);
             }
-            tx.execute(
-                "INSERT INTO cert_rows (
-                     certification_class, assurance_class, status, key_hash,
-                     revisioned_machine_profile_hash, profile_activation_epoch,
-                     model_id, decode_fingerprint, numeric_profile_id, fingerprint,
-                     certified_at_ms, os_build, module_generation,
-                     evidence_schema_revision, processing_fingerprint,
-                     runtime_config_digest, constraint_runtime_identities_json,
-                     worker_path_evidence_json, g_dec_manifest_revision, evidence_json
-                 ) VALUES (
-                     'measured_owned_decode', 'measured', ?1, ?2, ?2, ?3, ?4, ?5,
-                     ?6, ?5, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16
-                 )
-                 ON CONFLICT (
-                     revisioned_machine_profile_hash, profile_activation_epoch,
-                     model_id, decode_fingerprint, evidence_schema_revision
-                 ) WHERE certification_class = 'measured_owned_decode'
-                 DO UPDATE SET
-                     status = excluded.status,
-                     numeric_profile_id = excluded.numeric_profile_id,
-                     fingerprint = excluded.fingerprint,
-                     certified_at_ms = excluded.certified_at_ms,
-                     os_build = excluded.os_build,
-                     module_generation = excluded.module_generation,
-                     processing_fingerprint = excluded.processing_fingerprint,
-                     runtime_config_digest = excluded.runtime_config_digest,
-                     constraint_runtime_identities_json = excluded.constraint_runtime_identities_json,
-                     worker_path_evidence_json = excluded.worker_path_evidence_json,
-                     g_dec_manifest_revision = excluded.g_dec_manifest_revision,
-                     evidence_json = excluded.evidence_json",
-                params![
-                    row.status.as_str(),
-                    &row.revisioned_machine_profile_hash,
-                    row.profile_activation_epoch as i64,
-                    &row.model_id,
-                    &row.decode_fingerprint,
-                    row.numeric_profile_id.as_ref().map(|id| &id.0),
-                    row.certified_at_ms as i64,
-                    &row.os_build,
-                    row.module_generation as i64,
-                    &row.evidence_schema_revision,
-                    &row.processing_fingerprint,
-                    &row.runtime_config_digest,
-                    identities_json,
-                    worker_path_json,
-                    &row.g_dec_manifest_revision,
-                    evidence_json,
-                ],
-            )?;
+            for row in rows {
+                upsert_owned_decode_cert_row_tx(tx, row)?;
+            }
             Ok(ProbeWriteOutcome::Certified)
         })?;
         Ok(outcome)
@@ -2627,7 +2638,10 @@ impl SynapseStore {
         model_id: &str,
         decode_fingerprint: &str,
         evidence_schema_revision: &str,
+        constraint_runtime_identities: &[String],
     ) -> Result<Option<OwnedDecodeCertificationRow>, SynapseStoreError> {
+        let identities_digest =
+            constraint_runtime_identities_digest(constraint_runtime_identities)?;
         let raw = self.store.with_conn(|conn| {
             conn.query_row(
                 &format!(
@@ -2638,7 +2652,8 @@ impl SynapseStore {
                        AND profile_activation_epoch = ?2
                        AND model_id = ?3
                        AND decode_fingerprint = ?4
-                       AND evidence_schema_revision = ?5"
+                       AND evidence_schema_revision = ?5
+                       AND constraint_runtime_identities_digest = ?6"
                 ),
                 params![
                     revisioned_machine_profile_hash,
@@ -2646,12 +2661,88 @@ impl SynapseStore {
                     model_id,
                     decode_fingerprint,
                     evidence_schema_revision,
+                    identities_digest,
                 ],
                 owned_decode_cert_row_from_row,
             )
             .optional()
         })?;
         raw.map(decode_owned_decode_cert_row).transpose()
+    }
+
+    pub fn get_owned_decode_measurement_row(
+        &self,
+        revisioned_machine_profile_hash: &str,
+        profile_activation_epoch: u64,
+        model_id: &str,
+        decode_fingerprint: &str,
+        evidence_schema_revision: &str,
+        constraint_runtime_identities: &[String],
+    ) -> Result<Option<OwnedDecodeCertificationRow>, SynapseStoreError> {
+        let identities_digest =
+            constraint_runtime_identities_digest(constraint_runtime_identities)?;
+        let raw = self.store.with_conn(|conn| {
+            conn.query_row(
+                &format!(
+                    "{OWNED_CERT_SELECT_SQL}
+                     WHERE certification_class = 'measured_owned_decode'
+                       AND revisioned_machine_profile_hash = ?1
+                       AND profile_activation_epoch = ?2
+                       AND model_id = ?3
+                       AND decode_fingerprint = ?4
+                       AND evidence_schema_revision = ?5
+                       AND constraint_runtime_identities_digest = ?6
+                     ORDER BY certified_at_ms DESC LIMIT 1"
+                ),
+                params![
+                    revisioned_machine_profile_hash,
+                    profile_activation_epoch as i64,
+                    model_id,
+                    decode_fingerprint,
+                    evidence_schema_revision,
+                    identities_digest,
+                ],
+                owned_decode_cert_row_from_row,
+            )
+            .optional()
+        })?;
+        raw.map(decode_owned_decode_cert_row).transpose()
+    }
+
+    fn current_owned_decode_cert_rows(
+        &self,
+        revisioned_machine_profile_hash: &str,
+        profile_activation_epoch: u64,
+        model_id: &str,
+        decode_fingerprint: &str,
+    ) -> Result<Vec<OwnedDecodeCertificationRow>, SynapseStoreError> {
+        let raw = self.store.with_conn(|conn| {
+            let mut statement = conn.prepare(&format!(
+                "{OWNED_CERT_SELECT_SQL}
+                 WHERE certification_class = 'measured_owned_decode'
+                   AND status = 'certified'
+                   AND revisioned_machine_profile_hash = ?1
+                   AND profile_activation_epoch = ?2
+                   AND model_id = ?3
+                   AND decode_fingerprint = ?4
+                   AND evidence_schema_revision = ?5
+                 ORDER BY certified_at_ms DESC, row_id DESC"
+            ))?;
+            let rows = statement
+                .query_map(
+                    params![
+                        revisioned_machine_profile_hash,
+                        profile_activation_epoch as i64,
+                        model_id,
+                        decode_fingerprint,
+                        CERT_EVIDENCE_SCHEMA_REVISION,
+                    ],
+                    owned_decode_cert_row_from_row,
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })?;
+        raw.into_iter().map(decode_owned_decode_cert_row).collect()
     }
 
     // Staged storage API consumed by the epic's runtime slice; remove this allow there.
@@ -2666,21 +2757,18 @@ impl SynapseStore {
             &inputs.model_id,
             &inputs.decode_fingerprint,
             &inputs.evidence_schema_revision,
+            &inputs.constraint_runtime_identities,
         )?
         else {
             return Ok(None);
         };
         let mut required_identities = inputs.constraint_runtime_identities.clone();
         required_identities.sort();
-        if required_identities
-            .windows(2)
-            .any(|pair| pair[0] == pair[1])
+        required_identities.dedup();
+        if required_identities != inputs.constraint_runtime_identities
             || row.processing_fingerprint != inputs.processing_fingerprint
             || row.runtime_config_digest != inputs.runtime_config_digest
-            || !applicable_constraint_identities_match(
-                &row.constraint_runtime_identities,
-                &required_identities,
-            )
+            || row.constraint_runtime_identities != inputs.constraint_runtime_identities
             || row.worker_path_evidence != inputs.worker_path_evidence
             || row.g_dec_manifest_revision != inputs.g_dec_manifest_revision
             || !complete_g_dec_evidence(&row.evidence, &inputs.g_dec_manifest_revision)
@@ -2688,6 +2776,51 @@ impl SynapseStore {
             return Ok(None);
         }
         Ok(Some(row))
+    }
+
+    /// Compare the approval stamp and profile epoch immediately before dispatch.
+    /// The join keeps approval mutation and epoch rotation in one fenced read.
+    pub fn owned_decode_dispatch_admission_matches(
+        &self,
+        profile_activation_epoch: u64,
+        model_id: &str,
+        decode_fingerprint: &str,
+        approval_semantic_digest: &str,
+        approval_generation: u64,
+    ) -> Result<bool, SynapseStoreError> {
+        if profile_activation_epoch == 0 {
+            return Ok(false);
+        }
+        self.validate_persisted_migration_state()?;
+        let matches = self.store.with_conn_fenced(|tx| {
+            let current = tx
+                .query_row(
+                    "SELECT profile_state.profile_activation_epoch, approvals.enabled,
+                            approvals.semantic_digest, approvals.generation
+                     FROM profile_state
+                     JOIN approvals ON approvals.model_id = ?1
+                         AND approvals.decode_fingerprint = ?2
+                     WHERE profile_state.id = 0",
+                    params![model_id, decode_fingerprint],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<i64>>(0)?,
+                            row.get::<_, i64>(1)? != 0,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, i64>(3)? as u64,
+                        ))
+                    },
+                )
+                .optional()?;
+            Ok(matches!(
+                current,
+                Some((Some(epoch), true, digest, generation))
+                    if epoch == profile_activation_epoch as i64
+                        && digest == approval_semantic_digest
+                        && generation == approval_generation
+            ))
+        })?;
+        Ok(matches)
     }
 
     /// Read the two independent values that authorize owned-decode admission—the
@@ -2706,6 +2839,7 @@ impl SynapseStore {
         if profile_activation_epoch == 0 {
             return Ok(None);
         }
+        let identities_digest = constraint_runtime_identities_digest(&[])?;
         let admission = self.store.with_conn_fenced(|tx| {
             let (persisted_hash, persisted_epoch): (Option<String>, Option<i64>) = tx.query_row(
                 "SELECT revisioned_machine_profile_hash, profile_activation_epoch
@@ -2736,7 +2870,8 @@ impl SynapseStore {
                            AND profile_activation_epoch = ?2
                            AND model_id = ?3
                            AND decode_fingerprint = ?4
-                           AND evidence_schema_revision = ?5"
+                           AND evidence_schema_revision = ?5
+                           AND constraint_runtime_identities_digest = ?6"
                     ),
                     params![
                         revisioned_machine_profile_hash,
@@ -2744,6 +2879,7 @@ impl SynapseStore {
                         model_id,
                         decode_fingerprint,
                         CERT_EVIDENCE_SCHEMA_REVISION,
+                        &identities_digest,
                     ],
                     owned_decode_cert_row_from_row,
                 )
@@ -2781,12 +2917,11 @@ impl SynapseStore {
         }
         let mut expected_constraints = inputs.constraint_runtime_identities.clone();
         expected_constraints.sort();
-        if expected_constraints
-            .windows(2)
-            .any(|pair| pair[0] == pair[1])
-        {
+        expected_constraints.dedup();
+        if expected_constraints != inputs.constraint_runtime_identities {
             return Ok(None);
         }
+        let identities_digest = constraint_runtime_identities_digest(&expected_constraints)?;
         let admission = self.store.with_conn_fenced(|tx| {
             let (persisted_hash, persisted_epoch): (Option<String>, Option<i64>) = tx.query_row(
                 "SELECT revisioned_machine_profile_hash, profile_activation_epoch
@@ -2824,9 +2959,10 @@ impl SynapseStore {
                            AND status = 'certified'
                            AND revisioned_machine_profile_hash = ?1
                            AND profile_activation_epoch = ?2
-                           AND model_id = ?3
-                           AND decode_fingerprint = ?4
-                           AND evidence_schema_revision = ?5"
+                            AND model_id = ?3
+                            AND decode_fingerprint = ?4
+                            AND evidence_schema_revision = ?5
+                            AND constraint_runtime_identities_digest = ?6"
                     ),
                     params![
                         &inputs.revisioned_machine_profile_hash,
@@ -2834,6 +2970,7 @@ impl SynapseStore {
                         &inputs.model_id,
                         &inputs.decode_fingerprint,
                         &inputs.evidence_schema_revision,
+                        &identities_digest,
                     ],
                     owned_decode_cert_row_from_row,
                 )
@@ -2848,10 +2985,7 @@ impl SynapseStore {
                 || certification.decode_fingerprint != inputs.decode_fingerprint
                 || certification.processing_fingerprint != inputs.processing_fingerprint
                 || certification.runtime_config_digest != inputs.runtime_config_digest
-                || !applicable_constraint_identities_match(
-                    &certification.constraint_runtime_identities,
-                    &expected_constraints,
-                )
+                || certification.constraint_runtime_identities != expected_constraints
                 || certification.worker_path_evidence != inputs.worker_path_evidence
                 || certification.evidence_schema_revision != inputs.evidence_schema_revision
                 || certification.g_dec_manifest_revision != inputs.g_dec_manifest_revision
@@ -2980,65 +3114,50 @@ impl SynapseStore {
 
     pub fn get_cert_row(
         &self,
+        certification_class: CertificationClass,
         machine_profile_hash: &str,
         fingerprint: &Fingerprint,
     ) -> Result<Option<CertificationRow>, SynapseStoreError> {
+        if !matches!(
+            certification_class,
+            CertificationClass::Embedding | CertificationClass::Rerank
+        ) {
+            return Err(SynapseStoreError::Decode(
+                "measured certification reads require embedding or rerank class".to_string(),
+            ));
+        }
         let raw = self.store.with_conn(|conn| {
             conn.query_row(
                 &format!(
                     "{CERT_SELECT_SQL} WHERE assurance_class = 'measured'
-                     AND certification_class IN ('measured_owned_decode', 'embedding', 'rerank')
-                     AND status = 'certified' AND key_hash = ?1 AND fingerprint = ?2"
+                     AND certification_class = ?1 AND status = 'certified'
+                     AND key_hash = ?2 AND fingerprint = ?3"
                 ),
-                params![machine_profile_hash, &fingerprint.0],
+                params![
+                    certification_class.as_str(),
+                    machine_profile_hash,
+                    &fingerprint.0
+                ],
                 cert_row_from_row,
             )
             .optional()
         })?;
-        if let Some(raw) = raw {
-            return decode_cert_row(raw).map(Some);
-        }
-        // Keep the historical accessor useful for audit tooling. Legacy rows
-        // are deliberately not returned by the new owned-decode accessor.
-        let legacy = self.store.with_conn(|conn| {
-            conn.query_row(
-                &format!(
-                    "{CERT_SELECT_SQL} WHERE certification_class = 'legacy_owned_decode'
-                     AND status = 'uncertified'
-                     AND json_extract(evidence_json, '$.blocking_reason') IS NULL
-                     AND key_hash = ?1 AND fingerprint = ?2
-                     AND NOT EXISTS (
-                         SELECT 1 FROM cert_rows AS failed
-                         WHERE failed.certification_class = 'legacy_owned_decode'
-                           AND failed.key_hash = ?1
-                           AND failed.fingerprint = ?2
-                           AND json_extract(failed.evidence_json, '$.blocking_reason') IS NOT NULL
-                     )
-                     ORDER BY certified_at_ms DESC LIMIT 1"
-                ),
-                params![machine_profile_hash, &fingerprint.0],
-                cert_row_from_row,
-            )
-            .optional()
-        })?;
-        legacy.map(decode_cert_row).transpose().map(|row| {
-            row.map(|mut row| {
-                row.status = CertificationStatus::Certified;
-                row
-            })
-        })
+        raw.map(decode_cert_row).transpose()
     }
 
     pub fn latest_cert_row(
         &self,
+        certification_class: CertificationClass,
         fingerprint: &Fingerprint,
     ) -> Result<Option<CertificationRow>, SynapseStoreError> {
         let raw = self.store.with_conn(|conn| {
             conn.query_row(
                 &format!(
-                    "{CERT_SELECT_SQL} WHERE status = 'certified' AND fingerprint = ?1 ORDER BY certified_at_ms DESC LIMIT 1"
+                    "{CERT_SELECT_SQL} WHERE certification_class = ?1
+                     AND status = 'certified' AND fingerprint = ?2
+                     ORDER BY certified_at_ms DESC LIMIT 1"
                 ),
-                params![&fingerprint.0],
+                params![certification_class.as_str(), &fingerprint.0],
                 cert_row_from_row,
             )
             .optional()
@@ -3048,16 +3167,22 @@ impl SynapseStore {
 
     pub fn get_probe_row(
         &self,
+        certification_class: CertificationClass,
         machine_profile_hash: &str,
         fingerprint: &Fingerprint,
     ) -> Result<Option<CertificationRow>, SynapseStoreError> {
         let raw = self.store.with_conn(|conn| {
             conn.query_row(
                 &format!(
-                    "{CERT_SELECT_SQL} WHERE assurance_class = 'measured' AND key_hash = ?1
-                     AND fingerprint = ?2 ORDER BY certified_at_ms DESC LIMIT 1"
+                    "{CERT_SELECT_SQL} WHERE assurance_class = 'measured'
+                     AND certification_class = ?1 AND key_hash = ?2
+                     AND fingerprint = ?3 ORDER BY certified_at_ms DESC LIMIT 1"
                 ),
-                params![machine_profile_hash, &fingerprint.0],
+                params![
+                    certification_class.as_str(),
+                    machine_profile_hash,
+                    &fingerprint.0
+                ],
                 cert_row_from_row,
             )
             .optional()
@@ -3067,14 +3192,17 @@ impl SynapseStore {
 
     pub fn latest_probe_row(
         &self,
+        certification_class: CertificationClass,
         fingerprint: &Fingerprint,
     ) -> Result<Option<CertificationRow>, SynapseStoreError> {
         let raw = self.store.with_conn(|conn| {
             conn.query_row(
                 &format!(
-                    "{CERT_SELECT_SQL} WHERE assurance_class = 'measured' AND fingerprint = ?1 ORDER BY certified_at_ms DESC LIMIT 1"
+                    "{CERT_SELECT_SQL} WHERE assurance_class = 'measured'
+                     AND certification_class = ?1 AND fingerprint = ?2
+                     ORDER BY certified_at_ms DESC LIMIT 1"
                 ),
-                params![&fingerprint.0],
+                params![certification_class.as_str(), &fingerprint.0],
                 cert_row_from_row,
             )
             .optional()
@@ -3084,20 +3212,24 @@ impl SynapseStore {
 
     pub fn has_stale_cert_row(
         &self,
+        certification_class: CertificationClass,
         machine_profile_hash: &str,
         fingerprint: &Fingerprint,
     ) -> Result<bool, SynapseStoreError> {
         let count = self.store.with_conn(|conn| {
             conn.query_row(
                 "SELECT COUNT(1) FROM cert_rows
-                 WHERE assurance_class = 'measured'
-                   AND certification_class IN ('measured_owned_decode', 'legacy_owned_decode')
+                 WHERE assurance_class = 'measured' AND certification_class = ?1
                    AND (status = 'certified' OR (
                        status = 'uncertified'
                        AND json_extract(evidence_json, '$.blocking_reason') IS NULL
                    ))
-                   AND fingerprint = ?1 AND key_hash <> ?2",
-                params![&fingerprint.0, machine_profile_hash],
+                   AND fingerprint = ?2 AND key_hash <> ?3",
+                params![
+                    certification_class.as_str(),
+                    &fingerprint.0,
+                    machine_profile_hash
+                ],
                 |row| row.get::<_, i64>(0),
             )
         })?;
@@ -3607,16 +3739,37 @@ impl SynapseStore {
                         state.revisioned_machine_profile_hash.as_deref(),
                         state.profile_activation_epoch,
                     ) {
-                        (Some(hash), Some(epoch)) => self.get_owned_decode_cert_row(
-                            hash,
-                            epoch,
-                            &approval.model_id,
-                            &approval.decode_fingerprint,
-                            CERT_EVIDENCE_SCHEMA_REVISION,
-                        )?,
-                        _ => None,
+                        (Some(hash), Some(epoch)) => self
+                            .current_owned_decode_cert_rows(
+                                hash,
+                                epoch,
+                                &approval.model_id,
+                                &approval.decode_fingerprint,
+                            )?
+                            .into_iter()
+                            .any(|row| {
+                                let inputs = OwnedDecodeMatchInputs {
+                                    revisioned_machine_profile_hash: row
+                                        .revisioned_machine_profile_hash,
+                                    profile_activation_epoch: row.profile_activation_epoch,
+                                    model_id: row.model_id,
+                                    decode_fingerprint: row.decode_fingerprint,
+                                    processing_fingerprint: row.processing_fingerprint,
+                                    runtime_config_digest: row.runtime_config_digest,
+                                    constraint_runtime_identities: row
+                                        .constraint_runtime_identities,
+                                    worker_path_evidence: row.worker_path_evidence,
+                                    evidence_schema_revision: row.evidence_schema_revision,
+                                    g_dec_manifest_revision: row.g_dec_manifest_revision,
+                                };
+                                self.owned_decode_admission_matching(&inputs)
+                                    .ok()
+                                    .flatten()
+                                    .is_some()
+                            }),
+                        _ => false,
                     };
-                    if current.is_some() {
+                    if current {
                         ("serving".to_string(), None)
                     } else {
                         (
@@ -4944,6 +5097,12 @@ fn decode_cert_row(row: RawCertificationRow) -> Result<CertificationRow, Synapse
 
 // Staged storage API consumed by the epic's runtime slice; remove this allow there.
 #[allow(dead_code)]
+fn constraint_runtime_identities_digest(
+    identities: &[String],
+) -> Result<String, SynapseStoreError> {
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(identities)?)))
+}
+
 fn digest_text(hasher: &mut Sha256, value: &str) {
     hasher.update((value.len() as u64).to_be_bytes());
     hasher.update(value.as_bytes());
@@ -5125,14 +5284,6 @@ fn load_approval_tx_by_identity(
         approval_from_row,
     )
     .optional()
-}
-
-/// Unconstrained requests have no applicable constraint identity. Constrained
-/// requests must name only identities present in the row's certified set.
-fn applicable_constraint_identities_match(certified: &[String], required: &[String]) -> bool {
-    required
-        .iter()
-        .all(|identity| certified.binary_search(identity).is_ok())
 }
 
 fn owned_decode_match_inputs_equal(
@@ -5528,6 +5679,76 @@ fn to_sql_error(error: SynapseStoreError) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
 }
 
+fn upsert_owned_decode_cert_row_tx(
+    tx: &rusqlite::Transaction<'_>,
+    row: &OwnedDecodeCertificationRow,
+) -> rusqlite::Result<usize> {
+    let evidence_json = serde_json::to_string(&row.evidence)
+        .map_err(SynapseStoreError::from)
+        .map_err(to_sql_error)?;
+    let identities_json = serde_json::to_string(&row.constraint_runtime_identities)
+        .map_err(SynapseStoreError::from)
+        .map_err(to_sql_error)?;
+    let identities_digest =
+        constraint_runtime_identities_digest(&row.constraint_runtime_identities)
+            .map_err(to_sql_error)?;
+    let worker_path_json = serde_json::to_string(&row.worker_path_evidence)
+        .map_err(SynapseStoreError::from)
+        .map_err(to_sql_error)?;
+    tx.execute(
+        "INSERT INTO cert_rows (
+             certification_class, assurance_class, status, key_hash,
+             revisioned_machine_profile_hash, profile_activation_epoch,
+             model_id, decode_fingerprint, numeric_profile_id, fingerprint,
+             certified_at_ms, os_build, module_generation,
+             evidence_schema_revision, processing_fingerprint,
+             runtime_config_digest, constraint_runtime_identities_json,
+             constraint_runtime_identities_digest, worker_path_evidence_json,
+             g_dec_manifest_revision, evidence_json
+         ) VALUES (
+             'measured_owned_decode', 'measured', ?1, ?2, ?2, ?3, ?4, ?5,
+             ?6, ?5, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17
+         )
+         ON CONFLICT (
+             revisioned_machine_profile_hash, profile_activation_epoch,
+             model_id, decode_fingerprint, evidence_schema_revision,
+             constraint_runtime_identities_digest
+         ) WHERE certification_class = 'measured_owned_decode'
+         DO UPDATE SET
+             status = excluded.status,
+             numeric_profile_id = excluded.numeric_profile_id,
+             fingerprint = excluded.fingerprint,
+             certified_at_ms = excluded.certified_at_ms,
+             os_build = excluded.os_build,
+             module_generation = excluded.module_generation,
+             processing_fingerprint = excluded.processing_fingerprint,
+             runtime_config_digest = excluded.runtime_config_digest,
+             constraint_runtime_identities_json = excluded.constraint_runtime_identities_json,
+             worker_path_evidence_json = excluded.worker_path_evidence_json,
+             g_dec_manifest_revision = excluded.g_dec_manifest_revision,
+             evidence_json = excluded.evidence_json",
+        params![
+            row.status.as_str(),
+            &row.revisioned_machine_profile_hash,
+            row.profile_activation_epoch as i64,
+            &row.model_id,
+            &row.decode_fingerprint,
+            row.numeric_profile_id.as_ref().map(|id| &id.0),
+            row.certified_at_ms as i64,
+            &row.os_build,
+            row.module_generation as i64,
+            &row.evidence_schema_revision,
+            &row.processing_fingerprint,
+            &row.runtime_config_digest,
+            identities_json,
+            identities_digest,
+            worker_path_json,
+            &row.g_dec_manifest_revision,
+            evidence_json,
+        ],
+    )
+}
+
 fn table_epoch_tx(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<i64> {
     tx.query_row(
         "SELECT table_epoch FROM module_meta WHERE id = 0",
@@ -5607,6 +5828,77 @@ mod tests {
     use super::*;
     use cortexkit_store_types::{Isolation, StorageBackend};
     use synapse_core::MachineProfile;
+
+    fn owned_seed_model_config(model_id: &str) -> StoredModelConfig {
+        let (family, quant, artifact_digest, derived_digest) = match model_id {
+            "qwen3-0.6b-decode-f16" => (
+                "qwen3-0.6b",
+                "f16",
+                "sha256:0437e45c94563b09e13cb7a64478fc406947a93cb34a7e05870fc8dcd48e23fd",
+                None,
+            ),
+            "lfm2-1.2b-decode-f16" => (
+                "lfm2-1.2b",
+                "f16",
+                "sha256:60fef6ef4481c533ce7427793bed50200b55b3c68d0d00c52bc56f207a9acecd",
+                None,
+            ),
+            "qwen3-0.6b-decode-q8_0" => (
+                "qwen3-0.6b",
+                "q8_0",
+                "sha256:0437e45c94563b09e13cb7a64478fc406947a93cb34a7e05870fc8dcd48e23fd",
+                Some("17d2fbfeff90269190287f324ed93bab3bb1b4fa4aad98c3fbba1868c01cb0f2"),
+            ),
+            "lfm2-1.2b-decode-q8_0" => (
+                "lfm2-1.2b",
+                "q8_0",
+                "sha256:60fef6ef4481c533ce7427793bed50200b55b3c68d0d00c52bc56f207a9acecd",
+                Some("5874faabdce2567dcc0e7339e9547d79421ba312c71e3442c9cc3c4ed3cb47d0"),
+            ),
+            other => panic!("unknown migration seed model {other}"),
+        };
+        let mut build_flags = BTreeMap::new();
+        if let Some(derived_digest) = derived_digest {
+            build_flags.insert("quantizer_revision".to_string(), "q8-ingest-v1".to_string());
+            build_flags.insert("derived_digest".to_string(), derived_digest.to_string());
+        }
+        StoredModelConfig {
+            model_id: model_id.to_string(),
+            engine: "owned-metal-decode".to_string(),
+            task: "generate".to_string(),
+            artifact_digest: artifact_digest.to_string(),
+            artifact_format: "owned-safetensors".to_string(),
+            tokenizer_sanitized_digest: "sha256:test-tokenizer".to_string(),
+            model_locator: ModelAssetLocator::CacheDigest {
+                digest: artifact_digest.to_string(),
+            },
+            tokenizer_locator: ModelAssetLocator::CacheDigest {
+                digest: "sha256:test-tokenizer".to_string(),
+            },
+            model_source_url: "file:///model".to_string(),
+            tokenizer_source_url: "file:///tokenizer".to_string(),
+            pooling: "none".to_string(),
+            normalize: false,
+            max_tokens: 512,
+            quant: quant.to_string(),
+            pin: true,
+            owned_family: Some(family.to_string()),
+            owned_dtype: Some("f16".to_string()),
+            owned_execution: Some("supervised".to_string()),
+            owned_attention_units: None,
+            config_locator: None,
+            extra_locators: Vec::new(),
+            engine_identity: EngineIdentity {
+                engine: "owned-metal-decode".to_string(),
+                version: "test".to_string(),
+                build_flags,
+            },
+            numeric_profile_id: NumericProfileId(format!("numeric-{model_id}")),
+            fingerprint: Fingerprint(format!("catalog-{model_id}")),
+            worker_bin: None,
+            worker_runtime_dir: None,
+        }
+    }
 
     fn admit(
         store: &SynapseStore,
@@ -6050,7 +6342,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_from_v5_preserves_jobs_pages_and_marks_certifications_measured() {
+    fn migration_from_v5_preserves_jobs_pages_and_quarantines_legacy_measurements() {
         let (root, descriptor) = temp_descriptor("migration-v5");
         {
             let legacy = open_sqlite(&descriptor).unwrap();
@@ -6085,18 +6377,25 @@ mod tests {
         }
 
         let migrated = SynapseStore::open(&descriptor).unwrap();
-        let cert = migrated
-            .get_cert_row("machine", &Fingerprint("fp".to_string()))
+        assert!(migrated
+            .get_cert_row(
+                CertificationClass::Embedding,
+                "machine",
+                &Fingerprint("fp".to_string()),
+            )
             .unwrap()
+            .is_none());
+        let legacy_class: String = migrated
+            .store
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT certification_class FROM cert_rows WHERE fingerprint = 'fp'",
+                    [],
+                    |row| row.get(0),
+                )
+            })
             .unwrap();
-        assert_eq!(cert.assurance_class, AssuranceClass::Measured);
-        assert_eq!(cert.status, CertificationStatus::Certified);
-        assert_eq!(
-            cert.key,
-            CertificationKey::Measured {
-                machine_profile_hash: "machine".to_string()
-            }
-        );
+        assert_eq!(legacy_class, "legacy_owned_decode");
         let job = migrated.get_job_at("legacy-job", 21).unwrap().unwrap();
         assert_eq!(job.request_digest, "legacy:legacy-job");
         assert_eq!(job.result_retention_ttl_ms, 100);
@@ -6124,13 +6423,15 @@ mod tests {
         assert_ne!(without_hash, with_hash);
 
         store
-            .store_cert_row(&CertificationRow {
+            .store_class_scoped_cert_row(&ClassScopedCertificationRow {
+                certification_class: CertificationClass::Embedding,
                 assurance_class: AssuranceClass::Measured,
                 status: CertificationStatus::Certified,
-                key: CertificationKey::Measured {
-                    machine_profile_hash: without_hash.clone(),
-                },
-                numeric_profile_id: NumericProfileId("ane-numeric".to_string()),
+                key_hash: without_hash.clone(),
+                machine_profile_hash: Some(without_hash.clone()),
+                remote_profile_hash: None,
+                identity_revision: None,
+                numeric_profile_id: Some(NumericProfileId("ane-numeric".to_string())),
                 fingerprint: fingerprint.clone(),
                 certified_at_ms: 10,
                 os_build: "23G93".to_string(),
@@ -6140,16 +6441,19 @@ mod tests {
             .unwrap();
 
         assert!(store
-            .get_cert_row(&without_hash, &fingerprint)
+            .get_cert_row(CertificationClass::Embedding, &without_hash, &fingerprint)
             .unwrap()
             .is_some());
         assert!(store
-            .get_cert_row(&with_hash, &fingerprint)
+            .get_cert_row(CertificationClass::Embedding, &with_hash, &fingerprint)
             .unwrap()
             .is_none());
-        assert!(store.has_stale_cert_row(&with_hash, &fingerprint).unwrap());
+        assert!(store
+            .has_stale_cert_row(CertificationClass::Embedding, &with_hash, &fingerprint)
+            .unwrap());
         let refused = crate::ensure_fingerprint_certified(
             &store,
+            CertificationClass::Embedding,
             &with_hash,
             &fingerprint,
             "ane-model",
@@ -6166,22 +6470,24 @@ mod tests {
         let (root, descriptor) = temp_descriptor("uncertified-reprobe");
         let store = SynapseStore::open(&descriptor).unwrap();
         let fingerprint = Fingerprint("decode-fp".to_string());
-        let mut row = CertificationRow {
+        let mut row = ClassScopedCertificationRow {
+            certification_class: CertificationClass::Embedding,
             assurance_class: AssuranceClass::Measured,
             status: CertificationStatus::Certified,
-            key: CertificationKey::Measured {
-                machine_profile_hash: "machine-a".to_string(),
-            },
-            numeric_profile_id: NumericProfileId("decode-np".to_string()),
+            key_hash: "machine-a".to_string(),
+            machine_profile_hash: Some("machine-a".to_string()),
+            remote_profile_hash: None,
+            identity_revision: None,
+            numeric_profile_id: Some(NumericProfileId("decode-np".to_string())),
             fingerprint: fingerprint.clone(),
             certified_at_ms: 10,
             os_build: "os-a".to_string(),
             module_generation: 1,
             evidence: serde_json::json!({"gate": "token_exact"}),
         };
-        store.store_cert_row(&row).unwrap();
+        store.store_class_scoped_cert_row(&row).unwrap();
         assert!(store
-            .get_cert_row("machine-a", &fingerprint)
+            .get_cert_row(CertificationClass::Embedding, "machine-a", &fingerprint)
             .unwrap()
             .is_some());
 
@@ -6191,18 +6497,21 @@ mod tests {
             "blocking_reason": "token_mismatch",
             "mismatches": [{"prompt": "corrupted fixture"}],
         });
-        store.store_cert_row(&row).unwrap();
+        store.store_class_scoped_cert_row(&row).unwrap();
 
         assert!(store
-            .get_cert_row("machine-a", &fingerprint)
+            .get_cert_row(CertificationClass::Embedding, "machine-a", &fingerprint)
             .unwrap()
             .is_none());
-        assert_eq!(
-            store.get_probe_row("machine-a", &fingerprint).unwrap(),
-            Some(row)
-        );
+        let probe = store
+            .get_probe_row(CertificationClass::Embedding, "machine-a", &fingerprint)
+            .unwrap()
+            .unwrap();
+        assert_eq!(probe.status, CertificationStatus::Uncertified);
+        assert_eq!(probe.evidence, row.evidence);
         let refused = crate::ensure_fingerprint_certified(
             &store,
+            CertificationClass::Embedding,
             "machine-a",
             &fingerprint,
             "owned-qwen3",
@@ -6211,6 +6520,104 @@ mod tests {
         .expect_err("an uncertified decode outcome must refuse future owned requests");
         assert_eq!(refused.code, "not_certified");
         assert!(refused.message.contains("token_mismatch"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn embedding_certification_cannot_certify_rerank_with_shared_fingerprint() {
+        let (root, descriptor) = temp_descriptor("cross-class-certification");
+        let store = SynapseStore::open(&descriptor).unwrap();
+        let fingerprint = Fingerprint("shared-fingerprint".to_string());
+        store
+            .store_class_scoped_cert_row(&ClassScopedCertificationRow {
+                certification_class: CertificationClass::Embedding,
+                assurance_class: AssuranceClass::Measured,
+                status: CertificationStatus::Certified,
+                key_hash: "legacy-profile-hash".to_string(),
+                machine_profile_hash: Some("legacy-profile-hash".to_string()),
+                remote_profile_hash: None,
+                identity_revision: None,
+                numeric_profile_id: Some(NumericProfileId("embedding-profile".to_string())),
+                fingerprint: fingerprint.clone(),
+                certified_at_ms: 1,
+                os_build: "test-os".to_string(),
+                module_generation: 1,
+                evidence: serde_json::json!({"task": "embed"}),
+            })
+            .unwrap();
+        assert!(store
+            .get_cert_row(
+                CertificationClass::Embedding,
+                "legacy-profile-hash",
+                &fingerprint,
+            )
+            .unwrap()
+            .is_some());
+        assert!(store
+            .get_cert_row(
+                CertificationClass::Rerank,
+                "legacy-profile-hash",
+                &fingerprint,
+            )
+            .unwrap()
+            .is_none());
+        let refused = crate::ensure_fingerprint_certified(
+            &store,
+            CertificationClass::Rerank,
+            "legacy-profile-hash",
+            &fingerprint,
+            "rerank-model",
+            false,
+        )
+        .expect_err("embedding evidence must not admit a rerank lane");
+        assert_eq!(refused.code, "not_certified");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_hash_keeps_pre_upgrade_non_owned_certification_visible() {
+        let (root, descriptor) = temp_descriptor("legacy-hash-upgrade");
+        let store = SynapseStore::open(&descriptor).unwrap();
+        let profile = MachineProfile {
+            os_build: "test-os".to_string(),
+            arch: "aarch64".to_string(),
+            chip_model: "test-chip".to_string(),
+            ram_class: "test-ram".to_string(),
+            ane_subtype: None,
+            engine_identities: Vec::new(),
+        };
+        let (legacy_hash, revisioned_hash) = crate::module_state_machine_profile_hashes(&profile);
+        assert_ne!(legacy_hash, revisioned_hash);
+        let fingerprint = Fingerprint("pre-upgrade-fingerprint".to_string());
+        store
+            .store_class_scoped_cert_row(&ClassScopedCertificationRow {
+                certification_class: CertificationClass::Embedding,
+                assurance_class: AssuranceClass::Measured,
+                status: CertificationStatus::Certified,
+                key_hash: legacy_hash.clone(),
+                machine_profile_hash: Some(legacy_hash.clone()),
+                remote_profile_hash: None,
+                identity_revision: None,
+                numeric_profile_id: Some(NumericProfileId("pre-upgrade".to_string())),
+                fingerprint: fingerprint.clone(),
+                certified_at_ms: 1,
+                os_build: profile.os_build,
+                module_generation: 1,
+                evidence: serde_json::json!({"source": "pre-upgrade"}),
+            })
+            .unwrap();
+        assert!(store
+            .get_cert_row(CertificationClass::Embedding, &legacy_hash, &fingerprint)
+            .unwrap()
+            .is_some());
+        assert!(store
+            .get_cert_row(
+                CertificationClass::Embedding,
+                &revisioned_hash,
+                &fingerprint,
+            )
+            .unwrap()
+            .is_none());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -6242,7 +6649,7 @@ mod tests {
             Some(row)
         );
         assert!(store
-            .get_cert_row("remote-profile", &fingerprint)
+            .get_cert_row(CertificationClass::Rerank, "remote-profile", &fingerprint)
             .unwrap()
             .is_none());
         assert!(store
@@ -6520,13 +6927,26 @@ mod tests {
                         "INSERT INTO models (
                              model_id, engine, task, fingerprint, config_json,
                              created_ms, updated_ms
-                         ) VALUES (?1, 'owned-metal-decode', 'generate', ?1, '{}', 1, 1)",
+                         ) VALUES (?1, 'ort', 'embed', ?1, '{}', 1, 1)",
                         params![model_id],
                     )?;
                 }
                 Ok(())
             })
             .unwrap();
+        let wrong_shape = store
+            .migrate_owned_decode_approvals(
+                "owned-decode-approval-migration-v1",
+                APPROVAL_SCHEMA_REVISION,
+            )
+            .unwrap();
+        assert_eq!(wrong_shape.outcome, "unmappable_identity");
+        assert!(store.approvals().unwrap().is_empty());
+        for model_id in model_ids {
+            store
+                .upsert_model(&owned_seed_model_config(model_id), 2)
+                .unwrap();
+        }
         let applied = store
             .migrate_owned_decode_approvals(
                 "owned-decode-approval-migration-v1",
@@ -6535,6 +6955,21 @@ mod tests {
             .unwrap();
         assert_eq!(applied.outcome, "applied");
         assert_eq!(applied.rows, 4);
+        let computed_seed_digest = hex::encode(Sha256::digest(
+            include_str!("../owned-decode-manifests/migration-seed-manifest-v1.json").as_bytes(),
+        ));
+        let marker_digest: String = store
+            .store
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT seed_digest FROM approval_migration_markers
+                     WHERE seed_revision = 'owned-decode-approval-migration-v1'",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(marker_digest, computed_seed_digest);
         let already_applied = store
             .migrate_owned_decode_approvals(
                 "owned-decode-approval-migration-v1",
@@ -6566,7 +7001,36 @@ mod tests {
     }
 
     #[test]
-    fn owned_decode_rows_are_epoch_scoped_and_non_owned_classes_upsert_by_class() {
+    fn approval_migration_rejects_tampered_seed_bytes_before_parsing() {
+        let (root, descriptor) = temp_descriptor("approval-migration-seed-digest");
+        let store = SynapseStore::open(&descriptor).unwrap();
+        let tampered = include_str!("../owned-decode-manifests/migration-seed-manifest-v1.json")
+            .replacen("\"grammar_enabled\": true", "\"grammar_enabled\": false", 1);
+        let result = store
+            .migrate_owned_decode_approvals_from_seed(
+                &tampered,
+                "owned-decode-approval-migration-v1",
+                APPROVAL_SCHEMA_REVISION,
+            )
+            .unwrap();
+        assert_eq!(result.outcome, "invalid_seed");
+        assert_eq!(result.marker, "seed_digest_mismatch");
+        let marker_count: i64 = store
+            .store
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM approval_migration_markers",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(marker_count, 0);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn owned_decode_rows_are_epoch_scoped_shape_exact_and_class_isolated() {
         let (root, descriptor) = temp_descriptor("owned-row-epochs");
         let store = SynapseStore::open(&descriptor).unwrap();
         let profile_hash = "b".repeat(64);
@@ -6610,6 +7074,7 @@ mod tests {
                 "owned-model",
                 &decode_fingerprint,
                 CERT_EVIDENCE_SCHEMA_REVISION,
+                &row.constraint_runtime_identities,
             )
             .unwrap()
             .is_some());
@@ -6620,6 +7085,7 @@ mod tests {
                 "owned-model",
                 &decode_fingerprint,
                 CERT_EVIDENCE_SCHEMA_REVISION,
+                &row.constraint_runtime_identities,
             )
             .unwrap()
             .is_some());
@@ -6644,6 +7110,15 @@ mod tests {
         assert!(store
             .get_owned_decode_cert_row_matching(&unconstrained_inputs)
             .unwrap()
+            .is_none());
+        let mut unconstrained_row = row.clone();
+        unconstrained_row.constraint_runtime_identities.clear();
+        store
+            .store_owned_decode_cert_row(&unconstrained_row)
+            .unwrap();
+        assert!(store
+            .get_owned_decode_cert_row_matching(&unconstrained_inputs)
+            .unwrap()
             .is_some());
         let mut uncertified_constraint_inputs = match_inputs.clone();
         uncertified_constraint_inputs.constraint_runtime_identities =
@@ -6659,6 +7134,7 @@ mod tests {
                 "owned-model",
                 &decode_fingerprint,
                 CERT_EVIDENCE_SCHEMA_REVISION,
+                &row.constraint_runtime_identities,
             )
             .unwrap()
             .is_none());
@@ -6790,7 +7266,7 @@ mod tests {
     }
 
     #[test]
-    fn owned_decode_admission_requires_both_profile_guards() {
+    fn owned_decode_admission_and_health_require_full_current_evidence() {
         let (root, descriptor) = temp_descriptor("dual-guard");
         let store = SynapseStore::open(&descriptor).unwrap();
         store
@@ -6838,7 +7314,10 @@ mod tests {
             decode_fingerprint: decode_fingerprint.clone(),
             processing_fingerprint: "processing".to_string(),
             runtime_config_digest: "runtime".to_string(),
-            constraint_runtime_identities: vec!["constraint-a".to_string()],
+            constraint_runtime_identities: vec![
+                "constraint-a".to_string(),
+                "constraint-b".to_string(),
+            ],
             worker_path_evidence: serde_json::json!({}),
             evidence_schema_revision: CERT_EVIDENCE_SCHEMA_REVISION.to_string(),
             g_dec_manifest_revision: G_DEC_MANIFEST_REVISION.to_string(),
@@ -6860,11 +7339,49 @@ mod tests {
             decode_fingerprint: decode_fingerprint.clone(),
             processing_fingerprint: "processing".to_string(),
             runtime_config_digest: "runtime".to_string(),
-            constraint_runtime_identities: vec!["constraint-a".to_string()],
+            constraint_runtime_identities: vec![
+                "constraint-a".to_string(),
+                "constraint-b".to_string(),
+            ],
             worker_path_evidence: serde_json::json!({}),
             evidence_schema_revision: CERT_EVIDENCE_SCHEMA_REVISION.to_string(),
             g_dec_manifest_revision: G_DEC_MANIFEST_REVISION.to_string(),
         };
+        let mut subset_inputs = snapshot_inputs.clone();
+        subset_inputs.constraint_runtime_identities = vec!["constraint-a".to_string()];
+        assert!(store
+            .owned_decode_admission_matching(&subset_inputs)
+            .unwrap()
+            .is_none());
+        let mut no_constraint_inputs = snapshot_inputs.clone();
+        no_constraint_inputs.constraint_runtime_identities.clear();
+        assert!(store
+            .owned_decode_admission_matching(&no_constraint_inputs)
+            .unwrap()
+            .is_none());
+        let mut unconstrained_probe_row = row_a.clone();
+        unconstrained_probe_row
+            .constraint_runtime_identities
+            .clear();
+        assert_eq!(
+            store
+                .store_owned_decode_cert_rows_if_current(
+                    &snapshot_inputs,
+                    &snapshot_inputs,
+                    &[row_a.clone(), unconstrained_probe_row],
+                    2,
+                )
+                .unwrap(),
+            ProbeWriteOutcome::Certified
+        );
+        let mut unconstrained_probe_inputs = snapshot_inputs.clone();
+        unconstrained_probe_inputs
+            .constraint_runtime_identities
+            .clear();
+        assert!(store
+            .get_owned_decode_cert_row_matching(&unconstrained_probe_inputs)
+            .unwrap()
+            .is_some());
         let mut changed_terminal = snapshot_inputs.clone();
         changed_terminal.processing_fingerprint = "processing-changed".to_string();
         let stale = store
@@ -6879,6 +7396,7 @@ mod tests {
                     "owned-model",
                     &decode_fingerprint,
                     CERT_EVIDENCE_SCHEMA_REVISION,
+                    &row_a.constraint_runtime_identities,
                 )
                 .unwrap()
                 .unwrap()
@@ -6903,6 +7421,10 @@ mod tests {
         let mut unconstrained_inputs = snapshot_inputs.clone();
         unconstrained_inputs.constraint_runtime_identities.clear();
         assert!(store
+            .owned_decode_admission("owned-model", &decode_fingerprint, &hash_a, 1)
+            .unwrap()
+            .is_some());
+        assert!(store
             .owned_decode_admission_matching(&unconstrained_inputs)
             .unwrap()
             .is_some());
@@ -6926,8 +7448,12 @@ mod tests {
             .owned_decode_admission("owned-model", &decode_fingerprint, &hash_a, 1)
             .unwrap()
             .is_none());
+        let row_b = row(2, hash_b.clone());
+        store.store_owned_decode_cert_row(&row_b).unwrap();
+        let mut unconstrained_row_b = row_b.clone();
+        unconstrained_row_b.constraint_runtime_identities.clear();
         store
-            .store_owned_decode_cert_row(&row(2, hash_b.clone()))
+            .store_owned_decode_cert_row(&unconstrained_row_b)
             .unwrap();
         assert!(store
             .owned_decode_admission("owned-model", &decode_fingerprint, &hash_b, 2)
@@ -6940,6 +7466,37 @@ mod tests {
             Some(approval),
             "certification writes and serving reads must not mutate approvals"
         );
+        let mut incomplete_constrained = row_b;
+        incomplete_constrained.evidence = serde_json::json!({"g_dec": []});
+        store
+            .store_owned_decode_cert_row(&incomplete_constrained)
+            .unwrap();
+        let mut incomplete = unconstrained_row_b;
+        incomplete.evidence = serde_json::json!({"g_dec": []});
+        store.store_owned_decode_cert_row(&incomplete).unwrap();
+        let incomplete_inputs = OwnedDecodeMatchInputs {
+            revisioned_machine_profile_hash: incomplete.revisioned_machine_profile_hash.clone(),
+            profile_activation_epoch: incomplete.profile_activation_epoch,
+            model_id: incomplete.model_id.clone(),
+            decode_fingerprint: incomplete.decode_fingerprint.clone(),
+            processing_fingerprint: incomplete.processing_fingerprint.clone(),
+            runtime_config_digest: incomplete.runtime_config_digest.clone(),
+            constraint_runtime_identities: Vec::new(),
+            worker_path_evidence: incomplete.worker_path_evidence.clone(),
+            evidence_schema_revision: incomplete.evidence_schema_revision.clone(),
+            g_dec_manifest_revision: incomplete.g_dec_manifest_revision.clone(),
+        };
+        assert!(store
+            .owned_decode_admission_matching(&incomplete_inputs)
+            .unwrap()
+            .is_none());
+        let health = store.storage_health_inputs().unwrap();
+        let approval_health = health
+            .approval_certification_outcomes
+            .iter()
+            .find(|outcome| outcome.model_id == "owned-model")
+            .unwrap();
+        assert_eq!(approval_health.admission, "no_current_evidence");
         let _ = std::fs::remove_dir_all(root);
     }
 

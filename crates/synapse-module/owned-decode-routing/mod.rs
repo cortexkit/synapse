@@ -50,8 +50,9 @@ use crate::owned_decode_routing::identity::{
     ActivationDType, DecodeIdentityInputs, ProcessingIdentityInputs, Q8Identity, WeightQuant,
 };
 use crate::owned_decode_routing::lane::{
-    effective_grammar_enabled, select_lane, AdmissionEpochReader, FallbackReason, LaneKind,
-    LaneOutcome, LaneSelectionContext, LlamaLane, OwnedEvaluation, RoutingRefusal,
+    effective_grammar_enabled, select_lane, AdmissionBoundaryReader, AdmissionBoundarySnapshot,
+    FallbackReason, LaneKind, LaneOutcome, LaneSelectionContext, LlamaLane, OwnedEvaluation,
+    RoutingRefusal,
 };
 use crate::owned_decode_routing::provenance::{
     FinishReason, LaneProvenance, OwnedProvenanceInputs,
@@ -250,10 +251,10 @@ pub struct RoutingEnvironment {
     pub approval_grammar_enabled: bool,
     /// Whether the complete approval-backed serving predicate selected owned decode.
     serving_enabled: bool,
-    /// Epoch stamped by admission and re-read at the dispatch boundary.
-    admission_profile_activation_epoch: Option<u64>,
-    /// Persisted epoch reader used for the terminal pre-frame check.
-    admission_epoch_reader: Option<Arc<dyn AdmissionEpochReader>>,
+    /// Approval identity and epoch stamped by the fenced admission read.
+    admission_boundary_snapshot: Option<AdmissionBoundarySnapshot>,
+    /// Persisted reader used for the terminal pre-frame check.
+    admission_boundary_reader: Option<Arc<dyn AdmissionBoundaryReader>>,
     /// Whether the quarantine key is currently quarantined.
     pub quarantined: bool,
     /// The configured llama fallback lane, if any.
@@ -283,8 +284,8 @@ impl std::fmt::Debug for RoutingEnvironment {
             .field("approval_grammar_enabled", &self.approval_grammar_enabled)
             .field("serving_enabled", &self.serving_enabled)
             .field(
-                "admission_profile_activation_epoch",
-                &self.admission_profile_activation_epoch,
+                "admission_boundary_snapshot",
+                &self.admission_boundary_snapshot,
             )
             .field("quarantined", &self.quarantined)
             .field("llama", &self.llama)
@@ -322,8 +323,8 @@ impl RoutingEnvironment {
             grammar_enabled,
             approval_grammar_enabled,
             serving_enabled: serving,
-            admission_profile_activation_epoch: None,
-            admission_epoch_reader: None,
+            admission_boundary_snapshot: None,
+            admission_boundary_reader: None,
             quarantined,
             llama,
             equivalent_fingerprints,
@@ -391,32 +392,32 @@ impl RoutingEnvironment {
         self
     }
 
-    /// Stamp the epoch observed by admission and attach the persisted reader
-    /// used immediately before an owned worker frame is sent.
+    /// Stamp the approval and epoch returned by admission, then attach the
+    /// persisted reader used immediately before an owned worker frame is sent.
     #[must_use]
-    pub fn with_admission_epoch(
+    pub fn with_admission_boundary(
         mut self,
-        profile_activation_epoch: u64,
-        reader: Arc<dyn AdmissionEpochReader>,
+        snapshot: AdmissionBoundarySnapshot,
+        reader: Arc<dyn AdmissionBoundaryReader>,
     ) -> Self {
-        self.admission_profile_activation_epoch = Some(profile_activation_epoch);
-        self.admission_epoch_reader = Some(reader);
+        self.admission_boundary_snapshot = Some(snapshot);
+        self.admission_boundary_reader = Some(reader);
         self
     }
 
-    /// Return false when the persisted epoch no longer matches the admission
-    /// snapshot. Missing or failed reads are deliberately fail-closed.
+    /// Return false when the persisted approval or epoch no longer matches the
+    /// fenced admission snapshot. Missing or failed reads fail closed.
     #[must_use]
-    pub fn admission_epoch_is_current(&self) -> bool {
-        let Some(expected) = self.admission_profile_activation_epoch else {
+    pub fn admission_boundary_is_current(&self) -> bool {
+        let Some(snapshot) = self.admission_boundary_snapshot.as_ref() else {
             // Legacy/test environments have no persisted admission snapshot;
             // production environments that select owned always attach one.
             return true;
         };
-        let Some(reader) = self.admission_epoch_reader.as_ref() else {
+        let Some(reader) = self.admission_boundary_reader.as_ref() else {
             return false;
         };
-        matches!(reader.current_profile_activation_epoch(), Ok(Some(actual)) if actual == expected)
+        matches!(reader.admission_boundary_matches(snapshot), Ok(true))
     }
 
     #[must_use]
@@ -660,10 +661,10 @@ impl OwnedDecodeRouter {
             }
             LaneOutcome::Owned => {
                 // This is the last point before the first worker frame. The
-                // admission epoch is persisted state, so a rotation committed
-                // after resolution turns this request into the standard
-                // fail-closed refusal instead of dispatching old evidence.
-                if !env.admission_epoch_is_current() {
+                // Approval and epoch are persisted state, so a disable,
+                // rollback, or profile rotation committed after resolution turns
+                // this request into the standard fail-closed refusal.
+                if !env.admission_boundary_is_current() {
                     return Err(RoutingFailure::owned(OwnedDecodeError::NotCertified));
                 }
                 let command = DispatchedCommand {
@@ -730,9 +731,14 @@ mod tests {
     use super::*;
     use crate::owned_decode_routing::certification::CertificationStore;
     use crate::owned_decode_routing::request::SamplingMode;
+    use crate::store::{ModelAssetLocator, StoredModelConfig, SynapseStore};
+    use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
     use std::cell::RefCell;
+    use std::collections::BTreeMap;
     use std::rc::Rc;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Barrier;
+    use synapse_core::{EngineIdentity, MachineProfile, NumericProfileId};
 
     fn fp(s: &str) -> Fingerprint {
         Fingerprint(s.to_string())
@@ -822,12 +828,136 @@ mod tests {
         }
     }
 
-    struct EpochReader(AtomicU64);
+    static ROUTING_STORE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    impl lane::AdmissionEpochReader for EpochReader {
-        fn current_profile_activation_epoch(&self) -> Result<Option<u64>, String> {
-            Ok(Some(self.0.load(Ordering::SeqCst)))
+    struct BoundaryReader(AtomicU64);
+
+    impl lane::AdmissionBoundaryReader for BoundaryReader {
+        fn admission_boundary_matches(
+            &self,
+            snapshot: &lane::AdmissionBoundarySnapshot,
+        ) -> Result<bool, String> {
+            Ok(
+                snapshot.profile_activation_epoch == self.0.load(Ordering::SeqCst)
+                    && snapshot.approval_semantic_digest == "approval-digest"
+                    && snapshot.approval_generation == 0,
+            )
         }
+    }
+
+    struct BarrierBoundaryReader {
+        store: Arc<SynapseStore>,
+        boundary_reached: Arc<Barrier>,
+        mutation_committed: Arc<Barrier>,
+    }
+
+    impl lane::AdmissionBoundaryReader for BarrierBoundaryReader {
+        fn admission_boundary_matches(
+            &self,
+            snapshot: &lane::AdmissionBoundarySnapshot,
+        ) -> Result<bool, String> {
+            self.boundary_reached.wait();
+            self.mutation_committed.wait();
+            self.store
+                .owned_decode_dispatch_admission_matches(
+                    snapshot.profile_activation_epoch,
+                    &snapshot.model_id,
+                    &snapshot.decode_fingerprint,
+                    &snapshot.approval_semantic_digest,
+                    snapshot.approval_generation,
+                )
+                .map_err(|error| error.to_string())
+        }
+    }
+
+    fn dispatch_boundary_store(
+        entry: &CatalogEntry,
+        decode_fingerprint: &Fingerprint,
+    ) -> (
+        std::path::PathBuf,
+        Arc<SynapseStore>,
+        crate::store::ApprovalRow,
+    ) {
+        let root = std::env::temp_dir().join(format!(
+            "synapse-routing-boundary-{}-{}",
+            std::process::id(),
+            ROUTING_STORE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let descriptor = StorageDescriptor {
+            module_id: "synapse-routing-test".to_string(),
+            storage_namespace: "default".to_string(),
+            isolation: Isolation::Module,
+            backend: StorageBackend::Sqlite {
+                path: root.join("store.db").to_string_lossy().to_string(),
+            },
+        };
+        let store = Arc::new(SynapseStore::open(&descriptor).unwrap());
+        store
+            .upsert_model(
+                &StoredModelConfig {
+                    model_id: entry.entry_id.clone(),
+                    engine: CATALOG_ENGINE.to_string(),
+                    task: CATALOG_TASK.to_string(),
+                    artifact_digest: "sha256:source".to_string(),
+                    artifact_format: "owned-safetensors".to_string(),
+                    tokenizer_sanitized_digest: "sha256:tokenizer".to_string(),
+                    model_locator: ModelAssetLocator::CacheDigest {
+                        digest: "sha256:source".to_string(),
+                    },
+                    tokenizer_locator: ModelAssetLocator::CacheDigest {
+                        digest: "sha256:tokenizer".to_string(),
+                    },
+                    model_source_url: "file:///model".to_string(),
+                    tokenizer_source_url: "file:///tokenizer".to_string(),
+                    pooling: "none".to_string(),
+                    normalize: false,
+                    max_tokens: 2048,
+                    quant: entry.weight_quant.as_str().to_string(),
+                    pin: true,
+                    owned_family: Some(entry.family.as_str().to_string()),
+                    owned_dtype: Some("f16".to_string()),
+                    owned_execution: Some("supervised".to_string()),
+                    owned_attention_units: None,
+                    config_locator: None,
+                    extra_locators: Vec::new(),
+                    engine_identity: EngineIdentity {
+                        engine: CATALOG_ENGINE.to_string(),
+                        version: "test".to_string(),
+                        build_flags: BTreeMap::new(),
+                    },
+                    numeric_profile_id: NumericProfileId("test".to_string()),
+                    fingerprint: decode_fingerprint.clone(),
+                    worker_bin: None,
+                    worker_runtime_dir: None,
+                },
+                1,
+            )
+            .unwrap();
+        store
+            .observe_profile(
+                &MachineProfile {
+                    os_build: "test-os".to_string(),
+                    arch: "aarch64".to_string(),
+                    chip_model: "test-chip".to_string(),
+                    ram_class: "test".to_string(),
+                    ane_subtype: None,
+                    engine_identities: Vec::new(),
+                },
+                1,
+                1,
+            )
+            .unwrap();
+        let approval = store
+            .create_approval(
+                &entry.entry_id,
+                &decode_fingerprint.0,
+                true,
+                "test-operator",
+                1,
+                1,
+            )
+            .unwrap();
+        (root, store, approval)
     }
 
     #[test]
@@ -968,8 +1098,20 @@ mod tests {
     fn owned_dispatch_rechecks_the_persisted_epoch_at_the_frame_boundary() {
         let entry = catalog_entry(Family::Qwen3_0_6b, WeightQuant::F16);
         let router = router_with_certified(certified_store(&entry), Q8IngestRegistry::new());
-        let environment = env(true, Some(llama_lane()))
-            .with_admission_epoch(1, Arc::new(EpochReader(AtomicU64::new(2))));
+        let environment = env(true, Some(llama_lane())).with_admission_boundary(
+            lane::AdmissionBoundarySnapshot {
+                profile_activation_epoch: 1,
+                model_id: entry.entry_id.clone(),
+                decode_fingerprint: entry
+                    .decode_identity_inputs()
+                    .decode_fingerprint()
+                    .unwrap()
+                    .0,
+                approval_semantic_digest: "approval-digest".to_string(),
+                approval_generation: 0,
+            },
+            Arc::new(BoundaryReader(AtomicU64::new(2))),
+        );
         let dispatched = Rc::new(RefCell::new(Vec::new()));
         let mut dispatch = RecordingDispatch::new_succeeding(dispatched.clone());
         let failure = router
@@ -983,6 +1125,89 @@ mod tests {
             .expect_err("activation after admission must refuse");
         assert_eq!(failure.wire_id(), "owned_decode_not_certified");
         assert!(dispatched.borrow().is_empty());
+    }
+
+    enum BoundaryMutation {
+        Disable,
+        EmergencyRollback,
+    }
+
+    fn assert_dispatch_refuses_committed_approval_mutation(mutation: BoundaryMutation) {
+        let entry = catalog_entry(Family::Qwen3_0_6b, WeightQuant::F16);
+        let decode_fingerprint = entry.decode_identity_inputs().decode_fingerprint().unwrap();
+        let (root, store, approval) = dispatch_boundary_store(&entry, &decode_fingerprint);
+        let boundary_reached = Arc::new(Barrier::new(2));
+        let mutation_committed = Arc::new(Barrier::new(2));
+        let reader: Arc<dyn lane::AdmissionBoundaryReader> = Arc::new(BarrierBoundaryReader {
+            store: Arc::clone(&store),
+            boundary_reached: Arc::clone(&boundary_reached),
+            mutation_committed: Arc::clone(&mutation_committed),
+        });
+        let environment = env(true, Some(llama_lane())).with_admission_boundary(
+            lane::AdmissionBoundarySnapshot {
+                profile_activation_epoch: 1,
+                model_id: approval.model_id.clone(),
+                decode_fingerprint: approval.decode_fingerprint.clone(),
+                approval_semantic_digest: approval.semantic_digest.clone(),
+                approval_generation: approval.generation,
+            },
+            reader,
+        );
+        let mutation_store = Arc::clone(&store);
+        let mutation_model_id = approval.model_id.clone();
+        let mutation_decode_fingerprint = approval.decode_fingerprint.clone();
+        let mutation_thread = std::thread::spawn(move || {
+            boundary_reached.wait();
+            match mutation {
+                BoundaryMutation::Disable => {
+                    mutation_store
+                        .disable_approval(
+                            &mutation_model_id,
+                            &mutation_decode_fingerprint,
+                            "operator disable",
+                            2,
+                        )
+                        .unwrap();
+                }
+                BoundaryMutation::EmergencyRollback => {
+                    assert_eq!(
+                        mutation_store
+                            .emergency_rollback("emergency rollback", 2)
+                            .unwrap(),
+                        1
+                    );
+                }
+            }
+            mutation_committed.wait();
+        });
+        let router = router_with_certified(certified_store(&entry), Q8IngestRegistry::new());
+        let dispatched = Rc::new(RefCell::new(Vec::new()));
+        let mut dispatch = RecordingDispatch::new_succeeding(dispatched.clone());
+        let failure = router
+            .route_oneshot(
+                &environment,
+                &entry,
+                &request(Family::Qwen3_0_6b, WeightQuant::F16),
+                "gen-approval-mutated",
+                &mut dispatch,
+            )
+            .expect_err("approval mutation committed before dispatch must refuse");
+        mutation_thread.join().unwrap();
+        assert_eq!(failure.wire_id(), "owned_decode_not_certified");
+        assert!(dispatched.borrow().is_empty());
+        drop(environment);
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn owned_dispatch_refuses_disable_committed_after_admission_resolution() {
+        assert_dispatch_refuses_committed_approval_mutation(BoundaryMutation::Disable);
+    }
+
+    #[test]
+    fn owned_dispatch_refuses_rollback_committed_after_admission_resolution() {
+        assert_dispatch_refuses_committed_approval_mutation(BoundaryMutation::EmergencyRollback);
     }
 
     #[test]

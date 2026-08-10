@@ -44,8 +44,8 @@
       "legacy_owned_decode"
     ],
     "ddl": [
-      "CREATE TABLE cert_rows_rebuilt (row_id INTEGER PRIMARY KEY, certification_class TEXT NOT NULL, assurance_class TEXT NOT NULL, status TEXT NOT NULL, key_hash TEXT NOT NULL, machine_profile_hash TEXT, revisioned_machine_profile_hash TEXT, profile_activation_epoch INTEGER, model_id TEXT, decode_fingerprint TEXT, remote_profile_hash TEXT, identity_revision TEXT, numeric_profile_id TEXT, fingerprint TEXT NOT NULL, certified_at_ms INTEGER NOT NULL, os_build TEXT NOT NULL, module_generation INTEGER NOT NULL, evidence_schema_revision TEXT, processing_fingerprint TEXT, runtime_config_digest TEXT, constraint_runtime_identities_json TEXT, worker_path_evidence_json TEXT, g_dec_manifest_revision TEXT, evidence_json TEXT NOT NULL, CHECK (certification_class <> 'measured_owned_decode' OR (revisioned_machine_profile_hash IS NOT NULL AND profile_activation_epoch > 0 AND model_id IS NOT NULL AND decode_fingerprint IS NOT NULL AND evidence_schema_revision IS NOT NULL)), CHECK (certification_class <> 'legacy_owned_decode' OR status <> 'certified'))",
-      "CREATE UNIQUE INDEX cert_rows_owned_decode_identity_v1 ON cert_rows_rebuilt (revisioned_machine_profile_hash, profile_activation_epoch, model_id, decode_fingerprint, evidence_schema_revision) WHERE certification_class = 'measured_owned_decode'",
+      "CREATE TABLE cert_rows_rebuilt (row_id INTEGER PRIMARY KEY, certification_class TEXT NOT NULL, assurance_class TEXT NOT NULL, status TEXT NOT NULL, key_hash TEXT NOT NULL, machine_profile_hash TEXT, revisioned_machine_profile_hash TEXT, profile_activation_epoch INTEGER, model_id TEXT, decode_fingerprint TEXT, remote_profile_hash TEXT, identity_revision TEXT, numeric_profile_id TEXT, fingerprint TEXT NOT NULL, certified_at_ms INTEGER NOT NULL, os_build TEXT NOT NULL, module_generation INTEGER NOT NULL, evidence_schema_revision TEXT, processing_fingerprint TEXT, runtime_config_digest TEXT, constraint_runtime_identities_json TEXT, constraint_runtime_identities_digest TEXT, worker_path_evidence_json TEXT, g_dec_manifest_revision TEXT, evidence_json TEXT NOT NULL, CHECK (certification_class <> 'measured_owned_decode' OR (revisioned_machine_profile_hash IS NOT NULL AND profile_activation_epoch > 0 AND model_id IS NOT NULL AND decode_fingerprint IS NOT NULL AND evidence_schema_revision IS NOT NULL)), CHECK (certification_class <> 'legacy_owned_decode' OR status <> 'certified'))",
+      "CREATE UNIQUE INDEX cert_rows_owned_decode_identity_v2 ON cert_rows_rebuilt (revisioned_machine_profile_hash, profile_activation_epoch, model_id, decode_fingerprint, evidence_schema_revision, constraint_runtime_identities_digest) WHERE certification_class = 'measured_owned_decode'",
       "CREATE UNIQUE INDEX cert_rows_declared_identity_v1 ON cert_rows_rebuilt (key_hash, fingerprint) WHERE certification_class = 'declared'",
       "CREATE UNIQUE INDEX cert_rows_remote_identity_v1 ON cert_rows_rebuilt (key_hash, fingerprint) WHERE certification_class = 'remote'",
       "CREATE UNIQUE INDEX cert_rows_embedding_identity_v1 ON cert_rows_rebuilt (key_hash, fingerprint) WHERE certification_class = 'embedding'",
@@ -57,12 +57,12 @@
     {
       "id": "measured_owned_decode",
       "discriminator": "certification_class = 'measured_owned_decode'",
-      "required_columns": ["revisioned_machine_profile_hash", "profile_activation_epoch", "model_id", "decode_fingerprint", "evidence_schema_revision", "processing_fingerprint", "runtime_config_digest", "constraint_runtime_identities_json", "worker_path_evidence_json", "g_dec_manifest_revision"],
+      "required_columns": ["revisioned_machine_profile_hash", "profile_activation_epoch", "model_id", "decode_fingerprint", "evidence_schema_revision", "processing_fingerprint", "runtime_config_digest", "constraint_runtime_identities_json", "constraint_runtime_identities_digest", "worker_path_evidence_json", "g_dec_manifest_revision"],
       "nullable_columns": ["machine_profile_hash", "remote_profile_hash", "identity_revision", "numeric_profile_id"],
-      "logical_identity": ["revisioned_machine_profile_hash", "profile_activation_epoch", "model_id", "decode_fingerprint", "evidence_schema_revision"],
-      "partial_unique_index": "cert_rows_owned_decode_identity_v1",
-      "upsert_conflict_target": "ON CONFLICT (revisioned_machine_profile_hash, profile_activation_epoch, model_id, decode_fingerprint, evidence_schema_revision) WHERE certification_class = 'measured_owned_decode'",
-      "lookup": "current revisioned hash + current positive epoch + model_id + decode_fingerprint + compatible evidence_schema_revision",
+      "logical_identity": ["revisioned_machine_profile_hash", "profile_activation_epoch", "model_id", "decode_fingerprint", "evidence_schema_revision", "constraint_runtime_identities_digest"],
+      "partial_unique_index": "cert_rows_owned_decode_identity_v2",
+      "upsert_conflict_target": "ON CONFLICT (revisioned_machine_profile_hash, profile_activation_epoch, model_id, decode_fingerprint, evidence_schema_revision, constraint_runtime_identities_digest) WHERE certification_class = 'measured_owned_decode'",
+      "lookup": "current revisioned hash + current positive epoch + model_id + decode_fingerprint + compatible evidence_schema_revision + byte-exact ordered constraint identity-set digest",
       "staleness": "revisioned hash, epoch, processing fingerprint, runtime config, worker path, constrained identities, evidence schema, and exact G-DEC manifest revision",
       "legacy_rule": "a row missing model_id, positive epoch, complete gates, or supported evidence_schema_revision is legacy and cannot admit until re-probed"
     },
@@ -127,6 +127,7 @@
     {"column": "revisioned_machine_profile_hash", "measured_owned_decode": "added_required", "other_classes": "nullable_null", "legacy": "null"},
     {"column": "machine_profile_hash", "measured_owned_decode": "retained_legacy_only", "other_classes": "retained_when_existing", "legacy": "retained"},
     {"column": "model_id", "measured_owned_decode": "added_required", "other_classes": "nullable_null", "legacy": "null"},
+    {"column": "constraint_runtime_identities_digest", "measured_owned_decode": "derived_required_identity_key", "other_classes": "nullable_null", "legacy": "null_and_nonmatchable"},
     {"column": "profile_activation_epoch", "measured_owned_decode": "added_required_positive", "other_classes": "nullable_null", "legacy": "null"},
     {"column": "evidence_schema_revision", "measured_owned_decode": "added_required", "other_classes": "nullable_null", "legacy": "null"},
     {"column": "decode_fingerprint", "measured_owned_decode": "added_required", "other_classes": "nullable_null", "legacy": "null"},
@@ -144,10 +145,11 @@
     "create and validate every replacement partial index",
     "replace cert_rows and matching read/write paths",
     "remove the old shared conflict target only after replacement indexes validate",
-    "commit; rollback on any semantic or infrastructure failure"
+    "commit; rollback on any semantic or infrastructure failure",
+    "before fleet deployment, add the ordered identity-set digest key; the fresh table has no production measured rows, and any pre-release development rows without the digest remain nonmatchable until re-probed"
   ],
   "duplicate_queries": [
-    "SELECT revisioned_machine_profile_hash, profile_activation_epoch, model_id, decode_fingerprint, evidence_schema_revision, COUNT(*) FROM cert_rows_rebuilt WHERE certification_class = 'measured_owned_decode' GROUP BY 1,2,3,4,5 HAVING COUNT(*) > 1",
+    "SELECT revisioned_machine_profile_hash, profile_activation_epoch, model_id, decode_fingerprint, evidence_schema_revision, constraint_runtime_identities_digest, COUNT(*) FROM cert_rows_rebuilt WHERE certification_class = 'measured_owned_decode' GROUP BY 1,2,3,4,5,6 HAVING COUNT(*) > 1",
     "SELECT key_hash, fingerprint, COUNT(*) FROM cert_rows_rebuilt WHERE certification_class = 'declared' GROUP BY 1,2 HAVING COUNT(*) > 1",
     "SELECT key_hash, fingerprint, COUNT(*) FROM cert_rows_rebuilt WHERE certification_class = 'remote' GROUP BY 1,2 HAVING COUNT(*) > 1",
     "SELECT key_hash, fingerprint, COUNT(*) FROM cert_rows_rebuilt WHERE certification_class = 'embedding' GROUP BY 1,2 HAVING COUNT(*) > 1",

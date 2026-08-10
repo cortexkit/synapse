@@ -109,10 +109,19 @@ use synapse_engine_owned::{
 use thiserror::Error;
 use tokio::sync::{Notify, Semaphore};
 
-impl owned_decode_routing::lane::AdmissionEpochReader for SynapseStore {
-    fn current_profile_activation_epoch(&self) -> Result<Option<u64>, String> {
-        self.current_profile_activation_epoch()
-            .map_err(|error| error.to_string())
+impl owned_decode_routing::lane::AdmissionBoundaryReader for SynapseStore {
+    fn admission_boundary_matches(
+        &self,
+        snapshot: &owned_decode_routing::lane::AdmissionBoundarySnapshot,
+    ) -> Result<bool, String> {
+        self.owned_decode_dispatch_admission_matches(
+            snapshot.profile_activation_epoch,
+            &snapshot.model_id,
+            &snapshot.decode_fingerprint,
+            &snapshot.approval_semantic_digest,
+            snapshot.approval_generation,
+        )
+        .map_err(|error| error.to_string())
     }
 }
 
@@ -276,6 +285,10 @@ struct SynapseHandlerInner {
     connection_file: PathBuf,
     state: OnceLock<Arc<ModuleState>>,
     approval_operators: Mutex<HashMap<RouteHandle, String>>,
+}
+
+fn module_state_machine_profile_hashes(profile: &MachineProfile) -> (String, String) {
+    (profile.hash(), profile.revisioned_hash())
 }
 
 struct ModuleState {
@@ -962,8 +975,8 @@ struct MicroLlmOneshotParams {
     allow_equivalent: bool,
     #[serde(default)]
     required_epoch: Option<u64>,
-    #[serde(default)]
-    accept_declared: bool,
+    #[serde(default, rename = "accept_declared")]
+    _accept_declared: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1408,9 +1421,9 @@ impl SynapseHandler {
                 .iter()
                 .map(|model| model.engine_identity.clone()),
         ));
-        let revisioned_machine_profile_hash = machine_profile.revisioned_hash();
-        let machine_profile_hash = revisioned_machine_profile_hash.clone();
-        let legacy_machine_profile_hash = machine_profile.hash();
+        let (machine_profile_hash, revisioned_machine_profile_hash) =
+            module_state_machine_profile_hashes(&machine_profile);
+        let legacy_machine_profile_hash = machine_profile_hash.clone();
         let profile_activation =
             store.observe_profile(&machine_profile, now_ms(), module_generation)?;
         let profile_activation_epoch = profile_activation
@@ -1428,7 +1441,7 @@ impl SynapseHandler {
                 Arc::clone(&store),
                 configured_remote,
                 vault_client,
-                revisioned_machine_profile_hash.clone(),
+                machine_profile_hash.clone(),
             )
             .map_err(|error| ModuleError::Config(error.message))?,
         );
@@ -4493,7 +4506,12 @@ async fn embed_query(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         Ok(model) => model,
         Err(error) => return result_outcome(error_payload(&state, error)),
     };
-    if let Err(error) = ensure_model_certified(&state, &model, params.accept_declared) {
+    if let Err(error) = ensure_model_certified(
+        &state,
+        &model,
+        CertificationClass::Embedding,
+        params.accept_declared,
+    ) {
         return result_outcome(error_payload(&state, error));
     }
     if let Err(error) = check_fingerprint_constraints(
@@ -4778,7 +4796,12 @@ async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         Ok(model) => model,
         Err(error) => return result_outcome(error_payload(&state, error)),
     };
-    if let Err(error) = ensure_model_certified(&state, &model, params.accept_declared) {
+    if let Err(error) = ensure_model_certified(
+        &state,
+        &model,
+        CertificationClass::Embedding,
+        params.accept_declared,
+    ) {
         return result_outcome(error_payload(&state, error));
     }
     if let Err(error) = check_fingerprint_constraints(
@@ -5329,7 +5352,12 @@ async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
             ),
         ));
     }
-    if let Err(error) = ensure_model_certified(&state, &model, params.accept_declared) {
+    if let Err(error) = ensure_model_certified(
+        &state,
+        &model,
+        CertificationClass::Rerank,
+        params.accept_declared,
+    ) {
         return result_outcome(error_payload(&state, error));
     }
     if let Err(error) = check_fingerprint_constraints(
@@ -5538,13 +5566,6 @@ async fn microllm_oneshot(state: Arc<ModuleState>, params: Value) -> HandlerOutc
                 ),
             ),
         ));
-    }
-    if microllm_certification_required(&model)
-        && model.engine_identity.engine != "owned-metal-decode"
-    {
-        if let Err(error) = ensure_model_certified(&state, &model, params.accept_declared) {
-            return result_outcome(error_payload(&state, error));
-        }
     }
     if let Err(error) = check_fingerprint_constraints(
         &model,
@@ -6303,14 +6324,6 @@ fn owned_decode_environment(
         evidence_schema_revision: store::CERT_EVIDENCE_SCHEMA_REVISION.to_string(),
         g_dec_manifest_revision: store::G_DEC_MANIFEST_REVISION.to_string(),
     };
-    let approval = state
-        .store
-        .get_approval(&match_inputs.model_id, &match_inputs.decode_fingerprint)
-        .ok()
-        .flatten();
-    let approval_grammar_enabled = approval
-        .as_ref()
-        .is_some_and(|approval| approval.grammar_enabled);
     let certification = PersistentDecodeCertification {
         store: Arc::clone(&state.store),
         match_inputs: match_inputs.clone(),
@@ -6377,9 +6390,11 @@ fn owned_decode_environment(
         .owned_decode_admission_matching(&match_inputs)
         .ok()
         .flatten();
+    let approval = admission.as_ref().map(|admission| &admission.approval);
+    let approval_grammar_enabled = approval.is_some_and(|approval| approval.grammar_enabled);
     let serving_inputs = owned_decode_routing::lane::ServingPredicateInputs {
-        approval_enabled: approval.as_ref().is_some_and(|approval| approval.enabled),
-        approval_identity_matches: approval.as_ref().is_some_and(|approval| {
+        approval_enabled: approval.is_some_and(|approval| approval.enabled),
+        approval_identity_matches: approval.is_some_and(|approval| {
             approval.model_id == match_inputs.model_id
                 && approval.decode_fingerprint == match_inputs.decode_fingerprint
         }),
@@ -6413,9 +6428,20 @@ fn owned_decode_environment(
         equivalent_fingerprints,
         constraint_runtime_identity,
     );
-    let epoch_reader: Arc<dyn owned_decode_routing::lane::AdmissionEpochReader> =
-        state.store.clone();
-    environment = environment.with_admission_epoch(state.profile_activation_epoch, epoch_reader);
+    if let Some(admission) = admission {
+        let boundary_reader: Arc<dyn owned_decode_routing::lane::AdmissionBoundaryReader> =
+            state.store.clone();
+        environment = environment.with_admission_boundary(
+            owned_decode_routing::lane::AdmissionBoundarySnapshot {
+                profile_activation_epoch: admission.profile_activation_epoch,
+                model_id: admission.approval.model_id,
+                decode_fingerprint: admission.approval.decode_fingerprint,
+                approval_semantic_digest: admission.approval.semantic_digest,
+                approval_generation: admission.approval.generation,
+            },
+            boundary_reader,
+        );
+    }
     environment
 }
 
@@ -8400,12 +8426,14 @@ fn equivalent_fingerprints(alias_table: &AliasTable, model: &EmbeddingModel) -> 
 fn ensure_model_certified(
     state: &ModuleState,
     model: &EmbeddingModel,
+    certification_class: CertificationClass,
     accept_declared: bool,
 ) -> Result<(), WireOperationError> {
     // Owned-CUDA has no declared or inherited certification path. A measured
     // row must match this exact machine-profile hash before serving.
     if model.engine_identity.engine == CUDA_WORKER_ENGINE {
         return match state.store.get_cert_row(
+            certification_class,
             &state.machine_profile_hash,
             &model.certification_fingerprint,
         ) {
@@ -8425,6 +8453,7 @@ fn ensure_model_certified(
     }
     ensure_fingerprint_certified(
         &state.store,
+        certification_class,
         &state.machine_profile_hash,
         &model.certification_fingerprint,
         &model.model_id,
@@ -8434,12 +8463,13 @@ fn ensure_model_certified(
 
 fn ensure_fingerprint_certified(
     store: &SynapseStore,
+    certification_class: CertificationClass,
     machine_profile_hash: &str,
     fingerprint: &Fingerprint,
     model_id: &str,
     accept_declared: bool,
 ) -> Result<(), WireOperationError> {
-    match store.get_cert_row(machine_profile_hash, fingerprint) {
+    match store.get_cert_row(certification_class, machine_profile_hash, fingerprint) {
         Ok(Some(_)) => return Ok(()),
         Ok(None) => {}
         Err(error) => {
@@ -8454,7 +8484,7 @@ fn ensure_fingerprint_certified(
         Ok(Some(_)) => Ok(()),
         Ok(None) => {
             let failed_probe = store
-                .get_probe_row(machine_profile_hash, fingerprint)
+                .get_probe_row(certification_class, machine_profile_hash, fingerprint)
                 .map_err(|error| {
                     WireOperationError::from_stable(
                         StableError::engine_crashed(Some(100)),
@@ -8477,7 +8507,7 @@ fn ensure_fingerprint_certified(
                 ));
             }
             let stale = store
-                .has_stale_cert_row(machine_profile_hash, fingerprint)
+                .has_stale_cert_row(certification_class, machine_profile_hash, fingerprint)
                 .unwrap_or(false);
             let message = if stale {
                 format!(
@@ -8849,13 +8879,19 @@ async fn execute_probe_job(
     for row in perf_rows {
         let certification_required =
             row.workload != ModelTask::Generate.as_str() || row.engine == "owned-metal";
+        let certification_class = match row.workload.as_str() {
+            "embed" => Some(CertificationClass::Embedding),
+            "rerank" => Some(CertificationClass::Rerank),
+            _ => None,
+        };
         let certified = if certification_required {
-            match state
-                .store
-                .get_cert_row(&state.machine_profile_hash, &row.fingerprint)
-            {
-                Ok(row) => row.is_some(),
-                Err(error) => {
+            match certification_class.map(|class| {
+                state
+                    .store
+                    .get_cert_row(class, &state.machine_profile_hash, &row.fingerprint)
+            }) {
+                Some(Ok(row)) => row.is_some(),
+                Some(Err(error)) => {
                     fail_job_with_wire_error(
                         &state,
                         &job_id,
@@ -8867,6 +8903,7 @@ async fn execute_probe_job(
                     );
                     return;
                 }
+                None => false,
             }
         } else {
             true
@@ -9820,9 +9857,16 @@ fn store_owned_probe_outcome(
         module_generation: state.module_generation,
         evidence,
     };
+    let mut unconstrained_row = row.clone();
+    unconstrained_row.constraint_runtime_identities.clear();
     state
         .store
-        .store_owned_decode_cert_row_if_current(&snapshot_inputs, &terminal, &row, now_ms())
+        .store_owned_decode_cert_rows_if_current(
+            &snapshot_inputs,
+            &terminal,
+            &[row, unconstrained_row],
+            now_ms(),
+        )
         .map_err(|error| {
             WireOperationError::from_stable(
                 StableError::engine_crashed(Some(100)),
@@ -10652,27 +10696,133 @@ async fn mutate_alias_pair(
     }
 }
 
-fn lane_measurement_rows(state: &ModuleState, fingerprint: &Fingerprint) -> LaneMeasurementRows {
-    let current_certification = state
-        .store
-        .get_cert_row(&state.machine_profile_hash, fingerprint)
-        .ok()
-        .flatten();
-    let latest_certification = if current_certification.is_some() {
-        current_certification.clone()
-    } else {
-        state.store.latest_cert_row(fingerprint).ok().flatten()
-    };
-    let current_probe = state
-        .store
-        .get_probe_row(&state.machine_profile_hash, fingerprint)
-        .ok()
-        .flatten();
-    let latest_probe = if current_probe.is_some() {
-        current_probe.clone()
-    } else {
-        state.store.latest_probe_row(fingerprint).ok().flatten()
-    };
+fn certification_class_for_task(task: &str) -> Option<CertificationClass> {
+    match task {
+        "embed" => Some(CertificationClass::Embedding),
+        "rerank" => Some(CertificationClass::Rerank),
+        _ => None,
+    }
+}
+
+fn owned_measurement_report_row(row: OwnedDecodeCertificationRow) -> CertificationRow {
+    CertificationRow {
+        assurance_class: AssuranceClass::Measured,
+        status: row.status,
+        key: CertificationKey::Measured {
+            machine_profile_hash: row.revisioned_machine_profile_hash,
+        },
+        numeric_profile_id: row
+            .numeric_profile_id
+            .unwrap_or_else(|| NumericProfileId(String::new())),
+        fingerprint: row.fingerprint,
+        certified_at_ms: row.certified_at_ms,
+        os_build: row.os_build,
+        module_generation: row.module_generation,
+        evidence: row.evidence,
+    }
+}
+
+fn owned_decode_lane_admitted(state: &ModuleState, model: &EmbeddingModel) -> bool {
+    if model.engine_identity.engine != DECODE_WORKER_ENGINE {
+        return false;
+    }
+    owned_decode_probe_match_inputs(
+        state,
+        model,
+        state.revisioned_machine_profile_hash.clone(),
+        state.profile_activation_epoch,
+        Vec::new(),
+    )
+    .ok()
+    .and_then(|inputs| {
+        state
+            .store
+            .owned_decode_admission_matching(&inputs)
+            .ok()
+            .flatten()
+    })
+    .is_some()
+}
+
+fn lane_measurement_rows(
+    state: &ModuleState,
+    model_id: &str,
+    task: &str,
+    engine: &str,
+    fingerprint: &Fingerprint,
+    owned_admitted: bool,
+) -> LaneMeasurementRows {
+    let (current_certification, latest_certification, current_probe, latest_probe) =
+        if engine == DECODE_WORKER_ENGINE {
+            let current_probe = state
+                .store
+                .get_owned_decode_measurement_row(
+                    &state.revisioned_machine_profile_hash,
+                    state.profile_activation_epoch,
+                    model_id,
+                    &fingerprint.0,
+                    CERT_EVIDENCE_SCHEMA_REVISION,
+                    &[],
+                )
+                .ok()
+                .flatten()
+                .map(owned_measurement_report_row);
+            let current_certification = current_probe
+                .as_ref()
+                .filter(|row| owned_admitted && row.status == CertificationStatus::Certified)
+                .cloned();
+            (
+                current_certification.clone(),
+                current_certification,
+                current_probe.clone(),
+                current_probe,
+            )
+        } else if let Some(certification_class) = certification_class_for_task(task) {
+            let current_certification = state
+                .store
+                .get_cert_row(
+                    certification_class,
+                    &state.machine_profile_hash,
+                    fingerprint,
+                )
+                .ok()
+                .flatten();
+            let latest_certification = if current_certification.is_some() {
+                current_certification.clone()
+            } else {
+                state
+                    .store
+                    .latest_cert_row(certification_class, fingerprint)
+                    .ok()
+                    .flatten()
+            };
+            let current_probe = state
+                .store
+                .get_probe_row(
+                    certification_class,
+                    &state.machine_profile_hash,
+                    fingerprint,
+                )
+                .ok()
+                .flatten();
+            let latest_probe = if current_probe.is_some() {
+                current_probe.clone()
+            } else {
+                state
+                    .store
+                    .latest_probe_row(certification_class, fingerprint)
+                    .ok()
+                    .flatten()
+            };
+            (
+                current_certification,
+                latest_certification,
+                current_probe,
+                latest_probe,
+            )
+        } else {
+            (None, None, None, None)
+        };
     let current_performance = state
         .store
         .get_perf_row(&state.machine_profile_hash, fingerprint)
@@ -10849,7 +10999,18 @@ async fn probe_report(state: Arc<ModuleState>) -> HandlerOutcome {
                     .and_then(|entry| entry.decode_identity_inputs().decode_fingerprint().ok())
             })
             .unwrap_or_else(|| slot.spec.fingerprint.clone());
-        let measurements = lane_measurement_rows(&state, &certification_fingerprint);
+        let owned_admitted = slot
+            .loaded
+            .as_ref()
+            .is_some_and(|model| owned_decode_lane_admitted(&state, model));
+        let measurements = lane_measurement_rows(
+            &state,
+            &slot.spec.model_id,
+            &slot.spec.task,
+            &slot.spec.engine,
+            &certification_fingerprint,
+            owned_admitted,
+        );
         certification_stale |= measurements.certification_stale;
         performance_stale |= measurements.performance_stale;
         let worker = worker_health_from_slot(&slot);
@@ -11010,7 +11171,15 @@ async fn admission_status(state: Arc<ModuleState>) -> HandlerOutcome {
         .loaded_models()
         .into_iter()
         .map(|model| {
-            let measurements = lane_measurement_rows(&state, &model.certification_fingerprint);
+            let owned_admitted = owned_decode_lane_admitted(&state, &model);
+            let measurements = lane_measurement_rows(
+                &state,
+                &model.model_id,
+                model.task.as_str(),
+                &model.engine_identity.engine,
+                &model.certification_fingerprint,
+                owned_admitted,
+            );
             json!({
                 "model_id": model.model_id,
                 "fingerprint": model.fingerprint,
@@ -11063,24 +11232,19 @@ fn module_health(state: &ModuleState) -> ModuleHealth {
         .loaded_models()
         .into_iter()
         .map(|model| {
-            let measurements = lane_measurement_rows(state, &model.certification_fingerprint);
-            let owned_certified = (model.engine_identity.engine == DECODE_WORKER_ENGINE)
-                && state
-                    .store
-                    .get_owned_decode_cert_row(
-                        &state.revisioned_machine_profile_hash,
-                        state.profile_activation_epoch,
-                        &model.model_id,
-                        &model.certification_fingerprint.0,
-                        CERT_EVIDENCE_SCHEMA_REVISION,
-                    )
-                    .ok()
-                    .flatten()
-                    .is_some();
+            let owned_admitted = owned_decode_lane_admitted(state, &model);
+            let measurements = lane_measurement_rows(
+                state,
+                &model.model_id,
+                model.task.as_str(),
+                &model.engine_identity.engine,
+                &model.certification_fingerprint,
+                owned_admitted,
+            );
             LaneHealth {
                 model_id: model.model_id.clone(),
                 fingerprint: model.fingerprint.clone(),
-                certified: measurements.current_certification.is_some() || owned_certified,
+                certified: measurements.current_certification.is_some(),
                 certification_stale: measurements.certification_stale,
                 performance_stale: measurements.performance_stale,
                 worker: worker_health_for_model(&model),
