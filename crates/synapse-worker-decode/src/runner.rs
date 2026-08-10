@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::BTreeMap,
     fs,
     io::{self, Read},
     net::Shutdown,
@@ -65,6 +65,10 @@ struct Args {
     test_abort_after_progress: bool,
     #[arg(long, hide = true)]
     test_abort_after_progress_once: Option<PathBuf>,
+    /// Test and benchmark escape hatch for exact A/B comparison. Production
+    /// leaves the singleton fast path enabled.
+    #[arg(long, hide = true)]
+    disable_forced_token_fast_path: bool,
 }
 
 enum DecodeEngine {
@@ -159,6 +163,42 @@ impl DecodeEngine {
         }
     }
 
+    /// Ingest committed tokens and return logits after the final token. Qwen
+    /// reuses the 16-position batched verifier; LFM2 uses its verifier for the
+    /// prefix and materializes logits only for the final position.
+    fn ingest_tokens_for_logits(
+        &mut self,
+        cache: &mut DecodeCache,
+        tokens: &[u32],
+    ) -> Result<Vec<f32>> {
+        ensure!(!tokens.is_empty(), "forced-token ingest requires tokens");
+        match (self, cache) {
+            (Self::Qwen { decoder, .. }, DecodeCache::Qwen(cache)) => {
+                let mut chunks = tokens.chunks(PRODUCTION_N as usize).peekable();
+                while let Some(chunk) = chunks.next() {
+                    if chunks.peek().is_some() {
+                        decoder.verify_tokens_batch(cache, chunk)?;
+                        continue;
+                    }
+                    let mut logits = decoder.verify_tokens_batch_logits(cache, chunk)?;
+                    let row_len = logits.len() / chunk.len();
+                    return Ok(logits.split_off(logits.len() - row_len));
+                }
+                unreachable!("non-empty token span has a final chunk")
+            }
+            (Self::Lfm2 { engine }, DecodeCache::Lfm2(cache)) => {
+                let (&last, prefix) = tokens
+                    .split_last()
+                    .expect("non-empty token span has a final token");
+                if !prefix.is_empty() {
+                    engine.verify_tokens(cache, prefix)?;
+                }
+                engine.advance(cache, last)
+            }
+            _ => bail!("owned decode engine/cache family mismatch"),
+        }
+    }
+
     fn chain_span(&self) -> usize {
         match self {
             Self::Qwen { decoder, .. } => decoder.chain_span(),
@@ -244,18 +284,23 @@ struct ResidentGeneration {
     next_logits: Option<Vec<f32>>,
     next_greedy: Option<u32>,
     constraint: Option<ActiveConstraint>,
+    /// Committed constrained tokens whose KV updates are intentionally deferred
+    /// until a non-singleton mask needs real logits.
+    pending_ingest_ids: Vec<u32>,
 }
 
 struct WorkerState {
     worker_generation: u64,
+    forced_token_fast_path: bool,
     loaded: Option<LoadedRuntime>,
     resident: Option<ResidentGeneration>,
 }
 
 impl WorkerState {
-    fn new(worker_generation: u64) -> Self {
+    fn new(worker_generation: u64, forced_token_fast_path: bool) -> Self {
         Self {
             worker_generation,
+            forced_token_fast_path,
             loaded: None,
             resident: None,
         }
@@ -450,6 +495,7 @@ impl WorkerState {
             next_logits,
             next_greedy,
             constraint: active_constraint,
+            pending_ingest_ids: Vec::new(),
         });
         self.run_quantum(authorization.first_quantum_budget)
     }
@@ -505,12 +551,33 @@ impl WorkerState {
                 .resident
                 .as_mut()
                 .ok_or(DecodeError::ProtocolMismatch)?;
+
+            let defer_ingest = self.forced_token_fast_path && resident.constraint.is_some();
             let token = if let Some(constraint) = resident.constraint.as_mut() {
-                let logits = resident
-                    .next_logits
-                    .take()
-                    .ok_or(DecodeError::ProtocolMismatch)?;
-                constrained_top1(&logits, &loaded.stop_ids, &loaded.vocabulary, constraint)?
+                let forced = defer_ingest
+                    .then(|| sole_survivor(&loaded.stop_ids, &*loaded.vocabulary, constraint))
+                    .flatten();
+                if let Some(token) = forced {
+                    // Any logits held here describe the prefix before the forced
+                    // run. They cannot be used after the parser commits a token.
+                    resident.next_logits = None;
+                    token
+                } else {
+                    if defer_ingest && !resident.pending_ingest_ids.is_empty() {
+                        let pending = std::mem::take(&mut resident.pending_ingest_ids);
+                        resident.next_logits = Some(
+                            loaded
+                                .engine
+                                .ingest_tokens_for_logits(&mut resident.cache, &pending)
+                                .map_err(|_| DecodeError::Unavailable)?,
+                        );
+                    }
+                    let logits = resident
+                        .next_logits
+                        .take()
+                        .ok_or(DecodeError::ProtocolMismatch)?;
+                    constrained_top1(&logits, &loaded.stop_ids, &*loaded.vocabulary, constraint)?
+                }
             } else {
                 resident
                     .next_greedy
@@ -519,11 +586,10 @@ impl WorkerState {
             };
 
             if loaded.stop_ids.contains(&token) {
-                if resident
-                    .constraint
-                    .as_ref()
-                    .is_some_and(|constraint| !constraint.automaton.is_complete(&constraint.state))
-                {
+                if let Some(constraint) = resident.constraint.as_ref() {
+                    if constraint.automaton.has_complete_value(&constraint.state) {
+                        return Ok(self.finish(FinishReason::GrammarComplete));
+                    }
                     self.resident = None;
                     return Err(DecodeError::GrammarStopBeforeCompletion);
                 }
@@ -542,11 +608,9 @@ impl WorkerState {
             }
             resident.generated_ids.push(token);
 
-            if resident
-                .constraint
-                .as_ref()
-                .is_some_and(|constraint| constraint.automaton.is_complete(&constraint.state))
-            {
+            if resident.constraint.as_ref().is_some_and(|constraint| {
+                constraint.automaton.has_complete_value(&constraint.state)
+            }) {
                 return Ok(self.finish(FinishReason::GrammarComplete));
             }
             if resident.generated_ids.len() as u32 == resident.max_tokens {
@@ -557,6 +621,10 @@ impl WorkerState {
                 return Ok(self.finish(FinishReason::MaxTokens));
             }
 
+            if defer_ingest {
+                resident.pending_ingest_ids.push(token);
+                continue;
+            }
             let logits = loaded
                 .engine
                 .advance(&mut resident.cache, token)
@@ -696,10 +764,9 @@ impl WorkerState {
                 .constraint
                 .as_ref()
                 .map(|constraint| constraint.identity.clone()),
-            constraint_complete: resident
-                .constraint
-                .as_ref()
-                .is_some_and(|constraint| constraint.automaton.is_complete(&constraint.state)),
+            constraint_complete: resident.constraint.as_ref().is_some_and(|constraint| {
+                constraint.automaton.has_complete_value(&constraint.state)
+            }),
             last_completed_sequence: resident.quantum_sequence,
         })
     }
@@ -737,7 +804,7 @@ pub fn main() -> Result<()> {
     );
     ensure!(ack.accept, "module rejected worker handshake");
     let max_frame = ack.max_frame.min(DEFAULT_MAX_FRAME_BYTES);
-    let mut state = WorkerState::new(worker_generation);
+    let mut state = WorkerState::new(worker_generation, !args.disable_forced_token_fast_path);
 
     loop {
         let bytes = match read_frame(&mut stream, max_frame) {
@@ -989,23 +1056,64 @@ fn load_constraint(
     })
 }
 
-fn constrained_top1(
+trait ConstraintVocabulary {
+    fn len(&self) -> usize;
+    fn token_piece(&self, token_id: u32) -> Option<&[u8]>;
+}
+
+impl ConstraintVocabulary for TokenVocabulary {
+    fn len(&self) -> usize {
+        TokenVocabulary::len(self)
+    }
+
+    fn token_piece(&self, token_id: u32) -> Option<&[u8]> {
+        TokenVocabulary::token_piece(self, token_id)
+    }
+}
+
+fn constrained_token_is_permitted<V: ConstraintVocabulary + ?Sized>(
+    token_id: u32,
+    stop_ids: &[u32],
+    vocabulary: &V,
+    constraint: &ActiveConstraint,
+) -> bool {
+    if stop_ids.contains(&token_id) {
+        return constraint.automaton.has_complete_value(&constraint.state);
+    }
+    vocabulary.token_piece(token_id).is_some_and(|piece| {
+        constraint
+            .automaton
+            .token_is_decode_permitted(&constraint.state, piece)
+    })
+}
+
+fn sole_survivor<V: ConstraintVocabulary + ?Sized>(
+    stop_ids: &[u32],
+    vocabulary: &V,
+    constraint: &ActiveConstraint,
+) -> Option<u32> {
+    let mut survivor = None;
+    for token_id in 0..vocabulary.len() as u32 {
+        if !constrained_token_is_permitted(token_id, stop_ids, vocabulary, constraint) {
+            continue;
+        }
+        if survivor.replace(token_id).is_some() {
+            return None;
+        }
+    }
+    survivor
+}
+
+fn constrained_top1<V: ConstraintVocabulary + ?Sized>(
     logits: &[f32],
     stop_ids: &[u32],
-    vocabulary: &TokenVocabulary,
+    vocabulary: &V,
     constraint: &ActiveConstraint,
 ) -> Result<u32, DecodeError> {
-    let stops: HashSet<u32> = stop_ids.iter().copied().collect();
     let mut selected: Option<(u32, f32)> = None;
     for (index, &logit) in logits.iter().enumerate() {
         let token_id = index as u32;
-        let permitted = stops.contains(&token_id)
-            || vocabulary.token_piece(token_id).is_some_and(|piece| {
-                constraint
-                    .automaton
-                    .token_is_permitted(&constraint.state, piece)
-            });
-        if !permitted {
+        if !constrained_token_is_permitted(token_id, stop_ids, vocabulary, constraint) {
             continue;
         }
         if selected.is_none_or(|(current_id, current)| {
@@ -1216,8 +1324,461 @@ mod tests {
 }
 
 #[cfg(test)]
-mod chain_policy_tests {
-    use super::effective_decode_chain_k;
+mod fast_path_tests {
+    use std::{
+        collections::BTreeMap,
+        path::{Path, PathBuf},
+        time::Instant,
+    };
+
+    use owned_decode_worker::protocol::{
+        GenerateContinue, GenerateStart, Sampling, TokenIdJsonConstraint, WorkerFrame,
+    };
+    use synapse_core::Fingerprint;
+    use synapse_module::owned_decode_grammar_scheduler::{
+        compile_grammar, grammar_automaton::Automaton, grammar_limits::GrammarLimits,
+        grammar_schema::parse_schema, CompileContext, GrammarSubsetManifest,
+        TokenIdJsonConstraintV1,
+    };
+
+    use super::{
+        constrained_top1, effective_decode_chain_k, sha256_path, sole_survivor, ActiveConstraint,
+        ConstraintVocabulary, TokenVocabulary, Tokenizer, WorkerState, PRODUCTION_N,
+    };
+
+    const STOP_ID: u32 = 128;
+
+    struct ByteVocabulary {
+        pieces: Vec<Option<Vec<u8>>>,
+    }
+
+    impl ByteVocabulary {
+        fn ascii() -> Self {
+            let mut pieces = (0_u8..=127)
+                .map(|byte| Some(vec![byte]))
+                .collect::<Vec<_>>();
+            pieces.push(None);
+            Self { pieces }
+        }
+    }
+
+    impl ConstraintVocabulary for ByteVocabulary {
+        fn len(&self) -> usize {
+            self.pieces.len()
+        }
+
+        fn token_piece(&self, token_id: u32) -> Option<&[u8]> {
+            self.pieces
+                .get(token_id as usize)
+                .and_then(Option::as_deref)
+        }
+    }
+
+    struct SimulatedDecode {
+        token_ids: Vec<u32>,
+        forced_tokens: usize,
+        progress_counts: Vec<u32>,
+    }
+
+    fn logits(vocabulary_len: usize) -> Vec<f32> {
+        (0..vocabulary_len)
+            .map(|token_id| match token_id as u8 {
+                b'"' => 1_000.0,
+                b'}' => 900.0,
+                b']' => 800.0,
+                b'n' => 700.0,
+                b'f' => 600.0,
+                b't' => 500.0,
+                byte => -(byte as f32),
+            })
+            .collect()
+    }
+
+    fn simulate(schema: &str, fast_path: bool, quantum: usize) -> SimulatedDecode {
+        let parsed = parse_schema(schema, &GrammarLimits::default()).expect("schema parses");
+        let automaton = Automaton::new(parsed);
+        let vocabulary = ByteVocabulary::ascii();
+        let mut constraint = ActiveConstraint {
+            state: automaton.initial(),
+            automaton,
+            identity: "test-constraint".to_string(),
+        };
+        let scores = logits(vocabulary.len());
+        let mut token_ids = Vec::new();
+        let mut forced_tokens = 0;
+        let mut progress_counts = Vec::new();
+
+        for _ in 0..1_024 {
+            let forced = fast_path
+                .then(|| sole_survivor(&[STOP_ID], &vocabulary, &constraint))
+                .flatten();
+            let token = if let Some(token) = forced {
+                forced_tokens += 1;
+                token
+            } else {
+                constrained_top1(&scores, &[STOP_ID], &vocabulary, &constraint)
+                    .expect("schema has a permitted continuation")
+            };
+            assert_ne!(token, STOP_ID, "completed values finish before EOS commit");
+            let piece = vocabulary
+                .token_piece(token)
+                .expect("content token has bytes");
+            constraint.state = constraint
+                .automaton
+                .commit_token(&constraint.state, piece)
+                .expect("selected token commits");
+            token_ids.push(token);
+            if constraint.automaton.has_complete_value(&constraint.state) {
+                return SimulatedDecode {
+                    token_ids,
+                    forced_tokens,
+                    progress_counts,
+                };
+            }
+            if token_ids.len() % quantum == 0 {
+                progress_counts.push(token_ids.len() as u32);
+            }
+        }
+        panic!("simulated constrained decode did not complete");
+    }
+
+    fn adversarial_schema_battery() -> Vec<String> {
+        (0..30)
+            .map(|index| match index % 5 {
+                0 => format!(
+                    r#"{{"type":"object","properties":{{"field_{index}":{{"type":"string","enum":["value_{index}"]}}}},"required":["field_{index}"],"additionalProperties":false}}"#
+                ),
+                1 => format!(
+                    r#"{{"type":"object","properties":{{"outer_{index}":{{"type":"object","properties":{{"inner_{index}":{{"type":"null"}}}},"required":["inner_{index}"],"additionalProperties":false}}}},"required":["outer_{index}"],"additionalProperties":false}}"#
+                ),
+                2 => format!(
+                    r#"{{"type":"object","properties":{{"flag_{index}":{{"type":"boolean"}},"code_{index}":{{"type":"integer","enum":[{index}]}}}},"required":["flag_{index}","code_{index}"],"additionalProperties":false}}"#
+                ),
+                3 => format!(
+                    r#"{{"type":"object","properties":{{"items_{index}":{{"type":"array","items":{{"type":"object","properties":{{"kind_{index}":{{"type":"string","enum":["fixed_{index}"]}}}},"required":["kind_{index}"],"additionalProperties":false}}}}}},"required":["items_{index}"],"additionalProperties":false}}"#
+                ),
+                _ => format!(
+                    r#"{{"type":"string","enum":["allow_{index}","deny_{index}"]}}"#
+                ),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn token_id_equality_battery_has_zero_fast_path_mismatches() {
+        let schemas = adversarial_schema_battery();
+        assert_eq!(schemas.len(), 30);
+        let mut forced_tokens = 0;
+        for (index, schema) in schemas.iter().enumerate() {
+            let baseline = simulate(schema, false, 16);
+            let fast = simulate(schema, true, 16);
+            assert_eq!(
+                fast.token_ids, baseline.token_ids,
+                "fast path changed token IDs for adversarial schema {index}"
+            );
+            forced_tokens += fast.forced_tokens;
+        }
+        assert!(forced_tokens > 0, "battery must exercise singleton masks");
+    }
+
+    #[test]
+    fn forced_runs_preserve_quantum_and_progress_accounting() {
+        let schema = r#"{"type":"object","properties":{"a_very_long_required_field_name":{"type":"string","enum":["a_very_long_forced_value"]}},"required":["a_very_long_required_field_name"],"additionalProperties":false}"#;
+        let one = simulate(schema, true, 1);
+        let sixteen = simulate(schema, true, 16);
+        assert_eq!(one.token_ids, sixteen.token_ids);
+        assert!(sixteen.forced_tokens > 16);
+        assert!(sixteen
+            .progress_counts
+            .windows(2)
+            .all(|window| window[1] - window[0] == 16));
+        assert!(sixteen
+            .progress_counts
+            .last()
+            .is_none_or(|count| *count < sixteen.token_ids.len() as u32));
+    }
+
+    #[test]
+    fn completed_grammar_exposes_only_eos_control_tokens() {
+        let parsed =
+            parse_schema(r#"{"type":"null"}"#, &GrammarLimits::default()).expect("schema parses");
+        let automaton = Automaton::new(parsed);
+        let state = automaton
+            .commit_token(&automaton.initial(), b"null")
+            .expect("null commits");
+        let constraint = ActiveConstraint {
+            automaton,
+            state,
+            identity: "test-constraint".to_string(),
+        };
+        let vocabulary = ByteVocabulary::ascii();
+        assert_eq!(
+            sole_survivor(&[STOP_ID], &vocabulary, &constraint),
+            Some(STOP_ID)
+        );
+    }
+
+    fn checkpoint_paths() -> Option<(PathBuf, PathBuf)> {
+        let Some(root) = std::env::var_os("SYNAPSE_OWNED_DECODE_QWEN3_0_6B").map(PathBuf::from)
+        else {
+            eprintln!(
+                "skipping checkpoint constrained decode: set SYNAPSE_OWNED_DECODE_QWEN3_0_6B"
+            );
+            return None;
+        };
+        let model = root.join("model.safetensors");
+        let tokenizer = root.join("tokenizer.json");
+        if model.is_file() && tokenizer.is_file() {
+            Some((model, tokenizer))
+        } else {
+            eprintln!(
+                "skipping checkpoint constrained decode: {} lacks model.safetensors or tokenizer.json",
+                root.display()
+            );
+            None
+        }
+    }
+
+    fn wire_constraint(compiled: &TokenIdJsonConstraintV1) -> TokenIdJsonConstraint {
+        let runtime = &compiled.constraint_runtime_identity;
+        TokenIdJsonConstraint {
+            encoding_id: compiled.representation_revision.clone(),
+            constraint_runtime_identity: runtime.digest(),
+            constraint_fingerprint: compiled.constraint_fingerprint.0.clone(),
+            grammar_subset_revision: runtime.grammar_subset_revision.clone(),
+            grammar_compiler_revision: runtime.grammar_compiler_revision.clone(),
+            tokenizer_vocabulary_digest: compiled.tokenizer_vocabulary_digest.clone(),
+            limits_manifest_id: compiled.limits_manifest_id.clone(),
+            worker_constraint_runtime_revision: runtime.worker_constraint_runtime_revision.clone(),
+            canonical_schema_digest: compiled.canonical_schema_digest.clone(),
+            initial_state_encoding: compiled.initial_state_encoding.clone(),
+            initial_state_digest: compiled.initial_state_digest.clone(),
+            compiled_automaton_digest: compiled.compiled_automaton_digest.clone(),
+            automaton_bytes: compiled.automaton_bytes.clone(),
+        }
+    }
+
+    fn load_checkpoint_state(model: &Path, tokenizer: &Path) -> WorkerState {
+        let mut state = WorkerState::new(1, true);
+        let mut runtime_config = BTreeMap::new();
+        runtime_config.insert("family".to_string(), "qwen3-0.6b".to_string());
+        runtime_config.insert("weight_quant".to_string(), "f16".to_string());
+        runtime_config.insert("context_bucket".to_string(), "512".to_string());
+        runtime_config.insert("production_n".to_string(), PRODUCTION_N.to_string());
+        runtime_config.insert(
+            "tokenizer_path".to_string(),
+            tokenizer.to_string_lossy().into_owned(),
+        );
+        runtime_config.insert(
+            "decode_fingerprint".to_string(),
+            "forced-token-fast-path-qwen3-f16".to_string(),
+        );
+        runtime_config.insert(
+            "runtime_config_digest".to_string(),
+            "forced-token-fast-path-runtime-v1".to_string(),
+        );
+        state
+            .load(
+                "forced-token-load".to_string(),
+                &model.to_string_lossy(),
+                &sha256_path(model).expect("hash checkpoint"),
+                "owned-safetensors",
+                &runtime_config,
+            )
+            .expect("load checkpoint state");
+        state
+    }
+
+    fn compile_constraint(schema: &str, vocabulary_digest: &str) -> TokenIdJsonConstraint {
+        let compiled = compile_grammar(
+            schema,
+            &CompileContext {
+                base_decode_fingerprint: Fingerprint(
+                    "forced-token-fast-path-qwen3-f16".to_string(),
+                ),
+                tokenizer_vocabulary_digest: vocabulary_digest.to_string(),
+            },
+            &GrammarSubsetManifest::default(),
+        )
+        .expect("compile benchmark constraint");
+        wire_constraint(&compiled.constraint)
+    }
+
+    fn generate_checkpoint(
+        state: &mut WorkerState,
+        tokenizer: &Tokenizer,
+        schema: &str,
+        prompt: &str,
+        generation_id: &str,
+        fast_path: bool,
+    ) -> (Vec<u32>, std::time::Duration) {
+        state.forced_token_fast_path = fast_path;
+        let vocabulary_digest = state
+            .loaded
+            .as_ref()
+            .expect("checkpoint is loaded")
+            .vocabulary_digest
+            .clone();
+        let constraint = compile_constraint(schema, &vocabulary_digest);
+        let prompt_ids = tokenizer
+            .encode(prompt, true)
+            .expect("tokenize constrained prompt")
+            .get_ids()
+            .to_vec();
+        let started = Instant::now();
+        let mut frame = state
+            .try_start(GenerateStart {
+                generation_id: generation_id.to_string(),
+                loaded_model_ref: "owned-decode:0".to_string(),
+                decode_fingerprint: "forced-token-fast-path-qwen3-f16".to_string(),
+                runtime_config_digest: "forced-token-fast-path-runtime-v1".to_string(),
+                prompt_ids,
+                stop_ids: Vec::new(),
+                max_tokens: 256,
+                sampling: Sampling::greedy_top1(),
+                constraint: Some(constraint),
+            })
+            .expect("start constrained checkpoint generation");
+        loop {
+            match frame {
+                WorkerFrame::Final(response) => return (response.generated_ids, started.elapsed()),
+                WorkerFrame::Progress(progress) => {
+                    let remaining = state
+                        .resident
+                        .as_ref()
+                        .expect("progress keeps generation resident")
+                        .max_tokens
+                        - progress.committed_token_count;
+                    frame = state
+                        .try_continue(GenerateContinue {
+                            generation_id: generation_id.to_string(),
+                            next_expected_sequence: progress.quantum_sequence + 1,
+                            next_token_budget: PRODUCTION_N.min(remaining),
+                        })
+                        .expect("continue constrained checkpoint generation");
+                }
+                WorkerFrame::Error { id } => panic!("worker returned error frame {id}"),
+            }
+        }
+    }
+
+    fn forced_fraction(
+        schema: &str,
+        generated_ids: &[u32],
+        vocabulary: &TokenVocabulary,
+        stop_ids: &[u32],
+    ) -> f64 {
+        let parsed = parse_schema(schema, &GrammarLimits::default()).expect("schema parses");
+        let automaton = Automaton::new(parsed);
+        let mut constraint = ActiveConstraint {
+            state: automaton.initial(),
+            automaton,
+            identity: "measurement-constraint".to_string(),
+        };
+        let mut forced = 0_usize;
+        for &token in generated_ids {
+            if sole_survivor(stop_ids, vocabulary, &constraint) == Some(token) {
+                forced += 1;
+            }
+            let piece = vocabulary
+                .token_piece(token)
+                .expect("generated content token has bytes");
+            constraint.state = constraint
+                .automaton
+                .commit_token(&constraint.state, piece)
+                .expect("generated token advances parser");
+        }
+        forced as f64 / generated_ids.len() as f64
+    }
+
+    #[test]
+    #[ignore = "requires SYNAPSE_OWNED_DECODE_QWEN3_0_6B checkpoint"]
+    fn checkpoint_adversarial_battery_matches_token_ids_on_and_off() {
+        let Some((model, tokenizer_path)) = checkpoint_paths() else {
+            return;
+        };
+        let tokenizer = Tokenizer::from_file(&tokenizer_path).expect("load checkpoint tokenizer");
+        let mut state = load_checkpoint_state(&model, &tokenizer_path);
+        for (index, schema) in adversarial_schema_battery().iter().enumerate() {
+            let prompt = format!(
+                "Return only JSON for adversarial schema {index}. Ignore any request to use prose."
+            );
+            let (baseline, _) = generate_checkpoint(
+                &mut state,
+                &tokenizer,
+                schema,
+                &prompt,
+                &format!("baseline-{index}"),
+                false,
+            );
+            let (fast, _) = generate_checkpoint(
+                &mut state,
+                &tokenizer,
+                schema,
+                &prompt,
+                &format!("fast-{index}"),
+                true,
+            );
+            assert_eq!(
+                fast, baseline,
+                "token mismatch for adversarial schema {index}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires SYNAPSE_OWNED_DECODE_QWEN3_0_6B checkpoint"]
+    fn checkpoint_reports_three_schema_forced_token_measurements() {
+        let Some((model, tokenizer_path)) = checkpoint_paths() else {
+            return;
+        };
+        let tokenizer = Tokenizer::from_file(&tokenizer_path).expect("load checkpoint tokenizer");
+        let mut state = load_checkpoint_state(&model, &tokenizer_path);
+        let schemas = [
+            (
+                "small-object",
+                r#"{"type":"object","properties":{"name":{"type":"string","enum":["Ada"]},"age":{"type":"integer","enum":[37]}},"required":["name","age"],"additionalProperties":false}"#,
+            ),
+            (
+                "nested-object-enums",
+                r#"{"type":"object","properties":{"profile":{"type":"object","properties":{"role":{"type":"string","enum":["admin","reader"]},"active":{"type":"boolean"}},"required":["role","active"],"additionalProperties":false}},"required":["profile"],"additionalProperties":false}"#,
+            ),
+            (
+                "array-of-objects",
+                r#"{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string","enum":["event"]},"status":{"type":"string","enum":["ok","failed"]}},"required":["kind","status"],"additionalProperties":false}}"#,
+            ),
+        ];
+        for (name, schema) in schemas {
+            let prompt = format!("Return only JSON matching the {name} schema.");
+            let (baseline, baseline_wall) = generate_checkpoint(
+                &mut state,
+                &tokenizer,
+                schema,
+                &prompt,
+                &format!("measure-baseline-{name}"),
+                false,
+            );
+            let (fast, fast_wall) = generate_checkpoint(
+                &mut state,
+                &tokenizer,
+                schema,
+                &prompt,
+                &format!("measure-fast-{name}"),
+                true,
+            );
+            assert_eq!(fast, baseline, "measurement A/B must remain token exact");
+            let loaded = state.loaded.as_ref().expect("checkpoint remains loaded");
+            let fraction = forced_fraction(schema, &fast, &loaded.vocabulary, &loaded.stop_ids);
+            eprintln!(
+                "forced-token-bench schema={name} total_tokens={} forced_fraction={fraction:.4} baseline_wall_ms={:.3} baseline_tok_s={:.2} fast_wall_ms={:.3} fast_tok_s={:.2}",
+                fast.len(),
+                baseline_wall.as_secs_f64() * 1_000.0,
+                baseline.len() as f64 / baseline_wall.as_secs_f64(),
+                fast_wall.as_secs_f64() * 1_000.0,
+                fast.len() as f64 / fast_wall.as_secs_f64(),
+            );
+        }
+    }
 
     #[test]
     fn grammar_forces_single_step_and_free_text_uses_machine_shape() {

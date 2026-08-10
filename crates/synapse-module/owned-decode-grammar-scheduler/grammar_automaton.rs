@@ -529,6 +529,19 @@ impl Automaton {
         self.commit_token(state, token).is_ok()
     }
 
+    /// Whether constrained decode may select `token` from `state`.
+    ///
+    /// JSON whitespace is optional between structural values. Suppressing tokens
+    /// made entirely of optional whitespace keeps generation moving and matches
+    /// the worker's established JSON constraint mask. Whitespace remains legal
+    /// inside strings and while terminating scalar lexemes.
+    pub fn token_is_decode_permitted(&self, state: &State, token: &[u8]) -> bool {
+        if state.scalar.is_none() && token.iter().copied().all(is_whitespace) {
+            return false;
+        }
+        self.token_is_permitted(state, token)
+    }
+
     fn step_scalar(&self, scalar: &Scalar, byte: u8) -> Result<ScalarStep, StepError> {
         match scalar {
             Scalar::String {
@@ -1465,6 +1478,19 @@ mod tests {
         ];
         let permitted = mask_tokens(&automaton, &state, &vocabulary);
         assert_eq!(permitted, vec![0]);
+    }
+
+    #[test]
+    fn decode_mask_suppresses_only_structural_whitespace() {
+        let automaton = automaton(r#"{ "type": "string" }"#);
+        let initial = automaton.initial();
+        assert!(!automaton.token_is_decode_permitted(&initial, b" "));
+        assert!(automaton.token_is_decode_permitted(&initial, b"\""));
+
+        let inside_string = automaton
+            .commit_token(&initial, b"\"")
+            .expect("string opener is permitted");
+        assert!(automaton.token_is_decode_permitted(&inside_string, b" "));
     }
 
     #[test]

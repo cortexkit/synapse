@@ -45,6 +45,20 @@ impl TokenMask {
         self.allowed
     }
 
+    /// Returns the only allowed token without scanning the full vocabulary.
+    pub fn sole_survivor(&self) -> Option<u32> {
+        if self.allowed != 1 {
+            return None;
+        }
+        self.words
+            .iter()
+            .enumerate()
+            .find(|(_, word)| **word != 0)
+            .map(|(word_index, word)| {
+                (word_index * u64::BITS as usize + word.trailing_zeros() as usize) as u32
+            })
+    }
+
     /// Applies the mask in place for samplers that consume a full logit vector.
     #[allow(dead_code)]
     pub(crate) fn apply(&self, logits: &mut [f32]) {
@@ -1695,6 +1709,16 @@ mod tests {
         mask.apply(&mut logits);
         assert_eq!(logits, [f32::NEG_INFINITY, 2.0, f32::NEG_INFINITY, 4.0]);
         assert_eq!(mask.token_ids().collect::<Vec<_>>(), vec![1, 3]);
+    }
+
+    #[test]
+    fn token_mask_reports_a_sole_survivor_in_constant_words() {
+        let mut mask = TokenMask::empty(130);
+        assert_eq!(mask.sole_survivor(), None);
+        mask.insert(129);
+        assert_eq!(mask.sole_survivor(), Some(129));
+        mask.insert(7);
+        assert_eq!(mask.sole_survivor(), None);
     }
 
     #[test]
