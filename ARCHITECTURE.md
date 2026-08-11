@@ -19,7 +19,7 @@
 **Synapse SubC Module (`synapse-module`):**
 - Purpose: The main service listening on the SubC bus. Handles route binding, job admission, the model cache, remote provider dispatch, worker lifecycle supervision (offloading worker engine drops to dedicated threads), approval storage and identity-based rollback (`rollback.rs`), runtime admission probe health, storage epochs and rotation ledgers, owned CUDA evidence and declared identities, and in-process execution via the owned engine.
 - Location: `crates/synapse-module`
-- Contains: A 3-class aging scheduler, SQLite durable job and cache lease state, machine probe certification logic, socket/pipe-based worker host, the remote gateway client, module-side routing (`owned-decode-routing`), grammar compilation and DECODE scheduler (`owned-decode-grammar-scheduler`), certification gates and probes (`owned-decode-certification`), approval rollback (`rollback.rs`), contract manifests (`owned-decode-manifests`), and direct bindings to `synapse-engine-owned` and `synapse-engine-cuda`.
+- Contains: A 3-class aging scheduler, SQLite durable job and cache lease state, machine probe certification logic, socket/pipe-based worker host, the remote gateway client, module-side routing (`owned-decode-routing`), grammar compilation and DECODE scheduler (`owned-decode-grammar-scheduler`), certification gates and probes (`owned-decode-certification`), approval rollback (`rollback.rs`), contract manifests (`owned-decode-manifests`), request-scoped semantic-sidecar hint bank normalization and per-field slotting (`owned-decode-sidecar`), and direct bindings to `synapse-engine-owned` and `synapse-engine-cuda`.
 - Depends on: `synapse-core`, `synapse-engine-owned`, `synapse-engine-cuda`, `subc-client-rs`, `rusqlite`, `tokio`.
 
 **Remote Gateway (`crates/synapse-module/src/remote`):**
@@ -31,7 +31,7 @@
 **Synapse Owned Engine (`synapse-engine-owned`):**
 - Purpose: Primary in-process execution engine for Apple Silicon (macOS), providing exact-match Metal MPSGraph inference for ModernBERT, Qwen3, and MiniLM models, direct Metal step decode engines for Qwen3 and LFM2, supervised decode worker state management, and ModernBERT pair reranking (`rerank_pairs`).
 - Location: `crates/synapse-engine-owned`
-- Contains: Rust-to-Objective-C bindings, Metal shader graphs (including macOS 15+ `@available`-guarded fused scaled-dot-product attention for ModernBERT with `GRAPH_REVISION` package cache invalidation), direct Metal step decode kernels and models (`owned-decode-engine`), supervised decode worker protocol, boundary, crash budget, and supervision state machine (`owned-decode-worker`), and tensor operations for embedding and reranking (`crates/synapse-engine-owned/src/modernbert.rs`). The module stays the sole tokenizer owner; this engine strictly consumes canonical token IDs and executes tensor logic.
+- Contains: Rust-to-Objective-C bindings, Metal shader graphs (including macOS 15+ `@available`-guarded fused scaled-dot-product attention for ModernBERT with `GRAPH_REVISION` package cache invalidation), direct Metal step decode kernels and models (`owned-decode-engine`), supervised decode worker protocol, boundary, crash budget, sidecar hint bank installation protocol, and supervision state machine (`owned-decode-worker`), and tensor operations for embedding and reranking (`crates/synapse-engine-owned/src/modernbert.rs`). The module stays the sole tokenizer owner; this engine strictly consumes canonical token IDs and executes tensor logic.
 - Depends on: `synapse-core`, `safetensors`, `half`, Apple's `Metal` and `MPSGraph` frameworks.
 - Used by: `synapse-module` as the primary local engine.
 
@@ -45,14 +45,14 @@
 **Synapse Worker Lanes (`synapse-worker-*`):**
 - Purpose: Execute in-memory tokenization, tensor forward passes, and token generation for specific hardware classes (Apple Silicon MLX, Apple Neural Engine, Llama GGUF, NVIDIA CUDA, and supervised Metal decode).
 - Location: `crates/synapse-worker-mlx`, `crates/synapse-worker-ane`, `crates/synapse-worker-llama`, `crates/synapse-worker-cuda`, `crates/synapse-worker-decode`
-- Contains: Metal-accelerated customized MLX models, CoreML graphs (including the `gte-modernbert` embedder and reranker for the ANE quiet-tier via `ane-coreml-worker`), `llama.cpp` inference processes, supervised owned CUDA runner (`ck-synapse-worker-cuda`) executing MiniLM, ModernBERT, and Qwen3 embedding batches over IPC, and supervised owned Metal decode runner (`ck-synapse-worker-decode`) executing Qwen3 and LFM2 token generation under progress/continuation framing.
+- Contains: Metal-accelerated customized MLX models, CoreML graphs (including the `gte-modernbert` embedder and reranker for the ANE quiet-tier via `ane-coreml-worker`), `llama.cpp` inference processes, supervised owned CUDA runner (`ck-synapse-worker-cuda`) executing MiniLM, ModernBERT, and Qwen3 embedding batches over IPC, and supervised owned Metal decode runner (`ck-synapse-worker-decode`) executing Qwen3 and LFM2 token generation under progress/continuation framing and sidecar hint bank installation.
 - Depends on: `synapse-core`, `owned-decode-worker`, `synapse-engine-owned`, `mlx-rs`, `coreml` (via Swift), `reqwest`.
 - Used by: The `synapse-module` host spawning them dynamically based on user requests and capability tiers.
 
 **Synapse Core Abstractions (`synapse-core`):**
 - Purpose: Core vocabulary structs, engine traits, machine capability profiles, and error contracts shared between the host and its workers.
 - Location: `crates/synapse-core`
-- Contains: `WorkerHello` handshake with strict catalog engine identity validation, shared canonical HELLO engine identities (`worker_engine_names.rs`), binary framing logic, `EngineError` contract, `MachineProfile` with `ane_subtype` chip-identity mapping, `RuntimeConfig`, `TokenBatch`, per-request decode chain policy, and scheduling traits.
+- Contains: `WorkerHello` handshake with strict catalog engine identity validation, shared canonical HELLO engine identities (`worker_engine_names.rs`), binary framing logic, `EngineError` contract, `MachineProfile` with `ane_subtype` chip-identity mapping, `RuntimeConfig`, `TokenBatch`, per-request decode chain policy, request-scoped sidecar specification contracts (`sidecar_spec.rs`), and scheduling traits.
 
 **Benchmark Harness Core:**
 - Purpose: Provides CLI commands for corpus generation, power-monitored process wrapping, result schema definition, and numerical parity functions.
@@ -290,6 +290,11 @@
 - Purpose: Pure-Rust state machine supervising `ck-synapse-worker-decode` over `owned-metal-decode-worker-v1` IPC, managing sequence/session validation, terminal-control boundary precedence, crash-budget persistence/quarantine, and single-crash token-zero restart.
 - Location: `crates/synapse-engine-owned/owned-decode-worker/src/supervisor.rs`
 - Pattern: Worker lifecycle supervisor with crash budget and quarantine state.
+
+**Owned Decode Sidecar & Hint Bank:**
+- Purpose: Pure data handling module and shared contracts normalizing request-scoped semantic-sidecar results, building target-tokenizer hint banks (`SidecarHintBank`) for non-blocking suffix-match pickup during target decoding, managing per-field layout plan slotting (`PerFieldPlan`), and classifying sidecar outcome precedence (`SidecarOutcome`).
+- Location: `crates/synapse-module/owned-decode-sidecar/mod.rs`, `crates/synapse-core/src/sidecar_spec.rs`
+- Pattern: Data normalization, layout rendering policy, and tokenizer hint bank indexing.
 
 **LFM2 Causal Mixer:**
 - Purpose: Alternates 10 short-convolution layers and 6 full-attention layers with tied embeddings and GQA KV cache, supporting modern `layer_types` configurations.

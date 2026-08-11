@@ -29,7 +29,7 @@
 │   ├── synapse-engine-cuda/ # In-process CUDA engine and PTX kernel ports
 │   ├── synapse-engine-ort/ # In-process ONNX Runtime inference engine
 │   ├── synapse-engine-owned/ # Primary owned Metal engine, step engines, and decode worker state (macOS)
-│   ├── synapse-module/     # Main SubC module host, job queue, owned decode routing, and scheduler
+│   ├── synapse-module/     # Main SubC module host, job queue, owned decode routing, sidecar bank normalization, and scheduler
 │   ├── synapse-opctl/      # CLI operator control surface driving SubC commands
 │   ├── synapse-worker-ane/ # Apple Neural Engine supervised worker (Swift/CoreML)
 │   ├── synapse-worker-cuda/ # Supervised owned CUDA worker binary
@@ -65,7 +65,7 @@
 
 **crates/synapse-core/:**
 - Purpose: Defines shared abstractions for engines, worker protocol, caching, machine capability profiles, and scheduling.
-- Contains: Envelopes, machine profile structs, engine traits, error contracts, and shared canonical worker HELLO handshake identities (`worker_engine_names.rs`).
+- Contains: Envelopes, machine profile structs, engine traits, error contracts, shared canonical worker HELLO handshake identities (`worker_engine_names.rs`), and request-scoped sidecar specification contracts (`sidecar_spec.rs`).
 - Key files: `crates/synapse-core/src/worker_protocol.rs`, `crates/synapse-core/src/scheduler.rs`, `crates/synapse-core/src/machine_profile.rs`, `crates/synapse-core/src/worker_engine_names.rs`
 
 **crates/synapse-engine-cuda/:**
@@ -75,12 +75,12 @@
 
 **crates/synapse-engine-owned/:**
 - Purpose: The primary in-process execution engine for Apple Silicon (macOS), hosting embedding engines, direct Metal step decode engines, ModernBERT pair reranking, and decode worker supervision.
-- Contains: Metal MPSGraph inference layers for ModernBERT, Qwen3, and MiniLM models, direct Metal step decode engines (`owned-decode-engine`), ModernBERT pair reranking (`rerank_pairs`), and supervised decode worker state management (`owned-decode-worker`).
+- Contains: Metal MPSGraph inference layers for ModernBERT, Qwen3, and MiniLM models, direct Metal step decode engines (`owned-decode-engine`), ModernBERT pair reranking (`rerank_pairs`), and supervised decode worker state management and sidecar hint bank installation protocol (`owned-decode-worker`).
 - Key files: `crates/synapse-engine-owned/src/lib.rs`, `crates/synapse-engine-owned/owned-decode-engine/src/lib.rs`, `crates/synapse-engine-owned/owned-decode-worker/src/lib.rs`
 
 **crates/synapse-module/:**
 - Purpose: The primary SubC service module. Handles the content-addressed model cache, durable jobs, worker hosting (offloading worker drop teardown to dedicated threads), remote provider dispatch, owned decode routing, grammar compilation, approval storage and identity-based rollback (`rollback.rs`), owned CUDA evidence and declared identities, and route binding.
-- Contains: SQLite store initialization, SubC `ModuleHandler` implementation, UNIX socket / Windows pipe worker spawning, remote gateway client, owned decode routing (`owned-decode-routing`), grammar compilation and DECODE scheduler (`owned-decode-grammar-scheduler`), certification gates and probes (`owned-decode-certification`), approval rollback (`rollback.rs`), and contract manifests (`owned-decode-manifests`).
+- Contains: SQLite store initialization, SubC `ModuleHandler` implementation, UNIX socket / Windows pipe worker spawning, remote gateway client, owned decode routing (`owned-decode-routing`), grammar compilation and DECODE scheduler (`owned-decode-grammar-scheduler`), certification gates and probes (`owned-decode-certification`), approval rollback (`rollback.rs`), contract manifests (`owned-decode-manifests`), and request-scoped semantic-sidecar hint bank normalization and per-field slotting (`owned-decode-sidecar`).
 - Key files: `crates/synapse-module/src/lib.rs`, `crates/synapse-module/src/worker_host/mod.rs`, `crates/synapse-module/src/rollback.rs`, `crates/synapse-module/owned-decode-routing/mod.rs`, `crates/synapse-module/owned-decode-grammar-scheduler/mod.rs`
 
 **crates/synapse-opctl/:**
@@ -196,6 +196,8 @@
 
 **Core Logic:**
 - `crates/synapse-core/src/worker_engine_names.rs`: Shared canonical worker HELLO handshake identity definitions (`LLAMA_WORKER_ENGINE`, `DECODE_WORKER_ENGINE`, `CUDA_WORKER_ENGINE`, etc.).
+- `crates/synapse-core/src/sidecar_spec.rs`: Request-scoped semantic sidecar contracts (`SidecarSpec`, `SidecarHintBank`, `SidecarOutcome`, `SidecarBankEffect`, `SpanClass`).
+- `crates/synapse-module/owned-decode-sidecar/mod.rs`: Request-scoped semantic-sidecar result normalization, hint bank compilation, rendering policies, and per-field plan slotting.
 - `crates/synapse-module/src/rollback.rs`: Exact `(model_id, decode_fingerprint)` approval disablement and single-transaction emergency rollback routines.
 - `crates/synapse-module/src/remote/runtime.rs`: Provider pool routing, circuit breaker enforcement, and telemetry collection for external model execution.
 - `crates/synapse-engine-cuda/src/lib.rs`: Production owned CUDA embed engine, model family detection, and PTX build identity.
