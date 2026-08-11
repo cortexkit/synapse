@@ -147,3 +147,42 @@ approval state: **decided** (reversible, AFT-approved or within pre-approved sco
 - First action: same-harness graduation probe on the locked M1 (owned runtime vs
   llama-server-Metal vs MLX python, identical corpus/token accounting) to convert
   directional ratios into certifiable ones.
+
+## D-010: Owned-decode approvals are stable decisions; evidence is current local state
+
+- State: decided (runtime-bound decode cutover contracts v1)
+- Date: 2026-08-11
+- Decision: store owned-decode approval rows in the module SQLite store, keyed
+  exactly by `(model_id, decode_fingerprint)`. An approval records a human
+  decision about one artifact; it never contains a machine profile, a numeric
+  profile ID, or a concrete certification row. The row's unkeyed semantic
+  digest detects corruption and accidental edits inside the existing
+  local-operator trust boundary; it is not a claim of cryptographic resistance
+  to a principal that can rewrite the store and recompute the digest.
+- Admission: approval structure and digest are load-time checks. Evidence is a
+  serve-time check: an enabled approval with no current measured evidence is
+  structurally loadable and refuses owned serving. Current evidence must match
+  the runtime's `MachineProfile::revisioned_hash()` and positive activation
+  epoch, plus the current processing, runtime, worker-path, constraint, and
+  gate requirements. This is local profile-and-epoch binding, not physical-host
+  identity; a complete copied store on an identical collected profile is out of
+  scope. Epochs prevent reuse across observed A-to-B-to-A transitions but do
+  not claim to detect an intermediate profile that no module observed.
+- Operations: deployment is one replacement binary, one fenced migration, and
+  probe re-certification. The interval between deployment and the first
+  successful probe is deliberately fail-closed: eligible unconstrained traffic
+  uses llama fallback, identity-pinned traffic receives
+  `owned_decode_not_certified`, and constrained traffic keeps its existing
+  refusal behavior. A supported profile rotation is healed by probe alone;
+  approval bytes and the deployed binary must not change. A new
+  `decode_fingerprint` remains a distinct artifact and needs explicit approval.
+- Rollback: disable one exact approval identity with a reason, or atomically
+  disable every owned-decode approval for an emergency rollback. Re-certifying
+  evidence never overrides disabled state. The retired profile-keyed
+  `disable_profile(machine_profile_hash)` procedure is not an operational
+  path.
+- Release rule: the fleet transition report is the release record. It must
+  contain the unavailable-window measurement, trigger and ledger evidence,
+  binary and approval byte identities, clean source/build state, and an
+  instrumented zero approval-write result. Release remains blocked until every
+  execution-manifest job and every preceding slice pass.
