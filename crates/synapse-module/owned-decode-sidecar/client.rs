@@ -9,8 +9,8 @@ use std::str;
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::renderer::{FrozenObjectSchema, RenderError, RenderPolicy, SchemaValidationError};
-use crate::slotter::{PerFieldPlan, PerFieldPlanError, PerFieldResult};
+use super::renderer::{FrozenObjectSchema, RenderError, RenderPolicy, SchemaValidationError};
+use super::slotter::{PerFieldPlan, PerFieldPlanError, PerFieldResult};
 
 /// A validated sidecar value together with its deterministic runtime rendering.
 #[derive(Clone, Debug, PartialEq)]
@@ -30,7 +30,7 @@ pub fn prepare_whole_object(
         return Err(SidecarResultError::NonObject);
     }
     schema.validate_value(&value)?;
-    let rendered_view = crate::renderer::render_object(schema, &value, policy)?;
+    let rendered_view = super::renderer::render_object(schema, &value, policy)?;
     Ok(PreparedSidecarResult {
         value,
         rendered_view,
@@ -51,7 +51,7 @@ pub fn prepare_per_field(
     let slot_results = PerFieldResult::decode(plan, raw_slots)?;
     let value = slot_results.join_object(plan)?;
     schema.validate_value(&value)?;
-    let rendered_view = crate::renderer::render_object(schema, &value, policy)?;
+    let rendered_view = super::renderer::render_object(schema, &value, policy)?;
     Ok((
         PreparedSidecarResult {
             value,

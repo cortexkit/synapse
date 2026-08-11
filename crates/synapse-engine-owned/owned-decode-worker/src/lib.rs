@@ -53,8 +53,9 @@ pub use ownership::{
     OWNERSHIP_MANIFEST_REVISION,
 };
 pub use protocol::{
-    FinalResponse, FinishReason, FrameEnvelope, GenerateCancel, GenerateContinue, GenerateProgress,
-    GenerateStart, Sampling, TokenIdJsonConstraint, WorkerFrame, GREEDY_TOP1,
+    FinalResponse, FinishReason, FrameEnvelope, GenerateCancel, GenerateContinue,
+    GenerateInstallHintBank, GenerateProgress, GenerateStart, HintBankInstalled, Sampling,
+    TokenIdJsonConstraint, WorkerFrame, GREEDY_TOP1,
 };
 pub use supervisor::{
     Clock, GenerationOutcome, GenerationRequest, ManualClock, Provenance, SuccessOutput,
@@ -62,6 +63,6 @@ pub use supervisor::{
 };
 pub use validation::{validate_start, StartAuthorization, WorkerStartContext};
 pub use worker::{
-    CancelAck, DecodeWorker, ScriptedEvent, ScriptedLog, ScriptedWorkerFactory, SteppedFrame,
-    WorkerFactory, WorkerFault,
+    CancelAck, DecodeWorker, HintBankSource, NoHintBankSource, ScriptedEvent, ScriptedLog,
+    ScriptedWorkerFactory, SidecarHintBankPickup, SteppedFrame, WorkerFactory, WorkerFault,
 };

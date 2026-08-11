@@ -23,10 +23,14 @@ use crate::budget::{ChargeOutcome, CrashBudget, CrashBudgetStore};
 use crate::error::{DecodeError, FailureClassification};
 use crate::identity::QuarantineKey;
 use crate::protocol::{
-    FinalResponse, FinishReason, GenerateCancel, GenerateContinue, GenerateStart, WorkerFrame,
+    FinalResponse, FinishReason, GenerateCancel, GenerateContinue, GenerateInstallHintBank,
+    GenerateStart, WorkerFrame,
 };
 use crate::validation::{validate_start, WorkerStartContext};
-use crate::worker::{CancelAck, DecodeWorker, WorkerFactory, WorkerFault, WorkerStartFailure};
+use crate::worker::{
+    CancelAck, DecodeWorker, HintBankSource, NoHintBankSource, WorkerFactory, WorkerFault,
+    WorkerStartFailure,
+};
 
 /// A monotonic clock the supervisor reads at each boundary.
 pub trait Clock {
@@ -189,6 +193,29 @@ impl<S: CrashBudgetStore> Supervisor<S> {
         control: &TerminalControl,
         clock: &dyn Clock,
     ) -> GenerationOutcome {
+        let mut no_hint_bank = NoHintBankSource;
+        self.run_generation_with_hint_bank(
+            request,
+            factory,
+            context,
+            control,
+            clock,
+            &mut no_hint_bank,
+        )
+    }
+
+    /// Run a generation while polling a sidecar source only at progress
+    /// boundaries. A pending source is never awaited and an installed bank is
+    /// sent on the existing worker transport before the next continue request.
+    pub fn run_generation_with_hint_bank(
+        &mut self,
+        request: &GenerationRequest,
+        factory: &mut dyn WorkerFactory,
+        context: &WorkerStartContext,
+        control: &TerminalControl,
+        clock: &dyn Clock,
+        hint_bank_source: &mut dyn HintBankSource,
+    ) -> GenerationOutcome {
         let mut provenance = Provenance::default();
 
         // Pre-dispatch quarantine refusal: dispatch nothing, charge nothing.
@@ -224,7 +251,7 @@ impl<S: CrashBudgetStore> Supervisor<S> {
             };
         }
 
-        let first = self.run_attempt(request, factory, context, control, clock);
+        let first = self.run_attempt(request, factory, context, control, clock, hint_bank_source);
         match first {
             AttemptResult::Clean(result, accounting) => {
                 provenance.worker_generation = accounting.worker_generation;
@@ -266,7 +293,8 @@ impl<S: CrashBudgetStore> Supervisor<S> {
                 // Redispatch from the original prompt and initial constraint state
                 // on a fresh worker generation and session.
                 provenance.crash_retry_count = 1;
-                let second = self.run_attempt(request, factory, context, control, clock);
+                let second =
+                    self.run_attempt(request, factory, context, control, clock, hint_bank_source);
                 match second {
                     AttemptResult::Clean(result, accounting2) => {
                         provenance.worker_generation = accounting2.worker_generation;
@@ -317,6 +345,7 @@ impl<S: CrashBudgetStore> Supervisor<S> {
         context: &WorkerStartContext,
         control: &TerminalControl,
         clock: &dyn Clock,
+        hint_bank_source: &mut dyn HintBankSource,
     ) -> AttemptResult {
         // Spawn a fresh worker process. A spawn failure is a startup failure.
         let mut worker = match factory.spawn() {
@@ -352,6 +381,10 @@ impl<S: CrashBudgetStore> Supervisor<S> {
         // Attempt-local cumulative committed tokens; progress frames must
         // advance this (a non-advancing count is a protocol fault).
         let mut last_committed = 0u32;
+        // The source may retain a ready bank across a crash redispatch. Each
+        // worker attempt installs it once, while a ready source cannot create a
+        // concurrent mailbox or change a target step in flight.
+        let mut installed_bank_digest: Option<String> = None;
 
         loop {
             let stepped = match worker.step() {
@@ -443,6 +476,27 @@ impl<S: CrashBudgetStore> Supervisor<S> {
                                 );
                             }
                             let next_budget = self.production_n.min(remaining_request);
+                            // Exactly one non-blocking pickup occurs at each eligible
+                            // boundary. Installation is ordered after progress and
+                            // before continue on this same worker session.
+                            if let Some(bank) = hint_bank_source.poll() {
+                                let digest = bank.content_digest();
+                                if installed_bank_digest.as_deref() != Some(digest.as_str()) {
+                                    if worker
+                                        .install_hint_bank(&GenerateInstallHintBank {
+                                            generation_id: generation_id.clone(),
+                                            bank,
+                                        })
+                                        .is_err()
+                                    {
+                                        return AttemptResult::Chargeable(
+                                            FailureClassification::ProtocolFatal,
+                                            accounting,
+                                        );
+                                    }
+                                    installed_bank_digest = Some(digest);
+                                }
+                            }
                             if worker
                                 .send_continue(&GenerateContinue {
                                     generation_id: generation_id.clone(),
@@ -639,8 +693,9 @@ mod tests {
     use super::*;
     use crate::budget::{BudgetPolicy, BudgetRecord, BudgetStoreError, InMemoryBudgetStore};
     use crate::protocol::Sampling;
-    use crate::worker::ScriptedEvent;
-    use crate::worker::ScriptedWorkerFactory;
+    use crate::worker::{ScriptedEvent, ScriptedWorkerFactory, SidecarHintBankPickup};
+    use std::sync::mpsc::sync_channel;
+    use synapse_core::SidecarHintBank;
 
     fn context() -> WorkerStartContext {
         WorkerStartContext {
@@ -673,6 +728,78 @@ mod tests {
             CrashBudget::new(InMemoryBudgetStore::default(), BudgetPolicy::default()),
             16,
         )
+    }
+
+    fn hint_bank() -> SidecarHintBank {
+        SidecarHintBank {
+            views: vec![vec![7, 8, 9]],
+            schema_identity: "schema-v1".to_string(),
+            render_policy_digest: "layout-v1".to_string(),
+            built_at: 1,
+        }
+    }
+
+    #[test]
+    fn ready_bank_installs_after_progress_before_continue() {
+        let mut sup = supervisor();
+        let mut factory = ScriptedWorkerFactory::new(
+            vec![vec![
+                ScriptedEvent::Progress { committed: 16 },
+                ScriptedEvent::Final {
+                    finish: FinishReason::MaxTokens,
+                    ids: vec![7, 8, 9],
+                    constraint_complete: false,
+                },
+            ]],
+            context(),
+        );
+        let clock = ManualClock::new(0);
+        let mut pickup = SidecarHintBankPickup::ready(hint_bank());
+        let outcome = sup.run_generation_with_hint_bank(
+            &request(),
+            &mut factory,
+            &context(),
+            &TerminalControl::default(),
+            &clock,
+            &mut pickup,
+        );
+
+        assert!(outcome.result.is_ok());
+        let log = factory.log();
+        assert_eq!(log.boundary_commands, ["install_hint_bank", "continue"]);
+        assert_eq!(log.installed_bank_digests, [hint_bank().content_digest()]);
+    }
+
+    #[test]
+    fn pending_bank_source_does_not_install_or_delay_a_continue() {
+        let mut sup = supervisor();
+        let mut factory = ScriptedWorkerFactory::new(
+            vec![vec![
+                ScriptedEvent::Progress { committed: 16 },
+                ScriptedEvent::Final {
+                    finish: FinishReason::MaxTokens,
+                    ids: vec![7, 8, 9],
+                    constraint_complete: false,
+                },
+            ]],
+            context(),
+        );
+        let clock = ManualClock::new(0);
+        let (_sender, receiver) = sync_channel(1);
+        let mut pickup = SidecarHintBankPickup::pending(receiver);
+        let outcome = sup.run_generation_with_hint_bank(
+            &request(),
+            &mut factory,
+            &context(),
+            &TerminalControl::default(),
+            &clock,
+            &mut pickup,
+        );
+
+        assert!(outcome.result.is_ok());
+        let log = factory.log();
+        assert_eq!(log.boundary_commands, ["continue"]);
+        assert!(log.installed_bank_digests.is_empty());
     }
 
     #[test]

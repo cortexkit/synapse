@@ -41,6 +41,10 @@ pub mod owned_decode_grammar_scheduler;
 /// wires that directory into the crate as a module.
 #[path = "../owned-decode-routing/mod.rs"]
 pub mod owned_decode_routing;
+/// Runtime-owned sidecar normalization and bounded target-token hint banking.
+/// Sidecar completions never receive authority to commit target decode state.
+#[path = "../owned-decode-sidecar/mod.rs"]
+pub mod owned_decode_sidecar;
 #[allow(dead_code)]
 mod remote;
 mod rollback;
@@ -95,10 +99,10 @@ use synapse_core::{
     ModelCacheError, ModelCacheIngest, ModelCacheMeta, NormalizationMode, NumericDType,
     NumericProfile, NumericProfileId, PoolingStrategy, QueueClass, RerankEngine, RerankRequest,
     ResponseEnvelope, ResponseProvenance, RuntimeConfig, SanitizedTokenizer, SchedulerConfig,
-    StableError, SystemMachineProfileCollector, ThreadPolicyClass, TokenBatch, TokenizationError,
-    TokenizedBatch, TokenizerConfig, TruncationDisclosure, ValidatedArtifact, Vectors, WorkRequest,
-    WorkerPooling, CUDA_WORKER_ENGINE, MACHINE_PROFILE_HASH_REVISION, OWNED_CUDA_MINIMUM_DEVICE_CC,
-    OWNED_CUDA_MINIMUM_DRIVER_API, OWNED_CUDA_PTX_VIRTUAL_ARCH,
+    SidecarSpec, StableError, SystemMachineProfileCollector, ThreadPolicyClass, TokenBatch,
+    TokenizationError, TokenizedBatch, TokenizerConfig, TruncationDisclosure, ValidatedArtifact,
+    Vectors, WorkRequest, WorkerPooling, CUDA_WORKER_ENGINE, MACHINE_PROFILE_HASH_REVISION,
+    OWNED_CUDA_MINIMUM_DEVICE_CC, OWNED_CUDA_MINIMUM_DRIVER_API, OWNED_CUDA_PTX_VIRTUAL_ARCH,
 };
 use synapse_engine_ort::OrtEmbedEngine;
 use synapse_engine_owned::{
@@ -430,6 +434,10 @@ pub(crate) struct ModuleConfig {
     microllm_max_tokens: u32,
     #[serde(default)]
     grammar_enabled: bool,
+    /// Dormant semantic sidecar configuration. Launch still requires a compiled,
+    /// identity-matching `synapse-json-schema-v1` constraint.
+    #[serde(default)]
+    sidecar_spec: SidecarSpec,
     /// Free-text owned decode chain span. Grammar requests always use K=1
     /// because host-side token masking requires a per-token boundary; values
     /// above one change free-text execution shape only after certification
@@ -456,6 +464,7 @@ impl Default for ModuleConfig {
             alias_admin_enabled: false,
             microllm_max_tokens: default_microllm_max_tokens(),
             grammar_enabled: false,
+            sidecar_spec: SidecarSpec::default(),
             decode_chain_k: default_decode_chain_k(),
             cache_max_bytes: default_cache_max_bytes(),
             dev: DevConfig::default(),
@@ -722,6 +731,7 @@ struct RuntimeState {
     alias_admin_enabled: bool,
     microllm_max_tokens: u32,
     grammar_enabled: bool,
+    sidecar_spec: SidecarSpec,
     decode_chain_k: u32,
     cache_max_bytes: u64,
     scheduler: Arc<Mutex<InlineScheduler>>,
@@ -1477,6 +1487,11 @@ impl RuntimeState {
         let alias_admin_enabled = config.alias_admin_enabled || config.dev.alias_admin_enabled;
         let microllm_max_tokens = config.microllm_max_tokens;
         let grammar_enabled = config.grammar_enabled;
+        config
+            .sidecar_spec
+            .validate()
+            .map_err(|error| ModuleError::Config(error.to_string()))?;
+        let sidecar_spec = config.sidecar_spec;
         validate_decode_chain_k(config.decode_chain_k)?;
         let decode_chain_k = config.decode_chain_k;
         let cache_max_bytes = config.cache_max_bytes;
@@ -1511,6 +1526,7 @@ impl RuntimeState {
             alias_admin_enabled,
             microllm_max_tokens,
             grammar_enabled,
+            sidecar_spec,
             decode_chain_k,
             cache_max_bytes,
             scheduler,
@@ -5710,10 +5726,183 @@ fn worker_path_certification(evidence: &Value) -> bool {
         && matches!(battery, Some("20x64-token-exact" | "20x64-structural-band"))
 }
 
+fn sidecar_hint_bank_source(
+    state: Arc<ModuleState>,
+    target_prompt: &str,
+    grammar: Option<&str>,
+    target_tokenizer: &SanitizedTokenizer,
+    compiled: Option<&owned_decode_grammar_scheduler::grammar_compile::CompiledConstraint>,
+    worker_constraint: Option<&owned_decode_worker::protocol::TokenIdJsonConstraint>,
+    deadline_ms: u64,
+) -> Option<Box<dyn owned_decode_worker::worker::HintBankSource + Send>> {
+    let sidecar_spec = state.runtime.sidecar_spec.clone();
+    let compiled = compiled?;
+    let worker_constraint = worker_constraint?;
+    if !sidecar_spec.enabled
+        || sidecar_spec.strategy != synapse_core::SidecarStrategy::WholeObject
+        || compiled.constraint.canonical_schema_digest != worker_constraint.canonical_schema_digest
+    {
+        return None;
+    }
+    let grammar = grammar?.trim();
+    if grammar.is_empty() {
+        return None;
+    }
+    let schema = frozen_sidecar_object_schema(
+        compiled.automaton.schema(),
+        compiled.constraint.canonical_schema_digest.clone(),
+    );
+    let sidecar_prompt = format!(
+        "Return exactly one JSON object that satisfies this JSON Schema. Return no prose.\nSchema:\n{grammar}\n\nRequest:\n{target_prompt}"
+    );
+    let policy = owned_decode_sidecar::RenderPolicy::compact();
+    let render_policy_digest = policy.digest();
+    let schema_identity = compiled.constraint.canonical_schema_digest.clone();
+    let target_tokenizer = target_tokenizer.clone();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let _sidecar_job = tokio::spawn(async move {
+        let Ok(model) = ensure_model_loaded_for_control(
+            Arc::clone(&state),
+            &sidecar_spec.model_id,
+            Some(deadline_ms),
+        )
+        .await
+        else {
+            return;
+        };
+        if model.task != ModelTask::Generate {
+            return;
+        }
+        let Ok(tokenized) = model.tokenizer.tokenize_batch([sidecar_prompt.as_str()]) else {
+            return;
+        };
+        let Some(prompt) = tokenized.batch.items.first().cloned() else {
+            return;
+        };
+        let Ok(output) = execute_generate(
+            &state.runtime,
+            &model,
+            GenerateRequest {
+                prompt,
+                max_tokens: sidecar_spec.max_new_tokens,
+                grammar: None,
+            },
+            Some(tokio::time::Instant::now() + Duration::from_millis(deadline_ms)),
+        )
+        .await
+        else {
+            return;
+        };
+        // The frozen whole-object result contract has no scalar-root rendering
+        // variant. Such a valid grammar still launches the configured sidecar,
+        // but its completion cannot publish a bank until that contract grows a
+        // matching root representation.
+        let Some(schema) = schema else {
+            return;
+        };
+        let Ok(prepared) =
+            owned_decode_sidecar::prepare_whole_object(&schema, output.text.as_bytes(), &policy)
+        else {
+            return;
+        };
+        let Ok(bank) = owned_decode_sidecar::build_default_hint_bank(
+            &target_tokenizer,
+            schema_identity,
+            render_policy_digest,
+            &prepared,
+            owned_decode_sidecar::SidecarWorkBounds::default(),
+            now_ms(),
+        ) else {
+            return;
+        };
+        let _ = sender.try_send(bank);
+    });
+    Some(Box::new(
+        owned_decode_worker::worker::SidecarHintBankPickup::pending(receiver),
+    ))
+}
+
+fn frozen_sidecar_object_schema(
+    schema: &owned_decode_grammar_scheduler::grammar_schema::Schema,
+    schema_identity: String,
+) -> Option<owned_decode_sidecar::FrozenObjectSchema> {
+    let owned_decode_sidecar::FrozenSchema::Object { properties } =
+        frozen_sidecar_schema_node(schema, 0)?
+    else {
+        return None;
+    };
+    Some(owned_decode_sidecar::FrozenObjectSchema {
+        schema_identity,
+        properties,
+    })
+}
+
+fn frozen_sidecar_schema_node(
+    schema: &owned_decode_grammar_scheduler::grammar_schema::Schema,
+    index: usize,
+) -> Option<owned_decode_sidecar::FrozenSchema> {
+    use owned_decode_grammar_scheduler::grammar_schema::{NodeKind, SchemaType};
+    use owned_decode_sidecar::{FrozenProperty, FrozenScalarType};
+
+    let node = schema.node(index);
+    match (&node.ty, &node.kind) {
+        (
+            SchemaType::Object,
+            NodeKind::Object {
+                properties,
+                required,
+            },
+        ) => Some(owned_decode_sidecar::FrozenSchema::Object {
+            properties: properties
+                .iter()
+                .map(|(name, child)| {
+                    Some(FrozenProperty {
+                        name: name.clone(),
+                        required: required.contains(name),
+                        schema: frozen_sidecar_schema_node(schema, *child)?,
+                    })
+                })
+                .collect::<Option<Vec<_>>>()?,
+        }),
+        (SchemaType::Array, NodeKind::Array { items }) => {
+            Some(owned_decode_sidecar::FrozenSchema::Array {
+                items: Box::new(frozen_sidecar_schema_node(schema, *items)?),
+            })
+        }
+        (schema_type, NodeKind::Scalar { enumeration }) => {
+            let scalar_type = match schema_type {
+                SchemaType::String => FrozenScalarType::String,
+                SchemaType::Number => FrozenScalarType::Number,
+                SchemaType::Integer => FrozenScalarType::Integer,
+                SchemaType::Boolean => FrozenScalarType::Boolean,
+                SchemaType::Null => FrozenScalarType::Null,
+                SchemaType::Object | SchemaType::Array => return None,
+            };
+            let enumeration = match enumeration {
+                Some(values) => Some(
+                    values
+                        .iter()
+                        .map(|value| serde_json::from_str(&value.json_text()).ok())
+                        .collect::<Option<Vec<Value>>>()?,
+                ),
+                None => None,
+            };
+            Some(owned_decode_sidecar::FrozenSchema::Scalar {
+                scalar_type,
+                enumeration,
+            })
+        }
+        _ => None,
+    }
+}
+
 struct WireDecodeDispatch {
     owned: Option<Arc<Mutex<worker_host::SupervisedDecodeDispatch>>>,
     prompt: Vec<u32>,
     constraint: Option<owned_decode_worker::protocol::TokenIdJsonConstraint>,
+    /// Present only for an enabled request whose compiled constraint and
+    /// sidecar schema share the canonical identity.
+    sidecar_hint_bank_source: Option<Box<dyn owned_decode_worker::worker::HintBankSource + Send>>,
     deadline_ms: u64,
     llama: Option<Arc<EmbeddingModel>>,
     llama_output: Option<GenerateOutput>,
@@ -5739,6 +5928,14 @@ impl owned_decode_routing::DecodeDispatch for WireDecodeDispatch {
                 self.prompt.clone(),
                 self.constraint.clone(),
                 self.deadline_ms,
+            );
+            // Request-level routing installs the request-scoped source only
+            // after successful compilation and identity validation. Polling the
+            // source remains non-blocking while a sidecar job is pending.
+            dispatch.set_hint_bank_source(
+                self.sidecar_hint_bank_source
+                    .take()
+                    .unwrap_or_else(|| Box::new(owned_decode_worker::worker::NoHintBankSource)),
             );
             return owned_decode_routing::DecodeDispatch::dispatch(&mut *dispatch, command);
         }
@@ -6832,10 +7029,20 @@ async fn route_owned_decode_wire(
         Some(refusal) => environment.with_pre_dispatch_owned_refusal(refusal),
         None => environment,
     };
+    let sidecar_hint_bank_source = sidecar_hint_bank_source(
+        Arc::clone(&state),
+        &params.prompt,
+        params.grammar.as_deref(),
+        &tokenizer,
+        compiled_constraint.as_ref(),
+        worker_constraint.as_ref(),
+        deadline_ms,
+    );
     let dispatch = WireDecodeDispatch {
         owned,
         prompt,
         constraint: worker_constraint,
+        sidecar_hint_bank_source,
         deadline_ms,
         llama: llama_model.clone(),
         llama_output: None,
@@ -11764,6 +11971,33 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sidecar_config_is_default_off() {
+        assert!(!ModuleConfig::default().sidecar_spec.enabled);
+    }
+
+    #[test]
+    fn frozen_sidecar_schema_preserves_canonical_property_order() {
+        let schema = owned_decode_grammar_scheduler::grammar_schema::parse_schema(
+            r#"{"type":"object","properties":{"second":{"type":"integer"},"first":{"type":"string","enum":["ok"]}},"required":["first"],"additionalProperties":false}"#,
+            &owned_decode_grammar_scheduler::grammar_limits::GrammarLimits::default(),
+        )
+        .expect("schema parses");
+        let frozen = frozen_sidecar_object_schema(&schema, "schema-v1".to_string())
+            .expect("object schema is sidecar-renderable");
+        assert_eq!(frozen.schema_identity, "schema-v1");
+        assert_eq!(
+            frozen
+                .properties
+                .iter()
+                .map(|property| property.name.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+        assert!(frozen.properties[0].required);
+        assert!(!frozen.properties[1].required);
+    }
 
     #[test]
     fn catalog_identity_names_match_worker_hello_constants() {

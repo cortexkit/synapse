@@ -14,12 +14,14 @@
 
 use crate::error::DecodeError;
 use crate::protocol::{
-    FinalResponse, FinishReason, GenerateCancel, GenerateContinue, GenerateProgress, GenerateStart,
-    WorkerFrame,
+    FinalResponse, FinishReason, GenerateCancel, GenerateContinue, GenerateInstallHintBank,
+    GenerateProgress, GenerateStart, WorkerFrame,
 };
 use crate::validation::{validate_start, StartAuthorization, WorkerStartContext};
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::mpsc::{Receiver, TryRecvError};
+use synapse_core::SidecarHintBank;
 
 /// A shared log the scripted workers write to so fixtures can assert what the
 /// supervisor sent: continuation budgets (for remaining-budget truncation),
@@ -28,6 +30,9 @@ use std::rc::Rc;
 pub struct ScriptedLog {
     pub continue_budgets: Vec<u32>,
     pub continue_sequences: Vec<u32>,
+    /// Ordered boundary commands, used to prove installation precedes continue.
+    pub boundary_commands: Vec<String>,
+    pub installed_bank_digests: Vec<String>,
     pub cancels: u32,
     /// Forced worker kills (unacknowledged-cancellation escalation).
     pub kills: u32,
@@ -101,6 +106,16 @@ pub trait DecodeWorker {
     /// Drive the current quantum and return the frame the worker emits.
     fn step(&mut self) -> Result<SteppedFrame, WorkerFault>;
 
+    /// Install a complete sidecar bank after progress and before the next
+    /// continuation. The default makes this additive command safe for worker
+    /// implementations that intentionally ignore sidecar work.
+    fn install_hint_bank(
+        &mut self,
+        _installation: &GenerateInstallHintBank,
+    ) -> Result<(), WorkerFault> {
+        Ok(())
+    }
+
     /// Authorize the next quantum.
     fn send_continue(&mut self, cont: &GenerateContinue) -> Result<(), WorkerFault>;
 
@@ -111,6 +126,68 @@ pub trait DecodeWorker {
     /// cancellation the worker fails to acknowledge; resident state is
     /// destroyed with the process.
     fn kill(&mut self);
+}
+
+/// A bounded, non-blocking source of a request-scoped sidecar bank.
+///
+/// `poll` must only inspect in-memory readiness. It may not wait for sidecar
+/// work, allocate an unbounded buffer, or drive target decoding itself.
+pub trait HintBankSource {
+    fn poll(&mut self) -> Option<SidecarHintBank>;
+}
+
+/// The default source for the dormant feature.
+#[derive(Default)]
+pub struct NoHintBankSource;
+
+impl HintBankSource for NoHintBankSource {
+    fn poll(&mut self) -> Option<SidecarHintBank> {
+        None
+    }
+}
+
+/// A one-shot sidecar completion source backed by the module's bounded channel.
+///
+/// Once a bank arrives it remains available for a crash redispatch, but a pending
+/// channel is queried only with `try_recv`, so it cannot delay target progress.
+pub struct SidecarHintBankPickup {
+    receiver: Option<Receiver<SidecarHintBank>>,
+    ready: Option<SidecarHintBank>,
+}
+
+impl SidecarHintBankPickup {
+    #[must_use]
+    pub fn pending(receiver: Receiver<SidecarHintBank>) -> Self {
+        Self {
+            receiver: Some(receiver),
+            ready: None,
+        }
+    }
+
+    #[must_use]
+    pub fn ready(bank: SidecarHintBank) -> Self {
+        Self {
+            receiver: None,
+            ready: Some(bank),
+        }
+    }
+}
+
+impl HintBankSource for SidecarHintBankPickup {
+    fn poll(&mut self) -> Option<SidecarHintBank> {
+        if self.ready.is_none() {
+            let receiver = self.receiver.as_ref()?;
+            match receiver.try_recv() {
+                Ok(bank) => {
+                    self.ready = Some(bank);
+                    self.receiver = None;
+                }
+                Err(TryRecvError::Empty) => return None,
+                Err(TryRecvError::Disconnected) => self.receiver = None,
+            }
+        }
+        self.ready.clone()
+    }
 }
 
 /// Process supervision: spawn a fresh worker process for an attempt.
@@ -351,6 +428,20 @@ impl DecodeWorker for ScriptedWorker {
         }
     }
 
+    fn install_hint_bank(
+        &mut self,
+        installation: &GenerateInstallHintBank,
+    ) -> Result<(), WorkerFault> {
+        if installation.generation_id != self.generation_id {
+            return Err(WorkerFault::Crash);
+        }
+        let mut log = self.log.borrow_mut();
+        log.boundary_commands.push("install_hint_bank".to_string());
+        log.installed_bank_digests
+            .push(installation.bank.content_digest());
+        Ok(())
+    }
+
     fn send_continue(&mut self, cont: &GenerateContinue) -> Result<(), WorkerFault> {
         // A continuation whose expected sequence does not match the worker's next
         // sequence is a protocol violation; the scripted worker treats it as a
@@ -362,6 +453,7 @@ impl DecodeWorker for ScriptedWorker {
             return Err(WorkerFault::Crash);
         }
         let mut log = self.log.borrow_mut();
+        log.boundary_commands.push("continue".to_string());
         log.continue_budgets.push(cont.next_token_budget);
         log.continue_sequences.push(cont.next_expected_sequence);
         Ok(())

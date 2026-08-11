@@ -26,6 +26,7 @@
 //! `stop_token` finish) but not production logits.
 
 use serde::{Deserialize, Serialize};
+use synapse_core::SidecarHintBank;
 
 use crate::error::DecodeError;
 use crate::identity::{CONSTRAINT_ENCODING_ID, WORKER_PROTOCOL_ID};
@@ -349,6 +350,31 @@ pub struct GenerateContinue {
     pub next_token_budget: u32,
 }
 
+/// A request-scoped sidecar bank installed only at a progress boundary.
+///
+/// The bank is sent after a worker emits [`GenerateProgress`] and before the
+/// host authorizes the next quantum. It is never a second worker mailbox: a
+/// request either installs the complete bounded bank synchronously at that
+/// boundary or leaves the resident generation unchanged. Repeating an identical
+/// installation is idempotent; a different bank or a foreign generation is a
+/// protocol mismatch.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GenerateInstallHintBank {
+    pub generation_id: String,
+    pub bank: SidecarHintBank,
+}
+
+/// Acknowledgment for a successful sidecar-bank installation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HintBankInstalled {
+    pub generation_id: String,
+    /// Stable bank identity returned so the host can detect an unexpected
+    /// worker-side installation without inspecting the bank a second time.
+    pub bank_content_digest: String,
+}
+
 /// Cancellation. The worker destroys resident state and acknowledges.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -440,6 +466,10 @@ pub enum DecodeTransportRequest {
         req_id: String,
         continuation: GenerateContinue,
     },
+    GenerateInstallHintBank {
+        req_id: String,
+        installation: GenerateInstallHintBank,
+    },
     GenerateCancel {
         req_id: String,
         cancellation: GenerateCancel,
@@ -458,6 +488,10 @@ pub enum DecodeTransportResponse {
         req_id: String,
         generation_id: String,
         committed_token_count: u32,
+    },
+    HintBankInstalled {
+        req_id: String,
+        installation: HintBankInstalled,
     },
 }
 
@@ -570,6 +604,31 @@ mod tests {
             "cancellation": { "generation_id": "g1" },
             "grammar": "raw schemas are forbidden"
         });
+        assert!(serde_json::from_value::<DecodeTransportRequest>(unknown).is_err());
+    }
+
+    #[test]
+    fn sidecar_bank_installation_round_trips_and_denies_unknown_fields() {
+        let request = DecodeTransportRequest::GenerateInstallHintBank {
+            req_id: "r1".to_string(),
+            installation: GenerateInstallHintBank {
+                generation_id: "g1".to_string(),
+                bank: SidecarHintBank {
+                    views: vec![vec![1, 2, 3]],
+                    schema_identity: "schema-v1".to_string(),
+                    render_policy_digest: "layout-v1".to_string(),
+                    built_at: 1,
+                },
+            },
+        };
+        let wire = serde_json::to_value(&request).expect("serialize installation");
+        assert_eq!(
+            serde_json::from_value::<DecodeTransportRequest>(wire.clone())
+                .expect("deserialize installation"),
+            request
+        );
+        let mut unknown = wire;
+        unknown["installation"]["bank"]["unknown"] = serde_json::json!(true);
         assert!(serde_json::from_value::<DecodeTransportRequest>(unknown).is_err());
     }
 

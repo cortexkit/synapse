@@ -5,7 +5,7 @@ use std::fmt::Display;
 use synapse_core::{SanitizedTokenizer, SidecarHintBank};
 use thiserror::Error;
 
-use crate::client::PreparedSidecarResult;
+use super::client::PreparedSidecarResult;
 
 /// The bounded suffix window fixed for sidecar pickup.
 pub const MAX_SUFFIX_MATCH_TOKENS: usize = 7;

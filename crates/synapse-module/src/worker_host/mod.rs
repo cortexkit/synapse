@@ -12,7 +12,7 @@ use owned_decode_worker::{
     identity::QuarantineKey,
     protocol::{
         DecodeTransportRequest, DecodeTransportResponse, FrameEnvelope, GenerateCancel,
-        GenerateContinue, GenerateStart,
+        GenerateContinue, GenerateInstallHintBank, GenerateStart, HintBankInstalled,
     },
     supervisor::{
         Clock as OwnedClock, GenerationRequest as OwnedGenerationRequest, Supervisor,
@@ -20,7 +20,8 @@ use owned_decode_worker::{
     },
     validation::{StartAuthorization, WorkerStartContext},
     worker::{
-        CancelAck, DecodeWorker, SteppedFrame, WorkerFactory, WorkerFault, WorkerStartFailure,
+        CancelAck, DecodeWorker, HintBankSource, NoHintBankSource, SteppedFrame, WorkerFactory,
+        WorkerFault, WorkerStartFailure,
     },
 };
 use serde::Serialize;
@@ -478,6 +479,47 @@ impl WorkerHost {
         }
     }
 
+    /// Install a ready, bounded sidecar bank while the worker is paused at a
+    /// progress boundary. This reuses the resident worker transport rather than
+    /// creating a second mailbox or worker session.
+    pub async fn owned_decode_install_hint_bank(
+        &mut self,
+        installation: GenerateInstallHintBank,
+    ) -> Result<HintBankInstalled, WorkerHostError> {
+        let req_id = self.next_req_id("generate_install_hint_bank");
+        match self
+            .send_owned_request(DecodeTransportRequest::GenerateInstallHintBank {
+                req_id: req_id.clone(),
+                installation,
+            })
+            .await?
+        {
+            DecodeTransportResponse::HintBankInstalled {
+                req_id: got,
+                installation,
+            } => {
+                ensure_req_id(&req_id, &got)?;
+                Ok(installation)
+            }
+            DecodeTransportResponse::Frame {
+                req_id: got,
+                envelope,
+            } => {
+                ensure_req_id(&req_id, &got)?;
+                Err(WorkerHostError::WorkerErr {
+                    code: match envelope.frame {
+                        owned_decode_worker::protocol::WorkerFrame::Error { id } => id,
+                        other => format!("unexpected_{other:?}"),
+                    },
+                    msg: "owned worker rejected sidecar hint bank".to_string(),
+                })
+            }
+            other => Err(WorkerHostError::Protocol(format!(
+                "GENERATE_INSTALL_HINT_BANK returned unexpected response {other:?}"
+            ))),
+        }
+    }
+
     pub async fn owned_decode_cancel(
         &mut self,
         cancellation: GenerateCancel,
@@ -511,6 +553,9 @@ impl WorkerHost {
                     msg: "owned worker rejected cancellation".to_string(),
                 })
             }
+            other => Err(WorkerHostError::Protocol(format!(
+                "GENERATE_CANCEL returned unexpected response {other:?}"
+            ))),
         }
     }
 
@@ -974,6 +1019,15 @@ impl WorkerEngine {
             .block_on(host.owned_decode_continue(continuation))
     }
 
+    fn owned_decode_install_hint_bank(
+        &self,
+        installation: GenerateInstallHintBank,
+    ) -> Result<HintBankInstalled, WorkerHostError> {
+        let mut host = self.lock_host()?;
+        self.runtime()
+            .block_on(host.owned_decode_install_hint_bank(installation))
+    }
+
     fn owned_decode_cancel(&self, cancellation: GenerateCancel) -> Result<u32, WorkerHostError> {
         let mut host = self.lock_host()?;
         self.runtime()
@@ -1211,6 +1265,7 @@ pub struct SupervisedDecodeDispatch {
     context: WorkerStartContext,
     control: TerminalControl,
     clock: MonotonicDispatchClock,
+    hint_bank_source: Box<dyn HintBankSource + Send>,
 }
 
 impl SupervisedDecodeDispatch {
@@ -1239,6 +1294,7 @@ impl SupervisedDecodeDispatch {
             clock: MonotonicDispatchClock {
                 started: Instant::now(),
             },
+            hint_bank_source: Box::new(NoHintBankSource),
         })
     }
 
@@ -1254,6 +1310,13 @@ impl SupervisedDecodeDispatch {
         self.start.constraint.clone_from(&constraint);
         self.context.expected_constraint = constraint;
         self.control.deadline_at = Some(self.clock.now().saturating_add(deadline_ms));
+        self.hint_bank_source = Box::new(NoHintBankSource);
+    }
+
+    /// Replace the request-local completion source without changing the worker
+    /// pool or its crash-budget authority.
+    pub fn set_hint_bank_source(&mut self, hint_bank_source: Box<dyn HintBankSource + Send>) {
+        self.hint_bank_source = hint_bank_source;
     }
 
     #[must_use]
@@ -1289,12 +1352,13 @@ impl crate::owned_decode_routing::DecodeDispatch for SupervisedDecodeDispatch {
             key: self.key.clone(),
             start: self.start.clone(),
         };
-        let outcome = self.supervisor.run_generation(
+        let outcome = self.supervisor.run_generation_with_hint_bank(
             &request,
             &mut self.factory,
             &self.context,
             &self.control,
             &self.clock,
+            &mut *self.hint_bank_source,
         );
         let success = outcome.result.map_err(map_decode_error)?;
         Ok(crate::owned_decode_routing::ExecutionSuccess {
@@ -1438,6 +1502,31 @@ impl DecodeWorker for OwnedDecodeWorkerSession {
             worker_generation: self.worker_generation,
             frame,
         })
+    }
+
+    fn install_hint_bank(
+        &mut self,
+        installation: &GenerateInstallHintBank,
+    ) -> Result<(), WorkerFault> {
+        let response = self
+            .engine
+            .as_ref()
+            .ok_or(WorkerFault::Crash)?
+            .owned_decode_install_hint_bank(installation.clone());
+        let installed = match response {
+            Ok(installed) => installed,
+            Err(error) => {
+                self.reusable = false;
+                return Err(owned_host_fault(&error));
+            }
+        };
+        if installed.generation_id != installation.generation_id
+            || installed.bank_content_digest != installation.bank.content_digest()
+        {
+            self.reusable = false;
+            return Err(WorkerFault::Crash);
+        }
+        Ok(())
     }
 
     fn send_continue(&mut self, continuation: &GenerateContinue) -> Result<(), WorkerFault> {

@@ -5094,6 +5094,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "synapse-core",
  "thiserror 1.0.69",
 ]
 

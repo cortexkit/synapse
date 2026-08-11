@@ -16,8 +16,8 @@ use owned_decode_worker::{
     identity::{CONSTRAINT_ENCODING_ID, WORKER_PROTOCOL_ID},
     protocol::{
         DecodeTransportRequest, DecodeTransportResponse, FinalResponse, FinishReason,
-        FrameEnvelope, GenerateContinue, GenerateProgress, GenerateStart, TokenIdJsonConstraint,
-        WorkerFrame,
+        FrameEnvelope, GenerateContinue, GenerateInstallHintBank, GenerateProgress, GenerateStart,
+        HintBankInstalled, TokenIdJsonConstraint, WorkerFrame,
     },
     validation::{validate_start, WorkerStartContext},
 };
@@ -30,7 +30,7 @@ use synapse_core::{
         WorkerHello, WorkerHelloAck, WorkerRequest, WorkerResponse, DEFAULT_MAX_FRAME_BYTES,
         WORKER_PROTOCOL_VERSION,
     },
-    EngineIdentity, Fingerprint,
+    EngineIdentity, Fingerprint, SidecarHintBank,
 };
 use synapse_engine_owned::{
     owned_decode_engine::{
@@ -47,6 +47,7 @@ use synapse_module::{
         load_automaton, GrammarSubsetManifest,
     },
     owned_decode_routing::identity::{ConstraintFingerprintInputs, ConstraintRuntimeIdentity},
+    owned_decode_sidecar::find_hint_continuation,
 };
 use tokenizers::Tokenizer;
 
@@ -199,6 +200,51 @@ impl DecodeEngine {
         }
     }
 
+    /// Verify a bounded proposal and return one full logits row after each
+    /// supplied token. Qwen executes the production batched primitive; LFM2
+    /// retains the same row alignment through its resident sequential step path.
+    fn verify_tokens_batch_logits(
+        &mut self,
+        cache: &mut DecodeCache,
+        tokens: &[u32],
+    ) -> Result<Vec<f32>> {
+        ensure!(
+            !tokens.is_empty() && tokens.len() <= PRODUCTION_N as usize,
+            "sidecar verification requires between one and {PRODUCTION_N} tokens"
+        );
+        match (self, cache) {
+            (Self::Qwen { decoder, .. }, DecodeCache::Qwen(cache)) => {
+                decoder.verify_tokens_batch_logits(cache, tokens)
+            }
+            (Self::Lfm2 { engine }, DecodeCache::Lfm2(cache)) => {
+                let mut rows = Vec::new();
+                for &token in tokens {
+                    rows.extend(engine.advance(cache, token)?);
+                }
+                Ok(rows)
+            }
+            _ => bail!("owned decode engine/cache family mismatch"),
+        }
+    }
+
+    fn rewind(&mut self, cache: &mut DecodeCache, position: usize) -> Result<()> {
+        match (self, cache) {
+            (Self::Qwen { decoder, .. }, DecodeCache::Qwen(cache)) => {
+                decoder.rewind(cache, position)
+            }
+            (Self::Lfm2 { engine }, DecodeCache::Lfm2(cache)) => engine.rewind(cache, position),
+            _ => bail!("owned decode engine/cache family mismatch"),
+        }
+    }
+
+    fn cache_position(&self, cache: &DecodeCache) -> Result<usize> {
+        match (self, cache) {
+            (Self::Qwen { .. }, DecodeCache::Qwen(cache)) => Ok(cache.position),
+            (Self::Lfm2 { .. }, DecodeCache::Lfm2(cache)) => Ok(cache.position),
+            _ => bail!("owned decode engine/cache family mismatch"),
+        }
+    }
+
     fn chain_span(&self) -> usize {
         match self {
             Self::Qwen { decoder, .. } => decoder.chain_span(),
@@ -266,6 +312,7 @@ struct LoadedRuntime {
     stop_ids: Vec<u32>,
     vocabulary: Arc<TokenVocabulary>,
     vocabulary_digest: String,
+    context_bucket: usize,
     engine: DecodeEngine,
 }
 
@@ -273,6 +320,7 @@ struct ActiveConstraint {
     automaton: Automaton,
     state: State,
     identity: String,
+    schema_identity: String,
 }
 
 struct ResidentGeneration {
@@ -287,6 +335,17 @@ struct ResidentGeneration {
     /// Committed constrained tokens whose KV updates are intentionally deferred
     /// until a non-singleton mask needs real logits.
     pending_ingest_ids: Vec<u32>,
+    /// Complete target-tokenized sidecar bank, installed only at a progress
+    /// boundary through the owned-decode transport.
+    sidecar_hint_bank: Option<SidecarHintBank>,
+    /// The worker accepts bank installation only while it is paused after a
+    /// progress frame and before the matching continue request.
+    awaiting_continue: bool,
+}
+
+struct HintVerification {
+    committed: usize,
+    terminal: Option<FinishReason>,
 }
 
 struct WorkerState {
@@ -423,6 +482,7 @@ impl WorkerState {
             stop_ids,
             vocabulary,
             vocabulary_digest,
+            context_bucket: bucket,
             engine,
         });
         Ok(WorkerResponse::Loaded {
@@ -496,6 +556,8 @@ impl WorkerState {
             next_greedy,
             constraint: active_constraint,
             pending_ingest_ids: Vec::new(),
+            sidecar_hint_bank: None,
+            awaiting_continue: false,
         });
         self.run_quantum(authorization.first_quantum_budget)
     }
@@ -523,7 +585,42 @@ impl WorkerState {
         {
             return Err(DecodeError::ProtocolMismatch);
         }
+        self.resident
+            .as_mut()
+            .ok_or(DecodeError::ProtocolMismatch)?
+            .awaiting_continue = false;
         self.run_quantum(continuation.next_token_budget)
+    }
+
+    fn install_hint_bank(
+        &mut self,
+        installation: GenerateInstallHintBank,
+    ) -> Result<HintBankInstalled, DecodeError> {
+        let resident = self
+            .resident
+            .as_mut()
+            .ok_or(DecodeError::ProtocolMismatch)?;
+        let loaded = self
+            .loaded
+            .as_ref()
+            .ok_or(DecodeError::RuntimeConfigMismatch)?;
+        if !resident.awaiting_continue || installation.generation_id != resident.generation_id {
+            return Err(DecodeError::ProtocolMismatch);
+        }
+        let constraint = resident
+            .constraint
+            .as_ref()
+            .ok_or(DecodeError::ProtocolMismatch)?;
+        if installation.bank.schema_identity != constraint_schema_identity(constraint)
+            || !hint_bank_is_bounded(&installation.bank, loaded.vocabulary.len())
+        {
+            return Err(DecodeError::ProtocolMismatch);
+        }
+        let digest = install_sidecar_bank(&mut resident.sidecar_hint_bank, installation.bank)?;
+        Ok(HintBankInstalled {
+            generation_id: resident.generation_id.clone(),
+            bank_content_digest: digest,
+        })
     }
 
     fn run_quantum(&mut self, token_budget: u32) -> Result<WorkerFrame, DecodeError> {
@@ -542,93 +639,158 @@ impl WorkerState {
     }
 
     fn run_single_quantum(&mut self, token_budget: u32) -> Result<WorkerFrame, DecodeError> {
-        for _ in 0..token_budget {
-            let loaded = self
-                .loaded
-                .as_mut()
-                .ok_or(DecodeError::RuntimeConfigMismatch)?;
+        let mut remaining_quantum = token_budget as usize;
+        while remaining_quantum > 0 {
+            // Grammar positions with one legal token advance without model logits
+            // before the worker considers any sidecar continuation.
+            let forced = {
+                let loaded = self
+                    .loaded
+                    .as_ref()
+                    .ok_or(DecodeError::RuntimeConfigMismatch)?;
+                let resident = self
+                    .resident
+                    .as_mut()
+                    .ok_or(DecodeError::ProtocolMismatch)?;
+                (self.forced_token_fast_path && resident.constraint.is_some())
+                    .then(|| {
+                        resident.constraint.as_ref().and_then(|constraint| {
+                            sole_survivor(&loaded.stop_ids, &*loaded.vocabulary, constraint)
+                        })
+                    })
+                    .flatten()
+            };
+
+            if forced.is_none() {
+                self.flush_pending_constrained_ingest()?;
+                if let Some(verification) =
+                    self.try_verify_sidecar_hint(remaining_quantum.min(PRODUCTION_N as usize))?
+                {
+                    if verification.committed == 0 || verification.committed > remaining_quantum {
+                        return Err(DecodeError::ProtocolMismatch);
+                    }
+                    remaining_quantum -= verification.committed;
+                    if let Some(reason) = verification.terminal {
+                        return Ok(self.finish(reason));
+                    }
+                    continue;
+                }
+            }
+
+            let defer_ingest = self.resident.as_ref().is_some_and(|resident| {
+                self.forced_token_fast_path && resident.constraint.is_some()
+            });
+            let token = match forced {
+                Some(token) => {
+                    // Held logits describe the prefix before the forced run and
+                    // cannot select the next target-evaluated position after the
+                    // parser commits this token.
+                    self.resident
+                        .as_mut()
+                        .ok_or(DecodeError::ProtocolMismatch)?
+                        .next_logits = None;
+                    token
+                }
+                None => {
+                    let loaded = self
+                        .loaded
+                        .as_ref()
+                        .ok_or(DecodeError::RuntimeConfigMismatch)?;
+                    let resident = self
+                        .resident
+                        .as_mut()
+                        .ok_or(DecodeError::ProtocolMismatch)?;
+                    if let Some(constraint) = resident.constraint.as_ref() {
+                        let logits = resident
+                            .next_logits
+                            .take()
+                            .ok_or(DecodeError::ProtocolMismatch)?;
+                        constrained_top1(
+                            &logits,
+                            &loaded.stop_ids,
+                            &*loaded.vocabulary,
+                            constraint,
+                        )?
+                    } else {
+                        resident
+                            .next_greedy
+                            .take()
+                            .ok_or(DecodeError::ProtocolMismatch)?
+                    }
+                }
+            };
+
+            let terminal = {
+                let loaded = self
+                    .loaded
+                    .as_ref()
+                    .ok_or(DecodeError::RuntimeConfigMismatch)?;
+                let resident = self
+                    .resident
+                    .as_mut()
+                    .ok_or(DecodeError::ProtocolMismatch)?;
+                if loaded.stop_ids.contains(&token) {
+                    if let Some(constraint) = resident.constraint.as_ref() {
+                        if constraint.automaton.has_complete_value(&constraint.state) {
+                            Some(FinishReason::GrammarComplete)
+                        } else {
+                            self.resident = None;
+                            return Err(DecodeError::GrammarStopBeforeCompletion);
+                        }
+                    } else {
+                        Some(FinishReason::StopToken)
+                    }
+                } else {
+                    if let Some(constraint) = resident.constraint.as_mut() {
+                        commit_constrained_token(constraint, &*loaded.vocabulary, token)?;
+                    }
+                    resident.generated_ids.push(token);
+                    if resident.constraint.as_ref().is_some_and(|constraint| {
+                        constraint.automaton.has_complete_value(&constraint.state)
+                    }) {
+                        Some(FinishReason::GrammarComplete)
+                    } else if resident.generated_ids.len() as u32 == resident.max_tokens {
+                        if resident.constraint.is_some() {
+                            self.resident = None;
+                            return Err(DecodeError::GrammarMaxTokensExhausted);
+                        }
+                        Some(FinishReason::MaxTokens)
+                    } else {
+                        None
+                    }
+                }
+            };
+            remaining_quantum -= 1;
+            if let Some(reason) = terminal {
+                return Ok(self.finish(reason));
+            }
+
+            if defer_ingest {
+                self.resident
+                    .as_mut()
+                    .ok_or(DecodeError::ProtocolMismatch)?
+                    .pending_ingest_ids
+                    .push(token);
+                continue;
+            }
+            let logits = {
+                let loaded = self
+                    .loaded
+                    .as_mut()
+                    .ok_or(DecodeError::RuntimeConfigMismatch)?;
+                let resident = self
+                    .resident
+                    .as_mut()
+                    .ok_or(DecodeError::ProtocolMismatch)?;
+                loaded
+                    .engine
+                    .advance(&mut resident.cache, token)
+                    .map_err(|_| DecodeError::Unavailable)?
+            };
             let resident = self
                 .resident
                 .as_mut()
                 .ok_or(DecodeError::ProtocolMismatch)?;
-
-            let defer_ingest = self.forced_token_fast_path && resident.constraint.is_some();
-            let token = if let Some(constraint) = resident.constraint.as_mut() {
-                let forced = defer_ingest
-                    .then(|| sole_survivor(&loaded.stop_ids, &*loaded.vocabulary, constraint))
-                    .flatten();
-                if let Some(token) = forced {
-                    // Any logits held here describe the prefix before the forced
-                    // run. They cannot be used after the parser commits a token.
-                    resident.next_logits = None;
-                    token
-                } else {
-                    if defer_ingest && !resident.pending_ingest_ids.is_empty() {
-                        let pending = std::mem::take(&mut resident.pending_ingest_ids);
-                        resident.next_logits = Some(
-                            loaded
-                                .engine
-                                .ingest_tokens_for_logits(&mut resident.cache, &pending)
-                                .map_err(|_| DecodeError::Unavailable)?,
-                        );
-                    }
-                    let logits = resident
-                        .next_logits
-                        .take()
-                        .ok_or(DecodeError::ProtocolMismatch)?;
-                    constrained_top1(&logits, &loaded.stop_ids, &*loaded.vocabulary, constraint)?
-                }
-            } else {
-                resident
-                    .next_greedy
-                    .take()
-                    .ok_or(DecodeError::ProtocolMismatch)?
-            };
-
-            if loaded.stop_ids.contains(&token) {
-                if let Some(constraint) = resident.constraint.as_ref() {
-                    if constraint.automaton.has_complete_value(&constraint.state) {
-                        return Ok(self.finish(FinishReason::GrammarComplete));
-                    }
-                    self.resident = None;
-                    return Err(DecodeError::GrammarStopBeforeCompletion);
-                }
-                return Ok(self.finish(FinishReason::StopToken));
-            }
-
-            if let Some(constraint) = resident.constraint.as_mut() {
-                let piece = loaded
-                    .vocabulary
-                    .token_piece(token)
-                    .ok_or(DecodeError::GrammarUnsatisfiable)?;
-                constraint.state = constraint
-                    .automaton
-                    .commit_token(&constraint.state, piece)
-                    .map_err(|_| DecodeError::GrammarUnsatisfiable)?;
-            }
-            resident.generated_ids.push(token);
-
-            if resident.constraint.as_ref().is_some_and(|constraint| {
-                constraint.automaton.has_complete_value(&constraint.state)
-            }) {
-                return Ok(self.finish(FinishReason::GrammarComplete));
-            }
-            if resident.generated_ids.len() as u32 == resident.max_tokens {
-                if resident.constraint.is_some() {
-                    self.resident = None;
-                    return Err(DecodeError::GrammarMaxTokensExhausted);
-                }
-                return Ok(self.finish(FinishReason::MaxTokens));
-            }
-
-            if defer_ingest {
-                resident.pending_ingest_ids.push(token);
-                continue;
-            }
-            let logits = loaded
-                .engine
-                .advance(&mut resident.cache, token)
-                .map_err(|_| DecodeError::Unavailable)?;
             if resident.constraint.is_some() {
                 resident.next_logits = Some(logits);
             } else {
@@ -641,10 +803,310 @@ impl WorkerState {
             .as_mut()
             .ok_or(DecodeError::ProtocolMismatch)?;
         resident.quantum_sequence = resident.quantum_sequence.saturating_add(1);
+        resident.awaiting_continue = true;
         Ok(WorkerFrame::Progress(GenerateProgress {
             generation_id: resident.generation_id.clone(),
             quantum_sequence: resident.quantum_sequence,
             committed_token_count: resident.generated_ids.len() as u32,
+        }))
+    }
+
+    fn flush_pending_constrained_ingest(&mut self) -> Result<(), DecodeError> {
+        let pending = self
+            .resident
+            .as_mut()
+            .ok_or(DecodeError::ProtocolMismatch)?
+            .pending_ingest_ids
+            .drain(..)
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let logits = {
+            let loaded = self
+                .loaded
+                .as_mut()
+                .ok_or(DecodeError::RuntimeConfigMismatch)?;
+            let resident = self
+                .resident
+                .as_mut()
+                .ok_or(DecodeError::ProtocolMismatch)?;
+            loaded
+                .engine
+                .ingest_tokens_for_logits(&mut resident.cache, &pending)
+                .map_err(|_| DecodeError::Unavailable)?
+        };
+        self.resident
+            .as_mut()
+            .ok_or(DecodeError::ProtocolMismatch)?
+            .next_logits = Some(logits);
+        Ok(())
+    }
+
+    /// Verify a selected bank continuation with the grammar state at every
+    /// proposed position. Position zero uses resident next logits; later positions
+    /// use verifier row `i - 1`. A mismatch rewinds the speculative cache and
+    /// replays the accepted prefix plus the target-selected legal token.
+    fn try_verify_sidecar_hint(
+        &mut self,
+        proposal_limit: usize,
+    ) -> Result<Option<HintVerification>, DecodeError> {
+        let continuation = {
+            let loaded = self
+                .loaded
+                .as_ref()
+                .ok_or(DecodeError::RuntimeConfigMismatch)?;
+            let resident = self
+                .resident
+                .as_ref()
+                .ok_or(DecodeError::ProtocolMismatch)?;
+            let Some(bank) = resident.sidecar_hint_bank.as_ref() else {
+                return Ok(None);
+            };
+            if resident.constraint.is_none() {
+                return Ok(None);
+            }
+            let cache_position = loaded
+                .engine
+                .cache_position(&resident.cache)
+                .map_err(|_| DecodeError::Unavailable)?;
+            find_hint_continuation(
+                bank,
+                &resident.generated_ids,
+                loaded.context_bucket.saturating_sub(cache_position),
+                resident
+                    .max_tokens
+                    .saturating_sub(resident.generated_ids.len() as u32) as usize,
+                proposal_limit,
+            )
+        };
+        let Some(continuation) = continuation else {
+            return Ok(None);
+        };
+
+        let (checkpoint_position, resident_logits, initial_state, vocabulary_len) = {
+            let loaded = self
+                .loaded
+                .as_ref()
+                .ok_or(DecodeError::RuntimeConfigMismatch)?;
+            let resident = self
+                .resident
+                .as_ref()
+                .ok_or(DecodeError::ProtocolMismatch)?;
+            let constraint = resident
+                .constraint
+                .as_ref()
+                .ok_or(DecodeError::ProtocolMismatch)?;
+            (
+                loaded
+                    .engine
+                    .cache_position(&resident.cache)
+                    .map_err(|_| DecodeError::Unavailable)?,
+                resident
+                    .next_logits
+                    .clone()
+                    .ok_or(DecodeError::ProtocolMismatch)?,
+                constraint.state.clone(),
+                loaded.vocabulary.len(),
+            )
+        };
+        let verifier_logits = {
+            let loaded = self
+                .loaded
+                .as_mut()
+                .ok_or(DecodeError::RuntimeConfigMismatch)?;
+            let resident = self
+                .resident
+                .as_mut()
+                .ok_or(DecodeError::ProtocolMismatch)?;
+            loaded
+                .engine
+                .verify_tokens_batch_logits(&mut resident.cache, &continuation.tokens)
+                .map_err(|_| DecodeError::Unavailable)?
+        };
+        if verifier_logits.len() != continuation.tokens.len() * vocabulary_len {
+            return Err(DecodeError::ProtocolMismatch);
+        }
+
+        let (accepted, mismatch, terminal, accepted_state) = {
+            let loaded = self
+                .loaded
+                .as_ref()
+                .ok_or(DecodeError::RuntimeConfigMismatch)?;
+            let resident = self
+                .resident
+                .as_ref()
+                .ok_or(DecodeError::ProtocolMismatch)?;
+            let constraint = resident
+                .constraint
+                .as_ref()
+                .ok_or(DecodeError::ProtocolMismatch)?;
+            let mut state = initial_state;
+            let mut accepted = 0usize;
+            let mut mismatch = None;
+            let mut terminal = None;
+            for (index, &proposed) in continuation.tokens.iter().enumerate() {
+                let row = if index == 0 {
+                    &resident_logits
+                } else {
+                    &verifier_logits[(index - 1) * vocabulary_len..index * vocabulary_len]
+                };
+                let expected = constrained_top1_at_state(
+                    row,
+                    &loaded.stop_ids,
+                    &*loaded.vocabulary,
+                    &constraint.automaton,
+                    &state,
+                )?;
+                if expected != proposed {
+                    mismatch = Some(expected);
+                    break;
+                }
+                if loaded.stop_ids.contains(&expected) {
+                    terminal = Some(if constraint.automaton.has_complete_value(&state) {
+                        FinishReason::GrammarComplete
+                    } else {
+                        return Err(DecodeError::GrammarStopBeforeCompletion);
+                    });
+                    break;
+                }
+                state = commit_constraint_state(
+                    &constraint.automaton,
+                    &*loaded.vocabulary,
+                    state,
+                    expected,
+                )?;
+                accepted += 1;
+                if constraint.automaton.has_complete_value(&state) {
+                    terminal = Some(FinishReason::GrammarComplete);
+                    break;
+                }
+            }
+            (accepted, mismatch, terminal, state)
+        };
+
+        let full_acceptance =
+            mismatch.is_none() && terminal.is_none() && accepted == continuation.tokens.len();
+        if full_acceptance {
+            let final_logits =
+                verifier_logits[(continuation.tokens.len() - 1) * vocabulary_len..].to_vec();
+            let resident = self
+                .resident
+                .as_mut()
+                .ok_or(DecodeError::ProtocolMismatch)?;
+            resident
+                .generated_ids
+                .extend_from_slice(&continuation.tokens);
+            resident
+                .constraint
+                .as_mut()
+                .ok_or(DecodeError::ProtocolMismatch)?
+                .state = accepted_state;
+            resident.next_logits = Some(final_logits);
+            let exhausted = resident.generated_ids.len() as u32 == resident.max_tokens;
+            if exhausted {
+                // A constrained generation that reaches its configured budget
+                // before completing is a typed terminal failure, not a resident
+                // generation waiting for another continuation.
+                self.resident = None;
+                return Err(DecodeError::GrammarMaxTokensExhausted);
+            }
+            return Ok(Some(HintVerification {
+                committed: continuation.tokens.len(),
+                terminal: None,
+            }));
+        }
+
+        // The batched primitive advanced through the entire proposal. Restore the
+        // pre-verification checkpoint and replay the same state reached by an
+        // ordinary constrained greedy decode.
+        let mismatch_is_stop = mismatch.is_some_and(|token| {
+            self.loaded
+                .as_ref()
+                .is_some_and(|loaded| loaded.stop_ids.contains(&token))
+        });
+        let replay =
+            verification_replay_tokens(&continuation.tokens, accepted, mismatch, mismatch_is_stop);
+        let mut next_logits = None;
+        {
+            let loaded = self
+                .loaded
+                .as_mut()
+                .ok_or(DecodeError::RuntimeConfigMismatch)?;
+            let resident = self
+                .resident
+                .as_mut()
+                .ok_or(DecodeError::ProtocolMismatch)?;
+            loaded
+                .engine
+                .rewind(&mut resident.cache, checkpoint_position)
+                .map_err(|_| DecodeError::Unavailable)?;
+            for token in &replay {
+                next_logits = Some(
+                    loaded
+                        .engine
+                        .advance(&mut resident.cache, *token)
+                        .map_err(|_| DecodeError::Unavailable)?,
+                );
+            }
+        }
+        let resident = self
+            .resident
+            .as_mut()
+            .ok_or(DecodeError::ProtocolMismatch)?;
+        resident
+            .generated_ids
+            .extend_from_slice(&continuation.tokens[..accepted]);
+        resident
+            .constraint
+            .as_mut()
+            .ok_or(DecodeError::ProtocolMismatch)?
+            .state = accepted_state;
+        if let Some(token) = mismatch {
+            let loaded = self
+                .loaded
+                .as_ref()
+                .ok_or(DecodeError::RuntimeConfigMismatch)?;
+            if mismatch_is_stop {
+                let reason = if resident.constraint.as_ref().is_some_and(|constraint| {
+                    constraint.automaton.has_complete_value(&constraint.state)
+                }) {
+                    FinishReason::GrammarComplete
+                } else {
+                    return Err(DecodeError::GrammarStopBeforeCompletion);
+                };
+                return Ok(Some(HintVerification {
+                    committed: accepted,
+                    terminal: Some(reason),
+                }));
+            }
+            let constraint = resident
+                .constraint
+                .as_mut()
+                .ok_or(DecodeError::ProtocolMismatch)?;
+            commit_constrained_token(constraint, &*loaded.vocabulary, token)?;
+            resident.generated_ids.push(token);
+        }
+        resident.next_logits = next_logits;
+        let committed = replay.len();
+        let terminal = terminal.or_else(|| {
+            resident
+                .constraint
+                .as_ref()
+                .is_some_and(|constraint| {
+                    constraint.automaton.has_complete_value(&constraint.state)
+                })
+                .then_some(FinishReason::GrammarComplete)
+        });
+        let exhausted =
+            terminal.is_none() && resident.generated_ids.len() as u32 == resident.max_tokens;
+        if exhausted {
+            self.resident = None;
+            return Err(DecodeError::GrammarMaxTokensExhausted);
+        }
+        Ok(Some(HintVerification {
+            committed,
+            terminal,
         }))
     }
 
@@ -726,6 +1188,7 @@ impl WorkerState {
                         .ok_or(DecodeError::ProtocolMismatch)?;
                     resident.next_greedy = Some(token);
                     resident.quantum_sequence = resident.quantum_sequence.saturating_add(1);
+                    resident.awaiting_continue = true;
                     return Ok(WorkerFrame::Progress(GenerateProgress {
                         generation_id: resident.generation_id.clone(),
                         quantum_sequence: resident.quantum_sequence,
@@ -937,6 +1400,19 @@ fn handle_decode_request(
             req_id,
             envelope: state.continue_generation(continuation),
         },
+        DecodeTransportRequest::GenerateInstallHintBank {
+            req_id,
+            installation,
+        } => match state.install_hint_bank(installation) {
+            Ok(installation) => DecodeTransportResponse::HintBankInstalled {
+                req_id,
+                installation,
+            },
+            Err(error) => DecodeTransportResponse::Frame {
+                req_id,
+                envelope: error_frame(error),
+            },
+        },
         DecodeTransportRequest::GenerateCancel {
             req_id,
             cancellation,
@@ -1053,6 +1529,7 @@ fn load_constraint(
         automaton,
         state,
         identity: constraint.constraint_runtime_identity.clone(),
+        schema_identity: constraint.canonical_schema_digest.clone(),
     })
 }
 
@@ -1077,14 +1554,56 @@ fn constrained_token_is_permitted<V: ConstraintVocabulary + ?Sized>(
     vocabulary: &V,
     constraint: &ActiveConstraint,
 ) -> bool {
+    constrained_token_is_permitted_at_state(
+        token_id,
+        stop_ids,
+        vocabulary,
+        &constraint.automaton,
+        &constraint.state,
+    )
+}
+
+fn constrained_token_is_permitted_at_state<V: ConstraintVocabulary + ?Sized>(
+    token_id: u32,
+    stop_ids: &[u32],
+    vocabulary: &V,
+    automaton: &Automaton,
+    state: &State,
+) -> bool {
     if stop_ids.contains(&token_id) {
-        return constraint.automaton.has_complete_value(&constraint.state);
+        return automaton.has_complete_value(state);
     }
-    vocabulary.token_piece(token_id).is_some_and(|piece| {
-        constraint
-            .automaton
-            .token_is_decode_permitted(&constraint.state, piece)
-    })
+    vocabulary
+        .token_piece(token_id)
+        .is_some_and(|piece| automaton.token_is_decode_permitted(state, piece))
+}
+
+fn commit_constraint_state<V: ConstraintVocabulary + ?Sized>(
+    automaton: &Automaton,
+    vocabulary: &V,
+    state: State,
+    token: u32,
+) -> Result<State, DecodeError> {
+    let piece = vocabulary
+        .token_piece(token)
+        .ok_or(DecodeError::GrammarUnsatisfiable)?;
+    automaton
+        .commit_token(&state, piece)
+        .map_err(|_| DecodeError::GrammarUnsatisfiable)
+}
+
+fn commit_constrained_token<V: ConstraintVocabulary + ?Sized>(
+    constraint: &mut ActiveConstraint,
+    vocabulary: &V,
+    token: u32,
+) -> Result<(), DecodeError> {
+    constraint.state = commit_constraint_state(
+        &constraint.automaton,
+        vocabulary,
+        constraint.state.clone(),
+        token,
+    )?;
+    Ok(())
 }
 
 fn sole_survivor<V: ConstraintVocabulary + ?Sized>(
@@ -1104,16 +1623,79 @@ fn sole_survivor<V: ConstraintVocabulary + ?Sized>(
     survivor
 }
 
+fn constraint_schema_identity(constraint: &ActiveConstraint) -> &str {
+    &constraint.schema_identity
+}
+
+fn hint_bank_is_bounded(bank: &SidecarHintBank, vocabulary_len: usize) -> bool {
+    const MAX_VIEWS: usize = 2;
+    const MAX_TOKENS_PER_VIEW: usize = 4_096;
+
+    !bank.views.is_empty()
+        && bank.views.len() <= MAX_VIEWS
+        && bank.views.iter().all(|view| {
+            !view.is_empty()
+                && view.len() <= MAX_TOKENS_PER_VIEW
+                && view.iter().all(|&token| (token as usize) < vocabulary_len)
+        })
+}
+
+fn verification_replay_tokens(
+    proposal: &[u32],
+    accepted: usize,
+    mismatch: Option<u32>,
+    mismatch_is_stop: bool,
+) -> Vec<u32> {
+    let mut replay = proposal[..accepted].to_vec();
+    if let Some(token) = mismatch.filter(|_| !mismatch_is_stop) {
+        replay.push(token);
+    }
+    replay
+}
+
+fn install_sidecar_bank(
+    installed: &mut Option<SidecarHintBank>,
+    bank: SidecarHintBank,
+) -> Result<String, DecodeError> {
+    let digest = bank.content_digest();
+    match installed.as_ref() {
+        Some(existing) if existing.content_digest() == digest => Ok(digest),
+        Some(_) => Err(DecodeError::ProtocolMismatch),
+        None => {
+            *installed = Some(bank);
+            Ok(digest)
+        }
+    }
+}
+
 fn constrained_top1<V: ConstraintVocabulary + ?Sized>(
     logits: &[f32],
     stop_ids: &[u32],
     vocabulary: &V,
     constraint: &ActiveConstraint,
 ) -> Result<u32, DecodeError> {
+    constrained_top1_at_state(
+        logits,
+        stop_ids,
+        vocabulary,
+        &constraint.automaton,
+        &constraint.state,
+    )
+}
+
+fn constrained_top1_at_state<V: ConstraintVocabulary + ?Sized>(
+    logits: &[f32],
+    stop_ids: &[u32],
+    vocabulary: &V,
+    automaton: &Automaton,
+    state: &State,
+) -> Result<u32, DecodeError> {
     let mut selected: Option<(u32, f32)> = None;
     for (index, &logit) in logits.iter().enumerate() {
         let token_id = index as u32;
-        if !constrained_token_is_permitted(token_id, stop_ids, vocabulary, constraint) {
+        if !constrained_token_is_permitted_at_state(
+            token_id, stop_ids, vocabulary, automaton, state,
+        ) {
             continue;
         }
         if selected.is_none_or(|(current_id, current)| {
@@ -1332,9 +1914,10 @@ mod fast_path_tests {
     };
 
     use owned_decode_worker::protocol::{
-        GenerateContinue, GenerateStart, Sampling, TokenIdJsonConstraint, WorkerFrame,
+        GenerateContinue, GenerateInstallHintBank, GenerateStart, Sampling, TokenIdJsonConstraint,
+        WorkerFrame,
     };
-    use synapse_core::Fingerprint;
+    use synapse_core::{Fingerprint, SidecarHintBank};
     use synapse_module::owned_decode_grammar_scheduler::{
         compile_grammar, grammar_automaton::Automaton, grammar_limits::GrammarLimits,
         grammar_schema::parse_schema, CompileContext, GrammarSubsetManifest,
@@ -1342,8 +1925,10 @@ mod fast_path_tests {
     };
 
     use super::{
-        constrained_top1, effective_decode_chain_k, sha256_path, sole_survivor, ActiveConstraint,
-        ConstraintVocabulary, TokenVocabulary, Tokenizer, WorkerState, PRODUCTION_N,
+        commit_constraint_state, constrained_top1, constrained_top1_at_state,
+        effective_decode_chain_k, hint_bank_is_bounded, install_sidecar_bank, sha256_path,
+        sole_survivor, verification_replay_tokens, ActiveConstraint, ConstraintVocabulary,
+        DecodeError, TokenVocabulary, Tokenizer, WorkerState, PRODUCTION_N,
     };
 
     const STOP_ID: u32 = 128;
@@ -1402,6 +1987,7 @@ mod fast_path_tests {
             state: automaton.initial(),
             automaton,
             identity: "test-constraint".to_string(),
+            schema_identity: "test-schema".to_string(),
         };
         let scores = logits(vocabulary.len());
         let mut token_ids = Vec::new();
@@ -1510,6 +2096,7 @@ mod fast_path_tests {
             automaton,
             state,
             identity: "test-constraint".to_string(),
+            schema_identity: "test-schema".to_string(),
         };
         let vocabulary = ByteVocabulary::ascii();
         assert_eq!(
@@ -1674,6 +2261,7 @@ mod fast_path_tests {
             state: automaton.initial(),
             automaton,
             identity: "measurement-constraint".to_string(),
+            schema_identity: "measurement-schema".to_string(),
         };
         let mut forced = 0_usize;
         for &token in generated_ids {
@@ -1785,5 +2373,101 @@ mod fast_path_tests {
         assert_eq!(effective_decode_chain_k(1, false), 1);
         assert_eq!(effective_decode_chain_k(16, false), 16);
         assert_eq!(effective_decode_chain_k(16, true), 1);
+    }
+
+    fn test_hint_bank(views: Vec<Vec<u32>>) -> SidecarHintBank {
+        SidecarHintBank {
+            views,
+            schema_identity: "schema-v1".to_string(),
+            render_policy_digest: "layout-v1".to_string(),
+            built_at: 1,
+        }
+    }
+
+    #[test]
+    fn post_finish_bank_installation_is_rejected() {
+        let mut state = WorkerState::new(1, true);
+        assert_eq!(
+            state
+                .install_hint_bank(GenerateInstallHintBank {
+                    generation_id: "finished".to_string(),
+                    bank: test_hint_bank(vec![vec![1]]),
+                })
+                .unwrap_err(),
+            DecodeError::ProtocolMismatch
+        );
+    }
+
+    #[test]
+    fn grammar_masked_verification_aligns_resident_and_verifier_rows() {
+        let parsed =
+            parse_schema(r#"{"type":"null"}"#, &GrammarLimits::default()).expect("schema parses");
+        let automaton = Automaton::new(parsed);
+        let vocabulary = ByteVocabulary::ascii();
+        let mut state = automaton.initial();
+        let proposal = b"null";
+        let mut rows = proposal
+            .iter()
+            .map(|&expected| {
+                let mut logits = vec![-1_000.0; vocabulary.len()];
+                logits[expected as usize] = 1_000.0;
+                logits
+            })
+            .collect::<Vec<_>>();
+        let resident_next_logits = rows.remove(0);
+
+        for (position, &proposed) in proposal.iter().enumerate() {
+            // Position zero uses the resident pre-proposal logits. Every later
+            // proposal uses the verifier row produced after its predecessor.
+            let logits = if position == 0 {
+                &resident_next_logits
+            } else {
+                &rows[position - 1]
+            };
+            let selected =
+                constrained_top1_at_state(logits, &[STOP_ID], &vocabulary, &automaton, &state)
+                    .expect("a masked greedy token exists");
+            assert_eq!(selected, u32::from(proposed));
+            state = commit_constraint_state(&automaton, &vocabulary, state, selected)
+                .expect("selected token commits");
+        }
+        assert!(automaton.has_complete_value(&state));
+    }
+
+    #[test]
+    fn mismatch_replay_keeps_the_accepted_prefix_and_b1_token() {
+        let proposal = [10, 11, 12, 13];
+        assert_eq!(
+            verification_replay_tokens(&proposal, 2, Some(99), false),
+            [10, 11, 99]
+        );
+        assert_eq!(
+            verification_replay_tokens(&proposal, 2, Some(STOP_ID), true),
+            [10, 11]
+        );
+    }
+
+    #[test]
+    fn hint_bank_installation_is_idempotent_and_rejects_conflicts() {
+        let bank = test_hint_bank(vec![vec![1, 2, 3]]);
+        let mut installed = None;
+        let digest = install_sidecar_bank(&mut installed, bank.clone()).expect("first install");
+        assert_eq!(
+            install_sidecar_bank(&mut installed, bank).expect("same bank is idempotent"),
+            digest
+        );
+        assert_eq!(
+            install_sidecar_bank(&mut installed, test_hint_bank(vec![vec![4, 5]])).unwrap_err(),
+            DecodeError::ProtocolMismatch
+        );
+    }
+
+    #[test]
+    fn hint_bank_identity_and_bounds_reject_untrusted_installation() {
+        let bank = test_hint_bank(vec![vec![1, 2, 3]]);
+        assert!(hint_bank_is_bounded(&bank, 4));
+        assert!(!hint_bank_is_bounded(&bank, 3));
+        assert!(!hint_bank_is_bounded(&test_hint_bank(vec![]), 4));
+        assert!(!hint_bank_is_bounded(&test_hint_bank(vec![vec![1]; 3]), 4));
     }
 }

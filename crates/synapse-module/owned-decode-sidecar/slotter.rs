@@ -5,8 +5,8 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::client::{parse_one_json_value, SidecarResultError};
-use crate::renderer::{FrozenObjectSchema, FrozenProperty, SchemaValidationError};
+use super::client::{parse_one_json_value, SidecarResultError};
+use super::renderer::{FrozenObjectSchema, FrozenProperty, SchemaValidationError};
 
 /// Versioned inputs captured when a per-field fallback plan is frozen. These
 /// values contribute to the plan digest.
