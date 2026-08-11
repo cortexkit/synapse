@@ -1,0 +1,21 @@
+[package]
+name = "owned-decode-sidecar-contracts"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "mod.rs"
+
+# This manifest lets the pure sidecar contracts and colocated tests compile
+# independently; the standalone crate avoids changes to synapse-module routing
+# and its crate root.
+[workspace]
+
+[dependencies]
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+synapse-core = { path = "../../synapse-core" }
+thiserror = "1"
