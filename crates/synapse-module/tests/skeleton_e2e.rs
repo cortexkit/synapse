@@ -3251,11 +3251,11 @@ async fn uncertified_owned_target_refuses_and_maps_grammar_over_the_wire() {
     .await;
     assert_eq!(refusal.header.ty, FrameType::Error);
     let body: Value = serde_json::from_slice(&refusal.body).unwrap();
-    // On macOS the owned lane exists but is uncertified; elsewhere the owned
-    // engine is platform-gated out entirely, so resolution attaches the
-    // truthful platform refusal before certification is ever consulted.
+    // On macOS the fresh fixture store has no approval row. Absence is an
+    // operator-disabled cutover state, so its refusal is cutover_disabled rather
+    // than owned_decode_not_certified; elsewhere platform resolution wins first.
     let expected_refusal = if cfg!(target_os = "macos") {
-        "owned_decode_not_certified"
+        "cutover_disabled"
     } else {
         "owned_decode_unsupported"
     };

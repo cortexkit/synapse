@@ -9,7 +9,7 @@
       "retired_id": "grammar_unavailable_in_build",
       "replacement_id": "grammar_disabled",
       "affected_consumers": ["microllm.oneshot"],
-      "notes": "grammar_unavailable_in_build is retired in favor of grammar_disabled; finish-reason normalization preserves lane_finish_reason as additive provenance. Changing either literal or the authoritative request-contract revision requires a new binding-manifest revision and reruns G-DEC-03, G-DEC-07, and G-DEC-12."
+      "notes": "grammar_unavailable_in_build is retired in favor of grammar_disabled; finish-reason normalization preserves lane_finish_reason as additive provenance. Approval absence or explicit disable emits the existing cutover_disabled ID, while missing or stale certification evidence and stale_probe boundary rechecks emit owned_decode_not_certified. Changing any literal or the authoritative request-contract revision requires a new binding-manifest revision and reruns G-DEC-03, G-DEC-07, and G-DEC-12."
     }
   ]
 }

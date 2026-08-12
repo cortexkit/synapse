@@ -52,7 +52,7 @@ use crate::owned_decode_routing::identity::{
 use crate::owned_decode_routing::lane::{
     effective_grammar_enabled, select_lane, AdmissionBoundaryReader, AdmissionBoundarySnapshot,
     FallbackReason, LaneKind, LaneOutcome, LaneSelectionContext, LlamaLane, OwnedEvaluation,
-    RoutingRefusal,
+    RoutingRefusal, ServingRefusal,
 };
 use crate::owned_decode_routing::provenance::{
     FinishReason, LaneProvenance, OwnedProvenanceInputs,
@@ -251,6 +251,10 @@ pub struct RoutingEnvironment {
     pub approval_grammar_enabled: bool,
     /// Whether the complete approval-backed serving predicate selected owned decode.
     serving_enabled: bool,
+    /// The refusal class returned by a false serving predicate.
+    serving_refusal: Option<ServingRefusal>,
+    /// Operator-provided detail retained for an explicitly disabled approval.
+    serving_refusal_message: Option<String>,
     /// Approval identity and epoch stamped by the fenced admission read.
     admission_boundary_snapshot: Option<AdmissionBoundarySnapshot>,
     /// Persisted reader used for the terminal pre-frame check.
@@ -283,6 +287,7 @@ impl std::fmt::Debug for RoutingEnvironment {
             .field("grammar_enabled", &self.grammar_enabled)
             .field("approval_grammar_enabled", &self.approval_grammar_enabled)
             .field("serving_enabled", &self.serving_enabled)
+            .field("serving_refusal", &self.serving_refusal)
             .field(
                 "admission_boundary_snapshot",
                 &self.admission_boundary_snapshot,
@@ -312,17 +317,20 @@ impl RoutingEnvironment {
         machine_profile_hash: impl Into<String>,
         grammar_enabled: bool,
         approval_grammar_enabled: bool,
-        serving: bool,
+        serving: Result<(), ServingRefusal>,
         quarantined: bool,
         llama: Option<LlamaLane>,
         equivalent_fingerprints: BTreeSet<Fingerprint>,
         constraint_runtime_identity: Option<String>,
     ) -> Self {
+        let serving_refusal = serving.err();
         Self {
             machine_profile_hash: machine_profile_hash.into(),
             grammar_enabled,
             approval_grammar_enabled,
-            serving_enabled: serving,
+            serving_enabled: serving_refusal.is_none(),
+            serving_refusal,
+            serving_refusal_message: None,
             admission_boundary_snapshot: None,
             admission_boundary_reader: None,
             quarantined,
@@ -333,6 +341,14 @@ impl RoutingEnvironment {
             resolution_owned_refusal: None,
             pre_dispatch_owned_refusal: None,
         }
+    }
+
+    /// Attach the exact operator-provided reason from a disabled approval row.
+    #[must_use]
+    pub fn with_serving_refusal_message(mut self, message: impl Into<String>) -> Self {
+        debug_assert_eq!(self.serving_refusal, Some(ServingRefusal::CutoverDisabled));
+        self.serving_refusal_message = Some(message.into());
+        self
     }
 
     /// Set the validated per-machine free-text chain span used by owned requests.
@@ -384,6 +400,12 @@ impl RoutingEnvironment {
         self.serving_enabled
     }
 
+    /// Operator-provided detail from a disabled approval row, if routing refuses.
+    #[must_use]
+    pub fn serving_refusal_message(&self) -> Option<&str> {
+        self.serving_refusal_message.as_deref()
+    }
+
     /// Set the approval-local grammar switch after the approval row has been
     /// loaded and validated from the fenced admission read.
     #[must_use]
@@ -431,6 +453,8 @@ impl RoutingEnvironment {
 pub struct RoutingFailure {
     pub error: RoutingRefusal,
     pub underlying_owned_decode_refusal_id: Option<OwnedDecodeError>,
+    /// Additive diagnostic detail that never changes the stable wire code.
+    pub message: Option<String>,
 }
 
 impl RoutingFailure {
@@ -442,6 +466,15 @@ impl RoutingFailure {
         Self {
             error: RoutingRefusal::Owned(error),
             underlying_owned_decode_refusal_id: None,
+            message: None,
+        }
+    }
+
+    fn owned_with_message(error: OwnedDecodeError, message: impl Into<String>) -> Self {
+        Self {
+            error: RoutingRefusal::Owned(error),
+            underlying_owned_decode_refusal_id: None,
+            message: Some(message.into()),
         }
     }
 }
@@ -497,7 +530,9 @@ impl OwnedDecodeRouter {
             return OwnedEvaluation::Refused(refusal);
         }
         if !env.serving_enabled {
-            return OwnedEvaluation::NotPreferred;
+            return OwnedEvaluation::NotPreferred(
+                env.serving_refusal.unwrap_or(ServingRefusal::NotCertified),
+            );
         }
         if env.quarantined {
             return OwnedEvaluation::Refused(OwnedDecodeError::Quarantined);
@@ -607,6 +642,7 @@ impl OwnedDecodeRouter {
                 RequestValidationError::InvalidRequest(_) => RoutingFailure {
                     error: RoutingRefusal::InvalidRequest,
                     underlying_owned_decode_refusal_id: None,
+                    message: None,
                 },
                 RequestValidationError::SamplingUnsupported => {
                     RoutingFailure::owned(OwnedDecodeError::SamplingUnsupported)
@@ -634,6 +670,12 @@ impl OwnedDecodeRouter {
                 error,
                 underlying_owned_decode_refusal_id,
             } => Err(RoutingFailure {
+                message: matches!(
+                    error,
+                    RoutingRefusal::Serving(ServingRefusal::CutoverDisabled)
+                )
+                .then(|| env.serving_refusal_message().map(str::to_owned))
+                .flatten(),
                 error,
                 underlying_owned_decode_refusal_id,
             }),
@@ -663,9 +705,14 @@ impl OwnedDecodeRouter {
                 // This is the last point before the first worker frame. The
                 // Approval and epoch are persisted state, so a disable,
                 // rollback, or profile rotation committed after resolution turns
-                // this request into the standard fail-closed refusal.
+                // this request into the standard fail-closed refusal. The
+                // stale_probe marker distinguishes this boundary race from an
+                // ordinary missing-certification refusal.
                 if !env.admission_boundary_is_current() {
-                    return Err(RoutingFailure::owned(OwnedDecodeError::NotCertified));
+                    return Err(RoutingFailure::owned_with_message(
+                        OwnedDecodeError::NotCertified,
+                        "stale_probe: persisted admission boundary no longer matches",
+                    ));
                 }
                 let command = DispatchedCommand {
                     lane: LaneKind::OwnedDecode,
@@ -706,7 +753,7 @@ impl OwnedDecodeRouter {
 fn fallback_reason_wire(reason: FallbackReason) -> &'static str {
     match reason {
         FallbackReason::OwnedRefusal(error) => error.as_str(),
-        FallbackReason::ServingDisabled => "cutover_disabled",
+        FallbackReason::ServingRefusal(refusal) => refusal.wire_id(),
     }
 }
 
@@ -813,7 +860,9 @@ mod tests {
             "profile-a",
             true,
             serving_enabled,
-            serving_enabled,
+            serving_enabled
+                .then_some(())
+                .ok_or(ServingRefusal::CutoverDisabled),
             false,
             llama,
             BTreeSet::new(),
@@ -1124,6 +1173,10 @@ mod tests {
             )
             .expect_err("activation after admission must refuse");
         assert_eq!(failure.wire_id(), "owned_decode_not_certified");
+        assert!(failure
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("stale_probe")));
         assert!(dispatched.borrow().is_empty());
     }
 
@@ -1194,6 +1247,10 @@ mod tests {
             .expect_err("approval mutation committed before dispatch must refuse");
         mutation_thread.join().unwrap();
         assert_eq!(failure.wire_id(), "owned_decode_not_certified");
+        assert!(failure
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("stale_probe")));
         assert!(dispatched.borrow().is_empty());
         drop(environment);
         drop(store);
@@ -1540,6 +1597,31 @@ mod tests {
             .expect_err("execution failure");
         assert_eq!(err.wire_id(), "owned_decode_unavailable");
         assert_eq!(*dispatched.borrow(), vec![LaneKind::OwnedDecode]);
+    }
+
+    #[test]
+    fn disabled_approval_refusal_preserves_the_operator_reason() {
+        let entry = catalog_entry(Family::Qwen3_0_6b, WeightQuant::F16);
+        let router = router_with_certified(certified_store(&entry), Q8IngestRegistry::new());
+        let environment = env(false, None)
+            .with_serving_refusal_message("approval disabled pending certification");
+        let dispatched = Rc::new(RefCell::new(Vec::new()));
+        let mut dispatch = RecordingDispatch::new_succeeding(dispatched.clone());
+        let failure = router
+            .route_oneshot(
+                &environment,
+                &entry,
+                &request(Family::Qwen3_0_6b, WeightQuant::F16),
+                "gen-disabled-approval",
+                &mut dispatch,
+            )
+            .expect_err("disabled approval must refuse without a fallback lane");
+        assert_eq!(failure.wire_id(), "cutover_disabled");
+        assert_eq!(
+            failure.message.as_deref(),
+            Some("approval disabled pending certification")
+        );
+        assert!(dispatched.borrow().is_empty());
     }
 
     #[test]
