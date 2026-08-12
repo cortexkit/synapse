@@ -661,6 +661,7 @@ impl GateRunner {
         // blocked, even with certification and every other input satisfied.
         let bindings = &self.manifests.wire_bindings;
         let inputs = ServingPredicateInputs {
+            approval_present: true,
             approval_enabled: true,
             approval_identity_matches: true,
             current_profile_matches: true,
@@ -679,7 +680,7 @@ impl GateRunner {
             scheduler_evidence_committed: scheduler_evidence_committed(scheduler_status),
         };
         if scheduler_evidence_committed(scheduler_status) {
-            if !serving_predicate(&inputs) {
+            if serving_predicate(&inputs).is_err() {
                 return (
                     GateStatus::Failed {
                         reason: "serving predicate must hold when every input is satisfied"
@@ -689,7 +690,7 @@ impl GateRunner {
                 );
             }
             evidence.push("serving predicate holds with committed scheduler evidence".to_string());
-        } else if serving_predicate(&inputs) {
+        } else if serving_predicate(&inputs).is_ok() {
             return (
                 GateStatus::Failed {
                     reason: "serving predicate must stay false while scheduler evidence is blocked"
@@ -890,7 +891,7 @@ impl GateRunner {
             profile,
             false,
             false,
-            true,
+            Ok(()),
             false,
             None,
             BTreeSet::new(),

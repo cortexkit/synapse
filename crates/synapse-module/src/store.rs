@@ -1056,6 +1056,52 @@ pub struct OwnedDecodeAdmission {
     pub profile_activation_epoch: u64,
 }
 
+/// The failed arm from a fenced owned-decode admission read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OwnedDecodeAdmissionRefusal {
+    /// No operator approval exists for the exact model/fingerprint identity.
+    ApprovalAbsent,
+    /// The operator explicitly disabled approval and supplied this reason.
+    ApprovalDisabled { disabled_reason: String },
+    /// Profile, identity, or certification evidence is missing or stale.
+    NotCertified,
+}
+
+/// The approval row and complete certification result from one fenced read.
+/// Keeping a refused approval row lets routing report an explicit disable without
+/// re-reading mutable state outside the admission fence.
+#[derive(Clone, Debug, PartialEq)]
+pub enum OwnedDecodeAdmissionEvaluation {
+    Admitted(Box<OwnedDecodeAdmission>),
+    Refused {
+        approval: Box<Option<ApprovalRow>>,
+        refusal: OwnedDecodeAdmissionRefusal,
+    },
+}
+
+impl OwnedDecodeAdmissionEvaluation {
+    pub fn admission(&self) -> Option<&OwnedDecodeAdmission> {
+        match self {
+            Self::Admitted(admission) => Some(admission.as_ref()),
+            Self::Refused { .. } => None,
+        }
+    }
+
+    pub fn approval(&self) -> Option<&ApprovalRow> {
+        match self {
+            Self::Admitted(admission) => Some(&admission.approval),
+            Self::Refused { approval, .. } => approval.as_ref().as_ref(),
+        }
+    }
+
+    pub fn refusal(&self) -> Option<&OwnedDecodeAdmissionRefusal> {
+        match self {
+            Self::Admitted(_) => None,
+            Self::Refused { refusal, .. } => Some(refusal),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProbeWriteOutcome {
@@ -2901,28 +2947,47 @@ impl SynapseStore {
     }
 
     /// Resolve the complete owned-decode match tuple in one fenced read. The
-    /// caller supplies runtime-derived identities, while this transaction reads
-    /// the approval, current profile epoch, and class-scoped certification row
-    /// without allowing a rotation to interleave with admission.
+    /// compatibility wrapper preserves the old admission-only API for health and
+    /// reporting callers that do not expose a refusal to a request caller.
     pub fn owned_decode_admission_matching(
         &self,
         inputs: &OwnedDecodeMatchInputs,
     ) -> Result<Option<OwnedDecodeAdmission>, SynapseStoreError> {
+        Ok(self
+            .owned_decode_admission_evaluation(inputs)?
+            .admission()
+            .cloned())
+    }
+
+    /// Resolve the complete owned-decode match tuple in one fenced read while
+    /// retaining the failed predicate arm for routing. Only a missing or disabled
+    /// approval is a cutover refusal; all later mismatches mean current evidence
+    /// cannot certify serving.
+    pub fn owned_decode_admission_evaluation(
+        &self,
+        inputs: &OwnedDecodeMatchInputs,
+    ) -> Result<OwnedDecodeAdmissionEvaluation, SynapseStoreError> {
         self.validate_persisted_migration_state()?;
         if inputs.profile_activation_epoch == 0
             || inputs.evidence_schema_revision != CERT_EVIDENCE_SCHEMA_REVISION
             || inputs.g_dec_manifest_revision != G_DEC_MANIFEST_REVISION
         {
-            return Ok(None);
+            return Ok(OwnedDecodeAdmissionEvaluation::Refused {
+                approval: Box::new(None),
+                refusal: OwnedDecodeAdmissionRefusal::NotCertified,
+            });
         }
         let mut expected_constraints = inputs.constraint_runtime_identities.clone();
         expected_constraints.sort();
         expected_constraints.dedup();
         if expected_constraints != inputs.constraint_runtime_identities {
-            return Ok(None);
+            return Ok(OwnedDecodeAdmissionEvaluation::Refused {
+                approval: Box::new(None),
+                refusal: OwnedDecodeAdmissionRefusal::NotCertified,
+            });
         }
         let identities_digest = constraint_runtime_identities_digest(&expected_constraints)?;
-        let admission = self.store.with_conn_fenced(|tx| {
+        Ok(self.store.with_conn_fenced(|tx| {
             let (persisted_hash, persisted_epoch): (Option<String>, Option<i64>) = tx.query_row(
                 "SELECT revisioned_machine_profile_hash, profile_activation_epoch
                  FROM profile_state WHERE id = 0",
@@ -2932,7 +2997,10 @@ impl SynapseStore {
             if persisted_hash.as_deref() != Some(inputs.revisioned_machine_profile_hash.as_str())
                 || persisted_epoch != Some(inputs.profile_activation_epoch as i64)
             {
-                return Ok(None);
+                return Ok(OwnedDecodeAdmissionEvaluation::Refused {
+                    approval: Box::new(None),
+                    refusal: OwnedDecodeAdmissionRefusal::NotCertified,
+                });
             }
             let catalog_matches: i64 = tx.query_row(
                 "SELECT COUNT(*) FROM models WHERE model_id = ?1",
@@ -2940,16 +3008,30 @@ impl SynapseStore {
                 |row| row.get(0),
             )?;
             if catalog_matches != 1 || !is_catalog_model_id(&inputs.model_id) {
-                return Ok(None);
+                return Ok(OwnedDecodeAdmissionEvaluation::Refused {
+                    approval: Box::new(None),
+                    refusal: OwnedDecodeAdmissionRefusal::NotCertified,
+                });
             }
             let Some(approval) =
                 load_approval_tx_by_identity(tx, &inputs.model_id, &inputs.decode_fingerprint)?
             else {
-                return Ok(None);
+                return Ok(OwnedDecodeAdmissionEvaluation::Refused {
+                    approval: Box::new(None),
+                    refusal: OwnedDecodeAdmissionRefusal::ApprovalAbsent,
+                });
             };
             validate_approval(&approval, true).map_err(to_sql_error)?;
             if !approval.enabled {
-                return Ok(None);
+                return Ok(OwnedDecodeAdmissionEvaluation::Refused {
+                    approval: Box::new(Some(approval.clone())),
+                    refusal: OwnedDecodeAdmissionRefusal::ApprovalDisabled {
+                        disabled_reason: approval
+                            .disabled_reason
+                            .clone()
+                            .expect("validated disabled approval has a reason"),
+                    },
+                });
             }
             let raw = tx
                 .query_row(
@@ -2959,10 +3041,10 @@ impl SynapseStore {
                            AND status = 'certified'
                            AND revisioned_machine_profile_hash = ?1
                            AND profile_activation_epoch = ?2
-                            AND model_id = ?3
-                            AND decode_fingerprint = ?4
-                            AND evidence_schema_revision = ?5
-                            AND constraint_runtime_identities_digest = ?6"
+                           AND model_id = ?3
+                           AND decode_fingerprint = ?4
+                           AND evidence_schema_revision = ?5
+                           AND constraint_runtime_identities_digest = ?6"
                     ),
                     params![
                         &inputs.revisioned_machine_profile_hash,
@@ -2975,7 +3057,12 @@ impl SynapseStore {
                     owned_decode_cert_row_from_row,
                 )
                 .optional()?;
-            let Some(raw) = raw else { return Ok(None) };
+            let Some(raw) = raw else {
+                return Ok(OwnedDecodeAdmissionEvaluation::Refused {
+                    approval: Box::new(Some(approval)),
+                    refusal: OwnedDecodeAdmissionRefusal::NotCertified,
+                });
+            };
             let certification = decode_owned_decode_cert_row(raw).map_err(to_sql_error)?;
             validate_owned_decode_cert_row(&certification).map_err(to_sql_error)?;
             if certification.revisioned_machine_profile_hash
@@ -2994,16 +3081,20 @@ impl SynapseStore {
                     &inputs.g_dec_manifest_revision,
                 )
             {
-                return Ok(None);
+                return Ok(OwnedDecodeAdmissionEvaluation::Refused {
+                    approval: Box::new(Some(approval)),
+                    refusal: OwnedDecodeAdmissionRefusal::NotCertified,
+                });
             }
-            Ok(Some(OwnedDecodeAdmission {
-                approval,
-                certification,
-                revisioned_machine_profile_hash: inputs.revisioned_machine_profile_hash.clone(),
-                profile_activation_epoch: inputs.profile_activation_epoch,
-            }))
-        })?;
-        Ok(admission)
+            Ok(OwnedDecodeAdmissionEvaluation::Admitted(Box::new(
+                OwnedDecodeAdmission {
+                    approval,
+                    certification,
+                    revisioned_machine_profile_hash: inputs.revisioned_machine_profile_hash.clone(),
+                    profile_activation_epoch: inputs.profile_activation_epoch,
+                },
+            )))
+        })?)
     }
 
     // Staged storage API consumed by the epic's runtime slice; remove this allow there.
@@ -7498,6 +7589,182 @@ mod tests {
             .unwrap();
         assert_eq!(approval_health.admission, "no_current_evidence");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn owned_decode_refusal_mapping_tracks_each_fenced_predicate_arm() {
+        use crate::owned_decode_routing::lane::{
+            serving_predicate, ServingPredicateInputs, ServingRefusal,
+        };
+
+        #[derive(Clone, Copy)]
+        enum FixtureArm {
+            ApprovalAbsent,
+            ApprovalDisabled,
+            CertificationMissing,
+            BoundaryMismatch,
+        }
+
+        let cases = [
+            (
+                "approval absent",
+                FixtureArm::ApprovalAbsent,
+                "cutover_disabled",
+            ),
+            (
+                "approval disabled",
+                FixtureArm::ApprovalDisabled,
+                "cutover_disabled",
+            ),
+            (
+                "certification missing",
+                FixtureArm::CertificationMissing,
+                "owned_decode_not_certified",
+            ),
+            (
+                "boundary mismatch",
+                FixtureArm::BoundaryMismatch,
+                "owned_decode_not_certified",
+            ),
+        ];
+        for (name, arm, expected_wire) in cases {
+            let (root, descriptor) = temp_descriptor(&format!("refusal-{name}"));
+            let store = SynapseStore::open(&descriptor).unwrap();
+            let model_id = "qwen3-0.6b-decode-f16";
+            let decode_fingerprint =
+                "8bcb6dfc1bd55a38a56b5a6931132f428687e064104d106c2cc5efb898f80feb";
+            store
+                .upsert_model(&owned_seed_model_config(model_id), 1)
+                .unwrap();
+            let profile = MachineProfile {
+                os_build: "test-os".to_string(),
+                arch: "aarch64".to_string(),
+                chip_model: "test-chip".to_string(),
+                ram_class: "test-ram".to_string(),
+                ane_subtype: None,
+                engine_identities: Vec::new(),
+            };
+            store.observe_profile(&profile, 1, 1).unwrap();
+            let inputs = OwnedDecodeMatchInputs {
+                revisioned_machine_profile_hash: profile.revisioned_hash(),
+                profile_activation_epoch: 1,
+                model_id: model_id.to_string(),
+                decode_fingerprint: decode_fingerprint.to_string(),
+                processing_fingerprint: "processing".to_string(),
+                runtime_config_digest: "runtime".to_string(),
+                constraint_runtime_identities: Vec::new(),
+                worker_path_evidence: serde_json::json!({}),
+                evidence_schema_revision: CERT_EVIDENCE_SCHEMA_REVISION.to_string(),
+                g_dec_manifest_revision: G_DEC_MANIFEST_REVISION.to_string(),
+            };
+            if !matches!(arm, FixtureArm::ApprovalAbsent) {
+                store
+                    .create_approval(model_id, decode_fingerprint, true, "operator", 1, 1)
+                    .unwrap();
+            }
+            if matches!(arm, FixtureArm::ApprovalDisabled) {
+                store
+                    .disable_approval(
+                        model_id,
+                        decode_fingerprint,
+                        "approval disabled pending certification",
+                        2,
+                    )
+                    .unwrap();
+            }
+            if matches!(arm, FixtureArm::BoundaryMismatch) {
+                store
+                    .store_owned_decode_cert_row(&OwnedDecodeCertificationRow {
+                        status: CertificationStatus::Certified,
+                        revisioned_machine_profile_hash: inputs
+                            .revisioned_machine_profile_hash
+                            .clone(),
+                        profile_activation_epoch: inputs.profile_activation_epoch,
+                        model_id: inputs.model_id.clone(),
+                        decode_fingerprint: inputs.decode_fingerprint.clone(),
+                        processing_fingerprint: inputs.processing_fingerprint.clone(),
+                        runtime_config_digest: inputs.runtime_config_digest.clone(),
+                        constraint_runtime_identities: Vec::new(),
+                        worker_path_evidence: inputs.worker_path_evidence.clone(),
+                        evidence_schema_revision: inputs.evidence_schema_revision.clone(),
+                        g_dec_manifest_revision: inputs.g_dec_manifest_revision.clone(),
+                        numeric_profile_id: None,
+                        fingerprint: Fingerprint(inputs.decode_fingerprint.clone()),
+                        certified_at_ms: 1,
+                        os_build: "test-os".to_string(),
+                        module_generation: 1,
+                        evidence: serde_json::json!({
+                            "g_dec": (1..=12)
+                                .map(|number| serde_json::json!({
+                                    "id": format!("G-DEC-{number:02}"),
+                                    "status": "passed",
+                                    "manifest_revision": G_DEC_MANIFEST_REVISION,
+                                }))
+                                .collect::<Vec<_>>(),
+                        }),
+                    })
+                    .unwrap();
+            }
+
+            let evaluation = store.owned_decode_admission_evaluation(&inputs).unwrap();
+            let refusal = if matches!(arm, FixtureArm::BoundaryMismatch) {
+                let admission = evaluation
+                    .admission()
+                    .expect("fixture evidence must admit before the boundary changes");
+                store
+                    .disable_approval(model_id, decode_fingerprint, "boundary mutation", 2)
+                    .unwrap();
+                assert!(
+                    !store
+                        .owned_decode_dispatch_admission_matches(
+                            admission.profile_activation_epoch,
+                            &admission.approval.model_id,
+                            &admission.approval.decode_fingerprint,
+                            &admission.approval.semantic_digest,
+                            admission.approval.generation,
+                        )
+                        .unwrap(),
+                    "{name} fixture must fail the dispatch boundary recheck"
+                );
+                ServingRefusal::NotCertified
+            } else {
+                if matches!(arm, FixtureArm::ApprovalDisabled) {
+                    assert_eq!(
+                        evaluation.refusal(),
+                        Some(&OwnedDecodeAdmissionRefusal::ApprovalDisabled {
+                            disabled_reason: "approval disabled pending certification".to_string(),
+                        })
+                    );
+                }
+                let approval = evaluation.approval();
+                let admitted = evaluation.admission().is_some();
+                serving_predicate(&ServingPredicateInputs {
+                    approval_present: approval.is_some(),
+                    approval_enabled: approval.is_some_and(|row| row.enabled),
+                    approval_identity_matches: approval.is_some_and(|row| {
+                        row.model_id == inputs.model_id
+                            && row.decode_fingerprint == inputs.decode_fingerprint
+                    }),
+                    current_profile_matches: admitted,
+                    current_epoch_valid: true,
+                    certification_matches: admitted,
+                    evidence_revisions_compatible: admitted,
+                    gates_complete: admitted,
+                    processing_fingerprint_matches: admitted,
+                    runtime_config_digest_matches: admitted,
+                    worker_path_matches: admitted,
+                    constrained_identities_match: admitted,
+                    artifacts_trusted: true,
+                    identities_installed: true,
+                    quarantined: false,
+                    wire_bindings_literal: true,
+                    scheduler_evidence_committed: true,
+                })
+                .expect_err("fixture must refuse")
+            };
+            assert_eq!(refusal.wire_id(), expected_wire, "{name}");
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 
     fn temp_descriptor(label: &str) -> (std::path::PathBuf, StorageDescriptor) {

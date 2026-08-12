@@ -70,10 +70,11 @@ use store::{
     CertificationKey, CertificationRow, CertificationStatus, CheckpointItem,
     ClassScopedCertificationRow, EvidenceRequirementsDivergence, JobAdmission, JobAttemptClaim,
     JobRecord, KnobAssignmentRow, ModelAssetLocator, ModelCatalogEntry,
-    OwnedDecodeCertificationRow, OwnedDecodeMatchInputs, PerfRow, ProbeWriteOutcome,
-    RecommendedBatch, StorageHealthInputs, StoredModelConfig, SynapseStore, SynapseStoreError,
-    CERT_EVIDENCE_SCHEMA_REVISION, JOB_STATE_DONE, JOB_STATE_FAILED_PERMANENT,
-    JOB_STATE_FAILED_TRANSIENT, JOB_STATE_PAUSED_NEEDS_REAUTH, JOB_STATE_QUEUED, JOB_STATE_RUNNING,
+    OwnedDecodeAdmissionEvaluation, OwnedDecodeAdmissionRefusal, OwnedDecodeCertificationRow,
+    OwnedDecodeMatchInputs, PerfRow, ProbeWriteOutcome, RecommendedBatch, StorageHealthInputs,
+    StoredModelConfig, SynapseStore, SynapseStoreError, CERT_EVIDENCE_SCHEMA_REVISION,
+    JOB_STATE_DONE, JOB_STATE_FAILED_PERMANENT, JOB_STATE_FAILED_TRANSIENT,
+    JOB_STATE_PAUSED_NEEDS_REAUTH, JOB_STATE_QUEUED, JOB_STATE_RUNNING,
 };
 use subc_client_rs::{
     async_trait, BindDecision, HandlerOutcome, HealthReport, ModuleHandler, RequestCtx,
@@ -6582,14 +6583,24 @@ fn owned_decode_environment(
         cancellation_error_id: "cancelled".to_string(),
         wire_changelog: Vec::new(),
     };
-    let admission = state
+    let admission_evaluation = state
         .store
-        .owned_decode_admission_matching(&match_inputs)
-        .ok()
-        .flatten();
-    let approval = admission.as_ref().map(|admission| &admission.approval);
+        .owned_decode_admission_evaluation(&match_inputs)
+        .unwrap_or(OwnedDecodeAdmissionEvaluation::Refused {
+            approval: Box::new(None),
+            refusal: OwnedDecodeAdmissionRefusal::NotCertified,
+        });
+    let admission = admission_evaluation.admission().cloned();
+    let approval = admission_evaluation.approval();
     let approval_grammar_enabled = approval.is_some_and(|approval| approval.grammar_enabled);
+    let disabled_reason = match admission_evaluation.refusal() {
+        Some(OwnedDecodeAdmissionRefusal::ApprovalDisabled { disabled_reason }) => {
+            Some(disabled_reason.clone())
+        }
+        _ => None,
+    };
     let serving_inputs = owned_decode_routing::lane::ServingPredicateInputs {
+        approval_present: approval.is_some(),
         approval_enabled: approval.is_some_and(|approval| approval.enabled),
         approval_identity_matches: approval.is_some_and(|approval| {
             approval.model_id == match_inputs.model_id
@@ -6625,6 +6636,9 @@ fn owned_decode_environment(
         equivalent_fingerprints,
         constraint_runtime_identity,
     );
+    if let Some(disabled_reason) = disabled_reason {
+        environment = environment.with_serving_refusal_message(disabled_reason);
+    }
     if let Some(admission) = admission {
         let boundary_reader: Arc<dyn owned_decode_routing::lane::AdmissionBoundaryReader> =
             state.store.clone();
@@ -7078,17 +7092,29 @@ async fn route_owned_decode_wire(
     let mut routed = match routed {
         Ok(response) => response,
         Err(failure) => {
+            let detail = failure.message.as_deref();
             return channel_error(
                 failure.wire_id(),
-                match failure.underlying_owned_decode_refusal_id {
-                    Some(underlying) => format!(
+                match (failure.underlying_owned_decode_refusal_id, detail) {
+                    (Some(underlying), Some(detail)) => format!(
+                        "owned-decode request refused: {} (underlying {}; {detail})",
+                        failure.wire_id(),
+                        underlying.as_str()
+                    ),
+                    (Some(underlying), None) => format!(
                         "owned-decode request refused: {} (underlying {})",
                         failure.wire_id(),
                         underlying.as_str()
                     ),
-                    None => format!("owned-decode request refused: {}", failure.wire_id()),
+                    (None, Some(detail)) => {
+                        format!(
+                            "owned-decode request refused: {} ({detail})",
+                            failure.wire_id()
+                        )
+                    }
+                    (None, None) => format!("owned-decode request refused: {}", failure.wire_id()),
                 },
-            )
+            );
         }
     };
     if let Some(compiled) = compiled_constraint.as_ref() {

@@ -35,14 +35,34 @@ pub enum LaneKind {
     Llama,
 }
 
+/// The caller-visible reason that the approval-backed serving predicate refused
+/// the owned lane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServingRefusal {
+    /// An approval row is absent or explicitly disabled. Absence is an
+    /// operator-disabled cutover state, not missing certification evidence.
+    CutoverDisabled,
+    /// An enabled approval lacks current, matching certification evidence.
+    NotCertified,
+}
+
+impl ServingRefusal {
+    /// The existing wire ID for this serving-predicate refusal.
+    pub const fn wire_id(self) -> &'static str {
+        match self {
+            Self::CutoverDisabled => "cutover_disabled",
+            Self::NotCertified => "owned_decode_not_certified",
+        }
+    }
+}
+
 /// Why a substitutable request landed on the llama lane.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FallbackReason {
     /// A pre-dispatch owned-lane refusal from the fallback-eligible six.
     OwnedRefusal(OwnedDecodeError),
-    /// The approval-backed serving predicate is false, so substitutable
-    /// unconstrained requests default to the configured llama lane.
-    ServingDisabled,
+    /// The approval-backed serving predicate refused the owned lane.
+    ServingRefusal(ServingRefusal),
 }
 
 /// A refusal that routing can emit. Either an owned-decode/grammar error, the
@@ -51,6 +71,8 @@ pub enum FallbackReason {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RoutingRefusal {
     Owned(OwnedDecodeError),
+    /// A false approval-backed serving predicate with its specific stable reason.
+    Serving(ServingRefusal),
     /// The existing fingerprint-mismatch error; not fallback-eligible.
     FingerprintMismatch,
     /// An invalid caller-supplied request boundary; not fallback-eligible.
@@ -62,6 +84,7 @@ impl RoutingRefusal {
     pub fn wire_id(&self) -> &'static str {
         match self {
             Self::Owned(error) => error.as_str(),
+            Self::Serving(refusal) => refusal.wire_id(),
             Self::FingerprintMismatch => "substitution_rejected",
             Self::InvalidRequest => "invalid_request",
         }
@@ -76,8 +99,8 @@ pub enum OwnedEvaluation {
     /// The owned lane refused with a specific pre-dispatch (or other) error.
     Refused(OwnedDecodeError),
     /// Owned serving is not enabled for this approval and current evidence;
-    /// owned is not the preferred lane.
-    NotPreferred,
+    /// the reason preserves the predicate arm for caller-visible refusal mapping.
+    NotPreferred(ServingRefusal),
 }
 
 /// A configured llama fallback lane with its own identities.
@@ -178,10 +201,9 @@ pub fn select_lane(ctx: &LaneSelectionContext<'_>) -> LaneOutcome {
                     underlying_owned_decode_refusal_id: None,
                 },
             },
-            // Cutover disabled means no certified owned lane; for a constrained
-            // request that is the fallback-eligible NotCertified refusal, mapped
-            // to grammar_disabled.
-            OwnedEvaluation::NotPreferred => LaneOutcome::Refused {
+            // Constrained requests remain owned-only and use the grammar contract;
+            // grammar_disabled retains its existing not-certified underlying ID.
+            OwnedEvaluation::NotPreferred(_) => LaneOutcome::Refused {
                 error: RoutingRefusal::Owned(OwnedDecodeError::GrammarDisabled),
                 underlying_owned_decode_refusal_id: Some(OwnedDecodeError::NotCertified),
             },
@@ -197,8 +219,8 @@ pub fn select_lane(ctx: &LaneSelectionContext<'_>) -> LaneOutcome {
                 error: RoutingRefusal::Owned(*error),
                 underlying_owned_decode_refusal_id: None,
             },
-            OwnedEvaluation::NotPreferred => LaneOutcome::Refused {
-                error: RoutingRefusal::Owned(OwnedDecodeError::NotCertified),
+            OwnedEvaluation::NotPreferred(refusal) => LaneOutcome::Refused {
+                error: RoutingRefusal::Serving(*refusal),
                 underlying_owned_decode_refusal_id: None,
             },
         };
@@ -207,12 +229,12 @@ pub fn select_lane(ctx: &LaneSelectionContext<'_>) -> LaneOutcome {
     // 6. Substitutable unconstrained requests.
     match &ctx.owned {
         OwnedEvaluation::Selectable => LaneOutcome::Owned,
-        OwnedEvaluation::NotPreferred => match &ctx.llama {
+        OwnedEvaluation::NotPreferred(refusal) => match &ctx.llama {
             Some(_) => LaneOutcome::Llama {
-                fallback_reason: FallbackReason::ServingDisabled,
+                fallback_reason: FallbackReason::ServingRefusal(*refusal),
             },
             None => LaneOutcome::Refused {
-                error: RoutingRefusal::Owned(OwnedDecodeError::NotCertified),
+                error: RoutingRefusal::Serving(*refusal),
                 underlying_owned_decode_refusal_id: None,
             },
         },
@@ -249,6 +271,8 @@ pub fn select_lane(ctx: &LaneSelectionContext<'_>) -> LaneOutcome {
 /// function prevents a caller from treating a partial match as admission.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ServingPredicateInputs {
+    /// Whether the fenced store read found an approval row for this exact identity.
+    pub approval_present: bool,
     pub approval_enabled: bool,
     pub approval_identity_matches: bool,
     pub current_profile_matches: bool,
@@ -267,11 +291,15 @@ pub struct ServingPredicateInputs {
     pub scheduler_evidence_committed: bool,
 }
 
-/// Evaluate the complete fail-closed owned-decode serving predicate.
-#[must_use]
-pub fn serving_predicate(inputs: &ServingPredicateInputs) -> bool {
-    inputs.approval_enabled
-        && inputs.approval_identity_matches
+/// Evaluate the complete fail-closed owned-decode serving predicate and retain
+/// the first caller-visible refusal class. Approval absence and explicit disable
+/// are a cutover decision; every subsequent failed arm is missing or stale
+/// evidence.
+pub fn serving_predicate(inputs: &ServingPredicateInputs) -> Result<(), ServingRefusal> {
+    if !inputs.approval_present || !inputs.approval_enabled {
+        return Err(ServingRefusal::CutoverDisabled);
+    }
+    if inputs.approval_identity_matches
         && inputs.current_profile_matches
         && inputs.current_epoch_valid
         && inputs.certification_matches
@@ -286,6 +314,11 @@ pub fn serving_predicate(inputs: &ServingPredicateInputs) -> bool {
         && !inputs.quarantined
         && inputs.wire_bindings_literal
         && inputs.scheduler_evidence_committed
+    {
+        Ok(())
+    } else {
+        Err(ServingRefusal::NotCertified)
+    }
 }
 
 /// Approval and profile identity stamped by the fenced admission read.
@@ -366,6 +399,7 @@ mod tests {
     #[test]
     fn serving_predicate_is_fail_closed_for_every_gate() {
         let mut inputs = ServingPredicateInputs {
+            approval_present: true,
             approval_enabled: true,
             approval_identity_matches: true,
             current_profile_matches: true,
@@ -383,15 +417,29 @@ mod tests {
             wire_bindings_literal: true,
             scheduler_evidence_committed: true,
         };
-        assert!(serving_predicate(&inputs));
+        assert_eq!(serving_predicate(&inputs), Ok(()));
+        inputs.approval_present = false;
+        assert_eq!(
+            serving_predicate(&inputs),
+            Err(ServingRefusal::CutoverDisabled)
+        );
+        inputs.approval_present = true;
+        inputs.approval_enabled = false;
+        assert_eq!(
+            serving_predicate(&inputs),
+            Err(ServingRefusal::CutoverDisabled)
+        );
+        inputs.approval_enabled = true;
         macro_rules! rejects_when_false {
             ($field:ident) => {
                 inputs.$field = false;
-                assert!(!serving_predicate(&inputs));
+                assert_eq!(
+                    serving_predicate(&inputs),
+                    Err(ServingRefusal::NotCertified)
+                );
                 inputs.$field = true;
             };
         }
-        rejects_when_false!(approval_enabled);
         rejects_when_false!(approval_identity_matches);
         rejects_when_false!(current_profile_matches);
         rejects_when_false!(current_epoch_valid);
@@ -407,7 +455,10 @@ mod tests {
         rejects_when_false!(wire_bindings_literal);
         rejects_when_false!(scheduler_evidence_committed);
         inputs.quarantined = true;
-        assert!(!serving_predicate(&inputs));
+        assert_eq!(
+            serving_predicate(&inputs),
+            Err(ServingRefusal::NotCertified)
+        );
     }
 
     #[test]
@@ -696,28 +747,40 @@ mod tests {
     }
 
     #[test]
-    fn serving_disabled_routes_substitutable_to_llama() {
+    fn serving_refusals_preserve_the_predicate_arm_with_and_without_llama() {
         let request = unconstrained_request();
-        let outcome = select_lane(&ctx(&request, OwnedEvaluation::NotPreferred, Some(llama())));
-        assert_eq!(
-            outcome,
-            LaneOutcome::Llama {
-                fallback_reason: FallbackReason::ServingDisabled
-            }
-        );
+        for (refusal, expected_wire) in [
+            (ServingRefusal::CutoverDisabled, "cutover_disabled"),
+            (ServingRefusal::NotCertified, "owned_decode_not_certified"),
+        ] {
+            let fallback = select_lane(&ctx(
+                &request,
+                OwnedEvaluation::NotPreferred(refusal),
+                Some(llama()),
+            ));
+            assert_eq!(
+                fallback,
+                LaneOutcome::Llama {
+                    fallback_reason: FallbackReason::ServingRefusal(refusal)
+                }
+            );
+
+            let refusal_outcome =
+                select_lane(&ctx(&request, OwnedEvaluation::NotPreferred(refusal), None));
+            assert_eq!(outcome_wire(&refusal_outcome), expected_wire);
+        }
     }
 
     #[test]
-    fn serving_disabled_without_llama_refuses_not_certified() {
+    fn disabled_approval_no_longer_collapses_to_not_certified() {
         let request = unconstrained_request();
-        let outcome = select_lane(&ctx(&request, OwnedEvaluation::NotPreferred, None));
-        assert_eq!(
-            outcome,
-            LaneOutcome::Refused {
-                error: RoutingRefusal::Owned(OwnedDecodeError::NotCertified),
-                underlying_owned_decode_refusal_id: None,
-            }
-        );
+        let outcome = select_lane(&ctx(
+            &request,
+            OwnedEvaluation::NotPreferred(ServingRefusal::CutoverDisabled),
+            None,
+        ));
+        assert_eq!(outcome_wire(&outcome), "cutover_disabled");
+        assert_ne!(outcome_wire(&outcome), "owned_decode_not_certified");
     }
 
     fn outcome_wire(outcome: &LaneOutcome) -> &'static str {
