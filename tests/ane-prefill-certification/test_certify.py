@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""Deterministic acceptance tests for the ANE-prefill hardware certification harness."""
+
+from __future__ import annotations
+
+import importlib.util
+import sys
+import unittest
+from pathlib import Path
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parents[2]
+MODULE_PATH = Path(__file__).with_name("certify.py")
+SPEC = importlib.util.spec_from_file_location("ane_prefill_certify", MODULE_PATH)
+assert SPEC is not None and SPEC.loader is not None
+certify = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = certify
+SPEC.loader.exec_module(certify)
+
+DIGEST = "a" * 64
+
+
+class FakeDriver:
+    """Models raw driver observations without recreating harness verdict logic."""
+
+    def __init__(self, corrupt_split_case_id: str | None = None) -> None:
+        self.corrupt_split_case_id = corrupt_split_case_id
+        self.requests: list[dict[str, Any]] = []
+
+    def exchange(self, request: dict[str, Any]) -> dict[str, Any]:
+        self.requests.append(request)
+        operation = request["operation"]
+        if operation == "metadata":
+            return {
+                "status": "ok",
+                "machine_profile": "test-m5-profile",
+                "source_checkpoint_digest": DIGEST,
+            }
+        if operation == "precondition":
+            arm = request["arm"]
+            if arm["bucket"] == 256 and arm["decode_config"] == "q8-step":
+                return {
+                    "status": "absent",
+                    "absence_reason": "capacity_precondition_unmet",
+                    "detail": "the test q8 cache has no W320 capacity",
+                }
+            return {
+                "status": "ready",
+                "artifact_triple": {
+                    "source_checkpoint_digest": DIGEST,
+                    "derived_or_compiled_artifact_digest": DIGEST,
+                    "certification_recorded_artifact_digest": DIGEST,
+                },
+            }
+        if operation == "generate":
+            prompt = request["prompt_token_ids"]
+            arm = request["arm"]
+            token_seed = sum(prompt) % 10_000
+            tokens = [token_seed + offset for offset in range(certify.CONTINUATION_TOKENS)]
+            if request["engine"] == "ane-split" and request["case_id"] == self.corrupt_split_case_id:
+                tokens[-1] += 1
+            response: dict[str, Any] = {
+                "status": "ok",
+                "generated_token_ids": tokens,
+                "padded_width": arm["bucket"],
+                "first_token_index": len(prompt) - 1,
+                "active_cache_positions": len(prompt),
+                "decode_cache_position": len(prompt),
+            }
+            if arm["decode_config"] == "q8-step":
+                response["cache_handoff"] = "engine_to_engine"
+            return response
+        if operation in {"routing_battery", "warmup"}:
+            response = {"status": "ok"}
+            if operation == "routing_battery":
+                response["executed_case_ids"] = request["case_ids"]
+            return response
+        if operation == "measure_ttft":
+            return {
+                "status": "ok",
+                "worker_ttft_ms": 10 if request["engine"] == "ane-split" else 60,
+                "wire_ttft_ms": 12 if request["engine"] == "ane-split" else 62,
+            }
+        if operation == "exercise":
+            kind = request["kind"]
+            case_id = request["case_id"]
+            if kind == "bypass":
+                return {
+                    "status": "ok",
+                    "observed": {
+                        "prefill_engine": "gpu",
+                        "prefill_bypass_reason": case_id,
+                        "prefill_fallback_reason": None,
+                        "split_attempt_started": False,
+                        "arm_health_debit": 0,
+                        "decode_lane_health_debit": 0,
+                    },
+                }
+            if kind == "fallback":
+                return {
+                    "status": "ok",
+                    "observed": {
+                        "prefill_engine": "gpu",
+                        "prefill_fallback_from": "ane-w128",
+                        "prefill_fallback_reason": certify.FALLBACK_FAULTS[case_id],
+                        "split_attempt_started": True,
+                        "arm_health_debit": 1,
+                        "decode_lane_health_debit": 0,
+                    },
+                }
+            if kind == "protocol":
+                return {
+                    "status": "ok",
+                    "observed": {
+                        "initial_exact_arm_health_debit": 1,
+                        "later_prefill_bypass_reason": "quarantined",
+                        "later_request_health_debit": 0,
+                    },
+                }
+            return {
+                "status": "ok",
+                "observed": certify.STATE_EXPECTATIONS[case_id],
+            }
+        if operation == "worst_case_fallback":
+            components = {
+                "artifact_warm": {"guard_ms": 10, "prediction_ms": 10, "handoff_ms": 20, "gpu_prefill_ms": 60},
+                "cold_ready_compile_failure": {"guard_ms": 10, "readiness_ms": 100, "gpu_prefill_ms": 60},
+                "cold_ready_load_failure": {"guard_ms": 10, "readiness_ms": 100, "gpu_prefill_ms": 60},
+            }[request["case_id"]]
+            return {
+                "status": "ok",
+                "consumed_components_ms": components,
+                "total_ttft_ms": sum(components.values()),
+            }
+        raise AssertionError(f"unhandled driver request: {request}")
+
+
+class BrokenLifecycleDriver(FakeDriver):
+    """Returns a plausible but unsafe lifecycle observation for the guard test."""
+
+    def exchange(self, request: dict[str, Any]) -> dict[str, Any]:
+        response = super().exchange(request)
+        if request["operation"] == "exercise" and request["kind"] == "state" and request["case_id"] == "postselection_load_triple_mismatch":
+            response["observed"] = dict(response["observed"])
+            response["observed"]["certification_row_preserved"] = False
+        return response
+
+
+class BrokenTimingDriver(FakeDriver):
+    """Omits one warm-path component to prove the timing completeness guard is live."""
+
+    def exchange(self, request: dict[str, Any]) -> dict[str, Any]:
+        response = super().exchange(request)
+        if request["operation"] == "worst_case_fallback" and request["case_id"] == "artifact_warm":
+            response["consumed_components_ms"] = dict(response["consumed_components_ms"])
+            del response["consumed_components_ms"]["handoff_ms"]
+        return response
+
+
+class CertificationHarnessTests(unittest.TestCase):
+    def test_fixture_material_is_digest_pinned(self) -> None:
+        certify.verify_fixture_digest()
+        cases = certify.fixture_cases()
+        self.assertEqual(len([case for case in cases if case["kind"] == "width_exact"]), 60)
+        self.assertEqual(len([case for case in cases if case["kind"] == "variable_length"]), 17)
+
+    def test_full_matrix_requires_w128_green_and_records_allowed_absence(self) -> None:
+        driver = FakeDriver()
+        result = certify.Certifier(ROOT, driver).run()
+        outcomes = {(row["arm"]["bucket"], row["arm"]["decode_config"]): row for row in result["attempts"]}
+        self.assertEqual(outcomes[(128, "f16-step")]["outcome"], "certified")
+        self.assertEqual(outcomes[(128, "q8-step")]["outcome"], "certified")
+        self.assertEqual(outcomes[(256, "q8-step")]["absence_reason"], "capacity_precondition_unmet")
+        self.assertEqual(result["maximum_worst_case_fallback_ttft_ms"], 170.0)
+        self.assertEqual(len(result["semantic_exercises"]), len(certify.BYPASS_REASONS) + len(certify.FALLBACK_FAULTS) + len(certify.LIFECYCLE_CASES) + len(certify.QUARANTINE_CASES) + len(certify.PIN_CASES) + 1)
+
+    def test_w128_token_divergence_cannot_be_recorded_absent(self) -> None:
+        driver = FakeDriver(corrupt_split_case_id="w128-width-00")
+        with self.assertRaisesRegex(certify.CertificationFailure, "diverged"):
+            certify.Certifier(ROOT, driver).run()
+
+    def test_every_requested_semantic_case_reaches_the_driver(self) -> None:
+        driver = FakeDriver()
+        certify.Certifier(ROOT, driver).run()
+        bypasses = {request["case_id"] for request in driver.requests if request["operation"] == "exercise" and request["kind"] == "bypass"}
+        fallbacks = {request["case_id"] for request in driver.requests if request["operation"] == "exercise" and request["kind"] == "fallback"}
+        self.assertEqual(bypasses, set(certify.BYPASS_REASONS))
+        self.assertEqual(fallbacks, set(certify.FALLBACK_FAULTS))
+
+    def test_lifecycle_guard_rejects_a_runtime_mutation_of_a_green_row(self) -> None:
+        with self.assertRaisesRegex(certify.CertificationFailure, "certification_row_preserved=True"):
+            certify.Certifier(ROOT, BrokenLifecycleDriver()).run()
+
+    def test_warm_fallback_requires_every_consumed_component(self) -> None:
+        with self.assertRaisesRegex(certify.CertificationFailure, "components do not cover"):
+            certify.Certifier(ROOT, BrokenTimingDriver()).run()
+
+
+if __name__ == "__main__":
+    unittest.main()
