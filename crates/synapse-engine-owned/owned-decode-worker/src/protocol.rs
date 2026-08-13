@@ -382,6 +382,49 @@ pub struct GenerateCancel {
     pub generation_id: String,
 }
 
+/// Per-request counts for checking proposed tokens against the grammar before
+/// accepting them.
+///
+/// The worker includes these counts in the final response so an offline
+/// measurement tool can determine how many proposed tokens were accepted or
+/// rejected without reconstructing that information from the final sequence.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HintVerificationStats {
+    pub proposed_tokens: u32,
+    pub verified_tokens: u32,
+    pub accepted_tokens: u32,
+    pub rejected_proposal_attempts: u32,
+    pub accepted_tokens_by_span: AcceptedTokensBySpan,
+    pub first_divergence_categories: FirstDivergenceCategories,
+}
+
+impl HintVerificationStats {
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.proposed_tokens == 0
+            && self.verified_tokens == 0
+            && self.accepted_tokens == 0
+            && self.rejected_proposal_attempts == 0
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcceptedTokensBySpan {
+    pub structural: u32,
+    pub value: u32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FirstDivergenceCategories {
+    pub semantic_value: u32,
+    pub json_structure: u32,
+    pub whitespace: u32,
+    pub tokenization_boundary: u32,
+}
+
 /// A successful final response. Contains complete generated IDs for the
 /// successful attempt and accounting, but no authoritative text.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -399,6 +442,8 @@ pub struct FinalResponse {
     #[serde(default)]
     pub constraint_complete: bool,
     pub last_completed_sequence: u32,
+    #[serde(default, skip_serializing_if = "HintVerificationStats::is_empty")]
+    pub hint_verification: HintVerificationStats,
 }
 
 /// A frame emitted by the worker over a transport session.

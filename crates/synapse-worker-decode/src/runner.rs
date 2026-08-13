@@ -15,9 +15,10 @@ use owned_decode_worker::{
     error::DecodeError,
     identity::{CONSTRAINT_ENCODING_ID, WORKER_PROTOCOL_ID},
     protocol::{
-        DecodeTransportRequest, DecodeTransportResponse, FinalResponse, FinishReason,
-        FrameEnvelope, GenerateContinue, GenerateInstallHintBank, GenerateProgress, GenerateStart,
-        HintBankInstalled, TokenIdJsonConstraint, WorkerFrame,
+        AcceptedTokensBySpan, DecodeTransportRequest, DecodeTransportResponse, FinalResponse,
+        FinishReason, FirstDivergenceCategories, FrameEnvelope, GenerateContinue,
+        GenerateInstallHintBank, GenerateProgress, GenerateStart, HintBankInstalled,
+        HintVerificationStats, TokenIdJsonConstraint, WorkerFrame,
     },
     validation::{validate_start, WorkerStartContext},
 };
@@ -30,7 +31,7 @@ use synapse_core::{
         WorkerHello, WorkerHelloAck, WorkerRequest, WorkerResponse, DEFAULT_MAX_FRAME_BYTES,
         WORKER_PROTOCOL_VERSION,
     },
-    EngineIdentity, Fingerprint, SidecarHintBank,
+    EngineIdentity, Fingerprint, SidecarHintBank, SpanClass,
 };
 use synapse_engine_owned::{
     owned_decode_engine::{
@@ -338,6 +339,7 @@ struct ResidentGeneration {
     /// Complete target-tokenized sidecar bank, installed only at a progress
     /// boundary through the owned-decode transport.
     sidecar_hint_bank: Option<SidecarHintBank>,
+    hint_verification: HintVerificationStats,
     /// The worker accepts bank installation only while it is paused after a
     /// progress frame and before the matching continue request.
     awaiting_continue: bool,
@@ -557,6 +559,7 @@ impl WorkerState {
             constraint: active_constraint,
             pending_ingest_ids: Vec::new(),
             sidecar_hint_bank: None,
+            hint_verification: HintVerificationStats::default(),
             awaiting_continue: false,
         });
         self.run_quantum(authorization.first_quantum_budget)
@@ -928,7 +931,7 @@ impl WorkerState {
             return Err(DecodeError::ProtocolMismatch);
         }
 
-        let (accepted, mismatch, terminal, accepted_state) = {
+        let (accepted, verified, mismatch, terminal, accepted_state, accepted_spans, divergence) = {
             let loaded = self
                 .loaded
                 .as_ref()
@@ -943,8 +946,11 @@ impl WorkerState {
                 .ok_or(DecodeError::ProtocolMismatch)?;
             let mut state = initial_state;
             let mut accepted = 0usize;
+            let mut verified = 0usize;
             let mut mismatch = None;
             let mut terminal = None;
+            let mut accepted_spans = AcceptedTokensBySpan::default();
+            let mut divergence = None;
             for (index, &proposed) in continuation.tokens.iter().enumerate() {
                 let row = if index == 0 {
                     &resident_logits
@@ -958,8 +964,16 @@ impl WorkerState {
                     &constraint.automaton,
                     &state,
                 )?;
+                verified += 1;
                 if expected != proposed {
                     mismatch = Some(expected);
+                    divergence = Some(classify_hint_divergence(
+                        &constraint.automaton,
+                        &state,
+                        &*loaded.vocabulary,
+                        proposed,
+                        expected,
+                    ));
                     break;
                 }
                 if loaded.stop_ids.contains(&expected) {
@@ -969,6 +983,11 @@ impl WorkerState {
                         return Err(DecodeError::GrammarStopBeforeCompletion);
                     });
                     break;
+                }
+                match token_span_class(&constraint.automaton, &state, &*loaded.vocabulary, expected)
+                {
+                    SpanClass::Structural => accepted_spans.structural += 1,
+                    SpanClass::Value => accepted_spans.value += 1,
                 }
                 state = commit_constraint_state(
                     &constraint.automaton,
@@ -982,8 +1001,48 @@ impl WorkerState {
                     break;
                 }
             }
-            (accepted, mismatch, terminal, state)
+            (
+                accepted,
+                verified,
+                mismatch,
+                terminal,
+                state,
+                accepted_spans,
+                divergence,
+            )
         };
+
+        {
+            let stats = &mut self
+                .resident
+                .as_mut()
+                .ok_or(DecodeError::ProtocolMismatch)?
+                .hint_verification;
+            stats.proposed_tokens = stats
+                .proposed_tokens
+                .saturating_add(continuation.tokens.len().try_into().unwrap_or(u32::MAX));
+            stats.verified_tokens = stats
+                .verified_tokens
+                .saturating_add(verified.try_into().unwrap_or(u32::MAX));
+            stats.accepted_tokens = stats
+                .accepted_tokens
+                .saturating_add(accepted.try_into().unwrap_or(u32::MAX));
+            stats.accepted_tokens_by_span.structural = stats
+                .accepted_tokens_by_span
+                .structural
+                .saturating_add(accepted_spans.structural);
+            stats.accepted_tokens_by_span.value = stats
+                .accepted_tokens_by_span
+                .value
+                .saturating_add(accepted_spans.value);
+            if mismatch.is_some() {
+                stats.rejected_proposal_attempts =
+                    stats.rejected_proposal_attempts.saturating_add(1);
+            }
+            if let Some(category) = divergence {
+                increment_divergence(&mut stats.first_divergence_categories, category);
+            }
+        }
 
         let full_acceptance =
             mismatch.is_none() && terminal.is_none() && accepted == continuation.tokens.len();
@@ -1231,6 +1290,7 @@ impl WorkerState {
                 constraint.automaton.has_complete_value(&constraint.state)
             }),
             last_completed_sequence: resident.quantum_sequence,
+            hint_verification: resident.hint_verification,
         })
     }
 
@@ -1285,7 +1345,10 @@ pub fn main() -> Result<()> {
             .unwrap_or_default();
         if matches!(
             ty,
-            "GENERATE_START" | "GENERATE_CONTINUE" | "GENERATE_CANCEL"
+            "GENERATE_START"
+                | "GENERATE_CONTINUE"
+                | "GENERATE_INSTALL_HINT_BANK"
+                | "GENERATE_CANCEL"
         ) {
             let request: DecodeTransportRequest =
                 serde_json::from_value(value).context("decode owned worker request")?;
@@ -1638,6 +1701,68 @@ fn hint_bank_is_bounded(bank: &SidecarHintBank, vocabulary_len: usize) -> bool {
                 && view.len() <= MAX_TOKENS_PER_VIEW
                 && view.iter().all(|&token| (token as usize) < vocabulary_len)
         })
+}
+
+#[derive(Clone, Copy)]
+enum HintDivergenceCategory {
+    SemanticValue,
+    JsonStructure,
+    Whitespace,
+    TokenizationBoundary,
+}
+
+fn token_span_class<V: ConstraintVocabulary + ?Sized>(
+    automaton: &Automaton,
+    state: &State,
+    vocabulary: &V,
+    token: u32,
+) -> SpanClass {
+    vocabulary
+        .token_piece(token)
+        .map_or(SpanClass::Structural, |piece| {
+            state.token_span_class(automaton, piece)
+        })
+}
+
+fn classify_hint_divergence<V: ConstraintVocabulary + ?Sized>(
+    automaton: &Automaton,
+    state: &State,
+    vocabulary: &V,
+    proposed: u32,
+    expected: u32,
+) -> HintDivergenceCategory {
+    let proposed_piece = vocabulary.token_piece(proposed).unwrap_or_default();
+    let expected_piece = vocabulary.token_piece(expected).unwrap_or_default();
+    if proposed_piece == expected_piece {
+        return HintDivergenceCategory::TokenizationBoundary;
+    }
+    let without_whitespace = |piece: &[u8]| {
+        piece
+            .iter()
+            .copied()
+            .filter(|byte| !matches!(byte, b' ' | b'\t' | b'\n' | b'\r'))
+            .collect::<Vec<_>>()
+    };
+    if without_whitespace(proposed_piece) == without_whitespace(expected_piece) {
+        return HintDivergenceCategory::Whitespace;
+    }
+    match token_span_class(automaton, state, vocabulary, expected) {
+        SpanClass::Structural => HintDivergenceCategory::JsonStructure,
+        SpanClass::Value => HintDivergenceCategory::SemanticValue,
+    }
+}
+
+fn increment_divergence(
+    categories: &mut FirstDivergenceCategories,
+    category: HintDivergenceCategory,
+) {
+    let count = match category {
+        HintDivergenceCategory::SemanticValue => &mut categories.semantic_value,
+        HintDivergenceCategory::JsonStructure => &mut categories.json_structure,
+        HintDivergenceCategory::Whitespace => &mut categories.whitespace,
+        HintDivergenceCategory::TokenizationBoundary => &mut categories.tokenization_boundary,
+    };
+    *count = count.saturating_add(1);
 }
 
 fn verification_replay_tokens(
