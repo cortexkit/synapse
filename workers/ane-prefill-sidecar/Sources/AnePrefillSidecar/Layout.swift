@@ -130,8 +130,8 @@ public struct PrefillPayload: Equatable, Sendable {
 }
 
 /// Copies logits from the active token (`activeTokens - 1`), not the padded tail.
-/// CoreML convolution exports commonly use `[1, vocab, window]`, while other
-/// exporters use `[1, window, vocab]`; unit axes may appear around either form.
+/// CoreML exports may retain a window axis or project only the graph's selected
+/// final position; unit axes may appear around either form.
 public func copyActiveLogits(
     _ tensor: StridedTensor,
     activeTokens: Int,
@@ -143,21 +143,25 @@ public func copyActiveLogits(
     }
     let sequenceAxes = tensor.shape.indices.filter { tensor.shape[$0] == window }
     let vocabularyAxes = tensor.shape.indices.filter { tensor.shape[$0] == vocabularySize }
-    guard sequenceAxes.count == 1, vocabularyAxes.count == 1,
-          let sequenceAxis = sequenceAxes.first, let vocabularyAxis = vocabularyAxes.first,
-          sequenceAxis != vocabularyAxis,
+    guard vocabularyAxes.count == 1, let vocabularyAxis = vocabularyAxes.first else {
+        throw SidecarError.invalid(
+            "logits shape \(tensor.shape) must contain exactly one vocabulary axis"
+        )
+    }
+    guard sequenceAxes.count <= 1,
+          sequenceAxes.first != vocabularyAxis,
           tensor.shape.indices.allSatisfy({ axis in
-              axis == sequenceAxis || axis == vocabularyAxis || tensor.shape[axis] == 1
+              axis == sequenceAxes.first || axis == vocabularyAxis || tensor.shape[axis] == 1
           })
     else {
-        throw SidecarError.invalid(
-            "logits shape \(tensor.shape) must contain exactly one window and vocabulary axis"
-        )
+        throw SidecarError.invalid("logits shape \(tensor.shape) has unsupported non-unit axes")
     }
 
     var result = [Float](repeating: 0, count: vocabularySize)
     var index = [Int](repeating: 0, count: tensor.shape.count)
-    index[sequenceAxis] = activeTokens - 1
+    if let sequenceAxis = sequenceAxes.first {
+        index[sequenceAxis] = activeTokens - 1
+    }
     for vocabularyIndex in 0 ..< vocabularySize {
         index[vocabularyAxis] = vocabularyIndex
         result[vocabularyIndex] = try tensor.floatValue(at: tensor.offset(index))

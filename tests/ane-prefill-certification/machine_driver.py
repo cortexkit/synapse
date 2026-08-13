@@ -26,6 +26,15 @@ from typing import Any
 
 MAX_FRAME = 64 * 1024 * 1024
 SOURCE_MODEL = "model.safetensors"
+JSON_OBJECT_GRAMMAR = json.dumps(
+    {
+        "type": "object",
+        "properties": {"result": {"type": "string"}},
+        "required": ["result"],
+        "additionalProperties": False,
+    },
+    separators=(",", ":"),
+)
 
 
 def sha256_path(path: Path) -> str:
@@ -93,6 +102,7 @@ class WorkerClient:
         self,
         worker: Path,
         sidecar: Path,
+        constraint_compiler: Path,
         checkpoint: Path,
         compiled: Path | None,
         bucket: int,
@@ -100,6 +110,9 @@ class WorkerClient:
         chain_k: int,
     ) -> None:
         self._tmp = tempfile.TemporaryDirectory(prefix="ane-prefill-cert-")
+        self._constraint_compiler = constraint_compiler
+        self._tokenizer = checkpoint / "tokenizer.json"
+        self._constraints: dict[str, dict[str, Any]] = {}
         socket_path = Path(self._tmp.name) / "worker.sock"
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         listener.bind(str(socket_path))
@@ -138,7 +151,7 @@ class WorkerClient:
             "artifact_path": str(model_path),
             "family": "qwen3-0.6b",
             "weight_quant": "f16" if decode_config == "f16-step" else "q8_0",
-            "context_bucket": "512",
+            "context_bucket": "1024" if bucket == 512 else "512",
             "production_n": "16",
             "decode_chain_k": str(chain_k),
             "tokenizer_path": str(checkpoint / "tokenizer.json"),
@@ -173,7 +186,9 @@ class WorkerClient:
             raise RuntimeError(f"decode worker load failed: {loaded!r}")
         self._model_ref = loaded["model_ref"]
 
-    def generate(self, prompt: list[int], max_tokens: int) -> tuple[list[int], float, str]:
+    def generate(
+        self, prompt: list[int], max_tokens: int, grammar: str | None = None
+    ) -> tuple[list[int], float, str]:
         generation_id = f"cert-generation-{time.time_ns()}"
         log_offset = self._worker_log_path.stat().st_size
         started = time.monotonic()
@@ -190,6 +205,11 @@ class WorkerClient:
                     "stop_ids": [],
                     "max_tokens": max_tokens,
                     "sampling": {"mode": "greedy_top1", "params": None},
+                    **(
+                        {"constraint": self.constraint(grammar)}
+                        if grammar is not None
+                        else {}
+                    ),
                 },
             }
         )
@@ -224,6 +244,27 @@ class WorkerClient:
                 }
             )
 
+    def constraint(self, grammar: str) -> dict[str, Any]:
+        schema = JSON_OBJECT_GRAMMAR if grammar == "json-object" else grammar
+        if schema not in self._constraints:
+            output = subprocess.check_output(
+                [
+                    str(self._constraint_compiler),
+                    "--tokenizer",
+                    str(self._tokenizer),
+                    "--decode-fingerprint",
+                    self._decode_fingerprint,
+                    "--grammar",
+                    schema,
+                ],
+                text=True,
+            )
+            value = json.loads(output)
+            if not isinstance(value, dict):
+                raise RuntimeError("constraint compiler did not return an object")
+            self._constraints[schema] = value
+        return self._constraints[schema]
+
     def _request(self, value: dict[str, Any]) -> dict[str, Any]:
         write_frame(self._stream, value)
         return read_frame(self._stream)
@@ -254,6 +295,7 @@ class Driver:
         self.checkpoint = args.checkpoint.resolve()
         self.worker = args.worker.resolve()
         self.sidecar = args.sidecar.resolve()
+        self.constraint_compiler = args.constraint_compiler.resolve()
         self.artifacts = args.artifacts.resolve()
         self.profile = machine_profile()
         self.source_digest = sha256_path(self.checkpoint / SOURCE_MODEL)
@@ -312,6 +354,7 @@ class Driver:
             self.clients[key] = WorkerClient(
                 self.worker,
                 self.sidecar,
+                self.constraint_compiler,
                 self.checkpoint,
                 compiled,
                 bucket,
@@ -321,15 +364,10 @@ class Driver:
         return self.clients[key]
 
     def generate(self, request: dict[str, Any]) -> dict[str, Any]:
-        if request.get("grammar") is not None:
-            return {
-                "status": "absent",
-                "absence_reason": "compile_or_load_failure",
-                "detail": "the worker socket does not expose the module grammar compiler required to construct a production constraint frame",
-            }
         tokens, _, _ = self.client(request).generate(
             [int(token) for token in request["prompt_token_ids"]],
             int(request["max_tokens"]),
+            request.get("grammar"),
         )
         prompt_length = len(request["prompt_token_ids"])
         response: dict[str, Any] = {
@@ -364,6 +402,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--artifacts", type=Path, default=root / "bench/spikes/ane-prefill-split/artifacts")
     parser.add_argument("--worker", type=Path, default=root / "target/release/ck-synapse-worker-decode")
+    parser.add_argument(
+        "--constraint-compiler",
+        type=Path,
+        default=root / "target/release/compile_constraint",
+    )
     parser.add_argument(
         "--sidecar",
         type=Path,

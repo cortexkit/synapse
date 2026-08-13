@@ -6774,6 +6774,7 @@ dependencies = [
  "anyhow",
  "clap",
  "hex",
+ "libc",
  "owned-decode-worker",
  "serde",
  "serde_json",

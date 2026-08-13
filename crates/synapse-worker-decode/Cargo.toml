@@ -22,6 +22,7 @@ sha2 = { workspace = true }
 synapse-core = { path = "../synapse-core" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
 synapse-engine-owned = { path = "../synapse-engine-owned" }
 synapse-module = { path = "../synapse-module" }
 tokenizers = { workspace = true }

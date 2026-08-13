@@ -46,7 +46,15 @@ def build_bucket(args: argparse.Namespace, bucket: int) -> dict[str, Any]:
     compile_report = args.artifacts / f"compile-w{bucket}.json"
     attempts: list[dict[str, Any]] = []
     environment = os.environ.copy()
-    environment["DEVELOPER_DIR"] = args.developer_dir
+    environment.update(
+        {
+            "DEVELOPER_DIR": args.developer_dir,
+            "MKL_NUM_THREADS": "1",
+            "OMP_NUM_THREADS": "1",
+            "TOKENIZERS_PARALLELISM": "false",
+            "VECLIB_MAXIMUM_THREADS": "1",
+        }
+    )
     for attempt in range(1, MAX_ATTEMPTS + 1):
         for path in (package, compiled, conversion_report, compile_report):
             if path.is_dir():

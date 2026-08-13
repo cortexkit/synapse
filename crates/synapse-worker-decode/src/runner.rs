@@ -3,7 +3,10 @@ use std::{
     fs,
     io::{self, Read},
     net::Shutdown,
-    os::unix::net::{UnixListener, UnixStream},
+    os::{
+        fd::AsRawFd,
+        unix::net::{UnixListener, UnixStream},
+    },
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
@@ -375,6 +378,94 @@ impl AnePrefillRuntime {
     }
 }
 
+fn read_frame_until(
+    stream: &mut UnixStream,
+    max_frame: u32,
+    deadline: Instant,
+) -> io::Result<Vec<u8>> {
+    stream.set_nonblocking(true)?;
+    let result = (|| {
+        let mut length_bytes = [0_u8; 4];
+        read_exact_until(stream, &mut length_bytes, deadline)?;
+        let length = u32::from_le_bytes(length_bytes);
+        if length > max_frame {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("frame length {length} exceeds max {max_frame}"),
+            ));
+        }
+        let mut frame = vec![0_u8; length as usize];
+        read_exact_until(stream, &mut frame, deadline)?;
+        Ok(frame)
+    })();
+    let restore = stream.set_nonblocking(false);
+    match (result, restore) {
+        (Ok(frame), Ok(())) => Ok(frame),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+fn read_exact_until(
+    stream: &mut UnixStream,
+    buffer: &mut [u8],
+    deadline: Instant,
+) -> io::Result<()> {
+    let mut offset = 0;
+    while offset < buffer.len() {
+        match stream.read(&mut buffer[offset..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "sidecar closed before a complete frame",
+                ));
+            }
+            Ok(count) => offset += count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                wait_until_readable(stream, deadline)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn wait_until_readable(stream: &UnixStream, deadline: Instant) -> io::Result<()> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "sidecar frame readiness budget exhausted",
+            ));
+        }
+        let timeout_ms = remaining
+            .as_nanos()
+            .div_ceil(1_000_000)
+            .min(i32::MAX as u128) as i32;
+        let mut descriptor = libc::pollfd {
+            fd: stream.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
+        if ready > 0 {
+            return Ok(());
+        }
+        if ready == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "sidecar frame readiness budget exhausted",
+            ));
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
 struct AnePrefillClient {
     stream: UnixStream,
     child: Child,
@@ -382,6 +473,7 @@ struct AnePrefillClient {
     max_frame: u32,
     request_sequence: u64,
     readiness: Duration,
+    io_deadline: Instant,
 }
 
 impl AnePrefillClient {
@@ -460,6 +552,9 @@ impl AnePrefillClient {
             max_frame: DEFAULT_MAX_FRAME_BYTES,
             request_sequence: 0,
             readiness: Duration::ZERO,
+            io_deadline: Instant::now()
+                .checked_add(config.readiness_budget)
+                .unwrap_or_else(Instant::now),
         };
         client
             .stream
@@ -611,16 +706,19 @@ impl AnePrefillClient {
     }
 
     fn set_io_timeout(
-        &self,
+        &mut self,
         timeout: Duration,
         fault: AnePrefillFault,
     ) -> Result<(), AnePrefillFailure> {
         self.stream
-            .set_read_timeout(Some(timeout))
-            .and_then(|_| self.stream.set_write_timeout(Some(timeout)))
+            .set_write_timeout(Some(timeout))
             .map_err(|error| {
                 AnePrefillFailure::new(fault, format!("set sidecar I/O timeout: {error}"))
-            })
+            })?;
+        self.io_deadline = Instant::now()
+            .checked_add(timeout)
+            .unwrap_or_else(Instant::now);
+        Ok(())
     }
 
     fn write_json(
@@ -636,7 +734,7 @@ impl AnePrefillClient {
     }
 
     fn read_raw(&mut self, fault: AnePrefillFault) -> Result<Vec<u8>, AnePrefillFailure> {
-        read_frame(&mut self.stream, self.max_frame).map_err(|error| {
+        read_frame_until(&mut self.stream, self.max_frame, self.io_deadline).map_err(|error| {
             let timeout = matches!(
                 error.kind(),
                 io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
@@ -1462,7 +1560,7 @@ impl WorkerState {
                     layer_count,
                     model.config.num_key_value_heads,
                     model.config.head_dim,
-                    vocabulary.len(),
+                    model.vocabulary_size(),
                     bucket,
                 )?
                 .map(AnePrefillRuntime::new);
@@ -3052,6 +3150,8 @@ fn read_json<T: serde::de::DeserializeOwned>(stream: &mut UnixStream, max_frame:
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
     use super::*;
 
     #[test]
@@ -3154,6 +3254,63 @@ mod tests {
         assert_eq!(timings.handoff_total(), Duration::from_millis(58));
         assert_ne!(timings.handoff_total(), timings.readiness);
         assert_ne!(timings.handoff_total(), timings.prediction);
+    }
+
+    #[test]
+    fn sidecar_frame_reader_resumes_slow_chunked_frames_within_budget() {
+        let (mut reader, mut writer) = UnixStream::pair().expect("create sidecar protocol seam");
+        let payload = br#"{\"type\":\"INSTALLED\"}"#.to_vec();
+        let mut frame = (payload.len() as u32).to_le_bytes().to_vec();
+        frame.extend_from_slice(&payload);
+        let expected = payload.clone();
+        let writer_thread = thread::spawn(move || {
+            for chunk in frame.chunks(3) {
+                writer
+                    .write_all(chunk)
+                    .expect("write throttled frame chunk");
+                thread::sleep(Duration::from_millis(5));
+            }
+        });
+
+        let received = read_frame_until(
+            &mut reader,
+            DEFAULT_MAX_FRAME_BYTES,
+            Instant::now() + Duration::from_millis(500),
+        )
+        .expect("chunked frame arrives before readiness budget");
+        writer_thread.join().expect("throttled writer exits");
+        assert_eq!(received, expected);
+    }
+
+    #[test]
+    fn sidecar_frame_reader_maps_partial_frame_stall_to_readiness_exhaustion() {
+        let (mut reader, mut writer) = UnixStream::pair().expect("create sidecar protocol seam");
+        let writer_thread = thread::spawn(move || {
+            writer
+                .write_all(&8_u32.to_le_bytes()[..2])
+                .expect("write partial frame header");
+            thread::sleep(Duration::from_millis(100));
+        });
+        let started = Instant::now();
+
+        let error = read_frame_until(
+            &mut reader,
+            DEFAULT_MAX_FRAME_BYTES,
+            started + Duration::from_millis(30),
+        )
+        .expect_err("stalled partial frame must exhaust readiness budget");
+        let elapsed = started.elapsed();
+        writer_thread.join().expect("stalled writer exits");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(elapsed >= Duration::from_millis(20));
+        assert!(elapsed < Duration::from_millis(90));
+        assert_eq!(
+            AnePrefillFault::ReadinessBudget
+                .disposition()
+                .fallback_reason
+                .as_str(),
+            "readiness_budget_exhausted"
+        );
     }
 }
 

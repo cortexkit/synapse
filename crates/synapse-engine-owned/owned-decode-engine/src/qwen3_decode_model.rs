@@ -292,6 +292,10 @@ impl Model {
         &self.generation_stop_ids
     }
 
+    pub fn vocabulary_size(&self) -> usize {
+        self.config.vocab_size
+    }
+
     pub(crate) fn lm_head(&self) -> Result<&Tensor> {
         if self.config.tie_word_embeddings {
             Ok(&self.embeddings)

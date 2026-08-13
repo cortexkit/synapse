@@ -313,6 +313,7 @@ def main() -> int:
         minimum_deployment_target=ct.target.macOS14,
         compute_precision=ct.precision.FLOAT16,
         compute_units=ct.ComputeUnit.CPU_AND_NE,
+        skip_model_load=True,
     )
     converted_names = list(mlmodel.output_description)
     if len(converted_names) != len(names):
@@ -323,25 +324,57 @@ def main() -> int:
         if old != new:
             ct.utils.rename_feature(mlmodel._spec, old, new)
 
-    del exported, wrapper
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    metadata_report = ConversionReport(
+        status="converted_and_ran",
+        source_model=report_model_ref,
+        source_model_sha256=shared.sha256(model_path / "model.safetensors"),
+        window=args.window,
+        frontend="torch.export",
+        compute_precision="float16",
+        compute_units="CPU_AND_NE",
+        minimum_deployment_target="macOS14",
+        output_path=str(args.out),
+        output_count=len(names),
+        output_names=names,
+        kv_output_elements=sum(value.numel() for value in eager[1:]),
+        kv_output_bytes_f16=sum(value.numel() for value in eager[1:]) * 2,
+        package_size_bytes=0,
+        conversion_s=time.monotonic() - started,
+        model_config=config,
+        tokenizer_policy=tokenizer_policy,
+        environment=environment,
+        parity=[],
+    )
+    ensure_metadata(mlmodel, metadata_report)
+    mlmodel.save(args.out)
+    del exported, wrapper, mlmodel
     gc.collect()
-    prediction = mlmodel.predict(
+
+    # Loading the saved graph on CPU keeps parity independent from the Neural
+    # Engine placement check and avoids an OS Core ML teardown crash observed
+    # while the converter's in-memory MLE5 proxy releases shaped output ports.
+    parity_model = ct.models.MLModel(str(args.out), compute_units=ct.ComputeUnit.CPU_ONLY)
+    prediction = parity_model.predict(
         {
             "input_ids": input_ids.numpy().astype(np.int32),
             "attention_mask": attention_mask.numpy().astype(np.int32),
         }
     )
+    prediction = {name: np.array(value, copy=True) for name, value in prediction.items()}
+    del parity_model
+    gc.collect()
     if len(hf) != len(names):
         raise RuntimeError(f"HF returned {len(hf)} outputs, expected {len(names)}")
 
     parity: list[TensorParity] = []
-    for name, prediction_name, eager_value, exported_value, hf_value in zip(
-        names, converted_names, eager, exported_values, hf, strict=True
+    for name, eager_value, exported_value, hf_value in zip(
+        names, eager, exported_values, hf, strict=True
     ):
         eager_row = flatten(eager_value)
         exported_row = flatten(exported_value)
         hf_row = flatten(hf_value)
-        coreml_row = flatten(prediction[prediction_name])
+        coreml_row = flatten(prediction[name])
         if not (eager_row.shape == exported_row.shape == hf_row.shape == coreml_row.shape):
             raise RuntimeError(
                 f"{name} shape mismatch: eager={eager_row.shape}, export={exported_row.shape}, "
@@ -370,7 +403,6 @@ def main() -> int:
     if worst_export_abs > 1e-5:
         raise RuntimeError(f"torch.export parity failed: worst max abs {worst_export_abs}")
 
-    args.out.parent.mkdir(parents=True, exist_ok=True)
     provisional = ConversionReport(
         status="converted_and_ran",
         source_model=report_model_ref,
@@ -392,8 +424,6 @@ def main() -> int:
         environment=environment,
         parity=parity,
     )
-    ensure_metadata(mlmodel, provisional)
-    mlmodel.save(args.out)
     report = ConversionReport(
         **{**asdict(provisional), "package_size_bytes": shared.directory_size(args.out)}
     )

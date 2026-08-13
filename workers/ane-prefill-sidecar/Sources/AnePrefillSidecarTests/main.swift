@@ -90,6 +90,16 @@ private func logitsUseLastActiveTokenWithNonContiguousStride() throws {
         "logits were not read from the final active token"
     )
 
+    let projectedTensor = try StridedTensor(
+        shape: [1, 3, 1],
+        strides: [9, 2, 1],
+        storage: .float32([20, -1, 21, -1, 22])
+    )
+    try require(
+        try copyActiveLogits(projectedTensor, activeTokens: 2, window: 4, vocabularySize: 3) == [20, 21, 22],
+        "projected final-position logits were not accepted without a window axis"
+    )
+
     var convolutionValues = [Float](repeating: -1, count: 64)
     for position in 0 ..< 4 {
         for vocabulary in 0 ..< 3 {
