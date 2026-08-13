@@ -64,7 +64,7 @@ def run_coreml(
             "--logits-out",
             str(output_dir / f"{compute_units}-logits.bin"),
             "--model-window",
-            "128",
+            str(args.window),
             "--chunks",
             "1",
             "--cache-bucket",
@@ -88,8 +88,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compiled", type=Path, required=True)
     parser.add_argument("--runner", type=Path, required=True)
     parser.add_argument("--analyzer", type=Path, required=True)
+    parser.add_argument("--window", type=int, default=128, choices=(128, 256, 512))
     parser.add_argument("--case-id", default="w128-width-01")
     parser.add_argument("--cache-bucket", type=int, default=512, choices=(512, 1024, 2048))
+    parser.add_argument(
+        "--decode-config", choices=("f16-step", "q8-step"), default="f16-step"
+    )
     parser.add_argument("--max-new-tokens", type=int, default=64)
     parser.add_argument(
         "--skip-cpu-control",
@@ -112,8 +116,10 @@ def main() -> int:
         if not path.exists():
             raise FileNotFoundError(path)
     case = load_fixture(args.root, args.case_id)
-    if case["bucket"] != 128 or len(case["prompt_token_ids"]) != 128:
-        raise ValueError("this diagnostic is pinned to the W128 width-exact fixture")
+    if case["bucket"] != args.window or len(case["prompt_token_ids"]) != args.window:
+        raise ValueError("diagnostic fixtures must be width-exact for the selected graph window")
+    if args.window + args.max_new_tokens > args.cache_bucket:
+        raise ValueError("selected cache bucket cannot hold the prompt and continuation")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     fixture_path = args.output_dir / f"{args.case_id}.jsonl"
     fixture_path.write_text(
@@ -138,6 +144,7 @@ def main() -> int:
         "power": command_output(["pmset", "-g", "batt"]),
         "source_checkpoint_sha256": sha256_path(args.model),
         "compiled_package_sha256": sha256_path(args.compiled),
+        "decode_config": args.decode_config,
         "fixture_sha256": sha256_path(fixture_path),
     }
     (args.output_dir / "load-context.json").write_text(
@@ -159,6 +166,8 @@ def main() -> int:
         str(args.cache_bucket),
         "--max-new-tokens",
         str(args.max_new_tokens),
+        "--decode-config",
+        args.decode_config,
         "--out",
         str(args.output_dir / "analysis.json"),
     ]

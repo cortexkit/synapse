@@ -36,6 +36,9 @@ struct Args {
     cache_bucket: usize,
     #[arg(long, default_value_t = 64)]
     max_new_tokens: usize,
+    /// Decode engine configuration used for the same-config GPU oracle.
+    #[arg(long, default_value = "f16-step")]
+    decode_config: String,
 }
 
 #[derive(Deserialize)]
@@ -145,7 +148,12 @@ fn main() -> Result<()> {
         "prompt plus continuation exceeds cache bucket"
     );
 
-    let model = Qwen3DecodeModel::load(&args.model, Precision::F16)
+    let weight_quantization = match args.decode_config.as_str() {
+        "f16-step" => WeightQuantization::None,
+        "q8-step" => WeightQuantization::Q8_0,
+        other => anyhow::bail!("unsupported decode config {other}; expected f16-step or q8-step"),
+    };
+    let model = Qwen3DecodeModel::load_with_quant(&args.model, Precision::F16, weight_quantization)
         .with_context(|| format!("load Qwen3 model {}", args.model.display()))?;
     ensure!(
         model.config.num_key_value_heads == KV_HEADS,
@@ -160,7 +168,7 @@ fn main() -> Result<()> {
         &model,
         Precision::F16,
         args.cache_bucket,
-        WeightQuantization::None,
+        weight_quantization,
     )?;
 
     let (pure_cache, pure_final_logits) = gpu_prefill(&mut decoder, &row.input_ids)?;
