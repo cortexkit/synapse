@@ -128,6 +128,26 @@ def validate_contract(contract: dict[str, Any]) -> None:
         require_equal(entry.get("path"), path, f"named artifact path for {artifact}")
         gates = entry.get("must_exist_before")
         require(isinstance(gates, list) and gates, f"named artifact {artifact} has no creation gate")
+    design_records = named_artifacts["epic_design_note"].get("records")
+    require(isinstance(design_records, list), "epic design note records must be a list")
+    require(
+        "handshake-mismatch -> unavailable-arm mapping and its bypass reason" in design_records,
+        "epic design note must record the handshake-mismatch mapping",
+    )
+
+    handshake = contract.get("worker_handshake")
+    require(isinstance(handshake, dict), "worker_handshake must be an object")
+    require_equal(handshake.get("phase"), "sidecar CONNECT before any request frame", "worker handshake phase")
+    require_equal(
+        handshake.get("protocol"),
+        "existing strict handshake negotiates the worker protocol version and engine identity",
+        "worker handshake protocol",
+    )
+    require_equal(handshake.get("bypass_reason"), "quarantined", "worker handshake bypass reason")
+    require_equal(handshake.get("request_health_debit"), False, "worker handshake request health debit")
+    require("marks the exact arm unavailable" in str(handshake.get("mismatch")), "worker handshake unavailable consequence")
+    require("debits that arm once" in str(handshake.get("mismatch")), "worker handshake health debit")
+    require("dispatch_failure" in str(handshake.get("mid_attempt_defense_in_depth")), "mid-attempt mismatch fallback")
 
     arm_schema = contract.get("arm_schema")
     require(isinstance(arm_schema, dict), "arm_schema must be an object")
@@ -200,6 +220,12 @@ def validate_contract(contract: dict[str, Any]) -> None:
     require_equal(set(bypass_entries), set(BYPASS_REASONS), "bypass table coverage")
     require(all(entry.get("split_attempt_started") is False for entry in bypass_entries.values()), "a bypass table row starts an attempt")
     require(all(entry.get("health_debit") is False for entry in bypass_entries.values()), "a bypass table row debits health")
+    quarantined = bypass_entries["quarantined"]
+    require(
+        quarantined.get("unavailable_arm_mapping")
+        == "A CONNECT-time protocol-version or engine-identity mismatch has already charged this exact arm once and made it quarantine-eligible; later requests bypass without an additional debit.",
+        "quarantined bypass table handshake mapping",
+    )
 
     fallback_table = contract.get("fallback_table")
     require(isinstance(fallback_table, list), "fallback_table must be a list")
@@ -353,6 +379,10 @@ def require_rejected(action: Callable[[], None], label: str) -> None:
 
 def self_test(root: Path) -> None:
     contract, manifest = validate_all(root)
+
+    missing_handshake = copy.deepcopy(contract)
+    del missing_handshake["worker_handshake"]
+    require_rejected(lambda: validate_contract(missing_handshake), "missing worker handshake")
 
     overlapping = copy.deepcopy(contract)
     overlapping["reason_vocabularies"]["prefill_fallback_reason"][0] = "disabled"
