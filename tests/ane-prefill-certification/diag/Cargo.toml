@@ -1,0 +1,15 @@
+[package]
+name = "ane-prefill-divergence-diag"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+half = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+synapse-engine-owned = { path = "../../../crates/synapse-engine-owned" }
