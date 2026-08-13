@@ -1,0 +1,114 @@
+{
+  "manifest_revision": "ane-prefill-split-manifest-v1",
+  "contract": {
+    "path": "contracts/ane-prefill-split/ane-prefill-split-contract-v1.json",
+    "sha256": "6ff3133179eee14e7576e89ba9b1855aa9a2eba99e8689399869c6c8294e3b8a"
+  },
+  "artifact_kind": "ane_prefill_split_manifest_matrix",
+  "status": "planned_and_complete_for_first_certification_cut",
+  "fixed_artifact_paths": {
+    "epic_design_note": "docs/design-ane-prefill-split.md",
+    "evidence_record": "evidence/ane-prefill-split/evidence-record-v1.json",
+    "operations_document": "docs/operations-ane-prefill-split.md"
+  },
+  "family": "qwen3-0.6b",
+  "included_buckets": [128, 256, 512],
+  "decode_configs": ["f16-step", "q8-step"],
+  "artifact_identity_binding": {
+    "required_fields": [
+      "source_checkpoint_digest",
+      "derived_or_compiled_artifact_digest",
+      "certification_recorded_artifact_digest"
+    ],
+    "binding_time": "before the first certification execution for each package",
+    "record": "evidence/ane-prefill-split/evidence-record-v1.json",
+    "unbound_values": "A planned package has no invented digest. Certification must bind all three identities before it can issue a green row."
+  },
+  "packages": [
+    {
+      "package_id": "qwen3-0.6b-ane-prefill-w128",
+      "family": "qwen3-0.6b",
+      "bucket": 128,
+      "package_format": "CoreML .mlmodelc compiled per machine",
+      "buildable": true,
+      "routing_branch_required": true,
+      "certification_attempt_required": true,
+      "serves_arms": ["qwen3-0.6b-w128-f16-step", "qwen3-0.6b-w128-q8-step"]
+    },
+    {
+      "package_id": "qwen3-0.6b-ane-prefill-w256",
+      "family": "qwen3-0.6b",
+      "bucket": 256,
+      "package_format": "CoreML .mlmodelc compiled per machine",
+      "buildable": true,
+      "routing_branch_required": true,
+      "certification_attempt_required": true,
+      "serves_arms": ["qwen3-0.6b-w256-f16-step", "qwen3-0.6b-w256-q8-step"]
+    },
+    {
+      "package_id": "qwen3-0.6b-ane-prefill-w512",
+      "family": "qwen3-0.6b",
+      "bucket": 512,
+      "package_format": "CoreML .mlmodelc compiled per machine",
+      "buildable": true,
+      "routing_branch_required": true,
+      "certification_attempt_required": true,
+      "serves_arms": ["qwen3-0.6b-w512-f16-step", "qwen3-0.6b-w512-q8-step"]
+    }
+  ],
+  "arm_matrix": [
+    {
+      "arm_id": "qwen3-0.6b-w128-f16-step",
+      "arm_key_fields": {"machine_profile": "bound_at_probe", "family": "qwen3-0.6b", "bucket": 128, "decode_config": "f16-step"},
+      "package_id": "qwen3-0.6b-ane-prefill-w128",
+      "certification_attempt_required": true,
+      "activation_requirement": "current exact arm is certified",
+      "headline_ttft_gate_required": true
+    },
+    {
+      "arm_id": "qwen3-0.6b-w128-q8-step",
+      "arm_key_fields": {"machine_profile": "bound_at_probe", "family": "qwen3-0.6b", "bucket": 128, "decode_config": "q8-step"},
+      "package_id": "qwen3-0.6b-ane-prefill-w128",
+      "certification_attempt_required": true,
+      "activation_requirement": "current exact arm is certified",
+      "headline_ttft_gate_required": true
+    },
+    {
+      "arm_id": "qwen3-0.6b-w256-f16-step",
+      "arm_key_fields": {"machine_profile": "bound_at_probe", "family": "qwen3-0.6b", "bucket": 256, "decode_config": "f16-step"},
+      "package_id": "qwen3-0.6b-ane-prefill-w256",
+      "certification_attempt_required": true,
+      "activation_requirement": "current exact arm is certified",
+      "headline_ttft_gate_required": false
+    },
+    {
+      "arm_id": "qwen3-0.6b-w256-q8-step",
+      "arm_key_fields": {"machine_profile": "bound_at_probe", "family": "qwen3-0.6b", "bucket": 256, "decode_config": "q8-step"},
+      "package_id": "qwen3-0.6b-ane-prefill-w256",
+      "certification_attempt_required": true,
+      "activation_requirement": "current exact arm is certified",
+      "headline_ttft_gate_required": false
+    },
+    {
+      "arm_id": "qwen3-0.6b-w512-f16-step",
+      "arm_key_fields": {"machine_profile": "bound_at_probe", "family": "qwen3-0.6b", "bucket": 512, "decode_config": "f16-step"},
+      "package_id": "qwen3-0.6b-ane-prefill-w512",
+      "certification_attempt_required": true,
+      "activation_requirement": "current exact arm is certified",
+      "headline_ttft_gate_required": false
+    },
+    {
+      "arm_id": "qwen3-0.6b-w512-q8-step",
+      "arm_key_fields": {"machine_profile": "bound_at_probe", "family": "qwen3-0.6b", "bucket": 512, "decode_config": "q8-step"},
+      "package_id": "qwen3-0.6b-ane-prefill-w512",
+      "certification_attempt_required": true,
+      "activation_requirement": "current exact arm is certified",
+      "headline_ttft_gate_required": false
+    }
+  ],
+  "completion_rule": {
+    "w128": "both decode-config arms are certified and pass the headline TTFT gate",
+    "w256_w512": "each exact arm is certified or has a recorded absent attempt with exactly one absence_reason",
+    "omission": "A missing package, routing branch, certification arm, or attempt is a manifest error; omission is not an absent state."
+  }
+}
