@@ -9,9 +9,10 @@
 //!   quantization, engine family, engine name, or arithmetic identity revision
 //!   (and, for Q8, quantizer revision / derived digest). It never depends on
 //!   scheduler settings or on `metallib_revision`.
-//! - `processing_fingerprint` additionally covers the module-owned processing
-//!   assets: tokenizer sanitized digest, prompt-template revision, special-token
-//!   policy revision, stop-token policy revision, and detokenizer revision.
+//! - `processing_fingerprint` additionally covers the completed prefill engine
+//!   class plus module-owned processing assets: tokenizer sanitized digest,
+//!   prompt-template revision, special-token policy revision, stop-token policy
+//!   revision, and detokenizer revision.
 //! - `runtime_config_digest` is deployment/runtime identity: worker and protocol
 //!   revisions, metallib revision, chain-K and batched-verification settings,
 //!   resident limit, reservation inputs, context-manifest revision, crash policy,
@@ -162,12 +163,40 @@ impl DecodeIdentityInputs {
     }
 }
 
-/// Inputs to `processing_fingerprint`: the decode fingerprint plus the
-/// module-owned processing-asset revisions.
+/// The stable prefill engine class that contributes to processing identity.
+///
+/// This is deliberately coarser than an ANE prefill bucket. A caller pin must
+/// remain valid when prompt length crosses W128/W256/W512, while provenance
+/// retains the concrete bucket that completed a request.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PrefillEngineClass {
+    #[default]
+    Gpu,
+    AneSplit,
+}
+
+impl PrefillEngineClass {
+    /// Canonical payload value for this engine class.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Gpu => "gpu",
+            Self::AneSplit => "ane-split",
+        }
+    }
+}
+
+/// Inputs to `processing_fingerprint`: the decode fingerprint, completed
+/// prefill engine class, and module-owned processing-asset revisions.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessingIdentityInputs {
     pub decode_fingerprint: Fingerprint,
+    /// `gpu` preserves the pure-GPU completed-processing identity. The default
+    /// keeps older serialized descriptors compatible while still making the
+    /// discriminator mandatory in every newly computed payload.
+    #[serde(default)]
+    pub prefill_engine_class: PrefillEngineClass,
     pub tokenizer_sanitized_digest: String,
     pub prompt_template_revision: String,
     pub special_token_policy_revision: String,
@@ -178,6 +207,7 @@ pub struct ProcessingIdentityInputs {
 #[derive(Serialize)]
 struct ProcessingFingerprintPayload<'a> {
     decode_fingerprint: &'a str,
+    prefill_engine_class: &'static str,
     tokenizer_sanitized_digest: &'a str,
     prompt_template_revision: &'a str,
     special_token_policy_revision: &'a str,
@@ -186,11 +216,19 @@ struct ProcessingFingerprintPayload<'a> {
 }
 
 impl ProcessingIdentityInputs {
-    /// Compute the processing fingerprint over the decode fingerprint and the
-    /// five processing-asset revisions.
+    /// Return these inputs for a different completed prefill engine class.
+    #[must_use]
+    pub fn with_prefill_engine_class(mut self, prefill_engine_class: PrefillEngineClass) -> Self {
+        self.prefill_engine_class = prefill_engine_class;
+        self
+    }
+
+    /// Compute the processing fingerprint over the decode fingerprint, the
+    /// completed prefill engine class, and the five processing-asset revisions.
     pub fn processing_fingerprint(&self) -> Fingerprint {
         let payload = ProcessingFingerprintPayload {
             decode_fingerprint: &self.decode_fingerprint.0,
+            prefill_engine_class: self.prefill_engine_class.as_str(),
             tokenizer_sanitized_digest: &self.tokenizer_sanitized_digest,
             prompt_template_revision: &self.prompt_template_revision,
             special_token_policy_revision: &self.special_token_policy_revision,
@@ -406,6 +444,7 @@ mod tests {
         let decode = f16_inputs().decode_fingerprint().unwrap();
         let base = ProcessingIdentityInputs {
             decode_fingerprint: decode.clone(),
+            prefill_engine_class: PrefillEngineClass::Gpu,
             tokenizer_sanitized_digest: "sha256:tok".to_string(),
             prompt_template_revision: "tmpl-v1".to_string(),
             special_token_policy_revision: "special-v1".to_string(),
@@ -417,6 +456,7 @@ mod tests {
         // A processing-asset change rotates the processing fingerprint...
         let mut changed = ProcessingIdentityInputs {
             decode_fingerprint: decode.clone(),
+            prefill_engine_class: PrefillEngineClass::Gpu,
             tokenizer_sanitized_digest: "sha256:tok".to_string(),
             prompt_template_revision: "tmpl-v2".to_string(),
             special_token_policy_revision: "special-v1".to_string(),
@@ -426,9 +466,14 @@ mod tests {
         assert_ne!(changed.processing_fingerprint(), base);
 
         // ...while identical processing assets over the same decode fingerprint
-        // reproduce it.
+        // and engine class reproduce it.
         changed.prompt_template_revision = "tmpl-v1".to_string();
         assert_eq!(changed.processing_fingerprint(), base);
+
+        // Engine class is a required processing discriminator, but buckets are
+        // intentionally absent from this identity.
+        changed.prefill_engine_class = PrefillEngineClass::AneSplit;
+        assert_ne!(changed.processing_fingerprint(), base);
     }
 
     fn runtime_manifest() -> RuntimeConfigManifest {

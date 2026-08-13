@@ -10,6 +10,9 @@
 use serde::{Deserialize, Serialize};
 use synapse_core::{worker_engine_names::DECODE_WORKER_ENGINE, Fingerprint};
 
+use crate::owned_decode_routing::ane_prefill::{
+    PrefillBucket, PrefillBypassReason, PrefillEngine, PrefillFallbackReason, PrefillProvenance,
+};
 use crate::owned_decode_routing::family::FamilyRegistration;
 
 /// Canonical identity strings for the production owned-decode lane.
@@ -60,8 +63,19 @@ pub struct LaneProvenance {
     pub metallib_revision: String,
     pub worker_generation: u64,
     pub last_completed_quantum_sequence: u32,
+    /// The engine that completed prefill. This is always `gpu` for existing
+    /// pure-GPU routes and becomes an exact ANE window only after split success.
+    pub prefill_engine: PrefillEngine,
 
     // -- additive fields (present only when applicable) --
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill_bucket: Option<PrefillBucket>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill_bypass_reason: Option<PrefillBypassReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill_fallback_from: Option<PrefillEngine>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill_fallback_reason: Option<PrefillFallbackReason>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -119,6 +133,11 @@ impl LaneProvenance {
             metallib_revision: inputs.metallib_revision,
             worker_generation: inputs.worker_generation,
             last_completed_quantum_sequence: inputs.last_completed_quantum_sequence,
+            prefill_engine: PrefillEngine::Gpu,
+            prefill_bucket: None,
+            prefill_bypass_reason: None,
+            prefill_fallback_from: None,
+            prefill_fallback_reason: None,
             fallback_reason: None,
             lane_finish_reason: None,
             crash_retry_count: 0,
@@ -153,6 +172,11 @@ impl LaneProvenance {
             metallib_revision: String::new(),
             worker_generation: 0,
             last_completed_quantum_sequence: 0,
+            prefill_engine: PrefillEngine::Gpu,
+            prefill_bucket: None,
+            prefill_bypass_reason: None,
+            prefill_fallback_from: None,
+            prefill_fallback_reason: None,
             fallback_reason: None,
             lane_finish_reason: None,
             crash_retry_count: 0,
@@ -163,6 +187,20 @@ impl LaneProvenance {
             chain_k: None,
             underlying_owned_decode_refusal_id: None,
         }
+    }
+
+    /// Attach the typed completed-prefill provenance selected by the ANE split
+    /// router. Its invariants prevent a response from claiming both bypass and
+    /// fallback, or from claiming ANE after GPU completion.
+    #[must_use]
+    pub fn with_prefill_provenance(mut self, provenance: PrefillProvenance) -> Self {
+        debug_assert!(provenance.is_valid());
+        self.prefill_engine = provenance.prefill_engine;
+        self.prefill_bucket = provenance.prefill_bucket;
+        self.prefill_bypass_reason = provenance.prefill_bypass_reason;
+        self.prefill_fallback_from = provenance.prefill_fallback_from;
+        self.prefill_fallback_reason = provenance.prefill_fallback_reason;
+        self
     }
 
     /// Record the fallback reason (additive provenance; the owned refusal ID is
@@ -239,7 +277,9 @@ mod tests {
         assert_eq!(provenance.worker_generation, 7);
         assert_eq!(provenance.last_completed_quantum_sequence, 3);
         assert_eq!(provenance.chain_k, Some(1));
+        assert_eq!(provenance.prefill_engine, PrefillEngine::Gpu);
         // Additive fields absent by default.
+        assert!(provenance.prefill_bypass_reason.is_none());
         assert!(provenance.fallback_reason.is_none());
         assert_eq!(provenance.crash_retry_count, 0);
         assert!(provenance.constraint_fingerprint.is_none());
@@ -280,6 +320,8 @@ mod tests {
     fn additive_fields_omit_when_unset() {
         let provenance = LaneProvenance::llama(fp("d"), fp("p"));
         let json = serde_json::to_value(&provenance).unwrap();
+        assert_eq!(json.get("prefill_engine"), Some(&serde_json::json!("gpu")));
+        assert!(json.get("prefill_bypass_reason").is_none());
         assert!(json.get("fallback_reason").is_none());
         assert!(json.get("crash_retry_count").is_none());
         assert!(json.get("constraint_fingerprint").is_none());

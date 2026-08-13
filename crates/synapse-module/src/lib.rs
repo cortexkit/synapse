@@ -6048,13 +6048,14 @@ fn owned_decode_catalog_entry(
 fn owned_decode_processing_fingerprint(
     entry: &owned_decode_routing::CatalogEntry,
 ) -> Result<Fingerprint, owned_decode_routing::error::OwnedDecodeError> {
-    use owned_decode_routing::identity::ProcessingIdentityInputs;
+    use owned_decode_routing::identity::{PrefillEngineClass, ProcessingIdentityInputs};
 
     let decode_fingerprint = entry.decode_identity_inputs().decode_fingerprint()?;
     let families = owned_decode_routing::family::FamilyRegistry::production();
     let registration = families.get(entry.family)?;
     Ok(ProcessingIdentityInputs {
         decode_fingerprint,
+        prefill_engine_class: PrefillEngineClass::Gpu,
         tokenizer_sanitized_digest: registration.tokenizer_sanitized_digest.clone(),
         prompt_template_revision: registration.prompt_template_revision.clone(),
         special_token_policy_revision: registration.special_token_policy_revision.clone(),

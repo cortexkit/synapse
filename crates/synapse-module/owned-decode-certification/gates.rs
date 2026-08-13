@@ -34,8 +34,8 @@ use crate::owned_decode_routing::certification::{CertificationStore, StructuralB
 use crate::owned_decode_routing::error::OwnedDecodeError;
 use crate::owned_decode_routing::family::{Family, FamilyRegistry};
 use crate::owned_decode_routing::identity::{
-    ActivationDType, ConstraintRuntimeIdentity, DecodeIdentityInputs, ProcessingIdentityInputs,
-    Q8Identity, RuntimeConfigManifest, WeightQuant,
+    ActivationDType, ConstraintRuntimeIdentity, DecodeIdentityInputs, PrefillEngineClass,
+    ProcessingIdentityInputs, Q8Identity, RuntimeConfigManifest, WeightQuant,
 };
 use crate::owned_decode_routing::lane::{serving_predicate, ServingPredicateInputs};
 use crate::owned_decode_routing::q8ingest::{Q8IngestRegistry, TrustState};
@@ -709,8 +709,8 @@ impl GateRunner {
 
     /// G-DEC-06: identity behavior. Decode fingerprint rotates on artifact,
     /// arithmetic, family, and quantization changes; processing fingerprint
-    /// rotates only on processing assets; constraint identity is field
-    /// sensitive; scheduler settings rotate the runtime digest and never the
+    /// rotates on processing assets and completed prefill engine class; constraint
+    /// identity is field sensitive; scheduler settings rotate the runtime digest and never the
     /// decode fingerprint.
     pub fn gate_06_identity(&self) -> GateStatus {
         let mut evidence = Vec::new();
@@ -783,9 +783,10 @@ impl GateRunner {
         }
         evidence.push("scheduler fields rotate runtime_config_digest only".to_string());
 
-        // Processing fingerprint rotates on processing assets only.
+        // Processing fingerprint rotates on processing assets and engine class.
         let processing = ProcessingIdentityInputs {
             decode_fingerprint: base_fp.clone(),
+            prefill_engine_class: PrefillEngineClass::Gpu,
             tokenizer_sanitized_digest: "tok-v1".to_string(),
             prompt_template_revision: "template-v1".to_string(),
             special_token_policy_revision: "special-v1".to_string(),
@@ -805,7 +806,19 @@ impl GateRunner {
                 reason: "processing_fingerprint must be stable for identical inputs".to_string(),
             };
         }
-        evidence.push("processing_fingerprint rotates on processing assets only".to_string());
+        let split_processing = processing
+            .clone()
+            .with_prefill_engine_class(PrefillEngineClass::AneSplit)
+            .processing_fingerprint();
+        if split_processing == processing_fp {
+            return GateStatus::Failed {
+                reason: "prefill engine class must rotate processing_fingerprint".to_string(),
+            };
+        }
+        evidence.push(
+            "processing_fingerprint rotates on processing assets and prefill engine class"
+                .to_string(),
+        );
 
         // Constraint runtime identity is field sensitive across all seven fields.
         let cri = ConstraintRuntimeIdentity {

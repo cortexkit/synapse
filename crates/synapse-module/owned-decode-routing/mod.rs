@@ -25,6 +25,7 @@
 //! - [`lane`]: lane selection, fallback, and the serving predicate.
 //! - [`provenance`]: selected-lane response provenance.
 
+pub mod ane_prefill;
 pub mod certification;
 pub mod error;
 pub mod family;
@@ -47,7 +48,8 @@ use crate::owned_decode_routing::certification::{
 use crate::owned_decode_routing::error::OwnedDecodeError;
 use crate::owned_decode_routing::family::{Family, FamilyRegistry};
 use crate::owned_decode_routing::identity::{
-    ActivationDType, DecodeIdentityInputs, ProcessingIdentityInputs, Q8Identity, WeightQuant,
+    ActivationDType, DecodeIdentityInputs, PrefillEngineClass, ProcessingIdentityInputs,
+    Q8Identity, WeightQuant,
 };
 use crate::owned_decode_routing::lane::{
     effective_grammar_enabled, select_lane, AdmissionBoundaryReader, AdmissionBoundarySnapshot,
@@ -624,8 +626,12 @@ impl OwnedDecodeRouter {
             .decode_identity_inputs()
             .decode_fingerprint()
             .map_err(RoutingFailure::owned)?;
+        // The existing owned route completes with GPU prefill. The split router
+        // computes its own `ane-split` completed-processing identity and only
+        // installs it after a successful split attempt.
         let processing_fingerprint = ProcessingIdentityInputs {
             decode_fingerprint: decode_fingerprint.clone(),
+            prefill_engine_class: PrefillEngineClass::Gpu,
             tokenizer_sanitized_digest: registration.tokenizer_sanitized_digest.clone(),
             prompt_template_revision: registration.prompt_template_revision.clone(),
             special_token_policy_revision: registration.special_token_policy_revision.clone(),
