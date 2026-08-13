@@ -250,7 +250,7 @@ def ensure_metadata(mlmodel: ct.models.MLModel, report: ConversionReport) -> Non
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=MODEL_ID, help="HF repo id or local snapshot")
-    parser.add_argument("--window", type=int, required=True, choices=(32, 128))
+    parser.add_argument("--window", type=int, required=True, choices=(32, 128, 256, 512))
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--report-json", type=Path, required=True)
     parser.add_argument("--allow-download", action="store_true")
