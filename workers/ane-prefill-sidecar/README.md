@@ -1,0 +1,58 @@
+# ANE prefill sidecar
+
+`ane-prefill-sidecar` is the separately supervised Swift/CoreML stage for the
+Qwen3 fixed-window ANE prefill path. It owns only CoreML model lifetime,
+prediction, cancellation acknowledgement, and the wire payload. The module
+continues to own tokenization and prompt templates: `EXECUTE` accepts already
+tokenized, already right-padded `input_ids` and `attention_mask` values.
+
+## Connection and failure boundary
+
+The sidecar sends `HELLO` immediately after connecting to the Unix socket. The
+host must reply with a strict `HELLO_ACK` whose protocol version, nonce, and
+`expected_engine` exactly match this binary. Unknown handshake fields are
+rejected. A mismatch exits before the CoreML stage is created or a request is
+accepted; this sidecar does not attach response provenance or charge health, so
+the host can classify it as a pre-attempt incompatibility.
+
+After negotiation every JSON command rejects unknown top-level fields:
+
+- `INSTALL` verifies the compiled artifact SHA-256 and loads the model under
+  `readiness_timeout_ms` (1 ms through 1 hour). A load that completes after the
+  deadline is discarded and is never installed.
+- `EXECUTE` requires exactly one installed fixed-width input row. It validates
+  right padding, runs CoreML with `CPU_AND_NE`, and emits `EXECUTED`, then an
+  f32 little-endian logits frame and an f16 little-endian K/V frame.
+- `ABORT` is handled while prediction is in flight. The sidecar owns the active
+  execution ticket and never publishes logits or K/V after observing its
+  cancellation. `ABORTED` reports `cancellation_owner: "sidecar"`.
+- `TIMING_READBACK` returns bounded, sidecar-local timing for the most recent
+  128 executions. It contains readiness, prediction, K/V-layout, logits-copy,
+  and total milliseconds.
+
+CoreML does not expose a force-cancel operation for a synchronous model load or
+prediction. The sidecar bounds observable readiness and discards late loads;
+the supervising host owns process termination if a platform call hangs.
+
+## Payload layout
+
+The CoreML graph is fixed-window, but `active_tokens` controls the decode
+boundary. Logits are read at `active_tokens - 1`, never from a padded slot. The
+K/V frame contains only active positions in this exact order:
+
+```text
+[layer][key_or_value][head][position][dimension]
+```
+
+K/V values are f16 little-endian bits. The sidecar walks `MLMultiArray.strides`
+for every logits and K/V element rather than assuming contiguous CoreML
+storage. Padded positions are intentionally omitted so the decoding engine
+cannot import padding as cache state.
+
+## Development
+
+```sh
+cd workers/ane-prefill-sidecar
+swift run ane-prefill-sidecar-tests
+swift build -c release
+```
