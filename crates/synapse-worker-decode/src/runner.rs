@@ -3,10 +3,15 @@ use std::{
     fs,
     io::{self, Read},
     net::Shutdown,
-    os::unix::net::UnixStream,
+    os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
-    sync::Arc,
-    time::Instant,
+    process::{Child, Command, Stdio},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    thread,
+    time::{Duration, Instant},
 };
 
 use anyhow::{bail, ensure, Context, Result};
@@ -26,10 +31,10 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use synapse_core::{
     worker_engine_names::DECODE_WORKER_ENGINE,
-    worker_framing_sync::{read_frame, write_json_frame},
+    worker_framing_sync::{read_frame, write_frame, write_json_frame},
     worker_protocol::{
-        WorkerHello, WorkerHelloAck, WorkerRequest, WorkerResponse, DEFAULT_MAX_FRAME_BYTES,
-        WORKER_PROTOCOL_VERSION,
+        decode_f32_frame, WorkerHello, WorkerHelloAck, WorkerRequest, WorkerResponse,
+        DEFAULT_MAX_FRAME_BYTES, WORKER_PROTOCOL_VERSION,
     },
     EngineIdentity, Fingerprint, SidecarHintBank, SpanClass,
 };
@@ -54,6 +59,853 @@ use tokenizers::Tokenizer;
 
 const PRODUCTION_N: u32 = 16;
 const ENGINE_VERSION: &str = "owned-metal-decode-v1";
+const ANE_PREFILL_PROTOCOL_VERSION: u64 = 1;
+const ANE_PREFILL_ENGINE_NAME: &str = "ane-prefill-coreml";
+const ANE_PREFILL_ENGINE_VERSION: &str = "coreml-fixed-window-v1";
+static ANE_PREFILL_SOCKET_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// The closed runtime fallback vocabulary for an ANE-prefill attempt. Routing
+/// owns provenance and persistent arm health; this worker returns the exact
+/// reason so it never has to reinterpret a low-level sidecar failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum AnePrefillFallbackReason {
+    CompileFailure,
+    LoadFailure,
+    DispatchFailure,
+    PredictionFailure,
+    PredictionTimeout,
+    KvConversionFailure,
+    IpcHandoffFailure,
+    CacheHandoffFailure,
+    MetalUploadFailure,
+    TransferBudgetExceeded,
+    ReadinessBudgetExhausted,
+    ArtifactMismatch,
+    LogitsPublicationFailure,
+}
+
+impl AnePrefillFallbackReason {
+    #[cfg(test)]
+    const ALL: [Self; 13] = [
+        Self::CompileFailure,
+        Self::LoadFailure,
+        Self::DispatchFailure,
+        Self::PredictionFailure,
+        Self::PredictionTimeout,
+        Self::KvConversionFailure,
+        Self::IpcHandoffFailure,
+        Self::CacheHandoffFailure,
+        Self::MetalUploadFailure,
+        Self::TransferBudgetExceeded,
+        Self::ReadinessBudgetExhausted,
+        Self::ArtifactMismatch,
+        Self::LogitsPublicationFailure,
+    ];
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::CompileFailure => "compile_failure",
+            Self::LoadFailure => "load_failure",
+            Self::DispatchFailure => "dispatch_failure",
+            Self::PredictionFailure => "prediction_failure",
+            Self::PredictionTimeout => "prediction_timeout",
+            Self::KvConversionFailure => "kv_conversion_failure",
+            Self::IpcHandoffFailure => "ipc_handoff_failure",
+            Self::CacheHandoffFailure => "cache_handoff_failure",
+            Self::MetalUploadFailure => "metal_upload_failure",
+            Self::TransferBudgetExceeded => "transfer_budget_exceeded",
+            Self::ReadinessBudgetExhausted => "readiness_budget_exhausted",
+            Self::ArtifactMismatch => "artifact_mismatch",
+            Self::LogitsPublicationFailure => "logits_publication_failure",
+        }
+    }
+}
+
+/// Each failure mode has one, and only one, routing reason. The outer split-arm
+/// controller records exactly one debit for this disposition and intentionally
+/// never charges the decode-lane crash key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AnePrefillFault {
+    Compile,
+    Load,
+    Dispatch,
+    Prediction,
+    PredictionTimeout,
+    KvConversion,
+    Ipc,
+    CacheHandoff,
+    MetalUpload,
+    HandoffBudget,
+    ReadinessBudget,
+    ArtifactMismatch,
+    LogitsPublication,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AnePrefillFaultDisposition {
+    fallback_reason: AnePrefillFallbackReason,
+    split_arm_debits: u8,
+    decode_lane_debits: u8,
+}
+
+impl AnePrefillFault {
+    #[cfg(test)]
+    const ALL: [Self; 13] = [
+        Self::Compile,
+        Self::Load,
+        Self::Dispatch,
+        Self::Prediction,
+        Self::PredictionTimeout,
+        Self::KvConversion,
+        Self::Ipc,
+        Self::CacheHandoff,
+        Self::MetalUpload,
+        Self::HandoffBudget,
+        Self::ReadinessBudget,
+        Self::ArtifactMismatch,
+        Self::LogitsPublication,
+    ];
+
+    const fn fallback_reason(self) -> AnePrefillFallbackReason {
+        match self {
+            Self::Compile => AnePrefillFallbackReason::CompileFailure,
+            Self::Load => AnePrefillFallbackReason::LoadFailure,
+            Self::Dispatch => AnePrefillFallbackReason::DispatchFailure,
+            Self::Prediction => AnePrefillFallbackReason::PredictionFailure,
+            Self::PredictionTimeout => AnePrefillFallbackReason::PredictionTimeout,
+            Self::KvConversion => AnePrefillFallbackReason::KvConversionFailure,
+            Self::Ipc => AnePrefillFallbackReason::IpcHandoffFailure,
+            Self::CacheHandoff => AnePrefillFallbackReason::CacheHandoffFailure,
+            Self::MetalUpload => AnePrefillFallbackReason::MetalUploadFailure,
+            Self::HandoffBudget => AnePrefillFallbackReason::TransferBudgetExceeded,
+            Self::ReadinessBudget => AnePrefillFallbackReason::ReadinessBudgetExhausted,
+            Self::ArtifactMismatch => AnePrefillFallbackReason::ArtifactMismatch,
+            Self::LogitsPublication => AnePrefillFallbackReason::LogitsPublicationFailure,
+        }
+    }
+
+    const fn disposition(self) -> AnePrefillFaultDisposition {
+        AnePrefillFaultDisposition {
+            fallback_reason: self.fallback_reason(),
+            split_arm_debits: 1,
+            decode_lane_debits: 0,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct AnePrefillFailure {
+    fault: AnePrefillFault,
+    detail: String,
+}
+
+impl AnePrefillFailure {
+    fn new(fault: AnePrefillFault, detail: impl Into<String>) -> Self {
+        Self {
+            fault,
+            detail: detail.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct AnePrefillConfig {
+    sidecar_path: PathBuf,
+    artifact_path: PathBuf,
+    artifact_digest: String,
+    model_ref: String,
+    window: usize,
+    layers: usize,
+    kv_heads: usize,
+    head_dimension: usize,
+    vocabulary_size: usize,
+    readiness_budget: Duration,
+    prediction_budget: Duration,
+    handoff_budget: Duration,
+}
+
+impl AnePrefillConfig {
+    fn from_runtime_config(
+        runtime_config: &BTreeMap<String, String>,
+        model_ref: String,
+        layers: usize,
+        kv_heads: usize,
+        head_dimension: usize,
+        vocabulary_size: usize,
+        decode_bucket: usize,
+    ) -> Result<Option<Self>> {
+        let Some(artifact_path) = runtime_config.get("ane_prefill_artifact_path") else {
+            return Ok(None);
+        };
+        let sidecar_path = runtime_config
+            .get("ane_prefill_sidecar_path")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("CK_ANE_PREFILL_SIDECAR").map(PathBuf::from))
+            .context("ane_prefill_sidecar_path is required when ANE prefill is configured")?;
+        let artifact_digest =
+            required_config(runtime_config, "ane_prefill_artifact_digest")?.to_string();
+        let window = required_config(runtime_config, "ane_prefill_window")?
+            .parse::<usize>()
+            .context("parse ane_prefill_window")?;
+        ensure!(
+            [128, 256, 512].contains(&window) && window <= decode_bucket,
+            "ANE prefill window must be W128, W256, or W512 within the decode cache bucket"
+        );
+        Ok(Some(Self {
+            sidecar_path,
+            artifact_path: PathBuf::from(artifact_path),
+            artifact_digest,
+            model_ref,
+            window,
+            layers,
+            kv_heads,
+            head_dimension,
+            vocabulary_size,
+            readiness_budget: prefill_budget(runtime_config, "ane_prefill_readiness_budget_ms")?,
+            prediction_budget: prefill_budget(runtime_config, "ane_prefill_prediction_budget_ms")?,
+            handoff_budget: prefill_budget(runtime_config, "ane_prefill_handoff_budget_ms")?,
+        }))
+    }
+}
+
+fn prefill_budget(runtime_config: &BTreeMap<String, String>, key: &str) -> Result<Duration> {
+    let milliseconds = required_config(runtime_config, key)?
+        .parse::<u64>()
+        .with_context(|| format!("parse {key}"))?;
+    ensure!(milliseconds > 0, "{key} must be positive");
+    Ok(Duration::from_millis(milliseconds))
+}
+
+#[derive(Clone, Debug, Default)]
+struct AnePrefillTimings {
+    readiness: Duration,
+    prediction: Duration,
+    kv_layout: Duration,
+    logits_copy: Duration,
+    ipc: Duration,
+    kv_conversion: Duration,
+    cache_handoff: Duration,
+    metal_upload: Duration,
+    logits_publication: Duration,
+}
+
+impl AnePrefillTimings {
+    fn handoff_total(&self) -> Duration {
+        self.kv_layout
+            .saturating_add(self.logits_copy)
+            .saturating_add(self.ipc)
+            .saturating_add(self.kv_conversion)
+            .saturating_add(self.cache_handoff)
+            .saturating_add(self.metal_upload)
+            .saturating_add(self.logits_publication)
+    }
+}
+
+struct AnePrefillPayload {
+    active_tokens: usize,
+    logits: Vec<f32>,
+    kv_bits: Vec<u16>,
+    timings: AnePrefillTimings,
+}
+
+struct AnePrefillRuntime {
+    config: AnePrefillConfig,
+    client: Option<AnePrefillClient>,
+    last_failure: Option<AnePrefillFailure>,
+    last_timings: Option<AnePrefillTimings>,
+}
+
+impl AnePrefillRuntime {
+    fn new(config: AnePrefillConfig) -> Self {
+        Self {
+            config,
+            client: None,
+            last_failure: None,
+            last_timings: None,
+        }
+    }
+
+    fn execute(&mut self, prompt: &[u32]) -> Result<AnePrefillPayload, AnePrefillFailure> {
+        if prompt.is_empty() || prompt.len() > self.config.window {
+            return Err(AnePrefillFailure::new(
+                AnePrefillFault::Dispatch,
+                "prompt is outside the selected fixed ANE prefill window",
+            ));
+        }
+        if self.client.is_none() {
+            let client = AnePrefillClient::connect(&self.config)?;
+            self.client = Some(client);
+        }
+        let payload = self
+            .client
+            .as_mut()
+            .expect("sidecar client is installed before execution")
+            .execute(&self.config, prompt);
+        if payload.is_err() {
+            // A failed request never reuses a socket that may still hold a late
+            // EXECUTED frame. Dropping it also terminates an unresponsive sidecar.
+            self.client = None;
+        }
+        payload
+    }
+
+    fn record_failure(&mut self, failure: AnePrefillFailure) {
+        let disposition = failure.fault.disposition();
+        eprintln!(
+            "ANE prefill attempt fell back: reason={} split_arm_debits={} decode_lane_debits={} detail={}",
+            disposition.fallback_reason.as_str(),
+            disposition.split_arm_debits,
+            disposition.decode_lane_debits,
+            failure.detail
+        );
+        self.last_failure = Some(failure);
+    }
+
+    fn record_success(&mut self, timings: AnePrefillTimings) {
+        if std::env::var_os("CK_ANE_PREFILL_LOG_TIMINGS").is_some() {
+            eprintln!(
+                "ANE prefill timing: readiness={:?} prediction={:?} handoff={:?}",
+                timings.readiness,
+                timings.prediction,
+                timings.handoff_total()
+            );
+        }
+        self.last_failure = None;
+        self.last_timings = Some(timings);
+    }
+}
+
+struct AnePrefillClient {
+    stream: UnixStream,
+    child: Child,
+    socket_path: PathBuf,
+    max_frame: u32,
+    request_sequence: u64,
+    readiness: Duration,
+}
+
+impl AnePrefillClient {
+    fn connect(config: &AnePrefillConfig) -> Result<Self, AnePrefillFailure> {
+        let sequence = ANE_PREFILL_SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let socket_path = std::env::temp_dir().join(format!(
+            "ck-ane-prefill-{}-{sequence}.sock",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&socket_path);
+        let listener = UnixListener::bind(&socket_path).map_err(|error| {
+            AnePrefillFailure::new(
+                AnePrefillFault::Load,
+                format!("bind ANE sidecar socket {}: {error}", socket_path.display()),
+            )
+        })?;
+        listener.set_nonblocking(true).map_err(|error| {
+            AnePrefillFailure::new(
+                AnePrefillFault::Load,
+                format!("configure ANE sidecar listener: {error}"),
+            )
+        })?;
+        let nonce = format!("decode-{}-{sequence}", std::process::id());
+        let child = Command::new(&config.sidecar_path)
+            .arg("--socket")
+            .arg(&socket_path)
+            .arg("--nonce")
+            .arg(&nonce)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|error| {
+                AnePrefillFailure::new(
+                    AnePrefillFault::Load,
+                    format!(
+                        "spawn ANE prefill sidecar {}: {error}",
+                        config.sidecar_path.display()
+                    ),
+                )
+            })?;
+        let started = Instant::now();
+        let mut child = child;
+        let stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if started.elapsed() >= config.readiness_budget {
+                        let _ = child.kill();
+                        return Err(AnePrefillFailure::new(
+                            AnePrefillFault::Load,
+                            "ANE prefill sidecar did not connect before its readiness deadline",
+                        ));
+                    }
+                    if child.try_wait().ok().flatten().is_some() {
+                        return Err(AnePrefillFailure::new(
+                            AnePrefillFault::Load,
+                            "ANE prefill sidecar exited before its handshake",
+                        ));
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => {
+                    let _ = child.kill();
+                    return Err(AnePrefillFailure::new(
+                        AnePrefillFault::Load,
+                        format!("accept ANE prefill sidecar: {error}"),
+                    ));
+                }
+            }
+        };
+        let mut client = Self {
+            stream,
+            child,
+            socket_path,
+            max_frame: DEFAULT_MAX_FRAME_BYTES,
+            request_sequence: 0,
+            readiness: Duration::ZERO,
+        };
+        client
+            .stream
+            .set_read_timeout(Some(config.readiness_budget))
+            .map_err(|error| {
+                AnePrefillFailure::new(
+                    AnePrefillFault::Load,
+                    format!("set sidecar handshake timeout: {error}"),
+                )
+            })?;
+        let hello = client.read_json(AnePrefillFault::Load)?;
+        let advertised_max = validate_sidecar_hello(&hello, &nonce)?;
+        client.max_frame = advertised_max.min(DEFAULT_MAX_FRAME_BYTES);
+        client.write_json(
+            &serde_json::json!({
+                "type": "HELLO_ACK",
+                "protocol": ANE_PREFILL_PROTOCOL_VERSION,
+                "accept": true,
+                "expected_engine": {
+                    "name": ANE_PREFILL_ENGINE_NAME,
+                    "version": ANE_PREFILL_ENGINE_VERSION,
+                },
+                "nonce": nonce,
+                "max_frame_bytes": client.max_frame,
+            }),
+            AnePrefillFault::Load,
+        )?;
+        client.install(config)?;
+        Ok(client)
+    }
+
+    fn install(&mut self, config: &AnePrefillConfig) -> Result<(), AnePrefillFailure> {
+        let request_id = self.next_request_id("install");
+        let started = Instant::now();
+        self.set_io_timeout(config.readiness_budget, AnePrefillFault::ReadinessBudget)?;
+        self.write_json(
+            &serde_json::json!({
+                "type": "INSTALL",
+                "request_id": request_id,
+                "model_ref": config.model_ref,
+                "artifact_path": config.artifact_path,
+                "artifact_sha256": config.artifact_digest,
+                "window": config.window,
+                "layers": config.layers,
+                "kv_heads": config.kv_heads,
+                "head_dimension": config.head_dimension,
+                "vocabulary_size": config.vocabulary_size,
+                "readiness_timeout_ms": config.readiness_budget.as_millis(),
+            }),
+            AnePrefillFault::Load,
+        )?;
+        let response = self.read_json(AnePrefillFault::ReadinessBudget)?;
+        if response.get("type").and_then(Value::as_str) == Some("ERROR") {
+            return Err(sidecar_error(&response, AnePrefillFault::Load));
+        }
+        validate_response(&response, "INSTALLED", &request_id, config)?;
+        self.readiness = started.elapsed();
+        Ok(())
+    }
+
+    fn execute(
+        &mut self,
+        config: &AnePrefillConfig,
+        prompt: &[u32],
+    ) -> Result<AnePrefillPayload, AnePrefillFailure> {
+        let request_id = self.next_request_id("execute");
+        let input_ids = prompt
+            .iter()
+            .copied()
+            .map(|token| {
+                i32::try_from(token).map_err(|_| {
+                    AnePrefillFailure::new(
+                        AnePrefillFault::Dispatch,
+                        "token id exceeds the sidecar i32 protocol",
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut padded_ids = input_ids;
+        padded_ids.resize(config.window, 0);
+        let mut attention_mask = vec![0_i32; config.window];
+        attention_mask[..prompt.len()].fill(1);
+        self.set_io_timeout(
+            config
+                .prediction_budget
+                .saturating_add(config.handoff_budget),
+            AnePrefillFault::PredictionTimeout,
+        )?;
+        self.write_json(
+            &serde_json::json!({
+                "type": "EXECUTE",
+                "request_id": request_id,
+                "model_ref": config.model_ref,
+                "active_tokens": prompt.len(),
+                "input_ids": padded_ids,
+                "attention_mask": attention_mask,
+            }),
+            AnePrefillFault::Dispatch,
+        )?;
+        let response = self.read_json(AnePrefillFault::PredictionTimeout)?;
+        if response.get("type").and_then(Value::as_str) == Some("ERROR") {
+            return Err(sidecar_error(&response, AnePrefillFault::Prediction));
+        }
+        validate_execution_header(&response, &request_id, config, prompt.len())?;
+        let ipc_started = Instant::now();
+        self.set_io_timeout(config.handoff_budget, AnePrefillFault::Ipc)?;
+        let logits = decode_f32_frame(&self.read_raw(AnePrefillFault::Ipc)?)
+            .map_err(|error| AnePrefillFailure::new(AnePrefillFault::Ipc, error.to_string()))?;
+        let kv_bits = decode_f16_bits(&self.read_raw(AnePrefillFault::Ipc)?)?;
+        let timing_request_id = self.next_request_id("timing");
+        self.write_json(
+            &serde_json::json!({
+                "type": "TIMING_READBACK",
+                "request_id": timing_request_id,
+                "execution_id": request_id,
+            }),
+            AnePrefillFault::Ipc,
+        )?;
+        let timing = self.read_json(AnePrefillFault::Ipc)?;
+        if timing.get("type").and_then(Value::as_str) == Some("ERROR") {
+            return Err(sidecar_error(&timing, AnePrefillFault::Ipc));
+        }
+        validate_timing(&timing, &timing_request_id, &request_id)?;
+        let timings = AnePrefillTimings {
+            readiness: self.readiness,
+            prediction: milliseconds_field(&timing, "prediction_ms", AnePrefillFault::Ipc)?,
+            kv_layout: milliseconds_field(&timing, "kv_layout_ms", AnePrefillFault::Ipc)?,
+            logits_copy: milliseconds_field(&timing, "logits_copy_ms", AnePrefillFault::Ipc)?,
+            ipc: ipc_started.elapsed(),
+            ..AnePrefillTimings::default()
+        };
+        if timings.prediction > config.prediction_budget {
+            return Err(AnePrefillFailure::new(
+                AnePrefillFault::PredictionTimeout,
+                "sidecar prediction exceeded the calibrated ANE attempt budget",
+            ));
+        }
+        Ok(AnePrefillPayload {
+            active_tokens: prompt.len(),
+            logits,
+            kv_bits,
+            timings,
+        })
+    }
+
+    fn next_request_id(&mut self, kind: &str) -> String {
+        self.request_sequence = self.request_sequence.saturating_add(1);
+        format!("{kind}-{}", self.request_sequence)
+    }
+
+    fn set_io_timeout(
+        &self,
+        timeout: Duration,
+        fault: AnePrefillFault,
+    ) -> Result<(), AnePrefillFailure> {
+        self.stream
+            .set_read_timeout(Some(timeout))
+            .and_then(|_| self.stream.set_write_timeout(Some(timeout)))
+            .map_err(|error| {
+                AnePrefillFailure::new(fault, format!("set sidecar I/O timeout: {error}"))
+            })
+    }
+
+    fn write_json(
+        &mut self,
+        value: &Value,
+        fault: AnePrefillFault,
+    ) -> Result<(), AnePrefillFailure> {
+        let bytes = serde_json::to_vec(value).map_err(|error| {
+            AnePrefillFailure::new(fault, format!("encode sidecar frame: {error}"))
+        })?;
+        write_frame(&mut self.stream, &bytes, self.max_frame)
+            .map_err(|error| AnePrefillFailure::new(fault, format!("write sidecar frame: {error}")))
+    }
+
+    fn read_raw(&mut self, fault: AnePrefillFault) -> Result<Vec<u8>, AnePrefillFailure> {
+        read_frame(&mut self.stream, self.max_frame).map_err(|error| {
+            let timeout = matches!(
+                error.kind(),
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+            );
+            let fault = if timeout && fault == AnePrefillFault::PredictionTimeout {
+                AnePrefillFault::PredictionTimeout
+            } else {
+                fault
+            };
+            AnePrefillFailure::new(fault, format!("read sidecar frame: {error}"))
+        })
+    }
+
+    fn read_json(&mut self, fault: AnePrefillFault) -> Result<Value, AnePrefillFailure> {
+        let bytes = self.read_raw(fault)?;
+        serde_json::from_slice(&bytes)
+            .map_err(|error| AnePrefillFailure::new(fault, format!("decode sidecar JSON: {error}")))
+    }
+}
+
+impl Drop for AnePrefillClient {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = fs::remove_file(&self.socket_path);
+    }
+}
+
+fn validate_sidecar_hello(value: &Value, nonce: &str) -> Result<u32, AnePrefillFailure> {
+    let object = value.as_object().ok_or_else(|| {
+        AnePrefillFailure::new(AnePrefillFault::Load, "sidecar HELLO is not an object")
+    })?;
+    let engine = object
+        .get("engine")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            AnePrefillFailure::new(
+                AnePrefillFault::Load,
+                "sidecar HELLO has no engine identity",
+            )
+        })?;
+    let valid = object.len() == 5
+        && object.contains_key("type")
+        && object.contains_key("protocol")
+        && object.contains_key("engine")
+        && object.contains_key("nonce")
+        && object.contains_key("max_frame_bytes")
+        && object.get("type").and_then(Value::as_str) == Some("HELLO")
+        && object.get("protocol").and_then(Value::as_u64) == Some(ANE_PREFILL_PROTOCOL_VERSION)
+        && object.get("nonce").and_then(Value::as_str) == Some(nonce)
+        && engine.get("name").and_then(Value::as_str) == Some(ANE_PREFILL_ENGINE_NAME)
+        && engine.get("version").and_then(Value::as_str) == Some(ANE_PREFILL_ENGINE_VERSION);
+    if !valid {
+        return Err(AnePrefillFailure::new(
+            AnePrefillFault::Load,
+            "sidecar HELLO does not match the required protocol, nonce, or engine identity",
+        ));
+    }
+    let max_frame = object
+        .get("max_frame_bytes")
+        .and_then(Value::as_u64)
+        .and_then(|size| u32::try_from(size).ok())
+        .filter(|size| *size > 0)
+        .ok_or_else(|| {
+            AnePrefillFailure::new(
+                AnePrefillFault::Load,
+                "sidecar HELLO has an invalid maximum frame size",
+            )
+        })?;
+    Ok(max_frame)
+}
+
+fn validate_response(
+    value: &Value,
+    expected_type: &str,
+    request_id: &str,
+    config: &AnePrefillConfig,
+) -> Result<(), AnePrefillFailure> {
+    let valid = value.get("type").and_then(Value::as_str) == Some(expected_type)
+        && value.get("request_id").and_then(Value::as_str) == Some(request_id)
+        && value.get("model_ref").and_then(Value::as_str) == Some(config.model_ref.as_str());
+    if valid {
+        Ok(())
+    } else {
+        Err(AnePrefillFailure::new(
+            AnePrefillFault::Ipc,
+            format!("sidecar response is not a matching {expected_type} frame"),
+        ))
+    }
+}
+
+fn validate_execution_header(
+    value: &Value,
+    request_id: &str,
+    config: &AnePrefillConfig,
+    active_tokens: usize,
+) -> Result<(), AnePrefillFailure> {
+    validate_response(value, "EXECUTED", request_id, config)?;
+    let layout = value
+        .get("kv_layout")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            AnePrefillFailure::new(AnePrefillFault::Ipc, "EXECUTED frame has no K/V layout")
+        })?;
+    let expected_order = ["layer", "key_or_value", "head", "position", "dimension"];
+    let order = layout
+        .get("order")
+        .and_then(Value::as_array)
+        .map(|entries| entries.iter().filter_map(Value::as_str).collect::<Vec<_>>());
+    let valid = value.get("execution_id").and_then(Value::as_str) == Some(request_id)
+        && value.get("active_tokens").and_then(Value::as_u64) == Some(active_tokens as u64)
+        && layout.get("kind").and_then(Value::as_str) == Some("f16_le")
+        && order.as_deref() == Some(expected_order.as_slice())
+        && layout.get("layers").and_then(Value::as_u64) == Some(config.layers as u64)
+        && layout.get("kv_heads").and_then(Value::as_u64) == Some(config.kv_heads as u64)
+        && layout.get("head_dimension").and_then(Value::as_u64)
+            == Some(config.head_dimension as u64)
+        && layout.get("active_tokens").and_then(Value::as_u64) == Some(active_tokens as u64)
+        && value.get("logits_bytes").and_then(Value::as_u64)
+            == Some((config.vocabulary_size * std::mem::size_of::<f32>()) as u64)
+        && value.get("kv_bytes").and_then(Value::as_u64)
+            == Some(
+                (config.layers
+                    * 2
+                    * config.kv_heads
+                    * active_tokens
+                    * config.head_dimension
+                    * std::mem::size_of::<u16>()) as u64,
+            );
+    if valid {
+        Ok(())
+    } else {
+        Err(AnePrefillFailure::new(
+            AnePrefillFault::Ipc,
+            "EXECUTED frame does not describe the selected ANE prefill arm",
+        ))
+    }
+}
+
+fn validate_timing(
+    value: &Value,
+    request_id: &str,
+    execution_id: &str,
+) -> Result<(), AnePrefillFailure> {
+    let valid = value.get("type").and_then(Value::as_str) == Some("TIMING")
+        && value.get("request_id").and_then(Value::as_str) == Some(request_id)
+        && value.get("execution_id").and_then(Value::as_str) == Some(execution_id);
+    if valid {
+        Ok(())
+    } else {
+        Err(AnePrefillFailure::new(
+            AnePrefillFault::Ipc,
+            "sidecar timing readback does not match the completed execution",
+        ))
+    }
+}
+
+fn sidecar_error(value: &Value, default_fault: AnePrefillFault) -> AnePrefillFailure {
+    let code = value
+        .get("code")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let fault = match code {
+        "readiness_timeout" => AnePrefillFault::ReadinessBudget,
+        "artifact_mismatch" => AnePrefillFault::ArtifactMismatch,
+        "compile_failure" => AnePrefillFault::Compile,
+        "load_failure" => AnePrefillFault::Load,
+        "io_failure" => AnePrefillFault::Ipc,
+        "sidecar_busy" | "invalid_request" | "not_found" => AnePrefillFault::Dispatch,
+        "cancelled" => AnePrefillFault::Prediction,
+        _ => default_fault,
+    };
+    let message = value
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("sidecar returned an error response");
+    AnePrefillFailure::new(fault, format!("sidecar {code}: {message}"))
+}
+
+fn milliseconds_field(
+    value: &Value,
+    field: &str,
+    fault: AnePrefillFault,
+) -> Result<Duration, AnePrefillFailure> {
+    let milliseconds = value
+        .get(field)
+        .and_then(Value::as_f64)
+        .filter(|milliseconds| milliseconds.is_finite() && *milliseconds >= 0.0)
+        .ok_or_else(|| {
+            AnePrefillFailure::new(fault, format!("sidecar timing has invalid {field}"))
+        })?;
+    Ok(Duration::from_secs_f64(milliseconds / 1_000.0))
+}
+
+fn decode_f16_bits(bytes: &[u8]) -> Result<Vec<u16>, AnePrefillFailure> {
+    let chunks = bytes.chunks_exact(std::mem::size_of::<u16>());
+    if !chunks.remainder().is_empty() {
+        return Err(AnePrefillFailure::new(
+            AnePrefillFault::Ipc,
+            "sidecar f16 K/V frame length is not divisible by two",
+        ));
+    }
+    Ok(chunks
+        .map(|chunk| u16::from_le_bytes(chunk.try_into().expect("u16 frame chunk has two bytes")))
+        .collect())
+}
+
+fn expand_active_kv_bits(
+    active_bits: &[u16],
+    layers: usize,
+    kv_heads: usize,
+    active_tokens: usize,
+    cache_bucket: usize,
+    head_dimension: usize,
+) -> Result<Vec<u16>, AnePrefillFailure> {
+    let active_per_head = active_tokens.checked_mul(head_dimension).ok_or_else(|| {
+        AnePrefillFailure::new(AnePrefillFault::KvConversion, "active K/V shape overflow")
+    })?;
+    let cache_per_head = cache_bucket.checked_mul(head_dimension).ok_or_else(|| {
+        AnePrefillFailure::new(
+            AnePrefillFault::KvConversion,
+            "decode cache K/V shape overflow",
+        )
+    })?;
+    let active_per_layer = 2usize
+        .checked_mul(kv_heads)
+        .and_then(|size| size.checked_mul(active_per_head))
+        .ok_or_else(|| {
+            AnePrefillFailure::new(
+                AnePrefillFault::KvConversion,
+                "active K/V layer shape overflow",
+            )
+        })?;
+    let cache_per_layer = 2usize
+        .checked_mul(kv_heads)
+        .and_then(|size| size.checked_mul(cache_per_head))
+        .ok_or_else(|| {
+            AnePrefillFailure::new(
+                AnePrefillFault::KvConversion,
+                "decode cache layer shape overflow",
+            )
+        })?;
+    let expected_active = layers.checked_mul(active_per_layer).ok_or_else(|| {
+        AnePrefillFailure::new(
+            AnePrefillFault::KvConversion,
+            "active K/V payload shape overflow",
+        )
+    })?;
+    if active_bits.len() != expected_active || active_tokens == 0 || active_tokens > cache_bucket {
+        return Err(AnePrefillFailure::new(
+            AnePrefillFault::KvConversion,
+            "sidecar K/V payload does not match the active fixed-window layout",
+        ));
+    }
+    let mut cache_bits = vec![0_u16; layers * cache_per_layer];
+    for layer in 0..layers {
+        for key_or_value in 0..2 {
+            for head in 0..kv_heads {
+                let source =
+                    layer * active_per_layer + (key_or_value * kv_heads + head) * active_per_head;
+                let destination =
+                    layer * cache_per_layer + (key_or_value * kv_heads + head) * cache_per_head;
+                cache_bits[destination..destination + active_per_head]
+                    .copy_from_slice(&active_bits[source..source + active_per_head]);
+            }
+        }
+    }
+    Ok(cache_bits)
+}
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -95,6 +947,121 @@ impl DecodeEngine {
             engine.reset()?;
         }
         Ok(())
+    }
+
+    fn prefill_greedy_ane(
+        &mut self,
+        ane_prefill: &mut AnePrefillRuntime,
+        prompt: &[u32],
+        decode_bucket: usize,
+    ) -> Result<(DecodeCache, u32), AnePrefillFailure> {
+        let (cache, logits, mut timings) =
+            self.admit_ane_prefill(ane_prefill, prompt, decode_bucket)?;
+        let selection_started = Instant::now();
+        let token = first_token_from_logits(&logits)?;
+        timings.logits_publication = selection_started.elapsed();
+        ensure_handoff_budget(ane_prefill, &timings)?;
+        ane_prefill.record_success(timings);
+        Ok((cache, token))
+    }
+
+    fn prefill_logits_ane(
+        &mut self,
+        ane_prefill: &mut AnePrefillRuntime,
+        prompt: &[u32],
+        decode_bucket: usize,
+    ) -> Result<(DecodeCache, Vec<f32>), AnePrefillFailure> {
+        let (cache, logits, mut timings) =
+            self.admit_ane_prefill(ane_prefill, prompt, decode_bucket)?;
+        let publication_started = Instant::now();
+        validate_logits(&logits, ane_prefill.config.vocabulary_size)?;
+        timings.logits_publication = publication_started.elapsed();
+        ensure_handoff_budget(ane_prefill, &timings)?;
+        ane_prefill.record_success(timings);
+        Ok((cache, logits))
+    }
+
+    fn admit_ane_prefill(
+        &mut self,
+        ane_prefill: &mut AnePrefillRuntime,
+        prompt: &[u32],
+        decode_bucket: usize,
+    ) -> Result<(DecodeCache, Vec<f32>, AnePrefillTimings), AnePrefillFailure> {
+        let mut payload = ane_prefill.execute(prompt)?;
+        let conversion_started = Instant::now();
+        let cache_bits = expand_active_kv_bits(
+            &payload.kv_bits,
+            ane_prefill.config.layers,
+            ane_prefill.config.kv_heads,
+            payload.active_tokens,
+            decode_bucket,
+            ane_prefill.config.head_dimension,
+        )?;
+        payload.timings.kv_conversion = conversion_started.elapsed();
+        let cache = match self {
+            Self::Qwen {
+                decoder,
+                f16_prefill,
+                layer_count,
+            } => {
+                let cache = if let Some(prefill) = f16_prefill {
+                    // The q8 step engine imports K/V from its f16 prefill engine.
+                    // Materializing the sidecar payload in that source cache keeps
+                    // the existing engine-to-engine conversion on the certified path.
+                    let source_upload_started = Instant::now();
+                    prefill.import_caches(&cache_bits).map_err(|error| {
+                        AnePrefillFailure::new(
+                            AnePrefillFault::MetalUpload,
+                            format!("upload ANE K/V into the f16 source cache: {error}"),
+                        )
+                    })?;
+                    payload.timings.metal_upload = source_upload_started.elapsed();
+                    let cache_handoff_started = Instant::now();
+                    let source_bits =
+                        collect_qwen_cache_bits(prefill, *layer_count).map_err(|error| {
+                            AnePrefillFailure::new(
+                                AnePrefillFault::CacheHandoff,
+                                format!("read f16 cache for q8 handoff: {error}"),
+                            )
+                        })?;
+                    payload.timings.cache_handoff = cache_handoff_started.elapsed();
+                    let target_upload_started = Instant::now();
+                    decoder.import_caches(&source_bits).map_err(|error| {
+                        AnePrefillFailure::new(
+                            AnePrefillFault::MetalUpload,
+                            format!("upload q8 decode cache: {error}"),
+                        )
+                    })?;
+                    payload.timings.metal_upload = payload
+                        .timings
+                        .metal_upload
+                        .saturating_add(target_upload_started.elapsed());
+                    MetalStepKvCache {
+                        position: payload.active_tokens,
+                    }
+                } else {
+                    let upload_started = Instant::now();
+                    decoder.import_caches(&cache_bits).map_err(|error| {
+                        AnePrefillFailure::new(
+                            AnePrefillFault::MetalUpload,
+                            format!("upload ANE K/V into the f16 decode cache: {error}"),
+                        )
+                    })?;
+                    payload.timings.metal_upload = upload_started.elapsed();
+                    MetalStepKvCache {
+                        position: payload.active_tokens,
+                    }
+                };
+                DecodeCache::Qwen(cache)
+            }
+            Self::Lfm2 { .. } => {
+                return Err(AnePrefillFailure::new(
+                    AnePrefillFault::Dispatch,
+                    "ANE prefill is supported only for the Qwen3 decode engine",
+                ));
+            }
+        };
+        Ok((cache, payload.logits, payload.timings))
     }
 
     fn prefill_greedy(&mut self, prompt: &[u32]) -> Result<(DecodeCache, u32)> {
@@ -294,12 +1261,57 @@ fn handoff_qwen_cache(
     layer_count: usize,
     position: usize,
 ) -> Result<MetalStepKvCache> {
+    let cache_bits = collect_qwen_cache_bits(prefill, layer_count)?;
+    decoder.import_caches(&cache_bits)?;
+    Ok(MetalStepKvCache { position })
+}
+
+fn collect_qwen_cache_bits(prefill: &MetalStepDecoder<'_>, layer_count: usize) -> Result<Vec<u16>> {
     let mut cache_bits = Vec::new();
     for layer in 0..layer_count {
         cache_bits.extend(prefill.inspect_cache_bits(layer)?);
     }
-    decoder.import_caches(&cache_bits)?;
-    Ok(MetalStepKvCache { position })
+    Ok(cache_bits)
+}
+
+fn validate_logits(logits: &[f32], vocabulary_size: usize) -> Result<(), AnePrefillFailure> {
+    if logits.len() != vocabulary_size || !logits.iter().all(|logit| logit.is_finite()) {
+        return Err(AnePrefillFailure::new(
+            AnePrefillFault::LogitsPublication,
+            "sidecar logits cannot safely select or constrain the first token",
+        ));
+    }
+    Ok(())
+}
+
+fn first_token_from_logits(logits: &[f32]) -> Result<u32, AnePrefillFailure> {
+    validate_logits(logits, logits.len())?;
+    top_logits(logits, 1)
+        .first()
+        .map(|entry| entry.token_id)
+        .ok_or_else(|| {
+            AnePrefillFailure::new(
+                AnePrefillFault::LogitsPublication,
+                "sidecar produced no first-token candidate after cache admission",
+            )
+        })
+}
+
+fn ensure_handoff_budget(
+    ane_prefill: &AnePrefillRuntime,
+    timings: &AnePrefillTimings,
+) -> Result<(), AnePrefillFailure> {
+    if timings.handoff_total() > ane_prefill.config.handoff_budget {
+        return Err(AnePrefillFailure::new(
+            AnePrefillFault::HandoffBudget,
+            format!(
+                "ANE handoff consumed {:?}, exceeding its {:?} budget",
+                timings.handoff_total(),
+                ane_prefill.config.handoff_budget
+            ),
+        ));
+    }
+    Ok(())
 }
 
 struct LoadedRuntime {
@@ -315,6 +1327,9 @@ struct LoadedRuntime {
     vocabulary_digest: String,
     context_bucket: usize,
     engine: DecodeEngine,
+    /// Lazily connected after arm selection so a failed split attempt can return
+    /// to the resident pure-GPU prefill path without replacing this decode worker.
+    ane_prefill: Option<AnePrefillRuntime>,
 }
 
 struct ActiveConstraint {
@@ -431,7 +1446,8 @@ impl WorkerState {
         let vocabulary = Arc::new(TokenVocabulary::from_tokenizer(&tokenizer)?);
         let vocabulary_digest = token_vocabulary_digest(&vocabulary);
 
-        let (engine, stop_ids) = match family {
+        let model_ref = "owned-decode:0".to_string();
+        let (engine, stop_ids, ane_prefill) = match family {
             "qwen3-0.6b" => {
                 let model = Box::leak(Box::new(Qwen3DecodeModel::load_with_quant(
                     path,
@@ -440,6 +1456,16 @@ impl WorkerState {
                 )?));
                 let stop_ids = model.generation_stop_ids().to_vec();
                 let layer_count = model.layers.len();
+                let ane_prefill = AnePrefillConfig::from_runtime_config(
+                    runtime_config,
+                    model_ref.clone(),
+                    layer_count,
+                    model.config.num_key_value_heads,
+                    model.config.head_dim,
+                    vocabulary.len(),
+                    bucket,
+                )?
+                .map(AnePrefillRuntime::new);
                 let decoder = MetalStepDecoder::new(model, Precision::F16, bucket, quant)?;
                 let f16_prefill = if quant.is_quantized() {
                     let model = Box::leak(Box::new(Qwen3DecodeModel::load_with_quant(
@@ -463,17 +1489,17 @@ impl WorkerState {
                         layer_count,
                     },
                     stop_ids,
+                    ane_prefill,
                 )
             }
             "lfm2-1.2b" => {
                 let model = Lfm2DecodeModel::load_with_quant(path, Precision::F16, quant)?;
                 let stop_ids = model.generation_stop_ids().to_vec();
                 let engine = Lfm2HybridStepEngine::new(&model, Precision::F16, bucket, quant)?;
-                (DecodeEngine::Lfm2 { engine }, stop_ids)
+                (DecodeEngine::Lfm2 { engine }, stop_ids, None)
             }
             other => bail!("unsupported owned decode family {other}"),
         };
-        let model_ref = "owned-decode:0".to_string();
         self.loaded = Some(LoadedRuntime {
             model_ref: model_ref.clone(),
             decode_fingerprint: required_config(runtime_config, "decode_fingerprint")?.to_string(),
@@ -486,6 +1512,7 @@ impl WorkerState {
             vocabulary_digest,
             context_bucket: bucket,
             engine,
+            ane_prefill,
         });
         Ok(WorkerResponse::Loaded {
             req_id,
@@ -536,16 +1563,54 @@ impl WorkerState {
             .set_chain_span(effective_chain_k)
             .map_err(|_| DecodeError::Unavailable)?;
         let (cache, next_logits, next_greedy) = if active_constraint.is_some() {
-            let (cache, logits) = loaded
-                .engine
-                .prefill_logits(&start.prompt_ids)
-                .map_err(|_| DecodeError::Unavailable)?;
+            let split = loaded.ane_prefill.as_mut().map(|ane_prefill| {
+                loaded.engine.prefill_logits_ane(
+                    ane_prefill,
+                    &start.prompt_ids,
+                    loaded.context_bucket,
+                )
+            });
+            let (cache, logits) = match split {
+                Some(Ok(result)) => result,
+                Some(Err(failure)) => {
+                    if let Some(ane_prefill) = loaded.ane_prefill.as_mut() {
+                        ane_prefill.record_failure(failure);
+                    }
+                    loaded
+                        .engine
+                        .prefill_logits(&start.prompt_ids)
+                        .map_err(|_| DecodeError::Unavailable)?
+                }
+                None => loaded
+                    .engine
+                    .prefill_logits(&start.prompt_ids)
+                    .map_err(|_| DecodeError::Unavailable)?,
+            };
             (cache, Some(logits), None)
         } else {
-            let (cache, token) = loaded
-                .engine
-                .prefill_greedy(&start.prompt_ids)
-                .map_err(|_| DecodeError::Unavailable)?;
+            let split = loaded.ane_prefill.as_mut().map(|ane_prefill| {
+                loaded.engine.prefill_greedy_ane(
+                    ane_prefill,
+                    &start.prompt_ids,
+                    loaded.context_bucket,
+                )
+            });
+            let (cache, token) = match split {
+                Some(Ok(result)) => result,
+                Some(Err(failure)) => {
+                    if let Some(ane_prefill) = loaded.ane_prefill.as_mut() {
+                        ane_prefill.record_failure(failure);
+                    }
+                    loaded
+                        .engine
+                        .prefill_greedy(&start.prompt_ids)
+                        .map_err(|_| DecodeError::Unavailable)?
+                }
+                None => loaded
+                    .engine
+                    .prefill_greedy(&start.prompt_ids)
+                    .map_err(|_| DecodeError::Unavailable)?,
+            };
             (cache, None, Some(token))
         };
         self.resident = Some(ResidentGeneration {
@@ -2027,6 +3092,68 @@ mod tests {
             identity.build_flags["constraint_encoding"],
             "token-id-json-constraint-v1"
         );
+    }
+
+    #[test]
+    fn every_ane_prefill_fault_has_one_closed_fallback_reason() {
+        let expected = [
+            (AnePrefillFault::Compile, "compile_failure"),
+            (AnePrefillFault::Load, "load_failure"),
+            (AnePrefillFault::Dispatch, "dispatch_failure"),
+            (AnePrefillFault::Prediction, "prediction_failure"),
+            (AnePrefillFault::PredictionTimeout, "prediction_timeout"),
+            (AnePrefillFault::KvConversion, "kv_conversion_failure"),
+            (AnePrefillFault::Ipc, "ipc_handoff_failure"),
+            (AnePrefillFault::CacheHandoff, "cache_handoff_failure"),
+            (AnePrefillFault::MetalUpload, "metal_upload_failure"),
+            (AnePrefillFault::HandoffBudget, "transfer_budget_exceeded"),
+            (
+                AnePrefillFault::ReadinessBudget,
+                "readiness_budget_exhausted",
+            ),
+            (AnePrefillFault::ArtifactMismatch, "artifact_mismatch"),
+            (
+                AnePrefillFault::LogitsPublication,
+                "logits_publication_failure",
+            ),
+        ];
+        assert_eq!(AnePrefillFault::ALL.len(), expected.len());
+        assert_eq!(AnePrefillFallbackReason::ALL.len(), expected.len());
+        for (fault, reason) in expected {
+            assert_eq!(fault.fallback_reason().as_str(), reason);
+            assert_eq!(fault.disposition().fallback_reason.as_str(), reason);
+            assert_eq!(fault.disposition().split_arm_debits, 1);
+            assert_eq!(fault.disposition().decode_lane_debits, 0);
+        }
+    }
+
+    #[test]
+    fn active_kv_expansion_never_admits_padding_positions() {
+        let cache = expand_active_kv_bits(&(0_u16..8).collect::<Vec<_>>(), 1, 1, 2, 4, 2)
+            .expect("active fixed-window payload expands into the decode cache");
+        assert_eq!(
+            cache,
+            vec![0, 1, 2, 3, 0, 0, 0, 0, 4, 5, 6, 7, 0, 0, 0, 0],
+            "only the active two positions may populate either K/V cache plane"
+        );
+    }
+
+    #[test]
+    fn handoff_budget_includes_every_post_prediction_component() {
+        let timings = AnePrefillTimings {
+            readiness: Duration::from_millis(99),
+            prediction: Duration::from_millis(11),
+            kv_layout: Duration::from_millis(2),
+            logits_copy: Duration::from_millis(3),
+            ipc: Duration::from_millis(5),
+            kv_conversion: Duration::from_millis(7),
+            cache_handoff: Duration::from_millis(11),
+            metal_upload: Duration::from_millis(13),
+            logits_publication: Duration::from_millis(17),
+        };
+        assert_eq!(timings.handoff_total(), Duration::from_millis(58));
+        assert_ne!(timings.handoff_total(), timings.readiness);
+        assert_ne!(timings.handoff_total(), timings.prediction);
     }
 }
 
