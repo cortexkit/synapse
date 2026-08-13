@@ -16,6 +16,8 @@
 
 use std::collections::{BTreeSet, VecDeque};
 
+use synapse_core::SpanClass;
+
 use crate::owned_decode_grammar_scheduler::grammar_schema::{
     EnumLiteral, NodeKind, Schema, SchemaType,
 };
@@ -43,6 +45,36 @@ pub struct State {
     scalar: Option<Scalar>,
     /// True once exactly one complete top-level JSON value has closed.
     complete: bool,
+}
+
+impl State {
+    /// Attribute the next token to JSON structure or a semantic value.
+    ///
+    /// Object keys are structural because they are fixed by the schema. A token
+    /// that opens a scalar is classified after its first byte is stepped, which
+    /// keeps the opening quote or first literal byte with the value it begins.
+    pub fn token_span_class(&self, automaton: &Automaton, token: &[u8]) -> SpanClass {
+        let mut state = self.clone();
+        let mut value = semantic_scalar(&state.scalar);
+        for &byte in token {
+            let Ok(next) = automaton.step(&state, byte) else {
+                break;
+            };
+            value |= semantic_scalar(&next.scalar);
+            state = next;
+        }
+        if value {
+            SpanClass::Value
+        } else {
+            SpanClass::Structural
+        }
+    }
+}
+
+fn semantic_scalar(scalar: &Option<Scalar>) -> bool {
+    scalar
+        .as_ref()
+        .is_some_and(|scalar| !matches!(scalar, Scalar::ObjectKey { .. }))
 }
 
 /// An open container frame.

@@ -123,6 +123,22 @@ def percentile(values: Iterable[float], fraction: float) -> float:
     return ordered[math.ceil(fraction * len(ordered)) - 1]
 
 
+def measured_workloads(manifest: dict[str, Any]) -> tuple[str, ...]:
+    if manifest.get("measurement_phase") != "deterministic_arms_phase1":
+        return WORKLOADS
+    workloads = manifest.get("workloads")
+    if not isinstance(workloads, list):
+        raise EvidenceError("phase-1 manifest workloads must be a list")
+    selected = tuple(
+        workload.get("workload_id")
+        for workload in workloads
+        if isinstance(workload, dict) and workload.get("selected_for_measurement") is True
+    )
+    if selected != ("athena-classify-json",):
+        raise EvidenceError("deterministic phase 1 must select only athena-classify-json")
+    return selected
+
+
 def supported_arms(manifest: dict[str, Any]) -> list[str]:
     arms = manifest.get("arms")
     if not isinstance(arms, list):
@@ -176,6 +192,7 @@ def validate_manifest(manifest: dict[str, Any], require_ready: bool) -> None:
     if protocol.get("adversarial_schema_count") is None or int(protocol["adversarial_schema_count"]) < 30:
         raise EvidenceError("manifest requires fewer than 30 adversarial schemas")
     selected = supported_arms(manifest)
+    measured_workloads(manifest)
     unsupported = [
         arm
         for arm in manifest["arms"]
@@ -183,8 +200,12 @@ def validate_manifest(manifest: dict[str, Any], require_ready: bool) -> None:
     ]
     if unsupported:
         raise EvidenceError("unsupported placements must not enter measured-arm denominators")
-    if not any(arm in SIDECAR_ARMS for arm in selected):
-        raise EvidenceError("at least one supported sidecar arm must be selected")
+    phase = manifest.get("measurement_phase")
+    if phase == "deterministic_arms_phase1":
+        if set(selected) != {"B0", BASELINE_ARM, STRUCTURE_ONLY_ARM}:
+            raise EvidenceError("deterministic phase 1 must select exactly B0, B1, and SO-BANK")
+    elif not any(arm in SIDECAR_ARMS for arm in selected):
+        raise EvidenceError("at least one supported sidecar arm must be selected outside deterministic phase 1")
 
 
 def validate_frozen_tree(root: Path) -> None:
@@ -193,7 +214,22 @@ def validate_frozen_tree(root: Path) -> None:
     status_path = evidence / "measurement-status-v1.json"
     calibration_path = evidence / "render-calibration-v1.json"
     row_contract_path = evidence / "measurement-row-contract-v1.json"
-    for path in (manifest_path, status_path, calibration_path, row_contract_path, evidence / "SHA256SUMS"):
+    ready_manifest_path = evidence / "measurement-manifest-phase1-v1.json"
+    rows_path = evidence / "measurement-rows-phase1-v1.jsonl"
+    analysis_path = evidence / "measurement-analysis-phase1-v1.json"
+    required_paths = (
+        manifest_path,
+        status_path,
+        calibration_path,
+        row_contract_path,
+        ready_manifest_path,
+        rows_path,
+        analysis_path,
+        evidence / "cohort-classify-v1.jsonl",
+        evidence / "cohort-adversarial-v1.jsonl",
+        evidence / "SHA256SUMS",
+    )
+    for path in required_paths:
         if not path.is_file():
             raise EvidenceError(f"frozen evidence file is missing: {path}")
     manifest = read_json(manifest_path)
@@ -205,8 +241,10 @@ def validate_frozen_tree(root: Path) -> None:
         raise EvidenceError("unexpected measurement row-contract record_id")
     if status.get("result") != "negative_not_graduated":
         raise EvidenceError("checked-in status must be an honest negative result")
-    if status.get("measurement_execution") != "not_run":
-        raise EvidenceError("checked-in status must not present unrun evidence as measured")
+    if status.get("measurement_execution") != "phase1_executed":
+        raise EvidenceError("checked-in status must record the executed deterministic phase")
+    if status.get("graduated_arms") != []:
+        raise EvidenceError("checked-in status contradicts the negative graduation result")
     if calibration.get("measurement_execution") != "not_run":
         raise EvidenceError("unrun calibration must be recorded as unrun")
     expected_records = {
@@ -214,6 +252,11 @@ def validate_frozen_tree(root: Path) -> None:
         "measurement-status-v1.json",
         "render-calibration-v1.json",
         "measurement-row-contract-v1.json",
+        "measurement-manifest-phase1-v1.json",
+        "measurement-analysis-phase1-v1.json",
+        "measurement-rows-phase1-v1.jsonl",
+        "cohort-classify-v1.jsonl",
+        "cohort-adversarial-v1.jsonl",
     }
     entries: dict[str, str] = {}
     for line_number, line in enumerate((evidence / "SHA256SUMS").read_text(encoding="utf-8").splitlines(), 1):
@@ -227,11 +270,105 @@ def validate_frozen_tree(root: Path) -> None:
             raise EvidenceError(f"SHA256SUMS:{line_number}: duplicate record {name}")
         entries[name] = digest
     if set(entries) != expected_records:
-        raise EvidenceError("SHA256SUMS must cover exactly the frozen JSON records")
+        raise EvidenceError("SHA256SUMS must cover exactly the frozen evidence records")
     for name, expected in entries.items():
         actual = sha256((evidence / name).read_bytes())
         if actual != expected:
             raise EvidenceError(f"digest mismatch for {name}: expected {expected}, got {actual}")
+
+    ready_manifest = read_json(ready_manifest_path)
+    validate_manifest(ready_manifest, require_ready=True)
+    rows = read_jsonl(rows_path)
+    validate_manifest_cohorts(rows, ready_manifest, evidence)
+    report = summarize(rows, ready_manifest)
+    if canonical_json(report) != analysis_path.read_bytes():
+        raise EvidenceError("checked-in phase-1 analysis does not reproduce from the raw rows")
+    if report.get("result") != status.get("result") or report.get("graduated_arms") != status.get("graduated_arms"):
+        raise EvidenceError("checked-in status disagrees with reproduced phase-1 analysis")
+
+
+def validate_manifest_cohorts(
+    rows: list[dict[str, Any]], manifest: dict[str, Any], evidence_dir: Path
+) -> None:
+    cohorts = manifest.get("cohorts")
+    if not isinstance(cohorts, dict):
+        raise EvidenceError("ready manifest must bind frozen cohort records")
+
+    def cohort_rows(partition: str) -> list[dict[str, Any]]:
+        record = cohorts.get(partition)
+        if not isinstance(record, dict):
+            raise EvidenceError(f"manifest lacks the {partition} cohort record")
+        name = record.get("file")
+        digest = record.get("sha256")
+        if not isinstance(name, str) or Path(name).name != name:
+            raise EvidenceError(f"manifest {partition} cohort file must be a local basename")
+        path = evidence_dir / name
+        if not path.is_file() or not isinstance(digest, str) or sha256(path.read_bytes()) != digest:
+            raise EvidenceError(f"manifest {partition} cohort digest does not match {name}")
+        frozen = read_jsonl(path)
+        for item in frozen:
+            if not isinstance(item.get("request_id"), str) or not item["request_id"]:
+                raise EvidenceError(f"{name}: frozen request_id is missing")
+            if not isinstance(item.get("prompt"), str) or not item["prompt"]:
+                raise EvidenceError(f"{name}: frozen prompt is missing")
+            if not isinstance(item.get("grammar"), str) or not item["grammar"]:
+                raise EvidenceError(f"{name}: frozen grammar is missing")
+            nonnegative_count(item.get("max_tokens"), f"{name}.max_tokens")
+        return frozen
+
+    primary = cohort_rows("primary")
+    expected_primary = {item["request_id"] for item in primary}
+    if len(expected_primary) != len(primary):
+        raise EvidenceError("primary cohort duplicates a request_id")
+    actual_primary = {row["request_id"] for row in rows if row.get("partition") == "primary"}
+    if actual_primary != expected_primary:
+        raise EvidenceError("measurement primary rows do not match the frozen cohort file")
+
+    adversarial = cohort_rows("adversarial")
+    expected_adversarial = {
+        (item.get("request_id"), item.get("adversarial_schema_id")) for item in adversarial
+    }
+    if len(expected_adversarial) != len(adversarial) or any(
+        not isinstance(schema_id, str) or not schema_id
+        for _, schema_id in expected_adversarial
+    ):
+        raise EvidenceError("adversarial cohort has duplicate or missing schema identities")
+    actual_adversarial = {
+        (row["request_id"], row.get("adversarial_schema_id"))
+        for row in rows
+        if row.get("partition") == "adversarial"
+    }
+    if actual_adversarial != expected_adversarial:
+        raise EvidenceError("measurement adversarial rows do not match the frozen cohort file")
+
+
+def validate_phase1_arm_order(rows: list[dict[str, Any]], manifest: dict[str, Any]) -> None:
+    if manifest.get("measurement_phase") != "deterministic_arms_phase1":
+        return
+    protocol = manifest["protocol"]
+    if protocol.get("arm_order_algorithm") != "sha256_u64_be_sort_v1":
+        raise EvidenceError("deterministic phase 1 must bind its arm-order algorithm")
+    seed = protocol.get("arm_order_seed")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise EvidenceError("deterministic phase 1 must bind an integer arm-order seed")
+    selected = supported_arms(manifest)
+    for offset in range(0, len(rows), len(selected)):
+        block = rows[offset : offset + len(selected)]
+        if len(block) != len(selected):
+            raise EvidenceError("measurement rows end inside an arm-order block")
+        identity = {(row.get("partition"), row.get("request_id"), row.get("repetition")) for row in block}
+        if len(identity) != 1:
+            raise EvidenceError("measurement rows do not preserve request/repetition arm blocks")
+        _, request_id, repetition = next(iter(identity))
+        expected = sorted(
+            selected,
+            key=lambda arm: hashlib.sha256(
+                f"{seed}\n{request_id}\nmeasured\n{repetition}\n{arm}".encode()
+            ).digest()[:8],
+        )
+        actual = [row.get("arm_id") for row in block]
+        if actual != expected:
+            raise EvidenceError(f"{request_id}/{repetition}: measured arm order is not the seeded order")
 
 
 def validate_row_shape(row: dict[str, Any], selected: set[str], repetitions: int) -> None:
@@ -345,7 +482,7 @@ def request_medians(rows: list[dict[str, Any]], manifest: dict[str, Any]) -> dic
     for workload, request_id, arm_id in grouped:
         request_sets[(workload, arm_id)].add(request_id)
     minimum = int(protocol["minimum_eligible_requests_per_workload"])
-    for workload in WORKLOADS:
+    for workload in measured_workloads(manifest):
         baseline_ids = request_sets[(workload, BASELINE_ARM)]
         if len(baseline_ids) < minimum:
             raise EvidenceError(f"{workload}: B1 has {len(baseline_ids)} eligible requests, needs {minimum}")
@@ -390,7 +527,9 @@ def request_medians(rows: list[dict[str, Any]], manifest: dict[str, Any]) -> dic
         )
         if actual != expected:
             raise EvidenceError(f"{workload}/{request_id}/{arm_id}: token, response, or finish mismatch against B1")
-    if len(so_bank_digests) != sum(len(request_sets[(workload, BASELINE_ARM)]) for workload in WORKLOADS):
+    if len(so_bank_digests) != sum(
+        len(request_sets[(workload, BASELINE_ARM)]) for workload in measured_workloads(manifest)
+    ):
         raise EvidenceError("SO-BANK evidence is incomplete")
     return medians
 
@@ -459,6 +598,7 @@ def bootstrap_median_ci(differences: list[float], resamples: int, seed: int) -> 
 
 def summarize(rows: list[dict[str, Any]], manifest: dict[str, Any]) -> dict[str, Any]:
     validate_manifest(manifest, require_ready=True)
+    validate_phase1_arm_order(rows, manifest)
     primary_rows = [row for row in rows if row.get("partition") == "primary"]
     adversarial_rows = [row for row in rows if row.get("partition") == "adversarial"]
     if len(primary_rows) + len(adversarial_rows) != len(rows):
@@ -481,7 +621,7 @@ def summarize(rows: list[dict[str, Any]], manifest: dict[str, Any]) -> dict[str,
     seed = int(protocol["bootstrap_seed"])
     per_workload: dict[str, dict[str, Any]] = {}
     arm_graduation: dict[str, bool] = {}
-    for workload in WORKLOADS:
+    for workload in measured_workloads(manifest):
         workload_report: dict[str, Any] = {}
         request_ids = sorted(request_id for w, request_id, arm in medians if w == workload and arm == BASELINE_ARM)
         b1 = [medians[(workload, request_id, BASELINE_ARM)] for request_id in request_ids]
@@ -508,6 +648,14 @@ def summarize(rows: list[dict[str, Any]], manifest: dict[str, Any]) -> dict[str,
                     "estimate": statistics.median(differences),
                     "ci95_percentile": [low, high],
                 }
+                if arm_id == STRUCTURE_ONLY_ARM or arm_id in SIDECAR_ARMS:
+                    arm_graduation.setdefault(arm_id, True)
+                    entry["graduation_gates"] = {
+                        "median_at_least_five_percent_lower_than_b1": percentile(values, 0.5) <= percentile(b1, 0.5) * 0.95,
+                        "paired_ci_lower_bound_above_zero": low > 0,
+                        "p95_no_more_than_five_percent_worse_than_b1": percentile(values, 0.95) <= b1_p95 * 1.05,
+                    }
+                    arm_graduation[arm_id] = arm_graduation[arm_id] and all(entry["graduation_gates"].values())
                 if arm_id in SIDECAR_ARMS:
                     baseline_target = [target_decode_medians[(workload, request_id, BASELINE_ARM)] for request_id in request_ids]
                     arm_target = [target_decode_medians[(workload, request_id, arm_id)] for request_id in request_ids]
@@ -516,13 +664,7 @@ def summarize(rows: list[dict[str, Any]], manifest: dict[str, Any]) -> dict[str,
                         "sidecar_arm_target_decode": {"p50": percentile(arm_target, 0.5), "p95": percentile(arm_target, 0.95), "mean": statistics.fmean(arm_target)},
                         "paired_arm_minus_B1_median": statistics.median([arm - baseline for arm, baseline in zip(arm_target, baseline_target)]),
                     }
-                    arm_graduation.setdefault(arm_id, True)
-                    entry["graduation_gates"] = {
-                        "median_at_least_five_percent_lower_than_b1": percentile(values, 0.5) <= percentile(b1, 0.5) * 0.95,
-                        "paired_ci_lower_bound_above_zero": low > 0,
-                        "p95_no_more_than_five_percent_worse_than_b1": percentile(values, 0.95) <= b1_p95 * 1.05,
-                    }
-                    arm_graduation[arm_id] = arm_graduation[arm_id] and all(entry["graduation_gates"].values())
+
             workload_report[arm_id] = entry
         per_workload[workload] = workload_report
     outcomes: dict[str, dict[str, Any]] = {}
@@ -600,7 +742,7 @@ def summarize(rows: list[dict[str, Any]], manifest: dict[str, Any]) -> dict[str,
         "latency_and_resource_evidence": latency,
         "notes": [
             "All timing statistics use request medians; bootstrap units are request IDs.",
-            "A sidecar arm is eligible to graduate only when every workload passes every performance gate and token exactness has already been validated.",
+            "An accelerated arm is eligible to graduate only when every measured workload passes every performance gate and token exactness has already been validated.",
         ],
     }
 
@@ -710,6 +852,38 @@ def self_test(root: Path) -> None:
     report = summarize(rows, manifest)
     if report["result"] != "graduated" or report["graduated_arms"] != ["SC-METAL-DIRECT"]:
         raise AssertionError("known-good paired fixture must satisfy the graduation gate")
+
+    phase1_manifest = copy.deepcopy(manifest)
+    phase1_manifest["measurement_phase"] = "deterministic_arms_phase1"
+    phase1_manifest["protocol"]["arm_order_seed"] = 20260810
+    phase1_manifest["protocol"]["arm_order_algorithm"] = "sha256_u64_be_sort_v1"
+    phase1_manifest["workloads"] = [
+        {"workload_id": "athena-classify-json", "selected_for_measurement": True}
+    ]
+    for arm in phase1_manifest["arms"]:
+        arm["selected_for_measurement"] = arm["arm_id"] in {"B0", BASELINE_ARM, STRUCTURE_ONLY_ARM}
+    phase1_rows = [
+        row
+        for row in rows
+        if row["workload"] == "athena-classify-json"
+        and row["arm_id"] in {BASELINE_ARM, STRUCTURE_ONLY_ARM}
+    ]
+    for row in copy.deepcopy([row for row in phase1_rows if row["arm_id"] == BASELINE_ARM]):
+        row["arm_id"] = "B0"
+        phase1_rows.append(row)
+    phase1_rows.sort(
+        key=lambda row: (
+            row["partition"] != "primary",
+            row["request_id"],
+            row["repetition"],
+            hashlib.sha256(
+                f"20260810\n{row['request_id']}\nmeasured\n{row['repetition']}\n{row['arm_id']}".encode()
+            ).digest()[:8],
+        )
+    )
+    phase1_report = summarize(phase1_rows, phase1_manifest)
+    if phase1_report["result"] != "negative_not_graduated" or phase1_report["graduated_arms"]:
+        raise AssertionError("deterministic phase-1 fixture must analyze without a sidecar graduation claim")
     corrupted = copy.deepcopy(rows)
     for row in corrupted:
         if (
@@ -754,7 +928,10 @@ def main() -> int:
         if analyze:
             if not all(value is not None for value in (args.manifest, args.input, args.out)):
                 raise EvidenceError("--manifest, --input, and --out must be supplied together")
-            report = summarize(read_jsonl(args.input), read_json(args.manifest))
+            rows = read_jsonl(args.input)
+            manifest = read_json(args.manifest)
+            validate_manifest_cohorts(rows, manifest, args.manifest.resolve().parent)
+            report = summarize(rows, manifest)
             args.out.parent.mkdir(parents=True, exist_ok=True)
             args.out.write_bytes(canonical_json(report))
         if not args.validate_frozen and not args.self_test and not analyze:

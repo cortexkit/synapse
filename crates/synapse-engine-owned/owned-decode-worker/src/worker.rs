@@ -363,6 +363,7 @@ impl DecodeWorker for ScriptedWorker {
                             .map(|c| c.constraint_runtime_identity.clone()),
                         constraint_complete,
                         last_completed_sequence: last_sequence,
+                        hint_verification: Default::default(),
                     }),
                 })
             }
@@ -385,6 +386,7 @@ impl DecodeWorker for ScriptedWorker {
                     constraint_identity: None,
                     constraint_complete: false,
                     last_completed_sequence: 0,
+                    hint_verification: Default::default(),
                 }),
             }),
             ScriptedEvent::Crash => Err(WorkerFault::Crash),
@@ -422,6 +424,7 @@ impl DecodeWorker for ScriptedWorker {
                             .map(|c| c.constraint_runtime_identity.clone()),
                         constraint_complete: false,
                         last_completed_sequence: last_sequence,
+                        hint_verification: Default::default(),
                     }),
                 })
             }
