@@ -6,7 +6,7 @@
 
 **Key Characteristics:**
 - **Local Inference Service:** The primary production system (`synapse-module`) acts as a persistent SubC node that receives embedding, generation, and reranking requests. It routes work via a 3-class fair-share aging scheduler to underlying local hardware engine lanes, or to external provider pools via the remote gateway.
-- **Hardware-Specific Workers:** Local model inference runs outside the host process via supervised binary children (`ck-synapse-worker-mlx`, `ck-synapse-worker-ane`, `ck-synapse-worker-llama`, `ck-synapse-worker-cuda`, `ck-synapse-worker-decode`). The host speaks to them over UNIX domain sockets or Windows named pipes using a fast binary framing protocol.
+- **Hardware-Specific Workers:** Local model inference runs outside the host process via supervised binary children (`ck-synapse-worker-mlx`, `ck-synapse-worker-ane`, `ck-synapse-worker-llama`, `ck-synapse-worker-cuda`, `ck-synapse-worker-decode`, and Swift sidecar `ane-prefill-sidecar`). The host speaks to them over UNIX domain sockets or Windows named pipes using a fast binary framing protocol.
 - **Content-Addressed Cache & Durable Jobs:** Persistent SQLite storage manages model downloading (with concurrent shared-lease readers and a two-phase GC), machine capability probing, alias translation, and restartable generation requests (tracking execution/retention TTLs and checkpointed pages).
 - **Serial Execution under Idle-Gate Constraints (Bench Harness):** Prevent measurement contamination by ensuring the host machine is idle (average CPU <= 15%, GPU <= 5% for 6 seconds) before starting any evaluation run.
 - **Self-Contained Execution Lanes (Bench Harness):** Separate binaries or runtime environments for each target evaluate hardware backends before promoting them to production workers.
@@ -19,7 +19,7 @@
 **Synapse SubC Module (`synapse-module`):**
 - Purpose: The main service listening on the SubC bus. Handles route binding, job admission, the model cache, remote provider dispatch, worker lifecycle supervision (offloading worker engine drops to dedicated threads), approval storage and identity-based rollback (`rollback.rs`), runtime admission probe health, storage epochs and rotation ledgers, owned CUDA evidence and declared identities, and in-process execution via the owned engine.
 - Location: `crates/synapse-module`
-- Contains: A 3-class aging scheduler, SQLite durable job and cache lease state, machine probe certification logic, socket/pipe-based worker host, the remote gateway client, module-side routing (`owned-decode-routing`), grammar compilation and DECODE scheduler (`owned-decode-grammar-scheduler`), certification gates and probes (`owned-decode-certification`), approval rollback (`rollback.rs`), contract manifests (`owned-decode-manifests`), request-scoped semantic-sidecar hint bank normalization and per-field slotting (`owned-decode-sidecar`), and direct bindings to `synapse-engine-owned` and `synapse-engine-cuda`.
+- Contains: A 3-class aging scheduler, SQLite durable job and cache lease state, machine probe certification logic, socket/pipe-based worker host, the remote gateway client, module-side routing (`owned-decode-routing` including ANE split prefill routing `owned-decode-routing/ane_prefill.rs`), grammar compilation and DECODE scheduler (`owned-decode-grammar-scheduler`), certification gates and probes (`owned-decode-certification`), approval rollback (`rollback.rs`), contract manifests (`owned-decode-manifests`), request-scoped semantic-sidecar hint bank normalization and per-field slotting (`owned-decode-sidecar`), and direct bindings to `synapse-engine-owned` and `synapse-engine-cuda`.
 - Depends on: `synapse-core`, `synapse-engine-owned`, `synapse-engine-cuda`, `subc-client-rs`, `rusqlite`, `tokio`.
 
 **Remote Gateway (`crates/synapse-module/src/remote`):**
@@ -44,8 +44,8 @@
 
 **Synapse Worker Lanes (`synapse-worker-*`):**
 - Purpose: Execute in-memory tokenization, tensor forward passes, and token generation for specific hardware classes (Apple Silicon MLX, Apple Neural Engine, Llama GGUF, NVIDIA CUDA, and supervised Metal decode).
-- Location: `crates/synapse-worker-mlx`, `crates/synapse-worker-ane`, `crates/synapse-worker-llama`, `crates/synapse-worker-cuda`, `crates/synapse-worker-decode`
-- Contains: Metal-accelerated customized MLX models, CoreML graphs (including the `gte-modernbert` embedder and reranker for the ANE quiet-tier via `ane-coreml-worker`), `llama.cpp` inference processes, supervised owned CUDA runner (`ck-synapse-worker-cuda`) executing MiniLM, ModernBERT, and Qwen3 embedding batches over IPC, and supervised owned Metal decode runner (`ck-synapse-worker-decode`) executing Qwen3 and LFM2 token generation under progress/continuation framing and sidecar hint bank installation.
+- Location: `crates/synapse-worker-mlx`, `crates/synapse-worker-ane`, `crates/synapse-worker-llama`, `crates/synapse-worker-cuda`, `crates/synapse-worker-decode`, `workers/ane-prefill-sidecar`
+- Contains: Metal-accelerated customized MLX models, CoreML graphs (including the `gte-modernbert` embedder and reranker for the ANE quiet-tier via `ane-coreml-worker`), `llama.cpp` inference processes, supervised owned CUDA runner (`ck-synapse-worker-cuda`) executing MiniLM, ModernBERT, and Qwen3 embedding batches over IPC, supervised owned Metal decode runner (`ck-synapse-worker-decode`) executing Qwen3 and LFM2 token generation under progress/continuation framing and sidecar hint bank installation, and supervised Swift ANE prefill sidecar (`ane-prefill-sidecar`) executing fixed-window CoreML prefill passes.
 - Depends on: `synapse-core`, `owned-decode-worker`, `synapse-engine-owned`, `mlx-rs`, `coreml` (via Swift), `reqwest`.
 - Used by: The `synapse-module` host spawning them dynamically based on user requests and capability tiers.
 
@@ -153,6 +153,13 @@
 4. Query constraint state machine (`JsonParser` / automaton) to match allowed byte sequences against the token vocabulary trie and compute the vocabulary-wide bitset `TokenMask`.
 5. Apply the `TokenMask` to the logits (forcing unallowed token logits to negative infinity).
 6. Select the next token from masked logits, advance constraint parser state, and yield progress or final frame.
+
+**ANE Split Prefill and Decode Flow:**
+
+1. Decode requests with `DecodePrefill::AneSplit` enter `AnePrefillRouter` (`crates/synapse-module/owned-decode-routing/ane_prefill.rs`), which evaluates global gates (platform support, Qwen3 family, greedy top-1 sampling, identity pins) and selects the smallest fitting fixed-window prefill bucket (`W128`, `W256`, `W512`).
+2. The router verifies split-arm health (`SplitArmHealth`), checks deadline feasibility against calibrated p95 budgets (`SplitTimingBudgets`), acquires an ANE execution guard, and issues an `EXECUTE` command to `ane-prefill-sidecar` (`workers/ane-prefill-sidecar/`).
+3. `ane-prefill-sidecar` executes CoreML prediction on `CPU_AND_NE`, emitting f32 logits sampled at `active_tokens - 1` and f16 KV cache frames.
+4. `ck-synapse-worker-decode` ingests the KV cache frame and hands off execution to Metal step decode kernels for token generation. If pre-attempt or execution failures occur, the router tags response provenance with closed bypass (`PrefillBypassReason`) or fallback (`PrefillFallbackReason`) categories.
 
 
 **Corpus Generation Flow (Bench):**
@@ -356,6 +363,16 @@
 - Location: `crates/synapse-core/src/worker_engine_names.rs`
 - Pattern: Shared Identity Constants (`LLAMA_WORKER_ENGINE`, `DECODE_WORKER_ENGINE`, `CUDA_WORKER_ENGINE`, etc.).
 
+**ANE Prefill Router & Split Arm Health:**
+- Purpose: Pure routing boundary selecting certified fixed-window CoreML prefill arms (`W128`, `W256`, `W512`), deriving attempt budgets from p95 calibration, managing consecutive-strike quarantine health (`SplitArmHealth`), and mapping closed bypass (`PrefillBypassReason`) and fallback (`PrefillFallbackReason`) provenance.
+- Location: `crates/synapse-module/owned-decode-routing/ane_prefill.rs`
+- Pattern: Pure routing boundary with p95 attempt budgets, consecutive-strike quarantine, and closed provenance tracking.
+
+**ANE Prefill Sidecar:**
+- Purpose: Separately supervised Swift/CoreML process managing fixed-window Qwen3 prefill execution over UNIX domain sockets.
+- Location: `workers/ane-prefill-sidecar/`
+- Pattern: Out-of-process CoreML stage supporting SHA-verified model loading (`INSTALL`), fixed-window token execution on `CPU_AND_NE` (`EXECUTE`), f32 logits and f16 KV cache streaming, and in-flight prediction aborts (`ABORT`).
+
 
 ## Entry Points
 
@@ -428,6 +445,16 @@
 - Location: `crates/synapse-module/src/bin/inline_embed_throughput.rs`
 - Triggers: Execution of `inline_embed_throughput` binary.
 - Responsibilities: Evaluates local batch throughput and query concurrency/latencies under load.
+
+**Constraint Compiler (`compile_constraint`):**
+- Location: `crates/synapse-worker-decode/src/bin/compile_constraint.rs`
+- Triggers: Execution of `compile_constraint` binary.
+- Responsibilities: Compiles JSON Schema grammars into wire-serializable `TokenIdJsonConstraint` structures for worker distribution.
+
+**ANE Prefill Sidecar Binary (`ane-prefill-sidecar`):**
+- Location: `workers/ane-prefill-sidecar/Sources/AnePrefillSidecarExecutable/main.swift`
+- Triggers: Spawned by host worker supervision during ANE prefill execution.
+- Responsibilities: Loads compiled CoreML prefill packages (`INSTALL`), executes fixed-window prediction on `CPU_AND_NE` (`EXECUTE`), streams f32 logits and f16 KV cache frames, and acknowledges in-flight cancels (`ABORT`).
 
 **Campaign Harnesses:**
 - Location: `bench/campaign/decode-harness.sh`, `bench/campaign/metal-step-harness.sh`, `bench/campaign/lfm2-cuda-harness.sh`, `bench/campaign/metal-embed-harness.sh`

@@ -23,6 +23,7 @@
 │   ├── rig/                # External measurement harness and candidate supervisor
 │   ├── spikes/             # Benchmarking experimental spikes (unified-rt, ane-minilm)
 │   └── results/            # Saved telemetry metrics, results, and vectors
+├── contracts/              # Interface contracts and validation scripts (ane-prefill-split)
 ├── corpus/                 # Code chunk files used for evaluations
 ├── crates/                 # Core Synapse application and worker binaries
 │   ├── synapse-core/       # Shared types, protocol, and scheduler traits
@@ -38,9 +39,14 @@
 │   └── synapse-worker-mlx/ # Apple Silicon MLX supervised worker
 ├── docs/                   # Design logs and decisions documentation
 ├── evidence/               # Calibration evidence records and certification policies
+├── manifests/              # Component manifests (ane-prefill-split, semantic-sidecar-v1)
+├── operations/             # Production operations and enablement documentation
+├── tests/                  # Standalone certification harnesses (ane-prefill-certification)
 ├── tools/                  # Shared system tools and distillation harnesses
 │   ├── classify-distill/   # Athena classify distillation harness
 │   └── gather-distill/     # External gather-distillation data generation harness
+├── workers/                # Separately supervised Swift/CoreML sidecar processes
+│   └── ane-prefill-sidecar/ # Swift/CoreML fixed-window prefill sidecar for Qwen3
 ├── Cargo.toml              # Cargo workspace definition
 ├── DECISIONS.md            # Log of architecture design decisions
 └── FOUNDING.md             # Foundational constraints and handoff requirements
@@ -156,6 +162,36 @@
 - Contains: Calibration evidence, SHA256 checksums, and certification policy definitions (e.g., non-Mac certification threshold policies).
 - Key files: `evidence/nonmac/preparation/nonmac-cert-policy-v2.json`
 
+**contracts/:**
+- Purpose: Contains interface validation contracts and specification schema checkers.
+- Contains: JSON schema contracts and Python validation scripts.
+- Key files: `contracts/ane-prefill-split/ane-prefill-split-contract-v1.json`, `contracts/ane-prefill-split/validate_ane_prefill_split_contract.py`
+
+**manifests/:**
+- Purpose: Houses component manifests and target registration schemas.
+- Contains: JSON manifests for sidecar contracts and hardware splits.
+- Key files: `manifests/ane-prefill-split/ane-prefill-split-manifest-v1.json`, `manifests/semantic-sidecar-v1/README.md`
+
+**operations/:**
+- Purpose: Operational playbooks and enablement documentation for fleet components.
+- Contains: Markdown enablement guides.
+- Key files: `operations/ane-prefill-split/ENABLEMENT.md`
+
+**tests/:**
+- Purpose: Standalone certification suites and machine test harnesses running outside cargo test.
+- Contains: Python certification drivers and test harnesses.
+- Key files: `tests/ane-prefill-certification/README.md`, `tests/ane-prefill-certification/certify.py`
+
+**workers/:**
+- Purpose: Houses separately supervised non-Rust sidecar runtime processes.
+- Contains: Swift Package workspaces and executable sources.
+- Key files: `workers/ane-prefill-sidecar/Package.swift`
+
+**workers/ane-prefill-sidecar/:**
+- Purpose: Separately supervised Swift/CoreML sidecar for Qwen3 fixed-window ANE prefill execution.
+- Contains: Swift Package configuration, binary framing protocol handler, CoreML prediction stage, and executable entry.
+- Key files: `workers/ane-prefill-sidecar/Sources/AnePrefillSidecarExecutable/main.swift`, `workers/ane-prefill-sidecar/Sources/AnePrefillSidecar/Stage.swift`
+
 **tools/:**
 - Purpose: Houses shared development tools, utilities, and datasets generation/distillation harnesses.
 - Contains: The `gather-distill` and `classify-distill` TypeScript project workspaces, and `stt-voice-test` utility.
@@ -179,6 +215,8 @@
 - `crates/synapse-module/src/bin/subc_call.rs`: Management surface call utility.
 - `crates/synapse-module/src/bin/inline_embed_throughput.rs`: Batch throughput execution client.
 - `crates/synapse-module/src/bin/timeout_worker.rs`: Shared test mock worker advertising `SYNAPSE_WORKER_EXPECTED_ENGINE` for test timeout and fallback validation.
+- `crates/synapse-worker-decode/src/bin/compile_constraint.rs`: CLI utility compiling JSON Schema grammars into wire-serializable `TokenIdJsonConstraint` structures.
+- `workers/ane-prefill-sidecar/Sources/AnePrefillSidecarExecutable/main.swift`: Executable entry point for the Swift/CoreML ANE prefill sidecar.
 - `bench/harness/src/main.rs`: CLI runner for corpus generation, power wrapper execution, and parity check.
 - `bench/lanes/*/src/main.rs` (Rust), `bench/lanes/mlx-minilm/main.py` (Python), `bench/lanes/ts-embed/main.mjs` (JS), `bench/lanes/potion/main.py` (Python): Main executables for each specific runtime lane.
 - `bench/campaign/decode-harness.sh`, `bench/campaign/metal-step-harness.sh`, `bench/campaign/cuda-quant-harness.sh`, `bench/campaign/lfm2-cuda-harness.sh`, `bench/campaign/metal-embed-harness.sh`: Campaign controller scripts.
@@ -206,6 +244,7 @@
 - `crates/synapse-engine-owned/owned-decode-worker/src/supervisor.rs`: Supervised owned decode worker protocol, boundary precedence, and crash budget tracking.
 - `crates/synapse-module/owned-decode-grammar-scheduler/mod.rs`: Module-side JSON schema grammar compiler and DECODE quantum scheduler.
 - `crates/synapse-module/owned-decode-routing/mod.rs`: Decode request validation, Q8 ingest orchestration, certification probes, and lane routing.
+- `crates/synapse-module/owned-decode-routing/ane_prefill.rs`: ANE prefill split routing (`AnePrefillRouter`), fixed-window bucket selection (`W128`, `W256`, `W512`), attempt timing budgets, consecutive-strike health (`SplitArmHealth`), and closed bypass (`PrefillBypassReason`) and fallback (`PrefillFallbackReason`) provenance.
 - `crates/synapse-worker-decode/src/runner.rs`: Supervised Metal decode worker runner and IPC protocol loop.
 - `crates/synapse-module/src/worker_host/mod.rs`: Spawns and manages worker lifecycles over Unix domain sockets or Windows named pipes using a binary framing protocol.
 - `crates/synapse-module/src/store.rs`: SQLite-backed state for content-addressed model cache, durable jobs, active attempts, and performance tier capabilities.
