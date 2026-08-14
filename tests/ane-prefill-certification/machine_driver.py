@@ -123,6 +123,7 @@ class WorkerClient:
         self._worker_log = self._worker_log_path.open("ab", buffering=0)
         environment = os.environ.copy()
         environment["CK_ANE_PREFILL_LOG_TIMINGS"] = "1"
+        environment["CK_DECODE_LOG_STAGE_TIMINGS"] = "1"
         environment["CK_ANE_PREFILL_CERTIFICATION_PROBE"] = "1"
         self._child = subprocess.Popen(
             [str(worker), "--socket", str(socket_path), "--nonce", nonce],

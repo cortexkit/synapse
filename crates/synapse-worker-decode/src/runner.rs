@@ -11,7 +11,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
     thread,
     time::{Duration, Instant},
@@ -67,6 +67,7 @@ const ANE_PREFILL_PROTOCOL_VERSION: u64 = 1;
 const ANE_PREFILL_ENGINE_NAME: &str = "ane-prefill-coreml";
 const ANE_PREFILL_ENGINE_VERSION: &str = "coreml-fixed-window-v1";
 const ANE_PREFILL_CERTIFICATION_PROBE_ENV: &str = "CK_ANE_PREFILL_CERTIFICATION_PROBE";
+const DECODE_STAGE_TIMING_ENV: &str = "CK_DECODE_LOG_STAGE_TIMINGS";
 const ANE_PREFILL_CERTIFICATION_PROBE_TYPE: &str = "CERTIFICATION_ANE_PREFILL_FALLBACK_PROBE";
 const ANE_PREFILL_CERTIFICATION_TIMING_TYPE: &str = "CERTIFICATION_ANE_PREFILL_FALLBACK_TIMING";
 const ANE_PREFILL_CERTIFICATION_TIMING_ERROR_TYPE: &str =
@@ -307,6 +308,8 @@ fn prefill_budget(runtime_config: &BTreeMap<String, String>, key: &str) -> Resul
 struct AnePrefillTimings {
     readiness: Duration,
     prediction: Duration,
+    sidecar_prediction: Duration,
+    sidecar_total: Duration,
     kv_layout: Duration,
     logits_copy: Duration,
     ipc: Duration,
@@ -459,10 +462,19 @@ impl AnePrefillRuntime {
     fn record_success(&mut self, timings: AnePrefillTimings) {
         if std::env::var_os("CK_ANE_PREFILL_LOG_TIMINGS").is_some() {
             eprintln!(
-                "ANE prefill timing: readiness={:?} prediction={:?} handoff={:?}",
-                timings.readiness,
-                timings.prediction,
-                timings.handoff_total()
+                "ANE prefill timing: readiness_ms={:.3} worker_execute_ms={:.3} sidecar_prediction_ms={:.3} sidecar_kv_layout_ms={:.3} sidecar_logits_copy_ms={:.3} sidecar_total_ms={:.3} payload_ipc_ms={:.3} kv_expand_ms={:.3} cache_handoff_ms={:.3} metal_upload_ms={:.3} logits_publication_ms={:.3} contract_handoff_sum_ms={:.3}",
+                duration_milliseconds(timings.readiness),
+                duration_milliseconds(timings.prediction),
+                duration_milliseconds(timings.sidecar_prediction),
+                duration_milliseconds(timings.kv_layout),
+                duration_milliseconds(timings.logits_copy),
+                duration_milliseconds(timings.sidecar_total),
+                duration_milliseconds(timings.ipc),
+                duration_milliseconds(timings.kv_conversion),
+                duration_milliseconds(timings.cache_handoff),
+                duration_milliseconds(timings.metal_upload),
+                duration_milliseconds(timings.logits_publication),
+                duration_milliseconds(timings.handoff_total()),
             );
         }
         self.last_failure = None;
@@ -774,13 +786,13 @@ impl AnePrefillClient {
             return Err(sidecar_error(&timing, AnePrefillFault::Ipc));
         }
         validate_timing(&timing, &timing_request_id, &request_id)?;
-        let _sidecar_prediction =
-            milliseconds_field(&timing, "prediction_ms", AnePrefillFault::Ipc)?;
         let timings = AnePrefillTimings {
             readiness: self.readiness,
-            // Certification measures prediction time at the worker boundary using
-            // elapsed wall-clock time, but this code still validates the sidecar payload.
+            // `prediction` is wall time observed by the worker, while the sidecar
+            // fields measure work completed before it published `EXECUTED`.
             prediction,
+            sidecar_prediction: milliseconds_field(&timing, "prediction_ms", AnePrefillFault::Ipc)?,
+            sidecar_total: milliseconds_field(&timing, "total_ms", AnePrefillFault::Ipc)?,
             kv_layout: milliseconds_field(&timing, "kv_layout_ms", AnePrefillFault::Ipc)?,
             logits_copy: milliseconds_field(&timing, "logits_copy_ms", AnePrefillFault::Ipc)?,
             ipc: ipc_started.elapsed(),
@@ -1907,6 +1919,10 @@ impl WorkerState {
     }
 
     fn try_start(&mut self, start: GenerateStart) -> Result<WorkerFrame, DecodeError> {
+        let timing_enabled = decode_stage_timing_enabled();
+        let request_started = timing_enabled.then(Instant::now);
+        let prompt_tokens = start.prompt_ids.len();
+        let max_tokens = start.max_tokens;
         if self.resident.is_some() {
             return Err(DecodeError::ProtocolMismatch);
         }
@@ -1939,6 +1955,9 @@ impl WorkerState {
             .engine
             .set_chain_span(effective_chain_k)
             .map_err(|_| DecodeError::Unavailable)?;
+        let prepare = elapsed_if_enabled(request_started.as_ref());
+        let split_configured = loaded.ane_prefill.is_some();
+        let prefill_started = timing_enabled.then(Instant::now);
         let (cache, next_logits, next_greedy) = if active_constraint.is_some() {
             let split = loaded.ane_prefill.as_mut().map(|ane_prefill| {
                 loaded.engine.prefill_logits_ane(
@@ -1990,6 +2009,18 @@ impl WorkerState {
             };
             (cache, None, Some(token))
         };
+        let prefill = elapsed_if_enabled(prefill_started.as_ref());
+        let prefill_engine = if !split_configured {
+            "gpu"
+        } else if loaded
+            .ane_prefill
+            .as_ref()
+            .is_some_and(|runtime| runtime.last_failure.is_none())
+        {
+            "ane-split"
+        } else {
+            "gpu-fallback"
+        };
         self.resident = Some(ResidentGeneration {
             generation_id: start.generation_id,
             max_tokens: start.max_tokens,
@@ -2004,7 +2035,18 @@ impl WorkerState {
             hint_verification: HintVerificationStats::default(),
             awaiting_continue: false,
         });
-        self.run_quantum(authorization.first_quantum_budget)
+        let quantum_started = timing_enabled.then(Instant::now);
+        let frame = self.run_quantum(authorization.first_quantum_budget)?;
+        if timing_enabled {
+            eprintln!(
+                "Decode generate timing: engine={prefill_engine} prompt_tokens={prompt_tokens} max_tokens={max_tokens} prepare_ms={:.3} prefill_ms={:.3} first_quantum_ms={:.3} worker_total_ms={:.3}",
+                duration_milliseconds(prepare),
+                duration_milliseconds(prefill),
+                duration_milliseconds(elapsed_if_enabled(quantum_started.as_ref())),
+                duration_milliseconds(elapsed_if_enabled(request_started.as_ref())),
+            );
+        }
+        Ok(frame)
     }
 
     fn continue_generation(&mut self, continuation: GenerateContinue) -> FrameEnvelope {
@@ -2939,6 +2981,14 @@ fn handle_decode_request(
     abort_after_progress: bool,
     abort_after_progress_once: Option<&Path>,
 ) -> Result<()> {
+    let timing_enabled = decode_stage_timing_enabled();
+    let request_started = timing_enabled.then(Instant::now);
+    let request_kind = timing_enabled.then_some(match &request {
+        DecodeTransportRequest::GenerateStart { .. } => "start",
+        DecodeTransportRequest::GenerateContinue { .. } => "continue",
+        DecodeTransportRequest::GenerateInstallHintBank { .. } => "install_hint_bank",
+        DecodeTransportRequest::GenerateCancel { .. } => "cancel",
+    });
     let response = match request {
         DecodeTransportRequest::GenerateStart { req_id, start } => DecodeTransportResponse::Frame {
             req_id,
@@ -3000,7 +3050,17 @@ fn handle_decode_request(
     if emitted_progress && (abort_after_progress || abort_once) {
         std::process::abort();
     }
+    let dispatch = elapsed_if_enabled(request_started.as_ref());
+    let publication_started = timing_enabled.then(Instant::now);
     write_json_frame(stream, &response, max_frame)?;
+    if let Some(request_kind) = request_kind {
+        eprintln!(
+            "Decode protocol timing: request={request_kind} dispatch_ms={:.3} publication_ms={:.3} worker_total_ms={:.3}",
+            duration_milliseconds(dispatch),
+            duration_milliseconds(elapsed_if_enabled(publication_started.as_ref())),
+            duration_milliseconds(elapsed_if_enabled(request_started.as_ref())),
+        );
+    }
     Ok(())
 }
 
@@ -3387,6 +3447,15 @@ fn certification_probe_error(req_id: Option<&str>, code: &str, message: &str) ->
     })
 }
 
+fn decode_stage_timing_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os(DECODE_STAGE_TIMING_ENV).is_some())
+}
+
+fn elapsed_if_enabled(started: Option<&Instant>) -> Duration {
+    started.map(Instant::elapsed).unwrap_or_default()
+}
+
 fn duration_milliseconds(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1_000.0
 }
@@ -3626,6 +3695,8 @@ mod tests {
         let timings = AnePrefillTimings {
             readiness: Duration::from_millis(99),
             prediction: Duration::from_millis(11),
+            sidecar_prediction: Duration::from_millis(10),
+            sidecar_total: Duration::from_millis(20),
             kv_layout: Duration::from_millis(2),
             logits_copy: Duration::from_millis(3),
             ipc: Duration::from_millis(5),
