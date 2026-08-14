@@ -24,8 +24,8 @@ DIGEST = "a" * 64
 class FakeDriver:
     """Models raw driver observations without recreating harness verdict logic."""
 
-    def __init__(self, corrupt_split_case_id: str | None = None) -> None:
-        self.corrupt_split_case_id = corrupt_split_case_id
+    def __init__(self, forks: dict[str, dict[str, Any]] | None = None) -> None:
+        self.forks = forks or {}
         self.requests: list[dict[str, Any]] = []
 
     def exchange(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -58,8 +58,9 @@ class FakeDriver:
             arm = request["arm"]
             token_seed = sum(prompt) % 10_000
             tokens = [token_seed + offset for offset in range(certify.CONTINUATION_TOKENS)]
-            if request["engine"] == "ane-split" and request["case_id"] == self.corrupt_split_case_id:
-                tokens[-1] += 1
+            fork = self.forks.get(request["case_id"])
+            if request["engine"] == "ane-split" and fork is not None:
+                tokens[int(fork.get("position", 0))] += 1
             response: dict[str, Any] = {
                 "status": "ok",
                 "generated_token_ids": tokens,
@@ -71,6 +72,38 @@ class FakeDriver:
             if arm["decode_config"] == "q8-step":
                 response["cache_handoff"] = "engine_to_engine"
             return response
+        if operation == "band_gate_observation":
+            prompt = request["prompt_token_ids"]
+            token_seed = sum(prompt) % 10_000
+            fork = self.forks.get(request["case_id"])
+            first_fork = None
+            if fork is not None:
+                position = int(fork.get("position", 0))
+                oracle_token = token_seed + position
+                split_token = oracle_token + 1
+                oracle_top2 = [oracle_token, split_token]
+                split_top2 = [split_token, oracle_token]
+                if fork.get("kind") == "non_swap":
+                    split_top2 = [split_token, split_token + 1]
+                first_fork = {
+                    "position": position,
+                    "oracle_selected_token": oracle_token,
+                    "split_selected_token": split_token,
+                    "oracle_top2_token_ids": oracle_top2,
+                    "split_top2_token_ids": split_top2,
+                    "oracle_top2_gap": float(fork.get("oracle_gap", 0.01)),
+                    "split_top2_gap": float(fork.get("split_gap", 0.01)),
+                }
+            return {
+                "status": "ok",
+                "case_id": request["case_id"],
+                "first_fork": first_fork,
+                "kv_admission": {
+                    "active_positions": len(prompt),
+                    "p95_abs_difference": float((fork or {}).get("kv_p95", 0.07)),
+                    "roundtrip_bit_mismatches": int((fork or {}).get("bit_mismatches", 0)),
+                },
+            }
         if operation in {"routing_battery", "warmup"}:
             response = {"status": "ok"}
             if operation == "routing_battery":
@@ -175,10 +208,37 @@ class CertificationHarnessTests(unittest.TestCase):
         self.assertEqual(result["maximum_worst_case_fallback_ttft_ms"], 170.0)
         self.assertEqual(len(result["semantic_exercises"]), len(certify.BYPASS_REASONS) + len(certify.FALLBACK_FAULTS) + len(certify.LIFECYCLE_CASES) + len(certify.QUARANTINE_CASES) + len(certify.PIN_CASES) + 1)
 
-    def test_w128_token_divergence_cannot_be_recorded_absent(self) -> None:
-        driver = FakeDriver(corrupt_split_case_id="w128-width-00")
-        with self.assertRaisesRegex(certify.CertificationFailure, "diverged"):
-            certify.Certifier(ROOT, driver).run()
+    def test_legal_top2_swap_inside_band_passes(self) -> None:
+        driver = FakeDriver({"w128-width-00": {"position": 7}})
+        battery = certify.Certifier(ROOT, driver).run_token_battery(
+            certify.Arm("test-m5-profile", "qwen3-0.6b", 128, "f16-step", True)
+        )
+        gate = battery["band_gate"]
+        self.assertEqual(gate["fork_count"], 1)
+        self.assertTrue(gate["fork_evidence"][0]["swap_verdict"])
+
+    def test_non_swap_divergence_fails_closed(self) -> None:
+        driver = FakeDriver({"w128-width-00": {"kind": "non_swap"}})
+        with self.assertRaisesRegex(certify.TokenDivergence, "not an ordered top-2 swap") as raised:
+            certify.Certifier(ROOT, driver).run_token_battery(
+                certify.Arm("test-m5-profile", "qwen3-0.6b", 128, "f16-step", True)
+            )
+        self.assertFalse(raised.exception.evidence["fork_evidence"][0]["swap_verdict"])
+
+    def test_four_in_band_swaps_fail_the_twenty_prompt_cap(self) -> None:
+        forks = {f"w128-width-{index:02d}": {} for index in range(4)}
+        with self.assertRaisesRegex(certify.TokenDivergence, "above the 3-fork cap") as raised:
+            certify.Certifier(ROOT, FakeDriver(forks)).run_token_battery(
+                certify.Arm("test-m5-profile", "qwen3-0.6b", 128, "f16-step", True)
+            )
+        self.assertEqual(len(raised.exception.evidence["fork_evidence"]), 4)
+
+    def test_swap_with_gap_point_zero_six_fails_the_band(self) -> None:
+        driver = FakeDriver({"w128-width-00": {"split_gap": 0.06}})
+        with self.assertRaisesRegex(certify.TokenDivergence, "outside the < 0.05 band"):
+            certify.Certifier(ROOT, driver).run_token_battery(
+                certify.Arm("test-m5-profile", "qwen3-0.6b", 128, "f16-step", True)
+            )
 
     def test_every_requested_semantic_case_reaches_the_driver(self) -> None:
         driver = FakeDriver()

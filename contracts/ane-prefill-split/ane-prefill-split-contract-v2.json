@@ -1,0 +1,370 @@
+{
+  "contract_revision": "ane-prefill-split-contract-v2",
+  "schema_revision": 2,
+  "contract_kind": "production_split_prefill_contract",
+  "source_spec": {
+    "path": ".cortexkit/alfonso/drafts/2026-08-13-ane-prefill-split-refire3.md",
+    "binding_resolution": "resolutions_round_3 supersedes folded constraints when they disagree"
+  },
+  "named_artifacts": {
+    "epic_design_note": {
+      "path": "docs/design-ane-prefill-split.md",
+      "must_exist_before": ["worker_stage", "routing", "certification"],
+      "records": [
+        "swift_sidecar embodiment",
+        "padding direction and active-index rules",
+        "processing fingerprint canonical payload",
+        "split-arm persistence and migration shape",
+        "decode-config label mapping",
+        "handshake-mismatch -> unavailable-arm mapping and its bypass reason",
+        "recorded owner branch selections"
+      ]
+    },
+    "evidence_record": {
+      "path": "evidence/ane-prefill-split/evidence-record-v1.json",
+      "must_exist_before": ["certification", "fleet_enable"],
+      "records": [
+        "per-arm digests, package sizes, and package-to-arm mapping",
+        "oracle path, sampling seam, and processing-pin seam facts",
+        "timing samples, p95 values, and derived budgets",
+        "certification attempts and absence reasons"
+      ]
+    },
+    "operations_document": {
+      "path": "docs/operations-ane-prefill-split.md",
+      "must_exist_before": ["routing", "fleet_enable"],
+      "records": [
+        "enable and disable ladder",
+        "loader configuration and readiness budget",
+        "ANE guard bound and derived attempt budget",
+        "quarantine query and probation semantics",
+        "worst-case fallback TTFT and scheduler dissent"
+      ]
+    }
+  },
+  "scope": {
+    "family": "qwen3-0.6b",
+    "included_buckets": [128, 256, 512],
+    "decode_prefill_config": {
+      "field": "decode_prefill",
+      "type": "machine_level_user_tier",
+      "values": ["gpu", "ane-split"],
+      "default": "gpu"
+    },
+    "wire_freeze": {
+      "frozen_type": "MicroLlmOneshotParams",
+      "new_request_fields": false,
+      "routing_request": "OneshotRequest is internal to route_owned_decode_wire",
+      "current_route_sampling": "greedy_top1",
+      "current_route_required_processing_fingerprint": null
+    }
+  },
+  "worker_handshake": {
+    "phase": "sidecar CONNECT before any request frame",
+    "protocol": "existing strict handshake negotiates the worker protocol version and engine identity",
+    "mismatch": "A protocol-version or engine-identity mismatch marks the exact arm unavailable; the CONNECT fault debits that arm once and is quarantine-eligible.",
+    "request_behavior": "Requests never select an unavailable arm and bypass with prefill_bypass_reason=quarantined. This reports the arm's health-scoped unavailable state without adding a protocol-mismatch token.",
+    "bypass_reason": "quarantined",
+    "request_health_debit": false,
+    "mid_attempt_defense_in_depth": "A mismatch that somehow surfaces after a split attempt has begun maps to dispatch_failure."
+  },
+  "arm_schema": {
+    "identity_fields": ["machine_profile", "family", "bucket", "decode_config"],
+    "canonical_key": "(machine_profile, family, bucket, decode_config)",
+    "field_types": {
+      "machine_profile": "revisioned machine-profile digest string",
+      "family": "enum:qwen3-0.6b",
+      "bucket": "enum:128|256|512",
+      "decode_config": "enum:f16-step|q8-step"
+    },
+    "inheritance": "none across decode_config, bucket, or machine_profile",
+    "compiled_package_key": "(family, bucket)",
+    "certification_cache_requirement": "cache_bucket >= bucket + 64"
+  },
+  "decode_config_labels": {
+    "f16-step": {
+      "weight_quant": "f16",
+      "decode_engine": "owned_metal_f16_step",
+      "ane_kv_target": "decoding_engine_cache",
+      "engine_to_engine_cache_handoff": false,
+      "pure_gpu_oracle": "fleet_enabled_pure_gpu_prefill_same_decode_config"
+    },
+    "q8-step": {
+      "weight_quant": "q8_0",
+      "decode_engine": "owned_metal_q8_step",
+      "ane_kv_target": "decoding_engine_cache",
+      "engine_to_engine_cache_handoff": true,
+      "pure_gpu_oracle": "fleet_enabled_pure_gpu_prefill_same_decode_config"
+    }
+  },
+  "artifact_triple": {
+    "fields": [
+      "source_checkpoint_digest",
+      "derived_or_compiled_artifact_digest",
+      "certification_recorded_artifact_digest"
+    ],
+    "source_of_truth": {
+      "source_checkpoint_digest": "manifest entry",
+      "derived_or_compiled_artifact_digest": "loaded or newly-built runtime artifact",
+      "certification_recorded_artifact_digest": "green certification row"
+    },
+    "eligibility_rule": "A loaded arm is eligible only when its source_checkpoint_digest matches the manifest and its derived_or_compiled_artifact_digest matches the certification_recorded_artifact_digest. An unloaded certified arm with a matching source checkpoint is selectable; readiness must verify the complete triple before its first use.",
+    "preselection_mismatch": "artifact_digest_mismatch bypass",
+    "postselection_load_completion_mismatch": "artifact_mismatch fallback with one exact-arm health debit and no certification-row mutation"
+  },
+  "certification": {
+    "row_outcomes": ["certified", "absent"],
+    "runtime_states": ["certified", "bucket_absent", "not_certified"],
+    "runtime_state_derivation": {
+      "certified": "a current green row exists for the exact arm",
+      "bucket_absent": "a recorded certification attempt for the exact arm ended absent",
+      "not_certified": "no attempt row exists for the exact arm"
+    },
+    "not_runtime_states": ["artifact_digest_mismatch", "quarantined", "readiness", "load_state"],
+    "absence_reasons": [
+      "capacity_precondition_unmet",
+      "correctness_divergence",
+      "placement_failure",
+      "cert_transfer_budget_exceeded",
+      "ttft_not_lower",
+      "compile_or_load_failure",
+      "disk_headroom_unmet"
+    ],
+    "absence_response_mapping": "Every recorded absent row maps to the runtime bypass reason bucket_absent; its absence_reason is available only through the evidence record and operations query.",
+    "certification_requirements": {
+      "split_arm_correctness_gate": {
+        "gate_revision": "ane-prefill-split-band-gate-v2",
+        "decision_provenance": "Owner-ratified on 2026-08-14; parameters are derived from docs/diag-ane-prefill-divergence.md and docs/diag-ane-prefill-m1-authority.md.",
+        "scope": "Only ANE-prefill split arms are judged by this gate. Pure-GPU decode exactness, embedding parity, and every other lane retain their existing gates.",
+        "battery": "Each exact arm is judged independently over its 20 width-exact prompts against the same-decode-config pure-GPU oracle, with 64 greedy generated tokens per prompt.",
+        "first_fork_only": "A prompt is judged at its first divergent generated-token position. After a legal fork, the remaining continuation may differ freely and is not another fork.",
+        "top2_swap": "At every first fork, the split-selected token and oracle-selected token must form the same two-token top-2 set in both logits rows, with the order reversed between rows; each selected token is therefore the other row's top-2 candidate.",
+        "logit_near_tie": {
+          "comparison": "absolute top-1 minus top-2 gap in each logits row is strictly less than the limit",
+          "maximum_exclusive": 0.05,
+          "applies_to": ["same_decode_config_pure_gpu_oracle", "ane_prefill_split"]
+        },
+        "fork_cap": {
+          "maximum_inclusive": 3,
+          "battery_prompt_count": 20,
+          "per": "exact arm"
+        },
+        "kv_admission_fidelity": {
+          "active_position_p95_abs_maximum_inclusive": 0.1,
+          "reference": "The raw Core ML f16 K/V is compared with owned-Metal f16 pure-GPU prefill before any q8-step engine-to-engine handoff; token-fork logits still use the exact arm's same-decode-config oracle.",
+          "cache_admission_roundtrip_bit_mismatches": 0,
+          "applies_to": "every width-battery observation"
+        },
+        "evidence": "Certification output records each fork position, both ordered top-2 token sets, both gaps, and the harness-computed swap verdict, plus per-prompt active-position K/V p95 and admission roundtrip bit mismatches.",
+        "failure": "A non-swap fork, a gap outside the strict band, a fourth fork in one arm's 20-prompt battery, K/V p95 above the limit, a non-byte-faithful admission roundtrip, or incomplete evidence fails that exact arm with correctness_divergence."
+      },
+      "auxiliary_corpora": {
+        "corpora": ["variable_length_battery", "grammar_constrained_row", "chain_k_16_row"],
+        "rule": "Exercise split execution, fixed-window active-position invariants, grammar handling, and chain composition. Continuation token equality is not a correctness requirement for the distinct ane-split processing identity."
+      },
+      "ttft": "warm-package split p50 must be lower than same-config pure-GPU p50",
+      "w128_headline": "both W128 decode configs require pure-GPU p50 / split p50 >= 5.0"
+    }
+  },
+  "reason_vocabularies": {
+    "prefill_bypass_reason": [
+      "disabled",
+      "platform_unsupported",
+      "family_unsupported",
+      "sampling_uncertified",
+      "identity_pinned_gpu",
+      "prompt_over_max_bucket",
+      "no_fitting_cache_bucket",
+      "bucket_absent",
+      "not_certified",
+      "artifact_digest_mismatch",
+      "quarantined",
+      "ane_busy",
+      "deadline_too_tight"
+    ],
+    "prefill_fallback_reason": [
+      "compile_failure",
+      "load_failure",
+      "dispatch_failure",
+      "prediction_failure",
+      "prediction_timeout",
+      "kv_conversion_failure",
+      "ipc_handoff_failure",
+      "cache_handoff_failure",
+      "metal_upload_failure",
+      "transfer_budget_exceeded",
+      "readiness_budget_exhausted",
+      "artifact_mismatch",
+      "logits_publication_failure"
+    ],
+    "absence_reason": [
+      "capacity_precondition_unmet",
+      "correctness_divergence",
+      "placement_failure",
+      "cert_transfer_budget_exceeded",
+      "ttft_not_lower",
+      "compile_or_load_failure",
+      "disk_headroom_unmet"
+    ],
+    "disjointness_requirement": "The three vocabularies are pairwise disjoint; a spelling belongs to exactly one namespace."
+  },
+  "bypass_table": [
+    {"reason": "disabled", "phase": "global", "split_attempt_started": false, "health_debit": false},
+    {"reason": "platform_unsupported", "phase": "global", "split_attempt_started": false, "health_debit": false},
+    {"reason": "family_unsupported", "phase": "global", "split_attempt_started": false, "health_debit": false},
+    {"reason": "sampling_uncertified", "phase": "global", "split_attempt_started": false, "health_debit": false},
+    {"reason": "identity_pinned_gpu", "phase": "global", "split_attempt_started": false, "health_debit": false},
+    {"reason": "prompt_over_max_bucket", "phase": "window_enumeration", "split_attempt_started": false, "health_debit": false},
+    {"reason": "no_fitting_cache_bucket", "phase": "capacity_filter", "split_attempt_started": false, "health_debit": false},
+    {"reason": "bucket_absent", "phase": "terminal_smallest_fitting_arm", "split_attempt_started": false, "health_debit": false},
+    {"reason": "not_certified", "phase": "terminal_smallest_fitting_arm", "split_attempt_started": false, "health_debit": false},
+    {"reason": "artifact_digest_mismatch", "phase": "terminal_smallest_fitting_arm", "split_attempt_started": false, "health_debit": false},
+    {"reason": "quarantined", "phase": "terminal_smallest_fitting_arm", "split_attempt_started": false, "health_debit": false, "unavailable_arm_mapping": "A CONNECT-time protocol-version or engine-identity mismatch has already charged this exact arm once and made it quarantine-eligible; later requests bypass without an additional debit."},
+    {"reason": "ane_busy", "phase": "guard_acquisition", "split_attempt_started": false, "health_debit": false},
+    {"reason": "deadline_too_tight", "phase": "deadline_feasibility", "split_attempt_started": false, "health_debit": false}
+  ],
+  "fallback_table": [
+    {"fault": "compile_error_after_selection", "reason": "compile_failure", "health_debit": "exact_arm_once"},
+    {"fault": "load_error_or_load_timeout_after_selection", "reason": "load_failure", "health_debit": "exact_arm_once"},
+    {"fault": "dispatch_start_or_acknowledgement_failure", "reason": "dispatch_failure", "health_debit": "exact_arm_once"},
+    {"fault": "acknowledged_stage_exit_before_prediction_result", "reason": "prediction_failure", "health_debit": "exact_arm_once"},
+    {"fault": "prediction_budget_expiry_while_stage_unresponsive", "reason": "prediction_timeout", "health_debit": "exact_arm_once"},
+    {"fault": "kv_layout_or_conversion_failure", "reason": "kv_conversion_failure", "health_debit": "exact_arm_once"},
+    {"fault": "cache_payload_publication_or_receipt_failure", "reason": "ipc_handoff_failure", "health_debit": "exact_arm_once"},
+    {"fault": "prefill_engine_to_decoding_engine_cache_conversion_failure", "reason": "cache_handoff_failure", "health_debit": "exact_arm_once"},
+    {"fault": "metal_cache_upload_failure", "reason": "metal_upload_failure", "health_debit": "exact_arm_once"},
+    {"fault": "handoff_budget_expiry", "reason": "transfer_budget_exceeded", "health_debit": "exact_arm_once"},
+    {"fault": "readiness_budget_expiry", "reason": "readiness_budget_exhausted", "health_debit": "exact_arm_once"},
+    {"fault": "load_completion_artifact_triple_mismatch", "reason": "artifact_mismatch", "health_debit": "exact_arm_once"},
+    {"fault": "logits_copy_or_first_token_publication_failure", "reason": "logits_publication_failure", "health_debit": "exact_arm_once"}
+  ],
+  "routing": {
+    "global_bypass_precedence": [
+      "disabled",
+      "platform_unsupported",
+      "family_unsupported",
+      "sampling_uncertified",
+      "identity_pinned_gpu"
+    ],
+    "selection_algorithm": [
+      "evaluate global_bypass_precedence before window enumeration",
+      "enumerate included buckets greater than or equal to canonical prompt length in ascending order",
+      "remove buckets whose exact decode_config lacks cache_bucket >= prompt_length + max_tokens",
+      "select the first ascending exact arm with a green row, matching artifact triple, and no quarantine; unloaded matching arms remain selectable for bounded readiness",
+      "when no arm is selectable, derive bucket_absent, not_certified, artifact_digest_mismatch, or quarantined from the smallest remaining window alone",
+      "acquire the ANE guard within ane_attempt_budget_ms; failure is ane_busy and does not begin an attempt",
+      "after guard acquisition, evaluate remaining deadline feasibility; failure is deadline_too_tight and does not begin an attempt"
+    ],
+    "pinned_ane_split": "Never substitute GPU. A pre-attempt class returns the existing identity-preserving failure without a debit; an in-attempt failure returns an identity-preserving execution failure and debits the exact arm once.",
+    "unpinned": "A bypass completes on GPU with prefill_engine=gpu and exactly one bypass reason. A fallback completes on GPU with prefill_engine=gpu, prefill_fallback_from=ane-w<bucket>, and exactly one fallback reason."
+  },
+  "timing": {
+    "measurement_units": "milliseconds",
+    "derived_values": {
+      "ane_attempt_budget_ms": "2 * calibrated_coreml_prediction_p95_ms",
+      "prediction_budget_ms": "ane_attempt_budget_ms",
+      "handoff_budget_ms": "2 * calibrated_full_handoff_p95_ms",
+      "readiness_budget_ms": "configured loader compile-or-load budget; zero for artifact-warm requests"
+    },
+    "guard_rule": "ANE guard acquisition is pre-attempt and is bounded by ane_attempt_budget_ms. guard_wait_budget is retired and must not be independently configured.",
+    "prediction_rule": "The same calibrated ane_attempt_budget_ms bounds prediction after an attempt begins; guard time and prediction time are separately measured and never double-counted.",
+    "handoff_clock": [
+      "CoreML prediction return",
+      "stride-aware f16 K/V extraction and layout conversion",
+      "cache payload publication, transport, receipt, and validation",
+      "q8-step engine-to-engine cache conversion when applicable",
+      "Metal cache upload",
+      "logits copy and first-token selection"
+    ],
+    "full_split_ceiling_ms": "ane_attempt_budget_ms + readiness_budget_ms + prediction_budget_ms + handoff_budget_ms",
+    "deadline_feasibility": "elapsed_time + remaining readiness, prediction, handoff, and measured GPU-prefill p95 must fit the caller deadline",
+    "worst_case_fallback_rows": {
+      "artifact_warm": "consume guard, prediction, and handoff bounds; breach handoff last; then pay full GPU prefill",
+      "cold_ready": "consume guard and readiness budget; fail readiness; then pay full GPU prefill"
+    }
+  },
+  "processing_fingerprint": {
+    "engine_classes": ["gpu", "ane-split"],
+    "canonical_payload_fields_in_order": [
+      "decode_fingerprint",
+      "prefill_engine_class",
+      "tokenizer_sanitized_digest",
+      "prompt_template_revision",
+      "special_token_policy_revision",
+      "stop_token_policy_revision",
+      "detokenizer_revision"
+    ],
+    "canonical_encoding": "serde_json::to_vec over the declared payload struct in the listed field order",
+    "digest": "lowercase SHA-256 hex of canonical_encoding",
+    "bucket_included": false,
+    "completion_identity": {
+      "split_success": "ane-split",
+      "gpu_bypass_or_fallback": "gpu"
+    },
+    "wire_targets": ["DispatchedCommand.processing_fingerprint", "required_processing_fingerprint"]
+  },
+  "persistence": {
+    "certification_table": {
+      "name": "split_prefill_certification_rows",
+      "primary_key": ["machine_profile", "family", "bucket", "decode_config"],
+      "outcome_values": ["certified", "absent"],
+      "required_columns": [
+        "machine_profile",
+        "family",
+        "bucket",
+        "decode_config",
+        "outcome",
+        "artifact_triple_json",
+        "attempted_at_ms",
+        "evidence_record_ref"
+      ],
+      "certified_only_columns": ["timing_json", "processing_fingerprint", "oracle_path"],
+      "absent_only_columns": ["absence_reason"],
+      "write_rule": "only certification/probe work writes certification outcomes; runtime fallback never mutates a green row"
+    },
+    "health_table": {
+      "name": "split_prefill_arm_health",
+      "primary_key": ["machine_profile", "family", "bucket", "decode_config"],
+      "required_columns": ["consecutive_strikes", "quarantined_until_ms", "probation", "updated_at_ms"],
+      "failure_rule": "each fallback or pinned in-attempt failure adds exactly one strike to this arm and zero strikes to the decode-lane worker key",
+      "success_rule": "a successful split attempt resets only this arm's consecutive_strikes to zero",
+      "expiry_rule": "quarantine expiry enters probation at max_strikes - 1; one failure re-quarantines and one success clears probation",
+      "restart_rule": "both rows persist across process restart; load_state is process-local and is re-derived from the persisted certification row and artifact triple"
+    },
+    "migration": {
+      "shape": "create both split-prefill tables without rewriting existing worker-key crash-budget records",
+      "existing_worker_records": "retain cumulative saturating semantics unchanged",
+      "split_arm_records": "new records use the exact four-field arm key and consecutive semantics"
+    }
+  },
+  "recorded_owner_branches": [
+    {
+      "id": "OQ-2-decode-cache-capacity",
+      "selected": "enumerate_existing_decode_cache_capacities_and_record_absent_when_bucket_plus_64_is_unmet",
+      "escape": "adding a decode-side capacity requires an owner decision in the operations document",
+      "gate": "affected bucket certification",
+      "record": "docs/operations-ane-prefill-split.md"
+    },
+    {
+      "id": "OQ-3-worker-stage-embodiment",
+      "selected": "separately_supervised_swift_coreml_sidecar",
+      "escape": "in_process_bridge requires design-note proof of isolation, fallback, timeout, guard, lifecycle, and restart ownership",
+      "gate": "worker implementation",
+      "record": "docs/design-ane-prefill-split.md"
+    },
+    {
+      "id": "OQ-4-scheduler-accounting",
+      "selected": "pure_gpu_equivalent_admission_accounting",
+      "escape": "decode_only_charging requires an owner decision and admission-path tracing",
+      "gate": "routing and scheduler integration",
+      "record": "docs/operations-ane-prefill-split.md"
+    },
+    {
+      "id": "OQ-5-gpu-freed-calibration-failure",
+      "selected": "calibration_failure_blocks_enable_pending_owner_decision",
+      "escape": "owner decision may authorize enable after CALIBRATION-FAILED is recorded",
+      "gate": "fleet enable",
+      "record": "docs/operations-ane-prefill-split.md"
+    }
+  ]
+}

@@ -96,6 +96,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-new-tokens", type=int, default=64)
     parser.add_argument(
+        "--forced-prefix-json",
+        type=Path,
+        help="JSON array of tokens shared by the production paths before they diverge",
+    )
+    parser.add_argument(
         "--skip-cpu-control",
         action="store_true",
         help="capture only CPU_AND_NE (useful for the 20-fixture flip-density battery)",
@@ -171,6 +176,10 @@ def main() -> int:
         "--out",
         str(args.output_dir / "analysis.json"),
     ]
+    if args.forced_prefix_json is not None:
+        analyzer_command.extend(
+            ["--forced-prefix-json", str(args.forced_prefix_json.resolve())]
+        )
     if not args.skip_cpu_control:
         run_coreml(args, fixture_path, args.output_dir, "cpu-only")
         analyzer_command.extend(

@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-CONTRACT_PATH = Path("contracts/ane-prefill-split/ane-prefill-split-contract-v1.json")
+CONTRACT_PATH = Path("contracts/ane-prefill-split/ane-prefill-split-contract-v2.json")
 MANIFEST_PATH = Path("manifests/ane-prefill-split/ane-prefill-split-manifest-v1.json")
 NAMED_PATHS = {
     "epic_design_note": "docs/design-ane-prefill-split.md",
@@ -118,8 +118,8 @@ def require_disjoint(reason_sets: dict[str, set[str]]) -> None:
 
 
 def validate_contract(contract: dict[str, Any]) -> None:
-    require_equal(contract.get("contract_revision"), "ane-prefill-split-contract-v1", "contract revision")
-    require_equal(contract.get("schema_revision"), 1, "schema revision")
+    require_equal(contract.get("contract_revision"), "ane-prefill-split-contract-v2", "contract revision")
+    require_equal(contract.get("schema_revision"), 2, "schema revision")
     named_artifacts = contract.get("named_artifacts")
     require(isinstance(named_artifacts, dict), "named_artifacts must be an object")
     for artifact, path in NAMED_PATHS.items():
@@ -199,6 +199,37 @@ def validate_contract(contract: dict[str, Any]) -> None:
         ["artifact_digest_mismatch", "quarantined", "readiness", "load_state"],
         "non-state observables",
     )
+    requirements = certification.get("certification_requirements")
+    require(isinstance(requirements, dict), "certification requirements must be an object")
+    require("token_exactness" not in requirements, "split-arm strict token exactness was not replaced")
+    gate = requirements.get("split_arm_correctness_gate")
+    require(isinstance(gate, dict), "split-arm correctness band gate is missing")
+    require_equal(gate.get("gate_revision"), "ane-prefill-split-band-gate-v2", "band gate revision")
+    require("Only ANE-prefill split arms" in str(gate.get("scope")), "band gate scope")
+    require("first divergent" in str(gate.get("first_fork_only")), "first-fork rule")
+    require("order reversed" in str(gate.get("top2_swap")), "top-2 swap rule")
+    near_tie = gate.get("logit_near_tie")
+    require(isinstance(near_tie, dict), "near-tie band is missing")
+    require_equal(near_tie.get("maximum_exclusive"), 0.05, "near-tie exclusive maximum")
+    require("strictly less" in str(near_tie.get("comparison")), "near-tie comparison")
+    fork_cap = gate.get("fork_cap")
+    require(isinstance(fork_cap, dict), "fork cap is missing")
+    require_equal(fork_cap.get("maximum_inclusive"), 3, "fork cap")
+    require_equal(fork_cap.get("battery_prompt_count"), 20, "fork-cap battery size")
+    kv_gate = gate.get("kv_admission_fidelity")
+    require(isinstance(kv_gate, dict), "K/V admission gate is missing")
+    require_equal(kv_gate.get("active_position_p95_abs_maximum_inclusive"), 0.10, "K/V p95 maximum")
+    require("before any q8-step engine-to-engine handoff" in str(kv_gate.get("reference")), "K/V fidelity reference")
+    require_equal(kv_gate.get("cache_admission_roundtrip_bit_mismatches"), 0, "admission bit mismatches")
+    require("correctness_divergence" in str(gate.get("failure")), "band-gate failure mapping")
+    auxiliary = requirements.get("auxiliary_corpora")
+    require(isinstance(auxiliary, dict), "auxiliary certification corpora are missing")
+    require_equal(
+        auxiliary.get("corpora"),
+        ["variable_length_battery", "grammar_constrained_row", "chain_k_16_row"],
+        "auxiliary corpora",
+    )
+    require("distinct ane-split processing identity" in str(auxiliary.get("rule")), "split processing identity rule")
 
     vocabularies = contract.get("reason_vocabularies")
     require(isinstance(vocabularies, dict), "reason_vocabularies must be an object")
@@ -395,6 +426,14 @@ def self_test(root: Path) -> None:
     fallback_gap = copy.deepcopy(contract)
     fallback_gap["fallback_table"].pop()
     require_rejected(lambda: validate_contract(fallback_gap), "missing fallback table row")
+
+    widened_band = copy.deepcopy(contract)
+    widened_band["certification"]["certification_requirements"]["split_arm_correctness_gate"]["logit_near_tie"]["maximum_exclusive"] = 0.06
+    require_rejected(lambda: validate_contract(widened_band), "widened near-tie band")
+
+    widened_fork_cap = copy.deepcopy(contract)
+    widened_fork_cap["certification"]["certification_requirements"]["split_arm_correctness_gate"]["fork_cap"]["maximum_inclusive"] = 4
+    require_rejected(lambda: validate_contract(widened_fork_cap), "widened fork cap")
 
     missing_arm = copy.deepcopy(manifest)
     missing_arm["arm_matrix"].pop()

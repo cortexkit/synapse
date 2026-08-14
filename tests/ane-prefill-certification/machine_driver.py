@@ -296,6 +296,8 @@ class Driver:
         self.worker = args.worker.resolve()
         self.sidecar = args.sidecar.resolve()
         self.constraint_compiler = args.constraint_compiler.resolve()
+        self.diag_runner = args.diag_runner.resolve()
+        self.diag_analyzer = args.diag_analyzer.resolve()
         self.artifacts = args.artifacts.resolve()
         self.profile = machine_profile()
         self.source_digest = sha256_path(self.checkpoint / SOURCE_MODEL)
@@ -313,12 +315,95 @@ class Driver:
             return self.precondition(request["arm"])
         if operation == "generate":
             return self.generate(request)
+        if operation == "band_gate_observation":
+            return self.band_gate_observation(request)
         if operation in {"warmup", "measure_ttft"}:
             return self.timing(operation, request)
         return {
             "status": "absent",
             "absence_reason": "compile_or_load_failure",
             "detail": f"production certification seam is not exposed by the decode worker: {operation}",
+        }
+
+    def band_gate_observation(self, request: dict[str, Any]) -> dict[str, Any]:
+        arm = request["arm"]
+        bucket = int(arm["bucket"])
+        case_id = str(request["case_id"])
+        with tempfile.TemporaryDirectory(prefix=f"ane-prefill-band-{case_id}-") as directory:
+            output_dir = Path(directory)
+            command = [
+                sys.executable,
+                str(self.root / "tests/ane-prefill-certification/diag/run.py"),
+                "--root",
+                str(self.root),
+                "--model",
+                str(self.checkpoint / SOURCE_MODEL),
+                "--compiled",
+                str(self.package(bucket)),
+                "--runner",
+                str(self.diag_runner),
+                "--analyzer",
+                str(self.diag_analyzer),
+                "--window",
+                str(bucket),
+                "--case-id",
+                case_id,
+                "--cache-bucket",
+                "1024" if bucket == 512 else "512",
+                "--decode-config",
+                str(arm["decode_config"]),
+                "--max-new-tokens",
+                str(request["max_tokens"]),
+                "--skip-cpu-control",
+                "--output-dir",
+                str(output_dir),
+            ]
+            common_prefix = request.get("common_prefix_token_ids")
+            if common_prefix is not None:
+                prefix_path = output_dir / "forced-prefix.json"
+                prefix_path.write_text(json.dumps(common_prefix), encoding="utf-8")
+                command.extend(["--forced-prefix-json", str(prefix_path)])
+            completed = subprocess.run(command, text=True, capture_output=True)
+            if completed.returncode != 0:
+                detail = completed.stderr.strip() or completed.stdout.strip() or "diagnostic runner failed"
+                return {
+                    "status": "absent",
+                    "absence_reason": "compile_or_load_failure",
+                    "detail": f"{case_id} fork autopsy failed: {detail}",
+                }
+            analysis = json.loads((output_dir / "analysis.json").read_text(encoding="utf-8"))
+
+        control = next(
+            row for row in analysis["controls"] if row["compute_units"] == "CPU_AND_NE"
+        )
+        divergence = control["divergence"]
+        first_fork = None
+        if divergence is not None:
+            first_fork = {
+                "position": divergence["generated_token_index"],
+                "oracle_selected_token": divergence["oracle_token_id"],
+                "split_selected_token": divergence["control_token_id"],
+                "oracle_top2_token_ids": [
+                    candidate["token_id"] for candidate in divergence["oracle_top5"][:2]
+                ],
+                "split_top2_token_ids": [
+                    candidate["token_id"] for candidate in divergence["control_top5"][:2]
+                ],
+                "oracle_top2_gap": divergence["oracle_top2_gap"],
+                "split_top2_gap": divergence["control_top2_gap"],
+            }
+        fidelity = control["kv_vs_pure_gpu"]
+        return {
+            "status": "ok",
+            "case_id": case_id,
+            "first_fork": first_fork,
+            "kv_admission": {
+                "active_positions": fidelity["active_positions"],
+                "p95_abs_difference": fidelity["overall"]["p95_abs"],
+                "roundtrip_bit_mismatches": fidelity[
+                    "admission_roundtrip_bit_mismatches"
+                ],
+            },
         }
 
     def package(self, bucket: int) -> Path:
@@ -402,6 +487,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--artifacts", type=Path, default=root / "bench/spikes/ane-prefill-split/artifacts")
     parser.add_argument("--worker", type=Path, default=root / "target/release/ck-synapse-worker-decode")
+    parser.add_argument(
+        "--diag-runner",
+        type=Path,
+        default=root / "bench/spikes/ane-prefill-split/.build/ane-prefill-runner",
+    )
+    parser.add_argument(
+        "--diag-analyzer",
+        type=Path,
+        default=root
+        / "tests/ane-prefill-certification/diag/target/release/ane-prefill-divergence-diag",
+    )
     parser.add_argument(
         "--constraint-compiler",
         type=Path,

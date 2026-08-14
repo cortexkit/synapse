@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import statistics
 import subprocess
 from dataclasses import dataclass
@@ -19,13 +20,17 @@ from pathlib import Path
 from typing import Any, Protocol
 
 
-CONTRACT_PATH = Path("contracts/ane-prefill-split/ane-prefill-split-contract-v1.json")
+CONTRACT_PATH = Path("contracts/ane-prefill-split/ane-prefill-split-contract-v2.json")
 MANIFEST_PATH = Path("manifests/ane-prefill-split/ane-prefill-split-manifest-v1.json")
 FAMILY = "qwen3-0.6b"
 CONTINUATION_TOKENS = 64
 WIDTH_CASE_COUNT = 20
 TTFT_SAMPLE_COUNT = 20
 W128_HEADLINE_RATIO = 5.0
+BAND_GATE_REVISION = "ane-prefill-split-band-gate-v2"
+TOP2_GAP_LIMIT = 0.05
+WIDTH_FORK_LIMIT = 3
+KV_P95_LIMIT = 0.10
 
 VARIABLE_LENGTHS = {
     128: (1, 2, 16, 17, 64, 127, 128),
@@ -193,7 +198,11 @@ class ArmAbsent(CertificationFailure):
 
 
 class TokenDivergence(CertificationFailure):
-    """The split execution produced a different greedy continuation than the GPU oracle."""
+    """The split execution failed its width-battery structural correctness gate."""
+
+    def __init__(self, message: str, evidence: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.evidence = evidence
 
 
 def require(condition: bool, message: str) -> None:
@@ -332,7 +341,14 @@ class JsonlDriver:
 def contract_and_manifest(root: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     contract = read_json(root / CONTRACT_PATH)
     manifest = read_json(root / MANIFEST_PATH)
-    require(contract.get("contract_revision") == "ane-prefill-split-contract-v1", "unexpected ANE split contract revision")
+    require(contract.get("contract_revision") == "ane-prefill-split-contract-v2", "unexpected ANE split contract revision")
+    gate = contract.get("certification", {}).get("certification_requirements", {}).get("split_arm_correctness_gate", {})
+    require(gate.get("gate_revision") == BAND_GATE_REVISION, "unexpected ANE split correctness gate revision")
+    require(gate.get("logit_near_tie", {}).get("maximum_exclusive") == TOP2_GAP_LIMIT, "ANE split near-tie band drifted")
+    require(gate.get("fork_cap", {}).get("maximum_inclusive") == WIDTH_FORK_LIMIT, "ANE split fork cap drifted")
+    require(gate.get("fork_cap", {}).get("battery_prompt_count") == WIDTH_CASE_COUNT, "ANE split width battery size drifted")
+    require(gate.get("kv_admission_fidelity", {}).get("active_position_p95_abs_maximum_inclusive") == KV_P95_LIMIT, "ANE split K/V p95 limit drifted")
+    require(gate.get("kv_admission_fidelity", {}).get("cache_admission_roundtrip_bit_mismatches") == 0, "ANE split cache admission fidelity drifted")
     require(manifest.get("manifest_revision") == "ane-prefill-split-manifest-v1", "unexpected ANE split manifest revision")
     expected_fallbacks = set(FALLBACK_FAULTS.values())
     actual_fallbacks = set(contract.get("reason_vocabularies", {}).get("prefill_fallback_reason", []))
@@ -423,14 +439,164 @@ class Certifier:
             raise ArmAbsent(reason, str(response.get("detail", f"{case['case_id']} {engine} is absent")))
         require(response.get("status") == "ok", f"{case['case_id']} {engine} generation failed")
         tokens = response.get("generated_token_ids")
-        require(isinstance(tokens, list) and len(tokens) == CONTINUATION_TOKENS and all(isinstance(token, int) for token in tokens), f"{case['case_id']} {engine} did not return 64 generated token IDs")
+        valid_length = (
+            isinstance(tokens, list)
+            and all(isinstance(token, int) and not isinstance(token, bool) for token in tokens)
+            and (
+                0 < len(tokens) <= CONTINUATION_TOKENS
+                if case["kind"] == "grammar_constrained"
+                else len(tokens) == CONTINUATION_TOKENS
+            )
+        )
+        require(valid_length, f"{case['case_id']} {engine} returned an invalid generated-token sequence")
         return response
 
-    def compare_case(self, arm: Arm, case: dict[str, Any], **options: Any) -> None:
+    def band_gate_observation(
+        self,
+        arm: Arm,
+        case: dict[str, Any],
+        oracle: dict[str, Any],
+        split: dict[str, Any],
+    ) -> dict[str, Any]:
+        oracle_tokens = oracle["generated_token_ids"]
+        split_tokens = split["generated_token_ids"]
+        first_fork_position = next(
+            (index for index, pair in enumerate(zip(oracle_tokens, split_tokens)) if pair[0] != pair[1]),
+            None,
+        )
+        response = self.call(
+            "band_gate_observation",
+            arm=arm.wire(),
+            case_id=case["case_id"],
+            prompt_token_ids=case["prompt_token_ids"],
+            max_tokens=CONTINUATION_TOKENS,
+            common_prefix_token_ids=(
+                oracle_tokens[:first_fork_position]
+                if first_fork_position is not None
+                else None
+            ),
+        )
+        if response.get("status") == "absent":
+            reason = response.get("absence_reason")
+            require(reason in ABSENCE_REASONS, f"{case['case_id']} band observation reported an invalid absence reason")
+            raise ArmAbsent(reason, str(response.get("detail", f"{case['case_id']} band observation is absent")))
+        require(response.get("status") == "ok", f"{case['case_id']} band observation failed")
+        require(response.get("case_id") == case["case_id"], f"{case['case_id']} band observation names the wrong fixture")
+
+        kv = response.get("kv_admission")
+        require(isinstance(kv, dict), f"{case['case_id']} lacks K/V admission evidence")
+        active_positions = kv.get("active_positions")
+        p95 = kv.get("p95_abs_difference")
+        bit_mismatches = kv.get("roundtrip_bit_mismatches")
+        require(active_positions == len(case["prompt_token_ids"]), f"{case['case_id']} K/V evidence covers the wrong active positions")
+        require(
+            isinstance(p95, (int, float)) and not isinstance(p95, bool) and math.isfinite(p95) and p95 >= 0,
+            f"{case['case_id']} has invalid K/V p95 evidence",
+        )
+        require(
+            isinstance(bit_mismatches, int) and not isinstance(bit_mismatches, bool) and bit_mismatches >= 0,
+            f"{case['case_id']} has invalid cache-admission mismatch evidence",
+        )
+        kv_evidence = {
+            "case_id": case["case_id"],
+            "active_positions": active_positions,
+            "p95_abs_difference": float(p95),
+            "roundtrip_bit_mismatches": bit_mismatches,
+        }
+        if p95 > KV_P95_LIMIT:
+            raise TokenDivergence(
+                f"{arm.id} {case['case_id']} K/V p95 {p95:.6f} exceeds {KV_P95_LIMIT:.2f}",
+                {"kv_admission_evidence": [kv_evidence]},
+            )
+        if bit_mismatches != 0:
+            raise TokenDivergence(
+                f"{arm.id} {case['case_id']} cache admission changed {bit_mismatches} bits",
+                {"kv_admission_evidence": [kv_evidence]},
+            )
+
+        raw_fork = response.get("first_fork")
+        result: dict[str, Any] = {
+            "case_id": case["case_id"],
+            "active_positions": active_positions,
+            "kv_p95_abs_difference": float(p95),
+            "admission_roundtrip_bit_mismatches": bit_mismatches,
+            "token_exact": first_fork_position is None,
+        }
+        if first_fork_position is None:
+            return result
+
+        require(isinstance(raw_fork, dict), f"{case['case_id']} divergence lacks first-fork evidence")
+        position = raw_fork.get("position")
+        oracle_selected = raw_fork.get("oracle_selected_token")
+        split_selected = raw_fork.get("split_selected_token")
+        require(position == first_fork_position, f"{case['case_id']} diagnostic fork position differs from the production paths")
+        require(oracle_selected == oracle_tokens[position], f"{case['case_id']} diagnostic oracle token differs from the production path")
+        require(split_selected == split_tokens[position], f"{case['case_id']} diagnostic split token differs from the production path")
+
+        def top2(field: str) -> list[int]:
+            value = raw_fork.get(field)
+            require(
+                isinstance(value, list)
+                and len(value) == 2
+                and all(isinstance(token, int) and not isinstance(token, bool) for token in value)
+                and len(set(value)) == 2,
+                f"{case['case_id']} has invalid {field}",
+            )
+            return value
+
+        def gap(field: str) -> float:
+            value = raw_fork.get(field)
+            require(
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(value)
+                and value >= 0,
+                f"{case['case_id']} has invalid {field}",
+            )
+            return float(value)
+
+        oracle_top2 = top2("oracle_top2_token_ids")
+        split_top2 = top2("split_top2_token_ids")
+        oracle_gap = gap("oracle_top2_gap")
+        split_gap = gap("split_top2_gap")
+        swap_verdict = (
+            oracle_top2 == [oracle_selected, split_selected]
+            and split_top2 == [split_selected, oracle_selected]
+        )
+        fork = {
+            "case_id": case["case_id"],
+            "position": position,
+            "oracle_selected_token": oracle_selected,
+            "split_selected_token": split_selected,
+            "oracle_top2_token_ids": oracle_top2,
+            "split_top2_token_ids": split_top2,
+            "oracle_top2_gap": oracle_gap,
+            "split_top2_gap": split_gap,
+            "swap_verdict": swap_verdict,
+        }
+        result["first_fork"] = fork
+        if not swap_verdict:
+            raise TokenDivergence(
+                f"{arm.id} {case['case_id']} first fork is not an ordered top-2 swap",
+                {"fork_evidence": [fork], "kv_admission_evidence": [kv_evidence]},
+            )
+        if oracle_gap >= TOP2_GAP_LIMIT or split_gap >= TOP2_GAP_LIMIT:
+            raise TokenDivergence(
+                f"{arm.id} {case['case_id']} first-fork gaps {oracle_gap:.6f}/{split_gap:.6f} are outside the < {TOP2_GAP_LIMIT:.2f} band",
+                {"fork_evidence": [fork], "kv_admission_evidence": [kv_evidence]},
+            )
+        return result
+
+    def compare_case(
+        self,
+        arm: Arm,
+        case: dict[str, Any],
+        *,
+        apply_band_gate: bool = False,
+        **options: Any,
+    ) -> dict[str, Any] | None:
         oracle = self.generated_tokens(arm, case, "gpu", **options)
         split = self.generated_tokens(arm, case, "ane-split", **options)
-        if split["generated_token_ids"] != oracle["generated_token_ids"]:
-            raise TokenDivergence(f"{arm.id} diverged from its same-config GPU oracle on {case['case_id']}")
         prompt_length = len(case["prompt_token_ids"])
         require(split.get("padded_width") == arm.bucket, f"{case['case_id']} used the wrong fixed-width graph")
         require(split.get("first_token_index") == prompt_length - 1, f"{case['case_id']} read logits from a padded position")
@@ -438,16 +604,55 @@ class Certifier:
         require(split.get("decode_cache_position") == prompt_length, f"{case['case_id']} started decode at the wrong cache position")
         if arm.decode_config == "q8-step":
             require(split.get("cache_handoff") == "engine_to_engine", f"{case['case_id']} bypassed q8 cache handoff")
+        if apply_band_gate:
+            return self.band_gate_observation(arm, case, oracle, split)
+        return None
 
-    def run_token_battery(self, arm: Arm) -> dict[str, int]:
+    def run_token_battery(self, arm: Arm) -> dict[str, Any]:
         cases = [case for case in fixture_cases() if case["bucket"] == arm.bucket]
         width_cases = [case for case in cases if case["kind"] == "width_exact"]
         variable_cases = [case for case in cases if case["kind"] == "variable_length"]
         require(len(width_cases) == WIDTH_CASE_COUNT, f"W{arm.bucket} corpus does not have 20 width-exact prompts")
         require(tuple(len(case["prompt_token_ids"]) for case in variable_cases) == VARIABLE_LENGTHS[arm.bucket], f"W{arm.bucket} variable-length battery drifted")
-        for case in cases:
-            self.compare_case(arm, case)
 
+        width_rows = [
+            self.compare_case(arm, case, apply_band_gate=True) for case in width_cases
+        ]
+        require(all(isinstance(row, dict) for row in width_rows), f"{arm.id} width battery lacks band-gate evidence")
+        forks = [row["first_fork"] for row in width_rows if "first_fork" in row]
+        gaps = [
+            gap
+            for fork in forks
+            for gap in (fork["oracle_top2_gap"], fork["split_top2_gap"])
+        ]
+        band_gate = {
+            "gate_revision": BAND_GATE_REVISION,
+            "prompt_count": len(width_rows),
+            "fork_count": len(forks),
+            "fork_limit": WIDTH_FORK_LIMIT,
+            "gap_limit_exclusive": TOP2_GAP_LIMIT,
+            "worst_gap": max(gaps, default=0.0),
+            "kv_p95_limit_inclusive": KV_P95_LIMIT,
+            "worst_kv_p95_abs_difference": max(row["kv_p95_abs_difference"] for row in width_rows),
+            "fork_evidence": forks,
+            "kv_admission_evidence": [
+                {
+                    "case_id": row["case_id"],
+                    "active_positions": row["active_positions"],
+                    "p95_abs_difference": row["kv_p95_abs_difference"],
+                    "roundtrip_bit_mismatches": row["admission_roundtrip_bit_mismatches"],
+                }
+                for row in width_rows
+            ],
+        }
+        if len(forks) > WIDTH_FORK_LIMIT:
+            raise TokenDivergence(
+                f"{arm.id} has {len(forks)} first forks in {WIDTH_CASE_COUNT} prompts, above the {WIDTH_FORK_LIMIT}-fork cap",
+                band_gate,
+            )
+
+        for case in variable_cases:
+            self.compare_case(arm, case)
         grammar_case = {
             "case_id": f"w{arm.bucket}-grammar",
             "kind": "grammar_constrained",
@@ -462,7 +667,13 @@ class Certifier:
             "prompt_token_ids": deterministic_prompt(f"w{arm.bucket}-chain-k-16", min(96, arm.bucket)),
         }
         self.compare_case(arm, chain_case, chain_k=16)
-        return {"width_exact": len(width_cases), "variable_length": len(variable_cases), "grammar": 1, "chain_k_16": 1}
+        return {
+            "width_exact": len(width_cases),
+            "variable_length": len(variable_cases),
+            "grammar": 1,
+            "chain_k_16": 1,
+            "band_gate": band_gate,
+        }
 
     def run_routing_battery(self, arm: Arm) -> None:
         response = self.call("routing_battery", arm=arm.wire(), case_ids=list(ROUTING_CASES))
@@ -533,6 +744,7 @@ class Certifier:
                 "absence_reason": "correctness_divergence",
                 "detail": str(divergence),
                 "artifact_triple": artifact,
+                "correctness_evidence": divergence.evidence,
             }
         return {"arm": arm.wire(), "outcome": "certified", "artifact_triple": artifact, "battery": battery, "ttft": ttft}
 
@@ -620,8 +832,9 @@ class Certifier:
         exercises = self.run_semantic_exercises(arms)
         fallback_rows = self.worst_case_fallbacks()
         return {
-            "schema_revision": 1,
+            "schema_revision": 2,
             "record_kind": "ane_prefill_hardware_certification",
+            "correctness_gate_revision": BAND_GATE_REVISION,
             "fixture_sha256": FIXTURE_SHA256,
             "machine_profile": metadata["machine_profile"],
             "source_checkpoint_digest": metadata["source_checkpoint_digest"],

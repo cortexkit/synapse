@@ -1,8 +1,8 @@
 {
   "manifest_revision": "ane-prefill-split-manifest-v1",
   "contract": {
-    "path": "contracts/ane-prefill-split/ane-prefill-split-contract-v1.json",
-    "sha256": "843a5b4f1b1dc0f9b4b7bc42490b17e92213dc03f3dcbada1ff3c708d20631c8"
+    "path": "contracts/ane-prefill-split/ane-prefill-split-contract-v2.json",
+    "sha256": "29e17a42f593da7579ed712f55145e92a2e7d4d64daffb930289bab931f105ff"
   },
   "artifact_kind": "ane_prefill_split_manifest_matrix",
   "status": "planned_and_complete_for_first_certification_cut",

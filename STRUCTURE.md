@@ -165,7 +165,7 @@
 **contracts/:**
 - Purpose: Contains interface validation contracts and specification schema checkers.
 - Contains: JSON schema contracts and Python validation scripts.
-- Key files: `contracts/ane-prefill-split/ane-prefill-split-contract-v1.json`, `contracts/ane-prefill-split/validate_ane_prefill_split_contract.py`
+- Key files: `contracts/ane-prefill-split/ane-prefill-split-contract-v2.json`, `contracts/ane-prefill-split/validate_ane_prefill_split_contract.py`
 
 **manifests/:**
 - Purpose: Houses component manifests and target registration schemas.

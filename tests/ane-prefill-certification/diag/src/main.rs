@@ -39,6 +39,9 @@ struct Args {
     /// Decode engine configuration used for the same-config GPU oracle.
     #[arg(long, default_value = "f16-step")]
     decode_config: String,
+    /// JSON array of tokens shared by the production paths before they diverge.
+    #[arg(long)]
+    forced_prefix_json: Option<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -133,6 +136,17 @@ struct Trace {
 fn main() -> Result<()> {
     let args = Args::parse();
     ensure!(args.max_new_tokens > 0, "max-new-tokens must be positive");
+    let forced_prefix = args
+        .forced_prefix_json
+        .as_deref()
+        .map(read_forced_prefix)
+        .transpose()?;
+    if let Some(prefix) = &forced_prefix {
+        ensure!(
+            prefix.len() < args.max_new_tokens,
+            "forced prefix must end before the final generated position"
+        );
+    }
     let row = read_input(&args.input)?;
     ensure!(!row.input_ids.is_empty(), "prompt must not be empty");
     ensure!(
@@ -171,8 +185,44 @@ fn main() -> Result<()> {
         weight_quantization,
     )?;
 
-    let (pure_cache, pure_final_logits) = gpu_prefill(&mut decoder, &row.input_ids)?;
-    let pure_cache_bits = collect_cache_bits(&decoder)?;
+    // Both production arms prefill in f16. The q8 arm imports that f16 cache and
+    // uses q8 only for subsequent decode steps, so its oracle must do the same.
+    let (pure_cache, pure_final_logits, pure_cache_bits) =
+        if weight_quantization == WeightQuantization::None {
+            let (cache, logits) = gpu_prefill(&mut decoder, &row.input_ids)?;
+            let bits = collect_cache_bits(&decoder)?;
+            (cache, logits, bits)
+        } else {
+            let prefill_model = Qwen3DecodeModel::load_with_quant(
+                &args.model,
+                Precision::F16,
+                WeightQuantization::None,
+            )?;
+            let mut prefill_decoder = MetalStepDecoder::new(
+                &prefill_model,
+                Precision::F16,
+                args.cache_bucket,
+                WeightQuantization::None,
+            )?;
+            let (cache, logits) = gpu_prefill(&mut prefill_decoder, &row.input_ids)?;
+            let bits = collect_cache_bits(&prefill_decoder)?;
+            decoder.import_caches(&bits)?;
+            (cache, logits, bits)
+        };
+    let forced_oracle_row = if let Some(prefix) = &forced_prefix {
+        let logits = forced_row(
+            &mut decoder,
+            MetalStepKvCache {
+                position: row.input_ids.len(),
+            },
+            pure_final_logits.clone(),
+            prefix,
+        )?;
+        decoder.import_caches(&pure_cache_bits)?;
+        Some(logits)
+    } else {
+        None
+    };
     let pure_trace = generate(
         &mut decoder,
         pure_cache,
@@ -217,6 +267,7 @@ fn main() -> Result<()> {
         row.input_ids.len(),
         args.cache_bucket,
         args.max_new_tokens,
+        forced_prefix.as_deref().zip(forced_oracle_row.as_deref()),
     )?];
     if let Some((cpu_cache, cpu_logits)) = &cpu_outputs {
         controls.push(analyze_control(
@@ -229,6 +280,7 @@ fn main() -> Result<()> {
             row.input_ids.len(),
             args.cache_bucket,
             args.max_new_tokens,
+            forced_prefix.as_deref().zip(forced_oracle_row.as_deref()),
         )?);
     }
     let ane_vs_cpu_logits = cpu_outputs
@@ -296,6 +348,7 @@ fn analyze_control(
     active_positions: usize,
     cache_bucket: usize,
     max_new_tokens: usize,
+    forced_fork: Option<(&[u32], &[f32])>,
 ) -> Result<ControlResult> {
     let kv_vs_pure_gpu = kv_difference_stats(
         control_cache_bits,
@@ -310,6 +363,20 @@ fn analyze_control(
         .zip(control_cache_bits)
         .filter(|(left, right)| left != right)
         .count();
+    let forced_control_row = if let Some((prefix, _)) = forced_fork {
+        let logits = forced_row(
+            decoder,
+            MetalStepKvCache {
+                position: active_positions,
+            },
+            control_logits.to_vec(),
+            prefix,
+        )?;
+        decoder.import_caches(control_cache_bits)?;
+        Some(logits)
+    } else {
+        None
+    };
     let trace = generate(
         decoder,
         MetalStepKvCache {
@@ -318,42 +385,30 @@ fn analyze_control(
         control_logits.to_vec(),
         max_new_tokens,
     )?;
-    let match_depth = pure_trace
+    let autonomous_match_depth = pure_trace
         .tokens
         .iter()
         .zip(&trace.tokens)
         .take_while(|(left, right)| left == right)
         .count();
-    let divergence = if match_depth < max_new_tokens {
-        let oracle_row = &pure_trace.rows[match_depth];
-        let control_row = &trace.rows[match_depth];
-        let oracle_top5 = top_candidates(oracle_row, 5);
-        let control_top5 = top_candidates(control_row, 5);
-        let mut oracle_top2 = oracle_top5[..2]
-            .iter()
-            .map(|candidate| candidate.token_id)
-            .collect::<Vec<_>>();
-        let mut control_top2 = control_top5[..2]
-            .iter()
-            .map(|candidate| candidate.token_id)
-            .collect::<Vec<_>>();
-        oracle_top2.sort_unstable();
-        control_top2.sort_unstable();
-        let row_difference = difference_stats_f32(oracle_row, control_row);
-        Some(Divergence {
-            generated_token_index: match_depth,
-            oracle_token_id: pure_trace.tokens[match_depth],
-            control_token_id: trace.tokens[match_depth],
-            oracle_top2_gap: oracle_top5[0].logit - oracle_top5[1].logit,
-            control_top2_gap: control_top5[0].logit - control_top5[1].logit,
-            same_top2_token_set: oracle_top2 == control_top2,
-            oracle_top5,
-            control_top5,
-            max_abs_logit_difference: row_difference.max_abs,
-            mean_abs_logit_difference: row_difference.mean_abs,
-        })
+    let (match_depth, divergence) = if let Some(((prefix, oracle_row), control_row)) =
+        forced_fork.zip(forced_control_row.as_deref())
+    {
+        (
+            prefix.len(),
+            Some(divergence_from_rows(prefix.len(), oracle_row, control_row)),
+        )
+    } else if autonomous_match_depth < max_new_tokens {
+        (
+            autonomous_match_depth,
+            Some(divergence_from_rows(
+                autonomous_match_depth,
+                &pure_trace.rows[autonomous_match_depth],
+                &trace.rows[autonomous_match_depth],
+            )),
+        )
     } else {
-        None
+        (autonomous_match_depth, None)
     };
     Ok(ControlResult {
         compute_units: compute_units.to_owned(),
@@ -366,6 +421,56 @@ fn analyze_control(
             ..kv_vs_pure_gpu
         },
     })
+}
+
+fn divergence_from_rows(
+    generated_token_index: usize,
+    oracle_row: &[f32],
+    control_row: &[f32],
+) -> Divergence {
+    let oracle_top5 = top_candidates(oracle_row, 5);
+    let control_top5 = top_candidates(control_row, 5);
+    let mut oracle_top2 = oracle_top5[..2]
+        .iter()
+        .map(|candidate| candidate.token_id)
+        .collect::<Vec<_>>();
+    let mut control_top2 = control_top5[..2]
+        .iter()
+        .map(|candidate| candidate.token_id)
+        .collect::<Vec<_>>();
+    oracle_top2.sort_unstable();
+    control_top2.sort_unstable();
+    let row_difference = difference_stats_f32(oracle_row, control_row);
+    Divergence {
+        generated_token_index,
+        oracle_token_id: oracle_top5[0].token_id,
+        control_token_id: control_top5[0].token_id,
+        oracle_top2_gap: oracle_top5[0].logit - oracle_top5[1].logit,
+        control_top2_gap: control_top5[0].logit - control_top5[1].logit,
+        same_top2_token_set: oracle_top2 == control_top2,
+        oracle_top5,
+        control_top5,
+        max_abs_logit_difference: row_difference.max_abs,
+        mean_abs_logit_difference: row_difference.mean_abs,
+    }
+}
+
+fn forced_row(
+    decoder: &mut MetalStepDecoder<'_>,
+    mut cache: MetalStepKvCache,
+    mut logits: Vec<f32>,
+    prefix: &[u32],
+) -> Result<Vec<f32>> {
+    for &token in prefix {
+        logits = decoder.advance(&mut cache, token)?;
+    }
+    Ok(logits)
+}
+
+fn read_forced_prefix(path: &Path) -> Result<Vec<u32>> {
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("read forced prefix {}", path.display()))?;
+    serde_json::from_str(&text).context("parse forced-prefix JSON array")
 }
 
 fn read_input(path: &Path) -> Result<TokenizedRow> {

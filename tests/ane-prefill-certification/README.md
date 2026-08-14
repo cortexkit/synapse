@@ -10,9 +10,14 @@ ANE-prefill arms:
 | W512 | green or one deterministic ABSENT reason | green or one deterministic ABSENT reason |
 
 The harness has no mock-success mode. It accepts raw observations only from a
-machine adapter and computes the certification verdict itself. `test_certify.py`
-uses a fake adapter only to prove that the harness rejects a W128 token mismatch,
-requires every enumerated reason, and refuses a partial timing path.
+machine adapter and computes the certification verdict itself. Split-arm
+correctness uses `ane-prefill-split-band-gate-v2`: at most three first forks in
+the 20 width prompts, each an ordered top-2 swap with both gaps below `0.05`,
+active-position K/V p95 at most `0.10`, and a bit-faithful admission roundtrip.
+Downstream tokens after a legal first fork do not create more forks.
+`test_certify.py` uses a fake adapter only to prove the legal swap and each
+fail-closed boundary; it also requires every enumerated reason and rejects
+partial timing.
 
 ## Run
 
@@ -85,10 +90,29 @@ fixed-window witnesses:
 {"status":"ok","generated_token_ids":[1,2],"padded_width":128,"first_token_index":127,"active_cache_positions":128,"decode_cache_position":128,"cache_handoff":"engine_to_engine"}
 ```
 
-`generated_token_ids` must contain exactly 64 integers. `cache_handoff` is
-required for q8-step and must be `engine_to_engine`; it is ignored for f16-step.
-The harness compares split and same-config GPU token IDs itself, checks active
-positions, and rejects padded-logit or padded-cache behavior.
+`generated_token_ids` contains 64 integers except that a grammar-constrained
+row may stop early after at least one token. `cache_handoff` is required for
+q8-step and must be `engine_to_engine`; it is ignored for f16-step. The harness
+checks active positions and rejects padded-logit or padded-cache behavior. The
+width corpus is compared under the band gate; auxiliary variable, grammar, and
+chain rows exercise the distinct `ane-split` processing identity without
+requiring continuation equality.
+
+### `band_gate_observation`
+
+For each width prompt, the harness supplies the arm, immutable prompt IDs, and
+the prefix shared by the GPU oracle and split path before they diverge. Return raw first-fork and
+K/V evidence, never a certification verdict:
+
+```json
+{"status":"ok","case_id":"w128-width-01","first_fork":{"position":11,"oracle_selected_token":3728,"split_selected_token":3054,"oracle_top2_token_ids":[3728,3054],"split_top2_token_ids":[3054,3728],"oracle_top2_gap":0.003623,"split_top2_gap":0.012394},"kv_admission":{"active_positions":128,"p95_abs_difference":0.0703125,"roundtrip_bit_mismatches":0}}
+```
+
+`first_fork` is `null` when the production continuations are exact. The harness
+computes `swap_verdict`, enforces the strict gap and fork-count bounds, and emits
+every fork row. The machine driver replays a fork's shared prefix through the
+stride-aware diagnostic analyzer; q8 arms use f16 GPU prefill followed by q8
+decode, matching the production engine-to-engine handoff.
 
 ### `routing_battery`, `warmup`, and `measure_ttft`
 
