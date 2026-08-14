@@ -77,7 +77,9 @@ public final class ExecutionRegistry: @unchecked Sendable {
     public func abortAll() {
         lock.lock()
         defer { lock.unlock() }
-        active.values.forEach { _ = $0.abort() }
+        for ticket in active.values {
+            _ = ticket.abort()
+        }
     }
 }
 
@@ -87,6 +89,7 @@ public struct StageTimings: Codable, Equatable, Sendable {
     public let predictionMilliseconds: Double
     public let kvLayoutMilliseconds: Double
     public let logitsCopyMilliseconds: Double
+    public let integrityMilliseconds: Double
     public let totalMilliseconds: Double
     public let cancelled: Bool
 
@@ -96,6 +99,7 @@ public struct StageTimings: Codable, Equatable, Sendable {
         predictionMilliseconds: Double,
         kvLayoutMilliseconds: Double,
         logitsCopyMilliseconds: Double,
+        integrityMilliseconds: Double,
         totalMilliseconds: Double,
         cancelled: Bool
     ) {
@@ -104,6 +108,7 @@ public struct StageTimings: Codable, Equatable, Sendable {
         self.predictionMilliseconds = predictionMilliseconds
         self.kvLayoutMilliseconds = kvLayoutMilliseconds
         self.logitsCopyMilliseconds = logitsCopyMilliseconds
+        self.integrityMilliseconds = integrityMilliseconds
         self.totalMilliseconds = totalMilliseconds
         self.cancelled = cancelled
     }
@@ -114,6 +119,7 @@ public struct StageTimings: Codable, Equatable, Sendable {
         case predictionMilliseconds = "prediction_ms"
         case kvLayoutMilliseconds = "kv_layout_ms"
         case logitsCopyMilliseconds = "logits_copy_ms"
+        case integrityMilliseconds = "integrity_ms"
         case totalMilliseconds = "total_ms"
         case cancelled
     }
@@ -194,7 +200,8 @@ public func withinReadinessBudget<Value: Sendable>(
     guard milliseconds > 0 else {
         throw SidecarError.invalid("readiness budget must be positive")
     }
-    return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Value, any Error>) in
+    return try await withCheckedThrowingContinuation {
+        (continuation: CheckedContinuation<Value, any Error>) in
         let first = FirstCompletion(continuation)
         DispatchQueue.global(qos: .userInitiated).async {
             do {

@@ -1,14 +1,20 @@
 use std::{
     collections::BTreeMap,
-    fs,
+    fs::{self, File, OpenOptions},
     io::{self, Read},
     net::Shutdown,
     os::{
         fd::AsRawFd,
-        unix::net::{UnixListener, UnixStream},
+        unix::{
+            fs::OpenOptionsExt,
+            net::{UnixListener, UnixStream},
+        },
     },
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    ptr::NonNull,
+    rc::Rc,
+    slice,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, OnceLock,
@@ -63,7 +69,7 @@ use tokenizers::Tokenizer;
 
 const PRODUCTION_N: u32 = 16;
 const ENGINE_VERSION: &str = "owned-metal-decode-v1";
-const ANE_PREFILL_PROTOCOL_VERSION: u64 = 1;
+const ANE_PREFILL_PROTOCOL_VERSION: u64 = 2;
 const ANE_PREFILL_ENGINE_NAME: &str = "ane-prefill-coreml";
 const ANE_PREFILL_ENGINE_VERSION: &str = "coreml-fixed-window-v1";
 const ANE_PREFILL_CERTIFICATION_PROBE_ENV: &str = "CK_ANE_PREFILL_CERTIFICATION_PROBE";
@@ -73,6 +79,21 @@ const ANE_PREFILL_CERTIFICATION_TIMING_TYPE: &str = "CERTIFICATION_ANE_PREFILL_F
 const ANE_PREFILL_CERTIFICATION_TIMING_ERROR_TYPE: &str =
     "CERTIFICATION_ANE_PREFILL_FALLBACK_TIMING_ERROR";
 static ANE_PREFILL_SOCKET_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+const ANE_PREFILL_SHM_KIND: &str = "file_mmap_v1";
+const ANE_PREFILL_SHM_MAGIC: &[u8; 8] = b"CKANESM2";
+const ANE_PREFILL_SHM_HEADER_BYTES: usize = 4 * 1024;
+const ANE_PREFILL_SHM_PROTOCOL_OFFSET: usize = 8;
+const ANE_PREFILL_SHM_STATE_OFFSET: usize = 16;
+const ANE_PREFILL_SHM_GENERATION_OFFSET: usize = 24;
+const ANE_PREFILL_SHM_LOGITS_OFFSET_OFFSET: usize = 32;
+const ANE_PREFILL_SHM_LOGITS_BYTES_OFFSET: usize = 40;
+const ANE_PREFILL_SHM_KV_OFFSET_OFFSET: usize = 48;
+const ANE_PREFILL_SHM_KV_BYTES_OFFSET: usize = 56;
+const ANE_PREFILL_SHM_DIGEST_OFFSET: usize = 64;
+const ANE_PREFILL_SHM_DIGEST_BYTES: usize = 32;
+const ANE_PREFILL_SHM_EMPTY: u64 = 0;
+const ANE_PREFILL_SHM_WRITING: u64 = 1;
+const ANE_PREFILL_SHM_READY: u64 = 2;
 
 /// The closed runtime fallback vocabulary for an ANE-prefill attempt. Routing
 /// owns provenance and persistent arm health; this worker returns the exact
@@ -247,6 +268,7 @@ struct AnePrefillConfig {
     kv_heads: usize,
     head_dimension: usize,
     vocabulary_size: usize,
+    cache_bucket: usize,
     readiness_budget: Duration,
     prediction_budget: Duration,
     handoff_budget: Duration,
@@ -289,6 +311,7 @@ impl AnePrefillConfig {
             kv_heads,
             head_dimension,
             vocabulary_size,
+            cache_bucket: decode_bucket,
             readiness_budget: prefill_budget(runtime_config, "ane_prefill_readiness_budget_ms")?,
             prediction_budget: prefill_budget(runtime_config, "ane_prefill_prediction_budget_ms")?,
             handoff_budget: prefill_budget(runtime_config, "ane_prefill_handoff_budget_ms")?,
@@ -312,6 +335,7 @@ struct AnePrefillTimings {
     sidecar_total: Duration,
     kv_layout: Duration,
     logits_copy: Duration,
+    sidecar_integrity: Duration,
     ipc: Duration,
     kv_conversion: Duration,
     cache_handoff: Duration,
@@ -323,6 +347,7 @@ impl AnePrefillTimings {
     fn handoff_total(&self) -> Duration {
         self.kv_layout
             .saturating_add(self.logits_copy)
+            .saturating_add(self.sidecar_integrity)
             .saturating_add(self.ipc)
             .saturating_add(self.kv_conversion)
             .saturating_add(self.cache_handoff)
@@ -395,8 +420,320 @@ struct CertificationAttemptMeasurement {
 struct AnePrefillPayload {
     active_tokens: usize,
     logits: Vec<f32>,
-    kv_bits: Vec<u16>,
+    kv: SharedKvPayload,
     timings: AnePrefillTimings,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SharedMemoryLayout {
+    capacity: usize,
+    logits_offset: usize,
+    logits_bytes: usize,
+    kv_offset: usize,
+    kv_bytes: usize,
+}
+
+impl SharedMemoryLayout {
+    fn for_config(config: &AnePrefillConfig) -> Result<Self, AnePrefillFailure> {
+        let logits_bytes = config
+            .vocabulary_size
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| {
+                AnePrefillFailure::new(
+                    AnePrefillFault::KvConversion,
+                    "shared logits shape overflow",
+                )
+            })?;
+        let kv_bytes = config
+            .layers
+            .checked_mul(2)
+            .and_then(|size| size.checked_mul(config.kv_heads))
+            .and_then(|size| size.checked_mul(config.cache_bucket))
+            .and_then(|size| size.checked_mul(config.head_dimension))
+            .and_then(|size| size.checked_mul(std::mem::size_of::<u16>()))
+            .ok_or_else(|| {
+                AnePrefillFailure::new(AnePrefillFault::KvConversion, "shared K/V shape overflow")
+            })?;
+        let logits_offset = ANE_PREFILL_SHM_HEADER_BYTES;
+        let logits_end = logits_offset.checked_add(logits_bytes).ok_or_else(|| {
+            AnePrefillFailure::new(
+                AnePrefillFault::KvConversion,
+                "shared logits offset overflow",
+            )
+        })?;
+        let kv_offset = logits_end
+            .checked_add(63)
+            .map(|offset| offset & !63)
+            .ok_or_else(|| {
+                AnePrefillFailure::new(
+                    AnePrefillFault::KvConversion,
+                    "shared K/V alignment overflow",
+                )
+            })?;
+        let capacity = kv_offset.checked_add(kv_bytes).ok_or_else(|| {
+            AnePrefillFailure::new(
+                AnePrefillFault::KvConversion,
+                "shared payload capacity overflow",
+            )
+        })?;
+        Ok(Self {
+            capacity,
+            logits_offset,
+            logits_bytes,
+            kv_offset,
+            kv_bytes,
+        })
+    }
+}
+
+/// Worker-owned mapping used for one sidecar publication at a time. The control
+/// state is set to WRITING before payload stores and READY only after the digest,
+/// so a sidecar exit can be classified without trusting a partial socket frame.
+struct SharedMemoryHandoff {
+    _file: File,
+    path: PathBuf,
+    mapping: NonNull<u8>,
+    layout: SharedMemoryLayout,
+}
+
+impl SharedMemoryHandoff {
+    fn create(config: &AnePrefillConfig, sequence: u64) -> Result<Self, AnePrefillFailure> {
+        let layout = SharedMemoryLayout::for_config(config)?;
+        let mut created = None;
+        for attempt in 0..100_u32 {
+            let path = std::env::temp_dir().join(format!(
+                "ck-ane-prefill-{}-{sequence}-{attempt}.shm",
+                std::process::id()
+            ));
+            match OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+            {
+                Ok(file) => {
+                    created = Some((file, path));
+                    break;
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(AnePrefillFailure::new(
+                        AnePrefillFault::Ipc,
+                        format!("create ANE shared-memory handoff: {error}"),
+                    ));
+                }
+            }
+        }
+        let (file, path) = created.ok_or_else(|| {
+            AnePrefillFailure::new(
+                AnePrefillFault::Ipc,
+                "could not allocate a unique ANE shared-memory handoff",
+            )
+        })?;
+        file.set_len(layout.capacity as u64).map_err(|error| {
+            let _ = fs::remove_file(&path);
+            AnePrefillFailure::new(
+                AnePrefillFault::Ipc,
+                format!("size ANE shared-memory handoff: {error}"),
+            )
+        })?;
+        let address = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                layout.capacity,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        let mapping = NonNull::new(address.cast::<u8>()).filter(|_| address != libc::MAP_FAILED);
+        let Some(mapping) = mapping else {
+            let error = io::Error::last_os_error();
+            let _ = fs::remove_file(&path);
+            return Err(AnePrefillFailure::new(
+                AnePrefillFault::Ipc,
+                format!("map ANE shared-memory handoff: {error}"),
+            ));
+        };
+        Ok(Self {
+            _file: file,
+            path,
+            mapping,
+            layout,
+        })
+    }
+
+    fn prepare(&self, generation: u64) {
+        // SAFETY: A client starts the next generation only after the previous mapped
+        // slice has been imported, so resetting this header cannot race a reader.
+        unsafe {
+            std::ptr::write_bytes(self.mapping.as_ptr(), 0, ANE_PREFILL_SHM_HEADER_BYTES);
+            std::ptr::copy_nonoverlapping(
+                ANE_PREFILL_SHM_MAGIC.as_ptr(),
+                self.mapping.as_ptr(),
+                ANE_PREFILL_SHM_MAGIC.len(),
+            );
+        }
+        self.write_u64(
+            ANE_PREFILL_SHM_PROTOCOL_OFFSET,
+            ANE_PREFILL_PROTOCOL_VERSION,
+        );
+        self.write_u64(ANE_PREFILL_SHM_STATE_OFFSET, ANE_PREFILL_SHM_EMPTY);
+        self.write_u64(ANE_PREFILL_SHM_GENERATION_OFFSET, generation);
+        self.write_u64(
+            ANE_PREFILL_SHM_LOGITS_OFFSET_OFFSET,
+            self.layout.logits_offset as u64,
+        );
+        self.write_u64(
+            ANE_PREFILL_SHM_LOGITS_BYTES_OFFSET,
+            self.layout.logits_bytes as u64,
+        );
+        self.write_u64(
+            ANE_PREFILL_SHM_KV_OFFSET_OFFSET,
+            self.layout.kv_offset as u64,
+        );
+        self.write_u64(ANE_PREFILL_SHM_KV_BYTES_OFFSET, self.layout.kv_bytes as u64);
+    }
+
+    fn publication_started(&self, generation: u64) -> bool {
+        self.header_matches(generation)
+            && matches!(
+                self.read_u64(ANE_PREFILL_SHM_STATE_OFFSET),
+                ANE_PREFILL_SHM_WRITING | ANE_PREFILL_SHM_READY
+            )
+    }
+
+    fn validate_publication(
+        self: &Rc<Self>,
+        generation: u64,
+        expected_digest: &str,
+    ) -> Result<SharedKvPayload, AnePrefillFailure> {
+        if !self.header_matches(generation)
+            || self.read_u64(ANE_PREFILL_SHM_STATE_OFFSET) != ANE_PREFILL_SHM_READY
+        {
+            return Err(AnePrefillFailure::new(
+                AnePrefillFault::Ipc,
+                "shared-memory K/V publication is torn or incomplete",
+            ));
+        }
+        let expected_digest = hex::decode(expected_digest)
+            .ok()
+            .filter(|digest| {
+                digest.len() == ANE_PREFILL_SHM_DIGEST_BYTES
+                    && expected_digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            })
+            .ok_or_else(|| {
+                AnePrefillFailure::new(
+                    AnePrefillFault::Ipc,
+                    "EXECUTED shared-memory digest is invalid",
+                )
+            })?;
+        let header_digest = self.bytes(ANE_PREFILL_SHM_DIGEST_OFFSET, ANE_PREFILL_SHM_DIGEST_BYTES);
+        if header_digest != expected_digest.as_slice() {
+            return Err(AnePrefillFailure::new(
+                AnePrefillFault::Ipc,
+                "shared-memory control digest does not match EXECUTED",
+            ));
+        }
+        let mut hasher = ring::digest::Context::new(&ring::digest::SHA256);
+        hasher.update(self.bytes(self.layout.logits_offset, self.layout.logits_bytes));
+        hasher.update(self.bytes(self.layout.kv_offset, self.layout.kv_bytes));
+        if hasher.finish().as_ref() != expected_digest.as_slice() {
+            return Err(AnePrefillFailure::new(
+                AnePrefillFault::Ipc,
+                "shared-memory payload digest mismatch",
+            ));
+        }
+        Ok(SharedKvPayload {
+            memory: Rc::clone(self),
+        })
+    }
+
+    fn header_matches(&self, generation: u64) -> bool {
+        self.bytes(0, ANE_PREFILL_SHM_MAGIC.len()) == ANE_PREFILL_SHM_MAGIC
+            && self.read_u64(ANE_PREFILL_SHM_PROTOCOL_OFFSET) == ANE_PREFILL_PROTOCOL_VERSION
+            && self.read_u64(ANE_PREFILL_SHM_GENERATION_OFFSET) == generation
+            && self.read_u64(ANE_PREFILL_SHM_LOGITS_OFFSET_OFFSET)
+                == self.layout.logits_offset as u64
+            && self.read_u64(ANE_PREFILL_SHM_LOGITS_BYTES_OFFSET) == self.layout.logits_bytes as u64
+            && self.read_u64(ANE_PREFILL_SHM_KV_OFFSET_OFFSET) == self.layout.kv_offset as u64
+            && self.read_u64(ANE_PREFILL_SHM_KV_BYTES_OFFSET) == self.layout.kv_bytes as u64
+    }
+
+    fn bytes(&self, offset: usize, length: usize) -> &[u8] {
+        debug_assert!(offset <= self.layout.capacity && length <= self.layout.capacity - offset);
+        // SAFETY: The mapping remains live for self, and every caller uses offsets
+        // from the checked fixed layout or the fixed control header.
+        unsafe { slice::from_raw_parts(self.mapping.as_ptr().add(offset), length) }
+    }
+
+    #[cfg(test)]
+    fn write_bytes(&self, offset: usize, source: &[u8]) {
+        debug_assert!(
+            offset <= self.layout.capacity && source.len() <= self.layout.capacity - offset
+        );
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                source.as_ptr(),
+                self.mapping.as_ptr().add(offset),
+                source.len(),
+            );
+        }
+    }
+
+    fn read_u64(&self, offset: usize) -> u64 {
+        let bytes: [u8; 8] = self.bytes(offset, 8).try_into().expect("shared header u64");
+        u64::from_le_bytes(bytes)
+    }
+
+    fn write_u64(&self, offset: usize, value: u64) {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                value.to_le_bytes().as_ptr(),
+                self.mapping.as_ptr().add(offset),
+                8,
+            );
+        }
+    }
+}
+
+impl Drop for SharedMemoryHandoff {
+    fn drop(&mut self) {
+        unsafe {
+            libc::munmap(self.mapping.as_ptr().cast(), self.layout.capacity);
+        }
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+struct SharedKvPayload {
+    memory: Rc<SharedMemoryHandoff>,
+}
+
+impl SharedKvPayload {
+    fn bits(&self) -> &[u16] {
+        debug_assert_eq!(
+            self.memory.layout.kv_offset % std::mem::align_of::<u16>(),
+            0
+        );
+        debug_assert_eq!(self.memory.layout.kv_bytes % std::mem::size_of::<u16>(), 0);
+        // SAFETY: The sidecar has published READY and passed the payload digest before
+        // this view is created. Rc retains the mapping until Metal finishes import.
+        unsafe {
+            slice::from_raw_parts(
+                self.memory
+                    .mapping
+                    .as_ptr()
+                    .add(self.memory.layout.kv_offset)
+                    .cast::<u16>(),
+                self.memory.layout.kv_bytes / std::mem::size_of::<u16>(),
+            )
+        }
+    }
 }
 
 struct AnePrefillRuntime {
@@ -462,12 +799,13 @@ impl AnePrefillRuntime {
     fn record_success(&mut self, timings: AnePrefillTimings) {
         if std::env::var_os("CK_ANE_PREFILL_LOG_TIMINGS").is_some() {
             eprintln!(
-                "ANE prefill timing: readiness_ms={:.3} worker_execute_ms={:.3} sidecar_prediction_ms={:.3} sidecar_kv_layout_ms={:.3} sidecar_logits_copy_ms={:.3} sidecar_total_ms={:.3} payload_ipc_ms={:.3} kv_expand_ms={:.3} cache_handoff_ms={:.3} metal_upload_ms={:.3} logits_publication_ms={:.3} contract_handoff_sum_ms={:.3}",
+                "ANE prefill timing: readiness_ms={:.3} worker_execute_ms={:.3} sidecar_prediction_ms={:.3} sidecar_kv_layout_ms={:.3} sidecar_logits_copy_ms={:.3} sidecar_integrity_ms={:.3} sidecar_total_ms={:.3} payload_ipc_ms={:.3} kv_expand_ms={:.3} cache_handoff_ms={:.3} metal_upload_ms={:.3} logits_publication_ms={:.3} contract_handoff_sum_ms={:.3}",
                 duration_milliseconds(timings.readiness),
                 duration_milliseconds(timings.prediction),
                 duration_milliseconds(timings.sidecar_prediction),
                 duration_milliseconds(timings.kv_layout),
                 duration_milliseconds(timings.logits_copy),
+                duration_milliseconds(timings.sidecar_integrity),
                 duration_milliseconds(timings.sidecar_total),
                 duration_milliseconds(timings.ipc),
                 duration_milliseconds(timings.kv_conversion),
@@ -578,6 +916,7 @@ struct AnePrefillClient {
     request_sequence: u64,
     readiness: Duration,
     io_deadline: Instant,
+    shared_memory: Rc<SharedMemoryHandoff>,
 }
 
 impl AnePrefillClient {
@@ -601,6 +940,7 @@ impl AnePrefillClient {
             )
         })?;
         let nonce = format!("decode-{}-{sequence}", std::process::id());
+        let shared_memory = Rc::new(SharedMemoryHandoff::create(config, sequence)?);
         let readiness_started = Instant::now();
         let child = Command::new(&config.sidecar_path)
             .arg("--socket")
@@ -660,6 +1000,7 @@ impl AnePrefillClient {
             io_deadline: Instant::now()
                 .checked_add(config.readiness_budget)
                 .unwrap_or_else(Instant::now),
+            shared_memory,
         };
         client
             .stream
@@ -727,6 +1068,8 @@ impl AnePrefillClient {
         prompt: &[u32],
     ) -> Result<AnePrefillPayload, AnePrefillFailure> {
         let request_id = self.next_request_id("execute");
+        let generation = self.request_sequence;
+        self.shared_memory.prepare(generation);
         let input_ids = prompt
             .iter()
             .copied()
@@ -758,20 +1101,57 @@ impl AnePrefillClient {
                 "active_tokens": prompt.len(),
                 "input_ids": padded_ids,
                 "attention_mask": attention_mask,
+                "handoff": {
+                    "kind": ANE_PREFILL_SHM_KIND,
+                    "path": self.shared_memory.path,
+                    "capacity_bytes": self.shared_memory.layout.capacity,
+                    "generation": generation,
+                    "logits_offset": self.shared_memory.layout.logits_offset,
+                    "logits_bytes": self.shared_memory.layout.logits_bytes,
+                    "kv_offset": self.shared_memory.layout.kv_offset,
+                    "kv_bytes": self.shared_memory.layout.kv_bytes,
+                    "cache_tokens": config.cache_bucket,
+                },
             }),
             AnePrefillFault::Dispatch,
         )?;
-        let response = self.read_json(AnePrefillFault::PredictionTimeout)?;
+        let response = self
+            .read_json(AnePrefillFault::PredictionTimeout)
+            .map_err(|failure| {
+                if self.shared_memory.publication_started(generation) {
+                    AnePrefillFailure::new(
+                        AnePrefillFault::Ipc,
+                        format!(
+                            "sidecar exited during shared-memory publication: {}",
+                            failure.detail
+                        ),
+                    )
+                } else {
+                    failure
+                }
+            })?;
         if response.get("type").and_then(Value::as_str) == Some("ERROR") {
             return Err(sidecar_error(&response, AnePrefillFault::Prediction));
         }
-        validate_execution_header(&response, &request_id, config, prompt.len())?;
+        let digest = validate_execution_header(
+            &response,
+            &request_id,
+            config,
+            prompt.len(),
+            generation,
+            &self.shared_memory,
+        )?;
         let prediction = prediction_started.elapsed();
         let ipc_started = Instant::now();
         self.set_io_timeout(config.handoff_budget, AnePrefillFault::Ipc)?;
-        let logits = decode_f32_frame(&self.read_raw(AnePrefillFault::Ipc)?)
-            .map_err(|error| AnePrefillFailure::new(AnePrefillFault::Ipc, error.to_string()))?;
-        let kv_bits = decode_f16_bits(&self.read_raw(AnePrefillFault::Ipc)?)?;
+        let kv = self
+            .shared_memory
+            .validate_publication(generation, &digest)?;
+        let logits = decode_f32_frame(self.shared_memory.bytes(
+            self.shared_memory.layout.logits_offset,
+            self.shared_memory.layout.logits_bytes,
+        ))
+        .map_err(|error| AnePrefillFailure::new(AnePrefillFault::Ipc, error.to_string()))?;
         let timing_request_id = self.next_request_id("timing");
         self.write_json(
             &serde_json::json!({
@@ -795,6 +1175,7 @@ impl AnePrefillClient {
             sidecar_total: milliseconds_field(&timing, "total_ms", AnePrefillFault::Ipc)?,
             kv_layout: milliseconds_field(&timing, "kv_layout_ms", AnePrefillFault::Ipc)?,
             logits_copy: milliseconds_field(&timing, "logits_copy_ms", AnePrefillFault::Ipc)?,
+            sidecar_integrity: milliseconds_field(&timing, "integrity_ms", AnePrefillFault::Ipc)?,
             ipc: ipc_started.elapsed(),
             ..AnePrefillTimings::default()
         };
@@ -807,7 +1188,7 @@ impl AnePrefillClient {
         Ok(AnePrefillPayload {
             active_tokens: prompt.len(),
             logits,
-            kv_bits,
+            kv,
             timings,
         })
     }
@@ -943,41 +1324,71 @@ fn validate_execution_header(
     request_id: &str,
     config: &AnePrefillConfig,
     active_tokens: usize,
-) -> Result<(), AnePrefillFailure> {
+    generation: u64,
+    shared_memory: &SharedMemoryHandoff,
+) -> Result<String, AnePrefillFailure> {
     validate_response(value, "EXECUTED", request_id, config)?;
+    let object = value.as_object().ok_or_else(|| {
+        AnePrefillFailure::new(AnePrefillFault::Ipc, "EXECUTED frame is not an object")
+    })?;
     let layout = value
         .get("kv_layout")
         .and_then(Value::as_object)
         .ok_or_else(|| {
             AnePrefillFailure::new(AnePrefillFault::Ipc, "EXECUTED frame has no K/V layout")
         })?;
+    let handoff = value
+        .get("handoff")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            AnePrefillFailure::new(
+                AnePrefillFault::Ipc,
+                "EXECUTED frame has no shared-memory handoff",
+            )
+        })?;
     let expected_order = ["layer", "key_or_value", "head", "position", "dimension"];
     let order = layout
         .get("order")
         .and_then(Value::as_array)
         .map(|entries| entries.iter().filter_map(Value::as_str).collect::<Vec<_>>());
-    let valid = value.get("execution_id").and_then(Value::as_str) == Some(request_id)
+    let digest = handoff
+        .get("sha256")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let valid = object.len() == 9
+        && layout.len() == 8
+        && handoff.len() == 9
+        && value.get("execution_id").and_then(Value::as_str) == Some(request_id)
         && value.get("active_tokens").and_then(Value::as_u64) == Some(active_tokens as u64)
         && layout.get("kind").and_then(Value::as_str) == Some("f16_le")
         && order.as_deref() == Some(expected_order.as_slice())
         && layout.get("layers").and_then(Value::as_u64) == Some(config.layers as u64)
+        && layout.get("key_value_count").and_then(Value::as_u64) == Some(2)
         && layout.get("kv_heads").and_then(Value::as_u64) == Some(config.kv_heads as u64)
+        && layout.get("cache_tokens").and_then(Value::as_u64) == Some(config.cache_bucket as u64)
         && layout.get("head_dimension").and_then(Value::as_u64)
             == Some(config.head_dimension as u64)
         && layout.get("active_tokens").and_then(Value::as_u64) == Some(active_tokens as u64)
         && value.get("logits_bytes").and_then(Value::as_u64)
-            == Some((config.vocabulary_size * std::mem::size_of::<f32>()) as u64)
+            == Some(shared_memory.layout.logits_bytes as u64)
         && value.get("kv_bytes").and_then(Value::as_u64)
-            == Some(
-                (config.layers
-                    * 2
-                    * config.kv_heads
-                    * active_tokens
-                    * config.head_dimension
-                    * std::mem::size_of::<u16>()) as u64,
-            );
+            == Some(shared_memory.layout.kv_bytes as u64)
+        && handoff.get("kind").and_then(Value::as_str) == Some(ANE_PREFILL_SHM_KIND)
+        && handoff.get("path").and_then(Value::as_str) == shared_memory.path.to_str()
+        && handoff.get("capacity_bytes").and_then(Value::as_u64)
+            == Some(shared_memory.layout.capacity as u64)
+        && handoff.get("generation").and_then(Value::as_u64) == Some(generation)
+        && handoff.get("logits_offset").and_then(Value::as_u64)
+            == Some(shared_memory.layout.logits_offset as u64)
+        && handoff.get("logits_bytes").and_then(Value::as_u64)
+            == Some(shared_memory.layout.logits_bytes as u64)
+        && handoff.get("kv_offset").and_then(Value::as_u64)
+            == Some(shared_memory.layout.kv_offset as u64)
+        && handoff.get("kv_bytes").and_then(Value::as_u64)
+            == Some(shared_memory.layout.kv_bytes as u64)
+        && digest.len() == ANE_PREFILL_SHM_DIGEST_BYTES * 2;
     if valid {
-        Ok(())
+        Ok(digest.to_owned())
     } else {
         Err(AnePrefillFailure::new(
             AnePrefillFault::Ipc,
@@ -1015,6 +1426,7 @@ fn sidecar_error(value: &Value, default_fault: AnePrefillFault) -> AnePrefillFai
         "compile_failure" => AnePrefillFault::Compile,
         "load_failure" => AnePrefillFault::Load,
         "io_failure" => AnePrefillFault::Ipc,
+        "kv_conversion_failure" => AnePrefillFault::KvConversion,
         "sidecar_busy" | "invalid_request" | "not_found" => AnePrefillFault::Dispatch,
         "cancelled" => AnePrefillFault::Prediction,
         _ => default_fault,
@@ -1041,19 +1453,7 @@ fn milliseconds_field(
     Ok(Duration::from_secs_f64(milliseconds / 1_000.0))
 }
 
-fn decode_f16_bits(bytes: &[u8]) -> Result<Vec<u16>, AnePrefillFailure> {
-    let chunks = bytes.chunks_exact(std::mem::size_of::<u16>());
-    if !chunks.remainder().is_empty() {
-        return Err(AnePrefillFailure::new(
-            AnePrefillFault::Ipc,
-            "sidecar f16 K/V frame length is not divisible by two",
-        ));
-    }
-    Ok(chunks
-        .map(|chunk| u16::from_le_bytes(chunk.try_into().expect("u16 frame chunk has two bytes")))
-        .collect())
-}
-
+#[cfg(test)]
 fn expand_active_kv_bits(
     active_bits: &[u16],
     layers: usize,
@@ -1235,14 +1635,13 @@ impl DecodeEngine {
     ) -> Result<(DecodeCache, Vec<f32>, AnePrefillTimings), AnePrefillFailure> {
         let mut payload = ane_prefill.execute(prompt)?;
         let conversion_started = Instant::now();
-        let cache_bits = expand_active_kv_bits(
-            &payload.kv_bits,
-            ane_prefill.config.layers,
-            ane_prefill.config.kv_heads,
-            payload.active_tokens,
-            decode_bucket,
-            ane_prefill.config.head_dimension,
-        )?;
+        if decode_bucket != ane_prefill.config.cache_bucket {
+            return Err(AnePrefillFailure::new(
+                AnePrefillFault::KvConversion,
+                "shared-memory K/V cache bucket does not match the decode engine",
+            ));
+        }
+        let cache_bits = payload.kv.bits();
         payload.timings.kv_conversion = conversion_started.elapsed();
         let cache = match self {
             Self::Qwen {
@@ -1255,7 +1654,7 @@ impl DecodeEngine {
                     // Materializing the sidecar payload in that source cache keeps
                     // the existing engine-to-engine conversion on the certified path.
                     let source_upload_started = Instant::now();
-                    prefill.import_caches(&cache_bits).map_err(|error| {
+                    prefill.import_caches(cache_bits).map_err(|error| {
                         AnePrefillFailure::new(
                             AnePrefillFault::MetalUpload,
                             format!("upload ANE K/V into the f16 source cache: {error}"),
@@ -1287,7 +1686,7 @@ impl DecodeEngine {
                     }
                 } else {
                     let upload_started = Instant::now();
-                    decoder.import_caches(&cache_bits).map_err(|error| {
+                    decoder.import_caches(cache_bits).map_err(|error| {
                         AnePrefillFailure::new(
                             AnePrefillFault::MetalUpload,
                             format!("upload ANE K/V into the f16 decode cache: {error}"),
@@ -3619,6 +4018,30 @@ mod tests {
     }
 
     #[test]
+    fn sidecar_protocol_v2_mismatch_fails_during_handshake() {
+        let hello = |protocol| {
+            serde_json::json!({
+                "type": "HELLO",
+                "protocol": protocol,
+                "engine": {
+                    "name": ANE_PREFILL_ENGINE_NAME,
+                    "version": ANE_PREFILL_ENGINE_VERSION,
+                },
+                "nonce": "n",
+                "max_frame_bytes": DEFAULT_MAX_FRAME_BYTES,
+            })
+        };
+        assert_eq!(
+            validate_sidecar_hello(&hello(ANE_PREFILL_PROTOCOL_VERSION), "n")
+                .expect("protocol v2 sidecar negotiates"),
+            DEFAULT_MAX_FRAME_BYTES
+        );
+        let failure = validate_sidecar_hello(&hello(ANE_PREFILL_PROTOCOL_VERSION - 1), "n")
+            .expect_err("the retired socket protocol must fail closed");
+        assert_eq!(failure.fault, AnePrefillFault::Load);
+    }
+
+    #[test]
     fn custom_transport_rejects_unknown_fields() {
         let value = serde_json::json!({
             "type": "GENERATE_CANCEL",
@@ -3715,14 +4138,151 @@ mod tests {
         }
     }
 
+    fn test_ane_config() -> AnePrefillConfig {
+        AnePrefillConfig {
+            sidecar_path: PathBuf::from("sidecar"),
+            artifact_path: PathBuf::from("artifact"),
+            artifact_digest: "0".repeat(64),
+            model_ref: "fixture".to_owned(),
+            window: 2,
+            layers: 1,
+            kv_heads: 1,
+            head_dimension: 2,
+            vocabulary_size: 2,
+            cache_bucket: 4,
+            readiness_budget: Duration::from_secs(1),
+            prediction_budget: Duration::from_secs(1),
+            handoff_budget: Duration::from_secs(1),
+        }
+    }
+
+    fn publish_shared_fixture(
+        shared: &Rc<SharedMemoryHandoff>,
+        generation: u64,
+        logits: &[u8],
+        kv: &[u16],
+    ) -> String {
+        shared.prepare(generation);
+        shared.write_bytes(shared.layout.logits_offset, logits);
+        let kv_bytes = kv
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        shared.write_bytes(shared.layout.kv_offset, &kv_bytes);
+        let mut hasher = Sha256::new();
+        hasher.update(logits);
+        hasher.update(&kv_bytes);
+        let digest = hasher.finalize();
+        shared.write_bytes(ANE_PREFILL_SHM_DIGEST_OFFSET, &digest);
+        shared.write_u64(ANE_PREFILL_SHM_STATE_OFFSET, ANE_PREFILL_SHM_READY);
+        hex::encode(digest)
+    }
+
     #[test]
-    fn active_kv_expansion_never_admits_padding_positions() {
-        let cache = expand_active_kv_bits(&(0_u16..8).collect::<Vec<_>>(), 1, 1, 2, 4, 2)
-            .expect("active fixed-window payload expands into the decode cache");
+    fn shared_memory_cache_matches_legacy_socket_expansion_bit_for_bit() {
+        let config = test_ane_config();
+        let shared = Rc::new(
+            SharedMemoryHandoff::create(&config, u64::MAX - 10)
+                .expect("create shared-memory fixture"),
+        );
+        let legacy = expand_active_kv_bits(&(0_u16..8).collect::<Vec<_>>(), 1, 1, 2, 4, 2)
+            .expect("legacy active socket payload expands into the decode cache");
+        let logits = [0_u8; 8];
+        let digest = publish_shared_fixture(&shared, 7, &logits, &legacy);
+
+        let publication = shared
+            .validate_publication(7, &digest)
+            .expect("complete shared publication validates");
+        assert_eq!(publication.bits(), legacy);
         assert_eq!(
-            cache,
-            vec![0, 1, 2, 3, 0, 0, 0, 0, 4, 5, 6, 7, 0, 0, 0, 0],
-            "only the active two positions may populate either K/V cache plane"
+            publication.bits(),
+            [0, 1, 2, 3, 0, 0, 0, 0, 4, 5, 6, 7, 0, 0, 0, 0],
+            "only active positions may populate either K/V cache plane"
+        );
+    }
+
+    #[test]
+    #[ignore = "operator-only 20-sample shared-memory timing probe"]
+    fn shared_memory_handoff_20_sample_w128_timing() {
+        let mut config = test_ane_config();
+        config.window = 128;
+        config.layers = 28;
+        config.kv_heads = 8;
+        config.head_dimension = 128;
+        config.vocabulary_size = 151_936;
+        config.cache_bucket = 512;
+        let shared = Rc::new(
+            SharedMemoryHandoff::create(&config, u64::MAX - 7)
+                .expect("create W128 shared-memory timing fixture"),
+        );
+        let logits = vec![0_u8; shared.layout.logits_bytes];
+        let cache = vec![0_u16; shared.layout.kv_bytes / std::mem::size_of::<u16>()];
+        let digest = publish_shared_fixture(&shared, 10, &logits, &cache);
+
+        let mut samples = Vec::with_capacity(20);
+        for _ in 0..20 {
+            let started = Instant::now();
+            let publication = shared
+                .validate_publication(10, &digest)
+                .expect("shared-memory publication validates");
+            std::hint::black_box(publication.bits());
+            samples.push(duration_milliseconds(started.elapsed()));
+        }
+        let mut sorted = samples.clone();
+        sorted.sort_by(f64::total_cmp);
+        println!("shared_memory_handoff_ms={samples:?}");
+        println!(
+            "shared_memory_handoff_p50_ms={:.3}",
+            (sorted[9] + sorted[10]) / 2.0
+        );
+    }
+
+    #[test]
+    fn torn_shared_memory_write_maps_to_ipc_handoff_failure() {
+        let config = test_ane_config();
+        let shared = Rc::new(
+            SharedMemoryHandoff::create(&config, u64::MAX - 9)
+                .expect("create shared-memory fixture"),
+        );
+        shared.prepare(8);
+        shared.write_u64(ANE_PREFILL_SHM_STATE_OFFSET, ANE_PREFILL_SHM_WRITING);
+        shared.write_bytes(shared.layout.kv_offset, &[1, 2]);
+
+        assert!(
+            shared.publication_started(8),
+            "a sidecar crash mid-write must be observable"
+        );
+        let failure = match shared.validate_publication(8, &"0".repeat(64)) {
+            Err(failure) => failure,
+            Ok(_) => panic!("a partial shared-memory write must fail closed"),
+        };
+        assert_eq!(failure.fault, AnePrefillFault::Ipc);
+        assert_eq!(
+            failure.fault.fallback_reason().as_str(),
+            "ipc_handoff_failure"
+        );
+    }
+
+    #[test]
+    fn shared_memory_digest_mismatch_maps_to_ipc_handoff_failure() {
+        let config = test_ane_config();
+        let shared = Rc::new(
+            SharedMemoryHandoff::create(&config, u64::MAX - 8)
+                .expect("create shared-memory fixture"),
+        );
+        let logits = [0_u8; 8];
+        let cache = [0_u16; 16];
+        let digest = publish_shared_fixture(&shared, 9, &logits, &cache);
+        shared.write_bytes(shared.layout.kv_offset, &[1]);
+
+        let failure = match shared.validate_publication(9, &digest) {
+            Err(failure) => failure,
+            Ok(_) => panic!("a digest mismatch must fail closed"),
+        };
+        assert_eq!(failure.fault, AnePrefillFault::Ipc);
+        assert_eq!(
+            failure.fault.fallback_reason().as_str(),
+            "ipc_handoff_failure"
         );
     }
 
@@ -3735,13 +4295,14 @@ mod tests {
             sidecar_total: Duration::from_millis(20),
             kv_layout: Duration::from_millis(2),
             logits_copy: Duration::from_millis(3),
+            sidecar_integrity: Duration::from_millis(19),
             ipc: Duration::from_millis(5),
             kv_conversion: Duration::from_millis(7),
             cache_handoff: Duration::from_millis(11),
             metal_upload: Duration::from_millis(13),
             logits_publication: Duration::from_millis(17),
         };
-        assert_eq!(timings.handoff_total(), Duration::from_millis(58));
+        assert_eq!(timings.handoff_total(), Duration::from_millis(77));
         assert_ne!(timings.handoff_total(), timings.readiness);
         assert_ne!(timings.handoff_total(), timings.prediction);
     }

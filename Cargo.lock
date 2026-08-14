@@ -6776,6 +6776,7 @@ dependencies = [
  "hex",
  "libc",
  "owned-decode-worker",
+ "ring",
  "serde",
  "serde_json",
  "sha2",

@@ -43,11 +43,11 @@ private struct ExecutionLease: @unchecked Sendable {
     let request: ExecuteRequest
     let model: InstalledModel
     let ticket: ExecutionTicket
+    let publication: SharedMemoryPublication
 }
 
 private struct ExecutionResult {
-    let payload: PrefillPayload
-    let timing: StageTimings
+    let digest: String
 }
 
 private final class CoreMLStage: @unchecked Sendable {
@@ -59,8 +59,11 @@ private final class CoreMLStage: @unchecked Sendable {
     func install(_ request: InstallRequest) async throws -> InstalledModel {
         let shape = ModelShape(request)
         if let existing = modelLock.withLock({ models[request.modelRef] }) {
-            guard existing.artifactSHA256 == normalizedDigest(request.artifactSHA256), existing.shape == shape else {
-                throw SidecarError.invalid("model_ref is already installed with a different artifact or shape")
+            guard existing.artifactSHA256 == normalizedDigest(request.artifactSHA256),
+                existing.shape == shape
+            else {
+                throw SidecarError.invalid(
+                    "model_ref is already installed with a different artifact or shape")
             }
             return existing
         }
@@ -84,8 +87,10 @@ private final class CoreMLStage: @unchecked Sendable {
 
         return try modelLock.withLock {
             if let existing = models[request.modelRef] {
-                guard existing.artifactSHA256 == loaded.artifactSHA256, existing.shape == shape else {
-                    throw SidecarError.invalid("model_ref is already installed with a different artifact or shape")
+                guard existing.artifactSHA256 == loaded.artifactSHA256, existing.shape == shape
+                else {
+                    throw SidecarError.invalid(
+                        "model_ref is already installed with a different artifact or shape")
                 }
                 return existing
             }
@@ -100,8 +105,11 @@ private final class CoreMLStage: @unchecked Sendable {
         modelLock.unlock()
         guard let model else { throw SidecarError.notFound(request.modelRef) }
         try validateFixedWindowRequest(request, shape: model.shape)
+        try validateSharedMemoryHandoff(request.handoff, request: request, shape: model.shape)
+        let publication = try SharedMemoryPublication(descriptor: request.handoff)
         let ticket = try executions.begin(executionID: request.requestID)
-        return ExecutionLease(request: request, model: model, ticket: ticket)
+        return ExecutionLease(
+            request: request, model: model, ticket: ticket, publication: publication)
     }
 
     func execute(_ lease: ExecutionLease) async throws -> ExecutionResult {
@@ -109,6 +117,7 @@ private final class CoreMLStage: @unchecked Sendable {
         var predictionMilliseconds = 0.0
         var kvLayoutMilliseconds = 0.0
         var logitsCopyMilliseconds = 0.0
+        var integrityMilliseconds = 0.0
 
         do {
             try throwIfCancelled(lease.ticket)
@@ -118,24 +127,31 @@ private final class CoreMLStage: @unchecked Sendable {
             predictionMilliseconds = monotonicMilliseconds() - predictionStarted
             try throwIfCancelled(lease.ticket)
 
-            let kvStarted = monotonicMilliseconds()
-            var kvBits: [UInt16] = []
+            try lease.publication.begin()
             let shape = lease.model.shape
-            kvBits.reserveCapacity(shape.layers * 2 * shape.kvHeads * lease.request.activeTokens * shape.headDimension)
-            for layer in 0 ..< shape.layers {
-                for outputName in ["key", "value"] {
-                    let name = String(format: "%@_%02d", outputName, layer)
-                    guard let value = prediction.featureValue(for: name)?.multiArrayValue else {
-                        throw SidecarError.invalid("CoreML prediction has no K/V output named \(name)")
+            let kvStarted = monotonicMilliseconds()
+            try lease.publication.zeroKV()
+            try lease.publication.withMutableBytes(
+                offset: lease.request.handoff.kvOffset,
+                count: lease.request.handoff.kvBytes
+            ) { destination in
+                for layer in 0..<shape.layers {
+                    for (keyValueIndex, outputName) in ["key", "value"].enumerated() {
+                        let name = String(format: "%@_%02d", outputName, layer)
+                        guard let value = prediction.featureValue(for: name)?.multiArrayValue else {
+                            throw SidecarError.kvConversion(
+                                "CoreML prediction has no K/V output named \(name)")
+                        }
+                        try copyActiveKVToCache(
+                            value,
+                            to: destination,
+                            layer: layer,
+                            keyValueIndex: keyValueIndex,
+                            activeTokens: lease.request.activeTokens,
+                            shape: shape,
+                            cacheTokens: lease.request.handoff.cacheTokens
+                        )
                     }
-                    try appendActiveKV(
-                        stridedTensor(from: value),
-                        to: &kvBits,
-                        activeTokens: lease.request.activeTokens,
-                        window: shape.window,
-                        kvHeads: shape.kvHeads,
-                        headDimension: shape.headDimension
-                    )
                 }
             }
             kvLayoutMilliseconds = monotonicMilliseconds() - kvStarted
@@ -145,39 +161,38 @@ private final class CoreMLStage: @unchecked Sendable {
             guard let logitsArray = prediction.featureValue(for: "logits")?.multiArrayValue else {
                 throw SidecarError.invalid("CoreML prediction has no logits output")
             }
-            let logits = try copyActiveLogits(
-                stridedTensor(from: logitsArray),
-                activeTokens: lease.request.activeTokens,
-                window: shape.window,
-                vocabularySize: shape.vocabularySize
-            )
+            try lease.publication.withMutableBytes(
+                offset: lease.request.handoff.logitsOffset,
+                count: lease.request.handoff.logitsBytes
+            ) { destination in
+                try copyActiveLogitsToSharedMemory(
+                    logitsArray,
+                    to: destination,
+                    activeTokens: lease.request.activeTokens,
+                    window: shape.window,
+                    vocabularySize: shape.vocabularySize
+                )
+            }
             logitsCopyMilliseconds = monotonicMilliseconds() - logitsStarted
             try throwIfCancelled(lease.ticket)
 
+            let integrityStarted = monotonicMilliseconds()
+            let digest = try lease.publication.finish()
+            integrityMilliseconds = monotonicMilliseconds() - integrityStarted
             let wasCancelled = executions.finish(lease.ticket)
+            if wasCancelled { throw SidecarError.cancelled }
             let timing = StageTimings(
                 executionID: lease.request.requestID,
                 readinessMilliseconds: lease.model.readinessMilliseconds,
                 predictionMilliseconds: predictionMilliseconds,
                 kvLayoutMilliseconds: kvLayoutMilliseconds,
                 logitsCopyMilliseconds: logitsCopyMilliseconds,
+                integrityMilliseconds: integrityMilliseconds,
                 totalMilliseconds: monotonicMilliseconds() - executionStarted,
-                cancelled: wasCancelled
+                cancelled: false
             )
             timings.record(timing)
-            if wasCancelled { throw SidecarError.cancelled }
-            return ExecutionResult(
-                payload: PrefillPayload(
-                    activeTokens: lease.request.activeTokens,
-                    vocabularySize: shape.vocabularySize,
-                    logits: logits,
-                    kvBits: kvBits,
-                    layers: shape.layers,
-                    kvHeads: shape.kvHeads,
-                    headDimension: shape.headDimension
-                ),
-                timing: timing
-            )
+            return ExecutionResult(digest: digest)
         } catch {
             let wasCancelled = executions.finish(lease.ticket)
             let timing = StageTimings(
@@ -186,6 +201,7 @@ private final class CoreMLStage: @unchecked Sendable {
                 predictionMilliseconds: predictionMilliseconds,
                 kvLayoutMilliseconds: kvLayoutMilliseconds,
                 logitsCopyMilliseconds: logitsCopyMilliseconds,
+                integrityMilliseconds: integrityMilliseconds,
                 totalMilliseconds: monotonicMilliseconds() - executionStarted,
                 cancelled: wasCancelled || error as? SidecarError == .cancelled
             )
@@ -225,7 +241,8 @@ private struct Main {
                 "nonce": arguments.nonce,
                 "max_frame_bytes": defaultMaxFrameBytes,
             ])
-            let acceptedFrameBytes = try negotiateHelloAck(connection.readFrame(), nonce: arguments.nonce)
+            let acceptedFrameBytes = try negotiateHelloAck(
+                connection.readFrame(), nonce: arguments.nonce)
             connection.maxFrameBytes = acceptedFrameBytes
             let stage = CoreMLStage()
 
@@ -238,16 +255,18 @@ private struct Main {
                 }
                 do {
                     switch try parseCommand(frame) {
-                    case let .install(request):
+                    case .install(let request):
                         let installed = try await stage.install(request)
                         try connection.writeJSON([
                             "type": "INSTALLED",
                             "request_id": request.requestID,
                             "model_ref": request.modelRef,
                             "readiness_ms": installed.readinessMilliseconds,
-                            "engine": ["name": sidecarEngine.name, "version": sidecarEngine.version],
+                            "engine": [
+                                "name": sidecarEngine.name, "version": sidecarEngine.version,
+                            ],
                         ])
-                    case let .execute(request):
+                    case .execute(let request):
                         let lease = try stage.reserve(request)
                         Task.detached {
                             do {
@@ -257,18 +276,40 @@ private struct Main {
                                     "request_id": request.requestID,
                                     "execution_id": request.requestID,
                                     "model_ref": request.modelRef,
-                                    "active_tokens": result.payload.activeTokens,
-                                    "logits_bytes": result.payload.logitsByteCount,
-                                    "kv_bytes": result.payload.kvByteCount,
-                                    "kv_layout": result.payload.layout,
+                                    "active_tokens": request.activeTokens,
+                                    "logits_bytes": request.handoff.logitsBytes,
+                                    "kv_bytes": request.handoff.kvBytes,
+                                    "kv_layout": [
+                                        "kind": "f16_le",
+                                        "order": [
+                                            "layer", "key_or_value", "head", "position",
+                                            "dimension",
+                                        ],
+                                        "layers": lease.model.shape.layers,
+                                        "key_value_count": 2,
+                                        "kv_heads": lease.model.shape.kvHeads,
+                                        "cache_tokens": request.handoff.cacheTokens,
+                                        "active_tokens": request.activeTokens,
+                                        "head_dimension": lease.model.shape.headDimension,
+                                    ],
+                                    "handoff": [
+                                        "kind": request.handoff.kind,
+                                        "path": request.handoff.path,
+                                        "capacity_bytes": request.handoff.capacityBytes,
+                                        "generation": request.handoff.generation,
+                                        "logits_offset": request.handoff.logitsOffset,
+                                        "logits_bytes": request.handoff.logitsBytes,
+                                        "kv_offset": request.handoff.kvOffset,
+                                        "kv_bytes": request.handoff.kvBytes,
+                                        "sha256": result.digest,
+                                    ],
                                 ])
-                                try connection.writeFrame(littleEndianFloat32Frame(result.payload.logits))
-                                try connection.writeFrame(littleEndianFloat16Frame(result.payload.kvBits))
                             } catch {
-                                try? connection.writeJSON(errorResponse(error, requestID: request.requestID))
+                                try? connection.writeJSON(
+                                    errorResponse(error, requestID: request.requestID))
                             }
                         }
-                    case let .abort(request):
+                    case .abort(let request):
                         try connection.writeJSON([
                             "type": "ABORTED",
                             "request_id": request.requestID,
@@ -276,14 +317,17 @@ private struct Main {
                             "was_active": stage.abort(executionID: request.executionID),
                             "cancellation_owner": "sidecar",
                         ])
-                    case let .timingReadback(request):
+                    case .timingReadback(let request):
                         guard let timing = stage.timing(executionID: request.executionID) else {
                             throw SidecarError.notFound(request.executionID)
                         }
-                        try connection.writeJSON(timingResponse(requestID: request.requestID, timing: timing))
-                    case let .shutdown(request):
+                        try connection.writeJSON(
+                            timingResponse(requestID: request.requestID, timing: timing))
+                    case .shutdown(let request):
                         stage.shutdown()
-                        try connection.writeJSON(["type": "SHUTDOWN_ACK", "request_id": request.requestID])
+                        try connection.writeJSON([
+                            "type": "SHUTDOWN_ACK", "request_id": request.requestID,
+                        ])
                         return
                     }
                 } catch {
@@ -299,18 +343,132 @@ private struct Main {
 
 private func validateFixedWindowRequest(_ request: ExecuteRequest, shape: ModelShape) throws {
     guard request.inputIDs.count == shape.window, request.attentionMask.count == shape.window else {
-        throw SidecarError.invalid("EXECUTE inputs must be padded by the module to the installed fixed window")
+        throw SidecarError.invalid(
+            "EXECUTE inputs must be padded by the module to the installed fixed window")
     }
     guard request.activeTokens <= shape.window else {
         throw SidecarError.invalid("active_tokens exceeds the installed fixed window")
     }
-    for index in 0 ..< shape.window {
+    for index in 0..<shape.window {
         let expectedMask: Int32 = index < request.activeTokens ? 1 : 0
         guard request.attentionMask[index] == expectedMask else {
             throw SidecarError.invalid(
                 "EXECUTE must use right padding: active tokens first and no padded token in the decode cache"
             )
         }
+    }
+}
+
+private func validateSharedMemoryHandoff(
+    _ handoff: SharedMemoryHandoffDescriptor,
+    request: ExecuteRequest,
+    shape: ModelShape
+) throws {
+    let expectedLogitsBytes = shape.vocabularySize * MemoryLayout<Float>.size
+    let expectedKVBytes =
+        shape.layers * 2 * shape.kvHeads * handoff.cacheTokens * shape.headDimension
+        * MemoryLayout<UInt16>.size
+    guard handoff.logitsOffset == sharedMemoryHeaderBytes,
+        handoff.logitsBytes == expectedLogitsBytes,
+        handoff.kvOffset.isMultiple(of: 64),
+        handoff.kvBytes == expectedKVBytes,
+        handoff.cacheTokens >= request.activeTokens,
+        handoff.capacityBytes == handoff.kvOffset + handoff.kvBytes
+    else {
+        throw SidecarError.invalid(
+            "EXECUTE shared-memory layout does not match the installed model")
+    }
+}
+
+private func copyActiveKVToCache(
+    _ array: MLMultiArray,
+    to destination: UnsafeMutableRawBufferPointer,
+    layer: Int,
+    keyValueIndex: Int,
+    activeTokens: Int,
+    shape: ModelShape,
+    cacheTokens: Int
+) throws {
+    let tensorShape = array.shape.map(\.intValue)
+    let strides = array.strides.map(\.intValue)
+    guard array.dataType == .float16,
+        tensorShape == [1, shape.kvHeads, shape.window, shape.headDimension],
+        strides.count == tensorShape.count,
+        strides.allSatisfy({ $0 > 0 })
+    else {
+        throw SidecarError.kvConversion("K/V output must use the installed float16 shape")
+    }
+    let storageCount = requiredStorageCount(shape: tensorShape, strides: strides)
+    let source = UnsafeBufferPointer(
+        start: array.dataPointer.bindMemory(to: UInt16.self, capacity: storageCount),
+        count: storageCount
+    )
+    try copyActiveKVToPaddedCache(
+        source: source,
+        tensorShape: tensorShape,
+        strides: strides,
+        destination: destination.bindMemory(to: UInt16.self),
+        layer: layer,
+        keyValueIndex: keyValueIndex,
+        activeTokens: activeTokens,
+        window: shape.window,
+        layers: shape.layers,
+        kvHeads: shape.kvHeads,
+        cacheTokens: cacheTokens,
+        headDimension: shape.headDimension
+    )
+}
+
+private func copyActiveLogitsToSharedMemory(
+    _ array: MLMultiArray,
+    to destination: UnsafeMutableRawBufferPointer,
+    activeTokens: Int,
+    window: Int,
+    vocabularySize: Int
+) throws {
+    let shape = array.shape.map(\.intValue)
+    let strides = array.strides.map(\.intValue)
+    let sequenceAxes = shape.indices.filter { shape[$0] == window }
+    let vocabularyAxes = shape.indices.filter { shape[$0] == vocabularySize }
+    guard vocabularyAxes.count == 1,
+        let vocabularyAxis = vocabularyAxes.first,
+        sequenceAxes.count <= 1,
+        sequenceAxes.first != vocabularyAxis,
+        strides.count == shape.count,
+        strides.allSatisfy({ $0 > 0 }),
+        shape.indices.allSatisfy({ axis in
+            axis == sequenceAxes.first || axis == vocabularyAxis || shape[axis] == 1
+        }),
+        destination.count == vocabularySize * MemoryLayout<UInt32>.size
+    else {
+        throw SidecarError.invalid(
+            "logits output shape \(shape) is incompatible with the installed model")
+    }
+    let storageCount = requiredStorageCount(shape: shape, strides: strides)
+    var index = [Int](repeating: 0, count: shape.count)
+    if let sequenceAxis = sequenceAxes.first {
+        index[sequenceAxis] = activeTokens - 1
+    }
+    let target = destination.bindMemory(to: UInt32.self)
+    for vocabularyIndex in 0..<vocabularySize {
+        index[vocabularyAxis] = vocabularyIndex
+        let offset = zip(index, strides).reduce(0) { $0 + $1.0 * $1.1 }
+        let value: Float
+        switch array.dataType {
+        case .float16:
+            let source = array.dataPointer.bindMemory(to: UInt16.self, capacity: storageCount)
+            value = Float(Float16(bitPattern: source[offset]))
+        case .float32:
+            let source = array.dataPointer.bindMemory(to: Float.self, capacity: storageCount)
+            value = source[offset]
+        case .double:
+            let source = array.dataPointer.bindMemory(to: Double.self, capacity: storageCount)
+            value = Float(source[offset])
+        default:
+            throw SidecarError.invalid(
+                "unsupported CoreML logits data type \(array.dataType.rawValue)")
+        }
+        target[vocabularyIndex] = value.bitPattern.littleEndian
     }
 }
 
@@ -333,33 +491,13 @@ private func int32Array(_ values: [Int32]) throws -> MLMultiArray {
     return array
 }
 
-private func stridedTensor(from array: MLMultiArray) throws -> StridedTensor {
-    let shape = array.shape.map(\.intValue)
-    let strides = array.strides.map(\.intValue)
-    switch array.dataType {
-    case .float16:
-        let capacity = requiredStorageCount(shape: shape, strides: strides)
-        let pointer = array.dataPointer.bindMemory(to: UInt16.self, capacity: capacity)
-        return try StridedTensor(shape: shape, strides: strides, storage: .float16Bits(Array(UnsafeBufferPointer(start: pointer, count: capacity))))
-    case .float32:
-        let capacity = requiredStorageCount(shape: shape, strides: strides)
-        let pointer = array.dataPointer.bindMemory(to: Float.self, capacity: capacity)
-        return try StridedTensor(shape: shape, strides: strides, storage: .float32(Array(UnsafeBufferPointer(start: pointer, count: capacity))))
-    case .double:
-        let capacity = requiredStorageCount(shape: shape, strides: strides)
-        let pointer = array.dataPointer.bindMemory(to: Double.self, capacity: capacity)
-        return try StridedTensor(shape: shape, strides: strides, storage: .float64(Array(UnsafeBufferPointer(start: pointer, count: capacity))))
-    default:
-        throw SidecarError.invalid("unsupported CoreML output data type \(array.dataType.rawValue)")
-    }
-}
-
 private func requiredStorageCount(shape: [Int], strides: [Int]) -> Int {
     zip(shape, strides).reduce(1) { partial, pair in partial + (pair.0 - 1) * pair.1 }
 }
 
 private func normalizedDigest(_ raw: String) -> String {
-    raw.lowercased().hasPrefix("sha256:") ? String(raw.dropFirst("sha256:".count)).lowercased() : raw.lowercased()
+    raw.lowercased().hasPrefix("sha256:")
+        ? String(raw.dropFirst("sha256:".count)).lowercased() : raw.lowercased()
 }
 
 private func verifyDigest(at url: URL, expected: String) throws {
@@ -383,7 +521,10 @@ private func sha256(of url: URL) throws -> String {
         for relativePath in relativePaths {
             let child = url.appendingPathComponent(relativePath)
             var childIsDirectory: ObjCBool = false
-            guard FileManager.default.fileExists(atPath: child.path, isDirectory: &childIsDirectory), !childIsDirectory.boolValue else {
+            guard
+                FileManager.default.fileExists(atPath: child.path, isDirectory: &childIsDirectory),
+                !childIsDirectory.boolValue
+            else {
                 continue
             }
             hasher.update(data: Data(relativePath.utf8))
@@ -404,6 +545,7 @@ private func timingResponse(requestID: String, timing: StageTimings) -> [String:
         "prediction_ms": timing.predictionMilliseconds,
         "kv_layout_ms": timing.kvLayoutMilliseconds,
         "logits_copy_ms": timing.logitsCopyMilliseconds,
+        "integrity_ms": timing.integrityMilliseconds,
         "total_ms": timing.totalMilliseconds,
         "cancelled": timing.cancelled,
     ]
@@ -425,7 +567,9 @@ private func errorResponse(_ error: Error, requestID: String?) -> [String: Any] 
 }
 
 private func requestID(in frame: Data) -> String? {
-    guard let object = try? JSONSerialization.jsonObject(with: frame) as? [String: Any] else { return nil }
+    guard let object = try? JSONSerialization.jsonObject(with: frame) as? [String: Any] else {
+        return nil
+    }
     return object["request_id"] as? String
 }
 
@@ -441,7 +585,8 @@ private func parseArguments() throws -> Arguments {
         }
     }
     guard let socket, !socket.isEmpty, let nonce, !nonce.isEmpty else {
-        throw SidecarError.invalid("usage: ane-prefill-sidecar --socket <unix socket> --nonce <nonce>")
+        throw SidecarError.invalid(
+            "usage: ane-prefill-sidecar --socket <unix socket> --nonce <nonce>")
     }
     return Arguments(socket: socket, nonce: nonce)
 }
@@ -463,7 +608,8 @@ private final class UnixConnection: @unchecked Sendable {
         let lengthBytes = try readExactly(fd: fd, count: 4)
         let length = lengthBytes.withUnsafeBytes { raw -> UInt32 in
             let bytes = raw.bindMemory(to: UInt8.self)
-            return UInt32(bytes[0]) | (UInt32(bytes[1]) << 8) | (UInt32(bytes[2]) << 16) | (UInt32(bytes[3]) << 24)
+            return UInt32(bytes[0]) | (UInt32(bytes[1]) << 8) | (UInt32(bytes[2]) << 16)
+                | (UInt32(bytes[3]) << 24)
         }
         guard length <= UInt32(maxFrameBytes) else {
             throw SidecarError.io("frame exceeds negotiated maximum")
@@ -511,7 +657,8 @@ private func readExactly(fd: Int32, count: Int) throws -> Data {
 private func writeExactly(fd: Int32, bytes: UnsafeRawBufferPointer) throws {
     var offset = 0
     while offset < bytes.count {
-        let written = Darwin.write(fd, bytes.baseAddress!.advanced(by: offset), bytes.count - offset)
+        let written = Darwin.write(
+            fd, bytes.baseAddress!.advanced(by: offset), bytes.count - offset)
         if written < 0 {
             if errno == EINTR { continue }
             throw SidecarError.io("socket write failed: \(String(cString: strerror(errno)))")
