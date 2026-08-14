@@ -161,9 +161,18 @@ class FakeDriver:
                 "cold_ready_compile_failure": {"guard_ms": 10, "readiness_ms": 100, "gpu_prefill_ms": 60},
                 "cold_ready_load_failure": {"guard_ms": 10, "readiness_ms": 100, "gpu_prefill_ms": 60},
             }[request["case_id"]]
+            attempt_budget_spend = (
+                components["prediction_ms"]
+                if "prediction_ms" in components
+                else components["readiness_ms"]
+            )
             return {
                 "status": "ok",
+                "forced_fault": certify.TIMING_FORCED_FAULTS[request["case_id"]],
                 "consumed_components_ms": components,
+                "attempt_budget_spend_ms": attempt_budget_spend,
+                "fallback_trigger_latency_ms": sum(components.values()) - components["gpu_prefill_ms"],
+                "gpu_prefill_ms": components["gpu_prefill_ms"],
                 "total_ttft_ms": sum(components.values()),
             }
         raise AssertionError(f"unhandled driver request: {request}")
@@ -191,6 +200,19 @@ class BrokenTimingDriver(FakeDriver):
         return response
 
 
+class DisabledFallbackSeamDriver(FakeDriver):
+    """Models a production worker that did not opt into the certification probe."""
+
+    def exchange(self, request: dict[str, Any]) -> dict[str, Any]:
+        if request["operation"] == "worst_case_fallback":
+            return {
+                "status": "absent",
+                "absence_reason": "compile_or_load_failure",
+                "detail": "certification ANE timing probe is disabled",
+            }
+        return super().exchange(request)
+
+
 class CertificationHarnessTests(unittest.TestCase):
     def test_fixture_material_is_digest_pinned(self) -> None:
         certify.verify_fixture_digest()
@@ -206,6 +228,10 @@ class CertificationHarnessTests(unittest.TestCase):
         self.assertEqual(outcomes[(128, "q8-step")]["outcome"], "certified")
         self.assertEqual(outcomes[(256, "q8-step")]["absence_reason"], "capacity_precondition_unmet")
         self.assertEqual(result["maximum_worst_case_fallback_ttft_ms"], 170.0)
+        fallback_rows = result["worst_case_fallback_rows"]
+        self.assertEqual([row["case_id"] for row in fallback_rows], [case_id for case_id, _ in certify.TIMING_CASES])
+        self.assertTrue(all(row["arm"]["bucket"] == 128 for row in fallback_rows))
+        self.assertTrue(all(row["gpu_prefill_ms"] == row["consumed_components_ms"]["gpu_prefill_ms"] for row in fallback_rows))
         self.assertEqual(len(result["semantic_exercises"]), len(certify.BYPASS_REASONS) + len(certify.FALLBACK_FAULTS) + len(certify.LIFECYCLE_CASES) + len(certify.QUARANTINE_CASES) + len(certify.PIN_CASES) + 1)
 
     def test_legal_top2_swap_inside_band_passes(self) -> None:
@@ -255,6 +281,12 @@ class CertificationHarnessTests(unittest.TestCase):
     def test_warm_fallback_requires_every_consumed_component(self) -> None:
         with self.assertRaisesRegex(certify.CertificationFailure, "components do not cover"):
             certify.Certifier(ROOT, BrokenTimingDriver()).run()
+
+    def test_disabled_fallback_seam_emits_no_timing_rows(self) -> None:
+        certifier = certify.Certifier(ROOT, DisabledFallbackSeamDriver())
+        fallback_arm = certify.Arm("test-m5-profile", "qwen3-0.6b", 128, "f16-step", True)
+        with self.assertRaisesRegex(certify.CertificationFailure, "artifact_warm fallback measurement failed"):
+            certifier.worst_case_fallbacks(fallback_arm)
 
 
 if __name__ == "__main__":

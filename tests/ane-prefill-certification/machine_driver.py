@@ -4,8 +4,9 @@
 The adapter hosts the real release decode worker over its length-prefixed Unix
 socket protocol. Split requests configure that worker with the compiled CoreML
 artifact, causing the worker itself to launch and negotiate with the Swift
-sidecar. Operations that need production seams not exposed by this binary fail
-closed rather than synthesizing observations.
+sidecar. Its explicit fallback-timing probe is enabled only for these
+certification subprocesses; every other unavailable seam fails closed rather
+than synthesizing observations.
 """
 
 from __future__ import annotations
@@ -122,6 +123,7 @@ class WorkerClient:
         self._worker_log = self._worker_log_path.open("ab", buffering=0)
         environment = os.environ.copy()
         environment["CK_ANE_PREFILL_LOG_TIMINGS"] = "1"
+        environment["CK_ANE_PREFILL_CERTIFICATION_PROBE"] = "1"
         self._child = subprocess.Popen(
             [str(worker), "--socket", str(socket_path), "--nonce", nonce],
             stdin=subprocess.DEVNULL,
@@ -244,6 +246,26 @@ class WorkerClient:
                 }
             )
 
+    def fallback_timing(self, case_id: str, prompt: list[int]) -> dict[str, Any]:
+        response = self._request(
+            {
+                "type": "CERTIFICATION_ANE_PREFILL_FALLBACK_PROBE",
+                "req_id": self._next_id(),
+                "case_id": case_id,
+                "prompt_ids": prompt,
+            }
+        )
+        if response.get("type") == "CERTIFICATION_ANE_PREFILL_FALLBACK_TIMING_ERROR":
+            raise RuntimeError(
+                "worker refused certification fallback timing probe: "
+                + str(response.get("code", "unknown"))
+                + ": "
+                + str(response.get("message", "no detail"))
+            )
+        if response.get("type") != "CERTIFICATION_ANE_PREFILL_FALLBACK_TIMING":
+            raise RuntimeError(f"unexpected certification fallback timing response: {response!r}")
+        return response
+
     def constraint(self, grammar: str) -> dict[str, Any]:
         schema = JSON_OBJECT_GRAMMAR if grammar == "json-object" else grammar
         if schema not in self._constraints:
@@ -319,6 +341,8 @@ class Driver:
             return self.band_gate_observation(request)
         if operation in {"warmup", "measure_ttft"}:
             return self.timing(operation, request)
+        if operation == "worst_case_fallback":
+            return self.worst_case_fallback(request)
         return {
             "status": "absent",
             "absence_reason": "compile_or_load_failure",
@@ -474,6 +498,22 @@ class Driver:
         if operation == "warmup":
             return {"status": "ok"}
         return {"status": "ok", "worker_ttft_ms": elapsed, "wire_ttft_ms": elapsed}
+
+    def worst_case_fallback(self, request: dict[str, Any]) -> dict[str, Any]:
+        arm = request["arm"]
+        prompt = [101 + index % 30000 for index in range(int(arm["bucket"]))]
+        raw = self.client({"arm": arm, "engine": "ane-split"}).fallback_timing(
+            str(request["case_id"]), prompt
+        )
+        return {
+            "status": "ok",
+            "forced_fault": raw["forced_fault"],
+            "consumed_components_ms": raw["consumed_components_ms"],
+            "attempt_budget_spend_ms": raw["attempt_budget_spend_ms"],
+            "fallback_trigger_latency_ms": raw["fallback_trigger_latency_ms"],
+            "gpu_prefill_ms": raw["gpu_prefill_ms"],
+            "total_ttft_ms": raw["total_ttft_ms"],
+        }
 
     def close(self) -> None:
         for client in self.clients.values():

@@ -183,6 +183,11 @@ TIMING_CASES = (
     ("cold_ready_compile_failure", ("guard_ms", "readiness_ms", "gpu_prefill_ms")),
     ("cold_ready_load_failure", ("guard_ms", "readiness_ms", "gpu_prefill_ms")),
 )
+TIMING_FORCED_FAULTS = {
+    "artifact_warm": "handoff_budget",
+    "cold_ready_compile_failure": "compile",
+    "cold_ready_load_failure": "load",
+}
 
 
 class CertificationFailure(RuntimeError):
@@ -807,18 +812,75 @@ class Certifier:
         )
         return results
 
-    def worst_case_fallbacks(self) -> list[dict[str, Any]]:
+    def worst_case_fallbacks(self, arm: Arm) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         for case_id, components in TIMING_CASES:
-            response = self.call("worst_case_fallback", case_id=case_id)
+            response = self.call("worst_case_fallback", case_id=case_id, arm=arm.wire())
             require(response.get("status") == "ok", f"{case_id} fallback measurement failed")
             consumed = response.get("consumed_components_ms")
             require(isinstance(consumed, dict), f"{case_id} lacks consumed timing components")
             require(set(consumed) == set(components), f"{case_id} components do not cover the complete attempted path")
-            require(all(isinstance(value, (int, float)) and value >= 0 for value in consumed.values()), f"{case_id} has invalid component timing")
+            require(
+                all(
+                    isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    and math.isfinite(value)
+                    and value >= 0
+                    for value in consumed.values()
+                ),
+                f"{case_id} has invalid component timing",
+            )
+            attempt_budget_spend = response.get("attempt_budget_spend_ms")
+            fallback_trigger_latency = response.get("fallback_trigger_latency_ms")
+            gpu_prefill = response.get("gpu_prefill_ms")
+            for field, value in (
+                ("attempt_budget_spend_ms", attempt_budget_spend),
+                ("fallback_trigger_latency_ms", fallback_trigger_latency),
+                ("gpu_prefill_ms", gpu_prefill),
+            ):
+                require(
+                    isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    and math.isfinite(value)
+                    and value >= 0,
+                    f"{case_id} has invalid {field}",
+                )
+            expected_attempt_spend = consumed.get("prediction_ms", consumed.get("readiness_ms"))
+            require(
+                math.isclose(attempt_budget_spend, expected_attempt_spend, rel_tol=0.0, abs_tol=1e-9),
+                f"{case_id} attempt budget spend differs from its measured ANE stage",
+            )
+            require(
+                fallback_trigger_latency >= attempt_budget_spend,
+                f"{case_id} fallback triggered before its measured attempt budget spend",
+            )
+            require(
+                math.isclose(gpu_prefill, consumed["gpu_prefill_ms"], rel_tol=0.0, abs_tol=1e-9),
+                f"{case_id} reports a GPU prefill time that differs from its consumed stage",
+            )
+            forced_fault = response.get("forced_fault")
+            require(forced_fault == TIMING_FORCED_FAULTS[case_id], f"{case_id} reported the wrong forced fault")
             total = response.get("total_ttft_ms")
-            require(isinstance(total, (int, float)) and total >= sum(consumed.values()), f"{case_id} total TTFT is less than its consumed components")
-            rows.append({"case_id": case_id, "consumed_components_ms": consumed, "total_ttft_ms": float(total)})
+            require(
+                isinstance(total, (int, float))
+                and not isinstance(total, bool)
+                and math.isfinite(total)
+                and total >= sum(consumed.values())
+                and total >= fallback_trigger_latency + gpu_prefill,
+                f"{case_id} total TTFT is less than its observed fallback chain",
+            )
+            rows.append(
+                {
+                    "case_id": case_id,
+                    "arm": arm.wire(),
+                    "forced_fault": forced_fault,
+                    "consumed_components_ms": consumed,
+                    "attempt_budget_spend_ms": float(attempt_budget_spend),
+                    "fallback_trigger_latency_ms": float(fallback_trigger_latency),
+                    "gpu_prefill_ms": float(gpu_prefill),
+                    "total_ttft_ms": float(total),
+                }
+            )
         return rows
 
     def run(self) -> dict[str, Any]:
@@ -830,7 +892,10 @@ class Certifier:
         require(len(headline) == 2 and all(attempt["outcome"] == "certified" for attempt in headline), "both W128 arms must be green")
         require(all(attempt["outcome"] == "certified" or attempt.get("absence_reason") in ABSENCE_REASONS for attempt in attempts), "each non-headline arm must be green or deterministically absent")
         exercises = self.run_semantic_exercises(arms)
-        fallback_rows = self.worst_case_fallbacks()
+        fallback_arm = next(
+            arm for arm in arms if arm.bucket == 128 and arm.decode_config == "f16-step"
+        )
+        fallback_rows = self.worst_case_fallbacks(fallback_arm)
         return {
             "schema_revision": 2,
             "record_kind": "ane_prefill_hardware_certification",

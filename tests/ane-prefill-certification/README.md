@@ -28,7 +28,8 @@ comparison tools. The adapter must provide the JSONL protocol below. Then run:
 ```sh
 python3 tests/ane-prefill-certification/certify.py \
   --output evidence/ane-prefill-split/evidence-record-v1.json \
-  --driver python3 path/to/machine_driver.py --machine-config path/to/synapse.jsonc
+  --driver python3 tests/ane-prefill-certification/machine_driver.py \
+    --checkpoint "$SYNAPSE_OWNED_DECODE_QWEN3_0_6B"
 ```
 
 The output path is intentionally explicit: an operator cannot accidentally
@@ -146,11 +147,23 @@ a later `quarantined` bypass without a second request debit.
 
 ### `worst_case_fallback`
 
-The harness requests `artifact_warm`, `cold_ready_compile_failure`, and
-`cold_ready_load_failure`. Return every consumed timing component and the total
-TTFT. The warm row must consume guard, prediction, handoff, and GPU prefill; the
-cold rows must consume guard, readiness, and GPU prefill. The harness reports
-the maximum of the three totals into the evidence record.
+The harness sends all three calls to the W128 f16 split arm: `artifact_warm`,
+`cold_ready_compile_failure`, and `cold_ready_load_failure`. The production
+adapter translates each call to the worker's
+`CERTIFICATION_ANE_PREFILL_FALLBACK_PROBE` operation. It enables that operation
+only in the subprocess environment with `CK_ANE_PREFILL_CERTIFICATION_PROBE=1`;
+normal serving requests cannot select or supply a forced fault.
+
+Return every consumed timing component, the forced fault, attempt-budget spend,
+fallback-trigger latency, full GPU-prefill time, and total TTFT. Attempt-budget
+spend equals the measured prediction stage on the warm path and the measured
+readiness stage on cold paths; trigger latency is the worker wall time from the
+split attempt beginning to the forced fallback. The warm row must consume guard,
+prediction, handoff, and GPU prefill; the cold rows must consume guard,
+readiness, and GPU prefill. A disabled or unavailable probe is
+not an absence row: the harness fails before it can write fallback timing
+rows. The harness reports the maximum of the three totals into the evidence
+record.
 
 ## Fixture pinning
 

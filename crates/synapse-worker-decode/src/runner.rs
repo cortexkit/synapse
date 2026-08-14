@@ -30,6 +30,7 @@ use owned_decode_worker::{
     },
     validation::{validate_start, WorkerStartContext},
 };
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use synapse_core::{
@@ -65,6 +66,11 @@ const ENGINE_VERSION: &str = "owned-metal-decode-v1";
 const ANE_PREFILL_PROTOCOL_VERSION: u64 = 1;
 const ANE_PREFILL_ENGINE_NAME: &str = "ane-prefill-coreml";
 const ANE_PREFILL_ENGINE_VERSION: &str = "coreml-fixed-window-v1";
+const ANE_PREFILL_CERTIFICATION_PROBE_ENV: &str = "CK_ANE_PREFILL_CERTIFICATION_PROBE";
+const ANE_PREFILL_CERTIFICATION_PROBE_TYPE: &str = "CERTIFICATION_ANE_PREFILL_FALLBACK_PROBE";
+const ANE_PREFILL_CERTIFICATION_TIMING_TYPE: &str = "CERTIFICATION_ANE_PREFILL_FALLBACK_TIMING";
+const ANE_PREFILL_CERTIFICATION_TIMING_ERROR_TYPE: &str =
+    "CERTIFICATION_ANE_PREFILL_FALLBACK_TIMING_ERROR";
 static ANE_PREFILL_SOCKET_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// The closed runtime fallback vocabulary for an ANE-prefill attempt. Routing
@@ -168,6 +174,24 @@ impl AnePrefillFault {
         Self::ArtifactMismatch,
         Self::LogitsPublication,
     ];
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Compile => "compile",
+            Self::Load => "load",
+            Self::Dispatch => "dispatch",
+            Self::Prediction => "prediction",
+            Self::PredictionTimeout => "prediction_timeout",
+            Self::KvConversion => "kv_conversion",
+            Self::Ipc => "ipc",
+            Self::CacheHandoff => "cache_handoff",
+            Self::MetalUpload => "metal_upload",
+            Self::HandoffBudget => "handoff_budget",
+            Self::ReadinessBudget => "readiness_budget",
+            Self::ArtifactMismatch => "artifact_mismatch",
+            Self::LogitsPublication => "logits_publication",
+        }
+    }
 
     const fn fallback_reason(self) -> AnePrefillFallbackReason {
         match self {
@@ -304,6 +328,67 @@ impl AnePrefillTimings {
     }
 }
 
+/// These variants are used only by the opt-in certification timing probe to
+/// exercise the artifact-warm path and the cold-ready compile/load failure paths.
+/// Normal request generation cannot select them or a fault.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum CertificationFallbackCase {
+    ArtifactWarm,
+    ColdReadyCompileFailure,
+    ColdReadyLoadFailure,
+}
+
+impl CertificationFallbackCase {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ArtifactWarm => "artifact_warm",
+            Self::ColdReadyCompileFailure => "cold_ready_compile_failure",
+            Self::ColdReadyLoadFailure => "cold_ready_load_failure",
+        }
+    }
+
+    const fn forced_fault(self) -> AnePrefillFault {
+        match self {
+            Self::ArtifactWarm => AnePrefillFault::HandoffBudget,
+            Self::ColdReadyCompileFailure => AnePrefillFault::Compile,
+            Self::ColdReadyLoadFailure => AnePrefillFault::Load,
+        }
+    }
+}
+
+/// A raw worker request reserved for the opt-in certification process. It is
+/// kept outside the serving transport so a serving request cannot select a fault.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CertificationFallbackProbeRequest {
+    #[serde(rename = "type")]
+    request_type: String,
+    req_id: String,
+    case_id: CertificationFallbackCase,
+    prompt_ids: Vec<u32>,
+}
+
+#[derive(Debug, Serialize)]
+struct CertificationFallbackProbeResponse {
+    #[serde(rename = "type")]
+    response_type: &'static str,
+    req_id: String,
+    case_id: &'static str,
+    forced_fault: &'static str,
+    consumed_components_ms: BTreeMap<String, f64>,
+    attempt_budget_spend_ms: f64,
+    fallback_trigger_latency_ms: f64,
+    gpu_prefill_ms: f64,
+    total_ttft_ms: f64,
+}
+
+struct CertificationAttemptMeasurement {
+    consumed_components_ms: BTreeMap<String, Duration>,
+    attempt_budget_spend: Duration,
+    fallback_trigger_latency: Duration,
+}
+
 struct AnePrefillPayload {
     active_tokens: usize,
     logits: Vec<f32>,
@@ -335,21 +420,28 @@ impl AnePrefillRuntime {
                 "prompt is outside the selected fixed ANE prefill window",
             ));
         }
-        if self.client.is_none() {
-            let client = AnePrefillClient::connect(&self.config)?;
-            self.client = Some(client);
-        }
-        let payload = self
-            .client
-            .as_mut()
-            .expect("sidecar client is installed before execution")
-            .execute(&self.config, prompt);
+        let config = self.config.clone();
+        let payload = self.ensure_client()?.execute(&config, prompt);
         if payload.is_err() {
             // A failed request never reuses a socket that may still hold a late
             // EXECUTED frame. Dropping it also terminates an unresponsive sidecar.
             self.client = None;
         }
         payload
+    }
+
+    fn ensure_client(&mut self) -> Result<&mut AnePrefillClient, AnePrefillFailure> {
+        if self.client.is_none() {
+            self.client = Some(AnePrefillClient::connect(&self.config)?);
+        }
+        Ok(self
+            .client
+            .as_mut()
+            .expect("sidecar client is installed before use"))
+    }
+
+    fn discard_client(&mut self) {
+        self.client = None;
     }
 
     fn record_failure(&mut self, failure: AnePrefillFailure) {
@@ -497,6 +589,7 @@ impl AnePrefillClient {
             )
         })?;
         let nonce = format!("decode-{}-{sequence}", std::process::id());
+        let readiness_started = Instant::now();
         let child = Command::new(&config.sidecar_path)
             .arg("--socket")
             .arg(&socket_path)
@@ -583,12 +676,14 @@ impl AnePrefillClient {
             AnePrefillFault::Load,
         )?;
         client.install(config)?;
+        // Readiness includes process launch, handshake, and artifact installation.
+        // Measuring only INSTALL would hide cold-start time in fallback evidence.
+        client.readiness = readiness_started.elapsed();
         Ok(client)
     }
 
     fn install(&mut self, config: &AnePrefillConfig) -> Result<(), AnePrefillFailure> {
         let request_id = self.next_request_id("install");
-        let started = Instant::now();
         self.set_io_timeout(config.readiness_budget, AnePrefillFault::ReadinessBudget)?;
         self.write_json(
             &serde_json::json!({
@@ -611,7 +706,6 @@ impl AnePrefillClient {
             return Err(sidecar_error(&response, AnePrefillFault::Load));
         }
         validate_response(&response, "INSTALLED", &request_id, config)?;
-        self.readiness = started.elapsed();
         Ok(())
     }
 
@@ -643,6 +737,7 @@ impl AnePrefillClient {
                 .saturating_add(config.handoff_budget),
             AnePrefillFault::PredictionTimeout,
         )?;
+        let prediction_started = Instant::now();
         self.write_json(
             &serde_json::json!({
                 "type": "EXECUTE",
@@ -659,6 +754,7 @@ impl AnePrefillClient {
             return Err(sidecar_error(&response, AnePrefillFault::Prediction));
         }
         validate_execution_header(&response, &request_id, config, prompt.len())?;
+        let prediction = prediction_started.elapsed();
         let ipc_started = Instant::now();
         self.set_io_timeout(config.handoff_budget, AnePrefillFault::Ipc)?;
         let logits = decode_f32_frame(&self.read_raw(AnePrefillFault::Ipc)?)
@@ -678,9 +774,13 @@ impl AnePrefillClient {
             return Err(sidecar_error(&timing, AnePrefillFault::Ipc));
         }
         validate_timing(&timing, &timing_request_id, &request_id)?;
+        let _sidecar_prediction =
+            milliseconds_field(&timing, "prediction_ms", AnePrefillFault::Ipc)?;
         let timings = AnePrefillTimings {
             readiness: self.readiness,
-            prediction: milliseconds_field(&timing, "prediction_ms", AnePrefillFault::Ipc)?,
+            // Certification measures prediction time at the worker boundary using
+            // elapsed wall-clock time, but this code still validates the sidecar payload.
+            prediction,
             kv_layout: milliseconds_field(&timing, "kv_layout_ms", AnePrefillFault::Ipc)?,
             logits_copy: milliseconds_field(&timing, "logits_copy_ms", AnePrefillFault::Ipc)?,
             ipc: ipc_started.elapsed(),
@@ -1430,6 +1530,119 @@ struct LoadedRuntime {
     ane_prefill: Option<AnePrefillRuntime>,
 }
 
+impl LoadedRuntime {
+    fn prepare_certification_artifact_warm(&mut self, prompt: &[u32]) -> Result<()> {
+        let ane_prefill = self
+            .ane_prefill
+            .as_mut()
+            .context("ANE prefill is not configured for this worker")?;
+        self.engine
+            .reset()
+            .context("reset decode engine before ANE certification warmup")?;
+        self.engine
+            .prefill_greedy_ane(ane_prefill, prompt, self.context_bucket)
+            .map_err(|failure| {
+                anyhow::anyhow!("warm ANE prefill before timing: {}", failure.detail)
+            })?;
+        self.engine
+            .reset()
+            .context("reset decode engine before measured ANE attempt")
+    }
+
+    fn certification_artifact_warm_attempt(
+        &mut self,
+        prompt: &[u32],
+    ) -> Result<CertificationAttemptMeasurement> {
+        let ane_prefill = self
+            .ane_prefill
+            .as_mut()
+            .context("ANE prefill is not configured for this worker")?;
+        let attempt_started = Instant::now();
+        let (_cache, logits, mut timings) = self
+            .engine
+            .admit_ane_prefill(ane_prefill, prompt, self.context_bucket)
+            .map_err(|failure| {
+                anyhow::anyhow!("execute measured ANE attempt: {}", failure.detail)
+            })?;
+        let publication_started = Instant::now();
+        first_token_from_logits(&logits).map_err(|failure| {
+            anyhow::anyhow!("publish measured ANE logits: {}", failure.detail)
+        })?;
+        timings.logits_publication = publication_started.elapsed();
+        ensure_handoff_budget(ane_prefill, &timings).map_err(|failure| {
+            anyhow::anyhow!("validate measured ANE handoff: {}", failure.detail)
+        })?;
+
+        let fallback_trigger_latency = attempt_started.elapsed();
+        ane_prefill.record_failure(AnePrefillFailure::new(
+            AnePrefillFault::HandoffBudget,
+            "certification probe forces fallback only after the complete ANE handoff",
+        ));
+        let mut consumed_components_ms = BTreeMap::new();
+        consumed_components_ms.insert("prediction_ms".to_string(), timings.prediction);
+        consumed_components_ms.insert("handoff_ms".to_string(), timings.handoff_total());
+        Ok(CertificationAttemptMeasurement {
+            consumed_components_ms,
+            attempt_budget_spend: timings.prediction,
+            fallback_trigger_latency,
+        })
+    }
+
+    fn certification_cold_ready_attempt(
+        &mut self,
+        prompt: &[u32],
+        forced_fault: AnePrefillFault,
+    ) -> Result<CertificationAttemptMeasurement> {
+        debug_assert!(matches!(
+            forced_fault,
+            AnePrefillFault::Compile | AnePrefillFault::Load
+        ));
+        let ane_prefill = self
+            .ane_prefill
+            .as_mut()
+            .context("ANE prefill is not configured for this worker")?;
+        ensure!(
+            !prompt.is_empty() && prompt.len() <= ane_prefill.config.window,
+            "certification cold-ready prompt is outside the selected fixed ANE window"
+        );
+        self.engine
+            .reset()
+            .context("reset decode engine before cold ANE certification attempt")?;
+        ane_prefill.discard_client();
+        let attempt_started = Instant::now();
+        let readiness = ane_prefill
+            .ensure_client()
+            .map_err(|failure| {
+                anyhow::anyhow!("bring ANE sidecar to readiness: {}", failure.detail)
+            })?
+            .readiness;
+        let fallback_trigger_latency = attempt_started.elapsed();
+        ane_prefill.record_failure(AnePrefillFailure::new(
+            forced_fault,
+            "certification probe forces the cold-ready fallback after sidecar readiness",
+        ));
+        ane_prefill.discard_client();
+        let mut consumed_components_ms = BTreeMap::new();
+        consumed_components_ms.insert("readiness_ms".to_string(), readiness);
+        Ok(CertificationAttemptMeasurement {
+            consumed_components_ms,
+            attempt_budget_spend: readiness,
+            fallback_trigger_latency,
+        })
+    }
+
+    fn certification_gpu_prefill(&mut self, prompt: &[u32]) -> Result<Duration> {
+        self.engine
+            .reset()
+            .context("reset decode engine before GPU fallback prefill")?;
+        let started = Instant::now();
+        self.engine
+            .prefill_greedy(prompt)
+            .context("run GPU fallback prefill")?;
+        Ok(started.elapsed())
+    }
+}
+
 struct ActiveConstraint {
     automaton: Automaton,
     state: State,
@@ -1617,6 +1830,72 @@ impl WorkerState {
             model_ref,
             dims: 0,
             cold_load_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+        })
+    }
+
+    fn certification_fallback_probe(
+        &mut self,
+        request: CertificationFallbackProbeRequest,
+    ) -> Result<CertificationFallbackProbeResponse> {
+        ensure!(
+            self.resident.is_none(),
+            "certification ANE timing probe cannot run during a generation"
+        );
+        ensure!(
+            request.request_type == ANE_PREFILL_CERTIFICATION_PROBE_TYPE,
+            "unexpected certification ANE timing probe type"
+        );
+        ensure!(
+            !request.prompt_ids.is_empty(),
+            "certification ANE timing probe requires a non-empty prompt"
+        );
+        let loaded = self
+            .loaded
+            .as_mut()
+            .context("certification ANE timing probe requires a loaded runtime")?;
+        if request.case_id == CertificationFallbackCase::ArtifactWarm {
+            loaded.prepare_certification_artifact_warm(&request.prompt_ids)?;
+        }
+        let total_started = Instant::now();
+        // Certification records the uncontended guard boundary at the worker
+        // handoff instead of substituting a configured delay.
+        let guard_started = Instant::now();
+        let guard_wait = guard_started.elapsed();
+        let mut attempt = match request.case_id {
+            CertificationFallbackCase::ArtifactWarm => {
+                loaded.certification_artifact_warm_attempt(&request.prompt_ids)?
+            }
+            CertificationFallbackCase::ColdReadyCompileFailure
+            | CertificationFallbackCase::ColdReadyLoadFailure => loaded
+                .certification_cold_ready_attempt(
+                    &request.prompt_ids,
+                    request.case_id.forced_fault(),
+                )?,
+        };
+        let gpu_prefill = loaded.certification_gpu_prefill(&request.prompt_ids)?;
+        attempt
+            .consumed_components_ms
+            .insert("guard_ms".to_string(), guard_wait);
+        attempt
+            .consumed_components_ms
+            .insert("gpu_prefill_ms".to_string(), gpu_prefill);
+        let attempt_budget_spend_ms = duration_milliseconds(attempt.attempt_budget_spend);
+        let fallback_trigger_latency_ms = duration_milliseconds(attempt.fallback_trigger_latency);
+        let consumed_components_ms = attempt
+            .consumed_components_ms
+            .into_iter()
+            .map(|(stage, duration)| (stage, duration_milliseconds(duration)))
+            .collect();
+        Ok(CertificationFallbackProbeResponse {
+            response_type: ANE_PREFILL_CERTIFICATION_TIMING_TYPE,
+            req_id: request.req_id,
+            case_id: request.case_id.as_str(),
+            forced_fault: request.case_id.forced_fault().as_str(),
+            consumed_components_ms,
+            attempt_budget_spend_ms,
+            fallback_trigger_latency_ms,
+            gpu_prefill_ms: duration_milliseconds(gpu_prefill),
+            total_ttft_ms: duration_milliseconds(total_started.elapsed()),
         })
     }
 
@@ -2491,6 +2770,10 @@ pub fn main() -> Result<()> {
     ensure!(ack.accept, "module rejected worker handshake");
     let max_frame = ack.max_frame.min(DEFAULT_MAX_FRAME_BYTES);
     let mut state = WorkerState::new(worker_generation, !args.disable_forced_token_fast_path);
+    let certification_probe_enabled = std::env::var(ANE_PREFILL_CERTIFICATION_PROBE_ENV)
+        .ok()
+        .as_deref()
+        == Some("1");
 
     loop {
         let bytes = match read_frame(&mut stream, max_frame) {
@@ -2506,6 +2789,48 @@ pub fn main() -> Result<()> {
             .get("type")
             .and_then(Value::as_str)
             .unwrap_or_default();
+        if certification_fault_requested_on_normal_operation(&value, ty) {
+            write_json_frame(
+                &mut stream,
+                &WorkerResponse::Err {
+                    req_id: value
+                        .get("req_id")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                    code: "certification_probe_required".to_string(),
+                    msg: "ANE prefill forced faults are accepted only by the opt-in certification probe"
+                        .to_string(),
+                },
+                max_frame,
+            )?;
+            continue;
+        }
+        if ty == ANE_PREFILL_CERTIFICATION_PROBE_TYPE {
+            let response = match serde_json::from_value::<CertificationFallbackProbeRequest>(value)
+            {
+                Err(error) => certification_probe_error(
+                    None,
+                    "certification_probe_invalid_request",
+                    &error.to_string(),
+                ),
+                Ok(request) if !certification_probe_enabled => certification_probe_error(
+                    Some(&request.req_id),
+                    "certification_probe_disabled",
+                    "set CK_ANE_PREFILL_CERTIFICATION_PROBE=1 to enable this explicit probe",
+                ),
+                Ok(request) => match state.certification_fallback_probe(request) {
+                    Ok(response) => serde_json::to_value(response)
+                        .expect("certification timing response serializes"),
+                    Err(error) => certification_probe_error(
+                        None,
+                        "certification_probe_unavailable",
+                        &error.to_string(),
+                    ),
+                },
+            };
+            write_json_frame(&mut stream, &response, max_frame)?;
+            continue;
+        }
         if matches!(
             ty,
             "GENERATE_START"
@@ -3046,6 +3371,26 @@ fn standard_req_id(request: &WorkerRequest) -> Option<String> {
     }
 }
 
+fn certification_fault_requested_on_normal_operation(request: &Value, ty: &str) -> bool {
+    ty != ANE_PREFILL_CERTIFICATION_PROBE_TYPE
+        && ["forced_fault", "ane_prefill_certification_fault"]
+            .iter()
+            .any(|field| request.get(field).is_some())
+}
+
+fn certification_probe_error(req_id: Option<&str>, code: &str, message: &str) -> Value {
+    serde_json::json!({
+        "type": ANE_PREFILL_CERTIFICATION_TIMING_ERROR_TYPE,
+        "req_id": req_id,
+        "code": code,
+        "message": message,
+    })
+}
+
+fn duration_milliseconds(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1_000.0
+}
+
 fn effective_decode_chain_k(configured: usize, constrained: bool) -> usize {
     if constrained {
         1
@@ -3177,6 +3522,44 @@ mod tests {
             "raw_schema": {}
         });
         assert!(serde_json::from_value::<DecodeTransportRequest>(value).is_err());
+    }
+
+    #[test]
+    fn certification_faults_are_refused_on_normal_requests() {
+        let normal_request = serde_json::json!({
+            "type": "PING",
+            "req_id": "normal-request",
+            "forced_fault": "handoff_budget",
+        });
+        assert!(certification_fault_requested_on_normal_operation(
+            &normal_request,
+            "PING"
+        ));
+        let probe_request = serde_json::json!({
+            "type": ANE_PREFILL_CERTIFICATION_PROBE_TYPE,
+            "req_id": "certification-request",
+            "case_id": "artifact_warm",
+            "prompt_ids": [1],
+        });
+        assert!(!certification_fault_requested_on_normal_operation(
+            &probe_request,
+            ANE_PREFILL_CERTIFICATION_PROBE_TYPE
+        ));
+    }
+
+    #[test]
+    fn disabled_certification_probe_returns_no_timing_payload() {
+        let response = certification_probe_error(
+            Some("certification-request"),
+            "certification_probe_disabled",
+            "probe is disabled",
+        );
+        assert_eq!(
+            response.get("type").and_then(Value::as_str),
+            Some(ANE_PREFILL_CERTIFICATION_TIMING_ERROR_TYPE)
+        );
+        assert!(response.get("consumed_components_ms").is_none());
+        assert!(response.get("total_ttft_ms").is_none());
     }
 
     #[test]
