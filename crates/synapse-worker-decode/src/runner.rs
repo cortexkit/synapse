@@ -1151,6 +1151,42 @@ enum DecodeCache {
     Lfm2(Lfm2HybridStepCache),
 }
 
+fn prefill_qwen_batched(
+    decoder: &mut MetalStepDecoder<'_>,
+    prompt: &[u32],
+) -> Result<(MetalStepKvCache, u32)> {
+    ensure!(!prompt.is_empty(), "decode prompt must not be empty");
+    ensure!(
+        prompt.len() <= decoder.capacity(),
+        "decode prompt exceeds cache bucket"
+    );
+    let batch_tokens = MetalStepDecoder::MAX_BATCH_VERIFY_TOKENS;
+    let batched_len = prompt.len() / batch_tokens * batch_tokens;
+    let (batched, remainder) = prompt.split_at(batched_len);
+    let mut cache = MetalStepKvCache { position: 0 };
+    let mut first_token = None;
+
+    // Batch only complete 16-token spans; a shorter tail remains sequential.
+    // This preserves the established prefill command boundaries while reducing
+    // weight streaming for every full span.
+    for chunk in batched.chunks_exact(batch_tokens) {
+        first_token = decoder
+            .verify_tokens_batch(&mut cache, chunk)?
+            .last()
+            .copied();
+    }
+    if !remainder.is_empty() {
+        first_token = DecodeKernel::verify_tokens(decoder, &mut cache, remainder)?
+            .last()
+            .copied();
+    }
+
+    Ok((
+        cache,
+        first_token.expect("non-empty prompt produces an argmax"),
+    ))
+}
+
 impl DecodeEngine {
     fn reset(&mut self) -> Result<()> {
         if let Self::Lfm2 { engine } = self {
@@ -1285,12 +1321,12 @@ impl DecodeEngine {
                     // Mirror bench/spikes/unified-rt/src/qwen3_decode_metal_step.rs:
                     // Q8 keeps prefill at f16 quality, then hands the exact f16 KV
                     // bits to the bandwidth-oriented Q8 step engine.
-                    let (prefill_cache, token) = prefill.prefill(prompt)?;
+                    let (prefill_cache, token) = prefill_qwen_batched(prefill, prompt)?;
                     let cache =
                         handoff_qwen_cache(prefill, decoder, *layer_count, prefill_cache.position)?;
                     (cache, token)
                 } else {
-                    decoder.prefill(prompt)?
+                    prefill_qwen_batched(decoder, prompt)?
                 };
                 Ok((DecodeCache::Qwen(cache), token))
             }
