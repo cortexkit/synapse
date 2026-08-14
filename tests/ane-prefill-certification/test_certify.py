@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import sys
 import unittest
@@ -265,6 +266,51 @@ class CertificationHarnessTests(unittest.TestCase):
             certify.Certifier(ROOT, driver).run_token_battery(
                 certify.Arm("test-m5-profile", "qwen3-0.6b", 128, "f16-step", True)
             )
+
+    def test_real_driver_dispatch_covers_every_harness_operation(self) -> None:
+        certify_tree = ast.parse(MODULE_PATH.read_text(encoding="utf-8"))
+        requested = {
+            call.args[0].value
+            for call in ast.walk(certify_tree)
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "call"
+            and call.args
+            and isinstance(call.args[0], ast.Constant)
+            and isinstance(call.args[0].value, str)
+        }
+
+        driver_path = MODULE_PATH.with_name("machine_driver.py")
+        driver_tree = ast.parse(driver_path.read_text(encoding="utf-8"))
+        driver_class = next(
+            node
+            for node in driver_tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "Driver"
+        )
+        handle = next(
+            node
+            for node in driver_class.body
+            if isinstance(node, ast.FunctionDef) and node.name == "handle"
+        )
+        dispatched: set[str] = set()
+        for comparison in (
+            node for node in ast.walk(handle) if isinstance(node, ast.Compare)
+        ):
+            if not isinstance(comparison.left, ast.Name) or comparison.left.id != "operation":
+                continue
+            for comparator in comparison.comparators:
+                values = (
+                    comparator.elts
+                    if isinstance(comparator, (ast.Set, ast.Tuple, ast.List))
+                    else [comparator]
+                )
+                dispatched.update(
+                    value.value
+                    for value in values
+                    if isinstance(value, ast.Constant)
+                    and isinstance(value.value, str)
+                )
+        self.assertEqual(requested - dispatched, set())
 
     def test_every_requested_semantic_case_reaches_the_driver(self) -> None:
         driver = FakeDriver()

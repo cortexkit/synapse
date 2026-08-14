@@ -320,6 +320,7 @@ class Driver:
         self.constraint_compiler = args.constraint_compiler.resolve()
         self.diag_runner = args.diag_runner.resolve()
         self.diag_analyzer = args.diag_analyzer.resolve()
+        self.scenario_runner = args.scenario_runner.resolve()
         self.artifacts = args.artifacts.resolve()
         self.profile = machine_profile()
         self.source_digest = sha256_path(self.checkpoint / SOURCE_MODEL)
@@ -339,6 +340,10 @@ class Driver:
             return self.generate(request)
         if operation == "band_gate_observation":
             return self.band_gate_observation(request)
+        if operation == "routing_battery":
+            return self.routing_battery(request)
+        if operation == "exercise":
+            return self.exercise(request)
         if operation in {"warmup", "measure_ttft"}:
             return self.timing(operation, request)
         if operation == "worst_case_fallback":
@@ -348,6 +353,70 @@ class Driver:
             "absence_reason": "compile_or_load_failure",
             "detail": f"production certification seam is not exposed by the decode worker: {operation}",
         }
+
+    def routing_battery(self, request: dict[str, Any]) -> dict[str, Any]:
+        case_ids = request["case_ids"]
+        if not isinstance(case_ids, list) or not all(
+            isinstance(case_id, str) for case_id in case_ids
+        ):
+            raise RuntimeError("routing_battery case_ids must be a string list")
+        observations = {
+            case_id: self.run_scenario("routing", case_id, request["arm"])["observed"]
+            for case_id in case_ids
+        }
+        return {
+            "status": "ok",
+            "executed_case_ids": case_ids,
+            "observations": observations,
+        }
+
+    def exercise(self, request: dict[str, Any]) -> dict[str, Any]:
+        result = self.run_scenario(
+            "exercise",
+            str(request["case_id"]),
+            request["arm"],
+            kind=str(request["kind"]),
+        )
+        return {"status": "ok", "observed": result["observed"]}
+
+    def run_scenario(
+        self,
+        operation: str,
+        case_id: str,
+        arm: dict[str, Any],
+        *,
+        kind: str | None = None,
+    ) -> dict[str, Any]:
+        if arm.get("family") != "qwen3-0.6b":
+            raise RuntimeError(f"scenario runner does not support family {arm.get('family')!r}")
+        command = [
+            str(self.scenario_runner),
+            "--operation",
+            operation,
+            "--case-id",
+            case_id,
+            "--bucket",
+            str(arm["bucket"]),
+            "--decode-config",
+            str(arm["decode_config"]),
+        ]
+        if kind is not None:
+            command.extend(["--kind", kind])
+        completed = subprocess.run(command, text=True, capture_output=True)
+        if completed.returncode != 0:
+            detail = completed.stderr.strip() or completed.stdout.strip() or "scenario runner failed"
+            raise RuntimeError(f"{operation}/{case_id} scenario failed: {detail}")
+        result = json.loads(completed.stdout)
+        if (
+            not isinstance(result, dict)
+            or result.get("status") != "ok"
+            or result.get("case_id") != case_id
+            or not isinstance(result.get("observed"), dict)
+        ):
+            raise RuntimeError(
+                f"{operation}/{case_id} scenario returned an invalid observation: {result!r}"
+            )
+        return result
 
     def band_gate_observation(self, request: dict[str, Any]) -> dict[str, Any]:
         arm = request["arm"]
@@ -537,6 +606,12 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=root
         / "tests/ane-prefill-certification/diag/target/release/ane-prefill-divergence-diag",
+    )
+    parser.add_argument(
+        "--scenario-runner",
+        type=Path,
+        default=root
+        / "tests/ane-prefill-certification/diag/target/release/ane-prefill-scenario-runner",
     )
     parser.add_argument(
         "--constraint-compiler",

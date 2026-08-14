@@ -21,9 +21,18 @@ partial timing.
 
 ## Run
 
-On the certification machine, first build an adapter that drives the production
-router/worker and the existing `bench/spikes/ane-prefill-split` CoreML/Metal
-comparison tools. The adapter must provide the JSONL protocol below. Then run:
+On the certification machine, first build the diagnostic binaries used by the
+checked-in adapter, which drives the production router/worker and the existing
+`bench/spikes/ane-prefill-split` CoreML/Metal comparison tools:
+
+```sh
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  cargo build --release \
+    --manifest-path tests/ane-prefill-certification/diag/Cargo.toml \
+    --bins
+```
+
+The adapter provides the JSONL protocol below. Then run:
 
 ```sh
 python3 tests/ane-prefill-certification/certify.py \
