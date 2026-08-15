@@ -17,6 +17,7 @@ import statistics
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+import sys
 from typing import Any, Protocol
 
 
@@ -711,6 +712,26 @@ class Certifier:
         split_p50 = statistics.median(sample["worker_ttft_ms"] for sample in samples["ane-split"])
         gpu_p50 = statistics.median(sample["worker_ttft_ms"] for sample in samples["gpu"])
         ratio = gpu_p50 / split_p50
+        # A failed run never writes its output record, which previously
+        # discarded the raw samples exactly when they were needed to explain
+        # the failure. Emit them to stderr before any gate can raise so every
+        # verdict, pass or fail, leaves its evidence behind.
+        print(
+            json.dumps(
+                {
+                    "ttft_samples": {
+                        "arm": arm.id,
+                        "gpu_worker_ms": [s["worker_ttft_ms"] for s in samples["gpu"]],
+                        "split_worker_ms": [s["worker_ttft_ms"] for s in samples["ane-split"]],
+                        "gpu_p50": gpu_p50,
+                        "split_p50": split_p50,
+                        "ratio": ratio,
+                    }
+                },
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+        )
         if split_p50 >= gpu_p50:
             raise ArmAbsent("ttft_not_lower", f"{arm.id} split worker TTFT p50 is not lower than GPU")
         if arm.headline_gate:
