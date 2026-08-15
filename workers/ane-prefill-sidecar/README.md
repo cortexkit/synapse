@@ -22,8 +22,8 @@ After negotiation every JSON command rejects unknown top-level fields:
   deadline is discarded and is never installed.
 - `EXECUTE` requires exactly one installed fixed-width input row and a
   worker-created, mode-`0600` memory-mapped handoff file. It validates right
-  padding, runs CoreML with `CPU_AND_NE`, writes logits and K/V directly into
-  that mapping, and emits an `EXECUTED` layout header with a SHA-256 digest.
+  padding and gives CoreML custom-strided `outputBackings` over the worker's K/V
+  region, then emits an `EXECUTED` layout header with a SHA-256 digest.
 - `ABORT` is handled while prediction is in flight. The sidecar owns the active
   execution ticket and never publishes logits or K/V after observing its
   cancellation. `ABORTED` reports `cancellation_owner: "sidecar"`.
@@ -45,12 +45,15 @@ K/V region uses the Metal import order:
 [layer][key_or_value][head][cache_position][dimension]
 ```
 
-K/V values are f16 little-endian bits. The sidecar walks `MLMultiArray.strides`
-directly into the mapped cache layout rather than first materializing Swift
-arrays. Active positions retain their exact CoreML bits and every remaining
-cache position is zero. The worker validates the generation, layout, completed
-publication state, and SHA-256 digest before exposing the mapped K/V slice to
-the Metal uploader. The socket carries no logits or K/V data in protocol v2.
+K/V values are f16 little-endian bits. Each CoreML output view uses the mapped
+cache's `[head][cache_position][dimension]` strides, so prediction writes the
+worker-importable layout without an intermediate array or host copy. CoreML's
+fixed window includes right-padding positions; the sidecar clears that inactive
+tail before publication. Active positions retain their exact CoreML bits and
+every remaining cache position is zero. The worker validates the generation,
+layout, completed publication state, and SHA-256 digest before exposing the
+mapped K/V slice to the Metal uploader. The socket carries no logits or K/V data
+in protocol v2.
 
 ## Development
 

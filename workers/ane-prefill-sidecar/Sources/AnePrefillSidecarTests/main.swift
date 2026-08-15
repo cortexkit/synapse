@@ -1,4 +1,5 @@
 import AnePrefillSidecar
+import CoreML
 import CryptoKit
 import Darwin
 import Foundation
@@ -17,6 +18,8 @@ private struct TestHarness {
             try executionRegistryMakesCancellationSidecarOwned()
             try logitsUseLastActiveTokenWithNonContiguousStride()
             try kvUsesStrideAwareActivePositionLayout()
+            try mappedOutputBackingMatchesLegacyLayout()
+            try mappedBackingFailuresUseKVConversionToken()
             try sharedMemoryPublicationIsBitFaithful()
             try sharedMemoryRejectsTornWorkerHeader()
             try await readinessBudgetReturnsBeforeLateLoadCompletes()
@@ -218,6 +221,198 @@ private func kvUsesStrideAwareActivePositionLayout() throws {
     )
 }
 
+private func mappedOutputBackingMatchesLegacyLayout() throws {
+    let layers = 2
+    let kvHeads = 2
+    let window = 4
+    let activeTokens = 2
+    let cacheTokens = 6
+    let headDimension = 3
+    let planeElements = kvHeads * cacheTokens * headDimension
+    let totalElements = layers * 2 * planeElements
+    let byteCount = totalElements * MemoryLayout<UInt16>.size
+
+    try withAlignedMutableBytes(count: byteCount) { destination in
+        memset(destination.baseAddress!, 0, destination.count)
+        let backings = try MappedKVOutputBackings(
+            destination: destination,
+            window: window,
+            layers: layers,
+            kvHeads: kvHeads,
+            cacheTokens: cacheTokens,
+            headDimension: headDimension
+        )
+        var legacyActive: [UInt16] = []
+        for layer in 0..<layers {
+            for (keyValueIndex, outputName) in ["key", "value"].enumerated() {
+                var storage = [UInt16](repeating: 0, count: 80)
+                let name = String(format: "%@_%02d", outputName, layer)
+                guard let mapped = backings.outputBackings[name] as? MLMultiArray else {
+                    throw HarnessFailure(description: "missing mapped test backing \(name)")
+                }
+                let mappedStorage = mapped.dataPointer.bindMemory(
+                    to: UInt16.self,
+                    capacity: planeElements
+                )
+                let mappedStrides = mapped.strides.map(\.intValue)
+                for head in 0..<kvHeads {
+                    for position in 0..<window {
+                        for dimension in 0..<headDimension {
+                            let numericBits =
+                                layer * 1_000 + keyValueIndex * 400 + head * 100
+                                + position * 10 + dimension
+                            let bits = UInt16(numericBits)
+                            let legacyOffset = head * 40 + position * 7 + dimension * 2
+                            storage[legacyOffset] = bits
+                            let mappedOffset =
+                                head * mappedStrides[1] + position * mappedStrides[2]
+                                + dimension * mappedStrides[3]
+                            mappedStorage[mappedOffset] = bits
+                        }
+                    }
+                }
+                let legacyTensor = try StridedTensor(
+                    shape: [1, kvHeads, window, headDimension],
+                    strides: [79, 40, 7, 2],
+                    storage: .float16Bits(storage)
+                )
+                try appendActiveKV(
+                    legacyTensor,
+                    to: &legacyActive,
+                    activeTokens: activeTokens,
+                    window: window,
+                    kvHeads: kvHeads,
+                    headDimension: headDimension
+                )
+            }
+        }
+        let prediction = try MLDictionaryFeatureProvider(dictionary: backings.outputBackings)
+        try backings.validateAndClearInactive(
+            prediction: prediction,
+            activeTokens: activeTokens
+        )
+        var legacyPadded = [UInt16](repeating: 0, count: totalElements)
+        var activeOffset = 0
+        for layer in 0..<layers {
+            for keyValueIndex in 0..<2 {
+                for head in 0..<kvHeads {
+                    for position in 0..<activeTokens {
+                        let cacheRow =
+                            ((layer * 2 + keyValueIndex) * kvHeads + head) * cacheTokens
+                            + position
+                        let destinationOffset = cacheRow * headDimension
+                        for dimension in 0..<headDimension {
+                            legacyPadded[destinationOffset + dimension] = legacyActive[activeOffset]
+                            activeOffset += 1
+                        }
+                    }
+                }
+            }
+        }
+        let mappedBytes = Data(bytes: destination.baseAddress!, count: destination.count)
+        let legacyBytes = legacyPadded.withUnsafeBytes { Data($0) }
+        let mappedDigest = SHA256.hash(data: mappedBytes)
+        let legacyDigest = SHA256.hash(data: legacyBytes)
+        try require(
+            mappedDigest == legacyDigest,
+            "mapped output backing changed the legacy-expanded cache digest"
+        )
+        try require(
+            mappedBytes == legacyBytes,
+            "mapped output backing changed imported cache bytes"
+        )
+    }
+}
+
+private func mappedBackingFailuresUseKVConversionToken() throws {
+    let expectedBytes = 2 * 2 * 2 * 6 * 3 * MemoryLayout<UInt16>.size
+    try withAlignedMutableBytes(count: expectedBytes + 64) { allocation in
+        try expectKVConversionFailure {
+            _ = try MappedKVOutputBackings(
+                destination: UnsafeMutableRawBufferPointer(
+                    start: allocation.baseAddress,
+                    count: expectedBytes - MemoryLayout<UInt16>.size
+                ),
+                window: 4,
+                layers: 2,
+                kvHeads: 2,
+                cacheTokens: 6,
+                headDimension: 3
+            )
+        }
+        try expectKVConversionFailure {
+            _ = try MappedKVOutputBackings(
+                destination: UnsafeMutableRawBufferPointer(
+                    start: allocation.baseAddress!.advanced(by: MemoryLayout<UInt16>.size),
+                    count: expectedBytes
+                ),
+                window: 4,
+                layers: 2,
+                kvHeads: 2,
+                cacheTokens: 6,
+                headDimension: 3
+            )
+        }
+
+        let destination = UnsafeMutableRawBufferPointer(
+            start: allocation.baseAddress,
+            count: expectedBytes
+        )
+        let backings = try MappedKVOutputBackings(
+            destination: destination,
+            window: 4,
+            layers: 2,
+            kvHeads: 2,
+            cacheTokens: 6,
+            headDimension: 3
+        )
+        var replaced = backings.outputBackings
+        replaced["key_00"] = try MLMultiArray(
+            shape: [1, 2, 4, 3],
+            dataType: .float16
+        )
+        let wrongPrediction = try MLDictionaryFeatureProvider(dictionary: replaced)
+        try expectKVConversionFailure {
+            try backings.validateAndClearInactive(
+                prediction: wrongPrediction,
+                activeTokens: 2
+            )
+        }
+        let correctPrediction = try MLDictionaryFeatureProvider(
+            dictionary: backings.outputBackings
+        )
+        try expectKVConversionFailure {
+            try backings.validateAndClearInactive(
+                prediction: correctPrediction,
+                activeTokens: 0
+            )
+        }
+    }
+
+    let source = [UInt16](repeating: 0, count: 1)
+    var destination = [UInt16](repeating: 0, count: 48)
+    try source.withUnsafeBufferPointer { sourceBuffer in
+        try destination.withUnsafeMutableBufferPointer { destinationBuffer in
+            try expectKVConversionFailure {
+                try copyActiveKVToPaddedCache(
+                    source: sourceBuffer,
+                    tensorShape: [1, 2, 4, 3],
+                    strides: [Int.max, Int.max, Int.max, Int.max],
+                    destination: destinationBuffer,
+                    layer: 0,
+                    keyValueIndex: 0,
+                    activeTokens: 2,
+                    window: 4,
+                    layers: 1,
+                    kvHeads: 2,
+                    cacheTokens: 4,
+                    headDimension: 3
+                )
+            }
+        }
+    }
+}
+
 private func sharedMemoryPublicationIsBitFaithful() throws {
     let path = FileManager.default.temporaryDirectory
         .appendingPathComponent("ane-prefill-sidecar-test-\(UUID().uuidString).shm")
@@ -315,6 +510,30 @@ private func expectSidecarError(
     } catch let error as SidecarError {
         try require(error == expected, "expected \(expected), got \(error)")
     }
+}
+
+private func expectKVConversionFailure(operation: () throws -> Void) throws {
+    do {
+        try operation()
+        throw HarnessFailure(description: "expected kv_conversion_failure")
+    } catch let error as SidecarError {
+        try require(
+            error.code == "kv_conversion_failure",
+            "expected kv_conversion_failure, got \(error.code)"
+        )
+    }
+}
+
+private func withAlignedMutableBytes<Result>(
+    count: Int,
+    _ body: (UnsafeMutableRawBufferPointer) throws -> Result
+) throws -> Result {
+    var allocation: UnsafeMutableRawPointer?
+    guard posix_memalign(&allocation, 64, count) == 0, let allocation else {
+        throw HarnessFailure(description: "could not allocate aligned K/V test storage")
+    }
+    defer { free(allocation) }
+    return try body(UnsafeMutableRawBufferPointer(start: allocation, count: count))
 }
 
 private func require(_ condition: Bool, _ message: String) throws {

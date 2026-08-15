@@ -122,39 +122,47 @@ private final class CoreMLStage: @unchecked Sendable {
         do {
             try throwIfCancelled(lease.ticket)
             let provider = try featureProvider(for: lease.request)
-            let predictionStarted = monotonicMilliseconds()
-            let prediction = try await lease.model.model.prediction(from: provider)
-            predictionMilliseconds = monotonicMilliseconds() - predictionStarted
-            try throwIfCancelled(lease.ticket)
-
-            try lease.publication.begin()
             let shape = lease.model.shape
-            let kvStarted = monotonicMilliseconds()
+            let kvPreparationStarted = monotonicMilliseconds()
+            try lease.publication.begin()
             try lease.publication.zeroKV()
-            try lease.publication.withMutableBytes(
+            let kvBackings = try lease.publication.withMutableBytes(
                 offset: lease.request.handoff.kvOffset,
                 count: lease.request.handoff.kvBytes
             ) { destination in
-                for layer in 0..<shape.layers {
-                    for (keyValueIndex, outputName) in ["key", "value"].enumerated() {
-                        let name = String(format: "%@_%02d", outputName, layer)
-                        guard let value = prediction.featureValue(for: name)?.multiArrayValue else {
-                            throw SidecarError.kvConversion(
-                                "CoreML prediction has no K/V output named \(name)")
-                        }
-                        try copyActiveKVToCache(
-                            value,
-                            to: destination,
-                            layer: layer,
-                            keyValueIndex: keyValueIndex,
-                            activeTokens: lease.request.activeTokens,
-                            shape: shape,
-                            cacheTokens: lease.request.handoff.cacheTokens
-                        )
-                    }
-                }
+                try MappedKVOutputBackings(
+                    destination: destination,
+                    window: shape.window,
+                    layers: shape.layers,
+                    kvHeads: shape.kvHeads,
+                    cacheTokens: lease.request.handoff.cacheTokens,
+                    headDimension: shape.headDimension
+                )
             }
-            kvLayoutMilliseconds = monotonicMilliseconds() - kvStarted
+            kvLayoutMilliseconds = monotonicMilliseconds() - kvPreparationStarted
+
+            let options = MLPredictionOptions()
+            options.outputBackings = kvBackings.outputBackings
+            let predictionStarted = monotonicMilliseconds()
+            let prediction: MLFeatureProvider
+            do {
+                prediction = try await lease.model.model.prediction(
+                    from: provider,
+                    options: options
+                )
+            } catch {
+                throw SidecarError.kvConversion(
+                    "CoreML could not write K/V outputs into shared memory: \(error)")
+            }
+            predictionMilliseconds = monotonicMilliseconds() - predictionStarted
+            try throwIfCancelled(lease.ticket)
+
+            let kvValidationStarted = monotonicMilliseconds()
+            try kvBackings.validateAndClearInactive(
+                prediction: prediction,
+                activeTokens: lease.request.activeTokens
+            )
+            kvLayoutMilliseconds += monotonicMilliseconds() - kvValidationStarted
             try throwIfCancelled(lease.ticket)
 
             let logitsStarted = monotonicMilliseconds()
@@ -378,45 +386,6 @@ private func validateSharedMemoryHandoff(
         throw SidecarError.invalid(
             "EXECUTE shared-memory layout does not match the installed model")
     }
-}
-
-private func copyActiveKVToCache(
-    _ array: MLMultiArray,
-    to destination: UnsafeMutableRawBufferPointer,
-    layer: Int,
-    keyValueIndex: Int,
-    activeTokens: Int,
-    shape: ModelShape,
-    cacheTokens: Int
-) throws {
-    let tensorShape = array.shape.map(\.intValue)
-    let strides = array.strides.map(\.intValue)
-    guard array.dataType == .float16,
-        tensorShape == [1, shape.kvHeads, shape.window, shape.headDimension],
-        strides.count == tensorShape.count,
-        strides.allSatisfy({ $0 > 0 })
-    else {
-        throw SidecarError.kvConversion("K/V output must use the installed float16 shape")
-    }
-    let storageCount = requiredStorageCount(shape: tensorShape, strides: strides)
-    let source = UnsafeBufferPointer(
-        start: array.dataPointer.bindMemory(to: UInt16.self, capacity: storageCount),
-        count: storageCount
-    )
-    try copyActiveKVToPaddedCache(
-        source: source,
-        tensorShape: tensorShape,
-        strides: strides,
-        destination: destination.bindMemory(to: UInt16.self),
-        layer: layer,
-        keyValueIndex: keyValueIndex,
-        activeTokens: activeTokens,
-        window: shape.window,
-        layers: shape.layers,
-        kvHeads: shape.kvHeads,
-        cacheTokens: cacheTokens,
-        headDimension: shape.headDimension
-    )
 }
 
 private func copyActiveLogitsToSharedMemory(
