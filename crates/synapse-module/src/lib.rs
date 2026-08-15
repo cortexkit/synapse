@@ -11708,7 +11708,6 @@ fn manifest(module_id: &str) -> ModuleManifest {
             identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
         }],
         consumes: Vec::new(),
-        scheduled_tasks: Vec::new(),
         bindings: Bindings {
             storage: StorageBinding {
                 kind: StorageKind::Sqlite,
