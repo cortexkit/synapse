@@ -164,6 +164,9 @@ enum AnePrefillFault {
     PredictionTimeout,
     KvConversion,
     Ipc,
+    // Retain this fault in the closed fallback vocabulary for compatibility;
+    // direct cache admission no longer has a path that can raise it.
+    #[allow(dead_code)]
     CacheHandoff,
     MetalUpload,
     HandoffBudget,
@@ -337,8 +340,12 @@ struct AnePrefillTimings {
     logits_copy: Duration,
     sidecar_integrity: Duration,
     ipc: Duration,
+    mmap_validation: Duration,
+    mmap_hash: Duration,
     kv_conversion: Duration,
     cache_handoff: Duration,
+    source_metal_upload: Duration,
+    target_metal_upload: Duration,
     metal_upload: Duration,
     logits_publication: Duration,
 }
@@ -351,7 +358,7 @@ impl AnePrefillTimings {
             .saturating_add(self.ipc)
             .saturating_add(self.kv_conversion)
             .saturating_add(self.cache_handoff)
-            .saturating_add(self.metal_upload)
+            .saturating_add(self.mmap_hash.max(self.metal_upload))
             .saturating_add(self.logits_publication)
     }
 }
@@ -609,7 +616,8 @@ impl SharedMemoryHandoff {
         self: &Rc<Self>,
         generation: u64,
         expected_digest: &str,
-    ) -> Result<SharedKvPayload, AnePrefillFailure> {
+    ) -> Result<(SharedKvPayload, Duration), AnePrefillFailure> {
+        let validation_started = Instant::now();
         if !self.header_matches(generation)
             || self.read_u64(ANE_PREFILL_SHM_STATE_OFFSET) != ANE_PREFILL_SHM_READY
         {
@@ -639,18 +647,13 @@ impl SharedMemoryHandoff {
                 "shared-memory control digest does not match EXECUTED",
             ));
         }
-        let mut hasher = ring::digest::Context::new(&ring::digest::SHA256);
-        hasher.update(self.bytes(self.layout.logits_offset, self.layout.logits_bytes));
-        hasher.update(self.bytes(self.layout.kv_offset, self.layout.kv_bytes));
-        if hasher.finish().as_ref() != expected_digest.as_slice() {
-            return Err(AnePrefillFailure::new(
-                AnePrefillFault::Ipc,
-                "shared-memory payload digest mismatch",
-            ));
-        }
-        Ok(SharedKvPayload {
-            memory: Rc::clone(self),
-        })
+        Ok((
+            SharedKvPayload {
+                memory: Rc::clone(self),
+                expected_digest,
+            },
+            validation_started.elapsed(),
+        ))
     }
 
     fn header_matches(&self, generation: u64) -> bool {
@@ -712,17 +715,37 @@ impl Drop for SharedMemoryHandoff {
 
 struct SharedKvPayload {
     memory: Rc<SharedMemoryHandoff>,
+    expected_digest: Vec<u8>,
 }
 
 impl SharedKvPayload {
+    fn digest_parts(&self) -> (&[u8], &[u8], &[u8]) {
+        (
+            self.memory.bytes(
+                self.memory.layout.logits_offset,
+                self.memory.layout.logits_bytes,
+            ),
+            self.memory
+                .bytes(self.memory.layout.kv_offset, self.memory.layout.kv_bytes),
+            &self.expected_digest,
+        )
+    }
+
+    #[cfg(test)]
+    fn verify_digest(&self) -> Result<Duration, AnePrefillFailure> {
+        let (logits, kv, expected) = self.digest_parts();
+        verify_shared_memory_payload(logits, kv, expected)
+    }
+
     fn bits(&self) -> &[u16] {
         debug_assert_eq!(
             self.memory.layout.kv_offset % std::mem::align_of::<u16>(),
             0
         );
         debug_assert_eq!(self.memory.layout.kv_bytes % std::mem::size_of::<u16>(), 0);
-        // SAFETY: The sidecar has published READY and passed the payload digest before
-        // this view is created. Rc retains the mapping until Metal finishes import.
+        // SAFETY: The sidecar has published READY and the control header matches this
+        // mapping. Rc retains the immutable publication until import and digest
+        // verification both finish.
         unsafe {
             slice::from_raw_parts(
                 self.memory
@@ -734,6 +757,24 @@ impl SharedKvPayload {
             )
         }
     }
+}
+
+fn verify_shared_memory_payload(
+    logits: &[u8],
+    kv: &[u8],
+    expected_digest: &[u8],
+) -> Result<Duration, AnePrefillFailure> {
+    let started = Instant::now();
+    let mut hasher = ring::digest::Context::new(&ring::digest::SHA256);
+    hasher.update(logits);
+    hasher.update(kv);
+    if hasher.finish().as_ref() != expected_digest {
+        return Err(AnePrefillFailure::new(
+            AnePrefillFault::Ipc,
+            "shared-memory payload digest mismatch",
+        ));
+    }
+    Ok(started.elapsed())
 }
 
 struct AnePrefillRuntime {
@@ -799,7 +840,7 @@ impl AnePrefillRuntime {
     fn record_success(&mut self, timings: AnePrefillTimings) {
         if std::env::var_os("CK_ANE_PREFILL_LOG_TIMINGS").is_some() {
             eprintln!(
-                "ANE prefill timing: readiness_ms={:.3} worker_execute_ms={:.3} sidecar_prediction_ms={:.3} sidecar_kv_layout_ms={:.3} sidecar_logits_copy_ms={:.3} sidecar_integrity_ms={:.3} sidecar_total_ms={:.3} payload_ipc_ms={:.3} kv_expand_ms={:.3} cache_handoff_ms={:.3} metal_upload_ms={:.3} logits_publication_ms={:.3} contract_handoff_sum_ms={:.3}",
+                "ANE prefill timing: readiness_ms={:.3} worker_execute_ms={:.3} sidecar_prediction_ms={:.3} sidecar_kv_layout_ms={:.3} sidecar_logits_copy_ms={:.3} sidecar_integrity_ms={:.3} sidecar_total_ms={:.3} payload_ipc_ms={:.3} mmap_validate_ms={:.3} mmap_hash_ms={:.3} cache_import_ms={:.3} source_metal_upload_ms={:.3} cache_handoff_ms={:.3} target_metal_upload_ms={:.3} metal_upload_ms={:.3} logits_publication_ms={:.3} contract_handoff_sum_ms={:.3}",
                 duration_milliseconds(timings.readiness),
                 duration_milliseconds(timings.prediction),
                 duration_milliseconds(timings.sidecar_prediction),
@@ -808,8 +849,12 @@ impl AnePrefillRuntime {
                 duration_milliseconds(timings.sidecar_integrity),
                 duration_milliseconds(timings.sidecar_total),
                 duration_milliseconds(timings.ipc),
+                duration_milliseconds(timings.mmap_validation),
+                duration_milliseconds(timings.mmap_hash),
                 duration_milliseconds(timings.kv_conversion),
+                duration_milliseconds(timings.source_metal_upload),
                 duration_milliseconds(timings.cache_handoff),
+                duration_milliseconds(timings.target_metal_upload),
                 duration_milliseconds(timings.metal_upload),
                 duration_milliseconds(timings.logits_publication),
                 duration_milliseconds(timings.handoff_total()),
@@ -1144,7 +1189,7 @@ impl AnePrefillClient {
         let prediction = prediction_started.elapsed();
         let ipc_started = Instant::now();
         self.set_io_timeout(config.handoff_budget, AnePrefillFault::Ipc)?;
-        let kv = self
+        let (kv, mmap_validation) = self
             .shared_memory
             .validate_publication(generation, &digest)?;
         let logits = decode_f32_frame(self.shared_memory.bytes(
@@ -1177,6 +1222,7 @@ impl AnePrefillClient {
             logits_copy: milliseconds_field(&timing, "logits_copy_ms", AnePrefillFault::Ipc)?,
             sidecar_integrity: milliseconds_field(&timing, "integrity_ms", AnePrefillFault::Ipc)?,
             ipc: ipc_started.elapsed(),
+            mmap_validation,
             ..AnePrefillTimings::default()
         };
         if timings.prediction > config.prediction_budget {
@@ -1643,69 +1689,49 @@ impl DecodeEngine {
         }
         let cache_bits = payload.kv.bits();
         payload.timings.kv_conversion = conversion_started.elapsed();
-        let cache = match self {
-            Self::Qwen {
-                decoder,
-                f16_prefill,
-                layer_count,
-            } => {
-                let cache = if let Some(prefill) = f16_prefill {
-                    // The q8 step engine imports K/V from its f16 prefill engine.
-                    // Materializing the sidecar payload in that source cache keeps
-                    // the existing engine-to-engine conversion on the certified path.
-                    let source_upload_started = Instant::now();
-                    prefill.import_caches(cache_bits).map_err(|error| {
-                        AnePrefillFailure::new(
-                            AnePrefillFault::MetalUpload,
-                            format!("upload ANE K/V into the f16 source cache: {error}"),
-                        )
-                    })?;
-                    payload.timings.metal_upload = source_upload_started.elapsed();
-                    let cache_handoff_started = Instant::now();
-                    let source_bits =
-                        collect_qwen_cache_bits(prefill, *layer_count).map_err(|error| {
+        let (logits_bytes, kv_bytes, expected_digest) = payload.kv.digest_parts();
+        let (digest_result, cache_result, upload) = thread::scope(|scope| {
+            let digest = scope.spawn(move || {
+                verify_shared_memory_payload(logits_bytes, kv_bytes, expected_digest)
+            });
+            let upload_started = Instant::now();
+            let cache = match self {
+                Self::Qwen { decoder, .. } => {
+                    // Both decode configurations keep K/V in f16. Importing the
+                    // sidecar bytes into the target engine is bit-equivalent to the
+                    // old f16-engine upload/readback/q8-engine upload round trip.
+                    decoder
+                        .import_caches(cache_bits)
+                        .map(|()| {
+                            DecodeCache::Qwen(MetalStepKvCache {
+                                position: payload.active_tokens,
+                            })
+                        })
+                        .map_err(|error| {
                             AnePrefillFailure::new(
-                                AnePrefillFault::CacheHandoff,
-                                format!("read f16 cache for q8 handoff: {error}"),
+                                AnePrefillFault::MetalUpload,
+                                format!("upload ANE K/V into the decode cache: {error}"),
                             )
-                        })?;
-                    payload.timings.cache_handoff = cache_handoff_started.elapsed();
-                    let target_upload_started = Instant::now();
-                    decoder.import_caches(&source_bits).map_err(|error| {
-                        AnePrefillFailure::new(
-                            AnePrefillFault::MetalUpload,
-                            format!("upload q8 decode cache: {error}"),
-                        )
-                    })?;
-                    payload.timings.metal_upload = payload
-                        .timings
-                        .metal_upload
-                        .saturating_add(target_upload_started.elapsed());
-                    MetalStepKvCache {
-                        position: payload.active_tokens,
-                    }
-                } else {
-                    let upload_started = Instant::now();
-                    decoder.import_caches(cache_bits).map_err(|error| {
-                        AnePrefillFailure::new(
-                            AnePrefillFault::MetalUpload,
-                            format!("upload ANE K/V into the f16 decode cache: {error}"),
-                        )
-                    })?;
-                    payload.timings.metal_upload = upload_started.elapsed();
-                    MetalStepKvCache {
-                        position: payload.active_tokens,
-                    }
-                };
-                DecodeCache::Qwen(cache)
-            }
-            Self::Lfm2 { .. } => {
-                return Err(AnePrefillFailure::new(
+                        })
+                }
+                Self::Lfm2 { .. } => Err(AnePrefillFailure::new(
                     AnePrefillFault::Dispatch,
                     "ANE prefill is supported only for the Qwen3 decode engine",
-                ));
-            }
-        };
+                )),
+            };
+            let upload = upload_started.elapsed();
+            let digest = digest.join().unwrap_or_else(|_| {
+                Err(AnePrefillFailure::new(
+                    AnePrefillFault::Ipc,
+                    "shared-memory payload digest worker panicked",
+                ))
+            });
+            (digest, cache, upload)
+        });
+        payload.timings.mmap_hash = digest_result?;
+        payload.timings.target_metal_upload = upload;
+        payload.timings.metal_upload = upload;
+        let cache = cache_result?;
         Ok((cache, payload.logits, payload.timings))
     }
 
@@ -2474,7 +2500,7 @@ impl WorkerState {
         let frame = self.run_quantum(authorization.first_quantum_budget)?;
         if timing_enabled {
             eprintln!(
-                "Decode generate timing: engine={prefill_engine} prompt_tokens={prompt_tokens} max_tokens={max_tokens} prepare_ms={:.3} prefill_ms={:.3} first_quantum_ms={:.3} worker_total_ms={:.3}",
+                "Decode generate timing: engine={prefill_engine} prompt_tokens={prompt_tokens} max_tokens={max_tokens} prepare_ms={:.3} prefill_ms={:.3} first_step_ms={:.3} worker_total_ms={:.3}",
                 duration_milliseconds(prepare),
                 duration_milliseconds(prefill),
                 duration_milliseconds(elapsed_if_enabled(quantum_started.as_ref())),
@@ -4190,15 +4216,74 @@ mod tests {
         let logits = [0_u8; 8];
         let digest = publish_shared_fixture(&shared, 7, &logits, &legacy);
 
-        let publication = shared
+        let (publication, _) = shared
             .validate_publication(7, &digest)
             .expect("complete shared publication validates");
+        publication
+            .verify_digest()
+            .expect("complete shared publication digest validates");
         assert_eq!(publication.bits(), legacy);
         assert_eq!(
             publication.bits(),
             [0, 1, 2, 3, 0, 0, 0, 0, 4, 5, 6, 7, 0, 0, 0, 0],
             "only active positions may populate either K/V cache plane"
         );
+    }
+
+    #[test]
+    fn q8_direct_ane_cache_import_matches_f16_handoff_bit_for_bit() {
+        let Some(checkpoint) =
+            std::env::var_os("SYNAPSE_OWNED_DECODE_QWEN3_0_6B").map(PathBuf::from)
+        else {
+            eprintln!("skipping q8 direct cache import: set SYNAPSE_OWNED_DECODE_QWEN3_0_6B");
+            return;
+        };
+        let model_path = checkpoint.join("model.safetensors");
+        let f16_model = Box::leak(Box::new(
+            Qwen3DecodeModel::load_with_quant(
+                &model_path,
+                Precision::F16,
+                WeightQuantization::None,
+            )
+            .expect("load f16 checkpoint"),
+        ));
+        let q8_model = Box::leak(Box::new(
+            Qwen3DecodeModel::load_with_quant(
+                &model_path,
+                Precision::F16,
+                WeightQuantization::Q8_0,
+            )
+            .expect("load q8 checkpoint"),
+        ));
+        let bucket = 512;
+        let elements = f16_model.layers.len()
+            * 2
+            * f16_model.config.num_key_value_heads
+            * bucket
+            * f16_model.config.head_dim;
+        let cache_bits = (0..elements)
+            .map(|index| (index as u16).wrapping_mul(37).wrapping_add(11))
+            .collect::<Vec<_>>();
+        let f16_source =
+            MetalStepDecoder::new(f16_model, Precision::F16, bucket, WeightQuantization::None)
+                .expect("create f16 source engine");
+        let q8_target =
+            MetalStepDecoder::new(q8_model, Precision::F16, bucket, WeightQuantization::Q8_0)
+                .expect("create q8 target engine");
+
+        f16_source
+            .import_caches(&cache_bits)
+            .expect("import cache through the legacy f16 source engine");
+        let legacy = collect_qwen_cache_bits(&f16_source, f16_model.layers.len())
+            .expect("read legacy f16 handoff bytes");
+        q8_target
+            .import_caches(&cache_bits)
+            .expect("import cache directly into the q8 target engine");
+        let direct = collect_qwen_cache_bits(&q8_target, q8_model.layers.len())
+            .expect("read direct q8 cache bytes");
+
+        assert_eq!(legacy, cache_bits);
+        assert_eq!(direct, legacy);
     }
 
     #[test]
@@ -4222,9 +4307,12 @@ mod tests {
         let mut samples = Vec::with_capacity(20);
         for _ in 0..20 {
             let started = Instant::now();
-            let publication = shared
+            let (publication, _) = shared
                 .validate_publication(10, &digest)
                 .expect("shared-memory publication validates");
+            publication
+                .verify_digest()
+                .expect("shared-memory publication digest validates");
             std::hint::black_box(publication.bits());
             samples.push(duration_milliseconds(started.elapsed()));
         }
@@ -4264,7 +4352,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_memory_digest_mismatch_maps_to_ipc_handoff_failure() {
+    fn shared_memory_payload_digest_mismatch_maps_to_ipc_handoff_failure() {
         let config = test_ane_config();
         let shared = Rc::new(
             SharedMemoryHandoff::create(&config, u64::MAX - 8)
@@ -4274,10 +4362,35 @@ mod tests {
         let cache = [0_u16; 16];
         let digest = publish_shared_fixture(&shared, 9, &logits, &cache);
         shared.write_bytes(shared.layout.kv_offset, &[1]);
+        let (publication, _) = shared
+            .validate_publication(9, &digest)
+            .expect("control metadata still matches");
 
-        let failure = match shared.validate_publication(9, &digest) {
+        let failure = publication
+            .verify_digest()
+            .expect_err("a payload digest mismatch must fail closed");
+        assert_eq!(failure.fault, AnePrefillFault::Ipc);
+        assert_eq!(
+            failure.fault.fallback_reason().as_str(),
+            "ipc_handoff_failure"
+        );
+    }
+
+    #[test]
+    fn shared_memory_control_digest_mismatch_maps_to_ipc_handoff_failure() {
+        let config = test_ane_config();
+        let shared = Rc::new(
+            SharedMemoryHandoff::create(&config, u64::MAX - 6)
+                .expect("create shared-memory fixture"),
+        );
+        let logits = [0_u8; 8];
+        let cache = [0_u16; 16];
+        let digest = publish_shared_fixture(&shared, 11, &logits, &cache);
+        shared.write_bytes(ANE_PREFILL_SHM_DIGEST_OFFSET, &[1]);
+
+        let failure = match shared.validate_publication(11, &digest) {
             Err(failure) => failure,
-            Ok(_) => panic!("a digest mismatch must fail closed"),
+            Ok(_) => panic!("a control digest mismatch must fail closed"),
         };
         assert_eq!(failure.fault, AnePrefillFault::Ipc);
         assert_eq!(
@@ -4297,12 +4410,14 @@ mod tests {
             logits_copy: Duration::from_millis(3),
             sidecar_integrity: Duration::from_millis(19),
             ipc: Duration::from_millis(5),
+            mmap_hash: Duration::from_millis(19),
             kv_conversion: Duration::from_millis(7),
             cache_handoff: Duration::from_millis(11),
             metal_upload: Duration::from_millis(13),
             logits_publication: Duration::from_millis(17),
+            ..AnePrefillTimings::default()
         };
-        assert_eq!(timings.handoff_total(), Duration::from_millis(77));
+        assert_eq!(timings.handoff_total(), Duration::from_millis(83));
         assert_ne!(timings.handoff_total(), timings.readiness);
         assert_ne!(timings.handoff_total(), timings.prediction);
     }
