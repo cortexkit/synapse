@@ -529,6 +529,16 @@ class Driver:
         chain_k = int(request.get("chain_k", 1))
         key = (bucket, arm["decode_config"], engine, chain_k)
         if key not in self.clients:
+            # Worker trees are heavy (q8 split process trees reach ~14 GiB of
+            # static footprint), so letting one client per (bucket, config,
+            # engine, chain_k) accumulate nearly halted the machine during a
+            # full battery. Keep only clients for the CURRENT (bucket, config)
+            # arm alive: certify.py finishes one arm before starting the next,
+            # and both engines of an arm are needed together for paired TTFT,
+            # so evicting other arms' clients never discards a warm state the
+            # protocol will reuse.
+            for stale_key in [k for k in self.clients if (k[0], k[1]) != (bucket, arm["decode_config"])]:
+                self.clients.pop(stale_key).close()
             compiled = self.package(bucket) if engine == "ane-split" else None
             self.clients[key] = WorkerClient(
                 self.worker,
