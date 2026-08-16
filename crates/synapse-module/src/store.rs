@@ -6785,6 +6785,77 @@ mod tests {
                 .unwrap()
                 == 0
         );
+        // Per-table survival sweep. The targeted assertions above check row
+        // CONTENT for the interesting tables; this sweep checks that every
+        // table the populate arms wrote still carries rows at all, named per
+        // table so a quietly hollowed populate arm (a writer refactored into
+        // a no-op, an arm emptied in a merge) fails by name instead of
+        // leaving the fence green while it certifies against empty tables.
+        // The unknown-table panic is the same self-maintaining shape as the
+        // populate helper's version panic: a future migration that adds a
+        // table must declare its expected population here or the sweep is a
+        // red test, not a silently narrower fence.
+        let tables = migrated
+            .store
+            .with_conn(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' \
+                     AND name NOT LIKE 'sqlite_%' ORDER BY name",
+                )?;
+                let names = stmt
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(names)
+            })
+            .unwrap();
+        for table in &tables {
+            let expected_min: i64 = match table.as_str() {
+                "module_meta" => 1,
+                "jobs" => 1,
+                "result_pages" => 1,
+                "remote_checkpoints" => 1,
+                "remote_url_bindings" => 1,
+                "alias_rows" => 2,
+                "models" => 4,
+                "cert_rows" => 1,
+                "perf_rows" => 1,
+                "knob_assignments" => 1,
+                "owned_decode_cert_rows" => 1,
+                "approvals" => 4,
+                "approval_migration_markers" => 1,
+                "profile_state" => 1,
+                "profile_rotation_events" => 1,
+                "profile_rotation_certification_outcomes" => 4,
+                "cert_row_rebuild_events" => 1,
+                // The store framework's own bookkeeping (fence + namespace
+                // version rows), written by migrate() itself - populated by
+                // construction, not by an arm.
+                "cortexkit_fence" => 1,
+                "cortexkit_schema_version" => 1,
+                // Deliberately empty: its only legitimate writer requires a
+                // corrupted digest first; asserted exactly-zero above.
+                "approval_digest_corruption_events" => 0,
+                other => panic!(
+                    "table {other} has no declared population expectation; \
+                     populate it in the step-through fence (or declare why it \
+                     stays empty) before extending the schema"
+                ),
+            };
+            let count = migrated
+                .store
+                .with_conn(|conn| {
+                    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                })
+                .unwrap();
+            assert!(
+                count >= expected_min,
+                "{table} carries {count} rows (expected at least {expected_min}); \
+                 no migration was tested against data in it - the populate arm \
+                 that fills it has stopped writing"
+            );
+        }
         drop(migrated);
 
         let reopened = SynapseStore::open(&descriptor).unwrap();
