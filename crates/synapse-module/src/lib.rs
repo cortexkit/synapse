@@ -82,8 +82,9 @@ use subc_client_rs::{
 };
 use subc_protocol::{
     manifest::{
-        Bindings, IdentityBinding, IdentityScope, ManagementOperation, ManagementOperationKind,
-        ModuleManifest, ProviderRole, StorageBinding, StorageKind, StorageScope, TrustTier,
+        Bindings, Concurrency, IdentityBinding, IdentityScope, ManagementOperation,
+        ManagementOperationKind, ModuleManifest, ProviderRole, StorageBinding, StorageKind,
+        StorageScope, TrustTier,
     },
     ModuleHelloAckBody, Principal, PROTOCOL_VERSION, SUBC_MODULE_ID_ENV,
 };
@@ -11706,6 +11707,14 @@ fn manifest(module_id: &str) -> ModuleManifest {
             config_schema: json!({ "type": "object" }),
             observability: Vec::new(),
             identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
+            // A deliberate claim, not the enum default: synapse accepts
+            // concurrent calls (machine-wide admission exists precisely to
+            // absorb many clients at once) and owns all execution ordering
+            // internally via the admission semaphore and the fair-share
+            // scheduler. Serial would break concurrent embed traffic;
+            // StatelessParallel would discard per-channel FIFO, which job
+            // paging relies on.
+            concurrency: Concurrency::ModuleManaged,
         }],
         consumes: Vec::new(),
         bindings: Bindings {
