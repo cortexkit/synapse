@@ -6722,6 +6722,23 @@ mod tests {
             for index in 0..MIGRATIONS.len() {
                 legacy.migrate(NAMESPACE, &MIGRATIONS[..=index]).unwrap();
                 legacy = populate_version(MIGRATIONS[index].version, legacy);
+                // Mid-history check for the one table two arms share: models
+                // is written at v4 (one row) and again at v9 (all four), so
+                // the final sweep alone would stay green if the v4 arm went
+                // quiet - v9's rows mask it, and migrations 5-8 would land on
+                // an empty catalog untested. The claim's granularity must
+                // match the writer's: assert at the version boundary where
+                // masking begins.
+                if MIGRATIONS[index].version == 4 {
+                    let store = SynapseStore { store: legacy };
+                    assert_eq!(
+                        store.catalog_models().unwrap().len(),
+                        1,
+                        "the v4 populate arm stopped writing models; migrations \
+                         5-8 would land on an empty catalog"
+                    );
+                    legacy = store.store;
+                }
             }
         }
 
