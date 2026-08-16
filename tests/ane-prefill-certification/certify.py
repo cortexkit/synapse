@@ -694,6 +694,27 @@ class Certifier:
     def ttft(self, arm: Arm) -> dict[str, Any]:
         self.warmup(arm, "gpu")
         self.warmup(arm, "ane-split")
+        # The contract requires WARM-PACKAGE p50s. A fixed warmup count does not
+        # guarantee that: the semantic-exercise phase restarts the sidecar
+        # repeatedly, evicting its CoreML program from the ANE, and measured
+        # recovery takes ~10 requests - so a fixed 3-warmup protocol put the
+        # early samples on the recovery slope and biased the split median
+        # upward. Warm each engine until its last three probes agree within
+        # 15% (cap 12), so the sampled population is the steady state the
+        # contract names. Probes are discarded but emitted with the evidence.
+        warmup_probes: dict[str, list[float]] = {"gpu": [], "ane-split": []}
+        for engine in ("gpu", "ane-split"):
+            probes = warmup_probes[engine]
+            for attempt in range(12):
+                response = self.call("measure_ttft", arm=arm.wire(), engine=engine, sample=-(attempt + 1), request_cold=True, artifact_warm=True)
+                require(response.get("status") == "ok", f"{arm.id} {engine} steady-state warmup probe {attempt} failed")
+                worker_ms = response.get("worker_ttft_ms")
+                require(isinstance(worker_ms, (int, float)) and worker_ms > 0, f"{arm.id} {engine} warmup probe has invalid TTFT")
+                probes.append(float(worker_ms))
+                if len(probes) >= 3:
+                    recent = probes[-3:]
+                    if max(recent) - min(recent) <= 0.15 * min(recent):
+                        break
         samples: dict[str, list[dict[str, float]]] = {"gpu": [], "ane-split": []}
         for sample in range(TTFT_SAMPLE_COUNT):
             for engine in ("ane-split", "gpu"):
@@ -721,6 +742,8 @@ class Certifier:
                 {
                     "ttft_samples": {
                         "arm": arm.id,
+                        "warmup_probes_gpu_ms": warmup_probes["gpu"],
+                        "warmup_probes_split_ms": warmup_probes["ane-split"],
                         "gpu_worker_ms": [s["worker_ttft_ms"] for s in samples["gpu"]],
                         "split_worker_ms": [s["worker_ttft_ms"] for s in samples["ane-split"]],
                         "gpu_p50": gpu_p50,
