@@ -27,6 +27,12 @@ from typing import Any
 
 MAX_FRAME = 64 * 1024 * 1024
 SOURCE_MODEL = "model.safetensors"
+# Timed phases on the shared M1 CI machine require a quiet window: the
+# GitHub Actions runner worker process (Runner.Worker) must be absent, and
+# the 1-minute load average must be below this limit. Correctness checks
+# may run under CI load; only TTFT and fallback timing wait.
+QUIET_LOADAVG_LIMIT = 4.0
+QUIET_POLL_SECONDS = 15
 JSON_OBJECT_GRAMMAR = json.dumps(
     {
         "type": "object",
@@ -52,6 +58,59 @@ def sha256_path(path: Path) -> str:
             while chunk := stream.read(1024 * 1024):
                 hasher.update(chunk)
     return hasher.hexdigest()
+
+
+def command_output(command: list[str]) -> str:
+    return subprocess.run(command, check=False, text=True, capture_output=True).stdout.strip()
+
+
+def one_minute_loadavg() -> float:
+    return float(command_output(["sysctl", "-n", "vm.loadavg"]).strip("{} ").split()[0])
+
+
+def runner_worker_active() -> bool:
+    return bool(command_output(["pgrep", "-f", "Runner.Worker"]))
+
+
+def wait_for_quiet_window(label: str, *, require_low_load: bool) -> None:
+    """Block until this box is quiet enough for a timed certification phase.
+
+    `require_low_load` is true only before the first TTFT sample of a run.
+    Later fallback timing checks only for an active CI worker: the decode
+    worker and sidecar from earlier arms already raise loadavg, and waiting
+    on that bound after we started them would deadlock the battery.
+    """
+    while True:
+        load = one_minute_loadavg()
+        ci_active = runner_worker_active()
+        load_ok = (not require_low_load) or load < QUIET_LOADAVG_LIMIT
+        if not ci_active and load_ok:
+            print(
+                json.dumps(
+                    {
+                        "quiet_window": label,
+                        "loadavg_1": load,
+                        "runner_worker": False,
+                        "require_low_load": require_low_load,
+                    },
+                    sort_keys=True,
+                ),
+                file=sys.stderr,
+            )
+            return
+        print(
+            json.dumps(
+                {
+                    "waiting_for_quiet": label,
+                    "loadavg_1": load,
+                    "runner_worker": ci_active,
+                    "require_low_load": require_low_load,
+                },
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+        )
+        time.sleep(QUIET_POLL_SECONDS)
 
 
 def machine_profile() -> str:
@@ -265,6 +324,7 @@ class WorkerClient:
             )
         if response.get("type") != "CERTIFICATION_ANE_PREFILL_FALLBACK_TIMING":
             raise RuntimeError(f"unexpected certification fallback timing response: {response!r}")
+        print(json.dumps({"fallback_timing": response}, sort_keys=True), file=sys.stderr)
         return response
 
     def constraint(self, grammar: str) -> dict[str, Any]:
@@ -326,6 +386,7 @@ class Driver:
         self.profile = machine_profile()
         self.source_digest = sha256_path(self.checkpoint / SOURCE_MODEL)
         self.clients: dict[tuple[int, str, str, int], WorkerClient] = {}
+        self._timed_phase_quiet = False
 
     def handle(self, request: dict[str, Any]) -> dict[str, Any]:
         operation = request.get("operation")
@@ -572,6 +633,9 @@ class Driver:
         return response
 
     def timing(self, operation: str, request: dict[str, Any]) -> dict[str, Any]:
+        if not self._timed_phase_quiet:
+            wait_for_quiet_window("ttft", require_low_load=True)
+            self._timed_phase_quiet = True
         prompt = [101 + index % 30000 for index in range(min(128, int(request["arm"]["bucket"])))]
         client_request = {**request, "max_tokens": 1, "prompt_token_ids": prompt}
         _, elapsed, _ = self.client(client_request).generate(prompt, 1)
@@ -580,6 +644,8 @@ class Driver:
         return {"status": "ok", "worker_ttft_ms": elapsed, "wire_ttft_ms": elapsed}
 
     def worst_case_fallback(self, request: dict[str, Any]) -> dict[str, Any]:
+        if runner_worker_active():
+            wait_for_quiet_window("fallback", require_low_load=False)
         arm = request["arm"]
         prompt = [101 + index % 30000 for index in range(int(arm["bucket"]))]
         raw = self.client({"arm": arm, "engine": "ane-split"}).fallback_timing(
