@@ -6433,6 +6433,329 @@ mod tests {
     }
 
     #[test]
+    fn last_migration_succeeds_for_a_populated_store() {
+        // Each version is applied to the same on-disk store before its writer paths
+        // populate the rows that version can represent. Historical jobs/certs cannot
+        // be written by today's newer APIs until their coupled schema exists, so the
+        // v1-v5 job and v1-v8 cert arms remain empty; the v6 job writer and v9 cert
+        // writer populate them at the first compatible coupling. The approval writer
+        // also creates the marker and rotation writer creates parent/child ledger rows.
+        // Migration 6 creates both SQL triggers (remote_checkpoint_immutable and
+        // remote_url_binding_identity_immutable) unconditionally, so they need no
+        // separate armed-state row. Module generation/table epoch, the approval
+        // marker, and profile state are conditionally meaningful guard state; their
+        // real writers run in v1/v3/v9. The corruption-event table is intentionally
+        // empty: its only writer requires
+        // first corrupting a stored digest, which is reserved for mutation validation.
+        // Mutation proof (performed during development, not shipped): append this final
+        // data-moving migration: `CREATE TABLE moved_alias_rows_mutant (
+        // fingerprint_a TEXT NOT NULL, fingerprint_b TEXT NOT NULL,
+        // migrated_at_ms INTEGER NOT NULL); INSERT INTO moved_alias_rows_mutant
+        // (fingerprint_a, fingerprint_b) SELECT fingerprint_a, fingerprint_b
+        // FROM alias_rows;` It compiled and ran, then reddened this populated test on
+        // the source rows while existing empty-store tests stayed green. A unique-index
+        // mutant was not used because it cannot distinguish a fixture failure from a
+        // migration failure as clearly.
+        let model_ids = [
+            "qwen3-0.6b-decode-f16",
+            "lfm2-1.2b-decode-f16",
+            "qwen3-0.6b-decode-q8_0",
+            "lfm2-1.2b-decode-q8_0",
+        ];
+        let profile_before = MachineProfile {
+            os_build: "23G93".to_string(),
+            arch: "aarch64".to_string(),
+            chip_model: "Apple M5 Max".to_string(),
+            ram_class: "le_64_gib".to_string(),
+            ane_subtype: Some("h17(map)".to_string()),
+            engine_identities: Vec::new(),
+        };
+        let mut profile_after = profile_before.clone();
+        profile_after.os_build = "23G94".to_string();
+        let decode_fingerprint = "8bcb6dfc1bd55a38a56b5a6931132f428687e064104d106c2cc5efb898f80feb";
+        let (root, descriptor) = temp_descriptor("migration-populated-step-through");
+        {
+            let mut legacy = open_sqlite(&descriptor).unwrap();
+            let populate_version = |version: u32, store: SqliteStore| -> SqliteStore {
+                match version {
+                    1 => {
+                        let store = SynapseStore { store };
+                        store.next_module_generation().unwrap();
+                        store.store
+                    }
+                    2 => store,
+                    3 => {
+                        let store = SynapseStore { store };
+                        let alias_a = Fingerprint("alias-a".to_string());
+                        store
+                            .declare_alias_pair(
+                                &alias_a,
+                                &Fingerprint("alias-b1".to_string()),
+                                &serde_json::json!({"source": "fixture"}),
+                                1_001,
+                            )
+                            .unwrap();
+                        store
+                            .declare_alias_pair(
+                                &alias_a,
+                                &Fingerprint("alias-b2".to_string()),
+                                &serde_json::json!({"source": "fixture"}),
+                                1_002,
+                            )
+                            .unwrap();
+                        store.store
+                    }
+                    4 => {
+                        let store = SynapseStore { store };
+                        store
+                            .upsert_model(&owned_seed_model_config(model_ids[0]), 1_003)
+                            .unwrap();
+                        store.store
+                    }
+                    5 => {
+                        let store = SynapseStore { store };
+                        store
+                            .store_perf_row(&PerfRow {
+                                machine_profile_hash: "machine-profile-hash".to_string(),
+                                model_id: model_ids[0].to_string(),
+                                workload: "embed.batch".to_string(),
+                                numeric_profile_id: NumericProfileId("numeric-qwen3".to_string()),
+                                fingerprint: Fingerprint("perf-fingerprint".to_string()),
+                                engine: "owned-metal-decode".to_string(),
+                                measured_at_ms: 1_004,
+                                os_build: "23G93".to_string(),
+                                module_generation: 1,
+                                throughput_tok_s: 42.5,
+                                cold_load_ms: 125.0,
+                                single_item_latency_p50_ms: 18.0,
+                                details: serde_json::json!({"batch_size": 1}),
+                            })
+                            .unwrap();
+                        store
+                            .replace_knob_assignments(
+                                "machine-profile-hash",
+                                &[KnobAssignmentRow {
+                                    machine_profile_hash: "machine-profile-hash".to_string(),
+                                    workload: "embed.batch".to_string(),
+                                    knob: PerfKnob::Balanced,
+                                    model_id: model_ids[0].to_string(),
+                                    numeric_profile_id: NumericProfileId(
+                                        "numeric-qwen3".to_string(),
+                                    ),
+                                    fingerprint: Fingerprint("perf-fingerprint".to_string()),
+                                    engine: "owned-metal-decode".to_string(),
+                                    measured_at_ms: 1_004,
+                                    os_build: "23G93".to_string(),
+                                    module_generation: 1,
+                                    throughput_tok_s: 42.5,
+                                    single_item_latency_p50_ms: 18.0,
+                                }],
+                            )
+                            .unwrap();
+                        store.store
+                    }
+                    6 => {
+                        let store = SynapseStore { store };
+                        store
+                            .bind_remote_profile_url(
+                                "remote-profile-hash",
+                                "https://remote.example.test/v1",
+                            )
+                            .unwrap();
+                        let job_id = store
+                            .admit_job(
+                                "step-key",
+                                "legacy:step-job",
+                                "embed.batch",
+                                1,
+                                Some("cache-lease:remote-profile"),
+                                &serde_json::json!({"items": ["item-1"]}),
+                                1_005,
+                                60_000,
+                                86_400_000,
+                            )
+                            .unwrap()
+                            .record()
+                            .job_id
+                            .clone();
+                        assert!(job_id.starts_with("job_"));
+                        assert!(store.mark_job_running(&job_id, 1, 1_006).unwrap());
+                        store
+                            .commit_job_page(
+                                &job_id,
+                                0,
+                                br#"{"items":[{"id":"item-1","value":1}]}"#,
+                                &[CheckpointItem {
+                                    item_id: "item-1".to_string(),
+                                    result: br#"{"id":"item-1","value":1}"#.to_vec(),
+                                    provider_request_id: Some("provider-request-1".to_string()),
+                                }],
+                                1_007,
+                            )
+                            .unwrap();
+                        store.store
+                    }
+                    7 | 8 => store,
+                    9 => {
+                        let store = SynapseStore { store };
+                        let profile_hash = profile_before.revisioned_hash();
+                        store
+                            .store_cert_row(&CertificationRow {
+                                assurance_class: AssuranceClass::Measured,
+                                status: CertificationStatus::Uncertified,
+                                key: CertificationKey::Measured {
+                                    machine_profile_hash: profile_hash.clone(),
+                                },
+                                numeric_profile_id: NumericProfileId("numeric-qwen3".to_string()),
+                                fingerprint: Fingerprint("new-cert-fingerprint".to_string()),
+                                certified_at_ms: 1_008,
+                                os_build: profile_before.os_build.clone(),
+                                module_generation: 1,
+                                evidence: serde_json::json!({"source": "fixture"}),
+                            })
+                            .unwrap();
+                        for model_id in model_ids {
+                            store
+                                .upsert_model(&owned_seed_model_config(model_id), 1_009)
+                                .unwrap();
+                        }
+                        let migrated = store
+                            .migrate_owned_decode_approvals(
+                                "owned-decode-approval-migration-v1",
+                                APPROVAL_SCHEMA_REVISION,
+                            )
+                            .unwrap();
+                        assert_eq!(migrated.outcome, "applied");
+                        assert_eq!(migrated.rows, 4);
+                        store.observe_profile(&profile_before, 1_010, 1).unwrap();
+                        store.observe_profile(&profile_after, 1_011, 1).unwrap();
+
+                        let row = OwnedDecodeCertificationRow {
+                            status: CertificationStatus::Certified,
+                            revisioned_machine_profile_hash: profile_before.revisioned_hash(),
+                            profile_activation_epoch: 1,
+                            model_id: model_ids[0].to_string(),
+                            decode_fingerprint: decode_fingerprint.to_string(),
+                            processing_fingerprint: "processing-fingerprint".to_string(),
+                            runtime_config_digest: "runtime-config-digest".to_string(),
+                            constraint_runtime_identities: Vec::new(),
+                            worker_path_evidence: serde_json::json!({}),
+                            evidence_schema_revision: CERT_EVIDENCE_SCHEMA_REVISION.to_string(),
+                            g_dec_manifest_revision: G_DEC_MANIFEST_REVISION.to_string(),
+                            numeric_profile_id: Some(NumericProfileId("numeric-qwen3".to_string())),
+                            fingerprint: Fingerprint(decode_fingerprint.to_string()),
+                            certified_at_ms: 1_012,
+                            os_build: profile_before.os_build.clone(),
+                            module_generation: 1,
+                            evidence: serde_json::json!({"source": "fixture"}),
+                        };
+                        let mut terminal = OwnedDecodeMatchInputs {
+                            revisioned_machine_profile_hash: profile_before.revisioned_hash(),
+                            profile_activation_epoch: 1,
+                            model_id: model_ids[0].to_string(),
+                            decode_fingerprint: decode_fingerprint.to_string(),
+                            processing_fingerprint: "processing-fingerprint".to_string(),
+                            runtime_config_digest: "runtime-config-digest".to_string(),
+                            constraint_runtime_identities: Vec::new(),
+                            worker_path_evidence: serde_json::json!({}),
+                            evidence_schema_revision: CERT_EVIDENCE_SCHEMA_REVISION.to_string(),
+                            g_dec_manifest_revision: G_DEC_MANIFEST_REVISION.to_string(),
+                        };
+                        terminal.model_id = model_ids[1].to_string();
+                        let snapshot = OwnedDecodeMatchInputs {
+                            model_id: model_ids[0].to_string(),
+                            ..terminal.clone()
+                        };
+                        assert_eq!(
+                            store
+                                .store_owned_decode_cert_row_if_current(
+                                    &snapshot, &terminal, &row, 1_013,
+                                )
+                                .unwrap(),
+                            ProbeWriteOutcome::ProbeStale
+                        );
+                        store.store
+                    }
+                    10 => store,
+                    _ => panic!("no fixture rows for migration {version}"),
+                }
+            };
+
+            for index in 0..MIGRATIONS.len() {
+                legacy.migrate(NAMESPACE, &MIGRATIONS[..=index]).unwrap();
+                legacy = populate_version(MIGRATIONS[index].version, legacy);
+            }
+        }
+
+        let migrated = SynapseStore::open(&descriptor).unwrap();
+        assert_eq!(migrated.catalog_models().unwrap().len(), 4);
+        assert_eq!(migrated.alias_table().unwrap().rows.len(), 2);
+        assert_eq!(migrated.approvals().unwrap().len(), 4);
+        assert_eq!(migrated.rotation_events().unwrap().len(), 1);
+        assert_eq!(
+            migrated
+                .current_perf_rows("machine-profile-hash")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            migrated
+                .knob_assignments("machine-profile-hash")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(migrated.checkpoint_count("legacy:step-job").unwrap(), 1);
+        let resumed_job_id = migrated
+            .store
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT job_id FROM jobs WHERE request_key = 'step-key'
+                     ORDER BY created_ms DESC, rowid DESC LIMIT 1",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            migrated
+                .get_job_page(&resumed_job_id, 0)
+                .unwrap()
+                .as_deref(),
+            Some(br#"{"items":[{"id":"item-1","value":1}]}"#.as_slice())
+        );
+        let rotation_events = migrated.rotation_events().unwrap();
+        assert_eq!(rotation_events.len(), 1);
+        assert_eq!(
+            migrated
+                .rotation_outcomes(&rotation_events[0].event_id)
+                .unwrap()
+                .len(),
+            4
+        );
+        assert!(
+            migrated
+                .store
+                .with_conn(|conn| {
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM approval_digest_corruption_events",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                })
+                .unwrap()
+                == 0
+        );
+        drop(migrated);
+
+        let reopened = SynapseStore::open(&descriptor).unwrap();
+        assert_eq!(reopened.catalog_models().unwrap().len(), 4);
+        assert_eq!(reopened.alias_table().unwrap().rows.len(), 2);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn migration_from_v5_preserves_jobs_pages_and_quarantines_legacy_measurements() {
         let (root, descriptor) = temp_descriptor("migration-v5");
         {
