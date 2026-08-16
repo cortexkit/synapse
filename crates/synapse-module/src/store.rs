@@ -6433,6 +6433,44 @@ mod tests {
     }
 
     #[test]
+    fn schema_trigger_set_is_exactly_the_known_guards() {
+        // The migration fence above can only exercise guards that exist when it
+        // runs. Rows announce themselves (fixtures start failing without them);
+        // an armed guard announces nothing until something violates it, and a
+        // REMOVED guard announces nothing at all - queries just stop being
+        // refused. So the trigger set is pinned by name in both directions.
+        // If this test fails because you ADDED a trigger: arm it in the
+        // populated-store fence (write rows that exercise it mid-history),
+        // then add its name here. If it fails because one is MISSING: a
+        // guard the fence certifies against was dropped - that is a schema
+        // change, not a test to appease.
+        let (root, descriptor) = temp_descriptor("schema-trigger-set");
+        let store = SynapseStore::open(&descriptor).unwrap();
+        let mut triggers = store
+            .store
+            .with_conn(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT name FROM sqlite_master WHERE type = 'trigger' ORDER BY name",
+                )?;
+                let names = stmt
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(names)
+            })
+            .unwrap();
+        triggers.sort();
+        assert_eq!(
+            triggers,
+            vec![
+                "remote_checkpoint_immutable".to_string(),
+                "remote_url_binding_identity_immutable".to_string(),
+            ],
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn last_migration_succeeds_for_a_populated_store() {
         // Each version is applied to the same on-disk store before its writer paths
         // populate the rows that version can represent. Historical jobs/certs cannot
