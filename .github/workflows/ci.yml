@@ -34,12 +34,14 @@ jobs:
             runner: blacksmith-4vcpu-ubuntu-2404
           - name: windows
             runner: blacksmith-4vcpu-windows-2025
-          - name: macos-metal
-            # Temporary self-hosted M1 Max runner (GitHub-hosted macos-14 is
-            # blocked on org billing; permanent home will be the rented rig).
-            # The box doubles as the Lane 2 bench machine: CI jobs are
-            # correctness-only there, timed benches take the mkdir bench lock.
-            runner: [self-hosted, macos-metal]
+          # macos-metal lane OFFLINE: its self-hosted M1 Max runner was
+          # decommissioned (machine shipped away 2026-08-20) and the runner
+          # registration deleted. Metal/ANE coverage is currently local-only
+          # (developer machines run the full battery). Restore by registering
+          # a new Apple Silicon runner with the `macos-metal` label and
+          # re-adding this matrix entry:
+          # - name: macos-metal
+          #   runner: [self-hosted, macos-metal]
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
     steps:
