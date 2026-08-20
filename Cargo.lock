@@ -6516,7 +6516,7 @@ dependencies = [
 
 [[package]]
 name = "subc-client-rs"
-version = "0.3.0"
+version = "0.5.1"
 dependencies = [
  "async-trait",
  "serde",
@@ -6530,7 +6530,7 @@ dependencies = [
 
 [[package]]
 name = "subc-control"
-version = "0.1.1"
+version = "0.5.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -6539,7 +6539,7 @@ dependencies = [
 
 [[package]]
 name = "subc-core"
-version = "0.3.1"
+version = "0.7.0"
 dependencies = [
  "cortexkit-paths",
  "fs4",
@@ -6563,7 +6563,7 @@ version = "0.0.0"
 
 [[package]]
 name = "subc-protocol"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -6571,7 +6571,7 @@ dependencies = [
 
 [[package]]
 name = "subc-transport"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "getrandom 0.2.17",
  "hmac",
