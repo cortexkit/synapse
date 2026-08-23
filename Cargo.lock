@@ -1483,7 +1483,7 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-store-types"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "serde",
 ]
@@ -6516,7 +6516,7 @@ dependencies = [
 
 [[package]]
 name = "subc-client-rs"
-version = "0.5.1"
+version = "0.7.1"
 dependencies = [
  "async-trait",
  "serde",
