@@ -33,6 +33,7 @@ mod lfm2_decode_model;
 mod quant;
 mod qwen3_decode_metal_step;
 mod qwen3_decode_model;
+mod session;
 
 pub use decode_kernel::{top_logits, DecodeKernel, DecodeRuntime, TopLogit};
 pub use json_constraint::{DecodeConstraint, JsonConstraint, TokenMask, TokenVocabulary};
@@ -46,6 +47,18 @@ pub use qwen3_decode_metal_step::{
     MetalStepDecoder, MetalStepKvCache, MetalStepKvCache as Qwen3StepCache,
 };
 pub use qwen3_decode_model::Model as Qwen3DecodeModel;
+pub use session::{
+    required_kv_evaluation_matrix, select_kv_configuration, Active, ActiveKvSession, Closed,
+    ClosedKvSession, DecodeOutput, DepthController, DepthControllerMeasurement, DepthDecision,
+    DepthDecisionTelemetry, DepthObservation, DepthRequest, DraftProposal, DraftSource,
+    DraftSourceKind, FinishReason, FixedDepthController, KvAllocator, KvAllocatorAccounting,
+    KvBlockLease, KvBlockSize, KvConfiguration, KvMatrixCoordinate, KvMatrixMeasurement,
+    KvSessionId, NativeMtpDepthController, NativeMtpExecutor, NativeMtpHead, NativeMtpHeadPin,
+    NativeMtpRound, NoopTokenTap, OwnedDecodeError, OwnedDecodeResult, OwnedDecodeSession,
+    PrefillTelemetry, ProposalExecution, Retained, RetainedKvSession,
+    SelectedKvConfigurationTelemetry, SpeculativeDecodeOutput, SpeculativeDecodeTelemetry,
+    TokenTap, TokenTapEvent, KV_BLOCK_SIZES, KV_REUSE_BUCKETS,
+};
 
 /// Decode lane identity for the owned-metal-decode engine.
 pub const DECODE_LANE: &str = "owned-metal-decode";
