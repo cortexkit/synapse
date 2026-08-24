@@ -381,6 +381,125 @@ struct ApprovalEmergencyRollbackParams {
     reason: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnedDecodeSessionAdmissionParams {
+    catalog_fingerprint: String,
+    caller_id: String,
+    context_ceiling_tokens: u32,
+    generation: synapse_core::GenerationConfiguration,
+    kv_configuration: owned_decode_routing::admission::SessionKvConfiguration,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnedDecodeSessionDecodeParams {
+    session_id: String,
+    req_id: String,
+    prompt: String,
+    max_tokens: u32,
+    #[serde(default)]
+    grammar: Option<String>,
+    #[serde(default)]
+    deadline_ms: Option<u64>,
+    #[serde(default)]
+    max_queue_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnedDecodeSessionSnapshotParams {
+    session_id: String,
+    position_tokens: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnedDecodeSessionContinueParams {
+    session_id: String,
+    retained_kv_session_id: String,
+    /// Present when an aborted stream left a retained token prefix; `req_id`
+    /// lets the supervisor continue from that prefix without replaying or
+    /// skipping committed tokens.
+    #[serde(default)]
+    req_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnedDecodeSessionAbortParams {
+    session_id: String,
+    req_id: String,
+    retain_kv: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnedDecodeSessionCloseParams {
+    session_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnedDecodeSessionStatusParams {
+    session_id: String,
+    req_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnedDecodeServingControlParams {
+    catalog_fingerprint: String,
+    reason: String,
+}
+
+#[derive(Clone, Debug)]
+struct OwnedDecodeWireSession {
+    catalog_fingerprint: String,
+    model_id: String,
+    routing_session_id: owned_decode_routing::admission::SessionId,
+    kv_configuration: owned_decode_routing::admission::SessionKvConfiguration,
+    active_request: Option<String>,
+    retained_kv_session_id: Option<String>,
+    retained_position: Option<u32>,
+    closed: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PendingSessionAbort {
+    retain_kv: bool,
+}
+
+struct OwnedDecodeWireState {
+    sessions: BTreeMap<String, OwnedDecodeWireSession>,
+    residency: Option<owned_decode_routing::admission::ResidencyRouter>,
+    streams: owned_decode_worker::StreamingSupervisor,
+    scheduler: owned_decode_grammar_scheduler::scheduler::DecodeScheduler,
+    pending_aborts: BTreeMap<(String, String), PendingSessionAbort>,
+    next_session_sequence: u64,
+}
+
+impl Default for OwnedDecodeWireState {
+    fn default() -> Self {
+        Self {
+            sessions: BTreeMap::new(),
+            residency: None,
+            streams: owned_decode_worker::StreamingSupervisor::default(),
+            scheduler:
+                owned_decode_grammar_scheduler::scheduler::DecodeScheduler::shipped_embed_load_v1(),
+            pending_aborts: BTreeMap::new(),
+            next_session_sequence: 0,
+        }
+    }
+}
+
+struct ServingAdmissionMaterial {
+    machine: owned_decode_routing::admission::MachineTuple,
+    envelope: owned_decode_routing::admission::PlatformEnvelope,
+    artifact: owned_decode_routing::admission::ArtifactReservation,
+    model_id: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 struct WireOperationError {
     code: String,
@@ -746,6 +865,9 @@ struct RuntimeState {
     owned_decode_q8: Arc<Mutex<owned_decode_routing::q8ingest::Q8IngestRegistry>>,
     owned_decode_dispatches:
         Arc<Mutex<BTreeMap<String, Arc<Mutex<worker_host::SupervisedDecodeDispatch>>>>>,
+    /// Tracks module-owned decode sessions so serving admission, interrupted-stream
+    /// recovery, and scheduler updates use the same durable session state.
+    owned_decode_sessions: Arc<Mutex<OwnedDecodeWireState>>,
 }
 
 struct ModelSlot {
@@ -989,6 +1111,11 @@ struct MicroLlmOneshotParams {
     required_epoch: Option<u64>,
     #[serde(default, rename = "accept_declared")]
     _accept_declared: bool,
+    /// Set only by the session API; once a persistent session reserves
+    /// owned-decode KV state, force the same worker identity instead of switching
+    /// to a separate llama runtime.
+    #[serde(skip)]
+    owned_only: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -997,6 +1124,15 @@ struct MicroLlmOneshotPayload {
     finish_reason: String,
     n_prompt: usize,
     n_gen: usize,
+    /// Raw committed IDs let the session surface preserve the worker's exact
+    /// progress history instead of retokenizing rendered text.
+    generated_token_ids: Vec<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runtime_config_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    derived_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    generation_id: Option<String>,
     real_token_counts: Vec<u32>,
     truncation_disclosures: Vec<TruncationDisclosure>,
 }
@@ -1542,6 +1678,7 @@ impl RuntimeState {
                 owned_decode_routing::q8ingest::Q8IngestRegistry::new(),
             )),
             owned_decode_dispatches: Arc::new(Mutex::new(BTreeMap::new())),
+            owned_decode_sessions: Arc::new(Mutex::new(OwnedDecodeWireState::default())),
         })
     }
 
@@ -2495,6 +2632,25 @@ async fn dispatch_request(
         "job.resume" => job_resume(state, request.params).await,
         "rerank.score" => rerank_score(state, request.params).await,
         "microllm.oneshot" => microllm_oneshot(state, request.params).await,
+        "owned_decode.admit_session" | "admit_session" => {
+            owned_decode_admit_session(state, request.params).await
+        }
+        "owned_decode.decode" | "decode" => {
+            owned_decode_session_decode(state, request.params).await
+        }
+        "owned_decode.snapshot" | "snapshot" => {
+            owned_decode_session_snapshot(state, request.params).await
+        }
+        "owned_decode.continue" | "continue" => {
+            owned_decode_session_continue(state, request.params).await
+        }
+        "owned_decode.abort" | "abort" => owned_decode_session_abort(state, request.params).await,
+        "owned_decode.close" | "close" => owned_decode_session_close(state, request.params).await,
+        "owned_decode.session_status" | "session_status" => {
+            owned_decode_session_status(state, request.params).await
+        }
+        "owned_decode.disable" | "disable" => owned_decode_disable(state, request.params).await,
+        "owned_decode.revoke" | "revoke" => owned_decode_revoke(state, request.params).await,
         "model.load" => model_load(state, request.params).await,
         "model.unload" => model_unload(state, request.params).await,
         "cache.pin" => cache_pin(state, request.params).await,
@@ -2524,6 +2680,1440 @@ async fn dispatch_request(
             format!("unknown method '{other}' for synapse management surface"),
         ),
     }
+}
+
+fn owned_decode_failure(
+    state: &ModuleState,
+    code: impl Into<String>,
+    message: impl Into<String>,
+) -> HandlerOutcome {
+    result_outcome(json!({
+        "module_generation": state.module_generation,
+        "error": {
+            "code": code.into(),
+            "class": "permanent",
+            "safe_to_retry_same_request": false,
+            "message": message.into(),
+        }
+    }))
+}
+
+fn map_serving_refusal(refusal: store::ServingRefusal) -> synapse_core::OwnedDecodeRefusal {
+    match refusal {
+        store::ServingRefusal::ArtifactUnapproved => {
+            synapse_core::OwnedDecodeRefusal::ArtifactUnapproved
+        }
+        store::ServingRefusal::ArtifactDisabled => {
+            synapse_core::OwnedDecodeRefusal::ArtifactDisabled
+        }
+        store::ServingRefusal::ArtifactRevoked => synapse_core::OwnedDecodeRefusal::ArtifactRevoked,
+        store::ServingRefusal::CertificationMismatch => {
+            synapse_core::OwnedDecodeRefusal::ArtifactMismatch
+        }
+        store::ServingRefusal::RetainedStateInvalidated => {
+            synapse_core::OwnedDecodeRefusal::RetainedKvUnavailable
+        }
+    }
+}
+
+fn map_admission_refusal(
+    refusal: &owned_decode_routing::admission::AdmissionRefusal,
+) -> synapse_core::OwnedDecodeRefusal {
+    use owned_decode_routing::admission::AdmissionRefusal;
+
+    match refusal {
+        AdmissionRefusal::UnsupportedPlatformTuple => {
+            synapse_core::OwnedDecodeRefusal::UnsupportedMachine
+        }
+        AdmissionRefusal::InvalidContextCeiling { .. } => {
+            synapse_core::OwnedDecodeRefusal::InvalidContextCeiling
+        }
+        AdmissionRefusal::InsufficientReservedLaneMemory { .. } => {
+            synapse_core::OwnedDecodeRefusal::InsufficientMemory
+        }
+        AdmissionRefusal::IncompatibleArtifact
+        | AdmissionRefusal::ArtifactSwapActiveSessions { .. } => {
+            synapse_core::OwnedDecodeRefusal::IncompatibleResidentArtifact
+        }
+        AdmissionRefusal::UnsupportedGenerationConfig => {
+            synapse_core::OwnedDecodeRefusal::SamplingUnsupported
+        }
+        AdmissionRefusal::InvalidKvConfiguration => {
+            synapse_core::OwnedDecodeRefusal::InvalidKvConfiguration
+        }
+        AdmissionRefusal::InvalidKvAlignment { .. } => {
+            synapse_core::OwnedDecodeRefusal::InvalidKvAlignment
+        }
+        AdmissionRefusal::UnknownSession { .. } => {
+            synapse_core::OwnedDecodeRefusal::RetainedKvUnavailable
+        }
+    }
+}
+
+fn current_unified_memory_bytes() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("sysctl")
+            .args(["-n", "hw.memsize"])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .and_then(|value| value.trim().parse().ok())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+fn serving_admission_material(
+    state: &ModuleState,
+    catalog_fingerprint: &str,
+) -> Result<ServingAdmissionMaterial, (synapse_core::OwnedDecodeRefusal, String)> {
+    use owned_decode_certification::CertificationGateResult;
+    use owned_decode_routing::admission::{ArtifactReservation, MachineTuple, PlatformEnvelope};
+    use store::ServingApprovalState;
+
+    let approval = state
+        .store
+        .serving_approval(catalog_fingerprint)
+        .map_err(|error| {
+            (
+                synapse_core::OwnedDecodeRefusal::ArtifactMismatch,
+                format!("serving approval is unreadable: {error}"),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                synapse_core::OwnedDecodeRefusal::ArtifactUnapproved,
+                "no serving approval exists for the catalog fingerprint".to_string(),
+            )
+        })?;
+    match approval.state {
+        ServingApprovalState::Enabled => {}
+        ServingApprovalState::Disabled => {
+            return Err((
+                synapse_core::OwnedDecodeRefusal::ArtifactDisabled,
+                "the catalog fingerprint is disabled".to_string(),
+            ))
+        }
+        ServingApprovalState::Revoked => {
+            return Err((
+                synapse_core::OwnedDecodeRefusal::ArtifactRevoked,
+                "the catalog fingerprint is revoked".to_string(),
+            ))
+        }
+    }
+    let certification = state
+        .store
+        .serving_certification(&approval.certification_record_id)
+        .map_err(|error| {
+            (
+                synapse_core::OwnedDecodeRefusal::ArtifactMismatch,
+                format!("serving certification is unreadable: {error}"),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                synapse_core::OwnedDecodeRefusal::ArtifactMismatch,
+                "the serving approval references no certification record".to_string(),
+            )
+        })?;
+    let record = certification.record;
+    if record.unit.catalog_fingerprint != catalog_fingerprint {
+        return Err((
+            synapse_core::OwnedDecodeRefusal::ArtifactMismatch,
+            "the serving certification does not match the requested catalog fingerprint"
+                .to_string(),
+        ));
+    }
+    if record.machine_evidence.machine.machine_profile_hash != state.revisioned_machine_profile_hash
+        || record.machine_evidence.machine.macos_build != state.machine_profile.os_build
+    {
+        return Err((
+            synapse_core::OwnedDecodeRefusal::UnsupportedMachine,
+            "the serving certification was recorded for a different machine tuple".to_string(),
+        ));
+    }
+    let unified_memory_bytes = current_unified_memory_bytes().ok_or_else(|| {
+        (
+            synapse_core::OwnedDecodeRefusal::UnsupportedMachine,
+            "the module cannot read the machine unified-memory capacity".to_string(),
+        )
+    })?;
+    let platform = record
+        .gate_results
+        .iter()
+        .find_map(|result| match result {
+            CertificationGateResult::PlatformEnvelope(result) => Some(result),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            (
+                synapse_core::OwnedDecodeRefusal::ArtifactMismatch,
+                "the serving certification has no platform-envelope result".to_string(),
+            )
+        })?;
+    let artifact = ArtifactReservation::new(
+        record.unit.catalog_fingerprint.clone(),
+        platform.artifact_weight_bytes,
+        platform.kv_bytes_per_token,
+    )
+    .map_err(|error| {
+        (
+            synapse_core::OwnedDecodeRefusal::ArtifactMismatch,
+            format!("certified artifact reservation is invalid: {error}"),
+        )
+    })?;
+    let envelope = PlatformEnvelope::new(
+        platform.machine_profile_hash.clone(),
+        platform.macos_build.clone(),
+        platform.unified_memory_bytes,
+        platform.reserved_embed_rerank_bytes,
+        artifact.clone(),
+    )
+    .map_err(|error| {
+        (
+            synapse_core::OwnedDecodeRefusal::ArtifactMismatch,
+            format!("certified platform envelope is invalid: {error}"),
+        )
+    })?;
+    Ok(ServingAdmissionMaterial {
+        machine: MachineTuple::new(
+            state.revisioned_machine_profile_hash.clone(),
+            state.machine_profile.os_build.clone(),
+            unified_memory_bytes,
+        ),
+        envelope,
+        artifact,
+        model_id: record.artifact_lineage.model_id,
+    })
+}
+
+fn session_request_key(session_id: &str, req_id: &str) -> String {
+    format!("{session_id}:{req_id}")
+}
+
+async fn owned_decode_admit_session(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
+    let params: OwnedDecodeSessionAdmissionParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(error) => {
+            return channel_error(
+                "invalid_request",
+                format!("invalid owned_decode.admit_session params: {error}"),
+            )
+        }
+    };
+    if let Err(refusal) = synapse_core::validate_greedy_generation(&params.generation) {
+        return owned_decode_failure(
+            &state,
+            refusal.as_str(),
+            "wave-1 sessions require greedy_top1",
+        );
+    }
+    let material = match serving_admission_material(&state, &params.catalog_fingerprint) {
+        Ok(material) => material,
+        Err((refusal, message)) => return owned_decode_failure(&state, refusal.as_str(), message),
+    };
+    let mut sessions = match state.runtime.owned_decode_sessions.lock() {
+        Ok(sessions) => sessions,
+        Err(_) => {
+            return owned_decode_failure(
+                &state,
+                "owned_decode_unavailable",
+                "the decode-session coordinator is unavailable",
+            )
+        }
+    };
+    if sessions
+        .residency
+        .as_ref()
+        .is_none_or(|router| router.active_session_count() == 0)
+    {
+        sessions.residency = Some(owned_decode_routing::admission::ResidencyRouter::new(
+            material.machine.clone(),
+            material.envelope.clone(),
+        ));
+    }
+    let routing_request = owned_decode_routing::admission::AdmissionRequest::new(
+        params.caller_id,
+        material.artifact.clone(),
+        params.context_ceiling_tokens,
+        owned_decode_routing::admission::GenerationConfiguration::greedy_top1(),
+        params.kv_configuration,
+    );
+    let routing_admission = match sessions
+        .residency
+        .as_mut()
+        .expect("decode residency is initialized")
+        .admit_session(routing_request)
+    {
+        Ok(admission) => admission,
+        Err(refusal) => {
+            let wire = map_admission_refusal(&refusal);
+            return owned_decode_failure(&state, wire.as_str(), refusal.to_string());
+        }
+    };
+    let session_id = format!(
+        "owned-decode-{}-{}-{}",
+        state.module_generation,
+        now_ms(),
+        sessions.next_session_sequence
+    );
+    sessions.next_session_sequence = sessions.next_session_sequence.saturating_add(1);
+    let durable_admission =
+        state
+            .store
+            .admit_serving_session(&session_id, &params.catalog_fingerprint, now_ms());
+    let approval_generation = match durable_admission {
+        Ok(store::ServingSessionAdmission::Admitted {
+            approval_generation,
+            ..
+        }) => approval_generation,
+        Ok(store::ServingSessionAdmission::Refused { reason }) => {
+            let _ = sessions
+                .residency
+                .as_mut()
+                .expect("decode residency is initialized")
+                .close_session(routing_admission.session_id);
+            let refusal = map_serving_refusal(reason);
+            return owned_decode_failure(
+                &state,
+                refusal.as_str(),
+                "serving approval refused admission",
+            );
+        }
+        Err(error) => {
+            let _ = sessions
+                .residency
+                .as_mut()
+                .expect("decode residency is initialized")
+                .close_session(routing_admission.session_id);
+            return owned_decode_failure(
+                &state,
+                "store_failure",
+                format!("could not persist session admission: {error}"),
+            );
+        }
+    };
+    sessions.sessions.insert(
+        session_id.clone(),
+        OwnedDecodeWireSession {
+            catalog_fingerprint: params.catalog_fingerprint,
+            model_id: material.model_id,
+            routing_session_id: routing_admission.session_id,
+            kv_configuration: params.kv_configuration,
+            active_request: None,
+            retained_kv_session_id: None,
+            retained_position: None,
+            closed: false,
+        },
+    );
+    let receipt = routing_admission.receipt;
+    result_outcome(json!({
+        "session_id": session_id,
+        "catalog_fingerprint": receipt.catalog_fingerprint,
+        "approval_generation": approval_generation,
+        "reservation": {
+            "reserved_embed_rerank_bytes": receipt.reserved_embed_rerank_bytes,
+            "reserved_artifact_weight_bytes": receipt.reserved_artifact_weight_bytes,
+            "reserved_session_kv_bytes": receipt.reserved_session_kv_bytes,
+            "context_ceiling_tokens": receipt.context_ceiling_tokens,
+        },
+    }))
+}
+
+async fn owned_decode_session_snapshot(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
+    let params: OwnedDecodeSessionSnapshotParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(error) => {
+            return channel_error(
+                "invalid_request",
+                format!("invalid owned_decode.snapshot params: {error}"),
+            )
+        }
+    };
+    let mut sessions = match state.runtime.owned_decode_sessions.lock() {
+        Ok(sessions) => sessions,
+        Err(_) => {
+            return owned_decode_failure(
+                &state,
+                "owned_decode_unavailable",
+                "decode sessions are unavailable",
+            )
+        }
+    };
+    let Some(session) = sessions.sessions.get(&params.session_id).cloned() else {
+        return owned_decode_failure(
+            &state,
+            "unknown_session",
+            "the decode session does not exist",
+        );
+    };
+    if session.closed || session.active_request.is_some() {
+        return owned_decode_failure(
+            &state,
+            synapse_core::OwnedDecodeRefusal::SessionStillInFlight.as_str(),
+            "a session can snapshot only at an idle committed boundary",
+        );
+    }
+    let boundary = synapse_core::KvReuseBoundary {
+        position: params.position_tokens,
+        block_size: session.kv_configuration.block_size_tokens,
+        recurrent_state_grain: session.kv_configuration.recurrent_state_grain_tokens,
+    };
+    if let Err(refusal) = synapse_core::validate_kv_reuse_boundary(boundary) {
+        return owned_decode_failure(
+            &state,
+            refusal.as_str(),
+            "snapshot position is not a valid KV boundary",
+        );
+    }
+    let route = match sessions
+        .residency
+        .as_ref()
+        .expect("admitted decode session has residency")
+        .route_continuation(session.routing_session_id, params.position_tokens)
+    {
+        Ok(route) => route,
+        Err(refusal) => {
+            let wire = map_admission_refusal(&refusal);
+            return owned_decode_failure(&state, wire.as_str(), refusal.to_string());
+        }
+    };
+    let retained_kv_session_id = format!(
+        "{}:retained:{}:{}",
+        params.session_id, params.position_tokens, sessions.next_session_sequence
+    );
+    sessions.next_session_sequence = sessions.next_session_sequence.saturating_add(1);
+    match state.store.retain_serving_state(
+        &retained_kv_session_id,
+        &session.catalog_fingerprint,
+        now_ms(),
+    ) {
+        Ok(store::ServingContinuationAdmission::Admitted { .. }) => {}
+        Ok(store::ServingContinuationAdmission::Refused { reason }) => {
+            let refusal = map_serving_refusal(reason);
+            return owned_decode_failure(
+                &state,
+                refusal.as_str(),
+                "serving control refused KV retention",
+            );
+        }
+        Err(error) => {
+            return owned_decode_failure(
+                &state,
+                "store_failure",
+                format!("could not persist retained KV state: {error}"),
+            )
+        }
+    }
+    let session = sessions
+        .sessions
+        .get_mut(&params.session_id)
+        .expect("session remains registered while snapshotting");
+    session.retained_kv_session_id = Some(retained_kv_session_id.clone());
+    session.retained_position = Some(params.position_tokens);
+    result_outcome(json!({
+        "session_id": params.session_id,
+        "retained_kv_session_id": retained_kv_session_id,
+        "retained_position": route.retained_prefix_tokens,
+        "reused_blocks": route.reused_blocks,
+    }))
+}
+
+async fn owned_decode_session_continue(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
+    let params: OwnedDecodeSessionContinueParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(error) => {
+            return channel_error(
+                "invalid_request",
+                format!("invalid owned_decode.continue params: {error}"),
+            )
+        }
+    };
+    match state
+        .store
+        .admit_serving_continuation(&params.retained_kv_session_id)
+    {
+        Ok(store::ServingContinuationAdmission::Admitted { .. }) => {}
+        Ok(store::ServingContinuationAdmission::Refused { reason }) => {
+            let refusal = map_serving_refusal(reason);
+            return owned_decode_failure(
+                &state,
+                refusal.as_str(),
+                "serving control refused continuation",
+            );
+        }
+        Err(error) => {
+            return owned_decode_failure(
+                &state,
+                "store_failure",
+                format!("could not read retained KV state: {error}"),
+            )
+        }
+    }
+    let sessions = match state.runtime.owned_decode_sessions.lock() {
+        Ok(sessions) => sessions,
+        Err(_) => {
+            return owned_decode_failure(
+                &state,
+                "owned_decode_unavailable",
+                "decode sessions are unavailable",
+            )
+        }
+    };
+    let Some(session) = sessions.sessions.get(&params.session_id) else {
+        return owned_decode_failure(
+            &state,
+            "unknown_session",
+            "the decode session does not exist",
+        );
+    };
+    if session.closed || session.active_request.is_some() {
+        return owned_decode_failure(
+            &state,
+            synapse_core::OwnedDecodeRefusal::SessionStillInFlight.as_str(),
+            "a continuation requires an idle retained session",
+        );
+    }
+    if session.retained_kv_session_id.as_deref() != Some(&params.retained_kv_session_id) {
+        return owned_decode_failure(
+            &state,
+            synapse_core::OwnedDecodeRefusal::RetainedKvUnavailable.as_str(),
+            "the retained KV state belongs to a different session",
+        );
+    }
+    let position = session
+        .retained_position
+        .expect("retained session has a position");
+    if let Some(req_id) = params.req_id.as_deref() {
+        let prefix = match sessions.streams.continuation_prefix(
+            &params.session_id,
+            req_id,
+            &params.retained_kv_session_id,
+            synapse_core::ArtifactServingState::Approved,
+        ) {
+            Ok(prefix) => prefix,
+            Err(error) => {
+                return owned_decode_failure(
+                    &state,
+                    synapse_core::OwnedDecodeRefusal::RetainedKvUnavailable.as_str(),
+                    error.to_string(),
+                )
+            }
+        };
+        if prefix.retained_position != position {
+            return owned_decode_failure(
+                &state,
+                synapse_core::OwnedDecodeRefusal::RetainedKvUnavailable.as_str(),
+                "the retained stream prefix does not match the session snapshot",
+            );
+        }
+    }
+    let route = match sessions
+        .residency
+        .as_ref()
+        .expect("admitted decode session has residency")
+        .route_continuation(session.routing_session_id, position)
+    {
+        Ok(route) => route,
+        Err(refusal) => {
+            let wire = map_admission_refusal(&refusal);
+            return owned_decode_failure(&state, wire.as_str(), refusal.to_string());
+        }
+    };
+    result_outcome(json!({
+        "session_id": params.session_id,
+        "retained_kv_session_id": params.retained_kv_session_id,
+        "retained_position": route.retained_prefix_tokens,
+        "reused_blocks": route.reused_blocks,
+    }))
+}
+
+async fn owned_decode_session_abort(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
+    let params: OwnedDecodeSessionAbortParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(error) => {
+            return channel_error(
+                "invalid_request",
+                format!("invalid owned_decode.abort params: {error}"),
+            )
+        }
+    };
+    let mut sessions = match state.runtime.owned_decode_sessions.lock() {
+        Ok(sessions) => sessions,
+        Err(_) => {
+            return owned_decode_failure(
+                &state,
+                "owned_decode_unavailable",
+                "decode sessions are unavailable",
+            )
+        }
+    };
+    let Some(session) = sessions.sessions.get(&params.session_id) else {
+        return owned_decode_failure(
+            &state,
+            "unknown_session",
+            "the decode session does not exist",
+        );
+    };
+    if session.active_request.as_deref() != Some(&params.req_id) {
+        return owned_decode_failure(
+            &state,
+            synapse_core::OwnedDecodeRefusal::SessionStillInFlight.as_str(),
+            "the request is not an active decode in this session",
+        );
+    }
+    let op_id = session_request_key(&params.session_id, &params.req_id);
+    let cancellation = sessions.scheduler.request_cancel(&op_id, now_ms());
+    sessions.pending_aborts.insert(
+        (params.session_id.clone(), params.req_id.clone()),
+        PendingSessionAbort {
+            retain_kv: params.retain_kv,
+        },
+    );
+    let disposition = match cancellation {
+        owned_decode_grammar_scheduler::scheduler::CancelResult::RemovedQueued => "removed_queued",
+        owned_decode_grammar_scheduler::scheduler::CancelResult::DeferredToBoundary => {
+            "deferred_to_boundary"
+        }
+        owned_decode_grammar_scheduler::scheduler::CancelResult::NotFound => "deferred_to_boundary",
+    };
+    result_outcome(json!({
+        "session_id": params.session_id,
+        "req_id": params.req_id,
+        "abort": "requested",
+        "disposition": disposition,
+    }))
+}
+
+async fn owned_decode_session_status(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
+    let params: OwnedDecodeSessionStatusParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(error) => {
+            return channel_error(
+                "invalid_request",
+                format!("invalid owned_decode.session_status params: {error}"),
+            )
+        }
+    };
+    let sessions = match state.runtime.owned_decode_sessions.lock() {
+        Ok(sessions) => sessions,
+        Err(_) => {
+            return owned_decode_failure(
+                &state,
+                "owned_decode_unavailable",
+                "decode sessions are unavailable",
+            )
+        }
+    };
+    let Some(session) = sessions.sessions.get(&params.session_id) else {
+        return owned_decode_failure(
+            &state,
+            "unknown_session",
+            "the decode session does not exist",
+        );
+    };
+    if let Ok(status) = sessions
+        .streams
+        .session_status(&params.session_id, &params.req_id)
+    {
+        return result_outcome(serde_json::to_value(status).expect("session status serializes"));
+    }
+    if session.active_request.as_deref() == Some(&params.req_id) {
+        return result_outcome(json!({
+            "session_id": params.session_id,
+            "req_id": params.req_id,
+            "committed_token_count": 0,
+            "state": "in_flight",
+        }));
+    }
+    owned_decode_failure(
+        &state,
+        "unknown_request",
+        "the request is not registered for this session",
+    )
+}
+
+#[derive(Debug)]
+struct OwnedDecodeWorkerStream {
+    generated_token_ids: Vec<u32>,
+    identity: synapse_core::OneshotEnvelopeIdentity,
+    generation_id: String,
+}
+
+fn required_string(value: &Value, field: &str) -> Result<String, String> {
+    value
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| format!("owned worker response is missing {field}"))
+}
+
+fn parse_owned_decode_worker_stream(body: &[u8]) -> Result<OwnedDecodeWorkerStream, String> {
+    let body: Value = serde_json::from_slice(body)
+        .map_err(|error| format!("owned worker response is not JSON: {error}"))?;
+    let result = body
+        .get("result")
+        .ok_or_else(|| "owned worker response has no result".to_string())?;
+    let provenance = result
+        .get("provenance")
+        .ok_or_else(|| "owned worker response has no provenance".to_string())?;
+    if required_string(
+        provenance.get("lane").unwrap_or(&Value::Null),
+        "provenance.lane",
+    )? != "decode"
+        || required_string(
+            provenance.get("worker").unwrap_or(&Value::Null),
+            "provenance.worker",
+        )? != "supervised"
+    {
+        return Err(
+            "owned session execution did not stay on the supervised decode lane".to_string(),
+        );
+    }
+    let generated_token_ids = result
+        .get("generated_token_ids")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "owned worker response has no generated token IDs".to_string())?
+        .iter()
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|value| u32::try_from(value).ok())
+                .ok_or_else(|| "owned worker response has an invalid token ID".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let n_gen = result
+        .get("n_gen")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| "owned worker response has no generation count".to_string())?;
+    if n_gen != generated_token_ids.len() {
+        return Err("owned worker generation count disagrees with committed token IDs".to_string());
+    }
+    let decode_fingerprint = required_string(
+        provenance.get("decode_fingerprint").unwrap_or(&Value::Null),
+        "provenance.decode_fingerprint",
+    )?;
+    let processing_fingerprint = required_string(
+        provenance
+            .get("processing_fingerprint")
+            .unwrap_or(&Value::Null),
+        "provenance.processing_fingerprint",
+    )?;
+    let runtime_config_digest = required_string(
+        result.get("runtime_config_digest").unwrap_or(&Value::Null),
+        "runtime_config_digest",
+    )?;
+    let worker_generation = provenance
+        .get("worker_generation")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "owned worker response has no worker generation".to_string())?;
+    let generation_id = required_string(
+        result.get("generation_id").unwrap_or(&Value::Null),
+        "generation_id",
+    )?;
+    let derived_digest = result
+        .get("derived_digest")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    Ok(OwnedDecodeWorkerStream {
+        generated_token_ids,
+        identity: synapse_core::OneshotEnvelopeIdentity {
+            decode_fingerprint: synapse_core::Fingerprint(decode_fingerprint),
+            processing_fingerprint: synapse_core::Fingerprint(processing_fingerprint),
+            runtime_config_digest,
+            worker_generation,
+            derived_digest,
+        },
+        generation_id,
+    })
+}
+
+fn clear_owned_decode_request(state: &ModuleState, session_id: &str, req_id: &str) {
+    if let Ok(mut sessions) = state.runtime.owned_decode_sessions.lock() {
+        let op_id = session_request_key(session_id, req_id);
+        sessions.scheduler.remove_op(&op_id);
+        sessions
+            .pending_aborts
+            .remove(&(session_id.to_string(), req_id.to_string()));
+        if let Some(session) = sessions.sessions.get_mut(session_id) {
+            if session.active_request.as_deref() == Some(req_id) {
+                session.active_request = None;
+            }
+        }
+    }
+}
+
+async fn owned_decode_session_decode(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
+    let params: OwnedDecodeSessionDecodeParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(error) => {
+            return channel_error(
+                "invalid_request",
+                format!("invalid owned_decode.decode params: {error}"),
+            )
+        }
+    };
+    if params.req_id.trim().is_empty() || params.max_tokens == 0 {
+        return channel_error(
+            "invalid_request",
+            "owned_decode.decode requires a non-empty req_id and positive max_tokens",
+        );
+    }
+    let model_id = {
+        let mut sessions = match state.runtime.owned_decode_sessions.lock() {
+            Ok(sessions) => sessions,
+            Err(_) => {
+                return owned_decode_failure(
+                    &state,
+                    "owned_decode_unavailable",
+                    "decode sessions are unavailable",
+                )
+            }
+        };
+        let Some(session) = sessions.sessions.get(&params.session_id) else {
+            return owned_decode_failure(
+                &state,
+                "unknown_session",
+                "the decode session does not exist",
+            );
+        };
+        if session.closed || session.active_request.is_some() {
+            return owned_decode_failure(
+                &state,
+                synapse_core::OwnedDecodeRefusal::SessionStillInFlight.as_str(),
+                "the decode session is not idle",
+            );
+        }
+        let model_id = session.model_id.clone();
+        let op_id = session_request_key(&params.session_id, &params.req_id);
+        let admitted_at_ms = now_ms();
+        sessions
+            .scheduler
+            .admit_decode(owned_decode_grammar_scheduler::scheduler::DecodeOp {
+                op_id: op_id.clone(),
+                generation_id: params.req_id.clone(),
+                admitted_at_ms,
+                anchor_ms: admitted_at_ms,
+                committed_tokens: 0,
+                max_tokens: params.max_tokens,
+                resident: false,
+                cancelled_at_ms: None,
+                deadline_at_ms: params
+                    .deadline_ms
+                    .and_then(|deadline| admitted_at_ms.checked_add(deadline)),
+            });
+        let selected = sessions.scheduler.arbitrate(admitted_at_ms);
+        if selected
+            .as_ref()
+            .and_then(|selected| selected.op_id.as_deref())
+            != Some(op_id.as_str())
+        {
+            sessions.scheduler.remove_op(&op_id);
+            return owned_decode_failure(
+                &state,
+                "decode_scheduler_busy",
+                "decode work was not selected at a committed scheduler boundary",
+            );
+        }
+        sessions
+            .sessions
+            .get_mut(&params.session_id)
+            .expect("idle session remains registered")
+            .active_request = Some(params.req_id.clone());
+        model_id
+    };
+
+    let route_params = MicroLlmOneshotParams {
+        model: Some(model_id),
+        prompt: params.prompt.clone(),
+        max_tokens: params.max_tokens,
+        grammar: params.grammar.clone(),
+        deadline_ms: params.deadline_ms,
+        max_queue_ms: params.max_queue_ms,
+        target_fingerprint: None,
+        required_fingerprint: None,
+        allow_equivalent: false,
+        required_epoch: None,
+        _accept_declared: false,
+        owned_only: true,
+    };
+    let worker_stream = match route_owned_decode_wire(
+        Arc::clone(&state),
+        &route_params,
+        route_params.model.as_deref().expect("session model is set"),
+    )
+    .await
+    {
+        HandlerOutcome::Response(body) => match parse_owned_decode_worker_stream(&body) {
+            Ok(stream) => stream,
+            Err(error) => {
+                clear_owned_decode_request(&state, &params.session_id, &params.req_id);
+                return owned_decode_failure(&state, "worker_protocol_error", error);
+            }
+        },
+        outcome => {
+            clear_owned_decode_request(&state, &params.session_id, &params.req_id);
+            return outcome;
+        }
+    };
+    if worker_stream.generated_token_ids.len() > params.max_tokens as usize {
+        clear_owned_decode_request(&state, &params.session_id, &params.req_id);
+        return owned_decode_failure(
+            &state,
+            "worker_protocol_error",
+            "worker exceeded the admitted generation limit",
+        );
+    }
+
+    let mut sessions = match state.runtime.owned_decode_sessions.lock() {
+        Ok(sessions) => sessions,
+        Err(_) => {
+            return owned_decode_failure(
+                &state,
+                "owned_decode_unavailable",
+                "decode sessions are unavailable",
+            )
+        }
+    };
+    let op_id = session_request_key(&params.session_id, &params.req_id);
+    let Some(session) = sessions.sessions.get(&params.session_id) else {
+        sessions.scheduler.remove_op(&op_id);
+        return owned_decode_failure(
+            &state,
+            "unknown_session",
+            "the decode session closed before the worker responded",
+        );
+    };
+    if session.active_request.as_deref() != Some(&params.req_id) {
+        sessions.scheduler.remove_op(&op_id);
+        return owned_decode_failure(
+            &state,
+            "request_cancelled",
+            "the decode request was removed before the worker responded",
+        );
+    }
+    let grammar_constrained = params
+        .grammar
+        .as_deref()
+        .is_some_and(|grammar| !grammar.trim().is_empty());
+    let chain_k = if grammar_constrained {
+        1
+    } else {
+        state.runtime.decode_chain_k
+    };
+    let request = owned_decode_worker::StreamRequest {
+        req_id: params.req_id.clone(),
+        session_id: params.session_id.clone(),
+        generation_id: worker_stream.generation_id.clone(),
+        identity: worker_stream.identity.clone(),
+        decode_mode: synapse_core::DecodeMode::Serial,
+        grammar_constrained,
+        chain_k,
+    };
+    if let Err(error) = sessions.streams.begin(request) {
+        sessions.scheduler.remove_op(&op_id);
+        if let Some(session) = sessions.sessions.get_mut(&params.session_id) {
+            session.active_request = None;
+        }
+        return owned_decode_failure(&state, "worker_protocol_error", error.to_string());
+    }
+
+    let mut frames = Vec::new();
+    let mut committed = 0_u32;
+    let mut sequence = synapse_core::StreamSequence::FIRST.0;
+    let quantum = sessions.scheduler.config().production_n as usize;
+    let chunks = worker_stream
+        .generated_token_ids
+        .chunks(quantum)
+        .collect::<Vec<_>>();
+    for (index, token_ids) in chunks.iter().enumerate() {
+        committed = committed.saturating_add(token_ids.len() as u32);
+        if let Err(error) = sessions
+            .scheduler
+            .try_commit_quantum(&op_id, committed, now_ms())
+        {
+            sessions.scheduler.remove_op(&op_id);
+            if let Some(session) = sessions.sessions.get_mut(&params.session_id) {
+                session.active_request = None;
+            }
+            return owned_decode_failure(
+                &state,
+                "scheduler_boundary_error",
+                format!("scheduler boundary rejected the committed span: {error:?}"),
+            );
+        }
+        match state.store.commit_serving_session_boundary(
+            &params.session_id,
+            committed.into(),
+            now_ms(),
+        ) {
+            Ok(store::ServingBoundaryOutcome::Continue { .. }) => {}
+            Ok(store::ServingBoundaryOutcome::Terminated {
+                unload_artifact, ..
+            }) => {
+                // The store committed this exact prefix before revocation. Publish
+                // that progress before the terminal so status and stream history
+                // agree on every token that crossed the boundary.
+                let progress = synapse_core::FrameEnvelope::new(
+                    &params.req_id,
+                    &params.session_id,
+                    synapse_core::StreamSequence(sequence),
+                    synapse_core::WorkerFrame::Progress {
+                        progress: synapse_core::ProgressFrame {
+                            committed_token_ids: token_ids.to_vec(),
+                            committed_token_count: committed,
+                        },
+                    },
+                );
+                if let Err(error) = sessions.streams.observe_frame(&progress) {
+                    return owned_decode_failure(
+                        &state,
+                        "worker_protocol_error",
+                        error.to_string(),
+                    );
+                }
+                frames.push(progress);
+                sequence = sequence.saturating_add(1);
+                let terminal = synapse_core::TerminalEnvelope {
+                    req_id: params.req_id.clone(),
+                    session_id: params.session_id.clone(),
+                    committed_token_count: committed,
+                    tokens_emitted: committed,
+                    identity: worker_stream.identity.clone(),
+                    terminal_state: synapse_core::TerminalState::ArtifactRevoked,
+                    decode_mode: synapse_core::DecodeMode::Serial,
+                    speculative_telemetry: None,
+                };
+                let frame = synapse_core::FrameEnvelope::new(
+                    &params.req_id,
+                    &params.session_id,
+                    synapse_core::StreamSequence(sequence),
+                    synapse_core::WorkerFrame::Error { terminal },
+                );
+                if let Err(error) = sessions.streams.observe_frame(&frame) {
+                    return owned_decode_failure(
+                        &state,
+                        "worker_protocol_error",
+                        error.to_string(),
+                    );
+                }
+                frames.push(frame);
+                sessions.scheduler.remove_op(&op_id);
+                let routing_session_id = sessions
+                    .sessions
+                    .get(&params.session_id)
+                    .expect("revoked session remains registered")
+                    .routing_session_id;
+                if let Some(router) = sessions.residency.as_mut() {
+                    let _ = router.close_session(routing_session_id);
+                }
+                let model_id = sessions
+                    .sessions
+                    .get(&params.session_id)
+                    .expect("revoked session remains registered")
+                    .model_id
+                    .clone();
+                if let Some(session) = sessions.sessions.get_mut(&params.session_id) {
+                    session.active_request = None;
+                    session.closed = true;
+                }
+                if unload_artifact {
+                    if let Ok(mut dispatches) = state.runtime.owned_decode_dispatches.lock() {
+                        dispatches.remove(&model_id);
+                    }
+                }
+                return result_outcome(json!({
+                    "session_id": params.session_id,
+                    "req_id": params.req_id,
+                    "frames": frames,
+                }));
+            }
+            Err(error) => {
+                sessions.scheduler.remove_op(&op_id);
+                if let Some(session) = sessions.sessions.get_mut(&params.session_id) {
+                    session.active_request = None;
+                }
+                return owned_decode_failure(
+                    &state,
+                    "store_failure",
+                    format!("could not commit the decode boundary: {error}"),
+                );
+            }
+        }
+        let frame = synapse_core::FrameEnvelope::new(
+            &params.req_id,
+            &params.session_id,
+            synapse_core::StreamSequence(sequence),
+            synapse_core::WorkerFrame::Progress {
+                progress: synapse_core::ProgressFrame {
+                    committed_token_ids: token_ids.to_vec(),
+                    committed_token_count: committed,
+                },
+            },
+        );
+        if let Err(error) = sessions.streams.observe_frame(&frame) {
+            return owned_decode_failure(&state, "worker_protocol_error", error.to_string());
+        }
+        frames.push(frame);
+        sequence = sequence.saturating_add(1);
+
+        if let Some(abort) = sessions
+            .pending_aborts
+            .remove(&(params.session_id.clone(), params.req_id.clone()))
+        {
+            let retention = if abort.retain_kv {
+                let retained_kv_session_id = format!(
+                    "{}:retained:{}:{}",
+                    params.session_id, committed, sessions.next_session_sequence
+                );
+                sessions.next_session_sequence = sessions.next_session_sequence.saturating_add(1);
+                let catalog_fingerprint = sessions
+                    .sessions
+                    .get(&params.session_id)
+                    .expect("active session exists")
+                    .catalog_fingerprint
+                    .clone();
+                match state.store.retain_serving_state(
+                    &retained_kv_session_id,
+                    &catalog_fingerprint,
+                    now_ms(),
+                ) {
+                    Ok(store::ServingContinuationAdmission::Admitted { .. }) => {
+                        owned_decode_worker::RetentionPreflight::Ready {
+                            retained_kv_session_id,
+                            retained_position: committed,
+                        }
+                    }
+                    Ok(store::ServingContinuationAdmission::Refused { .. }) | Err(_) => {
+                        owned_decode_worker::RetentionPreflight::Refused
+                    }
+                }
+            } else {
+                owned_decode_worker::RetentionPreflight::NotRequested
+            };
+            match sessions
+                .streams
+                .abort(&params.session_id, &params.req_id, retention, None)
+            {
+                Ok(outcome) => {
+                    if let Some(prefix) = outcome.retained_prefix {
+                        if let Some(session) = sessions.sessions.get_mut(&params.session_id) {
+                            session.retained_kv_session_id = Some(prefix.retained_kv_session_id);
+                            session.retained_position = Some(prefix.retained_position);
+                        }
+                    }
+                    frames.push(outcome.terminal);
+                    sessions.scheduler.remove_op(&op_id);
+                    if let Some(session) = sessions.sessions.get_mut(&params.session_id) {
+                        session.active_request = None;
+                    }
+                    return result_outcome(json!({
+                        "session_id": params.session_id,
+                        "req_id": params.req_id,
+                        "cancelled": outcome.cancellation,
+                        "frames": frames,
+                    }));
+                }
+                Err(error) => {
+                    return owned_decode_failure(&state, "worker_protocol_error", error.to_string())
+                }
+            }
+        }
+        if index + 1 < chunks.len() {
+            sessions.scheduler.requeue_continuation(&op_id);
+            let selected = sessions.scheduler.arbitrate(now_ms());
+            if selected
+                .as_ref()
+                .and_then(|selected| selected.op_id.as_deref())
+                != Some(op_id.as_str())
+            {
+                sessions.scheduler.remove_op(&op_id);
+                if let Some(session) = sessions.sessions.get_mut(&params.session_id) {
+                    session.active_request = None;
+                }
+                return owned_decode_failure(
+                    &state,
+                    "decode_scheduler_busy",
+                    "a later decode quantum lost scheduler ownership",
+                );
+            }
+        }
+    }
+    // A zero-token worker result has no progress loop to detect an abort requested
+    // before completion, so apply abort handling at the already-committed boundary.
+    if let Some(abort) = sessions
+        .pending_aborts
+        .remove(&(params.session_id.clone(), params.req_id.clone()))
+    {
+        let retention = if abort.retain_kv {
+            let retained_kv_session_id = format!(
+                "{}:retained:{}:{}",
+                params.session_id, committed, sessions.next_session_sequence
+            );
+            sessions.next_session_sequence = sessions.next_session_sequence.saturating_add(1);
+            let catalog_fingerprint = sessions
+                .sessions
+                .get(&params.session_id)
+                .expect("active session exists")
+                .catalog_fingerprint
+                .clone();
+            match state.store.retain_serving_state(
+                &retained_kv_session_id,
+                &catalog_fingerprint,
+                now_ms(),
+            ) {
+                Ok(store::ServingContinuationAdmission::Admitted { .. }) => {
+                    owned_decode_worker::RetentionPreflight::Ready {
+                        retained_kv_session_id,
+                        retained_position: committed,
+                    }
+                }
+                Ok(store::ServingContinuationAdmission::Refused { .. }) | Err(_) => {
+                    owned_decode_worker::RetentionPreflight::Refused
+                }
+            }
+        } else {
+            owned_decode_worker::RetentionPreflight::NotRequested
+        };
+        match sessions
+            .streams
+            .abort(&params.session_id, &params.req_id, retention, None)
+        {
+            Ok(outcome) => {
+                if let Some(prefix) = outcome.retained_prefix {
+                    if let Some(session) = sessions.sessions.get_mut(&params.session_id) {
+                        session.retained_kv_session_id = Some(prefix.retained_kv_session_id);
+                        session.retained_position = Some(prefix.retained_position);
+                    }
+                }
+                frames.push(outcome.terminal);
+                sessions.scheduler.remove_op(&op_id);
+                if let Some(session) = sessions.sessions.get_mut(&params.session_id) {
+                    session.active_request = None;
+                }
+                return result_outcome(json!({
+                    "session_id": params.session_id,
+                    "req_id": params.req_id,
+                    "cancelled": outcome.cancellation,
+                    "frames": frames,
+                }));
+            }
+            Err(error) => {
+                return owned_decode_failure(&state, "worker_protocol_error", error.to_string())
+            }
+        }
+    }
+    let terminal = synapse_core::TerminalEnvelope {
+        req_id: params.req_id.clone(),
+        session_id: params.session_id.clone(),
+        committed_token_count: committed,
+        tokens_emitted: committed,
+        identity: worker_stream.identity,
+        terminal_state: synapse_core::TerminalState::Completed,
+        decode_mode: synapse_core::DecodeMode::Serial,
+        speculative_telemetry: None,
+    };
+    let frame = synapse_core::FrameEnvelope::new(
+        &params.req_id,
+        &params.session_id,
+        synapse_core::StreamSequence(sequence),
+        synapse_core::WorkerFrame::Final { terminal },
+    );
+    if let Err(error) = sessions.streams.observe_frame(&frame) {
+        return owned_decode_failure(&state, "worker_protocol_error", error.to_string());
+    }
+    frames.push(frame);
+    sessions.scheduler.remove_op(&op_id);
+    if let Some(session) = sessions.sessions.get_mut(&params.session_id) {
+        session.active_request = None;
+    }
+    result_outcome(json!({
+        "session_id": params.session_id,
+        "req_id": params.req_id,
+        "frames": frames,
+    }))
+}
+
+async fn owned_decode_session_close(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
+    let params: OwnedDecodeSessionCloseParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(error) => {
+            return channel_error(
+                "invalid_request",
+                format!("invalid owned_decode.close params: {error}"),
+            )
+        }
+    };
+    let mut sessions = match state.runtime.owned_decode_sessions.lock() {
+        Ok(sessions) => sessions,
+        Err(_) => {
+            return owned_decode_failure(
+                &state,
+                "owned_decode_unavailable",
+                "decode sessions are unavailable",
+            )
+        }
+    };
+    let Some(session) = sessions.sessions.get(&params.session_id).cloned() else {
+        return owned_decode_failure(
+            &state,
+            "unknown_session",
+            "the decode session does not exist",
+        );
+    };
+    if session.active_request.is_some() {
+        return owned_decode_failure(
+            &state,
+            synapse_core::OwnedDecodeRefusal::SessionStillInFlight.as_str(),
+            "an active decode must stop at a boundary before close",
+        );
+    }
+    let mut unload_artifact = false;
+    if !session.closed {
+        match state
+            .store
+            .complete_serving_session(&params.session_id, now_ms())
+        {
+            Ok(completion) => unload_artifact = completion.unload_artifact,
+            Err(error) => {
+                return owned_decode_failure(
+                    &state,
+                    "store_failure",
+                    format!("could not complete serving session: {error}"),
+                );
+            }
+        }
+        if let Some(router) = sessions.residency.as_mut() {
+            if let Err(error) = router.close_session(session.routing_session_id) {
+                return owned_decode_failure(&state, "routing_error", error.to_string());
+            }
+        }
+        if let Some(session) = sessions.sessions.get_mut(&params.session_id) {
+            session.closed = true;
+        }
+    }
+    drop(sessions);
+    if unload_artifact {
+        if let Ok(mut dispatches) = state.runtime.owned_decode_dispatches.lock() {
+            dispatches.remove(&session.model_id);
+        }
+    }
+    result_outcome(json!({
+        "session_id": params.session_id,
+        "closed": true,
+        "unload_artifact": unload_artifact,
+    }))
+}
+
+async fn owned_decode_disable(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
+    let params: OwnedDecodeServingControlParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(error) => {
+            return channel_error(
+                "invalid_request",
+                format!("invalid owned_decode.disable params: {error}"),
+            )
+        }
+    };
+    match state
+        .store
+        .disable_serving_catalog(&params.catalog_fingerprint, &params.reason, now_ms())
+    {
+        Ok(outcome) => {
+            // Collect session ownership before taking the worker map so decode's
+            // boundary path never contends on the same locks in reverse order.
+            let model_ids = outcome
+                .unload_artifact
+                .then(|| {
+                    state
+                        .runtime
+                        .owned_decode_sessions
+                        .lock()
+                        .ok()
+                        .map(|sessions| {
+                            sessions
+                                .sessions
+                                .values()
+                                .filter(|session| {
+                                    session.catalog_fingerprint == params.catalog_fingerprint
+                                })
+                                .map(|session| session.model_id.clone())
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default();
+            if !model_ids.is_empty() {
+                if let Ok(mut dispatches) = state.runtime.owned_decode_dispatches.lock() {
+                    for model_id in model_ids {
+                        dispatches.remove(&model_id);
+                    }
+                }
+            }
+            result_outcome(
+                serde_json::to_value(outcome).expect("serving disable outcome serializes"),
+            )
+        }
+        Err(error) => owned_decode_failure(
+            &state,
+            "store_failure",
+            format!("could not disable serving artifact: {error}"),
+        ),
+    }
+}
+
+async fn owned_decode_revoke(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
+    let params: OwnedDecodeServingControlParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(error) => {
+            return channel_error(
+                "invalid_request",
+                format!("invalid owned_decode.revoke params: {error}"),
+            )
+        }
+    };
+    let outcome = match state.store.revoke_serving_catalog(
+        &params.catalog_fingerprint,
+        &params.reason,
+        now_ms(),
+    ) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            return owned_decode_failure(
+                &state,
+                "store_failure",
+                format!("could not revoke serving artifact: {error}"),
+            )
+        }
+    };
+    if let Ok(mut sessions) = state.runtime.owned_decode_sessions.lock() {
+        let active_ops = sessions
+            .sessions
+            .iter()
+            .filter_map(|(session_id, session)| {
+                (session.catalog_fingerprint == params.catalog_fingerprint)
+                    .then_some((session_id.clone(), session.active_request.clone()))
+            })
+            .collect::<Vec<_>>();
+        for (session_id, req_id) in active_ops {
+            if let Some(req_id) = req_id {
+                sessions
+                    .scheduler
+                    .request_revoke(&session_request_key(&session_id, &req_id), now_ms());
+            }
+        }
+    }
+    if outcome.unload_artifact {
+        if let Ok(mut dispatches) = state.runtime.owned_decode_dispatches.lock() {
+            dispatches.clear();
+        }
+    }
+    result_outcome(serde_json::to_value(outcome).expect("serving revoke outcome serializes"))
 }
 
 #[derive(Clone)]
@@ -5657,6 +7247,10 @@ async fn microllm_oneshot(state: Arc<ModuleState>, params: Value) -> HandlerOutc
         finish_reason: output.finish_reason,
         n_prompt: output.n_prompt,
         n_gen: output.n_gen,
+        generated_token_ids: output.generated_token_ids,
+        runtime_config_digest: None,
+        derived_digest: None,
+        generation_id: None,
         real_token_counts: tokenized.real_token_counts,
         truncation_disclosures: tokenized.disclosures,
     };
@@ -6989,7 +8583,7 @@ async fn route_owned_decode_wire(
         allow_equivalent: params.allow_equivalent,
         target_fingerprint: params.target_fingerprint.clone().map(Fingerprint),
         required_processing_fingerprint: None,
-        owned_only: false,
+        owned_only: params.owned_only,
     };
     let total_tokens = u64::from(request.prompt_token_count) + u64::from(params.max_tokens);
     if total_tokens > state.runtime.inline.max_tokens {
@@ -7064,6 +8658,9 @@ async fn route_owned_decode_wire(
         llama_output: None,
     };
     let generation_id = format!("{}-{}", state.module_generation, now_ms());
+    // The worker and the terminal envelope must use the same generation identity.
+    // Keep a copy because the routing closure owns the dispatch-side value.
+    let generation_id_for_payload = generation_id.clone();
     let n_prompt = request.prompt_token_count as usize;
     let routed = tokio::task::spawn_blocking(move || {
         let mut dispatch = dispatch;
@@ -7163,6 +8760,14 @@ async fn route_owned_decode_wire(
         finish_reason: routed.finish_reason.as_str().to_string(),
         n_prompt,
         n_gen: routed.generated_token_ids.len(),
+        generated_token_ids: routed.generated_token_ids.clone(),
+        runtime_config_digest: Some(runtime_config_digest),
+        derived_digest: spec
+            .engine_identity
+            .build_flags
+            .get("derived_digest")
+            .cloned(),
+        generation_id: Some(generation_id_for_payload),
         real_token_counts: tokenized.real_token_counts,
         truncation_disclosures: tokenized.disclosures,
     };
@@ -11680,6 +13285,15 @@ fn management_operations() -> Vec<ManagementOperation> {
         op("job.resume", Mutate),
         op("rerank.score", Query),
         op("microllm.oneshot", Query),
+        op("owned_decode.admit_session", Mutate),
+        op("owned_decode.decode", Mutate),
+        op("owned_decode.snapshot", Mutate),
+        op("owned_decode.continue", Mutate),
+        op("owned_decode.abort", Mutate),
+        op("owned_decode.close", Mutate),
+        op("owned_decode.session_status", Query),
+        op("owned_decode.disable", Mutate),
+        op("owned_decode.revoke", Mutate),
         op("model.load", Mutate),
         op("model.status", Query),
         op("model.unload", Mutate),
@@ -12813,6 +14427,44 @@ mod tests {
             quiet.throughput_tok_s
                 >= performance.throughput_tok_s * BALANCED_QUIET_MIN_THROUGHPUT_RATIO
         );
+    }
+
+    #[test]
+    fn owned_decode_worker_result_preserves_raw_ids_and_terminal_identity() {
+        let response = json!({
+            "result": {
+                "provenance": {
+                    "lane": "decode",
+                    "worker": "supervised",
+                    "decode_fingerprint": "decode-fingerprint",
+                    "processing_fingerprint": "processing-fingerprint",
+                    "worker_generation": 9,
+                },
+                "generated_token_ids": [17, 23],
+                "n_gen": 2,
+                "runtime_config_digest": "runtime-digest",
+                "derived_digest": "derived-digest",
+                "generation_id": "generation-9",
+            }
+        });
+        let stream = parse_owned_decode_worker_stream(
+            &serde_json::to_vec(&response).expect("test response serializes"),
+        )
+        .expect("supervised owned response should map to a stream identity");
+
+        assert_eq!(stream.generated_token_ids, vec![17, 23]);
+        assert_eq!(stream.identity.decode_fingerprint.0, "decode-fingerprint");
+        assert_eq!(
+            stream.identity.processing_fingerprint.0,
+            "processing-fingerprint"
+        );
+        assert_eq!(stream.identity.runtime_config_digest, "runtime-digest");
+        assert_eq!(stream.identity.worker_generation, 9);
+        assert_eq!(
+            stream.identity.derived_digest.as_deref(),
+            Some("derived-digest")
+        );
+        assert_eq!(stream.generation_id, "generation-9");
     }
 }
 
