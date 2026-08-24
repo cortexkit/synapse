@@ -23,8 +23,10 @@
 //! - [`q8ingest`]: Q8 first-load derivation orchestration.
 //! - [`certification`]: certification-row access and structural-band checks.
 //! - [`lane`]: lane selection, fallback, and the serving predicate.
+//! - [`admission`]: platform-envelope admission, residency, and session reuse routing.
 //! - [`provenance`]: selected-lane response provenance.
 
+pub mod admission;
 pub mod ane_prefill;
 pub mod certification;
 pub mod error;
