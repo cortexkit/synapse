@@ -1,0 +1,226 @@
+{
+  "artifact": {
+    "catalog_fingerprint": "4e8d24cf9b42089fc0e7f442527c6f57c2f5d0bbd6a96b05d29f3a46a212a225",
+    "format": "GGUF",
+    "id": "qwen3.8-27b-q4-k-m-native-mtp-v1",
+    "model": "Qwen3.8-27B",
+    "quantization": "Q4_K_M",
+    "source_sha256": "a55c53e92388007f602f87a8b74a1daee83a07e1f291346dd6fcf5109d9eed0a"
+  },
+  "band_gate": {
+    "fingerprint": "fa8ed7d4a424e88d9492f4d0d94aeec9340ec9fd6088fddf039f072521eb415a",
+    "id": "agentic-battery-exact-token-parity-v1",
+    "mode": "exact",
+    "near_tie_policy": "disabled"
+  },
+  "battery_revision": "agentic-battery-v1",
+  "chat_template": {
+    "add_generation_prompt": true,
+    "id": "qwen3.8-instruct-tool-use-v1",
+    "sha256": "53a1e6ee6a0bd8f6a7fb2784e5e292482d8d5a742f2fe41e524b39295c1f63ec"
+  },
+  "generation": {
+    "do_sample": false,
+    "max_new_tokens": 256,
+    "min_p": 0,
+    "mode": "greedy",
+    "repetition_penalty": 1,
+    "seed": 0,
+    "temperature": 0,
+    "top_k": 1,
+    "top_p": 1,
+    "unsupported_non_greedy_error": "unsupported_generation_config"
+  },
+  "harness": {
+    "entrypoint": "harness.py",
+    "result_schema": "agentic-battery-acceptance-result-v1",
+    "revision": "agentic-battery-harness-v1"
+  },
+  "harness_sha256": "68a82aada444368d688cf56456d0d3239dc738892d2df06877f29dc63ec9cfde",
+  "input_token_range": {
+    "maximum": 16384,
+    "minimum": 1024
+  },
+  "llama_cpp_oracle": {
+    "backend": "metal",
+    "build_flags": [
+      "-DGGML_METAL=ON",
+      "-DGGML_METAL_EMBED_LIBRARY=ON",
+      "-DGGML_NATIVE=OFF",
+      "-DCMAKE_BUILD_TYPE=Release"
+    ],
+    "repository": "ggml-org/llama.cpp",
+    "revision": "b9580"
+  },
+  "manifest_content_sha256": "5d09c3352e69af02df7dea74397574dc107e5c94b3a8420684fdbe1afb638b8f",
+  "prompt_count": 20,
+  "prompt_digest_algorithm": "sha256",
+  "prompts": [
+    {
+      "category": "tool-call-transcript",
+      "id": "tool-call-transcript-01",
+      "input_tokens": 1024,
+      "path": "prompts/tool-call-transcript-01.json",
+      "sha256": "a72f715bb9aeddad454d1812ab8e15168ec26cdaaa4f5c339349726e8d89725e"
+    },
+    {
+      "category": "tool-call-transcript",
+      "id": "tool-call-transcript-02",
+      "input_tokens": 1536,
+      "path": "prompts/tool-call-transcript-02.json",
+      "sha256": "ed4b1d692142783fceb8f56c28bd66212814ab8d9110f18dbd3da2ff0f54b234"
+    },
+    {
+      "category": "tool-call-transcript",
+      "id": "tool-call-transcript-03",
+      "input_tokens": 2048,
+      "path": "prompts/tool-call-transcript-03.json",
+      "sha256": "b634ac880499db092822ed55102bcd3b628e339604ec6282a310012af5e100c5"
+    },
+    {
+      "category": "tool-call-transcript",
+      "id": "tool-call-transcript-04",
+      "input_tokens": 3072,
+      "path": "prompts/tool-call-transcript-04.json",
+      "sha256": "62f2a51ddf1b746663c14eee17fe9a919e5fcec0cc65ab64ef582b0bf7c30ed5"
+    },
+    {
+      "category": "tool-call-transcript",
+      "id": "tool-call-transcript-05",
+      "input_tokens": 4096,
+      "path": "prompts/tool-call-transcript-05.json",
+      "sha256": "23b3bfd96b9ef4f0622358e129f361f0e91e062d372259841b1c90facf94b8dc"
+    },
+    {
+      "category": "code-generation",
+      "id": "code-generation-01",
+      "input_tokens": 1536,
+      "path": "prompts/code-generation-01.json",
+      "sha256": "dc6d5da891adbd101632f778dd0006ce042e21fb1f9ee1e07cc0620c4f83b52f"
+    },
+    {
+      "category": "code-generation",
+      "id": "code-generation-02",
+      "input_tokens": 2048,
+      "path": "prompts/code-generation-02.json",
+      "sha256": "a8af9df6a0501202704e5407e6edf136f9f89e36072f9866c16120db4f77dba2"
+    },
+    {
+      "category": "code-generation",
+      "id": "code-generation-03",
+      "input_tokens": 3072,
+      "path": "prompts/code-generation-03.json",
+      "sha256": "54eea1a246f91c50ead4b5400e64b981c36c29ab50078bccaa4b1c217a8a3e28"
+    },
+    {
+      "category": "code-generation",
+      "id": "code-generation-04",
+      "input_tokens": 4096,
+      "path": "prompts/code-generation-04.json",
+      "sha256": "552b86b3935e5077ef85d4cfb802182d35aaee9492a90d095f331ec432462bea"
+    },
+    {
+      "category": "code-generation",
+      "id": "code-generation-05",
+      "input_tokens": 6144,
+      "path": "prompts/code-generation-05.json",
+      "sha256": "f57ce8c5fa422dc3e28045b45d3d6a127abdb5754ded2a5b143ef53d29e01d06"
+    },
+    {
+      "category": "constrained-json",
+      "id": "constrained-json-01",
+      "input_tokens": 2048,
+      "path": "prompts/constrained-json-01.json",
+      "sha256": "519f6f6288c1db605be11ac4811499078e495929611fc4d793c39026b6c67dcf"
+    },
+    {
+      "category": "constrained-json",
+      "id": "constrained-json-02",
+      "input_tokens": 3072,
+      "path": "prompts/constrained-json-02.json",
+      "sha256": "57f5a63b1bd592b4eee2ced3dc720f188793f024778f0ea56a7cc268ec122559"
+    },
+    {
+      "category": "constrained-json",
+      "id": "constrained-json-03",
+      "input_tokens": 4096,
+      "path": "prompts/constrained-json-03.json",
+      "sha256": "5d6bc36443f4076bae7ede87feb7a110cef4b1e54db4134ca1ef793b1549b9dc"
+    },
+    {
+      "category": "constrained-json",
+      "id": "constrained-json-04",
+      "input_tokens": 6144,
+      "path": "prompts/constrained-json-04.json",
+      "sha256": "657a809b88036e5a77eeb5d4eac8d27dad052d40ca171d6e588af341185371ff"
+    },
+    {
+      "category": "constrained-json",
+      "id": "constrained-json-05",
+      "input_tokens": 8192,
+      "path": "prompts/constrained-json-05.json",
+      "sha256": "5d9f322b0c1b016e0a534a0237ba20f8d71daa0d8e452d87b346fa3955969390"
+    },
+    {
+      "category": "long-context-prose-continuation",
+      "id": "long-context-prose-continuation-01",
+      "input_tokens": 4096,
+      "path": "prompts/long-context-prose-continuation-01.json",
+      "sha256": "07047909feb170f1ba869c7b2d9ee4bb89824ad4dfe8ed7ffdf50e2fa2f8d066"
+    },
+    {
+      "category": "long-context-prose-continuation",
+      "id": "long-context-prose-continuation-02",
+      "input_tokens": 6144,
+      "path": "prompts/long-context-prose-continuation-02.json",
+      "sha256": "a0506df49d598f82d83bcd854ca8d08fb59a006ac8869b0049880126c3184399"
+    },
+    {
+      "category": "long-context-prose-continuation",
+      "id": "long-context-prose-continuation-03",
+      "input_tokens": 8192,
+      "path": "prompts/long-context-prose-continuation-03.json",
+      "sha256": "c24e762c787a96de877b70e7b73d4fae4fc5ac4023f7e949d3ecfd840bc76a41"
+    },
+    {
+      "category": "long-context-prose-continuation",
+      "id": "long-context-prose-continuation-04",
+      "input_tokens": 12288,
+      "path": "prompts/long-context-prose-continuation-04.json",
+      "sha256": "a07a1d9c06b8eb07ba2aea1e81b5bc4658a6e449d2def53ee02476c17d393f0c"
+    },
+    {
+      "category": "long-context-prose-continuation",
+      "id": "long-context-prose-continuation-05",
+      "input_tokens": 16384,
+      "path": "prompts/long-context-prose-continuation-05.json",
+      "sha256": "726063a35ee9bf0c6fcb0559a4938922971b343384725dd4937f16281c5b5ed9"
+    }
+  ],
+  "required_manifest_fields": [
+    "schema_version",
+    "battery_revision",
+    "write_once",
+    "prompt_count",
+    "prompt_digest_algorithm",
+    "input_token_range",
+    "prompts",
+    "tokenizer",
+    "chat_template",
+    "generation",
+    "artifact",
+    "band_gate",
+    "harness",
+    "harness_sha256",
+    "llama_cpp_oracle",
+    "manifest_content_sha256"
+  ],
+  "schema_version": "agentic-battery-manifest-v1",
+  "tokenizer": {
+    "id": "Qwen/Qwen3.8-27B",
+    "revision": "b6c73d81f0d4fc313f6e03d7cae5b35d1a52af84",
+    "sha256": "5b3e0a821a4a781b0f86a1db82948fd82464941ae4134d5bc2c4c6658a51c51f",
+    "token_counting": "apply_chat_template(add_generation_prompt=true) then encode"
+  },
+  "write_once": true
+}
