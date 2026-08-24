@@ -1,0 +1,250 @@
+{
+  "artifact": {
+    "binds_at": "first-ingest",
+    "catalog_fingerprint": null,
+    "format": "GGUF",
+    "id": "qwen3.8-27b-q4-k-m-native-mtp-v1",
+    "model": "Qwen3.8-27B",
+    "pinned": false,
+    "quantization": "Q4_K_M",
+    "source_sha256": null
+  },
+  "band_gate": {
+    "fingerprint": "fa8ed7d4a424e88d9492f4d0d94aeec9340ec9fd6088fddf039f072521eb415a",
+    "id": "agentic-battery-exact-token-parity-v1",
+    "mode": "exact",
+    "near_tie_policy": "disabled"
+  },
+  "battery_revision": "agentic-battery-v1",
+  "chat_template": {
+    "add_generation_prompt": true,
+    "id": "qwen3.8-instruct-tool-use-v1",
+    "sha256": "53a1e6ee6a0bd8f6a7fb2784e5e292482d8d5a742f2fe41e524b39295c1f63ec"
+  },
+  "eligibility_status": "pending_oracle_run",
+  "generation": {
+    "do_sample": false,
+    "max_new_tokens": 256,
+    "min_p": 0,
+    "mode": "greedy",
+    "repetition_penalty": 1,
+    "seed": 0,
+    "temperature": 0,
+    "top_k": 1,
+    "top_p": 1,
+    "unsupported_non_greedy_error": "owned_decode_sampling_unsupported"
+  },
+  "harness": {
+    "entrypoint": "harness.py",
+    "result_schema": "agentic-battery-acceptance-result-v1",
+    "revision": "agentic-battery-harness-v1"
+  },
+  "harness_sha256": "f1e3a44ef71ff34718a068b8c1b6f86c0b96193b5a435019791737ab1f9d7842",
+  "input_token_range": {
+    "maximum": 16384,
+    "minimum": 1024
+  },
+  "llama_cpp_oracle": {
+    "backend": "metal",
+    "build_flags": [
+      "-DGGML_METAL=ON",
+      "-DGGML_METAL_EMBED_LIBRARY=ON",
+      "-DGGML_NATIVE=OFF",
+      "-DCMAKE_BUILD_TYPE=Release"
+    ],
+    "repository": "ggml-org/llama.cpp",
+    "revision": "b9580"
+  },
+  "manifest_content_sha256": "2824078343857f78e817da387932166eb740b4755eb1089ed0dabfd7c3300203",
+  "prompt_count": 20,
+  "prompt_digest_algorithm": "sha256",
+  "prompts": [
+    {
+      "category": "tool-call-transcript",
+      "id": "tool-call-transcript-01",
+      "input_tokens": 1024,
+      "path": "prompts/tool-call-transcript-01.json",
+      "sha256": "bf9f6e036779f5fabc2ce37a414ef4c37b25ed77fcda2f74f140105116abc471",
+      "speed_gate_eligible": null
+    },
+    {
+      "category": "tool-call-transcript",
+      "id": "tool-call-transcript-02",
+      "input_tokens": 1536,
+      "path": "prompts/tool-call-transcript-02.json",
+      "sha256": "da035d76afc855342cc7030eafca6c75685f4b628be8b6f2f14f0a31f2a2e298",
+      "speed_gate_eligible": null
+    },
+    {
+      "category": "tool-call-transcript",
+      "id": "tool-call-transcript-03",
+      "input_tokens": 2048,
+      "path": "prompts/tool-call-transcript-03.json",
+      "sha256": "25602ce28b479358dd93ed3c34a0407f7315fb39b707ec6d97dadc3047a0be9e",
+      "speed_gate_eligible": null
+    },
+    {
+      "category": "tool-call-transcript",
+      "id": "tool-call-transcript-04",
+      "input_tokens": 3072,
+      "path": "prompts/tool-call-transcript-04.json",
+      "sha256": "9f8867f8051a753e9d86abb0bd2e575b6e351efe07603fcfcb5fce0fbc3b7446",
+      "speed_gate_eligible": null
+    },
+    {
+      "category": "tool-call-transcript",
+      "id": "tool-call-transcript-05",
+      "input_tokens": 4096,
+      "path": "prompts/tool-call-transcript-05.json",
+      "sha256": "cb77f3fdc2241618b02605eb829f56abb5e3501d5610947b09cedbb1b2299e68",
+      "speed_gate_eligible": null
+    },
+    {
+      "category": "code-generation",
+      "id": "code-generation-01",
+      "input_tokens": 1536,
+      "path": "prompts/code-generation-01.json",
+      "sha256": "024d08cd3362ef4fa4a21daa77d6e1c831fc16648a9b2b154716ba03d7f24bcf",
+      "speed_gate_eligible": null
+    },
+    {
+      "category": "code-generation",
+      "id": "code-generation-02",
+      "input_tokens": 2048,
+      "path": "prompts/code-generation-02.json",
+      "sha256": "c8e6ab869d4d50ead13504a873dbab945e5757ed6b5ba22de4084f87fd5a44d6",
+      "speed_gate_eligible": null
+    },
+    {
+      "category": "code-generation",
+      "id": "code-generation-03",
+      "input_tokens": 3072,
+      "path": "prompts/code-generation-03.json",
+      "sha256": "c0f408b7155756e0aa2ef985864dfbcc4a0ceb55fb10fdd26c13826fb0351cf9",
+      "speed_gate_eligible": null
+    },
+    {
+      "category": "code-generation",
+      "id": "code-generation-04",
+      "input_tokens": 4096,
+      "path": "prompts/code-generation-04.json",
+      "sha256": "d3818c28fc02b3f05d8e4a5c0b51bf5826bcb524c544de58d4f7e3a4e21a8c7f",
+      "speed_gate_eligible": null
+    },
+    {
+      "category": "code-generation",
+      "id": "code-generation-05",
+      "input_tokens": 6144,
+      "path": "prompts/code-generation-05.json",
+      "sha256": "5ba29f35a4afdd9dc44f32d3ac593cb5b201bfbf73f572e425ba1e221c7f2817",
+      "speed_gate_eligible": null
+    },
+    {
+      "category": "constrained-json",
+      "id": "constrained-json-01",
+      "input_tokens": 2048,
+      "path": "prompts/constrained-json-01.json",
+      "sha256": "399eb16460dd5ccba34da137e6e80d6cfc5880839863efeeaf304c4c364b18be",
+      "speed_gate_eligible": null
+    },
+    {
+      "category": "constrained-json",
+      "id": "constrained-json-02",
+      "input_tokens": 3072,
+      "path": "prompts/constrained-json-02.json",
+      "sha256": "ba3ae476b5666e39f1d26f05dd89a8576ca32831e07c82b63dce7ddb527ebf20",
+      "speed_gate_eligible": null
+    },
+    {
+      "category": "constrained-json",
+      "id": "constrained-json-03",
+      "input_tokens": 4096,
+      "path": "prompts/constrained-json-03.json",
+      "sha256": "c1b1891f12b381341072c11812e6b15deed7b0415839714b3c36e9cc4be8aa63",
+      "speed_gate_eligible": null
+    },
+    {
+      "category": "constrained-json",
+      "id": "constrained-json-04",
+      "input_tokens": 6144,
+      "path": "prompts/constrained-json-04.json",
+      "sha256": "06ace0e452dfa281156bc57ce284ffe161e50fe4cf5188cebb559ac96108e8ab",
+      "speed_gate_eligible": null
+    },
+    {
+      "category": "constrained-json",
+      "id": "constrained-json-05",
+      "input_tokens": 8192,
+      "path": "prompts/constrained-json-05.json",
+      "sha256": "c4a91fa2c9bbce414a147c076901f1446ff1894cab44fec9da9f304da0de0184",
+      "speed_gate_eligible": null
+    },
+    {
+      "category": "long-context-prose-continuation",
+      "id": "long-context-prose-continuation-01",
+      "input_tokens": 4096,
+      "path": "prompts/long-context-prose-continuation-01.json",
+      "sha256": "b075f2ae26b0a5011a5f69e1c43498635c09ed990ace1500c76d9090aa0fc0c0",
+      "speed_gate_eligible": null
+    },
+    {
+      "category": "long-context-prose-continuation",
+      "id": "long-context-prose-continuation-02",
+      "input_tokens": 6144,
+      "path": "prompts/long-context-prose-continuation-02.json",
+      "sha256": "734260f7d82ae054a22ca654d9b6575518a5ca934dcab8579ec256adf9238d15",
+      "speed_gate_eligible": null
+    },
+    {
+      "category": "long-context-prose-continuation",
+      "id": "long-context-prose-continuation-03",
+      "input_tokens": 8192,
+      "path": "prompts/long-context-prose-continuation-03.json",
+      "sha256": "8d77a65626135d32bcab68ed34a62006ee6015bce34adeaeda22a2ce4913330c",
+      "speed_gate_eligible": null
+    },
+    {
+      "category": "long-context-prose-continuation",
+      "id": "long-context-prose-continuation-04",
+      "input_tokens": 12288,
+      "path": "prompts/long-context-prose-continuation-04.json",
+      "sha256": "7d0260457e3c92cca92dee08a689146d9d06ed31ff9065a73afd276715e4a2d9",
+      "speed_gate_eligible": null
+    },
+    {
+      "category": "long-context-prose-continuation",
+      "id": "long-context-prose-continuation-05",
+      "input_tokens": 16384,
+      "path": "prompts/long-context-prose-continuation-05.json",
+      "sha256": "462e39f5d729bd8a6d3b74a856697dfbb2ad89f78abb2ebb7b3de4accd567ec0",
+      "speed_gate_eligible": null
+    }
+  ],
+  "required_manifest_fields": [
+    "schema_version",
+    "battery_revision",
+    "write_once",
+    "prompt_count",
+    "prompt_digest_algorithm",
+    "input_token_range",
+    "eligibility_status",
+    "prompts",
+    "tokenizer",
+    "chat_template",
+    "generation",
+    "artifact",
+    "band_gate",
+    "harness",
+    "harness_sha256",
+    "llama_cpp_oracle",
+    "manifest_content_sha256"
+  ],
+  "schema_version": "agentic-battery-manifest-v1",
+  "tokenizer": {
+    "id": "Qwen/Qwen3.8-27B",
+    "revision": "b6c73d81f0d4fc313f6e03d7cae5b35d1a52af84",
+    "sha256": "5b3e0a821a4a781b0f86a1db82948fd82464941ae4134d5bc2c4c6658a51c51f",
+    "token_counting": "apply_chat_template(add_generation_prompt=true) then encode"
+  },
+  "write_once": true
+}
