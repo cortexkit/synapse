@@ -1,22 +1,9 @@
-//! The dedicated DECODE scheduler class and its quantum-sequencing protocol.
+//! The four-queue scheduler and quantum-sequencing protocol for owned decode.
 //!
-//! Owned generation does not reuse the Interactive or Bulk classes: it has a
-//! dedicated [`QueueClass::Decode`] with its own admission, fair-cycle weight,
-//! and aging window. This module models that scheduler in hardware-independent
-//! form so its mechanism — Control precedence, weighted boundary arbitration,
-//! oldest-anchor DECODE ordering, module-held permit release and reacquisition,
-//! FIFO continuation, queued cancellation and deadline removal, and N-token
-//! quantum sequencing — can be exercised and measured without Metal.
-//!
-//! Two binding decisions from the specification's resolutions shape the model:
-//! - *Yield-on-contention*: at a quantum boundary the module releases the decode
-//!   permit whenever weighted fair-cycle arbitration selects queued work from any
-//!   other class; the permit is retained only when DECODE is the sole runnable
-//!   class.
-//! - *Aggregate aging guarantee*: within DECODE, ordering is FIFO by admission
-//!   and the testable guarantee is that in every aging window in which at least
-//!   one DECODE operation is continuously runnable, at least one DECODE quantum
-//!   commits (rather than a per-operation one-window bound).
+//! The scheduler is intentionally hardware-independent: it makes queue precedence,
+//! weighted fairness, committed boundaries, and service-isolation telemetry explicit
+//! before work reaches a Metal worker. Control is the only priority queue. Interactive,
+//! Bulk, and Decode always take part in the same weighted fair cycle.
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -24,26 +11,38 @@ use serde::{Deserialize, Serialize};
 
 use crate::owned_decode_routing::error::OwnedDecodeError;
 
-/// The scheduler queue classes. Owned generation uses [`QueueClass::Decode`];
-/// llama fallback keeps its existing Interactive/Bulk class and consumes no
-/// DECODE accounting. Serialized in snake_case, so `Decode` is `"decode"`.
+/// The scheduler's normative queue identifiers.
+///
+/// The wire spelling remains snake_case for compatibility. Telemetry and test hooks
+/// use [`Self::identifier`], whose values are the normative `Control`, `Interactive`,
+/// `Bulk`, and `Decode` names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QueueClass {
     Control,
     Interactive,
-    Decode,
     Bulk,
+    Decode,
 }
 
 impl QueueClass {
-    /// The wire serialization. `Decode` serializes as `"decode"`.
+    /// The normative identifier emitted by scheduler telemetry.
+    pub const fn identifier(self) -> &'static str {
+        match self {
+            Self::Control => "Control",
+            Self::Interactive => "Interactive",
+            Self::Bulk => "Bulk",
+            Self::Decode => "Decode",
+        }
+    }
+
+    /// The backward-compatible wire serialization.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Control => "control",
             Self::Interactive => "interactive",
-            Self::Decode => "decode",
             Self::Bulk => "bulk",
+            Self::Decode => "decode",
         }
     }
 
@@ -52,47 +51,88 @@ impl QueueClass {
         match value {
             "control" => Ok(Self::Control),
             "interactive" => Ok(Self::Interactive),
-            "decode" => Ok(Self::Decode),
             "bulk" => Ok(Self::Bulk),
+            "decode" => Ok(Self::Decode),
             other => Err(format!("unknown queue class '{other}'")),
         }
     }
 }
 
-/// Scheduler runtime configuration. The five runtime-effective scheduler fields
-/// from `decode-sched-manifest-v1` are `production_n`, `decode_weight`,
-/// `decode_aging_window_ms`, plus the yield-policy and progress-protocol
-/// revisions (carried as strings for identity). Interactive and Bulk weights are
-/// local modeling inputs and do not enter runtime identity.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DecodeSchedulerConfig {
-    /// Exactly one production N from `{8,16,32}`; the maximum committed tokens per
-    /// quantum. N=1 is prohibited.
-    pub production_n: u32,
-    /// DECODE weight in the weighted fair cycle.
-    pub decode_weight: u32,
-    /// Interactive (embedding) weight in the weighted fair cycle.
-    pub interactive_weight: u32,
-    /// Bulk weight in the weighted fair cycle.
-    pub bulk_weight: u32,
-    /// The DECODE aging window in milliseconds.
-    pub decode_aging_window_ms: u64,
+/// Work that must stop at a committed scheduler boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuantumWorkKind {
+    Prefill,
+    Decode,
+    Mtp,
 }
 
-impl Default for DecodeSchedulerConfig {
-    fn default() -> Self {
-        Self {
-            production_n: 16,
-            decode_weight: 4,
-            interactive_weight: 1,
-            bulk_weight: 1,
-            decode_aging_window_ms: 250,
+impl QuantumWorkKind {
+    pub const fn identifier(self) -> &'static str {
+        match self {
+            Self::Prefill => "prefill",
+            Self::Decode => "decode",
+            Self::Mtp => "mtp",
         }
     }
 }
 
+/// Scheduler runtime configuration used by the shipped `embed-load-v1` profile.
+///
+/// `production_n` bounds every prefill, Decode, and MTP quantum. The queue weights
+/// affect only the fair cycle; Control remains outside that cycle at strict precedence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DecodeSchedulerConfig {
+    /// Exactly one production N from `{8,16,32}`; N=1 is prohibited.
+    pub production_n: u32,
+    /// Decode weight in the Interactive/Bulk/Decode fair cycle.
+    pub decode_weight: u32,
+    /// Interactive (embed and rerank) weight in the fair cycle.
+    pub interactive_weight: u32,
+    /// Bulk weight in the fair cycle.
+    pub bulk_weight: u32,
+    /// Recorded wait threshold kept in scheduler manifests for backward compatibility.
+    /// It does not bypass the weighted fair scheduling decision.
+    pub decode_aging_window_ms: u64,
+}
+
+/// The production scheduler profile used for `embed-load-v1`, not a test fixture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShippedSchedulerConfiguration {
+    pub profile_id: &'static str,
+    pub scheduler: DecodeSchedulerConfig,
+    pub decode_context_ceiling_tokens: u32,
+    pub embed_p95_slo_ms: u64,
+}
+
+pub const EMBED_LOAD_V1_PROFILE: &str = "embed-load-v1";
+pub const EMBED_LOAD_V1_CONTEXT_CEILING_TOKENS: u32 = 32_768;
+pub const EMBED_LOAD_V1_EMBED_P95_SLO_MS: u64 = 150;
+pub const SHIPPED_EMBED_LOAD_V1: ShippedSchedulerConfiguration = ShippedSchedulerConfiguration {
+    profile_id: EMBED_LOAD_V1_PROFILE,
+    scheduler: DecodeSchedulerConfig {
+        production_n: 16,
+        decode_weight: 4,
+        interactive_weight: 1,
+        bulk_weight: 1,
+        decode_aging_window_ms: 250,
+    },
+    decode_context_ceiling_tokens: EMBED_LOAD_V1_CONTEXT_CEILING_TOKENS,
+    embed_p95_slo_ms: EMBED_LOAD_V1_EMBED_P95_SLO_MS,
+};
+
+impl Default for DecodeSchedulerConfig {
+    fn default() -> Self {
+        SHIPPED_EMBED_LOAD_V1.scheduler
+    }
+}
+
 impl DecodeSchedulerConfig {
-    fn weight(&self, class: QueueClass) -> u32 {
+    /// Return the shipped, production configuration for `embed-load-v1`.
+    pub const fn shipped_embed_load_v1() -> Self {
+        SHIPPED_EMBED_LOAD_V1.scheduler
+    }
+
+    const fn weight(&self, class: QueueClass) -> u32 {
         match class {
             QueueClass::Decode => self.decode_weight,
             QueueClass::Interactive => self.interactive_weight,
@@ -100,9 +140,17 @@ impl DecodeSchedulerConfig {
             QueueClass::Control => 0,
         }
     }
+
+    const fn quantum_tokens(&self, kind: QuantumWorkKind) -> u32 {
+        match kind {
+            QuantumWorkKind::Prefill | QuantumWorkKind::Decode | QuantumWorkKind::Mtp => {
+                self.production_n
+            }
+        }
+    }
 }
 
-/// A DECODE operation tracked by the scheduler.
+/// A scheduler operation tracked across queued, resident, and boundary states.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DecodeOp {
     pub op_id: String,
@@ -114,31 +162,42 @@ pub struct DecodeOp {
     pub anchor_ms: u64,
     pub committed_tokens: u32,
     pub max_tokens: u32,
-    /// True once the operation has dispatched at least once and holds resident
-    /// continuation state awaiting its next quantum.
+    /// True once the operation has dispatched and holds resident continuation state.
     pub resident: bool,
-    /// When a cancellation was recorded (evaluated at the next boundary).
+    /// When an abort request was recorded for evaluation at a committed boundary.
     pub cancelled_at_ms: Option<u64>,
     /// Absolute deadline; expiry is evaluated at boundaries and while queued.
     pub deadline_at_ms: Option<u64>,
 }
 
-/// The outcome of a boundary evaluation, applying the binding precedence order
-/// terminal completion > cancellation > deadline.
+/// Rejection from the quantum-boundary guard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuantumCommitError {
+    UnknownOperation,
+    NotActiveQuantum,
+    NonMonotonicCommit,
+    ExceedsQuantumBudget,
+    ExceedsMaximumTokens,
+}
+
+/// The outcome of a committed boundary evaluation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BoundaryOutcome {
-    /// The quantum completed normally; any pending cancellation or deadline is a
-    /// no-op and does not retroactively fail the result.
+    /// An emergency revoke wins at the next committed boundary so the caller can
+    /// emit terminal `artifact_revoked` accounting with the proven token count.
+    Revoked,
+    /// The quantum completed normally; pending abort or deadline state does not
+    /// retroactively fail a completion that happened before those controls.
     Completed(FinishReason),
-    /// A cancellation recorded before or at this (non-terminal) boundary.
+    /// An abort recorded before or at this non-terminal boundary.
     Cancelled,
-    /// A deadline expired before or at this (non-terminal) boundary.
+    /// A deadline expired before or at this non-terminal boundary.
     DeadlineExceeded,
     /// Neither control applies; the operation continues with another quantum.
     Continue,
 }
 
-/// External finish reasons (exactly the four the wire contract allows).
+/// External successful finish reasons (the wire contract's four values).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FinishReason {
     StopToken,
@@ -159,13 +218,13 @@ pub enum BoundaryKind {
 /// A permit lifecycle event, recorded for scheduler measurements.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PermitEvent {
-    /// The module acquired the decode permit for a DECODE dispatch.
+    /// The module acquired the Decode permit for a Decode dispatch.
     Acquired,
-    /// DECODE won again while already holding the permit (no release overhead).
+    /// Decode won again while already holding the permit (no release overhead).
     Retained,
-    /// A non-DECODE class won the fair cycle; the decode permit was released.
+    /// A non-Decode class won the fair cycle, so the Decode permit was released.
     Released,
-    /// The arbitration did not touch the decode permit.
+    /// The arbitration did not touch the Decode permit.
     Unchanged,
 }
 
@@ -174,14 +233,35 @@ pub enum PermitEvent {
 pub struct Arbitration {
     /// The class selected for the next dispatch opportunity.
     pub selected: QueueClass,
-    /// For a DECODE selection, the selected operation (oldest aging anchor).
+    /// The selected operation. Decode selection uses oldest-anchor order.
     pub op_id: Option<String>,
-    /// What happened to the module-held decode permit.
+    /// What happened to the module-held Decode permit.
     pub permit_event: PermitEvent,
 }
 
-/// Aggregate scheduler measurements, mirroring the `decode-sched-manifest-v1`
-/// evidence record fields.
+/// A queue/execution measurement tagged with the normative queue identifier.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueueExecutionTelemetry {
+    pub queue: QueueClass,
+    pub queue_identifier: &'static str,
+    pub work_kind: Option<QuantumWorkKind>,
+    pub op_id: String,
+    pub queued_ms: u64,
+    pub dispatched_at_ms: u64,
+    pub queue_wait_ms: u64,
+    pub execution_ms: Option<u64>,
+    pub ttft_ms: Option<u64>,
+}
+
+/// Outcome of a production embed or rerank operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmbedServiceOutcome {
+    Completed { latency_ms: u64 },
+    Failed,
+    TimedOut,
+}
+
+/// Aggregate scheduler measurements and production-load test hooks.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Measurements {
     pub queue_depth_samples: Vec<u32>,
@@ -191,10 +271,44 @@ pub struct Measurements {
     pub sequence_traces: Vec<String>,
     pub cancellation_latency_ms: Vec<u64>,
     pub deadline_latency_ms: Vec<u64>,
+    pub queue_execution: Vec<QueueExecutionTelemetry>,
+    pub embed_service_outcomes: Vec<EmbedServiceOutcome>,
 }
 
-/// The DECODE scheduler. Holds one queue per class, the operation table, the
-/// module-held decode permit, the weighted fair-cycle credits, and measurements.
+impl Measurements {
+    /// The nearest-rank p95 over completed embeds. Failures are deliberately not
+    /// dropped: [`Self::embed_load_v1_slo_met`] rejects a run containing any.
+    pub fn completed_embed_p95_ms(&self) -> Option<u64> {
+        let mut latencies: Vec<u64> = self
+            .embed_service_outcomes
+            .iter()
+            .filter_map(|outcome| match outcome {
+                EmbedServiceOutcome::Completed { latency_ms } => Some(*latency_ms),
+                EmbedServiceOutcome::Failed | EmbedServiceOutcome::TimedOut => None,
+            })
+            .collect();
+        if latencies.is_empty() {
+            return None;
+        }
+        latencies.sort_unstable();
+        let rank = (latencies.len() * 95).div_ceil(100).max(1);
+        latencies.get(rank - 1).copied()
+    }
+
+    /// Check the shipped `embed-load-v1` latency target. A failed or timed-out
+    /// embed is a breach even when the completed samples meet nearest-rank p95.
+    pub fn embed_load_v1_slo_met(&self) -> bool {
+        self.embed_service_outcomes
+            .iter()
+            .all(|outcome| matches!(outcome, EmbedServiceOutcome::Completed { .. }))
+            && self
+                .completed_embed_p95_ms()
+                .is_some_and(|p95| p95 <= EMBED_LOAD_V1_EMBED_P95_SLO_MS)
+    }
+}
+
+/// The scheduler holds one queue per normative class, the operation table, the
+/// Decode permit, weighted fair-cycle credits, and production telemetry.
 #[derive(Clone, Debug)]
 pub struct DecodeScheduler {
     config: DecodeSchedulerConfig,
@@ -203,15 +317,25 @@ pub struct DecodeScheduler {
     bulk: VecDeque<String>,
     decode: VecDeque<String>,
     ops: BTreeMap<String, DecodeOp>,
+    quantum_work: BTreeMap<String, QuantumWorkKind>,
+    revoked_at_ms: BTreeMap<String, u64>,
+    active_quantum: Option<String>,
     permit_held: bool,
-    /// Smooth weighted round-robin credits keyed by class.
+    /// Smooth weighted round-robin credits keyed by workload class.
     credits: BTreeMap<QueueClass, i64>,
     measurements: Measurements,
 }
 
 impl DecodeScheduler {
     pub fn new(config: DecodeSchedulerConfig) -> Self {
-        assert!(config.production_n > 1, "N=1 is prohibited");
+        assert!(
+            matches!(config.production_n, 8 | 16 | 32),
+            "production N must be one of 8, 16, or 32"
+        );
+        assert!(
+            config.decode_weight > 0 && config.interactive_weight > 0 && config.bulk_weight > 0,
+            "every weighted workload class must have a positive weight"
+        );
         Self {
             config,
             control: VecDeque::new(),
@@ -219,10 +343,18 @@ impl DecodeScheduler {
             bulk: VecDeque::new(),
             decode: VecDeque::new(),
             ops: BTreeMap::new(),
+            quantum_work: BTreeMap::new(),
+            revoked_at_ms: BTreeMap::new(),
+            active_quantum: None,
             permit_held: false,
             credits: BTreeMap::new(),
             measurements: Measurements::default(),
         }
+    }
+
+    /// Build the shipped scheduler rather than a test-only tuned configuration.
+    pub fn shipped_embed_load_v1() -> Self {
+        Self::new(DecodeSchedulerConfig::shipped_embed_load_v1())
     }
 
     pub fn config(&self) -> &DecodeSchedulerConfig {
@@ -237,21 +369,46 @@ impl DecodeScheduler {
         self.permit_held
     }
 
+    pub fn active_quantum(&self) -> Option<&str> {
+        self.active_quantum.as_deref()
+    }
+
     pub fn op(&self, op_id: &str) -> Option<&DecodeOp> {
         self.ops.get(op_id)
     }
 
-    /// Number of queued operations across all classes.
+    /// Return a scheduler-visible queue depth for production telemetry and tests.
+    pub fn queued_count_for(&self, class: QueueClass) -> usize {
+        self.queue(class).len()
+    }
+
+    /// Number of queued operations across all normative classes.
     pub fn queued_count(&self) -> usize {
         self.control.len() + self.interactive.len() + self.bulk.len() + self.decode.len()
+    }
+
+    /// Return the kind of bounded work associated with an operation.
+    pub fn quantum_work_kind(&self, op_id: &str) -> Option<QuantumWorkKind> {
+        self.quantum_work.get(op_id).copied()
+    }
+
+    /// Return the largest legal next committed span for bounded work.
+    pub fn quantum_budget(&self, op_id: &str) -> Option<u32> {
+        let kind = self.quantum_work_kind(op_id)?;
+        let op = self.ops.get(op_id)?;
+        Some(
+            self.config
+                .quantum_tokens(kind)
+                .min(op.max_tokens.saturating_sub(op.committed_tokens)),
+        )
     }
 
     fn queue_mut(&mut self, class: QueueClass) -> &mut VecDeque<String> {
         match class {
             QueueClass::Control => &mut self.control,
             QueueClass::Interactive => &mut self.interactive,
-            QueueClass::Decode => &mut self.decode,
             QueueClass::Bulk => &mut self.bulk,
+            QueueClass::Decode => &mut self.decode,
         }
     }
 
@@ -259,25 +416,110 @@ impl DecodeScheduler {
         match class {
             QueueClass::Control => &self.control,
             QueueClass::Interactive => &self.interactive,
-            QueueClass::Decode => &self.decode,
             QueueClass::Bulk => &self.bulk,
+            QueueClass::Decode => &self.decode,
         }
     }
 
-    /// Admit a new DECODE operation. Its aging anchor starts at admission time.
+    fn is_queued(&self, op_id: &str) -> bool {
+        [
+            QueueClass::Control,
+            QueueClass::Interactive,
+            QueueClass::Bulk,
+            QueueClass::Decode,
+        ]
+        .into_iter()
+        .any(|class| self.queue(class).iter().any(|id| id == op_id))
+    }
+
+    /// Admit Decode work. Decode spans are bounded by the shipped production N.
     pub fn admit_decode(&mut self, op: DecodeOp) {
+        self.admit_quantum_work(QueueClass::Decode, QuantumWorkKind::Decode, op);
+    }
+
+    /// Admit native MTP work. It shares the Decode queue and the same N-token
+    /// committed boundary as ordinary Decode work.
+    pub fn admit_mtp(&mut self, op: DecodeOp) {
+        self.admit_quantum_work(QueueClass::Decode, QuantumWorkKind::Mtp, op);
+    }
+
+    /// Admit prefill work to an Interactive or Bulk workload queue. Prefill uses
+    /// the production N-token quantum so it can yield to embeds and controls.
+    pub fn admit_prefill(
+        &mut self,
+        class: QueueClass,
+        op_id: impl Into<String>,
+        admitted_at_ms: u64,
+        max_tokens: u32,
+    ) {
+        assert!(
+            matches!(class, QueueClass::Interactive | QueueClass::Bulk),
+            "prefill belongs to Interactive or Bulk"
+        );
+        let op_id = op_id.into();
+        self.admit_quantum_work(
+            class,
+            QuantumWorkKind::Prefill,
+            DecodeOp {
+                op_id,
+                generation_id: String::new(),
+                admitted_at_ms,
+                anchor_ms: admitted_at_ms,
+                committed_tokens: 0,
+                max_tokens,
+                resident: false,
+                cancelled_at_ms: None,
+                deadline_at_ms: None,
+            },
+        );
+    }
+
+    fn admit_quantum_work(&mut self, class: QueueClass, kind: QuantumWorkKind, op: DecodeOp) {
         assert_eq!(
             op.anchor_ms, op.admitted_at_ms,
             "anchor starts at admission"
         );
-        self.decode.push_back(op.op_id.clone());
-        self.ops.insert(op.op_id.clone(), op);
+        assert!(
+            op.max_tokens > 0,
+            "bounded work needs a positive token budget"
+        );
+        assert!(
+            matches!(
+                (class, kind),
+                (
+                    QueueClass::Decode,
+                    QuantumWorkKind::Decode | QuantumWorkKind::Mtp
+                ) | (
+                    QueueClass::Interactive | QueueClass::Bulk,
+                    QuantumWorkKind::Prefill
+                )
+            ),
+            "work kind must use its normative scheduler queue"
+        );
+        let op_id = op.op_id.clone();
+        self.queue_mut(class).push_back(op_id.clone());
+        self.quantum_work.insert(op_id.clone(), kind);
+        self.ops.insert(op_id, op);
         self.sample_depth();
     }
 
-    /// Admit a non-DECODE operation (Control, Interactive, or Bulk).
+    /// Admit ordinary unbounded service work to Control, Interactive, or Bulk.
     pub fn admit_other(&mut self, class: QueueClass, op_id: impl Into<String>) {
-        assert_ne!(class, QueueClass::Decode, "use admit_decode for DECODE");
+        self.admit_other_at(class, op_id, 0);
+    }
+
+    /// Admit ordinary service work with its actual queue timestamp for telemetry.
+    pub fn admit_other_at(
+        &mut self,
+        class: QueueClass,
+        op_id: impl Into<String>,
+        admitted_at_ms: u64,
+    ) {
+        assert_ne!(
+            class,
+            QueueClass::Decode,
+            "use Decode, MTP, or prefill admission"
+        );
         let op_id = op_id.into();
         self.queue_mut(class).push_back(op_id.clone());
         self.ops.insert(
@@ -285,8 +527,8 @@ impl DecodeScheduler {
             DecodeOp {
                 op_id,
                 generation_id: String::new(),
-                admitted_at_ms: 0,
-                anchor_ms: 0,
+                admitted_at_ms,
+                anchor_ms: admitted_at_ms,
                 committed_tokens: 0,
                 max_tokens: 0,
                 resident: false,
@@ -297,14 +539,23 @@ impl DecodeScheduler {
         self.sample_depth();
     }
 
+    /// Embed traffic is permanently admitted to the Interactive lane.
+    pub fn admit_embed(&mut self, op_id: impl Into<String>, admitted_at_ms: u64) {
+        self.admit_other_at(QueueClass::Interactive, op_id, admitted_at_ms);
+    }
+
+    /// Rerank traffic shares the permanently available Interactive service lane.
+    pub fn admit_rerank(&mut self, op_id: impl Into<String>, admitted_at_ms: u64) {
+        self.admit_other_at(QueueClass::Interactive, op_id, admitted_at_ms);
+    }
+
     fn sample_depth(&mut self) {
         self.measurements
             .queue_depth_samples
             .push(self.queued_count() as u32);
     }
 
-    /// The oldest continuously runnable DECODE operation: the one with the
-    /// smallest aging anchor, ties broken by admission order (FIFO).
+    /// The oldest waiting Decode operation, with admission order as the tie-breaker.
     fn select_decode(&self) -> Option<String> {
         self.decode
             .iter()
@@ -317,30 +568,26 @@ impl DecodeScheduler {
             .map(|op| op.op_id.clone())
     }
 
-    /// The age in milliseconds of the oldest-anchor DECODE operation.
-    fn oldest_decode_age_ms(&self, now_ms: u64) -> Option<u64> {
-        self.select_decode()
-            .and_then(|op_id| self.ops.get(&op_id))
-            .map(|op| now_ms.saturating_sub(op.anchor_ms))
+    fn take_decode(&mut self) -> Option<String> {
+        let op_id = self.select_decode()?;
+        let position = self.decode.iter().position(|id| id == &op_id)?;
+        self.decode.remove(position)
     }
 
     fn runnable_classes(&self) -> Vec<QueueClass> {
         [
             QueueClass::Interactive,
-            QueueClass::Decode,
             QueueClass::Bulk,
+            QueueClass::Decode,
         ]
         .into_iter()
         .filter(|class| !self.queue(*class).is_empty())
         .collect()
     }
 
-    /// Smooth weighted round-robin selection over the runnable classes. Returns
-    /// the class that wins the next fair-cycle opportunity.
+    /// Smooth weighted round-robin selection over the runnable workload classes.
     fn fair_cycle_pick(&mut self, runnable: &[QueueClass]) -> QueueClass {
-        // Add each runnable class's weight to its credit, then pick the class with
-        // the largest credit and subtract the total runnable weight from it. Over a
-        // stable runnable set this distributes selections in proportion to weights.
+        self.credits.retain(|class, _| runnable.contains(class));
         let total: i64 = runnable
             .iter()
             .map(|class| self.config.weight(*class) as i64)
@@ -353,83 +600,100 @@ impl DecodeScheduler {
             .iter()
             .max_by_key(|class| self.credits.get(class).copied().unwrap_or(0))
             .expect("runnable is non-empty");
-        if let Some(credit) = self.credits.get_mut(&picked) {
-            *credit -= total;
-        }
+        *self.credits.entry(picked).or_default() -= total;
         picked
     }
 
-    /// Arbitrate the next dispatch opportunity at a quantum boundary.
+    fn record_dispatch(&mut self, class: QueueClass, op_id: &str, now_ms: u64) {
+        let work_kind = self.quantum_work.get(op_id).copied();
+        let Some(op) = self.ops.get_mut(op_id) else {
+            return;
+        };
+        let queued_ms = op.admitted_at_ms;
+        let queue_wait_ms = now_ms.saturating_sub(queued_ms);
+        if work_kind.is_some() {
+            self.active_quantum = Some(op_id.to_string());
+            op.resident = true;
+        }
+        self.measurements
+            .per_op_waiting_ms
+            .push((op_id.to_string(), queue_wait_ms));
+        self.measurements
+            .queue_execution
+            .push(QueueExecutionTelemetry {
+                queue: class,
+                queue_identifier: class.identifier(),
+                work_kind,
+                op_id: op_id.to_string(),
+                queued_ms,
+                dispatched_at_ms: now_ms,
+                queue_wait_ms,
+                execution_ms: None,
+                ttft_ms: None,
+            });
+    }
+
+    fn arbitration(
+        &mut self,
+        selected: QueueClass,
+        op_id: Option<String>,
+        permit_event: PermitEvent,
+        now_ms: u64,
+    ) -> Arbitration {
+        if let Some(op_id) = op_id.as_deref() {
+            self.record_dispatch(selected, op_id, now_ms);
+        }
+        self.sample_depth();
+        Arbitration {
+            selected,
+            op_id,
+            permit_event,
+        }
+    }
+
+    /// Arbitrate exactly one committed-boundary dispatch opportunity.
     ///
-    /// Precedence: runnable Control first; else an aged DECODE operation; else the
-    /// weighted fair cycle over runnable Interactive/DECODE/Bulk. The decode permit
-    /// is released whenever a non-DECODE class wins while DECODE is runnable, and
-    /// retained when DECODE is the sole runnable class.
+    /// Control has strict precedence. Once Control is empty, Interactive, Bulk, and
+    /// Decode are selected only by the weighted fair cycle. Decode never obtains an
+    /// aging-based priority bypass because that would remove it from the fair cycle.
     pub fn arbitrate(&mut self, now_ms: u64) -> Option<Arbitration> {
+        if self.active_quantum.is_some() {
+            return None;
+        }
         self.sample_depth();
 
-        // 1. Control has strict precedence.
         if !self.control.is_empty() {
             let op_id = self.control.pop_front();
-            return Some(Arbitration {
-                selected: QueueClass::Control,
-                op_id,
-                permit_event: self.set_permit(false),
-            });
+            let permit_event = self.set_permit(false);
+            return Some(self.arbitration(QueueClass::Control, op_id, permit_event, now_ms));
         }
 
         let runnable = self.runnable_classes();
         if runnable.is_empty() {
             return None;
         }
-
-        // 2. An aged DECODE operation receives the next dispatch opportunity.
         let decode_runnable = runnable.contains(&QueueClass::Decode);
-        if decode_runnable {
-            if let Some(age) = self.oldest_decode_age_ms(now_ms) {
-                if age >= self.config.decode_aging_window_ms {
-                    let op_id = self.select_decode();
-                    return Some(Arbitration {
-                        selected: QueueClass::Decode,
-                        op_id,
-                        permit_event: self.set_permit(true),
-                    });
-                }
-            }
-        }
-
-        // 3. DECODE is the sole runnable class: consecutive quanta without release.
-        if runnable == [QueueClass::Decode] {
-            let op_id = self.select_decode();
-            return Some(Arbitration {
-                selected: QueueClass::Decode,
-                op_id,
-                permit_event: self.set_permit(true),
-            });
-        }
-
-        // 4. Weighted fair cycle over the runnable classes.
-        let picked = self.fair_cycle_pick(&runnable);
-        if picked == QueueClass::Decode {
-            let op_id = self.select_decode();
-            Some(Arbitration {
-                selected: QueueClass::Decode,
-                op_id,
-                permit_event: self.set_permit(true),
-            })
+        let picked = if runnable == [QueueClass::Decode] {
+            QueueClass::Decode
         } else {
-            let op_id = self.queue_mut(picked).pop_front();
-            Some(Arbitration {
-                selected: picked,
-                op_id,
-                // Yield-on-contention: a non-DECODE win releases the decode permit
-                // whenever DECODE was runnable.
-                permit_event: self.set_permit(!decode_runnable),
-            })
-        }
+            self.fair_cycle_pick(&runnable)
+        };
+        let op_id = if picked == QueueClass::Decode {
+            self.take_decode()
+        } else {
+            self.queue_mut(picked).pop_front()
+        };
+        let permit_event = if picked == QueueClass::Decode {
+            self.set_permit(true)
+        } else {
+            // A non-Decode winner yields the permit when resident Decode work was
+            // competing. This leaves the Interactive lane serviceable under decode.
+            self.set_permit(!decode_runnable)
+        };
+        Some(self.arbitration(picked, op_id, permit_event, now_ms))
     }
 
-    /// Set the module-held decode permit, returning the lifecycle event.
+    /// Set the module-held Decode permit, returning the lifecycle event.
     fn set_permit(&mut self, held: bool) -> PermitEvent {
         let event = match (self.permit_held, held) {
             (false, true) => PermitEvent::Acquired,
@@ -442,48 +706,110 @@ impl DecodeScheduler {
         event
     }
 
-    /// Record that the selected DECODE operation began a quantum: pop it from the
-    /// head of the DECODE queue if present (a resident continuation may not be at
-    /// the head), mark it resident, and record per-operation waiting time.
+    /// Begin a Decode or MTP quantum when resuming after a worker handoff interrupted
+    /// normal arbitration. Ordinary dispatch uses [`Self::arbitrate`], which begins
+    /// bounded work as it selects it.
     pub fn begin_decode_quantum(&mut self, op_id: &str, now_ms: u64) {
+        if self.active_quantum.as_deref() == Some(op_id) {
+            return;
+        }
+        if self.active_quantum.is_some() || !self.quantum_work.contains_key(op_id) {
+            return;
+        }
         if let Some(position) = self.decode.iter().position(|id| id == op_id) {
             self.decode.remove(position);
         }
-        if let Some(op) = self.ops.get_mut(op_id) {
-            let waiting = now_ms.saturating_sub(op.anchor_ms);
-            self.measurements
-                .per_op_waiting_ms
-                .push((op_id.to_string(), waiting));
-            op.resident = true;
-        }
+        self.record_dispatch(QueueClass::Decode, op_id, now_ms);
         self.sample_depth();
     }
 
-    /// Re-enqueue a resident continuation after a quantum boundary. It competes
-    /// through the same DECODE queue, fair-cycle, and aging machinery as a new
-    /// admission. The aging anchor was already advanced by [`Self::commit_quantum`].
+    /// Record a bounded operation's execution time and optional time-to-first-token.
+    pub fn record_execution(&mut self, op_id: &str, finished_at_ms: u64, ttft_ms: Option<u64>) {
+        if let Some(sample) = self
+            .measurements
+            .queue_execution
+            .iter_mut()
+            .rev()
+            .find(|sample| sample.op_id == op_id && sample.execution_ms.is_none())
+        {
+            sample.execution_ms = Some(finished_at_ms.saturating_sub(sample.dispatched_at_ms));
+            sample.ttft_ms = ttft_ms;
+        }
+    }
+
+    /// Record an embed or rerank outcome for the shipped `embed-load-v1` SLO.
+    pub fn record_embed_service_outcome(&mut self, outcome: EmbedServiceOutcome) {
+        self.measurements.embed_service_outcomes.push(outcome);
+    }
+
+    /// Re-enqueue a Decode or MTP continuation after a committed boundary.
     pub fn requeue_continuation(&mut self, op_id: &str) {
-        if !self.decode.iter().any(|id| id == op_id) {
+        let can_continue = self
+            .ops
+            .get(op_id)
+            .is_some_and(|op| op.cancelled_at_ms.is_none())
+            && !self.revoked_at_ms.contains_key(op_id)
+            && matches!(
+                self.quantum_work.get(op_id),
+                Some(QuantumWorkKind::Decode | QuantumWorkKind::Mtp)
+            )
+            && self.active_quantum.is_none();
+        if can_continue && !self.decode.iter().any(|id| id == op_id) {
             self.decode.push_back(op_id.to_string());
+            self.measurements.continuation_count += 1;
+            self.sample_depth();
         }
-        self.measurements.continuation_count += 1;
-        self.sample_depth();
     }
 
-    /// Record that a DECODE operation committed a quantum: advance the aging
-    /// anchor to the most recent committed-token time and update the committed
-    /// count. Updating the anchor prevents the operation from retaining aged
-    /// priority over an older operation.
-    pub fn commit_quantum(&mut self, op_id: &str, committed_tokens: u32, now_ms: u64) {
-        if let Some(op) = self.ops.get_mut(op_id) {
-            op.committed_tokens = committed_tokens;
-            op.anchor_ms = now_ms;
+    /// Commit a bounded quantum, enforcing the production-N limit.
+    pub fn try_commit_quantum(
+        &mut self,
+        op_id: &str,
+        committed_tokens: u32,
+        now_ms: u64,
+    ) -> Result<(), QuantumCommitError> {
+        let kind = self
+            .quantum_work
+            .get(op_id)
+            .copied()
+            .ok_or(QuantumCommitError::UnknownOperation)?;
+        if self.active_quantum.as_deref() != Some(op_id) {
+            return Err(QuantumCommitError::NotActiveQuantum);
         }
+        let quantum_budget = self.config.quantum_tokens(kind);
+        let op = self
+            .ops
+            .get_mut(op_id)
+            .ok_or(QuantumCommitError::UnknownOperation)?;
+        if committed_tokens <= op.committed_tokens {
+            return Err(QuantumCommitError::NonMonotonicCommit);
+        }
+        if committed_tokens > op.max_tokens {
+            return Err(QuantumCommitError::ExceedsMaximumTokens);
+        }
+        if committed_tokens - op.committed_tokens > quantum_budget {
+            return Err(QuantumCommitError::ExceedsQuantumBudget);
+        }
+        op.committed_tokens = committed_tokens;
+        op.anchor_ms = now_ms;
+        self.active_quantum = None;
+        Ok(())
+    }
+
+    /// Compatibility wrapper for existing callers. Invalid commits are ignored;
+    /// production callers that need a reason use [`Self::try_commit_quantum`].
+    pub fn commit_quantum(&mut self, op_id: &str, committed_tokens: u32, now_ms: u64) {
+        let _ = self.try_commit_quantum(op_id, committed_tokens, now_ms);
     }
 
     /// Remove a completed or terminated operation from the scheduler entirely.
     pub fn remove_op(&mut self, op_id: &str) {
         self.ops.remove(op_id);
+        self.quantum_work.remove(op_id);
+        self.revoked_at_ms.remove(op_id);
+        if self.active_quantum.as_deref() == Some(op_id) {
+            self.active_quantum = None;
+        }
         for queue in [
             &mut self.control,
             &mut self.interactive,
@@ -495,46 +821,56 @@ impl DecodeScheduler {
         self.sample_depth();
     }
 
-    /// Request cancellation of an operation. If it is still queued (not resident
-    /// in an active quantum), it is removed immediately with zero cancellation
-    /// latency and consumes no crash budget. Otherwise the cancellation is recorded
-    /// for evaluation at the next boundary.
-    pub fn request_cancel(&mut self, op_id: &str, now_ms: u64) -> CancelResult {
-        let queued = self.decode.iter().any(|id| id == op_id)
-            || self.interactive.iter().any(|id| id == op_id)
-            || self.bulk.iter().any(|id| id == op_id)
-            || self.control.iter().any(|id| id == op_id);
-        let is_resident = self.ops.get(op_id).map(|op| op.resident).unwrap_or(false);
-        if queued && !is_resident {
-            self.remove_op(op_id);
-            self.measurements.cancellation_latency_ms.push(0);
-            CancelResult::RemovedQueued
-        } else {
-            if let Some(op) = self.ops.get_mut(op_id) {
-                op.cancelled_at_ms = Some(now_ms);
-            }
-            CancelResult::DeferredToBoundary
+    fn request_boundary_control(
+        &mut self,
+        op_id: &str,
+        now_ms: u64,
+        is_revoke: bool,
+    ) -> CancelResult {
+        if !self.ops.contains_key(op_id) {
+            return CancelResult::NotFound;
         }
+        if self.is_queued(op_id) && self.active_quantum.as_deref() != Some(op_id) {
+            self.remove_op(op_id);
+            if !is_revoke {
+                self.measurements.cancellation_latency_ms.push(0);
+            }
+            return CancelResult::RemovedQueued;
+        }
+        if self.active_quantum.as_deref() == Some(op_id) {
+            if let Some(op) = self.ops.get_mut(op_id) {
+                if !is_revoke {
+                    op.cancelled_at_ms = Some(now_ms);
+                }
+            }
+            if is_revoke {
+                self.revoked_at_ms.insert(op_id.to_string(), now_ms);
+            }
+            return CancelResult::DeferredToBoundary;
+        }
+        CancelResult::NotFound
     }
 
-    /// Remove queued operations whose deadline has expired. Returns the removed op
-    /// IDs. Deadline expiry while queued is a clean removal: no crash-budget
-    /// consumption and no dispatch.
+    /// Abort an operation. An active quantum observes this only after it commits.
+    pub fn request_cancel(&mut self, op_id: &str, now_ms: u64) -> CancelResult {
+        self.request_boundary_control(op_id, now_ms, false)
+    }
+
+    /// Emergency revoke an operation. An active quantum emits `artifact_revoked`
+    /// accounting at its next committed boundary rather than exposing uncommitted work.
+    pub fn request_revoke(&mut self, op_id: &str, now_ms: u64) -> CancelResult {
+        self.request_boundary_control(op_id, now_ms, true)
+    }
+
+    /// Remove queued operations whose deadline has expired. Deadline expiry while
+    /// queued is a clean removal and never dispatches work.
     pub fn remove_expired_deadlines(&mut self, now_ms: u64) -> Vec<String> {
         let expired: Vec<String> = self
             .ops
             .values()
             .filter(|op| {
-                op.deadline_at_ms
-                    .map(|deadline| deadline <= now_ms)
-                    .unwrap_or(false)
-            })
-            .filter(|op| {
-                // Only remove operations still waiting in a queue.
-                self.decode.iter().any(|id| *id == op.op_id)
-                    || self.interactive.iter().any(|id| *id == op.op_id)
-                    || self.bulk.iter().any(|id| *id == op.op_id)
-                    || self.control.iter().any(|id| *id == op.op_id)
+                op.deadline_at_ms.is_some_and(|deadline| deadline <= now_ms)
+                    && self.is_queued(&op.op_id)
             })
             .map(|op| op.op_id.clone())
             .collect();
@@ -548,40 +884,35 @@ impl DecodeScheduler {
         expired
     }
 
-    /// Evaluate a boundary for an operation, applying the binding precedence order
-    /// terminal completion > cancellation > deadline.
+    /// Evaluate a committed boundary. Revocation is checked first; abort and
+    /// deadlines apply only to non-terminal progress boundaries.
     pub fn evaluate_boundary(
         &self,
         op_id: &str,
         boundary: BoundaryKind,
         now_ms: u64,
     ) -> BoundaryOutcome {
-        let op = match self.ops.get(op_id) {
-            Some(op) => op,
-            None => return BoundaryOutcome::Continue,
+        let Some(op) = self.ops.get(op_id) else {
+            return BoundaryOutcome::Continue;
         };
+        if self
+            .revoked_at_ms
+            .get(op_id)
+            .is_some_and(|revoked_at| *revoked_at <= now_ms)
+        {
+            return BoundaryOutcome::Revoked;
+        }
         match boundary {
-            // A terminal completion always wins; pending cancellation is a no-op and
-            // a deadline that expired during the final quantum does not retroactively
-            // fail the completed result.
-            //
-            // A worker-reported `Final(Cancelled)` is recorded here as
-            // `Completed(Cancelled)` for measurement. Intentional cross-crate
-            // divergence: the S3 supervisor classifies the same frame as its
-            // cancellation decision with payload suppression. The observable
-            // outcome is identical in both (finish reason `cancelled`, no
-            // payload); only the internal classification differs.
             BoundaryKind::Final(reason) => BoundaryOutcome::Completed(reason),
             BoundaryKind::Progress => {
-                if let Some(cancelled_at) = op.cancelled_at_ms {
-                    if cancelled_at <= now_ms {
-                        return BoundaryOutcome::Cancelled;
-                    }
+                if op
+                    .cancelled_at_ms
+                    .is_some_and(|cancelled_at| cancelled_at <= now_ms)
+                {
+                    return BoundaryOutcome::Cancelled;
                 }
-                if let Some(deadline) = op.deadline_at_ms {
-                    if deadline <= now_ms {
-                        return BoundaryOutcome::DeadlineExceeded;
-                    }
+                if op.deadline_at_ms.is_some_and(|deadline| deadline <= now_ms) {
+                    return BoundaryOutcome::DeadlineExceeded;
                 }
                 BoundaryOutcome::Continue
             }
@@ -589,13 +920,15 @@ impl DecodeScheduler {
     }
 }
 
-/// The result of a cancellation request.
+/// The result of an abort or revoke request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CancelResult {
-    /// The operation was queued and removed immediately (zero latency, no budget).
+    /// The operation was queued and removed immediately at a committed boundary.
     RemovedQueued,
-    /// The operation is resident; cancellation is evaluated at the next boundary.
+    /// The operation is active, so the control is observed at the next boundary.
     DeferredToBoundary,
+    /// The operation is no longer scheduler-owned.
+    NotFound,
 }
 
 /// The module-side validator for one logical generation's quantum-sequencing
@@ -630,7 +963,10 @@ pub struct ContinueFrame {
 
 impl GenerationProtocol {
     pub fn new(generation_id: impl Into<String>, production_n: u32, max_tokens: u32) -> Self {
-        assert!(production_n > 1, "N=1 is prohibited");
+        assert!(
+            matches!(production_n, 8 | 16 | 32),
+            "production N must be one of 8, 16, or 32"
+        );
         Self {
             generation_id: generation_id.into(),
             production_n,
@@ -758,21 +1094,42 @@ mod tests {
     }
 
     #[test]
-    fn decode_serializes_as_decode() {
-        assert_eq!(QueueClass::Decode.as_str(), "decode");
-        assert_eq!(QueueClass::parse("decode"), Ok(QueueClass::Decode));
-        let encoded = serde_json::to_string(&QueueClass::Decode).expect("serializes");
-        assert_eq!(encoded, "\"decode\"");
+    fn normative_queue_identifiers_and_wire_spellings_are_stable() {
+        for (class, identifier, wire) in [
+            (QueueClass::Control, "Control", "control"),
+            (QueueClass::Interactive, "Interactive", "interactive"),
+            (QueueClass::Bulk, "Bulk", "bulk"),
+            (QueueClass::Decode, "Decode", "decode"),
+        ] {
+            assert_eq!(class.identifier(), identifier);
+            assert_eq!(class.as_str(), wire);
+            assert_eq!(QueueClass::parse(wire), Ok(class));
+            assert_eq!(
+                serde_json::to_string(&class).expect("serializes"),
+                format!("\"{wire}\"")
+            );
+        }
     }
 
     #[test]
-    fn control_has_strict_precedence() {
+    fn control_has_strict_precedence_over_every_workload_class() {
         let mut scheduler = DecodeScheduler::new(DecodeSchedulerConfig::default());
         scheduler.admit_decode(op("d1", 0, 64));
+        scheduler.admit_other(QueueClass::Interactive, "i1");
+        scheduler.admit_other(QueueClass::Bulk, "b1");
         scheduler.admit_other(QueueClass::Control, "c1");
-        let arbitration = scheduler.arbitrate(0).expect("arbitrates");
+        let arbitration = scheduler.arbitrate(10).expect("arbitrates");
         assert_eq!(arbitration.selected, QueueClass::Control);
         assert_eq!(arbitration.op_id.as_deref(), Some("c1"));
+        let telemetry = scheduler
+            .measurements()
+            .queue_execution
+            .last()
+            .expect("control dispatch telemetry");
+        assert_eq!(telemetry.queue_identifier, "Control");
+        assert_eq!(scheduler.queued_count_for(QueueClass::Interactive), 1);
+        assert_eq!(scheduler.queued_count_for(QueueClass::Bulk), 1);
+        assert_eq!(scheduler.queued_count_for(QueueClass::Decode), 1);
     }
 
     #[test]
@@ -795,7 +1152,7 @@ mod tests {
     #[test]
     fn non_decode_win_releases_the_permit() {
         let mut scheduler = DecodeScheduler::new(DecodeSchedulerConfig::default());
-        scheduler.admit_decode(op("d1", 0, 64));
+        scheduler.admit_decode(op("d1", 0, 1_024));
         scheduler.admit_other(QueueClass::Interactive, "e1");
         scheduler.admit_other(QueueClass::Interactive, "e2");
         scheduler.admit_other(QueueClass::Interactive, "e3");
@@ -815,7 +1172,11 @@ mod tests {
                     saw_release = true;
                 }
                 if arbitration.selected == QueueClass::Decode {
-                    scheduler.commit_quantum("d1", 16, tick);
+                    let committed =
+                        scheduler.op("d1").expect("decode exists").committed_tokens + 16;
+                    scheduler
+                        .try_commit_quantum("d1", committed, tick)
+                        .expect("commits at the boundary");
                     scheduler.requeue_continuation("d1");
                 }
             }
@@ -827,22 +1188,57 @@ mod tests {
     }
 
     #[test]
-    fn aged_decode_preempts_fair_cycle() {
+    fn workload_classes_receive_weighted_fair_turns_without_aging_bypass() {
         let config = DecodeSchedulerConfig {
-            decode_aging_window_ms: 100,
+            decode_weight: 4,
+            interactive_weight: 2,
+            bulk_weight: 1,
             ..DecodeSchedulerConfig::default()
         };
         let mut scheduler = DecodeScheduler::new(config);
-        scheduler.admit_decode(op("d1", 0, 64));
-        // Keep Interactive runnable so the fair cycle would otherwise compete.
-        for i in 0..10 {
-            scheduler.admit_other(QueueClass::Interactive, format!("e{i}"));
+        scheduler.admit_decode(op("d1", 0, 20_000));
+        scheduler.admit_other(QueueClass::Interactive, "i0");
+        scheduler.admit_other(QueueClass::Bulk, "b0");
+        let mut interactive_wins = 0u32;
+        let mut bulk_wins = 0u32;
+        let mut decode_wins = 0u32;
+
+        for tick in 0..700u64 {
+            let arbitration = scheduler
+                .arbitrate(tick)
+                .expect("all classes remain runnable");
+            match arbitration.selected {
+                QueueClass::Interactive => {
+                    interactive_wins += 1;
+                    scheduler.admit_other(QueueClass::Interactive, format!("i{tick}"));
+                }
+                QueueClass::Bulk => {
+                    bulk_wins += 1;
+                    scheduler.admit_other(QueueClass::Bulk, format!("b{tick}"));
+                }
+                QueueClass::Decode => {
+                    decode_wins += 1;
+                    let committed =
+                        scheduler.op("d1").expect("decode exists").committed_tokens + 16;
+                    scheduler
+                        .try_commit_quantum("d1", committed, tick)
+                        .expect("within the Decode quantum");
+                    scheduler.requeue_continuation("d1");
+                }
+                QueueClass::Control => panic!("no control work was admitted"),
+            }
         }
-        // Before the aging window elapses, arbitration may pick either class.
-        // After it elapses, the aged DECODE operation must be selected.
-        let arbitration = scheduler.arbitrate(150).expect("arbitrates");
-        assert_eq!(arbitration.selected, QueueClass::Decode);
-        assert_eq!(arbitration.op_id.as_deref(), Some("d1"));
+
+        // The stable weights are 4:2:1, so every workload class participates and
+        // converges to its declared share rather than an aging-priority bypass.
+        assert_eq!((decode_wins, interactive_wins, bulk_wins), (400, 200, 100));
+        let telemetry_ids: std::collections::BTreeSet<_> = scheduler
+            .measurements()
+            .queue_execution
+            .iter()
+            .map(|sample| sample.queue_identifier)
+            .collect();
+        assert_eq!(telemetry_ids, ["Bulk", "Decode", "Interactive"].into());
     }
 
     #[test]
@@ -869,50 +1265,124 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_aging_guarantee_one_commit_per_window() {
-        // In every aging window where a DECODE op is continuously runnable and
-        // Control does not occupy the scheduler, at least one DECODE quantum commits.
-        let config = DecodeSchedulerConfig {
-            decode_aging_window_ms: 100,
-            ..DecodeSchedulerConfig::default()
-        };
-        let window = config.decode_aging_window_ms;
-        let mut scheduler = DecodeScheduler::new(config);
-        scheduler.admit_decode(op("d1", 0, 1024));
-        for i in 0..50 {
-            scheduler.admit_other(QueueClass::Interactive, format!("e{i}"));
-        }
-        let mut commit_times: Vec<u64> = Vec::new();
-        let mut committed = 0u32;
-        for tick in 0..1000u64 {
-            scheduler.remove_expired_deadlines(tick);
-            if let Some(arbitration) = scheduler.arbitrate(tick) {
-                match arbitration.selected {
-                    QueueClass::Decode => {
-                        let op_id = arbitration.op_id.clone().expect("decode op");
-                        committed += 16;
-                        scheduler.commit_quantum(&op_id, committed, tick);
-                        commit_times.push(tick);
-                        scheduler.requeue_continuation(&op_id);
-                    }
-                    QueueClass::Interactive => {
-                        scheduler.admit_other(QueueClass::Interactive, format!("refill{tick}"));
-                    }
-                    _ => {}
+    fn prefill_decode_and_mtp_work_are_bounded_by_production_n() {
+        let mut scheduler = DecodeScheduler::shipped_embed_load_v1();
+        scheduler.admit_prefill(QueueClass::Interactive, "p1", 0, 64);
+        let prefill = scheduler.arbitrate(0).expect("prefill dispatches");
+        assert_eq!(prefill.selected, QueueClass::Interactive);
+        assert_eq!(scheduler.quantum_budget("p1"), Some(16));
+        assert_eq!(
+            scheduler.try_commit_quantum("p1", 17, 1),
+            Err(QuantumCommitError::ExceedsQuantumBudget)
+        );
+        scheduler
+            .try_commit_quantum("p1", 16, 1)
+            .expect("prefill commits at the boundary");
+
+        scheduler.admit_mtp(op("m1", 2, 64));
+        let mtp = scheduler.arbitrate(2).expect("MTP dispatches");
+        assert_eq!(mtp.selected, QueueClass::Decode);
+        assert_eq!(
+            scheduler.quantum_work_kind("m1"),
+            Some(QuantumWorkKind::Mtp)
+        );
+        assert_eq!(
+            scheduler.try_commit_quantum("m1", 17, 3),
+            Err(QuantumCommitError::ExceedsQuantumBudget)
+        );
+        scheduler
+            .try_commit_quantum("m1", 16, 3)
+            .expect("MTP commits at the boundary");
+
+        scheduler.admit_decode(op("d1", 4, 64));
+        scheduler.arbitrate(4).expect("Decode dispatches");
+        assert_eq!(
+            scheduler.try_commit_quantum("d1", 17, 5),
+            Err(QuantumCommitError::ExceedsQuantumBudget)
+        );
+    }
+
+    #[test]
+    fn revoke_stops_active_work_at_the_next_committed_boundary() {
+        let mut scheduler = DecodeScheduler::shipped_embed_load_v1();
+        scheduler.admit_decode(op("d1", 0, 64));
+        scheduler.arbitrate(0).expect("Decode dispatches");
+        assert_eq!(
+            scheduler.request_revoke("d1", 1),
+            CancelResult::DeferredToBoundary
+        );
+        scheduler
+            .try_commit_quantum("d1", 16, 2)
+            .expect("the already-running quantum can commit");
+        assert_eq!(
+            scheduler.evaluate_boundary("d1", BoundaryKind::Final(FinishReason::StopToken), 2),
+            BoundaryOutcome::Revoked
+        );
+        scheduler.requeue_continuation("d1");
+        assert_eq!(scheduler.queued_count_for(QueueClass::Decode), 0);
+    }
+
+    #[test]
+    fn interactive_embed_and_rerank_service_remain_available_while_decode_is_resident() {
+        let mut scheduler = DecodeScheduler::shipped_embed_load_v1();
+        scheduler.admit_decode(op("d1", 0, 256));
+        scheduler.arbitrate(0).expect("initial Decode dispatch");
+        scheduler
+            .try_commit_quantum("d1", 16, 1)
+            .expect("first Decode boundary");
+        scheduler.requeue_continuation("d1");
+        scheduler.admit_embed("embed-1", 1);
+        scheduler.admit_rerank("rerank-1", 1);
+
+        let mut interactive_dispatches = 0;
+        for tick in 2..8 {
+            let arbitration = scheduler.arbitrate(tick).expect("work remains runnable");
+            match arbitration.selected {
+                QueueClass::Decode => {
+                    let committed =
+                        scheduler.op("d1").expect("Decode exists").committed_tokens + 16;
+                    scheduler
+                        .try_commit_quantum("d1", committed, tick)
+                        .expect("Decode quantum is bounded");
+                    scheduler.requeue_continuation("d1");
+                }
+                QueueClass::Interactive => {
+                    interactive_dispatches += 1;
+                    let op_id = arbitration.op_id.expect("service operation");
+                    scheduler.record_execution(&op_id, tick + 3, Some(1));
+                }
+                QueueClass::Bulk | QueueClass::Control => {
+                    panic!("no bulk or control work admitted")
                 }
             }
         }
-        // The gap between consecutive DECODE commits must never exceed the aging
-        // window (allowing the first commit to occur within the first window).
-        assert!(!commit_times.is_empty(), "decode committed at least once");
         assert!(
-            commit_times[0] <= window,
-            "first commit within the first window"
+            interactive_dispatches > 0,
+            "interactive service must receive fair turns"
         );
-        for window_pair in commit_times.windows(2) {
-            let gap = window_pair[1] - window_pair[0];
-            assert!(gap <= window, "gap {gap} exceeded the aging window");
+        assert!(scheduler
+            .measurements()
+            .queue_execution
+            .iter()
+            .any(|sample| {
+                sample.queue_identifier == "Interactive" && sample.execution_ms.is_some()
+            }));
+    }
+
+    #[test]
+    fn shipped_embed_load_configuration_exposes_a_failing_slo_for_errors() {
+        assert_eq!(SHIPPED_EMBED_LOAD_V1.profile_id, "embed-load-v1");
+        assert_eq!(SHIPPED_EMBED_LOAD_V1.decode_context_ceiling_tokens, 32_768);
+        assert_eq!(SHIPPED_EMBED_LOAD_V1.embed_p95_slo_ms, 150);
+        let mut scheduler = DecodeScheduler::shipped_embed_load_v1();
+        for _ in 0..20 {
+            scheduler
+                .record_embed_service_outcome(EmbedServiceOutcome::Completed { latency_ms: 150 });
         }
+        assert_eq!(scheduler.measurements().completed_embed_p95_ms(), Some(150));
+        assert!(scheduler.measurements().embed_load_v1_slo_met());
+        scheduler.record_embed_service_outcome(EmbedServiceOutcome::TimedOut);
+        assert!(!scheduler.measurements().embed_load_v1_slo_met());
     }
 
     #[test]
