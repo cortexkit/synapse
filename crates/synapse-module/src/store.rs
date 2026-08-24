@@ -15,7 +15,7 @@ use synapse_core::{
 };
 use thiserror::Error;
 
-use crate::PerfKnob;
+use crate::{owned_decode_certification::CertificationRecord, PerfKnob};
 
 const NAMESPACE: &str = "synapse_module";
 const APPROVAL_MIGRATION_SEED_DIGEST: &str =
@@ -548,14 +548,115 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 10,
         statements: r#"
-                  DROP INDEX IF EXISTS cert_rows_owned_decode_identity_v1;
-                  ALTER TABLE cert_rows
-                      ADD COLUMN constraint_runtime_identities_digest TEXT;
-                  CREATE UNIQUE INDEX cert_rows_owned_decode_identity_v2
-                      ON cert_rows (revisioned_machine_profile_hash, profile_activation_epoch,
-                                    model_id, decode_fingerprint, evidence_schema_revision,
-                                    constraint_runtime_identities_digest)
-                      WHERE certification_class = 'measured_owned_decode';
+                   DROP INDEX IF EXISTS cert_rows_owned_decode_identity_v1;
+                   ALTER TABLE cert_rows
+                       ADD COLUMN constraint_runtime_identities_digest TEXT;
+                   CREATE UNIQUE INDEX cert_rows_owned_decode_identity_v2
+                       ON cert_rows (revisioned_machine_profile_hash, profile_activation_epoch,
+                                     model_id, decode_fingerprint, evidence_schema_revision,
+                                     constraint_runtime_identities_digest)
+                       WHERE certification_class = 'measured_owned_decode';
+         "#,
+    },
+    Migration {
+        version: 11,
+        statements: r#"
+                   CREATE TABLE serving_artifacts (
+                       artifact_id TEXT PRIMARY KEY,
+                       model_id TEXT NOT NULL,
+                       source_format TEXT NOT NULL CHECK (source_format = 'gguf'),
+                       source_quantization TEXT NOT NULL CHECK (source_quantization = 'q4_k_m'),
+                       source_digest TEXT NOT NULL,
+                       derived_digest TEXT,
+                       derivation_contract TEXT,
+                       deterministic_inputs_digest TEXT,
+                       verified_derived_digest TEXT,
+                       artifact_json TEXT NOT NULL,
+                       gc_pinned INTEGER NOT NULL DEFAULT 0 CHECK (gc_pinned IN (0, 1)),
+                       ingested_at_ms INTEGER NOT NULL,
+                       CHECK (
+                           (derived_digest IS NULL
+                            AND derivation_contract IS NULL
+                            AND deterministic_inputs_digest IS NULL
+                            AND verified_derived_digest IS NULL)
+                           OR
+                           (derived_digest IS NOT NULL
+                            AND derivation_contract = 'q8-ingest-v1'
+                            AND deterministic_inputs_digest IS NOT NULL
+                            AND verified_derived_digest = derived_digest)
+                       )
+                   );
+                   CREATE UNIQUE INDEX serving_artifacts_source_identity_idx
+                       ON serving_artifacts(model_id, source_digest, derived_digest);
+
+                   CREATE TABLE serving_certification_records (
+                       certification_record_id TEXT PRIMARY KEY,
+                       catalog_fingerprint TEXT NOT NULL,
+                       artifact_id TEXT NOT NULL REFERENCES serving_artifacts(artifact_id),
+                       record_json TEXT NOT NULL,
+                       recorded_at_ms INTEGER NOT NULL
+                   );
+                   CREATE INDEX serving_certification_catalog_idx
+                       ON serving_certification_records(catalog_fingerprint, artifact_id);
+
+                   CREATE TABLE serving_approvals (
+                       catalog_fingerprint TEXT PRIMARY KEY,
+                       certification_record_id TEXT NOT NULL
+                           REFERENCES serving_certification_records(certification_record_id),
+                       artifact_id TEXT NOT NULL REFERENCES serving_artifacts(artifact_id),
+                       state TEXT NOT NULL CHECK (state IN ('enabled', 'disabled', 'revoked')),
+                       reason TEXT,
+                       approved_by TEXT NOT NULL,
+                       approved_at_ms INTEGER NOT NULL,
+                       updated_at_ms INTEGER NOT NULL,
+                       generation INTEGER NOT NULL,
+                       semantic_digest TEXT NOT NULL,
+                       CHECK (
+                           (state = 'enabled' AND reason IS NULL)
+                           OR
+                           (state IN ('disabled', 'revoked') AND reason IS NOT NULL AND length(trim(reason)) > 0)
+                       )
+                   );
+                   CREATE INDEX serving_approvals_certification_idx
+                       ON serving_approvals(certification_record_id, artifact_id);
+
+                   CREATE TABLE serving_sessions (
+                       session_id TEXT PRIMARY KEY,
+                       catalog_fingerprint TEXT NOT NULL,
+                       approval_generation INTEGER NOT NULL,
+                       state TEXT NOT NULL CHECK (
+                           state IN ('active', 'termination_requested', 'finished', 'terminated')
+                       ),
+                       committed_token_count INTEGER NOT NULL DEFAULT 0,
+                       terminal_reason TEXT,
+                       created_at_ms INTEGER NOT NULL,
+                       updated_at_ms INTEGER NOT NULL,
+                       CHECK (
+                           (state IN ('active', 'termination_requested') AND terminal_reason IS NULL)
+                           OR
+                           (state = 'finished' AND terminal_reason = 'completed')
+                           OR
+                           (state = 'terminated' AND terminal_reason = 'artifact_revoked')
+                       )
+                   );
+                   CREATE INDEX serving_sessions_active_artifact_idx
+                       ON serving_sessions(catalog_fingerprint, state);
+
+                   CREATE TABLE serving_retained_states (
+                       state_id TEXT PRIMARY KEY,
+                       catalog_fingerprint TEXT NOT NULL,
+                       valid INTEGER NOT NULL CHECK (valid IN (0, 1)),
+                       invalidation_reason TEXT,
+                       created_at_ms INTEGER NOT NULL,
+                       updated_at_ms INTEGER NOT NULL,
+                       CHECK (
+                           (valid = 1 AND invalidation_reason IS NULL)
+                           OR
+                           (valid = 0 AND invalidation_reason IN ('artifact_disabled', 'artifact_revoked'))
+                       )
+                   );
+                   CREATE INDEX serving_retained_states_artifact_idx
+                       ON serving_retained_states(catalog_fingerprint, valid);
          "#,
     },
 ];
@@ -885,6 +986,313 @@ pub const CERT_EVIDENCE_SCHEMA_REVISION: &str = "owned-decode-cert-evidence-v1";
 // Staged storage API consumed by the epic's runtime slice; remove this allow there.
 #[allow(dead_code)]
 pub const G_DEC_MANIFEST_REVISION: &str = "decode-fixture-registry-v1";
+
+/// The only derivation identifier accepted for an ingest-time Q8 repack.
+pub const Q8_INGEST_DERIVATION_CONTRACT: &str = "q8-ingest-v1";
+/// The schema revision for approval records that control agentic serving.
+pub const SERVING_APPROVAL_SCHEMA_REVISION: &str = "serving-approval-record-v1";
+
+/// A source artifact offered to the serving ingest boundary.
+///
+/// Serving accepts exactly GGUF Q4_K_M source weights. MLX group quantization is
+/// named explicitly so it is rejected rather than silently treated as a compatible
+/// source format.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactIngestRequest {
+    pub model_id: String,
+    pub source_format: String,
+    pub source_quantization: String,
+    pub source_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub q8_derivation: Option<Q8IngestDerivation>,
+}
+
+/// The verified output of the only supported deterministic repack operation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Q8IngestDerivation {
+    pub derivation_contract: String,
+    pub deterministic_inputs_digest: String,
+    pub derived_quantization: String,
+    pub derived_digest: String,
+    pub verified_derived_digest: String,
+}
+
+/// Immutable serving identity for a source artifact and its optional ingest-time
+/// Q8 derivative. Machine and certification data intentionally do not appear here.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelArtifactId {
+    pub artifact_id: String,
+    pub model_id: String,
+    pub source_format: String,
+    pub source_quantization: String,
+    pub source_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derived_digest: Option<String>,
+}
+
+impl ModelArtifactId {
+    fn from_ingest_request(request: &ArtifactIngestRequest) -> Result<Self, SynapseStoreError> {
+        validate_artifact_ingest(request)?;
+        let derived_digest = request
+            .q8_derivation
+            .as_ref()
+            .map(|derivation| derivation.derived_digest.clone());
+        let mut artifact = Self {
+            artifact_id: String::new(),
+            model_id: request.model_id.clone(),
+            source_format: request.source_format.clone(),
+            source_quantization: request.source_quantization.clone(),
+            source_digest: request.source_digest.clone(),
+            derived_digest,
+        };
+        artifact.artifact_id = artifact.expected_artifact_id();
+        Ok(artifact)
+    }
+
+    /// Recompute the deterministic identity used as the durable artifact key.
+    #[must_use]
+    pub fn expected_artifact_id(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"serving-artifact-id-v1\0");
+        digest_text(&mut hasher, &self.model_id);
+        digest_text(&mut hasher, &self.source_format);
+        digest_text(&mut hasher, &self.source_quantization);
+        digest_text(&mut hasher, &self.source_digest);
+        digest_optional_text(&mut hasher, self.derived_digest.as_deref());
+        hex::encode(hasher.finalize())
+    }
+}
+
+/// An immutable complete certification record associated with its ingested source.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct StoredServingCertification {
+    pub artifact: ModelArtifactId,
+    pub record: CertificationRecord,
+    pub recorded_at_ms: u64,
+}
+
+/// The approval state is the serving control point for one catalog fingerprint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServingApprovalState {
+    Enabled,
+    Disabled,
+    Revoked,
+}
+
+impl ServingApprovalState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Enabled => "enabled",
+            Self::Disabled => "disabled",
+            Self::Revoked => "revoked",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, SynapseStoreError> {
+        match value {
+            "enabled" => Ok(Self::Enabled),
+            "disabled" => Ok(Self::Disabled),
+            "revoked" => Ok(Self::Revoked),
+            other => Err(SynapseStoreError::Decode(format!(
+                "unknown serving approval state '{other}'"
+            ))),
+        }
+    }
+}
+
+/// A durable approval row that binds exactly one catalog fingerprint to one
+/// immutable certification record and its source artifact.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServingApprovalRecord {
+    pub schema_revision: String,
+    pub catalog_fingerprint: String,
+    pub certification_record_id: String,
+    pub artifact_id: String,
+    pub state: ServingApprovalState,
+    pub reason: Option<String>,
+    pub approved_by: String,
+    pub approved_at_ms: u64,
+    pub updated_at_ms: u64,
+    pub generation: u64,
+    pub semantic_digest: String,
+}
+
+impl ServingApprovalRecord {
+    fn expected_digest(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"serving-approval-record-v1\0");
+        digest_text(&mut hasher, &self.schema_revision);
+        digest_text(&mut hasher, &self.catalog_fingerprint);
+        digest_text(&mut hasher, &self.certification_record_id);
+        digest_text(&mut hasher, &self.artifact_id);
+        digest_text(&mut hasher, self.state.as_str());
+        digest_optional_text(&mut hasher, self.reason.as_deref());
+        digest_text(&mut hasher, &self.approved_by);
+        digest_text(&mut hasher, &self.approved_at_ms.to_string());
+        hex::encode(hasher.finalize())
+    }
+}
+
+/// A typed refusal produced by serving admission or retained-state continuation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServingRefusal {
+    ArtifactUnapproved,
+    ArtifactDisabled,
+    ArtifactRevoked,
+    CertificationMismatch,
+    RetainedStateInvalidated,
+}
+
+impl ServingRefusal {
+    /// Stable wire vocabulary used by session admission and continuation callers.
+    #[must_use]
+    pub const fn wire_id(self) -> &'static str {
+        match self {
+            Self::ArtifactUnapproved => "artifact_unapproved",
+            Self::ArtifactDisabled => "artifact_disabled",
+            Self::ArtifactRevoked => "artifact_revoked",
+            Self::CertificationMismatch => "artifact_not_certified",
+            Self::RetainedStateInvalidated => "retained_state_invalidated",
+        }
+    }
+}
+
+/// The result of attempting to create a new active serving session.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "outcome")]
+pub enum ServingSessionAdmission {
+    Admitted {
+        session_id: String,
+        catalog_fingerprint: String,
+        approval_generation: u64,
+    },
+    Refused {
+        reason: ServingRefusal,
+    },
+}
+
+/// The result of attempting to continue from a retained state.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "outcome")]
+pub enum ServingContinuationAdmission {
+    Admitted {
+        state_id: String,
+        catalog_fingerprint: String,
+        approval_generation: u64,
+    },
+    Refused {
+        reason: ServingRefusal,
+    },
+}
+
+/// The state of a durable active-session ledger entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServingSessionState {
+    Active,
+    TerminationRequested,
+    Finished,
+    Terminated,
+}
+
+impl ServingSessionState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::TerminationRequested => "termination_requested",
+            Self::Finished => "finished",
+            Self::Terminated => "terminated",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, SynapseStoreError> {
+        match value {
+            "active" => Ok(Self::Active),
+            "termination_requested" => Ok(Self::TerminationRequested),
+            "finished" => Ok(Self::Finished),
+            "terminated" => Ok(Self::Terminated),
+            other => Err(SynapseStoreError::Decode(format!(
+                "unknown serving session state '{other}'"
+            ))),
+        }
+    }
+
+    const fn is_active(self) -> bool {
+        matches!(self, Self::Active | Self::TerminationRequested)
+    }
+}
+
+/// A session row exposed to the engine's boundary and completion paths.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServingSessionRecord {
+    pub session_id: String,
+    pub catalog_fingerprint: String,
+    pub approval_generation: u64,
+    pub state: ServingSessionState,
+    pub committed_token_count: u64,
+    pub terminal_reason: Option<String>,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+/// A retained state is separate from active execution so control operations can
+/// invalidate continuations without terminating a normally disabled session.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetainedServingState {
+    pub state_id: String,
+    pub catalog_fingerprint: String,
+    pub valid: bool,
+    pub invalidation_reason: Option<String>,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+/// The control transaction's side effects and whether the caller may unload now.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ServingControlOutcome {
+    pub approval: ServingApprovalRecord,
+    pub invalidated_retained_states: u64,
+    pub active_sessions: u64,
+    pub termination_requested_sessions: u64,
+    pub unload_artifact: bool,
+}
+
+/// A commit at a proven token boundary either continues normally or delivers the
+/// pending revoke terminal accounting with the committed token count.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub enum ServingBoundaryOutcome {
+    Continue {
+        committed_token_count: u64,
+    },
+    Terminated {
+        terminal_reason: String,
+        tokens_emitted: u64,
+        unload_artifact: bool,
+    },
+}
+
+/// Completion of a natural active session and its deferred unload decision.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ServingSessionCompletion {
+    pub session: ServingSessionRecord,
+    pub unload_artifact: bool,
+}
+
+/// GC observes artifact pins, while serving control deliberately does not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactGcDisposition {
+    Collectable,
+    Pinned,
+}
 
 // Staged storage API consumed by the epic's runtime slice; remove this allow there.
 #[allow(dead_code)]
@@ -2395,7 +2803,8 @@ impl SynapseStore {
         Ok(changed)
     }
 
-    // Staged storage API consumed by the epic's runtime slice; remove this allow there.
+    // This storage helper is temporarily unused. Remove the dead-code allowance
+    // when a runtime caller is added.
     #[allow(dead_code)]
     fn mutate_approval<F>(
         &self,
@@ -2438,6 +2847,662 @@ impl SynapseStore {
             Ok(row)
         })?;
         Ok(row)
+    }
+
+    /// Validate, assign, and durably record an immutable serving artifact. A Q8
+    /// repack is accepted only when its independently verified digest matches the
+    /// deterministic derivation result supplied at ingest.
+    pub fn ingest_serving_artifact(
+        &self,
+        request: &ArtifactIngestRequest,
+        ingested_at_ms: u64,
+    ) -> Result<ModelArtifactId, SynapseStoreError> {
+        let artifact = ModelArtifactId::from_ingest_request(request)?;
+        let artifact_json = serde_json::to_string(&artifact)?;
+        let derivation = request.q8_derivation.as_ref();
+        self.store
+            .with_conn_fenced(|tx| {
+                let existing = load_serving_artifact_tx(tx, &artifact.artifact_id)?;
+                if let Some(existing) = existing {
+                    if existing.artifact == artifact && existing.derivation == request.q8_derivation
+                    {
+                        return Ok(existing.artifact);
+                    }
+                    return Err(to_sql_error(SynapseStoreError::Decode(format!(
+                        "serving artifact identity collision for '{}'",
+                        artifact.artifact_id
+                    ))));
+                }
+                tx.execute(
+                    "INSERT INTO serving_artifacts (
+                     artifact_id, model_id, source_format, source_quantization,
+                     source_digest, derived_digest, derivation_contract,
+                     deterministic_inputs_digest, verified_derived_digest, artifact_json,
+                     gc_pinned, ingested_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, ?11)",
+                    params![
+                        &artifact.artifact_id,
+                        &artifact.model_id,
+                        &artifact.source_format,
+                        &artifact.source_quantization,
+                        &artifact.source_digest,
+                        artifact.derived_digest.as_deref(),
+                        derivation.map(|value| value.derivation_contract.as_str()),
+                        derivation.map(|value| value.deterministic_inputs_digest.as_str()),
+                        derivation.map(|value| value.verified_derived_digest.as_str()),
+                        artifact_json,
+                        ingested_at_ms as i64,
+                    ],
+                )?;
+                Ok(artifact.clone())
+            })
+            .map_err(Into::into)
+    }
+
+    /// Set a cache-retention pin. Pins are consulted only by GC disposition and
+    /// never by admission, disablement, or revocation control transactions.
+    pub fn set_serving_artifact_gc_pin(
+        &self,
+        artifact_id: &str,
+        pinned: bool,
+    ) -> Result<(), SynapseStoreError> {
+        let changed = self.store.with_conn_fenced(|tx| {
+            tx.execute(
+                "UPDATE serving_artifacts SET gc_pinned = ?1 WHERE artifact_id = ?2",
+                params![pinned as i64, artifact_id],
+            )
+        })?;
+        if changed != 1 {
+            return Err(SynapseStoreError::Decode(format!(
+                "unknown serving artifact '{artifact_id}'"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Return the GC-only disposition for an ingested artifact.
+    pub fn serving_artifact_gc_disposition(
+        &self,
+        artifact_id: &str,
+    ) -> Result<ArtifactGcDisposition, SynapseStoreError> {
+        let pinned = self.store.with_conn(|conn| {
+            conn.query_row(
+                "SELECT gc_pinned FROM serving_artifacts WHERE artifact_id = ?1",
+                params![artifact_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+        })?;
+        match pinned {
+            Some(0) => Ok(ArtifactGcDisposition::Collectable),
+            Some(1) => Ok(ArtifactGcDisposition::Pinned),
+            Some(_) => Err(SynapseStoreError::Decode(
+                "serving artifact has invalid GC pin state".to_string(),
+            )),
+            None => Err(SynapseStoreError::Decode(format!(
+                "unknown serving artifact '{artifact_id}'"
+            ))),
+        }
+    }
+
+    /// Persist a complete immutable certification record only when it matches an
+    /// already ingested source artifact and its optional verified derivation.
+    pub fn store_serving_certification(
+        &self,
+        record: &CertificationRecord,
+        recorded_at_ms: u64,
+    ) -> Result<StoredServingCertification, SynapseStoreError> {
+        validate_serving_certification(record)?;
+        let record_json = serde_json::to_string(record)?;
+        let stored = self.store.with_conn_fenced(|tx| {
+            let artifact_id = &record.artifact_lineage.artifact_id;
+            let artifact = load_serving_artifact_tx(tx, artifact_id)?.ok_or_else(|| {
+                to_sql_error(SynapseStoreError::Decode(format!(
+                    "certification references unknown artifact '{artifact_id}'"
+                )))
+            })?;
+            validate_certification_artifact_match(record, &artifact).map_err(to_sql_error)?;
+            let existing = load_serving_certification_tx(tx, &record.record_id)?;
+            if let Some(existing) = existing {
+                if existing.record == *record && existing.artifact == artifact.artifact {
+                    return Ok(existing);
+                }
+                return Err(to_sql_error(SynapseStoreError::Decode(format!(
+                    "certification record '{}' is immutable",
+                    record.record_id
+                ))));
+            }
+            tx.execute(
+                "INSERT INTO serving_certification_records (
+                     certification_record_id, catalog_fingerprint, artifact_id,
+                     record_json, recorded_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    &record.record_id,
+                    &record.unit.catalog_fingerprint,
+                    artifact_id,
+                    record_json,
+                    recorded_at_ms as i64,
+                ],
+            )?;
+            Ok(StoredServingCertification {
+                artifact: artifact.artifact,
+                record: record.clone(),
+                recorded_at_ms,
+            })
+        })?;
+        Ok(stored)
+    }
+
+    /// Load and revalidate a serving certification record before use.
+    pub fn serving_certification(
+        &self,
+        certification_record_id: &str,
+    ) -> Result<Option<StoredServingCertification>, SynapseStoreError> {
+        let stored = self
+            .store
+            .with_conn(|conn| load_serving_certification_conn(conn, certification_record_id))?;
+        if let Some(stored) = &stored {
+            validate_serving_certification(&stored.record)?;
+            let artifact = self
+                .store
+                .with_conn(|conn| load_serving_artifact_conn(conn, &stored.artifact.artifact_id))?;
+            let artifact = artifact.ok_or_else(|| {
+                SynapseStoreError::Decode(format!(
+                    "certification references missing artifact '{}'",
+                    stored.artifact.artifact_id
+                ))
+            })?;
+            validate_certification_artifact_match(&stored.record, &artifact)?;
+        }
+        Ok(stored)
+    }
+
+    /// Atomically bind an enabled approval to the exact catalog fingerprint and
+    /// complete certification record. A different fingerprint or source artifact
+    /// cannot be approved through this transaction.
+    pub fn approve_serving_catalog(
+        &self,
+        catalog_fingerprint: &str,
+        certification_record_id: &str,
+        approved_by: &str,
+        approved_at_ms: u64,
+    ) -> Result<ServingApprovalRecord, SynapseStoreError> {
+        if !is_digest(catalog_fingerprint) {
+            return Err(SynapseStoreError::Decode(
+                "catalog_fingerprint must be a lowercase SHA-256 digest".to_string(),
+            ));
+        }
+        if approved_by.trim().is_empty() {
+            return Err(SynapseStoreError::Decode(
+                "serving approval requires a non-empty approver".to_string(),
+            ));
+        }
+        let approval = self.store.with_conn_fenced(|tx| {
+            let certification = load_serving_certification_tx(tx, certification_record_id)?
+                .ok_or_else(|| {
+                    to_sql_error(SynapseStoreError::Decode(format!(
+                        "unknown serving certification '{certification_record_id}'"
+                    )))
+                })?;
+            validate_serving_certification(&certification.record).map_err(to_sql_error)?;
+            if certification.record.unit.catalog_fingerprint != catalog_fingerprint {
+                return Err(to_sql_error(SynapseStoreError::Decode(
+                    "approval catalog fingerprint does not match certification".to_string(),
+                )));
+            }
+            let artifact = load_serving_artifact_tx(tx, &certification.artifact.artifact_id)?
+                .ok_or_else(|| {
+                    to_sql_error(SynapseStoreError::Decode(
+                        "serving certification references a missing artifact".to_string(),
+                    ))
+                })?;
+            validate_certification_artifact_match(&certification.record, &artifact)
+                .map_err(to_sql_error)?;
+
+            let generation = load_serving_approval_tx(tx, catalog_fingerprint)?
+                .map(|current| current.generation.saturating_add(1))
+                .unwrap_or(0);
+            let mut approval = ServingApprovalRecord {
+                schema_revision: SERVING_APPROVAL_SCHEMA_REVISION.to_string(),
+                catalog_fingerprint: catalog_fingerprint.to_string(),
+                certification_record_id: certification_record_id.to_string(),
+                artifact_id: certification.artifact.artifact_id,
+                state: ServingApprovalState::Enabled,
+                reason: None,
+                approved_by: approved_by.to_string(),
+                approved_at_ms,
+                updated_at_ms: approved_at_ms,
+                generation,
+                semantic_digest: String::new(),
+            };
+            approval.semantic_digest = approval.expected_digest();
+            validate_serving_approval(&approval, true).map_err(to_sql_error)?;
+            tx.execute(
+                "INSERT INTO serving_approvals (
+                     catalog_fingerprint, certification_record_id, artifact_id, state,
+                     reason, approved_by, approved_at_ms, updated_at_ms, generation,
+                     semantic_digest
+                 ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?6, ?7, ?8)
+                 ON CONFLICT(catalog_fingerprint) DO UPDATE SET
+                     certification_record_id = excluded.certification_record_id,
+                     artifact_id = excluded.artifact_id,
+                     state = excluded.state,
+                     reason = NULL,
+                     approved_by = excluded.approved_by,
+                     approved_at_ms = excluded.approved_at_ms,
+                     updated_at_ms = excluded.updated_at_ms,
+                     generation = excluded.generation,
+                     semantic_digest = excluded.semantic_digest",
+                params![
+                    &approval.catalog_fingerprint,
+                    &approval.certification_record_id,
+                    &approval.artifact_id,
+                    approval.state.as_str(),
+                    &approval.approved_by,
+                    approval.approved_at_ms as i64,
+                    approval.generation as i64,
+                    &approval.semantic_digest,
+                ],
+            )?;
+            Ok(approval)
+        })?;
+        Ok(approval)
+    }
+
+    /// Return one serving approval after verifying its tamper-evident fields.
+    pub fn serving_approval(
+        &self,
+        catalog_fingerprint: &str,
+    ) -> Result<Option<ServingApprovalRecord>, SynapseStoreError> {
+        let approval = self
+            .store
+            .with_conn(|conn| load_serving_approval_conn(conn, catalog_fingerprint))?;
+        if let Some(approval) = &approval {
+            validate_serving_approval(approval, true)?;
+        }
+        Ok(approval)
+    }
+
+    /// Disable one catalog fingerprint. The transaction rejects new admissions and
+    /// invalidates retained states, but deliberately leaves active sessions running.
+    pub fn disable_serving_catalog(
+        &self,
+        catalog_fingerprint: &str,
+        reason: &str,
+        updated_at_ms: u64,
+    ) -> Result<ServingControlOutcome, SynapseStoreError> {
+        self.control_serving_catalog(
+            catalog_fingerprint,
+            ServingApprovalState::Disabled,
+            reason,
+            updated_at_ms,
+        )
+    }
+
+    /// Revoke one catalog fingerprint as an emergency control action. The
+    /// transaction invalidates retained states and marks active sessions for
+    /// terminal `artifact_revoked` accounting at their next committed boundary.
+    pub fn revoke_serving_catalog(
+        &self,
+        catalog_fingerprint: &str,
+        reason: &str,
+        updated_at_ms: u64,
+    ) -> Result<ServingControlOutcome, SynapseStoreError> {
+        self.control_serving_catalog(
+            catalog_fingerprint,
+            ServingApprovalState::Revoked,
+            reason,
+            updated_at_ms,
+        )
+    }
+
+    /// Admit a new active session only through the current approval and matching
+    /// certification record. A refusal writes no session row.
+    pub fn admit_serving_session(
+        &self,
+        session_id: &str,
+        catalog_fingerprint: &str,
+        created_at_ms: u64,
+    ) -> Result<ServingSessionAdmission, SynapseStoreError> {
+        validate_session_id(session_id)?;
+        self.store
+            .with_conn_fenced(|tx| {
+                if load_serving_session_tx(tx, session_id)?.is_some() {
+                    return Err(to_sql_error(SynapseStoreError::Decode(format!(
+                        "serving session '{session_id}' already exists"
+                    ))));
+                }
+                let Some(approval) = load_serving_approval_tx(tx, catalog_fingerprint)? else {
+                    return Ok(ServingSessionAdmission::Refused {
+                        reason: ServingRefusal::ArtifactUnapproved,
+                    });
+                };
+                validate_serving_approval(&approval, true).map_err(to_sql_error)?;
+                let refusal = serving_approval_refusal_tx(tx, &approval)?;
+                if let Some(reason) = refusal {
+                    return Ok(ServingSessionAdmission::Refused { reason });
+                }
+                tx.execute(
+                    "INSERT INTO serving_sessions (
+                     session_id, catalog_fingerprint, approval_generation, state,
+                     committed_token_count, terminal_reason, created_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, ?3, 'active', 0, NULL, ?4, ?4)",
+                    params![
+                        session_id,
+                        catalog_fingerprint,
+                        approval.generation as i64,
+                        created_at_ms as i64,
+                    ],
+                )?;
+                Ok(ServingSessionAdmission::Admitted {
+                    session_id: session_id.to_string(),
+                    catalog_fingerprint: catalog_fingerprint.to_string(),
+                    approval_generation: approval.generation,
+                })
+            })
+            .map_err(Into::into)
+    }
+
+    /// Retain a continuation state while the catalog remains admitted. Later
+    /// disablement or revocation changes this row atomically with its approval.
+    pub fn retain_serving_state(
+        &self,
+        state_id: &str,
+        catalog_fingerprint: &str,
+        created_at_ms: u64,
+    ) -> Result<ServingContinuationAdmission, SynapseStoreError> {
+        validate_session_id(state_id)?;
+        self.store
+            .with_conn_fenced(|tx| {
+                if load_retained_serving_state_tx(tx, state_id)?.is_some() {
+                    return Err(to_sql_error(SynapseStoreError::Decode(format!(
+                        "retained serving state '{state_id}' already exists"
+                    ))));
+                }
+                let Some(approval) = load_serving_approval_tx(tx, catalog_fingerprint)? else {
+                    return Ok(ServingContinuationAdmission::Refused {
+                        reason: ServingRefusal::ArtifactUnapproved,
+                    });
+                };
+                validate_serving_approval(&approval, true).map_err(to_sql_error)?;
+                if let Some(reason) = serving_approval_refusal_tx(tx, &approval)? {
+                    return Ok(ServingContinuationAdmission::Refused { reason });
+                }
+                tx.execute(
+                    "INSERT INTO serving_retained_states (
+                     state_id, catalog_fingerprint, valid, invalidation_reason,
+                     created_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, 1, NULL, ?3, ?3)",
+                    params![state_id, catalog_fingerprint, created_at_ms as i64],
+                )?;
+                Ok(ServingContinuationAdmission::Admitted {
+                    state_id: state_id.to_string(),
+                    catalog_fingerprint: catalog_fingerprint.to_string(),
+                    approval_generation: approval.generation,
+                })
+            })
+            .map_err(Into::into)
+    }
+
+    /// Check a retained continuation against both its invalidation state and the
+    /// current approval. Disabled and revoked continuations retain those precise
+    /// typed refusals instead of collapsing into a generic stale-state result.
+    pub fn admit_serving_continuation(
+        &self,
+        state_id: &str,
+    ) -> Result<ServingContinuationAdmission, SynapseStoreError> {
+        self.store
+            .with_conn_fenced(|tx| {
+                let Some(state) = load_retained_serving_state_tx(tx, state_id)? else {
+                    return Ok(ServingContinuationAdmission::Refused {
+                        reason: ServingRefusal::RetainedStateInvalidated,
+                    });
+                };
+                if !state.valid {
+                    return Ok(ServingContinuationAdmission::Refused {
+                        reason: retained_state_refusal(&state),
+                    });
+                }
+                let Some(approval) = load_serving_approval_tx(tx, &state.catalog_fingerprint)?
+                else {
+                    return Ok(ServingContinuationAdmission::Refused {
+                        reason: ServingRefusal::ArtifactUnapproved,
+                    });
+                };
+                validate_serving_approval(&approval, true).map_err(to_sql_error)?;
+                if let Some(reason) = serving_approval_refusal_tx(tx, &approval)? {
+                    return Ok(ServingContinuationAdmission::Refused { reason });
+                }
+                Ok(ServingContinuationAdmission::Admitted {
+                    state_id: state.state_id,
+                    catalog_fingerprint: state.catalog_fingerprint,
+                    approval_generation: approval.generation,
+                })
+            })
+            .map_err(Into::into)
+    }
+
+    /// Commit an absolute token count at a session boundary. A pending emergency
+    /// revoke turns this exact boundary into the terminal accounting record.
+    pub fn commit_serving_session_boundary(
+        &self,
+        session_id: &str,
+        committed_token_count: u64,
+        updated_at_ms: u64,
+    ) -> Result<ServingBoundaryOutcome, SynapseStoreError> {
+        self.store
+            .with_conn_fenced(|tx| {
+                let mut session = load_serving_session_tx(tx, session_id)?.ok_or_else(|| {
+                    to_sql_error(SynapseStoreError::Decode(format!(
+                        "unknown serving session '{session_id}'"
+                    )))
+                })?;
+                if !session.state.is_active() {
+                    return Err(to_sql_error(SynapseStoreError::Decode(format!(
+                        "serving session '{session_id}' is already terminal"
+                    ))));
+                }
+                if committed_token_count < session.committed_token_count {
+                    return Err(to_sql_error(SynapseStoreError::Decode(
+                        "committed token count cannot move backward".to_string(),
+                    )));
+                }
+                let approval = load_serving_approval_tx(tx, &session.catalog_fingerprint)?;
+                let termination_requested = session.state
+                    == ServingSessionState::TerminationRequested
+                    || approval
+                        .as_ref()
+                        .is_some_and(|approval| approval.state == ServingApprovalState::Revoked);
+                if termination_requested {
+                    session.state = ServingSessionState::Terminated;
+                    session.terminal_reason = Some("artifact_revoked".to_string());
+                }
+                session.committed_token_count = committed_token_count;
+                session.updated_at_ms = updated_at_ms;
+                tx.execute(
+                    "UPDATE serving_sessions
+                 SET state = ?1, committed_token_count = ?2, terminal_reason = ?3,
+                     updated_at_ms = ?4
+                 WHERE session_id = ?5",
+                    params![
+                        session.state.as_str(),
+                        committed_token_count as i64,
+                        session.terminal_reason.as_deref(),
+                        updated_at_ms as i64,
+                        session_id,
+                    ],
+                )?;
+                if session.state == ServingSessionState::Terminated {
+                    let unload_artifact =
+                        serving_artifact_unload_ready_tx(tx, &session.catalog_fingerprint)?;
+                    return Ok(ServingBoundaryOutcome::Terminated {
+                        terminal_reason: "artifact_revoked".to_string(),
+                        tokens_emitted: committed_token_count,
+                        unload_artifact,
+                    });
+                }
+                Ok(ServingBoundaryOutcome::Continue {
+                    committed_token_count,
+                })
+            })
+            .map_err(Into::into)
+    }
+
+    /// Finish an active session naturally. A disabled approval reaches unload only
+    /// after this final active session leaves the ledger.
+    pub fn complete_serving_session(
+        &self,
+        session_id: &str,
+        updated_at_ms: u64,
+    ) -> Result<ServingSessionCompletion, SynapseStoreError> {
+        let completion = self.store.with_conn_fenced(|tx| {
+            let mut session = load_serving_session_tx(tx, session_id)?.ok_or_else(|| {
+                to_sql_error(SynapseStoreError::Decode(format!(
+                    "unknown serving session '{session_id}'"
+                )))
+            })?;
+            if session.state != ServingSessionState::Active {
+                return Err(to_sql_error(SynapseStoreError::Decode(
+                    "only an active serving session can finish naturally".to_string(),
+                )));
+            }
+            session.state = ServingSessionState::Finished;
+            session.terminal_reason = Some("completed".to_string());
+            session.updated_at_ms = updated_at_ms;
+            tx.execute(
+                "UPDATE serving_sessions
+                 SET state = 'finished', terminal_reason = 'completed', updated_at_ms = ?1
+                 WHERE session_id = ?2",
+                params![updated_at_ms as i64, session_id],
+            )?;
+            let unload_artifact =
+                serving_artifact_unload_ready_tx(tx, &session.catalog_fingerprint)?;
+            Ok(ServingSessionCompletion {
+                session,
+                unload_artifact,
+            })
+        })?;
+        Ok(completion)
+    }
+
+    /// Read a session ledger entry for recovery and terminal accounting.
+    pub fn serving_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<ServingSessionRecord>, SynapseStoreError> {
+        Ok(self
+            .store
+            .with_conn(|conn| load_serving_session_conn(conn, session_id))?)
+    }
+
+    /// Read a retained-state ledger entry for continuation recovery.
+    pub fn retained_serving_state(
+        &self,
+        state_id: &str,
+    ) -> Result<Option<RetainedServingState>, SynapseStoreError> {
+        Ok(self
+            .store
+            .with_conn(|conn| load_retained_serving_state_conn(conn, state_id))?)
+    }
+
+    fn control_serving_catalog(
+        &self,
+        catalog_fingerprint: &str,
+        requested_state: ServingApprovalState,
+        reason: &str,
+        updated_at_ms: u64,
+    ) -> Result<ServingControlOutcome, SynapseStoreError> {
+        if requested_state == ServingApprovalState::Enabled || reason.trim().is_empty() {
+            return Err(SynapseStoreError::Decode(
+                "serving control requires a disabling state and non-empty reason".to_string(),
+            ));
+        }
+        let outcome = self.store.with_conn_fenced(|tx| {
+            let mut approval =
+                load_serving_approval_tx(tx, catalog_fingerprint)?.ok_or_else(|| {
+                    to_sql_error(SynapseStoreError::Decode(format!(
+                        "no serving approval for catalog fingerprint '{catalog_fingerprint}'"
+                    )))
+                })?;
+            validate_serving_approval(&approval, true).map_err(to_sql_error)?;
+            let effective_state = if approval.state == ServingApprovalState::Revoked {
+                ServingApprovalState::Revoked
+            } else {
+                requested_state
+            };
+            let effective_reason = if effective_state == ServingApprovalState::Revoked
+                && approval.state == ServingApprovalState::Revoked
+            {
+                approval
+                    .reason
+                    .clone()
+                    .expect("validated revoked approval has a reason")
+            } else {
+                reason.to_string()
+            };
+            if approval.state != effective_state
+                || approval.reason.as_deref() != Some(effective_reason.as_str())
+            {
+                approval.state = effective_state;
+                approval.reason = Some(effective_reason);
+                approval.updated_at_ms = updated_at_ms;
+                approval.generation = approval.generation.saturating_add(1);
+                approval.semantic_digest = approval.expected_digest();
+                validate_serving_approval(&approval, true).map_err(to_sql_error)?;
+                tx.execute(
+                    "UPDATE serving_approvals
+                     SET state = ?1, reason = ?2, updated_at_ms = ?3, generation = ?4,
+                         semantic_digest = ?5
+                     WHERE catalog_fingerprint = ?6",
+                    params![
+                        approval.state.as_str(),
+                        approval.reason.as_deref(),
+                        updated_at_ms as i64,
+                        approval.generation as i64,
+                        &approval.semantic_digest,
+                        catalog_fingerprint,
+                    ],
+                )?;
+            }
+            let invalidated_retained_states = match effective_state {
+                ServingApprovalState::Disabled => tx.execute(
+                    "UPDATE serving_retained_states
+                     SET valid = 0, invalidation_reason = 'artifact_disabled', updated_at_ms = ?1
+                     WHERE catalog_fingerprint = ?2 AND valid = 1",
+                    params![updated_at_ms as i64, catalog_fingerprint],
+                )? as u64,
+                ServingApprovalState::Revoked => tx.execute(
+                    "UPDATE serving_retained_states
+                     SET valid = 0, invalidation_reason = 'artifact_revoked', updated_at_ms = ?1
+                     WHERE catalog_fingerprint = ?2
+                       AND (valid != 0 OR invalidation_reason != 'artifact_revoked')",
+                    params![updated_at_ms as i64, catalog_fingerprint],
+                )? as u64,
+                ServingApprovalState::Enabled => unreachable!("control never enables an approval"),
+            };
+            let termination_requested_sessions = if effective_state == ServingApprovalState::Revoked
+            {
+                tx.execute(
+                    "UPDATE serving_sessions
+                     SET state = 'termination_requested', updated_at_ms = ?1
+                     WHERE catalog_fingerprint = ?2 AND state = 'active'",
+                    params![updated_at_ms as i64, catalog_fingerprint],
+                )? as u64
+            } else {
+                0
+            };
+            let active_sessions = active_serving_session_count_tx(tx, catalog_fingerprint)?;
+            let unload_artifact = active_sessions == 0;
+            Ok(ServingControlOutcome {
+                approval,
+                invalidated_retained_states,
+                active_sessions,
+                termination_requested_sessions,
+                unload_artifact,
+            })
+        })?;
+        Ok(outcome)
     }
 
     pub fn store_cert_row(&self, row: &CertificationRow) -> Result<(), SynapseStoreError> {
@@ -5311,7 +6376,8 @@ fn validate_approval(row: &ApprovalRow, verify_digest: bool) -> Result<(), Synap
     Ok(())
 }
 
-// Staged storage API consumed by the epic's runtime slice; remove this allow there.
+// This storage helper is temporarily unused. Remove the dead-code allowance
+// when a runtime caller is added.
 #[allow(dead_code)]
 fn approval_from_row(row: &Row<'_>) -> rusqlite::Result<ApprovalRow> {
     let fencing_metadata: String = row.get(13)?;
@@ -5340,7 +6406,8 @@ fn approval_from_row(row: &Row<'_>) -> rusqlite::Result<ApprovalRow> {
     })
 }
 
-// Staged storage API consumed by the epic's runtime slice; remove this allow there.
+// This storage helper is temporarily unused. Remove the dead-code allowance
+// when a runtime caller is added.
 #[allow(dead_code)]
 fn load_approval_tx(
     tx: &rusqlite::Transaction<'_>,
@@ -5358,7 +6425,8 @@ fn load_approval_tx(
     .optional()
 }
 
-// Staged storage API consumed by the epic's runtime slice; remove this allow there.
+// This storage helper is temporarily unused. Remove the dead-code allowance
+// when a runtime caller is added.
 #[allow(dead_code)]
 fn load_approval_tx_by_identity(
     tx: &rusqlite::Transaction<'_>,
@@ -5375,6 +6443,496 @@ fn load_approval_tx_by_identity(
         approval_from_row,
     )
     .optional()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StoredServingArtifact {
+    artifact: ModelArtifactId,
+    derivation: Option<Q8IngestDerivation>,
+    gc_pinned: bool,
+}
+
+fn validate_artifact_ingest(request: &ArtifactIngestRequest) -> Result<(), SynapseStoreError> {
+    if request.source_format == "mlx-group-quant"
+        || request.source_format == "mlx_group_quant"
+        || request.source_quantization.contains("mlx")
+    {
+        return Err(SynapseStoreError::Decode(
+            "MLX group-quant source weights are not accepted for serving ingest".to_string(),
+        ));
+    }
+    if !is_catalog_model_id(&request.model_id)
+        || request.source_format != "gguf"
+        || request.source_quantization != "q4_k_m"
+        || !is_digest(&request.source_digest)
+    {
+        return Err(SynapseStoreError::Decode(
+            "serving ingest requires a canonical GGUF Q4_K_M source identity".to_string(),
+        ));
+    }
+    if let Some(derivation) = &request.q8_derivation {
+        if derivation.derivation_contract != Q8_INGEST_DERIVATION_CONTRACT
+            || derivation.derived_quantization != "q8_0"
+            || !is_digest(&derivation.deterministic_inputs_digest)
+            || !is_digest(&derivation.derived_digest)
+            || !is_digest(&derivation.verified_derived_digest)
+            || derivation.derived_digest != derivation.verified_derived_digest
+        {
+            return Err(SynapseStoreError::Decode(
+                "q8-ingest-v1 derivation must have verified deterministic Q8 output".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_stored_serving_artifact(
+    artifact: &ModelArtifactId,
+    derivation: Option<&Q8IngestDerivation>,
+) -> Result<(), SynapseStoreError> {
+    let request = ArtifactIngestRequest {
+        model_id: artifact.model_id.clone(),
+        source_format: artifact.source_format.clone(),
+        source_quantization: artifact.source_quantization.clone(),
+        source_digest: artifact.source_digest.clone(),
+        q8_derivation: derivation.cloned(),
+    };
+    validate_artifact_ingest(&request)?;
+    if artifact.derived_digest != derivation.map(|derivation| derivation.derived_digest.clone())
+        || artifact.artifact_id != artifact.expected_artifact_id()
+    {
+        return Err(SynapseStoreError::Decode(
+            "stored serving artifact identity is inconsistent".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_serving_certification(record: &CertificationRecord) -> Result<(), SynapseStoreError> {
+    record.validate().map_err(|error| {
+        SynapseStoreError::Decode(format!("invalid serving certification: {error}"))
+    })?;
+    if !is_digest(&record.unit.catalog_fingerprint) {
+        return Err(SynapseStoreError::Decode(
+            "serving certification catalog fingerprint must be a lowercase SHA-256 digest"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_certification_artifact_match(
+    record: &CertificationRecord,
+    artifact: &StoredServingArtifact,
+) -> Result<(), SynapseStoreError> {
+    validate_stored_serving_artifact(&artifact.artifact, artifact.derivation.as_ref())?;
+    let lineage = &record.artifact_lineage;
+    if lineage.artifact_id != artifact.artifact.artifact_id
+        || lineage.model_id != artifact.artifact.model_id
+        || lineage.quantization != "gguf-q4-k-m-compatible"
+        || lineage.source_digest != artifact.artifact.source_digest
+    {
+        return Err(SynapseStoreError::Decode(
+            "serving certification does not match the ingested GGUF source artifact".to_string(),
+        ));
+    }
+    match (&lineage.derived, &artifact.derivation) {
+        (None, None) => Ok(()),
+        (Some(recorded), Some(ingested))
+            if recorded.derivation_contract == ingested.derivation_contract
+                && recorded.deterministic_inputs_digest == ingested.deterministic_inputs_digest
+                && recorded.source_digest == artifact.artifact.source_digest
+                && recorded.derived_digest == ingested.derived_digest
+                && recorded.verified_derived_digest == ingested.verified_derived_digest =>
+        {
+            Ok(())
+        }
+        _ => Err(SynapseStoreError::Decode(
+            "serving certification derivation lineage does not match the ingested artifact"
+                .to_string(),
+        )),
+    }
+}
+
+fn validate_serving_approval(
+    approval: &ServingApprovalRecord,
+    verify_digest: bool,
+) -> Result<(), SynapseStoreError> {
+    if approval.schema_revision != SERVING_APPROVAL_SCHEMA_REVISION
+        || !is_digest(&approval.catalog_fingerprint)
+        || approval.certification_record_id.trim().is_empty()
+        || !is_digest(&approval.artifact_id)
+        || approval.approved_by.trim().is_empty()
+    {
+        return Err(SynapseStoreError::Decode(
+            "serving approval has an invalid identity or provenance".to_string(),
+        ));
+    }
+    match approval.state {
+        ServingApprovalState::Enabled if approval.reason.is_none() => {}
+        ServingApprovalState::Disabled | ServingApprovalState::Revoked
+            if approval
+                .reason
+                .as_deref()
+                .is_some_and(|reason| !reason.trim().is_empty()) => {}
+        _ => {
+            return Err(SynapseStoreError::Decode(
+                "serving approval state and reason are inconsistent".to_string(),
+            ))
+        }
+    }
+    if verify_digest && approval.semantic_digest != approval.expected_digest() {
+        return Err(SynapseStoreError::Decode(
+            "serving approval semantic digest mismatch".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn serving_artifact_from_columns(
+    artifact_json: String,
+    derivation_contract: Option<String>,
+    deterministic_inputs_digest: Option<String>,
+    derived_digest: Option<String>,
+    verified_derived_digest: Option<String>,
+    gc_pinned: i64,
+    json_index: usize,
+) -> rusqlite::Result<StoredServingArtifact> {
+    let artifact: ModelArtifactId = serde_json::from_str(&artifact_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            json_index,
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })?;
+    let derivation = match (
+        derivation_contract,
+        deterministic_inputs_digest,
+        derived_digest,
+        verified_derived_digest,
+    ) {
+        (None, None, None, None) => None,
+        (
+            Some(derivation_contract),
+            Some(deterministic_inputs_digest),
+            Some(derived_digest),
+            Some(verified_derived_digest),
+        ) => Some(Q8IngestDerivation {
+            derivation_contract,
+            deterministic_inputs_digest,
+            derived_quantization: "q8_0".to_string(),
+            derived_digest,
+            verified_derived_digest,
+        }),
+        _ => return Err(rusqlite::Error::InvalidQuery),
+    };
+    let stored = StoredServingArtifact {
+        artifact,
+        derivation,
+        gc_pinned: match gc_pinned {
+            0 => false,
+            1 => true,
+            _ => return Err(rusqlite::Error::InvalidQuery),
+        },
+    };
+    validate_stored_serving_artifact(&stored.artifact, stored.derivation.as_ref())
+        .map_err(to_sql_error)?;
+    Ok(stored)
+}
+
+fn serving_artifact_from_row(row: &Row<'_>) -> rusqlite::Result<StoredServingArtifact> {
+    serving_artifact_from_columns(
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        0,
+    )
+}
+
+fn load_serving_artifact_tx(
+    tx: &rusqlite::Transaction<'_>,
+    artifact_id: &str,
+) -> rusqlite::Result<Option<StoredServingArtifact>> {
+    tx.query_row(
+        "SELECT artifact_json, derivation_contract, deterministic_inputs_digest,
+                derived_digest, verified_derived_digest, gc_pinned
+         FROM serving_artifacts WHERE artifact_id = ?1",
+        params![artifact_id],
+        serving_artifact_from_row,
+    )
+    .optional()
+}
+
+fn load_serving_artifact_conn(
+    conn: &rusqlite::Connection,
+    artifact_id: &str,
+) -> rusqlite::Result<Option<StoredServingArtifact>> {
+    conn.query_row(
+        "SELECT artifact_json, derivation_contract, deterministic_inputs_digest,
+                derived_digest, verified_derived_digest, gc_pinned
+         FROM serving_artifacts WHERE artifact_id = ?1",
+        params![artifact_id],
+        serving_artifact_from_row,
+    )
+    .optional()
+}
+
+fn serving_certification_from_row(row: &Row<'_>) -> rusqlite::Result<StoredServingCertification> {
+    let record_json: String = row.get(0)?;
+    let record: CertificationRecord = serde_json::from_str(&record_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    let artifact = serving_artifact_from_columns(
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        2,
+    )?;
+    validate_serving_certification(&record).map_err(to_sql_error)?;
+    validate_certification_artifact_match(&record, &artifact).map_err(to_sql_error)?;
+    Ok(StoredServingCertification {
+        artifact: artifact.artifact,
+        record,
+        recorded_at_ms: row.get::<_, i64>(1)? as u64,
+    })
+}
+
+const SERVING_CERTIFICATION_SELECT_SQL: &str = "SELECT certification.record_json,
+    certification.recorded_at_ms, artifact.artifact_json, artifact.derivation_contract,
+    artifact.deterministic_inputs_digest, artifact.derived_digest,
+    artifact.verified_derived_digest, artifact.gc_pinned
+FROM serving_certification_records AS certification
+JOIN serving_artifacts AS artifact ON artifact.artifact_id = certification.artifact_id";
+
+fn load_serving_certification_tx(
+    tx: &rusqlite::Transaction<'_>,
+    certification_record_id: &str,
+) -> rusqlite::Result<Option<StoredServingCertification>> {
+    tx.query_row(
+        &format!(
+            "{SERVING_CERTIFICATION_SELECT_SQL}
+             WHERE certification.certification_record_id = ?1"
+        ),
+        params![certification_record_id],
+        serving_certification_from_row,
+    )
+    .optional()
+}
+
+fn load_serving_certification_conn(
+    conn: &rusqlite::Connection,
+    certification_record_id: &str,
+) -> rusqlite::Result<Option<StoredServingCertification>> {
+    conn.query_row(
+        &format!(
+            "{SERVING_CERTIFICATION_SELECT_SQL}
+             WHERE certification.certification_record_id = ?1"
+        ),
+        params![certification_record_id],
+        serving_certification_from_row,
+    )
+    .optional()
+}
+
+fn serving_approval_from_row(row: &Row<'_>) -> rusqlite::Result<ServingApprovalRecord> {
+    let approval = ServingApprovalRecord {
+        schema_revision: SERVING_APPROVAL_SCHEMA_REVISION.to_string(),
+        catalog_fingerprint: row.get(0)?,
+        certification_record_id: row.get(1)?,
+        artifact_id: row.get(2)?,
+        state: ServingApprovalState::parse(&row.get::<_, String>(3)?).map_err(to_sql_error)?,
+        reason: row.get(4)?,
+        approved_by: row.get(5)?,
+        approved_at_ms: row.get::<_, i64>(6)? as u64,
+        updated_at_ms: row.get::<_, i64>(7)? as u64,
+        generation: row.get::<_, i64>(8)? as u64,
+        semantic_digest: row.get(9)?,
+    };
+    validate_serving_approval(&approval, true).map_err(to_sql_error)?;
+    Ok(approval)
+}
+
+const SERVING_APPROVAL_SELECT_SQL: &str = "SELECT catalog_fingerprint,
+    certification_record_id, artifact_id, state, reason, approved_by, approved_at_ms,
+    updated_at_ms, generation, semantic_digest FROM serving_approvals";
+
+fn load_serving_approval_tx(
+    tx: &rusqlite::Transaction<'_>,
+    catalog_fingerprint: &str,
+) -> rusqlite::Result<Option<ServingApprovalRecord>> {
+    tx.query_row(
+        &format!("{SERVING_APPROVAL_SELECT_SQL} WHERE catalog_fingerprint = ?1"),
+        params![catalog_fingerprint],
+        serving_approval_from_row,
+    )
+    .optional()
+}
+
+fn load_serving_approval_conn(
+    conn: &rusqlite::Connection,
+    catalog_fingerprint: &str,
+) -> rusqlite::Result<Option<ServingApprovalRecord>> {
+    conn.query_row(
+        &format!("{SERVING_APPROVAL_SELECT_SQL} WHERE catalog_fingerprint = ?1"),
+        params![catalog_fingerprint],
+        serving_approval_from_row,
+    )
+    .optional()
+}
+
+fn serving_session_from_row(row: &Row<'_>) -> rusqlite::Result<ServingSessionRecord> {
+    Ok(ServingSessionRecord {
+        session_id: row.get(0)?,
+        catalog_fingerprint: row.get(1)?,
+        approval_generation: row.get::<_, i64>(2)? as u64,
+        state: ServingSessionState::parse(&row.get::<_, String>(3)?).map_err(to_sql_error)?,
+        committed_token_count: row.get::<_, i64>(4)? as u64,
+        terminal_reason: row.get(5)?,
+        created_at_ms: row.get::<_, i64>(6)? as u64,
+        updated_at_ms: row.get::<_, i64>(7)? as u64,
+    })
+}
+
+const SERVING_SESSION_SELECT_SQL: &str = "SELECT session_id, catalog_fingerprint,
+    approval_generation, state, committed_token_count, terminal_reason, created_at_ms,
+    updated_at_ms FROM serving_sessions";
+
+fn load_serving_session_tx(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+) -> rusqlite::Result<Option<ServingSessionRecord>> {
+    tx.query_row(
+        &format!("{SERVING_SESSION_SELECT_SQL} WHERE session_id = ?1"),
+        params![session_id],
+        serving_session_from_row,
+    )
+    .optional()
+}
+
+fn load_serving_session_conn(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+) -> rusqlite::Result<Option<ServingSessionRecord>> {
+    conn.query_row(
+        &format!("{SERVING_SESSION_SELECT_SQL} WHERE session_id = ?1"),
+        params![session_id],
+        serving_session_from_row,
+    )
+    .optional()
+}
+
+fn retained_serving_state_from_row(row: &Row<'_>) -> rusqlite::Result<RetainedServingState> {
+    let valid = match row.get::<_, i64>(2)? {
+        0 => false,
+        1 => true,
+        _ => return Err(rusqlite::Error::InvalidQuery),
+    };
+    let state = RetainedServingState {
+        state_id: row.get(0)?,
+        catalog_fingerprint: row.get(1)?,
+        valid,
+        invalidation_reason: row.get(3)?,
+        created_at_ms: row.get::<_, i64>(4)? as u64,
+        updated_at_ms: row.get::<_, i64>(5)? as u64,
+    };
+    if state.valid != state.invalidation_reason.is_none() {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    Ok(state)
+}
+
+const RETAINED_SERVING_STATE_SELECT_SQL: &str = "SELECT state_id, catalog_fingerprint,
+    valid, invalidation_reason, created_at_ms, updated_at_ms FROM serving_retained_states";
+
+fn load_retained_serving_state_tx(
+    tx: &rusqlite::Transaction<'_>,
+    state_id: &str,
+) -> rusqlite::Result<Option<RetainedServingState>> {
+    tx.query_row(
+        &format!("{RETAINED_SERVING_STATE_SELECT_SQL} WHERE state_id = ?1"),
+        params![state_id],
+        retained_serving_state_from_row,
+    )
+    .optional()
+}
+
+fn load_retained_serving_state_conn(
+    conn: &rusqlite::Connection,
+    state_id: &str,
+) -> rusqlite::Result<Option<RetainedServingState>> {
+    conn.query_row(
+        &format!("{RETAINED_SERVING_STATE_SELECT_SQL} WHERE state_id = ?1"),
+        params![state_id],
+        retained_serving_state_from_row,
+    )
+    .optional()
+}
+
+fn serving_approval_refusal_tx(
+    tx: &rusqlite::Transaction<'_>,
+    approval: &ServingApprovalRecord,
+) -> rusqlite::Result<Option<ServingRefusal>> {
+    match approval.state {
+        ServingApprovalState::Disabled => return Ok(Some(ServingRefusal::ArtifactDisabled)),
+        ServingApprovalState::Revoked => return Ok(Some(ServingRefusal::ArtifactRevoked)),
+        ServingApprovalState::Enabled => {}
+    }
+    let Some(certification) = load_serving_certification_tx(tx, &approval.certification_record_id)?
+    else {
+        return Ok(Some(ServingRefusal::CertificationMismatch));
+    };
+    if certification.artifact.artifact_id != approval.artifact_id
+        || certification.record.unit.catalog_fingerprint != approval.catalog_fingerprint
+    {
+        return Ok(Some(ServingRefusal::CertificationMismatch));
+    }
+    Ok(None)
+}
+
+fn retained_state_refusal(state: &RetainedServingState) -> ServingRefusal {
+    match state.invalidation_reason.as_deref() {
+        Some("artifact_disabled") => ServingRefusal::ArtifactDisabled,
+        Some("artifact_revoked") => ServingRefusal::ArtifactRevoked,
+        _ => ServingRefusal::RetainedStateInvalidated,
+    }
+}
+
+fn active_serving_session_count_tx(
+    tx: &rusqlite::Transaction<'_>,
+    catalog_fingerprint: &str,
+) -> rusqlite::Result<u64> {
+    Ok(tx.query_row(
+        "SELECT COUNT(*) FROM serving_sessions
+         WHERE catalog_fingerprint = ?1 AND state IN ('active', 'termination_requested')",
+        params![catalog_fingerprint],
+        |row| row.get::<_, i64>(0),
+    )? as u64)
+}
+
+fn serving_artifact_unload_ready_tx(
+    tx: &rusqlite::Transaction<'_>,
+    catalog_fingerprint: &str,
+) -> rusqlite::Result<bool> {
+    let approval = load_serving_approval_tx(tx, catalog_fingerprint)?
+        .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+    Ok(approval.state != ServingApprovalState::Enabled
+        && active_serving_session_count_tx(tx, catalog_fingerprint)? == 0)
+}
+
+fn validate_session_id(value: &str) -> Result<(), SynapseStoreError> {
+    if value.is_empty() || value.len() > 256 || value.bytes().any(|byte| byte.is_ascii_control()) {
+        return Err(SynapseStoreError::Decode(
+            "serving session and retained-state IDs must be non-empty printable strings"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn owned_decode_match_inputs_equal(
@@ -5917,6 +7475,16 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+    use crate::owned_decode_certification::{
+        ArtifactLineage, CertificationGateResult, CertificationRecord, CertificationUnit,
+        DerivedArtifactLineage, EmbedLoadResult, KvMatrixCandidate, KvMatrixResult,
+        KvSelectionEvidence, M5MeasurementEvidence, MachineScopedEvidence, MachineTuple,
+        MtpSpeedRepetition, MtpSpeedResult, PlatformEnvelopeResult, ProbeEvidence,
+        RuntimeConfiguration, SerialOracleFidelityResult, SpeculativeSerialFidelityResult,
+        SpeculativeTelemetry, TimingArmEvidence, TokenFidelityEvidence, TokenTapResult,
+        AGENTIC_BATTERY_ID, EMBED_LOAD_ID, LLAMA_CPP_ORACLE_REVISION, PLATFORM_ENVELOPE_ID,
+        WAVE_1_CONTEXT_CEILING_TOKENS,
+    };
     use cortexkit_store_types::{Isolation, StorageBackend};
     use synapse_core::MachineProfile;
 
@@ -5989,6 +7557,263 @@ mod tests {
             worker_bin: None,
             worker_runtime_dir: None,
         }
+    }
+
+    fn serving_catalog_fingerprint() -> String {
+        "d".repeat(64)
+    }
+
+    fn serving_artifact_request() -> ArtifactIngestRequest {
+        ArtifactIngestRequest {
+            model_id: "qwen3.8-27b".to_string(),
+            source_format: "gguf".to_string(),
+            source_quantization: "q4_k_m".to_string(),
+            source_digest: "a".repeat(64),
+            q8_derivation: Some(Q8IngestDerivation {
+                derivation_contract: Q8_INGEST_DERIVATION_CONTRACT.to_string(),
+                deterministic_inputs_digest: "b".repeat(64),
+                derived_quantization: "q8_0".to_string(),
+                derived_digest: "c".repeat(64),
+                verified_derived_digest: "c".repeat(64),
+            }),
+        }
+    }
+
+    fn complete_serving_certification(
+        artifact: &ModelArtifactId,
+        catalog_fingerprint: &str,
+    ) -> CertificationRecord {
+        let machine = MachineTuple {
+            machine_profile_hash: "machine-profile".to_string(),
+            macos_build: "25F84".to_string(),
+            unified_memory_bytes: 128 * 1024 * 1024 * 1024,
+        };
+        let runtime = RuntimeConfiguration {
+            runtime_config_digest: "runtime-config".to_string(),
+            runtime_revision: "runtime-v1".to_string(),
+        };
+        let unit = CertificationUnit {
+            base_artifact_id: artifact.artifact_id.clone(),
+            native_mtp_head_digest: "native-mtp-head".to_string(),
+            depth_controller_gate_digest: "depth-controller-gate".to_string(),
+            catalog_fingerprint: catalog_fingerprint.to_string(),
+        };
+        let timing_arm = |session: &str, tokens_per_second| TimingArmEvidence {
+            loaded_session_id: session.to_string(),
+            machine_profile_hash: machine.machine_profile_hash.clone(),
+            macos_build: machine.macos_build.clone(),
+            ac_power_connected: true,
+            one_minute_load_average: 1.0,
+            mean_tokens_per_second: tokens_per_second,
+        };
+        let candidates = [256, 512, 1024]
+            .into_iter()
+            .flat_map(|block_size_tokens| {
+                [4096, 8192, 16384]
+                    .into_iter()
+                    .map(move |reused_prefix_bucket_tokens| KvMatrixCandidate {
+                        block_size_tokens,
+                        reused_prefix_bucket_tokens,
+                        alignment_valid: true,
+                        retained_memory_overhead_percent: 10.0,
+                        warm_ttft_ms: if (block_size_tokens, reused_prefix_bucket_tokens)
+                            == (1024, 4096)
+                        {
+                            1.0
+                        } else {
+                            2.0
+                        },
+                    })
+            })
+            .collect::<Vec<_>>();
+        let selected = candidates
+            .iter()
+            .find(|candidate| {
+                (
+                    candidate.block_size_tokens,
+                    candidate.reused_prefix_bucket_tokens,
+                ) == (1024, 4096)
+            })
+            .cloned()
+            .expect("fixture includes the selected KV cell");
+        let manifest_digest = "agentic-manifest-digest".to_string();
+        CertificationRecord {
+            record_id: "serving-certification-record".to_string(),
+            manifest_digest: manifest_digest.clone(),
+            artifact_lineage: ArtifactLineage {
+                artifact_id: artifact.artifact_id.clone(),
+                model_id: artifact.model_id.clone(),
+                quantization: "gguf-q4-k-m-compatible".to_string(),
+                source_digest: artifact.source_digest.clone(),
+                derived: Some(DerivedArtifactLineage {
+                    derivation_contract: Q8_INGEST_DERIVATION_CONTRACT.to_string(),
+                    deterministic_inputs_digest: "b".repeat(64),
+                    source_digest: artifact.source_digest.clone(),
+                    derived_digest: artifact
+                        .derived_digest
+                        .clone()
+                        .expect("fixture is Q8 derived"),
+                    verified_derived_digest: artifact
+                        .derived_digest
+                        .clone()
+                        .expect("fixture is Q8 derived"),
+                }),
+            },
+            unit: unit.clone(),
+            machine_evidence: MachineScopedEvidence {
+                machine: machine.clone(),
+                probe: ProbeEvidence {
+                    probe_id: "certification-probe".to_string(),
+                    harness_revision: "harness-r1".to_string(),
+                    observed_at_ms: 1,
+                },
+                runtime: runtime.clone(),
+                m5_measurement: M5MeasurementEvidence {
+                    measurement_id: "m5-native-head-cost".to_string(),
+                    measurement_revision: "m5-r1".to_string(),
+                    machine_profile_hash: machine.machine_profile_hash.clone(),
+                    base_artifact_id: unit.base_artifact_id.clone(),
+                    catalog_fingerprint: unit.catalog_fingerprint.clone(),
+                    native_mtp_head_digest: unit.native_mtp_head_digest.clone(),
+                    runtime_config_digest: runtime.runtime_config_digest.clone(),
+                    head_forward_ms: 1.0,
+                    backbone_step_ms: 4.0,
+                    controller_constants_digest: "controller-constants".to_string(),
+                    registered: true,
+                    depth_zero_executes_no_head_work: true,
+                    positive_depth_chains_command_buffer: true,
+                },
+            },
+            gate_results: vec![
+                CertificationGateResult::SerialOracleFidelity(SerialOracleFidelityResult {
+                    manifest_digest: manifest_digest.clone(),
+                    battery_id: AGENTIC_BATTERY_ID.to_string(),
+                    oracle_revision: LLAMA_CPP_ORACLE_REVISION.to_string(),
+                    greedy_only: true,
+                    fidelity: TokenFidelityEvidence {
+                        generated_token_ids_match: true,
+                        stop_position_matches: true,
+                        finish_reason_matches: true,
+                    },
+                }),
+                CertificationGateResult::SpeculativeSerialFidelity(
+                    SpeculativeSerialFidelityResult {
+                        manifest_digest: manifest_digest.clone(),
+                        battery_id: AGENTIC_BATTERY_ID.to_string(),
+                        serial_certification_id: "serial-certification".to_string(),
+                        leviathan_greedy_acceptance: true,
+                        fidelity: TokenFidelityEvidence {
+                            generated_token_ids_match: true,
+                            stop_position_matches: true,
+                            finish_reason_matches: true,
+                        },
+                    },
+                ),
+                CertificationGateResult::MtpSpeed(MtpSpeedResult {
+                    manifest_digest: manifest_digest.clone(),
+                    battery_id: AGENTIC_BATTERY_ID.to_string(),
+                    generated_token_window: 256,
+                    serial_warmup_last_three_tok_s: [10.0, 10.5, 10.2],
+                    mtp_warmup_last_three_tok_s: [16.0, 16.5, 16.2],
+                    repetitions: vec![
+                        MtpSpeedRepetition {
+                            serial: timing_arm("session-1", 10.0),
+                            mtp: timing_arm("session-1", 16.0),
+                        },
+                        MtpSpeedRepetition {
+                            serial: timing_arm("session-2", 10.5),
+                            mtp: timing_arm("session-2", 16.5),
+                        },
+                        MtpSpeedRepetition {
+                            serial: timing_arm("session-3", 10.2),
+                            mtp: timing_arm("session-3", 16.2),
+                        },
+                    ],
+                    telemetry: SpeculativeTelemetry {
+                        proposed_depth: 4,
+                        accepted_depth: 3,
+                        acceptance_rate: 0.75,
+                        verification_work: 42,
+                        controller_decisions_digest: "controller-decisions".to_string(),
+                    },
+                }),
+                CertificationGateResult::KvMatrix(KvMatrixResult {
+                    manifest_digest: manifest_digest.clone(),
+                    machine_profile_hash: machine.machine_profile_hash.clone(),
+                    candidates,
+                    selection: KvSelectionEvidence {
+                        selected,
+                        continuation_token_ids_identical: true,
+                        reused_token_count: 4096,
+                        reused_block_count: 4,
+                        prefill_dispatches_over_reused_range: 0,
+                        cold_ttft_ms: 10.0,
+                        warm_ttft_ms: 1.0,
+                        close_restored_allocator_accounting: true,
+                    },
+                }),
+                CertificationGateResult::PlatformEnvelope(PlatformEnvelopeResult {
+                    manifest_digest: manifest_digest.clone(),
+                    envelope_id: PLATFORM_ENVELOPE_ID.to_string(),
+                    machine_profile_hash: machine.machine_profile_hash.clone(),
+                    macos_build: machine.macos_build.clone(),
+                    unified_memory_bytes: machine.unified_memory_bytes,
+                    reserved_embed_rerank_bytes: 1,
+                    artifact_weight_bytes: 1,
+                    kv_bytes_per_token: 1,
+                    mandatory_context_ceiling_tokens: WAVE_1_CONTEXT_CEILING_TOKENS,
+                    admitted_and_exercised_32k_session: true,
+                    exercised_reservation_accounting: true,
+                    exercised_kv_reuse: true,
+                    exercised_streaming: true,
+                    exercised_scheduler_interleaving: true,
+                }),
+                CertificationGateResult::EmbedLoad(EmbedLoadResult {
+                    manifest_digest: manifest_digest.clone(),
+                    workload_id: EMBED_LOAD_ID.to_string(),
+                    runtime_config_digest: runtime.runtime_config_digest.clone(),
+                    concurrent_clients: 8,
+                    poisson_aggregate_rate_per_second: 5.0,
+                    duration_seconds: 120,
+                    warmup_seconds: 10,
+                    completed_samples: 500,
+                    failed_embeddings: 0,
+                    timed_out_embeddings: 0,
+                    nearest_rank_p95_ms: 150.0,
+                    active_decode_context_ceiling_tokens: WAVE_1_CONTEXT_CEILING_TOKENS,
+                    used_shipped_scheduler_configuration: true,
+                }),
+                CertificationGateResult::TokenTap(TokenTapResult {
+                    manifest_digest,
+                    observed_after_acceptance_before_emission: true,
+                    read_only: true,
+                    token_ids_identical_when_enabled: true,
+                    stop_position_identical_when_enabled: true,
+                    finish_reason_identical_when_enabled: true,
+                    emitted_bytes_identical_when_enabled: true,
+                }),
+            ],
+        }
+    }
+
+    fn configure_serving_catalog(store: &SynapseStore) -> (ModelArtifactId, String) {
+        let artifact = store
+            .ingest_serving_artifact(&serving_artifact_request(), 1)
+            .expect("valid GGUF source ingests");
+        let catalog_fingerprint = serving_catalog_fingerprint();
+        let record = complete_serving_certification(&artifact, &catalog_fingerprint);
+        store
+            .store_serving_certification(&record, 2)
+            .expect("complete record matches the ingested artifact");
+        store
+            .approve_serving_catalog(
+                &catalog_fingerprint,
+                &record.record_id,
+                "principal:operator",
+                3,
+            )
+            .expect("matching record approves the catalog fingerprint");
+        (artifact, catalog_fingerprint)
     }
 
     fn admit(
@@ -6714,7 +8539,7 @@ mod tests {
                         );
                         store.store
                     }
-                    10 => store,
+                    10 | 11 => store,
                     _ => panic!("no fixture rows for migration {version}"),
                 }
             };
@@ -6852,6 +8677,14 @@ mod tests {
                 // Deliberately empty: its only legitimate writer requires a
                 // corrupted digest first; asserted exactly-zero above.
                 "approval_digest_corruption_events" => 0,
+                // These tables start empty because v11 introduces new serving
+                // state without translating an older representation. Their
+                // transactional writer paths are exercised by dedicated tests.
+                "serving_artifacts" => 0,
+                "serving_certification_records" => 0,
+                "serving_approvals" => 0,
+                "serving_sessions" => 0,
+                "serving_retained_states" => 0,
                 other => panic!(
                     "table {other} has no declared population expectation; \
                      populate it in the step-through fence (or declare why it \
@@ -8214,6 +10047,223 @@ mod tests {
             assert_eq!(refusal.wire_id(), expected_wire, "{name}");
             let _ = std::fs::remove_dir_all(root);
         }
+    }
+
+    #[test]
+    fn serving_ingest_requires_gguf_q4km_and_verified_q8_lineage() {
+        let (root, descriptor) = temp_descriptor("serving-ingest");
+        let store = SynapseStore::open(&descriptor).unwrap();
+
+        let mut mlx = serving_artifact_request();
+        mlx.source_format = "mlx-group-quant".to_string();
+        assert!(matches!(
+            store.ingest_serving_artifact(&mlx, 1),
+            Err(SynapseStoreError::Decode(message)) if message.contains("MLX group-quant")
+        ));
+
+        let mut unverified = serving_artifact_request();
+        unverified
+            .q8_derivation
+            .as_mut()
+            .unwrap()
+            .verified_derived_digest = "e".repeat(64);
+        assert!(matches!(
+            store.ingest_serving_artifact(&unverified, 1),
+            Err(SynapseStoreError::Decode(message)) if message.contains("verified deterministic Q8")
+        ));
+
+        let artifact = store
+            .ingest_serving_artifact(&serving_artifact_request(), 2)
+            .unwrap();
+        assert_eq!(artifact.source_format, "gguf");
+        assert_eq!(artifact.source_quantization, "q4_k_m");
+        assert_eq!(
+            artifact.derived_digest.as_deref(),
+            Some("c".repeat(64).as_str())
+        );
+        assert_eq!(
+            artifact.artifact_id,
+            store
+                .ingest_serving_artifact(&serving_artifact_request(), 3)
+                .unwrap()
+                .artifact_id,
+            "ingest identity is deterministic for identical verified lineage"
+        );
+
+        let catalog_fingerprint = serving_catalog_fingerprint();
+        let record = complete_serving_certification(&artifact, &catalog_fingerprint);
+        store.store_serving_certification(&record, 4).unwrap();
+        let mismatched_approval = store.approve_serving_catalog(
+            &"f".repeat(64),
+            &record.record_id,
+            "principal:operator",
+            5,
+        );
+        assert!(mismatched_approval
+            .expect_err("a catalog fingerprint cannot borrow another record")
+            .to_string()
+            .contains("does not match certification"));
+        let approved = store
+            .approve_serving_catalog(
+                &catalog_fingerprint,
+                &record.record_id,
+                "principal:operator",
+                6,
+            )
+            .unwrap();
+        assert_eq!(approved.artifact_id, artifact.artifact_id);
+        assert_eq!(approved.certification_record_id, record.record_id);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ordinary_disable_rejects_new_work_but_unloads_only_after_active_completion() {
+        let (root, descriptor) = temp_descriptor("serving-disable");
+        let store = SynapseStore::open(&descriptor).unwrap();
+        let (artifact, catalog_fingerprint) = configure_serving_catalog(&store);
+        assert_eq!(
+            store
+                .admit_serving_session("active-session", &catalog_fingerprint, 4)
+                .unwrap(),
+            ServingSessionAdmission::Admitted {
+                session_id: "active-session".to_string(),
+                catalog_fingerprint: catalog_fingerprint.clone(),
+                approval_generation: 0,
+            }
+        );
+        assert!(matches!(
+            store
+                .retain_serving_state("retained-state", &catalog_fingerprint, 5)
+                .unwrap(),
+            ServingContinuationAdmission::Admitted { .. }
+        ));
+        store
+            .set_serving_artifact_gc_pin(&artifact.artifact_id, true)
+            .unwrap();
+
+        let disabled = store
+            .disable_serving_catalog(&catalog_fingerprint, "maintenance", 6)
+            .unwrap();
+        assert_eq!(disabled.approval.state, ServingApprovalState::Disabled);
+        assert_eq!(disabled.invalidated_retained_states, 1);
+        assert_eq!(disabled.active_sessions, 1);
+        assert_eq!(disabled.termination_requested_sessions, 0);
+        assert!(!disabled.unload_artifact);
+        assert_eq!(
+            store
+                .serving_session("active-session")
+                .unwrap()
+                .unwrap()
+                .state,
+            ServingSessionState::Active,
+            "ordinary disable must not terminate active execution"
+        );
+        assert_eq!(
+            store.admit_serving_continuation("retained-state").unwrap(),
+            ServingContinuationAdmission::Refused {
+                reason: ServingRefusal::ArtifactDisabled,
+            }
+        );
+        assert_eq!(
+            store
+                .admit_serving_session("new-session", &catalog_fingerprint, 7)
+                .unwrap(),
+            ServingSessionAdmission::Refused {
+                reason: ServingRefusal::ArtifactDisabled,
+            }
+        );
+        let completed = store.complete_serving_session("active-session", 8).unwrap();
+        assert_eq!(
+            completed.session.terminal_reason.as_deref(),
+            Some("completed")
+        );
+        assert!(completed.unload_artifact);
+        assert_eq!(
+            store
+                .serving_artifact_gc_disposition(&artifact.artifact_id)
+                .unwrap(),
+            ArtifactGcDisposition::Pinned,
+            "a GC pin persists but did not block serving disablement or unload readiness"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn emergency_revoke_terminates_at_the_next_committed_boundary() {
+        let (root, descriptor) = temp_descriptor("serving-revoke");
+        let store = SynapseStore::open(&descriptor).unwrap();
+        let (artifact, catalog_fingerprint) = configure_serving_catalog(&store);
+        assert!(matches!(
+            store
+                .admit_serving_session("active-session", &catalog_fingerprint, 4)
+                .unwrap(),
+            ServingSessionAdmission::Admitted { .. }
+        ));
+        assert!(matches!(
+            store
+                .retain_serving_state("retained-state", &catalog_fingerprint, 5)
+                .unwrap(),
+            ServingContinuationAdmission::Admitted { .. }
+        ));
+        store
+            .set_serving_artifact_gc_pin(&artifact.artifact_id, true)
+            .unwrap();
+
+        let revoked = store
+            .revoke_serving_catalog(&catalog_fingerprint, "critical compromise", 6)
+            .unwrap();
+        assert_eq!(revoked.approval.state, ServingApprovalState::Revoked);
+        assert_eq!(revoked.invalidated_retained_states, 1);
+        assert_eq!(revoked.termination_requested_sessions, 1);
+        assert_eq!(revoked.active_sessions, 1);
+        assert!(!revoked.unload_artifact);
+        assert_eq!(
+            store
+                .serving_session("active-session")
+                .unwrap()
+                .unwrap()
+                .state,
+            ServingSessionState::TerminationRequested
+        );
+        assert_eq!(
+            store
+                .admit_serving_session("new-session", &catalog_fingerprint, 7)
+                .unwrap(),
+            ServingSessionAdmission::Refused {
+                reason: ServingRefusal::ArtifactRevoked,
+            }
+        );
+        assert_eq!(
+            store.admit_serving_continuation("retained-state").unwrap(),
+            ServingContinuationAdmission::Refused {
+                reason: ServingRefusal::ArtifactRevoked,
+            }
+        );
+        assert_eq!(
+            store
+                .commit_serving_session_boundary("active-session", 17, 8)
+                .unwrap(),
+            ServingBoundaryOutcome::Terminated {
+                terminal_reason: "artifact_revoked".to_string(),
+                tokens_emitted: 17,
+                unload_artifact: true,
+            }
+        );
+        let terminal = store.serving_session("active-session").unwrap().unwrap();
+        assert_eq!(terminal.state, ServingSessionState::Terminated);
+        assert_eq!(terminal.committed_token_count, 17);
+        assert_eq!(
+            terminal.terminal_reason.as_deref(),
+            Some("artifact_revoked")
+        );
+        assert_eq!(
+            store
+                .serving_artifact_gc_disposition(&artifact.artifact_id)
+                .unwrap(),
+            ArtifactGcDisposition::Pinned,
+            "blob pins affect GC only and never delay emergency revocation"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     fn temp_descriptor(label: &str) -> (std::path::PathBuf, StorageDescriptor) {
