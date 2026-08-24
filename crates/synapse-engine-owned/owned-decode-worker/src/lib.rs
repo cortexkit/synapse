@@ -34,6 +34,7 @@ pub mod error;
 pub mod identity;
 pub mod ownership;
 pub mod protocol;
+pub mod streaming;
 pub mod supervisor;
 pub mod validation;
 pub mod wire_error_bindings;
@@ -56,6 +57,10 @@ pub use protocol::{
     FinalResponse, FinishReason, FrameEnvelope, GenerateCancel, GenerateContinue,
     GenerateInstallHintBank, GenerateProgress, GenerateStart, HintBankInstalled, Sampling,
     TokenIdJsonConstraint, WorkerFrame, GREEDY_TOP1,
+};
+pub use streaming::{
+    AbortOutcome, RetainedPrefix, RetentionPreflight, StreamRequest, StreamingSupervisor,
+    StreamingSupervisorError, SupervisionCycle, WorkerDeathOutcome,
 };
 pub use supervisor::{
     Clock, GenerationOutcome, GenerationRequest, ManualClock, Provenance, SuccessOutput,
