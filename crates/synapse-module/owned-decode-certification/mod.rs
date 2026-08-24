@@ -11,6 +11,11 @@
 //!   [`probe::DecodeProbe`] seam, compare against the oracle, apply the
 //!   structural-band fork rules, and record machine-profile-local certification
 //!   rows (fail closed).
+//! - [`certification_unit`]: complete records joining immutable base-artifact
+//!   lineage with the native multi-token-prediction head and depth-controller gate.
+//!   Machine profile, probe, runtime, native head-forward and backbone cost
+//!   measurements, and gate evidence remain tied to one machine; missing or
+//!   mismatched evidence rejects certification.
 //! - [`scheduler_evidence`]: ingestion of the `decode-sched-manifest-v1`
 //!   evidence record. Until the numeric scheduler commitment lands
 //!   (OQ-DEC-SCHED-01), the status is blocked and owned serving stays disabled.
@@ -34,6 +39,7 @@
 //! module, matching the `owned-decode-routing` and
 //! `owned-decode-grammar-scheduler` precedent.
 
+pub mod certification_unit;
 pub mod fixture_groups;
 pub mod fixtures;
 pub mod gates;
@@ -47,6 +53,18 @@ mod spike_harness;
 #[cfg(all(test, target_os = "macos"))]
 mod metal_probe;
 
+pub use certification_unit::{
+    ArtifactLineage, CertificationError, CertificationGate, CertificationGateResult,
+    CertificationRecord, CertificationRegistry, CertificationRequest, CertificationUnit,
+    DerivedArtifactLineage, EmbedLoadResult, KvMatrixCandidate, KvMatrixResult,
+    KvSelectionEvidence, M5MeasurementEvidence, MachineScopedEvidence, MachineTuple,
+    MtpSpeedRepetition, MtpSpeedResult, PlatformEnvelopeResult, ProbeEvidence,
+    RuntimeConfiguration, SerialOracleFidelityResult, SpeculativeSerialFidelityResult,
+    SpeculativeTelemetry, TimingArmEvidence, TokenFidelityEvidence, TokenTapResult,
+    AGENTIC_BATTERY_ID, EMBED_LOAD_ID, LLAMA_CPP_ORACLE_REVISION, PLATFORM_ENVELOPE_ID,
+    Q8_INGEST_DERIVATION_CONTRACT, REQUIRED_CERTIFICATION_GATES, WAVE_1_CONTEXT_CEILING_TOKENS,
+    WAVE_1_MIN_UNIFIED_MEMORY_BYTES,
+};
 pub use fixture_groups::{
     run_constrained_negative, run_constrained_positive, run_request_processing,
     run_scheduler_continuity, GroupOutcome, CONSTRAINED_NEGATIVE_GROUP, CONSTRAINED_POSITIVE_GROUP,
