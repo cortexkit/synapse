@@ -183,6 +183,10 @@ impl WorkerClient {
             "runtime_config_digest".to_string(),
             RUNTIME_CONFIG_DIGEST.to_string(),
         );
+        runtime_config.insert(
+            "processing_fingerprint".to_string(),
+            "semantic-sidecar-phase1-processing".to_string(),
+        );
         let load = WorkerRequest::Load {
             req_id: "phase1-load".to_string(),
             artifact_path: model_path.display().to_string(),

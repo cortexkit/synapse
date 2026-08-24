@@ -297,6 +297,10 @@ fn supervised_dispatch(
         "runtime_config_digest".to_string(),
         runtime_config_digest.clone(),
     );
+    values.insert(
+        "processing_fingerprint".to_string(),
+        "worker-e2e-processing-v1".to_string(),
+    );
     let artifact = ValidatedArtifact {
         digest: sha256_file(&fixture.model),
         format: "owned-safetensors".to_string(),
