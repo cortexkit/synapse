@@ -40,8 +40,10 @@ pub use grammar_limits::{GrammarLimits, GrammarSubsetManifest};
 pub use grammar_schema::{parse_schema, Schema, SchemaError};
 pub use scheduler::{
     Arbitration, BoundaryKind, BoundaryOutcome, CancelResult, ContinueFrame, DecodeOp,
-    DecodeScheduler, DecodeSchedulerConfig, FinishReason, GenerationProtocol, Measurements,
-    PermitEvent, QueueClass,
+    DecodeScheduler, DecodeSchedulerConfig, EmbedServiceOutcome, FinishReason, GenerationProtocol,
+    Measurements, PermitEvent, QuantumCommitError, QuantumWorkKind, QueueClass,
+    QueueExecutionTelemetry, ShippedSchedulerConfiguration, EMBED_LOAD_V1_CONTEXT_CEILING_TOKENS,
+    EMBED_LOAD_V1_EMBED_P95_SLO_MS, EMBED_LOAD_V1_PROFILE, SHIPPED_EMBED_LOAD_V1,
 };
 
 #[cfg(test)]
