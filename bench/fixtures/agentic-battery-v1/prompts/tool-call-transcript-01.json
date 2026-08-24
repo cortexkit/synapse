@@ -25,6 +25,7 @@
       "role": "user"
     }
   ],
+  "speed_gate_eligible": null,
   "tools": [
     {
       "description": "Read the immutable session status.",

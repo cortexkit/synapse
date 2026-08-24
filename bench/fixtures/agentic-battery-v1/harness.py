@@ -52,6 +52,7 @@ PINNED_FIELDS = {
     "prompt_count": 20,
     "prompt_digest_algorithm": "sha256",
     "input_token_range": {"minimum": 1024, "maximum": 16384},
+    "eligibility_status": "pending_oracle_run",
     "tokenizer": {
         "id": "Qwen/Qwen3.8-27B",
         "revision": "b6c73d81f0d4fc313f6e03d7cae5b35d1a52af84",
@@ -73,15 +74,17 @@ PINNED_FIELDS = {
         "repetition_penalty": 1,
         "seed": 0,
         "max_new_tokens": 256,
-        "unsupported_non_greedy_error": "unsupported_generation_config",
+        "unsupported_non_greedy_error": "owned_decode_sampling_unsupported",
     },
     "artifact": {
         "id": "qwen3.8-27b-q4-k-m-native-mtp-v1",
         "model": "Qwen3.8-27B",
         "format": "GGUF",
         "quantization": "Q4_K_M",
-        "source_sha256": "a55c53e92388007f602f87a8b74a1daee83a07e1f291346dd6fcf5109d9eed0a",
-        "catalog_fingerprint": "4e8d24cf9b42089fc0e7f442527c6f57c2f5d0bbd6a96b05d29f3a46a212a225",
+        "pinned": False,
+        "source_sha256": None,
+        "catalog_fingerprint": None,
+        "binds_at": "first-ingest",
     },
     "band_gate": {
         "id": "agentic-battery-exact-token-parity-v1",
@@ -114,6 +117,7 @@ REQUIRED_MANIFEST_FIELDS = [
     "prompt_count",
     "prompt_digest_algorithm",
     "input_token_range",
+    "eligibility_status",
     "prompts",
     "tokenizer",
     "chat_template",
@@ -180,7 +184,14 @@ def validate_prompts(manifest: dict[str, Any], manifest_path: Path) -> None:
     for entry in prompts:
         if not isinstance(entry, dict):
             raise ManifestError("every prompt entry must be an object")
-        for field in ("id", "category", "path", "input_tokens", "sha256"):
+        for field in (
+            "id",
+            "category",
+            "path",
+            "input_tokens",
+            "sha256",
+            "speed_gate_eligible",
+        ):
             if field not in entry:
                 raise ManifestError(f"prompt entry is missing required field: {field}")
 
@@ -189,6 +200,7 @@ def validate_prompts(manifest: dict[str, Any], manifest_path: Path) -> None:
         path_text = entry["path"]
         input_tokens = entry["input_tokens"]
         digest = entry["sha256"]
+        speed_gate_eligible = entry["speed_gate_eligible"]
         if not isinstance(prompt_id, str) or prompt_id in seen_ids:
             raise ManifestError(f"prompt id must be unique: {prompt_id!r}")
         if category not in PROMPT_COUNTS:
@@ -202,6 +214,8 @@ def validate_prompts(manifest: dict[str, Any], manifest_path: Path) -> None:
             raise ManifestError(f"prompt {prompt_id} has an unpinned input token count")
         if not isinstance(digest, str) or len(digest) != 64:
             raise ManifestError(f"prompt {prompt_id} has no SHA-256 digest")
+        if speed_gate_eligible is not None and not isinstance(speed_gate_eligible, bool):
+            raise ManifestError(f"prompt {prompt_id} has an invalid speed-gate eligibility value")
 
         try:
             prompt_bytes = prompt_path.read_bytes()
@@ -214,6 +228,7 @@ def validate_prompts(manifest: dict[str, Any], manifest_path: Path) -> None:
             prompt.get("id") != prompt_id
             or prompt.get("category") != category
             or prompt.get("input_tokens") != input_tokens
+            or prompt.get("speed_gate_eligible") != speed_gate_eligible
             or not isinstance(prompt.get("messages"), list)
         ):
             raise ManifestError(f"prompt {prompt_id} does not match its manifest entry")
@@ -226,6 +241,30 @@ def validate_prompts(manifest: dict[str, Any], manifest_path: Path) -> None:
         raise ManifestError(f"prompt family composition is not pinned: {observed_counts}")
     if min(observed_tokens) != 1024 or max(observed_tokens) != 16384:
         raise ManifestError("prompt input token range must span 1k through 16k")
+
+
+def is_speed_gate_acceptance(acceptance: dict[str, Any]) -> bool:
+    """Recognize the stable speed-gate labels accepted by the harness input."""
+    return acceptance.get("gate") in {"speed-gate", "speed_gate"} or acceptance.get(
+        "acceptance_kind"
+    ) in {"speed-gate", "speed_gate"}
+
+
+def validate_speed_gate_eligibility(manifest: dict[str, Any]) -> None:
+    """Require an oracle-backed E3 selection before a speed result is recorded."""
+    eligible = [entry.get("speed_gate_eligible") for entry in manifest["prompts"]]
+    if not all(isinstance(value, bool) for value in eligible):
+        raise ManifestError("speed-gate acceptance requires boolean eligibility for every prompt")
+    if sum(eligible) < 16:
+        raise ManifestError("speed-gate acceptance requires at least 16 eligible prompts")
+
+
+def validate_acceptance_recording(manifest: dict[str, Any], acceptance: dict[str, Any]) -> None:
+    """Fail closed until ingest and the oracle run establish certifying inputs."""
+    if is_speed_gate_acceptance(acceptance):
+        validate_speed_gate_eligibility(manifest)
+    if manifest["artifact"]["pinned"] is not True:
+        raise ManifestError("acceptance recording is refused while the artifact is not pinned")
 
 
 def validate_manifest(manifest_path: Path) -> tuple[dict[str, Any], str]:
@@ -270,19 +309,31 @@ def write_result(path: Path, result: dict[str, Any]) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, default=Path(__file__).with_name("manifest.json"))
-    parser.add_argument("--result", type=Path, required=True)
+    parser.add_argument("--result", type=Path)
     parser.add_argument(
         "--acceptance-input",
         type=Path,
         help="optional JSON object from the caller to attach after fixture validation",
     )
+    parser.add_argument(
+        "--validate-only",
+        action="store_true",
+        help="validate fixture integrity without recording an acceptance result",
+    )
     args = parser.parse_args()
+    if not args.validate_only and args.result is None:
+        parser.error("--result is required unless --validate-only is used")
+    if args.validate_only and args.result is not None:
+        parser.error("--validate-only cannot be combined with --result")
 
     try:
         manifest, manifest_digest = validate_manifest(args.manifest)
+        if args.validate_only:
+            return 0
         acceptance: dict[str, Any] = {}
         if args.acceptance_input is not None:
             acceptance = read_json(args.acceptance_input)
+        validate_acceptance_recording(manifest, acceptance)
         write_result(
             args.result,
             {

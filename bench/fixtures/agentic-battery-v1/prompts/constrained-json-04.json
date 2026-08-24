@@ -36,5 +36,6 @@
       "evidence_count"
     ],
     "type": "object"
-  }
+  },
+  "speed_gate_eligible": null
 }
