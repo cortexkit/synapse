@@ -231,6 +231,13 @@ fn map_call_error(error: CallError) -> VaultError {
         | CallError::OutcomeUnknown(_)
         | CallError::SubscriptionBackpressure(_)
         | CallError::StaleRouteHandle(_) => VaultError::Unreachable,
+        // Capability-resolution failures cannot occur on this path (the vault
+        // client opens its route by module id, never by capability), but the
+        // variants exist on the shared error type. No frame reached the vault,
+        // so they classify with the transport failures.
+        CallError::CapabilityUnprovided { .. }
+        | CallError::CapabilityAmbiguous { .. }
+        | CallError::InvalidCapabilityIdentifier { .. } => VaultError::Unreachable,
     }
 }
 

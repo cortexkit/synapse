@@ -11667,6 +11667,10 @@ fn management_operations() -> Vec<ManagementOperation> {
     let op = |name: &str, kind| ManagementOperation {
         name: name.to_string(),
         kind,
+        // Wire descriptions are deliberately unset: the operation names are the
+        // documented surface, and the daemon treats the field as optional
+        // discovery metadata.
+        description: None,
     };
 
     vec![
@@ -11729,6 +11733,10 @@ fn manifest(module_id: &str) -> ModuleManifest {
                 optional: vec![IdentityScope::Session],
             },
         },
+        // Capability grammar is not adopted yet: omitting the block keeps the
+        // pre-capability manifest contract, and consumers keep addressing
+        // synapse by module id and operation name.
+        capabilities: None,
     }
 }
 
