@@ -30,9 +30,9 @@ use owned_decode_worker::{
     identity::{CONSTRAINT_ENCODING_ID, WORKER_PROTOCOL_ID},
     protocol::{
         AcceptedTokensBySpan, DecodeTransportRequest, DecodeTransportResponse, FinalResponse,
-        FinishReason, FirstDivergenceCategories, FrameEnvelope, GenerateContinue,
-        GenerateInstallHintBank, GenerateProgress, GenerateStart, HintBankInstalled,
-        HintVerificationStats, TokenIdJsonConstraint, WorkerFrame,
+        FinishReason, FirstDivergenceCategories, GenerateContinue, GenerateInstallHintBank,
+        GenerateProgress, GenerateStart, HintBankInstalled, HintVerificationStats,
+        TokenIdJsonConstraint, WorkerFrame,
     },
     validation::{validate_start, WorkerStartContext},
 };
@@ -46,7 +46,9 @@ use synapse_core::{
         decode_f32_frame, WorkerHello, WorkerHelloAck, WorkerRequest, WorkerResponse,
         DEFAULT_MAX_FRAME_BYTES, WORKER_PROTOCOL_VERSION,
     },
-    EngineIdentity, Fingerprint, SidecarHintBank, SpanClass,
+    CancelledTransportResponse, DecodeMode, EngineIdentity, Fingerprint,
+    FrameEnvelope as StreamFrameEnvelope, OneshotEnvelopeIdentity, ProgressFrame, SidecarHintBank,
+    SpanClass, StreamSequence, TerminalEnvelope, TerminalState, WorkerFrame as StreamWorkerFrame,
 };
 use synapse_engine_owned::{
     owned_decode_engine::{
@@ -1563,6 +1565,69 @@ fn expand_active_kv_bits(
     Ok(cache_bits)
 }
 
+const OWNED_DECODE_ENVELOPE_PROTOCOL_VERSION: u8 = 2;
+
+/// The standard worker handshake stays compatible with the generic worker
+/// transport while explicitly advertising the owned-decode envelope version.
+#[derive(Serialize)]
+struct DecodeWorkerHello {
+    #[serde(flatten)]
+    standard: WorkerHello,
+    protocol_version: u8,
+}
+
+/// Optional fields extracted from a resident-generation request. They identify
+/// the session and processing state before the runner sends protocol-version-two frames.
+#[derive(Default)]
+struct OwnedStreamRequestFields {
+    session_id: Option<String>,
+    processing_fingerprint: Option<String>,
+    derived_digest: Option<String>,
+}
+
+fn take_owned_stream_request_fields(value: &mut Value) -> Result<OwnedStreamRequestFields> {
+    let fields = value
+        .as_object_mut()
+        .context("owned decode request must be a JSON object")?;
+    let protocol_version = fields
+        .remove("protocol_version")
+        .map(|version| {
+            version
+                .as_u64()
+                .and_then(|version| u8::try_from(version).ok())
+                .context("owned decode protocol_version must be an unsigned byte")
+        })
+        .transpose()?
+        .unwrap_or(OWNED_DECODE_ENVELOPE_PROTOCOL_VERSION);
+    ensure!(
+        protocol_version == OWNED_DECODE_ENVELOPE_PROTOCOL_VERSION,
+        "owned decode request uses unsupported protocol_version {protocol_version}"
+    );
+
+    fn optional_nonempty_string(
+        fields: &mut serde_json::Map<String, Value>,
+        name: &str,
+    ) -> Result<Option<String>> {
+        let Some(value) = fields.remove(name) else {
+            return Ok(None);
+        };
+        let value = value
+            .as_str()
+            .context("owned decode stream field must be a string")?;
+        ensure!(
+            !value.is_empty(),
+            "owned decode stream field must not be empty"
+        );
+        Ok(Some(value.to_string()))
+    }
+
+    Ok(OwnedStreamRequestFields {
+        session_id: optional_nonempty_string(fields, "session_id")?,
+        processing_fingerprint: optional_nonempty_string(fields, "processing_fingerprint")?,
+        derived_digest: optional_nonempty_string(fields, "derived_digest")?,
+    })
+}
+
 #[derive(Debug, Parser)]
 struct Args {
     #[arg(long)]
@@ -1988,7 +2053,9 @@ fn ensure_handoff_budget(
 struct LoadedRuntime {
     model_ref: String,
     decode_fingerprint: String,
+    processing_fingerprint: String,
     runtime_config_digest: String,
+    derived_digest: Option<String>,
     production_n: u32,
     /// Machine-configured free-text chain span. Constraint requests override it
     /// to one at start because host-side token masking needs per-token logits.
@@ -2128,8 +2195,121 @@ struct ActiveConstraint {
     schema_identity: String,
 }
 
+#[derive(Clone)]
+struct ActiveStream {
+    req_id: String,
+    session_id: String,
+    identity: OneshotEnvelopeIdentity,
+    next_stream_sequence: u64,
+    reported_token_count: usize,
+}
+
+impl ActiveStream {
+    fn next_envelope(
+        &mut self,
+        frame: StreamWorkerFrame,
+    ) -> Result<StreamFrameEnvelope, DecodeError> {
+        let sequence = StreamSequence(self.next_stream_sequence);
+        self.next_stream_sequence = self
+            .next_stream_sequence
+            .checked_add(1)
+            .ok_or(DecodeError::ProtocolMismatch)?;
+        Ok(StreamFrameEnvelope::new(
+            self.req_id.clone(),
+            self.session_id.clone(),
+            sequence,
+            frame,
+        ))
+    }
+
+    fn progress(
+        &mut self,
+        generated_ids: &[u32],
+    ) -> Result<Option<StreamFrameEnvelope>, DecodeError> {
+        let committed_token_ids = generated_ids
+            .get(self.reported_token_count..)
+            .ok_or(DecodeError::ProtocolMismatch)?
+            .to_vec();
+        if committed_token_ids.is_empty() {
+            return Ok(None);
+        }
+        let committed_token_count =
+            u32::try_from(generated_ids.len()).map_err(|_| DecodeError::ProtocolMismatch)?;
+        self.reported_token_count = generated_ids.len();
+        self.next_envelope(StreamWorkerFrame::Progress {
+            progress: ProgressFrame {
+                committed_token_ids,
+                committed_token_count,
+            },
+        })
+        .map(Some)
+    }
+
+    fn terminal(
+        &mut self,
+        generated_ids: &[u32],
+        terminal_state: TerminalState,
+    ) -> Result<StreamFrameEnvelope, DecodeError> {
+        let committed_token_count =
+            u32::try_from(generated_ids.len()).map_err(|_| DecodeError::ProtocolMismatch)?;
+        let terminal = TerminalEnvelope {
+            req_id: self.req_id.clone(),
+            session_id: self.session_id.clone(),
+            committed_token_count,
+            tokens_emitted: committed_token_count,
+            identity: self.identity.clone(),
+            terminal_state,
+            decode_mode: DecodeMode::Serial,
+            speculative_telemetry: None,
+        };
+        let frame = match terminal_state {
+            TerminalState::Completed => StreamWorkerFrame::Final { terminal },
+            TerminalState::Aborted
+            | TerminalState::ArtifactDisabled
+            | TerminalState::ArtifactRevoked
+            | TerminalState::Failed => StreamWorkerFrame::Error { terminal },
+        };
+        self.next_envelope(frame)
+    }
+}
+
+struct ClosedGeneration {
+    stream: ActiveStream,
+    generated_ids: Vec<u32>,
+    terminal_state: TerminalState,
+}
+
+fn cancellation_response(
+    req_id: String,
+    generation_id: String,
+    generated_ids: &[u32],
+) -> Result<CancelledTransportResponse, DecodeError> {
+    Ok(CancelledTransportResponse {
+        req_id,
+        generation_id,
+        committed_token_count: u32::try_from(generated_ids.len())
+            .map_err(|_| DecodeError::ProtocolMismatch)?,
+    })
+}
+
+fn frames_for_closed_generation(
+    mut closed: ClosedGeneration,
+) -> Result<Vec<StreamFrameEnvelope>, DecodeError> {
+    let mut frames = Vec::with_capacity(2);
+    if let Some(progress) = closed.stream.progress(&closed.generated_ids)? {
+        frames.push(progress);
+    }
+    frames.push(
+        closed
+            .stream
+            .terminal(&closed.generated_ids, closed.terminal_state)?,
+    );
+    Ok(frames)
+}
+
 struct ResidentGeneration {
     generation_id: String,
+    stream: ActiveStream,
     max_tokens: u32,
     generated_ids: Vec<u32>,
     quantum_sequence: u32,
@@ -2159,6 +2339,7 @@ struct WorkerState {
     forced_token_fast_path: bool,
     loaded: Option<LoadedRuntime>,
     resident: Option<ResidentGeneration>,
+    closed_generation: Option<ClosedGeneration>,
 }
 
 impl WorkerState {
@@ -2168,6 +2349,7 @@ impl WorkerState {
             forced_token_fast_path,
             loaded: None,
             resident: None,
+            closed_generation: None,
         }
     }
 
@@ -2292,8 +2474,14 @@ impl WorkerState {
         self.loaded = Some(LoadedRuntime {
             model_ref: model_ref.clone(),
             decode_fingerprint: required_config(runtime_config, "decode_fingerprint")?.to_string(),
+            processing_fingerprint: required_config(runtime_config, "processing_fingerprint")?
+                .to_string(),
             runtime_config_digest: required_config(runtime_config, "runtime_config_digest")?
                 .to_string(),
+            derived_digest: runtime_config
+                .get("derived_digest")
+                .filter(|digest| !digest.is_empty())
+                .cloned(),
             production_n,
             decode_chain_k,
             stop_ids,
@@ -2309,6 +2497,102 @@ impl WorkerState {
             dims: 0,
             cold_load_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
         })
+    }
+
+    fn stream_for_start(
+        &self,
+        req_id: String,
+        start: &GenerateStart,
+        fields: OwnedStreamRequestFields,
+    ) -> Result<ActiveStream, DecodeError> {
+        let loaded = self
+            .loaded
+            .as_ref()
+            .ok_or(DecodeError::RuntimeConfigMismatch)?;
+        let session_id = fields
+            .session_id
+            .unwrap_or_else(|| start.generation_id.clone());
+        if fields
+            .processing_fingerprint
+            .as_deref()
+            .is_some_and(|fingerprint| fingerprint != loaded.processing_fingerprint)
+        {
+            return Err(DecodeError::ProtocolMismatch);
+        }
+        if let Some(derived_digest) = fields.derived_digest.as_deref() {
+            if loaded.derived_digest.as_deref() != Some(derived_digest) {
+                return Err(DecodeError::ProtocolMismatch);
+            }
+        }
+        let processing_fingerprint = loaded.processing_fingerprint.clone();
+        let derived_digest = loaded.derived_digest.clone();
+        if req_id.is_empty() || session_id.is_empty() || processing_fingerprint.is_empty() {
+            return Err(DecodeError::ProtocolMismatch);
+        }
+        Ok(ActiveStream {
+            req_id,
+            session_id,
+            identity: OneshotEnvelopeIdentity {
+                decode_fingerprint: Fingerprint(loaded.decode_fingerprint.clone()),
+                processing_fingerprint: Fingerprint(processing_fingerprint),
+                runtime_config_digest: loaded.runtime_config_digest.clone(),
+                worker_generation: self.worker_generation,
+                derived_digest,
+            },
+            next_stream_sequence: StreamSequence::FIRST.0,
+            reported_token_count: 0,
+        })
+    }
+
+    fn close_resident(&mut self, terminal_state: TerminalState) {
+        if self.closed_generation.is_none() {
+            if let Some(resident) = self.resident.take() {
+                self.closed_generation = Some(ClosedGeneration {
+                    stream: resident.stream,
+                    generated_ids: resident.generated_ids,
+                    terminal_state,
+                });
+            }
+        }
+    }
+
+    fn fail_active_generation(&mut self) {
+        self.close_resident(TerminalState::Failed);
+    }
+
+    fn progress_frames(&mut self) -> Result<Vec<StreamFrameEnvelope>, DecodeError> {
+        let resident = self
+            .resident
+            .as_mut()
+            .ok_or(DecodeError::ProtocolMismatch)?;
+        Ok(resident
+            .stream
+            .progress(&resident.generated_ids)?
+            .into_iter()
+            .collect())
+    }
+
+    fn closed_frames(&mut self) -> Result<Vec<StreamFrameEnvelope>, DecodeError> {
+        let closed = self
+            .closed_generation
+            .take()
+            .ok_or(DecodeError::ProtocolMismatch)?;
+        frames_for_closed_generation(closed)
+    }
+
+    fn failure_frames(
+        &mut self,
+        stream: ActiveStream,
+    ) -> Result<Vec<StreamFrameEnvelope>, DecodeError> {
+        if self.closed_generation.is_some() {
+            self.closed_frames()
+        } else {
+            frames_for_closed_generation(ClosedGeneration {
+                stream,
+                generated_ids: Vec::new(),
+                terminal_state: TerminalState::Failed,
+            })
+        }
     }
 
     fn certification_fallback_probe(
@@ -2377,14 +2661,11 @@ impl WorkerState {
         })
     }
 
-    fn start(&mut self, start: GenerateStart) -> FrameEnvelope {
-        match self.try_start(start) {
-            Ok(frame) => FrameEnvelope::new(frame),
-            Err(error) => error_frame(error),
-        }
-    }
-
-    fn try_start(&mut self, start: GenerateStart) -> Result<WorkerFrame, DecodeError> {
+    fn try_start(
+        &mut self,
+        start: GenerateStart,
+        stream: ActiveStream,
+    ) -> Result<WorkerFrame, DecodeError> {
         let timing_enabled = decode_stage_timing_enabled();
         let request_started = timing_enabled.then(Instant::now);
         let prompt_tokens = start.prompt_ids.len();
@@ -2489,6 +2770,7 @@ impl WorkerState {
         };
         self.resident = Some(ResidentGeneration {
             generation_id: start.generation_id,
+            stream,
             max_tokens: start.max_tokens,
             generated_ids: Vec::with_capacity(start.max_tokens as usize),
             quantum_sequence: 0,
@@ -2513,13 +2795,6 @@ impl WorkerState {
             );
         }
         Ok(frame)
-    }
-
-    fn continue_generation(&mut self, continuation: GenerateContinue) -> FrameEnvelope {
-        match self.try_continue(continuation) {
-            Ok(frame) => FrameEnvelope::new(frame),
-            Err(error) => error_frame(error),
-        }
     }
 
     fn try_continue(&mut self, continuation: GenerateContinue) -> Result<WorkerFrame, DecodeError> {
@@ -2687,7 +2962,6 @@ impl WorkerState {
                         if constraint.automaton.has_complete_value(&constraint.state) {
                             Some(FinishReason::GrammarComplete)
                         } else {
-                            self.resident = None;
                             return Err(DecodeError::GrammarStopBeforeCompletion);
                         }
                     } else {
@@ -2704,7 +2978,6 @@ impl WorkerState {
                         Some(FinishReason::GrammarComplete)
                     } else if resident.generated_ids.len() as u32 == resident.max_tokens {
                         if resident.constraint.is_some() {
-                            self.resident = None;
                             return Err(DecodeError::GrammarMaxTokensExhausted);
                         }
                         Some(FinishReason::MaxTokens)
@@ -3015,9 +3288,8 @@ impl WorkerState {
             let exhausted = resident.generated_ids.len() as u32 == resident.max_tokens;
             if exhausted {
                 // A constrained generation that reaches its configured budget
-                // before completing is a typed terminal failure, not a resident
-                // generation waiting for another continuation.
-                self.resident = None;
+                // before completing becomes a typed terminal failure at its last
+                // committed boundary.
                 return Err(DecodeError::GrammarMaxTokensExhausted);
             }
             return Ok(Some(HintVerification {
@@ -3110,7 +3382,6 @@ impl WorkerState {
         let exhausted =
             terminal.is_none() && resident.generated_ids.len() as u32 == resident.max_tokens;
         if exhausted {
-            self.resident = None;
             return Err(DecodeError::GrammarMaxTokensExhausted);
         }
         Ok(Some(HintVerification {
@@ -3214,9 +3485,16 @@ impl WorkerState {
             .resident
             .take()
             .expect("finish is called only for a resident generation");
+        let generated_ids = resident.generated_ids.clone();
+        let committed_token_count = generated_ids.len() as u32;
+        self.closed_generation = Some(ClosedGeneration {
+            stream: resident.stream.clone(),
+            generated_ids,
+            terminal_state: TerminalState::Completed,
+        });
         WorkerFrame::Final(FinalResponse {
             generation_id: resident.generation_id,
-            committed_token_count: resident.generated_ids.len() as u32,
+            committed_token_count,
             generated_ids: resident.generated_ids,
             decode_fingerprint: self
                 .loaded
@@ -3247,13 +3525,17 @@ impl WorkerState {
     fn cancel(
         &mut self,
         cancellation: &owned_decode_worker::protocol::GenerateCancel,
-    ) -> Result<u32, DecodeError> {
+    ) -> Result<CancelledTransportResponse, DecodeError> {
         let resident = self.resident.take().ok_or(DecodeError::ProtocolMismatch)?;
         if cancellation.generation_id != resident.generation_id {
             self.resident = Some(resident);
             return Err(DecodeError::ProtocolMismatch);
         }
-        Ok(resident.generated_ids.len() as u32)
+        cancellation_response(
+            resident.stream.req_id,
+            resident.generation_id,
+            &resident.generated_ids,
+        )
     }
 }
 
@@ -3262,18 +3544,29 @@ pub fn main() -> Result<()> {
     let worker_generation = worker_generation(&args.nonce)?;
     let mut stream = UnixStream::connect(&args.socket)
         .with_context(|| format!("connect worker socket {}", args.socket.display()))?;
-    let hello = WorkerHello {
-        v: WORKER_PROTOCOL_VERSION,
-        nonce: args.nonce,
-        engine: engine_identity(worker_generation),
-        pid: std::process::id(),
-        max_frame: DEFAULT_MAX_FRAME_BYTES,
+    let hello = DecodeWorkerHello {
+        standard: WorkerHello {
+            v: WORKER_PROTOCOL_VERSION,
+            nonce: args.nonce,
+            engine: engine_identity(worker_generation),
+            pid: std::process::id(),
+            max_frame: DEFAULT_MAX_FRAME_BYTES,
+        },
+        protocol_version: OWNED_DECODE_ENVELOPE_PROTOCOL_VERSION,
     };
     write_json_frame(&mut stream, &hello, DEFAULT_MAX_FRAME_BYTES)?;
-    let ack: WorkerHelloAck = read_json(&mut stream, DEFAULT_MAX_FRAME_BYTES)?;
+    let ack_value: Value = read_json(&mut stream, DEFAULT_MAX_FRAME_BYTES)?;
+    if let Some(protocol_version) = ack_value.get("protocol_version") {
+        ensure!(
+            protocol_version.as_u64() == Some(u64::from(OWNED_DECODE_ENVELOPE_PROTOCOL_VERSION)),
+            "module rejected owned decode envelope protocol version"
+        );
+    }
+    let ack: WorkerHelloAck =
+        serde_json::from_value(ack_value).context("decode worker hello ack")?;
     ensure!(
         ack.v == WORKER_PROTOCOL_VERSION,
-        "module replied with wrong protocol"
+        "module replied with wrong standard worker protocol"
     );
     ensure!(ack.accept, "module rejected worker handshake");
     let max_frame = ack.max_frame.min(DEFAULT_MAX_FRAME_BYTES);
@@ -3292,12 +3585,13 @@ pub fn main() -> Result<()> {
         if args.test_abort_on_request {
             std::process::abort();
         }
-        let value: Value = serde_json::from_slice(&bytes).context("decode request JSON")?;
+        let mut value: Value = serde_json::from_slice(&bytes).context("decode request JSON")?;
         let ty = value
             .get("type")
             .and_then(Value::as_str)
-            .unwrap_or_default();
-        if certification_fault_requested_on_normal_operation(&value, ty) {
+            .unwrap_or_default()
+            .to_string();
+        if certification_fault_requested_on_normal_operation(&value, &ty) {
             write_json_frame(
                 &mut stream,
                 &WorkerResponse::Err {
@@ -3340,12 +3634,13 @@ pub fn main() -> Result<()> {
             continue;
         }
         if matches!(
-            ty,
+            ty.as_str(),
             "GENERATE_START"
                 | "GENERATE_CONTINUE"
                 | "GENERATE_INSTALL_HINT_BANK"
                 | "GENERATE_CANCEL"
         ) {
+            let fields = take_owned_stream_request_fields(&mut value)?;
             let request: DecodeTransportRequest =
                 serde_json::from_value(value).context("decode owned worker request")?;
             handle_decode_request(
@@ -3353,6 +3648,7 @@ pub fn main() -> Result<()> {
                 max_frame,
                 &mut state,
                 request,
+                fields,
                 args.test_abort_after_progress,
                 args.test_abort_after_progress_once.as_deref(),
             )?;
@@ -3418,6 +3714,7 @@ pub fn main() -> Result<()> {
             }
             WorkerRequest::Shutdown {} => {
                 state.resident = None;
+                state.closed_generation = None;
                 state.loaded = None;
                 let _ = stream.shutdown(Shutdown::Both);
                 break;
@@ -3444,6 +3741,7 @@ fn handle_decode_request(
     max_frame: u32,
     state: &mut WorkerState,
     request: DecodeTransportRequest,
+    fields: OwnedStreamRequestFields,
     abort_after_progress: bool,
     abort_after_progress_once: Option<&Path>,
 ) -> Result<()> {
@@ -3455,57 +3753,70 @@ fn handle_decode_request(
         DecodeTransportRequest::GenerateInstallHintBank { .. } => "install_hint_bank",
         DecodeTransportRequest::GenerateCancel { .. } => "cancel",
     });
-    let response = match request {
-        DecodeTransportRequest::GenerateStart { req_id, start } => DecodeTransportResponse::Frame {
-            req_id,
-            envelope: state.start(*start),
-        },
-        DecodeTransportRequest::GenerateContinue {
-            req_id,
-            continuation,
-        } => DecodeTransportResponse::Frame {
-            req_id,
-            envelope: state.continue_generation(continuation),
-        },
+    let (responses, emitted_progress_boundary) = match request {
+        DecodeTransportRequest::GenerateStart { req_id, start } => {
+            let stream_context = match state.stream_for_start(req_id.clone(), &start, fields) {
+                Ok(stream_context) => stream_context,
+                Err(error) => {
+                    write_json_frame(
+                        stream,
+                        &WorkerResponse::Err {
+                            req_id: Some(req_id),
+                            code: error.as_str().to_string(),
+                            msg: "owned decode stream identity is unavailable".to_string(),
+                        },
+                        max_frame,
+                    )?;
+                    return Ok(());
+                }
+            };
+            if state.resident.is_some() {
+                let frames = state.failure_frames(stream_context)?;
+                (stream_frames_to_values(frames)?, false)
+            } else {
+                match state.try_start(*start, stream_context.clone()) {
+                    Ok(frame) => stream_frame_values_for_worker_frame(state, frame)?,
+                    Err(error) => (
+                        stream_failure_values(state, Some(stream_context), error)?,
+                        false,
+                    ),
+                }
+            }
+        }
+        DecodeTransportRequest::GenerateContinue { continuation, .. } => {
+            let _ = fields;
+            match state.try_continue(continuation) {
+                Ok(frame) => stream_frame_values_for_worker_frame(state, frame)?,
+                Err(error) => (stream_failure_values(state, None, error)?, false),
+            }
+        }
         DecodeTransportRequest::GenerateInstallHintBank {
             req_id,
             installation,
-        } => match state.install_hint_bank(installation) {
-            Ok(installation) => DecodeTransportResponse::HintBankInstalled {
-                req_id,
-                installation,
-            },
-            Err(error) => DecodeTransportResponse::Frame {
-                req_id,
-                envelope: error_frame(error),
-            },
-        },
-        DecodeTransportRequest::GenerateCancel {
-            req_id,
-            cancellation,
-        } => match state.cancel(&cancellation) {
-            Ok(committed_token_count) => DecodeTransportResponse::Cancelled {
-                req_id,
-                generation_id: cancellation.generation_id,
-                committed_token_count,
-            },
-            Err(error) => DecodeTransportResponse::Frame {
-                req_id,
-                envelope: error_frame(error),
-            },
-        },
-    };
-    let emitted_progress = matches!(
-        &response,
-        DecodeTransportResponse::Frame {
-            envelope: FrameEnvelope {
-                frame: WorkerFrame::Progress(_),
-                ..
-            },
-            ..
+        } => {
+            let _ = fields;
+            match state.install_hint_bank(installation) {
+                Ok(installation) => (
+                    vec![serde_json::to_value(
+                        DecodeTransportResponse::HintBankInstalled {
+                            req_id,
+                            installation,
+                        },
+                    )?],
+                    false,
+                ),
+                Err(error) => (stream_failure_values(state, None, error)?, false),
+            }
         }
-    );
-    let abort_once = emitted_progress
+        DecodeTransportRequest::GenerateCancel { cancellation, .. } => {
+            let _ = fields;
+            match state.cancel(&cancellation) {
+                Ok(cancellation) => (vec![serde_json::to_value(cancellation)?], false),
+                Err(error) => (stream_failure_values(state, None, error)?, false),
+            }
+        }
+    };
+    let abort_once = emitted_progress_boundary
         && abort_after_progress_once.is_some_and(|marker| {
             fs::OpenOptions::new()
                 .write(true)
@@ -3513,12 +3824,14 @@ fn handle_decode_request(
                 .open(marker)
                 .is_ok()
         });
-    if emitted_progress && (abort_after_progress || abort_once) {
+    if emitted_progress_boundary && (abort_after_progress || abort_once) {
         std::process::abort();
     }
     let dispatch = elapsed_if_enabled(request_started.as_ref());
     let publication_started = timing_enabled.then(Instant::now);
-    write_json_frame(stream, &response, max_frame)?;
+    for response in responses {
+        write_json_frame(stream, &response, max_frame)?;
+    }
     if let Some(request_kind) = request_kind {
         eprintln!(
             "Decode protocol timing: request={request_kind} dispatch_ms={:.3} publication_ms={:.3} worker_total_ms={:.3}",
@@ -3528,6 +3841,49 @@ fn handle_decode_request(
         );
     }
     Ok(())
+}
+
+fn stream_frames_to_values(frames: Vec<StreamFrameEnvelope>) -> Result<Vec<Value>> {
+    frames
+        .into_iter()
+        .map(serde_json::to_value)
+        .collect::<serde_json::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+fn stream_frame_values_for_worker_frame(
+    state: &mut WorkerState,
+    frame: WorkerFrame,
+) -> Result<(Vec<Value>, bool)> {
+    let (frames, emitted_progress_boundary) = match frame {
+        WorkerFrame::Progress(_) => (state.progress_frames()?, true),
+        WorkerFrame::Final(_) => (state.closed_frames()?, false),
+        WorkerFrame::Error { .. } => {
+            state.fail_active_generation();
+            (state.closed_frames()?, false)
+        }
+    };
+    Ok((stream_frames_to_values(frames)?, emitted_progress_boundary))
+}
+
+fn stream_failure_values(
+    state: &mut WorkerState,
+    fallback_stream: Option<ActiveStream>,
+    error: DecodeError,
+) -> Result<Vec<Value>> {
+    state.fail_active_generation();
+    let frames = match fallback_stream {
+        Some(stream) => state.failure_frames(stream)?,
+        None if state.closed_generation.is_some() => state.closed_frames()?,
+        None => {
+            return Ok(vec![serde_json::to_value(WorkerResponse::Err {
+                req_id: None,
+                code: error.as_str().to_string(),
+                msg: "owned decode request has no active stream".to_string(),
+            })?]);
+        }
+    };
+    stream_frames_to_values(frames)
 }
 
 fn load_constraint(
@@ -3860,12 +4216,6 @@ fn token_vocabulary_digest(vocabulary: &TokenVocabulary) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn error_frame(error: DecodeError) -> FrameEnvelope {
-    FrameEnvelope::new(WorkerFrame::Error {
-        id: error.as_str().to_string(),
-    })
-}
-
 /// Build the identity announced in the worker HELLO handshake.
 pub fn engine_identity(worker_generation: u64) -> EngineIdentity {
     let mut build_flags = BTreeMap::new();
@@ -4029,10 +4379,171 @@ fn read_json<T: serde::de::DeserializeOwned>(stream: &mut UnixStream, max_frame:
 }
 
 #[cfg(test)]
+fn checkpoint_test_stream(generation_id: &str) -> ActiveStream {
+    ActiveStream {
+        req_id: format!("checkpoint-request-{generation_id}"),
+        session_id: format!("checkpoint-session-{generation_id}"),
+        identity: OneshotEnvelopeIdentity {
+            decode_fingerprint: Fingerprint("forced-token-fast-path-qwen3-f16".to_string()),
+            processing_fingerprint: Fingerprint("checkpoint-processing".to_string()),
+            runtime_config_digest: "forced-token-fast-path-runtime-v1".to_string(),
+            worker_generation: 1,
+            derived_digest: None,
+        },
+        next_stream_sequence: StreamSequence::FIRST.0,
+        reported_token_count: 0,
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::io::Write;
 
     use super::*;
+
+    fn test_stream() -> ActiveStream {
+        ActiveStream {
+            req_id: "request-1".to_string(),
+            session_id: "session-1".to_string(),
+            identity: OneshotEnvelopeIdentity {
+                decode_fingerprint: Fingerprint("decode-fingerprint".to_string()),
+                processing_fingerprint: Fingerprint("processing-fingerprint".to_string()),
+                runtime_config_digest: "runtime-digest".to_string(),
+                worker_generation: 7,
+                derived_digest: Some("derived-digest".to_string()),
+            },
+            next_stream_sequence: StreamSequence::FIRST.0,
+            reported_token_count: 0,
+        }
+    }
+
+    #[test]
+    fn worker_hello_advertises_owned_decode_envelope_v2() {
+        let hello = DecodeWorkerHello {
+            standard: WorkerHello {
+                v: WORKER_PROTOCOL_VERSION,
+                nonce: "0123456789abcdef".to_string(),
+                engine: engine_identity(7),
+                pid: 1,
+                max_frame: DEFAULT_MAX_FRAME_BYTES,
+            },
+            protocol_version: OWNED_DECODE_ENVELOPE_PROTOCOL_VERSION,
+        };
+        let value = serde_json::to_value(hello).unwrap();
+        assert_eq!(value["protocol_version"], 2);
+        assert_eq!(
+            serde_json::from_value::<WorkerHello>(value.clone())
+                .unwrap()
+                .nonce,
+            "0123456789abcdef"
+        );
+        assert_eq!(value["v"], WORKER_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn request_metadata_negotiates_v2_without_relaxing_legacy_command_validation() {
+        let mut value = serde_json::json!({
+            "type": "GENERATE_CANCEL",
+            "protocol_version": 2,
+            "req_id": "control-request",
+            "session_id": "session-1",
+            "processing_fingerprint": "processing-fingerprint",
+            "derived_digest": "derived-digest",
+            "cancellation": { "generation_id": "generation-1" },
+        });
+        let fields = take_owned_stream_request_fields(&mut value).unwrap();
+        assert_eq!(fields.session_id.as_deref(), Some("session-1"));
+        assert_eq!(
+            fields.processing_fingerprint.as_deref(),
+            Some("processing-fingerprint")
+        );
+        assert_eq!(fields.derived_digest.as_deref(), Some("derived-digest"));
+        assert!(serde_json::from_value::<DecodeTransportRequest>(value).is_ok());
+
+        let mut retired = serde_json::json!({ "protocol_version": 1 });
+        assert!(take_owned_stream_request_fields(&mut retired).is_err());
+    }
+
+    #[test]
+    fn progress_and_terminal_frames_preserve_committed_token_history() {
+        let mut stream = test_stream();
+        let first = stream.progress(&[10, 11]).unwrap().unwrap();
+        let closed = ClosedGeneration {
+            stream,
+            generated_ids: vec![10, 11, 12],
+            terminal_state: TerminalState::Completed,
+        };
+        let terminal_frames = frames_for_closed_generation(closed).unwrap();
+        assert_eq!(terminal_frames.len(), 2);
+
+        let mut validator = synapse_core::StreamContractValidator::new("request-1", "session-1");
+        assert_eq!(
+            validator.observe(&first),
+            Ok(synapse_core::StreamFrameDisposition::Accepted)
+        );
+        assert_eq!(
+            validator.observe(&terminal_frames[0]),
+            Ok(synapse_core::StreamFrameDisposition::Accepted)
+        );
+        assert_eq!(
+            validator.observe(&terminal_frames[1]),
+            Ok(synapse_core::StreamFrameDisposition::Accepted)
+        );
+        assert_eq!(validator.committed_token_count(), 3);
+        let StreamWorkerFrame::Progress { progress } = &terminal_frames[0].frame else {
+            panic!("the final quantum must publish its newly committed token IDs first");
+        };
+        assert_eq!(progress.committed_token_ids, vec![12]);
+        assert_eq!(progress.committed_token_count, 3);
+        let StreamWorkerFrame::Final { terminal } = &terminal_frames[1].frame else {
+            panic!("successful generation must end in a final frame");
+        };
+        assert_eq!(terminal.tokens_emitted, 3);
+        assert_eq!(terminal.committed_token_count, 3);
+        assert_eq!(
+            terminal.identity.processing_fingerprint.0,
+            "processing-fingerprint"
+        );
+    }
+
+    #[test]
+    fn cancellation_acknowledges_the_original_request_boundary() {
+        let stream = test_stream();
+        let cancellation =
+            cancellation_response(stream.req_id, "generation-1".to_string(), &[31, 32, 33])
+                .unwrap();
+        assert_eq!(
+            serde_json::to_value(cancellation).unwrap(),
+            serde_json::json!({
+                "req_id": "request-1",
+                "generation_id": "generation-1",
+                "committed_token_count": 3,
+            })
+        );
+    }
+
+    #[test]
+    fn failed_terminal_reports_only_the_committed_prefix() {
+        let mut stream = test_stream();
+        let first = stream.progress(&[21, 22]).unwrap().unwrap();
+        let closed = ClosedGeneration {
+            stream,
+            generated_ids: vec![21, 22],
+            terminal_state: TerminalState::Failed,
+        };
+        let frames = frames_for_closed_generation(closed).unwrap();
+        assert_eq!(frames.len(), 1);
+        let StreamWorkerFrame::Error { terminal } = &frames[0].frame else {
+            panic!("failed generation must end in an error frame");
+        };
+        assert_eq!(terminal.committed_token_count, 2);
+        assert_eq!(terminal.tokens_emitted, 2);
+
+        let mut validator = synapse_core::StreamContractValidator::new("request-1", "session-1");
+        validator.observe(&first).unwrap();
+        validator.observe(&frames[0]).unwrap();
+        assert_eq!(validator.committed_token_count(), 2);
+    }
 
     #[test]
     fn worker_generation_is_bound_to_nonce() {
@@ -4487,6 +4998,7 @@ mod tests {
 
 #[cfg(test)]
 mod fast_path_tests {
+    use super::checkpoint_test_stream;
     use std::{
         collections::BTreeMap,
         path::{Path, PathBuf},
@@ -4744,6 +5256,10 @@ mod fast_path_tests {
             "runtime_config_digest".to_string(),
             "forced-token-fast-path-runtime-v1".to_string(),
         );
+        runtime_config.insert(
+            "processing_fingerprint".to_string(),
+            "forced-token-fast-path-processing-v1".to_string(),
+        );
         state
             .load(
                 "forced-token-load".to_string(),
@@ -4794,17 +5310,20 @@ mod fast_path_tests {
             .to_vec();
         let started = Instant::now();
         let mut frame = state
-            .try_start(GenerateStart {
-                generation_id: generation_id.to_string(),
-                loaded_model_ref: "owned-decode:0".to_string(),
-                decode_fingerprint: "forced-token-fast-path-qwen3-f16".to_string(),
-                runtime_config_digest: "forced-token-fast-path-runtime-v1".to_string(),
-                prompt_ids,
-                stop_ids: Vec::new(),
-                max_tokens: 256,
-                sampling: Sampling::greedy_top1(),
-                constraint: Some(constraint),
-            })
+            .try_start(
+                GenerateStart {
+                    generation_id: generation_id.to_string(),
+                    loaded_model_ref: "owned-decode:0".to_string(),
+                    decode_fingerprint: "forced-token-fast-path-qwen3-f16".to_string(),
+                    runtime_config_digest: "forced-token-fast-path-runtime-v1".to_string(),
+                    prompt_ids,
+                    stop_ids: Vec::new(),
+                    max_tokens: 256,
+                    sampling: Sampling::greedy_top1(),
+                    constraint: Some(constraint),
+                },
+                checkpoint_test_stream(generation_id),
+            )
             .expect("start constrained checkpoint generation");
         loop {
             match frame {
