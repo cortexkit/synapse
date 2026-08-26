@@ -178,14 +178,14 @@ cargo build --release -p synapse-bench
 Build locally, then rsync the source, binaries, model packages, prepared JSONL, and ORT references to the M1 box:
 
 ```bash
-ssh [bench-host-alias] 'rm -rf ~/bench-tools/ane-spike && mkdir -p ~/bench-tools/ane-spike/{src,bin,models,data,reference,results}'
+ssh $SYNAPSE_BENCH_HOST 'rm -rf ~/bench-tools/ane-spike && mkdir -p ~/bench-tools/ane-spike/{src,bin,models,data,reference,results}'
 
-rsync -av bench/spikes/ane-minilm/ [bench-host-alias]:~/bench-tools/ane-spike/src/
-rsync -av bench/spikes/ane-minilm/.build/ane-coreml [bench-host-alias]:~/bench-tools/ane-spike/bin/
-rsync -av target/release/synapse-bench [bench-host-alias]:~/bench-tools/ane-spike/bin/
-rsync -av ~/bench-tools/ane-spike/models/ [bench-host-alias]:~/bench-tools/ane-spike/models/
-rsync -av ~/bench-tools/ane-spike/data/ [bench-host-alias]:~/bench-tools/ane-spike/data/
-rsync -av ~/bench-tools/ane-spike/reference/ [bench-host-alias]:~/bench-tools/ane-spike/reference/
+rsync -av bench/spikes/ane-minilm/ $SYNAPSE_BENCH_HOST:~/bench-tools/ane-spike/src/
+rsync -av bench/spikes/ane-minilm/.build/ane-coreml $SYNAPSE_BENCH_HOST:~/bench-tools/ane-spike/bin/
+rsync -av target/release/synapse-bench $SYNAPSE_BENCH_HOST:~/bench-tools/ane-spike/bin/
+rsync -av ~/bench-tools/ane-spike/models/ $SYNAPSE_BENCH_HOST:~/bench-tools/ane-spike/models/
+rsync -av ~/bench-tools/ane-spike/data/ $SYNAPSE_BENCH_HOST:~/bench-tools/ane-spike/data/
+rsync -av ~/bench-tools/ane-spike/reference/ $SYNAPSE_BENCH_HOST:~/bench-tools/ane-spike/reference/
 ```
 
 ### 2) Compile the `.mlpackage` models on the M1 box
@@ -193,7 +193,7 @@ rsync -av ~/bench-tools/ane-spike/reference/ [bench-host-alias]:~/bench-tools/an
 The remote host does not need `coremlcompiler`; the Swift CLI's `compile` subcommand calls `MLModel.compileModel(at:)` directly.
 
 ```bash
-ssh [bench-host-alias] '
+ssh $SYNAPSE_BENCH_HOST '
 set -euo pipefail
 cd ~/bench-tools/ane-spike
 bin/ane-coreml compile --model models/all-MiniLM-L6-v2-seq256.mlpackage --out models/all-MiniLM-L6-v2-seq256.mlmodelc
@@ -204,7 +204,7 @@ bin/ane-coreml compile --model models/all-MiniLM-L6-v2-seq512.mlpackage --out mo
 ### 3) Placement reports on the M1 box
 
 ```bash
-ssh [bench-host-alias] '
+ssh $SYNAPSE_BENCH_HOST '
 set -euo pipefail
 cd ~/bench-tools/ane-spike
 head -n 1 data/aft-1000-b256.jsonl > data/aft-1-b256.jsonl
@@ -231,7 +231,7 @@ bin/ane-coreml embed \
 Prime `sudo` with the operator-provided password, then keep the lock only for the timed embed runs themselves:
 
 ```bash
-ssh [bench-host-alias] '
+ssh $SYNAPSE_BENCH_HOST '
 set -euo pipefail
 cd ~/bench-tools/ane-spike
 cleanup() {
@@ -239,10 +239,10 @@ cleanup() {
     kill "$PM_PID" >/dev/null 2>&1 || true
     wait "$PM_PID" 2>/dev/null || true
   fi
-  rmdir [bench-user-home]/bench.lock >/dev/null 2>&1 || true
+  rmdir $SYNAPSE_BENCH_ROOT/bench.lock >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
-until mkdir [bench-user-home]/bench.lock 2>/dev/null; do sleep 30; done
+until mkdir $SYNAPSE_BENCH_ROOT/bench.lock 2>/dev/null; do sleep 30; done
 for bucket in 256 512; do
   echo "<operator-provided sudo password>" | sudo -S -p "" true >/dev/null
   rm -f "results/powermetrics-b${bucket}.txt"
@@ -270,7 +270,7 @@ done
 ### 5) Pull the results back
 
 ```bash
-rsync -av [bench-host-alias]:~/bench-tools/ane-spike/results/ /tmp/ane-m1-results/
+rsync -av $SYNAPSE_BENCH_HOST:~/bench-tools/ane-spike/results/ /tmp/ane-m1-results/
 ```
 
 ## Notes

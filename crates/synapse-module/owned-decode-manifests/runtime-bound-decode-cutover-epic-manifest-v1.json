@@ -4,13 +4,13 @@
   "artifact_kind": "epic_manifest",
   "epic_id": "runtime-bound-decode-cutover",
   "source_spec": {
-    "path": ".cortexkit/alfonso/drafts/2026-08-08-runtime-bound-records-refire2.md",
-    "sha256": "f8e93a5ff083dc76d37db68f3f778da44ce53c6274f0730eea2d58b319a5d03b"
+    "path": "release-metadata/runtime-bound-decode-cutover",
+    "sha256": "not-applicable"
   },
   "acceptance_criterion": "33",
   "slice": {
     "id": "slice-1-contracts-and-manifests",
-    "work_item": "wi:[consult-id]:4:s1",
+    "work_item": "release:slice-1-contracts-and-manifests",
     "file_fence": [
       "**/manifests/**",
       "**/*-manifest.*",

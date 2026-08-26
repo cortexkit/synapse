@@ -58,7 +58,7 @@ The f16 path cleared the tail-sensitive gate shape the project uses elsewhere (`
 
 ### Throughput on the M1 bench box
 
-Timed runs used the shared lock at `[bench-user-home]/bench.lock`. The new f16 numbers were measured after the parity pass above, then rerun immediately under the same lock to capture the warm-cache state identically to the published fp32 rows.
+Timed runs used the shared lock at `$SYNAPSE_BENCH_ROOT/bench.lock`. The new f16 numbers were measured after the parity pass above, then rerun immediately under the same lock to capture the warm-cache state identically to the published fp32 rows.
 
 | Variant | First locked tok/s | Warm locked tok/s | Notes |
 |---|---:|---:|---|

@@ -1,22 +1,26 @@
-# Synapse (CortexKit AI module) — founding handoff
+# Synapse founding design notes
 
-Written by AFT-Alfonso for the new project session. AFT is the first consumer, Magic Context the second. This document carries everything the AFT session learned that the new module inherits. Treat it as input, not gospel: re-derive the architecture yourself, but do not re-learn these measurements the hard way.
+This document records the reusable technical decisions that shaped the module.
+Treat it as design input, not gospel: re-derive the architecture and validate
+measurements with public evidence.
 
 ## Mission
 
-One subc-supervised module that is the AI house for the whole CortexKit family: local inference (embeddings, rerankers, micro-LLMs; later image gen, STT, TTS) AND the gateway for remote AI endpoints (OpenAI-compatible, Ollama, LMStudio, provider APIs), so consumers talk to ONE surface regardless of where the model runs. LMStudio-like capability, but daemon-native (subc module, no GUI), multi-consumer, credential-integrated.
+One supervised module provides local inference (embeddings, rerankers,
+micro-LLMs; later image generation, STT, and TTS) and a gateway for remote AI
+endpoints, so consumers use one surface regardless of model location.
 
-- Consumers: AFT (semantic search — extraction of its embedding pipeline is already-decided architecture), Magic Context (embeddings; they hit the same class of problems), Alfonso/llm-runner (micro-LLM calls, TBD scope split), future products.
-- Remote auth: through the claustrum credentials module (~/Work/Projects/CortexKit/cortexkit-credentials) — the module never holds raw user API keys itself.
-- subc supervises the module process; consumers reach it over subc routing like any module.
+- Consumers: search, user-interface, and automation clients, plus future products.
+- Remote auth: through a separately documented credentials provider — the module never holds raw user API keys itself.
+- The supervisor manages the module process; consumers reach it through the module routing interface.
 
-## SUBC's founding answers (verbatim-sourced, 2026-07-04, pm_b4bff216)
+## Initial technical constraints
 
 1. **Prior art / name**: "embedding-engine" in early subc sketches was a placeholder — nothing designed or reserved; SUPERSEDED by this module. The founding session owns the name (avoid llm-runner-adjacent names). Manifest: register as a **ManagementSurface** (operations embed / rerank / infer / models.list, kind Query), NOT a ToolProvider — these are module-to-module capabilities, not agent-facing tools. execution_mode only exists on Tool entries; moot unless agent-facing tools are exposed later (then: stateless inference = pure, artifact-writing = mutating).
 
-2. **Credentials contract** (implemented, production-proven via llm-runner's `AuthMode::FromVault`): vault = subc-supervised claustrum credentials module (reserved, spawn-attested). Flow: operator imports credentials offline via CLI and mints capability handles (`ckh_…`); the consuming module reads its handles from `~/.config/cortexkit/<module>/vault-handles.json` (0600), opens an ordinary consumer connection, route.opens to the credentials module, requests payload by handle. Handles are the only scoping primitive in v1. Implemented already: read path, crash-safe OAuth refresh (epoch-CAS, kill-9-proven), HMAC audit chain, enumeration limiter, keychain master-key custody, and a `report_auth_failure` wire op (`{handle, provider_status}` on 401/403 so the vault can mark/refresh). Credential-id convention: `<method>:<provider>` (apikey:openai, oauth:anthropic). For remote AI endpoints: copy the llm-runner pattern exactly.
+2. **Credentials contract**: obtain opaque credential references through a separately documented provider API. The serving module must not read raw credentials, must report provider failures through that API, and must keep provider-specific refresh and audit behavior outside this repository.
 
-3. **Day-one constraints**: subc-protocol >= 0.6.x + subc-transport >= 0.3.x (principal era; SDK auto-attaches consumer_identity). Two-crate split per module template: `<x>-core` (pure logic) + `<x>-module` (wire binary); **ai-provider-quota is the canonical reference** (quota-module/src/main.rs). Storage: cortexkit-store descriptor delivered via HELLO_ACK, database-per-module (`~/.local/share/cortexkit/<module>/store.db`), never self-invented paths. Config: standard cortexkit locations, module is a read-only consumer. **Spawn model for GPU runtimes: subc supervises the MODULE PROCESS ONLY; heavy model runtimes (llama.cpp server, MLX process) are CHILDREN the module itself spawns and supervises** — keeps subc thin, lets the module swap runtimes without losing registration/routes, matches the subc→module→workers hierarchy. Module must degrade (not crash) on child death. CI: Blacksmith runners + cortexkit-ci App secrets for the cross-repo subconscious checkout (llm-runner's ci.yml is the template). Peer-owns-repo from day one.
+3. **Day-one constraints**: maintain compatible protocol and transport versions, split pure logic from the wire binary, and use standard XDG storage and configuration paths. **Spawn model for GPU runtimes: supervise the module process only; heavy model runtimes (llama.cpp server, MLX process) are children the module spawns and supervises.** The module must degrade rather than crash on child death. CI must use public dependencies and repository-scoped credentials only.
 
 4. **Scope vs llm-runner — separate modules, crisp line**: llm-runner = durable agentic SESSION engine (multi-turn loops, WAL/replay, chat wire families, tool dispatch). This module = model SERVING — stateless capability inference (embed batch, rerank candidates, transcribe audio, one-shot micro-LLM completion as a raw primitive). Rule: conversation/session/tool semantics → llm-runner; stateless capability inference → this module. Deferred convergence (do not design now): llm-runner may later consume this module's local models as a provider backend — lands as a ProviderSpec on llm-runner's side, zero changes here if the serving surface is clean.
 
@@ -64,12 +68,12 @@ Apple Silicon GPU (spiked, not yet shipped):
 - ORT CoreML EP is a DEAD END for both ANE and GPU on transformer embedders — four independent measurements, ANE fixed at 0. Do not retry this path.
 - MLX is the real path: Python mlx Qwen3-Embedding-0.6B hit 22.8K tok/s on code (7.4x faster than ONNX CPU) at ~60W GPU / ~11W CPU (CPU essentially freed). mlx-rs from Rust reproduces it (~62W GPU) with cosine parity >= 0.9994 vs Python on real bf16 weights (last-token pool + L2-normalize).
 - mlx-rs build needs full Xcode + Metal toolchain component — CI implication (macOS runners need the Metal component or prebuilt artifacts).
-- Spike artifacts: the CoreML/ANE spike source survives at aft:.alfonso/spikes/coreml_spike.rs (the dead-end evidence). The MLX spikes (Python throughput, Rust GPU offload, Rust bf16 parity vs mlx-embeddings with last-token pool + L2-normalize) were ephemeral — code cleaned up after proof — but the method is fully described in AFT session history and reproducible in ~1 day: reference vectors from Python mlx-embeddings, token-ID parity harness, vendored mlx-rs path dep. Ask AFT-Alfonso for the transcript if needed.
+- Spike artifacts for retired experiments are not part of the release. Reproduce the MLX method with public reference vectors, a token-ID parity harness, and documented mlx-rs dependencies.
 - Platform GPU landscape (from the same investigation): no framework unifies GPUs. Apple Silicon = MLX (proven). NVIDIA = ORT CUDA EP (mature, cheap to add — unlike its CoreML EP). AMD/Intel = fragmented, low ROI. Universal floor = bounded-CPU ort. Burn is the one candidate that could challenge the N-backends conclusion — evaluate it against this table.
 
 Model landscape (as of our research; re-survey):
 - gte-modernbert-base was our chosen upgrade target for code retrieval (CoIR ~79) — one model servable on both the MLX lane and the bounded-CPU ort lane.
-- model2vec (Potion Code 16M) from a contributor PR: static embeddings, no attention, no OOM class at all — interesting as a low-end/CPU-floor tier. Quantized vector storage + RRF fusion ideas from the same PR (cortexkit/aft#87) worth mining.
+- model2vec (Potion Code 16M) from a contributor PR: static embeddings, no attention, no OOM class at all — interesting as a low-end/CPU-floor tier. Quantized vector storage and RRF fusion ideas from earlier public work are worth mining.
 - Qwen3-Embedding-0.6B proven on MLX lane.
 
 Remote endpoints (scar tissue from AFT's semantic backends):
@@ -84,12 +88,12 @@ Remote endpoints (scar tissue from AFT's semantic backends):
 - Frames: dedicated reader task, never read_frame inside select! (cancellation-safety desync — AFT hit stream desync in production tests).
 - Long-running calls: inference is stateless but cold model loads run 60s+. AFT built a deferred-response pattern for its long bash calls; as a ManagementSurface this module should still avoid blocking its wire loop on model loads — async load + building/ready states, or ask SUBC what the ManagementSurface equivalent of deferred responses is.
 - Principal trust: direct/reserved/absent; the module should decide day one what untrusted binds may do (probably: nothing without credentials scoping).
-- Storage convention: config ~/.config/cortexkit/<module>.jsonc, data ~/.local/share/cortexkit/<module>/. Models are BIG — a shared model cache dir (~/.local/share/cortexkit/models/?) shared across module restarts, with checksummed downloads (AFT's downloader has the TOFU/sha256 patterns).
+- Storage convention: use XDG configuration and data directories. Models are large, so use a shared model cache across module restarts with checksummed downloads.
 - GPU residency: one module process holding Metal/GPU memory for hot models; decide model eviction policy (LRU by last-use with TTL?) early — this is the LMStudio-parity feature users feel.
 
 ## Suggested first moves for the new session
 
-1. Read ai-provider-quota (canonical module template) and llm-runner's FromVault + ci.yml before writing any code.
-2. Talk to MC-Alfonso: their embedding usage, model identity, and what API they'd consume (second consumer keeps the API honest).
-3. Decision #1 design pass (in-house hybrid vs wrap): write the tradeoff doc, Oracle it, get Ufuk's call.
+1. Review a public module template and credential-provider documentation before writing any code.
+2. Gather requirements from at least two independent consumers so the API remains honest.
+3. Decision #1 design pass (in-house hybrid vs wrap): write the tradeoff document and obtain independent review.
 4. Spike order that de-risked best for AFT: serve ONE model over subc with the ort CPU lane first (smallest end-to-end slice), then MLX lane, then remote-endpoint backend, then the store.

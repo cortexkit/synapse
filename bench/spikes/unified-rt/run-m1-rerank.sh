@@ -1,15 +1,15 @@
 #!/bin/zsh
 set -euo pipefail
 
-ROOT=[bench-user-home]/bench-tools/unified-rt-serving
+ROOT=${SYNAPSE_BENCH_ROOT:?set SYNAPSE_BENCH_ROOT}/bench-tools/unified-rt-serving
 BIN="$ROOT/bin/spike-unified-rt"
 DATA="$ROOT/data"
 RESULTS="$ROOT/results/m1-rerank"
 PACKAGES="$ROOT/packages/m1-rerank"
-MACMON=[bench-user-home]/bench-tools/bin/macmon
-LOCK=[bench-user-home]/bench.lock
+MACMON=${SYNAPSE_BENCH_ROOT:?set SYNAPSE_BENCH_ROOT}/bench-tools/bin/macmon
+LOCK=${SYNAPSE_BENCH_ROOT:?set SYNAPSE_BENCH_ROOT}/bench.lock
 
-MODEL=[bench-user-home]/.cache/huggingface/hub/models--Alibaba-NLP--gte-reranker-modernbert-base/snapshots/f7481e6055501a30fb19d090657df9ec1f79ab2c
+MODEL=${SYNAPSE_BENCH_ROOT:?set SYNAPSE_BENCH_ROOT}/.cache/huggingface/hub/models--Alibaba-NLP--gte-reranker-modernbert-base/snapshots/f7481e6055501a30fb19d090657df9ec1f79ab2c
 REQUESTS="$DATA/cosqa-rerank-1x50-repeated.jsonl"
 REFERENCE="$DATA/cosqa-rerank-1x50-repeated-reference.jsonl"
 

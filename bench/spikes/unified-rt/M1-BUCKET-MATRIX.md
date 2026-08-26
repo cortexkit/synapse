@@ -10,7 +10,7 @@ Policy v1 remains bounded and valid: every bucketed cell has exactly ten package
 
 | Item | Value |
 |---|---|
-| Host | `[bench-host]`, Apple M1 Max, 64 GiB |
+| Host | `<bench-host>`, Apple M1 Max, 64 GiB |
 | macOS | 26.5.2, build `25F84` |
 | Xcode | 26.6, build `17F113` |
 | Source revision | `fb8a7276986f122b945274891843a3fe9dc8c92c` |
@@ -19,7 +19,7 @@ Policy v1 remains bounded and valid: every bucketed cell has exactly ten package
 | Shape settings | policy v1 or `--shapes exact`, 4,000,000 attention units, maximum length 512, three passes |
 | Power tool | macmon 0.7.2, requested 100 ms interval, system-wide metrics |
 
-The binary was built locally with the Xcode and Homebrew paths required by the M1 protocol, then copied to `[bench-user-home]/bench-tools/unified-rt-serving/bin/spike-unified-rt`. The requested `[bench-user-home]/synapse` checkout does not exist, so no M1-side source build was attempted. Every timed process acquired `[bench-user-home]/bench.lock`, verified that `pgrep -f Runner.Worker` was empty, and released the lock on exit. The script waits five minutes before retrying either a busy lock or an active worker; no runner process was stopped.
+The binary was built locally with the Xcode and Homebrew paths required by the M1 protocol, then copied to `$SYNAPSE_BENCH_ROOT/bench-tools/unified-rt-serving/bin/spike-unified-rt`. The requested `$SYNAPSE_BENCH_ROOT/synapse` checkout does not exist, so no M1-side source build was attempted. Every timed process acquired `$SYNAPSE_BENCH_ROOT/bench.lock`, verified that `pgrep -f Runner.Worker` was empty, and released the lock on exit. The script waits five minutes before retrying either a busy lock or an active worker; no runner process was stopped.
 
 Each MISS deleted and recreated its mode-specific package root. The following HIT was a fresh process reusing that root. Exact compilation remains visible in pass 1 rather than `cold_load_s`. The three standard corpora have both MISS and HIT rows. MC exact mode has one fresh-root MISS, as planned, because repeating its 158-shape compile path would add little policy evidence.
 
@@ -104,7 +104,7 @@ The eight-row bucket policy does not leave the GPU broadly idle: effective use i
 
 ## Reproduction and retained artifacts
 
-The committed `run-m1-bucket-matrix.sh` contains the lock/retry guard, model snapshots, mode and cache ordering, macmon capture, fresh-root handling, and package-inventory check. `summarize-m1-bucket-matrix.py` derives the committed power and inventory summaries from the raw M1 files. Raw process logs, macmon JSONL, and before/after inventories remain at `[bench-user-home]/bench-tools/unified-rt-serving/results/m1-bucket-matrix/`. The 15 harness result JSON files and two evidence summaries are committed under `results/m1-bucket-matrix/`.
+The committed `run-m1-bucket-matrix.sh` contains the lock/retry guard, model snapshots, mode and cache ordering, macmon capture, fresh-root handling, and package-inventory check. `summarize-m1-bucket-matrix.py` derives the committed power and inventory summaries from the raw M1 files. Raw process logs, macmon JSONL, and before/after inventories remain at `$SYNAPSE_BENCH_ROOT/bench-tools/unified-rt-serving/results/m1-bucket-matrix/`. The 15 harness result JSON files and two evidence summaries are committed under `results/m1-bucket-matrix/`.
 
 ## Policy v2 — rejected
 
@@ -181,4 +181,4 @@ The extra rows raise gte power by roughly 2.5–3.4 W versus v1 without a meanin
 
 ### Retained evidence
 
-`run-m1-policy-v2.sh` is the executed campaign script. The eight result files, macmon-derived power summary, and byte-for-byte package inventory summary are committed under `results/m1-policy-v2/`. Raw logs, macmon JSONL, gate-status files, and before/after inventories remain at `[bench-user-home]/bench-tools/unified-rt-serving/results/m1-policy-v2/` on the M1.
+`run-m1-policy-v2.sh` is the executed campaign script. The eight result files, macmon-derived power summary, and byte-for-byte package inventory summary are committed under `results/m1-policy-v2/`. Raw logs, macmon JSONL, gate-status files, and before/after inventories remain at `$SYNAPSE_BENCH_ROOT/bench-tools/unified-rt-serving/results/m1-policy-v2/` on the M1.

@@ -12,9 +12,9 @@ The usual CosQA single-qrel limitation applies equally to both arms.
 
 ## Protocol
 
-- **Host:** `[bench-host]` (Apple M1 Max, macOS 26.5.2), reached by
+- **Host:** `<bench-host>` (Apple M1 Max, macOS 26.5.2), reached by
   SSH. Both quality runs used `nice -19` and never acquired
-  `[bench-user-home]/bench.lock`; no M5 work was used.
+  `$SYNAPSE_BENCH_ROOT/bench.lock`; no M5 work was used.
 - **Model:** `Qwen/Qwen3-Embedding-0.6B` snapshot
   `97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3`; `model.safetensors` SHA-256
   `0437e45c94563b09e13cb7a64478fc406947a93cb34a7e05870fc8dcd48e23fd`.

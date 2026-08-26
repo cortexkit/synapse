@@ -149,11 +149,11 @@ made the current-state buffer persistent and produced the gate results above.
 
 ## Measurement table
 
-Timed on `[bench-host]` (M1 Max), AC power, while holding and then promptly releasing `[bench-user-home]/bench.lock`. Each cell used 12 distinct prompts
+Timed on `<bench-host>` (M1 Max), AC power, while holding and then promptly releasing `$SYNAPSE_BENCH_ROOT/bench.lock`. Each cell used 12 distinct prompts
 from the fixed stride-seven schedule, repeated twice (24 fresh processes total).
 The metallib was transferred beside the executable and loaded executable-relative.
 The fresh competitor controls used the M1-native `llama-cli` at
-`[bench-user-home]/bench-tools/llama-b9580/llama-cli`, built from llama.cpp tag `b9580`
+`$SYNAPSE_BENCH_ROOT/bench-tools/llama-b9580/llama-cli`, built from llama.cpp tag `b9580`
 (commit `b4e3dc613baa92a3884d4151e3d631395c81934a`) with Xcode/AppleClang 21,
 CMake 4.4.0, and `GGML_METAL=ON`; the installed `llama-cli` SHA-256 is `02590612ba30c89133d656b7c1300028f345ec6c1cb879fb8f750a3626c02491`. The official Q8_0 GGUF came from
 `Qwen/Qwen3-0.6B-GGUF` snapshot `23749fefcc72300e3a2ad315e1317431b06b590a`
@@ -207,7 +207,7 @@ baseline is recorded in the campaign-4b section below.
 
 ## Campaign 2 winners 5+6
 
-Campaign `[consult-id]` promoted two attention
+Campaign `release-metal-step-1` promoted two attention
 micro-optimizations in order:
 
 1. **Winner 5 — attention value-phase softmax reuse** (proposal
@@ -238,12 +238,12 @@ These are follow-ups to revisit only with a new gate hypothesis, not claims of a
 
 ## Campaign 4b: three composition-honest winners
 
-Campaign `[consult-id]` closed
+Campaign `release-metal-step-2` closed
 `consecutive_dry_rounds` with three promoted winners. Its control was the
 campaign-2 winners-5+6 tree at **85.2589 tok/s Q8_0**, and all three promotion
 patches were pulled from the campaign store by proposal ID and applied in
 promotion order. The M1 authority run used AC power, an exclusive
-`[bench-user-home]/bench.lock`, no `Runner.Worker`, 12 stride-seven prompts, two fresh
+`$SYNAPSE_BENCH_ROOT/bench.lock`, no `Runner.Worker`, 12 stride-seven prompts, two fresh
 processes per prompt, and the worse repeat per prompt.
 
 ### Promoted mechanisms and provenance
@@ -316,7 +316,7 @@ than assuming the GEMV result transfers.
 
 ## Campaign 5 (decode-5): two composition-verified winners
 
-Campaign `[consult-id]` (harness
+Campaign `release-metal-step-3` (harness
 `qwen3-0.6b-q8-metal-step-decode`) closed with three promoted proposals but a
 messy terminal: "exploration failed after round 3: rig_unstable; winner from
 round 1 stands." Round 3 hit `invalid_control_drift` / `rig_unstable`, so the
@@ -329,7 +329,7 @@ scratch on the M1 authority box to settle what actually ships.
 The control was the campaign-4b three-winner tree at **103.6292 tok/s Q8_0**
 (the frozen base; the two decode source files were untouched on master since
 that pin). The M1 authority run used AC power (100% charged), an exclusive
-`[bench-user-home]/bench.lock`, no `Runner.Worker`, loadavg under 2.5, 12 stride-seven
+`$SYNAPSE_BENCH_ROOT/bench.lock`, no `Runner.Worker`, loadavg under 2.5, 12 stride-seven
 prompts, two fresh processes per prompt, and the worse repeat per prompt — the
 same harness protocol as campaign 4b. The fresh base control reproduced
 **103.6363 tok/s** (+0.007% vs the pinned 103.6292), so the box was stable and
@@ -521,9 +521,9 @@ result the authority machine did not confirm.
 
 ### Locked-M1 authority gates (green) and timing (measured, below bar)
 
-Locked M1 Max, `[bench-host]`, exclusive `[bench-user-home]/bench.lock` held
+Locked M1 Max, `<bench-host>`, exclusive `$SYNAPSE_BENCH_ROOT/bench.lock` held
 then released, AC power 100% charged, no `Runner.Worker`, 1-minute load average
-1.07--1.33. Built with the M1's own cargo (`[bench-user-home]/.cargo/bin/cargo`, full
+1.07--1.33. Built with the M1's own cargo (`$SYNAPSE_BENCH_ROOT/.cargo/bin/cargo`, full
 Xcode default), Qwen3-0.6B snapshot `c1899de289a04d12100db370d81485cdf75e47ca`,
 executable-relative 64,591-byte metallib beside the binary.
 
@@ -630,7 +630,7 @@ Q8_0 rows were reported only after a fresh Q8_0 quality gate.
 | Q8_0 block-row cooperative matvec | 20/20 f16 gate | final Q8_0: 14/20 exact, median depth 64.0, 55.2564 tok/s | **29.2656 tok/s** after 14/20, median depth 64.0 gate | Kept: Q8_0 is now faster than f16 |
 | Shared-to-private weight upload | 20/20 f16 gate; Q8_0 gate remained 14/20, median depth 64.0 | no material isolated delta on M5; residency verified | included in final | Kept: private residency removes repeated host-visible weight access |
 
-The locked-M1 final f16 sweep used AC power, `[bench-user-home]/bench.lock`, 12
+The locked-M1 final f16 sweep used AC power, `$SYNAPSE_BENCH_ROOT/bench.lock`, 12
 varied prompts selected by the house stride-seven schedule, two fresh-process
 repeats, and 24 samples total. The median stage breakdown was 55.8754 ms GPU
 execution, 0.1021 ms feed/encode, and 0.0340 ms logits readback per token.
@@ -644,7 +644,7 @@ was 14/20 exact with median depth 64.0.
 
 Every wave-2 kernel change passed the local f16 exactness gate before the
 locked-M1 timing cells; the Q8 row was reported only after a fresh Q8 quality
-gate. The M1 cells used AC power (100%, charged), `[bench-user-home]/bench.lock`, no
+gate. The M1 cells used AC power (100%, charged), `$SYNAPSE_BENCH_ROOT/bench.lock`, no
 `Runner.Worker`, the fixed stride-seven 12-prompt schedule, two fresh-process
 repeats, and the executable-relative 48,866-byte metallib.
 
@@ -660,7 +660,7 @@ remaining gap is GPU execution rather than dispatch (feed stayed 0.1022 ms/token
 
 A fresh llama.cpp control was not available on the locked host: neither
 `llama-cli` nor `llama-server` was installed, and no source checkout or archived
-MANIFEST was present under `[bench-user-home]/bench-tools`. The historical Q8_0
+MANIFEST was present under `$SYNAPSE_BENCH_ROOT/bench-tools`. The historical Q8_0
 control remains 190.36--203.45 tok/s from `DECODE-WAVE1.md`; it is not relabeled
 as a fresh wave-1 measurement.
 
@@ -746,7 +746,7 @@ wave log; the existing locked-M1 rows above remain unchanged.
 
 Every retained wave-3 change passed the local f16 exactness gate and the fresh
 Q8 depth gate before timing. The locked-M1 cells used AC power, an exclusive
-`[bench-user-home]/bench.lock`, no active `Runner.Worker`, the fixed stride-seven
+`$SYNAPSE_BENCH_ROOT/bench.lock`, no active `Runner.Worker`, the fixed stride-seven
 schedule (`completion-01,08,15,02,09,16,03,10,17,04,11,18`), 12 fresh processes
 per weight mode, and the executable-relative 51,570-byte metallib.
 

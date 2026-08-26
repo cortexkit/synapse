@@ -1,10 +1,6 @@
 # Synapse module v1 design (Lane 1)
 
-Status: DRAFT r2 — Oracle adversarial review folded in (16 findings, [task-id]).
-Constraints inherited from: SUBC review rounds (pm_aa948240, pm_5f7e36ff), MC
-contract (pm_56c42b11, pm_82691068), AFT riders (pm_4373925e, pm_74b2aff8),
-spike evidence (bench/lanes/llama-inproc, bench/spikes/unified-rt,
-bench/lanes/candle-embed), Decision #1 doc.
+Status: draft design validated against the benchmark evidence and Decision #1.
 
 ## Shape
 
@@ -230,23 +226,18 @@ transport-level closure.
 
 ## Model cache
 
-~/.local/share/cortexkit/models/ per SUBC convention: content-addressed sha256,
-tmp+fsync+atomic-rename, cortexkit-lease (module=models-cache, scope=digest).
-GC hardening (Oracle F14): loads take SHARED read leases; GC takes an EXCLUSIVE
-lease per digest and two-phase tombstones (mark, grace period, delete) so a
-concurrent validate/mmap never loses its file. Refcount/pin metadata beside
-blobs; Synapse-owns-GC; never touches other modules' pins. Artifact record:
-{digest, source, format, sanitized-tokenizer digest, validation state, pins}.
+`~/.local/share/synapse/models/` uses content-addressed SHA-256 artifacts and
+atomic replacement. A cross-process lease (`module=models-cache`,
+`scope=digest`) prevents GC from deleting a file while it is validated or
+memory-mapped. Loads take shared read leases; GC takes an exclusive lease and
+uses two-phase tombstones (mark, grace period, delete). Refcount/pin metadata
+lives beside blobs; Synapse owns GC and never touches other modules' pins.
+Artifact records contain `{digest, source, format, sanitized-tokenizer digest,
+validation state, pins}`.
 
-**Lease primitive gap (SUBC r2 review, source-verified)**: cortexkit-lease
-currently ships try_lock_exclusive ONLY — no shared mode. Resolution: option
-(a), extend cortexkit-lease with a shared-lock mode (fs4 exposes
-try_lock_shared; small commons addition). RESOLVED 2026-07-08: commons PR #1
-merged (16aed47, CI green 3 OSes) — acquire_shared exists with the exact
-semantics F14 needs (shared blocks exclusive until last holder drops, epoch-
-neutral shared handles). Path-dep to commons master until SUBC's next release
-pass publishes the semver-minor bump. Cache GC is UNBLOCKED for the cache
-implementation wave.
+**Lease primitive requirement**: the published lease dependency must provide
+shared and exclusive modes with the semantics needed above before cache GC is
+enabled.
 
 ## Health
 
@@ -258,12 +249,12 @@ No engine/GPU/worker probes on the dispatch path.
 ## Config
 
 Layered resolution (first hit wins per field): `SYNAPSE_CONFIG_PATH` env
-(tests), `<project>/.cortexkit/synapse.jsonc`, then
-`~/.config/cortexkit/synapse.jsonc`, then built-in defaults. JSONC comments
+(tests), `<project>/synapse.jsonc`, then
+`~/.config/synapse/synapse.jsonc`, then built-in defaults. JSONC comments
 are stripped before parse; unknown fields are rejected at boot (`deny_unknown_fields`)
 with the offending field named in the module log.
 
-`~/.config/cortexkit/synapse.jsonc` carries knob (performance|balanced|quiet,
+`~/.config/synapse/synapse.jsonc` carries knob (performance|balanced|quiet,
 default=balanced), `preload_models` (replaces the removed `SYNAPSE_PRELOAD_MODELS`
 env), inline/jobs/probe tuning, `alias_admin_enabled`, `microllm_max_tokens`
 (default 512), `grammar_enabled` (default false), and `cache_max_bytes` (GC
@@ -271,7 +262,7 @@ watermark target for two-phase `cache.gc` without an explicit digest). Remote
 endpoints remain post-v1. v1 samples config at startup; knob and gate changes
 take effect after restart.
 
-Machine-wide admission: an exclusive cortexkit-lease
+Machine-wide admission: an exclusive process lease
 (`module=synapse`, `scope=singleton`) is taken at boot; a second live instance
 exits nonzero with a typed log line.
 
@@ -301,4 +292,4 @@ activation, alias events beyond the day-1 pair.
   byte + a module-issued generation nonce so a stale worker from a previous
   module generation can never answer a new module's socket (SUBC r2 note,
   subc launch-nonce pattern).
-- ~~cortexkit-lease shared-mode commons PR~~ MERGED (commons #1, 16aed47).
+- Shared-mode lease support must be available in the published dependency before release.

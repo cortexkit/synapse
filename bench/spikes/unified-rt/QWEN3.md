@@ -42,7 +42,7 @@ Required gates are mean cosine at least 0.9999 and mean top-10 neighbor overlap 
 
 ## M1 throughput
 
-Timed on `[bench-host-alias]` under `[bench-user-home]/bench.lock`, using the same 400 chunks, max length 512, fp32, and length-sorted batching. The first row used a newly staged binary and the second immediately repeated the same command after Metal's process-independent shader caches had been populated.
+Timed on `$SYNAPSE_BENCH_HOST` under `$SYNAPSE_BENCH_ROOT/bench.lock`, using the same 400 chunks, max length 512, fp32, and length-sorted batching. The first row used a newly staged binary and the second immediately repeated the same command after Metal's process-independent shader caches had been populated.
 
 | Runtime | First run tok/s | Warm tok/s | Precision |
 |---|---:|---:|---|

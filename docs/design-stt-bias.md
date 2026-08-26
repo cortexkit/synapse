@@ -86,7 +86,7 @@ fixtures (bias must be strictly additive machinery).
 
 ## Sequencing
 
-1. (in flight) Eval kit + owned arms A1/A2 measured — [task-id].
+1. Evaluate the kit and owned arms A1/A2 with public benchmark evidence.
 2. Cascade baseline: faster-whisper initial_prompt (B1) + microllm rescore
    (B3) on the same kit — comparison arm, separate mason.
 3. Decision row: pick per-tier defaults from the table (the speed/energy knob

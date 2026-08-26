@@ -13,7 +13,16 @@ use subc_client_rs::{CallOptions, ConsumerOptions, SubcConsumer};
 use subc_protocol::{BindIdentity, RouteTarget};
 use tokio::time::{interval, sleep, MissedTickBehavior};
 
-const DEFAULT_SUBC: &str = "/Users/[owner]/.local/share/cortexkit/run/subc-connection.json";
+fn default_subc_path() -> PathBuf {
+    env::var_os("SYNAPSE_CONNECTION_FILE")
+        .map(PathBuf::from)
+        .or_else(|| {
+            env::var_os("XDG_RUNTIME_DIR")
+                .map(PathBuf::from)
+                .map(|directory| directory.join("synapse/subc-connection.json"))
+        })
+        .unwrap_or_else(|| env::temp_dir().join("synapse/subc-connection.json"))
+}
 const DEFAULT_MODEL: &str = "gte-modernbert-base-f16";
 const DEFAULT_BATCHES: &[usize] = &[1, 2, 4, 8, 16, 32, 64, 128, 256];
 const DEFAULT_CLASSES: &[TextClass] = &[TextClass::Memory, TextClass::Chunk];
@@ -161,7 +170,7 @@ impl Args {
     fn parse(mut args: impl Iterator<Item = String>) -> Result<Self> {
         let mut subc = env::var_os("SUBC_CONNECTION_FILE")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_SUBC));
+            .unwrap_or_else(default_subc_path);
         let mut model = DEFAULT_MODEL.to_string();
         let mut batches = DEFAULT_BATCHES.to_vec();
         let mut classes = DEFAULT_CLASSES.to_vec();

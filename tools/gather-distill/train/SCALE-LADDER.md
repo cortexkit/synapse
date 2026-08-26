@@ -101,7 +101,7 @@ Both adapters were merged with Axolotl's **legacy** merger. The memory-efficient
 
 Both Q8_0 files were hash- and size-verified after download to the Mac. They were also copied to the M1 bench machine and SHA-verified there. Each serving topology used llama.cpp build 9580 (`b4e3dc613`), Metal offload, FlashAttention, 131,072 served context, Jinja, and `--chat-template-kwargs '{"enable_thinking":false}'`. The `/apply-template` gate for each model ended with the required `<think>\n\n</think>\n\n` generation suffix.
 
-The 4B evaluation was already 34/40 jobs complete when the operator redirected remaining serving work away from the busy development Mac, so it finished locally. The 9B llama-server ran under the exclusive `[bench-user-home]/bench.lock` on `[bench-host-alias]`; the fixed harness, AFT tool proxy, corpora, scoring, and SSH tunnel remained local. The remote server was stopped and the lock released after scoring.
+The 4B evaluation was already 34/40 jobs complete when the operator redirected remaining serving work away from the busy development Mac, so it finished locally. The 9B llama-server ran under the exclusive `$SYNAPSE_BENCH_ROOT/bench.lock` on `$SYNAPSE_BENCH_HOST`; the fixed harness, AFT tool proxy, corpora, scoring, and SSH tunnel remained local. The remote server was stopped and the lock released after scoring.
 
 | model | natural file F1 | natural line Jaccard | contract-valid | API errors | avg tool calls | natural jobs | budget outcomes | wall time/traj |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: |

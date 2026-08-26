@@ -743,8 +743,7 @@ fn ensure_raw_path_inside_production_root(raw: &Path) -> Result<(), ManifestErro
 /// production root. This is the backstop for symlink escapes: the raw check
 /// confirms the requested path leads with `crates/synapse-module`, but a
 /// symlink could redirect it into the spike tree. The canonicalized path is
-/// absolute (e.g. `/Users/.../worktree/crates/synapse-module/owned-decode-manifests`),
-/// so the worktree root precedes the production-root segments; we require
+/// absolute, so the worktree root precedes the production-root segments; we require
 /// `crates/synapse-module` to appear as a *contiguous* component sequence and
 /// reject any canonicalized path that passes through `bench/spikes` before
 /// reaching it.

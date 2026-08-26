@@ -25,7 +25,7 @@ Do not auto-set `DEVELOPER_DIR` in scripts; configure the host or invocation so 
 
 ### Module config (`synapse.jsonc`)
 
-Example user-tier `~/.config/cortexkit/synapse.jsonc` (project configs must omit the user-only chain setting):
+Example user-tier `~/.config/synapse/synapse.jsonc` (project configs must omit the user-only chain setting):
 
 ```jsonc
 {

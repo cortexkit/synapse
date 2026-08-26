@@ -3,3 +3,10 @@ bench/results/
 bench/data/*.jsonl
 .cortexkit/alfonso/task-outputs/
 crates/synapse-module/owned-decode-sidecar/target/
+
+# Local operational artifacts and private benchmark corpora are never release inputs.
+.cortexkit/
+evidence/
+operations/
+corpus/aft-chunks.jsonl
+.banlist.local

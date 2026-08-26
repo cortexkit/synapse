@@ -428,7 +428,7 @@ fn parity_qwen3_q8() {
 /// structural band everywhere):
 /// - M5 Max (dev box): completion-15/step 17, engine 523 vs oracle 518,
 ///   CPU top-2 (518, 523), gap 0.000362.
-/// - M1 Max ([bench-host-alias]-metal CI runner, historical authority): completion-05/
+/// - M1 Max (historical CI runner, historical authority): completion-05/
 ///   step 8, engine 7693 vs oracle 1827, CPU top-2 (1827, 7693), gap 0.00727
 ///   (LFM2-METAL-STEP.md, stage-C certification).
 ///

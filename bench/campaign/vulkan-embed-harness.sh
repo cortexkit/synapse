@@ -42,7 +42,11 @@ DEFAULT_MODEL = (
     / ".cache/huggingface/hub/models--Alibaba-NLP--gte-modernbert-base/snapshots"
     / MODEL_REVISION
 )
-REMOTE_TARGET = "ufuka@[ally-host]"
+def configured_remote_target() -> str:
+    target = os.environ.get("SYNAPSE_CAMPAIGN_REMOTE_TARGET")
+    if not target:
+        raise HarnessError("set SYNAPSE_CAMPAIGN_REMOTE_TARGET to run a remote benchmark")
+    return target
 REMOTE_MODEL = r"C:\bench\model-modernbert"
 REMOTE_SOURCE_PARENT = r"C:\bench\campaign"
 REMOTE_CARGO_TARGET = r"%USERPROFILE%\cargo-target-decode"
@@ -51,7 +55,6 @@ REMOTE_CARGO_HOME = r"%USERPROFILE%\.cargo"
 REMOTE_RUSTUP_HOME = r"%USERPROFILE%\.rustup"
 REMOTE_SESSION_PREFIX = "gte-modernbert-vulkan"
 DEVELOPER_DIR = "/Applications/Xcode.app/Contents/Developer"
-FIXTURE_DIR_NAME = "bench/campaign/metal-embed-fixtures"
 CORPUS_NAME = "embedding-corpus.jsonl"
 REFERENCE_NAME = "master-reference-vectors.bin.gz"
 REFERENCE_METADATA_NAME = "REFERENCE-METADATA.json"
@@ -352,7 +355,9 @@ def load_reference_binary(path: Path) -> Tuple[List[str], List[List[float]]]:
 
 def extract_fixtures(workspace: Path, destination: Path) -> Tuple[Path, Path, List[Dict[str, Any]], List[List[float]]]:
     configured = os.environ.get("SYNAPSE_CAMPAIGN_FIXTURES")
-    source = Path(configured).expanduser().resolve() if configured else workspace / FIXTURE_DIR_NAME
+    if not configured:
+        raise HarnessError("set SYNAPSE_CAMPAIGN_FIXTURES to a licensed fixture directory")
+    source = Path(configured).expanduser().resolve()
     if not source.is_dir():
         raise HarnessError(f"embedding fixture directory is missing: {source}")
     corpus_source = source / CORPUS_NAME
@@ -465,7 +470,7 @@ def ssh_command() -> List[str]:
     known_hosts = os.environ.get("SYNAPSE_CAMPAIGN_SSH_KNOWN_HOSTS")
     if known_hosts:
         command.extend(["-o", f"UserKnownHostsFile={known_hosts}", "-o", "StrictHostKeyChecking=yes"])
-    command.append(os.environ.get("SYNAPSE_CAMPAIGN_REMOTE_TARGET", REMOTE_TARGET))
+    command.append(configured_remote_target())
     return command
 
 
@@ -480,7 +485,7 @@ def scp_command() -> List[str]:
     known_hosts = os.environ.get("SYNAPSE_CAMPAIGN_SSH_KNOWN_HOSTS")
     if known_hosts:
         command.extend(["-o", f"UserKnownHostsFile={known_hosts}", "-o", "StrictHostKeyChecking=yes"])
-    command.append(os.environ.get("SYNAPSE_CAMPAIGN_REMOTE_TARGET", REMOTE_TARGET))
+    command.append(configured_remote_target())
     return command
 
 
@@ -528,7 +533,7 @@ def windows_quote(path: str) -> str:
 
 
 def scp_to(local: Path, remote: str, log_path: Path) -> None:
-    target = os.environ.get("SYNAPSE_CAMPAIGN_REMOTE_TARGET", REMOTE_TARGET)
+    target = configured_remote_target()
     completed = subprocess.run(
         [*scp_command()[:-1], str(local), f"{target}:{remote_path_for_scp(remote)}"],
         stdin=subprocess.DEVNULL,
@@ -541,7 +546,7 @@ def scp_to(local: Path, remote: str, log_path: Path) -> None:
 
 
 def scp_from(remote: str, local: Path, log_path: Path) -> None:
-    target = os.environ.get("SYNAPSE_CAMPAIGN_REMOTE_TARGET", REMOTE_TARGET)
+    target = configured_remote_target()
     local.parent.mkdir(parents=True, exist_ok=True)
     completed = subprocess.run(
         [*scp_command()[:-1], f"{target}:{remote_path_for_scp(remote)}", str(local)],
@@ -758,7 +763,7 @@ def preserve_failure_scene(temp_root: Path, result_path: Path, remote_root: str 
             shutil.copy2(source, destination)
         scene = {
             "controller_cwd": os.getcwd(),
-            "remote_target": os.environ.get("SYNAPSE_CAMPAIGN_REMOTE_TARGET", REMOTE_TARGET),
+            "remote_target": configured_remote_target(),
             "remote_root": remote_root,
             "result": str(result_path),
         }
@@ -887,7 +892,12 @@ def workspace_commit(runner: Path, workspace: Path, log_path: Path) -> str:
 
 
 def acquire_bench_lock() -> Path:
-    lock = Path(os.environ.get("SYNAPSE_CAMPAIGN_BENCH_LOCK", "[bench-user-home]/bench.lock"))
+    lock = Path(
+        os.environ.get(
+            "SYNAPSE_CAMPAIGN_BENCH_LOCK",
+            str(Path(tempfile.gettempdir()) / "synapse-benchmark.lock"),
+        )
+    )
     measure_lock = Path(os.environ.get("SYNAPSE_CAMPAIGN_MEASURE_LOCK", "/tmp/aft-measure.lock"))
     if measure_lock.exists():
         raise HarnessError(f"measurement lock is already present: {measure_lock}")
@@ -1522,7 +1532,7 @@ def run_harness(workspace_arg: str, runner_arg: str, result_arg: str) -> int:
         f"gte-modernbert-base f16 Vulkan cooperative embedding baseline: {baseline_label}. "
         f"Protocol: {PROCESS_RUNS} paired fresh-process runs, {PASSES_PER_PROCESS - WARMUP_PASSES} "
         "timed steady passes after one discarded warmup; worse-of-two per run. "
-        "The Mac controller probes ufuka@[ally-host] over SSH and refuses a cargo/unified-rt tenant."
+        "The controller uses the explicitly configured remote target and refuses a busy benchmark tenant."
     )
     writer.write(initial_payload(baseline_note))
     try:
@@ -1688,7 +1698,7 @@ def run_harness(workspace_arg: str, runner_arg: str, result_arg: str) -> int:
                     "determinism_corpus_sha256": determinism_digest,
                 },
                 "remote": {
-                    "target": os.environ.get("SYNAPSE_CAMPAIGN_REMOTE_TARGET", REMOTE_TARGET),
+                    "target": configured_remote_target(),
                     "workspace": remote_workspace,
                     "user_profile": user_profile,
                     "cargo_target_dir": os.environ.get(
@@ -1756,13 +1766,11 @@ def self_test() -> int:
     assert metrics["mean_cosine"] == 1.0
     assert metrics["worst_decile_top10_rank_overlap"] == 1.0
     assert metrics["parity_passed"] is True
-    fixture_dir = Path(FIXTURE_DIR_NAME)
-    if fixture_dir.is_dir():
+    configured_fixture_dir = os.environ.get("SYNAPSE_CAMPAIGN_FIXTURES")
+    if configured_fixture_dir:
         fixture_test_root = Path(tempfile.mkdtemp(prefix="metal-embed-fixture-test-"))
         try:
-            _, reference_path, rows, vectors = extract_fixtures(
-                fixture_dir.parent.parent.parent, fixture_test_root
-            )
+            _, reference_path, rows, vectors = extract_fixtures(Path.cwd(), fixture_test_root)
             assert len(rows) == EXPECTED_ROWS
             assert len(vectors) == EXPECTED_ROWS
             assert reference_path.is_file()

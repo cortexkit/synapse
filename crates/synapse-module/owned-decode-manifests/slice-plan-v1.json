@@ -2,7 +2,7 @@
   "manifest_revision": "slice-plan-v1",
   "schema_revision": "runtime-bound-records-contracts-v1",
   "slice_id": "slice-1-contracts-and-manifests",
-  "work_item": "wi:[consult-id]:4:s1",
+  "work_item": "release:slice-1-contracts-and-manifests",
   "file_fence": [
     "**/manifests/**",
     "**/*-manifest.*",

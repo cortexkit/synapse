@@ -332,6 +332,7 @@ fn measure_semantic_sidecar_deterministic_phase1() {
     }
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let evidence = root.join("evidence/semantic-sidecar-v1");
+    fs::create_dir_all(&evidence).expect("create local semantic-sidecar evidence directory");
     let snapshot = PathBuf::from(
         std::env::var_os("SYNAPSE_OWNED_DECODE_QWEN3_0_6B")
             .expect("set SYNAPSE_OWNED_DECODE_QWEN3_0_6B to the pinned snapshot directory"),

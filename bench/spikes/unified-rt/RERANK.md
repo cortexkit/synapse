@@ -64,7 +64,7 @@ The executed run scored 1,000 pairs in 10.5875 s. Request-local fixed eight-row 
 
 ### Locked M1
 
-The locked run used `[bench-host]` (Apple M1 Max, 64 GiB, macOS 26.5.2 build `25F84`) and binary SHA-256 `3fae0455ccc650c1b597c7bc4b8c4dc8d08c224b45d471128fe360b9cddc9db3`. A non-measured prime process created all ten policy-v1 packages. Each measured row is then a fresh process reusing that warm cache, with fp32 Metal, explicit O0, maximum length 512, and the fixed eight-row combined-length buckets.
+The locked run used `<bench-host>` (Apple M1 Max, 64 GiB, macOS 26.5.2 build `25F84`) and binary SHA-256 `3fae0455ccc650c1b597c7bc4b8c4dc8d08c224b45d471128fe360b9cddc9db3`. A non-measured prime process created all ten policy-v1 packages. Each measured row is then a fresh process reusing that warm cache, with fp32 Metal, explicit O0, maximum length 512, and the fixed eight-row combined-length buckets.
 
 The committed fixture [`fixtures/cosqa-rerank-1x50-repeated.jsonl`](fixtures/cosqa-rerank-1x50-repeated.jsonl) repeats one real cosqa query with its 50 dense candidates 20 times, giving both 20 request-latency samples and a 1,000-pair throughput set. Its committed Transformers reference is [`fixtures/cosqa-rerank-1x50-repeated-reference.jsonl`](fixtures/cosqa-rerank-1x50-repeated-reference.jsonl). Every process passed Pearson and tie-aware top-1 gates.
 
@@ -82,7 +82,7 @@ macmon started, produced an idle sample, and waited another two seconds before e
 | HIT r1 | 31 | 95.2% | 36.97 W | 44.30 W |
 | HIT r2 | 31 | 94.0% | 36.38 W | 40.20 W |
 
-Every timed process acquired `[bench-user-home]/bench.lock`, verified that `Runner.Worker` was absent, and used trap-based macmon cleanup before releasing the lock. Raw logs remain under `[bench-user-home]/bench-tools/unified-rt-serving/results/m1-rerank/`; result JSON and the macmon-derived summary are committed under `results/m1-rerank/`.
+Every timed process acquired `$SYNAPSE_BENCH_ROOT/bench.lock`, verified that `Runner.Worker` was absent, and used trap-based macmon cleanup before releasing the lock. Raw logs remain under `$SYNAPSE_BENCH_ROOT/bench-tools/unified-rt-serving/results/m1-rerank/`; result JSON and the macmon-derived summary are committed under `results/m1-rerank/`.
 
 The fixture is reproducible from the first row of the canonical cosqa `gte-rerank-requests.jsonl`: duplicate its 50-document request 20 times with IDs `q20105-run-00` through `q20105-run-19`, then score the single request and duplicate its score row under the same IDs. The executed reference command was:
 

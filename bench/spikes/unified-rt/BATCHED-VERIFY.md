@@ -136,7 +136,7 @@ existing step path is unperturbed.
 
 ## Measurement (locked M1 authority)
 
-Locked M1 Max (`[bench-host]`), AC power, exclusive `[bench-user-home]/bench.lock`
+Locked M1 Max (`<bench-host>`), AC power, exclusive `$SYNAPSE_BENCH_ROOT/bench.lock`
 held then released, no `Runner.Worker`, 1-minute load 0.8-3.4 (< 8 bar). Built with
 the M1's own cargo (1.97.1) and Xcode Metal toolchain, Qwen3-0.6B snapshot
 `c1899de289a04d12100db370d81485cdf75e47ca`. Each K timed as the median of 40

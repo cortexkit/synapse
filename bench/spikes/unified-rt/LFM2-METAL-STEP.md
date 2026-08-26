@@ -9,7 +9,7 @@ orchestration, the Q8 path, the 20×64 sha256 fixtures, and the authoritative M1
 timing are tracked as precise follow-ups at the bottom of this document.
 
 **Measurement authority note:** timed cells belong on the locked M1
-(`[bench-host]`, `[bench-user-home]/bench.lock`). This increment was built
+(`<bench-host>`, `$SYNAPSE_BENCH_ROOT/bench.lock`). This increment was built
 and gated on an M5 Max; per project discipline M5 *timing* is advisory only.
 The gate here is an *exactness* gate, not a timing gate: the conv kernel uses
 per-dot serial f32 accumulation with Metal fast-math and FMA contraction
@@ -177,7 +177,7 @@ reference will silently break.
 No owned-step tok/s number exists yet — the step engine is not assembled
 end-to-end (follow-up B), so there is nothing honest to time. The cells below are
 the **prior locked M1 measurements** from `LFM2-DECODE-BASELINES.md`
-(2026-07-20, `[bench-host]`, Apple M1 Max, `[bench-user-home]/bench.lock`,
+(2026-07-20, `<bench-host>`, Apple M1 Max, `$SYNAPSE_BENCH_ROOT/bench.lock`,
 12 varied prompts × 2 repeats, 64-token cap, median of 24). They are the targets
 the step path must beat, reproduced here for context — **not** freshly measured
 by this task.
@@ -254,8 +254,8 @@ a tail path only if the gate shows it is needed (do not pad weights). Gate
 bit-identical to the Q8 CPU reference. *Assumed:* ×4 convention holds (all LFM2
 column dims are ×4).
 
-**D — Authoritative M1 timing.** On `[bench-host]` under
-`[bench-user-home]/bench.lock` (mkdir; load < 8; AC), measure single-stream decode
+**D — Authoritative M1 timing.** On `<bench-host>` under
+`$SYNAPSE_BENCH_ROOT/bench.lock` (mkdir; load < 8; AC), measure single-stream decode
 tok/s f16 + Q8 with the same 64-token completion protocol as
 `LFM2-DECODE-BASELINES.md` (12 varied prompts × 2 repeats, median of 24, fresh
 process per sample). Vary prompt text per iteration to defeat llama slot caching
@@ -562,7 +562,7 @@ $ SYNAPSE_UNIFIED_RT_LFM2_1_2B=<snapshot> cargo test -p spike-unified-rt \
 determinism: two runs byte-identical, sha 4356ac40ae5b1d30094899afcd2e8d9864570c601133bee5d30dcb1e0b60f30c
 test result: ok. 2 passed; 0 failed
 
-$ # locked M1 Max ([bench-host], [bench-user-home]/bench.lock, load 1.02)
+$ # locked M1 Max (<bench-host>, $SYNAPSE_BENCH_ROOT/bench.lock, load 1.02)
 [metal] DIVERGENCE completion-05: first diff at step 8: engine 7693 vs oracle 1827
 [metal] fork completion-05 step 8: CPU top-2 = (1827, 7693), gap 0.007270 (band 0.05)
 [metal] M1 AUTHORITY: pinned fork signature confirmed (completion-05 step 8, engine 7693 vs oracle 1827)
@@ -577,8 +577,8 @@ reference the same token stream and prints the per-position top-3 logits and
 
 ### 10.4 M1 timed f16 cell (authority)
 
-Locked M1 Max (`[bench-host]`, `MacBookPro18,2`), exclusive
-`[bench-user-home]/bench.lock` held, AC, one-minute load 1.02. Release build
+Locked M1 Max (`<bench-host>`, `MacBookPro18,2`), exclusive
+`$SYNAPSE_BENCH_ROOT/bench.lock` held, AC, one-minute load 1.02. Release build
 (`cargo test --release`), `hybrid_step_timing_probe`: prefill untimed, then one
 chained 64-token greedy decode per prompt, median of 20 prompts × 2 repeats (40
 samples) plus an uncounted warmup. The spread is tight (49.84–50.80, <2%), so the
@@ -764,8 +764,8 @@ the f16 engine's ~0.03 (Q8's coarser weights amplify the f16-activation and
 transcendental rounding slightly) but still small, and — crucially — the Q8
 quantization itself cancels because engine and oracle share the same bytes.
 
-Gate transcript — **M1 authority** (`MacBookPro18,2`, `[bench-host]`,
-`[bench-user-home]/bench.lock`, load ~0.7, AC; checkpoint `933cee00…`):
+Gate transcript — **M1 authority** (`MacBookPro18,2`, `<bench-host>`,
+`$SYNAPSE_BENCH_ROOT/bench.lock`, load ~0.7, AC; checkpoint `933cee00…`):
 
 ```
 $ SYNAPSE_UNIFIED_RT_LFM2_1_2B=<snapshot> cargo test --release -p spike-unified-rt \
@@ -835,8 +835,8 @@ the f16 path bit-for-bit unchanged on the authority machine.
 
 ### 11.6 Timed cells (M1 authority)
 
-Timed on the locked M1 (`MacBookPro18,2`, `[bench-host]`), exclusive
-`[bench-user-home]/bench.lock` held, AC, one-minute load 0.65. Release build, the
+Timed on the locked M1 (`MacBookPro18,2`, `<bench-host>`), exclusive
+`$SYNAPSE_BENCH_ROOT/bench.lock` held, AC, one-minute load 0.65. Release build, the
 stage-C protocol: prefill untimed, then one chained 64-token greedy decode per
 prompt, median of 20 prompts × 2 repeats (40 samples) plus an uncounted warmup.
 The Q8 spread is tight (144.34–149.23, <3.4%).
@@ -891,7 +891,7 @@ work, not quantization.
 
 - **M1 authority — DONE this increment.** The Q8 two-tier gate and the
   `--release q8_hybrid_step_timing_probe` ran on the locked M1
-  (`[bench-host]`, `[bench-user-home]/bench.lock`, load 0.65, AC): the M1
+  (`<bench-host>`, `$SYNAPSE_BENCH_ROOT/bench.lock`, load 0.65, AC): the M1
   fork signature is pinned (`Q8_M1_PINNED`, 20/20 byte-exact, zero forks) and the
   authoritative Q8 cell is **146.08 tok/s** vs llama Q8_0 `203.65` and our f16
   `49.89` (re-confirmed; stage C pinned 50.09). The f16 M1 gate was re-run green
@@ -929,8 +929,8 @@ SYNAPSE_UNIFIED_RT_LFM2_1_2B=<snapshot> cargo test -p spike-unified-rt \
 
 # Timed cells (release; the filter matches both the f16 and Q8 probes).
 # Authoritative only on the locked M1 under the bench lock:
-#   mkdir [bench-user-home]/bench.lock   # acquire (fails if held); load < 8; AC
-#   ... run ...; rmdir [bench-user-home]/bench.lock
+#   mkdir $SYNAPSE_BENCH_ROOT/bench.lock   # acquire (fails if held); load < 8; AC
+#   ... run ...; rmdir $SYNAPSE_BENCH_ROOT/bench.lock
 SYNAPSE_UNIFIED_RT_LFM2_1_2B=<snapshot> cargo test --release -p spike-unified-rt \
     hybrid_step_timing_probe -- --ignored --nocapture   # matches both f16 and Q8 probes
 ```

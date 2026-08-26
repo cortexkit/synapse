@@ -97,13 +97,13 @@ a genuine new vector space, not a broken export.
 
 ## Locked-M1 protocol
 
-Host: `[bench-host]`, MacBookPro18,2, Apple M1 Max, 64 GiB, macOS
+Host: `<bench-host>`, MacBookPro18,2, Apple M1 Max, 64 GiB, macOS
 26.5.2 (`25F84`). The canonical corpus is the 400-row Qwen text corpus,
 SHA-256 `5a9bfdc8c069657aa46cbb45bef91bc1a0ddc72602bfb96b189af31ba55f630c`.
 The frozen ORT fp32 vector reference SHA-256 is
 `cacee1f64d12704ea94cded9861f6aef903a018800b2e0a1ec67589c33c7cf46`.
 
-Every accepted M1 timed cell acquired `[bench-user-home]/bench.lock`, rejected an
+Every accepted M1 timed cell acquired `$SYNAPSE_BENCH_ROOT/bench.lock`, rejected an
 active `Runner.Worker`, started macmon at a requested 100 ms interval, waited
 for its first sample and two more seconds, then started sudo-primed
 powermetrics at 100 ms. A trap killed both samplers and released the lock.
@@ -115,7 +115,7 @@ J/doc includes the fresh-process package load, warmup, inference, and small
 process overhead. This is deliberately conservative for a 1.2 GB model.
 macmon's exact timestamp-filtered window is the primary column; powermetrics
 is an independent privileged cross-check. Raw artifacts remain under
-`[bench-host-alias]:~/bench-tools/ane-wave2/results/`; compact committed evidence is in
+`$SYNAPSE_BENCH_HOST:~/bench-tools/ane-wave2/results/`; compact committed evidence is in
 `results/wave2-qwen3-summary.json`.
 
 ## Placement proof

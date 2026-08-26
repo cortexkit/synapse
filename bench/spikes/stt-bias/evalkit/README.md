@@ -1,7 +1,7 @@
 # STT context-bias evaluation kit
 
 `terms.jsonl` contains 120 terms: 80 technical spelling-sensitive terms collected
-from this repository and CortexKit sibling vocabulary, and 40 ordinary control
+from public technical documentation, and 40 ordinary control
 words. Each row records its class and source. Terms marked `excluded` remain in
 the generated corpus but are omitted from term and WER scoring because macOS
 `say` cannot produce a stable pronunciation for that spelling. This avoids

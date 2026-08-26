@@ -10,7 +10,7 @@ This wave used one inference pass per fresh process because the current main bin
 
 | Item | Value |
 |---|---|
-| Host | `[bench-host]`, Apple M1 Max, 64 GiB |
+| Host | `<bench-host>`, Apple M1 Max, 64 GiB |
 | macOS | 26.5.2, build `25F84` |
 | Xcode | 26.6, build `17F113` |
 | Source revision | `2cb03a29d0016683351fa0c5d12501e23c43963f` (`origin/master` when built) |
@@ -20,9 +20,9 @@ This wave used one inference pass per fresh process because the current main bin
 | gte-modernbert corpus | `modernbert-corpus-400.jsonl`; 62,838 tokens |
 | Qwen3 corpus | `qwen3-corpus-400.jsonl`; 46,716 tokens |
 
-The requested M1 checkout at `[bench-user-home]/synapse` did not exist. `[bench-user-home]/Work/synapse` existed only as a non-Git source staging directory, so it could not be pulled. The measured binary was instead built from the current local `origin/master` revision shown above and copied to `[bench-user-home]/bench-tools/unified-rt-serving/bin/spike-unified-rt`; no spike compilation occurred on the M1.
+The requested M1 checkout at `$SYNAPSE_BENCH_ROOT/synapse` did not exist. `$SYNAPSE_BENCH_ROOT/Work/synapse` existed only as a non-Git source staging directory, so it could not be pulled. The measured binary was instead built from the current local `origin/master` revision shown above and copied to `$SYNAPSE_BENCH_ROOT/bench-tools/unified-rt-serving/bin/spike-unified-rt`; no spike compilation occurred on the M1.
 
-Every process acquired `[bench-user-home]/bench.lock`, checked that `pgrep -f Runner.Worker` was empty, and released the lock on exit. The first MiniLM process observed an active CI worker, released the lock without measuring, waited five minutes, reacquired it, rechecked the worker, and then ran. No runner process was stopped or changed.
+Every process acquired `$SYNAPSE_BENCH_ROOT/bench.lock`, checked that `pgrep -f Runner.Worker` was empty, and released the lock on exit. The first MiniLM process observed an active CI worker, released the lock without measuring, waited five minutes, reacquired it, rechecked the worker, and then ran. No runner process was stopped or changed.
 
 ## Measurement method and timing labels
 
@@ -39,7 +39,7 @@ The MiniLM bridge additionally emits per-shape executable timing. Its six shapes
 | f16 | MISS/compile | 0.105581 s | 0.105968 s | 0.000127 / 0.000129 s | 0.017725 / 0.017480 s |
 | f16 | HIT/load | 0.017256 s | 0.017303 s | 0 / 0 s | 0 / 0 s |
 
-The ModernBERT and Qwen3 bridges do not expose their internal per-shape preparation counters. Their separately reported `Load/prepare` and `Inference` walls therefore remain the available phase boundary. All result JSON is retained under `results/m1-serving-matrix/`; combined process logs remain on the M1 at `[bench-user-home]/bench-tools/unified-rt-serving/results/` because this measurement-only wave permits committed result JSON but not log files.
+The ModernBERT and Qwen3 bridges do not expose their internal per-shape preparation counters. Their separately reported `Load/prepare` and `Inference` walls therefore remain the available phase boundary. All result JSON is retained under `results/m1-serving-matrix/`; combined process logs remain on the M1 at `$SYNAPSE_BENCH_ROOT/bench-tools/unified-rt-serving/results/` because this measurement-only wave permits committed result JSON but not log files.
 
 ## Full matrix
 
@@ -89,13 +89,13 @@ Every one of the 24 processes evaluated both gates against its family-specific O
 
 **MiniLM is re-certified for both fp32 and f16.** The oracle was the frozen evidence pack's original M1 file, not a locally regenerated reference:
 
-- canonical reference: `[bench-user-home]/bench-tools/unified-rt-metal/ort-minilm-1000-vectors.jsonl`
+- canonical reference: `$SYNAPSE_BENCH_ROOT/bench-tools/unified-rt-metal/ort-minilm-1000-vectors.jsonl`
 - reference SHA-256: `7589eea5148562f6141c864d3357bab5dceb6881055afcf93b80efbdcae7d24d`
-- canonical corpus: `[bench-user-home]/bench-tools/unified-rt-metal/corpus-1000.jsonl`
+- canonical corpus: `$SYNAPSE_BENCH_ROOT/bench-tools/unified-rt-metal/corpus-1000.jsonl`
 - corpus SHA-256: `b7c8424f5b6bc5df61d96146a03642671789c1d41cbe37e82864117330996a10`
 - local working copies: `/tmp/ort-minilm-1000-vectors-official.jsonl` and `/tmp/minilm-corpus-1000-official.jsonl`
 
-`bench/data/*.jsonl` is ignored by the repository, so the 7.7 MiB reference and 508 KiB corpus were not committed there. They were copied unchanged to `[bench-user-home]/bench-tools/unified-rt-serving/data/` for this run; hashes matched before measurement.
+`bench/data/*.jsonl` is ignored by the repository, so the 7.7 MiB reference and 508 KiB corpus were not committed there. They were copied unchanged to `$SYNAPSE_BENCH_ROOT/bench-tools/unified-rt-serving/data/` for this run; hashes matched before measurement.
 
 The regenerated Qdrant MiniLM ONNX file that produced the rejected local oracle identifies itself as PyTorch 2.1.2, ONNX IR 6, default-domain opset 11, with 638 nodes and no optimization metadata. The original ONNX bytes used to make the frozen reference were not retained beside the vectors, so an opset or optimizer-level difference cannot be proven from metadata alone. The unchanged fp32 path's earlier cosine of `0.99920633` against the regenerated vectors is the decisive evidence that they came from a numerically different export; it is not an fp16 regression.
 
@@ -133,22 +133,22 @@ export PATH="/opt/homebrew/bin:$HOME/.cargo/bin:$PATH"
 export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
 cargo build --release --manifest-path bench/spikes/unified-rt/Cargo.toml
 
-ssh [bench-host-alias] 'mkdir -p [bench-user-home]/bench-tools/unified-rt-serving/bin \
-  [bench-user-home]/bench-tools/unified-rt-serving/data \
-  [bench-user-home]/bench-tools/unified-rt-serving/results \
-  [bench-user-home]/bench-tools/unified-rt-serving/packages'
+ssh $SYNAPSE_BENCH_HOST 'mkdir -p $SYNAPSE_BENCH_ROOT/bench-tools/unified-rt-serving/bin \
+  $SYNAPSE_BENCH_ROOT/bench-tools/unified-rt-serving/data \
+  $SYNAPSE_BENCH_ROOT/bench-tools/unified-rt-serving/results \
+  $SYNAPSE_BENCH_ROOT/bench-tools/unified-rt-serving/packages'
 scp target/release/spike-unified-rt \
-  [bench-host-alias]:[bench-user-home]/bench-tools/unified-rt-serving/bin/spike-unified-rt
+  $SYNAPSE_BENCH_HOST:$SYNAPSE_BENCH_ROOT/bench-tools/unified-rt-serving/bin/spike-unified-rt
 scp /tmp/modernbert-corpus-400.jsonl /tmp/modernbert-ort-400-vectors.jsonl \
   /tmp/qwen3-corpus-400.jsonl /tmp/qwen3-ort-400-vectors.jsonl \
-  [bench-host-alias]:[bench-user-home]/bench-tools/unified-rt-serving/data/
-ssh [bench-host-alias] 'cp [bench-user-home]/bench-tools/unified-rt-metal/corpus-1000.jsonl \
-  [bench-user-home]/bench-tools/unified-rt-serving/data/minilm-corpus-1000.jsonl; \
-  cp [bench-user-home]/bench-tools/unified-rt-metal/ort-minilm-1000-vectors.jsonl \
-  [bench-user-home]/bench-tools/unified-rt-serving/data/ort-minilm-1000-vectors.jsonl'
+  $SYNAPSE_BENCH_HOST:$SYNAPSE_BENCH_ROOT/bench-tools/unified-rt-serving/data/
+ssh $SYNAPSE_BENCH_HOST 'cp $SYNAPSE_BENCH_ROOT/bench-tools/unified-rt-metal/corpus-1000.jsonl \
+  $SYNAPSE_BENCH_ROOT/bench-tools/unified-rt-serving/data/minilm-corpus-1000.jsonl; \
+  cp $SYNAPSE_BENCH_ROOT/bench-tools/unified-rt-metal/ort-minilm-1000-vectors.jsonl \
+  $SYNAPSE_BENCH_ROOT/bench-tools/unified-rt-serving/data/ort-minilm-1000-vectors.jsonl'
 scp bench/spikes/unified-rt/run-m1-serving-matrix.sh \
-  [bench-host-alias]:[bench-user-home]/bench-tools/unified-rt-serving/run-matrix.sh
-ssh [bench-host-alias] '[bench-user-home]/bench-tools/unified-rt-serving/run-matrix.sh'
+  $SYNAPSE_BENCH_HOST:$SYNAPSE_BENCH_ROOT/bench-tools/unified-rt-serving/run-matrix.sh
+ssh $SYNAPSE_BENCH_HOST '$SYNAPSE_BENCH_ROOT/bench-tools/unified-rt-serving/run-matrix.sh'
 ```
 
 The first matrix invocation completed MiniLM, then found that the M1 ModernBERT snapshot had only ONNX weights. The exact safetensors blob used by the local gate was staged, hash-checked, and the remaining cells resumed without rerunning MiniLM:
@@ -156,9 +156,9 @@ The first matrix invocation completed MiniLM, then found that the M1 ModernBERT 
 ```sh
 scp ~/.cache/huggingface/hub/models--Alibaba-NLP--gte-modernbert-base/snapshots/\
 e7f32e3c00f91d699e8c43b53106206bcc72bb22/model.safetensors \
-  [bench-host-alias]:[bench-user-home]/.cache/huggingface/hub/models--Alibaba-NLP--gte-modernbert-base/\
+  $SYNAPSE_BENCH_HOST:$SYNAPSE_BENCH_ROOT/.cache/huggingface/hub/models--Alibaba-NLP--gte-modernbert-base/\
 snapshots/e7f32e3c00f91d699e8c43b53106206bcc72bb22/model.safetensors
-ssh [bench-host-alias] 'SKIP_MINILM=1 [bench-user-home]/bench-tools/unified-rt-serving/run-matrix.sh'
+ssh $SYNAPSE_BENCH_HOST 'SKIP_MINILM=1 $SYNAPSE_BENCH_ROOT/bench-tools/unified-rt-serving/run-matrix.sh'
 ```
 
 The committed script contains the exact lock/retry guard, cache deletion, model snapshots, corpora, references, output names, and command arguments. Each M1-side raw log also begins with its fully expanded command. The measured command shape was:

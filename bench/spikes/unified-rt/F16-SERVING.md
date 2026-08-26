@@ -40,8 +40,8 @@ campaign #1 result below for the current baseline) is **18,500.3485 tok/s**
 (median of the
 36 worse-of-two steady samples), recorded in
 `results/metal-embed-campaign/m1-baseline.json`. The run used
-`[bench-host]` (Apple M1 Max), acquired and released
-`[bench-user-home]/bench.lock`, and rejected an active `Runner.Worker`. Its minimum
+`<bench-host>` (Apple M1 Max), acquired and released
+`$SYNAPSE_BENCH_ROOT/bench.lock`, and rejected an active `Runner.Worker`. Its minimum
 mean cosine was `0.999999022` and minimum worst-decile top-10 overlap was
 `0.97400`. The fleet's ordinary coalesced observation remains about 14--15k
 tok/s, and the earlier
@@ -53,7 +53,7 @@ configured.
 
 ### Campaign #1 result: fused scaled-dot-product attention (integrated)
 
-Embedding campaign #1 (`[consult-id]`, harness
+Embedding campaign #1 (`release-embedding-benchmark-1`, harness
 `gte-modernbert-f16-metal-embed`) hit `time_budget_exhausted` mid-round-1, but
 its one fully-measured proposal was a clean gated WIN, promoted inside the round
 before the clock ran out. The winner is **proposal_bcc9cf06** "Fused
@@ -291,7 +291,7 @@ Two open questions from the embedding campaigns are measured directly:
    was missing. Attribution instrumentation now exists (env-gated, default-off) and
    the first measurement is recorded below.
 
-Both measurements used the locked M1 (same `[bench-host]`, AC power, no
+Both measurements used the locked M1 (same `<bench-host>`, AC power, no
 `Runner.Worker`, load < 2.5), the harness's own 2,000-chunk fixture (corpus SHA-256
 `25d1d544...`, reference vectors `d55221d4...`), and `max_length=512`, f16, bucket
 policy v1, explicit execution.

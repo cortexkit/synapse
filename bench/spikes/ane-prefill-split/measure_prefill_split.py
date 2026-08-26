@@ -26,6 +26,11 @@ VARIANTS = {
 }
 
 
+def bench_root() -> Path:
+    configured = os.environ.get("SYNAPSE_BENCH_ROOT")
+    return Path(configured) if configured else Path.home() / "synapse-bench"
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, required=True)
@@ -35,7 +40,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompts", type=Path, required=True)
     parser.add_argument("--work-dir", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--macmon", type=Path, default=Path("[bench-user-home]/bench-tools/bin/macmon"))
+    parser.add_argument("--macmon", type=Path, default=bench_root() / "bench-tools/bin/macmon")
     parser.add_argument("--locked", action="store_true")
     parser.add_argument("--skip-power", action="store_true")
     parser.add_argument("--battery-limit", type=int, default=20)
@@ -79,7 +84,7 @@ def environment_report() -> dict[str, Any]:
 def acquire_lock(enabled: bool) -> Path | None:
     if not enabled:
         return None
-    lock = Path("[bench-user-home]/bench.lock")
+    lock = bench_root() / "bench.lock"
     try:
         lock.mkdir()
     except FileExistsError as error:
@@ -506,7 +511,7 @@ def main() -> int:
             "environment": environment,
             "protocol": {
                 "locked": args.locked,
-                "lock_path": "[bench-user-home]/bench.lock" if args.locked else None,
+                "lock_path": str(bench_root() / "bench.lock") if args.locked else None,
                 "prompt_tokens": WINDOW,
                 "battery_prompts": len(rows),
                 "generated_tokens": 64,

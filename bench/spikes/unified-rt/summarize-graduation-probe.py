@@ -97,7 +97,7 @@ def summarize(raw_dir: Path) -> dict:
         )
 
     return {
-        "host": "[bench-host]",
+        "host": "<bench-host>",
         "tool": "macmon 0.7.2",
         "interval_ms": 100,
         "metric_scope": "system-wide",
@@ -106,7 +106,7 @@ def summarize(raw_dir: Path) -> dict:
             "Each inference window has the result JSON's final-pass duration and ends "
             "at the final sample with at least 1 W GPU power and 5% effective usage."
         ),
-        "raw_logs": "[bench-user-home]/bench-tools/graduation-probe/results/raw/",
+        "raw_logs": "$SYNAPSE_BENCH_ROOT/bench-tools/graduation-probe/results/raw/",
         "cells": cells,
     }
 

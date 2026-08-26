@@ -77,7 +77,7 @@ llama-server used the lane's greedy batched `/v1/embeddings` path, one excluded 
 
 | Item | Value |
 |---|---|
-| Host | `[bench-host]`, Apple M1 Max, 64 GiB |
+| Host | `<bench-host>`, Apple M1 Max, 64 GiB |
 | macOS / Xcode | 26.5.2 (`25F84`) / 26.6 (`17F113`) |
 | Source revision | `c0df85400434ba5f253bf7b3fb41fc803b06f13b` |
 | Owned binary SHA-256 | `3b92806c…e2b3` |
@@ -88,7 +88,7 @@ llama-server used the lane's greedy batched `/v1/embeddings` path, one excluded 
 
 The campaign MLX virtualenv had been evicted. With approval, it was rebuilt using `~/.local/bin/uv` and the pinned `mlx-embeddings==0.1.0` requirement. These are current-version incumbents rather than the older campaign environment. That is conservative for graduation: an improved current MLX result raises the bar faced by the owned runtime. Full package, binary, model, corpus, and host provenance is retained in `results/graduation-probe/environment.json`.
 
-Every inference process acquired `[bench-user-home]/bench.lock`, verified that `pgrep -f Runner.Worker` was empty, and released the lock. Before accepted measurements, an orphan from the already completed bucket campaign was found: outer PID 64588 had command `/bin/zsh [bench-user-home]/bench-tools/unified-rt-serving/run-bucket-matrix.sh` and start time `2026-07-12 05:52:50 CEST`; its retry child and macmon wrote only under `unified-rt-serving/results/m1-bucket-matrix/`. After ownership approval, those orphan processes and their `2026-07-12 10:52:55 CEST` stale lock were stopped. No Actions Runner service or `Runner.Worker` process was touched, and accepted graduation measurements began afterward.
+Every inference process acquired `$SYNAPSE_BENCH_ROOT/bench.lock`, verified that `pgrep -f Runner.Worker` was empty, and released the lock. Before accepted measurements, an orphan from the already completed bucket campaign was found: outer PID 64588 had command `/bin/zsh $SYNAPSE_BENCH_ROOT/bench-tools/unified-rt-serving/run-bucket-matrix.sh` and start time `2026-07-12 05:52:50 CEST`; its retry child and macmon wrote only under `unified-rt-serving/results/m1-bucket-matrix/`. After ownership approval, those orphan processes and their `2026-07-12 10:52:55 CEST` stale lock were stopped. No Actions Runner service or `Runner.Worker` process was touched, and accepted graduation measurements began afterward.
 
 ## Timing and power boundaries
 
@@ -106,20 +106,20 @@ export PATH="/opt/homebrew/bin:$HOME/.cargo/bin:$PATH"
 export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
 cargo build --release --manifest-path bench/spikes/unified-rt/Cargo.toml
 cargo build --release --manifest-path bench/lanes/llama/Cargo.toml
-scp target/release/spike-unified-rt [bench-host-alias]:[bench-user-home]/bench-tools/graduation-probe/bin/spike-unified-rt
-scp target/release/lane-llama [bench-host-alias]:[bench-user-home]/bench-tools/graduation-probe/bin/lane-llama
-scp bench/lanes/mlx-minilm/main.py bench/lanes/mlx-minilm/requirements.txt [bench-host-alias]:/tmp/
-ssh [bench-host-alias] '[bench-user-home]/.local/bin/uv venv --python 3.12 [bench-user-home]/bench-tools/graduation-probe/venvs/mlx-embeddings'
-ssh [bench-host-alias] '[bench-user-home]/.local/bin/uv pip install --python [bench-user-home]/bench-tools/graduation-probe/venvs/mlx-embeddings/bin/python -r [bench-user-home]/bench-tools/graduation-probe/scripts/mlx-requirements.txt'
-scp bench/spikes/unified-rt/run-m1-graduation-probe.sh [bench-host-alias]:[bench-user-home]/bench-tools/graduation-probe/scripts/run-probe.sh
-ssh [bench-host-alias] 'nohup zsh [bench-user-home]/bench-tools/graduation-probe/scripts/run-probe.sh >[bench-user-home]/bench-tools/graduation-probe/results/probe-run.log 2>&1 </dev/null &'
+scp target/release/spike-unified-rt $SYNAPSE_BENCH_HOST:$SYNAPSE_BENCH_ROOT/bench-tools/graduation-probe/bin/spike-unified-rt
+scp target/release/lane-llama $SYNAPSE_BENCH_HOST:$SYNAPSE_BENCH_ROOT/bench-tools/graduation-probe/bin/lane-llama
+scp bench/lanes/mlx-minilm/main.py bench/lanes/mlx-minilm/requirements.txt $SYNAPSE_BENCH_HOST:/tmp/
+ssh $SYNAPSE_BENCH_HOST '$SYNAPSE_BENCH_ROOT/.local/bin/uv venv --python 3.12 $SYNAPSE_BENCH_ROOT/bench-tools/graduation-probe/venvs/mlx-embeddings'
+ssh $SYNAPSE_BENCH_HOST '$SYNAPSE_BENCH_ROOT/.local/bin/uv pip install --python $SYNAPSE_BENCH_ROOT/bench-tools/graduation-probe/venvs/mlx-embeddings/bin/python -r $SYNAPSE_BENCH_ROOT/bench-tools/graduation-probe/scripts/mlx-requirements.txt'
+scp bench/spikes/unified-rt/run-m1-graduation-probe.sh $SYNAPSE_BENCH_HOST:$SYNAPSE_BENCH_ROOT/bench-tools/graduation-probe/scripts/run-probe.sh
+ssh $SYNAPSE_BENCH_HOST 'nohup zsh $SYNAPSE_BENCH_ROOT/bench-tools/graduation-probe/scripts/run-probe.sh >$SYNAPSE_BENCH_ROOT/bench-tools/graduation-probe/results/probe-run.log 2>&1 </dev/null &'
 ```
 
 The committed runner contains the exact expanded model, tokenizer, corpus, reference, cache, pooling, and output paths. Its measured command forms were:
 
 ```sh
 # Owned package-HIT repeats; --passes 3 for the separate steady process.
-[bench-user-home]/bench-tools/graduation-probe/bin/spike-unified-rt \
+$SYNAPSE_BENCH_ROOT/bench-tools/graduation-probe/bin/spike-unified-rt \
   --model "$MODEL" --tokenizer "$MODEL/tokenizer.json" \
   --corpus "$CORPUS" --reference "$REFERENCE" --limit 400 \
   --out "$RESULT" --dtype "$DTYPE" --device metal \
@@ -127,21 +127,21 @@ The committed runner contains the exact expanded model, tokenizer, corpus, refer
   --model-label "$LABEL"
 
 # llama-server fresh-process repeat; POOLING=mean|last|cls by family.
-[bench-user-home]/bench-tools/graduation-probe/bin/lane-llama embed \
-  --server-binary [bench-user-home]/bench-tools/bin/llama-server-wrap.sh \
+$SYNAPSE_BENCH_ROOT/bench-tools/graduation-probe/bin/lane-llama embed \
+  --server-binary $SYNAPSE_BENCH_ROOT/bench-tools/bin/llama-server-wrap.sh \
   --model "$GGUF" --tokenizer "$TOKENIZER" --corpus "$CORPUS" \
   --out "$RESULT" --vectors-out "$VECTORS" --reference "$REFERENCE" \
   --pooling "$POOLING" --model-label "$LABEL"
 
 # Current MLX Python fresh-process repeat.
-[bench-user-home]/bench-tools/graduation-probe/venvs/mlx-embeddings/bin/python \
-  [bench-user-home]/bench-tools/graduation-probe/scripts/mlx-embed.py \
+$SYNAPSE_BENCH_ROOT/bench-tools/graduation-probe/venvs/mlx-embeddings/bin/python \
+  $SYNAPSE_BENCH_ROOT/bench-tools/graduation-probe/scripts/mlx-embed.py \
   --model "$MODEL" --corpus "$CORPUS" --limit 400 \
   --out "$RESULT" --vectors-out "$VECTORS" --model-label "$LABEL"
 
 # Standard parity gate, every row as a query.
-[bench-user-home]/bench-tools/graduation-probe/bin/synapse-bench parity \
+$SYNAPSE_BENCH_ROOT/bench-tools/graduation-probe/bin/synapse-bench parity \
   --reference "$REFERENCE" --candidate "$VECTORS" --k 10 --stride 1
 ```
 
-Each raw M1 log begins with the fully shell-escaped expanded command. Raw command logs, vector JSONL, macmon JSONL, and epoch markers remain at `[bench-user-home]/bench-tools/graduation-probe/results/raw/`. Accepted lane results, parity reports, power windows, environment provenance, and the derived A/B summary are committed under `results/graduation-probe/`.
+Each raw M1 log begins with the fully shell-escaped expanded command. Raw command logs, vector JSONL, macmon JSONL, and epoch markers remain at `$SYNAPSE_BENCH_ROOT/bench-tools/graduation-probe/results/raw/`. Accepted lane results, parity reports, power windows, environment provenance, and the derived A/B summary are committed under `results/graduation-probe/`.

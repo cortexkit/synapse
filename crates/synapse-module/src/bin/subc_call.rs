@@ -25,7 +25,16 @@ use serde_json::{json, Value};
 use subc_client_rs::{CallOptions, ConsumerOptions, SubcConsumer};
 use subc_protocol::{BindIdentity, RouteTarget};
 
-const DEFAULT_SUBC: &str = "/Users/[owner]/.local/share/cortexkit/run/subc-connection.json";
+fn default_subc_path() -> PathBuf {
+    env::var_os("SYNAPSE_CONNECTION_FILE")
+        .map(PathBuf::from)
+        .or_else(|| {
+            env::var_os("XDG_RUNTIME_DIR")
+                .map(PathBuf::from)
+                .map(|directory| directory.join("synapse/subc-connection.json"))
+        })
+        .unwrap_or_else(|| env::temp_dir().join("synapse/subc-connection.json"))
+}
 
 const USAGE: &str = "\
 usage: subc_call --module <id> --method <name> [--params <json>] [--subc <path>] [--identity <harness>:<session_id>]
@@ -33,7 +42,7 @@ usage: subc_call --module <id> --method <name> [--params <json>] [--subc <path>]
   --module <id>       target module id (required)
   --method <name>     management-surface method (required)
   --params <json>     JSON object params (default: {})
-  --subc <path>       subc connection file (default: fleet run path)
+  --subc <path>       subc connection file (default: $SYNAPSE_CONNECTION_FILE or XDG runtime path)
   --identity <h>:<s>  override bind harness:session (chair verbs; exact bytes)
   --help, -h          show this help
 ";
@@ -108,7 +117,7 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    let mut subc = PathBuf::from(DEFAULT_SUBC);
+    let mut subc = default_subc_path();
     let mut module = None;
     let mut method = None;
     let mut params: Value = json!({});

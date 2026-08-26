@@ -308,7 +308,7 @@ fixing its dash incompatibility is separate ALF work.
 
 ### Campaign winner 1 confirmation
 
-Campaign `[consult-id]` winner 1 writes the value
+Campaign `release-quant-decode-1` winner 1 writes the value
 matvec and RoPE-normalized key directly to their per-layer KV-cache slots at the
 current token offset. This removes two device-to-device `cudaMemcpyAsync`
 launches for every layer and generated token. The campaign's controlled RTX 4090
@@ -334,7 +334,7 @@ CUDA-device-specific hook implementation.
 
 ### Campaign winners 2-4 confirmation
 
-Campaign `[consult-id]` banked three stacked CUDA
+Campaign `release-quant-decode-2` banked three stacked CUDA
 winners, applied in round order:
 
 1. Round 1 fused each residual add with the following RMSNorm boundary into one
@@ -369,7 +369,7 @@ territory rather than memory-bandwidth saturation. The winner-5 result is
 
 ### Campaign winner 5 confirmation
 
-Campaign `[consult-id]` winner 5 batches the Q8_0
+Campaign `release-quant-decode-3` winner 5 batches the Q8_0
 Q/K/V GEMVs for each layer into one decode launch. The kernel walks the query
 rows, key rows, and value rows in one grid, reusing the same normalized input
 while selecting each matrix's quantized row range. Q and raw K still feed the
@@ -392,7 +392,7 @@ P8, 210 MHz SM clock, and 22.83/23.04 W during the two preflights.
 
 ### Campaign winner 6 confirmation
 
-Campaign `[consult-id]` promoted winner 6,
+Campaign `release-quant-decode-4` promoted winner 6,
 proposal `c10004d6e5d172718b3811a3d63a0f1f8a00570c9cb044c6630c11721ab5e202`,
 which fuses each layer's query and key head-RMSNorm plus half-split RoPE into
 one launch. A block selects a query head or KV head, performs the same norm and
@@ -420,7 +420,7 @@ bandwidth. The rig reported driver `595.58.03`, P8, 210 MHz SM clock, and
 
 ### Campaign winner 7 confirmation
 
-Campaign `[consult-id]` promoted winner 7,
+Campaign `release-quant-decode-5` promoted winner 7,
 proposal `823f4100342746a109378a2837c00637327d37edc24aad40cd711105b4969930`,
 which captures the complete Qwen3 decode-token launch chain once and replays it
 for each generated token. The graph is instantiated lazily on the first decode
@@ -461,7 +461,7 @@ reason to relax the online-softmax gate.
 
 ### Campaign #14 winners 8+9: overlapping round-5 mechanisms
 
-Campaign `[consult-id]` promoted two round-5
+Campaign `release-quant-decode-6` promoted two round-5
 proposals. The authoritative store provenance is winner 8,
 `proposal_2f092e7671c295704f2ba115f494bce68dce0162044b480bf5302be1d9d51059`
 (claude), followed by winner 9,

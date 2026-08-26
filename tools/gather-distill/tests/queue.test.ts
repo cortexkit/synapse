@@ -28,7 +28,7 @@ describe("generation queue", () => {
       duration_ms: 10,
       input_tokens: 100,
       output_tokens: 20,
-      account: "acct1",
+      account: "test-account-1",
       valid: true,
       ts: new Date(0).toISOString(),
     };
@@ -60,7 +60,7 @@ describe("generation queue", () => {
       cache_read_input_tokens: 0,
       thinking_tokens: 0,
       model: "test",
-      account: "acct1",
+      account: "test-account-1",
       ts: new Date(0).toISOString(),
       valid: true,
     };

@@ -15,7 +15,7 @@ cosine `0.999999999994049`).
 ## Evaluation corpus
 
 [`evalkit/terms.jsonl`](evalkit/terms.jsonl) has 120 terms: 80 technical terms
-from Synapse and sibling CortexKit vocabulary, and 40 ordinary control words.
+from public technical documentation, and 40 ordinary control words.
 [`evalkit/generate_utterances.py`](evalkit/generate_utterances.py) deterministically
 builds three carrier sentences per term (360 source utterances, seed `20260719`).
 [`evalkit/synthesize_audio.py`](evalkit/synthesize_audio.py) uses macOS `say`

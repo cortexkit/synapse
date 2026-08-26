@@ -1,9 +1,8 @@
 # Owned-runtime Qwen3 decode campaign harness
 
-`decode-harness.sh` is the trusted controller for the Athena V3
-Qwen3-0.6B f16 single-stream decode campaign. Alfonso installs the exact Git
-blob named by `.cortexkit/campaign-lab.jsonc`, verifies its SHA-256 before and
-after execution, and invokes it as:
+`decode-harness.sh` is the trusted controller for the
+Qwen3-0.6B f16 single-stream decode campaign. The controller installs an explicitly configured, hash-verified harness blob
+before and after execution, and invokes it as:
 
 ```text
 {harness} {workspace} {candidate_runner} {result}
@@ -40,7 +39,7 @@ from its embedded pin. It does not download a model and forces
 The committed [`decode-fixtures/`](decode-fixtures/) directory contains the 20
 prompts, 20 token-only CPU-fp32 references produced with
 `transformers==4.51.0` and `torch==2.13.0` (1,280 tokens), and `SHA256SUMS`.
-Because Alfonso installs one hash-verified harness blob rather than a support
+Because the controller installs one hash-verified harness blob rather than a support
 file tree, the same fixture bytes and manifest are embedded in the controller.
 At startup it extracts them into a controller-owned temporary directory,
 verifies both hashes, checks row IDs and token counts, and makes the files
@@ -93,15 +92,13 @@ the numeric `median_tok_s` and the process exit status, not the JSON booleans:
 error. The JSON booleans remain as human-readable diagnostics.
 Acceptance thresholds remain campaign policy. The registration supplies a 5%
 baseline stability width and 5% control drift tolerance, plus a one-minute load
-threshold of 2.5 that makes Alfonso pause and requeue noisy work.
+threshold of 2.5 that makes the controller pause and requeue noisy work.
 
 ## Offline rig preparation
 
-A candidate build has no network egress. Preserve Synapse's normal sibling
-layout by hydrating the frozen `commons` and `subconscious` revisions beside the
-candidate workspace; workspace Cargo metadata refers to `../commons` and
-`../subconscious`. Before applying candidate patches or entering the sandbox,
-prepare the rig's controller image from that frozen, hydrated base:
+A candidate build has no network egress. Configure all required public
+Dependencies before applying candidate patches or entering the sandbox, then
+prepare the controller image from that hydrated base:
 
 ```sh
 cargo fetch --locked --manifest-path bench/spikes/unified-rt/Cargo.toml
@@ -128,11 +125,11 @@ result path must not already exist. A pass-through runner can simulate the
 campaign argv contract without simulating its sandbox identity:
 
 ```sh
-test ! -e [bench-user-home]/bench.lock
+test ! -e $SYNAPSE_BENCH_ROOT/bench.lock
 test ! -e /tmp/aft-measure.lock
 ! pgrep -f '[R]unner.Worker'
-mkdir [bench-user-home]/bench.lock
-trap 'rmdir [bench-user-home]/bench.lock' EXIT INT TERM HUP
+mkdir $SYNAPSE_BENCH_ROOT/bench.lock
+trap 'rmdir $SYNAPSE_BENCH_ROOT/bench.lock' EXIT INT TERM HUP
 
 cat >/tmp/pass-through-runner <<'SH'
 #!/bin/sh
@@ -149,7 +146,7 @@ SYNAPSE_CAMPAIGN_MODEL="$HOME/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/sn
 
 On 2026-07-15 the controller ran against pristine commit
 `f99215ce199e26c76e9bb5ce911571e847f612ad` on
-`[bench-host]` (M1 Max). The two lock paths were absent, no
+`<bench-host>` (M1 Max). The two lock paths were absent, no
 `Runner.Worker` was active, one-minute load was 1.88 at admission, the Cargo
 registry had been prewarmed from that frozen base, and the pass-through runner
 above was used. The complete cold-target harness took 146.662 seconds, so the

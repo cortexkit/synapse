@@ -1,16 +1,16 @@
 #!/bin/zsh
 set -euo pipefail
 
-ROOT=[bench-user-home]/bench-tools/unified-rt-serving
+ROOT=${SYNAPSE_BENCH_ROOT:?set SYNAPSE_BENCH_ROOT}/bench-tools/unified-rt-serving
 BIN="$ROOT/bin/spike-unified-rt"
 DATA="$ROOT/data"
 RESULTS="$ROOT/results"
 PACKAGES="$ROOT/packages"
-LOCK=[bench-user-home]/bench.lock
+LOCK=${SYNAPSE_BENCH_ROOT:?set SYNAPSE_BENCH_ROOT}/bench.lock
 
-MINILM=[bench-user-home]/.cache/huggingface/hub/models--sentence-transformers--all-MiniLM-L6-v2/snapshots/1110a243fdf4706b3f48f1d95db1a4f5529b4d41
-MODERNBERT=[bench-user-home]/.cache/huggingface/hub/models--Alibaba-NLP--gte-modernbert-base/snapshots/e7f32e3c00f91d699e8c43b53106206bcc72bb22
-QWEN3=[bench-user-home]/.cache/huggingface/hub/models--Qwen--Qwen3-Embedding-0.6B/snapshots/97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3
+MINILM=${SYNAPSE_BENCH_ROOT:?set SYNAPSE_BENCH_ROOT}/.cache/huggingface/hub/models--sentence-transformers--all-MiniLM-L6-v2/snapshots/1110a243fdf4706b3f48f1d95db1a4f5529b4d41
+MODERNBERT=${SYNAPSE_BENCH_ROOT:?set SYNAPSE_BENCH_ROOT}/.cache/huggingface/hub/models--Alibaba-NLP--gte-modernbert-base/snapshots/e7f32e3c00f91d699e8c43b53106206bcc72bb22
+QWEN3=${SYNAPSE_BENCH_ROOT:?set SYNAPSE_BENCH_ROOT}/.cache/huggingface/hub/models--Qwen--Qwen3-Embedding-0.6B/snapshots/97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3
 
 mkdir -p "$RESULTS" "$PACKAGES"
 

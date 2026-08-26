@@ -91,7 +91,7 @@ def summarize_power(raw_dir: Path, result_dir: Path) -> dict:
         )
 
     return {
-        "host": "[bench-host]",
+        "host": "<bench-host>",
         "tool": "macmon 0.7.2",
         "interval_ms": 100,
         "metric_scope": "system-wide",
@@ -101,7 +101,7 @@ def summarize_power(raw_dir: Path, result_dir: Path) -> dict:
             "last sample with at least 1 W GPU power and 5% effective GPU usage."
         ),
         "raw_logs": (
-            "[bench-user-home]/bench-tools/unified-rt-serving/results/"
+            "$SYNAPSE_BENCH_ROOT/bench-tools/unified-rt-serving/results/"
             f"{result_dir.name}/"
         ),
         "cells": cells,

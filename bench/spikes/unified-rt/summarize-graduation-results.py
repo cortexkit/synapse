@@ -141,7 +141,7 @@ def summarize(root: Path, power_path: Path) -> dict:
 
     return {
         "schema": "synapse-graduation-probe-v1",
-        "host": "[bench-host] (Apple M1 Max, 64 GiB)",
+        "host": "<bench-host> (Apple M1 Max, 64 GiB)",
         "corpus_rows": 400,
         "token_accounting": "real sanitized-tokenizer tokens",
         "power": {

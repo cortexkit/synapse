@@ -1,6 +1,6 @@
 {
   "environment": {
-    "host": "[bench-host]",
+    "host": "<bench-host>",
     "machine": "arm64",
     "macos": "26.5.2",
     "hardware_model": "MacBookPro18,2",
@@ -10,7 +10,7 @@
   },
   "protocol": {
     "locked": true,
-    "lock_path": "[bench-user-home]/bench.lock",
+    "lock_path": "$SYNAPSE_BENCH_ROOT/bench.lock",
     "prompt_tokens": 128,
     "battery_prompts": 20,
     "generated_tokens": 64,
@@ -30,7 +30,7 @@
       "stage": {
         "artifact_write_ms": 19.667207961902022,
         "cache_bucket": 512,
-        "cache_path": "[bench-user-home]/ane-prefill-split-survey/ane-prefill-split/artifacts/locked-m1-corrected/w128/cache.bin",
+        "cache_path": "$SYNAPSE_BENCH_ROOT/ane-prefill-split-survey/ane-prefill-split/artifacts/locked-m1-corrected/w128/cache.bin",
         "calls": 20,
         "chunks": 1,
         "cold_load_s": 0.18066670885309577,
@@ -51,9 +51,9 @@
         "logits_argmax_wall_s": 0.006534038111567497,
         "logits_copy_p50_ms": 0.18362491391599178,
         "logits_copy_wall_s": 0.005457584513351321,
-        "logits_path": "[bench-user-home]/ane-prefill-split-survey/ane-prefill-split/artifacts/locked-m1-corrected/w128/logits.bin",
+        "logits_path": "$SYNAPSE_BENCH_ROOT/ane-prefill-split-survey/ane-prefill-split/artifacts/locked-m1-corrected/w128/logits.bin",
         "logits_top2_gap": 7.9765625,
-        "model_path": "[bench-user-home]/ane-prefill-split-survey/ane-prefill-split/artifacts/qwen3-prefill-w128.mlmodelc",
+        "model_path": "$SYNAPSE_BENCH_ROOT/ane-prefill-split-survey/ane-prefill-split/artifacts/qwen3-prefill-w128.mlmodelc",
         "model_window": 128,
         "output_count": 57,
         "padded_cache_bytes_f16": 58720256,
@@ -438,7 +438,7 @@
       "stage": {
         "artifact_write_ms": 22.367208963260055,
         "cache_bucket": 512,
-        "cache_path": "[bench-user-home]/ane-prefill-split-survey/ane-prefill-split/artifacts/locked-m1-corrected/w32x4/cache.bin",
+        "cache_path": "$SYNAPSE_BENCH_ROOT/ane-prefill-split-survey/ane-prefill-split/artifacts/locked-m1-corrected/w32x4/cache.bin",
         "calls": 20,
         "chunks": 4,
         "cold_load_s": 0.12230299995280802,
@@ -459,9 +459,9 @@
         "logits_argmax_wall_s": 0.005648709833621979,
         "logits_copy_p50_ms": 0.2213341649621725,
         "logits_copy_wall_s": 0.005004458827897906,
-        "logits_path": "[bench-user-home]/ane-prefill-split-survey/ane-prefill-split/artifacts/locked-m1-corrected/w32x4/logits.bin",
+        "logits_path": "$SYNAPSE_BENCH_ROOT/ane-prefill-split-survey/ane-prefill-split/artifacts/locked-m1-corrected/w32x4/logits.bin",
         "logits_top2_gap": 7.03125,
-        "model_path": "[bench-user-home]/ane-prefill-split-survey/ane-prefill-split/artifacts/qwen3-prefill-w32.mlmodelc",
+        "model_path": "$SYNAPSE_BENCH_ROOT/ane-prefill-split-survey/ane-prefill-split/artifacts/qwen3-prefill-w32.mlmodelc",
         "model_window": 32,
         "output_count": 57,
         "padded_cache_bytes_f16": 58720256,
@@ -957,7 +957,7 @@
   "power": {
     "ane_w128": {
       "sample_count": 76,
-      "raw_path": "[bench-user-home]/ane-prefill-split-survey/ane-prefill-split/artifacts/locked-m1-corrected/power/ane-w128-macmon.jsonl",
+      "raw_path": "$SYNAPSE_BENCH_ROOT/ane-prefill-split-survey/ane-prefill-split/artifacts/locked-m1-corrected/power/ane-w128-macmon.jsonl",
       "ane_power": {
         "mean_w": 3.1269224348576055,
         "median_w": 3.272308349609375,
@@ -983,7 +983,7 @@
       "stage": {
         "artifact_write_ms": 16.52520801872015,
         "cache_bucket": 512,
-        "cache_path": "[bench-user-home]/ane-prefill-split-survey/ane-prefill-split/artifacts/locked-m1-corrected/power/ane-w128-cache.bin",
+        "cache_path": "$SYNAPSE_BENCH_ROOT/ane-prefill-split-survey/ane-prefill-split/artifacts/locked-m1-corrected/power/ane-w128-cache.bin",
         "calls": 300,
         "chunks": 1,
         "cold_load_s": 0.16638516588136554,
@@ -1004,9 +1004,9 @@
         "logits_argmax_wall_s": 0.08619403839111328,
         "logits_copy_p50_ms": 0.16779196448624134,
         "logits_copy_wall_s": 0.05231799161992967,
-        "logits_path": "[bench-user-home]/ane-prefill-split-survey/ane-prefill-split/artifacts/locked-m1-corrected/power/ane-w128-logits.bin",
+        "logits_path": "$SYNAPSE_BENCH_ROOT/ane-prefill-split-survey/ane-prefill-split/artifacts/locked-m1-corrected/power/ane-w128-logits.bin",
         "logits_top2_gap": 7.9765625,
-        "model_path": "[bench-user-home]/ane-prefill-split-survey/ane-prefill-split/artifacts/qwen3-prefill-w128.mlmodelc",
+        "model_path": "$SYNAPSE_BENCH_ROOT/ane-prefill-split-survey/ane-prefill-split/artifacts/qwen3-prefill-w128.mlmodelc",
         "model_window": 128,
         "output_count": 57,
         "padded_cache_bytes_f16": 58720256,
@@ -1020,7 +1020,7 @@
     },
     "ane_w32x4": {
       "sample_count": 83,
-      "raw_path": "[bench-user-home]/ane-prefill-split-survey/ane-prefill-split/artifacts/locked-m1-corrected/power/ane-w32x4-macmon.jsonl",
+      "raw_path": "$SYNAPSE_BENCH_ROOT/ane-prefill-split-survey/ane-prefill-split/artifacts/locked-m1-corrected/power/ane-w32x4-macmon.jsonl",
       "ane_power": {
         "mean_w": 1.9022299751459835,
         "median_w": 1.9692538976669312,
@@ -1046,7 +1046,7 @@
       "stage": {
         "artifact_write_ms": 22.794040851294994,
         "cache_bucket": 512,
-        "cache_path": "[bench-user-home]/ane-prefill-split-survey/ane-prefill-split/artifacts/locked-m1-corrected/power/ane-w32x4-cache.bin",
+        "cache_path": "$SYNAPSE_BENCH_ROOT/ane-prefill-split-survey/ane-prefill-split/artifacts/locked-m1-corrected/power/ane-w32x4-cache.bin",
         "calls": 100,
         "chunks": 4,
         "cold_load_s": 0.1418742500245571,
@@ -1067,9 +1067,9 @@
         "logits_argmax_wall_s": 0.02845033328048885,
         "logits_copy_p50_ms": 0.22441614419221878,
         "logits_copy_wall_s": 0.022004999918863177,
-        "logits_path": "[bench-user-home]/ane-prefill-split-survey/ane-prefill-split/artifacts/locked-m1-corrected/power/ane-w32x4-logits.bin",
+        "logits_path": "$SYNAPSE_BENCH_ROOT/ane-prefill-split-survey/ane-prefill-split/artifacts/locked-m1-corrected/power/ane-w32x4-logits.bin",
         "logits_top2_gap": 7.03125,
-        "model_path": "[bench-user-home]/ane-prefill-split-survey/ane-prefill-split/artifacts/qwen3-prefill-w32.mlmodelc",
+        "model_path": "$SYNAPSE_BENCH_ROOT/ane-prefill-split-survey/ane-prefill-split/artifacts/qwen3-prefill-w32.mlmodelc",
         "model_window": 32,
         "output_count": 57,
         "padded_cache_bytes_f16": 58720256,
@@ -1083,7 +1083,7 @@
     },
     "gpu_prefill": {
       "sample_count": 58,
-      "raw_path": "[bench-user-home]/ane-prefill-split-survey/ane-prefill-split/artifacts/locked-m1-corrected/power/gpu-prefill-macmon.jsonl",
+      "raw_path": "$SYNAPSE_BENCH_ROOT/ane-prefill-split-survey/ane-prefill-split/artifacts/locked-m1-corrected/power/gpu-prefill-macmon.jsonl",
       "ane_power": {
         "mean_w": 0.0,
         "median_w": 0.0,
@@ -1115,7 +1115,7 @@
     },
     "gpu_upload": {
       "sample_count": 47,
-      "raw_path": "[bench-user-home]/ane-prefill-split-survey/ane-prefill-split/artifacts/locked-m1-corrected/power/gpu-upload-macmon.jsonl",
+      "raw_path": "$SYNAPSE_BENCH_ROOT/ane-prefill-split-survey/ane-prefill-split/artifacts/locked-m1-corrected/power/gpu-upload-macmon.jsonl",
       "ane_power": {
         "mean_w": 0.0,
         "median_w": 0.0,
@@ -1147,7 +1147,7 @@
     },
     "gpu_decode": {
       "sample_count": 55,
-      "raw_path": "[bench-user-home]/ane-prefill-split-survey/ane-prefill-split/artifacts/locked-m1-corrected/power/gpu-decode-macmon.jsonl",
+      "raw_path": "$SYNAPSE_BENCH_ROOT/ane-prefill-split-survey/ane-prefill-split/artifacts/locked-m1-corrected/power/gpu-decode-macmon.jsonl",
       "ane_power": {
         "mean_w": 0.0,
         "median_w": 0.0,

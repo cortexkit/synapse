@@ -679,11 +679,11 @@ SYNAPSE_VULKAN_BATCHED_PROBE_QUANT=q8 ... (same)    # Q8 curve (default)
 ## Wave 6: extended-K completion, pool budget, and Ally campaign
 
 **Status on 2026-08-06: complete.** The Ally was admitted at the preferred mDNS
-hostname `[ally-host]` (SSH used the hostname, never an IP address). The
+hostname `<bench-host>` (SSH used the hostname, never an IP address). The
 preflight found no `cargo.exe`, `unified-rt.exe`, or `spike-unified-rt.exe` tenant;
 Turbo power was active and `Win32_Battery.BatteryStatus=2` (AC/charging) before
 the timed cells. The checkout was built with
-`CARGO_TARGET_DIR=C:\Users\ufuka\cargo-target-decode`; the existing checked-in
+`CARGO_TARGET_DIR=%USERPROFILE%\cargo-target-decode`; the existing checked-in
 SPIR-V artifacts were reused and no shader rebuild was needed.
 
 ### Descriptor-pool fix
@@ -756,11 +756,11 @@ and 48 cells; K=64 is recorded as a driver/device gate kill.
 ### Embed campaign registration and baseline
 
 `bench/campaign/vulkan-embed-harness.sh` completed the idle-gated campaign on
-`ufuka@[ally-host]`. The accepted result passed the determinism gate, full
+`$SYNAPSE_BENCH_TARGET`. The accepted result passed the determinism gate, full
 2,000-row embedding parity, and rank gate: mean cosine floor `0.999998996`,
 worst-decile top-10 overlap floor `0.97550`, and measured median
 **3952.0762978127013 tok/s** across three paired fresh-process runs. The
-registration in `.cortexkit/campaign-lab.jsonc` now carries that measured
-baseline, the hostname target, `C:\Users\ufuka\cargo-target-decode`, sibling
+external benchmark configuration carries the measured baseline, configured
+target, `%USERPROFILE%\cargo-target-decode`, and dependency
 checkouts, and harness SHA-256
 `9f17878f2c9faa965ed04ecaeb8844525613b65ac279b88ac9dce0b6c26475d0`.

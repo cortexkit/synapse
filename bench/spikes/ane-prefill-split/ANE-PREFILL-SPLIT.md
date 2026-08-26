@@ -23,7 +23,7 @@ prompts are exact through 64 tokens; the other 11 diverge at depths 1--12.
 
 ## Design-fork survey
 
-Survey authority: `[bench-host]`, MacBookPro18,2 (M1 Max), macOS
+Survey authority: `<bench-host>`, MacBookPro18,2 (M1 Max), macOS
 26.5.2, torch 2.5.1, coremltools 8.3.0, f16, `CPU_AND_NE`.
 
 | Export | Outputs | Logical K/V bytes/request | Package | Conversion | Core ML logits cosine vs eager | Placement |
@@ -39,7 +39,7 @@ engine's existing 512-token bucket, a 58,720,256-byte f16 device cache.
 
 ## Locked protocol
 
-- `[bench-user-home]/bench.lock` acquired with `mkdir`; no `Runner.Worker`; AC power;
+- `$SYNAPSE_BENCH_ROOT/bench.lock` acquired with `mkdir`; no `Runner.Worker`; AC power;
   one-minute load under 3.0 (recorded `{ 1.70 1.28 1.20 }`).
 - Source model hash:
   `f47f71177f32bcd101b7573ec9171e6a57f4f4d31148d38e382306f42996874b`.
@@ -63,7 +63,7 @@ engine's existing 512-token bucket, a 58,720,256-byte f16 device cache.
 The actions-runner service was paused only for measurement cells. The initial
 pause was 16:04:58Z--16:11:21Z; the corrected authoritative pause was
 16:27:38Z--16:33:13Z. After the corrected run, the listener was Started and the
-GitHub runner API reported `[bench-host-alias]-metal` online. Between pauses, GitHub's
+GitHub runner API reported `<bench-runner>` online. Between pauses, GitHub's
 Actions broker returned HTTP 503 while the healthy listener retried; no CI job
 was killed.
 

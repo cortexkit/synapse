@@ -1713,11 +1713,11 @@ mod tests {
     /// as f16: the engine-oracle gap is a small rounding effect, so forks are rare).
     const MAX_CERTIFIED_FORKS_Q8: usize = 2;
 
-    /// M1 authority Q8 fork signature (the primary gate), pinned from the locked
-    /// M1 run on 2026-07-27 (MacBookPro18,2, [bench-host], bench.lock
-    /// held, load ~1.1, AC): the Q8 engine is **20/20 byte-exact** against the Q8
-    /// CPU-reference oracle -- **zero forks** -- so the pinned M1 signature is
-    /// "no divergence" and the gate asserts an empty fork set on the M1. (Unlike
+    /// M1 authority Q8 fork signature (the primary gate), pinned from the
+    /// controlled M1 benchmark configuration on 2026-07-27 (MacBookPro18,2): the
+    /// Q8 engine is **20/20 byte-exact** against the Q8 CPU-reference oracle --
+    /// **zero forks** -- so the pinned M1 signature is "no divergence" and the
+    /// gate asserts an empty fork set on the M1. (Unlike
     /// the f16 engine, whose M1 run forked one near-tie, the Q8 engine's shared
     /// quantized bytes leave no sub-band near-tie to flip on this fixture set.)
     /// Set to false to revert to record-the-observed-signature mode.
@@ -2129,7 +2129,7 @@ mod tests {
     const M5_CANARY_STEP: usize = 17;
 
     /// Whether this process runs on the M1 fixture/timing authority
-    /// (LFM2-DECODE-BASELINES.md rig: [bench-host], Apple M1 Max,
+    /// (LFM2-DECODE-BASELINES.md rig: <bench-host>, Apple M1 Max,
     /// MacBookPro18,2). The f16 near-tie coin-flips resolve differently on other
     /// Apple GPUs, so the exact fork signature is pinned only here; elsewhere the
     /// structural band invariant is the gate. An explicit env override

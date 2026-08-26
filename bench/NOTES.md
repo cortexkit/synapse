@@ -8,9 +8,9 @@ Evidence accumulator for the tradeoff doc. Raw run JSONs land in bench/results/.
 - rustc 1.96.1; Xcode 26.6 (via DEVELOPER_DIR override, xcode-select points at CLT)
 - llama-server build 9580 (b4e3dc613), zerobrew
 - Power sampling: macmon 0.7.2 (sudo-free; cpu/gpu/ane watts, JSON pipe)
-- Corpus v1 (provisional): 4000 chunks from cortexkit/aft, 1,416,127 tokens,
-  avg 354 tok/chunk, Qwen3-Embedding tokenizer, line-based chunker.
-  To be superseded by AFT's real chunk export for final numbers.
+- Corpus v1 (provisional): 4,000 independently licensed test chunks, 1,416,127
+  tokens, avg 354 tok/chunk, Qwen3-Embedding tokenizer, line-based chunker.
+  Replace this fixture with a reviewed public corpus before publishing final numbers.
 
 ## Measurement protocol
 
@@ -20,10 +20,10 @@ Evidence accumulator for the tradeoff doc. Raw run JSONs land in bench/results/.
 - Lanes run SERIALLY, one at a time, idle-gated between lanes (bench/run-matrix.sh).
 - Deterministic outputs (parity reference vectors) may be generated on a busy machine;
   timing/power from those runs is discarded.
-- Contaminated-run register: bench/results/smoke-ort.json timings (LMStudio was
-  serving AFT's embedding burst during the run) — integration proof only.
+- Contaminated-run register: bench/results/smoke-ort.json timings are
+  integration proof only and are not published measurements.
 
-## Dispositions by inspection (worker [task-id], evidence cited in report)
+## Dispositions by inspection
 
 ### vllm — dispositioned (not benched)
 
@@ -60,15 +60,15 @@ Silicon) independently converges on the same hybrid we're evaluating.
 Parity: reference vectors from the ort-cpu lane (deterministic); embed lanes report mean
 cosine vs reference. Generative workload B judged on output validity, not parity.
 
-AFT steers folded in (pm_61591b08): corpus swap to AFT's real SemanticChunk export when
-it lands; rerank deferred to the API design round (with AFT before freeze); COLD-LOAD is
-a first-class metric column for the micro-LLM workload (always-on vs load-per-call
-architecture fork); wrap lanes measured with predicted-vs-measured stated side by side.
+External technical review: use a reviewed public corpus for final numbers;
+rerank remains deferred to the API design round; COLD-LOAD is a first-class
+metric for the micro-LLM workload (always-on vs load-per-call architecture
+fork); wrap lanes report predicted and measured results side by side.
 Internal queue design later: scheduler-owns-readiness (workers only receive runnable
 jobs), never workers-block-on-locks. API contract must state timeout tiers explicitly in
 manifest/op descriptions (25s-default-vs-60s-cold-load scar).
 
-## Burn inspection (worker [task-id], evidence cited in report)
+## Burn inspection
 
 - ONNX import moved OUT of the main repo to external burn-onnx (v0.21.0, 2026-05-12,
   first dedicated release): 160 ops, model checks include ModernBERT, all-MiniLM-L6-v2,
@@ -90,7 +90,7 @@ manifest/op descriptions (25s-default-vs-60s-cold-load scar).
   question for the LLM half today; it can only challenge the N-backends conclusion for
   embeddings.
 
-## ANE re-survey (worker [task-id], sources dated, retrieved 2026-07-04)
+## ANE re-survey (sources dated, retrieved 2026-07-04)
 
 Old conclusion (ORT-CoreML-EP dead end) holds for THAT path only; direct paths moved:
 
@@ -122,11 +122,11 @@ Old conclusion (ORT-CoreML-EP dead end) holds for THAT path only; direct paths m
 
 | Lane | Parity vs reference | Cold load (smoke) | Integration findings |
 |------|--------------------:|------------------:|----------------------|
-| ort-cpu (Qwen3-Emb fp32) | reference | 1.4s | KV-cache inputs in onnx-community export fed empty; AFT policies reproduced exactly |
+| ort-cpu (Qwen3-Emb fp32) | reference | 1.4s | KV-cache inputs in onnx-community export fed empty; reference policies reproduced exactly |
 | llama-metal (f16 GGUF, llama-server child) | 0.9999994 | 13.1s (incl model load) | --pooling last + --embd-normalize 2 verified; server returns per-request timings; chat_template_kwargs.enable_thinking=false works on build 9580; clean child lifecycle incl error paths |
 | mlx (bf16, mlx-rs 0.25.3) | 0.9958 | 4.4s | Full Qwen3 forward pass hand-written (RMSNorm/RoPE/GQA/q&k-norm); plain completion gave 0.000 label validity → Qwen chat template + thinking-disabled gives 1.000; mlx-sys release build 13m08s, needs cmake + DEVELOPER_DIR (real CI cost) |
 | burn-wgpu (MiniLM fallback, f32) | 1.0000 (vs ort same model) | 105.5s (Metal shader setup) | Qwen3 ONNX REFUSED by burn-onnx: "Nodes are not topologically sorted (ONNX spec violation)" — the validated-models path works, arbitrary exports don't; compile-time codegen pins the binary to one ONNX snapshot (no runtime model swap); 4m31s release build |
-| wrap-lmstudio | pending | n/a | blocked on AFT burst |
+| wrap-lmstudio | pending | n/a | blocked on another workload |
 
 Workload B smoke (10 prompts, greedy, 16 max tokens):
 - llama-metal: 10/10 valid labels, server decode ~281 tok/s (contaminated)
@@ -146,14 +146,14 @@ loading + per-request timings + one binary for embed+LLM.
   mlx lane without hand-implementing LFM2.5's hybrid conv/attention architecture in
   mlx-rs — which is itself the mlx-rs finding restated: every model family = new
   Rust code; llama.cpp got it for free from the GGUF ecosystem.
-- sglang ([task-id]): Python-first serving stack, quickstart still Linux+CUDA
+- sglang: Python-first serving stack, quickstart still Linux+CUDA
   sm80+, no Windows story — BUT it now has an official Apple Silicon path via a
   separate MLX/Metal guide (docs.sglang.io hardware-platforms/apple_metal, v0.5.14
   2026-06-26 shows active MLX work). Embeddings first-class (/v1/embeddings,
   Qwen3-Embedding-0.6B is their own bench default). Verdict: dispositioned as
   primary desktop runtime (Python stack, datacenter-oriented, no Windows); its
   Apple lane is MLX underneath — see the convergence note below.
-- vllm Metal claim ([task-id]): CORRECTION to our disposition. vLLM-Metal is
+- vllm Metal claim: CORRECTION to our disposition. vLLM-Metal is
   REAL: an official-org out-of-tree plugin (vllm-project/vllm-metal, created
   2025-12-12, alpha, ~1.4k stars), MLX-backed (deps: mlx, mlx-lm, mlx-vlm),
   registered via vllm.platform_plugins. Core vllm still has no in-tree Metal

@@ -1,7 +1,7 @@
 # Study: speculative-serving link sweep (2026-08-24)
 
-Four sources examined for the owned-LLM-loop program (draft:
-`.cortexkit/alfonso/drafts/2026-08-24-owned-llm-loop-agentic-scale-local-serving-27b-class.md`).
+Four sources examined for the owned-LLM-loop program. Internal planning drafts
+are intentionally not part of this release.
 Verdicts first; numbers are quoted from the sources, not re-measured.
 
 ## 1. dFlash 2 (inco.ai/blog/dflash2, checkpoints on HF)

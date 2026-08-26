@@ -15,7 +15,7 @@ That is not the original ~2 W total-system hypothesis, but it is still dramatica
 
 ## Measurement setup
 
-- Bench host: **M1 Max** over SSH (`[bench-host-alias]`), machine hash `MacBookPro18,2`.
+- Bench host: **M1 Max** over SSH (`<bench-host>`), machine hash `MacBookPro18,2`.
 - Corpus: first **1,000** rows of `corpus/aft-chunks.jsonl`, field `embed_text`.
 - Corpus integrity check: local and M1 copies matched exactly.
   - SHA-256: `1c36b742095318fe2fe5d0bd221974c94de9ce834e1dbee509eae2480cbe1479`

@@ -52,17 +52,17 @@ The smoke cosine is above the 0.999 conversion-bug stop threshold but already be
 
 ## Locked M1 protocol
 
-Host: `MacBookPro18,2`, Apple M1 Max, macOS 26.5.2 (`25F84`). Each measured process acquired `[bench-user-home]/bench.lock`, rejected an active `Runner.Worker`, started macmon, waited for its first sample and then another two seconds, and used a trap to kill macmon and release the lock. The executed protocol was:
+Host: `MacBookPro18,2`, Apple M1 Max, macOS 26.5.2 (`25F84`). Each measured process acquired `$SYNAPSE_BENCH_ROOT/bench.lock`, rejected an active `Runner.Worker`, started macmon, waited for its first sample and then another two seconds, and used a trap to kill macmon and release the lock. The executed protocol was:
 
 ```sh
-until mkdir [bench-user-home]/bench.lock 2>/dev/null; do sleep 30; done
+until mkdir $SYNAPSE_BENCH_ROOT/bench.lock 2>/dev/null; do sleep 30; done
 if pgrep -f Runner.Worker >/dev/null; then
-  rmdir [bench-user-home]/bench.lock
+  rmdir $SYNAPSE_BENCH_ROOT/bench.lock
   exit 75
 fi
 pid=""
-trap '[[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true; rmdir [bench-user-home]/bench.lock 2>/dev/null || true' EXIT INT TERM HUP
-[bench-user-home]/bench-tools/bin/macmon -i 100 pipe > "$MACMON_JSONL" 2> "$MACMON_LOG" &
+trap '[[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true; rmdir $SYNAPSE_BENCH_ROOT/bench.lock 2>/dev/null || true' EXIT INT TERM HUP
+$SYNAPSE_BENCH_ROOT/bench-tools/bin/macmon -i 100 pipe > "$MACMON_JSONL" 2> "$MACMON_LOG" &
 pid=$!
 for _ in {1..100}; do [[ -s "$MACMON_JSONL" ]] && break; sleep 0.1; done
 sleep 2
@@ -72,11 +72,11 @@ python3 -c 'import time; print(time.time())' > "$END_EPOCH"
 kill "$pid" 2>/dev/null || true
 wait "$pid" 2>/dev/null || true
 pid=""
-rmdir [bench-user-home]/bench.lock
+rmdir $SYNAPSE_BENCH_ROOT/bench.lock
 trap - EXIT INT TERM HUP
 ```
 
-Raw macmon windows and outputs remain at `[bench-host-alias]:~/bench-tools/ane-wave1/results/`. `results/wave1-summary.json` contains the filtered power summaries. Power is macmon's CPU, GPU, and ANE domains; combined energy uses their sum over runner cold-load plus inference time.
+Raw macmon windows and outputs remain at `$SYNAPSE_BENCH_HOST:~/bench-tools/ane-wave1/results/`. `results/wave1-summary.json` contains the filtered power summaries. Power is macmon's CPU, GPU, and ANE domains; combined energy uses their sum over runner cold-load plus inference time.
 
 ## Placement proof
 

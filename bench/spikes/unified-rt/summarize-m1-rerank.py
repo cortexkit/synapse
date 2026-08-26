@@ -81,7 +81,7 @@ def main() -> None:
         )
 
     summary = {
-        "host": "[bench-host]",
+        "host": "<bench-host>",
         "tool": "macmon 0.7.2",
         "interval_ms": 100,
         "metric_scope": "system-wide",
@@ -90,7 +90,7 @@ def main() -> None:
             "Each inference window has the result JSON infer_wall_s duration and ends "
             "at the last sample with at least 1 W GPU power and 5% effective GPU usage."
         ),
-        "raw_logs": "[bench-user-home]/bench-tools/unified-rt-serving/results/m1-rerank/",
+        "raw_logs": "$SYNAPSE_BENCH_ROOT/bench-tools/unified-rt-serving/results/m1-rerank/",
         "cells": cells,
     }
     (args.result_dir / "power-summary.json").write_text(

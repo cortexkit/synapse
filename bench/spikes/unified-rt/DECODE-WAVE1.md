@@ -12,25 +12,25 @@ This clears the `>=40 tok/s` bar with margin. The fresh same-machine llama.cpp M
 
 | Item | Value |
 |---|---|
-| Host | `[bench-host]`, Apple M1 Max |
+| Host | `<bench-host>`, Apple M1 Max |
 | Model | `Qwen/Qwen3-0.6B`, safetensors f16 storage |
 | Cache | one stream, bucket 512 |
 | Decode | greedy raw completion, 64 generated tokens |
 | Graph | one full-bucket prefill executable and one query-length-1 step executable |
 | Compilation | `MPSGraphOptimizationLevel1`, one serialized package per pass/bucket |
-| Lock | `mkdir [bench-user-home]/bench.lock`; `/tmp/aft-measure.lock` absent; no `Runner.Worker` |
+| Lock | `mkdir $SYNAPSE_BENCH_ROOT/bench.lock`; `/tmp/aft-measure.lock` absent; no `Runner.Worker` |
 
-The release binary was built in `[bench-user-home]/ck-campaign/workspaces/mason-winner-2/target/release/spike-unified-rt`. The hardened campaign harness SHA-256 was `008d43490e9504bd420bee96823b950e387ea90a1a81f46e20e9890980741a9c`. Timed cells ran only while the benchmark lock was held. AC power was confirmed before admission with `pmset -g batt`: `Now drawing from 'AC Power'`, internal battery **98%**, charging.
+The release binary was built in `$SYNAPSE_BENCH_ROOT/ck-campaign/workspaces/mason-winner-2/target/release/spike-unified-rt`. The hardened campaign harness SHA-256 was `008d43490e9504bd420bee96823b950e387ea90a1a81f46e20e9890980741a9c`. Timed cells ran only while the benchmark lock was held. AC power was confirmed before admission with `pmset -g batt`: `Now drawing from 'AC Power'`, internal battery **98%**, charging.
 
-The fresh llama.cpp controls used the M1-native `[bench-user-home]/bench-tools/llama-b9580/llama-cli`, built from llama.cpp tag `b9580` at commit `b4e3dc613baa92a3884d4151e3d631395c81934a` with Xcode/AppleClang 21, CMake 4.4.0, and `GGML_METAL=ON`; the installed `llama-cli` SHA-256 is `02590612ba30c89133d656b7c1300028f345ec6c1cb879fb8f750a3626c02491`; the companion libraries remain installed beside the binary. Fresh competitor admissions showed `AC Power`, internal battery **100%**, charged, with no active `Runner.Worker`. The Q8_0 model is the official `Qwen/Qwen3-0.6B-GGUF` snapshot `23749fefcc72300e3a2ad315e1317431b06b590a`, SHA-256 `9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031`. The f16 GGUF was converted on the M1 from the cached `Qwen/Qwen3-0.6B` snapshot `c1899de289a04d12100db370d81485cdf75e47ca` with that tag's `convert_hf_to_gguf.py --outtype f16`, SHA-256 `c81c7c27b35225376a52387800c5eca0748a93b46db885a1dbad370a318f55bb`. The install path is intentionally retained for later campaign lanes.
+The fresh llama.cpp controls used the M1-native `$SYNAPSE_BENCH_ROOT/bench-tools/llama-b9580/llama-cli`, built from llama.cpp tag `b9580` at commit `b4e3dc613baa92a3884d4151e3d631395c81934a` with Xcode/AppleClang 21, CMake 4.4.0, and `GGML_METAL=ON`; the installed `llama-cli` SHA-256 is `02590612ba30c89133d656b7c1300028f345ec6c1cb879fb8f750a3626c02491`; the companion libraries remain installed beside the binary. Fresh competitor admissions showed `AC Power`, internal battery **100%**, charged, with no active `Runner.Worker`. The Q8_0 model is the official `Qwen/Qwen3-0.6B-GGUF` snapshot `23749fefcc72300e3a2ad315e1317431b06b590a`, SHA-256 `9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031`. The f16 GGUF was converted on the M1 from the cached `Qwen/Qwen3-0.6B` snapshot `c1899de289a04d12100db370d81485cdf75e47ca` with that tag's `convert_hf_to_gguf.py --outtype f16`, SHA-256 `c81c7c27b35225376a52387800c5eca0748a93b46db885a1dbad370a318f55bb`. The install path is intentionally retained for later campaign lanes.
 
 ## Winner provenance
 
-Campaign `[consult-id]` banked winner-2 patch (`8c6da25c9dd5431acc8e632d9cc675520e75ae5cf85b0931d613f867896d9740`). It applied cleanly to the current file, which already contains winner 1; no hand port was needed. Its mechanism is **lm-head logits fp32 cast round-trip removal**: the f16 `linear` result is cast to fp32 only after the matmul, rather than casting the selected activations and lm-head weights to fp32 before the matmul.
+Campaign `release-benchmark-1` banked winner-2 patch (`8c6da25c9dd5431acc8e632d9cc675520e75ae5cf85b0931d613f867896d9740`). It applied cleanly to the current file, which already contains winner 1; no hand port was needed. Its mechanism is **lm-head logits fp32 cast round-trip removal**: the f16 `linear` result is cast to fp32 only after the matmul, rather than casting the selected activations and lm-head weights to fp32 before the matmul.
 
-Campaign `[consult-id]` banked winner 3. Its attention change leaves QK^T and PV matmuls in f16, casts QK^T scores up before scale/mask/softmax, then casts probabilities down before PV. The campaign reported **78.31 tok/s** for the controlled single-prompt cell and preserved the 20-prompt token-exact gate.
+Campaign `release-benchmark-2` banked winner 3. Its attention change leaves QK^T and PV matmuls in f16, casts QK^T scores up before scale/mask/softmax, then casts probabilities down before PV. The campaign reported **78.31 tok/s** for the controlled single-prompt cell and preserved the 20-prompt token-exact gate.
 
-Campaign `[consult-id]` banked winner 4. Its change is structural rather than a cast elimination: it drops the materialized `repeat_kv` expansion of the KV heads and instead reshapes Q to `[1, kv_heads, groups, seq, head_dim]` and K/V to `[1, kv_heads, 1, keys, head_dim]`, letting the attention matmuls broadcast the KV heads across each query-head group (GQA). The scale/mask/softmax island is unchanged (softmax moves to the trailing axis of the 5-D scores). On the locked M1 the campaign measured a steady candidate **84.00 tok/s** versus a **78.72 tok/s** control (+6.7%; first pair 84.35/78.90 = +6.9%) and preserved the token-exact gate. The change sits in the shared attention path after the step/prefill cache concat, so it applies to both the prefill and the step executable; no `repeat_kv` materialization remains in either.
+Campaign `release-benchmark-3` banked winner 4. Its change is structural rather than a cast elimination: it drops the materialized `repeat_kv` expansion of the KV heads and instead reshapes Q to `[1, kv_heads, groups, seq, head_dim]` and K/V to `[1, kv_heads, 1, keys, head_dim]`, letting the attention matmuls broadcast the KV heads across each query-head group (GQA). The scale/mask/softmax island is unchanged (softmax moves to the trailing axis of the 5-D scores). On the locked M1 the campaign measured a steady candidate **84.00 tok/s** versus a **78.72 tok/s** control (+6.7%; first pair 84.35/78.90 = +6.9%) and preserved the token-exact gate. The change sits in the shared attention path after the step/prefill cache concat, so it applies to both the prefill and the step executable; no `repeat_kv` materialization remains in either.
 
 The cumulative steady-decode arc is **40.55 -> 59.03 -> 73.81 -> 78.88 -> 84.32 tok/s**: the first number is the frozen pre-wave baseline, the second is winner 1's AC confirmation, the third is winner 2's AC confirmation, the fourth is the two-repeat winner-3 confirmation, and the fifth is the two-repeat winner-4 confirmation. The separately measured 78.31 tok/s figure is winner 3's controlled single-prompt campaign cell, not the campaign baseline. The prior campaign's battery winner was approximately **73.68 tok/s**; the 73.81 AC confirmation remained within 5%.
 
@@ -166,7 +166,7 @@ used 12 prompts from the fixed stride-seven schedule, repeated twice with a
 fresh process per prompt. Prompt text changed on every iteration; generation
 was greedy (`--temp 0 --top-k 1 --top-p 1`), single stream, `-n 64`, `-ngl 99`,
 `-c 512`, and `--single-turn`. Each repeat acquired and promptly released
-`[bench-user-home]/bench.lock` after AC-power and no-`Runner.Worker` admission.
+`$SYNAPSE_BENCH_ROOT/bench.lock` after AC-power and no-`Runner.Worker` admission.
 The values below are llama-cli's generation-rate timings, not process wall time.
 
 | Runtime | Storage | Repeat 1 median (spread) | Repeat 2 median (spread) | Combined 24-sample median (range) |

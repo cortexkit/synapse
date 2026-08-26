@@ -58,9 +58,9 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
 
 ## Locked-M1 measurement
 
-The measurement command must run on `[bench-host]` only after its
+The measurement command must run on `<bench-host>` only after its
 `Runner.Worker` is absent. `--locked` atomically creates
-`[bench-user-home]/bench.lock`, refuses an active worker or battery power, and removes
+`$SYNAPSE_BENCH_ROOT/bench.lock`, refuses an active worker or battery power, and removes
 the lock in a `finally` block.
 
 ```bash

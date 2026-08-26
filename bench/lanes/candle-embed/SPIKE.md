@@ -4,7 +4,7 @@
 
 - Machine class: Apple M5 Max.
 - Measurements here are **not idle-gated table-grade numbers**; light background activity may have existed.
-- The task corpus file was missing from this task worktree, so the runs below used the identical parent-repo copy read-only: `/Users/[owner]/Work/Projects/CortexKit/synapse/bench/data/corpus-v2.jsonl`.
+- The task corpus file was unavailable in this checkout, so the runs below used a separately managed, read-only benchmark fixture.
 - Subset measured: first 2,000 chunks (`/tmp/corpus-v2-2000.jsonl`).
 - Reference lane for parity: `lane-ort-embed` fp32 MiniLM on the same 2,000-chunk subset.
 - Candle implementation choices: stock `candle-transformers` BERT for `sentence-transformers/all-MiniLM-L6-v2`, `tokenizers` truncation at 512, length-sorted attention-unit batching (4M), mean pooling, L2 normalization, vectors restored to original chunk order.

@@ -1,9 +1,9 @@
 # LFM2 small-model Metal decode baselines
 
 **Measurement date:** 2026-07-20
-**Rig:** locked `[bench-host]` / Apple M1 Max (`MacBookPro18,2`, 10
+**Rig:** locked `<bench-host>` / Apple M1 Max (`MacBookPro18,2`, 10
 logical CPUs, 64 GiB), macOS 26.5.2 build `25F84`. All timed cells ran on AC
-power at 100% charged, under `[bench-user-home]/bench.lock`; no campaign, llama, or
+power at 100% charged, under `$SYNAPSE_BENCH_ROOT/bench.lock`; no campaign, llama, or
 rsync process was present. The one-minute load average was recorded for every
 sample and stayed below the `2.5` admission threshold during timed cells.
 

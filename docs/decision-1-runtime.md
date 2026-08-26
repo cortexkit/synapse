@@ -1,14 +1,11 @@
 # Decision #1: Synapse's local inference engine strategy
 
-Status: **RATIFIED (D-005, 2026-07-08)** — decided by Ufuk as written, no
-meeting required: every fork was resolved in signed written rounds (AFT, SUBC,
-MC) and validated by the implemented, hardened Lane 1 v1 surface before
-ratification. Later amendments by Ufuk folded in: two-lane engine program
-(adopt + owned runtime graduating by measurement), day-1 best-per-hardware
-incl. MLX/ANE on Macs, fingerprint contract as implemented
-(docs/wire-contract-v1.md).
-Decision owner: Ufuk. Reviewers: AFT-Alfonso (driving), SUBC-Alfonso, MC
-(written sign-offs on the fingerprint/equivalence contract).
+Status: **RATIFIED (D-005, 2026-07-08)** — the documented engine strategy was
+validated by the implemented Lane 1 v1 surface. Later amendments added a
+two-lane engine program (adopt plus owned runtime graduating by measurement),
+best-per-hardware support including MLX/ANE on Macs, and the implemented
+fingerprint contract (`docs/wire-contract-v1.md`).
+Decision ownership and review records are retained outside the public tree.
 
 Evidence base: 60+ idle-gated full-corpus lane runs across 4 hardware classes
 (M5 Max, M1 Max, RTX 3060, Ryzen Z1 Extreme), retrieval-quality evals on CoIR
@@ -513,8 +510,7 @@ against a kept baseline, save only verified wins, honest verdict UI.)
 
 ### Fingerprint and equivalence contract (pre-agreed by all three consumers, 2026-07-08)
 
-Converged via written review rounds (AFT pm_4373925e/pm_74b2aff8, SUBC
-pm_fc39f725, MC pm_82691068 — all signed):
+Converged through documented cross-consumer review:
 
 **Strict identity, declared equivalence, probe-enforced.** Fingerprints are
 strict per (model, quant, engine-lane, runtime-config). Interchangeability is

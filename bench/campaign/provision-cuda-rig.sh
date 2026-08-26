@@ -6,11 +6,11 @@ set -eu
 CANDIDATE_USER=${CANDIDATE_USER:-ck-candidate}
 CONTROLLER_USER=${CONTROLLER_USER:-${SUDO_USER:-root}}
 CAMPAIGN_ROOT=${CAMPAIGN_ROOT:-/opt/ck-campaign}
-REPO_URL=${REPO_URL:-https://github.com/cortexkit/synapse.git}
-SUBCONSCIOUS_URL=${SUBCONSCIOUS_URL:-https://github.com/cortexkit/subconscious.git}
-COMMONS_URL=${COMMONS_URL:-https://github.com/cortexkit/commons.git}
+REPO_URL=${REPO_URL:-}
+SUBCONSCIOUS_URL=${SUBCONSCIOUS_URL:-}
+COMMONS_URL=${COMMONS_URL:-}
 M1_RUNNER_SSH_TARGET=${M1_RUNNER_SSH_TARGET:-}
-M1_RUNNER_SOURCE_DIR=${M1_RUNNER_SOURCE_DIR:-[bench-user-home]/ck-campaign/rig/candidate-runner}
+M1_RUNNER_SOURCE_DIR=${M1_RUNNER_SOURCE_DIR:-}
 SYNAPSE_SOURCE=${SYNAPSE_SOURCE:-}
 SIBLING_SUBCONSCIOUS_SOURCE=${SIBLING_SUBCONSCIOUS_SOURCE:-}
 SIBLING_COMMONS_SOURCE=${SIBLING_COMMONS_SOURCE:-}
@@ -49,6 +49,10 @@ fi
 
 log() { printf '[cuda-provision] %s\n' "$*"; }
 fatal() { printf '[cuda-provision] ERROR: %s\n' "$*" >&2; exit 1; }
+
+[ -n "$REPO_URL" ] || fatal "set REPO_URL to the public Synapse repository"
+[ -n "$SUBCONSCIOUS_URL" ] || fatal "set SUBCONSCIOUS_URL to a public dependency repository"
+[ -n "$COMMONS_URL" ] || fatal "set COMMONS_URL to a public dependency repository"
 
 SCRIPT_DIR=$(unset CDPATH; cd -- "$(dirname -- "$0")" && pwd)
 REPO_DIR=$CAMPAIGN_ROOT/synapse

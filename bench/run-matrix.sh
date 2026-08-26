@@ -7,8 +7,9 @@ cd "$(dirname "$0")/.."
 
 BENCH=./target/release/synapse-bench
 RESULTS=bench/results
-# corpus-v2 = AFT's real chunk export (byte-exact embed_text, 15,271 chunks),
-# converted from corpus/aft-chunks.jsonl. v1 (line-chunked) is integration-only.
+# corpus-v2 is the fixture used for release benchmark results. When regenerating
+# it, use a corpus with an independent license; corpus-v1 is line-chunked and
+# suitable only for integration tests.
 CORPUS=bench/data/corpus-v2.jsonl
 PROMPTS=bench/data/microllm-prompts-v1.jsonl
 WAIT_MAX=${WAIT_MAX:-14400}   # max seconds to wait for idle per lane (4h)

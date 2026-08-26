@@ -15,7 +15,7 @@ Maximize steady-state embedding throughput of the owned runtime's Qwen3-Embeddin
 ## Accept gate (dual-threshold, frozen at classify — the campaign's round-termination predicate)
 
 1. **Minimum win**: a candidate variant must beat the current best (starting at the frozen baseline) by **>= 3%** steady tok/s, measured by the pinned rig, or it is pruned. Prune verdicts are banked to the leaderboard graveyard with full profiles.
-2. **Correctness floor (disqualifies regardless of speed)**: mean cosine **>= 0.9999** AND mean top-10 rank overlap **>= 0.995** vs the frozen ORT fp32 reference, every measured run. Reference: qwen3 400-row corpus sha256 5a9bfdc8…630c, reference vectors sha256 cacee1f…cf46 (staged on the rig at [bench-user-home]/bench-tools/unified-rt-serving/data/).
+2. **Correctness floor (disqualifies regardless of speed)**: mean cosine **>= 0.9999** AND mean top-10 rank overlap **>= 0.995** vs the frozen ORT fp32 reference, every measured run. Reference: qwen3 400-row corpus sha256 5a9bfdc8…630c, reference vectors sha256 cacee1f…cf46 (staged on the rig at $SYNAPSE_BENCH_ROOT/bench-tools/unified-rt-serving/data/).
 3. **Reconciliation**: rig-canonical vs candidate-reported token divergence > 1% = invalid run (rig enforces).
 
 ## Measurement protocol (rig-owned, candidate-blind)
@@ -27,8 +27,8 @@ Maximize steady-state embedding throughput of the owned runtime's Qwen3-Embeddin
 
 ## Rig profile (M1 box)
 
-- Host: [bench-host] (Apple M1 Max 64GB, macOS 26.5.2, Xcode 26.6, ssh alias [bench-host-alias]). Model snapshot + corpus + reference pre-staged under [bench-user-home]/bench-tools/unified-rt-serving/.
-- Lock discipline: `mkdir [bench-user-home]/bench.lock` before any timed run (trap-released rmdir), `pgrep -f Runner.Worker` must be empty (the box doubles as the macos-metal CI runner; CI jobs finish in 10-20 min — wait, never stop the service).
+- Host: <bench-host> (Apple M1 Max 64GB, macOS 26.5.2, Xcode 26.6, ssh alias $SYNAPSE_BENCH_HOST). Model snapshot + corpus + reference pre-staged under $SYNAPSE_BENCH_ROOT/bench-tools/unified-rt-serving/.
+- Lock discipline: `mkdir $SYNAPSE_BENCH_ROOT/bench.lock` before any timed run (trap-released rmdir), `pgrep -f Runner.Worker` must be empty (the box doubles as the macos-metal CI runner; CI jobs finish in 10-20 min — wait, never stop the service).
 - Power/rig metadata: macmon 0.7.2 via the rig's metadata block.
 - AVAILABILITY CAVEAT: this box ships out within days; its successor (rented Scaleway M4) is a DIFFERENT machine profile — the campaign must re-freeze the baseline on the successor before any cross-machine score comparison. Machine identity is part of every banked number.
 

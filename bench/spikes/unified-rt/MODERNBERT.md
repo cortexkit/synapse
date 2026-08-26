@@ -50,7 +50,7 @@ Reference vectors came from `lane-ort-embed` using the cached gte fp32 ONNX expo
 
 ## M1 throughput
 
-Timed runs were made only on `[bench-host-alias]`, under `[bench-user-home]/bench.lock`, over the same 400 chunks and length-sorted batching policy. “Warm” is an immediate second process run, so it includes the effect of OS and Metal shader caches while rebuilding process-local graph plans.
+Timed runs were made only on `$SYNAPSE_BENCH_HOST`, under `$SYNAPSE_BENCH_ROOT/bench.lock`, over the same 400 chunks and length-sorted batching policy. “Warm” is an immediate second process run, so it includes the effect of OS and Metal shader caches while rebuilding process-local graph plans.
 
 | Backend | First-run tok/s | Warm tok/s | First infer time | Warm infer time |
 |---|---:|---:|---:|---:|

@@ -100,15 +100,9 @@
 - Purpose: Standalone Bun/TypeScript data generation and SFT training pipeline for the production gatherer contract, supporting both Anthropic API (with multi-account OAuth rotation) and local OpenAI-compatible endpoints.
 - Location: `tools/gather-distill`
 - Contains: Trajectory generation, work queue handling, `AftClientPool` process wrapping, validation, gold-overlap scoring, zero-shot gatherer bake-off evaluation leaderboards (`tools/gather-distill/BAKEOFF-ZEROSHOT.md`), Axolotl SFT training configs/rungs (`tools/gather-distill/train/`), and student evaluation scale ladder metrics (`tools/gather-distill/train/SCALE-LADDER.md`).
-- Depends on: Bun, pinned `aft-v0.46.0` binary, and `@cortexkit/anthropic-auth-core`.
+- Depends on: Bun and a publicly documented authentication-provider interface.
 - Used by: Developers running qgen, gather, validate, score, or model distillation and SFT evaluation campaigns.
 
-**Athena Classify Distillation Harness:**
-- Purpose: Standalone Bun/TypeScript dataset generation and classification runner for the local `Athena-classify` student model.
-- Location: `tools/classify-distill`
-- Contains: Vendored ALF rust/ts contracts (sha-pinned provenance), real-export importer (`tools/classify-distill/src/importer.ts`), histogram-driven synthetic qgen (`tools/classify-distill/src/qgen.ts`), mechanical validator port (`tools/classify-distill/src/validator.ts`), multi-account OAuth Anthropic runner with dry-run/mock gates (`tools/classify-distill/src/runner.ts`), and contract parity verification (`tools/classify-distill/src/parity.ts`).
-- Depends on: Bun, `claude-sonnet-5` (qgen), `claude-opus-4-8` (run default), and `@cortexkit/anthropic-auth-core`.
-- Used by: Developers running Athena classify dataset generation, real attempt importing, parity auditing, or distillation campaigns.
 
 **Synapse Operator CLI (`synapse-opctl`):**
 - Purpose: Drive Synapse operations (models catalog, probe runs, scheduling admission stats, approval enablement and rollbacks, batch embedding, and jobs paging) through the fleet subc daemon connection.
@@ -478,5 +472,5 @@
 ## Cross-Cutting Concerns
 
 **Logging:** Console outputs are printed directly. Matrix status tracking, parameters, and outputs write directly to `bench/results/matrix.log`.
-**Caching:** Model files are located from HuggingFace cache snapshots. Content-addressed downloads will follow atomic tmp+rename patterns in `~/.local/share/cortexkit/models/`.
+**Caching:** Model files are located from HuggingFace cache snapshots. Content-addressed downloads will follow atomic tmp+rename patterns in `~/.local/share/synapse/models/.
 **Storage:** Structured outputs are written under `bench/results/` as telemetry metrics (`.measure.json`), parity vectors (`-vectors.jsonl`), and results summary (`.json`) files.

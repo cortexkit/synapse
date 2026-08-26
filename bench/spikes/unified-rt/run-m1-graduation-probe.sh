@@ -1,27 +1,27 @@
 #!/bin/zsh
 set -euo pipefail
 
-ROOT=[bench-user-home]/bench-tools/graduation-probe
+ROOT=${SYNAPSE_BENCH_ROOT:?set SYNAPSE_BENCH_ROOT}/bench-tools/graduation-probe
 BIN="$ROOT/bin/spike-unified-rt"
 LLAMA_LANE="$ROOT/bin/lane-llama"
-LLAMA_SERVER=[bench-user-home]/bench-tools/bin/llama-server-wrap.sh
+LLAMA_SERVER=${SYNAPSE_BENCH_ROOT:?set SYNAPSE_BENCH_ROOT}/bench-tools/bin/llama-server-wrap.sh
 PARITY="$ROOT/bin/synapse-bench"
 MLX_PY="$ROOT/venvs/mlx-embeddings/bin/python"
 MLX_SCRIPT="$ROOT/scripts/mlx-embed.py"
-DATA=[bench-user-home]/bench-tools/unified-rt-serving/data
+DATA=${SYNAPSE_BENCH_ROOT:?set SYNAPSE_BENCH_ROOT}/bench-tools/unified-rt-serving/data
 RESULTS="$ROOT/results/raw"
 PACKAGES="$ROOT/packages"
-MACMON=[bench-user-home]/bench-tools/bin/macmon
-LOCK=[bench-user-home]/bench.lock
+MACMON=${SYNAPSE_BENCH_ROOT:?set SYNAPSE_BENCH_ROOT}/bench-tools/bin/macmon
+LOCK=${SYNAPSE_BENCH_ROOT:?set SYNAPSE_BENCH_ROOT}/bench.lock
 MINILM_CORPUS="$ROOT/data/minilm-corpus-400.jsonl"
 
-MINILM=[bench-user-home]/.cache/huggingface/hub/models--sentence-transformers--all-MiniLM-L6-v2/snapshots/1110a243fdf4706b3f48f1d95db1a4f5529b4d41
-MINILM_MLX=[bench-user-home]/.cache/huggingface/hub/models--mlx-community--all-MiniLM-L6-v2-bf16/snapshots/b6691709eacd8f0afcc3faace288cf50e611f3aa
-MINILM_GGUF=[bench-user-home]/.cache/huggingface/hub/models--second-state--All-MiniLM-L6-v2-Embedding-GGUF/snapshots/544f204f2eaa2d71361ffc74d6df7170285b286a/all-MiniLM-L6-v2-ggml-model-f16.gguf
-MODERNBERT=[bench-user-home]/.cache/huggingface/hub/models--Alibaba-NLP--gte-modernbert-base/snapshots/e7f32e3c00f91d699e8c43b53106206bcc72bb22
-MODERNBERT_GGUF=[bench-user-home]/.cache/huggingface/hub/models--keisuke-miyako--gte-modernbert-base-gguf/snapshots/529959733131e37a8282ef5e03a35d185d236b55/gte-modernbert-base-F16.gguf
-QWEN3=[bench-user-home]/.cache/huggingface/hub/models--Qwen--Qwen3-Embedding-0.6B/snapshots/97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3
-QWEN3_GGUF=[bench-user-home]/.cache/huggingface/hub/models--Qwen--Qwen3-Embedding-0.6B-GGUF/snapshots/370f27d7550e0def9b39c1f16d3fbaa13aa67728/Qwen3-Embedding-0.6B-f16.gguf
+MINILM=${SYNAPSE_BENCH_ROOT:?set SYNAPSE_BENCH_ROOT}/.cache/huggingface/hub/models--sentence-transformers--all-MiniLM-L6-v2/snapshots/1110a243fdf4706b3f48f1d95db1a4f5529b4d41
+MINILM_MLX=${SYNAPSE_BENCH_ROOT:?set SYNAPSE_BENCH_ROOT}/.cache/huggingface/hub/models--mlx-community--all-MiniLM-L6-v2-bf16/snapshots/b6691709eacd8f0afcc3faace288cf50e611f3aa
+MINILM_GGUF=${SYNAPSE_BENCH_ROOT:?set SYNAPSE_BENCH_ROOT}/.cache/huggingface/hub/models--second-state--All-MiniLM-L6-v2-Embedding-GGUF/snapshots/544f204f2eaa2d71361ffc74d6df7170285b286a/all-MiniLM-L6-v2-ggml-model-f16.gguf
+MODERNBERT=${SYNAPSE_BENCH_ROOT:?set SYNAPSE_BENCH_ROOT}/.cache/huggingface/hub/models--Alibaba-NLP--gte-modernbert-base/snapshots/e7f32e3c00f91d699e8c43b53106206bcc72bb22
+MODERNBERT_GGUF=${SYNAPSE_BENCH_ROOT:?set SYNAPSE_BENCH_ROOT}/.cache/huggingface/hub/models--keisuke-miyako--gte-modernbert-base-gguf/snapshots/529959733131e37a8282ef5e03a35d185d236b55/gte-modernbert-base-F16.gguf
+QWEN3=${SYNAPSE_BENCH_ROOT:?set SYNAPSE_BENCH_ROOT}/.cache/huggingface/hub/models--Qwen--Qwen3-Embedding-0.6B/snapshots/97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3
+QWEN3_GGUF=${SYNAPSE_BENCH_ROOT:?set SYNAPSE_BENCH_ROOT}/.cache/huggingface/hub/models--Qwen--Qwen3-Embedding-0.6B-GGUF/snapshots/370f27d7550e0def9b39c1f16d3fbaa13aa67728/Qwen3-Embedding-0.6B-f16.gguf
 
 mkdir -p "$RESULTS" "$PACKAGES" "$ROOT/data"
 /usr/bin/head -n 400 "$DATA/minilm-corpus-1000.jsonl" >"$MINILM_CORPUS"

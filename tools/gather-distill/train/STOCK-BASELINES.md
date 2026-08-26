@@ -17,7 +17,7 @@ The ModelScope mirrors were used only as download transport after the direct Hug
 
 ## Fixed replay
 
-Both controls replayed the stock-2B no-thinking arm against the fixed 40 jobs, gold rows, read-only corpus checkouts, and pinned AFT binary at concurrency 2. The M1 server used llama.cpp build 9580 (`b4e3dc613baa92a3884d4151e3d631395c81934a`), Q8_0, `-ngl 99 --jinja -fa on -c 131072`, and `--chat-template-kwargs '{"enable_thinking":false}'`. The local harness connected through `EVAL_REMOTE_ENDPOINT=[bench-host-alias]`.
+Both controls replayed the stock-2B no-thinking arm against the fixed 40 jobs, gold rows, read-only corpus checkouts, and pinned AFT binary at concurrency 2. The M1 server used llama.cpp build 9580 (`b4e3dc613baa92a3884d4151e3d631395c81934a`), Q8_0, `-ngl 99 --jinja -fa on -c 131072`, and `--chat-template-kwargs '{"enable_thinking":false}'`. The local harness connected through `EVAL_REMOTE_ENDPOINT=<bench-host>`.
 
 | fixed input | SHA-256 |
 | --- | --- |
@@ -25,7 +25,7 @@ Both controls replayed the stock-2B no-thinking arm against the fixed 40 jobs, g
 | gold rows | `c469e507ed900913e553c1aa63ad59d216729903ac71501b863ad89273600483` |
 | AFT binary | `25cafa202e726a6b2d363fef4efac6e60ee6128105e7dbc42da7119e82b9a294` |
 
-The 4B and 9B servers ran sequentially under `[bench-user-home]/bench.lock`; `/tmp/aft-measure.lock` was absent and no `Runner.Worker` was active before either lock was acquired. The copied GGUF was SHA-verified on the M1 before each server launch. For both sizes, `/apply-template` ended with the required disabled-thinking generation suffix:
+The 4B and 9B servers ran sequentially under `$SYNAPSE_BENCH_ROOT/bench.lock`; `/tmp/aft-measure.lock` was absent and no `Runner.Worker` was active before either lock was acquired. The copied GGUF was SHA-verified on the M1 before each server launch. For both sizes, `/apply-template` ended with the required disabled-thinking generation suffix:
 
 ```text
 <think>

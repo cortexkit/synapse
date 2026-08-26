@@ -1,7 +1,7 @@
 {"term":"memcpy","class":"technical","source":"synapse","excluded":false}
 {"term":"cuBLASLt","class":"technical","source":"synapse","excluded":true,"exclusion_reason":"macOS say spells the mixed-case CUDA library name rather than producing a stable spoken form."}
 {"term":"MPSGraph","class":"technical","source":"synapse","excluded":true,"exclusion_reason":"macOS say expands the acronym and camel-case suffix inconsistently across voices."}
-{"term":"subc","class":"technical","source":"cortexkit-sibling","excluded":true,"exclusion_reason":"The four-letter abbreviation is pronounced as ordinary speech rather than the project name."}
+{"term":"Unicode","class":"technical","source":"public-reference","excluded":false,"exclusion_reason":null}
 {"term":"PAQ","class":"technical","source":"synapse","excluded":true,"exclusion_reason":"The acronym's letter-by-letter pronunciation is not stable enough for a text-targeted TTS oracle."}
 {"term":"tok/s","class":"technical","source":"synapse","excluded":true,"exclusion_reason":"The slash unit is spoken differently by Samantha and Daniel."}
 {"term":"RMSNorm","class":"technical","source":"synapse","excluded":true,"exclusion_reason":"macOS say does not preserve the intended acronym-plus-word pronunciation."}
@@ -32,7 +32,7 @@
 {"term":"Vulkan","class":"technical","source":"synapse","excluded":false}
 {"term":"MPS","class":"technical","source":"synapse","excluded":true,"exclusion_reason":"The acronym is read as letters and has no reliable exact-text pronunciation."}
 {"term":"M1","class":"technical","source":"synapse","excluded":true,"exclusion_reason":"The hardware label is pronounced as an alphanumeric sequence rather than a lexical term."}
-{"term":"CoreML","class":"technical","source":"cortexkit-sibling","excluded":false}
+{"term":"CoreML","class":"technical","source":"public-reference","excluded":false}
 {"term":"ONNX Runtime","class":"technical","source":"synapse","excluded":true,"exclusion_reason":"The ONNX initialism is pronounced differently by the bootstrap voices."}
 {"term":"llama.cpp","class":"technical","source":"synapse","excluded":true,"exclusion_reason":"The dotted project name is not rendered consistently by macOS say."}
 {"term":"GGML","class":"technical","source":"synapse","excluded":true,"exclusion_reason":"The all-caps format name is read as an unstable sequence of letters."}

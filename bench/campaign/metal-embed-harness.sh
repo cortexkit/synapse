@@ -562,7 +562,12 @@ def workspace_commit(runner: Path, workspace: Path, log_path: Path) -> str:
 
 
 def acquire_bench_lock() -> Path:
-    lock = Path(os.environ.get("SYNAPSE_CAMPAIGN_BENCH_LOCK", "[bench-user-home]/bench.lock"))
+    lock = Path(
+        os.environ.get(
+            "SYNAPSE_CAMPAIGN_BENCH_LOCK",
+            str(Path(tempfile.gettempdir()) / "synapse-benchmark.lock"),
+        )
+    )
     measure_lock = Path(os.environ.get("SYNAPSE_CAMPAIGN_MEASURE_LOCK", "/tmp/aft-measure.lock"))
     if measure_lock.exists():
         raise HarnessError(f"measurement lock is already present: {measure_lock}")
