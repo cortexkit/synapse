@@ -13351,6 +13351,10 @@ fn manifest(module_id: &str) -> ModuleManifest {
         // pre-capability manifest contract, and consumers keep addressing
         // synapse by module id and operation name.
         capabilities: None,
+        // Honest-until-injected: release scripts do not stamp CK_BUILD_* facts
+        // yet, and fabricating build provenance would defeat the field's
+        // purpose. The daemon overlays process-identity evidence regardless.
+        provenance: None,
     }
 }
 
