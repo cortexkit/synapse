@@ -10,3 +10,4 @@ evidence/
 operations/
 corpus/aft-chunks.jsonl
 .banlist.local
+tools/classify-distill/
