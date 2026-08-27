@@ -34,19 +34,21 @@ jobs:
             runner: blacksmith-4vcpu-ubuntu-2404
           - name: windows
             runner: blacksmith-4vcpu-windows-2025
-          # macos-metal lane OFFLINE: its self-hosted M1 Max runner was
-          # decommissioned (machine shipped away 2026-08-20) and the runner
-          # registration deleted. Metal/ANE coverage is currently local-only
-          # (developer machines run the full battery). Restore by registering
-          # a new Apple Silicon runner with the `macos-metal` label and
-          # re-adding this matrix entry:
+          # A macOS Metal/ANE lane requires Apple Silicon with real GPU/ANE
+          # access (hosted macOS runners virtualize the GPU), so that coverage
+          # runs on developer machines. Restore by registering a self-hosted
+          # Apple Silicon runner labeled `macos-metal` and adding:
           # - name: macos-metal
           #   runner: [self-hosted, macos-metal]
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
     steps:
+      # Cross-repo token: only needed while the sibling repositories are
+      # private. Once they are public the step self-skips and checkouts fall
+      # back to the workflow's default token.
       - name: Create cross-repo token
         id: app-token
+        if: ${{ secrets.CK_CI_APP_ID != '' }}
         uses: actions/create-github-app-token@v2
         with:
           app-id: ${{ secrets.CK_CI_APP_ID }}
@@ -64,14 +66,14 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: cortexkit/subconscious
-          token: ${{ steps.app-token.outputs.token }}
+          token: ${{ steps.app-token.outputs.token || github.token }}
           path: subconscious
 
       - name: Checkout commons (sibling)
         uses: actions/checkout@v4
         with:
           repository: cortexkit/commons
-          token: ${{ steps.app-token.outputs.token }}
+          token: ${{ steps.app-token.outputs.token || github.token }}
           path: commons
 
       - uses: dtolnay/rust-toolchain@stable
@@ -86,11 +88,6 @@ jobs:
         if: matrix.name == 'linux'
         shell: bash
         run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
-
-      - name: Install cargo-nextest (macos)
-        if: matrix.name == 'macos-metal'
-        shell: bash
-        run: curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
 
       - name: Install cargo-nextest (windows)
         if: matrix.name == 'windows'
@@ -173,9 +170,6 @@ jobs:
         shell: bash
         run: |
           crates="$SYNAPSE_CRATES"
-          if [ "${{ matrix.name }}" = "macos-metal" ]; then
-            crates="$crates -p synapse-worker-mlx -p synapse-worker-ane"
-          fi
           cargo clippy $crates --all-targets -- -D warnings
 
       # Windows tests run --release: rust links the release CRT even in debug
@@ -189,9 +183,6 @@ jobs:
         run: |
           crates="$SYNAPSE_CRATES"
           profile=""
-          if [ "${{ matrix.name }}" = "macos-metal" ]; then
-            crates="$crates -p synapse-worker-mlx -p synapse-worker-ane"
-          fi
           if [ "${{ matrix.name }}" = "windows" ]; then
             profile="--release"
           fi
@@ -285,40 +276,12 @@ jobs:
             exit 1
           fi
 
-      - name: Build supervised decode worker (macos-metal)
-        if: matrix.name == 'macos-metal'
-        working-directory: synapse
-        env:
-          DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
-        run: cargo build -p synapse-worker-decode
-
-      - name: Checkpoint-gated owned decode batteries (macos-metal)
-        if: matrix.name == 'macos-metal'
-        working-directory: synapse
-        shell: bash
-        env:
-          DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
-          SYNAPSE_OWNED_DECODE_WORKER_BIN: ${{ github.workspace }}/synapse/target/debug/ck-synapse-worker-decode
-          # The self-hosted [bench-host-alias]-metal runner carries these snapshots in its HF
-          # cache (provisioned July 2026); pinned revisions match the fixture shas.
-          SYNAPSE_OWNED_DECODE_QWEN3_0_6B: [bench-user-home]/.cache/huggingface/hub/models--Qwen--Qwen3-Embedding-0.6B/snapshots/97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3
-          SYNAPSE_OWNED_DECODE_LFM2_1_2B: [bench-user-home]/.cache/huggingface/hub/models--LiquidAI--LFM2-1.2B/snapshots/933cee00d754fb3bfe06c644c0cb95453f2d8bb2
-        run: |
-          : "${SYNAPSE_OWNED_DECODE_QWEN3_0_6B:?Qwen3 checkpoint is required}"
-          : "${SYNAPSE_OWNED_DECODE_LFM2_1_2B:?LFM2 checkpoint is required}"
-          test -f "$SYNAPSE_OWNED_DECODE_QWEN3_0_6B/model.safetensors"
-          test -f "$SYNAPSE_OWNED_DECODE_LFM2_1_2B/model.safetensors"
-          python3 - <<'PY'
-          import os
-          load = os.getloadavg()[0]
-          if load >= 8:
-              raise SystemExit(f"1-minute loadavg {load:.2f} is not below 8")
-          print(f"1-minute loadavg {load:.2f} is below 8")
-          PY
-          cargo nextest run -p synapse-engine-owned --test owned_decode_parity --run-ignored ignored-only --retries 0 --no-capture
-          cargo nextest run -p synapse-worker-decode --test worker_transport -E 'test(checkpoint_worker_socket_is_token_exact_and_carries_compiled_constraint)' --run-ignored ignored-only --retries 0 --no-capture
-          cargo nextest run -p synapse-worker-decode --test worker_transport -E 'test(checkpoint_worker_crash_redispatches_once_then_quarantines)' --run-ignored ignored-only --retries 0 --no-capture
-          cargo nextest run -p synapse-module --test skeleton_e2e -E 'test(certified_owned_oneshot_and_constraint_serve_after_real_worker_probe)' --run-ignored ignored-only --retries 0 --no-capture
+      # When a self-hosted `macos-metal` runner returns, restore the
+      # checkpoint-gated owned-decode battery steps for that lane: build
+      # synapse-worker-decode with the Xcode toolchain, assert the pinned
+      # Qwen3/LFM2 checkpoints exist in the runner's HF cache, gate on
+      # loadavg, then run the owned_decode_parity, worker_transport, and
+      # skeleton_e2e ignored-only batteries.
 
   linux-llama-cuda-manual:
     if: github.event_name == 'workflow_dispatch'
@@ -327,6 +290,7 @@ jobs:
     steps:
       - name: Create cross-repo token
         id: app-token
+        if: ${{ secrets.CK_CI_APP_ID != '' }}
         uses: actions/create-github-app-token@v2
         with:
           app-id: ${{ secrets.CK_CI_APP_ID }}
@@ -343,14 +307,14 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: cortexkit/subconscious
-          token: ${{ steps.app-token.outputs.token }}
+          token: ${{ steps.app-token.outputs.token || github.token }}
           path: subconscious
 
       - name: Checkout commons (sibling)
         uses: actions/checkout@v4
         with:
           repository: cortexkit/commons
-          token: ${{ steps.app-token.outputs.token }}
+          token: ${{ steps.app-token.outputs.token || github.token }}
           path: commons
 
       - uses: dtolnay/rust-toolchain@stable
@@ -436,6 +400,7 @@ jobs:
     steps:
       - name: Create cross-repo token
         id: app-token
+        if: ${{ secrets.CK_CI_APP_ID != '' }}
         uses: actions/create-github-app-token@v2
         with:
           app-id: ${{ secrets.CK_CI_APP_ID }}
@@ -452,14 +417,14 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: cortexkit/subconscious
-          token: ${{ steps.app-token.outputs.token }}
+          token: ${{ steps.app-token.outputs.token || github.token }}
           path: subconscious
 
       - name: Checkout commons (sibling)
         uses: actions/checkout@v4
         with:
           repository: cortexkit/commons
-          token: ${{ steps.app-token.outputs.token }}
+          token: ${{ steps.app-token.outputs.token || github.token }}
           path: commons
 
       - uses: dtolnay/rust-toolchain@stable
