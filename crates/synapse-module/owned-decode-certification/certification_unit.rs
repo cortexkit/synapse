@@ -447,7 +447,7 @@ impl MtpSpeedResult {
                 });
             }
         }
-        if self.speedup().map_or(true, |speedup| speedup < 1.5) {
+        if self.speedup().is_none_or(|speedup| speedup < 1.5) {
             return Err(CertificationError::InvalidGateEvidence {
                 gate,
                 reason: "MTP throughput is below the required 1.5x speedup",

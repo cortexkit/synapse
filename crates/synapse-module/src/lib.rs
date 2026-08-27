@@ -4027,27 +4027,26 @@ async fn owned_decode_disable(state: Arc<ModuleState>, params: Value) -> Handler
         Ok(outcome) => {
             // Collect session ownership before taking the worker map so decode's
             // boundary path never contends on the same locks in reverse order.
-            let model_ids = outcome
-                .unload_artifact
-                .then(|| {
-                    state
-                        .runtime
-                        .owned_decode_sessions
-                        .lock()
-                        .ok()
-                        .map(|sessions| {
-                            sessions
-                                .sessions
-                                .values()
-                                .filter(|session| {
-                                    session.catalog_fingerprint == params.catalog_fingerprint
-                                })
-                                .map(|session| session.model_id.clone())
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default()
-                })
-                .unwrap_or_default();
+            let model_ids = if outcome.unload_artifact {
+                state
+                    .runtime
+                    .owned_decode_sessions
+                    .lock()
+                    .ok()
+                    .map(|sessions| {
+                        sessions
+                            .sessions
+                            .values()
+                            .filter(|session| {
+                                session.catalog_fingerprint == params.catalog_fingerprint
+                            })
+                            .map(|session| session.model_id.clone())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
             if !model_ids.is_empty() {
                 if let Ok(mut dispatches) = state.runtime.owned_decode_dispatches.lock() {
                     for model_id in model_ids {
