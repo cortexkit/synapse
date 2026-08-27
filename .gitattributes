@@ -4,4 +4,5 @@
 # rewrites LF to CRLF and every baked digest check fails as tampered.
 crates/synapse-module/owned-decode-manifests/** text eol=lf
 bench/campaign/*-fixtures/** text eol=lf
+bench/fixtures/** text eol=lf
 evidence/** text eol=lf
