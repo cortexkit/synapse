@@ -35,9 +35,9 @@ jobs:
       matrix:
         include:
           - name: linux
-            runner: blacksmith-4vcpu-ubuntu-2404
+            runner: ubuntu-24.04
           - name: windows
-            runner: blacksmith-4vcpu-windows-2025
+            runner: windows-2025
           # A macOS Metal/ANE lane requires Apple Silicon with real GPU/ANE
           # access (hosted macOS runners virtualize the GPU), so that coverage
           # runs on developer machines. Restore by registering a self-hosted
@@ -117,10 +117,11 @@ jobs:
         if: matrix.name == 'windows'
         shell: pwsh
         run: |
-          # Blacksmith's windows image does not ship LLVM (unlike GitHub-hosted).
-          # choco's CDN has failed this install with a bare exit 1 before (red on
-          # d58029a2, green on same-sha rerun) — retry so a red here means the
-          # failure survived three attempts, not one bad CDN draw.
+          # GitHub-hosted windows images ship LLVM, so the existence guard
+          # usually skips this entirely; the retrying install stays for image
+          # drift. choco's CDN has failed with a bare exit 1 before — retry so
+          # a red here means the failure survived three attempts, not one bad
+          # CDN draw.
           if (!(Test-Path "C:\Program Files\LLVM\bin\libclang.dll")) {
             $attempts = 0
             while ($true) {
@@ -290,7 +291,9 @@ jobs:
   linux-llama-cuda-manual:
     if: github.event_name == 'workflow_dispatch'
     name: linux-llama-cuda-manual-gate
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    # ubuntu-24.04 pinned (not -latest): the CUDA repo below is the ubuntu2404
+    # channel and must move together with the image.
+    runs-on: ubuntu-24.04
     steps:
       - name: Create cross-repo token
         id: app-token
@@ -400,7 +403,7 @@ jobs:
   windows-llama-vulkan-manual:
     if: github.event_name == 'workflow_dispatch'
     name: windows-llama-vulkan-manual-gate
-    runs-on: blacksmith-4vcpu-windows-2025
+    runs-on: windows-2025
     steps:
       - name: Create cross-repo token
         id: app-token
