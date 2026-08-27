@@ -8,6 +8,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # secrets are not readable inside step `if` expressions, so the presence
+  # check is hoisted here where the secrets context IS allowed; steps branch
+  # on the env value.
+  HAS_CROSS_REPO_TOKEN: ${{ secrets.CK_CI_APP_ID != '' }}
   LLAMA_BUILD_GATE_BUDGET_SECONDS: "900"
   LLAMA_BUILD_EVIDENCE_CONTRACT: "nonmac-build-gates-v1"
   LLAMA_CUDA_TOOLKIT_PACKAGE: "cuda-toolkit-12-6"
@@ -48,7 +52,7 @@ jobs:
       # back to the workflow's default token.
       - name: Create cross-repo token
         id: app-token
-        if: ${{ secrets.CK_CI_APP_ID != '' }}
+        if: ${{ env.HAS_CROSS_REPO_TOKEN == 'true' }}
         uses: actions/create-github-app-token@v2
         with:
           app-id: ${{ secrets.CK_CI_APP_ID }}
@@ -290,7 +294,7 @@ jobs:
     steps:
       - name: Create cross-repo token
         id: app-token
-        if: ${{ secrets.CK_CI_APP_ID != '' }}
+        if: ${{ env.HAS_CROSS_REPO_TOKEN == 'true' }}
         uses: actions/create-github-app-token@v2
         with:
           app-id: ${{ secrets.CK_CI_APP_ID }}
@@ -400,7 +404,7 @@ jobs:
     steps:
       - name: Create cross-repo token
         id: app-token
-        if: ${{ secrets.CK_CI_APP_ID != '' }}
+        if: ${{ env.HAS_CROSS_REPO_TOKEN == 'true' }}
         uses: actions/create-github-app-token@v2
         with:
           app-id: ${{ secrets.CK_CI_APP_ID }}
