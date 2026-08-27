@@ -3038,13 +3038,13 @@ impl WorkerState {
     }
 
     fn flush_pending_constrained_ingest(&mut self) -> Result<(), DecodeError> {
-        let pending = self
-            .resident
-            .as_mut()
-            .ok_or(DecodeError::ProtocolMismatch)?
-            .pending_ingest_ids
-            .drain(..)
-            .collect::<Vec<_>>();
+        let pending = std::mem::take(
+            &mut self
+                .resident
+                .as_mut()
+                .ok_or(DecodeError::ProtocolMismatch)?
+                .pending_ingest_ids,
+        );
         if pending.is_empty() {
             return Ok(());
         }

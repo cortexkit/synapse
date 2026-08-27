@@ -222,7 +222,7 @@ mod tests {
         assert_eq!(args.method, "ping");
         assert_eq!(args.params, json!({}));
         assert_eq!(args.identity_override, None);
-        assert_eq!(args.subc, PathBuf::from(DEFAULT_SUBC));
+        assert_eq!(args.subc, default_subc_path());
     }
 
     #[test]
