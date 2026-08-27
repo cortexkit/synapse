@@ -74,7 +74,10 @@ pub struct AbortOutcome {
 pub enum WorkerDeathOutcome {
     /// The ordered history was complete, so the supervisor emitted terminal
     /// accounting with the committed count it can prove.
-    Terminal(StreamFrameEnvelope),
+    /// Boxed: the envelope dwarfs the other variant (~312 vs ~80 bytes), and
+    /// this outcome is constructed once per worker death, so the indirection
+    /// costs nothing on any hot path.
+    Terminal(Box<StreamFrameEnvelope>),
     /// A gap left committed history unprovable. The terminal status refuses every
     /// continuation instead of fabricating a stream terminal.
     FailedWithoutTerminal(SessionStatus),
@@ -331,7 +334,7 @@ impl StreamingSupervisor {
         if let Some(terminal) = terminal {
             let disposition = self.observe_frame(&terminal)?;
             debug_assert_eq!(disposition, StreamFrameDisposition::Accepted);
-            return Ok(WorkerDeathOutcome::Terminal(terminal));
+            return Ok(WorkerDeathOutcome::Terminal(Box::new(terminal)));
         }
 
         let state = self.request_mut(session_id, req_id)?;
