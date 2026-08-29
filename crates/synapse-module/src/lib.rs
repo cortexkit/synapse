@@ -13560,6 +13560,10 @@ fn manifest(module_id: &str) -> ModuleManifest {
         // pre-capability manifest contract, and consumers keep addressing
         // synapse by module id and operation name.
         capabilities: None,
+        // No self-signal declarations: synapse mutates nothing outside its own
+        // store and models directory, and observation-anchored signals would
+        // claim watch points we do not maintain. Absent block = zero signals.
+        self_signals: None,
         // Honest-until-injected: release scripts do not stamp CK_BUILD_* facts
         // yet, and fabricating build provenance would defeat the field's
         // purpose. The daemon overlays process-identity evidence regardless.
