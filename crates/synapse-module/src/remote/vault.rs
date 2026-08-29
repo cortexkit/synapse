@@ -123,19 +123,19 @@ enum CredentialGetOutcome {
 
 #[derive(Deserialize)]
 struct CredentialReadError {
-    code: CredentialReadErrorCode,
+    class: String,
+    code: String,
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum CredentialReadErrorCode {
-    NotFound,
-    NeedsReauth,
-    RefreshUnsupported,
-    RefreshFailed,
-    VaultLocked,
-    Corrupt,
-    TooManyItems,
+fn decode_credential_get_response(response: &[u8]) -> Result<CredentialGetResponse, VaultError> {
+    serde_json::from_slice(response).map_err(|_| VaultError::MalformedHandlesFile)
+}
+
+fn map_credential_read_error(error: CredentialReadError) -> VaultError {
+    VaultError::CredentialFailure {
+        class: error.class,
+        code: error.code,
+    }
 }
 
 #[async_trait]
@@ -154,8 +154,7 @@ impl VaultCredentialClient for SubcVaultCredentialClient {
         })
         .map_err(|_| VaultError::MalformedHandle)?;
         let response = self.call(body).await?;
-        let response: CredentialGetResponse =
-            serde_json::from_slice(&response).map_err(|_| VaultError::MalformedHandlesFile)?;
+        let response = decode_credential_get_response(&response)?;
         match response.into_outcome() {
             CredentialGetOutcome::Success {
                 payload,
@@ -169,15 +168,7 @@ impl VaultCredentialClient for SubcVaultCredentialClient {
                     .unwrap_or(u64::MAX);
                 Ok(CredentialToken::new(secret, expires_at_ms, record_version))
             }
-            CredentialGetOutcome::AppError { error } => Err(match error.code {
-                CredentialReadErrorCode::NotFound => VaultError::NotFound,
-                CredentialReadErrorCode::NeedsReauth => VaultError::NeedsReauth,
-                CredentialReadErrorCode::VaultLocked => VaultError::VaultLocked,
-                CredentialReadErrorCode::RefreshUnsupported
-                | CredentialReadErrorCode::RefreshFailed
-                | CredentialReadErrorCode::Corrupt
-                | CredentialReadErrorCode::TooManyItems => VaultError::MalformedHandlesFile,
-            }),
+            CredentialGetOutcome::AppError { error } => Err(map_credential_read_error(error)),
         }
     }
 
@@ -220,10 +211,10 @@ where
 
 fn map_call_error(error: CallError) -> VaultError {
     match error {
-        CallError::Module(body) if body.code == "needs_reauth" => VaultError::NeedsReauth,
-        CallError::Module(body) if body.code == "vault_locked" => VaultError::VaultLocked,
-        CallError::Module(body) if body.code == "not_found" => VaultError::NotFound,
-        CallError::Module(_) => VaultError::MalformedHandlesFile,
+        // Generic module call errors are top-level frames, not claustrum credential
+        // result errors. They have no credential error class, so treat them as a
+        // recoverable route failure instead of mislabeling a valid frame as malformed.
+        CallError::Module(_) => VaultError::Unreachable,
         // StaleRouteHandle is grouped with the transport failures: no frame was
         // emitted for the request, so the vault is unreachable through the held
         // connection until a reconnect establishes a fresh route.
@@ -281,5 +272,37 @@ mod tests {
             panic!("expected credential success");
         };
         assert_eq!(payload.len(), 6);
+    }
+
+    #[test]
+    fn unknown_code_in_known_class_deserializes_without_becoming_malformed() {
+        let response = decode_credential_get_response(
+            br#"{"result":{"error":{"class":"transient","code":"future_refresh_path"}}}"#,
+        )
+        .expect("a well-formed credential error must deserialize");
+        let CredentialGetOutcome::AppError { error } = response.into_outcome() else {
+            panic!("expected credential error outcome");
+        };
+
+        assert_eq!(error.class, "transient");
+        assert_eq!(error.code, "future_refresh_path");
+        assert_eq!(
+            map_credential_read_error(error),
+            VaultError::CredentialFailure {
+                class: "transient".to_string(),
+                code: "future_refresh_path".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn missing_error_class_is_a_malformed_credential_frame() {
+        let Err(error) =
+            decode_credential_get_response(br#"{"result":{"error":{"code":"not_found"}}}"#)
+        else {
+            panic!("credential errors without the required class are malformed");
+        };
+
+        assert_eq!(error, VaultError::MalformedHandlesFile);
     }
 }

@@ -552,6 +552,7 @@ pub(crate) enum VaultError {
     Unreachable,
     VaultLocked,
     NeedsReauth,
+    CredentialFailure { class: String, code: String },
 }
 
 #[async_trait]
@@ -574,6 +575,30 @@ pub(crate) trait VaultCredentialClient: Send + Sync {
 pub(super) enum CredentialDisposition {
     Reject(RuntimeError),
     PauseJob,
+}
+
+fn credential_error_message(class: &str, code: &str) -> String {
+    format!("vault reported {class} error (code '{code}')")
+}
+
+fn unrecognized_credential_error_class_message(class: &str, code: &str) -> String {
+    format!("vault reported unrecognized error class '{class}' (code '{code}')")
+}
+
+fn credential_failure_disposition(class: String, code: String) -> CredentialDisposition {
+    match class.as_str() {
+        "transient" | "auth_required" => CredentialDisposition::PauseJob,
+        "permanent" | "context_overflow" => CredentialDisposition::Reject(
+            RuntimeError::credential_config_invalid(credential_error_message(&class, &code)),
+        ),
+        _ => {
+            let message = unrecognized_credential_error_class_message(&class, &code);
+            // Pause unknown classes: rejecting a new transient condition kills a job,
+            // while pausing a permanent condition lets existing backoff retry safely.
+            eprintln!("{message}");
+            CredentialDisposition::PauseJob
+        }
+    }
 }
 
 pub(super) struct CredentialManager {
@@ -608,6 +633,9 @@ impl CredentialManager {
             .map_err(|error| match error {
                 VaultError::VaultLocked | VaultError::NeedsReauth => {
                     CredentialDisposition::PauseJob
+                }
+                VaultError::CredentialFailure { class, code } => {
+                    credential_failure_disposition(class, code)
                 }
                 VaultError::MalformedHandlesFile
                 | VaultError::MalformedHandle
@@ -1633,6 +1661,48 @@ mod tests {
         let error = continuity.calibrate(&profile, None).await.unwrap_err();
         assert_eq!(error.stable, StableError::provider_protocol_violation());
         let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn credential_failure_dispositions_follow_class_not_code() {
+        for (class, code) in [
+            ("auth_required", "needs_reauth"),
+            ("transient", "vault_locked"),
+            ("transient", "future_refresh_path"),
+        ] {
+            assert!(matches!(
+                credential_failure_disposition(class.to_string(), code.to_string()),
+                CredentialDisposition::PauseJob
+            ));
+        }
+
+        for (class, code) in [
+            ("permanent", "not_found"),
+            ("context_overflow", "too_many_items"),
+        ] {
+            let CredentialDisposition::Reject(error) =
+                credential_failure_disposition(class.to_string(), code.to_string())
+            else {
+                panic!("{class} vault errors must reject the credential request");
+            };
+            assert_eq!(error.stable, StableError::credential_config_invalid());
+            assert_eq!(
+                error.message,
+                format!("vault reported {class} error (code '{code}')")
+            );
+        }
+    }
+
+    #[test]
+    fn unrecognized_credential_error_classes_pause_with_an_accurate_log_message() {
+        assert_eq!(
+            unrecognized_credential_error_class_message("future_class", "future_code"),
+            "vault reported unrecognized error class 'future_class' (code 'future_code')"
+        );
+        assert!(matches!(
+            credential_failure_disposition("future_class".to_string(), "future_code".to_string()),
+            CredentialDisposition::PauseJob
+        ));
     }
 
     #[tokio::test]
