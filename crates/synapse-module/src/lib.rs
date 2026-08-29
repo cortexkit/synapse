@@ -80,8 +80,8 @@ use store::{
     JOB_STATE_PAUSED_NEEDS_REAUTH, JOB_STATE_QUEUED, JOB_STATE_RUNNING,
 };
 use subc_client_rs::{
-    async_trait, BindDecision, HandlerOutcome, HealthReport, ModuleHandler, RequestCtx,
-    RouteBindRequest, RouteHandle, SubcModuleError,
+    async_trait, build_provenance, BindDecision, HandlerOutcome, HealthReport, ModuleHandler,
+    RequestCtx, RouteBindRequest, RouteHandle, SubcModuleError,
 };
 use subc_protocol::{
     manifest::{
@@ -13612,10 +13612,18 @@ fn manifest(module_id: &str) -> ModuleManifest {
         // outside its own store and models directory, and observation-anchored
         // signals would claim watch points we do not maintain.
         self_signals: Some(Vec::new()),
-        // Honest-until-injected: release scripts do not stamp CK_BUILD_* facts
-        // yet, and fabricating build provenance would defeat the field's
-        // purpose. The daemon overlays process-identity evidence regardless.
-        provenance: None,
+        // Declare what is known rather than blanket-None: the SDK helper stamps
+        // `wire_crate_version` from the linked subc-protocol crate, and the
+        // newest migration this binary carries is a fact a daemon can compare
+        // against a store's actual version to spot a stale binary directly.
+        // Build facts stay absent because release scripts do not stamp
+        // CK_BUILD_* yet, and the helper maps an absent input to field omission
+        // rather than minting a sentinel string that would read as a fact.
+        provenance: Some(build_provenance(
+            None,
+            None,
+            Some(&store::newest_schema_version().to_string()),
+        )),
     }
 }
 
@@ -14000,6 +14008,48 @@ mod tests {
             undocumented_error_codes.is_empty(),
             "wire contract is missing stable error codes: {undocumented_error_codes:?}"
         );
+    }
+
+    #[test]
+    fn manifest_provenance_declares_only_facts_this_binary_knows() {
+        let provenance = manifest("synapse")
+            .provenance
+            .expect("an SDK module always has at least one honest provenance fact");
+
+        // The referent is the linked subc-protocol crate -- the fleet's shared
+        // wire vocabulary -- never synapse's own version, which would be a
+        // real number from the wrong numbering space and would read as correct
+        // to any check that inspects shape rather than meaning.
+        assert_eq!(
+            provenance.wire_crate_version.as_deref(),
+            Some(subc_client_rs::SUBC_PROTOCOL_CRATE_VERSION),
+            "wire_crate_version must name the linked SDK crate"
+        );
+
+        // Release scripts do not stamp these yet. Absent is the honest shape;
+        // a sentinel string like "unknown" would be a well-formed lie.
+        assert_eq!(provenance.build_git_sha, None);
+        assert_eq!(provenance.build_lock_digest, None);
+
+        // Deliberately NOT asserting the number itself: restating a derived
+        // value here would make this test agree with the code by construction
+        // and pass whatever the migration list said. Shape and presence are
+        // what this can check honestly; the derivation is what keeps the value
+        // true.
+        let schema_version = provenance
+            .store_schema_version
+            .as_deref()
+            .expect("a module with a migration list can state its newest migration");
+        assert!(
+            schema_version
+                .parse::<u32>()
+                .is_ok_and(|version| version > 0),
+            "store_schema_version must be a real migration number, got {schema_version:?}"
+        );
+
+        provenance
+            .validate()
+            .expect("declared provenance must satisfy the wire contract");
     }
 
     #[test]

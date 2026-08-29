@@ -27,6 +27,21 @@ pub const JOB_STATE_DONE: &str = "done";
 pub const JOB_STATE_FAILED_TRANSIENT: &str = "failed_transient";
 pub const JOB_STATE_FAILED_PERMANENT: &str = "failed_permanent";
 
+/// Newest schema version this binary can migrate a store to.
+///
+/// Derived from the migration list rather than restated as a literal: a literal
+/// keeps reporting the old number the first time a migration is appended, and a
+/// daemon comparing this against a store's actual version would then read a
+/// stale binary as current. `max` rather than `last` so it does not depend on
+/// the list staying sorted.
+pub fn newest_schema_version() -> u32 {
+    MIGRATIONS
+        .iter()
+        .map(|migration| migration.version)
+        .max()
+        .unwrap_or(0)
+}
+
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
