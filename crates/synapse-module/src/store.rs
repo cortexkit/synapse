@@ -659,6 +659,13 @@ const MIGRATIONS: &[Migration] = &[
                        ON serving_retained_states(catalog_fingerprint, valid);
          "#,
     },
+    Migration {
+        version: 12,
+        statements: r#"
+                   ALTER TABLE profile_state
+                       ADD COLUMN certification_stale_since_ms INTEGER;
+        "#,
+    },
 ];
 
 static JOB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1376,6 +1383,7 @@ pub struct ProfileState {
     pub previous_revisioned_machine_profile_hash: Option<String>,
     pub last_rotation_reason: Option<String>,
     pub last_rotation_at_ms: Option<u64>,
+    pub certification_stale_since_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -1446,6 +1454,7 @@ pub struct StorageHealthInputs {
     pub previous_revisioned_machine_profile_hash: Option<String>,
     pub current_revisioned_machine_profile_hash: Option<String>,
     pub profile_activation_epoch: Option<u64>,
+    pub certification_stale_since_ms: Option<u64>,
     pub last_rotation_at_ms: Option<u64>,
     pub last_rotation_reason: Option<String>,
     pub rotation_event_count: u64,
@@ -4450,15 +4459,44 @@ impl SynapseStore {
         let state = self.store.with_conn(|conn| {
             conn.query_row(
                 "SELECT snapshot_json, revisioned_machine_profile_hash,
-                        profile_activation_epoch, previous_revisioned_machine_profile_hash,
-                        last_rotation_reason, last_rotation_at_ms
-                 FROM profile_state WHERE id = 0",
+                         profile_activation_epoch, previous_revisioned_machine_profile_hash,
+                         last_rotation_reason, last_rotation_at_ms,
+                         certification_stale_since_ms
+                  FROM profile_state WHERE id = 0",
                 [],
                 profile_state_from_row,
             )
         })?;
         validate_profile_state(&state)?;
         Ok(state)
+    }
+
+    /// Persist the first certification mismatch observed for the current profile.
+    /// A hash guard prevents a request that raced a profile rotation from marking
+    /// the newly activated profile stale.
+    pub fn observe_certification_stale(
+        &self,
+        revisioned_machine_profile_hash: &str,
+        observed_at_ms: u64,
+    ) -> Result<Option<u64>, SynapseStoreError> {
+        let observed_at_ms = observed_at_ms.min(i64::MAX as u64) as i64;
+        let stale_since = self.store.with_conn_fenced(|tx| {
+            tx.execute(
+                "UPDATE profile_state
+                 SET certification_stale_since_ms = COALESCE(certification_stale_since_ms, ?1)
+                 WHERE id = 0 AND revisioned_machine_profile_hash = ?2",
+                params![observed_at_ms, revisioned_machine_profile_hash],
+            )?;
+            tx.query_row(
+                "SELECT certification_stale_since_ms
+                 FROM profile_state
+                 WHERE id = 0 AND revisioned_machine_profile_hash = ?1",
+                params![revisioned_machine_profile_hash],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()
+        })?;
+        Ok(stale_since.flatten().map(|value| value as u64))
     }
 
     /// Observe and durably activate a collected profile. The first observation
@@ -4475,9 +4513,10 @@ impl SynapseStore {
         let activation = self.store.with_conn_fenced(|tx| {
             let persisted = tx.query_row(
                 "SELECT snapshot_json, revisioned_machine_profile_hash,
-                        profile_activation_epoch, previous_revisioned_machine_profile_hash,
-                        last_rotation_reason, last_rotation_at_ms
-                 FROM profile_state WHERE id = 0",
+                         profile_activation_epoch, previous_revisioned_machine_profile_hash,
+                         last_rotation_reason, last_rotation_at_ms,
+                         certification_stale_since_ms
+                  FROM profile_state WHERE id = 0",
                 [],
                 profile_state_from_row,
             )?;
@@ -4501,6 +4540,7 @@ impl SynapseStore {
                     previous_revisioned_machine_profile_hash: None,
                     last_rotation_reason: None,
                     last_rotation_at_ms: None,
+                    certification_stale_since_ms: None,
                 };
                 return Ok(ProfileActivation {
                     state,
@@ -4540,9 +4580,10 @@ impl SynapseStore {
                      revisioned_machine_profile_hash = ?2,
                      profile_activation_epoch = ?3,
                      previous_revisioned_machine_profile_hash = ?4,
-                     last_rotation_reason = ?5,
-                     last_rotation_at_ms = ?6
-                 WHERE id = 0 AND revisioned_machine_profile_hash = ?7
+                      last_rotation_reason = ?5,
+                      last_rotation_at_ms = ?6,
+                      certification_stale_since_ms = NULL
+                  WHERE id = 0 AND revisioned_machine_profile_hash = ?7
                    AND profile_activation_epoch = ?8",
                 params![
                     &current_snapshot_json,
@@ -4558,9 +4599,10 @@ impl SynapseStore {
             if update_count != 1 {
                 let adopted = tx.query_row(
                     "SELECT snapshot_json, revisioned_machine_profile_hash,
-                            profile_activation_epoch, previous_revisioned_machine_profile_hash,
-                            last_rotation_reason, last_rotation_at_ms
-                     FROM profile_state WHERE id = 0",
+                         profile_activation_epoch, previous_revisioned_machine_profile_hash,
+                         last_rotation_reason, last_rotation_at_ms,
+                         certification_stale_since_ms
+                  FROM profile_state WHERE id = 0",
                     [],
                     profile_state_from_row,
                 )?;
@@ -4638,6 +4680,7 @@ impl SynapseStore {
                 previous_revisioned_machine_profile_hash: Some(old_hash),
                 last_rotation_reason: Some(reason),
                 last_rotation_at_ms: Some(observed_at_ms),
+                certification_stale_since_ms: None,
             };
             Ok(ProfileActivation {
                 state,
@@ -4990,6 +5033,7 @@ impl SynapseStore {
                 .previous_revisioned_machine_profile_hash,
             current_revisioned_machine_profile_hash: state.revisioned_machine_profile_hash,
             profile_activation_epoch: state.profile_activation_epoch,
+            certification_stale_since_ms: state.certification_stale_since_ms,
             last_rotation_at_ms: state.last_rotation_at_ms,
             last_rotation_reason: state.last_rotation_reason,
             rotation_event_count,
@@ -7124,6 +7168,14 @@ fn validate_profile_state(state: &ProfileState) -> Result<(), SynapseStoreError>
             ));
         }
     }
+    if state
+        .certification_stale_since_ms
+        .is_some_and(|value| value > i64::MAX as u64)
+    {
+        return Err(SynapseStoreError::ProfileStateCorrupt(
+            "certification stale timestamp exceeds SQLite range".to_string(),
+        ));
+    }
     if let Some(previous_hash) = state.previous_revisioned_machine_profile_hash.as_deref() {
         if !is_digest(previous_hash) {
             return Err(SynapseStoreError::ProfileStateCorrupt(
@@ -7151,8 +7203,10 @@ fn profile_state_from_row(row: &Row<'_>) -> rusqlite::Result<ProfileState> {
         })?;
     let epoch_value = row.get::<_, Option<i64>>(2)?;
     let last_rotation_value = row.get::<_, Option<i64>>(5)?;
+    let certification_stale_since_value = row.get::<_, Option<i64>>(6)?;
     if epoch_value.is_some_and(|value| value < 0)
         || last_rotation_value.is_some_and(|value| value < 0)
+        || certification_stale_since_value.is_some_and(|value| value < 0)
     {
         return Err(rusqlite::Error::InvalidQuery);
     }
@@ -7163,6 +7217,7 @@ fn profile_state_from_row(row: &Row<'_>) -> rusqlite::Result<ProfileState> {
         previous_revisioned_machine_profile_hash: row.get(3)?,
         last_rotation_reason: row.get(4)?,
         last_rotation_at_ms: last_rotation_value.map(|value| value as u64),
+        certification_stale_since_ms: certification_stale_since_value.map(|value| value as u64),
     })
 }
 
@@ -8490,8 +8545,78 @@ mod tests {
                             .unwrap();
                         assert_eq!(migrated.outcome, "applied");
                         assert_eq!(migrated.rows, 4);
-                        store.observe_profile(&profile_before, 1_010, 1).unwrap();
-                        store.observe_profile(&profile_after, 1_011, 1).unwrap();
+                        // This fixture populates migration v9 before the v12
+                        // timestamp column exists. Write the v9 profile rows directly
+                        // so the fence continues to exercise the historical schema.
+                        let profile_before_hash = profile_before.revisioned_hash();
+                        let profile_after_hash = profile_after.revisioned_hash();
+                        let event_id = rotation_event_id(&profile_after_hash, 2);
+                        let before_snapshot = serde_json::to_string(&profile_before).unwrap();
+                        let after_snapshot = serde_json::to_string(&profile_after).unwrap();
+                        store
+                            .store
+                            .with_conn_fenced(|tx| {
+                                tx.execute(
+                                    "UPDATE profile_state SET snapshot_json = ?1,
+                                         revisioned_machine_profile_hash = ?2,
+                                         profile_activation_epoch = 2,
+                                         previous_revisioned_machine_profile_hash = ?3,
+                                         last_rotation_reason = 'os_build',
+                                         last_rotation_at_ms = 1011
+                                     WHERE id = 0",
+                                    params![
+                                        after_snapshot,
+                                        profile_after_hash,
+                                        profile_before_hash
+                                    ],
+                                )?;
+                                tx.execute(
+                                    "INSERT INTO profile_rotation_events (
+                                         event_id, old_revisioned_machine_profile_hash,
+                                         new_revisioned_machine_profile_hash,
+                                         old_profile_activation_epoch,
+                                         new_profile_activation_epoch, changed_fields_json,
+                                         previous_snapshot_json, current_snapshot_json,
+                                         observed_at_ms, module_generation, created_at_ms
+                                     ) VALUES (?1, ?2, ?3, 1, 2, ?4, ?5, ?6, 1011, 1, 1011)",
+                                    params![
+                                        event_id,
+                                        profile_before_hash,
+                                        profile_after_hash,
+                                        serde_json::to_string(&["os_build"]).unwrap(),
+                                        before_snapshot,
+                                        after_snapshot,
+                                    ],
+                                )?;
+                                let mut stmt = tx.prepare(
+                                    "SELECT model_id, decode_fingerprint, enabled FROM approvals",
+                                )?;
+                                let approvals = stmt
+                                    .query_map([], |row| {
+                                        Ok((
+                                            row.get::<_, String>(0)?,
+                                            row.get::<_, String>(1)?,
+                                            row.get::<_, i64>(2)? != 0,
+                                        ))
+                                    })?
+                                    .collect::<Result<Vec<_>, _>>()?;
+                                drop(stmt);
+                                for (model_id, decode_fingerprint, enabled) in approvals {
+                                    tx.execute(
+                                        "INSERT INTO profile_rotation_certification_outcomes (
+                                             event_id, model_id, decode_fingerprint, outcome_state
+                                         ) VALUES (?1, ?2, ?3, ?4)",
+                                        params![
+                                            event_id,
+                                            model_id,
+                                            decode_fingerprint,
+                                            if enabled { "required" } else { "not_required" },
+                                        ],
+                                    )?;
+                                }
+                                Ok(())
+                            })
+                            .unwrap();
 
                         let row = OwnedDecodeCertificationRow {
                             status: CertificationStatus::Certified,
@@ -8539,7 +8664,7 @@ mod tests {
                         );
                         store.store
                     }
-                    10 | 11 => store,
+                    10 | 11 | 12 => store,
                     _ => panic!("no fixture rows for migration {version}"),
                 }
             };
@@ -9635,6 +9760,48 @@ mod tests {
             store.profile_state().unwrap().profile_activation_epoch,
             Some(3)
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn certification_stale_since_persists_across_store_reopen() {
+        let (root, descriptor) = temp_descriptor("certification-stale-since");
+        let profile = MachineProfile {
+            os_build: "os-a".to_string(),
+            arch: "aarch64".to_string(),
+            chip_model: "chip-a".to_string(),
+            ram_class: "le_32_gib".to_string(),
+            ane_subtype: None,
+            engine_identities: Vec::new(),
+        };
+        let profile_hash = profile.revisioned_hash();
+        let store = SynapseStore::open(&descriptor).expect("store opens");
+        store
+            .observe_profile(&profile, 10, 1)
+            .expect("profile activates");
+        assert_eq!(
+            store
+                .observe_certification_stale(&profile_hash, 123)
+                .expect("staleness records"),
+            Some(123)
+        );
+        assert_eq!(
+            store
+                .observe_certification_stale(&profile_hash, 456)
+                .expect("first observation remains fixed"),
+            Some(123)
+        );
+        drop(store);
+
+        let reopened = SynapseStore::open(&descriptor).expect("store reopens");
+        assert_eq!(
+            reopened
+                .profile_state()
+                .expect("profile state reads")
+                .certification_stale_since_ms,
+            Some(123)
+        );
+        drop(reopened);
         let _ = std::fs::remove_dir_all(root);
     }
 

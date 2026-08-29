@@ -5,7 +5,10 @@ use std::{
     env, fs,
     io::{Read, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, OnceLock,
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -321,6 +324,7 @@ struct ModuleHealth {
     module_generation: u64,
     loaded_models: usize,
     machine_profile_hash: String,
+    certification: CertificationHealth,
     certification_stale: bool,
     performance_stale: bool,
     lanes: Vec<LaneHealth>,
@@ -332,6 +336,20 @@ struct ModuleHealth {
     re_certification_state: String,
     evidence_requirements_divergence: Vec<EvidenceRequirementsDivergence>,
     approval_certification_outcomes: Vec<ApprovalCertificationHealth>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+struct CertificationHealth {
+    certification_stale: bool,
+    stale_since_ms: Option<u64>,
+    lanes: Vec<CertificationHealthLane>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+struct CertificationHealthLane {
+    model_id: String,
+    workload: String,
+    certified: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -843,6 +861,54 @@ fn default_probe_ane_placement_threshold() -> f64 {
     DEFAULT_PROBE_ANE_PLACEMENT_THRESHOLD
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct AdmissionRefusalCounter {
+    count: u64,
+    last_at_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct AdmissionTelemetrySnapshot {
+    refusals: BTreeMap<String, AdmissionRefusalCounter>,
+    jobs_minted: u64,
+}
+
+#[derive(Default)]
+struct AdmissionTelemetry {
+    jobs_minted: AtomicU64,
+    refusals: Mutex<BTreeMap<String, AdmissionRefusalCounter>>,
+}
+
+impl AdmissionTelemetry {
+    fn record_refusal(&self, reason: &str) {
+        if let Ok(mut refusals) = self.refusals.lock() {
+            let counter = refusals
+                .entry(reason.to_string())
+                .or_insert(AdmissionRefusalCounter {
+                    count: 0,
+                    last_at_ms: 0,
+                });
+            counter.count = counter.count.saturating_add(1);
+            counter.last_at_ms = now_ms();
+        }
+    }
+
+    fn record_job_minted(&self) {
+        self.jobs_minted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> AdmissionTelemetrySnapshot {
+        AdmissionTelemetrySnapshot {
+            refusals: self
+                .refusals
+                .lock()
+                .map(|refusals| refusals.clone())
+                .unwrap_or_default(),
+            jobs_minted: self.jobs_minted.load(Ordering::Relaxed),
+        }
+    }
+}
+
 struct RuntimeState {
     inline: InlineConfig,
     jobs: JobConfig,
@@ -868,6 +934,7 @@ struct RuntimeState {
     /// Tracks module-owned decode sessions so serving admission, interrupted-stream
     /// recovery, and scheduler updates use the same durable session state.
     owned_decode_sessions: Arc<Mutex<OwnedDecodeWireState>>,
+    admission_telemetry: Arc<AdmissionTelemetry>,
 }
 
 struct ModelSlot {
@@ -1679,6 +1746,7 @@ impl RuntimeState {
             )),
             owned_decode_dispatches: Arc::new(Mutex::new(BTreeMap::new())),
             owned_decode_sessions: Arc::new(Mutex::new(OwnedDecodeWireState::default())),
+            admission_telemetry: Arc::new(AdmissionTelemetry::default()),
         })
     }
 
@@ -1782,10 +1850,11 @@ impl RuntimeState {
                     deadline,
                 })
             }
-            AdmissionDecision::Reject(rejection) => Err(WireOperationError::from_stable(
-                rejection.error,
-                rejection.reason,
-            )),
+            AdmissionDecision::Reject(rejection) => {
+                let error = WireOperationError::from_stable(rejection.error, rejection.reason);
+                self.admission_telemetry.record_refusal(&error.code);
+                Err(error)
+            }
         }
     }
 }
@@ -2563,6 +2632,9 @@ impl ModuleHandler for SynapseHandler {
         }
     }
 
+    /// Keep the daemon health status `ok` while publishing certification metrics as
+    /// `{ certification: { certification_stale, stale_since_ms, lanes: [{ model_id,
+    /// workload, certified }] } }`. Health reads stored rows only; it never runs probes.
     async fn health(&self) -> HealthReport {
         let Some(state) = self.state() else {
             return HealthReport::ok();
@@ -2696,6 +2768,16 @@ fn owned_decode_failure(
             "message": message.into(),
         }
     }))
+}
+
+fn owned_decode_admission_failure(
+    state: &ModuleState,
+    code: impl Into<String>,
+    message: impl Into<String>,
+) -> HandlerOutcome {
+    let code = code.into();
+    state.runtime.admission_telemetry.record_refusal(&code);
+    owned_decode_failure(state, code, message)
 }
 
 fn map_serving_refusal(refusal: store::ServingRefusal) -> synapse_core::OwnedDecodeRefusal {
@@ -2906,7 +2988,7 @@ async fn owned_decode_admit_session(state: Arc<ModuleState>, params: Value) -> H
         }
     };
     if let Err(refusal) = synapse_core::validate_greedy_generation(&params.generation) {
-        return owned_decode_failure(
+        return owned_decode_admission_failure(
             &state,
             refusal.as_str(),
             "wave-1 sessions require greedy_top1",
@@ -2914,12 +2996,14 @@ async fn owned_decode_admit_session(state: Arc<ModuleState>, params: Value) -> H
     }
     let material = match serving_admission_material(&state, &params.catalog_fingerprint) {
         Ok(material) => material,
-        Err((refusal, message)) => return owned_decode_failure(&state, refusal.as_str(), message),
+        Err((refusal, message)) => {
+            return owned_decode_admission_failure(&state, refusal.as_str(), message)
+        }
     };
     let mut sessions = match state.runtime.owned_decode_sessions.lock() {
         Ok(sessions) => sessions,
         Err(_) => {
-            return owned_decode_failure(
+            return owned_decode_admission_failure(
                 &state,
                 "owned_decode_unavailable",
                 "the decode-session coordinator is unavailable",
@@ -2952,7 +3036,7 @@ async fn owned_decode_admit_session(state: Arc<ModuleState>, params: Value) -> H
         Ok(admission) => admission,
         Err(refusal) => {
             let wire = map_admission_refusal(&refusal);
-            return owned_decode_failure(&state, wire.as_str(), refusal.to_string());
+            return owned_decode_admission_failure(&state, wire.as_str(), refusal.to_string());
         }
     };
     let session_id = format!(
@@ -2978,7 +3062,7 @@ async fn owned_decode_admit_session(state: Arc<ModuleState>, params: Value) -> H
                 .expect("decode residency is initialized")
                 .close_session(routing_admission.session_id);
             let refusal = map_serving_refusal(reason);
-            return owned_decode_failure(
+            return owned_decode_admission_failure(
                 &state,
                 refusal.as_str(),
                 "serving approval refused admission",
@@ -4403,7 +4487,9 @@ async fn model_load(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         Err(error) => return channel_error("store_failure", error.to_string()),
     };
     let record = admission.record().clone();
-    if matches!(admission, JobAdmission::Admitted(_)) {
+    let job_minted = matches!(admission, JobAdmission::Admitted(_));
+    if job_minted {
+        state.runtime.admission_telemetry.record_job_minted();
         let task_state = Arc::clone(&state);
         let task_job_id = record.job_id.clone();
         let task_params = params.clone();
@@ -4506,6 +4592,21 @@ async fn model_unload(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
 }
 
 async fn resolve_model_for_request(
+    state: Arc<ModuleState>,
+    requested: Option<&str>,
+    task: ModelTask,
+) -> Result<Arc<EmbeddingModel>, WireOperationError> {
+    let resolution = resolve_model_for_request_inner(Arc::clone(&state), requested, task).await;
+    if let Err(error) = &resolution {
+        state
+            .runtime
+            .admission_telemetry
+            .record_refusal(&error.code);
+    }
+    resolution
+}
+
+async fn resolve_model_for_request_inner(
     state: Arc<ModuleState>,
     requested: Option<&str>,
     task: ModelTask,
@@ -6679,7 +6780,9 @@ async fn submit_remote_embed_batch_job(
         Err(error) => return channel_error("store_failure", error.to_string()),
     };
     let record = admission.record().clone();
-    if matches!(admission, JobAdmission::Admitted(_)) {
+    let job_minted = matches!(admission, JobAdmission::Admitted(_));
+    if job_minted {
+        state.runtime.admission_telemetry.record_job_minted();
         spawn_remote_embed_batch_job(Arc::clone(&state), record.job_id.clone(), work);
     }
     result_outcome(job_status_payload(&state, &record))
@@ -8424,6 +8527,10 @@ async fn route_owned_decode_wire(
         .flatten()
         .is_some_and(|approval| approval.grammar_enabled);
     if constrained && (!state.runtime.grammar_enabled || !approval_grammar_enabled) {
+        state
+            .runtime
+            .admission_telemetry
+            .record_refusal("grammar_disabled");
         return channel_error(
             "grammar_disabled",
             "constrained owned-decode requests require both runtime and approval grammar enablement",
@@ -8690,6 +8797,10 @@ async fn route_owned_decode_wire(
     let mut routed = match routed {
         Ok(response) => response,
         Err(failure) => {
+            state
+                .runtime
+                .admission_telemetry
+                .record_refusal(failure.wire_id());
             let detail = failure.message.as_deref();
             return channel_error(
                 failure.wire_id(),
@@ -8919,7 +9030,9 @@ async fn submit_embed_batch_job(
     };
 
     let record = admission.record().clone();
-    if matches!(admission, JobAdmission::Admitted(_)) {
+    let job_minted = matches!(admission, JobAdmission::Admitted(_));
+    if job_minted {
+        state.runtime.admission_telemetry.record_job_minted();
         let task_state = Arc::clone(&state);
         let task_job_id = record.job_id.clone();
         tokio::spawn(async move {
@@ -10270,8 +10383,8 @@ fn ensure_model_certified(
 ) -> Result<(), WireOperationError> {
     // Owned-CUDA has no declared or inherited certification path. A measured
     // row must match this exact machine-profile hash before serving.
-    if model.engine_identity.engine == CUDA_WORKER_ENGINE {
-        return match state.store.get_cert_row(
+    let result = if model.engine_identity.engine == CUDA_WORKER_ENGINE {
+        match state.store.get_cert_row(
             certification_class,
             &state.machine_profile_hash,
             &model.certification_fingerprint,
@@ -10288,16 +10401,38 @@ fn ensure_model_certified(
                 StableError::engine_crashed(Some(100)),
                 format!("read owned-cuda certification row: {error}"),
             )),
-        };
+        }
+    } else {
+        ensure_fingerprint_certified(
+            &state.store,
+            certification_class,
+            &state.machine_profile_hash,
+            &model.certification_fingerprint,
+            &model.model_id,
+            accept_declared,
+        )
+    };
+    if let Err(error) = &result {
+        state
+            .runtime
+            .admission_telemetry
+            .record_refusal(&error.code);
+        if error.code == "not_certified"
+            && state
+                .store
+                .has_stale_cert_row(
+                    certification_class,
+                    &state.machine_profile_hash,
+                    &model.certification_fingerprint,
+                )
+                .unwrap_or(false)
+        {
+            let _ = state
+                .store
+                .observe_certification_stale(&state.revisioned_machine_profile_hash, now_ms());
+        }
     }
-    ensure_fingerprint_certified(
-        &state.store,
-        certification_class,
-        &state.machine_profile_hash,
-        &model.certification_fingerprint,
-        &model.model_id,
-        accept_declared,
-    )
+    result
 }
 
 fn ensure_fingerprint_certified(
@@ -10436,7 +10571,9 @@ async fn probe_start(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         Err(error) => return channel_error("store_failure", error.to_string()),
     };
     let record = admission.record().clone();
-    if matches!(admission, JobAdmission::Admitted(_)) {
+    let job_minted = matches!(admission, JobAdmission::Admitted(_));
+    if job_minted {
+        state.runtime.admission_telemetry.record_job_minted();
         let supervisor_state = Arc::clone(&state);
         let supervisor_job_id = record.job_id.clone();
         let task_state = Arc::clone(&state);
@@ -12971,6 +13108,9 @@ async fn probe_report(state: Arc<ModuleState>) -> HandlerOutcome {
     }))
 }
 
+/// Report admission capacity plus process-local `{ refusals: { reason: { count,
+/// last_at_ms } }, jobs_minted }` counters. Refusal keys use stable identifiers from
+/// the admission protocol so clients can rely on the same keys across releases.
 async fn admission_status(state: Arc<ModuleState>) -> HandlerOutcome {
     let scheduler = match state.runtime.scheduler.lock() {
         Ok(scheduler) => scheduler,
@@ -13034,6 +13174,7 @@ async fn admission_status(state: Arc<ModuleState>) -> HandlerOutcome {
             })
         })
         .collect::<Vec<_>>();
+    let telemetry = state.runtime.admission_telemetry.snapshot();
     let certification_stale = lanes
         .iter()
         .any(|lane| lane["certification_stale"].as_bool().unwrap_or(false));
@@ -13049,6 +13190,8 @@ async fn admission_status(state: Arc<ModuleState>) -> HandlerOutcome {
         "inline_in_flight_executions": execution_in_flight,
         "execution_wait_p50_ms": execution_wait_p50_ms,
         "execution_wait_p95_ms": execution_wait_p95_ms,
+        "refusals": telemetry.refusals,
+        "jobs_minted": telemetry.jobs_minted,
         "lanes": lanes,
         "certification_stale": certification_stale,
         "performance_stale": performance_stale,
@@ -13062,6 +13205,70 @@ fn worker_health_for_model(model: &EmbeddingModel) -> Option<worker_host::Worker
             .ok()
             .and_then(|engine| engine.health_snapshot().ok()),
         EmbedBackend::Ort(_) | EmbedBackend::Owned(_) | EmbedBackend::OwnedDecode => None,
+    }
+}
+
+fn certification_health(
+    state: &ModuleState,
+    persisted_stale_since_ms: Option<u64>,
+) -> CertificationHealth {
+    let slots = state
+        .runtime
+        .catalog
+        .lock()
+        .map(|catalog| {
+            catalog
+                .values()
+                .map(|slot| ModelSlotSnapshot {
+                    spec: slot.spec.clone(),
+                    loaded: slot.loaded.clone(),
+                    state: slot.state.clone(),
+                    notify: Arc::clone(&slot.notify),
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut certification_stale = false;
+    let lanes = slots
+        .into_iter()
+        .map(|slot| {
+            let certification_fingerprint = slot
+                .loaded
+                .as_ref()
+                .map(|model| model.certification_fingerprint.clone())
+                .or_else(|| {
+                    (slot.spec.engine == "owned-metal-decode")
+                        .then(|| owned_decode_catalog_entry(&slot.spec).ok())
+                        .flatten()
+                        .and_then(|entry| entry.decode_identity_inputs().decode_fingerprint().ok())
+                })
+                .unwrap_or_else(|| slot.spec.fingerprint.clone());
+            let owned_admitted = slot
+                .loaded
+                .as_ref()
+                .is_some_and(|model| owned_decode_lane_admitted(state, model));
+            let measurements = lane_measurement_rows(
+                state,
+                &slot.spec.model_id,
+                &slot.spec.task,
+                &slot.spec.engine,
+                &certification_fingerprint,
+                owned_admitted,
+            );
+            certification_stale |= measurements.certification_stale;
+            CertificationHealthLane {
+                model_id: slot.spec.model_id,
+                workload: slot.spec.task,
+                certified: measurements.current_certification.is_some(),
+            }
+        })
+        .collect();
+    CertificationHealth {
+        certification_stale,
+        stale_since_ms: certification_stale
+            .then_some(persisted_stale_since_ms)
+            .flatten(),
+        lanes,
     }
 }
 
@@ -13098,6 +13305,7 @@ fn module_health(state: &ModuleState) -> ModuleHealth {
                 state.revisioned_machine_profile_hash.clone(),
             ),
             profile_activation_epoch: Some(state.profile_activation_epoch),
+            certification_stale_since_ms: None,
             last_rotation_at_ms: None,
             last_rotation_reason: Some("unknown_previous_snapshot".to_string()),
             rotation_event_count: 0,
@@ -13106,12 +13314,14 @@ fn module_health(state: &ModuleState) -> ModuleHealth {
             approval_certification_outcomes: Vec::new(),
         }
     });
+    let certification = certification_health(state, storage.certification_stale_since_ms);
     ModuleHealth {
         status: "ok".to_string(),
         module_generation: state.module_generation,
         loaded_models: state.runtime.loaded_model_count(),
         machine_profile_hash: state.legacy_machine_profile_hash.clone(),
-        certification_stale: lanes.iter().any(|lane| lane.certification_stale),
+        certification_stale: certification.certification_stale,
+        certification,
         performance_stale: lanes.iter().any(|lane| lane.performance_stale),
         lanes,
         previous_revisioned_machine_profile_hash: storage.previous_revisioned_machine_profile_hash,
@@ -13714,6 +13924,191 @@ mod tests {
             worker_bin: None,
             worker_runtime_dir: None,
         }
+    }
+
+    static TEST_STATE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn test_storage_descriptor(label: &str) -> (PathBuf, StorageDescriptor) {
+        let root = std::env::temp_dir().join(format!(
+            "synapse-module-{label}-{}-{}",
+            std::process::id(),
+            TEST_STATE_COUNTER.fetch_add(1, Ordering::Relaxed),
+        ));
+        let descriptor = StorageDescriptor {
+            module_id: "synapse-test".to_string(),
+            storage_namespace: "default".to_string(),
+            isolation: Isolation::Module,
+            backend: StorageBackend::Sqlite {
+                path: root.join("store.db").to_string_lossy().to_string(),
+            },
+        };
+        (root, descriptor)
+    }
+
+    fn test_machine_profile(os_build: &str) -> MachineProfile {
+        MachineProfile {
+            os_build: os_build.to_string(),
+            arch: "aarch64".to_string(),
+            chip_model: "test-chip".to_string(),
+            ram_class: "test-ram".to_string(),
+            ane_subtype: None,
+            engine_identities: Vec::new(),
+        }
+    }
+
+    fn test_module_state(store: Arc<SynapseStore>, profile: MachineProfile) -> Arc<ModuleState> {
+        let (machine_profile_hash, revisioned_machine_profile_hash) =
+            module_state_machine_profile_hashes(&profile);
+        let profile_activation_epoch = store
+            .profile_state()
+            .expect("test profile state reads")
+            .profile_activation_epoch
+            .expect("test profile is activated");
+        let runtime = Arc::new(
+            RuntimeState::from_catalog(ModuleConfig::default(), vec![stuck_model_spec()])
+                .expect("test runtime initializes"),
+        );
+        let remote_gateway = Arc::new(
+            RemoteGateway::new(
+                Arc::clone(&store),
+                Vec::new(),
+                Arc::new(SubcVaultCredentialClient::new(PathBuf::from("unused-subc"))),
+                machine_profile_hash.clone(),
+            )
+            .expect("empty remote gateway initializes"),
+        );
+        let continuity_check: Arc<dyn ContinuityCheck> = remote_gateway.continuity.clone();
+        Arc::new(ModuleState {
+            module_id: "synapse-test".to_string(),
+            store,
+            module_generation: 1,
+            machine_profile: profile,
+            machine_profile_hash: machine_profile_hash.clone(),
+            legacy_machine_profile_hash: machine_profile_hash,
+            revisioned_machine_profile_hash,
+            profile_activation_epoch,
+            runtime,
+            model_cache: Arc::new(ModelCache::new(
+                std::env::temp_dir().join("synapse-test-cache"),
+            )),
+            continuity_check,
+            remote_gateway,
+        })
+    }
+
+    #[tokio::test]
+    async fn health_reports_certification_staleness_for_rotated_profiles() {
+        let (root, descriptor) = test_storage_descriptor("health-certification-staleness");
+        let store = Arc::new(SynapseStore::open(&descriptor).expect("test store opens"));
+        let profile_a = test_machine_profile("test-os-a");
+        store
+            .observe_profile(&profile_a, 10, 1)
+            .expect("first profile activates");
+        let fingerprint = Fingerprint("test-fingerprint".to_string());
+        store
+            .store_class_scoped_cert_row(&ClassScopedCertificationRow {
+                certification_class: CertificationClass::Embedding,
+                assurance_class: AssuranceClass::Measured,
+                status: CertificationStatus::Certified,
+                key_hash: profile_a.hash(),
+                machine_profile_hash: Some(profile_a.hash()),
+                remote_profile_hash: None,
+                identity_revision: None,
+                numeric_profile_id: Some(NumericProfileId("test-profile".to_string())),
+                fingerprint: fingerprint.clone(),
+                certified_at_ms: 11,
+                os_build: profile_a.os_build.clone(),
+                module_generation: 1,
+                evidence: json!({}),
+            })
+            .expect("current certification stores");
+
+        let healthy_handler = SynapseHandler::new("synapse-test".to_string(), PathBuf::new());
+        assert!(healthy_handler
+            .inner
+            .state
+            .set(test_module_state(Arc::clone(&store), profile_a.clone()))
+            .is_ok());
+        let healthy = healthy_handler.health().await;
+        assert!(matches!(healthy.status, subc_client_rs::HealthStatus::Ok));
+        let healthy_metrics = healthy.metrics.expect("health has metrics");
+        assert_eq!(
+            healthy_metrics["certification"]["certification_stale"],
+            Value::Bool(false)
+        );
+        assert_eq!(
+            healthy_metrics["certification"]["lanes"],
+            json!([{"model_id": "stuck-model", "workload": "embed", "certified": true}])
+        );
+
+        let profile_b = test_machine_profile("test-os-b");
+        store
+            .observe_profile(&profile_b, 12, 1)
+            .expect("rotated profile activates");
+        assert_eq!(
+            store
+                .observe_certification_stale(&profile_b.revisioned_hash(), 13)
+                .expect("staleness records"),
+            Some(13)
+        );
+        let stale_handler = SynapseHandler::new("synapse-test".to_string(), PathBuf::new());
+        assert!(stale_handler
+            .inner
+            .state
+            .set(test_module_state(Arc::clone(&store), profile_b))
+            .is_ok());
+        let stale = stale_handler.health().await;
+        assert!(matches!(stale.status, subc_client_rs::HealthStatus::Ok));
+        let stale_metrics = stale.metrics.expect("health has metrics");
+        assert_eq!(
+            stale_metrics["certification"]["certification_stale"],
+            Value::Bool(true)
+        );
+        assert_eq!(stale_metrics["certification"]["stale_since_ms"], 13);
+        assert_eq!(
+            stale_metrics["certification"]["lanes"],
+            json!([{"model_id": "stuck-model", "workload": "embed", "certified": false}])
+        );
+
+        drop(stale_handler);
+        drop(healthy_handler);
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn admission_status_counts_refused_admissions_by_wire_reason() {
+        let (root, descriptor) = test_storage_descriptor("admission-refusal-counters");
+        let store = Arc::new(SynapseStore::open(&descriptor).expect("test store opens"));
+        let profile = test_machine_profile("test-os");
+        store
+            .observe_profile(&profile, 10, 1)
+            .expect("test profile activates");
+        let state = test_module_state(Arc::clone(&store), profile);
+        let error = match state.runtime.admit_inline(
+            QueueClass::Interactive,
+            state.runtime.inline.byte_budget.saturating_add(1),
+            None,
+            None,
+        ) {
+            Ok(_) => panic!("an over-budget request must be refused"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "queue_full");
+
+        let HandlerOutcome::Response(response) = admission_status(Arc::clone(&state)).await else {
+            panic!("admission.status should return a response")
+        };
+        let payload: Value = serde_json::from_slice(&response).expect("admission status is JSON");
+        assert_eq!(payload["result"]["refusals"]["queue_full"]["count"], 1);
+        assert!(payload["result"]["refusals"]["queue_full"]["last_at_ms"]
+            .as_u64()
+            .is_some_and(|value| value > 0));
+        assert_eq!(payload["result"]["jobs_minted"], 0);
+
+        drop(state);
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
