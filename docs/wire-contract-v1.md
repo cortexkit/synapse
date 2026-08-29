@@ -167,7 +167,13 @@ prompt in its evidence.
 `probe.report.result.lanes[]` adds:
 
 - `certification_required`: whether requests on this lane are gated;
-- `certification_status`: `certified`, `uncertified`, or `not_required`;
+- `certification_status`: `certified`, `uncertified`, or `not_required`, based
+  only on current-profile certification evidence;
+- `serving_admission`: `enabled` or `disabled` for owned-decode lanes, and
+  `null` for lanes without approval-backed admission;
+- `serving_admission_reason`: `null` when enabled or not applicable, otherwise
+  the approval's disable reason or a stable reason such as `approval_absent` or
+  `not_certified`;
 - `certification.status`: `certified` or `uncertified` for a persisted probe
   outcome;
 - `blocking_reason`: `token_mismatch`, `fixture_unavailable`, a typed probe

@@ -12726,7 +12726,6 @@ fn lane_measurement_rows(
     task: &str,
     engine: &str,
     fingerprint: &Fingerprint,
-    owned_admitted: bool,
 ) -> LaneMeasurementRows {
     let (current_certification, latest_certification, current_probe, latest_probe) =
         if engine == DECODE_WORKER_ENGINE {
@@ -12745,7 +12744,7 @@ fn lane_measurement_rows(
                 .map(owned_measurement_report_row);
             let current_certification = current_probe
                 .as_ref()
-                .filter(|row| owned_admitted && row.status == CertificationStatus::Certified)
+                .filter(|row| row.status == CertificationStatus::Certified)
                 .cloned();
             (
                 current_certification.clone(),
@@ -12819,6 +12818,48 @@ fn lane_measurement_rows(
         current_performance,
         latest_performance,
     }
+}
+
+fn lane_certification_status(
+    certification_required: bool,
+    evidence_certified: bool,
+) -> &'static str {
+    if !certification_required {
+        "not_required"
+    } else if evidence_certified {
+        "certified"
+    } else {
+        "uncertified"
+    }
+}
+
+fn serving_admission_projection(
+    owned_decode_lane: bool,
+    owned_admitted: bool,
+    evidence_certified: bool,
+    approval: Option<(bool, Option<String>)>,
+) -> (Option<&'static str>, Option<String>) {
+    if !owned_decode_lane {
+        return (None, None);
+    }
+    if owned_admitted && approval.as_ref().is_some_and(|(enabled, _)| *enabled) {
+        return (Some("enabled"), None);
+    }
+    let reason = match approval {
+        Some((false, disabled_reason)) => {
+            disabled_reason.or_else(|| Some("approval_disabled".to_string()))
+        }
+        Some((true, _)) => Some(
+            if evidence_certified {
+                "admission_rejected"
+            } else {
+                "not_certified"
+            }
+            .to_string(),
+        ),
+        None => Some("approval_absent".to_string()),
+    };
+    (Some("disabled"), reason)
 }
 
 fn worker_health_from_slot(slot: &ModelSlotSnapshot) -> Option<worker_host::WorkerHostHealth> {
@@ -12985,7 +13026,6 @@ async fn probe_report(state: Arc<ModuleState>) -> HandlerOutcome {
             &slot.spec.task,
             &slot.spec.engine,
             &certification_fingerprint,
-            owned_admitted,
         );
         certification_stale |= measurements.certification_stale;
         performance_stale |= measurements.performance_stale;
@@ -13005,13 +13045,27 @@ async fn probe_report(state: Arc<ModuleState>) -> HandlerOutcome {
             .or(measurements.current_certification.as_ref())
             .or(measurements.latest_certification.as_ref())
             .map(|row| certification_report_row(&state, row, probe_stale));
-        let certification_status = if !certification_required {
-            "not_required"
-        } else if measurements.current_certification.is_some() {
-            "certified"
-        } else {
-            "uncertified"
-        };
+        let certification_status = lane_certification_status(
+            certification_required,
+            measurements.current_certification.is_some(),
+        );
+        let (serving_admission, serving_admission_reason) =
+            if slot.spec.engine != DECODE_WORKER_ENGINE {
+                (None, None)
+            } else {
+                match state
+                    .store
+                    .get_approval(&slot.spec.model_id, &certification_fingerprint.0)
+                {
+                    Ok(approval) => serving_admission_projection(
+                        true,
+                        owned_admitted,
+                        measurements.current_certification.is_some(),
+                        approval.map(|approval| (approval.enabled, approval.disabled_reason)),
+                    ),
+                    Err(_) => (Some("disabled"), Some("approval_unavailable".to_string())),
+                }
+            };
         let performance = measurements
             .current_performance
             .as_ref()
@@ -13073,6 +13127,8 @@ async fn probe_report(state: Arc<ModuleState>) -> HandlerOutcome {
             "support_state": support_state,
             "certification_required": certification_required,
             "certification_status": certification_status,
+            "serving_admission": serving_admission,
+            "serving_admission_reason": serving_admission_reason,
             "certified": measurements.current_certification.is_some(),
             "certification_stale": measurements.certification_stale,
             "performance_stale": measurements.performance_stale,
@@ -13150,14 +13206,12 @@ async fn admission_status(state: Arc<ModuleState>) -> HandlerOutcome {
         .loaded_models()
         .into_iter()
         .map(|model| {
-            let owned_admitted = owned_decode_lane_admitted(&state, &model);
             let measurements = lane_measurement_rows(
                 &state,
                 &model.model_id,
                 model.task.as_str(),
                 &model.engine_identity.engine,
                 &model.certification_fingerprint,
-                owned_admitted,
             );
             json!({
                 "model_id": model.model_id,
@@ -13243,17 +13297,12 @@ fn certification_health(
                         .and_then(|entry| entry.decode_identity_inputs().decode_fingerprint().ok())
                 })
                 .unwrap_or_else(|| slot.spec.fingerprint.clone());
-            let owned_admitted = slot
-                .loaded
-                .as_ref()
-                .is_some_and(|model| owned_decode_lane_admitted(state, model));
             let measurements = lane_measurement_rows(
                 state,
                 &slot.spec.model_id,
                 &slot.spec.task,
                 &slot.spec.engine,
                 &certification_fingerprint,
-                owned_admitted,
             );
             certification_stale |= measurements.certification_stale;
             CertificationHealthLane {
@@ -13278,14 +13327,12 @@ fn module_health(state: &ModuleState) -> ModuleHealth {
         .loaded_models()
         .into_iter()
         .map(|model| {
-            let owned_admitted = owned_decode_lane_admitted(state, &model);
             let measurements = lane_measurement_rows(
                 state,
                 &model.model_id,
                 model.task.as_str(),
                 &model.engine_identity.engine,
                 &model.certification_fingerprint,
-                owned_admitted,
             );
             LaneHealth {
                 model_id: model.model_id.clone(),
@@ -13846,6 +13893,46 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn probe_report_separates_certification_from_serving_admission() {
+        let (serving_admission, serving_admission_reason) = serving_admission_projection(
+            true,
+            false,
+            true,
+            Some((false, Some("held for operator review".to_string()))),
+        );
+        let lfm2_lane = json!({
+            "certification_status": lane_certification_status(true, true),
+            "serving_admission": serving_admission,
+            "serving_admission_reason": serving_admission_reason,
+        });
+        assert_eq!(lfm2_lane["certification_status"], "certified");
+        assert_eq!(lfm2_lane["serving_admission"], "disabled");
+        assert_eq!(
+            lfm2_lane["serving_admission_reason"],
+            "held for operator review"
+        );
+
+        let (serving_admission, serving_admission_reason) =
+            serving_admission_projection(true, false, false, Some((true, None)));
+        let uncertified_lane = json!({
+            "certification_status": lane_certification_status(true, false),
+            "serving_admission": serving_admission,
+            "serving_admission_reason": serving_admission_reason,
+        });
+        assert_eq!(uncertified_lane["certification_status"], "uncertified");
+
+        let (serving_admission, serving_admission_reason) =
+            serving_admission_projection(true, true, true, Some((true, None)));
+        let enabled_lane = json!({
+            "certification_status": lane_certification_status(true, true),
+            "serving_admission": serving_admission,
+            "serving_admission_reason": serving_admission_reason,
+        });
+        assert_eq!(enabled_lane["certification_status"], "certified");
+        assert_eq!(enabled_lane["serving_admission"], "enabled");
+    }
 
     #[test]
     fn wire_contract_documents_every_management_operation() {
