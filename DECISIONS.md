@@ -4,6 +4,11 @@ Running log of design decisions. Entries made while Ufuk is AFK are marked with 
 approval state: **decided** (reversible, AFT-approved or within pre-approved scope),
 **banked** (recommendation recorded, needs Ufuk's call), **locked** (Ufuk-approved).
 
+Entries are point-in-time records: each describes the state of the world on its date,
+and later entries supersede earlier ones rather than editing them. Version numbers,
+crate names, and capability claims inside an entry are historical facts about that
+date, not claims about the current tree (the sibling trees move; the log does not).
+
 ## D-001: Module skeleton built on subc-client-rs SDK, not a hand-rolled frame loop
 
 - State: decided (SUBC-blessed, pm_fe84493f: SDK is the path for all new modules;
