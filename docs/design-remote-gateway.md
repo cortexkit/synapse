@@ -230,7 +230,7 @@ The current first-file-wins loader cannot express "project may tune knobs
 but never touch providers", so the loader changes:
 
 - `remote_providers` is a PRIVILEGED field: read EXCLUSIVELY from the
-  user-tier file (`~/.config/synapse/synapse.jsonc`) or
+  user-tier file (`~/.config/cortexkit/synapse.jsonc`) or
   SYNAPSE_CONFIG_PATH. If the project-tier file contains it → typed boot
   error naming the field and the rule.
 - When the project-tier file wins general selection, the user-tier file
