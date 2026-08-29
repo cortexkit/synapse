@@ -1,6 +1,7 @@
 use std::{future::Future, path::PathBuf, sync::Arc, time::Duration};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use subc_client_rs::{async_trait, CallError, CallOptions, ConsumerOptions, SubcConsumer};
 use subc_protocol::{BindIdentity, Priority, RouteTarget};
 use tokio::sync::Mutex;
@@ -8,6 +9,8 @@ use tokio::sync::Mutex;
 use super::runtime::{CredentialToken, VaultCredentialClient, VaultError};
 
 const CREDENTIALS_MODULE_ID: &str = "claustrum";
+/// Envelope key claustrum wraps every `credential.get` reply in.
+const CREDENTIAL_RESULT_KEY: &str = "result";
 const VAULT_MIN_TTL_MS: u64 = 600_000;
 const VAULT_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 const VAULT_ROUTE_READY_TIMEOUT: Duration = Duration::from_secs(1);
@@ -94,21 +97,6 @@ struct CredentialReportParams<'a> {
 
 #[derive(Deserialize)]
 #[serde(untagged)]
-enum CredentialGetResponse {
-    Direct(CredentialGetOutcome),
-    Wrapped { result: CredentialGetOutcome },
-}
-
-impl CredentialGetResponse {
-    fn into_outcome(self) -> CredentialGetOutcome {
-        match self {
-            Self::Direct(outcome) | Self::Wrapped { result: outcome } => outcome,
-        }
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
 enum CredentialGetOutcome {
     Success {
         payload: Vec<u8>,
@@ -127,8 +115,26 @@ struct CredentialReadError {
     code: String,
 }
 
-fn decode_credential_get_response(response: &[u8]) -> Result<CredentialGetResponse, VaultError> {
-    serde_json::from_slice(response).map_err(|_| VaultError::MalformedHandlesFile)
+/// Selects the credential envelope explicitly instead of by `#[serde(untagged)]`
+/// variant order.
+///
+/// Untagged enums are tried in declaration order, so a frame carrying both a
+/// wrapped `result.error` and top-level success fields resolved as a SUCCESS and
+/// discarded the error — returning a token built from the stray bytes. Claustrum
+/// cannot emit that frame today (their outcome is an enum whose variants cannot
+/// coexist), but the envelope choice was resting on declaration order rather than
+/// on a decision, and it failed toward serving a credential.
+///
+/// `result` therefore wins whenever it is present. The unwrapped form stays
+/// accepted, but as a documented fallback rather than a coincidence of ordering.
+fn decode_credential_get_response(response: &[u8]) -> Result<CredentialGetOutcome, VaultError> {
+    let envelope: Value =
+        serde_json::from_slice(response).map_err(|_| VaultError::MalformedHandlesFile)?;
+    let outcome = match envelope.get(CREDENTIAL_RESULT_KEY) {
+        Some(result) => result.clone(),
+        None => envelope,
+    };
+    serde_json::from_value(outcome).map_err(|_| VaultError::MalformedHandlesFile)
 }
 
 fn map_credential_read_error(error: CredentialReadError) -> VaultError {
@@ -154,8 +160,7 @@ impl VaultCredentialClient for SubcVaultCredentialClient {
         })
         .map_err(|_| VaultError::MalformedHandle)?;
         let response = self.call(body).await?;
-        let response = decode_credential_get_response(&response)?;
-        match response.into_outcome() {
+        match decode_credential_get_response(&response)? {
             CredentialGetOutcome::Success {
                 payload,
                 expires_at_ms,
@@ -264,14 +269,59 @@ mod tests {
 
     #[test]
     fn credential_wire_decoder_never_exposes_payload_in_errors() {
-        let response: CredentialGetResponse = serde_json::from_value(serde_json::json!({
-            "result": {"payload": [115, 101, 99, 114, 101, 116], "expires_at_ms": null, "record_version": 3}
-        }))
-        .unwrap();
-        let CredentialGetOutcome::Success { payload, .. } = response.into_outcome() else {
+        let response = decode_credential_get_response(
+            br#"{"result":{"payload":[115,101,99,114,101,116],"expires_at_ms":null,"record_version":3}}"#,
+        )
+        .expect("a well-formed credential success must deserialize");
+        let CredentialGetOutcome::Success { payload, .. } = response else {
             panic!("expected credential success");
         };
         assert_eq!(payload.len(), 6);
+    }
+
+    #[test]
+    fn wrapped_error_wins_over_stray_top_level_success_fields() {
+        // Envelope selection must not depend on untagged variant order: the
+        // wrapped error is the reply, and the stray top-level fields are not a
+        // credential. Decoding this as a success would hand a provider call a
+        // token built from bytes that accompanied a failure.
+        let response = decode_credential_get_response(
+            br#"{"result":{"error":{"class":"transient","code":"x"}},"payload":[1],"record_version":9}"#,
+        )
+        .expect("the wrapped error is a well-formed frame");
+        let CredentialGetOutcome::AppError { error } = response else {
+            panic!("stray top-level success fields must not outrank a wrapped error");
+        };
+        assert_eq!(error.class, "transient");
+    }
+
+    #[test]
+    fn unwrapped_outcome_is_still_accepted() {
+        // The fallback is deliberate, not incidental — pin it so removing it is a
+        // decision rather than a side effect.
+        let response = decode_credential_get_response(
+            br#"{"error":{"class":"permanent","code":"not_found"}}"#,
+        )
+        .expect("an unwrapped outcome remains decodable");
+        let CredentialGetOutcome::AppError { error } = response else {
+            panic!("expected credential error outcome");
+        };
+        assert_eq!(error.code, "not_found");
+    }
+
+    #[test]
+    fn missing_error_code_is_a_malformed_credential_frame() {
+        // `code` is non-Option, so this is currently rejected by the type rather
+        // than by intent. Pinning it turns an accident into a guarantee: adding
+        // #[serde(default)] later goes red here instead of silently widening
+        // what synapse accepts from the vault.
+        let Err(error) =
+            decode_credential_get_response(br#"{"result":{"error":{"class":"permanent"}}}"#)
+        else {
+            panic!("credential errors without the required code are malformed");
+        };
+
+        assert_eq!(error, VaultError::MalformedHandlesFile);
     }
 
     #[test]
@@ -280,7 +330,7 @@ mod tests {
             br#"{"result":{"error":{"class":"transient","code":"future_refresh_path"}}}"#,
         )
         .expect("a well-formed credential error must deserialize");
-        let CredentialGetOutcome::AppError { error } = response.into_outcome() else {
+        let CredentialGetOutcome::AppError { error } = response else {
             panic!("expected credential error outcome");
         };
 
