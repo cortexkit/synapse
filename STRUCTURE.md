@@ -13,6 +13,8 @@
 │   ├── harness/            # Core benchmark metrics and telemetry runner library
 │   ├── lanes/              # Crate workspace members and runtime scripts
 │   │   ├── burn/           # WGPU/Metal shader engine using Burn
+│   │   ├── candle-embed/   # Candle-based ONNX/safetensors embedding spike
+│   │   ├── llama-inproc/   # In-process llama.cpp binding spike
 │   │   ├── llama/          # Supervised llama-server child process executor
 │   │   ├── mlx-minilm/     # Python-based MLX GPU executor for MiniLM
 │   │   ├── mlx/            # Metal-accelerated MLX GPU executor
@@ -43,8 +45,8 @@
 ├── operations/             # Production operations and enablement documentation
 ├── tests/                  # Standalone certification harnesses (ane-prefill-certification)
 ├── tools/                  # Shared system tools and distillation harnesses
-│   ├── classify-distill/   # Athena classify distillation harness
-│   └── gather-distill/     # External gather-distillation data generation harness
+│   ├── gather-distill/     # External gather-distillation data generation harness
+│   └── stt-voice-test/     # Web-based speech-to-text voice testing utility
 ├── workers/                # Separately supervised Swift/CoreML sidecar processes
 │   └── ane-prefill-sidecar/ # Swift/CoreML fixed-window prefill sidecar for Qwen3
 ├── Cargo.toml              # Cargo workspace definition
@@ -57,7 +59,7 @@
 **.alfonso/:**
 - Purpose: Host experiment spikes, prototypes, and workspace development plans.
 - Contains: Rust source spikes.
-- Key files: `.alfonso/spikes/coreml_spike.rs`
+- Key files: `.alfonso/plans/`
 
 **.cortexkit/:**
 - Purpose: Houses agent prompts, configuration setups, and historian logs.
@@ -155,7 +157,7 @@
 **docs/:**
 - Purpose: Stores contextual architectural studies and decision analyses.
 - Contains: Markdown documents.
-- Key files: `docs/decision-1-runtime.md`, `docs/campaign-context-repro.md`
+- Key files: `docs/decision-1-runtime.md`, `docs/design-synapse-module.md`
 
 **evidence/:**
 - Purpose: Contains hardware calibration evidence records and certification policies.
@@ -194,12 +196,7 @@
 
 **tools/:**
 - Purpose: Houses shared development tools, utilities, and datasets generation/distillation harnesses.
-- Contains: The `gather-distill` and `classify-distill` TypeScript project workspaces, and `stt-voice-test` utility.
-
-**tools/classify-distill/:**
-- Purpose: Standalone Bun/TypeScript dataset generation and classification runner for the `Athena-classify` student model.
-- Contains: Vendored ALF rust/ts contracts, real export importer, histogram-driven qgen, Anthropic Claude OAuth/API runner with dry-run/mock gates, mechanical validator port, and parity checks.
-- Key files: `tools/classify-distill/src/cli.ts`, `tools/classify-distill/src/importer.ts`, `tools/classify-distill/src/qgen.ts`, `tools/classify-distill/src/runner.ts`, `tools/classify-distill/src/validator.ts`, `tools/classify-distill/README.md`
+- Contains: The `gather-distill` TypeScript project workspace, and `stt-voice-test` utility.
 
 **tools/gather-distill/:**
 - Purpose: Standalone external harness for generating QA datasets, collecting model tool-use trajectories, and orchestrating student model SFT training/evaluation.
@@ -224,7 +221,6 @@
 - `bench/eval-coir/score.py`: Computes retrieval quality metrics on generated vectors.
 - `bench/run-matrix.sh`: Global benchmark suite runner.
 - `bench/run-night.sh`: Nightly full-corpus multi-lane orchestrator.
-- `tools/classify-distill/src/cli.ts`: Entry point for the classify-distill harness commands (`import`, `qgen`, `run`, `parity`).
 - `tools/gather-distill/src/cli.ts`: Entry point for the gather-distillation harness commands (`qgen`, `gather`, `validate`, `score`).
 - `bench/spikes/unified-rt/src/bin/vulkan_probe.rs`: Vulkan memory type and budget capability prober.
 
@@ -264,10 +260,6 @@
 - `tools/gather-distill/src/validate.ts`: Citation verification, SHA-checking, and path bounds checker.
 - `tools/gather-distill/src/scorer.ts`: Offline gold-standard Jaccard and file F1 overlap quality scorer.
 - `tools/gather-distill/src/judge.ts`: OpenAI OAuth validation and judge scoring loop.
-- `tools/classify-distill/src/importer.ts`: Real ALF export attempt parser and gold/reject extractor.
-- `tools/classify-distill/src/qgen.ts`: Sonnet-5 synthetic request prose generator driven by consult class histograms.
-- `tools/classify-distill/src/runner.ts`: Classification execution loop supporting Anthropic OAuth rotation, prompt caching, and dry-run/mock gates.
-- `tools/classify-distill/src/validator.ts`: Mechanical validator port enforcing vendored ALF rust/ts contracts.
 - `bench/spikes/unified-rt/src/json_constraint.rs`: Constrained JSON schema grammar state machine and token mask generator.
 - `bench/spikes/unified-rt/src/lfm2.rs`: LFM2 model family, short-convolution, and full-attention mixer logic.
 - `bench/spikes/unified-rt/src/lfm2_audio.rs`: Mel-spectrogram DSP frontend, FastConformer speech encoder, and audio projector.

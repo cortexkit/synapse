@@ -198,13 +198,6 @@
 4. Validate trajectory JSON rows, confirming commit SHAs, file bounds, and citation content against the pinned repo — `tools/gather-distill/src/validate.ts`
 5. Perform offline gold-overlap scoring to evaluate candidate trajectory quality (tracking line-range Jaccard, file F1, and token usage) — `tools/gather-distill/src/scorer.ts`
 
-**Athena Classify Distillation Flow:**
-
-1. Import real ALF export attempts into candidate gold/reject rows based on attempt state and `accepted_plan_json` labels — `tools/classify-distill/src/importer.ts`
-2. Generate synthetic request prose with class priors from consult histograms via Sonnet-5 — `tools/classify-distill/src/qgen.ts`
-3. Execute dry-run or Opus classification runs using static prompt caching (~500 tokens prefix), multi-account OAuth rotation, and mechanical validation against vendored ALF contracts — `tools/classify-distill/src/runner.ts`, `tools/classify-distill/src/validator.ts`
-4. Split valid responses to gold JSONL and invalid or failed classifications to reject JSONL with validation errors for evaluation — `tools/classify-distill/src/runner.ts`
-
 **LFM2 Causal Decode and LFM2-Audio ASR Flow (unified-rt):**
 
 1. Detect model family from config `model_type` (`lfm2` or `lfm2-audio`).
@@ -271,11 +264,6 @@
 - Purpose: Managed pool for token rotation, concurrency limits, and cooldowns across multiple credentials.
 - Location: `tools/gather-distill/src/auth.ts`
 - Pattern: Rotating Credentials Pool with in-flight caps.
-
-**Classify Validator & Contract Port:**
-- Purpose: Enforce strict output JSON compliance against vendored ALF Rust/TS contract defaults, aliases, optional fields, unknown-field tolerance, route-specific checks, and council class resolver.
-- Location: `tools/classify-distill/src/validator.ts`
-- Pattern: Structural schema validator and intent resolver.
 
 **Grammar Compiler & Automaton:**
 - Purpose: Exclusively compiles `synapse-json-schema-v1` JSON schemas into byte-level JSON automata (`TokenIdJsonConstraintV1`) and enforces checked-in structural limits without exposing raw schema structures across the worker boundary.
@@ -419,11 +407,6 @@
 - Location: `tools/gather-distill/src/cli.ts`
 - Triggers: Invocation of Bun running the CLI commands.
 - Responsibilities: Routes commands to qgen (question generation with optional `--avoid-from` to avoid duplicating question lists), gather (trajectory collection), validate (trajectory inspection), and score (gold-overlap performance comparison and zero-shot bake-off evaluation).
-
-**Athena Classify Distillation CLI (`classify-distill`):**
-- Location: `tools/classify-distill/src/cli.ts`
-- Triggers: Invocation of Bun running `tools/classify-distill/src/cli.ts` commands (`import`, `qgen`, `run`, `parity`, `--dry-run`).
-- Responsibilities: Routes commands to import real attempt exports, generate synthetic request prose, verify contract parity against ALF, and execute Opus/Haiku classification runs.
 
 **Synapse Operator CLI (`synapse-opctl`):**
 - Location: `crates/synapse-opctl/src/main.rs`
