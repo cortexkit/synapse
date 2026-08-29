@@ -13890,6 +13890,27 @@ mod tests {
     }
 
     #[test]
+    fn wire_contract_documents_every_stable_error_code() {
+        const CONTRACT: &str = include_str!("../../../docs/wire-contract-v1.md");
+
+        let undocumented_error_codes = synapse_core::StableErrorCode::ALL
+            .into_iter()
+            .filter_map(|error_code| {
+                let wire_code = serde_json::to_value(error_code)
+                    .expect("stable error code serializes")
+                    .as_str()
+                    .expect("stable error code serializes as a string")
+                    .to_owned();
+                (!CONTRACT.contains(&format!("`{wire_code}`"))).then_some(wire_code)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            undocumented_error_codes.is_empty(),
+            "wire contract is missing stable error codes: {undocumented_error_codes:?}"
+        );
+    }
+
+    #[test]
     fn sidecar_config_is_default_off() {
         assert!(!ModuleConfig::default().sidecar_spec.enabled);
     }

@@ -35,6 +35,35 @@ pub enum StableErrorCode {
     SentinelCalibrationRefused,
 }
 
+impl StableErrorCode {
+    /// Every stable error code in declaration order.
+    pub const ALL: [Self; 23] = [
+        Self::QueueFull,
+        Self::DeadlineExceeded,
+        Self::ModelLoading,
+        Self::NotCertified,
+        Self::SubstitutionRejected,
+        Self::ArtifactInvalid,
+        Self::OwnedCudaUnsupported,
+        Self::EngineCrashed,
+        Self::ProbeRequired,
+        Self::MigrationRequired,
+        Self::ModuleRestarted,
+        Self::InvalidRequest,
+        Self::DeclaredIdentityNotAccepted,
+        Self::RemoteIdentityDrift,
+        Self::ProviderUnavailable,
+        Self::ProviderProtocolViolation,
+        Self::IdempotencyConflict,
+        Self::NeedsReauth,
+        Self::NeedsReauthExpired,
+        Self::RemoteDeploymentChanged,
+        Self::CredentialConfigInvalid,
+        Self::OpNotSupportedForRemote,
+        Self::SentinelCalibrationRefused,
+    ];
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StableError {
     pub code: StableErrorCode,
@@ -270,6 +299,44 @@ impl StableError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stable_error_code_all_covers_every_variant() {
+        const VARIANT_COUNT: usize = 23;
+
+        // This match is intentionally exhaustive so enum additions update the
+        // enumeration and its expected cardinality together.
+        fn assert_exhaustive(error_code: StableErrorCode) {
+            match error_code {
+                StableErrorCode::QueueFull
+                | StableErrorCode::DeadlineExceeded
+                | StableErrorCode::ModelLoading
+                | StableErrorCode::NotCertified
+                | StableErrorCode::SubstitutionRejected
+                | StableErrorCode::ArtifactInvalid
+                | StableErrorCode::OwnedCudaUnsupported
+                | StableErrorCode::EngineCrashed
+                | StableErrorCode::ProbeRequired
+                | StableErrorCode::MigrationRequired
+                | StableErrorCode::ModuleRestarted
+                | StableErrorCode::InvalidRequest
+                | StableErrorCode::DeclaredIdentityNotAccepted
+                | StableErrorCode::RemoteIdentityDrift
+                | StableErrorCode::ProviderUnavailable
+                | StableErrorCode::ProviderProtocolViolation
+                | StableErrorCode::IdempotencyConflict
+                | StableErrorCode::NeedsReauth
+                | StableErrorCode::NeedsReauthExpired
+                | StableErrorCode::RemoteDeploymentChanged
+                | StableErrorCode::CredentialConfigInvalid
+                | StableErrorCode::OpNotSupportedForRemote
+                | StableErrorCode::SentinelCalibrationRefused => {}
+            }
+        }
+
+        assert_exhaustive(StableErrorCode::QueueFull);
+        assert_eq!(StableErrorCode::ALL.len(), VARIANT_COUNT);
+    }
 
     #[test]
     fn stable_error_contract_round_trips_through_json() {

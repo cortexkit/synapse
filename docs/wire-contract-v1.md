@@ -30,10 +30,35 @@ MC); on any disagreement, the e2e tests win and this doc gets fixed.
 ## Errors (stable codes, typed recovery)
 
 Every error: {code, class: transient|permanent, retry_after_ms?,
-safe_to_retry_same_request}. Codes: queue_full, deadline_exceeded,
-model_loading, not_certified, substitution_rejected, artifact_invalid,
-engine_crashed, probe_required, migration_required, module_restarted, grammar_disabled.
-Transient carries retry_after_ms. Never poll-hammer a permanent code.
+safe_to_retry_same_request}. Transient carries retry_after_ms. Never poll-hammer
+a permanent code.
+
+The `code` field uses two vocabularies. Core `StableErrorCode` supplies
+`queue_full`, `deadline_exceeded`, `model_loading`, `not_certified`,
+`substitution_rejected`, `artifact_invalid`, `engine_crashed`,
+`probe_required`, `migration_required`, and `module_restarted` here, plus the
+remote additions below. Owned-decode refusals use a separate vocabulary:
+`grammar_disabled` is not a `StableErrorCode`; it is emitted for constrained
+`microllm.oneshot` requests when grammar is disabled by module or approval
+configuration, or when no certified enabled owned-decode grammar lane is
+available.
+
+- `owned_cuda_unsupported` — class `permanent`. Emitted before an owned-CUDA
+  worker is created when capability gating finds no usable CUDA capability
+  evidence, a driver API below 12040, or compute capability below 7.5.
+  **Consumer disposition:** do not retry on the unchanged host; select a
+  non-CUDA lane or provide a compatible driver and device before retrying.
+- `op_not_supported_for_remote` — class `permanent`. Emitted when gateway v1
+  receives a remote request or calibration for a task it cannot serve, including
+  remote `rerank.score` and `microllm.oneshot` requests and non-embed remote
+  profiles. **Consumer disposition:** do not retry the same operation against
+  that remote profile; select a compatible local lane or supported remote embed
+  operation.
+- `sentinel_calibration_refused` — class `permanent`. Emitted when remote
+  sentinel calibration detects provider self-noise that prevents a trustworthy
+  drift gate from being derived. **Consumer disposition:** treat the profile as
+  uncertified; do not retry the same calibration, and start a new probe only
+  after correcting the provider or profile behavior.
 
 ## Common request fields (acceptance constraints)
 
