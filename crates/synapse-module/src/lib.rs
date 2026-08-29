@@ -13843,6 +13843,53 @@ mod tests {
     use super::*;
 
     #[test]
+    fn wire_contract_documents_every_management_operation() {
+        const CONTRACT: &str = include_str!("../../../docs/wire-contract-v1.md");
+        const NEWLY_DOCUMENTED_OPERATIONS: [&str; 16] = [
+            "owned_decode.admit_session",
+            "owned_decode.decode",
+            "owned_decode.snapshot",
+            "owned_decode.continue",
+            "owned_decode.abort",
+            "owned_decode.close",
+            "owned_decode.session_status",
+            "owned_decode.disable",
+            "owned_decode.revoke",
+            "model.unload",
+            "alias.declare",
+            "alias.retract",
+            "approvals.migrate_owned_decode",
+            "approvals.enable",
+            "approvals.disable",
+            "approvals.emergency_rollback",
+        ];
+
+        let operation_names = management_operations()
+            .into_iter()
+            .map(|operation| operation.name)
+            .collect::<BTreeSet<_>>();
+        let undocumented = operation_names
+            .iter()
+            .filter(|name| !CONTRACT.contains(&format!("`{name}`")))
+            .collect::<Vec<_>>();
+        assert!(
+            undocumented.is_empty(),
+            "wire contract is missing registered operations: {undocumented:?}"
+        );
+
+        for name in NEWLY_DOCUMENTED_OPERATIONS {
+            assert!(
+                operation_names.contains(name),
+                "coverage sentinel is no longer registered: {name}"
+            );
+            assert!(
+                CONTRACT.contains(&format!("`{name}`")),
+                "wire contract is missing newly documented operation: {name}"
+            );
+        }
+    }
+
+    #[test]
     fn sidecar_config_is_default_off() {
         assert!(!ModuleConfig::default().sidecar_spec.enabled);
     }

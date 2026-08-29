@@ -1,6 +1,6 @@
 # Synapse wire contract v1 (consumer snapshot)
 
-Status: SNAPSHOT of the additive v1.1 surface as of 2026-07-10.
+Status: SNAPSHOT of the additive v1.1 surface as of 2026-08-29.
 Authoritative examples: crates/synapse-module/tests/skeleton_e2e.rs and
 tests/soak.rs. This doc restates the contract for consumer integration (AFT,
 MC); on any disagreement, the e2e tests win and this doc gets fixed.
@@ -44,6 +44,17 @@ required_epoch, target_fingerprint (embed.query: route only to a matching or
 certified-equivalent profile, else substitution_rejected/not_certified).
 
 ## Ops
+
+The management registry in this snapshot is `embed.query`, `embed.batch`,
+`embed.result`, `job.resume`, `rerank.score`, `microllm.oneshot`,
+`owned_decode.admit_session`, `owned_decode.decode`, `owned_decode.snapshot`,
+`owned_decode.continue`, `owned_decode.abort`, `owned_decode.close`,
+`owned_decode.session_status`, `owned_decode.disable`, `owned_decode.revoke`,
+`model.load`, `model.status`, `model.unload`, `models.list`, `probe.start`,
+`probe.status`, `probe.report`, `aliases.check_index`, `alias.retract`,
+`alias.declare`, `cache.pin`, `cache.gc`, `admission.status`,
+`approvals.migrate_owned_decode`, `approvals.enable`, `approvals.disable`, and
+`approvals.emergency_rollback`.
 
 - **embed.query** {model, text, …constraints} — interactive class, the
   latency path. Full envelope incl. fingerprint/equivalent_to (one-comparison
@@ -147,6 +158,251 @@ latency.
 
 Sampling and all other non-greedy certification semantics are deliberately out
 of scope until sampling ships.
+
+### Owned-decode session operations (envelope v2)
+
+Every successful operation below has the management response envelope
+`{"result": <payload>}`. Malformed parameters are channel errors with
+`invalid_request`; the owned-decode domain refusals below instead use
+`{"result":{"module_generation": <u64>, "error": {"code", "class":
+"permanent", "safe_to_retry_same_request": false, "message"}}}`. The domain
+refusal list is exhaustive for the checks in these handlers; a worker dispatch
+can additionally return the normal owned-route errors described by its route.
+
+#### `owned_decode.admit_session`
+
+- Params: `{catalog_fingerprint, caller_id, context_ceiling_tokens,
+  generation: {mode: "greedy_top1"}, kv_configuration:
+  {block_size_tokens, recurrent_state_grain_tokens}}`. All fields are required
+  and unknown fields are rejected. The only accepted generation mode is
+  `greedy_top1`; KV block size is one of 256, 512, or 1024 tokens and the
+  recurrent-state grain must be nonzero.
+- Result payload: `{session_id, catalog_fingerprint, approval_generation,
+  reservation: {reserved_embed_rerank_bytes, reserved_artifact_weight_bytes,
+  reserved_session_kv_bytes, context_ceiling_tokens}}`.
+- Errors: `invalid_request`, `sampling_unsupported`, `artifact_unapproved`,
+  `artifact_disabled`, `artifact_revoked`, `artifact_mismatch`,
+  `unsupported_machine`, `invalid_context_ceiling`, `insufficient_memory`,
+  `incompatible_resident_artifact`, `invalid_kv_configuration`,
+  `owned_decode_unavailable`, and `store_failure`.
+- Semantics: admission reserves the certified artifact and session KV budget,
+  records the serving-session approval generation, and writes no session on a
+  refusal. A session can only be admitted against the requested catalog
+  fingerprint's current serving approval and matching certification.
+
+#### `owned_decode.decode`
+
+- Params: `{session_id, req_id, prompt, max_tokens, grammar?, deadline_ms?,
+  max_queue_ms?}`. All fields before `?` are required; `req_id` is nonempty and
+  `max_tokens` is positive. `grammar` is free text when absent or empty.
+- Result payload: `{session_id, req_id, frames: [FrameEnvelope...]}`. Each
+  frame is envelope-v2: `{protocol: "owned-decode-envelope-v2",
+  protocol_version: 2, req_id, session_id, stream_seq, kind, ...}`. `stream_seq`
+  starts at 1 and is monotonic. A progress frame has
+  `{kind: "progress", progress: {committed_token_ids: [u32...],
+  committed_token_count}}`; the IDs are newly committed, while the count is
+  cumulative. The terminal is `{kind: "final"|"error", terminal: {req_id,
+  session_id, committed_token_count, tokens_emitted, decode_fingerprint,
+  processing_fingerprint, runtime_config_digest, worker_generation,
+  derived_digest?, terminal_state, decode_mode, speculative_telemetry?}}`.
+  The session handler emits serial terminals; `speculative_telemetry` is absent.
+- Errors: `invalid_request`, `unknown_session`, `session_still_in_flight`,
+  `decode_scheduler_busy`, `request_cancelled`, `worker_protocol_error`,
+  `scheduler_boundary_error`, `store_failure`, `owned_decode_unavailable`, and
+  normal owned-route errors such as `grammar_disabled`, `queue_full`,
+  `deadline_exceeded`, `model_loading`, `artifact_invalid`, and
+  `engine_crashed`.
+- Semantics: the response carries every frame produced by this invocation. A
+  token becomes visible only after its scheduler and durable serving-session
+  boundary both commit. The terminal accounts for exactly that committed prefix;
+  an emergency revoke returns an `artifact_revoked` error terminal after the
+  last committed progress frame rather than retracting tokens.
+
+#### `owned_decode.snapshot`
+
+- Params: `{session_id, position_tokens}`; both fields are required and unknown
+  fields are rejected.
+- Result payload: `{session_id, retained_kv_session_id, retained_position,
+  reused_blocks}`.
+- Errors: `invalid_request`, `unknown_session`, `session_still_in_flight`,
+  `invalid_kv_configuration`, `invalid_kv_alignment`, `artifact_unapproved`,
+  `artifact_disabled`, `artifact_revoked`, `artifact_mismatch`,
+  `incompatible_resident_artifact`, `store_failure`, and
+  `owned_decode_unavailable`.
+- Semantics: snapshots are accepted only while the session is idle, at the LCM
+  boundary of its KV block size and recurrent-state grain. The retained state
+  is durable and belongs to that session and catalog fingerprint.
+
+#### `owned_decode.continue`
+
+- Params: `{session_id, retained_kv_session_id, req_id?}`; unknown fields are
+  rejected.
+- Result payload: `{session_id, retained_kv_session_id, retained_position,
+  reused_blocks}`.
+- Errors: `invalid_request`, `unknown_session`, `session_still_in_flight`,
+  `retained_kv_unavailable`, `artifact_unapproved`, `artifact_disabled`,
+  `artifact_revoked`, `artifact_mismatch`, `incompatible_resident_artifact`,
+  `store_failure`, and `owned_decode_unavailable`.
+- Semantics: continuation is only for the matching session's retained state at
+  an idle boundary. When `req_id` is supplied, its retained stream prefix must
+  match the snapshot position, so continuation neither replays nor skips an
+  already committed token.
+
+#### `owned_decode.abort`
+
+- Params: `{session_id, req_id, retain_kv}`; all fields are required and
+  unknown fields are rejected.
+- Result payload: `{session_id, req_id, abort: "requested", disposition:
+  "removed_queued"|"deferred_to_boundary"}`.
+- Errors: `invalid_request`, `unknown_session`, `session_still_in_flight`, and
+  `owned_decode_unavailable`.
+- Semantics: abort is an acknowledgement, not a terminal. The active decode
+  observes it at its next committed boundary. If retained, its decode result
+  carries `cancelled: {req_id, generation_id, committed_token_count}` beside
+  the final error frame; status recovery uses that same committed count.
+
+#### `owned_decode.close`
+
+- Params: `{session_id}`; unknown fields are rejected.
+- Result payload: `{session_id, closed: true, unload_artifact}`.
+- Errors: `invalid_request`, `unknown_session`, `session_still_in_flight`,
+  `routing_error`, `store_failure`, and `owned_decode_unavailable`.
+- Semantics: close is idempotent after a successful close, but cannot close an
+  active decode. It completes durable serving state and may release the
+  artifact only when no active sessions still require it.
+
+#### `owned_decode.session_status`
+
+- Params: `{session_id, req_id}`; both fields are required and unknown fields
+  are rejected.
+- Result payload: `{session_id, req_id, committed_token_count, state,
+  retained_kv_session_id?}`. `state` is either `"in_flight"` or
+  `{state: "terminal", terminal_state: "completed"|"aborted"|
+  "artifact_disabled"|"artifact_revoked"|"failed"}`.
+- Errors: `invalid_request`, `unknown_session`, `unknown_request`, and
+  `owned_decode_unavailable`.
+- Semantics: use this result after a lost or gapped envelope-v2 frame. It is
+  authoritative for the monotonic committed-token count and never revises
+  history already committed by a progress frame.
+
+#### `owned_decode.disable`
+
+- Params: `{catalog_fingerprint, reason}`; both fields are required and
+  unknown fields are rejected.
+- Result payload: `{approval: {schema_revision, catalog_fingerprint,
+  certification_record_id, artifact_id, state: "disabled"|"revoked",
+  reason, approved_by, approved_at_ms, updated_at_ms, generation,
+  semantic_digest}, invalidated_retained_states, active_sessions,
+  termination_requested_sessions, unload_artifact}`.
+- Errors: `invalid_request` and `store_failure`.
+- Semantics: disable fences new session admissions and invalidates retained KV
+  states for that catalog fingerprint, but lets an already active decode finish
+  normally. A previously revoked serving approval remains revoked.
+
+#### `owned_decode.revoke`
+
+- Params: `{catalog_fingerprint, reason}`; both fields are required and
+  unknown fields are rejected.
+- Result payload: the same `ServingControlOutcome` shape as
+  `owned_decode.disable`, with `approval.state: "revoked"`.
+- Errors: `invalid_request` and `store_failure`.
+- Semantics: revoke fences new admissions, invalidates retained state, and
+  marks active sessions for `artifact_revoked` terminal accounting at their
+  next committed boundary. It also requests the in-memory scheduler revoke and
+  can unload the artifact when no active session remains.
+
+### Model and alias mutations
+
+#### `model.unload`
+
+- Params: `{model_id}`. `model_id` is required; this handler does not reject
+  additional fields.
+- Result payload: `{module_generation, model_id, fingerprint, state:
+  "unloaded", engine, task}`.
+- Errors: `invalid_request`, `model_loading`, and `engine_crashed`.
+- Semantics: unloading a ready model removes its loaded engine and owned-decode
+  dispatch cache, but keeps the catalog model registered and its cached artifact
+  available for later lazy reload.
+
+#### `alias.declare`
+
+- Params: `{left, right, evidence?}`; `fingerprint_a` and `fingerprint_b` are
+  accepted aliases for `left` and `right`. Both fingerprints must be nonempty;
+  omitted `evidence` becomes `{}`. This handler does not reject additional
+  fields.
+- Result payload: `{module_generation, changed, table_epoch}`.
+- Errors: `substitution_rejected`, `invalid_request`, and `store_failure`.
+- Semantics: alias administration must be enabled in module configuration.
+  Declaring an already-live pair is idempotent (`changed: false`) and preserves
+  its epoch; a new live pair records the evidence and advances `table_epoch`.
+
+#### `alias.retract`
+
+- Params: the same shape as `alias.declare`.
+- Result payload: `{module_generation, changed, table_epoch}`.
+- Errors: `substitution_rejected`, `invalid_request`, and `store_failure`.
+- Semantics: retracting a live pair records its end time and evidence, then
+  advances `table_epoch`; retracting a pair that is not live is idempotent and
+  leaves the epoch unchanged. Retraction affects future alias reads only, not
+  vectors or job pages already produced under the pair.
+
+### Owned-decode approval administration
+
+Approval rows are identified by the pair `(model_id, decode_fingerprint)`, not
+by model ID alone. The approval mutation path is a fenced store transaction:
+each changed identity receives a monotonic `generation`, and migration compares
+its single pinned seed marker before writing (the store epoch/CAS boundary).
+These wire operations do not accept a caller-supplied expected epoch. The
+server recomputes the row's semantic digest in the same transaction.
+
+#### `approvals.migrate_owned_decode`
+
+- Params: `{seed_revision, schema_revision}`; both fields are required and
+  unknown fields are rejected.
+- Result payload: `{outcome, seed_revision, rows, marker, rendering}`. Outcomes
+  include `applied`, `already_applied`, `invalid_seed`, `unmappable_identity`,
+  `duplicate_identity`, and `transaction_failed`; non-applied outcomes leave
+  approval rows and the migration marker unchanged.
+- Errors: `invalid_request`, `approval_migration_state_corrupt`, and
+  `store_failure`.
+- Semantics: the one-shot migration validates the pinned seed, resolves every
+  seed identity to exactly one eligible catalog model, compares its marker under
+  the fence, then writes all approval rows and the marker atomically.
+
+#### `approvals.enable`
+
+- Params: `{model_id, decode_fingerprint, grammar_enabled}`; all fields are
+  required and unknown fields are rejected.
+- Result payload: `{model_id, decode_fingerprint, enabled, grammar_enabled,
+  approved_by, approved_at_ms, semantic_digest, generation}`.
+- Errors: `invalid_request`, `operator_identity_unavailable`, and
+  `store_failure`.
+- Semantics: an authenticated operator identity supplies `approved_by`. Enable
+  creates or re-enables exactly the requested identity; a new row starts at
+  generation 0 and a re-enable increments its generation. The model ID must
+  resolve to exactly one owned-metal-decode generate catalog entry.
+
+#### `approvals.disable`
+
+- Params: `{model_id, decode_fingerprint, reason}`; all fields are required and
+  unknown fields are rejected.
+- Result payload: `{model_id, decode_fingerprint, enabled: false,
+  disabled_reason}`.
+- Errors: `invalid_request` and `store_failure`.
+- Semantics: disable changes exactly one approval identity. The reason must be
+  nonempty; disabling a missing identity or a storage validation failure is
+  reported as `store_failure` by this handler.
+
+#### `approvals.emergency_rollback`
+
+- Params: `{reason}`; `reason` is required and unknown fields are rejected.
+- Result payload: `{disabled, reason}`.
+- Errors: `invalid_request` and `store_failure`.
+- Semantics: the reason must be nonempty. One fenced transaction disables every
+  owned-decode approval identity across the approval lanes, writes that reason,
+  recomputes each changed row digest, and increments each changed row generation.
+  This approvals-table rollback does not itself invoke `owned_decode.revoke` or
+  terminate already active serving sessions.
 
 ## Divergence detector (content_sha256)
 
@@ -294,6 +550,13 @@ enters the pause path for jobs and returns inline `needs_reauth` for inline
 operations.
 
 ## Changelog
+
+### 2026-08-29: complete management-operation coverage
+
+Added the owned-decode session controls, owned-decode approval administration,
+`model.unload`, and alias declaration/retraction operations. The snapshot now
+records their parameter and result shapes, refusal codes, durable identity and
+fencing semantics, and envelope-v2 decode frames.
 
 ### Grammar refusal retirement
 
