@@ -8664,7 +8664,7 @@ mod tests {
                         );
                         store.store
                     }
-                    10 | 11 | 12 => store,
+                    10..=12 => store,
                     _ => panic!("no fixture rows for migration {version}"),
                 }
             };
