@@ -7,9 +7,12 @@ This workspace contains the Synapse SubC module, supervised inference workers, a
 Production crates live under `crates/`:
 
 - `synapse-core`: shared protocol, error, cache, fingerprint, scheduler, and tokenizer types.
-- `synapse-engine-ort`: in-process ONNX Runtime embedding engine.
- - `synapse-module`: SubC management surface, model cache, durable jobs, and worker host. Builds the `ck-synapse` binary (fleet `ck-*` naming convention for Activity Monitor grouping; `module_id` stays `synapse`).
- - `synapse-worker-llama`, `synapse-worker-mlx`, `synapse-worker-ane`: supervised worker binaries (`ck-synapse-worker-*`) that speak the Synapse worker protocol over Unix sockets (named pipes on Windows).
+- `synapse-engine-owned`: primary in-process Metal/MPSGraph engine for Apple Silicon (embedding, reranking, direct Metal step decode), with the supervised decode worker state machine in its `synapse-engine-owned/owned-decode-worker` subcrate.
+- `synapse-engine-cuda`: primary in-process CUDA engine (`owned-cuda-v1`, PTX kernel ports, f16 storage).
+- `synapse-engine-ort`: in-process ONNX Runtime embedding engine (universal CPU floor).
+- `synapse-module`: SubC management surface, model cache, durable jobs, and worker host. Builds the `ck-synapse` binary (fleet `ck-*` naming convention for Activity Monitor grouping; `module_id` stays `synapse`).
+- `synapse-opctl`: operator CLI (`ck-synapse-opctl`) for catalog, probes, admission stats, approvals, and paged results over the fleet daemon.
+- `synapse-worker-llama`, `synapse-worker-mlx`, `synapse-worker-ane`, `synapse-worker-cuda`, `synapse-worker-decode`: supervised worker binaries (`ck-synapse-worker-*`) that speak the Synapse worker protocol over Unix sockets (named pipes on Windows).
 
 ### MLX / Metal build requirement
 
