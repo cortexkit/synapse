@@ -12698,28 +12698,6 @@ fn owned_measurement_report_row(row: OwnedDecodeCertificationRow) -> Certificati
     }
 }
 
-fn owned_decode_lane_admitted(state: &ModuleState, model: &EmbeddingModel) -> bool {
-    if model.engine_identity.engine != DECODE_WORKER_ENGINE {
-        return false;
-    }
-    owned_decode_probe_match_inputs(
-        state,
-        model,
-        state.revisioned_machine_profile_hash.clone(),
-        state.profile_activation_epoch,
-        Vec::new(),
-    )
-    .ok()
-    .and_then(|inputs| {
-        state
-            .store
-            .owned_decode_admission_matching(&inputs)
-            .ok()
-            .flatten()
-    })
-    .is_some()
-}
-
 fn lane_measurement_rows(
     state: &ModuleState,
     model_id: &str,
@@ -13015,10 +12993,6 @@ async fn probe_report(state: Arc<ModuleState>) -> HandlerOutcome {
                     .and_then(|entry| entry.decode_identity_inputs().decode_fingerprint().ok())
             })
             .unwrap_or_else(|| slot.spec.fingerprint.clone());
-        let owned_admitted = slot
-            .loaded
-            .as_ref()
-            .is_some_and(|model| owned_decode_lane_admitted(&state, model));
         let measurements = lane_measurement_rows(
             &state,
             &slot.spec.model_id,
