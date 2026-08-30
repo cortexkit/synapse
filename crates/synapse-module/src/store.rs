@@ -8328,6 +8328,36 @@ mod tests {
     }
 
     #[test]
+    fn newest_schema_version_is_the_highest_migration_this_binary_carries() {
+        // Asserts the PROPERTY the derivation must satisfy, not the derivation
+        // itself. Restating `MIGRATIONS.iter().map(..).max()` here would make
+        // this agree with the code by construction and pass whatever the
+        // function did; the manifest-side check can only see shape, so a
+        // regressed derivation that still returns a positive number is
+        // invisible there. These two bounds pin it from both sides: `.min()`
+        // or a hardcoded low literal breaks the first, and a literal above the
+        // list breaks the second.
+        //
+        // `.last()` is NOT caught while the list stays sorted, because it then
+        // returns the same value as `.max()` -- an equivalent mutant, not a
+        // gap. It becomes a real regression only once the list is unsorted,
+        // and the first bound catches it exactly then.
+        let newest = newest_schema_version();
+        assert!(
+            MIGRATIONS
+                .iter()
+                .all(|migration| migration.version <= newest),
+            "newest_schema_version() reported {newest}, which is below a migration this binary carries"
+        );
+        assert!(
+            MIGRATIONS
+                .iter()
+                .any(|migration| migration.version == newest),
+            "newest_schema_version() reported {newest}, which is not a migration this binary carries"
+        );
+    }
+
+    #[test]
     fn schema_trigger_set_is_exactly_the_known_guards() {
         // The migration fence above can only exercise guards that exist when it
         // runs. Rows announce themselves (fixtures start failing without them);
