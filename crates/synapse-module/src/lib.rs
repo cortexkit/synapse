@@ -12833,33 +12833,32 @@ fn lane_certification_status(
     }
 }
 
+/// Projects approval + certification state into the lane summary's
+/// `serving_admission` field.
+///
+/// Deliberately independent of worker residency: decode workers spawn lazily,
+/// so "is a worker currently loaded" is a liveness fact (already visible in
+/// the summary's worker block), not an admission fact. Folding it in here made
+/// enabled-and-certified lanes render "disabled" after every restart until
+/// their first request arrived - the same conflation this projection exists to
+/// remove, in the opposite direction.
 fn serving_admission_projection(
     owned_decode_lane: bool,
-    owned_admitted: bool,
     evidence_certified: bool,
     approval: Option<(bool, Option<String>)>,
 ) -> (Option<&'static str>, Option<String>) {
     if !owned_decode_lane {
         return (None, None);
     }
-    if owned_admitted && approval.as_ref().is_some_and(|(enabled, _)| *enabled) {
-        return (Some("enabled"), None);
-    }
-    let reason = match approval {
-        Some((false, disabled_reason)) => {
-            disabled_reason.or_else(|| Some("approval_disabled".to_string()))
-        }
-        Some((true, _)) => Some(
-            if evidence_certified {
-                "admission_rejected"
-            } else {
-                "not_certified"
-            }
-            .to_string(),
+    match approval {
+        Some((true, _)) if evidence_certified => (Some("enabled"), None),
+        Some((true, _)) => (Some("disabled"), Some("not_certified".to_string())),
+        Some((false, disabled_reason)) => (
+            Some("disabled"),
+            disabled_reason.or_else(|| Some("approval_disabled".to_string())),
         ),
-        None => Some("approval_absent".to_string()),
-    };
-    (Some("disabled"), reason)
+        None => (Some("disabled"), Some("approval_absent".to_string())),
+    }
 }
 
 fn worker_health_from_slot(slot: &ModelSlotSnapshot) -> Option<worker_host::WorkerHostHealth> {
@@ -13059,7 +13058,6 @@ async fn probe_report(state: Arc<ModuleState>) -> HandlerOutcome {
                 {
                     Ok(approval) => serving_admission_projection(
                         true,
-                        owned_admitted,
                         measurements.current_certification.is_some(),
                         approval.map(|approval| (approval.enabled, approval.disabled_reason)),
                     ),
@@ -13906,7 +13904,6 @@ mod tests {
     fn probe_report_separates_certification_from_serving_admission() {
         let (serving_admission, serving_admission_reason) = serving_admission_projection(
             true,
-            false,
             true,
             Some((false, Some("held for operator review".to_string()))),
         );
@@ -13923,7 +13920,7 @@ mod tests {
         );
 
         let (serving_admission, serving_admission_reason) =
-            serving_admission_projection(true, false, false, Some((true, None)));
+            serving_admission_projection(true, false, Some((true, None)));
         let uncertified_lane = json!({
             "certification_status": lane_certification_status(true, false),
             "serving_admission": serving_admission,
@@ -13932,12 +13929,15 @@ mod tests {
         assert_eq!(uncertified_lane["certification_status"], "uncertified");
 
         let (serving_admission, serving_admission_reason) =
-            serving_admission_projection(true, true, true, Some((true, None)));
+            serving_admission_projection(true, true, Some((true, None)));
         let enabled_lane = json!({
             "certification_status": lane_certification_status(true, true),
             "serving_admission": serving_admission,
             "serving_admission_reason": serving_admission_reason,
         });
+        // Residency is no longer an input by construction: enabled-and-certified
+        // renders enabled whether or not a worker has spawned yet (the shape every
+        // decode lane is in right after a restart).
         assert_eq!(enabled_lane["certification_status"], "certified");
         assert_eq!(enabled_lane["serving_admission"], "enabled");
     }
