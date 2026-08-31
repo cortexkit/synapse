@@ -73,8 +73,8 @@
 
 **crates/synapse-core/:**
 - Purpose: Defines shared abstractions for engines, worker protocol, caching, machine capability profiles, and scheduling.
-- Contains: Envelopes, machine profile structs, engine traits, error contracts, shared canonical worker HELLO handshake identities (`worker_engine_names.rs`), and request-scoped sidecar specification contracts (`sidecar_spec.rs`).
-- Key files: `crates/synapse-core/src/worker_protocol.rs`, `crates/synapse-core/src/scheduler.rs`, `crates/synapse-core/src/machine_profile.rs`, `crates/synapse-core/src/worker_engine_names.rs`
+- Contains: Envelopes, machine profile structs, engine traits, error contracts with exhaustive stable error codes (`StableErrorCode::ALL` in `error_contract.rs`), shared canonical worker HELLO handshake identities (`worker_engine_names.rs`), and request-scoped sidecar specification contracts (`sidecar_spec.rs`).
+- Key files: `crates/synapse-core/src/worker_protocol.rs`, `crates/synapse-core/src/scheduler.rs`, `crates/synapse-core/src/machine_profile.rs`, `crates/synapse-core/src/worker_engine_names.rs`, `crates/synapse-core/src/error_contract.rs`
 
 **crates/synapse-engine-cuda/:**
 - Purpose: Primary in-process CUDA execution engine (`owned-cuda-v1`), hosting PTX kernel ports for MiniLM, ModernBERT, and Qwen3 embedding models.
@@ -87,9 +87,9 @@
 - Key files: `crates/synapse-engine-owned/src/lib.rs`, `crates/synapse-engine-owned/owned-decode-engine/src/lib.rs`, `crates/synapse-engine-owned/owned-decode-worker/src/lib.rs`
 
 **crates/synapse-module/:**
-- Purpose: The primary SubC service module. Handles the content-addressed model cache, durable jobs, worker hosting (offloading worker drop teardown to dedicated threads), remote provider dispatch, owned decode routing, grammar compilation, approval storage and identity-based rollback (`rollback.rs`), owned CUDA evidence and declared identities, and route binding.
+- Purpose: The primary SubC service module. Handles the content-addressed model cache, durable jobs, worker hosting (offloading worker drop teardown to dedicated threads), remote provider dispatch (with class-based vault error disposition), owned decode routing, grammar compilation, approval storage and identity-based rollback (`rollback.rs`), probe certification and persistent staleness tracking (`certification_stale_since_ms`), admission telemetry counters, owned CUDA evidence and declared identities, and route binding.
 - Contains: SQLite store initialization, SubC `ModuleHandler` implementation, UNIX socket / Windows pipe worker spawning, remote gateway client, owned decode routing (`owned-decode-routing`), grammar compilation and DECODE scheduler (`owned-decode-grammar-scheduler`), certification gates and probes (`owned-decode-certification`), approval rollback (`rollback.rs`), contract manifests (`owned-decode-manifests`), and request-scoped semantic-sidecar hint bank normalization and per-field slotting (`owned-decode-sidecar`).
-- Key files: `crates/synapse-module/src/lib.rs`, `crates/synapse-module/src/worker_host/mod.rs`, `crates/synapse-module/src/rollback.rs`, `crates/synapse-module/owned-decode-routing/mod.rs`, `crates/synapse-module/owned-decode-grammar-scheduler/mod.rs`
+- Key files: `crates/synapse-module/src/lib.rs`, `crates/synapse-module/src/worker_host/mod.rs`, `crates/synapse-module/src/rollback.rs`, `crates/synapse-module/src/remote/vault.rs`, `crates/synapse-module/owned-decode-routing/mod.rs`, `crates/synapse-module/owned-decode-grammar-scheduler/mod.rs`
 
 **crates/synapse-opctl/:**
 - Purpose: Command-line operator control surface driving SubC commands.
@@ -230,10 +230,12 @@
 
 **Core Logic:**
 - `crates/synapse-core/src/worker_engine_names.rs`: Shared canonical worker HELLO handshake identity definitions (`LLAMA_WORKER_ENGINE`, `DECODE_WORKER_ENGINE`, `CUDA_WORKER_ENGINE`, etc.).
+- `crates/synapse-core/src/error_contract.rs`: Exhaustive `StableErrorCode` enumeration (`StableErrorCode::ALL`), typed transient/permanent classification, and error conversion mappings.
 - `crates/synapse-core/src/sidecar_spec.rs`: Request-scoped semantic sidecar contracts (`SidecarSpec`, `SidecarHintBank`, `SidecarOutcome`, `SidecarBankEffect`, `SpanClass`).
 - `crates/synapse-module/owned-decode-sidecar/mod.rs`: Request-scoped semantic-sidecar result normalization, hint bank compilation, rendering policies, and per-field plan slotting.
 - `crates/synapse-module/src/rollback.rs`: Exact `(model_id, decode_fingerprint)` approval disablement and single-transaction emergency rollback routines.
 - `crates/synapse-module/src/remote/runtime.rs`: Provider pool routing, circuit breaker enforcement, and telemetry collection for external model execution.
+- `crates/synapse-module/src/remote/vault.rs`: Vault credential retrieval via SubC `claustrum` route with class-based error disposition (`transient`, `auth_required`, `permanent`, `context_overflow`).
 - `crates/synapse-engine-cuda/src/lib.rs`: Production owned CUDA embed engine, model family detection, and PTX build identity.
 - `crates/synapse-worker-cuda/src/main.rs`: Supervised CUDA worker IPC framing loop.
 - `crates/synapse-engine-owned/owned-decode-engine/src/lib.rs`: Production owned Metal decode engine implementations (Qwen3, LFM2).
@@ -243,7 +245,7 @@
 - `crates/synapse-module/owned-decode-routing/ane_prefill.rs`: ANE prefill split routing (`AnePrefillRouter`), fixed-window bucket selection (`W128`, `W256`, `W512`), attempt timing budgets, consecutive-strike health (`SplitArmHealth`), and closed bypass (`PrefillBypassReason`) and fallback (`PrefillFallbackReason`) provenance.
 - `crates/synapse-worker-decode/src/runner.rs`: Supervised Metal decode worker runner and IPC protocol loop.
 - `crates/synapse-module/src/worker_host/mod.rs`: Spawns and manages worker lifecycles over Unix domain sockets or Windows named pipes using a binary framing protocol.
-- `crates/synapse-module/src/store.rs`: SQLite-backed state for content-addressed model cache, durable jobs, active attempts, and performance tier capabilities.
+- `crates/synapse-module/src/store.rs`: SQLite-backed state for content-addressed model cache, durable jobs, active attempts, profile activation epochs, and persistent `certification_stale_since_ms` tracking.
 - `crates/synapse-core/src/scheduler.rs`: 3-class fair-share aging scheduler for managing concurrent inference requests.
 - `crates/synapse-core/src/machine_profile.rs`: Defines `MachineProfile` hardware identity structures and static `ane_subtype` chip mapping.
 - `bench/harness/src/metrics.rs`: Macmon power metrics execution, parsing, and system idle gating.

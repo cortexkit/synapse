@@ -17,15 +17,15 @@
 ## Layers
 
 **Synapse SubC Module (`synapse-module`):**
-- Purpose: The main service listening on the SubC bus. Handles route binding, job admission, the model cache, remote provider dispatch, worker lifecycle supervision (offloading worker engine drops to dedicated threads), approval storage and identity-based rollback (`rollback.rs`), runtime admission probe health, storage epochs and rotation ledgers, owned CUDA evidence and declared identities, and in-process execution via the owned engine.
+- Purpose: The main service listening on the SubC bus. Handles route binding, job admission, the model cache, remote provider dispatch, worker lifecycle supervision (offloading worker engine drops to dedicated threads), approval storage and identity-based rollback (`rollback.rs`), runtime admission probe health, certification metric publishing and persistent staleness tracking (`certification_stale_since_ms`), storage epochs and rotation ledgers, owned CUDA evidence and declared identities, and in-process execution via the owned engine.
 - Location: `crates/synapse-module`
-- Contains: A 3-class aging scheduler, SQLite durable job and cache lease state, machine probe certification logic, socket/pipe-based worker host, the remote gateway client, module-side routing (`owned-decode-routing` including ANE split prefill routing `owned-decode-routing/ane_prefill.rs`), grammar compilation and DECODE scheduler (`owned-decode-grammar-scheduler`), certification gates and probes (`owned-decode-certification`), approval rollback (`rollback.rs`), contract manifests (`owned-decode-manifests`), request-scoped semantic-sidecar hint bank normalization and per-field slotting (`owned-decode-sidecar`), and direct bindings to `synapse-engine-owned` and `synapse-engine-cuda`.
+- Contains: A 3-class aging scheduler, SQLite durable job and cache lease state, machine probe certification logic and separate serving admission gates, admission telemetry counters (`refusals`, `jobs_minted`), socket/pipe-based worker host, the remote gateway client, module-side routing (`crates/synapse-module/owned-decode-routing` including ANE split prefill routing `crates/synapse-module/owned-decode-routing/ane_prefill.rs`), grammar compilation and DECODE scheduler (`crates/synapse-module/owned-decode-grammar-scheduler`), certification gates and probes (`crates/synapse-module/owned-decode-certification`), approval rollback (`rollback.rs`), contract manifests (`crates/synapse-module/owned-decode-manifests`), request-scoped semantic-sidecar hint bank normalization and per-field slotting (`crates/synapse-module/owned-decode-sidecar`), and direct bindings to `synapse-engine-owned` and `synapse-engine-cuda`.
 - Depends on: `synapse-core`, `synapse-engine-owned`, `synapse-engine-cuda`, `subc-client-rs`, `rusqlite`, `tokio`.
 
 **Remote Gateway (`crates/synapse-module/src/remote`):**
-- Purpose: Executes remote provider dispatch through interactive-first turnover pools, circuit breakers, and loopback-verified clients.
+- Purpose: Executes remote provider dispatch through interactive-first turnover pools, circuit breakers, loopback-verified clients, and class-aware vault credential disposition.
 - Location: `crates/synapse-module/src/remote`
-- Contains: `ProviderRuntime`, client dispatch, vault credential management via the `claustrum` SubC route, HTTP validators, mock provider e2e, and checkpoint-driven continuity logic.
+- Contains: `ProviderRuntime`, client dispatch, vault credential management via the `claustrum` SubC route (classifying errors by class `transient`/`auth_required`/`permanent`/`context_overflow`), HTTP validators, mock provider e2e, and checkpoint-driven continuity logic.
 - Depends on: `synapse-core`, `subc-client-rs`, `reqwest`.
 
 **Synapse Owned Engine (`synapse-engine-owned`):**
@@ -52,7 +52,7 @@
 **Synapse Core Abstractions (`synapse-core`):**
 - Purpose: Core vocabulary structs, engine traits, machine capability profiles, and error contracts shared between the host and its workers.
 - Location: `crates/synapse-core`
-- Contains: `WorkerHello` handshake with strict catalog engine identity validation, shared canonical HELLO engine identities (`worker_engine_names.rs`), binary framing logic, `EngineError` contract, `MachineProfile` with `ane_subtype` chip-identity mapping, `RuntimeConfig`, `TokenBatch`, per-request decode chain policy, request-scoped sidecar specification contracts (`sidecar_spec.rs`), and scheduling traits.
+- Contains: `WorkerHello` handshake with strict catalog engine identity validation, shared canonical HELLO engine identities (`worker_engine_names.rs`), binary framing logic, `EngineError` and exhaustive stable error code contracts (`StableErrorCode::ALL` with typed transient/permanent classifications in `crates/synapse-core/src/error_contract.rs`), `MachineProfile` with `ane_subtype` chip-identity mapping, `RuntimeConfig`, `TokenBatch`, per-request decode chain policy, request-scoped sidecar specification contracts (`crates/synapse-core/src/sidecar_spec.rs`), and scheduling traits.
 
 **Benchmark Harness Core:**
 - Purpose: Provides CLI commands for corpus generation, power-monitored process wrapping, result schema definition, and numerical parity functions.
@@ -130,13 +130,13 @@
 
 **Production Inference Flow:**
 
-1. Initialize layered configuration from `SYNAPSE_CONFIG_PATH` (`synapse.jsonc`), rejecting unknown fields and applying `microllm` ceilings — `crates/synapse-module/src/remote/config.rs`
+1. Initialize layered configuration from `SYNAPSE_CONFIG_PATH` or `~/.config/cortexkit/synapse.jsonc` (merging `.cortexkit/synapse.jsonc`), rejecting unknown fields and applying `microllm` ceilings — `crates/synapse-module/src/remote/config.rs`
 2. Route request received via SubC — `crates/synapse-module/src/lib.rs`
 3. Validate alias surfaces, apply machine capability profiles with `ane_subtype` chip identity (Perf/Quiet tiers), verify microLLM certifications (refusing execution on uncertified fingerprints), or map user-tier `remote_providers` profiles — `crates/synapse-module/src/store.rs`
-4. Admit job to the DB (checking active attempt ID CAS, request-digest idempotency, and page counts of existing results to resume from checkpoints) — `crates/synapse-module/src/store.rs`
+4. Admit job to the DB (checking active attempt ID CAS, request-digest idempotency, and page counts of existing results to resume from checkpoints), recording admission telemetry (`jobs_minted` on admission, `refusals` with stable reason codes on rejection) — `crates/synapse-module/src/lib.rs` / `crates/synapse-module/src/store.rs`
 5. Dispatch based on route:
    - **Local:** Download/Verify models through content-addressed cache with shared leases and 24-hour age-floored temporary blob cleanup, admit to 3-class Aging Scheduler, spawn/handshake Worker lane (UNIX sockets / Windows pipes), submit binary frames.
-   - **Remote:** Forward through `ProviderRuntime` pools, passing circuit breakers and p90 estimators, fetching credentials via vault trait, executing strict loopback-validated HTTP calls, and serializing `recommended_batch` policies in model listings — `crates/synapse-module/src/remote/runtime.rs`
+   - **Remote:** Forward through `ProviderRuntime` pools, passing circuit breakers and p90 estimators, fetching credentials via vault client with class-based error disposition (`transient`/`auth_required` pausing jobs, `permanent`/`context_overflow` rejecting with `credential_config_invalid`), executing strict loopback-validated HTTP calls, and serializing `recommended_batch` policies in model listings — `crates/synapse-module/src/remote/runtime.rs`
 6. Commit checkpointed pages sequentially according to byte size limits (`result_page_bytes`) as the job runs (allowing page-while-running for snapshots and continuity hooks), mark job complete (applying execution/retention TTL split), and return envelope. If the client queries a job, they can follow pages via `page` parameters — `crates/synapse-module/src/store.rs`
 
 **Constrained Decoding Flow:**
@@ -311,9 +311,19 @@
 - Pattern: Concurrency Semaphore with observable stats wrapper.
 
 **Certification Status and Demotion:**
-- Purpose: Track local hardware engine capability status, storing whether a measured fingerprint is `certified` or `uncertified`.
-- Location: `crates/synapse-module/src/store.rs`
-- Pattern: SQLite-backed schema with automatic demotion upon failed re-certification.
+- Purpose: Track local hardware engine capability status, storing whether a measured fingerprint is `certified` or `uncertified`, persisting first-staleness timestamp `certification_stale_since_ms` in `profile_state`, and publishing lane certification status in health reports without triggering inline probes.
+- Location: `crates/synapse-module/src/store.rs`, `crates/synapse-module/src/lib.rs`
+- Pattern: SQLite-backed schema with automatic demotion upon failed re-certification and non-probing health metric projection.
+
+**Admission Telemetry & Decoupled Serving Gates:**
+- Purpose: Separates probe certification (`certified`, `uncertified`, `not_required`) from approval-backed serving admission (`serving_admission`: `enabled`, `disabled`), tracking runtime admission telemetry (`jobs_minted`, `refusals` counts and timestamps).
+- Location: `crates/synapse-module/src/lib.rs`
+- Pattern: In-memory atomic telemetry aggregation and decoupled admission gate evaluation.
+
+**Stable Error Contract:**
+- Purpose: Exhaustive stable error code taxonomy (`StableErrorCode::ALL`) providing typed classifications (`transient` with `retry_after_ms` vs `permanent` without blind retry), error mapping for host, owned-CUDA, remote gateway, and vault boundaries.
+- Location: `crates/synapse-core/src/error_contract.rs`
+- Pattern: Exhaustive enum taxonomy with stable error codes and typed recovery guidance.
 
 **Machine Profile:**
 - Purpose: Capture machine hardware and engine runtime identities (OS build, arch, chip model, RAM class, `ane_subtype` chip mapping, sorted engine identities) into a stable hash for fingerprinting and certification.
@@ -441,11 +451,11 @@
 
 ## Error Handling
 
-**Strategy:** Fail-fast utilizing `anyhow::Result` and typed subsystem errors (`SubcModuleError`, `EngineError`) with contextual layers.
+**Strategy:** Fail-fast utilizing `anyhow::Result` and typed subsystem errors (`SubcModuleError`, `EngineError`, `StableError`) with contextual layers.
 - **Worker Crash Domain:** If a worker binary crashes, deadlocks, or hangs, the `synapse-module` supervisor reclaims the job. Workers isolate dirty driver states, preventing host process termination. Host worker engine teardown runs on a dedicated thread off the runtime-driving threads to prevent async runtime panics on drop.
-- **Gateway Continuity:** The remote gateway tracks `ContinuityCheck` hooks for checkpointed streams, catching upstream disconnects or token censorship, while maintaining stable HTTP error unions.
+- **Gateway & Vault Continuity:** The remote gateway tracks `ContinuityCheck` hooks for checkpointed streams, catching upstream disconnects or token censorship. Vault credential failures are classified by error class (`transient`/`auth_required` pause jobs for retries, while `permanent`/`context_overflow` reject with `credential_config_invalid`), maintaining a stable error taxonomy.
 - **Durable Job Resiliency:** Jobs track their generation cycles. Crash-interrupted requests can be recovered via idempotent request-digest keys if the host restarts.
-- **SubC Communication:** Submodule failures strictly return properly formatted error envelopes detailing the specific layer failure (e.g., CacheMiss, EngineOOM).
+- **SubC Communication:** Submodule failures strictly return properly formatted error envelopes detailing the specific layer failure (e.g., CacheMiss, EngineOOM, NotCertified).
 
 **Bench Harness Strategy:** Fail-fast utilizing `anyhow::Result` error propagation with contextual layers (`.context()`).
 - **Child Supervision:** Spawned subprocesses (`llama-server`) are tracked via PID. If a child dies or fails to bind to its designated port within `HEALTH_TIMEOUT` (120s), the lane runner fails immediately rather than silently hanging. Platform-specific process control signals (such as SIGTERM on Unix) are gated appropriately so subprocess lifecycles function seamlessly on both Windows and Unix platforms.
