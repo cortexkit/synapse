@@ -168,6 +168,7 @@ class WorkerClient:
         bucket: int,
         decode_config: str,
         chain_k: int,
+        load: bool = True,
     ) -> None:
         self._tmp = tempfile.TemporaryDirectory(prefix="ane-prefill-cert-")
         self._constraint_compiler = constraint_compiler
@@ -208,6 +209,9 @@ class WorkerClient:
         self._runtime_digest = hashlib.sha256(
             self._decode_fingerprint.encode()
         ).hexdigest()
+        self._processing_fingerprint = hashlib.sha256(
+            f"processing-{self._decode_fingerprint}".encode()
+        ).hexdigest()
         model_path = checkpoint / SOURCE_MODEL
         runtime = {
             "artifact_path": str(model_path),
@@ -218,6 +222,7 @@ class WorkerClient:
             "decode_chain_k": str(chain_k),
             "tokenizer_path": str(checkpoint / "tokenizer.json"),
             "decode_fingerprint": self._decode_fingerprint,
+            "processing_fingerprint": self._processing_fingerprint,
             "runtime_config_digest": self._runtime_digest,
         }
         if compiled is not None:
@@ -232,15 +237,26 @@ class WorkerClient:
                     "ane_prefill_handoff_budget_ms": "600000",
                 }
             )
+        self._model_path = model_path
+        self._runtime = runtime
+        self._model_ref: str | None = None
+        if load:
+            self.load()
+
+    def load(self) -> None:
+        """Load the configured artifact after the transport handshake."""
+
+        if self._model_ref is not None:
+            raise RuntimeError("decode worker model is already loaded")
         write_frame(
             self._stream,
             {
                 "type": "LOAD",
                 "req_id": "cert-load",
-                "artifact_path": str(model_path),
-                "artifact_digest": sha256_path(model_path),
+                "artifact_path": str(self._model_path),
+                "artifact_digest": sha256_path(self._model_path),
                 "format": "owned-safetensors",
-                "runtime_config": runtime,
+                "runtime_config": self._runtime,
             },
         )
         loaded = read_frame(self._stream)
@@ -251,6 +267,8 @@ class WorkerClient:
     def generate(
         self, prompt: list[int], max_tokens: int, grammar: str | None = None
     ) -> tuple[list[int], float, str]:
+        if self._model_ref is None:
+            raise RuntimeError("decode worker model must load before generation")
         generation_id = f"cert-generation-{time.time_ns()}"
         log_offset = self._worker_log_path.stat().st_size
         started = time.monotonic()
@@ -275,10 +293,12 @@ class WorkerClient:
                 },
             }
         )
+        generated_ids: list[int] = []
         while True:
-            if response.get("type") != "FRAME":
-                raise RuntimeError(f"unexpected decode response: {response!r}")
-            envelope = response["envelope"]
+            # The v2 stream emits each envelope as its own frame. This adapter
+            # reads a terminal frame directly when the preceding progress frame
+            # exhausted the generation's token budget.
+            envelope = response
             kind = envelope.get("kind")
             if kind == "final":
                 elapsed = (time.monotonic() - started) * 1000
@@ -290,18 +310,25 @@ class WorkerClient:
                         "split worker produced no success timing and therefore cannot prove ANE execution; "
                         + (attempt_log.strip() or "worker emitted no ANE attempt diagnostic")
                     )
-                return envelope["generated_ids"], elapsed, attempt_log
+                return generated_ids, elapsed, attempt_log
             if kind != "progress":
-                raise RuntimeError(f"decode generation failed: {envelope!r}")
-            remaining = max_tokens - int(envelope["committed_token_count"])
+                raise RuntimeError(f"unexpected decode response: {response!r}")
+            progress = envelope["progress"]
+            generated_ids.extend(progress["committed_token_ids"])
+            committed = int(progress["committed_token_count"])
+            if committed >= max_tokens:
+                # A terminal frame may follow the progress frame without another
+                # request when the current quantum exhausts the token budget.
+                response = read_frame(self._stream)
+                continue
             response = self._request(
                 {
                     "type": "GENERATE_CONTINUE",
                     "req_id": self._next_id(),
                     "continuation": {
                         "generation_id": generation_id,
-                        "next_expected_sequence": int(envelope["quantum_sequence"]) + 1,
-                        "next_token_budget": min(16, remaining),
+                        "next_expected_sequence": int(envelope["stream_seq"]) + 1,
+                        "next_token_budget": min(16, max_tokens - committed),
                     },
                 }
             )
