@@ -1,0 +1,157 @@
+name: release
+
+# Alpha distribution contract (ck setup): every released binary ships as
+# <binary>-<os>-<arch>.zip with the binary at the archive root, beside a
+# <binary>-<os>-<arch>.zip.sha256 holding the hex sha256 of the zip bytes in
+# shasum format. Installers resolve the latest GitHub release, so this
+# workflow only runs on version tags and uploads to the tag's release.
+#
+# Platform sets (owned-CUDA is deliberately absent: it needs an nvcc build
+# environment the hosted runners do not carry; it remains a manual CI gate
+# and joins the release matrix when a CUDA build runner exists):
+# - darwin-arm64: module + opctl + llama/mlx/ane/decode workers
+# - linux-x64:    module + opctl + llama worker
+# - windows-x64:  module + opctl + llama worker
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: darwin-arm64
+            runner: macos-15
+            os_arch: darwin-arm64
+            binaries: >-
+              ck-synapse
+              ck-synapse-opctl
+              ck-synapse-worker-llama
+              ck-synapse-worker-mlx
+              ck-synapse-worker-ane
+              ck-synapse-worker-decode
+            packages: >-
+              -p synapse-module
+              -p synapse-opctl
+              -p synapse-worker-llama
+              -p synapse-worker-mlx
+              -p synapse-worker-ane
+              -p synapse-worker-decode
+          - name: linux-x64
+            runner: ubuntu-24.04
+            os_arch: linux-x64
+            binaries: >-
+              ck-synapse
+              ck-synapse-opctl
+              ck-synapse-worker-llama
+            packages: >-
+              -p synapse-module
+              -p synapse-opctl
+              -p synapse-worker-llama
+          - name: windows-x64
+            runner: windows-2025
+            os_arch: windows-x64
+            binaries: >-
+              ck-synapse
+              ck-synapse-opctl
+              ck-synapse-worker-llama
+            packages: >-
+              -p synapse-module
+              -p synapse-opctl
+              -p synapse-worker-llama
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout synapse
+        uses: actions/checkout@v4
+        with:
+          path: synapse
+
+      # Public sibling path-dependencies, pinned by the workspace lock.
+      - name: Checkout subconscious
+        uses: actions/checkout@v4
+        with:
+          repository: cortexkit/subconscious
+          path: subconscious
+      - name: Checkout commons
+        uses: actions/checkout@v4
+        with:
+          repository: cortexkit/commons
+          path: commons
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Select full Xcode (darwin)
+        if: matrix.name == 'darwin-arm64'
+        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+
+      - name: Install LLVM (windows)
+        if: matrix.name == 'windows-x64'
+        shell: pwsh
+        run: |
+          $attempts = 0
+          do {
+            $attempts++
+            choco install llvm -y --no-progress
+            if ($LASTEXITCODE -eq 0) { break }
+            Start-Sleep -Seconds (15 * $attempts)
+          } while ($attempts -lt 3)
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Build release binaries
+        working-directory: synapse
+        shell: bash
+        env:
+          DEVELOPER_DIR: ${{ matrix.name == 'darwin-arm64' && '/Applications/Xcode.app/Contents/Developer' || '' }}
+        run: cargo build --release --locked ${{ matrix.packages }}
+
+      - name: Package assets (zip + sha256)
+        working-directory: synapse
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for bin in ${{ matrix.binaries }}; do
+            src="target/release/$bin"
+            [ -f "$src" ] || src="target/release/$bin.exe"
+            [ -f "$src" ] || { echo "missing built binary: $bin" >&2; exit 1; }
+            asset="$bin-${{ matrix.os_arch }}.zip"
+            staging="$(mktemp -d)"
+            cp "$src" "$staging/"
+            (cd "$staging" && 7z a -tzip "$OLDPWD/dist/$asset" . >/dev/null)
+            (cd dist && shasum -a 256 "$asset" > "$asset.sha256")
+            rm -rf "$staging"
+          done
+          ls -la dist/
+
+      - name: Smoke --version from the packaged zip
+        working-directory: synapse
+        shell: bash
+        run: |
+          set -euo pipefail
+          probe="$(mktemp -d)"
+          7z x "dist/ck-synapse-${{ matrix.os_arch }}.zip" -o"$probe" >/dev/null
+          "$probe"/ck-synapse* --version
+
+      - name: Upload assets to the tag's release
+        working-directory: synapse
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          gh release view "$tag" >/dev/null 2>&1 || \
+            gh release create "$tag" --title "$tag" --notes "synapse ${tag} (alpha)" --prerelease
+          gh release upload "$tag" dist/* --clobber

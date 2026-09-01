@@ -31,6 +31,7 @@ const DEFAULT_COMPONENTS: usize = 8;
 #[derive(Debug, Parser)]
 #[command(
     name = "ck-synapse-opctl",
+    version,
     about = "Drive Synapse operations through the fleet subc daemon"
 )]
 struct Cli {

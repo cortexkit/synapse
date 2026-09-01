@@ -81,6 +81,11 @@
 - Contains: Byte-identical PTX kernel wrappers (`crates/synapse-engine-cuda/src/port/`), CUDA graph execution, precision-aware embedding engines (`OwnedCudaEmbedEngine`), model family detection, and device compute capability checks (`device_meets_floor`).
 - Key files: `crates/synapse-engine-cuda/src/lib.rs`, `crates/synapse-engine-cuda/src/cuda.rs`, `crates/synapse-engine-cuda/src/model.rs`
 
+**crates/synapse-engine-ort/:**
+- Purpose: Universal in-process ONNX Runtime CPU inference engine serving as the portable CPU floor for embedding models.
+- Contains: In-process ONNX Runtime session management, thread pool auto-scaling, pooling modes (Mean, Cls, Last), and vector normalization.
+- Key files: `crates/synapse-engine-ort/src/lib.rs`, `crates/synapse-engine-ort/Cargo.toml`
+
 **crates/synapse-engine-owned/:**
 - Purpose: The primary in-process execution engine for Apple Silicon (macOS), hosting embedding engines, direct Metal step decode engines, ModernBERT pair reranking, and decode worker supervision.
 - Contains: Metal MPSGraph inference layers for ModernBERT, Qwen3, and MiniLM models, direct Metal step decode engines (`owned-decode-engine`), ModernBERT pair reranking (`rerank_pairs`), and supervised decode worker state management and sidecar hint bank installation protocol (`owned-decode-worker`).
@@ -180,9 +185,9 @@
 - Key files: `operations/ane-prefill-split/ENABLEMENT.md`
 
 **tests/:**
-- Purpose: Standalone certification suites and machine test harnesses running outside cargo test.
-- Contains: Python certification drivers and test harnesses.
-- Key files: `tests/ane-prefill-certification/README.md`, `tests/ane-prefill-certification/certify.py`
+- Purpose: Standalone certification suites, attribution scripts, and machine test harnesses running outside cargo test.
+- Contains: Python certification drivers, decode worker memory and stage attribution profilers, and semantic sidecar measurement harnesses.
+- Key files: `tests/ane-prefill-certification/README.md`, `tests/ane-prefill-certification/certify.py`, `tests/decode_worker_stage_attribution.py`, `tests/decode_worker_memory_curve.py`
 
 **workers/:**
 - Purpose: Houses separately supervised non-Rust sidecar runtime processes.
@@ -237,6 +242,7 @@
 - `crates/synapse-module/src/remote/runtime.rs`: Provider pool routing, circuit breaker enforcement, and telemetry collection for external model execution.
 - `crates/synapse-module/src/remote/vault.rs`: Vault credential retrieval via SubC `claustrum` route with class-based error disposition (`transient`, `auth_required`, `permanent`, `context_overflow`).
 - `crates/synapse-engine-cuda/src/lib.rs`: Production owned CUDA embed engine, model family detection, and PTX build identity.
+- `crates/synapse-engine-ort/src/lib.rs`: Production in-process ONNX Runtime CPU embed engine with dynamic threading and pooling support.
 - `crates/synapse-worker-cuda/src/main.rs`: Supervised CUDA worker IPC framing loop.
 - `crates/synapse-engine-owned/owned-decode-engine/src/lib.rs`: Production owned Metal decode engine implementations (Qwen3, LFM2).
 - `crates/synapse-engine-owned/owned-decode-worker/src/supervisor.rs`: Supervised owned decode worker protocol, boundary precedence, and crash budget tracking.

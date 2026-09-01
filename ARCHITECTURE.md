@@ -42,6 +42,13 @@
 - Depends on: `synapse-core`, `safetensors`, `half`, `sha2`, CUDA toolkit/driver libraries.
 - Used by: `synapse-module` and `synapse-worker-cuda`.
 
+**Synapse ORT Engine (`synapse-engine-ort`):**
+- Purpose: Primary universal in-process ONNX Runtime execution engine providing the portable CPU baseline reference floor for embedding models.
+- Location: `crates/synapse-engine-ort`
+- Contains: In-process ONNX Runtime session management, intra-thread auto-scaling (`div_ceil(available_parallelism/2)`), pooling modes (`Mean`, `Cls`, `Last`), L2 normalization, and artifact digest verification.
+- Depends on: `synapse-core`, `ort`, `ndarray`, `half`, `sha2`.
+- Used by: `synapse-module` as the universal CPU embedding floor and parity baseline.
+
 **Synapse Worker Lanes (`synapse-worker-*`):**
 - Purpose: Execute in-memory tokenization, tensor forward passes, and token generation for specific hardware classes (Apple Silicon MLX, Apple Neural Engine, Llama GGUF, NVIDIA CUDA, and supervised Metal decode).
 - Location: `crates/synapse-worker-mlx`, `crates/synapse-worker-ane`, `crates/synapse-worker-llama`, `crates/synapse-worker-cuda`, `crates/synapse-worker-decode`, `workers/ane-prefill-sidecar`
@@ -316,7 +323,7 @@
 - Pattern: SQLite-backed schema with automatic demotion upon failed re-certification and non-probing health metric projection.
 
 **Admission Telemetry & Decoupled Serving Gates:**
-- Purpose: Separates probe certification (`certified`, `uncertified`, `not_required`) from approval-backed serving admission (`serving_admission`: `enabled`, `disabled`), tracking runtime admission telemetry (`jobs_minted`, `refusals` counts and timestamps).
+- Purpose: Separates probe certification (`certified`, `uncertified`, `not_required`) from approval-backed serving admission (`serving_admission`: `enabled`, `disabled`) independent of lazy worker residency, tracking runtime admission telemetry (`jobs_minted`, `refusals` counts and timestamps).
 - Location: `crates/synapse-module/src/lib.rs`
 - Pattern: In-memory atomic telemetry aggregation and decoupled admission gate evaluation.
 
@@ -344,6 +351,11 @@
 - Purpose: Execute CUDA PTX embedding inference for MiniLM, ModernBERT, and Qwen3 in f16 storage dtype across in-process and supervised out-of-process worker configurations.
 - Location: `crates/synapse-engine-cuda/src/lib.rs`, `crates/synapse-worker-cuda/src/main.rs`
 - Pattern: PTX Kernel Dispatch with CUDA Graph Execution and Hardware Capability Floor (`device_meets_floor`).
+
+**OrtEmbedEngine:**
+- Purpose: Universal in-process ONNX Runtime execution engine providing portable CPU embedding inference with configurable pooling, thread scaling, and digest validation.
+- Location: `crates/synapse-engine-ort/src/lib.rs`
+- Pattern: In-process ONNX Runtime Session wrapper implementing EmbedEngine.
 
 **Approval & Emergency Rollback:**
 - Purpose: Manages storage approvals, rotation ledgers, explicit `(model_id, decode_fingerprint)` enablement and disablement, and atomic single-transaction emergency rollbacks to instantly revoke serving approvals across all lanes.
