@@ -130,7 +130,13 @@ jobs:
             staging="$(mktemp -d)"
             cp "$src" "$staging/"
             (cd "$staging" && 7z a -tzip "$OLDPWD/dist/$asset" . >/dev/null)
-            (cd dist && shasum -a 256 "$asset" > "$asset.sha256")
+            # shasum is absent from the Windows runner's git-bash; sha256sum
+            # prints the identical "<hex>  <name>" sidecar format.
+            if command -v shasum >/dev/null 2>&1; then
+              (cd dist && shasum -a 256 "$asset" > "$asset.sha256")
+            else
+              (cd dist && sha256sum "$asset" > "$asset.sha256")
+            fi
             rm -rf "$staging"
           done
           ls -la dist/
