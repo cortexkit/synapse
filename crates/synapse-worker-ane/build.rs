@@ -5,7 +5,9 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-changed=swift/ane_worker.swift");
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set"));
-    let output = out_dir.join("synapse-worker-ane-swift");
+    // Same file name the launcher looks for beside itself in installed layouts,
+    // so release packaging can copy this artifact next to the launcher as-is.
+    let output = out_dir.join("ck-synapse-worker-ane-swift");
     println!(
         "cargo:rustc-env=SYNAPSE_ANE_SWIFT_WORKER={}",
         output.display()

@@ -4,6 +4,12 @@ Supervised Synapse worker for fixed-bucket Core ML MiniLM artifacts on Apple
 Neural Engine. The Rust binary is a tiny launcher; `build.rs` compiles the
 self-contained Swift worker with `swiftc` so no Xcode project is required.
 
+Packaging trap: the launcher execs `ck-synapse-worker-ane-swift`, resolved
+first from beside its own executable, then from `SYNAPSE_ANE_SWIFT_WORKER`,
+then from the build-time `OUT_DIR` artifact. Only the last exists on the
+machine that compiled the launcher, so any installed layout (release zips,
+fleet deploys) must copy the Swift worker next to the launcher.
+
 Runtime contract:
 
 - `LOAD` expects an already-compiled `.mlmodelc` directory. Conversion from
