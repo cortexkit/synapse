@@ -32,8 +32,9 @@ pub use worker_engine_names::*;
 pub use worker_framing::*;
 pub use worker_protocol::*;
 pub use worker_transport::{
-    accept_worker_handshake, accept_worker_handshake_with_engine, bind_listener,
-    handshake_on_stream_with_engine, prepare_listener, read_json, read_raw, worker_endpoint_digest,
-    worker_pipe_name, worker_socket_path, write_json, write_raw, TransportError,
-    WorkerTransportStream,
+    accept_worker_handshake, accept_worker_handshake_with_engine,
+    accept_worker_handshake_with_engine_and_protocol_version, bind_listener,
+    handshake_on_stream_with_engine, handshake_on_stream_with_engine_and_protocol_version,
+    prepare_listener, read_json, read_raw, worker_endpoint_digest, worker_pipe_name,
+    worker_socket_path, write_json, write_raw, TransportError, WorkerTransportStream,
 };

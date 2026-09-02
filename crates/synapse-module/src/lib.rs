@@ -3751,6 +3751,7 @@ async fn owned_decode_session_decode(state: Arc<ModuleState>, params: Value) -> 
                         progress: synapse_core::ProgressFrame {
                             committed_token_ids: token_ids.to_vec(),
                             committed_token_count: committed,
+                            boundary: synapse_core::ProgressBoundary::Continuing,
                         },
                     },
                 );
@@ -3837,6 +3838,7 @@ async fn owned_decode_session_decode(state: Arc<ModuleState>, params: Value) -> 
                 progress: synapse_core::ProgressFrame {
                     committed_token_ids: token_ids.to_vec(),
                     committed_token_count: committed,
+                    boundary: synapse_core::ProgressBoundary::Continuing,
                 },
             },
         );
@@ -7974,6 +7976,8 @@ fn build_supervised_decode_dispatch_for_chain_k(
         .decode_identity_inputs()
         .decode_fingerprint()
         .map_err(OwnedDecodeDispatchPreparationError::Refused)?;
+    let processing_fingerprint = owned_decode_processing_fingerprint(entry)
+        .map_err(OwnedDecodeDispatchPreparationError::Refused)?;
     let (runtime_config_digest, production_n) =
         owned_decode_runtime_identity(spec, entry, decode_chain_k);
     for (key, value) in [
@@ -7987,6 +7991,7 @@ fn build_supervised_decode_dispatch_for_chain_k(
             tokenizer_path.path.to_string_lossy().to_string(),
         ),
         ("decode_fingerprint", decode_fingerprint.0.clone()),
+        ("processing_fingerprint", processing_fingerprint.0),
         ("runtime_config_digest", runtime_config_digest.clone()),
     ] {
         runtime_config.values.insert(key.to_string(), value);

@@ -407,6 +407,9 @@ impl<S: CrashBudgetStore> Supervisor<S> {
                         accounting,
                     );
                 }
+                Err(WorkerFault::Protocol) => {
+                    return AttemptResult::Clean(Err(DecodeError::ProtocolMismatch), accounting);
+                }
             };
 
             // Reject delayed frames from a closed or superseded session. A frame
@@ -456,6 +459,10 @@ impl<S: CrashBudgetStore> Supervisor<S> {
                     }
                     last_committed = progress.committed_token_count;
 
+                    if progress.boundary == synapse_core::ProgressBoundary::Continuing {
+                        continue;
+                    }
+
                     let decision = evaluate_boundary(BoundaryInputs {
                         completion: None,
                         cancel_recorded_at: control.cancel_at,
@@ -482,33 +489,45 @@ impl<S: CrashBudgetStore> Supervisor<S> {
                             if let Some(bank) = hint_bank_source.poll() {
                                 let digest = bank.content_digest();
                                 if installed_bank_digest.as_deref() != Some(digest.as_str()) {
-                                    if worker
-                                        .install_hint_bank(&GenerateInstallHintBank {
-                                            generation_id: generation_id.clone(),
-                                            bank,
-                                        })
-                                        .is_err()
-                                    {
-                                        return AttemptResult::Chargeable(
-                                            FailureClassification::ProtocolFatal,
-                                            accounting,
-                                        );
+                                    match worker.install_hint_bank(&GenerateInstallHintBank {
+                                        generation_id: generation_id.clone(),
+                                        bank,
+                                    }) {
+                                        Ok(()) => {}
+                                        Err(WorkerFault::Protocol) => {
+                                            return AttemptResult::Clean(
+                                                Err(DecodeError::ProtocolMismatch),
+                                                accounting,
+                                            );
+                                        }
+                                        Err(_) => {
+                                            return AttemptResult::Chargeable(
+                                                FailureClassification::ProtocolFatal,
+                                                accounting,
+                                            );
+                                        }
                                     }
                                     installed_bank_digest = Some(digest);
                                 }
                             }
-                            if worker
-                                .send_continue(&GenerateContinue {
-                                    generation_id: generation_id.clone(),
-                                    next_expected_sequence: expected_sequence,
-                                    next_token_budget: next_budget,
-                                })
-                                .is_err()
-                            {
-                                return AttemptResult::Chargeable(
-                                    FailureClassification::ProtocolFatal,
-                                    accounting,
-                                );
+                            match worker.send_continue(&GenerateContinue {
+                                generation_id: generation_id.clone(),
+                                next_expected_sequence: expected_sequence,
+                                next_token_budget: next_budget,
+                            }) {
+                                Ok(()) => {}
+                                Err(WorkerFault::Protocol) => {
+                                    return AttemptResult::Clean(
+                                        Err(DecodeError::ProtocolMismatch),
+                                        accounting,
+                                    );
+                                }
+                                Err(_) => {
+                                    return AttemptResult::Chargeable(
+                                        FailureClassification::ProtocolFatal,
+                                        accounting,
+                                    );
+                                }
                             }
                         }
                         BoundaryDecision::DeadlineExceeded => {
@@ -618,6 +637,9 @@ fn cancel_at_boundary(
         generation_id: generation_id.to_string(),
     }) {
         Ok(_ack) => AttemptResult::Clean(Err(boundary_error), accounting),
+        Err(WorkerFault::Protocol) => {
+            AttemptResult::Clean(Err(DecodeError::ProtocolMismatch), accounting)
+        }
         Err(_) => {
             // Unacknowledged cancellation: kill the worker. Resident state is
             // destroyed with the process; the fault is charged by the caller.
@@ -640,6 +662,7 @@ fn classify_worker_fault(fault: WorkerFault) -> FailureClassification {
         WorkerFault::Timeout => FailureClassification::Timeout,
         WorkerFault::StartupFailure => FailureClassification::StartupFailure,
         WorkerFault::FailedCancellation => FailureClassification::FailedCancellation,
+        WorkerFault::Protocol => FailureClassification::ProtocolFatal,
     }
 }
 
@@ -737,6 +760,28 @@ mod tests {
             render_policy_digest: "layout-v1".to_string(),
             built_at: 1,
         }
+    }
+
+    #[test]
+    fn protocol_transport_error_returns_typed_failure_without_a_strike() {
+        let mut sup = supervisor();
+        let request = request();
+        let mut factory =
+            ScriptedWorkerFactory::new(vec![vec![ScriptedEvent::Protocol]], context());
+        let outcome = sup.run_generation(
+            &request,
+            &mut factory,
+            &context(),
+            &TerminalControl::default(),
+            &ManualClock::new(0),
+        );
+
+        assert_eq!(outcome.result, Err(DecodeError::ProtocolMismatch));
+        assert!(outcome.provenance.failure_classifications.is_empty());
+        assert_eq!(
+            sup.budget().remaining(&request.key),
+            BudgetPolicy::default().max_strikes
+        );
     }
 
     #[test]

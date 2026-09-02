@@ -159,12 +159,23 @@ impl StreamSequence {
     }
 }
 
+/// Whether a progress frame pauses command processing or precedes another frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ProgressBoundary {
+    /// The worker is paused until a later continue or cancel command.
+    Yield,
+    /// Another frame for the current command follows immediately.
+    Continuing,
+}
+
 /// Newly committed tokens and their cumulative count.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProgressFrame {
     pub committed_token_ids: Vec<u32>,
     pub committed_token_count: u32,
+    pub boundary: ProgressBoundary,
 }
 
 /// Whether the terminal response was decoded serially or speculatively.
@@ -233,7 +244,7 @@ pub struct TerminalEnvelope {
 
 /// The ordered worker-frame vocabulary for the version-two stream.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
 pub enum WorkerFrame {
     Progress { progress: ProgressFrame },
     Final { terminal: TerminalEnvelope },
@@ -242,7 +253,6 @@ pub enum WorkerFrame {
 
 /// A versioned worker frame correlated to exactly one decode request and session.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct FrameEnvelope {
     pub protocol: String,
     pub protocol_version: u8,
@@ -644,6 +654,7 @@ mod tests {
                 progress: ProgressFrame {
                     committed_token_ids: token_ids,
                     committed_token_count,
+                    boundary: ProgressBoundary::Yield,
                 },
             },
         )
@@ -688,6 +699,17 @@ mod tests {
         assert_eq!(value["protocol_version"], 2);
         assert_eq!(value["req_id"], "request-1");
         assert_eq!(value["stream_seq"], 1);
+        assert_eq!(value["progress"]["boundary"], "YIELD");
+        assert_eq!(
+            serde_json::from_value::<FrameEnvelope>(value.clone()).expect("valid v2 frame"),
+            frame
+        );
+        let mut missing_boundary = value.clone();
+        missing_boundary["progress"]
+            .as_object_mut()
+            .expect("progress is an object")
+            .remove("boundary");
+        assert!(serde_json::from_value::<FrameEnvelope>(missing_boundary).is_err());
         assert!(serde_json::from_value::<FrameEnvelope>(serde_json::json!({
             "protocol": OWNED_DECODE_ENVELOPE_V2_SCHEMA,
             "protocol_version": 2,
@@ -695,7 +717,11 @@ mod tests {
             "session_id": "session-1",
             "stream_seq": 1,
             "kind": "progress",
-            "progress": { "committed_token_ids": [], "committed_token_count": 0 },
+            "progress": {
+                "committed_token_ids": [],
+                "committed_token_count": 0,
+                "boundary": "YIELD"
+            },
             "unknown": true
         }))
         .is_err());

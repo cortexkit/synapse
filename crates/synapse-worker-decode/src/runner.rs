@@ -47,8 +47,9 @@ use synapse_core::{
         DEFAULT_MAX_FRAME_BYTES, WORKER_PROTOCOL_VERSION,
     },
     CancelledTransportResponse, DecodeMode, EngineIdentity, Fingerprint,
-    FrameEnvelope as StreamFrameEnvelope, OneshotEnvelopeIdentity, ProgressFrame, SidecarHintBank,
-    SpanClass, StreamSequence, TerminalEnvelope, TerminalState, WorkerFrame as StreamWorkerFrame,
+    FrameEnvelope as StreamFrameEnvelope, OneshotEnvelopeIdentity, ProgressBoundary, ProgressFrame,
+    SidecarHintBank, SpanClass, StreamSequence, TerminalEnvelope, TerminalState,
+    WorkerFrame as StreamWorkerFrame,
 };
 use synapse_engine_owned::{
     owned_decode_engine::{
@@ -2225,6 +2226,7 @@ impl ActiveStream {
     fn progress(
         &mut self,
         generated_ids: &[u32],
+        boundary: ProgressBoundary,
     ) -> Result<Option<StreamFrameEnvelope>, DecodeError> {
         let committed_token_ids = generated_ids
             .get(self.reported_token_count..)
@@ -2240,6 +2242,7 @@ impl ActiveStream {
             progress: ProgressFrame {
                 committed_token_ids,
                 committed_token_count,
+                boundary,
             },
         })
         .map(Some)
@@ -2296,7 +2299,10 @@ fn frames_for_closed_generation(
     mut closed: ClosedGeneration,
 ) -> Result<Vec<StreamFrameEnvelope>, DecodeError> {
     let mut frames = Vec::with_capacity(2);
-    if let Some(progress) = closed.stream.progress(&closed.generated_ids)? {
+    if let Some(progress) = closed
+        .stream
+        .progress(&closed.generated_ids, ProgressBoundary::Continuing)?
+    {
         frames.push(progress);
     }
     frames.push(
@@ -2556,6 +2562,15 @@ impl WorkerState {
         self.close_resident(TerminalState::Failed);
     }
 
+    fn stamp_response_req_id(&mut self, req_id: String) {
+        if let Some(resident) = self.resident.as_mut() {
+            resident.stream.req_id.clone_from(&req_id);
+        }
+        if let Some(closed) = self.closed_generation.as_mut() {
+            closed.stream.req_id = req_id;
+        }
+    }
+
     fn progress_frames(&mut self) -> Result<Vec<StreamFrameEnvelope>, DecodeError> {
         let resident = self
             .resident
@@ -2563,7 +2578,7 @@ impl WorkerState {
             .ok_or(DecodeError::ProtocolMismatch)?;
         Ok(resident
             .stream
-            .progress(&resident.generated_ids)?
+            .progress(&resident.generated_ids, ProgressBoundary::Yield)?
             .into_iter()
             .collect())
     }
@@ -3030,6 +3045,7 @@ impl WorkerState {
             generation_id: resident.generation_id.clone(),
             quantum_sequence: resident.quantum_sequence,
             committed_token_count: resident.generated_ids.len() as u32,
+            boundary: ProgressBoundary::Yield,
         }))
     }
 
@@ -3469,6 +3485,7 @@ impl WorkerState {
                         generation_id: resident.generation_id.clone(),
                         quantum_sequence: resident.quantum_sequence,
                         committed_token_count: resident.generated_ids.len() as u32,
+                        boundary: ProgressBoundary::Yield,
                     }));
                 }
             }
@@ -3521,17 +3538,14 @@ impl WorkerState {
     fn cancel(
         &mut self,
         cancellation: &owned_decode_worker::protocol::GenerateCancel,
+        req_id: String,
     ) -> Result<CancelledTransportResponse, DecodeError> {
         let resident = self.resident.take().ok_or(DecodeError::ProtocolMismatch)?;
         if cancellation.generation_id != resident.generation_id {
             self.resident = Some(resident);
             return Err(DecodeError::ProtocolMismatch);
         }
-        cancellation_response(
-            resident.stream.req_id,
-            resident.generation_id,
-            &resident.generated_ids,
-        )
+        cancellation_response(req_id, resident.generation_id, &resident.generated_ids)
     }
 }
 
@@ -3779,8 +3793,12 @@ fn handle_decode_request(
                 }
             }
         }
-        DecodeTransportRequest::GenerateContinue { continuation, .. } => {
+        DecodeTransportRequest::GenerateContinue {
+            req_id,
+            continuation,
+        } => {
             let _ = fields;
+            state.stamp_response_req_id(req_id);
             match state.try_continue(continuation) {
                 Ok(frame) => stream_frame_values_for_worker_frame(state, frame)?,
                 Err(error) => (stream_failure_values(state, None, error)?, false),
@@ -3791,6 +3809,7 @@ fn handle_decode_request(
             installation,
         } => {
             let _ = fields;
+            state.stamp_response_req_id(req_id.clone());
             match state.install_hint_bank(installation) {
                 Ok(installation) => (
                     vec![serde_json::to_value(
@@ -3804,9 +3823,13 @@ fn handle_decode_request(
                 Err(error) => (stream_failure_values(state, None, error)?, false),
             }
         }
-        DecodeTransportRequest::GenerateCancel { cancellation, .. } => {
+        DecodeTransportRequest::GenerateCancel {
+            req_id,
+            cancellation,
+        } => {
             let _ = fields;
-            match state.cancel(&cancellation) {
+            state.stamp_response_req_id(req_id.clone());
+            match state.cancel(&cancellation, req_id) {
                 Ok(cancellation) => (vec![serde_json::to_value(cancellation)?], false),
                 Err(error) => (stream_failure_values(state, None, error)?, false),
             }
@@ -4463,7 +4486,10 @@ mod tests {
     #[test]
     fn progress_and_terminal_frames_preserve_committed_token_history() {
         let mut stream = test_stream();
-        let first = stream.progress(&[10, 11]).unwrap().unwrap();
+        let first = stream
+            .progress(&[10, 11], ProgressBoundary::Yield)
+            .unwrap()
+            .unwrap();
         let closed = ClosedGeneration {
             stream,
             generated_ids: vec![10, 11, 12],
@@ -4491,6 +4517,7 @@ mod tests {
         };
         assert_eq!(progress.committed_token_ids, vec![12]);
         assert_eq!(progress.committed_token_count, 3);
+        assert_eq!(progress.boundary, ProgressBoundary::Continuing);
         let StreamWorkerFrame::Final { terminal } = &terminal_frames[1].frame else {
             panic!("successful generation must end in a final frame");
         };
@@ -4503,15 +4530,39 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_acknowledges_the_original_request_boundary() {
-        let stream = test_stream();
-        let cancellation =
-            cancellation_response(stream.req_id, "generation-1".to_string(), &[31, 32, 33])
-                .unwrap();
+    fn response_frames_use_the_command_req_id_without_resetting_stream_identity() {
+        let mut stream = test_stream();
+        let first = stream
+            .progress(&[10], ProgressBoundary::Yield)
+            .unwrap()
+            .unwrap();
+        stream.req_id = "continue-2".to_string();
+        let terminal_frames = frames_for_closed_generation(ClosedGeneration {
+            stream,
+            generated_ids: vec![10, 11],
+            terminal_state: TerminalState::Completed,
+        })
+        .unwrap();
+
+        assert_eq!(first.req_id, "request-1");
+        assert!(terminal_frames
+            .iter()
+            .all(|frame| frame.req_id == "continue-2"));
+        assert_eq!(terminal_frames[0].stream_seq, StreamSequence(2));
+    }
+
+    #[test]
+    fn cancellation_acknowledges_the_cancel_command() {
+        let cancellation = cancellation_response(
+            "cancel-2".to_string(),
+            "generation-1".to_string(),
+            &[31, 32, 33],
+        )
+        .unwrap();
         assert_eq!(
             serde_json::to_value(cancellation).unwrap(),
             serde_json::json!({
-                "req_id": "request-1",
+                "req_id": "cancel-2",
                 "generation_id": "generation-1",
                 "committed_token_count": 3,
             })
@@ -4521,7 +4572,10 @@ mod tests {
     #[test]
     fn failed_terminal_reports_only_the_committed_prefix() {
         let mut stream = test_stream();
-        let first = stream.progress(&[21, 22]).unwrap().unwrap();
+        let first = stream
+            .progress(&[21, 22], ProgressBoundary::Yield)
+            .unwrap()
+            .unwrap();
         let closed = ClosedGeneration {
             stream,
             generated_ids: vec![21, 22],

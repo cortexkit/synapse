@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -11,8 +11,8 @@ use owned_decode_worker::{
     error::DecodeError,
     identity::QuarantineKey,
     protocol::{
-        DecodeTransportRequest, DecodeTransportResponse, FrameEnvelope, GenerateCancel,
-        GenerateContinue, GenerateInstallHintBank, GenerateStart, HintBankInstalled,
+        DecodeTransportRequest, FrameEnvelope, GenerateCancel, GenerateContinue,
+        GenerateInstallHintBank, GenerateProgress, GenerateStart, HintBankInstalled,
     },
     supervisor::{
         Clock as OwnedClock, GenerationRequest as OwnedGenerationRequest, Supervisor,
@@ -24,15 +24,15 @@ use owned_decode_worker::{
         WorkerFault, WorkerStartFailure,
     },
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use synapse_core::{
-    accept_worker_handshake_with_engine, decode_f32_frame, encode_i32_frame, prepare_listener,
-    read_json, read_raw, worker_engine_names::LLAMA_WORKER_ENGINE, write_json, write_raw,
-    EmbedEngine, EngineError, EngineErrorStage, EngineIdentity, EngineRiskClass, GenerateEngine,
-    GenerateOutput, GenerateRequest, LoadedModel, RerankEngine, RerankRequest, RerankScores,
-    RuntimeConfig, TokenBatch, TokenIds, TransportError, ValidatedArtifact, Vector, Vectors,
-    WorkerCandidate, WorkerPooling, WorkerRequest, WorkerResponse, WorkerTokenItem,
-    WorkerTransportStream, DEFAULT_MAX_FRAME_BYTES,
+    accept_worker_handshake_with_engine_and_protocol_version, decode_f32_frame, encode_i32_frame,
+    prepare_listener, read_json, read_raw, worker_engine_names::LLAMA_WORKER_ENGINE, write_json,
+    write_raw, EmbedEngine, EngineError, EngineErrorStage, EngineIdentity, EngineRiskClass,
+    GenerateEngine, GenerateOutput, GenerateRequest, LoadedModel, ProgressBoundary, RerankEngine,
+    RerankRequest, RerankScores, RuntimeConfig, TokenBatch, TokenIds, TransportError,
+    ValidatedArtifact, Vector, Vectors, WorkerCandidate, WorkerPooling, WorkerRequest,
+    WorkerResponse, WorkerTokenItem, WorkerTransportStream, DEFAULT_MAX_FRAME_BYTES,
 };
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -119,6 +119,11 @@ pub enum WorkerHostError {
     Json(#[from] serde_json::Error),
     #[error("worker protocol: {0}")]
     Protocol(String),
+    #[error("worker protocol version {advertised:?} is unsupported; required {required}")]
+    ProtocolVersion {
+        advertised: Option<u8>,
+        required: u8,
+    },
     #[error("worker returned {code}: {msg}")]
     WorkerErr { code: String, msg: String },
     #[error("engine_crashed at {stage}: {detail}")]
@@ -192,6 +197,27 @@ struct LoadedWorkerModel {
     worker_model_ref: Option<String>,
 }
 
+#[derive(Debug)]
+struct OwnedDecodeAdapterState {
+    generation_id: String,
+    session_id: String,
+    generated_ids: Vec<u32>,
+    next_stream_sequence: u64,
+    quantum_sequence: u32,
+    max_tokens: u32,
+    constraint_identity: Option<String>,
+}
+
+#[derive(Debug)]
+enum OwnedDecodeCommandResponse {
+    Frames(Vec<FrameEnvelope>),
+    Cancelled(synapse_core::CancelledTransportResponse),
+    HintBankInstalled {
+        req_id: String,
+        installation: HintBankInstalled,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct WorkerHostHealth {
     pub worker_connected: bool,
@@ -220,6 +246,7 @@ pub struct WorkerHost {
     last_placement_share: Option<f64>,
     request_counter: u64,
     model_counter: u64,
+    owned_decode_stream: Option<OwnedDecodeAdapterState>,
 }
 
 impl WorkerHost {
@@ -233,6 +260,7 @@ impl WorkerHost {
             last_placement_share: None,
             request_counter: 0,
             model_counter: 0,
+            owned_decode_stream: None,
         }
     }
 
@@ -423,7 +451,7 @@ impl WorkerHost {
         &mut self,
         model: &LoadedModel,
         mut start: GenerateStart,
-    ) -> Result<(u64, FrameEnvelope), WorkerHostError> {
+    ) -> Result<(u64, Vec<FrameEnvelope>), WorkerHostError> {
         let (worker_model_ref, _) = self.ensure_worker_model(model).await?;
         start.loaded_model_ref = worker_model_ref;
         let worker_generation = self
@@ -434,20 +462,26 @@ impl WorkerHost {
                 WorkerHostError::Protocol("owned worker is not connected".to_string())
             })?;
         let req_id = self.next_req_id("generate_start");
+        self.owned_decode_stream = Some(OwnedDecodeAdapterState {
+            generation_id: start.generation_id.clone(),
+            session_id: start.generation_id.clone(),
+            generated_ids: Vec::new(),
+            next_stream_sequence: synapse_core::StreamSequence::FIRST.0,
+            quantum_sequence: 1,
+            max_tokens: start.max_tokens,
+            constraint_identity: start
+                .constraint
+                .as_ref()
+                .map(|constraint| constraint.constraint_fingerprint.clone()),
+        });
         match self
             .send_owned_request(DecodeTransportRequest::GenerateStart {
-                req_id: req_id.clone(),
+                req_id,
                 start: Box::new(start),
             })
             .await?
         {
-            DecodeTransportResponse::Frame {
-                req_id: got,
-                envelope,
-            } => {
-                ensure_req_id(&req_id, &got)?;
-                Ok((worker_generation, envelope))
-            }
+            OwnedDecodeCommandResponse::Frames(frames) => Ok((worker_generation, frames)),
             other => Err(WorkerHostError::Protocol(format!(
                 "GENERATE_START returned unexpected response {other:?}"
             ))),
@@ -457,22 +491,23 @@ impl WorkerHost {
     pub async fn owned_decode_continue(
         &mut self,
         continuation: GenerateContinue,
-    ) -> Result<FrameEnvelope, WorkerHostError> {
+    ) -> Result<Vec<FrameEnvelope>, WorkerHostError> {
         let req_id = self.next_req_id("generate_continue");
+        let adapter = self.owned_decode_stream.as_mut().ok_or_else(|| {
+            WorkerHostError::Protocol("GENERATE_CONTINUE has no active generation".to_string())
+        })?;
+        adapter.quantum_sequence = adapter
+            .quantum_sequence
+            .checked_add(1)
+            .ok_or_else(|| WorkerHostError::Protocol("quantum sequence overflow".to_string()))?;
         match self
             .send_owned_request(DecodeTransportRequest::GenerateContinue {
-                req_id: req_id.clone(),
+                req_id,
                 continuation,
             })
             .await?
         {
-            DecodeTransportResponse::Frame {
-                req_id: got,
-                envelope,
-            } => {
-                ensure_req_id(&req_id, &got)?;
-                Ok(envelope)
-            }
+            OwnedDecodeCommandResponse::Frames(frames) => Ok(frames),
             other => Err(WorkerHostError::Protocol(format!(
                 "GENERATE_CONTINUE returned unexpected response {other:?}"
             ))),
@@ -494,20 +529,21 @@ impl WorkerHost {
             })
             .await?
         {
-            DecodeTransportResponse::HintBankInstalled {
+            OwnedDecodeCommandResponse::HintBankInstalled {
                 req_id: got,
                 installation,
             } => {
                 ensure_req_id(&req_id, &got)?;
                 Ok(installation)
             }
-            DecodeTransportResponse::Frame {
-                req_id: got,
-                envelope,
-            } => {
-                ensure_req_id(&req_id, &got)?;
+            OwnedDecodeCommandResponse::Frames(frames) => {
+                let frame = frames.into_iter().last().ok_or_else(|| {
+                    WorkerHostError::Protocol(
+                        "GENERATE_INSTALL_HINT_BANK returned no frames".to_string(),
+                    )
+                })?;
                 Err(WorkerHostError::WorkerErr {
-                    code: match envelope.frame {
+                    code: match frame.frame {
                         owned_decode_worker::protocol::WorkerFrame::Error { id } => id,
                         other => format!("unexpected_{other:?}"),
                     },
@@ -532,21 +568,16 @@ impl WorkerHost {
             })
             .await?
         {
-            DecodeTransportResponse::Cancelled {
-                req_id: got,
-                committed_token_count,
-                ..
-            } => {
-                ensure_req_id(&req_id, &got)?;
-                Ok(committed_token_count)
+            OwnedDecodeCommandResponse::Cancelled(cancelled) => {
+                ensure_req_id(&req_id, &cancelled.req_id)?;
+                Ok(cancelled.committed_token_count)
             }
-            DecodeTransportResponse::Frame {
-                req_id: got,
-                envelope,
-            } => {
-                ensure_req_id(&req_id, &got)?;
+            OwnedDecodeCommandResponse::Frames(frames) => {
+                let frame = frames.into_iter().last().ok_or_else(|| {
+                    WorkerHostError::Protocol("GENERATE_CANCEL returned no frames".to_string())
+                })?;
                 Err(WorkerHostError::WorkerErr {
-                    code: match envelope.frame {
+                    code: match frame.frame {
                         owned_decode_worker::protocol::WorkerFrame::Error { id } => id,
                         other => format!("unexpected_{other:?}"),
                     },
@@ -789,12 +820,15 @@ impl WorkerHost {
             spawn_pipe_reader("[stdout] ", stdout, logs.clone());
         }
 
-        let stream = match accept_worker_handshake_with_engine(
+        let required_protocol_version =
+            (self.config.crash_authority == CrashAuthority::OwnedDecodeSupervisor).then_some(2);
+        let stream = match accept_worker_handshake_with_engine_and_protocol_version(
             listener,
             &nonce,
             self.config.max_frame,
             self.config.handshake_timeout,
             expected_engine,
+            required_protocol_version,
         )
         .await
         {
@@ -845,7 +879,8 @@ impl WorkerHost {
 
         match result {
             Ok(Ok(value)) => Ok(value),
-            Ok(Err(error @ WorkerHostError::Protocol(_))) => Err(error),
+            Ok(Err(error @ WorkerHostError::Protocol(_)))
+            | Ok(Err(error @ WorkerHostError::ProtocolVersion { .. })) => Err(error),
             Ok(Err(error)) => {
                 let stderr_tail = self.kill_current().await;
                 Err(WorkerHostError::EngineCrashed {
@@ -868,7 +903,7 @@ impl WorkerHost {
     async fn send_owned_request(
         &mut self,
         request: DecodeTransportRequest,
-    ) -> Result<DecodeTransportResponse, WorkerHostError> {
+    ) -> Result<OwnedDecodeCommandResponse, WorkerHostError> {
         self.ensure_worker().await?;
         let max_frame = self.config.max_frame;
         let result = timeout(self.config.request_timeout, async {
@@ -877,14 +912,20 @@ impl WorkerHost {
                 .as_mut()
                 .expect("connection exists after ensure_worker");
             write_json(&mut connection.stream, &request, max_frame).await?;
-            let response: DecodeTransportResponse =
-                read_json(&mut connection.stream, max_frame).await?;
-            Ok::<_, WorkerHostError>(response)
+            read_owned_decode_response(
+                &mut connection.stream,
+                max_frame,
+                &request,
+                &mut self.owned_decode_stream,
+            )
+            .await
         })
         .await;
         match result {
             Ok(Ok(response)) => Ok(response),
-            Ok(Err(error @ WorkerHostError::Protocol(_))) => Err(error),
+            Ok(Err(error @ WorkerHostError::Protocol(_)))
+            | Ok(Err(error @ WorkerHostError::ProtocolVersion { .. })) => Err(error),
+            Ok(Err(error @ WorkerHostError::WorkerErr { .. })) => Err(error),
             Ok(Err(error)) => {
                 let stderr_tail = self.kill_current().await;
                 Err(WorkerHostError::EngineCrashed {
@@ -956,6 +997,175 @@ impl WorkerHost {
     }
 }
 
+async fn read_owned_decode_response(
+    stream: &mut WorkerTransportStream,
+    max_frame: u32,
+    request: &DecodeTransportRequest,
+    state: &mut Option<OwnedDecodeAdapterState>,
+) -> Result<OwnedDecodeCommandResponse, WorkerHostError> {
+    let expected_req_id = match request {
+        DecodeTransportRequest::GenerateStart { req_id, .. }
+        | DecodeTransportRequest::GenerateContinue { req_id, .. }
+        | DecodeTransportRequest::GenerateInstallHintBank { req_id, .. }
+        | DecodeTransportRequest::GenerateCancel { req_id, .. } => req_id,
+    };
+    let mut frames = Vec::new();
+    loop {
+        let value: serde_json::Value = read_json(stream, max_frame).await?;
+        if let Ok(envelope) = serde_json::from_value::<synapse_core::FrameEnvelope>(value.clone()) {
+            let adapter = state.as_mut().ok_or_else(|| {
+                WorkerHostError::Protocol("owned decode frame has no active generation".to_string())
+            })?;
+            if envelope.protocol != synapse_core::OWNED_DECODE_ENVELOPE_V2_SCHEMA
+                || envelope.protocol_version
+                    != synapse_core::OWNED_DECODE_ENVELOPE_V2_PROTOCOL_VERSION
+                || envelope.req_id != *expected_req_id
+                || envelope.session_id != adapter.session_id
+                || envelope.stream_seq.0 != adapter.next_stream_sequence
+            {
+                return Err(WorkerHostError::Protocol(format!(
+                    "invalid owned decode v2 frame header for request {expected_req_id}"
+                )));
+            }
+            adapter.next_stream_sequence = adapter
+                .next_stream_sequence
+                .checked_add(1)
+                .ok_or_else(|| WorkerHostError::Protocol("stream sequence overflow".to_string()))?;
+            match envelope.frame {
+                synapse_core::WorkerFrame::Progress { progress } => {
+                    adapter
+                        .generated_ids
+                        .extend_from_slice(&progress.committed_token_ids);
+                    let committed_token_count = u32::try_from(adapter.generated_ids.len())
+                        .map_err(|_| {
+                            WorkerHostError::Protocol("token count overflow".to_string())
+                        })?;
+                    if committed_token_count != progress.committed_token_count {
+                        return Err(WorkerHostError::Protocol(
+                            "owned decode progress accounting mismatch".to_string(),
+                        ));
+                    }
+                    frames.push(FrameEnvelope::new(
+                        owned_decode_worker::protocol::WorkerFrame::Progress(GenerateProgress {
+                            generation_id: adapter.generation_id.clone(),
+                            quantum_sequence: adapter.quantum_sequence,
+                            committed_token_count,
+                            boundary: progress.boundary,
+                        }),
+                    ));
+                    if progress.boundary == ProgressBoundary::Yield {
+                        return Ok(OwnedDecodeCommandResponse::Frames(frames));
+                    }
+                }
+                synapse_core::WorkerFrame::Final { terminal } => {
+                    if terminal.req_id != *expected_req_id
+                        || terminal.session_id != adapter.session_id
+                        || terminal.committed_token_count != adapter.generated_ids.len() as u32
+                        || terminal.tokens_emitted != terminal.committed_token_count
+                        || terminal.terminal_state != synapse_core::TerminalState::Completed
+                    {
+                        return Err(WorkerHostError::Protocol(
+                            "owned decode terminal accounting mismatch".to_string(),
+                        ));
+                    }
+                    let finish_reason = if terminal.committed_token_count >= adapter.max_tokens {
+                        owned_decode_worker::protocol::FinishReason::MaxTokens
+                    } else if adapter.constraint_identity.is_some() {
+                        owned_decode_worker::protocol::FinishReason::GrammarComplete
+                    } else {
+                        owned_decode_worker::protocol::FinishReason::StopToken
+                    };
+                    frames.push(FrameEnvelope::new(
+                        owned_decode_worker::protocol::WorkerFrame::Final(
+                            owned_decode_worker::protocol::FinalResponse {
+                                generation_id: adapter.generation_id.clone(),
+                                generated_ids: adapter.generated_ids.clone(),
+                                committed_token_count: terminal.committed_token_count,
+                                decode_fingerprint: terminal.identity.decode_fingerprint.0,
+                                runtime_config_digest: terminal.identity.runtime_config_digest,
+                                worker_generation: terminal.identity.worker_generation,
+                                finish_reason,
+                                constraint_identity: adapter.constraint_identity.clone(),
+                                constraint_complete: adapter.constraint_identity.is_some(),
+                                last_completed_sequence: adapter.quantum_sequence,
+                                hint_verification: Default::default(),
+                            },
+                        ),
+                    ));
+                    *state = None;
+                    return Ok(OwnedDecodeCommandResponse::Frames(frames));
+                }
+                synapse_core::WorkerFrame::Error { terminal } => {
+                    if terminal.req_id != *expected_req_id
+                        || terminal.session_id != adapter.session_id
+                        || terminal.committed_token_count != adapter.generated_ids.len() as u32
+                        || terminal.tokens_emitted != terminal.committed_token_count
+                    {
+                        return Err(WorkerHostError::Protocol(
+                            "owned decode error accounting mismatch".to_string(),
+                        ));
+                    }
+                    let id = match terminal.terminal_state {
+                        synapse_core::TerminalState::Aborted => DecodeError::Cancelled.as_str(),
+                        synapse_core::TerminalState::ArtifactDisabled
+                        | synapse_core::TerminalState::ArtifactRevoked => {
+                            DecodeError::ArtifactPoisoned.as_str()
+                        }
+                        synapse_core::TerminalState::Failed
+                        | synapse_core::TerminalState::Completed => {
+                            DecodeError::ProtocolMismatch.as_str()
+                        }
+                    };
+                    frames.push(FrameEnvelope::new(
+                        owned_decode_worker::protocol::WorkerFrame::Error { id: id.to_string() },
+                    ));
+                    *state = None;
+                    return Ok(OwnedDecodeCommandResponse::Frames(frames));
+                }
+            }
+            continue;
+        }
+
+        if matches!(request, DecodeTransportRequest::GenerateCancel { .. }) {
+            if let Ok(cancelled) =
+                serde_json::from_value::<synapse_core::CancelledTransportResponse>(value.clone())
+            {
+                *state = None;
+                return Ok(OwnedDecodeCommandResponse::Cancelled(cancelled));
+            }
+        }
+        if matches!(
+            request,
+            DecodeTransportRequest::GenerateInstallHintBank { .. }
+        ) {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct InstalledResponse {
+                #[serde(rename = "type")]
+                response_type: String,
+                req_id: String,
+                installation: HintBankInstalled,
+            }
+            if let Ok(installed) = serde_json::from_value::<InstalledResponse>(value.clone()) {
+                if installed.response_type == "HINT_BANK_INSTALLED" {
+                    return Ok(OwnedDecodeCommandResponse::HintBankInstalled {
+                        req_id: installed.req_id,
+                        installation: installed.installation,
+                    });
+                }
+            }
+        }
+        if let Ok(WorkerResponse::Err { code, msg, .. }) =
+            serde_json::from_value::<WorkerResponse>(value.clone())
+        {
+            return Err(WorkerHostError::WorkerErr { code, msg });
+        }
+        return Err(WorkerHostError::Protocol(format!(
+            "worker returned malformed owned decode response: {value}"
+        )));
+    }
+}
+
 pub struct WorkerEngine {
     /// Present from construction until [`Drop`], which moves the runtime to a
     /// teardown thread: both `Runtime::block_on` and `Runtime::drop` panic on
@@ -1004,7 +1214,7 @@ impl WorkerEngine {
         &self,
         model: &LoadedModel,
         start: GenerateStart,
-    ) -> Result<(u64, FrameEnvelope), WorkerHostError> {
+    ) -> Result<(u64, Vec<FrameEnvelope>), WorkerHostError> {
         let mut host = self.lock_host()?;
         self.runtime()
             .block_on(host.owned_decode_start(model, start))
@@ -1013,7 +1223,7 @@ impl WorkerEngine {
     fn owned_decode_continue(
         &self,
         continuation: GenerateContinue,
-    ) -> Result<FrameEnvelope, WorkerHostError> {
+    ) -> Result<Vec<FrameEnvelope>, WorkerHostError> {
         let mut host = self.lock_host()?;
         self.runtime()
             .block_on(host.owned_decode_continue(continuation))
@@ -1426,7 +1636,7 @@ struct OwnedDecodeWorkerSession {
     engine: Option<WorkerEngine>,
     model: LoadedModel,
     worker_generation: u64,
-    pending: Option<owned_decode_worker::protocol::WorkerFrame>,
+    pending: VecDeque<owned_decode_worker::protocol::WorkerFrame>,
     idle: Arc<Mutex<Option<ReusableOwnedDecodeWorker>>>,
     reusable: bool,
 }
@@ -1438,7 +1648,7 @@ impl WorkerFactory for OwnedDecodeWorkerFactory {
                 engine: Some(worker.engine),
                 model: worker.model,
                 worker_generation: worker.worker_generation,
-                pending: None,
+                pending: VecDeque::new(),
                 idle: Arc::clone(&self.idle),
                 reusable: true,
             }));
@@ -1454,7 +1664,7 @@ impl WorkerFactory for OwnedDecodeWorkerFactory {
             engine: Some(engine),
             model,
             worker_generation,
-            pending: None,
+            pending: VecDeque::new(),
             idle: Arc::clone(&self.idle),
             reusable: true,
         }))
@@ -1480,24 +1690,33 @@ impl DecodeWorker for OwnedDecodeWorkerSession {
             .as_ref()
             .ok_or(WorkerStartFailure::Fault(WorkerFault::Crash))?
             .owned_decode_start(&self.model, start.clone());
-        let (worker_generation, envelope) = match response {
+        let (worker_generation, envelopes) = match response {
             Ok(response) => response,
             Err(error) => {
-                self.reusable = false;
-                return Err(WorkerStartFailure::Fault(owned_host_fault(&error)));
+                self.reusable = matches!(
+                    error,
+                    WorkerHostError::Protocol(_)
+                        | WorkerHostError::ProtocolVersion { .. }
+                        | WorkerHostError::Json(_)
+                        | WorkerHostError::WorkerErr { .. }
+                );
+                return Err(owned_host_start_failure(&error));
             }
         };
-        owned_decode_worker::protocol::validate_frame_structure(&envelope)?;
+        for envelope in &envelopes {
+            owned_decode_worker::protocol::validate_frame_structure(envelope)?;
+        }
         if worker_generation != self.worker_generation {
             self.reusable = false;
             return Err(WorkerStartFailure::Fault(WorkerFault::Crash));
         }
-        self.pending = Some(envelope.frame);
+        self.pending
+            .extend(envelopes.into_iter().map(|envelope| envelope.frame));
         Ok(authorization)
     }
 
     fn step(&mut self) -> Result<SteppedFrame, WorkerFault> {
-        let frame = self.pending.take().ok_or(WorkerFault::Crash)?;
+        let frame = self.pending.pop_front().ok_or(WorkerFault::Crash)?;
         Ok(SteppedFrame {
             worker_generation: self.worker_generation,
             frame,
@@ -1516,7 +1735,10 @@ impl DecodeWorker for OwnedDecodeWorkerSession {
         let installed = match response {
             Ok(installed) => installed,
             Err(error) => {
-                self.reusable = false;
+                self.reusable = matches!(
+                    error,
+                    WorkerHostError::Protocol(_) | WorkerHostError::ProtocolVersion { .. }
+                );
                 return Err(owned_host_fault(&error));
             }
         };
@@ -1535,16 +1757,22 @@ impl DecodeWorker for OwnedDecodeWorkerSession {
             .as_ref()
             .ok_or(WorkerFault::Crash)?
             .owned_decode_continue(continuation.clone());
-        let envelope = match response {
-            Ok(envelope) => envelope,
+        let envelopes = match response {
+            Ok(envelopes) => envelopes,
             Err(error) => {
-                self.reusable = false;
+                self.reusable = matches!(
+                    error,
+                    WorkerHostError::Protocol(_) | WorkerHostError::ProtocolVersion { .. }
+                );
                 return Err(owned_host_fault(&error));
             }
         };
-        owned_decode_worker::protocol::validate_frame_structure(&envelope)
-            .map_err(|_| WorkerFault::Crash)?;
-        self.pending = Some(envelope.frame);
+        for envelope in &envelopes {
+            owned_decode_worker::protocol::validate_frame_structure(envelope)
+                .map_err(|_| WorkerFault::Crash)?;
+        }
+        self.pending
+            .extend(envelopes.into_iter().map(|envelope| envelope.frame));
         Ok(())
     }
 
@@ -1556,6 +1784,12 @@ impl DecodeWorker for OwnedDecodeWorkerSession {
             .owned_decode_cancel(cancellation.clone());
         let committed_token_count = match response {
             Ok(committed_token_count) => committed_token_count,
+            Err(
+                error @ (WorkerHostError::Protocol(_) | WorkerHostError::ProtocolVersion { .. }),
+            ) => {
+                self.reusable = true;
+                return Err(owned_host_fault(&error));
+            }
             Err(_) => {
                 self.reusable = false;
                 return Err(WorkerFault::FailedCancellation);
@@ -1571,7 +1805,7 @@ impl DecodeWorker for OwnedDecodeWorkerSession {
         if let Some(engine) = self.engine.as_ref() {
             engine.owned_decode_kill();
         }
-        self.pending = None;
+        self.pending.clear();
     }
 }
 
@@ -1593,14 +1827,27 @@ impl Drop for OwnedDecodeWorkerSession {
     }
 }
 
+fn owned_host_start_failure(error: &WorkerHostError) -> WorkerStartFailure {
+    match error {
+        WorkerHostError::Protocol(_)
+        | WorkerHostError::ProtocolVersion { .. }
+        | WorkerHostError::Json(_) => WorkerStartFailure::Typed(DecodeError::ProtocolMismatch),
+        WorkerHostError::WorkerErr { code, .. } => WorkerStartFailure::Typed(
+            DecodeError::from_id(code).unwrap_or(DecodeError::ProtocolMismatch),
+        ),
+        _ => WorkerStartFailure::Fault(owned_host_fault(error)),
+    }
+}
+
 fn owned_host_fault(error: &WorkerHostError) -> WorkerFault {
     match error {
         WorkerHostError::EngineCrashed { stage, .. } if stage == "timeout" => WorkerFault::Timeout,
+        WorkerHostError::Protocol(_)
+        | WorkerHostError::ProtocolVersion { .. }
+        | WorkerHostError::Json(_)
+        | WorkerHostError::WorkerErr { .. } => WorkerFault::Protocol,
         WorkerHostError::EngineCrashed { .. }
         | WorkerHostError::Io(_)
-        | WorkerHostError::Json(_)
-        | WorkerHostError::Protocol(_)
-        | WorkerHostError::WorkerErr { .. }
         | WorkerHostError::Quarantined { .. } => WorkerFault::Crash,
     }
 }
@@ -1655,6 +1902,13 @@ impl From<TransportError> for WorkerHostError {
         match error {
             TransportError::Io(error) => Self::Io(error),
             TransportError::Protocol(message) => Self::Protocol(message),
+            TransportError::UnsupportedProtocolVersion {
+                advertised,
+                required,
+            } => Self::ProtocolVersion {
+                advertised,
+                required,
+            },
         }
     }
 }
@@ -1855,6 +2109,92 @@ mod tests {
             matches!(error, WorkerHostError::Protocol(message) if message.contains("rejected worker HELLO"))
         );
         client.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn owned_decode_handshake_refuses_a_pre_v2_worker() {
+        use synapse_core::worker_framing::write_json_frame;
+        use tokio::net::UnixStream;
+
+        let tmp = PathBuf::from(format!("/tmp/synh-v2-{}", nonce_hex16()));
+        let path = synapse_core::worker_socket_path(&tmp, "owned-v1-test");
+        let listener = synapse_core::bind_listener(&path).unwrap();
+        let client_path = path.clone();
+        let client = tokio::spawn(async move {
+            let mut stream = UnixStream::connect(&client_path).await.unwrap();
+            let hello = serde_json::json!({
+                "v": synapse_core::WORKER_PROTOCOL_VERSION,
+                "nonce": "0123456789abcdef",
+                "engine": { "engine": "decode", "version": "0", "build_flags": {} },
+                "pid": 1,
+                "max_frame": DEFAULT_MAX_FRAME_BYTES,
+                "protocol_version": 1,
+            });
+            write_json_frame(&mut stream, &hello, DEFAULT_MAX_FRAME_BYTES)
+                .await
+                .unwrap();
+        });
+        let error: WorkerHostError =
+            synapse_core::accept_worker_handshake_with_engine_and_protocol_version(
+                listener,
+                "0123456789abcdef",
+                DEFAULT_MAX_FRAME_BYTES,
+                Duration::from_secs(1),
+                Some("decode"),
+                Some(2),
+            )
+            .await
+            .expect_err("owned decode must reject a pre-v2 worker")
+            .into();
+
+        assert!(matches!(
+            error,
+            WorkerHostError::ProtocolVersion {
+                advertised: Some(1),
+                required: 2
+            }
+        ));
+        client.await.unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn malformed_owned_response_is_a_protocol_error() {
+        let (mut module, mut worker) = tokio::net::UnixStream::pair().unwrap();
+        synapse_core::write_json(
+            &mut worker,
+            &serde_json::json!({ "kind": "final", "not": "an envelope" }),
+            DEFAULT_MAX_FRAME_BYTES,
+        )
+        .await
+        .unwrap();
+        let request = DecodeTransportRequest::GenerateCancel {
+            req_id: "cancel-1".to_string(),
+            cancellation: GenerateCancel {
+                generation_id: "generation-1".to_string(),
+            },
+        };
+        let mut state = Some(OwnedDecodeAdapterState {
+            generation_id: "generation-1".to_string(),
+            session_id: "generation-1".to_string(),
+            generated_ids: Vec::new(),
+            next_stream_sequence: 1,
+            quantum_sequence: 1,
+            max_tokens: 16,
+            constraint_identity: None,
+        });
+
+        let error =
+            read_owned_decode_response(&mut module, DEFAULT_MAX_FRAME_BYTES, &request, &mut state)
+                .await
+                .expect_err("malformed response must fail");
+        assert!(matches!(error, WorkerHostError::Protocol(_)));
+        assert!(matches!(
+            owned_host_start_failure(&error),
+            WorkerStartFailure::Typed(DecodeError::ProtocolMismatch)
+        ));
     }
 
     #[test]

@@ -17,6 +17,11 @@ pub enum TransportError {
     Io(#[from] io::Error),
     #[error("worker protocol: {0}")]
     Protocol(String),
+    #[error("worker protocol version {advertised:?} is unsupported; required {required}")]
+    UnsupportedProtocolVersion {
+        advertised: Option<u8>,
+        required: u8,
+    },
 }
 
 pub type WorkerTransportStream = NamedPipeServer;
@@ -61,21 +66,41 @@ pub async fn accept_worker_handshake(
 }
 
 pub async fn accept_worker_handshake_with_engine(
-    mut server: NamedPipeServer,
+    server: NamedPipeServer,
     expected_nonce: &str,
     max_frame: u32,
     handshake_timeout: Duration,
     expected_engine: Option<&str>,
 ) -> Result<NamedPipeServer, TransportError> {
+    accept_worker_handshake_with_engine_and_protocol_version(
+        server,
+        expected_nonce,
+        max_frame,
+        handshake_timeout,
+        expected_engine,
+        None,
+    )
+    .await
+}
+
+pub async fn accept_worker_handshake_with_engine_and_protocol_version(
+    mut server: NamedPipeServer,
+    expected_nonce: &str,
+    max_frame: u32,
+    handshake_timeout: Duration,
+    expected_engine: Option<&str>,
+    required_protocol_version: Option<u8>,
+) -> Result<NamedPipeServer, TransportError> {
     timeout(handshake_timeout, server.connect())
         .await
         .map_err(|_| TransportError::Protocol("worker handshake timed out".to_string()))??;
-    handshake_on_stream_with_engine(
+    handshake_on_stream_with_engine_and_protocol_version(
         &mut server,
         expected_nonce,
         max_frame,
         handshake_timeout,
         expected_engine,
+        required_protocol_version,
     )
     .await?;
     Ok(server)
@@ -104,9 +129,37 @@ pub async fn handshake_on_stream_with_engine<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let hello: WorkerHello = timeout(handshake_timeout, read_json_frame(stream, max_frame))
+    handshake_on_stream_with_engine_and_protocol_version(
+        stream,
+        expected_nonce,
+        max_frame,
+        handshake_timeout,
+        expected_engine,
+        None,
+    )
+    .await
+}
+
+pub async fn handshake_on_stream_with_engine_and_protocol_version<S>(
+    stream: &mut S,
+    expected_nonce: &str,
+    max_frame: u32,
+    handshake_timeout: Duration,
+    expected_engine: Option<&str>,
+    required_protocol_version: Option<u8>,
+) -> Result<(), TransportError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let hello: serde_json::Value = timeout(handshake_timeout, read_json_frame(stream, max_frame))
         .await
         .map_err(|_| TransportError::Protocol("worker HELLO timed out".to_string()))??;
+    let advertised_protocol_version = hello
+        .get("protocol_version")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|version| u8::try_from(version).ok());
+    let hello: WorkerHello = serde_json::from_value(hello)
+        .map_err(|error| TransportError::Protocol(format!("invalid worker HELLO: {error}")))?;
     if hello.v != WORKER_PROTOCOL_VERSION || hello.nonce != expected_nonce {
         return Err(TransportError::Protocol(format!(
             "rejected worker HELLO v={} nonce_match={}",
@@ -121,17 +174,24 @@ where
             expected_engine.unwrap_or_default()
         )));
     }
-    let accepted_frame = max_frame.min(hello.max_frame);
-    write_json_frame(
-        stream,
-        &WorkerHelloAck {
-            v: WORKER_PROTOCOL_VERSION,
-            accept: true,
-            max_frame: accepted_frame,
-        },
-        accepted_frame,
-    )
-    .await?;
+    if required_protocol_version
+        .is_some_and(|required| advertised_protocol_version != Some(required))
+    {
+        return Err(TransportError::UnsupportedProtocolVersion {
+            advertised: advertised_protocol_version,
+            required: required_protocol_version.unwrap_or_default(),
+        });
+    }
+    let mut ack = serde_json::to_value(WorkerHelloAck {
+        v: WORKER_PROTOCOL_VERSION,
+        accept: true,
+        max_frame: accepted_frame,
+    })
+    .map_err(|error| TransportError::Protocol(format!("encode worker HELLO_ACK: {error}")))?;
+    if let Some(protocol_version) = required_protocol_version {
+        ack["protocol_version"] = serde_json::Value::from(protocol_version);
+    }
+    write_json_frame(stream, &ack, accepted_frame).await?;
     Ok(())
 }
 
