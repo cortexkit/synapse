@@ -6,10 +6,15 @@ name: release
 # shasum format. Installers resolve the latest GitHub release, so this
 # workflow only runs on version tags and uploads to the tag's release.
 #
-# Platform sets (owned-CUDA is deliberately absent: it needs an nvcc build
+# Platform sets. Deliberately absent: owned-CUDA (needs an nvcc build
 # environment the hosted runners do not carry; it remains a manual CI gate
-# and joins the release matrix when a CUDA build runner exists):
-# - darwin-arm64: module + opctl + llama/mlx/ane/decode workers
+# and joins the matrix when a CUDA build runner exists) and the MLX worker
+# (the frozen Lane-1 reference engine, not a serving lane — production Metal
+# embedding runs in-process — and its runtime loads mlx.metallib only from
+# beside the executable, which the one-binary-per-zip installer contract
+# cannot deliver).
+# - darwin-arm64: module + opctl + llama/ane/decode workers + the Swift ANE
+#                 worker the ane launcher execs from beside itself
 # - linux-x64:    module + opctl + llama worker
 # - windows-x64:  module + opctl + llama worker
 
@@ -37,14 +42,13 @@ jobs:
               ck-synapse
               ck-synapse-opctl
               ck-synapse-worker-llama
-              ck-synapse-worker-mlx
               ck-synapse-worker-ane
+              ck-synapse-worker-ane-swift
               ck-synapse-worker-decode
             packages: >-
               -p synapse-module
               -p synapse-opctl
               -p synapse-worker-llama
-              -p synapse-worker-mlx
               -p synapse-worker-ane
               -p synapse-worker-decode
           - name: linux-x64
@@ -131,11 +135,11 @@ jobs:
           DEVELOPER_DIR: ${{ matrix.name == 'darwin-arm64' && '/Applications/Xcode.app/Contents/Developer' || '' }}
         run: cargo build --release --locked ${{ matrix.packages }}
 
-      # Two darwin workers cannot run from a bare binary: the ANE launcher execs
-      # a Swift worker it expects beside itself, and the MLX runtime loads
-      # mlx.metallib from beside its executable. Both support files ride at the
-      # archive root of their worker's zip so a flat extraction installs them.
-      - name: Stage darwin worker support files
+      # The ANE launcher execs a Swift worker it resolves from beside its own
+      # executable. build.rs leaves that worker in cargo's OUT_DIR; it ships as
+      # its own named asset so the installer records and upgrades it like any
+      # other binary.
+      - name: Stage the Swift ANE worker as a release binary
         if: matrix.name == 'darwin-arm64'
         working-directory: synapse
         shell: bash
@@ -144,7 +148,7 @@ jobs:
           swift_worker=$(find target/release/build -type f -name ck-synapse-worker-ane-swift | head -1)
           [ -n "$swift_worker" ] || { echo "Swift ANE worker artifact not found" >&2; exit 1; }
           cp "$swift_worker" target/release/ck-synapse-worker-ane-swift
-          [ -f target/release/mlx.metallib ] || { echo "mlx.metallib not found beside the mlx worker" >&2; exit 1; }
+          target/release/ck-synapse-worker-ane-swift --version
 
       - name: Package assets (zip + sha256)
         working-directory: synapse
@@ -159,10 +163,6 @@ jobs:
             asset="$bin-${{ matrix.os_arch }}.zip"
             staging="$(mktemp -d)"
             cp "$src" "$staging/"
-            case "$bin" in
-              ck-synapse-worker-ane) cp target/release/ck-synapse-worker-ane-swift "$staging/" ;;
-              ck-synapse-worker-mlx) cp target/release/mlx.metallib "$staging/" ;;
-            esac
             (cd "$staging" && 7z a -tzip "$OLDPWD/dist/$asset" . >/dev/null)
             # shasum is absent from the Windows runner's git-bash; sha256sum
             # prints the identical "<hex>  <name>" sidecar format.
@@ -184,10 +184,11 @@ jobs:
           7z x "dist/ck-synapse-${{ matrix.os_arch }}.zip" -o"$probe" >/dev/null
           "$probe"/ck-synapse* --version
 
-      # Proves the packaged launcher finds its Swift sibling from a fresh
-      # extraction: with no arguments it must reach the Swift worker's usage
-      # error, not the launcher's not-found error.
-      - name: Smoke ANE launcher resolution from the packaged zip (darwin)
+      # Proves the packaged launcher finds its Swift sibling once both zips
+      # are extracted into one directory, as the installer does: with no
+      # arguments it must reach the Swift worker's usage error, not the
+      # launcher's not-found error.
+      - name: Smoke ANE launcher resolution from the packaged zips (darwin)
         if: matrix.name == 'darwin-arm64'
         working-directory: synapse
         shell: bash
@@ -195,6 +196,7 @@ jobs:
           set -euo pipefail
           probe="$(mktemp -d)"
           7z x "dist/ck-synapse-worker-ane-${{ matrix.os_arch }}.zip" -o"$probe" >/dev/null
+          7z x "dist/ck-synapse-worker-ane-swift-${{ matrix.os_arch }}.zip" -o"$probe" >/dev/null
           set +e
           output=$("$probe/ck-synapse-worker-ane" 2>&1)
           set -e

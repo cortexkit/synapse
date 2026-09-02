@@ -156,6 +156,12 @@ private func parseArgs() throws -> Args {
     var iterator = CommandLine.arguments.dropFirst().makeIterator()
     while let arg = iterator.next() {
         switch arg {
+        // Installed as a first-class binary beside the launcher, so it answers
+        // the same provenance probe every shipped binary does. The version
+        // string is generated at build time from the crate version.
+        case "--version":
+            print("ck-synapse-worker-ane-swift \(crateVersion)")
+            exit(0)
         case "--socket": socket = iterator.next()
         case "--nonce": nonce = iterator.next()
         case "--test-abort": testAbort = true

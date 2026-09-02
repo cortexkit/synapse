@@ -17,10 +17,23 @@ fn main() {
         return;
     }
 
+    // The Swift worker answers `--version` with the crate version; swiftc has
+    // no value-carrying define, so the constant is generated as a source file.
+    let version_source = out_dir.join("crate_version.swift");
+    std::fs::write(
+        &version_source,
+        format!(
+            "let crateVersion = \"{}\"\n",
+            env::var("CARGO_PKG_VERSION").expect("CARGO_PKG_VERSION is set")
+        ),
+    )
+    .expect("write generated Swift version source");
+
     let status = Command::new("swiftc")
         .arg("-O")
         .arg("-parse-as-library")
         .arg("swift/ane_worker.swift")
+        .arg(&version_source)
         .arg("-o")
         .arg(&output)
         .status();
