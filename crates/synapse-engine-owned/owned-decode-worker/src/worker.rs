@@ -21,7 +21,7 @@ use crate::validation::{validate_start, StartAuthorization, WorkerStartContext};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::mpsc::{Receiver, TryRecvError};
-use synapse_core::SidecarHintBank;
+use synapse_core::{ProgressBoundary, SidecarHintBank};
 
 /// A shared log the scripted workers write to so fixtures can assert what the
 /// supervisor sent: continuation budgets (for remaining-budget truncation),
@@ -50,6 +50,8 @@ pub enum WorkerFault {
     StartupFailure,
     /// The worker failed to acknowledge cancellation within the cancel timeout.
     FailedCancellation,
+    /// A complete transport frame violated the worker protocol without a process failure.
+    Protocol,
 }
 
 /// Failure to start a resident generation. Typed validation refusals are clean;
@@ -224,6 +226,8 @@ pub enum ScriptedEvent {
         generation: u64,
         finish: FinishReason,
     },
+    /// Return a non-process protocol error, such as malformed response JSON.
+    Protocol,
     /// Crash before emitting any frame this quantum.
     Crash,
     /// Stall past the deadline without emitting.
@@ -298,6 +302,7 @@ impl DecodeWorker for ScriptedWorker {
         let generation = self.generation;
         match event {
             ScriptedEvent::StartCrash => Err(WorkerFault::Crash),
+            ScriptedEvent::Protocol => Err(WorkerFault::Protocol),
             ScriptedEvent::Progress { committed } => {
                 self.committed = committed;
                 let sequence = self.next_sequence;
@@ -308,6 +313,7 @@ impl DecodeWorker for ScriptedWorker {
                         generation_id: self.generation_id.clone(),
                         quantum_sequence: sequence,
                         committed_token_count: committed,
+                        boundary: ProgressBoundary::Yield,
                     }),
                 })
             }
@@ -322,6 +328,7 @@ impl DecodeWorker for ScriptedWorker {
                         generation_id: self.generation_id.clone(),
                         quantum_sequence: sequence,
                         committed_token_count: committed,
+                        boundary: ProgressBoundary::Yield,
                     }),
                 })
             }
@@ -335,6 +342,7 @@ impl DecodeWorker for ScriptedWorker {
                         generation_id: "foreign-generation".into(),
                         quantum_sequence: sequence,
                         committed_token_count: committed,
+                        boundary: ProgressBoundary::Yield,
                     }),
                 })
             }

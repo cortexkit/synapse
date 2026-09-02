@@ -26,7 +26,7 @@
 //! `stop_token` finish) but not production logits.
 
 use serde::{Deserialize, Serialize};
-use synapse_core::SidecarHintBank;
+use synapse_core::{ProgressBoundary, SidecarHintBank};
 
 use crate::error::DecodeError;
 use crate::identity::{CONSTRAINT_ENCODING_ID, WORKER_PROTOCOL_ID};
@@ -337,6 +337,8 @@ pub struct GenerateProgress {
     pub quantum_sequence: u32,
     /// Attempt-local cumulative committed-token count.
     pub committed_token_count: u32,
+    /// Whether the command yielded or another frame follows immediately.
+    pub boundary: ProgressBoundary,
 }
 
 /// Continuation authorizing the next quantum.
@@ -602,6 +604,7 @@ mod tests {
             generation_id: "g1".into(),
             quantum_sequence: 1,
             committed_token_count: 8,
+            boundary: ProgressBoundary::Yield,
         }));
         let wire = envelope.to_wire();
         let parsed = FrameEnvelope::from_wire(&wire).expect("parse");

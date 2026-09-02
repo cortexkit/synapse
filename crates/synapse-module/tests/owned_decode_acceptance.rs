@@ -690,6 +690,7 @@ fn progress(
             progress: ProgressFrame {
                 committed_token_ids: tokens,
                 committed_token_count: count,
+                boundary: synapse_core::ProgressBoundary::Yield,
             },
         },
     )

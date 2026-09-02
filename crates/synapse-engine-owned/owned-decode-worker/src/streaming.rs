@@ -518,6 +518,7 @@ mod tests {
                 progress: ProgressFrame {
                     committed_token_ids: token_ids,
                     committed_token_count,
+                    boundary: synapse_core::ProgressBoundary::Yield,
                 },
             },
         )
