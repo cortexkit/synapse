@@ -642,8 +642,8 @@ mod imp {
     // -- Decode arm --------------------------------------------------------
 
     struct DecodeArm {
-        f16_decoder: MetalStepDecoder<'static>,
-        q8_decoder: MetalStepDecoder<'static>,
+        f16_decoder: MetalStepDecoder,
+        q8_decoder: MetalStepDecoder,
         stop_tokens: Vec<u32>,
         prompt_ids: Vec<u32>,
         /// Scratch buffer for the f16->Q8 KV cache handoff between generations.
@@ -679,27 +679,26 @@ mod imp {
             tokenizer.with_truncation(None).map_err(tokenizer_error)?;
 
             // f16 model for prefill (the parity-certified Q8 recipe prefills
-            // with f16 weights and steps with Q8 weights). Models are leaked
-            // to 'static so the decoders can outlive this constructor; the
-            // harness loads each model exactly once.
-            let f16_model: &'static Qwen3DecodeModel =
-                Box::leak(Box::new(Qwen3DecodeModel::load_with_quant(
-                    &snapshot.join("model.safetensors"),
-                    Precision::F16,
-                    WeightQuantization::None,
-                )?));
-            let q8_model: &'static Qwen3DecodeModel =
-                Box::leak(Box::new(Qwen3DecodeModel::load_with_quant(
-                    &snapshot.join("model.safetensors"),
-                    Precision::F16,
-                    WeightQuantization::Q8_0,
-                )?));
+            // with f16 weights and steps with Q8 weights).
+            let f16_model = Qwen3DecodeModel::load_with_quant(
+                &snapshot.join("model.safetensors"),
+                Precision::F16,
+                WeightQuantization::None,
+            )?;
+            let q8_model = Qwen3DecodeModel::load_with_quant(
+                &snapshot.join("model.safetensors"),
+                Precision::F16,
+                WeightQuantization::Q8_0,
+            )?;
+            let stop_tokens = q8_model.generation_stop_ids().to_vec();
+            let layers = q8_model.layers.len();
+            let layer_elements =
+                2 * q8_model.config.num_key_value_heads * 2048 * q8_model.config.head_dim;
             // Context bucket 2048: the workload record's context_bucket.
             let f16_decoder =
                 MetalStepDecoder::new(f16_model, Precision::F16, 2048, WeightQuantization::None)?;
             let q8_decoder =
                 MetalStepDecoder::new(q8_model, Precision::F16, 2048, WeightQuantization::Q8_0)?;
-            let stop_tokens = q8_model.generation_stop_ids().to_vec();
 
             // Build the fixed 128-token workload prompt by cycling the token
             // IDs of the first completion prompt.
@@ -713,11 +712,6 @@ mod imp {
                 prompt_ids.push(base[index % base.len()]);
             }
 
-            let layers = q8_model.layers.len();
-            let layer_elements = 2
-                * q8_model.config.num_key_value_heads
-                * q8_decoder.capacity()
-                * q8_model.config.head_dim;
             Ok(Self {
                 f16_decoder,
                 q8_decoder,

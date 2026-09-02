@@ -127,3 +127,106 @@ including 8729 MB `Malloc Large` and 2444 MB owned graphics. That closely
 matches the measured q8 GPU signature. Thus the fleet daemon's resident decode
 worker carries the same static q8 overhead today; the exposure does not require
 a growing request curve or a currently live ANE child.
+
+## Addendum: load-time representation ownership fix (2026-09-02)
+
+This addendum preserves the investigation above and records the consumer proof,
+implementation, and repeat measurements for the production fix.
+
+### Post-construction consumer map
+
+The Qwen3 loader materializes checkpoint tensors as f32 `Tensor.data`, creates
+Q8_0 blocks beside linear tensors when requested, and prepares f16 mirrors
+(`crates/synapse-engine-owned/owned-decode-engine/src/qwen3_decode_model.rs:131-232`,
+`:267-287`, `:337-350`). The native upload copies those pointers through a
+shared staging buffer into private Metal buffers and waits for the blit command
+to complete before returning
+(`crates/synapse-engine-owned/owned-decode-engine/src/qwen3_decode_metal_step.m:170-203`,
+`:321-471`). Therefore the Rust-side load model is an upload source, not storage
+referenced by later command buffers.
+
+| representation | consumers after `MetalStepDecoder::new` returns | verdict |
+| --- | --- | --- |
+| Qwen3 linear/lm-head f32 `Tensor.data` | None. Step, sequential verify, K<=16 batched verify, and chain call the native context using only decoder scalars (`qwen3_decode_metal_step.rs:341-514`, `:524-614`); the native context owns the private `MTLBuffer`s (`qwen3_decode_metal_step.m:77-120`). | Drop with the consumed load model. |
+| Qwen3 linear/lm-head CPU f16 mirrors | None after the synchronous prepare call (`qwen3_decode_metal_step.rs:94-175`). | Drop with the consumed load model. |
+| Qwen3 norm f32 data and f16 mirrors | None after synchronous upload; later calls pass epsilon but no norm pointer (`qwen3_decode_metal_step.rs:341-514`, `:542-569`). | Drop with the consumed load model. |
+| Qwen3 Q8_0 blocks, including a tied Q8 head | None after synchronous upload. `quantized_weight_sha256` is a pre-construction model utility (`qwen3_decode_model.rs:310-330`), not a resident decode consumer. | Drop with the consumed load model. |
+| Qwen3 embedding f16 mirror | None after the private embedding-table upload (`qwen3_decode_metal_step.rs:143-161`). Device-gather verify/chain uses the private table. | Drop with the consumed load model. |
+| Qwen3 embedding f32 data | The host-fed single-token step still slices this table and converts that row to the same f16 bits (`qwen3_decode_metal_step.rs:253-261`, `:542-569`). | Stays, moved into `MetalStepDecoder::embedding_table`. |
+| separate Qwen3 `f16_prefill` engine | Live. Q8 pure-GPU prefill runs this engine and hands its f16 K/V bits to the Q8 engine (`crates/synapse-worker-decode/src/runner.rs:1803-1821`); constrained prefill also runs it for full logits (`:1830-1850`). The quantum-bounded path sends complete 16-token chunks through batched mat-mat verification (`:1665-1699`). | Engine stays; its consumed load model does not. |
+| ANE failure fallback | Live GPU-engine consumer, not a CPU-weight consumer. Both constrained and unconstrained failures return to `prefill_logits`/`prefill_greedy` (`runner.rs:2702-2751`), which use the same resident Metal engines above. | Engines stay. No extra model copy is needed. |
+| production CPU/reference fallback | None. `DecodeEngine` has only Qwen3 Metal and LFM2 hybrid-Metal variants (`runner.rs:1649-1658`); production errors propagate as unavailable rather than invoking a CPU model (`:2660-2753`). CPU/spike references are checkpoint-gated test oracles, not worker fallbacks. | No retained CPU linear representation required. |
+
+LFM2 does not share the Qwen3 lifetime bug. Its constructor copies the only
+post-construction host input, an f16 embedding table, into the engine; f16
+weight holders are temporary, Q8 and convolution pointers are upload inputs,
+and the temporary holders drop immediately after synchronous prepare
+(`crates/synapse-engine-owned/owned-decode-engine/src/lfm2_decode_metal_step.rs:121-340`).
+Only the engine-owned embedding table is later read by single-token `advance`
+(`:495-515`); prefill, verify, and chain use the native context (`:384-442`,
+`:521-549`, `:574-604`). The worker's LFM2 model is already a local dropped
+after engine construction (`crates/synapse-worker-decode/src/runner.rs:2462-2466`).
+No LFM2 change was required.
+
+Worker restart behavior also remains bounded: each supervisor spawn creates a
+fresh transport session and reloads the immutable model key
+(`crates/synapse-module/src/worker_host/mod.rs:1209-1218`), and every worker
+`LOAD` reconstructs the engines (`crates/synapse-worker-decode/src/runner.rs:2356-2496`).
+`UNLOAD` and `SHUTDOWN` drop `LoadedRuntime` and its native contexts
+(`runner.rs:3688-3716`). The Qwen3 load models are no longer `Box::leak`ed, so a
+restart cannot strand their host representations; the crash/reload contract is
+exercised by `crates/synapse-worker-decode/tests/worker_transport.rs:461-535`.
+
+### Ownership change
+
+`MetalStepDecoder::new` now consumes `Qwen3DecodeModel`. It uploads from that
+model, waits for the native private-buffer copy, moves only the live f32
+embedding table into the decoder, and lets all remaining model storage drop
+before returning (`qwen3_decode_metal_step.rs:68-175`). Consuming the model is
+the ownership proof: no caller can retain or later read an uploaded tensor.
+The worker and certification/measurement callers now retain decoder engines,
+not leaked load models. There is no configuration switch.
+
+### Repeated stage curves
+
+The same release worker, checkpoint, 128-token prompt, five-request steady
+window, and GPU arms were measured immediately before and after the change.
+Figures are process-tree `phys_footprint` GiB; category columns are steady-state
+`footprint(1)` GiB.
+
+| arm | before load | after load | before steady | after steady | steady reduction | before/after Malloc Large | before/after graphics |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| q8 GPU | 11.521 | 4.225 | 10.696 | 4.072 | 6.624 GiB (61.9%) | 7.763 / 1.472 | 2.499 / 2.499 |
+| f16 GPU | 7.225 | 2.754 | 6.083 | 2.218 | 3.865 GiB (63.5%) | 4.332 / 0.610 | 1.564 / 1.564 |
+
+Raw curves:
+
+- `results/decode-worker-memory-attribution-2026-09-02-before-q8-gpu.json`
+- `results/decode-worker-memory-attribution-2026-09-02-after-q8-gpu.json`
+- `results/decode-worker-memory-attribution-2026-09-02-before-f16-gpu.json`
+- `results/decode-worker-memory-attribution-2026-09-02-after-f16-gpu.json`
+
+All four runs produced the same one-token SHA-256,
+`43c66c260828c9839f26474151db105481ff92f5e01377f75389d4ce3d2dd574`,
+and each run produced that digest for all five requests. The graphics category
+is unchanged while `Malloc Large` collapses, matching the intended removal of
+host upload representations rather than any arithmetic or Metal-kernel change.
+
+### Verification record
+
+- The complete `synapse-module` all-target test battery passed.
+- The Qwen3 prefill/verification exactness battery passed all eight ignored
+  tests, covering f16 and Q8 sequential prefill, K=16 mat-mat prefill, batched
+  logits, determinism, and rejection rollback.
+- The supplied checkpoint does not satisfy the repository's pinned
+  `owned_decode_parity` or worker-transport checkpoint fixtures on the base
+  revision: the Qwen3 parity lanes report the same first-token divergences
+  before and after this change, and the worker fixture quarantines before and
+  after. Baseline behavior was reproduced by restoring the unmodified sources
+  and rerunning one test from each battery. These failures were not hidden by
+  changing fixtures; the stage-harness digest and the independent eight-test
+  prefill/verification battery are the change-specific exactness evidence.
+- Rust 1.98 clippy with `--all-targets -D warnings` passed for all three changed
+  packages. The workspace-wide command reaches an unrelated pre-existing
+  `unnecessary_cast` in `bench/lanes/candle-embed/src/main.rs:365`.
+- Formatting, the public banlist, and comment-clarity review passed.
