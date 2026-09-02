@@ -77,16 +77,31 @@ jobs:
         with:
           path: synapse
 
-      # Public sibling path-dependencies, pinned by the workspace lock.
+      # Public sibling path-dependencies. Cargo.lock pins their crate
+      # versions but not their commits, so siblings.lock carries the exact
+      # SHAs the lock was refreshed against; checking out anything newer makes
+      # `cargo build --locked` refuse.
+      - name: Resolve sibling pins
+        id: pins
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in subconscious commons; do
+            sha=$(grep "^${name}=" synapse/siblings.lock | cut -d= -f2)
+            [ -n "$sha" ] || { echo "siblings.lock: missing pin for $name" >&2; exit 1; }
+            echo "${name}=${sha}" >> "$GITHUB_OUTPUT"
+          done
       - name: Checkout subconscious
         uses: actions/checkout@v4
         with:
           repository: cortexkit/subconscious
+          ref: ${{ steps.pins.outputs.subconscious }}
           path: subconscious
       - name: Checkout commons
         uses: actions/checkout@v4
         with:
           repository: cortexkit/commons
+          ref: ${{ steps.pins.outputs.commons }}
           path: commons
 
       - name: Install Rust toolchain

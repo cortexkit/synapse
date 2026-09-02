@@ -13595,11 +13595,17 @@ fn manifest(module_id: &str) -> ModuleManifest {
     // Build facts stay absent because release scripts do not stamp
     // CK_BUILD_* yet, and the helper maps an absent input to field omission
     // rather than minting a sentinel string that would read as a fact.
-    .provenance(Some(build_provenance(
-        None,
-        None,
-        Some(&store::newest_schema_version().to_string()),
-    )))
+    .provenance(Some(
+        build_provenance(
+            None,
+            None,
+            Some(&store::newest_schema_version().to_string()),
+        )
+        // Form validation covers only the sha and lock-digest inputs, and both
+        // are absent here, so an Err would mean the SDK contract itself
+        // changed rather than any runtime condition.
+        .expect("build_provenance with absent sha and lock digest cannot fail form validation"),
+    ))
     .build()
 }
 
