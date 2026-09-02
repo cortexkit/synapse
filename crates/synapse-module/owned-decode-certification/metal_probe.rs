@@ -189,13 +189,12 @@ fn fixture_fingerprint(fixture: &ParityFixture) -> Fingerprint {
     .expect("fixture identity inputs are valid")
 }
 
-/// Qwen3 lane probe: drives the production Metal step decoder. The decoder
-/// borrows the model, so both live behind shared references for the probe's
-/// lifetime. For Q8 lanes the f16 prefill decoder is present.
+/// Qwen3 lane probe: drives the production Metal step decoder. For Q8 lanes
+/// the separate f16 prefill decoder remains resident.
 struct Qwen3LaneProbe<'a> {
-    f16_decoder: Option<MetalStepDecoder<'a>>,
-    step_decoder: MetalStepDecoder<'a>,
-    model: &'a Qwen3DecodeModel,
+    f16_decoder: Option<MetalStepDecoder>,
+    step_decoder: MetalStepDecoder,
+    layer_count: usize,
     tokenizer: &'a Tokenizer,
     prompt_texts: &'a [String],
     stop_tokens: std::collections::HashSet<u32>,
@@ -209,7 +208,7 @@ impl DecodeProbe for Qwen3LaneProbe<'_> {
         qwen3_greedy_decode(
             &mut self.f16_decoder,
             &mut self.step_decoder,
-            self.model,
+            self.layer_count,
             self.tokenizer,
             &self.prompt_texts[prompt_index as usize],
             self.max_tokens,
@@ -279,7 +278,7 @@ fn load_tokenizer(snapshot: &std::path::Path) -> Tokenizer {
 fn qwen3_greedy_decode(
     f16_decoder: &mut Option<MetalStepDecoder>,
     step_decoder: &mut MetalStepDecoder,
-    model: &Qwen3DecodeModel,
+    layer_count: usize,
     tokenizer: &Tokenizer,
     prompt: &str,
     max_tokens: usize,
@@ -294,9 +293,8 @@ fn qwen3_greedy_decode(
     let (first, mut cache) = if weight_quant.is_quantized() {
         let f16 = f16_decoder.as_mut().expect("f16 decoder for Q8 prefill");
         let (f16_cache, first) = f16.prefill(&prompt_ids).expect("f16 prefill");
-        let one_layer_elements = 2 * model.config.num_key_value_heads * 512 * model.config.head_dim;
-        let mut cache_bits = Vec::with_capacity(model.layers.len() * one_layer_elements);
-        for layer in 0..model.layers.len() {
+        let mut cache_bits = Vec::new();
+        for layer in 0..layer_count {
             cache_bits.extend(f16.inspect_cache_bits(layer).expect("export f16 cache"));
         }
         step_decoder
@@ -481,7 +479,7 @@ fn metal_certification_probe_four_lanes() {
                 } else {
                     None
                 };
-                let f16_decoder = f16_model.as_ref().map(|model| {
+                let f16_decoder = f16_model.map(|model| {
                     MetalStepDecoder::new(model, Precision::F16, 512, WeightQuantization::None)
                         .expect("create Qwen3 f16 prefill decoder")
                 });
@@ -491,21 +489,21 @@ fn metal_certification_probe_four_lanes() {
                     weight_quant,
                 )
                 .expect("load Qwen3 decode model");
-                let step_decoder = MetalStepDecoder::new(&model, Precision::F16, 512, weight_quant)
+                let stop_tokens = model.generation_stop_ids().iter().copied().collect();
+                let layer_count = model.layers.len();
+                let step_decoder = MetalStepDecoder::new(model, Precision::F16, 512, weight_quant)
                     .expect("create Qwen3 Metal step decoder");
                 let mut lane_probe = Qwen3LaneProbe {
                     f16_decoder,
                     step_decoder,
-                    stop_tokens: model.generation_stop_ids().iter().copied().collect(),
-                    model: &model,
+                    stop_tokens,
+                    layer_count,
                     tokenizer: &tokenizer,
                     prompt_texts: &prompt_texts,
                     max_tokens,
                     weight_quant,
                     chain_k: 1,
                 };
-                // `f16_model` stays bound in this arm until after `lane_probe`
-                // drops, so the prefill decoder's borrow stays valid.
                 probe
                     .certify_unconstrained_lane_with_chain_k(
                         &mut lane_probe,

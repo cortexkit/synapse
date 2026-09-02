@@ -1648,8 +1648,8 @@ struct Args {
 
 enum DecodeEngine {
     Qwen {
-        decoder: MetalStepDecoder<'static>,
-        f16_prefill: Option<MetalStepDecoder<'static>>,
+        decoder: MetalStepDecoder,
+        f16_prefill: Option<MetalStepDecoder>,
         layer_count: usize,
     },
     Lfm2 {
@@ -1663,7 +1663,7 @@ enum DecodeCache {
 }
 
 fn prefill_qwen_batched(
-    decoder: &mut MetalStepDecoder<'_>,
+    decoder: &mut MetalStepDecoder,
     prompt: &[u32],
 ) -> Result<(MetalStepKvCache, u32)> {
     ensure!(!prompt.is_empty(), "decode prompt must not be empty");
@@ -1992,8 +1992,8 @@ impl DecodeEngine {
 }
 
 fn handoff_qwen_cache(
-    prefill: &MetalStepDecoder<'_>,
-    decoder: &mut MetalStepDecoder<'_>,
+    prefill: &MetalStepDecoder,
+    decoder: &mut MetalStepDecoder,
     layer_count: usize,
     position: usize,
 ) -> Result<MetalStepKvCache> {
@@ -2002,7 +2002,7 @@ fn handoff_qwen_cache(
     Ok(MetalStepKvCache { position })
 }
 
-fn collect_qwen_cache_bits(prefill: &MetalStepDecoder<'_>, layer_count: usize) -> Result<Vec<u16>> {
+fn collect_qwen_cache_bits(prefill: &MetalStepDecoder, layer_count: usize) -> Result<Vec<u16>> {
     let mut cache_bits = Vec::new();
     for layer in 0..layer_count {
         cache_bits.extend(prefill.inspect_cache_bits(layer)?);
@@ -2420,11 +2420,7 @@ impl WorkerState {
         let model_ref = "owned-decode:0".to_string();
         let (engine, stop_ids, ane_prefill) = match family {
             "qwen3-0.6b" => {
-                let model = Box::leak(Box::new(Qwen3DecodeModel::load_with_quant(
-                    path,
-                    Precision::F16,
-                    quant,
-                )?));
+                let model = Qwen3DecodeModel::load_with_quant(path, Precision::F16, quant)?;
                 let stop_ids = model.generation_stop_ids().to_vec();
                 let layer_count = model.layers.len();
                 let ane_prefill = AnePrefillConfig::from_runtime_config(
@@ -2439,11 +2435,11 @@ impl WorkerState {
                 .map(AnePrefillRuntime::new);
                 let decoder = MetalStepDecoder::new(model, Precision::F16, bucket, quant)?;
                 let f16_prefill = if quant.is_quantized() {
-                    let model = Box::leak(Box::new(Qwen3DecodeModel::load_with_quant(
+                    let model = Qwen3DecodeModel::load_with_quant(
                         path,
                         Precision::F16,
                         WeightQuantization::None,
-                    )?));
+                    )?;
                     Some(MetalStepDecoder::new(
                         model,
                         Precision::F16,
@@ -4755,24 +4751,21 @@ mod tests {
             return;
         };
         let model_path = checkpoint.join("model.safetensors");
-        let f16_model = Box::leak(Box::new(
-            Qwen3DecodeModel::load_with_quant(
-                &model_path,
-                Precision::F16,
-                WeightQuantization::None,
-            )
-            .expect("load f16 checkpoint"),
-        ));
-        let q8_model = Box::leak(Box::new(
-            Qwen3DecodeModel::load_with_quant(
-                &model_path,
-                Precision::F16,
-                WeightQuantization::Q8_0,
-            )
-            .expect("load q8 checkpoint"),
-        ));
+        let f16_model = Qwen3DecodeModel::load_with_quant(
+            &model_path,
+            Precision::F16,
+            WeightQuantization::None,
+        )
+        .expect("load f16 checkpoint");
+        let q8_model = Qwen3DecodeModel::load_with_quant(
+            &model_path,
+            Precision::F16,
+            WeightQuantization::Q8_0,
+        )
+        .expect("load q8 checkpoint");
         let bucket = 512;
-        let elements = f16_model.layers.len()
+        let layer_count = f16_model.layers.len();
+        let elements = layer_count
             * 2
             * f16_model.config.num_key_value_heads
             * bucket
@@ -4790,13 +4783,13 @@ mod tests {
         f16_source
             .import_caches(&cache_bits)
             .expect("import cache through the legacy f16 source engine");
-        let legacy = collect_qwen_cache_bits(&f16_source, f16_model.layers.len())
+        let legacy = collect_qwen_cache_bits(&f16_source, layer_count)
             .expect("read legacy f16 handoff bytes");
         q8_target
             .import_caches(&cache_bits)
             .expect("import cache directly into the q8 target engine");
-        let direct = collect_qwen_cache_bits(&q8_target, q8_model.layers.len())
-            .expect("read direct q8 cache bytes");
+        let direct =
+            collect_qwen_cache_bits(&q8_target, layer_count).expect("read direct q8 cache bytes");
 
         assert_eq!(legacy, cache_bits);
         assert_eq!(direct, legacy);

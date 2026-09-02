@@ -68,17 +68,18 @@ fn model_path() -> PathBuf {
     )
 }
 
-/// Build a Metal step decoder over the real model and hand both to `body`.
-/// The model outlives the decoder borrow within the closure scope.
+/// Build a Metal step decoder over the real model and pass its layer count to
+/// the test closure so it can inspect the decoder's cache.
 fn with_decoder<R>(
     weight_quant: WeightQuantization,
-    body: impl FnOnce(&Qwen3DecodeModel, &mut MetalStepDecoder) -> R,
+    body: impl FnOnce(usize, &mut MetalStepDecoder) -> R,
 ) -> R {
     let model = Qwen3DecodeModel::load_with_quant(&model_path(), Precision::F16, weight_quant)
         .expect("load Qwen3-0.6B");
-    let mut decoder = MetalStepDecoder::new(&model, Precision::F16, BUCKET, weight_quant)
+    let layers = model.layers.len();
+    let mut decoder = MetalStepDecoder::new(model, Precision::F16, BUCKET, weight_quant)
         .expect("construct Metal step decoder");
-    body(&model, &mut decoder)
+    body(layers, &mut decoder)
 }
 
 /// Host greedy argmax matching the sampler rule: highest logit, lowest id on
@@ -141,8 +142,7 @@ fn assert_kv_identical(reference: &[u16], candidate: &[u16], what: &str) {
 /// buffer prefill: byte-identical KV state and the same first-token argmax,
 /// for per-token spans of 8/16/32 and the 16-token batched spans.
 fn chunked_prefill_bit_exact_for(weight_quant: WeightQuantization) {
-    with_decoder(weight_quant, |model, decoder| {
-        let layers = model.layers.len();
+    with_decoder(weight_quant, |layers, decoder| {
         for prompt_len in [1usize, 5, 33, 128] {
             let prompt = synthetic_prompt(prompt_len);
 
@@ -233,7 +233,7 @@ fn chunked_prefill_is_bit_exact_q8() {
 /// {1,2,4,8,16} and prompt depths {1,5,33,128,469}. Port of the spike's
 /// campaign gate to the production engine.
 fn byte_identical_gate_for(weight_quant: WeightQuantization) {
-    with_decoder(weight_quant, |_model, decoder| {
+    with_decoder(weight_quant, |_layers, decoder| {
         for prompt_len in [1usize, 5, 33, 128, 469] {
             let prompt = synthetic_prompt(prompt_len);
             let (cache, first) = decoder.prefill(&prompt).expect("prefill");
@@ -305,7 +305,7 @@ fn batched_verify_logits_are_byte_identical_to_sequential_q8() {
 
 /// Two batched runs over the same draft must produce bit-identical logits.
 fn determinism_gate_for(weight_quant: WeightQuantization) {
-    with_decoder(weight_quant, |_model, decoder| {
+    with_decoder(weight_quant, |_layers, decoder| {
         let prompt = synthetic_prompt(64);
         let (cache, first) = decoder.prefill(&prompt).expect("prefill");
         let mut cache = cache;
@@ -355,7 +355,7 @@ fn batched_verify_is_deterministic_q8() {
 /// every rejection position so each KV slot in the batch window is exercised
 /// as the rollback boundary.
 fn forced_rejection_gate_for(weight_quant: WeightQuantization) {
-    with_decoder(weight_quant, |_model, decoder| {
+    with_decoder(weight_quant, |_layers, decoder| {
         let prompt = synthetic_prompt(48);
         let (cache, first) = decoder.prefill(&prompt).expect("prefill");
         let mut cache = cache;

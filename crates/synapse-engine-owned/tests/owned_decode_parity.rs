@@ -167,7 +167,7 @@ fn load_spike_qwen3_output(name: &str, pinned_sha256: &str) -> HashMap<String, V
 fn qwen3_greedy_decode(
     f16_decoder: &mut Option<MetalStepDecoder>,
     q8_decoder: &mut MetalStepDecoder,
-    model: &Qwen3DecodeModel,
+    layer_count: usize,
     tokenizer: &Tokenizer,
     prompt: &str,
     max_tokens: usize,
@@ -183,9 +183,8 @@ fn qwen3_greedy_decode(
         let f16 = f16_decoder.as_mut().expect("f16 decoder for Q8 prefill");
         let (f16_cache, first) = f16.prefill(&prompt_ids).expect("f16 prefill");
         // Export KV cache bits from the f16 engine.
-        let one_layer_elements = 2 * model.config.num_key_value_heads * 512 * model.config.head_dim;
-        let mut cache_bits = Vec::with_capacity(model.layers.len() * one_layer_elements);
-        for layer in 0..model.layers.len() {
+        let mut cache_bits = Vec::new();
+        for layer in 0..layer_count {
             cache_bits.extend(f16.inspect_cache_bits(layer).expect("export f16 cache"));
         }
         // Import into the Q8 engine.
@@ -343,7 +342,7 @@ fn run_qwen3_lane(
     } else {
         None
     };
-    let f16_decoder = f16_model.as_ref().map(|model| {
+    let f16_decoder = f16_model.map(|model| {
         MetalStepDecoder::new(model, Precision::F16, 512, WeightQuantization::None)
             .expect("create Qwen3 f16 decoder for Q8 prefill")
     });
@@ -354,10 +353,10 @@ fn run_qwen3_lane(
         weight_quant,
     )
     .expect("load Qwen3 decode model");
-    let mut decoder = MetalStepDecoder::new(&model, Precision::F16, 512, weight_quant)
-        .expect("create Qwen3 Metal step decoder");
-
     let stop_tokens = model.generation_stop_ids().iter().copied().collect();
+    let layer_count = model.layers.len();
+    let mut decoder = MetalStepDecoder::new(model, Precision::F16, 512, weight_quant)
+        .expect("create Qwen3 Metal step decoder");
     let prompts = load_decode_prompts();
     let mut byte_identical = 0;
     let mut forks = Vec::new();
@@ -367,7 +366,7 @@ fn run_qwen3_lane(
         let prod_tokens = qwen3_greedy_decode(
             &mut f16_dec,
             &mut decoder,
-            &model,
+            layer_count,
             &tokenizer,
             &prompt.prompt,
             64,

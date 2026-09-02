@@ -68,12 +68,21 @@ pub struct MetalStepKvCache {
 /// Production-owned Qwen3 Metal step decoder.
 ///
 /// Drives causal prefill and greedy token stepping through the device-resident
-/// Metal step kernels. Prefill uses the step engine's verify path
-/// (token-by-token on device) instead of the deprecated MPSGraph prefill.
-pub struct MetalStepDecoder<'a> {
+/// Metal step kernels. The constructor consumes the load-time model after the
+/// synchronous private-buffer upload, retaining only the f32 embedding table
+/// used by the host-fed single-token path.
+pub struct MetalStepDecoder {
     raw: NonNull<c_void>,
-    model: &'a Model,
+    embedding_table: Vec<f32>,
+    hidden: usize,
+    vocab: usize,
+    layer_count: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    rope_theta: f32,
+    epsilon: f32,
     bucket: usize,
+    weight_quantization: WeightQuantization,
     // Chained-decode span. k=1 preserves the fully instrumented per-token path
     // byte-for-byte; k>1 encodes k forward passes plus on-GPU argmax into one
     // command buffer with a single readback. Production baseline is K=1
@@ -81,9 +90,9 @@ pub struct MetalStepDecoder<'a> {
     chain_k: usize,
 }
 
-impl<'a> MetalStepDecoder<'a> {
+impl MetalStepDecoder {
     pub fn new(
-        model: &'a Model,
+        mut model: Model,
         precision: Precision,
         bucket: usize,
         weight_quantization: WeightQuantization,
@@ -117,17 +126,25 @@ impl<'a> MetalStepDecoder<'a> {
             )
         })
         .ok_or_else(last_error)?;
-        let decoder = Self {
+        let mut decoder = Self {
             raw,
-            model,
+            embedding_table: Vec::new(),
+            hidden: model.config.hidden_size,
+            vocab: model.config.vocab_size,
+            layer_count: model.layers.len(),
+            kv_heads: model.config.num_key_value_heads,
+            head_dim: model.config.head_dim,
+            rope_theta: model.config.rope_theta,
+            epsilon: model.config.rms_norm_eps,
             bucket,
+            weight_quantization,
             chain_k: 1,
         };
-        let params = decoder.layer_params()?;
-        let final_norm = decoder.model.final_norm.weight.metal_f16_bits()?;
-        let lm_head = decoder.model.lm_head()?.metal_f16_bits()?;
+        let params = Self::layer_params(&model)?;
+        let final_norm = model.final_norm.weight.metal_f16_bits()?;
+        let lm_head = model.lm_head()?.metal_f16_bits()?;
         // The chained-decode embedding gather reads this resident f16 table.
-        let embeddings = decoder.model.embeddings.metal_f16_bits()?;
+        let embeddings = model.embeddings.metal_f16_bits()?;
         let status = unsafe {
             synapse_qwen3_metal_step_prepare(
                 decoder.raw.as_ptr(),
@@ -136,8 +153,7 @@ impl<'a> MetalStepDecoder<'a> {
                 params.as_ptr(),
                 final_norm.as_ptr().cast(),
                 lm_head.as_ptr().cast(),
-                decoder
-                    .model
+                model
                     .lm_head_q8_0()
                     .map_or(std::ptr::null(), |weight| weight.as_bytes().as_ptr())
                     .cast(),
@@ -150,11 +166,16 @@ impl<'a> MetalStepDecoder<'a> {
                 last_error()
             );
         }
+
+        // `synapse_qwen3_metal_step_prepare` waits for its private-buffer blit
+        // before returning. Moving the sole live host representation out lets
+        // every uploaded source, mirror, and Q8 block drop with `model` here.
+        decoder.embedding_table = std::mem::take(&mut model.embeddings.data);
         Ok(decoder)
     }
 
-    fn layer_params(&self) -> Result<Vec<StepLayerParams>> {
-        self.model
+    fn layer_params(model: &Model) -> Result<Vec<StepLayerParams>> {
+        model
             .layers
             .iter()
             .map(|layer| {
@@ -232,11 +253,11 @@ impl<'a> MetalStepDecoder<'a> {
     fn embedding(&self, token: u32) -> Result<&[f32]> {
         let token = token as usize;
         ensure!(
-            token < self.model.config.vocab_size,
+            token < self.vocab,
             "token id {token} outside Qwen3 vocabulary"
         );
-        let hidden = self.model.config.hidden_size;
-        Ok(&self.model.embeddings.data[token * hidden..(token + 1) * hidden])
+        let hidden = self.hidden;
+        Ok(&self.embedding_table[token * hidden..(token + 1) * hidden])
     }
 
     pub fn import_caches(&self, cache_bits: &[u16]) -> Result<()> {
@@ -258,11 +279,10 @@ impl<'a> MetalStepDecoder<'a> {
 
     pub fn inspect_cache_bits(&self, layer: usize) -> Result<Vec<u16>> {
         ensure!(
-            layer < self.model.layers.len(),
+            layer < self.layer_count,
             "KV cache layer {layer} out of range"
         );
-        let elements =
-            2 * self.model.config.num_key_value_heads * self.bucket * self.model.config.head_dim;
+        let elements = 2 * self.kv_heads * self.bucket * self.head_dim;
         let mut bits = vec![0u16; elements];
         let status = unsafe {
             synapse_qwen3_metal_step_cache_copy(
@@ -282,15 +302,13 @@ impl<'a> MetalStepDecoder<'a> {
     }
 
     fn rope(&self, position: usize) -> (Vec<u16>, Vec<u16>) {
-        let head_dim = self.model.config.head_dim;
+        let head_dim = self.head_dim;
         let mut cosine = Vec::with_capacity(head_dim);
         let mut sine = Vec::with_capacity(head_dim);
         for index in 0..head_dim {
             let rotary_index = index % (head_dim / 2);
             let frequency = 1.0
                 / self
-                    .model
-                    .config
                     .rope_theta
                     .powf((2 * rotary_index) as f32 / head_dim as f32);
             let (sin, cos) = (position as f32 * frequency).sin_cos();
@@ -305,7 +323,7 @@ impl<'a> MetalStepDecoder<'a> {
     /// per-index formula as `rope`, so the chain's step S reads a block that is
     /// byte-identical to what the per-token path would compute for `start + S`.
     fn rope_chain(&self, start: usize, steps: usize) -> (Vec<u16>, Vec<u16>) {
-        let head_dim = self.model.config.head_dim;
+        let head_dim = self.head_dim;
         let mut cosine = Vec::with_capacity(head_dim * steps);
         let mut sine = Vec::with_capacity(head_dim * steps);
         for step in 0..steps {
@@ -341,9 +359,7 @@ impl<'a> MetalStepDecoder<'a> {
             "speculative verification exceeds cache capacity"
         );
         ensure!(
-            tokens
-                .iter()
-                .all(|&token| (token as usize) < self.model.config.vocab_size),
+            tokens.iter().all(|&token| (token as usize) < self.vocab),
             "speculative verification received a token outside the Qwen3 vocabulary"
         );
         let (rope_cos, rope_sin) = self.rope_chain(cache.position, tokens.len());
@@ -357,7 +373,7 @@ impl<'a> MetalStepDecoder<'a> {
                 rope_cos.as_ptr(),
                 rope_sin.as_ptr(),
                 argmaxes.as_mut_ptr(),
-                self.model.config.rms_norm_eps,
+                self.epsilon,
             )
         };
         if status != 0 {
@@ -398,7 +414,7 @@ impl<'a> MetalStepDecoder<'a> {
         cache: &mut MetalStepKvCache,
         tokens: &[u32],
     ) -> Result<Vec<f32>> {
-        let mut logits = vec![0.0f32; tokens.len() * self.model.config.vocab_size];
+        let mut logits = vec![0.0f32; tokens.len() * self.vocab];
         self.verify_tokens_batch_inner(cache, tokens, Some(&mut logits))?;
         Ok(logits)
     }
@@ -424,14 +440,12 @@ impl<'a> MetalStepDecoder<'a> {
             "batched verification exceeds cache capacity"
         );
         ensure!(
-            tokens
-                .iter()
-                .all(|&token| (token as usize) < self.model.config.vocab_size),
+            tokens.iter().all(|&token| (token as usize) < self.vocab),
             "batched verification received a token outside the Qwen3 vocabulary"
         );
         if let Some(logits) = &logits_out {
             ensure!(
-                logits.len() == tokens.len() * self.model.config.vocab_size,
+                logits.len() == tokens.len() * self.vocab,
                 "batched verification logits output has the wrong length"
             );
         }
@@ -447,7 +461,7 @@ impl<'a> MetalStepDecoder<'a> {
                 rope_sin.as_ptr(),
                 argmaxes.as_mut_ptr(),
                 logits_out.map_or(std::ptr::null_mut(), |logits| logits.as_mut_ptr()),
-                self.model.config.rms_norm_eps,
+                self.epsilon,
             )
         };
         if status != 0 {
@@ -486,7 +500,7 @@ impl<'a> MetalStepDecoder<'a> {
                 rope_cos.as_ptr(),
                 rope_sin.as_ptr(),
                 token_ids.as_mut_ptr(),
-                self.model.config.rms_norm_eps,
+                self.epsilon,
             )
         };
         if status != 0 {
@@ -500,7 +514,7 @@ impl<'a> MetalStepDecoder<'a> {
     }
 }
 
-impl DecodeKernel for MetalStepDecoder<'_> {
+impl DecodeKernel for MetalStepDecoder {
     type Cache = MetalStepKvCache;
 
     fn capacity(&self) -> usize {
@@ -532,7 +546,7 @@ impl DecodeKernel for MetalStepDecoder<'_> {
         );
         let input = encode_f16_bits(self.embedding(token)?);
         let (rope_cos, rope_sin) = self.rope(cache.position);
-        let mut logits = vec![0.0f32; self.model.config.vocab_size];
+        let mut logits = vec![0.0f32; self.vocab];
         let status = unsafe {
             synapse_qwen3_metal_step(
                 self.raw.as_ptr(),
@@ -541,7 +555,7 @@ impl DecodeKernel for MetalStepDecoder<'_> {
                 rope_cos.as_ptr(),
                 rope_sin.as_ptr(),
                 logits.as_mut_ptr(),
-                self.model.config.rms_norm_eps,
+                self.epsilon,
             )
         };
         if status != 0 {
@@ -601,11 +615,10 @@ impl DecodeKernel for MetalStepDecoder<'_> {
 
     fn inspect_cache_layer(&self, _cache: &Self::Cache, layer: usize) -> Result<Vec<f32>> {
         ensure!(
-            layer < self.model.layers.len(),
+            layer < self.layer_count,
             "KV cache layer {layer} out of range"
         );
-        let elements =
-            2 * self.model.config.num_key_value_heads * self.bucket * self.model.config.head_dim;
+        let elements = 2 * self.kv_heads * self.bucket * self.head_dim;
         let mut bits = vec![0u16; elements];
         let status = unsafe {
             synapse_qwen3_metal_step_cache_copy(
@@ -629,7 +642,7 @@ impl DecodeKernel for MetalStepDecoder<'_> {
     }
 }
 
-impl DecodeRuntime for MetalStepDecoder<'_> {
+impl DecodeRuntime for MetalStepDecoder {
     fn lane(&self) -> &'static str {
         "owned-metal-decode"
     }
@@ -639,7 +652,7 @@ impl DecodeRuntime for MetalStepDecoder<'_> {
     }
 
     fn weight_feed_path(&self) -> &'static str {
-        match self.model.weight_quantization {
+        match self.weight_quantization {
             WeightQuantization::None => "metal-step-persistent-f16-matvec",
             WeightQuantization::Q8_0 => "metal-step-persistent-q8_0-fused-dequant-matvec",
         }
@@ -650,7 +663,7 @@ impl DecodeRuntime for MetalStepDecoder<'_> {
     }
 }
 
-impl Drop for MetalStepDecoder<'_> {
+impl Drop for MetalStepDecoder {
     fn drop(&mut self) {
         unsafe {
             synapse_qwen3_metal_step_context_free(self.raw.as_ptr());
