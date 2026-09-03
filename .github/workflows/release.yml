@@ -214,3 +214,41 @@ jobs:
           gh release view "$tag" >/dev/null 2>&1 || \
             gh release create "$tag" --title "$tag" --notes "synapse ${tag} (alpha)" --prerelease
           gh release upload "$tag" dist/* --clobber
+
+      # Each lane records what it built so the finalize job can prune assets
+      # a previous cut of the same tag left behind (upload --clobber only
+      # replaces names that are still built).
+      - name: Record built asset names
+        working-directory: synapse
+        shell: bash
+        run: ls dist > "built-${{ matrix.name }}.txt"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: built-${{ matrix.name }}
+          path: synapse/built-${{ matrix.name }}.txt
+
+  finalize:
+    name: prune stale assets
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: built-*
+          merge-multiple: true
+      - name: Delete release assets not built by this run
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cat built-*.txt | sort -u > expected.txt
+          echo "expected $(wc -l < expected.txt) assets"
+          release_id=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}" --jq .id)
+          gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets?per_page=100" \
+            --jq '.[] | "\(.id) \(.name)"' | while read -r id name; do
+            if ! grep -qx "$name" expected.txt; then
+              echo "pruning stale asset $name"
+              gh api -X DELETE "repos/${GITHUB_REPOSITORY}/releases/assets/${id}"
+            fi
+          done
