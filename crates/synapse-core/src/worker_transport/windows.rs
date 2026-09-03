@@ -182,6 +182,7 @@ where
             required: required_protocol_version.unwrap_or_default(),
         });
     }
+    let accepted_frame = max_frame.min(hello.max_frame);
     let mut ack = serde_json::to_value(WorkerHelloAck {
         v: WORKER_PROTOCOL_VERSION,
         accept: true,
