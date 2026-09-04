@@ -3,5 +3,5 @@
 # from; release.yml checks the siblings out at these commits so that
 # `cargo build --locked` sees exactly the tree the lock was refreshed against.
 # Refresh together with Cargo.lock: scripts/refresh-siblings-lock.sh
-subconscious=4a2944beb373b3368057afbf04d3fd914f55b347
+subconscious=4f9d191485d7ee1be76272feb7db998423091325
 commons=3daf32bc46a6bfeff92c9f6342fcecf0ea2000c0
