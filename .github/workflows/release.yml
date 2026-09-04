@@ -228,7 +228,7 @@ jobs:
           path: synapse/built-${{ matrix.name }}.txt
 
   finalize:
-    name: prune stale assets
+    name: prune stale assets and publish
     needs: build
     runs-on: ubuntu-24.04
     steps:
@@ -244,7 +244,12 @@ jobs:
           set -euo pipefail
           cat built-*.txt | sort -u > expected.txt
           echo "expected $(wc -l < expected.txt) assets"
-          release_id=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}" --jq .id)
+          # Re-cutting a tag (delete + push) turns its existing release into a
+          # draft, and drafts are invisible to the by-tag lookup, so resolve
+          # the release from the listing instead.
+          release_id=$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            --jq ".[] | select(.tag_name == \"${GITHUB_REF_NAME}\") | .id" | head -1)
+          [ -n "$release_id" ] || { echo "no release for ${GITHUB_REF_NAME}" >&2; exit 1; }
           gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets?per_page=100" \
             --jq '.[] | "\(.id) \(.name)"' | while read -r id name; do
             if ! grep -qx "$name" expected.txt; then
@@ -252,3 +257,16 @@ jobs:
               gh api -X DELETE "repos/${GITHUB_REPOSITORY}/releases/assets/${id}"
             fi
           done
+
+      # Installers resolve the latest non-draft release, so a release that
+      # became a draft through a tag re-cut must be published again once its
+      # asset set is final.
+      - name: Publish the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release edit "${GITHUB_REF_NAME}" -R "${GITHUB_REPOSITORY}" --draft=false --prerelease
+          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}" \
+            --jq '"published \(.tag_name) draft=\(.draft) prerelease=\(.prerelease) assets=\(.assets|length)"'
