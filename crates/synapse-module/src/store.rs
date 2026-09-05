@@ -693,6 +693,11 @@ pub enum SynapseStoreError {
     Json(#[from] serde_json::Error),
     #[error("synapse store decode: {0}")]
     Decode(String),
+    #[error(
+        "synapse store schema is ahead of this binary: store recorded version {recorded}, binary chain ends at {chain_max}; \
+         this schema chain rebuilds and drops tables, so an older binary cannot serve it"
+    )]
+    SchemaAheadOfBinary { recorded: u32, chain_max: u32 },
     #[error("request key '{request_key}' is already bound to a different digest")]
     IdempotencyConflict {
         request_key: String,
@@ -1766,7 +1771,7 @@ pub struct SynapseStore {
 impl SynapseStore {
     pub fn open(descriptor: &StorageDescriptor) -> Result<Self, SynapseStoreError> {
         let store = open_sqlite(descriptor)?;
-        store.migrate(NAMESPACE, MIGRATIONS).map_err(|error| {
+        let outcome = store.migrate(NAMESPACE, MIGRATIONS).map_err(|error| {
             let message = error.to_string();
             if message.contains("cert_rows") || message.contains("cert_rows_rebuilt") {
                 SynapseStoreError::CertRowsRebuildFailed(message)
@@ -1774,6 +1779,17 @@ impl SynapseStore {
                 SynapseStoreError::Store(error)
             }
         })?;
+        // The migrator deliberately does not refuse a store written by a longer
+        // chain (that would brick binary rollbacks for additive-only schemas).
+        // Ours is not additive-only: migrations have rebuilt cert_rows and
+        // dropped the cutover tables, so an older binary would start serving
+        // against tables it cannot query. Fail closed instead of serving.
+        if outcome.store_ahead() {
+            return Err(SynapseStoreError::SchemaAheadOfBinary {
+                recorded: outcome.recorded,
+                chain_max: outcome.chain_max,
+            });
+        }
         Ok(Self { store })
     }
 
@@ -8881,6 +8897,43 @@ mod tests {
         let reopened = SynapseStore::open(&descriptor).unwrap();
         assert_eq!(reopened.catalog_models().unwrap().len(), 4);
         assert_eq!(reopened.alias_table().unwrap().rows.len(), 2);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn open_refuses_a_store_written_by_a_longer_schema_chain() {
+        let (root, descriptor) = temp_descriptor("schema-ahead");
+        let chain_max = MIGRATIONS.last().unwrap().version;
+        {
+            // A future binary's chain: everything this binary knows plus one
+            // additive step. Only the recorded version matters to the refusal.
+            let mut longer: Vec<Migration> = MIGRATIONS.to_vec();
+            longer.push(Migration {
+                version: chain_max + 1,
+                statements: "CREATE TABLE future_only (id INTEGER PRIMARY KEY)",
+            });
+            let future = open_sqlite(&descriptor).unwrap();
+            let outcome = future.migrate(NAMESPACE, &longer).unwrap();
+            assert_eq!(outcome.recorded, chain_max + 1);
+            assert!(!outcome.store_ahead());
+        }
+
+        let Err(error) = SynapseStore::open(&descriptor) else {
+            panic!("a store ahead of the binary's chain must not open");
+        };
+        let rendered = error.to_string();
+        match error {
+            SynapseStoreError::SchemaAheadOfBinary {
+                recorded,
+                chain_max: seen,
+            } => {
+                assert_eq!(recorded, chain_max + 1);
+                assert_eq!(seen, chain_max);
+            }
+            other => panic!("expected SchemaAheadOfBinary, got {other:?}"),
+        }
+        assert!(rendered.contains(&format!("recorded version {}", chain_max + 1)));
+        assert!(rendered.contains(&format!("chain ends at {chain_max}")));
         let _ = std::fs::remove_dir_all(root);
     }
 
