@@ -45,6 +45,8 @@ reqwest = { workspace = true }
 httpdate = { workspace = true }
 url = { workspace = true }
 cortexkit-lease = { workspace = true }
+cortexkit-log = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 rusqlite = { workspace = true }

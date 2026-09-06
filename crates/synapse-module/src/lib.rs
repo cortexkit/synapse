@@ -104,12 +104,12 @@ use synapse_core::{
     EngineIdentity, ErrorClass, Fingerprint, FlashAttentionSetting, GenerateEngine, GenerateOutput,
     GenerateRequest, LaneBudgetSnapshot, LaneScheduler, LoadedModel, MachineProfile, ModelCache,
     ModelCacheError, ModelCacheIngest, ModelCacheMeta, NormalizationMode, NumericDType,
-    NumericProfile, NumericProfileId, PoolingStrategy, QueueClass, RerankEngine, RerankRequest,
-    ResponseEnvelope, ResponseProvenance, RuntimeConfig, SanitizedTokenizer, SchedulerConfig,
-    SidecarSpec, StableError, SystemMachineProfileCollector, ThreadPolicyClass, TokenBatch,
-    TokenizationError, TokenizedBatch, TokenizerConfig, TruncationDisclosure, ValidatedArtifact,
-    Vectors, WorkRequest, WorkerPooling, CUDA_WORKER_ENGINE, MACHINE_PROFILE_HASH_REVISION,
-    OWNED_CUDA_MINIMUM_DEVICE_CC, OWNED_CUDA_MINIMUM_DRIVER_API, OWNED_CUDA_PTX_VIRTUAL_ARCH,
+    NumericProfile, NumericProfileId, PoolingStrategy, QueueClass, RerankRequest, ResponseEnvelope,
+    ResponseProvenance, RuntimeConfig, SanitizedTokenizer, SchedulerConfig, SidecarSpec,
+    StableError, SystemMachineProfileCollector, ThreadPolicyClass, TokenBatch, TokenizationError,
+    TokenizedBatch, TokenizerConfig, TruncationDisclosure, ValidatedArtifact, Vectors, WorkRequest,
+    WorkerPooling, CUDA_WORKER_ENGINE, MACHINE_PROFILE_HASH_REVISION, OWNED_CUDA_MINIMUM_DEVICE_CC,
+    OWNED_CUDA_MINIMUM_DRIVER_API, OWNED_CUDA_PTX_VIRTUAL_ARCH,
 };
 use synapse_engine_ort::OrtEmbedEngine;
 use synapse_engine_owned::{
@@ -138,6 +138,15 @@ impl owned_decode_routing::lane::AdmissionBoundaryReader for SynapseStore {
 
 pub const DEFAULT_MODULE_ID: &str = "synapse";
 
+pub const LOG_TAGS: &[&str] = &[
+    "perf",        // Periodic activity and per-request completion metrics.
+    "worker",      // Lines forwarded from supervised worker processes.
+    "admission",   // Job admission, refusal, and completion decisions.
+    "cert",        // Certification, staleness, and profile rotation events.
+    "maintenance", // Garbage collection and temporary-data sweeps.
+    "config",      // Configuration loading and validation failures.
+];
+
 const DEFAULT_INLINE_MAX_ITEMS: usize = 64;
 const DEFAULT_INLINE_MAX_TOKENS: u64 = 8_192;
 const DEFAULT_INLINE_BYTE_BUDGET: u64 = 64 * 1024 * 1024;
@@ -146,6 +155,7 @@ const DEFAULT_DEADLINE_MS: u64 = 30_000;
 const DEFAULT_ESTIMATED_EXECUTION_MS: u64 = 25;
 const DEFAULT_MAX_CONCURRENT_WORKERS: usize = 2;
 const DEFAULT_WORKER_LOAD_TIMEOUT_MS: u64 = 900_000;
+const DEFAULT_WORKER_FORWARD_LINES_PER_SEC: u32 = 50;
 const OWNED_DECODE_PROBE_TIMEOUT_MS: u64 = 900_000;
 const DEFAULT_TRANSIENT_RETRY_AFTER_MS: u64 = 100;
 const DEFAULT_JOB_EXECUTION_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
@@ -179,6 +189,12 @@ struct SynapseSingletonLease {
 
 pub async fn run_from_env() -> Result<(), ModuleError> {
     let module_id = module_id_from_environment(|key| env::var_os(key))?;
+    cortexkit_log::declared_tags(LOG_TAGS);
+    let _logger = cortexkit_log::init(cortexkit_log::Config::for_module(
+        &module_id,
+        cortexkit_log::Lane::Module,
+    ))
+    .map_err(|error| ModuleError::Config(format!("initialize fleet logger: {error}")))?;
     let _singleton = acquire_synapse_singleton_lease(&module_id)?;
     let connection_file = subc_connection_file_from_args()?;
     let handler = SynapseHandler::new(module_id.clone(), connection_file);
@@ -232,7 +248,12 @@ fn acquire_synapse_singleton_lease(module_id: &str) -> Result<SynapseSingletonLe
                 "synapse singleton lease held: only one synapse module may run machine-wide \
                  (module={module_id}, scope={SYNAPSE_SINGLETON_LEASE_SCOPE})"
             );
-            eprintln!("{message}");
+            tracing::warn!(
+                target: "admission",
+                module = %module_id,
+                scope = SYNAPSE_SINGLETON_LEASE_SCOPE,
+                "synapse singleton lease held: only one synapse module may run machine-wide"
+            );
             Err(ModuleError::SingletonHeld(message))
         }
         Err(cortexkit_lease::LeaseError::Io(error)) => {
@@ -581,6 +602,8 @@ pub(crate) struct ModuleConfig {
     #[serde(default)]
     worker: WorkerConfig,
     #[serde(default)]
+    log: LogConfig,
+    #[serde(default)]
     jobs: JobConfig,
     #[serde(default)]
     probe: ProbeConfig,
@@ -616,6 +639,7 @@ impl Default for ModuleConfig {
             preload_models: Vec::new(),
             inline: InlineConfig::default(),
             worker: WorkerConfig::default(),
+            log: LogConfig::default(),
             jobs: JobConfig::default(),
             probe: ProbeConfig::default(),
             knob: PerfKnob::default(),
@@ -674,6 +698,28 @@ impl Default for WorkerConfig {
 
 fn default_worker_load_timeout_ms() -> u64 {
     DEFAULT_WORKER_LOAD_TIMEOUT_MS
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LogConfig {
+    #[serde(default)]
+    perf_interval_secs: u64,
+    #[serde(default = "default_worker_forward_lines_per_sec")]
+    worker_forward_lines_per_sec: u32,
+}
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        Self {
+            perf_interval_secs: 0,
+            worker_forward_lines_per_sec: default_worker_forward_lines_per_sec(),
+        }
+    }
+}
+
+fn default_worker_forward_lines_per_sec() -> u32 {
+    DEFAULT_WORKER_FORWARD_LINES_PER_SEC
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -933,6 +979,7 @@ struct RuntimeState {
     jobs: JobConfig,
     probe: ProbeConfig,
     worker_load_timeout: Duration,
+    log: LogConfig,
     knob: PerfKnob,
     alias_admin_enabled: bool,
     microllm_max_tokens: u32,
@@ -954,6 +1001,7 @@ struct RuntimeState {
     /// recovery, and scheduler updates use the same durable session state.
     owned_decode_sessions: Arc<Mutex<OwnedDecodeWireState>>,
     admission_telemetry: Arc<AdmissionTelemetry>,
+    activity_telemetry: Arc<ActivityTelemetry>,
 }
 
 struct ModelSlot {
@@ -998,6 +1046,54 @@ struct InlineExecutionStats {
     wait_samples_ms: VecDeque<f64>,
 }
 
+#[derive(Default)]
+struct ActivityTelemetry {
+    by_model: Mutex<BTreeMap<String, u64>>,
+    completed_tokens: AtomicU64,
+    inline_sequence: AtomicU64,
+}
+
+impl ActivityTelemetry {
+    fn begin(self: &Arc<Self>, model_id: &str) -> ActivityGuard {
+        if let Ok(mut by_model) = self.by_model.lock() {
+            let count = by_model.entry(model_id.to_string()).or_default();
+            *count = count.saturating_add(1);
+        }
+        ActivityGuard {
+            telemetry: Arc::clone(self),
+            model_id: model_id.to_string(),
+        }
+    }
+
+    fn record_completed_tokens(&self, tokens: u64) {
+        self.completed_tokens.fetch_add(tokens, Ordering::Relaxed);
+    }
+
+    fn next_inline_job_id(&self, module_generation: u64) -> String {
+        let sequence = self.inline_sequence.fetch_add(1, Ordering::Relaxed);
+        format!("inline-{module_generation}-{sequence}")
+    }
+}
+
+struct ActivityGuard {
+    telemetry: Arc<ActivityTelemetry>,
+    model_id: String,
+}
+
+impl Drop for ActivityGuard {
+    fn drop(&mut self) {
+        if let Ok(mut by_model) = self.telemetry.by_model.lock() {
+            let remove = by_model.get_mut(&self.model_id).is_some_and(|count| {
+                *count = count.saturating_sub(1);
+                *count == 0
+            });
+            if remove {
+                by_model.remove(&self.model_id);
+            }
+        }
+    }
+}
+
 struct InlineExecutionPermit {
     _permit: tokio::sync::OwnedSemaphorePermit,
     stats: Arc<Mutex<InlineExecutionStats>>,
@@ -1023,10 +1119,11 @@ impl InlineAdmission {
     }
 }
 
-#[derive(Clone, Copy)]
 struct InlineWorkBudget {
     request_bytes: u64,
     deadline: Option<tokio::time::Instant>,
+    job_id: String,
+    started: Instant,
 }
 
 impl Drop for InlineAdmission {
@@ -1069,6 +1166,55 @@ impl ModelTask {
             Self::Generate => "generate",
         }
     }
+}
+
+fn execution_lane(model: &EmbeddingModel) -> &'static str {
+    match model.engine_identity.engine.as_str() {
+        "owned-metal" | MLX_WORKER_ENGINE => "metal",
+        ANE_WORKER_ENGINE => "ane",
+        CUDA_WORKER_ENGINE => "cuda",
+        "ort" => "ort",
+        LLAMA_ENGINE | LLAMA_WORKER_ENGINE => "llama",
+        DECODE_WORKER_ENGINE => "decode",
+        _ => "ort",
+    }
+}
+
+fn record_admission_refusal(
+    runtime: &RuntimeState,
+    model_id: &str,
+    job_id: Option<&str>,
+    reason: &str,
+) {
+    runtime.admission_telemetry.record_refusal(reason);
+    if let Some(job_id) = job_id {
+        tracing::warn!(
+            target: "admission",
+            model_id,
+            job_id,
+            reason,
+            "job refused"
+        );
+    } else {
+        tracing::warn!(target: "admission", model_id, reason, "job refused");
+    }
+}
+
+fn log_job_admitted(model_id: &str, job_id: &str) {
+    tracing::info!(target: "admission", model_id, job_id, "job admitted");
+}
+
+fn log_job_done(model_id: &str, job_id: &str, lane: &str, tokens: u64, started: Instant) {
+    let wall_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    tracing::info!(
+        target: "perf",
+        model_id,
+        job_id,
+        lane,
+        tokens,
+        wall_ms,
+        "job done"
+    );
 }
 
 #[derive(Clone)]
@@ -1707,6 +1853,7 @@ impl RuntimeState {
         let jobs = config.jobs;
         let probe = config.probe;
         let worker_load_timeout = Duration::from_millis(config.worker.load_timeout_ms);
+        let log = config.log;
         let knob = config.knob;
         let alias_admin_enabled = config.alias_admin_enabled || config.dev.alias_admin_enabled;
         let microllm_max_tokens = config.microllm_max_tokens;
@@ -1746,6 +1893,7 @@ impl RuntimeState {
             jobs,
             probe,
             worker_load_timeout,
+            log,
             knob,
             alias_admin_enabled,
             microllm_max_tokens,
@@ -1766,6 +1914,7 @@ impl RuntimeState {
             owned_decode_dispatches: Arc::new(Mutex::new(BTreeMap::new())),
             owned_decode_sessions: Arc::new(Mutex::new(OwnedDecodeWireState::default())),
             admission_telemetry: Arc::new(AdmissionTelemetry::default()),
+            activity_telemetry: Arc::new(ActivityTelemetry::default()),
         })
     }
 
@@ -1822,6 +1971,8 @@ impl RuntimeState {
 
     fn admit_inline(
         &self,
+        model_id: &str,
+        job_id: Option<&str>,
         queue_class: QueueClass,
         request_bytes: u64,
         deadline_ms: Option<u64>,
@@ -1863,6 +2014,9 @@ impl RuntimeState {
         ) {
             AdmissionDecision::Accept(_) => {
                 scheduler.in_flight_bytes = scheduler.in_flight_bytes.saturating_add(request_bytes);
+                if let Some(job_id) = job_id {
+                    log_job_admitted(model_id, job_id);
+                }
                 Ok(InlineAdmission {
                     scheduler: Arc::clone(&self.scheduler),
                     request_bytes,
@@ -1871,11 +2025,94 @@ impl RuntimeState {
             }
             AdmissionDecision::Reject(rejection) => {
                 let error = WireOperationError::from_stable(rejection.error, rejection.reason);
-                self.admission_telemetry.record_refusal(&error.code);
+                record_admission_refusal(self, model_id, job_id, &error.code);
                 Err(error)
             }
         }
     }
+}
+
+fn start_perf_sampler(state: Arc<ModuleState>) -> Option<tokio::task::JoinHandle<()>> {
+    let interval_secs = state.runtime.log.perf_interval_secs;
+    if interval_secs == 0 {
+        return None;
+    }
+    Some(tokio::spawn(async move {
+        let interval = Duration::from_secs(interval_secs);
+        loop {
+            tokio::time::sleep(interval).await;
+            emit_activity_sample(&state, interval_secs).await;
+        }
+    }))
+}
+
+async fn emit_activity_sample(state: &ModuleState, interval_secs: u64) {
+    let (in_flight, waiters) = state
+        .runtime
+        .execution_stats
+        .lock()
+        .map(|stats| (stats.in_flight, stats.waiters))
+        .unwrap_or_default();
+    let completed_tokens = state
+        .runtime
+        .activity_telemetry
+        .completed_tokens
+        .swap(0, Ordering::Relaxed);
+    if in_flight == 0 {
+        tracing::debug!(target: "perf", "activity idle");
+        return;
+    }
+    let by_model = state
+        .runtime
+        .activity_telemetry
+        .by_model
+        .lock()
+        .map(|counts| {
+            counts
+                .iter()
+                .map(|(model_id, count)| format!("{model_id}:{count}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default();
+    let workers = state
+        .runtime
+        .loaded_models()
+        .into_iter()
+        .filter_map(|model| match &model.backend {
+            EmbedBackend::Worker(engine) => Some((model.model_id.clone(), Arc::clone(engine))),
+            EmbedBackend::Ort(_) | EmbedBackend::Owned(_) | EmbedBackend::OwnedDecode => None,
+        })
+        .collect::<Vec<_>>();
+    let worker_rss_mb = tokio::task::spawn_blocking(move || {
+        workers
+            .into_iter()
+            .filter_map(|(model_id, engine)| {
+                let engine = engine.try_lock().ok()?;
+                let ping = engine.ping().ok()?;
+                Some(format!("{model_id}:{}", ping.rss_mb))
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    })
+    .await
+    .unwrap_or_default();
+    let tokens_per_s = if interval_secs == 0 {
+        0.0
+    } else {
+        completed_tokens as f64 / interval_secs as f64
+    };
+    let queue_depth = waiters;
+    tracing::debug!(
+        target: "perf",
+        in_flight,
+        by_model,
+        tokens_per_s = format_args!("{tokens_per_s:.3}"),
+        queue_depth,
+        waiters,
+        worker_rss_mb,
+        "activity"
+    );
 }
 
 fn bind_remote_provider_urls(
@@ -2592,7 +2829,7 @@ fn machine_profile_with_overrides(mut machine_profile: MachineProfile) -> Machin
 fn run_background_maintenance(state: &ModuleState) {
     let now = now_ms();
     if let Err(error) = state.store.purge_expired_jobs(now) {
-        eprintln!("[synapse-maintenance] job purge sweep failed: {error}");
+        tracing::warn!(target: "maintenance", error = %error, "job purge sweep failed");
     }
     let active_hashes = state
         .remote_gateway
@@ -2605,7 +2842,7 @@ fn run_background_maintenance(state: &ModuleState) {
             .store
             .sweep_remote_url_bindings(&active_hashes, now, 7 * 24 * 60 * 60 * 1_000)
     {
-        eprintln!("[synapse-maintenance] URL binding sweep failed: {error}");
+        tracing::warn!(target: "maintenance", error = %error, "URL binding sweep failed");
     }
 }
 
@@ -2618,7 +2855,8 @@ impl ModuleHandler for SynapseHandler {
         let state = self
             .initialize(ack)
             .unwrap_or_else(|error| panic!("synapse boot failed after HELLO_ACK: {error}"));
-        let _ = self.inner.state.set(state);
+        let _ = self.inner.state.set(Arc::clone(&state));
+        let _ = start_perf_sampler(state);
     }
 
     async fn on_bind(&self, req: &RouteBindRequest) -> BindDecision {
@@ -3649,6 +3887,8 @@ async fn owned_decode_session_decode(state: Arc<ModuleState>, params: Value) -> 
         Arc::clone(&state),
         &route_params,
         route_params.model.as_deref().expect("session model is set"),
+        params.req_id.clone(),
+        Instant::now(),
     )
     .await
     {
@@ -4511,6 +4751,9 @@ async fn model_load(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
     let job_minted = matches!(admission, JobAdmission::Admitted(_));
     if job_minted {
         state.runtime.admission_telemetry.record_job_minted();
+        if let Some(model_id) = params.model_id.as_deref() {
+            log_job_admitted(model_id, &record.job_id);
+        }
         let task_state = Arc::clone(&state);
         let task_job_id = record.job_id.clone();
         let task_params = params.clone();
@@ -4619,10 +4862,12 @@ async fn resolve_model_for_request(
 ) -> Result<Arc<EmbeddingModel>, WireOperationError> {
     let resolution = resolve_model_for_request_inner(Arc::clone(&state), requested, task).await;
     if let Err(error) = &resolution {
-        state
-            .runtime
-            .admission_telemetry
-            .record_refusal(&error.code);
+        record_admission_refusal(
+            &state.runtime,
+            requested.unwrap_or("default"),
+            None,
+            &error.code,
+        );
     }
     resolution
 }
@@ -4831,6 +5076,7 @@ async fn load_catalog_model_task(
     let load_started = std::time::Instant::now();
     let microllm_max_tokens = state.runtime.microllm_max_tokens;
     let worker_load_timeout = state.runtime.worker_load_timeout;
+    let worker_forward_lines_per_sec = state.runtime.log.worker_forward_lines_per_sec;
     let owned_decode_q8 = Arc::clone(&state.runtime.owned_decode_q8);
     let loaded = tokio::task::spawn_blocking(move || {
         load_catalog_model_blocking(
@@ -4839,6 +5085,7 @@ async fn load_catalog_model_task(
             model_cache,
             microllm_max_tokens,
             worker_load_timeout,
+            worker_forward_lines_per_sec,
             owned_decode_q8,
         )
     })
@@ -4966,6 +5213,7 @@ fn load_catalog_model_blocking(
     model_cache: Arc<ModelCache>,
     microllm_max_tokens: u32,
     worker_load_timeout: Duration,
+    worker_forward_lines_per_sec: u32,
     owned_decode_q8: Arc<Mutex<owned_decode_routing::q8ingest::Q8IngestRegistry>>,
 ) -> Result<EmbeddingModel, WireOperationError> {
     let task = parse_model_task(Some(&spec.task), &spec.engine, &spec.model_id)
@@ -5056,6 +5304,7 @@ fn load_catalog_model_blocking(
                 &artifact,
                 &runtime_config,
                 worker_load_timeout,
+                worker_forward_lines_per_sec,
             )?;
             (backend, loaded, None)
         }
@@ -5102,6 +5351,7 @@ fn load_catalog_model_blocking(
                 &artifact,
                 &runtime_config,
                 worker_load_timeout,
+                worker_forward_lines_per_sec,
             )?;
             (backend, loaded, None)
         }
@@ -5187,6 +5437,7 @@ fn load_worker_backend_blocking(
     artifact: &ValidatedArtifact,
     runtime_config: &RuntimeConfig,
     worker_load_timeout: Duration,
+    worker_forward_lines_per_sec: u32,
 ) -> Result<(EmbedBackend, LoadedModel), WireOperationError> {
     use worker_host::{WorkerEngine, WorkerHostConfig};
 
@@ -5217,6 +5468,8 @@ fn load_worker_backend_blocking(
     let mut config = WorkerHostConfig::new(worker_bin, runtime_dir);
     config.load_timeout = worker_load_timeout;
     config.worker_id = format!("synapse-{}-{}", spec.engine, spec.model_id);
+    config.model_id = Some(spec.model_id.clone());
+    config.worker_forward_lines_per_sec = worker_forward_lines_per_sec;
     config.engine_identity = Some(spec.engine_identity.clone());
     config.isolate_crash_key_by_worker_id = spec.engine == CUDA_WORKER_ENGINE;
     config.pooling =
@@ -6255,7 +6508,14 @@ async fn embed_query(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
     }
 
     let request_bytes = request_bytes_for_texts([params.text.as_str()]);
+    let job_id = state
+        .runtime
+        .activity_telemetry
+        .next_inline_job_id(state.module_generation);
+    let started = Instant::now();
     let admission = match state.runtime.admit_inline(
+        &model.model_id,
+        Some(&job_id),
         QueueClass::Interactive,
         request_bytes,
         params.deadline_ms,
@@ -6285,6 +6545,8 @@ async fn embed_query(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         InlineWorkBudget {
             request_bytes,
             deadline: Some(admission.deadline()),
+            job_id,
+            started,
         },
     )
     .await
@@ -6331,6 +6593,11 @@ async fn remote_embed_query(state: Arc<ModuleState>, params: EmbedQueryParams) -
         return remote_error_outcome(&state, error);
     }
     let request_bytes = request_bytes_for_texts([params.text.as_str()]);
+    let job_id = state
+        .runtime
+        .activity_telemetry
+        .next_inline_job_id(state.module_generation);
+    let started = Instant::now();
     let deadline_ms = params
         .deadline_ms
         .unwrap_or(state.runtime.inline.deadline_ms);
@@ -6354,6 +6621,8 @@ async fn remote_embed_query(state: Arc<ModuleState>, params: EmbedQueryParams) -
         ));
     }
     let _admission = match state.runtime.admit_inline(
+        &profile.synapse_model_id,
+        Some(&job_id),
         QueueClass::Interactive,
         request_bytes,
         params.deadline_ms,
@@ -6373,9 +6642,15 @@ async fn remote_embed_query(state: Arc<ModuleState>, params: EmbedQueryParams) -
         )
         .await
     {
-        Ok(result) => {
-            remote_embed_success(&state, &profile, vec![id], vec![original_count], result)
-        }
+        Ok(result) => remote_embed_success(
+            &state,
+            &profile,
+            vec![id],
+            vec![original_count],
+            result,
+            &job_id,
+            started,
+        ),
         Err(error) => remote_error_outcome(&state, error),
     }
 }
@@ -6386,7 +6661,14 @@ fn remote_embed_success(
     ids: Vec<String>,
     original_token_counts: Vec<u32>,
     result: remote::gateway::RemoteEmbeddingResult,
+    job_id: &str,
+    started: Instant,
 ) -> HandlerOutcome {
+    let tokens = result
+        .token_counts
+        .iter()
+        .map(|count| u64::from(*count))
+        .sum();
     let disclosures = original_token_counts
         .iter()
         .zip(&result.token_counts)
@@ -6430,6 +6712,11 @@ fn remote_embed_success(
     if let Some(provider_request_id) = result.provider_request_id {
         envelope["provider_request_id"] = Value::String(provider_request_id);
     }
+    state
+        .runtime
+        .activity_telemetry
+        .record_completed_tokens(tokens);
+    log_job_done(&profile.synapse_model_id, job_id, "remote", tokens, started);
     result_outcome(envelope)
 }
 
@@ -6602,7 +6889,14 @@ async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         .await;
     }
 
+    let job_id = state
+        .runtime
+        .activity_telemetry
+        .next_inline_job_id(state.module_generation);
+    let started = Instant::now();
     let admission = match state.runtime.admit_inline(
+        &model.model_id,
+        Some(&job_id),
         QueueClass::Bulk,
         request_bytes,
         params.deadline_ms,
@@ -6621,6 +6915,8 @@ async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         InlineWorkBudget {
             request_bytes,
             deadline: Some(admission.deadline()),
+            job_id,
+            started,
         },
     )
     .await
@@ -6737,7 +7033,14 @@ async fn remote_embed_batch(state: Arc<ModuleState>, params: EmbedBatchParams) -
         )
         .await;
     }
+    let job_id = state
+        .runtime
+        .activity_telemetry
+        .next_inline_job_id(state.module_generation);
+    let started = Instant::now();
     let _admission = match state.runtime.admit_inline(
+        &profile.synapse_model_id,
+        Some(&job_id),
         QueueClass::Bulk,
         request_bytes,
         params.deadline_ms,
@@ -6753,7 +7056,7 @@ async fn remote_embed_batch(state: Arc<ModuleState>, params: EmbedBatchParams) -
         .embed(&profile, &texts, RemoteClass::Bulk, deadline_ms)
         .await
     {
-        Ok(result) => remote_embed_success(&state, &profile, ids, counts, result),
+        Ok(result) => remote_embed_success(&state, &profile, ids, counts, result, &job_id, started),
         Err(error) => remote_error_outcome(&state, error),
     }
 }
@@ -6804,6 +7107,7 @@ async fn submit_remote_embed_batch_job(
     let job_minted = matches!(admission, JobAdmission::Admitted(_));
     if job_minted {
         state.runtime.admission_telemetry.record_job_minted();
+        log_job_admitted(&work.profile.synapse_model_id, &record.job_id);
         spawn_remote_embed_batch_job(Arc::clone(&state), record.job_id.clone(), work);
     }
     result_outcome(job_status_payload(&state, &record))
@@ -6840,6 +7144,8 @@ async fn execute_remote_embed_batch_job(
         );
         return;
     }
+    let started = Instant::now();
+    let mut completed_tokens = 0_u64;
     let committed = match state.store.committed_item_ids(&record.request_digest) {
         Ok(committed) => committed,
         Err(error) => {
@@ -6912,6 +7218,13 @@ async fn execute_remote_embed_batch_job(
             }
         };
         let provider_request_id = result.provider_request_id.clone();
+        completed_tokens = completed_tokens.saturating_add(
+            result
+                .token_counts
+                .iter()
+                .map(|count| u64::from(*count))
+                .sum::<u64>(),
+        );
         let disclosures = original_counts
             .iter()
             .zip(&result.token_counts)
@@ -7001,8 +7314,21 @@ async fn execute_remote_embed_batch_job(
         "identity_revision": work.profile.identity_revision,
         "provenance": state.remote_gateway.provenance(&work.profile),
     });
-    if let Err(error) = state.store.finish_job(&job_id, &summary, now_ms()) {
-        fail_job_with_wire_error(
+    match state.store.finish_job(&job_id, &summary, now_ms()) {
+        Ok(()) => {
+            state
+                .runtime
+                .activity_telemetry
+                .record_completed_tokens(completed_tokens);
+            log_job_done(
+                &work.profile.synapse_model_id,
+                &job_id,
+                "remote",
+                completed_tokens,
+                started,
+            );
+        }
+        Err(error) => fail_job_with_wire_error(
             &state,
             &job_id,
             true,
@@ -7010,7 +7336,7 @@ async fn execute_remote_embed_batch_job(
                 StableError::engine_crashed(Some(100)),
                 format!("finish remote checkpoint job: {error}"),
             ),
-        );
+        ),
     }
 }
 
@@ -7143,7 +7469,14 @@ async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
     } else {
         QueueClass::Bulk
     };
+    let job_id = state
+        .runtime
+        .activity_telemetry
+        .next_inline_job_id(state.module_generation);
+    let started = Instant::now();
     let admission = match state.runtime.admit_inline(
+        &model.model_id,
+        Some(&job_id),
         queue_class,
         request_bytes,
         params.deadline_ms,
@@ -7166,6 +7499,7 @@ async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
         },
         owned_pairs,
         Some(admission.deadline()),
+        Some(&job_id),
     )
     .await
     {
@@ -7204,6 +7538,13 @@ async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
         equivalent_to,
         payload,
     };
+    log_job_done(
+        &model.model_id,
+        &job_id,
+        execution_lane(&model),
+        candidate_token_counts,
+        started,
+    );
     result_outcome(serde_json::to_value(envelope).expect("rerank envelope should serialize"))
 }
 
@@ -7248,7 +7589,18 @@ async fn microllm_oneshot(state: Arc<ModuleState>, params: Value) -> HandlerOutc
             })
         });
         if owned_decode {
-            return route_owned_decode_wire(Arc::clone(&state), &params, model_id).await;
+            let job_id = state
+                .runtime
+                .activity_telemetry
+                .next_inline_job_id(state.module_generation);
+            return route_owned_decode_wire(
+                Arc::clone(&state),
+                &params,
+                model_id,
+                job_id,
+                Instant::now(),
+            )
+            .await;
         }
     }
     match params.grammar.as_deref() {
@@ -7337,7 +7689,14 @@ async fn microllm_oneshot(state: Arc<ModuleState>, params: Value) -> HandlerOutc
             ),
         ));
     }
+    let job_id = state
+        .runtime
+        .activity_telemetry
+        .next_inline_job_id(state.module_generation);
+    let started = Instant::now();
     let admission = match state.runtime.admit_inline(
+        &model.model_id,
+        Some(&job_id),
         QueueClass::Interactive,
         request_bytes,
         params.deadline_ms,
@@ -7358,6 +7717,7 @@ async fn microllm_oneshot(state: Arc<ModuleState>, params: Value) -> HandlerOutc
             grammar: None, // grammar requests are rejected before worker dispatch
         },
         Some(admission.deadline()),
+        Some(&job_id),
     )
     .await
     {
@@ -7365,6 +7725,7 @@ async fn microllm_oneshot(state: Arc<ModuleState>, params: Value) -> HandlerOutc
         Err(error) => return result_outcome(error_payload(&state, error)),
     };
     let equivalent_to = equivalent_fingerprints(&alias_table, &model);
+    let completed_tokens = (output.n_prompt as u64).saturating_add(output.n_gen as u64);
     let payload = MicroLlmOneshotPayload {
         text: output.text,
         finish_reason: output.finish_reason,
@@ -7390,6 +7751,13 @@ async fn microllm_oneshot(state: Arc<ModuleState>, params: Value) -> HandlerOutc
         equivalent_to,
         payload,
     };
+    log_job_done(
+        &model.model_id,
+        &job_id,
+        execution_lane(&model),
+        completed_tokens,
+        started,
+    );
     result_outcome(serde_json::to_value(envelope).expect("microllm envelope should serialize"))
 }
 
@@ -7507,6 +7875,7 @@ fn sidecar_hint_bank_source(
                 grammar: None,
             },
             Some(tokio::time::Instant::now() + Duration::from_millis(deadline_ms)),
+            None,
         )
         .await
         else {
@@ -8026,6 +8395,8 @@ fn build_supervised_decode_dispatch_for_chain_k(
     let runtime_dir = owned_decode_worker_runtime_dir(spec);
     let mut host_config = WorkerHostConfig::new(worker_bin, runtime_dir);
     host_config.worker_id = format!("synapse-owned-decode-{}", spec.model_id);
+    host_config.model_id = Some(spec.model_id.clone());
+    host_config.worker_forward_lines_per_sec = state.runtime.log.worker_forward_lines_per_sec;
     host_config.load_timeout = state.runtime.worker_load_timeout;
     host_config.request_timeout = Duration::from_millis(deadline_ms.max(1));
     let factory = OwnedDecodeWorkerFactory::new(host_config, artifact, runtime_config);
@@ -8467,6 +8838,8 @@ async fn route_owned_decode_wire(
     state: Arc<ModuleState>,
     params: &MicroLlmOneshotParams,
     model_id: &str,
+    job_id: String,
+    started: Instant,
 ) -> HandlerOutcome {
     use owned_decode_routing::lane::{LaneKind, LlamaLane};
     use owned_decode_routing::request::{OneshotRequest, SamplingMode};
@@ -8551,10 +8924,7 @@ async fn route_owned_decode_wire(
         .flatten()
         .is_some_and(|approval| approval.grammar_enabled);
     if constrained && (!state.runtime.grammar_enabled || !approval_grammar_enabled) {
-        state
-            .runtime
-            .admission_telemetry
-            .record_refusal("grammar_disabled");
+        record_admission_refusal(&state.runtime, model_id, Some(&job_id), "grammar_disabled");
         return channel_error(
             "grammar_disabled",
             "constrained owned-decode requests require both runtime and approval grammar enablement",
@@ -8729,6 +9099,8 @@ async fn route_owned_decode_wire(
         ));
     }
     let admission = match state.runtime.admit_inline(
+        model_id,
+        Some(&job_id),
         QueueClass::Interactive,
         request_bytes_for_texts([params.prompt.as_str()]),
         params.deadline_ms,
@@ -8741,6 +9113,7 @@ async fn route_owned_decode_wire(
         Ok(permit) => permit,
         Err(error) => return result_outcome(error_payload(&state, error)),
     };
+    let _activity = state.runtime.activity_telemetry.begin(model_id);
     let deadline_ms = params
         .deadline_ms
         .unwrap_or(state.runtime.inline.deadline_ms)
@@ -8821,10 +9194,7 @@ async fn route_owned_decode_wire(
     let mut routed = match routed {
         Ok(response) => response,
         Err(failure) => {
-            state
-                .runtime
-                .admission_telemetry
-                .record_refusal(failure.wire_id());
+            record_admission_refusal(&state.runtime, model_id, Some(&job_id), failure.wire_id());
             let detail = failure.message.as_deref();
             return channel_error(
                 failure.wire_id(),
@@ -8873,6 +9243,12 @@ async fn route_owned_decode_wire(
             Err(error) => return channel_error("artifact_invalid", error.to_string()),
         }
     };
+    let completion_lane = match routed.lane {
+        LaneKind::OwnedDecode => "decode",
+        LaneKind::Llama => "llama",
+    };
+    let completion_tokens =
+        (n_prompt as u64).saturating_add(routed.generated_token_ids.len() as u64);
     let selected_model = if routed.lane == LaneKind::Llama {
         llama_model.as_deref()
     } else {
@@ -8939,6 +9315,17 @@ async fn route_owned_decode_wire(
         equivalent_to,
         payload,
     };
+    state
+        .runtime
+        .activity_telemetry
+        .record_completed_tokens(completion_tokens);
+    log_job_done(
+        model_id,
+        &job_id,
+        completion_lane,
+        completion_tokens,
+        started,
+    );
     result_outcome(serde_json::to_value(envelope).expect("microllm envelope should serialize"))
 }
 
@@ -9057,6 +9444,7 @@ async fn submit_embed_batch_job(
     let job_minted = matches!(admission, JobAdmission::Admitted(_));
     if job_minted {
         state.runtime.admission_telemetry.record_job_minted();
+        log_job_admitted(&work.model.model_id, &record.job_id);
         let task_state = Arc::clone(&state);
         let task_job_id = record.job_id.clone();
         tokio::spawn(async move {
@@ -9092,6 +9480,8 @@ async fn execute_embed_batch_job(
         return;
     }
 
+    let started = Instant::now();
+    let requested_tokens = work.total_tokens;
     let committed_ids = match state.store.committed_item_ids(&record.request_digest) {
         Ok(ids) => ids,
         Err(error) => {
@@ -9143,8 +9533,15 @@ async fn execute_embed_batch_job(
             "page_count": record.page_count,
             "module_generation": state.module_generation,
         });
-        if let Err(error) = state.store.finish_job(&job_id, &summary, now_ms()) {
-            fail_job_with_wire_error(
+        match state.store.finish_job(&job_id, &summary, now_ms()) {
+            Ok(()) => log_job_done(
+                &work.model.model_id,
+                &job_id,
+                execution_lane(&work.model),
+                requested_tokens,
+                started,
+            ),
+            Err(error) => fail_job_with_wire_error(
                 &state,
                 &job_id,
                 true,
@@ -9152,7 +9549,7 @@ async fn execute_embed_batch_job(
                     StableError::engine_crashed(Some(100)),
                     format!("finish resumed checkpoint-only job: {error}"),
                 ),
-            );
+            ),
         }
         return;
     }
@@ -9164,6 +9561,7 @@ async fn execute_embed_batch_job(
         work.total_tokens,
         work.request_bytes,
         None,
+        Some(&job_id),
     )
     .await
     {
@@ -9226,8 +9624,15 @@ async fn execute_embed_batch_job(
             return;
         }
     }
-    if let Err(error) = state.store.finish_job(&job_id, &summary, now_ms()) {
-        fail_job_with_wire_error(
+    match state.store.finish_job(&job_id, &summary, now_ms()) {
+        Ok(()) => log_job_done(
+            &work.model.model_id,
+            &job_id,
+            execution_lane(&work.model),
+            requested_tokens,
+            started,
+        ),
+        Err(error) => fail_job_with_wire_error(
             &state,
             &job_id,
             true,
@@ -9235,7 +9640,7 @@ async fn execute_embed_batch_job(
                 StableError::engine_crashed(Some(100)),
                 format!("finish completed job pages: {error}"),
             ),
-        );
+        ),
     }
 }
 
@@ -9308,6 +9713,7 @@ async fn execute_embedding_quanta(
     _total_tokens: u64,
     request_bytes: u64,
     deadline: Option<tokio::time::Instant>,
+    job_id: Option<&str>,
 ) -> Result<Vectors, WireOperationError> {
     let profile = embedding_profile_enabled();
     let started = Instant::now();
@@ -9374,16 +9780,18 @@ async fn execute_embedding_quanta(
                 items: quantum_items,
             },
             deadline,
+            job_id,
         )
         .await?;
         if profile {
-            eprintln!(
-                "[synapse-embed-profile] quanta dispatch={} items={} tokens={} scheduler_quantum={} engine_ms={:.3}",
-                dispatch_count,
-                quantum_item_count,
-                quantum_tokens,
-                dispatch.quantum_tokens,
-                call_started.elapsed().as_secs_f64() * 1_000.0
+            tracing::debug!(
+                target: "perf",
+                dispatch = dispatch_count,
+                items = quantum_item_count,
+                tokens = quantum_tokens,
+                scheduler_quantum = dispatch.quantum_tokens,
+                engine_ms = format_args!("{:.3}", call_started.elapsed().as_secs_f64() * 1_000.0),
+                "quanta"
             );
         }
         for (&index, vector) in indices.iter().zip(vectors.drain(..)) {
@@ -9395,12 +9803,13 @@ async fn execute_embedding_quanta(
         tokio::task::yield_now().await;
     }
     if profile {
-        eprintln!(
-            "[synapse-embed-profile] quanta total_items={} dispatches={} scheduler_wait_ms={:.3} total_ms={:.3}",
-            item_count,
-            dispatch_count,
-            scheduler_wait_ms,
-            started.elapsed().as_secs_f64() * 1_000.0
+        tracing::debug!(
+            target: "perf",
+            total_items = item_count,
+            dispatches = dispatch_count,
+            scheduler_wait_ms = format_args!("{scheduler_wait_ms:.3}"),
+            total_ms = format_args!("{:.3}", started.elapsed().as_secs_f64() * 1_000.0),
+            "quanta"
         );
     }
     Ok(all_vectors)
@@ -9841,6 +10250,12 @@ async fn embed_tokenized(
     use_bulk_quanta: bool,
     budget: InlineWorkBudget,
 ) -> HandlerOutcome {
+    let InlineWorkBudget {
+        request_bytes,
+        deadline,
+        job_id,
+        started,
+    } = budget;
     let total_tokens = tokenized
         .real_token_counts
         .iter()
@@ -9852,12 +10267,20 @@ async fn embed_tokenized(
             &model,
             tokenized.batch,
             total_tokens,
-            budget.request_bytes,
-            budget.deadline,
+            request_bytes,
+            deadline,
+            Some(&job_id),
         )
         .await
     } else {
-        execute_embedding(&state.runtime, &model, tokenized.batch, budget.deadline).await
+        execute_embedding(
+            &state.runtime,
+            &model,
+            tokenized.batch,
+            deadline,
+            Some(&job_id),
+        )
+        .await
     } {
         Ok(vectors) => vectors,
         Err(error) => return result_outcome(error_payload(&state, error)),
@@ -9905,6 +10328,13 @@ async fn embed_tokenized(
         equivalent_to,
         payload,
     };
+    log_job_done(
+        &model.model_id,
+        &job_id,
+        execution_lane(&model),
+        total_tokens,
+        started,
+    );
     result_outcome(serde_json::to_value(envelope).expect("embed envelope should serialize"))
 }
 
@@ -10008,10 +10438,17 @@ async fn execute_embedding(
     model: &EmbeddingModel,
     batch: TokenBatch,
     deadline: Option<tokio::time::Instant>,
+    job_id: Option<&str>,
 ) -> Result<Vectors, WireOperationError> {
     let profile = embedding_profile_enabled();
+    let tokens = batch
+        .items
+        .iter()
+        .map(|item| item.len().max(1) as u64)
+        .sum::<u64>();
     let permit = acquire_execution_permit(runtime, deadline).await?;
-    match &model.backend {
+    let _activity = runtime.activity_telemetry.begin(&model.model_id);
+    let result = match &model.backend {
         EmbedBackend::Ort(engine) => {
             let engine = Arc::clone(engine);
             let loaded_model = model.loaded_model.clone();
@@ -10019,9 +10456,11 @@ async fn execute_embedding(
             tokio::task::spawn_blocking(move || {
                 let entered_at = Instant::now();
                 if profile {
-                    eprintln!(
-                        "[synapse-embed-profile] spawn_entry backend=ort wait_ms={:.3}",
-                        submitted_at.elapsed().as_secs_f64() * 1_000.0
+                    tracing::debug!(
+                        target: "perf",
+                        backend = "ort",
+                        wait_ms = format_args!("{:.3}", submitted_at.elapsed().as_secs_f64() * 1_000.0),
+                        "spawn_entry"
                     );
                 }
                 let _permit = permit;
@@ -10034,18 +10473,22 @@ async fn execute_embedding(
                     safe_to_retry_same_request: true,
                 })?;
                 if profile {
-                    eprintln!(
-                        "[synapse-embed-profile] mutex_acquired backend=ort wait_ms={:.3}",
-                        mutex_started.elapsed().as_secs_f64() * 1_000.0
+                    tracing::debug!(
+                        target: "perf",
+                        backend = "ort",
+                        wait_ms = format_args!("{:.3}", mutex_started.elapsed().as_secs_f64() * 1_000.0),
+                        "mutex_acquired"
                     );
                 }
                 let inference_started = Instant::now();
                 let result = engine.embed_batch(&loaded_model, batch);
                 if profile {
-                    eprintln!(
-                        "[synapse-embed-profile] engine_return backend=ort inference_ms={:.3} worker_ms={:.3}",
-                        inference_started.elapsed().as_secs_f64() * 1_000.0,
-                        entered_at.elapsed().as_secs_f64() * 1_000.0
+                    tracing::debug!(
+                        target: "perf",
+                        backend = "ort",
+                        inference_ms = format_args!("{:.3}", inference_started.elapsed().as_secs_f64() * 1_000.0),
+                        worker_ms = format_args!("{:.3}", entered_at.elapsed().as_secs_f64() * 1_000.0),
+                        "engine_return"
                     );
                 }
                 result
@@ -10066,9 +10509,11 @@ async fn execute_embedding(
             tokio::task::spawn_blocking(move || {
                 let entered_at = Instant::now();
                 if profile {
-                    eprintln!(
-                        "[synapse-embed-profile] spawn_entry backend=owned wait_ms={:.3}",
-                        submitted_at.elapsed().as_secs_f64() * 1_000.0
+                    tracing::debug!(
+                        target: "perf",
+                        backend = "owned",
+                        wait_ms = format_args!("{:.3}", submitted_at.elapsed().as_secs_f64() * 1_000.0),
+                        "spawn_entry"
                     );
                 }
                 let _permit = permit;
@@ -10081,18 +10526,22 @@ async fn execute_embedding(
                     safe_to_retry_same_request: true,
                 })?;
                 if profile {
-                    eprintln!(
-                        "[synapse-embed-profile] mutex_acquired backend=owned wait_ms={:.3}",
-                        mutex_started.elapsed().as_secs_f64() * 1_000.0
+                    tracing::debug!(
+                        target: "perf",
+                        backend = "owned",
+                        wait_ms = format_args!("{:.3}", mutex_started.elapsed().as_secs_f64() * 1_000.0),
+                        "mutex_acquired"
                     );
                 }
                 let inference_started = Instant::now();
                 let result = engine.embed_batch(&loaded_model, batch);
                 if profile {
-                    eprintln!(
-                        "[synapse-embed-profile] engine_return backend=owned inference_ms={:.3} worker_ms={:.3}",
-                        inference_started.elapsed().as_secs_f64() * 1_000.0,
-                        entered_at.elapsed().as_secs_f64() * 1_000.0
+                    tracing::debug!(
+                        target: "perf",
+                        backend = "owned",
+                        inference_ms = format_args!("{:.3}", inference_started.elapsed().as_secs_f64() * 1_000.0),
+                        worker_ms = format_args!("{:.3}", entered_at.elapsed().as_secs_f64() * 1_000.0),
+                        "engine_return"
                     );
                 }
                 result
@@ -10114,12 +10563,15 @@ async fn execute_embedding(
             let engine = Arc::clone(engine);
             let loaded_model = model.loaded_model.clone();
             let submitted_at = Instant::now();
+            let job_id = job_id.map(str::to_owned);
             tokio::task::spawn_blocking(move || {
                 let entered_at = Instant::now();
                 if profile {
-                    eprintln!(
-                        "[synapse-embed-profile] spawn_entry backend=worker wait_ms={:.3}",
-                        submitted_at.elapsed().as_secs_f64() * 1_000.0
+                    tracing::debug!(
+                        target: "perf",
+                        backend = "worker",
+                        wait_ms = format_args!("{:.3}", submitted_at.elapsed().as_secs_f64() * 1_000.0),
+                        "spawn_entry"
                     );
                 }
                 let _permit = permit;
@@ -10132,18 +10584,23 @@ async fn execute_embedding(
                     safe_to_retry_same_request: true,
                 })?;
                 if profile {
-                    eprintln!(
-                        "[synapse-embed-profile] mutex_acquired backend=worker wait_ms={:.3}",
-                        mutex_started.elapsed().as_secs_f64() * 1_000.0
+                    tracing::debug!(
+                        target: "perf",
+                        backend = "worker",
+                        wait_ms = format_args!("{:.3}", mutex_started.elapsed().as_secs_f64() * 1_000.0),
+                        "mutex_acquired"
                     );
                 }
                 let inference_started = Instant::now();
-                let result = engine.embed_batch(&loaded_model, batch);
+                let result =
+                    engine.embed_batch_with_job(&loaded_model, batch, job_id.as_deref());
                 if profile {
-                    eprintln!(
-                        "[synapse-embed-profile] engine_return backend=worker inference_ms={:.3} worker_ms={:.3}",
-                        inference_started.elapsed().as_secs_f64() * 1_000.0,
-                        entered_at.elapsed().as_secs_f64() * 1_000.0
+                    tracing::debug!(
+                        target: "perf",
+                        backend = "worker",
+                        inference_ms = format_args!("{:.3}", inference_started.elapsed().as_secs_f64() * 1_000.0),
+                        worker_ms = format_args!("{:.3}", entered_at.elapsed().as_secs_f64() * 1_000.0),
+                        "engine_return"
                     );
                 }
                 result
@@ -10157,7 +10614,11 @@ async fn execute_embedding(
             })?
             .map_err(engine_error_to_wire)
         }
+    };
+    if result.is_ok() {
+        runtime.activity_telemetry.record_completed_tokens(tokens);
     }
+    result
 }
 
 async fn execute_rerank(
@@ -10166,9 +10627,16 @@ async fn execute_rerank(
     request: RerankRequest,
     owned_pairs: Option<Vec<Vec<u32>>>,
     deadline: Option<tokio::time::Instant>,
+    job_id: Option<&str>,
 ) -> Result<synapse_core::RerankScores, WireOperationError> {
+    let tokens = request
+        .candidates
+        .iter()
+        .map(|candidate| request.query.len().saturating_add(candidate.len()) as u64)
+        .sum();
     let permit = acquire_execution_permit(runtime, deadline).await?;
-    match &model.backend {
+    let _activity = runtime.activity_telemetry.begin(&model.model_id);
+    let result = match &model.backend {
         EmbedBackend::Ort(_) | EmbedBackend::OwnedDecode => Err(WireOperationError::from_stable(
             StableError::artifact_invalid(),
             format!("model '{}' does not support rerank.score", model.model_id),
@@ -10208,6 +10676,7 @@ async fn execute_rerank(
         EmbedBackend::Worker(engine) => {
             let engine = Arc::clone(engine);
             let loaded_model = model.loaded_model.clone();
+            let job_id = job_id.map(str::to_owned);
             tokio::task::spawn_blocking(move || {
                 let _permit = permit;
                 let engine = engine.lock().map_err(|_| EngineError {
@@ -10217,7 +10686,7 @@ async fn execute_rerank(
                     retry_after_ms: Some(100),
                     safe_to_retry_same_request: true,
                 })?;
-                engine.rerank(&loaded_model, request)
+                engine.rerank_with_job(&loaded_model, request, job_id.as_deref())
             })
             .await
             .map_err(|error| {
@@ -10228,7 +10697,11 @@ async fn execute_rerank(
             })?
             .map_err(engine_error_to_wire)
         }
+    };
+    if result.is_ok() {
+        runtime.activity_telemetry.record_completed_tokens(tokens);
     }
+    result
 }
 
 fn owned_rerank_pairs(
@@ -10271,9 +10744,11 @@ async fn execute_generate(
     model: &EmbeddingModel,
     request: GenerateRequest,
     deadline: Option<tokio::time::Instant>,
+    job_id: Option<&str>,
 ) -> Result<GenerateOutput, WireOperationError> {
     let permit = acquire_execution_permit(runtime, deadline).await?;
-    match &model.backend {
+    let _activity = runtime.activity_telemetry.begin(&model.model_id);
+    let result = match &model.backend {
         EmbedBackend::Ort(_) | EmbedBackend::Owned(_) | EmbedBackend::OwnedDecode => {
             Err(WireOperationError::from_stable(
                 StableError::artifact_invalid(),
@@ -10286,6 +10761,7 @@ async fn execute_generate(
         EmbedBackend::Worker(engine) => {
             let engine = Arc::clone(engine);
             let loaded_model = model.loaded_model.clone();
+            let job_id = job_id.map(str::to_owned);
             tokio::task::spawn_blocking(move || {
                 let _permit = permit;
                 let engine = engine.lock().map_err(|_| EngineError {
@@ -10295,7 +10771,7 @@ async fn execute_generate(
                     retry_after_ms: Some(100),
                     safe_to_retry_same_request: true,
                 })?;
-                engine.generate(&loaded_model, request)
+                engine.generate_with_job(&loaded_model, request, job_id.as_deref())
             })
             .await
             .map_err(|error| {
@@ -10306,7 +10782,13 @@ async fn execute_generate(
             })?
             .map_err(engine_error_to_wire)
         }
+    };
+    if let Ok(output) = &result {
+        runtime
+            .activity_telemetry
+            .record_completed_tokens((output.n_prompt as u64).saturating_add(output.n_gen as u64));
     }
+    result
 }
 
 fn engine_error_to_wire(error: EngineError) -> WireOperationError {
@@ -10437,10 +10919,7 @@ fn ensure_model_certified(
         )
     };
     if let Err(error) = &result {
-        state
-            .runtime
-            .admission_telemetry
-            .record_refusal(&error.code);
+        record_admission_refusal(&state.runtime, &model.model_id, None, &error.code);
         if error.code == "not_certified"
             && state
                 .store
@@ -11058,11 +11537,18 @@ async fn execute_embed_probe_for_model(
         }
     };
     apply_owned_tokenizer_policy(&model, &mut tokenized);
-    let vectors =
-        match execute_embedding(&state.runtime, &model, tokenized.batch.clone(), None).await {
-            Ok(vectors) => vectors,
-            Err(error) => return Err(error),
-        };
+    let vectors = match execute_embedding(
+        &state.runtime,
+        &model,
+        tokenized.batch.clone(),
+        None,
+        None,
+    )
+    .await
+    {
+        Ok(vectors) => vectors,
+        Err(error) => return Err(error),
+    };
     let actual_dims = vectors.first().map(Vec::len);
     let actual_item_count = vectors.len();
     let vectors_have_one_dimension = vectors
@@ -11252,6 +11738,7 @@ async fn execute_rerank_probe_for_model(
                 candidates: token_items,
             },
             owned_pairs,
+            None,
             None,
         )
         .await
@@ -12009,7 +12496,14 @@ async fn measure_embed_perf(
                 break;
             }
         }
-        execute_embedding(runtime, model, TokenBatch { items: batch_items }, None).await?;
+        execute_embedding(
+            runtime,
+            model,
+            TokenBatch { items: batch_items },
+            None,
+            None,
+        )
+        .await?;
         batch_samples += 1;
     }
     let elapsed_secs = started.elapsed().as_secs_f64().max(f64::EPSILON);
@@ -12024,6 +12518,7 @@ async fn measure_embed_perf(
             TokenBatch {
                 items: vec![tokenized.batch.items[index].clone()],
             },
+            None,
             None,
         )
         .await?;
@@ -12099,7 +12594,15 @@ async fn measure_rerank_perf(
         let mut batch_tokens = 0_usize;
         while batch_tokens < PROBE_PERF_BATCH_TOKEN_BUDGET || batch_tokens == 0 {
             let (request, token_cost, owned_pairs) = &requests[cursor % requests.len()];
-            execute_rerank(runtime, model, request.clone(), owned_pairs.clone(), None).await?;
+            execute_rerank(
+                runtime,
+                model,
+                request.clone(),
+                owned_pairs.clone(),
+                None,
+                None,
+            )
+            .await?;
             batch_tokens = batch_tokens.saturating_add(*token_cost as usize);
             total_tokens = total_tokens.saturating_add(*token_cost);
             cursor += 1;
@@ -12115,7 +12618,15 @@ async fn measure_rerank_perf(
     for sample in 0..PROBE_PERF_SINGLE_SAMPLES {
         let (request, _, owned_pairs) = &requests[sample % requests.len()];
         let started = std::time::Instant::now();
-        execute_rerank(runtime, model, request.clone(), owned_pairs.clone(), None).await?;
+        execute_rerank(
+            runtime,
+            model,
+            request.clone(),
+            owned_pairs.clone(),
+            None,
+            None,
+        )
+        .await?;
         latency_samples.push(started.elapsed().as_secs_f64() * 1_000.0);
     }
     let single_item_latency_p50_ms = median_ms(&mut latency_samples);
@@ -13341,7 +13852,7 @@ fn module_health(state: &ModuleState) -> ModuleHealth {
         })
         .collect::<Vec<_>>();
     let storage = state.store.storage_health_inputs().unwrap_or_else(|error| {
-        eprintln!("WARN failed to read profile health state: {error}");
+        tracing::warn!(target: "cert", error = %error, "failed to read profile health state");
         StorageHealthInputs {
             previous_revisioned_machine_profile_hash: None,
             current_revisioned_machine_profile_hash: Some(
@@ -13746,12 +14257,17 @@ fn parse_module_config_json(
     }
     let config: ModuleConfig = serde_json::from_value(value).map_err(|error| {
         if let Some(field) = unknown_field_from_json_error(&error) {
-            eprintln!("synapse config parse error in {source}: unknown field '{field}'");
+            tracing::error!(
+                target: "config",
+                source,
+                field,
+                "synapse config parse error: unknown field"
+            );
             ModuleError::Config(format!(
                 "unknown config field '{field}' in {source} (deny_unknown_fields)"
             ))
         } else {
-            eprintln!("synapse config parse error in {source}: {error}");
+            tracing::error!(target: "config", source, error = %error, "synapse config parse error");
             ModuleError::Json(error)
         }
     })?;
@@ -14246,6 +14762,14 @@ mod tests {
     }
 
     fn test_module_state(store: Arc<SynapseStore>, profile: MachineProfile) -> Arc<ModuleState> {
+        test_module_state_with_config(store, profile, ModuleConfig::default())
+    }
+
+    fn test_module_state_with_config(
+        store: Arc<SynapseStore>,
+        profile: MachineProfile,
+        config: ModuleConfig,
+    ) -> Arc<ModuleState> {
         let (machine_profile_hash, revisioned_machine_profile_hash) =
             module_state_machine_profile_hashes(&profile);
         let profile_activation_epoch = store
@@ -14254,7 +14778,7 @@ mod tests {
             .profile_activation_epoch
             .expect("test profile is activated");
         let runtime = Arc::new(
-            RuntimeState::from_catalog(ModuleConfig::default(), vec![stuck_model_spec()])
+            RuntimeState::from_catalog(config, vec![stuck_model_spec()])
                 .expect("test runtime initializes"),
         );
         let remote_gateway = Arc::new(
@@ -14283,6 +14807,78 @@ mod tests {
             continuity_check,
             remote_gateway,
         })
+    }
+
+    #[tokio::test]
+    async fn perf_sampler_disabled_is_silent_and_enabled_names_active_model() {
+        let log_root = std::env::temp_dir().join(format!(
+            "synapse-perf-sampler-{}-{}",
+            std::process::id(),
+            TEST_STATE_COUNTER.fetch_add(1, Ordering::Relaxed),
+        ));
+        cortexkit_log::declared_tags(LOG_TAGS);
+        let log_handle = cortexkit_log::init(cortexkit_log::Config {
+            module_id: "synapse".to_string(),
+            logs_dir: log_root,
+            lane: cortexkit_log::Lane::Module,
+            spec: Some("debug".to_string()),
+            retention: cortexkit_log::Retention::default(),
+            redactor: None,
+            clock: None,
+        })
+        .expect("test logger initializes");
+
+        let (disabled_root, disabled_descriptor) = test_storage_descriptor("perf-disabled");
+        let disabled_store = Arc::new(
+            SynapseStore::open(&disabled_descriptor).expect("disabled sampler store opens"),
+        );
+        let disabled_profile = test_machine_profile("perf-disabled-os");
+        disabled_store
+            .observe_profile(&disabled_profile, 10, 1)
+            .expect("disabled sampler profile activates");
+        let disabled_state = test_module_state(disabled_store, disabled_profile);
+        assert!(start_perf_sampler(disabled_state).is_none());
+        assert!(!fs::read_to_string(log_handle.path())
+            .unwrap_or_default()
+            .contains(" tag=perf activity"));
+
+        let (enabled_root, enabled_descriptor) = test_storage_descriptor("perf-enabled");
+        let enabled_store =
+            Arc::new(SynapseStore::open(&enabled_descriptor).expect("enabled sampler store opens"));
+        let enabled_profile = test_machine_profile("perf-enabled-os");
+        enabled_store
+            .observe_profile(&enabled_profile, 10, 1)
+            .expect("enabled sampler profile activates");
+        let mut config = ModuleConfig::default();
+        config.log.perf_interval_secs = 1;
+        let enabled_state = test_module_state_with_config(enabled_store, enabled_profile, config);
+        enabled_state
+            .runtime
+            .execution_stats
+            .lock()
+            .expect("execution stats lock")
+            .in_flight = 1;
+        let _activity = enabled_state
+            .runtime
+            .activity_telemetry
+            .begin("active-model");
+        let sampler = start_perf_sampler(Arc::clone(&enabled_state)).expect("sampler starts");
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        sampler.abort();
+
+        let activity_lines = fs::read_to_string(log_handle.path())
+            .expect("perf log reads")
+            .lines()
+            .filter(|line| line.contains(" tag=perf activity "))
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert_eq!(activity_lines.len(), 1, "{activity_lines:#?}");
+        assert!(activity_lines[0].contains("in_flight=1"));
+        assert!(activity_lines[0].contains("by_model=active-model:1"));
+        assert!(activity_lines[0].contains("queue_depth=0 waiters=0"));
+
+        fs::remove_dir_all(disabled_root).expect("remove disabled sampler state");
+        fs::remove_dir_all(enabled_root).expect("remove enabled sampler state");
     }
 
     #[tokio::test]
@@ -14375,6 +14971,8 @@ mod tests {
             .expect("test profile activates");
         let state = test_module_state(Arc::clone(&store), profile);
         let error = match state.runtime.admit_inline(
+            "test-model",
+            None,
             QueueClass::Interactive,
             state.runtime.inline.byte_budget.saturating_add(1),
             None,
@@ -14809,6 +15407,34 @@ mod tests {
         )
         .expect("user tier may configure remote providers");
         assert_eq!(config.remote_providers.len(), 1);
+    }
+
+    #[test]
+    fn module_config_parses_log_settings() {
+        let default = parse_module_config_json(r#"{}"#, "test", ConfigTier::User)
+            .expect("default log config should parse");
+        assert_eq!(default.log.perf_interval_secs, 0);
+        assert_eq!(
+            default.log.worker_forward_lines_per_sec,
+            DEFAULT_WORKER_FORWARD_LINES_PER_SEC
+        );
+
+        let configured = parse_module_config_json(
+            r#"{"log":{"perf_interval_secs":5,"worker_forward_lines_per_sec":12}}"#,
+            "test",
+            ConfigTier::User,
+        )
+        .expect("log settings should parse");
+        assert_eq!(configured.log.perf_interval_secs, 5);
+        assert_eq!(configured.log.worker_forward_lines_per_sec, 12);
+
+        let error = parse_module_config_json(
+            r#"{"log":{"worker_forward_line_per_sec":12}}"#,
+            "test",
+            ConfigTier::User,
+        )
+        .expect_err("unknown log fields should fail");
+        assert!(error.to_string().contains("worker_forward_line_per_sec"));
     }
 
     #[test]

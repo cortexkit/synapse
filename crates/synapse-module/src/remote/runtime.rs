@@ -595,7 +595,7 @@ fn credential_failure_disposition(class: String, code: String) -> CredentialDisp
             let message = unrecognized_credential_error_class_message(&class, &code);
             // Pause unknown classes: rejecting a new transient condition kills a job,
             // while pausing a permanent condition lets existing backoff retry safely.
-            eprintln!("{message}");
+            tracing::warn!(target: "admission", class, code, "{message}");
             CredentialDisposition::PauseJob
         }
     }

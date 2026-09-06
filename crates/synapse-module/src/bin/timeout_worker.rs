@@ -36,6 +36,27 @@ fn optional_milliseconds(name: &str) -> Result<u64> {
     }
 }
 
+fn optional_count(name: &str) -> Result<usize> {
+    match argument(name) {
+        Ok(value) => value.parse().with_context(|| format!("invalid {name}")),
+        Err(_) => Ok(0),
+    }
+}
+
+fn emit_stderr_fixture(lines: usize, final_delay_ms: u64) -> Result<()> {
+    let mut stderr = io::stderr().lock();
+    for index in 0..lines {
+        writeln!(stderr, "fixture stderr line {index}")?;
+    }
+    stderr.flush()?;
+    if final_delay_ms > 0 {
+        thread::sleep(Duration::from_millis(final_delay_ms));
+        writeln!(stderr, "fixture stderr after flood")?;
+        stderr.flush()?;
+    }
+    Ok(())
+}
+
 /// The timeout worker is shared by tests for several catalog engines. Match
 /// the host's expected identity so the mock exercises request behavior instead
 /// of being rejected during the catalog identity handshake.
@@ -181,6 +202,8 @@ fn main() -> Result<()> {
     let hello = worker_hello(argument("--nonce")?);
     let load_sleep_ms = optional_milliseconds("--load-sleep-ms")?;
     let embed_sleep_ms = optional_milliseconds("--embed-sleep-ms")?;
+    let stderr_lines = optional_count("--stderr-lines")?;
+    let stderr_final_delay_ms = optional_milliseconds("--stderr-final-delay-ms")?;
     let mut stream = UnixStream::connect(&socket)
         .with_context(|| format!("connect mock worker socket {}", socket.display()))?;
     write_json_frame(&mut stream, &hello, DEFAULT_MAX_FRAME_BYTES)?;
@@ -189,6 +212,7 @@ fn main() -> Result<()> {
         bail!("mock worker handshake rejected");
     }
     let max_frame = ack.max_frame.min(DEFAULT_MAX_FRAME_BYTES);
+    emit_stderr_fixture(stderr_lines, stderr_final_delay_ms)?;
     run_worker(&mut stream, max_frame, load_sleep_ms, embed_sleep_ms)
 }
 
@@ -198,6 +222,8 @@ fn main() -> Result<()> {
     let hello = worker_hello(argument("--nonce")?);
     let load_sleep_ms = optional_milliseconds("--load-sleep-ms")?;
     let embed_sleep_ms = optional_milliseconds("--embed-sleep-ms")?;
+    let stderr_lines = optional_count("--stderr-lines")?;
+    let stderr_final_delay_ms = optional_milliseconds("--stderr-final-delay-ms")?;
     let (mut stream, max_frame) =
         synapse_core::worker_transport::windows_client::connect_and_handshake(
             &pipe,
@@ -205,10 +231,14 @@ fn main() -> Result<()> {
             DEFAULT_MAX_FRAME_BYTES,
         )
         .with_context(|| format!("connect mock worker pipe {pipe}"))?;
+    emit_stderr_fixture(stderr_lines, stderr_final_delay_ms)?;
     run_worker(&mut stream, max_frame, load_sleep_ms, embed_sleep_ms)
 }
 
 #[cfg(not(any(unix, windows)))]
 fn main() {
-    eprintln!("timeout mock worker requires a supported local transport");
+    tracing::error!(
+        target: "worker",
+        "timeout mock worker requires a supported local transport"
+    );
 }

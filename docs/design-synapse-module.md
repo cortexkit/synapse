@@ -267,6 +267,20 @@ Machine-wide admission: an exclusive process lease
 (`module=synapse`, `scope=singleton`) is taken at boot; a second live instance
 exits nonzero with a typed log line.
 
+Logging uses `cortexkit-log` and the fleet-wide `CK_LOG` level filter. The
+optional `log` block accepts only these keys:
+
+- `perf_interval_secs: u64` (default `0`): emit DEBUG `tag=perf` activity
+  samples at this interval; zero disables the sampler entirely.
+- `worker_forward_lines_per_sec: u32` (default `50`): cap the combined stdout
+  and stderr lines forwarded from each supervised worker. Suppressed lines are
+  counted on the next forwarded line as `dropped=<n>`.
+
+The module declares `perf`, `worker`, `admission`, `cert`, `maintenance`, and
+`config` tags. Log files and retention follow the shared logger's module-data
+path and defaults; Synapse does not assemble a log path or add another level
+control.
+
 ## v1 cut line
 
 IN: embed (query + batch incl. job-shaped), rerank.score, microllm.oneshot,
