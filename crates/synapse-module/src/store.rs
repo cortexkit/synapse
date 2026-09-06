@@ -1,12 +1,12 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
 
 use cortexkit_store::{open_sqlite, Migration, SqliteStore, StoreError};
-use cortexkit_store_types::StorageDescriptor;
-use rusqlite::{params, OptionalExtension, Row};
+use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
+use rusqlite::{params, OptionalExtension, Row, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -685,6 +685,84 @@ const MIGRATIONS: &[Migration] = &[
 
 static JOB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+// This independent inventory makes omission from the delete/import policy a
+// refusal instead of silently narrowing the restore contract.
+const RESTORE_APPLICATION_TABLES: &[&str] = &[
+    "alias_rows",
+    "approval_digest_corruption_events",
+    "approval_migration_markers",
+    "approvals",
+    "cert_row_rebuild_events",
+    "cert_rows",
+    "jobs",
+    "knob_assignments",
+    "models",
+    "perf_rows",
+    "profile_rotation_certification_outcomes",
+    "profile_rotation_events",
+    "profile_state",
+    "remote_checkpoints",
+    "remote_url_bindings",
+    "result_pages",
+    "serving_approvals",
+    "serving_artifacts",
+    "serving_certification_records",
+    "serving_retained_states",
+    "serving_sessions",
+];
+
+const RESTORE_KEEP_TABLES: &[&str] = &[
+    "approvals",
+    "serving_approvals",
+    "approval_migration_markers",
+    "alias_rows",
+    "knob_assignments",
+];
+
+// All jobs, including terminal rows, are discarded so restored request keys
+// cannot point at result pages or checkpoints from an older execution world.
+// Result/model/artifact/URL caches are also cleared rather than imported; every
+// consumer already treats their absence as a cache miss. `module_meta` is the
+// one cache kept from the live store because its generation and table epoch
+// fence concurrent writers and must never regress to captured values.
+//
+// Deletion order follows the live foreign-key graph even though restored
+// serving approvals intentionally outlive discarded certifications and
+// artifacts. Foreign keys are disabled only for this transaction: admission
+// reloads both missing rows and refuses with CertificationMismatch until a
+// probe re-derives them.
+const RESTORE_CLEAR_TABLES: &[&str] = &[
+    "serving_sessions",
+    "serving_retained_states",
+    "serving_approvals",
+    "serving_certification_records",
+    "serving_artifacts",
+    "remote_checkpoints",
+    "result_pages",
+    "jobs",
+    "profile_rotation_certification_outcomes",
+    "profile_rotation_events",
+    "profile_state",
+    "cert_rows",
+    "perf_rows",
+    "approval_digest_corruption_events",
+    "cert_row_rebuild_events",
+    "remote_url_bindings",
+    "models",
+    "approvals",
+    "approval_migration_markers",
+    "alias_rows",
+    "knob_assignments",
+];
+
+const RESTORE_LIVE_ONLY_TABLES: &[&str] =
+    &["module_meta", "cortexkit_fence", "cortexkit_schema_version"];
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct RestoreImportReport {
+    pub imported_rows: BTreeMap<String, u64>,
+}
+
 #[derive(Debug, Error)]
 pub enum SynapseStoreError {
     #[error("synapse store: {0}")]
@@ -725,6 +803,8 @@ pub enum SynapseStoreError {
     ProfileActivationLost,
     #[error("approval migration state corrupt: {0}")]
     ApprovalMigrationStateCorrupt(String),
+    #[error("restore import refused: {0}")]
+    RestoreRefused(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -1768,7 +1848,175 @@ pub struct SynapseStore {
     store: SqliteStore,
 }
 
+fn sqlite_path(descriptor: &StorageDescriptor) -> Result<PathBuf, SynapseStoreError> {
+    match &descriptor.backend {
+        StorageBackend::Sqlite { path } => Ok(PathBuf::from(path)),
+        _ => Err(SynapseStoreError::RestoreRefused(
+            "restore import requires a SQLite live store".to_string(),
+        )),
+    }
+}
+
+fn validate_restore_table_set(
+    connection: &rusqlite::Connection,
+    schema: &str,
+) -> rusqlite::Result<()> {
+    let expected = RESTORE_APPLICATION_TABLES
+        .iter()
+        .copied()
+        .chain(
+            RESTORE_LIVE_ONLY_TABLES
+                .iter()
+                .copied()
+                .filter(|table| *table != "cortexkit_fence"),
+        )
+        .collect::<BTreeSet<_>>();
+
+    // `schema` is selected only by this module, never from CLI input.
+    let mut statement = connection.prepare(&format!(
+        "SELECT name FROM {schema}.sqlite_master \
+         WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+    ))?;
+    let actual = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let expected = expected
+        .into_iter()
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    let mut expected_with_fence = expected.clone();
+    expected_with_fence.insert("cortexkit_fence".to_string());
+    if actual != expected && actual != expected_with_fence {
+        return Err(rusqlite::Error::InvalidParameterName(format!(
+            "restore table contract mismatch in {schema}: expected {expected:?} \
+             with optional cortexkit_fence, found {actual:?}"
+        )));
+    }
+    Ok(())
+}
+
 impl SynapseStore {
+    /// Import only durable operator intent from an Engram scratch database.
+    ///
+    /// Opening the capture first applies this binary's normal forward migrations
+    /// and preserves the typed refusal for captures written by a newer schema.
+    /// The target must be unserved; opening its store takes the same lease used
+    /// by the module before any live row is changed.
+    pub fn restore_from_capture(
+        live_descriptor: &StorageDescriptor,
+        capture_path: &Path,
+    ) -> Result<RestoreImportReport, SynapseStoreError> {
+        let metadata = std::fs::metadata(capture_path).map_err(|error| {
+            SynapseStoreError::RestoreRefused(format!(
+                "capture '{}' is not readable: {error}",
+                capture_path.display()
+            ))
+        })?;
+        if !metadata.is_file() {
+            return Err(SynapseStoreError::RestoreRefused(format!(
+                "capture '{}' is not a regular file",
+                capture_path.display()
+            )));
+        }
+
+        let live_path = sqlite_path(live_descriptor)?;
+        if live_path.exists()
+            && std::fs::canonicalize(capture_path).ok() == std::fs::canonicalize(&live_path).ok()
+        {
+            return Err(SynapseStoreError::RestoreRefused(
+                "capture and live store resolve to the same file".to_string(),
+            ));
+        }
+
+        let capture_descriptor = StorageDescriptor {
+            module_id: "synapse-restore-capture".to_string(),
+            storage_namespace: "restore-import".to_string(),
+            isolation: Isolation::Module,
+            backend: StorageBackend::Sqlite {
+                path: capture_path.to_string_lossy().into_owned(),
+            },
+        };
+        let migrated_capture = Self::open(&capture_descriptor)?;
+        drop(migrated_capture);
+
+        let live = Self::open(live_descriptor).map_err(|error| match error {
+            SynapseStoreError::Store(StoreError::Lease(lease)) => {
+                SynapseStoreError::RestoreRefused(format!(
+                    "target store lease for '{}' is held; stop the module before restore: {lease}",
+                    live_path.display()
+                ))
+            }
+            other => other,
+        })?;
+        live.import_migrated_capture(capture_path, None)
+    }
+
+    fn import_migrated_capture(
+        &self,
+        capture_path: &Path,
+        fail_after_table: Option<&str>,
+    ) -> Result<RestoreImportReport, SynapseStoreError> {
+        let capture_path = capture_path.to_string_lossy().into_owned();
+        let report = self.store.with_conn(|connection| {
+            connection.execute(
+                "ATTACH DATABASE ?1 AS restore_capture",
+                params![capture_path],
+            )?;
+            let foreign_keys_enabled: bool =
+                connection.query_row("PRAGMA foreign_keys", [], |row| {
+                    row.get::<_, i64>(0).map(|value| value != 0)
+                })?;
+            if foreign_keys_enabled {
+                connection.pragma_update(None, "foreign_keys", false)?;
+            }
+
+            let operation = (|| {
+                validate_restore_table_set(connection, "main")?;
+                validate_restore_table_set(connection, "restore_capture")?;
+                let transaction = rusqlite::Transaction::new_unchecked(
+                    connection,
+                    TransactionBehavior::Immediate,
+                )?;
+
+                for table in RESTORE_CLEAR_TABLES {
+                    transaction.execute(&format!("DELETE FROM \"{table}\""), [])?;
+                }
+
+                let mut imported_rows = BTreeMap::new();
+                for table in RESTORE_KEEP_TABLES {
+                    let rows = transaction.execute(
+                        &format!(
+                            "INSERT INTO main.\"{table}\" SELECT * FROM restore_capture.\"{table}\""
+                        ),
+                        [],
+                    )?;
+                    imported_rows.insert((*table).to_string(), rows as u64);
+                    if fail_after_table == Some(*table) {
+                        return Err(rusqlite::Error::InvalidParameterName(format!(
+                            "simulated restore interruption after {table}"
+                        )));
+                    }
+                }
+
+                transaction.commit()?;
+                Ok(RestoreImportReport { imported_rows })
+            })();
+
+            let detach = connection.execute_batch("DETACH DATABASE restore_capture");
+            let restore_foreign_keys = if foreign_keys_enabled {
+                connection.pragma_update(None, "foreign_keys", true)
+            } else {
+                Ok(())
+            };
+            let cleanup = detach.and(restore_foreign_keys);
+            match (operation, cleanup) {
+                (Ok(report), Ok(())) => Ok(report),
+                (Err(error), _) | (_, Err(error)) => Err(error),
+            }
+        })?;
+        Ok(report)
+    }
+
     pub fn open(descriptor: &StorageDescriptor) -> Result<Self, SynapseStoreError> {
         let store = open_sqlite(descriptor)?;
         let outcome = store.migrate(NAMESPACE, MIGRATIONS).map_err(|error| {
@@ -4544,6 +4792,10 @@ impl SynapseStore {
         let current_hash = profile.revisioned_hash();
         let current_snapshot_json = serde_json::to_string(profile)?;
         let activation = self.store.with_conn_fenced(|tx| {
+            // A trust-only restore removes the captured machine profile. Recreate
+            // the empty singleton on first observation so no stale machine fact
+            // is consulted while the replacement profile is being derived.
+            tx.execute("INSERT OR IGNORE INTO profile_state (id) VALUES (0)", [])?;
             let persisted = tx.query_row(
                 "SELECT snapshot_json, revisioned_machine_profile_hash,
                          profile_activation_epoch, previous_revisioned_machine_profile_hash,
@@ -10532,6 +10784,397 @@ mod tests {
             ArtifactGcDisposition::Pinned,
             "blob pins affect GC only and never delay emergency revocation"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn populate_every_restore_table(store: &SynapseStore, seed: &str) {
+        let catalog_fingerprint = hex::encode(Sha256::digest(seed.as_bytes()));
+        let artifact_id = hex::encode(Sha256::digest(format!("artifact-{seed}").as_bytes()));
+        store.next_module_generation().unwrap();
+        store
+            .store
+            .with_conn(|connection| {
+                connection.execute_batch(&format!(
+                    r#"
+                    UPDATE module_meta
+                    SET module_generation = 71, table_epoch = 72
+                    WHERE id = 0;
+                    INSERT INTO jobs (
+                        job_id, request_key, request_digest, kind, module_generation,
+                        state, created_ms, updated_ms, result_retention_ttl_ms,
+                        terminal_at_ms, params_json, page_count
+                    ) VALUES ('job-{seed}', 'key-{seed}', 'digest-{seed}', 'embed.batch',
+                              1, 'done', 1, 2, 100, 2, X'7B7D', 1);
+                    INSERT INTO result_pages (
+                        request_digest, page_no, page_json, committed_at
+                    ) VALUES ('digest-{seed}', 0, X'7B7D', 2);
+                    INSERT INTO remote_checkpoints (
+                        request_digest, item_id, result, page_no, committed_at
+                    ) VALUES ('digest-{seed}', 'item-{seed}', X'7B7D', 0, 2);
+                    INSERT INTO alias_rows (
+                        fingerprint_a, fingerprint_b, valid_from_ms, evidence_json
+                    ) VALUES ('alias-a-{seed}', 'alias-b-{seed}', 1, '{{}}');
+                    INSERT INTO models (
+                        model_id, engine, task, fingerprint, config_json, created_ms, updated_ms
+                    ) VALUES ('model-{seed}', 'engine', 'embed', 'fingerprint-{seed}', X'7B7D', 1, 2);
+                    INSERT INTO cert_rows (
+                        certification_class, assurance_class, status, key_hash,
+                        machine_profile_hash, fingerprint, certified_at_ms, os_build,
+                        module_generation, evidence_json
+                    ) VALUES ('embedding', 'measured', 'certified', 'key-hash-{seed}',
+                              'machine-{seed}', 'cert-{seed}', 1, 'os', 1, '{{}}');
+                    INSERT INTO perf_rows (
+                        machine_profile_hash, model_id, workload, numeric_profile_id,
+                        fingerprint, engine, measured_at_ms, os_build, module_generation,
+                        throughput_tok_s, cold_load_ms, single_item_latency_p50_ms, details_json
+                    ) VALUES ('machine-{seed}', 'model-{seed}', 'embed.batch', 'numeric-{seed}',
+                              'perf-{seed}', 'engine', 1, 'os', 1, 3.0, 4.0, 5.0, '{{}}');
+                    INSERT INTO knob_assignments (
+                        machine_profile_hash, workload, knob, model_id, numeric_profile_id,
+                        fingerprint, engine, measured_at_ms, os_build, module_generation,
+                        throughput_tok_s, single_item_latency_p50_ms
+                    ) VALUES ('machine-{seed}', 'embed.batch', 'balanced', 'model-{seed}',
+                              'numeric-{seed}', 'knob-{seed}', 'engine', 1, 'os', 1, 3.0, 5.0);
+                    INSERT INTO remote_url_bindings (remote_profile_hash, last_base_url)
+                    VALUES ('remote-{seed}', 'https://{seed}.example.test');
+                    INSERT INTO approvals (
+                        schema_revision, model_id, decode_fingerprint, enabled,
+                        grammar_enabled, updated_at_ms, evidence_requirements_revision,
+                        semantic_digest, generation, fencing_metadata
+                    ) VALUES ('schema-{seed}', 'approved-model-{seed}', 'decode-{seed}',
+                              1, 1, 1, 'evidence-{seed}', 'digest-{seed}', 3, '{{}}');
+                    INSERT INTO approval_digest_corruption_events (
+                        model_id, decode_fingerprint, observed_digest, recomputed_digest,
+                        observed_at_ms
+                    ) VALUES ('approved-model-{seed}', 'decode-{seed}', 'bad', 'good', 1);
+                    INSERT INTO approval_migration_markers (
+                        seed_revision, schema_revision, seed_digest, applied_at_ms, row_count
+                    ) VALUES ('seed-{seed}', 'schema-{seed}', 'seed-digest-{seed}', 1, 1);
+                    UPDATE profile_state
+                    SET snapshot_json = '{{}}', revisioned_machine_profile_hash = 'profile-{seed}',
+                        profile_activation_epoch = 1
+                    WHERE id = 0;
+                    INSERT INTO profile_rotation_events (
+                        event_id, new_revisioned_machine_profile_hash,
+                        new_profile_activation_epoch, changed_fields_json,
+                        current_snapshot_json, observed_at_ms, module_generation, created_at_ms
+                    ) VALUES ('rotation-{seed}', 'profile-{seed}', 1, '[]', '{{}}', 1, 1, 1);
+                    INSERT INTO profile_rotation_certification_outcomes (
+                        event_id, model_id, decode_fingerprint, outcome_state
+                    ) VALUES ('rotation-{seed}', 'approved-model-{seed}', 'decode-{seed}', 'passed');
+                    INSERT INTO cert_row_rebuild_events (outcome, detail, occurred_at_ms)
+                    VALUES ('rebuilt-{seed}', 'detail', 1);
+                    INSERT INTO serving_artifacts (
+                        artifact_id, model_id, source_format, source_quantization,
+                        source_digest, artifact_json, ingested_at_ms
+                    ) VALUES ('{artifact_id}', 'model-{seed}', 'gguf', 'q4_k_m',
+                              'source-{seed}', '{{}}', 1);
+                    INSERT INTO serving_certification_records (
+                        certification_record_id, catalog_fingerprint, artifact_id,
+                        record_json, recorded_at_ms
+                    ) VALUES ('serving-cert-{seed}', '{catalog_fingerprint}', '{artifact_id}', '{{}}', 1);
+                    INSERT INTO serving_approvals (
+                        catalog_fingerprint, certification_record_id, artifact_id, state,
+                        approved_by, approved_at_ms, updated_at_ms, generation, semantic_digest
+                    ) VALUES ('{catalog_fingerprint}', 'serving-cert-{seed}', '{artifact_id}',
+                              'enabled', 'operator-{seed}', 1, 1, 2, 'pending');
+                    INSERT INTO serving_sessions (
+                        session_id, catalog_fingerprint, approval_generation, state,
+                        created_at_ms, updated_at_ms
+                    ) VALUES ('session-{seed}', '{catalog_fingerprint}', 2, 'active', 1, 1);
+                    INSERT INTO serving_retained_states (
+                        state_id, catalog_fingerprint, valid, created_at_ms, updated_at_ms
+                    ) VALUES ('state-{seed}', '{catalog_fingerprint}', 1, 1, 1);
+                    "#
+                ))?;
+                let mut approval = ServingApprovalRecord {
+                    schema_revision: SERVING_APPROVAL_SCHEMA_REVISION.to_string(),
+                    catalog_fingerprint: catalog_fingerprint.clone(),
+                    certification_record_id: format!("serving-cert-{seed}"),
+                    artifact_id: artifact_id.clone(),
+                    state: ServingApprovalState::Enabled,
+                    reason: None,
+                    approved_by: format!("operator-{seed}"),
+                    approved_at_ms: 1,
+                    updated_at_ms: 1,
+                    generation: 2,
+                    semantic_digest: String::new(),
+                };
+                approval.semantic_digest = approval.expected_digest();
+                connection.execute(
+                    "UPDATE serving_approvals SET semantic_digest = ?1
+                     WHERE catalog_fingerprint = ?2",
+                    params![approval.semantic_digest, catalog_fingerprint],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    fn restore_application_tables() -> Vec<&'static str> {
+        RESTORE_APPLICATION_TABLES.to_vec()
+    }
+
+    fn table_rows(store: &SynapseStore, table: &str) -> Vec<Vec<rusqlite::types::Value>> {
+        store
+            .store
+            .with_conn(|connection| {
+                let mut statement =
+                    connection.prepare(&format!("SELECT * FROM \"{table}\" ORDER BY rowid"))?;
+                let columns = statement.column_count();
+                let rows = statement
+                    .query_map([], |row| {
+                        (0..columns)
+                            .map(|index| row.get(index))
+                            .collect::<rusqlite::Result<Vec<_>>>()
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .unwrap()
+    }
+
+    fn table_count(store: &SynapseStore, table: &str) -> i64 {
+        store
+            .store
+            .with_conn(|connection| {
+                connection.query_row(&format!("SELECT COUNT(*) FROM \"{table}\""), [], |row| {
+                    row.get(0)
+                })
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn restore_policy_classifies_every_application_table() {
+        let application = RESTORE_APPLICATION_TABLES
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let cleared = RESTORE_CLEAR_TABLES
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let kept = RESTORE_KEEP_TABLES.iter().copied().collect::<BTreeSet<_>>();
+        assert_eq!(cleared, application);
+        assert!(kept.is_subset(&cleared));
+    }
+
+    #[test]
+    fn restore_import_drops_resurrected_certification_and_all_untrusted_state() {
+        let (capture_root, capture_descriptor) = temp_descriptor("restore-capture-all");
+        let capture = SynapseStore::open(&capture_descriptor).unwrap();
+        populate_every_restore_table(&capture, "capture");
+        let keep_rows = RESTORE_KEEP_TABLES
+            .iter()
+            .map(|table| (*table, table_rows(&capture, table)))
+            .collect::<BTreeMap<_, _>>();
+        for table in restore_application_tables() {
+            assert!(
+                table_count(&capture, table) > 0,
+                "capture table {table} is empty"
+            );
+        }
+        let capture_path = sqlite_path(&capture_descriptor).unwrap();
+        drop(capture);
+
+        let (live_root, live_descriptor) = temp_descriptor("restore-live-all");
+        let live = SynapseStore::open(&live_descriptor).unwrap();
+        populate_every_restore_table(&live, "live");
+        let live_only_before = RESTORE_LIVE_ONLY_TABLES
+            .iter()
+            .map(|table| (*table, table_rows(&live, table)))
+            .chain(std::iter::once((
+                "sqlite_sequence",
+                table_rows(&live, "sqlite_sequence"),
+            )))
+            .collect::<BTreeMap<_, _>>();
+        drop(live);
+
+        let report = SynapseStore::restore_from_capture(&live_descriptor, &capture_path).unwrap();
+        let restored = SynapseStore::open(&live_descriptor).unwrap();
+        for table in RESTORE_KEEP_TABLES {
+            assert_eq!(
+                table_rows(&restored, table),
+                keep_rows[*table],
+                "trust table {table} was not restored row-for-row"
+            );
+            assert_eq!(
+                report.imported_rows.get(*table).copied(),
+                Some(keep_rows[*table].len() as u64)
+            );
+        }
+        for table in restore_application_tables() {
+            if !RESTORE_KEEP_TABLES.contains(&table) {
+                assert_eq!(
+                    table_count(&restored, table),
+                    0,
+                    "restore resurrected table {table}"
+                );
+            }
+        }
+        for (table, rows) in live_only_before {
+            assert_eq!(
+                table_rows(&restored, table),
+                rows,
+                "live framework table {table} changed during restore"
+            );
+        }
+        let restored_catalog = hex::encode(Sha256::digest(b"capture"));
+        assert_eq!(
+            restored
+                .admit_serving_session("post-restore-session", &restored_catalog, 3)
+                .unwrap(),
+            ServingSessionAdmission::Refused {
+                reason: ServingRefusal::CertificationMismatch,
+            },
+            "an approval cannot serve until its discarded certification is re-derived"
+        );
+        drop(restored);
+        let _ = std::fs::remove_dir_all(capture_root);
+        let _ = std::fs::remove_dir_all(live_root);
+    }
+
+    #[test]
+    fn restore_import_rolls_back_the_whole_trust_set_after_mid_import_failure() {
+        let (capture_root, capture_descriptor) = temp_descriptor("restore-capture-rollback");
+        let capture = SynapseStore::open(&capture_descriptor).unwrap();
+        populate_every_restore_table(&capture, "capture");
+        let capture_path = sqlite_path(&capture_descriptor).unwrap();
+        drop(capture);
+
+        let (live_root, live_descriptor) = temp_descriptor("restore-live-rollback");
+        let live = SynapseStore::open(&live_descriptor).unwrap();
+        populate_every_restore_table(&live, "live");
+        let mut tables = restore_application_tables();
+        tables.extend_from_slice(RESTORE_LIVE_ONLY_TABLES);
+        tables.push("sqlite_sequence");
+        let before = tables
+            .iter()
+            .map(|table| (*table, table_rows(&live, table)))
+            .collect::<BTreeMap<_, _>>();
+
+        let error = live
+            .import_migrated_capture(&capture_path, Some("approvals"))
+            .unwrap_err();
+        assert!(error.to_string().contains("simulated restore interruption"));
+        for (table, rows) in before {
+            assert_eq!(
+                table_rows(&live, table),
+                rows,
+                "mid-import failure split the trust set at table {table}"
+            );
+        }
+        drop(live);
+        let _ = std::fs::remove_dir_all(capture_root);
+        let _ = std::fs::remove_dir_all(live_root);
+    }
+
+    #[test]
+    fn restore_import_refuses_a_held_target_store_lease_without_changes() {
+        let (capture_root, capture_descriptor) = temp_descriptor("restore-capture-lease");
+        let capture = SynapseStore::open(&capture_descriptor).unwrap();
+        populate_every_restore_table(&capture, "capture");
+        let capture_path = sqlite_path(&capture_descriptor).unwrap();
+        drop(capture);
+
+        let (live_root, live_descriptor) = temp_descriptor("restore-live-lease");
+        let live = SynapseStore::open(&live_descriptor).unwrap();
+        populate_every_restore_table(&live, "live");
+        let before = table_rows(&live, "approvals");
+        let error =
+            SynapseStore::restore_from_capture(&live_descriptor, &capture_path).unwrap_err();
+        let rendered = error.to_string();
+        assert!(rendered.contains("target store lease"), "{rendered}");
+        assert!(rendered.contains("store.db"), "{rendered}");
+        assert_eq!(table_rows(&live, "approvals"), before);
+        drop(live);
+        let _ = std::fs::remove_dir_all(capture_root);
+        let _ = std::fs::remove_dir_all(live_root);
+    }
+
+    #[test]
+    fn restore_import_refuses_a_schema_ahead_capture_by_typed_arm() {
+        let (capture_root, capture_descriptor) = temp_descriptor("restore-capture-ahead");
+        let chain_max = newest_schema_version();
+        let mut longer = MIGRATIONS.to_vec();
+        longer.push(Migration {
+            version: chain_max + 1,
+            statements: "CREATE TABLE future_only (id INTEGER PRIMARY KEY)",
+        });
+        let capture_store = open_sqlite(&capture_descriptor).unwrap();
+        capture_store.migrate(NAMESPACE, &longer).unwrap();
+        drop(capture_store);
+
+        let (live_root, live_descriptor) = temp_descriptor("restore-live-ahead");
+        let capture_path = sqlite_path(&capture_descriptor).unwrap();
+        let error =
+            SynapseStore::restore_from_capture(&live_descriptor, &capture_path).unwrap_err();
+        assert!(matches!(
+            error,
+            SynapseStoreError::SchemaAheadOfBinary {
+                recorded,
+                chain_max: seen,
+            } if recorded == chain_max + 1 && seen == chain_max
+        ));
+        assert!(!sqlite_path(&live_descriptor).unwrap().exists());
+        let _ = std::fs::remove_dir_all(capture_root);
+        let _ = std::fs::remove_dir_all(live_root);
+    }
+
+    #[test]
+    fn restore_import_migrates_a_behind_capture_before_copying_trust() {
+        let (capture_root, capture_descriptor) = temp_descriptor("restore-capture-behind");
+        let capture_store = open_sqlite(&capture_descriptor).unwrap();
+        capture_store.migrate(NAMESPACE, &MIGRATIONS[..3]).unwrap();
+        capture_store
+            .with_conn(|connection| {
+                connection.execute(
+                    "INSERT INTO alias_rows (
+                         fingerprint_a, fingerprint_b, valid_from_ms, evidence_json
+                     ) VALUES ('behind-a', 'behind-b', 1, '{}')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        drop(capture_store);
+
+        let (live_root, live_descriptor) = temp_descriptor("restore-live-behind");
+        let capture_path = sqlite_path(&capture_descriptor).unwrap();
+        SynapseStore::restore_from_capture(&live_descriptor, &capture_path).unwrap();
+        let restored = SynapseStore::open(&live_descriptor).unwrap();
+        assert_eq!(table_count(&restored, "alias_rows"), 1);
+        assert_eq!(table_count(&restored, "cert_rows"), 0);
+        drop(restored);
+        let migrated_capture = SynapseStore::open(&capture_descriptor).unwrap();
+        assert_eq!(table_count(&migrated_capture, "alias_rows"), 1);
+        let _ = std::fs::remove_dir_all(capture_root);
+        let _ = std::fs::remove_dir_all(live_root);
+    }
+
+    #[test]
+    fn profile_observation_recreates_the_empty_row_after_restore() {
+        let (root, descriptor) = temp_descriptor("restore-empty-profile");
+        let store = SynapseStore::open(&descriptor).unwrap();
+        store
+            .store
+            .with_conn(|connection| {
+                connection.execute("DELETE FROM profile_state", [])?;
+                Ok(())
+            })
+            .unwrap();
+        let profile = MachineProfile {
+            os_build: "os".to_string(),
+            arch: "arch".to_string(),
+            chip_model: "chip".to_string(),
+            ram_class: "ram".to_string(),
+            ane_subtype: None,
+            engine_identities: Vec::new(),
+        };
+        let activation = store.observe_profile(&profile, 1, 1).unwrap();
+        assert_eq!(activation.state.profile_activation_epoch, Some(1));
+        assert_eq!(table_count(&store, "profile_state"), 1);
         let _ = std::fs::remove_dir_all(root);
     }
 

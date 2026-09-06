@@ -54,6 +54,7 @@ pub mod owned_decode_sidecar;
 mod remote;
 mod rollback;
 mod store;
+pub use store::RestoreImportReport;
 pub mod worker_host;
 
 use cortexkit_lease::{FileLeaseStore, LeaseHandle, LeaseKey, LeaseStore};
@@ -184,6 +185,29 @@ const SYNAPSE_SINGLETON_LEASE_SCOPE: &str = "singleton";
 
 struct SynapseSingletonLease {
     _handle: Box<dyn LeaseHandle>,
+}
+
+/// Restore the owner-approved trust set from an Engram scratch database.
+///
+/// An explicit directory supports isolated drills. Production callers omit it
+/// so the target is resolved by the same storage path function used when a
+/// daemon acknowledgment does not provide a descriptor at module boot.
+pub fn restore_import(
+    capture_path: &Path,
+    store_directory: Option<&Path>,
+) -> Result<RestoreImportReport, ModuleError> {
+    let descriptor = match store_directory {
+        Some(directory) => StorageDescriptor {
+            module_id: DEFAULT_MODULE_ID.to_string(),
+            storage_namespace: "default".to_string(),
+            isolation: Isolation::Module,
+            backend: StorageBackend::Sqlite {
+                path: directory.join("store.db").to_string_lossy().into_owned(),
+            },
+        },
+        None => resolve_storage_descriptor(&None, DEFAULT_MODULE_ID)?,
+    };
+    SynapseStore::restore_from_capture(&descriptor, capture_path).map_err(ModuleError::Store)
 }
 
 pub async fn run_from_env() -> Result<(), ModuleError> {
@@ -14019,7 +14043,28 @@ fn resolve_storage_descriptor(
         return serde_json::from_value(value.clone()).map_err(ModuleError::Json);
     }
 
-    let path = sqlite_store_path(&std::env::temp_dir().to_string_lossy(), module_id);
+    default_storage_descriptor_with_environment(module_id, |key| env::var_os(key))
+}
+
+fn default_storage_descriptor_with_environment(
+    module_id: &str,
+    mut env_var: impl FnMut(&str) -> Option<OsString>,
+) -> Result<StorageDescriptor, ModuleError> {
+    let data_home = env_var("XDG_DATA_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            env_var("HOME")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .map(|home| home.join(".local").join("share"))
+        })
+        .ok_or_else(|| {
+            ModuleError::Config(
+                "XDG_DATA_HOME and HOME are unset; cannot resolve Synapse store".to_string(),
+            )
+        })?;
+    let path = sqlite_store_path(&data_home.to_string_lossy(), module_id);
     Ok(StorageDescriptor {
         module_id: module_id.to_string(),
         storage_namespace: "default".to_string(),
@@ -15294,6 +15339,34 @@ mod tests {
         let unsupervised = module_id_from_environment(|_| None)
             .expect("an unsupervised development run keeps the default module id");
         assert_eq!(unsupervised, DEFAULT_MODULE_ID);
+    }
+
+    #[test]
+    fn default_store_resolver_uses_xdg_then_home_data_directory() {
+        let from_xdg =
+            default_storage_descriptor_with_environment(DEFAULT_MODULE_ID, |key| match key {
+                "XDG_DATA_HOME" => Some(OsString::from("/xdg-data")),
+                "HOME" => Some(OsString::from("/home/operator")),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            from_xdg.backend,
+            StorageBackend::Sqlite {
+                path: "/xdg-data/cortexkit/synapse/store.db".to_string()
+            }
+        );
+
+        let from_home = default_storage_descriptor_with_environment(DEFAULT_MODULE_ID, |key| {
+            (key == "HOME").then(|| OsString::from("/home/operator"))
+        })
+        .unwrap();
+        assert_eq!(
+            from_home.backend,
+            StorageBackend::Sqlite {
+                path: "/home/operator/.local/share/cortexkit/synapse/store.db".to_string()
+            }
+        );
     }
 
     #[test]
