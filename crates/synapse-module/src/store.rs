@@ -2176,7 +2176,18 @@ impl SynapseStore {
             });
         }
         let synapse_store = Self { store };
-        synapse_store.reclaim_freelist_if_needed()?;
+        // Reclaim is housekeeping, never a boot precondition: VACUUM needs an
+        // exclusive lock, and a backup reader holding a snapshot at this moment
+        // makes it SQLITE_BUSY. Failing open on that would turn a nightly
+        // capture into a module that cannot start; the next open or GC sweep
+        // retries.
+        if let Err(error) = synapse_store.reclaim_freelist_if_needed() {
+            tracing::warn!(
+                target: "maintenance",
+                error = %error,
+                "freelist reclaim skipped at open"
+            );
+        }
         Ok(synapse_store)
     }
 
