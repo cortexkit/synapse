@@ -2699,9 +2699,11 @@ impl SynapseStore {
                     )?;
                     Ok(())
                 })?;
-                eprintln!(
-                    "WARN approval_digest_mismatch model_id={} decode_fingerprint={}",
-                    model_id, decode_fingerprint
+                tracing::warn!(
+                    target: "cert",
+                    model_id,
+                    decode_fingerprint,
+                    "approval_digest_mismatch"
                 );
                 Err(SynapseStoreError::ApprovalDigestMismatch {
                     model_id,
@@ -4722,16 +4724,18 @@ impl SynapseStore {
         if activation.rotated {
             if let Some(event) = activation.event.as_ref() {
                 if event.changed_fields.iter().any(|field| field == "os_build") {
-                    eprintln!(
-                        "WARN machine profile rotation epoch={} changed_fields={}",
-                        event.new_profile_activation_epoch,
-                        event.changed_fields.join(",")
+                    tracing::warn!(
+                        target: "cert",
+                        epoch = event.new_profile_activation_epoch,
+                        changed_fields = %event.changed_fields.join(","),
+                        "machine profile rotation"
                     );
                 } else {
-                    eprintln!(
-                        "INFO machine profile rotation epoch={} changed_fields={}",
-                        event.new_profile_activation_epoch,
-                        event.changed_fields.join(",")
+                    tracing::info!(
+                        target: "cert",
+                        epoch = event.new_profile_activation_epoch,
+                        changed_fields = %event.changed_fields.join(","),
+                        "machine profile rotation"
                     );
                 }
             }

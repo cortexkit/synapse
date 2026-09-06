@@ -55,3 +55,5 @@ subc-transport = { path = "../subconscious/crates/subc-transport" }
 cortexkit-lease = { path = "../commons/crates/cortexkit-lease" }
 cortexkit-store = { path = "../commons/crates/cortexkit-store" }
 cortexkit-store-types = { path = "../commons/crates/cortexkit-store-types" }
+cortexkit-log = { path = "../commons/crates/cortexkit-log" }
+tracing = "0.1"

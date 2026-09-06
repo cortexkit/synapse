@@ -83,6 +83,10 @@ pub struct WorkerHostConfig {
     pub extra_args: Vec<String>,
     pub pooling: WorkerPooling,
     pub normalize: bool,
+    /// Stable catalog model identity attached to forwarded worker diagnostics.
+    pub model_id: Option<String>,
+    /// Shared stdout/stderr forwarding budget for this worker process.
+    pub worker_forward_lines_per_sec: u32,
     /// Optional catalog identity used by engines that share this generic host.
     pub engine_identity: Option<EngineIdentity>,
     /// Owned-CUDA has one process per stable model specification. Including
@@ -105,6 +109,8 @@ impl WorkerHostConfig {
             extra_args: Vec::new(),
             pooling: WorkerPooling::Mean,
             normalize: true,
+            model_id: None,
+            worker_forward_lines_per_sec: 50,
             engine_identity: None,
             isolate_crash_key_by_worker_id: false,
         }
@@ -189,6 +195,42 @@ struct WorkerConnection {
     worker_generation: u64,
 }
 
+#[derive(Default)]
+struct WorkerLogContext {
+    job_id: Option<String>,
+}
+
+struct WorkerForwardLimiter {
+    cap: u32,
+    window_started: Instant,
+    forwarded: u32,
+    dropped: u64,
+}
+
+impl WorkerForwardLimiter {
+    fn new(cap: u32) -> Self {
+        Self {
+            cap,
+            window_started: Instant::now(),
+            forwarded: 0,
+            dropped: 0,
+        }
+    }
+
+    fn admit(&mut self, now: Instant) -> Option<u64> {
+        if now.duration_since(self.window_started) >= Duration::from_secs(1) {
+            self.window_started = now;
+            self.forwarded = 0;
+        }
+        if self.forwarded >= self.cap {
+            self.dropped = self.dropped.saturating_add(1);
+            return None;
+        }
+        self.forwarded = self.forwarded.saturating_add(1);
+        Some(std::mem::take(&mut self.dropped))
+    }
+}
+
 #[derive(Clone, Debug)]
 struct LoadedWorkerModel {
     crash_key: String,
@@ -247,10 +289,15 @@ pub struct WorkerHost {
     request_counter: u64,
     model_counter: u64,
     owned_decode_stream: Option<OwnedDecodeAdapterState>,
+    log_context: Arc<Mutex<WorkerLogContext>>,
+    forward_limiter: Arc<Mutex<WorkerForwardLimiter>>,
 }
 
 impl WorkerHost {
     pub fn new(config: WorkerHostConfig) -> Self {
+        let forward_limiter = Arc::new(Mutex::new(WorkerForwardLimiter::new(
+            config.worker_forward_lines_per_sec,
+        )));
         Self {
             config,
             connection: None,
@@ -261,6 +308,14 @@ impl WorkerHost {
             request_counter: 0,
             model_counter: 0,
             owned_decode_stream: None,
+            log_context: Arc::new(Mutex::new(WorkerLogContext::default())),
+            forward_limiter,
+        }
+    }
+
+    fn set_log_job_id(&self, job_id: Option<&str>) {
+        if let Ok(mut context) = self.log_context.lock() {
+            context.job_id = job_id.map(str::to_owned);
         }
     }
 
@@ -813,11 +868,32 @@ impl WorkerHost {
             ))
         })?;
         let logs = LogRing::new();
+        let model_id = self
+            .config
+            .model_id
+            .clone()
+            .unwrap_or_else(|| self.config.worker_id.clone());
         if let Some(stderr) = child.stderr.take() {
-            spawn_pipe_reader("[stderr] ", stderr, logs.clone());
+            spawn_pipe_reader(
+                "stderr",
+                stderr,
+                logs.clone(),
+                self.config.worker_id.clone(),
+                model_id.clone(),
+                Arc::clone(&self.log_context),
+                Arc::clone(&self.forward_limiter),
+            );
         }
         if let Some(stdout) = child.stdout.take() {
-            spawn_pipe_reader("[stdout] ", stdout, logs.clone());
+            spawn_pipe_reader(
+                "stdout",
+                stdout,
+                logs.clone(),
+                self.config.worker_id.clone(),
+                model_id,
+                Arc::clone(&self.log_context),
+                Arc::clone(&self.forward_limiter),
+            );
         }
 
         let required_protocol_version =
@@ -1210,6 +1286,51 @@ impl WorkerEngine {
         self.runtime().block_on(host.ping())
     }
 
+    pub(crate) fn embed_batch_with_job(
+        &self,
+        model: &LoadedModel,
+        batch: TokenBatch,
+        job_id: Option<&str>,
+    ) -> Result<Vectors, EngineError> {
+        let mut host = self
+            .lock_host()
+            .map_err(|error| error.to_engine_error(EngineErrorStage::Inference))?;
+        host.set_log_job_id(job_id);
+        let result = self.runtime().block_on(host.embed_batch(model, batch));
+        host.set_log_job_id(None);
+        result.map_err(|error| error.to_engine_error(EngineErrorStage::Inference))
+    }
+
+    pub(crate) fn rerank_with_job(
+        &self,
+        model: &LoadedModel,
+        request: RerankRequest,
+        job_id: Option<&str>,
+    ) -> Result<RerankScores, EngineError> {
+        let mut host = self
+            .lock_host()
+            .map_err(|error| error.to_engine_error(EngineErrorStage::Inference))?;
+        host.set_log_job_id(job_id);
+        let result = self.runtime().block_on(host.rerank(model, request));
+        host.set_log_job_id(None);
+        result.map_err(|error| error.to_engine_error(EngineErrorStage::Inference))
+    }
+
+    pub(crate) fn generate_with_job(
+        &self,
+        model: &LoadedModel,
+        request: GenerateRequest,
+        job_id: Option<&str>,
+    ) -> Result<GenerateOutput, EngineError> {
+        let mut host = self
+            .lock_host()
+            .map_err(|error| error.to_engine_error(EngineErrorStage::Inference))?;
+        host.set_log_job_id(job_id);
+        let result = self.runtime().block_on(host.generate(model, request));
+        host.set_log_job_id(None);
+        result.map_err(|error| error.to_engine_error(EngineErrorStage::Inference))
+    }
+
     fn owned_decode_start(
         &self,
         model: &LoadedModel,
@@ -1328,12 +1449,7 @@ impl EmbedEngine for WorkerEngine {
     }
 
     fn embed_batch(&self, model: &LoadedModel, batch: TokenBatch) -> Result<Vectors, EngineError> {
-        let mut host = self
-            .lock_host()
-            .map_err(|error| error.to_engine_error(EngineErrorStage::Inference))?;
-        self.runtime()
-            .block_on(host.embed_batch(model, batch))
-            .map_err(|error| error.to_engine_error(EngineErrorStage::Inference))
+        self.embed_batch_with_job(model, batch, None)
     }
 
     fn embed_one(&self, model: &LoadedModel, ids: TokenIds) -> Result<Vector, EngineError> {
@@ -1372,12 +1488,7 @@ impl RerankEngine for WorkerEngine {
         model: &LoadedModel,
         request: RerankRequest,
     ) -> Result<RerankScores, EngineError> {
-        let mut host = self
-            .lock_host()
-            .map_err(|error| error.to_engine_error(EngineErrorStage::Inference))?;
-        self.runtime()
-            .block_on(host.rerank(model, request))
-            .map_err(|error| error.to_engine_error(EngineErrorStage::Inference))
+        self.rerank_with_job(model, request, None)
     }
 
     fn unload(&mut self, model: &LoadedModel) {
@@ -1403,12 +1514,7 @@ impl GenerateEngine for WorkerEngine {
         model: &LoadedModel,
         request: GenerateRequest,
     ) -> Result<GenerateOutput, EngineError> {
-        let mut host = self
-            .lock_host()
-            .map_err(|error| error.to_engine_error(EngineErrorStage::Inference))?;
-        self.runtime()
-            .block_on(host.generate(model, request))
-            .map_err(|error| error.to_engine_error(EngineErrorStage::Inference))
+        self.generate_with_job(model, request, None)
     }
 
     fn unload(&mut self, model: &LoadedModel) {
@@ -1852,23 +1958,103 @@ fn owned_host_fault(error: &WorkerHostError) -> WorkerFault {
     }
 }
 
-fn spawn_pipe_reader<R>(prefix: &'static str, mut reader: R, ring: LogRing)
-where
+fn spawn_pipe_reader<R>(
+    stream: &'static str,
+    mut reader: R,
+    ring: LogRing,
+    worker_id: String,
+    model_id: String,
+    context: Arc<Mutex<WorkerLogContext>>,
+    limiter: Arc<Mutex<WorkerForwardLimiter>>,
+) where
     R: AsyncRead + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
+        let prefix = format!("[{stream}] ");
         let mut buffer = [0_u8; 512];
+        let mut partial = Vec::new();
         loop {
             match reader.read(&mut buffer).await {
                 Ok(0) => break,
                 Ok(n) => {
                     ring.push(prefix.as_bytes());
                     ring.push(&buffer[..n]);
+                    partial.extend_from_slice(&buffer[..n]);
+                    while let Some(newline) = partial.iter().position(|byte| *byte == b'\n') {
+                        let mut complete = partial.drain(..=newline).collect::<Vec<_>>();
+                        complete.pop();
+                        if complete.last() == Some(&b'\r') {
+                            complete.pop();
+                        }
+                        forward_worker_line(
+                            &worker_id,
+                            stream,
+                            &model_id,
+                            &String::from_utf8_lossy(&complete),
+                            &context,
+                            &limiter,
+                        );
+                    }
                 }
                 Err(_) => break,
             }
         }
     });
+}
+
+fn forward_worker_line(
+    worker_id: &str,
+    stream: &str,
+    model_id: &str,
+    line: &str,
+    context: &Mutex<WorkerLogContext>,
+    limiter: &Mutex<WorkerForwardLimiter>,
+) {
+    let dropped = match limiter.lock() {
+        Ok(mut limiter) => match limiter.admit(Instant::now()) {
+            Some(dropped) => dropped,
+            None => return,
+        },
+        Err(_) => return,
+    };
+    let job_id = context
+        .lock()
+        .ok()
+        .and_then(|context| context.job_id.clone());
+    match (job_id.as_deref(), dropped) {
+        (Some(job_id), 0) => tracing::info!(
+            target: "worker",
+            worker = worker_id,
+            stream,
+            model_id,
+            job_id,
+            "{line}"
+        ),
+        (Some(job_id), dropped) => tracing::info!(
+            target: "worker",
+            worker = worker_id,
+            stream,
+            model_id,
+            job_id,
+            dropped,
+            "{line}"
+        ),
+        (None, 0) => tracing::info!(
+            target: "worker",
+            worker = worker_id,
+            stream,
+            model_id,
+            "{line}"
+        ),
+        (None, dropped) => tracing::info!(
+            target: "worker",
+            worker = worker_id,
+            stream,
+            model_id,
+            dropped,
+            "{line}"
+        ),
+    }
 }
 
 fn worker_transport_label() -> &'static str {
