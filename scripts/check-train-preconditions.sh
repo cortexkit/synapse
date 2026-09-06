@@ -70,8 +70,17 @@ def main() -> int:
         branches = [branches]
     if not isinstance(branches, list) or "train/**" not in branches:
         failures.append("train precondition failed: push trigger does not include branch train/**")
-    if not isinstance(branches, list) or "master" not in branches:
-        failures.append("train precondition failed: push trigger does not include default branch master")
+    # master is deliberately NOT a push trigger: branch protection requires the
+    # linux and windows checks on any sha reaching master, and those checks
+    # attach to the sha from its train run. A master run would re-prove a
+    # checked sha and double CI per landing. This only holds while protection
+    # is on; if it is ever removed, the master trigger must come back as the
+    # sole observer of an off-train push.
+    if isinstance(branches, list) and "master" in branches:
+        failures.append(
+            "train precondition failed: push trigger includes master "
+            "(protected branch; trains carry the checks, a master run is redundant)"
+        )
 
     jobs = workflow.get("jobs") if isinstance(workflow, dict) else None
     if not isinstance(jobs, dict):

@@ -5,7 +5,7 @@ on:
     # train/** branches are the CI-gated landing path: a train is pushed
     # there, CI runs on all platforms, and master fast-forwards only to a sha
     # that already carries a green check.
-    branches: [master, "train/**"]
+    branches: ["train/**"]
   # The push gate asks whether a change is good. This run asks whether what
   # already landed is still good against the siblings as they are now: CI
   # checks out subconscious/commons at their tips, so a sibling bump turns
