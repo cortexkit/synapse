@@ -15361,11 +15361,32 @@ mod tests {
             (key == "HOME").then(|| OsString::from("/home/operator"))
         })
         .unwrap();
-        assert_eq!(
-            from_home.backend,
-            StorageBackend::Sqlite {
-                path: "/home/operator/.local/share/cortexkit/synapse/store.db".to_string()
-            }
+        // The HOME arm joins path segments, so on Windows the separators come out
+        // mixed; compare components rather than the rendered string.
+        let StorageBackend::Sqlite { path } = &from_home.backend else {
+            panic!("expected a sqlite backend, got {:?}", from_home.backend);
+        };
+        let components = Path::new(path)
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let expected_tail = [
+            "home",
+            "operator",
+            ".local",
+            "share",
+            "cortexkit",
+            "synapse",
+            "store.db",
+        ];
+        assert!(
+            components.ends_with(
+                &expected_tail
+                    .iter()
+                    .map(|segment| segment.to_string())
+                    .collect::<Vec<_>>()
+            ),
+            "unexpected store path components: {components:?}"
         );
     }
 
