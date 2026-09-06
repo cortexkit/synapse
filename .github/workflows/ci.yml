@@ -2,7 +2,10 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    # train/** branches are the CI-gated landing path: a train is pushed
+    # there, CI runs on all platforms, and master fast-forwards only to a sha
+    # that already carries a green check.
+    branches: [master, "train/**"]
   pull_request:
   workflow_dispatch:
 
