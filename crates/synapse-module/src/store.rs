@@ -27,6 +27,35 @@ pub const JOB_STATE_DONE: &str = "done";
 pub const JOB_STATE_FAILED_TRANSIENT: &str = "failed_transient";
 pub const JOB_STATE_FAILED_PERMANENT: &str = "failed_permanent";
 
+/// Minimum dead-space volume in bytes required before triggering a VACUUM.
+///
+/// A small store with proportionally many free pages (for example, several
+/// megabytes of free space in an otherwise tiny database) is not worth the latency
+/// and exclusive I/O of a full SQLite rewrite. A 350 MB VACUUM requires roughly
+/// one second of exclusive I/O. Reclaiming free pages is worthwhile only when
+/// dead space is substantial (at least 64 MiB), meaningfully cutting disk usage
+/// and reducing the size of nightly online backups.
+pub const RECLAIM_FREELIST_MIN_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Divisor for the minimum ratio of free pages to total pages required before
+/// triggering a VACUUM (specifically, `freelist_count >= page_count / 2`).
+///
+/// When free pages make up less than half of the database, routine application
+/// writes will naturally reuse those free pages without increasing the database
+/// file size. VACUUM is reserved for stores where at least 50% of allocated space
+/// consists of empty freelist pages.
+pub const RECLAIM_FREELIST_PAGE_RATIO_DIVISOR: u64 = 2;
+
+static MAINTENANCE_VACUUM_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Return the total number of guarded freelist VACUUM operations executed in this process.
+///
+/// Intended for telemetry and test assertions verifying whether maintenance reclamation ran.
+#[doc(hidden)]
+pub fn maintenance_vacuum_count() -> u64 {
+    MAINTENANCE_VACUUM_COUNT.load(Ordering::Relaxed)
+}
+
 /// Newest schema version this binary can migrate a store to.
 ///
 /// Derived from the migration list rather than restated as a literal: a literal
@@ -1851,7 +1880,7 @@ impl JobAdmission {
 }
 
 pub struct SynapseStore {
-    store: SqliteStore,
+    pub(crate) store: SqliteStore,
 }
 
 fn sqlite_path(descriptor: &StorageDescriptor) -> Result<PathBuf, SynapseStoreError> {
@@ -2146,7 +2175,116 @@ impl SynapseStore {
                 chain_max: outcome.chain_max,
             });
         }
-        Ok(Self { store })
+        let synapse_store = Self { store };
+        synapse_store.reclaim_freelist_if_needed()?;
+        Ok(synapse_store)
+    }
+
+    /// Return the current SQLite freelist page count.
+    pub fn freelist_count(&self) -> Result<u64, SynapseStoreError> {
+        let count = self.store.with_conn(|conn| {
+            let count: i64 = conn.query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
+            Ok(count.max(0) as u64)
+        })?;
+        Ok(count)
+    }
+
+    /// Return the current SQLite total page count.
+    pub fn page_count(&self) -> Result<u64, SynapseStoreError> {
+        let count = self.store.with_conn(|conn| {
+            let count: i64 = conn.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+            Ok(count.max(0) as u64)
+        })?;
+        Ok(count)
+    }
+
+    /// Return the current SQLite database page size in bytes.
+    pub fn page_size(&self) -> Result<u64, SynapseStoreError> {
+        let size = self.store.with_conn(|conn| {
+            let size: i64 = conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+            Ok(size.max(0) as u64)
+        })?;
+        Ok(size)
+    }
+
+    #[doc(hidden)]
+    pub fn pub_connection_for_test<F, T>(&self, op: F) -> Result<T, SynapseStoreError>
+    where
+        F: FnOnce(&rusqlite::Connection) -> Result<T, rusqlite::Error>,
+    {
+        let result = self.store.with_conn(|conn| op(conn))?;
+        Ok(result)
+    }
+
+    /// Reclaim unused database pages by executing VACUUM when free page volume exceeds thresholds.
+    ///
+    /// The SQLite online backup API copies every allocated page in the database file,
+    /// including free pages on the freelist. When schema migrations or large deletions
+    /// leave tens of thousands of free pages behind, every subsequent backup generation
+    /// wastes time and storage copying unallocated space.
+    ///
+    /// To avoid repeated exclusive I/O penalties on an active or data-only store, VACUUM
+    /// is executed only when both of the following criteria are satisfied:
+    /// 1. `freelist_count * page_size >= RECLAIM_FREELIST_MIN_BYTES` (at least 64 MiB of free pages).
+    /// 2. `freelist_count >= page_count / RECLAIM_FREELIST_PAGE_RATIO_DIVISOR` (at least half of all pages are free).
+    ///
+    /// Concurrency and safety:
+    /// - Serialized writes: This method executes through `self.store.with_conn`, acquiring
+    ///   the store's internal connection mutex. This ensures no serving sessions, writes, or
+    ///   other maintenance routines run concurrently.
+    /// - Outside transactions: SQLite rejects `VACUUM` inside open transactions. `with_conn`
+    ///   provides direct connection access outside of any transaction block.
+    /// - WAL mode compatibility: In WAL mode, SQLite performs VACUUM safely into a temporary file
+    ///   and replaces the database file. It cannot and does not change the journal mode.
+    pub fn reclaim_freelist_if_needed(&self) -> Result<bool, SynapseStoreError> {
+        let start = std::time::Instant::now();
+        let vacuum_ran = self.store.with_conn(|conn| {
+            let page_size: i64 = conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+            let page_count: i64 = conn.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+            let freelist_count: i64 =
+                conn.query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
+
+            let page_size_bytes = page_size.max(0) as u64;
+            let pages = page_count.max(0) as u64;
+            let free_pages = freelist_count.max(0) as u64;
+            let free_bytes = free_pages.saturating_mul(page_size_bytes);
+
+            let byte_threshold_met = free_bytes >= RECLAIM_FREELIST_MIN_BYTES;
+            let ratio_threshold_met = free_pages >= pages / RECLAIM_FREELIST_PAGE_RATIO_DIVISOR;
+
+            if byte_threshold_met && ratio_threshold_met {
+                conn.execute_batch("VACUUM; PRAGMA wal_checkpoint(TRUNCATE);")?;
+                let after_page_count: i64 =
+                    conn.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+                let after_freelist_count: i64 =
+                    conn.query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
+                Ok(Some((
+                    pages,
+                    after_page_count.max(0) as u64,
+                    free_pages,
+                    after_freelist_count.max(0) as u64,
+                )))
+            } else {
+                Ok(None)
+            }
+        })?;
+
+        if let Some((before_pages, after_pages, before_free, after_free)) = vacuum_ran {
+            let wall_ms = start.elapsed().as_millis() as u64;
+            MAINTENANCE_VACUUM_COUNT.fetch_add(1, Ordering::Relaxed);
+            tracing::info!(
+                target: "maintenance",
+                before_page_count = before_pages,
+                after_page_count = after_pages,
+                before_freelist_count = before_free,
+                after_freelist_count = after_free,
+                wall_ms,
+                "vacuum reclaimed free pages"
+            );
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     // Staged storage API consumed by the epic's runtime slice; remove this allow there.
@@ -11514,6 +11652,194 @@ mod tests {
         let activation = store.observe_profile(&profile, 1, 1).unwrap();
         assert_eq!(activation.state.profile_activation_epoch, Some(1));
         assert_eq!(table_count(&store, "profile_state"), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reopen_above_threshold_reclaims_freelist_and_shrinks_file() {
+        let (root, descriptor) = temp_descriptor("reopen-above-threshold");
+        let db_path = match &descriptor.backend {
+            StorageBackend::Sqlite { path } => PathBuf::from(path),
+            _ => unreachable!(),
+        };
+        let store = SynapseStore::open(&descriptor).unwrap();
+        // Insert enough data to exceed RECLAIM_FREELIST_MIN_BYTES (64 MiB = 16,384 pages at 4 KiB).
+        // 66 chunks of 1 MiB each = 66 MiB.
+        store
+            .store
+            .with_conn(|conn| {
+                conn.execute(
+                    "CREATE TABLE bloat_seed (id INTEGER PRIMARY KEY, data BLOB)",
+                    [],
+                )?;
+                let chunk = vec![0xfeu8; 1024 * 1024];
+                let mut stmt = conn.prepare("INSERT INTO bloat_seed (data) VALUES (?1)")?;
+                for _ in 0..66 {
+                    stmt.execute(params![&chunk])?;
+                }
+                drop(stmt);
+                conn.execute("DELETE FROM bloat_seed", [])?;
+                Ok(())
+            })
+            .unwrap();
+
+        let freelist_before = store.freelist_count().unwrap();
+        let page_count_before = store.page_count().unwrap();
+        let page_size = store.page_size().unwrap();
+        assert!(freelist_before * page_size >= RECLAIM_FREELIST_MIN_BYTES);
+        assert!(freelist_before >= page_count_before / RECLAIM_FREELIST_PAGE_RATIO_DIVISOR);
+        drop(store);
+
+        let file_size_before = std::fs::metadata(&db_path).unwrap().len();
+        assert!(file_size_before >= 64 * 1024 * 1024);
+
+        let vacuum_count_before = maintenance_vacuum_count();
+        let reopened = SynapseStore::open(&descriptor).unwrap();
+        let freelist_after = reopened.freelist_count().unwrap();
+        let file_size_after = std::fs::metadata(&db_path).unwrap().len();
+        let vacuum_count_after = maintenance_vacuum_count();
+
+        assert_eq!(freelist_after, 0);
+        assert!(
+            file_size_after < file_size_before / 10,
+            "expected file to shrink: before={file_size_before}, after={file_size_after}"
+        );
+        assert_eq!(vacuum_count_after, vacuum_count_before + 1);
+
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reopen_below_threshold_does_not_vacuum() {
+        let (root, descriptor) = temp_descriptor("reopen-below-threshold");
+        let store = SynapseStore::open(&descriptor).unwrap();
+        // Insert a small amount below 64 MiB: 512 KiB (128 pages).
+        store
+            .store
+            .with_conn(|conn| {
+                conn.execute(
+                    "CREATE TABLE small_bloat (id INTEGER PRIMARY KEY, data BLOB)",
+                    [],
+                )?;
+                let chunk = vec![0x42u8; 1024];
+                let mut stmt = conn.prepare("INSERT INTO small_bloat (data) VALUES (?1)")?;
+                for _ in 0..512 {
+                    stmt.execute(params![&chunk])?;
+                }
+                drop(stmt);
+                conn.execute("DELETE FROM small_bloat", [])?;
+                Ok(())
+            })
+            .unwrap();
+
+        let freelist_before = store.freelist_count().unwrap();
+        let page_count_before = store.page_count().unwrap();
+        let page_size = store.page_size().unwrap();
+        // Free pages must satisfy the ratio threshold (>= page_count / 2) so that
+        // the byte threshold alone protects against vacuuming.
+        assert!(freelist_before >= 100);
+        assert!(
+            freelist_before >= page_count_before / RECLAIM_FREELIST_PAGE_RATIO_DIVISOR,
+            "freelist={freelist_before}, page_count={page_count_before}"
+        );
+        assert!(freelist_before * page_size < RECLAIM_FREELIST_MIN_BYTES);
+        drop(store);
+
+        let vacuum_count_before = maintenance_vacuum_count();
+        let reopened = SynapseStore::open(&descriptor).unwrap();
+        let freelist_after = reopened.freelist_count().unwrap();
+        let vacuum_count_after = maintenance_vacuum_count();
+
+        // Freelist count must remain unchanged because no VACUUM ran.
+        assert_eq!(freelist_after, freelist_before);
+        assert_eq!(vacuum_count_after, vacuum_count_before);
+
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[ignore]
+    fn drill_bloat_reclaim_measured() {
+        let (root, descriptor) = temp_descriptor("drill-bloat");
+        let db_path = match &descriptor.backend {
+            StorageBackend::Sqlite { path } => PathBuf::from(path),
+            _ => unreachable!(),
+        };
+        let store = SynapseStore::open(&descriptor).expect("scratch store opens");
+        // Bloat the scratch store past the threshold: 100 MB of blob rows
+        store
+            .store
+            .with_conn(|conn| {
+                conn.execute(
+                    "CREATE TABLE drill_bloat (id INTEGER PRIMARY KEY, payload BLOB)",
+                    [],
+                )?;
+                let chunk = vec![0xabu8; 1024 * 1024];
+                let mut stmt = conn.prepare("INSERT INTO drill_bloat (payload) VALUES (?1)")?;
+                for _ in 0..100 {
+                    stmt.execute(params![&chunk])?;
+                }
+                drop(stmt);
+                conn.execute("DELETE FROM drill_bloat", [])?;
+                Ok(())
+            })
+            .expect("bloat inserted and deleted");
+
+        let page_size = store.page_size().unwrap();
+        let page_count_before = store.page_count().unwrap();
+        let freelist_count_before = store.freelist_count().unwrap();
+        drop(store);
+
+        let file_size_before = std::fs::metadata(&db_path).unwrap().len();
+
+        println!("\n=== MEASURED DRILL: BEFORE RECLAIM ===");
+        println!("Database path: {}", db_path.display());
+        println!("Page size: {page_size} bytes");
+        println!("Page count before: {page_count_before}");
+        println!("Freelist count before: {freelist_count_before}");
+        println!(
+            "Freelist bytes before: {} bytes ({:.2} MiB)",
+            freelist_count_before * page_size,
+            (freelist_count_before * page_size) as f64 / (1024.0 * 1024.0)
+        );
+        println!(
+            "File size before: {file_size_before} bytes ({:.2} MiB)",
+            file_size_before as f64 / (1024.0 * 1024.0)
+        );
+
+        let reopened = SynapseStore::open(&descriptor).expect("reopen triggers guarded vacuum");
+
+        let page_count_after = reopened.page_count().unwrap();
+        let freelist_count_after = reopened.freelist_count().unwrap();
+        let file_size_after = std::fs::metadata(&db_path).unwrap().len();
+
+        println!("=== MEASURED DRILL: AFTER RECLAIM ===");
+        println!("Page count after: {page_count_after}");
+        println!("Freelist count after: {freelist_count_after}");
+        println!(
+            "Freelist bytes after: {} bytes",
+            freelist_count_after * page_size
+        );
+        println!(
+            "File size after: {file_size_after} bytes ({:.2} MiB)",
+            file_size_after as f64 / (1024.0 * 1024.0)
+        );
+        println!(
+            "Freelist reduction: {} -> {}",
+            freelist_count_before, freelist_count_after
+        );
+        println!(
+            "File size reduction: {} -> {} bytes ({:.2} MiB -> {:.2} MiB)",
+            file_size_before,
+            file_size_after,
+            file_size_before as f64 / (1024.0 * 1024.0),
+            file_size_after as f64 / (1024.0 * 1024.0)
+        );
+
+        assert_eq!(freelist_count_after, 0);
+        assert!(file_size_after < file_size_before / 10);
         let _ = std::fs::remove_dir_all(root);
     }
 
