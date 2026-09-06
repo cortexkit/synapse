@@ -28,8 +28,8 @@ and record the evidence and gate version; the only candidate direction here is
 
 - **Host:** local production box, Apple M5 Max, `aarch64`, OS build `25F84`.
   No M1, rental, daemon reload, redeploy, or probe run was used.
-- **Daemon:** use the connection file supplied through
-  `$SYNAPSE_CONNECTION_FILE`; record the module generation and machine profile
+- **Daemon:** use standard subc discovery or the connection file supplied
+  through `$SUBC_CONNECTION_FILE`; record the module generation and machine profile
   in local benchmark evidence rather than this document.
 - **Dataset:** prepared CoIR CosQA, 20,604 corpus documents, 500 test queries,
   and 500 qrels. Rows were sorted by the existing preparation path.

@@ -2,7 +2,9 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
-    env, fs,
+    env,
+    ffi::OsString,
+    fs,
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::{
@@ -89,7 +91,7 @@ use subc_protocol::{
         ManagementOperationKind, ModuleManifest, ProviderRole, StorageBinding, StorageKind,
         StorageScope, TrustTier,
     },
-    ModuleHelloAckBody, Principal, PROTOCOL_VERSION, SUBC_MODULE_ID_ENV,
+    ModuleHelloAckBody, Principal, PROTOCOL_VERSION, SUBC_LAUNCH_NONCE_ENV, SUBC_MODULE_ID_ENV,
 };
 use synapse_core::{
     evaluate_cuda_floor, owned_cuda_engine_identity, worker_binary_env_var,
@@ -176,16 +178,33 @@ struct SynapseSingletonLease {
 }
 
 pub async fn run_from_env() -> Result<(), ModuleError> {
-    let module_id = env::var(SUBC_MODULE_ID_ENV)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_MODULE_ID.to_string());
+    let module_id = module_id_from_environment(|key| env::var_os(key))?;
     let _singleton = acquire_synapse_singleton_lease(&module_id)?;
     let connection_file = subc_connection_file_from_args()?;
     let handler = SynapseHandler::new(module_id.clone(), connection_file);
     subc_client_rs::serve(manifest(&module_id), handler)
         .await
         .map_err(ModuleError::Serve)
+}
+
+fn module_id_from_environment(
+    mut env_var: impl FnMut(&str) -> Option<OsString>,
+) -> Result<String, ModuleError> {
+    let module_id = env_var(SUBC_MODULE_ID_ENV)
+        .and_then(|value| value.into_string().ok())
+        .filter(|value| !value.trim().is_empty());
+    if let Some(module_id) = module_id {
+        return Ok(module_id);
+    }
+    // Under supervision, falling back to DEFAULT_MODULE_ID (even though it is
+    // currently the true id) would make a missing daemon-supplied identity look valid.
+    // The launch nonce distinguishes supervised launches from local development.
+    if env_var(SUBC_LAUNCH_NONCE_ENV).is_some() {
+        return Err(ModuleError::Config(format!(
+            "{SUBC_MODULE_ID_ENV} is required when {SUBC_LAUNCH_NONCE_ENV} is present"
+        )));
+    }
+    Ok(DEFAULT_MODULE_ID.to_string())
 }
 
 fn subc_connection_file_from_args() -> Result<PathBuf, ModuleError> {
@@ -13615,31 +13634,75 @@ fn manifest(module_id: &str) -> ModuleManifest {
 }
 
 fn load_module_config() -> Result<ModuleConfig, ModuleError> {
-    if let Ok(path) = env::var(SYNAPSE_CONFIG_PATH_ENV) {
-        let path = PathBuf::from(path);
-        return load_module_config_file(&path, ConfigTier::User);
+    load_module_config_with_environment(|key| env::var_os(key), env::current_dir().ok().as_deref())
+}
+
+fn load_module_config_with_environment(
+    mut env_var: impl FnMut(&str) -> Option<OsString>,
+    cwd: Option<&Path>,
+) -> Result<ModuleConfig, ModuleError> {
+    if let Some(path) = env_var(SYNAPSE_CONFIG_PATH_ENV) {
+        return load_module_config_file(&PathBuf::from(path), ConfigTier::User);
     }
-    let user_path = env::var_os("HOME").map(|home| {
-        PathBuf::from(home)
-            .join(".config")
-            .join("cortexkit")
-            .join("synapse.jsonc")
-    });
-    if let Ok(cwd) = env::current_dir() {
+    let user_path = default_synapse_config_path_with_environment(&mut env_var);
+    if let Some(cwd) = cwd {
         let project_path = cwd.join(".cortexkit").join("synapse.jsonc");
         if project_path.is_file() {
             let mut project = load_module_config_file(&project_path, ConfigTier::Project)?;
-            if let Some(user_path) = user_path.as_ref().filter(|path| path.is_file()) {
+            if user_path.is_file() {
                 project.remote_providers =
-                    load_module_config_file(user_path, ConfigTier::User)?.remote_providers;
+                    load_module_config_file(&user_path, ConfigTier::User)?.remote_providers;
             }
             return Ok(project);
         }
     }
-    if let Some(path) = user_path.filter(|path| path.is_file()) {
-        return load_module_config_file(&path, ConfigTier::User);
+    if user_path.is_file() {
+        return load_module_config_file(&user_path, ConfigTier::User);
     }
     Ok(ModuleConfig::default())
+}
+
+// Use the daemon's config-home precedence so both processes select the same root.
+// Re-derived from `subc-core/src/daemon_config.rs::default_config_path` at subconscious
+// commit d5e09914b0791a66f2a5a00a9bb3422860ade95e (2026-09-06); Synapse appends its
+// own filename, and future convention changes should be re-derived from that function.
+fn default_synapse_config_path_with_environment(
+    env_var: &mut impl FnMut(&str) -> Option<OsString>,
+) -> PathBuf {
+    let mut non_empty_os_var = |key| env_var(key).filter(|value| !value.is_empty());
+
+    if let Some(config_home) = non_empty_os_var("XDG_CONFIG_HOME") {
+        return PathBuf::from(config_home)
+            .join("cortexkit")
+            .join("synapse.jsonc");
+    }
+
+    #[cfg(windows)]
+    {
+        if let Some(app_data) = non_empty_os_var("APPDATA") {
+            return PathBuf::from(app_data)
+                .join("cortexkit")
+                .join("synapse.jsonc");
+        }
+        if let Some(user_profile) = non_empty_os_var("USERPROFILE") {
+            return PathBuf::from(user_profile)
+                .join("AppData")
+                .join("Roaming")
+                .join("cortexkit")
+                .join("synapse.jsonc");
+        }
+    }
+
+    if let Some(home) = non_empty_os_var("HOME") {
+        return PathBuf::from(home)
+            .join(".config")
+            .join("cortexkit")
+            .join("synapse.jsonc");
+    }
+
+    PathBuf::from(".config")
+        .join("cortexkit")
+        .join("synapse.jsonc")
 }
 
 #[derive(Clone, Copy)]
@@ -14625,6 +14688,68 @@ mod tests {
             Some(DEFAULT_TRANSIENT_RETRY_AFTER_MS)
         );
         assert!(normalized.safe_to_retry_same_request);
+    }
+
+    #[test]
+    fn supervised_launch_without_subc_module_id_is_refused() {
+        let error = module_id_from_environment(|key| {
+            (key == SUBC_LAUNCH_NONCE_ENV).then(|| OsString::from("launch-nonce"))
+        })
+        .expect_err("a supervised launch must provide its module id");
+        assert!(matches!(error, ModuleError::Config(_)));
+        assert!(error.to_string().contains(SUBC_MODULE_ID_ENV));
+
+        let unsupervised = module_id_from_environment(|_| None)
+            .expect("an unsupervised development run keeps the default module id");
+        assert_eq!(unsupervised, DEFAULT_MODULE_ID);
+    }
+
+    #[test]
+    fn xdg_config_home_is_read_before_home_and_unset_uses_home() {
+        let root = std::env::temp_dir().join(format!(
+            "synapse-module-config-home-{}-{}",
+            std::process::id(),
+            TEST_STATE_COUNTER.fetch_add(1, Ordering::Relaxed),
+        ));
+        let xdg_home = root.join("xdg");
+        let home = root.join("home");
+        let project = root.join("project");
+        let xdg_config = xdg_home.join("cortexkit").join("synapse.jsonc");
+        let home_config = home.join(".config").join("cortexkit").join("synapse.jsonc");
+        fs::create_dir_all(xdg_config.parent().expect("XDG config parent")).unwrap();
+        fs::create_dir_all(home_config.parent().expect("HOME config parent")).unwrap();
+        fs::write(&xdg_config, r#"{"cache_max_bytes": 111}"#).unwrap();
+        fs::write(&home_config, r#"{"cache_max_bytes": 222}"#).unwrap();
+
+        let xdg = load_module_config_with_environment(
+            |key| match key {
+                "XDG_CONFIG_HOME" => Some(xdg_home.clone().into_os_string()),
+                "HOME" => Some(home.clone().into_os_string()),
+                _ => None,
+            },
+            Some(&project),
+        )
+        .expect("load XDG config");
+        assert_eq!(xdg.cache_max_bytes, 111);
+
+        let home_only = load_module_config_with_environment(
+            |key| match key {
+                "HOME" => Some(home.clone().into_os_string()),
+                _ => None,
+            },
+            Some(&project),
+        )
+        .expect("load HOME config");
+        assert_eq!(home_only.cache_max_bytes, 222);
+
+        let mut no_environment = |_: &str| -> Option<OsString> { None };
+        assert_eq!(
+            default_synapse_config_path_with_environment(&mut no_environment),
+            PathBuf::from(".config")
+                .join("cortexkit")
+                .join("synapse.jsonc")
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
