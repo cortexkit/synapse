@@ -18,12 +18,12 @@
 #   WATCH_CI_SETTLE=1 scripts/watch-ci.sh <run-id>
 set -uo pipefail
 
-# Lifted from cortexkit/aft at 5baba0f49; only these two defaults are local.
+# Lifted from cortexkit/aft at 36a9c7806; this default is the one local edit.
 REPO="${REPO:-cortexkit/synapse}"
 # Which workflow gates a landing. A sha can carry runs from several workflows
 # (cost-gate, testbox), so resolving a run BY SHA has to name the gating one or
 # it can latch a run that says nothing about the tests.
-WORKFLOW="${WATCH_CI_WORKFLOW:-ci.yml}"
+WORKFLOW="${WATCH_CI_WORKFLOW:-tests.yml}"
 # How long to wait for a run to appear for a sha: 40 tries, 15s apart, is ten
 # minutes of patience for a queue that normally produces a run in seconds. Both
 # knobs exist so tests can drive the resolver without waiting out that budget.

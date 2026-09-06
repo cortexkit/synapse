@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
-# Lifted from cortexkit/aft scripts/train-push.sh at 5baba0f49 (the fleet's
-# reference implementation). Local edits, kept minimal so the file can be
-# re-lifted: repository slug and gating workflow default to this repo's
-# (cortexkit/synapse, ci.yml), and aft's governed-docs preflight is replaced by
-# this repo's train-precondition checker.
-#
 # Push a train to its own branch, let CI be the gate, and advance main only on
 # green. Operator tooling runs through the real GitHub CLI (gh) via watch-ci.sh;
 # the shim is only for AI agent commands.
+#
+# Lifting this into another repository: carry four files together —
+# scripts/train-push.sh, scripts/watch-ci.sh, scripts/lib/operator-gh.sh,
+# scripts/lib/workflow-gates.py — plus `python3`, `git`, and the real `gh` on
+# PATH. Nothing else here assumes this repository's layout: the default branch
+# is read from origin/HEAD, and repo-local preflights run only when their
+# scripts exist (see "Repo-local preflights" below), with the header line
+# naming which ones ran.
 #
 # Why this is the default push path instead of scripts/gated-push.sh:
 # the local full Rust gate takes ~12 minutes on this box and only sees macOS.
@@ -85,9 +87,10 @@ remote="origin"
 default_branch=""
 # The workflow whose run gates a landing, shared with watch-ci.sh so the probe
 # and the watch cannot disagree about which run counts.
-tests_workflow_name="${WATCH_CI_WORKFLOW:-ci.yml}"
+tests_workflow_name="${WATCH_CI_WORKFLOW:-tests.yml}"
 # The repository the runs live in, same default as watch-ci.sh so the probe and
 # the watch cannot end up querying two different repositories.
+# Lifted from cortexkit/aft at 36a9c7806; this default is the one local edit.
 repo_slug="${REPO:-cortexkit/synapse}"
 # How long the first-run probe waits for a run to start. Overridable for the
 # same reason watch-ci.sh's resolver knobs are: tests cannot wait out the
@@ -164,7 +167,7 @@ source "$script_dir/lib/operator-gh.sh" || exit 2
 # lines here: `if:` conditions are routinely written as folded scalars, and a
 # line-oriented search misses them on exactly the workflows whose behaviour
 # depends on the ref.
-tests_workflow=".github/workflows/$tests_workflow_name"
+tests_workflow=".github/workflows/tests.yml"
 gate_scanner="$script_dir/lib/workflow-gates.py"
 # Absolute, so the pre-push warning below names a path the reader can act on
 # from anywhere rather than one relative to the repo root.
@@ -173,7 +176,7 @@ git_dir="$(git rev-parse --absolute-git-dir)"
 command -v python3 >/dev/null 2>&1 ||
   refuse "python3 is required to read the workflow files"
 if [ ! -f "$tests_workflow" ]; then
-  refuse "no $tests_workflow — add \`train/**\` to on.push.branches in $tests_workflow"
+  refuse "no $tests_workflow — add \`train/**\` to on.push.branches in .github/workflows/tests.yml"
 fi
 
 set +e
@@ -188,7 +191,7 @@ if [ "$scanner_rc" -ne 0 ]; then
 fi
 
 if ! printf '%s\n' "$gate_report" | grep -qx 'trigger|ok'; then
-  refuse "$tests_workflow_name does not run on $train_ref — add \`train/**\` to on.push.branches in $tests_workflow"
+  refuse "tests.yml does not run on $train_ref — add \`train/**\` to on.push.branches in .github/workflows/tests.yml"
 fi
 
 # Conditions that decide on something the landing path never satisfies. A gate
@@ -384,11 +387,35 @@ if [ ! -f "$probe_marker" ]; then
   run_trigger_probe
 fi
 
-# The train preconditions CI asserts as its first step, checked here before a
-# run is spent: a train whose workflow drifted would fail in seconds on CI
-# anyway, but failing locally is free.
-if ! bash scripts/check-train-preconditions.sh; then
-  refuse "train preconditions failed — see scripts/check-train-preconditions.sh"
+# Repo-local preflights. The script is lifted into other repositories as a
+# file, so nothing here may assume this repository's layout: each preflight
+# runs only when its script exists, and the header line names which ones ran
+# so a repository with none is distinguishable from one whose block was
+# deleted. This repository's two are the governed-docs gates gated-push.sh
+# runs; both are read-only here (scripts/align-governed-docs.sh is the
+# writing half and stays the remedy, not something this script performs).
+preflights_ran=()
+if [ -f scripts/audit-v049-agent-surface.ts ]; then
+  bun scripts/audit-v049-agent-surface.ts \
+    || refuse "governed-surface audit failed — run scripts/align-governed-docs.sh"
+  preflights_ran+=(governed-surface-audit)
+fi
+if [ -f scripts/release-gate-v049.mjs ]; then
+  node scripts/release-gate-v049.mjs \
+    || refuse "release gate failed — run scripts/align-governed-docs.sh"
+  preflights_ran+=(release-gate)
+fi
+# A repository may add its own preflights beside this script without editing
+# it; the hook is sourced so it can call `refuse` and `say`.
+if [ -f scripts/train-push.local.sh ]; then
+  # shellcheck disable=SC1091
+  . scripts/train-push.local.sh
+  preflights_ran+=(train-push.local.sh)
+fi
+if [ "${#preflights_ran[@]}" -eq 0 ]; then
+  say "preflights: none (no repo-local preflight scripts present)"
+else
+  say "preflights: ${preflights_ran[*]}"
 fi
 
 # ---------------------------------------------------------------------------

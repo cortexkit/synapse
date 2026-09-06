@@ -13,7 +13,7 @@ esac
 script_dir="$(cd -- "$(dirname -- "$script_path")" && pwd -P)"
 repo_root="$(cd "$script_dir/.." && pwd -P)"
 
-exec python3 - "$repo_root/.github/workflows/ci.yml" <<'PY'
+exec python3 - "$repo_root/.github/workflows/tests.yml" <<'PY'
 from __future__ import annotations
 
 import sys
