@@ -80,6 +80,12 @@ jobs:
         with:
           path: synapse
 
+      # Validate the workflow before sibling checkouts and toolchain setup spend time.
+      - name: Check train CI preconditions
+        if: matrix.name == 'linux'
+        shell: bash
+        run: bash synapse/scripts/check-train-preconditions.sh
+
       # Sibling layout: Cargo path deps resolve ../subconscious and ../commons.
       - name: Checkout subconscious (sibling)
         uses: actions/checkout@v4
