@@ -14865,6 +14865,13 @@ mod tests {
         let sampler = start_perf_sampler(Arc::clone(&enabled_state)).expect("sampler starts");
         tokio::time::sleep(Duration::from_millis(1_200)).await;
         sampler.abort();
+        // The aborted task still owns a clone of the state, and the state owns the
+        // open store. Windows refuses to delete a directory holding an open file,
+        // so wait for the task to finish unwinding and release every handle
+        // before the cleanup below.
+        let _ = sampler.await;
+        drop(_activity);
+        drop(enabled_state);
 
         let activity_lines = fs::read_to_string(log_handle.path())
             .expect("perf log reads")
