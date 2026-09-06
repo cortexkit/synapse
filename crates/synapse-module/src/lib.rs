@@ -87,9 +87,8 @@ use subc_client_rs::{
 };
 use subc_protocol::{
     manifest::{
-        Bindings, Concurrency, IdentityBinding, IdentityScope, ManagementOperation,
-        ManagementOperationKind, ModuleManifest, ProviderRole, StorageBinding, StorageKind,
-        StorageScope, TrustTier,
+        Concurrency, IdentityScope, ManagementOperation, ManagementOperationKind, ModuleManifest,
+        ProviderRole,
     },
     ModuleHelloAckBody, Principal, PROTOCOL_VERSION, SUBC_LAUNCH_NONCE_ENV, SUBC_MODULE_ID_ENV,
 };
@@ -14082,66 +14081,54 @@ fn manifest(module_id: &str) -> ModuleManifest {
     // wire fields stop breaking every constructor; the builder is the one
     // sanctioned construction path. Every deliberate claim below keeps its
     // reasoning from the literal-construction era.
-    ModuleManifest::builder(
-        module_id,
-        env!("CARGO_PKG_VERSION"),
-        TrustTier::FirstParty,
-        Bindings {
-            storage: StorageBinding {
-                kind: StorageKind::Sqlite,
-                scope: StorageScope::Project,
-                owns_schema: true,
-            },
-            vault_grants: Vec::new(),
-            identity: IdentityBinding {
-                requires: vec![IdentityScope::Project],
-                optional: vec![IdentityScope::Session],
-            },
-        },
-    )
-    .protocol_ver(PROTOCOL_VERSION)
-    .provides(vec![ProviderRole::ManagementSurface {
-        operations: management_operations(),
-        config_schema: json!({ "type": "object" }),
-        observability: Vec::new(),
-        identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
-        // A deliberate claim, not the enum default: synapse accepts
-        // concurrent calls (machine-wide admission exists precisely to
-        // absorb many clients at once) and owns all execution ordering
-        // internally via the admission semaphore and the fair-share
-        // scheduler. Serial would break concurrent embed traffic;
-        // StatelessParallel would discard per-channel FIFO, which job
-        // paging relies on.
-        concurrency: Concurrency::ModuleManaged,
-    }])
-    // Capability grammar is not adopted yet: leaving the block unset keeps the
-    // pre-capability manifest contract, and consumers keep addressing synapse
-    // by module id and operation name.
-    .capabilities(None)
-    // Examined and none declarable (Some([]) is the wire form of that claim;
-    // None would mean the vocabulary is un-adopted): synapse mutates nothing
-    // outside its own store and models directory, and observation-anchored
-    // signals would claim watch points we do not maintain.
-    .self_signals(Some(Vec::new()))
-    // Declare what is known rather than blanket-None: the SDK helper stamps
-    // `wire_crate_version` from the linked subc-protocol crate, and the
-    // newest migration this binary carries is a fact a daemon can compare
-    // against a store's actual version to spot a stale binary directly.
-    // Build facts stay absent because release scripts do not stamp
-    // CK_BUILD_* yet, and the helper maps an absent input to field omission
-    // rather than minting a sentinel string that would read as a fact.
-    .provenance(Some(
-        build_provenance(
-            None,
-            None,
-            Some(&store::newest_schema_version().to_string()),
-        )
-        // Form validation covers only the sha and lock-digest inputs, and both
-        // are absent here, so an Err would mean the SDK contract itself
-        // changed rather than any runtime condition.
-        .expect("build_provenance with absent sha and lock digest cannot fail form validation"),
-    ))
-    .build()
+    //
+    // Trust tier and bindings are left undeclared: subc-protocol 0.19 made
+    // them optional because the daemon reads neither on any production path,
+    // and a declaration nothing consumes only drifts from the truth unnoticed.
+    ModuleManifest::builder(module_id, env!("CARGO_PKG_VERSION"))
+        .protocol_ver(PROTOCOL_VERSION)
+        .provides(vec![ProviderRole::ManagementSurface {
+            operations: management_operations(),
+            config_schema: json!({ "type": "object" }),
+            observability: Vec::new(),
+            identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
+            // A deliberate claim, not the enum default: synapse accepts
+            // concurrent calls (machine-wide admission exists precisely to
+            // absorb many clients at once) and owns all execution ordering
+            // internally via the admission semaphore and the fair-share
+            // scheduler. Serial would break concurrent embed traffic;
+            // StatelessParallel would discard per-channel FIFO, which job
+            // paging relies on.
+            concurrency: Concurrency::ModuleManaged,
+        }])
+        // Capability grammar is not adopted yet: leaving the block unset keeps the
+        // pre-capability manifest contract, and consumers keep addressing synapse
+        // by module id and operation name.
+        .capabilities(None)
+        // Examined and none declarable (Some([]) is the wire form of that claim;
+        // None would mean the vocabulary is un-adopted): synapse mutates nothing
+        // outside its own store and models directory, and observation-anchored
+        // signals would claim watch points we do not maintain.
+        .self_signals(Some(Vec::new()))
+        // Declare what is known rather than blanket-None: the SDK helper stamps
+        // `wire_crate_version` from the linked subc-protocol crate, and the
+        // newest migration this binary carries is a fact a daemon can compare
+        // against a store's actual version to spot a stale binary directly.
+        // Build facts stay absent because release scripts do not stamp
+        // CK_BUILD_* yet, and the helper maps an absent input to field omission
+        // rather than minting a sentinel string that would read as a fact.
+        .provenance(Some(
+            build_provenance(
+                None,
+                None,
+                Some(&store::newest_schema_version().to_string()),
+            )
+            // Form validation covers only the sha and lock-digest inputs, and both
+            // are absent here, so an Err would mean the SDK contract itself
+            // changed rather than any runtime condition.
+            .expect("build_provenance with absent sha and lock digest cannot fail form validation"),
+        ))
+        .build()
 }
 
 fn load_module_config() -> Result<ModuleConfig, ModuleError> {
