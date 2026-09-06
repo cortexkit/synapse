@@ -249,12 +249,13 @@ No engine/GPU/worker probes on the dispatch path.
 ## Config
 
 Layered resolution (first hit wins per field): `SYNAPSE_CONFIG_PATH` env
-(tests), `<project>/synapse.jsonc`, then
-`~/.config/cortexkit/synapse.jsonc`, then built-in defaults. JSONC comments
-are stripped before parse; unknown fields are rejected at boot (`deny_unknown_fields`)
-with the offending field named in the module log.
+(tests), `<project>/.cortexkit/synapse.jsonc`, then the platform user config
+path (`$XDG_CONFIG_HOME/cortexkit/synapse.jsonc`; on Windows, APPDATA then
+USERPROFILE; otherwise `~/.config/cortexkit/synapse.jsonc`), then built-in
+defaults. JSONC comments are stripped before parse; unknown fields are rejected
+at boot (`deny_unknown_fields`) with the offending field named in the module log.
 
-`~/.config/cortexkit/synapse.jsonc` carries knob (performance|balanced|quiet,
+The platform user config carries knob (performance|balanced|quiet,
 default=balanced), `preload_models` (replaces the removed `SYNAPSE_PRELOAD_MODELS`
 env), inline/jobs/probe tuning, `alias_admin_enabled`, `microllm_max_tokens`
 (default 512), `grammar_enabled` (default false), and `cache_max_bytes` (GC

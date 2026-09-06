@@ -22,19 +22,8 @@ use std::{env, io::Write, path::PathBuf, process, time::Duration};
 
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
-use subc_client_rs::{CallOptions, ConsumerOptions, SubcConsumer};
+use subc_client_rs::{discover, CallOptions, ConsumerOptions, SubcConsumer};
 use subc_protocol::{BindIdentity, RouteTarget};
-
-fn default_subc_path() -> PathBuf {
-    env::var_os("SYNAPSE_CONNECTION_FILE")
-        .map(PathBuf::from)
-        .or_else(|| {
-            env::var_os("XDG_RUNTIME_DIR")
-                .map(PathBuf::from)
-                .map(|directory| directory.join("synapse/subc-connection.json"))
-        })
-        .unwrap_or_else(|| env::temp_dir().join("synapse/subc-connection.json"))
-}
 
 const USAGE: &str = "\
 usage: subc_call --module <id> --method <name> [--params <json>] [--subc <path>] [--identity <harness>:<session_id>]
@@ -42,14 +31,14 @@ usage: subc_call --module <id> --method <name> [--params <json>] [--subc <path>]
   --module <id>       target module id (required)
   --method <name>     management-surface method (required)
   --params <json>     JSON object params (default: {})
-  --subc <path>       subc connection file (default: $SYNAPSE_CONNECTION_FILE or XDG runtime path)
+  --subc <path>       explicit connection file (otherwise $SUBC_CONNECTION_FILE or daemon discovery)
   --identity <h>:<s>  override bind harness:session (chair verbs; exact bytes)
   --help, -h          show this help
 ";
 
 #[derive(Debug, PartialEq, Eq)]
 struct CliArgs {
-    subc: PathBuf,
+    subc: Option<PathBuf>,
     module: String,
     method: String,
     params: Value,
@@ -75,6 +64,9 @@ async fn main() -> Result<()> {
 }
 
 async fn run(args: CliArgs) -> Result<()> {
+    let subc = discover(args.subc.as_deref())
+        .context("discover subc daemon connection file")?
+        .path;
     if let Some((harness, session)) = &args.identity_override {
         // Loud disclosure only — identity must not appear in any other log path.
         writeln!(
@@ -84,9 +76,9 @@ async fn run(args: CliArgs) -> Result<()> {
         .ok();
     }
 
-    let consumer = SubcConsumer::connect(&args.subc, ConsumerOptions::default())
+    let consumer = SubcConsumer::connect(&subc, ConsumerOptions::default())
         .await
-        .with_context(|| format!("connect to subc through {}", args.subc.display()))?;
+        .with_context(|| format!("connect to subc through {}", subc.display()))?;
     let identity = build_identity(
         args.identity_override.clone(),
         env::current_dir,
@@ -117,7 +109,7 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    let mut subc = default_subc_path();
+    let mut subc = None;
     let mut module = None;
     let mut method = None;
     let mut params: Value = json!({});
@@ -127,7 +119,7 @@ where
         let arg = arg.as_ref();
         match arg {
             "--help" | "-h" => return Ok(ParsedCli::Help),
-            "--subc" => subc = PathBuf::from(iter.next().context("--subc value")?.as_ref()),
+            "--subc" => subc = Some(PathBuf::from(iter.next().context("--subc value")?.as_ref())),
             "--module" => {
                 module = Some(iter.next().context("--module value")?.as_ref().to_string())
             }
@@ -222,7 +214,7 @@ mod tests {
         assert_eq!(args.method, "ping");
         assert_eq!(args.params, json!({}));
         assert_eq!(args.identity_override, None);
-        assert_eq!(args.subc, default_subc_path());
+        assert_eq!(args.subc, None);
     }
 
     #[test]

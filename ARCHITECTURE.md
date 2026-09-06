@@ -137,7 +137,7 @@
 
 **Production Inference Flow:**
 
-1. Initialize layered configuration from `SYNAPSE_CONFIG_PATH` or `~/.config/cortexkit/synapse.jsonc` (merging `.cortexkit/synapse.jsonc`), rejecting unknown fields and applying `microllm` ceilings — `crates/synapse-module/src/remote/config.rs`
+1. Initialize layered configuration from `SYNAPSE_CONFIG_PATH` or the platform user path (`$XDG_CONFIG_HOME/cortexkit/synapse.jsonc`, with Windows and HOME fallbacks), merging `.cortexkit/synapse.jsonc`, rejecting unknown fields, and applying `microllm` ceilings — `crates/synapse-module/src/lib.rs`
 2. Route request received via SubC — `crates/synapse-module/src/lib.rs`
 3. Validate alias surfaces, apply machine capability profiles with `ane_subtype` chip identity (Perf/Quiet tiers), verify microLLM certifications (refusing execution on uncertified fingerprints), or map user-tier `remote_providers` profiles — `crates/synapse-module/src/store.rs`
 4. Admit job to the DB (checking active attempt ID CAS, request-digest idempotency, and page counts of existing results to resume from checkpoints), recording admission telemetry (`jobs_minted` on admission, `refusals` with stable reason codes on rejection) — `crates/synapse-module/src/lib.rs` / `crates/synapse-module/src/store.rs`

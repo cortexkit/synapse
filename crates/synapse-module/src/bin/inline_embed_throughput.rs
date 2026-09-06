@@ -9,20 +9,10 @@ use std::{
 
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
-use subc_client_rs::{CallOptions, ConsumerOptions, SubcConsumer};
+use subc_client_rs::{discover, CallOptions, ConsumerOptions, SubcConsumer};
 use subc_protocol::{BindIdentity, RouteTarget};
 use tokio::time::{interval, sleep, MissedTickBehavior};
 
-fn default_subc_path() -> PathBuf {
-    env::var_os("SYNAPSE_CONNECTION_FILE")
-        .map(PathBuf::from)
-        .or_else(|| {
-            env::var_os("XDG_RUNTIME_DIR")
-                .map(PathBuf::from)
-                .map(|directory| directory.join("synapse/subc-connection.json"))
-        })
-        .unwrap_or_else(|| env::temp_dir().join("synapse/subc-connection.json"))
-}
 const DEFAULT_MODEL: &str = "gte-modernbert-base-f16";
 const DEFAULT_BATCHES: &[usize] = &[1, 2, 4, 8, 16, 32, 64, 128, 256];
 const DEFAULT_CLASSES: &[TextClass] = &[TextClass::Memory, TextClass::Chunk];
@@ -57,9 +47,12 @@ impl TextClass {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse(env::args().skip(1))?;
-    let consumer = SubcConsumer::connect(&args.subc, ConsumerOptions::default())
+    let subc = discover(args.subc.as_deref())
+        .context("discover subc daemon connection file")?
+        .path;
+    let consumer = SubcConsumer::connect(&subc, ConsumerOptions::default())
         .await
-        .with_context(|| format!("connect to subc through {}", args.subc.display()))?;
+        .with_context(|| format!("connect to subc through {}", subc.display()))?;
     let identity = BindIdentity {
         project_root: env::current_dir().context("find exerciser project root")?,
         harness: "inline-embed-throughput".to_string(),
@@ -159,7 +152,7 @@ async fn main() -> Result<()> {
 }
 
 struct Args {
-    subc: PathBuf,
+    subc: Option<PathBuf>,
     model: String,
     batches: Vec<usize>,
     classes: Vec<TextClass>,
@@ -168,9 +161,7 @@ struct Args {
 
 impl Args {
     fn parse(mut args: impl Iterator<Item = String>) -> Result<Self> {
-        let mut subc = env::var_os("SUBC_CONNECTION_FILE")
-            .map(PathBuf::from)
-            .unwrap_or_else(default_subc_path);
+        let mut subc = None;
         let mut model = DEFAULT_MODEL.to_string();
         let mut batches = DEFAULT_BATCHES.to_vec();
         let mut classes = DEFAULT_CLASSES.to_vec();
@@ -178,7 +169,9 @@ impl Args {
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--subc" => {
-                    subc = PathBuf::from(args.next().context("--subc requires a path")?);
+                    subc = Some(PathBuf::from(
+                        args.next().context("--subc requires a path")?,
+                    ));
                 }
                 "--model" => {
                     model = args.next().context("--model requires a model id")?;
@@ -208,7 +201,7 @@ impl Args {
                 }
                 "-h" | "--help" => {
                     println!(
-                        "Usage: inline_embed_throughput [--subc PATH] [--model ID] [--batches 1,2,4,8,16,32,64,128,256] [--classes memory,chunk] [--repetitions 3]"
+                        "Usage: inline_embed_throughput [--subc PATH] [--model ID] [--batches 1,2,4,8,16,32,64,128,256] [--classes memory,chunk] [--repetitions 3]\n\nWhen --subc is omitted, SUBC_CONNECTION_FILE or standard daemon discovery is used."
                     );
                     std::process::exit(0);
                 }

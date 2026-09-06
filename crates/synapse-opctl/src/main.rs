@@ -12,19 +12,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use subc_client_rs::{CallError, CallOptions, ConsumerOptions, SubcConsumer};
+use subc_client_rs::{discover, CallError, CallOptions, ConsumerOptions, SubcConsumer};
 use subc_protocol::{BindIdentity, RouteTarget};
 
-fn default_subc_path() -> PathBuf {
-    env::var_os("SYNAPSE_CONNECTION_FILE")
-        .map(PathBuf::from)
-        .or_else(|| {
-            env::var_os("XDG_RUNTIME_DIR")
-                .map(PathBuf::from)
-                .map(|directory| directory.join("synapse/subc-connection.json"))
-        })
-        .unwrap_or_else(|| env::temp_dir().join("synapse/subc-connection.json"))
-}
 const MODULE_ID: &str = "synapse";
 const DEFAULT_COMPONENTS: usize = 8;
 
@@ -35,9 +25,9 @@ const DEFAULT_COMPONENTS: usize = 8;
     about = "Drive Synapse operations through the fleet subc daemon"
 )]
 struct Cli {
-    /// Path to the subc daemon connection file.
-    #[arg(long, global = true, default_value_os_t = default_subc_path())]
-    subc: PathBuf,
+    /// Explicit subc connection file. Otherwise use SUBC_CONNECTION_FILE or daemon discovery.
+    #[arg(long, global = true)]
+    subc: Option<PathBuf>,
 
     /// Print unformatted response JSON instead of the operator view.
     #[arg(long, global = true)]
@@ -226,16 +216,13 @@ async fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<()> {
-    if !cli.subc.is_file() {
-        bail!(
-            "subc connection file does not exist: {}",
-            cli.subc.display()
-        );
-    }
+    let subc = discover(cli.subc.as_deref())
+        .context("discover subc daemon connection file")?
+        .path;
     let project_root = discover_repo_root()?;
-    let consumer = SubcConsumer::connect(&cli.subc, ConsumerOptions::default())
+    let consumer = SubcConsumer::connect(&subc, ConsumerOptions::default())
         .await
-        .with_context(|| format!("connect to subc through {}", cli.subc.display()))?;
+        .with_context(|| format!("connect to subc through {}", subc.display()))?;
     let identity = BindIdentity {
         project_root,
         harness: "opctl".to_string(),
