@@ -758,9 +758,15 @@ const RESTORE_CLEAR_TABLES: &[&str] = &[
 const RESTORE_LIVE_ONLY_TABLES: &[&str] =
     &["module_meta", "cortexkit_fence", "cortexkit_schema_version"];
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+/// The reason recorded on approvals and serving approvals forced disabled during
+/// a restore operation. Restored approvals remain disabled until an operator
+/// explicitly inspects and re-enables them.
+pub const RESTORE_DISABLED_REASON: &str = "restored approval requires operator re-enable";
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RestoreImportReport {
     pub imported_rows: BTreeMap<String, u64>,
+    pub disabled_on_import: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Error)]
@@ -1901,7 +1907,8 @@ impl SynapseStore {
     /// Opening the capture first applies this binary's normal forward migrations
     /// and preserves the typed refusal for captures written by a newer schema.
     /// The target must be unserved; opening its store takes the same lease used
-    /// by the module before any live row is changed.
+    /// by the module before any live row is changed. Restored approvals are
+    /// imported disabled and require operator re-enable before serving resumes.
     pub fn restore_from_capture(
         live_descriptor: &StorageDescriptor,
         capture_path: &Path,
@@ -1998,8 +2005,109 @@ impl SynapseStore {
                     }
                 }
 
+                // Restored approvals must come back disabled. An emergency rollback
+                // or revocation flips approval states in place, so a snapshot taken
+                // prior to that rollback carries approvals as enabled. Importing them
+                // as enabled would resurrect revoked approvals as soon as a probe
+                // re-derives certification. To remain fail-closed without an external
+                // journal, we force every imported approval to disabled inside this
+                // same transaction, requiring an operator to review and re-enable.
+                let now = unix_now_ms();
+                let mut disabled_on_import = BTreeMap::new();
+
+                let mut approval_stmt = transaction.prepare(
+                    "SELECT row_id, schema_revision, model_id, decode_fingerprint, enabled,
+                            grammar_enabled, disabled_reason, approved_by, approved_at_ms,
+                            updated_at_ms, evidence_requirements_revision, semantic_digest,
+                            generation, fencing_metadata
+                     FROM main.approvals ORDER BY row_id",
+                )?;
+                let approval_rows = approval_stmt
+                    .query_map([], approval_from_row)?
+                    .collect::<Result<Vec<_>, _>>()?;
+                drop(approval_stmt);
+
+                let mut disabled_approvals = 0u64;
+                for mut row in approval_rows {
+                    row.enabled = false;
+                    row.grammar_enabled = false;
+                    row.disabled_reason = Some(RESTORE_DISABLED_REASON.to_string());
+                    row.updated_at_ms = now;
+                    row.generation = row.generation.saturating_add(1);
+                    row.semantic_digest = row.expected_digest().map_err(to_sql_error)?;
+                    transaction.execute(
+                        "UPDATE main.approvals
+                         SET enabled = 0, grammar_enabled = 0, disabled_reason = ?1,
+                             updated_at_ms = ?2, generation = ?3, semantic_digest = ?4
+                         WHERE row_id = ?5",
+                        params![
+                            row.disabled_reason.as_deref(),
+                            row.updated_at_ms as i64,
+                            row.generation as i64,
+                            &row.semantic_digest,
+                            row.row_id as i64,
+                        ],
+                    )?;
+                    disabled_approvals += 1;
+                }
+                disabled_on_import.insert("approvals".to_string(), disabled_approvals);
+
+                let mut serving_stmt = transaction.prepare(
+                    "SELECT catalog_fingerprint, certification_record_id, artifact_id, state,
+                            reason, approved_by, approved_at_ms, updated_at_ms, generation,
+                            semantic_digest
+                     FROM main.serving_approvals ORDER BY rowid",
+                )?;
+                let serving_rows = serving_stmt
+                    .query_map([], |row| {
+                        Ok(ServingApprovalRecord {
+                            schema_revision: SERVING_APPROVAL_SCHEMA_REVISION.to_string(),
+                            catalog_fingerprint: row.get(0)?,
+                            certification_record_id: row.get(1)?,
+                            artifact_id: row.get(2)?,
+                            state: ServingApprovalState::parse(&row.get::<_, String>(3)?)
+                                .map_err(to_sql_error)?,
+                            reason: row.get(4)?,
+                            approved_by: row.get(5)?,
+                            approved_at_ms: row.get::<_, i64>(6)? as u64,
+                            updated_at_ms: row.get::<_, i64>(7)? as u64,
+                            generation: row.get::<_, i64>(8)? as u64,
+                            semantic_digest: row.get(9)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                drop(serving_stmt);
+
+                let mut disabled_serving = 0u64;
+                for mut row in serving_rows {
+                    row.state = ServingApprovalState::Disabled;
+                    row.reason = Some(RESTORE_DISABLED_REASON.to_string());
+                    row.updated_at_ms = now;
+                    row.generation = row.generation.saturating_add(1);
+                    row.semantic_digest = row.expected_digest();
+                    transaction.execute(
+                        "UPDATE main.serving_approvals
+                         SET state = ?1, reason = ?2, updated_at_ms = ?3, generation = ?4,
+                             semantic_digest = ?5
+                         WHERE catalog_fingerprint = ?6",
+                        params![
+                            row.state.as_str(),
+                            row.reason.as_deref(),
+                            row.updated_at_ms as i64,
+                            row.generation as i64,
+                            &row.semantic_digest,
+                            &row.catalog_fingerprint,
+                        ],
+                    )?;
+                    disabled_serving += 1;
+                }
+                disabled_on_import.insert("serving_approvals".to_string(), disabled_serving);
+
                 transaction.commit()?;
-                Ok(RestoreImportReport { imported_rows })
+                Ok(RestoreImportReport {
+                    imported_rows,
+                    disabled_on_import,
+                })
             })();
 
             let detach = connection.execute_batch("DETACH DATABASE restore_capture");
@@ -10995,14 +11103,83 @@ mod tests {
         let restored = SynapseStore::open(&live_descriptor).unwrap();
         for table in RESTORE_KEEP_TABLES {
             assert_eq!(
-                table_rows(&restored, table),
-                keep_rows[*table],
-                "trust table {table} was not restored row-for-row"
-            );
-            assert_eq!(
                 report.imported_rows.get(*table).copied(),
                 Some(keep_rows[*table].len() as u64)
             );
+            if *table == "approvals" {
+                assert_eq!(
+                    report.disabled_on_import.get(*table).copied(),
+                    Some(keep_rows[*table].len() as u64)
+                );
+                let restored_rows = table_rows(&restored, table);
+                let captured_rows = &keep_rows[*table];
+                assert_eq!(restored_rows.len(), captured_rows.len());
+                for (restored_row, captured_row) in restored_rows.iter().zip(captured_rows.iter()) {
+                    // All non-state identity/provenance columns match captured row
+                    assert_eq!(restored_row[0], captured_row[0]);
+                    assert_eq!(restored_row[1], captured_row[1]);
+                    assert_eq!(restored_row[2], captured_row[2]);
+                    assert_eq!(restored_row[3], captured_row[3]);
+                    // enabled and grammar_enabled must be forced to 0
+                    assert_eq!(restored_row[4], rusqlite::types::Value::Integer(0));
+                    assert_eq!(restored_row[5], rusqlite::types::Value::Integer(0));
+                    // disabled_reason must be set
+                    assert_eq!(
+                        restored_row[6],
+                        rusqlite::types::Value::Text(RESTORE_DISABLED_REASON.to_string())
+                    );
+                    assert_eq!(restored_row[7], captured_row[7]);
+                    assert_eq!(restored_row[8], captured_row[8]);
+                    assert_eq!(restored_row[10], captured_row[10]);
+                    let captured_gen = match captured_row[12] {
+                        rusqlite::types::Value::Integer(gen) => gen,
+                        _ => panic!("generation is integer"),
+                    };
+                    assert_eq!(
+                        restored_row[12],
+                        rusqlite::types::Value::Integer(captured_gen + 1)
+                    );
+                    assert_eq!(restored_row[13], captured_row[13]);
+                }
+            } else if *table == "serving_approvals" {
+                assert_eq!(
+                    report.disabled_on_import.get(*table).copied(),
+                    Some(keep_rows[*table].len() as u64)
+                );
+                let restored_rows = table_rows(&restored, table);
+                let captured_rows = &keep_rows[*table];
+                assert_eq!(restored_rows.len(), captured_rows.len());
+                for (restored_row, captured_row) in restored_rows.iter().zip(captured_rows.iter()) {
+                    assert_eq!(restored_row[0], captured_row[0]);
+                    assert_eq!(restored_row[1], captured_row[1]);
+                    assert_eq!(restored_row[2], captured_row[2]);
+                    // state must be forced to disabled
+                    assert_eq!(
+                        restored_row[3],
+                        rusqlite::types::Value::Text("disabled".to_string())
+                    );
+                    assert_eq!(
+                        restored_row[4],
+                        rusqlite::types::Value::Text(RESTORE_DISABLED_REASON.to_string())
+                    );
+                    assert_eq!(restored_row[5], captured_row[5]);
+                    assert_eq!(restored_row[6], captured_row[6]);
+                    let captured_gen = match captured_row[8] {
+                        rusqlite::types::Value::Integer(gen) => gen,
+                        _ => panic!("generation is integer"),
+                    };
+                    assert_eq!(
+                        restored_row[8],
+                        rusqlite::types::Value::Integer(captured_gen + 1)
+                    );
+                }
+            } else {
+                assert_eq!(
+                    table_rows(&restored, table),
+                    keep_rows[*table],
+                    "trust table {table} was not restored row-for-row"
+                );
+            }
         }
         for table in restore_application_tables() {
             if !RESTORE_KEEP_TABLES.contains(&table) {
@@ -11026,10 +11203,172 @@ mod tests {
                 .admit_serving_session("post-restore-session", &restored_catalog, 3)
                 .unwrap(),
             ServingSessionAdmission::Refused {
-                reason: ServingRefusal::CertificationMismatch,
+                reason: ServingRefusal::ArtifactDisabled,
             },
-            "an approval cannot serve until its discarded certification is re-derived"
+            "a restored approval refuses admission because it is forced disabled"
         );
+        drop(restored);
+        let _ = std::fs::remove_dir_all(capture_root);
+        let _ = std::fs::remove_dir_all(live_root);
+    }
+
+    #[test]
+    fn restore_import_forces_imported_approvals_disabled_preventing_resurrection() {
+        let (capture_root, capture_descriptor) = temp_descriptor("restore-capture-disabled-hazard");
+        let capture = SynapseStore::open(&capture_descriptor).unwrap();
+
+        // 1. Seed capture with an ENABLED serving approval.
+        let (artifact, catalog_fingerprint) = configure_serving_catalog(&capture);
+        let serving_before = capture
+            .serving_approval(&catalog_fingerprint)
+            .unwrap()
+            .expect("serving approval must exist in capture");
+        assert_eq!(
+            serving_before.state,
+            ServingApprovalState::Enabled,
+            "capture must seed an enabled serving approval"
+        );
+        assert!(matches!(
+            capture
+                .admit_serving_session("capture-session", &catalog_fingerprint, 10)
+                .unwrap(),
+            ServingSessionAdmission::Admitted { .. }
+        ));
+
+        // 2. Seed capture with an ENABLED decode approval in `approvals` table.
+        let model_id = "qwen3-0.6b-decode-f16";
+        let decode_fingerprint = hex::encode(Sha256::digest(b"decode-fingerprint-hazard"));
+        capture
+            .store
+            .with_conn(|conn| {
+                let mut row = ApprovalRow {
+                    schema_revision: APPROVAL_SCHEMA_REVISION.to_string(),
+                    model_id: model_id.to_string(),
+                    decode_fingerprint: decode_fingerprint.clone(),
+                    enabled: true,
+                    grammar_enabled: true,
+                    disabled_reason: None,
+                    approved_by: Some("principal:operator".to_string()),
+                    approved_at_ms: Some(10),
+                    updated_at_ms: 10,
+                    evidence_requirements_revision:
+                        APPROVAL_EVIDENCE_REQUIREMENTS_REVISION.to_string(),
+                    semantic_digest: String::new(),
+                    row_id: 1,
+                    generation: 0,
+                    fencing_metadata: serde_json::json!({}),
+                };
+                row.semantic_digest = row.expected_digest().map_err(to_sql_error)?;
+                conn.execute(
+                    "INSERT INTO approvals (
+                        schema_revision, model_id, decode_fingerprint, enabled, grammar_enabled,
+                        disabled_reason, approved_by, approved_at_ms, updated_at_ms,
+                        evidence_requirements_revision, semantic_digest, generation, fencing_metadata
+                    ) VALUES (?1, ?2, ?3, 1, 1, NULL, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    params![
+                        &row.schema_revision,
+                        &row.model_id,
+                        &row.decode_fingerprint,
+                        &row.approved_by,
+                        row.approved_at_ms.map(|v| v as i64),
+                        row.updated_at_ms as i64,
+                        &row.evidence_requirements_revision,
+                        &row.semantic_digest,
+                        row.generation as i64,
+                        "{}",
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let capture_path = sqlite_path(&capture_descriptor).unwrap();
+        drop(capture);
+
+        // 3. Restore capture into a clean live store.
+        let (live_root, live_descriptor) = temp_descriptor("restore-live-disabled-hazard");
+        let report = SynapseStore::restore_from_capture(&live_descriptor, &capture_path).unwrap();
+        let restored = SynapseStore::open(&live_descriptor).unwrap();
+
+        // 4. Assert approvals table row is forced disabled on restore.
+        let restored_approval = restored
+            .get_approval(model_id, &decode_fingerprint)
+            .unwrap()
+            .expect("approvals row must exist in restored store");
+        assert!(
+            !restored_approval.enabled,
+            "approvals table row must be forced disabled on restore"
+        );
+        assert!(
+            !restored_approval.grammar_enabled,
+            "approvals table grammar_enabled must be 0 on restore"
+        );
+        assert_eq!(
+            restored_approval.disabled_reason.as_deref(),
+            Some(RESTORE_DISABLED_REASON)
+        );
+
+        assert_eq!(
+            report.disabled_on_import.get("approvals").copied(),
+            Some(1),
+            "approvals table rows forced disabled mismatch"
+        );
+        assert_eq!(
+            report.disabled_on_import.get("serving_approvals").copied(),
+            Some(1),
+            "serving_approvals table rows forced disabled mismatch"
+        );
+
+        // Serving predicate check for approvals row refusal.
+        let predicate_refusal = crate::owned_decode_routing::lane::serving_predicate(
+            &crate::owned_decode_routing::lane::ServingPredicateInputs {
+                approval_present: true,
+                approval_enabled: restored_approval.enabled,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            predicate_refusal,
+            Err(crate::owned_decode_routing::lane::ServingRefusal::CutoverDisabled),
+            "approvals row must refuse serving predicate with CutoverDisabled"
+        );
+
+        // 5. Assert serving_approvals table row is forced disabled on restore.
+        let restored_serving = restored
+            .serving_approval(&catalog_fingerprint)
+            .unwrap()
+            .expect("serving_approvals row must exist in restored store");
+        assert_eq!(
+            restored_serving.state,
+            ServingApprovalState::Disabled,
+            "serving_approvals table row must be forced disabled on restore"
+        );
+        assert_eq!(
+            restored_serving.reason.as_deref(),
+            Some(RESTORE_DISABLED_REASON)
+        );
+
+        // 6. Re-derive certification records in the restored store.
+        // If the approval came back enabled, this re-derivation would resurrect
+        // serving admission without operator review.
+        restored
+            .ingest_serving_artifact(&serving_artifact_request(), 100)
+            .unwrap();
+        let record = complete_serving_certification(&artifact, &catalog_fingerprint);
+        restored.store_serving_certification(&record, 200).unwrap();
+
+        // 7. Verify serving is STILL refused with ArtifactDisabled.
+        let session_outcome = restored
+            .admit_serving_session("post-restore-probe", &catalog_fingerprint, 300)
+            .unwrap();
+        assert_eq!(
+            session_outcome,
+            ServingSessionAdmission::Refused {
+                reason: ServingRefusal::ArtifactDisabled,
+            },
+            "serving_approvals table must refuse admission even after certification re-derivation"
+        );
+
         drop(restored);
         let _ = std::fs::remove_dir_all(capture_root);
         let _ = std::fs::remove_dir_all(live_root);

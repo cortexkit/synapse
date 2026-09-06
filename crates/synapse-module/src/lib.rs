@@ -192,6 +192,8 @@ struct SynapseSingletonLease {
 /// An explicit directory supports isolated drills. Production callers omit it
 /// so the target is resolved by the same storage path function used when a
 /// daemon acknowledgment does not provide a descriptor at module boot.
+/// Restored approvals are imported disabled and require operator re-enable
+/// before serving resumes.
 pub fn restore_import(
     capture_path: &Path,
     store_directory: Option<&Path>,
