@@ -15,6 +15,12 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Per-ref group: a repush to the same train cancels its superseded run, while
+# a train push never cancels an in-flight master run (a shared group would).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   # secrets are not readable inside step `if` expressions, so the presence
