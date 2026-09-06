@@ -54,7 +54,10 @@ pub mod owned_decode_sidecar;
 mod remote;
 mod rollback;
 mod store;
-pub use store::RestoreImportReport;
+pub use store::{
+    maintenance_vacuum_count, RestoreImportReport, SynapseStore, SynapseStoreError,
+    RECLAIM_FREELIST_MIN_BYTES, RECLAIM_FREELIST_PAGE_RATIO_DIVISOR,
+};
 pub mod worker_host;
 
 use cortexkit_lease::{FileLeaseStore, LeaseHandle, LeaseKey, LeaseStore};
@@ -78,9 +81,8 @@ use store::{
     JobRecord, KnobAssignmentRow, ModelAssetLocator, ModelCatalogEntry,
     OwnedDecodeAdmissionEvaluation, OwnedDecodeAdmissionRefusal, OwnedDecodeCertificationRow,
     OwnedDecodeMatchInputs, PerfRow, ProbeWriteOutcome, RecommendedBatch, StorageHealthInputs,
-    StoredModelConfig, SynapseStore, SynapseStoreError, CERT_EVIDENCE_SCHEMA_REVISION,
-    JOB_STATE_DONE, JOB_STATE_FAILED_PERMANENT, JOB_STATE_FAILED_TRANSIENT,
-    JOB_STATE_PAUSED_NEEDS_REAUTH, JOB_STATE_QUEUED, JOB_STATE_RUNNING,
+    StoredModelConfig, CERT_EVIDENCE_SCHEMA_REVISION, JOB_STATE_DONE, JOB_STATE_FAILED_PERMANENT,
+    JOB_STATE_FAILED_TRANSIENT, JOB_STATE_PAUSED_NEEDS_REAUTH, JOB_STATE_QUEUED, JOB_STATE_RUNNING,
 };
 use subc_client_rs::{
     async_trait, build_provenance, BindDecision, HandlerOutcome, HealthReport, ModuleHandler,
@@ -13987,10 +13989,24 @@ async fn cache_gc(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         )
     };
     match result {
-        Ok(outcomes) => result_outcome(json!({
-            "module_generation": state.module_generation,
-            "outcomes": outcomes,
-        })),
+        Ok(outcomes) => {
+            let removed_any = outcomes
+                .iter()
+                .any(|outcome| matches!(outcome, CacheGcOutcome::Deleted { .. }));
+            if removed_any {
+                if let Err(error) = state.store.reclaim_freelist_if_needed() {
+                    tracing::warn!(
+                        target: "maintenance",
+                        error = %error,
+                        "reclaim freelist failed after cache gc sweep"
+                    );
+                }
+            }
+            result_outcome(json!({
+                "module_generation": state.module_generation,
+                "outcomes": outcomes,
+            }))
+        }
         Err(error) => result_outcome(error_payload(&state, cache_error_to_wire(error))),
     }
 }
@@ -15037,6 +15053,151 @@ mod tests {
         drop(state);
         drop(store);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn model_cache_gc_sweep_reclaims_store_freelist_when_blobs_deleted() {
+        let (root, descriptor) = test_storage_descriptor("gc-reclaim");
+        let store = Arc::new(SynapseStore::open(&descriptor).unwrap());
+        let profile = test_machine_profile("gc-reclaim-os");
+        store.observe_profile(&profile, 10, 1).unwrap();
+
+        // Seed store with > 64 MiB of data and then delete it to create freelist pages.
+        store
+            .store
+            .with_conn(|conn| {
+                conn.execute(
+                    "CREATE TABLE bloat_seed (id INTEGER PRIMARY KEY, data BLOB)",
+                    [],
+                )?;
+                let chunk = vec![0xfeu8; 1024 * 1024];
+                let mut stmt = conn.prepare("INSERT INTO bloat_seed (data) VALUES (?1)")?;
+                for _ in 0..66 {
+                    stmt.execute(rusqlite::params![&chunk])?;
+                }
+                drop(stmt);
+                conn.execute("DELETE FROM bloat_seed", [])?;
+                Ok(())
+            })
+            .unwrap();
+
+        let freelist_before = store.freelist_count().unwrap();
+        let page_count_before = store.page_count().unwrap();
+        let page_size = store.page_size().unwrap();
+        assert!(freelist_before * page_size >= RECLAIM_FREELIST_MIN_BYTES);
+        assert!(freelist_before >= page_count_before / RECLAIM_FREELIST_PAGE_RATIO_DIVISOR);
+
+        let cache_root = std::env::temp_dir().join(format!(
+            "synapse-test-cache-gc-{}-{}",
+            std::process::id(),
+            TEST_STATE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let model_cache = Arc::new(ModelCache::new(&cache_root));
+        std::fs::create_dir_all(&cache_root).unwrap();
+        let blob_source = cache_root.join("test-blob.bin");
+        std::fs::write(&blob_source, b"test-model-artifact-payload").unwrap();
+        let meta = model_cache
+            .ingest(synapse_core::ModelCacheIngest {
+                source_url: format!("file://{}", blob_source.display()),
+                expected_digest: None,
+                format: "bin".to_string(),
+                tokenizer_path: None,
+                pin_module_id: None,
+            })
+            .expect("ingest test artifact into model cache");
+
+        let (machine_profile_hash, revisioned_machine_profile_hash) =
+            module_state_machine_profile_hashes(&profile);
+        let profile_activation_epoch = store
+            .profile_state()
+            .expect("test profile state reads")
+            .profile_activation_epoch
+            .expect("test profile is activated");
+        let runtime = Arc::new(
+            RuntimeState::from_catalog(ModuleConfig::default(), vec![stuck_model_spec()])
+                .expect("test runtime initializes"),
+        );
+        let remote_gateway = Arc::new(
+            RemoteGateway::new(
+                Arc::clone(&store),
+                Vec::new(),
+                Arc::new(SubcVaultCredentialClient::new(PathBuf::from("unused-subc"))),
+                machine_profile_hash.clone(),
+            )
+            .expect("empty remote gateway initializes"),
+        );
+        let continuity_check: Arc<dyn ContinuityCheck> = remote_gateway.continuity.clone();
+        let state = Arc::new(ModuleState {
+            module_id: "synapse-test".to_string(),
+            store: Arc::clone(&store),
+            module_generation: 1,
+            machine_profile: profile,
+            machine_profile_hash: machine_profile_hash.clone(),
+            legacy_machine_profile_hash: machine_profile_hash,
+            revisioned_machine_profile_hash,
+            profile_activation_epoch,
+            runtime,
+            model_cache,
+            continuity_check,
+            remote_gateway,
+        });
+
+        // An initial GC sweep with positive grace period places a tombstone on the artifact without deleting it.
+        let vacuum_count_before = maintenance_vacuum_count();
+        let outcome1 = cache_gc(
+            Arc::clone(&state),
+            json!({
+                "digest": meta.digest,
+                "grace_ms": 60_000
+            }),
+        )
+        .await;
+        let HandlerOutcome::Response(body1) = outcome1 else {
+            panic!("expected Response outcome from cache_gc");
+        };
+        let payload1: Value = serde_json::from_slice(&body1).expect("json response");
+        assert_eq!(payload1["result"]["outcomes"][0]["state"], "marked");
+        // No delete occurred, so store freelist remains un-vacuumed.
+        assert_eq!(store.freelist_count().unwrap(), freelist_before);
+        assert_eq!(maintenance_vacuum_count(), vacuum_count_before);
+
+        // A subsequent GC sweep after grace expiration deletes the tombstoned artifact.
+        let db_path = match &descriptor.backend {
+            StorageBackend::Sqlite { path } => PathBuf::from(path),
+            _ => unreachable!(),
+        };
+        let file_size_before = std::fs::metadata(&db_path).unwrap().len();
+
+        let outcome2 = cache_gc(
+            Arc::clone(&state),
+            json!({
+                "digest": meta.digest,
+                "grace_ms": 0
+            }),
+        )
+        .await;
+        let HandlerOutcome::Response(body2) = outcome2 else {
+            panic!("expected Response outcome from cache_gc");
+        };
+        let payload2: Value = serde_json::from_slice(&body2).expect("json response");
+        assert_eq!(payload2["result"]["outcomes"][0]["state"], "deleted");
+
+        // The GC sweep actually deleted tombstoned blobs, triggering guarded freelist reclaim!
+        let freelist_after = store.freelist_count().unwrap();
+        let file_size_after = std::fs::metadata(&db_path).unwrap().len();
+        let vacuum_count_after = maintenance_vacuum_count();
+
+        assert_eq!(freelist_after, 0);
+        assert!(
+            file_size_after < file_size_before / 10,
+            "expected file to shrink: before={file_size_before}, after={file_size_after}"
+        );
+        assert_eq!(vacuum_count_after, vacuum_count_before + 1);
+
+        drop(state);
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(cache_root);
     }
 
     #[tokio::test]
