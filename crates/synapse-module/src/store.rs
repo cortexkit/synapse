@@ -867,8 +867,8 @@ pub struct ModelCatalogEntry {
     pub dtype: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_class: Option<String>,
-    #[serde(default)]
-    pub certified: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certified: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warm_load_cost_hint_ms: Option<f64>,
 }
@@ -2367,6 +2367,11 @@ impl SynapseStore {
                     "ort" | "llama" => Some("cpu".to_string()),
                     _ => None,
                 };
+                let certified = if model.engine == "llama" && model.task == "generate" {
+                    None
+                } else {
+                    Some(false)
+                };
                 ModelCatalogEntry {
                     model_id: model.model_id,
                     state: "unloaded".to_string(),
@@ -2378,7 +2383,7 @@ impl SynapseStore {
                     dims: None,
                     dtype,
                     device_class,
-                    certified: false,
+                    certified,
                     warm_load_cost_hint_ms: None,
                 }
             })

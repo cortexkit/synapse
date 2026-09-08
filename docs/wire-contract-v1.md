@@ -136,9 +136,13 @@ The management registry in this snapshot is `embed.query`, `embed.batch`,
     reported by the loaded model or declared by a remote profile; omitted when unknown.
   - `dtype` (string, e.g. `"f16"`, `"f32"`, `"bf16"`) — numeric precision of the lane.
   - `device_class` (`"metal"` | `"ane"` | `"cpu"` | `"cuda"`) — execution device class.
-  - `certified` (boolean) — serving certification flag sourced directly from the serving
+  - `certified` (boolean, optional) — serving certification flag sourced directly from the serving
     admission predicate. A consumer will never see `certified: true` for a lane that would
-    refuse to serve due to missing or uncertified machine profile evidence.
+    refuse to serve due to missing or uncertified machine profile evidence. For lane classes
+    that have a certification concept (owned engines, embed and rerank lanes), this is `true`
+    only when verified evidence exists for the current machine profile, and `false` otherwise.
+    The field is omitted for lane classes that have no certification concept (such as legacy
+    worker-backed generate lanes).
   - `warm_load_cost_hint_ms` (float) — observed load duration hint in milliseconds,
     sourced from real measurements (such as observed load duration or benchmark probe
     data). This is an advisory hint, NOT a performance guarantee or upper bound; actual

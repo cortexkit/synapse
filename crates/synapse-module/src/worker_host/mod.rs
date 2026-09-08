@@ -1318,8 +1318,8 @@ impl WorkerEngine {
         host.model_info(&model.model_id)
     }
 
-    #[cfg(test)]
-    pub(crate) fn insert_loaded_model_for_test(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn insert_loaded_model_for_test(
         &self,
         model_id: String,
         dims: usize,

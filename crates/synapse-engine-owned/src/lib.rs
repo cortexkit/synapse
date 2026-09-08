@@ -253,7 +253,7 @@ impl OwnedMetalEmbedEngine {
         None
     }
 
-    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
     pub fn insert_test_model(
         &mut self,
         model_id: String,

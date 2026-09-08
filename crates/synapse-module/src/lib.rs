@@ -14127,34 +14127,41 @@ fn module_catalog_entries(state: &ModuleState) -> Vec<ModelCatalogEntry> {
                 })
                 .unwrap_or_else(|| spec.fingerprint.clone());
 
-            let certified = if spec.engine == DECODE_WORKER_ENGINE {
-                state
-                    .store
-                    .get_owned_decode_measurement_row(
-                        &state.revisioned_machine_profile_hash,
-                        state.profile_activation_epoch,
-                        &spec.model_id,
-                        &certification_fingerprint.0,
-                        CERT_EVIDENCE_SCHEMA_REVISION,
-                        &[],
-                    )
-                    .ok()
-                    .flatten()
-                    .is_some_and(|row| row.status == CertificationStatus::Certified)
-            } else if let Some(class) = certification_class_for_task(&spec.task) {
-                state
-                    .store
-                    .get_cert_row(
-                        class,
-                        &state.machine_profile_hash,
-                        &certification_fingerprint,
-                    )
-                    .ok()
-                    .flatten()
-                    .is_some()
-            } else {
-                spec.task == "generate"
-            };
+            let certified =
+                if spec.engine == DECODE_WORKER_ENGINE || spec.engine == "owned-metal-decode" {
+                    let has_cert = state
+                        .store
+                        .get_owned_decode_measurement_row(
+                            &state.revisioned_machine_profile_hash,
+                            state.profile_activation_epoch,
+                            &spec.model_id,
+                            &certification_fingerprint.0,
+                            CERT_EVIDENCE_SCHEMA_REVISION,
+                            &[],
+                        )
+                        .ok()
+                        .flatten()
+                        .is_some_and(|row| row.status == CertificationStatus::Certified);
+                    Some(has_cert)
+                } else if let Some(class) = certification_class_for_task(&spec.task) {
+                    let has_cert = state
+                        .store
+                        .get_cert_row(
+                            class,
+                            &state.machine_profile_hash,
+                            &certification_fingerprint,
+                        )
+                        .ok()
+                        .flatten()
+                        .is_some();
+                    Some(has_cert)
+                } else if spec.engine == "owned-metal" && spec.task == "generate" {
+                    Some(false)
+                } else {
+                    // Lane classes with no certification concept (such as worker-backed llama generate)
+                    // omit the field rather than fabricating true or false.
+                    None
+                };
 
             let warm_load_cost_hint_ms = last_cold_load_ms.or_else(|| {
                 state
@@ -16595,6 +16602,89 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn models_list_generate_lane_without_evidence_does_not_report_certified_true() {
+        let (_storage_dir, descriptor) = test_storage_descriptor("models-list-generate-uncert");
+        let store = Arc::new(SynapseStore::open(&descriptor).expect("open test store"));
+        let profile = test_machine_profile("test-os");
+        store
+            .activate_profile(&profile, 1, 1000)
+            .expect("activate profile");
+        let state = test_module_state(store, profile);
+
+        let mut llama_spec = stuck_model_spec();
+        llama_spec.model_id = "test-llama-generate".to_string();
+        llama_spec.engine = "llama".to_string();
+        llama_spec.task = "generate".to_string();
+
+        let mut decode_spec = stuck_model_spec();
+        decode_spec.model_id = "test-decode-generate".to_string();
+        decode_spec.engine = DECODE_WORKER_ENGINE.to_string();
+        decode_spec.task = "generate".to_string();
+
+        {
+            let mut catalog = state.runtime.catalog.lock().expect("catalog locks");
+            catalog.clear();
+            catalog.insert(
+                llama_spec.model_id.clone(),
+                ModelSlot {
+                    spec: llama_spec.clone(),
+                    loaded: None,
+                    state: ModelRuntimeState::Ready,
+                    notify: Arc::new(Notify::new()),
+                    last_cold_load_ms: None,
+                },
+            );
+            catalog.insert(
+                decode_spec.model_id.clone(),
+                ModelSlot {
+                    spec: decode_spec.clone(),
+                    loaded: None,
+                    state: ModelRuntimeState::Ready,
+                    notify: Arc::new(Notify::new()),
+                    last_cold_load_ms: None,
+                },
+            );
+        }
+
+        let snapshot = state
+            .store
+            .catalog_snapshot()
+            .expect("catalog snapshot reads");
+        let payload = models_list_payload(&state, snapshot);
+        let models = payload["models"]
+            .as_array()
+            .expect("models array in payload");
+
+        let llama_row = models
+            .iter()
+            .find(|r| r["model_id"] == "test-llama-generate")
+            .expect("llama row exists");
+        assert_ne!(
+            llama_row.get("certified"),
+            Some(&json!(true)),
+            "generate lane without evidence must not report certified=true"
+        );
+        assert!(
+            llama_row.get("certified").is_none(),
+            "legacy generate lane without certification concept must omit certified field"
+        );
+
+        let decode_row = models
+            .iter()
+            .find(|r| r["model_id"] == "test-decode-generate")
+            .expect("decode row exists");
+        assert_ne!(
+            decode_row.get("certified"),
+            Some(&json!(true)),
+            "uncertified decode lane must not report certified=true"
+        );
+        assert_eq!(
+            decode_row["certified"], false,
+            "uncertified decode lane must report certified=false"
+        );
     }
 }
 
