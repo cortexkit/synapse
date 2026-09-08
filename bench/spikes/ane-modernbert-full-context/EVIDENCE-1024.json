@@ -1,0 +1,127 @@
+{
+  "status": "stopped_at_1024_parity_failure",
+  "sequence_length": 1024,
+  "gate_min_cosine": 0.999,
+  "artifact_root": "/tmp/modernbert-full-context-m5/seq1024",
+  "digests": {
+    "model_combined_sha256": "324396e8d20bc40a0af9f258ecaa6278197055b8907be2c73c6840f784568538",
+    "model_safetensors_sha256": "3e85899d5728cb7de79781c0c3acfb91ccef9f875f1f7e0b3c9f3dd4b6a724ba",
+    "config_sha256": "8ba54dc3d35d7194f5178a4194b649f146753e02dabd22bdca5c5cbac15069ed",
+    "tokenizer_sha256": "6c8aaa9a542084f2457eab775d4eeb51f92a70c0fd9de28d5edb0ddec3c08d30",
+    "input_sha256": "631cb64de428c9e405ab1f4cfe61f07cab699565a900df560e6a060da964f48c",
+    "reference_sha256": "cd3471dc6aba56f60cf9c104337efdc7fa85131dd1f500a20921f23f00132af9",
+    "package_sha256": "d249c49778b2c9b15f1e1bb1f40ae09ab6ec0eb6e4cdd2ae3873ec477202ac27",
+    "diagnostic_reference_npz_sha256": "2c815a57e7a6e2b7af25c681171203455b76481abaaff5966fa6fd0d6c0e9fac",
+    "diagnostic_package_sha256": "3abb6f9243a7cbbef655a2d4e5231ab961a03b1bede419e7e788cd2bf398d555",
+    "toolchain_sha256": "4263ee6835e253f9ad946d9cb11ab38387e25505b6c28a43da39138dc75715a0"
+  },
+  "inputs": [
+    {"id": "full-context", "actual_token_count": 1024, "unique_active_token_ids": 120},
+    {"id": "multilingual", "actual_token_count": 64, "unique_active_token_ids": 60},
+    {"id": "partial-tile", "actual_token_count": 273, "unique_active_token_ids": 120}
+  ],
+  "cpu_full_model": {
+    "tiled_vs_huggingface_pooling": {
+      "min_cosine": 1.0,
+      "max_abs": 6.258487701416016e-7,
+      "mean_abs": 9.134895151419187e-8
+    },
+    "exported_vs_tiled_pooling": {"min_cosine": 1.0, "max_abs": 0.0, "mean_abs": 0.0},
+    "exported_vs_tiled_intermediate_checkpoints": {
+      "first_max_abs_over_1e-5": null,
+      "first_min_cosine_below_0.999": null
+    },
+    "active_sampled_positions_tiled_vs_huggingface": {
+      "minimum_cosine": 0.9999997615814209,
+      "first_checkpoint_below_0.999": null
+    },
+    "mask_and_rope": {
+      "global_mask_max_abs": 0.0,
+      "local_mask_max_abs": 0.0,
+      "rope_query_max_abs": 0.0,
+      "rope_key_max_abs": 0.0,
+      "dense_local_mask_allocated_only_for_1024_diagnostic": true
+    }
+  },
+  "export": {
+    "timing_s": {
+      "torch_export": 26.640561208012514,
+      "coreml_conversion": 41.0591667080007,
+      "package_save": 0.10886941599892452
+    },
+    "export_graph_sha256": "6ae3b99852037b016b60887afc8704d2402a02af7b3fdcaad7fce4baad8d202e",
+    "largest_attention_tensor": {"shape": [1, 1024, 1, 256], "numel": 262144},
+    "mil_largest_attention_output": {"operator": "einsum", "shape": [1, 1024, 1, 256], "numel": 262144},
+    "embedding_norm_mil": {"input_shape": [1, 1024, 768], "axes": [-1], "output_dtype": "float16"},
+    "sequence_square_attention_outputs": []
+  },
+  "coreml_cpu_and_ne": {
+    "status": "parity_failed",
+    "parity": {
+      "cosine_by_row": [0.9984976053237915, 0.9999022483825684, 0.998731255531311],
+      "min_cosine": 0.9984976053237915,
+      "max_abs": 0.007534056901931763,
+      "mean_abs": 0.0011350736021995544
+    },
+    "repeated_determinism_max_abs": 0.0,
+    "timing_s": {
+      "separate_process_load": 33.796195625007385,
+      "first_predict": 0.04753100001835264,
+      "warm_predict": 0.03461112501099706
+    },
+    "selected_intermediate_divergence_vs_tiled": {
+      "token_embeddings": {"max_abs": 0.0, "min_cosine": 0.9999999403953552},
+      "embeddings_norm": {"max_abs": 0.004452228546142578, "min_cosine": 0.9999998211860657},
+      "layer_0_output": {"max_abs": 0.058319091796875, "min_cosine": 0.9999927878379822},
+      "layer_16_attention_residual": {"max_abs": 115.982421875, "min_cosine": 0.9083670973777771, "reference_abs_max": 18396.017578125},
+      "final_norm": {"max_abs": 3.4922242164611816, "min_cosine": 0.7928977608680725}
+    },
+    "active_cls_first_checkpoint_below_0.999": {
+      "full-context": "layer_16.attention_residual",
+      "multilingual": null,
+      "partial-tile": "layer_16.attention_residual"
+    }
+  },
+  "coreml_cpu_only": {
+    "status": "parity_failed",
+    "parity": {
+      "cosine_by_row": [-0.18765494227409363, -0.17029939591884613, -0.1870286911725998],
+      "min_cosine": -0.18765494227409363,
+      "max_abs": 0.8979835510253906,
+      "mean_abs": 0.03553425148129463
+    },
+    "first_active_divergence": "embeddings_norm",
+    "token_embeddings": {"max_abs": 0.0, "min_cosine": 0.9999999403953552},
+    "embeddings_norm": {"max_abs": 1.4583861827850342, "min_cosine": 0.3606245517730713}
+  },
+  "placement": {
+    "evidence_kind": "MLComputePlan preferred placement; not a runtime dispatch trace",
+    "preferred_device_counts": {"cpu": 13, "neuralEngine": 11703, "unknown_constants": 18735},
+    "expensive_operator_device_counts": {
+      "conv": {"neuralEngine": 88},
+      "einsum": {"neuralEngine": 2112},
+      "layer_norm": {"neuralEngine": 45},
+      "softmax": {"neuralEngine": 1056}
+    },
+    "cpu_preferred_operator_counts": {
+      "greater_equal": 1,
+      "add": 1,
+      "select": 1,
+      "gather": 1,
+      "cast": 5,
+      "slice_by_index": 4
+    }
+  },
+  "memory_observations": {
+    "export": {"peak_owned_rss_bytes": 4203954176, "minimum_system_available_bytes": 54013952000, "minimum_system_free_bytes": 135086080, "maximum_system_wired_bytes": 8833318912},
+    "reload_cpu_and_ne": {"peak_owned_rss_bytes": 1067302912, "minimum_system_available_bytes": 54828220416, "minimum_system_free_bytes": 2356051968, "maximum_system_wired_bytes": 8757952512},
+    "placement": {"peak_owned_rss_bytes": 691306496, "minimum_system_available_bytes": 54760800256, "minimum_system_free_bytes": 1732247552, "maximum_system_wired_bytes": 8758788096}
+  },
+  "diagnosis": [
+    "Raw token embeddings are exact on both Core ML compute-unit modes. CPU_ONLY first diverges in embeddings_norm, before attention, despite the lowered MIL layer_norm using the intended final axis on [1,1024,768]; its final failure is a Core ML CPU execution-path problem, not evidence about tiled-attention mathematics.",
+    "CPU_AND_NE remains close through early layers, then active CLS crosses the 0.999 cosine gate at layer_16.attention_residual where the reference activation magnitude reaches 18396.017578125. This is consistent with accumulated float16/outlier sensitivity, but does not prove a hardware cause.",
+    "Independent mask and RoPE constructions match exactly at 1024. Eager query-tiled, streaming full-context, Hugging Face eager, and torch.export outputs pass CPU checks on the same three inputs.",
+    "The 1024 Core ML vector fails the fixed 0.999 minimum-cosine gate. No 4096 or 8192 result is accepted as feasibility evidence."
+  ],
+  "superseded_run_note": "An earlier driver revision incorrectly treated parity as a warning and started 2048/4096 before the stop policy was corrected. Those exact external logs are preserved but excluded from feasibility claims; the 4096 placement child was terminated and no 8192 stage started."
+}
