@@ -1,0 +1,462 @@
+[synapse-embed-profile] modernbert_plan batch=8 seq=64 plan_ms=18.338
+[synapse-embed-profile] modernbert_executable batch=8 seq=64 cached=0 select_ms=153.058
+[synapse-embed-profile] modernbert_execute batch=8 seq=64 execute_ms=32.665
+[synapse-embed-profile] modernbert_readback batch=8 seq=64 readback_ms=0.057 total_ms=227.585
+[synapse-embed-profile] modernbert_forward batch=8 seq=64 forward_ms=245.940
+[synapse-embed-profile] modernbert_embed_ids items=1 shape=8x64 total_ms=245.992
+[synapse-embed-profile] modernbert_plan batch=8 seq=96 plan_ms=17.454
+[synapse-embed-profile] modernbert_executable batch=8 seq=96 cached=0 select_ms=138.521
+[synapse-embed-profile] modernbert_execute batch=8 seq=96 execute_ms=19.716
+[synapse-embed-profile] modernbert_readback batch=8 seq=96 readback_ms=0.083 total_ms=176.151
+[synapse-embed-profile] modernbert_forward batch=8 seq=96 forward_ms=195.358
+[synapse-embed-profile] modernbert_embed_ids items=1 shape=8x96 total_ms=195.416
+[synapse-embed-profile] modernbert_plan batch=8 seq=128 plan_ms=17.528
+[synapse-embed-profile] modernbert_executable batch=8 seq=128 cached=0 select_ms=137.011
+[synapse-embed-profile] modernbert_execute batch=8 seq=128 execute_ms=26.195
+[synapse-embed-profile] modernbert_readback batch=8 seq=128 readback_ms=0.116 total_ms=181.357
+[synapse-embed-profile] modernbert_forward batch=8 seq=128 forward_ms=207.892
+[synapse-embed-profile] modernbert_embed_ids items=1 shape=8x128 total_ms=208.042
+[synapse-embed-profile] modernbert_plan batch=8 seq=160 plan_ms=18.733
+[synapse-embed-profile] modernbert_executable batch=8 seq=160 cached=0 select_ms=144.005
+[synapse-embed-profile] modernbert_execute batch=8 seq=160 execute_ms=30.787
+[synapse-embed-profile] modernbert_readback batch=8 seq=160 readback_ms=0.121 total_ms=194.157
+[synapse-embed-profile] modernbert_forward batch=8 seq=160 forward_ms=227.313
+[synapse-embed-profile] modernbert_embed_ids items=1 shape=8x160 total_ms=227.394
+[synapse-embed-profile] modernbert_plan batch=8 seq=192 plan_ms=16.798
+[synapse-embed-profile] modernbert_executable batch=8 seq=192 cached=0 select_ms=133.133
+[synapse-embed-profile] modernbert_execute batch=8 seq=192 execute_ms=34.256
+[synapse-embed-profile] modernbert_readback batch=8 seq=192 readback_ms=0.146 total_ms=185.284
+[synapse-embed-profile] modernbert_forward batch=8 seq=192 forward_ms=225.637
+[synapse-embed-profile] modernbert_embed_ids items=1 shape=8x192 total_ms=225.694
+[synapse-embed-profile] modernbert_plan batch=8 seq=256 plan_ms=17.470
+[synapse-embed-profile] modernbert_executable batch=8 seq=256 cached=0 select_ms=155.708
+[synapse-embed-profile] modernbert_execute batch=8 seq=256 execute_ms=42.998
+[synapse-embed-profile] modernbert_readback batch=8 seq=256 readback_ms=0.277 total_ms=220.798
+[synapse-embed-profile] modernbert_forward batch=8 seq=256 forward_ms=276.709
+[synapse-embed-profile] modernbert_embed_ids items=1 shape=8x256 total_ms=277.015
+[synapse-embed-profile] modernbert_plan batch=8 seq=320 plan_ms=17.025
+[synapse-embed-profile] modernbert_executable batch=8 seq=320 cached=0 select_ms=138.279
+[synapse-embed-profile] modernbert_execute batch=8 seq=320 execute_ms=54.201
+[synapse-embed-profile] modernbert_readback batch=8 seq=320 readback_ms=0.339 total_ms=210.807
+[synapse-embed-profile] modernbert_forward batch=8 seq=320 forward_ms=283.324
+[synapse-embed-profile] modernbert_embed_ids items=1 shape=8x320 total_ms=283.399
+[synapse-embed-profile] modernbert_plan batch=8 seq=384 plan_ms=18.179
+[synapse-embed-profile] modernbert_executable batch=8 seq=384 cached=0 select_ms=142.162
+[synapse-embed-profile] modernbert_execute batch=8 seq=384 execute_ms=65.711
+[synapse-embed-profile] modernbert_readback batch=8 seq=384 readback_ms=0.287 total_ms=227.583
+[synapse-embed-profile] modernbert_forward batch=8 seq=384 forward_ms=318.354
+[synapse-embed-profile] modernbert_embed_ids items=1 shape=8x384 total_ms=318.425
+[synapse-embed-profile] modernbert_plan batch=8 seq=448 plan_ms=17.495
+[synapse-embed-profile] modernbert_executable batch=8 seq=448 cached=0 select_ms=137.163
+[synapse-embed-profile] modernbert_execute batch=8 seq=448 execute_ms=76.974
+[synapse-embed-profile] modernbert_readback batch=8 seq=448 readback_ms=0.309 total_ms=233.376
+[synapse-embed-profile] modernbert_forward batch=8 seq=448 forward_ms=341.649
+[synapse-embed-profile] modernbert_embed_ids items=1 shape=8x448 total_ms=341.720
+[synapse-embed-profile] modernbert_plan batch=8 seq=512 plan_ms=16.027
+[synapse-embed-profile] modernbert_executable batch=8 seq=512 cached=0 select_ms=135.851
+[synapse-embed-profile] modernbert_execute batch=8 seq=512 execute_ms=93.549
+[synapse-embed-profile] modernbert_readback batch=8 seq=512 readback_ms=0.409 total_ms=247.629
+[synapse-embed-profile] modernbert_forward batch=8 seq=512 forward_ms=374.769
+[synapse-embed-profile] modernbert_embed_ids items=1 shape=8x512 total_ms=374.841
+[synapse-embed-profile] bucket_select call=1 items=1 max_tokens=511 shape=1x512 select_ms=0.001
+[synapse-embed-profile] modernbert_plan batch=1 seq=512 plan_ms=16.528
+[synapse-embed-profile] modernbert_executable batch=1 seq=512 cached=0 select_ms=127.351
+[synapse-embed-profile] modernbert_execute batch=1 seq=512 execute_ms=17.274
+[synapse-embed-profile] modernbert_readback batch=1 seq=512 readback_ms=0.052 total_ms=161.661
+[synapse-embed-profile] modernbert_forward batch=1 seq=512 forward_ms=177.101
+[synapse-embed-profile] modernbert_embed_ids items=1 shape=1x512 total_ms=177.163
+[synapse-embed-profile] family_return call=1 inference_ms=177.185
+[synapse-embed-profile] bucket_total items=1 bucket_calls=1 total_ms=177.232
+[synapse-embed-profile] bucket_select call=1 items=1 max_tokens=511 shape=1x512 select_ms=0.001
+[synapse-embed-profile] modernbert_plan batch=1 seq=512 plan_ms=0.018
+[synapse-embed-profile] modernbert_executable batch=1 seq=512 cached=1 select_ms=0.000
+[synapse-embed-profile] modernbert_execute batch=1 seq=512 execute_ms=14.291
+[synapse-embed-profile] modernbert_readback batch=1 seq=512 readback_ms=0.049 total_ms=14.830
+[synapse-embed-profile] modernbert_forward batch=1 seq=512 forward_ms=30.013
+[synapse-embed-profile] modernbert_embed_ids items=1 shape=1x512 total_ms=30.065
+[synapse-embed-profile] family_return call=1 inference_ms=30.084
+[synapse-embed-profile] bucket_total items=1 bucket_calls=1 total_ms=30.125
+[synapse-embed-profile] bucket_select call=1 items=1 max_tokens=511 shape=1x512 select_ms=0.001
+[synapse-embed-profile] modernbert_plan batch=1 seq=512 plan_ms=0.014
+[synapse-embed-profile] modernbert_executable batch=1 seq=512 cached=1 select_ms=0.000
+[synapse-embed-profile] modernbert_execute batch=1 seq=512 execute_ms=14.749
+[synapse-embed-profile] modernbert_readback batch=1 seq=512 readback_ms=0.055 total_ms=15.276
+[synapse-embed-profile] modernbert_forward batch=1 seq=512 forward_ms=30.346
+[synapse-embed-profile] modernbert_embed_ids items=1 shape=1x512 total_ms=30.394
+[synapse-embed-profile] family_return call=1 inference_ms=30.412
+[synapse-embed-profile] bucket_total items=1 bucket_calls=1 total_ms=30.459
+[synapse-embed-profile] bucket_select call=1 items=1 max_tokens=513 shape=1x768 select_ms=0.001
+[synapse-embed-profile] modernbert_plan batch=1 seq=768 plan_ms=16.433
+[synapse-embed-profile] modernbert_executable batch=1 seq=768 cached=0 select_ms=126.742
+[synapse-embed-profile] modernbert_execute batch=1 seq=768 execute_ms=22.571
+[synapse-embed-profile] modernbert_readback batch=1 seq=768 readback_ms=0.074 total_ms=166.503
+[synapse-embed-profile] modernbert_forward batch=1 seq=768 forward_ms=199.606
+[synapse-embed-profile] modernbert_embed_ids items=1 shape=1x768 total_ms=199.659
+[synapse-embed-profile] family_return call=1 inference_ms=199.680
+[synapse-embed-profile] bucket_total items=1 bucket_calls=1 total_ms=199.720
+[synapse-embed-profile] bucket_select call=1 items=1 max_tokens=513 shape=1x768 select_ms=0.001
+[synapse-embed-profile] modernbert_plan batch=1 seq=768 plan_ms=0.016
+[synapse-embed-profile] modernbert_executable batch=1 seq=768 cached=1 select_ms=0.000
+[synapse-embed-profile] modernbert_execute batch=1 seq=768 execute_ms=21.649
+[synapse-embed-profile] modernbert_readback batch=1 seq=768 readback_ms=0.073 total_ms=22.439
+[synapse-embed-profile] modernbert_forward batch=1 seq=768 forward_ms=47.915
+[synapse-embed-profile] modernbert_embed_ids items=1 shape=1x768 total_ms=47.967
+[synapse-embed-profile] family_return call=1 inference_ms=47.991
+[synapse-embed-profile] bucket_total items=1 bucket_calls=1 total_ms=48.032
+[synapse-embed-profile] bucket_select call=1 items=1 max_tokens=513 shape=1x768 select_ms=0.001
+[synapse-embed-profile] modernbert_plan batch=1 seq=768 plan_ms=0.016
+[synapse-embed-profile] modernbert_executable batch=1 seq=768 cached=1 select_ms=0.000
+[synapse-embed-profile] modernbert_execute batch=1 seq=768 execute_ms=21.841
+[synapse-embed-profile] modernbert_readback batch=1 seq=768 readback_ms=0.073 total_ms=22.622
+[synapse-embed-profile] modernbert_forward batch=1 seq=768 forward_ms=47.998
+[synapse-embed-profile] modernbert_embed_ids items=1 shape=1x768 total_ms=48.057
+[synapse-embed-profile] family_return call=1 inference_ms=48.079
+[synapse-embed-profile] bucket_total items=1 bucket_calls=1 total_ms=48.122
+[synapse-embed-profile] bucket_select call=1 items=1 max_tokens=603 shape=1x768 select_ms=0.001
+[synapse-embed-profile] modernbert_plan batch=1 seq=768 plan_ms=0.016
+[synapse-embed-profile] modernbert_executable batch=1 seq=768 cached=1 select_ms=0.000
+[synapse-embed-profile] modernbert_execute batch=1 seq=768 execute_ms=22.137
+[synapse-embed-profile] modernbert_readback batch=1 seq=768 readback_ms=0.072 total_ms=22.915
+[synapse-embed-profile] modernbert_forward batch=1 seq=768 forward_ms=48.299
+[synapse-embed-profile] modernbert_embed_ids items=1 shape=1x768 total_ms=48.348
+[synapse-embed-profile] family_return call=1 inference_ms=48.367
+[synapse-embed-profile] bucket_total items=1 bucket_calls=1 total_ms=48.412
+[synapse-embed-profile] bucket_select call=1 items=1 max_tokens=603 shape=1x768 select_ms=0.001
+[synapse-embed-profile] modernbert_plan batch=1 seq=768 plan_ms=0.013
+[synapse-embed-profile] modernbert_executable batch=1 seq=768 cached=1 select_ms=0.000
+[synapse-embed-profile] modernbert_execute batch=1 seq=768 execute_ms=22.079
+[synapse-embed-profile] modernbert_readback batch=1 seq=768 readback_ms=0.071 total_ms=22.906
+[synapse-embed-profile] modernbert_forward batch=1 seq=768 forward_ms=48.360
+[synapse-embed-profile] modernbert_embed_ids items=1 shape=1x768 total_ms=48.416
+[synapse-embed-profile] family_return call=1 inference_ms=48.436
+[synapse-embed-profile] bucket_total items=1 bucket_calls=1 total_ms=48.476
+[synapse-embed-profile] bucket_select call=1 items=1 max_tokens=603 shape=1x768 select_ms=0.001
+[synapse-embed-profile] modernbert_plan batch=1 seq=768 plan_ms=0.014
+[synapse-embed-profile] modernbert_executable batch=1 seq=768 cached=1 select_ms=0.000
+[synapse-embed-profile] modernbert_execute batch=1 seq=768 execute_ms=22.081
+[synapse-embed-profile] modernbert_readback batch=1 seq=768 readback_ms=0.075 total_ms=22.843
+[synapse-embed-profile] modernbert_forward batch=1 seq=768 forward_ms=48.283
+[synapse-embed-profile] modernbert_embed_ids items=1 shape=1x768 total_ms=48.339
+[synapse-embed-profile] family_return call=1 inference_ms=48.357
+[synapse-embed-profile] bucket_total items=1 bucket_calls=1 total_ms=48.398
+[synapse-embed-profile] bucket_select call=1 items=1 max_tokens=1203 shape=1x1536 select_ms=0.001
+[synapse-embed-profile] modernbert_plan batch=1 seq=1536 plan_ms=16.437
+[synapse-embed-profile] modernbert_executable batch=1 seq=1536 cached=0 select_ms=129.872
+[synapse-embed-profile] modernbert_execute batch=1 seq=1536 execute_ms=47.896
+[synapse-embed-profile] modernbert_readback batch=1 seq=1536 readback_ms=0.146 total_ms=196.242
+[synapse-embed-profile] modernbert_forward batch=1 seq=1536 forward_ms=290.926
+[synapse-embed-profile] modernbert_embed_ids items=1 shape=1x1536 total_ms=290.992
+[synapse-embed-profile] family_return call=1 inference_ms=291.013
+[synapse-embed-profile] bucket_total items=1 bucket_calls=1 total_ms=291.054
+[synapse-embed-profile] bucket_select call=1 items=1 max_tokens=1203 shape=1x1536 select_ms=0.001
+[synapse-embed-profile] modernbert_plan batch=1 seq=1536 plan_ms=0.014
+[synapse-embed-profile] modernbert_executable batch=1 seq=1536 cached=1 select_ms=0.000
+[synapse-embed-profile] modernbert_execute batch=1 seq=1536 execute_ms=46.629
+[synapse-embed-profile] modernbert_readback batch=1 seq=1536 readback_ms=0.151 total_ms=48.466
+[synapse-embed-profile] modernbert_forward batch=1 seq=1536 forward_ms=116.633
+[synapse-embed-profile] modernbert_embed_ids items=1 shape=1x1536 total_ms=116.697
+[synapse-embed-profile] family_return call=1 inference_ms=116.717
+[synapse-embed-profile] bucket_total items=1 bucket_calls=1 total_ms=116.758
+[synapse-embed-profile] bucket_select call=1 items=1 max_tokens=1203 shape=1x1536 select_ms=0.001
+[synapse-embed-profile] modernbert_plan batch=1 seq=1536 plan_ms=0.019
+[synapse-embed-profile] modernbert_executable batch=1 seq=1536 cached=1 select_ms=0.000
+[synapse-embed-profile] modernbert_execute batch=1 seq=1536 execute_ms=47.508
+[synapse-embed-profile] modernbert_readback batch=1 seq=1536 readback_ms=0.144 total_ms=49.498
+[synapse-embed-profile] modernbert_forward batch=1 seq=1536 forward_ms=117.735
+[synapse-embed-profile] modernbert_embed_ids items=1 shape=1x1536 total_ms=117.808
+[synapse-embed-profile] family_return call=1 inference_ms=117.828
+[synapse-embed-profile] bucket_total items=1 bucket_calls=1 total_ms=117.869
+[synapse-embed-profile] bucket_select call=1 items=1 max_tokens=2600 shape=1x3072 select_ms=0.002
+[synapse-embed-profile] modernbert_plan batch=1 seq=3072 plan_ms=16.184
+[synapse-embed-profile] modernbert_executable batch=1 seq=3072 cached=0 select_ms=128.855
+[synapse-embed-profile] modernbert_execute batch=1 seq=3072 execute_ms=160.902
+[synapse-embed-profile] modernbert_readback batch=1 seq=3072 readback_ms=0.292 total_ms=315.233
+[synapse-embed-profile] modernbert_forward batch=1 seq=3072 forward_ms=624.840
+[synapse-embed-profile] modernbert_embed_ids items=1 shape=1x3072 total_ms=624.932
+[synapse-embed-profile] family_return call=1 inference_ms=624.955
+[synapse-embed-profile] bucket_total items=1 bucket_calls=1 total_ms=625.002
+[synapse-embed-profile] bucket_select call=1 items=1 max_tokens=2600 shape=1x3072 select_ms=0.001
+[synapse-embed-profile] modernbert_plan batch=1 seq=3072 plan_ms=0.013
+[synapse-embed-profile] modernbert_executable batch=1 seq=3072 cached=1 select_ms=0.000
+[synapse-embed-profile] modernbert_execute batch=1 seq=3072 execute_ms=147.625
+[synapse-embed-profile] modernbert_readback batch=1 seq=3072 readback_ms=0.281 total_ms=153.666
+[synapse-embed-profile] modernbert_forward batch=1 seq=3072 forward_ms=359.478
+[synapse-embed-profile] modernbert_embed_ids items=1 shape=1x3072 total_ms=359.579
+[synapse-embed-profile] family_return call=1 inference_ms=359.601
+[synapse-embed-profile] bucket_total items=1 bucket_calls=1 total_ms=359.643
+[synapse-embed-profile] bucket_select call=1 items=1 max_tokens=2600 shape=1x3072 select_ms=0.001
+[synapse-embed-profile] modernbert_plan batch=1 seq=3072 plan_ms=0.013
+[synapse-embed-profile] modernbert_executable batch=1 seq=3072 cached=1 select_ms=0.000
+[synapse-embed-profile] modernbert_execute batch=1 seq=3072 execute_ms=149.554
+[synapse-embed-profile] modernbert_readback batch=1 seq=3072 readback_ms=0.292 total_ms=155.597
+[synapse-embed-profile] modernbert_forward batch=1 seq=3072 forward_ms=361.842
+[synapse-embed-profile] modernbert_embed_ids items=1 shape=1x3072 total_ms=361.934
+[synapse-embed-profile] family_return call=1 inference_ms=361.954
+[synapse-embed-profile] bucket_total items=1 bucket_calls=1 total_ms=361.995
+[synapse-embed-profile] bucket_select call=1 items=1 max_tokens=4096 shape=1x4096 select_ms=0.002
+[synapse-embed-profile] modernbert_plan batch=1 seq=4096 plan_ms=17.875
+[synapse-embed-profile] modernbert_executable batch=1 seq=4096 cached=0 select_ms=133.302
+[synapse-embed-profile] modernbert_execute batch=1 seq=4096 execute_ms=264.848
+[synapse-embed-profile] modernbert_readback batch=1 seq=4096 readback_ms=0.451 total_ms=436.873
+[synapse-embed-profile] modernbert_forward batch=1 seq=4096 forward_ms=958.485
+[synapse-embed-profile] modernbert_embed_ids items=1 shape=1x4096 total_ms=958.599
+[synapse-embed-profile] family_return call=1 inference_ms=958.674
+[synapse-embed-profile] bucket_total items=1 bucket_calls=1 total_ms=958.723
+[synapse-embed-profile] bucket_select call=1 items=1 max_tokens=4096 shape=1x4096 select_ms=0.001
+[synapse-embed-profile] modernbert_plan batch=1 seq=4096 plan_ms=0.019
+[synapse-embed-profile] modernbert_executable batch=1 seq=4096 cached=1 select_ms=0.000
+[synapse-embed-profile] modernbert_execute batch=1 seq=4096 execute_ms=263.642
+[synapse-embed-profile] modernbert_readback batch=1 seq=4096 readback_ms=0.410 total_ms=273.624
+[synapse-embed-profile] modernbert_forward batch=1 seq=4096 forward_ms=629.442
+[synapse-embed-profile] modernbert_embed_ids items=1 shape=1x4096 total_ms=629.560
+[synapse-embed-profile] family_return call=1 inference_ms=629.584
+[synapse-embed-profile] bucket_total items=1 bucket_calls=1 total_ms=629.630
+[synapse-embed-profile] bucket_select call=1 items=1 max_tokens=4096 shape=1x4096 select_ms=0.001
+[synapse-embed-profile] modernbert_plan batch=1 seq=4096 plan_ms=0.018
+[synapse-embed-profile] modernbert_executable batch=1 seq=4096 cached=1 select_ms=0.000
+[synapse-embed-profile] modernbert_execute batch=1 seq=4096 execute_ms=270.644
+[synapse-embed-profile] modernbert_readback batch=1 seq=4096 readback_ms=0.437 total_ms=282.001
+[synapse-embed-profile] modernbert_forward batch=1 seq=4096 forward_ms=658.076
+[synapse-embed-profile] modernbert_embed_ids items=1 shape=1x4096 total_ms=658.201
+[synapse-embed-profile] family_return call=1 inference_ms=658.222
+[synapse-embed-profile] bucket_total items=1 bucket_calls=1 total_ms=658.267
+[synapse-embed-profile] bucket_select call=1 items=8 max_tokens=131 shape=8x160 select_ms=0.001
+[synapse-embed-profile] modernbert_plan batch=8 seq=160 plan_ms=0.016
+[synapse-embed-profile] modernbert_executable batch=8 seq=160 cached=1 select_ms=0.000
+[synapse-embed-profile] modernbert_execute batch=8 seq=160 execute_ms=34.861
+[synapse-embed-profile] modernbert_readback batch=8 seq=160 readback_ms=0.158 total_ms=37.096
+[synapse-embed-profile] modernbert_forward batch=8 seq=160 forward_ms=73.400
+[synapse-embed-profile] modernbert_embed_ids items=8 shape=8x160 total_ms=73.534
+[synapse-embed-profile] family_return call=1 inference_ms=73.558
+[synapse-embed-profile] bucket_total items=8 bucket_calls=1 total_ms=73.610
+[synapse-embed-profile] bucket_select call=1 items=8 max_tokens=131 shape=8x160 select_ms=0.001
+[synapse-embed-profile] modernbert_plan batch=8 seq=160 plan_ms=0.015
+[synapse-embed-profile] modernbert_executable batch=8 seq=160 cached=1 select_ms=0.000
+[synapse-embed-profile] modernbert_execute batch=8 seq=160 execute_ms=34.954
+[synapse-embed-profile] modernbert_readback batch=8 seq=160 readback_ms=0.144 total_ms=35.645
+[synapse-embed-profile] modernbert_forward batch=8 seq=160 forward_ms=71.548
+[synapse-embed-profile] modernbert_embed_ids items=8 shape=8x160 total_ms=71.682
+[synapse-embed-profile] family_return call=1 inference_ms=71.704
+[synapse-embed-profile] bucket_total items=8 bucket_calls=1 total_ms=71.754
+[synapse-embed-profile] bucket_select call=1 items=8 max_tokens=131 shape=8x160 select_ms=0.001
+[synapse-embed-profile] modernbert_plan batch=8 seq=160 plan_ms=0.015
+[synapse-embed-profile] modernbert_executable batch=8 seq=160 cached=1 select_ms=0.000
+[synapse-embed-profile] modernbert_execute batch=8 seq=160 execute_ms=35.284
+[synapse-embed-profile] modernbert_readback batch=8 seq=160 readback_ms=0.133 total_ms=35.988
+[synapse-embed-profile] modernbert_forward batch=8 seq=160 forward_ms=71.551
+[synapse-embed-profile] modernbert_embed_ids items=8 shape=8x160 total_ms=71.677
+[synapse-embed-profile] family_return call=1 inference_ms=71.699
+[synapse-embed-profile] bucket_total items=8 bucket_calls=1 total_ms=71.747
+[synapse-embed-profile] bucket_select call=1 items=8 max_tokens=320 shape=8x320 select_ms=0.001
+[synapse-embed-profile] modernbert_plan batch=8 seq=320 plan_ms=0.016
+[synapse-embed-profile] modernbert_executable batch=8 seq=320 cached=1 select_ms=0.000
+[synapse-embed-profile] modernbert_execute batch=8 seq=320 execute_ms=66.880
+[synapse-embed-profile] modernbert_readback batch=8 seq=320 readback_ms=0.387 total_ms=68.423
+[synapse-embed-profile] modernbert_forward batch=8 seq=320 forward_ms=145.503
+[synapse-embed-profile] modernbert_embed_ids items=8 shape=8x320 total_ms=145.710
+[synapse-embed-profile] family_return call=1 inference_ms=145.736
+[synapse-embed-profile] bucket_total items=8 bucket_calls=1 total_ms=145.790
+[synapse-embed-profile] bucket_select call=1 items=8 max_tokens=320 shape=8x320 select_ms=0.001
+[synapse-embed-profile] modernbert_plan batch=8 seq=320 plan_ms=0.016
+[synapse-embed-profile] modernbert_executable batch=8 seq=320 cached=1 select_ms=0.000
+[synapse-embed-profile] modernbert_execute batch=8 seq=320 execute_ms=67.973
+[synapse-embed-profile] modernbert_readback batch=8 seq=320 readback_ms=0.273 total_ms=69.374
+[synapse-embed-profile] modernbert_forward batch=8 seq=320 forward_ms=148.577
+[synapse-embed-profile] modernbert_embed_ids items=8 shape=8x320 total_ms=148.742
+[synapse-embed-profile] family_return call=1 inference_ms=148.764
+[synapse-embed-profile] bucket_total items=8 bucket_calls=1 total_ms=148.815
+[synapse-embed-profile] bucket_select call=1 items=8 max_tokens=320 shape=8x320 select_ms=0.002
+[synapse-embed-profile] modernbert_plan batch=8 seq=320 plan_ms=0.016
+[synapse-embed-profile] modernbert_executable batch=8 seq=320 cached=1 select_ms=0.000
+[synapse-embed-profile] modernbert_execute batch=8 seq=320 execute_ms=69.263
+[synapse-embed-profile] modernbert_readback batch=8 seq=320 readback_ms=0.266 total_ms=70.641
+[synapse-embed-profile] modernbert_forward batch=8 seq=320 forward_ms=146.784
+[synapse-embed-profile] modernbert_embed_ids items=8 shape=8x320 total_ms=146.939
+[synapse-embed-profile] family_return call=1 inference_ms=146.960
+[synapse-embed-profile] bucket_total items=8 bucket_calls=1 total_ms=147.011
+[synapse-embed-profile] bucket_select call=1 items=8 max_tokens=448 shape=8x448 select_ms=0.008
+[synapse-embed-profile] modernbert_plan batch=8 seq=448 plan_ms=0.018
+[synapse-embed-profile] modernbert_executable batch=8 seq=448 cached=1 select_ms=0.001
+[synapse-embed-profile] modernbert_execute batch=8 seq=448 execute_ms=102.889
+[synapse-embed-profile] modernbert_readback batch=8 seq=448 readback_ms=0.379 total_ms=104.862
+[synapse-embed-profile] modernbert_forward batch=8 seq=448 forward_ms=220.715
+[synapse-embed-profile] modernbert_embed_ids items=8 shape=8x448 total_ms=220.888
+[synapse-embed-profile] family_return call=1 inference_ms=220.911
+[synapse-embed-profile] bucket_total items=8 bucket_calls=1 total_ms=220.973
+[synapse-embed-profile] bucket_select call=1 items=8 max_tokens=448 shape=8x448 select_ms=0.001
+[synapse-embed-profile] modernbert_plan batch=8 seq=448 plan_ms=0.015
+[synapse-embed-profile] modernbert_executable batch=8 seq=448 cached=1 select_ms=0.000
+[synapse-embed-profile] modernbert_execute batch=8 seq=448 execute_ms=102.958
+[synapse-embed-profile] modernbert_readback batch=8 seq=448 readback_ms=0.360 total_ms=104.932
+[synapse-embed-profile] modernbert_forward batch=8 seq=448 forward_ms=217.756
+[synapse-embed-profile] modernbert_embed_ids items=8 shape=8x448 total_ms=217.928
+[synapse-embed-profile] family_return call=1 inference_ms=217.950
+[synapse-embed-profile] bucket_total items=8 bucket_calls=1 total_ms=218.001
+[synapse-embed-profile] bucket_select call=1 items=8 max_tokens=448 shape=8x448 select_ms=0.002
+[synapse-embed-profile] modernbert_plan batch=8 seq=448 plan_ms=0.015
+[synapse-embed-profile] modernbert_executable batch=8 seq=448 cached=1 select_ms=0.001
+[synapse-embed-profile] modernbert_execute batch=8 seq=448 execute_ms=100.843
+[synapse-embed-profile] modernbert_readback batch=8 seq=448 readback_ms=0.563 total_ms=103.233
+[synapse-embed-profile] modernbert_forward batch=8 seq=448 forward_ms=212.491
+[synapse-embed-profile] modernbert_embed_ids items=8 shape=8x448 total_ms=212.662
+[synapse-embed-profile] family_return call=1 inference_ms=212.686
+[synapse-embed-profile] bucket_total items=8 bucket_calls=1 total_ms=212.733
+[synapse-embed-profile] bucket_select call=1 items=8 max_tokens=603 shape=8x768 select_ms=0.002
+[synapse-embed-profile] modernbert_plan batch=8 seq=768 plan_ms=19.054
+[synapse-embed-profile] modernbert_executable batch=8 seq=768 cached=0 select_ms=149.151
+[synapse-embed-profile] modernbert_execute batch=8 seq=768 execute_ms=176.922
+[synapse-embed-profile] modernbert_readback batch=8 seq=768 readback_ms=0.719 total_ms=349.418
+[synapse-embed-profile] modernbert_forward batch=8 seq=768 forward_ms=572.007
+[synapse-embed-profile] modernbert_embed_ids items=8 shape=8x768 total_ms=572.210
+[synapse-embed-profile] family_return call=1 inference_ms=574.414
+[synapse-embed-profile] bucket_total items=8 bucket_calls=1 total_ms=574.479
+[synapse-embed-profile] bucket_select call=1 items=8 max_tokens=603 shape=8x768 select_ms=0.002
+[synapse-embed-profile] modernbert_plan batch=8 seq=768 plan_ms=0.020
+[synapse-embed-profile] modernbert_executable batch=8 seq=768 cached=1 select_ms=0.000
+[synapse-embed-profile] modernbert_execute batch=8 seq=768 execute_ms=171.070
+[synapse-embed-profile] modernbert_readback batch=8 seq=768 readback_ms=0.640 total_ms=175.862
+[synapse-embed-profile] modernbert_forward batch=8 seq=768 forward_ms=386.905
+[synapse-embed-profile] modernbert_embed_ids items=8 shape=8x768 total_ms=387.101
+[synapse-embed-profile] family_return call=1 inference_ms=387.124
+[synapse-embed-profile] bucket_total items=8 bucket_calls=1 total_ms=387.174
+[synapse-embed-profile] bucket_select call=1 items=8 max_tokens=603 shape=8x768 select_ms=0.002
+[synapse-embed-profile] modernbert_plan batch=8 seq=768 plan_ms=0.016
+[synapse-embed-profile] modernbert_executable batch=8 seq=768 cached=1 select_ms=0.000
+[synapse-embed-profile] modernbert_execute batch=8 seq=768 execute_ms=176.924
+[synapse-embed-profile] modernbert_readback batch=8 seq=768 readback_ms=0.601 total_ms=181.589
+[synapse-embed-profile] modernbert_forward batch=8 seq=768 forward_ms=396.924
+[synapse-embed-profile] modernbert_embed_ids items=8 shape=8x768 total_ms=397.108
+[synapse-embed-profile] family_return call=1 inference_ms=397.133
+[synapse-embed-profile] bucket_total items=8 bucket_calls=1 total_ms=397.179
+[synapse-embed-profile] bucket_select call=1 items=8 max_tokens=1203 shape=8x1536 select_ms=0.005
+[synapse-embed-profile] modernbert_plan batch=8 seq=1536 plan_ms=17.500
+[synapse-embed-profile] modernbert_executable batch=8 seq=1536 cached=0 select_ms=143.181
+[synapse-embed-profile] modernbert_execute batch=8 seq=1536 execute_ms=358.368
+[synapse-embed-profile] modernbert_readback batch=8 seq=1536 readback_ms=1.299 total_ms=534.525
+[synapse-embed-profile] modernbert_forward batch=8 seq=1536 forward_ms=1137.580
+[synapse-embed-profile] modernbert_embed_ids items=8 shape=8x1536 total_ms=1140.230
+[synapse-embed-profile] family_return call=1 inference_ms=1140.318
+[synapse-embed-profile] bucket_total items=8 bucket_calls=1 total_ms=1140.372
+[synapse-embed-profile] bucket_select call=1 items=8 max_tokens=1203 shape=8x1536 select_ms=0.003
+[synapse-embed-profile] modernbert_plan batch=8 seq=1536 plan_ms=0.020
+[synapse-embed-profile] modernbert_executable batch=8 seq=1536 cached=1 select_ms=0.000
+[synapse-embed-profile] modernbert_execute batch=8 seq=1536 execute_ms=368.606
+[synapse-embed-profile] modernbert_readback batch=8 seq=1536 readback_ms=1.206 total_ms=381.500
+[synapse-embed-profile] modernbert_forward batch=8 seq=1536 forward_ms=973.874
+[synapse-embed-profile] modernbert_embed_ids items=8 shape=8x1536 total_ms=974.198
+[synapse-embed-profile] family_return call=1 inference_ms=974.264
+[synapse-embed-profile] bucket_total items=8 bucket_calls=1 total_ms=974.348
+[synapse-embed-profile] bucket_select call=1 items=8 max_tokens=1203 shape=8x1536 select_ms=0.003
+[synapse-embed-profile] modernbert_plan batch=8 seq=1536 plan_ms=0.018
+[synapse-embed-profile] modernbert_executable batch=8 seq=1536 cached=1 select_ms=0.000
+[synapse-embed-profile] modernbert_execute batch=8 seq=1536 execute_ms=377.021
+[synapse-embed-profile] modernbert_readback batch=8 seq=1536 readback_ms=1.222 total_ms=390.080
+[synapse-embed-profile] modernbert_forward batch=8 seq=1536 forward_ms=986.362
+[synapse-embed-profile] modernbert_embed_ids items=8 shape=8x1536 total_ms=986.643
+[synapse-embed-profile] family_return call=1 inference_ms=986.669
+[synapse-embed-profile] bucket_total items=8 bucket_calls=1 total_ms=986.773
+[synapse-embed-profile] bucket_select call=1 items=7 max_tokens=2600 shape=7x3072 select_ms=0.008
+[synapse-embed-profile] modernbert_plan batch=7 seq=3072 plan_ms=16.542
+[synapse-embed-profile] modernbert_executable batch=7 seq=3072 cached=0 select_ms=136.574
+[synapse-embed-profile] modernbert_execute batch=7 seq=3072 execute_ms=1026.397
+[synapse-embed-profile] modernbert_readback batch=7 seq=3072 readback_ms=2.199 total_ms=1240.573
+[synapse-embed-profile] modernbert_forward batch=7 seq=3072 forward_ms=2751.634
+[synapse-embed-profile] modernbert_embed_ids items=7 shape=7x3072 total_ms=2752.024
+[synapse-embed-profile] family_return call=1 inference_ms=2752.148
+[synapse-embed-profile] bucket_total items=7 bucket_calls=1 total_ms=2752.204
+[synapse-embed-profile] bucket_select call=1 items=7 max_tokens=2600 shape=7x3072 select_ms=0.003
+[synapse-embed-profile] modernbert_plan batch=7 seq=3072 plan_ms=0.018
+[synapse-embed-profile] modernbert_executable batch=7 seq=3072 cached=1 select_ms=0.000
+[synapse-embed-profile] modernbert_execute batch=7 seq=3072 execute_ms=960.263
+[synapse-embed-profile] modernbert_readback batch=7 seq=3072 readback_ms=2.174 total_ms=1000.319
+[synapse-embed-profile] modernbert_forward batch=7 seq=3072 forward_ms=2452.918
+[synapse-embed-profile] modernbert_embed_ids items=7 shape=7x3072 total_ms=2453.308
+[synapse-embed-profile] family_return call=1 inference_ms=2453.329
+[synapse-embed-profile] bucket_total items=7 bucket_calls=1 total_ms=2453.376
+[synapse-embed-profile] bucket_select call=1 items=7 max_tokens=2600 shape=7x3072 select_ms=0.003
+[synapse-embed-profile] modernbert_plan batch=7 seq=3072 plan_ms=0.014
+[synapse-embed-profile] modernbert_executable batch=7 seq=3072 cached=1 select_ms=0.000
+[synapse-embed-profile] modernbert_execute batch=7 seq=3072 execute_ms=926.200
+[synapse-embed-profile] modernbert_readback batch=7 seq=3072 readback_ms=2.321 total_ms=965.092
+[synapse-embed-profile] modernbert_forward batch=7 seq=3072 forward_ms=2405.214
+[synapse-embed-profile] modernbert_embed_ids items=7 shape=7x3072 total_ms=2409.930
+[synapse-embed-profile] family_return call=1 inference_ms=2413.998
+[synapse-embed-profile] bucket_total items=7 bucket_calls=1 total_ms=2417.971
+[synapse-embed-profile] bucket_select call=1 items=4 max_tokens=4096 shape=4x4096 select_ms=0.016
+[synapse-embed-profile] modernbert_plan batch=4 seq=4096 plan_ms=16.084
+[synapse-embed-profile] modernbert_executable batch=4 seq=4096 cached=0 select_ms=134.325
+[synapse-embed-profile] modernbert_execute batch=4 seq=4096 execute_ms=782.440
+[synapse-embed-profile] modernbert_readback batch=4 seq=4096 readback_ms=1.568 total_ms=984.197
+[synapse-embed-profile] modernbert_forward batch=4 seq=4096 forward_ms=2383.977
+[synapse-embed-profile] modernbert_embed_ids items=4 shape=4x4096 total_ms=2384.322
+[synapse-embed-profile] family_return call=1 inference_ms=2384.388
+[synapse-embed-profile] bucket_total items=4 bucket_calls=1 total_ms=2387.996
+[synapse-embed-profile] bucket_select call=1 items=4 max_tokens=4096 shape=4x4096 select_ms=0.002
+[synapse-embed-profile] modernbert_plan batch=4 seq=4096 plan_ms=0.018
+[synapse-embed-profile] modernbert_executable batch=4 seq=4096 cached=1 select_ms=0.000
+[synapse-embed-profile] modernbert_execute batch=4 seq=4096 execute_ms=733.000
+[synapse-embed-profile] modernbert_readback batch=4 seq=4096 readback_ms=1.828 total_ms=774.627
+[synapse-embed-profile] modernbert_forward batch=4 seq=4096 forward_ms=2137.385
+[synapse-embed-profile] modernbert_embed_ids items=4 shape=4x4096 total_ms=2137.890
+[synapse-embed-profile] family_return call=1 inference_ms=2137.927
+[synapse-embed-profile] bucket_total items=4 bucket_calls=1 total_ms=2137.988
+[synapse-embed-profile] bucket_select call=1 items=4 max_tokens=4096 shape=4x4096 select_ms=0.004
+[synapse-embed-profile] modernbert_plan batch=4 seq=4096 plan_ms=0.016
+[synapse-embed-profile] modernbert_executable batch=4 seq=4096 cached=1 select_ms=0.000
+[synapse-embed-profile] modernbert_execute batch=4 seq=4096 execute_ms=870.604
+[synapse-embed-profile] modernbert_readback batch=4 seq=4096 readback_ms=1.854 total_ms=907.552
+[synapse-embed-profile] modernbert_forward batch=4 seq=4096 forward_ms=2305.432
+[synapse-embed-profile] modernbert_embed_ids items=4 shape=4x4096 total_ms=2305.783
+[synapse-embed-profile] family_return call=1 inference_ms=2305.810
+[synapse-embed-profile] bucket_total items=4 bucket_calls=1 total_ms=2305.928
+[synapse-embed-profile] bucket_select call=1 items=5 max_tokens=2600 shape=7x3072 select_ms=0.002
+[synapse-embed-profile] modernbert_plan batch=7 seq=3072 plan_ms=0.016
+[synapse-embed-profile] modernbert_executable batch=7 seq=3072 cached=1 select_ms=0.000
+[synapse-embed-profile] modernbert_execute batch=7 seq=3072 execute_ms=1010.047
+[synapse-embed-profile] modernbert_readback batch=7 seq=3072 readback_ms=2.202 total_ms=1049.175
+[synapse-embed-profile] modernbert_forward batch=7 seq=3072 forward_ms=2494.047
+[synapse-embed-profile] modernbert_embed_ids items=5 shape=7x3072 total_ms=2494.264
+[synapse-embed-profile] family_return call=1 inference_ms=2494.285
+[synapse-embed-profile] bucket_select call=2 items=1 max_tokens=4096 shape=1x4096 select_ms=0.003
+[synapse-embed-profile] modernbert_plan batch=1 seq=4096 plan_ms=0.016
+[synapse-embed-profile] modernbert_executable batch=1 seq=4096 cached=1 select_ms=0.000
+[synapse-embed-profile] modernbert_execute batch=1 seq=4096 execute_ms=276.150
+[synapse-embed-profile] modernbert_readback batch=1 seq=4096 readback_ms=0.374 total_ms=285.684
+[synapse-embed-profile] modernbert_forward batch=1 seq=4096 forward_ms=620.944
+[synapse-embed-profile] modernbert_embed_ids items=1 shape=1x4096 total_ms=621.061
+[synapse-embed-profile] family_return call=2 inference_ms=621.082
+[synapse-embed-profile] bucket_total items=6 bucket_calls=2 total_ms=3115.455
+[synapse-embed-profile] bucket_select call=1 items=5 max_tokens=2600 shape=7x3072 select_ms=0.002
+[synapse-embed-profile] modernbert_plan batch=7 seq=3072 plan_ms=0.023
+[synapse-embed-profile] modernbert_executable batch=7 seq=3072 cached=1 select_ms=0.000
+[synapse-embed-profile] modernbert_execute batch=7 seq=3072 execute_ms=1059.913
+[synapse-embed-profile] modernbert_readback batch=7 seq=3072 readback_ms=2.313 total_ms=1098.400
+[synapse-embed-profile] modernbert_forward batch=7 seq=3072 forward_ms=2546.074
+[synapse-embed-profile] modernbert_embed_ids items=5 shape=7x3072 total_ms=2546.274
+[synapse-embed-profile] family_return call=1 inference_ms=2546.294
+[synapse-embed-profile] bucket_select call=2 items=1 max_tokens=4096 shape=1x4096 select_ms=0.003
+[synapse-embed-profile] modernbert_plan batch=1 seq=4096 plan_ms=0.014
+[synapse-embed-profile] modernbert_executable batch=1 seq=4096 cached=1 select_ms=0.000
+[synapse-embed-profile] modernbert_execute batch=1 seq=4096 execute_ms=283.121
+[synapse-embed-profile] modernbert_readback batch=1 seq=4096 readback_ms=0.372 total_ms=292.849
+[synapse-embed-profile] modernbert_forward batch=1 seq=4096 forward_ms=631.723
+[synapse-embed-profile] modernbert_embed_ids items=1 shape=1x4096 total_ms=631.844
+[synapse-embed-profile] family_return call=2 inference_ms=631.869
+[synapse-embed-profile] bucket_total items=6 bucket_calls=2 total_ms=3178.246
+[synapse-embed-profile] bucket_select call=1 items=5 max_tokens=2600 shape=7x3072 select_ms=0.002
+[synapse-embed-profile] modernbert_plan batch=7 seq=3072 plan_ms=0.015
+[synapse-embed-profile] modernbert_executable batch=7 seq=3072 cached=1 select_ms=0.000
+[synapse-embed-profile] modernbert_execute batch=7 seq=3072 execute_ms=1101.919
+[synapse-embed-profile] modernbert_readback batch=7 seq=3072 readback_ms=2.212 total_ms=1143.391
+[synapse-embed-profile] modernbert_forward batch=7 seq=3072 forward_ms=2612.335
+[synapse-embed-profile] modernbert_embed_ids items=5 shape=7x3072 total_ms=2612.548
+[synapse-embed-profile] family_return call=1 inference_ms=2612.579
+[synapse-embed-profile] bucket_select call=2 items=1 max_tokens=4096 shape=1x4096 select_ms=0.004
+[synapse-embed-profile] modernbert_plan batch=1 seq=4096 plan_ms=0.016
+[synapse-embed-profile] modernbert_executable batch=1 seq=4096 cached=1 select_ms=0.000
+[synapse-embed-profile] modernbert_execute batch=1 seq=4096 execute_ms=285.911
+[synapse-embed-profile] modernbert_readback batch=1 seq=4096 readback_ms=0.396 total_ms=295.343
+[synapse-embed-profile] modernbert_forward batch=1 seq=4096 forward_ms=641.768
+[synapse-embed-profile] modernbert_embed_ids items=1 shape=1x4096 total_ms=641.975
+[synapse-embed-profile] family_return call=2 inference_ms=641.997
+[synapse-embed-profile] bucket_total items=6 bucket_calls=2 total_ms=3254.663

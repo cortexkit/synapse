@@ -41,9 +41,9 @@ pub const GRAPH_REVISION: u32 = 4;
 pub const BUCKET_POLICY_VERSION: u32 = 2;
 pub const DEFAULT_ATTENTION_UNITS: usize = 4_000_000;
 #[cfg(target_os = "macos")]
-const MAX_SEQUENCE_BUCKETS: usize = 16;
+const MAX_SEQUENCE_BUCKETS: usize = 18;
 #[cfg(target_os = "macos")]
-const MAX_CACHED_BUCKET_SHAPES: usize = 32;
+const MAX_CACHED_BUCKET_SHAPES: usize = 36;
 #[cfg(target_os = "macos")]
 const EMBED_PROFILE_ENV: &str = "SYNAPSE_EMBED_PROFILE";
 
@@ -308,10 +308,10 @@ impl OwnedMetalEmbedEngine {
         let preload_ids = vec![vec![policy
             .terminal_token_id
             .unwrap_or(policy.pad_token_id)]];
-        // Capacity graphs remain eager so filled batches never pay a serving-time
-        // compile. Singleton graphs compile on first use, limiting cold-load work
-        // while keeping the total set bounded to two row classes per sequence.
-        for &shape in &buckets {
+        // Preserve the established short-shape preload set. Long capacity graphs and
+        // singleton graphs compile on first use, avoiding cold-load and resident-plan
+        // growth for sequence lengths a process never serves.
+        for &shape in runtime::eager_shapes(&buckets) {
             family
                 .embed_batch(&mut provider, &preload_ids, Some(shape))
                 .map_err(|error| {
@@ -755,7 +755,16 @@ mod tests {
             minilm_f16.build_flags["graph_revision"],
             GRAPH_REVISION.to_string()
         );
-        assert_eq!(minilm_f16.build_flags["bucket_policy"], "v2");
+        for family in [
+            ModelFamily::MiniLm,
+            ModelFamily::GteModernBert,
+            ModelFamily::Qwen3,
+        ] {
+            assert_eq!(
+                engine_identity(family, family.recommended_dtype()).build_flags["bucket_policy"],
+                "v2"
+            );
+        }
     }
 
     #[test]

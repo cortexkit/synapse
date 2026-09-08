@@ -17,10 +17,11 @@ mod qwen3;
 pub(crate) const GRAPH_REVISION: u32 = 4;
 pub(crate) const BUCKET_POLICY_VERSION: u32 = 2;
 const BUCKET_MAX_BATCH_ROWS: usize = 8;
+const BUCKET_EAGER_SEQUENCE_LIMIT: usize = 512;
 // Above the smallest bucket, adjacent steps are at most 1.5x apart. This keeps
 // sequence padding bounded without multiplying every sequence by every row count.
 const BUCKET_SEQUENCE_LADDER: &[usize] = &[
-    64, 96, 128, 160, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192,
+    64, 96, 128, 160, 192, 256, 320, 384, 448, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192,
 ];
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -179,6 +180,14 @@ pub(crate) fn bucket_shapes(max_length: usize, attention_units: usize) -> Vec<Ba
 
 pub(crate) fn covering_bucket(length: usize, buckets: &[BatchShape]) -> Option<BatchShape> {
     buckets.iter().copied().find(|shape| shape.seq >= length)
+}
+
+pub(crate) fn eager_shapes(buckets: &[BatchShape]) -> &[BatchShape] {
+    let count = buckets
+        .iter()
+        .take_while(|shape| shape.seq <= BUCKET_EAGER_SEQUENCE_LIMIT)
+        .count();
+    &buckets[..count]
 }
 
 pub(crate) fn cache_shapes(buckets: &[BatchShape]) -> Vec<BatchShape> {
@@ -2014,7 +2023,14 @@ mod bucket_policy_tests {
             buckets.iter().map(|shape| shape.seq).collect::<Vec<_>>(),
             BUCKET_SEQUENCE_LADDER
         );
-        assert_eq!(buckets.len(), 16);
+        assert_eq!(buckets.len(), 18);
+        assert_eq!(
+            eager_shapes(&buckets)
+                .iter()
+                .map(|shape| shape.seq)
+                .collect::<Vec<_>>(),
+            vec![64, 96, 128, 160, 192, 256, 320, 384, 448, 512]
+        );
 
         for length in 65..=FULL_CONTEXT {
             let shape = covering_bucket(length, &buckets).expect("length must be covered");
@@ -2058,12 +2074,20 @@ mod bucket_policy_tests {
     }
 
     #[test]
-    fn policy_v2_keeps_short_full_batches_on_capacity_graphs() {
+    fn policy_v2_keeps_existing_short_full_batches_on_capacity_graphs() {
         let buckets = bucket_shapes(FULL_CONTEXT, FULL_CONTEXT_ATTENTION_UNITS);
-        let plans = plan_batches(&[131; 8], &buckets).expect("short batch must be covered");
-        assert_eq!(plans.len(), 1);
-        assert_eq!(plans[0].indices, (0..8).collect::<Vec<_>>());
-        assert_eq!(plans[0].shape, BatchShape { batch: 8, seq: 160 });
+        for (length, expected_seq) in [(131, 160), (320, 320), (448, 448)] {
+            let plans = plan_batches(&[length; 8], &buckets).expect("short batch must be covered");
+            assert_eq!(plans.len(), 1);
+            assert_eq!(plans[0].indices, (0..8).collect::<Vec<_>>());
+            assert_eq!(
+                plans[0].shape,
+                BatchShape {
+                    batch: 8,
+                    seq: expected_seq
+                }
+            );
+        }
     }
 
     #[test]
@@ -2095,7 +2119,7 @@ mod bucket_policy_tests {
             BUCKET_MAX_BATCH_ROWS * FULL_CONTEXT_ATTENTION_UNITS,
         );
         let shapes = cache_shapes(&buckets);
-        assert_eq!(shapes.len(), 32);
+        assert_eq!(shapes.len(), 36);
         for bucket in buckets {
             assert!(shapes.contains(&BatchShape {
                 batch: 1,
@@ -2106,7 +2130,7 @@ mod bucket_policy_tests {
     }
 
     #[test]
-    fn over_budget_singleton_is_not_claimed_as_admissible() {
+    fn bucket_builder_omits_shape_that_public_load_rejects_as_over_budget() {
         let buckets = bucket_shapes(FULL_CONTEXT, FULL_CONTEXT_ATTENTION_UNITS - 1);
         assert_eq!(covering_bucket(FULL_CONTEXT, &buckets), None);
         assert_eq!(plan_batches(&[FULL_CONTEXT], &buckets), Err(FULL_CONTEXT));

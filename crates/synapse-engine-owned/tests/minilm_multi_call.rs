@@ -61,8 +61,8 @@ fn minilm_reuses_precompiled_packages_across_calls() {
         .expect("load owned-metal MiniLM");
     let compiled_count = package_count(&cache);
     assert_eq!(
-        compiled_count, 8,
-        "bucket policy v2 eagerly compiles one capacity graph per sequence bucket"
+        compiled_count, 10,
+        "bucket policy v2 preserves ten eager short-sequence capacity graphs"
     );
 
     let mut tokenizer = Tokenizer::from_file(&tokenizer_path).expect("load tokenizer");

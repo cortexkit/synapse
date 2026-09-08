@@ -1,0 +1,303 @@
+{
+  "baseline_metadata": {
+    "family": "gte-modernbert",
+    "dtype": "f16",
+    "model_config_sha256": "8ba54dc3d35d7194f5178a4194b649f146753e02dabd22bdca5c5cbac15069ed",
+    "max_tokens": 8192,
+    "attention_units": 67108864,
+    "execution": "explicit",
+    "bucket_policy_version": 1,
+    "engine_identity": {
+      "engine": "owned-metal",
+      "version": "owned-metal-v1",
+      "build_flags": {
+        "backend": "metal-mpsgraph",
+        "bucket_policy": "v1",
+        "dtype": "f16",
+        "family": "gte-modernbert",
+        "graph_revision": "4",
+        "risk_class": "abort_safe"
+      }
+    },
+    "input_token_id": 1,
+    "warmup_runs_per_case": 1,
+    "measured_repeats_per_case": 7,
+    "case_order": [
+      "filled-131",
+      "filled-320",
+      "filled-448"
+    ]
+  },
+  "candidate_metadata": {
+    "family": "gte-modernbert",
+    "dtype": "f16",
+    "model_config_sha256": "8ba54dc3d35d7194f5178a4194b649f146753e02dabd22bdca5c5cbac15069ed",
+    "max_tokens": 8192,
+    "attention_units": 67108864,
+    "execution": "explicit",
+    "bucket_policy_version": 2,
+    "engine_identity": {
+      "engine": "owned-metal",
+      "version": "owned-metal-v1",
+      "build_flags": {
+        "backend": "metal-mpsgraph",
+        "bucket_policy": "v2",
+        "dtype": "f16",
+        "family": "gte-modernbert",
+        "graph_revision": "4",
+        "risk_class": "abort_safe"
+      }
+    },
+    "input_token_id": 1,
+    "warmup_runs_per_case": 1,
+    "measured_repeats_per_case": 7,
+    "case_order": [
+      "filled-131",
+      "filled-320",
+      "filled-448"
+    ]
+  },
+  "cold_load_s": {
+    "baseline": 16.512406209,
+    "candidate": 13.709516167
+  },
+  "cases": [
+    {
+      "name": "filled-131",
+      "baseline": {
+        "shapes": [
+          {
+            "items": 8,
+            "max_tokens": 131,
+            "batch": 8,
+            "seq": 160
+          }
+        ],
+        "real_tokens": 1048,
+        "padded_tokens": 1280,
+        "padding_ratio_padded_over_real": 1.2213740458015268,
+        "padding_waste_fraction": 0.18125,
+        "first_use_engine_wall_s": 0.081276,
+        "warm_engine_wall_s": [
+          0.080253125,
+          0.08058225,
+          0.080496291,
+          0.079455333,
+          0.083290417,
+          0.077659541,
+          0.076700167
+        ],
+        "mean_warm_engine_wall_s": 0.079776732,
+        "real_tokens_per_s": [
+          13058.68151551731,
+          13005.345470001148,
+          13019.233395486508,
+          13189.800614138763,
+          12582.479926832399,
+          13494.80033625231,
+          13663.59476114309
+        ],
+        "mean_real_tokens_per_s": 13144.848002767363
+      },
+      "candidate": {
+        "shapes": [
+          {
+            "items": 8,
+            "max_tokens": 131,
+            "batch": 8,
+            "seq": 160
+          }
+        ],
+        "real_tokens": 1048,
+        "padded_tokens": 1280,
+        "padding_ratio_padded_over_real": 1.2213740458015268,
+        "padding_waste_fraction": 0.18125,
+        "first_use_engine_wall_s": 0.06154,
+        "warm_engine_wall_s": [
+          0.060973208,
+          0.060496458,
+          0.060900834,
+          0.062586875,
+          0.062108,
+          0.061151084,
+          0.060935917
+        ],
+        "mean_warm_engine_wall_s": 0.06130748228571429,
+        "real_tokens_per_s": [
+          17187.877009849966,
+          17323.328251713512,
+          17208.30292734579,
+          16744.72483248285,
+          16873.832678559927,
+          17137.880989975583,
+          17198.39548816505
+        ],
+        "mean_real_tokens_per_s": 17096.334596870383
+      },
+      "candidate_speedup_real_tokens_per_s": 1.300611052579012,
+      "vector_comparison": {
+        "exact_vectors": true,
+        "max_abs_diff": 0.0,
+        "min_cosine": 1.0
+      }
+    },
+    {
+      "name": "filled-320",
+      "baseline": {
+        "shapes": [
+          {
+            "items": 8,
+            "max_tokens": 320,
+            "batch": 8,
+            "seq": 320
+          }
+        ],
+        "real_tokens": 2560,
+        "padded_tokens": 2560,
+        "padding_ratio_padded_over_real": 1.0,
+        "padding_waste_fraction": 0.0,
+        "first_use_engine_wall_s": 0.159137,
+        "warm_engine_wall_s": [
+          0.15669475,
+          0.15467675,
+          0.153978417,
+          0.155713208,
+          0.153195917,
+          0.152743083,
+          0.151464167
+        ],
+        "mean_warm_engine_wall_s": 0.15406661314285716,
+        "real_tokens_per_s": [
+          16337.496948685262,
+          16550.645135742765,
+          16625.70670537547,
+          16440.48075870353,
+          16710.62812986067,
+          16760.169755117488,
+          16901.687380619864
+        ],
+        "mean_real_tokens_per_s": 16618.116402015006
+      },
+      "candidate": {
+        "shapes": [
+          {
+            "items": 8,
+            "max_tokens": 320,
+            "batch": 8,
+            "seq": 320
+          }
+        ],
+        "real_tokens": 2560,
+        "padded_tokens": 2560,
+        "padding_ratio_padded_over_real": 1.0,
+        "padding_waste_fraction": 0.0,
+        "first_use_engine_wall_s": 0.12645099999999998,
+        "warm_engine_wall_s": [
+          0.125154,
+          0.124218208,
+          0.125390333,
+          0.125492167,
+          0.126756583,
+          0.125693416,
+          0.125492667
+        ],
+        "mean_warm_engine_wall_s": 0.1254567677142857,
+        "real_tokens_per_s": [
+          20454.799686785882,
+          20608.8949536287,
+          20416.24692072554,
+          20399.679607094524,
+          20196.189731621274,
+          20367.0174736917,
+          20399.59832872147
+        ],
+        "mean_real_tokens_per_s": 20406.060957467012
+      },
+      "candidate_speedup_real_tokens_per_s": 1.2279406681128255,
+      "vector_comparison": {
+        "exact_vectors": true,
+        "max_abs_diff": 0.0,
+        "min_cosine": 1.0
+      }
+    },
+    {
+      "name": "filled-448",
+      "baseline": {
+        "shapes": [
+          {
+            "items": 8,
+            "max_tokens": 448,
+            "batch": 8,
+            "seq": 448
+          }
+        ],
+        "real_tokens": 3584,
+        "padded_tokens": 3584,
+        "padding_ratio_padded_over_real": 1.0,
+        "padding_waste_fraction": 0.0,
+        "first_use_engine_wall_s": 0.227761,
+        "warm_engine_wall_s": [
+          0.217920333,
+          0.220346417,
+          0.211708125,
+          0.211108084,
+          0.210405084,
+          0.206887917,
+          0.209295416
+        ],
+        "mean_warm_engine_wall_s": 0.21252448228571427,
+        "real_tokens_per_s": [
+          16446.37721804509,
+          16265.297383982423,
+          16928.967652989228,
+          16977.08553879917,
+          17033.808935909554,
+          17323.389649672,
+          17124.120864644257
+        ],
+        "mean_real_tokens_per_s": 16871.29246343453
+      },
+      "candidate": {
+        "shapes": [
+          {
+            "items": 8,
+            "max_tokens": 448,
+            "batch": 8,
+            "seq": 448
+          }
+        ],
+        "real_tokens": 3584,
+        "padded_tokens": 3584,
+        "padding_ratio_padded_over_real": 1.0,
+        "padding_waste_fraction": 0.0,
+        "first_use_engine_wall_s": 0.186804,
+        "warm_engine_wall_s": [
+          0.184372333,
+          0.187786167,
+          0.187010625,
+          0.187372458,
+          0.188029125,
+          0.192853375,
+          0.197452333
+        ],
+        "mean_warm_engine_wall_s": 0.18926805942857144,
+        "real_tokens_per_s": [
+          19438.925253497768,
+          19085.53786073071,
+          19164.68649842756,
+          19127.67777215155,
+          19060.876872133507,
+          18584.06678130471,
+          18151.21627354993
+        ],
+        "mean_real_tokens_per_s": 18944.71247311368
+      },
+      "candidate_speedup_real_tokens_per_s": 1.1228963349531704,
+      "vector_comparison": {
+        "exact_vectors": true,
+        "max_abs_diff": 0.0,
+        "min_cosine": 1.0
+      }
+    }
+  ]
+}
