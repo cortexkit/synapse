@@ -38,8 +38,12 @@ pub const ENGINE_VERSION: &str = "owned-metal-v1";
 // identity, so raising it invalidates stale cached executables that still encode the old
 // graph and moves the provenance fingerprint to match the new one.
 pub const GRAPH_REVISION: u32 = 4;
-pub const BUCKET_POLICY_VERSION: u32 = 1;
+pub const BUCKET_POLICY_VERSION: u32 = 2;
 pub const DEFAULT_ATTENTION_UNITS: usize = 4_000_000;
+#[cfg(target_os = "macos")]
+const MAX_SEQUENCE_BUCKETS: usize = 16;
+#[cfg(target_os = "macos")]
+const MAX_CACHED_BUCKET_SHAPES: usize = 32;
 #[cfg(target_os = "macos")]
 const EMBED_PROFILE_ENV: &str = "SYNAPSE_EMBED_PROFILE";
 
@@ -285,10 +289,17 @@ impl OwnedMetalEmbedEngine {
             terminal_token_id: policy.terminal_token_id,
         };
         let buckets = runtime::bucket_shapes(max_length, attention_units);
-        if buckets.len() > 12 {
+        if buckets.len() > MAX_SEQUENCE_BUCKETS {
             return Err(Self::error(
                 EngineErrorStage::Load,
-                format!("bucket policy produced {} shapes", buckets.len()),
+                format!("bucket policy produced {} sequence buckets", buckets.len()),
+            ));
+        }
+        let cache_shapes = runtime::cache_shapes(&buckets);
+        if cache_shapes.len() > MAX_CACHED_BUCKET_SHAPES {
+            return Err(Self::error(
+                EngineErrorStage::Load,
+                format!("bucket policy produced {} cache shapes", cache_shapes.len()),
             ));
         }
         let mut provider =
@@ -297,6 +308,9 @@ impl OwnedMetalEmbedEngine {
         let preload_ids = vec![vec![policy
             .terminal_token_id
             .unwrap_or(policy.pad_token_id)]];
+        // Capacity graphs remain eager so filled batches never pay a serving-time
+        // compile. Singleton graphs compile on first use, limiting cold-load work
+        // while keeping the total set bounded to two row classes per sequence.
         for &shape in &buckets {
             family
                 .embed_batch(&mut provider, &preload_ids, Some(shape))
@@ -547,32 +561,20 @@ fn run_bucketed(loaded: &mut OwnedLoadedModel, batch: TokenBatch) -> Result<Vect
             }
         }
     }
-    let mut order = (0..batch.items.len()).collect::<Vec<_>>();
-    order.sort_by_key(|&index| batch.items[index].len());
+    let lengths = batch.items.iter().map(Vec::len).collect::<Vec<_>>();
+    let plans = runtime::plan_batches(&lengths, &loaded.buckets).map_err(|length| {
+        OwnedMetalEmbedEngine::error(
+            EngineErrorStage::Inference,
+            format!("sequence length {length} exceeds certified bucket envelope"),
+        )
+    })?;
     let mut vectors = vec![Vec::new(); batch.items.len()];
-    let mut start = 0;
     let mut bucket_calls = 0_usize;
-    while start < order.len() {
-        let mut end = start;
+    for plan in plans {
         let bucket_started = Instant::now();
-        while end < order.len() {
-            let length = batch.items[order[end]].len();
-            let bucket = runtime::covering_bucket(length, &loaded.buckets).ok_or_else(|| {
-                OwnedMetalEmbedEngine::error(
-                    EngineErrorStage::Inference,
-                    format!("sequence length {length} exceeds certified bucket envelope"),
-                )
-            })?;
-            if end - start + 1 > bucket.batch {
-                break;
-            }
-            end += 1;
-        }
-        let length = batch.items[order[end - 1]].len();
-        let shape =
-            runtime::covering_bucket(length, &loaded.buckets).expect("bucket checked above");
         bucket_calls += 1;
-        let sequences = order[start..end]
+        let sequences = plan
+            .indices
             .iter()
             .map(|&index| batch.items[index].clone())
             .collect::<Vec<_>>();
@@ -581,16 +583,16 @@ fn run_bucketed(loaded: &mut OwnedLoadedModel, batch: TokenBatch) -> Result<Vect
                 "[synapse-embed-profile] bucket_select call={} items={} max_tokens={} shape={}x{} select_ms={:.3}",
                 bucket_calls,
                 sequences.len(),
-                length,
-                shape.batch,
-                shape.seq,
+                plan.max_tokens,
+                plan.shape.batch,
+                plan.shape.seq,
                 bucket_started.elapsed().as_secs_f64() * 1_000.0
             );
         }
         let inference_started = Instant::now();
         let produced = loaded
             .family
-            .embed_batch(&mut loaded.provider, &sequences, Some(shape))
+            .embed_batch(&mut loaded.provider, &sequences, Some(plan.shape))
             .map_err(|error| {
                 OwnedMetalEmbedEngine::error(EngineErrorStage::Inference, error.to_string())
             })?;
@@ -601,10 +603,9 @@ fn run_bucketed(loaded: &mut OwnedLoadedModel, batch: TokenBatch) -> Result<Vect
                 inference_started.elapsed().as_secs_f64() * 1_000.0
             );
         }
-        for (&original, vector) in order[start..end].iter().zip(produced) {
+        for (&original, vector) in plan.indices.iter().zip(produced) {
             vectors[original] = vector;
         }
-        start = end;
     }
     if profile {
         eprintln!(
@@ -633,35 +634,23 @@ fn run_rerank_bucketed(
             ));
         }
     }
-    let mut order = (0..pairs.len()).collect::<Vec<_>>();
-    order.sort_by_key(|&index| pairs[index].len());
+    let lengths = pairs.iter().map(Vec::len).collect::<Vec<_>>();
+    let plans = runtime::plan_batches(&lengths, &loaded.buckets).map_err(|length| {
+        OwnedMetalEmbedEngine::error(
+            EngineErrorStage::Inference,
+            format!("sequence length {length} exceeds certified bucket envelope"),
+        )
+    })?;
     let mut scores = vec![0.0; pairs.len()];
-    let mut start = 0;
-    while start < order.len() {
-        let mut end = start;
-        while end < order.len() {
-            let length = pairs[order[end]].len();
-            let bucket = runtime::covering_bucket(length, &loaded.buckets).ok_or_else(|| {
-                OwnedMetalEmbedEngine::error(
-                    EngineErrorStage::Inference,
-                    format!("sequence length {length} exceeds certified bucket envelope"),
-                )
-            })?;
-            if end - start + 1 > bucket.batch {
-                break;
-            }
-            end += 1;
-        }
-        let length = pairs[order[end - 1]].len();
-        let shape =
-            runtime::covering_bucket(length, &loaded.buckets).expect("rerank bucket checked above");
-        let sequences = order[start..end]
+    for plan in plans {
+        let sequences = plan
+            .indices
             .iter()
             .map(|&index| pairs[index].clone())
             .collect::<Vec<_>>();
         let produced = loaded
             .family
-            .rerank_batch(&mut loaded.provider, &sequences, Some(shape))
+            .rerank_batch(&mut loaded.provider, &sequences, Some(plan.shape))
             .map_err(|error| {
                 OwnedMetalEmbedEngine::error(EngineErrorStage::Inference, error.to_string())
             })?;
@@ -675,10 +664,9 @@ fn run_rerank_bucketed(
                 ),
             ));
         }
-        for (&original, score) in order[start..end].iter().zip(produced) {
+        for (&original, score) in plan.indices.iter().zip(produced) {
             scores[original] = score;
         }
-        start = end;
     }
     Ok(RerankScores { scores })
 }
@@ -757,6 +745,7 @@ mod tests {
 
     #[test]
     fn identity_separates_family_dtype_graph_and_policy() {
+        assert_eq!(BUCKET_POLICY_VERSION, runtime::BUCKET_POLICY_VERSION);
         let minilm_f16 = engine_identity(ModelFamily::MiniLm, OwnedDType::F16);
         let minilm_f32 = engine_identity(ModelFamily::MiniLm, OwnedDType::F32);
         let qwen_f16 = engine_identity(ModelFamily::Qwen3, OwnedDType::F16);
@@ -766,10 +755,7 @@ mod tests {
             minilm_f16.build_flags["graph_revision"],
             GRAPH_REVISION.to_string()
         );
-        assert_eq!(
-            minilm_f16.build_flags["bucket_policy"],
-            format!("v{BUCKET_POLICY_VERSION}")
-        );
+        assert_eq!(minilm_f16.build_flags["bucket_policy"], "v2");
     }
 
     #[test]
