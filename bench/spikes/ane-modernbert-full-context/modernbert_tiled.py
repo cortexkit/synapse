@@ -6,11 +6,11 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
-import torch  # pyright: ignore[reportMissingImports]
-import torch.nn.functional as functional  # pyright: ignore[reportMissingImports]
-from safetensors import safe_open  # pyright: ignore[reportMissingImports]
+import torch
+import torch.nn.functional as functional
+from safetensors import safe_open
 
 MASK_MIN_VALUE = -10_000.0
 AttentionKind = Literal["query_tiled", "streaming_reference"]
@@ -250,6 +250,13 @@ class ChannelLayerNorm(torch.nn.Module):
 
 
 class ModernBertLayer(torch.nn.Module):
+    attention_norm: torch.nn.Module
+    qkv: Conv1x1
+    attention_output: Conv1x1
+    mlp_norm: ChannelLayerNorm
+    mlp_input: Conv1x1
+    mlp_output: Conv1x1
+
     def __init__(
         self,
         *,
@@ -361,6 +368,11 @@ class ModernBertLayer(torch.nn.Module):
 class ModernBertEmbedder(torch.nn.Module):
     """GTE ModernBERT with raw checkpoint weights and normalized CLS pooling."""
 
+    global_cos: torch.Tensor
+    global_sin: torch.Tensor
+    local_cos: torch.Tensor
+    local_sin: torch.Tensor
+
     def __init__(
         self,
         config: ModernBertConfig,
@@ -437,7 +449,8 @@ class ModernBertEmbedder(torch.nn.Module):
         token_embeddings = token_embeddings.transpose(1, 2).unsqueeze(2)
         hidden = self.embedding_norm(token_embeddings)
         checkpoints = [sample(token_embeddings), sample(hidden)]
-        for layer in self.layers:
+        for layer_module in self.layers:
+            layer = cast(ModernBertLayer, layer_module)
             after_attention, hidden = layer.forward_checkpoints(
                 hidden,
                 attention_mask,

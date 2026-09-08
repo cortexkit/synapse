@@ -118,8 +118,8 @@
     "placement": {"peak_owned_rss_bytes": 691306496, "minimum_system_available_bytes": 54760800256, "minimum_system_free_bytes": 1732247552, "maximum_system_wired_bytes": 8758788096}
   },
   "diagnosis": [
-    "Raw token embeddings are exact on both Core ML compute-unit modes. CPU_ONLY first diverges in embeddings_norm, before attention, despite the lowered MIL layer_norm using the intended final axis on [1,1024,768]; its final failure is a Core ML CPU execution-path problem, not evidence about tiled-attention mathematics.",
-    "CPU_AND_NE remains close through early layers, then active CLS crosses the 0.999 cosine gate at layer_16.attention_residual where the reference activation magnitude reaches 18396.017578125. This is consistent with accumulated float16/outlier sensitivity, but does not prove a hardware cause.",
+    "Raw token embeddings are exact on both Core ML compute-unit modes and the full graph first diverges in embeddings_norm. The actual-value minimal norm graph does not reproduce this, so it is localization only, not proof of a Core ML execution defect; see EVIDENCE-NORM-ROOT-CAUSE.json.",
+    "CPU_AND_NE remains close through early layers, then active CLS crosses the 0.999 cosine gate at layer_16.attention_residual. Full-tensor probing later found a 45019.515625 residual maximum with fp16 spacing 32 and no overflow or non-finite value; see EVIDENCE-NORM-ROOT-CAUSE.json.",
     "Independent mask and RoPE constructions match exactly at 1024. Eager query-tiled, streaming full-context, Hugging Face eager, and torch.export outputs pass CPU checks on the same three inputs.",
     "The 1024 Core ML vector fails the fixed 0.999 minimum-cosine gate. No 4096 or 8192 result is accepted as feasibility evidence."
   ],

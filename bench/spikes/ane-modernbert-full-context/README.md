@@ -54,7 +54,13 @@ The driver samples owned-child RSS plus system free and wired memory. Defaults r
 
 ## Diagnose a 1024 parity failure
 
-`diagnose_1024.py` emits sampled checkpoints at raw embeddings, embedding normalization, every attention residual, every layer output, and final normalization for positions 0, 63, 64, 255, 256, and 1023. Its `reference`, `export`, and `reload` subcommands keep conversion/save separate from model reload. Run them through `run_guarded` (as demonstrated in the committed 1024 evidence) and compare both `cpu-and-ne` and `cpu-only`; do not continue longer stages until the failed gate is understood. The reference report also compares full-model pooling against Hugging Face on the exact stage input and independently reconstructs 1024 masks and RoPE.
+`diagnose_1024.py` emits sampled checkpoints at raw embeddings, embedding normalization, every attention residual, every layer output, and final normalization for positions 0, 63, 64, 255, 256, and 1023. Its `ranges` command records full-tensor activation maxima, non-finite counts, values beyond the fp16 range, and fp16 spacing at each layer. Its `reference`, `export`, and `reload` subcommands keep conversion/save separate from model reload. Run them through `run_guarded` (as demonstrated in the committed 1024 evidence) and compare both `cpu-and-ne` and `cpu-only`; do not continue longer stages until the failed gate is understood. The reference report also compares full-model pooling against Hugging Face on the exact stage input and independently reconstructs 1024 masks and RoPE.
+
+`norm_reproducer.py` is the smaller normalization control. `capture` saves the actual full-context row's 1024x768 token-embedding values and `embeddings.norm.weight`. `export` creates FLOAT16 or FLOAT32 packages without loading them; `reload` separately measures CPU_ONLY or CPU_AND_NE. One package compares native `layer_norm` with explicit mean/variance normalization for sequence-last input, channel-layout input, and a gather of the captured rows. Reports include raw values, digests, eager/export parity, MIL axes/dtypes/cast boundaries, and exact runtime errors. coremltools 9.0 has no public arbitrary-input MIL interpreter, so reports mark MIL execution unavailable rather than substituting a package prediction.
+
+The optional `--fp32-islands final-norm|residual` export control keeps only the selected full-model operations in float32. It is diagnostic, not a production policy or a parity-threshold override. Broader norm and norm-plus-residual controls were removed because they emitted zero vectors and therefore were invalid experiments, not precision evidence.
+
+Run `pyright -p pyrightconfig.json` from the repository root. The local `.venv` declared by that config contains the optional research dependencies; source files do not suppress missing-import or type diagnostics.
 
 ## Durable evidence
 

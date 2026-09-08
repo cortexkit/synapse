@@ -10,10 +10,10 @@ import shutil
 import time
 import traceback
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
-import numpy as np  # pyright: ignore[reportMissingImports]
-import torch  # pyright: ignore[reportMissingImports]
+import numpy as np
+import torch
 
 import modernbert_tiled as tiled
 from spike import (
@@ -60,6 +60,9 @@ def parse_args() -> argparse.Namespace:
     export.add_argument("--report", type=Path, required=True)
     export.add_argument("--overwrite", action="store_true")
 
+    ranges = subparsers.add_parser("ranges")
+    ranges.add_argument("--report", type=Path, required=True)
+
     reload_parser = subparsers.add_parser("reload")
     reload_parser.add_argument("--package", type=Path, required=True)
     reload_parser.add_argument("--reference", type=Path, required=True)
@@ -78,7 +81,7 @@ def hf_checkpoints(
     inputs: list[tuple[torch.Tensor, torch.Tensor]],
     positions: tuple[int, ...],
 ) -> tuple[np.ndarray, np.ndarray]:
-    from transformers import AutoModel  # pyright: ignore[reportMissingImports]
+    from transformers import AutoModel
 
     model = AutoModel.from_pretrained(
         snapshot, local_files_only=True, attn_implementation="eager", dtype=torch.float32
@@ -253,7 +256,7 @@ def mask_and_rope_checks(
 
     with torch.inference_mode():
         hidden = model._embed(input_ids)
-        layer = model.layers[0]
+        layer = cast(tiled.ModernBertLayer, model.layers[0])
         qkv = layer.qkv(layer.attention_norm(hidden)).reshape(
             1, 3, layer.heads, layer.head_dim, sequence_length
         )
@@ -280,6 +283,75 @@ def mask_and_rope_checks(
         "local_dense_allocated_only_for_1024_diagnostic": True,
         "rope_query_max_abs": float((rope_query - expected_query).abs().max()),
         "rope_key_max_abs": float((rope_key - expected_key).abs().max()),
+    }
+
+
+def activation_stats(value: torch.Tensor) -> dict[str, Any]:
+    finite = torch.isfinite(value)
+    absolute = value.detach().float().abs()
+    absolute_max = float(absolute.max())
+    bounded_for_spacing = min(absolute_max, float(torch.finfo(torch.float16).max))
+    return {
+        "shape": list(value.shape),
+        "abs_max": absolute_max,
+        "nonfinite_count": int((~finite).sum()),
+        "above_float16_max_count": int((absolute > torch.finfo(torch.float16).max).sum()),
+        "float16_spacing_at_abs_max": float(np.spacing(np.float16(bounded_for_spacing))),
+    }
+
+
+def command_ranges(args: argparse.Namespace) -> dict[str, Any]:
+    rows = read_jsonl(args.input)
+    inputs = row_tensors(rows)
+    model, _ = tiled.build_embedder(args.model, SEQUENCE_LENGTH, QUERY_TILE)
+    input_ids, attention_mask = inputs[0]
+    layers = []
+    with torch.inference_mode():
+        hidden = model._embed(input_ids)
+        embedding_stats = activation_stats(hidden)
+        for index, layer_module in enumerate(model.layers):
+            layer = cast(tiled.ModernBertLayer, layer_module)
+            attention_normalized = layer.attention_norm(hidden)
+            qkv = layer.qkv(attention_normalized)
+            after_attention = layer._attention_block(
+                hidden,
+                attention_mask,
+                model.global_cos,
+                model.global_sin,
+                model.local_cos,
+                model.local_sin,
+            )
+            mlp_normalized = layer.mlp_norm(after_attention)
+            mlp_input = layer.mlp_input(mlp_normalized)
+            activation, gate = mlp_input.chunk(2, dim=1)
+            gated = torch.nn.functional.gelu(activation) * gate
+            output = layer._mlp_block(after_attention)
+            layers.append(
+                {
+                    "layer": index,
+                    "attention_kind": "global" if layer.local_window is None else "local",
+                    "residual_input": activation_stats(hidden),
+                    "attention_normalized": activation_stats(attention_normalized),
+                    "qkv": activation_stats(qkv),
+                    "after_attention_residual": activation_stats(after_attention),
+                    "mlp_normalized": activation_stats(mlp_normalized),
+                    "mlp_input": activation_stats(mlp_input),
+                    "gated_mlp": activation_stats(gated),
+                    "layer_output": activation_stats(output),
+                }
+            )
+            hidden = output
+        final_normalized = model.final_norm(hidden)
+    return {
+        "status": "passed",
+        "row_id": rows[0]["id"],
+        "actual_token_count": rows[0]["actual_token_count"],
+        "embedding_norm": embedding_stats,
+        "layers": layers,
+        "final_norm": activation_stats(final_normalized),
+        "input_sha256": sha256_file(args.input),
+        "model": model_digests(args.model),
+        "environment": environment_report(),
     }
 
 
@@ -347,7 +419,7 @@ def command_reference(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def command_export(args: argparse.Namespace) -> dict[str, Any]:
-    import coremltools as ct  # pyright: ignore[reportMissingImports]
+    import coremltools as ct
 
     if args.out.exists():
         if not args.overwrite:
@@ -365,12 +437,15 @@ def command_export(args: argparse.Namespace) -> dict[str, Any]:
     del model
     gc.collect()
     started = time.perf_counter()
-    mlmodel = ct.convert(
-        exported,
-        minimum_deployment_target=ct.target.macOS15,
-        compute_precision=ct.precision.FLOAT16,
-        compute_units=ct.ComputeUnit.CPU_AND_NE,
-        skip_model_load=True,
+    mlmodel = cast(
+        Any,
+        ct.convert(
+            exported,
+            minimum_deployment_target=ct.target.macOS15,
+            compute_precision=ct.precision.FLOAT16,
+            compute_units=ct.ComputeUnit.CPU_AND_NE,
+            skip_model_load=True,
+        ),
     )
     conversion_s = time.perf_counter() - started
     outputs = list(mlmodel.output_description)
@@ -396,7 +471,7 @@ def command_export(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def command_reload(args: argparse.Namespace) -> dict[str, Any]:
-    import coremltools as ct  # pyright: ignore[reportMissingImports]
+    import coremltools as ct
 
     reference = np.load(args.reference)
     rows = read_jsonl(args.input)
@@ -449,6 +524,8 @@ def command_reload(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
+    if args.command == "ranges":
+        return command_ranges(args)
     if args.command == "reference":
         return command_reference(args)
     if args.command == "export":

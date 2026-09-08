@@ -1,0 +1,104 @@
+{
+  "status": "bounded_negative_at_1024",
+  "scope": "normalization, layout, precision, toolchain, activation-range, and fp32-island isolation only",
+  "unchanged_gate_min_cosine": 0.999,
+  "inputs": {
+    "source_row": "full-context",
+    "actual_token_count": 1024,
+    "input_jsonl_sha256": "631cb64de428c9e405ab1f4cfe61f07cab699565a900df560e6a060da964f48c",
+    "capture_npz_sha256": "40de2da09f54f9332b6a0fbe95315ce3df4f6dbec8f8caefe94d207e6b612079",
+    "model_safetensors_sha256": "3e85899d5728cb7de79781c0c3acfb91ccef9f875f1f7e0b3c9f3dd4b6a724ba",
+    "sequence_last_shape": [1, 1024, 768],
+    "sequence_last_range": {"min": -3.509765625, "max": 2.34375, "mean": 0.0011336887255311012, "variance": 0.009932128712534904},
+    "sequence_last_first_16": [-0.0653076171875, -0.01459503173828125, -0.019012451171875, -0.023406982421875, 0.0008864402770996094, -0.036865234375, -0.033660888671875, 0.0017728805541992188, -0.0207672119140625, -0.00927734375, -0.0278167724609375, 0.029205322265625, 0.011474609375, -0.002819061279296875, -0.0024433135986328125, -0.0064544677734375],
+    "norm_weight_range": {"min": 0.00099945068359375, "max": 1.4580078125, "mean": 0.7162593007087708, "variance": 0.033509086817502975},
+    "norm_weight_first_16": [0.58251953125, 0.9208984375, 0.69482421875, 0.89453125, 0.810546875, 0.79296875, 0.64501953125, 0.73388671875, 0.640625, 0.83203125, 0.8115234375, 0.294189453125, 0.70166015625, 0.7158203125, 0.99951171875, 0.63720703125]
+  },
+  "minimal_normalization": {
+    "formulations": ["native_sequence_last", "explicit_sequence_last", "native_channel_input", "explicit_channel_input", "native_after_gather", "explicit_after_gather"],
+    "pytorch_eager_explicit_vs_native": {"max_abs": 9.5367431640625e-7, "min_cosine": 0.9999998211860657},
+    "pytorch_exported_vs_eager": {"max_abs": 0.0},
+    "mil_evaluation": {"available": false, "reason": "coremltools 9.0 has no public arbitrary-input MIL interpreter"},
+    "float16_lowering": {
+      "package_sha256": "7b2434a95892af4b9d28075d6232b0e387b126a3e36cea5254715d55a7d90553",
+      "input_casts": ["sequence_last float32->float16", "channel_input float32->float16", "position_ids int32->uint16"],
+      "native_sequence_and_gather_norm": {"axes": [-1], "shape": [1, 1024, 768], "dtype": "float16"},
+      "channel_norm": {"axes": [1], "shape": [1, 768, 1, 1024], "dtype": "float16"},
+      "cpu_only_native_vs_eager_float32": {"max_abs": 0.00217437744140625, "min_cosine": 0.9999998211860657},
+      "cpu_only_explicit_vs_eager_float32": {"max_abs": 0.00563812255859375, "min_cosine": 0.9999997615814209},
+      "cpu_and_ne_all_formulations_vs_eager_float32": {"max_abs": 0.00998687744140625, "min_cosine": 0.9999997615814209},
+      "layout_and_gather_effect": "native sequence-last, channel-input, and gathered outputs are identical within each compute-unit run"
+    },
+    "float32_lowering": {
+      "package_sha256": "ee9a54b9ab759f58bb66fcc54e3b4cc48ebcdb7536dfb283cbbad9a03cd42935",
+      "input_casts": [],
+      "cpu_only_max_abs": 9.5367431640625e-7,
+      "cpu_and_ne_max_abs": 9.5367431640625e-7,
+      "minimum_cosine": 0.9999998211860657
+    },
+    "conclusion": "The actual-value minimal graph does not reproduce the full-model failure. Precision, native versus explicit normalization, axis/layout, and a preceding gather all pass independently. The earlier full-graph checkpoint is localization only, not proof of a Core ML layer-norm defect."
+  },
+  "toolchain_control": {
+    "measured_current": {"python": "3.12.12", "torch": "2.14.0", "coremltools": "9.0", "numpy": "2.5.3", "safetensors": "0.8.0", "environment_sha256": "0d7866584bd3e8c5af8800c42285ce166e3383f99666b321d40a13c14c5cbd15"},
+    "isolated_supported": {"python": "3.12.12", "torch": "2.7.0", "coremltools": "9.0", "numpy": "2.5.3", "safetensors": "0.8.0", "environment_sha256": "07384abf1a19124aaf9a605c4ebc6b1a9ef81cc7d3f729111fba3e61c590d1c9", "package_sha256": "ae1f9653419072b00dbf192133e9e199334de33a26692e4021a4c374461e3158"},
+    "output_max_abs_between_toolchains": {"cpu_only": 0.0, "cpu_and_ne": 0.0},
+    "conclusion": "PyTorch 2.7.0 and 2.14.0 produce byte-identical minimal Core ML outputs. This clears the minimal control only; it does not certify the unsupported full-model conversion combination."
+  },
+  "full_model_activation_ranges": {
+    "row": "full-context",
+    "nonfinite_count": 0,
+    "above_float16_max_count": 0,
+    "selected_residual_abs_max": {"layer_0_output": 43.392852783203125, "layer_4_output": 489.2973937988281, "layer_11_output": 18296.701171875, "layer_15_output": 44993.07421875, "layer_18_after_attention": 45019.515625},
+    "global_abs_max": 45019.515625,
+    "float16_spacing_at_global_abs_max": 32.0,
+    "conclusion": "There is no overflow or non-finite value. Quantization becomes coarse after the late residual stream develops ModernBERT outliers."
+  },
+  "full_model_1024_arms": {
+    "baseline_float16": {
+      "cosines": [0.9984976053237915, 0.9999022483825684, 0.998731255531311],
+      "min_cosine": 0.9984976053237915,
+      "status": "parity_failed",
+      "warm_predict_s": 0.03461112501099706,
+      "placement": {"cpu": 13, "neuralEngine": 11703, "einsum_neuralEngine": 2112, "softmax_neuralEngine": 1056, "conv_neuralEngine": 88, "layer_norm_neuralEngine": 45}
+    },
+    "final_norm_fp32": {
+      "cosines": [0.9984989762306213, 0.9999017715454102, 0.9987307786941528],
+      "min_cosine": 0.9984989762306213,
+      "status": "parity_failed",
+      "warm_predict_s": 0.035144458001013845,
+      "placement": {"cpu": 16, "neuralEngine": 11702, "layer_norm_cpu": 1, "layer_norm_neuralEngine": 44, "einsum_neuralEngine": 2112, "softmax_neuralEngine": 1056}
+    },
+    "residual_adds_fp32": {
+      "cosines": [0.9983750581741333, 0.9998681545257568, 0.9986574053764343],
+      "min_cosine": 0.9983750581741333,
+      "status": "parity_failed",
+      "warm_predict_s": 0.06668395799351856,
+      "separate_load_s": 998.9650664580113,
+      "placement": {"cpu": 141, "neuralEngine": 11660, "residual_add_cpu": 45, "cast_cpu": 89, "einsum_neuralEngine": 2112, "softmax_neuralEngine": 1056, "conv_neuralEngine": 88, "layer_norm_neuralEngine": 45}
+    },
+    "conclusion": "Neither valid localized fp32 island restores the unchanged 0.999 gate. Final norm is not the source. Moving residual adds to CPU makes parity slightly worse, doubles warm latency, adds 128 CPU-preferred operations, and makes model loading impractically slow. The error is distributed rather than produced by one final normalization or residual-add op."
+  },
+  "invalid_controls": {
+    "norm_only": {"observed_output": "all-zero vectors", "status": "invalid"},
+    "norm_and_residual": {"observed_output": "all-zero vectors", "status": "invalid"},
+    "resolution": "Both options were removed from the runnable fp32-island CLI and are excluded from precision conclusions. Exact external logs remain for audit only."
+  },
+  "tiled_implementation_state": {
+    "cpu_tiled_vs_huggingface_pooling": {"max_abs": 6.258487701416016e-7, "min_cosine": 1.0},
+    "torch_export_vs_eager": {"max_abs": 0.0},
+    "global_mask_max_abs": 0.0,
+    "local_mask_max_abs": 0.0,
+    "rope_query_max_abs": 0.0,
+    "rope_key_max_abs": 0.0,
+    "repeated_coreml_determinism_max_abs": 0.0,
+    "tests": "query-tile boundary, final partial tile, ordering, full-key visibility, padding, local/global masks, RoPE, bounded intermediates, strict stage gate"
+  },
+  "smallest_corrective_proposal": {
+    "proposal": "Do not add fp32 islands. In a separate follow-on, inspect and reproduce the reference implementation's exact orthogonal rotation/weight-folding scheme, first on captured layers around the layer-11 and layer-15 residual jumps, then rerun the same 1024 inputs and unchanged gate with placement evidence.",
+    "reason": "An exact-arithmetic output-preserving channel rotation targets distributed outlier conditioning without forcing residual or normalization operations off ANE.",
+    "implemented_here": false,
+    "source_research_status": "The delegated source task returned no usable source details; the follow-on must inspect actual source before implementation."
+  },
+  "artifact_roots": ["/tmp/modernbert-norm-reproducer-v3", "/tmp/modernbert-norm-supported-control", "/tmp/modernbert-final-norm-fp32-1024", "/tmp/modernbert-residual-fp32-1024", "/tmp/modernbert-full-context-m5/seq1024/diagnostic"],
+  "higher_contexts_run_in_this_root_cause_isolation": false
+}

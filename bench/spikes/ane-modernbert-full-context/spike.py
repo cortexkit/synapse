@@ -16,11 +16,11 @@ import time
 import traceback
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, cast
 
-import numpy as np  # pyright: ignore[reportMissingImports]
-import torch  # pyright: ignore[reportMissingImports]
-from tokenizers import Tokenizer  # pyright: ignore[reportMissingImports]
+import numpy as np
+import torch
+from tokenizers import Tokenizer
 
 from modernbert_tiled import ModernBertConfig, build_embedder
 
@@ -73,6 +73,12 @@ def parse_args() -> argparse.Namespace:
     export.add_argument("--out", type=Path, required=True)
     export.add_argument("--report", type=Path, required=True)
     export.add_argument("--overwrite", action="store_true")
+    export.add_argument(
+        "--fp32-islands",
+        choices=("none", "final-norm", "residual"),
+        default="none",
+        help="Experimental float32 islands; the default keeps the full graph float16.",
+    )
 
     reload_parser = subparsers.add_parser("reload")
     reload_parser.add_argument("--package", type=Path, required=True)
@@ -308,6 +314,7 @@ def inspect_mil_program(mlmodel: Any, sequence_length: int, query_tile_size: int
                         "name": operation.name,
                         "shape": shape,
                         "numel": int(np.prod(shape)) if shape else 0,
+                        "dtype": getattr(output.dtype, "__name__", str(output.dtype)),
                     }
                 )
     attention_ops = [
@@ -325,10 +332,22 @@ def inspect_mil_program(mlmodel: Any, sequence_length: int, query_tile_size: int
     counts: dict[str, int] = {}
     for item in operations:
         counts[item["operator"]] = counts.get(item["operator"], 0) + 1
+    precision_boundaries = [
+        item
+        for item in operations
+        if item["operator"] in {"cast", "layer_norm"}
+        or (
+            item["operator"] == "add"
+            and len(item["shape"]) == 4
+            and item["shape"][0] == 1
+            and item["shape"][2:] == [1, sequence_length]
+        )
+    ]
     return {
         "available": True,
         "operation_count": len(operations),
         "operator_counts": counts,
+        "precision_boundaries": precision_boundaries,
         "largest_attention_output": max(attention_ops, key=lambda item: item["numel"]),
         "forbidden_sequence_square_attention_outputs": forbidden,
     }
@@ -383,7 +402,7 @@ def command_cpu_check(args: argparse.Namespace) -> dict[str, Any]:
     del streaming
     gc.collect()
 
-    from transformers import AutoModel  # pyright: ignore[reportMissingImports]
+    from transformers import AutoModel
 
     hf_model = AutoModel.from_pretrained(
         args.model, local_files_only=True, attn_implementation="eager", dtype=torch.float32
@@ -450,7 +469,7 @@ def command_reference(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def command_export(args: argparse.Namespace) -> dict[str, Any]:
-    import coremltools as ct  # pyright: ignore[reportMissingImports]
+    import coremltools as ct
 
     if args.out.exists():
         if not args.overwrite:
@@ -461,7 +480,9 @@ def command_export(args: argparse.Namespace) -> dict[str, Any]:
     if reference_ids != [row["id"] for row in rows]:
         raise ValueError("reference row ordering differs from input")
     inputs = row_tensors(rows)
-    model, _ = build_embedder(args.model, args.seq_len, args.query_tile, attention_kind="query_tiled")
+    model, config = build_embedder(
+        args.model, args.seq_len, args.query_tile, attention_kind="query_tiled"
+    )
     eager = _run_model(model, inputs)
     eager_reference = parity_report(reference, eager)
     if eager_reference["min_cosine"] < 0.99999:
@@ -480,13 +501,37 @@ def command_export(args: argparse.Namespace) -> dict[str, Any]:
     del model
     gc.collect()
 
+    compute_precision: Any = ct.precision.FLOAT16
+    precision_policy = "float16"
+    if args.fp32_islands != "none":
+        preserve_final_norm = args.fp32_islands == "final-norm"
+        preserve_residual = args.fp32_islands == "residual"
+
+        def select_fp16(operation: Any) -> bool:
+            if (
+                preserve_final_norm
+                and operation.op_type == "layer_norm"
+                and operation.name == "layer_norm_44"
+            ):
+                return False
+            if not preserve_residual or operation.op_type != "add" or not operation.outputs:
+                return True
+            shape = tuple(int(dimension) for dimension in operation.outputs[0].shape)
+            return shape != (1, config.hidden_size, 1, args.seq_len)
+
+        compute_precision = ct.transform.FP16ComputePrecision(op_selector=select_fp16)
+        precision_policy = f"float16_with_{args.fp32_islands}_fp32_islands"
+
     conversion_started = time.perf_counter()
-    mlmodel = ct.convert(
-        exported,
-        minimum_deployment_target=ct.target.macOS15,
-        compute_precision=ct.precision.FLOAT16,
-        compute_units=ct.ComputeUnit.CPU_AND_NE,
-        skip_model_load=True,
+    mlmodel = cast(
+        Any,
+        ct.convert(
+            exported,
+            minimum_deployment_target=ct.target.macOS15,
+            compute_precision=compute_precision,
+            compute_units=ct.ComputeUnit.CPU_AND_NE,
+            skip_model_load=True,
+        ),
     )
     conversion_latency = time.perf_counter() - conversion_started
     outputs = list(mlmodel.output_description)
@@ -505,7 +550,7 @@ def command_export(args: argparse.Namespace) -> dict[str, Any]:
         "query_tile_size": args.query_tile,
         "key_tile_size": args.key_tile,
         "frontend": "torch.export",
-        "compute_precision": "float16",
+        "compute_precision": precision_policy,
         "compute_units": "CPU_AND_NE",
         "skip_model_load": True,
         "timing_s": {
@@ -528,7 +573,7 @@ def command_export(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def command_reload(args: argparse.Namespace) -> dict[str, Any]:
-    import coremltools as ct  # pyright: ignore[reportMissingImports]
+    import coremltools as ct
 
     rows = read_jsonl(args.input)
     reference_ids, reference = load_vectors(args.reference)

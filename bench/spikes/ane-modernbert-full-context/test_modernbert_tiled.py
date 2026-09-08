@@ -8,9 +8,10 @@ import unittest
 from typing import Any
 from unittest import mock
 
-import torch  # pyright: ignore[reportMissingImports]
+import torch
 
 import modernbert_tiled as tiled
+from norm_reproducer import NormVariants
 from run_stages import stage_can_continue
 
 
@@ -182,6 +183,18 @@ class AttentionTests(unittest.TestCase):
         self.assertLessEqual(max(math.prod(shape) for shape in score_shapes), 2 * 8 * 1 * 4)
         self.assertLessEqual(max(shape[1] for shape in mask_shapes), 8)
         self.assertNotIn((2, 9, 1, 9), mask_shapes)
+
+
+class NormReproducerTests(unittest.TestCase):
+    def test_actual_value_paths_preserve_axis_and_layout_semantics(self) -> None:
+        torch.manual_seed(29)
+        sequence_last = torch.randn(1, 9, 8)
+        channel_input = sequence_last.transpose(1, 2).unsqueeze(2).contiguous()
+        position_ids = torch.arange(9, dtype=torch.int32).unsqueeze(0)
+        model = NormVariants(torch.rand(8), sequence_last.squeeze(0))
+        outputs = model(sequence_last, channel_input, position_ids)
+        for candidate in outputs[1:]:
+            self.assertTrue(torch.allclose(outputs[0], candidate, atol=1e-6, rtol=1e-6))
 
 
 class StageGateTests(unittest.TestCase):
