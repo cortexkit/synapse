@@ -1115,7 +1115,7 @@ async fn embed_query_loaded_owned_metal_carries_distinct_provenance_and_content_
     );
     assert_eq!(
         result["provenance"]["engine"]["build_flags"]["bucket_policy"],
-        "v1"
+        "v2"
     );
     assert_eq!(result["fingerprint"].as_str().unwrap().len(), 64);
     let spike_golden: Value =

@@ -62,7 +62,7 @@ fn minilm_reuses_precompiled_packages_across_calls() {
     let compiled_count = package_count(&cache);
     assert_eq!(
         compiled_count, 10,
-        "bucket policy v1 compiles ten sequence shapes"
+        "bucket policy v2 preserves ten eager short-sequence capacity graphs"
     );
 
     let mut tokenizer = Tokenizer::from_file(&tokenizer_path).expect("load tokenizer");
@@ -80,12 +80,20 @@ fn minilm_reuses_precompiled_packages_across_calls() {
     let second = engine
         .embed_batch(&loaded, first_batch)
         .expect("second embedding call");
+    assert_eq!(
+        package_count(&cache),
+        compiled_count,
+        "capacity-graph calls must reuse the eager package"
+    );
+    let singleton_batch = token_batch(&tokenizer, &["a third independent call"]);
     let third = engine
-        .embed_batch(
-            &loaded,
-            token_batch(&tokenizer, &["a third independent call"]),
-        )
-        .expect("third embedding call");
+        .embed_batch(&loaded, singleton_batch.clone())
+        .expect("first singleton embedding call");
+    let singleton_count = package_count(&cache);
+    assert_eq!(singleton_count, compiled_count + 1);
+    let fourth = engine
+        .embed_batch(&loaded, singleton_batch)
+        .expect("repeated singleton embedding call");
 
     assert_eq!(first.len(), 2);
     assert_eq!(second.len(), 2);
@@ -96,9 +104,13 @@ fn minilm_reuses_precompiled_packages_across_calls() {
     }
     assert_eq!(third[0].len(), 384);
     assert_eq!(
+        third, fourth,
+        "singleton graph reuse must remain deterministic"
+    );
+    assert_eq!(
         package_count(&cache),
-        compiled_count,
-        "serving calls must not compile new graph packages"
+        singleton_count,
+        "warm singleton calls must reuse the lazily compiled package"
     );
     let _ = fs::remove_dir_all(cache);
 }

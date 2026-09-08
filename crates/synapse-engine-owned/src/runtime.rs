@@ -15,9 +15,14 @@ mod modernbert;
 mod qwen3;
 
 pub(crate) const GRAPH_REVISION: u32 = 4;
-pub(crate) const BUCKET_POLICY_VERSION: u32 = 1;
+pub(crate) const BUCKET_POLICY_VERSION: u32 = 2;
 const BUCKET_MAX_BATCH_ROWS: usize = 8;
-const BUCKET_SEQUENCE_LADDER: &[usize] = &[64, 96, 128, 160, 192, 256, 320, 384, 448, 512];
+const BUCKET_EAGER_SEQUENCE_LIMIT: usize = 512;
+// Above the smallest bucket, adjacent steps are at most 1.5x apart. This keeps
+// sequence padding bounded without multiplying every sequence by every row count.
+const BUCKET_SEQUENCE_LADDER: &[usize] = &[
+    64, 96, 128, 160, 192, 256, 320, 384, 448, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192,
+];
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Precision {
@@ -45,6 +50,13 @@ pub(crate) enum Execution {
 pub(crate) struct BatchShape {
     pub(crate) batch: usize,
     pub(crate) seq: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BatchPlan {
+    pub(crate) indices: Vec<usize>,
+    pub(crate) shape: BatchShape,
+    pub(crate) max_tokens: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -158,15 +170,77 @@ pub(crate) fn bucket_shapes(max_length: usize, attention_units: usize) -> Vec<Ba
     sequence_lengths.dedup();
     sequence_lengths
         .into_iter()
-        .map(|seq| BatchShape {
-            batch: BUCKET_MAX_BATCH_ROWS.min((attention_units / seq.saturating_mul(seq)).max(1)),
-            seq,
+        .filter_map(|seq| {
+            let attention_per_row = seq.checked_mul(seq)?;
+            let batch = BUCKET_MAX_BATCH_ROWS.min(attention_units / attention_per_row);
+            (batch > 0).then_some(BatchShape { batch, seq })
         })
         .collect()
 }
 
 pub(crate) fn covering_bucket(length: usize, buckets: &[BatchShape]) -> Option<BatchShape> {
     buckets.iter().copied().find(|shape| shape.seq >= length)
+}
+
+pub(crate) fn eager_shapes(buckets: &[BatchShape]) -> &[BatchShape] {
+    let count = buckets
+        .iter()
+        .take_while(|shape| shape.seq <= BUCKET_EAGER_SEQUENCE_LIMIT)
+        .count();
+    &buckets[..count]
+}
+
+pub(crate) fn cache_shapes(buckets: &[BatchShape]) -> Vec<BatchShape> {
+    let mut shapes = Vec::with_capacity(buckets.len().saturating_mul(2));
+    for &bucket in buckets {
+        shapes.push(BatchShape {
+            batch: 1,
+            seq: bucket.seq,
+        });
+        if bucket.batch > 1 {
+            shapes.push(bucket);
+        }
+    }
+    shapes
+}
+
+fn execution_shape(bucket: BatchShape, item_count: usize) -> BatchShape {
+    BatchShape {
+        // Singleton calls are common enough to deserve their own graph. Multi-row
+        // calls retain the capacity graph so filled batches keep their throughput.
+        batch: if item_count == 1 { 1 } else { bucket.batch },
+        seq: bucket.seq,
+    }
+}
+
+pub(crate) fn plan_batches(
+    lengths: &[usize],
+    buckets: &[BatchShape],
+) -> Result<Vec<BatchPlan>, usize> {
+    let mut order = (0..lengths.len()).collect::<Vec<_>>();
+    order.sort_by_key(|&index| (lengths[index], index));
+    let mut plans = Vec::new();
+    let mut start = 0;
+    while start < order.len() {
+        let mut end = start;
+        while end < order.len() {
+            let length = lengths[order[end]];
+            let bucket = covering_bucket(length, buckets).ok_or(length)?;
+            if end - start + 1 > bucket.batch {
+                break;
+            }
+            end += 1;
+        }
+        let max_tokens = lengths[order[end - 1]];
+        let bucket = covering_bucket(max_tokens, buckets).expect("bucket checked above");
+        plans.push(BatchPlan {
+            indices: order[start..end].to_vec(),
+            shape: execution_shape(bucket, end - start),
+            max_tokens,
+        });
+        start = end;
+    }
+    Ok(plans)
 }
 
 #[derive(Copy, Clone)]
@@ -1933,4 +2007,132 @@ pub(crate) fn get_tensor(tensors: &HashMap<String, Tensor>, base_name: &str) -> 
         }
     }
     bail!("missing tensor; tried {}", candidates.join(", "))
+}
+
+#[cfg(test)]
+mod bucket_policy_tests {
+    use super::*;
+
+    const FULL_CONTEXT: usize = 8192;
+    const FULL_CONTEXT_ATTENTION_UNITS: usize = FULL_CONTEXT * FULL_CONTEXT;
+
+    #[test]
+    fn policy_v2_covers_full_context_with_bounded_sequence_padding() {
+        let buckets = bucket_shapes(FULL_CONTEXT, FULL_CONTEXT_ATTENTION_UNITS);
+        assert_eq!(
+            buckets.iter().map(|shape| shape.seq).collect::<Vec<_>>(),
+            BUCKET_SEQUENCE_LADDER
+        );
+        assert_eq!(buckets.len(), 18);
+        assert_eq!(
+            eager_shapes(&buckets)
+                .iter()
+                .map(|shape| shape.seq)
+                .collect::<Vec<_>>(),
+            vec![64, 96, 128, 160, 192, 256, 320, 384, 448, 512]
+        );
+
+        for length in 65..=FULL_CONTEXT {
+            let shape = covering_bucket(length, &buckets).expect("length must be covered");
+            assert!(
+                shape.seq * 2 <= length * 3,
+                "length {length} padded past the 1.5x sequence bound to {}",
+                shape.seq
+            );
+        }
+        for shape in &buckets {
+            assert!(
+                shape.batch * shape.seq * shape.seq <= FULL_CONTEXT_ATTENTION_UNITS,
+                "shape {}x{} exceeds the attention budget",
+                shape.batch,
+                shape.seq
+            );
+        }
+    }
+
+    #[test]
+    fn policy_v2_maps_profile_lengths_to_nearby_singleton_shapes() {
+        let buckets = bucket_shapes(FULL_CONTEXT, FULL_CONTEXT_ATTENTION_UNITS);
+        for (length, expected_seq) in [
+            (511, 512),
+            (513, 768),
+            (603, 768),
+            (1203, 1536),
+            (2600, 3072),
+            (4096, 4096),
+        ] {
+            let plans = plan_batches(&[length], &buckets).expect("profile length must be covered");
+            assert_eq!(plans.len(), 1);
+            assert_eq!(
+                plans[0].shape,
+                BatchShape {
+                    batch: 1,
+                    seq: expected_seq
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn policy_v2_keeps_existing_short_full_batches_on_capacity_graphs() {
+        let buckets = bucket_shapes(FULL_CONTEXT, FULL_CONTEXT_ATTENTION_UNITS);
+        for (length, expected_seq) in [(131, 160), (320, 320), (448, 448)] {
+            let plans = plan_batches(&[length; 8], &buckets).expect("short batch must be covered");
+            assert_eq!(plans.len(), 1);
+            assert_eq!(plans[0].indices, (0..8).collect::<Vec<_>>());
+            assert_eq!(
+                plans[0].shape,
+                BatchShape {
+                    batch: 8,
+                    seq: expected_seq
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn planner_respects_capacity_and_restores_original_order() {
+        let buckets = bucket_shapes(FULL_CONTEXT, FULL_CONTEXT_ATTENTION_UNITS);
+        let lengths = [1203, 63, 603, 511, 4096, 513, 2600];
+        let plans = plan_batches(&lengths, &buckets).expect("mixed batch must be covered");
+        let mut restored = vec![usize::MAX; lengths.len()];
+        for plan in &plans {
+            assert!(plan.indices.len() <= plan.shape.batch);
+            assert!(plan
+                .indices
+                .iter()
+                .all(|&index| lengths[index] <= plan.shape.seq));
+            assert!(
+                plan.shape.batch * plan.shape.seq * plan.shape.seq <= FULL_CONTEXT_ATTENTION_UNITS
+            );
+            for &index in &plan.indices {
+                restored[index] = index;
+            }
+        }
+        assert_eq!(restored, (0..lengths.len()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn cache_shape_set_is_bounded_and_covers_singletons_and_full_batches() {
+        let buckets = bucket_shapes(
+            FULL_CONTEXT,
+            BUCKET_MAX_BATCH_ROWS * FULL_CONTEXT_ATTENTION_UNITS,
+        );
+        let shapes = cache_shapes(&buckets);
+        assert_eq!(shapes.len(), 36);
+        for bucket in buckets {
+            assert!(shapes.contains(&BatchShape {
+                batch: 1,
+                seq: bucket.seq
+            }));
+            assert!(shapes.contains(&bucket));
+        }
+    }
+
+    #[test]
+    fn bucket_builder_omits_shape_that_public_load_rejects_as_over_budget() {
+        let buckets = bucket_shapes(FULL_CONTEXT, FULL_CONTEXT_ATTENTION_UNITS - 1);
+        assert_eq!(covering_bucket(FULL_CONTEXT, &buckets), None);
+        assert_eq!(plan_batches(&[FULL_CONTEXT], &buckets), Err(FULL_CONTEXT));
+    }
 }
