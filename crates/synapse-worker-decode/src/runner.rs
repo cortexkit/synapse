@@ -3697,6 +3697,9 @@ pub fn main() -> Result<()> {
                     rss_mb: 0,
                     models_loaded: usize::from(state.loaded.is_some()),
                     placement_share: None,
+                    // This lane accepts any sequence up to the model's
+                    // configured maximum, so it advertises no bucket ladder.
+                    buckets: None,
                 },
                 max_frame,
             )?,

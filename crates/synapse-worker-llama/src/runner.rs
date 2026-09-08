@@ -399,6 +399,9 @@ fn worker_request_loop<S: Read + Write>(
                         rss_mb: 0,
                         models_loaded: state.models.len(),
                         placement_share: None,
+                        // This lane accepts any sequence up to the model's
+                        // configured maximum, so it advertises no bucket ladder.
+                        buckets: None,
                     },
                     max_frame,
                 )?;
