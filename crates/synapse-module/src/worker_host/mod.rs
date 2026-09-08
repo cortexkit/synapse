@@ -231,12 +231,22 @@ impl WorkerForwardLimiter {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkerModelInfo {
+    pub dims: usize,
+    pub cold_load_ms: u64,
+    pub buckets: Option<Vec<usize>>,
+}
+
 #[derive(Clone, Debug)]
 struct LoadedWorkerModel {
     crash_key: String,
     artifact: ValidatedArtifact,
     runtime_config: RuntimeConfig,
     worker_model_ref: Option<String>,
+    dims: usize,
+    cold_load_ms: u64,
+    buckets: Option<Vec<usize>>,
 }
 
 #[derive(Debug)]
@@ -336,7 +346,7 @@ impl WorkerHost {
             return Err(WorkerHostError::Quarantined { key: crash_key });
         }
 
-        let worker_model_ref = self
+        let (worker_model_ref, dims, cold_load_ms, buckets) = self
             .load_worker_model_ref(artifact, cfg, &crash_key)
             .await?;
         let stable_model_id = format!("host-model-{}", self.model_counter);
@@ -348,6 +358,9 @@ impl WorkerHost {
                 artifact: artifact.clone(),
                 runtime_config: cfg.clone(),
                 worker_model_ref: Some(worker_model_ref),
+                dims,
+                cold_load_ms,
+                buckets,
             },
         );
         Ok(LoadedModel {
@@ -711,6 +724,7 @@ impl WorkerHost {
                 rss_mb,
                 models_loaded,
                 placement_share,
+                ..
             } => {
                 ensure_req_id(&req_id, &got)?;
                 self.last_placement_share = placement_share;
@@ -731,6 +745,14 @@ impl WorkerHost {
         let req_id = format!("{prefix}-{}", self.request_counter);
         self.request_counter += 1;
         req_id
+    }
+
+    pub fn model_info(&self, model_id: &str) -> Option<WorkerModelInfo> {
+        self.loaded_models.get(model_id).map(|m| WorkerModelInfo {
+            dims: m.dims,
+            cold_load_ms: m.cold_load_ms,
+            buckets: m.buckets.clone(),
+        })
     }
 
     pub fn health_snapshot(&mut self) -> WorkerHostHealth {
@@ -774,11 +796,14 @@ impl WorkerHost {
             }
         }
 
-        let worker_model_ref = self
+        let (worker_model_ref, dims, cold_load_ms, buckets) = self
             .load_worker_model_ref(&loaded.artifact, &loaded.runtime_config, &loaded.crash_key)
             .await?;
         if let Some(entry) = self.loaded_models.get_mut(&model.model_id) {
             entry.worker_model_ref = Some(worker_model_ref.clone());
+            entry.dims = dims;
+            entry.cold_load_ms = cold_load_ms;
+            entry.buckets = buckets;
         }
         Ok((worker_model_ref, loaded.crash_key))
     }
@@ -788,7 +813,7 @@ impl WorkerHost {
         artifact: &ValidatedArtifact,
         cfg: &RuntimeConfig,
         crash_key: &str,
-    ) -> Result<String, WorkerHostError> {
+    ) -> Result<(String, usize, u64, Option<Vec<usize>>), WorkerHostError> {
         if self.quarantined.contains(crash_key) {
             return Err(WorkerHostError::Quarantined {
                 key: crash_key.to_string(),
@@ -808,12 +833,14 @@ impl WorkerHost {
                 WorkerResponse::Loaded {
                     req_id: got,
                     model_ref,
-                    ..
+                    dims,
+                    cold_load_ms,
+                    buckets,
                 },
                 _,
             )) => {
                 ensure_req_id(&req_id, &got)?;
-                Ok(model_ref)
+                Ok((model_ref, dims, cold_load_ms, buckets))
             }
             Ok((WorkerResponse::Err { code, msg, .. }, _)) => {
                 Err(WorkerHostError::WorkerErr { code, msg })
@@ -1284,6 +1311,38 @@ impl WorkerEngine {
     pub fn ping(&self) -> Result<WorkerPing, WorkerHostError> {
         let mut host = self.lock_host()?;
         self.runtime().block_on(host.ping())
+    }
+
+    pub fn model_info(&self, model: &LoadedModel) -> Option<WorkerModelInfo> {
+        let host = self.lock_host().ok()?;
+        host.model_info(&model.model_id)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn insert_loaded_model_for_test(
+        &self,
+        model_id: String,
+        dims: usize,
+        cold_load_ms: u64,
+        buckets: Option<Vec<usize>>,
+    ) -> LoadedModel {
+        let mut host = self.lock_host().expect("worker host locks");
+        host.loaded_models.insert(
+            model_id.clone(),
+            LoadedWorkerModel {
+                crash_key: "test-crash-key".to_string(),
+                artifact: ValidatedArtifact {
+                    digest: "sha256:test".to_string(),
+                    format: "coreml".to_string(),
+                },
+                runtime_config: RuntimeConfig::default(),
+                worker_model_ref: Some("worker-ref-0".to_string()),
+                dims,
+                cold_load_ms,
+                buckets,
+            },
+        );
+        LoadedModel { model_id }
     }
 
     pub(crate) fn embed_batch_with_job(
@@ -2437,6 +2496,9 @@ mod tests {
                 },
                 runtime_config,
                 worker_model_ref: Some("worker-model-0".to_string()),
+                dims: 0,
+                cold_load_ms: 0,
+                buckets: None,
             },
         );
 

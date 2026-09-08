@@ -1178,6 +1178,71 @@ struct EmbeddingModel {
     owned_decode_resolution_refusal: Option<owned_decode_routing::error::OwnedDecodeError>,
 }
 
+#[derive(Clone, Debug, Default)]
+struct ExecutionModelInfo {
+    dims: Option<usize>,
+    buckets: Option<Vec<usize>>,
+    dtype: Option<String>,
+}
+
+impl EmbeddingModel {
+    fn execution_info(&self) -> ExecutionModelInfo {
+        match &self.backend {
+            EmbedBackend::Owned(engine) => {
+                if let Ok(engine) = engine.lock() {
+                    if let Some(info) = engine.model_info(&self.loaded_model) {
+                        return ExecutionModelInfo {
+                            dims: Some(info.dims),
+                            buckets: Some(info.buckets),
+                            dtype: Some(info.dtype.as_str().to_string()),
+                        };
+                    }
+                }
+                ExecutionModelInfo::default()
+            }
+            EmbedBackend::Worker(engine) => {
+                if let Ok(engine) = engine.lock() {
+                    if let Some(info) = engine.model_info(&self.loaded_model) {
+                        return ExecutionModelInfo {
+                            dims: Some(info.dims),
+                            buckets: info.buckets,
+                            dtype: None,
+                        };
+                    }
+                }
+                ExecutionModelInfo::default()
+            }
+            EmbedBackend::Ort(_) | EmbedBackend::OwnedDecode => ExecutionModelInfo::default(),
+        }
+    }
+}
+
+fn dtype_for_slot(spec: &StoredModelConfig, exec_dtype: Option<String>) -> Option<String> {
+    if let Some(dtype) = exec_dtype {
+        return Some(dtype);
+    }
+    if let Some(owned_dtype) = &spec.owned_dtype {
+        return Some(owned_dtype.clone());
+    }
+    match spec.engine.as_str() {
+        "ane" | ANE_WORKER_ENGINE => Some("f16".to_string()),
+        "mlx" => Some("bf16".to_string()),
+        CUDA_WORKER_ENGINE => Some("f16".to_string()),
+        "ort" => Some("f32".to_string()),
+        _ => None,
+    }
+}
+
+fn device_class_for_engine(engine: &str) -> Option<String> {
+    match engine {
+        "owned-metal" | "owned-metal-decode" | MLX_WORKER_ENGINE => Some("metal".to_string()),
+        "ane" | ANE_WORKER_ENGINE => Some("ane".to_string()),
+        CUDA_WORKER_ENGINE | "cuda" => Some("cuda".to_string()),
+        "ort" | LLAMA_ENGINE | LLAMA_WORKER_ENGINE => Some("cpu".to_string()),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ModelTask {
     Embed,
@@ -1974,26 +2039,6 @@ impl RuntimeState {
                     .count()
             })
             .unwrap_or(0)
-    }
-
-    fn catalog_entries(&self) -> Vec<ModelCatalogEntry> {
-        self.catalog
-            .lock()
-            .map(|catalog| {
-                catalog
-                    .values()
-                    .map(|slot| ModelCatalogEntry {
-                        model_id: slot.spec.model_id.clone(),
-                        state: model_runtime_state_name(&slot.state).to_string(),
-                        fingerprints: vec![slot.spec.fingerprint.clone()],
-                        recommended_batch: recommended_batch_for_engine(
-                            &slot.spec.engine,
-                            slot.spec.max_tokens,
-                        ),
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default()
     }
 
     fn admit_inline(
@@ -14015,10 +14060,141 @@ fn cache_error_to_wire(error: ModelCacheError) -> WireOperationError {
     WireOperationError::from_stable(StableError::artifact_invalid(), error.to_string())
 }
 
-fn models_list_payload(state: &ModuleState, snapshot: CatalogSnapshot) -> Value {
-    let mut models = state
+fn module_catalog_entries(state: &ModuleState) -> Vec<ModelCatalogEntry> {
+    let slots = state
         .runtime
-        .catalog_entries()
+        .catalog
+        .lock()
+        .map(|catalog| {
+            catalog
+                .values()
+                .map(|slot| {
+                    (
+                        slot.spec.clone(),
+                        slot.loaded.clone(),
+                        slot.state.clone(),
+                        slot.last_cold_load_ms,
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    slots
+        .into_iter()
+        .map(|(spec, loaded, runtime_state, last_cold_load_ms)| {
+            let exec_info = loaded
+                .as_ref()
+                .map(|model| model.execution_info())
+                .unwrap_or_default();
+            let is_loaded = loaded.is_some();
+
+            let mut bucket_ladder = if is_loaded { exec_info.buckets } else { None };
+            if let Some(buckets) = bucket_ladder.as_mut() {
+                buckets.sort_unstable();
+                buckets.dedup();
+            }
+
+            let (max_tokens, max_tokens_source) = if let Some(ref buckets) = bucket_ladder {
+                if let Some(&largest_bucket) = buckets.last() {
+                    let source = if spec.engine == "owned-metal" {
+                        "runtime_bucket"
+                    } else {
+                        "worker_bucket"
+                    };
+                    (Some(largest_bucket), Some(source.to_string()))
+                } else {
+                    (Some(spec.max_tokens), Some("catalog".to_string()))
+                }
+            } else if is_loaded {
+                (Some(spec.max_tokens), Some("catalog".to_string()))
+            } else {
+                (Some(spec.max_tokens), Some("catalog_unloaded".to_string()))
+            };
+
+            let dims = if is_loaded { exec_info.dims } else { None };
+            let dtype = dtype_for_slot(&spec, exec_info.dtype);
+            let device_class = device_class_for_engine(&spec.engine);
+
+            let certification_fingerprint = loaded
+                .as_ref()
+                .map(|model| model.certification_fingerprint.clone())
+                .or_else(|| {
+                    (spec.engine == "owned-metal-decode")
+                        .then(|| owned_decode_catalog_entry(&spec).ok())
+                        .flatten()
+                        .and_then(|entry| entry.decode_identity_inputs().decode_fingerprint().ok())
+                })
+                .unwrap_or_else(|| spec.fingerprint.clone());
+
+            let certified =
+                if spec.engine == DECODE_WORKER_ENGINE || spec.engine == "owned-metal-decode" {
+                    let has_cert = state
+                        .store
+                        .get_owned_decode_measurement_row(
+                            &state.revisioned_machine_profile_hash,
+                            state.profile_activation_epoch,
+                            &spec.model_id,
+                            &certification_fingerprint.0,
+                            CERT_EVIDENCE_SCHEMA_REVISION,
+                            &[],
+                        )
+                        .ok()
+                        .flatten()
+                        .is_some_and(|row| row.status == CertificationStatus::Certified);
+                    Some(has_cert)
+                } else if let Some(class) = certification_class_for_task(&spec.task) {
+                    let has_cert = state
+                        .store
+                        .get_cert_row(
+                            class,
+                            &state.machine_profile_hash,
+                            &certification_fingerprint,
+                        )
+                        .ok()
+                        .flatten()
+                        .is_some();
+                    Some(has_cert)
+                } else if spec.engine == "owned-metal" && spec.task == "generate" {
+                    Some(false)
+                } else {
+                    // Lane classes with no certification concept (such as worker-backed llama generate)
+                    // omit the field rather than fabricating true or false.
+                    None
+                };
+
+            let warm_load_cost_hint_ms = last_cold_load_ms.or_else(|| {
+                state
+                    .store
+                    .get_perf_row(&state.machine_profile_hash, &spec.fingerprint)
+                    .ok()
+                    .flatten()
+                    .map(|perf| perf.cold_load_ms)
+            });
+
+            let recommended_batch =
+                recommended_batch_for_engine(&spec.engine, max_tokens.unwrap_or(spec.max_tokens));
+
+            ModelCatalogEntry {
+                model_id: spec.model_id,
+                state: model_runtime_state_name(&runtime_state).to_string(),
+                fingerprints: vec![spec.fingerprint],
+                recommended_batch,
+                max_tokens,
+                max_tokens_source,
+                bucket_ladder,
+                dims,
+                dtype,
+                device_class,
+                certified,
+                warm_load_cost_hint_ms,
+            }
+        })
+        .collect()
+}
+
+fn models_list_payload(state: &ModuleState, snapshot: CatalogSnapshot) -> Value {
+    let mut models = module_catalog_entries(state)
         .into_iter()
         .map(|entry| serde_json::to_value(entry).expect("catalog entry serializes"))
         .collect::<Vec<_>>();
@@ -14626,6 +14802,29 @@ mod tests {
             undocumented_error_codes.is_empty(),
             "wire contract is missing stable error codes: {undocumented_error_codes:?}"
         );
+    }
+
+    #[test]
+    fn wire_contract_documents_every_model_catalog_field() {
+        const CONTRACT: &str = include_str!("../../../docs/wire-contract-v1.md");
+        const MODEL_CATALOG_FIELDS: [&str; 9] = [
+            "recommended_batch",
+            "max_tokens",
+            "max_tokens_source",
+            "bucket_ladder",
+            "dims",
+            "dtype",
+            "device_class",
+            "certified",
+            "warm_load_cost_hint_ms",
+        ];
+
+        for field in MODEL_CATALOG_FIELDS {
+            assert!(
+                CONTRACT.contains(&format!("`{field}`")),
+                "wire contract is missing model catalog field: {field}"
+            );
+        }
     }
 
     #[test]
@@ -16091,6 +16290,401 @@ mod tests {
             Some("derived-digest")
         );
         assert_eq!(stream.generation_id, "generation-9");
+    }
+
+    fn make_test_tokenizer(dir: &Path, max_tokens: usize) -> SanitizedTokenizer {
+        let path = dir.join("tokenizer.json");
+        std::fs::write(
+            &path,
+            r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"[UNK]":0},"unk_token":"[UNK]"}}"#,
+        )
+        .expect("write test tokenizer");
+        SanitizedTokenizer::from_file(&path, TokenizerConfig { max_tokens })
+            .expect("load test tokenizer")
+    }
+
+    #[test]
+    fn models_list_rows_carry_all_contract_fields_matching_enforced_sources() {
+        use crate::worker_host::{WorkerEngine, WorkerHostConfig};
+
+        let (storage_dir, descriptor) = test_storage_descriptor("models-list-enforced");
+        let store = Arc::new(SynapseStore::open(&descriptor).expect("open test store"));
+        let profile = test_machine_profile("test-os");
+        store
+            .activate_profile(&profile, 1, 1000)
+            .expect("activate profile");
+        let state = test_module_state(store, profile);
+
+        let mut metal_spec = stuck_model_spec();
+        metal_spec.model_id = "test-metal-lane".to_string();
+        metal_spec.engine = "owned-metal".to_string();
+        metal_spec.task = "embed".to_string();
+        metal_spec.max_tokens = 512;
+        metal_spec.owned_dtype = Some("f16".to_string());
+        metal_spec.fingerprint = Fingerprint(
+            "metal-fingerprint-0000000000000000000000000000000000000000000000000000000000000000"
+                .to_string(),
+        );
+
+        let mut metal_engine = OwnedMetalEmbedEngine::new(OwnedFamily::MiniLm, OwnedDType::F16);
+        let metal_loaded = metal_engine.insert_test_model(
+            "owned-metal:test:0".to_string(),
+            384,
+            vec![128, 256, 384, 512],
+        );
+        let metal_model = Arc::new(EmbeddingModel {
+            model_id: metal_spec.model_id.clone(),
+            task: ModelTask::Embed,
+            loaded_model: metal_loaded,
+            backend: EmbedBackend::Owned(Arc::new(Mutex::new(metal_engine))),
+            tokenizer: make_test_tokenizer(&storage_dir, 512),
+            numeric_profile_id: metal_spec.numeric_profile_id.clone(),
+            fingerprint: metal_spec.fingerprint.clone(),
+            certification_fingerprint: metal_spec.fingerprint.clone(),
+            engine_identity: metal_spec.engine_identity.clone(),
+            owned_tokenizer_policy: None,
+            owned_decode_resolution_refusal: None,
+        });
+
+        state
+            .store
+            .store
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO cert_rows (
+                        certification_class, assurance_class, status, key_hash,
+                        machine_profile_hash, remote_profile_hash, identity_revision,
+                        numeric_profile_id, fingerprint, certified_at_ms, os_build,
+                        module_generation, evidence_json
+                     ) VALUES (?1, 'measured', 'certified', ?2, ?2, NULL, NULL, 'test-profile', ?3, 1000, 'test-os', 1, '{}')",
+                    rusqlite::params!["embedding", state.machine_profile_hash, &metal_spec.fingerprint.0],
+                )?;
+                Ok(())
+            })
+            .expect("insert cert row for metal lane");
+
+        let mut ane_spec = stuck_model_spec();
+        ane_spec.model_id = "test-ane-lane".to_string();
+        ane_spec.engine = "ane".to_string();
+        ane_spec.task = "embed".to_string();
+        // Catalog config carries 4096 (the batch budget drift defect) to verify
+        // the published ceiling prefers the worker's real loaded ceiling (512).
+        ane_spec.max_tokens = 4096;
+        ane_spec.fingerprint = Fingerprint(
+            "ane-fingerprint-0000000000000000000000000000000000000000000000000000000000000000"
+                .to_string(),
+        );
+
+        let worker_config = WorkerHostConfig::new(
+            PathBuf::from("/bin/false"),
+            storage_dir.join("test-ane-worker"),
+        );
+        let worker_engine = WorkerEngine::new(worker_config).expect("create worker engine");
+        let ane_loaded = worker_engine.insert_loaded_model_for_test(
+            "ane-host-model-0".to_string(),
+            384,
+            32,
+            Some(vec![128, 256, 512]),
+        );
+        let ane_model = Arc::new(EmbeddingModel {
+            model_id: ane_spec.model_id.clone(),
+            task: ModelTask::Embed,
+            loaded_model: ane_loaded,
+            backend: EmbedBackend::Worker(Arc::new(Mutex::new(worker_engine))),
+            tokenizer: make_test_tokenizer(&storage_dir, 512),
+            numeric_profile_id: ane_spec.numeric_profile_id.clone(),
+            fingerprint: ane_spec.fingerprint.clone(),
+            certification_fingerprint: ane_spec.fingerprint.clone(),
+            engine_identity: ane_spec.engine_identity.clone(),
+            owned_tokenizer_policy: None,
+            owned_decode_resolution_refusal: None,
+        });
+
+        let mut unloaded_spec = stuck_model_spec();
+        unloaded_spec.model_id = "test-unloaded-lane".to_string();
+        unloaded_spec.engine = "ort".to_string();
+        unloaded_spec.task = "embed".to_string();
+        unloaded_spec.max_tokens = 256;
+
+        {
+            let mut catalog = state.runtime.catalog.lock().expect("catalog locks");
+            catalog.clear();
+            catalog.insert(
+                metal_spec.model_id.clone(),
+                ModelSlot {
+                    spec: metal_spec.clone(),
+                    loaded: Some(metal_model),
+                    state: ModelRuntimeState::Ready,
+                    notify: Arc::new(Notify::new()),
+                    last_cold_load_ms: Some(18.5),
+                },
+            );
+            catalog.insert(
+                ane_spec.model_id.clone(),
+                ModelSlot {
+                    spec: ane_spec.clone(),
+                    loaded: Some(ane_model),
+                    state: ModelRuntimeState::Ready,
+                    notify: Arc::new(Notify::new()),
+                    last_cold_load_ms: Some(32.0),
+                },
+            );
+            catalog.insert(
+                unloaded_spec.model_id.clone(),
+                ModelSlot {
+                    spec: unloaded_spec.clone(),
+                    loaded: None,
+                    state: ModelRuntimeState::Unloaded,
+                    notify: Arc::new(Notify::new()),
+                    last_cold_load_ms: None,
+                },
+            );
+        }
+
+        let snapshot = state
+            .store
+            .catalog_snapshot()
+            .expect("catalog snapshot reads");
+        let payload = models_list_payload(&state, snapshot);
+        let models = payload["models"]
+            .as_array()
+            .expect("models array in payload");
+
+        assert_eq!(models.len(), 3);
+        for row in models {
+            assert!(
+                row["max_tokens"].as_u64().unwrap_or(0) > 0,
+                "every models.list row must carry positive max_tokens: {row:?}"
+            );
+            assert!(
+                row.get("max_tokens_source").is_some(),
+                "every row must disclose max_tokens_source: {row:?}"
+            );
+            assert!(
+                row.get("device_class").is_some(),
+                "every row must identify device_class: {row:?}"
+            );
+            assert!(
+                row.get("fingerprints").is_some(),
+                "every row must carry fingerprints: {row:?}"
+            );
+            assert!(
+                row.get("state").is_some(),
+                "every row must carry state: {row:?}"
+            );
+            assert!(
+                row.get("certified").is_some(),
+                "every row must carry certified flag: {row:?}"
+            );
+        }
+
+        let metal_row = models
+            .iter()
+            .find(|r| r["model_id"] == "test-metal-lane")
+            .expect("metal row exists");
+        assert_eq!(metal_row["max_tokens"], 512);
+        assert_eq!(metal_row["max_tokens_source"], "runtime_bucket");
+        assert_eq!(metal_row["bucket_ladder"], json!([128, 256, 384, 512]));
+        assert_eq!(metal_row["dims"], 384);
+        assert_eq!(metal_row["dtype"], "f16");
+        assert_eq!(metal_row["device_class"], "metal");
+        assert_eq!(metal_row["certified"], true);
+        assert_eq!(metal_row["warm_load_cost_hint_ms"], 18.5);
+        assert_eq!(metal_row["recommended_batch"]["rows"], 8);
+
+        let ane_row = models
+            .iter()
+            .find(|r| r["model_id"] == "test-ane-lane")
+            .expect("ane row exists");
+        assert_eq!(
+            ane_row["max_tokens"], 512,
+            "ANE ceiling must come from worker's largest bucket, not misleading catalog budget"
+        );
+        assert_eq!(ane_row["max_tokens_source"], "worker_bucket");
+        assert_eq!(ane_row["bucket_ladder"], json!([128, 256, 512]));
+        assert_eq!(ane_row["dims"], 384);
+        assert_eq!(ane_row["dtype"], "f16");
+        assert_eq!(ane_row["device_class"], "ane");
+        assert_eq!(
+            ane_row["certified"], false,
+            "uncertified ANE lane cannot advertise certified=true"
+        );
+        assert_eq!(ane_row["warm_load_cost_hint_ms"], 32.0);
+        assert_eq!(ane_row["recommended_batch"]["rows"], 8);
+        assert_eq!(ane_row["recommended_batch"]["token_budget"], 4096);
+
+        // Enforced ceiling invariant: verify that the advertised ceiling (512) would
+        // never permit a row length that the ANE worker refuses.
+        let ladder = ane_row["bucket_ladder"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap())
+            .collect::<Vec<_>>();
+        let advertised_ceiling = ane_row["max_tokens"].as_u64().unwrap();
+
+        // Any length up to the ceiling finds a covering bucket in the ladder:
+        for length in [1, 100, 128, 200, 256, 400, 512] {
+            assert!(
+                length <= advertised_ceiling,
+                "length should be within ceiling"
+            );
+            assert!(
+                ladder.iter().any(|&bucket| bucket >= length),
+                "ANE worker will accept length {length} because covering bucket exists"
+            );
+        }
+        // Any length exceeding the ceiling has no covering bucket:
+        for length in [513, 600, 1024, 4096] {
+            assert!(
+                length > advertised_ceiling,
+                "length exceeds advertised ceiling"
+            );
+            assert!(
+                !ladder.iter().any(|&bucket| bucket >= length),
+                "ANE worker would refuse length {length} as no covering bucket exists"
+            );
+        }
+
+        let unloaded_row = models
+            .iter()
+            .find(|r| r["model_id"] == "test-unloaded-lane")
+            .expect("unloaded row exists");
+        assert_eq!(unloaded_row["max_tokens"], 256);
+        assert_eq!(unloaded_row["max_tokens_source"], "catalog_unloaded");
+        assert!(
+            unloaded_row.get("bucket_ladder").is_none(),
+            "unloaded lane must omit unknown bucket ladder"
+        );
+        assert!(
+            unloaded_row.get("dims").is_none(),
+            "unloaded lane must omit unknown dims"
+        );
+        assert_eq!(unloaded_row["device_class"], "cpu");
+        assert_eq!(unloaded_row["certified"], false);
+    }
+
+    #[test]
+    fn models_list_every_row_carries_max_tokens_and_matches_enforced_source() {
+        let (_storage_dir, descriptor) = test_storage_descriptor("models-list-source-match");
+        let store = Arc::new(SynapseStore::open(&descriptor).expect("open test store"));
+        let profile = test_machine_profile("test-os");
+        store
+            .activate_profile(&profile, 1, 1000)
+            .expect("activate profile");
+        let state = test_module_state(store, profile);
+
+        let snapshot = state
+            .store
+            .catalog_snapshot()
+            .expect("catalog snapshot reads");
+        let payload = models_list_payload(&state, snapshot);
+        let models = payload["models"]
+            .as_array()
+            .expect("models array in payload");
+
+        assert!(
+            !models.is_empty(),
+            "models.list must contain at least one model"
+        );
+        for row in models {
+            let max_tokens = row["max_tokens"].as_u64();
+            assert!(
+                max_tokens.is_some_and(|val| val > 0),
+                "row {} missing positive max_tokens: {row:?}",
+                row["model_id"]
+            );
+            if row["model_id"] == "stuck-model" {
+                assert_eq!(
+                    max_tokens,
+                    Some(128),
+                    "stuck-model max_tokens must match catalog value (128)"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn models_list_generate_lane_without_evidence_does_not_report_certified_true() {
+        let (_storage_dir, descriptor) = test_storage_descriptor("models-list-generate-uncert");
+        let store = Arc::new(SynapseStore::open(&descriptor).expect("open test store"));
+        let profile = test_machine_profile("test-os");
+        store
+            .activate_profile(&profile, 1, 1000)
+            .expect("activate profile");
+        let state = test_module_state(store, profile);
+
+        let mut llama_spec = stuck_model_spec();
+        llama_spec.model_id = "test-llama-generate".to_string();
+        llama_spec.engine = "llama".to_string();
+        llama_spec.task = "generate".to_string();
+
+        let mut decode_spec = stuck_model_spec();
+        decode_spec.model_id = "test-decode-generate".to_string();
+        decode_spec.engine = DECODE_WORKER_ENGINE.to_string();
+        decode_spec.task = "generate".to_string();
+
+        {
+            let mut catalog = state.runtime.catalog.lock().expect("catalog locks");
+            catalog.clear();
+            catalog.insert(
+                llama_spec.model_id.clone(),
+                ModelSlot {
+                    spec: llama_spec.clone(),
+                    loaded: None,
+                    state: ModelRuntimeState::Ready,
+                    notify: Arc::new(Notify::new()),
+                    last_cold_load_ms: None,
+                },
+            );
+            catalog.insert(
+                decode_spec.model_id.clone(),
+                ModelSlot {
+                    spec: decode_spec.clone(),
+                    loaded: None,
+                    state: ModelRuntimeState::Ready,
+                    notify: Arc::new(Notify::new()),
+                    last_cold_load_ms: None,
+                },
+            );
+        }
+
+        let snapshot = state
+            .store
+            .catalog_snapshot()
+            .expect("catalog snapshot reads");
+        let payload = models_list_payload(&state, snapshot);
+        let models = payload["models"]
+            .as_array()
+            .expect("models array in payload");
+
+        let llama_row = models
+            .iter()
+            .find(|r| r["model_id"] == "test-llama-generate")
+            .expect("llama row exists");
+        assert_ne!(
+            llama_row.get("certified"),
+            Some(&json!(true)),
+            "generate lane without evidence must not report certified=true"
+        );
+        assert!(
+            llama_row.get("certified").is_none(),
+            "legacy generate lane without certification concept must omit certified field"
+        );
+
+        let decode_row = models
+            .iter()
+            .find(|r| r["model_id"] == "test-decode-generate")
+            .expect("decode row exists");
+        assert_ne!(
+            decode_row.get("certified"),
+            Some(&json!(true)),
+            "uncertified decode lane must not report certified=true"
+        );
+        assert_eq!(
+            decode_row["certified"], false,
+            "uncertified decode lane must report certified=false"
+        );
     }
 }
 

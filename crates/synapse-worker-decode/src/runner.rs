@@ -2498,6 +2498,7 @@ impl WorkerState {
             model_ref,
             dims: 0,
             cold_load_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+            buckets: None,
         })
     }
 

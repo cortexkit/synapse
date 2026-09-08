@@ -842,19 +842,35 @@ pub enum SynapseStoreError {
     RestoreRefused(String),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecommendedBatch {
     pub rows: usize,
     pub token_budget: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ModelCatalogEntry {
     pub model_id: String,
     pub state: String,
     pub fingerprints: Vec<Fingerprint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recommended_batch: Option<RecommendedBatch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bucket_ladder: Option<Vec<usize>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dims: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dtype: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_class: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certified: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warm_load_cost_hint_ms: Option<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2333,11 +2349,43 @@ impl SynapseStore {
         let models = self
             .catalog_models()?
             .into_iter()
-            .map(|model| ModelCatalogEntry {
-                model_id: model.model_id,
-                state: "unloaded".to_string(),
-                fingerprints: vec![model.fingerprint],
-                recommended_batch: None,
+            .map(|model| {
+                let dtype = model
+                    .owned_dtype
+                    .clone()
+                    .or_else(|| match model.engine.as_str() {
+                        "ane" => Some("f16".to_string()),
+                        "mlx" => Some("bf16".to_string()),
+                        "owned-cuda" => Some("f16".to_string()),
+                        "ort" => Some("f32".to_string()),
+                        _ => None,
+                    });
+                let device_class = match model.engine.as_str() {
+                    "owned-metal" | "owned-metal-decode" | "mlx" => Some("metal".to_string()),
+                    "ane" => Some("ane".to_string()),
+                    "owned-cuda" => Some("cuda".to_string()),
+                    "ort" | "llama" => Some("cpu".to_string()),
+                    _ => None,
+                };
+                let certified = if model.engine == "llama" && model.task == "generate" {
+                    None
+                } else {
+                    Some(false)
+                };
+                ModelCatalogEntry {
+                    model_id: model.model_id,
+                    state: "unloaded".to_string(),
+                    fingerprints: vec![model.fingerprint],
+                    recommended_batch: None,
+                    max_tokens: Some(model.max_tokens),
+                    max_tokens_source: Some("catalog_unloaded".to_string()),
+                    bucket_ladder: None,
+                    dims: None,
+                    dtype,
+                    device_class,
+                    certified,
+                    warm_load_cost_hint_ms: None,
+                }
             })
             .collect();
         Ok(CatalogSnapshot {

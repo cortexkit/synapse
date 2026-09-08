@@ -95,6 +95,21 @@ fn run_worker<S: Read + Write>(
     let abort_on_embed = std::env::var("SYNAPSE_TIMEOUT_WORKER_ABORT_ON_EMBED")
         .ok()
         .is_some_and(|value| value == "1");
+    let buckets: Option<Vec<usize>> = if std::env::var("SYNAPSE_TIMEOUT_WORKER_NO_BUCKETS")
+        .ok()
+        .is_some_and(|value| value == "1")
+    {
+        None
+    } else {
+        std::env::var("SYNAPSE_TIMEOUT_WORKER_BUCKETS")
+            .ok()
+            .map(|val| {
+                val.split(',')
+                    .filter_map(|s| s.trim().parse::<usize>().ok())
+                    .collect()
+            })
+            .or_else(|| Some(vec![128, 256, 512]))
+    };
 
     loop {
         let frame = match read_frame(stream, max_frame) {
@@ -111,8 +126,9 @@ fn run_worker<S: Read + Write>(
                     &WorkerResponse::Loaded {
                         req_id,
                         model_ref: "mock-model-0".to_string(),
-                        dims: 1,
+                        dims: embed_dims,
                         cold_load_ms: load_sleep_ms,
+                        buckets: buckets.clone(),
                     },
                     max_frame,
                 )?;
@@ -162,6 +178,7 @@ fn run_worker<S: Read + Write>(
                         rss_mb: 0,
                         models_loaded: 1,
                         placement_share: None,
+                        buckets: buckets.clone(),
                     },
                     max_frame,
                 )?;

@@ -134,6 +134,10 @@ private struct Main {
                     if let share = state.lastPlacementShare {
                         response["placement_share"] = share
                     }
+                    let allBuckets = state.models.values.flatMap { $0.buckets.map { $0.bucket } }
+                    if !allBuckets.isEmpty {
+                        response["buckets"] = Array(Set(allBuckets)).sorted()
+                    }
                     try writeJSONFrame(fd: fd, value: response)
                 case "SHUTDOWN":
                     return
@@ -245,7 +249,8 @@ private func handleLoad(state: inout WorkerState, request: [String: Any], reqId:
         "req_id": reqId,
         "model_ref": modelRef,
         "dims": dims,
-        "cold_load_ms": UInt64((monotonicTime() - started) * 1000)
+        "cold_load_ms": UInt64((monotonicTime() - started) * 1000),
+        "buckets": buckets.map { $0.bucket }
     ]
 }
 

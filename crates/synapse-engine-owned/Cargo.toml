@@ -7,6 +7,10 @@ license.workspace = true
 description = "Synapse owned Metal MPSGraph embedding engine."
 publish = false
 
+[features]
+default = []
+test-support = []
+
 [dependencies]
 synapse-core = { path = "../synapse-core" }
 anyhow = { workspace = true }

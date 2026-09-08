@@ -1387,6 +1387,14 @@ async fn owned_gte_rerank_loads_certifies_and_serves_deterministically() {
         .expect("reranker fingerprint")
         .to_string();
     assert_eq!(fingerprint.len(), 64);
+    assert_eq!(model["max_tokens"], 8192);
+    assert_eq!(model["max_tokens_source"], "runtime_bucket");
+    assert_eq!(model["device_class"], "metal");
+    assert_eq!(model["dtype"], "f32");
+    assert_eq!(model["dims"], 768);
+    assert_eq!(model["certified"], true);
+    assert!(model.get("bucket_ladder").is_some());
+    assert!(model.get("warm_load_cost_hint_ms").is_some());
 
     let params = serde_json::json!({
         "method": "rerank.score",

@@ -111,6 +111,8 @@ pub enum WorkerResponse {
         model_ref: String,
         dims: usize,
         cold_load_ms: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        buckets: Option<Vec<usize>>,
     },
     Vectors {
         req_id: String,
@@ -138,6 +140,8 @@ pub enum WorkerResponse {
         models_loaded: usize,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         placement_share: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        buckets: Option<Vec<usize>>,
     },
     Err {
         #[serde(default, skip_serializing_if = "Option::is_none")]

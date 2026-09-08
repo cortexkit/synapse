@@ -258,6 +258,10 @@ impl ModelFamily for Model {
         "qwen3-0.6b"
     }
 
+    fn output_dim(&self) -> usize {
+        self.config.hidden_size
+    }
+
     fn tokenizer_policy(&self) -> super::FamilyTokenizerPolicy {
         super::FamilyTokenizerPolicy {
             pad_token_id: 0,

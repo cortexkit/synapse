@@ -155,6 +155,10 @@ impl RemoteGateway {
                     "assurance": "declared",
                     "identity_revision": profile.identity_revision,
                     "task": task_name(profile.task),
+                    "max_tokens": profile.max_input_tokens,
+                    "max_tokens_source": "catalog",
+                    "dims": profile.dims,
+                    "certified": false,
                 })
             })
             .collect::<Vec<_>>();

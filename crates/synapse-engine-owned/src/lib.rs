@@ -183,6 +183,13 @@ pub fn engine_identity(family: ModelFamily, dtype: OwnedDType) -> EngineIdentity
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnedModelInfo {
+    pub dims: usize,
+    pub buckets: Vec<usize>,
+    pub dtype: OwnedDType,
+}
+
 pub struct OwnedMetalEmbedEngine {
     family: ModelFamily,
     dtype: OwnedDType,
@@ -225,6 +232,88 @@ impl OwnedMetalEmbedEngine {
     #[must_use]
     pub const fn dtype(&self) -> OwnedDType {
         self.dtype
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn model_info(&self, model: &LoadedModel) -> Option<OwnedModelInfo> {
+        let loaded = self.models.get(&model.model_id)?;
+        let loaded = loaded.lock().ok()?;
+        let mut buckets = loaded.buckets.iter().map(|b| b.seq).collect::<Vec<_>>();
+        buckets.sort_unstable();
+        buckets.dedup();
+        Some(OwnedModelInfo {
+            dims: loaded.family.output_dim(),
+            buckets,
+            dtype: self.dtype,
+        })
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn model_info(&self, _model: &LoadedModel) -> Option<OwnedModelInfo> {
+        None
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn insert_test_model(
+        &mut self,
+        model_id: String,
+        dims: usize,
+        bucket_seqs: Vec<usize>,
+    ) -> LoadedModel {
+        #[cfg(target_os = "macos")]
+        {
+            struct TestModelFamily(usize);
+            impl runtime::ModelFamily for TestModelFamily {
+                fn family_name(&self) -> &'static str {
+                    "test"
+                }
+                fn output_dim(&self) -> usize {
+                    self.0
+                }
+                fn tokenizer_policy(&self) -> runtime::FamilyTokenizerPolicy {
+                    runtime::FamilyTokenizerPolicy {
+                        pad_token_id: 0,
+                        terminal_token_id: None,
+                    }
+                }
+                fn embed_batch(
+                    &self,
+                    _provider: &mut dyn runtime::KernelProvider,
+                    _sequences: &[Vec<u32>],
+                    _shape: Option<runtime::BatchShape>,
+                ) -> anyhow::Result<Vec<Vec<f32>>> {
+                    Ok(Vec::new())
+                }
+            }
+
+            let config = runtime::MetalExecutionConfig::new(runtime::Execution::Explicit, None)
+                .expect("test metal config");
+            let provider = runtime::MetalProvider::new_with_config(precision(self.dtype), config)
+                .expect("test metal provider");
+            let buckets = bucket_seqs
+                .into_iter()
+                .map(|seq| runtime::BatchShape { batch: 1, seq })
+                .collect();
+            self.models.insert(
+                model_id.clone(),
+                Arc::new(Mutex::new(OwnedLoadedModel {
+                    family: Box::new(TestModelFamily(dims)),
+                    provider,
+                    buckets,
+                    tokenizer_policy: TokenizerPolicy {
+                        add_special_tokens: false,
+                        pad_token_id: 0,
+                        terminal_token_id: None,
+                    },
+                })),
+            );
+            LoadedModel { model_id }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (dims, bucket_seqs);
+            LoadedModel { model_id }
+        }
     }
 
     fn error(stage: EngineErrorStage, message: impl Into<String>) -> EngineError {
