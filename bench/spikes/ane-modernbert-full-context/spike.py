@@ -54,6 +54,7 @@ def parse_args() -> argparse.Namespace:
     cpu.add_argument("--seq-len", type=int, default=129)
     cpu.add_argument("--query-tile", type=int, default=32)
     cpu.add_argument("--report", type=Path, required=True)
+    _add_rotation_args(cpu)
 
     prepare = subparsers.add_parser("prepare-input")
     _add_stage_shape_args(prepare)
@@ -73,6 +74,7 @@ def parse_args() -> argparse.Namespace:
     export.add_argument("--out", type=Path, required=True)
     export.add_argument("--report", type=Path, required=True)
     export.add_argument("--overwrite", action="store_true")
+    _add_rotation_args(export)
     export.add_argument(
         "--fp32-islands",
         choices=("none", "final-norm", "residual"),
@@ -97,6 +99,16 @@ def _add_stage_shape_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--seq-len", type=int, required=True, choices=STAGES)
     parser.add_argument("--query-tile", type=int, default=256)
     parser.add_argument("--key-tile", type=int, default=256)
+
+
+def _add_rotation_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--rotation",
+        choices=("none", "hadamard"),
+        default="none",
+        help="Fold the reference residual-stream Hadamard rotation into the export.",
+    )
+    parser.add_argument("--rotation-seed", type=int, default=0)
 
 
 def sha256_file(path: Path) -> str:
@@ -386,8 +398,16 @@ def command_cpu_check(args: argparse.Namespace) -> dict[str, Any]:
     rows = benchmark_rows(args.model, config, args.seq_len, args.query_tile)
     inputs = row_tensors(rows)
 
-    tiled, _ = build_embedder(args.model, args.seq_len, args.query_tile, attention_kind="query_tiled")
+    tiled, _ = build_embedder(
+        args.model,
+        args.seq_len,
+        args.query_tile,
+        attention_kind="query_tiled",
+        rotation=args.rotation,
+        rotation_seed=args.rotation_seed,
+    )
     tiled_vectors = _run_model(tiled, inputs)
+    rotation = tiled.rotation_report()
     del tiled
     gc.collect()
 
@@ -428,6 +448,7 @@ def command_cpu_check(args: argparse.Namespace) -> dict[str, Any]:
         "fixtures": [row["id"] for row in rows],
         "tiled_vs_streaming_full_context": tiled_streaming,
         "tiled_vs_huggingface_eager": tiled_hf,
+        "rotation": rotation,
         "model": model_digests(args.model),
         "environment": environment_report(),
     }
@@ -481,8 +502,14 @@ def command_export(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("reference row ordering differs from input")
     inputs = row_tensors(rows)
     model, config = build_embedder(
-        args.model, args.seq_len, args.query_tile, attention_kind="query_tiled"
+        args.model,
+        args.seq_len,
+        args.query_tile,
+        attention_kind="query_tiled",
+        rotation=args.rotation,
+        rotation_seed=args.rotation_seed,
     )
+    rotation = model.rotation_report()
     eager = _run_model(model, inputs)
     eager_reference = parity_report(reference, eager)
     if eager_reference["min_cosine"] < 0.99999:
@@ -553,6 +580,7 @@ def command_export(args: argparse.Namespace) -> dict[str, Any]:
         "compute_precision": precision_policy,
         "compute_units": "CPU_AND_NE",
         "skip_model_load": True,
+        "rotation": rotation,
         "timing_s": {
             "torch_export": export_latency,
             "coreml_conversion": conversion_latency,

@@ -60,6 +60,8 @@ The driver samples owned-child RSS plus system free and wired memory. Defaults r
 
 The optional `--fp32-islands final-norm|residual` export control keeps only the selected full-model operations in float32. It is diagnostic, not a production policy or a parity-threshold override. Broader norm and norm-plus-residual controls were removed because they emitted zero vectors and therefore were invalid experiments, not precision evidence.
 
+`--rotation hadamard --rotation-seed 0` applies the reference ModernBERT exporter's residual-stream conditioning. It centers the canonical residual stream, converts bias-free LayerNorm to parameter-free RMSNorm, and folds a reproducible randomized Hadamard basis change into the token embeddings and paired projection weights. The only additional runtime projections are ANE-friendly 1x1 convolutions for the first residual branch and final unrotation. The transformation is output-preserving in exact arithmetic; the seed fixes the reference implementation's otherwise-random sign draw for reproducible package hashes. `run_stages.py --start-at 2048` can resume ordered staging after a separately verified 1024 result.
+
 Run `pyright -p pyrightconfig.json` from the repository root. The local `.venv` declared by that config contains the optional research dependencies; source files do not suppress missing-import or type diagnostics.
 
 ## Durable evidence
@@ -73,6 +75,8 @@ Target-only packages, vectors, and verbose logs stay outside git. Compact JSON r
 - exported-graph and MIL tensor-shape checks that reject sequence-square attention outputs;
 - system free/wired memory and owned-child peak RSS around every process;
 - complete operator/device counts, expensive-op placement (`matmul`/`einsum`, `softmax`, convolution, normalization, reductions), non-ANE operations, and exact errors.
+
+Rotation-conditioning measurements and source analysis are committed under `docs/evidence/ane-modernbert-rotation-conditioning/`.
 
 `CPU_AND_NE` excludes GPU but does not by itself prove ANE residency. Stage summaries distinguish mixed/CPU attention placement from successful CPU+NE prediction whose attention operators are preferred on ANE. The latter combines runtime success with `MLComputePlan`; the plan is still static preferred-placement evidence, not a runtime dispatch trace.
 

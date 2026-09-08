@@ -12,7 +12,59 @@ import torch
 
 import modernbert_tiled as tiled
 from norm_reproducer import NormVariants
-from run_stages import stage_can_continue
+from run_stages import selected_stages, stage_can_continue
+
+
+def tiny_model_fixture() -> tuple[tiled.ModernBertConfig, dict[str, torch.Tensor]]:
+    config = tiled.ModernBertConfig(
+        hidden_size=12,
+        intermediate_size=18,
+        num_attention_heads=3,
+        num_hidden_layers=2,
+        global_attn_every_n_layers=2,
+        global_rope_theta=10_000.0,
+        local_attention=4,
+        local_rope_theta=1_000.0,
+        max_position_embeddings=8,
+        norm_eps=1e-5,
+        pad_token_id=0,
+        cls_token_id=1,
+        sep_token_id=2,
+        vocab_size=32,
+    )
+    generator = torch.Generator().manual_seed(43)
+
+    def weight(*shape: int) -> torch.Tensor:
+        return torch.randn(shape, generator=generator) * 0.08
+
+    tensors = {
+        "embeddings.tok_embeddings.weight": weight(config.vocab_size, config.hidden_size),
+        "embeddings.norm.weight": torch.rand(config.hidden_size, generator=generator) + 0.5,
+        "final_norm.weight": torch.rand(config.hidden_size, generator=generator) + 0.5,
+    }
+    for layer_index in range(config.num_hidden_layers):
+        prefix = f"layers.{layer_index}"
+        tensors.update(
+            {
+                f"{prefix}.attn.Wqkv.weight": weight(3 * config.hidden_size, config.hidden_size),
+                f"{prefix}.attn.Wo.weight": weight(config.hidden_size, config.hidden_size),
+                f"{prefix}.mlp.Wi.weight": weight(
+                    2 * config.intermediate_size, config.hidden_size
+                ),
+                f"{prefix}.mlp.Wo.weight": weight(
+                    config.hidden_size, config.intermediate_size
+                ),
+                f"{prefix}.mlp_norm.weight": torch.rand(
+                    config.hidden_size, generator=generator
+                )
+                + 0.5,
+            }
+        )
+        if layer_index > 0:
+            tensors[f"{prefix}.attn_norm.weight"] = (
+                torch.rand(config.hidden_size, generator=generator) + 0.5
+            )
+    return config, tensors
 
 
 def dense_attention(
@@ -185,6 +237,48 @@ class AttentionTests(unittest.TestCase):
         self.assertNotIn((2, 9, 1, 9), mask_shapes)
 
 
+class RotationTests(unittest.TestCase):
+    def test_randomized_hadamard_is_orthogonal_and_seeded(self) -> None:
+        first = tiled.randomized_hadamard_matrix(12, seed=17)
+        second = tiled.randomized_hadamard_matrix(12, seed=17)
+        torch.testing.assert_close(first, second, rtol=0.0, atol=0.0)
+        torch.testing.assert_close(
+            first.T @ first,
+            torch.eye(12, dtype=torch.float64),
+            rtol=1e-12,
+            atol=1e-12,
+        )
+
+    def test_folded_rotation_preserves_end_to_end_output(self) -> None:
+        config, tensors = tiny_model_fixture()
+        baseline = tiled.ModernBertEmbedder(
+            config,
+            {name: value.clone() for name, value in tensors.items()},
+            sequence_length=5,
+            query_tile_size=3,
+        ).eval()
+        rotated = tiled.ModernBertEmbedder(
+            config,
+            {name: value.clone() for name, value in tensors.items()},
+            sequence_length=5,
+            query_tile_size=3,
+            rotation="hadamard",
+            rotation_seed=17,
+        ).eval()
+        input_ids = torch.tensor([[1, 8, 9, 2, 0]], dtype=torch.int32)
+        attention_mask = torch.tensor([[1, 1, 1, 1, 0]], dtype=torch.int32)
+        with torch.inference_mode():
+            expected = baseline(input_ids, attention_mask)
+            actual = rotated(input_ids, attention_mask)
+        torch.testing.assert_close(actual, expected, rtol=5e-5, atol=5e-5)
+
+    def test_rms_norm_matches_direct_formula(self) -> None:
+        value = torch.randn(2, 12, 1, 5)
+        norm = tiled.ChannelRMSNorm(12, 1e-5)
+        expected = value / torch.sqrt(value.square().mean(dim=1, keepdim=True) + 1e-5)
+        torch.testing.assert_close(norm(value), expected, rtol=2e-6, atol=2e-6)
+
+
 class NormReproducerTests(unittest.TestCase):
     def test_actual_value_paths_preserve_axis_and_layout_semantics(self) -> None:
         torch.manual_seed(29)
@@ -203,6 +297,11 @@ class StageGateTests(unittest.TestCase):
         self.assertFalse(stage_can_continue("parity_failed"))
         self.assertFalse(stage_can_continue("failed"))
         self.assertFalse(stage_can_continue(None))
+
+    def test_resume_stages_are_ordered_and_bounded(self) -> None:
+        self.assertEqual(selected_stages(2048, 8192), [2048, 4096, 8192])
+        with self.assertRaises(ValueError):
+            selected_stages(8192, 4096)
 
 
 class RopeTests(unittest.TestCase):

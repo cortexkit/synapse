@@ -62,6 +62,8 @@ def parse_args() -> argparse.Namespace:
 
     ranges = subparsers.add_parser("ranges")
     ranges.add_argument("--report", type=Path, required=True)
+    ranges.add_argument("--rotation", choices=("none", "hadamard"), default="none")
+    ranges.add_argument("--rotation-seed", type=int, default=0)
 
     reload_parser = subparsers.add_parser("reload")
     reload_parser.add_argument("--package", type=Path, required=True)
@@ -303,7 +305,14 @@ def activation_stats(value: torch.Tensor) -> dict[str, Any]:
 def command_ranges(args: argparse.Namespace) -> dict[str, Any]:
     rows = read_jsonl(args.input)
     inputs = row_tensors(rows)
-    model, _ = tiled.build_embedder(args.model, SEQUENCE_LENGTH, QUERY_TILE)
+    model, _ = tiled.build_embedder(
+        args.model,
+        SEQUENCE_LENGTH,
+        QUERY_TILE,
+        rotation=args.rotation,
+        rotation_seed=args.rotation_seed,
+    )
+    rotation = model.rotation_report()
     input_ids, attention_mask = inputs[0]
     layers = []
     with torch.inference_mode():
@@ -341,11 +350,12 @@ def command_ranges(args: argparse.Namespace) -> dict[str, Any]:
                 }
             )
             hidden = output
-        final_normalized = model.final_norm(hidden)
+        final_normalized = model.output_unrotate(model.final_norm(hidden))
     return {
         "status": "passed",
         "row_id": rows[0]["id"],
         "actual_token_count": rows[0]["actual_token_count"],
+        "rotation": rotation,
         "embedding_norm": embedding_stats,
         "layers": layers,
         "final_norm": activation_stats(final_normalized),
