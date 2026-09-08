@@ -44,36 +44,12 @@ distinct. Singleton vectors differ slightly across shapes; the worst observed co
 0.99998651 and maximum absolute difference was 0.00066243. Policy v2 deliberately
 rotates engine/package identity, so no same-fingerprint or mixed-space claim is made.
 
-## ANE feasibility and exact handoff
+## ANE status
 
-No existing ANE harness can execute this complete workload unchanged. The installed
-worker is MiniLM/mean-pooling only. The standalone GTE converter and runner support only
-fixed 128/256/512 buckets; rows 513, 603, and 1,203 are over the maximum, and the runner
-requires every row in a batch to have identical padded length. Therefore the mixed
-request cannot be run without dropping, truncating, or splitting rows, all of which would
-change the comparison.
-
-`ane-feasibility.json` records the explicit refusals. `ane-supported-seq512.jsonl` exports
-only the 511-token row to the existing fixed-512 schema, preserving all kept IDs and
-adding one masked pad token (`pad_token_id=50283`). If a matching GTE seq512 Core ML
-artifact is available, the bounded supported subset can be run separately:
-
-```sh
-swiftc -O -parse-as-library \
-  -o target/ane-coreml bench/spikes/ane-minilm/ane_coreml.swift
-
-target/ane-coreml run \
-  --model <gte-modernbert-seq512.mlmodelc> \
-  --input docs/evidence/owned-metal-bucket-policy-v2/ane-supported-seq512.jsonl \
-  --output <ane-vectors.jsonl> \
-  --stats-out <ane-stats.json> \
-  --placement-out <ane-placement.json> \
-  --batch-size 1 --pooling cls --compute-units cpuAndNeuralEngine
-```
-
-This would be a supported-subset diagnostic, not an exact three-arm workload. ANE has a
-distinct engine fingerprint and must not be treated as vector-space equivalent from
-cosine alone.
+ANE was not measured in this evidence set; production capability mapping is pending.
+The canonical diverse text fixture and exact token IDs remain available for a separate
+matched ANE measurement owned by the primary review. No ANE support limit, artifact
+availability, throughput, parity, or fingerprint-equivalence conclusion is made here.
 
 ## Synthetic shape diagnostic
 
@@ -93,8 +69,6 @@ before compaction at:
 - `text-metal-v1.profile.stderr`, `text-metal-v2.profile.stderr`: engine-selected shapes
   and first-use/cache timing.
 - `text-comparison.json`, `text-summary.txt`: strictly validated aggregate comparison.
-- `ane-supported-seq512.jsonl`, `ane-feasibility.json`: exact supported subset and
-  explicit unsupported requests.
 
 Regenerate comparisons with
 `bench/campaign/compare-owned-metal-bucket-probes.py`; run its negative tests with
