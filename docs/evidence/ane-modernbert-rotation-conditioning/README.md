@@ -1,0 +1,36 @@
+# GTE ModernBERT ANE rotation-conditioning evidence
+
+Measured on 2026-09-08 on the same MacBook Pro `Mac17,6` (M5 Max, 128 GB), macOS 27.0 build `26A5425a`, checkpoint snapshot `e7f32e3c00f91d699e8c43b53106206bcc72bb22`, toolchain, three input rows, and fixed 0.999 minimum-cosine gate as the unrotated full-context spike. Compact machine-readable results are in `EVIDENCE.json`.
+
+## Reference-source construction
+
+The implementation follows `smpanaro/ModernBERT-AppleNeuralEngine` at commit [`d026894`](https://github.com/smpanaro/ModernBERT-AppleNeuralEngine/tree/d0268940c0af4ffe2bca0f9eb3842fd05984215c). Its [`rotate_model`](https://github.com/smpanaro/ModernBERT-AppleNeuralEngine/blob/d0268940c0af4ffe2bca0f9eb3842fd05984215c/model.py#L405-L412) uses a randomized Walsh-Hadamard residual-stream rotation, not a learned SpinQuant matrix. For ModernBERT-base's 768 channels, [`get_hadK` and `get_had12`](https://github.com/smpanaro/ModernBERT-AppleNeuralEngine/blob/d0268940c0af4ffe2bca0f9eb3842fd05984215c/model.py#L539-L594) combine a fixed order-12 Hadamard matrix with power-of-two butterfly stages. [`random_hadamard_matrix`](https://github.com/smpanaro/ModernBERT-AppleNeuralEngine/blob/d0268940c0af4ffe2bca0f9eb3842fd05984215c/model.py#L532-L537) adds independent random signs. This spike fixes that sign draw at seed 0 so packages and evidence are reproducible; the resulting matrix SHA-256 is `5d2b2b0a351b6f0526314fb27f50e6d4830bf7efb6c1d60fe6964b24ea1c8f45`.
+
+The reference applies only QuaRot's residual-stream rotation. It does not rotate Q/K/V head coordinates or MLP intermediate channels. The embedding table is centered per token and right-multiplied by `Q`. LayerNorm scales are folded into QKV and MLP-input weights, and the norms become parameter-free RMSNorm. QKV and MLP-input weights are right-multiplied by `Q`; attention-output and MLP-output weights are centered over output channels and left-multiplied by `Qᵀ`. The final norm scale is folded into an unrotation projection. These operations are folded offline into weights. Two additional 768-by-768 runtime 1x1 convolutions remain: the first layer's residual transform and the final unrotation. The exact source operations are in [`fuse_layer_norms`](https://github.com/smpanaro/ModernBERT-AppleNeuralEngine/blob/d0268940c0af4ffe2bca0f9eb3842fd05984215c/model.py#L419-L482) and [`rotate_embeddings`, `rotate_layers`, and `rotate_head`](https://github.com/smpanaro/ModernBERT-AppleNeuralEngine/blob/d0268940c0af4ffe2bca0f9eb3842fd05984215c/model.py#L484-L521).
+
+The tensors touched are the token embedding table; embedding norm; every attention norm, QKV weight, and attention output weight; every MLP norm, input weight, and output weight; the final norm; the new first-layer residual projection; and the new final unrotation projection. RoPE, masks, attention scores/softmax, Q/K/V values, GELU/gate activations, and pooling are unchanged.
+
+## Exact-arithmetic preservation
+
+The transform is exactly output-preserving over real arithmetic; it is not a model change. Let `C = I - 11ᵀ/d`, and let `Q` be orthogonal. Centering converts bias-free LayerNorm to `diag(γ) RMSNorm(Cx)`. Folding `γ` into each consuming weight is exact. The transformed residual is `QᵀCx`; RMSNorm commutes with `Q` because `Q` preserves the L2 norm. Consuming weights cancel the basis change (`W diag(γ) Q Qᵀ`), producing weights map outputs back into the rotated residual basis (`QᵀCW`), and the final `diag(γ_final) Q` projection restores the canonical final-normalized output. ModernBERT's norm bias is false, so no omitted beta term exists. Float64 weight folding followed by float32 storage and fp16 execution introduces rounding, so byte identity is neither claimed nor required.
+
+## 1024 result
+
+The rotated eager query-tiled model retained cosine 1.0 against the unchanged streaming full-context reference, with maximum absolute error `6.2584877e-7`. The float16 CPU_AND_NE package passed all three unchanged inputs at cosines `0.9999589920`, `0.9999254942`, and `0.9999814034` (minimum `0.9999254942`). The corresponding unrotated values were `0.9984976053`, `0.9999022484`, and `0.9987312555` (minimum `0.9984976053`).
+
+The unrotated residual stream peaked at `45019.5156`, where fp16 spacing is 32. With rotation, the residual-stream maximum fell to `2366.5015`, where fp16 spacing is 2. The largest measured rotated activation of any sampled category was a gated-MLP value of `8295.4824`; no measured value was non-finite or exceeded fp16 range. This visible reduction and the parity recovery support the conditioning hypothesis.
+
+MLComputePlan continued to prefer all expensive operations on ANE. The unrotated plan had 88 convolutions, 2,112 einsums, 1,056 softmaxes, and 45 layer normalizations on ANE, with 13 CPU-preferred operations overall. The rotated plan had 90 convolutions, 2,112 einsums, 1,056 softmaxes, and 45 `reduce_l2_norm` operations on ANE, again with 13 CPU-preferred operations overall. The two added projections therefore remained ANE-preferred. This is preferred-placement evidence, not a runtime dispatch trace.
+
+## Sequential context staging
+
+Each stage ran in separate guarded processes for input preparation, reference inference, export/conversion, package reload/prediction, and placement inspection. No model process overlapped another. Memory pressure was captured before every resumed stage and throughout every child process.
+
+| Tokens | torch.export | Core ML conversion | Save | Load | First predict | Warm predict | Cosine by row | Plan placement | Pre-stage pressure | Peak owned RSS / minimum available |
+|---:|---:|---:|---:|---:|---:|---:|---|---|---|---|
+| 1024 | 56.058 s | 50.549 s | 0.112 s | 36.756 s | 36.285 ms | 32.639 ms | 0.9999590 / 0.9999255 / 0.9999814 | 90 conv, 2,112 einsum, 1,056 softmax on ANE | 53%, 35.008 GiB available | 3.904 / 30.060 GiB |
+| 2048 | 121.880 s | 205.272 s | 0.594 s | 152.322 s | 111.137 ms | 97.750 ms | 0.9999825 / 0.9999255 / 0.9999814 | 90 conv, 4,224 einsum, 2,112 softmax on ANE | 55%, 36.777 GiB available | 4.684 / 29.922 GiB |
+| 4096 | 251.323 s | 214.168 s | 0.303 s | 190.534 s | 340.430 ms | 417.119 ms | 0.9999752 / 0.9999255 / 0.9999814 | 90 conv, 8,448 einsum, 4,224 softmax on ANE | 54%, 35.311 GiB available | 6.482 / 29.246 GiB |
+| 8192 | 266.313 s | 583.385 s | 0.872 s | 735.348 s | 1639.901 ms | 1553.157 ms | 0.9999038 / 0.9999255 / 0.9999814 | 90 conv, 16,896 einsum, 8,448 softmax on ANE | 52%, 33.810 GiB available | 9.599 / 28.227 GiB |
+
+All four stages passed the unchanged gate. The 8192 full-context row used all 8192 active tokens without truncation or document chunking; each 256-query attention tile retained the complete 8192-key dimension. CPU_AND_NE prediction succeeded and MLComputePlan preferred every convolution, einsum, softmax, and norm reduction on ANE at 8192. The observed result therefore supports the all-ANE corpus design through the model's full context limit; an all-Metal fallback is not required by this experiment. Small mask/index operations remain CPU-preferred, as they did in the pre-rotation package, so “all-ANE” here means the ANE inference lane with all expensive model operations ANE-preferred, not a claim that every shape/index operation executes on ANE.

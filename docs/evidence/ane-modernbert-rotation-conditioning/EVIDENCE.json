@@ -1,0 +1,133 @@
+{
+  "status": "passed_full_8192_context_on_cpu_and_ne",
+  "measured_at": "2026-09-08",
+  "gate_min_cosine": 0.999,
+  "hardware": {
+    "machine": "Mac17,6",
+    "chip": "Apple M5 Max",
+    "physical_memory_bytes": 137438953472,
+    "macos": "27.0",
+    "macos_build": "26A5425a"
+  },
+  "toolchain_sha256": "4263ee6835e253f9ad946d9cb11ab38387e25505b6c28a43da39138dc75715a0",
+  "model": {
+    "snapshot": "e7f32e3c00f91d699e8c43b53106206bcc72bb22",
+    "combined_sha256": "324396e8d20bc40a0af9f258ecaa6278197055b8907be2c73c6840f784568538",
+    "model_safetensors_sha256": "3e85899d5728cb7de79781c0c3acfb91ccef9f875f1f7e0b3c9f3dd4b6a724ba"
+  },
+  "reference_source": {
+    "repository": "smpanaro/ModernBERT-AppleNeuralEngine",
+    "commit": "d0268940c0af4ffe2bca0f9eb3842fd05984215c",
+    "construction": "randomized Walsh-Hadamard residual-stream rotation; order-12 Hadamard base for hidden size 768 plus power-of-two butterfly stages and random Rademacher signs",
+    "learned": false,
+    "rotation_scope": "residual stream only; no Q/K/V head or MLP-intermediate rotation",
+    "offline_tensors": [
+      "centered and rotated token embeddings",
+      "LayerNorm scales folded into every QKV and MLP-input weight",
+      "centered and rotated every attention-output and MLP-output weight",
+      "final norm scale folded into output unrotation"
+    ],
+    "runtime_tensors": [
+      "layer-0 768x768 residual-transform 1x1 convolution",
+      "final 768x768 unrotation 1x1 convolution",
+      "parameter-free RMSNorm replacing bias-free LayerNorm"
+    ],
+    "exact_arithmetic_output_preserving": true,
+    "approximation_boundary": "Only float64-to-float32 folded-weight storage and fp16 runtime rounding are approximate.",
+    "local_reproducibility_change": "The reference draws signs from the global RNG; this experiment fixes seed 0."
+  },
+  "rotation": {
+    "kind": "hadamard",
+    "seed": 0,
+    "matrix_sha256": "5d2b2b0a351b6f0526314fb27f50e6d4830bf7efb6c1d60fe6964b24ea1c8f45"
+  },
+  "cpu_preservation": {
+    "sequence_length": 129,
+    "rotated_tiled_vs_huggingface_min_cosine": 1.0,
+    "rotated_tiled_vs_huggingface_max_abs": 4.2188912630081177e-7,
+    "rotated_tiled_vs_unrotated_streaming_min_cosine": 1.0,
+    "rotated_tiled_vs_unrotated_streaming_max_abs": 9.238719940185547e-7
+  },
+  "activation_ranges_1024": {
+    "row": "full-context",
+    "unrotated_residual_abs_max": 45019.515625,
+    "unrotated_fp16_spacing": 32.0,
+    "rotated_residual_abs_max": 2366.50146484375,
+    "rotated_fp16_spacing": 2.0,
+    "rotated_all_sampled_categories_abs_max": 8295.482421875,
+    "rotated_all_sampled_categories_max_location": "layer_11.gated_mlp",
+    "nonfinite_count": 0,
+    "above_float16_max_count": 0
+  },
+  "unrotated_1024_control": {
+    "input_sha256": "631cb64de428c9e405ab1f4cfe61f07cab699565a900df560e6a060da964f48c",
+    "cosine_by_row": [0.9984976053237915, 0.9999022483825684, 0.998731255531311],
+    "min_cosine": 0.9984976053237915,
+    "status": "parity_failed",
+    "placement": {
+      "preferred_device_counts": {"cpu": 13, "neuralEngine": 11703, "unknown_constants": 18735},
+      "conv_neuralEngine": 88,
+      "einsum_neuralEngine": 2112,
+      "softmax_neuralEngine": 1056,
+      "layer_norm_neuralEngine": 45
+    }
+  },
+  "stages": [
+    {
+      "sequence_length": 1024,
+      "actual_token_counts": [1024, 64, 273],
+      "status": "passed",
+      "input_sha256": "631cb64de428c9e405ab1f4cfe61f07cab699565a900df560e6a060da964f48c",
+      "reference_sha256": "cd3471dc6aba56f60cf9c104337efdc7fa85131dd1f500a20921f23f00132af9",
+      "package_sha256": "f3dbb531c4892257397b39b557cc19067869ca8146b73df0b89bc6d0187a631c",
+      "cosine_by_row": [0.9999589920043945, 0.9999254941940308, 0.9999814033508301],
+      "min_cosine": 0.9999254941940308,
+      "timing_s": {"torch_export": 56.05768820899539, "coreml_conversion": 50.54880141699687, "package_save": 0.1119218340027146, "separate_load": 36.75616179200006, "first_predict": 0.036285209003835917, "warm_predict_median": 0.03263837500708178},
+      "placement": {"cpu_preferred": 13, "neuralEngine_preferred": 11660, "conv_neuralEngine": 90, "einsum_neuralEngine": 2112, "softmax_neuralEngine": 1056, "reduce_l2_norm_neuralEngine": 45},
+      "memory": {"pre_stage_pressure_free_percent": 53, "pre_stage_available_bytes": 37589319680, "peak_owned_rss_bytes": 4192223232, "minimum_available_bytes": 32276365312}
+    },
+    {
+      "sequence_length": 2048,
+      "actual_token_counts": [2048, 64, 273],
+      "status": "passed",
+      "input_sha256": "22a2474bbb51b90f2ead5d4311309025389aacb65dfeaa30033524690c20693e",
+      "reference_sha256": "196f85cd8ade43c44942383280ef47817afccf3d3191554eda30d04ebe2b959f",
+      "package_sha256": "8494b69677cb44d42111a9b1c225264d6ffef81e44caa99c1b7a771081bfcf86",
+      "cosine_by_row": [0.999982476234436, 0.9999254941940308, 0.9999814033508301],
+      "min_cosine": 0.9999254941940308,
+      "timing_s": {"torch_export": 121.87981912499527, "coreml_conversion": 205.27212387500913, "package_save": 0.5943671250133775, "separate_load": 152.32195966600557, "first_predict": 0.11113704199669883, "warm_predict_median": 0.09775025001727045},
+      "placement": {"cpu_preferred": 21, "neuralEngine_preferred": 20712, "conv_neuralEngine": 90, "einsum_neuralEngine": 4224, "softmax_neuralEngine": 2112, "reduce_l2_norm_neuralEngine": 45},
+      "memory": {"pre_stage_pressure_free_percent": 55, "pre_stage_available_bytes": 39488831488, "peak_owned_rss_bytes": 5029445632, "minimum_available_bytes": 32128909312}
+    },
+    {
+      "sequence_length": 4096,
+      "actual_token_counts": [4096, 64, 273],
+      "status": "passed",
+      "input_sha256": "24c6df962b7975778dcfe73f373e61357d1d614143a9f15c9c13f5be13afad2d",
+      "reference_sha256": "bc62321eddaf3ca3ed9928ef467857221ca1f1a9ce69a6007bde1c763522b1cf",
+      "package_sha256": "b2aeb0c152111116c0abbce927e5e33531561ecab084aa9aa835e86179b4cd9a",
+      "cosine_by_row": [0.9999752044677734, 0.9999254941940308, 0.9999814033508301],
+      "min_cosine": 0.9999254941940308,
+      "timing_s": {"torch_export": 251.3226441249717, "coreml_conversion": 214.1678971670044, "package_save": 0.3031187089800369, "separate_load": 190.53357666698867, "first_predict": 0.3404301659902558, "warm_predict_median": 0.4171190829947591},
+      "placement": {"cpu_preferred": 37, "neuralEngine_preferred": 38816, "conv_neuralEngine": 90, "einsum_neuralEngine": 8448, "softmax_neuralEngine": 4224, "reduce_l2_norm_neuralEngine": 45},
+      "memory": {"pre_stage_pressure_free_percent": 54, "pre_stage_available_bytes": 37914869760, "peak_owned_rss_bytes": 6959628288, "minimum_available_bytes": 31402557440}
+    },
+    {
+      "sequence_length": 8192,
+      "actual_token_counts": [8192, 64, 273],
+      "status": "passed",
+      "no_truncation": true,
+      "query_tile_size": 256,
+      "full_key_dimension": 8192,
+      "input_sha256": "b2cb87f40ba3f0bdef0d18f316c6d680b0196e337c3f116dc0cbeb3e92017271",
+      "reference_sha256": "5048bd5ef437802a806341cf5c1219d0b1a06415a4cf38de1e1057a90c01410b",
+      "package_sha256": "3dde38e5efee621034dd1264707e79fbb01f58f58cf83ee24c94ebc564b6db92",
+      "cosine_by_row": [0.9999037981033325, 0.9999254941940308, 0.9999814033508301],
+      "min_cosine": 0.9999037981033325,
+      "timing_s": {"torch_export": 266.3125660420046, "coreml_conversion": 583.3850723330106, "package_save": 0.8717310000211, "separate_load": 735.3483105420019, "first_predict": 1.639900750014931, "warm_predict_median": 1.553156542009674},
+      "placement": {"cpu_preferred": 69, "neuralEngine_preferred": 75024, "conv_neuralEngine": 90, "einsum_neuralEngine": 16896, "softmax_neuralEngine": 8448, "reduce_l2_norm_neuralEngine": 45},
+      "memory": {"pre_stage_pressure_free_percent": 52, "pre_stage_available_bytes": 36302749696, "peak_owned_rss_bytes": 10306371584, "minimum_available_bytes": 30308188160}
+    }
+  ],
+  "conclusion": "Rotation suppresses residual outliers, restores the unchanged parity gate, preserves expensive-op ANE placement, and serves the complete 8192-token context. The all-ANE corpus design is supported; no truncation, chunk pooling, mixed Metal routing, or all-Metal fallback is needed by this result."
+}

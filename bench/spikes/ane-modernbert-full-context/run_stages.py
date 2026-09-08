@@ -24,9 +24,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--artifacts", type=Path, required=True)
     parser.add_argument("--through", type=int, choices=STAGES, required=True)
+    parser.add_argument("--start-at", type=int, choices=STAGES, default=STAGES[0])
     parser.add_argument("--query-tile", type=int, default=256)
     parser.add_argument("--key-tile", type=int, default=256)
     parser.add_argument("--warm-repetitions", type=int, default=3)
+    parser.add_argument("--rotation", choices=("none", "hadamard"), default="none")
+    parser.add_argument("--rotation-seed", type=int, default=0)
     parser.add_argument(
         "--measurement-slot-authorized",
         required=True,
@@ -182,6 +185,13 @@ def stage_can_continue(status: str | None) -> bool:
     return status == "passed"
 
 
+def selected_stages(start_at: int, through: int) -> list[int]:
+    stages = [stage for stage in STAGES if start_at <= stage <= through]
+    if not stages:
+        raise ValueError("start stage must not exceed final stage")
+    return stages
+
+
 def placement_classification(reload_report: dict[str, Any], placement: dict[str, Any]) -> str:
     if reload_report.get("status") == "failed":
         return "prediction_failed"
@@ -229,7 +239,8 @@ def main() -> int:
     run_report: dict[str, Any] = {
         "status": "running",
         "measurement_slot_authorized": args.measurement_slot_authorized,
-        "stages_requested": [stage for stage in STAGES if stage <= args.through],
+        "stages_requested": selected_stages(args.start_at, args.through),
+        "rotation": {"kind": args.rotation, "seed": args.rotation_seed},
         "initial_memory": initial,
         "guard": guard,
         "stage_reports": [],
@@ -240,7 +251,8 @@ def main() -> int:
         run_report["cpu_check_process"] = run_guarded(
             [
                 str(python), str(script), "--model", str(args.model), "cpu-check",
-                "--report", str(cpu_report),
+                     "--report", str(cpu_report), "--rotation", args.rotation,
+                     "--rotation-seed", str(args.rotation_seed),
             ],
             root / "cpu-check.log",
             **guard,
@@ -249,6 +261,7 @@ def main() -> int:
             raise RuntimeError("CPU check did not pass")
 
         for sequence_length in run_report["stages_requested"]:
+            stage_memory_before = memory_snapshot()
             stage_root = root / f"seq{sequence_length}"
             stage_root.mkdir(parents=True, exist_ok=True)
             input_path = stage_root / "input.jsonl"
@@ -276,7 +289,8 @@ def main() -> int:
                      "--seq-len", str(sequence_length), "--query-tile", str(args.query_tile),
                      "--key-tile", str(args.key_tile), "--input", str(input_path),
                      "--reference", str(reference_path), "--out", str(package_path),
-                     "--report", str(stage_root / "export.json"), "--overwrite"],
+                     "--report", str(stage_root / "export.json"), "--overwrite",
+                     "--rotation", args.rotation, "--rotation-seed", str(args.rotation_seed)],
                 ),
                 (
                     "reload",
@@ -312,6 +326,7 @@ def main() -> int:
             placement_report = read_json(stage_root / "placement.json")
             summary = {
                 "sequence_length": sequence_length,
+                "memory_before": stage_memory_before,
                 "status": reload_report.get("status", "failed"),
                 "processes": stage_processes,
                 "ane_classification": placement_classification(reload_report, placement_report),

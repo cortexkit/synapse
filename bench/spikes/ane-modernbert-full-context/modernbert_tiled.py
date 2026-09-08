@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
@@ -14,6 +16,7 @@ from safetensors import safe_open
 
 MASK_MIN_VALUE = -10_000.0
 AttentionKind = Literal["query_tiled", "streaming_reference"]
+RotationKind = Literal["none", "hadamard"]
 
 
 @dataclass(frozen=True)
@@ -50,6 +53,145 @@ class ModernBertConfig:
         if config.local_attention <= 0 or config.local_attention % 2:
             raise ValueError("local_attention must be a positive even window size")
         return config
+
+
+@dataclass(frozen=True)
+class RotationWeights:
+    layer0_residual: torch.Tensor
+    output_unrotate: torch.Tensor
+    seed: int
+    matrix_sha256: str
+
+
+def _hadamard12() -> torch.Tensor:
+    """Return the order-12 matrix used by the reference ModernBERT exporter."""
+    return torch.tensor(
+        [
+            [+1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1],
+            [+1, +1, -1, +1, -1, -1, -1, +1, +1, +1, -1, +1],
+            [+1, +1, +1, -1, +1, -1, -1, -1, +1, +1, +1, -1],
+            [+1, -1, +1, +1, -1, +1, -1, -1, -1, +1, +1, +1],
+            [+1, +1, -1, +1, +1, -1, +1, -1, -1, -1, +1, +1],
+            [+1, +1, +1, -1, +1, +1, -1, +1, -1, -1, -1, +1],
+            [+1, +1, +1, +1, -1, +1, +1, -1, +1, -1, -1, -1],
+            [+1, -1, +1, +1, +1, -1, +1, +1, -1, +1, -1, -1],
+            [+1, -1, -1, +1, +1, +1, -1, +1, +1, -1, +1, -1],
+            [+1, -1, -1, -1, +1, +1, +1, -1, +1, +1, -1, +1],
+            [+1, +1, -1, -1, -1, +1, +1, +1, -1, +1, +1, -1],
+            [+1, -1, +1, -1, -1, -1, +1, +1, +1, -1, +1, +1],
+        ],
+        dtype=torch.float64,
+    )
+
+
+def _hadamard_base(size: int, transpose: bool = False) -> tuple[torch.Tensor | None, int]:
+    if size % 12 == 0 and (size // 12) & (size // 12 - 1) == 0:
+        matrix = _hadamard12()
+        return (matrix.T if transpose else matrix), 12
+    if size > 0 and size & (size - 1) == 0:
+        return None, 1
+    raise ValueError("Hadamard rotation requires hidden size 12*2^n or 2^n")
+
+
+def _matmul_hadamard(value: torch.Tensor, transpose: bool = False) -> torch.Tensor:
+    size = value.shape[-1]
+    base, block_size = _hadamard_base(size, transpose)
+    source = value.clone().reshape(-1, size, 1)
+    target = source.clone()
+    while source.shape[1] > block_size:
+        source = source.reshape(source.shape[0], source.shape[1] // 2, 2, source.shape[2])
+        target = target.reshape(source.shape)
+        target[:, :, 0, :] = source[:, :, 0, :] + source[:, :, 1, :]
+        target[:, :, 1, :] = source[:, :, 0, :] - source[:, :, 1, :]
+        target = target.reshape(source.shape[0], source.shape[1], -1)
+        source, target = target, source
+    if base is not None:
+        source = base.reshape(1, block_size, block_size).to(source) @ source
+    return source.reshape(value.shape) / math.sqrt(size)
+
+
+def randomized_hadamard_matrix(size: int, seed: int) -> torch.Tensor:
+    """Build the reference randomized Hadamard rotation with a reproducible sign draw."""
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(seed)
+    signs = torch.randint(0, 2, (size,), generator=generator).to(torch.float64) * 2 - 1
+    return _matmul_hadamard(torch.diag(signs))
+
+
+def _replace_weight(
+    tensors: dict[str, torch.Tensor], name: str, transformed: torch.Tensor
+) -> None:
+    tensors[name] = transformed.to(dtype=tensors[name].dtype, device="cpu")
+
+
+def apply_hadamard_rotation(
+    config: ModernBertConfig, tensors: dict[str, torch.Tensor], seed: int
+) -> RotationWeights:
+    """Fold the reference residual-stream rotation into raw checkpoint weights."""
+    hidden_size = config.hidden_size
+    rotation = randomized_hadamard_matrix(hidden_size, seed)
+    centering = torch.eye(hidden_size, dtype=torch.float64) - (1.0 / hidden_size)
+
+    embedding_name = "embeddings.tok_embeddings.weight"
+    embedding = tensors[embedding_name].double()
+    _replace_weight(tensors, embedding_name, embedding - embedding.mean(dim=-1, keepdim=True))
+
+    embedding_scale = torch.diag(tensors["embeddings.norm.weight"].double())
+    residual = (centering @ embedding_scale).to(torch.float32)
+    first_qkv = "layers.0.attn.Wqkv.weight"
+    _replace_weight(
+        tensors,
+        first_qkv,
+        tensors[first_qkv].double() * tensors["embeddings.norm.weight"].double(),
+    )
+
+    for layer_index in range(config.num_hidden_layers):
+        prefix = f"layers.{layer_index}"
+        qkv_name = f"{prefix}.attn.Wqkv.weight"
+        attention_output_name = f"{prefix}.attn.Wo.weight"
+        mlp_input_name = f"{prefix}.mlp.Wi.weight"
+        mlp_output_name = f"{prefix}.mlp.Wo.weight"
+        if layer_index > 0:
+            _replace_weight(
+                tensors,
+                qkv_name,
+                tensors[qkv_name].double() * tensors[f"{prefix}.attn_norm.weight"].double(),
+            )
+        _replace_weight(
+            tensors,
+            mlp_input_name,
+            tensors[mlp_input_name].double() * tensors[f"{prefix}.mlp_norm.weight"].double(),
+        )
+        attention_output = tensors[attention_output_name].double()
+        _replace_weight(
+            tensors,
+            attention_output_name,
+            attention_output - attention_output.mean(dim=-2, keepdim=True),
+        )
+        mlp_output = tensors[mlp_output_name].double()
+        _replace_weight(
+            tensors,
+            mlp_output_name,
+            mlp_output - mlp_output.mean(dim=-2, keepdim=True),
+        )
+
+    output_unrotate = torch.diag(tensors["final_norm.weight"].double()).to(torch.float32)
+    _replace_weight(tensors, embedding_name, tensors[embedding_name].double() @ rotation)
+    residual = rotation.T @ residual.double() @ rotation
+    for layer_index in range(config.num_hidden_layers):
+        prefix = f"layers.{layer_index}"
+        for name in (f"{prefix}.attn.Wqkv.weight", f"{prefix}.mlp.Wi.weight"):
+            _replace_weight(tensors, name, tensors[name].double() @ rotation)
+        for name in (f"{prefix}.attn.Wo.weight", f"{prefix}.mlp.Wo.weight"):
+            _replace_weight(tensors, name, rotation.T @ tensors[name].double())
+    output_unrotate = output_unrotate.double() @ rotation
+    matrix_sha256 = hashlib.sha256(rotation.numpy().tobytes()).hexdigest()
+    return RotationWeights(
+        layer0_residual=residual.to(torch.float32),
+        output_unrotate=output_unrotate.to(torch.float32),
+        seed=seed,
+        matrix_sha256=matrix_sha256,
+    )
 
 
 def tile_ranges(length: int, tile_size: int) -> tuple[tuple[int, int], ...]:
@@ -249,13 +391,36 @@ class ChannelLayerNorm(torch.nn.Module):
         return normalized.transpose(1, 2).unsqueeze(2)
 
 
+class ChannelRMSNorm(torch.nn.Module):
+    """Parameter-free RMSNorm formulated to avoid squaring large residual values."""
+
+    def __init__(self, size: int, eps: float) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(
+            torch.ones((1, size, 1, 1), dtype=torch.float32), requires_grad=False
+        )
+        self.eps = eps
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        original_dtype = hidden.dtype
+        value = hidden.float()
+        eps_channel = torch.ones(
+            (value.shape[0], 1, value.shape[2], value.shape[3]),
+            dtype=value.dtype,
+            device=value.device,
+        ) * math.sqrt(self.eps * value.shape[1])
+        denominator = torch.linalg.vector_norm(torch.cat((value, eps_channel), dim=1), dim=1, keepdim=True)
+        normalized = value / denominator * math.sqrt(value.shape[1])
+        return normalized.to(original_dtype) * self.weight
+
+
 class ModernBertLayer(torch.nn.Module):
     attention_norm: torch.nn.Module
     qkv: Conv1x1
     attention_output: Conv1x1
-    mlp_norm: ChannelLayerNorm
     mlp_input: Conv1x1
     mlp_output: Conv1x1
+    residual_transform: torch.nn.Module
 
     def __init__(
         self,
@@ -267,17 +432,25 @@ class ModernBertLayer(torch.nn.Module):
         query_tile_size: int,
         key_tile_size: int,
         attention_kind: AttentionKind,
+        rotation_weights: RotationWeights | None,
     ) -> None:
         super().__init__()
         prefix = f"layers.{layer_index}"
-        self.attention_norm = (
-            torch.nn.Identity()
-            if layer_index == 0
-            else ChannelLayerNorm(tensors[f"{prefix}.attn_norm.weight"], config.norm_eps)
-        )
+        if layer_index == 0:
+            self.attention_norm = torch.nn.Identity()
+        elif rotation_weights is None:
+            self.attention_norm = ChannelLayerNorm(
+                tensors[f"{prefix}.attn_norm.weight"], config.norm_eps
+            )
+        else:
+            self.attention_norm = ChannelRMSNorm(config.hidden_size, config.norm_eps)
         self.qkv = Conv1x1(tensors[f"{prefix}.attn.Wqkv.weight"])
         self.attention_output = Conv1x1(tensors[f"{prefix}.attn.Wo.weight"])
-        self.mlp_norm = ChannelLayerNorm(tensors[f"{prefix}.mlp_norm.weight"], config.norm_eps)
+        self.mlp_norm = (
+            ChannelLayerNorm(tensors[f"{prefix}.mlp_norm.weight"], config.norm_eps)
+            if rotation_weights is None
+            else ChannelRMSNorm(config.hidden_size, config.norm_eps)
+        )
         self.mlp_input = Conv1x1(tensors[f"{prefix}.mlp.Wi.weight"])
         self.mlp_output = Conv1x1(tensors[f"{prefix}.mlp.Wo.weight"])
         self.heads = config.num_attention_heads
@@ -289,6 +462,11 @@ class ModernBertLayer(torch.nn.Module):
             None if layer_index % config.global_attn_every_n_layers == 0 else config.local_attention
         )
         self.attention_kind = attention_kind
+        self.residual_transform = (
+            Conv1x1(rotation_weights.layer0_residual)
+            if layer_index == 0 and rotation_weights is not None
+            else torch.nn.Identity()
+        )
 
     def _attention_block(
         self,
@@ -328,7 +506,7 @@ class ModernBertLayer(torch.nn.Module):
                 key_tile_size=self.key_tile_size,
                 local_window=self.local_window,
             )
-        return hidden + self.attention_output(attended)
+        return self.residual_transform(hidden) + self.attention_output(attended)
 
     def _mlp_block(self, hidden: torch.Tensor) -> torch.Tensor:
         mlp_input = self.mlp_input(self.mlp_norm(hidden))
@@ -381,14 +559,32 @@ class ModernBertEmbedder(torch.nn.Module):
         query_tile_size: int,
         key_tile_size: int = 256,
         attention_kind: AttentionKind = "query_tiled",
+        rotation: RotationKind = "none",
+        rotation_seed: int = 0,
     ) -> None:
         super().__init__()
         if sequence_length > config.max_position_embeddings:
             raise ValueError("sequence length exceeds the checkpoint's context limit")
+        if rotation not in ("none", "hadamard"):
+            raise ValueError(f"unsupported rotation: {rotation}")
+        rotation_weights = (
+            apply_hadamard_rotation(config, tensors, rotation_seed)
+            if rotation == "hadamard"
+            else None
+        )
+        self.rotation_kind = rotation
+        self.rotation_seed = rotation_seed
+        self.rotation_matrix_sha256 = (
+            rotation_weights.matrix_sha256 if rotation_weights is not None else None
+        )
         self.embedding_weight = torch.nn.Parameter(
             tensors["embeddings.tok_embeddings.weight"].float(), requires_grad=False
         )
-        self.embedding_norm = ChannelLayerNorm(tensors["embeddings.norm.weight"], config.norm_eps)
+        self.embedding_norm = (
+            ChannelLayerNorm(tensors["embeddings.norm.weight"], config.norm_eps)
+            if rotation_weights is None
+            else ChannelRMSNorm(config.hidden_size, config.norm_eps)
+        )
         self.layers = torch.nn.ModuleList(
             ModernBertLayer(
                 config=config,
@@ -398,10 +594,20 @@ class ModernBertEmbedder(torch.nn.Module):
                 query_tile_size=query_tile_size,
                 key_tile_size=key_tile_size,
                 attention_kind=attention_kind,
+                rotation_weights=rotation_weights,
             )
             for index in range(config.num_hidden_layers)
         )
-        self.final_norm = ChannelLayerNorm(tensors["final_norm.weight"], config.norm_eps)
+        self.final_norm = (
+            ChannelLayerNorm(tensors["final_norm.weight"], config.norm_eps)
+            if rotation_weights is None
+            else ChannelRMSNorm(config.hidden_size, config.norm_eps)
+        )
+        self.output_unrotate = (
+            torch.nn.Identity()
+            if rotation_weights is None
+            else Conv1x1(rotation_weights.output_unrotate)
+        )
         self.sequence_length = sequence_length
         global_cos, global_sin = build_rope_tables(
             sequence_length, config.head_dim, config.global_rope_theta
@@ -413,6 +619,13 @@ class ModernBertEmbedder(torch.nn.Module):
         self.register_buffer("global_sin", global_sin, persistent=True)
         self.register_buffer("local_cos", local_cos, persistent=True)
         self.register_buffer("local_sin", local_sin, persistent=True)
+
+    def rotation_report(self) -> dict[str, str | int]:
+        report: dict[str, str | int] = {"kind": self.rotation_kind}
+        if self.rotation_matrix_sha256 is not None:
+            report["seed"] = self.rotation_seed
+            report["matrix_sha256"] = self.rotation_matrix_sha256
+        return report
 
     def _embed(self, input_ids: torch.Tensor) -> torch.Tensor:
         hidden = functional.embedding(input_ids, self.embedding_weight)
@@ -434,7 +647,7 @@ class ModernBertEmbedder(torch.nn.Module):
                 self.local_cos,
                 self.local_sin,
             )
-        return self._normalize_cls(self.final_norm(hidden))
+        return self._normalize_cls(self.output_unrotate(self.final_norm(hidden)))
 
     def forward_diagnostics(
         self, input_ids: torch.Tensor, attention_mask: torch.Tensor
@@ -460,7 +673,7 @@ class ModernBertEmbedder(torch.nn.Module):
                 self.local_sin,
             )
             checkpoints.extend((sample(after_attention), sample(hidden)))
-        final_hidden = self.final_norm(hidden)
+        final_hidden = self.output_unrotate(self.final_norm(hidden))
         checkpoints.append(sample(final_hidden))
         return torch.stack(checkpoints, dim=1), self._normalize_cls(final_hidden)
 
@@ -481,6 +694,8 @@ def build_embedder(
     *,
     key_tile_size: int = 256,
     attention_kind: AttentionKind = "query_tiled",
+    rotation: RotationKind = "none",
+    rotation_seed: int = 0,
 ) -> tuple[ModernBertEmbedder, ModernBertConfig]:
     config = ModernBertConfig.from_snapshot(snapshot)
     model = ModernBertEmbedder(
@@ -490,5 +705,7 @@ def build_embedder(
         query_tile_size,
         key_tile_size,
         attention_kind,
+        rotation,
+        rotation_seed,
     ).eval()
     return model, config
