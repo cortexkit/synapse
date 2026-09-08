@@ -3678,6 +3678,13 @@ fn acquire_minilm_e2e_lock() -> MinilmE2eLock {
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 std::thread::sleep(Duration::from_millis(50));
             }
+            // Windows keeps a deleted-but-still-open file in a delete-pending
+            // state, and creating that name meanwhile fails with access denied
+            // rather than already-exists. That is the holder releasing the
+            // lock, so it is the same transient condition as a held lock.
+            Err(error) if cfg!(windows) && error.kind() == std::io::ErrorKind::PermissionDenied => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
             Err(error) => panic!("failed to acquire MiniLM e2e lock: {error}"),
         }
     }
