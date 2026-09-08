@@ -187,6 +187,15 @@ jobs:
           }
           echo "ORT_DYLIB_PATH=$dir\onnxruntime-win-x64-$v\lib\onnxruntime.dll" >> $env:GITHUB_ENV
 
+      # The repository is public, so a tracked home path, hostname or credential
+      # marker is a disclosure rather than untidiness. This ran only from a
+      # developer's shell until a leaked worktree path reached master, so it is
+      # a gate here: one lane is enough because the check reads tracked files.
+      - name: public banlist
+        if: matrix.name == 'linux'
+        working-directory: synapse
+        run: bash scripts/public-banlist-check.sh
+
       - name: fmt
         working-directory: synapse
         run: cargo fmt --all --check

@@ -57,9 +57,8 @@ The earlier repeated-token sweep is retained only as a shape/timing diagnostic, 
 production-throughput or ordering/parity evidence. Its compact derived files are
 `comparison.json`, `short-control-comparison.json`, `summary.txt`, and
 `short-control-summary.txt`. Original raw synthetic JSON and profile logs were preserved
-before compaction at:
-
-`/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/pool-94/.cortexkit/alfonso/evidence/owned-metal-bucket-policy-v2/synthetic-originals`
+before compaction, outside this repository, under the operator-local evidence
+directory `.cortexkit/alfonso/evidence/owned-metal-bucket-policy-v2/synthetic-originals`.
 
 ## Durable files
 
