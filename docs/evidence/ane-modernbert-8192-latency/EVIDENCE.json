@@ -1,0 +1,162 @@
+{
+  "status": "no_latency_candidate_advanced_past_1024",
+  "measured_at": "2026-09-08",
+  "gate_min_cosine": 0.999,
+  "hardware": {
+    "machine": "Mac17,6",
+    "chip": "Apple M5 Max",
+    "physical_memory_bytes": 137438953472,
+    "macos": "27.0",
+    "macos_build": "26A5425a"
+  },
+  "toolchain_sha256": "4263ee6835e253f9ad946d9cb11ab38387e25505b6c28a43da39138dc75715a0",
+  "model": {
+    "snapshot": "e7f32e3c00f91d699e8c43b53106206bcc72bb22",
+    "combined_sha256": "324396e8d20bc40a0af9f258ecaa6278197055b8907be2c73c6840f784568538",
+    "config_sha256": "8ba54dc3d35d7194f5178a4194b649f146753e02dabd22bdca5c5cbac15069ed",
+    "global_attn_every_n_layers": 3,
+    "local_attention": 128,
+    "local_radius_inclusive": 64,
+    "num_hidden_layers": 22,
+    "num_attention_heads": 12,
+    "global_layer_indices": [0, 3, 6, 9, 12, 15, 18, 21],
+    "local_layer_count": 14
+  },
+  "source_finding": {
+    "hypothesis": "The export computes full sequence-square scores for local layers and masks them afterward.",
+    "result": "refuted_by_source",
+    "export_behavior": "Each local query tile slices keys and values from max(0, query_start - 64) through min(sequence_length, query_end + 64), then applies the exact abs(query-key) <= 64 mask. With query tile 256, an interior local score is 384 by 256 per head, never sequence by sequence.",
+    "local_complexity": "O(sequence_length * (query_tile_size + local_attention))",
+    "global_complexity": "O(sequence_length^2) in 8 of 22 layers",
+    "reference_behavior": "Transformers 5.16.1 derives full_attention at indices divisible by global_attn_every_n_layers and sliding_attention elsewhere; sliding_window is local_attention // 2. The model builds separate full and bidirectional sliding-window masks and selects by layer type.",
+    "references": [
+      "bench/spikes/ane-modernbert-full-context/modernbert_tiled.py:264-312",
+      "bench/spikes/ane-modernbert-full-context/modernbert_tiled.py:461-463",
+      "https://github.com/huggingface/transformers/blob/v5.16.1/src/transformers/models/modernbert/configuration_modernbert.py#L113-L122",
+      "https://github.com/huggingface/transformers/blob/v5.16.1/src/transformers/models/modernbert/configuration_modernbert.py#L159-L167",
+      "https://github.com/huggingface/transformers/blob/v5.16.1/src/transformers/models/modernbert/modeling_modernbert.py#L250-L255",
+      "https://github.com/huggingface/transformers/blob/v5.16.1/src/transformers/models/modernbert/modeling_modernbert.py#L453-L472"
+    ]
+  },
+  "baseline_scaling": [
+    {
+      "sequence_length": 1024,
+      "warm_predict_ms": 32.63837500708178,
+      "package_load_s": 36.75616179200006,
+      "cosine_by_row": [0.9999589920043945, 0.9999254941940308, 0.9999814033508301],
+      "preferred_device_counts": {"cpu": 13, "neuralEngine": 11660},
+      "expensive_ane_counts": {"conv": 90, "einsum": 2112, "softmax": 1056, "reduce_l2_norm": 45}
+    },
+    {
+      "sequence_length": 2048,
+      "warm_predict_ms": 97.75025001727045,
+      "package_load_s": 152.32195966600557,
+      "cosine_by_row": [0.999982476234436, 0.9999254941940308, 0.9999814033508301],
+      "preferred_device_counts": {"cpu": 21, "neuralEngine": 20712},
+      "expensive_ane_counts": {"conv": 90, "einsum": 4224, "softmax": 2112, "reduce_l2_norm": 45}
+    },
+    {
+      "sequence_length": 4096,
+      "warm_predict_ms": 417.1190829947591,
+      "package_load_s": 190.53357666698867,
+      "cosine_by_row": [0.9999752044677734, 0.9999254941940308, 0.9999814033508301],
+      "preferred_device_counts": {"cpu": 37, "neuralEngine": 38816},
+      "expensive_ane_counts": {"conv": 90, "einsum": 8448, "softmax": 4224, "reduce_l2_norm": 45}
+    },
+    {
+      "sequence_length": 8192,
+      "warm_predict_ms": 1553.156542009674,
+      "package_load_s": 735.3483105420019,
+      "cosine_by_row": [0.9999037981033325, 0.9999254941940308, 0.9999814033508301],
+      "preferred_device_counts": {"cpu": 69, "neuralEngine": 75024},
+      "expensive_ane_counts": {"conv": 90, "einsum": 16896, "softmax": 8448, "reduce_l2_norm": 45}
+    }
+  ],
+  "same_session_1024_control": {
+    "query_tile_size": 256,
+    "package_sha256": "18903e4080f0dd849b10461bd7cd3f97cc59b6e992f7a13a66465cf14410331b",
+    "package_load_s": 34.663872834003996,
+    "first_predict_ms": 36.72041598474607,
+    "warm_predict_ms": [32.76545798871666, 32.69670798908919, 32.646624982589856, 32.67716700793244, 32.64466699329205],
+    "warm_predict_median_ms": 32.67716700793244,
+    "cosine_by_row": [0.9999589920043945, 0.9999254941940308, 0.9999814033508301],
+    "preferred_device_counts": {"cpu": 13, "neuralEngine": 11660, "unknown_constants": 18658},
+    "expensive_ane_counts": {"conv": 90, "einsum": 2112, "softmax": 1056, "reduce_l2_norm": 45},
+    "mil_operation_count": 30397
+  },
+  "negative_arms_1024": [
+    {
+      "name": "query_tile_128",
+      "change": "Halve both local and global query tiles.",
+      "status": "rejected_slower_at_1024",
+      "package_load_s": 96.773052250006,
+      "warm_predict_median_ms": 52.95024998486042,
+      "warm_change_vs_control_percent": 62.04,
+      "cosine_by_row": [0.9999589920043945, 0.9999254941940308, 0.9999778270721436],
+      "preferred_device_counts": {"cpu": 21, "neuralEngine": 20712, "unknown_constants": 31466},
+      "expensive_ane_counts": {"conv": 90, "einsum": 4224, "softmax": 2112, "reduce_l2_norm": 45}
+    },
+    {
+      "name": "query_tile_512",
+      "change": "Double both local and global query tiles.",
+      "status": "rejected_slower_at_1024",
+      "package_load_s": 25.64994375000242,
+      "warm_predict_median_ms": 40.8936660096515,
+      "warm_change_vs_control_percent": 25.14,
+      "cosine_by_row": [0.9999589920043945, 0.9999254941940308, 0.999976396560669],
+      "preferred_device_counts": {"cpu": 9, "neuralEngine": 7134, "unknown_constants": 12253},
+      "expensive_ane_counts": {"conv": 90, "einsum": 1056, "softmax": 528, "reduce_l2_norm": 45}
+    },
+    {
+      "name": "all_local_heads_grouped",
+      "change": "Process all 12 heads together only in local layers; global layers remain head-split.",
+      "status": "rejected_slower_at_1024",
+      "package_load_s": 24.563536624977132,
+      "warm_predict_median_ms": 46.51020799065009,
+      "warm_change_vs_control_percent": 42.33,
+      "cosine_by_row": [0.9999589920043945, 0.9999254941940308, 0.9999814033508301],
+      "preferred_device_counts": {"cpu": 13, "neuralEngine": 4968, "unknown_constants": 7318},
+      "expensive_ane_counts": {"conv": 90, "einsum": 768, "matmul": 112, "softmax": 440, "reduce_l2_norm": 45},
+      "mil_operation_count": 12365
+    },
+    {
+      "name": "two_local_heads_grouped",
+      "change": "Process local heads in groups of two; global layers remain head-split.",
+      "status": "rejected_slower_at_1024",
+      "package_load_s": 30.139113707991783,
+      "warm_predict_median_ms": 38.33779101842083,
+      "warm_change_vs_control_percent": 17.32,
+      "cosine_by_row": [0.9999589920043945, 0.9999254941940308, 0.9999814033508301],
+      "preferred_device_counts": {"cpu": 13, "neuralEngine": 10484, "unknown_constants": 15382},
+      "expensive_ane_counts": {"conv": 90, "einsum": 768, "matmul": 672, "softmax": 720, "reduce_l2_norm": 45},
+      "mil_operation_count": 25945
+    },
+    {
+      "name": "shared_attention_masks",
+      "change": "Construct identical padding/local masks once and reuse them across heads.",
+      "status": "rejected_no_lowered_graph_change_and_slower_measurement",
+      "package_load_s": 49.40260245898389,
+      "warm_predict_median_ms": 37.100791989360005,
+      "warm_change_vs_control_percent": 13.54,
+      "cosine_by_row": [0.9999589920043945, 0.9999254941940308, 0.9999814033508301],
+      "preferred_device_counts": {"cpu": 13, "neuralEngine": 11660, "unknown_constants": 18658},
+      "expensive_ane_counts": {"conv": 90, "einsum": 2112, "softmax": 1056, "reduce_l2_norm": 45},
+      "mil_operation_count": 30397
+    },
+    {
+      "name": "exact_offset_windows_with_unfold",
+      "change": "Extract each query's exact 129-key offset window before scoring, avoiding the rectangular tile halo.",
+      "status": "conversion_failed",
+      "error": "Unsupported fx node unfold, kind unfold",
+      "hardware_prediction_run": false,
+      "placement_available": false
+    }
+  ],
+  "after_by_stage": [
+    {"sequence_length": 1024, "accepted_after": null, "reason": "Every convertible candidate was slower than the same-session control."},
+    {"sequence_length": 2048, "accepted_after": null, "reason": "Not run because no candidate passed the 1024 latency screen."},
+    {"sequence_length": 4096, "accepted_after": null, "reason": "Not run because no candidate passed the shorter-stage gates."},
+    {"sequence_length": 8192, "accepted_after": null, "reason": "Not run because no candidate passed the shorter-stage gates."}
+  ],
+  "conclusion": "The claimed missing local band is not present: local layers already slice a bounded halo and scale linearly. Eight global layers preserve a quadratic term. Reducing dispatch count changed local einsums into larger batched matmuls and made 1024 prediction slower despite keeping every expensive operation ANE-preferred. Query tile 256 remained the measured optimum among 128, 256, and 512. No runtime change was retained, and longer stages were deliberately not run after the 1024 screen rejected every candidate."
+}
