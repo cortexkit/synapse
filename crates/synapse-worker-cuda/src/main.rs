@@ -229,6 +229,9 @@ fn worker_request_loop<S: Read + Write>(stream: &mut S, max_frame: u32, args: &A
                     rss_mb: 0,
                     models_loaded: usize::from(state.loaded.is_some()),
                     placement_share: None,
+                    // This lane accepts any sequence up to the model's
+                    // configured maximum, so it advertises no bucket ladder.
+                    buckets: None,
                 },
                 None,
             ),
