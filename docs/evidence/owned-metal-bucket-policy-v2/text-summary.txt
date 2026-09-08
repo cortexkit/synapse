@@ -1,0 +1,5 @@
+text-singleton-511       244.362ms -> 29.860ms; 2091.2 -> 17113.1 tok/s; 8.18x
+text-singleton-513       1769.365ms -> 48.281ms; 289.9 -> 10625.4 tok/s; 36.65x
+text-singleton-603       1739.976ms -> 47.560ms; 346.6 -> 12678.8 tok/s; 36.59x
+text-singleton-1203      1752.555ms -> 114.687ms; 686.4 -> 10489.4 tok/s; 15.28x
+text-mixed-budget-3072   3698.269ms -> 945.895ms; 830.7 -> 3247.7 tok/s; 3.91x

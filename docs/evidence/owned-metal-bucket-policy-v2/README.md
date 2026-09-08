@@ -1,73 +1,101 @@
 # Owned Metal bucket policy v2 evidence
 
-This directory contains durable raw output from the bounded serial probe in
-`crates/synapse-engine-owned/examples/embed_bucket_probe.rs`. The baseline binary used
-`ef00b483a4ee95efddab1d86d0e8b1a3bcd9e0b3`; the candidate used bucket policy v2 with
-the original short buckets preserved and long shapes loaded on first use.
+## Representative text-tokenized A/B
 
-## Configuration and protocol
+The primary evidence is the bounded serial workload in
+`representative-text-fixture.json`, generated with the committed
+`crates/synapse-engine-owned/examples/embed_bucket_probe.rs`. It contains diverse
+text seeds, exact kept token IDs, per-row ID digests, and measured real-token counts.
+No input was chunked. Baseline and candidate inputs are byte-for-byte identical.
+
+Configuration:
 
 - Hardware: Apple M5 Max, 18 cores, 128 GB.
 - Model: GTE ModernBERT base, f16, explicit MPSGraph execution.
-- `config.json` SHA-256: `8ba54dc3d35d7194f5178a4194b649f146753e02dabd22bdca5c5cbac15069ed`.
-- `max_tokens`: 8192; `attention_units`: 67,108,864; synthetic input token ID: 1.
-- Main run order: baseline process, then candidate process. Each case ran once as an
-  unmeasured first-use/warmup call, then twice in the listed order. Processes and cases
-  were serial; caches were separate and initially empty.
-- Warm milliseconds below are the arithmetic mean of the two measured engine calls.
-  Token rates are the arithmetic mean of each repeat's `real_tokens / engine_wall_s`.
-- Cold load, kept separate from first-use calls: baseline 17,694.413 ms; candidate
-  14,923.541 ms.
+- Model config SHA-256: `8ba54dc3d35d7194f5178a4194b649f146753e02dabd22bdca5c5cbac15069ed`.
+- Model weights SHA-256: `3e85899d5728cb7de79781c0c3acfb91ccef9f875f1f7e0b3c9f3dd4b6a724ba`.
+- Tokenizer SHA-256: `6c8aaa9a542084f2457eab775d4eeb51f92a70c0fd9de28d5edb0ddec3c08d30`.
+- `max_tokens=8192`, `attention_units=67108864`, explicit execution.
+- Serial order: Metal v1 process, then Metal v2 process. Each case had one timed
+  first-use call followed by three measured warm calls. Separate caches were empty at
+  process start. Cold load was measured separately.
+- Throughput is `total real tokens / total measured wall`, not a mean of reciprocal
+  timings. The five-case aggregate was 641.2 real tok/s for v1 and 4,975.2 real tok/s
+  for v2 (17,706 measured tokens per arm).
 
-| Case | Baseline warm ms | Candidate warm ms | Baseline real tok/s | Candidate real tok/s |
-|---|---:|---:|---:|---:|
-| singleton-511 | 221.011 | 30.314 | 2,312.1 | 16,857.5 |
-| singleton-513 | 1,718.693 | 48.098 | 298.5 | 10,665.7 |
-| singleton-603 | 1,697.327 | 48.458 | 355.3 | 12,443.7 |
-| singleton-1203 | 1,674.083 | 117.336 | 718.6 | 10,252.9 |
-| singleton-2600 | 1,687.830 | 360.841 | 1,540.5 | 7,205.5 |
-| singleton-4096 | 1,742.814 | 643.978 | 2,350.4 | 6,363.6 |
-| filled-131 (8 rows) | 60.088 | 71.776 | 17,441.5 | 14,601.0 |
-| filled-320 (8 rows) | 122.512 | 147.939 | 20,897.3 | 17,305.1 |
-| filled-448 (8 rows) | 188.463 | 215.396 | 19,019.9 | 16,641.6 |
-| filled-603 (8 rows) | 14,278.730 | 392.200 | 337.8 | 12,301.8 |
-| filled-1203 (8 rows) | 16,648.376 | 980.595 | 580.3 | 9,814.8 |
-| filled-2600 (7 rows) | 16,151.719 | 2,435.713 | 1,130.2 | 7,472.5 |
-| filled-4096 (4 rows) | 9,111.727 | 2,221.991 | 1,798.2 | 7,384.1 |
-| mixed | 11,943.401 | 3,216.480 | 797.7 | 2,962.0 |
+| Case | Real tokens | v1 first-use ms | v2 first-use ms | v1 warm ms | v2 warm ms | v1 real tok/s | v2 real tok/s |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| text-singleton-511 | 511 | 253.307 | 171.491 | 244.362 | 29.860 | 2,091.2 | 17,113.1 |
+| text-singleton-513 | 513 | 1,761.120 | 191.061 | 1,769.365 | 48.281 | 289.9 | 10,625.4 |
+| text-singleton-603 | 603 | 1,756.741 | 47.092 | 1,739.976 | 47.560 | 346.6 | 12,678.8 |
+| text-singleton-1203 | 1,203 | 1,747.220 | 280.720 | 1,752.555 | 114.687 | 686.4 | 10,489.4 |
+| text-mixed-budget-3072 | 3,072 | 3,830.399 | 1,052.846 | 3,698.269 | 945.895 | 830.7 | 3,247.7 |
 
-Because the baseline-first main run showed lower candidate numbers for the unchanged
-131/320/448 shapes, a short bounded order-control was run candidate first and baseline
-second against warm package caches. Each case had one warmup and seven measured calls:
+Cold load was 17,590.917 ms for v1 and 14,609.868 ms for v2. The mixed request has
+six distinct rows of 127, 255, 383, 511, 603, and 1,193 tokens, totaling exactly the
+module's 3,072-token quantum and remaining below eight rows.
 
-| Case | Baseline warm ms | Candidate warm ms | Baseline real tok/s | Candidate real tok/s |
-|---|---:|---:|---:|---:|
-| filled-131 (8x160) | 79.777 | 61.307 | 13,144.8 | 17,096.3 |
-| filled-320 (8x320) | 154.067 | 125.457 | 16,618.1 | 20,406.1 |
-| filled-448 (8x448) | 212.524 | 189.268 | 16,871.3 | 18,944.7 |
+The probe asserts the complete ordered vector array equals first use on every measured
+repeat; `repeat_vector_sha256` records every row of every repeat. The comparison tool
+also rejects metadata, exact input IDs, lengths, row counts, vector dimensions, profile
+row counts, or repeat digests that differ. The mixed batch is byte-exact across v1/v2,
+which provides non-vacuous output-order coverage because all six texts and vectors are
+distinct. Singleton vectors differ slightly across shapes; the worst observed cosine was
+0.99998651 and maximum absolute difference was 0.00066243. Policy v2 deliberately
+rotates engine/package identity, so no same-fingerprint or mixed-space claim is made.
 
-The selected shapes and vectors are identical for these three short controls. The two
-orders bracket host-state variance and provide no evidence of a policy-caused full-batch
-regression after preserving the original short ladder.
+## ANE feasibility and exact handoff
 
-All main-run vectors were byte-exact across policies except singleton-511, where changing
-from 8x512 to 1x512 produced maximum absolute difference 0.00036131 and cosine
-0.9999965398. This passes the existing 0.999 cosine gate, but policy v2 deliberately
-changes engine and package-cache identity; cosine is not used to claim an unchanged
-fingerprint.
+No existing ANE harness can execute this complete workload unchanged. The installed
+worker is MiniLM/mean-pooling only. The standalone GTE converter and runner support only
+fixed 128/256/512 buckets; rows 513, 603, and 1,203 are over the maximum, and the runner
+requires every row in a batch to have identical padded length. Therefore the mixed
+request cannot be run without dropping, truncating, or splitting rows, all of which would
+change the comparison.
 
-## Files
+`ane-feasibility.json` records the explicit refusals. `ane-supported-seq512.jsonl` exports
+only the 511-token row to the existing fixed-512 schema, preserving all kept IDs and
+adding one masked pad token (`pad_token_id=50283`). If a matching GTE seq512 Core ML
+artifact is available, the bounded supported subset can be run separately:
 
-- `baseline.raw.json`, `candidate.raw.json`: full metadata, per-repeat timings, and vectors.
-- `baseline.profile.stderr`, `candidate.profile.stderr`: engine-emitted selected shapes and
-  compile/cache timing.
-- `comparison.json`: parsed shapes, padded-token ratios, throughput, and exact/cosine
-  vector comparison.
-- `baseline-short-control.raw.json`, `candidate-short-control.raw.json` and matching
-  `*.profile.stderr`: seven-repeat reverse-order short-shape control.
-- `short-control-comparison.json`: parsed short-shape control.
-- `summary.txt`, `short-control-summary.txt`: compact generated tables.
+```sh
+swiftc -O -parse-as-library \
+  -o target/ane-coreml bench/spikes/ane-minilm/ane_coreml.swift
+
+target/ane-coreml run \
+  --model <gte-modernbert-seq512.mlmodelc> \
+  --input docs/evidence/owned-metal-bucket-policy-v2/ane-supported-seq512.jsonl \
+  --output <ane-vectors.jsonl> \
+  --stats-out <ane-stats.json> \
+  --placement-out <ane-placement.json> \
+  --batch-size 1 --pooling cls --compute-units cpuAndNeuralEngine
+```
+
+This would be a supported-subset diagnostic, not an exact three-arm workload. ANE has a
+distinct engine fingerprint and must not be treated as vector-space equivalent from
+cosine alone.
+
+## Synthetic shape diagnostic
+
+The earlier repeated-token sweep is retained only as a shape/timing diagnostic, not as
+production-throughput or ordering/parity evidence. Its compact derived files are
+`comparison.json`, `short-control-comparison.json`, `summary.txt`, and
+`short-control-summary.txt`. Original raw synthetic JSON and profile logs were preserved
+before compaction at:
+
+`/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/pool-94/.cortexkit/alfonso/evidence/owned-metal-bucket-policy-v2/synthetic-originals`
+
+## Durable files
+
+- `representative-text-fixture.json`: canonical diverse text/ID fixture and digests.
+- `text-metal-v1.raw.json`, `text-metal-v2.raw.json`: compact raw metadata, exact IDs,
+  timings, vectors, and per-repeat vector digests.
+- `text-metal-v1.profile.stderr`, `text-metal-v2.profile.stderr`: engine-selected shapes
+  and first-use/cache timing.
+- `text-comparison.json`, `text-summary.txt`: strictly validated aggregate comparison.
+- `ane-supported-seq512.jsonl`, `ane-feasibility.json`: exact supported subset and
+  explicit unsupported requests.
 
 Regenerate comparisons with
-`bench/campaign/compare-owned-metal-bucket-probes.py`; its arguments are documented by
-`--help`.
+`bench/campaign/compare-owned-metal-bucket-probes.py`; run its negative tests with
+`python3 -m unittest bench/campaign/tests/test_compare_owned_metal_bucket_probes.py`.

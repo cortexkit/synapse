@@ -1,10 +1,10 @@
-//! Serial, bounded owned-Metal bucket-policy probe.
+//! Serial, bounded owned-Metal bucket-policy probe with representative tokenized rows.
 //!
 //! Build this example at the baseline and candidate revisions, preserve each binary,
 //! then run each with `SYNAPSE_EMBED_PROFILE=1` and separate empty package caches:
 //! `embed_bucket_probe MODEL_DIR OUT.json CACHE_DIR [REPEATS] [CASE_CSV] 2> profile.stderr`.
-//! The JSON records exact inputs, configuration, cold load, warm timings, and vectors;
-//! stderr records the shapes selected by the engine itself.
+//! Output is compact JSON containing exact token IDs, model/tokenizer digests, first-use
+//! and repeated warm timings, vectors, and a digest for every repeated result.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -16,10 +16,10 @@ use synapse_core::{EmbedEngine, RuntimeConfig, TokenBatch, ValidatedArtifact};
 use synapse_engine_owned::{
     engine_identity, ModelFamily, OwnedDType, OwnedMetalEmbedEngine, BUCKET_POLICY_VERSION,
 };
+use tokenizers::Tokenizer;
 
 const MAX_TOKENS: usize = 8192;
 const ATTENTION_UNITS: usize = 67_108_864;
-const INPUT_TOKEN_ID: u32 = 1;
 
 #[derive(Serialize)]
 struct ProbeRun {
@@ -30,26 +30,38 @@ struct ProbeRun {
 
 #[derive(Serialize)]
 struct ProbeMetadata {
+    probe_version: &'static str,
     family: &'static str,
     dtype: &'static str,
     model_config_sha256: String,
+    model_weights_sha256: String,
+    tokenizer_sha256: String,
     max_tokens: usize,
     attention_units: usize,
     execution: &'static str,
     bucket_policy_version: u32,
     engine_identity: synapse_core::EngineIdentity,
-    input_token_id: u32,
-    warmup_runs_per_case: usize,
+    first_use_runs_per_case: usize,
     measured_repeats_per_case: usize,
     case_order: Vec<&'static str>,
+}
+
+#[derive(Clone, Serialize)]
+struct InputRow {
+    id: &'static str,
+    seed_text: &'static str,
+    target_tokens: usize,
+    input_ids: Vec<u32>,
 }
 
 #[derive(Serialize)]
 struct CaseRun {
     name: &'static str,
-    lengths: Vec<usize>,
+    rows: Vec<InputRow>,
     real_tokens: usize,
+    first_use_engine_wall_s: f64,
     warm_engine_wall_s: Vec<f64>,
+    repeat_vector_sha256: Vec<Vec<String>>,
     vectors: Vec<Vec<f32>>,
 }
 
@@ -65,16 +77,31 @@ fn main() {
     let repeats = args
         .get(4)
         .map(|value| value.parse::<usize>().expect("REPEATS must be an integer"))
-        .unwrap_or(2);
+        .unwrap_or(3);
     assert!(repeats > 0, "REPEATS must be positive");
+
+    let tokenizer_path = model_dir.join("tokenizer.json");
+    let tokenizer = Tokenizer::from_file(&tokenizer_path).expect("load tokenizer.json");
+    let requested_cases = args
+        .get(5)
+        .map(|value| value.split(',').collect::<Vec<_>>());
+    let cases = probe_cases(&tokenizer)
+        .into_iter()
+        .filter(|(name, _)| {
+            requested_cases
+                .as_ref()
+                .is_none_or(|requested| requested.contains(name))
+        })
+        .collect::<Vec<_>>();
+    assert!(!cases.is_empty(), "CASE_CSV selected no known cases");
 
     let family = ModelFamily::GteModernBert;
     let dtype = OwnedDType::F16;
+    let weights_path = model_dir.join("model.safetensors");
     let mut config = RuntimeConfig::default();
-    config.values.insert(
-        "model_path".to_string(),
-        model_dir.join("model.safetensors").display().to_string(),
-    );
+    config
+        .values
+        .insert("model_path".to_string(), weights_path.display().to_string());
     config.values.insert(
         "package_cache_root".to_string(),
         cache_dir.display().to_string(),
@@ -89,18 +116,6 @@ fn main() {
         .values
         .insert("attention_units".to_string(), ATTENTION_UNITS.to_string());
 
-    let requested_cases = args
-        .get(5)
-        .map(|value| value.split(',').collect::<Vec<_>>());
-    let cases = probe_cases()
-        .into_iter()
-        .filter(|(name, _)| {
-            requested_cases
-                .as_ref()
-                .is_none_or(|requested| requested.contains(name))
-        })
-        .collect::<Vec<_>>();
-    assert!(!cases.is_empty(), "CASE_CSV selected no known cases");
     let mut engine = OwnedMetalEmbedEngine::new(family, dtype);
     let cold_started = Instant::now();
     let loaded = engine
@@ -115,83 +130,147 @@ fn main() {
     let cold_load_s = cold_started.elapsed().as_secs_f64();
 
     let mut results = Vec::with_capacity(cases.len());
-    for (name, lengths) in cases {
-        let batch = token_batch(&lengths);
-        engine
+    for (name, rows) in cases {
+        let batch = token_batch(&rows);
+        let first_started = Instant::now();
+        let first_vectors = engine
             .embed_batch(&loaded, batch.clone())
-            .unwrap_or_else(|error| panic!("warm {name}: {error:?}"));
+            .unwrap_or_else(|error| panic!("first use {name}: {error:?}"));
+        let first_use_engine_wall_s = first_started.elapsed().as_secs_f64();
         let mut walls = Vec::with_capacity(repeats);
-        let mut vectors = Vec::new();
+        let mut repeat_vector_sha256 = Vec::with_capacity(repeats);
         for pass in 0..repeats {
             let started = Instant::now();
             let output = engine
                 .embed_batch(&loaded, batch.clone())
                 .unwrap_or_else(|error| panic!("measure {name} pass {pass}: {error:?}"));
             walls.push(started.elapsed().as_secs_f64());
-            if pass == 0 {
-                vectors = output;
-            }
+            assert_eq!(
+                output, first_vectors,
+                "{name} pass {pass} changed vectors or output order"
+            );
+            repeat_vector_sha256.push(output.iter().map(|row| vector_sha256(row)).collect());
         }
         results.push(CaseRun {
             name,
-            real_tokens: lengths.iter().sum(),
-            lengths,
+            real_tokens: rows.iter().map(|row| row.input_ids.len()).sum(),
+            rows,
+            first_use_engine_wall_s,
             warm_engine_wall_s: walls,
-            vectors,
+            repeat_vector_sha256,
+            vectors: first_vectors,
         });
     }
 
     let case_order = results.iter().map(|case| case.name).collect();
     let output = ProbeRun {
         metadata: ProbeMetadata {
+            probe_version: "representative-text-v1",
             family: family.as_str(),
             dtype: dtype.as_str(),
-            model_config_sha256: sha256(&model_dir.join("config.json")),
+            model_config_sha256: file_sha256(&model_dir.join("config.json")),
+            model_weights_sha256: file_sha256(&weights_path),
+            tokenizer_sha256: file_sha256(&tokenizer_path),
             max_tokens: MAX_TOKENS,
             attention_units: ATTENTION_UNITS,
             execution: "explicit",
             bucket_policy_version: BUCKET_POLICY_VERSION,
             engine_identity: engine_identity(family, dtype),
-            input_token_id: INPUT_TOKEN_ID,
-            warmup_runs_per_case: 1,
+            first_use_runs_per_case: 1,
             measured_repeats_per_case: repeats,
             case_order,
         },
         cold_load_s,
         cases: results,
     };
-    fs::write(output_path, serde_json::to_vec_pretty(&output).unwrap()).expect("write probe JSON");
+    fs::write(output_path, serde_json::to_vec(&output).unwrap()).expect("write probe JSON");
 }
 
-fn probe_cases() -> Vec<(&'static str, Vec<usize>)> {
-    vec![
-        ("singleton-511", vec![511]),
-        ("singleton-513", vec![513]),
-        ("singleton-603", vec![603]),
-        ("singleton-1203", vec![1203]),
-        ("singleton-2600", vec![2600]),
-        ("singleton-4096", vec![4096]),
-        ("filled-131", vec![131; 8]),
-        ("filled-320", vec![320; 8]),
-        ("filled-448", vec![448; 8]),
-        ("filled-603", vec![603; 8]),
-        ("filled-1203", vec![1203; 8]),
-        ("filled-2600", vec![2600; 7]),
-        ("filled-4096", vec![4096; 4]),
-        ("mixed", vec![511, 513, 603, 1203, 2600, 4096]),
-    ]
+fn probe_cases(tokenizer: &Tokenizer) -> Vec<(&'static str, Vec<InputRow>)> {
+    let seeds = [
+        ("climate", "Coastal climate adaptation combines wetlands, resilient transit, and neighborhood planning."),
+        ("database", "A database transaction remains atomic when concurrent writers update related account records."),
+        ("biology", "Protein folding depends on amino acid interactions, solvent conditions, and cellular machinery."),
+        ("history", "Archive letters describe trade routes, local elections, and daily life across several decades."),
+        ("music", "The chamber ensemble balances a lyrical violin melody against quiet rhythmic variations."),
+        ("astronomy", "Astronomers compare repeated spectra to estimate a distant planet's atmosphere and orbit."),
+        ("cooking", "Slow roasting vegetables develops sweetness while herbs and citrus preserve a bright finish."),
+        ("software", "The release pipeline validates schemas, runs deterministic tests, and signs immutable artifacts."),
+        ("education", "Students revise explanations after comparing evidence from several carefully controlled experiments."),
+        ("transport", "A regional rail timetable coordinates transfers while leaving recovery time for disruptions."),
+    ];
+    let single_targets = [511, 513, 603, 1203];
+    let mut cases = single_targets
+        .iter()
+        .enumerate()
+        .map(|(index, &target)| {
+            let (id, text) = seeds[index];
+            (
+                match target {
+                    511 => "text-singleton-511",
+                    513 => "text-singleton-513",
+                    603 => "text-singleton-603",
+                    1203 => "text-singleton-1203",
+                    _ => unreachable!(),
+                },
+                vec![tokenized_row(tokenizer, id, text, target)],
+            )
+        })
+        .collect::<Vec<_>>();
+    let mixed_targets = [127, 255, 383, 511, 603, 1193];
+    let mixed = mixed_targets
+        .iter()
+        .enumerate()
+        .map(|(index, &target)| {
+            let (id, text) = seeds[index + 4];
+            tokenized_row(tokenizer, id, text, target)
+        })
+        .collect();
+    cases.push(("text-mixed-budget-3072", mixed));
+    cases
 }
 
-fn token_batch(lengths: &[usize]) -> TokenBatch {
-    TokenBatch {
-        items: lengths
-            .iter()
-            .map(|&length| vec![INPUT_TOKEN_ID; length])
-            .collect(),
+fn tokenized_row(
+    tokenizer: &Tokenizer,
+    id: &'static str,
+    seed_text: &'static str,
+    target_tokens: usize,
+) -> InputRow {
+    let mut repetitions = 1;
+    loop {
+        let text = std::iter::repeat_n(seed_text, repetitions)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let encoding = tokenizer.encode(text, true).expect("tokenize seed text");
+        if encoding.len() >= target_tokens {
+            let mut input_ids = encoding.get_ids().to_vec();
+            input_ids.truncate(target_tokens);
+            return InputRow {
+                id,
+                seed_text,
+                target_tokens,
+                input_ids,
+            };
+        }
+        repetitions *= 2;
     }
 }
 
-fn sha256(path: &Path) -> String {
+fn token_batch(rows: &[InputRow]) -> TokenBatch {
+    TokenBatch {
+        items: rows.iter().map(|row| row.input_ids.clone()).collect(),
+    }
+}
+
+fn file_sha256(path: &Path) -> String {
     let bytes = fs::read(path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
     format!("{:x}", Sha256::digest(bytes))
+}
+
+fn vector_sha256(vector: &[f32]) -> String {
+    let mut digest = Sha256::new();
+    for value in vector {
+        digest.update(value.to_bits().to_le_bytes());
+    }
+    format!("{:x}", digest.finalize())
 }
