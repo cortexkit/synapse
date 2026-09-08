@@ -16482,15 +16482,24 @@ mod tests {
             .iter()
             .find(|r| r["model_id"] == "test-metal-lane")
             .expect("metal row exists");
-        assert_eq!(metal_row["max_tokens"], 512);
-        assert_eq!(metal_row["max_tokens_source"], "runtime_bucket");
-        assert_eq!(metal_row["bucket_ladder"], json!([128, 256, 384, 512]));
-        assert_eq!(metal_row["dims"], 384);
         assert_eq!(metal_row["dtype"], "f16");
         assert_eq!(metal_row["device_class"], "metal");
         assert_eq!(metal_row["certified"], true);
         assert_eq!(metal_row["warm_load_cost_hint_ms"], 18.5);
         assert_eq!(metal_row["recommended_batch"]["rows"], 8);
+        // The Metal engine only reports live shapes where it exists. Off macOS
+        // it holds no model, so the row falls back to catalog config: asserting
+        // the bucket-derived values everywhere would assert a fiction.
+        if cfg!(target_os = "macos") {
+            assert_eq!(metal_row["max_tokens"], 512);
+            assert_eq!(metal_row["max_tokens_source"], "runtime_bucket");
+            assert_eq!(metal_row["bucket_ladder"], json!([128, 256, 384, 512]));
+            assert_eq!(metal_row["dims"], 384);
+        } else {
+            assert_eq!(metal_row["max_tokens"], 512);
+            assert_eq!(metal_row["max_tokens_source"], "catalog");
+            assert!(metal_row.get("bucket_ladder").is_none());
+        }
 
         let ane_row = models
             .iter()
