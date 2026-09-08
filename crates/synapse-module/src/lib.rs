@@ -1324,6 +1324,7 @@ struct EmbedVector {
     id: String,
     vector: Vec<f32>,
     content_sha256: String,
+    submitted_sha256: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -6754,11 +6755,15 @@ fn remote_embed_success(
         .into_iter()
         .zip(result.vectors)
         .zip(result.submitted_texts)
-        .map(|((id, vector), text)| RemoteEmbedVector {
-            id,
-            vector,
-            content_sha256: sha256_text(&text),
-        })
+        .zip(result.submitted_sha256s)
+        .map(
+            |(((id, vector), text), submitted_sha256)| RemoteEmbedVector {
+                id,
+                vector,
+                content_sha256: sha256_text(&text),
+                submitted_sha256,
+            },
+        )
         .collect::<Vec<_>>();
     let dims = profile.dims.min(u32::MAX as usize) as u32;
     let table_epoch = state
@@ -7311,11 +7316,15 @@ async fn execute_remote_embed_batch_job(
             .cloned()
             .zip(result.vectors)
             .zip(result.submitted_texts)
-            .map(|((id, vector), text)| RemoteEmbedVector {
-                id,
-                vector,
-                content_sha256: sha256_text(&text),
-            })
+            .zip(result.submitted_sha256s)
+            .map(
+                |(((id, vector), text), submitted_sha256)| RemoteEmbedVector {
+                    id,
+                    vector,
+                    content_sha256: sha256_text(&text),
+                    submitted_sha256,
+                },
+            )
             .collect::<Vec<_>>();
         let mut page_value = json!({
             "fingerprint": work.profile.fingerprint,
@@ -9591,6 +9600,14 @@ async fn execute_embed_batch_job(
         .iter()
         .map(|index| work.tokenized.real_token_counts[*index])
         .collect();
+    work.tokenized.embedded_texts = pending_indices
+        .iter()
+        .map(|index| work.tokenized.embedded_texts[*index].clone())
+        .collect();
+    work.tokenized.submitted_sha256s = pending_indices
+        .iter()
+        .map(|index| work.tokenized.submitted_sha256s[*index].clone())
+        .collect();
     work.total_tokens = work
         .tokenized
         .real_token_counts
@@ -9940,10 +9957,12 @@ fn embed_result_pages(
         .into_iter()
         .zip(vectors)
         .zip(&tokenized.embedded_texts)
-        .map(|((id, vector), text)| EmbedVector {
+        .zip(&tokenized.submitted_sha256s)
+        .map(|(((id, vector), text), submitted_sha256)| EmbedVector {
             id,
             vector,
             content_sha256: sha256_text(text),
+            submitted_sha256: submitted_sha256.clone(),
         })
         .collect::<Vec<_>>();
     let page_ranges = page_ranges(
@@ -10376,10 +10395,12 @@ async fn embed_tokenized(
         .into_iter()
         .zip(vectors)
         .zip(&tokenized.embedded_texts)
-        .map(|((id, vector), text)| EmbedVector {
+        .zip(&tokenized.submitted_sha256s)
+        .map(|(((id, vector), text), submitted_sha256)| EmbedVector {
             id,
             vector,
             content_sha256: sha256_text(text),
+            submitted_sha256: submitted_sha256.clone(),
         })
         .collect::<Vec<_>>();
     let payload = EmbedResponsePayload {
@@ -14823,6 +14844,20 @@ mod tests {
             assert!(
                 CONTRACT.contains(&format!("`{field}`")),
                 "wire contract is missing model catalog field: {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn wire_contract_documents_every_embed_vector_field() {
+        const CONTRACT: &str = include_str!("../../../docs/wire-contract-v1.md");
+        const EMBED_VECTOR_FIELDS: [&str; 4] =
+            ["id", "vector", "content_sha256", "submitted_sha256"];
+
+        for field in EMBED_VECTOR_FIELDS {
+            assert!(
+                CONTRACT.contains(&format!("`{field}`")),
+                "wire contract is missing embed vector field: {field}"
             );
         }
     }

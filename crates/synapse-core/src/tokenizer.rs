@@ -38,6 +38,9 @@ pub struct TokenizedItem {
     /// stored-content hash as a divergence detector, so a truncated item must
     /// hash differently from the full submitted text.
     pub embedded_text: String,
+    /// The SHA-256 hex digest of the raw submitted text bytes before tokenization
+    /// or truncation.
+    pub submitted_sha256: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,6 +49,7 @@ pub struct TokenizedBatch {
     pub disclosures: Vec<TruncationDisclosure>,
     pub real_token_counts: Vec<u32>,
     pub embedded_texts: Vec<String>,
+    pub submitted_sha256s: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -152,12 +156,18 @@ impl SanitizedTokenizer {
             .iter()
             .map(|disclosure| disclosure.effective_tokens)
             .collect();
-        let embedded_texts = items.into_iter().map(|item| item.embedded_text).collect();
+        let mut embedded_texts = Vec::with_capacity(items.len());
+        let mut submitted_sha256s = Vec::with_capacity(items.len());
+        for item in items {
+            embedded_texts.push(item.embedded_text);
+            submitted_sha256s.push(item.submitted_sha256);
+        }
         Ok(TokenizedBatch {
             batch,
             disclosures,
             real_token_counts,
             embedded_texts,
+            submitted_sha256s,
         })
     }
 
@@ -190,9 +200,11 @@ impl SanitizedTokenizer {
         } else {
             text.to_string()
         };
+        let submitted_sha256 = sha256_text(text);
         Ok(TokenizedItem {
             ids,
             embedded_text,
+            submitted_sha256,
             disclosure: TruncationDisclosure {
                 submitted_tokens: submitted_tokens.min(u32::MAX as usize) as u32,
                 effective_tokens: effective_tokens.min(u32::MAX as usize) as u32,
@@ -200,6 +212,10 @@ impl SanitizedTokenizer {
             },
         })
     }
+}
+
+fn sha256_text(text: &str) -> String {
+    hex::encode(Sha256::digest(text.as_bytes()))
 }
 
 fn tokenizer_sha256(tokenizer: &Tokenizer) -> Result<String, TokenizationError> {
@@ -257,6 +273,21 @@ mod tests {
         assert_eq!(
             tokenized.embedded_texts[1], "a b c",
             "truncated items must carry the decode of the kept tokens, not the submitted text"
+        );
+        assert_eq!(
+            tokenized.submitted_sha256s[0],
+            sha256_text("a b"),
+            "untruncated items must hash the submitted text"
+        );
+        assert_eq!(
+            tokenized.submitted_sha256s[1],
+            sha256_text("a b c d e"),
+            "truncated items must hash the original submitted text before truncation"
+        );
+        assert_ne!(
+            tokenized.submitted_sha256s[1],
+            sha256_text(&tokenized.embedded_texts[1]),
+            "truncated item submitted hash must differ from embedded text hash"
         );
     }
 
