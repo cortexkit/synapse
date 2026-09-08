@@ -6,6 +6,7 @@ use std::{
 
 use reqwest::{header, Method, StatusCode};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use synapse_core::{RemoteProvenance, ResponseProvenance, StableError};
 
 use super::{
@@ -37,6 +38,7 @@ struct ProviderConnection {
 pub(crate) struct RemoteEmbeddingResult {
     pub vectors: Vec<Vec<f32>>,
     pub submitted_texts: Vec<String>,
+    pub submitted_sha256s: Vec<String>,
     pub token_counts: Vec<u32>,
     pub provider_request_id: Option<String>,
 }
@@ -219,12 +221,19 @@ impl RemoteGateway {
         class: RemoteClass,
         remaining_deadline_ms: u64,
     ) -> Result<RemoteEmbeddingResult, RemoteGatewayError> {
+        let original_sha256s = texts
+            .iter()
+            .map(|text| hex::encode(Sha256::digest(text.as_bytes())))
+            .collect::<Vec<_>>();
         let submitted = texts
             .iter()
             .map(|text| truncate_text(text, profile.max_input_tokens))
             .collect::<Vec<_>>();
-        self.embed_submitted(profile, submitted, class, remaining_deadline_ms)
-            .await
+        let mut result = self
+            .embed_submitted(profile, submitted, class, remaining_deadline_ms)
+            .await?;
+        result.submitted_sha256s = original_sha256s;
+        Ok(result)
     }
 
     pub async fn ensure_certified(
@@ -614,9 +623,14 @@ async fn execute_embedding_request(
                     started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
                     crate::now_ms(),
                 );
+                let submitted_sha256s = submitted_texts
+                    .iter()
+                    .map(|text| hex::encode(Sha256::digest(text.as_bytes())))
+                    .collect::<Vec<_>>();
                 return Ok(RemoteEmbeddingResult {
                     vectors,
                     submitted_texts,
+                    submitted_sha256s,
                     token_counts,
                     provider_request_id: final_request_id,
                 });
@@ -821,4 +835,5 @@ pub(crate) struct RemoteEmbedVector {
     pub id: String,
     pub vector: Vec<f32>,
     pub content_sha256: String,
+    pub submitted_sha256: String,
 }

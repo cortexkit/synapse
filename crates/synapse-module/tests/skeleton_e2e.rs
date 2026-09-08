@@ -699,6 +699,7 @@ async fn remote_gateway_declares_calibrates_checkpoints_trips_and_recovers() {
     );
     assert_eq!(embedded["result"]["payload"]["vectors"][0]["id"], "q");
     assert!(embedded["result"]["payload"]["vectors"][0]["content_sha256"].is_string());
+    assert!(embedded["result"]["payload"]["vectors"][0]["submitted_sha256"].is_string());
 
     let accepted = route_request(
         &mut consumer,
@@ -1098,6 +1099,10 @@ async fn embed_query_loaded_owned_metal_carries_distinct_provenance_and_content_
     assert_eq!(result["vectors"][0]["id"], "owned-q1");
     assert_eq!(
         result["vectors"][0]["content_sha256"],
+        "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+    );
+    assert_eq!(
+        result["vectors"][0]["submitted_sha256"],
         "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
     );
     assert_eq!(result["provenance"]["engine"]["engine"], "owned-metal");
@@ -1881,6 +1886,249 @@ async fn over_budget_embed_batch_returns_job_and_pages_results() {
         assert_eq!(vector["id"], format!("item-{index}"));
         assert_vectors_close(&vector["vector"], &inline_vectors[index]);
     }
+}
+
+#[tokio::test]
+async fn embed_query_row_over_ceiling_reports_submitted_and_content_hashes() {
+    let Some(preloads) = minilm_preload_config() else {
+        eprintln!("skipping MiniLM over-ceiling e2e: local HF ONNX snapshot is missing");
+        return;
+    };
+    let _lock = acquire_minilm_e2e_lock();
+    let (_daemon, _module, mut consumer, route) = open_route_with_preloads(Some(&preloads)).await;
+    certify_preloaded_models(&mut consumer, route, 40).await;
+
+    let submitted_text = "the quick brown fox jumps over the lazy dog. ".repeat(60);
+    let expected_submitted_sha = sha256_hex(submitted_text.as_bytes());
+
+    let body = route_request(
+        &mut consumer,
+        route,
+        10,
+        serde_json::json!({
+            "method": "embed.query",
+            "params": { "id": "over-cap-query", "text": &submitted_text }
+        }),
+    )
+    .await;
+
+    let result = &body["result"];
+    let vector = &result["vectors"][0];
+    let submitted_sha = vector["submitted_sha256"]
+        .as_str()
+        .expect("submitted_sha256 present");
+    let content_sha = vector["content_sha256"]
+        .as_str()
+        .expect("content_sha256 present");
+    let disclosure = &result["truncation_disclosures"][0];
+    let is_truncated = disclosure["truncated"].as_bool().expect("truncated bool");
+
+    assert_eq!(submitted_sha, expected_submitted_sha);
+    assert_ne!(content_sha, submitted_sha);
+    assert!(is_truncated);
+}
+
+#[tokio::test]
+async fn embed_query_row_under_ceiling_reports_equal_hashes() {
+    let Some(preloads) = minilm_preload_config() else {
+        eprintln!("skipping MiniLM under-ceiling e2e: local HF ONNX snapshot is missing");
+        return;
+    };
+    let _lock = acquire_minilm_e2e_lock();
+    let (_daemon, _module, mut consumer, route) = open_route_with_preloads(Some(&preloads)).await;
+    certify_preloaded_models(&mut consumer, route, 40).await;
+
+    let submitted_text = "hello world";
+    let expected_submitted_sha = sha256_hex(submitted_text.as_bytes());
+
+    let body = route_request(
+        &mut consumer,
+        route,
+        11,
+        serde_json::json!({
+            "method": "embed.query",
+            "params": { "id": "under-cap-query", "text": submitted_text }
+        }),
+    )
+    .await;
+
+    let result = &body["result"];
+    let vector = &result["vectors"][0];
+    let submitted_sha = vector["submitted_sha256"]
+        .as_str()
+        .expect("submitted_sha256 present");
+    let content_sha = vector["content_sha256"]
+        .as_str()
+        .expect("content_sha256 present");
+    let disclosure = &result["truncation_disclosures"][0];
+    let is_truncated = disclosure["truncated"].as_bool().expect("truncated bool");
+
+    assert_eq!(submitted_sha, expected_submitted_sha);
+    assert_eq!(content_sha, submitted_sha);
+    assert!(!is_truncated);
+}
+
+#[tokio::test]
+async fn embed_batch_with_mixed_over_cap_and_short_rows_returns_all_vectors() {
+    let Some(preloads) = minilm_preload_config() else {
+        eprintln!("skipping MiniLM mixed-batch e2e: local HF ONNX snapshot is missing");
+        return;
+    };
+    let _lock = acquire_minilm_e2e_lock();
+    let (_daemon, _module, mut consumer, route) = open_route_with_preloads(Some(&preloads)).await;
+    certify_preloaded_models(&mut consumer, route, 40).await;
+
+    let over_cap_text = "the quick brown fox jumps over the lazy dog. ".repeat(60);
+    let short_text_1 = "short alpha";
+    let short_text_2 = "short beta";
+
+    let items = vec![
+        serde_json::json!({ "id": "w100", "text": &over_cap_text }),
+        serde_json::json!({ "id": "w101", "text": short_text_1 }),
+        serde_json::json!({ "id": "w102", "text": short_text_2 }),
+    ];
+
+    let body = route_request(
+        &mut consumer,
+        route,
+        12,
+        serde_json::json!({
+            "method": "embed.batch",
+            "params": { "items": items }
+        }),
+    )
+    .await;
+
+    let result = &body["result"];
+    let vectors = result["vectors"].as_array().expect("vectors array");
+    assert_eq!(
+        vectors.len(),
+        3,
+        "must return vectors for ALL rows in the batch"
+    );
+
+    let v0 = &vectors[0];
+    assert_eq!(v0["id"], "w100");
+    let v0_submitted_sha = v0["submitted_sha256"].as_str().unwrap();
+    let v0_content_sha = v0["content_sha256"].as_str().unwrap();
+    assert_eq!(v0_submitted_sha, sha256_hex(over_cap_text.as_bytes()));
+    assert_ne!(v0_content_sha, v0_submitted_sha);
+    assert_eq!(result["truncation_disclosures"][0]["truncated"], true);
+
+    let v1 = &vectors[1];
+    assert_eq!(v1["id"], "w101");
+    let v1_submitted_sha = v1["submitted_sha256"].as_str().unwrap();
+    let v1_content_sha = v1["content_sha256"].as_str().unwrap();
+    assert_eq!(v1_submitted_sha, sha256_hex(short_text_1.as_bytes()));
+    assert_eq!(v1_content_sha, v1_submitted_sha);
+    assert_eq!(result["truncation_disclosures"][1]["truncated"], false);
+
+    let v2 = &vectors[2];
+    assert_eq!(v2["id"], "w102");
+    let v2_submitted_sha = v2["submitted_sha256"].as_str().unwrap();
+    let v2_content_sha = v2["content_sha256"].as_str().unwrap();
+    assert_eq!(v2_submitted_sha, sha256_hex(short_text_2.as_bytes()));
+    assert_eq!(v2_content_sha, v2_submitted_sha);
+    assert_eq!(result["truncation_disclosures"][2]["truncated"], false);
+}
+
+#[tokio::test]
+async fn job_tier_paged_results_replays_truncated_row_from_storage() {
+    let Some(preloads) = minilm_preload_config() else {
+        eprintln!("skipping MiniLM job-tier truncation e2e: local HF ONNX snapshot is missing");
+        return;
+    };
+    let preload_models: Value = serde_json::from_str(&preloads).expect("preload config is json");
+    let config = serde_json::json!({
+        "preload_models": preload_models,
+        "inline": { "max_items": 1 },
+        "jobs": {
+            "execution_ttl_ms": 60_000,
+            "result_retention_ttl_ms": 60_000,
+            "resume_deadline_ms": 60_000,
+            "result_page_bytes": 4_096,
+            "bulk_quantum_tokens": 16
+        }
+    })
+    .to_string();
+    let _lock = acquire_minilm_e2e_lock();
+    let (_daemon, _module, mut consumer, route) = open_route_with_config(&config).await;
+    certify_preloaded_models(&mut consumer, route, 80).await;
+
+    let over_cap_text = "the quick brown fox jumps over the lazy dog. ".repeat(60);
+    let short_text = "job tier short";
+
+    let items = vec![
+        serde_json::json!({ "id": "job-item-0", "text": &over_cap_text }),
+        serde_json::json!({ "id": "job-item-1", "text": short_text }),
+    ];
+
+    let accepted = route_request(
+        &mut consumer,
+        route,
+        500,
+        serde_json::json!({
+            "method": "embed.batch",
+            "params": { "request_key": "job-truncation-e2e", "items": items }
+        }),
+    )
+    .await;
+    let job_id = accepted["result"]["job_id"]
+        .as_str()
+        .expect("job response includes job_id")
+        .to_string();
+
+    let done = poll_embed_result(&mut consumer, route, 600, &job_id).await;
+    assert_eq!(done["result"]["state"], "done");
+    let page_count = done["result"]["page_count"].as_u64().unwrap();
+    let mut vectors = done["result"]["vectors"].as_array().unwrap().clone();
+    let mut disclosures = done["result"]["truncation_disclosures"]
+        .as_array()
+        .unwrap()
+        .clone();
+    for page in 1..page_count {
+        let body = route_request(
+            &mut consumer,
+            route,
+            600 + page,
+            serde_json::json!({
+                "method": "embed.result",
+                "params": { "job_id": &job_id, "page": page }
+            }),
+        )
+        .await;
+        vectors.extend(
+            body["result"]["vectors"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .cloned(),
+        );
+        disclosures.extend(
+            body["result"]["truncation_disclosures"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .cloned(),
+        );
+    }
+    assert_eq!(vectors.len(), 2);
+
+    let v0 = &vectors[0];
+    assert_eq!(v0["id"], "job-item-0");
+    let v0_submitted_sha = v0["submitted_sha256"].as_str().unwrap();
+    let v0_content_sha = v0["content_sha256"].as_str().unwrap();
+    assert_eq!(v0_submitted_sha, sha256_hex(over_cap_text.as_bytes()));
+    assert_ne!(v0_content_sha, v0_submitted_sha);
+    assert_eq!(disclosures[0]["truncated"], true);
+
+    let v1 = &vectors[1];
+    assert_eq!(v1["id"], "job-item-1");
+    let v1_submitted_sha = v1["submitted_sha256"].as_str().unwrap();
+    let v1_content_sha = v1["content_sha256"].as_str().unwrap();
+    assert_eq!(v1_submitted_sha, sha256_hex(short_text.as_bytes()));
+    assert_eq!(v1_content_sha, v1_submitted_sha);
+    assert_eq!(disclosures[1]["truncated"], false);
 }
 
 #[tokio::test]
@@ -3000,7 +3248,16 @@ fn copied_minilm_source_dir(label: &str) -> Option<PathBuf> {
     Some(source_dir)
 }
 
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(bytes))
+}
+
 fn minilm_preload_config() -> Option<String> {
+    minilm_preload_config_with_max_tokens(512)
+}
+
+fn minilm_preload_config_with_max_tokens(max_tokens: usize) -> Option<String> {
     let snapshot = minilm_onnx_snapshot()?;
     let model_path = snapshot.join("model.onnx");
     let tokenizer_path = snapshot.join("tokenizer.json");
@@ -3015,7 +3272,7 @@ fn minilm_preload_config() -> Option<String> {
             "tokenizer_path": tokenizer_path,
             "pooling": "mean",
             "normalize": true,
-            "max_tokens": 512,
+            "max_tokens": max_tokens,
             "quant": "fp32"
         }])
         .to_string(),

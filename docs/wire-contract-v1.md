@@ -23,9 +23,10 @@ MC); on any disagreement, the e2e tests win and this doc gets fixed.
   profile folds engine identity, sanitized-tokenizer digest, pooling,
   normalization, dtype, shape envelope, thread class. Anything that moves
   vector space mints a new string. Alias flips do NOT change fingerprints.
-- Per-item fields on embed responses: real_token_counts,
-  truncation_disclosures {submitted_tokens, effective_tokens, truncated},
-  and content_sha256 (see Divergence detector below).
+- Per-item fields on embed responses: `real_token_counts`,
+  `truncation_disclosures` (`submitted_tokens`, `effective_tokens`, `truncated`),
+  and `vectors` with `id`, `vector`, `content_sha256`, and `submitted_sha256`
+  (see Divergence detector below).
 
 ## Errors (stable codes, typed recovery)
 
@@ -468,14 +469,21 @@ server recomputes the row's semantic digest in the same transaction.
   This approvals-table rollback does not itself invoke `owned_decode.revoke` or
   terminate already active serving sessions.
 
-## Divergence detector (content_sha256)
+## Divergence detector (content_sha256 and submitted_sha256)
 
-Each embed item response echoes content_sha256 = hash of the EXACT text
-embedded (post-truncation). It is a DIVERGENCE DETECTOR, not a substitute
-key: if the echo differs from your own hash of what you stored, the vector
-does not represent your content (truncation or normalization drift) — the
-correct consumer behavior is reject + investigate loudly, never adopt the
-provider hash.
+Each embed item response echoes both `content_sha256` and `submitted_sha256`.
+`submitted_sha256` is the SHA-256 hex digest of the exact received text bytes
+before tokenization and before any truncation. `content_sha256` is the SHA-256
+hex digest of the text that was ACTUALLY EMBEDDED (the decoded kept tokens when
+the input was truncated).
+
+A difference between `content_sha256` and `submitted_sha256` means the item was
+truncated and is not a transport error; `truncation_disclosures` details the
+submitted versus effective token counts. Consumers using hashes as transport-
+divergence detectors should verify against `submitted_sha256`. Equal hashes
+mean nothing was dropped; different hashes mean the row was truncated.
+This field is additive and backwards-compatible; existing consumers reading only
+`content_sha256` are unaffected.
 
 ## Consumer patterns (as agreed)
 
@@ -537,7 +545,8 @@ and no request wire field is introduced.
 For `assurance: "declared"`, `content_sha256` hashes the exact post-truncation
 text Synapse submitted to the provider. In this lane, “embedded” means
 “submitted to the provider”; provider-side preprocessing is part of the declared
-risk accepted by the caller.
+risk accepted by the caller. `submitted_sha256` echoes the SHA-256 of the
+received text bytes before any truncation.
 
 ### Request opt-in
 

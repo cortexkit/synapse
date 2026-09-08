@@ -718,8 +718,11 @@ fn verify_embedding_response(response: &Value, submitted: &[SubmittedItem]) -> R
             submitted.len()
         );
     }
+    let disclosures = response
+        .pointer("/result/truncation_disclosures")
+        .and_then(Value::as_array);
     let mut seen = HashSet::with_capacity(vectors.len());
-    for item in vectors {
+    for (index, item) in vectors.iter().enumerate() {
         let id = item
             .get("id")
             .and_then(Value::as_str)
@@ -730,12 +733,43 @@ fn verify_embedding_response(response: &Value, submitted: &[SubmittedItem]) -> R
         let text = by_id
             .get(id)
             .with_context(|| format!("embedding response returned unknown item id '{id}'"))?;
-        let echoed = item
+        let submitted_echo = item
+            .get("submitted_sha256")
+            .and_then(Value::as_str)
+            .with_context(|| format!("embedding response item '{id}' omitted submitted_sha256"))?;
+        let content_echo = item
             .get("content_sha256")
             .and_then(Value::as_str)
             .with_context(|| format!("embedding response item '{id}' omitted content_sha256"))?;
-        verify_content_echo(text, echoed)
+
+        verify_submitted_echo(text, submitted_echo)
             .with_context(|| format!("embedding response item '{id}' diverged"))?;
+
+        if content_echo != submitted_echo {
+            let disclosure = disclosures.and_then(|d| d.get(index));
+            let is_truncated = disclosure
+                .and_then(|d| d.get("truncated"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if !is_truncated {
+                bail!(
+                    "embedding response item '{id}' diverged: content_sha256 differs from submitted_sha256 but truncation disclosure was not set"
+                );
+            }
+            eprintln!(
+                "embedding response item '{id}' truncated (submitted_sha256={submitted_echo}, content_sha256={content_echo})"
+            );
+        } else if let Some(disclosure) = disclosures.and_then(|d| d.get(index)) {
+            let is_truncated = disclosure
+                .get("truncated")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if is_truncated {
+                bail!(
+                    "embedding response item '{id}' diverged: truncation disclosure reported truncation but content_sha256 matches submitted_sha256"
+                );
+            }
+        }
 
         let vector = item
             .get("vector")
@@ -764,6 +798,15 @@ fn verify_embedding_response(response: &Value, submitted: &[SubmittedItem]) -> R
     Ok(())
 }
 
+fn verify_submitted_echo(text: &str, echoed: &str) -> Result<String> {
+    let expected = hex::encode(Sha256::digest(text.as_bytes()));
+    if echoed != expected {
+        bail!("submitted_sha256 mismatch: submitted={expected} echoed={echoed}");
+    }
+    Ok(expected)
+}
+
+#[cfg(test)]
 fn verify_content_echo(text: &str, echoed: &str) -> Result<String> {
     let expected = hex::encode(Sha256::digest(text.as_bytes()));
     if echoed != expected {
@@ -790,6 +833,122 @@ fn discover_repo_root() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verify_embedding_response_accepts_truncated_row_with_disclosure() {
+        let submitted = vec![
+            SubmittedItem {
+                id: "w100".to_string(),
+                text: "over cap long text".to_string(),
+            },
+            SubmittedItem {
+                id: "w101".to_string(),
+                text: "short".to_string(),
+            },
+        ];
+        let w100_submitted_sha = hex::encode(Sha256::digest(b"over cap long text"));
+        let w100_content_sha = hex::encode(Sha256::digest(b"over cap"));
+        let w101_sha = hex::encode(Sha256::digest(b"short"));
+        let response = json!({
+            "result": {
+                "fingerprint": "fp1",
+                "table_epoch": 0,
+                "dims": 2,
+                "vectors": [
+                    {
+                        "id": "w100",
+                        "vector": [1.0, 2.0],
+                        "submitted_sha256": w100_submitted_sha,
+                        "content_sha256": w100_content_sha,
+                    },
+                    {
+                        "id": "w101",
+                        "vector": [3.0, 4.0],
+                        "submitted_sha256": w101_sha,
+                        "content_sha256": w101_sha,
+                    }
+                ],
+                "truncation_disclosures": [
+                    {
+                        "submitted_tokens": 10,
+                        "effective_tokens": 5,
+                        "truncated": true,
+                    },
+                    {
+                        "submitted_tokens": 1,
+                        "effective_tokens": 1,
+                        "truncated": false,
+                    }
+                ]
+            }
+        });
+        assert!(verify_embedding_response(&response, &submitted).is_ok());
+    }
+
+    #[test]
+    fn verify_embedding_response_rejects_diverged_submitted_sha256() {
+        let submitted = vec![SubmittedItem {
+            id: "w100".to_string(),
+            text: "real text".to_string(),
+        }];
+        let response = json!({
+            "result": {
+                "fingerprint": "fp1",
+                "table_epoch": 0,
+                "dims": 2,
+                "vectors": [
+                    {
+                        "id": "w100",
+                        "vector": [1.0, 2.0],
+                        "submitted_sha256": "wrong_hash",
+                        "content_sha256": "wrong_hash",
+                    }
+                ],
+                "truncation_disclosures": [
+                    {
+                        "submitted_tokens": 2,
+                        "effective_tokens": 2,
+                        "truncated": false,
+                    }
+                ]
+            }
+        });
+        let error = verify_embedding_response(&response, &submitted).unwrap_err();
+        assert!(error.to_string().contains("diverged"));
+    }
+
+    #[test]
+    fn verify_embedding_response_rejects_undisclosed_content_sha256_difference() {
+        let submitted = vec![SubmittedItem {
+            id: "w100".to_string(),
+            text: "test text".to_string(),
+        }];
+        let submitted_sha = hex::encode(Sha256::digest(b"test text"));
+        let response = json!({
+            "result": {
+                "fingerprint": "fp1",
+                "table_epoch": 0,
+                "dims": 2,
+                "vectors": [
+                    {
+                        "id": "w100",
+                        "vector": [1.0, 2.0],
+                        "submitted_sha256": submitted_sha,
+                        "content_sha256": "different_hash",
+                    }
+                ],
+                "truncation_disclosures": [
+                    {
+                        "submitted_tokens": 2,
+                        "effective_tokens": 2,
+                        "truncated": false,
+                    }
+                ]
+            }
+        });
+        let error = verify_embedding_response(&response, &submitted).unwrap_err();
+        assert!(error.to_string().contains("diverged"));
+    }
 
     #[test]
     fn content_echo_accepts_exact_submitted_utf8() {
