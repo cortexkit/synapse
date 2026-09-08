@@ -110,11 +110,40 @@ The management registry in this snapshot is `embed.query`, `embed.batch`,
   fail closed with the same reason; the retired `grammar_unavailable_in_build` code
   is not emitted.
 - **models.list** — catalog + per-model state, fingerprints, alias rows,
-  recommended_batch (ADVISORY batch sizing per model; admission remains the
-  enforcement — consumers should not carry their own batch knobs). When present,
-  `recommended_batch` is `{ "rows": positive_integer, "token_budget": positive_integer }`;
-  `rows` is the advised request-row cap and `token_budget` is the corresponding
-  aggregate token cap. The field is omitted when an engine has no measured policy.
+  recommended_batch, per-row token ceiling (`max_tokens`), ceiling source
+  (`max_tokens_source`), bucket/shape ladder (`bucket_ladder`), output dimensions
+  (`dims`), dtype/precision (`dtype`), device class (`device_class`), serving
+  certification flag (`certified`), and warm-load cost hint (`warm_load_cost_hint_ms`).
+  - `recommended_batch` (ADVISORY batch sizing per model; admission remains the
+    enforcement — consumers should not carry their own batch knobs). When present,
+    `recommended_batch` is `{ "rows": positive_integer, "token_budget": positive_integer }`;
+    `rows` is the advised request-row cap and `token_budget` is the corresponding
+    aggregate token cap across an entire batch. The field is omitted when an engine
+    has no measured policy.
+  - `max_tokens` (positive integer) — the per-row token ceiling the lane will accept.
+    Sourced from what the module actually enforces at request time (the largest loaded
+    bucket on bucketed lanes such as ANE and Metal, or catalog config when unloaded).
+    Consumers must use this row limit rather than inferring a per-row cap from
+    `recommended_batch.token_budget`.
+  - `max_tokens_source` (`"worker_bucket"` | `"runtime_bucket"` | `"catalog_unloaded"` | `"catalog"`) —
+    discloses the origin of `max_tokens`. Distinguishes live enforced bucket limits from
+    unloaded catalog values so consumers know whether live worker state was consulted.
+  - `bucket_ladder` (array of positive integers, e.g. `[128, 256, 512]`) — the ladder
+    of sequence lengths the lane accepts. Present when the lane is loaded and enforces
+    discrete bucket envelopes; omitted when unloaded or when the lane accepts continuous
+    lengths up to `max_tokens`.
+  - `dims` (positive integer) — output embedding vector dimensions. Present when
+    reported by the loaded model or declared by a remote profile; omitted when unknown.
+  - `dtype` (string, e.g. `"f16"`, `"f32"`, `"bf16"`) — numeric precision of the lane.
+  - `device_class` (`"metal"` | `"ane"` | `"cpu"` | `"cuda"`) — execution device class.
+  - `certified` (boolean) — serving certification flag sourced directly from the serving
+    admission predicate. A consumer will never see `certified: true` for a lane that would
+    refuse to serve due to missing or uncertified machine profile evidence.
+  - `warm_load_cost_hint_ms` (float) — observed load duration hint in milliseconds,
+    sourced from real measurements (such as observed load duration or benchmark probe
+    data). This is an advisory hint, NOT a performance guarantee or upper bound; actual
+    load latency depends on residency (whether the model is already loaded in memory) and
+    system load. Omitted if no measurement has been recorded for the model.
 - **model.load / model.status, probe.start / probe.status / probe.report** —
   load and probe start/status are job-shaped (poll-first); `probe.report` is a
   query. Probe is EXPLICIT, never auto-triggered; certification + perf rows are

@@ -95,6 +95,7 @@ impl MetalExecutionConfig {
 
 pub(crate) trait ModelFamily: Send {
     fn family_name(&self) -> &'static str;
+    fn output_dim(&self) -> usize;
     fn tokenizer_policy(&self) -> FamilyTokenizerPolicy;
     fn supports_rerank(&self) -> bool {
         false
@@ -1541,6 +1542,10 @@ impl BertModel {
 impl ModelFamily for BertModel {
     fn family_name(&self) -> &'static str {
         "minilm"
+    }
+
+    fn output_dim(&self) -> usize {
+        self.config.hidden_size
     }
 
     fn tokenizer_policy(&self) -> FamilyTokenizerPolicy {

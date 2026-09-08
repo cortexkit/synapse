@@ -842,6 +842,10 @@ impl ModelFamily for ModernBertModel {
         "gte-modernbert"
     }
 
+    fn output_dim(&self) -> usize {
+        self.config.hidden_size
+    }
+
     fn supports_rerank(&self) -> bool {
         self.classification_head.is_some()
     }
