@@ -41,7 +41,12 @@ env:
   # and mark skipped execution as not a pass. CPU gates remain push-triggered.
   # Production crates gated by CI. Bench lanes are excluded on purpose:
   # heavy engine deps (burn, candle, python venvs) with no gate value.
-  SYNAPSE_CRATES: -p synapse-core -p synapse-engine-ort -p synapse-module -p synapse-worker-llama -p owned-decode-worker -p synapse-worker-decode
+  # Every workspace member that compiles on a runner without Metal or CUDA. The
+  # list is explicit rather than --workspace because the bench lanes and the
+  # macOS- and CUDA-only engines cannot build here, but anything portable left
+  # out is simply unbuilt and untested: the operator CLI shipped for weeks with
+  # its tests never once running in CI.
+  SYNAPSE_CRATES: -p synapse-core -p synapse-engine-ort -p synapse-module -p synapse-worker-llama -p owned-decode-worker -p synapse-worker-decode -p synapse-opctl
 
 jobs:
   test:
