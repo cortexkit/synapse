@@ -26,17 +26,32 @@ private let expensiveOperators: Set<String> = [
 @main
 private enum ModernBertPlacement {
     static func main() async throws {
-        guard CommandLine.arguments.count == 3 else {
+        guard CommandLine.arguments.count == 3 || CommandLine.arguments.count == 4 else {
             throw NSError(
                 domain: "ModernBertPlacement",
                 code: 2,
-                userInfo: [NSLocalizedDescriptionKey: "usage: placement MODEL.mlpackage REPORT.json"]
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "usage: placement MODEL.mlpackage REPORT.json [cpu-and-ne|all]"
+                ]
             )
         }
         let modelURL = URL(fileURLWithPath: CommandLine.arguments[1]).standardizedFileURL
         let reportURL = URL(fileURLWithPath: CommandLine.arguments[2]).standardizedFileURL
+        let computeUnitsName = CommandLine.arguments.count == 4 ? CommandLine.arguments[3] : "cpu-and-ne"
         let configuration = MLModelConfiguration()
-        configuration.computeUnits = .cpuAndNeuralEngine
+        switch computeUnitsName {
+        case "cpu-and-ne":
+            configuration.computeUnits = .cpuAndNeuralEngine
+        case "all":
+            configuration.computeUnits = .all
+        default:
+            throw NSError(
+                domain: "ModernBertPlacement",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "compute units must be cpu-and-ne or all"]
+            )
+        }
         if #available(macOS 14.4, *) {
             configuration.optimizationHints.reshapeFrequency = .infrequent
         }
@@ -61,7 +76,11 @@ private enum ModernBertPlacement {
         }
         var operations: [OperationPlacement] = []
         collect(plan: plan, block: function.block, into: &operations)
-        let report = summarize(modelURL: modelURL, operations: operations)
+        let report = summarize(
+            modelURL: modelURL,
+            computeUnits: computeUnitsName,
+            operations: operations
+        )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         try FileManager.default.createDirectory(
@@ -101,7 +120,11 @@ private func collect(
     }
 }
 
-private func summarize(modelURL: URL, operations: [OperationPlacement]) -> PlacementReport {
+private func summarize(
+    modelURL: URL,
+    computeUnits: String,
+    operations: [OperationPlacement]
+) -> PlacementReport {
     var preferredCounts: [String: Int] = [:]
     var operatorCounts: [String: [String: Int]] = [:]
     var expensiveCounts: [String: [String: Int]] = [:]
@@ -121,7 +144,7 @@ private func summarize(modelURL: URL, operations: [OperationPlacement]) -> Place
     }
     return PlacementReport(
         model_path: modelURL.path,
-        compute_units: "cpuAndNeuralEngine",
+        compute_units: computeUnits,
         evidence_kind: "MLComputePlan preferred placement; not a runtime dispatch trace",
         total_operations: operations.count,
         preferred_device_counts: preferredCounts,

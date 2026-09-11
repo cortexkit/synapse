@@ -4,12 +4,15 @@
 from __future__ import annotations
 
 import math
+import tempfile
 import unittest
+from pathlib import Path
 from typing import Any
 from unittest import mock
 
 import torch
 
+import attribute_load as load_attribution
 import modernbert_tiled as tiled
 from norm_reproducer import NormVariants
 from run_stages import selected_stages, stage_can_continue
@@ -302,6 +305,79 @@ class StageGateTests(unittest.TestCase):
         self.assertEqual(selected_stages(2048, 8192), [2048, 4096, 8192])
         with self.assertRaises(ValueError):
             selected_stages(8192, 4096)
+
+
+class LoadAttributionTests(unittest.TestCase):
+    def test_directory_stats_separate_logical_and_allocated_size(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            package = Path(temporary) / "model.mlpackage"
+            package.mkdir()
+            (package / "model.mlmodel").write_bytes(b"abc")
+            weights = package / "Data" / "weights"
+            weights.mkdir(parents=True)
+            (weights / "weight.bin").write_bytes(b"12345")
+            stats = load_attribution.directory_stats(package)
+        self.assertEqual(stats["logical_bytes"], 8)
+        self.assertEqual(stats["file_count"], 2)
+        self.assertGreaterEqual(stats["allocated_bytes"], stats["logical_bytes"])
+
+    def test_stage_specs_are_validated_and_sorted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            package1024 = root / "1024.mlpackage"
+            package8192 = root / "8192.mlpackage"
+            package1024.mkdir()
+            package8192.mkdir()
+            stages = load_attribution.parse_stages(
+                [f"8192={package8192}", f"1024={package1024}"]
+            )
+            self.assertEqual([stage for stage, _ in stages], [1024, 8192])
+            with self.assertRaises(ValueError):
+                load_attribution.parse_stages([f"1024={package1024}", f"1024={package1024}"])
+            with self.assertRaises(ValueError):
+                load_attribution.parse_stages([f"512={package1024}"])
+
+    def test_worker_detection_matches_executable_not_shell_arguments(self) -> None:
+        shell = mock.Mock(
+            info={
+                "pid": 10,
+                "name": "bash",
+                "cmdline": ["/bin/bash", "pgrep ck-synapse-worker-ane"],
+            }
+        )
+        worker = mock.Mock(
+            info={
+                "pid": 11,
+                "name": "ck-synapse-worker-ane-swift",
+                "cmdline": ["/usr/local/bin/ck-synapse-worker-ane-swift", "--socket", "x"],
+            }
+        )
+        with mock.patch.object(load_attribution.psutil, "process_iter", return_value=[shell, worker]):
+            self.assertEqual(
+                load_attribution.ane_worker_processes(),
+                [
+                    {
+                        "pid": 11,
+                        "name": "ck-synapse-worker-ane-swift",
+                        "command": "/usr/local/bin/ck-synapse-worker-ane-swift --socket x",
+                    }
+                ],
+            )
+
+    def test_compute_unit_names_map_without_fallback(self) -> None:
+        class Units:
+            CPU_AND_NE = object()
+            ALL = object()
+
+        class CoreML:
+            ComputeUnit = Units
+
+        self.assertIs(
+            load_attribution.coreml_compute_unit("cpu-and-ne", CoreML), Units.CPU_AND_NE
+        )
+        self.assertIs(load_attribution.coreml_compute_unit("all", CoreML), Units.ALL)
+        with self.assertRaises(ValueError):
+            load_attribution.coreml_compute_unit("cpu-only", CoreML)
 
 
 class RopeTests(unittest.TestCase):
