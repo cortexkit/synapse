@@ -976,10 +976,16 @@ mod tests {
 
     #[test]
     fn manifest_argument_reads_json_file() {
+        // The nonce is a clock reading rather than the thread name: under a test
+        // runner the thread is named for the test's full path, and the `::` in
+        // that name is not a legal filename character on Windows.
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or_default();
         let path = env::temp_dir().join(format!(
-            "synapse-opctl-manifest-{}-{}.json",
+            "synapse-opctl-manifest-{}-{nonce}.json",
             std::process::id(),
-            std::thread::current().name().unwrap_or("test")
         ));
         fs::write(
             &path,
