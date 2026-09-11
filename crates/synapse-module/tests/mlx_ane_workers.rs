@@ -19,6 +19,11 @@ struct GoldenItem {
     vector: Vec<f32>,
 }
 
+struct WorkerRun {
+    vectors: Vec<Vec<f32>>,
+    cold_load_ms: u64,
+}
+
 #[test]
 fn mlx_worker_minilm_matches_ort_golden_when_artifacts_exist() {
     let Some(worker_bin) = env_path("SYNAPSE_MLX_WORKER_BIN") else {
@@ -43,7 +48,7 @@ fn mlx_worker_minilm_matches_ort_golden_when_artifacts_exist() {
         &[("architecture", "bert")],
     );
     let expected = golden_items();
-    let mean = mean_pairwise_cosine(&actual, &expected);
+    let mean = mean_pairwise_cosine(&actual.vectors, &expected);
     assert!(mean >= 0.99, "MLX MiniLM mean cosine {mean:.6} < 0.99");
 }
 
@@ -63,7 +68,15 @@ fn ane_worker_minilm_matches_ort_golden_when_artifacts_exist() {
         return;
     };
 
-    let actual = run_embedding_worker(
+    let first = run_embedding_worker(
+        "ane",
+        worker_bin.clone(),
+        model_path.clone(),
+        "mlmodelc",
+        tokenizer_path.clone(),
+        &[],
+    );
+    let second = run_embedding_worker(
         "ane",
         worker_bin,
         model_path,
@@ -71,8 +84,17 @@ fn ane_worker_minilm_matches_ort_golden_when_artifacts_exist() {
         tokenizer_path,
         &[],
     );
+    eprintln!(
+        "ANE stable-path load durations: first={} ms, restarted={} ms",
+        first.cold_load_ms, second.cold_load_ms
+    );
+    assert_eq!(
+        vector_bytes(&first.vectors),
+        vector_bytes(&second.vectors),
+        "ANE vectors must be byte-identical after a worker restart at the same artifact path"
+    );
     let expected = golden_items();
-    let mean = mean_pairwise_cosine(&actual, &expected);
+    let mean = mean_pairwise_cosine(&second.vectors, &expected);
     assert!(mean >= 0.99, "ANE MiniLM mean cosine {mean:.6} < 0.99");
 }
 
@@ -97,7 +119,7 @@ fn run_embedding_worker(
     format: &str,
     tokenizer_path: PathBuf,
     runtime_overrides: &[(&str, &str)],
-) -> Vec<Vec<f32>> {
+) -> WorkerRun {
     let tokenizer = Tokenizer::from_file(&tokenizer_path)
         .unwrap_or_else(|error| panic!("load tokenizer {}: {error}", tokenizer_path.display()));
     let golden = golden_file();
@@ -138,9 +160,17 @@ fn run_embedding_worker(
             &runtime_config,
         )
         .unwrap_or_else(|error| panic!("load {label} worker model: {error:?}"));
-    engine
+    let cold_load_ms = engine
+        .model_info(&loaded)
+        .expect("loaded worker model has runtime information")
+        .cold_load_ms;
+    let vectors = engine
         .embed_batch(&loaded, TokenBatch { items })
-        .unwrap_or_else(|error| panic!("embed with {label} worker: {error:?}"))
+        .unwrap_or_else(|error| panic!("embed with {label} worker: {error:?}"));
+    WorkerRun {
+        vectors,
+        cold_load_ms,
+    }
 }
 
 fn assert_worker_crash_is_quarantined(label: &str, worker_bin: PathBuf) {
@@ -199,6 +229,14 @@ fn golden_items() -> Vec<Vec<f32>> {
         .items
         .into_iter()
         .map(|item| item.vector)
+        .collect()
+}
+
+fn vector_bytes(vectors: &[Vec<f32>]) -> Vec<u8> {
+    vectors
+        .iter()
+        .flatten()
+        .flat_map(|value| value.to_le_bytes())
         .collect()
 }
 
