@@ -143,6 +143,9 @@ where
             metadata_path.display()
         )
     })?;
+    // Windows refuses to rename a directory that still has an open handle
+    // inside it, so the handle is closed here rather than at end of scope.
+    drop(metadata_file);
 
     match fs::rename(transaction.path(), &final_root) {
         Ok(()) => {
