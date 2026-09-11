@@ -17,9 +17,9 @@
 ## Layers
 
 **Synapse SubC Module (`synapse-module`):**
-- Purpose: The main service listening on the SubC bus. Handles route binding, job admission, the model cache, remote provider dispatch, worker lifecycle supervision (offloading worker engine drops to dedicated threads), approval storage and identity-based rollback (`rollback.rs`), runtime admission probe health, certification metric publishing and persistent staleness tracking (`certification_stale_since_ms`), storage epochs and rotation ledgers, owned CUDA evidence and declared identities, and in-process execution via the owned engine.
+- Purpose: The main service listening on the SubC bus. Handles route binding, job admission, the model cache, remote provider dispatch, worker lifecycle supervision (offloading worker engine drops to dedicated threads), approval storage and identity-based rollback (`rollback.rs`), runtime admission probe health, certification metric publishing and persistent staleness tracking (`certification_stale_since_ms`), storage epochs and rotation ledgers, owned CUDA evidence and declared identities, full per-lane capability reporting on `models.list`, dual-hash embed divergence verification (`submitted_sha256` alongside `content_sha256`), and in-process execution via the owned engine.
 - Location: `crates/synapse-module`
-- Contains: A 3-class aging scheduler, SQLite durable job and cache lease state, machine probe certification logic and separate serving admission gates, admission telemetry counters (`refusals`, `jobs_minted`), socket/pipe-based worker host, the remote gateway client, module-side routing (`crates/synapse-module/owned-decode-routing` including ANE split prefill routing `crates/synapse-module/owned-decode-routing/ane_prefill.rs`), grammar compilation and DECODE scheduler (`crates/synapse-module/owned-decode-grammar-scheduler`), certification gates and probes (`crates/synapse-module/owned-decode-certification`), approval rollback (`rollback.rs`), contract manifests (`crates/synapse-module/owned-decode-manifests`), request-scoped semantic-sidecar hint bank normalization and per-field slotting (`crates/synapse-module/owned-decode-sidecar`), and direct bindings to `synapse-engine-owned` and `synapse-engine-cuda`.
+- Contains: A 3-class aging scheduler, SQLite durable job and cache lease state, machine probe certification logic and separate serving admission gates, admission telemetry counters (`refusals`, `jobs_minted`), socket/pipe-based worker host, the remote gateway client, module-side routing (`crates/synapse-module/owned-decode-routing` including ANE split prefill routing `crates/synapse-module/owned-decode-routing/ane_prefill.rs`), grammar compilation and DECODE scheduler (`crates/synapse-module/owned-decode-grammar-scheduler`), certification gates and probes (`crates/synapse-module/owned-decode-certification`), approval rollback (`rollback.rs`), contract manifests (`crates/synapse-module/owned-decode-manifests`), request-scoped semantic-sidecar hint bank normalization and per-field slotting (`crates/synapse-module/owned-decode-sidecar`), model catalog descriptors publishing per-row ceilings `max_tokens` with source provenance `max_tokens_source`, discrete `bucket_ladder` envelopes, output dimensions, dtypes, device classes, and warm-load hints, and direct bindings to `synapse-engine-owned` and `synapse-engine-cuda`.
 - Depends on: `synapse-core`, `synapse-engine-owned`, `synapse-engine-cuda`, `subc-client-rs`, `rusqlite`, `tokio`.
 
 **Remote Gateway (`crates/synapse-module/src/remote`):**
@@ -31,7 +31,7 @@
 **Synapse Owned Engine (`synapse-engine-owned`):**
 - Purpose: Primary in-process execution engine for Apple Silicon (macOS), providing exact-match Metal MPSGraph inference for ModernBERT, Qwen3, and MiniLM models, direct Metal step decode engines for Qwen3 and LFM2, supervised decode worker state management, and ModernBERT pair reranking (`rerank_pairs`).
 - Location: `crates/synapse-engine-owned`
-- Contains: Rust-to-Objective-C bindings, Metal shader graphs (including macOS 15+ `@available`-guarded fused scaled-dot-product attention for ModernBERT with `GRAPH_REVISION` package cache invalidation), direct Metal step decode kernels and models (`owned-decode-engine`), supervised decode worker protocol, boundary, crash budget, sidecar hint bank installation protocol, and supervision state machine (`owned-decode-worker`), and tensor operations for embedding and reranking (`crates/synapse-engine-owned/src/modernbert.rs`). The module stays the sole tokenizer owner; this engine strictly consumes canonical token IDs and executes tensor logic.
+- Contains: Rust-to-Objective-C bindings, Metal shader graphs (including macOS 15+ `@available`-guarded fused scaled-dot-product attention for ModernBERT with `GRAPH_REVISION` package cache invalidation), bucket policy v2 (`BUCKET_POLICY_VERSION = 2`) with an 18-step bounded sequence ladder up to 8192 (step ratio <= 1.5x), singleton row execution shapes (`batch = 1`), eager preloading bounded to `<= 512` sequences with on-demand compilation for longer capacity and singleton graphs, bounded cache shapes (`MAX_SEQUENCE_BUCKETS = 18`, `MAX_CACHED_BUCKET_SHAPES = 36`), direct Metal step decode kernels and models (`owned-decode-engine`), supervised decode worker protocol, boundary, crash budget, sidecar hint bank installation protocol, and supervision state machine (`owned-decode-worker`), and tensor operations for embedding and reranking (`crates/synapse-engine-owned/src/modernbert.rs`). Exposes loaded model capability metadata (`OwnedModelInfo` with `dims`, `buckets`, and `dtype`). The module stays the sole tokenizer owner; this engine strictly consumes canonical token IDs and executes tensor logic.
 - Depends on: `synapse-core`, `safetensors`, `half`, Apple's `Metal` and `MPSGraph` frameworks.
 - Used by: `synapse-module` as the primary local engine.
 
@@ -52,14 +52,14 @@
 **Synapse Worker Lanes (`synapse-worker-*`):**
 - Purpose: Execute in-memory tokenization, tensor forward passes, and token generation for specific hardware classes (Apple Silicon MLX, Apple Neural Engine, Llama GGUF, NVIDIA CUDA, and supervised Metal decode).
 - Location: `crates/synapse-worker-mlx`, `crates/synapse-worker-ane`, `crates/synapse-worker-llama`, `crates/synapse-worker-cuda`, `crates/synapse-worker-decode`, `workers/ane-prefill-sidecar`
-- Contains: Metal-accelerated customized MLX models, CoreML graphs (including the `gte-modernbert` embedder and reranker for the ANE quiet-tier via `ane-coreml-worker`), `llama.cpp` inference processes, supervised owned CUDA runner (`ck-synapse-worker-cuda`) executing MiniLM, ModernBERT, and Qwen3 embedding batches over IPC, supervised owned Metal decode runner (`ck-synapse-worker-decode`) executing Qwen3 and LFM2 token generation under progress/continuation framing and sidecar hint bank installation, and supervised Swift ANE prefill sidecar (`ane-prefill-sidecar`) executing fixed-window CoreML prefill passes.
+- Contains: Metal-accelerated customized MLX models, CoreML graphs (including the `gte-modernbert` embedder and reranker for the ANE quiet-tier via `ane-coreml-worker`), `llama.cpp` inference processes, supervised owned CUDA runner (`ck-synapse-worker-cuda`) executing MiniLM, ModernBERT, and Qwen3 embedding batches over IPC, supervised owned Metal decode runner (`ck-synapse-worker-decode`) executing Qwen3 and LFM2 token generation under progress/continuation framing and sidecar hint bank installation, and supervised Swift ANE prefill sidecar (`ane-prefill-sidecar`) executing fixed-window CoreML prefill passes. Worker processes disclose their discrete sequence bucket ladders (or `None` for continuous lanes) back to the host via `WorkerResponse::Loaded` and `WorkerResponse::Pong`.
 - Depends on: `synapse-core`, `owned-decode-worker`, `synapse-engine-owned`, `mlx-rs`, `coreml` (via Swift), `reqwest`.
 - Used by: The `synapse-module` host spawning them dynamically based on user requests and capability tiers.
 
 **Synapse Core Abstractions (`synapse-core`):**
 - Purpose: Core vocabulary structs, engine traits, machine capability profiles, and error contracts shared between the host and its workers.
 - Location: `crates/synapse-core`
-- Contains: `WorkerHello` handshake with strict catalog engine identity validation, shared canonical HELLO engine identities (`worker_engine_names.rs`), binary framing logic, `EngineError` and exhaustive stable error code contracts (`StableErrorCode::ALL` with typed transient/permanent classifications in `crates/synapse-core/src/error_contract.rs`), `MachineProfile` with `ane_subtype` chip-identity mapping, `RuntimeConfig`, `TokenBatch`, per-request decode chain policy, request-scoped sidecar specification contracts (`crates/synapse-core/src/sidecar_spec.rs`), and scheduling traits.
+- Contains: `WorkerHello` handshake with strict catalog engine identity validation, shared canonical HELLO engine identities (`worker_engine_names.rs`), binary framing logic, `WorkerResponse` bucket ladder disclosures (`buckets: Option<Vec<usize>>`), `SanitizedTokenizer` tokenization producing `TokenizedItem` and `TokenizedBatch` with `submitted_sha256` digests alongside `embedded_text` and truncation disclosures, `EngineError` and exhaustive stable error code contracts (`StableErrorCode::ALL` with typed transient/permanent classifications in `crates/synapse-core/src/error_contract.rs`), `MachineProfile` with `ane_subtype` chip-identity mapping, `RuntimeConfig`, `TokenBatch`, per-request decode chain policy, request-scoped sidecar specification contracts (`crates/synapse-core/src/sidecar_spec.rs`), and scheduling traits.
 
 **Benchmark Harness Core:**
 - Purpose: Provides CLI commands for corpus generation, power-monitored process wrapping, result schema definition, and numerical parity functions.
@@ -77,8 +77,8 @@
 
 **Native Engine Inference Lanes:**
 - Purpose: Execute in-memory tokenization, tensor forward passes, and pooling over target platforms.
-- Location: `bench/lanes/ort-embed`, `bench/lanes/mlx`, `bench/lanes/burn`, `bench/lanes/mlx-minilm`, `bench/lanes/ts-embed`, `bench/lanes/potion`, `bench/spikes/unified-rt`, `bench/spikes/ane-prefill-split`
-- Contains: Bounded-thread ONNX Runtime embedding logic, Metal-accelerated MLX custom model implementations, unified-rt candidate implementations (Vulkan cooperative-matrix/plain shaders on RDNA3 with device-local memory staging, budget validation, subgroup-parallel RMSNorm, vectorized loads, Q8 block-address hoisting, f16/Q8 pack-four subgroup rows, and batched mat-mat compute shaders in `bench/spikes/unified-rt/src/qwen3_decode_vulkan.rs`, CUDA cuBLASLt fused graphs and fused QK norm RoPE single-launch kernels on NVIDIA, Metal graph execution optimization levels O0/O1, package caching, true batched speculative verification on `bench/spikes/unified-rt/src/qwen3_decode_metal_step.rs`, and custom direct Metal step kernels for Qwen3 and LFM2 with device-resident conv-cache and Q8_0 hybrid engine in `bench/spikes/unified-rt/src/lfm2_decode_metal_step.rs`), ANE prefill and Metal decode split measurement (`bench/spikes/ane-prefill-split`), LFM2 hybrid causal backbone, LFM2-Audio ASR speech encoder (FastConformer and Slaney mel filterbank frontend), Qwen3-0.6B f16 Metal decode throughput optimizations, WGPU-based Burn ONNX imports, python-based MLX community/source loading, Model2Vec static embedding (`potion-code-16M`), and TypeScript setups.
+- Location: `bench/lanes/ort-embed`, `bench/lanes/mlx`, `bench/lanes/burn`, `bench/lanes/mlx-minilm`, `bench/lanes/ts-embed`, `bench/lanes/potion`, `bench/spikes/unified-rt`, `bench/spikes/ane-prefill-split`, `bench/spikes/ane-modernbert-full-context`
+- Contains: Bounded-thread ONNX Runtime embedding logic, Metal-accelerated MLX custom model implementations, unified-rt candidate implementations (Vulkan cooperative-matrix/plain shaders on RDNA3 with device-local memory staging, budget validation, subgroup-parallel RMSNorm, vectorized loads, Q8 block-address hoisting, f16/Q8 pack-four subgroup rows, and batched mat-mat compute shaders in `bench/spikes/unified-rt/src/qwen3_decode_vulkan.rs`, CUDA cuBLASLt fused graphs and fused QK norm RoPE single-launch kernels on NVIDIA, Metal graph execution optimization levels O0/O1, package caching, true batched speculative verification on `bench/spikes/unified-rt/src/qwen3_decode_metal_step.rs`, and custom direct Metal step kernels for Qwen3 and LFM2 with device-resident conv-cache and Q8_0 hybrid engine in `bench/spikes/unified-rt/src/lfm2_decode_metal_step.rs`), ANE prefill and Metal decode split measurement (`bench/spikes/ane-prefill-split`), query-tiled full-context 8192-token ModernBERT ANE feasibility testing with local/global attention windows, RoPE, and Hadamard residual rotation conditioning (`bench/spikes/ane-modernbert-full-context/modernbert_tiled.py`), LFM2 hybrid causal backbone, LFM2-Audio ASR speech encoder (FastConformer and Slaney mel filterbank frontend), Qwen3-0.6B f16 Metal decode throughput optimizations, WGPU-based Burn ONNX imports, python-based MLX community/source loading, Model2Vec static embedding (`potion-code-16M`), and TypeScript setups.
 - Depends on: `bench/harness` or `bench/rig`, target runtime libraries (`ort`, `mlx-rs`, `vulkano`, `cudarc`), and `tokenizers`.
 - Used by: The benchmark suite runners `bench/run-matrix.sh` and `bench/run-night.sh`.
 
@@ -114,7 +114,7 @@
 **Synapse Operator CLI (`synapse-opctl`):**
 - Purpose: Drive Synapse operations (models catalog, probe runs, scheduling admission stats, approval enablement and rollbacks, batch embedding, and jobs paging) through the fleet subc daemon connection.
 - Location: `crates/synapse-opctl`
-- Contains: CLI command parsing and formatting logic for operator management, including model status, probe execution, scheduler admission, approval migration, explicit enablement, disablement, emergency rollback, batch submission, and paged results.
+- Contains: CLI command parsing and formatting logic for operator management, including model status, probe execution, scheduler admission, approval migration, explicit enablement, disablement, emergency rollback, batch submission, and paged results. Validates embedding responses by asserting `submitted_sha256` against original submitted text and checking `content_sha256` against truncation disclosures to distinguish transport corruption from truncation.
 - Depends on: `subc-client-rs`, `clap`, `serde_json`, `tokio`.
 - Used by: Operators and deployment scripts monitoring or triggering runtime actions.
 
@@ -128,7 +128,7 @@
 **Campaign Harnesses:**
 - Purpose: Execute and coordinate sandboxed evaluation campaigns (single-stream decode, Metal direct step, CUDA quantization, LFM2 CUDA Q8, and Metal embedding).
 - Location: `bench/campaign`
-- Contains: Integrity validation of model snapshots, fixtures, and target runners; deterministic verification of intervention hooks; candidate-owned temporary workspace staging and build output/target directories; toolchain environment forwarding (`RUSTUP_HOME`, `CARGO_HOME`); split-stream append-mode logging (`.log` and `.log.stderr`); and failure scene preservation.
+- Contains: Integrity validation of model snapshots, fixtures, and target runners; deterministic verification of intervention hooks; candidate-owned temporary workspace staging and build output/target directories; toolchain environment forwarding (`RUSTUP_HOME`, `CARGO_HOME`); split-stream append-mode logging (`.log` and `.log.stderr`); failure scene preservation; and probe comparison analysis (`bench/campaign/compare-owned-metal-bucket-probes.py`) evaluating baseline versus candidate `embed_bucket_probe` JSON runs across cold-load, first-use compilation overhead, warm latency, cache shape limits, and numerical parity.
 - Depends on: `spike-unified-rt` runner.
 - Used by: Automated evaluation gates to confirm decode and embedding performance and correctness.
 
@@ -144,7 +144,7 @@
 5. Dispatch based on route:
    - **Local:** Download/Verify models through content-addressed cache with shared leases and 24-hour age-floored temporary blob cleanup, admit to 3-class Aging Scheduler, spawn/handshake Worker lane (UNIX sockets / Windows pipes), submit binary frames.
    - **Remote:** Forward through `ProviderRuntime` pools, passing circuit breakers and p90 estimators, fetching credentials via vault client with class-based error disposition (`transient`/`auth_required` pausing jobs, `permanent`/`context_overflow` rejecting with `credential_config_invalid`), executing strict loopback-validated HTTP calls, and serializing `recommended_batch` policies in model listings — `crates/synapse-module/src/remote/runtime.rs`
-6. Commit checkpointed pages sequentially according to byte size limits (`result_page_bytes`) as the job runs (allowing page-while-running for snapshots and continuity hooks), mark job complete (applying execution/retention TTL split), and return envelope. If the client queries a job, they can follow pages via `page` parameters — `crates/synapse-module/src/store.rs`
+6. Commit checkpointed pages sequentially according to byte size limits (`result_page_bytes`) as the job runs (allowing page-while-running for snapshots and continuity hooks), mark job complete (applying execution/retention TTL split), and return envelope. If the client queries a job, they can follow pages via `page` parameters — `crates/synapse-module/src/store.rs`. On embedding routes (`embed.query`, `embed.batch`), each output item echoes both `content_sha256` (hash of actually embedded tokens post-truncation) and `submitted_sha256` (hash of raw submitted text before tokenization or truncation). Model discovery on `models.list` serializes per-lane capability descriptors including `max_tokens` (enforced per-row ceiling), `max_tokens_source` (`worker_bucket`, `runtime_bucket`, `catalog_unloaded`, `catalog`), `bucket_ladder` (accepted sequence lengths), `dims`, `dtype`, `device_class`, `certified`, and `warm_load_cost_hint_ms` — `crates/synapse-module/src/lib.rs`.
 
 **Constrained Decoding Flow:**
 
@@ -220,7 +220,7 @@
 **Worker Framing Protocol:**
 - Purpose: A byte-exact IPC mechanism sending dynamic float and integer arrays between the Rust host and worker children over sockets.
 - Location: `crates/synapse-core/src/worker_protocol.rs`
-- Pattern: Binary Serialization (e.g., `decode_f32_frame`, `encode_i32_frame`) with host-side catalog engine identity validation during `WorkerHello` handshake.
+- Pattern: Binary Serialization (e.g., `decode_f32_frame`, `encode_i32_frame`) with host-side catalog engine identity validation during `WorkerHello` handshake, and loaded sequence bucket disclosures (`buckets: Option<Vec<usize>>`) on `WorkerResponse::Loaded` and `WorkerResponse::Pong`.
 
 **Fair-Share Scheduler:**
 - Purpose: Manage execution time slices across queued, active, and completed jobs, guaranteeing that background operations don't starve foreground priority work.
@@ -377,6 +377,21 @@
 - Location: `workers/ane-prefill-sidecar/`
 - Pattern: Out-of-process CoreML stage supporting SHA-verified model loading (`INSTALL`), fixed-window token execution on `CPU_AND_NE` (`EXECUTE`), f32 logits and f16 KV cache streaming, and in-flight prediction aborts (`ABORT`).
 
+**Divergence Detector & Truncation Echo:**
+- Purpose: Dual-hash verification on embed responses. `submitted_sha256` echoes the SHA-256 hex digest of the raw submitted text bytes before tokenization or truncation; `content_sha256` echoes the SHA-256 hex digest of the decoded kept tokens actually embedded. Equality proves untruncated transport fidelity; divergence signals truncation (accompanied by `truncation_disclosures`).
+- Location: `crates/synapse-core/src/tokenizer.rs`, `crates/synapse-module/src/lib.rs`, `docs/wire-contract-v1.md`
+- Pattern: Dual-Hash Verification with Truncation Disclosure.
+
+**Owned Metal Bucket Policy v2:**
+- Purpose: Discrete sequence-length bucketing policy (`BUCKET_POLICY_VERSION = 2`) defining an 18-step bounded sequence ladder up to 8192 (`[64, 96, 128, 160, 192, 256, 320, 384, 448, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192]`) with adjacent step ratio <= 1.5x, compiling singleton row shapes (`batch = 1`) on demand while reserving capacity shapes for multi-row batches, eager preloading up to 512 tokens, and enforcing cache limits (`MAX_SEQUENCE_BUCKETS = 18`, `MAX_CACHED_BUCKET_SHAPES = 36`).
+- Location: `crates/synapse-engine-owned/src/runtime.rs`, `crates/synapse-engine-owned/src/lib.rs`
+- Pattern: Bounded Ladder with Singleton Specialization and Demand-Driven Compilation.
+
+**Model Catalog Capability Descriptor:**
+- Purpose: Publishes comprehensive per-lane execution parameters and boundaries in `models.list` responses, disclosing `max_tokens` (enforced per-row ceiling), `max_tokens_source` (`worker_bucket`, `runtime_bucket`, `catalog_unloaded`, `catalog`), `bucket_ladder` (discrete sequence lengths accepted by loaded bucketed lanes), `dims`, `dtype`, `device_class`, `certified`, and `warm_load_cost_hint_ms`.
+- Location: `crates/synapse-module/src/lib.rs`, `docs/wire-contract-v1.md`
+- Pattern: Discovery Descriptor with Enforced Ceiling Provenance.
+
 
 ## Entry Points
 
@@ -433,7 +448,7 @@
 **Synapse Operator CLI (`synapse-opctl`):**
 - Location: `crates/synapse-opctl/src/main.rs`
 - Triggers: Execution of the `ck-synapse-opctl` binary.
-- Responsibilities: Routes commands to list models, view scheduler stats, start probes, manage approval migrations/enablements/disablements, run batches, and fetch paged job results.
+- Responsibilities: Routes commands to list models, view scheduler stats, start probes, manage approval migrations/enablements/disablements, run batches, verify embedding response truncation disclosures and submitted text digests, and fetch paged job results.
 
 **Management Surface SubC Caller (`subc-call`):**
 - Location: `crates/synapse-module/src/bin/subc_call.rs`
@@ -459,6 +474,21 @@
 - Location: `bench/campaign/decode-harness.sh`, `bench/campaign/metal-step-harness.sh`, `bench/campaign/lfm2-cuda-harness.sh`, `bench/campaign/metal-embed-harness.sh`
 - Triggers: Invocation of campaign harness scripts by evaluation runners.
 - Responsibilities: Manage snapshot validation, locked candidate execution sandbox, candidate-owned workspace staging, toolchain environment forwarding, correctness verification, split-stream append-mode logging, failure scene preservation, and performance evaluation.
+
+**Owned Metal Bucket Probe (`embed_bucket_probe`):**
+- Location: `crates/synapse-engine-owned/examples/embed_bucket_probe.rs`
+- Triggers: Invocation of `embed_bucket_probe` binary during Metal embedding bucket evaluation.
+- Responsibilities: Serial, bounded probe executing representative tokenized rows with `SYNAPSE_EMBED_PROFILE=1` to record exact token IDs, digests, cold-load, first-use, and warm timings.
+
+**Bucket Probe Comparator (`compare-owned-metal-bucket-probes`):**
+- Location: `bench/campaign/compare-owned-metal-bucket-probes.py`
+- Triggers: Invocation by evaluation scripts or developers comparing bucket policy versions.
+- Responsibilities: Analyzes JSON outputs from `embed_bucket_probe`, checking cold load, first-use compilation overhead, warm latency speedups, cache shape counts, and numerical parity.
+
+**ANE ModernBERT Full-Context Spike (`ane-modernbert-full-context`):**
+- Location: `bench/spikes/ane-modernbert-full-context/spike.py`, `bench/spikes/ane-modernbert-full-context/run_stages.py`
+- Triggers: Execution during ANE 8192-token ModernBERT feasibility testing.
+- Responsibilities: Drives CPU verification, CoreML query-tiled export, staged context execution (1024 to 8192), Hadamard rotation conditioning, memory profiling, and parity checking.
 
 
 ## Error Handling
