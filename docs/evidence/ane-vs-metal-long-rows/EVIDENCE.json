@@ -1,0 +1,1041 @@
+{
+  "ane_packages": [
+    {
+      "compiled_stable_path_verified_against_compile_report": true,
+      "input_sha256": "631cb64de428c9e405ab1f4cfe61f07cab699565a900df560e6a060da964f48c",
+      "package_sha256": "18903e4080f0dd849b10461bd7cd3f97cc59b6e992f7a13a66465cf14410331b",
+      "sequence_length": 1024
+    },
+    {
+      "compiled_stable_path_verified_against_compile_report": true,
+      "input_sha256": "24c6df962b7975778dcfe73f373e61357d1d614143a9f15c9c13f5be13afad2d",
+      "package_sha256": "8cab14b63ebb881f207f9818b6bfb6411763272535a54d4c3981d68baf3457c5",
+      "sequence_length": 4096
+    },
+    {
+      "compiled_stable_path_verified_against_compile_report": true,
+      "input_sha256": "b2cb87f40ba3f0bdef0d18f316c6d680b0196e337c3f116dc0cbeb3e92017271",
+      "package_sha256": "c4156ac920176edec2fcac4f2ea086b30838df2d078cb1cc21409d7cb7d23466",
+      "sequence_length": 8192
+    }
+  ],
+  "boundaries": {
+    "ane": "Caller wall around CompiledMLModel.predict on a prebuilt padded input dictionary through normalized embedding return. Stable-path load, first use, warmup, worker checks, and IPC are outside the timer.",
+    "metal": "Caller wall around production OwnedMetalEmbedEngine.embed_batch on a prebuilt TokenBatch through bucket selection, padding/mask construction, MPSGraph execution, readback, and normalized CLS return. Load, first use, warmup, and IPC are outside the timer.",
+    "shared_input": "Identical pre-tokenized active token IDs; tokenization and text transport are outside both timers.",
+    "unavoidable_difference": "The rotated ANE package is a spike artifact, not a production worker lane, so no honest common worker-IPC boundary exists. ANE includes Python/Core ML bridge overhead; Metal includes Rust bucket planning. Both numbers use the nearest in-process complete embedding-call wall boundary."
+  },
+  "hardware": {
+    "chip": "Apple M5 Max",
+    "machine": "Mac17,6",
+    "macos": "27.0",
+    "macos_build": "26A5425a",
+    "physical_memory_bytes": 137438953472,
+    "python": "3.12.12"
+  },
+  "measured_at": "2026-09-12",
+  "measurement_protocol": {
+    "ambient_load": true,
+    "condition_capture": "One-minute load average and CPU idle percentage were sampled for one second immediately before and after every lane arm.",
+    "conditions": {
+      "1024-r1-ane": {
+        "after": {
+          "captured_unix_s": 1789168006.9885728,
+          "cpu_idle_percent": 55.2,
+          "load_average_1m": 8.2138671875
+        },
+        "before": {
+          "captured_unix_s": 1789167988.227078,
+          "cpu_idle_percent": 53.9,
+          "load_average_1m": 6.30224609375
+        }
+      },
+      "1024-r1-metal": {
+        "after": {
+          "captured_unix_s": 1789168025.679539,
+          "cpu_idle_percent": 70.0,
+          "load_average_1m": 7.97509765625
+        },
+        "before": {
+          "captured_unix_s": 1789168008.080075,
+          "cpu_idle_percent": 52.5,
+          "load_average_1m": 8.2138671875
+        }
+      },
+      "1024-r2-ane": {
+        "after": {
+          "captured_unix_s": 1789168045.866229,
+          "cpu_idle_percent": 65.7,
+          "load_average_1m": 7.69970703125
+        },
+        "before": {
+          "captured_unix_s": 1789168026.765868,
+          "cpu_idle_percent": 59.5,
+          "load_average_1m": 7.97509765625
+        }
+      },
+      "1024-r2-metal": {
+        "after": {
+          "captured_unix_s": 1789168064.645277,
+          "cpu_idle_percent": 47.9,
+          "load_average_1m": 7.8837890625
+        },
+        "before": {
+          "captured_unix_s": 1789168046.965922,
+          "cpu_idle_percent": 67.2,
+          "load_average_1m": 7.69970703125
+        }
+      },
+      "128-r1-ane": {
+        "after": {
+          "captured_unix_s": 1789167927.7203882,
+          "cpu_idle_percent": 61.6,
+          "load_average_1m": 7.3857421875
+        },
+        "before": {
+          "captured_unix_s": 1789167875.848106,
+          "cpu_idle_percent": 78.1,
+          "load_average_1m": 8.9306640625
+        }
+      },
+      "128-r1-metal": {
+        "after": {
+          "captured_unix_s": 1789167948.4294772,
+          "cpu_idle_percent": 86.1,
+          "load_average_1m": 6.59375
+        },
+        "before": {
+          "captured_unix_s": 1789167928.799523,
+          "cpu_idle_percent": 81.6,
+          "load_average_1m": 6.8740234375
+        }
+      },
+      "128-r2-ane": {
+        "after": {
+          "captured_unix_s": 1789167968.5542028,
+          "cpu_idle_percent": 76.8,
+          "load_average_1m": 5.50537109375
+        },
+        "before": {
+          "captured_unix_s": 1789167949.5268202,
+          "cpu_idle_percent": 84.6,
+          "load_average_1m": 6.59375
+        }
+      },
+      "128-r2-metal": {
+        "after": {
+          "captured_unix_s": 1789167987.121131,
+          "cpu_idle_percent": 64.3,
+          "load_average_1m": 6.24169921875
+        },
+        "before": {
+          "captured_unix_s": 1789167969.640299,
+          "cpu_idle_percent": 77.7,
+          "load_average_1m": 5.50537109375
+        }
+      },
+      "4096-r1-ane": {
+        "after": {
+          "captured_unix_s": 1789168086.9289799,
+          "cpu_idle_percent": 44.1,
+          "load_average_1m": 7.298828125
+        },
+        "before": {
+          "captured_unix_s": 1789168065.747287,
+          "cpu_idle_percent": 48.6,
+          "load_average_1m": 7.8837890625
+        }
+      },
+      "4096-r1-metal": {
+        "after": {
+          "captured_unix_s": 1789168107.411962,
+          "cpu_idle_percent": 52.0,
+          "load_average_1m": 8.365234375
+        },
+        "before": {
+          "captured_unix_s": 1789168088.0771961,
+          "cpu_idle_percent": 55.5,
+          "load_average_1m": 7.298828125
+        }
+      },
+      "4096-r2-ane": {
+        "after": {
+          "captured_unix_s": 1789168129.151249,
+          "cpu_idle_percent": 75.7,
+          "load_average_1m": 7.724609375
+        },
+        "before": {
+          "captured_unix_s": 1789168108.516164,
+          "cpu_idle_percent": 51.1,
+          "load_average_1m": 8.255859375
+        }
+      },
+      "4096-r2-metal": {
+        "after": {
+          "captured_unix_s": 1789168148.3798048,
+          "cpu_idle_percent": 44.8,
+          "load_average_1m": 7.8671875
+        },
+        "before": {
+          "captured_unix_s": 1789168130.224498,
+          "cpu_idle_percent": 74.3,
+          "load_average_1m": 7.724609375
+        }
+      },
+      "8192-r1-ane": {
+        "after": {
+          "captured_unix_s": 1789168175.818403,
+          "cpu_idle_percent": 73.5,
+          "load_average_1m": 7.8525390625
+        },
+        "before": {
+          "captured_unix_s": 1789168149.472563,
+          "cpu_idle_percent": 45.6,
+          "load_average_1m": 7.8671875
+        }
+      },
+      "8192-r1-metal": {
+        "after": {
+          "captured_unix_s": 1789168196.9914129,
+          "cpu_idle_percent": 73.3,
+          "load_average_1m": 8.54833984375
+        },
+        "before": {
+          "captured_unix_s": 1789168176.892559,
+          "cpu_idle_percent": 45.8,
+          "load_average_1m": 7.8525390625
+        }
+      },
+      "8192-r2-ane": {
+        "after": {
+          "captured_unix_s": 1789168223.990361,
+          "cpu_idle_percent": 54.9,
+          "load_average_1m": 8.9072265625
+        },
+        "before": {
+          "captured_unix_s": 1789168198.074792,
+          "cpu_idle_percent": 75.9,
+          "load_average_1m": 8.54833984375
+        }
+      },
+      "8192-r2-metal": {
+        "after": {
+          "captured_unix_s": 1789168244.587734,
+          "cpu_idle_percent": 77.4,
+          "load_average_1m": 8.4443359375
+        },
+        "before": {
+          "captured_unix_s": 1789168225.081832,
+          "cpu_idle_percent": 59.7,
+          "load_average_1m": 8.9072265625
+        }
+      }
+    },
+    "contention": "The paired arms were interleaved ANE, Metal, ANE, Metal at every length so ambient drift landed on both lanes. A benchmark lock excluded other registered runs; Runner.Worker was absent; every ANE timed block was checked before, monitored during, and checked after for ck-synapse-worker-ane. Absolute values are ambient-load observations; the paired ratio is the comparison result.",
+    "minimum_repetitions": 11,
+    "minimum_timed_duration_s": 15.0,
+    "order": [
+      "128-r1-ane",
+      "128-r1-metal",
+      "128-r2-ane",
+      "128-r2-metal",
+      "1024-r1-ane",
+      "1024-r1-metal",
+      "1024-r2-ane",
+      "1024-r2-metal",
+      "4096-r1-ane",
+      "4096-r1-metal",
+      "4096-r2-ane",
+      "4096-r2-metal",
+      "8192-r1-ane",
+      "8192-r1-metal",
+      "8192-r2-ane",
+      "8192-r2-metal"
+    ],
+    "power": "Not measured: concurrent foreign CPU work made host-level power unattributable. ANE's efficiency case remains unmeasured."
+  },
+  "measurement_slot": "Alfonso cleared the supervised ANE worker and authorized the non-overlapping slot on 2026-09-11",
+  "model": {
+    "ane_rotation": {
+      "kind": "hadamard",
+      "matrix_sha256": "5d2b2b0a351b6f0526314fb27f50e6d4830bf7efb6c1d60fe6964b24ea1c8f45",
+      "seed": 0
+    },
+    "metal_bucket_policy_version": 2,
+    "metal_dtype": "f16",
+    "model_safetensors_sha256": "3e85899d5728cb7de79781c0c3acfb91ccef9f875f1f7e0b3c9f3dd4b6a724ba",
+    "snapshot": "e7f32e3c00f91d699e8c43b53106206bcc72bb22"
+  },
+  "power_state": {
+    "battery_percent": 80,
+    "power_source": "AC Power"
+  },
+  "rows": [
+    {
+      "ane": {
+        "arms": [
+          {
+            "ambient_conditions": {
+              "after": {
+                "captured_unix_s": 1789167927.7203882,
+                "cpu_idle_percent": 61.6,
+                "load_average_1m": 7.3857421875
+              },
+              "before": {
+                "captured_unix_s": 1789167875.848106,
+                "cpu_idle_percent": 78.1,
+                "load_average_1m": 8.9306640625
+              }
+            },
+            "round": 1,
+            "timing": {
+              "max_row_wall_ms": 53.95395803498104,
+              "mean_row_wall_ms": 37.390852788871996,
+              "median_row_wall_ms": 39.16062496136874,
+              "min_row_wall_ms": 32.047541986685246,
+              "p95_row_wall_ms": 41.21183295501396,
+              "real_tokens_per_s_at_median": 3268.5893068935884,
+              "samples": 401
+            }
+          },
+          {
+            "ambient_conditions": {
+              "after": {
+                "captured_unix_s": 1789167968.5542028,
+                "cpu_idle_percent": 76.8,
+                "load_average_1m": 5.50537109375
+              },
+              "before": {
+                "captured_unix_s": 1789167949.5268202,
+                "cpu_idle_percent": 84.6,
+                "load_average_1m": 6.59375
+              }
+            },
+            "round": 2,
+            "timing": {
+              "max_row_wall_ms": 42.329917021561414,
+              "mean_row_wall_ms": 36.92781704987212,
+              "median_row_wall_ms": 38.73387447674759,
+              "min_row_wall_ms": 31.548374972771853,
+              "p95_row_wall_ms": 40.79925001133233,
+              "real_tokens_per_s_at_median": 3304.600991487179,
+              "samples": 406
+            }
+          }
+        ],
+        "executed_batch_shape": [
+          1,
+          1024
+        ],
+        "guard": [
+          {
+            "abort_reason": null,
+            "maximum_system_wired_bytes": 16121266176,
+            "minimum_system_available_bytes": 49183621120,
+            "peak_owned_rss_bytes": 845070336
+          },
+          {
+            "abort_reason": null,
+            "maximum_system_wired_bytes": 10377789440,
+            "minimum_system_available_bytes": 52115357696,
+            "peak_owned_rss_bytes": 441204736
+          }
+        ],
+        "padded_tokens": 1024,
+        "power": {
+          "reason": "Concurrent foreign CPU work made host-level power unattributable to either lane.",
+          "status": "not_measured"
+        },
+        "timing": {
+          "max_row_wall_ms": 53.95395803498104,
+          "mean_row_wall_ms": 37.15790048399721,
+          "median_row_wall_ms": 39.014667039737105,
+          "min_row_wall_ms": 31.548374972771853,
+          "p95_row_wall_ms": 40.98441603127867,
+          "real_tokens_per_s_at_median": 3280.817438980828,
+          "samples": 807
+        },
+        "vector_sha256": "5e0853f687db1d7bd0ed8c009fb9ae5a4766575397ba854060352a8250b6ff9c"
+      },
+      "input_ids_sha256": "3ab76d933cad5de02dabbd1d7fe2422571269c8ba825c14521c79df746ddeeb2",
+      "metal": {
+        "arms": [
+          {
+            "ambient_conditions": {
+              "after": {
+                "captured_unix_s": 1789167948.4294772,
+                "cpu_idle_percent": 86.1,
+                "load_average_1m": 6.59375
+              },
+              "before": {
+                "captured_unix_s": 1789167928.799523,
+                "cpu_idle_percent": 81.6,
+                "load_average_1m": 6.8740234375
+              }
+            },
+            "round": 1,
+            "timing": {
+              "max_row_wall_ms": 27.506875,
+              "mean_row_wall_ms": 6.584293086479367,
+              "median_row_wall_ms": 6.311521000000001,
+              "min_row_wall_ms": 6.0770420000000005,
+              "p95_row_wall_ms": 8.099749999999998,
+              "real_tokens_per_s_at_median": 20280.372987747327,
+              "samples": 2278
+            }
+          },
+          {
+            "ambient_conditions": {
+              "after": {
+                "captured_unix_s": 1789167987.121131,
+                "cpu_idle_percent": 64.3,
+                "load_average_1m": 6.24169921875
+              },
+              "before": {
+                "captured_unix_s": 1789167969.640299,
+                "cpu_idle_percent": 77.7,
+                "load_average_1m": 5.50537109375
+              }
+            },
+            "round": 2,
+            "timing": {
+              "max_row_wall_ms": 15.841167,
+              "mean_row_wall_ms": 6.547207849847228,
+              "median_row_wall_ms": 6.3804170000000004,
+              "min_row_wall_ms": 6.165792,
+              "p95_row_wall_ms": 7.077583,
+              "real_tokens_per_s_at_median": 20061.384702598592,
+              "samples": 2291
+            }
+          }
+        ],
+        "executed_batch_shape": [
+          1,
+          128
+        ],
+        "guard": [
+          {
+            "abort_reason": null,
+            "maximum_system_wired_bytes": 16371417088,
+            "minimum_system_available_bytes": 48476471296,
+            "peak_owned_rss_bytes": 1836728320
+          },
+          {
+            "abort_reason": null,
+            "maximum_system_wired_bytes": 11132534784,
+            "minimum_system_available_bytes": 49069719552,
+            "peak_owned_rss_bytes": 1842872320
+          }
+        ],
+        "padded_tokens": 128,
+        "power": {
+          "reason": "Concurrent foreign CPU work made host-level power unattributable to either lane.",
+          "status": "not_measured"
+        },
+        "timing": {
+          "max_row_wall_ms": 27.506875,
+          "mean_row_wall_ms": 6.565697709564456,
+          "median_row_wall_ms": 6.351958000000001,
+          "min_row_wall_ms": 6.0770420000000005,
+          "p95_row_wall_ms": 7.7725,
+          "real_tokens_per_s_at_median": 20151.26674326247,
+          "samples": 4569
+        },
+        "vector_sha256": "526a8e031c9b3fe6740b53fa31b7f7f6e8f843929a19d50a4d7fa4d340fad4ea"
+      },
+      "metal_over_ane_median_speed_ratio": 6.142148143885255,
+      "paired_round_median_speed_ratio": 6.13768452167986,
+      "paired_round_speed_ratios": [
+        6.204625630076924,
+        6.0707434132827975
+      ],
+      "real_tokens": 128,
+      "vector_agreement_diagnostic": {
+        "cosine": 0.9999785475950228,
+        "gate": false,
+        "max_abs": 0.0007944721874999991
+      }
+    },
+    {
+      "ane": {
+        "arms": [
+          {
+            "ambient_conditions": {
+              "after": {
+                "captured_unix_s": 1789168006.9885728,
+                "cpu_idle_percent": 55.2,
+                "load_average_1m": 8.2138671875
+              },
+              "before": {
+                "captured_unix_s": 1789167988.227078,
+                "cpu_idle_percent": 53.9,
+                "load_average_1m": 6.30224609375
+              }
+            },
+            "round": 1,
+            "timing": {
+              "max_row_wall_ms": 53.9356250083074,
+              "mean_row_wall_ms": 41.047533563727335,
+              "median_row_wall_ms": 41.99816699838266,
+              "min_row_wall_ms": 32.64920797664672,
+              "p95_row_wall_ms": 44.827334000729024,
+              "real_tokens_per_s_at_median": 24382.016482753497,
+              "samples": 365
+            }
+          },
+          {
+            "ambient_conditions": {
+              "after": {
+                "captured_unix_s": 1789168045.866229,
+                "cpu_idle_percent": 65.7,
+                "load_average_1m": 7.69970703125
+              },
+              "before": {
+                "captured_unix_s": 1789168026.765868,
+                "cpu_idle_percent": 59.5,
+                "load_average_1m": 7.97509765625
+              }
+            },
+            "round": 2,
+            "timing": {
+              "max_row_wall_ms": 42.46983298799023,
+              "mean_row_wall_ms": 37.537366354150606,
+              "median_row_wall_ms": 39.06916698906571,
+              "min_row_wall_ms": 32.559750019572675,
+              "p95_row_wall_ms": 41.0339169902727,
+              "real_tokens_per_s_at_median": 26209.926622868283,
+              "samples": 399
+            }
+          }
+        ],
+        "executed_batch_shape": [
+          1,
+          1024
+        ],
+        "guard": [
+          {
+            "abort_reason": null,
+            "maximum_system_wired_bytes": 15820587008,
+            "minimum_system_available_bytes": 48398368768,
+            "peak_owned_rss_bytes": 449773568
+          },
+          {
+            "abort_reason": null,
+            "maximum_system_wired_bytes": 16032579584,
+            "minimum_system_available_bytes": 45904953344,
+            "peak_owned_rss_bytes": 443187200
+          }
+        ],
+        "padded_tokens": 1024,
+        "power": {
+          "reason": "Concurrent foreign CPU work made host-level power unattributable to either lane.",
+          "status": "not_measured"
+        },
+        "timing": {
+          "max_row_wall_ms": 53.9356250083074,
+          "mean_row_wall_ms": 39.21434414406619,
+          "median_row_wall_ms": 40.22789601003751,
+          "min_row_wall_ms": 32.559750019572675,
+          "p95_row_wall_ms": 44.48733403114602,
+          "real_tokens_per_s_at_median": 25454.972831402752,
+          "samples": 764
+        },
+        "vector_sha256": "49ec0fd7f15cc508cab708c5adedbbf0008a3f2d026f97be3fb029701d16dd24"
+      },
+      "input_ids_sha256": "18f2031b406f821c7bb80d8248a941c4d45c77e8705fddbf09c2ae8ce0083e7d",
+      "metal": {
+        "arms": [
+          {
+            "ambient_conditions": {
+              "after": {
+                "captured_unix_s": 1789168025.679539,
+                "cpu_idle_percent": 70.0,
+                "load_average_1m": 7.97509765625
+              },
+              "before": {
+                "captured_unix_s": 1789168008.080075,
+                "cpu_idle_percent": 52.5,
+                "load_average_1m": 8.2138671875
+              }
+            },
+            "round": 1,
+            "timing": {
+              "max_row_wall_ms": 50.891583,
+              "mean_row_wall_ms": 33.226911327433626,
+              "median_row_wall_ms": 32.940167,
+              "min_row_wall_ms": 31.262999999999998,
+              "p95_row_wall_ms": 36.050582999999996,
+              "real_tokens_per_s_at_median": 31086.66692551984,
+              "samples": 452
+            }
+          },
+          {
+            "ambient_conditions": {
+              "after": {
+                "captured_unix_s": 1789168064.645277,
+                "cpu_idle_percent": 47.9,
+                "load_average_1m": 7.8837890625
+              },
+              "before": {
+                "captured_unix_s": 1789168046.965922,
+                "cpu_idle_percent": 67.2,
+                "load_average_1m": 7.69970703125
+              }
+            },
+            "round": 2,
+            "timing": {
+              "max_row_wall_ms": 54.974250000000005,
+              "mean_row_wall_ms": 40.19354532085562,
+              "median_row_wall_ms": 39.7090835,
+              "min_row_wall_ms": 33.031667,
+              "p95_row_wall_ms": 45.358125,
+              "real_tokens_per_s_at_median": 25787.550599096554,
+              "samples": 374
+            }
+          }
+        ],
+        "executed_batch_shape": [
+          1,
+          1024
+        ],
+        "guard": [
+          {
+            "abort_reason": null,
+            "maximum_system_wired_bytes": 16529620992,
+            "minimum_system_available_bytes": 45635174400,
+            "peak_owned_rss_bytes": 1861107712
+          },
+          {
+            "abort_reason": null,
+            "maximum_system_wired_bytes": 16212983808,
+            "minimum_system_available_bytes": 41423585280,
+            "peak_owned_rss_bytes": 2057797632
+          }
+        ],
+        "padded_tokens": 1024,
+        "power": {
+          "reason": "Concurrent foreign CPU work made host-level power unattributable to either lane.",
+          "status": "not_measured"
+        },
+        "timing": {
+          "max_row_wall_ms": 54.974250000000005,
+          "mean_row_wall_ms": 36.381295242130754,
+          "median_row_wall_ms": 34.498083,
+          "min_row_wall_ms": 31.262999999999998,
+          "p95_row_wall_ms": 43.155958,
+          "real_tokens_per_s_at_median": 29682.808752010948,
+          "samples": 826
+        },
+        "vector_sha256": "53a8fbefb7d88fbaf2ee1043b1a063956b8407472fbbbc08feaa7fc15ae3ad67"
+      },
+      "metal_over_ane_median_speed_ratio": 1.166090765392312,
+      "paired_round_median_speed_ratio": 1.1294341550567215,
+      "paired_round_speed_ratios": [
+        1.2749834267198057,
+        0.9838848833936373
+      ],
+      "real_tokens": 1024,
+      "vector_agreement_diagnostic": {
+        "cosine": 0.9999601685432116,
+        "gate": false,
+        "max_abs": 0.0010482278126953126
+      }
+    },
+    {
+      "ane": {
+        "arms": [
+          {
+            "ambient_conditions": {
+              "after": {
+                "captured_unix_s": 1789168086.9289799,
+                "cpu_idle_percent": 44.1,
+                "load_average_1m": 7.298828125
+              },
+              "before": {
+                "captured_unix_s": 1789168065.747287,
+                "cpu_idle_percent": 48.6,
+                "load_average_1m": 7.8837890625
+              }
+            },
+            "round": 1,
+            "timing": {
+              "max_row_wall_ms": 330.9643749962561,
+              "mean_row_wall_ms": 325.70360723060577,
+              "median_row_wall_ms": 325.8143329876475,
+              "min_row_wall_ms": 318.63175000762567,
+              "p95_row_wall_ms": 329.3112909886986,
+              "real_tokens_per_s_at_median": 12571.577077167107,
+              "samples": 47
+            }
+          },
+          {
+            "ambient_conditions": {
+              "after": {
+                "captured_unix_s": 1789168129.151249,
+                "cpu_idle_percent": 75.7,
+                "load_average_1m": 7.724609375
+              },
+              "before": {
+                "captured_unix_s": 1789168108.516164,
+                "cpu_idle_percent": 51.1,
+                "load_average_1m": 8.255859375
+              }
+            },
+            "round": 2,
+            "timing": {
+              "max_row_wall_ms": 334.1614159871824,
+              "mean_row_wall_ms": 325.8705565970926,
+              "median_row_wall_ms": 325.737041013781,
+              "min_row_wall_ms": 319.17466601589695,
+              "p95_row_wall_ms": 330.0972909783013,
+              "real_tokens_per_s_at_median": 12574.560102996424,
+              "samples": 47
+            }
+          }
+        ],
+        "executed_batch_shape": [
+          1,
+          4096
+        ],
+        "guard": [
+          {
+            "abort_reason": null,
+            "maximum_system_wired_bytes": 10823221248,
+            "minimum_system_available_bytes": 45085261824,
+            "peak_owned_rss_bytes": 616972288
+          },
+          {
+            "abort_reason": null,
+            "maximum_system_wired_bytes": 9533685760,
+            "minimum_system_available_bytes": 45753778176,
+            "peak_owned_rss_bytes": 613580800
+          }
+        ],
+        "padded_tokens": 4096,
+        "power": {
+          "reason": "Concurrent foreign CPU work made host-level power unattributable to either lane.",
+          "status": "not_measured"
+        },
+        "timing": {
+          "max_row_wall_ms": 334.1614159871824,
+          "mean_row_wall_ms": 325.7870819138492,
+          "median_row_wall_ms": 325.76343751861714,
+          "min_row_wall_ms": 318.63175000762567,
+          "p95_row_wall_ms": 330.0972909783013,
+          "real_tokens_per_s_at_median": 12573.541190502438,
+          "samples": 94
+        },
+        "vector_sha256": "c78d62b3f450a3533beb5d729ada7849f021915e255d37876d68d3f7216dc11a"
+      },
+      "input_ids_sha256": "6a4e99a96c1a9e8ea798578bd352b399ac1d1163865b411c1e4eceda8881ca77",
+      "metal": {
+        "arms": [
+          {
+            "ambient_conditions": {
+              "after": {
+                "captured_unix_s": 1789168107.411962,
+                "cpu_idle_percent": 52.0,
+                "load_average_1m": 8.365234375
+              },
+              "before": {
+                "captured_unix_s": 1789168088.0771961,
+                "cpu_idle_percent": 55.5,
+                "load_average_1m": 7.298828125
+              }
+            },
+            "round": 1,
+            "timing": {
+              "max_row_wall_ms": 417.88674999999995,
+              "mean_row_wall_ms": 348.41278984090906,
+              "median_row_wall_ms": 339.120042,
+              "min_row_wall_ms": 321.514042,
+              "p95_row_wall_ms": 404.189834,
+              "real_tokens_per_s_at_median": 12078.318862675771,
+              "samples": 44
+            }
+          },
+          {
+            "ambient_conditions": {
+              "after": {
+                "captured_unix_s": 1789168148.3798048,
+                "cpu_idle_percent": 44.8,
+                "load_average_1m": 7.8671875
+              },
+              "before": {
+                "captured_unix_s": 1789168130.224498,
+                "cpu_idle_percent": 74.3,
+                "load_average_1m": 7.724609375
+              }
+            },
+            "round": 2,
+            "timing": {
+              "max_row_wall_ms": 497.195916,
+              "mean_row_wall_ms": 313.7496109583334,
+              "median_row_wall_ms": 309.06910350000004,
+              "min_row_wall_ms": 285.13766699999996,
+              "p95_row_wall_ms": 343.097125,
+              "real_tokens_per_s_at_median": 13252.69965071096,
+              "samples": 48
+            }
+          }
+        ],
+        "executed_batch_shape": [
+          1,
+          4096
+        ],
+        "guard": [
+          {
+            "abort_reason": null,
+            "maximum_system_wired_bytes": 16728506368,
+            "minimum_system_available_bytes": 42548903936,
+            "peak_owned_rss_bytes": 2190573568
+          },
+          {
+            "abort_reason": null,
+            "maximum_system_wired_bytes": 15896592384,
+            "minimum_system_available_bytes": 42205200384,
+            "peak_owned_rss_bytes": 2333409280
+          }
+        ],
+        "padded_tokens": 4096,
+        "power": {
+          "reason": "Concurrent foreign CPU work made host-level power unattributable to either lane.",
+          "status": "not_measured"
+        },
+        "timing": {
+          "max_row_wall_ms": 497.195916,
+          "mean_row_wall_ms": 330.3276530326087,
+          "median_row_wall_ms": 321.973667,
+          "min_row_wall_ms": 285.13766699999996,
+          "p95_row_wall_ms": 393.087583,
+          "real_tokens_per_s_at_median": 12721.537255405427,
+          "samples": 92
+        },
+        "vector_sha256": "df9cb9ba6adc4104de56fa6d8e5bf9c84897adb57624a508113373e3e9661fd2"
+      },
+      "metal_over_ane_median_speed_ratio": 1.011770436240729,
+      "paired_round_median_speed_ratio": 1.0073467496974835,
+      "paired_round_speed_ratios": [
+        0.9607640146129951,
+        1.0539294847819718
+      ],
+      "real_tokens": 4096,
+      "vector_agreement_diagnostic": {
+        "cosine": 0.9999748966989962,
+        "gate": false,
+        "max_abs": 0.0008991258125000002
+      }
+    },
+    {
+      "ane": {
+        "arms": [
+          {
+            "ambient_conditions": {
+              "after": {
+                "captured_unix_s": 1789168175.818403,
+                "cpu_idle_percent": 73.5,
+                "load_average_1m": 7.8525390625
+              },
+              "before": {
+                "captured_unix_s": 1789168149.472563,
+                "cpu_idle_percent": 45.6,
+                "load_average_1m": 7.8671875
+              }
+            },
+            "round": 1,
+            "timing": {
+              "max_row_wall_ms": 1564.7303750156425,
+              "mean_row_wall_ms": 1561.2976666465825,
+              "median_row_wall_ms": 1561.7997500230558,
+              "min_row_wall_ms": 1559.6473750192672,
+              "p95_row_wall_ms": 1564.7303750156425,
+              "real_tokens_per_s_at_median": 5245.230702514242,
+              "samples": 11
+            }
+          },
+          {
+            "ambient_conditions": {
+              "after": {
+                "captured_unix_s": 1789168223.990361,
+                "cpu_idle_percent": 54.9,
+                "load_average_1m": 8.9072265625
+              },
+              "before": {
+                "captured_unix_s": 1789168198.074792,
+                "cpu_idle_percent": 75.9,
+                "load_average_1m": 8.54833984375
+              }
+            },
+            "round": 2,
+            "timing": {
+              "max_row_wall_ms": 1567.0610420056619,
+              "mean_row_wall_ms": 1562.2494544579902,
+              "median_row_wall_ms": 1561.8333329912275,
+              "min_row_wall_ms": 1555.5294579826295,
+              "p95_row_wall_ms": 1567.0610420056619,
+              "real_tokens_per_s_at_median": 5245.117918126807,
+              "samples": 11
+            }
+          }
+        ],
+        "executed_batch_shape": [
+          1,
+          8192
+        ],
+        "guard": [
+          {
+            "abort_reason": null,
+            "maximum_system_wired_bytes": 15634857984,
+            "minimum_system_available_bytes": 42664132608,
+            "peak_owned_rss_bytes": 962035712
+          },
+          {
+            "abort_reason": null,
+            "maximum_system_wired_bytes": 15650996224,
+            "minimum_system_available_bytes": 44959367168,
+            "peak_owned_rss_bytes": 911720448
+          }
+        ],
+        "padded_tokens": 8192,
+        "power": {
+          "reason": "Concurrent foreign CPU work made host-level power unattributable to either lane.",
+          "status": "not_measured"
+        },
+        "timing": {
+          "max_row_wall_ms": 1567.0610420056619,
+          "mean_row_wall_ms": 1561.7735605522862,
+          "median_row_wall_ms": 1561.8279580085073,
+          "min_row_wall_ms": 1555.5294579826295,
+          "p95_row_wall_ms": 1566.442332987208,
+          "real_tokens_per_s_at_median": 5245.135969038261,
+          "samples": 22
+        },
+        "vector_sha256": "90fc95ca1e0512889a8b8fb642b4f7d872f1119d9ac60bf4b6abec45ef5e9d6f"
+      },
+      "input_ids_sha256": "0f785d67728a2db0c7ce0c27ba8d659d34d4951c11da1df2d875083fd6e62966",
+      "metal": {
+        "arms": [
+          {
+            "ambient_conditions": {
+              "after": {
+                "captured_unix_s": 1789168196.9914129,
+                "cpu_idle_percent": 73.3,
+                "load_average_1m": 8.54833984375
+              },
+              "before": {
+                "captured_unix_s": 1789168176.892559,
+                "cpu_idle_percent": 45.8,
+                "load_average_1m": 7.8525390625
+              }
+            },
+            "round": 1,
+            "timing": {
+              "max_row_wall_ms": 872.206917,
+              "mean_row_wall_ms": 732.7470675238095,
+              "median_row_wall_ms": 707.403625,
+              "min_row_wall_ms": 683.504333,
+              "p95_row_wall_ms": 859.57425,
+              "real_tokens_per_s_at_median": 11580.376054759403,
+              "samples": 21
+            }
+          },
+          {
+            "ambient_conditions": {
+              "after": {
+                "captured_unix_s": 1789168244.587734,
+                "cpu_idle_percent": 77.4,
+                "load_average_1m": 8.4443359375
+              },
+              "before": {
+                "captured_unix_s": 1789168225.081832,
+                "cpu_idle_percent": 59.7,
+                "load_average_1m": 8.9072265625
+              }
+            },
+            "round": 2,
+            "timing": {
+              "max_row_wall_ms": 836.491208,
+              "mean_row_wall_ms": 701.129767090909,
+              "median_row_wall_ms": 685.646125,
+              "min_row_wall_ms": 666.701375,
+              "p95_row_wall_ms": 803.1537079999999,
+              "real_tokens_per_s_at_median": 11947.854295829353,
+              "samples": 22
+            }
+          }
+        ],
+        "executed_batch_shape": [
+          1,
+          8192
+        ],
+        "guard": [
+          {
+            "abort_reason": null,
+            "maximum_system_wired_bytes": 17359159296,
+            "minimum_system_available_bytes": 40741142528,
+            "peak_owned_rss_bytes": 3760848896
+          },
+          {
+            "abort_reason": null,
+            "maximum_system_wired_bytes": 16860938240,
+            "minimum_system_available_bytes": 43124113408,
+            "peak_owned_rss_bytes": 3812638720
+          }
+        ],
+        "padded_tokens": 8192,
+        "power": {
+          "reason": "Concurrent foreign CPU work made host-level power unattributable to either lane.",
+          "status": "not_measured"
+        },
+        "timing": {
+          "max_row_wall_ms": 872.206917,
+          "mean_row_wall_ms": 716.5707742790698,
+          "median_row_wall_ms": 696.840292,
+          "min_row_wall_ms": 666.701375,
+          "p95_row_wall_ms": 836.491208,
+          "real_tokens_per_s_at_median": 11755.921828928917,
+          "samples": 43
+        },
+        "vector_sha256": "8d99fe3b00b8c30047cba2d1e3663655e87f2c10ad12ab8846398e4548fc727d"
+      },
+      "metal_over_ane_median_speed_ratio": 2.2412997295634383,
+      "paired_round_median_speed_ratio": 2.2428457961697346,
+      "paired_round_speed_ratios": [
+        2.207791556090847,
+        2.2779000362486226
+      ],
+      "real_tokens": 8192,
+      "vector_agreement_diagnostic": {
+        "cosine": 0.9999075652654178,
+        "gate": false,
+        "max_abs": 0.0018205051914062503
+      }
+    }
+  ],
+  "conclusion": "Do not ship an 8192-token ANE lane. Under interleaved ambient-load arms, production Metal was 2.208x and 2.278x faster at 8192 tokens (2.243x paired median); 4096 was effectively tied. ANE power efficiency was not measurable credibly under concurrent foreign CPU load, so no energy advantage is claimed. Rotating the consumer fingerprint and forcing a full re-embed is not justified by these results.",
+  "safety": {
+    "abort_available_bytes": 17179869184,
+    "abort_free_bytes": 0,
+    "abort_owned_rss_bytes": 34359738368,
+    "abort_wired_fraction": 0.5,
+    "guard_abort_count": 0,
+    "initial_memory": {
+      "available_bytes": 52086046720,
+      "captured_unix_s": 1789167874.721198,
+      "compressor_bytes": 32057606144,
+      "free_bytes": 8160706560,
+      "inactive_bytes": 43280384000,
+      "memory_pressure": "The system has 137438953472 (8388608 pages with a page size of 16384).\nSystem-wide memory free percentage: 69%",
+      "page_size": 16384,
+      "physical_bytes": 137438953472,
+      "wired_bytes": 9603137536
+    },
+    "limitation": "Owned RSS and system wired/available observations cannot guarantee that ANE allocation is bounded or prevent workstation pressure.",
+    "minimum_available_preflight_bytes": 34359738368,
+    "one_model_process_at_a_time": true,
+    "timeout_s": 1800.0,
+    "unexpected_ane_worker_detected": false
+  },
+  "source_revision": "b3d39044557d4b1957f88964016adc7639ff3ed9",
+  "status": "passed_matched_long_row_measurement"
+}
