@@ -14,6 +14,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+mod ane_artifact;
 // Provider adapters stay module-private so credentials and remote identity checks
 // cannot be bypassed by a second public call path.
 /// Certification probes, immutable fixture batteries and oracles,
@@ -5303,16 +5304,35 @@ fn load_catalog_model_blocking(
     let model_path = locator_path(&spec.model_locator, &model_cache)?;
     let tokenizer_path = locator_path(&spec.tokenizer_locator, &model_cache)?;
     let owned_profile = stored_owned_profile(&spec)?;
-    let effective_model_path = if let Some(profile) = owned_profile.as_ref() {
-        assemble_owned_model_package(&spec, &model_path.path, &model_cache, profile)?
-    } else {
-        model_path.path.clone()
-    };
     let extra_assets = spec
         .extra_locators
         .iter()
         .map(|locator| locator_path(locator, &model_cache))
         .collect::<Result<Vec<_>, _>>()?;
+    let ane_artifacts = if spec.engine == "ane"
+        && cfg!(target_os = "macos")
+        && matches!(spec.artifact_format.as_str(), "mlmodelc" | "coreml")
+    {
+        Some(materialize_ane_artifacts(
+            &spec,
+            &model_path,
+            &extra_assets,
+            model_cache.root(),
+        )?)
+    } else {
+        None
+    };
+    let effective_model_path = if let Some(artifacts) = ane_artifacts.as_ref() {
+        artifacts
+            .first()
+            .expect("ANE artifact set always contains the primary model")
+            .path
+            .clone()
+    } else if let Some(profile) = owned_profile.as_ref() {
+        assemble_owned_model_package(&spec, &model_path.path, &model_cache, profile)?
+    } else {
+        model_path.path.clone()
+    };
     let tokenizer = SanitizedTokenizer::from_file(
         &tokenizer_path.path,
         TokenizerConfig {
@@ -5343,6 +5363,7 @@ fn load_catalog_model_blocking(
         &extra_assets,
         model_cache.root(),
         microllm_max_tokens,
+        ane_artifacts.as_deref(),
     );
     let artifact = ValidatedArtifact {
         digest: spec.artifact_digest.clone(),
@@ -5568,6 +5589,38 @@ fn load_worker_backend_blocking(
     ))
 }
 
+fn materialize_ane_artifacts(
+    spec: &StoredModelConfig,
+    model: &LocatedAsset,
+    extra_assets: &[LocatedAsset],
+    cache_root: &Path,
+) -> Result<Vec<ane_artifact::MaterializedCoreMlArtifact>, WireOperationError> {
+    let assets = std::iter::once((&spec.model_locator, model))
+        .chain(spec.extra_locators.iter().zip(extra_assets.iter()));
+    let mut materialized = Vec::with_capacity(1 + extra_assets.len());
+    for (locator, asset) in assets {
+        let source_digest = model_asset_digest(locator, &spec.artifact_digest);
+        let artifact =
+            ane_artifact::materialize_core_ml_artifact(&asset.path, &source_digest, cache_root)
+                .map_err(|error| {
+                    artifact_invalid_error(format!(
+                        "materialize ANE Core ML artifact {}: {error:#}",
+                        asset.path.display()
+                    ))
+                })?;
+        tracing::debug!(
+            target: "maintenance",
+            source = %asset.path.display(),
+            materialized = %artifact.path.display(),
+            source_digest,
+            reused = artifact.reused,
+            "ANE Core ML artifact ready"
+        );
+        materialized.push(artifact);
+    }
+    Ok(materialized)
+}
+
 fn unload_embedding_model_blocking(model: Arc<EmbeddingModel>) -> Result<(), WireOperationError> {
     match &model.backend {
         EmbedBackend::Ort(engine) => {
@@ -5610,6 +5663,7 @@ fn model_runtime_config(
     extra_assets: &[LocatedAsset],
     model_cache_root: &Path,
     microllm_max_tokens: u32,
+    ane_artifacts: Option<&[ane_artifact::MaterializedCoreMlArtifact]>,
 ) -> RuntimeConfig {
     let mut runtime_config = RuntimeConfig::default();
     runtime_config.values.insert(
@@ -5621,21 +5675,35 @@ fn model_runtime_config(
         model_path.to_string_lossy().to_string(),
     );
     if spec.engine == "ane" {
-        let mut paths = vec![model_path.to_string_lossy().to_string()];
-        paths.extend(
-            extra_assets
-                .iter()
-                .map(|asset| asset.path.to_string_lossy().to_string()),
-        );
-        let mut digests = vec![model_asset_digest(
-            &spec.model_locator,
-            &spec.artifact_digest,
-        )];
-        digests.extend(
-            spec.extra_locators
-                .iter()
-                .map(|locator| model_asset_digest(locator, &spec.artifact_digest)),
-        );
+        let (paths, digests) = if let Some(artifacts) = ane_artifacts {
+            (
+                artifacts
+                    .iter()
+                    .map(|artifact| artifact.path.to_string_lossy().to_string())
+                    .collect(),
+                artifacts
+                    .iter()
+                    .map(|artifact| artifact.digest.clone())
+                    .collect(),
+            )
+        } else {
+            let mut paths = vec![model_path.to_string_lossy().to_string()];
+            paths.extend(
+                extra_assets
+                    .iter()
+                    .map(|asset| asset.path.to_string_lossy().to_string()),
+            );
+            let mut digests = vec![model_asset_digest(
+                &spec.model_locator,
+                &spec.artifact_digest,
+            )];
+            digests.extend(
+                spec.extra_locators
+                    .iter()
+                    .map(|locator| model_asset_digest(locator, &spec.artifact_digest)),
+            );
+            (paths, digests)
+        };
         runtime_config.values.insert(
             "artifact_paths".to_string(),
             serde_json::to_string(&paths).expect("ANE artifact paths serialize"),
@@ -5781,6 +5849,7 @@ pub fn llama_backend_contract_runtime_config(
         &[],
         Path::new("/tmp/synapse-backend-contract-cache"),
         DEFAULT_MICROLLM_MAX_TOKENS,
+        None,
     ))
 }
 
@@ -8440,6 +8509,7 @@ fn build_supervised_decode_dispatch_for_chain_k(
         &[],
         state.model_cache.root(),
         state.runtime.microllm_max_tokens,
+        None,
     );
     let decode_fingerprint = entry
         .decode_identity_inputs()
@@ -14041,19 +14111,39 @@ async fn cache_gc(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
     };
     let now = now_ms();
     let grace_ms = params.grace_ms.unwrap_or(60_000);
-    let result: Result<Vec<CacheGcOutcome>, ModelCacheError> = if let Some(digest) = params.digest {
-        state
-            .model_cache
-            .gc_digest(&digest, &state.module_id, now, grace_ms)
-            .map(|outcome| vec![outcome])
-    } else {
-        state.model_cache.gc_to_watermark(
-            &state.module_id,
-            now,
-            grace_ms,
-            state.runtime.cache_max_bytes,
-        )
-    };
+    let result: Result<Vec<CacheGcOutcome>, ModelCacheError> = (|| {
+        ane_artifact::cleanup_abandoned_temps(state.model_cache.root(), SystemTime::now())
+            .map_err(ane_materialization_cache_error)?;
+        let outcomes = if let Some(digest) = params.digest {
+            vec![state
+                .model_cache
+                .gc_digest(&digest, &state.module_id, now, grace_ms)?]
+        } else {
+            // Materialized bundles consume the same cache budget as their source
+            // blobs. Lowering the blob watermark by their current size makes the
+            // existing mark/delete pass run whenever the combined cache is over
+            // budget; source deletion below reclaims the matching bundle.
+            let materialized_bytes =
+                ane_artifact::total_materialized_bytes(state.model_cache.root())
+                    .map_err(ane_materialization_cache_error)?;
+            state.model_cache.gc_to_watermark(
+                &state.module_id,
+                now,
+                grace_ms,
+                state
+                    .runtime
+                    .cache_max_bytes
+                    .saturating_sub(materialized_bytes),
+            )?
+        };
+        for outcome in &outcomes {
+            if let CacheGcOutcome::Deleted { digest } = outcome {
+                ane_artifact::remove_for_source_digest(state.model_cache.root(), digest)
+                    .map_err(ane_materialization_cache_error)?;
+            }
+        }
+        Ok(outcomes)
+    })();
     match result {
         Ok(outcomes) => {
             let removed_any = outcomes
@@ -14075,6 +14165,10 @@ async fn cache_gc(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         }
         Err(error) => result_outcome(error_payload(&state, cache_error_to_wire(error))),
     }
+}
+
+fn ane_materialization_cache_error(error: anyhow::Error) -> ModelCacheError {
+    ModelCacheError::ArtifactInvalid(format!("ANE materialization cache: {error:#}"))
 }
 
 fn cache_error_to_wire(error: ModelCacheError) -> WireOperationError {
@@ -15339,6 +15433,14 @@ mod tests {
                 pin_module_id: None,
             })
             .expect("ingest test artifact into model cache");
+        let materialized =
+            ane_artifact::materialized_entry_path(&cache_root, &meta.digest).unwrap();
+        std::fs::create_dir_all(materialized.join("artifact")).unwrap();
+        std::fs::write(
+            materialized.join("artifact/weights.bin"),
+            b"derived Core ML bytes",
+        )
+        .unwrap();
 
         let (machine_profile_hash, revisioned_machine_profile_hash) =
             module_state_machine_profile_hashes(&profile);
@@ -15347,8 +15449,14 @@ mod tests {
             .expect("test profile state reads")
             .profile_activation_epoch
             .expect("test profile is activated");
+        let module_config = ModuleConfig {
+            cache_max_bytes: std::fs::metadata(model_cache.blob_path(&meta.digest))
+                .unwrap()
+                .len(),
+            ..ModuleConfig::default()
+        };
         let runtime = Arc::new(
-            RuntimeState::from_catalog(ModuleConfig::default(), vec![stuck_model_spec()])
+            RuntimeState::from_catalog(module_config, vec![stuck_model_spec()])
                 .expect("test runtime initializes"),
         );
         let remote_gateway = Arc::new(
@@ -15376,12 +15484,12 @@ mod tests {
             remote_gateway,
         });
 
-        // An initial GC sweep with positive grace period places a tombstone on the artifact without deleting it.
+        // The source blob alone is exactly at the watermark, so this sweep runs
+        // only when the derivative is included in the cache budget.
         let vacuum_count_before = maintenance_vacuum_count();
         let outcome1 = cache_gc(
             Arc::clone(&state),
             json!({
-                "digest": meta.digest,
                 "grace_ms": 60_000
             }),
         )
@@ -15391,6 +15499,10 @@ mod tests {
         };
         let payload1: Value = serde_json::from_slice(&body1).expect("json response");
         assert_eq!(payload1["result"]["outcomes"][0]["state"], "marked");
+        assert!(
+            materialized.is_dir(),
+            "marking a source must retain its Core ML derivative during grace"
+        );
         // No delete occurred, so store freelist remains un-vacuumed.
         assert_eq!(store.freelist_count().unwrap(), freelist_before);
         assert_eq!(maintenance_vacuum_count(), vacuum_count_before);
@@ -15405,7 +15517,6 @@ mod tests {
         let outcome2 = cache_gc(
             Arc::clone(&state),
             json!({
-                "digest": meta.digest,
                 "grace_ms": 0
             }),
         )
@@ -15415,6 +15526,10 @@ mod tests {
         };
         let payload2: Value = serde_json::from_slice(&body2).expect("json response");
         assert_eq!(payload2["result"]["outcomes"][0]["state"], "deleted");
+        assert!(
+            !materialized.exists(),
+            "deleting a source must reclaim its Core ML derivative"
+        );
 
         // The GC sweep actually deleted tombstoned blobs, triggering guarded freelist reclaim!
         let freelist_after = store.freelist_count().unwrap();
