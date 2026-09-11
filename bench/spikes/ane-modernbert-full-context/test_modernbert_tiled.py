@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import tempfile
 import unittest
@@ -13,6 +14,7 @@ from unittest import mock
 import torch
 
 import attribute_load as load_attribution
+import compare_long_rows as long_rows
 import modernbert_tiled as tiled
 from norm_reproducer import NormVariants
 from run_stages import selected_stages, stage_can_continue
@@ -378,6 +380,64 @@ class LoadAttributionTests(unittest.TestCase):
         self.assertIs(load_attribution.coreml_compute_unit("all", CoreML), Units.ALL)
         with self.assertRaises(ValueError):
             load_attribution.coreml_compute_unit("cpu-only", CoreML)
+
+
+class LongRowComparisonTests(unittest.TestCase):
+    def test_cases_share_exact_active_ids_and_short_case_keeps_terminal_token(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            specs: dict[int, long_rows.StageSpec] = {}
+            for length in long_rows.STAGE_LENGTHS:
+                input_path = root / f"input-{length}.jsonl"
+                ids = [1, *[10 + (index % 31) for index in range(length - 2)], 2]
+                input_path.write_text(
+                    json.dumps(
+                        {
+                            "id": "full-context",
+                            "input_ids": ids,
+                            "attention_mask": [1] * length,
+                        }
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                specs[length] = long_rows.StageSpec(
+                    sequence_length=length,
+                    package=root / f"{length}.mlpackage",
+                    compiled=root / f"{length}.mlmodelc",
+                    input_path=input_path,
+                    export_report=root / f"export-{length}.json",
+                    compile_report=root / f"compile-{length}.json",
+                    package_sha256=f"package-{length}",
+                    input_sha256=f"input-{length}",
+                )
+
+            cases = long_rows.build_cases(specs, root / "cases")
+            self.assertEqual(cases[128]["input_ids"][-1], 2)
+            self.assertEqual(cases[128]["input_ids"][:127], cases[1024]["input_ids"][:127])
+            for length in long_rows.CASE_LENGTHS:
+                saved = json.loads(Path(cases[length]["path"]).read_text(encoding="utf-8"))
+                self.assertEqual(saved["input_ids"], cases[length]["input_ids"])
+                self.assertEqual(saved["real_tokens"], length)
+
+    def test_timing_and_vector_diagnostics_use_real_tokens(self) -> None:
+        summary = long_rows.timing_summary([2.0, 1.0, 3.0], 4096)
+        self.assertEqual(summary["median_row_wall_ms"], 2000.0)
+        self.assertEqual(summary["real_tokens_per_s_at_median"], 2048.0)
+        self.assertAlmostEqual(long_rows.cosine([1.0, 0.0], [1.0, 1.0]), 1.0 / math.sqrt(2.0))
+
+    def test_profile_shape_requires_one_observed_engine_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            log = Path(temporary) / "metal.log"
+            log.write_text(
+                "[synapse-embed-profile] bucket_select call=1 items=1 max_tokens=4096 shape=1x4096 select_ms=0.001\n"
+                "[synapse-embed-profile] bucket_select call=2 items=1 max_tokens=4096 shape=1x4096 select_ms=0.001\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(long_rows.parse_metal_shape(log), [1, 4096])
+            log.write_text(log.read_text() + "bucket_select shape=1x8192\n", encoding="utf-8")
+            with self.assertRaises(RuntimeError):
+                long_rows.parse_metal_shape(log)
 
 
 class RopeTests(unittest.TestCase):
