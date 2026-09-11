@@ -1,0 +1,233 @@
+{
+  "status": "direct_mlpackage_load_repeats_slow_path_stable_mlmodelc_load_is_cached_across_processes",
+  "measured_at": "2026-09-11",
+  "source_revision": "96f8fecf52f99e9c6adef91dc3154be8d69fce27",
+  "measurement_slot": "The resident ANE worker was cleared before measurement; every guarded child checked again before and after loading.",
+  "hardware": {
+    "machine": "Mac17,6",
+    "chip": "Apple M5 Max",
+    "physical_memory_bytes": 137438953472,
+    "macos": "27.0",
+    "macos_build": "26A5425a"
+  },
+  "toolchain": {
+    "python": "3.12.12",
+    "coremltools": "9.0",
+    "torch": "2.14.0",
+    "transformers": "5.16.1",
+    "tokenizers": "0.23.2",
+    "safetensors": "0.8.0",
+    "numpy": "2.5.3",
+    "psutil": "7.2.2",
+    "sha256": "4263ee6835e253f9ad946d9cb11ab38387e25505b6c28a43da39138dc75715a0"
+  },
+  "model": {
+    "snapshot": "e7f32e3c00f91d699e8c43b53106206bcc72bb22",
+    "combined_sha256": "324396e8d20bc40a0af9f258ecaa6278197055b8907be2c73c6840f784568538",
+    "model_safetensors_sha256": "3e85899d5728cb7de79781c0c3acfb91ccef9f875f1f7e0b3c9f3dd4b6a724ba",
+    "parameter_count": 149014272,
+    "parameter_dtype": "float16",
+    "rotation": {
+      "kind": "hadamard",
+      "seed": 0,
+      "matrix_sha256": "5d2b2b0a351b6f0526314fb27f50e6d4830bf7efb6c1d60fe6964b24ea1c8f45"
+    }
+  },
+  "once_or_every_time": {
+    "direct_mlpackage_cpu_and_ne": {
+      "interpretation": "Every load was slow because coremltools compiled the source package to a different temporary .mlmodelc path for every MLModel object.",
+      "sequence_1024": {
+        "package_sha256": "18903e4080f0dd849b10461bd7cd3f97cc59b6e992f7a13a66465cf14410331b",
+        "same_process": [
+          {
+            "wall_s": 36.64087170897983,
+            "framework_load_s": 35.033458416,
+            "compiled_path_suffix": "gte-modernbert_1D7FC922-9B9C-4530-B8DC-7B7C90613520.mlmodelc"
+          },
+          {
+            "wall_s": 33.598534041957464,
+            "framework_load_s": 32.708216375,
+            "compiled_path_suffix": "gte-modernbert_C228699D-029C-4581-8335-66627FDEB357.mlmodelc"
+          }
+        ],
+        "fresh_process": {
+          "wall_s": 33.69776895799441,
+          "framework_load_s": 32.797775166,
+          "compiled_path_suffix": "gte-modernbert_770FFA1B-FB4D-4FE2-BD5C-4F06FF8B4260.mlmodelc"
+        }
+      },
+      "sequence_8192": {
+        "package_sha256": "c4156ac920176edec2fcac4f2ea086b30838df2d078cb1cc21409d7cb7d23466",
+        "same_process": [
+          {
+            "wall_s": 601.5650729580084,
+            "framework_load_s": 595.644968916,
+            "compiled_path_suffix": "gte-modernbert_B4E18AA5-E152-4BE9-A31D-34D53147A4E1.mlmodelc"
+          },
+          {
+            "wall_s": 725.6560564999818,
+            "framework_load_s": 719.823668958,
+            "compiled_path_suffix": "gte-modernbert_91B2C664-5DE3-4C00-AC2F-F9D750FB2CB0.mlmodelc"
+          }
+        ],
+        "fresh_process": {
+          "wall_s": 670.3016697919811,
+          "framework_load_s": 663.858854208,
+          "compiled_path_suffix": "gte-modernbert_8D96E36D-D070-4B05-95F8-4EB75F60A25B.mlmodelc"
+        }
+      }
+    },
+    "stable_compiled_mlmodelc_cpu_and_ne": {
+      "interpretation": "The specialization is paid once for a stable compiled-model path and compute configuration, and the cache survives process exit.",
+      "sequence_1024": {
+        "explicit_package_compilation_wall_s": 5.996210250013974,
+        "same_process_framework_load_s": [32.870408958, 0.272059166],
+        "fresh_process_framework_load_s": 0.296072333,
+        "cold_to_second_load_speedup": 120.81055828512764,
+        "cold_to_fresh_process_speedup": 106.98894695486285
+      },
+      "sequence_8192": {
+        "explicit_package_compilation_wall_s": 5.908695542020723,
+        "same_process_framework_load_s": [579.688224708, 2.161591125],
+        "fresh_process_framework_load_s": 1.774648166,
+        "same_process_wall_s": [579.6987603749731, 2.1617534160031937],
+        "fresh_process_wall_s": 1.7856979169882834,
+        "cold_to_second_load_speedup": 268.1613712662761,
+        "cold_to_fresh_process_speedup": 324.63428156576424
+      }
+    },
+    "answer": "Core ML's specialization is a one-time cost only when the exact compiled .mlmodelc path and configuration are stable. The spike's direct .mlpackage load path creates a new temporary compiled path and therefore pays the slow path on every load, in the same process and in a fresh process."
+  },
+  "cache": {
+    "documented_scope": "Apple documents an OS-managed specialized-asset cache linked to the full compiled .mlmodelc path and configuration; it is not process-local.",
+    "public_filesystem_location": null,
+    "public_clear_api": null,
+    "safe_invalidation_control_1024": {
+      "method": "Compile the unchanged package to a second app-owned versioned .mlmodelc path without touching private OS cache directories.",
+      "warm_fresh_process_framework_load_s_before_invalidation": 0.296072333,
+      "new_path_fresh_process_framework_load_s": 32.113484833,
+      "slow_path_restored": true
+    },
+    "tooling_limits": [
+      "fs_usage was available only as root and was not run with privilege escalation.",
+      "xcrun xctrace was unavailable in the installed command-line developer tools.",
+      "No private Core ML or ANE cache directory was deleted, and no cache location is claimed from filesystem guessing."
+    ]
+  },
+  "phase_attribution": {
+    "sequence_8192_stable_path": {
+      "source_package_to_mlmodelc_wall_s": 5.908695542020723,
+      "cold_framework_load_s": 579.688224708,
+      "fresh_process_cached_framework_load_s": 1.774648166,
+      "cache_miss_specific_envelope_s": 577.913576542,
+      "cold_compile_plus_load_fraction_inside_framework_load_percent": 98.99099613783864,
+      "framework_call": "MLModel loadContentsOfURL:configuration:error:",
+      "process_rss_before_bytes": 302530560,
+      "process_rss_loaded_bytes": 856162304,
+      "guarded_process_peak_rss_bytes": 2003599360,
+      "minimum_system_available_bytes": 43147886592,
+      "maximum_system_wired_bytes": 16236052480
+    },
+    "attributed": [
+      "Package-to-.mlmodelc source compilation is separate and took 5.909 s at 8192.",
+      "579.688 s of the stable-path cold load was reported by Core ML inside MLModel loadContentsOfURL, not by Python wrapper overhead.",
+      "The 577.914 s difference between cold and cached framework loads belongs to Core ML's prepare-and-cache envelope.",
+      "CPU_AND_NE compute plans preferred all expensive operations on ANE, while the much faster 8192 .all load preferred them on GPU; this identifies ANE specialization as the scaling-sensitive path rather than source-package deserialization alone."
+    ],
+    "unattributed": [
+      "Core ML exposes no public timing split inside prepare-and-cache for ANE compiler work versus weight transformation or layout.",
+      "RSS and system wired/available samples bound process and host pressure but cannot identify ANE-resident bytes or separate allocation from specialization.",
+      "Cached load time includes compiled-model deserialization and runtime allocation, but those components cannot be timed independently with the available APIs.",
+      "MLComputePlan is static anticipated-placement evidence, not a runtime dispatch trace."
+    ]
+  },
+  "compute_units": {
+    "sequence_1024": {
+      "cpu_and_ne_cold_framework_load_s": 32.870408958,
+      "all_cold_framework_load_s": 32.409333833,
+      "cpu_and_ne_preferred_device_counts": {"cpu": 13, "neuralEngine": 11660, "unknown_constants": 18658},
+      "all_preferred_device_counts": {"cpu": 13, "neuralEngine": 11660, "unknown_constants": 18658},
+      "result": ".all did not materially change load time or placement at 1024."
+    },
+    "sequence_8192": {
+      "cpu_and_ne_cold_framework_load_s": 579.688224708,
+      "all_cold_framework_load_s": 32.112288583,
+      "all_load_reduction_percent": 94.45881522375551,
+      "cpu_and_ne_preferred_device_counts": {"cpu": 69, "neuralEngine": 75024, "unknown_constants": 108314},
+      "all_preferred_device_counts": {"gpu": 75093, "unknown_constants": 108314},
+      "cpu_and_ne_expensive_placement": {"conv_neuralEngine": 90, "einsum_neuralEngine": 16896, "softmax_neuralEngine": 8448},
+      "all_expensive_placement": {"conv_gpu": 90, "einsum_gpu": 16896, "softmax_gpu": 8448},
+      "result": ".all avoided the long ANE-specialization path by moving every non-constant operation to GPU; it is not an ANE load-time improvement."
+    }
+  },
+  "scaling": {
+    "stages": [
+      {
+        "sequence_length": 1024,
+        "parameter_count": 149014272,
+        "package_logical_bytes": 310601744,
+        "package_allocated_bytes": 310616064,
+        "package_mib": 296.213,
+        "mil_operation_count": 30397,
+        "original_direct_package_load_s": 36.75616179200006
+      },
+      {
+        "sequence_length": 2048,
+        "parameter_count": 149014272,
+        "package_logical_bytes": 318010810,
+        "package_allocated_bytes": 318017536,
+        "package_mib": 303.279,
+        "mil_operation_count": 52265,
+        "original_direct_package_load_s": 152.32195966600557
+      },
+      {
+        "sequence_length": 4096,
+        "parameter_count": 149014272,
+        "package_logical_bytes": 332866915,
+        "package_allocated_bytes": 332877824,
+        "package_mib": 317.447,
+        "mil_operation_count": 96001,
+        "original_direct_package_load_s": 190.53357666698867
+      },
+      {
+        "sequence_length": 8192,
+        "parameter_count": 149014272,
+        "package_logical_bytes": 362794575,
+        "package_allocated_bytes": 362807296,
+        "package_mib": 345.988,
+        "mil_operation_count": 183473,
+        "original_direct_package_load_s": 735.3483105420019
+      }
+    ],
+    "package_size_ratio_8192_to_1024": 1.1680377911851003,
+    "mil_operation_ratio_8192_to_1024": 6.0358916998388,
+    "original_load_ratio_8192_to_1024": 20.00612345498081,
+    "characterization": "Parameter count is constant and package size grows only 16.8% from 1024 to 8192, so weights and raw package bytes do not explain a 20.0x load increase. Lowered operation count grows 6.0x and global attention tensor dimensions grow with sequence length. The non-smooth ladder and opaque compiler prevent a defensible single exponent, but the scaling is in graph/device specialization, not parameter count."
+  },
+  "safety": {
+    "minimum_available_preflight_bytes": 34359738368,
+    "abort_available_bytes": 17179869184,
+    "abort_wired_fraction": 0.5,
+    "abort_owned_rss_bytes": 34359738368,
+    "one_model_process_at_a_time": true,
+    "unexpected_ane_worker_detected": false,
+    "guard_abort_count": 0,
+    "limitation": "Owned RSS and system wired memory are observations; they cannot guarantee ANE allocation is bounded or prevent workstation pressure."
+  },
+  "tooling": [
+    "bench/spikes/ane-modernbert-full-context/attribute_load.py",
+    "coremltools.models.utils.compile_model for persistent .mlmodelc creation",
+    "coremltools MLModel and CompiledMLModel load timing",
+    "MLModel.load_duration_in_nano_seconds / Core ML proxy timing for MLModel loadContentsOfURL",
+    "MLComputePlan with cpuAndNeuralEngine and all configurations",
+    "run_stages.run_guarded with memory-pressure and timeout aborts",
+    "psutil process scans before and after every timed load"
+  ],
+  "production_path_observation": {
+    "source": "crates/synapse-worker-ane/swift/ane_worker.swift",
+    "stable_directory_behavior": "A directory artifact is loaded in place, preserving a reusable full path.",
+    "archive_behavior": "A file artifact is unzipped under a new synapse-ane-UUID temporary directory for each worker load.",
+    "implication": "A packaged 8192 artifact must be materialized once at a stable versioned path before worker startup; a new UUID extraction path would intentionally miss the specialization cache."
+  },
+  "campaign_target": "Do not optimize model math first. Persist the compiled 8192 .mlmodelc under a stable versioned install path and reuse that exact path and CPU_AND_NE configuration across worker starts. This turns the ANE specialization into a one-time install or first-run cost. Then target the remaining first-specialization cost only if installation cannot absorb roughly 10-12 minutes. Do not use .all as an ANE fix because 8192 placement moves to GPU."
+}
