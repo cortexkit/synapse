@@ -1,0 +1,17 @@
+[package]
+name = "ane-direct-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Deliberately outside the synapse workspace: this probe links an external
+# MIT-licensed crate from a local clone, and vendoring that path into the
+# workspace manifest would make every workspace build depend on a checkout
+# that is not part of this repository.
+[workspace]
+
+[dependencies]
+# Relative rather than absolute: this file is tracked in a public repository,
+# so an absolute path would publish the operator's home directory. The clone is
+# expected as a sibling of the CortexKit projects directory.
+ane = { path = "../../../../../../OSS/siliconswarm-at-ensue-plugin/ane_kernel/crates/ane" }

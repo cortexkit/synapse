@@ -1,12 +1,20 @@
-/target
+# Unanchored so it covers build directories of nested crates that carry their
+# own workspace, not just the root one. Their artifacts embed absolute paths
+# from the machine that built them, which is a disclosure in a public
+# repository; an anchored rule left every nested crate to be named by hand.
+target/
 bench/results/
 bench/data/*.jsonl
 .cortexkit/alfonso/task-outputs/
-crates/synapse-module/owned-decode-sidecar/target/
 
 # Local operational artifacts and private benchmark corpora are never release inputs.
 .cortexkit/
-evidence/
+# Anchored to the top level on purpose: this excludes the operator's calibration
+# records and certification policies, NOT docs/evidence, which is published
+# measurement evidence and is tracked. An unanchored rule matches at any depth,
+# which silently ignored every new file under docs/evidence while the files
+# already committed there kept working, since tracking beats ignoring.
+/evidence/
 operations/
 corpus/aft-chunks.jsonl
 .banlist.local
