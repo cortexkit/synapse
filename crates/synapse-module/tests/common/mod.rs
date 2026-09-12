@@ -36,21 +36,33 @@ pub fn unique_temp_dir(label: &str) -> PathBuf {
     std::env::temp_dir().join(format!("{label}-{}-{n}-{timestamp}", process::id()))
 }
 
-/// Give a spawned module an isolated config and singleton lease scope.
+/// Give a spawned module an isolated config, data home, and singleton lease
+/// scope.
 ///
 /// Tests that need production-like settings pass them in `config_json`; all
 /// other children receive an explicit empty config instead of consulting the
 /// operator's HOME. The lease override keeps test modules separate from the
 /// machine-wide fleet lease while preserving the production singleton policy.
+///
+/// The data home matters for a reason the config and lease overrides do not
+/// cover: a spawned module resolves its LOG file from the data home, not from
+/// its config, so without this every test run appended to the operator's live
+/// `synapse.log` and shared its rotation. Test traffic then reads as production
+/// activity in the one surface an operator consults to see what the daemon is
+/// doing, and a long run evicts real history. The store is unaffected either
+/// way because the test daemon supplies it in HELLO_ACK.
 pub fn configure_test_module_command(command: &mut Command, config_json: Option<&str>) {
     let test_root = unique_temp_dir("synapse-module-test");
     let config_path = test_root.join("synapse.jsonc");
     let lease_root = test_root.join("leases");
+    let data_home = test_root.join("data");
     std::fs::create_dir_all(&lease_root).unwrap();
+    std::fs::create_dir_all(&data_home).unwrap();
     std::fs::write(&config_path, config_json.unwrap_or("{}")).unwrap();
     command
         .env("SYNAPSE_CONFIG_PATH", config_path)
-        .env("CORTEXKIT_LEASE_ROOT", lease_root);
+        .env("CORTEXKIT_LEASE_ROOT", lease_root)
+        .env("XDG_DATA_HOME", data_home);
 }
 
 pub async fn connect_consumer(connection_file_path: &Path) -> TcpStream {
