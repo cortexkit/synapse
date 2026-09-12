@@ -6827,7 +6827,7 @@ dependencies = [
 
 [[package]]
 name = "synapse-module"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "anyhow",
  "cortexkit-lease",
@@ -6860,7 +6860,7 @@ dependencies = [
 
 [[package]]
 name = "synapse-opctl"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -6889,7 +6889,7 @@ dependencies = [
 
 [[package]]
 name = "synapse-worker-ane"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "anyhow",
  "synapse-core",
@@ -6897,7 +6897,7 @@ dependencies = [
 
 [[package]]
 name = "synapse-worker-cuda"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -6909,7 +6909,7 @@ dependencies = [
 
 [[package]]
 name = "synapse-worker-decode"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -6928,7 +6928,7 @@ dependencies = [
 
 [[package]]
 name = "synapse-worker-llama"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -6947,7 +6947,7 @@ dependencies = [
 
 [[package]]
 name = "synapse-worker-mlx"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "anyhow",
  "clap",
