@@ -16,7 +16,9 @@ certified; this is the research path beside it.
 
 ## Reference implementation
 
-Cloned locally at `~/Work/OSS/siliconswarm-at-ensue-plugin` (MIT).
+`mutable-state-inc/siliconswarm-at-ensue-plugin` on GitHub (MIT). Clone it
+wherever this machine keeps third-party checkouts; paths below are relative to
+that clone.
 
 - `skills/ane-private-api/SKILL.md` — the complete binding reference. Read this
   first and in full; it is 200 lines and replaces reading the source.
@@ -63,26 +65,57 @@ DistilBERT example does exactly this and is the reference for how.
 | QoS | `UserInteractive` is lowest latency |
 
 Treat every number here as a hypothesis to re-measure on the target chip, not
-as a constant. They were measured on other people's hardware and at least one
-(the fusion depth limit) is reported differently on different chips.
+as a constant: they were measured on other people's hardware, and the SRAM
+figures did NOT reproduce on ours — see the section below before designing
+around them.
 
-## The tradeoff that matters
+## What we measured on this hardware, and what did not hold
 
-Fusing layers cuts the per-dispatch tax, but a fused graph's weights must still
-fit under the 16 MB SRAM threshold or the whole dispatch drops to DRAM
-bandwidth — a ~300x difference. So there is an optimum fusion depth rather than
-"fuse as much as possible", and it moves with the model's per-layer weight size.
+Measured on an M5 Max under macOS 27; full numbers and method in
+`docs/evidence/ane-direct-api-m5/`. These supersede the reference table above
+where they disagree, for this chip.
 
-Work it out before writing kernels: divide the model's fp16 weight bytes by its
-layer count. GTE ModernBERT is 149M parameters, about 300 MB in fp16 across 22
-layers, so roughly 13.6 MB per layer — just under the threshold alone, and over
-it if two layers are fused.
+**Batch attention over heads. This is the single largest lever found.** A
+ModernBERT-shaped layer whose attention is built as one matmul pair per head
+costs 41 ms at 512 positions; reshaping so heads sit on the channel axis and
+issuing one matmul across all of them costs 0.79 ms, for identical arithmetic.
+53x from graph construction alone. The DistilBERT example expresses it the
+batched way, with `reshape` to `[1, heads, head_dim, seq]`, a `transpose`, one
+`matrix_multiplication`, and the inverse afterwards.
+
+**There is no SRAM cliff here.** Weights from 2 MiB to 72 MiB, well past the
+claimed 32 MB, produced a smooth monotonic curve with no discontinuity either
+side of the reported 16 MB threshold. So do not design a fusion depth around
+fitting weights into cache; that optimum does not exist on this chip.
+
+**Fusion is not the lever.** Fusing one, two and three real layers changed
+per-layer time by under 1%, because the fixed per-dispatch cost is about 0.2% of
+a 1.5 ms layer. Fusion is worth pursuing only where sequences are short enough
+that the fixed cost dominates the work.
+
+**A new sequence shape costs about 0.2 s to compile**, flat from 128 to 2048
+positions, against Core ML's 32 s at 1024 and 579 s at 8192. This is the real
+prize: shapes can be compiled at startup rather than shipped as artifacts, so a
+bucket ladder's step count stops being a cost worth designing around.
+
+**Constant-weight ops reach 4,800 to 10,500 GFLOP/s; attention reaches about
+1,000.** Anything with weights baked at compile time flies. The dynamic path,
+where both matmul operands are runtime tensors, is roughly ten times worse per
+FLOP and is where the remaining headroom is.
+
+**A faithful port lands near parity, not ahead.** Assembling those parts over
+ModernBERT's 22 layers gives about 30 ms against the shipping Core ML lane's
+25.5 ms. Reach for this path for control over shapes and packaging, not for an
+expected speedup.
 
 ## Measuring honestly
 
-`run_cached_with_stats` returns `hw_execution_time_ns`: real nanoseconds on the
-Neural Engine, excluding XPC and dispatch. Use it to separate hardware time from
-framing cost before optimizing either.
+`run_cached_with_stats` is meant to return `hw_execution_time_ns`, real
+nanoseconds on the Neural Engine excluding XPC and dispatch. It returns 0 on our
+hardware: the bindings set the statistics mask on the request after compilation
+and it appears to belong on the model before load. Until that is fixed, timing
+is wall clock and includes dispatch, so measure ratios between arms in one run
+rather than trusting an absolute figure.
 
 `run_cached` reuses the request object and saves the dispatch overhead, but the
 SAME `TensorData` objects must be passed every call — contents may change,
