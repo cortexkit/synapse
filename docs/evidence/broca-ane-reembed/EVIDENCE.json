@@ -1,0 +1,208 @@
+{
+  "status": "blocked_before_corpus_embedding",
+  "measured_at": "2026-09-12",
+  "production_boundary": {
+    "live_store_opened": false,
+    "read_only_copy_open_mode": "SQLite mode=ro, immutable=1",
+    "fingerprint_changed": false,
+    "catalog_changed": false,
+    "certification_changed": false,
+    "private_content_committed": false,
+    "private_query_content_committed": false,
+    "broca_rows_embedded": 0
+  },
+  "hardware": {
+    "machine": "Mac17,6",
+    "chip": "Apple M5 Max",
+    "physical_memory_bytes": 137438953472,
+    "macos": "27.0",
+    "macos_build": "26A5425a"
+  },
+  "toolchain": {
+    "python": "3.12.12",
+    "coremltools": "9.0",
+    "torch": "2.14.0",
+    "transformers": "5.16.1",
+    "tokenizers": "0.23.2",
+    "safetensors": "0.8.0",
+    "numpy": "2.5.3",
+    "psutil": "7.2.2",
+    "sha256": "4263ee6835e253f9ad946d9cb11ab38387e25505b6c28a43da39138dc75715a0"
+  },
+  "model": {
+    "snapshot": "e7f32e3c00f91d699e8c43b53106206bcc72bb22",
+    "model_safetensors_sha256": "3e85899d5728cb7de79781c0c3acfb91ccef9f875f1f7e0b3c9f3dd4b6a724ba",
+    "rotation": {
+      "kind": "hadamard",
+      "seed": 0,
+      "matrix_sha256": "5d2b2b0a351b6f0526314fb27f50e6d4830bf7efb6c1d60fe6964b24ea1c8f45"
+    },
+    "query_tile_size": 256,
+    "key_tile_size": 256
+  },
+  "ladder": {
+    "gate_min_cosine": 0.999,
+    "all_buckets_passed_parity": true,
+    "broca_content_used_for_parity": false,
+    "fixture_timing_is_not_a_reembed_timing_answer": true,
+    "pre_run_condition_only": {
+      "load_average_1m": 13.6171875,
+      "cpu_idle_percent": 0.2,
+      "limitation": "This sample preceded the staged run; ambient conditions were not captured beside every fixture prediction, so fixture latency is diagnostic only."
+    },
+    "buckets": [
+      {
+        "sequence_length": 1024,
+        "status": "passed",
+        "minimum_cosine": 0.9999254941940308,
+        "cosine_by_fixture_row": [
+          0.9999589920043945,
+          0.9999254941940308,
+          0.9999814033508301
+        ],
+        "torch_export_s": 34.469535166048445,
+        "coreml_conversion_s": 50.72528808307834,
+        "package_save_s": 0.12072483403608203,
+        "direct_package_load_s": 36.26123858301435,
+        "fixture_warm_predict_median_ms": 32.605874934233725,
+        "package_sha256": "a0fd7cddc58a6526b0b940d9534033e8638b5512eacc2d1b236a9b0df455f085",
+        "rebuilt_placement_inspected": true
+      },
+      {
+        "sequence_length": 2048,
+        "status": "passed",
+        "minimum_cosine": 0.9999254941940308,
+        "cosine_by_fixture_row": [
+          0.999982476234436,
+          0.9999254941940308,
+          0.9999814033508301
+        ],
+        "torch_export_s": 74.23599158402067,
+        "coreml_conversion_s": 124.3669226670172,
+        "package_save_s": 0.19904979097191244,
+        "direct_package_load_s": 89.04697962501086,
+        "fixture_warm_predict_median_ms": 102.34287497587502,
+        "package_sha256": "7a86585e45270f0a574482caa7caeadfdca3d432909d2392bbc81577b054ec3a",
+        "rebuilt_placement_inspected": true
+      },
+      {
+        "sequence_length": 4096,
+        "status": "passed",
+        "minimum_cosine": 0.9999254941940308,
+        "cosine_by_fixture_row": [
+          0.9999752044677734,
+          0.9999254941940308,
+          0.9999814033508301
+        ],
+        "torch_export_s": 156.76291812502313,
+        "coreml_conversion_s": 228.9401825419627,
+        "package_save_s": 0.30140750005375594,
+        "direct_package_load_s": 262.2177745420486,
+        "fixture_warm_predict_median_ms": 432.9629169078544,
+        "package_sha256": "c0edaeb0f77652d4dccecdb52844f1d703c558b24d9e60f34d78ceeacf150be8",
+        "rebuilt_placement_inspected": true
+      },
+      {
+        "sequence_length": 8192,
+        "status": "passed",
+        "minimum_cosine": 0.9999037981033325,
+        "cosine_by_fixture_row": [
+          0.9999037981033325,
+          0.9999254941940308,
+          0.9999814033508301
+        ],
+        "torch_export_s": 278.8789228750393,
+        "coreml_conversion_s": 745.1661107499385,
+        "package_save_s": 0.759155209059827,
+        "direct_package_load_s": 941.0013232909841,
+        "fixture_warm_predict_median_ms": 1985.8735830057412,
+        "package_sha256": "b26192a4791ad1e1a088d8e462714d9d5325f66748f894bde62f3558caa74e5d",
+        "rebuilt_placement_inspected": false,
+        "placement_note": "The staged controller was externally terminated while its separately spawned 8192 reload was active. The reload completed and wrote passing parity and determinism reports, but the controller did not launch the final placement inspection."
+      }
+    ]
+  },
+  "production_vector_check": {
+    "expected_blob_bytes": 16384,
+    "observed_blob_bytes": 16384,
+    "decoded_dtype": "little-endian float32",
+    "decoded_dimensions": 4096,
+    "all_observed_production_rows_matched_blob_size": true,
+    "limitation": "The byte arithmetic confirms dtype and dimension, not a unique model name. The store registration uses an opaque provider identity and carries no model-name provenance."
+  },
+  "corpus_identity_gate": {
+    "result": "failed",
+    "declared_row_counts": {
+      "memory": 396,
+      "commit": 1233,
+      "chunk": 543,
+      "total": 2172
+    },
+    "observed_production_vector_counts": {
+      "memory": 398,
+      "commit": 1252,
+      "chunk": 561,
+      "total": 2211
+    },
+    "chunk_reconstruction": {
+      "implementation_source": "cortexkit/magic-context@70d3945bde0feb75a24e922880791f5fe7267823",
+      "source_function": "buildCanonicalChunkTextFromFts plus chunkCanonicalText",
+      "configured_max_input_tokens": 8192,
+      "window_safety_ratio": 0.9,
+      "stored_production_windows": 561,
+      "current_windows_rebuilt_from_message_fts_rowid_map_and_message_history_fts": 545,
+      "exact_matches_by_compartment_window_bounds_and_chunk_hash": 516,
+      "stored_windows_without_an_exact_current_match": 45,
+      "current_windows_without_an_exact_stored_baseline": 29,
+      "summary_fallback_rows_in_exact_matches": 3,
+      "summary_fallback_rule": "For an empty mapped conversational span, use title plus p1; compartment content was never treated as a transcript.",
+      "identity_fields_checked": [
+        "compartment_id",
+        "production_model_id",
+        "window_index",
+        "start_ordinal",
+        "end_ordinal",
+        "chunk_hash"
+      ]
+    },
+    "decision": "No private corpus row was sent through the ladder. Running only the 516 matching chunks, substituting current text for stale vectors, or re-windowing the 545 current windows would violate the same-row requirement."
+  },
+  "reembed_duration": {
+    "status": "not_measured",
+    "answer": null,
+    "per_bucket_rows": null,
+    "per_bucket_timing": null,
+    "ambient_samples": null,
+    "reason": "The corpus identity gate failed before stable-path compilation and before the first Broca row."
+  },
+  "quality": {
+    "status": "no_candidate_numbers_published",
+    "answer": null,
+    "pure_cosine": null,
+    "hybrid": null,
+    "per_class": null,
+    "pooled_blind_judging": {
+      "status": "not_run",
+      "system_identity_stripped": null,
+      "pool_randomized": null,
+      "calibration_known_good": "not_run",
+      "calibration_deliberately_mismatched": "not_run",
+      "calibration_arms_separated": false
+    },
+    "additional_offline_baseline_gap": {
+      "production_document_vectors_present": true,
+      "production_query_vectors_present": false,
+      "query_count": 298,
+      "reason": "Pure-cosine baseline retrieval requires query vectors in the production vector space. The supplied query records contain text and metadata but no vectors, and the read-only store has no query-vector table. Calling production or sending private queries to an external provider was outside the isolation boundary."
+    }
+  },
+  "required_next_inputs": [
+    "A quiescent read-only store snapshot whose declared memory, commit, and chunk rows match the snapshot contents.",
+    "For every chunk baseline vector, canonical text whose SHA-256 equals chunk_hash at the same compartment and window identity, or an explicit frozen transcript export kept in private scratch.",
+    "Production-space query vectors for all 298 private queries, generated without touching production and stored beside the private inputs, or an approved exact offline production-embedder checkpoint and preprocessing contract."
+  ],
+  "plain_answers": {
+    "full_reembed_duration": "Not publishable from this snapshot: the same-row gate failed before corpus timing.",
+    "retrieval_quality_loss": "Not publishable: the same-row gate failed, production-space query vectors were unavailable offline, and calibration arms were therefore not run."
+  }
+}
