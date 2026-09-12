@@ -175,6 +175,34 @@ jobs:
           done
           ls -la dist/
 
+      # The oldest ck-subc whose HELLO parser accepts this build's manifest.
+      # subc-protocol 0.19 stopped sending an empty `consumes`, and a daemon
+      # below 0.17.20 requires that field, so it refuses the module at
+      # registration with nothing in the release explaining why. `ck upgrade`
+      # and `ck setup` read this floor and refuse the mismatch up front.
+      #
+      # The floor is knowledge rather than something derivable from the lock,
+      # so the protocol version it applies to is asserted here: a bump past
+      # 0.19 fails the release instead of publishing a floor nobody rechecked.
+      # One lane emits it because the asset is per-release, not per-platform.
+      - name: Emit release-manifest.json (declares the daemon floor)
+        if: matrix.name == 'linux-x64'
+        working-directory: synapse
+        shell: bash
+        run: |
+          set -euo pipefail
+          protocol=$(awk '/^name = "subc-protocol"$/{getline; gsub(/["]/,""); print $3}' Cargo.lock)
+          case "$protocol" in
+            0.19.*) ;;
+            *)
+              echo "subc-protocol is $protocol, not 0.19.x: recheck the ck-subc floor with subconscious before releasing" >&2
+              exit 1
+              ;;
+          esac
+          printf '{\n  "requires_core": "0.17.20"\n}\n' > dist/release-manifest.json
+          python3 -c "import json;d=json.load(open('dist/release-manifest.json'));assert d['requires_core']=='0.17.20',d"
+          cat dist/release-manifest.json
+
       - name: Smoke --version from the packaged zip
         working-directory: synapse
         shell: bash
