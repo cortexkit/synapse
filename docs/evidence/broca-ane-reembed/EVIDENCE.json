@@ -1,5 +1,5 @@
 {
-  "status": "blocked_before_corpus_embedding",
+  "status": "completed_second_attempt",
   "measured_at": "2026-09-12",
   "production_boundary": {
     "live_store_opened": false,
@@ -196,13 +196,187 @@
       "reason": "Pure-cosine baseline retrieval requires query vectors in the production vector space. The supplied query records contain text and metadata but no vectors, and the read-only store has no query-vector table. Calling production or sending private queries to an external provider was outside the isolation boundary."
     }
   },
-  "required_next_inputs": [
+  "first_attempt_required_next_inputs": [
     "A quiescent read-only store snapshot whose declared memory, commit, and chunk rows match the snapshot contents.",
     "For every chunk baseline vector, canonical text whose SHA-256 equals chunk_hash at the same compartment and window identity, or an explicit frozen transcript export kept in private scratch.",
     "Production-space query vectors for all 298 private queries, generated without touching production and stored beside the private inputs, or an approved exact offline production-embedder checkpoint and preprocessing contract."
   ],
+  "second_attempt": {
+    "production_boundary": {
+      "live_store_opened": false,
+      "read_only_copy_open_mode": "SQLite mode=ro, immutable=1, query_only=ON",
+      "fingerprint_changed": false,
+      "catalog_changed": false,
+      "certification_changed": false,
+      "private_content_committed": false,
+      "private_query_content_committed": false,
+      "unique_corpus_rows_embedded": 2204,
+      "timed_corpus_predictions": 6612,
+      "query_vectors_embedded_outside_timing": 298
+    },
+    "input_verification": {
+      "snapshot_sha256_matches_manifest": true,
+      "manifest_counts_match_snapshot": true,
+      "counts": {
+        "active_memories": 398,
+        "memory_vectors_across_statuses": 601,
+        "commit_vectors": 1261,
+        "chunk_vectors": 545,
+        "chunk_compartments": 436
+      },
+      "production_query_vectors": {
+        "count": 298,
+        "dimensions": 4096,
+        "all_l2_normalized": true,
+        "all_query_sha256_keys_match": true,
+        "model_identity_matches_memory_and_commit_vectors": true
+      },
+      "package_hashes_reverified": [
+        {"sequence_length": 1024, "sha256": "a0fd7cddc58a6526b0b940d9534033e8638b5512eacc2d1b236a9b0df455f085", "matched_record": true},
+        {"sequence_length": 2048, "sha256": "7a86585e45270f0a574482caa7caeadfdca3d432909d2392bbc81577b054ec3a", "matched_record": true},
+        {"sequence_length": 4096, "sha256": "c0edaeb0f77652d4dccecdb52844f1d703c558b24d9e60f34d78ceeacf150be8", "matched_record": true},
+        {"sequence_length": 8192, "sha256": "b26192a4791ad1e1a088d8e462714d9d5325f66748f894bde62f3558caa74e5d", "matched_record": true}
+      ],
+      "buckets_rebuilt": 0
+    },
+    "corpus_identity_gate": {
+      "result": "passed",
+      "implementation_source": "cortexkit/magic-context@70d3945bde0feb75a24e922880791f5fe7267823",
+      "configured_max_input_tokens": 8192,
+      "window_safety_ratio": 0.9,
+      "compartments": 436,
+      "generated_windows": 545,
+      "stored_windows": 545,
+      "exact_matches": 545,
+      "mismatches": 0,
+      "summary_fallback_exact_matches": 3,
+      "identity_fields_checked": ["compartment_id", "model_id", "window_index", "start_ordinal", "end_ordinal", "chunk_hash"]
+    },
+    "stable_compilation_and_specialization": {
+      "all_packages_compiled_once_to_stable_mlmodelc": true,
+      "stable_paths_used_for_timed_rows": [1024, 2048, 4096],
+      "sequence_8192": {
+        "stable_path_timed_rows": false,
+        "stable_load_timeout_budgets_s": [2400, 7200, 3600],
+        "each_attempt_ended_at_its_harness_timeout": true,
+        "ane_compiler_observed_progressing": true,
+        "related_jetsam_or_memorystatus_kill_in_six_hour_log": false,
+        "earlier_successful_direct_load_s": 941.0013232909841,
+        "startup_comparison_limitation": "The earlier successful load did not sample conditions throughout, so the observations do not define a controlled contention curve.",
+        "fallback": "Load the reverified package once, allow Core ML to compile and specialize internally, exclude that one-time load and warmup, and measure all rows warm in that process.",
+        "fallback_load_s_excluded": 2518.814784041955,
+        "fallback_first_predict_s_excluded": 2.5010132079478353,
+        "fallback_second_predict_s_excluded": 2.37892054207623,
+        "cold_start_claim_supported": false
+      }
+    },
+    "reembed_duration": {
+      "status": "measured",
+      "scope": "Warm CPU_AND_NE model-execution wall time for the complete retrievable corpus; database extraction, tokenization, model switching, compilation, specialization, and warmup excluded.",
+      "compute_units": "CPU_AND_NE (GPU excluded)",
+      "corpus_rows": 2204,
+      "rows_by_kind": {"memory": 398, "commit": 1261, "chunk": 545},
+      "truncated_at_model_limit_by_kind": {"memory": 0, "commit": 2, "chunk": 0},
+      "repetitions": 3,
+      "full_pass_assembly": "Each repetition is the sum of four non-overlapping model-resident bucket intervals.",
+      "full_reembed_s": {"median": 554.0650338750565, "min": 523.5557740442455, "max": 588.5179933329346, "spread": 64.96221928868908},
+      "ambient_all_intervals": {
+        "load_average_1m": {"median_of_interval_medians": 6.099609375, "observed_min": 2.2783203125, "observed_max": 29.0283203125},
+        "cpu_idle_percent": {"median_of_interval_medians": 75.25, "observed_min": 19.5, "observed_max": 92.6}
+      },
+      "buckets": [
+        {
+          "sequence_length": 1024,
+          "rows": 1777,
+          "timing_s": {"median": 58.437541209044866, "min": 58.09680354199372, "max": 59.30961150000803, "spread": 1.2128079580143094},
+          "ambient_summary": {"load_average_1m": {"median_of_interval_medians": 6.009765625, "observed_min": 5.5166015625, "observed_max": 9.65966796875}, "cpu_idle_percent": {"median_of_interval_medians": 77.2, "observed_min": 32.1, "observed_max": 86.1}},
+          "intervals": [
+            {"repetition": 1, "elapsed_s": 59.30961150000803, "load_average_1m": {"median": 8.091796875, "min": 7.111328125, "max": 9.65966796875}, "cpu_idle_percent": {"median": 73.5, "min": 32.1, "max": 82.5}, "ambient_samples_inside": 57},
+            {"repetition": 2, "elapsed_s": 58.09680354199372, "load_average_1m": {"median": 6.009765625, "min": 5.61181640625, "max": 7.111328125}, "cpu_idle_percent": {"median": 77.3, "min": 58.9, "max": 86.1}, "ambient_samples_inside": 56},
+            {"repetition": 3, "elapsed_s": 58.437541209044866, "load_average_1m": {"median": 5.8623046875, "min": 5.5166015625, "max": 6.20947265625}, "cpu_idle_percent": {"median": 77.2, "min": 55.5, "max": 81.3}, "ambient_samples_inside": 57}
+          ]
+        },
+        {
+          "sequence_length": 2048,
+          "rows": 121,
+          "timing_s": {"median": 10.134004084044136, "min": 10.12855175009463, "max": 10.374185582972132, "spread": 0.24563383287750185},
+          "ambient_summary": {"load_average_1m": {"median_of_interval_medians": 6.11474609375, "observed_min": 5.99755859375, "observed_max": 7.22412109375}, "cpu_idle_percent": {"median_of_interval_medians": 71.2, "observed_min": 59.7, "observed_max": 82.3}},
+          "intervals": [
+            {"repetition": 1, "elapsed_s": 10.374185582972132, "load_average_1m": {"median": 6.08447265625, "min": 5.99755859375, "max": 6.31787109375}, "cpu_idle_percent": {"median": 68.8, "min": 62.9, "max": 75.6}, "ambient_samples_inside": 10},
+            {"repetition": 2, "elapsed_s": 10.12855175009463, "load_average_1m": {"median": 6.2119140625, "min": 6.11474609375, "max": 6.31787109375}, "cpu_idle_percent": {"median": 77.0, "min": 59.7, "max": 82.3}, "ambient_samples_inside": 9},
+            {"repetition": 3, "elapsed_s": 10.134004084044136, "load_average_1m": {"median": 6.11474609375, "min": 6.025390625, "max": 7.22412109375}, "cpu_idle_percent": {"median": 71.2, "min": 60.3, "max": 80.1}, "ambient_samples_inside": 9}
+          ]
+        },
+        {
+          "sequence_length": 4096,
+          "rows": 130,
+          "timing_s": {"median": 41.54288354201708, "min": 41.508144708001055, "max": 42.75628716708161, "spread": 1.2481424590805545},
+          "ambient_summary": {"load_average_1m": {"median_of_interval_medians": 2.6884765625, "observed_min": 2.2783203125, "observed_max": 3.88134765625}, "cpu_idle_percent": {"median_of_interval_medians": 80.4, "observed_min": 52.1, "observed_max": 92.6}},
+          "intervals": [
+            {"repetition": 1, "elapsed_s": 41.54288354201708, "load_average_1m": {"median": 2.5107421875, "min": 2.2783203125, "max": 2.7763671875}, "cpu_idle_percent": {"median": 87.5, "min": 69.3, "max": 92.6}, "ambient_samples_inside": 32},
+            {"repetition": 2, "elapsed_s": 41.508144708001055, "load_average_1m": {"median": 2.6884765625, "min": 2.4873046875, "max": 3.2138671875}, "cpu_idle_percent": {"median": 80.4, "min": 74.4, "max": 87.5}, "ambient_samples_inside": 33},
+            {"repetition": 3, "elapsed_s": 42.75628716708161, "load_average_1m": {"median": 3.5615234375, "min": 3.2138671875, "max": 3.88134765625}, "cpu_idle_percent": {"median": 77.35, "min": 52.1, "max": 88.0}, "ambient_samples_inside": 34}
+          ]
+        },
+        {
+          "sequence_length": 8192,
+          "rows": 176,
+          "timing_s": {"median": 444.33153387496714, "min": 412.22794158407487, "max": 477.2913127079373, "spread": 65.06337112386245},
+          "ambient_summary": {"load_average_1m": {"median_of_interval_medians": 9.12353515625, "observed_min": 5.2060546875, "observed_max": 29.0283203125}, "cpu_idle_percent": {"median_of_interval_medians": 65.45, "observed_min": 19.5, "observed_max": 87.6}},
+          "direct_package_single_process_fallback": true,
+          "intervals": [
+            {"repetition": 1, "elapsed_s": 477.2913127079373, "load_average_1m": {"median": 9.196044921875, "min": 5.2060546875, "max": 29.0283203125}, "cpu_idle_percent": {"median": 60.95, "min": 32.1, "max": 87.6}, "ambient_samples_inside": 176},
+            {"repetition": 2, "elapsed_s": 444.33153387496714, "load_average_1m": {"median": 9.12353515625, "min": 6.02001953125, "max": 28.62451171875}, "cpu_idle_percent": {"median": 65.45, "min": 32.1, "max": 76.6}, "ambient_samples_inside": 176},
+            {"repetition": 3, "elapsed_s": 412.22794158407487, "load_average_1m": {"median": 8.48876953125, "min": 7.0302734375, "max": 16.40087890625}, "cpu_idle_percent": {"median": 67.35, "min": 19.5, "max": 82.0}, "ambient_samples_inside": 176}
+          ]
+        }
+      ]
+    },
+    "quality": {
+      "status": "publishable",
+      "judge": "local Qwen3.5-35B-A3B Q4_K_M, temperature 0, schema-constrained 0-3 grades",
+      "top_k": 10,
+      "binary_relevance": "grade >= 2",
+      "queries_supplied": 298,
+      "queries_judged": 275,
+      "queries_without_a_vector_bearing_requested_source": 23,
+      "protocol": {"pooled_by_stable_row_identity": true, "system_identity_stripped": true, "order_randomized": true, "each_pooled_row_judged_once_per_arm": true, "query_focused_excerpt_policy_shared": true},
+      "calibration_gate": "known-good relevance >= 0.95, mismatch relevance <= 0.01, and pairwise grade separation >= 0.95",
+      "pure_cosine": {
+        "pooled_rows": 4843,
+        "calibration": {"batches": 751, "known_good_relevant_rate": 0.9613848202396804, "mismatch_relevant_rate": 0.0, "pairwise_separation_rate": 0.9813581890812251, "passed": true},
+        "per_class": {
+          "memory": {"production_precision": 0.275092936802974, "ane_precision": 0.5023474178403756, "ane_minus_production_precision": 0.22725448103740165, "production_pooled_coverage": 0.5174825174825175, "ane_pooled_coverage": 0.7482517482517482},
+          "commit": {"production_precision": 0.2195618950585838, "ane_precision": 0.4264919941775837, "ane_minus_production_precision": 0.2069300991189999, "production_pooled_coverage": 0.40545625587958606, "ane_pooled_coverage": 0.8269049858889934},
+          "chunk": {"production_precision": 0.3855421686746988, "ane_precision": 0.4144486692015209, "ane_minus_production_precision": 0.028906500526822088, "production_pooled_coverage": 0.5303867403314917, "ane_pooled_coverage": 0.6022099447513812}
+        },
+        "overall": {
+          "production": {"precision_at_10": 0.24545454545454545, "ndcg_at_10": 0.4407030367709321, "pooled_recall_at_10": 0.4385045895462562, "mrr_at_10": 0.5355324675324675},
+          "ane": {"precision_at_10": 0.4370909090909091, "ndcg_at_10": 0.7319151589537729, "pooled_recall_at_10": 0.8142527335979718, "mrr_at_10": 0.7671688311688312},
+          "production_minus_ane_bootstrap_95_percent": {"precision_at_10": [-0.22181818181818183, -0.16217272727272733], "ndcg_at_10": [-0.3294899411860073, -0.25324758193443336], "pooled_recall_at_10": [-0.43439230384914906, -0.31923691787159053], "mrr_at_10": [-0.28203997113997115, -0.1809539321789322]}
+        }
+      },
+      "hybrid": {
+        "reason_run": "Pure cosine showed a gap.",
+        "fusion": {"semantic_weight": 0.7, "fts_weight": 0.3, "single_source_penalty": 0.8, "source_boosts": {"memory": 1.3, "commit": 1.2, "chunk": 1.275}},
+        "pooled_rows": 4762,
+        "calibration": {"batches": 741, "known_good_relevant_rate": 0.9527665317139001, "mismatch_relevant_rate": 0.0, "pairwise_separation_rate": 0.9784075573549258, "passed": true},
+        "per_class": {
+          "memory": {"production_precision": 0.22011834319526627, "ane_precision": 0.3884393063583815, "ane_minus_production_precision": 0.1683209631631152},
+          "commit": {"production_precision": 0.24229607250755286, "ane_precision": 0.4249536751080914, "ane_minus_production_precision": 0.18265760260053854},
+          "chunk": {"production_precision": 0.404, "ane_precision": 0.39473684210526316, "ane_minus_production_precision": -0.009263157894736862}
+        },
+        "overall": {
+          "production": {"precision_at_10": 0.25018181818181817, "ndcg_at_10": 0.47930511487786326, "pooled_recall_at_10": 0.4747890281719624, "mrr_at_10": 0.563062049062049},
+          "ane": {"precision_at_10": 0.41054545454545455, "ndcg_at_10": 0.7401302549118979, "pooled_recall_at_10": 0.8171032834483195, "mrr_at_10": 0.760968253968254},
+          "production_minus_ane_bootstrap_95_percent": {"precision_at_10": [-0.1912727272727273, -0.13053636363636367], "ndcg_at_10": [-0.29913753606164495, -0.22414101485565038], "pooled_recall_at_10": [-0.39620201037240677, -0.2836014490076046], "mrr_at_10": [-0.2462219696969697, -0.14846078643578647]}
+        }
+      },
+      "limitations": ["One deterministic local judge, not human editorial labels.", "Long rows used the same query-focused excerpt policy on both systems.", "Bootstrap intervals cover query resampling, not judge uncertainty."]
+    }
+  },
   "plain_answers": {
-    "full_reembed_duration": "Not publishable from this snapshot: the same-row gate failed before corpus timing.",
-    "retrieval_quality_loss": "Not publishable: the same-row gate failed, production-space query vectors were unavailable offline, and calibration arms were therefore not run."
+    "full_reembed_duration": "554.1 seconds (9 minutes 14 seconds) median warm ANE model-execution wall time for 2,204 retrievable rows; observed range 523.6 to 588.5 seconds under one-minute load averages from 2.28 to 29.03.",
+    "retrieval_quality_loss": "No loss in pure cosine: ANE precision@10 was 0.4371 versus production 0.2455, a 19.16 percentage-point gain; nDCG@10 was 0.7319 versus 0.4407. The pure-cosine ANE precision gain was 22.73 points for memory, 20.69 for commits, and 2.89 for chunks."
   }
 }
