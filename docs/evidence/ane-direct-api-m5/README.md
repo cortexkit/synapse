@@ -107,6 +107,45 @@ two and three ModernBERT layers changed per-layer time by under 1%, because the
 Fusion is worth pursuing only where the fixed cost is a large share of the work,
 which means very short sequences. At serving lengths it is noise.
 
+## A new sequence shape costs 0.2 s, not minutes
+
+This is the finding with product consequences. The Core ML lane carries one
+compiled package per bucket, each paying specialization on first load — 32 s at
+1024 positions, 579 s at 8192 — and about 275 MB on disk, because every package
+embeds its own weights.
+
+Compiling a full ModernBERT-shaped layer through the direct API took 0.20, 0.20,
+0.16, 0.19 and 0.15 s at 128, 256, 512, 1024 and 2048 positions. Flat in
+sequence length, where Core ML's cost grows superlinearly.
+
+At that price shapes stop being artifacts. A ladder can be compiled at startup
+rather than shipped, and its step count stops being a cost worth designing
+around. It also revisits the 8192 bucket, which passed parity but was shelved
+partly because of a 735 s load.
+
+Extrapolation caveat: this is one layer. A model compiles as per-layer
+executables, since the op-depth limit forbids one graph for all 22, so a whole
+model at one shape is roughly 4.4 s if compile cost is linear in layer count,
+which is untested.
+
+## Weights are not duplicated per shape, as far as process memory can tell
+
+Compiling and EXECUTING five graphs holding 22.5 MiB of distinct weights grew
+resident size by 4.8 MiB. Holding one weight set at five sequence shapes grew it
+by 0.2 to 1.3 MiB per shape after the first, rising to 6.2 MiB at 2048 — a
+pattern that tracks activation buffers, which scale with sequence, rather than
+weights, which do not.
+
+Execution matters to that claim and was added after a first attempt measured
+only compilation: a graph that never runs need not have materialized anything.
+
+The instrument is the limit here. Process resident size did not reveal the
+accelerator memory behind an earlier incident on this machine, where several
+decode workers held roughly 100 GB of kernel-wired IOAccelerator memory while
+process listings showed nothing. Neural Engine allocations may be accounted the
+same way. So this establishes that weights are not duplicated in process-visible
+memory, and settling it properly needs system-wide wired-page accounting.
+
 ## Instrumentation gap
 
 `run_cached_with_stats` returns 0 ns at every size on this machine. The bindings
@@ -125,10 +164,11 @@ says a ported model would produce correct vectors. A correctness gate against
 the existing reference is required before any of it is believed as a model.
 
 Two arms in the attribution probe report `execute failed`: four projections in
-one graph, and a single dynamic matmul. Both build graphs whose terminal tensors
-do not match the single output buffer the harness binds. That is a harness
-limitation rather than an API one, and it leaves the dynamic matmul unpriced in
-isolation.
+one graph, and a single dynamic matmul. Both build graphs with several terminal
+tensors while the harness binds one output buffer, so execution refuses them.
+That is a harness limitation rather than an API one, and it leaves the dynamic
+matmul unpriced in isolation. Chaining the projections into a single terminal
+fixes it, as the residency probe does.
 
 Everything here is one machine, one chip, one OS build. The private API is
 undocumented and can change without notice.
