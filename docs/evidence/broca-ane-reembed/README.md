@@ -75,6 +75,50 @@ Because pure cosine showed a gap, a second independently pooled and calibrated r
 
 Overall hybrid nDCG was 0.4793 for production and 0.7401 for ANE; pooled recall was 0.4748 and 0.8171 respectively. Fusion narrowed the overall precision advantage by 3.12 points but did not absorb it.
 
+## Does the advantage ride on lexical overlap?
+
+The queries are keyword bags — median six words, none of them questions — and a
+language-model judge grading a keyword bag against a document tends to reward
+surface term overlap. If the winning system also retrieves more overlapping
+rows, retrieval and judging reward the same thing and the margin is inflated.
+
+Both halves of that mechanism are present. The ANE arm's retrieved rows share
+more query terms than production's (mean query-term coverage 0.212 against
+0.131 in the pure arm), and the judge's grade correlates with overlap within
+each system (+0.575 for production, +0.418 for ANE).
+
+But the advantage does not live where that mechanism operates. Splitting judged
+rows by how much of the query's content vocabulary appears in the text the judge
+saw:
+
+| Query-term overlap | Production relevant | ANE relevant | Gap | Production rows | ANE rows |
+|---|---:|---:|---:|---:|---:|
+| none | 7.9% | 23.3% | **+15.4 pp** | 1,510 | 921 |
+| low | 31.2% | 42.6% | +11.4 pp | 648 | 780 |
+| mid | 49.2% | 56.4% | +7.2 pp | 398 | 691 |
+| high | 80.9% | 74.0% | **-6.9 pp** | 194 | 358 |
+
+The gap is widest where there is NO shared vocabulary and reverses where overlap
+is highest. An overlap artifact would do the opposite: concentrate the advantage
+in the high band, where a judge can reward surface match, and vanish in the
+none band. On rows sharing no query terms at all, the ANE arm is relevant three
+times as often. The hybrid arm shows the same shape (+13.8 points at none, -1.9
+at high).
+
+So the confound is real as a mechanism and does not explain the result. What the
+none-band numbers describe is production retrieving a large volume of rows that
+share neither vocabulary nor meaning with the query — 55% of its returned rows
+fall in that band against the ANE arm's 33%.
+
+That is consistent with the separate finding that production's query path sends
+raw keyword text to an instruction-tuned embedder with no instruction, which is
+off-recipe for that model family. Under those conditions the comparison measures
+how the two embedders degrade on this query distribution, not their relative
+quality in general. A recipe-fair re-run is the correct next measurement.
+
+The probe is `bench/spikes/ane-direct-probe/lexical_overlap_probe.py`; it reads
+private judging artifacts from scratch and emits aggregates only.
+
 ## Privacy and interpretation limits
 
 The database was opened with SQLite `mode=ro`, `immutable=1`, and `query_only=ON`. Private rows, vectors, queries, identifiers, model artifacts, and judge packets remained in scratch. This directory contains aggregate counts and metrics only.
