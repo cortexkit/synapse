@@ -89,12 +89,12 @@
 **crates/synapse-engine-owned/:**
 - Purpose: The primary in-process execution engine for Apple Silicon (macOS), hosting embedding engines, direct Metal step decode engines, ModernBERT pair reranking, and decode worker supervision.
 - Contains: Metal MPSGraph inference layers for ModernBERT, Qwen3, and MiniLM models, bucket policy v2 (`BUCKET_POLICY_VERSION = 2`) with an 18-step bounded sequence ladder up to 8192, singleton row execution shapes (`batch = 1`), eager preloading bounded to `<= 512` sequences, cache limits (`MAX_SEQUENCE_BUCKETS = 18`, `MAX_CACHED_BUCKET_SHAPES = 36`), direct Metal step decode engines (`owned-decode-engine`), ModernBERT pair reranking (`rerank_pairs`), model capability descriptor queries (`model_info`), and supervised decode worker state management and sidecar hint bank installation protocol (`owned-decode-worker`).
-- Key files: `crates/synapse-engine-owned/src/lib.rs`, `crates/synapse-engine-owned/src/runtime.rs`, `crates/synapse-engine-owned/examples/embed_bucket_probe.rs`, `crates/synapse-engine-owned/owned-decode-engine/src/lib.rs`, `crates/synapse-engine-owned/owned-decode-worker/src/lib.rs`
+- Key files: `crates/synapse-engine-owned/src/lib.rs`, `crates/synapse-engine-owned/src/runtime.rs`, `crates/synapse-engine-owned/examples/embed_bucket_probe.rs`, `crates/synapse-engine-owned/examples/long_row_probe.rs`, `crates/synapse-engine-owned/owned-decode-engine/src/lib.rs`, `crates/synapse-engine-owned/owned-decode-worker/src/lib.rs`
 
 **crates/synapse-module/:**
 - Purpose: The primary SubC service module. Handles the content-addressed model cache, durable jobs, worker hosting (offloading worker drop teardown to dedicated threads), remote provider dispatch (with class-based vault error disposition), owned decode routing, grammar compilation, approval storage and identity-based rollback (`rollback.rs`), probe certification and persistent staleness tracking (`certification_stale_since_ms`), admission telemetry counters, full per-lane capability reporting on `models.list`, dual-hash embed divergence verification (`submitted_sha256` alongside `content_sha256`), owned CUDA evidence and declared identities, and route binding.
 - Contains: SQLite store initialization, SubC `ModuleHandler` implementation, UNIX socket / Windows pipe worker spawning, remote gateway client, owned decode routing (`owned-decode-routing`), grammar compilation and DECODE scheduler (`owned-decode-grammar-scheduler`), certification gates and probes (`owned-decode-certification`), approval rollback (`rollback.rs`), contract manifests (`owned-decode-manifests`), model catalog descriptors publishing per-row ceilings `max_tokens` with source provenance `max_tokens_source`, discrete `bucket_ladder` envelopes, output dimensions, dtypes, device classes, and warm-load hints, and request-scoped semantic-sidecar hint bank normalization and per-field slotting (`owned-decode-sidecar`).
-- Key files: `crates/synapse-module/src/lib.rs`, `crates/synapse-module/src/worker_host/mod.rs`, `crates/synapse-module/src/rollback.rs`, `crates/synapse-module/src/remote/vault.rs`, `crates/synapse-module/owned-decode-routing/mod.rs`, `crates/synapse-module/owned-decode-grammar-scheduler/mod.rs`
+- Key files: `crates/synapse-module/src/lib.rs`, `crates/synapse-module/src/worker_host/mod.rs`, `crates/synapse-module/src/rollback.rs`, `crates/synapse-module/src/ane_artifact.rs`, `crates/synapse-module/src/remote/vault.rs`, `crates/synapse-module/owned-decode-routing/mod.rs`, `crates/synapse-module/owned-decode-grammar-scheduler/mod.rs`
 
 **crates/synapse-opctl/:**
 - Purpose: Command-line operator control surface driving SubC commands.
@@ -142,7 +142,7 @@
 **bench/spikes/:**
 - Purpose: Holds discrete architecture experimentation paths and new backend developments.
 - Contains: `unified-rt` (CUDA/Vulkan/M1 exact-match execution, including direct Metal step kernels, LFM2 Metal step engine, and Vulkan Qwen3 decode), `ane-minilm` (Apple Neural Engine CoreML conversion), `ane-prefill-split` (Apple Neural Engine prefill and Metal decode split measurement spike), and `ane-modernbert-full-context` (fixed-shape 8192-token ModernBERT ANE feasibility spike, query tiling, and Hadamard rotation conditioning).
-- Key files: `bench/spikes/unified-rt/src/main.rs`, `bench/spikes/unified-rt/src/vulkan_backend.rs`, `bench/spikes/unified-rt/src/cuda_backend.rs`, `bench/spikes/unified-rt/src/lfm2.rs`, `bench/spikes/unified-rt/src/lfm2_audio.rs`, `bench/spikes/unified-rt/src/lfm2_decode.rs`, `bench/spikes/unified-rt/src/qwen3_decode.rs`, `bench/spikes/unified-rt/src/qwen3_decode_vulkan.rs`, `bench/spikes/unified-rt/src/qwen3_decode_metal_step.rs`, `bench/spikes/unified-rt/src/lfm2_decode_metal_step.rs`, `bench/spikes/ane-prefill-split/src/main.rs`, `bench/spikes/ane-modernbert-full-context/spike.py`
+- Key files: `bench/spikes/unified-rt/src/main.rs`, `bench/spikes/unified-rt/src/vulkan_backend.rs`, `bench/spikes/unified-rt/src/cuda_backend.rs`, `bench/spikes/unified-rt/src/lfm2.rs`, `bench/spikes/unified-rt/src/lfm2_audio.rs`, `bench/spikes/unified-rt/src/lfm2_decode.rs`, `bench/spikes/unified-rt/src/qwen3_decode.rs`, `bench/spikes/unified-rt/src/qwen3_decode_vulkan.rs`, `bench/spikes/unified-rt/src/qwen3_decode_metal_step.rs`, `bench/spikes/unified-rt/src/lfm2_decode_metal_step.rs`, `bench/spikes/ane-prefill-split/src/main.rs`, `bench/spikes/ane-modernbert-full-context/spike.py`, `bench/spikes/ane-modernbert-full-context/compare_long_rows.py`, `bench/spikes/ane-modernbert-full-context/attribute_load.py`
 
 **bench/eval-coir/:**
 - Purpose: Hosts the CoIR retrieval and rerank quality evaluation harness.
@@ -161,7 +161,7 @@
 
 **docs/:**
 - Purpose: Stores contextual architectural studies, decision analyses, and empirical benchmark evidence.
-- Contains: Markdown documents and empirical evidence datasets under `docs/evidence/` (`owned-metal-bucket-policy-v2`, `ane-modernbert-rotation-conditioning`, `ane-modernbert-8192-latency`).
+- Contains: Markdown documents and empirical evidence datasets under `docs/evidence/` (`owned-metal-bucket-policy-v2`, `ane-modernbert-rotation-conditioning`, `ane-modernbert-8192-latency`, `ane-load-time-attribution`, `ane-vs-metal-long-rows`, `owned-ane-matched-workload`).
 - Key files: `docs/decision-1-runtime.md`, `docs/design-synapse-module.md`, `docs/wire-contract-v1.md`
 
 **evidence/:**
@@ -219,6 +219,7 @@
 - `crates/synapse-module/src/bin/timeout_worker.rs`: Shared test mock worker advertising `SYNAPSE_WORKER_EXPECTED_ENGINE` for test timeout and fallback validation.
 - `crates/synapse-worker-decode/src/bin/compile_constraint.rs`: CLI utility compiling JSON Schema grammars into wire-serializable `TokenIdJsonConstraint` structures.
 - `crates/synapse-engine-owned/examples/embed_bucket_probe.rs`: Serial, bounded owned-Metal bucket-policy probe evaluating first-use, warm latency, and parity.
+- `crates/synapse-engine-owned/examples/long_row_probe.rs`: Single-row owned-Metal long-row probe (up to 8192 tokens) recording cold-load, first-use, and warm timings with vector digests for ANE comparison.
 - `workers/ane-prefill-sidecar/Sources/AnePrefillSidecarExecutable/main.swift`: Executable entry point for the Swift/CoreML ANE prefill sidecar.
 - `bench/harness/src/main.rs`: CLI runner for corpus generation, power wrapper execution, and parity check.
 - `bench/lanes/*/src/main.rs` (Rust), `bench/lanes/mlx-minilm/main.py` (Python), `bench/lanes/ts-embed/main.mjs` (JS), `bench/lanes/potion/main.py` (Python): Main executables for each specific runtime lane.
@@ -258,6 +259,7 @@
 - `crates/synapse-module/src/worker_host/mod.rs`: Spawns and manages worker lifecycles over Unix domain sockets or Windows named pipes using a binary framing protocol.
 - `crates/synapse-module/src/lib.rs`: Full per-lane capability descriptors in `models.list` and `submitted_sha256` emission on embed query/batch results.
 - `crates/synapse-module/src/store.rs`: SQLite-backed state for content-addressed model cache, durable jobs, active attempts, profile activation epochs, and persistent `certification_stale_since_ms` tracking.
+- `crates/synapse-module/src/ane_artifact.rs`: Digest-keyed stable materialization of archived CoreML bundles (extract-once publish, digest verification, 24-hour abandoned-temp reclamation).
 - `bench/spikes/ane-modernbert-full-context/modernbert_tiled.py`: Query-tiled ModernBERT implementation preserving 22 layers, RoPE, and local/global windows with Hadamard rotation conditioning.
 - `crates/synapse-core/src/scheduler.rs`: 3-class fair-share aging scheduler for managing concurrent inference requests.
 - `crates/synapse-core/src/machine_profile.rs`: Defines `MachineProfile` hardware identity structures and static `ane_subtype` chip mapping.
