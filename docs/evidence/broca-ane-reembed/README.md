@@ -1,5 +1,17 @@
 # Broca ANE re-embed and retrieval-quality rig
 
+## Arm 2: instructed production queries
+
+### Verdict
+
+No arm-2 candidate quality numbers are publishable. The instructed production query-vector file passed its SHA-256, count, dimension, normalization, and query-identity gates. The pure-cosine retrieval then reused the unchanged corpus and ANE vectors, admitted the same 275 of 298 queries under the same source filters, and produced 4,408 rows in the blind pool.
+
+Fresh judging did not pass the predeclared calibration gate. Across 666 judging batches, the known-good item was relevant in 94.89% of batches, below the required 95%; the deliberately mismatched item was relevant in 0%, and the pairwise grade separation rate was 98.05%. Arm 1 passed the same three checks at 96.14%, 0%, and 98.14%, respectively.
+
+The gate failed before candidate metrics were computed. A 4,370-row production-style hybrid pool had already been prepared, but hybrid judging, scoring, and the lexical-overlap probe were not run: continuing would turn labels rejected by the protocol into candidate numbers. The decisive none-band comparison remains unanswered. Arm 1 measured 7.9% relevance for production and 23.3% for ANE in that band; arm 2 has no corresponding figure.
+
+No corpus or query vector was embedded, no bucket was rebuilt, and no ladder or production state was touched in this arm.
+
 ## Second-attempt verdict
 
 Both original input blockers are cleared.

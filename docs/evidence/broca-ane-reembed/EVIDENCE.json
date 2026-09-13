@@ -375,6 +375,88 @@
       "limitations": ["One deterministic local judge, not human editorial labels.", "Long rows used the same query-focused excerpt policy on both systems.", "Bootstrap intervals cover query resampling, not judge uncertainty."]
     }
   },
+  "arm_2": {
+    "status": "calibration_failed_no_candidate_numbers",
+    "measured_at": "2026-09-12",
+    "purpose": "Repeat the quality comparison with instructed production query vectors and no other protocol change.",
+    "input_verification": {
+      "production_query_vector_file_sha256": "cc645f692f269dc8c2d19eb4fd864f2598b8610d7ea1b560138cf438291a5e83",
+      "sha256_matched": true,
+      "query_instruction_sha256": "df4b2898bf22e00bacddddd489243a3f8793730e38b842ec10161cebd94d36d6",
+      "vectors": 298,
+      "dimensions": 4096,
+      "all_l2_normalized": true,
+      "all_query_sha256_keys_match": true,
+      "same_snapshot_and_manifest_reused_without_modification": true,
+      "same_ane_document_vectors_reused_without_modification": true,
+      "same_ane_query_vectors_reused_without_modification": true,
+      "corpus_rows_reembedded": 0,
+      "query_vectors_reembedded_by_ane": 0,
+      "buckets_rebuilt": 0,
+      "ladder_run": false
+    },
+    "quality": {
+      "judge": "local Qwen3.5-35B-A3B Q4_K_M, temperature 0, schema-constrained 0-3 grades",
+      "top_k": 10,
+      "binary_relevance": "grade >= 2",
+      "queries_supplied": 298,
+      "queries_judged": 275,
+      "queries_without_a_vector_bearing_requested_source": 23,
+      "protocol": {
+        "pure_cosine": true,
+        "per_invocation_source_filters_honored": true,
+        "pooled_by_stable_row_identity": true,
+        "system_identity_stripped": true,
+        "order_randomized": true,
+        "each_pure_cosine_pooled_row_judged_once": true,
+        "query_focused_excerpt_policy_shared": true,
+        "labels_reused_from_arm_1": false
+      },
+      "calibration_gate": "known-good relevance >= 0.95, mismatch relevance <= 0.01, and pairwise grade separation >= 0.95",
+      "pure_cosine": {
+        "retrieval_status": "completed",
+        "pooled_rows": 4408,
+        "judging_status": "completed_fresh",
+        "calibration": {
+          "batches": 666,
+          "known_good_grade_counts": {"0": 13, "1": 21, "2": 24, "3": 608},
+          "mismatch_grade_counts": {"0": 666, "1": 0, "2": 0, "3": 0},
+          "known_good_relevant_rate": 0.948948948948949,
+          "mismatch_relevant_rate": 0.0,
+          "pairwise_separation_rate": 0.9804804804804805,
+          "passed": false
+        },
+        "candidate_metrics": null
+      },
+      "hybrid": {
+        "retrieval_status": "completed",
+        "pooled_rows": 4370,
+        "judging_status": "not_run_after_pure_cosine_calibration_gate_failed",
+        "candidate_metrics": null
+      },
+      "lexical_overlap_probe": {
+        "status": "not_run_after_pure_cosine_calibration_gate_failed",
+        "candidate_metrics": null
+      },
+      "decisive_none_band": {
+        "arm_1": {
+          "production_relevance": 0.079,
+          "ane_relevance": 0.233
+        },
+        "arm_2": null,
+        "conclusion": "The recipe question remains unanswered because the judging calibration gate failed."
+      }
+    },
+    "production_boundary": {
+      "live_store_opened": false,
+      "fingerprint_changed": false,
+      "catalog_changed": false,
+      "certification_changed": false,
+      "private_content_committed": false,
+      "private_query_content_committed": false,
+      "timing_reported": false
+    }
+  },
   "plain_answers": {
     "full_reembed_duration": "554.1 seconds (9 minutes 14 seconds) median warm ANE model-execution wall time for 2,204 retrievable rows; observed range 523.6 to 588.5 seconds under one-minute load averages from 2.28 to 29.03.",
     "retrieval_quality_loss": "No loss in pure cosine: ANE precision@10 was 0.4371 versus production 0.2455, a 19.16 percentage-point gain; nDCG@10 was 0.7319 versus 0.4407. The pure-cosine ANE precision gain was 22.73 points for memory, 20.69 for commits, and 2.89 for chunks."
