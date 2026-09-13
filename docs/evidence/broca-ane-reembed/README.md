@@ -1,5 +1,56 @@
 # Broca ANE re-embed and retrieval-quality rig
 
+## Corrected-calibration re-judgment
+
+### Verdict: the sample-size guard refused the run
+
+The corrected literal-anchored instrument cannot support its predeclared gate on this query set. Only **38 of all 298 queries** have a qualifying real-corpus known-good row; 260 are excluded for lack of a unique literal. Among the 275 queries that can enter the vector comparison, only **36 are calibratable** and 239 are excluded. Both populations are below the required minimum of 50, so the run stopped before judging. There is no corrected calibration rate and no re-judged candidate metric for any arm.
+
+This refusal is not sensitive to where the ordinary-English boundary is drawn. As a conservative upper-bound check, treating every parsed query token as a possible literal, including ordinary words, finds only 41 qualifying queries in the full set and 38 among the retrieval-eligible set. That still cannot reach the guard.
+
+The two arm-3 input files matched their predeclared SHA-256 hashes. The guard then stopped the run before the rephrased queries were embedded through ANE, before arm-3 retrieval, and before any fresh label was requested. Existing arm-1 and arm-2 rankings and pools were left unchanged; no old label was transferred.
+
+### Decisive none-band comparison
+
+The none-band result is unavailable under the corrected instrument for all three arms. Arm 1's historical publication is shown beside the absent re-judgment rather than silently promoted to a corrected result.
+
+| Result | Production rows with no query vocabulary | Production relevance in band | ANE rows with no query vocabulary | ANE relevance in band |
+|---|---:|---:|---:|---:|
+| Arm 1, published | 54.9% | 7.9% | 33.5% | 23.3% |
+| Arm 1, corrected re-judgment | not run | not run | not run | not run |
+| Arm 2, corrected re-judgment | not run | not run | not run | not run |
+| Arm 3, corrected re-judgment | not run | not run | not run | not run |
+
+### Corrected calibration by arm
+
+The known-good selection is keyed by `part_id`, so every arm has the same 36 calibratable retrieval-eligible queries and the same 239 exclusions. A rate was not computed from a sample the protocol declared too small.
+
+| Arm | Calibration rate | Calibratable queries | Excluded for no unique literal | Result |
+|---|---:|---:|---:|---|
+| 1 | not run | 36 | 239 | sample-size guard failed |
+| 2 | not run | 36 | 239 | sample-size guard failed |
+| 3 | not run | 36 | 239 | sample-size guard failed |
+
+The literal selector parsed identifiers, paths, symbols, and hash-like tokens from each original keyword-bag query, then required an exact, case-sensitive occurrence in exactly one of the 2,204 corpus rows. When several literals qualified, it preferred hash-like IDs, then paths, structured identifiers, mixed-case identifiers, and finally non-English alphabetic tokens, with length and lexical order as deterministic tie-breakers. The selected row excerpt was fixed from the original query and keyed by `part_id`, so arm 3 could not draw a different calibration row.
+
+A literal-anchored known-good would still be among the most lexically overlapping rows in its batch. Passing this gate would show that the judge recognises real answer-shaped evidence; it would **not** show that the judge is free of overlap bias. The overlap-band table remains the only instrument for that question, and the unchanged probe was not run because no arm cleared the guard.
+
+### Headline and lever status
+
+| Pure-cosine metric | Arm 1 published, production / ANE | Arm 1 re-judged | Arm 2 re-judged | Arm 3 re-judged |
+|---|---:|---:|---:|---:|
+| Memory precision | 0.2751 / 0.5023 | not run | not run | not run |
+| Commit precision | 0.2196 / 0.4265 | not run | not run | not run |
+| Chunk precision | 0.3855 / 0.4144 | not run | not run | not run |
+| Overall precision@10 | 0.2455 / 0.4371 | not run | not run | not run |
+| Overall nDCG@10 | 0.4407 / 0.7319 | not run | not run | not run |
+| Overall pooled recall@10 | 0.4385 / 0.8143 | not run | not run | not run |
+| Overall MRR@10 | 0.5355 / 0.7672 | not run | not run | not run |
+
+The corrected hybrid headline and per-class metrics are likewise not run for any arm. Arm 1's published numbers remain historical and are not corrected-calibration results. The **recipe lever** is arm 2 minus arm 1 and is unmeasurable. The **guidance lever** is arm 3 minus arm 2—not arm 3 minus arm 1—and is also unmeasurable. Substituting the arm-3-minus-arm-1 comparison would not isolate guidance and was not done.
+
+No quality timing was collected. No corpus row was re-embedded, no bucket was rebuilt, and no ladder, catalog, fingerprint, certification record, or production state was touched.
+
 ## Arm 2: instructed production queries
 
 ### Verdict

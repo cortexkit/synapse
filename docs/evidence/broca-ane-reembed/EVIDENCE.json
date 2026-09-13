@@ -457,6 +457,135 @@
       "timing_reported": false
     }
   },
+  "corrected_calibration_rejudgment": {
+    "status": "sample_size_guard_failed_no_judging",
+    "measured_at": "2026-09-13",
+    "purpose": "Re-judge all three retrieval arms with one real-corpus, literal-anchored known-good set keyed by part_id.",
+    "input_verification": {
+      "arm_3_rephrased_queries_sha256": "4c4a2aa7b8fbacc4426d22c15a8b6d2bb12e7e720c59fbd5b9b38794830a0688",
+      "arm_3_rephrased_queries_sha256_matched": true,
+      "arm_3_instructed_production_query_vectors_sha256": "b802ceed305e8a16e499b63c00ffe46d11c2ce44ad19cb0f898fa6f545eabafe",
+      "arm_3_instructed_production_query_vectors_sha256_matched": true,
+      "same_original_query_part_ids_used_for_all_arms": true,
+      "corpus_rows_considered_for_literal_selection": 2204
+    },
+    "instrument": {
+      "known_good": "A real corpus row selected by an exact unique literal from the original keyword-bag query, with deterministic distinctiveness and tie-break ordering and the selection keyed by part_id.",
+      "mismatch": "The previously used unrelated natural-history item, unchanged.",
+      "thresholds": {
+        "known_good_relevance_minimum": 0.95,
+        "mismatch_relevance_maximum": 0.01,
+        "pairwise_grade_separation_minimum": 0.95
+      },
+      "minimum_calibratable_queries": 50,
+      "literal_match": {
+        "case_sensitive": true,
+        "requires_exact_literal_occurrence_in_exactly_one_corpus_row": true,
+        "preference_order": ["hash-like ID", "path", "structured identifier", "mixed-case identifier", "non-English alphabetic token"],
+        "tie_breakers": ["longer literal", "lexical order"]
+      },
+      "full_query_population": {
+        "queries": 298,
+        "calibratable_queries": 38,
+        "excluded_queries_no_unique_literal": 260
+      },
+      "retrieval_eligible_population": {
+        "queries": 275,
+        "calibratable_queries": 36,
+        "excluded_queries_no_unique_literal": 239
+      },
+      "all_token_upper_bound_check": {
+        "description": "Treat every parsed query token as a possible literal, including ordinary English words.",
+        "full_query_population_calibratable": 41,
+        "retrieval_eligible_population_calibratable": 38,
+        "still_below_guard": true
+      },
+      "guard_passed": false,
+      "overlap_bias_caveat": "A literal-anchored known-good remains among the most lexically overlapping rows in its batch. The gate can show recognition of real answer-shaped evidence, not freedom from overlap bias; only the overlap-band table addresses that bias."
+    },
+    "per_arm": {
+      "arm_1": {
+        "calibration_rate": null,
+        "calibratable_queries": 36,
+        "excluded_queries_no_unique_literal": 239,
+        "status": "not_run_after_sample_size_guard_failed"
+      },
+      "arm_2": {
+        "calibration_rate": null,
+        "calibratable_queries": 36,
+        "excluded_queries_no_unique_literal": 239,
+        "status": "not_run_after_sample_size_guard_failed"
+      },
+      "arm_3": {
+        "calibration_rate": null,
+        "calibratable_queries": 36,
+        "excluded_queries_no_unique_literal": 239,
+        "status": "not_run_after_sample_size_guard_failed"
+      }
+    },
+    "execution": {
+      "fresh_labels_requested": 0,
+      "labels_reused_from_previous_runs": 0,
+      "arm_1_existing_rankings_or_pools_modified": false,
+      "arm_2_existing_rankings_or_pools_modified": false,
+      "arm_3_ane_query_vectors_embedded": 0,
+      "arm_3_retrieval_run": false,
+      "hybrid_retrieval_run": false,
+      "lexical_overlap_probe_run": false,
+      "corpus_rows_reembedded": 0,
+      "buckets_rebuilt": 0,
+      "ladder_run": false,
+      "quality_timing_collected": false
+    },
+    "results": {
+      "decisive_none_band": {
+        "arm_1_rejudged": null,
+        "arm_2_rejudged": null,
+        "arm_3_rejudged": null,
+        "arm_1_published": {
+          "production_returned_row_fraction": 0.5490909090909091,
+          "production_relevance": 0.079,
+          "ane_returned_row_fraction": 0.3349090909090909,
+          "ane_relevance": 0.233
+        }
+      },
+      "pure_cosine": {"arm_1_rejudged": null, "arm_2_rejudged": null, "arm_3_rejudged": null},
+      "hybrid": {"arm_1_rejudged": null, "arm_2_rejudged": null, "arm_3_rejudged": null},
+      "arm_1_published_reference": {
+        "per_class_precision": {
+          "memory": {"production": 0.275092936802974, "ane": 0.5023474178403756},
+          "commit": {"production": 0.2195618950585838, "ane": 0.4264919941775837},
+          "chunk": {"production": 0.3855421686746988, "ane": 0.4144486692015209}
+        },
+        "overall": {
+          "production": {
+            "precision_at_10": 0.24545454545454545,
+            "ndcg_at_10": 0.4407030367709321,
+            "pooled_recall_at_10": 0.4385045895462562,
+            "mrr_at_10": 0.5355324675324675
+          },
+          "ane": {
+            "precision_at_10": 0.4370909090909091,
+            "ndcg_at_10": 0.7319151589537729,
+            "pooled_recall_at_10": 0.8142527335979718,
+            "mrr_at_10": 0.7671688311688312
+          }
+        }
+      },
+      "recipe_lever_arm_2_minus_arm_1": null,
+      "guidance_lever_arm_3_minus_arm_2": null,
+      "decision": "The corrected instrument has too few calibratable queries to support its gate. No re-judged candidate or overlap metric is publishable, and neither lever is measurable."
+    },
+    "production_boundary": {
+      "live_store_opened": false,
+      "fingerprint_changed": false,
+      "catalog_changed": false,
+      "certification_changed": false,
+      "private_content_committed": false,
+      "private_query_content_committed": false,
+      "timing_reported": false
+    }
+  },
   "plain_answers": {
     "full_reembed_duration": "554.1 seconds (9 minutes 14 seconds) median warm ANE model-execution wall time for 2,204 retrievable rows; observed range 523.6 to 588.5 seconds under one-minute load averages from 2.28 to 29.03.",
     "retrieval_quality_loss": "No loss in pure cosine: ANE precision@10 was 0.4371 versus production 0.2455, a 19.16 percentage-point gain; nDCG@10 was 0.7319 versus 0.4407. The pure-cosine ANE precision gain was 22.73 points for memory, 20.69 for commits, and 2.89 for chunks."
