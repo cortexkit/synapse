@@ -1,5 +1,175 @@
 # Broca ANE re-embed and retrieval-quality rig
 
+## Union-judged decisive run
+
+### Verdict: publishable, with a poor residual-noise control
+
+All three pure-cosine retrieval arms now read one shared set of fresh labels. The
+recipe change reverses the none-band result for production: arm 2 raises
+production relevance from **8.5% to 31.4%**, while the unchanged ANE ranking is
+exactly flat at **21.6%**. The isolated recipe lever is therefore **+22.9
+percentage points** for production. Under the guidance change, arm 3 moves
+production by **+2.1 points** and ANE by **+2.5 points** against arm 2; the gap
+changes by only **+0.4 point**, so this run does not resolve a guidance effect.
+Arm 3 minus arm 1 is not used because that comparison changes both recipe and
+guidance.
+
+**The order-sensitivity control is poor and bounds every result below.** Rejudging
+a deterministic random 10% of split union batches (101 of 1,009) after
+permuting row order gave only **59.6% exact-grade agreement and 87.1%
+binary-relevance agreement** across 690 candidate labels. Put differently, 12.9%
+of binary labels moved under order alone. The recipe delta is larger than that
+raw disagreement rate and has an unchanged-ANE control, which supports its
+direction inside this fixed instrument. The control is not a confidence interval,
+so the exact effect size remains uncertain. The 2–3 point
+guidance movements are much smaller than this noise floor and are not
+interpretable as an effect.
+
+### Inputs and one shared instrument
+
+Both arm-3 inputs passed their predeclared SHA-256 checks:
+
+- `broca-ctx-search-queries-arm3-rephrased.json`:
+  `4c4a2aa7b8fbacc4426d22c15a8b6d2bb12e7e720c59fbd5b9b38794830a0688`
+- `broca-ctx-search-query-vectors-arm3-rephrased-instructed.json`:
+  `b802ceed305e8a16e499b63c00ffe46d11c2ce44ad19cb0f898fa6f545eabafe`
+
+All 298 rephrasings were embedded through the existing 1,024-token ANE package.
+Every rephrasing fit that bucket; every 4,096-dimensional production vector and
+768-dimensional ANE vector passed its normalization and identity checks. Arm 3
+then admitted the same 275 retrieval-eligible queries and produced 4,425 rows in
+its two-system pool. Arm 1 and arm 2 rankings were reused byte-for-byte. No old
+label transferred.
+
+For each original query identity, the six top-10 lists were deduplicated by
+stable row identity and sorted by that identity. The sorted union was split into
+contiguous groups of at most eight candidate rows. This fixed rule produced
+7,107 unique per-query candidate rows in 1,009 judge batches; every candidate
+was judged exactly once. The split is a pure function of union membership, not
+of arm provenance or incidental iteration order.
+
+The judge saw the **original keyword bag** for every arm. Arm 3 retrieval alone
+used the rephrasing. Across all 298 pairs, the rephrasing drops no original term
+and adds no content term; it adds only grammatical connectives and word order,
+so either form has the same content vocabulary. The original bag was chosen
+because it is the request the agent actually issued, while the rephrasing is a
+synthetic treatment rather than ground truth. This choice costs clarity: bags
+are harder to judge than grammatical questions. That difficulty is constant
+across arms, and the poor order control above measures its residual effect. The
+unchanged lexical-overlap probe also uses the original bag for all three arms.
+
+The absolute known-good relevance gate is retired. Its item restated the query
+and therefore measured lexical credulity rather than answer recognition. For
+liveness only, the restatement remained as a relative anchor against the fixed
+mismatch: the anchor outranked the mismatch in **98.81%** of 1,009 batches,
+above the 95% threshold. The mismatch graded 0 in **1,009 of 1,009** batches, so
+its relevance rate was 0%, below the 1% ceiling.
+
+No quality timing was collected. No corpus row was re-embedded, no bucket was
+rebuilt, and no ladder, catalog, fingerprint, certification record, live store,
+or production state was touched.
+
+### Decisive none-band levels and deltas
+
+The noise bound beside this result is **59.6% exact / 87.1% binary agreement**
+under row-order permutation. Levels give context; the recipe and guidance reads
+come only from adjacent-arm deltas under the shared labels.
+
+| Result | Production rows in none band | Production relevance | ANE rows in none band | ANE relevance | ANE minus production |
+|---|---:|---:|---:|---:|---:|
+| Arm 1, published | 1,510 (54.9%) | 7.9% | 921 (33.5%) | 23.3% | +15.4 pp |
+| Arm 1, union-judged | 1,510 (54.9%) | 8.5% | 921 (33.5%) | 21.6% | +13.1 pp |
+| Arm 2, union-judged | 748 (27.2%) | 31.4% | 921 (33.5%) | 21.6% | -9.8 pp |
+| Arm 3, union-judged | 764 (27.8%) | 33.5% | 867 (31.5%) | 24.1% | -9.4 pp |
+
+| Isolated none-band lever | Production delta | ANE delta | Change in ANE-minus-production gap | Reading |
+|---|---:|---:|---:|---|
+| Recipe: arm 2 minus arm 1 | **+22.9 pp** | 0.0 pp | -22.9 pp | Large fixed-instrument reversal; the order control is not a confidence interval |
+| Guidance: arm 3 minus arm 2 | +2.1 pp | +2.5 pp | +0.4 pp | Below the measured noise floor; unresolved |
+
+### Arm 1 published beside union-judged
+
+The noise bound beside the union-judged columns is **59.6% exact / 87.1%
+binary agreement**. Arm 1's old values remain historical rather than being
+smoothed into the new instrument. They differ because the same rows are now
+graded beside rows retrieved by the other arms.
+
+| Metric | Arm 1 published, production / ANE | Arm 1 union-judged, production / ANE | Arm 2 union-judged, production / ANE | Arm 3 union-judged, production / ANE |
+|---|---:|---:|---:|---:|
+| Precision@10 | 0.2455 / 0.4371 | 0.2513 / 0.4258 | 0.5262 / 0.4258 | 0.5415 / 0.4324 |
+| nDCG@10 | 0.4407 / 0.7319 | 0.3850 / 0.5925 | 0.6849 / 0.5925 | 0.7038 / 0.6068 |
+| Pooled recall@10 | 0.4385 / 0.8143 | 0.2869 / 0.4960 | 0.6167 / 0.4960 | 0.6378 / 0.5086 |
+| MRR@10 | 0.5355 / 0.7672 | 0.5163 / 0.7501 | 0.8000 / 0.7501 | 0.8082 / 0.7850 |
+
+Arm 1's published bootstrap intervals resampled queries while treating labels as
+fixed. Labels are not fixed in practice: the earlier duplicated-row analysis
+found 81.1% binary stability, and this order control found 87.1%. Those published
+intervals are therefore too narrow and must not be read as covering judge
+uncertainty.
+
+### Union-judged precision by class
+
+The noise bound beside these class levels is **59.6% exact / 87.1% binary
+agreement**.
+
+| Arm | Class | Production precision | ANE precision | ANE minus production |
+|---|---|---:|---:|---:|
+| 1 | Memory | 24.9% | 45.1% | +20.2 pp |
+| 1 | Commit | 22.7% | 41.5% | +18.9 pp |
+| 1 | Chunk | 45.0% | 46.8% | +1.8 pp |
+| 2 | Memory | 53.2% | 45.1% | -8.1 pp |
+| 2 | Commit | 52.0% | 41.5% | -10.5 pp |
+| 2 | Chunk | 56.4% | 46.8% | -9.7 pp |
+| 3 | Memory | 54.9% | 46.7% | -8.3 pp |
+| 3 | Commit | 53.8% | 42.3% | -11.5 pp |
+| 3 | Chunk | 55.3% | 45.0% | -10.3 pp |
+
+### Unchanged lexical-overlap probe
+
+`bench/spikes/ane-direct-probe/lexical_overlap_probe.py` was run unchanged over
+all three arms, reading the shared union labels. The noise bound beside every
+band is **59.6% exact / 87.1% binary agreement**. Counts are returned rows, so a
+row retrieved by both systems appears once in each system's column.
+
+| Arm | Overlap band | Production relevant | ANE relevant | Gap | Production rows | ANE rows |
+|---|---|---:|---:|---:|---:|---:|
+| 1 | none | 8.5% | 21.6% | +13.1 pp | 1,510 | 921 |
+| 1 | low | 31.8% | 42.2% | +10.4 pp | 648 | 780 |
+| 1 | mid | 48.0% | 52.8% | +4.8 pp | 398 | 691 |
+| 1 | high | 85.1% | 77.7% | -7.4 pp | 194 | 358 |
+| 2 | none | 31.4% | 21.6% | -9.8 pp | 748 | 921 |
+| 2 | low | 51.0% | 42.2% | -8.8 pp | 784 | 780 |
+| 2 | mid | 59.9% | 52.8% | -7.1 pp | 798 | 691 |
+| 2 | high | 79.5% | 77.7% | -1.9 pp | 420 | 358 |
+| 3 | none | 33.5% | 24.1% | -9.4 pp | 764 | 867 |
+| 3 | low | 52.0% | 40.1% | -11.9 pp | 771 | 795 |
+| 3 | mid | 62.0% | 52.2% | -9.8 pp | 784 | 717 |
+| 3 | high | 80.3% | 77.4% | -2.9 pp | 431 | 371 |
+
+Mean overlap was 0.131 / 0.212 for production / ANE in arm 1, 0.241 /
+0.212 in arm 2, and 0.242 / 0.220 in arm 3. The corresponding within-system
+correlations between overlap and grade were +0.584 / +0.432, +0.380 / +0.432,
+and +0.374 / +0.416.
+
+### Pool size and arm coverage per query
+
+The noise bound for labels drawn from these pools remains **59.6% exact / 87.1%
+binary agreement**. A query's arm coverage is the share of its union retrieved
+by either system in that arm. Shares can sum above 100% because the same row can
+be covered by more than one arm.
+
+| Quantity across 275 queries | Minimum | Median | Mean | Maximum |
+|---|---:|---:|---:|---:|
+| Union pool rows | 13 | 26 | 25.84 | 37 |
+| Arm 1 coverage | 48.5% | 69.2% | 69.3% | 100.0% |
+| Arm 2 coverage | 45.2% | 61.5% | 63.2% | 92.3% |
+| Arm 3 coverage | 43.8% | 62.5% | 63.6% | 93.3% |
+
+`EVIDENCE.json` records all 275 per-query pool sizes, each arm's coverage count
+and share, and each arm's exclusive count and share. Those records are sorted by
+numeric composition and contain no query or row identity, so arm-dominated pools
+remain visible without publishing private identifiers.
+
 ## Corrected-calibration re-judgment
 
 ### Verdict: the sample-size guard refused the run
@@ -70,6 +240,10 @@ Both original input blockers are cleared.
 1. **Full retrievable-corpus re-embed duration:** **554.1 s (9 min 14 s) median** for 2,204 rows, with a 523.6–588.5 s range across three warm repetitions. This is model-execution wall time summed across the four non-overlapping, model-resident bucket intervals; it excludes database extraction, tokenization, model switching, compilation, specialization, and warmup. The 8,192 bucket dominates at 444.3 s median for 176 rows.
 2. **Quality loss against production:** **none in the pure-cosine arm.** At top 10, ANE precision was 43.71% versus 24.55% for production, a **19.16 percentage-point gain**, and ANE nDCG was 0.7319 versus 0.4407. The query-bootstrap 95% interval for production-minus-ANE precision was -22.18 to -16.22 points. Pure-cosine judged precision also favored ANE within memory, commit, and chunk strata. The production-style hybrid arm retained a 16.04-point overall ANE precision advantage; its chunk stratum was nearly tied, with production ahead by 0.93 point.
 
+That published interval resampled queries while treating labels as fixed. The
+later 81.1% duplicated-row binary stability result shows that assumption is
+false, so the interval is too narrow and does not cover judge uncertainty.
+
 These measurements do not change a production fingerprint, catalog entry, certification record, or live store.
 
 ## Second-attempt input gates
@@ -124,6 +298,10 @@ Judging batches held at most eight pooled rows plus a known-good and deliberatel
 | nDCG | 0.4407 | 0.7319 | -0.3295 to -0.2532 |
 | Pooled recall | 0.4385 | 0.8143 | -0.4344 to -0.3192 |
 | MRR | 0.5355 | 0.7672 | -0.2820 to -0.1810 |
+
+These published intervals resample queries with fixed labels. Because labels
+were only 81.1% stable in the duplicated-row comparison, every interval in the
+last column is too narrow and excludes judge uncertainty.
 
 ### Production-style hybrid arm
 
