@@ -141,8 +141,8 @@
 
 **bench/spikes/:**
 - Purpose: Holds discrete architecture experimentation paths and new backend developments.
-- Contains: `unified-rt` (CUDA/Vulkan/M1 exact-match execution, including direct Metal step kernels, LFM2 Metal step engine, and Vulkan Qwen3 decode), `ane-minilm` (Apple Neural Engine CoreML conversion), `ane-prefill-split` (Apple Neural Engine prefill and Metal decode split measurement spike), and `ane-modernbert-full-context` (fixed-shape 8192-token ModernBERT ANE feasibility spike, query tiling, and Hadamard rotation conditioning).
-- Key files: `bench/spikes/unified-rt/src/main.rs`, `bench/spikes/unified-rt/src/vulkan_backend.rs`, `bench/spikes/unified-rt/src/cuda_backend.rs`, `bench/spikes/unified-rt/src/lfm2.rs`, `bench/spikes/unified-rt/src/lfm2_audio.rs`, `bench/spikes/unified-rt/src/lfm2_decode.rs`, `bench/spikes/unified-rt/src/qwen3_decode.rs`, `bench/spikes/unified-rt/src/qwen3_decode_vulkan.rs`, `bench/spikes/unified-rt/src/qwen3_decode_metal_step.rs`, `bench/spikes/unified-rt/src/lfm2_decode_metal_step.rs`, `bench/spikes/ane-prefill-split/src/main.rs`, `bench/spikes/ane-modernbert-full-context/spike.py`, `bench/spikes/ane-modernbert-full-context/compare_long_rows.py`, `bench/spikes/ane-modernbert-full-context/attribute_load.py`
+- Contains: `unified-rt` (CUDA/Vulkan/M1 exact-match execution, including direct Metal step kernels, LFM2 Metal step engine, and Vulkan Qwen3 decode), `ane-minilm` (Apple Neural Engine CoreML conversion), `ane-prefill-split` (Apple Neural Engine prefill and Metal decode split measurement spike), `ane-modernbert-full-context` (fixed-shape 8192-token ModernBERT ANE feasibility spike, query tiling, and Hadamard rotation conditioning), and `ane-direct-probe` (private `_ANEInMemoryModel` API probes: identity-projection correctness gate, per-part ModernBERT layer attribution, SRAM/sequence scaling, per-shape compile cost, weight residency, and lexical-overlap retrieval audit; standalone workspace deliberately outside the root `Cargo.toml` members).
+- Key files: `bench/spikes/unified-rt/src/main.rs`, `bench/spikes/unified-rt/src/vulkan_backend.rs`, `bench/spikes/unified-rt/src/cuda_backend.rs`, `bench/spikes/unified-rt/src/lfm2.rs`, `bench/spikes/unified-rt/src/lfm2_audio.rs`, `bench/spikes/unified-rt/src/lfm2_decode.rs`, `bench/spikes/unified-rt/src/qwen3_decode.rs`, `bench/spikes/unified-rt/src/qwen3_decode_vulkan.rs`, `bench/spikes/unified-rt/src/qwen3_decode_metal_step.rs`, `bench/spikes/unified-rt/src/lfm2_decode_metal_step.rs`, `bench/spikes/ane-prefill-split/src/main.rs`, `bench/spikes/ane-modernbert-full-context/spike.py`, `bench/spikes/ane-modernbert-full-context/compare_long_rows.py`, `bench/spikes/ane-modernbert-full-context/attribute_load.py`, `bench/spikes/ane-direct-probe/src/main.rs`, `bench/spikes/ane-direct-probe/src/bin/modernbert_layer.rs`, `bench/spikes/ane-direct-probe/lexical_overlap_probe.py`
 
 **bench/eval-coir/:**
 - Purpose: Hosts the CoIR retrieval and rerank quality evaluation harness.
@@ -161,7 +161,7 @@
 
 **docs/:**
 - Purpose: Stores contextual architectural studies, decision analyses, and empirical benchmark evidence.
-- Contains: Markdown documents and empirical evidence datasets under `docs/evidence/` (`owned-metal-bucket-policy-v2`, `ane-modernbert-rotation-conditioning`, `ane-modernbert-8192-latency`, `ane-load-time-attribution`, `ane-vs-metal-long-rows`, `owned-ane-matched-workload`).
+- Contains: Markdown documents and empirical evidence datasets under `docs/evidence/` (`owned-metal-bucket-policy-v2`, `ane-modernbert-rotation-conditioning`, `ane-modernbert-8192-latency`, `ane-load-time-attribution`, `ane-vs-metal-long-rows`, `owned-ane-matched-workload`, `ane-direct-api-m5`, `broca-ane-reembed`).
 - Key files: `docs/decision-1-runtime.md`, `docs/design-synapse-module.md`, `docs/wire-contract-v1.md`
 
 **evidence/:**
