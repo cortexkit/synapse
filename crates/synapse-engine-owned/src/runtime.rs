@@ -97,6 +97,14 @@ pub(crate) trait ModelFamily: Send {
     fn family_name(&self) -> &'static str;
     fn output_dim(&self) -> usize;
     fn tokenizer_policy(&self) -> FamilyTokenizerPolicy;
+    fn encode_hidden(
+        &self,
+        _provider: &mut dyn KernelProvider,
+        _sequences: &[Vec<u32>],
+        _shape: BatchShape,
+    ) -> Result<crate::HiddenStates> {
+        bail!("{} does not expose token hidden states", self.family_name())
+    }
     fn supports_rerank(&self) -> bool {
         false
     }

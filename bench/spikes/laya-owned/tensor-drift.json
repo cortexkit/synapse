@@ -1,0 +1,582 @@
+{
+  "fp32": [
+    {
+      "name": "preset-email-category",
+      "encoder": {
+        "max_absolute": 0.11035513877868652,
+        "rmse": 0.0019469889394819041
+      },
+      "head": {
+        "max_absolute": 1.88153076171875,
+        "rmse": 0.1594927196313474
+      },
+      "act_logits_max_absolute": 0.63427734375
+    },
+    {
+      "name": "preset-email-is_phishing",
+      "encoder": {
+        "max_absolute": 0.0595705509185791,
+        "rmse": 0.0024944319553653607
+      },
+      "head": {
+        "max_absolute": 3.41943359375,
+        "rmse": 0.35067556373513026
+      },
+      "act_logits_max_absolute": 1.62890625
+    },
+    {
+      "name": "preset-triage-intent",
+      "encoder": {
+        "max_absolute": 0.7863454818725586,
+        "rmse": 0.00592783505697908
+      },
+      "head": {
+        "max_absolute": 14.79815673828125,
+        "rmse": 0.4991283535876537
+      },
+      "act_logits_max_absolute": 0.1884765625
+    },
+    {
+      "name": "preset-triage-frustration",
+      "encoder": {
+        "max_absolute": 0.12705612182617188,
+        "rmse": 0.0016785940258488513
+      },
+      "head": {
+        "max_absolute": 1.3367919921875,
+        "rmse": 0.10237610013942382
+      },
+      "act_logits_max_absolute": 0.399658203125
+    },
+    {
+      "name": "preset-guard-jailbreak",
+      "encoder": {
+        "max_absolute": 0.10884428024291992,
+        "rmse": 0.0027917338529058157
+      },
+      "head": {
+        "max_absolute": 1.6706085205078125,
+        "rmse": 0.10621923805701347
+      },
+      "act_logits_max_absolute": 0.1978759765625
+    },
+    {
+      "name": "preset-moderation-toxic",
+      "encoder": {
+        "max_absolute": 0.04206562042236328,
+        "rmse": 0.0012820732557333383
+      },
+      "head": {
+        "max_absolute": 1.4041748046875,
+        "rmse": 0.10003986760296059
+      },
+      "act_logits_max_absolute": 1.3310546875
+    },
+    {
+      "name": "preset-router-domain",
+      "encoder": {
+        "max_absolute": 0.08154869079589844,
+        "rmse": 0.0014417977223012755
+      },
+      "head": {
+        "max_absolute": 1.98541259765625,
+        "rmse": 0.12589715590901382
+      },
+      "act_logits_max_absolute": 0.35546875
+    },
+    {
+      "name": "preset-router-difficulty",
+      "encoder": {
+        "max_absolute": 0.065673828125,
+        "rmse": 0.0014389308257856778
+      },
+      "head": {
+        "max_absolute": 0.765899658203125,
+        "rmse": 0.09224810796703958
+      },
+      "act_logits_max_absolute": 0.1103515625
+    },
+    {
+      "name": "owned-classify-0",
+      "encoder": {
+        "max_absolute": 0.06008148193359375,
+        "rmse": 0.0015140009687926459
+      },
+      "head": {
+        "max_absolute": 1.09393310546875,
+        "rmse": 0.10858300536332695
+      },
+      "act_logits_max_absolute": 0.00439453125
+    },
+    {
+      "name": "owned-classify-1",
+      "encoder": {
+        "max_absolute": 0.059001922607421875,
+        "rmse": 0.0014909759547103094
+      },
+      "head": {
+        "max_absolute": 0.82281494140625,
+        "rmse": 0.10339838167686073
+      },
+      "act_logits_max_absolute": 0.40185546875
+    },
+    {
+      "name": "owned-classify-2",
+      "encoder": {
+        "max_absolute": 0.04520130157470703,
+        "rmse": 0.001431590278038603
+      },
+      "head": {
+        "max_absolute": 1.64849853515625,
+        "rmse": 0.11444683789934887
+      },
+      "act_logits_max_absolute": 0.2646484375
+    },
+    {
+      "name": "owned-classify-3",
+      "encoder": {
+        "max_absolute": 0.0713353157043457,
+        "rmse": 0.001531872282052037
+      },
+      "head": {
+        "max_absolute": 4.2481689453125,
+        "rmse": 0.17250934892090122
+      },
+      "act_logits_max_absolute": 0.087890625
+    },
+    {
+      "name": "owned-sufficient",
+      "encoder": {
+        "max_absolute": 0.04836463928222656,
+        "rmse": 0.001763523825180515
+      },
+      "head": {
+        "max_absolute": 0.692138671875,
+        "rmse": 0.0690246035848868
+      },
+      "act_logits_max_absolute": 0.0830078125
+    },
+    {
+      "name": "owned-insufficient",
+      "encoder": {
+        "max_absolute": 0.04695701599121094,
+        "rmse": 0.001594563651186076
+      },
+      "head": {
+        "max_absolute": 0.9019775390625,
+        "rmse": 0.10624430956968936
+      },
+      "act_logits_max_absolute": 0.466796875
+    },
+    {
+      "name": "owned-urgency-high",
+      "encoder": {
+        "max_absolute": 0.03682899475097656,
+        "rmse": 0.0013160788491764126
+      },
+      "head": {
+        "max_absolute": 0.5458984375,
+        "rmse": 0.06598984230066826
+      },
+      "act_logits_max_absolute": 0.268798828125
+    },
+    {
+      "name": "owned-urgency-low",
+      "encoder": {
+        "max_absolute": 0.06360435485839844,
+        "rmse": 0.0019596282229786643
+      },
+      "head": {
+        "max_absolute": 1.71429443359375,
+        "rmse": 0.1800314560556281
+      },
+      "act_logits_max_absolute": 5.244873046875
+    },
+    {
+      "name": "adversarial-long-state",
+      "encoder": {
+        "max_absolute": 22.465179443359375,
+        "rmse": 0.054937008128894314
+      },
+      "head": {
+        "max_absolute": 433.69219970703125,
+        "rmse": 5.182747750325276
+      },
+      "act_logits_max_absolute": 4.72412109375
+    },
+    {
+      "name": "adversarial-head-overflow",
+      "encoder": {
+        "max_absolute": 0.05935525894165039,
+        "rmse": 0.00137634920922216
+      },
+      "head": {
+        "max_absolute": 1.4388427734375,
+        "rmse": 0.0960026798768891
+      },
+      "act_logits_max_absolute": 0.5849609375
+    },
+    {
+      "name": "adversarial-twelve",
+      "encoder": {
+        "max_absolute": 0.057135581970214844,
+        "rmse": 0.0017345607674525846
+      },
+      "head": {
+        "max_absolute": 1.926177978515625,
+        "rmse": 0.20648101425790974
+      },
+      "act_logits_max_absolute": 1.51123046875
+    },
+    {
+      "name": "adversarial-unicode",
+      "encoder": {
+        "max_absolute": 0.05688762664794922,
+        "rmse": 0.0027032144863803754
+      },
+      "head": {
+        "max_absolute": 6.21600341796875,
+        "rmse": 0.6463828620536446
+      },
+      "act_logits_max_absolute": 5.9736328125
+    },
+    {
+      "name": "adversarial-empty-description",
+      "encoder": {
+        "max_absolute": 0.05098724365234375,
+        "rmse": 0.0024068722593505476
+      },
+      "head": {
+        "max_absolute": 1.32513427734375,
+        "rmse": 0.20501691921743226
+      },
+      "act_logits_max_absolute": 1.5361328125
+    },
+    {
+      "name": "adversarial-json",
+      "encoder": {
+        "max_absolute": 0.04384040832519531,
+        "rmse": 0.0012716668276496715
+      },
+      "head": {
+        "max_absolute": 0.495849609375,
+        "rmse": 0.04887718242217253
+      },
+      "act_logits_max_absolute": 0.3515625
+    },
+    {
+      "name": "adversarial-turns",
+      "encoder": {
+        "max_absolute": 0.12871170043945312,
+        "rmse": 0.003447042306980973
+      },
+      "head": {
+        "max_absolute": 4.133636474609375,
+        "rmse": 0.37307687359447317
+      },
+      "act_logits_max_absolute": 0.28955078125
+    },
+    {
+      "name": "adversarial-mask",
+      "encoder": {
+        "max_absolute": 0.052822113037109375,
+        "rmse": 0.0017501772621997922
+      },
+      "head": {
+        "max_absolute": 1.087738037109375,
+        "rmse": 0.15213586218385725
+      },
+      "act_logits_max_absolute": 0.47265625
+    }
+  ],
+  "f16_encoder": [
+    {
+      "name": "preset-email-category",
+      "encoder": {
+        "max_absolute": 0.125,
+        "rmse": 0.0020408467685798302
+      },
+      "head": {
+        "max_absolute": 2.63629150390625,
+        "rmse": 0.15777702217291925
+      },
+      "act_logits_max_absolute": 1.21435546875
+    },
+    {
+      "name": "preset-email-is_phishing",
+      "encoder": {
+        "max_absolute": 0.0625,
+        "rmse": 0.0035530780494579506
+      },
+      "head": {
+        "max_absolute": 4.8978271484375,
+        "rmse": 0.31117949071680767
+      },
+      "act_logits_max_absolute": 1.212890625
+    },
+    {
+      "name": "preset-triage-intent",
+      "encoder": {
+        "max_absolute": 0.15625,
+        "rmse": 0.002230331070299732
+      },
+      "head": {
+        "max_absolute": 2.55908203125,
+        "rmse": 0.18601345941186875
+      },
+      "act_logits_max_absolute": 1.25439453125
+    },
+    {
+      "name": "preset-triage-frustration",
+      "encoder": {
+        "max_absolute": 0.06640625,
+        "rmse": 0.002325981336784414
+      },
+      "head": {
+        "max_absolute": 1.19818115234375,
+        "rmse": 0.14569703169523698
+      },
+      "act_logits_max_absolute": 2.9072265625
+    },
+    {
+      "name": "preset-guard-jailbreak",
+      "encoder": {
+        "max_absolute": 0.18115234375,
+        "rmse": 0.0037378784246751675
+      },
+      "head": {
+        "max_absolute": 4.824493408203125,
+        "rmse": 0.31300750717390297
+      },
+      "act_logits_max_absolute": 2.27490234375
+    },
+    {
+      "name": "preset-moderation-toxic",
+      "encoder": {
+        "max_absolute": 0.056884765625,
+        "rmse": 0.0019201867441449496
+      },
+      "head": {
+        "max_absolute": 2.669036865234375,
+        "rmse": 0.16399198902817708
+      },
+      "act_logits_max_absolute": 1.93017578125
+    },
+    {
+      "name": "preset-router-domain",
+      "encoder": {
+        "max_absolute": 0.0859375,
+        "rmse": 0.0017315998552948201
+      },
+      "head": {
+        "max_absolute": 2.00836181640625,
+        "rmse": 0.14231274530225965
+      },
+      "act_logits_max_absolute": 0.0703125
+    },
+    {
+      "name": "preset-router-difficulty",
+      "encoder": {
+        "max_absolute": 0.15625,
+        "rmse": 0.00212153519709261
+      },
+      "head": {
+        "max_absolute": 1.3232421875,
+        "rmse": 0.15282615727225493
+      },
+      "act_logits_max_absolute": 0.39453125
+    },
+    {
+      "name": "owned-classify-0",
+      "encoder": {
+        "max_absolute": 0.078125,
+        "rmse": 0.00189959483291791
+      },
+      "head": {
+        "max_absolute": 2.57073974609375,
+        "rmse": 0.14975746809680882
+      },
+      "act_logits_max_absolute": 0.08349609375
+    },
+    {
+      "name": "owned-classify-1",
+      "encoder": {
+        "max_absolute": 0.09375,
+        "rmse": 0.0019774229616982384
+      },
+      "head": {
+        "max_absolute": 2.27325439453125,
+        "rmse": 0.21734276206013875
+      },
+      "act_logits_max_absolute": 0.8935546875
+    },
+    {
+      "name": "owned-classify-2",
+      "encoder": {
+        "max_absolute": 0.06640625,
+        "rmse": 0.002157041170061743
+      },
+      "head": {
+        "max_absolute": 3.04315185546875,
+        "rmse": 0.17880676684535074
+      },
+      "act_logits_max_absolute": 0.38330078125
+    },
+    {
+      "name": "owned-classify-3",
+      "encoder": {
+        "max_absolute": 0.0625,
+        "rmse": 0.0019527659029080046
+      },
+      "head": {
+        "max_absolute": 3.24249267578125,
+        "rmse": 0.15183748215356618
+      },
+      "act_logits_max_absolute": 0.02978515625
+    },
+    {
+      "name": "owned-sufficient",
+      "encoder": {
+        "max_absolute": 0.0625,
+        "rmse": 0.002574591211551865
+      },
+      "head": {
+        "max_absolute": 0.9458465576171875,
+        "rmse": 0.11859649806550539
+      },
+      "act_logits_max_absolute": 0.2724609375
+    },
+    {
+      "name": "owned-insufficient",
+      "encoder": {
+        "max_absolute": 0.0703125,
+        "rmse": 0.002299635337162695
+      },
+      "head": {
+        "max_absolute": 1.06463623046875,
+        "rmse": 0.17344781732901612
+      },
+      "act_logits_max_absolute": 1.7568359375
+    },
+    {
+      "name": "owned-urgency-high",
+      "encoder": {
+        "max_absolute": 0.0390625,
+        "rmse": 0.0015745949203129037
+      },
+      "head": {
+        "max_absolute": 1.0186767578125,
+        "rmse": 0.08963469482315582
+      },
+      "act_logits_max_absolute": 0.045166015625
+    },
+    {
+      "name": "owned-urgency-low",
+      "encoder": {
+        "max_absolute": 0.0625,
+        "rmse": 0.0022195846603610216
+      },
+      "head": {
+        "max_absolute": 1.49859619140625,
+        "rmse": 0.18658516807674558
+      },
+      "act_logits_max_absolute": 4.507080078125
+    },
+    {
+      "name": "adversarial-long-state",
+      "encoder": {
+        "max_absolute": 10.978515625,
+        "rmse": 0.041343012423397316
+      },
+      "head": {
+        "max_absolute": 254.4610595703125,
+        "rmse": 4.12312296433106
+      },
+      "act_logits_max_absolute": 1.87109375
+    },
+    {
+      "name": "adversarial-head-overflow",
+      "encoder": {
+        "max_absolute": 0.21484375,
+        "rmse": 0.0020963722739232994
+      },
+      "head": {
+        "max_absolute": 4.60943603515625,
+        "rmse": 0.21380490511664085
+      },
+      "act_logits_max_absolute": 0.34765625
+    },
+    {
+      "name": "adversarial-twelve",
+      "encoder": {
+        "max_absolute": 0.078125,
+        "rmse": 0.002042723912336418
+      },
+      "head": {
+        "max_absolute": 1.91693115234375,
+        "rmse": 0.19420315655917755
+      },
+      "act_logits_max_absolute": 0.64892578125
+    },
+    {
+      "name": "adversarial-unicode",
+      "encoder": {
+        "max_absolute": 0.158203125,
+        "rmse": 0.003006854798325353
+      },
+      "head": {
+        "max_absolute": 4.8289794921875,
+        "rmse": 0.3425044313806817
+      },
+      "act_logits_max_absolute": 3.57861328125
+    },
+    {
+      "name": "adversarial-empty-description",
+      "encoder": {
+        "max_absolute": 0.0859375,
+        "rmse": 0.002981905019390582
+      },
+      "head": {
+        "max_absolute": 1.7609024047851562,
+        "rmse": 0.21932985307201486
+      },
+      "act_logits_max_absolute": 0.2470703125
+    },
+    {
+      "name": "adversarial-json",
+      "encoder": {
+        "max_absolute": 0.0625,
+        "rmse": 0.002156853944644325
+      },
+      "head": {
+        "max_absolute": 1.035400390625,
+        "rmse": 0.1146336335029017
+      },
+      "act_logits_max_absolute": 0.68701171875
+    },
+    {
+      "name": "adversarial-turns",
+      "encoder": {
+        "max_absolute": 0.171875,
+        "rmse": 0.005273852826287263
+      },
+      "head": {
+        "max_absolute": 6.390106201171875,
+        "rmse": 0.5512302876194222
+      },
+      "act_logits_max_absolute": 0.10791015625
+    },
+    {
+      "name": "adversarial-mask",
+      "encoder": {
+        "max_absolute": 0.0625,
+        "rmse": 0.0024905265060956327
+      },
+      "head": {
+        "max_absolute": 2.10870361328125,
+        "rmse": 0.3069708404338111
+      },
+      "act_logits_max_absolute": 2.77734375
+    }
+  ]
+}
