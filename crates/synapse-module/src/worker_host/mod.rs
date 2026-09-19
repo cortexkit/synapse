@@ -1277,6 +1277,10 @@ pub struct WorkerEngine {
     /// a thread.
     runtime: Option<Runtime>,
     host: Arc<Mutex<WorkerHost>>,
+    /// How long [`Drop`] waits for the teardown thread. Always
+    /// [`TEARDOWN_BUDGET`] in production; a field only so a test can prove the
+    /// wait happens without spending the real budget to do it.
+    teardown_budget: Duration,
 }
 
 impl WorkerEngine {
@@ -1286,6 +1290,7 @@ impl WorkerEngine {
         Ok(Self {
             runtime: Some(runtime),
             host: Arc::new(Mutex::new(WorkerHost::new(config))),
+            teardown_budget: TEARDOWN_BUDGET,
         })
     }
 
@@ -1443,24 +1448,49 @@ impl WorkerEngine {
     }
 }
 
+/// How long a drop waits for its worker child to be killed and reaped.
+///
+/// `kill_current` sends a kill and awaits the child's exit, which a live worker
+/// completes in milliseconds. The budget exists so a wedged child or a held host
+/// mutex cannot stall shutdown indefinitely, not to accommodate a slow one.
+const TEARDOWN_BUDGET: Duration = Duration::from_secs(5);
+
 impl Drop for WorkerEngine {
     fn drop(&mut self) {
         let Some(runtime) = self.runtime.take() else {
             return;
         };
         let host = Arc::clone(&self.host);
+        let (finished_tx, finished) = std::sync::mpsc::sync_channel(1);
         let teardown = move || {
             if let Ok(mut host) = host.lock() {
                 let _ = runtime.block_on(host.kill_current());
             }
             drop(runtime);
+            let _ = finished_tx.send(());
         };
+        let budget = self.teardown_budget;
         if tokio::runtime::Handle::try_current().is_ok() {
             // Dropped on a thread that is driving a tokio runtime (module
             // state teardown): block_on here — or even dropping the engine
             // runtime — panics, and a panic in Drop aborts the rest of the
             // state teardown. Hand the blocking kill to a dedicated thread.
             std::thread::spawn(teardown);
+            // Then WAIT for that thread, bounded. Spawning without waiting made
+            // shutdown depend on the process outliving a thread nothing joins:
+            // on an orderly exit the kill raced `main` returning, and the child
+            // was reaped only because it independently exits on socket EOF.
+            // That backstop works and is measured, but it leaves our own
+            // teardown unobservable and reports nothing when it does not fire.
+            // The teardown thread drives its OWN runtime, so waiting here cannot
+            // deadlock against the runtime this thread is driving.
+            if finished.recv_timeout(budget).is_err() {
+                tracing::warn!(
+                    target: "synapse.worker",
+                    budget_ms = budget.as_millis() as u64,
+                    "worker teardown did not finish within its budget; the child is left to exit on socket EOF"
+                );
+            }
         } else {
             teardown();
         }
@@ -2299,6 +2329,62 @@ mod tests {
         // Directly dropping in the async context reproduces the fleet panic
         // with the old Drop; with the teardown-thread Drop it must succeed.
         drop(engine);
+    }
+
+    /// The engine must WAIT for its teardown thread, not merely start it.
+    ///
+    /// Holding the host mutex stalls teardown deterministically, which stands in
+    /// for the real stall (a wedged child that will not reap). If `Drop` returns
+    /// promptly the wait is gone, and shutdown is back to racing `main` with the
+    /// child reaped only by socket EOF. The assertion is on ELAPSED TIME rather
+    /// than on an error, because a drop that skipped the wait still succeeds.
+    #[tokio::test]
+    async fn worker_engine_drop_waits_for_its_teardown_thread() {
+        let budget = Duration::from_millis(400);
+        let mut engine =
+            WorkerEngine::new(WorkerHostConfig::new("unused-worker", std::env::temp_dir()))
+                .expect("engine constructs");
+        engine.teardown_budget = budget;
+        let host = Arc::clone(&engine.host);
+
+        let held = host.lock().expect("host mutex");
+        let started = Instant::now();
+        drop(engine);
+        let waited = started.elapsed();
+        drop(held);
+
+        assert!(
+            waited >= budget,
+            "drop returned in {waited:?} without waiting out its {budget:?} budget, so the \
+             teardown thread was started and abandoned"
+        );
+        // An upper bound as well: waiting materially past the budget would mean
+        // the bound is not doing its job either.
+        assert!(
+            waited < budget * 5,
+            "drop waited {waited:?}, far past its {budget:?} budget"
+        );
+    }
+
+    /// The companion: with nothing stalling teardown, the drop must return
+    /// quickly rather than always paying the budget. Without this, the test
+    /// above would pass over an implementation that slept unconditionally.
+    #[tokio::test]
+    async fn worker_engine_drop_returns_promptly_when_teardown_is_free() {
+        let mut engine =
+            WorkerEngine::new(WorkerHostConfig::new("unused-worker", std::env::temp_dir()))
+                .expect("engine constructs");
+        engine.teardown_budget = Duration::from_secs(30);
+
+        let started = Instant::now();
+        drop(engine);
+        let waited = started.elapsed();
+
+        assert!(
+            waited < Duration::from_secs(5),
+            "an unobstructed teardown took {waited:?}; drop is paying its budget rather than \
+             waiting for completion"
+        );
     }
 
     #[tokio::test]
