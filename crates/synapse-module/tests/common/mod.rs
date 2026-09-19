@@ -301,6 +301,30 @@ pub async fn wait_for_catalog(stream: &mut TcpStream, module_id: &str, wait: Dur
 mod tests {
     use super::*;
 
+    /// Open a directory handle that `set_times` can act on. On Windows a plain
+    /// `File::open` of a directory fails with "Access is denied" twice over:
+    /// a directory handle needs FILE_FLAG_BACKUP_SEMANTICS, which std does not
+    /// set, and writing timestamps needs FILE_WRITE_ATTRIBUTES access, which a
+    /// read-only open does not carry (the first fix opened the handle and then
+    /// failed on set_times with the same message). The sweep itself is
+    /// unaffected (it reads mtime through `metadata()`); only this test, which
+    /// ages a directory by hand, needs the handle.
+    fn open_directory_for_times(path: &std::path::Path) -> std::fs::File {
+        let mut options = std::fs::OpenOptions::new();
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+            const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+            options
+                .access_mode(FILE_WRITE_ATTRIBUTES)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+        }
+        #[cfg(not(windows))]
+        options.read(true);
+        options.open(path).unwrap()
+    }
+
     #[test]
     fn sweeps_only_stale_test_root_children() {
         let suffix = format!(
@@ -317,8 +341,7 @@ mod tests {
         }
         let old_mtime = SystemTime::now() - Duration::from_secs(25 * 60 * 60);
         for path in [&old, &outside] {
-            std::fs::File::open(path)
-                .unwrap()
+            open_directory_for_times(path)
                 .set_times(std::fs::FileTimes::new().set_modified(old_mtime))
                 .unwrap();
         }
