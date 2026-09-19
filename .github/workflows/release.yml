@@ -8,11 +8,7 @@ name: release
 #
 # Platform sets. Deliberately absent: owned-CUDA (needs an nvcc build
 # environment the hosted runners do not carry; it remains a manual CI gate
-# and joins the matrix when a CUDA build runner exists) and the MLX worker
-# (the frozen Lane-1 reference engine, not a serving lane — production Metal
-# embedding runs in-process — and its runtime loads mlx.metallib only from
-# beside the executable, which the one-binary-per-zip installer contract
-# cannot deliver).
+# and joins the matrix when a CUDA build runner exists).
 # - darwin-arm64: module + opctl + llama/ane/decode workers + the Swift ANE
 #                 worker the ane launcher execs from beside itself
 # - linux-x64:    module + opctl + llama worker

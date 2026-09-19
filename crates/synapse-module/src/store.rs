@@ -2355,13 +2355,12 @@ impl SynapseStore {
                     .clone()
                     .or_else(|| match model.engine.as_str() {
                         "ane" => Some("f16".to_string()),
-                        "mlx" => Some("bf16".to_string()),
                         "owned-cuda" => Some("f16".to_string()),
                         "ort" => Some("f32".to_string()),
                         _ => None,
                     });
                 let device_class = match model.engine.as_str() {
-                    "owned-metal" | "owned-metal-decode" | "mlx" => Some("metal".to_string()),
+                    "owned-metal" | "owned-metal-decode" => Some("metal".to_string()),
                     "ane" => Some("ane".to_string()),
                     "owned-cuda" => Some("cuda".to_string()),
                     "ort" | "llama" => Some("cpu".to_string()),

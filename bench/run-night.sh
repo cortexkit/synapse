@@ -48,7 +48,6 @@ find_snapshot() {
 fail=0
 need() { [ -e "$1" ] || { echo "MISSING: $1" >&2; fail=1; }; }
 need target/release/lane-ort-embed
-need target/release/lane-mlx
 need target/release/lane-llama
 need target/release/lane-burn
 need target/release/lane-wrap-embed
@@ -61,7 +60,6 @@ need "$POTION_PY"
 
 SNAP_ONNX=$(find_snapshot "$HOME/.cache/huggingface/hub/models--onnx-community--Qwen3-Embedding-0.6B-ONNX/snapshots/*" || true)
 SNAP_MLX_EMBED=$(find_snapshot "$HOME/.cache/huggingface/hub/models--Qwen--Qwen3-Embedding-0.6B/snapshots/*" || true)
-SNAP_MLX_MICROLLM=$(find_snapshot "$HOME/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/*" || true)
 SNAP_GGUF_EMBED=$(find_snapshot "$HOME/.cache/huggingface/hub/models--Qwen--Qwen3-Embedding-0.6B-GGUF/snapshots/*" || true)
 SNAP_GGUF_LLM=$(find_snapshot "$HOME/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B-GGUF/snapshots/*" || true)
 SNAP_MINILM=$(find_snapshot "$HOME/.cache/huggingface/hub/models--Qdrant--all-MiniLM-L6-v2-onnx/snapshots/*" || true)
@@ -76,7 +74,7 @@ SNAP_JINA=$(find_snapshot "$HOME/.cache/huggingface/hub/models--jinaai--jina-emb
 SNAP_QWEN_QUANTS=$(find_snapshot "$HOME/.cache/huggingface/hub/models--mradermacher--Qwen3-Embedding-0.6B-GGUF/snapshots/*" || true)
 SNAP_QWEN_MLX_8BIT=$(find_snapshot "$HOME/.cache/huggingface/hub/models--mlx-community--Qwen3-Embedding-0.6B-8bit/snapshots/*" || true)
 
-for v in SNAP_ONNX SNAP_MLX_EMBED SNAP_MLX_MICROLLM SNAP_GGUF_EMBED SNAP_GGUF_LLM SNAP_MINILM SNAP_MINILM_GGUF SNAP_LFM SNAP_GTE_MODERNBERT SNAP_NOMIC_MODERNBERT SNAP_NOMIC_MLX SNAP_GTE_GGUF SNAP_NOMIC_GGUF SNAP_JINA SNAP_QWEN_QUANTS SNAP_QWEN_MLX_8BIT; do
+for v in SNAP_ONNX SNAP_MLX_EMBED SNAP_GGUF_EMBED SNAP_GGUF_LLM SNAP_MINILM SNAP_MINILM_GGUF SNAP_LFM SNAP_GTE_MODERNBERT SNAP_NOMIC_MODERNBERT SNAP_NOMIC_MLX SNAP_GTE_GGUF SNAP_NOMIC_GGUF SNAP_JINA SNAP_QWEN_QUANTS SNAP_QWEN_MLX_8BIT; do
   [ -n "${!v}" ] || { echo "MISSING snapshot: $v" >&2; fail=1; }
 done
 
@@ -134,13 +132,6 @@ run ort-cpu-embed \
   --vectors-out "$RESULTS/ort-cpu-embed-vectors.jsonl" \
   --pooling last --max-length 512 \
   --model-label "Qwen3-Embedding-0.6B@onnx-fp32"
-
-run mlx-embed \
-  ./target/release/lane-mlx embed \
-  --model "$SNAP_MLX_EMBED" --tokenizer "$SNAP_MLX_EMBED/tokenizer.json" \
-  --corpus "$CORPUS" --out "$RESULTS/mlx-embed.json" \
-  --reference "$RESULTS/ort-cpu-embed-vectors.jsonl" \
-  --model-label "Qwen3-Embedding-0.6B@mlx-bf16"
 
 run llama-metal-embed \
   ./target/release/lane-llama embed --server-binary "$LLAMA_BIN" \
@@ -335,11 +326,6 @@ $BENCH parity \
   --k 10 --stride 50 > "$RESULTS/mlx-qwen-8bit-parity-report.json" || echo "mlx qwen 8bit parity report failed" >&2
 
 # --- Workload B: micro-LLM one-shots -----------------------------------------
-run mlx-microllm \
-  ./target/release/lane-mlx microllm \
-  --model "$SNAP_MLX_MICROLLM" --tokenizer "$SNAP_MLX_MICROLLM/tokenizer.json" \
-  --prompts "$PROMPTS" --out "$RESULTS/mlx-microllm.json"
-
 run llama-metal-microllm \
   ./target/release/lane-llama microllm --server-binary "$LLAMA_BIN" \
   --model "$SNAP_GGUF_LLM/Qwen3-0.6B-Q8_0.gguf" \

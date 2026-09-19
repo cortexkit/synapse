@@ -17,7 +17,6 @@
 │   │   ├── llama-inproc/   # In-process llama.cpp binding spike
 │   │   ├── llama/          # Supervised llama-server child process executor
 │   │   ├── mlx-minilm/     # Python-based MLX GPU executor for MiniLM
-│   │   ├── mlx/            # Metal-accelerated MLX GPU executor
 │   │   ├── ort-embed/      # Bounded-CPU ONNX runtime embedding runner
 │   │   ├── potion/         # Model2Vec static embedding lane (potion-code-16M)
 │   │   ├── ts-embed/       # TypeScript Bun/Node runner (Transformers.js or ORT Node)
@@ -37,8 +36,7 @@
 │   ├── synapse-worker-ane/ # Apple Neural Engine supervised worker (Swift/CoreML)
 │   ├── synapse-worker-cuda/ # Supervised owned CUDA worker binary
 │   ├── synapse-worker-decode/ # Supervised owned Metal decode worker binary (macOS)
-│   ├── synapse-worker-llama/ # llama.cpp supervised worker (GGUF)
-│   └── synapse-worker-mlx/ # Apple Silicon MLX supervised worker
+│   └── synapse-worker-llama/ # llama.cpp supervised worker (GGUF)
 ├── docs/                   # Design logs, decisions, and empirical benchmark evidence (docs/evidence/)
 ├── evidence/               # Calibration evidence records and certification policies
 ├── manifests/              # Component manifests (ane-prefill-split, semantic-sidecar-v1)
@@ -64,7 +62,7 @@
 **.cortexkit/:**
 - Purpose: Houses agent prompts, configuration setups, and historian logs.
 - Contains: Markdown prompts, ignores, and sub-directories.
-- Key files: `.cortexkit/alfonso/prompts/lane-mlx.md`, `.cortexkit/alfonso/prompts/lane-llama.md`
+- Key files: `.cortexkit/alfonso/prompts/lane-llama.md`, `.cortexkit/alfonso/prompts/ane-lane-production.md`
 
 **crates/:**
 - Purpose: Contains the production Synapse runtime, module host, and inference workers.
@@ -103,10 +101,10 @@
 
 
 **crates/synapse-worker-*/:**
-- Purpose: Specialized out-of-process inference engines built for specific hardware (ANE, MLX, llama.cpp, NVIDIA CUDA, supervised Metal decode).
+- Purpose: Specialized out-of-process inference engines built for specific hardware (ANE, llama.cpp, NVIDIA CUDA, supervised Metal decode).
 - Contains: Binaries that speak the `worker_protocol` over a local socket or named pipe, disclosing discrete sequence bucket ladders (or `None` for continuous lanes) back to the host in `WorkerResponse::Loaded` and `WorkerResponse::Pong`.
-- Key files: `crates/synapse-worker-mlx/src/main.rs`, `crates/synapse-worker-ane/src/main.rs`, `crates/synapse-worker-cuda/src/main.rs`
-- Build note: `synapse-worker-mlx` requires full Xcode with the Metal toolchain on macOS. If `xcrun` resolves to Command Line Tools only, build with `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer`; the workspace does not auto-set it.
+- Key files: `crates/synapse-worker-ane/src/main.rs`, `crates/synapse-worker-cuda/src/main.rs`, `crates/synapse-worker-llama/src/main.rs`
+- Build note: the macOS Metal crates require full Xcode with the Metal toolchain. If `xcrun` resolves to Command Line Tools only, build with `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer`; the workspace does not auto-set it.
 
 **crates/synapse-worker-cuda/:**
 - Purpose: Supervised out-of-process CUDA worker executing MiniLM, ModernBERT, and Qwen3 embedding batches over socket or pipe IPC.
@@ -152,7 +150,7 @@
 **bench/lanes/:**
 - Purpose: Groups individual workspace crates and runtime scripts that run candidate models.
 - Contains: Sub-directories for each runtime backend (Rust crates, Python venvs, Bun packages).
-- Key files: `bench/lanes/ort-embed/src/main.rs`, `bench/lanes/mlx/src/main.rs`, `bench/lanes/llama/src/main.rs`, `bench/lanes/mlx-minilm/main.py`, `bench/lanes/ts-embed/main.mjs`, `bench/lanes/potion/main.py`
+- Key files: `bench/lanes/ort-embed/src/main.rs`, `bench/lanes/llama/src/main.rs`, `bench/lanes/mlx-minilm/main.py`, `bench/lanes/ts-embed/main.mjs`, `bench/lanes/potion/main.py`
 
 **bench/results/:**
 - Purpose: Storage directory for the output log files, parity vectors, and metrics.
@@ -265,7 +263,6 @@
 - `crates/synapse-core/src/machine_profile.rs`: Defines `MachineProfile` hardware identity structures and static `ane_subtype` chip mapping.
 - `bench/harness/src/metrics.rs`: Macmon power metrics execution, parsing, and system idle gating.
 - `bench/harness/src/parity.rs`: Numerical calculation of cosine similarity, rank stability/overlap checks, and file parsing functions.
-- `bench/lanes/mlx/src/main.rs`: Qwen3 model architecture implementation and custom forward passes in MLX.
 - `bench/lanes/mlx-minilm/main.py`: Length-sorted batched MLX GPU execution for MiniLM.
 - `bench/lanes/ts-embed/main.mjs`: Transformers.js (q8/fp32) and native `onnxruntime-node` embedding logic.
 - `bench/lanes/potion/main.py`: Model2Vec static embedding lane utilizing `model2vec` (StaticModel) with `potion-code-16M`.
@@ -293,7 +290,7 @@
 
 **Files:** Snake case for Rust files (`main.rs`, `metrics.rs`) and scripts (`run-matrix.sh`).
 **Directories:** Kebab case for lane folder structures (`ort-embed`, `wrap-embed`).
-**Binaries:** The fleet convention prefixes runtime executables with `ck-` (e.g., `ck-synapse`, `ck-synapse-worker-mlx`) to group them in Activity Monitor, while preserving the un-prefixed module ID and crate names.
+**Binaries:** The fleet convention prefixes runtime executables with `ck-` (e.g., `ck-synapse`, `ck-synapse-worker-ane`) to group them in Activity Monitor, while preserving the un-prefixed module ID and crate names.
 
 ## Where to Add New Code
 

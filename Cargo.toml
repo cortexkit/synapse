@@ -7,7 +7,6 @@ members = [
     "bench/lanes/wrap-embed",
     "bench/lanes/llama",
     "bench/lanes/llama-inproc",
-    "bench/lanes/mlx",
     "bench/lanes/burn",
     "bench/spikes/unified-rt",
     "bench/lanes/candle-embed",
@@ -20,7 +19,6 @@ members = [
     "crates/synapse-opctl",
     "crates/synapse-worker-llama",
     "crates/synapse-worker-cuda",
-    "crates/synapse-worker-mlx",
     "crates/synapse-worker-ane",
     "crates/synapse-worker-decode",
 ]

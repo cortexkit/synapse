@@ -12,16 +12,16 @@ Production crates live under `crates/`:
 - `synapse-engine-ort`: in-process ONNX Runtime embedding engine (universal CPU floor).
 - `synapse-module`: SubC management surface, model cache, durable jobs, and worker host. Builds the `ck-synapse` binary (fleet `ck-*` naming convention for Activity Monitor grouping; `module_id` stays `synapse`).
 - `synapse-opctl`: operator CLI (`ck-synapse-opctl`) for catalog, probes, admission stats, approvals, and paged results over the fleet daemon.
-- `synapse-worker-llama`, `synapse-worker-mlx`, `synapse-worker-ane`, `synapse-worker-cuda`, `synapse-worker-decode`: supervised worker binaries (`ck-synapse-worker-*`) that speak the Synapse worker protocol over Unix sockets (named pipes on Windows).
+- `synapse-worker-llama`, `synapse-worker-ane`, `synapse-worker-cuda`, `synapse-worker-decode`: supervised worker binaries (`ck-synapse-worker-*`) that speak the Synapse worker protocol over Unix sockets (named pipes on Windows).
 
-### MLX / Metal build requirement
+### Metal build requirement
 
-`synapse-worker-mlx` depends on `mlx-rs`/`mlx-sys`, which need the full Xcode Metal toolchain on macOS. Command Line Tools alone can make `xcrun` fail to find `metal` or `metallib`, producing noisy CMake output from dependencies.
+`synapse-engine-owned` compiles Metal shaders and Objective-C MPSGraph drivers, which need the full Xcode Metal toolchain on macOS. Command Line Tools alone can make `xcrun` fail to find `metal` or `metallib`, producing confusing build failures.
 
-Use an explicit developer directory when building the worker or full workspace on affected hosts:
+Use an explicit developer directory when building the Metal crates or the full workspace on affected hosts:
 
 ```bash
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer cargo build -p synapse-worker-mlx
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer cargo build -p synapse-engine-owned
 ```
 
 Do not auto-set `DEVELOPER_DIR` in scripts; configure the host or invocation so Cargo uses the intended Xcode installation.

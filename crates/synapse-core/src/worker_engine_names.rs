@@ -8,8 +8,6 @@
 pub const LLAMA_ENGINE: &str = "llama";
 /// The HELLO identity announced by the llama.cpp worker.
 pub const LLAMA_WORKER_ENGINE: &str = "llama.cpp-worker";
-/// The HELLO identity announced by the MLX worker.
-pub const MLX_WORKER_ENGINE: &str = "mlx-worker";
 /// The HELLO identity announced by the Core ML/ANE worker.
 pub const ANE_WORKER_ENGINE: &str = "ane-coreml-worker";
 /// The HELLO identity announced by the owned Metal decode worker.
@@ -23,7 +21,6 @@ pub const CUDA_WORKER_ENGINE: &str = "owned-cuda";
 pub fn worker_binary_file_name(engine: &str) -> Option<&'static str> {
     match engine {
         LLAMA_ENGINE => Some("ck-synapse-worker-llama"),
-        "mlx" => Some("ck-synapse-worker-mlx"),
         "ane" => Some("ck-synapse-worker-ane"),
         CUDA_WORKER_ENGINE => Some("ck-synapse-worker-cuda"),
         DECODE_WORKER_ENGINE => Some("ck-synapse-worker-decode"),

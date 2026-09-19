@@ -25,34 +25,6 @@ struct WorkerRun {
 }
 
 #[test]
-fn mlx_worker_minilm_matches_ort_golden_when_artifacts_exist() {
-    let Some(worker_bin) = env_path("SYNAPSE_MLX_WORKER_BIN") else {
-        skip("SYNAPSE_MLX_WORKER_BIN is not set");
-        return;
-    };
-    let Some(model_path) = env_path("SYNAPSE_MLX_MINILM_SAFETENSORS") else {
-        skip("SYNAPSE_MLX_MINILM_SAFETENSORS is not set");
-        return;
-    };
-    let Some(tokenizer_path) = env_path("SYNAPSE_MINILM_TOKENIZER_JSON") else {
-        skip("SYNAPSE_MINILM_TOKENIZER_JSON is not set");
-        return;
-    };
-
-    let actual = run_embedding_worker(
-        "mlx",
-        worker_bin,
-        model_path,
-        "safetensors",
-        tokenizer_path,
-        &[("architecture", "bert")],
-    );
-    let expected = golden_items();
-    let mean = mean_pairwise_cosine(&actual.vectors, &expected);
-    assert!(mean >= 0.99, "MLX MiniLM mean cosine {mean:.6} < 0.99");
-}
-
-#[test]
 fn ane_worker_minilm_matches_ort_golden_when_artifacts_exist() {
     let Some(worker_bin) = env_path("SYNAPSE_ANE_WORKER_BIN") else {
         skip("SYNAPSE_ANE_WORKER_BIN is not set");
@@ -99,17 +71,13 @@ fn ane_worker_minilm_matches_ort_golden_when_artifacts_exist() {
 }
 
 #[test]
-fn mlx_and_ane_workers_share_crash_quarantine_path_when_available() {
-    for (label, env_key) in [
-        ("mlx", "SYNAPSE_MLX_WORKER_BIN"),
-        ("ane", "SYNAPSE_ANE_WORKER_BIN"),
-    ] {
-        let Some(worker_bin) = env_path(env_key) else {
-            skip(&format!("{env_key} is not set"));
-            continue;
-        };
-        assert_worker_crash_is_quarantined(label, worker_bin);
-    }
+fn ane_worker_crash_is_quarantined_when_available() {
+    let env_key = "SYNAPSE_ANE_WORKER_BIN";
+    let Some(worker_bin) = env_path(env_key) else {
+        skip(&format!("{env_key} is not set"));
+        return;
+    };
+    assert_worker_crash_is_quarantined("ane", worker_bin);
 }
 
 fn run_embedding_worker(

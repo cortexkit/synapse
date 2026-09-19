@@ -101,7 +101,6 @@ use synapse_core::{
     worker_binary_file_name,
     worker_engine_names::{
         ANE_WORKER_ENGINE, DECODE_WORKER_ENGINE, LLAMA_ENGINE, LLAMA_WORKER_ENGINE,
-        MLX_WORKER_ENGINE,
     },
     worker_runtime_dir_env_var, AdmissionDecision, AdmissionRequest, AliasTable, CacheGcOutcome,
     CertifiedShapeEnvelope, Clock, CudaFloorDecision, EmbedEngine, EngineError, EngineErrorStage,
@@ -1267,7 +1266,6 @@ fn dtype_for_slot(spec: &StoredModelConfig, exec_dtype: Option<String>) -> Optio
     }
     match spec.engine.as_str() {
         "ane" | ANE_WORKER_ENGINE => Some("f16".to_string()),
-        "mlx" => Some("bf16".to_string()),
         CUDA_WORKER_ENGINE => Some("f16".to_string()),
         "ort" => Some("f32".to_string()),
         _ => None,
@@ -1276,7 +1274,7 @@ fn dtype_for_slot(spec: &StoredModelConfig, exec_dtype: Option<String>) -> Optio
 
 fn device_class_for_engine(engine: &str) -> Option<String> {
     match engine {
-        "owned-metal" | "owned-metal-decode" | MLX_WORKER_ENGINE => Some("metal".to_string()),
+        "owned-metal" | "owned-metal-decode" => Some("metal".to_string()),
         "ane" | ANE_WORKER_ENGINE => Some("ane".to_string()),
         CUDA_WORKER_ENGINE | "cuda" => Some("cuda".to_string()),
         "ort" | LLAMA_ENGINE | LLAMA_WORKER_ENGINE => Some("cpu".to_string()),
@@ -1303,7 +1301,7 @@ impl ModelTask {
 
 fn execution_lane(model: &EmbeddingModel) -> &'static str {
     match model.engine_identity.engine.as_str() {
-        "owned-metal" | MLX_WORKER_ENGINE => "metal",
+        "owned-metal" => "metal",
         ANE_WORKER_ENGINE => "ane",
         CUDA_WORKER_ENGINE => "cuda",
         "ort" => "ort",
@@ -2650,7 +2648,6 @@ fn build_stored_model_config(
             Some(OwnedDType::F32) => NumericDType::F32,
             None => match engine_name {
                 LLAMA_ENGINE | "ane" => NumericDType::F16,
-                "mlx" => NumericDType::Bf16,
                 _ => NumericDType::F32,
             },
         },
@@ -2861,7 +2858,6 @@ fn canonical_engine_name(engine: &str) -> String {
         "owned-decode" | "owned_metal_decode" | "owned-metal-decode" => {
             "owned-metal-decode".to_string()
         }
-        MLX_WORKER_ENGINE => "mlx".to_string(),
         other => other.to_string(),
     }
 }
@@ -2869,7 +2865,6 @@ fn canonical_engine_name(engine: &str) -> String {
 fn default_artifact_format(engine_name: &str) -> String {
     match engine_name {
         LLAMA_ENGINE => "gguf".to_string(),
-        "mlx" => "safetensors".to_string(),
         "ane" => "mlmodelc".to_string(),
         "owned-metal" => "safetensors-package".to_string(),
         "owned-cuda" => "safetensors-package".to_string(),
@@ -2881,7 +2876,6 @@ fn default_artifact_format(engine_name: &str) -> String {
 fn default_quant(engine_name: &str) -> String {
     match engine_name {
         LLAMA_ENGINE => "f16".to_string(),
-        "mlx" => "bf16".to_string(),
         "ane" => "fp16".to_string(),
         "owned-metal" | "owned-cuda" | "owned-metal-decode" => "f16".to_string(),
         _ => "fp32".to_string(),
@@ -2895,14 +2889,6 @@ fn catalog_model_engine_identity(engine_name: &str) -> Result<EngineIdentity, Mo
             LLAMA_WORKER_ENGINE,
             "protocol-v1",
             &[("transport", worker_catalog_transport())],
-        )),
-        "mlx" => Ok(worker_catalog_identity(
-            MLX_WORKER_ENGINE,
-            "protocol-v1",
-            &[
-                ("transport", worker_catalog_transport()),
-                ("numeric_profile", "bf16-distinct"),
-            ],
         )),
         "ane" => Ok(worker_catalog_identity(
             ANE_WORKER_ENGINE,
@@ -5575,7 +5561,7 @@ fn load_catalog_model_blocking(
             },
             None,
         ),
-        LLAMA_ENGINE | "mlx" | "ane" => {
+        LLAMA_ENGINE | "ane" => {
             let (backend, loaded) = load_worker_backend_blocking(
                 &spec,
                 &artifact,
@@ -5686,7 +5672,7 @@ fn load_worker_backend_blocking(
 ) -> Result<(EmbedBackend, LoadedModel), WireOperationError> {
     use worker_host::{WorkerEngine, WorkerHostConfig};
 
-    if matches!(spec.engine.as_str(), "mlx" | "ane") && !cfg!(target_os = "macos") {
+    if spec.engine.as_str() == "ane" && !cfg!(target_os = "macos") {
         return Err(artifact_invalid_error(format!(
             "{} model '{}' is only supported on macOS",
             spec.engine, spec.model_id
@@ -14084,7 +14070,7 @@ fn lane_blocking_reason(
     );
     if worker_quarantined || failed_quarantined {
         Some("quarantined")
-    } else if !cfg!(target_os = "macos") && matches!(slot.spec.engine.as_str(), "mlx" | "ane") {
+    } else if !cfg!(target_os = "macos") && slot.spec.engine.as_str() == "ane" {
         Some("unsupported_platform")
     } else {
         Some("probe_required")
@@ -15702,7 +15688,6 @@ mod tests {
     fn catalog_identity_names_match_worker_hello_constants() {
         let expected = [
             ("llama", LLAMA_WORKER_ENGINE),
-            ("mlx", MLX_WORKER_ENGINE),
             ("ane", ANE_WORKER_ENGINE),
             ("owned-metal-decode", DECODE_WORKER_ENGINE),
             ("owned-cuda", CUDA_WORKER_ENGINE),
@@ -16644,7 +16629,6 @@ mod tests {
         assert!(engine_requires_microllm_certification("owned-metal-decode"));
         assert!(!engine_requires_microllm_certification("owned-metal"));
         assert!(!engine_requires_microllm_certification("llama"));
-        assert!(!engine_requires_microllm_certification("mlx"));
     }
 
     #[test]
@@ -17174,20 +17158,13 @@ mod tests {
     }
 
     #[test]
-    fn mlx_and_ane_catalog_identities_are_distinct_worker_profiles() {
-        let mlx = catalog_model_engine_identity("mlx").unwrap();
+    fn ane_catalog_identity_carries_the_neural_engine_placement_gate() {
         let ane = catalog_model_engine_identity("ane").unwrap();
-        assert_eq!(mlx.engine, "mlx-worker");
-        assert_eq!(
-            mlx.build_flags.get("numeric_profile").map(String::as_str),
-            Some("bf16-distinct")
-        );
         assert_eq!(ane.engine, "ane-coreml-worker");
         assert_eq!(
             ane.build_flags.get("placement_gate").map(String::as_str),
             Some("neural-engine")
         );
-        assert_ne!(mlx, ane);
     }
 
     #[test]
@@ -17326,7 +17303,7 @@ mod tests {
                 workload: "embed".to_string(),
                 numeric_profile_id: NumericProfileId("np-fast".to_string()),
                 fingerprint: Fingerprint("fp-fast".to_string()),
-                engine: MLX_WORKER_ENGINE.to_string(),
+                engine: "owned-metal".to_string(),
                 measured_at_ms: 10,
                 os_build: "24A1".to_string(),
                 module_generation: 1,

@@ -47,7 +47,6 @@ find_snapshot() {
 
 SNAP_ONNX=$HOME/.cache/huggingface/hub/models--onnx-community--Qwen3-Embedding-0.6B-ONNX/snapshots/c25a394dd583836952667c12f008335071b3f43d
 SNAP_MLX_EMBED=$(find_snapshot "$HOME/.cache/huggingface/hub/models--Qwen--Qwen3-Embedding-0.6B/snapshots/*")
-SNAP_MLX_MICROLLM=${SNAP_MLX_MICROLLM:-$(find_snapshot "$HOME/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/*" || true)}
 
 # Lane 1: ort-cpu reference (workload A)
 wait_for_idle_and_run ort-cpu-embed \
@@ -60,29 +59,9 @@ wait_for_idle_and_run ort-cpu-embed \
   --pooling last --max-length 512 \
   --model-label "Qwen3-Embedding-0.6B@onnx-fp32"
 
-# Lane 2: mlx-rs / Metal embedding (workload A)
-wait_for_idle_and_run mlx-embed \
-  ./target/release/lane-mlx embed \
-  --model "$SNAP_MLX_EMBED" \
-  --tokenizer "$SNAP_MLX_EMBED/tokenizer.json" \
-  --corpus "$CORPUS" \
-  --out "$RESULTS/mlx-embed.json" \
-  --vectors-out "$RESULTS/mlx-embed-vectors.jsonl" \
-  --reference "$RESULTS/ort-cpu-embed-vectors.jsonl" \
-  --model-label "Qwen3-Embedding-0.6B@mlx-bf16"
-
-# Lane 3: mlx-rs / Metal micro-LLM one-shot (workload B).
-# Leave SNAP_MLX_MICROLLM empty to skip until the bf16 safetensors snapshot is cached.
-if [ -n "$SNAP_MLX_MICROLLM" ]; then
-  wait_for_idle_and_run mlx-microllm \
-    ./target/release/lane-mlx microllm \
-    --model "$SNAP_MLX_MICROLLM" \
-    --tokenizer "$SNAP_MLX_MICROLLM/tokenizer.json" \
-    --prompts "$PROMPTS" \
-    --out "$RESULTS/mlx-microllm.json"
-else
-  echo "skip mlx-microllm: cache Qwen/Qwen3-0.6B bf16 safetensors and set SNAP_MLX_MICROLLM if auto-detect does not find it" >&2
-fi
+# Lanes 2 and 3 were the mlx-rs embedding and micro-LLM lanes. They were removed
+# with the MLX worker crate. SNAP_MLX_EMBED stays defined because the llama and
+# wrap lanes below still read that snapshot's tokenizer.json.
 
 SNAP_GGUF_EMBED=$(find_snapshot "$HOME/.cache/huggingface/hub/models--Qwen--Qwen3-Embedding-0.6B-GGUF/snapshots/*")
 SNAP_GGUF_LLM=$(find_snapshot "$HOME/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B-GGUF/snapshots/*")
