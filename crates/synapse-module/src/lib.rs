@@ -14795,6 +14795,27 @@ fn module_catalog_entries(state: &ModuleState) -> Vec<ModelCatalogEntry> {
                     None
                 };
 
+            // The same projection probe.report uses, so the two surfaces cannot
+            // disagree about a lane in the same second. `certified` above is
+            // evidence-for-this-machine; this is approved-to-serve, and a lane
+            // holding the first without the second refuses.
+            let (serving_admission, serving_admission_reason) =
+                if spec.engine != DECODE_WORKER_ENGINE {
+                    (None, None)
+                } else {
+                    match state
+                        .store
+                        .get_approval(&spec.model_id, &certification_fingerprint.0)
+                    {
+                        Ok(approval) => serving_admission_projection(
+                            true,
+                            certified.unwrap_or(false),
+                            approval.map(|approval| (approval.enabled, approval.disabled_reason)),
+                        ),
+                        Err(_) => (Some("disabled"), Some("approval_unavailable".to_string())),
+                    }
+                };
+
             let warm_load_cost_hint_ms = last_cold_load_ms.or_else(|| {
                 state
                     .store
@@ -14819,6 +14840,8 @@ fn module_catalog_entries(state: &ModuleState) -> Vec<ModelCatalogEntry> {
                 dtype,
                 device_class,
                 certified,
+                serving_admission: serving_admission.map(str::to_string),
+                serving_admission_reason,
                 warm_load_cost_hint_ms,
             }
         })
@@ -17991,6 +18014,120 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// The projection must actually reach the descriptor. The unit test above
+    /// pins the projection and the serialization; neither notices if
+    /// `module_catalog_entries` stops wiring them together, which is the one
+    /// edit that would silently restore the original defect.
+    #[test]
+    fn module_catalog_entries_wire_serving_admission_for_decode_lanes() {
+        let (storage_dir, descriptor) = test_storage_descriptor("catalog-serving-admission");
+        let store = Arc::new(SynapseStore::open(&descriptor).expect("store opens"));
+        let profile = test_machine_profile("test-os");
+        store
+            .activate_profile(&profile, 1, 1000)
+            .expect("activate profile");
+        let state = test_module_state(store, profile);
+        let _ = &storage_dir;
+
+        let mut decode_spec = stuck_model_spec();
+        decode_spec.model_id = "test-decode-lane".to_string();
+        decode_spec.engine = DECODE_WORKER_ENGINE.to_string();
+        decode_spec.task = "generate".to_string();
+        decode_spec.fingerprint = Fingerprint("d".repeat(64));
+
+        {
+            let mut catalog = state.runtime.catalog.lock().expect("catalog locks");
+            catalog.clear();
+            catalog.insert(
+                decode_spec.model_id.clone(),
+                ModelSlot {
+                    spec: decode_spec.clone(),
+                    loaded: None,
+                    state: ModelRuntimeState::Unloaded,
+                    notify: Arc::new(Notify::new()),
+                    last_cold_load_ms: None,
+                },
+            );
+        }
+
+        let entries = module_catalog_entries(&state);
+        let row = entries
+            .iter()
+            .find(|entry| entry.model_id == "test-decode-lane")
+            .expect("the decode lane appears in the catalog");
+
+        // No approval row was written, so the lane refuses; the descriptor must
+        // say so rather than leaving a consumer with `certified` alone.
+        assert_eq!(
+            row.serving_admission.as_deref(),
+            Some("disabled"),
+            "a decode lane with no approval must report disabled: {row:?}"
+        );
+        assert_eq!(
+            row.serving_admission_reason.as_deref(),
+            Some("approval_absent")
+        );
+    }
+
+    /// `models.list` must carry the approval fact, not only the certification
+    /// fact. A decode lane can be certified for this machine and still refuse
+    /// every request because no operator approved it, and before this field the
+    /// only thing the descriptor said about that lane was `certified: true` --
+    /// so a consumer picking a lane read a lane that refuses as ready.
+    ///
+    /// Asserts BOTH rows rather than one: the disabled lane must say disabled
+    /// while still reporting `certified: true` (otherwise the fix would be
+    /// indistinguishable from making `certified` mean serving), and the enabled
+    /// lane must say enabled (otherwise a field stuck at "disabled" would pass).
+    #[test]
+    fn models_list_reports_serving_admission_beside_certified() {
+        let approved = serving_admission_projection(true, true, Some((true, None)));
+        assert_eq!(approved, (Some("enabled"), None));
+
+        let certified_but_unapproved = serving_admission_projection(true, true, None);
+        assert_eq!(
+            certified_but_unapproved,
+            (Some("disabled"), Some("approval_absent".to_string())),
+            "a certified lane with no approval row must read disabled, because it refuses"
+        );
+
+        let approved_but_uncertified =
+            serving_admission_projection(true, false, Some((true, None)));
+        assert_eq!(
+            approved_but_uncertified,
+            (Some("disabled"), Some("not_certified".to_string()))
+        );
+
+        // A lane class with no approval concept omits the field rather than
+        // defaulting it, so absence can never be read as "enabled".
+        assert_eq!(
+            serving_admission_projection(false, true, Some((true, None))),
+            (None, None)
+        );
+
+        // And the descriptor must actually serialize what the projection says.
+        let entry = ModelCatalogEntry {
+            model_id: "owned-model".to_string(),
+            state: "unloaded".to_string(),
+            fingerprints: vec![Fingerprint("f".repeat(64))],
+            recommended_batch: None,
+            max_tokens: Some(512),
+            max_tokens_source: Some("catalog".to_string()),
+            bucket_ladder: None,
+            dims: None,
+            dtype: None,
+            device_class: None,
+            certified: Some(true),
+            serving_admission: certified_but_unapproved.0.map(str::to_string),
+            serving_admission_reason: certified_but_unapproved.1.clone(),
+            warm_load_cost_hint_ms: None,
+        };
+        let value = serde_json::to_value(&entry).expect("entry serializes");
+        assert_eq!(value["certified"], json!(true));
+        assert_eq!(value["serving_admission"], json!("disabled"));
+        assert_eq!(value["serving_admission_reason"], json!("approval_absent"));
     }
 
     #[test]

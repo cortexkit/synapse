@@ -869,6 +869,20 @@ pub struct ModelCatalogEntry {
     pub device_class: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub certified: Option<bool>,
+    /// Whether this lane is approved to take traffic: `"enabled"` or
+    /// `"disabled"`, omitted for lane classes with no approval concept.
+    ///
+    /// Separate from `certified` because they are separate facts and a lane can
+    /// hold one without the other. `certified` says evidence exists for this
+    /// machine; this says an operator approved serving. A lane that is certified
+    /// and unapproved refuses, which is why a consumer choosing where to send
+    /// traffic wants this field rather than `certified`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serving_admission: Option<String>,
+    /// Why `serving_admission` is `"disabled"`; absent when it is enabled or
+    /// when the lane has no approval concept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serving_admission_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warm_load_cost_hint_ms: Option<f64>,
 }
@@ -2383,6 +2397,12 @@ impl SynapseStore {
                     dtype,
                     device_class,
                     certified,
+                    // This store-side listing has no approval reader; the
+                    // module's catalog path supplies serving_admission where it
+                    // is meaningful. Omitted rather than defaulted, so a
+                    // consumer cannot read absence as "enabled".
+                    serving_admission: None,
+                    serving_admission_reason: None,
                     warm_load_cost_hint_ms: None,
                 }
             })

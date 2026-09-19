@@ -137,13 +137,23 @@ The management registry in this snapshot is `embed.query`, `embed.batch`,
     reported by the loaded model or declared by a remote profile; omitted when unknown.
   - `dtype` (string, e.g. `"f16"`, `"f32"`, `"bf16"`) — numeric precision of the lane.
   - `device_class` (`"metal"` | `"ane"` | `"cpu"` | `"cuda"`) — execution device class.
-  - `certified` (boolean, optional) — serving certification flag sourced directly from the serving
-    admission predicate. A consumer will never see `certified: true` for a lane that would
-    refuse to serve due to missing or uncertified machine profile evidence. For lane classes
-    that have a certification concept (owned engines, embed and rerank lanes), this is `true`
-    only when verified evidence exists for the current machine profile, and `false` otherwise.
-    The field is omitted for lane classes that have no certification concept (such as legacy
+  - `certified` (boolean, optional) — whether verified certification evidence exists for this
+    lane under the machine profile the module is currently running. For lane classes that have
+    a certification concept (owned engines, embed and rerank lanes) this is `true` or `false`;
+    it is omitted for lane classes that have no certification concept (such as legacy
     worker-backed generate lanes).
+    **`certified: true` does not mean the lane will serve.** Certification and serving approval
+    are separate facts recorded by separate writes: a lane that is certified but not approved
+    refuses every request (or, for a substitutable unconstrained request, is answered by a
+    different lane). A consumer deciding where to send traffic wants `serving_admission` below.
+  - `serving_admission` (`"enabled"` | `"disabled"`, optional) — whether this lane is approved
+    to take traffic, from the same projection `probe.report` uses, so the two surfaces agree.
+    `"enabled"` requires both an enabled approval row and current certification evidence.
+    Omitted for lane classes with no approval concept — absence means "not applicable", never
+    "enabled".
+  - `serving_admission_reason` (string, optional) — why `serving_admission` is `"disabled"`,
+    one of `approval_absent`, `approval_disabled`, `not_certified`, `approval_unavailable`, or
+    a recorded operator reason. Absent when the lane is enabled or has no approval concept.
   - `warm_load_cost_hint_ms` (float) — observed load duration hint in milliseconds,
     sourced from real measurements (such as observed load duration or benchmark probe
     data). This is an advisory hint, NOT a performance guarantee or upper bound; actual
