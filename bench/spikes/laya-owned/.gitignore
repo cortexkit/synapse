@@ -2,3 +2,6 @@
 target/
 __pycache__/
 dumps/
+data/
+quality-v0.json
+rows-*.jsonl
