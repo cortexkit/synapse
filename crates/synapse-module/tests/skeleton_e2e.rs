@@ -24,8 +24,8 @@ use subc_daemon::{
     daemon_config::StorageConfig, serve_listener, ControlHandler, Registry, Router, ServerAuth,
 };
 use subc_protocol::Frame;
-use subc_transport::write_frame;
 use subc_protocol::{Flags, FrameType, Priority};
+use subc_transport::write_frame;
 use subc_transport::{
     generate_daemon_id, generate_key, write_atomic, ConnectionInfo, Endpoint, SCHEMA_VERSION,
 };
