@@ -316,7 +316,12 @@ if [ "$scanner_rc" -ne 0 ]; then
   refuse "could not read the workflow files (workflow-gates.py exit $scanner_rc)"
 fi
 
-if ! printf '%s\n' "$gate_report" | grep -qx 'trigger|ok'; then
+# A here-string rather than `printf | grep -q`: under pipefail, grep -q closes
+# the pipe on its first match and a producer still writing takes SIGPIPE, so
+# the pipeline returns 141 and the guard reads FALSE exactly when the row is
+# present. The report is small enough today that the writer usually finishes
+# first, which is the kind of reasoning that hides the defect until it does not.
+if ! grep -qx 'trigger|ok' <<<"$gate_report"; then
   refuse "tests.yml does not run on $train_ref — add \`train/**\` to on.push.branches in .github/workflows/tests.yml"
 fi
 
@@ -425,8 +430,77 @@ if [ -e "$git_dir/REBASE_HEAD" ]; then
   say "note: REBASE_HEAD present with no rebase in progress (a finished rebase's leftover ref; ignored)"
 fi
 
+# Editors run cargo without --locked on save (rust-analyzer's check-on-save
+# is the measured case), and in a repository that path-depends on sibling
+# checkouts that rewrites Cargo.lock to whatever those checkouts happen to be
+# at: the `version =` line of each source-less package moves and nothing
+# else. That diff cannot be an intentional edit here, because pins advance
+# through refresh-siblings-lock.sh, which moves siblings.lock in the same
+# change. So a lone Cargo.lock drift of exactly that shape is restored and
+# named rather than refused. Anything wider (a `source =` or `checksum =`
+# line, a dependency list, any other dirty file) is still the operator's
+# uncommitted work and stays a refusal. The gate's guarantee holds either
+# way: CI tests the pushed commit, and the restored lock IS that commit's.
+#
+# Prints the drifted package names, one per line, when the working tree is
+# dirty in exactly that way; prints nothing and returns 1 otherwise.
+sibling_lock_drift_packages() {
+  [ "$(git status --porcelain)" = " M Cargo.lock" ] || return 1
+  # Every changed line must be a version line. -U1 keeps the `name =` line
+  # that precedes `version =` in a [[package]] block as context.
+  local diff non_version
+  diff="$(git diff -U1 -- Cargo.lock)"
+  # One awk pass rather than a grep pipeline ending in -q: under pipefail a
+  # `grep -qv` that meets a non-version line first exits, the writers behind
+  # it take SIGPIPE, the pipeline returns 141, and the `if` reads FALSE — so a
+  # real working-tree change early in a large diff was classified as pure
+  # drift and Cargo.lock was RESTORED over the operator's uncommitted work.
+  # Reading to EOF and counting cannot be inverted that way.
+  non_version="$(printf '%s\n' "$diff" | awk '
+    /^(\+\+\+|---)/ { next }
+    /^[-+]/ && !/^[-+]version = "/ { n++ }
+    END { print n + 0 }')"
+  if [ "$non_version" -ne 0 ]; then
+    return 1
+  fi
+  # For each removed version line, find the [[package]] block in HEAD's lock
+  # with that name and that version and require it to have no `source =`.
+  # A name can appear twice (a path copy beside a registry or git copy of
+  # the same crate), which is why the block is matched on both fields.
+  local head_lock names name old
+  head_lock="$(git show HEAD:Cargo.lock)"
+  names=""
+  while IFS= read -r line; do
+    case "$line" in
+      'name = "'*) name="${line#name = \"}"; name="${name%\"}" ;;
+      '-version = "'*)
+        old="${line#-version = \"}"; old="${old%\"}"
+        [ -n "$name" ] || return 1
+        printf '%s\n' "$head_lock" | awk -v n="$name" -v v="$old" '
+          /^\[\[package\]\]/ { inblk=1; hit=0; src=0; next }
+          inblk && $0 == "name = \"" n "\"" { hit=1; next }
+          inblk && hit && $0 == "version = \"" v "\"" { ver=1; next }
+          inblk && hit && ver && /^source = / { src=1 }
+          inblk && /^$/ { if (hit && ver) { found=1; if (src) bad=1 } inblk=0; hit=0; ver=0; src=0 }
+          END { if (hit && ver) { found=1; if (src) bad=1 } exit !(found && !bad) }
+        ' || return 1
+        names="${names}${name}\n"
+        name=""
+        ;;
+    esac
+  done <<EOF_DIFF
+$(printf '%s\n' "$diff" | grep -E '^( name = "|-version = ")' | sed 's/^ //')
+EOF_DIFF
+  [ -n "$names" ] || return 1
+  printf '%b' "$names"
+}
+
 # CI tests the pushed commit, not the working tree. Uncommitted work would be
 # invisible to the gate and then silently absent from what lands on main.
+if drifted="$(sibling_lock_drift_packages)"; then
+  git checkout -- Cargo.lock
+  say "restored Cargo.lock: sibling path-dependency drift in $(printf '%s' "$drifted" | paste -sd, -) (an editor's cargo run without --locked; the committed lock is what CI tests)"
+fi
 if [ -n "$(git status --porcelain)" ]; then
   refuse "working tree is not clean (commit or stash before pushing a train)"
 fi
