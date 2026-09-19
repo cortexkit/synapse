@@ -13877,12 +13877,29 @@ fn lane_measurement_rows(
                 .as_ref()
                 .filter(|row| row.status == CertificationStatus::Certified)
                 .cloned();
-            (
-                current_certification.clone(),
-                current_certification,
-                current_probe.clone(),
-                current_probe,
-            )
+            // `latest` must be a DIFFERENT fact from `current`, or every
+            // staleness reading derived from the pair is unsatisfiable: the
+            // consumers compute `current.is_none() && latest.is_some()`, which
+            // is a constant false when both name the same row. So look the lane
+            // up again without the profile scope -- "was this ever certified"
+            // against "is it certified here" -- which is what separates a lane
+            // whose profile rotated from one that was never probed.
+            let latest = if current_certification.is_some() {
+                current_certification.clone()
+            } else {
+                state
+                    .store
+                    .latest_owned_decode_measurement_row(
+                        model_id,
+                        &fingerprint.0,
+                        CERT_EVIDENCE_SCHEMA_REVISION,
+                        &[],
+                    )
+                    .ok()
+                    .flatten()
+                    .map(owned_measurement_report_row)
+            };
+            (current_certification, latest.clone(), current_probe, latest)
         } else if let Some(certification_class) = certification_class_for_task(task) {
             let current_certification = state
                 .store

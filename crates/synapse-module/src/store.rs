@@ -4414,6 +4414,48 @@ impl SynapseStore {
         raw.map(decode_owned_decode_cert_row).transpose()
     }
 
+    /// The newest certified decode row for this lane under ANY machine profile.
+    ///
+    /// The profile-scoped lookup above answers "is this lane certified HERE".
+    /// This answers "was it ever certified", which is the other half an operator
+    /// needs: together they separate a lane that was certified and then had its
+    /// profile rotate from one that was never probed. Without it the decode
+    /// branch has only one fact and both states render identically -- see
+    /// `docs/audits/meaning-serving-gates.md`.
+    pub fn latest_owned_decode_measurement_row(
+        &self,
+        model_id: &str,
+        decode_fingerprint: &str,
+        evidence_schema_revision: &str,
+        constraint_runtime_identities: &[String],
+    ) -> Result<Option<OwnedDecodeCertificationRow>, SynapseStoreError> {
+        let identities_digest =
+            constraint_runtime_identities_digest(constraint_runtime_identities)?;
+        let raw = self.store.with_conn(|conn| {
+            conn.query_row(
+                &format!(
+                    "{OWNED_CERT_SELECT_SQL}
+                     WHERE certification_class = 'measured_owned_decode'
+                       AND status = 'certified'
+                       AND model_id = ?1
+                       AND decode_fingerprint = ?2
+                       AND evidence_schema_revision = ?3
+                       AND constraint_runtime_identities_digest = ?4
+                     ORDER BY certified_at_ms DESC LIMIT 1"
+                ),
+                params![
+                    model_id,
+                    decode_fingerprint,
+                    evidence_schema_revision,
+                    identities_digest,
+                ],
+                owned_decode_cert_row_from_row,
+            )
+            .optional()
+        })?;
+        raw.map(decode_owned_decode_cert_row).transpose()
+    }
+
     fn current_owned_decode_cert_rows(
         &self,
         revisioned_machine_profile_hash: &str,
@@ -10461,6 +10503,100 @@ mod tests {
         );
         drop(reopened);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// `latest_owned_decode_measurement_row` must find a certified row under a
+    /// profile that is no longer current, because that is the only thing that
+    /// separates "certified, then the machine rotated" from "never probed". The
+    /// profile-scoped lookup answers `None` for both, so a staleness reading
+    /// built from it alone is unsatisfiable rather than merely inaccurate.
+    #[test]
+    fn latest_decode_row_survives_a_rotation_the_scoped_lookup_misses() {
+        let (_root, descriptor) = temp_descriptor("latest-decode-row-rotation");
+        let store = SynapseStore::open(&descriptor).expect("store opens");
+        let profile_a = MachineProfile {
+            os_build: "os-before-rotation".to_string(),
+            arch: "aarch64".to_string(),
+            chip_model: "chip-a".to_string(),
+            ram_class: "le_32_gib".to_string(),
+            ane_subtype: None,
+            engine_identities: Vec::new(),
+        };
+        let mut profile_b = profile_a.clone();
+        profile_b.os_build = "os-after-rotation".to_string();
+        store.observe_profile(&profile_a, 10, 1).expect("profile a");
+        // The identity validator requires real digests, a catalog-shaped model
+        // id and the current revisions; a row that fails it never reaches the
+        // lookup this test is about.
+        let decode_fingerprint = "d".repeat(64);
+
+        store
+            .store_owned_decode_cert_row(&OwnedDecodeCertificationRow {
+                status: CertificationStatus::Certified,
+                revisioned_machine_profile_hash: profile_a.revisioned_hash(),
+                profile_activation_epoch: 1,
+                model_id: "owned-model".to_string(),
+                decode_fingerprint: decode_fingerprint.clone(),
+                processing_fingerprint: "processing".to_string(),
+                runtime_config_digest: "runtime".to_string(),
+                constraint_runtime_identities: Vec::new(),
+                worker_path_evidence: serde_json::json!({}),
+                evidence_schema_revision: CERT_EVIDENCE_SCHEMA_REVISION.to_string(),
+                g_dec_manifest_revision: G_DEC_MANIFEST_REVISION.to_string(),
+                numeric_profile_id: None,
+                fingerprint: Fingerprint(decode_fingerprint.clone()),
+                certified_at_ms: 11,
+                os_build: profile_a.os_build.clone(),
+                module_generation: 1,
+                evidence: serde_json::json!({}),
+            })
+            .expect("row stores under profile a");
+
+        assert_ne!(profile_a.revisioned_hash(), profile_b.revisioned_hash());
+
+        let scoped = store
+            .get_owned_decode_measurement_row(
+                &profile_b.revisioned_hash(),
+                1,
+                "owned-model",
+                &decode_fingerprint,
+                CERT_EVIDENCE_SCHEMA_REVISION,
+                &[],
+            )
+            .expect("scoped lookup runs");
+        assert!(
+            scoped.is_none(),
+            "the profile-scoped lookup must not see a row from the previous profile"
+        );
+
+        let latest = store
+            .latest_owned_decode_measurement_row(
+                "owned-model",
+                &decode_fingerprint,
+                CERT_EVIDENCE_SCHEMA_REVISION,
+                &[],
+            )
+            .expect("latest lookup runs")
+            .expect("a row certified under any profile must still be found");
+        assert_eq!(
+            latest.revisioned_machine_profile_hash,
+            profile_a.revisioned_hash()
+        );
+
+        // A lane that was never certified stays None on both, so the two states
+        // are distinguishable rather than merely both non-empty.
+        let never = store
+            .latest_owned_decode_measurement_row(
+                "never-probed-model",
+                &decode_fingerprint,
+                CERT_EVIDENCE_SCHEMA_REVISION,
+                &[],
+            )
+            .expect("latest lookup runs for an unknown lane");
+        assert!(
+            never.is_none(),
+            "a never-certified lane must have no latest row"
+        );
     }
 
     #[test]
