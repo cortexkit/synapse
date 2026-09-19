@@ -227,12 +227,26 @@ pub fn restore_import(
 
 pub async fn run_from_env() -> Result<(), ModuleError> {
     let module_id = module_id_from_environment(|key| env::var_os(key))?;
-    // The supervised setup: the daemon injects SUBC_MODULE_ID, CK_LOG and the
-    // retention knobs (CK_LOG_MAX_AGE_DAYS, CK_LOG_ALARM_SEGMENT_MB) from its
-    // `log` config block, and init_from_env reads all of them. module_id was
-    // already resolved from the same variable above with this module's own
-    // refusal rules, so the logger cannot disagree with it.
-    let _logger = cortexkit_log::init_from_env()
+    // Under supervision the daemon injects SUBC_MODULE_ID plus the retention
+    // knobs (CK_LOG_MAX_AGE_DAYS, CK_LOG_ALARM_SEGMENT_MB) from its `log` config
+    // block, and from_env reads all of them. Outside supervision it refuses for a
+    // missing SUBC_MODULE_ID, while module_id_from_environment above deliberately
+    // falls back to the default id for local runs -- so taking from_env's answer
+    // unconditionally would turn a supported unsupervised launch into a startup
+    // panic. That one typed error is answered with the id already resolved here;
+    // every other arm, and the knob reading itself, stays the crate's.
+    let logger_config = match cortexkit_log::Config::from_env() {
+        Ok(config) => config,
+        Err(cortexkit_log::InitError::ModuleIdNotInEnvironment) => {
+            cortexkit_log::Config::for_module(&module_id)
+        }
+        Err(error) => {
+            return Err(ModuleError::Config(format!(
+                "initialize fleet logger: {error}"
+            )))
+        }
+    };
+    let _logger = cortexkit_log::init(logger_config)
         .map_err(|error| ModuleError::Config(format!("initialize fleet logger: {error}")))?;
     let _singleton = acquire_synapse_singleton_lease(&module_id)?;
     let connection_file = subc_connection_file_from_args()?;
