@@ -5,3 +5,5 @@ dumps/
 data/
 quality-v0.json
 rows-*.jsonl
+quality-v1.json
+quality*run.log
