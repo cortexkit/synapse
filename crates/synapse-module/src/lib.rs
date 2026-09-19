@@ -1956,12 +1956,20 @@ impl SynapseHandler {
             validate_remote_providers(&config.remote_providers).map_err(ModuleError::Config)?;
         bind_remote_provider_urls(&store, &configured_remote)?;
         let catalog_models = sync_and_load_catalog_models(&store, &config)?;
-        let machine_profile = machine_profile_with_overrides(MachineProfile::collect(
+        // A machine-identity probe that cannot be established refuses the boot
+        // rather than substituting a placeholder. A substituted value would
+        // rotate the profile hash, fail every certified lane closed, and rotate
+        // back on the next boot that happens to succeed -- a silent,
+        // self-reverting identity change with nothing in the record to explain
+        // it. The daemon surfaces this refusal and retries under its backoff.
+        let collected = MachineProfile::collect(
             &SystemMachineProfileCollector,
             catalog_models
                 .iter()
                 .map(|model| model.engine_identity.clone()),
-        ));
+        )
+        .map_err(|error| ModuleError::Config(error.to_string()))?;
+        let machine_profile = machine_profile_with_overrides(collected);
         let (machine_profile_hash, revisioned_machine_profile_hash) =
             module_state_machine_profile_hashes(&machine_profile);
         let legacy_machine_profile_hash = machine_profile_hash.clone();
