@@ -1,0 +1,17 @@
+[package]
+name = "laya-owned"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+synapse-engine-owned = { path = "../../../crates/synapse-engine-owned" }
+synapse-core = { path = "../../../crates/synapse-core" }
+anyhow = "1"
+half = "2"
+libm = "0.2"
+safetensors = "0.7"
+serde_json = { version = "1", features = ["preserve_order"] }
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }

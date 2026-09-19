@@ -74,6 +74,60 @@ fn gte_public_load_and_inference_cover_8192_context() {
     let _ = fs::remove_dir_all(cache);
 }
 
+#[test]
+fn encode_hidden_cls_normalized_matches_gte_embed() {
+    let snapshot = gte_snapshot().expect("GTE fixture required for hidden-state equivalence");
+    let cache = unique_temp_dir("owned-metal-gte-hidden");
+    let mut runtime = RuntimeConfig::default();
+    runtime.values.insert(
+        "model_path".into(),
+        snapshot.join("model.safetensors").display().to_string(),
+    );
+    runtime
+        .values
+        .insert("package_cache_root".into(), cache.display().to_string());
+    runtime.values.insert("max_tokens".into(), "64".into());
+    runtime
+        .values
+        .insert("attention_units".into(), "8192".into());
+    let mut engine = OwnedMetalEmbedEngine::new(ModelFamily::GteModernBert, OwnedDType::F32);
+    let loaded = engine
+        .load(
+            &ValidatedArtifact {
+                digest: "sha256:hidden-fixture".into(),
+                format: "safetensors-package".into(),
+            },
+            &runtime,
+        )
+        .unwrap();
+    let sequences = vec![vec![50281, 100, 200, 50282], vec![50281, 300, 50282]];
+    let hidden = engine
+        .encode_hidden(&loaded, &sequences, Some((2, 64)))
+        .unwrap();
+    assert_eq!((hidden.batch, hidden.seq, hidden.hidden), (2, 64, 768));
+    assert_eq!(
+        hidden
+            .attention_mask
+            .iter()
+            .map(|&x| usize::from(x))
+            .sum::<usize>(),
+        7
+    );
+    let embedded = engine
+        .embed_batch(&loaded, TokenBatch { items: sequences })
+        .unwrap();
+    // GTE embedding uses the CLS token followed by L2 normalization, not mean pooling.
+    for (row, expected) in embedded.iter().enumerate() {
+        let start = row * hidden.seq * hidden.hidden;
+        let cls = &hidden.data[start..start + hidden.hidden];
+        let norm = cls.iter().map(|x| x * x).sum::<f32>().sqrt();
+        for (&actual, &expected) in cls.iter().zip(expected) {
+            assert!((actual / norm - expected).abs() <= 1e-5);
+        }
+    }
+    fs::remove_dir_all(cache).unwrap();
+}
+
 fn gte_snapshot() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("SYNAPSE_GTE_MODERNBERT_SAFETENSORS_SNAPSHOT") {
         return Some(PathBuf::from(path));

@@ -190,6 +190,16 @@ pub struct OwnedModelInfo {
     pub dtype: OwnedDType,
 }
 
+/// Row-major, final-normalized token states, without pooling or a task head.
+#[derive(Debug)]
+pub struct HiddenStates {
+    pub batch: usize,
+    pub seq: usize,
+    pub hidden: usize,
+    pub data: Vec<f32>,
+    pub attention_mask: Vec<u8>,
+}
+
 pub struct OwnedMetalEmbedEngine {
     family: ModelFamily,
     dtype: OwnedDType,
@@ -214,6 +224,54 @@ struct OwnedLoadedModel {
 }
 
 impl OwnedMetalEmbedEngine {
+    /// Encode tokens without pooling. An explicit `(batch, seq)` must fit a loaded
+    /// bucket's capacity; otherwise the smallest covering bucket is selected.
+    /// ModernBERT returns states after final_norm and needs no classification head.
+    #[cfg(target_os = "macos")]
+    pub fn encode_hidden(
+        &self,
+        model: &LoadedModel,
+        sequences: &[Vec<u32>],
+        shape: Option<(usize, usize)>,
+    ) -> Result<HiddenStates, EngineError> {
+        let fail = |message| Self::error(EngineErrorStage::Inference, message);
+        let loaded = self
+            .models
+            .get(&model.model_id)
+            .ok_or_else(|| fail("unknown owned-metal model"))?;
+        let mut loaded = loaded
+            .lock()
+            .map_err(|_| fail("owned-metal model mutex was poisoned"))?;
+        if sequences.is_empty() || sequences.iter().any(Vec::is_empty) {
+            return Err(fail("hidden-state input must be nonempty"));
+        }
+        let real_seq = sequences.iter().map(Vec::len).max().unwrap();
+        let (batch, seq) = shape.unwrap_or_else(|| {
+            loaded
+                .buckets
+                .iter()
+                .filter(|s| s.batch >= sequences.len() && s.seq >= real_seq)
+                .min_by_key(|s| s.seq)
+                .map(|s| (sequences.len(), s.seq))
+                .unwrap_or((0, 0))
+        });
+        if batch < sequences.len()
+            || seq < real_seq
+            || !loaded
+                .buckets
+                .iter()
+                .any(|s| s.batch >= batch && s.seq >= seq)
+        {
+            return Err(fail("hidden-state shape exceeds loaded bucket capacity"));
+        }
+        let OwnedLoadedModel {
+            family, provider, ..
+        } = &mut *loaded;
+        family
+            .encode_hidden(provider, sequences, runtime::BatchShape { batch, seq })
+            .map_err(|error| Self::error(EngineErrorStage::Inference, error.to_string()))
+    }
+
     #[must_use]
     pub fn new(family: ModelFamily, dtype: OwnedDType) -> Self {
         Self {

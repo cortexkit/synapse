@@ -527,7 +527,16 @@ impl ModernBertModel {
             let context = context
                 .downcast_mut::<MetalContext>()
                 .context("ModernBERT provider returned the wrong block context type")?;
-            context.forward(self, &mut current, attention_mask, batch, seq)
+            static PROFILE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let started = (*PROFILE.get_or_init(crate::embed_profile_enabled)).then(Instant::now);
+            let result = context.forward(self, &mut current, attention_mask, batch, seq);
+            if let Some(started) = started {
+                eprintln!(
+                    "[synapse-embed-profile] modernbert_block_forward batch={} seq={} forward_ms={:.3}",
+                    batch, seq, started.elapsed().as_secs_f64() * 1_000.0
+                );
+            }
+            result
         };
         if !provider.block_forward(BlockForwardRequest {
             family: self.family_name(),
@@ -838,6 +847,41 @@ pub(super) fn load_family(path: &Path, precision: Precision) -> Result<Box<dyn M
 }
 
 impl ModelFamily for ModernBertModel {
+    fn encode_hidden(
+        &self,
+        provider: &mut dyn KernelProvider,
+        sequences: &[Vec<u32>],
+        shape: BatchShape,
+    ) -> Result<crate::HiddenStates> {
+        ensure!(
+            !sequences.is_empty() && sequences.iter().all(|s| !s.is_empty()),
+            "empty ModernBERT input"
+        );
+        ensure!(
+            shape.batch >= sequences.len() && sequences.iter().all(|s| s.len() <= shape.seq),
+            "hidden-state shape does not cover input"
+        );
+        ensure!(
+            shape.seq <= self.config.max_position_embeddings,
+            "hidden-state sequence exceeds model context"
+        );
+        let mut ids = vec![self.config.pad_token_id; shape.batch * shape.seq];
+        let mut attention_mask = vec![0_u8; ids.len()];
+        for (row, sequence) in sequences.iter().enumerate() {
+            let start = row * shape.seq;
+            ids[start..start + sequence.len()].copy_from_slice(sequence);
+            attention_mask[start..start + sequence.len()].fill(1);
+        }
+        let data = self.forward(provider, &ids, &attention_mask, shape.batch, shape.seq)?;
+        Ok(crate::HiddenStates {
+            batch: shape.batch,
+            seq: shape.seq,
+            hidden: self.config.hidden_size,
+            data,
+            attention_mask,
+        })
+    }
+
     fn family_name(&self) -> &'static str {
         "gte-modernbert"
     }

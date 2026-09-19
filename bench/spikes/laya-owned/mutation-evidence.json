@@ -1,0 +1,16 @@
+[
+  {
+    "control": "NON-VACUITY BREAK: disable literal [MASK] replacement in the Rust sequence encoder",
+    "expected_red": "tests::battery_ids_and_markers_are_byte_exact",
+    "captured_output": "tests::battery_ids_and_markers_are_byte_exact ... FAILED: input ids differ: adversarial-mask; sequence::tests::json_spacing_and_unicode_match_python ... ok; 1 passed, 1 failed",
+    "applied_evidence": "src/sequence.rs staged before mutation; git diff --stat empty before, then 1 file changed, 1 insertion(+), 1 deletion(-); git checkout -- followed by touch restored an empty git diff --stat",
+    "outcome": "reddened"
+  },
+  {
+    "control": "NON-VACUITY BREAK: replace the first owned probability vector with an incorrect one-hot distribution",
+    "expected_red": "pre_registered_fp32_probability_and_argmax_gate",
+    "captured_output": "AssertionError: pre_registered_fp32_probability_and_argmax_gate; max delta probability 0.9997966759; argmax agreement 23/24; preset-email-category gap 0.9971652646; no other checks failed",
+    "applied_evidence": "owned-f16.json and parity-f16.json staged before mutation; git diff --stat empty before, then owned-f16.json: 1 file changed, 9 insertions(+), 8 deletions(-); git checkout -- followed by touch on both files restored an empty git diff --stat",
+    "outcome": "reddened"
+  }
+]
