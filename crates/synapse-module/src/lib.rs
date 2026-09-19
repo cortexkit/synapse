@@ -1887,7 +1887,7 @@ struct SystemClock;
 /// for the measurements.
 fn recommended_batch_for_engine(engine: &str, max_tokens: usize) -> Option<RecommendedBatch> {
     match engine {
-        "owned-metal" => Some(RecommendedBatch {
+        "owned-metal" | CUDA_WORKER_ENGINE => Some(RecommendedBatch {
             rows: MAX_ENGINE_BATCH_ITEMS,
             token_budget: DEFAULT_ENGINE_BATCH_TOKEN_BUDGET,
         }),
@@ -17195,6 +17195,12 @@ mod tests {
         let owned = recommended_batch_for_engine("owned-metal", 512).unwrap();
         assert_eq!(owned.rows, MAX_ENGINE_BATCH_ITEMS);
         assert_eq!(owned.token_budget, DEFAULT_ENGINE_BATCH_TOKEN_BUDGET);
+
+        let cuda = recommended_batch_for_engine(CUDA_WORKER_ENGINE, 2048)
+            .expect("CUDA clients need usable batch advice");
+        let wire = serde_json::to_value(cuda).expect("serialize CUDA batch advice");
+        assert_eq!(wire["rows"], MAX_ENGINE_BATCH_ITEMS);
+        assert_eq!(wire["token_budget"], DEFAULT_ENGINE_BATCH_TOKEN_BUDGET);
 
         let ane = recommended_batch_for_engine("ane", 512).unwrap();
         assert_eq!(ane.rows, MAX_ENGINE_BATCH_ITEMS);
