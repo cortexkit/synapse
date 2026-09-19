@@ -7,3 +7,6 @@ quality-v0.json
 rows-*.jsonl
 quality-v1.json
 quality*run.log
+rows-jev-*.jsonl
+jev-*.json
+jev-*.log
