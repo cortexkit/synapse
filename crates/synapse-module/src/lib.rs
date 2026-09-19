@@ -4184,9 +4184,19 @@ async fn owned_decode_session_decode(state: Arc<ModuleState>, params: Value) -> 
             Ok(store::ServingBoundaryOutcome::Terminated {
                 unload_artifact, ..
             }) => {
-                // The store committed this exact prefix before revocation. Publish
-                // that progress before the terminal so status and stream history
-                // agree on every token that crossed the boundary.
+                // Publish this progress before the terminal so status and stream
+                // history agree on every token that crossed the boundary.
+                //
+                // Note what the prefix is, because it is easy to read the wrong
+                // way: the store did NOT commit it before revocation. The same
+                // transaction that observes `Revoked` also writes the new
+                // committed count and then returns `Terminated`
+                // (`store.rs:3905-3933`), so this prefix is the quantum
+                // generated after revocation and committed by the transaction
+                // that saw it. That is the documented boundary behaviour -- a
+                // revoke fences admission and truncates emission at the next
+                // COMMITTED boundary, not mid-quantum -- and publishing it is
+                // correct precisely because the store already counted it.
                 let progress = synapse_core::FrameEnvelope::new(
                     &params.req_id,
                     &params.session_id,

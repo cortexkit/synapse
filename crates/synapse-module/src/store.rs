@@ -11232,6 +11232,12 @@ mod tests {
         );
         let terminal = store.serving_session("active-session").unwrap().unwrap();
         assert_eq!(terminal.state, ServingSessionState::Terminated);
+        // 17, not the pre-revoke count: the transaction that OBSERVES the
+        // revocation also writes the new committed count before returning
+        // Terminated. So the prefix a caller publishes on a terminal boundary
+        // was committed by the revoke-observing transaction, not before it --
+        // which is what makes publishing that progress correct rather than a
+        // leak past the fence.
         assert_eq!(terminal.committed_token_count, 17);
         assert_eq!(
             terminal.terminal_reason.as_deref(),
