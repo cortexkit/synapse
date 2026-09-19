@@ -103,10 +103,10 @@ pub fn unique_temp_dir(label: &str) -> PathBuf {
 /// The data home matters for a reason the config and lease overrides do not
 /// cover: a spawned module resolves its LOG file from the data home, not from
 /// its config, so without this every test run appended to the operator's live
-/// `synapse.log` and shared its rotation. Test traffic then reads as production
-/// activity in the one surface an operator consults to see what the daemon is
-/// doing, and a long run evicts real history. The store is unaffected either
-/// way because the test daemon supplies it in HELLO_ACK.
+/// log segment for today (`logs/synapse.<YYYY-MM-DD>.log`). Test traffic then
+/// reads as production activity in the one surface an operator consults to see
+/// what the daemon is doing. The store is unaffected either way because the
+/// test daemon supplies it in HELLO_ACK.
 pub fn configure_test_module_command(command: &mut Command, config_json: Option<&str>) {
     let test_root = unique_temp_dir("synapse-module-test");
     let config_path = test_root.join("synapse.jsonc");

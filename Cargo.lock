@@ -1457,7 +1457,7 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-log"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "cortexkit-store-types 0.2.2",
@@ -1468,11 +1468,11 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-log"
-version = "0.2.0"
-source = "git+https://github.com/cortexkit/commons.git?rev=99736150c6d0c769c1c7479894fba7f07c322a5f#99736150c6d0c769c1c7479894fba7f07c322a5f"
+version = "0.3.0"
+source = "git+https://github.com/cortexkit/commons.git?rev=50a70f2dbb1e44efa8346271e17c9aa8cd6115c8#50a70f2dbb1e44efa8346271e17c9aa8cd6115c8"
 dependencies = [
  "chrono",
- "cortexkit-store-types 0.2.1",
+ "cortexkit-store-types 0.2.2 (git+https://github.com/cortexkit/commons.git?rev=50a70f2dbb1e44efa8346271e17c9aa8cd6115c8)",
  "regex",
  "tracing",
  "tracing-subscriber",
@@ -1495,8 +1495,7 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-store-types"
-version = "0.2.1"
-source = "git+https://github.com/cortexkit/commons.git?rev=99736150c6d0c769c1c7479894fba7f07c322a5f#99736150c6d0c769c1c7479894fba7f07c322a5f"
+version = "0.2.2"
 dependencies = [
  "serde",
 ]
@@ -1504,6 +1503,7 @@ dependencies = [
 [[package]]
 name = "cortexkit-store-types"
 version = "0.2.2"
+source = "git+https://github.com/cortexkit/commons.git?rev=50a70f2dbb1e44efa8346271e17c9aa8cd6115c8#50a70f2dbb1e44efa8346271e17c9aa8cd6115c8"
 dependencies = [
  "serde",
 ]
@@ -6416,9 +6416,9 @@ dependencies = [
 
 [[package]]
 name = "subc-daemon"
-version = "0.18.15"
+version = "0.18.16"
 dependencies = [
- "cortexkit-log 0.2.0 (git+https://github.com/cortexkit/commons.git?rev=99736150c6d0c769c1c7479894fba7f07c322a5f)",
+ "cortexkit-log 0.3.0 (git+https://github.com/cortexkit/commons.git?rev=50a70f2dbb1e44efa8346271e17c9aa8cd6115c8)",
  "cortexkit-paths",
  "fs4",
  "getrandom 0.2.17",
@@ -6575,7 +6575,7 @@ version = "0.1.0-alpha.2"
 dependencies = [
  "anyhow",
  "cortexkit-lease",
- "cortexkit-log 0.2.0",
+ "cortexkit-log 0.3.0",
  "cortexkit-store",
  "cortexkit-store-types 0.2.2",
  "half",

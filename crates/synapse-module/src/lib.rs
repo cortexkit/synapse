@@ -141,7 +141,17 @@ impl owned_decode_routing::lane::AdmissionBoundaryReader for SynapseStore {
 
 pub const DEFAULT_MODULE_ID: &str = "synapse";
 
-pub const LOG_TAGS: &[&str] = &[
+/// The components this module logs under, one per `tracing` target it emits.
+///
+/// The fleet logger derives a line's logger name from the target, rooted at the
+/// module id: an event sent to target `perf` renders as `synapse.perf`, and
+/// that dotted name is what the `CK_LOG` filter matches on
+/// (`CK_LOG=error,synapse.perf=info`). Nothing registers this list at runtime —
+/// the logger accepts any target, because refusing one inside a logging call
+/// would be a worse failure than an undeclared name. The list is therefore
+/// documentation, and the source of the manifest's `--loggers` declaration when
+/// that lands.
+pub const LOG_LOGGERS: &[&str] = &[
     "perf",        // Periodic activity and per-request completion metrics.
     "worker",      // Lines forwarded from supervised worker processes.
     "admission",   // Job admission, refusal, and completion decisions.
@@ -217,12 +227,8 @@ pub fn restore_import(
 
 pub async fn run_from_env() -> Result<(), ModuleError> {
     let module_id = module_id_from_environment(|key| env::var_os(key))?;
-    cortexkit_log::declared_tags(LOG_TAGS);
-    let _logger = cortexkit_log::init(cortexkit_log::Config::for_module(
-        &module_id,
-        cortexkit_log::Lane::Module,
-    ))
-    .map_err(|error| ModuleError::Config(format!("initialize fleet logger: {error}")))?;
+    let _logger = cortexkit_log::init(cortexkit_log::Config::for_module(&module_id))
+        .map_err(|error| ModuleError::Config(format!("initialize fleet logger: {error}")))?;
     let _singleton = acquire_synapse_singleton_lease(&module_id)?;
     let connection_file = subc_connection_file_from_args()?;
     let handler = SynapseHandler::new(module_id.clone(), connection_file);
@@ -15833,13 +15839,12 @@ mod tests {
             std::process::id(),
             TEST_STATE_COUNTER.fetch_add(1, Ordering::Relaxed),
         ));
-        cortexkit_log::declared_tags(LOG_TAGS);
         let log_handle = cortexkit_log::init(cortexkit_log::Config {
             module_id: "synapse".to_string(),
             logs_dir: log_root,
-            lane: cortexkit_log::Lane::Module,
+            bound: Vec::new(),
             spec: Some("debug".to_string()),
-            retention: cortexkit_log::Retention::default(),
+            retention: cortexkit_log::SegmentRetention::default(),
             redactor: None,
             clock: None,
         })
@@ -15857,7 +15862,7 @@ mod tests {
         assert!(start_perf_sampler(disabled_state).is_none());
         assert!(!fs::read_to_string(log_handle.path())
             .unwrap_or_default()
-            .contains(" tag=perf activity"));
+            .contains("synapse.perf: activity"));
 
         let (enabled_root, enabled_descriptor) = test_storage_descriptor("perf-enabled");
         let enabled_store =
@@ -15893,7 +15898,7 @@ mod tests {
         let activity_lines = fs::read_to_string(log_handle.path())
             .expect("perf log reads")
             .lines()
-            .filter(|line| line.contains(" tag=perf activity "))
+            .filter(|line| line.contains("synapse.perf: activity "))
             .map(str::to_owned)
             .collect::<Vec<_>>();
         assert_eq!(activity_lines.len(), 1, "{activity_lines:#?}");

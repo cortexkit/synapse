@@ -267,19 +267,30 @@ Machine-wide admission: an exclusive process lease
 (`module=synapse`, `scope=singleton`) is taken at boot; a second live instance
 exits nonzero with a typed log line.
 
-Logging uses `cortexkit-log` and the fleet-wide `CK_LOG` level filter. The
-optional `log` block accepts only these keys:
+Logging uses `cortexkit-log` and the fleet-wide `CK_LOG` level filter. Every
+line names a hierarchical logger rooted at the module id, which the crate
+derives from the tracing target:
 
-- `perf_interval_secs: u64` (default `0`): emit DEBUG `tag=perf` activity
+```
+2026-09-05T10:41:03.123Z DEBUG synapse.perf: activity in_flight=2 queue_depth=1
+```
+
+so one component is raised without raising the rest:
+`CK_LOG=error,synapse.perf=info`. The optional `log` block accepts only these
+keys:
+
+- `perf_interval_secs: u64` (default `0`): emit DEBUG `synapse.perf` activity
   samples at this interval; zero disables the sampler entirely.
 - `worker_forward_lines_per_sec: u32` (default `50`): cap the combined stdout
   and stderr lines forwarded from each supervised worker. Suppressed lines are
   counted on the next forwarded line as `dropped=<n>`.
 
-The module declares `perf`, `worker`, `admission`, `cert`, `maintenance`, and
-`config` tags. Log files and retention follow the shared logger's module-data
-path and defaults; Synapse does not assemble a log path or add another level
-control.
+The module logs under the components `perf`, `worker`, `admission`, `cert`,
+`maintenance`, and `config`, so its logger names are `synapse.<component>` plus
+the bare `synapse` for events that name no target. Log files and retention
+follow the shared logger's module-data path and defaults — one segment per UTC
+day at `<module data dir>/logs/synapse.<YYYY-MM-DD>.log`; Synapse does not
+assemble a log path or add another level control.
 
 ## v1 cut line
 

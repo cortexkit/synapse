@@ -4,11 +4,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use cortexkit_log::{Config, Lane, Retention};
+use cortexkit_log::{Config, SegmentRetention};
 use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
 use rusqlite::params;
 use synapse_module::{
-    SynapseStore, LOG_TAGS, RECLAIM_FREELIST_MIN_BYTES, RECLAIM_FREELIST_PAGE_RATIO_DIVISOR,
+    SynapseStore, RECLAIM_FREELIST_MIN_BYTES, RECLAIM_FREELIST_PAGE_RATIO_DIVISOR,
 };
 
 static TEST_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -35,13 +35,12 @@ fn test_descriptor(root: &Path) -> StorageDescriptor {
 #[test]
 fn maintenance_log_absent_below_threshold_and_present_above_threshold() {
     let log_dir = unique_dir("logs");
-    cortexkit_log::declared_tags(LOG_TAGS);
     let log_handle = cortexkit_log::init(Config {
         module_id: "synapse".to_string(),
         logs_dir: log_dir.clone(),
-        lane: Lane::Module,
+        bound: Vec::new(),
         spec: Some("debug".to_string()),
-        retention: Retention::default(),
+        retention: SegmentRetention::default(),
         redactor: None,
         clock: Some(Arc::new(SystemTime::now)),
     })
@@ -89,8 +88,8 @@ fn maintenance_log_absent_below_threshold_and_present_above_threshold() {
     // Verify maintenance log line is absent
     let log_content = fs::read_to_string(log_handle.path()).unwrap_or_default();
     assert!(
-        !log_content.contains("tag=maintenance"),
-        "expected no tag=maintenance line when below threshold, found:\n{log_content}"
+        !log_content.contains("synapse.maintenance:"),
+        "expected no synapse.maintenance line when below threshold, found:\n{log_content}"
     );
 
     // Case 2: Store above threshold reopened -> assert VACUUM ran and log line present.
@@ -141,12 +140,12 @@ fn maintenance_log_absent_below_threshold_and_present_above_threshold() {
     let log_content_after = fs::read_to_string(log_handle.path()).unwrap_or_default();
     let maintenance_lines = log_content_after
         .lines()
-        .filter(|line| line.contains("tag=maintenance"))
+        .filter(|line| line.contains("synapse.maintenance:"))
         .collect::<Vec<_>>();
     assert_eq!(
         maintenance_lines.len(),
         1,
-        "expected exactly 1 tag=maintenance line, found:\n{log_content_after}"
+        "expected exactly 1 synapse.maintenance line, found:\n{log_content_after}"
     );
     let line = maintenance_lines[0];
     assert!(

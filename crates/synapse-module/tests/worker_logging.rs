@@ -6,10 +6,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use cortexkit_log::{Config, Lane, Retention};
+use cortexkit_log::{Config, SegmentRetention};
 use synapse_core::{RuntimeConfig, ValidatedArtifact};
 use synapse_module::worker_host::{WorkerHost, WorkerHostConfig};
-use synapse_module::LOG_TAGS;
 
 fn unique_root(label: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
@@ -89,23 +88,24 @@ async fn start_fixture_worker(
 #[tokio::test]
 async fn worker_lines_are_forwarded_and_rate_limited() {
     let log_root = unique_root("worker-log");
-    cortexkit_log::declared_tags(LOG_TAGS);
     let handle = cortexkit_log::init(Config {
         module_id: "synapse".to_string(),
         logs_dir: log_root,
-        lane: Lane::Module,
+        bound: Vec::new(),
         spec: Some("info".to_string()),
-        retention: Retention::default(),
+        retention: SegmentRetention::default(),
         redactor: None,
         clock: Some(Arc::new(SystemTime::now)),
     })
     .expect("fleet logger initializes");
 
     let _three = start_fixture_worker("worker-three", "model-three", 50, 3, None).await;
-    let contents = wait_for_log(handle.path(), "fixture stderr line 2").await;
+    // The segment is named for the current UTC day, so the path is re-derived
+    // rather than held from init.
+    let contents = wait_for_log(&handle.path(), "fixture stderr line 2").await;
     let three_lines = contents
         .lines()
-        .filter(|line| line.contains("tag=worker") && line.contains("worker=worker-three"))
+        .filter(|line| line.contains("synapse.worker:") && line.contains("worker=worker-three"))
         .collect::<Vec<_>>();
     assert_eq!(three_lines.len(), 3, "{three_lines:#?}");
     assert!(three_lines
@@ -113,10 +113,10 @@ async fn worker_lines_are_forwarded_and_rate_limited() {
         .all(|line| { line.contains("stream=stderr") && line.contains("model_id=model-three") }));
 
     let _flood = start_fixture_worker("worker-flood", "model-flood", 3, 500, Some(1_100)).await;
-    let contents = wait_for_log(handle.path(), "fixture stderr after flood").await;
+    let contents = wait_for_log(&handle.path(), "fixture stderr after flood").await;
     let flood_lines = contents
         .lines()
-        .filter(|line| line.contains("tag=worker") && line.contains("worker=worker-flood"))
+        .filter(|line| line.contains("synapse.worker:") && line.contains("worker=worker-flood"))
         .collect::<Vec<_>>();
     let initial_forwarded = flood_lines
         .iter()
