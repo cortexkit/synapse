@@ -1458,9 +1458,10 @@ dependencies = [
 [[package]]
 name = "cortexkit-log"
 version = "0.3.0"
+source = "git+https://github.com/cortexkit/commons.git?rev=50a70f2dbb1e44efa8346271e17c9aa8cd6115c8#50a70f2dbb1e44efa8346271e17c9aa8cd6115c8"
 dependencies = [
  "chrono",
- "cortexkit-store-types 0.2.2",
+ "cortexkit-store-types 0.2.2 (git+https://github.com/cortexkit/commons.git?rev=50a70f2dbb1e44efa8346271e17c9aa8cd6115c8)",
  "regex",
  "tracing",
  "tracing-subscriber",
@@ -1468,11 +1469,10 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-log"
-version = "0.3.0"
-source = "git+https://github.com/cortexkit/commons.git?rev=50a70f2dbb1e44efa8346271e17c9aa8cd6115c8#50a70f2dbb1e44efa8346271e17c9aa8cd6115c8"
+version = "0.3.1"
 dependencies = [
  "chrono",
- "cortexkit-store-types 0.2.2 (git+https://github.com/cortexkit/commons.git?rev=50a70f2dbb1e44efa8346271e17c9aa8cd6115c8)",
+ "cortexkit-store-types 0.2.2",
  "regex",
  "tracing",
  "tracing-subscriber",
@@ -6392,6 +6392,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "subc-cgroup"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+]
+
+[[package]]
 name = "subc-client-rs"
 version = "0.15.2"
 dependencies = [
@@ -6416,9 +6423,9 @@ dependencies = [
 
 [[package]]
 name = "subc-daemon"
-version = "0.18.16"
+version = "0.18.18"
 dependencies = [
- "cortexkit-log 0.3.0 (git+https://github.com/cortexkit/commons.git?rev=50a70f2dbb1e44efa8346271e17c9aa8cd6115c8)",
+ "cortexkit-log 0.3.0",
  "cortexkit-paths",
  "fs4",
  "getrandom 0.2.17",
@@ -6426,6 +6433,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "subc-cgroup",
  "subc-control",
  "subc-jsonc",
  "subc-protocol",
@@ -6575,7 +6583,7 @@ version = "0.1.0-alpha.2"
 dependencies = [
  "anyhow",
  "cortexkit-lease",
- "cortexkit-log 0.3.0",
+ "cortexkit-log 0.3.1",
  "cortexkit-store",
  "cortexkit-store-types 0.2.2",
  "half",
