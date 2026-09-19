@@ -14,9 +14,9 @@ use std::{
 };
 
 use common::{
-    configure_test_module_command, connect_consumer, raw_route_frame, read_frame_timeout,
-    route_open, route_request, unique_temp_dir, wait_for_catalog, TestRoute, MODULE_ID,
-    SETUP_TIMEOUT,
+    configure_test_module_command, connect_consumer, install_test_tracing, raw_route_frame,
+    read_frame_timeout, route_open, route_request, unique_temp_dir, wait_for_catalog, TestRoute,
+    MODULE_ID, SETUP_TIMEOUT,
 };
 use serde_json::Value;
 use subc_core::{
@@ -44,14 +44,12 @@ const BURST_DEADLINE_MS: u64 = 2_000;
 struct TestDaemon {
     registry: std::sync::Arc<Registry>,
     connection_file_path: PathBuf,
-    temp_dir: PathBuf,
     task: tokio::task::JoinHandle<Result<(), subc_core::ServerError>>,
 }
 
 impl Drop for TestDaemon {
     fn drop(&mut self) {
         self.task.abort();
-        let _ = std::fs::remove_dir_all(&self.temp_dir);
     }
 }
 
@@ -332,6 +330,7 @@ async fn crash_budget_quarantines_llama_without_affecting_ort_lane() {
 }
 
 async fn start_daemon() -> TestDaemon {
+    install_test_tracing();
     let temp_dir = unique_temp_dir("synapse-soak-daemon");
     let data_home = temp_dir.join("data-home");
     std::fs::create_dir_all(&data_home).unwrap();
@@ -365,7 +364,6 @@ async fn start_daemon() -> TestDaemon {
     TestDaemon {
         registry,
         connection_file_path,
-        temp_dir,
         task,
     }
 }

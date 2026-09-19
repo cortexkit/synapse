@@ -3,7 +3,10 @@
 use std::{
     path::{Path, PathBuf},
     process,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        OnceLock,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -22,6 +25,56 @@ pub const SETUP_TIMEOUT: Duration = Duration::from_secs(60);
 pub const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+static TEST_ROOT_SWEEP: OnceLock<()> = OnceLock::new();
+
+const TEST_ROOT_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+const TEST_ROOT_PARENT: &str = "synapse-tests";
+
+/// Install the test subscriber before a daemon starts so subc-core's wire
+/// diagnostics are retained by the test harness instead of being discarded.
+pub fn install_test_tracing() {
+    sweep_stale_test_roots_once();
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("subc_core=debug,info"));
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_env_filter(filter)
+        .try_init();
+}
+
+fn sweep_stale_test_roots_once() {
+    TEST_ROOT_SWEEP.get_or_init(|| {
+        let swept = sweep_stale_test_roots_at(SystemTime::now());
+        eprintln!("[test-daemon] swept {swept} stale test roots");
+    });
+}
+
+fn sweep_stale_test_roots_at(now: SystemTime) -> usize {
+    let parent = std::env::temp_dir().join(TEST_ROOT_PARENT);
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return 0;
+    };
+    let mut swept = 0;
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let Ok(modified) = entry.metadata().and_then(|metadata| metadata.modified()) else {
+            continue;
+        };
+        if now
+            .duration_since(modified)
+            .is_ok_and(|age| age > TEST_ROOT_MAX_AGE)
+            && std::fs::remove_dir_all(entry.path()).is_ok()
+        {
+            swept += 1;
+        }
+    }
+    swept
+}
 
 pub fn unique_temp_dir(label: &str) -> PathBuf {
     let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -33,7 +86,9 @@ pub fn unique_temp_dir(label: &str) -> PathBuf {
     // harness has started termination, so cleanup may leave the old directory.
     // Include a wall-clock nonce to prevent a later process-ID reuse from
     // reopening that stale test store.
-    std::env::temp_dir().join(format!("{label}-{}-{n}-{timestamp}", process::id()))
+    let parent = std::env::temp_dir().join(TEST_ROOT_PARENT);
+    std::fs::create_dir_all(&parent).expect("create shared test root parent");
+    parent.join(format!("{label}-{}-{n}-{timestamp}", process::id()))
 }
 
 /// Give a spawned module an isolated config, data home, and singleton lease
@@ -239,5 +294,41 @@ pub async fn wait_for_catalog(stream: &mut TcpStream, module_id: &str, wait: Dur
         );
         corr += 1;
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sweeps_only_stale_test_root_children() {
+        let suffix = format!(
+            "{}-{}",
+            process::id(),
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        let parent = std::env::temp_dir().join(TEST_ROOT_PARENT);
+        let old = parent.join(format!("old-{suffix}"));
+        let young = parent.join(format!("young-{suffix}"));
+        let outside = std::env::temp_dir().join(format!("outside-{suffix}"));
+        for path in [&old, &young, &outside] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let old_mtime = SystemTime::now() - Duration::from_secs(25 * 60 * 60);
+        for path in [&old, &outside] {
+            std::fs::File::open(path)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(old_mtime))
+                .unwrap();
+        }
+
+        sweep_stale_test_roots_at(SystemTime::now());
+
+        assert!(!old.exists(), "the 25-hour-old child must be swept");
+        assert!(young.exists(), "the young child must remain");
+        assert!(outside.exists(), "a sibling outside the parent must remain");
+        let _ = std::fs::remove_dir_all(young);
+        let _ = std::fs::remove_dir_all(outside);
     }
 }
