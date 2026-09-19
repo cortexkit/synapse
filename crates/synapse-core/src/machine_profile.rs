@@ -339,9 +339,11 @@ mod tests {
     use super::*;
 
     thread_local! {
-        /// Which probe the current case starves. Thread-local because `Prober`
-        /// is a function pointer on the production path and cannot capture.
-        static STARVED: RefCell<Option<(String, Option<String>)>> = const { RefCell::new(None) };
+        /// Which probes the current case starves: a program, and the specific
+        /// arguments to starve (empty means every call to it). Thread-local
+        /// because `Prober` is a function pointer on the production path and
+        /// cannot capture.
+        static STARVED: RefCell<Option<(String, Vec<String>)>> = const { RefCell::new(None) };
     }
 
     struct FakeCollector {
@@ -462,6 +464,11 @@ mod tests {
     /// one field first, so it would refuse on that one no matter what the others
     /// do, and a default restored on any later field would go unnoticed. Each
     /// prober below refuses exactly one program and answers the rest.
+    ///
+    /// `chip_model` needs BOTH of its probes starved, not one: it tries
+    /// `machdep.cpu.brand_string` and falls back to `hw.model`, which is
+    /// deliberate (the brand string is absent on some hosts), so starving only
+    /// the first exercises the fallback rather than the refusal.
     #[test]
     fn every_probed_identity_field_refuses_rather_than_substituting() {
         fn answer_for(program: &str, args: &[&str]) -> String {
@@ -473,30 +480,43 @@ mod tests {
 
         // Each case names the program to starve and the field it feeds. Every
         // one of these fields is an input to the identity hash.
+        // Each case starves the probes of exactly ONE field. Starving a whole
+        // program would be easier and would not attribute: `sysctl` serves both
+        // chip_model and ram_class, so starving it entirely proves only that
+        // whichever is evaluated first refuses.
         #[cfg(target_os = "macos")]
-        let cases: &[(&str, Option<&str>, &str)] = &[
-            ("sw_vers", None, "os_build"),
-            ("sysctl", Some("hw.memsize"), "ram_class"),
+        let cases: &[(&str, &[&str], &str)] = &[
+            ("sw_vers", &[], "os_build"),
+            ("sysctl", &["hw.memsize"], "ram_class"),
+            (
+                "sysctl",
+                &["machdep.cpu.brand_string", "hw.model"],
+                "chip_model",
+            ),
         ];
         #[cfg(not(target_os = "macos"))]
-        let cases: &[(&str, Option<&str>, &str)] = &[("uname", None, "os_build and chip_model")];
+        let cases: &[(&str, &[&str], &str)] = &[("uname", &[], "os_build and chip_model")];
 
-        for (starved_program, starved_arg, field) in cases {
+        for (starved_program, starved_args, field) in cases {
             // A thread-local rather than a capture, because Prober is a plain
             // function pointer and must stay one for the production path.
             STARVED.with(|cell| {
-                *cell.borrow_mut() =
-                    Some((starved_program.to_string(), starved_arg.map(str::to_string)))
+                *cell.borrow_mut() = Some((
+                    starved_program.to_string(),
+                    starved_args.iter().map(|a| a.to_string()).collect(),
+                ))
             });
 
             fn selective(program: &str, args: &[&str]) -> Result<String, ProfileProbeError> {
                 let starve = STARVED.with(|cell| cell.borrow().clone());
-                if let Some((target_program, target_arg)) = starve {
+                if let Some((target_program, target_args)) = starve {
                     let program_matches = program == target_program;
-                    let arg_matches = match target_arg {
-                        Some(ref wanted) => args.last().copied() == Some(wanted.as_str()),
-                        None => true,
-                    };
+                    // An empty arg list starves every call to that program.
+                    let arg_matches = target_args.is_empty()
+                        || args
+                            .last()
+                            .copied()
+                            .is_some_and(|last| target_args.iter().any(|a| a == last));
                     if program_matches && arg_matches {
                         return Err(ProfileProbeError::new(program, "refused for this test"));
                     }
@@ -511,6 +531,46 @@ mod tests {
                  there silently rotates the identity hash"
             );
         }
+
+        STARVED.with(|cell| *cell.borrow_mut() = None);
+    }
+
+    /// The companion that makes the `chip_model` case above attributable: with
+    /// only the brand string starved, the documented `hw.model` fallback must
+    /// carry the profile rather than refusing. If this ever fails, the case
+    /// above is passing for the wrong reason.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn chip_model_falls_back_to_hw_model_before_it_refuses() {
+        STARVED.with(|cell| {
+            *cell.borrow_mut() = Some((
+                "sysctl".to_string(),
+                vec!["machdep.cpu.brand_string".to_string()],
+            ))
+        });
+
+        fn selective(program: &str, args: &[&str]) -> Result<String, ProfileProbeError> {
+            let starve = STARVED.with(|cell| cell.borrow().clone());
+            if let Some((target_program, target_args)) = starve {
+                if program == target_program
+                    && args
+                        .last()
+                        .copied()
+                        .is_some_and(|last| target_args.iter().any(|a| a == last))
+                {
+                    return Err(ProfileProbeError::new(program, "refused for this test"));
+                }
+            }
+            match (program, args.last().copied()) {
+                ("sysctl", Some("hw.memsize")) => Ok("137438953472".to_string()),
+                ("sysctl", Some("hw.model")) => Ok("Mac16,6".to_string()),
+                _ => Ok("probe-answer".to_string()),
+            }
+        }
+
+        let base = collect_base_profile_with(selective)
+            .expect("a starved brand string must fall back to hw.model, not refuse");
+        assert_eq!(base.chip_model, "Mac16,6");
 
         STARVED.with(|cell| *cell.borrow_mut() = None);
     }
