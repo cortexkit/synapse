@@ -11,7 +11,8 @@ use std::{
 };
 
 use serde_json::Value;
-use subc_core::{read_frame, write_frame, Frame};
+use subc_protocol::Frame;
+use subc_transport::{read_frame, write_frame};
 use subc_protocol::{BindIdentity, Flags, FrameType, Priority, RouteTarget};
 use subc_transport::{authenticate_client, connection_file};
 use tokio::{
@@ -35,7 +36,7 @@ const TEST_ROOT_PARENT: &str = "synapse-tests";
 pub fn install_test_tracing() {
     sweep_stale_test_roots_once();
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("subc_core=debug,info"));
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("subc_daemon=debug,info"));
     let _ = tracing_subscriber::fmt()
         .with_test_writer()
         .with_env_filter(filter)

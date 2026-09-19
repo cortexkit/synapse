@@ -20,10 +20,11 @@ use common::{
 };
 use rusqlite::{params, Connection};
 use serde_json::Value;
-use subc_core::{
-    daemon_config::StorageConfig, serve_listener, write_frame, ControlHandler, Frame, Registry,
-    Router, ServerAuth,
+use subc_daemon::{
+    daemon_config::StorageConfig, serve_listener, ControlHandler, Registry, Router, ServerAuth,
 };
+use subc_protocol::Frame;
+use subc_transport::write_frame;
 use subc_protocol::{Flags, FrameType, Priority};
 use subc_transport::{
     generate_daemon_id, generate_key, write_atomic, ConnectionInfo, Endpoint, SCHEMA_VERSION,
@@ -41,7 +42,7 @@ struct TestDaemon {
     registry: std::sync::Arc<Registry>,
     connection_file_path: PathBuf,
     data_home: PathBuf,
-    task: tokio::task::JoinHandle<Result<(), subc_core::ServerError>>,
+    task: tokio::task::JoinHandle<Result<(), subc_daemon::ServerError>>,
 }
 
 impl Drop for TestDaemon {
