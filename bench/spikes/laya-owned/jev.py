@@ -36,6 +36,22 @@ MODEL = "jev-latest"
 # The production-faithful set: Athena's own classify prompt defines no class, so
 # names plus one neutral sentence is at least as much as production gets. Reused
 # verbatim from the laya run so the two are comparable byte for byte.
+CRITERIA_V2_CONVENTION = {
+    "AUDIT": "Inspect something against requirements or standards to identify issues.",
+    # ALF's classify prompt carries this rule verbatim: a supervised measurable
+    # experiment routes to campaign, and "for route=campaign use EVALUATE". The
+    # earlier arms omitted it, so 73 of 91 EVALUATE rows were unreachable.
+    "EVALUATE": (
+        "Assess the quality, value, or suitability of something. ALSO use this for any "
+        "supervised measurable experiment or optimization campaign: an explicit objective "
+        "metric measured by a harness on a machine, with a time or round budget."
+    ),
+    "PLAN": "Organize proposed actions into a plan for achieving a goal.",
+    "DIAGNOSE": "Determine the cause of a problem from the available evidence.",
+    "EXPLAIN": "Clarify how or why something works or happens.",
+    "SPEC": "Define the requirements and intended behavior of something.",
+}
+
 CRITERIA_V0 = {
     "AUDIT": "Inspect something against requirements or standards to identify issues.",
     "EVALUATE": "Assess the quality, value, or suitability of something.",
@@ -49,6 +65,9 @@ CRITERIA_V0 = {
 # its 192-token question head. Measured from the laya run rather than assumed:
 # the median surviving fraction there put the cut near 1300 characters.
 LAYA_STATE_CHARS = 1300
+
+
+CRITERIA = {"v0": CRITERIA_V0, "v2": CRITERIA_V2_CONVENTION}
 
 
 def key():
@@ -78,7 +97,7 @@ def ask(api_key, state, attempt=0):
                 "kind": {
                     "type": "choice",
                     "instructions": "Which kind of work does this request ask for?",
-                    "criteria": CRITERIA_V0,
+                    "criteria": CRITERIA[os.environ.get("JEV_CRITERIA", "v0")],
                 }
             },
         }

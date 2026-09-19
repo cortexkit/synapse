@@ -32,6 +32,24 @@ The obvious objection to the original result was that laya's English checkpoint 
 
 **Context costs Jev 3.0 points. Laya sits 32.2 points below Jev on identical bytes.** So truncation explains almost none of the gap, and the 1024-token checkpoint moving laya from 0.378 to 0.467 on the synthetic set is a capability effect, not a context one.
 
+## State the convention and Jev matches the trained student
+
+The 54.9% above is not a fair reading of Jev against our trained Qwen3.5-2B (92.0% on the same rows), because **the student was trained on the convention labels and Jev was never told them**. The fair test is to give Jev the same rule ALF's classifier is given. Quoting their prompt's campaign clause into the EVALUATE option — their production text, not wording tuned against gold:
+
+| | accuracy |
+|---|---:|
+| Jev, criteria omitting the convention | 0.549 |
+| **Jev, convention stated (one sentence)** | **0.867** |
+| Jev, on the 219 current-schema rows | **0.922** |
+| trained Qwen3.5-2B, all 233 rows | 0.920 |
+| constant-AUDIT floor | 0.524 |
+
+**One sentence is worth 32 points.** EVALUATE recall goes 0.03 to 0.85.
+
+The residual gap is a third labelling artifact, not a Jev failure. All 14 DIAGNOSE rows scored 0.00 — and every one carries `system_prompt_era: legacy-42823a47b464` with `declared_campaign` instead of `route`, i.e. a schema that predates the current contract. Their prose reads *"Supervised rig-proof campaign. Objective: make slow_sum.sh faster..."*, which is a campaign brief; Jev answered EVALUATE on all 14, which is **correct under the convention it was given and wrong under a label from a retired era**. Excluding that era, Jev reaches 0.922 against the student's 0.920.
+
+So for this task the honest statement is: **Jev matches our trained 2B on the current-schema production distribution, at zero training cost, provided the routing conventions are written into the criteria.**
+
 ## Our real-set labels are one-third convention
 
 Jev at 94.9% on synthetic and 54.9% on real is too large a gap to be noise, and the confusion matrix names the cause. Jev recalls AUDIT at 0.99 on the real set but EVALUATE at 0.03 — and per ALF, Athena's prompt says *"for route=campaign use EVALUATE"*:
@@ -51,6 +69,18 @@ The original QUALITY.md verdict stands on its own terms — laya zero-shot is un
 - **A trained laya head is now a measurement with a known ceiling.** Jev at 94.9% says the task is learnable by this architecture. Laya ships a fine-tuning recipe, our 999 synthetic rows are already in typed-decision shape, and ALF's class-conditioned panel addenda (`council.rs:124` onward) are the natural source for training-time class semantics. That is the experiment worth running if anyone wants a local lane.
 - **`act_probability` remains the disqualifier for gating, and it is laya-specific.** It was 1.0 on all 2,464 laya predictions. Jev's `confidence` varies normally (0.35 on the smoke row, spread across the corpus), so a constant confidence is a property of the open checkpoint rather than of the class.
 - **Jev itself is a viable hosted option at this price.** $0.045 for 2,464 classifications is far below what the trained-2B lane costs to serve, though it is a remote dependency on request prose, which is the tradeoff our owned lanes exist to avoid.
+
+## Operating envelope, measured across all four runs
+
+1,698 requests, 1.37M input tokens, **$0.058 total**.
+
+| | measured |
+|---|---|
+| latency | **1,086-1,150 ms per request**, stable across corpora and sizes |
+| cost | **~$0.034 per 1,000 decisions** at their published $0.042/MTok |
+| throughput | serial only in this harness; ~1,115 s per 1,000 decisions unparallelised |
+
+That envelope decides fit more than accuracy does. A second per decision is fine for batch classification, offline judging and anything already waiting on a human or a build; it is too slow for an interactive gate, where our owned lanes answer embeddings in 8-25 ms. And every call is a remote dependency carrying the state verbatim — which is precisely what the owned lanes exist to avoid.
 
 ## Method
 
