@@ -55,3 +55,11 @@ cortexkit-store = { path = "../commons/crates/cortexkit-store" }
 cortexkit-store-types = { path = "../commons/crates/cortexkit-store-types" }
 cortexkit-log = { path = "../commons/crates/cortexkit-log" }
 tracing = "0.1"
+
+# Sibling crates are taken by path here, but subc-daemon pins the same commons
+# crates by git rev, and cargo treats path and git as distinct sources -- so the
+# graph compiled cortexkit-log and cortexkit-store-types twice. Redirect the git
+# source at the path checkout the workspace already uses, so one source wins.
+[patch."https://github.com/cortexkit/commons.git"]
+cortexkit-log = { path = "../commons/crates/cortexkit-log" }
+cortexkit-store-types = { path = "../commons/crates/cortexkit-store-types" }
