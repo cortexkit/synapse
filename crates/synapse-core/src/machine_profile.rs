@@ -202,6 +202,25 @@ fn ram_class(probe: Prober) -> Result<String, ProfileProbeError> {
     }
 }
 
+/// The ANE subtype, carrying HOW it was learned in the value itself.
+///
+/// The `(map)` suffix is provenance: this came from the static chip-identity
+/// table, not from a device probe. Nothing parses it today.
+///
+/// READ THIS BEFORE ADDING A PROBED SUBTYPE. The suffix means the two spellings
+/// are distinct strings, and this value feeds the machine-profile hash that
+/// gates serving, so the day a probe lands someone must decide whether `"h16"`
+/// and `"h16(map)"` are the same machine. There is no safe default:
+///
+/// - Treat them as THE SAME and certification evidence gathered while we were
+///   guessing transfers to a machine where the guess was verified. Usually
+///   harmless, and wrong exactly when the static map was wrong about a chip --
+///   which is the case a probe exists to catch.
+/// - Treat them as DIFFERENT and every Apple machine's fingerprint rotates when
+///   the probe ships, costing a full re-certification for no physical change.
+///
+/// Whoever adds the probe owns that call and should record it here rather than
+/// letting the string comparison decide silently.
 fn ane_subtype(chip_model: &str) -> Option<String> {
     #[cfg(target_os = "macos")]
     {
