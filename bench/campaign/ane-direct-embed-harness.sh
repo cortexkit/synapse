@@ -170,6 +170,26 @@ def configured_constants() -> None:
     for name, pinned in expected.items():
         if os.environ.get(name, pinned) != pinned:
             raise HarnessError(f"campaign registration {name} disagrees with the pinned harness")
+    # The load ceiling is a scoring constant, not an operational knob, so it is
+    # validated with the digests rather than left to the environment. It was not,
+    # and a registration setting 24 silently beat the documented 16 while the
+    # emitted note went on asserting 16 -- measured consequence: the SAME
+    # unmodified tree scored 7619 / 9049 / 7586 tok/s across three passes at
+    # ambient load 27-30, a 19.3% spread that fails a 3% win threshold against
+    # its own baseline in 3 of 3 runs. Above this ceiling the harness scores
+    # ambient load, not the candidate.
+    configured_load = os.environ.get(
+        "SYNAPSE_CAMPAIGN_MAX_LOAD_1M", str(DEFAULT_MAX_LOAD_1M)
+    )
+    try:
+        configured_load_value = float(configured_load)
+    except ValueError as error:
+        raise HarnessError("configured load threshold is not numeric") from error
+    if configured_load_value != DEFAULT_MAX_LOAD_1M:
+        raise HarnessError(
+            "campaign registration SYNAPSE_CAMPAIGN_MAX_LOAD_1M disagrees with the "
+            f"pinned harness ({configured_load_value:g} vs {DEFAULT_MAX_LOAD_1M:g})"
+        )
 
 
 def verify_regular_file(path: Path, label: str) -> None:
@@ -732,7 +752,7 @@ def run_harness(workspace_arg: str, runner_arg: str, result_arg: str) -> int:
         note = (
             f"{baseline_note} Row set SHA-256={ROW_SET_SHA256}; binding commit={BINDING_COMMIT}; "
             f"minimum cosine across shapes={min_cosine:.9f}; one-minute load threshold={maximum_load:.2f}. "
-            "A threshold of 16 admits this shared workstation's normal background load and therefore carries more "
+            f"A threshold of {DEFAULT_MAX_LOAD_1M:g} admits this shared workstation's normal background load and therefore carries more "
             "absolute variance than a dedicated 2.5-load rig; every shape records admission, in-report, and completion load."
         )
         writer.write({

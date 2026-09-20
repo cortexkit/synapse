@@ -7,10 +7,10 @@
 {
   "machine": "m5-local",
   "harness_path": "bench/campaign/ane-direct-embed-harness.sh",
-  "harness_sha256": "a3f9546e2402ffb5ce077a915cb52d609e2f964de732807e40b0d68291185933",
+  "harness_sha256": "7daf809e60e566b453662fba110c225294b4944b646996175f6fede4e68c6db5",
   "parameters": {},
   "parity_command": {
-    "harness_sha256": "a3f9546e2402ffb5ce077a915cb52d609e2f964de732807e40b0d68291185933",
+    "harness_sha256": "7daf809e60e566b453662fba110c225294b4944b646996175f6fede4e68c6db5",
     "program": "{harness}",
     "args": ["{workspace}", "{candidate_runner}", "{result}"],
     "env": {
@@ -26,11 +26,11 @@
       "RUSTUP_HOME": "<RIG>/.rustup",
       "CARGO_HOME": "<RIG>/.cargo",
       "CARGO_NET_OFFLINE": "1",
-      "SYNAPSE_CAMPAIGN_MAX_LOAD_1M": "24"
+      "SYNAPSE_CAMPAIGN_MAX_LOAD_1M": "16"
     }
   },
   "objective_command": {
-    "harness_sha256": "a3f9546e2402ffb5ce077a915cb52d609e2f964de732807e40b0d68291185933",
+    "harness_sha256": "7daf809e60e566b453662fba110c225294b4944b646996175f6fede4e68c6db5",
     "program": "{harness}",
     "args": ["{workspace}", "{candidate_runner}", "{result}"],
     "env": {
@@ -46,7 +46,7 @@
       "RUSTUP_HOME": "<RIG>/.rustup",
       "CARGO_HOME": "<RIG>/.cargo",
       "CARGO_NET_OFFLINE": "1",
-      "SYNAPSE_CAMPAIGN_MAX_LOAD_1M": "24"
+      "SYNAPSE_CAMPAIGN_MAX_LOAD_1M": "16"
     }
   },
   "output_schema": {
@@ -69,7 +69,7 @@
     "bench/spikes/ane-direct-probe/Cargo.toml",
     "bench/spikes/ane-direct-probe/Cargo.lock"
   ],
-  "load_threshold_1m": 24,
+  "load_threshold_1m": 16,
   "action_timeout_seconds": 1800,
   "warmup": {"first_per_side": 0, "warm_per_side": 0},
   "budget": {"hours": 6, "machine_cost_usd": 0.0, "max_rounds": 6}
