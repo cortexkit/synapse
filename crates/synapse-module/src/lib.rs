@@ -14792,6 +14792,25 @@ fn module_catalog_entries(state: &ModuleState) -> Vec<ModelCatalogEntry> {
                             CERT_EVIDENCE_SCHEMA_REVISION,
                             &[],
                         )
+                        // A store error renders identically to "no certified
+                        // row": both become false. That direction is
+                        // deliberate and fail-closed -- an unreadable store
+                        // must never publish `certified: true`. What it costs
+                        // is an operator who cannot tell "not certified" from
+                        // "database unreadable", so make the error OBSERVABLE
+                        // rather than changing what the flag means. Absence is
+                        // already spoken for by lane classes with no
+                        // certification concept; giving it a second producer
+                        // here would trade a silent error for an ambiguous
+                        // field.
+                        .inspect_err(|error| {
+                            tracing::warn!(
+                                target: "synapse.catalog",
+                                model_id = %spec.model_id,
+                                %error,
+                                "certification row unreadable; reporting certified=false"
+                            );
+                        })
                         .ok()
                         .flatten()
                         .is_some_and(|row| row.status == CertificationStatus::Certified);
@@ -14804,6 +14823,16 @@ fn module_catalog_entries(state: &ModuleState) -> Vec<ModelCatalogEntry> {
                             &state.machine_profile_hash,
                             &certification_fingerprint,
                         )
+                        // Same fail-closed swallow as the decode arm above, and
+                        // the same remedy: report it rather than encode it.
+                        .inspect_err(|error| {
+                            tracing::warn!(
+                                target: "synapse.catalog",
+                                model_id = %spec.model_id,
+                                %error,
+                                "certification row unreadable; reporting certified=false"
+                            );
+                        })
                         .ok()
                         .flatten()
                         .is_some();
