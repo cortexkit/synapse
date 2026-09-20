@@ -9283,6 +9283,17 @@ fn owned_decode_environment(
         worker_path_matches: admission.is_some(),
         constrained_identities_match: admission.is_some(),
         artifacts_trusted,
+        // Subsumed rather than unchecked, which is not obvious from the
+        // literal. This arm's contract is "the exact runtime and processing
+        // identities are installed", and `admission` is the fenced
+        // certification match, which compares processing_fingerprint,
+        // runtime_config_digest, constraint_runtime_identities and
+        // worker_path_evidence against the stored row before it resolves
+        // (`store.rs:7636-7648`). A row that disagrees on any of them does
+        // not match, so `admission.is_some()` -- already required by the
+        // four arms above -- is the identity check. Passing `admission`
+        // here too would add a fifth reading of one fact rather than a
+        // check; the honest value is the constant, with the reason stated.
         identities_installed: true,
         quarantined,
         wire_bindings_literal: owned_decode_certification::wire_bindings_are_literal(

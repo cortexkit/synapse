@@ -285,6 +285,16 @@ pub struct ServingPredicateInputs {
     pub worker_path_matches: bool,
     pub constrained_identities_match: bool,
     pub artifacts_trusted: bool,
+    /// The exact runtime and processing identities are installed.
+    ///
+    /// Production supplies a constant `true` deliberately: the fenced
+    /// certification match the other arms depend on already compares
+    /// processing_fingerprint, runtime_config_digest,
+    /// constraint_runtime_identities and worker_path_evidence, so a row that
+    /// disagrees never resolves and the identity obligation is discharged
+    /// there. The arm is kept because it names a distinct obligation, and a
+    /// caller able to check identity installation independently of a
+    /// certification row should supply that answer rather than the constant.
     pub identities_installed: bool,
     pub quarantined: bool,
     pub wire_bindings_literal: bool,
