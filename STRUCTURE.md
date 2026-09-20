@@ -22,7 +22,7 @@
 │   │   ├── ts-embed/       # TypeScript Bun/Node runner (Transformers.js or ORT Node)
 │   │   └── wrap-embed/     # External API wrapper (Ollama/LMStudio)
 │   ├── rig/                # External measurement harness and candidate supervisor
-│   ├── spikes/             # Benchmarking experimental spikes (unified-rt, ane-minilm, ane-modernbert-full-context)
+│   ├── spikes/             # Benchmarking experimental spikes (unified-rt, ane-minilm, ane-modernbert-full-context, laya-owned)
 │   └── results/            # Saved telemetry metrics, results, and vectors
 ├── contracts/              # Interface contracts and validation scripts (ane-prefill-split)
 ├── corpus/                 # Code chunk files used for evaluations
@@ -45,9 +45,11 @@
 ├── tools/                  # Shared system tools and distillation harnesses
 │   ├── gather-distill/     # External gather-distillation data generation harness
 │   └── stt-voice-test/     # Web-based speech-to-text voice testing utility
+├── scripts/                # Packaging, CI monitoring, and sibling lock maintenance scripts
 ├── workers/                # Separately supervised Swift/CoreML sidecar processes
 │   └── ane-prefill-sidecar/ # Swift/CoreML fixed-window prefill sidecar for Qwen3
 ├── Cargo.toml              # Cargo workspace definition
+├── CONTRIBUTING.md         # Contribution workflow (issue first, then PR)
 ├── DECISIONS.md            # Log of architecture design decisions
 └── FOUNDING.md             # Foundational constraints and handoff requirements
 ```
@@ -71,7 +73,7 @@
 
 **crates/synapse-core/:**
 - Purpose: Defines shared abstractions for engines, worker protocol, caching, machine capability profiles, and scheduling.
-- Contains: Envelopes, machine profile structs, engine traits, error contracts with exhaustive stable error codes (`StableErrorCode::ALL` in `error_contract.rs`), shared canonical worker HELLO handshake identities with sibling binary file names (`worker_binary_file_name` in `worker_engine_names.rs`), `WorkerResponse` bucket ladder disclosures (`buckets: Option<Vec<usize>>`), sanitized tokenizer batching with `submitted_sha256` digest retention, and request-scoped sidecar specification contracts (`sidecar_spec.rs`).
+- Contains: Envelopes, machine profile structs with bounded fail-closed identity probes (`ProfileProbeError` preventing placeholder fallback and profile hash drift), engine traits, error contracts with exhaustive stable error codes (`StableErrorCode::ALL` in `error_contract.rs`), shared canonical worker HELLO handshake identities with sibling binary file names (`worker_binary_file_name` in `worker_engine_names.rs`), `WorkerResponse` bucket ladder disclosures (`buckets: Option<Vec<usize>>`), sanitized tokenizer batching with `submitted_sha256` digest retention, and request-scoped sidecar specification contracts (`sidecar_spec.rs`).
 - Key files: `crates/synapse-core/src/worker_protocol.rs`, `crates/synapse-core/src/tokenizer.rs`, `crates/synapse-core/src/scheduler.rs`, `crates/synapse-core/src/machine_profile.rs`, `crates/synapse-core/src/worker_engine_names.rs`, `crates/synapse-core/src/error_contract.rs`
 
 **crates/synapse-engine-cuda/:**
@@ -86,12 +88,12 @@
 
 **crates/synapse-engine-owned/:**
 - Purpose: The primary in-process execution engine for Apple Silicon (macOS), hosting embedding engines, direct Metal step decode engines, ModernBERT pair reranking, and decode worker supervision.
-- Contains: Metal MPSGraph inference layers for ModernBERT, Qwen3, and MiniLM models, bucket policy v2 (`BUCKET_POLICY_VERSION = 2`) with an 18-step bounded sequence ladder up to 8192, singleton row execution shapes (`batch = 1`), eager preloading bounded to `<= 512` sequences, cache limits (`MAX_SEQUENCE_BUCKETS = 18`, `MAX_CACHED_BUCKET_SHAPES = 36`), direct Metal step decode engines (`owned-decode-engine`), ModernBERT pair reranking (`rerank_pairs`), model capability descriptor queries (`model_info`), and supervised decode worker state management and sidecar hint bank installation protocol (`owned-decode-worker`).
+- Contains: Metal MPSGraph inference layers for ModernBERT, Qwen3, and MiniLM models, bucket policy v2 (`BUCKET_POLICY_VERSION = 2`) with an 18-step bounded sequence ladder up to 8192, singleton row execution shapes (`batch = 1`), eager preloading bounded to `<= 512` sequences, cache limits (`MAX_SEQUENCE_BUCKETS = 18`, `MAX_CACHED_BUCKET_SHAPES = 36`), direct Metal step decode engines (`owned-decode-engine`), unpooled token hidden-state extraction (`encode_hidden` producing `HiddenStates` for ModernBERT), ModernBERT pair reranking (`rerank_pairs`), model capability descriptor queries (`model_info`), and supervised decode worker state management and sidecar hint bank installation protocol (`owned-decode-worker`).
 - Key files: `crates/synapse-engine-owned/src/lib.rs`, `crates/synapse-engine-owned/src/runtime.rs`, `crates/synapse-engine-owned/examples/embed_bucket_probe.rs`, `crates/synapse-engine-owned/examples/long_row_probe.rs`, `crates/synapse-engine-owned/owned-decode-engine/src/lib.rs`, `crates/synapse-engine-owned/owned-decode-worker/src/lib.rs`
 
 **crates/synapse-module/:**
-- Purpose: The primary SubC service module. Handles the content-addressed model cache, durable jobs, worker hosting (offloading worker drop teardown to dedicated threads), remote provider dispatch (with class-based vault error disposition), owned decode routing, grammar compilation, approval storage and identity-based rollback (`rollback.rs`), probe certification and persistent staleness tracking (`certification_stale_since_ms`), admission telemetry counters (`jobs_minted` with terminal `jobs_completed`/`jobs_failed`/`jobs_inherited` and derived `jobs_open`), full per-lane capability reporting on `models.list`, dual-hash embed divergence verification (`submitted_sha256` alongside `content_sha256`), owned CUDA evidence from the isolated per-worker floor probe and declared identities, persisted native owned profiles with cache-assembled packages, and route binding.
-- Contains: SQLite store initialization, SubC `ModuleHandler` implementation, UNIX socket / Windows pipe worker spawning, remote gateway client, owned decode routing (`owned-decode-routing`), grammar compilation and DECODE scheduler (`owned-decode-grammar-scheduler`), certification gates and probes (`owned-decode-certification`), per-worker-path isolated CUDA floor probe cache, persisted native owned profiles with per-job load scratch paths, approval rollback (`rollback.rs`), contract manifests (`owned-decode-manifests`), model catalog descriptors publishing per-row ceilings `max_tokens` with source provenance `max_tokens_source`, discrete `bucket_ladder` envelopes, output dimensions, dtypes, device classes, and warm-load hints, and request-scoped semantic-sidecar hint bank normalization and per-field slotting (`owned-decode-sidecar`).
+- Purpose: The primary SubC service module. Handles the content-addressed model cache, durable jobs, worker hosting (offloading worker drop teardown to dedicated threads with a bounded 5-second join budget), remote provider dispatch (with class-based vault error disposition), owned decode routing, grammar compilation, approval storage and identity-based rollback (`rollback.rs`), probe certification and persistent staleness tracking (`certification_stale_since_ms`), admission telemetry counters (`jobs_minted` with terminal `jobs_completed`/`jobs_failed`/`jobs_inherited` and derived `jobs_open`), full per-lane capability reporting on `models.list`, dual-hash embed divergence verification (`submitted_sha256` alongside `content_sha256`), owned CUDA evidence from the isolated per-worker floor probe and declared identities, persisted native owned profiles with cache-assembled packages, and route binding.
+- Contains: SQLite store initialization with unscoped decode measurement queries (`latest_owned_decode_measurement_row`) separating profile rotation staleness from never-probed lanes, SubC `ModuleHandler` implementation, UNIX socket / Windows pipe worker spawning, remote gateway client, owned decode routing (`owned-decode-routing`), grammar compilation and DECODE scheduler (`owned-decode-grammar-scheduler`), certification gates and probes (`owned-decode-certification`), per-worker-path isolated CUDA floor probe cache, persisted native owned profiles with per-job load scratch paths, approval rollback (`rollback.rs`), contract manifests (`owned-decode-manifests`), model catalog descriptors publishing per-row ceilings `max_tokens` with source provenance `max_tokens_source`, discrete `bucket_ladder` envelopes, output dimensions, dtypes, device classes, serving admission states (`serving_admission`, `serving_admission_reason`), and warm-load hints, and request-scoped semantic-sidecar hint bank normalization and per-field slotting (`owned-decode-sidecar`).
 - Key files: `crates/synapse-module/src/lib.rs`, `crates/synapse-module/src/worker_host/mod.rs`, `crates/synapse-module/src/rollback.rs`, `crates/synapse-module/src/ane_artifact.rs`, `crates/synapse-module/src/remote/vault.rs`, `crates/synapse-module/owned-decode-routing/mod.rs`, `crates/synapse-module/owned-decode-grammar-scheduler/mod.rs`, `crates/synapse-module/src/fixtures/probe_corpus_qwen3_embedding_fp32.json`
 
 **crates/synapse-opctl/:**
@@ -139,8 +141,8 @@
 
 **bench/spikes/:**
 - Purpose: Holds discrete architecture experimentation paths and new backend developments.
-- Contains: `unified-rt` (CUDA/Vulkan/M1 exact-match execution, including direct Metal step kernels, LFM2 Metal step engine, and Vulkan Qwen3 decode), `ane-minilm` (Apple Neural Engine CoreML conversion), `ane-prefill-split` (Apple Neural Engine prefill and Metal decode split measurement spike), `ane-modernbert-full-context` (fixed-shape 8192-token ModernBERT ANE feasibility spike, query tiling, and Hadamard rotation conditioning), and `ane-direct-probe` (private `_ANEInMemoryModel` API probes: identity-projection correctness gate, faithful full-model gate, per-part ModernBERT layer attribution, attention matmul gap, direct sequence scaling, SRAM/sequence scaling, per-shape compile cost, weight residency, and lexical-overlap retrieval audit; standalone workspace deliberately outside the root `Cargo.toml` members).
-- Key files: `bench/spikes/unified-rt/src/main.rs`, `bench/spikes/unified-rt/src/vulkan_backend.rs`, `bench/spikes/unified-rt/src/cuda_backend.rs`, `bench/spikes/unified-rt/src/lfm2.rs`, `bench/spikes/unified-rt/src/lfm2_audio.rs`, `bench/spikes/unified-rt/src/lfm2_decode.rs`, `bench/spikes/unified-rt/src/qwen3_decode.rs`, `bench/spikes/unified-rt/src/qwen3_decode_vulkan.rs`, `bench/spikes/unified-rt/src/qwen3_decode_metal_step.rs`, `bench/spikes/unified-rt/src/lfm2_decode_metal_step.rs`, `bench/spikes/ane-prefill-split/src/main.rs`, `bench/spikes/ane-modernbert-full-context/spike.py`, `bench/spikes/ane-modernbert-full-context/compare_long_rows.py`, `bench/spikes/ane-modernbert-full-context/attribute_load.py`, `bench/spikes/ane-direct-probe/src/main.rs`, `bench/spikes/ane-direct-probe/src/bin/modernbert_layer.rs`, `bench/spikes/ane-direct-probe/src/bin/modernbert_full.rs`, `bench/spikes/ane-direct-probe/src/bin/attention_gap.rs`, `bench/spikes/ane-direct-probe/src/bin/sequence_attribution.rs`, `bench/spikes/ane-direct-probe/lexical_overlap_probe.py`
+- Contains: `unified-rt` (CUDA/Vulkan/M1 exact-match execution, including direct Metal step kernels, LFM2 Metal step engine, and Vulkan Qwen3 decode), `laya-owned` (typed-decision model spike evaluating categorical choice, ordinal score, and calibrated noul question execution over ModernBERT hidden states using host-side decision heads), `ane-minilm` (Apple Neural Engine CoreML conversion), `ane-prefill-split` (Apple Neural Engine prefill and Metal decode split measurement spike), `ane-modernbert-full-context` (fixed-shape 8192-token ModernBERT ANE feasibility spike, query tiling, and Hadamard rotation conditioning), and `ane-direct-probe` (private `_ANEInMemoryModel` API probes: identity-projection correctness gate, faithful full-model gate, per-part ModernBERT layer attribution, attention matmul gap, direct sequence scaling, SRAM/sequence scaling, per-shape compile cost, weight residency, and lexical-overlap retrieval audit; standalone workspace deliberately outside the root `Cargo.toml` members).
+- Key files: `bench/spikes/unified-rt/src/main.rs`, `bench/spikes/unified-rt/src/vulkan_backend.rs`, `bench/spikes/unified-rt/src/cuda_backend.rs`, `bench/spikes/unified-rt/src/lfm2.rs`, `bench/spikes/unified-rt/src/lfm2_audio.rs`, `bench/spikes/unified-rt/src/lfm2_decode.rs`, `bench/spikes/unified-rt/src/qwen3_decode.rs`, `bench/spikes/unified-rt/src/qwen3_decode_vulkan.rs`, `bench/spikes/unified-rt/src/qwen3_decode_metal_step.rs`, `bench/spikes/unified-rt/src/lfm2_decode_metal_step.rs`, `bench/spikes/laya-owned/src/main.rs`, `bench/spikes/ane-prefill-split/src/main.rs`, `bench/spikes/ane-modernbert-full-context/spike.py`, `bench/spikes/ane-modernbert-full-context/compare_long_rows.py`, `bench/spikes/ane-modernbert-full-context/attribute_load.py`, `bench/spikes/ane-direct-probe/src/main.rs`, `bench/spikes/ane-direct-probe/src/bin/modernbert_layer.rs`, `bench/spikes/ane-direct-probe/src/bin/modernbert_full.rs`, `bench/spikes/ane-direct-probe/src/bin/attention_gap.rs`, `bench/spikes/ane-direct-probe/src/bin/sequence_attribution.rs`, `bench/spikes/ane-direct-probe/lexical_overlap_probe.py`
 
 **bench/eval-coir/:**
 - Purpose: Hosts the CoIR retrieval and rerank quality evaluation harness.
@@ -206,6 +208,11 @@
 - Contains: Bun workspaces, Anthropic/OpenAI API adapters (supporting OpenAI OAuth transports), AFT child process pools, validation scripts, scoring modules, utility judge matrix evaluation engines, Axolotl SFT training configs (`tools/gather-distill/train/axolotl/`), Antares gather-SFT rungs (`tools/gather-distill/train/ANTARES-RUNG.md`), and student ladder evaluation results (`tools/gather-distill/train/SCALE-LADDER.md`).
 - Key files: `tools/gather-distill/src/cli.ts`, `tools/gather-distill/README.md`, `tools/gather-distill/BAKEOFF-ZEROSHOT.md`, `tools/gather-distill/train/ANTARES-RUNG.md`, `tools/gather-distill/train/SCALE-LADDER.md`
 
+**scripts/:**
+- Purpose: Houses build, release packaging, CI monitoring, and sibling lock maintenance utilities.
+- Contains: Shell and PowerShell scripts for packaging CUDA binaries, CI watch loops, and sibling lock refresh tooling.
+- Key files: `scripts/package-owned-cuda.ps1`, `scripts/refresh-siblings-lock.sh`, `scripts/watch-ci.sh`
+
 ## Key File Locations
 
 **Entry Points:**
@@ -245,6 +252,7 @@
 - `crates/synapse-module/src/remote/runtime.rs`: Provider pool routing, circuit breaker enforcement, and telemetry collection for external model execution.
 - `crates/synapse-module/src/remote/vault.rs`: Vault credential retrieval via SubC `claustrum` route with class-based error disposition (`transient`, `auth_required`, `permanent`, `context_overflow`).
 - `crates/synapse-engine-cuda/src/lib.rs`: Production owned CUDA embed engine, model family detection, and PTX build identity.
+- `crates/synapse-engine-owned/src/lib.rs`: Production owned Metal embed engine, unpooled token hidden-state extraction (`encode_hidden`), and loaded model capability metadata.
 - `crates/synapse-engine-ort/src/lib.rs`: Production in-process ONNX Runtime CPU embed engine with dynamic threading and pooling support.
 - `crates/synapse-worker-cuda/src/main.rs`: Supervised CUDA worker IPC framing loop.
 - `crates/synapse-engine-owned/src/runtime.rs`: Bucket policy v2 ladder (up to 8192), batch planning (`plan_batches`), singleton shape compilation, and caching boundaries.
@@ -255,12 +263,13 @@
 - `crates/synapse-module/owned-decode-routing/ane_prefill.rs`: ANE prefill split routing (`AnePrefillRouter`), fixed-window bucket selection (`W128`, `W256`, `W512`), attempt timing budgets, consecutive-strike health (`SplitArmHealth`), and closed bypass (`PrefillBypassReason`) and fallback (`PrefillFallbackReason`) provenance.
 - `crates/synapse-worker-decode/src/runner.rs`: Supervised Metal decode worker runner and IPC protocol loop.
 - `crates/synapse-module/src/worker_host/mod.rs`: Spawns and manages worker lifecycles over Unix domain sockets or Windows named pipes using a binary framing protocol.
-- `crates/synapse-module/src/lib.rs`: Full per-lane capability descriptors in `models.list` and `submitted_sha256` emission on embed query/batch results.
-- `crates/synapse-module/src/store.rs`: SQLite-backed state for content-addressed model cache, durable jobs, active attempts, profile activation epochs, and persistent `certification_stale_since_ms` tracking.
+- `crates/synapse-module/src/lib.rs`: Full per-lane capability descriptors in `models.list` (including `serving_admission` and `serving_admission_reason`), and `submitted_sha256` emission on embed query/batch results.
+- `crates/synapse-module/src/store.rs`: SQLite-backed state for content-addressed model cache, durable jobs, active attempts, profile activation epochs, unscoped decode measurements (`latest_owned_decode_measurement_row`), and persistent `certification_stale_since_ms` tracking.
 - `crates/synapse-module/src/ane_artifact.rs`: Digest-keyed stable materialization of archived CoreML bundles (extract-once publish, digest verification, 24-hour abandoned-temp reclamation).
 - `bench/spikes/ane-modernbert-full-context/modernbert_tiled.py`: Query-tiled ModernBERT implementation preserving 22 layers, RoPE, and local/global windows with Hadamard rotation conditioning.
+- `bench/spikes/laya-owned/src/main.rs`: Laya typed-decision runner evaluating ModernBERT hidden states with host-side transformer decision head.
 - `crates/synapse-core/src/scheduler.rs`: 3-class fair-share aging scheduler for managing concurrent inference requests.
-- `crates/synapse-core/src/machine_profile.rs`: Defines `MachineProfile` hardware identity structures and static `ane_subtype` chip mapping.
+- `crates/synapse-core/src/machine_profile.rs`: Defines `MachineProfile` hardware identity structures, static `ane_subtype` chip mapping, and bounded fail-closed identity probes (`ProfileProbeError`).
 - `bench/harness/src/metrics.rs`: Macmon power metrics execution, parsing, and system idle gating.
 - `bench/harness/src/parity.rs`: Numerical calculation of cosine similarity, rank stability/overlap checks, and file parsing functions.
 - `bench/lanes/mlx-minilm/main.py`: Length-sorted batched MLX GPU execution for MiniLM.
