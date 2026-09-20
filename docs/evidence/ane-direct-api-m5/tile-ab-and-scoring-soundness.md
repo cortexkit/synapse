@@ -40,7 +40,32 @@ Verdict: **inconclusive**. Tile 256 is not the free win it looked like, and tile
 128 is not proven optimal here either. The question stays open and needs a quiet
 box, not another opinion.
 
-## The control's own variance is the finding worth keeping
+## CORRECTION (2026-09-20, same day): what this says about the ENGINE
+
+The section below was published claiming the campaign gate would reject the
+unmodified tree 3 of 3. **That is wrong and the error is mine.** No surface
+reported it; I computed it by hand against the pinned constant and asserted it
+about a system I had not read.
+
+The campaign engine never scores an absolute against a cross-session constant.
+It runs an interleaved order of control and candidate samples inside one block,
+folds `paired_ratios(candidate, control)` per position, takes the median, and
+promotes on a bootstrapped `interval.lower >= min_gain`. The 19.3% swing below
+cancels in that ratio by construction and the pinned baseline never enters the
+verdict.
+
+What my run *would* have triggered is the engine's own drift check: a control at
+7.6k against a 9.2k epoch reference is `control_drifted`, which aborts the block
+`InvalidControlDrift` with `RebaselineRequired` and re-measures before scoring
+anything. So the engine detects exactly the condition I claimed it was blind to.
+
+The numbers below are sound. Their subject was wrong: they are evidence about
+THE BOX, and the empirical case for why paired ratios and drift detection are
+necessary — not evidence that they are missing. The load-ceiling fix still
+stands on its own, because drift detection catches drift and does not catch a
+ceiling nobody validated.
+
+## The control's own variance, as evidence about the machine
 
 The three control passes are the *same unmodified tree*:
 
@@ -49,11 +74,13 @@ The three control passes are the *same unmodified tree*:
 Ambient load during the run was 27-30. The pinned campaign baseline of
 9,222.45 tok/s was admitted at load 8.13.
 
-Consequences for the harness as registered:
+Consequences, corrected:
 
-1. **Absolute-against-a-pinned-constant scoring is unsound on this box.** The
-   unmodified tree failed a 3%-win threshold against its own baseline in 3 of 3
-   passes. A candidate is therefore scored mostly on the ambient load it drew.
+1. **A bare harness invocation compared to a cross-session constant is not a
+   score on this box.** The unmodified tree lands 17-18% below its own pinned
+   baseline in 3 of 3 passes. That is a statement about running the harness
+   DIRECTLY, which is what I did; inside a block the engine pairs against a
+   co-measured control and would call this drift, not a failure.
 2. **The load ceiling admits that.** The registration sets
    `SYNAPSE_CAMPAIGN_MAX_LOAD_1M=24` while the harness documents 16 and its own
    emitted note asserts "a threshold of 16 admits this shared workstation's
@@ -69,9 +96,10 @@ Consequences for the harness as registered:
 
 Before re-firing:
 
-- Score candidate/control ratios measured in one session. The harness currently
-  measures one tree per invocation and compares to a constant from another
-  session; that has to change or the campaign measures load.
+- Nothing about scoring. The engine already pairs within a block; that item was
+  my error and is struck. What remains true is that the harness must keep being
+  invoked per side by the block rather than compared to a constant by hand,
+  which is how it is registered.
 - Reconcile the load ceiling with the baseline's admission load, and make
   `configured_constants()` validate it so the two cannot silently diverge again.
 - Tell proposal authors the tile question is **open on this tree**, not closed.
