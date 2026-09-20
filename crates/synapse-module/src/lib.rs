@@ -4376,67 +4376,16 @@ async fn owned_decode_session_decode(state: Arc<ModuleState>, params: Value) -> 
         frames.push(frame);
         sequence = sequence.saturating_add(1);
 
-        if let Some(abort) = sessions
-            .pending_aborts
-            .remove(&(params.session_id.clone(), params.req_id.clone()))
-        {
-            let retention = if abort.retain_kv {
-                let retained_kv_session_id = format!(
-                    "{}:retained:{}:{}",
-                    params.session_id, committed, sessions.next_session_sequence
-                );
-                sessions.next_session_sequence = sessions.next_session_sequence.saturating_add(1);
-                let catalog_fingerprint = sessions
-                    .sessions
-                    .get(&params.session_id)
-                    .expect("active session exists")
-                    .catalog_fingerprint
-                    .clone();
-                match state.store.retain_serving_state(
-                    &retained_kv_session_id,
-                    &catalog_fingerprint,
-                    now_ms(),
-                ) {
-                    Ok(store::ServingContinuationAdmission::Admitted { .. }) => {
-                        owned_decode_worker::RetentionPreflight::Ready {
-                            retained_kv_session_id,
-                            retained_position: committed,
-                        }
-                    }
-                    Ok(store::ServingContinuationAdmission::Refused { .. }) | Err(_) => {
-                        owned_decode_worker::RetentionPreflight::Refused
-                    }
-                }
-            } else {
-                owned_decode_worker::RetentionPreflight::NotRequested
-            };
-            match sessions
-                .streams
-                .abort(&params.session_id, &params.req_id, retention, None)
-            {
-                Ok(outcome) => {
-                    if let Some(prefix) = outcome.retained_prefix {
-                        if let Some(session) = sessions.sessions.get_mut(&params.session_id) {
-                            session.retained_kv_session_id = Some(prefix.retained_kv_session_id);
-                            session.retained_position = Some(prefix.retained_position);
-                        }
-                    }
-                    frames.push(outcome.terminal);
-                    sessions.scheduler.remove_op(&op_id);
-                    if let Some(session) = sessions.sessions.get_mut(&params.session_id) {
-                        session.active_request = None;
-                    }
-                    return result_outcome(json!({
-                        "session_id": params.session_id,
-                        "req_id": params.req_id,
-                        "cancelled": outcome.cancellation,
-                        "frames": frames,
-                    }));
-                }
-                Err(error) => {
-                    return owned_decode_failure(&state, "worker_protocol_error", error.to_string())
-                }
-            }
+        if let Some(outcome) = take_pending_session_abort(
+            &state,
+            &mut sessions,
+            &params.session_id,
+            &params.req_id,
+            committed,
+            &op_id,
+            &mut frames,
+        ) {
+            return outcome;
         }
         if index + 1 < chunks.len() {
             sessions.scheduler.requeue_continuation(&op_id);
@@ -4460,67 +4409,16 @@ async fn owned_decode_session_decode(state: Arc<ModuleState>, params: Value) -> 
     }
     // A zero-token worker result has no progress loop to detect an abort requested
     // before completion, so apply abort handling at the already-committed boundary.
-    if let Some(abort) = sessions
-        .pending_aborts
-        .remove(&(params.session_id.clone(), params.req_id.clone()))
-    {
-        let retention = if abort.retain_kv {
-            let retained_kv_session_id = format!(
-                "{}:retained:{}:{}",
-                params.session_id, committed, sessions.next_session_sequence
-            );
-            sessions.next_session_sequence = sessions.next_session_sequence.saturating_add(1);
-            let catalog_fingerprint = sessions
-                .sessions
-                .get(&params.session_id)
-                .expect("active session exists")
-                .catalog_fingerprint
-                .clone();
-            match state.store.retain_serving_state(
-                &retained_kv_session_id,
-                &catalog_fingerprint,
-                now_ms(),
-            ) {
-                Ok(store::ServingContinuationAdmission::Admitted { .. }) => {
-                    owned_decode_worker::RetentionPreflight::Ready {
-                        retained_kv_session_id,
-                        retained_position: committed,
-                    }
-                }
-                Ok(store::ServingContinuationAdmission::Refused { .. }) | Err(_) => {
-                    owned_decode_worker::RetentionPreflight::Refused
-                }
-            }
-        } else {
-            owned_decode_worker::RetentionPreflight::NotRequested
-        };
-        match sessions
-            .streams
-            .abort(&params.session_id, &params.req_id, retention, None)
-        {
-            Ok(outcome) => {
-                if let Some(prefix) = outcome.retained_prefix {
-                    if let Some(session) = sessions.sessions.get_mut(&params.session_id) {
-                        session.retained_kv_session_id = Some(prefix.retained_kv_session_id);
-                        session.retained_position = Some(prefix.retained_position);
-                    }
-                }
-                frames.push(outcome.terminal);
-                sessions.scheduler.remove_op(&op_id);
-                if let Some(session) = sessions.sessions.get_mut(&params.session_id) {
-                    session.active_request = None;
-                }
-                return result_outcome(json!({
-                    "session_id": params.session_id,
-                    "req_id": params.req_id,
-                    "cancelled": outcome.cancellation,
-                    "frames": frames,
-                }));
-            }
-            Err(error) => {
-                return owned_decode_failure(&state, "worker_protocol_error", error.to_string())
-            }
-        }
+    if let Some(outcome) = take_pending_session_abort(
+        &state,
+        &mut sessions,
+        &params.session_id,
+        &params.req_id,
+        committed,
+        &op_id,
+        &mut frames,
+    ) {
+        return outcome;
     }
     let terminal = synapse_core::TerminalEnvelope {
         req_id: params.req_id.clone(),
