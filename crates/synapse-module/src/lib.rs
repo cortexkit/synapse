@@ -3955,6 +3955,80 @@ fn clear_owned_decode_request(state: &ModuleState, session_id: &str, req_id: &st
     }
 }
 
+/// Consume an abort at a committed session boundary.
+///
+/// This is called after every progress frame and again after the progress loop because a
+/// zero-token worker result has no frame boundary at which to observe a pending abort.
+fn take_pending_session_abort(
+    state: &ModuleState,
+    sessions: &mut OwnedDecodeWireState,
+    session_id: &str,
+    req_id: &str,
+    committed: u32,
+    op_id: &str,
+    frames: &mut Vec<synapse_core::FrameEnvelope>,
+) -> Option<HandlerOutcome> {
+    let abort = sessions
+        .pending_aborts
+        .remove(&(session_id.to_string(), req_id.to_string()))?;
+    let retention = if abort.retain_kv {
+        let retained_kv_session_id = format!(
+            "{session_id}:retained:{committed}:{}",
+            sessions.next_session_sequence
+        );
+        sessions.next_session_sequence = sessions.next_session_sequence.saturating_add(1);
+        let catalog_fingerprint = sessions
+            .sessions
+            .get(session_id)
+            .expect("active session exists")
+            .catalog_fingerprint
+            .clone();
+        match state.store.retain_serving_state(
+            &retained_kv_session_id,
+            &catalog_fingerprint,
+            now_ms(),
+        ) {
+            Ok(store::ServingContinuationAdmission::Admitted { .. }) => {
+                owned_decode_worker::RetentionPreflight::Ready {
+                    retained_kv_session_id,
+                    retained_position: committed,
+                }
+            }
+            Ok(store::ServingContinuationAdmission::Refused { .. }) | Err(_) => {
+                owned_decode_worker::RetentionPreflight::Refused
+            }
+        }
+    } else {
+        owned_decode_worker::RetentionPreflight::NotRequested
+    };
+    match sessions.streams.abort(session_id, req_id, retention, None) {
+        Ok(outcome) => {
+            if let Some(prefix) = outcome.retained_prefix {
+                if let Some(session) = sessions.sessions.get_mut(session_id) {
+                    session.retained_kv_session_id = Some(prefix.retained_kv_session_id);
+                    session.retained_position = Some(prefix.retained_position);
+                }
+            }
+            frames.push(outcome.terminal);
+            sessions.scheduler.remove_op(op_id);
+            if let Some(session) = sessions.sessions.get_mut(session_id) {
+                session.active_request = None;
+            }
+            Some(result_outcome(json!({
+                "session_id": session_id,
+                "req_id": req_id,
+                "cancelled": outcome.cancellation,
+                "frames": frames,
+            })))
+        }
+        Err(error) => Some(owned_decode_failure(
+            state,
+            "worker_protocol_error",
+            error.to_string(),
+        )),
+    }
+}
+
 async fn owned_decode_session_decode(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
     let params: OwnedDecodeSessionDecodeParams = match serde_json::from_value(params) {
         Ok(params) => params,
@@ -15947,6 +16021,330 @@ mod tests {
             continuity_check,
             remote_gateway,
         })
+    }
+
+    const PENDING_ABORT_SESSION_ID: &str = "pending-abort-session";
+    const PENDING_ABORT_REQ_ID: &str = "pending-abort-request";
+    const PENDING_ABORT_COMMITTED: u32 = 2;
+    const PENDING_ABORT_SEQUENCE: u64 = 11;
+
+    fn pending_abort_identity() -> synapse_core::OneshotEnvelopeIdentity {
+        synapse_core::OneshotEnvelopeIdentity {
+            decode_fingerprint: Fingerprint("decode-fingerprint".to_string()),
+            processing_fingerprint: Fingerprint("processing-fingerprint".to_string()),
+            runtime_config_digest: "runtime-digest".to_string(),
+            worker_generation: 7,
+            derived_digest: Some("derived-digest".to_string()),
+        }
+    }
+
+    fn pending_abort_test_state(
+        label: &str,
+        approved_catalog: bool,
+    ) -> (PathBuf, Arc<ModuleState>, String) {
+        let (root, descriptor) = test_storage_descriptor(label);
+        let store = Arc::new(SynapseStore::open(&descriptor).expect("pending-abort store opens"));
+        let profile = test_machine_profile(label);
+        store
+            .observe_profile(&profile, 10, 1)
+            .expect("pending-abort profile activates");
+        let catalog_fingerprint = if approved_catalog {
+            store::configure_serving_catalog_for_test(&store)
+        } else {
+            "d".repeat(64)
+        };
+        let state = test_module_state(store, profile);
+        let op_id = session_request_key(PENDING_ABORT_SESSION_ID, PENDING_ABORT_REQ_ID);
+        {
+            let mut sessions = state
+                .runtime
+                .owned_decode_sessions
+                .lock()
+                .expect("decode sessions lock");
+            sessions.next_session_sequence = PENDING_ABORT_SEQUENCE;
+            sessions.sessions.insert(
+                PENDING_ABORT_SESSION_ID.to_string(),
+                OwnedDecodeWireSession {
+                    catalog_fingerprint,
+                    model_id: "test-model".to_string(),
+                    routing_session_id: owned_decode_routing::admission::SessionId(1),
+                    kv_configuration: owned_decode_routing::admission::SessionKvConfiguration::new(
+                        256, 256,
+                    )
+                    .expect("test KV configuration is valid"),
+                    active_request: Some(PENDING_ABORT_REQ_ID.to_string()),
+                    retained_kv_session_id: None,
+                    retained_position: None,
+                    closed: false,
+                },
+            );
+            sessions
+                .streams
+                .begin(owned_decode_worker::StreamRequest {
+                    req_id: PENDING_ABORT_REQ_ID.to_string(),
+                    session_id: PENDING_ABORT_SESSION_ID.to_string(),
+                    generation_id: "generation-1".to_string(),
+                    identity: pending_abort_identity(),
+                    decode_mode: synapse_core::DecodeMode::Serial,
+                    grammar_constrained: false,
+                    chain_k: 1,
+                })
+                .expect("pending-abort stream begins");
+            sessions
+                .streams
+                .observe_frame(&synapse_core::FrameEnvelope::new(
+                    PENDING_ABORT_REQ_ID,
+                    PENDING_ABORT_SESSION_ID,
+                    synapse_core::StreamSequence::FIRST,
+                    synapse_core::WorkerFrame::Progress {
+                        progress: synapse_core::ProgressFrame {
+                            committed_token_ids: vec![17, 23],
+                            committed_token_count: PENDING_ABORT_COMMITTED,
+                            boundary: synapse_core::ProgressBoundary::Continuing,
+                        },
+                    },
+                ))
+                .expect("pending-abort progress is observed");
+            sessions
+                .scheduler
+                .admit_decode(owned_decode_grammar_scheduler::scheduler::DecodeOp {
+                    op_id: op_id.clone(),
+                    generation_id: PENDING_ABORT_REQ_ID.to_string(),
+                    admitted_at_ms: 1,
+                    anchor_ms: 1,
+                    committed_tokens: PENDING_ABORT_COMMITTED,
+                    max_tokens: 16,
+                    resident: true,
+                    cancelled_at_ms: None,
+                    deadline_at_ms: None,
+                });
+            assert_eq!(
+                sessions
+                    .scheduler
+                    .arbitrate(1)
+                    .and_then(|selected| selected.op_id),
+                Some(op_id.clone())
+            );
+        }
+        (root, state, op_id)
+    }
+
+    fn assert_abort_terminal(frame: &synapse_core::FrameEnvelope) {
+        let synapse_core::WorkerFrame::Error { terminal } = &frame.frame else {
+            panic!("pending abort should push an error terminal")
+        };
+        assert_eq!(
+            terminal.terminal_state,
+            synapse_core::TerminalState::Aborted
+        );
+        assert_eq!(terminal.committed_token_count, PENDING_ABORT_COMMITTED);
+    }
+
+    #[test]
+    fn pending_session_abort_retains_approved_kv_prefix() {
+        let (root, state, op_id) = pending_abort_test_state("abort-retained", true);
+        let retained_id = format!(
+            "{PENDING_ABORT_SESSION_ID}:retained:{PENDING_ABORT_COMMITTED}:{PENDING_ABORT_SEQUENCE}"
+        );
+        let mut frames = Vec::new();
+        let result = {
+            let mut sessions = state
+                .runtime
+                .owned_decode_sessions
+                .lock()
+                .expect("decode sessions lock");
+            sessions.pending_aborts.insert(
+                (
+                    PENDING_ABORT_SESSION_ID.to_string(),
+                    PENDING_ABORT_REQ_ID.to_string(),
+                ),
+                PendingSessionAbort { retain_kv: true },
+            );
+            let outcome = take_pending_session_abort(
+                &state,
+                &mut sessions,
+                PENDING_ABORT_SESSION_ID,
+                PENDING_ABORT_REQ_ID,
+                PENDING_ABORT_COMMITTED,
+                &op_id,
+                &mut frames,
+            )
+            .expect("pending abort diverts decode");
+            let session = sessions
+                .sessions
+                .get(PENDING_ABORT_SESSION_ID)
+                .expect("session remains registered");
+            assert_eq!(sessions.next_session_sequence, PENDING_ABORT_SEQUENCE + 1);
+            assert_eq!(
+                session.retained_kv_session_id.as_deref(),
+                Some(retained_id.as_str())
+            );
+            assert_eq!(session.retained_position, Some(PENDING_ABORT_COMMITTED));
+            assert_eq!(session.active_request, None);
+            assert!(sessions.scheduler.op(&op_id).is_none());
+            response_result(outcome, "take pending retained abort")
+        };
+
+        assert_eq!(result["cancelled"]["committed_token_count"], 2);
+        assert_eq!(frames.len(), 1);
+        assert_abort_terminal(&frames[0]);
+        let retained = state
+            .store
+            .retained_serving_state(&retained_id)
+            .expect("retained state reads")
+            .expect("approved retention writes a store row");
+        assert_eq!(retained.state_id, retained_id);
+        assert!(retained.valid);
+
+        drop(state);
+        fs::remove_dir_all(root).expect("remove pending-abort state");
+    }
+
+    #[test]
+    fn pending_session_abort_refused_retention_aborts_without_prefix() {
+        let (root, state, op_id) = pending_abort_test_state("abort-refused", false);
+        let refused_id = format!(
+            "{PENDING_ABORT_SESSION_ID}:retained:{PENDING_ABORT_COMMITTED}:{PENDING_ABORT_SEQUENCE}"
+        );
+        let mut frames = Vec::new();
+        {
+            let mut sessions = state
+                .runtime
+                .owned_decode_sessions
+                .lock()
+                .expect("decode sessions lock");
+            sessions.pending_aborts.insert(
+                (
+                    PENDING_ABORT_SESSION_ID.to_string(),
+                    PENDING_ABORT_REQ_ID.to_string(),
+                ),
+                PendingSessionAbort { retain_kv: true },
+            );
+            let outcome = take_pending_session_abort(
+                &state,
+                &mut sessions,
+                PENDING_ABORT_SESSION_ID,
+                PENDING_ABORT_REQ_ID,
+                PENDING_ABORT_COMMITTED,
+                &op_id,
+                &mut frames,
+            )
+            .expect("pending abort diverts decode");
+            let result = response_result(outcome, "take pending refused abort");
+            assert_eq!(result["cancelled"]["committed_token_count"], 2);
+            let session = sessions
+                .sessions
+                .get(PENDING_ABORT_SESSION_ID)
+                .expect("session remains registered");
+            assert_eq!(sessions.next_session_sequence, PENDING_ABORT_SEQUENCE + 1);
+            assert_eq!(session.retained_kv_session_id, None);
+            assert_eq!(session.retained_position, None);
+            assert_eq!(session.active_request, None);
+            assert!(sessions.scheduler.op(&op_id).is_none());
+        }
+
+        assert_eq!(frames.len(), 1);
+        assert_abort_terminal(&frames[0]);
+        assert!(state
+            .store
+            .retained_serving_state(&refused_id)
+            .expect("retained state reads")
+            .is_none());
+
+        drop(state);
+        fs::remove_dir_all(root).expect("remove pending-abort state");
+    }
+
+    #[test]
+    fn pending_session_abort_without_retention_aborts_cleanly() {
+        let (root, state, op_id) = pending_abort_test_state("abort-not-requested", false);
+        let unrequested_id = format!(
+            "{PENDING_ABORT_SESSION_ID}:retained:{PENDING_ABORT_COMMITTED}:{PENDING_ABORT_SEQUENCE}"
+        );
+        let mut frames = Vec::new();
+        {
+            let mut sessions = state
+                .runtime
+                .owned_decode_sessions
+                .lock()
+                .expect("decode sessions lock");
+            sessions.pending_aborts.insert(
+                (
+                    PENDING_ABORT_SESSION_ID.to_string(),
+                    PENDING_ABORT_REQ_ID.to_string(),
+                ),
+                PendingSessionAbort { retain_kv: false },
+            );
+            let outcome = take_pending_session_abort(
+                &state,
+                &mut sessions,
+                PENDING_ABORT_SESSION_ID,
+                PENDING_ABORT_REQ_ID,
+                PENDING_ABORT_COMMITTED,
+                &op_id,
+                &mut frames,
+            )
+            .expect("pending abort diverts decode");
+            let result = response_result(outcome, "take pending unretained abort");
+            assert_eq!(result["cancelled"]["committed_token_count"], 2);
+            let session = sessions
+                .sessions
+                .get(PENDING_ABORT_SESSION_ID)
+                .expect("session remains registered");
+            assert_eq!(sessions.next_session_sequence, PENDING_ABORT_SEQUENCE);
+            assert_eq!(session.retained_kv_session_id, None);
+            assert_eq!(session.retained_position, None);
+            assert_eq!(session.active_request, None);
+            assert!(sessions.scheduler.op(&op_id).is_none());
+        }
+
+        assert_eq!(frames.len(), 1);
+        assert_abort_terminal(&frames[0]);
+        assert!(state
+            .store
+            .retained_serving_state(&unrequested_id)
+            .expect("retained state reads")
+            .is_none());
+
+        drop(state);
+        fs::remove_dir_all(root).expect("remove pending-abort state");
+    }
+
+    #[test]
+    fn missing_pending_session_abort_does_not_divert_decode() {
+        let (root, state, op_id) = pending_abort_test_state("abort-missing", false);
+        let mut frames = Vec::new();
+        {
+            let mut sessions = state
+                .runtime
+                .owned_decode_sessions
+                .lock()
+                .expect("decode sessions lock");
+            assert!(take_pending_session_abort(
+                &state,
+                &mut sessions,
+                PENDING_ABORT_SESSION_ID,
+                PENDING_ABORT_REQ_ID,
+                PENDING_ABORT_COMMITTED,
+                &op_id,
+                &mut frames,
+            )
+            .is_none());
+            let session = sessions
+                .sessions
+                .get(PENDING_ABORT_SESSION_ID)
+                .expect("session remains registered");
+            assert_eq!(sessions.next_session_sequence, PENDING_ABORT_SEQUENCE);
+            assert_eq!(
+                session.active_request.as_deref(),
+                Some(PENDING_ABORT_REQ_ID)
+            );
+            assert!(sessions.scheduler.op(&op_id).is_some());
+        }
+        assert!(frames.is_empty());
+
+        drop(state);
+        fs::remove_dir_all(root).expect("remove pending-abort state");
     }
 
     #[tokio::test]

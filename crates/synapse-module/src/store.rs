@@ -8179,6 +8179,11 @@ fn new_job_id(request_key: &str, generation: u64, now_ms: u64) -> String {
 }
 
 #[cfg(test)]
+pub(crate) fn configure_serving_catalog_for_test(store: &SynapseStore) -> String {
+    tests::configure_serving_catalog(store).1
+}
+
+#[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
 
@@ -8504,7 +8509,7 @@ mod tests {
         }
     }
 
-    fn configure_serving_catalog(store: &SynapseStore) -> (ModelArtifactId, String) {
+    pub(super) fn configure_serving_catalog(store: &SynapseStore) -> (ModelArtifactId, String) {
         let artifact = store
             .ingest_serving_artifact(&serving_artifact_request(), 1)
             .expect("valid GGUF source ingests");
