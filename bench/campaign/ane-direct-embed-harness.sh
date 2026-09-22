@@ -193,10 +193,18 @@ def configured_constants() -> None:
 
 
 def verify_regular_file(path: Path, label: str) -> None:
+    # Only ENOENT means missing. This harness runs as the controller and inspects
+    # a workspace the driver hands to the candidate, so EACCES is a real outcome
+    # here: the file exists and the controller cannot see it. Reporting that as
+    # "missing" sends the operator looking for a file that is present.
     try:
         mode = os.lstat(path).st_mode
-    except OSError as error:
+    except FileNotFoundError as error:
         raise HarnessError(f"{label} is missing: {path}") from error
+    except OSError as error:
+        raise HarnessError(
+            f"{label} cannot be inspected by the controller: {path}: {error}"
+        ) from error
     if not stat.S_ISREG(mode) or stat.S_ISLNK(mode):
         raise HarnessError(f"{label} is not a regular file: {path}")
 
@@ -316,10 +324,16 @@ def run_command(argv: Sequence[str], log_path: Path, cwd: Optional[Path] = None)
 
 
 def runner_output(path: Path) -> str:
+    # An empty string must keep meaning "the runner wrote nothing", because a
+    # silent runner is a diagnosis in its own right (the step never became a
+    # process). An unreadable log therefore reports itself instead of collapsing
+    # into the same empty value.
     try:
         return path.read_text(errors="replace").strip()
-    except OSError:
+    except FileNotFoundError:
         return ""
+    except OSError as error:
+        return f"<runner output unreadable: {path}: {error}>"
 
 
 def run_through_runner(runner: Path, argv: Sequence[str], log_path: Path) -> int:

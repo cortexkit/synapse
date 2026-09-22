@@ -7,10 +7,10 @@
 {
   "machine": "m5-local",
   "harness_path": "bench/campaign/ane-direct-embed-harness.sh",
-  "harness_sha256": "7daf809e60e566b453662fba110c225294b4944b646996175f6fede4e68c6db5",
+  "harness_sha256": "3ad8bd031625df46444c07fa80f10ad4c44f3a6246a10076cf586e1b6d94d2b1",
   "parameters": {},
   "parity_command": {
-    "harness_sha256": "7daf809e60e566b453662fba110c225294b4944b646996175f6fede4e68c6db5",
+    "harness_sha256": "3ad8bd031625df46444c07fa80f10ad4c44f3a6246a10076cf586e1b6d94d2b1",
     "program": "{harness}",
     "args": ["{workspace}", "{candidate_runner}", "{result}"],
     "env": {
@@ -30,7 +30,7 @@
     }
   },
   "objective_command": {
-    "harness_sha256": "7daf809e60e566b453662fba110c225294b4944b646996175f6fede4e68c6db5",
+    "harness_sha256": "3ad8bd031625df46444c07fa80f10ad4c44f3a6246a10076cf586e1b6d94d2b1",
     "program": "{harness}",
     "args": ["{workspace}", "{candidate_runner}", "{result}"],
     "env": {
