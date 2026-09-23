@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import stat
+import time
 import statistics
 import subprocess
 import sys
@@ -144,13 +145,28 @@ def configured_max_load() -> float:
     return value
 
 
-def enforce_load_preflight(label: str, maximum: float) -> float:
-    observed = load_average_1m()
-    if observed > maximum:
-        raise HarnessError(
-            f"LOAD_PREFLIGHT_REFUSED: {label} one-minute load {observed:.2f} exceeds configured threshold {maximum:.2f}"
-        )
-    return observed
+# How long a load check waits for the one-minute average to come back under the
+# threshold before refusing. The rig is shared, and a single burst from another
+# tenant can lift the one-minute average past the ceiling for a minute or two.
+# A one-shot check turned that burst into a failed campaign after the whole
+# planning phase had already run; waiting a bounded time turns it into a delay.
+# The measurement itself is never taken above the threshold.
+LOAD_WAIT_SECONDS = 300.0
+LOAD_POLL_SECONDS = 15.0
+
+
+def enforce_load_preflight(label: str, maximum: float, wait_seconds: float = LOAD_WAIT_SECONDS) -> float:
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        observed = load_average_1m()
+        if observed <= maximum:
+            return observed
+        if time.monotonic() >= deadline:
+            raise HarnessError(
+                f"LOAD_PREFLIGHT_REFUSED: {label} one-minute load {observed:.2f} exceeds configured threshold "
+                f"{maximum:.2f} after waiting {wait_seconds:.0f}s for it to fall"
+            )
+        time.sleep(min(LOAD_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
 
 
 def configured_constants() -> None:
@@ -879,7 +895,7 @@ def self_test(workspace_arg: Optional[str]) -> int:
     assert validate_report
     assert math.isclose(statistics.median([1.0, 2.0, 3.0]), 2.0)
     try:
-        enforce_load_preflight("self-test", 0.000001)
+        enforce_load_preflight("self-test", 0.000001, wait_seconds=0.0)
     except HarnessError as error:
         assert "LOAD_PREFLIGHT_REFUSED" in str(error)
     else:
