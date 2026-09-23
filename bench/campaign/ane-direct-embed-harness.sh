@@ -340,6 +340,22 @@ def run_through_runner(runner: Path, argv: Sequence[str], log_path: Path) -> int
     return run_command([str(runner), *argv], log_path)
 
 
+def runner_stdout(runner: Path, argv: Sequence[str], log_path: Path) -> Tuple[int, str, str]:
+    # For commands whose stdout is compared exactly (a commit SHA). run_command
+    # merges stderr into the same log, and anything the runner's shells print on
+    # stderr (bash warns "shell-init: error retrieving current directory" when it
+    # starts in a directory the candidate cannot read) would then sit beside the
+    # value and fail an equality check on a correct answer. stdout is read on its
+    # own; stderr is returned separately so a refusal can still show it.
+    stdout_path = log_path.with_suffix(".stdout")
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with stdout_path.open("wb") as stdout, log_path.open("ab") as stderr:
+        completed = subprocess.run(
+            [str(runner), *argv], stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr, check=False
+        )
+    return completed.returncode, runner_output(stdout_path), runner_output(log_path)
+
+
 def runner_failure(status: int, log_path: Path) -> str:
     # The exit status is reported with the output because the output alone can
     # be empty for two different reasons: the step never became a process, or
@@ -440,15 +456,15 @@ def stage_sources(
             f"candidate output directories are not writable: {runner_failure(status, output_chmod_log)}"
         )
     verify_candidate_contract(staged_workspace)
-    head_log = temp_root / "staged-binding-head.log"
-    if run_through_runner(
+    status, head, head_stderr = runner_stdout(
         runner,
         ["/usr/bin/git", "-c", f"safe.directory={staged_binding}", "-C", str(staged_binding), "rev-parse", "HEAD"],
-        head_log,
-    ) != 0 or runner_output(head_log) != BINDING_COMMIT:
+        temp_root / "staged-binding-head.log",
+    )
+    if status != 0 or head != BINDING_COMMIT:
         raise HarnessError(
-            "staged ANE binding clone is not at pinned commit "
-            f"{BINDING_COMMIT}: {runner_output(head_log) or '<empty>'}"
+            f"staged ANE binding clone is not at pinned commit {BINDING_COMMIT}: "
+            f"exit status {status}; stdout: {head or '<empty>'}; stderr: {head_stderr[-2048:] or '<empty>'}"
         )
     resolved_dependency = (
         staged_workspace / PROBE_DIR / "../../../../../../OSS/siliconswarm-at-ensue-plugin/ane_kernel/crates/ane"
@@ -497,14 +513,16 @@ def candidate_environment(target: Path) -> List[str]:
 
 
 def workspace_commit(runner: Path, workspace: Path, log_path: Path) -> str:
-    status = run_through_runner(
+    status, value, stderr = runner_stdout(
         runner,
         ["/usr/bin/git", "-c", f"safe.directory={workspace}", "-C", str(workspace), "rev-parse", "HEAD"],
         log_path,
     )
-    value = runner_output(log_path)
     if status != 0 or re.fullmatch(r"[0-9a-f]{40}", value) is None:
-        raise CandidateRejected("candidate workspace did not report one full Git commit SHA")
+        raise CandidateRejected(
+            "candidate workspace did not report one full Git commit SHA: "
+            f"exit status {status}; stdout: {value or '<empty>'}; stderr: {stderr[-2048:] or '<empty>'}"
+        )
     return value
 
 
