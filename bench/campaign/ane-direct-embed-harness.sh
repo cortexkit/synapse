@@ -503,6 +503,13 @@ def candidate_environment(target: Path) -> List[str]:
         "TRANSFORMERS_OFFLINE=1",
         "CARGO_NET_OFFLINE=true",
         "CARGO_TERM_COLOR=never",
+        # An empty RUSTC_WRAPPER overrides any build.rustc-wrapper in the
+        # forwarded CARGO_HOME config. A caching wrapper such as sccache talks to
+        # its server over a local socket, and the candidate runs under a
+        # network-denying sandbox that blocks local sockets too, so the wrapper
+        # fails with EPERM before rustc ever runs. The candidate builds with rustc
+        # directly.
+        "RUSTC_WRAPPER=",
         f"PATH={':'.join(path_parts)}",
         f"CARGO_TARGET_DIR={target}",
     ]
