@@ -410,6 +410,19 @@ def stage_sources(
     staged_binding = binding_parent / "siliconswarm-at-ensue-plugin"
     copy_tree(runner, workspace, staged_workspace, temp_root / "workspace-copy.log")
     copy_tree(runner, binding, staged_binding, temp_root / "binding-copy.log")
+    # The copies are made as the candidate, so they carry the candidate's modes
+    # (the workspace root is 700) and none of the controller read grant, which
+    # the driver writes only on the candidate's own workspace directories. The
+    # contract check and the dependency-path check below read this staged tree as
+    # the controller, so the candidate opens it for reading first. No candidate
+    # code has run yet, and a later chmod back would make those checks refuse,
+    # not pass.
+    stage_chmod_log = temp_root / "stage-chmod.log"
+    status = run_through_runner(runner, ["/bin/chmod", "-R", "a+rX", str(stage_root)], stage_chmod_log)
+    if status != 0:
+        raise HarnessError(
+            f"candidate runner could not open the staged tree for reading: {runner_failure(status, stage_chmod_log)}"
+        )
     output_root = temp_root / "candidate-output"
     target = output_root / "target"
     output_mkdir_log = temp_root / "output-mkdir.log"
