@@ -340,6 +340,69 @@ async fn open_route() -> (TestDaemon, ModuleProcess, tokio::net::TcpStream, Test
     open_route_with_preloads(None).await
 }
 
+/// Every segment the module's logger wrote under `data_home`, concatenated.
+fn module_log_text(data_home: &Path) -> String {
+    let logs = data_home.join("cortexkit").join(MODULE_ID).join("logs");
+    let mut text = String::new();
+    for entry in std::fs::read_dir(&logs).into_iter().flatten().flatten() {
+        text.push_str(&std::fs::read_to_string(entry.path()).unwrap_or_default());
+    }
+    text
+}
+
+/// A restart must be readable from the module's own log. Without a start and a
+/// stop line, a module that restarts and serves nothing writes nothing at all,
+/// and a clean shutdown looks the same in the log as a process that was killed
+/// outright. Closing the daemon side is what a daemon cut does to a module, so
+/// the stop line is asserted on that path, not on a kill.
+#[tokio::test]
+async fn module_logs_start_and_stop_across_a_daemon_connection_close() {
+    // The daemon runs each accepted connection as a detached task, so aborting
+    // its accept loop leaves the module's connection open and the module never
+    // sees it close. Running the daemon on a runtime of its own lets the test
+    // shut that runtime down, which cancels every connection task and closes
+    // the socket, as a real daemon exit does.
+    let (daemon_runtime, daemon) = std::thread::spawn(|| {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("daemon runtime");
+        let daemon = runtime.block_on(start_daemon());
+        (runtime, daemon)
+    })
+    .join()
+    .expect("start the daemon on its own runtime");
+    let data_home = unique_temp_dir("synapse-lifecycle-log");
+    std::fs::create_dir_all(&data_home).unwrap();
+    let data_home_arg = data_home.to_string_lossy().into_owned();
+    let mut module = spawn_synapse_module_with_env(
+        &daemon.connection_file_path,
+        None,
+        None,
+        &[("XDG_DATA_HOME", data_home_arg.as_str())],
+    );
+    wait_for_registration(&daemon.registry, MODULE_ID, Duration::from_secs(30)).await;
+    assert!(
+        module_log_text(&data_home).contains("synapse started"),
+        "a registered module must have logged its start; log: {}",
+        module_log_text(&data_home)
+    );
+
+    drop(daemon);
+    daemon_runtime.shutdown_background();
+    let exited = tokio::time::timeout(Duration::from_secs(30), module.child.wait()).await;
+    assert!(
+        exited.is_ok(),
+        "the module must exit once the daemon side of its connection is gone"
+    );
+    let log = module_log_text(&data_home);
+    assert!(
+        log.contains("synapse stopped"),
+        "a module whose daemon connection closed must log that it stopped; log: {log}"
+    );
+}
+
 async fn open_route_with_preloads(
     preload_models: Option<&str>,
 ) -> (TestDaemon, ModuleProcess, tokio::net::TcpStream, TestRoute) {

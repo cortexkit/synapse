@@ -251,9 +251,37 @@ pub async fn run_from_env() -> Result<(), ModuleError> {
     let _singleton = acquire_synapse_singleton_lease(&module_id)?;
     let connection_file = subc_connection_file_from_args()?;
     let handler = SynapseHandler::new(module_id.clone(), connection_file);
-    subc_client_rs::serve(manifest(&module_id), handler)
-        .await
-        .map_err(ModuleError::Serve)
+    // One line when serving starts and one when it ends, so a restart that the
+    // daemon or an operator caused can be read from this log alone. Without them
+    // a module that restarts and serves nothing leaves no trace at all, and a
+    // shutdown can't be told apart from a process that was killed outright:
+    // only the second leaves no "stopped" line.
+    let started = std::time::Instant::now();
+    tracing::info!(
+        target: "lifecycle",
+        module = %module_id,
+        pid = std::process::id(),
+        version = env!("CARGO_PKG_VERSION"),
+        "synapse started"
+    );
+    let outcome = subc_client_rs::serve(manifest(&module_id), handler).await;
+    let uptime_s = started.elapsed().as_secs();
+    match &outcome {
+        Ok(()) => tracing::info!(
+            target: "lifecycle",
+            module = %module_id,
+            uptime_s,
+            "synapse stopped: serve loop returned"
+        ),
+        Err(error) => tracing::warn!(
+            target: "lifecycle",
+            module = %module_id,
+            uptime_s,
+            error = %error,
+            "synapse stopped: serve loop failed"
+        ),
+    }
+    outcome.map_err(ModuleError::Serve)
 }
 
 fn module_id_from_environment(
