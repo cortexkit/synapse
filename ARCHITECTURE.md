@@ -128,7 +128,7 @@
 **Campaign Harnesses:**
 - Purpose: Execute and coordinate sandboxed evaluation campaigns (single-stream decode, Metal direct step, CUDA quantization, LFM2 CUDA Q8, Metal embedding, and ANE direct-API embedding).
 - Location: `bench/campaign`
-- Contains: Integrity validation of model snapshots, fixtures, and target runners; deterministic verification of intervention hooks; candidate-owned temporary workspace staging and build output/target directories; toolchain environment forwarding (`RUSTUP_HOME`, `CARGO_HOME`); split-stream append-mode logging (`.log` and `.log.stderr`); failure scene preservation; and probe comparison analysis (`bench/campaign/compare-owned-metal-bucket-probes.py`) evaluating baseline versus candidate `embed_bucket_probe` JSON runs across cold-load, first-use compilation overhead, warm latency, cache shape limits, and numerical parity; and ANE direct-API embed campaign control (`bench/campaign/ane-direct-embed-harness.sh` with `bench/campaign/ane-direct-embed-pack.jsonc` and `bench/campaign/ane-direct-embed-registration.jsonc`) driving the faithful full-model gate over committed pre-tokenized rows with aggregate-throughput scoring.
+- Contains: Integrity validation of model snapshots, fixtures, and target runners; deterministic verification of intervention hooks; candidate-owned temporary workspace staging and build output/target directories; toolchain environment forwarding (`RUSTUP_HOME`, `CARGO_HOME`); split-stream append-mode logging (`.log` and `.log.stderr`); failure scene preservation; and probe comparison analysis (`bench/campaign/compare-owned-metal-bucket-probes.py`) evaluating baseline versus candidate `embed_bucket_probe` JSON runs across cold-load, first-use compilation overhead, warm latency, cache shape limits, and numerical parity; and ANE direct-API embed campaign control (`bench/campaign/ane-direct-embed-harness.sh` with `bench/campaign/ane-direct-embed-pack.jsonc` and `bench/campaign/ane-direct-embed-registration.jsonc`) driving the faithful full-model gate over committed pre-tokenized rows with aggregate-throughput scoring. The ANE direct-embed harness validates the one-minute load ceiling (`SYNAPSE_CAMPAIGN_MAX_LOAD_1M`, pinned default `DEFAULT_MAX_LOAD_1M = 16`) as a scoring constant beside the digests, refusing by name when a registration disagrees — never as an operational knob — and distinguishes an unreadable controller-inspected file (EACCES, reported with its path) from a genuinely missing one (ENOENT) so an unreadable runner log cannot forge the empty output that means "the runner wrote nothing".
 - Depends on: `spike-unified-rt` runner.
 - Used by: Automated evaluation gates to confirm decode and embedding performance and correctness.
 
@@ -292,6 +292,11 @@
 - Location: `crates/synapse-module/owned-decode-sidecar/mod.rs`, `crates/synapse-core/src/sidecar_spec.rs`
 - Pattern: Data normalization, layout rendering policy, and tokenizer hint bank indexing.
 
+**Owned Decode Session Abort & KV Retention:**
+- Purpose: Consume a pending `owned_decode.abort` at a committed session boundary, optionally retaining the resident KV prefix. Retention is preflighted against the serving approval for the session's catalog fingerprint: admission writes a `serving_retained_states` row and hands `RetentionPreflight::Ready { retained_kv_session_id, retained_position }` to the worker, while refusal or store failure yields `RetentionPreflight::Refused`; an abort that retains its prefix records `RetainedPrefix` on the session and keeps the resident KV, while an abort without a retained prefix is queued for the next supervision-cycle cleanup. Consume the abort after every progress frame and again after the progress loop, because a zero-token worker result has no frame boundary at which to observe it — `take_pending_session_abort` is the single consumption site.
+- Location: `crates/synapse-module/src/lib.rs`, `crates/synapse-module/src/store.rs`, `crates/synapse-engine-owned/owned-decode-worker/src/streaming.rs`
+- Pattern: Boundary-deferred cancellation with approval-checked KV retention and single-consumption abort state.
+
 **LFM2 Causal Mixer:**
 - Purpose: Alternates 10 short-convolution layers and 6 full-attention layers with tied embeddings and GQA KV cache, supporting modern `layer_types` configurations.
 - Location: `bench/spikes/unified-rt/src/lfm2.rs`
@@ -318,7 +323,7 @@
 - Pattern: Concurrency Semaphore with observable stats wrapper.
 
 **Certification Status and Demotion:**
-- Purpose: Track local hardware engine capability status, storing whether a measured fingerprint is `certified` or `uncertified`, persisting first-staleness timestamp `certification_stale_since_ms` in `profile_state`, resolving unscoped historical certification rows (`latest_owned_decode_measurement_row`) to distinguish profile rotation staleness from never-probed lanes, and publishing lane certification status in health reports without triggering inline probes.
+- Purpose: Track local hardware engine capability status, storing whether a measured fingerprint is `certified` or `uncertified`, persisting first-staleness timestamp `certification_stale_since_ms` in `profile_state`, resolving unscoped historical certification rows (`latest_owned_decode_measurement_row`) to distinguish profile rotation staleness from never-probed lanes, and publishing lane certification status in health reports without triggering inline probes. A certification row that cannot be read renders `certified=false` (fail-closed: an unreadable store never publishes `certified=true`) and logs at warn with the model id on `synapse.catalog`, so an operator can tell "database unreadable" from "not certified"; absence of the field stays reserved for lane classes with no certification concept.
 - Location: `crates/synapse-module/src/store.rs`, `crates/synapse-module/src/lib.rs`
 - Pattern: SQLite-backed schema with automatic demotion upon failed re-certification, unscoped history lookup for rotation detection, and non-probing health metric projection.
 
@@ -333,7 +338,7 @@
 - Pattern: Exhaustive enum taxonomy with stable error codes and typed recovery guidance.
 
 **Machine Profile:**
-- Purpose: Capture machine hardware and engine runtime identities (OS build, arch, chip model, RAM class, `ane_subtype` chip mapping, sorted engine identities) into a stable hash for fingerprinting and certification. Identity probes enforce bounded execution (2 seconds, killed and abandoned on expiry) and fail closed (`ProfileProbeError`) rather than substituting fallback placeholders, preventing silent rotation of the machine-profile hash.
+- Purpose: Capture machine hardware and engine runtime identities (OS build, arch, chip model, RAM class, `ane_subtype` chip mapping, sorted engine identities) into a stable hash for fingerprinting and certification. The `ane_subtype` value carries a `(map)` provenance suffix recording static chip-table origin; because that value feeds the serving-gated profile hash, a future probed subtype must decide explicitly whether `"h16"` and `"h16(map)"` are the same machine rather than letting the string comparison decide silently. Identity probes enforce bounded execution (2 seconds, killed and abandoned on expiry) and fail closed (`ProfileProbeError`) rather than substituting fallback placeholders, preventing silent rotation of the machine-profile hash.
 - Location: `crates/synapse-core/src/machine_profile.rs`
 - Pattern: Serializable Identity Profile with SHA-256 fingerprinting and bounded fail-closed probing.
 
@@ -507,7 +512,7 @@
 **Bench Harness Strategy:** Fail-fast utilizing `anyhow::Result` error propagation with contextual layers (`.context()`).
 - **Child Supervision:** Spawned subprocesses (`llama-server`) are tracked via PID. If a child dies or fails to bind to its designated port within `HEALTH_TIMEOUT` (120s), the lane runner fails immediately rather than silently hanging. Platform-specific process control signals (such as SIGTERM on Unix) are gated appropriately so subprocess lifecycles function seamlessly on both Windows and Unix platforms.
 - **HTTP Resiliency:** Requests to external wrapping endpoints (`wrap-embed`) implement read timeouts, connect timeouts, and bounded retry loops with backoff to recover from transient rate limits or cold-load stalls.
-- **Campaign Failure Preservation:** The decode campaign harness separates standard output and standard error streams into append-only logs (`.log` and `.log.stderr`) to avoid truncating diagnostics. If a candidate build, verification, or run fails, the harness dumps logs and staging details to the results directory as a preserved failure scene before cleaning up.
+- **Campaign Failure Preservation:** The decode campaign harness separates standard output and standard error streams into append-only logs (`.log` and `.log.stderr`) to avoid truncating diagnostics. If a candidate build, verification, or run fails, the harness dumps logs and staging details to the results directory as a preserved failure scene before cleaning up. Controller-side inspection distinguishes an unreadable path (EACCES, named with its path) from a missing one (ENOENT), and an unreadable runner log reports itself rather than collapsing into the empty output that means the runner never became a process.
 
 ## Cross-Cutting Concerns
 

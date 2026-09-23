@@ -93,7 +93,7 @@
 
 **crates/synapse-module/:**
 - Purpose: The primary SubC service module. Handles the content-addressed model cache, durable jobs, worker hosting (offloading worker drop teardown to dedicated threads with a bounded 5-second join budget), remote provider dispatch (with class-based vault error disposition), owned decode routing, grammar compilation, approval storage and identity-based rollback (`rollback.rs`), probe certification and persistent staleness tracking (`certification_stale_since_ms`), admission telemetry counters (`jobs_minted` with terminal `jobs_completed`/`jobs_failed`/`jobs_inherited` and derived `jobs_open`), full per-lane capability reporting on `models.list`, dual-hash embed divergence verification (`submitted_sha256` alongside `content_sha256`), owned CUDA evidence from the isolated per-worker floor probe and declared identities, persisted native owned profiles with cache-assembled packages, and route binding.
-- Contains: SQLite store initialization with unscoped decode measurement queries (`latest_owned_decode_measurement_row`) separating profile rotation staleness from never-probed lanes, SubC `ModuleHandler` implementation, UNIX socket / Windows pipe worker spawning, remote gateway client, owned decode routing (`owned-decode-routing`), grammar compilation and DECODE scheduler (`owned-decode-grammar-scheduler`), certification gates and probes (`owned-decode-certification`), per-worker-path isolated CUDA floor probe cache, persisted native owned profiles with per-job load scratch paths, approval rollback (`rollback.rs`), contract manifests (`owned-decode-manifests`), model catalog descriptors publishing per-row ceilings `max_tokens` with source provenance `max_tokens_source`, discrete `bucket_ladder` envelopes, output dimensions, dtypes, device classes, serving admission states (`serving_admission`, `serving_admission_reason`), and warm-load hints, and request-scoped semantic-sidecar hint bank normalization and per-field slotting (`owned-decode-sidecar`).
+- Contains: SQLite store initialization with unscoped decode measurement queries (`latest_owned_decode_measurement_row`) separating profile rotation staleness from never-probed lanes, SubC `ModuleHandler` implementation, UNIX socket / Windows pipe worker spawning, remote gateway client, owned decode routing (`owned-decode-routing`), grammar compilation and DECODE scheduler (`owned-decode-grammar-scheduler`), certification gates and probes (`owned-decode-certification`), boundary-deferred session abort with approval-checked KV retention (`take_pending_session_abort`, consumed after every progress frame and again after the progress loop so a zero-token result still observes a pending abort), per-worker-path isolated CUDA floor probe cache, persisted native owned profiles with per-job load scratch paths, approval rollback (`rollback.rs`), contract manifests (`owned-decode-manifests`), model catalog descriptors publishing per-row ceilings `max_tokens` with source provenance `max_tokens_source`, discrete `bucket_ladder` envelopes, output dimensions, dtypes, device classes, serving admission states (`serving_admission`, `serving_admission_reason`), and warm-load hints, and request-scoped semantic-sidecar hint bank normalization and per-field slotting (`owned-decode-sidecar`).
 - Key files: `crates/synapse-module/src/lib.rs`, `crates/synapse-module/src/worker_host/mod.rs`, `crates/synapse-module/src/rollback.rs`, `crates/synapse-module/src/ane_artifact.rs`, `crates/synapse-module/src/remote/vault.rs`, `crates/synapse-module/owned-decode-routing/mod.rs`, `crates/synapse-module/owned-decode-grammar-scheduler/mod.rs`, `crates/synapse-module/src/fixtures/probe_corpus_qwen3_embedding_fp32.json`
 
 **crates/synapse-opctl/:**
@@ -125,7 +125,7 @@
 
 **bench/campaign/:**
 - Purpose: Verification harness and campaign fixtures for decode models and embedding backends.
-- Contains: Locked sandboxed campaign controller scripts, prompt/reference fixtures, signature validation checks, probe comparison scripts (`compare-owned-metal-bucket-probes.py`), and diagnostic logs/failure scenes.
+- Contains: Locked sandboxed campaign controller scripts, prompt/reference fixtures, signature validation checks, probe comparison scripts (`compare-owned-metal-bucket-probes.py`), and diagnostic logs/failure scenes. The ANE direct-embed harness validates the pinned one-minute load ceiling (`SYNAPSE_CAMPAIGN_MAX_LOAD_1M`, default `DEFAULT_MAX_LOAD_1M = 16`) as a scoring constant instead of an environment knob, and reports a controller-unreadable file (EACCES, naming the path) distinctly from a missing one (ENOENT) so an unreadable runner log cannot forge an empty output.
 - Key files: `bench/campaign/decode-harness.sh`, `bench/campaign/metal-step-harness.sh`, `bench/campaign/cuda-quant-harness.sh`, `bench/campaign/lfm2-cuda-harness.sh`, `bench/campaign/metal-embed-harness.sh`, `bench/campaign/ane-direct-embed-harness.sh`, `bench/campaign/ane-direct-embed-pack.jsonc`, `bench/campaign/ane-direct-embed-registration.jsonc`, `bench/campaign/compare-owned-metal-bucket-probes.py`, `bench/campaign/README.md`
 
 
@@ -209,9 +209,9 @@
 - Key files: `tools/gather-distill/src/cli.ts`, `tools/gather-distill/README.md`, `tools/gather-distill/BAKEOFF-ZEROSHOT.md`, `tools/gather-distill/train/ANTARES-RUNG.md`, `tools/gather-distill/train/SCALE-LADDER.md`
 
 **scripts/:**
-- Purpose: Houses build, release packaging, CI monitoring, and sibling lock maintenance utilities.
-- Contains: Shell and PowerShell scripts for packaging CUDA binaries, CI watch loops, and sibling lock refresh tooling.
-- Key files: `scripts/package-owned-cuda.ps1`, `scripts/refresh-siblings-lock.sh`, `scripts/watch-ci.sh`
+- Purpose: Houses build, release packaging, CI monitoring, sibling lock maintenance, and rig acceptance utilities.
+- Contains: Shell and PowerShell scripts for packaging CUDA binaries, CI watch loops, sibling lock refresh tooling, and the two-uid ACL acceptance check proving the campaign rig's controller read grant (positive arm reads a protected candidate-owned workspace; negative arm asserts the harness refuses a stripped entry naming EACCES and the path).
+- Key files: `scripts/package-owned-cuda.ps1`, `scripts/refresh-siblings-lock.sh`, `scripts/watch-ci.sh`, `scripts/rig-acl-acceptance.sh`
 
 ## Key File Locations
 
@@ -228,7 +228,7 @@
 - `workers/ane-prefill-sidecar/Sources/AnePrefillSidecarExecutable/main.swift`: Executable entry point for the Swift/CoreML ANE prefill sidecar.
 - `bench/harness/src/main.rs`: CLI runner for corpus generation, power wrapper execution, and parity check.
 - `bench/lanes/*/src/main.rs` (Rust), `bench/lanes/mlx-minilm/main.py` (Python), `bench/lanes/ts-embed/main.mjs` (JS), `bench/lanes/potion/main.py` (Python): Main executables for each specific runtime lane.
-- `bench/campaign/decode-harness.sh`, `bench/campaign/metal-step-harness.sh`, `bench/campaign/cuda-quant-harness.sh`, `bench/campaign/lfm2-cuda-harness.sh`, `bench/campaign/metal-embed-harness.sh`: Campaign controller scripts.
+- `bench/campaign/decode-harness.sh`, `bench/campaign/metal-step-harness.sh`, `bench/campaign/cuda-quant-harness.sh`, `bench/campaign/lfm2-cuda-harness.sh`, `bench/campaign/metal-embed-harness.sh`, `bench/campaign/ane-direct-embed-harness.sh`: Campaign controller scripts.
 - `bench/campaign/compare-owned-metal-bucket-probes.py`: Bucket policy comparison script evaluating baseline vs candidate probe runs.
 - `bench/spikes/ane-modernbert-full-context/spike.py`: Standalone CLI driver for CPU checks and stage runs of 8192-token ModernBERT on ANE.
 - `bench/eval-coir/prepare.py`: Downloads and structures datasets for retrieval tasks.
@@ -263,13 +263,13 @@
 - `crates/synapse-module/owned-decode-routing/ane_prefill.rs`: ANE prefill split routing (`AnePrefillRouter`), fixed-window bucket selection (`W128`, `W256`, `W512`), attempt timing budgets, consecutive-strike health (`SplitArmHealth`), and closed bypass (`PrefillBypassReason`) and fallback (`PrefillFallbackReason`) provenance.
 - `crates/synapse-worker-decode/src/runner.rs`: Supervised Metal decode worker runner and IPC protocol loop.
 - `crates/synapse-module/src/worker_host/mod.rs`: Spawns and manages worker lifecycles over Unix domain sockets or Windows named pipes using a binary framing protocol.
-- `crates/synapse-module/src/lib.rs`: Full per-lane capability descriptors in `models.list` (including `serving_admission` and `serving_admission_reason`), and `submitted_sha256` emission on embed query/batch results.
-- `crates/synapse-module/src/store.rs`: SQLite-backed state for content-addressed model cache, durable jobs, active attempts, profile activation epochs, unscoped decode measurements (`latest_owned_decode_measurement_row`), and persistent `certification_stale_since_ms` tracking.
+- `crates/synapse-module/src/lib.rs`: Full per-lane capability descriptors in `models.list` (including `serving_admission` and `serving_admission_reason`), `submitted_sha256` emission on embed query/batch results, and boundary-deferred session abort consumption (`take_pending_session_abort`) with approval-checked KV retention.
+- `crates/synapse-module/src/store.rs`: SQLite-backed state for content-addressed model cache, durable jobs, active attempts, profile activation epochs, unscoped decode measurements (`latest_owned_decode_measurement_row`), approval-checked retained continuation states (`retain_serving_state`, `admit_serving_continuation`, `retained_serving_state`), and persistent `certification_stale_since_ms` tracking.
 - `crates/synapse-module/src/ane_artifact.rs`: Digest-keyed stable materialization of archived CoreML bundles (extract-once publish, digest verification, 24-hour abandoned-temp reclamation).
 - `bench/spikes/ane-modernbert-full-context/modernbert_tiled.py`: Query-tiled ModernBERT implementation preserving 22 layers, RoPE, and local/global windows with Hadamard rotation conditioning.
 - `bench/spikes/laya-owned/src/main.rs`: Laya typed-decision runner evaluating ModernBERT hidden states with host-side transformer decision head.
 - `crates/synapse-core/src/scheduler.rs`: 3-class fair-share aging scheduler for managing concurrent inference requests.
-- `crates/synapse-core/src/machine_profile.rs`: Defines `MachineProfile` hardware identity structures, static `ane_subtype` chip mapping, and bounded fail-closed identity probes (`ProfileProbeError`).
+- `crates/synapse-core/src/machine_profile.rs`: Defines `MachineProfile` hardware identity structures, static `ane_subtype` chip mapping (values carry a `(map)` provenance suffix recording static-table origin, which feeds the serving-gated profile hash — decide same-vs-different machine identity before adding a probed subtype), and bounded fail-closed identity probes (`ProfileProbeError`).
 - `bench/harness/src/metrics.rs`: Macmon power metrics execution, parsing, and system idle gating.
 - `bench/harness/src/parity.rs`: Numerical calculation of cosine similarity, rank stability/overlap checks, and file parsing functions.
 - `bench/lanes/mlx-minilm/main.py`: Length-sorted batched MLX GPU execution for MiniLM.
