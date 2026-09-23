@@ -340,6 +340,15 @@ def run_through_runner(runner: Path, argv: Sequence[str], log_path: Path) -> int
     return run_command([str(runner), *argv], log_path)
 
 
+def runner_failure(status: int, log_path: Path) -> str:
+    # The exit status is reported with the output because the output alone can
+    # be empty for two different reasons: the step never became a process, or
+    # the runner lost its stderr. The status is the only part of a failed runner
+    # call that cannot go missing, so it is never dropped.
+    output = runner_output(log_path)
+    return f"exit status {status}; output: {output[-4096:] if output else '<runner wrote nothing>'}"
+
+
 def git_output(repo: Path, args: Sequence[str], label: str) -> str:
     completed = subprocess.run(
         ["/usr/bin/git", "-C", str(repo), *args],
@@ -390,22 +399,33 @@ def stage_sources(
     workspace_parent = stage_root / "Projects/CortexKit"
     binding_parent = stage_root / "OSS"
     mkdir_log = temp_root / "stage-mkdir.log"
-    if run_through_runner(
+    status = run_through_runner(
         runner, ["/bin/mkdir", "-p", str(workspace_parent), str(binding_parent)], mkdir_log
-    ) != 0:
-        raise HarnessError(f"candidate runner could not create staging directories: {runner_output(mkdir_log)}")
+    )
+    if status != 0:
+        raise HarnessError(
+            f"candidate runner could not create staging directories: {runner_failure(status, mkdir_log)}"
+        )
     staged_workspace = workspace_parent / "synapse"
     staged_binding = binding_parent / "siliconswarm-at-ensue-plugin"
     copy_tree(runner, workspace, staged_workspace, temp_root / "workspace-copy.log")
     copy_tree(runner, binding, staged_binding, temp_root / "binding-copy.log")
     output_root = temp_root / "candidate-output"
     target = output_root / "target"
-    if run_through_runner(runner, ["/bin/mkdir", "-p", str(target)], temp_root / "output-mkdir.log") != 0:
-        raise HarnessError("candidate runner could not create candidate output directories")
-    if run_through_runner(
-        runner, ["/bin/chmod", "777", str(output_root), str(target)], temp_root / "output-chmod.log"
-    ) != 0:
-        raise HarnessError("candidate output directories are not writable")
+    output_mkdir_log = temp_root / "output-mkdir.log"
+    status = run_through_runner(runner, ["/bin/mkdir", "-p", str(target)], output_mkdir_log)
+    if status != 0:
+        raise HarnessError(
+            f"candidate runner could not create candidate output directories: {runner_failure(status, output_mkdir_log)}"
+        )
+    output_chmod_log = temp_root / "output-chmod.log"
+    status = run_through_runner(
+        runner, ["/bin/chmod", "777", str(output_root), str(target)], output_chmod_log
+    )
+    if status != 0:
+        raise HarnessError(
+            f"candidate output directories are not writable: {runner_failure(status, output_chmod_log)}"
+        )
     verify_candidate_contract(staged_workspace)
     head_log = temp_root / "staged-binding-head.log"
     if run_through_runner(
