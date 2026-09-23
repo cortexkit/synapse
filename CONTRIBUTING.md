@@ -14,7 +14,9 @@ Issues that report a defect with evidence are welcome without any further ceremo
 
 ## Then the pull request
 
-Reference the issue and the go. Keep it to that scope; a second improvement noticed along the way is a second issue.
+The go is a label: a maintainer adds `design-approved` to the issue once the shape is agreed. Put the issue number on the `Approved issue: #` line of the pull request template. `Refs #N` also works, but a closing keyword is never required, because maintainers close an issue when the fix ships, not when it merges. A contribution gate checks this automatically. A pull request whose linked issue is not yet approved is turned into a draft, and it becomes ready for review on its own once the label is applied. When there is genuinely no design to agree, such as a typo or a broken link, a maintainer can label the pull request `trivial` instead.
+
+Keep the pull request to the issue's scope; a second improvement noticed along the way is a second issue.
 
 What a review checks:
 
