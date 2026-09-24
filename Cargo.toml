@@ -46,20 +46,21 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 sha2 = "0.10"
 thiserror = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "process"] }
-subc-client-rs = { path = "../subconscious/crates/subc-client-rs" }
-subc-daemon = { path = "../subconscious/crates/subc-daemon" }
-subc-protocol = { path = "../subconscious/crates/subc-protocol" }
-subc-transport = { path = "../subconscious/crates/subc-transport" }
-cortexkit-lease = { path = "../commons/crates/cortexkit-lease" }
-cortexkit-store = { path = "../commons/crates/cortexkit-store" }
-cortexkit-store-types = { path = "../commons/crates/cortexkit-store-types" }
-cortexkit-log = { path = "../commons/crates/cortexkit-log" }
+# The subc crates are published on crates.io and pinned exactly. subc-daemon in
+# particular must not float: a caret there can resolve a daemon built on a newer
+# subc-protocol minor, leaving the lock with two copies of subc-protocol and
+# subc-control while this workspace's own code talks the older one. The wire
+# crates move together, as one block, so the graph keeps a single copy of each.
+# subc-control is not a direct dependency; every pinned crate here requires it
+# at ^0.20, which keeps it to one copy without a pin of its own.
+subc-client-rs = "=0.19.0"
+subc-daemon = "=0.21.4"
+subc-protocol = "=0.25.2"
+subc-transport = "=0.7.4"
+# The commons crates are published on crates.io too.
+cortexkit-lease = "0.1.0"
+cortexkit-store = "0.2.0"
+cortexkit-store-types = "0.2.2"
+cortexkit-log = "0.3.3"
 tracing = "0.1"
 
-# Sibling crates are taken by path here, but subc-daemon pins the same commons
-# crates by git rev, and cargo treats path and git as distinct sources -- so the
-# graph compiled cortexkit-log and cortexkit-store-types twice. Redirect the git
-# source at the path checkout the workspace already uses, so one source wins.
-[patch."https://github.com/cortexkit/commons.git"]
-cortexkit-log = { path = "../commons/crates/cortexkit-log" }
-cortexkit-store-types = { path = "../commons/crates/cortexkit-store-types" }
