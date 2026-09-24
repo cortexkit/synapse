@@ -247,13 +247,14 @@ void *synapse_qwen3_metal_step_context_new(
     uint64_t intermediate,
     uint64_t vocab,
     float epsilon,
-    const char *metallib_path
+    const uint8_t *metallib_bytes,
+    uint64_t metallib_len
 ) {
     @autoreleasepool {
         if (bucket == 0 || hidden == 0 || query_heads == 0 || kv_heads == 0 || head_dim == 0 ||
             intermediate == 0 || vocab == 0 || query_heads % kv_heads != 0 || head_dim % 2 != 0 ||
-            metallib_path == NULL) {
-            set_error(@"invalid Metal step dimensions or metallib path");
+            metallib_bytes == NULL || metallib_len == 0) {
+            set_error(@"invalid Metal step dimensions or empty embedded metallib");
             return NULL;
         }
         Qwen3MetalStepContext *context = calloc(1, sizeof(*context));
@@ -269,8 +270,14 @@ void *synapse_qwen3_metal_step_context_new(
         }
         context->queue = [context->device newCommandQueue];
         NSError *error = nil;
-        NSURL *library_url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:metallib_path]];
-        context->library = [context->device newLibraryWithURL:library_url error:&error];
+        // The metallib is compiled into the binary, so the library is created
+        // from in-memory bytes rather than a file that would have to be
+        // deployed beside the executable. DISPATCH_DATA_DESTRUCTOR_DEFAULT
+        // copies the bytes, so the dispatch data owns its own storage.
+        dispatch_data_t library_data = dispatch_data_create(
+            metallib_bytes, (size_t)metallib_len, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+        context->library = [context->device newLibraryWithData:library_data error:&error];
+        dispatch_release(library_data);
         if (context->queue == nil || context->library == nil) {
             set_error(error.localizedDescription ?: @"failed to load Metal step metallib");
             [context->queue release];

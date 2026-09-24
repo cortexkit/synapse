@@ -46,8 +46,9 @@ fn main() {
         println!("cargo:rustc-link-lib=framework={framework}");
     }
 
-    // Compile the Metal step kernels into metallibs. The runtime loads them
-    // beside the executable (relocatable) or from the OUT_DIR path (build-time).
+    // Compile the Metal step kernels into metallibs in OUT_DIR. The engines
+    // embed these files with `include_bytes!`, so the decode binaries carry
+    // their kernels and nothing has to be deployed beside the executable.
     let out_dir =
         std::path::PathBuf::from(std::env::var_os("OUT_DIR").expect("Cargo must provide OUT_DIR"));
 
@@ -88,11 +89,6 @@ fn main() {
             qwen3_metallib_status.success(),
             "xcrun metallib failed for the Qwen3 step kernels"
         );
-        if let Some(profile_dir) = out_dir.ancestors().nth(3) {
-            let executable_library = profile_dir.join("qwen3_decode_metal_step.metallib");
-            std::fs::copy(&qwen3_metallib_path, executable_library)
-                .expect("copy Qwen3 step metallib beside the executable");
-        }
 
         // LFM2 step metallib: the conv step kernel plus a reused IEEE-strict
         // copy of the Qwen3 step kernels (RMSNorm, QKV matvec, QK-norm+RoPE,
@@ -158,25 +154,18 @@ fn main() {
             lfm2_metallib_status.success(),
             "xcrun metallib failed for the LFM2 step kernels"
         );
-        if let Some(profile_dir) = out_dir.ancestors().nth(3) {
-            let executable_library = profile_dir.join("lfm2_decode_metal_step.metallib");
-            std::fs::copy(&lfm2_metallib_path, executable_library)
-                .expect("copy LFM2 step metallib beside the executable");
-        }
     } else {
+        // `include_bytes!` needs the files to exist, so write empty
+        // placeholders; the engines refuse to construct with an empty library
+        // and report that the build lacked the Metal developer tools.
+        for name in [
+            "qwen3_decode_metal_step.metallib",
+            "lfm2_decode_metal_step.metallib",
+        ] {
+            std::fs::write(out_dir.join(name), []).expect("write placeholder metallib");
+        }
         println!(
-            "cargo:warning=Metal developer tools unavailable; Metal step metallib will be built by a macOS toolchain"
+            "cargo:warning=Metal developer tools unavailable; the embedded Metal step metallibs are empty and the owned decode engines will refuse to start"
         );
     }
-
-    // Expose the metallib paths to the Rust engines so they can fall back to
-    // the build-time path if the beside-executable copy is not found.
-    println!(
-        "cargo:rustc-env=SYNAPSE_OWNED_DECODE_QWEN3_STEP_LIB={}",
-        out_dir.join("qwen3_decode_metal_step.metallib").display()
-    );
-    println!(
-        "cargo:rustc-env=SYNAPSE_OWNED_DECODE_LFM2_STEP_LIB={}",
-        out_dir.join("lfm2_decode_metal_step.metallib").display()
-    );
 }
