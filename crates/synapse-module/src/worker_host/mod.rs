@@ -1827,6 +1827,25 @@ fn map_decode_error(error: DecodeError) -> crate::owned_decode_routing::error::O
     }
 }
 
+/// A startup failure charges the lane's crash budget and the request is refused
+/// as `owned_decode_unavailable`, which says nothing about the cause. The error is
+/// logged here, where it still exists, so an operator reading the log can tell a
+/// missing artifact from a failed spawn or a worker that died during load.
+fn decode_startup_failure(
+    stage: &'static str,
+    artifact_digest: &str,
+    error: &dyn std::fmt::Debug,
+) -> WorkerFault {
+    tracing::warn!(
+        target: "worker",
+        stage,
+        artifact_digest,
+        error = ?error,
+        "owned decode worker failed to start"
+    );
+    WorkerFault::StartupFailure
+}
+
 struct OwnedDecodeWorkerSession {
     engine: Option<WorkerEngine>,
     model: LoadedModel,
@@ -1848,13 +1867,14 @@ impl WorkerFactory for OwnedDecodeWorkerFactory {
                 reusable: true,
             }));
         }
-        let mut engine =
-            WorkerEngine::new(self.config.clone()).map_err(|_| WorkerFault::StartupFailure)?;
+        let digest = self.artifact.digest.as_str();
+        let mut engine = WorkerEngine::new(self.config.clone())
+            .map_err(|error| decode_startup_failure("spawn the worker", digest, &error))?;
         let model = GenerateEngine::load(&mut engine, &self.artifact, &self.runtime_config)
-            .map_err(|_| WorkerFault::StartupFailure)?;
-        let worker_generation = engine
-            .owned_decode_worker_generation()
-            .map_err(|_| WorkerFault::StartupFailure)?;
+            .map_err(|error| decode_startup_failure("load the model", digest, &error))?;
+        let worker_generation = engine.owned_decode_worker_generation().map_err(|error| {
+            decode_startup_failure("read the worker generation", digest, &error)
+        })?;
         Ok(Box::new(OwnedDecodeWorkerSession {
             engine: Some(engine),
             model,
