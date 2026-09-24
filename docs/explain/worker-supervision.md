@@ -194,7 +194,7 @@ Production builds one `SupervisedDecodeDispatch` from `build_supervised_decode_d
 - a persistent budget file `<owned worker runtime dir>/<model_id>-crash-budget.json`;
 - a `QuarantineKey(machine_profile_hash, decode_fingerprint, runtime_config_digest)`;
 - a start frame/context with immutable model/runtime identities; and
-- a per-dispatch monotonic clock.
+- a wall-clock dispatch clock (milliseconds since the Unix epoch), because the same reading sets deadlines and is persisted as the crash budget's `quarantined_until`, which the routing precheck and later processes read back.
 
 Configured-shape dispatches are cached by model ID behind `Arc<Mutex<_>>`; the mutex serializes logical generations for that model. `set_request` replaces prompt and constraint, sets an absolute boundary deadline to `clock.now() + deadline_ms`, and resets the sidecar hint source. Dispatch then replaces generation ID, decode fingerprint, and max tokens from the routed command. The only production constructor sets `TerminalControl.cancel_at` to `None`, and `set_request` has no cancellation setter, so caller-recorded cancellation does not currently reach this production dispatch.
 
@@ -412,7 +412,6 @@ A change in this path must preserve, or deliberately revise together, all of the
 These were encountered while following the path; no source was changed:
 
 - **Negotiated frame size is not used by the host after HELLO.** `handshake_on_stream_*` ACKs `min(host, worker)`, and workers use that value, but `WorkerHost::send_request` and `send_owned_request` continue passing `config.max_frame`. Shipped workers advertise the same 64 MiB, but a smaller worker maximum would make the two sides enforce different limits.
-- **Production quarantine precheck uses time zero.** `owned_decode_quarantined` opens the persistent budget and calls `is_quarantined(&key, 0)`. Any persisted positive `quarantined_until` therefore remains routing-quarantined regardless of elapsed wall time, even though the budget abstraction and live dispatch clock define expiry at `now >= until`.
 - **A cached owned dispatch keeps its first transport timeout.** `set_request` updates the boundary deadline but not `WorkerHostConfig.request_timeout`, which was fixed when the cached factory was constructed. Later requests with a different deadline use the new boundary deadline but the first request's per-command transport timeout.
 - **CUDA unsupported rerank/generate does not consume the raw input frame.** The host always sends that frame, while CUDA immediately returns `backend_missing`; a subsequent request on the same connection would read the leftover raw frame as JSON. Current catalog routing uses this worker for embedding, so I found no production caller for those unsupported operations.
 - **One failed ping can account/restart more than once.** `ping` loops over tracked model entries without deduplicating crash keys, and each below-threshold iteration directly calls `start_worker` rather than `ensure_worker`. Production normally gives each catalog model its own host, but a multi-model host can charge one physical death repeatedly and replace a just-started connection during that loop.

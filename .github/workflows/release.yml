@@ -150,9 +150,16 @@ jobs:
       # registration with nothing in the release explaining why. `ck upgrade`
       # and `ck setup` read this floor and refuse the mismatch up front.
       #
+      # The floor was rechecked against subc-protocol 0.25: everything a 0.25
+      # module adds to HELLO since then (`ready`, and a provenance absence
+      # reason) is optional and omitted when unset, and a 0.17.20 daemon drops
+      # unknown manifest keys. An older daemon would ignore `ready: false` and
+      # send no machine id; synapse never declares `ready` and never reads a
+      # machine id, so neither difference affects it.
+      #
       # The floor is knowledge rather than something derivable from the lock,
       # so the protocol version it applies to is asserted here: a bump past
-      # 0.19 fails the release instead of publishing a floor nobody rechecked.
+      # 0.25 fails the release instead of publishing a floor nobody rechecked.
       # One lane emits it because the asset is per-release, not per-platform.
       - name: Emit release-manifest.json (declares the daemon floor)
         if: matrix.name == 'linux-x64'
@@ -162,9 +169,9 @@ jobs:
           set -euo pipefail
           protocol=$(awk '/^name = "subc-protocol"$/{getline; gsub(/["]/,""); print $3}' Cargo.lock)
           case "$protocol" in
-            0.19.*) ;;
+            0.25.*) ;;
             *)
-              echo "subc-protocol is $protocol, not 0.19.x: recheck the ck-subc floor with subconscious before releasing" >&2
+              echo "subc-protocol is $protocol, not 0.25.x: recheck the ck-subc floor with subconscious before releasing" >&2
               exit 1
               ;;
           esac
