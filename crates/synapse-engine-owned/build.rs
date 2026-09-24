@@ -155,9 +155,19 @@ fn main() {
             "xcrun metallib failed for the LFM2 step kernels"
         );
     } else {
-        // `include_bytes!` needs the files to exist, so write empty
-        // placeholders; the engines refuse to construct with an empty library
-        // and report that the build lacked the Metal developer tools.
+        // An optimized build is what gets packaged and deployed. Shipping a
+        // decode worker whose kernels are empty would pass every build step and
+        // fail only on the first request, so refuse here instead.
+        assert!(
+            std::env::var("PROFILE").as_deref() != Ok("release"),
+            "Metal developer tools are unavailable, so the owned decode kernels \
+             cannot be compiled; a release build must carry them. Install the \
+             Metal toolchain or set DEVELOPER_DIR to a full Xcode."
+        );
+        // Debug builds may continue so the rest of the workspace can still be
+        // built and tested without Xcode. `include_bytes!` needs the files to
+        // exist, so write empty placeholders; the engines refuse to construct
+        // with an empty library and report that the build lacked the tools.
         for name in [
             "qwen3_decode_metal_step.metallib",
             "lfm2_decode_metal_step.metallib",
