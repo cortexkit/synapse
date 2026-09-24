@@ -28,7 +28,7 @@ crates/                     production Rust crates
 docs/                       design notes, wire contract, audits, measured evidence
 manifests/                  component manifests (ane-prefill-split, semantic-sidecar-v1)
 results/                    saved measurement outputs from tests/ scripts
-scripts/                    packaging, CI watch, sibling lock refresh, git hooks
+scripts/                    packaging, CI watch, train landing, git hooks
 tests/                      standalone certification and attribution scripts (outside cargo test)
 tools/                      gather-distill (Bun/TS dataset and SFT harness), stt-voice-test
 workers/                    non-Rust worker processes: ane-prefill-sidecar (Swift package)
@@ -40,9 +40,8 @@ Inside `crates/synapse-module`, the owned-generation code sits next to `src/` in
 Inside `crates/synapse-engine-owned`, `owned-decode-engine/` holds the Metal decode
 kernels and `owned-decode-worker/` the supervisor and protocol.
 
-Root files: `Cargo.toml` (workspace members), `siblings.lock` (pinned commits of the
-`subconscious` and `commons` path dependencies), `DECISIONS.md`, `FOUNDING.md`,
-`CONTRIBUTING.md`.
+Root files: `Cargo.toml` (workspace members and the pinned subc and commons crates),
+`DECISIONS.md`, `FOUNDING.md`, `CONTRIBUTING.md`.
 
 ## Where to add new code
 

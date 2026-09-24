@@ -158,9 +158,11 @@ quality. `bench/run-matrix.sh` and `bench/run-night.sh` run the lanes in sequenc
   migrations this binary carries, `open` fails with `SchemaAheadOfBinary` instead of
   serving; migrations are not additive-only, so a rollback binary cannot run on a
   migrated store.
-- **Sibling repositories are path dependencies.** The workspace expects the
-  `subconscious` and `commons` checkouts beside this one (`../subconscious`,
-  `../commons`); `siblings.lock` records their revisions.
+- **The subc wire crates move together, at exact versions.** The subc and commons
+  crates come from crates.io. `subc-daemon` is pinned with `=`, because a caret
+  requirement can resolve a newer daemon built on a different protocol minor and leave
+  two copies of `subc-protocol` in the lock. After any bump, check that the lock holds
+  one version of each `subc-*` crate.
 
 ## Longer pages
 

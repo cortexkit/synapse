@@ -24,7 +24,7 @@ What a review checks:
 - **The tests fail without the fix.** We mutation-check: a test that passes on unpatched code proves nothing, and we will say so.
 - **No new suppressions.** No `as any`-equivalents: `#[allow(...)]` added to quiet a real lint, `unsafe` without a stated invariant, an ignored test, or a widened tolerance to make a gate pass.
 - **Comments explain the reason,** for a reader who was not in the discussion. No references to issue numbers, review rounds, or "as discussed".
-- **`Cargo.lock` at `origin/master` bytes.** Sibling crates are pinned in `siblings.lock`; a lock refreshed against your local checkout cannot reproduce on CI. If your change genuinely needs a dependency bump, say so in the issue.
+- **`Cargo.lock` at `origin/master` bytes.** Leave the lock as it is unless your change needs a dependency bump, and if it does, say so in the issue. The subc crates move together at exact versions, so a bump to one of them usually means bumping the set.
 
 Claims in a PR description get verified against the source, and numbers get re-measured where we can. That is not distrust — it is the same standard we hold our own changes to, and it is why a merged change here can be relied on.
 
