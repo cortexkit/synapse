@@ -58,7 +58,10 @@ pub struct BudgetRecord {
     pub strikes: u32,
     /// Ordered failure classifications, mirrored into provenance and telemetry.
     pub failure_classifications: Vec<FailureClassification>,
-    /// When quarantine lifts; `None` when not quarantined.
+    /// When quarantine lifts; `None` when not quarantined. Production callers
+    /// charge and check with wall-clock milliseconds since the Unix epoch,
+    /// because this value is persisted and read back by other call sites and
+    /// by later processes that share no monotonic clock with the writer.
     pub quarantined_until: Option<Timestamp>,
 }
 
@@ -125,6 +128,11 @@ impl FileBudgetStore {
     /// Open or create the store at `path`, loading any existing records.
     pub fn open(path: impl AsRef<Path>) -> std::io::Result<Self> {
         let path = path.as_ref().to_path_buf();
+        // Files written by older builds may hold a `quarantined_until` taken
+        // from a per-process monotonic clock (a small number such as 66056)
+        // rather than wall-clock epoch milliseconds. Against the wall clock
+        // such a value reads as long expired, which is the safe direction: the
+        // lane is not blocked by stale state. No migration is needed.
         let records = if path.exists() {
             let bytes = std::fs::read(&path)?;
             serde_json::from_slice(&bytes)
