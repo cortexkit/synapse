@@ -7,9 +7,7 @@ on:
     # that already carries a green check.
     branches: ["train/**"]
   # The push gate asks whether a change is good. This run asks whether what
-  # already landed is still good against the siblings as they are now: CI
-  # checks out subconscious/commons at their tips, so a sibling bump turns
-  # an already-green sha red with no commit here.
+  # already landed is still good on the current runner images and toolchains.
   schedule:
     - cron: "0 6 * * *"
   pull_request:
@@ -23,10 +21,6 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # secrets are not readable inside step `if` expressions, so the presence
-  # check is hoisted here where the secrets context IS allowed; steps branch
-  # on the env value.
-  HAS_CROSS_REPO_TOKEN: ${{ secrets.CK_CI_APP_ID != '' }}
   LLAMA_BUILD_GATE_BUDGET_SECONDS: "900"
   LLAMA_BUILD_EVIDENCE_CONTRACT: "nonmac-build-gates-v1"
   LLAMA_CUDA_TOOLKIT_PACKAGE: "cuda-toolkit-12-6"
@@ -67,44 +61,16 @@ jobs:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
     steps:
-      # Cross-repo token: only needed while the sibling repositories are
-      # private. Once they are public the step self-skips and checkouts fall
-      # back to the workflow's default token.
-      - name: Create cross-repo token
-        id: app-token
-        if: ${{ env.HAS_CROSS_REPO_TOKEN == 'true' }}
-        uses: actions/create-github-app-token@v2
-        with:
-          app-id: ${{ secrets.CK_CI_APP_ID }}
-          private-key: ${{ secrets.CK_CI_APP_PRIVATE_KEY }}
-          owner: cortexkit
-          repositories: synapse,subconscious,commons
-
       - name: Checkout synapse
         uses: actions/checkout@v4
         with:
           path: synapse
 
-      # Validate the workflow before sibling checkouts and toolchain setup spend time.
+      # Validate the workflow before toolchain setup spends time.
       - name: Check train CI preconditions
         if: matrix.name == 'linux'
         shell: bash
         run: bash synapse/scripts/check-train-preconditions.sh
-
-      # Sibling layout: Cargo path deps resolve ../subconscious and ../commons.
-      - name: Checkout subconscious (sibling)
-        uses: actions/checkout@v4
-        with:
-          repository: cortexkit/subconscious
-          token: ${{ steps.app-token.outputs.token || github.token }}
-          path: subconscious
-
-      - name: Checkout commons (sibling)
-        uses: actions/checkout@v4
-        with:
-          repository: cortexkit/commons
-          token: ${{ steps.app-token.outputs.token || github.token }}
-          path: commons
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -372,34 +338,10 @@ jobs:
     # channel and must move together with the image.
     runs-on: ubuntu-24.04
     steps:
-      - name: Create cross-repo token
-        id: app-token
-        if: ${{ env.HAS_CROSS_REPO_TOKEN == 'true' }}
-        uses: actions/create-github-app-token@v2
-        with:
-          app-id: ${{ secrets.CK_CI_APP_ID }}
-          private-key: ${{ secrets.CK_CI_APP_PRIVATE_KEY }}
-          owner: cortexkit
-          repositories: synapse,subconscious,commons
-
       - name: Checkout synapse
         uses: actions/checkout@v4
         with:
           path: synapse
-
-      - name: Checkout subconscious (sibling)
-        uses: actions/checkout@v4
-        with:
-          repository: cortexkit/subconscious
-          token: ${{ steps.app-token.outputs.token || github.token }}
-          path: subconscious
-
-      - name: Checkout commons (sibling)
-        uses: actions/checkout@v4
-        with:
-          repository: cortexkit/commons
-          token: ${{ steps.app-token.outputs.token || github.token }}
-          path: commons
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -488,34 +430,10 @@ jobs:
     name: windows-llama-vulkan-manual-gate
     runs-on: windows-2025
     steps:
-      - name: Create cross-repo token
-        id: app-token
-        if: ${{ env.HAS_CROSS_REPO_TOKEN == 'true' }}
-        uses: actions/create-github-app-token@v2
-        with:
-          app-id: ${{ secrets.CK_CI_APP_ID }}
-          private-key: ${{ secrets.CK_CI_APP_PRIVATE_KEY }}
-          owner: cortexkit
-          repositories: synapse,subconscious,commons
-
       - name: Checkout synapse
         uses: actions/checkout@v4
         with:
           path: synapse
-
-      - name: Checkout subconscious (sibling)
-        uses: actions/checkout@v4
-        with:
-          repository: cortexkit/subconscious
-          token: ${{ steps.app-token.outputs.token || github.token }}
-          path: subconscious
-
-      - name: Checkout commons (sibling)
-        uses: actions/checkout@v4
-        with:
-          repository: cortexkit/commons
-          token: ${{ steps.app-token.outputs.token || github.token }}
-          path: commons
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -707,34 +625,10 @@ jobs:
       OWNED_CUDA_CUDART_SHA256: 8c7f187543545cefdbf55f66ecb8c990e159e38a78694fda50e251fcb2f4fe5f
       OWNED_CUDA_CUBLAS_SHA256: af2de4aab12ce773f934529877ae444452ddf9a5b1156aa2d7549f0ca39693ea
     steps:
-      - name: Create cross-repo token
-        id: app-token
-        if: ${{ env.HAS_CROSS_REPO_TOKEN == 'true' }}
-        uses: actions/create-github-app-token@v2
-        with:
-          app-id: ${{ secrets.CK_CI_APP_ID }}
-          private-key: ${{ secrets.CK_CI_APP_PRIVATE_KEY }}
-          owner: cortexkit
-          repositories: synapse,subconscious,commons
-
       - name: Checkout synapse
         uses: actions/checkout@v4
         with:
           path: synapse
-
-      - name: Checkout subconscious (sibling)
-        uses: actions/checkout@v4
-        with:
-          repository: cortexkit/subconscious
-          token: ${{ steps.app-token.outputs.token || github.token }}
-          path: subconscious
-
-      - name: Checkout commons (sibling)
-        uses: actions/checkout@v4
-        with:
-          repository: cortexkit/commons
-          token: ${{ steps.app-token.outputs.token || github.token }}
-          path: commons
 
       - uses: dtolnay/rust-toolchain@stable
         with:
