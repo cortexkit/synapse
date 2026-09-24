@@ -1645,17 +1645,25 @@ impl OwnedDecodeWorkerFactory {
     }
 }
 
-struct MonotonicDispatchClock {
-    started: Instant,
-}
+/// The supervisor's clock for a production dispatch: wall-clock milliseconds
+/// since the Unix epoch.
+///
+/// The supervisor reads one clock for two purposes: request deadlines, and the
+/// crash budget's `quarantined_until`, which is persisted to disk and read back
+/// by the routing precheck (with wall-clock `now_ms()`) and by later processes.
+/// A value persisted from a per-process monotonic clock means nothing to any of
+/// those readers, so the quarantine would be invisible to routing and lost on
+/// restart. Deadlines are set from this same clock in `set_request`, so they
+/// stay comparable with every reading the supervisor takes; the only cost is
+/// that a wall-clock step during one request can move its deadline.
+struct WallDispatchClock;
 
-impl OwnedClock for MonotonicDispatchClock {
+impl OwnedClock for WallDispatchClock {
     fn now(&self) -> u64 {
-        self.started
-            .elapsed()
-            .as_millis()
-            .try_into()
-            .unwrap_or(u64::MAX)
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis().try_into().unwrap_or(u64::MAX))
+            .unwrap_or(0)
     }
 }
 
@@ -1669,7 +1677,7 @@ pub struct SupervisedDecodeDispatch {
     start: GenerateStart,
     context: WorkerStartContext,
     control: TerminalControl,
-    clock: MonotonicDispatchClock,
+    clock: WallDispatchClock,
     hint_bank_source: Box<dyn HintBankSource + Send>,
 }
 
@@ -1696,9 +1704,7 @@ impl SupervisedDecodeDispatch {
             start,
             context,
             control,
-            clock: MonotonicDispatchClock {
-                started: Instant::now(),
-            },
+            clock: WallDispatchClock,
             hint_bank_source: Box::new(NoHintBankSource),
         })
     }
@@ -2405,6 +2411,239 @@ mod tests {
             "an unobstructed teardown took {waited:?}; drop is paying its budget rather than \
              waiting for completion"
         );
+    }
+
+    fn wall_now_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis().try_into().unwrap_or(u64::MAX))
+            .unwrap_or(0)
+    }
+
+    fn owned_quarantine_key() -> QuarantineKey {
+        QuarantineKey::new("clock-profile", "clock-fingerprint", "clock-runtime")
+    }
+
+    fn budget_file(label: &str) -> PathBuf {
+        std::env::temp_dir()
+            .join(format!(
+                "synapse-owned-clock-{label}-{}-{}",
+                std::process::id(),
+                nonce_hex16()
+            ))
+            .join("budget.json")
+    }
+
+    /// A production `SupervisedDecodeDispatch` whose worker can never start:
+    /// the runtime config names no artifact, so every spawn is a startup
+    /// failure that the supervisor charges to the crash budget. This drives
+    /// real strikes through the production supervisor and clock without a
+    /// model or worker binary.
+    fn failing_dispatch(budget_path: &Path) -> SupervisedDecodeDispatch {
+        let factory = OwnedDecodeWorkerFactory::new(
+            WorkerHostConfig::new("missing-owned-decode-worker", std::env::temp_dir()),
+            ValidatedArtifact {
+                digest: "clock-digest".to_string(),
+                format: "owned-safetensors".to_string(),
+            },
+            RuntimeConfig {
+                values: BTreeMap::new(),
+            },
+        );
+        let start = GenerateStart {
+            generation_id: String::new(),
+            loaded_model_ref: String::new(),
+            decode_fingerprint: "clock-fingerprint".to_string(),
+            runtime_config_digest: "clock-runtime".to_string(),
+            prompt_ids: vec![1],
+            stop_ids: Vec::new(),
+            max_tokens: 4,
+            sampling: owned_decode_worker::protocol::Sampling::greedy_top1(),
+            constraint: None,
+        };
+        let context = WorkerStartContext {
+            loaded_model_ref: String::new(),
+            decode_fingerprint: "clock-fingerprint".to_string(),
+            runtime_config_digest: "clock-runtime".to_string(),
+            expected_constraint: None,
+        };
+        let mut dispatch = SupervisedDecodeDispatch::new(
+            factory,
+            budget_path,
+            OwnedBudgetPolicy::default(),
+            16,
+            owned_quarantine_key(),
+            start,
+            context,
+            TerminalControl::default(),
+        )
+        .expect("supervised dispatch opens its budget store");
+        dispatch.set_request(vec![1], None, 60_000);
+        dispatch
+    }
+
+    fn dispatch_once(
+        dispatch: &mut SupervisedDecodeDispatch,
+        generation_id: &str,
+    ) -> Result<
+        crate::owned_decode_routing::ExecutionSuccess,
+        crate::owned_decode_routing::error::OwnedDecodeError,
+    > {
+        use crate::owned_decode_routing::DecodeDispatch;
+        dispatch.dispatch(&crate::owned_decode_routing::DispatchedCommand {
+            lane: crate::owned_decode_routing::lane::LaneKind::OwnedDecode,
+            decode_fingerprint: synapse_core::Fingerprint("clock-fingerprint".to_string()),
+            processing_fingerprint: synapse_core::Fingerprint("clock-processing".to_string()),
+            prompt_token_count: 1,
+            max_tokens: 4,
+            generation_id: generation_id.to_string(),
+            constrained: false,
+            chain_k: 1,
+        })
+    }
+
+    /// Charge strikes through the dispatch path until the key is quarantined.
+    fn strike_until_quarantined(dispatch: &mut SupervisedDecodeDispatch) {
+        use crate::owned_decode_routing::error::OwnedDecodeError;
+        let max_strikes = OwnedBudgetPolicy::default().max_strikes;
+        for strike in 0..max_strikes {
+            let result = dispatch_once(dispatch, &format!("clock-strike-{strike}"));
+            let expected = if strike + 1 == max_strikes {
+                OwnedDecodeError::Quarantined
+            } else {
+                OwnedDecodeError::Unavailable
+            };
+            assert_eq!(result.err(), Some(expected), "strike {strike}");
+        }
+        assert_eq!(dispatch.crash_budget_remaining(), 0);
+    }
+
+    /// The routing precheck reopens the budget file and asks `is_quarantined`
+    /// with wall-clock `now_ms()`. A quarantine charged by dispatch must be
+    /// visible to that exact question immediately, and must lift once the wall
+    /// clock passes `quarantined_until`.
+    #[test]
+    fn dispatch_quarantine_is_visible_to_the_wall_clock_precheck() {
+        let path = budget_file("precheck");
+        let mut dispatch = failing_dispatch(&path);
+        let before = wall_now_ms();
+        strike_until_quarantined(&mut dispatch);
+        let after = wall_now_ms();
+
+        let precheck = OwnedCrashBudget::new(
+            FileBudgetStore::open(&path).expect("precheck reopens the budget"),
+            OwnedBudgetPolicy::default(),
+        );
+        let key = owned_quarantine_key();
+        assert!(
+            precheck.is_quarantined(&key, wall_now_ms()),
+            "the routing precheck must see the quarantine dispatch just charged; persisted \
+             record: {:?}",
+            precheck.record(&key)
+        );
+
+        // The persisted expiry is a wall-clock instant: charge time plus the
+        // policy duration, where the charge happened between `before` and
+        // `after`.
+        let duration = OwnedBudgetPolicy::default().quarantine_duration_ms;
+        let until = precheck
+            .record(&key)
+            .quarantined_until
+            .expect("an exhausted key records its expiry");
+        assert!(
+            (before + duration..=after + duration).contains(&until),
+            "quarantined_until {until} is not wall-clock charge time plus {duration} \
+             (charged between {before} and {after})"
+        );
+
+        // Expiry, with the wall-clock reading injected rather than slept for.
+        assert!(precheck.is_quarantined(&key, until - 1));
+        assert!(
+            !precheck.is_quarantined(&key, until),
+            "the quarantine lifts once the wall clock reaches its expiry"
+        );
+
+        drop(dispatch);
+        let _ = std::fs::remove_dir_all(path.parent().expect("budget directory"));
+    }
+
+    /// A module restart must not lose the quarantine: a fresh process reopens
+    /// the budget file with a fresh dispatch, and both the wall-clock predicate
+    /// and the new dispatch still refuse the key without charging it again.
+    #[test]
+    fn dispatch_quarantine_survives_a_store_reopen() {
+        use crate::owned_decode_routing::error::OwnedDecodeError;
+
+        let path = budget_file("restart");
+        {
+            let mut first_process = failing_dispatch(&path);
+            strike_until_quarantined(&mut first_process);
+        }
+
+        let reopened = FileBudgetStore::open(&path).expect("reopen the budget file");
+        let budget = OwnedCrashBudget::new(reopened, OwnedBudgetPolicy::default());
+        let key = owned_quarantine_key();
+        assert!(
+            budget.is_quarantined(&key, wall_now_ms()),
+            "a reopened budget must still hold the quarantine at wall-clock now; record: {:?}",
+            budget.record(&key)
+        );
+
+        let mut second_process = failing_dispatch(&path);
+        assert!(second_process.is_quarantined());
+        assert_eq!(
+            dispatch_once(&mut second_process, "after-restart").err(),
+            Some(OwnedDecodeError::Quarantined)
+        );
+        let strikes = OwnedCrashBudget::new(
+            FileBudgetStore::open(&path).expect("reopen the budget file"),
+            OwnedBudgetPolicy::default(),
+        )
+        .record(&key)
+        .strikes;
+        assert_eq!(
+            strikes,
+            OwnedBudgetPolicy::default().max_strikes,
+            "a refused quarantined dispatch charges nothing"
+        );
+
+        drop(second_process);
+        let _ = std::fs::remove_dir_all(path.parent().expect("budget directory"));
+    }
+
+    /// The converse across a restart: a quarantine whose wall-clock expiry has
+    /// passed must not block a freshly created dispatch. A clock that restarts
+    /// at zero with each dispatch would read any wall-clock expiry as far in
+    /// the future.
+    #[test]
+    fn expired_wall_clock_quarantine_does_not_block_a_fresh_dispatch() {
+        let path = budget_file("expired");
+        let policy = OwnedBudgetPolicy::default();
+        {
+            let mut budget = OwnedCrashBudget::new(
+                FileBudgetStore::open(&path).expect("open the budget file"),
+                policy,
+            );
+            let charged_at = wall_now_ms() - policy.quarantine_duration_ms - 60_000;
+            for _ in 0..policy.max_strikes {
+                budget
+                    .charge(
+                        &owned_quarantine_key(),
+                        owned_decode_worker::error::FailureClassification::Crash,
+                        charged_at,
+                    )
+                    .expect("charge persists");
+            }
+        }
+
+        let dispatch = failing_dispatch(&path);
+        assert!(
+            !dispatch.is_quarantined(),
+            "a quarantine that expired in wall-clock time must not block a new dispatch"
+        );
+
+        drop(dispatch);
+        let _ = std::fs::remove_dir_all(path.parent().expect("budget directory"));
     }
 
     #[tokio::test]

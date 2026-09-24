@@ -32,7 +32,14 @@ use crate::worker::{
     WorkerStartFailure,
 };
 
-/// A monotonic clock the supervisor reads at each boundary.
+/// The clock the supervisor reads at each boundary.
+///
+/// One reading serves both request deadlines and crash-budget charges, and a
+/// charge persists `now + quarantine_duration_ms` as the key's
+/// `quarantined_until`. Production implementations must therefore return
+/// wall-clock milliseconds since the Unix epoch, the same clock the routing
+/// precheck and any later process use to read that persisted value, and
+/// `TerminalControl` deadlines must be expressed on the same clock.
 pub trait Clock {
     fn now(&self) -> Timestamp;
 }
