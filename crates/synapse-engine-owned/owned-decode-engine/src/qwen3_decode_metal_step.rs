@@ -11,7 +11,9 @@
 //!
 //! The Metal kernels (`.metal`), the Objective-C driver (`.m`), and the FFI
 //! binding are byte-identical to the spike so the pinned fixture batteries
-//! reproduce exactly. The only change is the prefill strategy: the step
+//! reproduce exactly, except that the compiled library is now embedded in the
+//! binary and handed to the driver as bytes instead of a file path. The only
+//! arithmetic change is the prefill strategy: the step
 //! engine's `verify` path feeds prompt tokens one-by-one through the same
 //! device-resident forward pass, producing the same KV cache state and the
 //! same greedy argmax after the final prompt token.
@@ -28,11 +30,10 @@
 
 #![cfg(target_os = "macos")]
 
-use std::ffi::{c_char, c_void, CStr, CString};
-use std::path::PathBuf;
+use std::ffi::{c_char, c_void, CStr};
 use std::ptr::NonNull;
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{bail, ensure, Result};
 
 use super::decode_kernel::{DecodeKernel, DecodeRuntime};
 use super::quant::WeightQuantization;
@@ -110,8 +111,10 @@ impl MetalStepDecoder {
             "Metal step weight quantization does not match the loaded model"
         );
 
-        let library_path = metal_step_library_path()?;
-        let library = CString::new(library_path.to_string_lossy().as_bytes())?;
+        ensure!(
+            !QWEN3_STEP_METALLIB.is_empty(),
+            "Metal step metallib was not embedded: the crate was built without the Metal developer tools"
+        );
         let raw = NonNull::new(unsafe {
             synapse_qwen3_metal_step_context_new(
                 bucket as u64,
@@ -122,7 +125,8 @@ impl MetalStepDecoder {
                 model.config.intermediate_size as u64,
                 model.config.vocab_size as u64,
                 model.config.rms_norm_eps,
-                library.as_ptr(),
+                QWEN3_STEP_METALLIB.as_ptr(),
+                QWEN3_STEP_METALLIB.len() as u64,
             )
         })
         .ok_or_else(last_error)?;
@@ -671,24 +675,14 @@ impl Drop for MetalStepDecoder {
     }
 }
 
-fn metal_step_library_path() -> Result<PathBuf> {
-    let executable = std::env::current_exe().context("locate engine executable")?;
-    let beside_executable = executable
-        .parent()
-        .context("engine executable has no parent directory")?
-        .join("qwen3_decode_metal_step.metallib");
-    if beside_executable.is_file() {
-        return Ok(beside_executable);
-    }
-    let build_path = PathBuf::from(env!("SYNAPSE_OWNED_DECODE_QWEN3_STEP_LIB"));
-    ensure!(
-        build_path.is_file(),
-        "Metal step metallib is missing beside {} and at {}",
-        executable.display(),
-        build_path.display()
-    );
-    Ok(build_path)
-}
+/// The compiled Qwen3 step kernels, embedded at build time so the engine never
+/// depends on a `.metallib` file being deployed beside the executable or on the
+/// build tree still existing. `build.rs` writes this file into `OUT_DIR`; it
+/// is empty only when the crate was built without the Metal developer tools.
+pub(crate) const QWEN3_STEP_METALLIB: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/qwen3_decode_metal_step.metallib"
+));
 
 fn last_error() -> anyhow::Error {
     unsafe {
@@ -711,7 +705,8 @@ unsafe extern "C" {
         intermediate: u64,
         vocab: u64,
         epsilon: f32,
-        metallib_path: *const c_char,
+        metallib_bytes: *const u8,
+        metallib_len: u64,
     ) -> *mut c_void;
     fn synapse_qwen3_metal_step_context_free(context: *mut c_void);
     fn synapse_qwen3_metal_step_prepare(
@@ -776,4 +771,87 @@ unsafe extern "C" {
         elements: u64,
     ) -> i32;
     fn synapse_qwen3_metal_step_last_error() -> *const c_char;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Compiled Metal libraries begin with this magic.
+    const METALLIB_MAGIC: &[u8] = b"MTLB";
+
+    /// Both decode families embed a real compiled library, not the empty
+    /// placeholder a build without the Metal developer tools would leave.
+    #[test]
+    fn step_metallibs_are_embedded_in_the_binary() {
+        for (name, bytes) in [
+            ("qwen3", QWEN3_STEP_METALLIB),
+            (
+                "lfm2",
+                super::super::lfm2_decode_metal_step::LFM2_STEP_METALLIB,
+            ),
+        ] {
+            assert!(
+                bytes.starts_with(METALLIB_MAGIC),
+                "{name} step metallib is not an embedded compiled Metal library ({} bytes)",
+                bytes.len()
+            );
+        }
+    }
+
+    /// The Qwen3 native context builds its `MTLLibrary` and every step
+    /// pipeline from the embedded bytes alone. No `.metallib` file is consulted,
+    /// so this passes regardless of what sits beside the test executable.
+    #[test]
+    fn context_loads_pipelines_from_embedded_bytes() {
+        let raw = unsafe {
+            synapse_qwen3_metal_step_context_new(
+                512,
+                64,
+                2,
+                1,
+                32,
+                128,
+                128,
+                1e-6,
+                QWEN3_STEP_METALLIB.as_ptr(),
+                QWEN3_STEP_METALLIB.len() as u64,
+            )
+        };
+        let raw = NonNull::new(raw).unwrap_or_else(|| panic!("{:#}", last_error()));
+        unsafe { synapse_qwen3_metal_step_context_free(raw.as_ptr()) };
+    }
+
+    /// No engine source may locate a step library on disk any more: the
+    /// beside-the-executable lookup and the baked build-tree path were what
+    /// made deployed workers fail once the build directory was cleaned. The
+    /// forbidden needles are split so this test does not match itself.
+    #[test]
+    fn engine_sources_do_not_load_a_metallib_from_a_path() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let sources = [
+            "owned-decode-engine/src/qwen3_decode_metal_step.rs",
+            "owned-decode-engine/src/lfm2_decode_metal_step.rs",
+            "owned-decode-engine/src/qwen3_decode_metal_step.m",
+            "owned-decode-engine/src/lfm2_decode_metal_step.m",
+            "build.rs",
+        ];
+        let needles = [
+            concat!("metal_step_library", "_path"),
+            concat!("newLibrary", "WithURL"),
+            concat!("newLibrary", "WithFile"),
+            concat!("current", "_exe"),
+            concat!("_STEP", "_LIB"),
+        ];
+        for source in sources {
+            let content = std::fs::read_to_string(manifest_dir.join(source))
+                .unwrap_or_else(|error| panic!("read {source}: {error}"));
+            for needle in needles {
+                assert!(
+                    !content.contains(needle),
+                    "{source} still contains `{needle}`; step metallibs must be embedded"
+                );
+            }
+        }
+    }
 }

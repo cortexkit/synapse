@@ -100,15 +100,33 @@ static id<MTLComputePipelineState> pipeline(id<MTLDevice> device, id<MTLLibrary>
     return result;
 }
 
+// The metallib is compiled into the binary, so the library is created from
+// in-memory bytes rather than a file that would have to be deployed beside the
+// executable. DISPATCH_DATA_DESTRUCTOR_DEFAULT copies the bytes, so the
+// dispatch data owns its own storage.
+static id<MTLLibrary> library_from_bytes(
+    id<MTLDevice> device,
+    const uint8_t *metallib_bytes,
+    uint64_t metallib_len,
+    NSError **error
+) {
+    dispatch_data_t library_data = dispatch_data_create(
+        metallib_bytes, (size_t)metallib_len, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+    id<MTLLibrary> library = [device newLibraryWithData:library_data error:error];
+    dispatch_release(library_data);
+    return library;
+}
+
 void *synapse_lfm2_metal_step_context_new(
     uint64_t hidden,
     uint64_t kernel_size,
-    const char *metallib_path
+    const uint8_t *metallib_bytes,
+    uint64_t metallib_len
 ) {
     @autoreleasepool {
         if (hidden == 0 || kernel_size == 0 || hidden > UINT32_MAX || kernel_size > UINT32_MAX ||
-            metallib_path == NULL) {
-            set_error(@"invalid LFM2 Metal step dimensions or metallib path");
+            metallib_bytes == NULL || metallib_len == 0) {
+            set_error(@"invalid LFM2 Metal step dimensions or empty embedded metallib");
             return NULL;
         }
         Lfm2MetalStepContext *context = calloc(1, sizeof(*context));
@@ -124,8 +142,7 @@ void *synapse_lfm2_metal_step_context_new(
         }
         context->queue = [context->device newCommandQueue];
         NSError *error = nil;
-        NSURL *library_url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:metallib_path]];
-        context->library = [context->device newLibraryWithURL:library_url error:&error];
+        context->library = library_from_bytes(context->device, metallib_bytes, metallib_len, &error);
         if (context->queue == nil || context->library == nil) {
             set_error(error.localizedDescription ?: @"failed to load LFM2 Metal step metallib");
             [context->queue release];
@@ -548,13 +565,14 @@ void *synapse_lfm2_hybrid_step_context_new(
     uint64_t vocab,
     uint64_t kernel_size,
     float epsilon,
-    const char *metallib_path
+    const uint8_t *metallib_bytes,
+    uint64_t metallib_len
 ) {
     @autoreleasepool {
         if (bucket == 0 || hidden == 0 || query_heads == 0 || kv_heads == 0 || head_dim == 0 ||
             intermediate == 0 || vocab == 0 || kernel_size == 0 || query_heads % kv_heads != 0 ||
-            head_dim % 2 != 0 || metallib_path == NULL) {
-            set_error(@"invalid LFM2 hybrid step dimensions or metallib path");
+            head_dim % 2 != 0 || metallib_bytes == NULL || metallib_len == 0) {
+            set_error(@"invalid LFM2 hybrid step dimensions or empty embedded metallib");
             return NULL;
         }
         Lfm2HybridStepContext *context = calloc(1, sizeof(*context));
@@ -570,8 +588,7 @@ void *synapse_lfm2_hybrid_step_context_new(
         }
         context->queue = [context->device newCommandQueue];
         NSError *error = nil;
-        NSURL *library_url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:metallib_path]];
-        context->library = [context->device newLibraryWithURL:library_url error:&error];
+        context->library = library_from_bytes(context->device, metallib_bytes, metallib_len, &error);
         if (context->queue == nil || context->library == nil) {
             set_error(error.localizedDescription ?: @"failed to load LFM2 hybrid step metallib");
             [context->queue release];

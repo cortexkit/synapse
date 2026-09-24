@@ -14,8 +14,7 @@
 
 #![cfg(target_os = "macos")]
 
-use std::ffi::{c_char, c_void, CStr, CString};
-use std::path::PathBuf;
+use std::ffi::{c_char, c_void, CStr};
 use std::ptr::NonNull;
 
 use anyhow::{bail, ensure, Context, Result};
@@ -139,8 +138,10 @@ impl Lfm2HybridStepEngine {
         let config = &model.config;
         let hidden = config.hidden_size;
         let head_dim = config.head_dim;
-        let library_path = metal_step_library_path()?;
-        let library = CString::new(library_path.to_string_lossy().as_bytes())?;
+        ensure!(
+            !LFM2_STEP_METALLIB.is_empty(),
+            "LFM2 Metal step metallib was not embedded: the crate was built without the Metal developer tools"
+        );
         let raw = NonNull::new(unsafe {
             synapse_lfm2_hybrid_step_context_new(
                 bucket as u64,
@@ -152,7 +153,8 @@ impl Lfm2HybridStepEngine {
                 config.vocab_size as u64,
                 config.conv_kernel_size as u64,
                 config.rms_norm_eps,
-                library.as_ptr(),
+                LFM2_STEP_METALLIB.as_ptr(),
+                LFM2_STEP_METALLIB.len() as u64,
             )
         })
         .ok_or_else(last_error)?;
@@ -637,24 +639,12 @@ impl Drop for Lfm2HybridStepEngine {
     }
 }
 
-fn metal_step_library_path() -> Result<PathBuf> {
-    let executable = std::env::current_exe().context("locate engine executable")?;
-    let beside_executable = executable
-        .parent()
-        .context("engine executable has no parent directory")?
-        .join("lfm2_decode_metal_step.metallib");
-    if beside_executable.is_file() {
-        return Ok(beside_executable);
-    }
-    let build_path = PathBuf::from(env!("SYNAPSE_OWNED_DECODE_LFM2_STEP_LIB"));
-    ensure!(
-        build_path.is_file(),
-        "LFM2 Metal step metallib is missing beside {} and at {}",
-        executable.display(),
-        build_path.display()
-    );
-    Ok(build_path)
-}
+/// The compiled LFM2 step kernels, embedded at build time so the engine never
+/// depends on a `.metallib` file being deployed beside the executable or on the
+/// build tree still existing. `build.rs` writes this file into `OUT_DIR`; it
+/// is empty only when the crate was built without the Metal developer tools.
+pub(crate) const LFM2_STEP_METALLIB: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/lfm2_decode_metal_step.metallib"));
 
 fn last_error() -> anyhow::Error {
     unsafe {
@@ -679,7 +669,8 @@ unsafe extern "C" {
         vocab: u64,
         kernel_size: u64,
         epsilon: f32,
-        metallib_path: *const c_char,
+        metallib_bytes: *const u8,
+        metallib_len: u64,
     ) -> *mut c_void;
     fn synapse_lfm2_hybrid_step_prepare(
         context: *mut c_void,
