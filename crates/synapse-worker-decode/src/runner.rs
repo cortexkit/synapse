@@ -959,7 +959,8 @@ fn wait_until_readable(stream: &UnixStream, deadline: Instant) -> io::Result<()>
 struct AnePrefillClient {
     stream: UnixStream,
     child: Child,
-    socket_path: PathBuf,
+    // Never read: held only so the socket file is unlinked when the client drops.
+    _socket_path: RemoveOnDrop,
     max_frame: u32,
     request_sequence: u64,
     readiness: Duration,
@@ -970,6 +971,13 @@ struct AnePrefillClient {
 impl AnePrefillClient {
     fn connect(config: &AnePrefillConfig) -> Result<Self, AnePrefillFailure> {
         let sequence = ANE_PREFILL_SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        Self::connect_with_sequence(config, sequence)
+    }
+
+    fn connect_with_sequence(
+        config: &AnePrefillConfig,
+        sequence: u64,
+    ) -> Result<Self, AnePrefillFailure> {
         let socket_path = std::env::temp_dir().join(format!(
             "ck-ane-prefill-{}-{sequence}.sock",
             std::process::id()
@@ -981,6 +989,9 @@ impl AnePrefillClient {
                 format!("bind ANE sidecar socket {}: {error}", socket_path.display()),
             )
         })?;
+        // From here on the socket file exists. Owning its path in a guard means every
+        // early return below (and any added later) unlinks it without per-branch cleanup.
+        let socket_path = RemoveOnDrop(socket_path);
         listener.set_nonblocking(true).map_err(|error| {
             AnePrefillFailure::new(
                 AnePrefillFault::Load,
@@ -992,7 +1003,7 @@ impl AnePrefillClient {
         let readiness_started = Instant::now();
         let child = Command::new(&config.sidecar_path)
             .arg("--socket")
-            .arg(&socket_path)
+            .arg(socket_path.path())
             .arg("--nonce")
             .arg(&nonce)
             .stdin(Stdio::null())
@@ -1041,7 +1052,7 @@ impl AnePrefillClient {
         let mut client = Self {
             stream,
             child,
-            socket_path,
+            _socket_path: socket_path,
             max_frame: DEFAULT_MAX_FRAME_BYTES,
             request_sequence: 0,
             readiness: Duration::ZERO,
@@ -1301,8 +1312,98 @@ impl Drop for AnePrefillClient {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = fs::remove_file(&self.socket_path);
+        // `_socket_path` is a `RemoveOnDrop`; it unlinks the socket when the fields drop,
+        // which happens after the sidecar has been killed and reaped above.
     }
+}
+
+/// Owns a filesystem path and removes it (best effort) when dropped.
+struct RemoveOnDrop(PathBuf);
+
+impl RemoveOnDrop {
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+/// Removes ANE prefill socket and shared-memory files left in the temp directory by
+/// decode workers that died without running their destructors (for example when killed).
+/// Both file names embed the owning worker's pid, so nothing else would ever reuse or
+/// remove them. Best effort: removal failures are logged and never stop worker start.
+fn sweep_stale_ane_prefill_files() {
+    sweep_stale_ane_prefill_files_in(&std::env::temp_dir(), std::process::id());
+}
+
+fn sweep_stale_ane_prefill_files_in(directory: &Path, own_pid: u32) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name.to_str().and_then(ane_prefill_file_owner_pid) else {
+            continue;
+        };
+        if pid == own_pid || process_may_be_alive(pid) {
+            continue;
+        }
+        let path = entry.path();
+        if let Err(error) = fs::remove_file(&path) {
+            if error.kind() != io::ErrorKind::NotFound {
+                eprintln!(
+                    "warning: could not remove stale ANE prefill file {}: {error}",
+                    path.display()
+                );
+            }
+        }
+    }
+}
+
+/// Returns the owning pid for names exactly of the form `ck-ane-prefill-<pid>-<seq>.sock`
+/// or `ck-ane-prefill-<pid>-<seq>-<attempt>.shm` (all numeric parts plain ASCII digits),
+/// and `None` for anything else.
+fn ane_prefill_file_owner_pid(name: &str) -> Option<u32> {
+    let rest = name.strip_prefix("ck-ane-prefill-")?;
+    let (stem, expected_parts) = match rest.strip_suffix(".sock") {
+        Some(stem) => (stem, 2),
+        None => (rest.strip_suffix(".shm")?, 3),
+    };
+    let parts = stem.split('-').collect::<Vec<_>>();
+    if parts.len() != expected_parts
+        || parts
+            .iter()
+            .any(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return None;
+    }
+    let pid = parts[0].parse::<u32>().ok()?;
+    // pid 0 and values outside `pid_t` would make `kill` address a process group or
+    // wrap around, so they are never treated as a worker pid.
+    if pid == 0 || libc::pid_t::try_from(pid).is_err() {
+        return None;
+    }
+    Some(pid)
+}
+
+/// Reports whether `pid` might still be running. Only a definite "no such process"
+/// (`ESRCH`) counts as dead; `EPERM` means the process exists under another user.
+///
+/// This deliberately errs towards "alive": a recycled pid now owned by an unrelated
+/// process looks alive, so the sweep may leave a stale file behind, but it can never
+/// remove a file that belongs to a live worker.
+fn process_may_be_alive(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return true;
+    };
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
 fn validate_sidecar_hello(value: &Value, nonce: &str) -> Result<u32, AnePrefillFailure> {
@@ -3552,6 +3653,8 @@ impl WorkerState {
 
 pub fn main() -> Result<()> {
     let args = Args::parse();
+    // Runs before any ANE prefill client can connect, so it only sees other processes' files.
+    sweep_stale_ane_prefill_files();
     let worker_generation = worker_generation(&args.nonce)?;
     let mut stream = UnixStream::connect(&args.socket)
         .with_context(|| format!("connect worker socket {}", args.socket.display()))?;
@@ -4749,6 +4852,131 @@ mod tests {
             readiness_budget: Duration::from_secs(1),
             prediction_budget: Duration::from_secs(1),
             handoff_budget: Duration::from_secs(1),
+        }
+    }
+
+    fn ane_socket_path(sequence: u64) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "ck-ane-prefill-{}-{sequence}.sock",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn failed_sidecar_spawn_removes_ane_socket_file() {
+        let sequence = u64::MAX - 20;
+        let mut config = test_ane_config();
+        config.sidecar_path = PathBuf::from("/nonexistent/ck-ane-prefill-sidecar");
+        let Err(failure) = AnePrefillClient::connect_with_sequence(&config, sequence) else {
+            panic!("a missing sidecar binary must fail to connect");
+        };
+        assert!(
+            failure.detail.contains("spawn ANE prefill sidecar"),
+            "unexpected failure: {}",
+            failure.detail
+        );
+        let path = ane_socket_path(sequence);
+        assert!(!path.exists(), "leaked ANE socket file {}", path.display());
+    }
+
+    #[test]
+    fn sidecar_exiting_before_handshake_removes_ane_socket_file() {
+        let sequence = u64::MAX - 21;
+        let mut config = test_ane_config();
+        config.sidecar_path = PathBuf::from("/usr/bin/false");
+        config.readiness_budget = Duration::from_secs(5);
+        let Err(failure) = AnePrefillClient::connect_with_sequence(&config, sequence) else {
+            panic!("a sidecar that exits immediately must fail to connect");
+        };
+        assert!(
+            failure.detail.contains("exited before its handshake"),
+            "unexpected failure: {}",
+            failure.detail
+        );
+        let path = ane_socket_path(sequence);
+        assert!(!path.exists(), "leaked ANE socket file {}", path.display());
+    }
+
+    #[test]
+    fn sweep_removes_only_dead_workers_ane_prefill_files() {
+        let mut child = Command::new("/usr/bin/true")
+            .spawn()
+            .expect("spawn short-lived child");
+        let dead_pid = child.id();
+        child.wait().expect("reap short-lived child");
+        let mut live_child = Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn long-lived child");
+        let live_pid = live_child.id();
+        let own_pid = std::process::id();
+        let directory = std::env::temp_dir().join(format!(
+            "ck-ane-prefill-sweep-test-{own_pid}-{}",
+            ANE_PREFILL_SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&directory).expect("create sweep fixture directory");
+        let removed = [
+            format!("ck-ane-prefill-{dead_pid}-3.sock"),
+            format!("ck-ane-prefill-{dead_pid}-3-0.shm"),
+        ];
+        let kept = [
+            format!("ck-ane-prefill-{own_pid}-3.sock"),
+            format!("ck-ane-prefill-{own_pid}-3-0.shm"),
+            // Another live process of this user: `kill(pid, 0)` succeeds.
+            format!("ck-ane-prefill-{live_pid}-3.sock"),
+            format!("ck-ane-prefill-{live_pid}-3-0.shm"),
+            // launchd runs as root, so `kill(1, 0)` fails with EPERM, which means alive.
+            "ck-ane-prefill-1-3.sock".to_owned(),
+            "ck-ane-prefill-notapid.sock".to_owned(),
+            format!("ck-ane-prefill-{dead_pid}-3.sock.bak"),
+            format!("ck-ane-prefill-{dead_pid}-3-0-1.shm"),
+            format!("ck-ane-prefill-{dead_pid}-x.sock"),
+            format!("ck-ane-prefill-{dead_pid}-3.shm"),
+            format!("ck-ane-prefill-+{dead_pid}-3.sock"),
+            "ck-ane-prefill-0-3.sock".to_owned(),
+        ];
+        for name in removed.iter().chain(&kept) {
+            fs::write(directory.join(name), b"fixture").expect("write sweep fixture");
+        }
+
+        sweep_stale_ane_prefill_files_in(&directory, own_pid);
+        let _ = live_child.kill();
+        let _ = live_child.wait();
+
+        for name in &removed {
+            assert!(
+                !directory.join(name).exists(),
+                "dead-pid file {name} survived"
+            );
+        }
+        for name in &kept {
+            assert!(directory.join(name).exists(), "file {name} was removed");
+        }
+        fs::remove_dir_all(&directory).expect("remove sweep fixture directory");
+    }
+
+    #[test]
+    fn ane_prefill_file_owner_pid_parses_only_exact_names() {
+        assert_eq!(
+            ane_prefill_file_owner_pid("ck-ane-prefill-42-7.sock"),
+            Some(42)
+        );
+        assert_eq!(
+            ane_prefill_file_owner_pid("ck-ane-prefill-42-7-0.shm"),
+            Some(42)
+        );
+        for name in [
+            "ck-ane-prefill-notapid.sock",
+            "ck-ane-prefill-42.sock",
+            "ck-ane-prefill-42-7-0.sock",
+            "ck-ane-prefill-42-7.shm",
+            "ck-ane-prefill--7.sock",
+            "ck-ane-prefill-0-7.sock",
+            "ck-ane-prefill-4294967295-7.sock",
+            "ck-ane-prefill-42-7.sockx",
+            "xck-ane-prefill-42-7.sock",
+        ] {
+            assert_eq!(ane_prefill_file_owner_pid(name), None, "{name}");
         }
     }
 
