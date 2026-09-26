@@ -873,7 +873,7 @@ fn package_root(
         .filter(|output| output.status.success())
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
         .filter(|build| !build.is_empty())
-        .unwrap_or_else(|| "unknown-os-build".to_string());
+        .unwrap_or_else(|| UNKNOWN_OS_BUILD.to_string());
     resolve_package_root(
         cache_root,
         family.as_str(),
@@ -881,6 +881,20 @@ fn package_root(
         dtype.as_str(),
         &os_build,
     )
+}
+
+/// OS build recorded when `sw_vers` cannot be read. Pruning is skipped under it,
+/// because without the real build this process cannot tell which keys are stale.
+const UNKNOWN_OS_BUILD: &str = "unknown-os-build";
+
+/// The parts of a package directory name that decide whether it is stale.
+#[cfg(target_os = "macos")]
+struct PackageKey<'a> {
+    graph_revision: u32,
+    bucket_policy: u32,
+    model_hash: &'a str,
+    dtype: &'a str,
+    os_build: &'a str,
 }
 
 /// Directory name of one compiled-package cache entry. Every component that
@@ -898,11 +912,11 @@ fn package_key_name(
 }
 
 /// Split a package directory name produced by `package_key_name` for `family`
-/// into `(model_hash, dtype)`. Names of other families (including families
-/// whose name merely starts with `family`) and names that do not follow the
-/// layout return `None`, so they are never treated as a sibling.
+/// into its parts. Names of other families (including families whose name
+/// merely starts with `family`) and names that do not follow the layout return
+/// `None`, so they are never treated as a sibling.
 #[cfg(target_os = "macos")]
-fn parse_package_key<'a>(name: &'a str, family: &str) -> Option<(&'a str, &'a str)> {
+fn parse_package_key<'a>(name: &'a str, family: &str) -> Option<PackageKey<'a>> {
     let rest = name.strip_prefix(family)?.strip_prefix("-graph-v")?;
     let (graph_revision, rest) = rest.split_once("-bucket-policy-v")?;
     let mut parts = rest.splitn(4, '-');
@@ -911,13 +925,22 @@ fn parse_package_key<'a>(name: &'a str, family: &str) -> Option<(&'a str, &'a st
     let dtype = parts.next()?;
     let os_build = parts.next()?;
     let is_number = |value: &str| !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit());
-    (is_number(graph_revision)
+    if !(is_number(graph_revision)
         && is_number(bucket_policy)
         && model_hash.len() == 16
         && model_hash.bytes().all(|b| b.is_ascii_hexdigit())
         && !dtype.is_empty()
         && !os_build.is_empty())
-    .then_some((model_hash, dtype))
+    {
+        return None;
+    }
+    Some(PackageKey {
+        graph_revision: graph_revision.parse().ok()?,
+        bucket_policy: bucket_policy.parse().ok()?,
+        model_hash,
+        dtype,
+        os_build,
+    })
 }
 
 /// Create the package directory for the current graph revision, bucket policy
@@ -941,18 +964,23 @@ fn resolve_package_root(
     let root = cache_root.join(&name);
     std::fs::create_dir_all(&root)
         .map_err(|error| format!("create package root {}: {error}", root.display()))?;
-    prune_stale_package_siblings(cache_root, &name, family, model_hash, dtype);
+    if os_build != UNKNOWN_OS_BUILD {
+        prune_stale_package_siblings(cache_root, &name, family, model_hash, dtype, os_build);
+    }
     Ok(root)
 }
 
-/// Remove package directories of the same family, model and dtype whose graph
-/// revision, bucket policy or OS build differ from `current`.
+/// Remove package directories of the same family, model and dtype that no
+/// binary on this machine can load again: those compiled on a different OS
+/// build, and those of an OLDER graph revision or bucket policy.
 ///
-/// Such a directory only exists because an earlier OS build or an earlier
-/// graph or bucket-policy revision compiled it. Serialized MPSGraph packages
-/// are specific to the OS build and to the graph this binary builds, so this
-/// binary on this OS can never load them again; without pruning, every OS
-/// update or revision bump leaves a full stale set per model behind.
+/// Serialized MPSGraph packages are specific to the OS build and to the graph
+/// that built them, so without pruning every OS update or revision bump leaves
+/// a full stale set per model behind. Keys of a NEWER revision are kept: they
+/// belong to a newer binary sharing this cache root (for example a test run
+/// from a tree ahead of the deployed module), and pruning in both directions
+/// would make the two binaries delete and recompile each other's packages on
+/// every load.
 ///
 /// Pruning is best effort: failures are logged and never fail the load.
 ///
@@ -972,6 +1000,7 @@ fn prune_stale_package_siblings(
     family: &str,
     model_hash: &str,
     dtype: &str,
+    os_build: &str,
 ) {
     let entries = match std::fs::read_dir(cache_root) {
         Ok(entries) => entries,
@@ -985,8 +1014,13 @@ fn prune_stale_package_siblings(
     };
     let is_stale_sibling = |name: &str| {
         name != current
-            && parse_package_key(name, family)
-                .is_some_and(|(hash, key_dtype)| hash == model_hash && key_dtype == dtype)
+            && parse_package_key(name, family).is_some_and(|key| {
+                key.model_hash == model_hash
+                    && key.dtype == dtype
+                    && (key.os_build != os_build
+                        || key.graph_revision < GRAPH_REVISION
+                        || key.bucket_policy < BUCKET_POLICY_VERSION)
+            })
     };
     for entry in entries.flatten() {
         let Ok(name) = entry.file_name().into_string() else {
@@ -1109,6 +1143,8 @@ mod tests {
         let current_populated = key(current_graph, current_policy, model, "f16", "26A428");
         let other_dtype = key(current_graph, current_policy, model, "f32", "25G72");
         let other_model_key = key(current_graph, current_policy, other_model, "f16", "25G72");
+        let newer_graph = key(current_graph + 1, current_policy, model, "f16", "26A428");
+        let newer_policy = key(current_graph, current_policy + 1, model, "f16", "26A428");
         let other_family = cache_root.join(package_key_name(
             "minilm",
             current_graph,
@@ -1131,7 +1167,14 @@ mod tests {
         for stale in [&older_os, &older_policy, &older_graph, &interrupted_prune] {
             assert!(!stale.exists(), "stale key survived: {}", stale.display());
         }
-        for kept in [&other_dtype, &other_model_key, &other_family, &unrelated] {
+        for kept in [
+            &other_dtype,
+            &other_model_key,
+            &other_family,
+            &unrelated,
+            &newer_graph,
+            &newer_policy,
+        ] {
             assert!(
                 kept.is_dir(),
                 "unrelated key was removed: {}",
@@ -1144,6 +1187,38 @@ mod tests {
             .filter(|name| name.starts_with('.'))
             .collect::<Vec<_>>();
         assert!(leftovers.is_empty(), "pruning left {leftovers:?}");
+        std::fs::remove_dir_all(&cache_root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn resolving_under_an_unknown_os_build_prunes_nothing() {
+        let cache_root = std::env::temp_dir().join(format!(
+            "synapse-owned-package-unknown-os-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let family = ModelFamily::GteModernBert.as_str();
+        let model = "6b82e782f001347b";
+        let real = cache_root.join(package_key_name(
+            family,
+            GRAPH_REVISION,
+            BUCKET_POLICY_VERSION,
+            model,
+            "f16",
+            "26A428",
+        ));
+        std::fs::create_dir_all(&real).unwrap();
+
+        resolve_package_root(&cache_root, family, model, "f16", UNKNOWN_OS_BUILD).unwrap();
+
+        assert!(
+            real.is_dir(),
+            "a failed sw_vers read must not prune the real OS build's packages"
+        );
         std::fs::remove_dir_all(&cache_root).unwrap();
     }
 }
