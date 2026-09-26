@@ -1026,7 +1026,10 @@ impl AnePrefillClient {
                 Ok((stream, _)) => break stream,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     if started.elapsed() >= config.readiness_budget {
+                        // Reap as well as kill, or the sidecar stays a zombie until
+                        // this worker exits.
                         let _ = child.kill();
+                        let _ = child.wait();
                         return Err(AnePrefillFailure::new(
                             AnePrefillFault::Load,
                             "ANE prefill sidecar did not connect before its readiness deadline",
@@ -1042,6 +1045,7 @@ impl AnePrefillClient {
                 }
                 Err(error) => {
                     let _ = child.kill();
+                    let _ = child.wait();
                     return Err(AnePrefillFailure::new(
                         AnePrefillFault::Load,
                         format!("accept ANE prefill sidecar: {error}"),
