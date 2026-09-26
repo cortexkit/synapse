@@ -14638,20 +14638,25 @@ async fn cache_gc(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
     let now = now_ms();
     let grace_ms = params.grace_ms.unwrap_or(60_000);
     let result: Result<Vec<CacheGcOutcome>, ModelCacheError> = (|| {
-        ane_artifact::cleanup_abandoned_temps(state.model_cache.root(), SystemTime::now())
+        let sweep_started = SystemTime::now();
+        ane_artifact::cleanup_abandoned_temps(state.model_cache.root(), sweep_started)
             .map_err(ane_materialization_cache_error)?;
+        // Partial downloads left by a crashed ingest; files younger than the
+        // 24-hour floor may belong to an ingest still in progress and stay.
+        state
+            .model_cache
+            .cleanup_abandoned_ingest_temps(sweep_started)?;
         let outcomes = if let Some(digest) = params.digest {
             vec![state
                 .model_cache
                 .gc_digest(&digest, &state.module_id, now, grace_ms)?]
         } else {
-            // Materialized bundles consume the same cache budget as their source
-            // blobs. Lowering the blob watermark by their current size makes the
-            // existing mark/delete pass run whenever the combined cache is over
-            // budget; source deletion below reclaims the matching bundle.
-            let materialized_bytes =
-                ane_artifact::total_materialized_bytes(state.model_cache.root())
-                    .map_err(ane_materialization_cache_error)?;
+            // Materialized bundles and derived Q8 decode weights consume the same
+            // cache budget as their source blobs. Lowering the blob watermark by
+            // their current size makes the existing mark/delete pass run whenever
+            // the combined cache is over budget; source deletion below reclaims
+            // the matching derivatives.
+            let materialized_bytes = derived_artifact_bytes(state.model_cache.root())?;
             state.model_cache.gc_to_watermark(
                 &state.module_id,
                 now,
@@ -14666,6 +14671,11 @@ async fn cache_gc(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
             if let CacheGcOutcome::Deleted { digest } = outcome {
                 ane_artifact::remove_for_source_digest(state.model_cache.root(), digest)
                     .map_err(ane_materialization_cache_error)?;
+                owned_decode_routing::q8artifact::remove_for_source_digest(
+                    state.model_cache.root(),
+                    digest,
+                )
+                .map_err(q8_artifact_cache_error)?;
             }
         }
         Ok(outcomes)
@@ -14695,6 +14705,20 @@ async fn cache_gc(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
 
 fn ane_materialization_cache_error(error: anyhow::Error) -> ModelCacheError {
     ModelCacheError::ArtifactInvalid(format!("ANE materialization cache: {error:#}"))
+}
+
+fn q8_artifact_cache_error(error: anyhow::Error) -> ModelCacheError {
+    ModelCacheError::ArtifactInvalid(format!("owned-decode Q8 cache: {error:#}"))
+}
+
+/// Bytes of every artifact derived from a cached source blob and stored below
+/// the model cache root: Core ML bundles and owned-decode Q8 weights.
+fn derived_artifact_bytes(cache_root: &Path) -> Result<u64, ModelCacheError> {
+    let ane_bytes = ane_artifact::total_materialized_bytes(cache_root)
+        .map_err(ane_materialization_cache_error)?;
+    let q8_bytes = owned_decode_routing::q8artifact::total_cached_bytes(cache_root)
+        .map_err(q8_artifact_cache_error)?;
+    Ok(ane_bytes.saturating_add(q8_bytes))
 }
 
 fn cache_error_to_wire(error: ModelCacheError) -> WireOperationError {
@@ -16813,6 +16837,197 @@ mod tests {
         let _ = std::fs::remove_dir_all(cache_root);
     }
 
+    /// Module state over a fresh store and an empty model cache whose budget is
+    /// `cache_max_bytes`. Returns the state, the cache and the directories to
+    /// remove after the test.
+    fn cache_gc_test_state(
+        label: &str,
+        cache_max_bytes: u64,
+    ) -> (Arc<ModuleState>, Arc<ModelCache>, PathBuf, PathBuf) {
+        let (root, descriptor) = test_storage_descriptor(label);
+        let store = Arc::new(SynapseStore::open(&descriptor).unwrap());
+        let profile = test_machine_profile(&format!("{label}-os"));
+        store.observe_profile(&profile, 10, 1).unwrap();
+        let cache_root = std::env::temp_dir().join(format!(
+            "synapse-test-{label}-{}-{}",
+            std::process::id(),
+            TEST_STATE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&cache_root).unwrap();
+        let model_cache = Arc::new(ModelCache::new(&cache_root));
+        let (machine_profile_hash, revisioned_machine_profile_hash) =
+            module_state_machine_profile_hashes(&profile);
+        let profile_activation_epoch = store
+            .profile_state()
+            .expect("test profile state reads")
+            .profile_activation_epoch
+            .expect("test profile is activated");
+        let runtime = Arc::new(
+            RuntimeState::from_catalog(
+                ModuleConfig {
+                    cache_max_bytes,
+                    ..ModuleConfig::default()
+                },
+                vec![stuck_model_spec()],
+            )
+            .expect("test runtime initializes"),
+        );
+        let remote_gateway = Arc::new(
+            RemoteGateway::new(
+                Arc::clone(&store),
+                Vec::new(),
+                Arc::new(SubcVaultCredentialClient::new(PathBuf::from("unused-subc"))),
+                machine_profile_hash.clone(),
+            )
+            .expect("empty remote gateway initializes"),
+        );
+        let continuity_check: Arc<dyn ContinuityCheck> = remote_gateway.continuity.clone();
+        let state = Arc::new(ModuleState {
+            module_id: "synapse-test".to_string(),
+            store,
+            module_generation: 1,
+            machine_profile: profile,
+            machine_profile_hash: machine_profile_hash.clone(),
+            legacy_machine_profile_hash: machine_profile_hash,
+            revisioned_machine_profile_hash,
+            profile_activation_epoch,
+            runtime,
+            model_cache: Arc::clone(&model_cache),
+            continuity_check,
+            remote_gateway,
+        });
+        (state, model_cache, root, cache_root)
+    }
+
+    fn ingest_cache_gc_blob(model_cache: &ModelCache, name: &str, payload: &[u8]) -> String {
+        let source = model_cache.root().join(name);
+        std::fs::write(&source, payload).unwrap();
+        model_cache
+            .ingest(synapse_core::ModelCacheIngest {
+                source_url: format!("file://{}", source.display()),
+                expected_digest: None,
+                format: "bin".to_string(),
+                tokenizer_path: None,
+                pin_module_id: None,
+            })
+            .expect("ingest test artifact into model cache")
+            .digest
+    }
+
+    /// A published Q8 artifact directory as `derive_and_cache_q8_blocks` leaves
+    /// it: an object file and a lineage sidecar naming its source digest.
+    fn write_q8_artifact(
+        cache_root: &Path,
+        key: &str,
+        source_digest: &str,
+        bytes: usize,
+    ) -> PathBuf {
+        let dir = cache_root
+            .join(owned_decode_routing::q8artifact::CACHE_DIRECTORY)
+            .join(key);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("weights.q8_0"), vec![7_u8; bytes]).unwrap();
+        std::fs::write(
+            dir.join("lineage.json"),
+            serde_json::to_vec(&json!({ "source_manifest_digest": source_digest })).unwrap(),
+        )
+        .unwrap();
+        dir
+    }
+
+    async fn run_cache_gc(state: &Arc<ModuleState>, params: Value) -> Value {
+        let HandlerOutcome::Response(body) = cache_gc(Arc::clone(state), params).await else {
+            panic!("expected Response outcome from cache_gc");
+        };
+        let payload: Value = serde_json::from_slice(&body).expect("json response");
+        assert!(payload.get("error").is_none(), "cache_gc failed: {payload}");
+        payload["result"].clone()
+    }
+
+    #[tokio::test]
+    async fn cache_gc_source_deletion_reclaims_its_q8_artifact_only() {
+        let (state, model_cache, root, cache_root) = cache_gc_test_state("gc-q8-source", u64::MAX);
+        let deleted = ingest_cache_gc_blob(&model_cache, "deleted.bin", b"deleted source");
+        let kept = ingest_cache_gc_blob(&model_cache, "kept.bin", b"kept source");
+        let deleted_q8 = write_q8_artifact(&cache_root, &"1".repeat(64), &deleted, 16);
+        let kept_q8 = write_q8_artifact(&cache_root, &"2".repeat(64), &kept, 16);
+
+        for grace_ms in [60_000, 0] {
+            run_cache_gc(&state, json!({ "digest": deleted, "grace_ms": grace_ms })).await;
+        }
+
+        assert!(!model_cache.blob_path(&deleted).exists());
+        assert!(
+            !deleted_q8.exists(),
+            "deleting a source must reclaim its Q8 derivative"
+        );
+        assert!(
+            kept_q8.join("weights.q8_0").is_file(),
+            "a Q8 artifact of another source must survive"
+        );
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(cache_root);
+    }
+
+    #[tokio::test]
+    async fn cache_gc_watermark_counts_q8_artifact_bytes() {
+        // The blob alone is exactly at the budget; only the Q8 derivative
+        // pushes the combined cache over it.
+        let payload = b"q8 watermark source blob";
+        let (state, model_cache, root, cache_root) =
+            cache_gc_test_state("gc-q8-watermark", payload.len() as u64);
+        let digest = ingest_cache_gc_blob(&model_cache, "source.bin", payload);
+        let q8 = write_q8_artifact(&cache_root, &"3".repeat(64), &digest, 64);
+
+        let first = run_cache_gc(&state, json!({ "grace_ms": 60_000 })).await;
+        assert_eq!(
+            first["outcomes"][0]["state"], "marked",
+            "Q8 bytes must count toward the cache budget: {first}"
+        );
+        let second = run_cache_gc(&state, json!({ "grace_ms": 0 })).await;
+        assert_eq!(second["outcomes"][0]["state"], "deleted");
+        assert!(!q8.exists());
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(cache_root);
+    }
+
+    #[tokio::test]
+    async fn cache_gc_removes_ingest_temps_older_than_a_day_only() {
+        let (state, _model_cache, root, cache_root) =
+            cache_gc_test_state("gc-ingest-temp", u64::MAX);
+        let tmp = cache_root.join("tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let abandoned = tmp.join("ingest-1-1.tmp");
+        let in_progress = tmp.join("ingest-2-2.tmp");
+        std::fs::write(&abandoned, b"partial download").unwrap();
+        std::fs::write(&in_progress, b"partial download").unwrap();
+        let backdate = |path: &Path, age: Duration| {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(SystemTime::now() - age)
+                .unwrap();
+        };
+        backdate(&abandoned, Duration::from_secs(25 * 60 * 60));
+        backdate(&in_progress, Duration::from_secs(23 * 60 * 60));
+
+        run_cache_gc(&state, json!({ "grace_ms": 60_000 })).await;
+
+        assert!(
+            !abandoned.exists(),
+            "a partial file older than 24 h is removed"
+        );
+        assert!(
+            in_progress.is_file(),
+            "a partial file younger than 24 h may belong to a running ingest"
+        );
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(cache_root);
+    }
     #[tokio::test]
     async fn model_load_wait_timeout_fires_for_never_notified_slot() {
         let runtime = RuntimeState::from_catalog(ModuleConfig::default(), vec![stuck_model_spec()])
