@@ -198,7 +198,9 @@ impl RequestStream {
 ///
 /// Status records intentionally survive resource cleanup. They are the recovery
 /// authority for a client that lost frames, while only non-retained resident
-/// resources are reclaimed during the next supervision cycle.
+/// resources are reclaimed during the next supervision cycle. The records of a
+/// session are dropped only when its owner forgets the session
+/// ([`Self::forget_session`]); until then they are kept, however old.
 #[derive(Default)]
 pub struct StreamingSupervisor {
     requests: BTreeMap<(String, String), RequestStream>,
@@ -258,6 +260,18 @@ impl StreamingSupervisor {
             state.cleanup_pending = true;
         }
         Ok(StreamFrameDisposition::Accepted)
+    }
+
+    /// Drop every request record of one session and return how many were removed.
+    ///
+    /// The owner calls this when it forgets a closed session. From then on no
+    /// status query can reach these records, so keeping them would only grow the
+    /// map by one entry per request for the life of the process.
+    pub fn forget_session(&mut self, session_id: &str) -> usize {
+        let before = self.requests.len();
+        self.requests
+            .retain(|(owner_session, _), _| owner_session != session_id);
+        before - self.requests.len()
     }
 
     /// Return the authoritative committed count and in-flight or terminal state.
@@ -542,6 +556,31 @@ mod tests {
                 },
             },
         )
+    }
+
+    #[test]
+    fn forget_session_drops_only_that_sessions_records() {
+        let mut supervisor = StreamingSupervisor::default();
+        supervisor.begin(request()).unwrap();
+        supervisor
+            .begin(StreamRequest {
+                req_id: "request-2".to_string(),
+                ..request()
+            })
+            .unwrap();
+        supervisor
+            .begin(StreamRequest {
+                session_id: "session-2".to_string(),
+                ..request()
+            })
+            .unwrap();
+
+        assert_eq!(supervisor.forget_session("session-1"), 2);
+
+        assert!(supervisor.session_status("session-1", "request-1").is_err());
+        assert!(supervisor.session_status("session-1", "request-2").is_err());
+        assert!(supervisor.session_status("session-2", "request-1").is_ok());
+        assert_eq!(supervisor.forget_session("session-1"), 0);
     }
 
     #[test]

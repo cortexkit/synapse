@@ -653,16 +653,27 @@ impl Default for OwnedDecodeWireState {
 
 impl OwnedDecodeWireState {
     /// Forget sessions that have been closed for longer than the retention
-    /// window and return how many were removed. Open sessions are never
-    /// removed, however long ago they were admitted.
+    /// window, together with their request stream records, and return how many
+    /// sessions were removed. Open sessions are never removed, however long ago
+    /// they were admitted.
     fn evict_expired_closed_sessions(&mut self, now_ms: u64) -> usize {
-        let before = self.sessions.len();
-        self.sessions.retain(|_, session| {
-            session.closed_at_ms.is_none_or(|closed_at_ms| {
-                now_ms.saturating_sub(closed_at_ms) <= CLOSED_OWNED_DECODE_SESSION_RETENTION_MS
+        let expired = self
+            .sessions
+            .iter()
+            .filter(|(_, session)| {
+                session.closed_at_ms.is_some_and(|closed_at_ms| {
+                    now_ms.saturating_sub(closed_at_ms) > CLOSED_OWNED_DECODE_SESSION_RETENTION_MS
+                })
             })
-        });
-        before - self.sessions.len()
+            .map(|(session_id, _)| session_id.clone())
+            .collect::<Vec<_>>();
+        for session_id in &expired {
+            self.sessions.remove(session_id);
+            // Status looks the session up first, so once it is gone its stream
+            // records are unreachable and would only accumulate.
+            self.streams.forget_session(session_id);
+        }
+        expired.len()
     }
 }
 
@@ -16605,6 +16616,17 @@ mod tests {
         );
 
         assert!(!retained_session_registered(&state));
+        assert!(
+            state
+                .runtime
+                .owned_decode_sessions
+                .lock()
+                .expect("decode sessions lock")
+                .streams
+                .session_status(RETAINED_SESSION_ID, RETAINED_REQ_ID)
+                .is_err(),
+            "an evicted session's request stream record must be dropped with it"
+        );
         assert_eq!(
             retained_session_status(&state).await["error"]["code"],
             "unknown_session"
