@@ -885,6 +885,7 @@ fn package_root(
 
 /// OS build recorded when `sw_vers` cannot be read. Pruning is skipped under it,
 /// because without the real build this process cannot tell which keys are stale.
+#[cfg(target_os = "macos")]
 const UNKNOWN_OS_BUILD: &str = "unknown-os-build";
 
 /// The parts of a package directory name that decide whether it is stale.
