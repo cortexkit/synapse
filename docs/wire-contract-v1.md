@@ -360,6 +360,14 @@ can additionally return the normal owned-route errors described by its route.
 - Semantics: close is idempotent after a successful close, but cannot close an
   active decode. It completes durable serving state and may release the
   artifact only when no active sessions still require it.
+- Retention: a closed session (closed by `owned_decode.close` or by an
+  `artifact_revoked` terminal) stays known for 15 minutes after it closed, so a
+  retried close and a status query after a lost frame both still see it. After
+  that window the module forgets the session: `owned_decode.close`,
+  `owned_decode.session_status`, `owned_decode.snapshot`,
+  `owned_decode.continue`, and `owned_decode.decode` all return
+  `unknown_session` for it. A repeated close does not restart the window. Open
+  sessions are never forgotten, however long ago they were admitted.
 
 #### `owned_decode.session_status`
 
@@ -373,7 +381,10 @@ can additionally return the normal owned-route errors described by its route.
   `owned_decode_unavailable`.
 - Semantics: use this result after a lost or gapped envelope-v2 frame. It is
   authoritative for the monotonic committed-token count and never revises
-  history already committed by a progress frame.
+  history already committed by a progress frame. A closed session's terminal
+  state stays available for 15 minutes after it closed; after that window the
+  session is no longer known and status returns `unknown_session` (see the
+  retention rule under `owned_decode.close`).
 
 #### `owned_decode.disable`
 
@@ -387,7 +398,10 @@ can additionally return the normal owned-route errors described by its route.
 - Errors: `invalid_request` and `store_failure`.
 - Semantics: disable fences new session admissions and invalidates retained KV
   states for that catalog fingerprint, but lets an already active decode finish
-  normally. A previously revoked serving approval remains revoked.
+  normally. A previously revoked serving approval remains revoked. When
+  `unload_artifact` is true, the module also unloads the resident decode worker
+  for the model named by the catalog's certification record, whether or not any
+  session for that catalog is still known.
 
 #### `owned_decode.revoke`
 
