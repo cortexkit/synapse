@@ -25,6 +25,9 @@ use crate::owned_decode_routing::family::Family;
 const Q8_BLOCK_ELEMENTS: usize = 32;
 const Q8_BLOCK_BYTES: usize = 34;
 const ARTIFACT_FORMAT: &str = "synapse-owned-decode-q8_0-v1";
+/// Directory below the model cache root holding one subdirectory per derived
+/// Q8 artifact key.
+pub const CACHE_DIRECTORY: &str = "owned-decode-q8";
 
 /// A verified-on-read or newly published derived Q8 artifact.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -86,7 +89,7 @@ pub fn derive_and_cache_q8_blocks(
     let key_digest = hex::encode(Sha256::digest(
         [source_key.as_bytes(), b"\0", quantizer_revision.as_bytes()].concat(),
     ));
-    let artifact_dir = cache_root.join("owned-decode-q8").join(key_digest);
+    let artifact_dir = cache_root.join(CACHE_DIRECTORY).join(key_digest);
     fs::create_dir_all(&artifact_dir)
         .with_context(|| format!("create Q8 cache directory {}", artifact_dir.display()))?;
     let object_path = artifact_dir.join("weights.q8_0");
@@ -212,6 +215,107 @@ pub fn derive_and_cache_q8_blocks(
         metadata_path,
         reused: false,
     })
+}
+
+/// The only lineage field garbage collection needs. Parsed on its own so that
+/// attribution does not depend on the rest of the sidecar layout.
+#[derive(Deserialize)]
+struct Q8Lineage {
+    source_manifest_digest: String,
+}
+
+fn normalized_source_key(digest: &str) -> String {
+    digest
+        .trim()
+        .strip_prefix("sha256:")
+        .unwrap_or(digest.trim())
+        .to_ascii_lowercase()
+}
+
+/// Remove every derived Q8 artifact whose lineage names `source_digest` as its
+/// source, after model-cache GC deleted that source blob. Returns the number of
+/// artifact directories removed.
+///
+/// The artifact key is a one-way hash of the source digest and the quantizer
+/// revision, so attribution reads the `source_manifest_digest` recorded in
+/// each artifact's published lineage sidecar. A directory without a readable
+/// sidecar cannot be attributed and is left alone: it is either an ingest in
+/// progress (the sidecar is published last) or debris from an interrupted one.
+///
+/// Deletion cannot pull weights from under a loaded worker: the object is read
+/// only while a model loads, and the load holds a shared lease on the source
+/// blob, which GC must hold exclusively before it can delete that source.
+pub fn remove_for_source_digest(cache_root: &Path, source_digest: &str) -> Result<usize> {
+    let cache_directory = cache_root.join(CACHE_DIRECTORY);
+    if !cache_directory.is_dir() {
+        return Ok(0);
+    }
+    let wanted = normalized_source_key(source_digest);
+    let mut removed = 0;
+    for entry in fs::read_dir(&cache_directory)
+        .with_context(|| format!("list Q8 cache {}", cache_directory.display()))?
+    {
+        let entry = entry
+            .with_context(|| format!("read Q8 cache entry below {}", cache_directory.display()))?;
+        let artifact_dir = entry.path();
+        let Ok(bytes) = fs::read(artifact_dir.join("lineage.json")) else {
+            continue;
+        };
+        let Ok(lineage) = serde_json::from_slice::<Q8Lineage>(&bytes) else {
+            continue;
+        };
+        if normalized_source_key(&lineage.source_manifest_digest) != wanted {
+            continue;
+        }
+        match fs::remove_dir_all(&artifact_dir) {
+            Ok(()) => removed += 1,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "remove Q8 artifact after source GC {}",
+                        artifact_dir.display()
+                    )
+                })
+            }
+        }
+    }
+    Ok(removed)
+}
+
+/// Bytes on disk below the Q8 cache directory, counted against the same
+/// model-cache budget as the source blobs they derive from.
+pub fn total_cached_bytes(cache_root: &Path) -> Result<u64> {
+    let cache_directory = cache_root.join(CACHE_DIRECTORY);
+    if !cache_directory.is_dir() {
+        return Ok(0);
+    }
+    directory_bytes(&cache_directory)
+}
+
+fn directory_bytes(path: &Path) -> Result<u64> {
+    let mut total = 0_u64;
+    for entry in
+        fs::read_dir(path).with_context(|| format!("list Q8 cache directory {}", path.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("read Q8 cache entry below {}", path.display()))?;
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            // A concurrent ingest may rename or remove its private files.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("stat Q8 cache entry {}", entry.path().display()))
+            }
+        };
+        if metadata.is_dir() {
+            total = total.saturating_add(directory_bytes(&entry.path())?);
+        } else if metadata.is_file() {
+            total = total.saturating_add(metadata.len());
+        }
+    }
+    Ok(total)
 }
 
 fn load_cached_artifact(
@@ -610,6 +714,68 @@ mod tests {
                     .unwrap();
             assert_ne!(rotated.object_path, first.object_path);
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn source_removal_reclaims_only_artifacts_attributed_to_that_source() {
+        let root = temp_dir("source-removal");
+        let cache = root.join("cache");
+        let qwen = root.join("qwen");
+        fs::create_dir_all(&qwen).unwrap();
+        write_checkpoint(
+            &qwen,
+            json!({"num_hidden_layers": 1, "tie_word_embeddings": true}),
+            &qwen_names(),
+        );
+        let deleted_source = format!("sha256:{}", "a".repeat(64));
+        let kept_source = format!("sha256:{}", "b".repeat(64));
+        let removed_v1 = derive_and_cache_q8_blocks(
+            &qwen,
+            &cache,
+            Family::Qwen3_0_6b,
+            &deleted_source,
+            "q8-ingest-v1",
+        )
+        .unwrap();
+        let removed_v2 = derive_and_cache_q8_blocks(
+            &qwen,
+            &cache,
+            Family::Qwen3_0_6b,
+            &deleted_source,
+            "q8-ingest-v2",
+        )
+        .unwrap();
+        let kept = derive_and_cache_q8_blocks(
+            &qwen,
+            &cache,
+            Family::Qwen3_0_6b,
+            &kept_source,
+            "q8-ingest-v1",
+        )
+        .unwrap();
+        // An ingest that never published its sidecar cannot be attributed.
+        let unattributed = cache.join(CACHE_DIRECTORY).join("c".repeat(64));
+        fs::create_dir_all(&unattributed).unwrap();
+        fs::write(unattributed.join("weights.1.2.tmp"), b"partial").unwrap();
+
+        let before = total_cached_bytes(&cache).unwrap();
+        let object_bytes = fs::metadata(&kept.object_path).unwrap().len();
+        assert!(before > 3 * object_bytes, "total counts every artifact");
+
+        // GC reports digests normalized to lowercase with the sha256 prefix;
+        // a bare uppercase digest must attribute the same artifacts.
+        let removed = remove_for_source_digest(&cache, &"A".repeat(64)).unwrap();
+        assert_eq!(removed, 2);
+        assert!(!removed_v1.object_path.parent().unwrap().exists());
+        assert!(!removed_v2.object_path.parent().unwrap().exists());
+        assert!(kept.object_path.is_file());
+        assert!(unattributed.is_dir());
+        assert!(total_cached_bytes(&cache).unwrap() < before);
+        assert_eq!(
+            remove_for_source_digest(&cache, &deleted_source).unwrap(),
+            0
+        );
         fs::remove_dir_all(root).unwrap();
     }
 }

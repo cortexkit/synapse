@@ -478,13 +478,20 @@ impl ModelCache {
     }
 
     fn cleanup_tmp(&self) -> Result<(), ModelCacheError> {
+        self.cleanup_abandoned_ingest_temps(SystemTime::now())
+    }
+
+    /// Remove partial ingest files that were last written at least 24 hours
+    /// before `now`. A process that crashed mid-download leaves a model-sized
+    /// partial file here; this runs at the start of every ingest and from
+    /// cache GC so the file does not wait for the next ingest.
+    pub fn cleanup_abandoned_ingest_temps(&self, now: SystemTime) -> Result<(), ModelCacheError> {
         let tmp_dir = self.root.join(TMP_DIR);
         if !tmp_dir.exists() {
             return Ok(());
         }
         // The cache is machine-wide, so a concurrent ingest may own a fresh file here.
         // Only remove files old enough to be abandoned by a crashed process.
-        let now = SystemTime::now();
         for entry in fs::read_dir(&tmp_dir).map_err(|source| ModelCacheError::Io {
             action: "list temp cache directory",
             path: tmp_dir.display().to_string(),

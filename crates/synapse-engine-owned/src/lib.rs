@@ -874,16 +874,166 @@ fn package_root(
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
         .filter(|build| !build.is_empty())
         .unwrap_or_else(|| "unknown-os-build".to_string());
-    let root = cache_root.join(format!(
-        "{}-graph-v{}-bucket-policy-v{}-{hash:016x}-{}-{os_build}",
+    resolve_package_root(
+        cache_root,
         family.as_str(),
+        &format!("{hash:016x}"),
+        dtype.as_str(),
+        &os_build,
+    )
+}
+
+/// Directory name of one compiled-package cache entry. Every component that
+/// can make a serialized MPSGraph package unusable is part of the name.
+#[cfg(target_os = "macos")]
+fn package_key_name(
+    family: &str,
+    graph_revision: u32,
+    bucket_policy: u32,
+    model_hash: &str,
+    dtype: &str,
+    os_build: &str,
+) -> String {
+    format!("{family}-graph-v{graph_revision}-bucket-policy-v{bucket_policy}-{model_hash}-{dtype}-{os_build}")
+}
+
+/// Split a package directory name produced by `package_key_name` for `family`
+/// into `(model_hash, dtype)`. Names of other families (including families
+/// whose name merely starts with `family`) and names that do not follow the
+/// layout return `None`, so they are never treated as a sibling.
+#[cfg(target_os = "macos")]
+fn parse_package_key<'a>(name: &'a str, family: &str) -> Option<(&'a str, &'a str)> {
+    let rest = name.strip_prefix(family)?.strip_prefix("-graph-v")?;
+    let (graph_revision, rest) = rest.split_once("-bucket-policy-v")?;
+    let mut parts = rest.splitn(4, '-');
+    let bucket_policy = parts.next()?;
+    let model_hash = parts.next()?;
+    let dtype = parts.next()?;
+    let os_build = parts.next()?;
+    let is_number = |value: &str| !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit());
+    (is_number(graph_revision)
+        && is_number(bucket_policy)
+        && model_hash.len() == 16
+        && model_hash.bytes().all(|b| b.is_ascii_hexdigit())
+        && !dtype.is_empty()
+        && !os_build.is_empty())
+    .then_some((model_hash, dtype))
+}
+
+/// Create the package directory for the current graph revision, bucket policy
+/// and OS build, then prune stale keys of the same model and dtype.
+#[cfg(target_os = "macos")]
+fn resolve_package_root(
+    cache_root: &Path,
+    family: &str,
+    model_hash: &str,
+    dtype: &str,
+    os_build: &str,
+) -> Result<PathBuf, String> {
+    let name = package_key_name(
+        family,
         GRAPH_REVISION,
         BUCKET_POLICY_VERSION,
-        dtype.as_str()
-    ));
+        model_hash,
+        dtype,
+        os_build,
+    );
+    let root = cache_root.join(&name);
     std::fs::create_dir_all(&root)
         .map_err(|error| format!("create package root {}: {error}", root.display()))?;
+    prune_stale_package_siblings(cache_root, &name, family, model_hash, dtype);
     Ok(root)
+}
+
+/// Remove package directories of the same family, model and dtype whose graph
+/// revision, bucket policy or OS build differ from `current`.
+///
+/// Such a directory only exists because an earlier OS build or an earlier
+/// graph or bucket-policy revision compiled it. Serialized MPSGraph packages
+/// are specific to the OS build and to the graph this binary builds, so this
+/// binary on this OS can never load them again; without pruning, every OS
+/// update or revision bump leaves a full stale set per model behind.
+///
+/// Pruning is best effort: failures are logged and never fail the load.
+///
+/// Several processes can resolve packages for the same model at once (the
+/// module, a certification probe, a bench or a test sharing the cache root),
+/// and one of them may be an older binary still compiling into the key this
+/// one considers stale. A stale directory is therefore first renamed to a
+/// private hidden name and only then deleted. The rename is atomic, so a
+/// package at a live key path is never observed half-deleted: an older
+/// writer either finds its directory gone (its package load falls back to
+/// compiling) or keeps writing into the renamed tree, which is then removed.
+/// The current key and keys of other models or dtypes are never touched.
+#[cfg(target_os = "macos")]
+fn prune_stale_package_siblings(
+    cache_root: &Path,
+    current: &str,
+    family: &str,
+    model_hash: &str,
+    dtype: &str,
+) {
+    let entries = match std::fs::read_dir(cache_root) {
+        Ok(entries) => entries,
+        Err(error) => {
+            eprintln!(
+                "owned-metal: skip stale package pruning, cannot list {}: {error}",
+                cache_root.display()
+            );
+            return;
+        }
+    };
+    let is_stale_sibling = |name: &str| {
+        name != current
+            && parse_package_key(name, family)
+                .is_some_and(|(hash, key_dtype)| hash == model_hash && key_dtype == dtype)
+    };
+    for entry in entries.flatten() {
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        // A hidden `.<key>.pruning-*` directory is a stale key whose deletion
+        // was interrupted after the rename below; finish removing it.
+        let pruning_leftover = name
+            .strip_prefix('.')
+            .and_then(|hidden| hidden.split_once(".pruning-"))
+            .is_some_and(|(key, _)| is_stale_sibling(key));
+        if pruning_leftover {
+            remove_package_tree(&entry.path());
+            continue;
+        }
+        if !is_stale_sibling(&name) {
+            continue;
+        }
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        let trash = cache_root.join(format!(".{name}.pruning-{}-{nonce}", std::process::id()));
+        match std::fs::rename(entry.path(), &trash) {
+            Ok(()) => remove_package_tree(&trash),
+            // Another process pruned the same key first.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => eprintln!(
+                "owned-metal: failed to retire stale package {}: {error}",
+                entry.path().display()
+            ),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn remove_package_tree(path: &Path) {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => eprintln!(
+            "owned-metal: failed to remove stale package {}: {error}",
+            path.display()
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -922,5 +1072,78 @@ mod tests {
             OwnedDType::F32
         );
         assert_eq!(ModelFamily::Qwen3.recommended_dtype(), OwnedDType::F16);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn resolving_a_package_key_prunes_only_stale_keys_of_the_same_model_and_dtype() {
+        let cache_root = std::env::temp_dir().join(format!(
+            "synapse-owned-package-prune-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&cache_root).unwrap();
+        let family = ModelFamily::GteModernBert.as_str();
+        let model = "6b82e782f001347b";
+        let other_model = "fb2726a2bfc119cb";
+        let key = |graph, policy, hash, dtype, os| {
+            let name = package_key_name(family, graph, policy, hash, dtype, os);
+            let path = cache_root.join(&name);
+            std::fs::create_dir_all(path.join("8x128.mpsgraphpackage")).unwrap();
+            std::fs::write(path.join("8x128.mpsgraphpackage/data"), b"package").unwrap();
+            path
+        };
+        let current_policy = BUCKET_POLICY_VERSION;
+        let current_graph = GRAPH_REVISION;
+        let older_os = key(current_graph, current_policy, model, "f16", "25G72");
+        let older_policy = key(current_graph, current_policy - 1, model, "f16", "26A428");
+        let older_graph = key(current_graph - 1, current_policy, model, "f16", "26A428");
+        let interrupted_prune = cache_root.join(format!(
+            ".{}.pruning-1-2",
+            package_key_name(family, current_graph, current_policy, model, "f16", "25F84")
+        ));
+        std::fs::create_dir_all(&interrupted_prune).unwrap();
+        let current_populated = key(current_graph, current_policy, model, "f16", "26A428");
+        let other_dtype = key(current_graph, current_policy, model, "f32", "25G72");
+        let other_model_key = key(current_graph, current_policy, other_model, "f16", "25G72");
+        let other_family = cache_root.join(package_key_name(
+            "minilm",
+            current_graph,
+            current_policy,
+            model,
+            "f16",
+            "25G72",
+        ));
+        std::fs::create_dir_all(&other_family).unwrap();
+        let unrelated = cache_root.join("unrelated-directory");
+        std::fs::create_dir_all(&unrelated).unwrap();
+
+        let resolved = resolve_package_root(&cache_root, family, model, "f16", "26A428").unwrap();
+
+        assert_eq!(resolved, current_populated);
+        assert!(
+            resolved.join("8x128.mpsgraphpackage/data").is_file(),
+            "the resolved key keeps its compiled packages"
+        );
+        for stale in [&older_os, &older_policy, &older_graph, &interrupted_prune] {
+            assert!(!stale.exists(), "stale key survived: {}", stale.display());
+        }
+        for kept in [&other_dtype, &other_model_key, &other_family, &unrelated] {
+            assert!(
+                kept.is_dir(),
+                "unrelated key was removed: {}",
+                kept.display()
+            );
+        }
+        let leftovers = std::fs::read_dir(&cache_root)
+            .unwrap()
+            .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+            .filter(|name| name.starts_with('.'))
+            .collect::<Vec<_>>();
+        assert!(leftovers.is_empty(), "pruning left {leftovers:?}");
+        std::fs::remove_dir_all(&cache_root).unwrap();
     }
 }
