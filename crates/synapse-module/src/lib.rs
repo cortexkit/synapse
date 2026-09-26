@@ -601,8 +601,27 @@ struct OwnedDecodeWireSession {
     active_request: Option<String>,
     retained_kv_session_id: Option<String>,
     retained_position: Option<u32>,
-    closed: bool,
+    /// Wall-clock time (`now_ms`) at which close or an artifact revoke ended the
+    /// session; `None` while it is open. Background maintenance evicts the entry
+    /// once it has been closed for longer than
+    /// [`CLOSED_OWNED_DECODE_SESSION_RETENTION_MS`].
+    closed_at_ms: Option<u64>,
 }
+
+impl OwnedDecodeWireSession {
+    fn is_closed(&self) -> bool {
+        self.closed_at_ms.is_some()
+    }
+}
+
+/// How long a closed decode session stays registered before background
+/// maintenance forgets it. Keeping it for a while is what lets a repeated
+/// `owned_decode.close` stay idempotent and lets `owned_decode.session_status`
+/// report the terminal state to a client that lost the terminal frame. Both of
+/// those recoveries happen within seconds of the close, so 15 minutes is a
+/// generous margin while still stopping the session map from growing by one
+/// entry per admitted session for the life of the module.
+const CLOSED_OWNED_DECODE_SESSION_RETENTION_MS: u64 = 15 * 60 * 1_000;
 
 #[derive(Clone, Copy, Debug)]
 struct PendingSessionAbort {
@@ -629,6 +648,21 @@ impl Default for OwnedDecodeWireState {
             pending_aborts: BTreeMap::new(),
             next_session_sequence: 0,
         }
+    }
+}
+
+impl OwnedDecodeWireState {
+    /// Forget sessions that have been closed for longer than the retention
+    /// window and return how many were removed. Open sessions are never
+    /// removed, however long ago they were admitted.
+    fn evict_expired_closed_sessions(&mut self, now_ms: u64) -> usize {
+        let before = self.sessions.len();
+        self.sessions.retain(|_, session| {
+            session.closed_at_ms.is_none_or(|closed_at_ms| {
+                now_ms.saturating_sub(closed_at_ms) <= CLOSED_OWNED_DECODE_SESSION_RETENTION_MS
+            })
+        });
+        before - self.sessions.len()
     }
 }
 
@@ -3017,7 +3051,12 @@ fn machine_profile_with_overrides(mut machine_profile: MachineProfile) -> Machin
 /// Run storage maintenance from the host's periodic health cadence. Keeping
 /// this work on an existing heartbeat avoids a second timer loop in the module.
 fn run_background_maintenance(state: &ModuleState) {
-    let now = now_ms();
+    run_background_maintenance_at(state, now_ms());
+}
+
+/// The maintenance pass with the wall-clock reading supplied by the caller, so
+/// tests can run it at a chosen time instead of waiting for time to pass.
+fn run_background_maintenance_at(state: &ModuleState, now: u64) {
     if let Err(error) = state.store.purge_expired_jobs(now) {
         tracing::warn!(target: "maintenance", error = %error, "job purge sweep failed");
     }
@@ -3033,6 +3072,14 @@ fn run_background_maintenance(state: &ModuleState) {
             .sweep_remote_url_bindings(&active_hashes, now, 7 * 24 * 60 * 60 * 1_000)
     {
         tracing::warn!(target: "maintenance", error = %error, "URL binding sweep failed");
+    }
+    match state.runtime.owned_decode_sessions.lock() {
+        Ok(mut sessions) => {
+            sessions.evict_expired_closed_sessions(now);
+        }
+        Err(_) => {
+            tracing::warn!(target: "maintenance", "closed decode session sweep skipped: session lock poisoned");
+        }
     }
 }
 
@@ -3420,6 +3467,45 @@ fn serving_admission_material(
     })
 }
 
+/// Resolve the model a serving approval's catalog runs, from the certification
+/// record the approval references. Unlike [`serving_admission_material`] this
+/// does not require the approval to be enabled, because `owned_decode.disable`
+/// needs the model after the approval has left the enabled state.
+fn serving_catalog_model_id(
+    state: &ModuleState,
+    approval: &store::ServingApprovalRecord,
+) -> Option<String> {
+    let certification = match state
+        .store
+        .serving_certification(&approval.certification_record_id)
+    {
+        Ok(Some(certification)) => certification,
+        Ok(None) => {
+            tracing::warn!(
+                catalog_fingerprint = %approval.catalog_fingerprint,
+                "serving approval references no certification record; cannot resolve its model"
+            );
+            return None;
+        }
+        Err(error) => {
+            tracing::warn!(
+                catalog_fingerprint = %approval.catalog_fingerprint,
+                error = %error,
+                "serving certification is unreadable; cannot resolve its model"
+            );
+            return None;
+        }
+    };
+    let record = certification.record;
+    if record.unit.catalog_fingerprint != approval.catalog_fingerprint {
+        tracing::warn!(
+            catalog_fingerprint = %approval.catalog_fingerprint,
+            "serving certification does not match its approval's catalog fingerprint"
+        );
+        return None;
+    }
+    Some(record.artifact_lineage.model_id)
+}
 fn session_request_key(session_id: &str, req_id: &str) -> String {
     format!("{session_id}:{req_id}")
 }
@@ -3542,7 +3628,7 @@ async fn owned_decode_admit_session(state: Arc<ModuleState>, params: Value) -> H
             active_request: None,
             retained_kv_session_id: None,
             retained_position: None,
-            closed: false,
+            closed_at_ms: None,
         },
     );
     let receipt = routing_admission.receipt;
@@ -3586,7 +3672,7 @@ async fn owned_decode_session_snapshot(state: Arc<ModuleState>, params: Value) -
             "the decode session does not exist",
         );
     };
-    if session.closed || session.active_request.is_some() {
+    if session.is_closed() || session.active_request.is_some() {
         return owned_decode_failure(
             &state,
             synapse_core::OwnedDecodeRefusal::SessionStillInFlight.as_str(),
@@ -3706,7 +3792,7 @@ async fn owned_decode_session_continue(state: Arc<ModuleState>, params: Value) -
             "the decode session does not exist",
         );
     };
-    if session.closed || session.active_request.is_some() {
+    if session.is_closed() || session.active_request.is_some() {
         return owned_decode_failure(
             &state,
             synapse_core::OwnedDecodeRefusal::SessionStillInFlight.as_str(),
@@ -4091,7 +4177,7 @@ async fn owned_decode_session_decode(state: Arc<ModuleState>, params: Value) -> 
                 "the decode session does not exist",
             );
         };
-        if session.closed || session.active_request.is_some() {
+        if session.is_closed() || session.active_request.is_some() {
             return owned_decode_failure(
                 &state,
                 synapse_core::OwnedDecodeRefusal::SessionStillInFlight.as_str(),
@@ -4361,7 +4447,7 @@ async fn owned_decode_session_decode(state: Arc<ModuleState>, params: Value) -> 
                     .clone();
                 if let Some(session) = sessions.sessions.get_mut(&params.session_id) {
                     session.active_request = None;
-                    session.closed = true;
+                    session.closed_at_ms = Some(now_ms());
                 }
                 if unload_artifact {
                     if let Ok(mut dispatches) = state.runtime.owned_decode_dispatches.lock() {
@@ -4514,7 +4600,7 @@ async fn owned_decode_session_close(state: Arc<ModuleState>, params: Value) -> H
         );
     }
     let mut unload_artifact = false;
-    if !session.closed {
+    if !session.is_closed() {
         match state
             .store
             .complete_serving_session(&params.session_id, now_ms())
@@ -4534,7 +4620,7 @@ async fn owned_decode_session_close(state: Arc<ModuleState>, params: Value) -> H
             }
         }
         if let Some(session) = sessions.sessions.get_mut(&params.session_id) {
-            session.closed = true;
+            session.closed_at_ms = Some(now_ms());
         }
     }
     drop(sessions);
@@ -4565,31 +4651,14 @@ async fn owned_decode_disable(state: Arc<ModuleState>, params: Value) -> Handler
         .disable_serving_catalog(&params.catalog_fingerprint, &params.reason, now_ms())
     {
         Ok(outcome) => {
-            // Collect session ownership before taking the worker map so decode's
-            // boundary path never contends on the same locks in reverse order.
-            let model_ids = if outcome.unload_artifact {
-                state
-                    .runtime
-                    .owned_decode_sessions
-                    .lock()
-                    .ok()
-                    .map(|sessions| {
-                        sessions
-                            .sessions
-                            .values()
-                            .filter(|session| {
-                                session.catalog_fingerprint == params.catalog_fingerprint
-                            })
-                            .map(|session| session.model_id.clone())
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-            if !model_ids.is_empty() {
-                if let Ok(mut dispatches) = state.runtime.owned_decode_dispatches.lock() {
-                    for model_id in model_ids {
+            // The store's certification record is the authority for which model
+            // a catalog serves. The in-memory session map is not: closed
+            // sessions are evicted after a retention window, the map starts
+            // empty after a module restart, and certification can load a worker
+            // before any session is admitted.
+            if outcome.unload_artifact {
+                if let Some(model_id) = serving_catalog_model_id(&state, &outcome.approval) {
+                    if let Ok(mut dispatches) = state.runtime.owned_decode_dispatches.lock() {
                         dispatches.remove(&model_id);
                     }
                 }
@@ -16001,7 +16070,7 @@ mod tests {
                     active_request: Some(PENDING_ABORT_REQ_ID.to_string()),
                     retained_kv_session_id: None,
                     retained_position: None,
-                    closed: false,
+                    closed_at_ms: None,
                 },
             );
             sessions
@@ -16273,6 +16342,401 @@ mod tests {
         fs::remove_dir_all(root).expect("remove pending-abort state");
     }
 
+    const RETAINED_SESSION_ID: &str = "retained-closed-session";
+    const RETAINED_REQ_ID: &str = "retained-closed-request";
+
+    /// A module state whose store holds one approved, certified serving catalog.
+    fn owned_decode_serving_test_state(label: &str) -> (PathBuf, Arc<ModuleState>, String) {
+        let (root, descriptor) = test_storage_descriptor(label);
+        let store = Arc::new(SynapseStore::open(&descriptor).expect("serving store opens"));
+        let profile = test_machine_profile(label);
+        store
+            .observe_profile(&profile, 10, 1)
+            .expect("serving profile activates");
+        let catalog_fingerprint = store::configure_serving_catalog_for_test(&store);
+        let state = test_module_state(store, profile);
+        (root, state, catalog_fingerprint)
+    }
+
+    /// The model the test catalog's certification record names, read straight
+    /// from the stored certification.
+    fn certified_model_id(state: &ModuleState, catalog_fingerprint: &str) -> String {
+        let approval = state
+            .store
+            .serving_approval(catalog_fingerprint)
+            .expect("serving approval reads")
+            .expect("test catalog is approved");
+        state
+            .store
+            .serving_certification(&approval.certification_record_id)
+            .expect("serving certification reads")
+            .expect("approval references a certification")
+            .record
+            .artifact_lineage
+            .model_id
+    }
+
+    /// Register an open session in both the durable ledger and the in-memory
+    /// map, with a completed request stream so `session_status` has a terminal
+    /// state to report.
+    fn register_completed_session(
+        state: &ModuleState,
+        catalog_fingerprint: &str,
+        model_id: &str,
+        admitted_at_ms: u64,
+    ) {
+        assert!(matches!(
+            state
+                .store
+                .admit_serving_session(RETAINED_SESSION_ID, catalog_fingerprint, admitted_at_ms)
+                .expect("serving session admission persists"),
+            store::ServingSessionAdmission::Admitted { .. }
+        ));
+        let mut sessions = state
+            .runtime
+            .owned_decode_sessions
+            .lock()
+            .expect("decode sessions lock");
+        sessions.sessions.insert(
+            RETAINED_SESSION_ID.to_string(),
+            OwnedDecodeWireSession {
+                catalog_fingerprint: catalog_fingerprint.to_string(),
+                model_id: model_id.to_string(),
+                routing_session_id: owned_decode_routing::admission::SessionId(1),
+                kv_configuration: owned_decode_routing::admission::SessionKvConfiguration::new(
+                    256, 256,
+                )
+                .expect("test KV configuration is valid"),
+                active_request: None,
+                retained_kv_session_id: None,
+                retained_position: None,
+                closed_at_ms: None,
+            },
+        );
+        sessions
+            .streams
+            .begin(owned_decode_worker::StreamRequest {
+                req_id: RETAINED_REQ_ID.to_string(),
+                session_id: RETAINED_SESSION_ID.to_string(),
+                generation_id: "generation-1".to_string(),
+                identity: pending_abort_identity(),
+                decode_mode: synapse_core::DecodeMode::Serial,
+                grammar_constrained: false,
+                chain_k: 1,
+            })
+            .expect("request stream begins");
+        sessions
+            .streams
+            .observe_frame(&synapse_core::FrameEnvelope::new(
+                RETAINED_REQ_ID,
+                RETAINED_SESSION_ID,
+                synapse_core::StreamSequence::FIRST,
+                synapse_core::WorkerFrame::Final {
+                    terminal: synapse_core::TerminalEnvelope {
+                        req_id: RETAINED_REQ_ID.to_string(),
+                        session_id: RETAINED_SESSION_ID.to_string(),
+                        committed_token_count: 0,
+                        tokens_emitted: 0,
+                        identity: pending_abort_identity(),
+                        terminal_state: synapse_core::TerminalState::Completed,
+                        decode_mode: synapse_core::DecodeMode::Serial,
+                        speculative_telemetry: None,
+                    },
+                },
+            ))
+            .expect("terminal frame is observed");
+    }
+
+    async fn close_retained_session(state: &Arc<ModuleState>) -> Value {
+        response_result(
+            owned_decode_session_close(
+                Arc::clone(state),
+                json!({ "session_id": RETAINED_SESSION_ID }),
+            )
+            .await,
+            "owned_decode.close",
+        )
+    }
+
+    async fn retained_session_status(state: &Arc<ModuleState>) -> Value {
+        response_result(
+            owned_decode_session_status(
+                Arc::clone(state),
+                json!({ "session_id": RETAINED_SESSION_ID, "req_id": RETAINED_REQ_ID }),
+            )
+            .await,
+            "owned_decode.session_status",
+        )
+    }
+
+    fn retained_session_closed_at_ms(state: &ModuleState) -> u64 {
+        state
+            .runtime
+            .owned_decode_sessions
+            .lock()
+            .expect("decode sessions lock")
+            .sessions
+            .get(RETAINED_SESSION_ID)
+            .expect("closed session is still registered")
+            .closed_at_ms
+            .expect("close records when the session closed")
+    }
+
+    fn retained_session_registered(state: &ModuleState) -> bool {
+        state
+            .runtime
+            .owned_decode_sessions
+            .lock()
+            .expect("decode sessions lock")
+            .sessions
+            .contains_key(RETAINED_SESSION_ID)
+    }
+
+    /// A dispatch that never starts a worker; the tests only check whether the
+    /// dispatch cache still holds it.
+    fn idle_decode_dispatch(
+        root: &Path,
+        name: &str,
+    ) -> Arc<Mutex<worker_host::SupervisedDecodeDispatch>> {
+        use owned_decode_worker::{
+            budget::BudgetPolicy,
+            identity::QuarantineKey,
+            protocol::{GenerateStart, Sampling},
+            supervisor::TerminalControl,
+            validation::WorkerStartContext,
+        };
+        let factory = worker_host::OwnedDecodeWorkerFactory::new(
+            worker_host::WorkerHostConfig::new("missing-owned-decode-worker", root),
+            ValidatedArtifact {
+                digest: "idle-digest".to_string(),
+                format: "owned-safetensors".to_string(),
+            },
+            RuntimeConfig {
+                values: BTreeMap::new(),
+            },
+        );
+        let dispatch = worker_host::SupervisedDecodeDispatch::new(
+            factory,
+            root.join(format!("{name}-budget.json")),
+            BudgetPolicy::default(),
+            16,
+            QuarantineKey::new("idle-machine", "idle-fingerprint", "idle-runtime"),
+            GenerateStart {
+                generation_id: String::new(),
+                loaded_model_ref: String::new(),
+                decode_fingerprint: "idle-fingerprint".to_string(),
+                runtime_config_digest: "idle-runtime".to_string(),
+                prompt_ids: vec![1],
+                stop_ids: Vec::new(),
+                max_tokens: 1,
+                sampling: Sampling::greedy_top1(),
+                constraint: None,
+            },
+            WorkerStartContext {
+                loaded_model_ref: String::new(),
+                decode_fingerprint: "idle-fingerprint".to_string(),
+                runtime_config_digest: "idle-runtime".to_string(),
+                expected_constraint: None,
+            },
+            TerminalControl::default(),
+        )
+        .expect("idle dispatch opens its budget store");
+        Arc::new(Mutex::new(dispatch))
+    }
+
+    /// Cache a dispatch for the certified model and one for an unrelated model,
+    /// so a test can tell a targeted unload from clearing the whole cache.
+    fn cache_certified_and_unrelated_dispatches(
+        state: &ModuleState,
+        root: &Path,
+        certified_model_id: &str,
+    ) {
+        let mut dispatches = state
+            .runtime
+            .owned_decode_dispatches
+            .lock()
+            .expect("dispatch cache lock");
+        dispatches.insert(
+            certified_model_id.to_string(),
+            idle_decode_dispatch(root, "certified"),
+        );
+        dispatches.insert(
+            "unrelated-model".to_string(),
+            idle_decode_dispatch(root, "unrelated"),
+        );
+    }
+
+    fn cached_dispatch_models(state: &ModuleState) -> Vec<String> {
+        state
+            .runtime
+            .owned_decode_dispatches
+            .lock()
+            .expect("dispatch cache lock")
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    async fn disable_catalog(state: &Arc<ModuleState>, catalog_fingerprint: &str) -> Value {
+        response_result(
+            owned_decode_disable(
+                Arc::clone(state),
+                json!({
+                    "catalog_fingerprint": catalog_fingerprint,
+                    "reason": "operator disable",
+                }),
+            )
+            .await,
+            "owned_decode.disable",
+        )
+    }
+
+    #[tokio::test]
+    async fn maintenance_evicts_session_closed_longer_than_retention() {
+        let (root, state, catalog) = owned_decode_serving_test_state("evict-expired-closed");
+        let model_id = certified_model_id(&state, &catalog);
+        register_completed_session(&state, &catalog, &model_id, now_ms());
+        assert_eq!(close_retained_session(&state).await["closed"], true);
+        let closed_at_ms = retained_session_closed_at_ms(&state);
+
+        run_background_maintenance_at(
+            &state,
+            closed_at_ms + CLOSED_OWNED_DECODE_SESSION_RETENTION_MS + 1,
+        );
+
+        assert!(!retained_session_registered(&state));
+        assert_eq!(
+            retained_session_status(&state).await["error"]["code"],
+            "unknown_session"
+        );
+        assert_eq!(
+            close_retained_session(&state).await["error"]["code"],
+            "unknown_session"
+        );
+
+        drop(state);
+        fs::remove_dir_all(root).expect("remove eviction state");
+    }
+
+    #[tokio::test]
+    async fn maintenance_keeps_session_closed_within_retention() {
+        let (root, state, catalog) = owned_decode_serving_test_state("keep-recent-closed");
+        let model_id = certified_model_id(&state, &catalog);
+        register_completed_session(&state, &catalog, &model_id, now_ms());
+        assert_eq!(close_retained_session(&state).await["closed"], true);
+        let closed_at_ms = retained_session_closed_at_ms(&state);
+
+        // Exactly at the retention boundary the session is still kept.
+        run_background_maintenance_at(
+            &state,
+            closed_at_ms + CLOSED_OWNED_DECODE_SESSION_RETENTION_MS,
+        );
+
+        assert!(retained_session_registered(&state));
+        let status = retained_session_status(&state).await;
+        assert!(status.get("error").is_none(), "status failed: {status}");
+        assert_eq!(status["session_id"], RETAINED_SESSION_ID);
+        assert_eq!(
+            status["state"],
+            json!({ "state": "terminal", "terminal_state": "completed" })
+        );
+        let repeated_close = close_retained_session(&state).await;
+        assert_eq!(
+            repeated_close["closed"], true,
+            "repeated close: {repeated_close}"
+        );
+        assert_eq!(
+            retained_session_closed_at_ms(&state),
+            closed_at_ms,
+            "a repeated close must not restart the retention window"
+        );
+
+        drop(state);
+        fs::remove_dir_all(root).expect("remove retention state");
+    }
+
+    #[tokio::test]
+    async fn maintenance_never_evicts_open_session() {
+        let (root, state, catalog) = owned_decode_serving_test_state("keep-open");
+        let model_id = certified_model_id(&state, &catalog);
+        // Admitted at the very start of the clock and swept at its very end.
+        register_completed_session(&state, &catalog, &model_id, 1);
+
+        run_background_maintenance_at(&state, u64::MAX);
+
+        assert!(retained_session_registered(&state));
+        let status = retained_session_status(&state).await;
+        assert!(status.get("error").is_none(), "status failed: {status}");
+
+        drop(state);
+        fs::remove_dir_all(root).expect("remove open-session state");
+    }
+
+    #[tokio::test]
+    async fn disable_unloads_model_after_its_closed_session_was_evicted() {
+        let (root, state, catalog) = owned_decode_serving_test_state("disable-after-evict");
+        let model_id = certified_model_id(&state, &catalog);
+        register_completed_session(&state, &catalog, &model_id, now_ms());
+        assert_eq!(close_retained_session(&state).await["closed"], true);
+        let closed_at_ms = retained_session_closed_at_ms(&state);
+        run_background_maintenance_at(
+            &state,
+            closed_at_ms + CLOSED_OWNED_DECODE_SESSION_RETENTION_MS + 1,
+        );
+        assert!(!retained_session_registered(&state));
+        cache_certified_and_unrelated_dispatches(&state, &root, &model_id);
+
+        let outcome = disable_catalog(&state, &catalog).await;
+
+        assert_eq!(outcome["unload_artifact"], true, "disable: {outcome}");
+        assert_eq!(
+            cached_dispatch_models(&state),
+            vec!["unrelated-model".to_string()]
+        );
+
+        drop(state);
+        fs::remove_dir_all(root).expect("remove disable-after-evict state");
+    }
+
+    #[tokio::test]
+    async fn disable_unloads_model_no_session_ever_used() {
+        let (root, state, catalog) = owned_decode_serving_test_state("disable-no-session");
+        let model_id = certified_model_id(&state, &catalog);
+        // A dispatch cached by certification before any session was admitted.
+        cache_certified_and_unrelated_dispatches(&state, &root, &model_id);
+
+        let outcome = disable_catalog(&state, &catalog).await;
+
+        assert_eq!(outcome["unload_artifact"], true, "disable: {outcome}");
+        assert_eq!(
+            cached_dispatch_models(&state),
+            vec!["unrelated-model".to_string()]
+        );
+
+        drop(state);
+        fs::remove_dir_all(root).expect("remove disable-no-session state");
+    }
+
+    #[tokio::test]
+    async fn disable_unloads_model_of_recently_closed_session() {
+        let (root, state, catalog) = owned_decode_serving_test_state("disable-recent-closed");
+        let model_id = certified_model_id(&state, &catalog);
+        register_completed_session(&state, &catalog, &model_id, now_ms());
+        assert_eq!(close_retained_session(&state).await["closed"], true);
+        cache_certified_and_unrelated_dispatches(&state, &root, &model_id);
+
+        let outcome = disable_catalog(&state, &catalog).await;
+
+        assert_eq!(outcome["unload_artifact"], true, "disable: {outcome}");
+        assert_eq!(
+            cached_dispatch_models(&state),
+            vec!["unrelated-model".to_string()]
+        );
+        assert!(retained_session_registered(&state));
+
+        drop(state);
+        fs::remove_dir_all(root).expect("remove disable-recent-closed state");
+    }
     #[tokio::test]
     async fn perf_sampler_disabled_is_silent_and_enabled_names_active_model() {
         let log_root = std::env::temp_dir().join(format!(
