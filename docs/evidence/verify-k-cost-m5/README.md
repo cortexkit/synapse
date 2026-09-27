@@ -282,3 +282,45 @@ K=8 42.37 (GPU-time ratio 4.5). In this run the depth-32 K=8 phase merged into t
 next depth's setup cluster: the binary used for it did not yet have the idle tail
 after the last phase, which has since been added. That merge is why no depth-32 K=8
 number appears here.
+
+## Results (full run, M5 Max, Qwen3-0.6B, bucket 2048)
+
+Raw data: `full.json` and `full.log`. 300 rounds per cell in blocks of 50, batch
+and sequential arms interleaved. Correctness guard: for every lane, depth and K,
+the batched verify returned the same tokens as K sequential steps with
+bit-identical logits.
+
+Batched verify cost relative to K=1 (median of per-round paired ratios, p10-p90
+in brackets):
+
+| Lane | Depth | K=2 | K=4 | K=8 | K=16 |
+|---|---|---|---|---|---|
+| f16 | 32 | 1.20 (1.16-1.24) | 1.61 (1.56-1.67) | 2.46 (2.38-2.60) | 4.47 (4.32-4.76) |
+| f16 | 470 | 1.33 (1.25-1.39) | 1.99 (1.82-2.07) | 3.34 (3.02-3.46) | 6.22 (5.60-6.42) |
+| q8_0 | 32 | 1.39 (1.19-1.58) | 2.19 (1.87-2.47) | 3.83 (3.11-4.37) | 9.08 (7.41-10.32) |
+| q8_0 | 470 | 1.48 (1.38-1.55) | 2.46 (2.20-2.60) | 4.45 (3.91-4.72) | 9.21 (8.09-9.82) |
+
+K=1 medians: f16 9.23 ms at depth 32 and 14.57 ms at depth 470; q8_0 4.68 ms and
+10.38 ms.
+
+What the extra cost is made of: going from depth 32 to depth 470 roughly
+multiplies the extra cost of verifying K tokens by 2.5, and about 60% of the
+extra cost at depth 470 depends on depth (56-65% across K and both lanes). Cost
+that grows with context comes from attention reading the KV cache. That is consistent with each
+extra verified row paying its own attention pass over the context instead of the
+K rows sharing one read of the KV cache; the Metal System Trace above would
+confirm it per kernel, and has not been run yet. The
+remaining, depth-independent part is also large at small K (13 ms extra for K=8
+at depth 32 in both lanes), so the matrix-vector work does not amortise weight
+reads well across rows either, and least of all in q8_0.
+
+Context: Husky reports 1.5x for checking 8 tokens on a 4B 4-bit model. Our K=8
+figure is 2.5x-4.5x on a 0.6B model, so a guess source has to be accepted much
+more often here before speculative decoding pays. The depth decomposition points
+at attention over the context as the first lever, which is also where Husky's
+thread-group split applies.
+
+Load caveat: this machine is shared. The one-minute load average ranged from
+about 10 to 42 during the run (26 at the start, 30 at the end). The ratios above
+are paired within each round, so ambient load largely cancels, but the absolute
+milliseconds are ambient context, and the q8_0 ratios have wider spread.
