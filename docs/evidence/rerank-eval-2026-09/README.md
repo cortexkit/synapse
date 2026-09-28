@@ -290,7 +290,7 @@ The initial requirement was identical ordering plus maximum absolute score error
 scores: reference 0.0018913834/0.0018942355, llama.cpp
 0.0019104981/0.0019013400. The run stopped and a stopped-run report was committed.
 
-**After seeing that result, the operator amended the order gate.** The reason was
+**After seeing that result, the order gate was amended.** The reason was
 that a reference gap of approximately 0.00000285 was tiny compared with the
 already-selected 0.005 absolute-error tolerance, making exact order brittle to
 FP32/F16 numerical differences. The amended rule requires every pairwise order
