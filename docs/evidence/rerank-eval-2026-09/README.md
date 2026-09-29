@@ -1181,3 +1181,271 @@ No new serving policy, model certification, retrieval, or judging was introduced
 The scripts, frozen-input hashes, references, raw responses and per-query
 checkpoints remain private; this public addition contains only aggregate results
 and model provenance.
+
+## Neural Engine reranker follow-up: gte-reranker-modernbert on ANE (direct API)
+
+**Stopped at the fidelity gate; no full-pool ANE arm was scored.** The direct
+fp16 encoder with an fp32 CPU classification head exceeded the unchanged
+maximum sigmoid-score error of 0.005. Consequently there are no new sol A/B
+metrics, paired baseline deltas, leader-gap flags, MC head-15 result, or luna
+grade-2 counts for this arm. Existing saved orders were first rerun through the
+existing fixed-reference metric script: every arm and its aggregate statistics
+reproduced exactly, hence also to the published four decimals.
+
+This is a **spike path, not a served lane**. The new `modernbert_rerank` binary in
+`bench/spikes/ane-direct-probe` uses the same `_ANEInMemoryModel` graph builders
+as the successful embedding probe, including per-token centred-channel
+rescaling before LayerNorm squaring. No Core ML conversion, precision change,
+Hadamard rotation, or relaxed gate was used.
+
+### Checkpoint, architecture and pair boundary
+
+- Checkpoint: `Alibaba-NLP/gte-reranker-modernbert-base`, revision
+  `f7481e6055501a30fb19d090657df9ec1f79ab2c`.
+- Reference: Transformers **5.17.0**, PyTorch **2.14.0**, CPU fp32, eager
+  attention, evaluation mode. The reference's classification forward and its
+  explicit pooling/head decomposition agreed within 1e-6 on all 20 pairs.
+- Binding pin: `ec54af9501d4bfd0cf3a4b162e59022dee2118cb`; macOS 27.0, arm64.
+  Compilation ran with `TMPDIR` unset. The existing Cargo manifest and lockfile
+  were unchanged; an ignored local build mirror resolved the external binding.
+- The config matches the embedding port's architecture: 22 layers, hidden 768,
+  intermediate 1152, 12 heads, global attention every third layer (starting at
+  layer zero), local window 128, global/local RoPE bases 160000/10000, norm
+  epsilon 1e-5, maximum 8192 positions. Encoder weights have the additional
+  `model.` prefix; the loader now handles it without changing graph arithmetic.
+- The config specifies **mean pooling**. Following
+  `ModernBertForSequenceClassification` and `ModernBertPredictionHead`, the CPU
+  path computes the attention-masked mean of final normalized token states,
+  head dense → exact-erf GELU → LayerNorm → classifier. Dropout is disabled for
+  evaluation. `classifier_bias=false` applies to the head dense, **not** the
+  final classifier: its checkpoint bias is loaded and applied.
+- The frozen candidate strings were used unchanged, with their saved SHA-256
+  values checked. Hugging Face encoded `(query, document)` pairs, including
+  special tokens, with **no truncation**. All 3,613 AFT and 3,730 MC pairs were
+  tokenized, but only the fidelity sample received ANE scores. The longest pair
+  is **694 tokens**. Required widths across the full input are
+  **64, 128, 192, 256, 320, 384, 448, 512, 576, 640, 704**; padding is to the
+  smallest multiple of 64, with a minimum width of 64.
+
+### Fidelity gate and error isolation
+
+Selection read no grades: among queries with at least four candidates, choose
+those with shortest, median, and three longest maximum pair lengths; choose
+four candidate-length quantiles within each query, then restore saved corpus
+order. The resulting 20 pairs span **22–694 tokens**, including **641, 664 and
+694** above 512. Each of the five queries contributes exactly four pairs.
+
+The maximum absolute error on `sigmoid(logit)` is **0.01037967**, exceeding
+**0.005**; pairs 3 and 20 fail. No pairwise order violation has a reference gap
+≥0.005, even checking all 190 pairs rather than only within-query comparisons.
+One inversion (pairs 11/12) has reference gap **0.00043529**, inside the exempt
+band. Passing the ordering condition does not rescue the failed error gate.
+
+| Pair (saved sample order) | Tokens | HF fp32 logit | ANE + CPU logit | Absolute sigmoid error |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 641 | 2.223608 | 2.239576 | 0.00139801 |
+| 2 | 83 | 0.332835 | 0.350631 | 0.00432146 |
+| 3 | 47 | -0.271247 | -0.229074 | **0.01037967** |
+| 4 | 30 | 1.128618 | 1.134704 | 0.00112222 |
+| 5 | 54 | 1.270585 | 1.277332 | 0.00115239 |
+| 6 | 45 | 1.301642 | 1.299789 | 0.00031173 |
+| 7 | 694 | 0.829474 | 0.839307 | 0.00207568 |
+| 8 | 37 | 1.305662 | 1.318152 | 0.00208770 |
+| 9 | 664 | 3.371196 | 3.373440 | 0.00007198 |
+| 10 | 26 | 1.229646 | 1.228110 | 0.00026886 |
+| 11 | 30 | 1.337598 | 1.339258 | 0.00027333 |
+| 12 | 34 | 1.334957 | 1.340008 | 0.00083196 |
+| 13 | 50 | 1.199571 | 1.207120 | 0.00134058 |
+| 14 | 22 | 0.817416 | 0.799724 | 0.00377206 |
+| 15 | 30 | 0.785636 | 0.772817 | 0.00276361 |
+| 16 | 36 | 0.963942 | 0.955209 | 0.00174876 |
+| 17 | 155 | -0.122301 | -0.122783 | 0.00012015 |
+| 18 | 94 | -0.015225 | -0.017021 | 0.00044914 |
+| 19 | 75 | -1.005514 | -0.986368 | 0.00377135 |
+| 20 | 113 | -0.528034 | -0.504456 | **0.00551837** |
+
+Feeding the HF pooled fp32 states into the **same Rust CPU head** limits maximum
+absolute logit error to **0.00000406**. The divergence therefore arises before
+the head, in the ANE encoder/pooling values; the maximum pooled-channel error
+is **0.03276828**. This isolates the failing stage, not an individual layer or
+operator. The inherited encoder includes fp16 arithmetic and tanh-approximate
+GELU; this run does not distinguish their individual contributions. Embedding
+cosine ≥0.999 is not sufficient evidence of calibrated classification-score
+fidelity. No corrective precision/path experiment or full scoring followed the
+failed gate.
+
+### Ambient timing, not a full-pool latency result
+
+The read-only campaign rig claim was checked before starting and before every
+sample pair (stronger than between queries); all 21 checks found no claim.
+Observed host load averages ranged **9.99–14.77 / 16.97–17.33 / 17.39–17.51**
+(1/5/15 minutes). These are **ambient wall-clock** measurements, with first-use
+execution included and no claim of isolated or steady-state performance.
+
+| Fidelity sample timing | Median | Minimum–maximum |
+| --- | ---: | ---: |
+| Encoder, including embedding gather and surface transfers | 8.032 ms | 5.298–72.885 ms |
+| CPU mean pooling and classification head | 0.407 ms | 0.305–0.677 ms |
+| Total scoring, excluding compilation and JSON I/O | 8.442 ms | 5.715–73.546 ms |
+
+Four widths were compiled once each and cached for the process: **64: 4.289 s;
+128: 6.619 s; 192: 7.155 s; 704: 11.231 s**. These are full-encoder bundle
+compilation times (embedding norm, 22 individual layers, final norm), not the
+approximately 0.2-second single-graph shape-compilation measurement. The other
+seven input widths were not compiled because full scoring was prohibited by
+the failed fidelity gate.
+
+Private storage retains the tokenizer IDs, reference states, per-pair logits
+and timing, per-shape compile timing, rig/load observations, exact model hashes,
+selection rule and metric-reproduction artifacts. No query or candidate text
+is included here.
+
+### Authorized diagnosis: formula error versus ANE numerical error
+
+After the initial stop, the same retained 20 pairs were rerun for diagnosis,
+without changing the gate, model, tokenizer IDs, padding, or CPU head. An
+important correction to the initial hypothesis: the embedding probe's
+**in-process CPU reference already uses exact-erf GELU**. Only its ANE graph
+uses tanh GELU. The diagnostic adds a CPU tanh option matching the graph's
+activation formula, while preserving the original exact-erf CPU default.
+Both CPU variants use fp32 encoder weights and arithmetic; LayerNorm uses its
+ordinary fp32 expression rather than the graph's algebraically equivalent
+rescaled expression. This is a formula comparison, not an emulation of every
+fp16 compiler operation or intermediate rounding.
+
+| Encoder, same fp32 CPU head | Maximum absolute sigmoid error vs HF | Maximum absolute logit error | ≥0.005-gap order violations | Unchanged gate |
+| --- | ---: | ---: | ---: | --- |
+| Rust fp32, tanh GELU | 0.0026112680 | 0.0111742020 | 0 | Pass |
+| Rust fp32, exact-erf GELU | 0.0000018849 | 0.0000075400 | 0 | Pass |
+| ANE fp16, unchanged tanh graph | 0.0103796673 | 0.0421731174 | 0 | **Fail** |
+
+All 20 ANE logits reproduced their initial values. The near-tie inversion
+remains confined to pairs 11/12; neither CPU variant inverted a pair. The
+original two failures show both a real formula contribution and a larger
+additional device-path discrepancy:
+
+| Pair | HF fp32 logit | Rust fp32 tanh logit | Rust fp32 erf logit | ANE logit | Tanh sigmoid error | Erf sigmoid error | ANE sigmoid error |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 3 | -0.27124730 | -0.26167122 | -0.27124774 | -0.22907418 | 0.00235202 | 0.00000011 | 0.01037967 |
+| 20 | -0.52803361 | -0.51685941 | -0.52803248 | -0.50445628 | 0.00261127 | 0.00000026 | 0.00551837 |
+
+**Best-supported explanation:** tanh GELU introduces measurable cumulative
+formula error, but it does **not** by itself fail the gate in fp32. Exact erf
+reduces CPU-vs-HF score error to roughly two millionths. The much larger ANE
+error therefore cannot be explained by that formula difference alone; it
+includes device-path numerical effects absent from the fp32 encoder, consistent
+with fp16 weights/intermediates and compiler arithmetic. This experiment does
+not separately identify weight quantization, activation rounding, reduction
+order, or compiler lowering, nor prove that an fp16 exact-erf graph would pass.
+
+The tested binding exposes **no erf or exact GELU op**. Its activation enum
+contains ReLU, tanh, leaky ReLU, sigmoid, ELU, linear, hard sigmoid, softplus and
+softsign; elementwise unary operations include inverse, sqrt/rsqrt, abs,
+threshold, log and exp. Inspection of the graph API and MIL operation mappings
+found no additional erf lowering. No available composition with a demonstrated
+fp32 error bound ≤1e-6 was established. This is a statement about the checked
+API and available proof, not a mathematical impossibility claim about all
+compositions. **No alternative approximation was substituted and no ANE graph
+formula was changed.** The repeated ANE gate still fails, so full scoring and
+new-arm metrics remain prohibited.
+
+### Per-layer attribution on the two failing pairs
+
+These are maximum absolute differences against hooked HF fp32 layer outputs,
+**after each complete attention/MLP residual layer and before final norm**.
+Layers are numbered 1–22. The maxima below include every channel and every
+position of the padded tensors (64 positions for pair 3, 128 for pair 20).
+The private evidence also retains separate active-token-only maxima and the
+full hidden-state arrays; ANE channel-major storage was transposed to match HF
+and CPU token-major storage before comparison. HF hook runs reproduced their
+saved logits within 1e-6.
+
+| Layer | Pair 3 ANE | Pair 3 CPU tanh | Pair 3 CPU erf | Pair 20 ANE | Pair 20 CPU tanh | Pair 20 CPU erf |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 0.082054 | 0.014738 | 0.000029 | 0.096092 | 0.012903 | 0.000017 |
+| 2 | 0.137875 | 0.069096 | 0.000034 | 0.164047 | 0.092384 | 0.000025 |
+| 3 | 0.150352 | 0.080025 | 0.000032 | 0.190060 | 0.095562 | 0.000031 |
+| 4 | 0.259487 | 0.088230 | 0.000076 | 0.174084 | 0.102562 | 0.000034 |
+| 5 | 0.657913 | 0.182419 | 0.000137 | 0.849884 | 0.215790 | 0.000053 |
+| 6 | 0.811279 | 0.223694 | 0.000168 | 0.975113 | 0.256958 | 0.000061 |
+| 7 | 0.879044 | 0.256332 | 0.000168 | 0.963501 | 0.279663 | 0.000099 |
+| 8 | 0.935806 | 0.263474 | 0.000168 | 0.962814 | 0.283813 | 0.000088 |
+| 9 | 1.047882 | 0.294220 | 0.000198 | 1.050873 | 0.320206 | 0.000076 |
+| 10 | 1.002899 | 0.326462 | 0.000122 | 3.025360 | 0.614639 | 0.000473 |
+| 11 | 0.683304 | 0.234497 | 0.000130 | 2.800552 | 0.530869 | 0.000458 |
+| 12 | 2.626526 | 0.546448 | 0.001831 | 2.522705 | 0.525879 | 0.001038 |
+| 13 | 2.980774 | 0.554199 | 0.001831 | 2.233154 | 0.529358 | 0.000916 |
+| 14 | 3.088684 | 0.561096 | 0.001831 | 2.137268 | 0.527374 | 0.000854 |
+| 15 | 2.802673 | 0.572205 | 0.001831 | 1.715759 | 0.526031 | 0.000793 |
+| 16 | 1.545898 | 0.360859 | 0.002136 | 4.955383 | 0.530792 | 0.000916 |
+| 17 | 2.214216 | 0.465515 | 0.002228 | 5.006317 | 0.541004 | 0.000977 |
+| 18 | 2.689034 | 0.575043 | 0.002319 | 5.186615 | 0.626965 | 0.000977 |
+| 19 | 3.283520 | 0.982750 | 0.001999 | 5.783859 | 1.355728 | 0.001266 |
+| 20 | 5.203156 | 0.978439 | 0.001434 | 5.686768 | 1.222523 | 0.001038 |
+| 21 | 5.114960 | 1.043152 | 0.001251 | 5.456680 | 1.478600 | 0.001053 |
+| 22 | 7.226776 | 1.633240 | 0.001404 | 5.803955 | 2.067627 | 0.001404 |
+
+Error is already present after layer 1 and grows non-monotonically, with marked
+increases at layer 12 and the final layers for pair 3, and layers 10 and 16 for
+pair 20. These are unnormalized residual magnitudes, not score errors; final
+normalization substantially changes the scale. Restricting the final-layer
+maximum to active tokens gives ANE errors **6.170792 / 5.803955** for pairs
+3/20, so the discrepancy is not merely padded output. The table identifies
+where accumulated divergence is visible, not an isolated faulty operator.
+
+### Embedding regression check
+
+Although the shared ANE graph was **unchanged**, `modernbert_full` was rerun on
+its existing `rows.jsonl` at 512 positions, one layer per executable, before and
+after the diagnostic instrumentation. Its minimum cosine is **0.9991073 before
+and 0.9991073 after**, above the unchanged **0.999** gate. Both runs are
+deterministic; all returned embedding vectors match exactly across runs. The
+original exact-erf CPU default was preserved. Both checks used the same row-set
+hash, an unset `TMPDIR`, and an empty read-only campaign rig claim before
+execution. Diagnostic ANE measurements also waited on that claim before each
+pair. Layer-capture I/O is not included in the earlier latency claims.
+
+### Exploratory system ranking: failed fidelity gate retained
+
+The explicitly authorized arm is **gte-reranker-modernbert, ANE fp16 (direct API, FAILED fidelity gate: exploratory)**. This measures the **ANE system as built**, not a faithful reproduction of the reference model. The maximum sigmoid-score error remains **0.01037967 against a 0.005 limit**; the failed fidelity gate and diagnosis above stand unchanged. These exploratory ranking results do not reverse or relax that failure. Earlier stop statements describe the pre-authorization runs; this later experiment is separate.
+
+All **7,343 pairs (3,613 AFT / 3,730 MC)** were scored with the unchanged fp16/tanh graph, original pair tokens and no truncation. Exact score ties retain baseline order; MC head-15 reranks only baseline positions 1–15. All 85/92 queries, including four empty pools, remain in fixed-reference metrics. No new sol judgments were requested. The existing metric/bootstrap script was reused, and every existing arm’s metrics remained exactly unchanged.
+
+Each metric cell is **sol A / sol B / mean(A,B)**, using the two saved full-pool judge rankings. These are descriptive exploratory point estimates, not equivalence or superiority claims.
+
+| Tool / arm | overlap@10 A / B / mean | RBO A / B / mean | P@10 A / B / mean |
+| --- | --- | --- | --- |
+| AFT / gte-reranker-modernbert, ANE fp16 (direct API, FAILED fidelity gate: exploratory) | 0.7635 / 0.7300 / 0.7468 | 0.5104 / 0.5039 / 0.5071 | 0.2941 / 0.2824 / 0.2882 |
+| MC / gte-reranker-modernbert, ANE fp16 (direct API, FAILED fidelity gate: exploratory) | 0.5723 / 0.5608 / 0.5666 | 0.4834 / 0.4801 / 0.4817 | 0.1511 / 0.1435 / 0.1473 |
+| MC / gte-reranker-modernbert, ANE fp16 (direct API, FAILED fidelity gate: exploratory), head 15 | 0.5323 / 0.5260 / 0.5292 | 0.4648 / 0.4621 / 0.4635 | 0.1272 / 0.1217 / 0.1245 |
+
+Compared with Synapse’s production `rerank.score` on Metal, the exploratory system’s mean overlap@10 is **0.7468 versus production Metal’s 0.7480 on AFT**, and **0.5666 versus 0.5666 on MC**; both MC head-15 means round to **0.5292**. Matching rounded metrics does not imply identical rankings or establish equivalence.
+
+Paired deltas versus baseline use the unchanged 10,000 query resamples, seed 2609. Cells are **A; B**, mean delta [95% interval]; these intervals do not account for systematic judge error or multiplicity.
+
+| Tool / arm | Δoverlap@10 A; B | ΔRBO A; B | ΔP@10 A; B |
+| --- | --- | --- | --- |
+| AFT / gte-reranker-modernbert, ANE fp16 (direct API, FAILED fidelity gate: exploratory) | 0.1257 [0.0714, 0.1859]; 0.0906 [0.0387, 0.1450] | 0.0678 [0.0414, 0.0958]; 0.0591 [0.0323, 0.0859] | 0.0647 [0.0376, 0.0941]; 0.0518 [0.0235, 0.0812] |
+| MC / gte-reranker-modernbert, ANE fp16 (direct API, FAILED fidelity gate: exploratory) | 0.0607 [0.0105, 0.1116]; 0.0442 [-0.0114, 0.0987] | 0.0603 [0.0366, 0.0855]; 0.0611 [0.0387, 0.0865] | 0.0359 [0.0141, 0.0620]; 0.0293 [0.0098, 0.0511] |
+| MC / gte-reranker-modernbert, ANE fp16 (direct API, FAILED fidelity gate: exploratory), head 15 | 0.0208 [-0.0011, 0.0449]; 0.0093 [-0.0254, 0.0406] | 0.0418 [0.0247, 0.0597]; 0.0432 [0.0268, 0.0610] | 0.0120 [0.0043, 0.0207]; 0.0076 [-0.0011, 0.0174] |
+
+Known luna grade-2 query counts (**new / lost / zero→some / some→zero**) are AFT / **gte-reranker-modernbert, ANE fp16 (direct API, FAILED fidelity gate: exploratory)**: **25 / 4 / 6 / 0**; MC / **gte-reranker-modernbert, ANE fp16 (direct API, FAILED fidelity gate: exploratory)**: **22 / 4 / 7 / 0**; MC / **gte-reranker-modernbert, ANE fp16 (direct API, FAILED fidelity gate: exploratory), head 15**: **11 / 2 / 4 / 0**. These count queries with known grade-2 items entering/leaving the baseline top 10, including transitions between zero and some such items. Existing labels are reused; unknown grades are not treated as irrelevant. Private leader-gap recomputation includes the arm only under its full **FAILED fidelity gate: exploratory** name; the earlier published non-exploratory leader-gap tables are not revised.
+
+**Agreement with production Metal, independent of sol.** Kendall τ is over final baseline-tie-broken total orders (τ-a equals τ-b here), undefined for fewer than two candidates. Top-10 set overlap is intersection/min(10, candidate count), undefined for empty pools. Small pools can therefore have overlap 1 despite changed ordering. The MC head-15 comparison uses the Metal head-15 variant. Full per-query values, candidate counts and discordant-pair counts are in [the anonymous per-query CSV](gte-ane-metal-rank-agreement.csv); ordinals follow each frozen corpus’s saved query order.
+
+| Tool / arm | Mean Kendall τ (eligible queries) | Mean top-10 overlap (nonempty queries) | Identical top-10 sets |
+| --- | ---: | ---: | ---: |
+| AFT / gte-reranker-modernbert, ANE fp16 (direct API, FAILED fidelity gate: exploratory) | 0.991377 (79) | 0.996386 (83) | 80/83 |
+| MC / gte-reranker-modernbert, ANE fp16 (direct API, FAILED fidelity gate: exploratory) | 0.991241 (85) | 0.988889 (90) | 80/90 |
+| MC / gte-reranker-modernbert, ANE fp16 (direct API, FAILED fidelity gate: exploratory), head 15 | 0.999097 (85) | 0.996667 (90) | 87/90 |
+
+**Ambient timing, not isolated or directly comparable to production batch latency.** The first all-width-resident attempt failed program loading with “no ANE resources”; its 88 partial scores are retained separately and excluded. The successful run grouped pairs by width, retaining one unchanged encoder process at a time, checking the database reservation for another ANE campaign before every query/width group, waiting while held, and compiling each width once. This changes scheduling, not graph arithmetic or ranking tie policy. The scoring totals below exclude compilation, model loading and JSON I/O; encoder includes embedding gather/surface transfers, CPU head includes pooling.
+
+| Tool / arm | Encoder median / p95 | CPU head median / p95 | Total median / p95 |
+| --- | ---: | ---: | ---: |
+| AFT / gte-reranker-modernbert, ANE fp16 (direct API, FAILED fidelity gate: exploratory) | 4.797 / 10.883 ms | 0.304 / 0.395 ms | 5.117 / 11.206 ms |
+| MC / gte-reranker-modernbert, ANE fp16 (direct API, FAILED fidelity gate: exploratory) | 6.114 / 8.821 ms | 0.310 / 0.398 ms | 6.432 / 9.141 ms |
+
+Full-encoder **compile seconds by width**: **64: 5.135**; **128: 5.087**; **192: 10.216**; **256: 9.492**; **320: 26.089**; **384: 11.176**; **448: 9.882**; **512: 13.678**; **576: 12.267**; **640: 8.878**; **704: 9.858**. Per-pair encoder/head/total and all compile measurements are retained in private JSONL/JSON records, not published here. Longest pair remains **694 tokens**; all 11 widths were exercised. `TMPDIR` was unset.
+
+There were **502** read-only rig checks, **0** observing a held claim (the driver waits 30 seconds and rechecks when held). Observed 1/5/15-minute load-average ranges were **13.52–21.33** / **12.80–15.12** / **13.26–14.13**. This remains a spike path, not a served lane.

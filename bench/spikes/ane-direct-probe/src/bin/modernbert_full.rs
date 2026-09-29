@@ -15,6 +15,9 @@ use safetensors::{Dtype, SafeTensors};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+#[path = "../reranker.rs"]
+pub mod reranker;
+
 const MODEL_ID: &str = "Alibaba-NLP/gte-modernbert-base";
 const GATE: f32 = 0.999;
 const MASK_MIN: f32 = -10_000.0;
@@ -147,6 +150,8 @@ struct Report {
 struct CpuResult {
     checkpoints: Vec<Vec<f32>>,
     vector: Vec<f32>,
+    final_hidden: Vec<f32>,
+    layer_states: Vec<Vec<f32>>,
 }
 
 struct AneModel {
@@ -319,11 +324,16 @@ fn load_model(snapshot: &Path) -> Result<(Config, Weights, ModelIdentity)> {
     let bytes =
         fs::read(&weights_path).with_context(|| format!("read {}", weights_path.display()))?;
     let st = SafeTensors::deserialize(&bytes).context("parse model.safetensors")?;
+    let prefix = if st.tensor("model.embeddings.norm.weight").is_ok() {
+        "model."
+    } else {
+        ""
+    };
     let hidden = config.hidden_size;
     let intermediate = config.intermediate_size;
     let mut layers = Vec::with_capacity(config.num_hidden_layers);
     for index in 0..config.num_hidden_layers {
-        let prefix = format!("layers.{index}");
+        let prefix = format!("{prefix}layers.{index}");
         layers.push(LayerWeights {
             qkv: load_linear(&st, &format!("{prefix}.attn.Wqkv"), hidden * 3, hidden)?,
             attention_output: load_linear(&st, &format!("{prefix}.attn.Wo"), hidden, hidden)?,
@@ -342,13 +352,22 @@ fn load_model(snapshot: &Path) -> Result<(Config, Weights, ModelIdentity)> {
         });
     }
     let weights = Weights {
-        embeddings: load_linear(&st, "embeddings.tok_embeddings", config.vocab_size, hidden)?,
-        embedding_norm: load_vector(&st, "embeddings.norm.weight", hidden)?,
+        embeddings: load_linear(
+            &st,
+            &format!("{prefix}embeddings.tok_embeddings"),
+            config.vocab_size,
+            hidden,
+        )?,
+        embedding_norm: load_vector(&st, &format!("{prefix}embeddings.norm.weight"), hidden)?,
         layers,
-        final_norm: load_vector(&st, "final_norm.weight", hidden)?,
+        final_norm: load_vector(&st, &format!("{prefix}final_norm.weight"), hidden)?,
     };
     let identity = ModelIdentity {
-        model_id: MODEL_ID,
+        model_id: if prefix.is_empty() {
+            MODEL_ID
+        } else {
+            "Alibaba-NLP/gte-reranker-modernbert-base"
+        },
         snapshot_hash: snapshot
             .file_name()
             .and_then(|name| name.to_str())
@@ -1021,6 +1040,20 @@ fn cpu_reference(
     config: &Config,
     sequence_length: usize,
 ) -> Result<CpuResult> {
+    cpu_reference_diagnostic(row, weights, config, sequence_length, false, false)
+}
+
+// Keep the embedding reference exact-erf by default; the tanh option isolates
+// the ANE graph's activation formula without changing device precision.
+fn cpu_reference_diagnostic(
+    row: &[u32],
+    weights: &Weights,
+    config: &Config,
+    sequence_length: usize,
+    tanh_gelu: bool,
+    capture_layers: bool,
+) -> Result<CpuResult> {
+    let mut layer_states = Vec::new();
     let hidden = config.hidden_size;
     let mut ids = vec![config.pad_token_id; sequence_length];
     ids[..row.len()].copy_from_slice(row);
@@ -1078,10 +1111,16 @@ fn cpu_reference(
             let destination = position * config.intermediate_size;
             for column in 0..config.intermediate_size {
                 let value = projected[source + column];
-                let exact_gelu =
-                    0.5 * value * (1.0 + libm::erff(value * std::f32::consts::FRAC_1_SQRT_2));
+                let gelu = if tanh_gelu {
+                    let squared = value * value;
+                    let cubed = squared * value;
+                    let inner = value + 0.044_715 * cubed;
+                    (0.5 * value) * (1.0 + (0.797_884_6 * inner).tanh())
+                } else {
+                    0.5 * value * (1.0 + libm::erff(value * std::f32::consts::FRAC_1_SQRT_2))
+                };
                 activated[destination + column] =
-                    exact_gelu * projected[source + config.intermediate_size + column];
+                    gelu * projected[source + config.intermediate_size + column];
             }
         }
         let mlp_output = linear_cpu(&activated, sequence_length, &layer.mlp_output);
@@ -1089,6 +1128,9 @@ fn cpu_reference(
             *destination += source;
         }
         checkpoints.push(current[..hidden].to_vec());
+        if capture_layers {
+            layer_states.push(current.clone());
+        }
     }
     layer_norm_cpu(
         &mut current,
@@ -1101,6 +1143,8 @@ fn cpu_reference(
     Ok(CpuResult {
         vector: l2_normalize(current[..hidden].to_vec()),
         checkpoints,
+        final_hidden: current,
+        layer_states,
     })
 }
 
