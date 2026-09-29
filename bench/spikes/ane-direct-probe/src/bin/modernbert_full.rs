@@ -608,7 +608,17 @@ fn attention_graph(
             );
             masked = graph.addition(masked, distance);
         }
-        let probabilities = graph.soft_max(masked, -1);
+        // Softmax over keys runs on the channel axis rather than the last
+        // (width) axis: [1, heads, queries, keys] is transposed to
+        // [1, keys, heads, queries], normalized on axis 1, and transposed back
+        // so the value matmul sees its original layout. The math is the same
+        // and only fp16 rounding differs; the channel-axis reduction measured
+        // faster on the M5 Neural Engine at sequence 512 and still passes the
+        // cosine gate at every sequence (see
+        // docs/evidence/ane-direct-api-m5/fuse-and-channel-softmax.md).
+        let channel_logits = graph.transpose(masked, [0, 3, 1, 2]);
+        let channel_probabilities = graph.soft_max(channel_logits, 1);
+        let probabilities = graph.transpose(channel_probabilities, [0, 2, 3, 1]);
         contexts.push(graph.matrix_multiplication(probabilities, value_slice, false, false));
     }
     let context = if contexts.len() == 1 {
@@ -681,6 +691,20 @@ fn compile_model(
 ) -> Result<AneModel> {
     let hidden_shape = shape(sequence_length, config.hidden_size);
     let mask_shape = shape(sequence_length, 1);
+    // At sequence 512 two layers are compiled into each executable whatever
+    // the caller asked for: it halves the number of executable dispatches, returned
+    // vectors byte-identical to the one-layer graph, and it measured faster
+    // (docs/evidence/ane-direct-api-m5/fuse-and-channel-softmax.md). Three
+    // layers per executable compile but crash at runtime, so two is the cap.
+    // Longer sequences keep the caller's grouping, so a sequence-512 gain
+    // cannot come from moving work into the longer shapes. The report's
+    // `layers_per_executable` still echoes the command-line value, while the
+    // checkpoint labels follow the grouping actually compiled.
+    let layers_per_executable = if sequence_length == 512 {
+        2
+    } else {
+        layers_per_executable
+    };
 
     let mut embedding_graph = Graph::new();
     let embedding_input = embedding_graph.placeholder(hidden_shape);
