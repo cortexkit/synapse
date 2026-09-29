@@ -1,5 +1,26 @@
 # Does top-50 reranking improve the top 10?
 
+## Erratum: the original plumb probability readout
+
+The first report's plumb arm did **not consistently rank by
+P(A | A or B)**. Its grammar-constrained, post-sampling readout sometimes
+returned raw P(A) over the whole vocabulary instead. For one reproduced
+candidate, **P(A) = 0.8966 and P(B) = 0.0288**, summing to **0.9254**;
+the saved score was 0.8966, rather than the conditional probability 0.9689.
+The pinned sampler applied the grammar only when the initially sampled token
+required it, so the defect was conditional, not a constant rescaling.
+
+The original 20-pair plumb fidelity gate missed this case: every saved response
+had A/B probability mass within **2.98 × 10⁻⁸ of 1**. Its passing error bound
+therefore did not validate the readout on the remaining candidates. The first
+five queries per tool reproduced bit-for-bit after rebuilding the exact GGUF
+(166 AFT and 250 MC pairs), including the defective score above.
+
+**The Qwen arms are unaffected:** they used `--reranking` rank pooling, not
+this next-token readout. Historical tables below are retained as reported;
+the Jev / sol follow-up distinguishes corrected plumb results from the original
+unnormalized comparator. No additional luna judging is used for the correction.
+
 ## Answer
 
 **Yes, on this retained traffic sample and shared relevance judge. The dedicated
@@ -599,3 +620,376 @@ display, not just inference cost. These are relevance and ambient-cost results,
 not measurements of agent task completion. All scripts, raw outputs, frozen
 inputs, and judge evidence for this follow-up are retained in private evaluation
 storage; this report contains only aggregate results and model provenance.
+
+## Jev follow-up: fixed full-pool sol references
+
+This follow-up replaces new-item union judging with a **fixed, full-candidate
+reference**. Adding an arm no longer expands the judge pool or moves another
+arm's denominator. All earlier sections are retained, subject to the plumb
+readout erratum above. Before new scoring, all **16** cross-size follow-up
+expanded-union nDCG values were recomputed from saved orders and primary v2+
+v3 labels and matched to four decimals. No v4 luna judgments were run.
+
+**Primary-metric point estimates (mean of the two references):**
+
+- AFT: baseline **0.6386**; leader **Qwen3-Reranker-8B 0.7633**; best Jev point estimate **Jev noul 0.7319**.
+- MC: baseline **0.5141**; leader **Jev noul 0.6055**; best Jev point estimate **Jev noul 0.6055**.
+
+Point-estimate leaders are not automatically distinguishable: see the paired
+intervals and judge-rerun flags below. The failed plumb score gates leave
+the requested Jev-versus-plumb ordinal comparison unresolved.
+
+### Scoring and privacy
+
+The same 85 AFT and 92 MC queries, including empty and small sets, and all
+3,613 AFT / 3,730 MC frozen candidate texts were reused without retrieval or
+text enrichment. Exact score ties preserve baseline order. MC head-15 arms
+rerank only baseline positions 1–15 and leave the rest untouched.
+
+**Jev is a hosted third-party API: frozen candidate texts and search queries
+were sent to TypeSafe.** Every request had one candidate as its unchanged
+`state` and one decision, with the original plumb relevance criterion.
+The noul arm ranks by the returned probability of true. The score decision
+uses the documented ordered `criteria` list with three levels, copied
+verbatim from the existing luna judge's grade definitions:
+- 0: not relevant or no useful evidence for the query.
+- 1: partly relevant, tangential but useful, or incomplete evidence.
+- 2: directly relevant evidence that helps answer the query or locate the requested code/history.
+
+**Sharing the ranker/evaluator definition of relevance was intentional.**
+Expected grade **E = P(1) + 2·P(2)** was fixed before results; P(2)-only
+ordering is a separately labelled **secondary** arm. These are two orders
+from one score response, not two scoring calls. The API documentation was
+read before execution; score decisions accept 2–10 levels. Only one decision
+was sent per request, with at most four Jev requests in flight. Responses
+were checkpointed; transient failures used exponential backoff.
+
+Resolved Jev version(s): **jev-1.13.0**. Primary
+sample responses were reused in the full run rather than rescoring them.
+
+A client defect rejected **21 MC score responses** for not summing to one
+within an undocumented 0.001 tolerance before saving their bodies. Those
+bodies and usage counts were lost. With explicit authorization, **only those
+21 responses were requested once again**, adding 21 calls; the corrected
+client saves raw responses before validation and uses returned probabilities
+as-is, without renormalizing Jev E. Jev’s repeat spread means these 21
+replacements need not match what the lost originals said.
+
+### Plumb readout correction and failed score gates
+
+The official plumb revision and llama.cpp pin above were retained. Rebuilding
+with `--outtype f16 --no-mtp` reproduced SHA-256
+`c710d60dc8b07f1577e9a5911cb26bccff3108cc516d840f22075e5dac497f63`.
+The historical readout reproduced all 416 first-five-query scores exactly.
+
+The corrected readout uses **pre-sampling, pre-grammar log probabilities**,
+requires every declared option-letter token to be present, divides their
+log probabilities by the checkpoint temperature 2.07, and normalizes only
+over A/B (noul) or A/B/C (score). The shared vocabulary normalizer cancels.
+A grammar constrains only the unused generated token to ASCII, avoiding an
+incomplete UTF-8 token suppressing the probability payload; probabilities
+are captured before that grammar. No absent token is imputed.
+
+Both noul and score were checked on the same fixed 20 AFT pairs, selected
+without grades (up to four per query). Reference was pinned jevk5 v0.2.0,
+FP32 Torch on MPS. Every component and ranking statistic had to satisfy
+maximum absolute error ≤0.005 and no pairwise order violation when the
+reference gap was at least 0.005. The tolerance and pairs were not changed.
+
+| Readout | Max P(0)/P(true) error | Max P(1)/P(false) error | Max P(2) error | Max E error | Outside-band order violations | Gate |
+|---|---:|---:|---:|---:|---:|---|
+| noul F16 | 0.0046361 | 0.0046361 | — | — | 0 | pass |
+| score F16 | 0.0041070 | 0.0011069 | 0.0052139 | 0.0093209 | 0 | fail |
+| score F32 | 0.0032637 | 0.0008598 | 0.0041234 | 0.0073871 | 0 | fail |
+
+F32 was converted from the same official safetensors with `--outtype f32
+--no-mtp`, SHA-256 `ce64c779598089710e7a8edce1affeb67584d3553dacced5a6df4c8843ef185e`. It reduced error but did **not**
+pass the unchanged expected-grade gate. The discrepancy therefore cannot
+be attributed solely to F16 weight rounding; **its cause is not established**.
+Consequently **no full plumb score
+arm was run**, including no P(2)-only or head-15 score arm. This is an
+explicit missing comparison, not a zero result or a relaxed fidelity claim.
+Corrected plumb noul passed and was rescored over every candidate. The old
+unnormalized noul ranking remains a separate comparator. In AFT, correction
+changed six complete query orders, four top-10 orders and one top-10
+membership set; **all MC orders were unchanged**.
+
+Maximum F16–F32 differences on those same 20 score pairs: P(0)=0.0009197, P(1)=0.0002472, P(2)=0.0010905, E=0.0019338.
+
+### Full-pool reference and repeatability
+
+Judge: **`openai/gpt-6-sol`, variant `medium`, temperature 0**, output cap
+2,048, no tools, through BROCA `session.send`. Each call used a fresh
+`synapse-judge-rerank2609-sol-` session. Fixed instructions preceded the
+original query, original one-line scope, and all frozen candidate texts.
+Opaque IDs came from canonical candidate identity order, not any arm rank.
+Presentation was shuffled with seed 2609 + query index for A and 9062 +
+query index for B (zero-based global order: AFT then MC). Every query was
+submitted in both passes, including empty sets. Singleton/empty sets cannot
+have a genuinely different row permutation. The exact seeded shuffles also
+coincided for **three two-candidate MC queries**. These same-order repeats
+are excluded from the sol B-versus-A repeatability mean (MC n=89), but
+retained in every arm metric (MC n=92); no additional calls were made.
+For a two-item pool it is impossible for both passes to avoid baseline
+order and also differ from each other. We retained the specified random
+seeds rather than forcing an order. Calls ran with at most three
+query workers; pass B started only after all pass-A checkpoints existed.
+
+The judge returned `{"relevant":[ids, most relevant first],
+"not_relevant":[ids]}`. Relevant means helping answer the query or locate
+what it asks for. Every ID had to appear exactly once across the two lists;
+invalid responses were logged and retried in fresh sessions. Model origin
+was independently checked through `session.read`; medium, temperature, output
+cap and no-tools admission were verified from digest-checked WAL records
+matching the run ID. Account-limit exhaustion would stop further submissions,
+not trigger retries around the limit.
+
+Accepted references: **354**; invalid-response retries: **3**.
+Dry-run input/output tokens were **2,215 / 431** and **4,708 / 786**.
+Before the full run, their mean projected **1,225,371 input / 215,409 output
+tokens** for both passes; this was an uncertain two-query extrapolation.
+
+Jev repeat probes were **not deterministic**. For 20 candidates scored twice
+per decision type, noul had 7/20 identical probabilities, maximum absolute
+spread **0.04**, mean **0.013**. Score had 16/60 identical probability
+components, maximum spread **0.09**, mean **0.018**. Full-run candidates
+were otherwise scored once per decision type. This is a property of the
+hosted model, not a local numerical-conversion fidelity pass.
+
+Sol B-versus-A agreement is an **empirical repeatability benchmark, not a
+mathematical upper bound**: an arm can agree with A more than B happens to.
+For overlap and precision, the B arm displays only its ordered relevant
+list (up to 10); its irrelevant items enter only the tied-tail RBO.
+
+| Tool | Sol B vs A overlap@10 | RBO p=0.9 | P@10 |
+|---|---:|---:|---:|
+| AFT, n=85 | 0.7704 | 0.5644 | 0.3153 |
+| MC, n=89 | 0.6201 | 0.5191 | 0.1787 |
+
+### Metric definitions and results
+
+**Primary: overlap@10** = arm/sol top-10 intersection divided by
+min(10, number of sol-relevant items, candidate count), or 0 if none are
+relevant. **P@10** counts displayed sol-relevant items and always divides
+by 10, including small sets. Empty queries contribute zero.
+
+**RBO uses finite extrapolated expected-prefix-overlap tied-tail RBO**,
+p=0.9. Sol-relevant items have strict ranks; all not-relevant items form
+one tied tail. At depth d, each tail member has inclusion probability
+(d − relevant-count)/tail-size, clipped to [0,1]. Expected overlap is the
+sum of products of the two lists’ inclusion probabilities. RBO is
+`(1−p) Σ[d=1..n] p^(d−1) overlap(d)/d + p^n`, since both full lists
+contain the same candidate set. B’s tail is tied too. For an empty pool
+RBO is 0. Thus RBO can be positive even when sol marks nothing relevant.
+
+Every arm is scored against **both** fixed references. Each cell below is
+**A / B / mean(A,B)**. Qwen orders are reused, not rescored.
+
+| Tool / arm | overlap@10 A / B / mean | RBO A / B / mean | P@10 A / B / mean |
+|---|---|---|---|
+| AFT / baseline | 0.6378 / 0.6394 / 0.6386 | 0.4426 / 0.4448 / 0.4437 | 0.2294 / 0.2306 / 0.2300 |
+| AFT / Qwen3-Reranker-0.6B | 0.7485 / 0.7350 / 0.7417 | 0.4988 / 0.5000 / 0.4994 | 0.2859 / 0.2871 / 0.2865 |
+| AFT / Qwen3-Reranker-8B | 0.7710 / 0.7556 / 0.7633 | 0.5197 / 0.5147 / 0.5172 | 0.3000 / 0.2941 / 0.2971 |
+| AFT / plumb noul, unnormalized readout (as first reported) | 0.7048 / 0.6861 / 0.6955 | 0.4665 / 0.4567 / 0.4616 | 0.2612 / 0.2529 / 0.2571 |
+| AFT / plumb-4b noul, corrected F16 | 0.7068 / 0.6878 / 0.6973 | 0.4714 / 0.4618 / 0.4666 | 0.2624 / 0.2541 / 0.2582 |
+| AFT / Jev noul | 0.7358 / 0.7279 / 0.7319 | 0.4839 / 0.4845 / 0.4842 | 0.2800 / 0.2776 / 0.2788 |
+| AFT / Jev score, E | 0.7319 / 0.7262 / 0.7290 | 0.4750 / 0.4842 / 0.4796 | 0.2788 / 0.2753 / 0.2771 |
+| AFT / Jev score, P(2), secondary | 0.7276 / 0.7237 / 0.7256 | 0.4758 / 0.4845 / 0.4802 | 0.2753 / 0.2729 / 0.2741 |
+| MC / baseline | 0.5116 / 0.5167 / 0.5141 | 0.4231 / 0.4190 / 0.4210 | 0.1152 / 0.1141 / 0.1147 |
+| MC / Qwen3-Reranker-8B | 0.5689 / 0.5646 / 0.5667 | 0.4876 / 0.4788 / 0.4832 | 0.1576 / 0.1489 / 0.1533 |
+| MC / Qwen3-Reranker-0.6B | 0.5487 / 0.5604 / 0.5545 | 0.4798 / 0.4792 / 0.4795 | 0.1522 / 0.1489 / 0.1505 |
+| MC / Qwen3-Reranker-0.6B, head 15 | 0.5222 / 0.5256 / 0.5239 | 0.4620 / 0.4617 / 0.4618 | 0.1272 / 0.1217 / 0.1245 |
+| MC / Qwen3-Reranker-8B, head 15 | 0.5391 / 0.5298 / 0.5345 | 0.4649 / 0.4595 / 0.4622 | 0.1293 / 0.1217 / 0.1255 |
+| MC / plumb noul, unnormalized readout (as first reported) | 0.5349 / 0.5307 / 0.5328 | 0.4516 / 0.4519 / 0.4518 | 0.1391 / 0.1391 / 0.1391 |
+| MC / plumb-4b noul, corrected F16 | 0.5349 / 0.5307 / 0.5328 | 0.4516 / 0.4519 / 0.4518 | 0.1391 / 0.1391 / 0.1391 |
+| MC / plumb-4b noul, corrected F16, head 15 | 0.5296 / 0.5268 / 0.5282 | 0.4470 / 0.4473 / 0.4472 | 0.1250 / 0.1196 / 0.1223 |
+| MC / Jev noul | 0.6118 / 0.5991 / 0.6055 | 0.4905 / 0.4877 / 0.4891 | 0.1565 / 0.1522 / 0.1543 |
+| MC / Jev noul, head 15 | 0.5385 / 0.5316 / 0.5351 | 0.4661 / 0.4639 / 0.4650 | 0.1293 / 0.1250 / 0.1272 |
+| MC / Jev score, E | 0.6023 / 0.5956 / 0.5989 | 0.4819 / 0.4769 / 0.4794 | 0.1554 / 0.1500 / 0.1527 |
+| MC / Jev score, E, head 15 | 0.5366 / 0.5300 / 0.5333 | 0.4638 / 0.4610 / 0.4624 | 0.1283 / 0.1228 / 0.1255 |
+| MC / Jev score, P(2), secondary | 0.5888 / 0.5810 / 0.5849 | 0.4746 / 0.4688 / 0.4717 | 0.1511 / 0.1446 / 0.1478 |
+| MC / Jev score, P(2), secondary, head 15 | 0.5361 / 0.5295 / 0.5328 | 0.4629 / 0.4598 / 0.4614 | 0.1272 / 0.1228 / 0.1250 |
+| MC / plumb noul, unnormalized readout (as first reported), head 15 | 0.5296 / 0.5268 / 0.5282 | 0.4470 / 0.4473 / 0.4472 | 0.1250 / 0.1196 / 0.1223 |
+
+### Paired deltas versus baseline
+
+10,000 paired query bootstrap resamples, `random.Random(2609)`, reset per
+tool, linear percentile endpoints. Resample indices are shared across arms,
+metrics and references within a tool. Each cell gives **A; B** as mean
+delta [95% interval]. Baseline deltas are zero. These intervals omit
+systematic judge error, within-project dependence and multiplicity adjustment.
+
+| Tool / arm | Δoverlap@10 A; B | ΔRBO A; B | ΔP@10 A; B |
+|---|---|---|---|
+| AFT / Qwen3-Reranker-0.6B | 0.1106 [0.0572, 0.1684]; 0.0956 [0.0492, 0.1457] | 0.0562 [0.0303, 0.0823]; 0.0551 [0.0303, 0.0803] | 0.0565 [0.0294, 0.0859]; 0.0565 [0.0294, 0.0847] |
+| AFT / Qwen3-Reranker-8B | 0.1331 [0.0783, 0.1932]; 0.1162 [0.0662, 0.1710] | 0.0771 [0.0525, 0.1035]; 0.0699 [0.0442, 0.0979] | 0.0706 [0.0435, 0.1012]; 0.0635 [0.0341, 0.0941] |
+| AFT / plumb noul, unnormalized readout (as first reported) | 0.0670 [0.0020, 0.1306]; 0.0467 [-0.0112, 0.1031] | 0.0240 [-0.0011, 0.0488]; 0.0119 [-0.0121, 0.0367] | 0.0318 [0.0082, 0.0576]; 0.0224 [-0.0047, 0.0494] |
+| AFT / plumb-4b noul, corrected F16 | 0.0689 [0.0040, 0.1327]; 0.0484 [-0.0100, 0.1051] | 0.0288 [0.0041, 0.0532]; 0.0170 [-0.0068, 0.0414] | 0.0329 [0.0082, 0.0588]; 0.0235 [-0.0035, 0.0506] |
+| AFT / Jev noul | 0.0980 [0.0488, 0.1527]; 0.0885 [0.0380, 0.1423] | 0.0413 [0.0184, 0.0651]; 0.0396 [0.0163, 0.0647] | 0.0506 [0.0235, 0.0788]; 0.0471 [0.0188, 0.0776] |
+| AFT / Jev score, E | 0.0941 [0.0421, 0.1513]; 0.0867 [0.0364, 0.1405] | 0.0324 [0.0090, 0.0564]; 0.0394 [0.0147, 0.0645] | 0.0494 [0.0235, 0.0776]; 0.0447 [0.0165, 0.0741] |
+| AFT / Jev score, P(2), secondary | 0.0897 [0.0373, 0.1474]; 0.0843 [0.0348, 0.1377] | 0.0333 [0.0093, 0.0578]; 0.0397 [0.0144, 0.0655] | 0.0459 [0.0188, 0.0753]; 0.0424 [0.0141, 0.0729] |
+| MC / Qwen3-Reranker-8B | 0.0573 [0.0120, 0.1003]; 0.0480 [-0.0082, 0.1031] | 0.0645 [0.0415, 0.0901]; 0.0598 [0.0388, 0.0837] | 0.0424 [0.0185, 0.0717]; 0.0348 [0.0120, 0.0609] |
+| MC / Qwen3-Reranker-0.6B | 0.0371 [-0.0199, 0.0918]; 0.0437 [-0.0091, 0.0948] | 0.0567 [0.0341, 0.0812]; 0.0602 [0.0374, 0.0859] | 0.0370 [0.0141, 0.0641]; 0.0348 [0.0141, 0.0598] |
+| MC / Qwen3-Reranker-0.6B, head 15 | 0.0106 [-0.0199, 0.0364]; 0.0090 [-0.0222, 0.0359] | 0.0389 [0.0227, 0.0566]; 0.0427 [0.0271, 0.0595] | 0.0120 [0.0033, 0.0217]; 0.0076 [-0.0022, 0.0185] |
+| MC / Qwen3-Reranker-8B, head 15 | 0.0275 [0.0094, 0.0498]; 0.0131 [-0.0196, 0.0424] | 0.0419 [0.0256, 0.0598]; 0.0406 [0.0250, 0.0580] | 0.0141 [0.0054, 0.0239]; 0.0076 [-0.0022, 0.0174] |
+| MC / plumb noul, unnormalized readout (as first reported) | 0.0233 [-0.0329, 0.0790]; 0.0140 [-0.0447, 0.0694] | 0.0285 [0.0045, 0.0546]; 0.0330 [0.0084, 0.0594] | 0.0239 [0.0011, 0.0489]; 0.0250 [0.0043, 0.0489] |
+| MC / plumb-4b noul, corrected F16 | 0.0233 [-0.0329, 0.0790]; 0.0140 [-0.0447, 0.0694] | 0.0285 [0.0045, 0.0546]; 0.0330 [0.0084, 0.0594] | 0.0239 [0.0011, 0.0489]; 0.0250 [0.0043, 0.0489] |
+| MC / plumb-4b noul, corrected F16, head 15 | 0.0180 [0.0018, 0.0382]; 0.0101 [-0.0226, 0.0397] | 0.0240 [0.0059, 0.0436]; 0.0283 [0.0098, 0.0486] | 0.0098 [0.0022, 0.0185]; 0.0054 [-0.0054, 0.0174] |
+| MC / Jev noul | 0.1002 [0.0564, 0.1482]; 0.0825 [0.0278, 0.1374] | 0.0675 [0.0427, 0.0946]; 0.0688 [0.0440, 0.0962] | 0.0413 [0.0217, 0.0631]; 0.0380 [0.0174, 0.0620] |
+| MC / Jev noul, head 15 | 0.0269 [0.0087, 0.0490]; 0.0150 [-0.0176, 0.0446] | 0.0431 [0.0255, 0.0624]; 0.0449 [0.0279, 0.0636] | 0.0141 [0.0065, 0.0239]; 0.0109 [0.0011, 0.0217] |
+| MC / Jev score, E | 0.0907 [0.0490, 0.1360]; 0.0789 [0.0274, 0.1315] | 0.0588 [0.0359, 0.0847]; 0.0579 [0.0348, 0.0837] | 0.0402 [0.0207, 0.0620]; 0.0359 [0.0163, 0.0598] |
+| MC / Jev score, E, head 15 | 0.0250 [0.0048, 0.0484]; 0.0133 [-0.0204, 0.0440] | 0.0407 [0.0235, 0.0595]; 0.0421 [0.0251, 0.0607] | 0.0130 [0.0043, 0.0228]; 0.0087 [-0.0022, 0.0207] |
+| MC / Jev score, P(2), secondary | 0.0772 [0.0358, 0.1220]; 0.0643 [0.0119, 0.1178] | 0.0515 [0.0295, 0.0759]; 0.0498 [0.0277, 0.0746] | 0.0359 [0.0163, 0.0576]; 0.0304 [0.0109, 0.0533] |
+| MC / Jev score, P(2), secondary, head 15 | 0.0245 [0.0045, 0.0473]; 0.0129 [-0.0210, 0.0431] | 0.0398 [0.0230, 0.0584]; 0.0409 [0.0241, 0.0597] | 0.0120 [0.0033, 0.0207]; 0.0087 [-0.0000, 0.0185] |
+| MC / plumb noul, unnormalized readout (as first reported), head 15 | 0.0180 [0.0018, 0.0382]; 0.0101 [-0.0226, 0.0397] | 0.0240 [0.0059, 0.0436]; 0.0283 [0.0098, 0.0486] | 0.0098 [0.0022, 0.0185]; 0.0054 [-0.0054, 0.0174] |
+
+### Leader gaps sensitive to the judge rerun
+
+Leaders are selected separately per metric by mean(A,B). An arm is flagged
+when the paired leader-minus-arm interval includes zero under A **or** B,
+or when their point-estimate ordering swaps between A and B. This is a
+repeatability warning, not an equivalence test. It does not compare a gap
+to one minus an agreement score. Full paired gap intervals are retained
+privately with the per-query results.
+
+| Tool / metric | Mean-reference leader | Flagged comparators |
+|---|---|---|
+| AFT / overlap10 | Qwen3-Reranker-8B | Qwen3-Reranker-0.6B |
+| AFT / rbo09 | Qwen3-Reranker-8B | none |
+| AFT / p10 | Qwen3-Reranker-8B | Qwen3-Reranker-0.6B; Jev noul; Jev score, E; Jev score, P(2), secondary |
+| MC / overlap10 | Jev noul | Qwen3-Reranker-8B; Qwen3-Reranker-0.6B; Jev score, E; Jev score, P(2), secondary |
+| MC / rbo09 | Jev noul | Qwen3-Reranker-8B; Qwen3-Reranker-0.6B; Jev score, E |
+| MC / p10 | Jev noul | Qwen3-Reranker-8B; Qwen3-Reranker-0.6B; Jev score, E; Jev score, P(2), secondary |
+
+### Link to existing luna labels
+
+Luna v2/v3 labelled only the old top-10 unions, not the full pool. Unknown
+luna grades are **not** treated as irrelevant. The first fraction below is
+the requested share of all sol-relevant items known to have luna grade ≥1;
+the second restricts its denominator to sol-relevant items that luna judged.
+The third is the share of all existing luna grade-2 items sol marked relevant.
+
+| Tool / reference | Luna ≥1 / all sol-relevant | Luna ≥1 / luna-judged sol-relevant | Sol-relevant / luna grade-2 |
+|---|---|---|---|
+| AFT / A | 295/370 (79.7%) | 295/312 (94.6%) | 186/212 (87.7%) |
+| AFT / B | 286/365 (78.4%) | 286/304 (94.1%) | 190/212 (89.6%) |
+| MC / A | 174/216 (80.6%) | 174/186 (93.5%) | 87/126 (69.0%) |
+| MC / B | 161/196 (82.1%) | 161/175 (92.0%) | 83/126 (65.9%) |
+
+Existing luna grade-2 membership changes versus baseline, as **query counts**.
+New and lost may overlap. Because new full-pool items lack luna labels,
+these count **known** grade-2 items only, not exhaustive grade-2 relevance.
+
+| Tool / arm | Known new | Known lost | Known zero → some | Known some → zero |
+|---|---:|---:|---:|---:|
+| AFT / Qwen3-Reranker-0.6B | 27 | 6 | 6 | 1 |
+| AFT / Qwen3-Reranker-8B | 25 | 6 | 5 | 2 |
+| AFT / plumb noul, unnormalized readout (as first reported) | 26 | 13 | 5 | 3 |
+| AFT / plumb-4b noul, corrected F16 | 26 | 13 | 5 | 3 |
+| AFT / Jev noul | 27 | 11 | 6 | 2 |
+| AFT / Jev score, E | 26 | 11 | 6 | 1 |
+| AFT / Jev score, P(2), secondary | 26 | 10 | 6 | 0 |
+| MC / Qwen3-Reranker-8B | 24 | 4 | 8 | 0 |
+| MC / Qwen3-Reranker-0.6B | 22 | 5 | 7 | 0 |
+| MC / Qwen3-Reranker-0.6B, head 15 | 12 | 4 | 5 | 0 |
+| MC / Qwen3-Reranker-8B, head 15 | 12 | 0 | 5 | 0 |
+| MC / plumb noul, unnormalized readout (as first reported) | 23 | 9 | 8 | 1 |
+| MC / plumb-4b noul, corrected F16 | 23 | 9 | 8 | 1 |
+| MC / plumb-4b noul, corrected F16, head 15 | 11 | 4 | 5 | 1 |
+| MC / Jev noul | 25 | 6 | 7 | 1 |
+| MC / Jev noul, head 15 | 11 | 2 | 5 | 1 |
+| MC / Jev score, E | 24 | 5 | 7 | 0 |
+| MC / Jev score, E, head 15 | 12 | 1 | 5 | 0 |
+| MC / Jev score, P(2), secondary | 24 | 7 | 7 | 1 |
+| MC / Jev score, P(2), secondary, head 15 | 11 | 1 | 5 | 0 |
+| MC / plumb noul, unnormalized readout (as first reported), head 15 | 11 | 4 | 5 | 1 |
+
+### Latency and accounting
+
+Ambient wall-clock call latency, including client/network overhead; no
+exclusive hardware reservation. ×50 and ×15 are **serial scale estimates**,
+not measured batch/head-15 endpoints or production latency. Jev had up to
+four calls in flight; local plumb was sequential. Head-15 arms reuse scores.
+
+| Tool / arm | Calls | Mean ms | Median ms | p95 ms | Mean ×50 s | Mean ×15 s |
+|---|---:|---:|---:|---:|---:|---:|
+| AFT / jev-noul | 3613 | 323.83 | 296.65 | 464.89 | 16.19 | 4.86 |
+| AFT / jev-score | 3613 | 325.15 | 297.47 | 445.46 | 16.26 | 4.88 |
+| AFT / plumb-noul | 3613 | 157.11 | 142.64 | 256.46 | 7.86 | 2.36 |
+| MC / jev-noul | 3730 | 341.29 | 306.45 | 520.40 | 17.06 | 5.12 |
+| MC / jev-score | 3730 | 341.93 | 305.47 | 533.07 | 17.10 | 5.13 |
+| MC / plumb-noul | 3730 | 145.82 | 138.81 | 198.09 | 7.29 | 2.19 |
+
+Successfully checkpointed Jev calls (including 40 repeat probes): **14726**.
+Reported Jev usage: **5,573,636 input_tokens**, **301,883 output_tokens**.
+Completed/transcribed sol runs: **357**; reported usage:
+**1,016,116 input_tokens**, **0 cached_input_tokens**, **0 cache_write_tokens**, **104,341 output_tokens**, **54,235 reasoning_tokens**.
+Tokens are reported in the provider fields as returned; reasoning tokens
+are not added again to output tokens. No monetary charge was returned in
+the recorded Jev responses or judge usage, so total cost is **unknown**, not
+zero. Pauses resumed from checkpoints; an interrupted in-flight Jev request
+can have been billed without a saved response (at most four at the pause),
+so successful-call/token totals are not an exact billing reconciliation.
+The 21 lost original score responses are additional successful HTTP calls
+whose token usage is unavailable; they are not included in checkpointed usage.
+
+### Per-query sol self-agreement
+
+Anonymous triples are **overlap@10 / RBO / P@10**, in the retained corpus
+query order within each tool. An asterisk marks the three same-order
+two-item repeats excluded from the repeatability mean, not from arm metrics.
+These include small and empty sets; no query
+or candidate text, session identity, or project path is published.
+
+AFT, 85 queries:
+
+```text
+1.0000/1.0000/0.1000, 0.8333/0.7064/0.5000, 1.0000/0.7616/0.6000, 1.0000/0.6709/0.1000, 1.0000/0.6063/0.3000
+1.0000/0.4233/0.1000, 1.0000/0.7808/0.8000, 1.0000/0.7239/1.0000, 0.8333/0.7517/0.5000, 0.7778/0.6953/0.7000
+0.9000/0.8524/0.9000, 0.9000/0.8599/1.0000, 0.9000/0.8587/1.0000, 1.0000/0.8365/0.7000, 1.0000/0.5461/0.3000
+0.0000/1.0000/0.0000, 1.0000/1.0000/0.1000, 1.0000/0.4267/0.1000, 1.0000/0.6908/0.7000, 1.0000/0.4233/0.1000
+0.0000/0.1990/0.0000, 0.9000/0.8253/0.9000, 1.0000/0.5342/0.1000, 1.0000/0.6037/0.3000, 1.0000/0.2276/0.2000
+1.0000/0.6513/0.3000, 1.0000/0.4267/0.1000, 1.0000/0.5578/0.2000, 0.2000/0.2079/1.0000, 1.0000/0.6487/0.3000
+1.0000/0.5113/0.1000, 1.0000/0.4233/0.1000, 1.0000/0.4233/0.1000, 0.0000/0.1990/0.0000, 1.0000/0.8735/0.1000
+0.0000/0.1990/0.0000, 0.6000/0.5563/0.3000, 0.0000/0.1990/0.0000, 1.0000/0.8220/0.3000, 0.7000/0.8236/0.7000
+1.0000/1.0000/0.1000, 1.0000/0.6684/1.0000, 1.0000/0.5461/0.3000, 0.0000/0.1990/0.0000, 1.0000/0.4549/0.2000
+0.6667/0.5578/0.2000, 0.0000/0.1990/0.0000, 1.0000/0.5578/0.2000, 1.0000/0.6011/0.3000, 1.0000/0.7975/0.8000
+1.0000/0.6037/0.3000, 1.0000/0.4660/0.2000, 0.0000/0.1990/0.0000, 0.0000/0.0000/0.0000, 1.0000/1.0000/0.2000
+1.0000/0.4233/0.1000, 0.0000/0.1990/0.0000, 0.8750/0.7866/0.7000, 1.0000/0.4233/0.1000, 0.0000/0.0000/0.0000
+1.0000/0.4233/0.1000, 0.8889/0.8350/0.8000, 1.0000/0.6011/0.3000, 1.0000/0.6011/0.3000, 1.0000/0.6867/0.1000
+1.0000/0.5186/0.1000, 0.0000/0.1990/0.0000, 1.0000/0.5578/0.2000, 0.8000/0.9346/1.0000, 1.0000/0.4543/0.1000
+1.0000/0.7587/0.9000, 0.3333/0.4233/0.1000, 1.0000/0.6487/0.3000, 0.7143/0.7657/0.5000, 1.0000/0.7025/0.5000
+0.0000/0.1990/0.0000, 0.6667/0.5374/0.4000, 0.8571/0.6071/0.6000, 0.3333/0.5549/0.2000, 1.0000/0.4233/0.1000
+1.0000/0.7429/0.2000, 0.0000/0.1990/0.0000, 1.0000/0.4233/0.1000, 0.8000/0.5406/0.4000, 1.0000/0.4233/0.1000
+```
+
+MC, 92 queries:
+
+```text
+0.9000/0.6681/1.0000, 0.6667/0.4549/0.2000, 0.3333/0.4233/0.1000, 0.5000/0.6827/0.4000, 0.8571/0.5207/0.6000
+1.0000/0.5549/0.2000, 1.0000/0.5549/0.2000, 1.0000/0.5549/0.2000, 0.1000/0.4233/0.1000, 1.0000/0.4233/0.1000
+1.0000/0.7415/1.0000, 1.0000/0.4233/0.1000, 0.0000/1.0000/0.0000, 0.0000/0.9500/0.0000*, 0.0000/1.0000/0.0000
+0.0000/0.1990/0.0000, 1.0000/0.4233/0.1000, 1.0000/0.4233/0.1000, 0.0000/1.0000/0.0000, 0.0000/0.1990/0.0000
+1.0000/0.4233/0.1000, 0.0000/1.0000/0.0000, 1.0000/0.8030/1.0000, 1.0000/0.7745/1.0000, 1.0000/0.5549/0.2000
+0.8333/0.7064/0.5000, 0.8000/0.8049/0.9000, 1.0000/0.8394/0.7000, 1.0000/0.7796/0.6000, 0.9000/0.8187/1.0000
+1.0000/0.4233/0.1000, 1.0000/0.4233/0.1000, 0.0000/0.9500/0.0000*, 0.5000/0.3233/0.1000, 0.0000/0.9500/0.0000
+1.0000/0.5549/0.2000, 0.0000/0.9500/0.0000, 0.0000/1.0000/0.0000, 0.0000/0.1990/0.0000, 0.0000/0.1990/0.0000
+0.5000/0.4233/0.1000, 1.0000/0.5549/0.2000, 0.0000/0.1990/0.0000, 0.5000/0.4233/0.1000, 0.0000/0.9500/0.0000*
+0.0000/0.9500/0.0000, 1.0000/0.5549/0.2000, 1.0000/0.5549/0.2000, 1.0000/0.4233/0.1000, 1.0000/0.4549/0.2000
+1.0000/0.5549/0.2000, 1.0000/0.4233/0.1000, 0.0000/0.1990/0.0000, 0.0000/0.0000/0.0000, 1.0000/0.4233/0.1000
+1.0000/0.4233/0.1000, 1.0000/0.4233/0.1000, 1.0000/0.6461/0.3000, 0.0000/0.1990/0.0000, 1.0000/0.4233/0.1000
+0.0000/0.1990/0.0000, 1.0000/0.5549/0.2000, 1.0000/0.4233/0.1000, 1.0000/0.4233/0.1000, 0.0000/0.9033/0.0000
+1.0000/0.4233/0.1000, 1.0000/0.4233/0.1000, 0.0000/0.1990/0.0000, 1.0000/0.4233/0.1000, 0.0000/0.1990/0.0000
+1.0000/0.4233/0.1000, 0.0000/0.1990/0.0000, 0.0000/0.0000/0.0000, 1.0000/0.9775/0.1000, 0.0000/0.9500/0.0000
+0.0000/0.1990/0.0000, 1.0000/0.4233/0.1000, 1.0000/0.4233/0.1000, 0.8000/0.5505/0.4000, 1.0000/0.4233/0.1000
+0.0000/0.1990/0.0000, 1.0000/0.4233/0.1000, 1.0000/0.4233/0.1000, 1.0000/0.4233/0.1000, 0.0000/0.9500/0.0000
+0.0000/0.9033/0.0000, 0.5000/0.4233/0.1000, 0.0000/0.1990/0.0000, 0.5000/0.4233/0.1000, 1.0000/0.4233/0.1000
+1.0000/0.7657/0.5000, 1.0000/0.4549/0.2000
+```
+
+These results measure agreement with a relevance-ranking judge, not agent
+task completion or exhaustive human ground truth. Sol can be systematically
+wrong in both passes. The fixed-reference method prevents new arms moving
+the reference pool; it does not eliminate judge bias or sampling uncertainty.
+Raw prompts, responses, per-query metrics, retry records, script snapshots,
+fidelity evidence and call accounting remain in private evaluation storage.
