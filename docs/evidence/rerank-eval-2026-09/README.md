@@ -993,3 +993,191 @@ wrong in both passes. The fixed-reference method prevents new arms moving
 the reference pool; it does not eliminate judge bias or sampling uncertainty.
 Raw prompts, responses, per-query metrics, retry records, script snapshots,
 fidelity evidence and call accounting remain in private evaluation storage.
+
+## Production reranker follow-up: gte-reranker-modernbert on Metal
+
+A cross-encoder reranker reads the **query and candidate text**, never the
+embedding vectors that retrieved the candidates. It can therefore rerank results
+from any embedder; it does not need to share the embedder's family or vector
+space. This arm tests whether Synapse's existing small production cross-encoder
+ranks as well as Qwen3-Reranker-0.6B, without changing retrieval or serving code.
+Here AFT denotes the 85 retained code-search queries (`aft_search`), and MC
+(Magic Context) the 92 retained project-history queries (`ctx_search`). The two
+fixed references are the saved A/B full-pool rankings from `openai/gpt-6-sol`.
+
+**On mean-reference overlap@10, production GTE is slightly ahead of Qwen 0.6B:**
+AFT **0.7480 versus 0.7417**, MC **0.5666 versus 0.5545**. These are descriptive
+point estimates, not an equivalence or superiority test. AFT reverses their
+ordering between references A and B. GTE's mean P@10 is higher on AFT but lower
+on MC; the evidence does not support a blanket win. MC head-15 overlap is
+**0.5292**, versus **0.5666** for full-pool GTE. The point-estimate leaders remain
+Qwen 8B on AFT and Jev noul on MC. No new judgments were requested.
+
+### Reproduction, lane identity, and workload fidelity
+
+Before scoring, the unchanged existing metric implementation was rerun on the
+saved orders and fixed sol A/B references. **All 23 existing arm rows, comprising
+207 overlap@10, RBO and P@10 values (A, B and mean), matched the Jev follow-up's
+“Metric definitions and results” table to four decimals.** Its metric and
+bootstrap code was reused for the new results, including leader-gap
+recomputation with the new arms present.
+
+The production `models.list` response certified
+`gte-reranker-modernbert-base-f32`, dtype **f32**, device **Metal**. The score
+responses independently identified **owned-metal**, `owned-metal-v1`,
+`metal-mpsgraph`, graph revision 4. Every scoring call required the exact
+fingerprint, with equivalent-lane substitution disabled:
+
+`2fa5f24c0208f30c6db4bf18eb66bc0b2c46f765882cb744fcc58cd080b2b92d`
+
+The model initially reported `unloaded`, then `ready` after successful scoring;
+actual `rerank.score` responses establish that it served this workload. This
+production catalog did not expose a `serving_admission` field for this lane.
+The post-load per-row ceiling was **8,192 tokens**, sourced from `runtime_bucket`.
+The catalog's recommended batch (8 rows / 3,072 tokens) is advisory, not the
+wire admission limit. The client respected the inline limits of 64 candidates
+and 8,192 aggregate query-plus-candidate tokens (including pair special tokens).
+Every nonempty query fit in one call; none needed splitting. Calls were strictly
+sequential through the worktree-built `subc_call` management client.
+
+Fidelity was checked **before full scoring**, using the first four baseline
+candidates from each of the first five saved MC queries: **20 pairs / 5 queries**,
+selected without grades. The official Hugging Face reference was
+`Alibaba-NLP/gte-reranker-modernbert-base`, revision
+`f7481e6055501a30fb19d090657df9ec1f79ab2c`, Transformers **5.17.0**, PyTorch
+**2.14.0**, FP32 on **CPU**, eager attention. Both paths received unchanged query
+and candidate text with the model's paired-input tokenizer. Comparison applied
+sigmoid to each path's raw logit, not to a probability readout.
+
+| Real pairs | Inside-band pairs / 190 | Order disagreements | Outside-band violations | Max sigmoid absolute error | Gate |
+|---:|---:|---:|---:|---:|---|
+| 20 | 3 | 0 | 0 | 0.0000015915 | pass |
+
+The unchanged amended gate was maximum absolute error ≤0.005 and no pairwise
+order violation at a reference gap ≥0.005. The gate did not coarsen the actual
+ranking scores. The production arm sorted raw scores descending, retaining
+baseline order on exact ties. The MC head-15 variant reused those scores only
+for baseline positions 1–15 and left the remainder untouched.
+
+All **3,613 AFT / 3,730 MC** frozen candidate texts were checked against their
+saved SHA-256 digests and passed byte-for-byte to the endpoint. All **85 AFT /
+92 MC** queries were retained; the four empty queries made no scoring calls.
+Responses disclosed **zero truncated candidate rows and zero truncated query
+rows in each tool**, including zero truncation in the fidelity sample. Thus no
+disclosed truncation could change an order. Query checkpoints retain every raw
+score, response, input hash and call wall time in private evaluation storage.
+
+### Fixed-reference metrics, with the production arm included
+
+Definitions and populations are unchanged from the Jev follow-up: each cell is
+**A / B / mean(A,B)**, with full-pool sol references fixed. Existing arms below
+are reused, not rescored. No embedding or query/candidate text is published.
+
+| Tool / arm | overlap@10 A / B / mean | RBO A / B / mean | P@10 A / B / mean |
+|---|---|---|---|
+| AFT / baseline | 0.6378 / 0.6394 / 0.6386 | 0.4426 / 0.4448 / 0.4437 | 0.2294 / 0.2306 / 0.2300 |
+| AFT / Qwen3-Reranker-0.6B | 0.7485 / 0.7350 / 0.7417 | 0.4988 / 0.5000 / 0.4994 | 0.2859 / 0.2871 / 0.2865 |
+| AFT / Qwen3-Reranker-8B | 0.7710 / 0.7556 / 0.7633 | 0.5197 / 0.5147 / 0.5172 | 0.3000 / 0.2941 / 0.2971 |
+| AFT / plumb noul, unnormalized readout (as first reported) | 0.7048 / 0.6861 / 0.6955 | 0.4665 / 0.4567 / 0.4616 | 0.2612 / 0.2529 / 0.2571 |
+| AFT / plumb-4b noul, corrected F16 | 0.7068 / 0.6878 / 0.6973 | 0.4714 / 0.4618 / 0.4666 | 0.2624 / 0.2541 / 0.2582 |
+| AFT / Jev noul | 0.7358 / 0.7279 / 0.7319 | 0.4839 / 0.4845 / 0.4842 | 0.2800 / 0.2776 / 0.2788 |
+| AFT / Jev score, E | 0.7319 / 0.7262 / 0.7290 | 0.4750 / 0.4842 / 0.4796 | 0.2788 / 0.2753 / 0.2771 |
+| AFT / Jev score, P(2), secondary | 0.7276 / 0.7237 / 0.7256 | 0.4758 / 0.4845 / 0.4802 | 0.2753 / 0.2729 / 0.2741 |
+| AFT / gte-reranker-modernbert, Metal (production rerank.score) | 0.7647 / 0.7312 / 0.7480 | 0.5108 / 0.5053 / 0.5080 | 0.2941 / 0.2835 / 0.2888 |
+| MC / baseline | 0.5116 / 0.5167 / 0.5141 | 0.4231 / 0.4190 / 0.4210 | 0.1152 / 0.1141 / 0.1147 |
+| MC / Qwen3-Reranker-8B | 0.5689 / 0.5646 / 0.5667 | 0.4876 / 0.4788 / 0.4832 | 0.1576 / 0.1489 / 0.1533 |
+| MC / Qwen3-Reranker-0.6B | 0.5487 / 0.5604 / 0.5545 | 0.4798 / 0.4792 / 0.4795 | 0.1522 / 0.1489 / 0.1505 |
+| MC / Qwen3-Reranker-0.6B, head 15 | 0.5222 / 0.5256 / 0.5239 | 0.4620 / 0.4617 / 0.4618 | 0.1272 / 0.1217 / 0.1245 |
+| MC / Qwen3-Reranker-8B, head 15 | 0.5391 / 0.5298 / 0.5345 | 0.4649 / 0.4595 / 0.4622 | 0.1293 / 0.1217 / 0.1255 |
+| MC / plumb noul, unnormalized readout (as first reported) | 0.5349 / 0.5307 / 0.5328 | 0.4516 / 0.4519 / 0.4518 | 0.1391 / 0.1391 / 0.1391 |
+| MC / plumb-4b noul, corrected F16 | 0.5349 / 0.5307 / 0.5328 | 0.4516 / 0.4519 / 0.4518 | 0.1391 / 0.1391 / 0.1391 |
+| MC / plumb-4b noul, corrected F16, head 15 | 0.5296 / 0.5268 / 0.5282 | 0.4470 / 0.4473 / 0.4472 | 0.1250 / 0.1196 / 0.1223 |
+| MC / Jev noul | 0.6118 / 0.5991 / 0.6055 | 0.4905 / 0.4877 / 0.4891 | 0.1565 / 0.1522 / 0.1543 |
+| MC / Jev noul, head 15 | 0.5385 / 0.5316 / 0.5351 | 0.4661 / 0.4639 / 0.4650 | 0.1293 / 0.1250 / 0.1272 |
+| MC / Jev score, E | 0.6023 / 0.5956 / 0.5989 | 0.4819 / 0.4769 / 0.4794 | 0.1554 / 0.1500 / 0.1527 |
+| MC / Jev score, E, head 15 | 0.5366 / 0.5300 / 0.5333 | 0.4638 / 0.4610 / 0.4624 | 0.1283 / 0.1228 / 0.1255 |
+| MC / Jev score, P(2), secondary | 0.5888 / 0.5810 / 0.5849 | 0.4746 / 0.4688 / 0.4717 | 0.1511 / 0.1446 / 0.1478 |
+| MC / Jev score, P(2), secondary, head 15 | 0.5361 / 0.5295 / 0.5328 | 0.4629 / 0.4598 / 0.4614 | 0.1272 / 0.1228 / 0.1250 |
+| MC / plumb noul, unnormalized readout (as first reported), head 15 | 0.5296 / 0.5268 / 0.5282 | 0.4470 / 0.4473 / 0.4472 | 0.1250 / 0.1196 / 0.1223 |
+| MC / gte-reranker-modernbert, Metal (production rerank.score) | 0.5723 / 0.5608 / 0.5666 | 0.4832 / 0.4799 / 0.4815 | 0.1511 / 0.1435 / 0.1473 |
+| MC / gte-reranker-modernbert, Metal (production rerank.score), head 15 | 0.5323 / 0.5260 / 0.5292 | 0.4649 / 0.4622 / 0.4636 | 0.1272 / 0.1217 / 0.1245 |
+
+### Production-arm paired deltas versus baseline
+
+Same 10,000 paired query resamples, seed 2609, reset per tool, with linear
+percentile endpoints and shared resamples across arms, references and metrics.
+Each cell is **A; B**, mean delta [95% interval]. Baseline deltas for the Qwen,
+plumb and Jev arms are unchanged from the Jev follow-up's paired-delta table. Intervals omit systematic judge error,
+within-project dependence and multiplicity adjustment. In particular, MC's
+full-pool overlap interval includes zero under B, and head-15's includes zero
+under both references.
+
+| Tool / arm | Δoverlap@10 A; B | ΔRBO A; B | ΔP@10 A; B |
+|---|---|---|---|
+| AFT / gte-reranker-modernbert, Metal (production rerank.score) | 0.1269 [0.0725, 0.1871]; 0.0918 [0.0399, 0.1463] | 0.0682 [0.0417, 0.0961]; 0.0604 [0.0332, 0.0876] | 0.0647 [0.0376, 0.0941]; 0.0529 [0.0247, 0.0824] |
+| MC / gte-reranker-modernbert, Metal (production rerank.score) | 0.0607 [0.0105, 0.1116]; 0.0442 [-0.0114, 0.0987] | 0.0601 [0.0364, 0.0854]; 0.0609 [0.0386, 0.0863] | 0.0359 [0.0141, 0.0620]; 0.0293 [0.0098, 0.0511] |
+| MC / gte-reranker-modernbert, Metal (production rerank.score), head 15 | 0.0208 [-0.0011, 0.0449]; 0.0093 [-0.0254, 0.0406] | 0.0419 [0.0249, 0.0599]; 0.0432 [0.0269, 0.0611] | 0.0120 [0.0043, 0.0207]; 0.0076 [-0.0011, 0.0174] |
+
+### Recomputed leader-gap flags
+
+The same rule is applied to all arms, including GTE: flag when the paired
+leader-minus-arm interval includes zero under A or B, or the point ordering
+swaps between references. Leaders maximize mean(A,B) separately per metric;
+`overlap10`, `rbo09` and `p10` denote overlap@10, RBO at p=0.9 and P@10.
+These are repeatability warnings, not equivalence claims. GTE is now flagged
+against the AFT leader on all three metrics, and against the MC leader on RBO
+and P@10, but not MC overlap@10. Head-15 GTE is
+not flagged against any full-pool metric leader.
+
+| Tool / metric | Mean-reference leader | Flagged comparators |
+|---|---|---|
+| AFT / overlap10 | Qwen3-Reranker-8B | Qwen3-Reranker-0.6B; gte-reranker-modernbert, Metal (production rerank.score) |
+| AFT / rbo09 | Qwen3-Reranker-8B | gte-reranker-modernbert, Metal (production rerank.score) |
+| AFT / p10 | Qwen3-Reranker-8B | Qwen3-Reranker-0.6B; Jev noul; Jev score, E; Jev score, P(2), secondary; gte-reranker-modernbert, Metal (production rerank.score) |
+| MC / overlap10 | Jev noul | Qwen3-Reranker-8B; Qwen3-Reranker-0.6B; Jev score, E; Jev score, P(2), secondary |
+| MC / rbo09 | Jev noul | Qwen3-Reranker-8B; Qwen3-Reranker-0.6B; Jev score, E; gte-reranker-modernbert, Metal (production rerank.score) |
+| MC / p10 | Jev noul | Qwen3-Reranker-8B; Qwen3-Reranker-0.6B; Jev score, E; Jev score, P(2), secondary; gte-reranker-modernbert, Metal (production rerank.score) |
+
+### Known luna grade-2 membership changes
+
+These are query counts versus baseline, using only the existing `openai/gpt-6-luna`
+relevance labels from the original (v2) and expanded-union (v3) judging rounds.
+“Known” means the item was judged grade 2 (directly relevant). New/lost counts
+queries gaining/losing at least one such top-10 item; zero/some counts changes
+in having any such item. New and lost can overlap. Unknown grades are not
+treated as irrelevant; this is not exhaustive full-pool grade-2 relevance.
+Existing-arm counts are unchanged.
+
+| Tool / arm | Known new | Known lost | Known zero → some | Known some → zero |
+|---|---:|---:|---:|---:|
+| AFT / gte-reranker-modernbert, Metal (production rerank.score) | 25 | 4 | 6 | 0 |
+| MC / gte-reranker-modernbert, Metal (production rerank.score) | 22 | 4 | 7 | 0 |
+| MC / gte-reranker-modernbert, Metal (production rerank.score), head 15 | 11 | 2 | 4 | 0 |
+
+### Ambient production wire latency
+
+These are **real production wire wall times**, including client startup,
+tokenization, IPC, queueing and Metal inference, on a shared machine; **ambient**,
+not a controlled cross-model speed benchmark or serving promise. Every measured
+full-50 query fit in a single call, so the per-50 column is measured, **not** a
+mean-candidate ×50 extrapolation. Other query sizes contribute to the all-call
+statistics. Head-15 reuses full-pool scores and was not timed separately.
+
+| Tool | Successful full-run calls | Mean ms / call | Median ms | p95 ms | Full-50 queries | Measured mean ms / 50 | Median ms / 50 | p95 ms / 50 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| AFT | 83 | 271.67 | 235.38 | 499.61 | 53 | 300.39 | 278.04 | 492.40 |
+| MC | 90 | 148.04 | 153.72 | 260.46 | 74 | 173.88 | 156.19 | 261.84 |
+
+The first fidelity request encountered a **cold load**: five initial requests
+returned retryable `model_loading` responses without scores. Those attempts
+were saved and retried sequentially. The post-load catalog reported a warm-load
+cost hint of **1,047.96 ms**; this is a catalog hint, not a measured cold-start
+end-to-end interval. The first successful four-candidate fidelity call took
+**223.35 ms**; all five successful fidelity calls and the loading attempts are
+excluded from the full-run table. No cold-load duration is inferred from the
+pause between attempts. All 173 full-run calls completed successfully.
+
+No new serving policy, model certification, retrieval, or judging was introduced.
+The scripts, frozen-input hashes, references, raw responses and per-query
+checkpoints remain private; this public addition contains only aggregate results
+and model provenance.
