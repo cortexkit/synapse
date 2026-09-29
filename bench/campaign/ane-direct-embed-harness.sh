@@ -7,6 +7,7 @@ set -euo pipefail
 exec /usr/bin/python3 - "$@" <<'PY'
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import math
@@ -549,15 +550,30 @@ def workspace_commit(runner: Path, workspace: Path, log_path: Path) -> str:
     return value
 
 
-def acquire_bench_lock() -> Path:
+def acquire_bench_lock() -> int:
+    """Hold an exclusive advisory lock for the whole measurement.
+
+    The kernel drops a flock when the holding process dies, however it dies.
+    A marker directory does not: a harness killed mid-run (for example when the
+    campaign controller restarts during setup) left it behind, and every later
+    run on that path refused until someone deleted it by hand. The returned
+    descriptor is the lock; closing it releases the lock.
+    """
     lock = Path(os.environ.get("SYNAPSE_CAMPAIGN_BENCH_LOCK", str(Path(tempfile.gettempdir()) / "synapse-benchmark.lock")))
     measure_lock = Path(os.environ.get("SYNAPSE_CAMPAIGN_MEASURE_LOCK", "/tmp/aft-measure.lock"))
     if measure_lock.exists():
         raise HarnessError(f"measurement lock is already present: {measure_lock}")
     try:
-        lock.mkdir()
-    except FileExistsError as error:
-        raise HarnessError(f"benchmark lock is already present: {lock}") from error
+        descriptor = os.open(lock, os.O_RDWR | os.O_CREAT, 0o644)
+    except IsADirectoryError as error:
+        raise HarnessError(
+            f"benchmark lock path is a directory left by an older harness; remove it: {lock}"
+        ) from error
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as error:
+        os.close(descriptor)
+        raise HarnessError(f"benchmark lock is held by another running harness: {lock}") from error
     worker = subprocess.run(
         ["/usr/bin/pgrep", "-f", "Runner.Worker"],
         stdin=subprocess.DEVNULL,
@@ -566,18 +582,18 @@ def acquire_bench_lock() -> Path:
         check=False,
     )
     if worker.returncode == 0:
-        lock.rmdir()
+        os.close(descriptor)
         raise HarnessError("Runner.Worker is active; benchmark lock released without measuring")
-    return lock
+    return descriptor
 
 
-def release_bench_lock(lock: Optional[Path]) -> None:
+def release_bench_lock(lock: Optional[int]) -> None:
     if lock is None:
         return
     try:
-        lock.rmdir()
+        os.close(lock)
     except OSError as error:
-        print(f"warning: could not release benchmark lock {lock}: {error}", file=sys.stderr)
+        print(f"warning: could not release benchmark lock descriptor {lock}: {error}", file=sys.stderr)
 
 
 def run_private_api_preflight(
@@ -756,7 +772,7 @@ def run_harness(workspace_arg: str, runner_arg: str, result_arg: str) -> int:
     writer.write(initial_payload(baseline_note))
     temp_root = Path(tempfile.mkdtemp(prefix="synapse-ane-direct-embed-campaign-", dir="/tmp"))
     temp_root.chmod(0o777)
-    lock: Optional[Path] = None
+    lock: Optional[int] = None
     try:
         verify_candidate_contract(workspace)
         row_protocol = expected_row_protocol(workspace / ROWS)
