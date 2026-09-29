@@ -1,0 +1,1969 @@
+{
+  "environment": {
+    "python": "3.12.12",
+    "macos": "27.0",
+    "machine": "arm64",
+    "coremltools": "8.3.0",
+    "torch": "2.5.1",
+    "transformers": "4.48.0"
+  },
+  "source_model": "Alibaba-NLP/gte-modernbert-base",
+  "source_snapshot": "e7f32e3c00f91d699e8c43b53106206bcc72bb22",
+  "packages": {
+    "single-seq128": {
+      "package_bytes": 298728690,
+      "weights": {
+        "Data/com.apple.CoreML/weights/weight.bin": {
+          "bytes": 298109248,
+          "sha256": "e862615a1d0acb95e2b3a9048dbf69eaf5a0ee8b68afcca14bf0fd76a9267954"
+        }
+      }
+    },
+    "single-seq256": {
+      "package_bytes": 298843378,
+      "weights": {
+        "Data/com.apple.CoreML/weights/weight.bin": {
+          "bytes": 298174784,
+          "sha256": "5b2060cf62d40d7977c4b2a9d60ef497178d68e1b02c59431b9d3a521a3d23b2"
+        }
+      }
+    },
+    "single-seq512": {
+      "package_bytes": 299171058,
+      "weights": {
+        "Data/com.apple.CoreML/weights/weight.bin": {
+          "bytes": 298305856,
+          "sha256": "bfa9e9edaee4fd96c82b1fe452c0df78899219a844d73134a918035e02c1db0e"
+        }
+      }
+    },
+    "single-seq1024": {
+      "package_bytes": 300219637,
+      "weights": {
+        "Data/com.apple.CoreML/weights/weight.bin": {
+          "bytes": 298568000,
+          "sha256": "49b877ec83a90479367aaf0a302b5b91c53e81e4b691e18594826189d622321e"
+        }
+      }
+    },
+    "mf-128-256-512": {
+      "package_bytes": 299754550,
+      "weights": {
+        "Data/com.apple.CoreML/weights/weight.bin": {
+          "bytes": 298502976,
+          "sha256": "4e330789be198e13fb998fc0a27788c23db8e2f8351f560ba25e1c95e81479b3"
+        }
+      }
+    },
+    "mf-128-256-512-1024": {
+      "package_bytes": 301629965,
+      "weights": {
+        "Data/com.apple.CoreML/weights/weight.bin": {
+          "bytes": 299027520,
+          "sha256": "a107d3585461e6286a89baf4594da42b7037adb5002f6a426e0f60f805cb5605"
+        }
+      }
+    }
+  },
+  "multi_function_spec": {
+    "mf-128-256-512": {
+      "specification_version": 9,
+      "functions": [
+        {
+          "name": "seq128",
+          "inputs": [
+            {
+              "name": "input_ids",
+              "shape": [
+                1,
+                128
+              ]
+            },
+            {
+              "name": "attention_mask",
+              "shape": [
+                1,
+                128
+              ]
+            }
+          ],
+          "outputs": [
+            "embedding"
+          ]
+        },
+        {
+          "name": "seq256",
+          "inputs": [
+            {
+              "name": "input_ids",
+              "shape": [
+                1,
+                256
+              ]
+            },
+            {
+              "name": "attention_mask",
+              "shape": [
+                1,
+                256
+              ]
+            }
+          ],
+          "outputs": [
+            "embedding"
+          ]
+        },
+        {
+          "name": "seq512",
+          "inputs": [
+            {
+              "name": "input_ids",
+              "shape": [
+                1,
+                512
+              ]
+            },
+            {
+              "name": "attention_mask",
+              "shape": [
+                1,
+                512
+              ]
+            }
+          ],
+          "outputs": [
+            "embedding"
+          ]
+        }
+      ]
+    },
+    "mf-128-256-512-1024": {
+      "specification_version": 9,
+      "functions": [
+        {
+          "name": "seq128",
+          "inputs": [
+            {
+              "name": "input_ids",
+              "shape": [
+                1,
+                128
+              ]
+            },
+            {
+              "name": "attention_mask",
+              "shape": [
+                1,
+                128
+              ]
+            }
+          ],
+          "outputs": [
+            "embedding"
+          ]
+        },
+        {
+          "name": "seq256",
+          "inputs": [
+            {
+              "name": "input_ids",
+              "shape": [
+                1,
+                256
+              ]
+            },
+            {
+              "name": "attention_mask",
+              "shape": [
+                1,
+                256
+              ]
+            }
+          ],
+          "outputs": [
+            "embedding"
+          ]
+        },
+        {
+          "name": "seq512",
+          "inputs": [
+            {
+              "name": "input_ids",
+              "shape": [
+                1,
+                512
+              ]
+            },
+            {
+              "name": "attention_mask",
+              "shape": [
+                1,
+                512
+              ]
+            }
+          ],
+          "outputs": [
+            "embedding"
+          ]
+        },
+        {
+          "name": "seq1024",
+          "inputs": [
+            {
+              "name": "input_ids",
+              "shape": [
+                1,
+                1024
+              ]
+            },
+            {
+              "name": "attention_mask",
+              "shape": [
+                1,
+                1024
+              ]
+            }
+          ],
+          "outputs": [
+            "embedding"
+          ]
+        }
+      ]
+    }
+  },
+  "single_parity_gate": {
+    "128": "passed",
+    "256": "passed",
+    "512": "passed",
+    "1024": "passed"
+  },
+  "compile_ms": {
+    "single-seq128": 86.392917,
+    "single-seq256": 87.4375,
+    "single-seq512": 94.970209,
+    "single-seq1024": 121.412083,
+    "mf-128-256-512": 216.678584,
+    "mf-128-256-512-1024": 322.896667
+  },
+  "compiled": {
+    "single-seq128": {
+      "bytes": 298564424,
+      "weights": {
+        "weights/weight.bin": {
+          "bytes": 298109248,
+          "sha256": "e862615a1d0acb95e2b3a9048dbf69eaf5a0ee8b68afcca14bf0fd76a9267954"
+        }
+      }
+    },
+    "single-seq256": {
+      "bytes": 298941640,
+      "weights": {
+        "weights/weight.bin": {
+          "bytes": 298174784,
+          "sha256": "5b2060cf62d40d7977c4b2a9d60ef497178d68e1b02c59431b9d3a521a3d23b2"
+        }
+      }
+    },
+    "single-seq512": {
+      "bytes": 300285896,
+      "weights": {
+        "weights/weight.bin": {
+          "bytes": 298305856,
+          "sha256": "bfa9e9edaee4fd96c82b1fe452c0df78899219a844d73134a918035e02c1db0e"
+        }
+      }
+    },
+    "single-seq1024": {
+      "bytes": 305334814,
+      "weights": {
+        "weights/weight.bin": {
+          "bytes": 298568000,
+          "sha256": "49b877ec83a90479367aaf0a302b5b91c53e81e4b691e18594826189d622321e"
+        }
+      }
+    },
+    "mf-128-256-512": {
+      "bytes": 301595442,
+      "weights": {
+        "weights/weight.bin": {
+          "bytes": 298502976,
+          "sha256": "4e330789be198e13fb998fc0a27788c23db8e2f8351f560ba25e1c95e81479b3"
+        }
+      }
+    },
+    "mf-128-256-512-1024": {
+      "bytes": 308850112,
+      "weights": {
+        "weights/weight.bin": {
+          "bytes": 299027520,
+          "sha256": "a107d3585461e6286a89baf4594da42b7037adb5002f6a426e0f60f805cb5605"
+        }
+      }
+    }
+  },
+  "production": {
+    "128": {
+      "source_digest": "sha256:8c3bf4b2a50634ec4a3eb54e986b769c84d0d11946c281ecd88d24827afd7d80",
+      "materialized_digest": "sha256:78c82761765daaf252b3c10e76ab57fb82245d7eb8b885593f3e82acff4d16cf",
+      "bytes": 298564424,
+      "rebuilt_matches": {
+        "analytics/coremldata.bin": false,
+        "coremldata.bin": false,
+        "model.mil": false,
+        "weights/weight.bin": true
+      }
+    },
+    "512": {
+      "source_digest": "sha256:9df6b44617b49e08a068602efc3fddcd7dadc0e46791929698b524c96d544f72",
+      "materialized_digest": "sha256:60e12dcd58ea78f55adaab9b0eace83e53afa9fdc8394c03fae14c8c93b85eff",
+      "bytes": 300285896,
+      "rebuilt_matches": {
+        "analytics/coremldata.bin": false,
+        "coremldata.bin": false,
+        "model.mil": false,
+        "weights/weight.bin": true
+      }
+    },
+    "256": {
+      "source_digest": "sha256:a8626c487794f879b88c73bf9c8fe6f7864e3cc252a1db0d79bb5e096210b9fd",
+      "materialized_digest": "sha256:553dad5320920690cc7a570a890a22fd27e6ea40285d11fe4350748bfecc676f",
+      "bytes": 298941640,
+      "rebuilt_matches": {
+        "analytics/coremldata.bin": false,
+        "coremldata.bin": false,
+        "model.mil": false,
+        "weights/weight.bin": true
+      }
+    }
+  },
+  "placement": {
+    "prod-seq128": {
+      "placement_share": 0.9941245593419507,
+      "preferred_device_counts": {
+        "cpu": 5,
+        "neuralEngine": 846,
+        "unknown": 1042
+      },
+      "non_neural_engine_operators": {
+        "ios17.cast": {
+          "cpu": 1
+        },
+        "ios17.expand_dims": {
+          "cpu": 2
+        },
+        "ios17.gather": {
+          "cpu": 1
+        },
+        "tile": {
+          "cpu": 1
+        }
+      },
+      "total_operations": 1893
+    },
+    "single-seq128": {
+      "placement_share": 0.9941245593419507,
+      "preferred_device_counts": {
+        "cpu": 5,
+        "neuralEngine": 846,
+        "unknown": 1042
+      },
+      "non_neural_engine_operators": {
+        "ios17.cast": {
+          "cpu": 1
+        },
+        "ios17.expand_dims": {
+          "cpu": 2
+        },
+        "ios17.gather": {
+          "cpu": 1
+        },
+        "tile": {
+          "cpu": 1
+        }
+      },
+      "total_operations": 1893
+    },
+    "mf-128-256-512:seq128": {
+      "placement_share": 0.9941245593419507,
+      "preferred_device_counts": {
+        "cpu": 5,
+        "neuralEngine": 846,
+        "unknown": 1042
+      },
+      "non_neural_engine_operators": {
+        "ios18.cast": {
+          "cpu": 1
+        },
+        "ios18.expand_dims": {
+          "cpu": 2
+        },
+        "ios18.gather": {
+          "cpu": 1
+        },
+        "tile": {
+          "cpu": 1
+        }
+      },
+      "total_operations": 1893
+    },
+    "prod-seq256": {
+      "placement_share": 0.9941245593419507,
+      "preferred_device_counts": {
+        "cpu": 5,
+        "neuralEngine": 846,
+        "unknown": 1042
+      },
+      "non_neural_engine_operators": {
+        "ios17.cast": {
+          "cpu": 1
+        },
+        "ios17.expand_dims": {
+          "cpu": 2
+        },
+        "ios17.gather": {
+          "cpu": 1
+        },
+        "tile": {
+          "cpu": 1
+        }
+      },
+      "total_operations": 1893
+    },
+    "single-seq256": {
+      "placement_share": 0.9941245593419507,
+      "preferred_device_counts": {
+        "cpu": 5,
+        "neuralEngine": 846,
+        "unknown": 1042
+      },
+      "non_neural_engine_operators": {
+        "ios17.cast": {
+          "cpu": 1
+        },
+        "ios17.expand_dims": {
+          "cpu": 2
+        },
+        "ios17.gather": {
+          "cpu": 1
+        },
+        "tile": {
+          "cpu": 1
+        }
+      },
+      "total_operations": 1893
+    },
+    "mf-128-256-512:seq256": {
+      "placement_share": 0.9941245593419507,
+      "preferred_device_counts": {
+        "cpu": 5,
+        "neuralEngine": 846,
+        "unknown": 1042
+      },
+      "non_neural_engine_operators": {
+        "ios18.cast": {
+          "cpu": 1
+        },
+        "ios18.expand_dims": {
+          "cpu": 2
+        },
+        "ios18.gather": {
+          "cpu": 1
+        },
+        "tile": {
+          "cpu": 1
+        }
+      },
+      "total_operations": 1893
+    },
+    "prod-seq512": {
+      "placement_share": 0.9941245593419507,
+      "preferred_device_counts": {
+        "cpu": 5,
+        "neuralEngine": 846,
+        "unknown": 1042
+      },
+      "non_neural_engine_operators": {
+        "ios17.cast": {
+          "cpu": 1
+        },
+        "ios17.expand_dims": {
+          "cpu": 2
+        },
+        "ios17.gather": {
+          "cpu": 1
+        },
+        "tile": {
+          "cpu": 1
+        }
+      },
+      "total_operations": 1893
+    },
+    "single-seq512": {
+      "placement_share": 0.9941245593419507,
+      "preferred_device_counts": {
+        "cpu": 5,
+        "neuralEngine": 846,
+        "unknown": 1042
+      },
+      "non_neural_engine_operators": {
+        "ios17.cast": {
+          "cpu": 1
+        },
+        "ios17.expand_dims": {
+          "cpu": 2
+        },
+        "ios17.gather": {
+          "cpu": 1
+        },
+        "tile": {
+          "cpu": 1
+        }
+      },
+      "total_operations": 1893
+    },
+    "mf-128-256-512:seq512": {
+      "placement_share": 0.9941245593419507,
+      "preferred_device_counts": {
+        "cpu": 5,
+        "neuralEngine": 846,
+        "unknown": 1042
+      },
+      "non_neural_engine_operators": {
+        "ios18.cast": {
+          "cpu": 1
+        },
+        "ios18.expand_dims": {
+          "cpu": 2
+        },
+        "ios18.gather": {
+          "cpu": 1
+        },
+        "tile": {
+          "cpu": 1
+        }
+      },
+      "total_operations": 1893
+    },
+    "single-seq1024": {
+      "placement_share": 0.9941245593419507,
+      "preferred_device_counts": {
+        "cpu": 5,
+        "neuralEngine": 846,
+        "unknown": 1042
+      },
+      "non_neural_engine_operators": {
+        "ios17.cast": {
+          "cpu": 1
+        },
+        "ios17.expand_dims": {
+          "cpu": 2
+        },
+        "ios17.gather": {
+          "cpu": 1
+        },
+        "tile": {
+          "cpu": 1
+        }
+      },
+      "total_operations": 1893
+    },
+    "mf-128-256-512-1024:seq128": {
+      "placement_share": 0.9941245593419507,
+      "preferred_device_counts": {
+        "cpu": 5,
+        "neuralEngine": 846,
+        "unknown": 1042
+      },
+      "non_neural_engine_operators": {
+        "ios18.cast": {
+          "cpu": 1
+        },
+        "ios18.expand_dims": {
+          "cpu": 2
+        },
+        "ios18.gather": {
+          "cpu": 1
+        },
+        "tile": {
+          "cpu": 1
+        }
+      },
+      "total_operations": 1893
+    },
+    "mf-128-256-512-1024:seq256": {
+      "placement_share": 0.9941245593419507,
+      "preferred_device_counts": {
+        "cpu": 5,
+        "neuralEngine": 846,
+        "unknown": 1042
+      },
+      "non_neural_engine_operators": {
+        "ios18.cast": {
+          "cpu": 1
+        },
+        "ios18.expand_dims": {
+          "cpu": 2
+        },
+        "ios18.gather": {
+          "cpu": 1
+        },
+        "tile": {
+          "cpu": 1
+        }
+      },
+      "total_operations": 1893
+    },
+    "mf-128-256-512-1024:seq512": {
+      "placement_share": 0.9941245593419507,
+      "preferred_device_counts": {
+        "cpu": 5,
+        "neuralEngine": 846,
+        "unknown": 1042
+      },
+      "non_neural_engine_operators": {
+        "ios18.cast": {
+          "cpu": 1
+        },
+        "ios18.expand_dims": {
+          "cpu": 2
+        },
+        "ios18.gather": {
+          "cpu": 1
+        },
+        "tile": {
+          "cpu": 1
+        }
+      },
+      "total_operations": 1893
+    },
+    "mf-128-256-512-1024:seq1024": {
+      "placement_share": 0.9941245593419507,
+      "preferred_device_counts": {
+        "cpu": 5,
+        "neuralEngine": 846,
+        "unknown": 1042
+      },
+      "non_neural_engine_operators": {
+        "ios18.cast": {
+          "cpu": 1
+        },
+        "ios18.expand_dims": {
+          "cpu": 2
+        },
+        "ios18.gather": {
+          "cpu": 1
+        },
+        "tile": {
+          "cpu": 1
+        }
+      },
+      "total_operations": 1893
+    }
+  },
+  "parity": {
+    "seq128": {
+      "single_rebuilt_vs_production": {
+        "rows": 8,
+        "all_identical": true,
+        "max_abs": 0.0,
+        "min_cosine": 0.9999999999999998,
+        "per_row": [
+          {
+            "id": "short-fox",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 0.9999999999999999,
+            "finite": true
+          },
+          {
+            "id": "short-boundary",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0,
+            "finite": true
+          },
+          {
+            "id": "short-multilingual",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0,
+            "finite": true
+          },
+          {
+            "id": "short-structured",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0000000000000002,
+            "finite": true
+          },
+          {
+            "id": "near-climate",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 0.9999999999999999,
+            "finite": true
+          },
+          {
+            "id": "near-database",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0000000000000002,
+            "finite": true
+          },
+          {
+            "id": "near-software",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 0.9999999999999998,
+            "finite": true
+          },
+          {
+            "id": "near-science",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0,
+            "finite": true
+          }
+        ]
+      },
+      "mf3_vs_production": {
+        "rows": 8,
+        "all_identical": true,
+        "max_abs": 0.0,
+        "min_cosine": 0.9999999999999998,
+        "per_row": [
+          {
+            "id": "short-fox",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 0.9999999999999999,
+            "finite": true
+          },
+          {
+            "id": "short-boundary",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0,
+            "finite": true
+          },
+          {
+            "id": "short-multilingual",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0,
+            "finite": true
+          },
+          {
+            "id": "short-structured",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0000000000000002,
+            "finite": true
+          },
+          {
+            "id": "near-climate",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 0.9999999999999999,
+            "finite": true
+          },
+          {
+            "id": "near-database",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0000000000000002,
+            "finite": true
+          },
+          {
+            "id": "near-software",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 0.9999999999999998,
+            "finite": true
+          },
+          {
+            "id": "near-science",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0,
+            "finite": true
+          }
+        ]
+      },
+      "mf4_vs_production": {
+        "rows": 8,
+        "all_identical": true,
+        "max_abs": 0.0,
+        "min_cosine": 0.9999999999999998,
+        "per_row": [
+          {
+            "id": "short-fox",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 0.9999999999999999,
+            "finite": true
+          },
+          {
+            "id": "short-boundary",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0,
+            "finite": true
+          },
+          {
+            "id": "short-multilingual",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0,
+            "finite": true
+          },
+          {
+            "id": "short-structured",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0000000000000002,
+            "finite": true
+          },
+          {
+            "id": "near-climate",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 0.9999999999999999,
+            "finite": true
+          },
+          {
+            "id": "near-database",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0000000000000002,
+            "finite": true
+          },
+          {
+            "id": "near-software",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 0.9999999999999998,
+            "finite": true
+          },
+          {
+            "id": "near-science",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0,
+            "finite": true
+          }
+        ]
+      },
+      "production_vs_fp32_reference": {
+        "rows": 8,
+        "all_identical": false,
+        "max_abs": 0.008932620286941528,
+        "min_cosine": 0.9988990029971022,
+        "per_row": [
+          {
+            "id": "short-fox",
+            "identical": false,
+            "max_abs": 0.005086034536361694,
+            "cosine": 0.9997585136666214,
+            "finite": true
+          },
+          {
+            "id": "short-boundary",
+            "identical": false,
+            "max_abs": 0.0007547782734036446,
+            "cosine": 0.9999823019342731,
+            "finite": true
+          },
+          {
+            "id": "short-multilingual",
+            "identical": false,
+            "max_abs": 0.0030914247035980225,
+            "cosine": 0.9998079049430626,
+            "finite": true
+          },
+          {
+            "id": "short-structured",
+            "identical": false,
+            "max_abs": 0.0045958757400512695,
+            "cosine": 0.9997382134339478,
+            "finite": true
+          },
+          {
+            "id": "near-climate",
+            "identical": false,
+            "max_abs": 0.004459977149963379,
+            "cosine": 0.9995248611052197,
+            "finite": true
+          },
+          {
+            "id": "near-database",
+            "identical": false,
+            "max_abs": 0.006128132343292236,
+            "cosine": 0.9995135818612456,
+            "finite": true
+          },
+          {
+            "id": "near-software",
+            "identical": false,
+            "max_abs": 0.007764790207147598,
+            "cosine": 0.9988990029971022,
+            "finite": true
+          },
+          {
+            "id": "near-science",
+            "identical": false,
+            "max_abs": 0.008932620286941528,
+            "cosine": 0.9993774897246498,
+            "finite": true
+          }
+        ]
+      }
+    },
+    "seq256": {
+      "single_rebuilt_vs_production": {
+        "rows": 8,
+        "all_identical": true,
+        "max_abs": 0.0,
+        "min_cosine": 0.9999999999999999,
+        "per_row": [
+          {
+            "id": "short-fox",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 0.9999999999999999,
+            "finite": true
+          },
+          {
+            "id": "short-boundary",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0,
+            "finite": true
+          },
+          {
+            "id": "short-multilingual",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0,
+            "finite": true
+          },
+          {
+            "id": "short-structured",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0000000000000002,
+            "finite": true
+          },
+          {
+            "id": "near-climate",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 0.9999999999999999,
+            "finite": true
+          },
+          {
+            "id": "near-database",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0,
+            "finite": true
+          },
+          {
+            "id": "near-software",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0,
+            "finite": true
+          },
+          {
+            "id": "near-science",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0000000000000002,
+            "finite": true
+          }
+        ]
+      },
+      "mf3_vs_production": {
+        "rows": 8,
+        "all_identical": true,
+        "max_abs": 0.0,
+        "min_cosine": 0.9999999999999999,
+        "per_row": [
+          {
+            "id": "short-fox",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 0.9999999999999999,
+            "finite": true
+          },
+          {
+            "id": "short-boundary",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0,
+            "finite": true
+          },
+          {
+            "id": "short-multilingual",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0,
+            "finite": true
+          },
+          {
+            "id": "short-structured",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0000000000000002,
+            "finite": true
+          },
+          {
+            "id": "near-climate",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 0.9999999999999999,
+            "finite": true
+          },
+          {
+            "id": "near-database",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0,
+            "finite": true
+          },
+          {
+            "id": "near-software",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0,
+            "finite": true
+          },
+          {
+            "id": "near-science",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0000000000000002,
+            "finite": true
+          }
+        ]
+      },
+      "mf4_vs_production": {
+        "rows": 8,
+        "all_identical": true,
+        "max_abs": 0.0,
+        "min_cosine": 0.9999999999999999,
+        "per_row": [
+          {
+            "id": "short-fox",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 0.9999999999999999,
+            "finite": true
+          },
+          {
+            "id": "short-boundary",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0,
+            "finite": true
+          },
+          {
+            "id": "short-multilingual",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0,
+            "finite": true
+          },
+          {
+            "id": "short-structured",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0000000000000002,
+            "finite": true
+          },
+          {
+            "id": "near-climate",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 0.9999999999999999,
+            "finite": true
+          },
+          {
+            "id": "near-database",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0,
+            "finite": true
+          },
+          {
+            "id": "near-software",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0,
+            "finite": true
+          },
+          {
+            "id": "near-science",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0000000000000002,
+            "finite": true
+          }
+        ]
+      },
+      "production_vs_fp32_reference": {
+        "rows": 8,
+        "all_identical": false,
+        "max_abs": 0.009275645017623901,
+        "min_cosine": 0.9989988989149982,
+        "per_row": [
+          {
+            "id": "short-fox",
+            "identical": false,
+            "max_abs": 0.005086034536361694,
+            "cosine": 0.9997585136666214,
+            "finite": true
+          },
+          {
+            "id": "short-boundary",
+            "identical": false,
+            "max_abs": 0.0007547782734036446,
+            "cosine": 0.9999823019342731,
+            "finite": true
+          },
+          {
+            "id": "short-multilingual",
+            "identical": false,
+            "max_abs": 0.0030914247035980225,
+            "cosine": 0.9998079049430626,
+            "finite": true
+          },
+          {
+            "id": "short-structured",
+            "identical": false,
+            "max_abs": 0.0045958757400512695,
+            "cosine": 0.9997382134339478,
+            "finite": true
+          },
+          {
+            "id": "near-climate",
+            "identical": false,
+            "max_abs": 0.0042573511600494385,
+            "cosine": 0.9996058962194859,
+            "finite": true
+          },
+          {
+            "id": "near-database",
+            "identical": false,
+            "max_abs": 0.005556017160415649,
+            "cosine": 0.9995243449695892,
+            "finite": true
+          },
+          {
+            "id": "near-software",
+            "identical": false,
+            "max_abs": 0.007848173379898071,
+            "cosine": 0.9989988989149982,
+            "finite": true
+          },
+          {
+            "id": "near-science",
+            "identical": false,
+            "max_abs": 0.009275645017623901,
+            "cosine": 0.9993894151592284,
+            "finite": true
+          }
+        ]
+      }
+    },
+    "seq512": {
+      "single_rebuilt_vs_production": {
+        "rows": 8,
+        "all_identical": true,
+        "max_abs": 0.0,
+        "min_cosine": 0.9999999999999999,
+        "per_row": [
+          {
+            "id": "short-fox",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 0.9999999999999999,
+            "finite": true
+          },
+          {
+            "id": "short-boundary",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0,
+            "finite": true
+          },
+          {
+            "id": "short-multilingual",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0,
+            "finite": true
+          },
+          {
+            "id": "short-structured",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0000000000000002,
+            "finite": true
+          },
+          {
+            "id": "near-climate",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0000000000000002,
+            "finite": true
+          },
+          {
+            "id": "near-database",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0,
+            "finite": true
+          },
+          {
+            "id": "near-software",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0,
+            "finite": true
+          },
+          {
+            "id": "near-science",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0000000000000002,
+            "finite": true
+          }
+        ]
+      },
+      "mf3_vs_production": {
+        "rows": 8,
+        "all_identical": true,
+        "max_abs": 0.0,
+        "min_cosine": 0.9999999999999999,
+        "per_row": [
+          {
+            "id": "short-fox",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 0.9999999999999999,
+            "finite": true
+          },
+          {
+            "id": "short-boundary",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0,
+            "finite": true
+          },
+          {
+            "id": "short-multilingual",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0,
+            "finite": true
+          },
+          {
+            "id": "short-structured",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0000000000000002,
+            "finite": true
+          },
+          {
+            "id": "near-climate",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0000000000000002,
+            "finite": true
+          },
+          {
+            "id": "near-database",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0,
+            "finite": true
+          },
+          {
+            "id": "near-software",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0,
+            "finite": true
+          },
+          {
+            "id": "near-science",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0000000000000002,
+            "finite": true
+          }
+        ]
+      },
+      "mf4_vs_production": {
+        "rows": 8,
+        "all_identical": true,
+        "max_abs": 0.0,
+        "min_cosine": 0.9999999999999999,
+        "per_row": [
+          {
+            "id": "short-fox",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 0.9999999999999999,
+            "finite": true
+          },
+          {
+            "id": "short-boundary",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0,
+            "finite": true
+          },
+          {
+            "id": "short-multilingual",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0,
+            "finite": true
+          },
+          {
+            "id": "short-structured",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0000000000000002,
+            "finite": true
+          },
+          {
+            "id": "near-climate",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0000000000000002,
+            "finite": true
+          },
+          {
+            "id": "near-database",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0,
+            "finite": true
+          },
+          {
+            "id": "near-software",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0,
+            "finite": true
+          },
+          {
+            "id": "near-science",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0000000000000002,
+            "finite": true
+          }
+        ]
+      },
+      "production_vs_fp32_reference": {
+        "rows": 8,
+        "all_identical": false,
+        "max_abs": 0.010754048824310303,
+        "min_cosine": 0.9991705295797525,
+        "per_row": [
+          {
+            "id": "short-fox",
+            "identical": false,
+            "max_abs": 0.005086034536361694,
+            "cosine": 0.9997585136666214,
+            "finite": true
+          },
+          {
+            "id": "short-boundary",
+            "identical": false,
+            "max_abs": 0.0007547782734036446,
+            "cosine": 0.9999823019342731,
+            "finite": true
+          },
+          {
+            "id": "short-multilingual",
+            "identical": false,
+            "max_abs": 0.0030914247035980225,
+            "cosine": 0.9998079049430626,
+            "finite": true
+          },
+          {
+            "id": "short-structured",
+            "identical": false,
+            "max_abs": 0.0045958757400512695,
+            "cosine": 0.9997382134339478,
+            "finite": true
+          },
+          {
+            "id": "near-climate",
+            "identical": false,
+            "max_abs": 0.004467606544494629,
+            "cosine": 0.9995869328575561,
+            "finite": true
+          },
+          {
+            "id": "near-database",
+            "identical": false,
+            "max_abs": 0.004737138748168945,
+            "cosine": 0.9998034925802601,
+            "finite": true
+          },
+          {
+            "id": "near-software",
+            "identical": false,
+            "max_abs": 0.007468670606613159,
+            "cosine": 0.9991705295797525,
+            "finite": true
+          },
+          {
+            "id": "near-science",
+            "identical": false,
+            "max_abs": 0.010754048824310303,
+            "cosine": 0.9991747854401263,
+            "finite": true
+          }
+        ]
+      }
+    },
+    "seq1024": {
+      "mf4_vs_single": {
+        "rows": 8,
+        "all_identical": true,
+        "max_abs": 0.0,
+        "min_cosine": 0.9999999999999998,
+        "per_row": [
+          {
+            "id": "short-fox",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 0.9999999999999999,
+            "finite": true
+          },
+          {
+            "id": "short-boundary",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0,
+            "finite": true
+          },
+          {
+            "id": "short-multilingual",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0,
+            "finite": true
+          },
+          {
+            "id": "short-structured",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0000000000000002,
+            "finite": true
+          },
+          {
+            "id": "near-climate",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0,
+            "finite": true
+          },
+          {
+            "id": "near-database",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0,
+            "finite": true
+          },
+          {
+            "id": "near-software",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 0.9999999999999998,
+            "finite": true
+          },
+          {
+            "id": "near-science",
+            "identical": true,
+            "max_abs": 0.0,
+            "cosine": 1.0,
+            "finite": true
+          }
+        ]
+      },
+      "single_vs_fp32_reference": {
+        "rows": 8,
+        "all_identical": false,
+        "max_abs": 0.00993761420249939,
+        "min_cosine": 0.9991220021244217,
+        "per_row": [
+          {
+            "id": "short-fox",
+            "identical": false,
+            "max_abs": 0.005086034536361694,
+            "cosine": 0.9997585136666214,
+            "finite": true
+          },
+          {
+            "id": "short-boundary",
+            "identical": false,
+            "max_abs": 0.0007547782734036446,
+            "cosine": 0.9999823019342731,
+            "finite": true
+          },
+          {
+            "id": "short-multilingual",
+            "identical": false,
+            "max_abs": 0.0030914247035980225,
+            "cosine": 0.9998079049430626,
+            "finite": true
+          },
+          {
+            "id": "short-structured",
+            "identical": false,
+            "max_abs": 0.0045958757400512695,
+            "cosine": 0.9997382134339478,
+            "finite": true
+          },
+          {
+            "id": "near-climate",
+            "identical": false,
+            "max_abs": 0.004856467247009277,
+            "cosine": 0.9997140870825378,
+            "finite": true
+          },
+          {
+            "id": "near-database",
+            "identical": false,
+            "max_abs": 0.008650451898574829,
+            "cosine": 0.9992129982157778,
+            "finite": true
+          },
+          {
+            "id": "near-software",
+            "identical": false,
+            "max_abs": 0.008746743202209473,
+            "cosine": 0.9991220021244217,
+            "finite": true
+          },
+          {
+            "id": "near-science",
+            "identical": false,
+            "max_abs": 0.00993761420249939,
+            "cosine": 0.9992452909051174,
+            "finite": true
+          }
+        ]
+      },
+      "mf4_vs_fp32_reference": {
+        "rows": 8,
+        "all_identical": false,
+        "max_abs": 0.00993761420249939,
+        "min_cosine": 0.9991220021244217,
+        "per_row": [
+          {
+            "id": "short-fox",
+            "identical": false,
+            "max_abs": 0.005086034536361694,
+            "cosine": 0.9997585136666214,
+            "finite": true
+          },
+          {
+            "id": "short-boundary",
+            "identical": false,
+            "max_abs": 0.0007547782734036446,
+            "cosine": 0.9999823019342731,
+            "finite": true
+          },
+          {
+            "id": "short-multilingual",
+            "identical": false,
+            "max_abs": 0.0030914247035980225,
+            "cosine": 0.9998079049430626,
+            "finite": true
+          },
+          {
+            "id": "short-structured",
+            "identical": false,
+            "max_abs": 0.0045958757400512695,
+            "cosine": 0.9997382134339478,
+            "finite": true
+          },
+          {
+            "id": "near-climate",
+            "identical": false,
+            "max_abs": 0.004856467247009277,
+            "cosine": 0.9997140870825378,
+            "finite": true
+          },
+          {
+            "id": "near-database",
+            "identical": false,
+            "max_abs": 0.008650451898574829,
+            "cosine": 0.9992129982157778,
+            "finite": true
+          },
+          {
+            "id": "near-software",
+            "identical": false,
+            "max_abs": 0.008746743202209473,
+            "cosine": 0.9991220021244217,
+            "finite": true
+          },
+          {
+            "id": "near-science",
+            "identical": false,
+            "max_abs": 0.00993761420249939,
+            "cosine": 0.9992452909051174,
+            "finite": true
+          }
+        ]
+      }
+    }
+  },
+  "load": {
+    "by_model": {
+      "prod-seq128:-": {
+        "cold_load_ms": [
+          2565.259667,
+          2523.4105,
+          2665.394791
+        ],
+        "cold_first_predict_ms": [
+          6.665917,
+          5.383959,
+          5.661291
+        ],
+        "warm_load_ms": [
+          41.468792,
+          40.097875,
+          38.023416,
+          39.815542,
+          39.009792,
+          42.60275,
+          42.008083,
+          39.045333,
+          43.818833,
+          42.206541,
+          46.169417,
+          38.5935,
+          38.397333,
+          40.0665,
+          40.18425
+        ],
+        "warm_load_median_ms": 40.097875
+      },
+      "prod-seq256:-": {
+        "cold_load_ms": [
+          3719.092083,
+          3661.492208,
+          3597.173166
+        ],
+        "cold_first_predict_ms": [
+          12.40625,
+          11.468625,
+          11.264959
+        ],
+        "warm_load_ms": [
+          50.494125,
+          43.230208,
+          43.08675,
+          43.146375,
+          43.280667,
+          55.057083,
+          44.183167,
+          47.508583,
+          43.006917,
+          46.199083,
+          42.513541,
+          40.604125,
+          47.566625,
+          46.146958,
+          43.966458
+        ],
+        "warm_load_median_ms": 43.966458
+      },
+      "prod-seq512:-": {
+        "cold_load_ms": [
+          3995.358333,
+          4031.956,
+          4008.096083
+        ],
+        "cold_first_predict_ms": [
+          30.569708,
+          28.798458,
+          27.894875
+        ],
+        "warm_load_ms": [
+          49.602708,
+          49.038541,
+          49.381542,
+          51.356166,
+          49.293791,
+          50.180459,
+          48.014166,
+          49.120083,
+          50.737958,
+          48.458708,
+          52.768417,
+          50.472042,
+          54.053625,
+          50.551958,
+          49.391583
+        ],
+        "warm_load_median_ms": 49.602708
+      },
+      "mf-128-256-512:seq128": {
+        "cold_load_ms": [
+          2646.600666,
+          2617.68,
+          2663.4735
+        ],
+        "cold_first_predict_ms": [
+          5.394583,
+          5.376417,
+          5.719708
+        ],
+        "warm_load_ms": [
+          86.121333,
+          88.663792,
+          81.083291,
+          84.987959,
+          83.835333,
+          85.824167,
+          81.769208,
+          88.8685,
+          91.026625,
+          88.412458,
+          88.939583,
+          85.449333,
+          85.940292,
+          85.137,
+          86.682041
+        ],
+        "warm_load_median_ms": 85.940292
+      },
+      "mf-128-256-512:seq256": {
+        "cold_load_ms": [
+          3701.095542,
+          3843.63375,
+          3745.480042
+        ],
+        "cold_first_predict_ms": [
+          11.101042,
+          11.089917,
+          11.268209
+        ],
+        "warm_load_ms": [
+          89.019125,
+          85.521334,
+          85.889125,
+          83.822459,
+          85.550417,
+          89.635083,
+          85.659875,
+          86.611208,
+          85.706,
+          94.859208,
+          84.744375,
+          90.997084,
+          88.515917,
+          87.6005,
+          88.335125
+        ],
+        "warm_load_median_ms": 86.611208
+      },
+      "mf-128-256-512:seq512": {
+        "cold_load_ms": [
+          4275.168209,
+          4226.433541,
+          6087.34875
+        ],
+        "cold_first_predict_ms": [
+          27.3725,
+          29.039625,
+          38.277417
+        ],
+        "warm_load_ms": [
+          88.731041,
+          83.542416,
+          87.5275,
+          85.702125,
+          84.506542,
+          91.266709,
+          91.782083,
+          93.54375,
+          92.153875,
+          91.7325,
+          167.954541,
+          157.452334,
+          158.969292,
+          164.206375,
+          207.800875
+        ],
+        "warm_load_median_ms": 91.782083
+      }
+    },
+    "load1_min": 7.81787109375,
+    "load1_max": 15.08203125
+  },
+  "latency": {
+    "load_ms": {
+      "mf-128-256-512-1024:seq1024": 137.772292,
+      "mf-128-256-512:seq128": 72.760834,
+      "mf-128-256-512:seq256": 67.809625,
+      "mf-128-256-512:seq512": 70.326625,
+      "prod-seq128": 56.936125,
+      "prod-seq256": 28.585041,
+      "prod-seq512": 35.897625,
+      "single-seq1024": 79.977334
+    },
+    "labels": {
+      "mf-128-256-512-1024:seq1024": {
+        "runs": 30,
+        "rows_per_run": 8,
+        "median_ms": 586.973625,
+        "quiet_runs": 30,
+        "quiet_median_ms": 586.973625,
+        "p10_ms": 586.655708,
+        "p90_ms": 699.818708,
+        "min_ms": 586.043667,
+        "max_ms": 707.656208,
+        "max_load1_seen": 7.6923828125,
+        "waited_s": 0.074053957
+      },
+      "mf-128-256-512:seq128": {
+        "runs": 30,
+        "rows_per_run": 8,
+        "median_ms": 28.1133955,
+        "quiet_runs": 30,
+        "quiet_median_ms": 28.1133955,
+        "p10_ms": 27.664542,
+        "p90_ms": 31.289666,
+        "min_ms": 27.521791,
+        "max_ms": 32.198208,
+        "max_load1_seen": 7.6923828125,
+        "waited_s": 0.070857378
+      },
+      "mf-128-256-512:seq256": {
+        "runs": 30,
+        "rows_per_run": 8,
+        "median_ms": 72.29443749999999,
+        "quiet_runs": 30,
+        "quiet_median_ms": 72.29443749999999,
+        "p10_ms": 72.101167,
+        "p90_ms": 85.276666,
+        "min_ms": 71.721959,
+        "max_ms": 85.962459,
+        "max_load1_seen": 7.6923828125,
+        "waited_s": 0.069321791
+      },
+      "mf-128-256-512:seq512": {
+        "runs": 30,
+        "rows_per_run": 8,
+        "median_ms": 203.207354,
+        "quiet_runs": 30,
+        "quiet_median_ms": 203.207354,
+        "p10_ms": 202.879708,
+        "p90_ms": 242.222167,
+        "min_ms": 202.54825,
+        "max_ms": 260.857042,
+        "max_load1_seen": 7.6923828125,
+        "waited_s": 0.071664664
+      },
+      "prod-seq128": {
+        "runs": 30,
+        "rows_per_run": 8,
+        "median_ms": 28.1061875,
+        "quiet_runs": 30,
+        "quiet_median_ms": 28.1061875,
+        "p10_ms": 27.686,
+        "p90_ms": 30.960584,
+        "min_ms": 27.592958,
+        "max_ms": 32.2045,
+        "max_load1_seen": 7.6923828125,
+        "waited_s": 0.070198419
+      },
+      "prod-seq256": {
+        "runs": 30,
+        "rows_per_run": 8,
+        "median_ms": 72.3666875,
+        "quiet_runs": 30,
+        "quiet_median_ms": 72.3666875,
+        "p10_ms": 72.04325,
+        "p90_ms": 84.619916,
+        "min_ms": 71.966,
+        "max_ms": 85.385,
+        "max_load1_seen": 7.6923828125,
+        "waited_s": 0.070611791
+      },
+      "prod-seq512": {
+        "runs": 30,
+        "rows_per_run": 8,
+        "median_ms": 202.94045799999998,
+        "quiet_runs": 30,
+        "quiet_median_ms": 202.94045799999998,
+        "p10_ms": 202.61175,
+        "p90_ms": 248.371875,
+        "min_ms": 202.219042,
+        "max_ms": 255.087959,
+        "max_load1_seen": 7.6923828125,
+        "waited_s": 0.072010169
+      },
+      "single-seq1024": {
+        "runs": 30,
+        "rows_per_run": 8,
+        "median_ms": 586.329375,
+        "quiet_runs": 30,
+        "quiet_median_ms": 586.329375,
+        "p10_ms": 586.11525,
+        "p90_ms": 668.175792,
+        "min_ms": 585.017583,
+        "max_ms": 729.273042,
+        "max_load1_seen": 7.6923828125,
+        "waited_s": 0.07245433
+      }
+    }
+  },
+  "memory": {
+    "multi-function-3-functions": {
+      "samples": 6,
+      "footprint_after_load_median_bytes": 52085456.0,
+      "footprint_after_predict_median_bytes": 54412176.0,
+      "resident_after_predict_median_bytes": 66723840.0,
+      "load_all_three_warm_median_ms": 325.14102149999997,
+      "wired_delta_while_loaded_bytes": [
+        -137134080,
+        808632320,
+        384548864,
+        749404160,
+        136019968,
+        4803772416
+      ]
+    },
+    "production-3-packages": {
+      "samples": 6,
+      "footprint_after_load_median_bytes": 40182480.0,
+      "footprint_after_predict_median_bytes": 42492792.0,
+      "resident_after_predict_median_bytes": 54763520.0,
+      "load_all_three_warm_median_ms": 159.8508545,
+      "wired_delta_while_loaded_bytes": [
+        7303823360,
+        3576135680,
+        1200635904,
+        990003200,
+        485998592,
+        -5001183232
+      ]
+    }
+  }
+}
