@@ -34,7 +34,7 @@ BINDING_COMMIT = "ec54af9501d4bfd0cf3a4b162e59022dee2118cb"
 PROBE_MAIN_SHA256 = "6fb9f3e6666501d3d721c538d13634ea48e38dd4c7baa80d07ea41e975118a1a"
 CARGO_TOML_SHA256 = "fb8879f32857ef99f7945a0ba728d9cd711d1455f513d7347a1a4a51ed7ddd47"
 CARGO_LOCK_SHA256 = "c1d21e074012193f57b8c5bde32e36d564fa77bd79ebb15080ac6e062086b89d"
-PROTECTED_RUST_SHA256 = "919afda47a643e3b49cc421c74325b01b4b6b213b08b37405663e1bd0b79dd0d"
+PROTECTED_RUST_SHA256 = "d81eb1285e8a197b5c6429cd4a650bd1d96a3e23e87fc0869d630dd28b4087a8"
 EXPECTED_ANE_DEPENDENCY = (
     'ane = { path = "../../../../../../OSS/siliconswarm-at-ensue-plugin/ane_kernel/crates/ane" }'
 )
@@ -294,6 +294,10 @@ def protected_rust_digest(path: Path) -> str:
         (r"^fn softmax_cpu\b", "softmax_cpu"),
         (r"^fn attention_cpu\b", "attention_cpu"),
         (r"^fn cpu_reference\b", "cpu_reference"),
+        # cpu_reference is a thin wrapper that calls cpu_reference_diagnostic,
+        # which holds the fp32 CPU encoder every ANE vector is scored against.
+        # Pinning only the wrapper would leave that encoder free to change.
+        (r"^fn cpu_reference_diagnostic\b", "cpu_reference_diagnostic"),
         (r"^fn cosine\b", "cosine"),
         (r"^fn max_abs\b", "max_abs"),
         (r"^fn byte_identical\b", "byte_identical"),
@@ -644,7 +648,8 @@ def validate_report(
     payload: Mapping[str, Any], sequence: int, expected_rows: Sequence[Tuple[str, int]]
 ) -> Dict[str, Any]:
     expected_top = {
-        "model", "sequence_length", "layers_per_executable", "pooling", "cpu_reference",
+        "model", "sequence_length", "layers_per_executable",
+        "compiled_layers_per_executable", "pooling", "cpu_reference",
         "row_set_sha256", "rows", "min_cosine", "mean_cosine", "deterministic",
         "gate_min_cosine", "gate_passed", "first_divergence", "checkpoint_metrics",
         "one_minute_load_average", "timing_note", "vectors",

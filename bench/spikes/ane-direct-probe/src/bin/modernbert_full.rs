@@ -130,7 +130,12 @@ struct RowMetric {
 struct Report {
     model: ModelIdentity,
     sequence_length: usize,
+    /// The grouping the caller asked for on the command line.
     layers_per_executable: usize,
+    /// The grouping actually compiled. `compile_model` may override the
+    /// request for a shape (it fuses two layers at sequence 512), so a reader
+    /// of this report must not take the requested value as what ran.
+    compiled_layers_per_executable: usize,
     pooling: &'static str,
     cpu_reference: &'static str,
     row_set_sha256: String,
@@ -698,8 +703,11 @@ fn compile_model(
     // layers per executable compile but crash at runtime, so two is the cap.
     // Longer sequences keep the caller's grouping, so a sequence-512 gain
     // cannot come from moving work into the longer shapes. The report's
-    // `layers_per_executable` still echoes the command-line value, while the
-    // checkpoint labels follow the grouping actually compiled.
+    // `layers_per_executable` echoes the command-line request, because
+    // bench/campaign/ane-direct-embed-harness.sh always asks for one layer and
+    // rejects a report whose request differs, so a candidate cannot change what
+    // was asked for. `compiled_layers_per_executable` and the checkpoint labels
+    // follow the grouping actually compiled.
     let layers_per_executable = if sequence_length == 512 {
         2
     } else {
@@ -1356,6 +1364,7 @@ fn main() -> Result<()> {
         model: identity,
         sequence_length: cli.sequence_length,
         layers_per_executable: cli.layers_per_executable,
+        compiled_layers_per_executable: config.num_hidden_layers.div_ceil(model.chunks.len()),
         pooling: "first token (CLS), then L2 normalize; the model card defines embedding pooling, while config classifier_pooling=mean is classifier-head metadata",
         cpu_reference: "fp32, exact erf GELU, full permitted attention",
         row_set_sha256: sha256_bytes(&rows_bytes),

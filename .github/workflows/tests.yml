@@ -169,6 +169,15 @@ jobs:
         working-directory: synapse
         run: bash scripts/public-banlist-check.sh
 
+      # The ANE campaign harness pins the probe's comparator, gate and row set by
+      # digest, and refuses every candidate when they drift. A spike merge once
+      # changed that code without re-pinning and nothing noticed until a later
+      # measurement run. The self-test needs only Python and the tracked files.
+      - name: ANE campaign harness self-test
+        if: matrix.name == 'linux'
+        working-directory: synapse
+        run: bash bench/campaign/ane-direct-embed-harness.sh --self-test .
+
       - name: fmt
         working-directory: synapse
         shell: bash
