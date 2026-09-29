@@ -1216,3 +1216,48 @@ original exact-erf CPU default was preserved. Both checks used the same row-set
 hash, an unset `TMPDIR`, and an empty read-only campaign rig claim before
 execution. Diagnostic ANE measurements also waited on that claim before each
 pair. Layer-capture I/O is not included in the earlier latency claims.
+
+### Exploratory system ranking: failed fidelity gate retained
+
+The explicitly authorized arm is **gte-reranker-modernbert, ANE fp16 (direct API, FAILED fidelity gate: exploratory)**. This measures the **ANE system as built**, not a faithful reproduction of the reference model. The maximum sigmoid-score error remains **0.01037967 against a 0.005 limit**; the failed fidelity gate and diagnosis above stand unchanged. These exploratory ranking results do not reverse or relax that failure. Earlier stop statements describe the pre-authorization runs; this later experiment is separate.
+
+All **7,343 pairs (3,613 AFT / 3,730 MC)** were scored with the unchanged fp16/tanh graph, original pair tokens and no truncation. Exact score ties retain baseline order; MC head-15 reranks only baseline positions 1–15. All 85/92 queries, including four empty pools, remain in fixed-reference metrics. No new sol judgments were requested. The existing metric/bootstrap script was reused, and every existing arm’s metrics remained exactly unchanged.
+
+Each metric cell is **sol A / sol B / mean(A,B)**, using the two saved full-pool judge rankings. These are descriptive exploratory point estimates, not equivalence or superiority claims.
+
+| Tool / arm | overlap@10 A / B / mean | RBO A / B / mean | P@10 A / B / mean |
+| --- | --- | --- | --- |
+| AFT / gte-reranker-modernbert, ANE fp16 (direct API, FAILED fidelity gate: exploratory) | 0.7635 / 0.7300 / 0.7468 | 0.5104 / 0.5039 / 0.5071 | 0.2941 / 0.2824 / 0.2882 |
+| MC / gte-reranker-modernbert, ANE fp16 (direct API, FAILED fidelity gate: exploratory) | 0.5723 / 0.5608 / 0.5666 | 0.4834 / 0.4801 / 0.4817 | 0.1511 / 0.1435 / 0.1473 |
+| MC / gte-reranker-modernbert, ANE fp16 (direct API, FAILED fidelity gate: exploratory), head 15 | 0.5323 / 0.5260 / 0.5292 | 0.4648 / 0.4621 / 0.4635 | 0.1272 / 0.1217 / 0.1245 |
+
+Compared with Synapse’s production `rerank.score` on Metal, the exploratory system’s mean overlap@10 is **0.7468 versus production Metal’s 0.7480 on AFT**, and **0.5666 versus 0.5666 on MC**; both MC head-15 means round to **0.5292**. Matching rounded metrics does not imply identical rankings or establish equivalence.
+
+Paired deltas versus baseline use the unchanged 10,000 query resamples, seed 2609. Cells are **A; B**, mean delta [95% interval]; these intervals do not account for systematic judge error or multiplicity.
+
+| Tool / arm | Δoverlap@10 A; B | ΔRBO A; B | ΔP@10 A; B |
+| --- | --- | --- | --- |
+| AFT / gte-reranker-modernbert, ANE fp16 (direct API, FAILED fidelity gate: exploratory) | 0.1257 [0.0714, 0.1859]; 0.0906 [0.0387, 0.1450] | 0.0678 [0.0414, 0.0958]; 0.0591 [0.0323, 0.0859] | 0.0647 [0.0376, 0.0941]; 0.0518 [0.0235, 0.0812] |
+| MC / gte-reranker-modernbert, ANE fp16 (direct API, FAILED fidelity gate: exploratory) | 0.0607 [0.0105, 0.1116]; 0.0442 [-0.0114, 0.0987] | 0.0603 [0.0366, 0.0855]; 0.0611 [0.0387, 0.0865] | 0.0359 [0.0141, 0.0620]; 0.0293 [0.0098, 0.0511] |
+| MC / gte-reranker-modernbert, ANE fp16 (direct API, FAILED fidelity gate: exploratory), head 15 | 0.0208 [-0.0011, 0.0449]; 0.0093 [-0.0254, 0.0406] | 0.0418 [0.0247, 0.0597]; 0.0432 [0.0268, 0.0610] | 0.0120 [0.0043, 0.0207]; 0.0076 [-0.0011, 0.0174] |
+
+Known luna grade-2 query counts (**new / lost / zero→some / some→zero**) are AFT / **gte-reranker-modernbert, ANE fp16 (direct API, FAILED fidelity gate: exploratory)**: **25 / 4 / 6 / 0**; MC / **gte-reranker-modernbert, ANE fp16 (direct API, FAILED fidelity gate: exploratory)**: **22 / 4 / 7 / 0**; MC / **gte-reranker-modernbert, ANE fp16 (direct API, FAILED fidelity gate: exploratory), head 15**: **11 / 2 / 4 / 0**. These count queries with known grade-2 items entering/leaving the baseline top 10, including transitions between zero and some such items. Existing labels are reused; unknown grades are not treated as irrelevant. Private leader-gap recomputation includes the arm only under its full **FAILED fidelity gate: exploratory** name; the earlier published non-exploratory leader-gap tables are not revised.
+
+**Agreement with production Metal, independent of sol.** Kendall τ is over final baseline-tie-broken total orders (τ-a equals τ-b here), undefined for fewer than two candidates. Top-10 set overlap is intersection/min(10, candidate count), undefined for empty pools. Small pools can therefore have overlap 1 despite changed ordering. The MC head-15 comparison uses the Metal head-15 variant. Full per-query values, candidate counts and discordant-pair counts are in [the anonymous per-query CSV](gte-ane-metal-rank-agreement.csv); ordinals follow each frozen corpus’s saved query order.
+
+| Tool / arm | Mean Kendall τ (eligible queries) | Mean top-10 overlap (nonempty queries) | Identical top-10 sets |
+| --- | ---: | ---: | ---: |
+| AFT / gte-reranker-modernbert, ANE fp16 (direct API, FAILED fidelity gate: exploratory) | 0.991377 (79) | 0.996386 (83) | 80/83 |
+| MC / gte-reranker-modernbert, ANE fp16 (direct API, FAILED fidelity gate: exploratory) | 0.991241 (85) | 0.988889 (90) | 80/90 |
+| MC / gte-reranker-modernbert, ANE fp16 (direct API, FAILED fidelity gate: exploratory), head 15 | 0.999097 (85) | 0.996667 (90) | 87/90 |
+
+**Ambient timing, not isolated or directly comparable to production batch latency.** The first all-width-resident attempt failed program loading with “no ANE resources”; its 88 partial scores are retained separately and excluded. The successful run grouped pairs by width, retaining one unchanged encoder process at a time, checking the database reservation for another ANE campaign before every query/width group, waiting while held, and compiling each width once. This changes scheduling, not graph arithmetic or ranking tie policy. The scoring totals below exclude compilation, model loading and JSON I/O; encoder includes embedding gather/surface transfers, CPU head includes pooling.
+
+| Tool / arm | Encoder median / p95 | CPU head median / p95 | Total median / p95 |
+| --- | ---: | ---: | ---: |
+| AFT / gte-reranker-modernbert, ANE fp16 (direct API, FAILED fidelity gate: exploratory) | 4.797 / 10.883 ms | 0.304 / 0.395 ms | 5.117 / 11.206 ms |
+| MC / gte-reranker-modernbert, ANE fp16 (direct API, FAILED fidelity gate: exploratory) | 6.114 / 8.821 ms | 0.310 / 0.398 ms | 6.432 / 9.141 ms |
+
+Full-encoder **compile seconds by width**: **64: 5.135**; **128: 5.087**; **192: 10.216**; **256: 9.492**; **320: 26.089**; **384: 11.176**; **448: 9.882**; **512: 13.678**; **576: 12.267**; **640: 8.878**; **704: 9.858**. Per-pair encoder/head/total and all compile measurements are retained in private JSONL/JSON records, not published here. Longest pair remains **694 tokens**; all 11 widths were exercised. `TMPDIR` was unset.
+
+There were **502** read-only rig checks, **0** observing a held claim (the driver waits 30 seconds and rechecks when held). Observed 1/5/15-minute load-average ranges were **13.52–21.33** / **12.80–15.12** / **13.26–14.13**. This remains a spike path, not a served lane.
