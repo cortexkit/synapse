@@ -413,3 +413,189 @@ MC, 92 queries:
 All raw queries, candidate text, session identifiers, project paths, scores, and
 labels remain in private evaluation artifacts and the authorized judge channel.
 This public report contains methodology, provenance, counts, and aggregate results only.
+
+## Follow-up: cross-size rerankers and MC head-15 variants
+
+This follow-up uses the same frozen text, candidate identities, query populations,
+official weight revisions, instruction lines, and llama.cpp pin as the original
+run. No retrieval was rerun and no serving code changed. The new full-pool arms
+are **0.6B on MC** and **8B on AFT**. Both MC head-15 variants are included:
+they rerank only baseline positions 1–15, leave positions 16–50 in baseline
+order, and display the first 10. They reuse full-pool scores; exact ties retain
+baseline order. Small and empty sets are retained.
+
+**Takeaways on the expanded common denominator:**
+
+- **MC 0.6B retains a substantial lift:** nDCG@10 rises from 0.4244 to 0.5669,
+  a gain of 0.1425 [0.0974, 0.1893], versus 0.5953 for the full-pool 8B.
+- **MC 0.6B head-15 trades relevance for cost:** nDCG@10 is 0.5229, a gain
+  of 0.0986 [0.0657, 0.1336]. Its serial cost estimate is about 0.40 seconds
+  per 15 candidates, versus 1.34 seconds per 50 for the same new scoring run.
+- **AFT 8B adds little to the 0.6B point estimate:** nDCG@10 is 0.8338
+  versus 0.8273, while strict P@10 is slightly lower (0.2118 versus 0.2165).
+  These baseline-relative intervals do not establish an 8B-versus-0.6B win.
+- **Judge uncertainty remains material:** 13/60 repeated new labels moved
+  (21.7%). The reported bootstrap intervals hold those labels fixed.
+
+### Reproduction before new scoring
+
+All six original nDCG@10 results were recomputed from primary v2 labels and
+saved orders, matching the original report to four decimals. The other three
+metrics and all reported paired bootstrap intervals for AFT, MC, and MC
+full-50 also reproduced to four decimals. Recovered bootstrap details are
+Python `random.Random(2609)`, 10,000 resamples using `randrange(n)`, reset per
+population, and linear percentile endpoints; each population shares resamples
+across arms and metrics.
+
+| Population | Baseline | plumb-4b | Original Qwen arm |
+|---|---:|---:|---:|
+| AFT | 0.6405 | 0.7593 | 0.8309 (0.6B) |
+| MC | 0.4338 | 0.4974 | 0.6105 (8B) |
+
+Both original instructed GGUFs were rebuilt from the pinned official weights.
+Their SHA-256 hashes exactly matched `61e3a461…` (0.6B/code) and
+`a38d0365…` (8B/history), including the full hashes recorded above.
+Re-scoring the first five retained query sets per tool produced **bit-identical
+numeric scores**: AFT 166 pairs and MC 250 pairs, maximum absolute error **0**
+for each. These are exact reproduction results, not merely tolerance passes.
+
+### New conversions and fidelity gates
+
+The new files are F16, with only the tool-specific rerank instruction changed
+by the pinned official metadata utility. The 8B/code file reuses the freshly
+rebuilt, hash-verified 8B/history tensors. References used FP32 MPS, PyTorch
+2.11.0, Transformers 4.57.6, and Python 3.14.2. The amended gate remained
+maximum absolute error ≤0.005 and no pairwise order violation outside a
+reference gap strictly below 0.005. Neither new gate required an amendment.
+
+| New arm | Real pairs / queries | Inside-band pairs / 190 | Order disagreements | Outside-band violations | Max absolute error | Result |
+|---|---:|---:|---:|---:|---:|---|
+| MC / 0.6B | 20 / 5 | 6 | 0 | 0 | 0.0041511059 | pass |
+| AFT / 8B | 20 / 6 | 6 | 0 | 0 | 0.0006102622 | pass |
+
+The MC gate retained the previous 20 real MC pairs. The AFT gate selected the
+first 20 pairs from the final frozen AFT corpus, taking up to four candidates
+per query in saved order, without consulting grades. Every gate and scoring
+input was checked against the corpus text and SHA-256 digests. Both gates
+passed before their respective full scoring runs.
+
+| New GGUF | SHA-256 |
+|---|---|
+| Qwen 0.6B F16, history instruction | `0de02616633bb00fa2b6782dcf000c3f2b1a70906280c7945cbc4ba04b9dc349` |
+| Qwen 8B F16, code instruction | `d774e75121988287b21524944c79e9943a13920680ce9b82ff22e41ca243d410` |
+
+### Shared expanded-union metrics
+
+**All rows below, including old arms, use the same expanded judged union per
+query.** Additional judged items can increase ideal DCG, so old-arm nDCG
+values here may be lower than the original table even though their ranking
+and labels did not change. Precision and MRR retain their original values.
+Do not compare a new arm here to an old-arm nDCG denominator from above.
+The union is still not an exhaustive full-pool relevance audit.
+
+| Population | Arm | nDCG@10 | P@10 ≥1 | P@10 =2 | MRR@10 =2 |
+|---|---|---:|---:|---:|---:|
+| AFT, n=85 | baseline | 0.6367 | 0.3800 | 0.1682 | 0.6410 |
+| AFT, n=85 | plumb-4b | 0.7554 | 0.5035 | 0.2000 | 0.6782 |
+| AFT, n=85 | Qwen3-Reranker-0.6B, full pool | 0.8273 | 0.5447 | 0.2165 | 0.7651 |
+| AFT, n=85 | Qwen3-Reranker-8B, full pool | 0.8338 | 0.5435 | 0.2118 | 0.7735 |
+| MC, n=92 | baseline | 0.4244 | 0.3109 | 0.0793 | 0.3594 |
+| MC, n=92 | plumb-4b | 0.4852 | 0.3293 | 0.1076 | 0.4395 |
+| MC, n=92 | Qwen3-Reranker-8B, full pool | 0.5953 | 0.3978 | 0.1109 | 0.5091 |
+| MC, n=92 | Qwen3-Reranker-0.6B, full pool | 0.5669 | 0.3870 | 0.1098 | 0.5216 |
+| MC, n=92 | Qwen3-Reranker-0.6B, head 15 | 0.5229 | 0.3489 | 0.0902 | 0.5149 |
+| MC, n=92 | Qwen3-Reranker-8B, head 15 | 0.5342 | 0.3641 | 0.0946 | 0.4841 |
+| MC full-50, n=74 | baseline | 0.4988 | 0.3824 | 0.0973 | 0.4333 |
+| MC full-50, n=74 | plumb-4b | 0.5695 | 0.4054 | 0.1324 | 0.5329 |
+| MC full-50, n=74 | Qwen3-Reranker-8B, full pool | 0.6995 | 0.4905 | 0.1365 | 0.6194 |
+| MC full-50, n=74 | Qwen3-Reranker-0.6B, full pool | 0.6642 | 0.4770 | 0.1351 | 0.6349 |
+| MC full-50, n=74 | Qwen3-Reranker-0.6B, head 15 | 0.6096 | 0.4297 | 0.1108 | 0.6267 |
+| MC full-50, n=74 | Qwen3-Reranker-8B, head 15 | 0.6236 | 0.4486 | 0.1162 | 0.5883 |
+
+### Paired deltas versus baseline
+
+These use the reproduced seed and percentile bootstrap method above, holding
+all v2 and v3 labels fixed. Intervals omit judge uncertainty, within-project
+dependence, and multiple-comparison adjustment. Baseline deltas are zero.
+
+| Population / arm | ΔnDCG@10 | ΔP@10 ≥1 | ΔP@10 =2 | ΔMRR@10 =2 |
+|---|---|---|---|---|
+| AFT, n=85 / plumb-4b | 0.1187 [0.0628, 0.1750] | 0.1235 [0.0788, 0.1682] | 0.0318 [0.0118, 0.0529] | 0.0372 [-0.0322, 0.1100] |
+| AFT, n=85 / Qwen3-Reranker-0.6B, full pool | 0.1906 [0.1394, 0.2433] | 0.1647 [0.1224, 0.2071] | 0.0482 [0.0282, 0.0694] | 0.1241 [0.0602, 0.1947] |
+| AFT, n=85 / Qwen3-Reranker-8B, full pool | 0.1971 [0.1483, 0.2489] | 0.1635 [0.1235, 0.2047] | 0.0435 [0.0247, 0.0647] | 0.1325 [0.0692, 0.2008] |
+| MC, n=92 / plumb-4b | 0.0609 [0.0143, 0.1109] | 0.0185 [-0.0163, 0.0544] | 0.0283 [0.0109, 0.0500] | 0.0801 [0.0124, 0.1489] |
+| MC, n=92 / Qwen3-Reranker-8B, full pool | 0.1709 [0.1255, 0.2212] | 0.0870 [0.0576, 0.1196] | 0.0315 [0.0163, 0.0489] | 0.1497 [0.0861, 0.2170] |
+| MC, n=92 / Qwen3-Reranker-0.6B, full pool | 0.1425 [0.0974, 0.1893] | 0.0761 [0.0402, 0.1130] | 0.0304 [0.0152, 0.0500] | 0.1622 [0.1039, 0.2250] |
+| MC, n=92 / Qwen3-Reranker-0.6B, head 15 | 0.0986 [0.0657, 0.1336] | 0.0380 [0.0185, 0.0587] | 0.0109 [0.0033, 0.0207] | 0.1555 [0.0980, 0.2173] |
+| MC, n=92 / Qwen3-Reranker-8B, head 15 | 0.1099 [0.0769, 0.1445] | 0.0533 [0.0348, 0.0728] | 0.0152 [0.0076, 0.0239] | 0.1247 [0.0673, 0.1868] |
+| MC full-50, n=74 / plumb-4b | 0.0707 [0.0127, 0.1307] | 0.0230 [-0.0203, 0.0676] | 0.0351 [0.0135, 0.0608] | 0.0996 [0.0168, 0.1834] |
+| MC full-50, n=74 / Qwen3-Reranker-8B, full pool | 0.2007 [0.1476, 0.2588] | 0.1081 [0.0730, 0.1459] | 0.0392 [0.0216, 0.0608] | 0.1861 [0.1090, 0.2685] |
+| MC full-50, n=74 / Qwen3-Reranker-0.6B, full pool | 0.1654 [0.1121, 0.2216] | 0.0946 [0.0514, 0.1405] | 0.0378 [0.0189, 0.0608] | 0.2016 [0.1310, 0.2772] |
+| MC full-50, n=74 / Qwen3-Reranker-0.6B, head 15 | 0.1108 [0.0737, 0.1514] | 0.0473 [0.0230, 0.0743] | 0.0135 [0.0027, 0.0257] | 0.1934 [0.1256, 0.2687] |
+| MC full-50, n=74 / Qwen3-Reranker-8B, head 15 | 0.1248 [0.0881, 0.1632] | 0.0662 [0.0432, 0.0892] | 0.0189 [0.0095, 0.0297] | 0.1550 [0.0849, 0.2322] |
+
+### Newly displayed and lost grade-2 items
+
+As in the original report, these are **query counts**, not total item counts:
+new/lost means at least one such membership change, and both can occur for
+one query. Zero/some columns count changes in having any grade-2 top-10 item.
+
+| Population / arm | New item | Lost item | Zero → some | Some → zero |
+|---|---:|---:|---:|---:|
+| AFT, n=85 / plumb-4b | 26 | 13 | 5 | 3 |
+| AFT, n=85 / Qwen3-Reranker-0.6B, full pool | 27 | 6 | 6 | 1 |
+| AFT, n=85 / Qwen3-Reranker-8B, full pool | 25 | 6 | 5 | 2 |
+| MC, n=92 / plumb-4b | 23 | 9 | 8 | 1 |
+| MC, n=92 / Qwen3-Reranker-8B, full pool | 24 | 4 | 8 | 0 |
+| MC, n=92 / Qwen3-Reranker-0.6B, full pool | 22 | 5 | 7 | 0 |
+| MC, n=92 / Qwen3-Reranker-0.6B, head 15 | 12 | 4 | 5 | 0 |
+| MC, n=92 / Qwen3-Reranker-8B, head 15 | 12 | 0 | 5 | 0 |
+
+MC full-50 has the same membership-change counts as MC overall; small sets
+cannot change top-10 membership.
+
+### New-only judging and permutation control
+
+Only **418 previously unlabelled candidates** were judged: 129 AFT and
+289 MC, in **140 new primary batches** (66 AFT, 74 MC).
+No v2 label was replaced or re-judged. New identities were sorted per query,
+split into batches of at most eight, and assigned short opaque IDs from that
+canonical order. Every call used the unchanged judge prompt and original
+one-line scope, `openai/gpt-6-luna`, variant `low`, temperature 0, output cap
+512, no tools, and a fresh `synapse-judge-rerank2609-v3-` session.
+The producing model was verified through `session.read` origin; variant and
+temperature were independently verified through digest-checked own-session
+`RunStarted.config` records matching each admitted run ID.
+
+**New items were labelled in batches containing only other new items, so their
+batch context differs from v2.** The permutation rate on v3 batches is the
+check on that sensitivity, not proof that mixed v2/v3 batch contexts are
+equivalent or that judge bias is absent.
+
+With seed 2609, **14 batches** (ceil of 10% of new primary batches) were
+selected among batches with at least two items. Every repeated order genuinely
+changed; IDs, text, prompt, and generation configuration stayed fixed.
+**13/60 labels moved (21.7%)**, across
+**6/14 repeated batches**. The primary labels, not repeats,
+were used for the metric tables.
+
+### Ambient latency and head-15 scale
+
+Shared-Mac sequential per-candidate observations include request overhead and
+exclude model load. No exclusive reservation was made. The ×50 and ×15
+columns are serial scale estimates from mean candidate latency, **not measured
+batch-endpoint or production head-15 latency**. Head-only variants reused
+full-pool scores and were not separately timed.
+
+| Tool / model | Candidates | Mean ms / candidate | Median ms | p95 ms | Mean ×50, seconds | Mean ×15, seconds |
+|---|---:|---:|---:|---:|---:|---:|
+| AFT / 8B (new) | 3,613 | 138.0 | 117.9 | 189.8 | 6.90 | 2.07 |
+| MC / 0.6B (new) | 3,730 | 26.9 | 21.4 | 58.3 | 1.34 | 0.40 |
+| MC / 8B (original) | 3,730 | 262.3 | 271.1 | 342.8 | 13.11 | 3.93 |
+
+Different execution periods, prompt lengths, and cache behavior prevent a
+controlled speed comparison. Reranking 15 limits which evidence can enter the
+display, not just inference cost. These are relevance and ambient-cost results,
+not measurements of agent task completion. All scripts, raw outputs, frozen
+inputs, and judge evidence for this follow-up are retained in private evaluation
+storage; this report contains only aggregate results and model provenance.
