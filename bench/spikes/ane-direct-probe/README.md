@@ -38,3 +38,35 @@ are byte-identical.
 `rows.jsonl` contains four short real-text rows and four repeated-prose rows near
 each of the 512, 1024, and 2048 shape limits. Its SHA-256 is
 `f4889a38df77b9940ce973c4d9b82857d0c401987ae8e77b5ca25e6062808c39`.
+
+## Direct-ANE sequence-classification spike
+
+`modernbert_rerank` reuses the ModernBERT encoder graph builders for
+`Alibaba-NLP/gte-reranker-modernbert-base`. It loads the checkpoint's `model.*`
+encoder weights and performs masked mean pooling, dense, exact-erf GELU, layer
+norm, and classifier (including classifier bias) on CPU in fp32. It is a spike,
+not a served lane. The retained 20-pair evaluation **failed** the required
+sigmoid-score fidelity gate; do not use this binary's scores as an accepted
+benchmark arm. See the Neural Engine follow-up in
+`docs/evidence/rerank-eval-2026-09/README.md`.
+
+```sh
+env -u TMPDIR cargo run --release --bin modernbert_rerank -- "$MODEL_SNAPSHOT" < pairs.jsonl
+```
+
+Input is one JSON object per line with `id` and `input_ids`: use Hugging Face
+`tokenizer(query, document, truncation=False, padding=False)` including special
+tokens. Every supplied position is attended; the binary adds masked padding to
+the smallest multiple of 64 and rejects empty or over-limit inputs. It caches
+one encoder bundle per width for the process lifetime. Output starts with a
+`ready` model-identity record, followed by one JSON result per pair containing a
+raw logit, token count, shape, encoder/CPU-head/total milliseconds, and compile
+milliseconds only on a shape's first use. Encoder time includes CPU embedding
+gather and IOSurface transfers; total excludes compilation, JSON I/O and model
+loading. Pooling is included in CPU-head time. Optional `reference_pool` input
+and returned `reference_head_logit` isolate head arithmetic from encoder error;
+returned `pooled` values support private fidelity diagnosis.
+
+The caller must check the read-only `campaign_rig_claim` table before inference
+and between queries, waiting until no campaign holds the Neural Engine. All
+reported timing is ambient wall time, not isolated device execution time.

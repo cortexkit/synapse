@@ -15,6 +15,9 @@ use safetensors::{Dtype, SafeTensors};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+#[path = "../reranker.rs"]
+pub mod reranker;
+
 const MODEL_ID: &str = "Alibaba-NLP/gte-modernbert-base";
 const GATE: f32 = 0.999;
 const MASK_MIN: f32 = -10_000.0;
@@ -319,11 +322,16 @@ fn load_model(snapshot: &Path) -> Result<(Config, Weights, ModelIdentity)> {
     let bytes =
         fs::read(&weights_path).with_context(|| format!("read {}", weights_path.display()))?;
     let st = SafeTensors::deserialize(&bytes).context("parse model.safetensors")?;
+    let prefix = if st.tensor("model.embeddings.norm.weight").is_ok() {
+        "model."
+    } else {
+        ""
+    };
     let hidden = config.hidden_size;
     let intermediate = config.intermediate_size;
     let mut layers = Vec::with_capacity(config.num_hidden_layers);
     for index in 0..config.num_hidden_layers {
-        let prefix = format!("layers.{index}");
+        let prefix = format!("{prefix}layers.{index}");
         layers.push(LayerWeights {
             qkv: load_linear(&st, &format!("{prefix}.attn.Wqkv"), hidden * 3, hidden)?,
             attention_output: load_linear(&st, &format!("{prefix}.attn.Wo"), hidden, hidden)?,
@@ -342,13 +350,22 @@ fn load_model(snapshot: &Path) -> Result<(Config, Weights, ModelIdentity)> {
         });
     }
     let weights = Weights {
-        embeddings: load_linear(&st, "embeddings.tok_embeddings", config.vocab_size, hidden)?,
-        embedding_norm: load_vector(&st, "embeddings.norm.weight", hidden)?,
+        embeddings: load_linear(
+            &st,
+            &format!("{prefix}embeddings.tok_embeddings"),
+            config.vocab_size,
+            hidden,
+        )?,
+        embedding_norm: load_vector(&st, &format!("{prefix}embeddings.norm.weight"), hidden)?,
         layers,
-        final_norm: load_vector(&st, "final_norm.weight", hidden)?,
+        final_norm: load_vector(&st, &format!("{prefix}final_norm.weight"), hidden)?,
     };
     let identity = ModelIdentity {
-        model_id: MODEL_ID,
+        model_id: if prefix.is_empty() {
+            MODEL_ID
+        } else {
+            "Alibaba-NLP/gte-reranker-modernbert-base"
+        },
         snapshot_hash: snapshot
             .file_name()
             .and_then(|name| name.to_str())
