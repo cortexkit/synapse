@@ -7,6 +7,8 @@ struct Pair {
     id: String,
     input_ids: Vec<u32>,
     reference_pool: Option<Vec<f32>>,
+    #[serde(default)]
+    capture_layers: bool,
 }
 
 struct Head {
@@ -80,7 +82,19 @@ impl Head {
     }
 }
 
-fn encode(model: &AneModel, ids: &[u32], weights: &Weights, config: &Config) -> Result<Vec<f32>> {
+fn save_f32(path: &Path, values: &[f32]) -> Result<()> {
+    let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+    fs::write(path, bytes)?;
+    Ok(())
+}
+
+fn encode(
+    model: &AneModel,
+    ids: &[u32],
+    weights: &Weights,
+    config: &Config,
+    capture: Option<&Path>,
+) -> Result<Vec<f32>> {
     let width = model.shape.width;
     model
         .raw
@@ -99,6 +113,12 @@ fn encode(model: &AneModel, ids: &[u32], weights: &Weights, config: &Config) -> 
             (&model.hidden_b, &model.hidden_a)
         };
         executable.run_cached(&[source, &model.key_mask], &[destination])?;
+        if let Some(path) = capture {
+            save_f32(
+                &path.join(format!("ane-layer-{}.f32", model.chunk_ends[index])),
+                &destination.read_f32(),
+            )?;
+        }
     }
     let source = if model.chunks.len().is_multiple_of(2) {
         &model.hidden_a
@@ -115,12 +135,24 @@ pub fn main() -> Result<()> {
             .nth(1)
             .context("usage: modernbert_rerank SNAPSHOT < pairs.jsonl")?,
     );
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    let diagnostic_dir = if args.is_empty() {
+        None
+    } else {
+        ensure!(
+            args.len() == 2 && args[0] == "--diagnose",
+            "expected --diagnose OUTPUT_DIRECTORY"
+        );
+        let path = PathBuf::from(&args[1]);
+        fs::create_dir_all(&path)?;
+        Some(path)
+    };
     let (config, weights, identity) = load_model(&snapshot)?;
     let head = Head::load(&snapshot, &config)?;
     let mut models = BTreeMap::new();
     println!("{}", serde_json::json!({"ready":true,"model":identity}));
     io::stdout().flush()?;
-    for line in io::stdin().lock().lines() {
+    for (pair_index, line) in io::stdin().lock().lines().enumerate() {
         let pair: Pair = serde_json::from_str(&line?)?;
         ensure!(!pair.input_ids.is_empty(), "empty pair");
         ensure!(
@@ -138,9 +170,22 @@ pub fn main() -> Result<()> {
             entry.insert(compile_model(&config, &weights, width, 1)?);
             compile_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
         }
+        let capture_path = diagnostic_dir
+            .as_ref()
+            .filter(|_| pair.capture_layers)
+            .map(|p| p.join(format!("pair-{}", pair_index + 1)));
+        if let Some(path) = &capture_path {
+            fs::create_dir_all(path)?;
+        }
         let total = Instant::now();
         let start = Instant::now();
-        let hidden = encode(&models[&width], &pair.input_ids, &weights, &config)?;
+        let hidden = encode(
+            &models[&width],
+            &pair.input_ids,
+            &weights,
+            &config,
+            capture_path.as_deref(),
+        )?;
         let encoder_ms = start.elapsed().as_secs_f64() * 1000.0;
         let start = Instant::now();
         let pooled: Vec<f32> = (0..config.hidden_size)
@@ -165,9 +210,45 @@ pub fn main() -> Result<()> {
             }
             None => None,
         };
+        let mut cpu_logits = BTreeMap::new();
+        if diagnostic_dir.is_some() {
+            // The embedding reference masks pad IDs. Reject literal pad IDs here
+            // so the CPU/device diagnostic comparison has identical attention masks.
+            ensure!(
+                !pair.input_ids.contains(&config.pad_token_id),
+                "diagnostic reference cannot attend a literal pad ID"
+            );
+            for (name, tanh) in [("tanh", true), ("erf", false)] {
+                let cpu = cpu_reference_diagnostic(
+                    &pair.input_ids,
+                    &weights,
+                    &config,
+                    width,
+                    tanh,
+                    capture_path.is_some(),
+                )?;
+                let pooled: Vec<f32> = (0..config.hidden_size)
+                    .map(|c| {
+                        (0..pair.input_ids.len())
+                            .map(|p| cpu.final_hidden[p * config.hidden_size + c])
+                            .sum::<f32>()
+                            / pair.input_ids.len() as f32
+                    })
+                    .collect();
+                cpu_logits.insert(name, head.score(&pooled));
+                if let Some(path) = &capture_path {
+                    for (layer, states) in cpu.layer_states.iter().enumerate() {
+                        save_f32(
+                            &path.join(format!("cpu-{name}-layer-{}.f32", layer + 1)),
+                            states,
+                        )?;
+                    }
+                }
+            }
+        }
         println!(
             "{}",
-            serde_json::json!({"id":pair.id,"tokens":pair.input_ids.len(),"shape":width,
+            serde_json::json!({"cpu_logits":cpu_logits,"diagnostic_capture":capture_path.is_some(),"id":pair.id,"tokens":pair.input_ids.len(),"shape":width,
             "logit":logit,"encoder_ms":encoder_ms,"cpu_head_ms":head_ms,"total_ms":total_ms,
             "compile_ms":compile_ms,"reference_head_logit":reference_head_logit,"pooled":pooled})
         );

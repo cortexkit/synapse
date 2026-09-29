@@ -70,3 +70,21 @@ returned `pooled` values support private fidelity diagnosis.
 The caller must check the read-only `campaign_rig_claim` table before inference
 and between queries, waiting until no campaign holds the Neural Engine. All
 reported timing is ambient wall time, not isolated device execution time.
+
+### Formula and layer diagnosis
+
+Add `--diagnose "$PRIVATE_DIAG_DIR"` after the snapshot argument to score each
+input with two CPU reference encoders as well: the ANE graph's tanh-GELU formula
+and exact-erf GELU. Both use the same fp32 pooling/classification head. The
+embedding probe's default CPU reference already used exact erf; its default
+behavior and the shared ANE graph are unchanged.
+
+Set `capture_layers: true` on selected input rows to save all 22 post-residual,
+pre-final-norm hidden states beneath `pair-N` in the diagnostic directory, where
+N is the one-based input ordinal. Files are little-endian fp32: ANE files are
+channel-major `[hidden, width]`; CPU files are token-major `[width, hidden]`.
+The `cpu_logits` result object distinguishes `tanh` and `erf`. Diagnostic inputs
+containing literal pad IDs are rejected because the existing embedding CPU
+reference masks those IDs, while pair inference attends every supplied token.
+Layer capture adds surface reads and disk I/O, so diagnostic timings are not
+comparable to normal scoring timings. Keep states and token IDs private.

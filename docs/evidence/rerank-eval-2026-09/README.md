@@ -1111,3 +1111,108 @@ Private storage retains the tokenizer IDs, reference states, per-pair logits
 and timing, per-shape compile timing, rig/load observations, exact model hashes,
 selection rule and metric-reproduction artifacts. No query or candidate text
 is included here.
+
+### Authorized diagnosis: formula error versus ANE numerical error
+
+After the initial stop, the same retained 20 pairs were rerun for diagnosis,
+without changing the gate, model, tokenizer IDs, padding, or CPU head. An
+important correction to the initial hypothesis: the embedding probe's
+**in-process CPU reference already uses exact-erf GELU**. Only its ANE graph
+uses tanh GELU. The diagnostic adds a CPU tanh option matching the graph's
+activation formula, while preserving the original exact-erf CPU default.
+Both CPU variants use fp32 encoder weights and arithmetic; LayerNorm uses its
+ordinary fp32 expression rather than the graph's algebraically equivalent
+rescaled expression. This is a formula comparison, not an emulation of every
+fp16 compiler operation or intermediate rounding.
+
+| Encoder, same fp32 CPU head | Maximum absolute sigmoid error vs HF | Maximum absolute logit error | ≥0.005-gap order violations | Unchanged gate |
+| --- | ---: | ---: | ---: | --- |
+| Rust fp32, tanh GELU | 0.0026112680 | 0.0111742020 | 0 | Pass |
+| Rust fp32, exact-erf GELU | 0.0000018849 | 0.0000075400 | 0 | Pass |
+| ANE fp16, unchanged tanh graph | 0.0103796673 | 0.0421731174 | 0 | **Fail** |
+
+All 20 ANE logits reproduced their initial values. The near-tie inversion
+remains confined to pairs 11/12; neither CPU variant inverted a pair. The
+original two failures show both a real formula contribution and a larger
+additional device-path discrepancy:
+
+| Pair | HF fp32 logit | Rust fp32 tanh logit | Rust fp32 erf logit | ANE logit | Tanh sigmoid error | Erf sigmoid error | ANE sigmoid error |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 3 | -0.27124730 | -0.26167122 | -0.27124774 | -0.22907418 | 0.00235202 | 0.00000011 | 0.01037967 |
+| 20 | -0.52803361 | -0.51685941 | -0.52803248 | -0.50445628 | 0.00261127 | 0.00000026 | 0.00551837 |
+
+**Best-supported explanation:** tanh GELU introduces measurable cumulative
+formula error, but it does **not** by itself fail the gate in fp32. Exact erf
+reduces CPU-vs-HF score error to roughly two millionths. The much larger ANE
+error therefore cannot be explained by that formula difference alone; it
+includes device-path numerical effects absent from the fp32 encoder, consistent
+with fp16 weights/intermediates and compiler arithmetic. This experiment does
+not separately identify weight quantization, activation rounding, reduction
+order, or compiler lowering, nor prove that an fp16 exact-erf graph would pass.
+
+The tested binding exposes **no erf or exact GELU op**. Its activation enum
+contains ReLU, tanh, leaky ReLU, sigmoid, ELU, linear, hard sigmoid, softplus and
+softsign; elementwise unary operations include inverse, sqrt/rsqrt, abs,
+threshold, log and exp. Inspection of the graph API and MIL operation mappings
+found no additional erf lowering. No available composition with a demonstrated
+fp32 error bound ≤1e-6 was established. This is a statement about the checked
+API and available proof, not a mathematical impossibility claim about all
+compositions. **No alternative approximation was substituted and no ANE graph
+formula was changed.** The repeated ANE gate still fails, so full scoring and
+new-arm metrics remain prohibited.
+
+### Per-layer attribution on the two failing pairs
+
+These are maximum absolute differences against hooked HF fp32 layer outputs,
+**after each complete attention/MLP residual layer and before final norm**.
+Layers are numbered 1–22. The maxima below include every channel and every
+position of the padded tensors (64 positions for pair 3, 128 for pair 20).
+The private evidence also retains separate active-token-only maxima and the
+full hidden-state arrays; ANE channel-major storage was transposed to match HF
+and CPU token-major storage before comparison. HF hook runs reproduced their
+saved logits within 1e-6.
+
+| Layer | Pair 3 ANE | Pair 3 CPU tanh | Pair 3 CPU erf | Pair 20 ANE | Pair 20 CPU tanh | Pair 20 CPU erf |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 0.082054 | 0.014738 | 0.000029 | 0.096092 | 0.012903 | 0.000017 |
+| 2 | 0.137875 | 0.069096 | 0.000034 | 0.164047 | 0.092384 | 0.000025 |
+| 3 | 0.150352 | 0.080025 | 0.000032 | 0.190060 | 0.095562 | 0.000031 |
+| 4 | 0.259487 | 0.088230 | 0.000076 | 0.174084 | 0.102562 | 0.000034 |
+| 5 | 0.657913 | 0.182419 | 0.000137 | 0.849884 | 0.215790 | 0.000053 |
+| 6 | 0.811279 | 0.223694 | 0.000168 | 0.975113 | 0.256958 | 0.000061 |
+| 7 | 0.879044 | 0.256332 | 0.000168 | 0.963501 | 0.279663 | 0.000099 |
+| 8 | 0.935806 | 0.263474 | 0.000168 | 0.962814 | 0.283813 | 0.000088 |
+| 9 | 1.047882 | 0.294220 | 0.000198 | 1.050873 | 0.320206 | 0.000076 |
+| 10 | 1.002899 | 0.326462 | 0.000122 | 3.025360 | 0.614639 | 0.000473 |
+| 11 | 0.683304 | 0.234497 | 0.000130 | 2.800552 | 0.530869 | 0.000458 |
+| 12 | 2.626526 | 0.546448 | 0.001831 | 2.522705 | 0.525879 | 0.001038 |
+| 13 | 2.980774 | 0.554199 | 0.001831 | 2.233154 | 0.529358 | 0.000916 |
+| 14 | 3.088684 | 0.561096 | 0.001831 | 2.137268 | 0.527374 | 0.000854 |
+| 15 | 2.802673 | 0.572205 | 0.001831 | 1.715759 | 0.526031 | 0.000793 |
+| 16 | 1.545898 | 0.360859 | 0.002136 | 4.955383 | 0.530792 | 0.000916 |
+| 17 | 2.214216 | 0.465515 | 0.002228 | 5.006317 | 0.541004 | 0.000977 |
+| 18 | 2.689034 | 0.575043 | 0.002319 | 5.186615 | 0.626965 | 0.000977 |
+| 19 | 3.283520 | 0.982750 | 0.001999 | 5.783859 | 1.355728 | 0.001266 |
+| 20 | 5.203156 | 0.978439 | 0.001434 | 5.686768 | 1.222523 | 0.001038 |
+| 21 | 5.114960 | 1.043152 | 0.001251 | 5.456680 | 1.478600 | 0.001053 |
+| 22 | 7.226776 | 1.633240 | 0.001404 | 5.803955 | 2.067627 | 0.001404 |
+
+Error is already present after layer 1 and grows non-monotonically, with marked
+increases at layer 12 and the final layers for pair 3, and layers 10 and 16 for
+pair 20. These are unnormalized residual magnitudes, not score errors; final
+normalization substantially changes the scale. Restricting the final-layer
+maximum to active tokens gives ANE errors **6.170792 / 5.803955** for pairs
+3/20, so the discrepancy is not merely padded output. The table identifies
+where accumulated divergence is visible, not an isolated faulty operator.
+
+### Embedding regression check
+
+Although the shared ANE graph was **unchanged**, `modernbert_full` was rerun on
+its existing `rows.jsonl` at 512 positions, one layer per executable, before and
+after the diagnostic instrumentation. Its minimum cosine is **0.9991073 before
+and 0.9991073 after**, above the unchanged **0.999** gate. Both runs are
+deterministic; all returned embedding vectors match exactly across runs. The
+original exact-erf CPU default was preserved. Both checks used the same row-set
+hash, an unset `TMPDIR`, and an empty read-only campaign rig claim before
+execution. Diagnostic ANE measurements also waited on that claim before each
+pair. Layer-capture I/O is not included in the earlier latency claims.

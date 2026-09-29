@@ -150,6 +150,8 @@ struct Report {
 struct CpuResult {
     checkpoints: Vec<Vec<f32>>,
     vector: Vec<f32>,
+    final_hidden: Vec<f32>,
+    layer_states: Vec<Vec<f32>>,
 }
 
 struct AneModel {
@@ -1038,6 +1040,20 @@ fn cpu_reference(
     config: &Config,
     sequence_length: usize,
 ) -> Result<CpuResult> {
+    cpu_reference_diagnostic(row, weights, config, sequence_length, false, false)
+}
+
+// Keep the embedding reference exact-erf by default; the tanh option isolates
+// the ANE graph's activation formula without changing device precision.
+fn cpu_reference_diagnostic(
+    row: &[u32],
+    weights: &Weights,
+    config: &Config,
+    sequence_length: usize,
+    tanh_gelu: bool,
+    capture_layers: bool,
+) -> Result<CpuResult> {
+    let mut layer_states = Vec::new();
     let hidden = config.hidden_size;
     let mut ids = vec![config.pad_token_id; sequence_length];
     ids[..row.len()].copy_from_slice(row);
@@ -1095,10 +1111,16 @@ fn cpu_reference(
             let destination = position * config.intermediate_size;
             for column in 0..config.intermediate_size {
                 let value = projected[source + column];
-                let exact_gelu =
-                    0.5 * value * (1.0 + libm::erff(value * std::f32::consts::FRAC_1_SQRT_2));
+                let gelu = if tanh_gelu {
+                    let squared = value * value;
+                    let cubed = squared * value;
+                    let inner = value + 0.044_715 * cubed;
+                    (0.5 * value) * (1.0 + (0.797_884_6 * inner).tanh())
+                } else {
+                    0.5 * value * (1.0 + libm::erff(value * std::f32::consts::FRAC_1_SQRT_2))
+                };
                 activated[destination + column] =
-                    exact_gelu * projected[source + config.intermediate_size + column];
+                    gelu * projected[source + config.intermediate_size + column];
             }
         }
         let mlp_output = linear_cpu(&activated, sequence_length, &layer.mlp_output);
@@ -1106,6 +1128,9 @@ fn cpu_reference(
             *destination += source;
         }
         checkpoints.push(current[..hidden].to_vec());
+        if capture_layers {
+            layer_states.push(current.clone());
+        }
     }
     layer_norm_cpu(
         &mut current,
@@ -1118,6 +1143,8 @@ fn cpu_reference(
     Ok(CpuResult {
         vector: l2_normalize(current[..hidden].to_vec()),
         checkpoints,
+        final_hidden: current,
+        layer_states,
     })
 }
 
