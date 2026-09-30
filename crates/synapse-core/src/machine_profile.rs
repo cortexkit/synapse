@@ -289,7 +289,7 @@ fn command_stdout_within(
     args: &[&str],
     budget: Duration,
 ) -> Result<String, ProfileProbeError> {
-    let mut child = Command::new(program)
+    let mut child = crate::without_launch_nonce(Command::new(program))
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

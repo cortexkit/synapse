@@ -868,7 +868,8 @@ impl WorkerHost {
         let (endpoint, listener) =
             prepare_listener(&self.config.runtime_dir, &self.config.worker_id)?;
         let nonce = nonce_hex16();
-        let mut command = Command::new(&self.config.worker_bin);
+        let mut command =
+            synapse_core::without_launch_nonce_tokio(Command::new(&self.config.worker_bin));
         append_worker_spawn_args(&mut command, &endpoint, &nonce);
         command
             .env("SYNAPSE_WORKER_ID", &self.config.worker_id)

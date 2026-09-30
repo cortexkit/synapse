@@ -534,7 +534,7 @@ fn fixture_text(index: usize, class: TextClass, nonce: &str) -> String {
 }
 
 fn loadavg_1m() -> Result<f64> {
-    let output = Command::new("sysctl")
+    let output = synapse_core::without_launch_nonce(Command::new("sysctl"))
         .args(["-n", "vm.loadavg"])
         .output()
         .context("read one-minute load average")?;

@@ -43,7 +43,7 @@ pub fn main() -> Result<()> {
              the launcher, SYNAPSE_ANE_SWIFT_WORKER, or the build-time artifact"
         );
     };
-    let error = Command::new(worker)
+    let error = synapse_core::without_launch_nonce(Command::new(worker))
         .args(std::env::args_os().skip(1))
         .exec();
     Err(error.into())

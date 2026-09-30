@@ -180,7 +180,7 @@ where
 }
 
 fn extract_archive(source_path: &Path, destination: &Path) -> Result<()> {
-    let output = Command::new("/usr/bin/unzip")
+    let output = synapse_core::without_launch_nonce(Command::new("/usr/bin/unzip"))
         .arg("-q")
         .arg("-o")
         .arg(source_path)

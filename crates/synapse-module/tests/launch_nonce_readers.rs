@@ -105,7 +105,7 @@ fn no_workspace_source_reads_the_launch_nonce_around_the_sdk() {
     let mut offenders = Vec::new();
     for path in &sources {
         let source = std::fs::read_to_string(path).expect("read source file");
-        for (line, text) in direct_nonce_reads(&source) {
+        for (line, text) in nonce_reads_in_file(path.strip_prefix(&root).unwrap_or(path), &source) {
             let relative = path.strip_prefix(&root).unwrap_or(path);
             offenders.push(format!("{}:{line}: {text}", relative.display()));
         }
@@ -149,4 +149,123 @@ fn the_scan_flags_direct_reads_and_leaves_other_nonces_alone() {
     );
     assert!(shipped_sources(&workspace_root()).contains(&runner.canonicalize().unwrap()));
     assert!(direct_nonce_reads(&source).is_empty());
+}
+
+// Only child_process.rs's remove_launch_nonce helper may name the SDK constants,
+// and only in these exact removal statements. Reads in that file must still go
+// through the SDK.
+fn nonce_reads_in_file(path: &Path, source: &str) -> Vec<(usize, String)> {
+    direct_nonce_reads(source)
+        .into_iter()
+        .filter(|(_, text)| {
+            !(path == Path::new("crates/synapse-core/src/child_process.rs")
+                && matches!(
+                    text.as_str(),
+                    "command.env_remove(subc_os::launch_nonce::LAUNCH_NONCE_ENV);"
+                        | "command.env_remove(subc_os::launch_nonce::LAUNCH_NONCE_FD_ENV);"
+                ))
+        })
+        .collect()
+}
+
+#[test]
+fn helper_exception_allows_only_removals_in_the_helper_file() {
+    let helper = Path::new("crates/synapse-core/src/child_process.rs");
+    let removal = "command.env_remove(subc_os::launch_nonce::LAUNCH_NONCE_ENV);";
+    assert!(nonce_reads_in_file(helper, removal).is_empty());
+    assert_eq!(
+        nonce_reads_in_file(Path::new("crates/other/src/lib.rs"), removal).len(),
+        1
+    );
+    assert_eq!(
+        nonce_reads_in_file(
+            helper,
+            "std::env::var(subc_os::launch_nonce::LAUNCH_NONCE_ENV);"
+        )
+        .len(),
+        1
+    );
+}
+
+// Production constructors must be wrapped in without_launch_nonce (or its tokio
+// counterpart) on the same or immediately preceding line (rustfmt wraps long
+// initializers). Skip #[cfg(test)] items by balanced braces. The inventory only
+// includes src directories, not tests/ fixtures, and this scan excludes bench/.
+// This intentionally enforces a spelling convention, not dataflow.
+fn unstripped_commands(path: &Path, source: &str) -> Vec<String> {
+    let mut offenders = Vec::new();
+    let mut test_item = false;
+    let mut depth = 0isize;
+    let mut opened = false;
+    let mut previous = "";
+    for (index, line) in source.lines().enumerate() {
+        let code = code_part(line).trim();
+        if code == "#[cfg(test)]" {
+            test_item = true;
+            opened = false;
+            depth = 0;
+        }
+        if test_item {
+            opened |= code.contains('{');
+            depth += code.matches('{').count() as isize - code.matches('}').count() as isize;
+            if (opened && depth == 0) || (!opened && code.ends_with(';')) {
+                test_item = false;
+            }
+        } else if code.contains("Command::new(")
+            && !code.contains("without_launch_nonce(")
+            && !code.contains("without_launch_nonce_tokio(")
+            && !previous.ends_with("without_launch_nonce(")
+            && !previous.ends_with("without_launch_nonce_tokio(")
+        {
+            offenders.push(format!("{}:{}: {}", path.display(), index + 1, code));
+        }
+        previous = code;
+    }
+    offenders
+}
+
+#[test]
+fn every_shipped_command_strips_the_launch_nonce() {
+    let root = workspace_root();
+    let sources = shipped_sources(&root);
+    assert!(sources.len() > 50, "source inventory is unexpectedly empty");
+    let mut offenders = Vec::new();
+    for path in sources {
+        let relative = path.strip_prefix(&root).unwrap();
+        if relative.starts_with("bench") {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path).expect("read source file");
+        offenders.extend(unstripped_commands(relative, &source));
+    }
+    assert!(
+        offenders.is_empty(),
+        "child commands must use without_launch_nonce:\n{}",
+        offenders.join("\n")
+    );
+}
+
+#[test]
+fn command_scan_control_reports_unstripped_constructor_by_file_and_line() {
+    let path = Path::new("crates/control/src/lib.rs");
+    let planted = "fn launch() {\n    let child = Command::new(\"worker\").spawn();\n}\n";
+    assert_eq!(
+        unstripped_commands(path, planted),
+        vec!["crates/control/src/lib.rs:2: let child = Command::new(\"worker\").spawn();"]
+    );
+    assert!(unstripped_commands(
+        path,
+        "let command = without_launch_nonce(Command::new(\"worker\"));"
+    )
+    .is_empty());
+    assert!(unstripped_commands(
+        path,
+        "let command = without_launch_nonce(\nCommand::new(\"worker\"));"
+    )
+    .is_empty());
+    assert!(unstripped_commands(
+        path,
+        "#[cfg(test)]\nmod tests {\nlet command = Command::new(\"worker\");\n}\n"
+    )
+    .is_empty());
 }

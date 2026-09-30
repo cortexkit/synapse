@@ -1001,7 +1001,7 @@ impl AnePrefillClient {
         let nonce = format!("decode-{}-{sequence}", std::process::id());
         let shared_memory = Rc::new(SharedMemoryHandoff::create(config, sequence)?);
         let readiness_started = Instant::now();
-        let child = Command::new(&config.sidecar_path)
+        let child = synapse_core::without_launch_nonce(Command::new(&config.sidecar_path))
             .arg("--socket")
             .arg(socket_path.path())
             .arg("--nonce")
