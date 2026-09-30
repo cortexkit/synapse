@@ -301,6 +301,18 @@ fn spawn_synapse_module_with_env(
     config_json: Option<&str>,
     extra_env: &[(&str, &str)],
 ) -> ModuleProcess {
+    let mut command =
+        synapse_module_command(subc_connection_file, preload_models, config_json, extra_env);
+    let child = command.spawn().expect("spawn synapse-module");
+    ModuleProcess { child }
+}
+
+fn synapse_module_command(
+    subc_connection_file: &Path,
+    preload_models: Option<&str>,
+    config_json: Option<&str>,
+    extra_env: &[(&str, &str)],
+) -> Command {
     let config_contents = if let Some(config_json) = config_json {
         Some(config_json.to_string())
     } else {
@@ -318,8 +330,7 @@ fn spawn_synapse_module_with_env(
     for (key, value) in extra_env {
         command.env(key, value);
     }
-    let child = command.spawn().expect("spawn synapse-module");
-    ModuleProcess { child }
+    command
 }
 
 async fn wait_for_registration(registry: &Registry, module_id: &str, wait: Duration) {
@@ -400,6 +411,82 @@ async fn module_logs_start_and_stop_across_a_daemon_connection_close() {
     assert!(
         log.contains("synapse stopped"),
         "a module whose daemon connection closed must log that it stopped; log: {log}"
+    );
+    // The stop line must say how the connection ended. The daemon went away
+    // without a GOODBYE here, which the SDK reports as a clean close (`eof`)
+    // or, if the socket was torn down with data still unread, a reset.
+    let stop_line = log
+        .lines()
+        .find(|line| line.contains("synapse stopped"))
+        .unwrap_or_default();
+    assert!(
+        stop_line.contains("reason=eof") || stop_line.contains("reason=reset"),
+        "the stop line must carry the connection-end reason of a daemon that vanished; \
+         line: {stop_line}"
+    );
+}
+
+/// The daemon hands each module its launch nonce on descriptor 3 (named by
+/// `SUBC_LAUNCH_NONCE_FD`) and will stop setting the `SUBC_LAUNCH_NONCE`
+/// environment copy. This launches the real module with the nonce ONLY on the
+/// descriptor, the way the daemon does, and checks that it still boots,
+/// registers, reports where it read the nonce, and serves over a route.
+///
+/// The in-process test daemon has no supervisor, so it does not check the
+/// nonce against one it minted; what this proves is the module side: the
+/// descriptor is read, HELLO carries the nonce it held, and serving works.
+#[cfg(unix)]
+#[tokio::test]
+async fn module_launched_with_the_nonce_only_on_fd_3_registers_and_serves() {
+    use subc_os::launch_nonce::{LaunchNonceHandoff, LAUNCH_NONCE_ENV, LAUNCH_NONCE_FD_ENV};
+    use subc_protocol::manifest::LaunchNonceSource;
+
+    let daemon = start_daemon().await;
+    let handoff = LaunchNonceHandoff::new("fd-only-launch-nonce").expect("make the nonce pipe");
+    let fd_env = handoff.fd_env_value();
+    let mut command = synapse_module_command(
+        &daemon.connection_file_path,
+        None,
+        None,
+        &[(LAUNCH_NONCE_FD_ENV, fd_env.as_str())],
+    );
+    command.env_remove(LAUNCH_NONCE_ENV);
+    // Last, after every other pre-exec step, as the handoff requires.
+    handoff.install_last(command.as_std_mut());
+    let module = ModuleProcess {
+        child: command.spawn().expect("spawn synapse-module"),
+    };
+
+    let (daemon, _module, mut consumer, route) =
+        open_route_for_started_module(daemon, module).await;
+
+    let registration = daemon
+        .registry
+        .get_module(MODULE_ID)
+        .unwrap()
+        .expect("the module registered");
+    let source = registration
+        .manifest
+        .provenance
+        .as_ref()
+        .and_then(|provenance| provenance.launch_nonce_source.clone());
+    assert_eq!(
+        source,
+        Some(LaunchNonceSource::Fd),
+        "HELLO must report that the nonce came from the descriptor"
+    );
+
+    let body = route_request(
+        &mut consumer,
+        route,
+        2,
+        serde_json::json!({ "method": "models.list", "params": {} }),
+    )
+    .await;
+    assert_eq!(
+        body["result"]["models"],
+        Value::Array(Vec::new()),
+        "body: {body}"
     );
 }
 
