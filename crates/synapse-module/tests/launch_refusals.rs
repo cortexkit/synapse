@@ -16,6 +16,12 @@ use std::process::Command;
 /// Runs the module binary in an isolated home so it can never touch the
 /// operator's live logs, lease or store, and returns its combined output.
 fn launch(home: &Path, vars: &[(&str, &str)]) -> String {
+    launch_command(home, vars, |_| {})
+}
+
+/// `launch`, with a hook that can adjust the command last, after every other
+/// setting, which is where the launch-nonce handoff must be installed.
+fn launch_command(home: &Path, vars: &[(&str, &str)], finish: impl FnOnce(&mut Command)) -> String {
     let mut command = Command::new(env!("CARGO_BIN_EXE_ck-synapse"));
     command
         .env_clear()
@@ -26,6 +32,7 @@ fn launch(home: &Path, vars: &[(&str, &str)]) -> String {
     for (key, value) in vars {
         command.env(key, value);
     }
+    finish(&mut command);
     let output = command.output().expect("module binary runs");
     format!(
         "{}{}",
@@ -79,7 +86,32 @@ fn supervised_launch_without_an_id_still_refuses_by_name() {
     // The fallback must not leak into supervision: a daemon-spawned launch that
     // lost its id is a broken contract, not a local run.
     assert!(
-        output.contains("SUBC_MODULE_ID is required when SUBC_LAUNCH_NONCE is present"),
+        output.contains("SUBC_MODULE_ID is required when a launch nonce is present"),
         "a supervised launch missing its id must refuse by name; got: {output}"
+    );
+}
+
+/// The daemon hands the launch nonce over on descriptor 3, named by
+/// `SUBC_LAUNCH_NONCE_FD`, and will stop setting the `SUBC_LAUNCH_NONCE` copy.
+/// A launch carrying the nonce only on the descriptor is still supervised, so
+/// it must hit the same refusal. A module that checked only the environment
+/// would take it for a local run and fall back to the default id.
+#[cfg(unix)]
+#[test]
+fn supervised_launch_with_the_nonce_only_on_fd_3_still_refuses_by_name() {
+    use subc_os::launch_nonce::{LaunchNonceHandoff, LAUNCH_NONCE_FD_ENV};
+
+    let home = isolated_home("supervised-fd");
+    let handoff = LaunchNonceHandoff::new("test-nonce").expect("make the nonce pipe");
+    let fd_env = handoff.fd_env_value();
+    let output = launch_command(
+        &home,
+        &[(LAUNCH_NONCE_FD_ENV, fd_env.as_str())],
+        |command| handoff.install_last(command),
+    );
+
+    assert!(
+        output.contains("SUBC_MODULE_ID is required when a launch nonce is present"),
+        "a launch with the nonce only on descriptor 3 must refuse by name; got: {output}"
     );
 }

@@ -86,15 +86,15 @@ use store::{
     JOB_STATE_FAILED_TRANSIENT, JOB_STATE_PAUSED_NEEDS_REAUTH, JOB_STATE_QUEUED, JOB_STATE_RUNNING,
 };
 use subc_client_rs::{
-    async_trait, build_provenance, BindDecision, HandlerOutcome, HealthReport, ModuleHandler,
-    RequestCtx, RouteBindRequest, RouteHandle, SubcModuleError,
+    async_trait, build_provenance, BindDecision, ConnectionEnd, HandlerOutcome, HealthReport,
+    ModuleHandler, RequestCtx, RouteBindRequest, RouteHandle, SubcModuleError,
 };
 use subc_protocol::{
     manifest::{
         Concurrency, IdentityScope, ManagementOperation, ManagementOperationKind, ModuleManifest,
         ProviderRole,
     },
-    ModuleHelloAckBody, Principal, PROTOCOL_VERSION, SUBC_LAUNCH_NONCE_ENV, SUBC_MODULE_ID_ENV,
+    ModuleHelloAckBody, Principal, PROTOCOL_VERSION, SUBC_MODULE_ID_ENV,
 };
 use synapse_core::{
     evaluate_cuda_floor, owned_cuda_engine_identity, worker_binary_env_var,
@@ -226,7 +226,12 @@ pub fn restore_import(
 }
 
 pub async fn run_from_env() -> Result<(), ModuleError> {
-    let module_id = module_id_from_environment(|key| env::var_os(key))?;
+    // This is the process's first read of the launch nonce, and it happens
+    // before anything is spawned: the SDK reads the nonce pipe the daemon left
+    // on descriptor 3 once, closes it and caches the value, so no worker this
+    // module starts later can inherit the pipe. HELLO reuses the cached value.
+    let module_id =
+        module_id_from_environment(|key| env::var_os(key), LaunchNonceState::from_sdk())?;
     // Under supervision the daemon injects SUBC_MODULE_ID plus the retention
     // knobs (CK_LOG_MAX_AGE_DAYS, CK_LOG_ALARM_SEGMENT_MB) from its `log` config
     // block, and from_env reads all of them. Outside supervision it refuses for a
@@ -251,6 +256,10 @@ pub async fn run_from_env() -> Result<(), ModuleError> {
     let _singleton = acquire_synapse_singleton_lease(&module_id)?;
     let connection_file = subc_connection_file_from_args()?;
     let handler = SynapseHandler::new(module_id.clone(), connection_file);
+    // `serve` takes the handler, so keep a handle on the one slot the stop line
+    // needs: how the daemon connection ended, which the SDK reports to the
+    // handler just before `serve` returns.
+    let connection_end = Arc::clone(&handler.inner.connection_end);
     // One line when serving starts and one when it ends, so a restart that the
     // daemon or an operator caused can be read from this log alone. Without them
     // a module that restarts and serves nothing leaves no trace at all, and a
@@ -267,10 +276,15 @@ pub async fn run_from_env() -> Result<(), ModuleError> {
     let outcome = subc_client_rs::serve(manifest(&module_id), handler).await;
     let uptime_s = started.elapsed().as_secs();
     match &outcome {
+        // `reason` tells a planned stop (`goodbye`) from a daemon that vanished
+        // (`eof`, `reset`) and from this module closing the connection itself
+        // (`closed`), which the bare stop line could not. On the error arm the
+        // SDK reports no reason; the error itself says why.
         Ok(()) => tracing::info!(
             target: "lifecycle",
             module = %module_id,
             uptime_s,
+            reason = connection_end_reason(connection_end.get().copied()),
             "synapse stopped: serve loop returned"
         ),
         Err(error) => tracing::warn!(
@@ -284,8 +298,46 @@ pub async fn run_from_env() -> Result<(), ModuleError> {
     outcome.map_err(ModuleError::Serve)
 }
 
+/// The name the `synapse stopped` line gives for how the daemon connection
+/// ended. `unknown` only if the SDK returned without reporting an end, which
+/// it does not do on a clean return.
+fn connection_end_reason(end: Option<ConnectionEnd>) -> &'static str {
+    end.map_or("unknown", ConnectionEnd::as_str)
+}
+
+/// What this process's launch nonce says about how it was started. The daemon
+/// gives a nonce to every module it spawns, so its presence is what marks a
+/// supervised launch; a local development run has none.
+#[derive(Debug)]
+enum LaunchNonceState {
+    /// No nonce anywhere: an unsupervised local run.
+    Absent,
+    /// A nonce was read, from the descriptor or from the environment copy.
+    Present,
+    /// The daemon named a nonce descriptor that could not be read. The launch
+    /// was still meant to be supervised, so it is treated like `Present`.
+    Unreadable(String),
+}
+
+impl LaunchNonceState {
+    /// Reads the nonce through the SDK's single reader. It takes descriptor 3
+    /// when the daemon handed the nonce over that way and falls back to the
+    /// `SUBC_LAUNCH_NONCE` environment copy otherwise (always, on Windows,
+    /// where the daemon has no descriptor handoff). A second reader here would
+    /// be wrong, not just redundant: the first read closes the descriptor, and
+    /// a later independent read could take whatever reuses that number.
+    fn from_sdk() -> Self {
+        match subc_client_rs::launch_nonce() {
+            Ok(Some(_)) => Self::Present,
+            Ok(None) => Self::Absent,
+            Err(error) => Self::Unreadable(error.to_string()),
+        }
+    }
+}
+
 fn module_id_from_environment(
     mut env_var: impl FnMut(&str) -> Option<OsString>,
+    launch_nonce: LaunchNonceState,
 ) -> Result<String, ModuleError> {
     let module_id = env_var(SUBC_MODULE_ID_ENV)
         .and_then(|value| value.into_string().ok())
@@ -296,12 +348,16 @@ fn module_id_from_environment(
     // Under supervision, falling back to DEFAULT_MODULE_ID (even though it is
     // currently the true id) would make a missing daemon-supplied identity look valid.
     // The launch nonce distinguishes supervised launches from local development.
-    if env_var(SUBC_LAUNCH_NONCE_ENV).is_some() {
-        return Err(ModuleError::Config(format!(
-            "{SUBC_MODULE_ID_ENV} is required when {SUBC_LAUNCH_NONCE_ENV} is present"
-        )));
+    match launch_nonce {
+        LaunchNonceState::Absent => Ok(DEFAULT_MODULE_ID.to_string()),
+        LaunchNonceState::Present => Err(ModuleError::Config(format!(
+            "{SUBC_MODULE_ID_ENV} is required when a launch nonce is present"
+        ))),
+        LaunchNonceState::Unreadable(error) => Err(ModuleError::Config(format!(
+            "{SUBC_MODULE_ID_ENV} is required when a launch nonce is present \
+             (the launch nonce descriptor could not be read: {error})"
+        ))),
     }
-    Ok(DEFAULT_MODULE_ID.to_string())
 }
 
 fn subc_connection_file_from_args() -> Result<PathBuf, ModuleError> {
@@ -415,6 +471,9 @@ struct SynapseHandlerInner {
     connection_file: PathBuf,
     state: OnceLock<Arc<ModuleState>>,
     approval_operators: Mutex<HashMap<RouteHandle, String>>,
+    /// How the daemon connection ended, set once by the SDK's end-of-connection
+    /// callback and read by the `synapse stopped` log line.
+    connection_end: Arc<OnceLock<ConnectionEnd>>,
 }
 
 fn module_state_machine_profile_hashes(profile: &MachineProfile) -> (String, String) {
@@ -2012,6 +2071,7 @@ impl SynapseHandler {
                 connection_file,
                 state: OnceLock::new(),
                 approval_operators: Mutex::new(HashMap::new()),
+                connection_end: Arc::new(OnceLock::new()),
             }),
         }
     }
@@ -3135,6 +3195,13 @@ impl ModuleHandler for SynapseHandler {
         if let Ok(mut operators) = self.inner.approval_operators.lock() {
             operators.remove(handle);
         }
+    }
+
+    /// Remembers how the daemon connection ended so the `synapse stopped` line
+    /// can say it. The SDK calls this at most once per connection, and this
+    /// module serves exactly one connection per process.
+    async fn on_connection_end(&self, end: ConnectionEnd) {
+        let _ = self.inner.connection_end.set(end);
     }
 
     /// Keep the daemon health status `ok` while publishing certification metrics as
@@ -17897,16 +17964,43 @@ mod tests {
 
     #[test]
     fn supervised_launch_without_subc_module_id_is_refused() {
-        let error = module_id_from_environment(|key| {
-            (key == SUBC_LAUNCH_NONCE_ENV).then(|| OsString::from("launch-nonce"))
-        })
-        .expect_err("a supervised launch must provide its module id");
+        let error = module_id_from_environment(|_| None, LaunchNonceState::Present)
+            .expect_err("a supervised launch must provide its module id");
         assert!(matches!(error, ModuleError::Config(_)));
         assert!(error.to_string().contains(SUBC_MODULE_ID_ENV));
 
-        let unsupervised = module_id_from_environment(|_| None)
+        // A nonce descriptor the daemon named but that could not be read still
+        // marks a supervised launch; it must not fall through to the default id.
+        let unreadable = module_id_from_environment(
+            |_| None,
+            LaunchNonceState::Unreadable("descriptor 3 is not open".to_string()),
+        )
+        .expect_err("an unreadable nonce descriptor is still a supervised launch");
+        assert!(unreadable.to_string().contains(SUBC_MODULE_ID_ENV));
+        assert!(unreadable.to_string().contains("descriptor 3 is not open"));
+
+        let unsupervised = module_id_from_environment(|_| None, LaunchNonceState::Absent)
             .expect("an unsupervised development run keeps the default module id");
         assert_eq!(unsupervised, DEFAULT_MODULE_ID);
+
+        let supervised = module_id_from_environment(
+            |key| (key == SUBC_MODULE_ID_ENV).then(|| OsString::from("synapse-test")),
+            LaunchNonceState::Present,
+        )
+        .expect("a supervised launch with its module id is accepted");
+        assert_eq!(supervised, "synapse-test");
+    }
+
+    #[test]
+    fn stop_line_reason_names_how_the_connection_ended() {
+        assert_eq!(
+            connection_end_reason(Some(ConnectionEnd::Goodbye)),
+            "goodbye"
+        );
+        assert_eq!(connection_end_reason(Some(ConnectionEnd::Eof)), "eof");
+        assert_eq!(connection_end_reason(Some(ConnectionEnd::Reset)), "reset");
+        assert_eq!(connection_end_reason(Some(ConnectionEnd::Closed)), "closed");
+        assert_eq!(connection_end_reason(None), "unknown");
     }
 
     #[test]
