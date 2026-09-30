@@ -866,7 +866,7 @@ fn package_root(
         .fold(1469598103934665603u64, |hash, byte| {
             (hash ^ u64::from(byte)).wrapping_mul(1099511628211)
         });
-    let os_build = std::process::Command::new("sw_vers")
+    let os_build = synapse_core::without_launch_nonce(std::process::Command::new("sw_vers"))
         .arg("-buildVersion")
         .output()
         .ok()

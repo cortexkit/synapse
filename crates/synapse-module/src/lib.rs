@@ -3407,7 +3407,7 @@ fn map_admission_refusal(
 fn current_unified_memory_bytes() -> Option<u64> {
     #[cfg(target_os = "macos")]
     {
-        std::process::Command::new("sysctl")
+        synapse_core::without_launch_nonce(std::process::Command::new("sysctl"))
             .args(["-n", "hw.memsize"])
             .output()
             .ok()
@@ -6281,7 +6281,8 @@ fn owned_cuda_probe_floor(worker: Option<&Path>) -> Result<OwnedCudaFloorReading
     // Failed probes stay cached deliberately until module restart.
     entry
         .get_or_init(|| {
-            let mut command = std::process::Command::new(&worker);
+            let mut command =
+                synapse_core::without_launch_nonce(std::process::Command::new(&worker));
             command.arg("--probe-floor");
             run_owned_cuda_probe(&mut command, Duration::from_secs(10))
         })

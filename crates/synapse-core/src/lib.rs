@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
 pub mod cache;
+pub mod child_process;
+pub use child_process::{without_launch_nonce, without_launch_nonce_tokio};
 pub mod cuda;
 pub mod engine;
 pub mod envelope;
