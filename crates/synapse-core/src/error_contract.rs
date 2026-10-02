@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -33,11 +34,17 @@ pub enum StableErrorCode {
     CredentialConfigInvalid,
     OpNotSupportedForRemote,
     SentinelCalibrationRefused,
+    ModelNotInstalled,
+    UnknownModel,
+    SelfCheckFailed,
+    BackendUnavailable,
+    ModelInUse,
+    DownloadFailed,
 }
 
 impl StableErrorCode {
     /// Every stable error code in declaration order.
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 29] = [
         Self::QueueFull,
         Self::DeadlineExceeded,
         Self::ModelLoading,
@@ -61,6 +68,12 @@ impl StableErrorCode {
         Self::CredentialConfigInvalid,
         Self::OpNotSupportedForRemote,
         Self::SentinelCalibrationRefused,
+        Self::ModelNotInstalled,
+        Self::UnknownModel,
+        Self::SelfCheckFailed,
+        Self::BackendUnavailable,
+        Self::ModelInUse,
+        Self::DownloadFailed,
     ];
 }
 
@@ -71,6 +84,12 @@ pub struct StableError {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_after_ms: Option<u64>,
     pub safe_to_retry_same_request: bool,
+    /// Structured, code-specific context for the refusal (for example the
+    /// catalog id a `model_not_installed` error refers to). It is always a JSON
+    /// object when present and is omitted from the wire when absent, so errors
+    /// without details serialize exactly as they did before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<Map<String, Value>>,
 }
 
 impl StableError {
@@ -85,7 +104,14 @@ impl StableError {
             class,
             retry_after_ms,
             safe_to_retry_same_request,
+            details: None,
         }
+    }
+
+    /// Returns this error with `details` replaced by the given object.
+    pub fn with_details(mut self, details: Map<String, Value>) -> Self {
+        self.details = Some(details);
+        self
     }
 
     pub const fn queue_full(retry_after_ms: Option<u64>) -> Self {
@@ -294,15 +320,75 @@ impl StableError {
             false,
         )
     }
+
+    pub const fn model_not_installed() -> Self {
+        Self::new(
+            StableErrorCode::ModelNotInstalled,
+            ErrorClass::Permanent,
+            None,
+            false,
+        )
+    }
+
+    pub const fn unknown_model() -> Self {
+        Self::new(
+            StableErrorCode::UnknownModel,
+            ErrorClass::Permanent,
+            None,
+            false,
+        )
+    }
+
+    pub const fn self_check_failed() -> Self {
+        Self::new(
+            StableErrorCode::SelfCheckFailed,
+            ErrorClass::Permanent,
+            None,
+            false,
+        )
+    }
+
+    pub const fn backend_unavailable() -> Self {
+        Self::new(
+            StableErrorCode::BackendUnavailable,
+            ErrorClass::Permanent,
+            None,
+            false,
+        )
+    }
+
+    pub const fn model_in_use() -> Self {
+        Self::new(
+            StableErrorCode::ModelInUse,
+            ErrorClass::Permanent,
+            None,
+            false,
+        )
+    }
+
+    /// Delay a client should wait before retrying a failed model download.
+    pub const DOWNLOAD_FAILED_RETRY_AFTER_MS: u64 = 1_000;
+
+    /// A model download failed for a reason that may clear on its own (network
+    /// drop, HTTP error status, full disk), so retrying the same request is safe.
+    pub const fn download_failed() -> Self {
+        Self::new(
+            StableErrorCode::DownloadFailed,
+            ErrorClass::Transient,
+            Some(Self::DOWNLOAD_FAILED_RETRY_AFTER_MS),
+            true,
+        )
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn stable_error_code_all_covers_every_variant() {
-        const VARIANT_COUNT: usize = 23;
+        const VARIANT_COUNT: usize = 29;
 
         // This match is intentionally exhaustive so enum additions update the
         // enumeration and its expected cardinality together.
@@ -330,7 +416,13 @@ mod tests {
                 | StableErrorCode::RemoteDeploymentChanged
                 | StableErrorCode::CredentialConfigInvalid
                 | StableErrorCode::OpNotSupportedForRemote
-                | StableErrorCode::SentinelCalibrationRefused => {}
+                | StableErrorCode::SentinelCalibrationRefused
+                | StableErrorCode::ModelNotInstalled
+                | StableErrorCode::UnknownModel
+                | StableErrorCode::SelfCheckFailed
+                | StableErrorCode::BackendUnavailable
+                | StableErrorCode::ModelInUse
+                | StableErrorCode::DownloadFailed => {}
             }
         }
 
@@ -363,12 +455,158 @@ mod tests {
             StableError::credential_config_invalid(),
             StableError::op_not_supported_for_remote(),
             StableError::sentinel_calibration_refused(),
+            StableError::model_not_installed(),
+            StableError::unknown_model(),
+            StableError::self_check_failed(),
+            StableError::backend_unavailable(),
+            StableError::model_in_use(),
+            StableError::download_failed(),
+            StableError::unknown_model()
+                .with_details(details(json!({"model_id": "no-such-model"}))),
+            StableError::download_failed().with_details(details(json!({
+                "file": "model.safetensors",
+                "reason": "http_status",
+                "http_status": 500,
+            }))),
         ];
 
         let json = serde_json::to_string(&errors).expect("serialize stable errors");
         let decoded: Vec<StableError> =
             serde_json::from_str(&json).expect("deserialize stable errors");
         assert_eq!(decoded, errors);
+    }
+
+    #[test]
+    fn new_stable_error_codes_round_trip_with_their_frozen_wire_shape() {
+        // (constructor output, wire code, class, retry_after_ms, safe to retry)
+        let cases = [
+            (
+                StableError::model_not_installed(),
+                "model_not_installed",
+                "permanent",
+                None,
+                false,
+            ),
+            (
+                StableError::unknown_model(),
+                "unknown_model",
+                "permanent",
+                None,
+                false,
+            ),
+            (
+                StableError::self_check_failed(),
+                "self_check_failed",
+                "permanent",
+                None,
+                false,
+            ),
+            (
+                StableError::backend_unavailable(),
+                "backend_unavailable",
+                "permanent",
+                None,
+                false,
+            ),
+            (
+                StableError::model_in_use(),
+                "model_in_use",
+                "permanent",
+                None,
+                false,
+            ),
+            (
+                StableError::download_failed(),
+                "download_failed",
+                "transient",
+                Some(1_000),
+                true,
+            ),
+        ];
+
+        for (error, code, class, retry_after_ms, safe) in cases {
+            let mut expected = json!({
+                "code": code,
+                "class": class,
+                "safe_to_retry_same_request": safe,
+            });
+            if let Some(retry_after_ms) = retry_after_ms {
+                expected["retry_after_ms"] = json!(retry_after_ms);
+            }
+            let wire = serde_json::to_value(&error).expect("serialize stable error");
+            assert_eq!(wire, expected, "wire shape for {code}");
+            let decoded: StableError =
+                serde_json::from_value(expected).expect("deserialize stable error");
+            assert_eq!(decoded, error, "round trip for {code}");
+        }
+    }
+
+    #[test]
+    fn new_stable_error_code_classes_are_frozen() {
+        for error in [
+            StableError::model_not_installed(),
+            StableError::unknown_model(),
+            StableError::self_check_failed(),
+            StableError::backend_unavailable(),
+            StableError::model_in_use(),
+        ] {
+            assert_eq!(error.class, ErrorClass::Permanent, "{:?}", error.code);
+            assert_eq!(error.retry_after_ms, None, "{:?}", error.code);
+            assert!(!error.safe_to_retry_same_request, "{:?}", error.code);
+            assert_eq!(error.details, None, "{:?}", error.code);
+        }
+
+        let download = StableError::download_failed();
+        assert_eq!(download.code, StableErrorCode::DownloadFailed);
+        assert_eq!(download.class, ErrorClass::Transient);
+        assert_eq!(download.retry_after_ms, Some(1_000));
+        assert!(download.safe_to_retry_same_request);
+    }
+
+    #[test]
+    fn details_are_serialized_only_when_present() {
+        let without = serde_json::to_value(StableError::unknown_model()).expect("serialize");
+        assert!(
+            without.get("details").is_none(),
+            "absent details must be omitted from the wire: {without}"
+        );
+
+        let holders = json!({
+            "catalog_id": "gte-modernbert-base",
+            "holders": [{"kind": "job", "job_id": "job-1"}],
+        });
+        let with = serde_json::to_value(
+            StableError::model_in_use().with_details(details(holders.clone())),
+        )
+        .expect("serialize");
+        assert_eq!(with["details"], holders);
+
+        // Errors written before the field existed carry no `details` key and
+        // must still decode.
+        let legacy: StableError = serde_json::from_value(json!({
+            "code": "queue_full",
+            "class": "transient",
+            "retry_after_ms": 25,
+            "safe_to_retry_same_request": true,
+        }))
+        .expect("deserialize legacy error");
+        assert_eq!(legacy, StableError::queue_full(Some(25)));
+
+        // `details` is an object on the wire; any other JSON type is refused.
+        let not_object = serde_json::from_value::<StableError>(json!({
+            "code": "unknown_model",
+            "class": "permanent",
+            "safe_to_retry_same_request": false,
+            "details": "no-such-model",
+        }));
+        assert!(not_object.is_err());
+    }
+
+    fn details(value: Value) -> Map<String, Value> {
+        match value {
+            Value::Object(map) => map,
+            other => panic!("details must be a JSON object, got {other}"),
+        }
     }
 
     #[test]
