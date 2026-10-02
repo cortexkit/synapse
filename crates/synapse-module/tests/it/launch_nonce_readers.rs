@@ -91,6 +91,19 @@ fn collect(directory: &Path, inside_src: bool, found: &mut Vec<PathBuf>) {
     }
 }
 
+/// Every direct nonce read under `root`, as `path:line: text` relative to it.
+fn tree_nonce_reads(root: &Path) -> Vec<String> {
+    let mut offenders = Vec::new();
+    for path in &shipped_sources(root) {
+        let source = std::fs::read_to_string(path).expect("read source file");
+        let relative = path.strip_prefix(root).unwrap_or(path);
+        for (line, text) in nonce_reads_in_file(relative, &source) {
+            offenders.push(format!("{}:{line}: {text}", relative.display()));
+        }
+    }
+    offenders
+}
+
 #[test]
 fn no_workspace_source_reads_the_launch_nonce_around_the_sdk() {
     let root = workspace_root();
@@ -102,14 +115,7 @@ fn no_workspace_source_reads_the_launch_nonce_around_the_sdk() {
         root.display()
     );
 
-    let mut offenders = Vec::new();
-    for path in &sources {
-        let source = std::fs::read_to_string(path).expect("read source file");
-        for (line, text) in nonce_reads_in_file(path.strip_prefix(&root).unwrap_or(path), &source) {
-            let relative = path.strip_prefix(&root).unwrap_or(path);
-            offenders.push(format!("{}:{line}: {text}", relative.display()));
-        }
-    }
+    let offenders = tree_nonce_reads(&root);
     assert!(
         offenders.is_empty(),
         "read the launch nonce through subc_client_rs::launch_nonce(), not the \
@@ -149,6 +155,42 @@ fn the_scan_flags_direct_reads_and_leaves_other_nonces_alone() {
     );
     assert!(shipped_sources(&workspace_root()).contains(&runner.canonicalize().unwrap()));
     assert!(direct_nonce_reads(&source).is_empty());
+}
+
+/// Runs the whole tree scan, inventory walk included, over a scratch workspace
+/// with a read planted in a nested member's `src/`, and in places the walk must
+/// skip. The snippet controls above prove the line matcher; this proves the
+/// walk actually reaches the files the matcher is meant to see.
+#[test]
+fn the_tree_scan_finds_a_read_planted_in_a_nested_member() {
+    let root = std::env::temp_dir().join(format!(
+        "synapse-tests/nonce-scan-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let read = r#"let nonce = std::env::var("SUBC_LAUNCH_NONCE");"#;
+    for (file, body) in [
+        ("crates/outer/inner/src/deep/lib.rs", read),
+        ("bench/lane/src/main.rs", "fn main() {}"),
+        ("crates/outer/target/debug/build/gen.rs", read),
+        ("crates/outer/tests/fixture.rs", read),
+    ] {
+        let path = root.join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, body).unwrap();
+    }
+    let offenders = tree_nonce_reads(&root);
+    std::fs::remove_dir_all(&root).unwrap();
+    assert_eq!(
+        offenders,
+        vec![format!(
+            "{}:1: {read}",
+            Path::new("crates/outer/inner/src/deep/lib.rs").display()
+        )]
+    );
 }
 
 // Only child_process.rs's remove_launch_nonce helper may name the SDK constants,
