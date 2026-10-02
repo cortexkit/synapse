@@ -8,6 +8,7 @@
 //! into a startup panic, and nothing in production notices because the daemon
 //! always injects the variable. These tests pin the two arms apart.
 
+#[path = "../common/mod.rs"]
 mod common;
 
 use std::path::{Path, PathBuf};

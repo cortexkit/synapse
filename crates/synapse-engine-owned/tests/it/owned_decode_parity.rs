@@ -41,7 +41,7 @@
 //! SYNAPSE_OWNED_DECODE_QWEN3_0_6B=<qwen3-snapshot> \
 //! SYNAPSE_OWNED_DECODE_LFM2_1_2B=<lfm2-snapshot> \
 //! SYNAPSE_OWNED_DECODE_SPIKE_REFERENCES=<spike-fixtures-dir> \
-//! cargo test -p synapse-engine-owned --release --test owned_decode_parity -- --ignored --nocapture
+//! cargo test -p synapse-engine-owned --release --test it owned_decode_parity:: -- --ignored --nocapture
 //! ```
 
 #![cfg(target_os = "macos")]

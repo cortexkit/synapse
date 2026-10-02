@@ -45,7 +45,7 @@
 //! ```text
 //! DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
 //! SYNAPSE_OWNED_DECODE_QWEN3_0_6B=<qwen3-snapshot> \
-//! cargo test -p synapse-engine-owned --release --test owned_decode_prefill_chunking -- --ignored --nocapture
+//! cargo test -p synapse-engine-owned --release --test it owned_decode_prefill_chunking:: -- --ignored --nocapture
 //! ```
 
 #![cfg(target_os = "macos")]
