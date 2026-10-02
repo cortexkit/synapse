@@ -56,16 +56,9 @@ def workflow_triggers(workflow: object) -> object:
     return workflow.get(True)
 
 
-def main() -> int:
-    workflow_path = Path(sys.argv[1])
+def check(workflow: object) -> list[str]:
+    """Every precondition the parsed workflow breaks, as failure lines."""
     failures: list[str] = []
-
-    try:
-        with workflow_path.open(encoding="utf-8") as workflow_file:
-            workflow = yaml.safe_load(workflow_file)
-    except (OSError, yaml.YAMLError) as error:
-        print(f"train precondition failed: cannot parse {workflow_path}: {error}")
-        return 1
 
     triggers = workflow_triggers(workflow)
     push = triggers.get("push") if isinstance(triggers, dict) else None
@@ -144,6 +137,87 @@ def main() -> int:
             "train precondition failed: concurrency.group does not include github.ref"
         )
 
+    return failures
+
+
+def control_workflow() -> dict:
+    """A minimal workflow that satisfies every precondition."""
+    jobs: dict = {"test": {"steps": [{"name": "build", "run": "true"}]}}
+    for job_id, (condition, _reason) in ALLOWED_JOB_CONDITIONS.items():
+        jobs[job_id] = {"if": condition, "steps": [{"run": "true"}]}
+    return {
+        True: {"push": {"branches": ["train/**"]}},
+        "concurrency": {"group": "ci-${{ github.ref }}"},
+        "jobs": jobs,
+    }
+
+
+def self_test() -> list[str]:
+    """Run each refusal arm against a planted violation before the real check.
+
+    A checker whose pattern drifts until it matches nothing would pass every
+    workflow, so each arm must refuse its own planted break here, and the clean
+    control must pass, or the whole run fails instead of reporting clean.
+    """
+    manual_job = next(iter(ALLOWED_JOB_CONDITIONS))
+
+    def no_train(w):
+        w[True]["push"]["branches"] = ["main"]
+
+    def master(w):
+        w[True]["push"]["branches"].append("master")
+
+    def job_if(w):
+        w["jobs"]["test"]["if"] = "github.ref == 'refs/heads/master'"
+
+    def step_if(w):
+        w["jobs"]["test"]["steps"][0]["if"] = "github.event_name == 'push'"
+
+    def gate_drift(w):
+        del w["jobs"][manual_job]["if"]
+
+    def concurrency(w):
+        w["concurrency"]["group"] = "ci-${{ github.workflow }}"
+
+    arms = [
+        (no_train, "push trigger does not include branch train/**"),
+        (master, "push trigger includes master"),
+        (job_if, "path-dependent if at job 'test':"),
+        (step_if, "path-dependent if at job 'test', step 'build'"),
+        (gate_drift, f"manual gate allow-list drift at job '{manual_job}'"),
+        (concurrency, "concurrency.group does not include github.ref"),
+    ]
+    problems: list[str] = []
+    clean = check(control_workflow())
+    if clean:
+        problems.append(f"the clean control workflow was refused: {clean}")
+    for plant, expected in arms:
+        workflow = control_workflow()
+        plant(workflow)
+        found = check(workflow)
+        if len(found) != 1 or expected not in found[0]:
+            problems.append(f"planting {plant.__name__} expected one '{expected}' refusal, got {found}")
+    if not problems:
+        print(f"train precondition self-test: clean control passed, {len(arms)} planted breaks refused")
+    return problems
+
+
+def main() -> int:
+    problems = self_test()
+    if problems:
+        for problem in problems:
+            print(f"train precondition self-test failed: {problem}")
+        return 1
+
+    workflow_path = Path(sys.argv[1])
+    try:
+        with workflow_path.open(encoding="utf-8") as workflow_file:
+            workflow = yaml.safe_load(workflow_file)
+    except (OSError, yaml.YAMLError) as error:
+        print(f"train precondition failed: cannot parse {workflow_path}: {error}")
+        return 1
+
+    failures = check(workflow)
     for failure in failures:
         print(failure)
     return 1 if failures else 0
