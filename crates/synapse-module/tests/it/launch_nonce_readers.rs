@@ -184,13 +184,12 @@ fn the_tree_scan_finds_a_read_planted_in_a_nested_member() {
     }
     let offenders = tree_nonce_reads(&root);
     std::fs::remove_dir_all(&root).unwrap();
-    assert_eq!(
-        offenders,
-        vec![format!(
-            "{}:1: {read}",
-            Path::new("crates/outer/inner/src/deep/lib.rs").display()
-        )]
-    );
+    // Built from components so the expected path uses the platform separator,
+    // the same way the scan renders the path it walked.
+    let planted: PathBuf = ["crates", "outer", "inner", "src", "deep", "lib.rs"]
+        .iter()
+        .collect();
+    assert_eq!(offenders, vec![format!("{}:1: {read}", planted.display())]);
 }
 
 // Only child_process.rs's remove_launch_nonce helper may name the SDK constants,
