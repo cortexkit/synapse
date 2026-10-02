@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ane::{Executable, Graph, NSQualityOfService, Shape, Tensor, TensorData};
 use anyhow::{bail, ensure, Context, Result};
@@ -99,6 +99,15 @@ struct Cli {
     warm_repetitions: usize,
     report: Option<PathBuf>,
     vectors_out: Option<PathBuf>,
+    /// Milliseconds to sleep after each timed prediction returns and before the
+    /// next one is submitted. Zero keeps the historical back-to-back dispatch.
+    gap_ms: f64,
+    /// Interleaved dispatch-gap experiment: block `b` sleeps
+    /// `block_gaps_ms[b % len]` between predictions. Disabled when `blocks` is 0.
+    block_gaps_ms: Vec<f64>,
+    blocks: usize,
+    calls_per_block: usize,
+    per_call_out: Option<PathBuf>,
 }
 
 #[derive(Serialize)]
@@ -123,7 +132,60 @@ struct RowMetric {
     active_tokens: usize,
     cosine: f32,
     warm_wall_ms_median: f64,
+    /// Every warm call in submission order, so a stall is not averaged away.
+    warm_wall_ms: Vec<f64>,
     deterministic: bool,
+}
+
+/// One block of the interleaved dispatch-gap experiment.
+#[derive(Serialize)]
+struct GapBlock {
+    block: usize,
+    gap_ms: f64,
+    load_1m_start: f64,
+    load_5m_start: f64,
+    load_1m_end: f64,
+    load_5m_end: f64,
+    calls: usize,
+    /// Block wall time from first submission to the end of the last sleep.
+    elapsed_ms: f64,
+    /// Sum of per-call wall times, gap excluded.
+    call_ms_sum: f64,
+    /// Sum of measured sleeps; the OS may overshoot the requested gap.
+    slept_ms_sum: f64,
+    /// Calls whose normalized vector differed in any bit from the row's
+    /// correctness-phase vector.
+    output_mismatches: usize,
+}
+
+/// One timed prediction of the interleaved dispatch-gap experiment.
+#[derive(Serialize)]
+struct GapCall {
+    block: usize,
+    gap_ms: f64,
+    index_in_block: usize,
+    row: String,
+    /// Submission time relative to the start of the first block.
+    started_ms: f64,
+    wall_ms: f64,
+    /// Measured sleep that followed this call.
+    slept_ms: f64,
+    identical: bool,
+    /// Wall time of each `run_cached` inside the prediction, in order:
+    /// embedding norm, each layer chunk, final norm.
+    dispatch_ms: Vec<f64>,
+}
+
+#[derive(Serialize)]
+struct GapExperiment {
+    sequence_length: usize,
+    arms_gap_ms: Vec<f64>,
+    calls_per_block: usize,
+    dispatches_per_call: usize,
+    row_order: Vec<String>,
+    timing_note: &'static str,
+    blocks: Vec<GapBlock>,
+    calls: Vec<GapCall>,
 }
 
 #[derive(Serialize)]
@@ -149,6 +211,10 @@ struct Report {
     checkpoint_metrics: Vec<CheckpointMetric>,
     one_minute_load_average: f64,
     timing_note: &'static str,
+    /// Sleep inserted after each warm call before the next was submitted.
+    gap_ms: f64,
+    /// Per-block summary of the interleaved gap experiment, empty when off.
+    gap_blocks: Vec<GapBlock>,
     vectors: Vec<Vec<f32>>,
 }
 
@@ -175,7 +241,8 @@ fn parse_cli() -> Result<Cli> {
     let mut args = std::env::args().skip(1);
     let snapshot = args.next().map(PathBuf::from).context(
         "usage: modernbert_full SNAPSHOT ROWS [--seq N] [--layers-per-executable N] \
-         [--warm-repetitions N] [--report PATH] [--vectors-out PATH]",
+         [--warm-repetitions N] [--report PATH] [--vectors-out PATH] [--gap-ms MS] \
+         [--block-gaps-ms MS,MS,...] [--blocks N] [--calls-per-block N] [--per-call-out PATH]",
     )?;
     let rows = args
         .next()
@@ -189,6 +256,11 @@ fn parse_cli() -> Result<Cli> {
         warm_repetitions: 5,
         report: None,
         vectors_out: None,
+        gap_ms: 0.0,
+        block_gaps_ms: vec![0.0, 3.0],
+        blocks: 0,
+        calls_per_block: 400,
+        per_call_out: None,
     };
     while let Some(flag) = args.next() {
         let value = args
@@ -205,6 +277,19 @@ fn parse_cli() -> Result<Cli> {
             }
             "--report" => cli.report = Some(PathBuf::from(value)),
             "--vectors-out" => cli.vectors_out = Some(PathBuf::from(value)),
+            "--gap-ms" => cli.gap_ms = value.parse().context("invalid --gap-ms")?,
+            "--block-gaps-ms" => {
+                cli.block_gaps_ms = value
+                    .split(',')
+                    .map(|part| part.trim().parse::<f64>())
+                    .collect::<Result<_, _>>()
+                    .context("invalid --block-gaps-ms")?
+            }
+            "--blocks" => cli.blocks = value.parse().context("invalid --blocks")?,
+            "--calls-per-block" => {
+                cli.calls_per_block = value.parse().context("invalid --calls-per-block")?
+            }
+            "--per-call-out" => cli.per_call_out = Some(PathBuf::from(value)),
             other => bail!("unknown argument {other}"),
         }
     }
@@ -219,6 +304,22 @@ fn parse_cli() -> Result<Cli> {
     ensure!(
         cli.warm_repetitions > 0,
         "warm repetitions must be positive"
+    );
+    ensure!(
+        cli.gap_ms.is_finite() && cli.gap_ms >= 0.0,
+        "--gap-ms must be a non-negative number"
+    );
+    ensure!(
+        !cli.block_gaps_ms.is_empty()
+            && cli
+                .block_gaps_ms
+                .iter()
+                .all(|gap| gap.is_finite() && *gap >= 0.0),
+        "--block-gaps-ms must list non-negative numbers"
+    );
+    ensure!(
+        cli.blocks == 0 || cli.calls_per_block > 0,
+        "calls per block must be positive"
     );
     Ok(cli)
 }
@@ -830,6 +931,27 @@ impl AneModel {
         config: &Config,
         capture: bool,
     ) -> Result<(Vec<f32>, Vec<Vec<f32>>)> {
+        self.run_timed(row, weights, config, capture, None)
+    }
+
+    /// `run`, optionally appending the wall time of every `run_cached` in
+    /// submission order so a stall can be attributed to one dispatch.
+    fn run_timed(
+        &self,
+        row: &[u32],
+        weights: &Weights,
+        config: &Config,
+        capture: bool,
+        mut dispatch_ms: Option<&mut Vec<f64>>,
+    ) -> Result<(Vec<f32>, Vec<Vec<f32>>)> {
+        let mut timed = |run: &mut dyn FnMut() -> Result<()>| -> Result<()> {
+            let started = Instant::now();
+            run()?;
+            if let Some(times) = dispatch_ms.as_deref_mut() {
+                times.push(started.elapsed().as_secs_f64() * 1_000.0);
+            }
+            Ok(())
+        };
         let sequence_length = self.shape.width;
         self.raw
             .copy_from_f32(&raw_embeddings(row, weights, config, sequence_length)?);
@@ -842,9 +964,11 @@ impl AneModel {
             };
         }
         self.key_mask.copy_from_f32(&mask);
-        self.embedding
-            .run_cached(&[&self.raw], &[&self.hidden_a])
-            .context("run embedding norm")?;
+        timed(&mut || {
+            self.embedding
+                .run_cached(&[&self.raw], &[&self.hidden_a])
+                .context("run embedding norm")
+        })?;
         let mut checkpoints = Vec::new();
         if capture {
             checkpoints.push(surface_cls(
@@ -859,9 +983,11 @@ impl AneModel {
             } else {
                 (&self.hidden_b, &self.hidden_a)
             };
-            executable
-                .run_cached(&[source, &self.key_mask], &[destination])
-                .with_context(|| format!("run through layer {}", self.chunk_ends[index]))?;
+            timed(&mut || {
+                executable
+                    .run_cached(&[source, &self.key_mask], &[destination])
+                    .with_context(|| format!("run through layer {}", self.chunk_ends[index]))
+            })?;
             if capture {
                 checkpoints.push(surface_cls(
                     destination,
@@ -875,9 +1001,11 @@ impl AneModel {
         } else {
             &self.hidden_b
         };
-        self.final_norm
-            .run_cached(&[final_input], &[&self.raw])
-            .context("run final norm")?;
+        timed(&mut || {
+            self.final_norm
+                .run_cached(&[final_input], &[&self.raw])
+                .context("run final norm")
+        })?;
         let cls = surface_cls(&self.raw, sequence_length, config.hidden_size);
         if capture {
             checkpoints.push(cls.clone());
@@ -1206,13 +1334,116 @@ fn byte_identical(left: &[f32], right: &[f32]) -> bool {
 }
 
 fn load_average() -> f64 {
+    load_averages().0
+}
+
+/// One- and five-minute load averages, NaN where the system did not report one.
+fn load_averages() -> (f64, f64) {
     let mut values = [f64::NAN; 3];
     let count = unsafe { getloadavg(values.as_mut_ptr(), values.len() as i32) };
-    if count > 0 {
-        values[0]
-    } else {
-        f64::NAN
+    (
+        if count > 0 { values[0] } else { f64::NAN },
+        if count > 1 { values[1] } else { f64::NAN },
+    )
+}
+
+/// Sleeps for `gap_ms` and returns the measured sleep in milliseconds; a zero
+/// gap returns immediately without a syscall so the default path is unchanged.
+fn sleep_gap(gap_ms: f64) -> f64 {
+    if gap_ms <= 0.0 {
+        return 0.0;
     }
+    let started = Instant::now();
+    std::thread::sleep(Duration::from_secs_f64(gap_ms / 1_000.0));
+    started.elapsed().as_secs_f64() * 1_000.0
+}
+
+/// Rounds to microsecond resolution so the per-call file stays readable.
+fn round_ms(value: f64) -> f64 {
+    (value * 1_000.0).round() / 1_000.0
+}
+
+/// Interleaved A/B over dispatch gaps on the already-compiled model. Block `b`
+/// uses `block_gaps_ms[b % len]`, so arms alternate and share drift in machine
+/// load. Each block cycles through the rows in file order. Every output is
+/// compared bit-for-bit with that row's correctness-phase vector, so a gap
+/// that changed results would show up as a mismatch rather than a speedup.
+fn run_gap_experiment(
+    cli: &Cli,
+    model: &AneModel,
+    rows: &[InputRow],
+    weights: &Weights,
+    config: &Config,
+    reference_vectors: &[Vec<f32>],
+) -> Result<GapExperiment> {
+    let mut blocks = Vec::with_capacity(cli.blocks);
+    let mut calls = Vec::with_capacity(cli.blocks * cli.calls_per_block);
+    let experiment_start = Instant::now();
+    for block in 0..cli.blocks {
+        let gap_ms = cli.block_gaps_ms[block % cli.block_gaps_ms.len()];
+        let (load_1m_start, load_5m_start) = load_averages();
+        let block_start = Instant::now();
+        let mut call_ms_sum = 0.0;
+        let mut slept_ms_sum = 0.0;
+        let mut output_mismatches = 0;
+        for index_in_block in 0..cli.calls_per_block {
+            let row_index = index_in_block % rows.len();
+            let ids = rows[row_index].ids(cli.sequence_length)?;
+            let mut dispatch_ms = Vec::with_capacity(model.chunks.len() + 2);
+            let started_ms = experiment_start.elapsed().as_secs_f64() * 1_000.0;
+            let started = Instant::now();
+            let (vector, _) = model.run_timed(ids, weights, config, false, Some(&mut dispatch_ms))?;
+            let wall_ms = started.elapsed().as_secs_f64() * 1_000.0;
+            let slept_ms = sleep_gap(gap_ms);
+            let identical = byte_identical(&vector, &reference_vectors[row_index]);
+            if !identical {
+                output_mismatches += 1;
+            }
+            call_ms_sum += wall_ms;
+            slept_ms_sum += slept_ms;
+            calls.push(GapCall {
+                block,
+                gap_ms,
+                index_in_block,
+                row: rows[row_index].id.clone(),
+                started_ms: round_ms(started_ms),
+                wall_ms: round_ms(wall_ms),
+                slept_ms: round_ms(slept_ms),
+                identical,
+                dispatch_ms: dispatch_ms.into_iter().map(round_ms).collect(),
+            });
+        }
+        let elapsed_ms = block_start.elapsed().as_secs_f64() * 1_000.0;
+        let (load_1m_end, load_5m_end) = load_averages();
+        eprintln!(
+            "block {block} gap {gap_ms} ms: {} calls, mean {:.3} ms, load {load_1m_start:.2}->{load_1m_end:.2}, mismatches {output_mismatches}",
+            cli.calls_per_block,
+            call_ms_sum / cli.calls_per_block as f64
+        );
+        blocks.push(GapBlock {
+            block,
+            gap_ms,
+            load_1m_start,
+            load_5m_start,
+            load_1m_end,
+            load_5m_end,
+            calls: cli.calls_per_block,
+            elapsed_ms: round_ms(elapsed_ms),
+            call_ms_sum: round_ms(call_ms_sum),
+            slept_ms_sum: round_ms(slept_ms_sum),
+            output_mismatches,
+        });
+    }
+    Ok(GapExperiment {
+        sequence_length: cli.sequence_length,
+        arms_gap_ms: cli.block_gaps_ms.clone(),
+        calls_per_block: cli.calls_per_block,
+        dispatches_per_call: model.chunks.len() + 2,
+        row_order: rows.iter().map(|row| row.id.clone()).collect(),
+        timing_note: "wall clock per prediction (CPU embedding gather, IOSurface conversion and every dispatch included, gap sleep excluded); dispatch_ms times each run_cached alone",
+        blocks,
+        calls,
+    })
 }
 
 fn checkpoint_labels(config: &Config, chunk_ends: &[usize]) -> Vec<String> {
@@ -1308,22 +1539,36 @@ fn main() -> Result<()> {
         let (repeated, _) = model.run(ids, &weights, &config, false)?;
         let row_deterministic = byte_identical(&candidate, &repeated);
         deterministic &= row_deterministic;
-        let mut timings = Vec::with_capacity(cli.warm_repetitions);
+        let mut warm_wall_ms = Vec::with_capacity(cli.warm_repetitions);
         for _ in 0..cli.warm_repetitions {
             let started = Instant::now();
             let _ = model.run(ids, &weights, &config, false)?;
-            timings.push(started.elapsed().as_secs_f64() * 1_000.0);
+            warm_wall_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+            sleep_gap(cli.gap_ms);
         }
+        let mut timings = warm_wall_ms.clone();
         timings.sort_by(f64::total_cmp);
         row_metrics.push(RowMetric {
             id: row.id.clone(),
             active_tokens: ids.len(),
             cosine: row_cosine,
             warm_wall_ms_median: timings[timings.len() / 2],
+            warm_wall_ms,
             deterministic: row_deterministic,
         });
         output_vectors.push(candidate);
     }
+
+    let gap_blocks = if cli.blocks > 0 {
+        let experiment = run_gap_experiment(&cli, &model, &rows, &weights, &config, &output_vectors)?;
+        if let Some(path) = &cli.per_call_out {
+            let json = serde_json::to_vec(&experiment).context("serialize per-call data")?;
+            write_json(path, &json)?;
+        }
+        experiment.blocks
+    } else {
+        Vec::new()
+    };
 
     let checkpoint_metrics = labels
         .into_iter()
@@ -1378,6 +1623,8 @@ fn main() -> Result<()> {
         checkpoint_metrics,
         one_minute_load_average: load_average(),
         timing_note: "warm per-row wall clock; embedding gather, IOSurface conversion, and dispatch overhead included",
+        gap_ms: cli.gap_ms,
+        gap_blocks,
         vectors: output_vectors,
     };
     let json = serde_json::to_vec_pretty(&report).context("serialize report")?;
