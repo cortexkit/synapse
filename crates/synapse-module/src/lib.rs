@@ -6347,7 +6347,7 @@ fn run_owned_cuda_probe(
         .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
         .unwrap_or_default();
     let fail = |reason: String| format!("{reason}; stderr: {stderr}");
-    let status = status.map_err(&fail)?;
+    let status = status.map_err(fail)?;
     if !status.success() {
         return Err(fail(format!("CUDA floor probe exited {status}")));
     }

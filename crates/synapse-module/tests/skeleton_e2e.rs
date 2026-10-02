@@ -115,6 +115,27 @@ impl Drop for RemoteMockProvider {
     }
 }
 
+/// Decrements `counter` if it is above zero and reports whether it did.
+///
+/// Written as a compare-exchange loop rather than `fetch_update`, which Rust
+/// 1.99 deprecates; its replacement `try_update` does not exist on 1.98, and
+/// this file must build on both.
+fn take_one(counter: &AtomicUsize) -> bool {
+    let mut current = counter.load(Ordering::SeqCst);
+    while current > 0 {
+        match counter.compare_exchange_weak(
+            current,
+            current - 1,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => return true,
+            Err(actual) => current = actual,
+        }
+    }
+    false
+}
+
 async fn serve_remote_mock_request(
     mut stream: TcpStream,
     failures_remaining: Arc<AtomicUsize>,
@@ -155,12 +176,7 @@ async fn serve_remote_mock_request(
         request.extend_from_slice(&buffer[..read]);
     }
     requests.fetch_add(1, Ordering::SeqCst);
-    if failures_remaining
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-            remaining.checked_sub(1)
-        })
-        .is_ok()
-    {
+    if take_one(&failures_remaining) {
         let _ =
             write_mock_http_response(&mut stream, 500, serde_json::json!({"error":"storm"})).await;
         return;
