@@ -21,3 +21,6 @@ reqwest = { workspace = true }
 
 [dev-dependencies]
 ahash = "0.8"
+
+[build-dependencies]
+serde_json = { workspace = true }

@@ -620,15 +620,15 @@ mod tests {
         assert_eq!(identity.storage_dtype, "f16");
         assert_eq!(identity.ptx_virtual_arch, "compute_75");
         assert_eq!(identity.minimum_device_cc, "7.5");
-        assert_eq!(identity.minimum_cuda_driver_api, 13_020);
+        assert_eq!(identity.minimum_cuda_driver_api, 13_000);
     }
 
     #[test]
     fn floor_includes_driver_and_compute_capability_boundaries() {
-        assert!(!device_meets_floor(13_019, 7, 5));
-        assert!(!device_meets_floor(13_020, 7, 4));
-        assert!(device_meets_floor(13_020, 7, 5));
-        assert!(device_meets_floor(13_020, 8, 0));
+        assert!(!device_meets_floor(12_999, 7, 5));
+        assert!(!device_meets_floor(13_000, 7, 4));
+        assert!(device_meets_floor(13_000, 7, 5));
+        assert!(device_meets_floor(13_000, 8, 0));
     }
 
     #[test]

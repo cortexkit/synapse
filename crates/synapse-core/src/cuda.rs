@@ -10,43 +10,36 @@ pub const OWNED_CUDA_ENGINE: &str = CUDA_WORKER_ENGINE;
 /// The backend identity describes PTX executed by the CUDA driver JIT.
 pub const OWNED_CUDA_BACKEND: &str = "cuda-ptx";
 pub const OWNED_CUDA_PTX_VIRTUAL_ARCH: &str = "compute_75";
-pub const OWNED_CUDA_MINIMUM_DEVICE_CC: f32 = manifest_floor_integer(b"\"cuda_min_compute_major\"")
-    as f32
-    + manifest_floor_integer(b"\"cuda_min_compute_minor\"") as f32 / 10.0;
-pub const OWNED_CUDA_MINIMUM_DRIVER_API: u32 = manifest_floor_integer(b"\"cuda_min_driver_api\"");
+pub const OWNED_CUDA_MINIMUM_DEVICE_CC: f32 =
+    build_floor_integer(env!("SYNAPSE_CUDA_MIN_COMPUTE_MAJOR")) as f32
+        + build_floor_integer(env!("SYNAPSE_CUDA_MIN_COMPUTE_MINOR")) as f32 / 10.0;
+pub const OWNED_CUDA_MINIMUM_DRIVER_API: u32 =
+    build_floor_integer(env!("SYNAPSE_CUDA_MIN_DRIVER_API"));
 
-// These public constants retain their existing API while taking their values
-// from the first CUDA profile in bench/parity/models.json. Evaluation runs at
-// compile time, so an absent integer fails the build instead of using a default.
-const fn manifest_floor_integer(key: &[u8]) -> u32 {
-    let bytes = include_bytes!("../../../bench/parity/models.json");
+// The build script validates JSON and agreement across every CUDA profile.
+// This conversion only reads its decimal environment values, keeping the
+// public numeric constants usable in const contexts without reading JSON again.
+const fn build_floor_integer(value: &str) -> u32 {
+    let bytes = value.as_bytes();
+    assert!(!bytes.is_empty(), "empty build floor integer");
+    let mut number = 0u32;
     let mut i = 0;
-    while i + key.len() < bytes.len() {
-        let mut j = 0;
-        while j < key.len() && bytes[i + j] == key[j] {
-            j += 1;
-        }
-        if j == key.len() {
-            i += j;
-            while i < bytes.len()
-                && (bytes[i] == b' ' || bytes[i] == b':' || bytes[i] == b'\n' || bytes[i] == b'\r')
-            {
-                i += 1;
-            }
-            let mut value = 0;
-            let start = i;
-            while i < bytes.len() && bytes[i] >= b'0' && bytes[i] <= b'9' {
-                value = value * 10 + (bytes[i] - b'0') as u32;
-                i += 1;
-            }
-            if i == start {
-                panic!("CUDA floor must be an integer");
-            }
-            return value;
-        }
+    while i < bytes.len() {
+        assert!(
+            bytes[i] >= b'0' && bytes[i] <= b'9',
+            "invalid build floor integer"
+        );
+        number = match number.checked_mul(10) {
+            Some(n) => n,
+            None => panic!("build floor integer overflow"),
+        };
+        number = match number.checked_add((bytes[i] - b'0') as u32) {
+            Some(n) => n,
+            None => panic!("build floor integer overflow"),
+        };
         i += 1;
     }
-    panic!("CUDA floor is missing from manifest");
+    number
 }
 pub const OWNED_CUDA_IDENTITY_REVISION: &str = "owned-cuda-identity-v1";
 pub const MACHINE_PROFILE_HASH_REVISION: &str = "machine-profile-v2";
@@ -229,20 +222,20 @@ mod tests {
     #[test]
     fn floor_rejects_driver_boundary_and_accepts_it_at_the_floor() {
         assert_eq!(
-            evaluate_cuda_floor(13019, 7, 5, None).refusal_code(),
+            evaluate_cuda_floor(12999, 7, 5, None).refusal_code(),
             Some("cuda_driver_too_old")
         );
-        assert!(evaluate_cuda_floor(13020, 7, 5, None).is_supported());
+        assert!(evaluate_cuda_floor(13000, 7, 5, None).is_supported());
     }
 
     #[test]
     fn floor_rejects_compute_boundary_and_accepts_above_it() {
         assert_eq!(
-            evaluate_cuda_floor(13020, 7, 4, None).refusal_code(),
+            evaluate_cuda_floor(13000, 7, 4, None).refusal_code(),
             Some("cuda_compute_capability_too_low")
         );
-        assert!(evaluate_cuda_floor(13020, 7, 5, None).is_supported());
-        assert!(evaluate_cuda_floor(13020, 8, 0, None).is_supported());
+        assert!(evaluate_cuda_floor(13000, 7, 5, None).is_supported());
+        assert!(evaluate_cuda_floor(13000, 8, 0, None).is_supported());
     }
 
     #[test]
@@ -252,7 +245,7 @@ mod tests {
         assert_eq!(identity.build_flags["backend"], OWNED_CUDA_BACKEND);
         assert_eq!(identity.build_flags["ptx_virtual_arch"], "compute_75");
         assert_eq!(identity.build_flags["minimum_device_cc"], "7.5");
-        assert_eq!(identity.build_flags["minimum_cuda_driver_api"], "13020");
+        assert_eq!(identity.build_flags["minimum_cuda_driver_api"], "13000");
         assert_eq!(identity.build_flags["risk_class"], "abort_capable");
     }
 

@@ -44,15 +44,15 @@ try {
     $present = Invoke-Worker $exe '--probe-floor'
     if ($present.Code -eq 0) {
         $floor = $present.Out | ConvertFrom-Json
-        if ($floor.status -ne 'ok' -or $floor.code -ne 'ok' -or $floor.required.driver_api -ne 13020 -or $floor.observed.driver_api -lt 13020 -or $floor.observed.compute_capability.major -lt 7 -or ($floor.observed.compute_capability.major -eq 7 -and $floor.observed.compute_capability.minor -lt 5)) {
-            throw 'GPU below owned-CUDA floor: driver API >= 13020 and compute capability >= 7.5 required'
+        if ($floor.status -ne 'ok' -or $floor.code -ne 'ok' -or $floor.required.driver_api -ne 13000 -or $floor.observed.driver_api -lt 13000 -or $floor.observed.compute_capability.major -lt 7 -or ($floor.observed.compute_capability.major -eq 7 -and $floor.observed.compute_capability.minor -lt 5)) {
+            throw 'GPU below owned-CUDA floor: driver API >= 13000 and compute capability >= 7.5 required'
         }
         Write-Output "PASS packaged GPU probe: $($present.Out.Trim())"
     } elseif ($RequireGpu) {
         throw "Packaged GPU probe failed: $($present.Code) $($present.Err)"
     } else {
         $floor = $present.Out | ConvertFrom-Json
-        if ($present.Code -ne 2 -or $floor.status -ne 'refused' -or $floor.required.driver_api -ne 13020 -or $floor.code -notin @('cuda_no_driver', 'cuda_driver_too_old', 'cuda_compute_capability_too_low')) {
+        if ($present.Code -ne 2 -or $floor.status -ne 'refused' -or $floor.required.driver_api -ne 13000 -or $floor.code -notin @('cuda_no_driver', 'cuda_driver_too_old', 'cuda_compute_capability_too_low')) {
             throw "Packaged runtime resolution failed: $($present.Code) $($present.Out) $($present.Err)"
         }
         Write-Output "GPU execution not available on this runner: $($present.Out.Trim())"

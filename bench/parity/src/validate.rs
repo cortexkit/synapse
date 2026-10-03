@@ -732,7 +732,7 @@ mod cuda_floor_tests {
                 .get_mut("gte-modernbert-base.owned-vulkan")
                 .unwrap();
             match field {
-                0 => p.cuda_min_driver_api = Some(13020),
+                0 => p.cuda_min_driver_api = Some(13000),
                 1 => p.cuda_min_compute_major = Some(7),
                 _ => p.cuda_min_compute_minor = Some(5),
             };
