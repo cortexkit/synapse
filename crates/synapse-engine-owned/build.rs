@@ -52,19 +52,8 @@ fn main() {
     let out_dir =
         std::path::PathBuf::from(std::env::var_os("OUT_DIR").expect("Cargo must provide OUT_DIR"));
 
-    let xcrun = |args: &[&str]| {
-        let mut cmd = std::process::Command::new("xcrun");
-        if std::env::var_os("DEVELOPER_DIR").is_none() {
-            let xcode_dev = std::path::Path::new("/Applications/Xcode.app/Contents/Developer");
-            if xcode_dev.is_dir() {
-                cmd.env("DEVELOPER_DIR", xcode_dev);
-            }
-        }
-        cmd.args(args);
-        cmd
-    };
-
-    let metal_available = xcrun(&["-sdk", "macosx", "--find", "metal"])
+    let metal_available = std::process::Command::new("xcrun")
+        .args(["-sdk", "macosx", "--find", "metal"])
         .output()
         .is_ok_and(|output| output.status.success());
 
@@ -72,23 +61,25 @@ fn main() {
         // Qwen3 step metallib.
         let qwen3_air_path = out_dir.join("qwen3_decode_metal_step.air");
         let qwen3_metallib_path = out_dir.join("qwen3_decode_metal_step.metallib");
-        let qwen3_metal_status = xcrun(&[
-            "-sdk",
-            "macosx",
-            "metal",
-            "-std=macos-metal2.3",
-            "-c",
-            "owned-decode-engine/src/qwen3_decode_metal_step.metal",
-            "-o",
-        ])
-        .arg(&qwen3_air_path)
-        .status()
-        .expect("run xcrun metal for the Qwen3 step kernels");
+        let qwen3_metal_status = std::process::Command::new("xcrun")
+            .args([
+                "-sdk",
+                "macosx",
+                "metal",
+                "-std=macos-metal2.3",
+                "-c",
+                "owned-decode-engine/src/qwen3_decode_metal_step.metal",
+                "-o",
+            ])
+            .arg(&qwen3_air_path)
+            .status()
+            .expect("run xcrun metal for the Qwen3 step kernels");
         assert!(
             qwen3_metal_status.success(),
             "xcrun metal failed for the Qwen3 step kernels"
         );
-        let qwen3_metallib_status = xcrun(&["-sdk", "macosx", "metallib"])
+        let qwen3_metallib_status = std::process::Command::new("xcrun")
+            .args(["-sdk", "macosx", "metallib"])
             .arg(&qwen3_air_path)
             .arg("-o")
             .arg(&qwen3_metallib_path)
@@ -108,48 +99,51 @@ fn main() {
         // requires for bit-exactness vs the CPU reference.
         let lfm2_air_path = out_dir.join("lfm2_decode_metal_step.air");
         let lfm2_metallib_path = out_dir.join("lfm2_decode_metal_step.metallib");
-        let lfm2_metal_status = xcrun(&[
-            "-sdk",
-            "macosx",
-            "metal",
-            "-std=macos-metal2.3",
-            // IEEE-strict math: the conv step must reproduce the CPU
-            // reference bit-for-bit, so disable Metal's default fast-math
-            // (reassociation) and FMA contraction.
-            "-fno-fast-math",
-            "-ffp-contract=off",
-            "-c",
-            "owned-decode-engine/src/lfm2_decode_metal_step.metal",
-            "-o",
-        ])
-        .arg(&lfm2_air_path)
-        .status()
-        .expect("run xcrun metal for the LFM2 step kernels");
+        let lfm2_metal_status = std::process::Command::new("xcrun")
+            .args([
+                "-sdk",
+                "macosx",
+                "metal",
+                "-std=macos-metal2.3",
+                // IEEE-strict math: the conv step must reproduce the CPU
+                // reference bit-for-bit, so disable Metal's default fast-math
+                // (reassociation) and FMA contraction.
+                "-fno-fast-math",
+                "-ffp-contract=off",
+                "-c",
+                "owned-decode-engine/src/lfm2_decode_metal_step.metal",
+                "-o",
+            ])
+            .arg(&lfm2_air_path)
+            .status()
+            .expect("run xcrun metal for the LFM2 step kernels");
         assert!(
             lfm2_metal_status.success(),
             "xcrun metal failed for the LFM2 step kernels"
         );
         // Reused Qwen3 step kernels compiled IEEE-strict into the LFM2 metallib.
         let lfm2_reused_air_path = out_dir.join("lfm2_reused_qwen3_step.air");
-        let lfm2_reused_metal_status = xcrun(&[
-            "-sdk",
-            "macosx",
-            "metal",
-            "-std=macos-metal2.3",
-            "-fno-fast-math",
-            "-ffp-contract=off",
-            "-c",
-            "owned-decode-engine/src/qwen3_decode_metal_step.metal",
-            "-o",
-        ])
-        .arg(&lfm2_reused_air_path)
-        .status()
-        .expect("run xcrun metal for the reused Qwen3 step kernels (LFM2 lib)");
+        let lfm2_reused_metal_status = std::process::Command::new("xcrun")
+            .args([
+                "-sdk",
+                "macosx",
+                "metal",
+                "-std=macos-metal2.3",
+                "-fno-fast-math",
+                "-ffp-contract=off",
+                "-c",
+                "owned-decode-engine/src/qwen3_decode_metal_step.metal",
+                "-o",
+            ])
+            .arg(&lfm2_reused_air_path)
+            .status()
+            .expect("run xcrun metal for the reused Qwen3 step kernels (LFM2 lib)");
         assert!(
             lfm2_reused_metal_status.success(),
             "xcrun metal failed for the reused Qwen3 step kernels (LFM2 lib)"
         );
-        let lfm2_metallib_status = xcrun(&["-sdk", "macosx", "metallib"])
+        let lfm2_metallib_status = std::process::Command::new("xcrun")
+            .args(["-sdk", "macosx", "metallib"])
             .arg(&lfm2_air_path)
             .arg(&lfm2_reused_air_path)
             .arg("-o")
