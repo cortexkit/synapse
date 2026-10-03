@@ -6638,6 +6638,7 @@ dependencies = [
  "subc-transport",
  "synapse-core",
  "synapse-engine-owned",
+ "synapse-module",
  "thiserror 1.0.69",
  "tokenizers 0.21.4",
  "tokio",

@@ -58,6 +58,11 @@ subc-os = { workspace = true }
 subc-transport = { workspace = true }
 tokenizers = { workspace = true }
 synapse-engine-owned = { path = "../synapse-engine-owned", features = ["test-support"] }
+# Turns on this crate's own test-support feature in test builds, so the
+# ck-synapse binary the end-to-end tests spawn honours the SYNAPSE_TEST_*
+# overrides (catalog, runnable backends, download barriers). Release builds
+# never see it.
+synapse-module = { path = ".", features = ["test-support"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
