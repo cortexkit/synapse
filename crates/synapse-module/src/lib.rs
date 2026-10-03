@@ -5660,12 +5660,12 @@ async fn load_catalog_model_task(
         )
     })
     .await
-    .map_err(|error| {
-        WireOperationError::from_stable(
+    .unwrap_or_else(|error| {
+        Err(WireOperationError::from_stable(
             StableError::engine_crashed(Some(100)),
             format!("model load join failed: {error}"),
-        )
-    })?;
+        ))
+    });
     match loaded {
         Ok(model) => {
             let cold_load_ms = load_started.elapsed().as_secs_f64() * 1_000.0;
@@ -5674,6 +5674,14 @@ async fn load_catalog_model_task(
             Ok(model)
         }
         Err(error) => {
+            let error = if is_catalog {
+                WireOperationError::from_stable(
+                    StableError::engine_crashed(Some(250)),
+                    error.message,
+                )
+            } else {
+                error
+            };
             set_model_slot_state(
                 &state.runtime,
                 &model_id,
@@ -15456,14 +15464,31 @@ fn module_catalog_entries(state: &ModuleState) -> Vec<ModelCatalogEntry> {
 }
 
 fn models_list_payload(state: &ModuleState, snapshot: CatalogSnapshot) -> Value {
-    let mut models = module_catalog_entries(state)
+    // The durable download can become committed before its executor refreshes
+    // the in-memory registry. Project catalog rows from current install records.
+    if let Err(error) = sync_installed_catalog_slots(state) {
+        return error_payload(state, error);
+    }
+    let rows = module_catalog_entries(state)
         .into_iter()
-        .map(|entry| serde_json::to_value(entry).expect("catalog entry serializes"))
-        .collect::<Vec<_>>();
-    for row in &mut models {
-        if let Err(error) = catalog_list_row(state, row) {
+        .map(|entry| serde_json::to_value(entry).expect("catalog entry serializes"));
+    let mut models = Vec::new();
+    for mut row in rows {
+        if let Some((entry, backend)) =
+            resolved_catalog_lane(&state.runtime, row["model_id"].as_str().unwrap_or(""))
+        {
+            let installed = match current_catalog_install(state, entry, &backend.backend) {
+                Ok(install) => install.is_some(),
+                Err(error) => return error_payload(state, error),
+            };
+            if !state.runtime.runnable_backends.contains(&backend.backend) || !installed {
+                continue;
+            }
+        }
+        if let Err(error) = catalog_list_row(state, &mut row) {
             return error_payload(state, error);
         }
+        models.push(row);
     }
     models.extend(state.remote_gateway.catalog_entries());
     models.sort_by(|left, right| left["model_id"].as_str().cmp(&right["model_id"].as_str()));
@@ -21032,7 +21057,25 @@ fn catalog_test_barrier(kind: &str, job: &str) {
 fn catalog_call_fault(id: &str, call: &str) -> Result<(), WireOperationError> {
     #[cfg(feature = "test-support")]
     if env::var("SYNAPSE_TEST_CATALOG_FAULT_LANE").ok().as_deref() == Some(id) {
+        if call == "load" {
+            if let Ok(path) = env::var("SYNAPSE_TEST_CATALOG_LOAD_ATTEMPTS") {
+                fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .expect("test catalog load counter")
+                    .write_all(format!("{id}\n").as_bytes())
+                    .expect("test catalog load counter write");
+            }
+        }
         match env::var("SYNAPSE_TEST_CATALOG_FAULT").ok().as_deref() {
+            Some(value) if value == format!("{call}:stall-crash") => {
+                std::thread::sleep(Duration::from_secs(6));
+                return Err(WireOperationError::from_stable(
+                    StableError::engine_crashed(Some(250)),
+                    "injected catalog engine crash",
+                ));
+            }
             Some(value) if value == format!("{call}:stall") => {
                 std::thread::sleep(Duration::from_secs(10))
             }
@@ -21937,31 +21980,75 @@ async fn resolve_serving_model(
     }
     let (entry, backend) = select_catalog_lane(&state, requested, task, required, target)?;
     let lane = catalog::lane_id(&entry.id, &backend.backend);
-    let task_state = state.clone();
     let budget = deadline_ms.unwrap_or(state.runtime.inline.deadline_ms);
     if budget == 0 {
-        return Err(WireOperationError::from_stable(
-            StableError::deadline_exceeded(),
-            "request deadline expired",
-        ));
+        return Err(catalog_loading_response(&lane, budget));
     }
-    let handle =
-        tokio::spawn(async move { ensure_catalog_lane_ready(task_state, entry, backend).await });
-    match tokio::time::timeout(Duration::from_millis(budget.min(5000)), handle).await {
+    let started = std::time::Instant::now();
+    let lock = catalog_lane_lock(&state.runtime, &lane);
+    let (guard, waited) = match lock.clone().try_lock_owned() {
+        Ok(guard) => (guard, false),
+        Err(_) => (
+            tokio::time::timeout(Duration::from_millis(budget.min(5000)), lock.lock_owned())
+                .await
+                .map_err(|_| catalog_loading_response(&lane, budget))?,
+            true,
+        ),
+    };
+    if let Some(error) = catalog_failed_load(&state.runtime, &lane, !waited) {
+        return Err(error);
+    }
+    let remaining = budget
+        .min(5000)
+        .saturating_sub(started.elapsed().as_millis().min(u64::MAX as u128) as u64);
+    let task_state = state.clone();
+    // Only the lock owner starts detached work. A timed-out waiter must not
+    // stay queued and start a new load after the attempt it was waiting for fails.
+    let handle = tokio::spawn(async move {
+        ensure_catalog_lane_ready_owned(task_state, entry, backend, guard).await
+    });
+    match tokio::time::timeout(Duration::from_millis(remaining), handle).await {
         Ok(Ok(result)) => result,
         Ok(Err(e)) => Err(WireOperationError::from_stable(
             StableError::engine_crashed(Some(250)),
             format!("catalog load task failed: {e}"),
         )),
-        Err(_) if budget <= 5000 => Err(WireOperationError::from_stable(
+        Err(_) => Err(catalog_loading_response(&lane, budget)),
+    }
+}
+
+fn catalog_loading_response(lane: &str, budget: u64) -> WireOperationError {
+    if budget <= 5000 {
+        WireOperationError::from_stable(
             StableError::deadline_exceeded(),
             "catalog admission deadline expired",
-        )),
-        Err(_) => Err(WireOperationError::from_stable(
+        )
+    } else {
+        WireOperationError::from_stable(
             StableError::model_loading(Some(250)),
             format!("catalog lane '{lane}' is loading"),
-        )),
+        )
     }
+}
+
+fn catalog_failed_load(
+    runtime: &RuntimeState,
+    lane: &str,
+    acknowledge: bool,
+) -> Option<WireOperationError> {
+    let mut catalog = runtime.catalog.lock().expect("runtime catalog");
+    let slot = catalog.get_mut(lane)?;
+    let ModelRuntimeState::Failed(error) = &slot.state else {
+        return None;
+    };
+    let error = error.clone();
+    // Waiters all observe the completed attempt's error. A fresh request
+    // acknowledges it, so a later retry can start one new attempt.
+    if acknowledge {
+        slot.state = ModelRuntimeState::Unloaded;
+        slot.notify.notify_waiters();
+    }
+    Some(error)
 }
 struct CatalogInvocation {
     runtime: Arc<RuntimeState>,
@@ -21982,9 +22069,29 @@ async fn ensure_catalog_lane_ready(
     entry: catalog::CatalogEntry,
     backend: catalog::CatalogBackend,
 ) -> Result<Arc<EmbeddingModel>, WireOperationError> {
+    let lane = catalog::lane_id(&entry.id, &backend.backend);
+    let lock = catalog_lane_lock(&state.runtime, &lane);
+    let (guard, waited) = match lock.clone().try_lock_owned() {
+        Ok(guard) => (guard, false),
+        Err(_) => (lock.lock_owned().await, true),
+    };
+    if let Some(error) = catalog_failed_load(&state.runtime, &lane, !waited) {
+        return Err(error);
+    }
+    ensure_catalog_lane_ready_owned(state, entry, backend, guard).await
+}
+
+async fn ensure_catalog_lane_ready_owned(
+    state: Arc<ModuleState>,
+    entry: catalog::CatalogEntry,
+    backend: catalog::CatalogBackend,
+    guard: tokio::sync::OwnedMutexGuard<()>,
+) -> Result<Arc<EmbeddingModel>, WireOperationError> {
     use store::CatalogBlobCache;
     let lane = catalog::lane_id(&entry.id, &backend.backend);
-    let guard = catalog_lane_lock(&state.runtime, &lane).lock_owned().await;
+    if model_slot_snapshot(&state.runtime, &lane).is_none() {
+        sync_installed_catalog_slots(&state)?;
+    }
     let (check_id, key) = catalog_self_check_key(&state, &entry, &backend)?;
     let projection = catalog_self_check_projection(&state, &entry, &backend)?;
     if projection["state"] == "failed" {
@@ -22000,12 +22107,17 @@ async fn ensure_catalog_lane_ready(
     {
         model
     } else {
-        {
-            let _disk = state
-                .runtime
-                .catalog_disk
-                .lock()
-                .expect("catalog disk lock");
+        set_model_slot_state(&state.runtime, &lane, ModelRuntimeState::Validating);
+        let verify_state = state.clone();
+        let verify_entry = entry.clone();
+        let verify_backend = backend.clone();
+        let verify_lane = lane.clone();
+        let verified = tokio::task::spawn_blocking(move || {
+            let state = verify_state;
+            let entry = verify_entry;
+            let backend = verify_backend;
+            let lane = verify_lane;
+            let _disk = state.runtime.catalog_disk.lock().expect("catalog disk lock");
             let install = current_catalog_install(&state,&entry,&backend.backend)?.ok_or_else(|| catalog_wire_error("model_not_installed",json!({"catalog_id":entry.id,"lane_id":lane,"download_op":"models.download","download_job_id":null}),"catalog installation disappeared"))?;
             for file in entry.backend_files(&backend.backend).values() {
                 let member = install
@@ -22053,6 +22165,13 @@ async fn ensure_catalog_lane_ready(
                 slot.spec = spec;
                 slot.state = ModelRuntimeState::Loading;
             }
+            Ok(())
+        }).await.unwrap_or_else(|error| Err(WireOperationError::from_stable(
+            StableError::engine_crashed(Some(250)), format!("catalog verification task failed: {error}"),
+        )));
+        if let Err(error) = verified {
+            set_model_slot_state(&state.runtime, &lane, ModelRuntimeState::Unloaded);
+            return Err(error);
         }
         let load_state = state.clone();
         let load_lane = lane.clone();

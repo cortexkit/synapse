@@ -1126,7 +1126,6 @@ async fn catalog_multi_backend_resolver_refuses_substitution_before_load() {
     assert_eq!(models["models"], serde_json::json!([]));
 }
 
-#[cfg(target_os = "macos")]
 fn real_catalog_fixture(id: &str) -> Option<(Value, BTreeMap<String, PathBuf>)> {
     let mut catalog: Value =
         serde_json::from_str(include_str!("../../src/catalog/models.json")).unwrap();
@@ -1222,7 +1221,10 @@ async fn catalog_real_metal_redirect_download_self_checks_and_serves_without_pro
     let done = h.wait_state(job, &["committed", "failed"]).await;
     assert_eq!(done["state"], "committed", "{done}");
     let before = h.call("models.list", serde_json::json!({})).await;
-    assert_eq!(before["models"][0]["self_check"]["state"], "pending");
+    assert_eq!(
+        before["models"][0]["self_check"]["state"], "pending",
+        "{before}"
+    );
     assert_eq!(before["models"][0]["certified"], false);
     let requests = h.server.paths().len();
     for model in ["gte-modernbert-base", "gte-modernbert-base-metal"] {
@@ -1747,4 +1749,115 @@ async fn catalog_unavailable_backend_is_listed_but_never_downloaded() {
         .await;
     assert_eq!(refused["error"]["code"], "backend_unavailable", "{refused}");
     assert!(h.server.paths().is_empty());
+}
+
+async fn wait_failed_catalog_load(h: &mut CatalogHarness, lane: &str) -> Value {
+    let until = Instant::now() + Duration::from_secs(180);
+    loop {
+        let status = h
+            .call("model.status", serde_json::json!({"model_id":lane}))
+            .await;
+        if status["state"] == "failed" {
+            return status;
+        }
+        assert!(Instant::now() < until, "load did not fail: {status}");
+        sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn catalog_failed_load_after_inline_timeout_reaches_next_request_and_retry_is_single_flight()
+{
+    let Some((catalog, files)) = real_catalog_fixture("gte-modernbert-base") else {
+        return;
+    };
+    let root = unique_temp_dir("catalog-load-attempts");
+    std::fs::create_dir_all(&root).unwrap();
+    let counter = root.join("attempts");
+    let mut h = CatalogHarness::start_catalog_env(
+        "ok",
+        None,
+        catalog,
+        files,
+        "metal",
+        Some("load:stall-crash"),
+        &[(
+            "SYNAPSE_TEST_CATALOG_LOAD_ATTEMPTS",
+            counter.to_str().unwrap(),
+        )],
+    )
+    .await;
+    let download = h.download("gte-modernbert-base", "load-failure").await;
+    let done = h
+        .wait_state(
+            download["job_id"].as_str().unwrap(),
+            &["committed", "failed"],
+        )
+        .await;
+    assert_eq!(done["state"], "committed", "{done}");
+    let request =
+        serde_json::json!({"model":"gte-modernbert-base", "text":"hello", "deadline_ms":30000});
+    let loading = h.call("embed.query", request.clone()).await;
+    assert_eq!(loading["error"]["code"], "model_loading", "{loading}");
+    let failed = wait_failed_catalog_load(&mut h, "gte-modernbert-base-metal").await;
+    assert_eq!(failed["error"]["code"], "engine_crashed");
+    assert_eq!(
+        std::fs::read_to_string(&counter).unwrap().lines().count(),
+        1
+    );
+    let observed = h.call("embed.query", request.clone()).await;
+    assert_eq!(
+        observed["error"]["code"], "engine_crashed",
+        "a completed failure must not become model_loading: {observed}"
+    );
+    assert_eq!(observed["error"]["class"], "transient");
+    assert_eq!(observed["error"]["retry_after_ms"], 250);
+    assert_eq!(observed["error"]["safe_to_retry_same_request"], true);
+    assert_eq!(
+        observed["error"]["message"],
+        "injected catalog engine crash"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&counter).unwrap().lines().count(),
+        1,
+        "reporting the stored error must not start a new load"
+    );
+    let mut clients = Vec::new();
+    for index in 0..3 {
+        let mut client = connect_consumer(&h.daemon.connection_file_path).await;
+        wait_for_catalog(&mut client, MODULE_ID, SETUP_TIMEOUT).await;
+        let route = route_open(&mut client, &h.fixture_root, index + 1).await;
+        clients.push((client, route));
+    }
+    let mut waiters = Vec::new();
+    for (mut client, route) in clients {
+        let params = request.clone();
+        waiters.push(tokio::spawn(async move {
+            route_request(
+                &mut client,
+                route,
+                100,
+                serde_json::json!({"method":"embed.query", "params":params}),
+            )
+            .await["result"]
+                .clone()
+        }));
+    }
+    for waiter in waiters {
+        let result = waiter.await.unwrap();
+        assert_eq!(result["error"]["code"], "model_loading", "{result}");
+    }
+    wait_failed_catalog_load(&mut h, "gte-modernbert-base-metal").await;
+    assert_eq!(
+        std::fs::read_to_string(&counter).unwrap().lines().count(),
+        2,
+        "concurrent retry waiters must share one attempt"
+    );
+    let observed = h.call("embed.query", request).await;
+    assert_eq!(observed["error"]["code"], "engine_crashed", "{observed}");
+    assert_eq!(
+        std::fs::read_to_string(&counter).unwrap().lines().count(),
+        2
+    );
+    let _ = std::fs::remove_dir_all(root);
 }

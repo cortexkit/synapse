@@ -680,7 +680,7 @@ fn soak_config(assets: &SoakAssets, _worker_bin: &Path, _temp_dir: &Path) -> Str
                 "pooling": "mean",
                 "normalize": true,
                 "max_tokens": 512,
-                "format": "safetensors",
+                "format": "safetensors-package",
                 "quant": "fp32"
             }
         ],
