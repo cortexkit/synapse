@@ -21008,6 +21008,9 @@ fn download_error(
         message,
     )
 }
+/// Pause a test download without holding its publish or catalog_disk mutex.
+/// Cancellation takes both mutexes, so holding either here prevents a test from
+/// cancelling the paused job before releasing the barrier.
 fn catalog_test_barrier(kind: &str, job: &str) {
     #[cfg(feature = "test-support")]
     if let Ok(root) = env::var(format!(
@@ -21158,11 +21161,11 @@ async fn fetch_catalog_download(
                         .map_err(catalog_store_error)?;
                 }
             }
-            if matches!(reuse, store::DownloadReuse::Rooted) {
-                catalog_test_barrier("pre-publish", &record.job_id);
-            }
             reuse
         };
+        if matches!(reuse, store::DownloadReuse::Rooted) {
+            catalog_test_barrier("pre-publish", &record.job_id);
+        }
         match reuse {
             store::DownloadReuse::Stopped(_) => return Ok(()),
             store::DownloadReuse::Rooted => continue,
@@ -21248,6 +21251,7 @@ async fn fetch_catalog_download(
         if digest != file.sha256 || size != file.size_bytes {
             return Err(catalog_artifact_error(file, Some(digest), Some(size)));
         }
+        catalog_test_barrier("pre-publish", &record.job_id);
         let _publish = lock.lock().expect("publish lock");
         let _disk = state
             .runtime
@@ -21265,7 +21269,6 @@ async fn fetch_catalog_download(
         {
             store::DownloadPublication::Stopped(_) => return Ok(()),
             store::DownloadPublication::Proceed { .. } => {
-                catalog_test_barrier("pre-publish", &record.job_id);
                 state
                     .model_cache
                     .ingest(ModelCacheIngest {

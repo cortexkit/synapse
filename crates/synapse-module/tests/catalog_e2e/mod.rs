@@ -1,8 +1,19 @@
 use super::*;
-use std::sync::Mutex;
+use std::{collections::BTreeMap, sync::Mutex};
 use tokio::sync::Notify;
 
 const BODY: &[u8] = b"fixture catalog artifact bytes";
+
+fn assert_golden_status(status: &Value) {
+    let fixtures: Value =
+        serde_json::from_str(include_str!("../fixtures/catalog_wire_v1.json")).unwrap();
+    let mut actual = status.clone();
+    let state = actual["state"].as_str().unwrap().to_owned();
+    assert!(actual["job_id"].as_str().is_some_and(|id| !id.is_empty()));
+    actual["job_id"] = "<job>".into();
+    actual.as_object_mut().unwrap().remove("kind");
+    assert_eq!(actual, fixtures[&state], "flat {state} wire shape");
+}
 
 fn catalog_sha256(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
@@ -17,7 +28,8 @@ struct CatalogServer {
 }
 
 impl CatalogServer {
-    async fn start(mode: &'static str) -> Self {
+    async fn start(mode: &'static str, files: BTreeMap<String, PathBuf>) -> Self {
+        let files = Arc::new(files);
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -29,6 +41,7 @@ impl CatalogServer {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let seen = seen.clone();
                 let gate = gate.clone();
+                let files = files.clone();
                 tokio::spawn(async move {
                     let mut request = Vec::new();
                     let mut buffer = [0; 4096];
@@ -52,12 +65,39 @@ impl CatalogServer {
                         .lines()
                         .any(|line| line.to_ascii_lowercase() == format!("host: {address}")));
                     seen.lock().unwrap().push(path.clone());
-                    if mode == "redirect" && path.contains("/resolve/") {
-                        stream.write_all(format!("HTTP/1.1 302 Found\r\nLocation: http://{address}/redirected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+                    if mode == "redirect"
+                        && path.contains("/resolve/")
+                        && !path.starts_with("/redirected")
+                    {
+                        let target = if files.is_empty() {
+                            "/redirected".to_owned()
+                        } else {
+                            format!("/redirected{path}")
+                        };
+                        stream.write_all(format!("HTTP/1.1 302 Found\r\nLocation: http://{address}{target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
                         return;
                     }
                     if mode == "http_error" {
                         stream.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                        return;
+                    }
+                    if !files.is_empty() {
+                        let file_path = files
+                            .get(path.strip_prefix("/redirected").unwrap_or(&path))
+                            .expect("requested pinned fixture file");
+                        let mut file = std::fs::File::open(file_path).unwrap();
+                        let size = file.metadata().unwrap().len();
+                        stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {size}\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+                        let mut buffer = vec![0; 64 * 1024];
+                        loop {
+                            let count = std::io::Read::read(&mut file, &mut buffer).unwrap();
+                            if count == 0 {
+                                break;
+                            }
+                            if stream.write_all(&buffer[..count]).await.is_err() {
+                                break;
+                            }
+                        }
                         return;
                     }
                     stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", BODY.len()).as_bytes()).await.unwrap();
@@ -92,7 +132,10 @@ impl CatalogServer {
     fn assert_pinned_requests(&self) {
         let paths = self.paths();
         assert!(!paths.is_empty());
-        for path in paths.iter().filter(|p| p.contains("/resolve/")) {
+        for path in paths
+            .iter()
+            .filter(|p| p.contains("/resolve/") && !p.starts_with("/redirected"))
+        {
             let parts: Vec<_> = path.split('/').collect();
             assert_eq!(parts[3], "resolve", "{path}");
             assert_eq!(parts[4].len(), 40, "{path}");
@@ -123,9 +166,6 @@ struct CatalogHarness {
 
 impl CatalogHarness {
     async fn start(mode: &'static str, barrier: Option<(&str, &Path)>) -> Self {
-        let server = CatalogServer::start(mode).await;
-        let root = unique_temp_dir("catalog-fixture");
-        std::fs::create_dir_all(&root).unwrap();
         let mut catalog: Value =
             serde_json::from_str(include_str!("../../src/catalog/models.json")).unwrap();
         // The files share a digest to exercise distinct-blob accounting without downloading release weights.
@@ -135,36 +175,8 @@ impl CatalogHarness {
                 file["size_bytes"] = BODY.len().into();
             }
         }
-        let catalog_path = root.join("catalog.json");
-        std::fs::write(&catalog_path, catalog.to_string()).unwrap();
-        let config = serde_json::json!({"hf_endpoint":server.endpoint}).to_string();
-        let daemon = start_daemon().await;
-        let path = catalog_path.to_str().unwrap();
-        let cache = root.join("cache");
-        let mut overrides = vec![
-            ("SYNAPSE_TEST_CATALOG", path),
-            ("SYNAPSE_TEST_RUNNABLE_BACKENDS", "metal"),
-            ("CORTEXKIT_MODEL_CACHE", cache.to_str().unwrap()),
-        ];
-        if let Some((name, path)) = barrier {
-            overrides.push((name, path.to_str().unwrap()));
-        }
-        let module = spawn_synapse_module_with_env(
-            &daemon.connection_file_path,
-            None,
-            Some(&config),
-            &overrides,
-        );
-        let (daemon, module, consumer, route) = open_route_for_started_module(daemon, module).await;
-        let mut harness = Self {
-            daemon,
-            _module: module,
-            consumer,
-            route,
-            next_id: 100,
-            server,
-            fixture_root: root,
-        };
+        let mut harness =
+            Self::start_catalog(mode, barrier, catalog, BTreeMap::new(), "metal", None).await;
         let catalog = harness
             .call(
                 "models.catalog",
@@ -174,10 +186,58 @@ impl CatalogHarness {
         assert_eq!(
             catalog["models"][0]["download_bytes"],
             BODY.len(),
-            "catalog and runnable-backend overrides must be honored"
+            "catalog override must be honored"
         );
         assert_eq!(catalog["models"][0]["backends"][0]["runnable"], true);
         harness
+    }
+
+    async fn start_catalog(
+        mode: &'static str,
+        barrier: Option<(&str, &Path)>,
+        catalog: Value,
+        files: BTreeMap<String, PathBuf>,
+        backends: &str,
+        fault: Option<&str>,
+    ) -> Self {
+        let server = CatalogServer::start(mode, files).await;
+        let root = unique_temp_dir("catalog-fixture");
+        std::fs::create_dir_all(&root).unwrap();
+        let catalog_path = root.join("catalog.json");
+        std::fs::write(&catalog_path, catalog.to_string()).unwrap();
+        let config = serde_json::json!({"hf_endpoint":server.endpoint}).to_string();
+        let daemon = start_daemon().await;
+        let path = catalog_path.to_str().unwrap();
+        let cache = root.join("cache");
+        let mut overrides = vec![
+            ("SYNAPSE_TEST_CATALOG", path),
+            ("SYNAPSE_TEST_RUNNABLE_BACKENDS", backends),
+            ("CORTEXKIT_MODEL_CACHE", cache.to_str().unwrap()),
+        ];
+        if let Some((name, path)) = barrier {
+            overrides.push((name, path.to_str().unwrap()));
+        }
+        let fault_lane = format!("{}-metal", catalog["models"][0]["id"].as_str().unwrap());
+        if let Some(fault) = fault {
+            overrides.push(("SYNAPSE_TEST_CATALOG_FAULT_LANE", &fault_lane));
+            overrides.push(("SYNAPSE_TEST_CATALOG_FAULT", fault));
+        }
+        let module = spawn_synapse_module_with_env(
+            &daemon.connection_file_path,
+            None,
+            Some(&config),
+            &overrides,
+        );
+        let (daemon, module, consumer, route) = open_route_for_started_module(daemon, module).await;
+        Self {
+            daemon,
+            _module: module,
+            consumer,
+            route,
+            next_id: 100,
+            server,
+            fixture_root: root,
+        }
     }
 
     async fn call(&mut self, method: &str, params: Value) -> Value {
@@ -202,7 +262,7 @@ impl CatalogHarness {
     }
 
     async fn wait_state(&mut self, job: &str, states: &[&str]) -> Value {
-        let until = Instant::now() + Duration::from_secs(15);
+        let until = Instant::now() + Duration::from_secs(90);
         let mut previous = 0;
         loop {
             let status = self
@@ -233,6 +293,17 @@ impl CatalogHarness {
                 .unwrap();
             assert_eq!(count, 0, "{table}");
         }
+        for directory in ["blobs", "catalog-staging"] {
+            let path = self.fixture_root.join("cache").join(directory);
+            if path.exists() {
+                assert_eq!(
+                    std::fs::read_dir(&path).unwrap().count(),
+                    0,
+                    "leftover files in {}",
+                    path.display()
+                );
+            }
+        }
     }
 }
 
@@ -249,7 +320,22 @@ async fn catalog_download_progress_single_flight_cancel_and_remove_holder() {
     let first = h.download("gte-modernbert-base", "first").await;
     assert!(["queued", "downloading"].contains(&first["state"].as_str().unwrap()));
     let job = first["job_id"].as_str().unwrap().to_owned();
-    let progress = h.wait_state(&job, &["downloading"]).await;
+    if first["state"] == "queued" {
+        assert_golden_status(&first);
+    }
+    let until = Instant::now() + Duration::from_secs(15);
+    let progress = loop {
+        let progress = h.wait_state(&job, &["downloading"]).await;
+        if progress["bytes_done"] == 1 {
+            break progress;
+        }
+        assert!(
+            Instant::now() < until,
+            "first body byte was not observed: {progress}"
+        );
+        sleep(Duration::from_millis(20)).await;
+    };
+    assert_golden_status(&progress);
     assert_eq!(progress["bytes_total"], BODY.len());
     assert!(progress["bytes_done"].as_u64().unwrap() < BODY.len() as u64);
     let second = h.download("gte-modernbert-base", "second").await;
@@ -280,6 +366,7 @@ async fn catalog_download_progress_single_flight_cancel_and_remove_holder() {
         .call("models.download.cancel", serde_json::json!({"job_id":job}))
         .await;
     assert_eq!(cancelled["state"], "cancelled");
+    assert_golden_status(&cancelled);
     h.server.release.notify_waiters();
     h.wait_state(&job, &["cancelled"]).await;
     h.assert_clean();
@@ -295,6 +382,7 @@ async fn catalog_redirect_commit_reuse_projections_and_removal() {
     let job = first["job_id"].as_str().unwrap().to_owned();
     let committed = h.wait_state(&job, &["committed", "failed"]).await;
     assert_eq!(committed["state"], "committed", "{committed}");
+    assert_golden_status(&committed);
     assert!(committed.get("bytes_done").is_none());
     assert!(committed.get("error").is_none());
     assert_eq!(h.server.paths().len(), 2);
@@ -390,6 +478,7 @@ async fn catalog_pre_publish_cancel_cleans_acquisitions() {
         .call("models.download.cancel", serde_json::json!({"job_id":job}))
         .await;
     assert_eq!(cancelled["state"], "cancelled");
+    assert_golden_status(&cancelled);
     std::fs::write(root.join(format!("{job}.release")), b"release").unwrap();
     h.wait_state(&job, &["cancelled"]).await;
     h.assert_clean();
@@ -671,9 +760,10 @@ async fn catalog_conflicting_legacy_rows_do_not_change_catalog_projections() {
     let admission = h.call("admission.status", serde_json::json!({})).await;
     let conn = Connection::open(expected_store_path(&h.daemon.data_home)).unwrap();
     let fingerprint = before["models"][0]["fingerprints"][0].as_str().unwrap();
-    conn.execute("INSERT INTO cert_rows (assurance_class,key_hash,machine_profile_hash,numeric_profile_id,fingerprint,certified_at_ms,os_build,module_generation,evidence_json,status) VALUES ('measured','conflict','conflict','conflict',?1,1,'other-os',1,'{}','uncertified')", [fingerprint]).unwrap();
-    conn.execute("INSERT INTO perf_rows VALUES ('conflict','gte-modernbert-base-metal','embed','conflict',?1,'ort',1,'other-os',1,1,1,1,'{}')", [fingerprint]).unwrap();
-    conn.execute("INSERT INTO knob_assignments VALUES ('conflict','embed','interactive','gte-modernbert-base-metal','conflict',?1,'ort',1,'other-os',1,1,1)", [fingerprint]).unwrap();
+    let machine = admission["machine_profile_hash"].as_str().unwrap();
+    conn.execute("INSERT INTO cert_rows (certification_class,assurance_class,key_hash,machine_profile_hash,numeric_profile_id,fingerprint,certified_at_ms,os_build,module_generation,evidence_json,status) VALUES ('embedding','measured',?2,?2,'conflict',?1,1,'other-os',1,'{}','uncertified')", params![fingerprint, machine]).unwrap();
+    conn.execute("INSERT INTO perf_rows VALUES (?2,'gte-modernbert-base-metal','embed','conflict',?1,'ort',1,'other-os',1,1,1,1,'{}')", params![fingerprint, machine]).unwrap();
+    conn.execute("INSERT INTO knob_assignments VALUES (?2,'embed','interactive','gte-modernbert-base-metal','conflict',?1,'ort',1,'other-os',1,1,1)", params![fingerprint, machine]).unwrap();
     conn.execute("INSERT INTO approvals (schema_revision,model_id,decode_fingerprint,enabled,grammar_enabled,disabled_reason,updated_at_ms,evidence_requirements_revision,semantic_digest) VALUES ('conflict','gte-modernbert-base-metal',?1,0,0,'conflicting denial',1,'conflict','conflict')", [fingerprint]).unwrap();
     let after = h.call("models.list", serde_json::json!({})).await;
     assert_eq!(before["models"], after["models"]);
@@ -719,12 +809,39 @@ async fn catalog_pre_commit_cancel_has_one_terminal_winner() {
         )
         .await;
     assert_eq!(remove["error"]["code"], "model_in_use");
-    let cancel = h
-        .call("models.download.cancel", serde_json::json!({"job_id":job}))
-        .await;
-    assert_eq!(cancel["state"], "cancelled");
+    let verifying = h.wait_state(&job, &["verifying"]).await;
+    assert_golden_status(&verifying);
+    let mut canceller = connect_consumer(&h.daemon.connection_file_path).await;
+    let cancel_route = route_open(&mut canceller, &h.fixture_root, 1).await;
+    let cancel_job = job.clone();
+    let cancel_task = tokio::spawn(async move {
+        route_request(
+            &mut canceller,
+            cancel_route,
+            2,
+            serde_json::json!({"method":"models.download.cancel","params":{"job_id":cancel_job}}),
+        )
+        .await
+    });
     std::fs::write(root.join(format!("{job}.release")), b"release").unwrap();
-    h.wait_state(&job, &["cancelled"]).await;
+    let cancel = cancel_task.await.unwrap();
+    let terminal = h.wait_state(&job, &["cancelled", "committed"]).await;
+    assert_eq!(cancel["result"]["state"], terminal["state"]);
+    let installed = h
+        .call("models.catalog", serde_json::json!({"installed":true}))
+        .await;
+    if terminal["state"] == "committed" {
+        assert_eq!(installed["models"].as_array().unwrap().len(), 1);
+        let removed = h
+            .call(
+                "models.remove",
+                serde_json::json!({"catalog_id":"gte-modernbert-base"}),
+            )
+            .await;
+        assert_eq!(removed["freed_bytes"], BODY.len());
+    } else {
+        assert_eq!(installed["models"], serde_json::json!([]));
+    }
     h.assert_clean();
     let _ = std::fs::remove_dir_all(root);
 }
@@ -864,4 +981,460 @@ async fn catalog_committed_install_and_job_survive_restart() {
     let again = h.download("gte-modernbert-base", "first").await;
     assert_eq!(again["state"], "committed");
     assert_eq!(h.server.paths().len(), 1);
+}
+
+#[tokio::test]
+async fn catalog_multi_backend_resolver_refuses_substitution_before_load() {
+    let mut catalog: Value =
+        serde_json::from_str(include_str!("../../src/catalog/models.json")).unwrap();
+    let mut entry = catalog["models"][0].clone();
+    entry["id"] = "resolver-fixture".into();
+    for file in entry["files"].as_array_mut().unwrap() {
+        file["sha256"] = catalog_sha256(BODY).into();
+        file["size_bytes"] = BODY.len().into();
+    }
+    let metal = entry["backends"][0]["fingerprint"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let ane = "a".repeat(64);
+    let mut backend = entry["backends"][0].clone();
+    backend["backend"] = "ane".into();
+    backend["dtype"] = "f32".into();
+    backend["fingerprint"] = ane.clone().into();
+    entry["backends"].as_array_mut().unwrap().push(backend);
+    let mut ane_files = entry["files"].as_array().unwrap().clone();
+    for file in &mut ane_files {
+        file["path"] = format!("ane/{}", file["path"].as_str().unwrap()).into();
+        file["backends"] = serde_json::json!(["ane"]);
+    }
+    entry["files"].as_array_mut().unwrap().extend(ane_files);
+    catalog["models"] = serde_json::json!([entry]);
+    let mut h =
+        CatalogHarness::start_catalog("ok", None, catalog, BTreeMap::new(), "metal,ane", None)
+            .await;
+    let listing = h.call("models.catalog", serde_json::json!({})).await;
+    let rows = listing["models"][0]["backends"].as_array().unwrap();
+    assert_eq!(
+        rows.len(),
+        2,
+        "test catalog override must add the second backend"
+    );
+    assert_eq!(rows[0]["lane_id"], "resolver-fixture-metal");
+    assert_eq!(rows[1]["lane_id"], "resolver-fixture-ane");
+    assert_eq!(rows[0]["runnable"], true);
+    assert_eq!(rows[1]["runnable"], true);
+    for (model, required, target) in [
+        ("resolver-fixture", "unknown".to_owned(), None),
+        ("resolver-fixture-metal", ane.clone(), None),
+        ("resolver-fixture", metal.clone(), Some(ane.clone())),
+    ] {
+        let mut params =
+            serde_json::json!({"model":model,"text":"hello","required_fingerprint":required});
+        if let Some(target) = target {
+            params["target_fingerprint"] = target.into();
+        }
+        let refused = h.call("embed.query", params).await;
+        assert_eq!(
+            refused["error"]["code"], "substitution_rejected",
+            "{refused}"
+        );
+        assert!(refused["error"]["message"].is_string());
+        assert_eq!(
+            refused["error"]["details"]["required_fingerprint"],
+            required
+        );
+    }
+    for (pin, selected) in [
+        (None, "resolver-fixture-metal"),
+        (Some(ane), "resolver-fixture-ane"),
+    ] {
+        let mut params = serde_json::json!({"model":"resolver-fixture","text":"hello"});
+        if let Some(pin) = pin {
+            params["required_fingerprint"] = pin.into();
+        }
+        let refused = h.call("embed.query", params).await;
+        assert_eq!(refused["error"]["code"], "model_not_installed");
+        assert_eq!(refused["error"]["details"]["lane_id"], selected);
+    }
+    assert!(h.server.paths().is_empty());
+    let models = h.call("models.list", serde_json::json!({})).await;
+    assert_eq!(models["models"], serde_json::json!([]));
+}
+
+#[cfg(target_os = "macos")]
+fn real_catalog_fixture(id: &str) -> Option<(Value, BTreeMap<String, PathBuf>)> {
+    let mut catalog: Value =
+        serde_json::from_str(include_str!("../../src/catalog/models.json")).unwrap();
+    let entry = catalog["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["id"] == id)
+        .unwrap()
+        .clone();
+    let searched = PathBuf::from(std::env::var("HOME").unwrap()).join(format!(
+        ".cache/huggingface/hub/models--{}/snapshots",
+        entry["upstream"]["hf_repo"]
+            .as_str()
+            .unwrap()
+            .replace('/', "--")
+    ));
+    let (snapshot, searched) = match id {
+        "gte-modernbert-base" => (
+            gte_safetensors_snapshot(),
+            std::env::var("SYNAPSE_GTE_MODERNBERT_SAFETENSORS_SNAPSHOT")
+                .map(PathBuf::from)
+                .unwrap_or(searched),
+        ),
+        "gte-reranker-modernbert-base" => (
+            gte_reranker_safetensors_snapshot(),
+            std::env::var("SYNAPSE_GTE_RERANKER_MODERNBERT_SAFETENSORS_SNAPSHOT")
+                .map(PathBuf::from)
+                .unwrap_or(searched),
+        ),
+        _ => (
+            first_snapshot_with(&searched, "model.safetensors"),
+            searched,
+        ),
+    };
+    let Some(snapshot) = snapshot else {
+        eprintln!(
+            "skipping Metal catalog serve: no safetensors snapshot found under {}",
+            searched.display()
+        );
+        return None;
+    };
+    let mut files = BTreeMap::new();
+    for file in entry["files"].as_array().unwrap() {
+        let local = snapshot.join(file["path"].as_str().unwrap());
+        if !local.is_file() {
+            eprintln!(
+                "skipping Metal catalog serve: missing {} (snapshot search {})",
+                local.display(),
+                searched.display()
+            );
+            return None;
+        }
+        assert_eq!(
+            std::fs::metadata(&local).unwrap().len(),
+            file["size_bytes"].as_u64().unwrap(),
+            "{} must match the pinned catalog artifact",
+            local.display()
+        );
+        assert_eq!(
+            catalog_sha256(&std::fs::read(&local).unwrap()),
+            file["sha256"].as_str().unwrap(),
+            "{} must match the pinned catalog artifact",
+            local.display()
+        );
+        let path = format!(
+            "/{}/resolve/{}/{}",
+            entry["upstream"]["hf_repo"].as_str().unwrap(),
+            entry["upstream"]["revision"].as_str().unwrap(),
+            file["path"].as_str().unwrap()
+        );
+        files.insert(path, local);
+    }
+    catalog["models"] = serde_json::json!([entry]);
+    catalog["catalog_revision"] = 717.into();
+    Some((catalog, files))
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn catalog_real_metal_redirect_download_self_checks_and_serves_without_probe() {
+    let Some((catalog, files)) = real_catalog_fixture("gte-modernbert-base") else {
+        return;
+    };
+    let expected_fingerprint = catalog["models"][0]["backends"][0]["fingerprint"].clone();
+    let mut h =
+        CatalogHarness::start_catalog("redirect", None, catalog, files, "metal", None).await;
+    assert_eq!(
+        h.call("models.catalog", serde_json::json!({})).await["catalog_revision"],
+        717
+    );
+    let accepted = h.download("gte-modernbert-base", "real").await;
+    let job = accepted["job_id"].as_str().unwrap();
+    let done = h.wait_state(job, &["committed", "failed"]).await;
+    assert_eq!(done["state"], "committed", "{done}");
+    let before = h.call("models.list", serde_json::json!({})).await;
+    assert_eq!(before["models"][0]["self_check"]["state"], "pending");
+    assert_eq!(before["models"][0]["certified"], false);
+    let requests = h.server.paths().len();
+    for model in ["gte-modernbert-base", "gte-modernbert-base-metal"] {
+        let served = h.call("embed.query", serde_json::json!({"model":model,"text":"The quick brown fox jumps over the lazy dog.","deadline_ms":30000})).await;
+        assert_eq!(served["fingerprint"], expected_fingerprint, "{served}");
+        assert_eq!(served["dims"], 768);
+    }
+    assert_eq!(h.server.paths().len(), requests, "serving must not fetch");
+    let listed = h.call("models.list", serde_json::json!({})).await;
+    assert_eq!(listed["models"][0]["certified"], true);
+    assert_eq!(listed["models"][0]["self_check"]["state"], "passed");
+    let status = h.call("admission.status", serde_json::json!({})).await;
+    assert_eq!(status["catalog_lanes"], 1);
+    assert_eq!(status["lanes"][0]["certification_required"], false);
+    assert_eq!(status["lanes"][0]["certification_status"], "not_required");
+    let loaded_remove = h
+        .call(
+            "models.remove",
+            serde_json::json!({"catalog_id":"gte-modernbert-base"}),
+        )
+        .await;
+    assert_eq!(loaded_remove["error"]["code"], "model_in_use");
+    assert_eq!(
+        h.call(
+            "model.unload",
+            serde_json::json!({"model_id":"gte-modernbert-base-metal"})
+        )
+        .await["state"],
+        "unloaded"
+    );
+    h.server.assert_pinned_requests();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn catalog_real_metal_stalled_self_check_keeps_single_flight_holder() {
+    let Some((catalog, files)) = real_catalog_fixture("gte-modernbert-base") else {
+        return;
+    };
+    let mut h = CatalogHarness::start_catalog(
+        "ok",
+        None,
+        catalog,
+        files,
+        "metal",
+        Some("self_check:stall"),
+    )
+    .await;
+    let accepted = h.download("gte-modernbert-base", "real").await;
+    let done = h
+        .wait_state(
+            accepted["job_id"].as_str().unwrap(),
+            &["committed", "failed"],
+        )
+        .await;
+    assert_eq!(done["state"], "committed", "{done}");
+    let served = h
+        .call(
+            "embed.query",
+            serde_json::json!({"model":"gte-modernbert-base","text":"hello","deadline_ms":30000}),
+        )
+        .await;
+    assert_eq!(
+        served["error"]["code"], "engine_crashed",
+        "stall override must time out the numerical check: {served}"
+    );
+    assert_eq!(served["error"]["retry_after_ms"], 250);
+    let listed = h.call("models.list", serde_json::json!({})).await;
+    assert_eq!(listed["models"][0]["self_check"]["state"], "pending");
+    let unload = h
+        .call(
+            "model.unload",
+            serde_json::json!({"model_id":"gte-modernbert-base-metal"}),
+        )
+        .await;
+    assert_eq!(unload["error"]["code"], "model_in_use");
+    assert!(unload["error"]["details"]["holders"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|holder| holder["kind"] == "self_check"));
+    let started = Instant::now();
+    let second = h
+        .call(
+            "embed.query",
+            serde_json::json!({"model":"gte-modernbert-base","text":"hello","deadline_ms":200}),
+        )
+        .await;
+    assert_eq!(second["error"]["code"], "deadline_exceeded");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "a second numerical check must not start while one remains in flight"
+    );
+    sleep(Duration::from_secs(11)).await;
+    let late = h.call("models.list", serde_json::json!({})).await;
+    assert_eq!(
+        late["models"][0]["self_check"]["state"], "pending",
+        "late check must not overwrite its invalidated generation"
+    );
+}
+
+#[tokio::test]
+async fn catalog_no_body_byte_timeout_fails_and_cleans_download() {
+    let mut h = CatalogHarness::start("stall", None).await;
+    let accepted = h.download("gte-modernbert-base", "idle-timeout").await;
+    let job = accepted["job_id"].as_str().unwrap();
+    h.wait_state(job, &["downloading"]).await;
+    sleep(Duration::from_secs(61)).await;
+    let failed = h.wait_state(job, &["failed"]).await;
+    assert_eq!(failed["error"]["code"], "download_failed");
+    assert_eq!(failed["error"]["details"]["reason"], "network");
+    h.assert_clean();
+    h.server.assert_pinned_requests();
+}
+
+#[cfg(not(target_os = "macos"))]
+#[tokio::test]
+async fn catalog_native_non_macos_lists_metal_as_unsupported_without_override() {
+    let (_daemon, _module, mut consumer, route) = open_route().await;
+    let result = route_request(
+        &mut consumer,
+        route,
+        100,
+        serde_json::json!({"method":"models.catalog","params":{}}),
+    )
+    .await;
+    for row in result["result"]["models"].as_array().unwrap() {
+        assert_eq!(row["download_bytes"], 0);
+        for backend in row["backends"].as_array().unwrap() {
+            assert_eq!(backend["runnable"], false);
+            assert_eq!(backend["reason"], "not_supported_on_platform");
+            assert_eq!(backend["installed"], false);
+            assert_eq!(backend["self_check"], Value::Null);
+        }
+    }
+    let runnable = route_request(
+        &mut consumer,
+        route,
+        101,
+        serde_json::json!({"method":"models.catalog","params":{"runnable_here":true}}),
+    )
+    .await;
+    assert_eq!(runnable["result"]["models"], serde_json::json!([]));
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn catalog_real_qwen_embedding_serves_catalog_and_lane_ids_then_unloads() {
+    let Some((catalog, files)) = real_catalog_fixture("qwen3-embedding-0.6b") else {
+        return;
+    };
+    let fingerprint = catalog["models"][0]["backends"][0]["fingerprint"].clone();
+    let mut h = CatalogHarness::start_catalog("ok", None, catalog, files, "metal", None).await;
+    let accepted = h.download("qwen3-embedding-0.6b", "real").await;
+    let done = h
+        .wait_state(
+            accepted["job_id"].as_str().unwrap(),
+            &["committed", "failed"],
+        )
+        .await;
+    assert_eq!(done["state"], "committed", "{done}");
+    for model in ["qwen3-embedding-0.6b-metal", "qwen3-embedding-0.6b"] {
+        let served = h
+            .call(
+                "embed.query",
+                serde_json::json!({"model":model,"text":"hello","deadline_ms":30000}),
+            )
+            .await;
+        assert_eq!(served["fingerprint"], fingerprint, "{served}");
+        assert_eq!(served["dims"], 1024);
+    }
+    let unloaded = h
+        .call(
+            "model.unload",
+            serde_json::json!({"model_id":"qwen3-embedding-0.6b-metal"}),
+        )
+        .await;
+    assert_eq!(unloaded["state"], "unloaded");
+    h.server.assert_pinned_requests();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn catalog_real_reranker_loaded_metadata_is_pinned() {
+    let Some((catalog, files)) = real_catalog_fixture("gte-reranker-modernbert-base") else {
+        return;
+    };
+    let mut h = CatalogHarness::start_catalog("ok", None, catalog, files, "metal", None).await;
+    let accepted = h.download("gte-reranker-modernbert-base", "real").await;
+    let done = h
+        .wait_state(
+            accepted["job_id"].as_str().unwrap(),
+            &["committed", "failed"],
+        )
+        .await;
+    assert_eq!(done["state"], "committed", "{done}");
+    let served = h.call("rerank.score", serde_json::json!({"model":"gte-reranker-modernbert-base","query":"What is Rust?","candidates":[{"id":"rust","text":"Rust is a systems programming language."}],"deadline_ms":30000})).await;
+    assert!(served.get("error").is_none(), "{served}");
+    let listed = h.call("models.list", serde_json::json!({})).await;
+    let row = &listed["models"][0];
+    assert_eq!(row["model_id"], "gte-reranker-modernbert-base-metal");
+    assert_eq!(row["fingerprints"][0].as_str().unwrap().len(), 64);
+    assert_eq!(row["dims"], 768);
+    assert_eq!(row["max_tokens"], 8192);
+    assert_eq!(row["max_tokens_source"], "runtime_bucket");
+    assert_eq!(row["device_class"], "metal");
+    assert_eq!(row["dtype"], "f32");
+    h.server.assert_pinned_requests();
+}
+
+#[tokio::test]
+async fn catalog_endpoint_with_path_refuses_module_start_by_name() {
+    let daemon = start_daemon().await;
+    let server = CatalogServer::start("ok", BTreeMap::new()).await;
+    let config = serde_json::json!({"hf_endpoint":format!("{}/forbidden-path", server.endpoint)})
+        .to_string();
+    let mut command =
+        synapse_module_command(&daemon.connection_file_path, None, Some(&config), &[]);
+    command.stderr(process::Stdio::piped());
+    let output = tokio::time::timeout(Duration::from_secs(15), command.output())
+        .await
+        .expect("invalid endpoint must refuse startup")
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("hf_endpoint"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(server.paths().is_empty());
+}
+
+#[tokio::test]
+async fn catalog_free_form_load_refusals_happen_before_network_io() {
+    let mut h = CatalogHarness::start("ok", None).await;
+    let base = serde_json::json!({"source":"hf","repo":"fixture/model","files":{"model":"model.safetensors","tokenizer":"tokenizer.json"},"engine":"owned-metal","task":"embed","model_id":"free-form","family":"gte-modernbert","dtype":"f16","execution":"explicit","pooling":"cls"});
+    let mut requests = vec![base.clone()];
+    let mut main = base.clone();
+    main["revision"] = "main".into();
+    requests.push(main);
+    for engine in ["ort", "llama"] {
+        let mut request = base.clone();
+        request["engine"] = engine.into();
+        request["revision"] = "a".repeat(40).into();
+        requests.push(request);
+    }
+    let mut reserved = base.clone();
+    reserved["model_id"] = "gte-modernbert-base".into();
+    reserved["revision"] = "a".repeat(40).into();
+    requests.push(reserved);
+    let mut unpinned_url = base.clone();
+    unpinned_url["source"] = "file".into();
+    unpinned_url["path"] = h.fixture_root.to_str().unwrap().into();
+    unpinned_url["files"]["model"] =
+        serde_json::json!({"url":format!("{}/file",h.server.endpoint)});
+    requests.push(unpinned_url);
+    for params in requests {
+        h.next_id += 1;
+        let frame = raw_route_frame(
+            &mut h.consumer,
+            h.route,
+            h.next_id,
+            serde_json::json!({"method":"model.load","params":params}),
+        )
+        .await;
+        let body: Value = serde_json::from_slice(&frame.body).unwrap();
+        let error = if body["result"]["error"].is_object() {
+            &body["result"]["error"]
+        } else if body["error"].is_object() {
+            &body["error"]
+        } else {
+            &body
+        };
+        assert_eq!(error["code"], "invalid_request", "{body}");
+        assert!(error["message"].is_string());
+    }
+    assert!(h.server.paths().is_empty());
 }
