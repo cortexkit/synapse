@@ -284,7 +284,9 @@ fn tokens_from_prompt_digest(prompt: &Value) -> Vec<u32> {
         .as_str()
         .expect("pinned prompt digest")
         .as_bytes()
-        .chunks_exact(8)
+        .as_chunks::<8>()
+        .0
+        .iter()
         .map(|chunk| {
             u32::from_str_radix(std::str::from_utf8(chunk).expect("hex digest chunk"), 16)
                 .expect("hex digest chunk")

@@ -418,12 +418,13 @@ pub fn encode_i32_frame(values: &[i32]) -> Vec<u8> {
 }
 
 pub fn decode_i32_frame(bytes: &[u8]) -> Result<Vec<i32>, RawFrameError> {
-    let chunks = bytes.chunks_exact(std::mem::size_of::<i32>());
-    if !chunks.remainder().is_empty() {
+    let (chunks, remainder) = bytes.as_chunks::<4>();
+    if !remainder.is_empty() {
         return Err(RawFrameError::new("i32 frame length is not divisible by 4"));
     }
     Ok(chunks
-        .map(|chunk| i32::from_le_bytes(chunk.try_into().expect("chunk has four bytes")))
+        .iter()
+        .map(|chunk| i32::from_le_bytes(*chunk))
         .collect())
 }
 
@@ -436,12 +437,13 @@ pub fn encode_f32_frame(values: &[f32]) -> Vec<u8> {
 }
 
 pub fn decode_f32_frame(bytes: &[u8]) -> Result<Vec<f32>, RawFrameError> {
-    let chunks = bytes.chunks_exact(std::mem::size_of::<f32>());
-    if !chunks.remainder().is_empty() {
+    let (chunks, remainder) = bytes.as_chunks::<4>();
+    if !remainder.is_empty() {
         return Err(RawFrameError::new("f32 frame length is not divisible by 4"));
     }
     Ok(chunks
-        .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("chunk has four bytes")))
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
         .collect())
 }
 

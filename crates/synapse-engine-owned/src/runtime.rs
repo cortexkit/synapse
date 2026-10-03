@@ -616,7 +616,10 @@ mod metal_backend {
                 batch > 0 && seq > 0 && hidden > 0 && heads > 0 && intermediate > 0,
                 "encoder dimensions must be non-zero"
             );
-            ensure!(hidden % heads == 0, "hidden size must divide heads");
+            ensure!(
+                hidden.is_multiple_of(heads),
+                "hidden size must divide heads"
+            );
             ensure!(
                 hidden_states.len() == batch * seq * hidden,
                 "encoder hidden shape mismatch"
@@ -1317,7 +1320,9 @@ impl BertModel {
             config.hidden_act
         );
         ensure!(
-            config.hidden_size % config.num_attention_heads == 0,
+            config
+                .hidden_size
+                .is_multiple_of(config.num_attention_heads),
             "hidden size must divide heads"
         );
 
@@ -1956,26 +1961,22 @@ fn load_single_safetensors_file(path: &Path) -> Result<HashMap<String, Tensor>> 
 fn tensor_from_view(dtype: SafeDtype, shape: &[usize], bytes: &[u8]) -> Result<Tensor> {
     let values = match dtype {
         SafeDtype::F32 => bytes
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("chunk_exact length")))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
             .collect(),
         SafeDtype::F16 => bytes
-            .chunks_exact(2)
-            .map(|chunk| {
-                half::f16::from_bits(u16::from_le_bytes(
-                    chunk.try_into().expect("chunk_exact length"),
-                ))
-                .to_f32()
-            })
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|chunk| half::f16::from_bits(u16::from_le_bytes(*chunk)).to_f32())
             .collect(),
         SafeDtype::BF16 => bytes
-            .chunks_exact(2)
-            .map(|chunk| {
-                half::bf16::from_bits(u16::from_le_bytes(
-                    chunk.try_into().expect("chunk_exact length"),
-                ))
-                .to_f32()
-            })
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|chunk| half::bf16::from_bits(u16::from_le_bytes(*chunk)).to_f32())
             .collect(),
         other => bail!("unsupported safetensor dtype {other:?}; expected f32/f16/bf16"),
     };
@@ -1983,8 +1984,10 @@ fn tensor_from_view(dtype: SafeDtype, shape: &[usize], bytes: &[u8]) -> Result<T
     if matches!(dtype, SafeDtype::F16) {
         tensor.metal_f16_bits = Some(
             bytes
-                .chunks_exact(2)
-                .map(|chunk| u16::from_le_bytes(chunk.try_into().expect("chunk_exact length")))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|chunk| u16::from_le_bytes(*chunk))
                 .collect(),
         );
     }

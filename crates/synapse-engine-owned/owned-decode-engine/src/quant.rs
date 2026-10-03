@@ -53,11 +53,11 @@ impl Q8_0Tensor {
             "Q8_0 matrix must contain at least one row"
         );
         ensure!(
-            row_width % Q8_0_BLOCK_ELEMENTS == 0,
+            row_width.is_multiple_of(Q8_0_BLOCK_ELEMENTS),
             "Q8_0 matrix row width {row_width} is not divisible by {Q8_0_BLOCK_ELEMENTS}"
         );
         ensure!(
-            values.len() % row_width == 0,
+            values.len().is_multiple_of(row_width),
             "Q8_0 matrix data length does not contain complete rows"
         );
         ensure!(
@@ -66,7 +66,7 @@ impl Q8_0Tensor {
         );
 
         let mut bytes = Vec::with_capacity(values.len() / Q8_0_BLOCK_ELEMENTS * Q8_0_BLOCK_BYTES);
-        for block in values.chunks_exact(Q8_0_BLOCK_ELEMENTS) {
+        for block in values.as_chunks::<Q8_0_BLOCK_ELEMENTS>().0 {
             let maximum = block.iter().copied().map(f32::abs).fold(0.0f32, f32::max);
             let scale = maximum / 127.0;
             bytes.extend_from_slice(&f16::from_f32(scale).to_bits().to_le_bytes());
@@ -88,7 +88,7 @@ impl Q8_0Tensor {
     fn dequantize(&self) -> Vec<f32> {
         let mut values =
             Vec::with_capacity(self.bytes.len() / Q8_0_BLOCK_BYTES * Q8_0_BLOCK_ELEMENTS);
-        for block in self.bytes.chunks_exact(Q8_0_BLOCK_BYTES) {
+        for block in self.bytes.as_chunks::<Q8_0_BLOCK_BYTES>().0 {
             let scale = f32::from(f16::from_bits(u16::from_le_bytes([block[0], block[1]])));
             values.extend(block[2..].iter().map(|value| (*value as i8) as f32 * scale));
         }
@@ -140,7 +140,7 @@ mod tests {
             .collect::<Vec<_>>();
         let quantized = Q8_0Tensor::quantize(&values, 32).unwrap();
         let decoded = quantized.dequantize();
-        for (block, source) in values.chunks_exact(32).enumerate() {
+        for (block, source) in values.as_chunks::<32>().0.iter().enumerate() {
             let scale = source.iter().copied().map(f32::abs).fold(0.0, f32::max) / 127.0;
             for index in 0..32 {
                 assert!((source[index] - decoded[block * 32 + index]).abs() <= scale * 0.51 + 1e-3);

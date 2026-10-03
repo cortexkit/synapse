@@ -1384,7 +1384,9 @@ mod imp {
                 // starts is evaluated at its end boundary, deferring exactly
                 // the quantum duration. Sample the distribution across the
                 // window.
-                if cancellation_latency_ms.len() < protocol.cancel_probes && boundaries % 31 == 0 {
+                if cancellation_latency_ms.len() < protocol.cancel_probes
+                    && boundaries.is_multiple_of(31)
+                {
                     cancellation_latency_ms.push(quantum_ms);
                 }
                 committed += batch.len() as u32;

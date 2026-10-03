@@ -158,7 +158,7 @@ impl KvConfiguration {
     /// snapshot/reuse boundary.
     pub fn validate_boundary(self, position: usize) -> OwnedDecodeResult<()> {
         let alignment = self.alignment()?;
-        if position % alignment != 0 {
+        if !position.is_multiple_of(alignment) {
             return Err(OwnedDecodeError::InvalidKvAlignment {
                 position,
                 required_alignment: alignment,

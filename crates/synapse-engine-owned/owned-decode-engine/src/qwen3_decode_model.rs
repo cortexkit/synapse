@@ -125,7 +125,9 @@ impl Model {
             "Qwen3 config has no KV heads"
         );
         ensure!(
-            config.num_attention_heads % config.num_key_value_heads == 0,
+            config
+                .num_attention_heads
+                .is_multiple_of(config.num_key_value_heads),
             "Qwen3 query heads must divide evenly across KV heads"
         );
         let tensors = load_safetensor_map(&root, path)?;

@@ -125,7 +125,7 @@ pub fn validate_kv_reuse_boundary(boundary: KvReuseBoundary) -> Result<(), Owned
 
     let alignment = lcm(boundary.block_size, boundary.recurrent_state_grain)
         .ok_or(OwnedDecodeRefusal::InvalidKvConfiguration)?;
-    if boundary.position % alignment != 0 {
+    if !boundary.position.is_multiple_of(alignment) {
         return Err(OwnedDecodeRefusal::InvalidKvAlignment);
     }
 

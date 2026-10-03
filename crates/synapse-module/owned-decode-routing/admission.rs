@@ -327,7 +327,7 @@ impl SessionKvConfiguration {
 
     fn validate_boundary(&self, position_tokens: u32) -> Result<(), AdmissionRefusal> {
         let alignment_tokens = self.alignment_tokens()?;
-        if position_tokens % alignment_tokens != 0 {
+        if !position_tokens.is_multiple_of(alignment_tokens) {
             return Err(AdmissionRefusal::InvalidKvAlignment {
                 position_tokens,
                 alignment_tokens,

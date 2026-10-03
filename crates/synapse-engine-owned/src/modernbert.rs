@@ -662,12 +662,18 @@ fn attention(
     theta: f32,
 ) -> Result<Vec<f32>> {
     let rows = batch * seq;
-    ensure!(qkv.len() % (rows * 3) == 0, "ModernBERT QKV shape mismatch");
+    ensure!(
+        qkv.len().is_multiple_of(rows * 3),
+        "ModernBERT QKV shape mismatch"
+    );
     let hidden = qkv.len() / (rows * 3);
-    ensure!(hidden % heads == 0, "ModernBERT head shape mismatch");
+    ensure!(
+        hidden.is_multiple_of(heads),
+        "ModernBERT head shape mismatch"
+    );
     let head_dim = hidden / heads;
     ensure!(
-        head_dim % 2 == 0,
+        head_dim.is_multiple_of(2),
         "ModernBERT RoPE head dimension must be even"
     );
 

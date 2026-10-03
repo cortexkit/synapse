@@ -204,7 +204,7 @@ pub fn run_wrapped(
         if let Some(rss) = sample_rss(child_pid) {
             peak_rss = peak_rss.max(rss);
         }
-        if ticks % 20 == 0 {
+        if ticks.is_multiple_of(20) {
             if let Some(pct) = foreign_cpu_pct(child_pid) {
                 foreign_samples.push(pct);
             }
