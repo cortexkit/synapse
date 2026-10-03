@@ -15421,6 +15421,9 @@ fn module_catalog_entries(state: &ModuleState) -> Vec<ModelCatalogEntry> {
                 };
 
             let warm_load_cost_hint_ms = last_cold_load_ms.or_else(|| {
+                if resolved_catalog_lane(&state.runtime, &spec.model_id).is_some() {
+                    return None;
+                }
                 state
                     .store
                     .get_perf_row(&state.machine_profile_hash, &spec.fingerprint)
@@ -21048,135 +21051,172 @@ fn catalog_call_fault(id: &str, call: &str) -> Result<(), WireOperationError> {
 async fn execute_catalog_download(state: Arc<ModuleState>, record: JobRecord) {
     let result = fetch_catalog_download(&state, &record).await;
     if let Err(error) = result {
-        let lock = download_publish_lock(&state.runtime, &record.job_id);
-        let _publish = lock.lock().expect("publish lock");
-        let _disk = state
-            .runtime
-            .catalog_disk
-            .lock()
-            .expect("catalog disk lock");
-        let value = serde_json::to_value(error).expect("wire error");
-        match state.store.end_download_job(
-            &record.job_id,
-            store::DownloadEnd::Failed { error_json: &value },
-            &CatalogCache(&state.model_cache),
-            now_ms(),
-        ) {
-            Ok(store::DownloadTransition::Applied { .. }) => {
-                state.runtime.admission_telemetry.record_job_failed()
-            }
-            Ok(_) => {}
-            Err(error) => tracing::warn!(%error,"download failure transaction failed"),
-        }
-    }
-}
-async fn fetch_catalog_download(
-    state: &Arc<ModuleState>,
-    record: &JobRecord,
-) -> Result<(), WireOperationError> {
-    use store::CatalogBlobCache;
-    let entry = state
-        .runtime
-        .release_catalog
-        .entry(
-            record
-                .params_json
-                .as_ref()
-                .and_then(|p| p["catalog_id"].as_str())
-                .unwrap_or(""),
-        )
-        .ok_or_else(|| catalog_unknown("download entry"))?
-        .clone();
-    let manifest = entry.manifest_digest();
-    let targets = entry
-        .backends
-        .iter()
-        .filter(|b| state.runtime.runnable_backends.contains(&b.backend))
-        .map(|b| b.backend.clone())
-        .collect::<Vec<_>>();
-    let files = entry
-        .files
-        .iter()
-        .filter(|f| f.backends.iter().any(|b| targets.contains(b)))
-        .cloned()
-        .collect::<Vec<_>>();
-    let mut planned = BTreeSet::new();
-    let total = files
-        .iter()
-        .filter(|f| {
-            planned.insert(f.sha256.clone())
-                && CatalogCache(&state.model_cache)
-                    .blob_size(&f.sha256)
-                    .ok()
-                    .flatten()
-                    != Some(f.size_bytes)
-        })
-        .map(|f| f.size_bytes)
-        .sum::<u64>();
-    state
-        .runtime
-        .download_bytes
-        .lock()
-        .expect("download counters")
-        .insert(record.job_id.clone(), (0, total));
-    let staging = catalog_staging(&state.model_cache, &record.job_id);
-    fs::create_dir_all(&staging)
-        .map_err(|e| download_error("", "storage_full", None, e.to_string()))?;
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::limited(10))
-        .build()
-        .map_err(|e| download_error("", "network", None, e.to_string()))?;
-    for file in &files {
-        let lock = download_publish_lock(&state.runtime, &record.job_id);
-        let reuse = {
+        if let Err(error) = catalog_download_blocking(move || {
+            let lock = download_publish_lock(&state.runtime, &record.job_id);
             let _publish = lock.lock().expect("publish lock");
             let _disk = state
                 .runtime
                 .catalog_disk
                 .lock()
                 .expect("catalog disk lock");
-            let reuse = state
-                .store
-                .root_reused_download_blob(
-                    &record.job_id,
-                    &file.sha256,
-                    file.size_bytes,
-                    &CatalogCache(&state.model_cache),
-                )
-                .map_err(catalog_store_error)?;
-            if matches!(reuse, store::DownloadReuse::Absent) {
-                if let Some(size) = CatalogCache(&state.model_cache)
-                    .blob_size(&file.sha256)
-                    .map_err(catalog_store_error)?
-                {
-                    let error = catalog_artifact_error(file, None, Some(size));
-                    state
-                        .store
-                        .quarantine_catalog_blob(
-                            &file.sha256,
-                            &serde_json::to_value(error).expect("wire error"),
-                            &CatalogCache(&state.model_cache),
-                            now_ms(),
-                        )
-                        .map_err(catalog_store_error)?;
+            let value = serde_json::to_value(error).expect("wire error");
+            match state.store.end_download_job(
+                &record.job_id,
+                store::DownloadEnd::Failed { error_json: &value },
+                &CatalogCache(&state.model_cache),
+                now_ms(),
+            ) {
+                Ok(store::DownloadTransition::Applied { .. }) => {
+                    state.runtime.admission_telemetry.record_job_failed()
                 }
+                Ok(_) => {}
+                Err(error) => tracing::warn!(%error, "download failure transaction failed"),
             }
-            reuse
-        };
-        if matches!(reuse, store::DownloadReuse::Rooted) {
-            catalog_test_barrier("pre-publish", &record.job_id);
+            Ok(())
+        })
+        .await
+        {
+            tracing::warn!(%error, "download failure cleanup task failed");
+        }
+    }
+}
+
+// Download disk transactions and hashing must not occupy a Tokio runtime worker:
+// management frames need to remain responsive while a large artifact is written or published.
+async fn catalog_download_blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, WireOperationError> + Send + 'static,
+) -> Result<T, WireOperationError> {
+    tokio::task::spawn_blocking(work).await.map_err(|error| {
+        WireOperationError::from_stable(
+            StableError::engine_crashed(Some(250)),
+            format!("catalog download blocking task failed: {error}"),
+        )
+    })?
+}
+async fn fetch_catalog_download(
+    state: &Arc<ModuleState>,
+    record: &JobRecord,
+) -> Result<(), WireOperationError> {
+    use store::CatalogBlobCache;
+    let plan_state = state.clone();
+    let plan_record = record.clone();
+    let (entry, manifest, targets, files, staging) = catalog_download_blocking(move || {
+        let entry = plan_state
+            .runtime
+            .release_catalog
+            .entry(
+                plan_record
+                    .params_json
+                    .as_ref()
+                    .and_then(|p| p["catalog_id"].as_str())
+                    .unwrap_or(""),
+            )
+            .ok_or_else(|| catalog_unknown("download entry"))?
+            .clone();
+        let manifest = entry.manifest_digest();
+        let targets = entry
+            .backends
+            .iter()
+            .filter(|b| plan_state.runtime.runnable_backends.contains(&b.backend))
+            .map(|b| b.backend.clone())
+            .collect::<Vec<_>>();
+        let files = entry
+            .files
+            .iter()
+            .filter(|f| f.backends.iter().any(|b| targets.contains(b)))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut planned = BTreeSet::new();
+        let total = files
+            .iter()
+            .filter(|f| {
+                planned.insert(f.sha256.clone())
+                    && CatalogCache(&plan_state.model_cache)
+                        .blob_size(&f.sha256)
+                        .ok()
+                        .flatten()
+                        != Some(f.size_bytes)
+            })
+            .map(|f| f.size_bytes)
+            .sum::<u64>();
+        plan_state
+            .runtime
+            .download_bytes
+            .lock()
+            .expect("download counters")
+            .insert(plan_record.job_id.clone(), (0, total));
+        let staging = catalog_staging(&plan_state.model_cache, &plan_record.job_id);
+        fs::create_dir_all(&staging)
+            .map_err(|e| download_error("", "storage_full", None, e.to_string()))?;
+        Ok((entry, manifest, targets, files, staging))
+    })
+    .await?;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .build()
+        .map_err(|e| download_error("", "network", None, e.to_string()))?;
+    for file in &files {
+        let reuse_state = state.clone();
+        let reuse_record = record.clone();
+        let reuse_file = file.clone();
+        let (reuse, active) = catalog_download_blocking(move || {
+            let lock = download_publish_lock(&reuse_state.runtime, &reuse_record.job_id);
+            let reuse = {
+                let _publish = lock.lock().expect("publish lock");
+                let _disk = reuse_state
+                    .runtime
+                    .catalog_disk
+                    .lock()
+                    .expect("catalog disk lock");
+                let reuse = reuse_state
+                    .store
+                    .root_reused_download_blob(
+                        &reuse_record.job_id,
+                        &reuse_file.sha256,
+                        reuse_file.size_bytes,
+                        &CatalogCache(&reuse_state.model_cache),
+                    )
+                    .map_err(catalog_store_error)?;
+                if matches!(reuse, store::DownloadReuse::Absent) {
+                    if let Some(size) = CatalogCache(&reuse_state.model_cache)
+                        .blob_size(&reuse_file.sha256)
+                        .map_err(catalog_store_error)?
+                    {
+                        let error = catalog_artifact_error(&reuse_file, None, Some(size));
+                        reuse_state
+                            .store
+                            .quarantine_catalog_blob(
+                                &reuse_file.sha256,
+                                &serde_json::to_value(error).expect("wire error"),
+                                &CatalogCache(&reuse_state.model_cache),
+                                now_ms(),
+                            )
+                            .map_err(catalog_store_error)?;
+                    }
+                }
+                reuse
+            };
+            if matches!(reuse, store::DownloadReuse::Rooted) {
+                catalog_test_barrier("pre-publish", &reuse_record.job_id);
+            }
+            if matches!(reuse, store::DownloadReuse::Absent)
+                && !reuse_state
+                    .store
+                    .advance_download_job(&reuse_record.job_id, "downloading", now_ms())
+                    .map_err(catalog_store_error)?
+            {
+                return Ok((reuse, false));
+            }
+            Ok((reuse, true))
+        })
+        .await?;
+        if !active {
+            return Ok(());
         }
         match reuse {
             store::DownloadReuse::Stopped(_) => return Ok(()),
             store::DownloadReuse::Rooted => continue,
             store::DownloadReuse::Absent => {}
-        }
-        if !state
-            .store
-            .advance_download_job(&record.job_id, "downloading", now_ms())
-            .map_err(catalog_store_error)?
-        {
-            return Ok(());
         }
         let source = huggingface_resolve_url(
             &state.runtime.hf_endpoint,
@@ -21201,8 +21241,13 @@ async fn fetch_catalog_download(
             ));
         }
         let path = staging.join(&file.sha256);
-        let mut output = fs::File::create(&path)
-            .map_err(|e| download_error(&file.path, "storage_full", None, e.to_string()))?;
+        let output_path = path.clone();
+        let output_file = file.clone();
+        let mut output = catalog_download_blocking(move || {
+            fs::File::create(output_path)
+                .map_err(|e| download_error(&output_file.path, "storage_full", None, e.to_string()))
+        })
+        .await?;
         let mut hasher = Sha256::new();
         let mut size = 0u64;
         loop {
@@ -21213,116 +21258,150 @@ async fn fetch_catalog_download(
             let Some(body) = body else {
                 break;
             };
-            if !state
-                .store
-                .get_job(&record.job_id)
-                .map_err(catalog_store_error)?
-                .is_some_and(|j| store::is_download_non_terminal(&j.state))
-            {
+            let write_state = state.clone();
+            let write_record = record.clone();
+            let write_file = file.clone();
+            let written = catalog_download_blocking(move || {
+                if !write_state
+                    .store
+                    .get_job(&write_record.job_id)
+                    .map_err(catalog_store_error)?
+                    .is_some_and(|j| store::is_download_non_terminal(&j.state))
+                {
+                    return Ok(None);
+                }
+                output.write_all(&body).map_err(|e| {
+                    download_error(&write_file.path, "storage_full", None, e.to_string())
+                })?;
+                hasher.update(&body);
+                size = size.saturating_add(body.len() as u64);
+                if let Some(counts) = write_state
+                    .runtime
+                    .download_bytes
+                    .lock()
+                    .expect("download counters")
+                    .get_mut(&write_record.job_id)
+                {
+                    counts.0 = counts.0.saturating_add(body.len() as u64);
+                }
+                Ok(Some((output, hasher, size)))
+            })
+            .await?;
+            let Some(written) = written else {
                 return Ok(());
-            }
-            output
-                .write_all(&body)
-                .map_err(|e| download_error(&file.path, "storage_full", None, e.to_string()))?;
-            hasher.update(&body);
-            size = size.saturating_add(body.len() as u64);
-            if let Some(counts) = state
-                .runtime
-                .download_bytes
-                .lock()
-                .expect("download counters")
-                .get_mut(&record.job_id)
-            {
-                counts.0 = counts.0.saturating_add(body.len() as u64);
-            }
+            };
+            (output, hasher, size) = written;
         }
-        output
-            .sync_all()
-            .map_err(|e| download_error(&file.path, "storage_full", None, e.to_string()))?;
-        drop(output);
-        if !state
-            .store
-            .advance_download_job(&record.job_id, "verifying", now_ms())
-            .map_err(catalog_store_error)?
-        {
+        let publish_state = state.clone();
+        let publish_record = record.clone();
+        let publish_file = file.clone();
+        let published = catalog_download_blocking(move || {
+            output.sync_all().map_err(|e| {
+                download_error(&publish_file.path, "storage_full", None, e.to_string())
+            })?;
+            drop(output);
+            if !publish_state
+                .store
+                .advance_download_job(&publish_record.job_id, "verifying", now_ms())
+                .map_err(catalog_store_error)?
+            {
+                return Ok(false);
+            }
+            let digest = hex::encode(hasher.finalize());
+            if digest != publish_file.sha256 || size != publish_file.size_bytes {
+                return Err(catalog_artifact_error(
+                    &publish_file,
+                    Some(digest),
+                    Some(size),
+                ));
+            }
+            catalog_test_barrier("pre-publish", &publish_record.job_id);
+            let lock = download_publish_lock(&publish_state.runtime, &publish_record.job_id);
+            let _publish = lock.lock().expect("publish lock");
+            let _disk = publish_state
+                .runtime
+                .catalog_disk
+                .lock()
+                .expect("catalog disk lock");
+            match publish_state
+                .store
+                .record_download_publication(
+                    &publish_record.job_id,
+                    &publish_file.sha256,
+                    &CatalogCache(&publish_state.model_cache),
+                )
+                .map_err(catalog_store_error)?
+            {
+                store::DownloadPublication::Stopped(_) => return Ok(false),
+                store::DownloadPublication::Proceed { .. } => {
+                    publish_state
+                        .model_cache
+                        .ingest(ModelCacheIngest {
+                            source_url: local_file_url(&path),
+                            expected_digest: Some(publish_file.sha256.clone()),
+                            format: if publish_file.role == "model" {
+                                "safetensors"
+                            } else {
+                                "json"
+                            }
+                            .into(),
+                            tokenizer_path: None,
+                            pin_module_id: None,
+                        })
+                        .map_err(model_cache_load_error)?;
+                }
+            }
+            Ok(true)
+        })
+        .await?;
+        if !published {
             return Ok(());
         }
-        let digest = hex::encode(hasher.finalize());
-        if digest != file.sha256 || size != file.size_bytes {
-            return Err(catalog_artifact_error(file, Some(digest), Some(size)));
-        }
-        catalog_test_barrier("pre-publish", &record.job_id);
+    }
+    let commit_state = state.clone();
+    let commit_record = record.clone();
+    catalog_download_blocking(move || {
+        catalog_test_barrier("pre-commit", &commit_record.job_id);
+        let lock = download_publish_lock(&commit_state.runtime, &commit_record.job_id);
         let _publish = lock.lock().expect("publish lock");
-        let _disk = state
+        let _disk = commit_state
             .runtime
             .catalog_disk
             .lock()
             .expect("catalog disk lock");
-        match state
+        let installs = targets
+            .iter()
+            .map(|b| store::CatalogInstallRecord {
+                catalog_id: entry.id.clone(),
+                manifest_digest: manifest.clone(),
+                backend: b.clone(),
+                members: entry
+                    .backend_files(b)
+                    .values()
+                    .map(|f| store::CatalogInstallMember {
+                        path: f.path.clone(),
+                        digest: f.sha256.clone(),
+                    })
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
+        if let store::DownloadTransition::Applied { .. } = commit_state
             .store
-            .record_download_publication(
-                &record.job_id,
-                &file.sha256,
-                &CatalogCache(&state.model_cache),
-            )
+            .commit_download_job(&commit_record.job_id, &installs, now_ms())
             .map_err(catalog_store_error)?
         {
-            store::DownloadPublication::Stopped(_) => return Ok(()),
-            store::DownloadPublication::Proceed { .. } => {
-                state
-                    .model_cache
-                    .ingest(ModelCacheIngest {
-                        source_url: local_file_url(&path),
-                        expected_digest: Some(file.sha256.clone()),
-                        format: if file.role == "model" {
-                            "safetensors"
-                        } else {
-                            "json"
-                        }
-                        .into(),
-                        tokenizer_path: None,
-                        pin_module_id: None,
-                    })
-                    .map_err(model_cache_load_error)?;
-            }
+            commit_state
+                .runtime
+                .admission_telemetry
+                .record_job_completed();
+            CatalogCache(&commit_state.model_cache)
+                .delete_staging(&commit_record.job_id)
+                .map_err(catalog_store_error)?;
+            sync_installed_catalog_slots(&commit_state)?;
         }
-    }
-    catalog_test_barrier("pre-commit", &record.job_id);
-    let lock = download_publish_lock(&state.runtime, &record.job_id);
-    let _publish = lock.lock().expect("publish lock");
-    let _disk = state
-        .runtime
-        .catalog_disk
-        .lock()
-        .expect("catalog disk lock");
-    let installs = targets
-        .iter()
-        .map(|b| store::CatalogInstallRecord {
-            catalog_id: entry.id.clone(),
-            manifest_digest: manifest.clone(),
-            backend: b.clone(),
-            members: entry
-                .backend_files(b)
-                .values()
-                .map(|f| store::CatalogInstallMember {
-                    path: f.path.clone(),
-                    digest: f.sha256.clone(),
-                })
-                .collect(),
-        })
-        .collect::<Vec<_>>();
-    if let store::DownloadTransition::Applied { .. } = state
-        .store
-        .commit_download_job(&record.job_id, &installs, now_ms())
-        .map_err(catalog_store_error)?
-    {
-        state.runtime.admission_telemetry.record_job_completed();
-        CatalogCache(&state.model_cache)
-            .delete_staging(&record.job_id)
-            .map_err(catalog_store_error)?;
-        sync_installed_catalog_slots(state)?;
-    }
-    Ok(())
+        Ok(())
+    })
+    .await
 }
 
 fn catalog_blob_referenced(tx: &rusqlite::Transaction<'_>, digest: &str) -> rusqlite::Result<bool> {

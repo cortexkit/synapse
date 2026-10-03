@@ -253,6 +253,28 @@ impl CatalogHarness {
         response["result"].clone()
     }
 
+    #[cfg(target_os = "macos")]
+    async fn serve_when_ready(&mut self, method: &str, params: Value) -> Value {
+        let until = Instant::now() + Duration::from_secs(120);
+        loop {
+            let result = self.call(method, params.clone()).await;
+            if result["error"]["code"] != "model_loading" {
+                return result;
+            }
+            assert_eq!(result["error"]["class"], "transient");
+            assert_eq!(result["error"]["safe_to_retry_same_request"], true);
+            let retry = result["error"]["retry_after_ms"]
+                .as_u64()
+                .expect("loading retry delay");
+            assert_eq!(retry, 250);
+            assert!(
+                Instant::now() < until,
+                "catalog cold load exceeded 120 s: {result}"
+            );
+            sleep(Duration::from_millis(retry)).await;
+        }
+    }
+
     async fn download(&mut self, id: &str, key: &str) -> Value {
         self.call(
             "models.download",
@@ -1183,7 +1205,7 @@ async fn catalog_real_metal_redirect_download_self_checks_and_serves_without_pro
     assert_eq!(before["models"][0]["certified"], false);
     let requests = h.server.paths().len();
     for model in ["gte-modernbert-base", "gte-modernbert-base-metal"] {
-        let served = h.call("embed.query", serde_json::json!({"model":model,"text":"The quick brown fox jumps over the lazy dog.","deadline_ms":30000})).await;
+        let served = h.serve_when_ready("embed.query", serde_json::json!({"model":model,"text":"The quick brown fox jumps over the lazy dog.","deadline_ms":30000})).await;
         assert_eq!(served["fingerprint"], expected_fingerprint, "{served}");
         assert_eq!(served["dims"], 768);
     }
@@ -1200,7 +1222,7 @@ async fn catalog_real_metal_redirect_download_self_checks_and_serves_without_pro
     let pending = h.call("models.list", serde_json::json!({})).await;
     assert_eq!(pending["models"][0]["self_check"]["state"], "pending");
     let served_again = h
-        .call(
+        .serve_when_ready(
             "embed.query",
             serde_json::json!({"model":"gte-modernbert-base","text":"hello","deadline_ms":30000}),
         )
@@ -1290,7 +1312,7 @@ async fn catalog_real_metal_stalled_self_check_keeps_single_flight_holder() {
         .await;
     assert_eq!(done["state"], "committed", "{done}");
     let served = h
-        .call(
+        .serve_when_ready(
             "embed.query",
             serde_json::json!({"model":"gte-modernbert-base","text":"hello","deadline_ms":30000}),
         )
@@ -1402,7 +1424,7 @@ async fn catalog_real_qwen_embedding_serves_catalog_and_lane_ids_then_unloads() 
     assert_eq!(done["state"], "committed", "{done}");
     for model in ["qwen3-embedding-0.6b-metal", "qwen3-embedding-0.6b"] {
         let served = h
-            .call(
+            .serve_when_ready(
                 "embed.query",
                 serde_json::json!({"model":model,"text":"hello","deadline_ms":30000}),
             )
@@ -1435,7 +1457,7 @@ async fn catalog_real_reranker_loaded_metadata_is_pinned() {
         )
         .await;
     assert_eq!(done["state"], "committed", "{done}");
-    let served = h.call("rerank.score", serde_json::json!({"model":"gte-reranker-modernbert-base","query":"What is Rust?","candidates":[{"id":"rust","text":"Rust is a systems programming language."}],"deadline_ms":30000})).await;
+    let served = h.serve_when_ready("rerank.score", serde_json::json!({"model":"gte-reranker-modernbert-base","query":"What is Rust?","candidates":[{"id":"rust","text":"Rust is a systems programming language."}],"deadline_ms":30000})).await;
     assert!(served.get("error").is_none(), "{served}");
     let listed = h.call("models.list", serde_json::json!({})).await;
     let row = &listed["models"][0];
@@ -1543,7 +1565,7 @@ async fn catalog_real_numerical_failure_persists_and_pinned_requests_fail_closed
         .await;
     assert_eq!(done["state"], "committed", "{done}");
     let refused = h
-        .call(
+        .serve_when_ready(
             "embed.query",
             serde_json::json!({"model":"gte-modernbert-base","text":"hello","deadline_ms":30000}),
         )
