@@ -58,8 +58,9 @@ fn emit_stderr_fixture(lines: usize, final_delay_ms: u64) -> Result<()> {
 }
 
 /// The timeout worker is shared by tests for several catalog engines. Match
-/// the host's expected identity so the mock exercises request behavior instead
-/// of being rejected during the catalog identity handshake.
+/// the host's expected identity (and, for manifest-bound lanes, its expected
+/// manifest digest and kernel revision) so the mock exercises request behavior
+/// instead of being rejected during the handshake.
 fn worker_hello(nonce: String) -> WorkerHello {
     let engine = std::env::var("SYNAPSE_WORKER_EXPECTED_ENGINE")
         .unwrap_or_else(|_| "timeout-mock".to_string());
@@ -73,6 +74,8 @@ fn worker_hello(nonce: String) -> WorkerHello {
         },
         pid: std::process::id(),
         max_frame: DEFAULT_MAX_FRAME_BYTES,
+        manifest_digest: std::env::var("SYNAPSE_WORKER_EXPECTED_MANIFEST_DIGEST").ok(),
+        kernel_revision: std::env::var("SYNAPSE_WORKER_EXPECTED_KERNEL_REVISION").ok(),
     }
 }
 
@@ -179,12 +182,25 @@ fn run_worker<S: Read + Write>(
                         models_loaded: 1,
                         placement_share: None,
                         buckets: buckets.clone(),
+                        ane_resident_shapes: None,
                     },
                     max_frame,
                 )?;
             }
             WorkerRequest::Unload { req_id, .. } => {
                 write_json_frame(stream, &WorkerResponse::Unloaded { req_id }, max_frame)?;
+            }
+            unsupported @ (WorkerRequest::RerankSequences { .. }
+            | WorkerRequest::AneAdmitShape { .. }
+            | WorkerRequest::AneEvictShape { .. }) => {
+                if unsupported.carries_raw_frame() {
+                    let _ = read_frame(stream, max_frame).context("read unsupported raw frame")?;
+                }
+                write_json_frame(
+                    stream,
+                    &WorkerResponse::unsupported_request(&unsupported),
+                    max_frame,
+                )?;
             }
             other => {
                 let req_id = match other {
@@ -194,6 +210,9 @@ fn run_worker<S: Read + Write>(
                     | WorkerRequest::Unload { .. }
                     | WorkerRequest::Ping { .. }
                     | WorkerRequest::Generate { .. }
+                    | WorkerRequest::RerankSequences { .. }
+                    | WorkerRequest::AneAdmitShape { .. }
+                    | WorkerRequest::AneEvictShape { .. }
                     | WorkerRequest::Shutdown {} => None,
                 };
                 write_json_frame(

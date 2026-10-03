@@ -27,12 +27,13 @@ use owned_decode_worker::{
 use serde::{Deserialize, Serialize};
 use synapse_core::{
     accept_worker_handshake_with_engine_and_protocol_version, decode_f32_frame, encode_i32_frame,
-    prepare_listener, read_json, read_raw, worker_engine_names::LLAMA_WORKER_ENGINE, write_json,
-    write_raw, EmbedEngine, EngineError, EngineErrorStage, EngineIdentity, EngineRiskClass,
-    GenerateEngine, GenerateOutput, GenerateRequest, LoadedModel, ProgressBoundary, RerankEngine,
-    RerankRequest, RerankScores, RuntimeConfig, TokenBatch, TokenIds, TransportError,
-    ValidatedArtifact, Vector, Vectors, WorkerCandidate, WorkerPooling, WorkerRequest,
-    WorkerResponse, WorkerTokenItem, WorkerTransportStream, DEFAULT_MAX_FRAME_BYTES,
+    is_owned_worker_hello_engine, prepare_listener, read_json, read_raw,
+    worker_engine_names::LLAMA_WORKER_ENGINE, write_json, write_raw, EmbedEngine, EngineError,
+    EngineErrorStage, EngineIdentity, EngineRiskClass, ExpectedHelloBinding, GenerateEngine,
+    GenerateOutput, GenerateRequest, LoadedModel, ProgressBoundary, RerankEngine, RerankRequest,
+    RerankScores, RuntimeConfig, TokenBatch, TokenIds, TransportError, ValidatedArtifact, Vector,
+    Vectors, WorkerCandidate, WorkerPooling, WorkerRequest, WorkerResponse, WorkerSequence,
+    WorkerTokenItem, WorkerTransportStream, DEFAULT_MAX_FRAME_BYTES,
 };
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -92,6 +93,14 @@ pub struct WorkerHostConfig {
     /// Owned-CUDA has one process per stable model specification. Including
     /// the worker id in the crash key keeps equal artifacts isolated.
     pub isolate_crash_key_by_worker_id: bool,
+    /// Manifest digest and kernel revision an owned worker's HELLO must carry.
+    /// Set only for lanes bound to the model manifest; `None` keeps the
+    /// handshake that accepts a HELLO without either field.
+    pub expected_hello_binding: Option<ExpectedHelloBinding>,
+    /// Direct-ANE lane lock the spawned worker inherits as its stdin, so the
+    /// lock stays held until this worker has exited too. See
+    /// [`ane_residency::AneDirectLaneLock`].
+    pub inherited_lane_lock: Option<Arc<std::fs::File>>,
 }
 
 impl WorkerHostConfig {
@@ -113,6 +122,8 @@ impl WorkerHostConfig {
             worker_forward_lines_per_sec: 50,
             engine_identity: None,
             isolate_crash_key_by_worker_id: false,
+            expected_hello_binding: None,
+            inherited_lane_lock: None,
         }
     }
 }
@@ -132,6 +143,11 @@ pub enum WorkerHostError {
     },
     #[error("worker returned {code}: {msg}")]
     WorkerErr { code: String, msg: String },
+    /// The worker's HELLO was refused because its manifest digest or kernel
+    /// revision differs from the lane's (`manifest_mismatch`,
+    /// `kernel_revision_mismatch`). Distinct from a worker `ERR` at LOAD.
+    #[error("worker HELLO refused with {code}: {msg}")]
+    HelloRefused { code: String, msg: String },
     #[error("engine_crashed at {stage}: {detail}")]
     EngineCrashed {
         stage: String,
@@ -153,10 +169,20 @@ impl WorkerHostError {
             risk_class: EngineRiskClass::AbortCapable,
             message: self.to_string(),
             retry_after_ms: match self {
-                Self::Quarantined { .. } | Self::WorkerErr { .. } => None,
+                Self::Quarantined { .. } | Self::WorkerErr { .. } | Self::HelloRefused { .. } => {
+                    None
+                }
                 _ => Some(250),
             },
             safe_to_retry_same_request: matches!(self, Self::EngineCrashed { .. }),
+        }
+    }
+
+    /// The typed code of a worker `ERR` or of a HELLO refusal.
+    pub fn code(&self) -> Option<&str> {
+        match self {
+            Self::WorkerErr { code, .. } | Self::HelloRefused { code, .. } => Some(code),
+            _ => None,
         }
     }
 }
@@ -417,24 +443,17 @@ impl WorkerHost {
         model: &LoadedModel,
         request: RerankRequest,
     ) -> Result<RerankScores, WorkerHostError> {
+        if self.serves_owned_rerank() && !request.query.is_empty() {
+            return Err(WorkerHostError::Protocol(
+                "owned rerank lanes take fully composed sequences as candidates; query must be empty"
+                    .to_string(),
+            ));
+        }
         let (worker_model_ref, crash_key) = self.ensure_worker_model(model).await?;
         let req_id = self.next_req_id("rerank");
-        let mut ids = token_ids_to_i32(&request.query)?;
-        for candidate in &request.candidates {
-            ids.extend(token_ids_to_i32(candidate)?);
-        }
-        let worker_request = WorkerRequest::Rerank {
-            req_id: req_id.clone(),
-            model_ref: worker_model_ref,
-            query_n_tokens: request.query.len(),
-            candidates: request
-                .candidates
-                .iter()
-                .map(|candidate| WorkerCandidate {
-                    n_tokens: candidate.len(),
-                })
-                .collect(),
-        };
+        let (worker_request, ids) =
+            self.rerank_request(req_id.clone(), worker_model_ref, &request)?;
+        let wire_type = worker_request.wire_type();
         match self
             .send_request(worker_request, Some(encode_i32_frame(&ids)), true)
             .await
@@ -450,7 +469,7 @@ impl WorkerHost {
                 Err(WorkerHostError::WorkerErr { code, msg })
             }
             Ok((other, _)) => Err(WorkerHostError::Protocol(format!(
-                "RERANK returned unexpected response {other:?}"
+                "{wire_type} returned unexpected response {other:?}"
             ))),
             Err(error @ WorkerHostError::EngineCrashed { .. }) => {
                 self.record_crash_and_maybe_restart(crash_key).await;
@@ -458,6 +477,66 @@ impl WorkerHost {
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// Owned workers (CUDA, Vulkan, direct ANE) score `RERANK_SEQUENCES`;
+    /// every other lane, llama included, keeps the segment-frame `RERANK`.
+    fn serves_owned_rerank(&self) -> bool {
+        self.config
+            .engine_identity
+            .as_ref()
+            .is_some_and(|identity| is_owned_worker_hello_engine(&identity.engine))
+    }
+
+    /// Builds the rerank request for this lane and its raw i32 frame.
+    ///
+    /// Owned lanes receive each candidate as one fully composed sequence
+    /// (query, candidate and every special or template token, built by the
+    /// module from the manifest grammar), concatenated in candidate order. The
+    /// llama lane receives the query segment followed by the candidate
+    /// segments and assembles the pairs itself.
+    fn rerank_request(
+        &self,
+        req_id: String,
+        model_ref: String,
+        request: &RerankRequest,
+    ) -> Result<(WorkerRequest, Vec<i32>), WorkerHostError> {
+        let owned = self.serves_owned_rerank();
+        let mut ids = if owned {
+            Vec::new()
+        } else {
+            token_ids_to_i32(&request.query)?
+        };
+        for candidate in &request.candidates {
+            ids.extend(token_ids_to_i32(candidate)?);
+        }
+        let worker_request = if owned {
+            WorkerRequest::RerankSequences {
+                req_id,
+                model_ref,
+                sequences: request
+                    .candidates
+                    .iter()
+                    .map(|sequence| WorkerSequence {
+                        n_tokens: sequence.len(),
+                    })
+                    .collect(),
+            }
+        } else {
+            WorkerRequest::Rerank {
+                req_id,
+                model_ref,
+                query_n_tokens: request.query.len(),
+                candidates: request
+                    .candidates
+                    .iter()
+                    .map(|candidate| WorkerCandidate {
+                        n_tokens: candidate.len(),
+                    })
+                    .collect(),
+            }
+        };
+        Ok((worker_request, ids))
     }
 
     pub async fn generate(
@@ -879,6 +958,9 @@ impl WorkerHost {
         for arg in &self.config.extra_args {
             command.arg(arg);
         }
+        if let Some(lock) = &self.config.inherited_lane_lock {
+            command.stdin(ane_residency::inheritable_lock_stdio(lock)?);
+        }
         let expected_engine = self
             .config
             .engine_identity
@@ -888,6 +970,20 @@ impl WorkerHost {
             // The timeout test worker exercises several catalog engines; pass
             // the expected identity without weakening the host-side handshake.
             command.env("SYNAPSE_WORKER_EXPECTED_ENGINE", expected_engine);
+        }
+        if let Some(binding) = &self.config.expected_hello_binding {
+            // Like the expected engine, these exist for the timeout test
+            // worker, which echoes them into its HELLO. Real owned workers
+            // send the digest and revision they were built with.
+            command
+                .env(
+                    "SYNAPSE_WORKER_EXPECTED_MANIFEST_DIGEST",
+                    &binding.manifest_digest,
+                )
+                .env(
+                    "SYNAPSE_WORKER_EXPECTED_KERNEL_REVISION",
+                    &binding.kernel_revision,
+                );
         }
         let mut child = command.spawn().map_err(|error| {
             WorkerHostError::Protocol(format!(
@@ -933,6 +1029,7 @@ impl WorkerHost {
             self.config.handshake_timeout,
             expected_engine,
             required_protocol_version,
+            self.config.expected_hello_binding.as_ref(),
         )
         .await
         {
@@ -2067,7 +2164,8 @@ fn owned_host_fault(error: &WorkerHostError) -> WorkerFault {
         WorkerHostError::Protocol(_)
         | WorkerHostError::ProtocolVersion { .. }
         | WorkerHostError::Json(_)
-        | WorkerHostError::WorkerErr { .. } => WorkerFault::Protocol,
+        | WorkerHostError::WorkerErr { .. }
+        | WorkerHostError::HelloRefused { .. } => WorkerFault::Protocol,
         WorkerHostError::EngineCrashed { .. }
         | WorkerHostError::Io(_)
         | WorkerHostError::Quarantined { .. } => WorkerFault::Crash,
@@ -2211,6 +2309,10 @@ impl From<TransportError> for WorkerHostError {
                 advertised,
                 required,
             },
+            TransportError::HelloBindingMismatch(mismatch) => Self::HelloRefused {
+                code: mismatch.code.to_string(),
+                msg: mismatch.to_string(),
+            },
         }
     }
 }
@@ -2305,6 +2407,9 @@ fn request_stage(request: &WorkerRequest) -> &'static str {
         WorkerRequest::Load { .. } => "load",
         WorkerRequest::EmbedBatch { .. } => "embed_batch",
         WorkerRequest::Rerank { .. } => "rerank",
+        WorkerRequest::RerankSequences { .. } => "rerank_sequences",
+        WorkerRequest::AneAdmitShape { .. } => "ane_admit_shape",
+        WorkerRequest::AneEvictShape { .. } => "ane_evict_shape",
         WorkerRequest::Generate { .. } => "generate",
         WorkerRequest::Unload { .. } => "unload",
         WorkerRequest::Ping { .. } => "ping",
@@ -2682,6 +2787,8 @@ mod tests {
                 },
                 pid: 1,
                 max_frame: DEFAULT_MAX_FRAME_BYTES,
+                manifest_digest: None,
+                kernel_revision: None,
             };
             write_json_frame(&mut stream, &hello, DEFAULT_MAX_FRAME_BYTES)
                 .await
@@ -2734,6 +2841,7 @@ mod tests {
                 Duration::from_secs(1),
                 Some("decode"),
                 Some(2),
+                None,
             )
             .await
             .expect_err("owned decode must reject a pre-v2 worker")
@@ -2854,5 +2962,1727 @@ mod tests {
         assert_eq!(tracked.crash_key, "model-key");
         assert_eq!(tracked.artifact.format, "gguf");
         assert!(tracked.worker_model_ref.is_none());
+    }
+
+    type SeenRequests = Vec<(WorkerRequest, Option<Vec<u8>>)>;
+
+    /// Connects `host` to an in-process mock worker that answers each request
+    /// with `respond`. The returned task yields every request (and its raw
+    /// frame) once the host drops the connection.
+    #[cfg(unix)]
+    fn attach_mock_worker<F>(
+        host: &mut WorkerHost,
+        respond: F,
+    ) -> tokio::task::JoinHandle<SeenRequests>
+    where
+        F: Fn(&WorkerRequest, Option<&[u8]>) -> (WorkerResponse, Option<Vec<u8>>) + Send + 'static,
+    {
+        let (module, mut worker) = tokio::net::UnixStream::pair().unwrap();
+        // The mock below speaks the protocol in-process; the host still owns a
+        // child process per connection, so give it a harmless one.
+        let child = Command::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        host.connection = Some(WorkerConnection {
+            stream: module,
+            child,
+            logs: LogRing::new(),
+            worker_generation: 1,
+        });
+        tokio::spawn(async move {
+            let mut seen = Vec::new();
+            while let Ok(request) =
+                read_json::<WorkerRequest, _>(&mut worker, DEFAULT_MAX_FRAME_BYTES).await
+            {
+                let raw = if request.carries_raw_frame() {
+                    Some(
+                        read_raw(&mut worker, DEFAULT_MAX_FRAME_BYTES)
+                            .await
+                            .unwrap(),
+                    )
+                } else {
+                    None
+                };
+                let (response, raw_out) = respond(&request, raw.as_deref());
+                write_json(&mut worker, &response, DEFAULT_MAX_FRAME_BYTES)
+                    .await
+                    .unwrap();
+                if let Some(raw_out) = raw_out {
+                    write_raw(&mut worker, &raw_out, DEFAULT_MAX_FRAME_BYTES)
+                        .await
+                        .unwrap();
+                }
+                seen.push((request, raw));
+            }
+            seen
+        })
+    }
+
+    fn host_for_engine(engine: &str) -> WorkerHost {
+        let mut config = WorkerHostConfig::new("/bin/false", std::env::temp_dir());
+        config.engine_identity = Some(EngineIdentity {
+            engine: engine.to_string(),
+            version: "test".to_string(),
+            build_flags: BTreeMap::new(),
+        });
+        WorkerHost::new(config)
+    }
+
+    fn runtime_config(extra: &[(&str, &str)]) -> RuntimeConfig {
+        let mut config = RuntimeConfig::default();
+        config
+            .values
+            .insert("artifact_path".to_string(), "/tmp/model.bin".to_string());
+        for (key, value) in extra {
+            config.values.insert(key.to_string(), value.to_string());
+        }
+        config
+    }
+
+    fn artifact() -> ValidatedArtifact {
+        ValidatedArtifact {
+            digest: "sha256:package".to_string(),
+            format: "safetensors-package".to_string(),
+        }
+    }
+
+    /// Answers LOAD with LOADED (or with the ERR code named by the
+    /// `test_error` runtime key), and scores each rerank input by the sum of
+    /// its ids so a test can tell which ids were scored in which order.
+    #[cfg(unix)]
+    fn rerank_mock(
+        request: &WorkerRequest,
+        raw: Option<&[u8]>,
+    ) -> (WorkerResponse, Option<Vec<u8>>) {
+        match request {
+            WorkerRequest::Load {
+                req_id,
+                runtime_config,
+                ..
+            } => match runtime_config.get("test_error") {
+                Some(code) => (
+                    WorkerResponse::Err {
+                        req_id: Some(req_id.clone()),
+                        code: code.clone(),
+                        msg: "refused before reading weights".to_string(),
+                    },
+                    None,
+                ),
+                None => (
+                    WorkerResponse::Loaded {
+                        req_id: req_id.clone(),
+                        model_ref: "mock:0".to_string(),
+                        dims: 0,
+                        cold_load_ms: 0,
+                        buckets: None,
+                    },
+                    None,
+                ),
+            },
+            WorkerRequest::RerankSequences {
+                req_id, sequences, ..
+            } => {
+                let ids = synapse_core::decode_i32_frame(raw.unwrap()).unwrap();
+                let mut offset = 0;
+                let scores = sequences
+                    .iter()
+                    .map(|sequence| {
+                        let slice = &ids[offset..offset + sequence.n_tokens];
+                        offset += sequence.n_tokens;
+                        slice.iter().sum::<i32>() as f32
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(offset, ids.len(), "raw frame holds exactly the sequences");
+                (
+                    WorkerResponse::Scores {
+                        req_id: req_id.clone(),
+                    },
+                    Some(synapse_core::encode_f32_frame(&scores)),
+                )
+            }
+            WorkerRequest::Rerank {
+                req_id, candidates, ..
+            } => (
+                WorkerResponse::Scores {
+                    req_id: req_id.clone(),
+                },
+                Some(synapse_core::encode_f32_frame(&vec![0.5; candidates.len()])),
+            ),
+            other => (WorkerResponse::unsupported_request(other), None),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn owned_lanes_send_composed_sequences_and_keep_candidate_order() {
+        let sequences: Vec<Vec<u32>> = vec![
+            vec![1, 500, 2, 900, 901, 2],
+            vec![1, 500, 2, 7, 2],
+            vec![1, 500, 2, 40, 41, 42, 43, 2],
+            vec![1, 500, 2, 3000, 2],
+        ];
+        for engine in synapse_core::OWNED_WORKER_HELLO_ENGINES {
+            let mut host = host_for_engine(engine);
+            let mock = attach_mock_worker(&mut host, rerank_mock);
+            let model = host
+                .load_model(&artifact(), &runtime_config(&[]))
+                .await
+                .unwrap();
+            let scores = host
+                .rerank(
+                    &model,
+                    RerankRequest {
+                        query: Vec::new(),
+                        candidates: sequences.clone(),
+                    },
+                )
+                .await
+                .unwrap();
+            let expected: Vec<f32> = sequences
+                .iter()
+                .map(|sequence| sequence.iter().sum::<u32>() as f32)
+                .collect();
+            assert_eq!(
+                scores.scores, expected,
+                "{engine} scores keep candidate order"
+            );
+            drop(host);
+
+            let seen = mock.await.unwrap();
+            let (request, raw) = &seen[1];
+            let WorkerRequest::RerankSequences {
+                sequences: sent, ..
+            } = request
+            else {
+                panic!("{engine} must receive RERANK_SEQUENCES, got {request:?}");
+            };
+            assert_eq!(sent.len(), sequences.len());
+            let ids = synapse_core::decode_i32_frame(raw.as_deref().unwrap()).unwrap();
+            let mut offset = 0;
+            for (sent, fixture) in sent.iter().zip(&sequences) {
+                let delivered = &ids[offset..offset + sent.n_tokens];
+                offset += sent.n_tokens;
+                let fixture: Vec<i32> = fixture.iter().map(|id| *id as i32).collect();
+                assert_eq!(
+                    delivered,
+                    fixture.as_slice(),
+                    "{engine} sequences arrive unchanged"
+                );
+            }
+            assert_eq!(offset, ids.len());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn llama_lane_keeps_the_segment_rerank_frame() {
+        let mut host = host_for_engine(LLAMA_WORKER_ENGINE);
+        let mock = attach_mock_worker(&mut host, rerank_mock);
+        let model = host
+            .load_model(&artifact(), &runtime_config(&[]))
+            .await
+            .unwrap();
+        host.rerank(
+            &model,
+            RerankRequest {
+                query: vec![10, 11],
+                candidates: vec![vec![20], vec![30, 31, 32]],
+            },
+        )
+        .await
+        .unwrap();
+        drop(host);
+        let seen = mock.await.unwrap();
+        let (request, raw) = &seen[1];
+        assert!(matches!(
+            request,
+            WorkerRequest::Rerank { query_n_tokens: 2, candidates, .. } if candidates.len() == 2
+        ));
+        assert_eq!(
+            synapse_core::decode_i32_frame(raw.as_deref().unwrap()).unwrap(),
+            vec![10, 11, 20, 30, 31, 32]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn owned_rerank_refuses_an_uncomposed_query_segment() {
+        let mut host = host_for_engine("owned-vulkan");
+        let _mock = attach_mock_worker(&mut host, rerank_mock);
+        let model = host
+            .load_model(&artifact(), &runtime_config(&[]))
+            .await
+            .unwrap();
+        let error = host
+            .rerank(
+                &model,
+                RerankRequest {
+                    query: vec![1, 2],
+                    candidates: vec![vec![3]],
+                },
+            )
+            .await
+            .expect_err("owned lanes never assemble pairs themselves");
+        assert!(
+            matches!(error, WorkerHostError::Protocol(message) if message.contains("composed"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn load_forwards_profile_and_operation_and_surfaces_typed_refusals() {
+        let mut host = host_for_engine("ane-direct-worker");
+        let mock = attach_mock_worker(&mut host, rerank_mock);
+        host.load_model(
+            &artifact(),
+            &runtime_config(&[
+                (
+                    synapse_core::LOAD_RUNTIME_PROFILE,
+                    "gte-reranker-modernbert-base.ane-direct-worker",
+                ),
+                (synapse_core::LOAD_RUNTIME_OPERATION, "rerank"),
+            ]),
+        )
+        .await
+        .unwrap();
+        for code in [
+            synapse_core::ERR_MODEL_UNSUPPORTED,
+            synapse_core::ERR_OPERATION_MISMATCH,
+            synapse_core::ERR_PACKAGE_DIGEST_MISMATCH,
+            synapse_core::ERR_HEAD_TENSOR_MISSING,
+        ] {
+            let error = host
+                .load_model(&artifact(), &runtime_config(&[("test_error", code)]))
+                .await
+                .expect_err("the worker refuses this LOAD");
+            assert!(
+                matches!(&error, WorkerHostError::WorkerErr { code: got, .. } if got == code),
+                "{code}: {error}"
+            );
+            assert_eq!(error.code(), Some(code));
+            assert!(error.to_string().contains(code));
+        }
+        drop(host);
+        let seen = mock.await.unwrap();
+        let WorkerRequest::Load {
+            runtime_config,
+            artifact_digest,
+            ..
+        } = &seen[0].0
+        else {
+            panic!("first request is LOAD");
+        };
+        assert_eq!(
+            runtime_config.get("profile").map(String::as_str),
+            Some("gte-reranker-modernbert-base.ane-direct-worker")
+        );
+        assert_eq!(
+            runtime_config.get("operation").map(String::as_str),
+            Some("rerank")
+        );
+        assert_eq!(artifact_digest, "sha256:package");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hello_binding_refusal_is_distinct_from_load_refusals() {
+        use synapse_core::worker_framing::write_json_frame;
+        use tokio::net::UnixStream;
+
+        let tmp = PathBuf::from(format!("/tmp/synh-bind-{}", nonce_hex16()));
+        let path = synapse_core::worker_socket_path(&tmp, "binding-test");
+        let listener = synapse_core::bind_listener(&path).unwrap();
+        let client_path = path.clone();
+        let client = tokio::spawn(async move {
+            let mut stream = UnixStream::connect(&client_path).await.unwrap();
+            let hello = serde_json::json!({
+                "v": synapse_core::WORKER_PROTOCOL_VERSION,
+                "nonce": "0123456789abcdef",
+                "engine": { "engine": "owned-cuda", "version": "0", "build_flags": {} },
+                "pid": 1,
+                "max_frame": DEFAULT_MAX_FRAME_BYTES,
+                "manifest_digest": "b".repeat(64),
+                "kernel_revision": "cuda-kernel-v1",
+            });
+            write_json_frame(&mut stream, &hello, DEFAULT_MAX_FRAME_BYTES)
+                .await
+                .unwrap();
+        });
+        let expected = ExpectedHelloBinding {
+            manifest_digest: "a".repeat(64),
+            kernel_revision: "cuda-kernel-v1".to_string(),
+        };
+        let error: WorkerHostError =
+            synapse_core::accept_worker_handshake_with_engine_and_protocol_version(
+                listener,
+                "0123456789abcdef",
+                DEFAULT_MAX_FRAME_BYTES,
+                Duration::from_secs(1),
+                Some("owned-cuda"),
+                None,
+                Some(&expected),
+            )
+            .await
+            .expect_err("a worker built from another manifest is refused")
+            .into();
+        assert!(matches!(
+            &error,
+            WorkerHostError::HelloRefused { code, .. } if code == synapse_core::ERR_MANIFEST_MISMATCH
+        ));
+        assert_eq!(error.code(), Some(synapse_core::ERR_MANIFEST_MISMATCH));
+        assert!(error
+            .to_engine_error(EngineErrorStage::Load)
+            .retry_after_ms
+            .is_none());
+        client.await.unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Direct-ANE shape residency: the module-side budget for compiled shapes
+/// across every direct-ANE worker, and the lock that keeps the lane to one
+/// module process.
+///
+/// A direct-ANE worker compiles one executable set per (model, ladder shape)
+/// and keeps it resident on the Neural Engine. Too many resident shapes
+/// exhaust the ANE, so the supervisor owns a budget of
+/// [`ANE_RESIDENT_SHAPES_PER_MODEL`] shapes per model ref and
+/// [`ANE_RESIDENT_SHAPES_TOTAL`] overall, enforced with `ANE_ADMIT_SHAPE` and
+/// `ANE_EVICT_SHAPE`. A shape counts against the budget from its admit request
+/// until its `EVICTED` ack. While a request runs on a shape it holds a lease,
+/// and a leased shape is never evicted.
+///
+/// A request runs its rungs one at a time in ascending order and releases each
+/// rung's lease before asking for the next one ([`AneResidencySupervisor::run_by_rung`]),
+/// so no request holds a lease while it waits. Waiting requests are served
+/// strictly first in, first out; when the budget is full, the request at the
+/// head of the queue evicts the least recently used shape that has no lease.
+///
+/// Worker connections must not be held while waiting for admission: the
+/// request at the head may need to evict a shape on another worker. That is why
+/// workers are driven through [`AneShapeWorker`], whose connection is held only
+/// for a single exchange ([`AneWorkerChannel`]).
+pub mod ane_residency {
+    use std::collections::{BTreeMap, VecDeque};
+    use std::future::Future;
+    use std::io;
+    #[cfg(unix)]
+    use std::path::Path;
+    use std::path::PathBuf;
+    use std::pin::Pin;
+    use std::process::Stdio;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex, MutexGuard};
+
+    use synapse_core::{
+        read_json, read_raw, write_json, write_raw, AnePlacementInventory, TransportError,
+        WorkerRequest, WorkerResponse, ERR_ANE_LANE_BUSY,
+    };
+    use thiserror::Error;
+    use tokio::io::{AsyncRead, AsyncWrite};
+    use tokio::sync::Notify;
+
+    /// Padded sequence shapes a direct-ANE worker compiles; a sequence runs on
+    /// the smallest rung at least its length.
+    pub const ANE_SHAPE_LADDER: [usize; 7] = [128, 256, 512, 1024, 2048, 4096, 8192];
+    pub const ANE_RESIDENT_SHAPES_PER_MODEL: usize = 4;
+    pub const ANE_RESIDENT_SHAPES_TOTAL: usize = 8;
+    /// Lock file, relative to the home directory, held by the one module
+    /// process allowed to run direct-ANE workers.
+    pub const ANE_DIRECT_LOCK_HOME_PATH: &str = "Library/Caches/ck-synapse/ane-direct.lock";
+
+    pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+    /// The smallest ladder rung that holds `n_tokens`, or `None` above 8192.
+    pub fn ladder_rung(n_tokens: usize) -> Option<usize> {
+        ANE_SHAPE_LADDER
+            .iter()
+            .copied()
+            .find(|rung| *rung >= n_tokens)
+    }
+
+    #[derive(Debug, Error)]
+    pub enum AneResidencyError {
+        #[error("sequence of {n_tokens} tokens exceeds the largest direct-ANE shape {max}")]
+        SequenceTooLong { n_tokens: usize, max: usize },
+        /// The worker answered `ERR`.
+        #[error("worker returned {code}: {msg}")]
+        WorkerErr { code: String, msg: String },
+        #[error("direct-ANE worker channel: {0}")]
+        Channel(String),
+        #[error("ane_lane_busy: another live process holds {}", path.display())]
+        LaneBusy { path: PathBuf },
+        #[error("direct-ANE lane lock: {0}")]
+        Io(#[from] io::Error),
+    }
+
+    impl AneResidencyError {
+        pub fn code(&self) -> Option<&str> {
+            match self {
+                Self::WorkerErr { code, .. } => Some(code),
+                Self::LaneBusy { .. } => Some(ERR_ANE_LANE_BUSY),
+                _ => None,
+            }
+        }
+    }
+
+    impl From<TransportError> for AneResidencyError {
+        fn from(error: TransportError) -> Self {
+            Self::Channel(error.to_string())
+        }
+    }
+
+    /// One direct-ANE worker the supervisor admits and evicts shapes on.
+    pub trait AneShapeWorker: Send + Sync {
+        /// Stable id of this worker; shapes are dropped per worker on restart.
+        fn worker_id(&self) -> &str;
+        /// Sends `ANE_ADMIT_SHAPE` and waits for `ADMITTED`.
+        fn admit_shape<'a>(
+            &'a self,
+            model_ref: &'a str,
+            shape: usize,
+        ) -> BoxFuture<'a, Result<AnePlacementInventory, AneResidencyError>>;
+        /// Sends `ANE_EVICT_SHAPE` and waits for `EVICTED`.
+        fn evict_shape<'a>(
+            &'a self,
+            model_ref: &'a str,
+            shape: usize,
+        ) -> BoxFuture<'a, Result<(), AneResidencyError>>;
+        /// Replaces the worker process with a fresh one that has no shapes.
+        fn restart(&self) -> BoxFuture<'_, Result<(), AneResidencyError>>;
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct AneResidencyLimits {
+        pub per_model: usize,
+        pub total: usize,
+    }
+
+    impl Default for AneResidencyLimits {
+        fn default() -> Self {
+            Self {
+                per_model: ANE_RESIDENT_SHAPES_PER_MODEL,
+                total: ANE_RESIDENT_SHAPES_TOTAL,
+            }
+        }
+    }
+
+    /// Counters sampled after every `ADMITTED` and every `EVICTED`.
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    pub struct AneResidencyStats {
+        pub admitted: u64,
+        pub evicted: u64,
+        pub samples: u64,
+        pub max_resident_per_model: usize,
+        pub max_resident_total: usize,
+        pub restarts: u64,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+    struct ShapeKey {
+        model_ref: String,
+        shape: usize,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum SlotState {
+        Admitting,
+        Resident,
+        Evicting,
+    }
+
+    struct Slot {
+        /// Distinguishes this residency from an earlier one of the same shape,
+        /// so a lease or ack from before a restart never touches the new slot.
+        id: u64,
+        worker: Arc<dyn AneShapeWorker>,
+        state: SlotState,
+        leases: u32,
+        last_used: u64,
+        inventory: Option<Arc<AnePlacementInventory>>,
+    }
+
+    #[derive(Default)]
+    struct State {
+        slots: BTreeMap<ShapeKey, Slot>,
+        waiters: VecDeque<u64>,
+        next_ticket: u64,
+        next_slot: u64,
+        clock: u64,
+        stats: AneResidencyStats,
+    }
+
+    impl State {
+        fn tick(&mut self) -> u64 {
+            self.clock += 1;
+            self.clock
+        }
+
+        fn model_count(&self, model_ref: &str) -> usize {
+            self.slots
+                .keys()
+                .filter(|key| key.model_ref == model_ref)
+                .count()
+        }
+
+        fn sample(&mut self) {
+            self.stats.samples += 1;
+            let mut per_model: BTreeMap<&str, usize> = BTreeMap::new();
+            for key in self.slots.keys() {
+                *per_model.entry(key.model_ref.as_str()).or_default() += 1;
+            }
+            let largest = per_model.values().copied().max().unwrap_or(0);
+            self.stats.max_resident_per_model = self.stats.max_resident_per_model.max(largest);
+            self.stats.max_resident_total = self.stats.max_resident_total.max(self.slots.len());
+        }
+    }
+
+    struct Inner {
+        limits: AneResidencyLimits,
+        state: Mutex<State>,
+        changed: Notify,
+        #[cfg(unix)]
+        lane_lock: Option<AneDirectLaneLock>,
+    }
+
+    impl Inner {
+        fn lock(&self) -> MutexGuard<'_, State> {
+            self.state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+    }
+
+    /// A request's place in the admission queue; leaving the queue (served or
+    /// cancelled) lets the next request re-check its turn.
+    struct QueueTicket<'a> {
+        inner: &'a Inner,
+        id: u64,
+    }
+
+    impl<'a> QueueTicket<'a> {
+        fn enqueue(inner: &'a Inner) -> Self {
+            let mut state = inner.lock();
+            state.next_ticket += 1;
+            let id = state.next_ticket;
+            state.waiters.push_back(id);
+            Self { inner, id }
+        }
+    }
+
+    impl Drop for QueueTicket<'_> {
+        fn drop(&mut self) {
+            let mut state = self.inner.lock();
+            let queued = state.waiters.len();
+            state.waiters.retain(|ticket| *ticket != self.id);
+            let removed = state.waiters.len() != queued;
+            drop(state);
+            if removed {
+                self.inner.changed.notify_waiters();
+            }
+        }
+    }
+
+    enum Step {
+        Leased(AneShapeLease),
+        Admit(u64),
+        Evict {
+            key: ShapeKey,
+            slot_id: u64,
+            owner: Arc<dyn AneShapeWorker>,
+        },
+        Wait,
+    }
+
+    /// Owns the direct-ANE residency budget. Cheap to clone; clones share it.
+    #[derive(Clone)]
+    pub struct AneResidencySupervisor {
+        inner: Arc<Inner>,
+    }
+
+    impl AneResidencySupervisor {
+        /// A supervisor that holds no lane lock (the caller holds it, or tests).
+        pub fn new(limits: AneResidencyLimits) -> Self {
+            Self {
+                inner: Arc::new(Inner {
+                    limits,
+                    state: Mutex::new(State::default()),
+                    changed: Notify::new(),
+                    #[cfg(unix)]
+                    lane_lock: None,
+                }),
+            }
+        }
+
+        /// A supervisor holding the lane lock for as long as it lives.
+        #[cfg(unix)]
+        pub fn with_lane_lock(limits: AneResidencyLimits, lock: AneDirectLaneLock) -> Self {
+            Self {
+                inner: Arc::new(Inner {
+                    limits,
+                    state: Mutex::new(State::default()),
+                    changed: Notify::new(),
+                    lane_lock: Some(lock),
+                }),
+            }
+        }
+
+        /// Takes the lane lock at `~/Library/Caches/ck-synapse/ane-direct.lock`;
+        /// fails with `ane_lane_busy` while another process or its workers hold it.
+        #[cfg(unix)]
+        pub fn acquire_lane(limits: AneResidencyLimits) -> Result<Self, AneResidencyError> {
+            let path = AneDirectLaneLock::default_path().ok_or_else(|| {
+                AneResidencyError::Io(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "HOME is not set, so the direct-ANE lane lock has no location",
+                ))
+            })?;
+            Ok(Self::with_lane_lock(
+                limits,
+                AneDirectLaneLock::acquire(&path)?,
+            ))
+        }
+
+        /// The held lane lock; spawned direct-ANE workers must inherit it
+        /// (see [`inheritable_lock_stdio`]).
+        #[cfg(unix)]
+        pub fn lane_lock(&self) -> Option<&AneDirectLaneLock> {
+            self.inner.lane_lock.as_ref()
+        }
+
+        pub fn limits(&self) -> AneResidencyLimits {
+            self.inner.limits
+        }
+
+        pub fn stats(&self) -> AneResidencyStats {
+            self.inner.lock().stats.clone()
+        }
+
+        /// Shapes counted against the budget, per model ref.
+        pub fn resident_shapes(&self) -> BTreeMap<String, Vec<usize>> {
+            let state = self.inner.lock();
+            let mut shapes: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+            for key in state.slots.keys() {
+                shapes
+                    .entry(key.model_ref.clone())
+                    .or_default()
+                    .push(key.shape);
+            }
+            shapes
+        }
+
+        /// Waits for `shape` of `model_ref` to be resident on `worker` and
+        /// leases it. The lease must be dropped before the caller waits for
+        /// anything else in the supervisor.
+        pub async fn lease(
+            &self,
+            worker: &Arc<dyn AneShapeWorker>,
+            model_ref: &str,
+            shape: usize,
+        ) -> Result<AneShapeLease, AneResidencyError> {
+            let key = ShapeKey {
+                model_ref: model_ref.to_string(),
+                shape,
+            };
+            let ticket = QueueTicket::enqueue(&self.inner);
+            loop {
+                // Register for wakeups before reading the state, so a change
+                // between the check and the wait is not missed.
+                let notified = self.inner.changed.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                match self.next_step(ticket.id, &key, worker) {
+                    Step::Leased(lease) => return Ok(lease),
+                    Step::Admit(slot_id) => return self.admit(worker.clone(), key, slot_id).await,
+                    Step::Evict {
+                        key,
+                        slot_id,
+                        owner,
+                    } => self.evict(owner, key, slot_id).await,
+                    Step::Wait => notified.await,
+                }
+            }
+        }
+
+        /// Runs a request whose sequences have `lengths` tokens, one ladder
+        /// rung at a time in ascending order. `run` receives the rung and the
+        /// indices of the sequences padded to it, and must return one output
+        /// per index; it runs while that rung's lease is held, and the lease is
+        /// released before the next rung is requested. Outputs come back in
+        /// the order of `lengths`.
+        pub async fn run_by_rung<T, F, Fut>(
+            &self,
+            worker: &Arc<dyn AneShapeWorker>,
+            model_ref: &str,
+            lengths: &[usize],
+            mut run: F,
+        ) -> Result<Vec<T>, AneResidencyError>
+        where
+            F: FnMut(usize, Vec<usize>) -> Fut,
+            Fut: Future<Output = Result<Vec<T>, AneResidencyError>>,
+        {
+            let mut rungs: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+            for (index, &n_tokens) in lengths.iter().enumerate() {
+                let rung = ladder_rung(n_tokens).ok_or(AneResidencyError::SequenceTooLong {
+                    n_tokens,
+                    max: ANE_SHAPE_LADDER[ANE_SHAPE_LADDER.len() - 1],
+                })?;
+                rungs.entry(rung).or_default().push(index);
+            }
+            let mut outputs: Vec<Option<T>> = (0..lengths.len()).map(|_| None).collect();
+            for (rung, indices) in rungs {
+                let lease = self.lease(worker, model_ref, rung).await?;
+                let results = run(rung, indices.clone()).await;
+                drop(lease);
+                let results = results?;
+                if results.len() != indices.len() {
+                    return Err(AneResidencyError::Channel(format!(
+                        "rung {rung} returned {} outputs for {} sequences",
+                        results.len(),
+                        indices.len()
+                    )));
+                }
+                for (index, value) in indices.into_iter().zip(results) {
+                    outputs[index] = Some(value);
+                }
+            }
+            Ok(outputs
+                .into_iter()
+                .map(|value| value.expect("every sequence belongs to exactly one rung"))
+                .collect())
+        }
+
+        fn next_step(&self, ticket: u64, key: &ShapeKey, worker: &Arc<dyn AneShapeWorker>) -> Step {
+            let mut state = self.inner.lock();
+            if state.waiters.front() != Some(&ticket) {
+                return Step::Wait;
+            }
+            let now = state.tick();
+            if let Some(slot) = state.slots.get_mut(key) {
+                if slot.state != SlotState::Resident {
+                    // Wait for the admission or eviction in flight to settle.
+                    return Step::Wait;
+                }
+                slot.leases += 1;
+                slot.last_used = now;
+                let lease = AneShapeLease {
+                    inner: self.inner.clone(),
+                    key: key.clone(),
+                    slot_id: slot.id,
+                    inventory: slot.inventory.clone(),
+                };
+                state.waiters.pop_front();
+                self.inner.changed.notify_waiters();
+                return Step::Leased(lease);
+            }
+            let model_full = state.model_count(&key.model_ref) >= self.inner.limits.per_model;
+            let total_full = state.slots.len() >= self.inner.limits.total;
+            if !model_full && !total_full {
+                state.next_slot += 1;
+                let id = state.next_slot;
+                state.slots.insert(
+                    key.clone(),
+                    Slot {
+                        id,
+                        worker: worker.clone(),
+                        state: SlotState::Admitting,
+                        leases: 0,
+                        last_used: now,
+                        inventory: None,
+                    },
+                );
+                state.waiters.pop_front();
+                self.inner.changed.notify_waiters();
+                return Step::Admit(id);
+            }
+            // When the model is at its own limit only one of its shapes frees
+            // the slot it needs; otherwise any model's shape does.
+            let victim = state
+                .slots
+                .iter()
+                .filter(|(candidate, slot)| {
+                    slot.state == SlotState::Resident
+                        && slot.leases == 0
+                        && (!model_full || candidate.model_ref == key.model_ref)
+                })
+                .min_by_key(|(_, slot)| slot.last_used)
+                .map(|(candidate, slot)| (candidate.clone(), slot.id, slot.worker.clone()));
+            let Some((victim, slot_id, owner)) = victim else {
+                return Step::Wait;
+            };
+            if let Some(slot) = state.slots.get_mut(&victim) {
+                slot.state = SlotState::Evicting;
+            }
+            Step::Evict {
+                key: victim,
+                slot_id,
+                owner,
+            }
+        }
+
+        async fn admit(
+            &self,
+            worker: Arc<dyn AneShapeWorker>,
+            key: ShapeKey,
+            slot_id: u64,
+        ) -> Result<AneShapeLease, AneResidencyError> {
+            let inner = self.inner.clone();
+            // The exchange runs on its own task so its outcome is recorded even
+            // if the waiting request is dropped part way through.
+            let task = tokio::spawn(async move {
+                match worker.admit_shape(&key.model_ref, key.shape).await {
+                    Ok(inventory) => finish_admit(&inner, &key, slot_id, inventory),
+                    Err(error) => {
+                        recover_worker(&inner, &worker).await;
+                        Err(error)
+                    }
+                }
+            });
+            task.await.map_err(|error| {
+                AneResidencyError::Channel(format!("shape admission task failed: {error}"))
+            })?
+        }
+
+        async fn evict(&self, owner: Arc<dyn AneShapeWorker>, key: ShapeKey, slot_id: u64) {
+            let inner = self.inner.clone();
+            let task = tokio::spawn(async move {
+                match owner.evict_shape(&key.model_ref, key.shape).await {
+                    Ok(()) => {
+                        let mut state = inner.lock();
+                        if state.slots.get(&key).is_some_and(|slot| slot.id == slot_id) {
+                            state.slots.remove(&key);
+                            state.stats.evicted += 1;
+                            state.sample();
+                        }
+                        drop(state);
+                        inner.changed.notify_waiters();
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "worker",
+                            worker_id = owner.worker_id(),
+                            model_ref = %key.model_ref,
+                            shape = key.shape,
+                            error = %error,
+                            "direct-ANE evict failed; restarting the worker"
+                        );
+                        recover_worker(&inner, &owner).await;
+                    }
+                }
+            });
+            if let Err(error) = task.await {
+                tracing::warn!(target: "worker", error = %error, "direct-ANE eviction task failed");
+            }
+        }
+    }
+
+    fn finish_admit(
+        inner: &Arc<Inner>,
+        key: &ShapeKey,
+        slot_id: u64,
+        inventory: AnePlacementInventory,
+    ) -> Result<AneShapeLease, AneResidencyError> {
+        let mut state = inner.lock();
+        let now = state.tick();
+        let Some(slot) = state.slots.get_mut(key).filter(|slot| slot.id == slot_id) else {
+            return Err(AneResidencyError::Channel(format!(
+                "worker restarted while admitting {} shape {}",
+                key.model_ref, key.shape
+            )));
+        };
+        let inventory = Arc::new(inventory);
+        slot.state = SlotState::Resident;
+        slot.leases = 1;
+        slot.last_used = now;
+        slot.inventory = Some(inventory.clone());
+        state.stats.admitted += 1;
+        state.sample();
+        drop(state);
+        inner.changed.notify_waiters();
+        Ok(AneShapeLease {
+            inner: inner.clone(),
+            key: key.clone(),
+            slot_id,
+            inventory: Some(inventory),
+        })
+    }
+
+    /// Restarts a worker that answered an admit or evict with `ERR` (or lost
+    /// its connection), then forgets every shape counted for it, since the new
+    /// process has none, and wakes the waiting requests.
+    async fn recover_worker(inner: &Inner, worker: &Arc<dyn AneShapeWorker>) {
+        if let Err(error) = worker.restart().await {
+            tracing::warn!(
+                target: "worker",
+                worker_id = worker.worker_id(),
+                error = %error,
+                "direct-ANE worker restart failed"
+            );
+        }
+        let mut state = inner.lock();
+        let worker_id = worker.worker_id();
+        state
+            .slots
+            .retain(|_, slot| slot.worker.worker_id() != worker_id);
+        state.stats.restarts += 1;
+        drop(state);
+        inner.changed.notify_waiters();
+    }
+
+    /// A held lease on one resident shape; dropping it releases the lease.
+    pub struct AneShapeLease {
+        inner: Arc<Inner>,
+        key: ShapeKey,
+        slot_id: u64,
+        inventory: Option<Arc<AnePlacementInventory>>,
+    }
+
+    impl AneShapeLease {
+        pub fn model_ref(&self) -> &str {
+            &self.key.model_ref
+        }
+
+        pub fn shape(&self) -> usize {
+            self.key.shape
+        }
+
+        /// The placement inventory the worker reported when it admitted the shape.
+        pub fn inventory(&self) -> Option<&AnePlacementInventory> {
+            self.inventory.as_deref()
+        }
+    }
+
+    impl Drop for AneShapeLease {
+        fn drop(&mut self) {
+            let mut state = self.inner.lock();
+            let now = state.tick();
+            if let Some(slot) = state
+                .slots
+                .get_mut(&self.key)
+                .filter(|slot| slot.id == self.slot_id)
+            {
+                slot.leases = slot.leases.saturating_sub(1);
+                slot.last_used = now;
+            }
+            drop(state);
+            self.inner.changed.notify_waiters();
+        }
+    }
+
+    /// Opens a fresh connection to a direct-ANE worker process (spawning it
+    /// and completing its HELLO).
+    pub type AneWorkerConnector<S> =
+        Box<dyn Fn() -> BoxFuture<'static, Result<S, AneResidencyError>> + Send + Sync>;
+
+    /// A direct-ANE worker connection used for one exchange at a time, so a
+    /// shape admission or eviction never waits behind a whole request.
+    pub struct AneWorkerChannel<S> {
+        worker_id: String,
+        max_frame: u32,
+        stream: tokio::sync::Mutex<Option<S>>,
+        connect: AneWorkerConnector<S>,
+        request_counter: AtomicU64,
+    }
+
+    impl<S> AneWorkerChannel<S>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        pub async fn connect(
+            worker_id: impl Into<String>,
+            max_frame: u32,
+            connect: AneWorkerConnector<S>,
+        ) -> Result<Self, AneResidencyError> {
+            let stream = connect().await?;
+            Ok(Self {
+                worker_id: worker_id.into(),
+                max_frame,
+                stream: tokio::sync::Mutex::new(Some(stream)),
+                connect,
+                request_counter: AtomicU64::new(0),
+            })
+        }
+
+        pub fn next_req_id(&self, prefix: &str) -> String {
+            format!(
+                "{prefix}-{}",
+                self.request_counter.fetch_add(1, Ordering::Relaxed)
+            )
+        }
+
+        /// Sends one request (and its raw frame) and reads the response (and
+        /// its raw frame). A transport failure closes the connection; the
+        /// worker is unusable until [`AneShapeWorker::restart`].
+        pub async fn exchange(
+            &self,
+            request: &WorkerRequest,
+            raw: Option<&[u8]>,
+        ) -> Result<(WorkerResponse, Option<Vec<u8>>), AneResidencyError> {
+            let mut guard = self.stream.lock().await;
+            let stream = guard.as_mut().ok_or_else(|| {
+                AneResidencyError::Channel(format!("worker {} is not connected", self.worker_id))
+            })?;
+            let max_frame = self.max_frame;
+            let result = async {
+                write_json(stream, request, max_frame).await?;
+                if let Some(raw) = raw {
+                    write_raw(stream, raw, max_frame).await?;
+                }
+                let response: WorkerResponse = read_json(stream, max_frame).await?;
+                let raw = if response.carries_raw_frame() {
+                    Some(read_raw(stream, max_frame).await?)
+                } else {
+                    None
+                };
+                Ok::<_, TransportError>((response, raw))
+            }
+            .await;
+            result.map_err(|error| {
+                *guard = None;
+                error.into()
+            })
+        }
+    }
+
+    impl<S> AneShapeWorker for AneWorkerChannel<S>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        fn worker_id(&self) -> &str {
+            &self.worker_id
+        }
+
+        fn admit_shape<'a>(
+            &'a self,
+            model_ref: &'a str,
+            shape: usize,
+        ) -> BoxFuture<'a, Result<AnePlacementInventory, AneResidencyError>> {
+            Box::pin(async move {
+                let req_id = self.next_req_id("admit");
+                let request = WorkerRequest::AneAdmitShape {
+                    req_id: req_id.clone(),
+                    model_ref: model_ref.to_string(),
+                    shape,
+                };
+                match self.exchange(&request, None).await? {
+                    (
+                        WorkerResponse::Admitted {
+                            req_id: got,
+                            inventory,
+                        },
+                        _,
+                    ) if got == req_id => Ok(inventory),
+                    (WorkerResponse::Err { code, msg, .. }, _) => {
+                        Err(AneResidencyError::WorkerErr { code, msg })
+                    }
+                    (other, _) => Err(AneResidencyError::Channel(format!(
+                        "ANE_ADMIT_SHAPE returned unexpected response {other:?}"
+                    ))),
+                }
+            })
+        }
+
+        fn evict_shape<'a>(
+            &'a self,
+            model_ref: &'a str,
+            shape: usize,
+        ) -> BoxFuture<'a, Result<(), AneResidencyError>> {
+            Box::pin(async move {
+                let req_id = self.next_req_id("evict");
+                let request = WorkerRequest::AneEvictShape {
+                    req_id: req_id.clone(),
+                    model_ref: model_ref.to_string(),
+                    shape,
+                };
+                match self.exchange(&request, None).await? {
+                    (WorkerResponse::Evicted { req_id: got }, _) if got == req_id => Ok(()),
+                    (WorkerResponse::Err { code, msg, .. }, _) => {
+                        Err(AneResidencyError::WorkerErr { code, msg })
+                    }
+                    (other, _) => Err(AneResidencyError::Channel(format!(
+                        "ANE_EVICT_SHAPE returned unexpected response {other:?}"
+                    ))),
+                }
+            })
+        }
+
+        fn restart(&self) -> BoxFuture<'_, Result<(), AneResidencyError>> {
+            Box::pin(async move {
+                let mut guard = self.stream.lock().await;
+                // Closing the connection ends the old worker process, which
+                // exits when its supervisor connection closes.
+                *guard = None;
+                *guard = Some((self.connect)().await?);
+                Ok(())
+            })
+        }
+    }
+
+    /// A `Stdio` for a direct-ANE worker's stdin that duplicates the locked
+    /// descriptor. The duplicate shares the lock, so the lock is released only
+    /// when this process and every worker it spawned have closed it.
+    pub fn inheritable_lock_stdio(lock: &std::fs::File) -> io::Result<Stdio> {
+        Ok(Stdio::from(lock.try_clone()?))
+    }
+
+    /// The advisory lock (`flock`) that allows one module process at a time to
+    /// run direct-ANE workers.
+    #[cfg(unix)]
+    #[derive(Debug)]
+    pub struct AneDirectLaneLock {
+        file: Arc<std::fs::File>,
+        path: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl AneDirectLaneLock {
+        /// `~/Library/Caches/ck-synapse/ane-direct.lock`.
+        pub fn default_path() -> Option<PathBuf> {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(ANE_DIRECT_LOCK_HOME_PATH))
+        }
+
+        /// Takes the lock without waiting. While any other open description of
+        /// the file holds it (another module process, or a direct-ANE worker
+        /// that inherited it and has not exited yet), fails with
+        /// `ane_lane_busy`.
+        // `File::try_lock` is a `flock(LOCK_EX | LOCK_NB)` on unix. It is newer
+        // than the workspace's declared minimum Rust version, but every build
+        // of this crate uses the pinned stable toolchain that has it, and the
+        // crate forbids the unsafe code a direct `flock` call would need.
+        #[allow(clippy::incompatible_msrv)]
+        pub fn acquire(path: &Path) -> Result<Self, AneResidencyError> {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(path)?;
+            match file.try_lock() {
+                Ok(()) => Ok(Self {
+                    file: Arc::new(file),
+                    path: path.to_path_buf(),
+                }),
+                Err(std::fs::TryLockError::WouldBlock) => Err(AneResidencyError::LaneBusy {
+                    path: path.to_path_buf(),
+                }),
+                Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
+            }
+        }
+
+        pub fn path(&self) -> &Path {
+            &self.path
+        }
+
+        /// The locked file, for [`super::WorkerHostConfig::inherited_lane_lock`].
+        pub fn inheritable(&self) -> Arc<std::fs::File> {
+            self.file.clone()
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::collections::{HashMap, HashSet};
+        use std::time::Duration;
+        use synapse_core::{
+            decode_f32_frame, encode_f32_frame, encode_i32_frame, AneExecutable, WorkerPooling,
+            WorkerTokenItem, DEFAULT_MAX_FRAME_BYTES, ERR_SHAPE_NOT_ADMITTED,
+        };
+        use tokio::io::DuplexStream;
+
+        const LAYERS: u32 = 4;
+        type Channel = Arc<AneWorkerChannel<DuplexStream>>;
+
+        /// What the mock workers observe, kept independently of the
+        /// supervisor's own accounting so the budget checks can fail.
+        #[derive(Default)]
+        struct Ledger {
+            /// Requests currently running on (model_ref, shape); a request
+            /// counts itself here only while it holds that shape's lease.
+            in_flight: HashMap<(String, usize), u32>,
+            /// Shapes compiled in some live mock worker.
+            resident: HashSet<(String, usize)>,
+            max_per_model: usize,
+            max_total: usize,
+            /// `admit <model> <shape>` / `evict <model> <shape>`, in arrival order.
+            events: Vec<String>,
+            leased_evicts: u64,
+            shape_not_admitted: u64,
+            /// Admissions the mock answers with `ERR`, once each.
+            fail_admit: HashSet<(String, usize)>,
+            admit_delay: Duration,
+            connects: HashMap<String, u32>,
+        }
+
+        type SharedLedger = Arc<Mutex<Ledger>>;
+
+        fn record_residency(ledger: &mut Ledger) {
+            let mut per_model: HashMap<&str, usize> = HashMap::new();
+            for (model, _) in &ledger.resident {
+                *per_model.entry(model.as_str()).or_default() += 1;
+            }
+            let largest = per_model.values().copied().max().unwrap_or(0);
+            ledger.max_per_model = ledger.max_per_model.max(largest);
+            ledger.max_total = ledger.max_total.max(ledger.resident.len());
+        }
+
+        /// One mock direct-ANE worker process: compiles shapes on admit,
+        /// refuses inference on a shape it has not admitted, and loses every
+        /// shape when its connection closes.
+        async fn serve_mock(mut stream: DuplexStream, ledger: SharedLedger) {
+            let max = DEFAULT_MAX_FRAME_BYTES;
+            let mut own: HashSet<(String, usize)> = HashSet::new();
+            while let Ok(request) = read_json::<WorkerRequest, _>(&mut stream, max).await {
+                let raw = if request.carries_raw_frame() {
+                    match read_raw(&mut stream, max).await {
+                        Ok(raw) => Some(raw),
+                        Err(_) => break,
+                    }
+                } else {
+                    None
+                };
+                let (response, raw_out) = match &request {
+                    WorkerRequest::AneAdmitShape {
+                        req_id,
+                        model_ref,
+                        shape,
+                    } => {
+                        let delay = ledger.lock().unwrap().admit_delay;
+                        tokio::time::sleep(delay).await;
+                        let key = (model_ref.clone(), *shape);
+                        let mut ledger = ledger.lock().unwrap();
+                        if ledger.fail_admit.remove(&key) {
+                            (
+                                WorkerResponse::Err {
+                                    req_id: Some(req_id.clone()),
+                                    code: "compile_failed".to_string(),
+                                    msg: "injected admission failure".to_string(),
+                                },
+                                None,
+                            )
+                        } else {
+                            own.insert(key.clone());
+                            ledger.resident.insert(key);
+                            ledger.events.push(format!("admit {model_ref} {shape}"));
+                            record_residency(&mut ledger);
+                            let inventory = AnePlacementInventory {
+                                executables: vec![AneExecutable {
+                                    id: format!("{model_ref}-{shape}"),
+                                    layers: (0..LAYERS).collect(),
+                                }],
+                                cpu_stages: vec!["token_embedding".to_string()],
+                            };
+                            (
+                                WorkerResponse::Admitted {
+                                    req_id: req_id.clone(),
+                                    inventory,
+                                },
+                                None,
+                            )
+                        }
+                    }
+                    WorkerRequest::AneEvictShape {
+                        req_id,
+                        model_ref,
+                        shape,
+                    } => {
+                        let key = (model_ref.clone(), *shape);
+                        let mut ledger = ledger.lock().unwrap();
+                        if ledger.in_flight.get(&key).copied().unwrap_or(0) > 0 {
+                            ledger.leased_evicts += 1;
+                        }
+                        own.remove(&key);
+                        ledger.resident.remove(&key);
+                        ledger.events.push(format!("evict {model_ref} {shape}"));
+                        record_residency(&mut ledger);
+                        (
+                            WorkerResponse::Evicted {
+                                req_id: req_id.clone(),
+                            },
+                            None,
+                        )
+                    }
+                    WorkerRequest::EmbedBatch {
+                        req_id,
+                        model_ref,
+                        items,
+                        ..
+                    } => {
+                        let rungs: Vec<usize> = items
+                            .iter()
+                            .map(|item| ladder_rung(item.n_tokens).unwrap())
+                            .collect();
+                        let total: usize = items.iter().map(|item| item.n_tokens).sum();
+                        assert_eq!(
+                            raw.as_ref().map(Vec::len),
+                            Some(total * 4),
+                            "the id frame holds every item's tokens"
+                        );
+                        if rungs
+                            .iter()
+                            .all(|rung| own.contains(&(model_ref.clone(), *rung)))
+                        {
+                            let values: Vec<f32> = rungs.iter().map(|rung| *rung as f32).collect();
+                            (
+                                WorkerResponse::Vectors {
+                                    req_id: req_id.clone(),
+                                    dims: 1,
+                                    n: items.len(),
+                                },
+                                Some(encode_f32_frame(&values)),
+                            )
+                        } else {
+                            ledger.lock().unwrap().shape_not_admitted += 1;
+                            (
+                                WorkerResponse::Err {
+                                    req_id: Some(req_id.clone()),
+                                    code: ERR_SHAPE_NOT_ADMITTED.to_string(),
+                                    msg: format!("{model_ref} rungs {rungs:?} are not resident"),
+                                },
+                                None,
+                            )
+                        }
+                    }
+                    other => (WorkerResponse::unsupported_request(other), None),
+                };
+                if write_json(&mut stream, &response, max).await.is_err() {
+                    break;
+                }
+                if let Some(raw_out) = raw_out {
+                    if write_raw(&mut stream, &raw_out, max).await.is_err() {
+                        break;
+                    }
+                }
+            }
+            let mut ledger = ledger.lock().unwrap();
+            for key in own {
+                ledger.resident.remove(&key);
+            }
+        }
+
+        async fn mock_channel(worker_id: &str, ledger: &SharedLedger) -> Channel {
+            let connect_id = worker_id.to_string();
+            let connect_ledger = ledger.clone();
+            let connect: AneWorkerConnector<DuplexStream> = Box::new(move || {
+                let worker_id = connect_id.clone();
+                let ledger = connect_ledger.clone();
+                Box::pin(async move {
+                    let (host, worker) = tokio::io::duplex(1 << 16);
+                    *ledger
+                        .lock()
+                        .unwrap()
+                        .connects
+                        .entry(worker_id)
+                        .or_default() += 1;
+                    tokio::spawn(serve_mock(worker, ledger));
+                    Ok(host)
+                })
+            });
+            Arc::new(
+                AneWorkerChannel::connect(worker_id, DEFAULT_MAX_FRAME_BYTES, connect)
+                    .await
+                    .unwrap(),
+            )
+        }
+
+        /// One embed request over sequences of `lengths` tokens, run rung by
+        /// rung. The mock answers each sequence with its rung, so the result
+        /// also shows that outputs come back in sequence order.
+        async fn embed(
+            supervisor: AneResidencySupervisor,
+            channel: Channel,
+            model_ref: String,
+            lengths: Vec<usize>,
+            ledger: SharedLedger,
+        ) -> Result<Vec<f32>, AneResidencyError> {
+            let worker: Arc<dyn AneShapeWorker> = channel.clone();
+            let lengths_ref = &lengths;
+            supervisor
+                .run_by_rung(&worker, &model_ref, &lengths, |rung, indices| {
+                    let channel = channel.clone();
+                    let ledger = ledger.clone();
+                    let model_ref = model_ref.clone();
+                    async move {
+                        let key = (model_ref.clone(), rung);
+                        *ledger
+                            .lock()
+                            .unwrap()
+                            .in_flight
+                            .entry(key.clone())
+                            .or_default() += 1;
+                        // Keep the lease a little while so leases overlap
+                        // with other requests' admissions and evictions.
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                        let items: Vec<WorkerTokenItem> = indices
+                            .iter()
+                            .map(|index| WorkerTokenItem {
+                                id: index.to_string(),
+                                n_tokens: lengths_ref[*index],
+                            })
+                            .collect();
+                        let total: usize = items.iter().map(|item| item.n_tokens).sum();
+                        let request = WorkerRequest::EmbedBatch {
+                            req_id: channel.next_req_id("embed"),
+                            model_ref,
+                            pooling: WorkerPooling::Cls,
+                            normalize: true,
+                            items,
+                        };
+                        let result = channel
+                            .exchange(&request, Some(&encode_i32_frame(&vec![7; total])))
+                            .await;
+                        *ledger.lock().unwrap().in_flight.get_mut(&key).unwrap() -= 1;
+                        match result? {
+                            (WorkerResponse::Vectors { .. }, Some(raw)) => {
+                                Ok(decode_f32_frame(&raw).unwrap())
+                            }
+                            (WorkerResponse::Err { code, msg, .. }, _) => {
+                                Err(AneResidencyError::WorkerErr { code, msg })
+                            }
+                            (other, _) => Err(AneResidencyError::Channel(format!("{other:?}"))),
+                        }
+                    }
+                })
+                .await
+        }
+
+        fn expected_rungs(lengths: &[usize]) -> Vec<f32> {
+            lengths
+                .iter()
+                .map(|length| ladder_rung(*length).unwrap() as f32)
+                .collect()
+        }
+
+        #[test]
+        fn ladder_rung_is_the_smallest_shape_that_fits() {
+            assert_eq!(ladder_rung(1), Some(128));
+            assert_eq!(ladder_rung(128), Some(128));
+            assert_eq!(ladder_rung(129), Some(256));
+            assert_eq!(ladder_rung(8192), Some(8192));
+            assert_eq!(ladder_rung(8193), None);
+        }
+
+        /// Every request is submitted at once: each of the 7 shapes for each
+        /// of 4 models, eight two-rung embeds (rungs 128 and 256) and one
+        /// rerank-sized pool spanning rungs 128, 512 and 2048.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn eight_concurrent_two_rung_requests_complete_within_the_budget() {
+            let ledger = SharedLedger::default();
+            let supervisor = AneResidencySupervisor::new(AneResidencyLimits::default());
+            let models = ["gte-embed", "gte-rerank", "qwen-embed", "qwen-rerank"];
+            let mut channels = HashMap::new();
+            for model in models {
+                channels.insert(
+                    model,
+                    mock_channel(&format!("worker-{model}"), &ledger).await,
+                );
+            }
+            let mut requests: Vec<(&str, Vec<usize>)> = Vec::new();
+            for model in models {
+                for shape in ANE_SHAPE_LADDER {
+                    requests.push((model, vec![shape]));
+                }
+            }
+            for _ in 0..8 {
+                requests.push(("gte-embed", vec![100, 200, 90, 250]));
+            }
+            requests.push(("gte-rerank", vec![100, 400, 1500, 120, 2000]));
+            let mut tasks = Vec::new();
+            for (model, lengths) in requests {
+                let task = tokio::spawn(embed(
+                    supervisor.clone(),
+                    channels[model].clone(),
+                    model.to_string(),
+                    lengths.clone(),
+                    ledger.clone(),
+                ));
+                tasks.push((task, lengths));
+            }
+            for (task, lengths) in tasks {
+                let output = tokio::time::timeout(Duration::from_secs(60), task)
+                    .await
+                    .expect("no request waits forever")
+                    .unwrap()
+                    .expect("request completes");
+                assert_eq!(output, expected_rungs(&lengths));
+            }
+
+            let ledger = ledger.lock().unwrap();
+            assert_eq!(ledger.shape_not_admitted, 0);
+            assert_eq!(ledger.leased_evicts, 0, "a leased shape was evicted");
+            assert!(ledger.max_per_model <= ANE_RESIDENT_SHAPES_PER_MODEL);
+            assert!(ledger.max_total <= ANE_RESIDENT_SHAPES_TOTAL);
+            // The workload must actually press on the budget for the bounds
+            // above to mean anything.
+            assert_eq!(ledger.max_total, ANE_RESIDENT_SHAPES_TOTAL);
+            assert!(ledger.events.iter().any(|event| event.starts_with("evict")));
+            let stats = supervisor.stats();
+            assert!(stats.max_resident_per_model <= ANE_RESIDENT_SHAPES_PER_MODEL);
+            assert!(stats.max_resident_total <= ANE_RESIDENT_SHAPES_TOTAL);
+            assert_eq!(stats.samples, stats.admitted + stats.evicted);
+            assert_eq!(stats.restarts, 0);
+        }
+
+        #[tokio::test]
+        async fn waiters_are_served_fifo_and_only_the_lru_unleased_shape_is_evicted() {
+            let ledger = SharedLedger::default();
+            let supervisor = AneResidencySupervisor::new(AneResidencyLimits {
+                per_model: 8,
+                total: 3,
+            });
+            let channel = mock_channel("worker-m", &ledger).await;
+            let worker: Arc<dyn AneShapeWorker> = channel.clone();
+            for shape in [128, 256, 512] {
+                drop(supervisor.lease(&worker, "m", shape).await.unwrap());
+            }
+            // 128 is now the most recently used shape, and leased.
+            let held = supervisor.lease(&worker, "m", 128).await.unwrap();
+            assert_eq!(
+                held.inventory().unwrap().executables[0].layers,
+                vec![0, 1, 2, 3]
+            );
+            drop(supervisor.lease(&worker, "m", 1024).await.unwrap());
+            assert_eq!(
+                ledger.lock().unwrap().events.last().map(String::as_str),
+                Some("admit m 1024")
+            );
+            assert!(ledger
+                .lock()
+                .unwrap()
+                .events
+                .contains(&"evict m 256".to_string()));
+            assert!(!ledger
+                .lock()
+                .unwrap()
+                .events
+                .contains(&"evict m 128".to_string()));
+
+            // Fill the budget with leased shapes, then queue three requests.
+            let held_512 = supervisor.lease(&worker, "m", 512).await.unwrap();
+            let held_1024 = supervisor.lease(&worker, "m", 1024).await.unwrap();
+            let order = Arc::new(Mutex::new(Vec::new()));
+            let mut waiters = Vec::new();
+            for shape in [2048, 4096, 8192] {
+                let supervisor = supervisor.clone();
+                let worker = worker.clone();
+                let order = order.clone();
+                waiters.push(tokio::spawn(async move {
+                    let lease = supervisor.lease(&worker, "m", shape).await.unwrap();
+                    order.lock().unwrap().push(shape);
+                    drop(lease);
+                }));
+                // Let this request reach the queue before the next one.
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(
+                order.lock().unwrap().is_empty(),
+                "no slot is free while all are leased"
+            );
+            drop(held);
+            drop(held_512);
+            drop(held_1024);
+            for waiter in waiters {
+                waiter.await.unwrap();
+            }
+            assert_eq!(*order.lock().unwrap(), vec![2048, 4096, 8192]);
+            assert_eq!(ledger.lock().unwrap().leased_evicts, 0);
+        }
+
+        #[tokio::test]
+        async fn err_ack_restarts_the_worker_drops_its_shapes_and_resumes_waiters() {
+            let ledger = SharedLedger::default();
+            let supervisor = AneResidencySupervisor::new(AneResidencyLimits {
+                per_model: 4,
+                total: 2,
+            });
+            let channel_a = mock_channel("worker-a", &ledger).await;
+            let channel_b = mock_channel("worker-b", &ledger).await;
+            let worker_a: Arc<dyn AneShapeWorker> = channel_a.clone();
+            let worker_b: Arc<dyn AneShapeWorker> = channel_b.clone();
+            drop(supervisor.lease(&worker_a, "a", 128).await.unwrap());
+            let held_b = supervisor.lease(&worker_b, "b", 128).await.unwrap();
+            {
+                let mut ledger = ledger.lock().unwrap();
+                ledger.fail_admit.insert(("a".to_string(), 256));
+                ledger.admit_delay = Duration::from_millis(50);
+            }
+
+            let failing = {
+                let supervisor = supervisor.clone();
+                let worker_a = worker_a.clone();
+                tokio::spawn(async move { supervisor.lease(&worker_a, "a", 256).await.map(drop) })
+            };
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            // Queued behind the failing admission with the budget full.
+            let waiting = {
+                let supervisor = supervisor.clone();
+                let worker_b = worker_b.clone();
+                tokio::spawn(async move { supervisor.lease(&worker_b, "b", 512).await.map(drop) })
+            };
+
+            let error = failing
+                .await
+                .unwrap()
+                .expect_err("the injected ERR reaches the request");
+            assert_eq!(error.code(), Some("compile_failed"));
+            waiting
+                .await
+                .unwrap()
+                .expect("the queued request resumes after the restart");
+
+            assert_eq!(
+                ledger.lock().unwrap().connects["worker-a"],
+                2,
+                "worker a restarted"
+            );
+            assert_eq!(ledger.lock().unwrap().connects["worker-b"], 1);
+            let resident = supervisor.resident_shapes();
+            assert!(
+                !resident.contains_key("a"),
+                "worker a's shapes are dropped: {resident:?}"
+            );
+            assert_eq!(resident["b"], vec![128, 512]);
+            assert_eq!(supervisor.stats().restarts, 1);
+            drop(held_b);
+            // The restarted worker admits again.
+            drop(supervisor.lease(&worker_a, "a", 256).await.unwrap());
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn second_holder_is_busy_until_the_holder_and_its_workers_exit() {
+            let dir = std::env::temp_dir().join(format!(
+                "synapse-ane-lock-{}-{}",
+                std::process::id(),
+                super::super::nonce_hex16()
+            ));
+            let path = dir.join("ane-direct.lock");
+            let holder = AneDirectLaneLock::acquire(&path).unwrap();
+            let mut worker = std::process::Command::new("sleep")
+                .arg("30")
+                .stdin(inheritable_lock_stdio(&holder.inheritable()).unwrap())
+                .spawn()
+                .unwrap();
+
+            // Each acquire opens the file anew, so it contends exactly like a
+            // second module process would.
+            let busy = AneDirectLaneLock::acquire(&path).expect_err("holder is alive");
+            assert_eq!(busy.code(), Some(ERR_ANE_LANE_BUSY));
+            drop(holder);
+            let busy = AneDirectLaneLock::acquire(&path).expect_err("its worker is alive");
+            assert_eq!(busy.code(), Some(ERR_ANE_LANE_BUSY));
+            worker.kill().unwrap();
+            worker.wait().unwrap();
+            let replacement = AneDirectLaneLock::acquire(&path)
+                .expect("the lock is free once the holder and its workers exited");
+            assert_eq!(replacement.path(), path.as_path());
+            drop(replacement);
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 }

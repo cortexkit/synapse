@@ -55,4 +55,25 @@ mod tests {
             "Swift worker scan positive control is missing"
         );
     }
+
+    /// The Swift worker writes its own HELLO, so its protocol constant must
+    /// track the shared Rust one; the host refuses any other `v`.
+    #[test]
+    fn swift_protocol_version_matches_the_worker_protocol_version() {
+        let source = include_str!("../swift/ane_worker.swift");
+        let declared: Vec<&str> = source
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("private let protocolVersion = "))
+            .collect();
+        assert_eq!(
+            declared.len(),
+            1,
+            "the Swift worker declares its protocol version exactly once"
+        );
+        let swift_version: u8 = declared[0]
+            .trim()
+            .parse()
+            .expect("the Swift protocol version is an integer literal");
+        assert_eq!(swift_version, synapse_core::WORKER_PROTOCOL_VERSION);
+    }
 }

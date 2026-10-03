@@ -208,6 +208,9 @@ pub fn main() -> Result<()> {
         engine: engine_identity(),
         pid: std::process::id(),
         max_frame: DEFAULT_MAX_FRAME_BYTES,
+        // The llama worker is not bound to the model manifest.
+        manifest_digest: None,
+        kernel_revision: None,
     };
     run_worker_loop(args, hello)?;
     Ok(())
@@ -402,11 +405,29 @@ fn worker_request_loop<S: Read + Write>(
                         // This lane accepts any sequence up to the model's
                         // configured maximum, so it advertises no bucket ladder.
                         buckets: None,
+                        ane_resident_shapes: None,
                     },
                     max_frame,
                 )?;
             }
             WorkerRequest::Shutdown {} => break,
+            // Composed-sequence rerank and direct-ANE shape residency are for
+            // the owned CUDA, Vulkan and direct-ANE workers. Read and discard
+            // the raw frame a refused request carries so the connection stays
+            // usable.
+            unsupported @ (WorkerRequest::RerankSequences { .. }
+            | WorkerRequest::AneAdmitShape { .. }
+            | WorkerRequest::AneEvictShape { .. }) => {
+                if unsupported.carries_raw_frame() {
+                    synapse_core::worker_framing_sync::read_frame(stream, max_frame)
+                        .context("discard the raw frame of an unsupported request")?;
+                }
+                synapse_core::worker_framing_sync::write_json_frame(
+                    stream,
+                    &WorkerResponse::unsupported_request(&unsupported),
+                    max_frame,
+                )?;
+            }
         }
     }
     Ok(max_frame)

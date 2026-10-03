@@ -3669,6 +3669,9 @@ pub fn main() -> Result<()> {
             engine: engine_identity(worker_generation),
             pid: std::process::id(),
             max_frame: DEFAULT_MAX_FRAME_BYTES,
+            // The decode worker is not bound to the embed/rerank manifest.
+            manifest_digest: None,
+            kernel_revision: None,
         },
         protocol_version: OWNED_DECODE_ENVELOPE_PROTOCOL_VERSION,
     };
@@ -3807,6 +3810,7 @@ pub fn main() -> Result<()> {
                     // This lane accepts any sequence up to the model's
                     // configured maximum, so it advertises no bucket ladder.
                     buckets: None,
+                    ane_resident_shapes: None,
                 },
                 max_frame,
             )?,
@@ -4556,6 +4560,8 @@ mod tests {
                 engine: engine_identity(7),
                 pid: 1,
                 max_frame: DEFAULT_MAX_FRAME_BYTES,
+                manifest_digest: None,
+                kernel_revision: None,
             },
             protocol_version: OWNED_DECODE_ENVELOPE_PROTOCOL_VERSION,
         };

@@ -1,7 +1,10 @@
 use std::io;
 use std::time::Duration;
 
-use crate::worker_protocol::{WorkerHello, WorkerHelloAck, WORKER_PROTOCOL_VERSION};
+use crate::worker_protocol::{
+    check_hello_binding, ExpectedHelloBinding, HelloBindingMismatch, WorkerHello, WorkerHelloAck,
+    WORKER_PROTOCOL_VERSION,
+};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use thiserror::Error;
@@ -22,6 +25,10 @@ pub enum TransportError {
         advertised: Option<u8>,
         required: u8,
     },
+    /// An owned worker's HELLO named a different (or no) manifest digest or
+    /// kernel revision than the host's lane requires.
+    #[error("rejected worker HELLO: {0}")]
+    HelloBindingMismatch(#[from] HelloBindingMismatch),
 }
 
 pub type WorkerTransportStream = UnixStream;
@@ -83,10 +90,15 @@ pub async fn accept_worker_handshake_with_engine(
         handshake_timeout,
         expected_engine,
         None,
+        None,
     )
     .await
 }
 
+/// Accepts one worker connection and validates its HELLO: protocol version,
+/// nonce, engine identity, the owned-decode envelope version when required,
+/// and, when `expected_binding` is given, an owned worker's manifest digest
+/// and kernel revision (see [`check_hello_binding`]).
 pub async fn accept_worker_handshake_with_engine_and_protocol_version(
     listener: UnixListener,
     expected_nonce: &str,
@@ -94,6 +106,7 @@ pub async fn accept_worker_handshake_with_engine_and_protocol_version(
     handshake_timeout: Duration,
     expected_engine: Option<&str>,
     required_protocol_version: Option<u8>,
+    expected_binding: Option<&ExpectedHelloBinding>,
 ) -> Result<UnixStream, TransportError> {
     let accept = timeout(handshake_timeout, listener.accept())
         .await
@@ -106,6 +119,7 @@ pub async fn accept_worker_handshake_with_engine_and_protocol_version(
         handshake_timeout,
         expected_engine,
         required_protocol_version,
+        expected_binding,
     )
     .await?;
     Ok(stream)
@@ -141,6 +155,7 @@ where
         handshake_timeout,
         expected_engine,
         None,
+        None,
     )
     .await
 }
@@ -152,6 +167,7 @@ pub async fn handshake_on_stream_with_engine_and_protocol_version<S>(
     handshake_timeout: Duration,
     expected_engine: Option<&str>,
     required_protocol_version: Option<u8>,
+    expected_binding: Option<&ExpectedHelloBinding>,
 ) -> Result<(), TransportError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -187,6 +203,7 @@ where
             required: required_protocol_version.unwrap_or_default(),
         });
     }
+    check_hello_binding(&hello, expected_binding)?;
     let accepted_frame = max_frame.min(hello.max_frame);
     let mut ack = serde_json::to_value(WorkerHelloAck {
         v: WORKER_PROTOCOL_VERSION,
@@ -237,4 +254,185 @@ pub async fn write_raw<S: AsyncWrite + Unpin>(
     crate::worker_framing::write_frame(stream, bytes, max_frame)
         .await
         .map_err(TransportError::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::worker_protocol::{
+        ERR_KERNEL_REVISION_MISMATCH, ERR_MANIFEST_MISMATCH, OWNED_WORKER_HELLO_ENGINES,
+    };
+    use crate::EngineIdentity;
+
+    const NONCE: &str = "0123456789abcdef";
+
+    fn binding() -> ExpectedHelloBinding {
+        ExpectedHelloBinding {
+            manifest_digest: "d".repeat(64),
+            kernel_revision: "kernel-rev-a".to_string(),
+        }
+    }
+
+    fn hello_json(
+        engine: &str,
+        manifest: Option<&str>,
+        revision: Option<&str>,
+    ) -> serde_json::Value {
+        serde_json::to_value(WorkerHello {
+            v: WORKER_PROTOCOL_VERSION,
+            nonce: NONCE.to_string(),
+            engine: EngineIdentity {
+                engine: engine.to_string(),
+                version: "test".to_string(),
+                build_flags: Default::default(),
+            },
+            pid: 1,
+            max_frame: 4096,
+            manifest_digest: manifest.map(str::to_owned),
+            kernel_revision: revision.map(str::to_owned),
+        })
+        .unwrap()
+    }
+
+    /// Runs the host side of the handshake against a HELLO already written by
+    /// the worker end of an in-memory pipe, and returns the host's verdict.
+    async fn handshake(
+        hello: serde_json::Value,
+        expected_engine: Option<&str>,
+        required_protocol_version: Option<u8>,
+        expected_binding: Option<&ExpectedHelloBinding>,
+    ) -> Result<(), TransportError> {
+        let (mut host, mut worker) = tokio::io::duplex(64 * 1024);
+        write_json_frame(&mut worker, &hello, 4096).await.unwrap();
+        let verdict = handshake_on_stream_with_engine_and_protocol_version(
+            &mut host,
+            NONCE,
+            4096,
+            Duration::from_secs(1),
+            expected_engine,
+            required_protocol_version,
+            expected_binding,
+        )
+        .await;
+        if verdict.is_ok() {
+            let ack: WorkerHelloAck = read_json_frame(&mut worker, 4096).await.unwrap();
+            assert!(ack.accept);
+            assert_eq!(ack.v, WORKER_PROTOCOL_VERSION);
+        }
+        verdict
+    }
+
+    fn binding_code(error: TransportError) -> &'static str {
+        match error {
+            TransportError::HelloBindingMismatch(mismatch) => mismatch.code,
+            other => panic!("expected a HELLO binding refusal, got {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn bound_host_refuses_an_owned_worker_with_a_missing_or_different_binding() {
+        let expected = binding();
+        let digest = expected.manifest_digest.clone();
+        for engine in OWNED_WORKER_HELLO_ENGINES {
+            handshake(
+                hello_json(engine, Some(&digest), Some("kernel-rev-a")),
+                Some(engine),
+                None,
+                Some(&expected),
+            )
+            .await
+            .expect("matching binding is accepted");
+            for (manifest, revision, code) in [
+                (None, Some("kernel-rev-a"), ERR_MANIFEST_MISMATCH),
+                (
+                    Some("e".repeat(64)),
+                    Some("kernel-rev-a"),
+                    ERR_MANIFEST_MISMATCH,
+                ),
+                (Some(digest.clone()), None, ERR_KERNEL_REVISION_MISMATCH),
+                (
+                    Some(digest.clone()),
+                    Some("kernel-rev-b"),
+                    ERR_KERNEL_REVISION_MISMATCH,
+                ),
+            ] {
+                let error = handshake(
+                    hello_json(engine, manifest.as_deref(), revision),
+                    Some(engine),
+                    None,
+                    Some(&expected),
+                )
+                .await
+                .expect_err("mismatched binding is refused");
+                assert_eq!(binding_code(error), code, "{engine}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unbound_host_accepts_an_owned_worker_without_binding_fields() {
+        handshake(
+            hello_json("owned-cuda", None, None),
+            Some("owned-cuda"),
+            None,
+            None,
+        )
+        .await
+        .expect("lanes without an expected binding keep today's handshake");
+        let error = handshake(
+            hello_json("owned-cuda", None, None),
+            Some("owned-cuda"),
+            None,
+            Some(&binding()),
+        )
+        .await
+        .expect_err("the same worker is refused once the lane expects a binding");
+        assert_eq!(binding_code(error), ERR_MANIFEST_MISMATCH);
+    }
+
+    #[tokio::test]
+    async fn non_owned_workers_pass_a_bound_host_with_both_fields_absent() {
+        for engine in ["llama.cpp-worker", "ane-coreml-worker"] {
+            handshake(
+                hello_json(engine, None, None),
+                Some(engine),
+                None,
+                Some(&binding()),
+            )
+            .await
+            .expect("non-owned workers are not manifest-bound");
+        }
+        let mut decode = hello_json("owned-metal-decode", None, None);
+        decode["protocol_version"] = serde_json::Value::from(2);
+        handshake(
+            decode,
+            Some("owned-metal-decode"),
+            Some(2),
+            Some(&binding()),
+        )
+        .await
+        .expect("decode HELLO at v2 passes with neither binding field");
+    }
+
+    #[tokio::test]
+    async fn wrong_engine_identity_and_old_protocol_are_rejected() {
+        let error = handshake(
+            hello_json("llama.cpp-worker", None, None),
+            Some("owned-cuda"),
+            None,
+            None,
+        )
+        .await
+        .expect_err("engine identity must match");
+        assert!(
+            matches!(error, TransportError::Protocol(message) if message.contains("engine=llama.cpp-worker"))
+        );
+
+        let mut old = hello_json("llama.cpp-worker", None, None);
+        old["v"] = serde_json::Value::from(1);
+        let error = handshake(old, Some("llama.cpp-worker"), None, None)
+            .await
+            .expect_err("v1 HELLO is refused");
+        assert!(matches!(error, TransportError::Protocol(message) if message.contains("v=1")));
+    }
 }

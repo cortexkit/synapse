@@ -9,7 +9,10 @@ use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use tokio::time::timeout;
 
 use crate::worker_framing::{read_frame, read_json_frame, write_frame, write_json_frame};
-use crate::worker_protocol::{WorkerHello, WorkerHelloAck, WORKER_PROTOCOL_VERSION};
+use crate::worker_protocol::{
+    check_hello_binding, ExpectedHelloBinding, HelloBindingMismatch, WorkerHello, WorkerHelloAck,
+    WORKER_PROTOCOL_VERSION,
+};
 
 #[derive(Debug, Error)]
 pub enum TransportError {
@@ -22,6 +25,10 @@ pub enum TransportError {
         advertised: Option<u8>,
         required: u8,
     },
+    /// An owned worker's HELLO named a different (or no) manifest digest or
+    /// kernel revision than the host's lane requires.
+    #[error("rejected worker HELLO: {0}")]
+    HelloBindingMismatch(#[from] HelloBindingMismatch),
 }
 
 pub type WorkerTransportStream = NamedPipeServer;
@@ -79,10 +86,15 @@ pub async fn accept_worker_handshake_with_engine(
         handshake_timeout,
         expected_engine,
         None,
+        None,
     )
     .await
 }
 
+/// Accepts one worker connection and validates its HELLO: protocol version,
+/// nonce, engine identity, the owned-decode envelope version when required,
+/// and, when `expected_binding` is given, an owned worker's manifest digest
+/// and kernel revision (see [`check_hello_binding`]).
 pub async fn accept_worker_handshake_with_engine_and_protocol_version(
     mut server: NamedPipeServer,
     expected_nonce: &str,
@@ -90,6 +102,7 @@ pub async fn accept_worker_handshake_with_engine_and_protocol_version(
     handshake_timeout: Duration,
     expected_engine: Option<&str>,
     required_protocol_version: Option<u8>,
+    expected_binding: Option<&ExpectedHelloBinding>,
 ) -> Result<NamedPipeServer, TransportError> {
     timeout(handshake_timeout, server.connect())
         .await
@@ -101,6 +114,7 @@ pub async fn accept_worker_handshake_with_engine_and_protocol_version(
         handshake_timeout,
         expected_engine,
         required_protocol_version,
+        expected_binding,
     )
     .await?;
     Ok(server)
@@ -136,6 +150,7 @@ where
         handshake_timeout,
         expected_engine,
         None,
+        None,
     )
     .await
 }
@@ -147,6 +162,7 @@ pub async fn handshake_on_stream_with_engine_and_protocol_version<S>(
     handshake_timeout: Duration,
     expected_engine: Option<&str>,
     required_protocol_version: Option<u8>,
+    expected_binding: Option<&ExpectedHelloBinding>,
 ) -> Result<(), TransportError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -182,6 +198,7 @@ where
             required: required_protocol_version.unwrap_or_default(),
         });
     }
+    check_hello_binding(&hello, expected_binding)?;
     let accepted_frame = max_frame.min(hello.max_frame);
     let mut ack = serde_json::to_value(WorkerHelloAck {
         v: WORKER_PROTOCOL_VERSION,
@@ -296,6 +313,8 @@ mod tests {
             },
             pid: 1,
             max_frame,
+            manifest_digest: None,
+            kernel_revision: None,
         };
         write_json_frame(&mut client, &hello, max_frame)
             .await
@@ -312,5 +331,82 @@ mod tests {
             .expect("write raw");
         let raw = server_task.await.expect("server task");
         assert_eq!(raw, b"tensor-bytes");
+    }
+
+    /// Runs the host side of the handshake against a HELLO already written by
+    /// the worker end of an in-memory pipe, and returns the host's verdict.
+    async fn bound_handshake(
+        engine: &str,
+        manifest: Option<&str>,
+        revision: Option<&str>,
+        expected_binding: Option<&ExpectedHelloBinding>,
+    ) -> Result<(), TransportError> {
+        let nonce = "0123456789abcdef";
+        let (mut host, mut worker) = tokio::io::duplex(64 * 1024);
+        let hello = WorkerHello {
+            v: WORKER_PROTOCOL_VERSION,
+            nonce: nonce.to_string(),
+            engine: EngineIdentity {
+                engine: engine.to_string(),
+                version: "test".to_string(),
+                build_flags: Default::default(),
+            },
+            pid: 1,
+            max_frame: 4096,
+            manifest_digest: manifest.map(str::to_owned),
+            kernel_revision: revision.map(str::to_owned),
+        };
+        write_json_frame(&mut worker, &hello, 4096).await.unwrap();
+        handshake_on_stream_with_engine_and_protocol_version(
+            &mut host,
+            nonce,
+            4096,
+            Duration::from_secs(1),
+            Some(engine),
+            None,
+            expected_binding,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn pipe_handshake_enforces_the_owned_worker_binding() {
+        use crate::worker_protocol::{ERR_KERNEL_REVISION_MISMATCH, ERR_MANIFEST_MISMATCH};
+
+        let expected = ExpectedHelloBinding {
+            manifest_digest: "d".repeat(64),
+            kernel_revision: "kernel-rev-a".to_string(),
+        };
+        let digest = expected.manifest_digest.clone();
+        bound_handshake("owned-vulkan", None, None, None)
+            .await
+            .expect("lanes without an expected binding keep today's handshake");
+        bound_handshake(
+            "owned-vulkan",
+            Some(&digest),
+            Some("kernel-rev-a"),
+            Some(&expected),
+        )
+        .await
+        .expect("matching binding is accepted");
+        bound_handshake("llama.cpp-worker", None, None, Some(&expected))
+            .await
+            .expect("non-owned workers are not manifest-bound");
+        for (manifest, revision, code) in [
+            (None, Some("kernel-rev-a"), ERR_MANIFEST_MISMATCH),
+            (Some(digest.as_str()), None, ERR_KERNEL_REVISION_MISMATCH),
+            (
+                Some(digest.as_str()),
+                Some("kernel-rev-b"),
+                ERR_KERNEL_REVISION_MISMATCH,
+            ),
+        ] {
+            match bound_handshake("owned-cuda", manifest, revision, Some(&expected)).await {
+                Err(TransportError::HelloBindingMismatch(mismatch)) => {
+                    assert_eq!(mismatch.code, code)
+                }
+                other => panic!("expected a {code} refusal, got {other:?}"),
+            }
+        }
     }
 }

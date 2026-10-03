@@ -108,6 +108,10 @@ fn main() -> Result<()> {
         engine: engine_identity(),
         pid: std::process::id(),
         max_frame: DEFAULT_MAX_FRAME_BYTES,
+        // Not yet bound to the model manifest, so lanes that expect a
+        // binding refuse this worker with manifest_mismatch.
+        manifest_digest: None,
+        kernel_revision: None,
     };
     #[cfg(unix)]
     {
@@ -259,10 +263,22 @@ fn worker_request_loop<S: Read + Write>(stream: &mut S, max_frame: u32, args: &A
                     // This lane accepts any sequence up to the model's
                     // configured maximum, so it advertises no bucket ladder.
                     buckets: None,
+                    ane_resident_shapes: None,
                 },
                 None,
             ),
             WorkerRequest::Shutdown {} => break,
+            // Not served by this worker yet. Read and discard the raw frame a
+            // refused request carries so the connection stays usable.
+            unsupported @ (WorkerRequest::RerankSequences { .. }
+            | WorkerRequest::AneAdmitShape { .. }
+            | WorkerRequest::AneEvictShape { .. }) => {
+                if unsupported.carries_raw_frame() {
+                    read_frame(stream, max_frame)
+                        .context("discard the raw frame of an unsupported request")?;
+                }
+                (WorkerResponse::unsupported_request(&unsupported), None)
+            }
         };
         write_json_frame(stream, &response, max_frame)?;
         if let Some(vectors) = vectors {
