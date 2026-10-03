@@ -4151,11 +4151,7 @@ pub mod ane_residency {
         /// the file holds it (another module process, or a direct-ANE worker
         /// that inherited it and has not exited yet), fails with
         /// `ane_lane_busy`.
-        // `File::try_lock` is a `flock(LOCK_EX | LOCK_NB)` on unix. It is newer
-        // than the workspace's declared minimum Rust version, but every build
-        // of this crate uses the pinned stable toolchain that has it, and the
-        // crate forbids the unsafe code a direct `flock` call would need.
-        #[allow(clippy::incompatible_msrv)]
+        // `File::try_lock` is a `flock` and avoids the unsafe code a direct call would need.
         pub fn acquire(path: &Path) -> Result<Self, AneResidencyError> {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
