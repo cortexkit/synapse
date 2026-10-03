@@ -6595,22 +6595,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "synapse-engine-ort"
-version = "0.0.0"
-dependencies = [
- "half",
- "hex",
- "ndarray 0.17.2",
- "ort",
- "serde",
- "serde_json",
- "sha2",
- "synapse-core",
- "thiserror 1.0.69",
- "tokenizers 0.21.4",
-]
-
-[[package]]
 name = "synapse-engine-owned"
 version = "0.0.0"
 dependencies = [
@@ -6639,6 +6623,7 @@ dependencies = [
  "half",
  "hex",
  "httpdate",
+ "metal",
  "owned-decode-worker",
  "reqwest",
  "rusqlite",
@@ -6652,7 +6637,6 @@ dependencies = [
  "subc-protocol",
  "subc-transport",
  "synapse-core",
- "synapse-engine-ort",
  "synapse-engine-owned",
  "thiserror 1.0.69",
  "tokenizers 0.21.4",
@@ -6743,7 +6727,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "synapse-core",
- "synapse-engine-ort",
  "synapse-module",
  "tokenizers 0.21.4",
  "tokio",

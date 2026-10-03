@@ -115,7 +115,6 @@ use synapse_core::{
     WorkerPooling, CUDA_WORKER_ENGINE, MACHINE_PROFILE_HASH_REVISION, OWNED_CUDA_MINIMUM_DEVICE_CC,
     OWNED_CUDA_MINIMUM_DRIVER_API, OWNED_CUDA_PTX_VIRTUAL_ARCH,
 };
-use synapse_engine_ort::OrtEmbedEngine;
 use synapse_engine_owned::{
     engine_identity as owned_engine_identity, ModelFamily as OwnedFamily, OwnedDType,
     OwnedMetalEmbedEngine, TokenizerPolicy as OwnedTokenizerPolicy,
@@ -752,6 +751,8 @@ struct WireOperationError {
     retry_after_ms: Option<u64>,
     safe_to_retry_same_request: bool,
     message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<Value>,
 }
 
 impl WireOperationError {
@@ -774,6 +775,7 @@ impl WireOperationError {
             retry_after_ms,
             safe_to_retry_same_request: error.safe_to_retry_same_request,
             message: message.into(),
+            details: error.details.map(Value::Object),
         }
     }
 }
@@ -781,6 +783,8 @@ impl WireOperationError {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ModuleConfig {
+    #[serde(default = "default_hf_endpoint")]
+    hf_endpoint: String,
     #[serde(default)]
     preload_models: Vec<PreloadModelConfig>,
     #[serde(default)]
@@ -822,6 +826,7 @@ pub(crate) struct ModuleConfig {
 impl Default for ModuleConfig {
     fn default() -> Self {
         Self {
+            hf_endpoint: default_hf_endpoint(),
             preload_models: Vec::new(),
             inline: InlineConfig::default(),
             worker: WorkerConfig::default(),
@@ -1200,6 +1205,15 @@ impl AdmissionTelemetry {
 }
 
 struct RuntimeState {
+    hf_endpoint: String,
+    release_catalog: catalog::Catalog,
+    runnable_backends: BTreeSet<String>,
+    catalog_locks: Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    download_locks: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
+    download_bytes: Mutex<BTreeMap<String, (u64, u64)>>,
+    catalog_disk: Mutex<()>,
+    self_check_holders: Mutex<BTreeMap<String, String>>,
+    catalog_jobs: Mutex<BTreeMap<String, String>>,
     inline: InlineConfig,
     jobs: JobConfig,
     probe: ProbeConfig,
@@ -1216,7 +1230,6 @@ struct RuntimeState {
     execution: Arc<Semaphore>,
     execution_stats: Arc<Mutex<InlineExecutionStats>>,
     control_loads: Arc<Semaphore>,
-    ort_engine: Arc<Mutex<OrtEmbedEngine>>,
     catalog: Arc<Mutex<BTreeMap<String, ModelSlot>>>,
     job_progress: Arc<Mutex<BTreeMap<String, ModelRuntimeState>>>,
     owned_decode_q8: Arc<Mutex<owned_decode_routing::q8ingest::Q8IngestRegistry>>,
@@ -1410,7 +1423,7 @@ impl EmbeddingModel {
                 }
                 ExecutionModelInfo::default()
             }
-            EmbedBackend::Ort(_) | EmbedBackend::OwnedDecode => ExecutionModelInfo::default(),
+            EmbedBackend::OwnedDecode => ExecutionModelInfo::default(),
         }
     }
 }
@@ -1425,7 +1438,6 @@ fn dtype_for_slot(spec: &StoredModelConfig, exec_dtype: Option<String>) -> Optio
     match spec.engine.as_str() {
         "ane" | ANE_WORKER_ENGINE => Some("f16".to_string()),
         CUDA_WORKER_ENGINE => Some("f16".to_string()),
-        "ort" => Some("f32".to_string()),
         _ => None,
     }
 }
@@ -1435,7 +1447,7 @@ fn device_class_for_engine(engine: &str) -> Option<String> {
         "owned-metal" | "owned-metal-decode" => Some("metal".to_string()),
         "ane" | ANE_WORKER_ENGINE => Some("ane".to_string()),
         CUDA_WORKER_ENGINE | "cuda" => Some("cuda".to_string()),
-        "ort" | LLAMA_ENGINE | LLAMA_WORKER_ENGINE => Some("cpu".to_string()),
+        LLAMA_ENGINE | LLAMA_WORKER_ENGINE => Some("cpu".to_string()),
         _ => None,
     }
 }
@@ -1462,10 +1474,9 @@ fn execution_lane(model: &EmbeddingModel) -> &'static str {
         "owned-metal" => "metal",
         ANE_WORKER_ENGINE => "ane",
         CUDA_WORKER_ENGINE => "cuda",
-        "ort" => "ort",
         LLAMA_ENGINE | LLAMA_WORKER_ENGINE => "llama",
         DECODE_WORKER_ENGINE => "decode",
-        _ => "ort",
+        _ => "unknown",
     }
 }
 
@@ -1508,7 +1519,6 @@ fn log_job_done(model_id: &str, job_id: &str, lane: &str, tokens: u64, started: 
 
 #[derive(Clone)]
 enum EmbedBackend {
-    Ort(Arc<Mutex<OrtEmbedEngine>>),
     Owned(Arc<Mutex<OwnedMetalEmbedEngine>>),
     /// Owned decode is loaded for each supervised generation so its generation
     /// supervisor, rather than the generic worker host, enforces the crash limit.
@@ -1741,8 +1751,11 @@ struct ModelLoadFiles {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct ModelLoadParams {
     source: String,
+    #[serde(default)]
+    revision: Option<String>,
     #[serde(default)]
     repo: Option<String>,
     #[serde(default)]
@@ -2089,7 +2102,10 @@ impl SynapseHandler {
         let configured_remote =
             validate_remote_providers(&config.remote_providers).map_err(ModuleError::Config)?;
         bind_remote_provider_urls(&store, &configured_remote)?;
-        let catalog_models = sync_and_load_catalog_models(&store, &config)?;
+        validate_hf_endpoint(&config.hf_endpoint).map_err(ModuleError::Config)?;
+        let release_catalog = runtime_release_catalog()?;
+        let model_cache = Arc::new(ModelCache::new(ModelCache::default_root()?));
+        let catalog_models = sync_and_load_catalog_models(&store, &config, &release_catalog, &model_cache)?;
         // A machine-identity probe that cannot be established refuses the boot
         // rather than substituting a placeholder. A substituted value would
         // rotate the profile hash, fail every certified lane closed, and rotate
@@ -2115,7 +2131,6 @@ impl SynapseHandler {
             .ok_or_else(|| {
                 ModuleError::Config("profile activation epoch is missing".to_string())
             })?;
-        let model_cache = Arc::new(ModelCache::new(ModelCache::default_root()?));
         let vault_client = Arc::new(SubcVaultCredentialClient::new(
             self.inner.connection_file.clone(),
         ));
@@ -2131,7 +2146,7 @@ impl SynapseHandler {
         let runtime = Arc::new(RuntimeState::from_catalog(config, catalog_models)?);
         reconcile_startup_orphans(&store, module_generation, &runtime.admission_telemetry)?;
         let continuity_check: Arc<dyn ContinuityCheck> = remote_gateway.continuity.clone();
-        Ok(Arc::new(ModuleState {
+        let state = Arc::new(ModuleState {
             module_id: self.inner.module_id.clone(),
             store,
             module_generation,
@@ -2144,7 +2159,9 @@ impl SynapseHandler {
             model_cache,
             continuity_check,
             remote_gateway,
-        }))
+        });
+        startup_catalog_runtime(&state)?;
+        Ok(state)
     }
 }
 
@@ -2174,6 +2191,10 @@ impl RuntimeState {
         config: ModuleConfig,
         models: Vec<StoredModelConfig>,
     ) -> Result<Self, ModuleError> {
+        validate_hf_endpoint(&config.hf_endpoint).map_err(ModuleError::Config)?;
+        let release_catalog = runtime_release_catalog()?;
+        let runnable_backends = detected_catalog_backends();
+        let hf_endpoint = config.hf_endpoint;
         let inline = config.inline;
         let jobs = config.jobs;
         let probe = config.probe;
@@ -2214,6 +2235,15 @@ impl RuntimeState {
             })
             .collect();
         Ok(Self {
+            hf_endpoint,
+            release_catalog,
+            runnable_backends,
+            catalog_locks: Mutex::new(BTreeMap::new()),
+            download_locks: Mutex::new(BTreeMap::new()),
+            download_bytes: Mutex::new(BTreeMap::new()),
+            catalog_disk: Mutex::new(()),
+            self_check_holders: Mutex::new(BTreeMap::new()),
+            catalog_jobs: Mutex::new(BTreeMap::new()),
             inline,
             jobs,
             probe,
@@ -2230,7 +2260,6 @@ impl RuntimeState {
             execution,
             execution_stats,
             control_loads: Arc::new(Semaphore::new(1)),
-            ort_engine: Arc::new(Mutex::new(OrtEmbedEngine::new())),
             catalog: Arc::new(Mutex::new(catalog)),
             job_progress: Arc::new(Mutex::new(BTreeMap::new())),
             owned_decode_q8: Arc::new(Mutex::new(
@@ -2386,7 +2415,7 @@ async fn emit_activity_sample(state: &ModuleState, interval_secs: u64) {
         .into_iter()
         .filter_map(|model| match &model.backend {
             EmbedBackend::Worker(engine) => Some((model.model_id.clone(), Arc::clone(engine))),
-            EmbedBackend::Ort(_) | EmbedBackend::Owned(_) | EmbedBackend::OwnedDecode => None,
+            EmbedBackend::Owned(_) | EmbedBackend::OwnedDecode => None,
         })
         .collect::<Vec<_>>();
     let worker_rss_mb = tokio::task::spawn_blocking(move || {
@@ -2442,15 +2471,28 @@ fn bind_remote_provider_urls(
 fn sync_and_load_catalog_models(
     store: &SynapseStore,
     config: &ModuleConfig,
+    catalog: &catalog::Catalog,
+    cache: &ModelCache,
 ) -> Result<Vec<StoredModelConfig>, ModuleError> {
     let now = now_ms();
     for (index, preload) in config.preload_models.clone().into_iter().enumerate() {
+        let id = preload.model_id.clone().unwrap_or_else(|| format!("{}-{index}",preload.engine));
+        if catalog.is_reserved_id(&id) { return Err(ModuleError::Config(format!("preload_models entry '{id}' uses a catalog-reserved id; use models.download"))); }
+        let engine = canonical_engine_name(&preload.engine);
+        let task = parse_model_task(preload.task.as_deref(),&engine,&id)?;
+        if matches!(task,ModelTask::Embed | ModelTask::Rerank) && !store::OWNED_EMBED_RERANK_ENGINES.contains(&engine.as_str()) {
+            tracing::warn!(model_id=%id,%engine,"skipping preload_models entry with disallowed embed/rerank engine");
+            continue;
+        }
         let spec = build_preload_catalog_model(index, preload, &config.inline, &config.jobs)?;
         store.upsert_model(&spec, now)?;
     }
 
     let mut normalized = Vec::new();
-    for model in store.catalog_models()? {
+    let reconciled = store.reconcile_persisted_registrations(&|id| catalog.is_reserved_id(id),&CatalogCache(cache))?;
+    for (id,engine) in &reconciled.deleted { tracing::warn!(model_id=%id,%engine,"deleted persisted registration with disallowed embed/rerank engine"); }
+    for id in &reconciled.skipped_reserved { tracing::warn!(model_id=%id,"skipping persisted catalog-reserved registration"); }
+    for model in reconciled.registrable {
         let refreshed = normalize_catalog_model(model.clone(), &config.inline, &config.jobs)?;
         if refreshed != model {
             store.upsert_model(&refreshed, now)?;
@@ -3051,7 +3093,6 @@ fn default_quant(engine_name: &str) -> String {
 
 fn catalog_model_engine_identity(engine_name: &str) -> Result<EngineIdentity, ModuleError> {
     match engine_name {
-        "ort" => Ok(OrtEmbedEngine::new().identity()),
         LLAMA_ENGINE => Ok(worker_catalog_identity(
             LLAMA_WORKER_ENGINE,
             "protocol-v1",
@@ -3267,6 +3308,10 @@ async fn dispatch_request(
     approved_by: Option<&str>,
 ) -> HandlerOutcome {
     match request.method.as_str() {
+        "models.catalog" => models_catalog(state, request.params).await,
+        "models.download" => models_download(state, request.params).await,
+        "models.download.cancel" => models_download_cancel(state, request.params).await,
+        "models.remove" => models_remove(state, request.params).await,
         "models.list" => match state.store.catalog_snapshot() {
             Ok(snapshot) => result_outcome(models_list_payload(&state, snapshot)),
             Err(error) => channel_error("store_failure", error.to_string()),
@@ -5052,7 +5097,10 @@ async fn model_load(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
             )
         }
     };
-    if let Err(message) = validate_model_load_request(&params) {
+    if params.model_id.as_deref().is_some_and(|id| state.runtime.release_catalog.is_reserved_id(id)) {
+        return result_outcome(error_payload(&state, catalog_wire_error("invalid_request", json!({"model_id": params.model_id}), "catalog ids must be installed with models.download")));
+    }
+    if let Err(message) = validate_model_load_request(&params).and_then(|_| resolve_model_load_sources_at(&params, &state.runtime.hf_endpoint).map(|_| ())) {
         return channel_error("invalid_request", message);
     }
     let now = now_ms();
@@ -5120,6 +5168,7 @@ async fn model_status(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
     };
     match (params.job_id, params.model_id) {
         (Some(job_id), None) => match state.store.get_job(&job_id) {
+            Ok(Some(record)) if record.kind == store::DOWNLOAD_JOB_KIND => result_outcome(download_status_payload(&state,&record,true)),
             Ok(Some(record)) if record.kind == "model.load" => {
                 result_outcome(model_load_job_status_payload(&state, &record))
             }
@@ -5132,7 +5181,7 @@ async fn model_status(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
         },
         (None, Some(model_id)) => match model_slot_snapshot(&state.runtime, &model_id) {
             Some(slot) => result_outcome(model_status_payload(state.module_generation, &slot)),
-            None => channel_error("invalid_request", "unknown model_id"),
+            None => result_outcome(error_payload(&state,catalog_unknown(&model_id))),
         },
         _ => channel_error(
             "invalid_request",
@@ -5151,8 +5200,21 @@ async fn model_unload(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
             )
         }
     };
+    if let Some(entry) = state.runtime.release_catalog.entry(&params.model_id) {
+        return result_outcome(error_payload(&state,catalog_wire_error("invalid_request",json!({"catalog_id":entry.id,"lane_ids":entry.backends.iter().map(|b| catalog::lane_id(&entry.id,&b.backend)).collect::<Vec<_>>()}),"model.unload requires a lane id")));
+    }
+    if model_slot_snapshot(&state.runtime,&params.model_id).is_some_and(|slot| matches!(slot.state,ModelRuntimeState::Loading | ModelRuntimeState::Resolving | ModelRuntimeState::Validating)) {
+        return result_outcome(error_payload(&state,WireOperationError::from_stable(StableError::model_loading(Some(250)),"model is still loading")));
+    }
+    let lane_lock = catalog_lane_lock(&state.runtime,&params.model_id);
+    let _catalog_guard = if resolved_catalog_lane(&state.runtime,&params.model_id).is_some() {
+        match lane_lock.try_lock_owned() {
+            Ok(guard) => Some(guard),
+            Err(_) => return result_outcome(error_payload(&state,catalog_wire_error("model_in_use",json!({"catalog_id":state.runtime.release_catalog.resolve_reserved(&params.model_id).map(|(e,_)| &e.id),"holders":state.runtime.self_check_holders.lock().expect("self-check holders").get(&params.model_id).map(|id| vec![json!({"kind":"self_check","check_id":id})]).unwrap_or_else(|| vec![json!({"kind":"request","lease_id":params.model_id})])}),"catalog engine invocation is still in flight")))
+        }
+    } else { None };
     let Some(snapshot) = model_slot_snapshot(&state.runtime, &params.model_id) else {
-        return channel_error("invalid_request", "unknown model_id");
+        return result_outcome(error_payload(&state,catalog_unknown(&params.model_id)));
     };
     if matches!(
         snapshot.state,
@@ -5170,6 +5232,9 @@ async fn model_unload(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
         ));
     }
     if let Some(loaded) = snapshot.loaded {
+        if resolved_catalog_lane(&state.runtime,&params.model_id).is_some() && Arc::strong_count(&loaded) > 2 {
+            return result_outcome(error_payload(&state,catalog_wire_error("model_in_use",json!({"catalog_id":state.runtime.release_catalog.resolve_reserved(&params.model_id).map(|(e,_)| &e.id),"holders":[{"kind":"request","lease_id":params.model_id}]}),"catalog lane holds a live request")));
+        }
         let unload = tokio::task::spawn_blocking(move || unload_embedding_model_blocking(loaded))
             .await
             .map_err(|error| {
@@ -5266,7 +5331,7 @@ async fn resolve_model_for_request_inner(
     };
     let Some(snapshot) = model_slot_snapshot(&state.runtime, &model_id) else {
         return Err(WireOperationError::from_stable(
-            StableError::model_loading(Some(250)),
+            StableError::new(synapse_core::StableErrorCode::UnknownModel,ErrorClass::Permanent,None,false).with_details(serde_json::from_value(json!({"model_id":model_id})).expect("details object")),
             format!("model '{model_id}' is not registered"),
         ));
     };
@@ -5414,17 +5479,18 @@ async fn load_catalog_model_task(
         ));
     };
     let spec = snapshot.spec.clone();
-    let ort_engine = Arc::clone(&state.runtime.ort_engine);
     let model_cache = Arc::clone(&state.model_cache);
     let load_started = std::time::Instant::now();
     let microllm_max_tokens = state.runtime.microllm_max_tokens;
     let worker_load_timeout = state.runtime.worker_load_timeout;
     let worker_forward_lines_per_sec = state.runtime.log.worker_forward_lines_per_sec;
     let owned_decode_q8 = Arc::clone(&state.runtime.owned_decode_q8);
+    let is_catalog = state.runtime.release_catalog.is_reserved_id(&model_id);
+    let fault_lane = model_id.clone();
     let loaded = tokio::task::spawn_blocking(move || {
+        if is_catalog { catalog_call_fault(&fault_lane,"load")?; }
         load_catalog_model_blocking(
             spec,
-            ort_engine,
             model_cache,
             microllm_max_tokens,
             worker_load_timeout,
@@ -5596,7 +5662,6 @@ fn assemble_owned_model_package(
 
 fn load_catalog_model_blocking(
     spec: StoredModelConfig,
-    ort_engine: Arc<Mutex<OrtEmbedEngine>>,
     model_cache: Arc<ModelCache>,
     microllm_max_tokens: u32,
     worker_load_timeout: Duration,
@@ -5683,22 +5748,6 @@ fn load_catalog_model_blocking(
         format: spec.artifact_format.clone(),
     };
     let (backend, loaded_model, owned_tokenizer_policy) = match spec.engine.as_str() {
-        "ort" => {
-            let mut engine = ort_engine.lock().map_err(|_| {
-                WireOperationError::from_stable(
-                    StableError::engine_crashed(Some(100)),
-                    "ORT engine mutex was poisoned during model load",
-                )
-            })?;
-            let loaded_model = engine
-                .load(&artifact, &runtime_config)
-                .map_err(engine_error_to_wire)?;
-            (
-                EmbedBackend::Ort(Arc::clone(&ort_engine)),
-                loaded_model,
-                None,
-            )
-        }
         "owned-cuda" => {
             if cfg!(target_os = "macos") {
                 return Err(artifact_invalid_error(format!(
@@ -5952,16 +6001,6 @@ fn materialize_ane_artifacts(
 
 fn unload_embedding_model_blocking(model: Arc<EmbeddingModel>) -> Result<(), WireOperationError> {
     match &model.backend {
-        EmbedBackend::Ort(engine) => {
-            let mut engine = engine.lock().map_err(|_| {
-                WireOperationError::from_stable(
-                    StableError::engine_crashed(Some(100)),
-                    "ORT engine mutex was poisoned during model unload",
-                )
-            })?;
-            engine.unload(&model.loaded_model);
-            Ok(())
-        }
         EmbedBackend::Owned(engine) => {
             let mut engine = engine.lock().map_err(|_| {
                 WireOperationError::from_stable(
@@ -6610,7 +6649,7 @@ async fn execute_model_load_job(state: Arc<ModuleState>, job_id: String, params:
     }
 
     let result = async {
-        let sources = resolve_model_load_sources(&params).map_err(artifact_invalid_error)?;
+        let sources = resolve_model_load_sources_at(&params, &state.runtime.hf_endpoint).map_err(artifact_invalid_error)?;
         let temp_dir = model_load_scratch_path(&job_id);
         let scratch = ModelLoadScratch::create(temp_dir.clone())
             .map_err(|error| io_to_load_error("create temp directory", &temp_dir, &error))?;
@@ -6799,11 +6838,26 @@ fn validate_model_load_request(params: &ModelLoadParams) -> Result<(), String> {
     {
         return Err("model.load requires files.model and files.tokenizer".to_string());
     }
-    resolve_model_load_sources(params).map(|_| ())
+    let engine = canonical_engine_name(&params.engine);
+    let task = parse_model_task(params.task.as_deref(), &engine, params.model_id.as_deref().unwrap_or("model"))
+        .map_err(|error| error.to_string())?;
+    if matches!(task, ModelTask::Embed | ModelTask::Rerank) && !store::OWNED_EMBED_RERANK_ENGINES.contains(&engine.as_str()) {
+        return Err(format!("engine '{engine}' is not an owned embed/rerank engine"));
+    }
+    if params.source == "hf" && !params.revision.as_deref().is_some_and(pinned_revision) {
+        return Err("model.load source=hf requires a 40-hex revision".to_string());
+    }
+    Ok(())
 }
 
-fn resolve_model_load_sources(
+#[cfg(test)]
+fn resolve_model_load_sources(params: &ModelLoadParams) -> Result<ResolvedModelLoadSources, String> {
+    resolve_model_load_sources_at(params, &default_hf_endpoint())
+}
+
+fn resolve_model_load_sources_at(
     params: &ModelLoadParams,
+    endpoint: &str,
 ) -> Result<ResolvedModelLoadSources, String> {
     let resolve = |spec: &ModelLoadFileSpec| -> Result<ResolvedModelLoadAsset, String> {
         let locator = spec.locator();
@@ -6821,7 +6875,7 @@ fn resolve_model_load_sources(
                         .as_deref()
                         .filter(|value| !value.trim().is_empty())
                         .ok_or_else(|| "model.load source=hf requires repo".to_string())?;
-                    huggingface_resolve_url(repo, locator)?
+                    huggingface_resolve_url(endpoint, repo, params.revision.as_deref().unwrap_or(""), locator)?
                 }
                 "url" => {
                     let base = params
@@ -6842,10 +6896,11 @@ fn resolve_model_load_sources(
                 other => return Err(format!("unsupported model.load source '{other}'")),
             }
         };
-        Ok(ResolvedModelLoadAsset {
-            source_url,
-            expected_digest: spec.expected_digest(),
-        })
+        let expected_digest = spec.expected_digest().or_else(|| {
+            std::ptr::eq(spec, &params.files.model).then(|| params.expected_digest.clone()).flatten()
+        });
+        validate_resolved_asset(&source_url, expected_digest.as_deref(), endpoint)?;
+        Ok(ResolvedModelLoadAsset { source_url, expected_digest })
     };
 
     Ok(ResolvedModelLoadSources {
@@ -6861,20 +6916,23 @@ fn resolve_model_load_sources(
     })
 }
 
-fn huggingface_resolve_url(repo: &str, file: &str) -> Result<String, String> {
-    let mut url = Url::parse("https://huggingface.co/")
+fn huggingface_resolve_url(endpoint: &str, repo: &str, revision: &str, file: &str) -> Result<String, String> {
+    validate_hf_endpoint(endpoint)?;
+    if !pinned_revision(revision) { return Err("Hugging Face revision must be a 40-hex commit".into()); }
+    let mut url = Url::parse(endpoint)
         .map_err(|error| format!("build Hugging Face base URL: {error}"))?;
     {
         let mut segments = url
             .path_segments_mut()
             .map_err(|_| "build Hugging Face path segments".to_string())?;
+        segments.pop_if_empty();
         for segment in repo.split('/') {
             if !segment.is_empty() {
                 segments.push(segment);
             }
         }
         segments.push("resolve");
-        segments.push("main");
+        segments.push(revision);
         for segment in file.split('/') {
             if !segment.is_empty() {
                 segments.push(segment);
@@ -7164,7 +7222,8 @@ fn copy_source_stream(
 }
 
 async fn embed_query(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
-    let params: EmbedQueryParams = match serde_json::from_value(params) {
+    let resolution_started = Instant::now();
+    let mut params: EmbedQueryParams = match serde_json::from_value(params) {
         Ok(params) => params,
         Err(error) => {
             return channel_error(
@@ -7184,16 +7243,23 @@ async fn embed_query(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         Ok(alias_table) => alias_table,
         Err(error) => return channel_error("store_failure", error.to_string()),
     };
-    let model = match resolve_model_for_request(
+    let model = match resolve_serving_model(
         Arc::clone(&state),
         params.model.as_deref(),
         ModelTask::Embed,
+        params.required_fingerprint.as_deref(),
+        params.target_fingerprint.as_deref(),
+        params.deadline_ms,
     )
     .await
     {
         Ok(model) => model,
         Err(error) => return result_outcome(error_payload(&state, error)),
     };
+    if resolved_catalog_lane(&state.runtime,&model.model_id).is_some() {
+        let budget = params.deadline_ms.unwrap_or(state.runtime.inline.deadline_ms);
+        params.deadline_ms = Some(budget.saturating_sub(resolution_started.elapsed().as_millis() as u64));
+    }
     if let Err(error) = ensure_model_certified(
         &state,
         &model,
@@ -7484,7 +7550,8 @@ fn sha256_text(text: &str) -> String {
 }
 
 async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
-    let params: EmbedBatchParams = match serde_json::from_value(params) {
+    let resolution_started = Instant::now();
+    let mut params: EmbedBatchParams = match serde_json::from_value(params) {
         Ok(params) => params,
         Err(error) => {
             return channel_error(
@@ -7500,6 +7567,7 @@ async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
     {
         return remote_embed_batch(state, params).await;
     }
+    let mut job_params = json!({"model":params.model,"required_fingerprint":params.required_fingerprint,"target_fingerprint":params.target_fingerprint,"allow_equivalent":params.allow_equivalent,"required_epoch":params.required_epoch,"accept_declared":params.accept_declared,"request_key":params.request_key});
     let items = match batch_items(params.items, params.texts) {
         Ok(items) => items,
         Err(message) => return channel_error("invalid_request", message),
@@ -7507,21 +7575,37 @@ async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
     if items.is_empty() {
         return channel_error("invalid_request", "embed.batch requires at least one item");
     }
+    if params.model.as_deref().is_none_or(|id| state.runtime.release_catalog.is_reserved_id(id)) {
+        let (entry,backend) = match select_catalog_lane(&state,params.model.as_deref(),ModelTask::Embed,params.required_fingerprint.as_deref(),params.target_fingerprint.as_deref()) {
+            Ok(lane) => lane, Err(e) => return result_outcome(error_payload(&state,e))
+        };
+        if items.len() > state.runtime.inline.max_items {
+            job_params["items"] = json!(items.iter().map(|i| json!({"id":i.id,"text":i.text})).collect::<Vec<_>>());
+            return submit_catalog_embed_job(state,entry,backend,job_params).await;
+        }
+    }
 
     let alias_table = match state.store.alias_table() {
         Ok(alias_table) => alias_table,
         Err(error) => return channel_error("store_failure", error.to_string()),
     };
-    let model = match resolve_model_for_request(
+    let model = match resolve_serving_model(
         Arc::clone(&state),
         params.model.as_deref(),
         ModelTask::Embed,
+        params.required_fingerprint.as_deref(),
+        params.target_fingerprint.as_deref(),
+        params.deadline_ms,
     )
     .await
     {
         Ok(model) => model,
         Err(error) => return result_outcome(error_payload(&state, error)),
     };
+    if resolved_catalog_lane(&state.runtime,&model.model_id).is_some() {
+        let budget = params.deadline_ms.unwrap_or(state.runtime.inline.deadline_ms);
+        params.deadline_ms = Some(budget.saturating_sub(resolution_started.elapsed().as_millis() as u64));
+    }
     if let Err(error) = ensure_model_certified(
         &state,
         &model,
@@ -8056,7 +8140,8 @@ async fn execute_remote_embed_batch_job(
 }
 
 async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
-    let params: RerankScoreParams = match serde_json::from_value(params) {
+    let resolution_started = Instant::now();
+    let mut params: RerankScoreParams = match serde_json::from_value(params) {
         Ok(params) => params,
         Err(error) => {
             return channel_error(
@@ -8102,10 +8187,13 @@ async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
         Ok(alias_table) => alias_table,
         Err(error) => return channel_error("store_failure", error.to_string()),
     };
-    let model = match resolve_model_for_request(
+    let model = match resolve_serving_model(
         Arc::clone(&state),
         params.model.as_deref(),
         ModelTask::Rerank,
+        params.required_fingerprint.as_deref(),
+        params.target_fingerprint.as_deref(),
+        params.deadline_ms,
     )
     .await
     {
@@ -8123,6 +8211,10 @@ async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
                 ),
             ),
         ));
+    }
+    if resolved_catalog_lane(&state.runtime,&model.model_id).is_some() {
+        let budget = params.deadline_ms.unwrap_or(state.runtime.inline.deadline_ms);
+        params.deadline_ms = Some(budget.saturating_sub(resolution_started.elapsed().as_millis() as u64));
     }
     if let Err(error) = ensure_model_certified(
         &state,
@@ -8343,10 +8435,13 @@ async fn microllm_oneshot(state: Arc<ModuleState>, params: Value) -> HandlerOutc
         Ok(alias_table) => alias_table,
         Err(error) => return channel_error("store_failure", error.to_string()),
     };
-    let model = match resolve_model_for_request(
+    let model = match resolve_serving_model(
         Arc::clone(&state),
         params.model.as_deref(),
         ModelTask::Generate,
+        params.required_fingerprint.as_deref(),
+        params.target_fingerprint.as_deref(),
+        params.deadline_ms,
     )
     .await
     {
@@ -11213,60 +11308,10 @@ async fn execute_embedding(
         .sum::<u64>();
     let permit = acquire_execution_permit(runtime, deadline).await?;
     let _activity = runtime.activity_telemetry.begin(&model.model_id);
+    let catalog_lane = resolved_catalog_lane(runtime,&model.model_id).is_some();
+    let catalog_guard = if catalog_lane { Some(catalog_lane_lock(runtime,&model.model_id).lock_owned().await) } else { None };
+    let fault_lane = catalog_lane.then(|| model.model_id.clone());
     let result = match &model.backend {
-        EmbedBackend::Ort(engine) => {
-            let engine = Arc::clone(engine);
-            let loaded_model = model.loaded_model.clone();
-            let submitted_at = Instant::now();
-            tokio::task::spawn_blocking(move || {
-                let entered_at = Instant::now();
-                if profile {
-                    tracing::debug!(
-                        target: "perf",
-                        backend = "ort",
-                        wait_ms = format_args!("{:.3}", submitted_at.elapsed().as_secs_f64() * 1_000.0),
-                        "spawn_entry"
-                    );
-                }
-                let _permit = permit;
-                let mutex_started = Instant::now();
-                let engine = engine.lock().map_err(|_| EngineError {
-                    stage: EngineErrorStage::Inference,
-                    risk_class: synapse_core::EngineRiskClass::AbortSafe,
-                    message: "ORT engine mutex was poisoned during inference".to_string(),
-                    retry_after_ms: Some(100),
-                    safe_to_retry_same_request: true,
-                })?;
-                if profile {
-                    tracing::debug!(
-                        target: "perf",
-                        backend = "ort",
-                        wait_ms = format_args!("{:.3}", mutex_started.elapsed().as_secs_f64() * 1_000.0),
-                        "mutex_acquired"
-                    );
-                }
-                let inference_started = Instant::now();
-                let result = engine.embed_batch(&loaded_model, batch);
-                if profile {
-                    tracing::debug!(
-                        target: "perf",
-                        backend = "ort",
-                        inference_ms = format_args!("{:.3}", inference_started.elapsed().as_secs_f64() * 1_000.0),
-                        worker_ms = format_args!("{:.3}", entered_at.elapsed().as_secs_f64() * 1_000.0),
-                        "engine_return"
-                    );
-                }
-                result
-            })
-            .await
-            .map_err(|error| {
-                WireOperationError::from_stable(
-                    StableError::engine_crashed(Some(100)),
-                    format!("embedding worker join failed: {error}"),
-                )
-            })?
-            .map_err(engine_error_to_wire)
-        }
         EmbedBackend::Owned(engine) => {
             let engine = Arc::clone(engine);
             let loaded_model = model.loaded_model.clone();
@@ -11282,6 +11327,8 @@ async fn execute_embedding(
                     );
                 }
                 let _permit = permit;
+                let _catalog_guard = catalog_guard;
+                if let Some(id) = fault_lane.as_deref() { catalog_engine_fault(id,"serve")?; }
                 let mutex_started = Instant::now();
                 let engine = engine.lock().map_err(|_| EngineError {
                     stage: EngineErrorStage::Inference,
@@ -11340,6 +11387,8 @@ async fn execute_embedding(
                     );
                 }
                 let _permit = permit;
+                let _catalog_guard = catalog_guard;
+                if let Some(id) = fault_lane.as_deref() { catalog_engine_fault(id,"serve")?; }
                 let mutex_started = Instant::now();
                 let engine = engine.lock().map_err(|_| EngineError {
                     stage: EngineErrorStage::Inference,
@@ -11401,8 +11450,11 @@ async fn execute_rerank(
         .sum();
     let permit = acquire_execution_permit(runtime, deadline).await?;
     let _activity = runtime.activity_telemetry.begin(&model.model_id);
+    let catalog_lane = resolved_catalog_lane(runtime,&model.model_id).is_some();
+    let catalog_guard = if catalog_lane { Some(catalog_lane_lock(runtime,&model.model_id).lock_owned().await) } else { None };
+    let fault_lane = catalog_lane.then(|| model.model_id.clone());
     let result = match &model.backend {
-        EmbedBackend::Ort(_) | EmbedBackend::OwnedDecode => Err(WireOperationError::from_stable(
+        EmbedBackend::OwnedDecode => Err(WireOperationError::from_stable(
             StableError::artifact_invalid(),
             format!("model '{}' does not support rerank.score", model.model_id),
         )),
@@ -11420,6 +11472,8 @@ async fn execute_rerank(
             let loaded_model = model.loaded_model.clone();
             tokio::task::spawn_blocking(move || {
                 let _permit = permit;
+                let _catalog_guard = catalog_guard;
+                if let Some(id) = fault_lane.as_deref() { catalog_engine_fault(id,"serve")?; }
                 let engine = engine.lock().map_err(|_| EngineError {
                     stage: EngineErrorStage::Inference,
                     risk_class: synapse_core::EngineRiskClass::AbortCapable,
@@ -11444,6 +11498,8 @@ async fn execute_rerank(
             let job_id = job_id.map(str::to_owned);
             tokio::task::spawn_blocking(move || {
                 let _permit = permit;
+                let _catalog_guard = catalog_guard;
+                if let Some(id) = fault_lane.as_deref() { catalog_engine_fault(id,"serve")?; }
                 let engine = engine.lock().map_err(|_| EngineError {
                     stage: EngineErrorStage::Inference,
                     risk_class: synapse_core::EngineRiskClass::AbortCapable,
@@ -11513,8 +11569,11 @@ async fn execute_generate(
 ) -> Result<GenerateOutput, WireOperationError> {
     let permit = acquire_execution_permit(runtime, deadline).await?;
     let _activity = runtime.activity_telemetry.begin(&model.model_id);
+    let catalog_lane = resolved_catalog_lane(runtime,&model.model_id).is_some();
+    let catalog_guard = if catalog_lane { Some(catalog_lane_lock(runtime,&model.model_id).lock_owned().await) } else { None };
+    let fault_lane = catalog_lane.then(|| model.model_id.clone());
     let result = match &model.backend {
-        EmbedBackend::Ort(_) | EmbedBackend::Owned(_) | EmbedBackend::OwnedDecode => {
+        EmbedBackend::Owned(_) | EmbedBackend::OwnedDecode => {
             Err(WireOperationError::from_stable(
                 StableError::artifact_invalid(),
                 format!(
@@ -11529,6 +11588,8 @@ async fn execute_generate(
             let job_id = job_id.map(str::to_owned);
             tokio::task::spawn_blocking(move || {
                 let _permit = permit;
+                let _catalog_guard = catalog_guard;
+                if let Some(id) = fault_lane.as_deref() { catalog_engine_fault(id,"serve")?; }
                 let engine = engine.lock().map_err(|_| EngineError {
                     stage: EngineErrorStage::Inference,
                     risk_class: synapse_core::EngineRiskClass::AbortCapable,
@@ -11652,6 +11713,7 @@ fn ensure_model_certified(
     certification_class: CertificationClass,
     accept_declared: bool,
 ) -> Result<(), WireOperationError> {
+    if resolved_catalog_lane(&state.runtime,&model.model_id).is_some() { return Ok(()); }
     // Owned-CUDA has no declared or inherited certification path. A measured
     // row must match this exact machine-profile hash before serving.
     let result = if model.engine_identity.engine == CUDA_WORKER_ENGINE {
@@ -11804,6 +11866,9 @@ async fn probe_start(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         }
     };
     let now = now_ms();
+    if params.models.as_ref().is_some_and(|ids| ids.iter().any(|id| state.runtime.release_catalog.is_reserved_id(id))) {
+        return result_outcome(error_payload(&state,catalog_wire_error("invalid_request",json!({"models":params.models}),"catalog lanes use self-check, not probe.start")));
+    }
     let model_filter = params.models;
     let request_key = params
         .request_key
@@ -12451,7 +12516,7 @@ async fn ane_placement_share_for_model(
             })?;
             Ok(ping.placement_share)
         }
-        EmbedBackend::Ort(_) | EmbedBackend::Owned(_) | EmbedBackend::OwnedDecode => Ok(None),
+        EmbedBackend::Owned(_) | EmbedBackend::OwnedDecode => Ok(None),
     }
 }
 
@@ -14028,6 +14093,9 @@ fn lane_measurement_rows(
     engine: &str,
     fingerprint: &Fingerprint,
 ) -> LaneMeasurementRows {
+    if resolved_catalog_lane(&state.runtime,model_id).is_some() {
+        return LaneMeasurementRows { current_certification:None,latest_certification:None,current_probe:None,latest_probe:None,current_performance:None,latest_performance:None,certification_stale:false,performance_stale:false };
+    }
     let (current_certification, latest_certification, current_probe, latest_probe) =
         if engine == DECODE_WORKER_ENGINE {
             let current_probe = state
@@ -14157,6 +14225,7 @@ fn catalog_measurement_summary(state: &ModuleState) -> CatalogMeasurementSummary
         .unwrap_or_default();
     let lanes = slots
         .into_iter()
+        .filter(|slot| resolved_catalog_lane(&state.runtime,&slot.spec.model_id).is_none_or(|(e,b)| current_catalog_install(state,e,&b.backend).ok().flatten().is_some()))
         .map(|slot| {
             let certification_fingerprint = slot
                 .loaded
@@ -14373,6 +14442,12 @@ async fn probe_report(state: Arc<ModuleState>) -> HandlerOutcome {
             certification_fingerprint,
             measurements,
         } = catalog_lane;
+        if let Some((entry,backend)) = resolved_catalog_lane(&state.runtime,&slot.spec.model_id) {
+            let mut row = json!({"model_id":slot.spec.model_id,"task":entry.task,"engine":slot.spec.engine,"backend":backend.backend,"fingerprint":backend.fingerprint,"state":model_runtime_state_name(&slot.state),"certification_required":false,"certification_status":"not_required","certification_stale":false,"performance_stale":false});
+            if let Err(e) = catalog_list_row(&state,&mut row) { return result_outcome(error_payload(&state,e)); }
+            lanes.push(row);
+            continue;
+        }
         let worker = worker_health_from_slot(&slot);
         let worker_quarantined = worker
             .as_ref()
@@ -14425,8 +14500,7 @@ async fn probe_report(state: Arc<ModuleState>) -> HandlerOutcome {
             .engine_identity
             .build_flags
             .get("backend")
-            .cloned()
-            .or_else(|| (slot.spec.engine == "ort").then(|| "cpu".to_string()));
+            .cloned();
         let support_state = if blocking_reason.is_some_and(|reason| {
             matches!(
                 reason,
@@ -14546,7 +14620,7 @@ async fn admission_status(state: Arc<ModuleState>) -> HandlerOutcome {
     let execution_wait_p50_ms = execution_wait_percentile(&execution_stats, 0.50);
     let execution_wait_p95_ms = execution_wait_percentile(&execution_stats, 0.95);
     let catalog_measurements = catalog_measurement_summary(&state);
-    let lanes = state
+    let mut lanes = state
         .runtime
         .loaded_models()
         .into_iter()
@@ -14573,6 +14647,14 @@ async fn admission_status(state: Arc<ModuleState>) -> HandlerOutcome {
             })
         })
         .collect::<Vec<_>>();
+    for row in &mut lanes {
+        let id = row["model_id"].as_str().unwrap_or("").to_string();
+        if resolved_catalog_lane(&state.runtime,&id).is_some() {
+            if let Err(e) = catalog_list_row(&state,row) { return result_outcome(error_payload(&state,e)); }
+            row["certification_required"] = json!(false);
+            row["certification_status"] = json!("not_required");
+        }
+    }
     let telemetry = state.runtime.admission_telemetry.snapshot();
     result_outcome(json!({
         "module_generation": state.module_generation,
@@ -14603,7 +14685,7 @@ fn worker_health_for_model(model: &EmbeddingModel) -> Option<worker_host::Worker
             .lock()
             .ok()
             .and_then(|engine| engine.health_snapshot().ok()),
-        EmbedBackend::Ort(_) | EmbedBackend::Owned(_) | EmbedBackend::OwnedDecode => None,
+        EmbedBackend::Owned(_) | EmbedBackend::OwnedDecode => None,
     }
 }
 
@@ -14786,6 +14868,9 @@ async fn cache_gc(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
     };
     let now = now_ms();
     let grace_ms = params.grace_ms.unwrap_or(60_000);
+    let _catalog_disk = state.runtime.catalog_disk.lock().expect("catalog disk lock");
+    let roots = match catalog_cache_roots(&state) { Ok(r) => r, Err(e) => return channel_error("store_failure",e.to_string()) };
+    let _catalog_roots = match roots.iter().map(|d| state.model_cache.acquire_read(d)).collect::<Result<Vec<_>,_>>() { Ok(r) => r, Err(e) => return result_outcome(error_payload(&state,cache_error_to_wire(e))) };
     let result: Result<Vec<CacheGcOutcome>, ModelCacheError> = (|| {
         let sweep_started = SystemTime::now();
         ane_artifact::cleanup_abandoned_temps(state.model_cache.root(), sweep_started)
@@ -14908,6 +14993,7 @@ fn module_catalog_entries(state: &ModuleState) -> Vec<ModelCatalogEntry> {
 
     slots
         .into_iter()
+        .filter(|(spec,_,_,_)| resolved_catalog_lane(&state.runtime,&spec.model_id).is_none_or(|(e,b)| current_catalog_install(state,e,&b.backend).ok().flatten().is_some()))
         .map(|(spec, loaded, runtime_state, last_cold_load_ms)| {
             let exec_info = loaded
                 .as_ref()
@@ -15076,6 +15162,9 @@ fn models_list_payload(state: &ModuleState, snapshot: CatalogSnapshot) -> Value 
         .into_iter()
         .map(|entry| serde_json::to_value(entry).expect("catalog entry serializes"))
         .collect::<Vec<_>>();
+    for row in &mut models {
+        if let Err(error) = catalog_list_row(state,row) { return error_payload(state,error); }
+    }
     models.extend(state.remote_gateway.catalog_entries());
     models.sort_by(|left, right| left["model_id"].as_str().cmp(&right["model_id"].as_str()));
     json!({
@@ -15177,6 +15266,10 @@ fn management_operations() -> Vec<ManagementOperation> {
         op("model.status", Query),
         op("model.unload", Mutate),
         op("models.list", Query),
+        op("models.catalog", Query),
+        op("models.download", Mutate),
+        op("models.download.cancel", Mutate),
+        op("models.remove", Mutate),
         op("probe.start", Mutate),
         op("probe.status", Query),
         op("probe.report", Query),
@@ -18391,12 +18484,12 @@ mod tests {
     }
 
     #[test]
-    fn huggingface_resolve_url_uses_repo_segments_and_resolve_main() {
-        let url = huggingface_resolve_url("Qdrant/all-MiniLM-L6-v2-onnx", "onnx/model.onnx")
+    fn huggingface_resolve_url_uses_repo_segments_and_pinned_revision() {
+        let url = huggingface_resolve_url("https://huggingface.co", "Qdrant/all-MiniLM-L6-v2-onnx", "0123456789012345678901234567890123456789", "onnx/model.onnx")
             .expect("hf url should resolve");
         assert_eq!(
             url,
-            "https://huggingface.co/Qdrant/all-MiniLM-L6-v2-onnx/resolve/main/onnx/model.onnx"
+            "https://huggingface.co/Qdrant/all-MiniLM-L6-v2-onnx/resolve/0123456789012345678901234567890123456789/onnx/model.onnx"
         );
     }
 
@@ -18816,7 +18909,7 @@ mod tests {
 
         let mut unloaded_spec = stuck_model_spec();
         unloaded_spec.model_id = "test-unloaded-lane".to_string();
-        unloaded_spec.engine = "ort".to_string();
+        unloaded_spec.engine = "ane".to_string();
         unloaded_spec.task = "embed".to_string();
         unloaded_spec.max_tokens = 256;
 
@@ -18983,7 +19076,7 @@ mod tests {
             unloaded_row.get("dims").is_none(),
             "unloaded lane must omit unknown dims"
         );
-        assert_eq!(unloaded_row["device_class"], "cpu");
+        assert_eq!(unloaded_row["device_class"], "ane");
         assert_eq!(unloaded_row["certified"], false);
     }
 
@@ -19487,7 +19580,7 @@ mod tests {
                         "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
                     }
                 },
-                "engine": "ort"
+                "engine": "owned-metal"
             }),
         )
         .await;
@@ -19663,4 +19756,844 @@ mod routing_identity_dump_tests {
             serde_json::to_string_pretty(&identities).expect("identity tuples serialize")
         );
     }
+
+    fn isolated_catalog_state(label: &str, runnable: bool) -> (PathBuf, Arc<ModuleState>) {
+        let (root,descriptor) = test_storage_descriptor(label);
+        let store = Arc::new(SynapseStore::open(&descriptor).unwrap());
+        let profile = test_machine_profile("catalog-test-os");
+        store.observe_profile(&profile,1,1).unwrap();
+        let mut state = test_module_state(store,profile);
+        let inner = Arc::get_mut(&mut state).unwrap();
+        inner.model_cache = Arc::new(ModelCache::new(root.join("cache")));
+        let runtime = Arc::get_mut(&mut inner.runtime).unwrap();
+        runtime.catalog.lock().unwrap().clear();
+        runtime.runnable_backends = if runnable { BTreeSet::from(["metal".into()]) } else { BTreeSet::new() };
+        (root,state)
+    }
+
+    #[test]
+    fn catalog_endpoint_and_asset_guards_reject_unpinned_network_io() {
+        for value in ["https://example.org/a","https://example.org?x=1","https://user@example.org","file:///tmp/models","https://example.org#fragment"] {
+            assert!(validate_hf_endpoint(value).is_err(),"accepted {value}");
+        }
+        assert!(validate_hf_endpoint("http://127.0.0.1:1234").is_ok());
+        let sha = "a".repeat(64);
+        assert!(validate_resolved_asset("https://elsewhere.org/model",None,"https://huggingface.co").is_err());
+        assert!(validate_resolved_asset("https://huggingface.co/repo/resolve/main/model",Some(&sha),"https://huggingface.co").is_err());
+        assert!(validate_resolved_asset("http://127.0.0.1:1234/repo/resolve/main/model",Some(&sha),"http://127.0.0.1:1234").is_err());
+        assert!(validate_resolved_asset("https://cdn.example.org/body",Some(&sha),"https://huggingface.co").is_ok());
+        assert!(validate_resolved_asset("file:///tmp/model",None,"https://huggingface.co").is_ok());
+        let url = huggingface_resolve_url("http://127.0.0.1:1234","owner/repo",&"a".repeat(40),"dir/a b.json").unwrap();
+        assert_eq!(url,format!("http://127.0.0.1:1234/owner/repo/resolve/{}/dir/a%20b.json","a".repeat(40)));
+        assert!(huggingface_resolve_url("https://huggingface.co","owner/repo","main","model").is_err());
+    }
+
+    #[test]
+    fn model_load_uses_each_resolved_asset_scheme_for_digest_guards() {
+        let mut params: ModelLoadParams = serde_json::from_value(json!({"source":"file","path":"/tmp","engine":"owned-metal","task":"embed","files":{"model":{"url":"https://cdn.example.org/model"},"tokenizer":"tokenizer.json"}})).unwrap();
+        assert!(resolve_model_load_sources(&params).is_err());
+        params.expected_digest = Some("a".repeat(64));
+        assert!(resolve_model_load_sources(&params).is_ok());
+        params.engine = "ort".into();
+        assert!(validate_model_load_request(&params).is_err());
+        params.engine = "llama".into();
+        assert!(validate_model_load_request(&params).is_err());
+    }
+
+    #[tokio::test]
+    async fn catalog_default_resolution_refuses_before_loading_and_ignores_knobs() {
+        let (root,state) = isolated_catalog_state("default-resolution",true);
+        let not_installed = resolve_serving_model(state.clone(),None,ModelTask::Embed,None,None,None).await.err().unwrap();
+        assert_eq!(not_installed.code,"model_not_installed");
+        assert_eq!(not_installed.details.unwrap()["catalog_id"],"gte-modernbert-base");
+        let mismatch = resolve_serving_model(state.clone(),Some("gte-modernbert-base"),ModelTask::Rerank,None,None,None).await.err().unwrap();
+        assert_eq!(mismatch.code,"invalid_request");
+        let fingerprint = resolve_serving_model(state.clone(),Some("gte-modernbert-base"),ModelTask::Embed,Some(&"0".repeat(64)),None,None).await.err().unwrap();
+        assert_eq!(fingerprint.code,"substitution_rejected");
+        let unknown = resolve_serving_model(state.clone(),Some("gte-modernbert-base-ane"),ModelTask::Embed,None,None,None).await.err().unwrap();
+        assert_eq!(unknown.code,"unknown_model");
+        assert!(state.runtime.catalog.lock().unwrap().is_empty());
+        drop(state); fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn catalog_no_accelerator_lists_every_entry_and_refuses_downloads() {
+        let (root,state) = isolated_catalog_state("no-accelerator",false);
+        let result = response_result(models_catalog(state.clone(),json!({})).await,"models.catalog");
+        assert_eq!(result["models"].as_array().unwrap().len(),4);
+        for row in result["models"].as_array().unwrap() { assert_eq!(row["download_bytes"],0); assert_eq!(row["install_state"],"not_installed"); }
+        let result = response_result(models_download(state.clone(),json!({"catalog_id":"gte-modernbert-base"})).await,"models.download");
+        assert_eq!(result["error"]["code"],"backend_unavailable");
+        let result = response_result(models_download(state.clone(),json!({"catalog_id":"gte-modernbert-base-ane"})).await,"models.download");
+        assert_eq!(result["error"]["code"],"invalid_request");
+        let result = response_result(models_remove(state.clone(),json!({"catalog_id":"minilm"})).await,"models.remove");
+        assert_eq!(result["error"]["code"],"unknown_model");
+        let result = response_result(model_load(state.clone(),json!({"source":"file","path":"/missing","engine":"owned-metal","model_id":"gte-modernbert-base-ane","files":{"model":"m","tokenizer":"t"}})).await,"model.load");
+        assert_eq!(result["error"]["code"],"invalid_request");
+        drop(state); fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn catalog_self_check_generation_fences_late_completion_and_projects_mirrors() {
+        let (root,state) = isolated_catalog_state("self-check-generation",true);
+        let entry = state.runtime.release_catalog.entry("gte-modernbert-base").unwrap();
+        let backend = &entry.backends[0];
+        let (id,key) = catalog_self_check_key(&state,entry,backend).unwrap();
+        let first = catalog_check_generation(&state,&id,&key).unwrap();
+        assert!(catalog_complete_check(&state,&id,first,"pending",None).unwrap());
+        assert!(!catalog_complete_check(&state,&id,first,"passed",None).unwrap());
+        let second = catalog_check_generation(&state,&id,&key).unwrap();
+        assert!(second > first);
+        assert!(catalog_complete_check(&state,&id,second,"failed",Some("numerical_mismatch")).unwrap());
+        let mut row = json!({"model_id":"gte-modernbert-base-metal"});
+        catalog_list_row(&state,&mut row).unwrap();
+        assert_eq!(row["certified"],false);
+        assert_eq!(row["serving_admission"],"disabled");
+        assert_eq!(row["serving_admission_reason"],"self_check_failed");
+        assert_eq!(row["self_check"]["reason"],"numerical_mismatch");
+        assert!(row["self_check"]["checked_at_ms"].as_u64().is_some());
+        drop(state); fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn catalog_download_streams_pinned_files_commits_and_reuses_without_network() {
+        use tokio::io::{AsyncReadExt,AsyncWriteExt};
+        let (root,mut state) = isolated_catalog_state("download-stream",true);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}",listener.local_addr().unwrap());
+        let body = b"catalog fixture bytes";
+        let revision = "a".repeat(40);
+        let runtime = Arc::get_mut(&mut Arc::get_mut(&mut state).unwrap().runtime).unwrap();
+        runtime.hf_endpoint = endpoint;
+        let entry = runtime.release_catalog.models.iter_mut().find(|e| e.id == "gte-modernbert-base").unwrap();
+        entry.upstream.revision = revision.clone();
+        for file in &mut entry.files { file.sha256 = sha256_hex(body); file.size_bytes = body.len() as u64; }
+        let requests = Arc::new(AtomicU64::new(0)); let seen = requests.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream,_) = listener.accept().await.unwrap();
+                let mut buffer = [0u8;4096]; let size = stream.read(&mut buffer).await.unwrap();
+                let request = String::from_utf8_lossy(&buffer[..size]);
+                assert!(request.contains(&format!("/resolve/{revision}/")),"{request}");
+                seen.fetch_add(1,Ordering::SeqCst);
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len()).as_bytes()).await.unwrap();
+                stream.write_all(body).await.unwrap();
+            }
+        });
+        let accepted = response_result(models_download(state.clone(),json!({"catalog_id":"gte-modernbert-base","request_key":"first"})).await,"models.download");
+        assert_eq!(accepted["state"],"queued");
+        let job = accepted["job_id"].as_str().unwrap();
+        let deadline = tokio::time::Instant::now()+Duration::from_secs(5);
+        loop {
+            let record = state.store.get_job(job).unwrap().unwrap();
+            if !store::is_download_non_terminal(&record.state) { assert_eq!(record.state,"committed","{record:?}"); break; }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(requests.load(Ordering::SeqCst),1);
+        let same = response_result(models_download(state.clone(),json!({"catalog_id":"gte-modernbert-base","request_key":"first"})).await,"models.download");
+        assert_eq!(same["job_id"],job); assert_eq!(same["state"],"committed");
+        let status = response_result(model_status(state.clone(),json!({"job_id":job})).await,"model.status");
+        assert_eq!(status,json!({"job_id":job,"state":"committed","kind":"models.download"}));
+        let removed = response_result(models_remove(state.clone(),json!({"catalog_id":"gte-modernbert-base"})).await,"models.remove");
+        assert_eq!(removed["freed_bytes"],body.len() as u64);
+        assert_eq!(removed["removed_manifests"].as_array().unwrap().len(),1);
+        assert_eq!(requests.load(Ordering::SeqCst),1);
+        server.abort(); drop(state); fs::remove_dir_all(root).unwrap();
+    }
+}
+
+// Compiled release entries require a complete install and their own numerical
+// self-check. User-registered models' probe results and performance preferences
+// cannot authorize a different backend for a compiled release entry.
+fn default_hf_endpoint() -> String { "https://huggingface.co".into() }
+fn pinned_revision(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+fn validate_hf_endpoint(endpoint: &str) -> Result<(), String> {
+    let url = Url::parse(endpoint).map_err(|e| format!("hf_endpoint: {e}"))?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none()
+        || !matches!(url.path(), "" | "/") || url.query().is_some() || url.fragment().is_some()
+        || !url.username().is_empty() || url.password().is_some() {
+        return Err("hf_endpoint must be an absolute HTTP(S) origin without path, query or userinfo".into());
+    }
+    Ok(())
+}
+fn validate_resolved_asset(source: &str, digest: Option<&str>, endpoint: &str) -> Result<(), String> {
+    let Ok(url) = Url::parse(source) else { return Ok(()); };
+    if !matches!(url.scheme(), "http" | "https") { return Ok(()); }
+    if !digest.is_some_and(|d| {
+        let d = d.strip_prefix("sha256:").unwrap_or(d);
+        d.len() == 64 && d.bytes().all(|b| b.is_ascii_hexdigit())
+    }) { return Err("every HTTP(S) asset requires a sha256 digest".into()); }
+    let configured = Url::parse(endpoint).map_err(|e| e.to_string())?;
+    let same_origin = |other: &Url| url.host_str() == other.host_str()
+        && url.port_or_known_default() == other.port_or_known_default();
+    if url.host_str() == Some("huggingface.co") && url.port_or_known_default() == Some(443)
+        || same_origin(&configured) {
+        let segments = url.path_segments().ok_or("invalid Hugging Face URL")?.collect::<Vec<_>>();
+        if !segments.windows(2).any(|pair| pair[0] == "resolve" && pinned_revision(pair[1])) {
+            return Err("Hugging Face resolve URLs require a pinned 40-hex revision".into());
+        }
+    }
+    Ok(())
+}
+fn runtime_release_catalog() -> Result<catalog::Catalog, ModuleError> {
+    #[cfg(feature = "test-support")]
+    if let Ok(path) = env::var("SYNAPSE_TEST_CATALOG") {
+        let text = fs::read_to_string(path).map_err(|e| ModuleError::Config(format!("test catalog: {e}")))?;
+        return catalog::load_schema_valid(&text).map_err(|e| ModuleError::Config(e.to_string()));
+    }
+    catalog::compiled_catalog().cloned().map_err(|e| ModuleError::Config(e.to_string()))
+}
+fn detected_catalog_backends() -> BTreeSet<String> {
+    #[cfg(feature = "test-support")]
+    if let Ok(value) = env::var("SYNAPSE_TEST_RUNNABLE_BACKENDS") {
+        return value.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect();
+    }
+    let mut backends = BTreeSet::new();
+    #[cfg(target_os = "macos")]
+    if metal::Device::system_default().is_some() { backends.insert("metal".into()); }
+    backends
+}
+fn catalog_backend_reason(runtime: &RuntimeState, backend: &str) -> Option<&'static str> {
+    if runtime.runnable_backends.contains(backend) { None }
+    else if !cfg!(target_os = "macos") && matches!(backend, "metal" | "ane") { Some("not_supported_on_platform") }
+    else if backend == "metal" { Some("device_missing") }
+    else { Some("worker_missing") }
+}
+fn catalog_wire_error(code: &str, details: Value, message: impl Into<String>) -> WireOperationError {
+    let stable_code: synapse_core::StableErrorCode = serde_json::from_value(json!(code)).expect("known stable code");
+    let mut error = WireOperationError::from_stable(StableError::new(stable_code, if code == "download_failed" { ErrorClass::Transient } else { ErrorClass::Permanent }, if code == "download_failed" { Some(1000) } else { None }, code == "download_failed"), message);
+    error.details = Some(details);
+    error
+}
+fn catalog_store_error(error: impl std::fmt::Display) -> WireOperationError {
+    WireOperationError { code:"store_failure".into(),class:ErrorClass::Transient,retry_after_ms:Some(250),safe_to_retry_same_request:true,message:error.to_string(),details:None }
+}
+fn catalog_unknown(id: &str) -> WireOperationError {
+    catalog_wire_error("unknown_model", json!({"model_id":id}), format!("unknown model '{id}'"))
+}
+fn catalog_request_digest(entry: &catalog::CatalogEntry) -> String {
+    sha256_hex(catalog::jcs(&json!({"catalog_id":entry.id,"manifest_digest":entry.manifest_digest()})).expect("integer manifest").as_bytes())
+}
+fn catalog_entry_for_management<'a>(runtime: &'a RuntimeState, id: &str) -> Result<&'a catalog::CatalogEntry, WireOperationError> {
+    if let Some((entry, Some(_))) = runtime.release_catalog.resolve_reserved(id) {
+        return Err(catalog_wire_error("invalid_request", json!({"model_id":id,"catalog_id":entry.id}), "use a catalog id, not a derived lane id"));
+    }
+    runtime.release_catalog.entry(id).ok_or_else(|| catalog_unknown(id))
+}
+fn catalog_lane_lock(runtime: &RuntimeState, id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    runtime.catalog_locks.lock().expect("catalog lock map").entry(id.into()).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone()
+}
+fn download_publish_lock(runtime: &RuntimeState, id: &str) -> Arc<Mutex<()>> {
+    runtime.download_locks.lock().expect("download lock map").entry(id.into()).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
+}
+struct CatalogCache<'a>(&'a ModelCache);
+impl store::CatalogBlobCache for CatalogCache<'_> {
+    fn blob_size(&self, digest: &str) -> std::io::Result<Option<u64>> {
+        match fs::metadata(self.0.blob_path(digest)) { Ok(m) => Ok(Some(m.len())), Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None), Err(e) => Err(e) }
+    }
+    fn is_pinned(&self, digest: &str) -> std::io::Result<bool> {
+        match self.0.read_meta(digest) { Ok(m) => Ok(!m.pins.is_empty()), Err(ModelCacheError::NotFound(_)) => Ok(false), Err(e) => Err(std::io::Error::other(e.to_string())) }
+    }
+    fn remove_pins(&self, digest: &str) -> std::io::Result<()> {
+        match self.0.read_meta(digest) {
+            Ok(mut m) => { m.pins.clear(); fs::write(self.0.meta_path(digest), serde_json::to_vec(&m)?) },
+            Err(ModelCacheError::NotFound(_)) => Ok(()), Err(e) => Err(std::io::Error::other(e.to_string()))
+        }
+    }
+    fn delete_blob(&self, digest: &str) -> std::io::Result<u64> {
+        let path = self.0.blob_path(digest);
+        let bytes = self.blob_size(digest)?.unwrap_or(0);
+        let packages = synapse_engine_owned::remove_compiled_packages(self.0.root(), &path);
+        remove_catalog_file(&path)?;
+        remove_catalog_file(&self.0.meta_path(digest))?;
+        Ok(bytes.saturating_add(packages))
+    }
+    fn delete_staging(&self, id: &str) -> std::io::Result<()> {
+        let path = catalog_staging(self.0, id);
+        match fs::remove_dir_all(path) { Ok(()) => Ok(()), Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()), Err(e) => Err(e) }
+    }
+}
+fn remove_catalog_file(path: &Path) -> std::io::Result<()> {
+    match fs::remove_file(path) { Ok(()) => Ok(()), Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()), Err(e) => Err(e) }
+}
+fn catalog_staging(cache: &ModelCache, id: &str) -> PathBuf { cache.root().join("catalog-staging").join(id) }
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelsCatalogParams { query: Option<String>, task: Option<String>, runnable_here: Option<bool>, installed: Option<bool> }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelsDownloadParams { catalog_id: String, request_key: Option<String> }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelsRemoveParams { catalog_id: String }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelsCancelParams { job_id: String }
+fn current_catalog_install(state: &ModuleState, entry: &catalog::CatalogEntry, backend: &str) -> Result<Option<store::CatalogInstallRecord>, WireOperationError> {
+    Ok(state.store.catalog_installs(&entry.id).map_err(catalog_store_error)?.into_iter().find(|r| r.manifest_digest == entry.manifest_digest() && r.backend == backend))
+}
+fn catalog_entry_complete(state: &ModuleState, entry: &catalog::CatalogEntry) -> Result<bool, WireOperationError> {
+    use store::CatalogBlobCache;
+    for backend in entry.backends.iter().filter(|b| state.runtime.runnable_backends.contains(&b.backend)) {
+        if current_catalog_install(state, entry, &backend.backend)?.is_none() { return Ok(false); }
+        for file in entry.backend_files(&backend.backend).values() {
+            if CatalogCache(&state.model_cache).blob_size(&file.sha256).map_err(catalog_store_error)? != Some(file.size_bytes) { return Ok(false); }
+        }
+    }
+    Ok(true)
+}
+async fn models_catalog(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
+    let params: ModelsCatalogParams = match serde_json::from_value(params) { Ok(p) => p, Err(e) => return channel_error("invalid_request", e.to_string()) };
+    let result = (|| {
+        let mut rows = Vec::new();
+        for entry in &state.runtime.release_catalog.models {
+            let query = params.query.as_deref().unwrap_or("").trim().to_lowercase();
+            if ![&entry.id, &entry.name, &entry.description].iter().any(|s| s.to_lowercase().contains(&query)) || params.task.as_deref().is_some_and(|t| t != entry.task) { continue; }
+            let runnable = entry.backends.iter().filter(|b| state.runtime.runnable_backends.contains(&b.backend)).map(|b| b.backend.as_str()).collect::<Vec<_>>();
+            if params.runnable_here.is_some_and(|r| r != !runnable.is_empty()) { continue; }
+            let installs = state.store.catalog_installs(&entry.id).map_err(catalog_store_error)?;
+            let manifest = entry.manifest_digest();
+            let installed = !runnable.is_empty() && runnable.iter().all(|b| installs.iter().any(|i| i.manifest_digest == manifest && i.backend == *b));
+            if params.installed.is_some_and(|wanted| wanted != installed) { continue; }
+            let install_state = if installed { "installed" } else if installs.iter().any(|i| i.manifest_digest != manifest) { "stale" } else { "not_installed" };
+            let mut backends = Vec::new();
+            for b in &entry.backends {
+                let installed = installs.iter().any(|i| i.manifest_digest == manifest && i.backend == b.backend);
+                let check = if installed { catalog_self_check_projection(&state, entry, b)? } else { Value::Null };
+                backends.push(json!({"backend":b.backend,"lane_id":catalog::lane_id(&entry.id,&b.backend),"fingerprint":b.fingerprint,"runnable":catalog_backend_reason(&state.runtime,&b.backend).is_none(),"reason":catalog_backend_reason(&state.runtime,&b.backend),"installed":installed,"self_check":check}));
+            }
+            rows.push(json!({"id":entry.id,"task":entry.task,"name":entry.name,"description":entry.description,"default_for_task":entry.default_for_task,"upstream":entry.upstream,"manifest_digest":manifest,"download_bytes":entry.download_bytes(&runnable),"install_state":install_state,"backends":backends}));
+        }
+        rows.sort_by(|a,b| a["id"].as_str().cmp(&b["id"].as_str()));
+        Ok::<_,WireOperationError>(json!({"catalog_revision":state.runtime.release_catalog.catalog_revision,"models":rows}))
+    })();
+    match result { Ok(v) => result_outcome(v), Err(e) => result_outcome(error_payload(&state,e)) }
+}
+fn download_status_payload(state: &ModuleState, record: &JobRecord, kind: bool) -> Value {
+    let mut value = json!({"job_id":record.job_id,"state":record.state});
+    if kind { value["kind"] = json!(store::DOWNLOAD_JOB_KIND); }
+    if record.state == "downloading" {
+        let (done,total) = state.runtime.download_bytes.lock().expect("download counters").get(&record.job_id).copied().unwrap_or_default();
+        value["bytes_done"] = json!(done); value["bytes_total"] = json!(total);
+    }
+    if record.state == "failed" { value["error"] = record.error_json.clone().unwrap_or(Value::Null); }
+    value
+}
+async fn models_download(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
+    let params: ModelsDownloadParams = match serde_json::from_value(params) { Ok(p) => p, Err(e) => return channel_error("invalid_request", e.to_string()) };
+    let admitted = (|| {
+        let _disk = state.runtime.catalog_disk.lock().expect("catalog disk lock");
+        let entry = catalog_entry_for_management(&state.runtime, &params.catalog_id)?;
+        if !entry.backends.iter().any(|b| state.runtime.runnable_backends.contains(&b.backend)) { return Err(catalog_backend_unavailable(&state,entry,None)); }
+        let request_key = params.request_key.as_deref().map(str::trim).filter(|k| !k.is_empty()).map(str::to_string).unwrap_or_else(|| format!("models.download:{}:{}",entry.id,entry.manifest_digest()));
+        state.store.admit_download_job(&store::DownloadJobRequest { request_key:&request_key, request_digest:&catalog_request_digest(entry), module_generation:state.module_generation, params_json:&json!({"catalog_id":entry.id,"manifest_digest":entry.manifest_digest()}), now_ms:now_ms(), result_retention_ttl_ms:state.runtime.jobs.result_retention_ttl_ms, entry_complete:catalog_entry_complete(&state,entry)? }).map_err(|e| match e { SynapseStoreError::IdempotencyConflict { .. } => WireOperationError::from_stable(StableError::idempotency_conflict(),e.to_string()), _ => catalog_store_error(e) })
+    })();
+    match admitted {
+        Ok(admission) => {
+            let response = download_status_payload(&state,admission.record(),false);
+            if let store::DownloadAdmission::Created(record) = admission {
+                state.runtime.admission_telemetry.record_job_minted();
+                let task_state = state.clone();
+                tokio::spawn(async move { execute_catalog_download(task_state,record).await; });
+            }
+            result_outcome(response)
+        }, Err(e) => result_outcome(error_payload(&state,e))
+    }
+}
+async fn models_download_cancel(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
+    let params: ModelsCancelParams = match serde_json::from_value(params) { Ok(p) => p, Err(e) => return channel_error("invalid_request",e.to_string()) };
+    let lock = download_publish_lock(&state.runtime,&params.job_id);
+    let _publish = lock.lock().expect("publish lock");
+    let _disk = state.runtime.catalog_disk.lock().expect("catalog disk lock");
+    match state.store.end_download_job(&params.job_id,store::DownloadEnd::Cancelled,&CatalogCache(&state.model_cache),now_ms()) {
+        Ok(store::DownloadTransition::Applied { record,.. }) => { state.runtime.admission_telemetry.record_job_failed(); result_outcome(download_status_payload(&state,&record,false)) },
+        Ok(store::DownloadTransition::Unchanged(Some(record))) => result_outcome(download_status_payload(&state,&record,false)),
+        Ok(_) => channel_error("invalid_request","unknown or expired job_id"), Err(e) => channel_error("store_failure",e.to_string())
+    }
+}
+
+fn catalog_backend_unavailable(state: &ModuleState, entry: &catalog::CatalogEntry, selected: Option<&catalog::CatalogBackend>) -> WireOperationError {
+    let backends = entry.backends.iter().filter(|b| selected.is_none_or(|s| s.backend == b.backend)).map(|b| json!({"backend":b.backend,"reason":catalog_backend_reason(&state.runtime,&b.backend)})).collect::<Vec<_>>();
+    catalog_wire_error("backend_unavailable", json!({"catalog_id":entry.id,"lane_id":selected.map(|b| catalog::lane_id(&entry.id,&b.backend)),"backends":backends}), "no selected catalog backend is runnable here")
+}
+fn catalog_artifact_error(file: &catalog::CatalogFile, actual_digest: Option<String>, actual_size: Option<u64>) -> WireOperationError {
+    catalog_wire_error("artifact_invalid",json!({"file":file.path,"expected_sha256":file.sha256,"actual_sha256":actual_digest,"expected_size":file.size_bytes,"actual_size":actual_size,"recovery_op":"models.download"}), "catalog artifact does not match the pinned manifest")
+}
+fn download_error(file: &str, reason: &str, status: Option<u16>, message: impl Into<String>) -> WireOperationError {
+    catalog_wire_error("download_failed",json!({"file":file,"reason":reason,"http_status":status}),message)
+}
+fn catalog_test_barrier(kind: &str, job: &str) {
+    #[cfg(feature = "test-support")]
+    if let Ok(root) = env::var(format!("SYNAPSE_TEST_DOWNLOAD_{}_BARRIER",kind.to_ascii_uppercase().replace('-',"_"))) {
+        let root = PathBuf::from(root);
+        let _ = fs::create_dir_all(&root);
+        let _ = fs::write(root.join(format!("{job}.ready")),b"ready");
+        while !root.join(format!("{job}.release")).exists() { std::thread::sleep(Duration::from_millis(10)); }
+    }
+    let _ = (kind,job);
+}
+fn catalog_call_fault(id: &str, call: &str) -> Result<(),WireOperationError> {
+    #[cfg(feature = "test-support")]
+    if env::var("SYNAPSE_TEST_CATALOG_FAULT_LANE").ok().as_deref() == Some(id) {
+        match env::var("SYNAPSE_TEST_CATALOG_FAULT").ok().as_deref() {
+            Some(value) if value == format!("{call}:stall") => std::thread::sleep(Duration::from_secs(10)),
+            Some(value) if value == format!("{call}:crash") => return Err(WireOperationError::from_stable(StableError::engine_crashed(Some(250)),"injected catalog engine crash")),
+            _ => {}
+        }
+    }
+    let _ = (id,call);
+    Ok(())
+}
+async fn execute_catalog_download(state: Arc<ModuleState>, record: JobRecord) {
+    let result = fetch_catalog_download(&state,&record).await;
+    if let Err(error) = result {
+        let lock = download_publish_lock(&state.runtime,&record.job_id);
+        let _publish = lock.lock().expect("publish lock");
+        let _disk = state.runtime.catalog_disk.lock().expect("catalog disk lock");
+        let value = serde_json::to_value(error).expect("wire error");
+        match state.store.end_download_job(&record.job_id,store::DownloadEnd::Failed { error_json:&value },&CatalogCache(&state.model_cache),now_ms()) {
+            Ok(store::DownloadTransition::Applied { .. }) => state.runtime.admission_telemetry.record_job_failed(),
+            Ok(_) => {}, Err(error) => tracing::warn!(%error,"download failure transaction failed")
+        }
+    }
+}
+async fn fetch_catalog_download(state: &Arc<ModuleState>, record: &JobRecord) -> Result<(),WireOperationError> {
+    use store::CatalogBlobCache;
+    let entry = state.runtime.release_catalog.entry(record.params_json.as_ref().and_then(|p| p["catalog_id"].as_str()).unwrap_or("")).ok_or_else(|| catalog_unknown("download entry"))?.clone();
+    let manifest = entry.manifest_digest();
+    let targets = entry.backends.iter().filter(|b| state.runtime.runnable_backends.contains(&b.backend)).map(|b| b.backend.clone()).collect::<Vec<_>>();
+    let files = entry.files.iter().filter(|f| f.backends.iter().any(|b| targets.contains(b))).cloned().collect::<Vec<_>>();
+    let mut planned = BTreeSet::new();
+    let total = files.iter().filter(|f| planned.insert(f.sha256.clone()) && CatalogCache(&state.model_cache).blob_size(&f.sha256).ok().flatten() != Some(f.size_bytes)).map(|f| f.size_bytes).sum::<u64>();
+    state.runtime.download_bytes.lock().expect("download counters").insert(record.job_id.clone(),(0,total));
+    let staging = catalog_staging(&state.model_cache,&record.job_id);
+    fs::create_dir_all(&staging).map_err(|e| download_error("","storage_full",None,e.to_string()))?;
+    let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::limited(10)).build().map_err(|e| download_error("","network",None,e.to_string()))?;
+    for file in &files {
+        let lock = download_publish_lock(&state.runtime,&record.job_id);
+        let reuse = {
+            let _publish = lock.lock().expect("publish lock");
+            let _disk = state.runtime.catalog_disk.lock().expect("catalog disk lock");
+            let reuse = state.store.root_reused_download_blob(&record.job_id,&file.sha256,file.size_bytes,&CatalogCache(&state.model_cache)).map_err(catalog_store_error)?;
+            if matches!(reuse,store::DownloadReuse::Absent) {
+                if let Some(size) = CatalogCache(&state.model_cache).blob_size(&file.sha256).map_err(catalog_store_error)? {
+                    let error = catalog_artifact_error(file,None,Some(size));
+                    state.store.quarantine_catalog_blob(&file.sha256,&serde_json::to_value(error).expect("wire error"),&CatalogCache(&state.model_cache),now_ms()).map_err(catalog_store_error)?;
+                }
+            }
+            if matches!(reuse,store::DownloadReuse::Rooted) { catalog_test_barrier("pre-publish",&record.job_id); }
+            reuse
+        };
+        match reuse { store::DownloadReuse::Stopped(_) => return Ok(()), store::DownloadReuse::Rooted => continue, store::DownloadReuse::Absent => {} }
+        if !state.store.advance_download_job(&record.job_id,"downloading",now_ms()).map_err(catalog_store_error)? { return Ok(()); }
+        let source = huggingface_resolve_url(&state.runtime.hf_endpoint,&entry.upstream.hf_repo,&entry.upstream.revision,&file.path).map_err(artifact_invalid_error)?;
+        validate_resolved_asset(&source,Some(&file.sha256),&state.runtime.hf_endpoint).map_err(artifact_invalid_error)?;
+        let mut response = tokio::time::timeout(Duration::from_secs(60),client.get(&source).send()).await.map_err(|_| download_error(&file.path,"network",None,"download idle timeout"))?.map_err(|e| download_error(&file.path,"network",None,e.to_string()))?;
+        if !response.status().is_success() { return Err(download_error(&file.path,"http_status",Some(response.status().as_u16()),"download HTTP refusal")); }
+        let path = staging.join(&file.sha256);
+        let mut output = fs::File::create(&path).map_err(|e| download_error(&file.path,"storage_full",None,e.to_string()))?;
+        let mut hasher = Sha256::new(); let mut size = 0u64;
+        loop {
+            let body = tokio::time::timeout(Duration::from_secs(60),response.chunk()).await.map_err(|_| download_error(&file.path,"network",None,"download idle timeout"))?.map_err(|e| download_error(&file.path,"network",None,e.to_string()))?;
+            let Some(body) = body else { break; };
+            if !state.store.get_job(&record.job_id).map_err(catalog_store_error)?.is_some_and(|j| store::is_download_non_terminal(&j.state)) { return Ok(()); }
+            output.write_all(&body).map_err(|e| download_error(&file.path,"storage_full",None,e.to_string()))?;
+            hasher.update(&body); size = size.saturating_add(body.len() as u64);
+            if let Some(counts) = state.runtime.download_bytes.lock().expect("download counters").get_mut(&record.job_id) { counts.0 = counts.0.saturating_add(body.len() as u64); }
+        }
+        output.sync_all().map_err(|e| download_error(&file.path,"storage_full",None,e.to_string()))?;
+        drop(output);
+        if !state.store.advance_download_job(&record.job_id,"verifying",now_ms()).map_err(catalog_store_error)? { return Ok(()); }
+        let digest = hex::encode(hasher.finalize());
+        if digest != file.sha256 || size != file.size_bytes { return Err(catalog_artifact_error(file,Some(digest),Some(size))); }
+        let _publish = lock.lock().expect("publish lock");
+        let _disk = state.runtime.catalog_disk.lock().expect("catalog disk lock");
+        match state.store.record_download_publication(&record.job_id,&file.sha256,&CatalogCache(&state.model_cache)).map_err(catalog_store_error)? {
+            store::DownloadPublication::Stopped(_) => return Ok(()),
+            store::DownloadPublication::Proceed { .. } => {
+                catalog_test_barrier("pre-publish",&record.job_id);
+                state.model_cache.ingest(ModelCacheIngest { source_url:local_file_url(&path),expected_digest:Some(file.sha256.clone()),format:if file.role == "model" { "safetensors" } else { "json" }.into(),tokenizer_path:None,pin_module_id:None }).map_err(model_cache_load_error)?;
+            }
+        }
+    }
+    catalog_test_barrier("pre-commit",&record.job_id);
+    let lock = download_publish_lock(&state.runtime,&record.job_id);
+    let _publish = lock.lock().expect("publish lock");
+    let _disk = state.runtime.catalog_disk.lock().expect("catalog disk lock");
+    let installs = targets.iter().map(|b| store::CatalogInstallRecord { catalog_id:entry.id.clone(),manifest_digest:manifest.clone(),backend:b.clone(),members:entry.backend_files(b).values().map(|f| store::CatalogInstallMember { path:f.path.clone(),digest:f.sha256.clone() }).collect() }).collect::<Vec<_>>();
+    if let store::DownloadTransition::Applied { .. } = state.store.commit_download_job(&record.job_id,&installs,now_ms()).map_err(catalog_store_error)? {
+        state.runtime.admission_telemetry.record_job_completed();
+        CatalogCache(&state.model_cache).delete_staging(&record.job_id).map_err(catalog_store_error)?;
+        sync_installed_catalog_slots(state)?;
+    }
+    Ok(())
+}
+
+fn catalog_blob_referenced(tx: &rusqlite::Transaction<'_>, digest: &str) -> rusqlite::Result<bool> {
+    let roots: i64 = tx.query_row("SELECT (SELECT COUNT(*) FROM catalog_install_members WHERE digest=?1) + (SELECT COUNT(*) FROM download_acquisitions WHERE digest=?1)", [digest], |r| r.get(0))?;
+    if roots > 0 { return Ok(true); }
+    let mut query = tx.prepare("SELECT config_json FROM models")?;
+    let configs = query.query_map([],|r| r.get::<_,Vec<u8>>(0))?;
+    for config in configs {
+        let value: Value = serde_json::from_slice(&config?).unwrap_or(Value::Null);
+        fn contains(value: &Value, digest: &str) -> bool {
+            match value { Value::String(s) => s.strip_prefix("sha256:").unwrap_or(s) == digest, Value::Array(a) => a.iter().any(|v| contains(v,digest)), Value::Object(o) => o.values().any(|v| contains(v,digest)), _ => false }
+        }
+        if contains(&value,digest) { return Ok(true); }
+    }
+    Ok(false)
+}
+fn catalog_holders(state: &ModuleState, entry: &catalog::CatalogEntry) -> Result<Vec<Value>,WireOperationError> {
+    let mut holders = Vec::new();
+    for backend in &entry.backends {
+        let id = catalog::lane_id(&entry.id,&backend.backend);
+        if let Some(slot) = model_slot_snapshot(&state.runtime,&id) {
+            if slot.loaded.is_some() { holders.push(json!({"kind":"loaded","model_id":id})); }
+            if matches!(slot.state,ModelRuntimeState::Loading | ModelRuntimeState::Resolving | ModelRuntimeState::Validating) { holders.push(json!({"kind":"job","job_id":format!("catalog-load:{id}")})); }
+        }
+        if let Some(check_id) = state.runtime.self_check_holders.lock().expect("self-check holders").get(&id) { holders.push(json!({"kind":"self_check","check_id":check_id})); }
+    }
+    if let Some(job) = state.store.active_download_job(&catalog_request_digest(entry)).map_err(catalog_store_error)? { holders.push(json!({"kind":"job","job_id":job.job_id})); }
+    for (job,id) in state.runtime.catalog_jobs.lock().expect("catalog jobs").iter() { if id == &entry.id { holders.push(json!({"kind":"job","job_id":job})); } }
+    Ok(holders)
+}
+async fn models_remove(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
+    use store::CatalogBlobCache;
+    let params: ModelsRemoveParams = match serde_json::from_value(params) { Ok(p) => p, Err(e) => return channel_error("invalid_request",e.to_string()) };
+    let result = (|| {
+        let _disk = state.runtime.catalog_disk.lock().expect("catalog disk lock");
+        let entry = catalog_entry_for_management(&state.runtime,&params.catalog_id)?;
+        let holders = catalog_holders(&state,entry)?;
+        if !holders.is_empty() { return Err(catalog_wire_error("model_in_use",json!({"catalog_id":entry.id,"holders":holders}),"catalog model is in use")); }
+        let installs = state.store.catalog_installs(&entry.id).map_err(catalog_store_error)?;
+        let manifests = installs.iter().map(|i| i.manifest_digest.clone()).collect::<BTreeSet<_>>();
+        let freed = state.store.store.with_conn_fenced(|tx| {
+            let mut q = tx.prepare("SELECT DISTINCT digest FROM catalog_install_members WHERE catalog_id=?1")?;
+            let digests = q.query_map([&entry.id],|r| r.get::<_,String>(0))?.collect::<Result<Vec<_>,_>>()?;
+            drop(q);
+            tx.execute("DELETE FROM catalog_install_members WHERE catalog_id=?1",[&entry.id])?;
+            tx.execute("DELETE FROM catalog_installs WHERE catalog_id=?1",[&entry.id])?;
+            tx.execute("DELETE FROM catalog_self_checks WHERE catalog_id=?1",[&entry.id])?;
+            let mut freed = 0u64;
+            for digest in digests {
+                if !catalog_blob_referenced(tx,&digest)? && !CatalogCache(&state.model_cache).is_pinned(&digest).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))? {
+                    freed = freed.saturating_add(CatalogCache(&state.model_cache).delete_blob(&digest).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?);
+                }
+            }
+            Ok(freed)
+        }).map_err(catalog_store_error)?;
+        let mut slots = state.runtime.catalog.lock().expect("runtime catalog");
+        for b in &entry.backends { slots.remove(&catalog::lane_id(&entry.id,&b.backend)); }
+        Ok(json!({"catalog_id":entry.id,"removed_manifests":manifests,"freed_bytes":freed}))
+    })();
+    match result { Ok(v) => result_outcome(v), Err(e) => result_outcome(error_payload(&state,e)) }
+}
+fn catalog_lane_spec(state: &ModuleState, entry: &catalog::CatalogEntry, backend: &catalog::CatalogBackend, verify: bool) -> Result<StoredModelConfig,WireOperationError> {
+    let files = entry.backend_files(&backend.backend);
+    let model = files["model"];
+    let tokenizer = files["tokenizer"];
+    let max_tokens = backend.max_tokens.expect("validated max_tokens") as usize;
+    let tokenizer_path = state.model_cache.blob_path(&tokenizer.sha256);
+    let sanitized_digest = if verify { format!("sha256:{}",SanitizedTokenizer::from_file(&tokenizer_path,TokenizerConfig { max_tokens }).map_err(|e| artifact_invalid_error(e.to_string()))?.sanitized_sha256()) } else { format!("sha256:{}", "0".repeat(64)) };
+    let owned = OwnedCatalogConfig {
+        family: OwnedFamily::parse(backend.family.as_deref().expect("validated family")).map_err(|e| artifact_invalid_error(e.to_string()))?,
+        dtype: OwnedDType::parse(backend.dtype.as_deref().expect("validated dtype")).map_err(|e| artifact_invalid_error(e.to_string()))?,
+        execution: backend.execution.clone().expect("validated execution"),
+        attention_units: backend.attention_units.expect("validated attention units") as usize,
+        config_locator:files.get("config").map(|f| ModelAssetLocator::CacheDigest { digest:format!("sha256:{}",f.sha256) }),
+        extra_locators:Vec::new(), identity_override:None,
+    };
+    let roles = files.iter().map(|(role,file)| (role.to_string(),format!("sha256:{}",file.sha256))).collect::<Vec<_>>();
+    let digest = format!("sha256:{}",sha256_hex(&serde_json::to_vec(&roles).expect("role digests")));
+    // Test catalogs can exercise backend selection without non-Metal hardware.
+    // Each declared backend still has its own files and invocation mutex.
+    build_stored_model_config(catalog::lane_id(&entry.id,&backend.backend),"owned-metal",parse_model_task(Some(&entry.task),"owned-metal",&entry.id).map_err(|e| artifact_invalid_error(e.to_string()))?,digest,"safetensors".into(),sanitized_digest,ModelAssetLocator::CacheDigest { digest:format!("sha256:{}",model.sha256) },ModelAssetLocator::CacheDigest { digest:format!("sha256:{}",tokenizer.sha256) },local_file_url(&state.model_cache.blob_path(&model.sha256)),local_file_url(&tokenizer_path),parse_pooling(backend.pooling.as_deref().unwrap_or("cls")).map_err(|e| artifact_invalid_error(e.to_string()))?,backend.normalize.unwrap_or(false),max_tokens,backend.dtype.clone().expect("validated dtype"),false,None,None,Vec::new(),Some(owned),&InlineConfig::default(),&JobConfig::default()).map_err(|e| artifact_invalid_error(e.to_string()))
+}
+fn sync_installed_catalog_slots(state: &ModuleState) -> Result<(),WireOperationError> {
+    for entry in &state.runtime.release_catalog.models {
+        for backend in &entry.backends {
+            if !state.runtime.runnable_backends.contains(&backend.backend) || current_catalog_install(state,entry,&backend.backend)?.is_none() { continue; }
+            let id = catalog::lane_id(&entry.id,&backend.backend);
+            if model_slot_snapshot(&state.runtime,&id).is_some() { continue; }
+            let mut spec = catalog_lane_spec(state,entry,backend,false)?;
+            // Unloaded rows expose the fingerprint declared by the catalog backend.
+            // Loading recomputes it from verified artifact and tokenizer bytes and
+            // rejects a different value before invoking the engine.
+            spec.fingerprint = Fingerprint(backend.fingerprint.clone());
+            register_runtime_catalog_model(&state.runtime,spec)?;
+        }
+    }
+    Ok(())
+}
+fn catalog_self_check_key(state: &ModuleState, entry: &catalog::CatalogEntry, backend: &catalog::CatalogBackend) -> Result<(String,Value),WireOperationError> {
+    let mut identity = owned_engine_identity(OwnedFamily::parse(backend.family.as_deref().expect("family")).map_err(|e| artifact_invalid_error(e.to_string()))?,OwnedDType::parse(backend.dtype.as_deref().expect("dtype")).map_err(|e| artifact_invalid_error(e.to_string()))?);
+    #[cfg(feature = "test-support")]
+    if let Ok(version) = env::var("SYNAPSE_TEST_ENGINE_IDENTITY") { identity.version = version; }
+    let key = json!({"catalog_id":entry.id,"manifest_digest":entry.manifest_digest(),"backend":backend.backend,"fingerprint":backend.fingerprint,"engine_identity":identity,"os_build":state.machine_profile.os_build,"fixture_revision":entry.self_check.as_ref().expect("self-check").fixture_revision.to_string()});
+    let id = sha256_hex(catalog::jcs(&key).map_err(catalog_store_error)?.as_bytes());
+    Ok((id,key))
+}
+fn catalog_self_check_projection(state: &ModuleState, entry: &catalog::CatalogEntry, backend: &catalog::CatalogBackend) -> Result<Value,WireOperationError> {
+    use rusqlite::OptionalExtension;
+    let (id,_) = catalog_self_check_key(state,entry,backend)?;
+    let row = state.store.store.with_conn(|conn| conn.query_row("SELECT state, checked_at_ms, reason FROM catalog_self_checks WHERE check_id=?1",[&id],|r| Ok((r.get::<_,String>(0)?,r.get::<_,Option<u64>>(1)?,r.get::<_,Option<String>>(2)?))).optional()).map_err(catalog_store_error)?;
+    let (status,checked,reason) = row.unwrap_or(("pending".into(),None,None));
+    Ok(json!({"state":status,"checked_at_ms":checked,"reason":reason}))
+}
+fn catalog_self_check_failed(entry: &catalog::CatalogEntry, backend: &catalog::CatalogBackend, check_id: &str, reason: &Value) -> WireOperationError {
+    catalog_wire_error("self_check_failed",json!({"model_id":catalog::lane_id(&entry.id,&backend.backend),"backend":backend.backend,"check_id":check_id,"reason":reason}),"catalog numerical self-check failed")
+}
+fn catalog_check_generation(state: &ModuleState, id: &str, key: &Value) -> Result<u64,WireOperationError> {
+    state.store.store.with_conn_fenced(|tx| {
+        tx.execute("UPDATE self_check_run_seq SET value=value+1 WHERE id=0",[])?;
+        let generation: u64 = tx.query_row("SELECT value FROM self_check_run_seq WHERE id=0",[],|r| r.get(0))?;
+        tx.execute("INSERT INTO catalog_self_checks (check_id,catalog_id,manifest_digest,backend,fingerprint,engine_identity_json,os_build,fixture_revision,state,generation,checked_at_ms,reason) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'running',?9,NULL,NULL) ON CONFLICT(check_id) DO UPDATE SET state='running',generation=excluded.generation,checked_at_ms=NULL,reason=NULL",rusqlite::params![id,key["catalog_id"].as_str(),key["manifest_digest"].as_str(),key["backend"].as_str(),key["fingerprint"].as_str(),key["engine_identity"].to_string(),key["os_build"].as_str(),key["fixture_revision"].as_str(),generation])?;
+        Ok(generation)
+    }).map_err(catalog_store_error)
+}
+fn catalog_complete_check(state: &ModuleState, id: &str, generation: u64, status: &str, reason: Option<&str>) -> Result<bool,WireOperationError> {
+    state.store.store.with_conn_fenced(|tx| {
+        if status == "pending" {
+            tx.execute("UPDATE self_check_run_seq SET value=value+1 WHERE id=0",[])?;
+            Ok(tx.execute("UPDATE catalog_self_checks SET state='pending',generation=(SELECT value FROM self_check_run_seq WHERE id=0),checked_at_ms=NULL,reason=NULL WHERE check_id=?1 AND state='running' AND generation=?2",rusqlite::params![id,generation])? > 0)
+        } else {
+            Ok(tx.execute("UPDATE catalog_self_checks SET state=?3,checked_at_ms=?4,reason=?5 WHERE check_id=?1 AND state='running' AND generation=?2",rusqlite::params![id,generation,status,now_ms(),reason])? > 0)
+        }
+    }).map_err(catalog_store_error)
+}
+fn numerical_catalog_check(model: &EmbeddingModel, entry: &catalog::CatalogEntry, backend: &catalog::CatalogBackend) -> Result<(bool,f64,f64),WireOperationError> {
+    catalog_call_fault(&model.model_id,"self_check")?;
+    let EmbedBackend::Owned(engine) = &model.backend else { return Err(artifact_invalid_error("catalog self-check requires an owned engine")); };
+    let engine = engine.lock().map_err(|_| transient_model_load_error("owned engine mutex poisoned"))?;
+    let check = entry.self_check.as_ref().expect("self-check");
+    if entry.task == "embed" {
+        let texts = check.inputs.iter().map(|i| match i { catalog::SelfCheckInput::Text(s) => s.as_str(), _ => unreachable!() }).collect::<Vec<_>>();
+        let mut tokenized = model.tokenizer.tokenize_batch(texts).map_err(|e| artifact_invalid_error(e.to_string()))?;
+        apply_owned_tokenizer_policy(model,&mut tokenized);
+        let vectors = engine.embed_batch(&model.loaded_model,tokenized.batch).map_err(engine_error_to_wire)?;
+        let references = check.reference.vectors.as_ref().expect("embed references");
+        let shape = vectors.len() == 8 && vectors.iter().all(|v| v.len() == backend.dims.expect("dims") as usize && v.iter().all(|x| x.is_finite()));
+        let min = if shape { vectors.iter().zip(references).map(|(v,r)| cosine(v,r)).fold(1.0f64,f64::min) } else { -1.0 };
+        Ok((shape && min.is_finite() && min >= 0.999,min,0.999))
+    } else {
+        let tolerance = backend.rerank_abs_tolerance.expect("tolerance");
+        let mut max = 0.0f64; let mut passed = true;
+        for (input,reference) in check.inputs.iter().zip(check.reference.scores.as_ref().expect("rerank references")) {
+            let catalog::SelfCheckInput::Rerank(input) = input else { unreachable!() };
+            let pairs = owned_rerank_pairs(model,&input.query,&input.candidates)?.expect("owned pairs");
+            let raw = engine.rerank_pairs(&model.loaded_model,pairs).map_err(engine_error_to_wire)?;
+            let scores = raw.scores.iter().map(|x| 1.0/(1.0+(-f64::from(*x)).exp())).collect::<Vec<_>>();
+            if scores.len() != reference.len() || raw.scores.iter().any(|s| !s.is_finite()) { passed = false; continue; }
+            for (s,r) in scores.iter().zip(reference) { max = max.max((s-r).abs()); }
+            for i in 0..scores.len() { for j in i+1..scores.len() { if (reference[i]-reference[j]).abs() >= tolerance && (scores[i]-scores[j])*(reference[i]-reference[j]) < 0.0 { passed = false; } } }
+        }
+        Ok((passed && max <= tolerance,max,tolerance))
+    }
+}
+
+fn resolved_catalog_lane<'a>(runtime: &'a RuntimeState, id: &str) -> Option<(&'a catalog::CatalogEntry,&'a catalog::CatalogBackend)> {
+    let (entry,backend) = runtime.release_catalog.resolve_reserved(id)?;
+    Some((entry,entry.backend(backend?)?))
+}
+fn select_catalog_lane(state: &ModuleState, requested: Option<&str>, task: ModelTask, required: Option<&str>, target: Option<&str>) -> Result<(catalog::CatalogEntry,catalog::CatalogBackend),WireOperationError> {
+    let requested = requested.map(str::to_string).or_else(|| state.runtime.release_catalog.models.iter().find(|e| e.task == task.as_str() && e.default_for_task).map(|e| e.id.clone())).ok_or_else(|| catalog_unknown(task.as_str()))?;
+    let (entry,pinned) = state.runtime.release_catalog.resolve_reserved(&requested).ok_or_else(|| catalog_unknown(&requested))?;
+    let pinned_backend = pinned.map(|b| entry.backend(b).ok_or_else(|| catalog_unknown(&requested))).transpose()?;
+    if entry.task != task.as_str() { return Err(catalog_wire_error("invalid_request",json!({"catalog_id":entry.id,"requested_task":task.as_str(),"catalog_task":entry.task}),"catalog task does not match request")); }
+    let fingerprint = required.or(target);
+    let matched = fingerprint.map(|f| entry.backends.iter().find(|b| b.fingerprint == f));
+    if matched.is_some_and(|b| b.is_none()) || pinned_backend.is_some_and(|b| fingerprint.is_some_and(|f| f != b.fingerprint)) || required.zip(target).is_some_and(|(r,t)| r != t) {
+        return Err(catalog_wire_error("substitution_rejected",json!({"lane_id":pinned_backend.map(|b| catalog::lane_id(&entry.id,&b.backend)),"required_fingerprint":fingerprint}),"catalog fingerprints cannot be substituted"));
+    }
+    let selected = pinned_backend.or(matched.flatten()).or_else(|| entry.backends.iter().find(|b| state.runtime.runnable_backends.contains(&b.backend)));
+    let backend = selected.ok_or_else(|| catalog_backend_unavailable(&state,entry,None))?;
+    if catalog_backend_reason(&state.runtime,&backend.backend).is_some() { return Err(catalog_backend_unavailable(&state,entry,Some(backend))); }
+    if current_catalog_install(&state,entry,&backend.backend)?.is_none() {
+        let job = state.store.active_download_job(&catalog_request_digest(entry)).map_err(catalog_store_error)?;
+        return Err(catalog_wire_error("model_not_installed",json!({"catalog_id":entry.id,"lane_id":catalog::lane_id(&entry.id,&backend.backend),"download_op":"models.download","download_job_id":job.map(|j| j.job_id)}),"install this model with models.download"));
+    }
+    let check = catalog_self_check_projection(&state,entry,backend)?;
+    if check["state"] == "failed" { return Err(catalog_self_check_failed(entry,backend,&catalog_self_check_key(&state,entry,backend)?.0,&check["reason"])); }
+    Ok((entry.clone(),backend.clone()))
+}
+async fn resolve_serving_model(state: Arc<ModuleState>, requested: Option<&str>, task: ModelTask, required: Option<&str>, target: Option<&str>, deadline_ms: Option<u64>) -> Result<Arc<EmbeddingModel>,WireOperationError> {
+    if task == ModelTask::Generate || requested.is_some_and(|id| !state.runtime.release_catalog.is_reserved_id(id)) {
+        return resolve_model_for_request(state,requested,task).await;
+    }
+    let (entry,backend) = select_catalog_lane(&state,requested,task,required,target)?;
+    let lane = catalog::lane_id(&entry.id,&backend.backend);
+    let task_state = state.clone();
+    let budget = deadline_ms.unwrap_or(state.runtime.inline.deadline_ms);
+    if budget == 0 { return Err(WireOperationError::from_stable(StableError::deadline_exceeded(),"request deadline expired")); }
+    let handle = tokio::spawn(async move { ensure_catalog_lane_ready(task_state,entry,backend).await });
+    match tokio::time::timeout(Duration::from_millis(budget.min(5000)),handle).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(e)) => Err(WireOperationError::from_stable(StableError::engine_crashed(Some(250)),format!("catalog load task failed: {e}"))),
+        Err(_) if budget <= 5000 => Err(WireOperationError::from_stable(StableError::deadline_exceeded(),"catalog admission deadline expired")),
+        Err(_) => Err(WireOperationError::from_stable(StableError::model_loading(Some(250)),format!("catalog lane '{lane}' is loading")))
+    }
+}
+struct CatalogInvocation {
+    runtime: Arc<RuntimeState>,
+    lane: String,
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+}
+impl Drop for CatalogInvocation {
+    fn drop(&mut self) { self.runtime.self_check_holders.lock().expect("self-check holders").remove(&self.lane); }
+}
+async fn ensure_catalog_lane_ready(state: Arc<ModuleState>, entry: catalog::CatalogEntry, backend: catalog::CatalogBackend) -> Result<Arc<EmbeddingModel>,WireOperationError> {
+    use store::CatalogBlobCache;
+    let lane = catalog::lane_id(&entry.id,&backend.backend);
+    let guard = catalog_lane_lock(&state.runtime,&lane).lock_owned().await;
+    let (check_id,key) = catalog_self_check_key(&state,&entry,&backend)?;
+    let projection = catalog_self_check_projection(&state,&entry,&backend)?;
+    if projection["state"] == "failed" { return Err(catalog_self_check_failed(&entry,&backend,&check_id,&projection["reason"])); }
+    let model = if let Some(model) = model_slot_snapshot(&state.runtime,&lane).and_then(|s| s.loaded) { model } else {
+        {
+            let _disk = state.runtime.catalog_disk.lock().expect("catalog disk lock");
+            let install = current_catalog_install(&state,&entry,&backend.backend)?.ok_or_else(|| catalog_wire_error("model_not_installed",json!({"catalog_id":entry.id,"lane_id":lane,"download_op":"models.download","download_job_id":null}),"catalog installation disappeared"))?;
+            for file in entry.backend_files(&backend.backend).values() {
+                let member = install.members.iter().find(|m| m.path == file.path).ok_or_else(|| catalog_artifact_error(file,None,None))?;
+                let size = CatalogCache(&state.model_cache).blob_size(&member.digest).map_err(catalog_store_error)?;
+                let path = state.model_cache.blob_path(&member.digest);
+                let digest = sha256_file(&path).ok();
+                if size != Some(file.size_bytes) || digest.as_deref() != Some(member.digest.as_str()) || member.digest != file.sha256 {
+                    let error = catalog_artifact_error(file,digest,size);
+                    state.store.quarantine_catalog_blob(&member.digest,&serde_json::to_value(&error).expect("wire error"),&CatalogCache(&state.model_cache),now_ms()).map_err(catalog_store_error)?;
+                    return Err(error);
+                }
+            }
+            let spec = catalog_lane_spec(&state,&entry,&backend,true)?;
+            if spec.fingerprint.0 != backend.fingerprint {
+                return Err(catalog_wire_error("artifact_invalid",json!({"model_id":lane,"expected_fingerprint":backend.fingerprint,"actual_fingerprint":spec.fingerprint}),"catalog fingerprint differs from verified artifact parameters"));
+            }
+            if let Some(slot) = state.runtime.catalog.lock().expect("runtime catalog").get_mut(&lane) { slot.spec = spec; slot.state = ModelRuntimeState::Loading; }
+        }
+        let load_state = state.clone(); let load_lane = lane.clone();
+        // The lane guard belongs to this task, not the waiting request. A request
+        // timeout cannot allow another load while a blocking engine load runs.
+        let loaded = load_catalog_model_task(load_state,load_lane).await?;
+        loaded
+    };
+    if projection["state"] == "passed" { return Ok(model); }
+    let generation = catalog_check_generation(&state,&check_id,&key)?;
+    state.runtime.self_check_holders.lock().expect("self-check holders").insert(lane.clone(),check_id.clone());
+    let invocation = CatalogInvocation { runtime:state.runtime.clone(),lane:lane.clone(),_guard:guard };
+    let call_model = model.clone(); let call_entry = entry.clone(); let call_backend = backend.clone();
+    let handle = tokio::task::spawn_blocking(move || {
+        let _invocation = invocation;
+        let result = numerical_catalog_check(&call_model,&call_entry,&call_backend);
+        (result,_invocation)
+    });
+    match tokio::time::timeout(Duration::from_millis(2000),handle).await {
+        Ok(Ok((Ok((passed,observed,threshold)),_invocation))) => {
+            let reason = if passed { None } else { Some("numerical_mismatch") };
+            if !catalog_complete_check(&state,&check_id,generation,if passed { "passed" } else { "failed" },reason)? {
+                return Err(WireOperationError::from_stable(StableError::engine_crashed(Some(250)),"self-check generation changed"));
+            }
+            if passed { Ok(model) } else {
+                tracing::warn!(model_id=%lane,backend=%backend.backend,%check_id,observed,threshold,key=%key,"catalog numerical self-check failed");
+                Err(catalog_self_check_failed(&entry,&backend,&check_id,&json!("numerical_mismatch")))
+            }
+        },
+        other => {
+            catalog_complete_check(&state,&check_id,generation,"pending",None)?;
+            let message = match other { Err(_) => "catalog self-check exceeded 2000 ms".to_string(), Ok(Err(e)) => e.to_string(), Ok(Ok((Err(e),_invocation))) => e.message, _ => unreachable!() };
+            Err(WireOperationError::from_stable(StableError::engine_crashed(Some(250)),message))
+        }
+    }
+}
+
+fn startup_catalog_runtime(state: &ModuleState) -> Result<(),ModuleError> {
+    state.store.store.with_conn_fenced(|tx| {
+        tx.execute("UPDATE catalog_self_checks SET state='pending',checked_at_ms=NULL,reason=NULL WHERE state='running'",[])?;
+        Ok(())
+    }).map_err(|e| ModuleError::Config(e.to_string()))?;
+    let error = json!({"code":"module_restarted","class":"transient","retry_after_ms":250,"safe_to_retry_same_request":true,"message":"module restarted during download"});
+    let failed = state.store.fail_interrupted_download_jobs(state.module_generation,&error,&CatalogCache(&state.model_cache),now_ms())?;
+    state.runtime.admission_telemetry.record_jobs_inherited(failed.len() as u64);
+    state.runtime.admission_telemetry.record_jobs_failed(failed.len() as u64);
+    sync_installed_catalog_slots(state).map_err(|e| ModuleError::Config(e.message))
+}
+fn catalog_list_row(state: &ModuleState, row: &mut Value) -> Result<(),WireOperationError> {
+    let id = row["model_id"].as_str().unwrap_or("").to_string();
+    if let Some((entry,backend)) = resolved_catalog_lane(&state.runtime,&id) {
+        let check = catalog_self_check_projection(state,entry,backend)?;
+        row["certified"] = json!(check["state"] == "passed");
+        row["serving_admission"] = json!(if check["state"] == "failed" { "disabled" } else { "enabled" });
+        if check["state"] == "failed" { row["serving_admission_reason"] = json!("self_check_failed"); }
+        else { row.as_object_mut().expect("catalog row").remove("serving_admission_reason"); }
+        row["self_check"] = check;
+        row["fingerprints"] = json!([backend.fingerprint]);
+    } else if model_slot_snapshot(&state.runtime,&id).is_some_and(|s| matches!(s.spec.task.as_str(),"embed" | "rerank")) {
+        row["self_check"] = json!({"state":"not_applicable","checked_at_ms":null,"reason":null});
+    }
+    Ok(())
+}
+
+fn catalog_engine_fault(id: &str, call: &str) -> Result<(),EngineError> {
+    catalog_call_fault(id,call).map_err(|error| EngineError { stage:EngineErrorStage::Inference,risk_class:synapse_core::EngineRiskClass::AbortCapable,message:error.message,retry_after_ms:Some(250),safe_to_retry_same_request:true })
+}
+
+fn catalog_cache_roots(state: &ModuleState) -> Result<Vec<String>,SynapseStoreError> {
+    let mut roots = state.store.store.with_conn(|conn| {
+        let mut query = conn.prepare("SELECT digest FROM catalog_install_members UNION SELECT digest FROM download_acquisitions")?;
+        let roots = query.query_map([],|r| r.get::<_,String>(0))?.collect::<Result<Vec<_>,_>>()?;
+        Ok(roots)
+    })?;
+    for model in state.store.catalog_models()? {
+        for locator in std::iter::once(&model.model_locator).chain(std::iter::once(&model.tokenizer_locator)).chain(model.config_locator.iter()).chain(model.extra_locators.iter()) {
+            if let ModelAssetLocator::CacheDigest { digest } = locator { roots.push(digest.clone()); }
+        }
+    }
+    roots.sort(); roots.dedup(); Ok(roots)
+}
+
+async fn submit_catalog_embed_job(state: Arc<ModuleState>, entry: catalog::CatalogEntry, backend: catalog::CatalogBackend, params: Value) -> HandlerOutcome {
+    let Some(key) = params["request_key"].as_str().filter(|s| !s.trim().is_empty()) else { return channel_error("invalid_request","job-shaped embed.batch requires a non-empty request_key"); };
+    let digest = compute_request_digest("embed.batch",&catalog::lane_id(&entry.id,&backend.backend),None,None,&params,&[]);
+    let admission = {
+        let _disk = state.runtime.catalog_disk.lock().expect("catalog disk lock");
+        if let Err(e) = select_catalog_lane(&state,Some(&catalog::lane_id(&entry.id,&backend.backend)),ModelTask::Embed,Some(&backend.fingerprint),None) { return result_outcome(error_payload(&state,e)); }
+        match state.store.admit_job(key,&digest,"embed.batch",state.module_generation,None,&params,now_ms(),state.runtime.jobs.execution_ttl_ms,state.runtime.jobs.result_retention_ttl_ms) {
+            Ok(admission) => {
+                if matches!(admission,JobAdmission::Admitted(_)) { state.runtime.catalog_jobs.lock().expect("catalog jobs").insert(admission.record().job_id.clone(),entry.id.clone()); }
+                admission
+            },
+            Err(e @ SynapseStoreError::IdempotencyConflict { .. }) => return result_outcome(error_payload(&state,WireOperationError::from_stable(StableError::idempotency_conflict(),e.to_string()))),
+            Err(e) => return channel_error("store_failure",e.to_string())
+        }
+    };
+    let record = admission.record().clone();
+    let response = job_status_payload(&state,&record);
+    if matches!(admission,JobAdmission::Admitted(_)) {
+        state.runtime.admission_telemetry.record_job_minted();
+        tokio::spawn(async move {
+            let job = record.job_id.clone();
+            let prepared = async {
+                let budget = record.execution_expires_ms.unwrap_or(now_ms()).saturating_sub(now_ms());
+                let task_state = state.clone();
+                let loading = tokio::spawn(async move { ensure_catalog_lane_ready(task_state,entry,backend).await });
+                let model = tokio::time::timeout(Duration::from_millis(budget),loading).await.map_err(|_| WireOperationError::from_stable(StableError::deadline_exceeded(),"catalog batch execution deadline expired"))?.map_err(|e| WireOperationError::from_stable(StableError::engine_crashed(Some(250)),e.to_string()))??;
+                let parsed: EmbedBatchParams = serde_json::from_value(params).map_err(|e| artifact_invalid_error(e.to_string()))?;
+                let items = batch_items(parsed.items,parsed.texts).map_err(artifact_invalid_error)?;
+                let request_bytes = request_bytes_for_texts(items.iter().map(|i| i.text.as_str()));
+                let mut tokenized = model.tokenizer.tokenize_batch(items.iter().map(|i| i.text.as_str())).map_err(|e| artifact_invalid_error(e.to_string()))?;
+                apply_owned_tokenizer_policy(&model,&mut tokenized);
+                let total_tokens = tokenized.real_token_counts.iter().map(|n| u64::from(*n)).sum();
+                let alias_table = state.store.alias_table().map_err(catalog_store_error)?;
+                check_fingerprint_constraints(&model,&alias_table,parsed.target_fingerprint.as_deref(),parsed.required_fingerprint.as_deref(),false,parsed.required_epoch)?;
+                Ok::<_,WireOperationError>(EmbedBatchJobWork { model,request_digest:digest,ids:items.into_iter().map(|i| i.id).collect(),tokenized,alias_table,request_bytes,total_tokens })
+            }.await;
+            match prepared {
+                Ok(work) => execute_embed_batch_job(state.clone(),job.clone(),work).await,
+                Err(e) => fail_job_with_wire_error(&state,&job,e.class == ErrorClass::Transient,e)
+            }
+            state.runtime.catalog_jobs.lock().expect("catalog jobs").remove(&job);
+        });
+    }
+    result_outcome(response)
 }

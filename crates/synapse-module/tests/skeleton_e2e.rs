@@ -1053,8 +1053,10 @@ async fn job_resume_respawns_remote_job_and_pages_are_readable() {
 }
 
 #[tokio::test]
-async fn embed_query_returns_typed_probe_required_error() {
-    let (_daemon, _module, mut consumer, route) = open_route().await;
+async fn embed_query_default_catalog_returns_typed_model_not_installed_error() {
+    let daemon = start_daemon().await;
+    let module = spawn_synapse_module_with_env(&daemon.connection_file_path,None,None,&[("SYNAPSE_TEST_RUNNABLE_BACKENDS","metal")]);
+    let (_daemon,_module,mut consumer,route) = open_route_for_started_module(daemon,module).await;
     let frame = raw_route_frame(
         &mut consumer,
         route,
@@ -1069,7 +1071,9 @@ async fn embed_query_returns_typed_probe_required_error() {
     assert_eq!(frame.header.ty, FrameType::Response);
     let body: Value = serde_json::from_slice(&frame.body).expect("decode response body");
     assert_eq!(body["result"]["module_generation"].as_u64(), Some(1));
-    assert_eq!(body["result"]["error"]["code"], "probe_required");
+    assert_eq!(body["result"]["error"]["code"], "model_not_installed");
+    assert_eq!(body["result"]["error"]["details"]["catalog_id"], "gte-modernbert-base");
+    assert_eq!(body["result"]["error"]["details"]["download_op"], "models.download");
     assert_eq!(body["result"]["error"]["class"], "permanent");
     assert_eq!(
         body["result"]["error"]["safe_to_retry_same_request"],
@@ -1080,7 +1084,7 @@ async fn embed_query_returns_typed_probe_required_error() {
 #[tokio::test]
 async fn embed_query_preloaded_minilm_returns_vectors_and_envelope() {
     let Some(preloads) = minilm_preload_config() else {
-        eprintln!("skipping MiniLM embed.query e2e: local HF ONNX snapshot is missing");
+        eprintln!("skipping MiniLM embed.query e2e: local HF safetensors snapshot is missing");
         return;
     };
     let _lock = acquire_minilm_e2e_lock();
@@ -1093,7 +1097,7 @@ async fn embed_query_preloaded_minilm_returns_vectors_and_envelope() {
         4,
         serde_json::json!({
             "method": "embed.query",
-            "params": { "id": "q1", "text": "hello world" }
+            "params": { "model": "minilm", "id": "q1", "text": "hello world" }
         }),
     )
     .await;
@@ -1103,7 +1107,7 @@ async fn embed_query_preloaded_minilm_returns_vectors_and_envelope() {
         5,
         serde_json::json!({
             "method": "embed.query",
-            "params": { "id": "q2", "text": "hello world again" }
+            "params": { "model": "minilm", "id": "q2", "text": "hello world again" }
         }),
     )
     .await;
@@ -1124,14 +1128,14 @@ async fn embed_query_preloaded_minilm_returns_vectors_and_envelope() {
         result["truncation_disclosures"][0]["truncated"],
         Value::Bool(false)
     );
-    assert_eq!(result["provenance"]["engine"]["engine"], "ort");
+    assert_eq!(result["provenance"]["engine"]["engine"], "owned-metal");
     assert_eq!(result["fingerprint"], second["result"]["fingerprint"]);
 }
 
 #[tokio::test]
 async fn probe_refuses_lane_without_matching_reference_fixture() {
     let Some(preloads) = minilm_preload_config() else {
-        eprintln!("skipping missing-reference probe e2e: local HF ONNX snapshot is missing");
+        eprintln!("skipping missing-reference probe e2e: local HF safetensors snapshot is missing");
         return;
     };
     let mut models: Value = serde_json::from_str(&preloads).expect("preload config is json");
@@ -1180,8 +1184,8 @@ async fn embed_query_loaded_owned_metal_carries_distinct_provenance_and_content_
         eprintln!("skipping owned-metal MiniLM e2e: local safetensors snapshot is missing");
         return;
     };
-    let Some(ort_preloads) = minilm_preload_config() else {
-        eprintln!("skipping owned-metal cross-engine e2e: local ONNX snapshot is missing");
+    let Some(owned_preloads) = minilm_preload_config() else {
+        eprintln!("skipping owned-metal cross-dtype e2e: local safetensors snapshot is missing");
         return;
     };
     let _lock = acquire_minilm_e2e_lock();
@@ -1189,7 +1193,7 @@ async fn embed_query_loaded_owned_metal_carries_distinct_provenance_and_content_
     let cache = unique_temp_dir("synapse-owned-model-cache");
     let module = spawn_synapse_module_with_env(
         &daemon.connection_file_path,
-        Some(&ort_preloads),
+        Some(&owned_preloads),
         None,
         &[("CORTEXKIT_MODEL_CACHE", cache.to_string_lossy().as_ref())],
     );
@@ -1860,7 +1864,7 @@ async fn owned_gte_inline_embed_batch_throughput_sweep() {
 #[tokio::test]
 async fn embed_batch_preloaded_minilm_preserves_order_and_envelope() {
     let Some(preloads) = minilm_preload_config() else {
-        eprintln!("skipping MiniLM embed.batch e2e: local HF ONNX snapshot is missing");
+        eprintln!("skipping MiniLM embed.batch e2e: local HF safetensors snapshot is missing");
         return;
     };
     let _lock = acquire_minilm_e2e_lock();
@@ -1881,7 +1885,7 @@ async fn embed_batch_preloaded_minilm_preserves_order_and_envelope() {
         6,
         serde_json::json!({
             "method": "embed.batch",
-            "params": { "items": items }
+            "params": { "model": "minilm", "items": items }
         }),
     )
     .await;
@@ -1903,7 +1907,7 @@ async fn embed_batch_preloaded_minilm_preserves_order_and_envelope() {
 #[tokio::test]
 async fn over_budget_embed_batch_returns_job_and_pages_results() {
     let Some(preloads) = minilm_preload_config() else {
-        eprintln!("skipping MiniLM job-tier e2e: local HF ONNX snapshot is missing");
+        eprintln!("skipping MiniLM job-tier e2e: local HF safetensors snapshot is missing");
         return;
     };
     let preload_models: Value = serde_json::from_str(&preloads).expect("preload config is json");
@@ -1936,7 +1940,7 @@ async fn over_budget_embed_batch_returns_job_and_pages_results() {
             100 + index as u64,
             serde_json::json!({
                 "method": "embed.query",
-                "params": { "id": format!("item-{index}"), "text": text }
+                "params": { "model": "minilm", "id": format!("item-{index}"), "text": text }
             }),
         )
         .await;
@@ -1959,7 +1963,7 @@ async fn over_budget_embed_batch_returns_job_and_pages_results() {
         200,
         serde_json::json!({
             "method": "embed.batch",
-            "params": { "request_key": "job-tier-e2e", "items": items }
+            "params": { "model": "minilm", "request_key": "job-tier-e2e", "items": items }
         }),
     )
     .await;
@@ -2056,7 +2060,7 @@ async fn over_budget_embed_batch_returns_job_and_pages_results() {
 #[tokio::test]
 async fn embed_query_row_over_ceiling_reports_submitted_and_content_hashes() {
     let Some(preloads) = minilm_preload_config() else {
-        eprintln!("skipping MiniLM over-ceiling e2e: local HF ONNX snapshot is missing");
+        eprintln!("skipping MiniLM over-ceiling e2e: local HF safetensors snapshot is missing");
         return;
     };
     let _lock = acquire_minilm_e2e_lock();
@@ -2072,7 +2076,7 @@ async fn embed_query_row_over_ceiling_reports_submitted_and_content_hashes() {
         10,
         serde_json::json!({
             "method": "embed.query",
-            "params": { "id": "over-cap-query", "text": &submitted_text }
+            "params": { "model": "minilm", "id": "over-cap-query", "text": &submitted_text }
         }),
     )
     .await;
@@ -2096,7 +2100,7 @@ async fn embed_query_row_over_ceiling_reports_submitted_and_content_hashes() {
 #[tokio::test]
 async fn embed_query_row_under_ceiling_reports_equal_hashes() {
     let Some(preloads) = minilm_preload_config() else {
-        eprintln!("skipping MiniLM under-ceiling e2e: local HF ONNX snapshot is missing");
+        eprintln!("skipping MiniLM under-ceiling e2e: local HF safetensors snapshot is missing");
         return;
     };
     let _lock = acquire_minilm_e2e_lock();
@@ -2112,7 +2116,7 @@ async fn embed_query_row_under_ceiling_reports_equal_hashes() {
         11,
         serde_json::json!({
             "method": "embed.query",
-            "params": { "id": "under-cap-query", "text": submitted_text }
+            "params": { "model": "minilm", "id": "under-cap-query", "text": submitted_text }
         }),
     )
     .await;
@@ -2136,7 +2140,7 @@ async fn embed_query_row_under_ceiling_reports_equal_hashes() {
 #[tokio::test]
 async fn embed_batch_with_mixed_over_cap_and_short_rows_returns_all_vectors() {
     let Some(preloads) = minilm_preload_config() else {
-        eprintln!("skipping MiniLM mixed-batch e2e: local HF ONNX snapshot is missing");
+        eprintln!("skipping MiniLM mixed-batch e2e: local HF safetensors snapshot is missing");
         return;
     };
     let _lock = acquire_minilm_e2e_lock();
@@ -2159,7 +2163,7 @@ async fn embed_batch_with_mixed_over_cap_and_short_rows_returns_all_vectors() {
         12,
         serde_json::json!({
             "method": "embed.batch",
-            "params": { "items": items }
+            "params": { "model": "minilm", "items": items }
         }),
     )
     .await;
@@ -2200,7 +2204,7 @@ async fn embed_batch_with_mixed_over_cap_and_short_rows_returns_all_vectors() {
 #[tokio::test]
 async fn job_tier_paged_results_replays_truncated_row_from_storage() {
     let Some(preloads) = minilm_preload_config() else {
-        eprintln!("skipping MiniLM job-tier truncation e2e: local HF ONNX snapshot is missing");
+        eprintln!("skipping MiniLM job-tier truncation e2e: local HF safetensors snapshot is missing");
         return;
     };
     let preload_models: Value = serde_json::from_str(&preloads).expect("preload config is json");
@@ -2234,7 +2238,7 @@ async fn job_tier_paged_results_replays_truncated_row_from_storage() {
         500,
         serde_json::json!({
             "method": "embed.batch",
-            "params": { "request_key": "job-truncation-e2e", "items": items }
+            "params": { "model": "minilm", "request_key": "job-truncation-e2e", "items": items }
         }),
     )
     .await;
@@ -2299,7 +2303,7 @@ async fn job_tier_paged_results_replays_truncated_row_from_storage() {
 #[tokio::test]
 async fn admission_status_reports_execution_waiters_during_concurrent_batches() {
     let Some(preloads) = minilm_preload_config() else {
-        eprintln!("skipping execution admission e2e: local HF ONNX snapshot is missing");
+        eprintln!("skipping execution admission e2e: local HF safetensors snapshot is missing");
         return;
     };
     let preload_models: Value = serde_json::from_str(&preloads).expect("preload config is json");
@@ -2348,7 +2352,7 @@ async fn admission_status_reports_execution_waiters_during_concurrent_batches() 
             401,
             serde_json::json!({
                 "method": "embed.batch",
-                "params": { "items": first_items }
+                "params": { "model": "minilm", "items": first_items }
             }),
         )
         .await
@@ -2361,7 +2365,7 @@ async fn admission_status_reports_execution_waiters_during_concurrent_batches() 
             402,
             serde_json::json!({
                 "method": "embed.batch",
-                "params": { "items": second_items }
+                "params": { "model": "minilm", "items": second_items }
             }),
         )
         .await
@@ -2396,7 +2400,7 @@ async fn admission_status_reports_execution_waiters_during_concurrent_batches() 
 #[tokio::test]
 async fn alias_surface_certifies_declares_retracts_and_preserves_old_job_pages() {
     let Some(preloads) = minilm_alias_preload_config() else {
-        eprintln!("skipping MiniLM alias e2e: local HF ONNX snapshot is missing");
+        eprintln!("skipping MiniLM alias e2e: local HF safetensors snapshot is missing");
         return;
     };
     let config = serde_json::json!({
@@ -2545,7 +2549,7 @@ async fn alias_surface_certifies_declares_retracts_and_preserves_old_job_pages()
 #[tokio::test]
 async fn probe_report_exposes_blocking_reasons_perf_rows_and_default_assignments() {
     let Some(preloads) = minilm_preload_config() else {
-        eprintln!("skipping probe.report e2e: local HF ONNX snapshot is missing");
+        eprintln!("skipping probe.report e2e: local HF safetensors snapshot is missing");
         return;
     };
     let _lock = acquire_minilm_e2e_lock();
@@ -2607,9 +2611,9 @@ async fn probe_report_exposes_blocking_reasons_perf_rows_and_default_assignments
 }
 
 #[tokio::test]
-async fn quiet_knob_restart_uses_persisted_assignment() {
+async fn quiet_knob_restart_keeps_assignment_but_omitted_model_uses_catalog_default() {
     let Some(preloads) = minilm_alias_preload_config() else {
-        eprintln!("skipping knob routing e2e: local HF ONNX snapshot is missing");
+        eprintln!("skipping knob routing e2e: local HF safetensors snapshot is missing");
         return;
     };
     let config = module_config_with_preloads(preloads.clone(), "balanced");
@@ -2696,13 +2700,19 @@ async fn quiet_knob_restart_uses_persisted_assignment() {
         }),
     )
     .await;
-    assert_eq!(routed["result"]["fingerprint"], quiet_fingerprint);
+    assert_eq!(first["result"]["error"]["code"], "model_not_installed");
+    assert_eq!(first["result"]["error"]["details"]["catalog_id"], "gte-modernbert-base");
+    assert_eq!(routed["result"]["error"]["code"], "model_not_installed");
+    let explicit = route_request(&mut consumer,route,126,serde_json::json!({"method":"embed.query","params":{"model":quiet_model_id,"text":"explicit free-form selection remains available"}})).await;
+    if explicit["result"]["error"]["code"] == "model_loading" { poll_model_ready(&mut consumer,route,127,&quiet_model_id).await; }
+    let explicit = route_request(&mut consumer,route,128,serde_json::json!({"method":"embed.query","params":{"model":quiet_model_id,"text":"explicit free-form selection remains available"}})).await;
+    assert_eq!(explicit["result"]["fingerprint"], quiet_fingerprint);
 }
 
 #[tokio::test]
 async fn os_build_override_marks_probe_rows_stale_in_report_and_status() {
     let Some(preloads) = minilm_preload_config() else {
-        eprintln!("skipping stale probe e2e: local HF ONNX snapshot is missing");
+        eprintln!("skipping stale probe e2e: local HF safetensors snapshot is missing");
         return;
     };
     let _lock = acquire_minilm_e2e_lock();
@@ -2763,7 +2773,7 @@ async fn os_build_override_marks_probe_rows_stale_in_report_and_status() {
 #[tokio::test]
 async fn embed_query_deadline_one_returns_typed_rejection() {
     let Some(preloads) = minilm_preload_config() else {
-        eprintln!("skipping MiniLM deadline e2e: local HF ONNX snapshot is missing");
+        eprintln!("skipping MiniLM deadline e2e: local HF safetensors snapshot is missing");
         return;
     };
     let _lock = acquire_minilm_e2e_lock();
@@ -2776,7 +2786,7 @@ async fn embed_query_deadline_one_returns_typed_rejection() {
         7,
         serde_json::json!({
             "method": "embed.query",
-            "params": { "text": "deadline should reject", "deadline_ms": 1 }
+            "params": { "model": "minilm", "text": "deadline should reject", "deadline_ms": 1 }
         }),
     )
     .await;
@@ -2791,7 +2801,7 @@ async fn embed_query_deadline_one_returns_typed_rejection() {
 #[tokio::test]
 async fn concurrent_embed_burst_finishes_with_vectors_or_typed_rejections() {
     let Some(preloads) = minilm_preload_config() else {
-        eprintln!("skipping MiniLM burst e2e: local HF ONNX snapshot is missing");
+        eprintln!("skipping MiniLM burst e2e: local HF safetensors snapshot is missing");
         return;
     };
     let _lock = acquire_minilm_e2e_lock();
@@ -2808,7 +2818,7 @@ async fn concurrent_embed_burst_finishes_with_vectors_or_typed_rejections() {
             start_corr + offset,
             serde_json::to_vec(&serde_json::json!({
                 "method": "embed.query",
-                "params": { "id": format!("burst-{offset}"), "text": format!("burst text {offset}") }
+                "params": { "model": "minilm", "id": format!("burst-{offset}"), "text": format!("burst text {offset}") }
             }))
             .unwrap(),
         )
@@ -2840,7 +2850,7 @@ async fn concurrent_embed_burst_finishes_with_vectors_or_typed_rejections() {
 #[tokio::test]
 async fn model_load_file_source_reaches_ready_and_lazy_reload_after_unload() {
     let Some(source_dir) = copied_minilm_source_dir("synapse-model-load-file") else {
-        eprintln!("skipping model.load file e2e: local HF ONNX snapshot is missing");
+        eprintln!("skipping model.load file e2e: local HF safetensors snapshot is missing");
         return;
     };
     let _lock = acquire_minilm_e2e_lock();
@@ -2855,8 +2865,11 @@ async fn model_load_file_source_reaches_ready_and_lazy_reload_after_unload() {
             "params": {
                 "source": "file",
                 "path": source_dir,
-                "files": { "model": "model.onnx", "tokenizer": "tokenizer.json" },
-                "engine": "ort",
+                "files": { "model": "model.safetensors", "tokenizer": "tokenizer.json", "config": "config.json" },
+                "engine": "owned-metal",
+                "family": "minilm",
+                "dtype": "f32",
+                "execution": "explicit",
                 "pooling": "mean",
                 "task": "embed",
                 "model_id": "minilm-loaded",
@@ -2949,7 +2962,7 @@ async fn model_load_file_source_reaches_ready_and_lazy_reload_after_unload() {
 #[tokio::test]
 async fn model_load_digest_mismatch_fails_with_artifact_invalid() {
     let Some(source_dir) = copied_minilm_source_dir("synapse-model-load-digest-mismatch") else {
-        eprintln!("skipping model.load digest mismatch e2e: local HF ONNX snapshot is missing");
+        eprintln!("skipping model.load digest mismatch e2e: local HF safetensors snapshot is missing");
         return;
     };
     let _lock = acquire_minilm_e2e_lock();
@@ -2964,9 +2977,12 @@ async fn model_load_digest_mismatch_fails_with_artifact_invalid() {
             "params": {
                 "source": "file",
                 "path": source_dir,
-                "files": { "model": "model.onnx", "tokenizer": "tokenizer.json" },
+                "files": { "model": "model.safetensors", "tokenizer": "tokenizer.json", "config": "config.json" },
                 "expected_digest": format!("sha256:{}", "0".repeat(64)),
-                "engine": "ort",
+                "engine": "owned-metal",
+                "family": "minilm",
+                "dtype": "f32",
+                "execution": "explicit",
                 "pooling": "mean",
                 "task": "embed",
                 "request_key": "model-load-digest-mismatch"
@@ -2984,7 +3000,7 @@ async fn model_load_digest_mismatch_fails_with_artifact_invalid() {
 #[tokio::test]
 async fn model_load_restart_mid_download_marks_job_restarted_and_resubmit_succeeds() {
     let Some(source_dir) = copied_minilm_source_dir("synapse-model-load-restart") else {
-        eprintln!("skipping model.load restart e2e: local HF ONNX snapshot is missing");
+        eprintln!("skipping model.load restart e2e: local HF safetensors snapshot is missing");
         return;
     };
     let _lock = acquire_minilm_e2e_lock();
@@ -3003,8 +3019,11 @@ async fn model_load_restart_mid_download_marks_job_restarted_and_resubmit_succee
         "params": {
             "source": "file",
             "path": source_dir,
-            "files": { "model": "model.onnx", "tokenizer": "tokenizer.json" },
-            "engine": "ort",
+            "files": { "model": "model.safetensors", "tokenizer": "tokenizer.json", "config": "config.json" },
+            "engine": "owned-metal",
+                "family": "minilm",
+                "dtype": "f32",
+                "execution": "explicit",
             "pooling": "mean",
             "task": "embed",
             "request_key": "model-load-restart"
@@ -3400,16 +3419,17 @@ fn assert_vectors_close(actual: &Value, expected: &Value) {
 }
 
 fn copied_minilm_source_dir(label: &str) -> Option<PathBuf> {
-    let snapshot = minilm_onnx_snapshot()?;
-    let model_path = snapshot.join("model.onnx");
+    let snapshot = minilm_safetensors_snapshot()?;
+    let model_path = snapshot.join("model.safetensors");
     let tokenizer_path = snapshot.join("tokenizer.json");
     if !model_path.exists() || !tokenizer_path.exists() {
         return None;
     }
     let source_dir = unique_temp_dir(label);
     std::fs::create_dir_all(&source_dir).ok()?;
-    std::fs::copy(&model_path, source_dir.join("model.onnx")).ok()?;
+    std::fs::copy(&model_path, source_dir.join("model.safetensors")).ok()?;
     std::fs::copy(&tokenizer_path, source_dir.join("tokenizer.json")).ok()?;
+    std::fs::copy(snapshot.join("config.json"),source_dir.join("config.json")).ok()?;
     Some(source_dir)
 }
 
@@ -3423,8 +3443,8 @@ fn minilm_preload_config() -> Option<String> {
 }
 
 fn minilm_preload_config_with_max_tokens(max_tokens: usize) -> Option<String> {
-    let snapshot = minilm_onnx_snapshot()?;
-    let model_path = snapshot.join("model.onnx");
+    let snapshot = minilm_safetensors_snapshot()?;
+    let model_path = snapshot.join("model.safetensors");
     let tokenizer_path = snapshot.join("tokenizer.json");
     if !model_path.exists() || !tokenizer_path.exists() {
         return None;
@@ -3432,7 +3452,10 @@ fn minilm_preload_config_with_max_tokens(max_tokens: usize) -> Option<String> {
     Some(
         serde_json::json!([{
             "model_id": "minilm",
-            "engine": "ort",
+            "engine": "owned-metal",
+                "family": "minilm",
+                "dtype": "f32",
+                "execution": "explicit",
             "model_path": model_path,
             "tokenizer_path": tokenizer_path,
             "pooling": "mean",
@@ -3454,7 +3477,6 @@ fn test_sha256(path: PathBuf) -> String {
     )
 }
 
-#[cfg(target_os = "macos")]
 fn minilm_safetensors_snapshot() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("SYNAPSE_MINILM_SAFETENSORS_SNAPSHOT") {
         return Some(PathBuf::from(path));
@@ -3485,8 +3507,8 @@ fn gte_reranker_safetensors_snapshot() -> Option<PathBuf> {
 }
 
 fn minilm_alias_preload_config() -> Option<Value> {
-    let snapshot = minilm_onnx_snapshot()?;
-    let model_path = snapshot.join("model.onnx");
+    let snapshot = minilm_safetensors_snapshot()?;
+    let model_path = snapshot.join("model.safetensors");
     let tokenizer_path = snapshot.join("tokenizer.json");
     if !model_path.exists() || !tokenizer_path.exists() {
         return None;
@@ -3494,7 +3516,10 @@ fn minilm_alias_preload_config() -> Option<Value> {
     Some(serde_json::json!([
         {
             "model_id": "minilm-a",
-            "engine": "ort",
+            "engine": "owned-metal",
+                "family": "minilm",
+                "dtype": "f32",
+                "execution": "explicit",
             "model_path": model_path,
             "tokenizer_path": tokenizer_path,
             "pooling": "mean",
@@ -3504,7 +3529,10 @@ fn minilm_alias_preload_config() -> Option<Value> {
         },
         {
             "model_id": "minilm-b",
-            "engine": "ort",
+            "engine": "owned-metal",
+                "family": "minilm",
+                "dtype": "f32",
+                "execution": "explicit",
             "model_path": model_path,
             "tokenizer_path": tokenizer_path,
             "pooling": "mean",
@@ -3515,19 +3543,6 @@ fn minilm_alias_preload_config() -> Option<Value> {
     ]))
 }
 
-fn minilm_onnx_snapshot() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("SYNAPSE_MINILM_ONNX_SNAPSHOT") {
-        return Some(PathBuf::from(path));
-    }
-    let home = std::env::var("HOME").ok()?;
-    let snapshots = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--Qdrant--all-MiniLM-L6-v2-onnx/snapshots");
-    let manual = snapshots.join("manual");
-    if manual.exists() {
-        return Some(manual);
-    }
-    first_snapshot_with(&snapshots, "model.onnx")
-}
 
 fn first_snapshot_with(snapshots: &Path, file_name: &str) -> Option<PathBuf> {
     std::fs::read_dir(snapshots)

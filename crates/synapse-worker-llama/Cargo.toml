@@ -39,6 +39,5 @@ llama-cpp-sys-2 = { version = "0.1.151", features = ["common"] }
 
 [dev-dependencies]
 synapse-module = { path = "../synapse-module" }
-synapse-engine-ort = { path = "../synapse-engine-ort" }
 tokenizers = { workspace = true }
 tokio = { workspace = true }

@@ -146,6 +146,62 @@ The management registry in this snapshot is `embed.query`, `embed.batch`,
   When the constrained runtime is unavailable or not certified, grammar requests
   fail closed with the same reason; the retired `grammar_unavailable_in_build` code
   is not emitted.
+- **`models.catalog`** (query) `{query?, task?, runnable_here?, installed?}` →
+  `{catalog_revision, models[]}`. Unknown params are rejected. Filters intersect;
+  query is trimmed, case-insensitive substring search over id, name and description;
+  task matches exactly. Rows are ordered by id. Each row carries `{id, task, name,
+  description, default_for_task, upstream {hf_repo, revision}, manifest_digest,
+  download_bytes, install_state, backends[]}`. Install state is `not_installed`,
+  `installed` or `stale`; `installed: false` includes both not-installed and stale.
+  A backend row is `{backend, lane_id, fingerprint, runnable, reason, installed,
+  self_check}`; self-check is null without a current install. Reason is null when
+  runnable, otherwise `not_supported_on_platform`, `device_missing`,
+  `device_below_floor` or `worker_missing`. Download bytes sum distinct manifest
+  files needed by runnable backends, independent of installation (zero with none).
+  Catalog values and pinned upstream revisions come from the compiled document.
+- **`models.download`** (mutate) `{catalog_id, request_key?}` → a flat download
+  status, initially `queued` or `downloading`, before off-request-path fetching
+  completes. No automatic downloads occur. Checks, in order: a derived lane id
+  is `invalid_request {model_id, catalog_id}`; an absent catalog id is
+  `unknown_model {model_id}`; no runnable backend is `backend_unavailable
+  {catalog_id, lane_id | null, backends[] {backend, reason}}`. Blank request keys
+  are omitted; default is `models.download:<catalog_id>:<manifest_digest>`.
+  Keys bind to the JCS SHA-256 of `{catalog_id, manifest_digest}`: different
+  content is `idempotency_conflict`; non-terminal requests share one job per
+  entry manifest. A committed binding is reusable while the entry is complete.
+  Size-correct digest blobs are reused without network; only missing or
+  wrong-size blobs are fetched. Every fetched body is size- and SHA-256-verified.
+  The shared flat status shapes are `{job_id, state: queued}`, `{job_id,
+  state: downloading, bytes_done, bytes_total}`, `{job_id, state: verifying}`,
+  `{job_id, state: committed}`, `{job_id, state: failed, error}` and `{job_id,
+  state: cancelled}`. Byte counts appear only while downloading and error only
+  on failure. A zero-network-byte job moves directly from queued to committed.
+  `model.status {job_id}` accepts these jobs and adds `kind: "models.download"`.
+  Failure codes include `download_failed {file, reason: network | http_status |
+  storage_full, http_status | null}`, `artifact_invalid {file, expected_sha256,
+  actual_sha256, expected_size, actual_size, recovery_op: "models.download"}`
+  and `module_restarted`. Downloads have a 60000 ms no-body-byte timeout, not
+  an absolute execution TTL. Terminal jobs and key bindings expire together
+  after the configured result-retention TTL; non-terminal jobs are not purged.
+- **`models.download.cancel`** (mutate) `{job_id}` → the same flat download
+  status. Cancellation is idempotent and affects every caller attached to the
+  shared job. Terminal jobs remain unchanged. An unknown or expired job id is
+  `invalid_request`. Publication, commit, cancel and failure share a publish
+  fence: exactly one terminal transition wins, and a committed job is never
+  cleaned up by cancellation. Cancel/failure removes staging and only newly
+  published blobs with no remaining install, pin, registration or job root.
+- **`models.remove`** (mutate) `{catalog_id}` → `{catalog_id, removed_manifests[],
+  freed_bytes}`. Removes every current and stale install and its self-check
+  rows, then unlinks only unreferenced member blobs and owned compiled packages.
+  Freed bytes are the on-disk bytes actually unlinked. Checks, in order: a
+  derived lane id is `invalid_request {model_id, catalog_id}`; an absent catalog
+  id is `unknown_model {model_id}`; any active holder is `model_in_use
+  {catalog_id, holders[]}`. Holders are `{kind: loaded, model_id}`, `{kind: job,
+  job_id}`, `{kind: self_check, check_id}` or `{kind: request, lease_id}`.
+  An active first download is a holder even before any install commits. Only
+  after the in-use check may an uninstalled entry return empty manifests and
+  zero freed bytes. Malformed or unknown-field params remain channel errors;
+  the listed semantic refusals are result-envelope wire errors with details.
 - **models.list** — catalog + per-model state, fingerprints, alias rows,
   recommended_batch, per-row token ceiling (`max_tokens`), ceiling source
   (`max_tokens_source`), bucket/shape ladder (`bucket_ladder`), output dimensions
