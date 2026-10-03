@@ -14,14 +14,14 @@ bench/                      benchmark and research tree
   rig/                      synapse-rig: candidate supervisor over framed stdio
   spikes/                   research prototypes (unified-rt, ane-*, laya-owned, stt-bias)
 contracts/                  interface contracts and their validators
-crates/                     product and development Rust crates
+crates/                     production Rust crates
   synapse-core/             shared types, engine traits, tokenizer, worker protocol, scheduler
-  synapse-engine-cuda/      development CUDA engine (PTX ports; no shipped catalog backend)
+  synapse-engine-cuda/      CUDA embedding engine (PTX kernel ports)
   synapse-engine-owned/     Metal embedding engine, Metal decode kernels, owned-decode supervisor (macOS)
   synapse-module/           the subc module (ck-synapse): ops, store, worker host, remote gateway
   synapse-opctl/            operator CLI (ck-synapse-opctl)
   synapse-worker-ane/       Core ML / Neural Engine embedding worker (Rust launcher + Swift)
-  synapse-worker-cuda/      development CUDA worker (not shipped by release matrix)
+  synapse-worker-cuda/      CUDA embedding worker
   synapse-worker-decode/    owned Metal generation worker (macOS)
   synapse-worker-llama/     llama.cpp worker for GGUF models
 docs/                       design notes, wire contract, audits, measured evidence
@@ -39,13 +39,8 @@ Inside `crates/synapse-module`, the owned-generation code sits next to `src/` in
 Inside `crates/synapse-engine-owned`, `owned-decode-engine/` holds the Metal decode
 kernels and `owned-decode-worker/` the supervisor and protocol.
 
-The compiled catalog and validation live in `crates/synapse-module/src/catalog/`.
-It declares Metal backends for three entries and none for Qwen3-Reranker; model
-installation is explicit and catalog serving uses self-check. No CPU or ONNX
-Runtime product floor exists; `bench/lanes/ort-embed` remains a bench reference.
-Linux/Windows releases ship only module, opctl and llama worker; CUDA/Vulkan
-catalog workers await evidence-backed release activation. The owned-decode stack
-remains compiled/tested with unchanged gates, not the default decode lane.
+The compiled model catalog and its validation live in
+`crates/synapse-module/src/catalog/`.
 
 Root files: `Cargo.toml` (workspace members and the pinned subc and commons crates),
 `DECISIONS.md`, `FOUNDING.md`, `CONTRIBUTING.md`.
@@ -82,7 +77,7 @@ cannot run under `cargo test` go in the top-level `tests/`.
 
 ## Naming conventions
 
-- Shipped binaries carry the `ck-` prefix (`ck-synapse`, `ck-synapse-worker-llama`);
+- Shipped binaries carry the `ck-` prefix (`ck-synapse`, `ck-synapse-worker-cuda`);
   crate names and the subc module id (`synapse`) do not.
 - Directories and crate names are kebab-case (`synapse-worker-decode`, `ort-embed`).
 - Rust source files are snake_case (`worker_engine_names.rs`, `ane_artifact.rs`).

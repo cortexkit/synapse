@@ -40,24 +40,21 @@ crash budget (`owned-decode-worker`) used by the decode worker and the module.
 
 **CUDA engine** (`crates/synapse-engine-cuda`). Embedding on NVIDIA GPUs (MiniLM,
 ModernBERT, Qwen3) from ported PTX kernels, with a hardware-floor check. The module
-does not link it; its development worker is `ck-synapse-worker-cuda`, which
-is not shipped by the release matrix or activated in the current catalog.
+does not link it; it runs only inside `ck-synapse-worker-cuda`.
 
 There is no CPU embedding lane: embedding and reranking run only on synapse's own
-GPU and Neural Engine engines. The current catalog declares only Metal backends
-for three entries and no backend for Qwen3-Reranker. Unsupported hosts report
-`backend_unavailable`, not CPU fallback; consumers may opt into the remote gateway.
-ONNX Runtime is bench-only, not a portable product floor.
+GPU and Neural Engine engines. A host with no runnable backend for a model gets
+`backend_unavailable`, never a CPU fallback; consumers may opt into the remote
+gateway. ONNX Runtime survives only as a bench reference.
 
-**Workers.** These source-tree binaries use module supervision and local IPC;
-source presence does not imply release publication. Linux/Windows releases ship
-only the module, opctl and llama worker. The owned-decode stack is kept compiled
-and tested with unchanged gates, not made the default decode lane:
+**Workers.** Each is a separate binary the module spawns, handshakes with, and
+supervises. Which ones a release ships is decided by the release workflow, not
+by their presence here:
 - `ck-synapse-worker-llama` (`crates/synapse-worker-llama`): llama.cpp for GGUF models.
 - `ck-synapse-worker-ane` (`crates/synapse-worker-ane`): a small Rust launcher that
   execs a Swift Core ML worker built by `build.rs`; embeds on the Neural Engine using
   fixed-bucket compiled models.
-- `ck-synapse-worker-cuda` (`crates/synapse-worker-cuda`): development-only, not shipped; wraps the CUDA engine;
+- `ck-synapse-worker-cuda` (`crates/synapse-worker-cuda`): wraps the CUDA engine;
   `--probe-floor` reports hardware readings before the module commits to it.
 - `ck-synapse-worker-decode` (`crates/synapse-worker-decode`): owned Metal token
   generation for Qwen3 and LFM2, driven quantum by quantum by the owned-decode
