@@ -185,7 +185,7 @@ impl CatalogHarness {
             .await;
         assert_eq!(
             catalog["models"][0]["download_bytes"],
-            BODY.len(),
+            3 * BODY.len(),
             "catalog override must be honored"
         );
         assert_eq!(catalog["models"][0]["backends"][0]["runnable"], true);
@@ -554,6 +554,11 @@ async fn catalog_stale_installs_are_visible_but_not_served_or_counted_installed(
         params!["gte-modernbert-base", "0".repeat(64)],
     )
     .unwrap();
+    let digest = catalog_sha256(BODY);
+    let blobs = h.fixture_root.join("cache/blobs");
+    std::fs::create_dir_all(&blobs).unwrap();
+    std::fs::write(blobs.join(&digest), BODY).unwrap();
+    conn.execute("INSERT INTO catalog_install_members VALUES ('gte-modernbert-base',?1,'metal','model.safetensors',?2)", params!["0".repeat(64), digest]).unwrap();
     let stale = h
         .call(
             "models.catalog",
@@ -586,6 +591,7 @@ async fn catalog_stale_installs_are_visible_but_not_served_or_counted_installed(
         removed["removed_manifests"],
         serde_json::json!(["0".repeat(64)])
     );
+    assert_eq!(removed["freed_bytes"], BODY.len());
     h.assert_clean();
 }
 
@@ -899,6 +905,10 @@ async fn catalog_corrupt_blob_is_quarantined_and_explicit_download_repairs_it() 
 
 impl CatalogHarness {
     async fn restart(&mut self) {
+        self.restart_with_os(None).await;
+    }
+
+    async fn restart_with_os(&mut self, os_build: Option<&str>) {
         self._module.child.kill().await.unwrap();
         self._module.child.wait().await.unwrap();
         let until = Instant::now() + SETUP_TIMEOUT;
@@ -918,15 +928,19 @@ impl CatalogHarness {
         let catalog = self.fixture_root.join("catalog.json");
         let cache = self.fixture_root.join("cache");
         let config = serde_json::json!({"hf_endpoint":self.server.endpoint}).to_string();
+        let mut overrides = vec![
+            ("SYNAPSE_TEST_CATALOG", catalog.to_str().unwrap()),
+            ("SYNAPSE_TEST_RUNNABLE_BACKENDS", "metal"),
+            ("CORTEXKIT_MODEL_CACHE", cache.to_str().unwrap()),
+        ];
+        if let Some(os_build) = os_build {
+            overrides.push(("SYNAPSE_OS_BUILD_OVERRIDE", os_build));
+        }
         self._module = spawn_synapse_module_with_env(
             &self.daemon.connection_file_path,
             None,
             Some(&config),
-            &[
-                ("SYNAPSE_TEST_CATALOG", catalog.to_str().unwrap()),
-                ("SYNAPSE_TEST_RUNNABLE_BACKENDS", "metal"),
-                ("CORTEXKIT_MODEL_CACHE", cache.to_str().unwrap()),
-            ],
+            &overrides,
         );
         wait_for_registration(&self.daemon.registry, MODULE_ID, SETUP_TIMEOUT).await;
         self.consumer = connect_consumer(&self.daemon.connection_file_path).await;
@@ -1009,12 +1023,19 @@ async fn catalog_multi_backend_resolver_refuses_substitution_before_load() {
         file["backends"] = serde_json::json!(["ane"]);
     }
     entry["files"].as_array_mut().unwrap().extend(ane_files);
-    catalog["models"] = serde_json::json!([entry]);
+    catalog["models"][0]["default_for_task"] = false.into();
+    catalog["models"].as_array_mut().unwrap().push(entry);
     let mut h =
         CatalogHarness::start_catalog("ok", None, catalog, BTreeMap::new(), "metal,ane", None)
             .await;
     let listing = h.call("models.catalog", serde_json::json!({})).await;
-    let rows = listing["models"][0]["backends"].as_array().unwrap();
+    let resolver = listing["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == "resolver-fixture")
+        .unwrap();
+    let rows = resolver["backends"].as_array().unwrap();
     assert_eq!(
         rows.len(),
         2,
@@ -1136,7 +1157,6 @@ fn real_catalog_fixture(id: &str) -> Option<(Value, BTreeMap<String, PathBuf>)> 
         );
         files.insert(path, local);
     }
-    catalog["models"] = serde_json::json!([entry]);
     catalog["catalog_revision"] = 717.into();
     Some((catalog, files))
 }
@@ -1175,6 +1195,24 @@ async fn catalog_real_metal_redirect_download_self_checks_and_serves_without_pro
     assert_eq!(status["catalog_lanes"], 1);
     assert_eq!(status["lanes"][0]["certification_required"], false);
     assert_eq!(status["lanes"][0]["certification_status"], "not_required");
+    h.restart_with_os(Some("catalog-test-changed-os-build"))
+        .await;
+    let pending = h.call("models.list", serde_json::json!({})).await;
+    assert_eq!(pending["models"][0]["self_check"]["state"], "pending");
+    let served_again = h
+        .call(
+            "embed.query",
+            serde_json::json!({"model":"gte-modernbert-base","text":"hello","deadline_ms":30000}),
+        )
+        .await;
+    assert_eq!(
+        served_again["fingerprint"], expected_fingerprint,
+        "{served_again}"
+    );
+    assert_eq!(
+        h.call("models.list", serde_json::json!({})).await["models"][0]["self_check"]["state"],
+        "passed"
+    );
     let loaded_remove = h
         .call(
             "models.remove",
@@ -1190,7 +1228,42 @@ async fn catalog_real_metal_redirect_download_self_checks_and_serves_without_pro
         .await["state"],
         "unloaded"
     );
+    let cache = h.fixture_root.join("cache");
+    let expected_freed = directory_bytes(&cache.join("blobs"))
+        + directory_bytes(&cache.join("owned-metal-packages"));
+    let removed = h
+        .call(
+            "models.remove",
+            serde_json::json!({"catalog_id":"gte-modernbert-base"}),
+        )
+        .await;
+    assert_eq!(removed["freed_bytes"], expected_freed);
+    assert_eq!(directory_bytes(&cache.join("blobs")), 0);
+    assert_eq!(directory_bytes(&cache.join("owned-metal-packages")), 0);
+    assert_eq!(
+        h.call("models.list", serde_json::json!({})).await["models"],
+        serde_json::json!([])
+    );
     h.server.assert_pinned_requests();
+}
+
+#[cfg(target_os = "macos")]
+fn directory_bytes(path: &Path) -> u64 {
+    if !path.exists() {
+        return 0;
+    }
+    std::fs::read_dir(path)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            let metadata = entry.metadata().unwrap();
+            if metadata.is_dir() {
+                directory_bytes(&entry.path())
+            } else {
+                metadata.len()
+            }
+        })
+        .sum()
 }
 
 #[cfg(target_os = "macos")]
@@ -1311,7 +1384,13 @@ async fn catalog_real_qwen_embedding_serves_catalog_and_lane_ids_then_unloads() 
     let Some((catalog, files)) = real_catalog_fixture("qwen3-embedding-0.6b") else {
         return;
     };
-    let fingerprint = catalog["models"][0]["backends"][0]["fingerprint"].clone();
+    let fingerprint = catalog["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["id"] == "qwen3-embedding-0.6b")
+        .unwrap()["backends"][0]["fingerprint"]
+        .clone();
     let mut h = CatalogHarness::start_catalog("ok", None, catalog, files, "metal", None).await;
     let accepted = h.download("qwen3-embedding-0.6b", "real").await;
     let done = h
@@ -1437,4 +1516,61 @@ async fn catalog_free_form_load_refusals_happen_before_network_io() {
         assert!(error["message"].is_string());
     }
     assert!(h.server.paths().is_empty());
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn catalog_real_numerical_failure_persists_and_pinned_requests_fail_closed() {
+    let Some((mut catalog, files)) = real_catalog_fixture("gte-modernbert-base") else {
+        return;
+    };
+    let fingerprint = catalog["models"][0]["backends"][0]["fingerprint"].clone();
+    for vector in catalog["models"][0]["self_check"]["reference"]["vectors"]
+        .as_array_mut()
+        .unwrap()
+    {
+        for component in vector.as_array_mut().unwrap() {
+            *component = 0.0.into();
+        }
+    }
+    let mut h = CatalogHarness::start_catalog("ok", None, catalog, files, "metal", None).await;
+    let accepted = h.download("gte-modernbert-base", "perturbed").await;
+    let done = h
+        .wait_state(
+            accepted["job_id"].as_str().unwrap(),
+            &["committed", "failed"],
+        )
+        .await;
+    assert_eq!(done["state"], "committed", "{done}");
+    let refused = h
+        .call(
+            "embed.query",
+            serde_json::json!({"model":"gte-modernbert-base","text":"hello","deadline_ms":30000}),
+        )
+        .await;
+    assert_eq!(
+        refused["error"]["code"], "self_check_failed",
+        "perturbed reference must fail: {refused}"
+    );
+    assert_eq!(
+        refused["error"]["details"]["check_id"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
+    let listed = h.call("models.list", serde_json::json!({})).await;
+    assert_eq!(listed["models"][0]["self_check"]["state"], "failed");
+    assert_eq!(listed["models"][0]["serving_admission"], "disabled");
+    assert_eq!(
+        listed["models"][0]["serving_admission_reason"],
+        "self_check_failed"
+    );
+    h.restart().await;
+    let pinned = h.call("embed.query", serde_json::json!({"model":"gte-modernbert-base-metal","required_fingerprint":fingerprint,"text":"hello","deadline_ms":30000})).await;
+    assert_eq!(pinned["error"]["code"], "self_check_failed");
+    assert_eq!(
+        pinned["error"]["details"]["check_id"],
+        refused["error"]["details"]["check_id"]
+    );
 }
