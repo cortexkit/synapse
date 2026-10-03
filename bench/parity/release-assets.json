@@ -1,0 +1,155 @@
+{
+  "assets": [
+    {
+      "asset": "ck-synapse-darwin-arm64.zip",
+      "binary": "ck-synapse",
+      "binding": "certification",
+      "os_arch": "darwin-arm64",
+      "rows": [
+        "ane-m5",
+        "metal-m5"
+      ]
+    },
+    {
+      "asset": "ck-synapse-worker-ane-direct-darwin-arm64.zip",
+      "binary": "ck-synapse-worker-ane-direct",
+      "binding": "certification",
+      "os_arch": "darwin-arm64",
+      "rows": [
+        "ane-m5"
+      ]
+    },
+    {
+      "asset": "ck-synapse-opctl-darwin-arm64.zip",
+      "binary": "ck-synapse-opctl",
+      "binding": "exempt",
+      "os_arch": "darwin-arm64",
+      "reason": "operator CLI; no certification lane executes it"
+    },
+    {
+      "asset": "ck-synapse-worker-llama-darwin-arm64.zip",
+      "binary": "ck-synapse-worker-llama",
+      "binding": "exempt",
+      "os_arch": "darwin-arm64",
+      "reason": "llama.cpp worker; not an embed or rerank lane for the four models"
+    },
+    {
+      "asset": "ck-synapse-worker-ane-darwin-arm64.zip",
+      "binary": "ck-synapse-worker-ane",
+      "binding": "exempt",
+      "os_arch": "darwin-arm64",
+      "reason": "Core ML ANE launcher; Core ML is not a certification lane"
+    },
+    {
+      "asset": "ck-synapse-worker-ane-swift-darwin-arm64.zip",
+      "binary": "ck-synapse-worker-ane-swift",
+      "binding": "exempt",
+      "os_arch": "darwin-arm64",
+      "reason": "Core ML Swift worker; Core ML is not a certification lane"
+    },
+    {
+      "asset": "ck-synapse-worker-decode-darwin-arm64.zip",
+      "binary": "ck-synapse-worker-decode",
+      "binding": "exempt",
+      "os_arch": "darwin-arm64",
+      "reason": "owned decode worker; decode is not certified by this flow"
+    },
+    {
+      "asset": "ck-synapse-linux-x64.zip",
+      "binary": "ck-synapse",
+      "binding": "certification",
+      "os_arch": "linux-x64",
+      "rows": [
+        "cuda-linux-nvidia",
+        "vulkan-linux-amd",
+        "vulkan-linux-nvidia"
+      ]
+    },
+    {
+      "asset": "ck-synapse-worker-cuda-linux-x64.zip",
+      "binary": "ck-synapse-worker-cuda",
+      "binding": "certification",
+      "os_arch": "linux-x64",
+      "rows": [
+        "cuda-linux-nvidia"
+      ]
+    },
+    {
+      "asset": "ck-synapse-worker-vulkan-linux-x64.zip",
+      "binary": "ck-synapse-worker-vulkan",
+      "binding": "certification",
+      "os_arch": "linux-x64",
+      "rows": [
+        "vulkan-linux-amd",
+        "vulkan-linux-nvidia"
+      ]
+    },
+    {
+      "asset": "ck-synapse-opctl-linux-x64.zip",
+      "binary": "ck-synapse-opctl",
+      "binding": "exempt",
+      "os_arch": "linux-x64",
+      "reason": "operator CLI; no certification lane executes it"
+    },
+    {
+      "asset": "ck-synapse-worker-llama-linux-x64.zip",
+      "binary": "ck-synapse-worker-llama",
+      "binding": "exempt",
+      "os_arch": "linux-x64",
+      "reason": "llama.cpp worker; not an embed or rerank lane for the four models"
+    },
+    {
+      "asset": "ck-synapse-windows-x64.zip",
+      "binary": "ck-synapse.exe",
+      "binding": "certification",
+      "os_arch": "windows-x64",
+      "rows": [
+        "cuda-windows-nvidia",
+        "vulkan-windows-amd",
+        "vulkan-windows-nvidia"
+      ]
+    },
+    {
+      "asset": "ck-synapse-worker-cuda-windows-x64.zip",
+      "binary": "ck-synapse-worker-cuda.exe",
+      "binding": "certification",
+      "os_arch": "windows-x64",
+      "rows": [
+        "cuda-windows-nvidia"
+      ],
+      "runtime_files_from": "manifest.json"
+    },
+    {
+      "asset": "ck-synapse-worker-vulkan-windows-x64.zip",
+      "binary": "ck-synapse-worker-vulkan.exe",
+      "binding": "certification",
+      "os_arch": "windows-x64",
+      "rows": [
+        "vulkan-windows-amd",
+        "vulkan-windows-nvidia"
+      ]
+    },
+    {
+      "asset": "ck-synapse-opctl-windows-x64.zip",
+      "binary": "ck-synapse-opctl.exe",
+      "binding": "exempt",
+      "os_arch": "windows-x64",
+      "reason": "operator CLI; no certification lane executes it"
+    },
+    {
+      "asset": "ck-synapse-worker-llama-windows-x64.zip",
+      "binary": "ck-synapse-worker-llama.exe",
+      "binding": "exempt",
+      "os_arch": "windows-x64",
+      "reason": "llama.cpp worker; not an embed or rerank lane for the four models"
+    },
+    {
+      "asset": "release-manifest.json",
+      "binding": "exempt",
+      "os_arch": "linux-x64",
+      "reason": "release metadata written by the linux job; not an executable"
+    }
+  ],
+  "schema": "synapse-parity-release-assets-v1",
+  "sidecar_suffix": ".sha256"
+}

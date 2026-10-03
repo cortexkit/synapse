@@ -1,0 +1,46 @@
+{
+  "artifact_digest": "sha256:9a63560f30b6bcc9a71239c507575125f91175cc52e5b2cb24f4339f06e43bad",
+  "captured": {
+    "engine_identity": {
+      "build_flags": {
+        "backend": "metal-mpsgraph",
+        "bucket_policy": "v2",
+        "dtype": "f16",
+        "family": "gte-modernbert",
+        "graph_revision": "4",
+        "risk_class": "abort_safe"
+      },
+      "engine": "owned-metal",
+      "version": "owned-metal-v1"
+    },
+    "numeric_profile_id": "567b4f9bc8edbd3ab1b0f2550653ba62dc3434d0860b1b11e3bc8fedc83cfe21",
+    "source": "production module stored config (models table) and models.list, 2026-10-02"
+  },
+  "engine": "owned-metal",
+  "expected_fingerprint": "24cc5271f42dbc2d154f963e2d67d1adef322cbdfbb541b3eddfaa8ae8859dfb",
+  "inline": {
+    "byte_budget": 67108864,
+    "deadline_ms": 30000,
+    "estimated_execution_ms": 25,
+    "max_concurrent_workers": 2,
+    "max_items": 64,
+    "max_queue_ms": 5000,
+    "max_tokens": 8192
+  },
+  "jobs": {
+    "bulk_quantum_tokens": 3072,
+    "execution_ttl_ms": 86400000,
+    "result_page_bytes": 524288,
+    "result_retention_ttl_ms": 86400000,
+    "resume_deadline_ms": 86400000
+  },
+  "max_tokens": 8192,
+  "model_id": "gte-modernbert-base-f16",
+  "normalize": true,
+  "owned_dtype": "f16",
+  "owned_family": "gte-modernbert",
+  "pooling": "mean",
+  "quant": "f16",
+  "sanitized_tokenizer_digest": "sha256:f64652c0d4292921662f8a34068ed38c9db4a8e78daae667eaff88a30494ef8b",
+  "task": "embed"
+}

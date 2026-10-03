@@ -1,0 +1,31 @@
+[package]
+name = "synapse-parity"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+description = "Model manifest, converted-package producer and reference fixtures for owned-lane parity"
+publish = false
+
+# Deliberately its own workspace: this crate lives under bench/parity/ next to
+# the manifest it validates, and the root workspace member list is owned by a
+# different change. Run its tests with
+# `cargo test --manifest-path bench/parity/Cargo.toml`.
+[workspace]
+
+[features]
+default = ["checkpoints"]
+# Checks that read downloaded checkpoints (tokenizer behaviour in particular).
+# Off for consumers that only need the manifest types and the sizing function.
+checkpoints = ["dep:tokenizers"]
+
+[dependencies]
+half = "2.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokenizers = { version = "0.21", default-features = false, features = ["onig"], optional = true }
+
+[[bin]]
+name = "parity-manifest"
+path = "src/bin/parity-manifest.rs"

@@ -1,0 +1,18 @@
+{
+  "inline": {
+    "byte_budget": 67108864,
+    "deadline_ms": 30000,
+    "estimated_execution_ms": 25,
+    "max_concurrent_workers": 2,
+    "max_items": 64,
+    "max_queue_ms": 5000,
+    "max_tokens": 8192
+  },
+  "jobs": {
+    "bulk_quantum_tokens": 3072,
+    "execution_ttl_ms": 86400000,
+    "result_page_bytes": 524288,
+    "result_retention_ttl_ms": 86400000,
+    "resume_deadline_ms": 86400000
+  }
+}

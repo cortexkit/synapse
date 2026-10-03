@@ -1,0 +1,671 @@
+{
+  "admission": {
+    "ane_resident_shapes_per_model": 4,
+    "ane_resident_shapes_total": 8,
+    "ane_shape_ladder": [
+      128,
+      256,
+      512,
+      1024,
+      2048,
+      4096,
+      8192
+    ],
+    "max_context_tokens": 8192
+  },
+  "converter": {
+    "command": "cargo run --release --locked --manifest-path bench/parity/Cargo.toml --bin parity-manifest -- convert --profile <profile id> --hf-cache <hugging face hub cache> --out <file>",
+    "rule": "v1"
+  },
+  "digests": {
+    "grammar": {
+      "gte-modernbert-base": "2d31f6b3d00d4a7d53dfef8681c149f047a5b15c782b2327531067c47daa7ffd",
+      "gte-reranker-modernbert-base": "6d8710c3739877054b3aa0e0d5f3fd0b5a7ad52441d338ec4025365490f6bccb",
+      "qwen3-embedding-0.6b": "0786dec33dd85e7bf6da2bfb5ebfd16736c33dfc87fd8680575853f30facbd21",
+      "qwen3-reranker-0.6b": "7a1704427f35997c04ce26ad128707ef10f29fd60b17cd382e8d345c618c0c1f"
+    },
+    "profiles": {
+      "gte-modernbert-base.ane-direct-worker": "797176c690b001c3f8cd76343f764311a2d6943cdeee88f541fc230bd5ad1c2f",
+      "gte-modernbert-base.owned-cuda": "c4fece4aafcebe8a15d6ddfe23001cd5325e330ee7487c7f80574ae55948c831",
+      "gte-modernbert-base.owned-metal": "9ba0521494657eb281532ead061cd82916a1923a9560d1cddb7212ab7e92398a",
+      "gte-modernbert-base.owned-vulkan": "e8e18233566f2f5a83caed9c61bae2547547c5bf60121799ea69defcb1886fbd",
+      "gte-reranker-modernbert-base.ane-direct-worker": "2f290e2397757211f5fb9a35869d53ab41030f1b8d86b34a60ed032c3aaedf1b",
+      "gte-reranker-modernbert-base.owned-cuda": "b7c3da9a07e3a0d730ee3f49a4ec5fcf605aae801529d70c72a41ce17b24c878",
+      "gte-reranker-modernbert-base.owned-metal": "96ec4ca41db7fa1716f28d37b88dde89a5fe316e6c91b7ae9c5b96c900fec7a0",
+      "gte-reranker-modernbert-base.owned-vulkan": "0ce0cb615618ecc37782357eff286746b8bf644f56cd022a3cc613766c826458",
+      "qwen3-embedding-0.6b.ane-direct-worker": "05e8ac1af8e3e78e2cbde230ddb16d6fb08379df42b984f2a366e7da2b72a511",
+      "qwen3-embedding-0.6b.owned-cuda": "0c21d47c720c5ba5a429d351fc8089f92cb6d819811de04e885db58cd242e2b0",
+      "qwen3-embedding-0.6b.owned-metal": "d3f98359d9b76aa1576eb96bec880868e3b35963d8dfdcee21f8cc9a82b45b52",
+      "qwen3-embedding-0.6b.owned-vulkan": "1220fd0a6bbd5fac28db6b63e39497f373a6c7e5b4884c61512bc858ec578d4f",
+      "qwen3-reranker-0.6b.ane-direct-worker": "14397bd7b99619e15e4b46343daa109298ebe8538ac6661dba69dabef4f33a12",
+      "qwen3-reranker-0.6b.owned-cuda": "0cd5cd444db750f13b140e2a9081ec79707fd42ec29d4caf89807f33f53cf407",
+      "qwen3-reranker-0.6b.owned-metal": "25826de645ccad44540bfaecc8a712bbaf1736aa66a05791e1df6e359409dec7",
+      "qwen3-reranker-0.6b.owned-vulkan": "edd6750ed46977d22d450f77cf5fc29abaecf44dfe55c67548e0d0305d666fb3"
+    }
+  },
+  "models": {
+    "gte-modernbert-base": {
+      "architecture": {
+        "class": "ModernBertModel",
+        "family": "modernbert",
+        "params": {
+          "activation": "gelu",
+          "attention_bias": false,
+          "attention_mask": "bidirectional",
+          "eos_token_id": 50282,
+          "global_attn_every_n_layers": 3,
+          "global_rope_theta": 160000.0,
+          "hidden_size": 768,
+          "intermediate_size": 1152,
+          "local_attention": 128,
+          "local_rope_theta": 10000.0,
+          "max_position_embeddings": 8192,
+          "mlp_bias": false,
+          "mlp_kind": "geglu",
+          "norm_bias": false,
+          "norm_eps": 0.00001,
+          "norm_type": "layernorm",
+          "num_attention_heads": 12,
+          "num_hidden_layers": 22,
+          "pad_token_id": 50283,
+          "tie_word_embeddings": false,
+          "vocab_size": 50368
+        }
+      },
+      "checkpoint_digest": "sha256:3e85899d5728cb7de79781c0c3acfb91ccef9f875f1f7e0b3c9f3dd4b6a724ba",
+      "files": {
+        "config.json": "8ba54dc3d35d7194f5178a4194b649f146753e02dabd22bdca5c5cbac15069ed",
+        "model.safetensors": "3e85899d5728cb7de79781c0c3acfb91ccef9f875f1f7e0b3c9f3dd4b6a724ba",
+        "tokenizer.json": "6c8aaa9a542084f2457eab775d4eeb51f92a70c0fd9de28d5edb0ddec3c08d30"
+      },
+      "grammar": {
+        "kind": "single_sequence",
+        "pad": {
+          "id": 50283,
+          "text": "[PAD]"
+        },
+        "pooling": "cls",
+        "readout": {
+          "kind": "pooled_hidden_state"
+        },
+        "special_tokens": {
+          "cls": {
+            "id": 50281,
+            "text": "[CLS]"
+          },
+          "sep": {
+            "id": 50282,
+            "text": "[SEP]"
+          }
+        },
+        "terminal_tokens": [
+          {
+            "id": 50282,
+            "text": "[SEP]"
+          }
+        ]
+      },
+      "hf_repo": "Alibaba-NLP/gte-modernbert-base",
+      "hf_revision": "e7f32e3c00f91d699e8c43b53106206bcc72bb22",
+      "operation": "embed",
+      "output": {
+        "dimension": 768,
+        "normalization": "l2"
+      },
+      "tensor_index_sha256": "9a24ad4510d23f6b5a90af1515a59487f3f0f4302e2f6e0e38883c2893919ede",
+      "tensor_prefix": "",
+      "tokenizer_digest": "sha256:6c8aaa9a542084f2457eab775d4eeb51f92a70c0fd9de28d5edb0ddec3c08d30"
+    },
+    "gte-reranker-modernbert-base": {
+      "architecture": {
+        "class": "ModernBertForSequenceClassification",
+        "family": "modernbert",
+        "params": {
+          "activation": "gelu",
+          "attention_bias": false,
+          "attention_mask": "bidirectional",
+          "eos_token_id": 50282,
+          "global_attn_every_n_layers": 3,
+          "global_rope_theta": 160000.0,
+          "hidden_size": 768,
+          "intermediate_size": 1152,
+          "local_attention": 128,
+          "local_rope_theta": 10000.0,
+          "max_position_embeddings": 8192,
+          "mlp_bias": false,
+          "mlp_kind": "geglu",
+          "norm_bias": false,
+          "norm_eps": 0.00001,
+          "norm_type": "layernorm",
+          "num_attention_heads": 12,
+          "num_hidden_layers": 22,
+          "pad_token_id": 50283,
+          "tie_word_embeddings": false,
+          "vocab_size": 50368
+        }
+      },
+      "checkpoint_digest": "sha256:13c533d902d6a48fa97375c6856c3e60854f9228ea760e3fc18ebde057e0cf31",
+      "files": {
+        "config.json": "c9316ff715158502dad782f35454eee18de984160618dc30afe7508feb46b7ce",
+        "model.safetensors": "13c533d902d6a48fa97375c6856c3e60854f9228ea760e3fc18ebde057e0cf31",
+        "tokenizer.json": "2aea6ff4701d063e7e029b6be695a1659f2caaa2ae4fb0e8b18285818271becd",
+        "tokenizer_config.json": "626c86908d7c711f93b0feffd8657b782cc2727b391f9be190240e8cafb626d5"
+      },
+      "grammar": {
+        "kind": "pair",
+        "pad": {
+          "id": 50283,
+          "text": "[PAD]"
+        },
+        "pooling": "masked_mean",
+        "readout": {
+          "kind": "sigmoid_classifier_logit"
+        },
+        "special_tokens": {
+          "cls": {
+            "id": 50281,
+            "text": "[CLS]"
+          },
+          "sep": {
+            "id": 50282,
+            "text": "[SEP]"
+          }
+        },
+        "terminal_tokens": [
+          {
+            "id": 50282,
+            "text": "[SEP]"
+          }
+        ]
+      },
+      "head": {
+        "forbidden_tensor_keys": [
+          "head.dense.bias",
+          "head.norm.bias"
+        ],
+        "norm_eps": 0.00001,
+        "pooling": "masked_mean",
+        "required_tensor_keys": [
+          "classifier.bias",
+          "classifier.weight",
+          "head.dense.weight",
+          "head.norm.weight"
+        ],
+        "stages": [
+          "dense",
+          "activation:gelu",
+          "layernorm",
+          "classifier"
+        ],
+        "tensors": {
+          "classifier": {
+            "key": "classifier.weight",
+            "shape": [
+              1,
+              768
+            ]
+          },
+          "classifier_bias": {
+            "key": "classifier.bias",
+            "shape": [
+              1
+            ]
+          },
+          "dense": {
+            "key": "head.dense.weight",
+            "shape": [
+              768,
+              768
+            ]
+          },
+          "norm": {
+            "key": "head.norm.weight",
+            "shape": [
+              768
+            ]
+          }
+        }
+      },
+      "hf_repo": "Alibaba-NLP/gte-reranker-modernbert-base",
+      "hf_revision": "f7481e6055501a30fb19d090657df9ec1f79ab2c",
+      "operation": "rerank",
+      "output": {
+        "dimension": 1,
+        "normalization": "none"
+      },
+      "tensor_index_sha256": "1d47a632a2facd6cbbf3f0db5b0fe5e2263a6881d83e1b6380d81ed0ff9cb219",
+      "tensor_prefix": "model.",
+      "tokenizer_digest": "sha256:2aea6ff4701d063e7e029b6be695a1659f2caaa2ae4fb0e8b18285818271becd"
+    },
+    "qwen3-embedding-0.6b": {
+      "architecture": {
+        "class": "Qwen3ForCausalLM",
+        "family": "qwen3",
+        "params": {
+          "activation": "silu",
+          "attention_bias": false,
+          "attention_mask": "causal",
+          "eos_token_id": 151643,
+          "head_dim": 128,
+          "hidden_size": 1024,
+          "intermediate_size": 3072,
+          "max_position_embeddings": 32768,
+          "mlp_kind": "swiglu",
+          "norm_eps": 1e-6,
+          "norm_type": "rmsnorm",
+          "num_attention_heads": 16,
+          "num_hidden_layers": 28,
+          "num_key_value_heads": 8,
+          "pad_token_id": 151643,
+          "qk_norm": true,
+          "rope_scaling": null,
+          "rope_theta": 1000000.0,
+          "tie_word_embeddings": true,
+          "use_sliding_window": false,
+          "vocab_size": 151669
+        }
+      },
+      "checkpoint_digest": "sha256:0437e45c94563b09e13cb7a64478fc406947a93cb34a7e05870fc8dcd48e23fd",
+      "files": {
+        "config.json": "b5bf1f51fc45be473a54718cef92448d90a1be001bf9b9a44b8c7f10a19feaa9",
+        "model.safetensors": "0437e45c94563b09e13cb7a64478fc406947a93cb34a7e05870fc8dcd48e23fd",
+        "tokenizer.json": "def76fb086971c7867b829c23a26261e38d9d74e02139253b38aeb9df8b4b50a",
+        "tokenizer_config.json": "253153d0738ceb4c668d2eff957714dd2bea0b56de772a9fdccd96cbf517e6a0"
+      },
+      "grammar": {
+        "kind": "single_sequence",
+        "pad": {
+          "id": 151643,
+          "text": "<|endoftext|>"
+        },
+        "pooling": "last_non_pad",
+        "readout": {
+          "kind": "pooled_hidden_state"
+        },
+        "special_tokens": {
+          "eos": {
+            "id": 151643,
+            "text": "<|endoftext|>"
+          }
+        },
+        "terminal_tokens": [
+          {
+            "id": 151643,
+            "text": "<|endoftext|>"
+          }
+        ]
+      },
+      "hf_repo": "Qwen/Qwen3-Embedding-0.6B",
+      "hf_revision": "97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3",
+      "operation": "embed",
+      "output": {
+        "dimension": 1024,
+        "normalization": "l2"
+      },
+      "tensor_index_sha256": "61f0cd4e262a6899a646a2e72e8f034615358608c8bf24867bf65249cf40942b",
+      "tensor_prefix": "",
+      "tokenizer_digest": "sha256:def76fb086971c7867b829c23a26261e38d9d74e02139253b38aeb9df8b4b50a"
+    },
+    "qwen3-reranker-0.6b": {
+      "architecture": {
+        "class": "Qwen3ForCausalLM",
+        "family": "qwen3",
+        "params": {
+          "activation": "silu",
+          "attention_bias": false,
+          "attention_mask": "causal",
+          "eos_token_id": 151645,
+          "head_dim": 128,
+          "hidden_size": 1024,
+          "intermediate_size": 3072,
+          "max_position_embeddings": 40960,
+          "mlp_kind": "swiglu",
+          "norm_eps": 1e-6,
+          "norm_type": "rmsnorm",
+          "num_attention_heads": 16,
+          "num_hidden_layers": 28,
+          "num_key_value_heads": 8,
+          "pad_token_id": 151643,
+          "qk_norm": true,
+          "rope_scaling": null,
+          "rope_theta": 1000000.0,
+          "tie_word_embeddings": true,
+          "use_sliding_window": false,
+          "vocab_size": 151669
+        }
+      },
+      "checkpoint_digest": "sha256:27cd75a405b9c1b46b59abfd88aaa209e6fed2a1972cde9b70e7659537c5e65b",
+      "files": {
+        "README.md": "5bba8c734f6dd3ae48317b4139317e45a7fce48fc55e15670b23a0dd15492ab6",
+        "config.json": "d479c427a9ca5295218063d4f9aca4f297ab4ac27487cca7af42c84643d51ef0",
+        "model.safetensors": "27cd75a405b9c1b46b59abfd88aaa209e6fed2a1972cde9b70e7659537c5e65b",
+        "tokenizer.json": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
+        "tokenizer_config.json": "253153d0738ceb4c668d2eff957714dd2bea0b56de772a9fdccd96cbf517e6a0"
+      },
+      "grammar": {
+        "kind": "template",
+        "pad": {
+          "id": 151643,
+          "text": "<|endoftext|>"
+        },
+        "pooling": "last_non_pad",
+        "readout": {
+          "kind": "yes_no_two_way_softmax",
+          "no": {
+            "id": 2152,
+            "text": "no"
+          },
+          "weight": "model.embed_tokens.weight",
+          "yes": {
+            "id": 9693,
+            "text": "yes"
+          }
+        },
+        "special_tokens": {
+          "im_end": {
+            "id": 151645,
+            "text": "<|im_end|>"
+          },
+          "im_start": {
+            "id": 151644,
+            "text": "<|im_start|>"
+          },
+          "think_end": {
+            "id": 151668,
+            "text": "</think>"
+          },
+          "think_start": {
+            "id": 151667,
+            "text": "<think>"
+          }
+        },
+        "template": {
+          "body_format": "<Instruct>: {instruction}\n<Query>: {query}\n<Document>: {doc}",
+          "instruction": "Given a web search query, retrieve relevant passages that answer the query",
+          "oracle": {
+            "path": "oracles/qwen3-reranker-0.6b-README.md",
+            "sha256": "5bba8c734f6dd3ae48317b4139317e45a7fce48fc55e15670b23a0dd15492ab6"
+          },
+          "prefix": "<|im_start|>system\nJudge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be \"yes\" or \"no\".<|im_end|>\n<|im_start|>user\n",
+          "suffix": "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        },
+        "terminal_tokens": []
+      },
+      "head": {
+        "forbidden_tensor_keys": [
+          "lm_head.weight"
+        ],
+        "pooling": "last_non_pad",
+        "required_tensor_keys": [
+          "model.embed_tokens.weight"
+        ],
+        "stages": [
+          "readout_rows"
+        ],
+        "tensors": {
+          "readout": {
+            "key": "model.embed_tokens.weight",
+            "shape": [
+              151669,
+              1024
+            ]
+          }
+        }
+      },
+      "hf_repo": "Qwen/Qwen3-Reranker-0.6B",
+      "hf_revision": "e61197ed45024b0ed8a2d74b80b4d909f1255473",
+      "operation": "rerank",
+      "output": {
+        "dimension": 1,
+        "normalization": "none"
+      },
+      "tensor_index_sha256": "4bf86eec11ba5d38ccb4ba6f46c6e9d05d7874db87fb42b633752fea897a58b3",
+      "tensor_prefix": "model.",
+      "tokenizer_digest": "sha256:aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4"
+    }
+  },
+  "profiles": {
+    "gte-modernbert-base.ane-direct-worker": {
+      "compute_dtype": "f16",
+      "conversion_rule": "v1",
+      "converted_package_digest": "sha256:8a31e3d67a89412b4314136f5ec3489a46dacf438480010139c7d6c2dc045375",
+      "cpu_stages": [
+        "token_embedding",
+        "mask_position",
+        "rotation_in",
+        "rotation_out",
+        "final_norm",
+        "pooling"
+      ],
+      "fp32_tensors": [
+        "embeddings.tok_embeddings.weight",
+        "rotation_in.weight",
+        "rotation_out.weight"
+      ],
+      "gelu_lowering": "tanh",
+      "lane": "ane-direct-worker",
+      "model": "gte-modernbert-base",
+      "rerank_tolerance_class": "fp16",
+      "rotation": "modernbert-hadamard-768-v2",
+      "storage_dtype": "f16"
+    },
+    "gte-modernbert-base.owned-cuda": {
+      "compute_dtype": "f16",
+      "conversion_rule": "v1",
+      "converted_package_digest": "sha256:9259f3b731a35f260d74df99b618231a4d68f5dce9d75c6e4f039e1dbad646cd",
+      "fp32_tensors": [],
+      "lane": "owned-cuda",
+      "model": "gte-modernbert-base",
+      "rerank_tolerance_class": "fp16",
+      "storage_dtype": "f16"
+    },
+    "gte-modernbert-base.owned-metal": {
+      "compute_dtype": "f16",
+      "conversion_rule": "none",
+      "fp32_tensors": [],
+      "lane": "owned-metal",
+      "model": "gte-modernbert-base",
+      "rerank_tolerance_class": "fp16",
+      "storage_dtype": "f16"
+    },
+    "gte-modernbert-base.owned-vulkan": {
+      "compute_dtype": "f16",
+      "conversion_rule": "v1",
+      "converted_package_digest": "sha256:1557b3ef614f761b91fbd0c68c9f9bea7124e3971fe189c9e3044c16f5092336",
+      "fp32_tensors": [],
+      "lane": "owned-vulkan",
+      "model": "gte-modernbert-base",
+      "rerank_tolerance_class": "fp16",
+      "storage_dtype": "f16",
+      "vulkan_min_device_local_bytes": 563911172,
+      "vulkan_min_storage_buffer_range": 77365248,
+      "vulkan_sub_batch_max_tokens": 8192
+    },
+    "gte-reranker-modernbert-base.ane-direct-worker": {
+      "compute_dtype": "f16",
+      "conversion_rule": "v1",
+      "converted_package_digest": "sha256:2ecb952868e28ed5a45c3f5c057e0f6d46df384ba540e1f05113462fd0d6a1de",
+      "cpu_stages": [
+        "token_embedding",
+        "mask_position",
+        "rotation_in",
+        "rotation_out",
+        "final_norm",
+        "pooling",
+        "gte_classifier_head"
+      ],
+      "fp32_tensors": [
+        "classifier.bias",
+        "classifier.weight",
+        "head.dense.weight",
+        "head.norm.weight",
+        "model.embeddings.tok_embeddings.weight",
+        "rotation_in.weight",
+        "rotation_out.weight"
+      ],
+      "gelu_lowering": "tanh",
+      "lane": "ane-direct-worker",
+      "model": "gte-reranker-modernbert-base",
+      "rerank_tolerance_class": "fp16",
+      "rotation": "modernbert-hadamard-768-v2",
+      "storage_dtype": "f16"
+    },
+    "gte-reranker-modernbert-base.owned-cuda": {
+      "compute_dtype": "f16",
+      "conversion_rule": "v1",
+      "converted_package_digest": "sha256:b40b133b99ff8f70a7bc7d0cefbcb3a5aba78f6fb55f67cda7b7991e085f0f6d",
+      "fp32_tensors": [],
+      "lane": "owned-cuda",
+      "model": "gte-reranker-modernbert-base",
+      "rerank_tolerance_class": "fp16",
+      "storage_dtype": "f16"
+    },
+    "gte-reranker-modernbert-base.owned-metal": {
+      "compute_dtype": "f32",
+      "conversion_rule": "none",
+      "fp32_tensors": "all",
+      "lane": "owned-metal",
+      "model": "gte-reranker-modernbert-base",
+      "rerank_tolerance_class": "fp32",
+      "storage_dtype": "f32"
+    },
+    "gte-reranker-modernbert-base.owned-vulkan": {
+      "compute_dtype": "f16",
+      "conversion_rule": "v1",
+      "converted_package_digest": "sha256:dc2640312b8c69c1f9b17655ec8d9215467584acb6f8880d0ac228730780182e",
+      "fp32_tensors": [],
+      "lane": "owned-vulkan",
+      "model": "gte-reranker-modernbert-base",
+      "rerank_tolerance_class": "fp16",
+      "storage_dtype": "f16",
+      "vulkan_min_device_local_bytes": 564311558,
+      "vulkan_min_storage_buffer_range": 77365248,
+      "vulkan_sub_batch_max_tokens": 8192
+    },
+    "qwen3-embedding-0.6b.ane-direct-worker": {
+      "compute_dtype": "f16",
+      "conversion_rule": "v1",
+      "converted_package_digest": "sha256:1af6d091d7d5f21a998af0f438333d9af051c82af8b27bd2439c60efa09bd5db",
+      "cpu_stages": [
+        "token_embedding",
+        "mask_position",
+        "final_norm",
+        "pooling"
+      ],
+      "fp32_tensors": [
+        "embed_tokens.weight",
+        "norm.weight"
+      ],
+      "gelu_lowering": "none",
+      "lane": "ane-direct-worker",
+      "model": "qwen3-embedding-0.6b",
+      "rerank_tolerance_class": "fp16",
+      "rotation": "none",
+      "storage_dtype": "f16"
+    },
+    "qwen3-embedding-0.6b.owned-cuda": {
+      "compute_dtype": "f16",
+      "conversion_rule": "v1",
+      "converted_package_digest": "sha256:7dad02fc38d5fa8f1ecea57150e1cf877b59f61895489a0765a45e84f9df3d4d",
+      "fp32_tensors": [],
+      "lane": "owned-cuda",
+      "model": "qwen3-embedding-0.6b",
+      "rerank_tolerance_class": "fp16",
+      "storage_dtype": "f16"
+    },
+    "qwen3-embedding-0.6b.owned-metal": {
+      "compute_dtype": "f16",
+      "conversion_rule": "none",
+      "fp32_tensors": [],
+      "lane": "owned-metal",
+      "model": "qwen3-embedding-0.6b",
+      "rerank_tolerance_class": "fp16",
+      "storage_dtype": "f16"
+    },
+    "qwen3-embedding-0.6b.owned-vulkan": {
+      "compute_dtype": "f16",
+      "conversion_rule": "v1",
+      "converted_package_digest": "sha256:0e52945e2503f7abb6d92dfaf7bd43f7246801dee288d5e76127f93c2503bd44",
+      "fp32_tensors": [],
+      "lane": "owned-vulkan",
+      "model": "qwen3-embedding-0.6b",
+      "rerank_tolerance_class": "fp16",
+      "storage_dtype": "f16",
+      "vulkan_min_device_local_bytes": 1764145156,
+      "vulkan_min_storage_buffer_range": 310618112,
+      "vulkan_sub_batch_max_tokens": 8192
+    },
+    "qwen3-reranker-0.6b.ane-direct-worker": {
+      "compute_dtype": "f16",
+      "conversion_rule": "v1",
+      "converted_package_digest": "sha256:cc02357cfc81a92562b251914bed5c8d3960b7edf4814ee73de9f21611e22959",
+      "cpu_stages": [
+        "token_embedding",
+        "mask_position",
+        "final_norm",
+        "pooling",
+        "qwen_yes_no_readout"
+      ],
+      "fp32_tensors": [
+        "model.embed_tokens.weight",
+        "model.norm.weight"
+      ],
+      "gelu_lowering": "none",
+      "lane": "ane-direct-worker",
+      "model": "qwen3-reranker-0.6b",
+      "rerank_tolerance_class": "fp16",
+      "rotation": "none",
+      "storage_dtype": "f16"
+    },
+    "qwen3-reranker-0.6b.owned-cuda": {
+      "compute_dtype": "f16",
+      "conversion_rule": "v1",
+      "converted_package_digest": "sha256:d67169c6cb3a384a6c88272fade51064029aaa51368c45e03cc71f93ece37c80",
+      "fp32_tensors": [],
+      "lane": "owned-cuda",
+      "model": "qwen3-reranker-0.6b",
+      "rerank_tolerance_class": "fp16",
+      "storage_dtype": "f16"
+    },
+    "qwen3-reranker-0.6b.owned-metal": {
+      "compute_dtype": "f16",
+      "conversion_rule": "none",
+      "fp32_tensors": [],
+      "lane": "owned-metal",
+      "model": "qwen3-reranker-0.6b",
+      "rerank_tolerance_class": "fp16",
+      "storage_dtype": "f16"
+    },
+    "qwen3-reranker-0.6b.owned-vulkan": {
+      "compute_dtype": "f16",
+      "conversion_rule": "v1",
+      "converted_package_digest": "sha256:ccb27c4693f46b5d301ec524bff0c3bb7138a4e70713eb15b8cdfe8cd4c76f6c",
+      "fp32_tensors": [],
+      "lane": "owned-vulkan",
+      "model": "qwen3-reranker-0.6b",
+      "rerank_tolerance_class": "fp16",
+      "storage_dtype": "f16",
+      "vulkan_min_device_local_bytes": 1763101700,
+      "vulkan_min_storage_buffer_range": 310618112,
+      "vulkan_sub_batch_max_tokens": 8192
+    }
+  },
+  "reference": {
+    "device": "cpu",
+    "dtype": "fp32",
+    "reference_seed": 0,
+    "reference_transformers_version": "5.16.1"
+  },
+  "rotations": {
+    "modernbert-hadamard-768-v2": {
+      "construction": "Q = D kron(H12, H64) / sqrt(768): H12 Paley type I (q = 11, H = I + S), H64 Sylvester, D diagonal row signs; row r takes bit r % 256 (LSB first within each byte) of SHA-256(b\"modernbert-hadamard-768\" || sign_seed as u64 LE || r / 256 as u64 LE), set bit = -1; generated by bench/parity/src/hadamard.rs",
+      "dimension": 768,
+      "element": "f64le",
+      "layout": "row_major",
+      "scope": "modernbert-residual-stream-v1",
+      "sha256": "5cd34f0d01ce33615f987bd62be88b8e595f5083a3c94b42291c053d5cf87d53",
+      "sign_seed": 0
+    }
+  },
+  "schema": "synapse-parity-models-v1"
+}

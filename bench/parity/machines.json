@@ -1,0 +1,98 @@
+{
+  "machines": {
+    "m5-max-macbook-pro": {
+      "description": "M5 Max MacBook Pro used by the existing ANE evidence",
+      "gpu": "Apple M5 Max",
+      "model_identifier": "Mac17,6",
+      "os_arch": [
+        "darwin-arm64"
+      ],
+      "rented": false
+    },
+    "rog-ally-x": {
+      "description": "ASUS ROG Ally X; Windows, and Linux booted from external media unless a dedicated Linux AMD machine is found first",
+      "gpu": "AMD Radeon 780M",
+      "os_arch": [
+        "linux-x64",
+        "windows-x64"
+      ],
+      "rented": false
+    },
+    "rtx-3080-windows": {
+      "description": "The owner's Windows RTX 3080 box",
+      "fallback": "a rented Windows NVIDIA GPU instance, recorded with its instance id",
+      "gpu": "NVIDIA GeForce RTX 3080",
+      "os_arch": [
+        "windows-x64"
+      ],
+      "rented": false
+    },
+    "vast-ai-linux-nvidia": {
+      "description": "Rented vast.ai Linux NVIDIA instance; the record names its instance id",
+      "gpu": "NVIDIA",
+      "os_arch": [
+        "linux-x64"
+      ],
+      "rented": true
+    }
+  },
+  "rows": {
+    "ane-m5": {
+      "floor_probe": true,
+      "lane": "ane-direct-worker",
+      "machine": "m5-max-macbook-pro",
+      "module_config": "rows/ane-m5.json",
+      "os_arch": "darwin-arm64"
+    },
+    "cuda-linux-nvidia": {
+      "floor_probe": true,
+      "lane": "owned-cuda",
+      "machine": "vast-ai-linux-nvidia",
+      "module_config": "rows/cuda-linux-nvidia.json",
+      "os_arch": "linux-x64"
+    },
+    "cuda-windows-nvidia": {
+      "floor_probe": true,
+      "lane": "owned-cuda",
+      "machine": "rtx-3080-windows",
+      "module_config": "rows/cuda-windows-nvidia.json",
+      "os_arch": "windows-x64"
+    },
+    "metal-m5": {
+      "floor_probe": false,
+      "lane": "owned-metal",
+      "machine": "m5-max-macbook-pro",
+      "module_config": "rows/metal-m5.json",
+      "os_arch": "darwin-arm64"
+    },
+    "vulkan-linux-amd": {
+      "floor_probe": true,
+      "lane": "owned-vulkan",
+      "machine": "rog-ally-x",
+      "module_config": "rows/vulkan-linux-amd.json",
+      "os_arch": "linux-x64"
+    },
+    "vulkan-linux-nvidia": {
+      "floor_probe": true,
+      "lane": "owned-vulkan",
+      "machine": "vast-ai-linux-nvidia",
+      "module_config": "rows/vulkan-linux-nvidia.json",
+      "os_arch": "linux-x64"
+    },
+    "vulkan-windows-amd": {
+      "floor_probe": true,
+      "lane": "owned-vulkan",
+      "machine": "rog-ally-x",
+      "module_config": "rows/vulkan-windows-amd.json",
+      "os_arch": "windows-x64"
+    },
+    "vulkan-windows-nvidia": {
+      "floor_probe": true,
+      "lane": "owned-vulkan",
+      "machine": "rtx-3080-windows",
+      "module_config": "rows/vulkan-windows-nvidia.json",
+      "os_arch": "windows-x64"
+    }
+  },
+  "schema": "synapse-parity-machines-v1"
+}
