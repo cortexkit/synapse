@@ -364,7 +364,7 @@ pub(crate) fn read_evidence_dir(dir: &Path) -> std::io::Result<BTreeMap<String, 
 pub(crate) fn engine_tree_at(repo_root: &Path, revision: &str) -> Result<String, String> {
     let mut trees = Vec::with_capacity(ENGINE_TREE_DIRS.len());
     for dir in ENGINE_TREE_DIRS {
-        let output = Command::new("git")
+        let output = synapse_core::without_launch_nonce(Command::new("git"))
             .arg("-C")
             .arg(repo_root)
             .args(["rev-parse", "--verify", &format!("{revision}:{dir}")])
