@@ -6783,7 +6783,7 @@ pub enum DownloadPublication {
     Proceed { newly_published: bool },
     /// The job is already terminal; nothing was written and the caller must
     /// not publish.
-    Stopped(JobRecord),
+    Stopped(Box<JobRecord>),
 }
 
 /// Result of [`SynapseStore::root_reused_download_blob`].
@@ -6795,7 +6795,7 @@ pub enum DownloadReuse {
     /// caller must fetch the file.
     Absent,
     /// The job is already terminal; nothing was written.
-    Stopped(JobRecord),
+    Stopped(Box<JobRecord>),
 }
 
 /// How a cancel or failure ends a download job.
@@ -6889,7 +6889,7 @@ impl SynapseStore {
         request: &DownloadJobRequest<'_>,
     ) -> Result<DownloadAdmission, SynapseStoreError> {
         enum TxAdmission {
-            Ready(DownloadAdmission),
+            Ready(Box<DownloadAdmission>),
             Conflict(String),
         }
 
@@ -6906,7 +6906,9 @@ impl SynapseStore {
                     let reusable = is_download_non_terminal(&job.state)
                         || (job.state == DOWNLOAD_STATE_COMMITTED && request.entry_complete);
                     if reusable {
-                        return Ok(TxAdmission::Ready(DownloadAdmission::Attached(job)));
+                        return Ok(TxAdmission::Ready(Box::new(DownloadAdmission::Attached(
+                            job,
+                        ))));
                     }
                 }
             }
@@ -6959,10 +6961,10 @@ impl SynapseStore {
                     admission.record().job_id,
                 ],
             )?;
-            Ok(TxAdmission::Ready(admission))
+            Ok(TxAdmission::Ready(Box::new(admission)))
         })?;
         match admission {
-            TxAdmission::Ready(admission) => Ok(admission),
+            TxAdmission::Ready(admission) => Ok(*admission),
             TxAdmission::Conflict(existing_digest) => Err(SynapseStoreError::IdempotencyConflict {
                 request_key: request.request_key.to_string(),
                 existing_digest,
@@ -7013,7 +7015,7 @@ impl SynapseStore {
         let digest = normalize_blob_digest(digest)?;
         let publication = self.store.with_conn_fenced(|tx| {
             if let Some(stopped) = stopped_download_job_tx(tx, job_id)? {
-                return Ok(DownloadPublication::Stopped(stopped));
+                return Ok(DownloadPublication::Stopped(Box::new(stopped)));
             }
             let newly_published = cache
                 .blob_size(&digest)
@@ -7047,7 +7049,7 @@ impl SynapseStore {
         let digest = normalize_blob_digest(digest)?;
         let reuse = self.store.with_conn_fenced(|tx| {
             if let Some(stopped) = stopped_download_job_tx(tx, job_id)? {
-                return Ok(DownloadReuse::Stopped(stopped));
+                return Ok(DownloadReuse::Stopped(Box::new(stopped)));
             }
             let present = cache
                 .blob_size(&digest)
@@ -13777,7 +13779,7 @@ mod tests {
         );
         applied(
             store
-                .commit_download_job(&repair.job_id, &[replacement.clone()], 31)
+                .commit_download_job(&repair.job_id, std::slice::from_ref(&replacement), 31)
                 .unwrap(),
         );
         assert_eq!(
