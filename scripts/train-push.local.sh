@@ -21,41 +21,50 @@ if [ "$(uname -s)" = "Darwin" ]; then
   if [ -d /Applications/Xcode.app ]; then
     export DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
   fi
-  # These two commands rewrite Cargo.lock as a side effect, because the sibling
-  # path dependencies (../subconscious, ../commons) are other agents' working
-  # checkouts and routinely sit ahead of siblings.lock. That rewrite dirties the
-  # tree, and the NEXT train then refuses on a change this script made itself.
-  #
-  # --locked does not solve it: it refuses to run at all whenever a sibling has
-  # moved, which here is most of the time, and those checkouts are not ours to
-  # roll back. CI is unaffected either way because it checks the siblings out at
-  # the pinned commits. So verify against whatever is on disk, then put the lock
-  # back exactly as it was — and leave a deliberate lock edit alone.
-  lock_was_clean=no
-  git diff --quiet -- Cargo.lock 2>/dev/null && lock_was_clean=yes
-  restore_lock() {
-    if [ "$lock_was_clean" = yes ]; then
-      git checkout -- Cargo.lock 2>/dev/null || true
-    fi
-  }
+  # --locked: the subc and commons crates are exact crates.io pins in the root
+  # Cargo.toml (no sibling path checkouts), so a Cargo.lock that would need
+  # rewriting means the committed lock is wrong, which is worth refusing.
   # shellcheck disable=SC2086
-  cargo clippy $mac_crates --all-targets -- -D warnings \
-    || { restore_lock; refuse "macOS-only crates failed clippy (CI cannot run these; see scripts/train-push.local.sh)"; }
-  cargo test -p synapse-engine-owned --lib \
-    || { restore_lock; refuse "synapse-engine-owned lib tests failed (CI cannot run these)"; }
-  restore_lock
+  cargo clippy --locked $mac_crates --all-targets -- -D warnings \
+    || refuse "macOS-only crates failed clippy (CI cannot run these; see scripts/train-push.local.sh)"
+  cargo test --locked -p synapse-engine-owned --lib \
+    || refuse "synapse-engine-owned lib tests failed (CI cannot run these)"
 fi
 
-# The daily cron on tests.yml is this repository's only sample of "same sha,
-# siblings at their tips" (pushes build against siblings.lock, so a lock wave
-# that breaks the tips is invisible to them). Its result reaches nobody unless
-# something reads it, and three seats found multi-day red streaks this way
-# (fleet notices #486, #487, #490). Read it here, where every landing passes.
+# Linux clippy, run here because otherwise a Linux-only failure (code behind
+# cfg(not(target_os = "macos")), or test helpers left dead when their callers
+# are macOS-only) is found only by a CI train about ten minutes later. It
+# checks the crates CI lints, read from tests.yml so the two lists cannot
+# drift. ring's build script needs a Linux C compiler, which zig provides
+# through the scripts/lib/zig-*.sh shims. Without zig or the rust target this is
+# a notice, not a refusal: CI still gates the train.
+linux_target=x86_64-unknown-linux-gnu
+if command -v zig >/dev/null 2>&1 && rustup target list --installed 2>/dev/null | grep -qx "$linux_target"; then
+  ci_crates="$(sed -n 's/^ *SYNAPSE_CRATES: *//p' .github/workflows/tests.yml | head -1)"
+  [ -n "$ci_crates" ] || refuse "could not read SYNAPSE_CRATES from .github/workflows/tests.yml for the Linux clippy check"
+  # The llama worker's build script compiles llama.cpp through CMake, which
+  # zig cannot cross-build from here; that one crate stays CI-only.
+  ci_crates="$(printf '%s\n' "$ci_crates" | sed 's/-p synapse-worker-llama//')"
+  # shellcheck disable=SC2086
+  CC_x86_64_unknown_linux_gnu="$PWD/scripts/lib/zig-cc-linux.sh" \
+  AR_x86_64_unknown_linux_gnu="$PWD/scripts/lib/zig-ar.sh" \
+    cargo clippy --locked --target "$linux_target" $ci_crates --all-targets -- -D warnings \
+    || refuse "Linux-target clippy failed (the same check CI's linux job runs; see scripts/train-push.local.sh)"
+else
+  say "NOTICE: skipping the Linux clippy preflight (needs zig and 'rustup target add $linux_target'); CI will be the first Linux check"
+fi
+
+# The daily cron on tests.yml is this repository's only scheduled sample of
+# master against the current toolchain and runner images, which a push-only
+# CI never sees change. Its result reaches nobody unless something reads it:
+# a red scheduled run raises no alert, and repositories in this fleet have sat
+# red for days before anyone looked. Read it here, where every landing passes.
 # NOTICES, not refusals: a scheduled red is about what already landed, and the
-# push in front of you may be its fix. --event schedule is filtered server-side,
-# so a push flood cannot empty the window (#489). The 48 h age bound is above
-# GitHub's routine queue lag (a cron landing five hours late is healthy) and
-# catches the case a green last run hides: a cron that fired, then stopped.
+# push in front of you may be its fix. --event schedule is filtered
+# server-side, so a burst of push runs cannot crowd the last scheduled run out
+# of the list. The 48 h age bound is above GitHub's routine queue lag (a cron
+# landing five hours late is healthy) and catches the case a green last run
+# hides: a cron that fired, then stopped.
 if command -v gh >/dev/null 2>&1; then
   sched="$(gh run list --event schedule --limit 1 --json conclusion,createdAt,headSha \
     --jq '.[] | "\(.conclusion) \(.createdAt[0:16]) \(.headSha[0:8])"' 2>/dev/null || true)"
