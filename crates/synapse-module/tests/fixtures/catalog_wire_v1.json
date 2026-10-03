@@ -1,0 +1,8 @@
+{
+  "unknown_download": {"module_generation":1,"error":{"code":"unknown_model","class":"permanent","safe_to_retry_same_request":false,"message":"unknown model 'no-such-model'","details":{"model_id":"no-such-model"}}},
+  "committed": {"job_id":"<job>","state":"committed"},
+  "cancelled": {"job_id":"<job>","state":"cancelled"},
+  "queued": {"job_id":"<job>","state":"queued"},
+  "downloading": {"job_id":"<job>","state":"downloading","bytes_done":1,"bytes_total":30},
+  "verifying": {"job_id":"<job>","state":"verifying"}
+}

@@ -1,4 +1,4 @@
-#![cfg(unix)]
+#![cfg(all(unix, target_os = "macos"))]
 #![forbid(unsafe_code)]
 
 mod common;
@@ -65,16 +65,17 @@ impl Drop for ModuleProcess {
 }
 
 struct SoakAssets {
-    onnx_snapshot: PathBuf,
-    gguf_snapshot: PathBuf,
+    safetensors_snapshot: PathBuf,
     worker_bin: PathBuf,
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires local MiniLM ONNX, MiniLM GGUF, and llama worker assets"]
+#[ignore = "requires local MiniLM safetensors and llama worker assets; crash soak also needs SYNAPSE_SOAK_DECODE_GGUF"]
 async fn mixed_load_burst_and_idempotent_job_invariants_hold() {
     let Some(assets) = soak_assets() else {
-        eprintln!("skipping soak: MiniLM ONNX/GGUF snapshots or llama worker binary are missing");
+        eprintln!(
+            "skipping soak: MiniLM safetensors/GGUF snapshots or llama worker binary are missing"
+        );
         return;
     };
     let config_temp = unique_temp_dir("synapse-soak-config");
@@ -85,14 +86,14 @@ async fn mixed_load_burst_and_idempotent_job_invariants_hold() {
         &mut control,
         control_route,
         100,
-        &["minilm-ort", "minilm-llama"],
+        &["minilm-metal", "minilm-metal-secondary"],
     )
     .await;
 
     let job_body = serde_json::json!({
         "method": "embed.batch",
         "params": {
-            "model": "minilm-ort",
+            "model": "minilm-metal",
             "request_key": "soak-idempotent-5k",
             "items": soak_items(SOAK_JOB_ITEMS),
         }
@@ -144,7 +145,7 @@ async fn mixed_load_burst_and_idempotent_job_invariants_hold() {
                         serde_json::json!({
                             "method": "embed.query",
                             "params": {
-                                "model": "minilm-ort",
+                                "model": "minilm-metal",
                                 "id": format!("sustain-{consumer_index}-{query_index}"),
                                 "text": format!("sustained soak query {consumer_index} {query_index}"),
                                 "deadline_ms": 5_000,
@@ -169,7 +170,7 @@ async fn mixed_load_burst_and_idempotent_job_invariants_hold() {
         30_000,
         serde_json::json!({
             "method": "probe.start",
-            "params": { "request_key": "soak-probe-mid", "models": ["minilm-ort"] }
+            "params": { "request_key": "soak-probe-mid", "models": ["minilm-metal"] }
         }),
     )
     .await;
@@ -214,84 +215,86 @@ async fn mixed_load_burst_and_idempotent_job_invariants_hold() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires local MiniLM ONNX, MiniLM GGUF, and llama worker assets"]
-async fn crash_budget_quarantines_llama_without_affecting_ort_lane() {
+#[ignore = "requires local MiniLM safetensors and llama worker assets; crash soak also needs SYNAPSE_SOAK_DECODE_GGUF"]
+async fn crash_budget_quarantines_llama_without_affecting_metal_lane() {
     let Some(assets) = soak_assets() else {
         eprintln!(
-            "skipping crash soak: MiniLM ONNX/GGUF snapshots or llama worker binary are missing"
+            "skipping crash soak: MiniLM safetensors/GGUF snapshots or llama worker binary are missing"
         );
         return;
     };
     let config_temp = unique_temp_dir("synapse-soak-crash-config");
     std::fs::create_dir_all(&config_temp).unwrap();
     let wrapper = aborting_worker_wrapper(&assets.worker_bin, &config_temp);
-    let config = soak_config(&assets, &wrapper, &config_temp);
+    let Some(decode_model) = std::env::var_os("SYNAPSE_SOAK_DECODE_GGUF").map(PathBuf::from) else {
+        eprintln!("skipping crash soak: SYNAPSE_SOAK_DECODE_GGUF must name a decoder GGUF");
+        return;
+    };
+    let mut config: Value =
+        serde_json::from_str(&soak_config(&assets, &wrapper, &config_temp)).unwrap();
+    config["preload_models"][1] = serde_json::json!({
+        "model_id": "minilm-llama", "engine": LLAMA_ENGINE, "task":"generate",
+        "model_path": decode_model, "tokenizer_path":assets.safetensors_snapshot.join("tokenizer.json"),
+        "worker_bin":wrapper, "worker_runtime_dir":short_worker_runtime_dir(&config_temp),
+        "format":"gguf", "quant":"f16", "max_tokens":512
+    });
+    let config = config.to_string();
     let (_daemon, _module, mut control, control_route) = open_route_with_config(&config).await;
-    certify_models(&mut control, control_route, 60_000, &["minilm-ort"]).await;
+    certify_models(&mut control, control_route, 60_000, &["minilm-metal"]).await;
 
     for attempt in 0..3_u64 {
-        let ort = route_request(
+        let metal = route_request(
             &mut control,
             control_route,
             61_000 + attempt,
             serde_json::json!({
                 "method": "embed.query",
                 "params": {
-                    "model": "minilm-ort",
-                    "id": format!("ort-during-crash-{attempt}"),
-                    "text": format!("ort lane remains isolated during crash attempt {attempt}")
+                    "model": "minilm-metal",
+                    "id": format!("metal-during-crash-{attempt}"),
+                    "text": format!("Metal lane remains isolated during crash attempt {attempt}")
                 }
             }),
         )
         .await;
-        assert_eq!(ort["result"]["dims"].as_u64(), Some(384));
-        assert_eq!(ort["result"]["module_generation"].as_u64(), Some(1));
+        assert_eq!(metal["result"]["dims"].as_u64(), Some(384));
+        assert_eq!(metal["result"]["module_generation"].as_u64(), Some(1));
 
-        let accepted = route_request(
+        let started = Instant::now();
+        // llama.cpp remains a supported generate engine; embedding is owned-only.
+        // The abort wrapper allows LOAD, then kills the real worker on generation.
+        let done = route_request(
             &mut control,
             control_route,
             62_000 + attempt,
             serde_json::json!({
-                "method": "probe.start",
-                "params": {
-                    "request_key": format!("soak-crash-llama-{attempt}"),
-                    "models": ["minilm-llama"]
-                }
+                "method": "microllm.oneshot",
+                "params": {"model":"minilm-llama", "prompt":"hello", "max_tokens":1}
             }),
-        )
-        .await;
-        let probe_id = accepted["result"]["job_id"].as_str().unwrap().to_string();
-        let started = Instant::now();
-        let done = poll_probe_status(
-            &mut control,
-            control_route,
-            63_000 + attempt * 100,
-            &probe_id,
         )
         .await;
         assert!(
             started.elapsed() < Duration::from_secs(30),
-            "probe crash should settle within the worker request timeout: {done:?}"
+            "generate crash should settle within the worker request timeout: {done:?}"
         );
-        let state = done["result"]["state"].as_str().unwrap_or("");
         let error = &done["result"]["error"];
         if attempt < 2 {
             assert_eq!(
-                state, "failed_transient",
-                "probe should fail on worker crash"
+                error["class"], "transient",
+                "generate should fail transiently on worker crash"
             );
             assert_eq!(
                 error["code"], "engine_crashed",
-                "probe should expose typed crash: {done:?}"
+                "generate should expose typed crash: {done:?}"
             );
         } else {
             assert_eq!(
-                state, "failed_permanent",
-                "quarantine should fail the probe permanently"
+                error["class"], "permanent",
+                "quarantine should refuse generation permanently"
             );
             assert_eq!(
                 error["code"], "probe_required",
-                "quarantine should require a fresh probe: {done:?}"
+                "quarantine should require recovery before generation: {done:?}"
             );
             assert!(error["message"]
                 .as_str()
@@ -317,17 +320,17 @@ async fn crash_budget_quarantines_llama_without_affecting_ort_lane() {
     assert_eq!(llama_health["degraded"], true);
     assert!(llama_health["quarantined_models"].as_u64().unwrap_or(0) >= 1);
 
-    let ort_after = route_request(
+    let metal_after = route_request(
         &mut control,
         control_route,
         65_000,
         serde_json::json!({
             "method": "embed.query",
-            "params": { "model": "minilm-ort", "text": "ort lane still answers after quarantine" }
+            "params": { "model": "minilm-metal", "text": "Metal lane still answers after quarantine" }
         }),
     )
     .await;
-    assert_eq!(ort_after["result"]["dims"].as_u64(), Some(384));
+    assert_eq!(metal_after["result"]["dims"].as_u64(), Some(384));
 }
 
 async fn start_daemon() -> TestDaemon {
@@ -566,7 +569,7 @@ async fn burst_queries_fast_fail_without_hangs(connection_file_path: &Path) {
                     serde_json::to_vec(&serde_json::json!({
                         "method": "embed.query",
                         "params": {
-                            "model": "minilm-ort",
+                            "model": "minilm-metal",
                             "id": format!("burst-{connection_index}-{offset}"),
                             "text": format!("burst query {connection_index} {offset}"),
                             "deadline_ms": BURST_DEADLINE_MS,
@@ -647,18 +650,19 @@ fn soak_items(count: usize) -> Vec<Value> {
         .collect()
 }
 
-fn soak_config(assets: &SoakAssets, worker_bin: &Path, temp_dir: &Path) -> String {
-    let tokenizer_path = assets.onnx_snapshot.join("tokenizer.json");
-    let onnx_model = assets.onnx_snapshot.join("model.onnx");
-    let gguf_model = assets
-        .gguf_snapshot
-        .join("all-MiniLM-L6-v2-ggml-model-f16.gguf");
+fn soak_config(assets: &SoakAssets, _worker_bin: &Path, _temp_dir: &Path) -> String {
+    let tokenizer_path = assets.safetensors_snapshot.join("tokenizer.json");
+    let metal_model = assets.safetensors_snapshot.join("model.safetensors");
+
     serde_json::json!({
         "preload_models": [
             {
-                "model_id": "minilm-ort",
-                "engine": "ort",
-                "model_path": onnx_model,
+                "model_id": "minilm-metal",
+                "engine": "owned-metal",
+                "family": "minilm",
+                "dtype": "f32",
+                "execution": "explicit",
+                "model_path": metal_model,
                 "tokenizer_path": tokenizer_path,
                 "pooling": "mean",
                 "normalize": true,
@@ -666,17 +670,18 @@ fn soak_config(assets: &SoakAssets, worker_bin: &Path, temp_dir: &Path) -> Strin
                 "quant": "fp32"
             },
             {
-                "model_id": "minilm-llama",
-                "engine": LLAMA_ENGINE,
-                "model_path": gguf_model,
-                "tokenizer_path": assets.onnx_snapshot.join("tokenizer.json"),
-                "worker_bin": worker_bin,
-                "worker_runtime_dir": short_worker_runtime_dir(temp_dir),
+                "model_id": "minilm-metal-secondary",
+                "engine": "owned-metal",
+                "family": "minilm",
+                "dtype": "f32",
+                "execution": "explicit",
+                "model_path": metal_model,
+                "tokenizer_path": assets.safetensors_snapshot.join("tokenizer.json"),
                 "pooling": "mean",
                 "normalize": true,
                 "max_tokens": 512,
-                "format": "gguf",
-                "quant": "f16"
+                "format": "safetensors",
+                "quant": "fp32"
             }
         ],
         "inline": {
@@ -717,21 +722,18 @@ fn aborting_worker_wrapper(real_worker: &Path, temp_dir: &Path) -> PathBuf {
 }
 
 fn soak_assets() -> Option<SoakAssets> {
-    let onnx_snapshot = minilm_onnx_snapshot()?;
-    let gguf_snapshot = minilm_gguf_snapshot()?;
+    let safetensors_snapshot = minilm_safetensors_snapshot()?;
     let worker_bin = llama_worker_bin()?;
     let required = [
-        onnx_snapshot.join("model.onnx"),
-        onnx_snapshot.join("tokenizer.json"),
-        gguf_snapshot.join("all-MiniLM-L6-v2-ggml-model-f16.gguf"),
+        safetensors_snapshot.join("model.safetensors"),
+        safetensors_snapshot.join("tokenizer.json"),
         worker_bin.clone(),
     ];
     required
         .iter()
         .all(|path| path.exists())
         .then_some(SoakAssets {
-            onnx_snapshot,
-            gguf_snapshot,
+            safetensors_snapshot,
             worker_bin,
         })
 }
@@ -746,29 +748,18 @@ fn llama_worker_bin() -> Option<PathBuf> {
     candidate.exists().then_some(candidate)
 }
 
-fn minilm_onnx_snapshot() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("SYNAPSE_MINILM_ONNX_SNAPSHOT") {
+fn minilm_safetensors_snapshot() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("SYNAPSE_MINILM_SAFETENSORS_SNAPSHOT") {
         return Some(PathBuf::from(path));
     }
     let home = std::env::var("HOME").ok()?;
     let snapshots = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--Qdrant--all-MiniLM-L6-v2-onnx/snapshots");
+        .join(".cache/huggingface/hub/models--sentence-transformers--all-MiniLM-L6-v2/snapshots");
     let manual = snapshots.join("manual");
     if manual.exists() {
         return Some(manual);
     }
-    first_snapshot_with(&snapshots, "model.onnx")
-}
-
-fn minilm_gguf_snapshot() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("SYNAPSE_MINILM_GGUF_SNAPSHOT") {
-        return Some(PathBuf::from(path));
-    }
-    let home = std::env::var("HOME").ok()?;
-    let snapshots = PathBuf::from(home).join(
-        ".cache/huggingface/hub/models--second-state--All-MiniLM-L6-v2-Embedding-GGUF/snapshots",
-    );
-    first_snapshot_with(&snapshots, "all-MiniLM-L6-v2-ggml-model-f16.gguf")
+    first_snapshot_with(&snapshots, "model.safetensors")
 }
 
 fn first_snapshot_with(snapshots: &Path, file_name: &str) -> Option<PathBuf> {
