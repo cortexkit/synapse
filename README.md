@@ -4,14 +4,19 @@ This workspace contains the Synapse SubC module, supervised inference workers, a
 
 ## Synapse crates
 
-Production crates live under `crates/`:
+Product and development crates live under `crates/`. The current catalog ships
+Metal embedding/reranking on supported Macs, with explicit `models.download`
+installation and automatic self-check. Unsupported hosts have no runnable catalog
+backend or CPU fallback; ONNX Runtime is bench-only. Decode routing is unchanged.
+See [the wire contract](docs/wire-contract-v1.md) for operations and migration.
 
 - `synapse-core`: shared protocol, error, cache, fingerprint, scheduler, and tokenizer types.
 - `synapse-engine-owned`: primary in-process Metal/MPSGraph engine for Apple Silicon (embedding, reranking, direct Metal step decode), with the supervised decode worker state machine in its `synapse-engine-owned/owned-decode-worker` subcrate.
-- `synapse-engine-cuda`: primary in-process CUDA engine (`owned-cuda-v1`, PTX kernel ports, f16 storage).
+- `synapse-engine-cuda`: development CUDA engine (`owned-cuda-v1`, PTX kernel ports, f16 storage); not a shipped catalog backend.
 - `synapse-module`: SubC management surface, model cache, durable jobs, and worker host. Builds the `ck-synapse` binary (fleet `ck-*` naming convention for Activity Monitor grouping; `module_id` stays `synapse`).
 - `synapse-opctl`: operator CLI (`ck-synapse-opctl`) for catalog, probes, admission stats, approvals, and paged results over the fleet daemon.
-- `synapse-worker-llama`, `synapse-worker-ane`, `synapse-worker-cuda`, `synapse-worker-decode`: supervised worker binaries (`ck-synapse-worker-*`) that speak the Synapse worker protocol over Unix sockets (named pipes on Windows).
+- `synapse-worker-llama`, `synapse-worker-ane`, `synapse-worker-decode`: supervised worker binaries (`ck-synapse-worker-*`) over Unix sockets (named pipes on Windows). The owned-decode stack remains compiled/tested with its certification, probe and serving-approval gates, not the default decode lane.
+- `synapse-worker-cuda`: development/manual-gate worker, not shipped by the release matrix. Linux/Windows releases contain the module, opctl and llama worker only.
 
 ### Metal build requirement
 
@@ -69,7 +74,10 @@ Example user-tier `~/.config/cortexkit/synapse.jsonc` (project configs must omit
 Tests can point at a file with `SYNAPSE_CONFIG_PATH`. Only one synapse module
 per machine (singleton lease); a second instance refuses to start.
 
-### Owned-CUDA hardware floor
+### Development owned-CUDA hardware floor
+
+The CUDA worker and the manual package below are development surfaces, not
+published release assets or runnable backends in this release's model catalog.
 
 `ck-synapse-worker-cuda` implements `--probe-floor` (hidden, like the
 `--test-abort*` surfaces). It prints one JSON object and exits 0:
@@ -100,7 +108,7 @@ Otherwise both readings come from the probe; partial overrides are not merged:
 - `SYNAPSE_CUDA_PACKAGING_DRIVER` — optional; the driver string a packaging
   build was tested against, carried into the refusal for diagnostics.
 
-### Windows owned-CUDA package
+### Manual Windows owned-CUDA package
 
 The manual Windows CUDA gate packages the worker with runtime DLLs derived
 from the same pinned `cuda_cudart` and `libcublas` redistribution archives

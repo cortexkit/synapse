@@ -40,19 +40,24 @@ crash budget (`owned-decode-worker`) used by the decode worker and the module.
 
 **CUDA engine** (`crates/synapse-engine-cuda`). Embedding on NVIDIA GPUs (MiniLM,
 ModernBERT, Qwen3) from ported PTX kernels, with a hardware-floor check. The module
-does not link it; it runs only inside `ck-synapse-worker-cuda`.
+does not link it; its development worker is `ck-synapse-worker-cuda`, which
+is not shipped by the release matrix or activated in the current catalog.
 
 There is no CPU embedding lane: embedding and reranking run only on synapse's own
-GPU and Neural Engine engines (the Metal, Core ML/ANE and CUDA code above), and
-machines without a supported GPU use the remote gateway.
+GPU and Neural Engine engines. The current catalog declares only Metal backends
+for three entries and no backend for Qwen3-Reranker. Unsupported hosts report
+`backend_unavailable`, not CPU fallback; consumers may opt into the remote gateway.
+ONNX Runtime is bench-only, not a portable product floor.
 
-**Workers.** Each is a separate binary the module spawns, handshakes with, and
-supervises:
+**Workers.** These source-tree binaries use module supervision and local IPC;
+source presence does not imply release publication. Linux/Windows releases ship
+only the module, opctl and llama worker. The owned-decode stack is kept compiled
+and tested with unchanged gates, not made the default decode lane:
 - `ck-synapse-worker-llama` (`crates/synapse-worker-llama`): llama.cpp for GGUF models.
 - `ck-synapse-worker-ane` (`crates/synapse-worker-ane`): a small Rust launcher that
   execs a Swift Core ML worker built by `build.rs`; embeds on the Neural Engine using
   fixed-bucket compiled models.
-- `ck-synapse-worker-cuda` (`crates/synapse-worker-cuda`): wraps the CUDA engine;
+- `ck-synapse-worker-cuda` (`crates/synapse-worker-cuda`): development-only, not shipped; wraps the CUDA engine;
   `--probe-floor` reports hardware readings before the module commits to it.
 - `ck-synapse-worker-decode` (`crates/synapse-worker-decode`): owned Metal token
   generation for Qwen3 and LFM2, driven quantum by quantum by the owned-decode
@@ -87,6 +92,7 @@ quality. `bench/run-matrix.sh` and `bench/run-night.sh` run the lanes in sequenc
 | Area | Path | What is there |
 | --- | --- | --- |
 | Module entry and ops | `crates/synapse-module/src/lib.rs` | `dispatch_request`, `management_operations`, handlers, config |
+| Compiled model catalog | `crates/synapse-module/src/catalog/` | pinned entries, manifests, backend declarations and self-check references |
 | Store | `crates/synapse-module/src/store.rs` | SQLite schema, migrations, cache, jobs, certification, approvals |
 | Approvals rollback | `crates/synapse-module/src/rollback.rs` | disable and emergency rollback |
 | Core ML materialization | `crates/synapse-module/src/ane_artifact.rs` | digest-keyed extraction of Core ML bundles |
@@ -118,10 +124,10 @@ quality. `bench/run-matrix.sh` and `bench/run-night.sh` run the lanes in sequenc
    bulk, decode, control). Batches over the inline budget become a durable job in the
    store and the caller gets a `job_id` back; a `request_key` makes resubmission
    idempotent.
-4. The lane is checked against the store: the model is fetched or verified in the
-   content-addressed cache, and lanes that need certification refuse with
-   `not_certified` unless evidence exists for the current machine profile (owned
-   generation lanes also need an enabled approval).
+4. Catalog installation is explicit through `models.download`; serving never
+   fetches files. The module verifies cached members, lazily loads and self-checks
+   catalog lanes without probes or approvals. Free-form/legacy lanes keep their
+   existing probe/certification gates (owned generation also needs approval).
 5. The work runs on the chosen lane: the in-process owned Metal engine, a worker
    over the worker protocol, or the remote gateway.
 6. Results are committed in pages as the job runs. Callers read them with
@@ -129,6 +135,13 @@ quality. `bench/run-matrix.sh` and `bench/run-night.sh` run the lanes in sequenc
    restart until the retention TTL. Items carry ids and page order is not item order.
 
 ## Rules that bite
+
+- **Catalog and legacy lanes are separate.** Catalog lane ids are
+  `<catalog_id>-<backend>`; omitted embed/rerank models use the task's catalog
+  default, not knob assignments. Legacy ids, fingerprints and gates are unchanged;
+  moving to the catalog requires deliberate re-embedding. Self-check is keyed by
+  install, backend, fingerprint, engine, OS build and fixture revision. Failed
+  checks persist; catalog lanes never return `probe_required`/`not_certified`.
 
 - **Serving needs certification and approval.** An owned-generation lane serves only
   with an enabled approval row and current certification evidence; certified-but-not-

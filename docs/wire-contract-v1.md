@@ -1,18 +1,22 @@
 # Synapse wire contract v1 (consumer snapshot)
 
-Status: SNAPSHOT of the additive v1.1 surface as of 2026-08-29.
+Status: SNAPSHOT of v1.1 with explicit catalog installation and owned-only local embedding/reranking.
 Authoritative examples: crates/synapse-module/tests/skeleton_e2e.rs and
 tests/soak.rs. This doc restates the contract for consumer integration (AFT,
 MC); on any disagreement, the e2e tests win and this doc gets fixed.
 
-## Envelope (every response, every op)
+## Envelope (inference payloads)
+
+Management responses wrap operation payloads as `{"result": <payload>}`.
+The fields below describe inference payloads, not every management result.
+Download statuses are flat inside `result`.
 
 ```json
 {
   "fingerprint": "…",            // strict identity string — persist VERBATIM, compare only, never parse
   "table_epoch": 0,               // alias-table version; persist (fingerprint, table_epoch) per index
   "dims": 384,
-  "provenance": { "engine": { "engine": "ort", "version": "…", "build_flags": {} } },
+  "provenance": { "engine": { "engine": "owned-metal", "version": "…", "build_flags": {} } },
   "module_generation": 3,         // bumps every module boot — cheap restart detection mid-conversation
   "equivalent_to": [],            // live alias reads; inline, no second call
   …op payload flattened here…
@@ -31,7 +35,8 @@ MC); on any disagreement, the e2e tests win and this doc gets fixed.
 ## Errors (stable codes, typed recovery)
 
 Every error: {code, class: transient|permanent, retry_after_ms?,
-safe_to_retry_same_request}. Transient carries retry_after_ms. Never poll-hammer
+safe_to_retry_same_request, message, details?}. `details` is an optional object.
+Transient errors may carry retry_after_ms. Never poll-hammer
 a permanent code.
 
 The `code` field uses two vocabularies. Core `StableErrorCode` supplies
@@ -97,6 +102,43 @@ available.
   http_status | storage_full, http_status | null}`. **Consumer disposition:**
   retry the download after `retry_after_ms`.
 
+### Catalog result-envelope rule and reused errors
+
+Semantic refusals specified with details use
+`{"result":{"module_generation": <u64>, "error": <wire error>}}`, including
+semantic `invalid_request` from download, remove, unload and wrong-task serving.
+Malformed or unknown-field params remain channel-level `invalid_request` with a
+message. A failed download carries `error` beside `state` in its flat status.
+
+- `artifact_invalid` — permanent, not safe to retry unchanged. Digest/size
+  mismatch or missing/wrong-size cached blob: `{file, expected_sha256,
+  actual_sha256, expected_size, actual_size, recovery_op: "models.download"}`.
+  Loaded fingerprint mismatch: `{model_id, expected_fingerprint, actual_fingerprint}`.
+  Corrupt blobs are quarantined and affected installs/pins invalidated; other
+  blobs are untouched. Explicit download repairs the file; serving never fetches.
+- `module_restarted` — permanent, not safe to retry the same job. Non-terminal
+  downloads fail and clean up on restart; committed installs survive. Submit a
+  new download attempt. No catalog-specific details object is added.
+- `deadline_exceeded` — transient, not safe to retry the same request; request budget expired before
+  readiness. No catalog-specific details object is added.
+- Wrong-task `invalid_request` — permanent, not safe to retry unchanged;
+  `{catalog_id, requested_task, catalog_task}`, without load or network I/O.
+- Derived-id management `invalid_request` — permanent, not safe to retry unchanged;
+  download/remove carry `{model_id, catalog_id}`, including undeclared reserved
+  backends. Unload with a catalog id carries `{catalog_id, lane_ids[]}`.
+- `substitution_rejected` — permanent, not safe to retry unchanged. A lane id
+  combined with another fingerprint carries `{lane_id, required_fingerprint}`.
+  Unknown fingerprints also refuse without load. Aliases and `allow_equivalent`
+  never substitute catalog fingerprints.
+- `engine_crashed` — transient on catalog paths, `retry_after_ms: 250`, safe to
+  retry; includes load/runtime failure or the 2000 ms self-check ceiling.
+- `model_loading` — transient, `retry_after_ms: 250`, safe to retry. Inline
+  serving waits up to `min(remaining deadline, 5000 ms)` for load/self-check;
+  this code is used only when that cap expires with deadline remaining.
+  Admitted batch jobs wait within their execution budget and never fail with it.
+- `idempotency_conflict` — permanent, not safe to retry unchanged; replace a
+  download key bound to a different digest.
+
 ## Common request fields (acceptance constraints)
 
 deadline_ms (absolute budget), max_queue_ms (fast-fail bound — admission is
@@ -112,7 +154,8 @@ The management registry in this snapshot is `embed.query`, `embed.batch`,
 `owned_decode.admit_session`, `owned_decode.decode`, `owned_decode.snapshot`,
 `owned_decode.continue`, `owned_decode.abort`, `owned_decode.close`,
 `owned_decode.session_status`, `owned_decode.disable`, `owned_decode.revoke`,
-`model.load`, `model.status`, `model.unload`, `models.list`, `probe.start`,
+`model.load`, `model.status`, `model.unload`, `models.list`, `models.catalog`,
+`models.download`, `models.download.cancel`, `models.remove`, `probe.start`,
 `probe.status`, `probe.report`, `aliases.check_index`, `alias.retract`,
 `alias.declare`, `cache.pin`, `cache.gc`, `admission.status`,
 `approvals.migrate_owned_decode`, `approvals.enable`, `approvals.disable`, and
@@ -135,8 +178,9 @@ The management registry in this snapshot is `embed.query`, `embed.batch`,
     pages readable and resumes by item id.
 - **rerank.score** {model, query, candidates[], …} — RAW per-candidate
   scores (no server-side ordering opinions); interactive ≤20 candidates,
-  bulk beyond. Qwen3-Reranker architectures are rejected at load (measured
-  broken template path in llama.cpp b9580).
+  bulk beyond. Catalog `qwen3-reranker-0.6b` has no backends and cannot
+  download or serve (`backend_unavailable`). Free-form local reranking accepts
+  owned engines only, never llama.cpp.
 - **microllm.oneshot** {model, prompt, max_tokens, grammar?, …} — greedy.
   `max_tokens` is capped by module config `microllm_max_tokens` (default 512);
   requests above the ceiling are rejected with both numbers in the error.
@@ -244,22 +288,96 @@ The management registry in this snapshot is `embed.query`, `embed.batch`,
     Omitted for lane classes with no approval concept — absence means "not applicable", never
     "enabled".
   - `serving_admission_reason` (string, optional) — why `serving_admission` is `"disabled"`,
-    one of `approval_absent`, `approval_disabled`, `not_certified`, `approval_unavailable`, or
+    one of `approval_absent`, `approval_disabled`, `not_certified`, `approval_unavailable`,
+    `self_check_failed`, or
     a recorded operator reason. Absent when the lane is enabled or has no approval concept.
   - `warm_load_cost_hint_ms` (float) — observed load duration hint in milliseconds,
     sourced from real measurements (such as observed load duration or benchmark probe
     data). This is an advisory hint, NOT a performance guarantee or upper bound; actual
     load latency depends on residency (whether the model is already loaded in memory) and
     system load. Omitted if no measurement has been recorded for the model.
+
+  Local embed/rerank rows never report `device_class: cpu`; the current catalog
+  reports `metal` only. Other device classes describe legacy or future lanes.
+  Catalog rows are an exception to approval-based fields above. They add
+  `self_check` (`state: pending | passed | failed`, with identity/evidence when
+  available); free-form embed/rerank rows use `state: not_applicable`.
+  For one release catalog `certified` mirrors `self_check.state == passed` and
+  `serving_admission` is enabled unless self-check failed, then disabled with
+  reason `self_check_failed`. No approval row is consulted. Next release removes
+  these two compatibility fields from catalog rows in favor of `self_check`.
+  Catalog rows exist for runnable, current-manifest installed backends only,
+  have lane id `<catalog_id>-<backend>`, one fingerprint, and initial state
+  `unloaded` with `max_tokens_source: catalog_unloaded`. Unload keeps the row;
+  remove deletes it. Free-form field presence and decode gates are unchanged.
 - **model.load / model.status, probe.start / probe.status / probe.report** —
   load and probe start/status are job-shaped (poll-first); `probe.report` is a
   query. Probe is EXPLICIT, never auto-triggered; certification + perf rows are
   keyed by machine profile and stamped with os_build/module_generation; the
   report returns the full measured capability table plus per-knob assignments.
-  Embed/rerank ops and `microllm.oneshot` routed to an owned-engine lane refuse
+  Free-form embed/rerank ops and `microllm.oneshot` routed to an owned-engine lane refuse
   (`not_certified`/`probe_required`) until the (machine, fingerprint) pair is
   certified. Lane-1 worker-backed `microllm.oneshot` routes retain their existing
   dispatch path and do not acquire the owned-lane certification gate.
+
+### Catalog serving and migration
+
+The compiled catalog has four frozen ids: `gte-modernbert-base` (embed,
+`Alibaba-NLP/gte-modernbert-base`, revision `e7f32e3c00f91d699e8c43b53106206bcc72bb22`),
+`gte-reranker-modernbert-base` (rerank, `Alibaba-NLP/gte-reranker-modernbert-base`,
+revision `f7481e6055501a30fb19d090657df9ec1f79ab2c`), `qwen3-embedding-0.6b`
+(embed, `Qwen/Qwen3-Embedding-0.6B`, revision `97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3`),
+and `qwen3-reranker-0.6b` (rerank, `Qwen/Qwen3-Reranker-0.6B`, revision
+`e61197ed45024b0ed8a2d74b80b4d909f1255473`). The first three declare only Metal;
+the last has no backends or files. No catalog ANE/CUDA/Vulkan backend ships in
+this release. On Linux/Windows the Metal rows remain visible but report
+`not_supported_on_platform`; `runnable_here: true` returns no entries and
+`download_bytes` is zero. There is no CPU fallback.
+
+A catalog id selects the first runnable backend in catalog order; a declared
+lane id or fingerprint pins a backend. The selected lane never falls back to
+another backend when loading, failed or uninstalled. Serving uses cached local
+files only, lazily loads and runs self-check, never network I/O. Catalog lanes
+never read knob assignments or require probes/approvals. The self-check key is
+catalog id, manifest digest, backend, fingerprint, engine identity, OS build and
+fixture revision. Key changes reset it to pending; persisted numerical failure
+refuses without rerunning. Remove and redownload also permits a new check.
+
+#### Removed or rejected paths and their replacements
+
+- ORT and MiniLM product/catalog lanes are removed: use a catalog id and explicitly
+  download it. ORT remains only as a bench reference, not a portable CPU floor.
+- Catalog-reserved `probe.start` targets return `invalid_request`: use automatic
+  self-check after explicit installation, not operator probe or approval.
+- Omitted-model local embed/rerank knob routing is removed: specify a model or
+  use the task's `default_for_task` entry (the two GTE entries).
+- Unregistered embed/rerank ids no longer return `model_loading`: use the
+  `unknown_model` correction flow. Uninstalled catalog ids/lanes return
+  `model_not_installed`; call `models.download` rather than polling a load.
+- Free-form embed/rerank with `ort`, `llama` or any non-owned engine is refused
+  with `invalid_request` before network I/O: use an owned engine (`owned-metal`,
+  `ane`, `owned-cuda`, or the owned Vulkan value when available). Invalid engine
+  preload entries are skipped with one WARN; disallowed persisted rows are not
+  restored and their pins are removed. Free-form lanes keep their probe gates.
+- Catalog `certified`/`serving_admission` are one-release compatibility projections:
+  consumers must move to `self_check` before those fields are removed next release.
+- Unpinned `source=hf`, revision `main`, URLs containing `resolve/main`, and
+  resolved HTTP(S) assets without SHA-256 are rejected before network I/O:
+  supply a pinned 40-hex revision and a digest for each resolved network asset,
+  regardless of `source` (including `source=file`).
+- `model.load` or preload using any catalog id or `<catalog_id>-<backend>` for
+  `metal`, `ane`, `cuda` or `vulkan` is rejected: use `models.download`.
+  Load returns `invalid_request`; reserved preload ids fail startup naming the
+  entry. Undeclared derived ids are `unknown_model` for serving/status/unload,
+  but `invalid_request` for download/remove; use a declared lane or catalog id.
+- `model.unload` with a catalog id is rejected: unload a declared lane id from
+  `details.lane_ids`, then use `models.remove` to delete installation files.
+
+Legacy preload lanes (including `gte-modernbert-base-f16`,
+`gte-reranker-modernbert-base-f32` and the ANE package-set lane) remain separate:
+same ids, config, fingerprints and probe gates, with no implicit catalog mapping.
+Moving to a catalog id is deliberate and requires re-embedding. Owned decode
+routing, certification, probes and approvals are unchanged.
 
 ### Fixed-bucket ANE package sets
 
@@ -294,10 +412,14 @@ reported Neural Engine share across its buckets.
   - `jobs_open`: derived in-flight count satisfying the identity
     `jobs_open = jobs_minted + jobs_inherited - jobs_completed - jobs_failed`
     (saturating to zero, never underflowing).
-  Top-level `catalog_lanes` counts every known lane, while `certified_lanes`
-  counts lanes with certification evidence for the current machine profile.
-  Top-level `certification_stale` and `performance_stale` scan the full catalog,
-  including unloaded lanes. The `lanes` array remains resident-only because its
+  Download jobs count as minted; `committed` counts completed, and `failed`
+  or `cancelled` counts failed, preserving the identity above.
+  `catalog_lanes` counts every known lane. `certified_lanes`, `certification_stale`
+  and `performance_stale` count only probe-gated lanes (free-form and decode),
+  including unloaded ones, and exclude catalog lanes. Catalog lanes report
+  `certification_required: false`, `certification_status: not_required`, and
+  their `self_check`; `probe.report` lists known catalog lanes even when unloaded.
+  The `lanes` array remains resident-only because its
   `meeting_deadlines`, rolling start-delay, waiter, and in-flight values describe
   live execution state. The contract lives in per-request budgets, not this
   snapshot.
@@ -515,7 +637,9 @@ can additionally return the normal owned-route errors described by its route.
   additional fields.
 - Result payload: `{module_generation, model_id, fingerprint, state:
   "unloaded", engine, task}`.
-- Errors: `invalid_request`, `model_loading`, and `engine_crashed`.
+- Errors: `invalid_request`, `unknown_model`, `model_in_use`, `model_loading`,
+  and `engine_crashed`. A catalog id carries `{catalog_id, lane_ids[]}`; use a
+  declared lane id. An undeclared derived lane is `unknown_model`.
 - Semantics: unloading a ready model removes its loaded engine and owned-decode
   dispatch cache, but keeps the catalog model registered and its cached artifact
   available for later lazy reload.
@@ -631,8 +755,8 @@ This field is additive and backwards-compatible; existing consumers reading only
 
 - Crash domain: llama.cpp runs in supervised single-lane workers; engine
   crashes are typed (engine_crashed, transient with budget → quarantine as
-  permanent probe_required). The ort lane is isolated from llama crashes
-  (soak-proven). Nothing hangs: every request ends in result, typed error,
+  permanent probe_required on probe-gated lanes). ORT is not shipped;
+  catalog lanes use self-check instead. Every request ends in result, typed error,
   or transport closure.
 - Health: cached state only; worker liveness/crash-window and probe-row
   staleness ride models.list / probe.report / health detail. ANE worker PING
@@ -706,7 +830,7 @@ credentials, or by resubmitting the same request key and digest. Deadline expiry
 transitions durably to terminal `needs_reauth_expired`; result retention starts
 at that terminal transition.
 
-Every job status carries `pages_available`. `embed.result` serves any committed
+Every embed job status carries `pages_available` (download jobs do not). `embed.result` serves any committed
 page whose index is below that count while the job is queued, running, paused,
 done, or failed. A page commit atomically makes its item results, page metadata,
 and incremented visible count observable. Previously committed pages remain
@@ -732,7 +856,7 @@ omitted when the resulting array is empty.
 ### Stable error-code union and credential mapping
 
 Every error retains `{code, class, retry_after_ms?,
-safe_to_retry_same_request}`. The complete remote additions are:
+safe_to_retry_same_request, message, details?}`. The complete remote additions are:
 
 - `declared_identity_not_accepted` — permanent.
 - `remote_identity_drift` — permanent; the model is quarantined.
