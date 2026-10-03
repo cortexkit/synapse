@@ -2964,6 +2964,7 @@ mod tests {
         assert!(tracked.worker_model_ref.is_none());
     }
 
+    #[cfg(unix)]
     type SeenRequests = Vec<(WorkerRequest, Option<Vec<u8>>)>;
 
     /// Connects `host` to an in-process mock worker that answers each request
@@ -3020,6 +3021,7 @@ mod tests {
         })
     }
 
+    #[cfg(unix)]
     fn host_for_engine(engine: &str) -> WorkerHost {
         let mut config = WorkerHostConfig::new("/bin/false", std::env::temp_dir());
         config.engine_identity = Some(EngineIdentity {
@@ -3030,6 +3032,7 @@ mod tests {
         WorkerHost::new(config)
     }
 
+    #[cfg(unix)]
     fn runtime_config(extra: &[(&str, &str)]) -> RuntimeConfig {
         let mut config = RuntimeConfig::default();
         config
@@ -3041,6 +3044,7 @@ mod tests {
         config
     }
 
+    #[cfg(unix)]
     fn artifact() -> ValidatedArtifact {
         ValidatedArtifact {
             digest: "sha256:package".to_string(),
