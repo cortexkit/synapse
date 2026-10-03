@@ -144,22 +144,19 @@ jobs:
           done
           ls -la dist/
 
-      # The oldest ck-subc whose HELLO parser accepts this build's manifest.
-      # subc-protocol 0.19 stopped sending an empty `consumes`, and a daemon
-      # below 0.17.20 requires that field, so it refuses the module at
-      # registration with nothing in the release explaining why. `ck upgrade`
-      # and `ck setup` read this floor and refuse the mismatch up front.
+      # The oldest ck-subc this build is known to run against. `ck upgrade` and
+      # `ck setup` read this floor and refuse an older daemon up front, instead
+      # of letting the module fail at registration with nothing in the release
+      # explaining why.
       #
-      # The floor was rechecked against subc-protocol 0.25: everything a 0.25
-      # module adds to HELLO since then (`ready`, and a provenance absence
-      # reason) is optional and omitted when unset, and a 0.17.20 daemon drops
-      # unknown manifest keys. An older daemon would ignore `ready: false` and
-      # send no machine id; synapse never declares `ready` and never reads a
-      # machine id, so neither difference affects it.
+      # For subc-protocol 0.29 the floor is 0.20.53: the oldest daemon that
+      # 0.29 modules are known to run against, as recorded by SUBC, which owns
+      # the daemon, when the 0.29 wave shipped. Nothing lower has been tested
+      # with a 0.29 module, so nothing lower is claimed.
       #
       # The floor is knowledge rather than something derivable from the lock,
       # so the protocol version it applies to is asserted here: a bump past
-      # 0.25 fails the release instead of publishing a floor nobody rechecked.
+      # 0.29 fails the release instead of publishing a floor nobody rechecked.
       # One lane emits it because the asset is per-release, not per-platform.
       - name: Emit release-manifest.json (declares the daemon floor)
         if: matrix.name == 'linux-x64'
@@ -169,14 +166,14 @@ jobs:
           set -euo pipefail
           protocol=$(awk '/^name = "subc-protocol"$/{getline; gsub(/["]/,""); print $3}' Cargo.lock)
           case "$protocol" in
-            0.25.*) ;;
+            0.29.*) ;;
             *)
-              echo "subc-protocol is $protocol, not 0.25.x: recheck the ck-subc floor with subconscious before releasing" >&2
+              echo "subc-protocol is $protocol, not 0.29.x: recheck the ck-subc floor with subconscious before releasing" >&2
               exit 1
               ;;
           esac
-          printf '{\n  "requires_core": "0.17.20"\n}\n' > dist/release-manifest.json
-          python3 -c "import json;d=json.load(open('dist/release-manifest.json'));assert d['requires_core']=='0.17.20',d"
+          printf '{\n  "requires_core": "0.20.53"\n}\n' > dist/release-manifest.json
+          python3 -c "import json;d=json.load(open('dist/release-manifest.json'));assert d['requires_core']=='0.20.53',d"
           cat dist/release-manifest.json
 
       - name: Smoke --version from the packaged zip
