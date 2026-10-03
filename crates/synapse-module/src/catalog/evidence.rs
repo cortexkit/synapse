@@ -772,4 +772,13 @@ mod tests {
         let missing = Path::new(env!("CARGO_MANIFEST_DIR")).join("no-such-evidence-dir");
         assert!(read_evidence_dir(&missing).unwrap().is_empty());
     }
+
+    #[test]
+    fn the_repository_evidence_dir_reads_as_record_files_only() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(EVIDENCE_DIR);
+        let records = read_evidence_dir(&dir).expect("evidence dir is readable or absent");
+        assert!(records.keys().all(|name| name.ends_with(".json")));
+    }
 }
