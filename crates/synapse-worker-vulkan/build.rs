@@ -39,6 +39,10 @@ fn main() {
     let raw = fs::read(&manifest_path).expect("read model manifest");
     let value: synapse_parity::manifest::Manifest =
         synapse_parity::manifest::Manifest::from_slice(&raw).expect("parse model manifest");
+    for (slug, model) in &value.models {
+        synapse_parity::arch::check_schema(slug, &model.architecture)
+            .expect("embedded architecture must be complete and match its class");
+    }
     let canonical = synapse_parity::canonical::canonical_bytes_of(&value);
     fs::write(out.join("manifest.json"), &canonical).expect("embed manifest");
     println!(

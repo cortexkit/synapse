@@ -15,6 +15,7 @@ use crate::{
 struct Instance {
     _entry: Entry,
     raw: ash::Instance,
+    api_version: u32,
 }
 impl Drop for Instance {
     fn drop(&mut self) {
@@ -30,10 +31,22 @@ fn instance() -> Result<Instance> {
         "libvulkan.so.1"
     };
     let entry = unsafe { Entry::load_from(library) }.context("vulkan_no_device")?;
-    let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_2);
+    let loader_version = unsafe { entry.try_enumerate_instance_version() }
+        .context("vulkan_no_device")?
+        .unwrap_or(vk::API_VERSION_1_0);
+    let api_version = if loader_version >= vk::API_VERSION_1_3 {
+        vk::API_VERSION_1_3
+    } else {
+        vk::API_VERSION_1_2
+    };
+    let app = vk::ApplicationInfo::default().api_version(api_version);
     let info = vk::InstanceCreateInfo::default().application_info(&app);
     let raw = unsafe { entry.create_instance(&info, None) }.context("vulkan_no_device")?;
-    Ok(Instance { _entry: entry, raw })
+    Ok(Instance {
+        _entry: entry,
+        raw,
+        api_version,
+    })
 }
 
 fn inspect(instance: &Instance, physical: vk::PhysicalDevice, index: usize) -> Adapter {
@@ -97,8 +110,22 @@ pub fn enumerate() -> Result<Vec<Adapter>, String> {
         .collect())
 }
 
+pub struct Prepared {
+    pub adapter: Adapter,
+    device: Arc<Device>,
+}
+
+pub fn prepare(required: Required) -> Result<Prepared> {
+    let device = Device::new(required)?;
+    Ok(Prepared {
+        adapter: device.adapter.clone(),
+        device,
+    })
+}
+
 struct Device {
     instance: Instance,
+    adapter: Adapter,
     raw: ash::Device,
     physical: vk::PhysicalDevice,
     queue: vk::Queue,
@@ -129,12 +156,17 @@ impl Drop for Device {
 }
 
 impl Device {
-    fn new(adapter: &Adapter) -> Result<Arc<Self>> {
+    fn new(required: Required) -> Result<Arc<Self>> {
         let instance = instance()?;
-        let physical = unsafe { instance.raw.enumerate_physical_devices() }?
-            .get(adapter.index)
-            .copied()
-            .context("vulkan_no_device")?;
+        let physicals =
+            unsafe { instance.raw.enumerate_physical_devices() }.context("vulkan_no_device")?;
+        let adapters = physicals
+            .iter()
+            .enumerate()
+            .map(|(index, physical)| inspect(&instance, *physical, index))
+            .collect();
+        let adapter = crate::admission::select(adapters, required).map_err(|code| anyhow!(code))?;
+        let physical = physicals[adapter.index];
         let queues = unsafe {
             instance
                 .raw
@@ -152,9 +184,11 @@ impl Device {
             vk::PhysicalDeviceShaderFloat16Int8Features::default().shader_float16(true);
         let mut storage16 =
             vk::PhysicalDevice16BitStorageFeatures::default().storage_buffer16_bit_access(true);
+        let can_cooperate =
+            instance.api_version >= vk::API_VERSION_1_3 && adapter.use_cooperative();
         let mut cooperative = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default();
         let mut memory_model = vk::PhysicalDeviceVulkanMemoryModelFeatures::default();
-        if adapter.use_cooperative() {
+        if can_cooperate {
             let mut query = vk::PhysicalDeviceFeatures2::default()
                 .push_next(&mut cooperative)
                 .push_next(&mut memory_model);
@@ -164,7 +198,7 @@ impl Device {
                     .get_physical_device_features2(physical, &mut query);
             }
         }
-        let coop_shape = if adapter.use_cooperative() {
+        let coop_shape = if can_cooperate {
             let extension =
                 ash::khr::cooperative_matrix::Instance::new(&instance._entry, &instance.raw);
             unsafe { extension.get_physical_device_cooperative_matrix_properties(physical) }
@@ -183,7 +217,7 @@ impl Device {
         } else {
             false
         };
-        let coop_enabled = adapter.use_cooperative()
+        let coop_enabled = can_cooperate
             && cooperative.cooperative_matrix == vk::TRUE
             && memory_model.vulkan_memory_model == vk::TRUE
             && coop_shape;
@@ -218,6 +252,7 @@ impl Device {
             .0 as u32;
         let mut device = Self {
             instance,
+            adapter,
             raw,
             physical,
             queue,
@@ -724,7 +759,7 @@ impl Engine {
     pub fn load(
         model: Model,
         profile: Profile,
-        adapter: Adapter,
+        prepared: Prepared,
         required: Required,
         header: &synapse_parity::safetensors::Header,
         data: &[u8],
@@ -746,11 +781,7 @@ impl Engine {
             arena_bytes(&plan) <= required.min_device_local_bytes,
             "vulkan_insufficient_memory"
         );
-        let mut arena = Arena::new(
-            Device::new(&adapter)?,
-            &plan,
-            required.min_device_local_bytes,
-        )?;
+        let mut arena = Arena::new(prepared.device, &plan, required.min_device_local_bytes)?;
         if model.architecture.family == Family::Qwen3 {
             let t = u64::from(profile.vulkan_sub_batch_max_tokens.unwrap());
             let d = model.architecture.int("head_dim")?;
@@ -913,7 +944,7 @@ impl Engine {
         let seq = padded.width as u32;
         let batch = padded.lengths.len() as u32;
         let rows = seq * batch;
-        let eps = arch.float(if modern { "norm_eps" } else { "rms_norm_eps" })? as f32;
+        let eps = crate::norm_epsilon(&self.model)?;
         let vocab = arch.int("vocab_size")? as i32;
         ensure!(
             padded.ids.iter().all(|id| *id >= 0 && *id < vocab),

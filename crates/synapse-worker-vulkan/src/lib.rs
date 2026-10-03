@@ -10,6 +10,14 @@ pub const MANIFEST_DIGEST: &str = env!("VULKAN_MANIFEST_DIGEST");
 pub const KERNEL_REVISION: &str = env!("VULKAN_KERNEL_REVISION");
 include!(concat!(env!("OUT_DIR"), "/shaders.rs"));
 
+#[cfg(any(feature = "vulkan", test))]
+pub(crate) fn norm_epsilon(model: &synapse_parity::manifest::Model) -> synapse_parity::Result<f32> {
+    model
+        .architecture
+        .float("norm_eps")
+        .map(|value| value as f32)
+}
+
 pub fn manifest() -> Manifest {
     Manifest::from_slice(include_bytes!(concat!(env!("OUT_DIR"), "/manifest.json")))
         .expect("build-validated embedded manifest")
@@ -80,6 +88,27 @@ mod tests {
         assert_ne!(original, Sha256::digest(b"shader-set-b"));
     }
     #[test]
+    fn every_model_uses_manifest_norm_epsilon_without_config_defaults() {
+        let manifest = manifest();
+        for slug in synapse_parity::manifest::MODEL_SLUGS {
+            let model = &manifest.models[slug];
+            let expected =
+                if model.architecture.family == synapse_parity::manifest::Family::Modernbert {
+                    1e-5f32
+                } else {
+                    1e-6f32
+                };
+            assert_eq!(norm_epsilon(model).unwrap(), expected, "{slug}");
+            let mut missing = model.clone();
+            missing.architecture.params.remove("norm_eps");
+            assert!(
+                norm_epsilon(&missing).is_err(),
+                "{slug} must not supply an engine default"
+            );
+        }
+    }
+
+    #[test]
     fn batch_longest_padding_golden() {
         #[derive(serde::Deserialize)]
         struct Golden {
@@ -90,17 +119,19 @@ mod tests {
             lengths: Vec<usize>,
             width: usize,
         }
-        let golden: Golden =
+        let fixtures: Vec<Golden> =
             serde_json::from_str(include_str!("../tests/fixtures/padded-vulkan.json")).unwrap();
-        let padded = pad(&golden.sequences, golden.pad_id).unwrap();
-        assert_eq!(
-            padded,
-            Padded {
-                ids: golden.ids,
-                mask: golden.mask,
-                lengths: golden.lengths,
-                width: golden.width
-            }
-        );
+        for golden in fixtures {
+            let padded = pad(&golden.sequences, golden.pad_id).unwrap();
+            assert_eq!(
+                padded,
+                Padded {
+                    ids: golden.ids,
+                    mask: golden.mask,
+                    lengths: golden.lengths,
+                    width: golden.width
+                }
+            );
+        }
     }
 }

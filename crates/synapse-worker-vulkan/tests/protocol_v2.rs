@@ -102,6 +102,7 @@ async fn hosted_hello_ping_unsupported_rerank_then_ping() {
         .unwrap()
         .unwrap()
         .success());
+    #[cfg(unix)]
     std::fs::remove_dir_all(root).unwrap();
 }
 

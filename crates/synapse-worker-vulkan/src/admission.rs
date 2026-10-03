@@ -202,10 +202,12 @@ mod tests {
             select(vec![intel.clone()], required).unwrap_err(),
             "vulkan_unsupported_vendor"
         );
-        assert_eq!(
-            select(vec![cpu, intel], required).unwrap_err(),
-            "vulkan_unsupported_vendor"
-        );
+        let mixed = probe(required, || Ok(vec![cpu, intel]));
+        assert_eq!(mixed.code.as_deref(), Some("vulkan_unsupported_vendor"));
+        assert_eq!(mixed.exit_code(), 2);
+        let empty = probe(required, || Ok(Vec::new()));
+        assert_eq!(empty.code.as_deref(), Some("vulkan_no_device"));
+        assert_eq!(empty.exit_code(), 2);
         let mut a = device();
         a.index = 4;
         assert_eq!(select(vec![a, device()], required).unwrap().index, 0);

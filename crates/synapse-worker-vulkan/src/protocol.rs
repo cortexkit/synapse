@@ -264,6 +264,21 @@ fn load(
     lookup: impl FnOnce() -> std::result::Result<Vec<Adapter>, String>,
 ) -> std::result::Result<Loaded, String> {
     let mut package_path = Path::new(path).to_path_buf();
+    #[cfg(feature = "vulkan")]
+    let mut prepared = None;
+    #[cfg(feature = "vulkan")]
+    let lookup = || {
+        let manifest = crate::manifest();
+        let profile = &manifest.profiles[&config["profile"]];
+        let required = requirements(&manifest, Some(&profile.model))?;
+        select(lookup()?, required)?;
+        // Keep the admitted logical device alive before opening the package;
+        // loader or instance startup must not occur again after artifact reads.
+        let context = crate::runtime::prepare(required).map_err(runtime_error_code)?;
+        let adapters = vec![context.adapter.clone()];
+        prepared = Some(context);
+        Ok(adapters)
+    };
     let preflight = preflight(config, artifact_digest, lookup, || {
         if package_path.is_dir() {
             package_path = package_path.join("model.safetensors");
@@ -275,7 +290,7 @@ fn load(
     #[cfg(feature = "vulkan")]
     {
         use sha2::{Digest, Sha256};
-        let (model, profile, adapter, header) = preflight;
+        let (model, profile, _adapter, _header) = preflight;
         let bytes = std::fs::read(&package_path).map_err(|_| "artifact_invalid".to_owned())?;
         if format!("{:x}", Sha256::digest(&bytes)) != digest(artifact_digest) {
             return Err("package_digest_mismatch".into());
@@ -283,6 +298,11 @@ fn load(
         let profile_id = config.get("profile").unwrap();
         synapse_parity::safetensors::verify_package_structure(&bytes, profile_id)
             .map_err(|_| "package_digest_mismatch".to_owned())?;
+        // Tensor offsets must come from the same verified bytes as the data,
+        // not from the earlier header-only read of a replaceable path.
+        let (header_bytes, data) = synapse_parity::safetensors::split_file(&bytes)
+            .map_err(|_| "artifact_invalid".to_owned())?;
+        let header = parse_header_json(header_bytes).map_err(|_| "artifact_invalid".to_owned())?;
         let expected = synapse_parity::arch::expected_tensors(&model)
             .map_err(|_| "model_unsupported".to_owned())?;
         if header.tensors.len() != expected.len()
@@ -294,8 +314,6 @@ fn load(
         {
             return Err("package_digest_mismatch".into());
         }
-        let (_, data) = synapse_parity::safetensors::split_file(&bytes)
-            .map_err(|_| "artifact_invalid".to_owned())?;
         if header
             .tensors
             .values()
@@ -306,16 +324,15 @@ fn load(
         let dims = model.output.dimension as usize;
         let operation = model.operation;
         let required = requirements(&crate::manifest(), Some(&profile.model))?;
-        let engine = crate::runtime::Engine::load(model, profile, adapter, required, &header, data)
-            .map_err(|e| {
-                if e.to_string().contains("vulkan_insufficient_memory") {
-                    "vulkan_insufficient_memory".to_owned()
-                } else if e.to_string().contains("vulkan_no_device") {
-                    "vulkan_no_device".to_owned()
-                } else {
-                    "vulkan_load_failed".to_owned()
-                }
-            })?;
+        let engine = crate::runtime::Engine::load(
+            model,
+            profile,
+            prepared.take().expect("device prepared before header"),
+            required,
+            &header,
+            data,
+        )
+        .map_err(runtime_error_code)?;
         Ok(Loaded {
             model_ref: digest(artifact_digest).into(),
             operation,
@@ -327,6 +344,24 @@ fn load(
     {
         let _ = preflight;
         Err("vulkan_no_device".into())
+    }
+}
+
+#[cfg(feature = "vulkan")]
+fn runtime_error_code(error: anyhow::Error) -> String {
+    let code = error.to_string();
+    if matches!(
+        code.as_str(),
+        "vulkan_no_device"
+            | "vulkan_api_too_old"
+            | "vulkan_software_device"
+            | "vulkan_unsupported_vendor"
+            | "vulkan_insufficient_memory"
+    ) || code.starts_with("vulkan_missing_feature:")
+    {
+        code
+    } else {
+        "vulkan_load_failed".into()
     }
 }
 
@@ -343,7 +378,8 @@ fn infer(
     if model.operation != operation {
         return Err("operation_mismatch".into());
     }
-    if lengths.iter().any(|n| *n > 8192) {
+    let max_context = crate::manifest().admission.max_context_tokens as usize;
+    if lengths.iter().any(|n| *n > max_context) {
         return Err("sequence_too_long".into());
     }
     if lengths.is_empty() || lengths.len() > 256 || lengths.contains(&0) {
@@ -454,6 +490,28 @@ mod tests {
         let pong: WorkerResponse = read_json_frame(&mut output, DEFAULT_MAX_FRAME_BYTES).unwrap();
         assert!(matches!(pong,WorkerResponse::Pong {req_id,..} if req_id=="ping"));
     }
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn retained_device_startup_preserves_floor_refusal_codes() {
+        for code in [
+            "vulkan_no_device",
+            "vulkan_api_too_old",
+            "vulkan_software_device",
+            "vulkan_unsupported_vendor",
+            "vulkan_insufficient_memory",
+            "vulkan_missing_feature:shaderFloat16",
+            "vulkan_missing_feature:storageBuffer16BitAccess",
+            "vulkan_missing_feature:subgroupArithmetic",
+            "vulkan_missing_feature:subgroupComputeStage",
+        ] {
+            assert_eq!(runtime_error_code(anyhow::anyhow!(code)), code);
+        }
+        assert_eq!(
+            runtime_error_code(anyhow::anyhow!("pipeline creation failed")),
+            "vulkan_load_failed"
+        );
+    }
+
     fn eligible() -> Adapter {
         Adapter {
             index: 0,
