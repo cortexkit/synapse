@@ -88,3 +88,8 @@ GPU_PARITY gte-reranker-modernbert-base max_score_error=0.001476765 min_kendall_
 GPU_PARITY qwen3-embedding-0.6b min_cosine=0.999999780 rows=11 padded_width=200
 GPU_PARITY qwen3-reranker-0.6b max_score_error=0.000006936 min_kendall_tau=1.000000000 rows=19
 ```
+
+As a hardware regression control, disabling the shader's local-attention window
+lowered the GTE embedding minimum cosine to `0.952105393`; the named GPU parity
+test failed against the `0.999` gate. The shader was restored before subsequent
+verification. This exercises the math itself, not merely its SPIR-V digest.
