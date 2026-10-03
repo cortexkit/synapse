@@ -3,7 +3,9 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::worker_engine_names::CUDA_WORKER_ENGINE;
+use crate::worker_engine_names::{
+    ANE_DIRECT_WORKER_ENGINE, CUDA_WORKER_ENGINE, VULKAN_WORKER_ENGINE,
+};
 use crate::EngineIdentity;
 
 /// Version every worker HELLO carries in `v`; the host accepts only an exact
@@ -18,8 +20,11 @@ pub const DEFAULT_MAX_FRAME_BYTES: u32 = 64 * 1024 * 1024;
 /// HELLO engine identities of the owned embed/rerank workers (CUDA, Vulkan and
 /// direct ANE). Only these are bound to a model manifest and kernel revision;
 /// llama, owned decode and Core ML workers omit both HELLO fields.
-pub const OWNED_WORKER_HELLO_ENGINES: [&str; 3] =
-    [CUDA_WORKER_ENGINE, "owned-vulkan", "ane-direct-worker"];
+pub const OWNED_WORKER_HELLO_ENGINES: [&str; 3] = [
+    CUDA_WORKER_ENGINE,
+    VULKAN_WORKER_ENGINE,
+    ANE_DIRECT_WORKER_ENGINE,
+];
 
 pub fn is_owned_worker_hello_engine(engine: &str) -> bool {
     OWNED_WORKER_HELLO_ENGINES.contains(&engine)

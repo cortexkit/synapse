@@ -14,6 +14,11 @@ pub const ANE_WORKER_ENGINE: &str = "ane-coreml-worker";
 pub const DECODE_WORKER_ENGINE: &str = "owned-metal-decode";
 /// The HELLO identity announced by the owned CUDA worker.
 pub const CUDA_WORKER_ENGINE: &str = "owned-cuda";
+/// The HELLO identity announced by the owned Vulkan worker.
+pub const VULKAN_WORKER_ENGINE: &str = "owned-vulkan";
+/// The HELLO identity announced by the direct Neural Engine worker, which
+/// drives the ANE through the private framework rather than Core ML.
+pub const ANE_DIRECT_WORKER_ENGINE: &str = "ane-direct-worker";
 
 /// Worker binary file names for sibling resolution beside the module binary.
 /// Release installers unpack each binary at the archive root, so a worker
