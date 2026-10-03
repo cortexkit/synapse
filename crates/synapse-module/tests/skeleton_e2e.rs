@@ -1055,8 +1055,14 @@ async fn job_resume_respawns_remote_job_and_pages_are_readable() {
 #[tokio::test]
 async fn embed_query_default_catalog_returns_typed_model_not_installed_error() {
     let daemon = start_daemon().await;
-    let module = spawn_synapse_module_with_env(&daemon.connection_file_path,None,None,&[("SYNAPSE_TEST_RUNNABLE_BACKENDS","metal")]);
-    let (_daemon,_module,mut consumer,route) = open_route_for_started_module(daemon,module).await;
+    let module = spawn_synapse_module_with_env(
+        &daemon.connection_file_path,
+        None,
+        None,
+        &[("SYNAPSE_TEST_RUNNABLE_BACKENDS", "metal")],
+    );
+    let (_daemon, _module, mut consumer, route) =
+        open_route_for_started_module(daemon, module).await;
     let frame = raw_route_frame(
         &mut consumer,
         route,
@@ -1072,8 +1078,14 @@ async fn embed_query_default_catalog_returns_typed_model_not_installed_error() {
     let body: Value = serde_json::from_slice(&frame.body).expect("decode response body");
     assert_eq!(body["result"]["module_generation"].as_u64(), Some(1));
     assert_eq!(body["result"]["error"]["code"], "model_not_installed");
-    assert_eq!(body["result"]["error"]["details"]["catalog_id"], "gte-modernbert-base");
-    assert_eq!(body["result"]["error"]["details"]["download_op"], "models.download");
+    assert_eq!(
+        body["result"]["error"]["details"]["catalog_id"],
+        "gte-modernbert-base"
+    );
+    assert_eq!(
+        body["result"]["error"]["details"]["download_op"],
+        "models.download"
+    );
     assert_eq!(body["result"]["error"]["class"], "permanent");
     assert_eq!(
         body["result"]["error"]["safe_to_retry_same_request"],
@@ -1984,6 +1996,7 @@ async fn over_budget_embed_batch_returns_job_and_pages_results() {
         serde_json::json!({
             "method": "embed.batch",
             "params": {
+                "model": "minilm",
                 "request_key": "job-tier-e2e",
                 "items": texts.iter().enumerate().map(|(index, text)| serde_json::json!({
                     "id": format!("item-{index}"),
@@ -2002,6 +2015,7 @@ async fn over_budget_embed_batch_returns_job_and_pages_results() {
         serde_json::json!({
             "method": "embed.batch",
             "params": {
+                "model": "minilm",
                 "request_key": "job-tier-e2e",
                 "items": [
                     { "id": "item-0", "text": "different request content" },
@@ -2204,7 +2218,9 @@ async fn embed_batch_with_mixed_over_cap_and_short_rows_returns_all_vectors() {
 #[tokio::test]
 async fn job_tier_paged_results_replays_truncated_row_from_storage() {
     let Some(preloads) = minilm_preload_config() else {
-        eprintln!("skipping MiniLM job-tier truncation e2e: local HF safetensors snapshot is missing");
+        eprintln!(
+            "skipping MiniLM job-tier truncation e2e: local HF safetensors snapshot is missing"
+        );
         return;
     };
     let preload_models: Value = serde_json::from_str(&preloads).expect("preload config is json");
@@ -2682,29 +2698,30 @@ async fn quiet_knob_restart_keeps_assignment_but_omitted_model_uses_catalog_defa
         123,
         serde_json::json!({
             "method": "embed.query",
-            "params": { "id": "quiet-knob", "text": "quiet knob uses the persisted assignment" }
+            "params": { "id": "quiet-knob", "text": "omitted model ignores the persisted preference" }
         }),
     )
     .await;
-    if first["result"]["error"]["code"] == "model_loading" {
-        let ready = poll_model_ready(&mut consumer, route, 124, &quiet_model_id).await;
-        assert_eq!(ready["result"]["state"], "ready");
-    }
     let routed = route_request(
         &mut consumer,
         route,
         125,
         serde_json::json!({
             "method": "embed.query",
-            "params": { "id": "quiet-knob-2", "text": "quiet knob uses the persisted assignment after restart" }
+            "params": { "id": "quiet-knob-2", "text": "catalog default remains selected after restart" }
         }),
     )
     .await;
     assert_eq!(first["result"]["error"]["code"], "model_not_installed");
-    assert_eq!(first["result"]["error"]["details"]["catalog_id"], "gte-modernbert-base");
+    assert_eq!(
+        first["result"]["error"]["details"]["catalog_id"],
+        "gte-modernbert-base"
+    );
     assert_eq!(routed["result"]["error"]["code"], "model_not_installed");
     let explicit = route_request(&mut consumer,route,126,serde_json::json!({"method":"embed.query","params":{"model":quiet_model_id,"text":"explicit free-form selection remains available"}})).await;
-    if explicit["result"]["error"]["code"] == "model_loading" { poll_model_ready(&mut consumer,route,127,&quiet_model_id).await; }
+    if explicit["result"]["error"]["code"] == "model_loading" {
+        poll_model_ready(&mut consumer, route, 127, &quiet_model_id).await;
+    }
     let explicit = route_request(&mut consumer,route,128,serde_json::json!({"method":"embed.query","params":{"model":quiet_model_id,"text":"explicit free-form selection remains available"}})).await;
     assert_eq!(explicit["result"]["fingerprint"], quiet_fingerprint);
 }
@@ -2962,7 +2979,9 @@ async fn model_load_file_source_reaches_ready_and_lazy_reload_after_unload() {
 #[tokio::test]
 async fn model_load_digest_mismatch_fails_with_artifact_invalid() {
     let Some(source_dir) = copied_minilm_source_dir("synapse-model-load-digest-mismatch") else {
-        eprintln!("skipping model.load digest mismatch e2e: local HF safetensors snapshot is missing");
+        eprintln!(
+            "skipping model.load digest mismatch e2e: local HF safetensors snapshot is missing"
+        );
         return;
     };
     let _lock = acquire_minilm_e2e_lock();
@@ -3429,7 +3448,7 @@ fn copied_minilm_source_dir(label: &str) -> Option<PathBuf> {
     std::fs::create_dir_all(&source_dir).ok()?;
     std::fs::copy(&model_path, source_dir.join("model.safetensors")).ok()?;
     std::fs::copy(&tokenizer_path, source_dir.join("tokenizer.json")).ok()?;
-    std::fs::copy(snapshot.join("config.json"),source_dir.join("config.json")).ok()?;
+    std::fs::copy(snapshot.join("config.json"), source_dir.join("config.json")).ok()?;
     Some(source_dir)
 }
 
@@ -3542,7 +3561,6 @@ fn minilm_alias_preload_config() -> Option<Value> {
         }
     ]))
 }
-
 
 fn first_snapshot_with(snapshots: &Path, file_name: &str) -> Option<PathBuf> {
     std::fs::read_dir(snapshots)

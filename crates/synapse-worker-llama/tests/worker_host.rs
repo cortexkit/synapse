@@ -27,10 +27,8 @@ async fn worker_loads_minilm_and_embeds_batch_with_ort_parity() {
         return;
     };
 
-    let fixture: Fixture = serde_json::from_str(include_str!(
-        "fixtures/minilm_golden.json"
-    ))
-    .expect("golden fixture should decode");
+    let fixture: Fixture = serde_json::from_str(include_str!("fixtures/minilm_golden.json"))
+        .expect("golden fixture should decode");
     let batch = tokenize_fixture(&paths.tokenizer, &fixture);
 
     let mut host = WorkerHost::new(worker_config("minilm-roundtrip"));
