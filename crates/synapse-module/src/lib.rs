@@ -21076,7 +21076,7 @@ async fn execute_catalog_download(state: Arc<ModuleState>, record: JobRecord) {
         })
         .await
         {
-            tracing::warn!(%error, "download failure cleanup task failed");
+            tracing::warn!(error = %error.message, "download failure cleanup task failed");
         }
     }
 }
