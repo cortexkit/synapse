@@ -1,0 +1,33 @@
+[package]
+name = "synapse-worker-vulkan"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "ck-synapse-worker-vulkan"
+path = "src/main.rs"
+
+[features]
+default = []
+vulkan = ["dep:ash"]
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+sha2.workspace = true
+synapse-core = { path = "../synapse-core" }
+synapse-parity = { path = "../../bench/parity", default-features = false }
+ash = { version = "0.38", optional = true, default-features = false, features = ["loaded", "std"] }
+
+[build-dependencies]
+sha2.workspace = true
+synapse-parity = { path = "../../bench/parity", default-features = false }
+
+[dev-dependencies]
+tempfile = "3"
+tokio.workspace = true

@@ -42,6 +42,18 @@ pub struct VulkanFloors {
 const F32: u64 = 4;
 const I32: u64 = 4;
 
+/// Storage buffers share a device-local arena with 256-byte-aligned offsets.
+/// Round every slice, including the final slice, so the arena has no unaccounted tail.
+pub const BUFFER_ALIGNMENT: u64 = 256;
+
+pub fn aligned_bytes(bytes: u64) -> u64 {
+    bytes.div_ceil(BUFFER_ALIGNMENT) * BUFFER_ALIGNMENT
+}
+
+pub fn arena_bytes(plan: &[Buffer]) -> u64 {
+    plan.iter().map(|buffer| aligned_bytes(buffer.bytes)).sum()
+}
+
 /// Every buffer the Vulkan worker allocates for `model`.
 pub fn buffer_plan(
     model: &Model,
@@ -158,12 +170,12 @@ pub fn peak_bytes(
     let resident: u64 = plan
         .iter()
         .filter(|b| !b.per_sub_batch)
-        .map(|b| b.bytes)
+        .map(|b| aligned_bytes(b.bytes))
         .sum();
     let activations: u64 = plan
         .iter()
         .filter(|b| b.per_sub_batch)
-        .map(|b| b.bytes)
+        .map(|b| aligned_bytes(b.bytes))
         .sum();
     let per_sub_batch = (sub_batch_max_tokens / context_tokens).max(1);
     let mut peak = resident;
@@ -174,4 +186,33 @@ pub fn peak_bytes(
         remaining -= take;
     }
     peak
+}
+
+#[cfg(test)]
+mod alignment_tests {
+    use super::*;
+
+    #[test]
+    fn arena_rounds_each_buffer_to_256_bytes() {
+        let plan = vec![
+            Buffer {
+                name: "weight".into(),
+                bytes: 257,
+                per_sub_batch: false,
+            },
+            Buffer {
+                name: "activation".into(),
+                bytes: 1,
+                per_sub_batch: true,
+            },
+            Buffer {
+                name: "result".into(),
+                bytes: 256,
+                per_sub_batch: false,
+            },
+        ];
+        assert_eq!(arena_bytes(&plan), 512 + 256 + 256);
+        assert_eq!(peak_bytes(&plan, 8192, 256, 8192), 1024);
+        assert_eq!(arena_bytes(&plan) % BUFFER_ALIGNMENT, 0);
+    }
 }
