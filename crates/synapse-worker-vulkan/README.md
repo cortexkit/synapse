@@ -53,3 +53,38 @@ around another inference runtime.
 Hosted protocol/floor tests need no GPU. Model-output parity, performance and
 physical-allocation evidence still require certification on AMD/NVIDIA hardware;
 a successful hosted smoke test is not evidence of model-output parity.
+
+## Development-only GPU parity
+
+`moltenvk-diagnostic` is non-default and exposes an explicit macOS-only test
+constructor, not a production LOAD/probe override. It opens the SDK's real dylib,
+enables portability enumeration/subset and uses the plain shader on Apple GPUs.
+Default and `vulkan` builds cannot import that constructor (compile-fail doctest).
+
+After verifying and converting the manifest-pinned checkpoints with
+`bench/parity`'s `parity-manifest convert` command, run:
+
+```sh
+export VULKAN_SDK="$PWD/target/vulkan-sdk/1.4.357.0/macOS"
+VK_ICD_FILENAMES="$VULKAN_SDK/share/vulkan/icd.d/MoltenVK_icd.json" \
+SYNAPSE_MOLTENVK_LOADER="$VULKAN_SDK/lib/libvulkan.1.dylib" \
+SYNAPSE_VULKAN_TEST_PACKAGES="$PWD/target/gpu-parity/packages" \
+cargo test -p synapse-worker-vulkan --features moltenvk-diagnostic \
+  --test gpu_parity -- --ignored --nocapture
+```
+
+The ignored test executes the production Engine and shaders against CPU-fp32
+fixtures, including 129/200-token rows, batch-longest padding and a ten-candidate
+pool. It requires cosine >= 0.999, unit norm within 1e-3, fp16 score error <= 0.02,
+gap-gated top-10 order and Kendall tau >= 0.99. Package directories must not
+contain config.json. AMD/NVIDIA release certification remains separate.
+
+Measured on MoltenVK plain compute (API 1.3; float16, 16-bit storage and subgroup
+arithmetic supported; cooperative matrices unavailable):
+
+```text
+GPU_PARITY gte-modernbert-base min_cosine=0.999997843 rows=11 padded_width=200
+GPU_PARITY gte-reranker-modernbert-base max_score_error=0.001476765 min_kendall_tau=1.000000000 rows=19
+GPU_PARITY qwen3-embedding-0.6b min_cosine=0.999999780 rows=11 padded_width=200
+GPU_PARITY qwen3-reranker-0.6b max_score_error=0.000006936 min_kendall_tau=1.000000000 rows=19
+```
