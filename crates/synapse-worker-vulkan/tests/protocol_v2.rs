@@ -147,3 +147,12 @@ fn version_reports_embedded_bindings_and_feature() {
     assert!(text.contains(MANIFEST_DIGEST));
     assert!(text.contains(KERNEL_REVISION));
 }
+
+#[cfg(feature = "vulkan")]
+#[test]
+fn shader_set_revision_matches_pinned_spirv_fixture() {
+    assert_eq!(
+        KERNEL_REVISION,
+        include_str!("fixtures/kernel-revision.txt").trim()
+    );
+}

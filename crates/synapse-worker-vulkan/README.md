@@ -44,8 +44,9 @@ driver `VkMemoryRequirements.size`, allocation count and selected heap. Driver
 allocation padding is visible in that report rather than hidden in payload
 accounting.
 
-Cooperative GEMM requires API 1.3, `VK_KHR_cooperative_matrix`, its enabled feature
-and the supported subgroup 16×16×16 f16-input/f32-accumulator shape. Other devices
+Cooperative GEMM requires API 1.3, `VK_KHR_cooperative_matrix`, its enabled feature,
+the Vulkan memory-model feature and the supported subgroup 16×16×16
+f16-input/f32-accumulator shape. Other devices
 and other projection shapes use the plain kernel. Neither kernel is a wrapper
 around another inference runtime.
 

@@ -153,8 +153,11 @@ impl Device {
         let mut storage16 =
             vk::PhysicalDevice16BitStorageFeatures::default().storage_buffer16_bit_access(true);
         let mut cooperative = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default();
+        let mut memory_model = vk::PhysicalDeviceVulkanMemoryModelFeatures::default();
         if adapter.use_cooperative() {
-            let mut query = vk::PhysicalDeviceFeatures2::default().push_next(&mut cooperative);
+            let mut query = vk::PhysicalDeviceFeatures2::default()
+                .push_next(&mut cooperative)
+                .push_next(&mut memory_model);
             unsafe {
                 instance
                     .raw
@@ -180,8 +183,14 @@ impl Device {
         } else {
             false
         };
-        let coop_enabled =
-            adapter.use_cooperative() && cooperative.cooperative_matrix == vk::TRUE && coop_shape;
+        let coop_enabled = adapter.use_cooperative()
+            && cooperative.cooperative_matrix == vk::TRUE
+            && memory_model.vulkan_memory_model == vk::TRUE
+            && coop_shape;
+        cooperative = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default()
+            .cooperative_matrix(coop_enabled);
+        memory_model = vk::PhysicalDeviceVulkanMemoryModelFeatures::default()
+            .vulkan_memory_model(coop_enabled);
         let extensions: Vec<_> = if coop_enabled {
             vec![ash::khr::cooperative_matrix::NAME.as_ptr()]
         } else {
@@ -193,7 +202,9 @@ impl Device {
             .push_next(&mut float16)
             .push_next(&mut storage16);
         if coop_enabled {
-            info = info.push_next(&mut cooperative);
+            info = info
+                .push_next(&mut cooperative)
+                .push_next(&mut memory_model);
         }
         let raw = unsafe { instance.raw.create_device(physical, &info, None) }?;
         let queue = unsafe { raw.get_device_queue(family, 0) };
@@ -205,12 +216,27 @@ impl Device {
             .max_by_key(|(_, h)| h.size)
             .context("no device-local heap")?
             .0 as u32;
+        let mut device = Self {
+            instance,
+            raw,
+            physical,
+            queue,
+            heap_index,
+            pool: vk::CommandPool::null(),
+            descriptor_layout: vk::DescriptorSetLayout::null(),
+            descriptor_pool: vk::DescriptorPool::null(),
+            pipeline_layout: vk::PipelineLayout::null(),
+            plain: vk::Pipeline::null(),
+            cooperative: None,
+        };
+        let raw = &device.raw;
         let pool = unsafe {
             raw.create_command_pool(
                 &vk::CommandPoolCreateInfo::default().queue_family_index(family),
                 None,
             )
         }?;
+        device.pool = pool;
         let bindings: Vec<_> = (0..7)
             .map(|binding| {
                 vk::DescriptorSetLayoutBinding::default()
@@ -226,6 +252,7 @@ impl Device {
                 None,
             )
         }?;
+        device.descriptor_layout = descriptor_layout;
         let pool_sizes = [vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::STORAGE_BUFFER)
             .descriptor_count(7)];
@@ -237,6 +264,7 @@ impl Device {
                 None,
             )
         }?;
+        device.descriptor_pool = descriptor_pool;
         let layouts = [descriptor_layout];
         let ranges = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::COMPUTE)
@@ -249,6 +277,7 @@ impl Device {
                 None,
             )
         }?;
+        device.pipeline_layout = pipeline_layout;
         let make_pipeline = |name: &str| -> Result<vk::Pipeline> {
             let bytes = SHADERS
                 .iter()
@@ -272,29 +301,22 @@ impl Device {
             unsafe {
                 raw.destroy_shader_module(module, None);
             }
-            result
-                .map(|p| p[0])
-                .map_err(|(_, e)| anyhow!("create compute pipeline: {e}"))
+            result.map(|p| p[0]).map_err(|(pipelines, e)| {
+                for pipeline in pipelines {
+                    unsafe {
+                        raw.destroy_pipeline(pipeline, None);
+                    }
+                }
+                anyhow!("create compute pipeline: {e}")
+            })
         };
-        let plain = make_pipeline("plain")?;
-        let cooperative = if coop_enabled {
+        device.plain = make_pipeline("plain")?;
+        device.cooperative = if coop_enabled {
             Some(make_pipeline("cooperative")?)
         } else {
             None
         };
-        Ok(Arc::new(Self {
-            instance,
-            raw,
-            physical,
-            queue,
-            pool,
-            descriptor_layout,
-            descriptor_pool,
-            pipeline_layout,
-            plain,
-            cooperative,
-            heap_index,
-        }))
+        Ok(Arc::new(device))
     }
 
     fn submit(&self, record: impl FnOnce(vk::CommandBuffer)) -> Result<()> {
@@ -321,6 +343,20 @@ impl Device {
             self.raw.free_command_buffers(self.pool, &[command]);
         }
         Ok(())
+    }
+}
+
+struct TransferBuffer {
+    device: Arc<Device>,
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+}
+impl Drop for TransferBuffer {
+    fn drop(&mut self) {
+        unsafe {
+            self.device.raw.destroy_buffer(self.buffer, None);
+            self.device.raw.free_memory(self.memory, None);
+        }
     }
 }
 
@@ -356,6 +392,15 @@ impl Arena {
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
         let buffer = unsafe { device.raw.create_buffer(&info, None) }?;
         let requirements = unsafe { device.raw.get_buffer_memory_requirements(buffer) };
+        let mut arena = Self {
+            device: device.clone(),
+            buffer,
+            memory: vk::DeviceMemory::null(),
+            slices,
+            requested_bytes,
+            driver_bytes: requirements.size,
+            mapped: false,
+        };
         let props = unsafe {
             device
                 .instance
@@ -393,18 +438,12 @@ impl Arena {
                 None,
             )
         }?;
+        arena.memory = memory;
+        arena.mapped = mapped;
         unsafe {
             device.raw.bind_buffer_memory(buffer, memory, 0)?;
         }
-        Ok(Self {
-            device,
-            buffer,
-            memory,
-            slices,
-            requested_bytes,
-            driver_bytes: requirements.size,
-            mapped,
-        })
+        Ok(arena)
     }
 
     fn descriptor(&self, name: &str) -> Result<vk::DescriptorBufferInfo> {
@@ -451,6 +490,11 @@ impl Arena {
             .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST);
         let buffer = unsafe { device.raw.create_buffer(&info, None) }?;
         let req = unsafe { device.raw.get_buffer_memory_requirements(buffer) };
+        let mut staging = TransferBuffer {
+            device: device.clone(),
+            buffer,
+            memory: vk::DeviceMemory::null(),
+        };
         let props = unsafe {
             device
                 .instance
@@ -480,6 +524,7 @@ impl Arena {
                 None,
             )
         }?;
+        staging.memory = memory;
         unsafe {
             device.raw.bind_buffer_memory(buffer, memory, 0)?;
         }
@@ -519,10 +564,7 @@ impl Arena {
                 device.raw.unmap_memory(memory);
             }
         }
-        unsafe {
-            device.raw.destroy_buffer(buffer, None);
-            device.raw.free_memory(memory, None);
-        }
+        drop(staging);
         if !upload {
             destination.copy_from_slice(&padded[..original_len]);
         }
@@ -925,7 +967,7 @@ impl Engine {
                 false,
                 eps,
             )?;
-            // Copy through a projection-free add so every layer sees normalized embeddings as its residual.
+            // The first layer's residual must be the normalized embeddings.
             self.copy("activation:normed", "activation:hidden", rows * h, dummy)?;
         }
         for layer in 0..arch.int("num_hidden_layers")? {

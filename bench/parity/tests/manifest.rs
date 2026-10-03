@@ -15,7 +15,7 @@ use synapse_parity::parity_dir;
 use synapse_parity::rules::derived_profile;
 use synapse_parity::safetensors::parse_header_json;
 use synapse_parity::validate::{check_head, validate_dir, validate_manifest};
-use synapse_parity::vulkan::{vulkan_floors, FLOOR_SEQUENCES};
+use synapse_parity::vulkan::{vulkan_floors, BUFFER_ALIGNMENT, FLOOR_SEQUENCES};
 
 fn manifest() -> Manifest {
     Manifest::load(&parity_dir().join(MANIFEST_FILE)).unwrap()
@@ -44,7 +44,6 @@ fn expect_err<T: std::fmt::Debug>(result: synapse_parity::Result<T>, needle: &st
         error.0
     );
 }
-
 
 /// A labelled mutation applied to a copy of the manifest.
 type ManifestEdit = fn(&mut Manifest);
@@ -437,22 +436,32 @@ fn vulkan_floors_equal_the_sizing_function() {
             Some(floors.min_device_local_bytes),
             "{id}"
         );
-        // The device-local floor depends on the sequence count (the result
-        // buffer holds every sequence), so sizing for 255 instead of 256 must
-        // give a smaller value.
-        let fewer = vulkan_floors(
-            m.model(slug).unwrap(),
-            profile.storage_dtype,
-            &profile.fp32_tensors,
-            8192,
-            255,
-            8192,
-        )
-        .unwrap();
-        assert!(
-            fewer.min_device_local_bytes < floors.min_device_local_bytes,
-            "{id}"
-        );
+        assert_eq!(floors.min_device_local_bytes % BUFFER_ALIGNMENT, 0, "{id}");
+        let floor_at = |sequences| {
+            vulkan_floors(
+                m.model(slug).unwrap(),
+                profile.storage_dtype,
+                &profile.fp32_tensors,
+                8192,
+                sequences,
+                8192,
+            )
+            .unwrap()
+            .min_device_local_bytes
+        };
+        // More results cannot shrink the arena, but an additional score may
+        // still fit in padding reserved by the previous 256-byte alignment.
+        for n in 1..=512 {
+            assert!(floor_at(n) <= floor_at(n + 1), "{id} at {n}");
+        }
+        let result_bytes = u64::from(m.model(slug).unwrap().output.dimension) * 4;
+        let quantum = BUFFER_ALIGNMENT.div_ceil(result_bytes);
+        for n in [1, 63, 128, 255, 256, 512] {
+            assert!(
+                floor_at(n + quantum) > floor_at(n),
+                "{id} at {n} + {quantum}"
+            );
+        }
     }
     assert_eq!(FLOOR_SEQUENCES, 256);
     // The largest Qwen3 buffer is its f16 token-embedding table.

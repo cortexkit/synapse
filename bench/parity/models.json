@@ -28,19 +28,19 @@
       "gte-modernbert-base.ane-direct-worker": "797176c690b001c3f8cd76343f764311a2d6943cdeee88f541fc230bd5ad1c2f",
       "gte-modernbert-base.owned-cuda": "38e70f3671ef38133fcb1f2f7aecc3ef8f335d897fc7b57af53a208ada6de23f",
       "gte-modernbert-base.owned-metal": "9ba0521494657eb281532ead061cd82916a1923a9560d1cddb7212ab7e92398a",
-      "gte-modernbert-base.owned-vulkan": "e8e18233566f2f5a83caed9c61bae2547547c5bf60121799ea69defcb1886fbd",
+      "gte-modernbert-base.owned-vulkan": "cf31cdcd2fc4d2eb12b300adf8389a596afacae32e685bf1037db86ce4f9cedc",
       "gte-reranker-modernbert-base.ane-direct-worker": "2f290e2397757211f5fb9a35869d53ab41030f1b8d86b34a60ed032c3aaedf1b",
       "gte-reranker-modernbert-base.owned-cuda": "64c440fc552585a34cee2bfdc05ef391813fd5972467100cc6012ffec78e8519",
       "gte-reranker-modernbert-base.owned-metal": "96ec4ca41db7fa1716f28d37b88dde89a5fe316e6c91b7ae9c5b96c900fec7a0",
-      "gte-reranker-modernbert-base.owned-vulkan": "0ce0cb615618ecc37782357eff286746b8bf644f56cd022a3cc613766c826458",
+      "gte-reranker-modernbert-base.owned-vulkan": "1da21b3ab0d541caec40a65fd1cf2cec5c8f1ec590ebc5df360d6bf9471da783",
       "qwen3-embedding-0.6b.ane-direct-worker": "05e8ac1af8e3e78e2cbde230ddb16d6fb08379df42b984f2a366e7da2b72a511",
       "qwen3-embedding-0.6b.owned-cuda": "d7350ff3e1241d8fda584bea12645dfee47e89d5c6de8394902923ccfec1071e",
       "qwen3-embedding-0.6b.owned-metal": "d3f98359d9b76aa1576eb96bec880868e3b35963d8dfdcee21f8cc9a82b45b52",
-      "qwen3-embedding-0.6b.owned-vulkan": "1220fd0a6bbd5fac28db6b63e39497f373a6c7e5b4884c61512bc858ec578d4f",
+      "qwen3-embedding-0.6b.owned-vulkan": "5b7a21399df6feeb67009d5ec0a19978dfdf1575e277482851bd015ac97b4a81",
       "qwen3-reranker-0.6b.ane-direct-worker": "14397bd7b99619e15e4b46343daa109298ebe8538ac6661dba69dabef4f33a12",
       "qwen3-reranker-0.6b.owned-cuda": "0e171a8f9e78a58f22b916591bbb728c1dc9ed7edee7dda70d051550512823a6",
       "qwen3-reranker-0.6b.owned-metal": "25826de645ccad44540bfaecc8a712bbaf1736aa66a05791e1df6e359409dec7",
-      "qwen3-reranker-0.6b.owned-vulkan": "edd6750ed46977d22d450f77cf5fc29abaecf44dfe55c67548e0d0305d666fb3"
+      "qwen3-reranker-0.6b.owned-vulkan": "5e413988714f7fea56eb4ba937cf1f714641dca322e3986b39076be339b0614d"
     }
   },
   "models": {
@@ -480,7 +480,7 @@
       "model": "gte-modernbert-base",
       "rerank_tolerance_class": "fp16",
       "storage_dtype": "f16",
-      "vulkan_min_device_local_bytes": 563911172,
+      "vulkan_min_device_local_bytes": 563911424,
       "vulkan_min_storage_buffer_range": 77365248,
       "vulkan_sub_batch_max_tokens": 8192
     },
@@ -544,7 +544,7 @@
       "model": "gte-reranker-modernbert-base",
       "rerank_tolerance_class": "fp16",
       "storage_dtype": "f16",
-      "vulkan_min_device_local_bytes": 564311558,
+      "vulkan_min_device_local_bytes": 564312064,
       "vulkan_min_storage_buffer_range": 77365248,
       "vulkan_sub_batch_max_tokens": 8192
     },
@@ -600,7 +600,7 @@
       "model": "qwen3-embedding-0.6b",
       "rerank_tolerance_class": "fp16",
       "storage_dtype": "f16",
-      "vulkan_min_device_local_bytes": 1764145156,
+      "vulkan_min_device_local_bytes": 1764145408,
       "vulkan_min_storage_buffer_range": 310618112,
       "vulkan_sub_batch_max_tokens": 8192
     },
@@ -657,7 +657,7 @@
       "model": "qwen3-reranker-0.6b",
       "rerank_tolerance_class": "fp16",
       "storage_dtype": "f16",
-      "vulkan_min_device_local_bytes": 1763101700,
+      "vulkan_min_device_local_bytes": 1763101952,
       "vulkan_min_storage_buffer_range": 310618112,
       "vulkan_sub_batch_max_tokens": 8192
     }

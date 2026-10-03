@@ -309,11 +309,11 @@ fn load(
         let engine = crate::runtime::Engine::load(model, profile, adapter, required, &header, data)
             .map_err(|e| {
                 if e.to_string().contains("vulkan_insufficient_memory") {
-                    "vulkan_insufficient_memory".into()
+                    "vulkan_insufficient_memory".to_owned()
                 } else if e.to_string().contains("vulkan_no_device") {
-                    "vulkan_no_device".into()
+                    "vulkan_no_device".to_owned()
                 } else {
-                    "vulkan_load_failed".into()
+                    "vulkan_load_failed".to_owned()
                 }
             })?;
         Ok(Loaded {

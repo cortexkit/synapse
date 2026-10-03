@@ -6663,6 +6663,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "synapse-parity"
+version = "0.0.0"
+dependencies = [
+ "half",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "synapse-rig"
 version = "0.0.0"
 dependencies = [
@@ -6731,6 +6741,22 @@ dependencies = [
  "synapse-core",
  "synapse-module",
  "tokenizers 0.21.4",
+ "tokio",
+]
+
+[[package]]
+name = "synapse-worker-vulkan"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ash",
+ "clap",
+ "serde",
+ "serde_json",
+ "sha2",
+ "synapse-core",
+ "synapse-parity",
+ "tempfile",
  "tokio",
 ]
 
