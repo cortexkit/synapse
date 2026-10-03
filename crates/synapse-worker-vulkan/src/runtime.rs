@@ -30,6 +30,13 @@ fn instance() -> Result<Instance> {
     } else {
         "libvulkan.so.1"
     };
+    instance_from_loader(library, false)
+}
+
+fn instance_from_loader(
+    library: impl AsRef<std::ffi::OsStr>,
+    portability: bool,
+) -> Result<Instance> {
     let entry = unsafe { Entry::load_from(library) }.context("vulkan_no_device")?;
     let loader_version = unsafe { entry.try_enumerate_instance_version() }
         .context("vulkan_no_device")?
@@ -40,7 +47,13 @@ fn instance() -> Result<Instance> {
         vk::API_VERSION_1_2
     };
     let app = vk::ApplicationInfo::default().api_version(api_version);
-    let info = vk::InstanceCreateInfo::default().application_info(&app);
+    let extensions = [ash::khr::portability_enumeration::NAME.as_ptr()];
+    let mut info = vk::InstanceCreateInfo::default().application_info(&app);
+    if portability {
+        info = info
+            .flags(vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR)
+            .enabled_extension_names(&extensions);
+    }
     let raw = unsafe { entry.create_instance(&info, None) }.context("vulkan_no_device")?;
     Ok(Instance {
         _entry: entry,
@@ -123,6 +136,30 @@ pub fn prepare(required: Required) -> Result<Prepared> {
     })
 }
 
+/// Explicit development-only Apple GPU entry point. Release LOAD and probe
+/// retain their loader names, vendor policy and cooperative selection.
+#[cfg(all(target_os = "macos", feature = "moltenvk-diagnostic"))]
+pub fn prepare_moltenvk_parity(loader: &std::path::Path, required: Required) -> Result<Prepared> {
+    let instance = instance_from_loader(loader.as_os_str(), true)?;
+    let device = Device::with_instance(required, instance, true)?;
+    eprintln!(
+        "MoltenVK plain-path adapter: {}",
+        serde_json::to_string(&device.adapter)?
+    );
+    Ok(Prepared {
+        adapter: device.adapter.clone(),
+        device,
+    })
+}
+
+/// Production Vulkan builds cannot import the diagnostic entry point.
+/// ```compile_fail
+/// use synapse_worker_vulkan::runtime::prepare;
+/// use synapse_worker_vulkan::runtime::prepare_moltenvk_parity;
+/// ```
+#[cfg(not(feature = "moltenvk-diagnostic"))]
+pub struct DiagnosticApiAbsent;
+
 struct Device {
     instance: Instance,
     adapter: Adapter,
@@ -157,15 +194,44 @@ impl Drop for Device {
 
 impl Device {
     fn new(required: Required) -> Result<Arc<Self>> {
-        let instance = instance()?;
+        Self::with_instance(required, instance()?, false)
+    }
+
+    fn with_instance(
+        required: Required,
+        instance: Instance,
+        diagnostic: bool,
+    ) -> Result<Arc<Self>> {
         let physicals =
             unsafe { instance.raw.enumerate_physical_devices() }.context("vulkan_no_device")?;
-        let adapters = physicals
+        let adapters: Vec<Adapter> = physicals
             .iter()
             .enumerate()
             .map(|(index, physical)| inspect(&instance, *physical, index))
             .collect();
-        let adapter = crate::admission::select(adapters, required).map_err(|code| anyhow!(code))?;
+        #[cfg(all(target_os = "macos", feature = "moltenvk-diagnostic"))]
+        let adapters = if diagnostic {
+            let diagnostics: Vec<_> = adapters
+                .into_iter()
+                .filter(|a| a.vendor == 0x106b)
+                .collect();
+            for adapter in &diagnostics {
+                let mut floor_check = adapter.clone();
+                floor_check.vendor = 0x1002;
+                floor_check.check(required).map_err(|code| anyhow!(code))?;
+            }
+            diagnostics
+        } else {
+            adapters
+        };
+        let adapter = if diagnostic {
+            adapters
+                .into_iter()
+                .next()
+                .context("no Apple diagnostic adapter")?
+        } else {
+            crate::admission::select(adapters, required).map_err(|code| anyhow!(code))?
+        };
         let physical = physicals[adapter.index];
         let queues = unsafe {
             instance
@@ -185,7 +251,7 @@ impl Device {
         let mut storage16 =
             vk::PhysicalDevice16BitStorageFeatures::default().storage_buffer16_bit_access(true);
         let can_cooperate =
-            instance.api_version >= vk::API_VERSION_1_3 && adapter.use_cooperative();
+            !diagnostic && instance.api_version >= vk::API_VERSION_1_3 && adapter.use_cooperative();
         let mut cooperative = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default();
         let mut memory_model = vk::PhysicalDeviceVulkanMemoryModelFeatures::default();
         if can_cooperate {
@@ -225,11 +291,14 @@ impl Device {
             .cooperative_matrix(coop_enabled);
         memory_model = vk::PhysicalDeviceVulkanMemoryModelFeatures::default()
             .vulkan_memory_model(coop_enabled);
-        let extensions: Vec<_> = if coop_enabled {
+        let mut extensions: Vec<_> = if coop_enabled {
             vec![ash::khr::cooperative_matrix::NAME.as_ptr()]
         } else {
             vec![]
         };
+        if diagnostic {
+            extensions.push(ash::khr::portability_subset::NAME.as_ptr());
+        }
         let mut info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_info)
             .enabled_extension_names(&extensions)
