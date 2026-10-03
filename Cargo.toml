@@ -50,12 +50,12 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-uti
 # subc-protocol minor, leaving the lock with two copies of subc-protocol and
 # subc-control while this workspace's own code talks the older one. The wire
 # crates move together, as one block, so the graph keeps a single copy of each.
-# subc-control is not a direct dependency; every pinned crate here requires it
-# at ^0.24, which keeps it to one copy without a pin of its own.
-subc-client-rs = "=0.23.1"
-subc-daemon = "=0.25.0"
-subc-protocol = "=0.27.0"
-subc-transport = "=0.8.1"
+# subc-control is not a direct dependency; every pinned crate here requires the
+# same caret range of it, which keeps it to one copy without a pin of its own.
+subc-client-rs = "=0.26.0"
+subc-daemon = "=0.31.0"
+subc-protocol = "=0.29.0"
+subc-transport = "=0.10.0"
 # Test-only: subc-os carries the daemon's half of the launch-nonce handoff
 # (the pipe it places on descriptor 3 of a spawned module), which the tests use
 # to launch the module exactly as the daemon does. Pinned to the copy the SDK
