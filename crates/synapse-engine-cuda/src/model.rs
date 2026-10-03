@@ -93,6 +93,8 @@ pub(crate) struct ModernBertModel {
     pub(crate) embedding_norm: Vec<f32>,
     pub(crate) layers: Vec<ModernBertLayer>,
     pub(crate) final_norm: Vec<f32>,
+    profile: Option<crate::manifest::Profile>,
+    head: Option<ModernHead>,
 }
 
 #[derive(Clone)]
@@ -126,6 +128,8 @@ pub(crate) struct Qwen3Model {
     /// Set once the CUDA context has the layer weights; the host copies are
     /// then dropped so only the VRAM residency survives.
     weights_uploaded: bool,
+    profile: Option<crate::manifest::Profile>,
+    readout: Option<(Vec<f32>, Vec<f32>)>,
 }
 
 pub(crate) fn resolve_model_root(path: &Path) -> Result<PathBuf> {
@@ -182,7 +186,7 @@ fn load_safetensors_file(path: &Path) -> Result<HashMap<String, Tensor>> {
     // `Vec<u8>` would only ever be a transient second copy of the model in
     // host RAM. The non-CUDA build cannot use `unsafe` here because the crate
     // forbids it outside the `cuda` feature, so it keeps the plain read.
-    #[cfg(feature = "cuda")]
+    #[cfg(all(feature = "cuda", not(target_os = "macos")))]
     let bytes = {
         let file =
             fs::File::open(path).with_context(|| format!("open safetensors {}", path.display()))?;
@@ -191,7 +195,7 @@ fn load_safetensors_file(path: &Path) -> Result<HashMap<String, Tensor>> {
         unsafe { memmap2::Mmap::map(&file) }
             .with_context(|| format!("mmap safetensors {}", path.display()))?
     };
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(all(feature = "cuda", not(target_os = "macos"))))]
     let bytes = fs::read(path).with_context(|| format!("read safetensors {}", path.display()))?;
     let tensors = SafeTensors::deserialize(&bytes)
         .map_err(|error| anyhow::anyhow!("load safetensors {}: {error}", path.display()))?;
@@ -384,7 +388,7 @@ impl MiniLmModel {
         let seq = sequences.iter().map(Vec::len).max().unwrap_or(1);
         ensure!(seq <= self.position_embeddings.shape[0]);
         let mut hidden = vec![0.0; real_batch * seq * self.hidden];
-        let mut mask = vec![0u8; real_batch * seq];
+        let (_, mask, _) = pad_batch(sequences, self.pad_token_id)?;
         for (row, ids) in sequences.iter().enumerate() {
             for (position, &token) in ids.iter().enumerate() {
                 let token = token as usize;
@@ -396,7 +400,6 @@ impl MiniLmModel {
                         + self.position_embeddings.data[position * self.hidden + feature]
                         + self.token_type_embeddings.data[feature];
                 }
-                mask[row * seq + position] = 1;
             }
         }
         layer_norm(
@@ -465,13 +468,31 @@ fn default_local_theta() -> f32 {
 }
 
 impl ModernBertModel {
-    pub(crate) fn load(path: &Path) -> Result<Self> {
+    pub(crate) fn load(path: &Path, profile: Option<&crate::manifest::Profile>) -> Result<Self> {
         let root = resolve_model_root(path)?;
-        let config: ModernConfig =
-            serde_json::from_str(&fs::read_to_string(root.join("config.json"))?)?;
+        let config: ModernConfig = if let Some(profile) = profile {
+            let mut params = profile.params();
+            params["model_type"] = "modernbert".into();
+            serde_json::from_value(params)?
+        } else {
+            serde_json::from_str(&fs::read_to_string(root.join("config.json"))?)?
+        };
         ensure!(config.model_type == "modernbert");
         ensure!(config.hidden_size % config.num_attention_heads == 0);
-        let tensors = load_safetensor_map(&root, path)?;
+        let mut tensors = load_safetensor_map(&root, path)?;
+        let head = if profile.is_some_and(|p| p.operation() == "rerank") {
+            Some(ModernHead::load(&tensors)?)
+        } else {
+            None
+        };
+        if let Some(prefix) = profile.and_then(|p| p.model["tensor_prefix"].as_str()) {
+            if !prefix.is_empty() {
+                tensors = tensors
+                    .into_iter()
+                    .filter_map(|(k, v)| k.strip_prefix(prefix).map(|k| (k.to_owned(), v)))
+                    .collect();
+            }
+        }
         let embeddings = get_tensor(&tensors, MODERNBERT_EMBEDDINGS)?.clone();
         let embedding_norm = take_vector(&tensors, MODERNBERT_EMBEDDING_NORM)?;
         let final_norm = take_vector(&tensors, MODERNBERT_FINAL_NORM)?;
@@ -533,6 +554,8 @@ impl ModernBertModel {
             embedding_norm,
             layers,
             final_norm,
+            profile: profile.cloned(),
+            head,
         })
     }
 
@@ -547,7 +570,7 @@ impl ModernBertModel {
         let seq = sequences.iter().map(Vec::len).max().unwrap_or(1);
         ensure!(seq <= self.max_position_embeddings);
         let mut hidden = vec![0.0; real_batch * seq * self.hidden];
-        let mut mask = vec![0u8; real_batch * seq];
+        let (_, mask, _) = pad_batch(sequences, self.pad_token_id)?;
         for (row, ids) in sequences.iter().enumerate() {
             for (position, &token) in ids.iter().enumerate() {
                 let token = token as usize;
@@ -556,7 +579,6 @@ impl ModernBertModel {
                 hidden[destination..destination + self.hidden].copy_from_slice(
                     &self.embeddings.data[token * self.hidden..(token + 1) * self.hidden],
                 );
-                mask[row * seq + position] = u8::from(token as u32 != self.pad_token_id);
             }
         }
         layer_norm(
@@ -585,8 +607,25 @@ impl ModernBertModel {
         let mut vectors = Vec::with_capacity(real_batch);
         for row in 0..real_batch {
             let offset = row * seq * self.hidden;
-            let mut vector = hidden[offset..offset + self.hidden].to_vec();
-            normalize_l2(&mut vector);
+            let mut vector = if let Some(profile) = &self.profile {
+                pool_hidden(
+                    &hidden[offset..offset + seq * self.hidden],
+                    &mask[row * seq..(row + 1) * seq],
+                    self.hidden,
+                    profile.model["grammar"]["pooling"].as_str().unwrap(),
+                )?
+            } else {
+                hidden[offset..offset + self.hidden].to_vec()
+            };
+            if let Some(head) = &self.head {
+                vector = vec![head.score(&vector, self.epsilon)];
+            } else if self
+                .profile
+                .as_ref()
+                .is_none_or(|p| p.model["output"]["normalization"] == "l2")
+            {
+                normalize_l2(&mut vector);
+            }
             vectors.push(vector);
         }
         let _ = precision;
@@ -609,15 +648,44 @@ struct QwenConfig {
 }
 
 impl Qwen3Model {
-    pub(crate) fn load(path: &Path) -> Result<Self> {
+    pub(crate) fn load(path: &Path, profile: Option<&crate::manifest::Profile>) -> Result<Self> {
         let root = resolve_model_root(path)?;
-        let config: QwenConfig =
-            serde_json::from_str(&fs::read_to_string(root.join("config.json"))?)?;
+        let config: QwenConfig = if let Some(profile) = profile {
+            let mut params = profile.params();
+            params["rms_norm_eps"] = params["norm_eps"].clone();
+            serde_json::from_value(params)?
+        } else {
+            serde_json::from_str(&fs::read_to_string(root.join("config.json"))?)?
+        };
         ensure!(config.num_hidden_layers > 0);
         ensure!(config.num_attention_heads % config.num_key_value_heads == 0);
-        let tensors = load_safetensor_map(&root, path)?;
+        let mut tensors = load_safetensor_map(&root, path)?;
+        if let Some(prefix) = profile.and_then(|p| p.model["tensor_prefix"].as_str()) {
+            if !prefix.is_empty() {
+                tensors = tensors
+                    .into_iter()
+                    .filter_map(|(k, v)| k.strip_prefix(prefix).map(|k| (k.to_owned(), v)))
+                    .collect();
+            }
+        }
         let embeddings = get_tensor(&tensors, QWEN3_EMBEDDINGS)?.clone();
         ensure!(embeddings.shape == vec![config.vocab_size, config.hidden_size]);
+        let readout = profile
+            .filter(|p| p.operation() == "rerank")
+            .map(|p| {
+                let row = |name: &str| -> Result<Vec<f32>> {
+                    let id = p.model["grammar"]["readout"][name]["id"]
+                        .as_u64()
+                        .context("head_tensor_missing")? as usize;
+                    ensure!(id < config.vocab_size);
+                    Ok(
+                        embeddings.data[id * config.hidden_size..(id + 1) * config.hidden_size]
+                            .to_vec(),
+                    )
+                };
+                Ok::<_, anyhow::Error>((row("yes")?, row("no")?))
+            })
+            .transpose()?;
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for index in 0..config.num_hidden_layers {
             let norm = |name: &str| take_vector(&tensors, &family_layer_tensor_name(index, name));
@@ -650,6 +718,8 @@ impl Qwen3Model {
                 .eos_token_id
                 .context("Qwen3 config is missing eos_token_id")?,
             weights_uploaded: false,
+            profile: profile.cloned(),
+            readout,
             embeddings,
             layers,
             final_norm,
@@ -667,15 +737,12 @@ impl Qwen3Model {
         let real_batch = sequences.len();
         ensure!(real_batch > 0 && sequences.iter().all(|ids| !ids.is_empty()));
         let seq = sequences.iter().map(Vec::len).max().unwrap_or(1);
-        let mut token_ids = vec![0u32; real_batch * seq];
-        let mut mask = vec![0u8; real_batch * seq];
-        for (row, ids) in sequences.iter().enumerate() {
-            for (position, &token) in ids.iter().enumerate() {
-                ensure!((token as usize) < self.vocab_size);
-                token_ids[row * seq + position] = token;
-                mask[row * seq + position] = 1;
-            }
-        }
+        ensure!(seq <= crate::manifest::max_context_tokens());
+        let pad = self.profile.as_ref().map_or(0, |p| p.pad_id());
+        let (token_ids, mask, _) = pad_batch(sequences, pad)?;
+        ensure!(token_ids
+            .iter()
+            .all(|&token| (token as usize) < self.vocab_size));
         let mut hidden = vec![0.0f32; real_batch * seq * self.hidden];
         let upload = !self.weights_uploaded;
         // The CUDA worker wants the table as f16; encode once here so the
@@ -722,8 +789,25 @@ impl Qwen3Model {
                 .find(|&position| mask[row * seq + position] != 0)
                 .unwrap_or(0);
             let offset = (row * seq + last) * self.hidden;
-            let mut vector = hidden[offset..offset + self.hidden].to_vec();
-            normalize_l2(&mut vector);
+            let mut vector = if let Some(profile) = &self.profile {
+                pool_hidden(
+                    &hidden[row * seq * self.hidden..(row + 1) * seq * self.hidden],
+                    &mask[row * seq..(row + 1) * seq],
+                    self.hidden,
+                    profile.model["grammar"]["pooling"].as_str().unwrap(),
+                )?
+            } else {
+                hidden[offset..offset + self.hidden].to_vec()
+            };
+            if let Some((yes, no)) = &self.readout {
+                vector = vec![yes_no_score(&vector, yes, no)];
+            } else if self
+                .profile
+                .as_ref()
+                .is_none_or(|p| p.model["output"]["normalization"] == "l2")
+            {
+                normalize_l2(&mut vector);
+            }
             vectors.push(vector);
         }
         Ok(vectors)
@@ -875,6 +959,299 @@ mod tests {
             ] {
                 assert_resolves(&names, &family_layer_tensor_name(index, name));
             }
+        }
+    }
+}
+
+struct ModernHead {
+    dense: Vec<f32>,
+    norm: Vec<f32>,
+    classifier: Vec<f32>,
+    bias: f32,
+}
+impl ModernHead {
+    fn load(tensors: &HashMap<String, Tensor>) -> Result<Self> {
+        Ok(Self {
+            dense: take_matrix(tensors, "head.dense.weight")?,
+            norm: take_vector(tensors, "head.norm.weight")?,
+            classifier: take_matrix(tensors, "classifier.weight")?,
+            bias: take_vector(tensors, "classifier.bias")?[0],
+        })
+    }
+    fn score(&self, pooled: &[f32], epsilon: f32) -> f32 {
+        let n = pooled.len();
+        let mut hidden: Vec<f32> = self
+            .dense
+            .chunks_exact(n)
+            .map(|row| {
+                let x = dot(row, pooled);
+                // Use the checkpoint's erf-based GELU, not the tanh formulation.
+                0.5 * x * (1.0 + erf(x / std::f32::consts::SQRT_2))
+            })
+            .collect();
+        layer_norm(&mut hidden, 1, n, &self.norm, &vec![0.0; n], epsilon);
+        sigmoid(dot(&self.classifier, &hidden) + self.bias)
+    }
+}
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(a, b)| a * b).sum()
+}
+fn sigmoid(x: f32) -> f32 {
+    if x >= 0.0 {
+        1.0 / (1.0 + (-x).exp())
+    } else {
+        let e = x.exp();
+        e / (1.0 + e)
+    }
+}
+fn yes_no_score(hidden: &[f32], yes: &[f32], no: &[f32]) -> f32 {
+    sigmoid(dot(hidden, yes) - dot(hidden, no))
+}
+fn erf(x: f32) -> f32 {
+    let sign = x.signum();
+    let x = x.abs();
+    let t = 1.0 / (1.0 + 0.3275911 * x);
+    sign * (1.0
+        - (((((1.0614054 * t - 1.4531521) * t) + 1.4214138) * t - 0.28449672) * t + 0.2548296)
+            * t
+            * (-x * x).exp())
+}
+fn pool_hidden(hidden: &[f32], mask: &[u8], width: usize, pooling: &str) -> Result<Vec<f32>> {
+    ensure!(hidden.len() == mask.len() * width);
+    let valid: Vec<_> = mask
+        .iter()
+        .enumerate()
+        .filter_map(|(i, m)| (*m != 0).then_some(i))
+        .collect();
+    ensure!(!valid.is_empty(), "sequence contains only padding");
+    match pooling {
+        "cls" => Ok(hidden[..width].to_vec()),
+        "last_non_pad" => {
+            let i = *valid.last().unwrap();
+            Ok(hidden[i * width..(i + 1) * width].to_vec())
+        }
+        "masked_mean" => {
+            let mut out = vec![0.0; width];
+            for &i in &valid {
+                for (j, v) in out.iter_mut().enumerate() {
+                    *v += hidden[i * width + j] / valid.len() as f32;
+                }
+            }
+            Ok(out)
+        }
+        _ => bail!("unsupported manifest pooling {pooling}"),
+    }
+}
+
+#[cfg(test)]
+mod readout_tests {
+    use super::*;
+    #[test]
+    fn masked_pooling_ignores_padding_states() {
+        assert_eq!(
+            pool_hidden(&[2., 4., 6., 8., 100., 200.], &[1, 1, 0], 2, "masked_mean").unwrap(),
+            vec![4., 6.]
+        );
+        assert_eq!(
+            pool_hidden(&[2., 4., 6., 8., 100., 200.], &[1, 1, 0], 2, "last_non_pad").unwrap(),
+            vec![6., 8.]
+        );
+    }
+    #[test]
+    fn qwen_readout_is_two_way_and_stable() {
+        assert!((yes_no_score(&[1., 2.], &[2., 3.], &[1., 2.]) - 0.95257413).abs() < 1e-6);
+        assert_eq!(yes_no_score(&[1000.], &[2.], &[1.]), 1.);
+    }
+    #[test]
+    fn modern_head_applies_sigmoid_after_classifier() {
+        let head = ModernHead {
+            dense: vec![1., 0., 0., 1.],
+            norm: vec![1., 1.],
+            classifier: vec![0., 0.],
+            bias: 2.,
+        };
+        assert!((head.score(&[1., 2.], 1e-5) - 0.8807971).abs() < 1e-6);
+    }
+}
+
+fn pad_batch(sequences: &[Vec<u32>], pad: u32) -> Result<(Vec<u32>, Vec<u8>, usize)> {
+    ensure!(!sequences.is_empty() && sequences.iter().all(|ids| !ids.is_empty()));
+    let seq = sequences.iter().map(Vec::len).max().unwrap();
+    let mut ids = vec![pad; seq * sequences.len()];
+    let mut mask = vec![0; ids.len()];
+    for (row, tokens) in sequences.iter().enumerate() {
+        ids[row * seq..row * seq + tokens.len()].copy_from_slice(tokens);
+        // A terminal token can have the same id as PAD. Only added padding is
+        // masked; real input positions remain visible to attention and pooling.
+        mask[row * seq..row * seq + tokens.len()].fill(1);
+    }
+    Ok((ids, mask, seq))
+}
+#[cfg(test)]
+mod padding_tests {
+    use super::*;
+    #[test]
+    fn cuda_right_padding_golden_includes_terminal_pad_id() {
+        let (ids, mask, seq) = pad_batch(&[vec![10, 151643], vec![20, 21, 22]], 151643).unwrap();
+        assert_eq!(seq, 3);
+        assert_eq!(ids, vec![10, 151643, 151643, 20, 21, 22]);
+        assert_eq!(mask, vec![1, 1, 0, 1, 1, 1]);
+        assert_eq!(
+            pool_hidden(&[2., 4., 100.], &mask[..3], 1, "masked_mean").unwrap(),
+            vec![3.]
+        );
+    }
+}
+
+#[cfg(test)]
+mod converted_package_tests {
+    use super::*;
+    use serde_json::json;
+    use sha2::{Digest, Sha256};
+    use std::collections::BTreeMap;
+    fn package(
+        profile: &crate::manifest::Profile,
+        shapes: BTreeMap<String, Vec<usize>>,
+    ) -> Vec<u8> {
+        let mut data = Vec::new();
+        let mut header = serde_json::Map::new();
+        header.insert(
+            "__metadata__".into(),
+            json!({"profile":profile.id,"conversion_rule":"v1"}),
+        );
+        for (name, shape) in shapes {
+            let start = data.len();
+            for _ in 0..shape.iter().product::<usize>() {
+                data.extend_from_slice(&half::f16::from_f32(1.0).to_bits().to_le_bytes());
+            }
+            header.insert(
+                name,
+                json!({"dtype":"F16","shape":shape,"data_offsets":[start,data.len()]}),
+            );
+        }
+        let mut bytes = serde_json::to_vec(&header).unwrap();
+        while bytes.len() % 8 != 0 {
+            bytes.push(b' ');
+        }
+        let mut out = (bytes.len() as u64).to_le_bytes().to_vec();
+        out.extend(bytes);
+        out.extend(data);
+        out
+    }
+    #[test]
+    fn converted_profiles_load_without_config() {
+        for slug in [
+            "gte-modernbert-base",
+            "gte-reranker-modernbert-base",
+            "qwen3-embedding-0.6b",
+            "qwen3-reranker-0.6b",
+        ] {
+            let mut p =
+                crate::manifest::Profile::select(&format!("{slug}.owned-cuda"), None).unwrap();
+            let params = &mut p.model["architecture"]["params"];
+            for (key, value) in [
+                ("hidden_size", 2),
+                ("intermediate_size", 2),
+                ("num_hidden_layers", 1),
+                ("num_attention_heads", 1),
+                ("num_key_value_heads", 1),
+                ("head_dim", 2),
+                ("vocab_size", 4),
+                ("pad_token_id", 3),
+            ] {
+                params[key] = value.into();
+            }
+            p.model["grammar"]["pad"]["id"] = 3.into();
+            let prefix = p.model["tensor_prefix"].as_str().unwrap().to_owned();
+            let mut shapes = BTreeMap::new();
+            let modern = p.model["architecture"]["family"] == "modernbert";
+            if modern {
+                for (key, shape) in [
+                    (MODERNBERT_EMBEDDINGS, vec![4, 2]),
+                    (MODERNBERT_EMBEDDING_NORM, vec![2]),
+                    (MODERNBERT_FINAL_NORM, vec![2]),
+                ] {
+                    shapes.insert(format!("{prefix}{key}"), shape);
+                }
+                for (key, shape) in [
+                    ("attn.Wqkv", vec![6, 2]),
+                    ("attn.Wo", vec![2, 2]),
+                    ("mlp.Wi", vec![4, 2]),
+                    ("mlp.Wo", vec![2, 2]),
+                    ("mlp_norm", vec![2]),
+                ] {
+                    shapes.insert(
+                        format!("{prefix}{}", family_layer_tensor_name(0, key)),
+                        shape,
+                    );
+                }
+                if p.operation() == "rerank" {
+                    for (key, shape) in [
+                        ("head.dense.weight", vec![2, 2]),
+                        ("head.norm.weight", vec![2]),
+                        ("classifier.weight", vec![1, 2]),
+                        ("classifier.bias", vec![1]),
+                    ] {
+                        shapes.insert(key.into(), shape);
+                    }
+                }
+            } else {
+                shapes.insert(format!("{prefix}{QWEN3_EMBEDDINGS}"), vec![4, 2]);
+                shapes.insert(format!("{prefix}{QWEN3_FINAL_NORM}"), vec![2]);
+                for key in [
+                    "input_layernorm",
+                    "post_attention_layernorm",
+                    "self_attn.q_norm",
+                    "self_attn.k_norm",
+                ] {
+                    shapes.insert(
+                        format!("{prefix}{}", family_layer_tensor_name(0, key)),
+                        vec![2],
+                    );
+                }
+                for key in [
+                    "self_attn.q_proj",
+                    "self_attn.k_proj",
+                    "self_attn.v_proj",
+                    "self_attn.o_proj",
+                    "mlp.gate_proj",
+                    "mlp.up_proj",
+                    "mlp.down_proj",
+                ] {
+                    shapes.insert(
+                        format!("{prefix}{}", family_layer_tensor_name(0, key)),
+                        vec![2, 2],
+                    );
+                }
+                p.model["grammar"]["readout"]["yes"]["id"] = 1.into();
+                p.model["grammar"]["readout"]["no"]["id"] = 2.into();
+            }
+            if let Some(tensors) = p.model["head"]["tensors"].as_object_mut() {
+                for tensor in tensors.values_mut() {
+                    let key = tensor["key"].as_str().unwrap();
+                    tensor["shape"] = json!(shapes[key]);
+                }
+            }
+            let bytes = package(&p, shapes);
+            p.package_digest = format!("sha256:{:x}", Sha256::digest(&bytes));
+            let root =
+                std::env::temp_dir().join(format!("cuda-package-{}-{slug}", std::process::id()));
+            fs::create_dir_all(&root).unwrap();
+            let path = root.join("model.safetensors");
+            fs::write(&path, bytes).unwrap();
+            assert!(!root.join("config.json").exists());
+            p.validate_header(&root, &p.package_digest).unwrap();
+            p.verify_package(&path).unwrap();
+            if modern {
+                let loaded = ModernBertModel::load(&root, Some(&p)).unwrap();
+                assert_eq!(loaded.hidden, 2);
+                assert_eq!(loaded.head.is_some(), p.operation() == "rerank");
+            } else {
+                let loaded = Qwen3Model::load(&root, Some(&p)).unwrap();
+                assert_eq!(loaded.hidden, 2);
+                assert_eq!(loaded.readout.is_some(), p.operation() == "rerank");
+            }
+            fs::remove_dir_all(root).unwrap();
         }
     }
 }

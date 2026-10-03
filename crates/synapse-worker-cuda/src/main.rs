@@ -20,7 +20,10 @@ use synapse_core::{
 #[cfg(feature = "cuda")]
 use synapse_core::{EmbedEngine, RuntimeConfig, TokenBatch, ValidatedArtifact};
 #[cfg(feature = "cuda")]
-use synapse_engine_cuda::{detect_family, OwnedCudaEmbedEngine};
+use synapse_engine_cuda::manifest::Profile;
+use synapse_engine_cuda::manifest::{floor_envelope, manifest_digest};
+#[cfg(feature = "cuda")]
+use synapse_engine_cuda::{ModelFamily, OwnedCudaEmbedEngine};
 
 const KERNEL_REVISION: &str = "4d0ded67c30286fe2be37cc7413359ad745dd751";
 
@@ -50,6 +53,8 @@ struct LoadedModel {
     #[cfg(feature = "cuda")]
     dims: usize,
     #[cfg(feature = "cuda")]
+    operation: String,
+    #[cfg(feature = "cuda")]
     engine: OwnedCudaEmbedEngine,
     #[cfg(feature = "cuda")]
     engine_model: synapse_core::LoadedModel,
@@ -57,36 +62,35 @@ struct LoadedModel {
 
 fn version_probe() -> bool {
     if std::env::args().skip(1).any(|arg| arg == "--version") {
-        println!(concat!(
+        println!(
+            "{} {} features={} manifest_digest={}",
             env!("CARGO_BIN_NAME"),
-            " ",
-            env!("CARGO_PKG_VERSION")
-        ));
+            env!("CARGO_PKG_VERSION"),
+            if cfg!(feature = "cuda") {
+                "cuda"
+            } else {
+                "none"
+            },
+            manifest_digest()
+        );
         true
     } else {
         false
     }
 }
 
-/// Print the observed hardware floor as a single JSON object and exit 0.
-///
-/// Only the CUDA-enabled build can answer; a build without the feature prints
-/// the error to stderr and exits non-zero so the caller records the refusal
-/// rather than mistaking silence for a pass.
 fn probe_floor() -> Result<()> {
-    #[cfg(feature = "cuda")]
-    {
-        let probe = synapse_engine_cuda::probe_hardware_floor()?;
-        println!(
-            "{{\"driver_api\":{},\"compute_capability\":{{\"major\":{},\"minor\":{}}}}}",
-            probe.driver_api, probe.compute_major, probe.compute_minor
-        );
-        Ok(())
+    let args: Vec<_> = std::env::args().collect();
+    let model = args
+        .windows(2)
+        .find(|pair| pair[0] == "--model")
+        .map(|pair| pair[1].as_str());
+    let envelope = floor_envelope(synapse_engine_cuda::probe_hardware_floor(), model);
+    println!("{}", envelope);
+    if envelope["status"] != "ok" {
+        std::process::exit(2);
     }
-    #[cfg(not(feature = "cuda"))]
-    {
-        anyhow::bail!("--probe-floor requires a build with cargo feature `cuda`")
-    }
+    Ok(())
 }
 
 /// Build the identity announced in the worker HELLO handshake.
@@ -102,17 +106,7 @@ fn main() -> Result<()> {
         return probe_floor();
     }
     let args = Args::parse();
-    let hello = WorkerHello {
-        v: WORKER_PROTOCOL_VERSION,
-        nonce: args.nonce.clone(),
-        engine: engine_identity(),
-        pid: std::process::id(),
-        max_frame: DEFAULT_MAX_FRAME_BYTES,
-        // Not yet bound to the model manifest, so lanes that expect a
-        // binding refuse this worker with manifest_mismatch.
-        manifest_digest: None,
-        kernel_revision: None,
-    };
+    let hello = worker_hello(args.nonce.clone());
     #[cfg(unix)]
     {
         let socket = args
@@ -159,6 +153,19 @@ fn validate_ack(ack: &WorkerHelloAck) -> Result<()> {
 }
 
 fn worker_request_loop<S: Read + Write>(stream: &mut S, max_frame: u32, args: &Args) -> Result<()> {
+    worker_request_loop_with_probe(
+        stream,
+        max_frame,
+        args,
+        synapse_engine_cuda::probe_hardware_floor,
+    )
+}
+fn worker_request_loop_with_probe<S: Read + Write>(
+    stream: &mut S,
+    max_frame: u32,
+    args: &Args,
+    probe: fn() -> Result<synapse_engine_cuda::HardwareFloorProbe>,
+) -> Result<()> {
     let mut state = WorkerState::default();
     loop {
         let frame = match read_frame(stream, max_frame) {
@@ -179,13 +186,14 @@ fn worker_request_loop<S: Read + Write>(stream: &mut S, max_frame: u32, args: &A
                 format,
                 runtime_config,
             } => (
-                handle_load(
+                handle_load_with_probe(
                     &mut state,
                     req_id,
                     artifact_path,
                     artifact_digest,
                     format,
                     runtime_config,
+                    probe,
                 ),
                 None,
             ),
@@ -209,21 +217,17 @@ fn worker_request_loop<S: Read + Write>(stream: &mut S, max_frame: u32, args: &A
                     Err(error) => Err(format!("read token-id frame: {error}")),
                 };
                 match ids {
-                    Ok(ids) => handle_embed(&state, req_id, &model_ref, &items, &ids),
+                    Ok(ids) => handle_sequences(&state, req_id, &model_ref, &items, &ids, false),
                     Err(message) => (
                         error_response(Some(req_id), "invalid_request", &message),
                         None,
                     ),
                 }
             }
-            WorkerRequest::Rerank { req_id, .. } => (
-                error_response(
-                    Some(req_id),
-                    "backend_missing",
-                    "owned-CUDA worker v1 does not expose rerank",
-                ),
-                None,
-            ),
+            unsupported @ WorkerRequest::Rerank { .. } => {
+                read_frame(stream, max_frame).context("discard unsupported rerank frame")?;
+                (WorkerResponse::unsupported_request(&unsupported), None)
+            }
             WorkerRequest::Generate { req_id, .. } => (
                 error_response(
                     Some(req_id),
@@ -270,8 +274,40 @@ fn worker_request_loop<S: Read + Write>(stream: &mut S, max_frame: u32, args: &A
             WorkerRequest::Shutdown {} => break,
             // Not served by this worker yet. Read and discard the raw frame a
             // refused request carries so the connection stays usable.
-            unsupported @ (WorkerRequest::RerankSequences { .. }
-            | WorkerRequest::AneAdmitShape { .. }
+            WorkerRequest::RerankSequences {
+                req_id,
+                model_ref,
+                sequences,
+            } => {
+                let raw = read_frame(stream, max_frame).context("read rerank sequences")?;
+                match decode_i32_frame(&raw) {
+                    Ok(ids) => match ids
+                        .into_iter()
+                        .map(|id| u32::try_from(id).map_err(|_| "negative token id"))
+                        .collect::<Result<Vec<_>, _>>()
+                    {
+                        Ok(ids) => {
+                            let items: Vec<_> = sequences
+                                .iter()
+                                .enumerate()
+                                .map(|(i, s)| synapse_core::WorkerTokenItem {
+                                    id: i.to_string(),
+                                    n_tokens: s.n_tokens,
+                                })
+                                .collect();
+                            handle_sequences(&state, req_id, &model_ref, &items, &ids, true)
+                        }
+                        Err(error) => {
+                            (error_response(Some(req_id), "invalid_request", error), None)
+                        }
+                    },
+                    Err(error) => (
+                        error_response(Some(req_id), "invalid_request", &error.to_string()),
+                        None,
+                    ),
+                }
+            }
+            unsupported @ (WorkerRequest::AneAdmitShape { .. }
             | WorkerRequest::AneEvictShape { .. }) => {
                 if unsupported.carries_raw_frame() {
                     read_frame(stream, max_frame)
@@ -288,13 +324,14 @@ fn worker_request_loop<S: Read + Write>(stream: &mut S, max_frame: u32, args: &A
     Ok(())
 }
 
-fn handle_load(
+fn handle_load_with_probe(
     state: &mut WorkerState,
     req_id: String,
     artifact_path: String,
     artifact_digest: String,
     format: String,
     runtime_config: BTreeMap<String, String>,
+    probe: fn() -> Result<synapse_engine_cuda::HardwareFloorProbe>,
 ) -> WorkerResponse {
     if artifact_path.trim().is_empty() || format.trim().is_empty() {
         return error_response(
@@ -319,6 +356,7 @@ fn handle_load(
             artifact_digest,
             format,
             runtime_config,
+            probe,
         );
         error_response(
             Some(req_id),
@@ -329,10 +367,38 @@ fn handle_load(
 
     #[cfg(feature = "cuda")]
     {
-        let family = match detect_family(&artifact_path) {
-            Ok(family) => family,
-            Err(error) => {
-                return error_response(Some(req_id), "artifact_invalid", &error.to_string());
+        let profile = match Profile::select(
+            runtime_config
+                .get("profile")
+                .map(String::as_str)
+                .unwrap_or(""),
+            Some(
+                runtime_config
+                    .get("operation")
+                    .map(String::as_str)
+                    .unwrap_or(""),
+            ),
+        ) {
+            Ok(p) => p,
+            Err(e) => return error_response(Some(req_id), &e.to_string(), &e.to_string()),
+        };
+        let envelope = synapse_engine_cuda::manifest::floor_envelope_for_profile(probe(), &profile);
+        if envelope["status"] != "ok" {
+            return error_response(
+                Some(req_id),
+                envelope["code"].as_str().unwrap(),
+                "CUDA floor refused load",
+            );
+        }
+        let family = match profile.model["architecture"]["family"].as_str() {
+            Some("modernbert") => ModelFamily::GteModernBert,
+            Some("qwen3") => ModelFamily::Qwen3,
+            _ => {
+                return error_response(
+                    Some(req_id),
+                    "model_unsupported",
+                    "unsupported manifest family",
+                )
             }
         };
         let mut engine = OwnedCudaEmbedEngine::serving(family);
@@ -341,12 +407,10 @@ fn handle_load(
         };
         runtime
             .values
-            .entry("model_path".to_string())
-            .or_insert_with(|| artifact_path.clone());
+            .insert("model_path".into(), artifact_path.clone());
         runtime
             .values
-            .entry("artifact_path".to_string())
-            .or_insert_with(|| artifact_path.clone());
+            .insert("artifact_path".into(), artifact_path.clone());
         let started = Instant::now();
         let engine_model = match engine.load(
             &ValidatedArtifact {
@@ -357,20 +421,29 @@ fn handle_load(
         ) {
             Ok(model) => model,
             Err(error) => {
-                return error_response(Some(req_id), "artifact_invalid", &error.message);
+                let code = match error.message.as_str() {
+                    "model_unsupported"
+                    | "operation_mismatch"
+                    | "package_digest_mismatch"
+                    | "head_tensor_missing" => error.message.as_str(),
+                    _ => "artifact_invalid",
+                };
+                return error_response(Some(req_id), code, &error.message);
             }
         };
-        let Some(dims) = engine.dimensions(&engine_model) else {
+        let Some(_) = engine.dimensions(&engine_model) else {
             return error_response(
                 Some(req_id),
                 "artifact_invalid",
                 "owned-CUDA engine did not report embedding dimensions",
             );
         };
+        let dims = profile.model["output"]["dimension"].as_u64().unwrap() as usize;
         let model_ref = engine_model.model_id.clone();
         state.loaded = Some(LoadedModel {
             model_ref: model_ref.clone(),
             dims,
+            operation: profile.operation().into(),
             engine,
             engine_model,
         });
@@ -384,12 +457,13 @@ fn handle_load(
     }
 }
 
-fn handle_embed(
+fn handle_sequences(
     state: &WorkerState,
     req_id: String,
     model_ref: &str,
     items: &[synapse_core::WorkerTokenItem],
     ids: &[u32],
+    rerank: bool,
 ) -> (WorkerResponse, Option<Vec<f32>>) {
     let Some(model) = state.loaded.as_ref() else {
         return (
@@ -421,7 +495,7 @@ fn handle_embed(
 
     #[cfg(not(feature = "cuda"))]
     {
-        let _ = (model, ids);
+        let _ = (model, ids, rerank);
         (
             error_response(
                 Some(req_id),
@@ -434,6 +508,29 @@ fn handle_embed(
 
     #[cfg(feature = "cuda")]
     {
+        if (model.operation == "rerank") != rerank {
+            return (
+                error_response(
+                    Some(req_id),
+                    "operation_mismatch",
+                    "request does not match manifest operation",
+                ),
+                None,
+            );
+        }
+        if items
+            .iter()
+            .any(|item| item.n_tokens > synapse_engine_cuda::manifest::max_context_tokens())
+        {
+            return (
+                error_response(
+                    Some(req_id),
+                    "sequence_too_long",
+                    "input exceeds 8192 tokens",
+                ),
+                None,
+            );
+        }
         let mut offset = 0;
         let batch = TokenBatch {
             items: items
@@ -453,10 +550,14 @@ fn handle_embed(
             {
                 let values = vectors.into_iter().flatten().collect();
                 (
-                    WorkerResponse::Vectors {
-                        req_id,
-                        dims: model.dims,
-                        n: items.len(),
+                    if rerank {
+                        WorkerResponse::Scores { req_id }
+                    } else {
+                        WorkerResponse::Vectors {
+                            req_id,
+                            dims: model.dims,
+                            n: items.len(),
+                        }
                     },
                     Some(values),
                 )
@@ -510,13 +611,14 @@ mod tests {
     #[test]
     fn missing_feature_refuses_load_without_creating_model_state() {
         let mut state = WorkerState::default();
-        let response = handle_load(
+        let response = handle_load_with_probe(
             &mut state,
             "load-1".to_string(),
             "/tmp/model".to_string(),
             "sha256:abc".to_string(),
             "safetensors".to_string(),
             BTreeMap::new(),
+            synapse_engine_cuda::probe_hardware_floor,
         );
         if !cfg!(feature = "cuda") {
             assert!(
@@ -524,5 +626,111 @@ mod tests {
             );
             assert!(state.loaded.is_none());
         }
+    }
+}
+
+fn worker_hello(nonce: String) -> WorkerHello {
+    WorkerHello {
+        v: WORKER_PROTOCOL_VERSION,
+        nonce,
+        engine: engine_identity(),
+        pid: std::process::id(),
+        max_frame: DEFAULT_MAX_FRAME_BYTES,
+        manifest_digest: Some(manifest_digest()),
+        kernel_revision: Some(KERNEL_REVISION.into()),
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    struct Duplex {
+        input: std::io::Cursor<Vec<u8>>,
+        output: Vec<u8>,
+    }
+    impl Read for Duplex {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            self.input.read(bytes)
+        }
+    }
+    impl Write for Duplex {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.output.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    fn missing_driver() -> Result<synapse_engine_cuda::HardwareFloorProbe> {
+        anyhow::bail!("cuda_no_driver")
+    }
+    #[test]
+    fn hello_and_ping_succeed_with_injected_missing_driver() {
+        assert_eq!(
+            floor_envelope(missing_driver(), None)["code"],
+            "cuda_no_driver"
+        );
+        let hello = worker_hello("driverless".into());
+        assert_eq!(hello.nonce, "driverless");
+        assert!(hello.manifest_digest.is_some());
+        let mut input = Vec::new();
+        write_json_frame(
+            &mut input,
+            &WorkerRequest::Ping {
+                req_id: "ping".into(),
+            },
+            DEFAULT_MAX_FRAME_BYTES,
+        )
+        .unwrap();
+        write_json_frame(
+            &mut input,
+            &WorkerRequest::Shutdown {},
+            DEFAULT_MAX_FRAME_BYTES,
+        )
+        .unwrap();
+        let args = Args {
+            socket: None,
+            nonce: "driverless".into(),
+            test_abort: false,
+            test_abort_on_request: false,
+            #[cfg(windows)]
+            pipe: None,
+        };
+        let mut stream = Duplex {
+            input: std::io::Cursor::new(input),
+            output: Vec::new(),
+        };
+        worker_request_loop_with_probe(&mut stream, DEFAULT_MAX_FRAME_BYTES, &args, missing_driver)
+            .unwrap();
+        let mut output = std::io::Cursor::new(stream.output);
+        assert!(
+            matches!(synapse_core::worker_framing_sync::read_json_frame::<_,WorkerResponse>(&mut output,DEFAULT_MAX_FRAME_BYTES).unwrap(),WorkerResponse::Pong{req_id,..} if req_id=="ping")
+        );
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod load_floor_tests {
+    use super::*;
+    #[test]
+    fn missing_driver_refuses_before_artifact_open() {
+        fn no_driver() -> Result<synapse_engine_cuda::HardwareFloorProbe> {
+            anyhow::bail!("cuda_no_driver")
+        }
+        let p = Profile::select("gte-modernbert-base.owned-cuda", Some("embed")).unwrap();
+        let response = handle_load_with_probe(
+            &mut WorkerState::default(),
+            "sentinel".into(),
+            "artifact-open-must-not-happen/model.safetensors".into(),
+            p.package_digest,
+            "safetensors-package".into(),
+            BTreeMap::from([
+                ("profile".into(), p.id),
+                ("operation".into(), "embed".into()),
+            ]),
+            no_driver,
+        );
+        assert!(matches!(response,WorkerResponse::Err{code,..} if code=="cuda_no_driver"));
     }
 }

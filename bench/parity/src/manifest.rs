@@ -375,6 +375,12 @@ pub struct Profile {
     pub vulkan_min_storage_buffer_range: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vulkan_min_device_local_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cuda_min_driver_api: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cuda_min_compute_major: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cuda_min_compute_minor: Option<u32>,
 }
 
 /// Digests recorded in the manifest. They are outside every hashed entry, so

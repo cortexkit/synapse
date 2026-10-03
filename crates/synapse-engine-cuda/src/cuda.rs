@@ -54,6 +54,71 @@ mod enabled {
         down_weight: *const f32,
     }
 
+    // The driver is optional at process startup. Keep the handle resident and
+    // resolve each entry point only when a CUDA operation is requested.
+    fn driver_symbol(name: &std::ffi::CStr) -> Result<*mut c_void> {
+        use std::sync::LazyLock;
+        static HANDLE: LazyLock<usize> = LazyLock::new(|| {
+            #[cfg(unix)]
+            unsafe {
+                unsafe extern "C" {
+                    fn dlopen(name: *const c_char, flags: i32) -> *mut c_void;
+                }
+                dlopen(c"libcuda.so.1".as_ptr(), 2) as usize
+            }
+            #[cfg(windows)]
+            unsafe {
+                #[link(name = "kernel32")]
+                unsafe extern "system" {
+                    fn LoadLibraryW(name: *const u16) -> *mut c_void;
+                }
+                let wide: Vec<u16> = "nvcuda.dll".encode_utf16().chain(Some(0)).collect();
+                LoadLibraryW(wide.as_ptr()) as usize
+            }
+        });
+        if *HANDLE == 0 {
+            bail!("cuda_no_driver");
+        }
+        #[cfg(unix)]
+        let symbol = unsafe {
+            unsafe extern "C" {
+                fn dlsym(handle: *mut c_void, name: *const c_char) -> *mut c_void;
+            }
+            dlsym(*HANDLE as *mut c_void, name.as_ptr())
+        };
+        #[cfg(windows)]
+        let symbol = unsafe {
+            #[link(name = "kernel32")]
+            unsafe extern "system" {
+                fn GetProcAddress(handle: *mut c_void, name: *const c_char) -> *mut c_void;
+            }
+            GetProcAddress(*HANDLE as *mut c_void, name.as_ptr())
+        };
+        if symbol.is_null() {
+            bail!("cuda_no_driver");
+        }
+        Ok(symbol)
+    }
+    macro_rules! driver_api {
+        ($name:ident($($arg:ident: $ty:ty),*)) => {
+            #[allow(non_snake_case)]
+            unsafe fn $name($($arg: $ty),*) -> i32 {
+                let Ok(symbol) = driver_symbol(std::ffi::CStr::from_bytes_with_nul(concat!(stringify!($name), "\0").as_bytes()).unwrap()) else { return 3; };
+                let function: unsafe extern "system" fn($($ty),*) -> i32 = unsafe { std::mem::transmute(symbol) };
+                unsafe { function($($arg),*) }
+            }
+        };
+    }
+    driver_api!(cuInit(flags: u32));
+    driver_api!(cuDriverGetVersion(version: *mut i32));
+    driver_api!(cuDeviceGet(device: *mut i32, ordinal: i32));
+    driver_api!(cuDeviceGetAttribute(value: *mut i32, attrib: i32, device: i32));
+    driver_api!(cuCtxGetDevice(device: *mut i32));
+    driver_api!(cuCtxSetCurrent(context: *mut c_void));
+    driver_api!(cuDevicePrimaryCtxRetain(context: *mut *mut c_void, device: i32));
+    driver_api!(cuDevicePrimaryCtxRelease(device: i32));
+    driver_api!(cuGetErrorString(status: i32, message: *mut *const c_char));
+
     struct DeviceBinding {
         runtime_device: i32,
         driver_device: i32,
@@ -82,10 +147,11 @@ mod enabled {
                     // Windows searches the executable directory and installed
                     // system locations without changing PATH or global policy.
                     if unsafe { LoadLibraryW(wide.as_ptr()) }.is_null() {
-                        return Err(format!(
-                            "cannot load CUDA library {name}: {}",
-                            std::io::Error::last_os_error()
-                        ));
+                        return Err(if name == "nvcuda.dll" {
+                            "cuda_no_driver".into()
+                        } else {
+                            format!("cuda_runtime_missing:{name}")
+                        });
                     }
                 }
                 Ok(())
@@ -164,6 +230,7 @@ mod enabled {
     /// verdict.
     pub fn probe_hardware_floor() -> Result<crate::HardwareFloorProbe> {
         ensure_libraries_loaded()?;
+        driver_symbol(c"cuInit")?;
         cuda_driver_check(unsafe { cuInit(0) }, "cuInit")?;
         let mut driver_api = 0;
         cuda_driver_check(
@@ -556,15 +623,7 @@ mod enabled {
     const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR: i32 = 76;
 
     unsafe extern "C" {
-        fn cuInit(flags: u32) -> i32;
-        fn cuDriverGetVersion(version: *mut i32) -> i32;
-        fn cuDeviceGet(device: *mut i32, ordinal: i32) -> i32;
-        fn cuDeviceGetAttribute(value: *mut i32, attrib: i32, device: i32) -> i32;
-        fn cuCtxGetDevice(device: *mut i32) -> i32;
-        fn cuCtxSetCurrent(context: *mut c_void) -> i32;
-        fn cuDevicePrimaryCtxRetain(context: *mut *mut c_void, device: i32) -> i32;
-        fn cuDevicePrimaryCtxRelease(device: i32) -> i32;
-        fn cuGetErrorString(status: i32, message: *mut *const c_char) -> i32;
+
         fn cudaGetDevice(device: *mut i32) -> i32;
         fn cudaSetDevice(device: i32) -> i32;
         fn cudaGetErrorString(status: i32) -> *const c_char;

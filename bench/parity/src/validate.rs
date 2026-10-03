@@ -629,7 +629,7 @@ fn check_profiles(manifest: &Manifest) -> Result<()> {
             ));
         }
         let model = manifest.model(&profile.model)?;
-        check_profile(id, &profile.model, model, profile)?;
+
         match (&profile.converted_package_digest, profile.lane.is_worker()) {
             (Some(digest), true) => {
                 let hex = digest.strip_prefix("sha256:").ok_or_else(|| {
@@ -651,6 +651,21 @@ fn check_profiles(manifest: &Manifest) -> Result<()> {
                 ))
             }
         }
+        let cuda = (
+            profile.cuda_min_driver_api,
+            profile.cuda_min_compute_major,
+            profile.cuda_min_compute_minor,
+        );
+        match (profile.lane, cuda) {
+            (Lane::OwnedCuda, (Some(driver), Some(major), Some(minor)))
+                if driver > 0 && major > 0 && minor < 10 => {}
+            (Lane::OwnedCuda, _) => {
+                return Err(perr!("CUDA profile `{id}` lacks valid CUDA floor keys"))
+            }
+            (_, (None, None, None)) => {}
+            _ => return Err(perr!("non-CUDA profile `{id}` carries CUDA floor keys")),
+        }
+        check_profile(id, &profile.model, model, profile)?;
         let vulkan = (
             profile.vulkan_sub_batch_max_tokens,
             profile.vulkan_min_storage_buffer_range,
@@ -687,4 +702,44 @@ fn check_profiles(manifest: &Manifest) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod cuda_floor_tests {
+    use super::*;
+    #[test]
+    fn cuda_floor_fields_are_required_and_exclusive() {
+        let manifest = Manifest::from_slice(include_bytes!("../models.json")).unwrap();
+        check_profiles(&manifest).unwrap();
+        for field in 0..3 {
+            let mut missing = manifest.clone();
+            let p = missing
+                .profiles
+                .get_mut("gte-modernbert-base.owned-cuda")
+                .unwrap();
+            match field {
+                0 => p.cuda_min_driver_api = None,
+                1 => p.cuda_min_compute_major = None,
+                _ => p.cuda_min_compute_minor = None,
+            };
+            assert!(check_profiles(&missing)
+                .unwrap_err()
+                .to_string()
+                .contains("CUDA floor keys"));
+            let mut extra = manifest.clone();
+            let p = extra
+                .profiles
+                .get_mut("gte-modernbert-base.owned-vulkan")
+                .unwrap();
+            match field {
+                0 => p.cuda_min_driver_api = Some(13020),
+                1 => p.cuda_min_compute_major = Some(7),
+                _ => p.cuda_min_compute_minor = Some(5),
+            };
+            assert!(check_profiles(&extra)
+                .unwrap_err()
+                .to_string()
+                .contains("non-CUDA"));
+        }
+    }
 }

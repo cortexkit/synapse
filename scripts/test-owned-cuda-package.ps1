@@ -39,21 +39,23 @@ try {
     $version = Invoke-Worker $isolatedExe '--version'
     if ($version.Code -ne 0 -or $version.Out -notmatch '^ck-synapse-worker-cuda ') { throw "No-DLL version failed: $($version.Err)" }
     $missing = Invoke-Worker $isolatedExe '--probe-floor'
-    if ($missing.Code -eq 0 -or $missing.Err -notmatch 'cannot load CUDA library') { throw "Missing-DLL refusal failed: $($missing.Code) $($missing.Err)" }
+    $missingFloor = $missing.Out | ConvertFrom-Json
+    if ($missing.Code -ne 2 -or $missingFloor.status -ne 'refused' -or $missingFloor.code -ne 'cuda_runtime_missing:cublasLt64_13.dll') { throw "Missing-DLL refusal failed: $($missing.Code) $($missing.Out) $($missing.Err)" }
     $present = Invoke-Worker $exe '--probe-floor'
     if ($present.Code -eq 0) {
         $floor = $present.Out | ConvertFrom-Json
-        if ($floor.driver_api -le 0 -or $floor.compute_capability.major -le 0) { throw 'Invalid floor JSON' }
-        if ($RequireGpu -and ($floor.driver_api -lt 12040 -or $floor.compute_capability.major -lt 7 -or ($floor.compute_capability.major -eq 7 -and $floor.compute_capability.minor -lt 5))) {
-            throw 'GPU below owned-CUDA floor: driver API >= 12040 and compute capability >= 7.5 required'
+        if ($floor.status -ne 'ok' -or $floor.code -ne 'ok' -or $floor.required.driver_api -ne 13020 -or $floor.observed.driver_api -lt 13020 -or $floor.observed.compute_capability.major -lt 7 -or ($floor.observed.compute_capability.major -eq 7 -and $floor.observed.compute_capability.minor -lt 5)) {
+            throw 'GPU below owned-CUDA floor: driver API >= 13020 and compute capability >= 7.5 required'
         }
         Write-Output "PASS packaged GPU probe: $($present.Out.Trim())"
     } elseif ($RequireGpu) {
         throw "Packaged GPU probe failed: $($present.Code) $($present.Err)"
-    } elseif ($present.Err -match 'cannot load CUDA library (cublas|cudart)' -or $present.Err -notmatch '(nvcuda.dll|cuInit|cuDeviceGet)') {
-        throw "Packaged runtime resolution failed: $($present.Code) $($present.Err)"
     } else {
-        Write-Output "GPU execution not available on this runner: $($present.Err.Trim())"
+        $floor = $present.Out | ConvertFrom-Json
+        if ($present.Code -ne 2 -or $floor.status -ne 'refused' -or $floor.required.driver_api -ne 13020 -or $floor.code -notin @('cuda_no_driver', 'cuda_driver_too_old', 'cuda_compute_capability_too_low')) {
+            throw "Packaged runtime resolution failed: $($present.Code) $($present.Out) $($present.Err)"
+        }
+        Write-Output "GPU execution not available on this runner: $($present.Out.Trim())"
     }
     Write-Output 'PASS archive hashes, no-DLL version, missing-DLL refusal, side-by-side runtime resolution'
 } finally {

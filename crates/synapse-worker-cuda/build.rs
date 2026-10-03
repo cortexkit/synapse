@@ -24,8 +24,10 @@ fn main() {
         );
         // Link arguments on the engine rlib do not propagate to this executable.
         println!("cargo:rustc-link-lib=delayimp");
-        // The CUDA 13 import libraries link cudart/cublas statically; cuBLASLt
-        // is the remaining load-time DLL (verified with dumpbin /dependents).
-        println!("cargo:rustc-link-arg=/DELAYLOAD:cublasLt64_13.dll");
+        // Delay runtime imports so --probe-floor can report missing libraries
+        // as typed refusals instead of the OS loader exiting before main.
+        for name in ["cublasLt64_13.dll", "cublas64_13.dll", "cudart64_13.dll"] {
+            println!("cargo:rustc-link-arg=/DELAYLOAD:{name}");
+        }
     }
 }

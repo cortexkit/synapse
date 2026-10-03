@@ -451,6 +451,9 @@
     },
     "gte-modernbert-base.owned-cuda": {
       "compute_dtype": "f16",
+      "cuda_min_driver_api": 13020,
+      "cuda_min_compute_major": 7,
+      "cuda_min_compute_minor": 5,
       "conversion_rule": "v1",
       "converted_package_digest": "sha256:9259f3b731a35f260d74df99b618231a4d68f5dce9d75c6e4f039e1dbad646cd",
       "fp32_tensors": [],
@@ -512,6 +515,9 @@
     },
     "gte-reranker-modernbert-base.owned-cuda": {
       "compute_dtype": "f16",
+      "cuda_min_driver_api": 13020,
+      "cuda_min_compute_major": 7,
+      "cuda_min_compute_minor": 5,
       "conversion_rule": "v1",
       "converted_package_digest": "sha256:b40b133b99ff8f70a7bc7d0cefbcb3a5aba78f6fb55f67cda7b7991e085f0f6d",
       "fp32_tensors": [],
@@ -565,6 +571,9 @@
     },
     "qwen3-embedding-0.6b.owned-cuda": {
       "compute_dtype": "f16",
+      "cuda_min_driver_api": 13020,
+      "cuda_min_compute_major": 7,
+      "cuda_min_compute_minor": 5,
       "conversion_rule": "v1",
       "converted_package_digest": "sha256:7dad02fc38d5fa8f1ecea57150e1cf877b59f61895489a0765a45e84f9df3d4d",
       "fp32_tensors": [],
@@ -619,6 +628,9 @@
     },
     "qwen3-reranker-0.6b.owned-cuda": {
       "compute_dtype": "f16",
+      "cuda_min_driver_api": 13020,
+      "cuda_min_compute_major": 7,
+      "cuda_min_compute_minor": 5,
       "conversion_rule": "v1",
       "converted_package_digest": "sha256:d67169c6cb3a384a6c88272fade51064029aaa51368c45e03cc71f93ece37c80",
       "fp32_tensors": [],

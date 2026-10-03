@@ -1,4 +1,5 @@
 fn main() {
+    embed_manifest();
     println!("cargo:rerun-if-env-changed=CUDACXX");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
@@ -92,8 +93,58 @@ fn main() {
             cuda_root.join("bin").display()
         );
     }
-    println!("cargo:rustc-link-lib=cuda");
+
     println!("cargo:rustc-link-lib=cublasLt");
     println!("cargo:rustc-link-lib=cublas");
     println!("cargo:rustc-link-lib=cudart");
+}
+
+fn embed_manifest() {
+    use sha2::{Digest, Sha256};
+    let path = "../../bench/parity/models.json";
+    println!("cargo:rerun-if-changed={path}");
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path).expect("read model manifest"))
+            .expect("parse model manifest");
+    fn canonical(value: &serde_json::Value, out: &mut Vec<u8>) {
+        use serde_json::Value;
+        match value {
+            Value::Object(map) => {
+                let mut keys: Vec<_> = map.keys().collect();
+                keys.sort();
+                out.push(b'{');
+                for (i, key) in keys.into_iter().enumerate() {
+                    if i > 0 {
+                        out.push(b',');
+                    }
+                    out.extend(serde_json::to_vec(key).unwrap());
+                    out.push(b':');
+                    canonical(&map[key], out);
+                }
+                out.push(b'}');
+            }
+            Value::Array(items) => {
+                out.push(b'[');
+                for (i, v) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push(b',');
+                    }
+                    canonical(v, out);
+                }
+                out.push(b']');
+            }
+            scalar => out.extend(serde_json::to_vec(scalar).unwrap()),
+        }
+    }
+    let mut bytes = Vec::new();
+    canonical(&manifest, &mut bytes);
+    println!(
+        "cargo:rustc-env=SYNAPSE_CUDA_MANIFEST_DIGEST={:x}",
+        Sha256::digest(&bytes)
+    );
+    std::fs::write(
+        std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("models.json"),
+        bytes,
+    )
+    .expect("write canonical manifest");
 }

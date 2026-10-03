@@ -16,6 +16,7 @@ use synapse_core::{
 };
 
 mod cuda;
+pub mod manifest;
 mod model;
 
 pub use cuda::probe_hardware_floor;
@@ -24,8 +25,7 @@ pub const ENGINE_VERSION: &str = "owned-cuda-v1";
 /// The source revision from which the CUDA kernels were ported.
 pub const KERNEL_REVISION: &str = "4d0ded67c30286fe2be37cc7413359ad745dd751";
 pub const PTX_VIRTUAL_ARCH: &str = "compute_75";
-pub const MINIMUM_DEVICE_CC: &str = "7.5";
-pub const MINIMUM_CUDA_DRIVER_API: u32 = 12_040;
+pub const MINIMUM_CUDA_DRIVER_API: u32 = synapse_core::cuda::OWNED_CUDA_MINIMUM_DRIVER_API;
 pub const RISK_CLASS: EngineRiskClass = EngineRiskClass::AbortCapable;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -179,7 +179,7 @@ pub fn build_identity(family: ModelFamily, dtype: StorageDType) -> CudaBuildIden
         storage_dtype: dtype.as_str().to_owned(),
         kernel_revision: KERNEL_REVISION.to_owned(),
         ptx_virtual_arch: PTX_VIRTUAL_ARCH.to_owned(),
-        minimum_device_cc: MINIMUM_DEVICE_CC.to_owned(),
+        minimum_device_cc: synapse_core::cuda::OWNED_CUDA_MINIMUM_DEVICE_CC.to_string(),
         minimum_cuda_driver_api: MINIMUM_CUDA_DRIVER_API,
         risk_class: RISK_CLASS,
     }
@@ -199,8 +199,11 @@ pub struct HardwareFloorProbe {
 /// Hardware-floor predicate used by capability probes before worker creation.
 #[must_use]
 pub fn device_meets_floor(driver_api: u32, compute_major: u32, compute_minor: u32) -> bool {
-    driver_api >= MINIMUM_CUDA_DRIVER_API
-        && (compute_major > 7 || (compute_major == 7 && compute_minor >= 5))
+    manifest::default_floor().accepts(HardwareFloorProbe {
+        driver_api,
+        compute_major,
+        compute_minor,
+    })
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -348,8 +351,24 @@ impl OwnedCudaEmbedEngine {
     fn load_cuda(&mut self, path: &Path, cfg: &RuntimeConfig) -> Result<LoadedModel, EngineError> {
         cuda::ensure_available()
             .map_err(|error| Self::error(EngineErrorStage::Load, error.to_string()))?;
-        let detected = detect_family(path)
-            .map_err(|error| Self::error(EngineErrorStage::Load, error.to_string()))?;
+        let profile = cfg
+            .values
+            .get("profile")
+            .map(|id| {
+                manifest::Profile::select(id, cfg.values.get("operation").map(String::as_str))
+            })
+            .transpose()
+            .map_err(|e| Self::error(EngineErrorStage::Load, e.to_string()))?;
+        let detected = if let Some(profile) = &profile {
+            match profile.model["architecture"]["family"].as_str() {
+                Some("modernbert") => ModelFamily::GteModernBert,
+                Some("qwen3") => ModelFamily::Qwen3,
+                _ => return Err(Self::error(EngineErrorStage::Load, "model_unsupported")),
+            }
+        } else {
+            detect_family(path)
+                .map_err(|error| Self::error(EngineErrorStage::Load, error.to_string()))?
+        };
         if detected != self.family {
             return Err(Self::error(
                 EngineErrorStage::Load,
@@ -369,7 +388,7 @@ impl OwnedCudaEmbedEngine {
                     .map_err(|error| Self::error(EngineErrorStage::Load, error.to_string()))?,
             },
             ModelFamily::GteModernBert => LoadedFamily::GteModernBert {
-                model: model::ModernBertModel::load(path)
+                model: model::ModernBertModel::load(path, profile.as_ref())
                     .map_err(|error| Self::error(EngineErrorStage::Load, error.to_string()))?,
                 context: cuda::ModernBertContext::new(self.graphs, precision(self.dtype))
                     .map_err(|error| Self::error(EngineErrorStage::Load, error.to_string()))?,
@@ -382,7 +401,7 @@ impl OwnedCudaEmbedEngine {
                     ));
                 }
                 LoadedFamily::Qwen3 {
-                    model: model::Qwen3Model::load(path)
+                    model: model::Qwen3Model::load(path, profile.as_ref())
                         .map_err(|error| Self::error(EngineErrorStage::Load, error.to_string()))?,
                     context: cuda::Qwen3Context::new(self.graphs, precision(self.dtype))
                         .map_err(|error| Self::error(EngineErrorStage::Load, error.to_string()))?,
@@ -440,6 +459,25 @@ impl EmbedEngine for OwnedCudaEmbedEngine {
             ));
         }
         let path = Self::model_path(cfg)?;
+        if let Some(id) = cfg.values.get("profile") {
+            let profile =
+                manifest::Profile::select(id, cfg.values.get("operation").map(String::as_str))
+                    .map_err(|e| Self::error(EngineErrorStage::Load, e.to_string()))?;
+            let envelope = manifest::floor_envelope_for_profile(probe_hardware_floor(), &profile);
+            if envelope["status"] != "ok" {
+                return Err(Self::error(
+                    EngineErrorStage::Load,
+                    envelope["code"].as_str().unwrap(),
+                ));
+            }
+            let path = profile
+                .validate_header(&path, &artifact.digest)
+                .map_err(|e| Self::error(EngineErrorStage::Load, e.to_string()))?;
+            profile
+                .verify_package(&path)
+                .map_err(|e| Self::error(EngineErrorStage::Load, e.to_string()))?;
+            return self.load_cuda(&path, cfg);
+        }
         if !artifact.digest.trim().is_empty() && path.is_file() {
             verify_digest(&path, &artifact.digest)?;
         }
@@ -582,15 +620,15 @@ mod tests {
         assert_eq!(identity.storage_dtype, "f16");
         assert_eq!(identity.ptx_virtual_arch, "compute_75");
         assert_eq!(identity.minimum_device_cc, "7.5");
-        assert_eq!(identity.minimum_cuda_driver_api, 12_040);
+        assert_eq!(identity.minimum_cuda_driver_api, 13_020);
     }
 
     #[test]
     fn floor_includes_driver_and_compute_capability_boundaries() {
-        assert!(!device_meets_floor(12_039, 7, 5));
-        assert!(!device_meets_floor(12_040, 7, 4));
-        assert!(device_meets_floor(12_040, 7, 5));
-        assert!(device_meets_floor(12_040, 8, 0));
+        assert!(!device_meets_floor(13_019, 7, 5));
+        assert!(!device_meets_floor(13_020, 7, 4));
+        assert!(device_meets_floor(13_020, 7, 5));
+        assert!(device_meets_floor(13_020, 8, 0));
     }
 
     #[test]

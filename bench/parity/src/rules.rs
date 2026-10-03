@@ -151,6 +151,30 @@ pub fn derived_profile(model_slug: &str, model: &Model, lane: Lane) -> Result<Pr
         vulkan_sub_batch_max_tokens: None,
         vulkan_min_storage_buffer_range: None,
         vulkan_min_device_local_bytes: None,
+        cuda_min_driver_api: if lane == Lane::OwnedCuda {
+            crate::manifest::Manifest::from_slice(include_bytes!("../models.json"))?
+                .profiles
+                .get(&format!("{model_slug}.owned-cuda"))
+                .and_then(|p| p.cuda_min_driver_api)
+        } else {
+            None
+        },
+        cuda_min_compute_major: if lane == Lane::OwnedCuda {
+            crate::manifest::Manifest::from_slice(include_bytes!("../models.json"))?
+                .profiles
+                .get(&format!("{model_slug}.owned-cuda"))
+                .and_then(|p| p.cuda_min_compute_major)
+        } else {
+            None
+        },
+        cuda_min_compute_minor: if lane == Lane::OwnedCuda {
+            crate::manifest::Manifest::from_slice(include_bytes!("../models.json"))?
+                .profiles
+                .get(&format!("{model_slug}.owned-cuda"))
+                .and_then(|p| p.cuda_min_compute_minor)
+        } else {
+            None
+        },
     })
 }
 
