@@ -403,19 +403,26 @@ async fn module_logs_start_and_stop_across_a_daemon_connection_close() {
     let data_home = unique_temp_dir("synapse-lifecycle-log");
     std::fs::create_dir_all(&data_home).unwrap();
     let data_home_arg = data_home.to_string_lossy().into_owned();
-    let mut module = spawn_synapse_module_with_env(
+    let module = spawn_synapse_module_with_env(
         &daemon.connection_file_path,
         None,
         None,
         &[("XDG_DATA_HOME", data_home_arg.as_str())],
     );
-    wait_for_registration(&daemon.registry, MODULE_ID, Duration::from_secs(30)).await;
+    // Registration alone is not enough before tearing the daemon down: the
+    // daemon records the module as registered before its HELLO_ACK reaches the
+    // module, so a shutdown in that window ends the module with "connection
+    // closed before HELLO_ACK" instead of a served-then-closed connection.
+    // A route the module has answered proves it finished the handshake.
+    let (daemon, mut module, consumer, _route) =
+        open_route_for_started_module(daemon, module).await;
     assert!(
         module_log_text(&data_home).contains("synapse started"),
         "a registered module must have logged its start; log: {}",
         module_log_text(&data_home)
     );
 
+    drop(consumer);
     drop(daemon);
     daemon_runtime.shutdown_background();
     let exited = tokio::time::timeout(Duration::from_secs(30), module.child.wait()).await;
