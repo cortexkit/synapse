@@ -17,7 +17,6 @@ contracts/                  interface contracts and their validators
 crates/                     production Rust crates
   synapse-core/             shared types, engine traits, tokenizer, worker protocol, scheduler
   synapse-engine-cuda/      CUDA embedding engine (PTX kernel ports)
-  synapse-engine-ort/       ONNX Runtime CPU embedding engine
   synapse-engine-owned/     Metal embedding engine, Metal decode kernels, owned-decode supervisor (macOS)
   synapse-module/           the subc module (ck-synapse): ops, store, worker host, remote gateway
   synapse-opctl/            operator CLI (ck-synapse-opctl)

@@ -42,8 +42,9 @@ crash budget (`owned-decode-worker`) used by the decode worker and the module.
 ModernBERT, Qwen3) from ported PTX kernels, with a hardware-floor check. The module
 does not link it; it runs only inside `ck-synapse-worker-cuda`.
 
-**ORT engine** (`crates/synapse-engine-ort`). In-process ONNX Runtime embedding on
-CPU. It is the portable floor on any machine and the parity reference for other lanes.
+There is no CPU embedding lane: embedding and reranking run only on synapse's own
+GPU and Neural Engine engines (the Metal, Core ML/ANE and CUDA code above), and
+machines without a supported GPU use the remote gateway.
 
 **Workers.** Each is a separate binary the module spawns, handshakes with, and
 supervises:
@@ -72,8 +73,8 @@ probes, admission stats, approvals and rollback, batch submission, paged results
 method call to any module.
 
 **Bench tree** (`bench/`). `bench/harness` (`synapse-bench`) builds corpora, wraps runs
-with power telemetry behind an idle gate, and computes parity against the CPU ORT
-reference. `bench/rig` (`synapse-rig`) drives a candidate as a subprocess over framed
+with power telemetry (taken only once the machine is idle, so other load does not
+count toward a run's power), and computes parity against an fp32 reference. `bench/rig` (`synapse-rig`) drives a candidate as a subprocess over framed
 stdio so timing and token accounting are measured outside the candidate. `bench/lanes`
 holds one runner per backend under test (Rust crates, Python and JS scripts);
 `bench/spikes` holds research prototypes, `unified-rt` being the largest;
@@ -121,7 +122,7 @@ quality. `bench/run-matrix.sh` and `bench/run-night.sh` run the lanes in sequenc
    content-addressed cache, and lanes that need certification refuse with
    `not_certified` unless evidence exists for the current machine profile (owned
    generation lanes also need an enabled approval).
-5. The work runs on the chosen lane: an in-process engine (owned Metal, ORT), a worker
+5. The work runs on the chosen lane: the in-process owned Metal engine, a worker
    over the worker protocol, or the remote gateway.
 6. Results are committed in pages as the job runs. Callers read them with
    `embed.result`; pages are readable while the job is still running and survive a

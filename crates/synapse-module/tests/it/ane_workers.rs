@@ -187,7 +187,7 @@ fn assert_worker_crash_is_quarantined(label: &str, worker_bin: PathBuf) {
 
 fn golden_file() -> GoldenFile {
     serde_json::from_str(include_str!(
-        "../../../synapse-engine-ort/tests/fixtures/minilm_golden.json"
+        "../../../synapse-worker-llama/tests/fixtures/minilm_golden.json"
     ))
     .expect("golden fixture should parse")
 }
