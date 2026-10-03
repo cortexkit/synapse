@@ -11,7 +11,10 @@ use std::{
 
 use synapse_core::{
     worker_framing_sync::{read_frame, write_frame, write_json_frame},
-    worker_protocol::{WorkerHello, WorkerHelloAck, WorkerResponse, DEFAULT_MAX_FRAME_BYTES},
+    worker_protocol::{
+        WorkerHello, WorkerHelloAck, WorkerResponse, DEFAULT_MAX_FRAME_BYTES,
+        WORKER_PROTOCOL_VERSION,
+    },
 };
 use synapse_module::worker_host::{WorkerEngine, WorkerHostConfig};
 
@@ -74,7 +77,7 @@ fn normal_requests_cannot_select_a_certification_forced_fault() {
     write_json_frame(
         &mut stream,
         &WorkerHelloAck {
-            v: 1,
+            v: WORKER_PROTOCOL_VERSION,
             accept: true,
             max_frame: DEFAULT_MAX_FRAME_BYTES,
         },
