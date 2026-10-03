@@ -146,20 +146,6 @@ jobs:
             curl -sSfL "$base/$f" -o "$snap/$f"
           done
 
-      # Windows exercises the wave-11 load-dynamic ort path end to end: the
-      # official DLL is what ORT_DYLIB_PATH points at in production.
-      - name: onnxruntime DLL (windows)
-        if: matrix.name == 'windows'
-        shell: pwsh
-        run: |
-          $v = "1.23.2"
-          $dir = "C:\onnxruntime"
-          if (!(Test-Path "$dir\onnxruntime-win-x64-$v\lib\onnxruntime.dll")) {
-            curl.exe -sSfL "https://github.com/microsoft/onnxruntime/releases/download/v$v/onnxruntime-win-x64-$v.zip" -o ort.zip
-            Expand-Archive ort.zip -DestinationPath $dir
-          }
-          echo "ORT_DYLIB_PATH=$dir\onnxruntime-win-x64-$v\lib\onnxruntime.dll" >> $env:GITHUB_ENV
-
       # The repository is public, so a tracked home path, hostname or credential
       # marker is a disclosure rather than untidiness. This ran only from a
       # developer's shell until a leaked worktree path reached master, so it is

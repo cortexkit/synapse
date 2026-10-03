@@ -13,18 +13,24 @@ use std::{
     time::Duration,
 };
 
+#[cfg(target_os = "macos")]
+use common::read_frame_timeout;
 use common::{
     configure_test_module_command, connect_consumer, install_test_tracing, raw_route_frame,
-    read_frame_timeout, route_open, route_request, unique_temp_dir, wait_for_catalog, TestRoute,
-    MODULE_ID, SETUP_TIMEOUT,
+    route_open, route_request, unique_temp_dir, wait_for_catalog, TestRoute, MODULE_ID,
+    SETUP_TIMEOUT,
 };
 use rusqlite::{params, Connection};
 use serde_json::Value;
 use subc_daemon::{
     daemon_config::StorageConfig, serve_listener, ControlHandler, Registry, Router, ServerAuth,
 };
+#[cfg(target_os = "macos")]
 use subc_protocol::Frame;
-use subc_protocol::{Flags, FrameType, Priority};
+use subc_protocol::FrameType;
+#[cfg(target_os = "macos")]
+use subc_protocol::{Flags, Priority};
+#[cfg(target_os = "macos")]
 use subc_transport::write_frame;
 use subc_transport::{
     generate_daemon_id, generate_key, write_atomic, ConnectionInfo, Endpoint, SCHEMA_VERSION,
@@ -1100,6 +1106,7 @@ async fn embed_query_default_catalog_returns_typed_model_not_installed_error() {
     );
 }
 
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn embed_query_preloaded_minilm_returns_vectors_and_envelope() {
     let Some(preloads) = minilm_preload_config() else {
@@ -1151,6 +1158,7 @@ async fn embed_query_preloaded_minilm_returns_vectors_and_envelope() {
     assert_eq!(result["fingerprint"], second["result"]["fingerprint"]);
 }
 
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn probe_refuses_lane_without_matching_reference_fixture() {
     let Some(preloads) = minilm_preload_config() else {
@@ -1880,6 +1888,7 @@ async fn owned_gte_inline_embed_batch_throughput_sweep() {
     );
 }
 
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn embed_batch_preloaded_minilm_preserves_order_and_envelope() {
     let Some(preloads) = minilm_preload_config() else {
@@ -1923,6 +1932,7 @@ async fn embed_batch_preloaded_minilm_preserves_order_and_envelope() {
     }
 }
 
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn over_budget_embed_batch_returns_job_and_pages_results() {
     let Some(preloads) = minilm_preload_config() else {
@@ -2078,6 +2088,7 @@ async fn over_budget_embed_batch_returns_job_and_pages_results() {
     }
 }
 
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn embed_query_row_over_ceiling_reports_submitted_and_content_hashes() {
     let Some(preloads) = minilm_preload_config() else {
@@ -2118,6 +2129,7 @@ async fn embed_query_row_over_ceiling_reports_submitted_and_content_hashes() {
     assert!(is_truncated);
 }
 
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn embed_query_row_under_ceiling_reports_equal_hashes() {
     let Some(preloads) = minilm_preload_config() else {
@@ -2158,6 +2170,7 @@ async fn embed_query_row_under_ceiling_reports_equal_hashes() {
     assert!(!is_truncated);
 }
 
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn embed_batch_with_mixed_over_cap_and_short_rows_returns_all_vectors() {
     let Some(preloads) = minilm_preload_config() else {
@@ -2222,6 +2235,7 @@ async fn embed_batch_with_mixed_over_cap_and_short_rows_returns_all_vectors() {
     assert_eq!(result["truncation_disclosures"][2]["truncated"], false);
 }
 
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn job_tier_paged_results_replays_truncated_row_from_storage() {
     let Some(preloads) = minilm_preload_config() else {
@@ -2323,6 +2337,7 @@ async fn job_tier_paged_results_replays_truncated_row_from_storage() {
     assert_eq!(disclosures[1]["truncated"], false);
 }
 
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn admission_status_reports_execution_waiters_during_concurrent_batches() {
     let Some(preloads) = minilm_preload_config() else {
@@ -2420,6 +2435,7 @@ async fn admission_status_reports_execution_waiters_during_concurrent_batches() 
     let _ = second_task.await.unwrap();
 }
 
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn alias_surface_certifies_declares_retracts_and_preserves_old_job_pages() {
     let Some(preloads) = minilm_alias_preload_config() else {
@@ -2569,6 +2585,7 @@ async fn alias_surface_certifies_declares_retracts_and_preserves_old_job_pages()
     assert_eq!(after["result"]["equivalent_to"], Value::Array(Vec::new()));
 }
 
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn probe_report_exposes_blocking_reasons_perf_rows_and_default_assignments() {
     let Some(preloads) = minilm_preload_config() else {
@@ -2633,6 +2650,7 @@ async fn probe_report_exposes_blocking_reasons_perf_rows_and_default_assignments
     assert_eq!(result["lanes"][0]["performance"]["stale"], false);
 }
 
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn quiet_knob_restart_keeps_assignment_but_omitted_model_uses_catalog_default() {
     let Some(preloads) = minilm_alias_preload_config() else {
@@ -2733,6 +2751,7 @@ async fn quiet_knob_restart_keeps_assignment_but_omitted_model_uses_catalog_defa
     assert_eq!(explicit["result"]["fingerprint"], quiet_fingerprint);
 }
 
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn os_build_override_marks_probe_rows_stale_in_report_and_status() {
     let Some(preloads) = minilm_preload_config() else {
@@ -2794,6 +2813,7 @@ async fn os_build_override_marks_probe_rows_stale_in_report_and_status() {
     assert_eq!(status["result"]["lanes"][0]["performance_stale"], true);
 }
 
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn embed_query_deadline_one_returns_typed_rejection() {
     let Some(preloads) = minilm_preload_config() else {
@@ -2822,6 +2842,7 @@ async fn embed_query_deadline_one_returns_typed_rejection() {
     assert_eq!(error["class"], "transient");
 }
 
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn concurrent_embed_burst_finishes_with_vectors_or_typed_rejections() {
     let Some(preloads) = minilm_preload_config() else {
@@ -2871,6 +2892,7 @@ async fn concurrent_embed_burst_finishes_with_vectors_or_typed_rejections() {
     }
 }
 
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn model_load_file_source_reaches_ready_and_lazy_reload_after_unload() {
     let Some(source_dir) = copied_minilm_source_dir("synapse-model-load-file") else {
@@ -2983,6 +3005,7 @@ async fn model_load_file_source_reaches_ready_and_lazy_reload_after_unload() {
     assert_eq!(second["result"]["dims"].as_u64(), Some(384));
 }
 
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn model_load_digest_mismatch_fails_with_artifact_invalid() {
     let Some(source_dir) = copied_minilm_source_dir("synapse-model-load-digest-mismatch") else {
@@ -3023,6 +3046,7 @@ async fn model_load_digest_mismatch_fails_with_artifact_invalid() {
     assert_eq!(failed["result"]["error"]["class"], "permanent");
 }
 
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn model_load_restart_mid_download_marks_job_restarted_and_resubmit_succeeds() {
     let Some(source_dir) = copied_minilm_source_dir("synapse-model-load-restart") else {
@@ -3116,6 +3140,7 @@ async fn model_load_restart_mid_download_marks_job_restarted_and_resubmit_succee
     assert_eq!(ready["result"]["state"], "ready");
 }
 
+#[cfg(target_os = "macos")]
 async fn certify_preloaded_models(
     consumer: &mut tokio::net::TcpStream,
     route: TestRoute,
@@ -3220,6 +3245,7 @@ async fn run_probe_job(
     body
 }
 
+#[cfg(target_os = "macos")]
 async fn poll_model_load_job(
     consumer: &mut tokio::net::TcpStream,
     route: TestRoute,
@@ -3254,6 +3280,7 @@ async fn poll_model_load_job(
     }
 }
 
+#[cfg(target_os = "macos")]
 async fn poll_model_ready(
     consumer: &mut tokio::net::TcpStream,
     route: TestRoute,
@@ -3322,6 +3349,7 @@ async fn poll_embed_result(
     }
 }
 
+#[cfg(target_os = "macos")]
 async fn ensure_model_loaded_by_query(
     consumer: &mut tokio::net::TcpStream,
     route: TestRoute,
@@ -3352,6 +3380,7 @@ async fn ensure_model_loaded_by_query(
     }
 }
 
+#[cfg(target_os = "macos")]
 fn module_config_with_preloads(preloads: Value, knob: &str) -> String {
     serde_json::json!({
         "preload_models": preloads,
@@ -3360,6 +3389,7 @@ fn module_config_with_preloads(preloads: Value, knob: &str) -> String {
     .to_string()
 }
 
+#[cfg(target_os = "macos")]
 fn overwrite_knob_assignment(
     store_path: &Path,
     machine_profile_hash: &str,
@@ -3430,6 +3460,7 @@ fn assert_vector_cosine_at_least(actual: &Value, expected: &Value, minimum: f64)
     );
 }
 
+#[cfg(target_os = "macos")]
 fn assert_vectors_close(actual: &Value, expected: &Value) {
     let actual = actual.as_array().expect("actual vector is an array");
     let expected = expected.as_array().expect("expected vector is an array");
@@ -3444,6 +3475,7 @@ fn assert_vectors_close(actual: &Value, expected: &Value) {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn copied_minilm_source_dir(label: &str) -> Option<PathBuf> {
     let snapshot = minilm_safetensors_snapshot()?;
     let model_path = snapshot.join("model.safetensors");
@@ -3459,15 +3491,18 @@ fn copied_minilm_source_dir(label: &str) -> Option<PathBuf> {
     Some(source_dir)
 }
 
+#[cfg(target_os = "macos")]
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::Digest;
     hex::encode(sha2::Sha256::digest(bytes))
 }
 
+#[cfg(target_os = "macos")]
 fn minilm_preload_config() -> Option<String> {
     minilm_preload_config_with_max_tokens(512)
 }
 
+#[cfg(target_os = "macos")]
 fn minilm_preload_config_with_max_tokens(max_tokens: usize) -> Option<String> {
     let snapshot = minilm_safetensors_snapshot()?;
     let model_path = snapshot.join("model.safetensors");
@@ -3503,6 +3538,7 @@ fn test_sha256(path: PathBuf) -> String {
     )
 }
 
+#[cfg(target_os = "macos")]
 fn minilm_safetensors_snapshot() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("SYNAPSE_MINILM_SAFETENSORS_SNAPSHOT") {
         return Some(PathBuf::from(path));
@@ -3532,6 +3568,7 @@ fn gte_reranker_safetensors_snapshot() -> Option<PathBuf> {
     first_snapshot_with(&snapshots, "model.safetensors")
 }
 
+#[cfg(target_os = "macos")]
 fn minilm_alias_preload_config() -> Option<Value> {
     let snapshot = minilm_safetensors_snapshot()?;
     let model_path = snapshot.join("model.safetensors");
@@ -3569,6 +3606,7 @@ fn minilm_alias_preload_config() -> Option<Value> {
     ]))
 }
 
+#[cfg(target_os = "macos")]
 fn first_snapshot_with(snapshots: &Path, file_name: &str) -> Option<PathBuf> {
     std::fs::read_dir(snapshots)
         .ok()?
@@ -3577,6 +3615,7 @@ fn first_snapshot_with(snapshots: &Path, file_name: &str) -> Option<PathBuf> {
         .find(|path| path.join(file_name).exists())
 }
 
+#[cfg(target_os = "macos")]
 /// Serialises the MiniLM e2e tests across every test process on the box.
 /// The handle is an OS advisory lock (flock on unix, LockFileEx on Windows)
 /// through the same lease store the module uses for its singleton lease, so
@@ -4134,6 +4173,7 @@ fn production_binary_carries_owned_decode_errors_and_retires_legacy_grammar_lite
     );
 }
 
+#[cfg(target_os = "macos")]
 /// Upper bound on waiting for a LIVE holder. Twenty-two tests queue on this
 /// lock and each holds it for one daemon lifetime, so on a loaded shared
 /// workstation the last waiter can legitimately sit here for many minutes;
@@ -4143,6 +4183,7 @@ fn production_binary_carries_owned_decode_errors_and_retires_legacy_grammar_lite
 /// worth a named failure rather than a silent CI timeout.
 const MINILM_E2E_LOCK_WAIT: Duration = Duration::from_secs(1800);
 
+#[cfg(target_os = "macos")]
 fn acquire_minilm_e2e_lock() -> MinilmE2eLock {
     use cortexkit_lease::{FileLeaseStore, LeaseError, LeaseKey, LeaseStore};
     let store = FileLeaseStore::new(std::env::temp_dir());
