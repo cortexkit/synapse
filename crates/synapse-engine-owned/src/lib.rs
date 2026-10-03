@@ -853,12 +853,7 @@ fn parse_usize(cfg: &RuntimeConfig, key: &str, default: usize) -> Result<usize, 
 }
 
 #[cfg(target_os = "macos")]
-fn package_root(
-    cache_root: &Path,
-    model_path: &Path,
-    family: ModelFamily,
-    dtype: OwnedDType,
-) -> Result<PathBuf, String> {
+fn canonical_model_hash(model_path: &Path) -> String {
     let canonical = std::fs::canonicalize(model_path).unwrap_or_else(|_| model_path.to_path_buf());
     let hash = canonical
         .to_string_lossy()
@@ -866,6 +861,17 @@ fn package_root(
         .fold(1469598103934665603u64, |hash, byte| {
             (hash ^ u64::from(byte)).wrapping_mul(1099511628211)
         });
+    format!("{hash:016x}")
+}
+
+#[cfg(target_os = "macos")]
+fn package_root(
+    cache_root: &Path,
+    model_path: &Path,
+    family: ModelFamily,
+    dtype: OwnedDType,
+) -> Result<PathBuf, String> {
+    let model_hash = canonical_model_hash(model_path);
     let os_build = synapse_core::without_launch_nonce(std::process::Command::new("sw_vers"))
         .arg("-buildVersion")
         .output()
@@ -877,7 +883,7 @@ fn package_root(
     resolve_package_root(
         cache_root,
         family.as_str(),
-        &format!("{hash:016x}"),
+        &model_hash,
         dtype.as_str(),
         &os_build,
     )
@@ -1071,6 +1077,142 @@ fn remove_package_tree(path: &Path) {
     }
 }
 
+/// Extract the model hash component from a compiled package directory name or
+/// leftover pruning/removing directory name.
+#[cfg(target_os = "macos")]
+fn package_model_hash(name: &str) -> Option<&str> {
+    let unhidden = if let Some(stripped) = name.strip_prefix('.') {
+        if let Some((k, _)) = stripped.split_once(".pruning-") {
+            k
+        } else if let Some((k, _)) = stripped.split_once(".removing-") {
+            k
+        } else {
+            return None;
+        }
+    } else {
+        name
+    };
+    let (family, rest) = unhidden.split_once("-graph-v")?;
+    if family.is_empty() {
+        return None;
+    }
+    let (graph_revision, rest) = rest.split_once("-bucket-policy-v")?;
+    let mut parts = rest.splitn(4, '-');
+    let bucket_policy = parts.next()?;
+    let model_hash = parts.next()?;
+    let dtype = parts.next()?;
+    let os_build = parts.next()?;
+    let is_number = |value: &str| !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit());
+    if is_number(graph_revision)
+        && is_number(bucket_policy)
+        && model_hash.len() == 16
+        && model_hash.bytes().all(|b| b.is_ascii_hexdigit())
+        && !dtype.is_empty()
+        && !os_build.is_empty()
+    {
+        Some(model_hash)
+    } else {
+        None
+    }
+}
+
+/// Sum of on-disk file bytes within a directory tree.
+#[cfg(target_os = "macos")]
+fn directory_bytes(path: &Path) -> u64 {
+    let mut total = 0_u64;
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let entry_path = entry.path();
+        let Ok(metadata) = std::fs::symlink_metadata(&entry_path) else {
+            continue;
+        };
+        if metadata.is_dir() {
+            total = total.saturating_add(directory_bytes(&entry_path));
+        } else if metadata.is_file() || metadata.is_symlink() {
+            total = total.saturating_add(metadata.len());
+        }
+    }
+    total
+}
+
+/// Remove every compiled package directory under `cache_root` whose key's
+/// model hash matches the canonical `model_path`, and return the total bytes removed.
+///
+/// On macOS, compiled Metal MPSGraph packages are keyed on the FNV-1a hash
+/// of the canonical model path. When a model is unlinked, its compiled packages
+/// become orphans unless cleaned up.
+#[cfg(target_os = "macos")]
+pub fn remove_compiled_packages(cache_root: &Path, model_path: &Path) -> u64 {
+    let target_model_hash = canonical_model_hash(model_path);
+    let Ok(entries) = std::fs::read_dir(cache_root) else {
+        return 0;
+    };
+    let mut total_freed = 0_u64;
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if !package_model_hash(&name)
+            .is_some_and(|hash| hash.eq_ignore_ascii_case(&target_model_hash))
+        {
+            continue;
+        }
+
+        let is_leftover = name.starts_with('.');
+        let path_to_remove = if is_leftover {
+            entry.path()
+        } else {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos());
+            let trash = cache_root.join(format!(".{name}.removing-{}-{nonce}", std::process::id()));
+            match std::fs::rename(entry.path(), &trash) {
+                Ok(()) => trash,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    eprintln!(
+                        "owned-metal: failed to rename package directory for removal {}: {error}",
+                        entry.path().display()
+                    );
+                    entry.path()
+                }
+            }
+        };
+
+        let bytes = directory_bytes(&path_to_remove);
+        match std::fs::remove_dir_all(&path_to_remove) {
+            Ok(()) => {
+                total_freed = total_freed.saturating_add(bytes);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                eprintln!(
+                    "owned-metal: failed to remove package directory {}: {error}",
+                    path_to_remove.display()
+                );
+            }
+        }
+    }
+    total_freed
+}
+
+/// Remove every compiled package directory under `cache_root` whose key's
+/// model hash matches the canonical `model_path`, and return the total bytes removed.
+///
+/// Off macOS, compiled Metal packages are not generated or cached, so this is a no-op returning 0.
+#[cfg(not(target_os = "macos"))]
+pub fn remove_compiled_packages(_cache_root: &Path, _model_path: &Path) -> u64 {
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1221,5 +1363,158 @@ mod tests {
             "a failed sw_vers read must not prune the real OS build's packages"
         );
         std::fs::remove_dir_all(&cache_root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn remove_compiled_packages_removes_matching_model_and_preserves_other() {
+        let temp = std::env::temp_dir().join(format!(
+            "synapse-remove-packages-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp).unwrap();
+        let cache_root = temp.join("cache");
+        std::fs::create_dir_all(&cache_root).unwrap();
+
+        let model_a = temp.join("model_a.safetensors");
+        let model_b = temp.join("model_b.safetensors");
+        std::fs::write(&model_a, b"model-a-weights").unwrap();
+        std::fs::write(&model_b, b"model-b-weights").unwrap();
+
+        // Create package directories for model_a across two dtypes and an older revision
+        let root_a1 = package_root(
+            &cache_root,
+            &model_a,
+            ModelFamily::GteModernBert,
+            OwnedDType::F16,
+        )
+        .unwrap();
+        let root_a2 = package_root(
+            &cache_root,
+            &model_a,
+            ModelFamily::GteModernBert,
+            OwnedDType::F32,
+        )
+        .unwrap();
+
+        let hash_a = canonical_model_hash(&model_a);
+        let older_a = cache_root.join(package_key_name(
+            ModelFamily::GteModernBert.as_str(),
+            GRAPH_REVISION - 1,
+            BUCKET_POLICY_VERSION,
+            &hash_a,
+            "f16",
+            "25G72",
+        ));
+        std::fs::create_dir_all(&older_a).unwrap();
+
+        // Create package directories for model_b
+        let root_b1 = package_root(
+            &cache_root,
+            &model_b,
+            ModelFamily::GteModernBert,
+            OwnedDType::F16,
+        )
+        .unwrap();
+        let root_b2 =
+            package_root(&cache_root, &model_b, ModelFamily::Qwen3, OwnedDType::F16).unwrap();
+
+        // An unrelated directory in cache_root that should not be touched
+        let unrelated = cache_root.join("unrelated-directory");
+        std::fs::create_dir_all(&unrelated).unwrap();
+        let unrelated_file = unrelated.join("some-file");
+        std::fs::write(&unrelated_file, b"leave-me-alone").unwrap();
+
+        // Write packages with known byte sizes
+        let file_a1 = root_a1.join("8x128.mpsgraphpackage").join("data");
+        std::fs::create_dir_all(file_a1.parent().unwrap()).unwrap();
+        std::fs::write(&file_a1, b"package-data-for-model-a1").unwrap();
+
+        let file_a2 = root_a2.join("1x512.mpsgraphpackage").join("data");
+        std::fs::create_dir_all(file_a2.parent().unwrap()).unwrap();
+        std::fs::write(&file_a2, b"package-data-for-model-a2-longer").unwrap();
+
+        let older_a_file = older_a.join("data");
+        std::fs::write(&older_a_file, b"older-revision-data").unwrap();
+
+        let file_b1 = root_b1.join("8x128.mpsgraphpackage").join("data");
+        std::fs::create_dir_all(file_b1.parent().unwrap()).unwrap();
+        std::fs::write(&file_b1, b"package-data-for-model-b1").unwrap();
+
+        let file_b2 = root_b2.join("1x128.mpsgraphpackage").join("data");
+        std::fs::create_dir_all(file_b2.parent().unwrap()).unwrap();
+        std::fs::write(&file_b2, b"package-data-for-model-b2").unwrap();
+
+        let expected_freed_a = b"package-data-for-model-a1".len() as u64
+            + b"package-data-for-model-a2-longer".len() as u64
+            + b"older-revision-data".len() as u64;
+
+        let freed_a = remove_compiled_packages(&cache_root, &model_a);
+        assert_eq!(freed_a, expected_freed_a);
+
+        // Model A directories must all be removed
+        assert!(!root_a1.exists(), "root_a1 should be removed");
+        assert!(!root_a2.exists(), "root_a2 should be removed");
+        assert!(!older_a.exists(), "older_a should be removed");
+
+        // Model B directories and files must be completely intact
+        assert!(root_b1.exists(), "root_b1 should still exist");
+        assert!(root_b2.exists(), "root_b2 should still exist");
+        assert_eq!(
+            std::fs::read(&file_b1).unwrap(),
+            b"package-data-for-model-b1"
+        );
+        assert_eq!(
+            std::fs::read(&file_b2).unwrap(),
+            b"package-data-for-model-b2"
+        );
+
+        // Unrelated directory must be intact
+        assert!(unrelated.is_dir());
+        assert_eq!(std::fs::read(&unrelated_file).unwrap(), b"leave-me-alone");
+
+        // Removing model_a again is a no-op returning 0
+        assert_eq!(remove_compiled_packages(&cache_root, &model_a), 0);
+
+        // Now remove model_b and verify it cleans up its directories
+        let expected_freed_b =
+            b"package-data-for-model-b1".len() as u64 + b"package-data-for-model-b2".len() as u64;
+        let freed_b = remove_compiled_packages(&cache_root, &model_b);
+        assert_eq!(freed_b, expected_freed_b);
+        assert!(!root_b1.exists(), "root_b1 should be removed");
+        assert!(!root_b2.exists(), "root_b2 should be removed");
+        assert!(unrelated.is_dir());
+
+        std::fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn remove_compiled_packages_returns_zero_for_missing_cache_root() {
+        let temp = std::env::temp_dir().join(format!(
+            "synapse-missing-cache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let model = temp.join("model.safetensors");
+        assert_eq!(
+            remove_compiled_packages(&temp.join("no-such-cache"), &model),
+            0
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn remove_compiled_packages_is_noop_off_macos() {
+        let cache_root = Path::new("/any/cache/path");
+        let model_path = Path::new("/any/model/path");
+        assert_eq!(remove_compiled_packages(cache_root, model_path), 0);
     }
 }
