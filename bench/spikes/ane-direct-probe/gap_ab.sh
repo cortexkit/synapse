@@ -23,8 +23,18 @@ rig_db="$HOME/.local/share/cortexkit/prefrontal-core/store.db"
 synapse_logs="$HOME/.local/share/cortexkit/synapse/logs"
 mkdir -p "$out"
 
+# Prints the number of rig claims, or "unknown" when the store cannot be read
+# (it is briefly unopenable while its owner rewrites it). The start gate only
+# accepts "0", so an unreadable store makes the script keep waiting.
 rig_claims() {
-    sqlite3 "file:$rig_db?mode=ro" "SELECT count(*) FROM campaign_rig_claim"
+    local attempt
+    for attempt in 1 2 3; do
+        if sqlite3 "file:$rig_db?mode=ro" "SELECT count(*) FROM campaign_rig_claim" 2>/dev/null; then
+            return 0
+        fi
+        sleep 2
+    done
+    echo unknown
 }
 
 while true; do

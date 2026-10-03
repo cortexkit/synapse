@@ -1,0 +1,32 @@
+start 2026-10-03T12:05:48Z load 10.06/10.35/17.50 rig claims 0
+compiling 22 layers at sequence 512 (1 layer(s) per executable)
+CPU fp32 reference: short-fox
+CPU fp32 reference: short-boundary
+CPU fp32 reference: short-multilingual
+CPU fp32 reference: short-structured
+CPU fp32 reference: near-climate
+CPU fp32 reference: near-database
+CPU fp32 reference: near-software
+CPU fp32 reference: near-science
+block 0 gap 0 ms: 500 calls, mean 25.019 ms, load 11.61->15.34, mismatches 0
+block 1 gap 3 ms: 500 calls, mean 26.844 ms, load 15.34->18.03, mismatches 0
+block 2 gap 0 ms: 500 calls, mean 26.006 ms, load 18.03->18.60, mismatches 0
+block 3 gap 3 ms: 500 calls, mean 24.871 ms, load 18.60->18.11, mismatches 0
+block 4 gap 0 ms: 500 calls, mean 24.919 ms, load 18.11->22.08, mismatches 0
+block 5 gap 3 ms: 500 calls, mean 25.002 ms, load 22.08->20.55, mismatches 0
+block 6 gap 0 ms: 500 calls, mean 24.880 ms, load 20.55->30.97, mismatches 0
+block 7 gap 3 ms: 500 calls, mean 24.649 ms, load 30.97->27.88, mismatches 0
+block 8 gap 0 ms: 500 calls, mean 24.812 ms, load 27.88->27.43, mismatches 0
+block 9 gap 3 ms: 500 calls, mean 25.057 ms, load 27.43->26.49, mismatches 0
+block 10 gap 0 ms: 500 calls, mean 25.025 ms, load 26.49->23.95, mismatches 0
+block 11 gap 3 ms: 500 calls, mean 24.931 ms, load 23.95->23.95, mismatches 0
+block 12 gap 0 ms: 500 calls, mean 25.082 ms, load 23.95->21.60, mismatches 0
+block 13 gap 3 ms: 500 calls, mean 31.607 ms, load 21.60->22.52, mismatches 0
+block 14 gap 0 ms: 500 calls, mean 25.693 ms, load 22.52->21.95, mismatches 0
+block 15 gap 3 ms: 500 calls, mean 30.481 ms, load 21.95->26.02, mismatches 0
+block 16 gap 0 ms: 500 calls, mean 30.835 ms, load 26.02->27.50, mismatches 0
+block 17 gap 3 ms: 500 calls, mean 29.558 ms, load 27.50->29.48, mismatches 0
+block 18 gap 0 ms: 500 calls, mean 27.560 ms, load 29.48->29.52, mismatches 0
+block 19 gap 3 ms: 500 calls, mean 29.582 ms, load 29.52->28.13, mismatches 0
+end 2026-10-03T12:10:49Z exit 0
+synapse log lines during run:        0

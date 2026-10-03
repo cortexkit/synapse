@@ -35,6 +35,23 @@ checkpoint localization, warm wall time, and one-minute load average. A 512 run
 exits unsuccessfully unless minimum cosine is at least 0.999 and repeated vectors
 are byte-identical.
 
+Every row's report entry also lists each warm call's wall time
+(`warm_wall_ms`), not only the median. `--gap-ms MS` (default 0) sleeps that
+long after each warm prediction returns and before the next is submitted.
+
+### Interleaved dispatch-gap experiment
+
+`--blocks N` (default 0, off) runs, after the correctness phase, N timed blocks
+of `--calls-per-block` predictions (default 400) that cycle through the rows in
+file order. Block `b` sleeps `--block-gaps-ms` entry `b % len` (default `0,3`)
+between predictions, so arms alternate and share drift in machine load. Each
+prediction is compared bit for bit with its row's correctness-phase vector.
+`--per-call-out PATH` writes every prediction's wall time, measured sleep and
+per-dispatch times, and each block's one- and five-minute load. `gap_ab.sh`
+wraps a run with a load and rig-claim wait, a load monitor and a copy of the
+production Synapse log for the run window; `gap_analysis.py` summarizes the
+per-call file. Results are in `docs/evidence/ane-dispatch-gap/`.
+
 `rows.jsonl` contains four short real-text rows and four repeated-prose rows near
 each of the 512, 1024, and 2048 shape limits. Its SHA-256 is
 `f4889a38df77b9940ce973c4d9b82857d0c401987ae8e77b5ca25e6062808c39`.
