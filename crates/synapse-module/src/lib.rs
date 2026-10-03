@@ -20410,11 +20410,16 @@ fn detected_catalog_backends() -> BTreeSet<String> {
             .map(str::to_string)
             .collect();
     }
-    let mut backends = BTreeSet::new();
     #[cfg(target_os = "macos")]
-    if metal::Device::system_default().is_some() {
-        backends.insert("metal".into());
-    }
+    let backends = {
+        let mut backends = BTreeSet::new();
+        if metal::Device::system_default().is_some() {
+            backends.insert("metal".into());
+        }
+        backends
+    };
+    #[cfg(not(target_os = "macos"))]
+    let backends = BTreeSet::new();
     backends
 }
 fn catalog_backend_reason(runtime: &RuntimeState, backend: &str) -> Option<&'static str> {
@@ -21636,11 +21641,11 @@ fn select_catalog_lane(
             .iter()
             .find(|b| state.runtime.runnable_backends.contains(&b.backend))
     });
-    let backend = selected.ok_or_else(|| catalog_backend_unavailable(&state, entry, None))?;
+    let backend = selected.ok_or_else(|| catalog_backend_unavailable(state, entry, None))?;
     if catalog_backend_reason(&state.runtime, &backend.backend).is_some() {
-        return Err(catalog_backend_unavailable(&state, entry, Some(backend)));
+        return Err(catalog_backend_unavailable(state, entry, Some(backend)));
     }
-    if current_catalog_install(&state, entry, &backend.backend)?.is_none() {
+    if current_catalog_install(state, entry, &backend.backend)?.is_none() {
         let job = state
             .store
             .active_download_job(&catalog_request_digest(entry))
@@ -21651,12 +21656,12 @@ fn select_catalog_lane(
             "install this model with models.download",
         ));
     }
-    let check = catalog_self_check_projection(&state, entry, backend)?;
+    let check = catalog_self_check_projection(state, entry, backend)?;
     if check["state"] == "failed" {
         return Err(catalog_self_check_failed(
             entry,
             backend,
-            &catalog_self_check_key(&state, entry, backend)?.0,
+            &catalog_self_check_key(state, entry, backend)?.0,
             &check["reason"],
         ));
     }
