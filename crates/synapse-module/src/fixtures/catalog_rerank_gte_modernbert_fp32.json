@@ -1,0 +1,72 @@
+{
+  "corpus_id": "catalog_rerank_gte_modernbert_fp32",
+  "comment": "Release evidence corpus for the gte-reranker-modernbert-base catalog entry. Each score is sigmoid(raw logit) of the fp32 Transformers reference on CPU.",
+  "generation_command": "uv run --no-project --python 3.12 --with transformers==5.17.0 --with torch==2.14.0 python bench/catalog/gen_catalog_references.py",
+  "reference_tool": "transformers 5.17.0, torch 2.14.0; CPU fp32, eager attention, sigmoid(raw logit) of the classification head; bench/catalog/gen_catalog_references.py",
+  "upstream": {
+    "hf_repo": "Alibaba-NLP/gte-reranker-modernbert-base",
+    "revision": "f7481e6055501a30fb19d090657df9ec1f79ab2c"
+  },
+  "files": [
+    {
+      "path": "model.safetensors",
+      "sha256": "13c533d902d6a48fa97375c6856c3e60854f9228ea760e3fc18ebde057e0cf31",
+      "size_bytes": 598436708
+    },
+    {
+      "path": "tokenizer.json",
+      "sha256": "2aea6ff4701d063e7e029b6be695a1659f2caaa2ae4fb0e8b18285818271becd",
+      "size_bytes": 3583499
+    },
+    {
+      "path": "config.json",
+      "sha256": "c9316ff715158502dad782f35454eee18de984160618dc30afe7508feb46b7ce",
+      "size_bytes": 1333
+    }
+  ],
+  "pairs": 24,
+  "items": [
+    {
+      "id": "rk00-rust-borrow",
+      "query": "Why does the Rust compiler reject two mutable borrows of the same value?",
+      "candidates": ["Rust allows either one mutable reference or any number of shared references to a value at a time, which rules out data races at compile time.", "Cargo is the Rust package manager; it downloads dependencies and builds crates.", "The borrow checker tracks lifetimes so that references never outlive the data they point to.", "Tomatoes grow best in full sun with consistently moist soil."],
+      "raw_logits": [3.2593507766723633, 1.1761035919189453, 2.3809080123901367, -2.2577805519104004],
+      "scores": [0.9630076697887561, 0.7642464961173493, 0.9153598101818776, 0.09468044022005397]
+    },
+    {
+      "id": "rk01-http-status",
+      "query": "what does http status 429 mean",
+      "candidates": ["429 Too Many Requests means the client has sent too many requests in a given amount of time and is being rate limited.", "404 Not Found means the server cannot find the requested resource.", "A Retry-After header tells the client how long to wait before making a new request.", "The violin has four strings tuned in perfect fifths."],
+      "raw_logits": [2.2569992542266846, 1.5588335990905762, 1.492522954940796, -2.929929733276367],
+      "scores": [0.9052525688141674, 0.8261859183284321, 0.8164566523653143, 0.05069370633007627]
+    },
+    {
+      "id": "rk02-photosynthesis",
+      "query": "How do plants turn sunlight into chemical energy?",
+      "candidates": ["In photosynthesis, chlorophyll absorbs light and the plant uses that energy to convert carbon dioxide and water into glucose and oxygen.", "Plants absorb water through their roots and move it up through the xylem.", "Solar panels convert sunlight directly into electricity using photovoltaic cells.", "The stock market closed higher on Friday after a volatile week."],
+      "raw_logits": [2.351870059967041, 1.5318700075149536, 1.4276461601257324, -2.098193645477295],
+      "scores": [0.9130827551435324, 0.8222797538965808, 0.8065342952864312, 0.1092725133003439]
+    },
+    {
+      "id": "rk03-sql-join",
+      "query": "difference between inner join and left join",
+      "candidates": ["An inner join returns only rows with matching keys in both tables, while a left join returns every row from the left table and fills unmatched columns with NULL.", "A primary key uniquely identifies each row in a table.", "A full outer join returns all rows from both tables, matched where possible.", "Penguins live almost exclusively in the Southern Hemisphere."],
+      "raw_logits": [3.554363965988159, 0.36023902893066406, 1.473817229270935, -1.5579408407211304],
+      "scores": [0.9721956332149462, 0.589098294990683, 0.8136368928526646, 0.173942321561152]
+    },
+    {
+      "id": "rk04-sleep",
+      "query": "How many hours of sleep does an adult need?",
+      "candidates": ["Most adults need between seven and nine hours of sleep per night to function well.", "Caffeine can stay in the body for several hours and disturb sleep.", "Newborn babies sleep up to seventeen hours a day.", "The Great Wall of China is thousands of kilometres long."],
+      "raw_logits": [3.6272921562194824, 1.4389255046844482, 1.89329195022583, -1.6453293561935425],
+      "scores": [0.9741005337723544, 0.8082882045342081, 0.8691304211874303, 0.16174120002766199]
+    },
+    {
+      "id": "rk05-git-rebase",
+      "query": "git rebase vs merge",
+      "candidates": ["Merging creates a merge commit that joins two histories, while rebasing replays your commits on top of another branch to keep a linear history.", "git stash temporarily shelves uncommitted changes so you can switch branches.", "Interactive rebase lets you reorder, squash or edit commits before sharing them.", "A croissant is made from laminated dough layered with butter."],
+      "raw_logits": [2.453113079071045, 1.4632415771484375, 1.9690099954605103, -2.078016996383667],
+      "scores": [0.9207888064211598, 0.812027964952711, 0.8775047371820677, 0.11125188490627701]
+    }
+  ]
+}

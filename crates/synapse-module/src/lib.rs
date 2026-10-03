@@ -15,6 +15,7 @@ use std::{
 };
 
 mod ane_artifact;
+mod catalog;
 // Provider adapters stay module-private so credentials and remote identity checks
 // cannot be bypassed by a second public call path.
 /// Certification probes, immutable fixture batteries and oracles,
