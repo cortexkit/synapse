@@ -60,6 +60,42 @@ available.
   drift gate from being derived. **Consumer disposition:** treat the profile as
   uncertified; do not retry the same calibration, and start a new probe only
   after correcting the provider or profile behavior.
+- `model_not_installed` — class `permanent`, no `retry_after_ms`, not safe to
+  retry the same request. Emitted when a catalog model is requested on a backend
+  that has no install record for the entry's current manifest. `details`:
+  `{catalog_id, lane_id | null, download_op: "models.download",
+  download_job_id | null}`; `download_job_id` names the non-terminal download
+  job for the entry's current manifest, if one is running. **Consumer
+  disposition:** call `models.download` (or wait for the named job) before
+  retrying.
+- `unknown_model` — class `permanent`, no `retry_after_ms`, not safe to retry
+  the same request. Emitted when the requested id is neither a catalog id, a
+  declared catalog lane id, nor a registered model. `details`: `{model_id}`
+  (the requested id). **Consumer disposition:** do not retry; correct the id.
+- `self_check_failed` — class `permanent`, no `retry_after_ms`, not safe to
+  retry the same request. Emitted when a catalog lane's persisted self-check
+  has failed for the current self-check key. `details`: `{model_id, backend,
+  check_id, reason}`; `check_id` is the lowercase hex sha256 of the JCS
+  serialization of the self-check key. **Consumer disposition:** do not retry
+  on the unchanged install; the check reruns only after the key changes or the
+  model is removed and downloaded again.
+- `backend_unavailable` — class `permanent`, no `retry_after_ms`, not safe to
+  retry the same request. Emitted when a catalog entry has no backend runnable
+  on this machine, or the selected backend is not runnable here. `details`:
+  `{catalog_id, lane_id | null, backends[] {backend, reason}}`. **Consumer
+  disposition:** do not retry on this host; select another model or host.
+- `model_in_use` — class `permanent`, no `retry_after_ms`, not safe to retry
+  the same request. Emitted when a removal or unload would disturb a model that
+  is still held. `details`: `{catalog_id, holders[]}`, each holder
+  `{kind: "loaded", model_id}` | `{kind: "job", job_id}` |
+  `{kind: "self_check", check_id}` | `{kind: "request", lease_id}`.
+  **Consumer disposition:** release or wait out the named holders, then issue
+  a new request.
+- `download_failed` — class `transient`, `retry_after_ms: 1000`, safe to retry
+  the same request. Emitted when a model download fails on the network, on an
+  HTTP error status, or on full storage. `details`: `{file, reason: network |
+  http_status | storage_full, http_status | null}`. **Consumer disposition:**
+  retry the download after `retry_after_ms`.
 
 ## Common request fields (acceptance constraints)
 
