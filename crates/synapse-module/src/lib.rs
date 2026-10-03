@@ -21609,7 +21609,7 @@ fn catalog_lane_spec(
         parse_model_task(Some(&entry.task), "owned-metal", &entry.id)
             .map_err(|e| artifact_invalid_error(e.to_string()))?,
         digest,
-        "safetensors".into(),
+        "safetensors-package".into(),
         sanitized_digest,
         ModelAssetLocator::CacheDigest {
             digest: format!("sha256:{}", model.sha256),
