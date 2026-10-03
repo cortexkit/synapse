@@ -862,8 +862,10 @@ const RESTORE_CLEAR_TABLES: &[&str] = &[
 ];
 
 // `self_check_run_seq` stays with the live store for the same reason as
-// `module_meta`: its value fences late self-check completions, so it must
-// never move backwards to a captured value.
+// `module_meta`. Each self-check run takes the next value as its generation,
+// and a completion is written only if its row still carries that generation.
+// Moving the counter back to a captured value would hand out generations
+// already used, so a stale completion could match a newer run's row.
 const RESTORE_LIVE_ONLY_TABLES: &[&str] = &[
     "module_meta",
     "self_check_run_seq",
@@ -6665,9 +6667,10 @@ pub const DOWNLOAD_STATE_CANCELLED: &str = "cancelled";
 #[cfg_attr(not(test), allow(dead_code))]
 const DOWNLOAD_NON_TERMINAL_SQL: &str = "('queued', 'downloading', 'verifying')";
 
-/// Engines a free-form embed or rerank registration may name. Every other
-/// engine, `ort` and `llama` included, is refused for those tasks; none of
-/// these has a CPU execution mode.
+/// Engines a free-form embed or rerank registration may name: the owned
+/// accelerated engines, none of which has a CPU execution mode. Embedding and
+/// reranking serve only on owned accelerated lanes, so every other engine,
+/// including the CPU-bound `ort` and `llama`, is refused for those tasks.
 #[cfg_attr(not(test), allow(dead_code))]
 pub const OWNED_EMBED_RERANK_ENGINES: &[&str] =
     &["owned-metal", "ane", "owned-cuda", "owned-vulkan"];
