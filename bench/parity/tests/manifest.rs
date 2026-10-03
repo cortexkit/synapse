@@ -45,6 +45,9 @@ fn expect_err<T: std::fmt::Debug>(result: synapse_parity::Result<T>, needle: &st
     );
 }
 
+
+/// A labelled mutation applied to a copy of the manifest.
+type ManifestEdit = fn(&mut Manifest);
 #[test]
 fn committed_manifest_passes_schema_only_validation() {
     validate_dir(&parity_dir()).unwrap();
@@ -512,7 +515,7 @@ fn digests_cover_every_grammar_and_profile_entry() {
 
     // Template literals, yes/no ids and architecture parameters change the
     // grammar digest (where they are grammar) and every profile of the model.
-    let edits: [(&str, fn(&mut Manifest)); 3] = [
+    let edits: [(&str, ManifestEdit); 3] = [
         ("template", |m| {
             m.models
                 .get_mut("qwen3-reranker-0.6b")
