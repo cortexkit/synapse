@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod common;
+mod catalog_e2e;
 
 use std::{
     net::Ipv4Addr,
