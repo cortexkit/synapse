@@ -13,6 +13,11 @@ fn main() {
     ] {
         println!("cargo:rerun-if-changed={source}");
     }
+    // The Metal toolchain is located through xcrun, which follows DEVELOPER_DIR.
+    // Without this line, a build that ran while xcrun pointed at the Command
+    // Line Tools keeps its empty placeholder metallibs after DEVELOPER_DIR is
+    // set, until the crate is cleaned.
+    println!("cargo:rerun-if-env-changed=DEVELOPER_DIR");
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
         return;
