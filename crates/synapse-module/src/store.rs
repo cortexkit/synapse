@@ -710,6 +710,70 @@ const MIGRATIONS: &[Migration] = &[
                        ADD COLUMN certification_stale_since_ms INTEGER;
         "#,
     },
+    // Catalog installs, catalog download jobs and catalog-lane self-checks.
+    // Additive only: no existing table is touched.
+    Migration {
+        version: 13,
+        statements: r#"
+                   CREATE TABLE catalog_installs (
+                       catalog_id TEXT NOT NULL,
+                       manifest_digest TEXT NOT NULL,
+                       backend TEXT NOT NULL,
+                       PRIMARY KEY (catalog_id, manifest_digest, backend)
+                   );
+                   CREATE TABLE catalog_install_members (
+                       catalog_id TEXT NOT NULL,
+                       manifest_digest TEXT NOT NULL,
+                       backend TEXT NOT NULL,
+                       path TEXT NOT NULL,
+                       digest TEXT NOT NULL,
+                       PRIMARY KEY (catalog_id, manifest_digest, backend, path)
+                   );
+                   CREATE INDEX catalog_install_members_digest_idx
+                       ON catalog_install_members(digest);
+
+                   CREATE TABLE download_acquisitions (
+                       job_id TEXT NOT NULL,
+                       digest TEXT NOT NULL,
+                       newly_published INTEGER NOT NULL CHECK (newly_published IN (0, 1)),
+                       PRIMARY KEY (job_id, digest)
+                   );
+                   CREATE INDEX download_acquisitions_digest_idx
+                       ON download_acquisitions(digest);
+
+                   CREATE TABLE download_key_bindings (
+                       request_key TEXT PRIMARY KEY,
+                       request_digest TEXT NOT NULL,
+                       job_id TEXT NOT NULL
+                   );
+                   CREATE INDEX download_key_bindings_job_idx
+                       ON download_key_bindings(job_id);
+
+                   CREATE TABLE catalog_self_checks (
+                       check_id TEXT PRIMARY KEY,
+                       catalog_id TEXT NOT NULL,
+                       manifest_digest TEXT NOT NULL,
+                       backend TEXT NOT NULL,
+                       fingerprint TEXT NOT NULL,
+                       engine_identity_json TEXT NOT NULL,
+                       os_build TEXT NOT NULL,
+                       fixture_revision TEXT NOT NULL,
+                       state TEXT NOT NULL
+                           CHECK (state IN ('pending', 'running', 'passed', 'failed')),
+                       generation INTEGER NOT NULL,
+                       checked_at_ms INTEGER,
+                       reason TEXT
+                   );
+                   CREATE INDEX catalog_self_checks_lane_idx
+                       ON catalog_self_checks(catalog_id, backend);
+
+                   CREATE TABLE self_check_run_seq (
+                       id INTEGER PRIMARY KEY CHECK (id = 0),
+                       value INTEGER NOT NULL
+                   );
+                   INSERT INTO self_check_run_seq (id, value) VALUES (0, 0);
+        "#,
+    },
 ];
 
 static JOB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -722,7 +786,12 @@ const RESTORE_APPLICATION_TABLES: &[&str] = &[
     "approval_migration_markers",
     "approvals",
     "cert_row_rebuild_events",
+    "catalog_install_members",
+    "catalog_installs",
+    "catalog_self_checks",
     "cert_rows",
+    "download_acquisitions",
+    "download_key_bindings",
     "jobs",
     "knob_assignments",
     "models",
@@ -751,7 +820,10 @@ const RESTORE_KEEP_TABLES: &[&str] = &[
 // All jobs, including terminal rows, are discarded so restored request keys
 // cannot point at result pages or checkpoints from an older execution world.
 // Result/model/artifact/URL caches are also cleared rather than imported; every
-// consumer already treats their absence as a cache miss. `module_meta` is the
+// consumer already treats their absence as a cache miss. Catalog install
+// records and self-check rows are cleared the same way: the blobs stay in the
+// content-addressed cache, so the next `models.download` reuses them without
+// network I/O and the self-check reruns on first use. `module_meta` is the
 // one cache kept from the live store because its generation and table epoch
 // fence concurrent writers and must never regress to captured values.
 //
@@ -768,7 +840,12 @@ const RESTORE_CLEAR_TABLES: &[&str] = &[
     "serving_artifacts",
     "remote_checkpoints",
     "result_pages",
+    "download_key_bindings",
+    "download_acquisitions",
     "jobs",
+    "catalog_install_members",
+    "catalog_installs",
+    "catalog_self_checks",
     "profile_rotation_certification_outcomes",
     "profile_rotation_events",
     "profile_state",
@@ -784,8 +861,15 @@ const RESTORE_CLEAR_TABLES: &[&str] = &[
     "knob_assignments",
 ];
 
-const RESTORE_LIVE_ONLY_TABLES: &[&str] =
-    &["module_meta", "cortexkit_fence", "cortexkit_schema_version"];
+// `self_check_run_seq` stays with the live store for the same reason as
+// `module_meta`: its value fences late self-check completions, so it must
+// never move backwards to a captured value.
+const RESTORE_LIVE_ONLY_TABLES: &[&str] = &[
+    "module_meta",
+    "self_check_run_seq",
+    "cortexkit_fence",
+    "cortexkit_schema_version",
+];
 
 /// The reason recorded on approvals and serving approvals forced disabled during
 /// a restore operation. Restored approvals remain disabled until an operator
@@ -6459,7 +6543,7 @@ impl SynapseStore {
                 "UPDATE jobs SET state = ?1, updated_ms = ?2, terminal_at_ms = ?2,
                      execution_expires_ms = NULL, active_attempt_id = NULL,
                      error_json = ?3, result_json = NULL
-                 WHERE module_generation < ?4 AND state IN (?5, ?6, ?7)",
+                 WHERE module_generation < ?4 AND state IN (?5, ?6, ?7) AND kind <> ?8",
                 params![
                     JOB_STATE_FAILED_TRANSIENT,
                     now_ms as i64,
@@ -6468,6 +6552,10 @@ impl SynapseStore {
                     JOB_STATE_QUEUED,
                     JOB_STATE_RUNNING,
                     JOB_STATE_PAUSED_NEEDS_REAUTH,
+                    // Download jobs fail at startup through
+                    // fail_interrupted_download_jobs, which also runs their
+                    // staging and blob cleanup.
+                    DOWNLOAD_JOB_KIND,
                 ],
             )
         })?;
@@ -6552,6 +6640,1098 @@ impl SynapseStore {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Catalog installs and catalog download jobs
+// ---------------------------------------------------------------------------
+
+/// `jobs.kind` of a catalog `models.download` job.
+pub const DOWNLOAD_JOB_KIND: &str = "models.download";
+/// Download job states, stored in `jobs.state`. The first three are
+/// non-terminal; a job leaves them exactly once, through the commit, cancel or
+/// failure transaction.
+#[cfg_attr(not(test), allow(dead_code))]
+pub const DOWNLOAD_STATE_QUEUED: &str = "queued";
+#[cfg_attr(not(test), allow(dead_code))]
+pub const DOWNLOAD_STATE_DOWNLOADING: &str = "downloading";
+#[cfg_attr(not(test), allow(dead_code))]
+pub const DOWNLOAD_STATE_VERIFYING: &str = "verifying";
+#[cfg_attr(not(test), allow(dead_code))]
+pub const DOWNLOAD_STATE_COMMITTED: &str = "committed";
+#[cfg_attr(not(test), allow(dead_code))]
+pub const DOWNLOAD_STATE_FAILED: &str = "failed";
+#[cfg_attr(not(test), allow(dead_code))]
+pub const DOWNLOAD_STATE_CANCELLED: &str = "cancelled";
+/// The non-terminal download states as an SQL list, for `state IN ...`.
+#[cfg_attr(not(test), allow(dead_code))]
+const DOWNLOAD_NON_TERMINAL_SQL: &str = "('queued', 'downloading', 'verifying')";
+
+/// Engines a free-form embed or rerank registration may name. Every other
+/// engine, `ort` and `llama` included, is refused for those tasks; none of
+/// these has a CPU execution mode.
+#[cfg_attr(not(test), allow(dead_code))]
+pub const OWNED_EMBED_RERANK_ENGINES: &[&str] =
+    &["owned-metal", "ane", "owned-cuda", "owned-vulkan"];
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn is_download_non_terminal(state: &str) -> bool {
+    matches!(
+        state,
+        DOWNLOAD_STATE_QUEUED | DOWNLOAD_STATE_DOWNLOADING | DOWNLOAD_STATE_VERIFYING
+    )
+}
+
+/// The content-addressed model cache as the catalog transactions see it.
+///
+/// Catalog install members and download acquisitions root blobs that live on
+/// disk, outside SQLite, so the cleanup and quarantine transactions touch both.
+/// The store calls these methods while its transaction is open, and an error
+/// rolls the transaction back. File deletions cannot be rolled back, so every
+/// method must be safe to repeat: removing something already gone succeeds.
+///
+/// Digests are 64 lowercase hex characters with no `sha256:` prefix.
+pub trait CatalogBlobCache {
+    /// Size in bytes of the published blob, or `None` when it is absent.
+    fn blob_size(&self, digest: &str) -> std::io::Result<Option<u64>>;
+    /// Whether any `cache.pin` holds the blob.
+    fn is_pinned(&self, digest: &str) -> std::io::Result<bool>;
+    /// Drop every `cache.pin` on the blob.
+    fn remove_pins(&self, digest: &str) -> std::io::Result<()>;
+    /// Unlink the blob and its cache metadata; returns the bytes unlinked.
+    fn delete_blob(&self, digest: &str) -> std::io::Result<u64>;
+    /// Delete the job's staging directory and everything in it.
+    fn delete_staging(&self, job_id: &str) -> std::io::Result<()>;
+}
+
+/// One file of an installed catalog backend: the path the catalog gives it and
+/// the digest of the cached blob holding its bytes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogInstallMember {
+    pub path: String,
+    pub digest: String,
+}
+
+/// The install record of one catalog backend for one manifest, with its member
+/// rows. Member rows are the only source for which blobs an install references.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogInstallRecord {
+    pub catalog_id: String,
+    pub manifest_digest: String,
+    pub backend: String,
+    pub members: Vec<CatalogInstallMember>,
+}
+
+/// A blob a download job published or reused and has not yet committed.
+/// `newly_published` is true when the job (or, after a hand-off, another job
+/// whose cleanup left it here) created the blob, so the job's cleanup may
+/// delete it; a pre-existing blob is never deleted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DownloadAcquisition {
+    pub job_id: String,
+    pub digest: String,
+    pub newly_published: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DownloadKeyBinding {
+    pub request_key: String,
+    pub request_digest: String,
+    pub job_id: String,
+}
+
+/// Inputs to [`SynapseStore::admit_download_job`].
+#[derive(Clone, Debug)]
+pub struct DownloadJobRequest<'a> {
+    /// The caller's request key, already defaulted when it was blank.
+    pub request_key: &'a str,
+    /// The digest of `{catalog_id, manifest_digest}`. All downloads of one
+    /// entry manifest share it, which is how they share one job.
+    pub request_digest: &'a str,
+    pub module_generation: u64,
+    pub params_json: &'a Value,
+    pub now_ms: u64,
+    pub result_retention_ttl_ms: u64,
+    /// Whether the entry is complete right now. A key bound to a committed job
+    /// returns that job only while this holds; otherwise it binds to a fresh
+    /// job that repairs or finishes the install.
+    pub entry_complete: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DownloadAdmission {
+    /// A new job was minted and the key bound to it.
+    Created(JobRecord),
+    /// The key now refers to an existing job.
+    Attached(JobRecord),
+}
+
+impl DownloadAdmission {
+    #[must_use]
+    pub fn record(&self) -> &JobRecord {
+        match self {
+            DownloadAdmission::Created(record) | DownloadAdmission::Attached(record) => record,
+        }
+    }
+}
+
+/// Result of [`SynapseStore::record_download_publication`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DownloadPublication {
+    /// The acquisition row is written; the caller may publish the blob.
+    Proceed { newly_published: bool },
+    /// The job is already terminal; nothing was written and the caller must
+    /// not publish.
+    Stopped(JobRecord),
+}
+
+/// Result of [`SynapseStore::root_reused_download_blob`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DownloadReuse {
+    /// The blob is present with its size and now rooted by this job.
+    Rooted,
+    /// The blob is absent or has the wrong size; nothing was written and the
+    /// caller must fetch the file.
+    Absent,
+    /// The job is already terminal; nothing was written.
+    Stopped(JobRecord),
+}
+
+/// How a cancel or failure ends a download job.
+#[derive(Clone, Copy, Debug)]
+pub enum DownloadEnd<'a> {
+    Cancelled,
+    Failed { error_json: &'a Value },
+}
+
+/// What a cancel or failure cleanup did with the job's acquired blobs.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DownloadCleanup {
+    /// Newly published blobs nothing else referenced, now unlinked.
+    pub deleted_blobs: Vec<String>,
+    /// Bytes those unlinks freed.
+    pub freed_bytes: u64,
+    /// Newly published blobs another job had also acquired; that job's
+    /// acquisition row now carries `newly_published`, so its own cleanup
+    /// deletes the blob if it too ends without committing.
+    pub handed_off: Vec<String>,
+    /// Newly published blobs kept because a member row, a `cache.pin` or a
+    /// free-form registration references them.
+    pub kept: Vec<String>,
+}
+
+/// Outcome of a compare-and-swap that ends a download job.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DownloadTransition {
+    /// This call moved the job to its terminal state.
+    Applied {
+        record: JobRecord,
+        cleanup: DownloadCleanup,
+    },
+    /// The job was already terminal, so the call changed nothing. Carries the
+    /// job as it stands, or `None` when no download job has that id.
+    Unchanged(Option<JobRecord>),
+}
+
+/// The key of one catalog install record.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CatalogInstallKey {
+    pub catalog_id: String,
+    pub manifest_digest: String,
+    pub backend: String,
+}
+
+/// What [`SynapseStore::quarantine_catalog_blob`] removed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct QuarantineReport {
+    /// Install records deleted because one of their members named the blob.
+    pub removed_installs: Vec<CatalogInstallKey>,
+    /// Non-terminal download jobs failed because they had acquired the blob.
+    pub failed_jobs: Vec<String>,
+    /// Bytes unlinked: the quarantined blob plus the failed jobs' cleanup.
+    pub freed_bytes: u64,
+}
+
+/// What [`SynapseStore::reconcile_persisted_registrations`] decided for the
+/// persisted `models` rows at startup.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RegistrationReconciliation {
+    /// Rows the runtime may register, in `catalog_models` order.
+    pub registrable: Vec<StoredModelConfig>,
+    /// `(model_id, engine)` of embed/rerank rows deleted because their engine
+    /// is outside [`OWNED_EMBED_RERANK_ENGINES`].
+    pub deleted: Vec<(String, String)>,
+    /// Blob digests whose `cache.pin` was dropped with a deleted row.
+    pub unpinned_digests: Vec<String>,
+    /// Rows kept in the table but not registered because their `model_id` is
+    /// catalog-reserved.
+    pub skipped_reserved: Vec<String>,
+}
+
+// The module's download, serving and startup paths call these; until they are
+// wired in, a non-test build sees some of them unused.
+#[cfg_attr(not(test), allow(dead_code))]
+impl SynapseStore {
+    /// Bind a `models.download` request key to a job, minting the job when
+    /// needed. At most one non-terminal download job exists per request digest
+    /// (that is, per catalog entry manifest), and every key for that digest
+    /// attaches to it. A key keeps returning its committed job only while the
+    /// entry is complete. A key bound to a different digest is an
+    /// [`SynapseStoreError::IdempotencyConflict`].
+    ///
+    /// The job row gets the internal request key `models.download:<job_id>`,
+    /// because `jobs.request_key` lookups belong to `admit_job`, and no
+    /// execution deadline: download jobs end only through their own
+    /// transactions.
+    pub fn admit_download_job(
+        &self,
+        request: &DownloadJobRequest<'_>,
+    ) -> Result<DownloadAdmission, SynapseStoreError> {
+        enum TxAdmission {
+            Ready(DownloadAdmission),
+            Conflict(String),
+        }
+
+        let params_bytes = serde_json::to_vec(request.params_json)?;
+        let admission = self.store.with_conn_fenced(|tx| {
+            let now_ms = request.now_ms as i64;
+            expire_jobs_tx(tx, now_ms)?;
+            purge_retained_jobs_tx(tx, now_ms)?;
+            if let Some(binding) = download_key_binding_tx(tx, request.request_key)? {
+                if binding.request_digest != request.request_digest {
+                    return Ok(TxAdmission::Conflict(binding.request_digest));
+                }
+                if let Some(job) = job_by_id_tx(tx, &binding.job_id)? {
+                    let reusable = is_download_non_terminal(&job.state)
+                        || (job.state == DOWNLOAD_STATE_COMMITTED && request.entry_complete);
+                    if reusable {
+                        return Ok(TxAdmission::Ready(DownloadAdmission::Attached(job)));
+                    }
+                }
+            }
+
+            let admission = match active_download_job_tx(tx, request.request_digest)? {
+                Some(job) => DownloadAdmission::Attached(job),
+                None => {
+                    let job_id = new_job_id(
+                        request.request_key,
+                        request.module_generation,
+                        request.now_ms,
+                    );
+                    tx.execute(
+                        "INSERT INTO jobs (
+                             job_id, request_key, request_digest, kind, module_generation,
+                             state, created_ms, updated_ms, execution_expires_ms,
+                             result_retention_ttl_ms, terminal_at_ms, active_attempt_id,
+                             logical_handle, paused_at_ms, resume_deadline_ms, params_json,
+                             result_json, error_json, page_count
+                         ) VALUES (
+                             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, NULL, ?8, NULL, NULL,
+                             NULL, NULL, NULL, ?9, NULL, NULL, 0
+                         )",
+                        params![
+                            job_id,
+                            format!("{DOWNLOAD_JOB_KIND}:{job_id}"),
+                            request.request_digest,
+                            DOWNLOAD_JOB_KIND,
+                            request.module_generation as i64,
+                            DOWNLOAD_STATE_QUEUED,
+                            now_ms,
+                            request.result_retention_ttl_ms as i64,
+                            &params_bytes,
+                        ],
+                    )?;
+                    DownloadAdmission::Created(
+                        job_by_id_tx(tx, &job_id)?.expect("inserted download job is readable"),
+                    )
+                }
+            };
+            tx.execute(
+                "INSERT INTO download_key_bindings (request_key, request_digest, job_id)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(request_key) DO UPDATE SET
+                     request_digest = excluded.request_digest,
+                     job_id = excluded.job_id",
+                params![
+                    request.request_key,
+                    request.request_digest,
+                    admission.record().job_id,
+                ],
+            )?;
+            Ok(TxAdmission::Ready(admission))
+        })?;
+        match admission {
+            TxAdmission::Ready(admission) => Ok(admission),
+            TxAdmission::Conflict(existing_digest) => Err(SynapseStoreError::IdempotencyConflict {
+                request_key: request.request_key.to_string(),
+                existing_digest,
+                requested_digest: request.request_digest.to_string(),
+            }),
+        }
+    }
+
+    /// Move a non-terminal download job to `downloading` or `verifying`.
+    /// Returns false when the job is already terminal.
+    pub fn advance_download_job(
+        &self,
+        job_id: &str,
+        state: &str,
+        now_ms: u64,
+    ) -> Result<bool, SynapseStoreError> {
+        if state != DOWNLOAD_STATE_DOWNLOADING && state != DOWNLOAD_STATE_VERIFYING {
+            return Err(SynapseStoreError::Decode(format!(
+                "download job progress cannot move to state '{state}'"
+            )));
+        }
+        let changed = self.store.with_conn_fenced(|tx| {
+            tx.execute(
+                &format!(
+                    "UPDATE jobs SET state = ?1, updated_ms = ?2
+                     WHERE job_id = ?3 AND kind = ?4 AND state IN {DOWNLOAD_NON_TERMINAL_SQL}"
+                ),
+                params![state, now_ms as i64, job_id, DOWNLOAD_JOB_KIND],
+            )
+        })?;
+        Ok(changed > 0)
+    }
+
+    /// Write the acquisition row for a blob the job is about to publish.
+    ///
+    /// The caller holds the job's publish lock, which the commit, cancel and
+    /// failure paths also take, and publishes only on `Proceed`. So no blob is
+    /// published after the job is terminal, and every published blob has a row
+    /// its cleanup will see. `newly_published` is true only when the blob is
+    /// absent now; a row this job already holds keeps `newly_published` if
+    /// either write set it.
+    pub fn record_download_publication(
+        &self,
+        job_id: &str,
+        digest: &str,
+        cache: &dyn CatalogBlobCache,
+    ) -> Result<DownloadPublication, SynapseStoreError> {
+        let digest = normalize_blob_digest(digest)?;
+        let publication = self.store.with_conn_fenced(|tx| {
+            if let Some(stopped) = stopped_download_job_tx(tx, job_id)? {
+                return Ok(DownloadPublication::Stopped(stopped));
+            }
+            let newly_published = cache
+                .blob_size(&digest)
+                .map_err(|error| cache_error("stat blob", &digest, error))?
+                .is_none();
+            tx.execute(
+                "INSERT INTO download_acquisitions (job_id, digest, newly_published)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(job_id, digest) DO UPDATE SET
+                     newly_published = MAX(newly_published, excluded.newly_published)",
+                params![job_id, digest, newly_published],
+            )?;
+            Ok(DownloadPublication::Proceed { newly_published })
+        })?;
+        Ok(publication)
+    }
+
+    /// Root an already-cached blob for this job instead of fetching it.
+    ///
+    /// In one transaction the job confirms the blob is present with
+    /// `size_bytes` and writes its acquisition row with `newly_published`
+    /// false, so another job's cleanup cannot delete the blob before this job
+    /// commits or ends, and this job's own cleanup never deletes it.
+    pub fn root_reused_download_blob(
+        &self,
+        job_id: &str,
+        digest: &str,
+        size_bytes: u64,
+        cache: &dyn CatalogBlobCache,
+    ) -> Result<DownloadReuse, SynapseStoreError> {
+        let digest = normalize_blob_digest(digest)?;
+        let reuse = self.store.with_conn_fenced(|tx| {
+            if let Some(stopped) = stopped_download_job_tx(tx, job_id)? {
+                return Ok(DownloadReuse::Stopped(stopped));
+            }
+            let present = cache
+                .blob_size(&digest)
+                .map_err(|error| cache_error("stat blob", &digest, error))?;
+            if present != Some(size_bytes) {
+                return Ok(DownloadReuse::Absent);
+            }
+            tx.execute(
+                "INSERT INTO download_acquisitions (job_id, digest, newly_published)
+                 VALUES (?1, ?2, 0)
+                 ON CONFLICT(job_id, digest) DO NOTHING",
+                params![job_id, digest],
+            )?;
+            Ok(DownloadReuse::Rooted)
+        })?;
+        Ok(reuse)
+    }
+
+    /// Commit a download job: compare-and-swap from a non-terminal state to
+    /// `committed`, in one transaction that writes an install record with its
+    /// member rows for every backend in `installs` (the job's target set,
+    /// whether or not any byte was fetched), replacing any earlier member set
+    /// for the same record, and deletes the job's acquisition rows, whose
+    /// blobs the member rows now root. Commit never runs cleanup. If the job
+    /// is already terminal nothing changes.
+    pub fn commit_download_job(
+        &self,
+        job_id: &str,
+        installs: &[CatalogInstallRecord],
+        now_ms: u64,
+    ) -> Result<DownloadTransition, SynapseStoreError> {
+        let installs = installs
+            .iter()
+            .map(normalize_install_record)
+            .collect::<Result<Vec<_>, _>>()?;
+        let transition = self.store.with_conn_fenced(|tx| {
+            let changed = tx.execute(
+                &format!(
+                    "UPDATE jobs SET state = ?1, updated_ms = ?2, terminal_at_ms = ?2,
+                         execution_expires_ms = NULL, active_attempt_id = NULL,
+                         error_json = NULL
+                     WHERE job_id = ?3 AND kind = ?4 AND state IN {DOWNLOAD_NON_TERMINAL_SQL}"
+                ),
+                params![
+                    DOWNLOAD_STATE_COMMITTED,
+                    now_ms as i64,
+                    job_id,
+                    DOWNLOAD_JOB_KIND
+                ],
+            )?;
+            if changed == 0 {
+                return Ok(DownloadTransition::Unchanged(download_job_tx(tx, job_id)?));
+            }
+            for install in &installs {
+                tx.execute(
+                    "DELETE FROM catalog_install_members
+                     WHERE catalog_id = ?1 AND manifest_digest = ?2 AND backend = ?3",
+                    params![install.catalog_id, install.manifest_digest, install.backend],
+                )?;
+                tx.execute(
+                    "INSERT OR IGNORE INTO catalog_installs (catalog_id, manifest_digest, backend)
+                     VALUES (?1, ?2, ?3)",
+                    params![install.catalog_id, install.manifest_digest, install.backend],
+                )?;
+                for member in &install.members {
+                    tx.execute(
+                        "INSERT INTO catalog_install_members (
+                             catalog_id, manifest_digest, backend, path, digest
+                         ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![
+                            install.catalog_id,
+                            install.manifest_digest,
+                            install.backend,
+                            member.path,
+                            member.digest,
+                        ],
+                    )?;
+                }
+            }
+            tx.execute(
+                "DELETE FROM download_acquisitions WHERE job_id = ?1",
+                params![job_id],
+            )?;
+            Ok(DownloadTransition::Applied {
+                record: job_by_id_tx(tx, job_id)?.expect("committed download job is readable"),
+                cleanup: DownloadCleanup::default(),
+            })
+        })?;
+        Ok(transition)
+    }
+
+    /// Cancel or fail a download job: compare-and-swap from a non-terminal
+    /// state, and in the same transaction run the job's cleanup (see
+    /// [`DownloadCleanup`]). A job that already committed, or already ended,
+    /// is left unchanged.
+    pub fn end_download_job(
+        &self,
+        job_id: &str,
+        end: DownloadEnd<'_>,
+        cache: &dyn CatalogBlobCache,
+        now_ms: u64,
+    ) -> Result<DownloadTransition, SynapseStoreError> {
+        let (state, error_bytes) = download_end_columns(end)?;
+        let transition = self.store.with_conn_fenced(|tx| {
+            let Some(cleanup) = end_download_job_tx(
+                tx,
+                job_id,
+                state,
+                error_bytes.as_deref(),
+                now_ms,
+                cache,
+                None,
+            )?
+            else {
+                return Ok(DownloadTransition::Unchanged(download_job_tx(tx, job_id)?));
+            };
+            Ok(DownloadTransition::Applied {
+                record: job_by_id_tx(tx, job_id)?.expect("ended download job is readable"),
+                cleanup,
+            })
+        })?;
+        Ok(transition)
+    }
+
+    /// Fail, with cleanup, every non-terminal download job minted by an
+    /// earlier module generation. Runs at startup, before any new download
+    /// job exists; a job whose process died has no one left to finish it.
+    /// Returns the ids of the failed jobs.
+    pub fn fail_interrupted_download_jobs(
+        &self,
+        current_generation: u64,
+        error_json: &Value,
+        cache: &dyn CatalogBlobCache,
+        now_ms: u64,
+    ) -> Result<Vec<String>, SynapseStoreError> {
+        let error_bytes = serde_json::to_vec(error_json)?;
+        let failed = self.store.with_conn_fenced(|tx| {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT job_id FROM jobs
+                 WHERE kind = ?1 AND module_generation < ?2
+                   AND state IN {DOWNLOAD_NON_TERMINAL_SQL}
+                 ORDER BY created_ms, job_id"
+            ))?;
+            let job_ids = stmt
+                .query_map(
+                    params![DOWNLOAD_JOB_KIND, current_generation as i64],
+                    |row| row.get::<_, String>(0),
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(stmt);
+            let mut failed = Vec::new();
+            for job_id in job_ids {
+                if end_download_job_tx(
+                    tx,
+                    &job_id,
+                    DOWNLOAD_STATE_FAILED,
+                    Some(&error_bytes),
+                    now_ms,
+                    cache,
+                    None,
+                )?
+                .is_some()
+                {
+                    failed.push(job_id);
+                }
+            }
+            Ok(failed)
+        })?;
+        Ok(failed)
+    }
+
+    /// Quarantine a cached blob whose bytes no longer match their digest.
+    ///
+    /// One transaction fails every non-terminal download job holding an
+    /// acquisition row for the blob (running that job's cleanup), deletes
+    /// every install record with a member naming the blob and the member rows
+    /// naming it, drops the blob's `cache.pin`s and unlinks the blob. Other
+    /// blobs are untouched: an affected install's other member rows stay, so
+    /// those blobs remain rooted and the next download reuses them and fetches
+    /// only the quarantined file. The commit that reinstalls the backend
+    /// replaces its member set. A free-form registration naming the blob stays
+    /// registered; its next load finds the blob missing.
+    pub fn quarantine_catalog_blob(
+        &self,
+        digest: &str,
+        job_error_json: &Value,
+        cache: &dyn CatalogBlobCache,
+        now_ms: u64,
+    ) -> Result<QuarantineReport, SynapseStoreError> {
+        let digest = normalize_blob_digest(digest)?;
+        let error_bytes = serde_json::to_vec(job_error_json)?;
+        let report = self.store.with_conn_fenced(|tx| {
+            let mut report = QuarantineReport::default();
+            let mut stmt = tx.prepare(&format!(
+                "SELECT DISTINCT a.job_id FROM download_acquisitions a
+                 JOIN jobs j ON j.job_id = a.job_id
+                 WHERE a.digest = ?1 AND j.kind = ?2
+                   AND j.state IN {DOWNLOAD_NON_TERMINAL_SQL}
+                 ORDER BY a.job_id"
+            ))?;
+            let holders = stmt
+                .query_map(params![digest, DOWNLOAD_JOB_KIND], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(stmt);
+            for job_id in holders {
+                if let Some(cleanup) = end_download_job_tx(
+                    tx,
+                    &job_id,
+                    DOWNLOAD_STATE_FAILED,
+                    Some(&error_bytes),
+                    now_ms,
+                    cache,
+                    Some(&digest),
+                )? {
+                    report.freed_bytes = report.freed_bytes.saturating_add(cleanup.freed_bytes);
+                    report.failed_jobs.push(job_id);
+                }
+            }
+
+            let mut stmt = tx.prepare(
+                "SELECT DISTINCT catalog_id, manifest_digest, backend
+                 FROM catalog_install_members WHERE digest = ?1
+                 ORDER BY catalog_id, manifest_digest, backend",
+            )?;
+            let installs = stmt
+                .query_map(params![digest], |row| {
+                    Ok(CatalogInstallKey {
+                        catalog_id: row.get(0)?,
+                        manifest_digest: row.get(1)?,
+                        backend: row.get(2)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(stmt);
+            for install in &installs {
+                tx.execute(
+                    "DELETE FROM catalog_installs
+                     WHERE catalog_id = ?1 AND manifest_digest = ?2 AND backend = ?3",
+                    params![install.catalog_id, install.manifest_digest, install.backend],
+                )?;
+            }
+            report.removed_installs = installs;
+            tx.execute(
+                "DELETE FROM catalog_install_members WHERE digest = ?1",
+                params![digest],
+            )?;
+
+            cache
+                .remove_pins(&digest)
+                .map_err(|error| cache_error("remove pins of", &digest, error))?;
+            let freed = cache
+                .delete_blob(&digest)
+                .map_err(|error| cache_error("delete blob", &digest, error))?;
+            report.freed_bytes = report.freed_bytes.saturating_add(freed);
+            Ok(report)
+        })?;
+        Ok(report)
+    }
+
+    /// Decide at startup what to do with each persisted `models` row, which
+    /// the runtime restores without `model.load` validation.
+    ///
+    /// An embed or rerank row whose engine is outside
+    /// [`OWNED_EMBED_RERANK_ENGINES`] is deleted, and the `cache.pin` on each
+    /// blob it named is dropped unless a remaining row also names that blob,
+    /// so `cache.gc` can reclaim it. A row whose `model_id` is catalog-reserved
+    /// (`is_reserved`) stays in the table but is not returned as registrable.
+    /// Every other row is registrable.
+    pub fn reconcile_persisted_registrations(
+        &self,
+        is_reserved: &dyn Fn(&str) -> bool,
+        cache: &dyn CatalogBlobCache,
+    ) -> Result<RegistrationReconciliation, SynapseStoreError> {
+        let reconciliation = self.store.with_conn_fenced(|tx| {
+            let mut stmt = tx.prepare(
+                "SELECT model_id, engine, task, config_json FROM models
+                 ORDER BY created_ms ASC, model_id ASC",
+            )?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(stmt);
+
+            let mut reconciliation = RegistrationReconciliation::default();
+            let mut released = BTreeSet::new();
+            for (model_id, engine, task, config_json) in rows {
+                let embed_or_rerank = task == "embed" || task == "rerank";
+                if embed_or_rerank && !OWNED_EMBED_RERANK_ENGINES.contains(&engine.as_str()) {
+                    tx.execute("DELETE FROM models WHERE model_id = ?1", params![model_id])?;
+                    released.extend(registration_blob_digests(&config_json));
+                    reconciliation.deleted.push((model_id, engine));
+                } else if is_reserved(&model_id) {
+                    reconciliation.skipped_reserved.push(model_id);
+                } else {
+                    reconciliation
+                        .registrable
+                        .push(decode_model_config(config_json)?);
+                }
+            }
+            for digest in released {
+                if free_form_references_digest_tx(tx, &digest)? {
+                    continue;
+                }
+                cache
+                    .remove_pins(&digest)
+                    .map_err(|error| cache_error("remove pins of", &digest, error))?;
+                reconciliation.unpinned_digests.push(digest);
+            }
+            Ok(reconciliation)
+        })?;
+        Ok(reconciliation)
+    }
+
+    /// Every install record of a catalog entry, current and stale manifests
+    /// alike, with its member rows.
+    pub fn catalog_installs(
+        &self,
+        catalog_id: &str,
+    ) -> Result<Vec<CatalogInstallRecord>, SynapseStoreError> {
+        let installs = self.store.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT manifest_digest, backend FROM catalog_installs
+                 WHERE catalog_id = ?1 ORDER BY manifest_digest, backend",
+            )?;
+            let keys = stmt
+                .query_map(params![catalog_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut members = conn.prepare(
+                "SELECT path, digest FROM catalog_install_members
+                 WHERE catalog_id = ?1 AND manifest_digest = ?2 AND backend = ?3
+                 ORDER BY path",
+            )?;
+            let mut installs = Vec::with_capacity(keys.len());
+            for (manifest_digest, backend) in keys {
+                let rows = members
+                    .query_map(params![catalog_id, manifest_digest, backend], |row| {
+                        Ok(CatalogInstallMember {
+                            path: row.get(0)?,
+                            digest: row.get(1)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                installs.push(CatalogInstallRecord {
+                    catalog_id: catalog_id.to_string(),
+                    manifest_digest,
+                    backend,
+                    members: rows,
+                });
+            }
+            Ok(installs)
+        })?;
+        Ok(installs)
+    }
+
+    /// The acquisition rows a download job holds.
+    pub fn download_acquisitions(
+        &self,
+        job_id: &str,
+    ) -> Result<Vec<DownloadAcquisition>, SynapseStoreError> {
+        let rows = self.store.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT job_id, digest, newly_published FROM download_acquisitions
+                 WHERE job_id = ?1 ORDER BY digest",
+            )?;
+            let rows = stmt
+                .query_map(params![job_id], |row| {
+                    Ok(DownloadAcquisition {
+                        job_id: row.get(0)?,
+                        digest: row.get(1)?,
+                        newly_published: row.get(2)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })?;
+        Ok(rows)
+    }
+
+    pub fn download_key_binding(
+        &self,
+        request_key: &str,
+    ) -> Result<Option<DownloadKeyBinding>, SynapseStoreError> {
+        let binding = self
+            .store
+            .with_conn_fenced(|tx| download_key_binding_tx(tx, request_key))?;
+        Ok(binding)
+    }
+
+    /// The non-terminal download job for a request digest, if one exists.
+    pub fn active_download_job(
+        &self,
+        request_digest: &str,
+    ) -> Result<Option<JobRecord>, SynapseStoreError> {
+        let job = self
+            .store
+            .with_conn_fenced(|tx| active_download_job_tx(tx, request_digest))?;
+        Ok(job)
+    }
+}
+
+fn download_end_columns(
+    end: DownloadEnd<'_>,
+) -> Result<(&'static str, Option<Vec<u8>>), SynapseStoreError> {
+    Ok(match end {
+        DownloadEnd::Cancelled => (DOWNLOAD_STATE_CANCELLED, None),
+        DownloadEnd::Failed { error_json } => {
+            (DOWNLOAD_STATE_FAILED, Some(serde_json::to_vec(error_json)?))
+        }
+    })
+}
+
+/// Compare-and-swap a download job into `state` (cancelled or failed) and run
+/// its cleanup. Returns `None`, changing nothing, when the job is not a
+/// non-terminal download job. `quarantined` names a blob the caller deletes
+/// itself, which the cleanup therefore leaves alone.
+#[cfg_attr(not(test), allow(dead_code))]
+fn end_download_job_tx(
+    tx: &rusqlite::Transaction<'_>,
+    job_id: &str,
+    state: &str,
+    error_bytes: Option<&[u8]>,
+    now_ms: u64,
+    cache: &dyn CatalogBlobCache,
+    quarantined: Option<&str>,
+) -> rusqlite::Result<Option<DownloadCleanup>> {
+    let changed = tx.execute(
+        &format!(
+            "UPDATE jobs SET state = ?1, updated_ms = ?2, terminal_at_ms = ?2,
+                 execution_expires_ms = NULL, active_attempt_id = NULL,
+                 error_json = ?3, result_json = NULL
+             WHERE job_id = ?4 AND kind = ?5 AND state IN {DOWNLOAD_NON_TERMINAL_SQL}"
+        ),
+        params![state, now_ms as i64, error_bytes, job_id, DOWNLOAD_JOB_KIND],
+    )?;
+    if changed == 0 {
+        return Ok(None);
+    }
+    cleanup_download_job_tx(tx, job_id, cache, quarantined).map(Some)
+}
+
+/// Cleanup for a download job that ends without committing. It runs only in
+/// the transaction that moves the job to `cancelled` or `failed`.
+///
+/// The staging directory is deleted. Each newly published blob is then
+/// handed off when another job also acquired it (that job's row takes over
+/// `newly_published`), kept when a member row, a `cache.pin` or a free-form
+/// registration references it, and otherwise unlinked. Blobs the job only
+/// reused are pre-existing and never deleted. Finally the job's acquisition
+/// rows go.
+#[cfg_attr(not(test), allow(dead_code))]
+fn cleanup_download_job_tx(
+    tx: &rusqlite::Transaction<'_>,
+    job_id: &str,
+    cache: &dyn CatalogBlobCache,
+    quarantined: Option<&str>,
+) -> rusqlite::Result<DownloadCleanup> {
+    cache
+        .delete_staging(job_id)
+        .map_err(|error| cache_error("delete staging of job", job_id, error))?;
+    let mut stmt = tx.prepare(
+        "SELECT digest FROM download_acquisitions
+         WHERE job_id = ?1 AND newly_published = 1 ORDER BY digest",
+    )?;
+    let published = stmt
+        .query_map(params![job_id], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(stmt);
+
+    let mut cleanup = DownloadCleanup::default();
+    for digest in published {
+        if quarantined == Some(digest.as_str()) {
+            continue;
+        }
+        let handed_off = tx.execute(
+            "UPDATE download_acquisitions SET newly_published = 1
+             WHERE digest = ?1 AND job_id <> ?2",
+            params![digest, job_id],
+        )?;
+        if handed_off > 0 {
+            cleanup.handed_off.push(digest);
+            continue;
+        }
+        let member: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM catalog_install_members WHERE digest = ?1)",
+            params![digest],
+            |row| row.get(0),
+        )?;
+        let pinned = cache
+            .is_pinned(&digest)
+            .map_err(|error| cache_error("read pins of", &digest, error))?;
+        if member || pinned || free_form_references_digest_tx(tx, &digest)? {
+            cleanup.kept.push(digest);
+            continue;
+        }
+        let freed = cache
+            .delete_blob(&digest)
+            .map_err(|error| cache_error("delete blob", &digest, error))?;
+        cleanup.freed_bytes = cleanup.freed_bytes.saturating_add(freed);
+        cleanup.deleted_blobs.push(digest);
+    }
+    tx.execute(
+        "DELETE FROM download_acquisitions WHERE job_id = ?1",
+        params![job_id],
+    )?;
+    Ok(cleanup)
+}
+
+/// Whether a persisted free-form registration names the blob. The check is a
+/// substring match over the stored config JSON, so it errs towards keeping a
+/// blob: any locator, artifact digest or other field carrying the digest
+/// counts, in either case and with or without the `sha256:` prefix.
+#[cfg_attr(not(test), allow(dead_code))]
+fn free_form_references_digest_tx(
+    tx: &rusqlite::Transaction<'_>,
+    digest: &str,
+) -> rusqlite::Result<bool> {
+    tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM models WHERE instr(lower(CAST(config_json AS TEXT)), ?1) > 0
+         )",
+        params![digest.to_ascii_lowercase()],
+        |row| row.get(0),
+    )
+}
+
+/// The blob digests a stored registration names: every `digest` or
+/// `artifact_digest` string field anywhere in its config that is a sha256.
+/// Read from raw JSON so a row this binary can no longer decode still
+/// releases its pins.
+#[cfg_attr(not(test), allow(dead_code))]
+fn registration_blob_digests(config_json: &[u8]) -> BTreeSet<String> {
+    fn collect(value: &Value, digests: &mut BTreeSet<String>) {
+        match value {
+            Value::Object(fields) => {
+                for (key, field) in fields {
+                    if key == "digest" || key == "artifact_digest" {
+                        if let Some(digest) = field
+                            .as_str()
+                            .and_then(|text| normalize_blob_digest(text).ok())
+                        {
+                            digests.insert(digest);
+                        }
+                    }
+                    collect(field, digests);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    collect(item, digests);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut digests = BTreeSet::new();
+    if let Ok(value) = serde_json::from_slice::<Value>(config_json) {
+        collect(&value, &mut digests);
+    }
+    digests
+}
+
+/// The job, when it is a download job that can no longer acquire blobs
+/// because it is terminal. `None` means it is still running. An id that names
+/// no download job is an error: only a running job's own worker calls this.
+#[cfg_attr(not(test), allow(dead_code))]
+fn stopped_download_job_tx(
+    tx: &rusqlite::Transaction<'_>,
+    job_id: &str,
+) -> rusqlite::Result<Option<JobRecord>> {
+    let job = download_job_tx(tx, job_id)?.ok_or_else(|| {
+        rusqlite::Error::InvalidParameterName(format!("no download job '{job_id}'"))
+    })?;
+    if is_download_non_terminal(&job.state) {
+        Ok(None)
+    } else {
+        Ok(Some(job))
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn download_job_tx(
+    tx: &rusqlite::Transaction<'_>,
+    job_id: &str,
+) -> rusqlite::Result<Option<JobRecord>> {
+    Ok(job_by_id_tx(tx, job_id)?.filter(|job| job.kind == DOWNLOAD_JOB_KIND))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn active_download_job_tx(
+    tx: &rusqlite::Transaction<'_>,
+    request_digest: &str,
+) -> rusqlite::Result<Option<JobRecord>> {
+    let sql = format!(
+        "{JOB_SELECT_SQL} WHERE kind = ?1 AND request_digest = ?2
+           AND state IN {DOWNLOAD_NON_TERMINAL_SQL}
+         ORDER BY created_ms DESC, rowid DESC LIMIT 1"
+    );
+    tx.query_row(&sql, params![DOWNLOAD_JOB_KIND, request_digest], row_to_job)
+        .optional()
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn download_key_binding_tx(
+    tx: &rusqlite::Transaction<'_>,
+    request_key: &str,
+) -> rusqlite::Result<Option<DownloadKeyBinding>> {
+    tx.query_row(
+        "SELECT request_key, request_digest, job_id FROM download_key_bindings
+         WHERE request_key = ?1",
+        params![request_key],
+        |row| {
+            Ok(DownloadKeyBinding {
+                request_key: row.get(0)?,
+                request_digest: row.get(1)?,
+                job_id: row.get(2)?,
+            })
+        },
+    )
+    .optional()
+}
+
+/// A blob digest in the form the catalog tables store: 64 lowercase hex
+/// characters, with any `sha256:` prefix removed.
+#[cfg_attr(not(test), allow(dead_code))]
+fn normalize_blob_digest(value: &str) -> Result<String, SynapseStoreError> {
+    let raw = value.strip_prefix("sha256:").unwrap_or(value);
+    if raw.len() != 64 || !raw.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(SynapseStoreError::Decode(format!(
+            "blob digest must be 64 hex characters, got '{value}'"
+        )));
+    }
+    Ok(raw.to_ascii_lowercase())
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn normalize_install_record(
+    record: &CatalogInstallRecord,
+) -> Result<CatalogInstallRecord, SynapseStoreError> {
+    if record.catalog_id.is_empty()
+        || record.manifest_digest.is_empty()
+        || record.backend.is_empty()
+    {
+        return Err(SynapseStoreError::Decode(
+            "catalog install records need a catalog id, manifest digest and backend".to_string(),
+        ));
+    }
+    let members = record
+        .members
+        .iter()
+        .map(|member| {
+            if member.path.is_empty() {
+                return Err(SynapseStoreError::Decode(format!(
+                    "catalog install member of {} has an empty path",
+                    record.catalog_id
+                )));
+            }
+            Ok(CatalogInstallMember {
+                path: member.path.clone(),
+                digest: normalize_blob_digest(&member.digest)?,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(CatalogInstallRecord {
+        members,
+        ..record.clone()
+    })
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn cache_error(action: &str, subject: &str, error: std::io::Error) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
+        error.kind(),
+        format!("model cache: {action} {subject}: {error}"),
+    )))
+}
 fn expire_jobs_tx(tx: &rusqlite::Transaction<'_>, now_ms: i64) -> rusqlite::Result<usize> {
     let execution_error = serde_json::to_vec(&serde_json::json!({
         "code": "deadline_exceeded",
@@ -6567,16 +7747,21 @@ fn expire_jobs_tx(tx: &rusqlite::Transaction<'_>, now_ms: i64) -> rusqlite::Resu
         "message": "credential reauthentication deadline expired",
     }))
     .expect("reauth expiry error serializes");
+    // Download jobs have no execution TTL: they are admitted with a NULL
+    // execution_expires_ms, and the kind filter keeps them exempt even if a
+    // deadline were ever written. They end only through their own commit,
+    // cancel or failure transactions, which also clean up their blobs.
     let execution_expired = tx.execute(
         "UPDATE jobs SET state = ?1, updated_ms = ?2, terminal_at_ms = ?2,
              execution_expires_ms = NULL, active_attempt_id = NULL, error_json = ?3
-         WHERE state IN (?4, ?5) AND execution_expires_ms <= ?2",
+         WHERE state IN (?4, ?5) AND execution_expires_ms <= ?2 AND kind <> ?6",
         params![
             JOB_STATE_FAILED_TRANSIENT,
             now_ms,
             execution_error,
             JOB_STATE_QUEUED,
             JOB_STATE_RUNNING,
+            DOWNLOAD_JOB_KIND,
         ],
     )?;
     let reauth_expired = tx.execute(
@@ -6615,7 +7800,8 @@ fn expire_job_tx(
     tx.execute(
         "UPDATE jobs SET state = ?1, updated_ms = ?2, terminal_at_ms = ?2,
              execution_expires_ms = NULL, active_attempt_id = NULL, error_json = ?3
-         WHERE job_id = ?4 AND state IN (?5, ?6) AND execution_expires_ms <= ?2",
+         WHERE job_id = ?4 AND state IN (?5, ?6) AND execution_expires_ms <= ?2
+           AND kind <> ?7",
         params![
             JOB_STATE_FAILED_TRANSIENT,
             now_ms,
@@ -6623,6 +7809,7 @@ fn expire_job_tx(
             job_id,
             JOB_STATE_QUEUED,
             JOB_STATE_RUNNING,
+            DOWNLOAD_JOB_KIND,
         ],
     )?;
     tx.execute(
@@ -6654,6 +7841,12 @@ fn purge_retained_jobs_tx(tx: &rusqlite::Transaction<'_>, now_ms: i64) -> rusqli
     drop(stmt);
     for (job_id, _) in &expired {
         tx.execute("DELETE FROM jobs WHERE job_id = ?1", params![job_id])?;
+        // A download request key stays bound to its job only as long as the
+        // job row exists; a binding to a purged job would point at nothing.
+        tx.execute(
+            "DELETE FROM download_key_bindings WHERE job_id = ?1",
+            params![job_id],
+        )?;
     }
     let digests = expired
         .iter()
@@ -9352,7 +10545,7 @@ mod tests {
                         );
                         store.store
                     }
-                    10..=12 => store,
+                    10..=13 => store,
                     _ => panic!("no fixture rows for migration {version}"),
                 }
             };
@@ -9498,6 +10691,16 @@ mod tests {
                 "serving_approvals" => 0,
                 "serving_sessions" => 0,
                 "serving_retained_states" => 0,
+                // v13 adds catalog install, download and self-check state with
+                // no older representation to translate, so these start empty;
+                // their transactions are exercised by the catalog store tests.
+                // The run-sequence counter is seeded with its single row.
+                "catalog_installs" => 0,
+                "catalog_install_members" => 0,
+                "download_acquisitions" => 0,
+                "download_key_bindings" => 0,
+                "catalog_self_checks" => 0,
+                "self_check_run_seq" => 1,
                 other => panic!(
                     "table {other} has no declared population expectation; \
                      populate it in the step-through fence (or declare why it \
@@ -11261,6 +12464,9 @@ mod tests {
     fn populate_every_restore_table(store: &SynapseStore, seed: &str) {
         let catalog_fingerprint = hex::encode(Sha256::digest(seed.as_bytes()));
         let artifact_id = hex::encode(Sha256::digest(format!("artifact-{seed}").as_bytes()));
+        // Differs between the capture and live seeds, so the restore tests can
+        // tell a counter copied from the capture from the live one.
+        let run_seq = 70 + seed.len();
         store.next_module_generation().unwrap();
         store
             .store
@@ -11356,6 +12562,22 @@ mod tests {
                     INSERT INTO serving_retained_states (
                         state_id, catalog_fingerprint, valid, created_at_ms, updated_at_ms
                     ) VALUES ('state-{seed}', '{catalog_fingerprint}', 1, 1, 1);
+                    INSERT INTO catalog_installs (catalog_id, manifest_digest, backend)
+                    VALUES ('catalog-{seed}', 'manifest-{seed}', 'metal');
+                    INSERT INTO catalog_install_members (
+                        catalog_id, manifest_digest, backend, path, digest
+                    ) VALUES ('catalog-{seed}', 'manifest-{seed}', 'metal', 'model.safetensors',
+                              'blob-{seed}');
+                    INSERT INTO download_acquisitions (job_id, digest, newly_published)
+                    VALUES ('download-{seed}', 'blob-{seed}', 1);
+                    INSERT INTO download_key_bindings (request_key, request_digest, job_id)
+                    VALUES ('download-key-{seed}', 'download-digest-{seed}', 'download-{seed}');
+                    INSERT INTO catalog_self_checks (
+                        check_id, catalog_id, manifest_digest, backend, fingerprint,
+                        engine_identity_json, os_build, fixture_revision, state, generation
+                    ) VALUES ('check-{seed}', 'catalog-{seed}', 'manifest-{seed}', 'metal',
+                              'fingerprint-{seed}', '{{}}', 'os', '1', 'passed', 1);
+                    UPDATE self_check_run_seq SET value = {run_seq} WHERE id = 0;
                     "#
                 ))?;
                 let mut approval = ServingApprovalRecord {
@@ -12065,6 +13287,928 @@ mod tests {
 
         assert_eq!(freelist_count_after, 0);
         assert!(file_size_after < file_size_before / 10);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// In-memory stand-in for the model cache: blob sizes by digest, pinned
+    /// digests and job ids with a staging directory.
+    #[derive(Default)]
+    struct FakeBlobCache {
+        blobs: std::cell::RefCell<BTreeMap<String, u64>>,
+        pins: std::cell::RefCell<BTreeSet<String>>,
+        staging: std::cell::RefCell<BTreeSet<String>>,
+    }
+
+    impl FakeBlobCache {
+        fn publish(&self, digest: &str, size: u64) {
+            self.blobs.borrow_mut().insert(digest.to_string(), size);
+        }
+
+        fn has_blob(&self, digest: &str) -> bool {
+            self.blobs.borrow().contains_key(digest)
+        }
+
+        fn pin(&self, digest: &str) {
+            self.pins.borrow_mut().insert(digest.to_string());
+        }
+
+        fn pinned(&self, digest: &str) -> bool {
+            self.pins.borrow().contains(digest)
+        }
+
+        fn stage(&self, job_id: &str) {
+            self.staging.borrow_mut().insert(job_id.to_string());
+        }
+
+        fn staged(&self, job_id: &str) -> bool {
+            self.staging.borrow().contains(job_id)
+        }
+    }
+
+    impl CatalogBlobCache for FakeBlobCache {
+        fn blob_size(&self, digest: &str) -> std::io::Result<Option<u64>> {
+            Ok(self.blobs.borrow().get(digest).copied())
+        }
+
+        fn is_pinned(&self, digest: &str) -> std::io::Result<bool> {
+            Ok(self.pinned(digest))
+        }
+
+        fn remove_pins(&self, digest: &str) -> std::io::Result<()> {
+            self.pins.borrow_mut().remove(digest);
+            Ok(())
+        }
+
+        fn delete_blob(&self, digest: &str) -> std::io::Result<u64> {
+            Ok(self.blobs.borrow_mut().remove(digest).unwrap_or(0))
+        }
+
+        fn delete_staging(&self, job_id: &str) -> std::io::Result<()> {
+            self.staging.borrow_mut().remove(job_id);
+            Ok(())
+        }
+    }
+
+    /// A blob digest made of one repeated hex character.
+    fn blob(seed: char) -> String {
+        seed.to_string().repeat(64)
+    }
+
+    fn download_request<'a>(
+        request_key: &'a str,
+        request_digest: &'a str,
+        params_json: &'a Value,
+        now_ms: u64,
+        entry_complete: bool,
+    ) -> DownloadJobRequest<'a> {
+        DownloadJobRequest {
+            request_key,
+            request_digest,
+            module_generation: 1,
+            params_json,
+            now_ms,
+            result_retention_ttl_ms: 1_000,
+            entry_complete,
+        }
+    }
+
+    fn admit_download(
+        store: &SynapseStore,
+        request_key: &str,
+        request_digest: &str,
+        now_ms: u64,
+    ) -> JobRecord {
+        let params = serde_json::json!({ "request_digest": request_digest });
+        store
+            .admit_download_job(&download_request(
+                request_key,
+                request_digest,
+                &params,
+                now_ms,
+                false,
+            ))
+            .unwrap()
+            .record()
+            .clone()
+    }
+
+    fn install(catalog_id: &str, backend: &str, members: &[(&str, &str)]) -> CatalogInstallRecord {
+        CatalogInstallRecord {
+            catalog_id: catalog_id.to_string(),
+            manifest_digest: format!("manifest-{catalog_id}"),
+            backend: backend.to_string(),
+            members: members
+                .iter()
+                .map(|(path, digest)| CatalogInstallMember {
+                    path: (*path).to_string(),
+                    digest: (*digest).to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    fn acquisitions(store: &SynapseStore, job_id: &str) -> Vec<(String, bool)> {
+        store
+            .download_acquisitions(job_id)
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.digest, row.newly_published))
+            .collect()
+    }
+
+    fn job_state(store: &SynapseStore, job_id: &str) -> String {
+        store.get_job_at(job_id, 0).unwrap().unwrap().state
+    }
+
+    fn applied(transition: DownloadTransition) -> (JobRecord, DownloadCleanup) {
+        match transition {
+            DownloadTransition::Applied { record, cleanup } => (record, cleanup),
+            other => panic!("expected the transition to apply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn download_admission_shares_one_job_per_entry_manifest_and_binds_keys() {
+        let (root, descriptor) = temp_descriptor("download-admission");
+        let store = SynapseStore::open(&descriptor).unwrap();
+        let params = serde_json::json!({ "catalog_id": "gte-modernbert-base" });
+
+        let DownloadAdmission::Created(job) = store
+            .admit_download_job(&download_request("key-a", "digest-1", &params, 10, false))
+            .unwrap()
+        else {
+            panic!("the first download of a manifest mints a job");
+        };
+        assert_eq!(job.kind, DOWNLOAD_JOB_KIND);
+        assert_eq!(job.state, DOWNLOAD_STATE_QUEUED);
+        assert_eq!(job.request_key, format!("models.download:{}", job.job_id));
+        assert_eq!(job.execution_expires_ms, None);
+        assert_eq!(job.params_json.as_ref(), Some(&params));
+
+        // A second key for the same manifest attaches to the same job.
+        assert_eq!(
+            store
+                .admit_download_job(&download_request("key-b", "digest-1", &params, 11, false))
+                .unwrap(),
+            DownloadAdmission::Attached(job.clone())
+        );
+        // Reusing a key for another manifest is refused.
+        match store.admit_download_job(&download_request("key-a", "digest-2", &params, 12, false)) {
+            Err(SynapseStoreError::IdempotencyConflict {
+                existing_digest,
+                requested_digest,
+                ..
+            }) => {
+                assert_eq!(existing_digest, "digest-1");
+                assert_eq!(requested_digest, "digest-2");
+            }
+            other => panic!("expected an idempotency conflict, got {other:?}"),
+        }
+        // Another manifest gets its own job.
+        let other = admit_download(&store, "key-c", "digest-2", 13);
+        assert_ne!(other.job_id, job.job_id);
+
+        applied(store.commit_download_job(&job.job_id, &[], 20).unwrap());
+        // While the entry is complete the key keeps returning its committed job.
+        let DownloadAdmission::Attached(committed) = store
+            .admit_download_job(&download_request("key-a", "digest-1", &params, 21, true))
+            .unwrap()
+        else {
+            panic!("a complete entry returns the committed job");
+        };
+        assert_eq!(committed.job_id, job.job_id);
+        assert_eq!(committed.state, DOWNLOAD_STATE_COMMITTED);
+
+        // Once the entry is incomplete the key binds to a fresh job, and a key
+        // still bound to the committed job attaches to that fresh job.
+        let DownloadAdmission::Created(repair) = store
+            .admit_download_job(&download_request("key-a", "digest-1", &params, 22, false))
+            .unwrap()
+        else {
+            panic!("an incomplete entry mints a new job");
+        };
+        assert_ne!(repair.job_id, job.job_id);
+        assert_eq!(
+            store.download_key_binding("key-a").unwrap().unwrap().job_id,
+            repair.job_id
+        );
+        assert_eq!(
+            store
+                .admit_download_job(&download_request("key-b", "digest-1", &params, 23, false))
+                .unwrap(),
+            DownloadAdmission::Attached(repair.clone())
+        );
+        assert_eq!(
+            store
+                .active_download_job("digest-1")
+                .unwrap()
+                .unwrap()
+                .job_id,
+            repair.job_id
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn download_jobs_are_exempt_from_execution_ttl_and_purge_drops_their_bindings() {
+        let (root, descriptor) = temp_descriptor("download-ttl");
+        let store = SynapseStore::open(&descriptor).unwrap();
+        let cache = FakeBlobCache::default();
+        let download = admit_download(&store, "key-a", "digest-1", 10);
+        let running = admit_download(&store, "key-b", "digest-2", 10);
+        let load = store
+            .admit_job(
+                "load-key",
+                "load-digest",
+                "model.load",
+                1,
+                None,
+                &serde_json::json!({}),
+                10,
+                100,
+                1_000,
+            )
+            .unwrap()
+            .record()
+            .clone();
+
+        // Far past any execution TTL: the load job expires, downloads do not.
+        store.purge_expired_jobs(1_000_000).unwrap();
+        assert_eq!(job_state(&store, &load.job_id), JOB_STATE_FAILED_TRANSIENT);
+        assert_eq!(
+            store
+                .get_job_at(&download.job_id, 1_000_000)
+                .unwrap()
+                .unwrap()
+                .state,
+            DOWNLOAD_STATE_QUEUED
+        );
+        // The generic restart sweep leaves downloads to their own startup path.
+        store
+            .fail_prior_generation_incomplete_jobs(5, &serde_json::json!({}), 1_000_001)
+            .unwrap();
+        assert_eq!(job_state(&store, &download.job_id), DOWNLOAD_STATE_QUEUED);
+
+        applied(
+            store
+                .end_download_job(&download.job_id, DownloadEnd::Cancelled, &cache, 2_000_000)
+                .unwrap(),
+        );
+        store.purge_expired_jobs(2_000_999).unwrap();
+        assert!(store.get_job_at(&download.job_id, 0).unwrap().is_some());
+        assert!(store.download_key_binding("key-a").unwrap().is_some());
+
+        // Retention elapsed: the terminal job and its binding go together; the
+        // non-terminal job and its binding stay.
+        store.purge_expired_jobs(2_001_000).unwrap();
+        assert!(store.get_job_at(&download.job_id, 0).unwrap().is_none());
+        assert!(store.download_key_binding("key-a").unwrap().is_none());
+        assert_eq!(job_state(&store, &running.job_id), DOWNLOAD_STATE_QUEUED);
+        assert_eq!(
+            store.download_key_binding("key-b").unwrap().unwrap().job_id,
+            running.job_id
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn publication_marks_only_absent_blobs_newly_published_and_stops_once_terminal() {
+        let (root, descriptor) = temp_descriptor("download-publication");
+        let store = SynapseStore::open(&descriptor).unwrap();
+        let cache = FakeBlobCache::default();
+        cache.publish(&blob('a'), 5);
+        let job = admit_download(&store, "key-a", "digest-1", 10);
+        assert!(store
+            .advance_download_job(&job.job_id, DOWNLOAD_STATE_DOWNLOADING, 11)
+            .unwrap());
+
+        assert_eq!(
+            store
+                .record_download_publication(&job.job_id, &blob('b'), &cache)
+                .unwrap(),
+            DownloadPublication::Proceed {
+                newly_published: true
+            }
+        );
+        assert_eq!(
+            store
+                .record_download_publication(&job.job_id, &blob('a'), &cache)
+                .unwrap(),
+            DownloadPublication::Proceed {
+                newly_published: false
+            }
+        );
+        // A prefixed, upper-case digest names the same row.
+        let prefixed = format!("sha256:{}", blob('b').to_ascii_uppercase());
+        store
+            .record_download_publication(&job.job_id, &prefixed, &cache)
+            .unwrap();
+        assert_eq!(
+            acquisitions(&store, &job.job_id),
+            vec![(blob('a'), false), (blob('b'), true)]
+        );
+
+        applied(
+            store
+                .end_download_job(&job.job_id, DownloadEnd::Cancelled, &cache, 12)
+                .unwrap(),
+        );
+        let DownloadPublication::Stopped(stopped) = store
+            .record_download_publication(&job.job_id, &blob('c'), &cache)
+            .unwrap()
+        else {
+            panic!("a terminal job must not publish");
+        };
+        assert_eq!(stopped.state, DOWNLOAD_STATE_CANCELLED);
+        assert!(acquisitions(&store, &job.job_id).is_empty());
+        assert!(!store
+            .advance_download_job(&job.job_id, DOWNLOAD_STATE_VERIFYING, 13)
+            .unwrap());
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reuse_root_writes_a_not_newly_published_row_only_for_a_present_blob_of_its_size() {
+        let (root, descriptor) = temp_descriptor("download-reuse");
+        let store = SynapseStore::open(&descriptor).unwrap();
+        let cache = FakeBlobCache::default();
+        cache.publish(&blob('a'), 5);
+        let job = admit_download(&store, "key-a", "digest-1", 10);
+
+        assert_eq!(
+            store
+                .root_reused_download_blob(&job.job_id, &blob('b'), 5, &cache)
+                .unwrap(),
+            DownloadReuse::Absent
+        );
+        assert_eq!(
+            store
+                .root_reused_download_blob(&job.job_id, &blob('a'), 6, &cache)
+                .unwrap(),
+            DownloadReuse::Absent
+        );
+        assert!(acquisitions(&store, &job.job_id).is_empty());
+        assert_eq!(
+            store
+                .root_reused_download_blob(&job.job_id, &blob('a'), 5, &cache)
+                .unwrap(),
+            DownloadReuse::Rooted
+        );
+        assert_eq!(acquisitions(&store, &job.job_id), vec![(blob('a'), false)]);
+
+        // Rooting a blob this job itself published keeps it newly published.
+        store
+            .record_download_publication(&job.job_id, &blob('b'), &cache)
+            .unwrap();
+        cache.publish(&blob('b'), 3);
+        assert_eq!(
+            store
+                .root_reused_download_blob(&job.job_id, &blob('b'), 3, &cache)
+                .unwrap(),
+            DownloadReuse::Rooted
+        );
+        assert_eq!(
+            acquisitions(&store, &job.job_id),
+            vec![(blob('a'), false), (blob('b'), true)]
+        );
+
+        // Cleanup deletes what the job published and never what it reused.
+        let (_, cleanup) = applied(
+            store
+                .end_download_job(&job.job_id, DownloadEnd::Cancelled, &cache, 11)
+                .unwrap(),
+        );
+        assert_eq!(cleanup.deleted_blobs, vec![blob('b')]);
+        assert!(cache.has_blob(&blob('a')));
+        assert!(!cache.has_blob(&blob('b')));
+        assert!(matches!(
+            store
+                .root_reused_download_blob(&job.job_id, &blob('a'), 5, &cache)
+                .unwrap(),
+            DownloadReuse::Stopped(_)
+        ));
+        assert!(acquisitions(&store, &job.job_id).is_empty());
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn commit_writes_installs_drops_acquisitions_and_wins_exactly_once() {
+        let (root, descriptor) = temp_descriptor("download-commit");
+        let store = SynapseStore::open(&descriptor).unwrap();
+        let cache = FakeBlobCache::default();
+        cache.publish(&blob('b'), 2);
+        let job = admit_download(&store, "key-a", "digest-1", 10);
+        store
+            .record_download_publication(&job.job_id, &blob('a'), &cache)
+            .unwrap();
+        cache.publish(&blob('a'), 1);
+        store
+            .root_reused_download_blob(&job.job_id, &blob('b'), 2, &cache)
+            .unwrap();
+
+        let installs = vec![
+            install(
+                "gte",
+                "metal",
+                &[
+                    ("model.safetensors", &blob('a')),
+                    ("tokenizer.json", &blob('b')),
+                ],
+            ),
+            install("gte", "ane", &[("tokenizer.json", &blob('b'))]),
+        ];
+        let (record, cleanup) = applied(
+            store
+                .commit_download_job(&job.job_id, &installs, 20)
+                .unwrap(),
+        );
+        assert_eq!(record.state, DOWNLOAD_STATE_COMMITTED);
+        assert_eq!(record.terminal_at_ms, Some(20));
+        assert_eq!(cleanup, DownloadCleanup::default());
+        let mut expected = installs.clone();
+        expected.sort_by(|left, right| left.backend.cmp(&right.backend));
+        assert_eq!(store.catalog_installs("gte").unwrap(), expected);
+        assert!(acquisitions(&store, &job.job_id).is_empty());
+
+        // The commit won; a second commit, a cancel and a failure all lose and
+        // change nothing.
+        assert_eq!(
+            store.commit_download_job(&job.job_id, &[], 21).unwrap(),
+            DownloadTransition::Unchanged(Some(record.clone()))
+        );
+        assert_eq!(
+            store
+                .end_download_job(&job.job_id, DownloadEnd::Cancelled, &cache, 22)
+                .unwrap(),
+            DownloadTransition::Unchanged(Some(record.clone()))
+        );
+        let error = serde_json::json!({ "code": "download_failed" });
+        assert_eq!(
+            store
+                .end_download_job(
+                    &job.job_id,
+                    DownloadEnd::Failed { error_json: &error },
+                    &cache,
+                    23
+                )
+                .unwrap(),
+            DownloadTransition::Unchanged(Some(record))
+        );
+        assert!(cache.has_blob(&blob('a')) && cache.has_blob(&blob('b')));
+        assert_eq!(store.catalog_installs("gte").unwrap(), expected);
+
+        // A later repair commit replaces the member set of the same record.
+        let repair = admit_download(&store, "key-a", "digest-1", 30);
+        assert_ne!(repair.job_id, job.job_id);
+        let replacement = install(
+            "gte",
+            "metal",
+            &[
+                ("model.safetensors", &blob('c')),
+                ("tokenizer.json", &blob('b')),
+            ],
+        );
+        applied(
+            store
+                .commit_download_job(&repair.job_id, &[replacement.clone()], 31)
+                .unwrap(),
+        );
+        assert_eq!(
+            store.catalog_installs("gte").unwrap(),
+            vec![expected[0].clone(), replacement]
+        );
+        assert_eq!(
+            store.commit_download_job("job_missing", &[], 32).unwrap(),
+            DownloadTransition::Unchanged(None)
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cancel_cleanup_deletes_only_unreferenced_blobs_the_job_published() {
+        let (root, descriptor) = temp_descriptor("download-cancel");
+        let store = SynapseStore::open(&descriptor).unwrap();
+        let cache = FakeBlobCache::default();
+        // e: pre-existing and reused, so never deleted.
+        cache.publish(&blob('e'), 50);
+        let job = admit_download(&store, "key-a", "digest-1", 10);
+        for (seed, size) in [('a', 1), ('b', 2), ('c', 3), ('d', 4)] {
+            assert_eq!(
+                store
+                    .record_download_publication(&job.job_id, &blob(seed), &cache)
+                    .unwrap(),
+                DownloadPublication::Proceed {
+                    newly_published: true
+                }
+            );
+            cache.publish(&blob(seed), size);
+        }
+        store
+            .root_reused_download_blob(&job.job_id, &blob('e'), 50, &cache)
+            .unwrap();
+        cache.stage(&job.job_id);
+
+        // b: a member row of another entry's install references it.
+        let other = admit_download(&store, "key-o", "digest-o", 11);
+        applied(
+            store
+                .commit_download_job(
+                    &other.job_id,
+                    &[install("other", "metal", &[("model", &blob('b'))])],
+                    12,
+                )
+                .unwrap(),
+        );
+        // c: a cache.pin holds it.
+        cache.pin(&blob('c'));
+        // d: a free-form registration names it.
+        let mut free_form = owned_seed_model_config("qwen3-0.6b-decode-f16");
+        free_form.model_id = "free-form".to_string();
+        free_form.model_locator = ModelAssetLocator::CacheDigest {
+            digest: format!("sha256:{}", blob('d')),
+        };
+        store.upsert_model(&free_form, 13).unwrap();
+
+        let (record, cleanup) = applied(
+            store
+                .end_download_job(&job.job_id, DownloadEnd::Cancelled, &cache, 14)
+                .unwrap(),
+        );
+        assert_eq!(record.state, DOWNLOAD_STATE_CANCELLED);
+        assert_eq!(record.error_json, None);
+        assert_eq!(
+            cleanup,
+            DownloadCleanup {
+                deleted_blobs: vec![blob('a')],
+                freed_bytes: 1,
+                handed_off: Vec::new(),
+                kept: vec![blob('b'), blob('c'), blob('d')],
+            }
+        );
+        assert!(!cache.has_blob(&blob('a')));
+        for seed in ['b', 'c', 'd', 'e'] {
+            assert!(cache.has_blob(&blob(seed)), "blob {seed} was deleted");
+        }
+        assert!(!cache.staged(&job.job_id));
+        assert!(acquisitions(&store, &job.job_id).is_empty());
+
+        // The cancel won: a late commit writes nothing.
+        assert!(matches!(
+            store
+                .commit_download_job(
+                    &job.job_id,
+                    &[install("gte", "metal", &[("model", &blob('a'))])],
+                    15,
+                )
+                .unwrap(),
+            DownloadTransition::Unchanged(Some(_))
+        ));
+        assert!(store.catalog_installs("gte").unwrap().is_empty());
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cleanup_hands_a_shared_newly_published_blob_to_the_job_that_reused_it() {
+        let (root, descriptor) = temp_descriptor("download-hand-off");
+        let store = SynapseStore::open(&descriptor).unwrap();
+        let cache = FakeBlobCache::default();
+
+        // Job a publishes the blob, job b reuses it, and a is cancelled
+        // before commit.
+        let job_a = admit_download(&store, "key-a", "digest-a", 10);
+        let job_b = admit_download(&store, "key-b", "digest-b", 10);
+        store
+            .record_download_publication(&job_a.job_id, &blob('a'), &cache)
+            .unwrap();
+        cache.publish(&blob('a'), 7);
+        assert_eq!(
+            store
+                .root_reused_download_blob(&job_b.job_id, &blob('a'), 7, &cache)
+                .unwrap(),
+            DownloadReuse::Rooted
+        );
+        let (_, cleanup) = applied(
+            store
+                .end_download_job(&job_a.job_id, DownloadEnd::Cancelled, &cache, 11)
+                .unwrap(),
+        );
+        assert_eq!(cleanup.handed_off, vec![blob('a')]);
+        assert!(cleanup.deleted_blobs.is_empty());
+        assert!(cache.has_blob(&blob('a')));
+        assert_eq!(acquisitions(&store, &job_b.job_id), vec![(blob('a'), true)]);
+        // b commits with every member present and nothing refetched.
+        applied(
+            store
+                .commit_download_job(
+                    &job_b.job_id,
+                    &[install("shared", "metal", &[("model", &blob('a'))])],
+                    12,
+                )
+                .unwrap(),
+        );
+        assert!(cache.has_blob(&blob('a')));
+
+        // Same hand-off, but the job that took the blob over then fails: its
+        // cleanup now deletes the blob, and the failure keeps its error.
+        let job_c = admit_download(&store, "key-c", "digest-c", 20);
+        let job_d = admit_download(&store, "key-d", "digest-d", 20);
+        store
+            .record_download_publication(&job_c.job_id, &blob('c'), &cache)
+            .unwrap();
+        cache.publish(&blob('c'), 9);
+        store
+            .root_reused_download_blob(&job_d.job_id, &blob('c'), 9, &cache)
+            .unwrap();
+        cache.stage(&job_d.job_id);
+        applied(
+            store
+                .end_download_job(&job_c.job_id, DownloadEnd::Cancelled, &cache, 21)
+                .unwrap(),
+        );
+        let error = serde_json::json!({
+            "code": "download_failed",
+            "details": { "reason": "network" },
+        });
+        let (record, cleanup) = applied(
+            store
+                .end_download_job(
+                    &job_d.job_id,
+                    DownloadEnd::Failed { error_json: &error },
+                    &cache,
+                    22,
+                )
+                .unwrap(),
+        );
+        assert_eq!(record.state, DOWNLOAD_STATE_FAILED);
+        assert_eq!(record.error_json, Some(error));
+        assert_eq!(cleanup.deleted_blobs, vec![blob('c')]);
+        assert_eq!(cleanup.freed_bytes, 9);
+        assert!(!cache.has_blob(&blob('c')));
+        assert!(!cache.staged(&job_d.job_id));
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn quarantine_removes_the_blob_its_installs_members_and_pins_and_fails_holding_jobs() {
+        let (root, descriptor) = temp_descriptor("download-quarantine");
+        let store = SynapseStore::open(&descriptor).unwrap();
+        let cache = FakeBlobCache::default();
+        let (bad, shared, other) = (blob('a'), blob('b'), blob('c'));
+        cache.publish(&bad, 10);
+        cache.publish(&shared, 20);
+        cache.publish(&other, 30);
+        cache.pin(&bad);
+        cache.pin(&shared);
+        let setup = admit_download(&store, "key-setup", "digest-setup", 10);
+        applied(
+            store
+                .commit_download_job(
+                    &setup.job_id,
+                    &[
+                        install("gte", "metal", &[("model", &bad), ("tokenizer", &shared)]),
+                        install("qwen", "metal", &[("model", &bad), ("tokenizer", &other)]),
+                        install(
+                            "rerank",
+                            "metal",
+                            &[("model", &other), ("tokenizer", &shared)],
+                        ),
+                    ],
+                    11,
+                )
+                .unwrap(),
+        );
+        let mut free_form = owned_seed_model_config("qwen3-0.6b-decode-f16");
+        free_form.model_id = "free-form".to_string();
+        free_form.model_locator = ModelAssetLocator::CacheDigest {
+            digest: format!("sha256:{bad}"),
+        };
+        store.upsert_model(&free_form, 12).unwrap();
+
+        // A running job that reused the bad blob and published another one,
+        // and a running job that never touched it.
+        let holder = admit_download(&store, "key-h", "digest-h", 13);
+        store
+            .root_reused_download_blob(&holder.job_id, &bad, 10, &cache)
+            .unwrap();
+        store
+            .record_download_publication(&holder.job_id, &blob('d'), &cache)
+            .unwrap();
+        cache.publish(&blob('d'), 4);
+        cache.stage(&holder.job_id);
+        let bystander = admit_download(&store, "key-x", "digest-x", 13);
+        store
+            .record_download_publication(&bystander.job_id, &blob('e'), &cache)
+            .unwrap();
+        cache.publish(&blob('e'), 5);
+
+        let error = serde_json::json!({ "code": "artifact_invalid" });
+        let report = store
+            .quarantine_catalog_blob(&format!("sha256:{bad}"), &error, &cache, 20)
+            .unwrap();
+        assert_eq!(
+            report,
+            QuarantineReport {
+                removed_installs: vec![
+                    CatalogInstallKey {
+                        catalog_id: "gte".to_string(),
+                        manifest_digest: "manifest-gte".to_string(),
+                        backend: "metal".to_string(),
+                    },
+                    CatalogInstallKey {
+                        catalog_id: "qwen".to_string(),
+                        manifest_digest: "manifest-qwen".to_string(),
+                        backend: "metal".to_string(),
+                    },
+                ],
+                failed_jobs: vec![holder.job_id.clone()],
+                freed_bytes: 10 + 4,
+            }
+        );
+        assert!(!cache.has_blob(&bad));
+        assert!(!cache.pinned(&bad));
+        assert!(cache.pinned(&shared));
+        for digest in [&shared, &other, &blob('e')] {
+            assert!(cache.has_blob(digest), "blob {digest} was touched");
+        }
+        assert!(!cache.has_blob(&blob('d')), "the failed job's cleanup ran");
+        assert!(!cache.staged(&holder.job_id));
+        assert!(store.catalog_installs("gte").unwrap().is_empty());
+        assert!(store.catalog_installs("qwen").unwrap().is_empty());
+        assert_eq!(store.catalog_installs("rerank").unwrap().len(), 1);
+        // Only member rows naming the bad blob go; the others keep their blobs
+        // rooted so the repair download fetches only the quarantined file.
+        let members = store
+            .store
+            .with_conn(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT catalog_id, digest FROM catalog_install_members
+                     ORDER BY catalog_id, path",
+                )?;
+                let rows = stmt
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .unwrap();
+        assert_eq!(
+            members,
+            vec![
+                ("gte".to_string(), shared.clone()),
+                ("qwen".to_string(), other.clone()),
+                ("rerank".to_string(), other.clone()),
+                ("rerank".to_string(), shared.clone()),
+            ]
+        );
+        let failed = store.get_job_at(&holder.job_id, 0).unwrap().unwrap();
+        assert_eq!(failed.state, DOWNLOAD_STATE_FAILED);
+        assert_eq!(failed.error_json, Some(error));
+        assert!(acquisitions(&store, &holder.job_id).is_empty());
+        assert_eq!(job_state(&store, &bystander.job_id), DOWNLOAD_STATE_QUEUED);
+        assert_eq!(
+            acquisitions(&store, &bystander.job_id),
+            vec![(blob('e'), true)]
+        );
+        assert!(store
+            .catalog_models()
+            .unwrap()
+            .iter()
+            .any(|model| model.model_id == "free-form"));
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn startup_fails_interrupted_download_jobs_with_cleanup() {
+        let (root, descriptor) = temp_descriptor("download-startup");
+        let store = SynapseStore::open(&descriptor).unwrap();
+        let cache = FakeBlobCache::default();
+        let queued = admit_download(&store, "key-q", "digest-q", 10);
+        store
+            .record_download_publication(&queued.job_id, &blob('a'), &cache)
+            .unwrap();
+        cache.publish(&blob('a'), 3);
+        cache.stage(&queued.job_id);
+        let verifying = admit_download(&store, "key-v", "digest-v", 11);
+        store
+            .advance_download_job(&verifying.job_id, DOWNLOAD_STATE_VERIFYING, 12)
+            .unwrap();
+        let committed = admit_download(&store, "key-c", "digest-c", 12);
+        applied(
+            store
+                .commit_download_job(&committed.job_id, &[], 13)
+                .unwrap(),
+        );
+        let params = serde_json::json!({});
+        let mut current = download_request("key-n", "digest-n", &params, 14, false);
+        current.module_generation = 2;
+        let current = store.admit_download_job(&current).unwrap().record().clone();
+
+        let error = serde_json::json!({ "code": "module_restarted" });
+        let failed = store
+            .fail_interrupted_download_jobs(2, &error, &cache, 20)
+            .unwrap();
+        assert_eq!(
+            failed,
+            vec![queued.job_id.clone(), verifying.job_id.clone()]
+        );
+        for job_id in &failed {
+            let record = store.get_job_at(job_id, 0).unwrap().unwrap();
+            assert_eq!(record.state, DOWNLOAD_STATE_FAILED);
+            assert_eq!(record.error_json.as_ref(), Some(&error));
+            assert!(acquisitions(&store, job_id).is_empty());
+        }
+        assert!(!cache.has_blob(&blob('a')));
+        assert!(!cache.staged(&queued.job_id));
+        assert_eq!(
+            job_state(&store, &committed.job_id),
+            DOWNLOAD_STATE_COMMITTED
+        );
+        assert_eq!(job_state(&store, &current.job_id), DOWNLOAD_STATE_QUEUED);
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn startup_reconciliation_deletes_disallowed_embed_rerank_rows_and_skips_reserved_ids() {
+        let (root, descriptor) = temp_descriptor("registration-reconcile");
+        let store = SynapseStore::open(&descriptor).unwrap();
+        let cache = FakeBlobCache::default();
+        let registration = |model_id: &str, engine: &str, task: &str, digests: &[String]| {
+            let mut config = owned_seed_model_config("qwen3-0.6b-decode-f16");
+            config.model_id = model_id.to_string();
+            config.engine = engine.to_string();
+            config.task = task.to_string();
+            config.artifact_digest = format!("sha256:{}", digests[0]);
+            config.model_locator = ModelAssetLocator::CacheDigest {
+                digest: format!("sha256:{}", digests[0]),
+            };
+            config.tokenizer_locator = ModelAssetLocator::CacheDigest {
+                digest: format!("sha256:{}", digests[digests.len() - 1]),
+            };
+            config
+        };
+        let rows = [
+            registration("minilm", "ort", "embed", &[blob('a'), blob('b')]),
+            registration("bge-rerank", "llama", "rerank", &[blob('c')]),
+            registration("gte-modernbert-base", "owned-metal", "embed", &[blob('d')]),
+            registration("owned-embed", "owned-metal", "embed", &[blob('c')]),
+            registration("decoder", "llama", "generate", &[blob('e')]),
+        ];
+        for (index, row) in rows.iter().enumerate() {
+            store.upsert_model(row, 10 + index as u64).unwrap();
+        }
+        for seed in ['a', 'b', 'c', 'd', 'e'] {
+            cache.pin(&blob(seed));
+        }
+
+        let reconciliation = store
+            .reconcile_persisted_registrations(&|id| id == "gte-modernbert-base", &cache)
+            .unwrap();
+        assert_eq!(
+            reconciliation.deleted,
+            vec![
+                ("minilm".to_string(), "ort".to_string()),
+                ("bge-rerank".to_string(), "llama".to_string()),
+            ]
+        );
+        assert_eq!(
+            reconciliation
+                .registrable
+                .iter()
+                .map(|model| model.model_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["owned-embed", "decoder"]
+        );
+        assert_eq!(
+            reconciliation.skipped_reserved,
+            vec!["gte-modernbert-base".to_string()]
+        );
+        // c stays pinned: the kept owned-metal row still names it.
+        assert_eq!(reconciliation.unpinned_digests, vec![blob('a'), blob('b')]);
+        assert!(!cache.pinned(&blob('a')) && !cache.pinned(&blob('b')));
+        for seed in ['c', 'd', 'e'] {
+            assert!(cache.pinned(&blob(seed)), "pin on {seed} was dropped");
+        }
+        // The reserved row stays in the table; only the disallowed rows go.
+        assert_eq!(
+            store
+                .catalog_models()
+                .unwrap()
+                .iter()
+                .map(|model| model.model_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["gte-modernbert-base", "owned-embed", "decoder"]
+        );
+        drop(store);
         let _ = std::fs::remove_dir_all(root);
     }
 
