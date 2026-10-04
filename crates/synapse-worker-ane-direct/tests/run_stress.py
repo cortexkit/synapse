@@ -1,5 +1,6 @@
 """Run the development-only hardware stress test; never writes release evidence."""
 import argparse
+import json
 import os
 from pathlib import Path
 import signal
@@ -20,8 +21,29 @@ if args.out:
     env["ANE_STRESS_OUT"] = str(args.out.resolve())
 env.setdefault("ANE_TEST_WORKER", str(ROOT / "target/release/ck-synapse-worker-ane-direct"))
 env.setdefault("ANE_TEST_PACKAGES", str(ROOT / "target/ane-direct-packages"))
-command = ["cargo", "test", "--locked", "-p", "synapse-module", "worker_host::ane_residency::hardware_tests::real_direct_ane_residency_stress", "--", "--ignored", "--exact", "--nocapture"]
 deadline = time.monotonic() + args.timeout
+
+def run(command, cwd, capture=False):
+    process = subprocess.Popen(command, cwd=cwd, env=env, start_new_session=True,
+                               stdout=subprocess.PIPE if capture else None, text=True)
+    try:
+        stdout, _ = process.communicate(timeout=max(1, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.wait()
+        raise SystemExit("stress timed out; terminated the test and its workers")
+    if process.returncode:
+        raise SystemExit(process.returncode)
+    return stdout
+
+# Build before waiting: compilation can push load back over the measurement bar.
+build = run(["cargo", "test", "--locked", "-p", "synapse-module", "--lib", "--no-run", "--message-format=json"], ROOT, capture=True)
+artifacts = [json.loads(line) for line in build.splitlines() if line.startswith("{")]
+executables = [a["executable"] for a in artifacts if a.get("reason") == "compiler-artifact"
+               and a.get("target", {}).get("name") == "synapse_module"
+               and a.get("profile", {}).get("test") and a.get("executable")]
+if len(executables) != 1:
+    raise SystemExit("expected exactly one compiled supervisor test executable")
 if os.getloadavg()[0] >= 16:
     if not args.wait_for_load:
         raise SystemExit("stress deferred: 1-minute load must be below16")
@@ -31,11 +53,4 @@ if os.getloadavg()[0] >= 16:
         if remaining <= 0:
             raise SystemExit("stress timed out waiting for load<16; no model requests submitted")
         threading.Event().wait(min(30, remaining))
-process = subprocess.Popen(command, cwd=ROOT, env=env, start_new_session=True)
-try:
-    result = process.wait(timeout=max(1, deadline - time.monotonic()))
-except subprocess.TimeoutExpired:
-    os.killpg(process.pid, signal.SIGKILL)
-    process.wait()
-    raise SystemExit("stress timed out; terminated the test and its workers")
-raise SystemExit(result)
+run([executables[0], "--ignored", "--exact", "worker_host::ane_residency::hardware_tests::real_direct_ane_residency_stress", "--nocapture"], ROOT / "crates/synapse-module")
