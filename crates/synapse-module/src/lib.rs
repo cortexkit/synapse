@@ -87,13 +87,13 @@ use store::{
     JOB_STATE_FAILED_TRANSIENT, JOB_STATE_PAUSED_NEEDS_REAUTH, JOB_STATE_QUEUED, JOB_STATE_RUNNING,
 };
 use subc_client_rs::{
-    async_trait, build_provenance, BindDecision, ConnectionEnd, HandlerOutcome, HealthReport,
-    ModuleHandler, RequestCtx, RouteBindRequest, RouteHandle, SubcModuleError,
+    async_trait, BindDecision, ConnectionEnd, HandlerOutcome, HealthReport, ModuleHandler,
+    RequestCtx, RouteBindRequest, RouteHandle, SubcModuleError,
 };
 use subc_protocol::{
     manifest::{
-        Concurrency, IdentityScope, ManagementOperation, ManagementOperationKind, ModuleManifest,
-        ProviderRole,
+        build_provenance_from_source, BuildGitShaSource, Concurrency, GitTreeState, IdentityScope,
+        ManagementOperation, ManagementOperationKind, ModuleManifest, ProviderRole,
     },
     ModuleHelloAckBody, Principal, PROTOCOL_VERSION, SUBC_MODULE_ID_ENV,
 };
@@ -15675,25 +15675,45 @@ fn manifest(module_id: &str) -> ModuleManifest {
         // outside its own store and models directory, and observation-anchored
         // signals would claim watch points we do not maintain.
         .self_signals(Some(Vec::new()))
-        // Declare what is known rather than blanket-None: the SDK helper stamps
-        // `wire_crate_version` from the linked subc-protocol crate, and the
-        // newest migration this binary carries is a fact a daemon can compare
-        // against a store's actual version to spot a stale binary directly.
-        // Build facts stay absent because release scripts do not stamp
-        // CK_BUILD_* yet, and the helper maps an absent input to field omission
-        // rather than minting a sentinel string that would read as a fact.
-        .provenance(Some(
-            build_provenance(
-                None,
-                None,
-                Some(&store::newest_schema_version().to_string()),
-            )
-            // Form validation covers only the sha and lock-digest inputs, and both
-            // are absent here, so an Err would mean the SDK contract itself
-            // changed rather than any runtime condition.
-            .expect("build_provenance with absent sha and lock digest cannot fail form validation"),
-        ))
+        // Declare the provenance facts this build actually has: the linked
+        // subc-protocol crate version, the commit when the source tree was
+        // clean (omitted with a reason when it was dirty or git was
+        // unavailable), and the newest store migration this binary carries,
+        // which a daemon can compare with the store's version to spot a stale
+        // binary.
+        .provenance(Some(declared_provenance()))
         .build()
+}
+
+/// Where this build's commit came from, as embedded by `build.rs`.
+fn build_git_sha_source() -> BuildGitShaSource<'static> {
+    match (
+        option_env!("SYNAPSE_BUILD_REV"),
+        option_env!("SYNAPSE_BUILD_TREE"),
+    ) {
+        (Some(revision), Some(tree)) => BuildGitShaSource::Git {
+            revision,
+            tree_state: if tree == "clean" {
+                GitTreeState::Clean
+            } else {
+                GitTreeState::Dirty
+            },
+        },
+        _ => BuildGitShaSource::NoGitDir,
+    }
+}
+
+fn declared_provenance() -> subc_protocol::manifest::ManifestProvenance {
+    build_provenance_from_source(
+        build_git_sha_source(),
+        None,
+        Some(&store::newest_schema_version().to_string()),
+    )
+    // The only inputs the helper validates are the commit, which build.rs
+    // emits as a full 40-character hex string, and the Cargo.lock digest, which
+    // is passed as absent. A validation failure here would mean build.rs
+    // emitted something malformed, not a runtime condition.
+    .expect("build.rs emits a canonical commit, so provenance form validation passes")
 }
 
 fn load_module_config() -> Result<ModuleConfig, ModuleError> {
@@ -16483,9 +16503,29 @@ mod tests {
             "wire_crate_version must name the linked SDK crate"
         );
 
-        // Release scripts do not stamp these yet. Absent is the honest shape;
-        // a sentinel string like "unknown" would be a well-formed lie.
-        assert_eq!(provenance.build_git_sha, None);
+        // The commit is declared only for a clean tree; a dirty tree or a
+        // build without git declares it absent, with the reason. A sentinel
+        // string like "unknown" would be a well-formed lie.
+        match build_git_sha_source() {
+            BuildGitShaSource::Git {
+                revision,
+                tree_state: GitTreeState::Clean,
+            } => {
+                assert_eq!(provenance.build_git_sha.as_deref(), Some(revision));
+                assert_eq!(provenance.build_git_sha_absence_reason, None);
+            }
+            BuildGitShaSource::Git { .. } => {
+                assert_eq!(provenance.build_git_sha, None);
+                assert_eq!(
+                    provenance.build_git_sha_absence_reason,
+                    Some(subc_protocol::manifest::BuildGitShaAbsenceReason::DeclinedDirty)
+                );
+            }
+            _ => {
+                assert_eq!(provenance.build_git_sha, None);
+                assert!(provenance.build_git_sha_absence_reason.is_some());
+            }
+        }
         assert_eq!(provenance.build_lock_digest, None);
 
         // Deliberately NOT asserting the number itself: restating a derived
