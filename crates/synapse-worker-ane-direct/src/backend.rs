@@ -308,8 +308,9 @@ impl Model {
         };
         let embeddings = self.tensor(&format!("{}{embedding_name}", self.profile.prefix()))?;
         let mut input = vec![0.0; hidden * shape];
-        for position in 0..shape {
-            let token = tokens.get(position).copied().unwrap_or(pad) as usize;
+        let padded = padded_ids(tokens, pad, shape);
+        for (position, token) in padded.into_iter().enumerate() {
+            let token = token as usize;
             let embedding = embeddings
                 .get(token * hidden..(token + 1) * hidden)
                 .context("invalid_request")?;
@@ -473,6 +474,11 @@ impl Model {
         stages.emit("cpu_head");
         Ok(vec![score])
     }
+}
+fn padded_ids(tokens: &[u32], pad: u32, shape: usize) -> Vec<u32> {
+    let mut ids = tokens.to_vec();
+    ids.resize(shape, pad);
+    ids
 }
 pub fn padding_mask(tokens: &[u32], pad: u32, shape: usize) -> Vec<f32> {
     let _ = pad;
@@ -1144,6 +1150,48 @@ mod admission_error_tests {
             ane::Error::Evaluate("no ANE resources".into()),
         ] {
             assert_eq!(admission_error(other, 3).to_string(), "compile layer 3");
+        }
+    }
+}
+
+#[cfg(test)]
+mod padding_golden_tests {
+    use super::*;
+    #[test]
+    fn direct_ane_padding_matches_independent_committed_golden() {
+        let fixture: Value =
+            serde_json::from_slice(include_bytes!("../tests/fixtures/direct-ane-padding.json"))
+                .unwrap();
+        assert_eq!(fixture["lane"], "ane-direct-worker");
+        let cases = fixture["cases"].as_array().unwrap();
+        assert_eq!(cases.len(), 12);
+        for case in cases {
+            let slug = case["model"].as_str().unwrap();
+            let operation = if slug.contains("reranker") {
+                "rerank"
+            } else {
+                "embed"
+            };
+            let profile = Profile::select(&format!("{slug}.ane-direct-worker"), operation).unwrap();
+            let ids: Vec<u32> = serde_json::from_value(case["input_ids"].clone()).unwrap();
+            let expected_ids: Vec<u32> =
+                serde_json::from_value(case["padded_ids"].clone()).unwrap();
+            let expected_mask: Vec<f32> =
+                serde_json::from_value(case["additive_mask"].clone()).unwrap();
+            let shape = rung(ids.len()).unwrap();
+            let pad = profile.n("pad_token_id") as u32;
+            assert_eq!(pad as u64, case["pad_id"].as_u64().unwrap());
+            assert_eq!(shape as u64, case["shape"].as_u64().unwrap());
+            assert_eq!(
+                padded_ids(&ids, pad, shape),
+                expected_ids,
+                "{slug} padded ids"
+            );
+            assert_eq!(
+                padding_mask(&ids, pad, shape),
+                expected_mask,
+                "{slug} derived mask"
+            );
         }
     }
 }

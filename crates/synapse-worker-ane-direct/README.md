@@ -88,3 +88,35 @@ The separate lock-lifetime test must kill the module while it holds the lane
 lock and has resident shapes/in-flight work, then show that a replacement gets
 `ane_lane_busy` until every old worker exits. That test and full padded golden
 fixture comparison are also still required.
+
+## Development integration tests
+
+`tests/fixtures/direct-ane-padding.json` pins post-padding ids and additive masks
+for all four models, including a real token whose id equals the pad id. Its
+independent generator uses only the shared token fixtures, not model inference.
+The worker consumes the same padding helper checked by this golden test.
+
+The module's ignored hardware tests run real release workers through the
+production handshake, inherited-lock spawning and residency supervisor. Build
+the worker with `cargo build --release --locked -p synapse-worker-ane-direct`.
+Set `ANE_TEST_WORKER` to its absolute path and `ANE_TEST_PACKAGES` to the four
+converted-package directory. Run the killed-holder test with:
+
+```
+cargo test --release --locked -p synapse-module killed_holder_with_resident_work_keeps_lane_busy_until_old_worker_exits -- --ignored --nocapture
+```
+
+Run the 37-request stress harness with:
+
+```
+python3 crates/synapse-worker-ane-direct/tests/run_stress.py --wait-for-load --timeout 7200 --out crates/synapse-worker-ane-direct/evidence/stress-dev.json
+```
+
+Omit `--out` to use a temporary JSON file. The Rust test validates the committed
+development schema and refuses to start if the one-minute load is at least16.
+The report records machine identifiers, OS build, source commit and all three
+load averages. It is development evidence, never release certification.
+Reranker pools at128/512/2048 must be finite with byte-identical repeats. The
+Metal ordering comparison is explicitly skipped when that lane/package is not
+available; a2048-rung parity fixture remains a parity-crate follow-up, not a new
+worker-authored model reference generator.
