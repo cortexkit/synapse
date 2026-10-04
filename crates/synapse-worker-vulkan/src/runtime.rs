@@ -710,8 +710,8 @@ impl Arena {
             device.raw.update_descriptor_sets(&writes, &[]);
         }
         let cooperative = params.op == 1
-            && params.inner % 16 == 0
-            && params.cols % 16 == 0
+            && params.inner.is_multiple_of(16)
+            && params.cols.is_multiple_of(16)
             && device.cooperative.is_some();
         let groups = if cooperative {
             params.rows.div_ceil(16) * params.cols.div_ceil(16)
@@ -880,6 +880,8 @@ impl Engine {
     fn weight(&self, name: &str) -> String {
         format!("weight:{}{name}", self.model.tensor_prefix)
     }
+    // Operands name shader descriptor bindings directly; keep their order visible.
+    #[allow(clippy::too_many_arguments)]
     fn run(
         &self,
         p: Params,
@@ -904,6 +906,8 @@ impl Engine {
             count,
         )
     }
+    // Matrix geometry and buffer operands remain explicit at projection call sites.
+    #[allow(clippy::too_many_arguments)]
     fn linear(
         &self,
         rows: u32,
@@ -931,6 +935,8 @@ impl Engine {
             rows * cols,
         )
     }
+    // Keep the normalization geometry, buffer operands and numeric policy explicit.
+    #[allow(clippy::too_many_arguments)]
     fn norm(
         &self,
         rows: u32,

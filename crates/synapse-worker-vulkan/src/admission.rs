@@ -215,7 +215,8 @@ mod tests {
     #[test]
     fn each_missing_requirement_has_exact_code() {
         let required = requirements(&crate::manifest(), None).unwrap();
-        let cases: Vec<(&str, Box<dyn Fn(&mut Adapter)>)> = vec![
+        type RefusalCase = (&'static str, Box<dyn Fn(&mut Adapter)>);
+        let cases: Vec<RefusalCase> = vec![
             (
                 "vulkan_software_device",
                 Box::new(|a| {
