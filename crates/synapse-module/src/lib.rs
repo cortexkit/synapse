@@ -20592,6 +20592,19 @@ mod catalog_runtime_tests {
         assert_eq!(removed["removed_manifests"].as_array().unwrap().len(), 1);
         assert_eq!(requests.load(Ordering::SeqCst), 1);
         server.abort();
+        // The detached download task still holds a state clone, and with it
+        // the store connection, for a moment after the job reads committed.
+        // Windows refuses to delete a directory with an open file, so wait
+        // until this test holds the only reference before removing it.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while Arc::strong_count(&state) > 1 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{} module-state references still held",
+                Arc::strong_count(&state)
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         drop(state);
         fs::remove_dir_all(root).unwrap();
     }
