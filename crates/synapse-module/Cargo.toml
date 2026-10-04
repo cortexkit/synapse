@@ -29,6 +29,7 @@ test-support = ["synapse-engine-owned/test-support"]
 [dependencies]
 anyhow = { workspace = true }
 synapse-core = { path = "../synapse-core" }
+synapse-certify = { path = "../synapse-certify" }
 synapse-engine-owned = { path = "../synapse-engine-owned" }
 owned-decode-worker = { path = "../synapse-engine-owned/owned-decode-worker" }
 serde = { workspace = true }

@@ -21,6 +21,24 @@ async fn main() {
         return;
     }
 
+    match synapse_certify::command::parse(&arguments) {
+        Ok(Some(command)) => {
+            match synapse_certify::command::dispatch(command) {
+                Ok(report) => println!("{report}"),
+                Err(error) => {
+                    eprintln!("{error}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+    }
+
     match parse_restore_import(&arguments) {
         Ok(Some((capture, store_directory))) => {
             match synapse_module::restore_import(&capture, store_directory.as_deref()) {
@@ -87,6 +105,33 @@ fn parse_restore_import(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn certification_verbs_are_recognized_before_module_startup() {
+        for arguments in [
+            vec![
+                "certify".into(),
+                "run".into(),
+                "--row".into(),
+                "metal-m5".into(),
+                "--model".into(),
+                "gte-modernbert-base".into(),
+            ],
+            vec![
+                "certify".into(),
+                "validate".into(),
+                "--assets".into(),
+                "assets".into(),
+                "checkout".into(),
+            ],
+        ] {
+            assert!(synapse_certify::command::parse(&arguments)
+                .unwrap()
+                .is_some());
+            assert_eq!(parse_restore_import(&arguments).unwrap(), None);
+        }
+        assert!(synapse_certify::command::parse(&["certify".into()]).is_err());
+    }
 
     #[test]
     fn restore_import_accepts_canonical_and_explicit_target_shapes() {

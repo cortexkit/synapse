@@ -12,6 +12,7 @@ members = [
     "bench/spikes/unified-rt",
     "bench/lanes/candle-embed",
     "crates/synapse-core",
+    "crates/synapse-certify",
     "crates/synapse-engine-owned",
     "crates/synapse-engine-cuda",
     "crates/synapse-engine-owned/owned-decode-worker",

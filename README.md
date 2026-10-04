@@ -11,6 +11,7 @@ backend or CPU fallback; ONNX Runtime is bench-only. Decode routing is unchanged
 See [the wire contract](docs/wire-contract-v1.md) for operations and migration.
 
 - `synapse-core`: shared protocol, error, cache, fingerprint, scheduler, and tokenizer types.
+- `synapse-certify`: schema-1 certification producer and minimal 32-combination candidate validator.
 - `synapse-engine-owned`: primary in-process Metal/MPSGraph engine for Apple Silicon (embedding, reranking, direct Metal step decode), with the supervised decode worker state machine in its `synapse-engine-owned/owned-decode-worker` subcrate.
 - `synapse-engine-cuda`: development CUDA engine (`owned-cuda-v1`, PTX kernel ports, f16 storage); not a shipped catalog backend.
 - `synapse-module`: SubC management surface, model cache, durable jobs, and worker host. Builds the `ck-synapse` binary (fleet `ck-*` naming convention for Activity Monitor grouping; `module_id` stays `synapse`).
