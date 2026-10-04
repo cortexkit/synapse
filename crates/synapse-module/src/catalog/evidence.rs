@@ -390,8 +390,7 @@ mod tests {
     const ENGINE_TREE: &str =
         "1111111111111111111111111111111111111111\n2222222222222222222222222222222222222222";
 
-    /// A passing record set for every backend the compiled catalog declares,
-    /// as a reference run would write it.
+    /// Synthetic passing records for verifier tests, not hardware evidence.
     fn passing_records() -> BTreeMap<String, Value> {
         let catalog = compiled_catalog().unwrap();
         let mut records = BTreeMap::new();
@@ -451,6 +450,27 @@ mod tests {
 
     const GTE: &str = "gte-modernbert-base__metal.json";
     const RERANKER: &str = "gte-reranker-modernbert-base__metal.json";
+
+    /// Release-only gate: ordinary workspace tests use synthetic fixtures.
+    /// Missing hardware evidence must block a tag rather than skip this check.
+    #[test]
+    #[ignore = "requires checked-in full-corpus hardware evidence for the release tree"]
+    fn release_catalog_evidence() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let engine_tree = engine_tree_at(&root, "HEAD").expect("release engine trees at HEAD");
+        let records = read_evidence_dir(&root.join(EVIDENCE_DIR)).expect("read release evidence");
+        match verify_catalog_evidence(COMPILED_CATALOG_JSON, &records, &engine_tree) {
+            Ok(verified) => println!("verified {} catalog backends at HEAD", verified.len()),
+            Err(failures) => {
+                for failure in &failures {
+                    eprintln!("{failure}");
+                }
+                panic!(
+                    "release evidence failed: a fresh-run producer must write matching full-corpus hardware records to {EVIDENCE_DIR}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn passing_records_verify_every_declared_backend() {

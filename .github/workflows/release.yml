@@ -26,7 +26,23 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  verify-catalog-evidence:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify catalog evidence at the release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p synapse-module --lib \
+            catalog::evidence::tests::release_catalog_evidence -- \
+            --ignored --exact --nocapture 2>&1 | tee catalog-evidence.log
+          # Cargo succeeds on a misspelled filter too; require the gate to run.
+          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' catalog-evidence.log
+
   build:
+    needs: verify-catalog-evidence
     strategy:
       fail-fast: false
       matrix:
@@ -97,6 +113,17 @@ jobs:
           } while ($attempts -lt 3)
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
+      - name: Reject ORT dependencies in every release package
+        working-directory: synapse
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo tree --locked --target all --edges normal,build,dev --prefix none \
+            --format '{p}' ${{ matrix.packages }} > release-dependencies.txt
+          # Match the package name token, not a substring of another crate name.
+          awk '$1 == "ort" || $1 == "synapse-engine-ort" { print; found = 1 }
+               END { exit found ? 1 : 0 }' release-dependencies.txt
+
       - name: Build release binaries
         working-directory: synapse
         shell: bash
@@ -143,6 +170,24 @@ jobs:
             rm -rf "$staging"
           done
           ls -la dist/
+
+      - name: Reject ONNX Runtime DLLs in Windows assets
+        if: matrix.name == 'windows-x64'
+        working-directory: synapse
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile
+          assets = list(Path('dist').glob('*.zip'))
+          assert assets, 'no Windows release archives to inspect'
+          for asset in assets:
+              with ZipFile(asset) as archive:
+                  for name in archive.namelist():
+                      basename = name.replace('\\', '/').rsplit('/', 1)[-1]
+                      assert basename.lower() != 'onnxruntime.dll', f'{asset}: {name}'
+          print(f'checked {len(assets)} Windows release archives: no onnxruntime.dll')
+          PY
 
       # The oldest ck-subc this build is known to run against. `ck upgrade` and
       # `ck setup` read this floor and refuse an older daemon up front, instead
