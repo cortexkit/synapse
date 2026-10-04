@@ -91,6 +91,44 @@ fn no_output_fails_every_gate_with_zero_completed_fixtures() {
 }
 
 #[test]
+fn partial_output_fails_every_gate_and_reports_incomplete_output() {
+    let manifest = manifest();
+    for profile_id in [
+        "gte-modernbert-base.owned-metal",
+        "gte-reranker-modernbert-base.owned-metal",
+    ] {
+        let model = &manifest.profiles[profile_id].model;
+        let fixtures = FixtureSet::load(&parity_dir(), &manifest, model).unwrap();
+        let mut outputs = reference_outputs(&manifest, model, &fixtures);
+        let complete = evaluate(&manifest, profile_id, "fp", &fixtures, &outputs).unwrap();
+        let gates = serde_json::to_value(&complete.gates).unwrap();
+        assert!(
+            gates.as_object().unwrap().values().all(|v| v == true),
+            "{profile_id}: {complete:?}"
+        );
+        let expected = fixtures.cases().len();
+        assert_eq!(complete.expected_fixtures, expected);
+        assert_eq!(complete.completed_fixtures, expected);
+
+        assert!(outputs.remove(&fixtures.cases()[0].id).is_some());
+        assert_eq!(outputs.len(), expected - 1);
+        assert!(!outputs.is_empty());
+        let partial = evaluate(&manifest, profile_id, "fp", &fixtures, &outputs).unwrap();
+        assert_eq!(partial.expected_fixtures, expected);
+        assert_eq!(partial.completed_fixtures, expected - 1);
+        let gates = serde_json::to_value(&partial.gates).unwrap();
+        assert!(
+            gates.as_object().unwrap().values().all(|v| v == false),
+            "{profile_id}: {partial:?}"
+        );
+        assert!(partial
+            .failures
+            .iter()
+            .any(|failure| failure == "incomplete_output"));
+    }
+}
+
+#[test]
 fn embedding_dimension_finiteness_norm_and_cosine_are_independent() {
     let manifest = manifest();
     let model = "gte-modernbert-base";
