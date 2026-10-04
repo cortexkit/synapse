@@ -40,6 +40,18 @@ The old failure is therefore not an established per-program or executable-count
 ceiling. See [the resource measurements](resource-experiments.md) for each
 executable's payload, I/O allocations and machine load.
 
+Warm 512-token gte embedding latency is now 26.800ms after batching the exact
+fp32 rotation matrices on CPU Accelerate, instead of scalar per-token dense
+loops. See [the before/after stage table](latency-stages.md); transformer graphs
+and cached ANE requests are unchanged.
+
+A load-specific `no ANE resources` failure drops all previously loaded layer
+executables and returns `ane_resources_exhausted` without admitting the shape.
+The module supervisor then evicts its lane-wide LRU unleased shape and retries
+once; another exhaustion (or no unleased victim) becomes a transient refusal
+with a 250ms retry delay. For other admission errors the module still restarts
+the worker and forgets every shape previously counted for that worker.
+
 The worker still has no passing simultaneous-request stress result. That test
 must complete 28 shape/model admissions, eight two-rung embedding requests and
 one three-rung reranker pool through FIFO admission and unleased eviction. All

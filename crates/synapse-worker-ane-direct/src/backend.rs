@@ -210,6 +210,16 @@ impl Model {
             .with_context(|| format!("tensor_missing:{name}"))
     }
     pub fn admit(&mut self, shape: usize, os: &str) -> Result<AnePlacementInventory> {
+        self.admit_with_compiler(shape, os, |graph, _| {
+            graph.compile(NSQualityOfService::UserInteractive)
+        })
+    }
+    fn admit_with_compiler(
+        &mut self,
+        shape: usize,
+        os: &str,
+        mut compile: impl FnMut(&Graph, usize) -> std::result::Result<ane::Executable, ane::Error>,
+    ) -> Result<AnePlacementInventory> {
         ensure!(LADDER.contains(&shape), "invalid_shape");
         if let Some(resident) = self.resident.get(&shape) {
             return Ok(resident.inventory.clone());
@@ -258,13 +268,15 @@ impl Model {
             };
             #[cfg(test)]
             let layer_started = std::time::Instant::now();
-            let result = graph.compile(NSQualityOfService::UserInteractive);
+            let result = compile(&graph, layer);
             #[cfg(test)]
             if let Some(payload) = diagnostic {
-                diagnostic_artifact(payload);
+                diagnostic_artifact(payload, result.is_ok());
                 println!("LAYER_LOAD shape={shape} layer={layer} prior_loaded={} elapsed_ms={:.3} outcome={}", executables.len(), layer_started.elapsed().as_secs_f64()*1000.0, result.as_ref().map(|_| "LOADED".to_owned()).unwrap_or_else(|e| e.to_string()));
             }
-            executables.push(result.with_context(|| format!("compile layer {layer}"))?);
+            // The vector stays local until every layer loads. Returning an
+            // error drops all previous executables before the worker replies.
+            executables.push(result.map_err(|error| admission_error(error, layer))?);
         }
         self.resident.insert(
             shape,
@@ -734,6 +746,39 @@ mod fresh_process_hardware {
             .to_owned();
         Model::load(profile, &root.join(format!("{slug}.safetensors")), &digest).unwrap()
     }
+    #[test]
+    #[ignore = "Nth-load rollback uses real ANE executables and pinned weights"]
+    fn nth_load_exhaustion_leaves_shape_fully_absent() {
+        let mut model = model("gte-modernbert-base");
+        let mut attempts = 0;
+        let failure = model
+            .admit_with_compiler(128, "rollback-test", |graph, layer| {
+                attempts += 1;
+                if layer == 3 {
+                    Err(ane::Error::Load(
+                        "no ANE resources (transient; retry)".into(),
+                    ))
+                } else {
+                    graph.compile(NSQualityOfService::UserInteractive)
+                }
+            })
+            .unwrap_err();
+        assert!(failure.to_string().starts_with("ane_resources_exhausted:"));
+        assert_eq!(attempts, 4);
+        assert!(
+            model.resident.is_empty(),
+            "partially loaded shape became resident"
+        );
+        assert_eq!(
+            model.run(&[1]).unwrap_err().to_string(),
+            "shape_not_admitted"
+        );
+        let inventory = model.admit(128, "rollback-test").unwrap();
+        assert_eq!(inventory.executables.len(), 22);
+        assert_eq!(model.resident.len(), 1);
+        drop(model);
+        cleanup_diagnostic_artifacts();
+    }
     fn resident_surface_bytes(model: &Model) {
         for (&shape, resident) in &model.resident {
             let sizes = [
@@ -815,7 +860,7 @@ mod fresh_process_hardware {
                 .map(|_| "LOADED".to_owned())
                 .unwrap_or_else(|e| e.to_string())
         );
-        diagnostic_artifact(payload);
+        diagnostic_artifact(payload, result.is_ok());
         let success = result.is_ok();
         drop(result);
         cleanup_diagnostic_artifacts();
@@ -908,6 +953,7 @@ fn diagnostic_payload(graph: &Graph, shape: usize, layer: usize) -> (String, Str
 #[cfg(test)]
 fn diagnostic_artifact(
     (prefix, weight_digest, mil_bytes, weight_bytes): (String, String, usize, usize),
+    loaded: bool,
 ) {
     let paths: Vec<_> = std::fs::read_dir(std::env::temp_dir())
         .unwrap()
@@ -924,6 +970,10 @@ fn diagnostic_artifact(
                 })
         })
         .collect();
+    // An injected or pre-emission failure has no artifact to inspect.
+    if paths.is_empty() && !loaded {
+        return;
+    }
     assert_eq!(
         paths.len(),
         1,
@@ -1065,5 +1115,35 @@ mod cpu_rotation_tests {
             }
         }
         assert!(matmul_channels(&matrix[..8], &input, 3, 2, false).is_err());
+    }
+}
+
+fn admission_error(error: ane::Error, layer: usize) -> anyhow::Error {
+    if matches!(&error, ane::Error::Load(message) if message.contains("no ANE resources")) {
+        anyhow::anyhow!("ane_resources_exhausted:compile layer {layer}: {error}")
+    } else {
+        anyhow::Error::new(error).context(format!("compile layer {layer}"))
+    }
+}
+
+#[cfg(test)]
+mod admission_error_tests {
+    use super::*;
+    #[test]
+    fn only_resource_load_failure_gets_exhaustion_code() {
+        let transient = admission_error(
+            ane::Error::Load("no ANE resources (transient; retry)".into()),
+            3,
+        );
+        assert!(transient
+            .to_string()
+            .starts_with("ane_resources_exhausted:"));
+        for other in [
+            ane::Error::Load("another load error".into()),
+            ane::Error::Compile("no ANE resources".into()),
+            ane::Error::Evaluate("no ANE resources".into()),
+        ] {
+            assert_eq!(admission_error(other, 3).to_string(), "compile layer 3");
+        }
     }
 }

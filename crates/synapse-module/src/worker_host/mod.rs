@@ -169,12 +169,18 @@ impl WorkerHostError {
             risk_class: EngineRiskClass::AbortCapable,
             message: self.to_string(),
             retry_after_ms: match self {
+                Self::WorkerErr { code, .. }
+                    if code == ane_residency::ERR_ANE_RESOURCES_EXHAUSTED =>
+                {
+                    Some(ane_residency::ANE_RESOURCES_RETRY_AFTER_MS)
+                }
                 Self::Quarantined { .. } | Self::WorkerErr { .. } | Self::HelloRefused { .. } => {
                     None
                 }
                 _ => Some(250),
             },
-            safe_to_retry_same_request: matches!(self, Self::EngineCrashed { .. }),
+            safe_to_retry_same_request: matches!(self, Self::EngineCrashed { .. })
+                || matches!(self, Self::WorkerErr {code, ..} if code == ane_residency::ERR_ANE_RESOURCES_EXHAUSTED),
         }
     }
 
@@ -3393,6 +3399,8 @@ pub mod ane_residency {
     pub const ANE_SHAPE_LADDER: [usize; 7] = [128, 256, 512, 1024, 2048, 4096, 8192];
     pub const ANE_RESIDENT_SHAPES_PER_MODEL: usize = 4;
     pub const ANE_RESIDENT_SHAPES_TOTAL: usize = 8;
+    pub const ERR_ANE_RESOURCES_EXHAUSTED: &str = "ane_resources_exhausted";
+    pub const ANE_RESOURCES_RETRY_AFTER_MS: u64 = 250;
     /// Lock file, relative to the home directory, held by the one module
     /// process allowed to run direct-ANE workers.
     pub const ANE_DIRECT_LOCK_HOME_PATH: &str = "Library/Caches/ck-synapse/ane-direct.lock";
@@ -3414,6 +3422,8 @@ pub mod ane_residency {
         /// The worker answered `ERR`.
         #[error("worker returned {code}: {msg}")]
         WorkerErr { code: String, msg: String },
+        #[error("ane_resources_exhausted: {msg}; retry after {retry_after_ms}ms")]
+        ResourcesExhausted { msg: String, retry_after_ms: u64 },
         #[error("direct-ANE worker channel: {0}")]
         Channel(String),
         #[error("ane_lane_busy: another live process holds {}", path.display())]
@@ -3423,10 +3433,27 @@ pub mod ane_residency {
     }
 
     impl AneResidencyError {
+        pub fn to_engine_error(
+            &self,
+            stage: synapse_core::EngineErrorStage,
+        ) -> synapse_core::EngineError {
+            synapse_core::EngineError {
+                stage,
+                risk_class: synapse_core::EngineRiskClass::AbortCapable,
+                message: self.to_string(),
+                retry_after_ms: if let Self::ResourcesExhausted { retry_after_ms, .. } = self {
+                    Some(*retry_after_ms)
+                } else {
+                    None
+                },
+                safe_to_retry_same_request: matches!(self, Self::ResourcesExhausted { .. }),
+            }
+        }
         pub fn code(&self) -> Option<&str> {
             match self {
                 Self::WorkerErr { code, .. } => Some(code),
                 Self::LaneBusy { .. } => Some(ERR_ANE_LANE_BUSY),
+                Self::ResourcesExhausted { .. } => Some(ERR_ANE_RESOURCES_EXHAUSTED),
                 _ => None,
             }
         }
@@ -3704,7 +3731,9 @@ pub mod ane_residency {
                         key,
                         slot_id,
                         owner,
-                    } => self.evict(owner, key, slot_id).await,
+                    } => {
+                        self.evict(owner, key, slot_id).await;
+                    }
                     Step::Wait => notified.await,
                 }
             }
@@ -3835,9 +3864,13 @@ pub mod ane_residency {
             let inner = self.inner.clone();
             // The exchange runs on its own task so its outcome is recorded even
             // if the waiting request is dropped part way through.
+            let supervisor = self.clone();
             let task = tokio::spawn(async move {
                 match worker.admit_shape(&key.model_ref, key.shape).await {
                     Ok(inventory) => finish_admit(&inner, &key, slot_id, inventory),
+                    Err(error) if error.code() == Some(ERR_ANE_RESOURCES_EXHAUSTED) => {
+                        retry_resource_admission(&supervisor, &worker, key, slot_id, error).await
+                    }
                     Err(error) => {
                         recover_worker(&inner, &worker).await;
                         Err(error)
@@ -3849,7 +3882,7 @@ pub mod ane_residency {
             })?
         }
 
-        async fn evict(&self, owner: Arc<dyn AneShapeWorker>, key: ShapeKey, slot_id: u64) {
+        async fn evict(&self, owner: Arc<dyn AneShapeWorker>, key: ShapeKey, slot_id: u64) -> bool {
             let inner = self.inner.clone();
             let task = tokio::spawn(async move {
                 match owner.evict_shape(&key.model_ref, key.shape).await {
@@ -3862,6 +3895,7 @@ pub mod ane_residency {
                         }
                         drop(state);
                         inner.changed.notify_waiters();
+                        true
                     }
                     Err(error) => {
                         tracing::warn!(
@@ -3873,11 +3907,83 @@ pub mod ane_residency {
                             "direct-ANE evict failed; restarting the worker"
                         );
                         recover_worker(&inner, &owner).await;
+                        false
                     }
                 }
             });
-            if let Err(error) = task.await {
-                tracing::warn!(target: "worker", error = %error, "direct-ANE eviction task failed");
+            match task.await {
+                Ok(evicted) => evicted,
+                Err(error) => {
+                    tracing::warn!(target: "worker", error = %error, "direct-ANE eviction task failed");
+                    false
+                }
+            }
+        }
+    }
+
+    fn resource_victim(inner: &Inner) -> Option<(ShapeKey, u64, Arc<dyn AneShapeWorker>)> {
+        let mut state = inner.lock();
+        let victim = state
+            .slots
+            .iter()
+            .filter(|(_, slot)| slot.state == SlotState::Resident && slot.leases == 0)
+            .min_by_key(|(_, slot)| slot.last_used)
+            .map(|(key, slot)| (key.clone(), slot.id, slot.worker.clone()));
+        if let Some((key, _, _)) = &victim {
+            state.slots.get_mut(key).unwrap().state = SlotState::Evicting;
+        }
+        victim
+    }
+
+    fn forget_failed_admission(inner: &Inner, key: &ShapeKey, slot_id: u64) {
+        let mut state = inner.lock();
+        if state
+            .slots
+            .get(key)
+            .is_some_and(|slot| slot.id == slot_id && slot.state == SlotState::Admitting)
+        {
+            state.slots.remove(key);
+        }
+        drop(state);
+        inner.changed.notify_waiters();
+    }
+
+    fn resource_refusal(error: AneResidencyError) -> AneResidencyError {
+        AneResidencyError::ResourcesExhausted {
+            msg: error.to_string(),
+            retry_after_ms: ANE_RESOURCES_RETRY_AFTER_MS,
+        }
+    }
+
+    async fn retry_resource_admission(
+        supervisor: &AneResidencySupervisor,
+        worker: &Arc<dyn AneShapeWorker>,
+        key: ShapeKey,
+        slot_id: u64,
+        error: AneResidencyError,
+    ) -> Result<AneShapeLease, AneResidencyError> {
+        // Keep the failed shape's budget reservation while freeing one physical
+        // resident. Selecting and marking the victim under the lock prevents a
+        // new lease from racing the eviction; the worker owns partial rollback.
+        let Some((victim, victim_id, owner)) = resource_victim(&supervisor.inner) else {
+            forget_failed_admission(&supervisor.inner, &key, slot_id);
+            return Err(resource_refusal(error));
+        };
+        if !supervisor.evict(owner, victim, victim_id).await {
+            forget_failed_admission(&supervisor.inner, &key, slot_id);
+            return Err(resource_refusal(error));
+        }
+        // One retry only. A second resource refusal must leave the target absent
+        // without restarting a healthy worker or recursively evicting the lane.
+        match worker.admit_shape(&key.model_ref, key.shape).await {
+            Ok(inventory) => finish_admit(&supervisor.inner, &key, slot_id, inventory),
+            Err(error) if error.code() == Some(ERR_ANE_RESOURCES_EXHAUSTED) => {
+                forget_failed_admission(&supervisor.inner, &key, slot_id);
+                Err(resource_refusal(error))
+            }
+            Err(error) => {
+                recover_worker(&supervisor.inner, worker).await;
+                Err(error)
             }
         }
     }
@@ -3913,8 +4019,8 @@ pub mod ane_residency {
         })
     }
 
-    /// Restarts a worker that answered an admit or evict with `ERR` (or lost
-    /// its connection), then forgets every shape counted for it, since the new
+    /// Restarts a worker after a non-resource admission error or eviction error
+    /// (including a lost connection), then forgets its shapes, since the new
     /// process has none, and wakes the waiting requests.
     async fn recover_worker(inner: &Inner, worker: &Arc<dyn AneShapeWorker>) {
         if let Err(error) = worker.restart().await {
@@ -4215,6 +4321,8 @@ pub mod ane_residency {
             shape_not_admitted: u64,
             /// Admissions the mock answers with `ERR`, once each.
             fail_admit: HashSet<(String, usize)>,
+            exhaust_admit: HashMap<(String, usize), usize>,
+            admit_attempts: HashMap<(String, usize), usize>,
             admit_delay: Duration,
             connects: HashMap<String, u32>,
         }
@@ -4256,7 +4364,27 @@ pub mod ane_residency {
                         tokio::time::sleep(delay).await;
                         let key = (model_ref.clone(), *shape);
                         let mut ledger = ledger.lock().unwrap();
-                        if ledger.fail_admit.remove(&key) {
+                        *ledger.admit_attempts.entry(key.clone()).or_default() += 1;
+                        let exhausted =
+                            ledger.exhaust_admit.get_mut(&key).is_some_and(|remaining| {
+                                if *remaining > 0 {
+                                    *remaining -= 1;
+                                    true
+                                } else {
+                                    false
+                                }
+                            });
+                        if exhausted {
+                            ledger.events.push(format!("exhaust {model_ref} {shape}"));
+                            (
+                                WorkerResponse::Err {
+                                    req_id: Some(req_id.clone()),
+                                    code: ERR_ANE_RESOURCES_EXHAUSTED.into(),
+                                    msg: "injected ANE resource exhaustion".into(),
+                                },
+                                None,
+                            )
+                        } else if ledger.fail_admit.remove(&key) {
                             (
                                 WorkerResponse::Err {
                                     req_id: Some(req_id.clone()),
@@ -4363,6 +4491,129 @@ pub mod ane_residency {
             for key in own {
                 ledger.resident.remove(&key);
             }
+        }
+
+        #[tokio::test]
+        async fn resource_exhaustion_evicts_cross_worker_lru_and_retries_once_without_restart() {
+            let ledger = Arc::new(Mutex::new(Ledger::default()));
+            let a = mock_channel("a", &ledger).await;
+            let b = mock_channel("b", &ledger).await;
+            let supervisor = AneResidencySupervisor::new(AneResidencyLimits::default());
+            let wa: Arc<dyn AneShapeWorker> = a;
+            let wb: Arc<dyn AneShapeWorker> = b;
+            drop(supervisor.lease(&wa, "old", 128).await.unwrap());
+            drop(supervisor.lease(&wb, "new", 256).await.unwrap());
+            ledger
+                .lock()
+                .unwrap()
+                .exhaust_admit
+                .insert(("new".into(), 512), 1);
+            let lease = supervisor.lease(&wb, "new", 512).await.unwrap();
+            let data = ledger.lock().unwrap();
+            assert_eq!(data.admit_attempts[&("new".into(), 512)], 2);
+            assert_eq!(
+                data.events
+                    .iter()
+                    .filter(|event| event.starts_with("evict "))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                vec!["evict old 128"]
+            );
+            assert_eq!(data.connects["a"], 1);
+            assert_eq!(data.connects["b"], 1);
+            assert_eq!(supervisor.stats().restarts, 0);
+            assert!(data.max_per_model <= 4 && data.max_total <= 8);
+            drop(data);
+            drop(lease);
+        }
+
+        #[tokio::test]
+        async fn two_resource_exhaustions_refuse_transiently_after_exactly_one_retry() {
+            let ledger = Arc::new(Mutex::new(Ledger::default()));
+            let channel = mock_channel("worker", &ledger).await;
+            let worker: Arc<dyn AneShapeWorker> = channel;
+            let supervisor = AneResidencySupervisor::new(AneResidencyLimits::default());
+            for rung in [128, 256] {
+                drop(supervisor.lease(&worker, "model", rung).await.unwrap());
+            }
+            ledger
+                .lock()
+                .unwrap()
+                .exhaust_admit
+                .insert(("model".into(), 512), 2);
+            let error = match supervisor.lease(&worker, "model", 512).await {
+                Err(error) => error,
+                Ok(_) => panic!("second exhaustion was not refused"),
+            };
+            assert_eq!(error.code(), Some(ERR_ANE_RESOURCES_EXHAUSTED));
+            let refusal = error.to_engine_error(synapse_core::EngineErrorStage::Load);
+            assert_eq!(refusal.retry_after_ms, Some(ANE_RESOURCES_RETRY_AFTER_MS));
+            assert!(refusal.safe_to_retry_same_request);
+            let data = ledger.lock().unwrap();
+            assert_eq!(data.admit_attempts[&("model".into(), 512)], 2);
+            assert_eq!(
+                data.events
+                    .iter()
+                    .filter(|e| e.starts_with("evict "))
+                    .count(),
+                1
+            );
+            assert_eq!(data.connects["worker"], 1);
+            assert!(!data.resident.contains(&("model".into(), 512)));
+            assert_eq!(supervisor.resident_shapes()["model"], vec![256]);
+            assert_eq!(supervisor.stats().restarts, 0);
+        }
+
+        #[tokio::test]
+        async fn resource_exhaustion_never_evicts_a_leased_shape() {
+            let ledger = Arc::new(Mutex::new(Ledger::default()));
+            let channel = mock_channel("worker", &ledger).await;
+            let worker: Arc<dyn AneShapeWorker> = channel;
+            let supervisor = AneResidencySupervisor::new(AneResidencyLimits::default());
+            let protected = supervisor.lease(&worker, "model", 128).await.unwrap();
+            ledger
+                .lock()
+                .unwrap()
+                .exhaust_admit
+                .insert(("model".into(), 512), 1);
+            let error = match supervisor.lease(&worker, "model", 512).await {
+                Err(error) => error,
+                Ok(_) => panic!("leased-only lane should refuse instead of evicting"),
+            };
+            assert_eq!(
+                error
+                    .to_engine_error(synapse_core::EngineErrorStage::Load)
+                    .retry_after_ms,
+                Some(250)
+            );
+            let data = ledger.lock().unwrap();
+            assert_eq!(data.admit_attempts[&("model".into(), 512)], 1);
+            assert!(data.resident.contains(&("model".into(), 128)));
+            assert!(!data.events.iter().any(|e| e.starts_with("evict ")));
+            assert_eq!(supervisor.stats().restarts, 0);
+            drop(data);
+            drop(protected);
+        }
+
+        #[test]
+        fn typed_worker_resource_error_has_public_retry_delay() {
+            let error = super::super::WorkerHostError::WorkerErr {
+                code: ERR_ANE_RESOURCES_EXHAUSTED.into(),
+                msg: "pressure".into(),
+            };
+            let mapped = error.to_engine_error(synapse_core::EngineErrorStage::Load);
+            assert_eq!(mapped.retry_after_ms, Some(250));
+            assert!(mapped.safe_to_retry_same_request);
+            let other = super::super::WorkerHostError::WorkerErr {
+                code: "compile_failed".into(),
+                msg: "bad graph".into(),
+            };
+            assert_eq!(
+                other
+                    .to_engine_error(synapse_core::EngineErrorStage::Load)
+                    .retry_after_ms,
+                None
+            );
         }
 
         async fn mock_channel(worker_id: &str, ledger: &SharedLedger) -> Channel {
