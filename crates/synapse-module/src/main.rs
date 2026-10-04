@@ -23,7 +23,12 @@ async fn main() {
 
     match synapse_certify::command::parse(&arguments) {
         Ok(Some(command)) => {
-            match synapse_certify::command::dispatch(command) {
+            let source = if option_env!("SYNAPSE_BUILD_TREE") == Some("clean") {
+                option_env!("SYNAPSE_BUILD_REV")
+            } else {
+                None
+            };
+            match synapse_certify::command::dispatch(command, source) {
                 Ok(report) => println!("{report}"),
                 Err(error) => {
                     eprintln!("{error}");

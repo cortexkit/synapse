@@ -54,11 +54,11 @@ pub fn parse(arguments: &[OsString]) -> Result<Option<Command>> {
     }
 }
 
-pub fn dispatch(command: Command) -> Result<serde_json::Value> {
+pub fn dispatch(command: Command, source: Option<&str>) -> Result<serde_json::Value> {
     match command {
         Command::Run { .. } => Err(refuse(LIVE_RUNNER_MISSING)),
         Command::Validate { assets, checkout } => {
-            let source = env!("SYNAPSE_CERTIFICATION_SOURCE");
+            let source = source.ok_or_else(|| refuse("candidate was built from a dirty tree or without git; evidence cannot be bound to a commit"))?;
             let eligible = validate_checkout(&checkout, &assets, source)?;
             Ok(serde_json::json!({"source_commit": source, "eligible": eligible}))
         }
@@ -107,7 +107,7 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(
-            dispatch(command).unwrap_err().to_string(),
+            dispatch(command, None).unwrap_err().to_string(),
             format!("certification_refused: {LIVE_RUNNER_MISSING}")
         );
     }

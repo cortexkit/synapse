@@ -5,9 +5,11 @@ and the offline validator for matrix coverage, status, drop evidence, artifact
 digests and parity identity. `ck-synapse certify validate --assets <dir>
 <checkout-root>` validates the 32 canonical records under
 `docs/evidence/certification/<candidate-source-commit>/`. The candidate source
-commit is embedded when the candidate binary is built, so an evidence-only
-commit does not change which records the candidate validates. Artifact paths
-are relative to the extracted candidate asset directory, not ZIP paths; the
+commit is supplied from the module's existing build stamp only when its source
+tree was clean. A dirty build or a build without Git provenance refuses
+validation because its evidence cannot be bound to a commit. An evidence-only
+commit does not change which records an already-built candidate validates.
+Artifact paths are relative to the extracted candidate asset directory, not ZIP paths; the
 validator hashes the files themselves. Only passed combinations appear in the
 returned `eligible` list.
 

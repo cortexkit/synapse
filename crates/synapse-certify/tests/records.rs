@@ -400,3 +400,39 @@ fn validator_does_not_add_producer_gates() {
     records[0].parity.gates = BTreeMap::from([("score".into(), false)]);
     assert!(validate(&records, &assets.0).is_ok());
 }
+
+#[test]
+fn validate_dispatch_uses_supplied_clean_candidate_source() {
+    let assets = Assets::new();
+    for record in matrix(&assets) {
+        write_record(&record, &assets.0).unwrap();
+    }
+    let source = "a".repeat(40);
+    let report = synapse_certify::command::dispatch(
+        synapse_certify::command::Command::Validate {
+            assets: assets.0.clone(),
+            checkout: assets.0.clone(),
+        },
+        Some(&source),
+    )
+    .unwrap();
+    assert_eq!(report["source_commit"], source);
+    assert_eq!(report["eligible"].as_array().unwrap().len(), 32);
+}
+
+#[test]
+fn validate_dispatch_without_clean_source_refuses_and_writes_nothing() {
+    let assets = Assets::new();
+    let checkout = assets.0.join("absent-checkout");
+    let error = synapse_certify::command::dispatch(
+        synapse_certify::command::Command::Validate {
+            assets: assets.0.join("absent-assets"),
+            checkout: checkout.clone(),
+        },
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(error.to_string(), "certification_refused: candidate was built from a dirty tree or without git; evidence cannot be bound to a commit");
+    assert!(!checkout.exists());
+    assert_eq!(std::fs::read_dir(&assets.0).unwrap().count(), 3);
+}
