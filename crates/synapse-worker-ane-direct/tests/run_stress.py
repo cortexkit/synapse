@@ -20,7 +20,7 @@ if args.out:
     env["ANE_STRESS_OUT"] = str(args.out.resolve())
 env.setdefault("ANE_TEST_WORKER", str(ROOT / "target/release/ck-synapse-worker-ane-direct"))
 env.setdefault("ANE_TEST_PACKAGES", str(ROOT / "target/ane-direct-packages"))
-command = ["cargo", "test", "--release", "--locked", "-p", "synapse-module", "worker_host::ane_residency::hardware_tests::real_direct_ane_residency_stress", "--", "--ignored", "--exact", "--nocapture"]
+command = ["cargo", "test", "--locked", "-p", "synapse-module", "worker_host::ane_residency::hardware_tests::real_direct_ane_residency_stress", "--", "--ignored", "--exact", "--nocapture"]
 deadline = time.monotonic() + args.timeout
 if os.getloadavg()[0] >= 16:
     if not args.wait_for_load:

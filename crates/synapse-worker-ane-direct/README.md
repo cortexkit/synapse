@@ -32,7 +32,7 @@ failed loading layer 14 at 4096 with
 `Program load failed — no ANE resources (transient; retry) (underlying=0x5)`.
 The ladder experiment dropped all earlier shapes before each admission; the
 failure occurred while accumulating the current shape's layer executables, not
-while retaining six shapes. This is a measured failure of the required ladder,
+after earlier shapes had been cleared. This was a real transient load failure,
 not an authorized model drop.
 Subsequent fresh release processes retained all 22 layer executables at each
 of 2048, 4096 and 8192 successfully. Layer 14 also loaded alone at 4096 and 8192.
@@ -55,10 +55,10 @@ the worker and forgets every shape previously counted for that worker.
 The worker still has no passing simultaneous-request stress result. That test
 must complete 28 shape/model admissions, eight two-rung embedding requests and
 one three-rung reranker pool through FIFO admission and unleased eviction. All
-outputs must match their reference fixtures, every residency sample must stay
-within four shapes per model and eight overall, and no leased eviction,
-`shape_not_admitted` or `no ANE resources` error may occur. No stress success
-artifact is fabricated and no resource-management redesign has been selected.
+outputs must be finite, reranker repeats must be byte-identical, every residency
+sample must stay within four shapes per model and eight overall, and no leased
+eviction, `shape_not_admitted` or `no ANE resources` error may occur. Numerical
+parity remains a separate check; no stress success artifact is fabricated.
 
 Four-model short-input real-weight parity at 128 was measured against the
 committed fp32 fixtures:
@@ -103,7 +103,7 @@ Set `ANE_TEST_WORKER` to its absolute path and `ANE_TEST_PACKAGES` to the four
 converted-package directory. Run the killed-holder test with:
 
 ```
-cargo test --release --locked -p synapse-module killed_holder_with_resident_work_keeps_lane_busy_until_old_worker_exits -- --ignored --nocapture
+cargo test --locked -p synapse-module killed_holder_with_resident_work_keeps_lane_busy_until_old_worker_exits -- --ignored --nocapture
 ```
 
 Run the 37-request stress harness with:
@@ -114,8 +114,10 @@ python3 crates/synapse-worker-ane-direct/tests/run_stress.py --wait-for-load --t
 
 Omit `--out` to use a temporary JSON file. The Rust test validates the committed
 development schema and refuses to start if the one-minute load is at least16.
-The report records machine identifiers, OS build, source commit and all three
-load averages. It is development evidence, never release certification.
+The report records machine identifiers, OS build, source commit, harness profile
+and all three load averages. The test driver may use debug mode (the unrelated
+owned-decode release build requires the Metal developer toolchain), but the
+spawned direct-ANE workers use the release binary. It is development evidence, never release certification.
 Reranker pools at128/512/2048 must be finite with byte-identical repeats. The
 Metal ordering comparison is explicitly skipped when that lane/package is not
 available; a2048-rung parity fixture remains a parity-crate follow-up, not a new

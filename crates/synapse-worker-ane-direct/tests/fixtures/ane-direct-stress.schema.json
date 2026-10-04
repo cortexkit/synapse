@@ -2,11 +2,12 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Direct ANE development stress measurement",
   "type": "object",
-  "required": ["schema", "kind", "source_commit", "machine", "os", "load_1_5_15_start", "load_1_5_15_end", "request_count", "completed_count", "request_errors", "sample_count", "samples", "max_resident_per_model", "max_resident_total", "admitted_count", "evicted_count", "shape_not_admitted_count", "leased_evict_count", "no_ane_resources", "ane_lane_busy", "metal_ranking_check", "reranker_pool_check"],
+  "required": ["schema", "kind", "harness_profile", "source_commit", "machine", "os", "load_1_5_15_start", "load_1_5_15_end", "request_count", "completed_count", "request_errors", "sample_count", "samples", "max_resident_per_model", "max_resident_total", "admitted_count", "evicted_count", "shape_not_admitted_count", "leased_evict_count", "no_ane_resources", "ane_lane_busy", "metal_ranking_check", "reranker_pool_check"],
   "additionalProperties": false,
   "properties": {
     "schema": {"type": "integer", "const": 1},
     "kind": {"type": "string", "const": "development"},
+    "harness_profile": {"type": "string", "enum": ["debug", "release"]},
     "source_commit": {"type": "string", "minLength": 40, "maxLength": 40},
     "machine": {"type": "object", "required": ["model_identifier", "platform_uuid"], "properties": {"model_identifier": {"type": "string", "minLength": 1}, "platform_uuid": {"type": "string", "minLength": 1}}},
     "os": {"type": "object", "required": ["version", "build"], "properties": {"version": {"type": "string", "minLength": 1}, "build": {"type": "string", "minLength": 1}}},
