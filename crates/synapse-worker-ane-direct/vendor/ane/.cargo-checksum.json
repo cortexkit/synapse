@@ -1,7 +1,7 @@
 {
   "files": {
     "Cargo.toml": "bb70d7a091b3272101ca3de7dbde0242ab84405fc307cba5f9dd42b86786d8cd",
-    "VENDORED.md": "95a0bf35318b929a73e392d2ce516e1e8a3653622455c902ff016db0d0ee9c12",
+    "VENDORED.md": "b753ad00eed65a8c3391ff992ed33f7f20b16df25e47788a4e3633dbe6c1ae87",
     "build.rs": "d5339f906b4cb1c86b2b7d539729f74c8bc7b3a79f950bf4fffbd312842e8c59",
     "src/ane_client.rs": "9aabbf44811f23a0f13f56349b0f981be55aafe328608c65094a6ba2b681ebf1",
     "src/ane_in_memory_model.rs": "902f0d34eee9c2ff0f12764207110c5552011a3ca6b8e796e9f876d4b761f3bd",
@@ -14,7 +14,7 @@
     "src/error.rs": "2f4fc3dbb6a28f98a4822c3a507b98c45e69a39c08d09190cd97152f571d14f3",
     "src/executable.rs": "e65c4eb8aae0c1c743466204717d05237b706e7f828abd900793f1383b342f6b",
     "src/ffi.rs": "38ad454bda6a5a0f4f4842ef1342ca5c07853dc4e75b52ec48d03a2f72116cfb",
-    "src/graph/compile.rs": "3edea9178aa834318bc3a1c9e9bedad4f50963e174bff990dc35a1be36637bf2",
+    "src/graph/compile.rs": "fe6aad85547aac7432323a14d881253f8b978fd0e55ebd469ad7e08b43e52d4b",
     "src/graph/descriptor.rs": "ce22baf7cddbf05136d8fa81f4796bdef31315bac7f94935d919f6069261b625",
     "src/graph/mod.rs": "896bc499bb7b9ad6d09581cc64f1a8e5fcfc4590ed329ab077ab4da59e4eb815",
     "src/graph/ops.rs": "8c01b946eb7271e644248ddb513bde8ef1650fcb5cfea3977499e00e6d9cb348",

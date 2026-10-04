@@ -250,11 +250,21 @@ impl Model {
             } else {
                 qwen::layer_graph(&mut graph, input, mask, self, layer, shape)?;
             }
-            executables.push(
-                graph
-                    .compile(NSQualityOfService::UserInteractive)
-                    .with_context(|| format!("compile layer {layer}"))?,
-            );
+            #[cfg(test)]
+            let diagnostic = if std::env::var_os("ANE_DIAGNOSTICS").is_some() {
+                Some(diagnostic_payload(&graph, shape, layer))
+            } else {
+                None
+            };
+            #[cfg(test)]
+            let layer_started = std::time::Instant::now();
+            let result = graph.compile(NSQualityOfService::UserInteractive);
+            #[cfg(test)]
+            if let Some(payload) = diagnostic {
+                diagnostic_artifact(payload);
+                println!("LAYER_LOAD shape={shape} layer={layer} prior_loaded={} elapsed_ms={:.3} outcome={}", executables.len(), layer_started.elapsed().as_secs_f64()*1000.0, result.as_ref().map(|_| "LOADED".to_owned()).unwrap_or_else(|e| e.to_string()));
+            }
+            executables.push(result.with_context(|| format!("compile layer {layer}"))?);
         }
         self.resident.insert(
             shape,
@@ -660,5 +670,241 @@ mod ladder_hardware {
             }
         }
         assert_eq!(requests, 28);
+    }
+}
+
+#[cfg(test)]
+mod fresh_process_hardware {
+    use super::*;
+    fn model(slug: &str) -> Model {
+        crate::worker::test_private_api().unwrap();
+        let root = std::path::PathBuf::from(
+            std::env::var_os("ANE_TEST_PACKAGES").expect("ANE_TEST_PACKAGES"),
+        );
+        let operation = if slug.contains("reranker") {
+            "rerank"
+        } else {
+            "embed"
+        };
+        let profile = Profile::select(&format!("{slug}.ane-direct-worker"), operation).unwrap();
+        let digest = profile.numeric["converted_package_digest"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        Model::load(profile, &root.join(format!("{slug}.safetensors")), &digest).unwrap()
+    }
+    fn resident_surface_bytes(model: &Model) {
+        for (&shape, resident) in &model.resident {
+            let sizes = [
+                resident.a.surface().allocationSize(),
+                resident.b.surface().allocationSize(),
+                resident.residual.surface().allocationSize(),
+                resident.mask.surface().allocationSize(),
+            ];
+            println!("RESIDENT_IO shape={shape} iosurface_bytes={sizes:?} total_bytes={} fp32_scratch_bytes={}", sizes.iter().sum::<isize>(), (3 * model.profile.n("hidden_size") + 1) * shape * 4);
+        }
+    }
+    #[test]
+    #[ignore = "fresh-process experiment with real weights; ANE_TEST_SHAPE required"]
+    fn fresh_process_gte_single_shape_admission() {
+        let mut model = model("gte-modernbert-base");
+        assert!(model.resident.is_empty());
+        let shape: usize = std::env::var("ANE_TEST_SHAPE").unwrap().parse().unwrap();
+        let started = std::time::Instant::now();
+        let result = model.admit(shape, "fresh-process-release");
+        println!(
+            "FRESH_SHAPE shape={shape} prior_resident=[] elapsed_ms={:.3} resident={:?} outcome={}",
+            started.elapsed().as_secs_f64() * 1000.0,
+            model.resident.keys().collect::<Vec<_>>(),
+            result
+                .as_ref()
+                .map(|_| "ADMITTED".to_owned())
+                .unwrap_or_else(|e| format!("{e:#}"))
+        );
+        resident_surface_bytes(&model);
+        let success = result.is_ok();
+        drop(result);
+        drop(model);
+        cleanup_diagnostic_artifacts();
+        assert!(success, "shape admission failed; see per-layer diagnostics");
+    }
+    #[test]
+    #[ignore = "fresh-process single-layer diagnostic with real weights"]
+    fn fresh_process_gte_single_layer_load() {
+        let model = model("gte-modernbert-base");
+        let shape: usize = std::env::var("ANE_TEST_SHAPE").unwrap().parse().unwrap();
+        let layer: usize = std::env::var("ANE_TEST_LAYER").unwrap().parse().unwrap();
+        let hidden = model.profile.n("hidden_size");
+        let mut graph = Graph::new();
+        let input = graph.placeholder(modernbert::shape(shape, hidden));
+        let mask = graph.placeholder(modernbert::shape(shape, 1));
+        let residual = if layer == 0 {
+            graph.placeholder(modernbert::shape(shape, hidden))
+        } else {
+            input
+        };
+        let config: modernbert::Config =
+            serde_json::from_value(model.profile.params().clone()).unwrap();
+        let base = format!("{}layers.{layer}", model.profile.prefix());
+        let linear = |name: &str| modernbert::Linear {
+            weight: model
+                .tensor(&format!("{base}.{name}.weight"))
+                .unwrap()
+                .to_vec(),
+        };
+        let weights = modernbert::LayerWeights {
+            qkv: linear("attn.Wqkv"),
+            attention_output: linear("attn.Wo"),
+            attention_norm: (layer > 0).then(|| vec![1.0; hidden]),
+            mlp_input: linear("mlp.Wi"),
+            mlp_output: linear("mlp.Wo"),
+            mlp_norm: vec![1.0; hidden],
+        };
+        let _ = modernbert::layer_graph(
+            &mut graph, input, residual, mask, &weights, &config, layer, shape,
+        );
+        let payload = diagnostic_payload(&graph, shape, layer);
+        let started = std::time::Instant::now();
+        let result = graph.compile(NSQualityOfService::UserInteractive);
+        println!(
+            "FRESH_LAYER shape={shape} layer={layer} elapsed_ms={:.3} outcome={}",
+            started.elapsed().as_secs_f64() * 1000.0,
+            result
+                .as_ref()
+                .map(|_| "LOADED".to_owned())
+                .unwrap_or_else(|e| e.to_string())
+        );
+        diagnostic_artifact(payload);
+        let success = result.is_ok();
+        drop(result);
+        cleanup_diagnostic_artifacts();
+        assert!(success, "single layer failed; see diagnostics");
+    }
+    #[test]
+    #[ignore = "real-weight 512-token latency; ANE_TEST_MODEL required"]
+    fn real_weight_512_warm_latency() {
+        let slug = std::env::var("ANE_TEST_MODEL").unwrap();
+        let mut model = model(&slug);
+        let fixture: Value = serde_json::from_slice(
+            &std::fs::read(format!(
+                "../../bench/parity/fixtures/{slug}/{slug}.ref-v1.transformers-5.16.1.seed-0.json"
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let case = fixture["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|case| {
+                case["input_ids"]
+                    .as_array()
+                    .is_some_and(|ids| ids.len() == 512)
+            })
+            .expect("512-token fixture");
+        let tokens: Vec<u32> = serde_json::from_value(case["input_ids"].clone()).unwrap();
+        let started = std::time::Instant::now();
+        model.admit(512, "latency-test").unwrap();
+        let compile_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let started = std::time::Instant::now();
+        let output = model.run(&tokens).unwrap();
+        let first_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let mut times = Vec::new();
+        for _ in 0..5 {
+            let started = std::time::Instant::now();
+            let repeat = model.run(&tokens).unwrap();
+            times.push(started.elapsed().as_secs_f64() * 1000.0);
+            assert_eq!(output, repeat, "nondeterministic warm result");
+        }
+        let mut sorted = times.clone();
+        sorted.sort_by(f64::total_cmp);
+        let metric = if model.profile.operation() == "embed" {
+            let expected: Vec<f32> = serde_json::from_value(case["output"].clone()).unwrap();
+            let dot = output
+                .iter()
+                .zip(&expected)
+                .map(|(a, b)| *a as f64 * *b as f64)
+                .sum::<f64>();
+            let norm = (output.iter().map(|v| (*v as f64).powi(2)).sum::<f64>()
+                * expected.iter().map(|v| (*v as f64).powi(2)).sum::<f64>())
+            .sqrt();
+            format!("cosine={:.9}", dot / norm)
+        } else {
+            format!(
+                "score={} expected={} abs={:.9}",
+                output[0],
+                case["output"],
+                (output[0] as f64 - case["output"].as_f64().unwrap()).abs()
+            )
+        };
+        println!("LATENCY model={slug} tokens=512 debug_assertions={} compile_ms={compile_ms:.3} first_ms={first_ms:.3} warm_ms={times:?} median_ms={:.3} {metric}", cfg!(debug_assertions), sorted[2]);
+        drop(model);
+        cleanup_diagnostic_artifacts();
+    }
+}
+
+#[cfg(test)]
+fn diagnostic_paths() -> &'static std::sync::Mutex<Vec<std::path::PathBuf>> {
+    static PATHS: std::sync::OnceLock<std::sync::Mutex<Vec<std::path::PathBuf>>> =
+        std::sync::OnceLock::new();
+    PATHS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+#[cfg(test)]
+fn diagnostic_payload(graph: &Graph, shape: usize, layer: usize) -> (String, String, usize, usize) {
+    let (mil, weights) = graph.source_payload();
+    let prefix = format!("{:X}_", Sha256::digest(mil.as_bytes()));
+    println!("LAYER_PAYLOAD shape={shape} layer={layer} attention={} mil_bytes={} weight_bytes={} total_bytes={}", if layer.is_multiple_of(3) { "global" } else { "local" }, mil.len(), weights.len(), mil.len()+weights.len());
+    (
+        prefix,
+        format!("{:x}", Sha256::digest(&weights)),
+        mil.len(),
+        weights.len(),
+    )
+}
+#[cfg(test)]
+fn diagnostic_artifact(
+    (prefix, weight_digest, mil_bytes, weight_bytes): (String, String, usize, usize),
+) {
+    let paths: Vec<_> = std::fs::read_dir(std::env::temp_dir())
+        .unwrap()
+        .filter_map(|entry| {
+            let entry = entry.unwrap();
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(&prefix))
+                .then(|| entry.path())
+                .filter(|path| {
+                    std::fs::read(path.join("weights/weight.bin"))
+                        .is_ok_and(|bytes| format!("{:x}", Sha256::digest(bytes)) == weight_digest)
+                })
+        })
+        .collect();
+    assert_eq!(
+        paths.len(),
+        1,
+        "expected one artifact for this exact MIL/weights payload"
+    );
+    let path = paths.into_iter().next().unwrap();
+    assert_eq!(
+        std::fs::metadata(path.join("model.mil")).unwrap().len() as usize,
+        mil_bytes
+    );
+    assert_eq!(
+        std::fs::metadata(path.join("weights/weight.bin"))
+            .unwrap()
+            .len() as usize,
+        weight_bytes
+    );
+    diagnostic_paths().lock().unwrap().push(path);
+}
+#[cfg(test)]
+fn cleanup_diagnostic_artifacts() {
+    for path in diagnostic_paths().lock().unwrap().drain(..) {
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("remove diagnostic model artifact: {error}"),
+        }
     }
 }

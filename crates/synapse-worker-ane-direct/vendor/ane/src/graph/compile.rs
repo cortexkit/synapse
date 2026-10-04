@@ -54,6 +54,14 @@ impl Graph {
         (all_ops.into_boxed_slice(), shapes.into_boxed_slice())
     }
 
+    /// Return the exact MIL text and packed weights submitted to the private
+    /// compiler. This measures source payloads, not opaque compiled programs.
+    #[doc(hidden)]
+    pub fn source_payload(&self) -> (String, Box<[u8]>) {
+        let (ops, shapes) = self.to_ops_and_shapes();
+        crate::ops::mil::emit_mil(&ops, &shapes)
+    }
+
     /// Compile this graph to an ANE executable.
     ///
     /// Returns [`crate::Error::SpatialWidthTooSmall`] if any placeholder has a
