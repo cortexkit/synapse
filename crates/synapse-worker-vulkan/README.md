@@ -93,3 +93,8 @@ As a hardware regression control, disabling the shader's local-attention window
 lowered the GTE embedding minimum cosine to `0.952105393`; the named GPU parity
 test failed against the `0.999` gate. The shader was restored before subsequent
 verification. This exercises the math itself, not merely its SPIR-V digest.
+
+Linux `x86_64-unknown-linux-gnu` all-target Clippy passes with `-D warnings` for
+both default and `vulkan` feature sets. The diagnostic-API compile-fail doctest
+also has a regression control: removing its non-default feature gate lets the
+import compile and makes the doctest fail; restoring the gate makes it pass.
