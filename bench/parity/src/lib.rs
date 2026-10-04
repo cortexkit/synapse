@@ -14,6 +14,7 @@ pub mod canonical;
 #[cfg(feature = "checkpoints")]
 pub mod checkpoint;
 pub mod convert;
+pub mod evaluator;
 pub mod hadamard;
 pub mod inventory;
 pub mod manifest;

@@ -1,0 +1,7 @@
+{
+  "description": "Reverse ranks 9 through 12 in a 100-candidate pool with reference scores (101-rank)*0.02. Six discordant pairs among 4950 comparable pairs leave global tau above 0.99, but invert reference top-10 candidates.",
+  "permutation": [12, 11, 10, 9],
+  "expected_tau": 0.9975757575757576,
+  "expected_top10": false,
+  "expected_pass": false
+}
