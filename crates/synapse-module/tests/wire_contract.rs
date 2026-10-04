@@ -6,7 +6,9 @@ use synapse_core::error_contract::StableErrorCode;
 const DOC: &str = include_str!("../../../docs/wire-contract-v1.md");
 const SOURCE: &str = include_str!("../src/lib.rs");
 
-fn documented_ops(doc: &str) -> BTreeSet<&str> {
+fn documented_ops(doc: &str) -> BTreeSet<String> {
+    // Normalized so a CRLF checkout still has a blank-line paragraph break.
+    let doc = doc.replace("\r\n", "\n");
     let ops = doc
         .split("The management registry in this snapshot is ")
         .nth(1)
@@ -16,11 +18,12 @@ fn documented_ops(doc: &str) -> BTreeSet<&str> {
         .unwrap();
     ops.split('`')
         .enumerate()
-        .filter_map(|(i, s)| (i % 2 == 1).then_some(s))
+        .filter(|(i, _)| i % 2 == 1)
+        .map(|(_, s)| s.to_string())
         .collect()
 }
 
-fn registered_ops(source: &str) -> BTreeSet<&str> {
+fn registered_ops(source: &str) -> BTreeSet<String> {
     source
         .split("fn management_operations()")
         .nth(1)
@@ -33,6 +36,7 @@ fn registered_ops(source: &str) -> BTreeSet<&str> {
             line.trim()
                 .strip_prefix("op(\"")
                 .and_then(|s| s.split('"').next())
+                .map(str::to_string)
         })
         .collect()
 }
@@ -89,6 +93,13 @@ fn stable_errors_are_exhaustively_documented_and_keep_wire_names() {
             "undocumented stable error {name}"
         );
     }
+}
+
+#[test]
+fn inventory_parse_survives_a_crlf_checkout() {
+    let crlf = DOC.replace('\n', "\r\n");
+    assert_eq!(documented_ops(&crlf), documented_ops(DOC));
+    assert!(documented_ops(&crlf).len() > 10);
 }
 
 #[test]
