@@ -314,23 +314,17 @@ impl Model {
         stages.emit("initial_input_copy_fp32_to_fp16");
         if self.profile.modern() {
             let matrix = self.tensor("rotation_in.weight")?;
-            let mut residual = vec![0.0; input.len()];
+            // The converted residual projection is a dense fp32 matrix, not
+            // just the Hadamard basis. Batch its sequence columns on the CPU.
+            let mut residual = matmul_channels(matrix, &input, hidden, shape, true)?;
+            let direction = rotation_center_direction();
             for position in 0..shape {
-                let row: Vec<_> = (0..hidden).map(|c| input[c * shape + position]).collect();
-                let mut row: Vec<f32> = (0..hidden)
-                    .map(|c| {
-                        row.iter()
-                            .enumerate()
-                            .map(|(i, v)| v * matrix[i * hidden + c])
-                            .sum()
-                    })
-                    .collect();
-                let direction = rotation_center_direction();
-                let mean =
-                    row.iter().zip(direction).map(|(v, q)| v * q).sum::<f32>() / hidden as f32;
+                let mean = (0..hidden)
+                    .map(|c| residual[c * shape + position] * direction[c])
+                    .sum::<f32>()
+                    / hidden as f32;
                 for c in 0..hidden {
-                    row[c] -= mean * direction[c];
-                    residual[c * shape + position] = row[c];
+                    residual[c * shape + position] -= mean * direction[c];
                 }
             }
             stages.emit("rotation_in_fp32");
@@ -368,22 +362,48 @@ impl Model {
         };
         let raw = surface.read_f32();
         stages.emit("final_readback_fp16_to_fp32");
-        let mut rows = Vec::new();
-        for (position, &token) in tokens.iter().enumerate() {
-            let _ = token;
+        // CLS pooling and last-token readout consume only one row. The
+        // ModernBERT classifier needs every unpadded row for mean pooling.
+        let positions: Vec<usize> = if self.profile.modern() && self.profile.operation() == "rerank"
+        {
+            (0..tokens.len()).collect()
+        } else if self.profile.modern() {
+            vec![0]
+        } else {
+            vec![tokens.len() - 1]
+        };
+        let columns = positions.len();
+        let mut normalized = vec![0.0; hidden * columns];
+        let norm_weight = if self.profile.modern() {
+            None
+        } else {
+            Some(self.tensor(&format!("{}norm.weight", self.profile.prefix()))?)
+        };
+        for (column, position) in positions.into_iter().enumerate() {
             let mut row: Vec<_> = (0..hidden).map(|c| raw[c * shape + position]).collect();
-            if self.profile.modern() {
-                rms_cpu(&mut row, None, self.profile.f("norm_eps"));
-                row = linear_cpu(&row, self.tensor("rotation_out.weight")?, hidden)?;
-            } else {
-                rms_cpu(
-                    &mut row,
-                    Some(self.tensor(&format!("{}norm.weight", self.profile.prefix()))?),
-                    self.profile.f("norm_eps"),
-                );
+            rms_cpu(&mut row, norm_weight, self.profile.f("norm_eps"));
+            for c in 0..hidden {
+                normalized[c * columns + column] = row[c];
             }
-            rows.push(row);
         }
+        let projected = if self.profile.modern() {
+            matmul_channels(
+                self.tensor("rotation_out.weight")?,
+                &normalized,
+                hidden,
+                columns,
+                false,
+            )?
+        } else {
+            normalized
+        };
+        let mut rows: Vec<Vec<f32>> = (0..columns)
+            .map(|position| {
+                (0..hidden)
+                    .map(|c| projected[c * columns + position])
+                    .collect()
+            })
+            .collect();
         stages.emit("rotation_out_and_final_norm_fp32");
         if self.profile.operation() == "embed" {
             let mut vector = if self.profile.modern() {
@@ -955,5 +975,95 @@ impl StageClock {
     }
     fn restart(&mut self) {
         self.last = std::time::Instant::now();
+    }
+}
+
+#[link(name = "Accelerate", kind = "framework")]
+unsafe extern "C" {
+    fn cblas_sgemm(
+        layout: i32,
+        trans_a: i32,
+        trans_b: i32,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        a: *const f32,
+        lda: i32,
+        b: *const f32,
+        ldb: i32,
+        beta: f32,
+        c: *mut f32,
+        ldc: i32,
+    );
+}
+
+fn matmul_channels(
+    matrix: &[f32],
+    input: &[f32],
+    hidden: usize,
+    columns: usize,
+    transpose: bool,
+) -> Result<Vec<f32>> {
+    ensure!(
+        matrix.len()
+            == hidden
+                .checked_mul(hidden)
+                .context("invalid_rotation_shape")?
+            && input.len()
+                == hidden
+                    .checked_mul(columns)
+                    .context("invalid_rotation_shape")?,
+        "invalid_rotation_shape"
+    );
+    let h = i32::try_from(hidden)?;
+    let n = i32::try_from(columns)?;
+    ensure!(h > 0 && n > 0, "invalid_rotation_shape");
+    let mut output = vec![0.0f32; input.len()];
+    // Row-major matrices are hidden-by-hidden and hidden-by-columns. The
+    // lengths/leading dimensions above ensure BLAS cannot overrun either slice.
+    // SGEMM accumulates fp32 on the CPU; no transformer operation moves off ANE.
+    unsafe {
+        cblas_sgemm(
+            101,
+            if transpose { 112 } else { 111 },
+            111,
+            h,
+            n,
+            h,
+            1.0,
+            matrix.as_ptr(),
+            h,
+            input.as_ptr(),
+            n,
+            0.0,
+            output.as_mut_ptr(),
+            n,
+        );
+    }
+    Ok(output)
+}
+
+#[cfg(test)]
+mod cpu_rotation_tests {
+    use super::*;
+    #[test]
+    fn batched_fp32_projection_matches_independent_scalar_rows() {
+        let matrix = [1.0, 2.0, -3.0, 4.0, -5.0, 6.0, -7.0, 8.0, 9.0];
+        let input = [0.25, -0.5, 2.0, 1.0, 0.125, 4.0];
+        for transposed in [false, true] {
+            let actual = matmul_channels(&matrix, &input, 3, 2, transposed).unwrap();
+            for c in 0..3 {
+                for position in 0..2 {
+                    let mut expected = 0.0f32;
+                    for i in 0..3 {
+                        expected += input[i * 2 + position]
+                            * matrix[if transposed { i * 3 + c } else { c * 3 + i }];
+                    }
+                    assert!((actual[c * 2 + position] - expected).abs() < 1e-5);
+                }
+            }
+        }
+        assert!(matmul_channels(&matrix[..8], &input, 3, 2, false).is_err());
     }
 }
