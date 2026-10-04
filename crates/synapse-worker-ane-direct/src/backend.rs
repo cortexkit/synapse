@@ -280,6 +280,10 @@ impl Model {
         Ok(inventory)
     }
     pub fn run(&self, tokens: &[u32]) -> Result<Vec<f32>> {
+        self.run_stages(tokens, false)
+    }
+    fn run_stages(&self, tokens: &[u32], traced: bool) -> Result<Vec<f32>> {
+        let mut stages = StageClock::new(traced);
         let shape = rung(tokens.len())?;
         let resident = self.resident.get(&shape).context("shape_not_admitted")?;
         let hidden = self.profile.n("hidden_size");
@@ -305,7 +309,9 @@ impl Model {
                 input[channel * shape + position] = row[channel];
             }
         }
+        stages.emit("host_prologue");
         resident.a.copy_from_f32(&input);
+        stages.emit("initial_input_copy_fp32_to_fp16");
         if self.profile.modern() {
             let matrix = self.tensor("rotation_in.weight")?;
             let mut residual = vec![0.0; input.len()];
@@ -327,21 +333,32 @@ impl Model {
                     residual[c * shape + position] = row[c];
                 }
             }
+            stages.emit("rotation_in_fp32");
             resident.residual.copy_from_f32(&residual);
+            stages.emit("residual_copy_fp32_to_fp16");
         }
         resident
             .mask
             .copy_from_f32(&padding_mask(tokens, pad, shape));
+        stages.emit("mask_copy_fp32_to_fp16");
         for (layer, executable) in resident.executables.iter().enumerate() {
             let (src, dst) = if layer % 2 == 0 {
                 (&resident.a, &resident.b)
             } else {
                 (&resident.b, &resident.a)
             };
-            if layer == 0 && self.profile.modern() {
-                executable.run_cached(&[src, &resident.mask, &resident.residual], &[dst])?;
+            let inputs: &[&TensorData] = if layer == 0 && self.profile.modern() {
+                &[src, &resident.mask, &resident.residual]
             } else {
-                executable.run_cached(&[src, &resident.mask], &[dst])?;
+                &[src, &resident.mask]
+            };
+            if traced {
+                let (prepare, evaluate, created) =
+                    executable.run_cached_profiled(inputs, &[dst])?;
+                println!("FORWARD_LAYER layer={layer} request_prepare_ms={:.6} sync_submit_and_wait_ms={:.6} request_created={created} interlayer_host_copy_bytes=0 iosurface_allocations=0", prepare.as_secs_f64()*1000.0, evaluate.as_secs_f64()*1000.0);
+                stages.restart();
+            } else {
+                executable.run_cached(inputs, &[dst])?;
             }
         }
         let surface = if resident.executables.len() % 2 == 0 {
@@ -350,6 +367,7 @@ impl Model {
             &resident.b
         };
         let raw = surface.read_f32();
+        stages.emit("final_readback_fp16_to_fp32");
         let mut rows = Vec::new();
         for (position, &token) in tokens.iter().enumerate() {
             let _ = token;
@@ -366,6 +384,7 @@ impl Model {
             }
             rows.push(row);
         }
+        stages.emit("rotation_out_and_final_norm_fp32");
         if self.profile.operation() == "embed" {
             let mut vector = if self.profile.modern() {
                 rows.remove(0)
@@ -376,6 +395,7 @@ impl Model {
             for value in &mut vector {
                 *value /= norm;
             }
+            stages.emit("cpu_head");
             return Ok(vector);
         }
         let score = if self.profile.modern() {
@@ -418,6 +438,7 @@ impl Model {
             };
             1.0 / (1.0 + (dot(no) - dot(yes)).exp())
         };
+        stages.emit("cpu_head");
         Ok(vec![score])
     }
 }
@@ -838,6 +859,9 @@ mod fresh_process_hardware {
             )
         };
         println!("LATENCY model={slug} tokens=512 debug_assertions={} compile_ms={compile_ms:.3} first_ms={first_ms:.3} warm_ms={times:?} median_ms={:.3} {metric}", cfg!(debug_assertions), sorted[2]);
+        if std::env::var_os("ANE_TRACE_FORWARD").is_some() {
+            model.run_stages(&tokens, true).unwrap();
+        }
         drop(model);
         cleanup_diagnostic_artifacts();
     }
@@ -906,5 +930,30 @@ fn cleanup_diagnostic_artifacts() {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => panic!("remove diagnostic model artifact: {error}"),
         }
+    }
+}
+
+struct StageClock {
+    enabled: bool,
+    last: std::time::Instant,
+}
+impl StageClock {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            last: std::time::Instant::now(),
+        }
+    }
+    fn emit(&mut self, stage: &str) {
+        if self.enabled {
+            println!(
+                "FORWARD_STAGE name={stage} elapsed_ms={:.6}",
+                self.last.elapsed().as_secs_f64() * 1000.0
+            );
+            self.restart();
+        }
+    }
+    fn restart(&mut self) {
+        self.last = std::time::Instant::now();
     }
 }

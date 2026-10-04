@@ -78,6 +78,32 @@ impl Executable {
             .map_err(|error| Error::Evaluate(error.localizedDescription().to_string()))
     }
 
+    /// Profile cached-request preparation separately from synchronous evaluation.
+    /// Evaluation includes submission and waiting: the private API exposes one
+    /// blocking call, so those two costs cannot be measured independently here.
+    /// The caller must use the same tensors and serialize calls, as for `run_cached`.
+    #[doc(hidden)]
+    pub fn run_cached_profiled(
+        &self,
+        inputs: &[&TensorData],
+        outputs: &[&TensorData],
+    ) -> Result<(std::time::Duration, std::time::Duration, bool), Error> {
+        let started = std::time::Instant::now();
+        let cached = unsafe { &mut *self.cached_request.get() };
+        let created = cached.is_none();
+        if created {
+            let input_surfaces: Vec<_> = inputs.iter().map(|td| td.surface()).collect();
+            let output_surfaces: Vec<_> = outputs.iter().map(|td| td.surface()).collect();
+            *cached = Some(Request::new(&input_surfaces, &output_surfaces)?);
+        }
+        let prepare = started.elapsed();
+        let started = std::time::Instant::now();
+        self.inner
+            .evaluate(self.qos, &cached.as_ref().unwrap().inner)
+            .map_err(|error| Error::Evaluate(error.localizedDescription().to_string()))?;
+        Ok((prepare, started.elapsed(), created))
+    }
+
     /// Run the compiled program with hardware performance stats collection.
     ///
     /// Returns `hw_execution_time_ns`. The hw time is the actual
