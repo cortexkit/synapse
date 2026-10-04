@@ -1,0 +1,30 @@
+[package]
+name = "synapse-worker-ane-direct"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ck-synapse-worker-ane-direct"
+path = "src/main.rs"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+ane = { path = "vendor/ane" }
+anyhow.workspace = true
+clap.workspace = true
+synapse-core = { path = "../synapse-core" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+half = "2.7"
+safetensors = "0.7"
+libc = "0.2"
+libm = "0.2"
+
+[dev-dependencies]
+serde_json.workspace = true
+sha2.workspace = true
+
+[build-dependencies]
+serde_json.workspace = true
+sha2.workspace = true

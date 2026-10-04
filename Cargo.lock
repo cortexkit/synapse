@@ -85,6 +85,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "ane"
+version = "0.1.0"
+dependencies = [
+ "half",
+ "hf-hub",
+ "libc",
+ "metal",
+ "objc2",
+ "objc2-foundation",
+ "objc2-io-surface",
+ "rand 0.10.2",
+ "safetensors 0.7.0",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokenizers 0.22.2",
+]
+
+[[package]]
 name = "anstream"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4791,6 +4810,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "objc2-io-surface"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "180788110936d59bab6bd83b6060ffdfffb3b922ba1396b312ae795e1de9d81d"
+dependencies = [
+ "bitflags 2.13.0",
+ "libc",
+ "objc2",
+ "objc2-core-foundation",
+ "objc2-foundation",
+]
+
+[[package]]
 name = "objc2-metal"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6692,6 +6724,23 @@ name = "synapse-worker-ane"
 version = "0.1.0-alpha.2"
 dependencies = [
  "anyhow",
+ "synapse-core",
+]
+
+[[package]]
+name = "synapse-worker-ane-direct"
+version = "0.1.0"
+dependencies = [
+ "ane",
+ "anyhow",
+ "clap",
+ "half",
+ "libc",
+ "libm",
+ "safetensors 0.7.0",
+ "serde",
+ "serde_json",
+ "sha2",
  "synapse-core",
 ]
 
