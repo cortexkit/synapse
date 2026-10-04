@@ -149,7 +149,7 @@ fn error(req_id: Option<String>, message: &str) -> WorkerResponse {
     }
 }
 fn os_build() -> Result<String> {
-    let output = std::process::Command::new("sw_vers")
+    let output = synapse_core::without_launch_nonce(std::process::Command::new("sw_vers"))
         .arg("-buildVersion")
         .output()?;
     anyhow::ensure!(output.status.success(), "os_build_unavailable");
@@ -339,6 +339,11 @@ fn sequences(model: &Model, sizes: &[usize], raw: &[u8]) -> Result<Vec<f32>> {
 }
 
 #[cfg(test)]
+pub(crate) fn test_private_api() -> Result<()> {
+    private_api()
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use synapse_core::worker_framing_sync::write_json_frame;
@@ -463,9 +468,4 @@ mod tests {
             matches!(response, WorkerResponse::Err { code, .. } if code == "ane_private_api_unavailable")
         );
     }
-}
-
-#[cfg(test)]
-pub(crate) fn test_private_api() -> Result<()> {
-    private_api()
 }

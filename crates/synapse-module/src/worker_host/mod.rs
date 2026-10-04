@@ -4439,11 +4439,13 @@ pub mod ane_residency {
             }
         }
         fn signal(pid: u32, number: i32) {
-            assert!(std::process::Command::new("/bin/kill")
-                .args([format!("-{number}"), pid.to_string()])
-                .status()
-                .unwrap()
-                .success());
+            assert!(
+                synapse_core::without_launch_nonce(std::process::Command::new("/bin/kill"))
+                    .args([format!("-{number}"), pid.to_string()])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
         }
         #[derive(Default)]
         struct Ledger {
@@ -4599,7 +4601,7 @@ pub mod ane_residency {
             }
         }
         fn output(command: &str, args: &[&str]) -> String {
-            let result = std::process::Command::new(command)
+            let result = synapse_core::without_launch_nonce(std::process::Command::new(command))
                 .args(args)
                 .output()
                 .unwrap();
@@ -4767,11 +4769,14 @@ pub mod ane_residency {
             println!("ANE_STRESS_OUTPUT={}", out.display());
         }
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-        #[ignore = "real four-worker admission stress; load must be under16"]
+        #[ignore = "real four-worker stress; load1<16 and load5<20 required"]
         async fn real_direct_ane_residency_stress() {
             let load_start = load_averages();
             assert_eq!(load_start.len(), 3);
-            assert!(load_start[0] < 16.0, "stress deferred: load={load_start:?}");
+            assert!(
+                load_start[0] < 16.0 && load_start[1] < 20.0,
+                "stress deferred: load={load_start:?}"
+            );
             let root = PathBuf::from(format!("../../target/ane-stress-{}", std::process::id()));
             std::fs::create_dir_all(&root).unwrap();
             let lock = AneDirectLaneLock::acquire(&root.join("lane.lock")).unwrap();
@@ -4925,9 +4930,10 @@ pub mod ane_residency {
         impl Drop for StoppedWorker {
             fn drop(&mut self) {
                 if let Some(pid) = self.0 {
-                    let _ = std::process::Command::new("/bin/kill")
-                        .args(["-9".to_owned(), pid.to_string()])
-                        .status();
+                    let _ =
+                        synapse_core::without_launch_nonce(std::process::Command::new("/bin/kill"))
+                            .args(["-9".to_owned(), pid.to_string()])
+                            .status();
                 }
             }
         }
@@ -4974,21 +4980,23 @@ pub mod ane_residency {
             panic!("holder completed before parent killed it");
         }
         #[tokio::test]
-        #[ignore = "requires the real release worker, pinned weights and macOS ANE"]
+        #[ignore = "requires the real worker, pinned weights and macOS ANE"]
         async fn killed_holder_with_resident_work_keeps_lane_busy_until_old_worker_exits() {
             let root = PathBuf::from(format!("../../target/ane-holder-{}", std::process::id()));
             std::fs::create_dir_all(&root).unwrap();
-            let mut holder = tokio::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--ignored",
-                    "--exact",
-                    "worker_host::ane_residency::hardware_tests::real_lane_holder_process",
-                    "--nocapture",
-                ])
-                .env("ANE_HOLDER_ROOT", &root)
-                .kill_on_drop(true)
-                .spawn()
-                .unwrap();
+            let mut holder = synapse_core::without_launch_nonce_tokio(
+                tokio::process::Command::new(std::env::current_exe().unwrap()),
+            )
+            .args([
+                "--ignored",
+                "--exact",
+                "worker_host::ane_residency::hardware_tests::real_lane_holder_process",
+                "--nocapture",
+            ])
+            .env("ANE_HOLDER_ROOT", &root)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
             let ready = tokio::time::timeout(Duration::from_secs(120), async {
                 loop {
                     if let Ok(bytes) = std::fs::read(root.join("ready.json")) {

@@ -96,9 +96,9 @@ for all four models, including a real token whose id equals the pad id. Its
 independent generator uses only the shared token fixtures, not model inference.
 The worker consumes the same padding helper checked by this golden test.
 
-The module's ignored hardware tests run real release workers through the
+The module's ignored hardware tests run real workers through the
 production handshake, inherited-lock spawning and residency supervisor. Build
-the worker with `cargo build --release --locked -p synapse-worker-ane-direct`.
+the worker with `cargo build --locked -p synapse-worker-ane-direct`.
 Set `ANE_TEST_WORKER` to its absolute path and `ANE_TEST_PACKAGES` to the four
 converted-package directory. Run the killed-holder test with:
 
@@ -109,15 +109,20 @@ cargo test --locked -p synapse-module killed_holder_with_resident_work_keeps_lan
 Run the 37-request stress harness with:
 
 ```
-python3 crates/synapse-worker-ane-direct/tests/run_stress.py --wait-for-load --timeout 7200 --out crates/synapse-worker-ane-direct/evidence/stress-dev.json
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer python3 crates/synapse-worker-ane-direct/tests/run_stress.py --wait-for-load --timeout 28800 --out crates/synapse-worker-ane-direct/evidence/stress-dev.json
 ```
 
 Omit `--out` to use a temporary JSON file. The Rust test validates the committed
-development schema and refuses to start if the one-minute load is at least16.
+development schema and refuses to start unless load1<16 and load5<20. The
+launcher polls `sysctl -n vm.loadavg` every60 seconds; `--driver <path>` runs an
+already-built supervisor test executable without invoking Cargo after the wait.
 The report records machine identifiers, OS build, source commit, harness profile
-and all three load averages. The test driver may use debug mode (the unrelated
-owned-decode release build requires the Metal developer toolchain), but the
-spawned direct-ANE workers use the release binary. It is development evidence, never release certification.
+and all three load averages. By default the driver and workers use debug builds;
+set `ANE_TEST_WORKER` explicitly to measure a different worker build. Full Xcode
+must be selected with `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer`
+so dependencies compile their real Metal kernels. After changing that setting,
+run `cargo clean -p synapse-engine-owned` to invalidate an earlier stub build. The generated stress report provides development evidence, not
+release certification.
 Reranker pools at128/512/2048 must be finite with byte-identical repeats. The
 Metal ordering comparison is explicitly skipped when that lane/package is not
 available; a2048-rung parity fixture remains a parity-crate follow-up, not a new

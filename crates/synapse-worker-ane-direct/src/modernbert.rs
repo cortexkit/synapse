@@ -290,6 +290,7 @@ fn attention_graph(
     graph.addition(residual, projected)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn layer_graph(
     graph: &mut Graph,
     hidden: Tensor,

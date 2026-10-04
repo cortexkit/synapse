@@ -185,13 +185,17 @@ impl Model {
             let values = match expected {
                 Dtype::F32 => tensor
                     .data()
-                    .chunks_exact(4)
-                    .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| f32::from_le_bytes(*b))
                     .collect(),
                 Dtype::F16 => tensor
                     .data()
-                    .chunks_exact(2)
-                    .map(|b| f16::from_bits(u16::from_le_bytes(b.try_into().unwrap())).to_f32())
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|b| f16::from_bits(u16::from_le_bytes(*b)).to_f32())
                     .collect(),
                 _ => unreachable!(),
             };
