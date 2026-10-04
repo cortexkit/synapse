@@ -1132,6 +1132,7 @@ async fn catalog_multi_backend_resolver_refuses_substitution_before_load() {
     assert_eq!(models["models"], serde_json::json!([]));
 }
 
+#[cfg(target_os = "macos")]
 fn real_catalog_fixture(id: &str) -> Option<(Value, BTreeMap<String, PathBuf>)> {
     let mut catalog: Value =
         serde_json::from_str(include_str!("../../src/catalog/models.json")).unwrap();
@@ -1306,7 +1307,6 @@ async fn catalog_real_metal_redirect_download_self_checks_and_serves_without_pro
     h.server.assert_pinned_requests();
 }
 
-#[cfg(target_os = "macos")]
 fn directory_bytes(path: &Path) -> u64 {
     if !path.exists() {
         return 0;
@@ -1765,6 +1765,7 @@ async fn catalog_unavailable_backend_is_listed_but_never_downloaded() {
     assert!(h.server.paths().is_empty());
 }
 
+#[cfg(target_os = "macos")]
 async fn wait_failed_catalog_load(h: &mut CatalogHarness, lane: &str) -> Value {
     let until = Instant::now() + Duration::from_secs(180);
     loop {
@@ -1779,6 +1780,9 @@ async fn wait_failed_catalog_load(h: &mut CatalogHarness, lane: &str) -> Value {
     }
 }
 
+// Needs a real model so the load gets far enough to fail in the engine; the
+// owned engine and its snapshots exist only on macOS.
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn catalog_failed_load_after_inline_timeout_reaches_next_request_and_retry_is_single_flight()
 {
