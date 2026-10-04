@@ -436,3 +436,22 @@ fn validate_dispatch_without_clean_source_refuses_and_writes_nothing() {
     assert!(!checkout.exists());
     assert_eq!(std::fs::read_dir(&assets.0).unwrap().count(), 3);
 }
+
+// The producer and the validator each apply the latency drop rule, so each
+// needs its own boundary test: a slowdown of exactly 3x keeps a Qwen3 ANE cell
+// in the release, and only a slowdown strictly above 3x may drop it.
+#[test]
+fn producer_latency_drop_is_strictly_above_three() {
+    let assets = Assets::new();
+    for model in MODELS.iter().filter(|m| m.starts_with("qwen3-")) {
+        let mut mock = runner(model);
+        mock.evidence.raw_series = Some(series(3.0));
+        let record = produce(&mut mock, &assets.0, "ane-m5", model).unwrap();
+        assert_eq!(record.status, "passed", "{model} at exactly 3x");
+        let mut mock = runner(model);
+        mock.evidence.raw_series = Some(series(3.000_001));
+        let record = produce(&mut mock, &assets.0, "ane-m5", model).unwrap();
+        assert_eq!(record.status, "dropped", "{model} above 3x");
+        assert_eq!(record.drop_cause.as_deref(), Some("latency"));
+    }
+}
