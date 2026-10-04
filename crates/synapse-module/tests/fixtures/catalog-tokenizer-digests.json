@@ -1,0 +1,5 @@
+{
+  "gte-modernbert-base": "sha256:f64652c0d4292921662f8a34068ed38c9db4a8e78daae667eaff88a30494ef8b",
+  "gte-reranker-modernbert-base": "sha256:f64652c0d4292921662f8a34068ed38c9db4a8e78daae667eaff88a30494ef8b",
+  "qwen3-embedding-0.6b": "sha256:71241c4586582e04d5d51a420bad74d3ef5353bfdac5a53a7ba7440dbf33e350"
+}

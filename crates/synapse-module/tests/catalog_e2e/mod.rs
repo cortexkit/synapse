@@ -221,7 +221,12 @@ impl CatalogHarness {
         let daemon = start_daemon().await;
         let path = catalog_path.to_str().unwrap();
         let cache = root.join("cache");
+        let timings = root.join("validation-timings.jsonl");
         let mut overrides = vec![
+            (
+                "SYNAPSE_TEST_CATALOG_VALIDATION_TIMINGS",
+                timings.to_str().unwrap(),
+            ),
             ("SYNAPSE_TEST_CATALOG", path),
             ("SYNAPSE_TEST_RUNNABLE_BACKENDS", backends),
             ("CORTEXKIT_MODEL_CACHE", cache.to_str().unwrap()),
@@ -288,9 +293,10 @@ impl CatalogHarness {
                         serde_json::json!({"model_id":lanes["models"][0]["model_id"]}),
                     )
                     .await;
-                panic!(
-                    "catalog cold load exceeded 120 s: {result}; lanes: {lanes}; loader: {status}"
-                );
+                let timings =
+                    std::fs::read_to_string(self.fixture_root.join("validation-timings.jsonl"))
+                        .unwrap_or_default();
+                panic!("catalog cold load exceeded 120 s: {result}; lanes: {lanes}; loader: {status}; validation timings: {timings}");
             }
             sleep(Duration::from_millis(retry)).await;
         }
@@ -1277,15 +1283,20 @@ async fn catalog_real_metal_redirect_download_self_checks_and_serves_without_pro
         "unloaded"
     );
     let cache = h.fixture_root.join("cache");
-    let expected_freed = directory_bytes(&cache.join("blobs"))
-        + directory_bytes(&cache.join("owned-metal-packages"));
+    let before_remove = directory_bytes(&cache.join("blobs"))
+        + directory_bytes(&cache.join("owned-metal-packages"))
+        + directory_bytes(&cache.join("owned-metal-models"));
     let removed = h
         .call(
             "models.remove",
             serde_json::json!({"catalog_id":"gte-modernbert-base"}),
         )
         .await;
-    assert_eq!(removed["freed_bytes"], expected_freed);
+    let after_remove = directory_bytes(&cache.join("blobs"))
+        + directory_bytes(&cache.join("owned-metal-packages"))
+        + directory_bytes(&cache.join("owned-metal-models"));
+    assert_eq!(removed["freed_bytes"], before_remove - after_remove);
+    assert_eq!(directory_bytes(&cache.join("owned-metal-models")), 0);
     assert_eq!(directory_bytes(&cache.join("blobs")), 0);
     assert_eq!(directory_bytes(&cache.join("owned-metal-packages")), 0);
     assert_eq!(
@@ -1728,16 +1739,19 @@ async fn catalog_unavailable_backend_is_listed_but_never_downloaded() {
     let listing = h.call("models.catalog", serde_json::json!({})).await;
     assert_eq!(listing["models"].as_array().unwrap().len(), 4);
     for entry in listing["models"].as_array().unwrap() {
-        assert_eq!(entry["installed"], false);
-        assert_eq!(entry["backends"][0]["runnable"], false);
-        assert_eq!(
-            entry["backends"][0]["reason"],
-            if cfg!(target_os = "macos") {
-                "device_missing"
-            } else {
-                "not_supported_on_platform"
-            }
-        );
+        assert_eq!(entry["install_state"], "not_installed");
+        for backend in entry["backends"].as_array().unwrap() {
+            assert_eq!(backend["installed"], false);
+            assert_eq!(backend["runnable"], false);
+            assert_eq!(
+                backend["reason"],
+                if cfg!(target_os = "macos") {
+                    "device_missing"
+                } else {
+                    "not_supported_on_platform"
+                }
+            );
+        }
     }
     let refused = h.download("gte-modernbert-base", "unavailable").await;
     assert_eq!(refused["error"]["code"], "backend_unavailable", "{refused}");
@@ -1860,4 +1874,94 @@ async fn catalog_failed_load_after_inline_timeout_reaches_next_request_and_retry
         2
     );
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn catalog_shared_member_keeps_derived_packages_until_last_root_is_removed() {
+    let mut h = CatalogHarness::start("ok", None).await;
+    let path = h.fixture_root.join("catalog.json");
+    let mut catalog: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let mut shared = catalog["models"][0].clone();
+    shared["id"] = "shared-package".into();
+    shared["default_for_task"] = false.into();
+    catalog["models"].as_array_mut().unwrap().push(shared);
+    std::fs::write(&path, catalog.to_string()).unwrap();
+    h.restart().await;
+    for (id, key) in [("gte-modernbert-base", "a"), ("shared-package", "b")] {
+        let accepted = h.download(id, key).await;
+        let done = h
+            .wait_state(
+                accepted["job_id"].as_str().unwrap(),
+                &["committed", "failed"],
+            )
+            .await;
+        assert_eq!(done["state"], "committed", "{done}");
+    }
+    let cache = h.fixture_root.join("cache");
+    let packages = cache.join("owned-metal-models");
+    for key in ["a".repeat(64), "b".repeat(64)] {
+        let package = packages.join(key);
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("model.safetensors"), BODY).unwrap();
+        std::fs::write(package.join("config.json"), b"{}").unwrap();
+        std::fs::write(
+            package.join("role-digests.json"),
+            serde_json::to_vec(&vec![catalog_sha256(BODY)]).unwrap(),
+        )
+        .unwrap();
+        #[cfg(target_os = "macos")]
+        {
+            let canonical = std::fs::canonicalize(package.join("model.safetensors")).unwrap();
+            let mut hash = 1469598103934665603u64;
+            for byte in canonical.to_string_lossy().as_bytes() {
+                hash ^= u64::from(*byte);
+                hash = hash.wrapping_mul(0x100000001b3);
+            }
+            let compiled = cache.join("owned-metal-packages").join(format!(
+                "gte-modernbert-graph-v1-bucket-policy-v1-{hash:016x}-f16-test"
+            ));
+            std::fs::create_dir_all(&compiled).unwrap();
+            std::fs::write(compiled.join("kernel"), b"compiled").unwrap();
+        }
+    }
+    let derived = directory_bytes(&packages) + directory_bytes(&cache.join("owned-metal-packages"));
+    let removed = h
+        .call(
+            "models.remove",
+            serde_json::json!({"catalog_id":"gte-modernbert-base"}),
+        )
+        .await;
+    assert_eq!(removed["freed_bytes"], 0, "{removed}");
+    assert_eq!(
+        directory_bytes(&packages) + directory_bytes(&cache.join("owned-metal-packages")),
+        derived
+    );
+    let before = derived + directory_bytes(&cache.join("blobs"));
+    let removed = h
+        .call(
+            "models.remove",
+            serde_json::json!({"catalog_id":"shared-package"}),
+        )
+        .await;
+    let after = directory_bytes(&packages)
+        + directory_bytes(&cache.join("owned-metal-packages"))
+        + directory_bytes(&cache.join("blobs"));
+    assert_eq!(removed["freed_bytes"], before - after, "{removed}");
+    assert_eq!(
+        after, 0,
+        "last root must reclaim both packages and their compiled entries"
+    );
+}
+
+#[tokio::test]
+async fn catalog_startup_sweeps_renamed_package_removal_orphans() {
+    let mut h = CatalogHarness::start("ok", None).await;
+    let orphan = h
+        .fixture_root
+        .join("cache/owned-metal-models")
+        .join(format!(".{}.removing-0-1", "a".repeat(64)));
+    std::fs::create_dir_all(&orphan).unwrap();
+    std::fs::write(orphan.join("model.safetensors"), BODY).unwrap();
+    h.restart().await;
+    assert!(!orphan.exists());
 }

@@ -110,7 +110,7 @@
           "attention_units": 67108864,
           "max_tokens": 8192,
           "rerank_abs_tolerance": 0.005,
-          "fingerprint": "2fa5f24c0208f30c6db4bf18eb66bc0b2c46f765882cb744fcc58cd080b2b92d"
+          "fingerprint": "6da1fa7f1dfa0c7c883dd34ca9c3e5d06e50ceaaabbb13d49fd7b7b291b0b9b9"
         }
       ],
       "self_check": {

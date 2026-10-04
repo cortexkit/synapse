@@ -5797,6 +5797,7 @@ fn assemble_owned_model_package(
     if package_root.join("config.json").is_file()
         && package_root.join("model.safetensors").is_file()
     {
+        record_owned_package_roles(&package_root, spec)?;
         return Ok(package_root);
     }
     fs::create_dir_all(&packages_root)
@@ -5813,6 +5814,7 @@ fn assemble_owned_model_package(
         .map_err(|error| io_to_load_error("copy owned model", model_path, &error))?;
     fs::copy(&config.path, temporary.join("config.json"))
         .map_err(|error| io_to_load_error("copy owned config", &config.path, &error))?;
+    record_owned_package_roles(&temporary, spec)?;
     match fs::rename(&temporary, &package_root) {
         Ok(()) => {}
         Err(_) if package_root.is_dir() => {
@@ -5827,6 +5829,34 @@ fn assemble_owned_model_package(
         }
     }
     Ok(package_root)
+}
+
+fn record_owned_package_roles(
+    package: &Path,
+    spec: &StoredModelConfig,
+) -> Result<(), WireOperationError> {
+    let mut digests = Vec::new();
+    for locator in std::iter::once(&spec.model_locator)
+        .chain(std::iter::once(&spec.tokenizer_locator))
+        .chain(spec.config_locator.iter())
+        .chain(spec.extra_locators.iter())
+    {
+        let ModelAssetLocator::CacheDigest { digest } = locator else {
+            return Ok(());
+        };
+        digests.push(digest.trim_start_matches("sha256:").to_string());
+    }
+    digests.sort();
+    digests.dedup();
+    let path = package.join("role-digests.json");
+    let temporary = package.join("role-digests.json.tmp");
+    fs::write(
+        &temporary,
+        serde_json::to_vec(&digests).expect("role digests"),
+    )
+    .map_err(|error| io_to_load_error("write owned package roots", &temporary, &error))?;
+    fs::rename(&temporary, &path)
+        .map_err(|error| io_to_load_error("publish owned package roots", &path, &error))
 }
 
 fn load_catalog_model_blocking(
@@ -20719,6 +20749,121 @@ fn download_publish_lock(runtime: &RuntimeState, id: &str) -> Arc<Mutex<()>> {
         .or_insert_with(|| Arc::new(Mutex::new(())))
         .clone()
 }
+fn catalog_directory_bytes(root: &Path) -> std::io::Result<u64> {
+    let mut pending = vec![root.to_path_buf()];
+    let mut bytes = 0u64;
+    while let Some(path) = pending.pop() {
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                pending.push(entry.path());
+            } else if kind.is_file() {
+                bytes = bytes.saturating_add(entry.metadata()?.len());
+            }
+        }
+    }
+    Ok(bytes)
+}
+
+fn remove_owned_package_directory(path: &Path) -> std::io::Result<u64> {
+    let name = path.file_name().expect("package name").to_string_lossy();
+    let orphan = path.with_file_name(format!(
+        ".{name}.removing-{}-{}",
+        std::process::id(),
+        now_ms()
+    ));
+    fs::rename(path, &orphan)?;
+    let bytes = catalog_directory_bytes(&orphan)?;
+    fs::remove_dir_all(orphan)?;
+    Ok(bytes)
+}
+
+fn sweep_owned_package_orphans(cache: &Path) -> std::io::Result<u64> {
+    let mut freed = 0u64;
+    for directory in ["owned-metal-models", "owned-metal-packages"] {
+        let entries = match fs::read_dir(cache.join(directory)) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if entry.file_type()?.is_dir() && name.starts_with('.') && name.contains(".removing-") {
+                let bytes = catalog_directory_bytes(&entry.path())?;
+                fs::remove_dir_all(entry.path())?;
+                freed = freed.saturating_add(bytes);
+            }
+        }
+    }
+    Ok(freed)
+}
+
+fn reclaim_unrooted_owned_packages(
+    tx: &rusqlite::Transaction<'_>,
+    cache: &ModelCache,
+) -> rusqlite::Result<u64> {
+    use store::CatalogBlobCache;
+    let io = |error: std::io::Error| rusqlite::Error::ToSqlConversionFailure(Box::new(error));
+    let entries = match fs::read_dir(cache.root().join("owned-metal-models")) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(io(error)),
+    };
+    let mut freed = 0u64;
+    for entry in entries {
+        let entry = entry.map_err(io)?;
+        if !entry.file_type().map_err(io)?.is_dir()
+            || entry.file_name().to_string_lossy().starts_with('.')
+        {
+            continue;
+        }
+        let descriptor = match fs::read(entry.path().join("role-digests.json")) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(io(error)),
+        };
+        let Ok(digests) = serde_json::from_slice::<Vec<String>>(&descriptor) else {
+            continue;
+        };
+        if digests.is_empty()
+            || digests.iter().any(|digest| {
+                digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+        {
+            continue;
+        }
+        let mut rooted = false;
+        for digest in &digests {
+            if catalog_blob_referenced(tx, digest)?
+                || CatalogCache(cache).is_pinned(digest).map_err(io)?
+            {
+                rooted = true;
+                break;
+            }
+        }
+        if rooted {
+            continue;
+        }
+        // Compiled keys hash the assembled model's canonical path, not its blob
+        // path. Reclaim them while that path still exists, then hide the package
+        // before deleting it so interrupted removal cannot be mistaken for a cache hit.
+        let compiled = synapse_engine_owned::remove_compiled_packages(
+            &cache.root().join("owned-metal-packages"),
+            &entry.path(),
+        )
+        .saturating_add(synapse_engine_owned::remove_compiled_packages(
+            &cache.root().join("owned-metal-packages"),
+            &entry.path().join("model.safetensors"),
+        ));
+        freed = freed
+            .saturating_add(compiled)
+            .saturating_add(remove_owned_package_directory(&entry.path()).map_err(io)?);
+    }
+    Ok(freed)
+}
+
 struct CatalogCache<'a>(&'a ModelCache);
 impl store::CatalogBlobCache for CatalogCache<'_> {
     fn blob_size(&self, digest: &str) -> std::io::Result<Option<u64>> {
@@ -21054,6 +21199,20 @@ fn catalog_test_barrier(kind: &str, job: &str) {
     }
     let _ = (kind, job);
 }
+fn catalog_validation_timing(lane: &str, stage: &str, started: std::time::Instant) {
+    #[cfg(feature = "test-support")]
+    if let Ok(path) = env::var("SYNAPSE_TEST_CATALOG_VALIDATION_TIMINGS") {
+        if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(
+                file,
+                "{}",
+                json!({"lane":lane,"stage":stage,"elapsed_ms":started.elapsed().as_millis()})
+            );
+        }
+    }
+    let _ = (lane, stage, started);
+}
+
 fn catalog_call_fault(id: &str, call: &str) -> Result<(), WireOperationError> {
     #[cfg(feature = "test-support")]
     if env::var("SYNAPSE_TEST_CATALOG_FAULT_LANE").ok().as_deref() == Some(id) {
@@ -21588,6 +21747,8 @@ async fn models_remove(state: Arc<ModuleState>, params: Value) -> HandlerOutcome
                         );
                     }
                 }
+                freed =
+                    freed.saturating_add(reclaim_unrooted_owned_packages(tx, &state.model_cache)?);
                 Ok(freed)
             })
             .map_err(catalog_store_error)?;
@@ -22117,7 +22278,9 @@ async fn ensure_catalog_lane_ready_owned(
             let entry = verify_entry;
             let backend = verify_backend;
             let lane = verify_lane;
+            let lock_started = std::time::Instant::now();
             let _disk = state.runtime.catalog_disk.lock().expect("catalog disk lock");
+            catalog_validation_timing(&lane, "disk_lock", lock_started);
             let install = current_catalog_install(&state,&entry,&backend.backend)?.ok_or_else(|| catalog_wire_error("model_not_installed",json!({"catalog_id":entry.id,"lane_id":lane,"download_op":"models.download","download_job_id":null}),"catalog installation disappeared"))?;
             for file in entry.backend_files(&backend.backend).values() {
                 let member = install
@@ -22129,7 +22292,9 @@ async fn ensure_catalog_lane_ready_owned(
                     .blob_size(&member.digest)
                     .map_err(catalog_store_error)?;
                 let path = state.model_cache.blob_path(&member.digest);
+                let hash_started = std::time::Instant::now();
                 let digest = sha256_file(&path).ok();
+                catalog_validation_timing(&lane, &file.path, hash_started);
                 if size != Some(file.size_bytes)
                     || digest.as_deref() != Some(member.digest.as_str())
                     || member.digest != file.sha256
@@ -22147,7 +22312,9 @@ async fn ensure_catalog_lane_ready_owned(
                     return Err(error);
                 }
             }
+            let parameters_started = std::time::Instant::now();
             let spec = catalog_lane_spec(&state, &entry, &backend, true)?;
+            catalog_validation_timing(&lane, "parameters", parameters_started);
             if spec.fingerprint.0 != backend.fingerprint {
                 return Err(catalog_wire_error(
                     "artifact_invalid",
@@ -22170,7 +22337,11 @@ async fn ensure_catalog_lane_ready_owned(
             StableError::engine_crashed(Some(250)), format!("catalog verification task failed: {error}"),
         )));
         if let Err(error) = verified {
-            set_model_slot_state(&state.runtime, &lane, ModelRuntimeState::Unloaded);
+            set_model_slot_state(
+                &state.runtime,
+                &lane,
+                ModelRuntimeState::Failed(error.clone()),
+            );
             return Err(error);
         }
         let load_state = state.clone();
@@ -22251,6 +22422,8 @@ async fn ensure_catalog_lane_ready_owned(
 }
 
 fn startup_catalog_runtime(state: &ModuleState) -> Result<(), ModuleError> {
+    sweep_owned_package_orphans(state.model_cache.root())
+        .map_err(|error| ModuleError::Config(format!("sweep removed owned packages: {error}")))?;
     state.store.store.with_conn_fenced(|tx| {
         tx.execute("UPDATE catalog_self_checks SET state='pending',checked_at_ms=NULL,reason=NULL WHERE state='running'",[])?;
         Ok(())
