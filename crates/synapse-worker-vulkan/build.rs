@@ -6,8 +6,10 @@ const SHADERS: [(&str, &str); 2] = [("plain", "vulkan1.2"), ("cooperative", "vul
 fn verify_spirv(bytes: &[u8]) {
     assert_eq!(bytes.len() % 4, 0, "SPIR-V word alignment");
     let words: Vec<_> = bytes
-        .chunks_exact(4)
-        .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| u32::from_le_bytes(*b))
         .collect();
     assert_eq!(words.first(), Some(&0x07230203), "SPIR-V magic");
     let mut offset = 5;
