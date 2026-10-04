@@ -17,6 +17,7 @@ See [the wire contract](docs/wire-contract-v1.md) for operations and migration.
 - `synapse-opctl`: operator CLI (`ck-synapse-opctl`) for catalog, probes, admission stats, approvals, and paged results over the fleet daemon.
 - `synapse-worker-llama`, `synapse-worker-ane`, `synapse-worker-decode`: supervised worker binaries (`ck-synapse-worker-*`) over Unix sockets (named pipes on Windows). The owned-decode stack remains compiled/tested with its certification, probe and serving-approval gates, not the default decode lane.
 - `synapse-worker-cuda`: development/manual-gate worker, not shipped by the release matrix. Linux/Windows releases contain the module, opctl and llama worker only.
+- `synapse-worker-vulkan`: owned Vulkan embedding and reranking worker for AMD and NVIDIA GPUs; development worker, not yet shipped by the release matrix.
 
 ### Metal build requirement
 

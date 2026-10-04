@@ -59,6 +59,9 @@ by their presence here:
 - `ck-synapse-worker-decode` (`crates/synapse-worker-decode`): owned Metal token
   generation for Qwen3 and LFM2, driven quantum by quantum by the owned-decode
   supervisor.
+- `ck-synapse-worker-vulkan` (`crates/synapse-worker-vulkan`): owned Vulkan compute
+  shaders for embedding and reranking on AMD and NVIDIA GPUs; it loads the Vulkan
+  loader at runtime, so a host without one gets a typed refusal.
 - `ane-prefill-sidecar` (`workers/ane-prefill-sidecar`): a Swift package that runs
   fixed-window Qwen3 prefill on the Neural Engine and hands the KV cache to the decode
   worker.

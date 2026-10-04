@@ -24,6 +24,7 @@ crates/                     production Rust crates
   synapse-worker-cuda/      CUDA embedding worker
   synapse-worker-decode/    owned Metal generation worker (macOS)
   synapse-worker-llama/     llama.cpp worker for GGUF models
+  synapse-worker-vulkan/    Vulkan embedding and reranking worker (AMD and NVIDIA)
 docs/                       design notes, wire contract, audits, measured evidence
 manifests/                  component manifests (ane-prefill-split, semantic-sidecar-v1)
 results/                    saved measurement outputs from tests/ scripts
