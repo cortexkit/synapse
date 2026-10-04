@@ -147,6 +147,15 @@ allow_equivalent (default false: hard substitution rejection),
 required_epoch, target_fingerprint (embed.query: route only to a matching or
 certified-equivalent profile, else substitution_rejected/not_certified).
 
+## Flow-scoped routes
+
+Synapse does not declare the `flow-scopes/v1` capability, so the daemon keeps
+routes whose scope carries a `flow_id` away from it. If such a route is bound
+anyway, synapse serves on it only the operations declared `query` in its
+management registry. Every other method, including the mutations and any
+undeclared name, gets the channel-level error `flow_scope_refused`, naming the
+method and the flow. Routes without a `flow_id` are unaffected.
+
 ## Ops
 
 The management registry in this snapshot is `embed.query`, `embed.batch`,

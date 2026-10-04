@@ -471,9 +471,63 @@ struct SynapseHandlerInner {
     connection_file: PathBuf,
     state: OnceLock<Arc<ModuleState>>,
     approval_operators: Mutex<HashMap<RouteHandle, String>>,
+    /// The `flow_id` from each bound route's scope, for routes the daemon
+    /// opened on behalf of a flow (an automation acting for its owner).
+    /// Recorded at bind; `flow_refusal` uses it to refuse methods on such
+    /// routes.
+    flow_routes: Mutex<HashMap<RouteHandle, String>>,
     /// How the daemon connection ended, set once by the SDK's end-of-connection
     /// callback and read by the `synapse stopped` log line.
     connection_end: Arc<OnceLock<ConnectionEnd>>,
+}
+
+impl SynapseHandlerInner {
+    /// Remembers whether a bound route's scope belongs to a flow. The stamp is
+    /// fixed for the route's life, so recording it once at bind is enough.
+    fn record_bind_scope(&self, req: &RouteBindRequest) {
+        let flow_id = req
+            .scope
+            .as_ref()
+            .and_then(|scope| scope.attributes.flow_id.clone());
+        if let Ok(mut flows) = self.flow_routes.lock() {
+            match flow_id {
+                Some(flow_id) => {
+                    flows.insert(req.handle, flow_id);
+                }
+                None => {
+                    flows.remove(&req.handle);
+                }
+            }
+        }
+    }
+
+    /// A flow acts for its owner without the owner present, so on a flow's
+    /// route synapse serves only the operations it declares as queries, which
+    /// give every caller the same answer. Every other method (the mutations
+    /// that change what the whole machine serves, and any name not declared at
+    /// all) is refused by name. Without this, a flow would load, remove or
+    /// approve models as its owner.
+    fn flow_refusal(&self, route: &RouteHandle, method: &str) -> Option<HandlerOutcome> {
+        let flow_id = match self.flow_routes.lock() {
+            Ok(flows) => flows.get(route).cloned()?,
+            // A poisoned map can't say whether this route is a flow's, so
+            // refuse rather than serve a mutation unchecked.
+            Err(_) => "unknown".to_string(),
+        };
+        let declared_query = management_operations()
+            .iter()
+            .any(|op| op.name == method && op.kind == ManagementOperationKind::Query);
+        if declared_query {
+            return None;
+        }
+        Some(channel_error(
+            "flow_scope_refused",
+            format!(
+                "{method} is not available on a flow-scoped route (flow {flow_id}): \
+                 flows may call only synapse's query operations"
+            ),
+        ))
+    }
 }
 
 fn module_state_machine_profile_hashes(profile: &MachineProfile) -> (String, String) {
@@ -2085,6 +2139,7 @@ impl SynapseHandler {
                 connection_file,
                 state: OnceLock::new(),
                 approval_operators: Mutex::new(HashMap::new()),
+                flow_routes: Mutex::new(HashMap::new()),
                 connection_end: Arc::new(OnceLock::new()),
             }),
         }
@@ -3247,12 +3302,16 @@ impl ModuleHandler for SynapseHandler {
                 operators.remove(&req.handle);
             }
         }
+        self.inner.record_bind_scope(req);
         BindDecision::accept()
     }
 
     async fn on_route_gone(&self, handle: &RouteHandle) {
         if let Ok(mut operators) = self.inner.approval_operators.lock() {
             operators.remove(handle);
+        }
+        if let Ok(mut flows) = self.inner.flow_routes.lock() {
+            flows.remove(handle);
         }
     }
 
@@ -3309,6 +3368,12 @@ impl ModuleHandler for SynapseHandler {
             }
         };
 
+        if let Some(refusal) = self
+            .inner
+            .flow_refusal(&ctx.route_handle(), &envelope.method)
+        {
+            return refusal;
+        }
         let approved_by = self
             .inner
             .approval_operators
@@ -15866,6 +15931,114 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Builds a bind whose scope is decoded from the daemon's wire JSON, so the
+    /// test also checks that the linked subc-protocol accepts a scope carrying
+    /// `flow_id` (protocols before 0.29 refuse that unknown field).
+    fn bind_with_scope(channel: u16, flow_id: Option<&str>) -> RouteBindRequest {
+        let mut attributes = json!({"agent_id": "agent-1"});
+        if let Some(flow_id) = flow_id {
+            attributes["flow_id"] = json!(flow_id);
+        }
+        let stamp: subc_protocol::scope::ScopeStamp = serde_json::from_value(json!({
+            "owner": {"kind": "reserved", "module_id": "prefrontal-core"},
+            "ref": "head-1",
+            "scope_epoch": 3,
+            "kind": "worker",
+            "attributes": attributes,
+            "owner_authorized": true
+        }))
+        .expect("decode a scope stamp from wire JSON");
+        RouteBindRequest::new(
+            RouteHandle::detached(channel, 1),
+            subc_protocol::RouteTarget::ManagementSurface {
+                module_id: "synapse".into(),
+            },
+            subc_protocol::BindIdentity::new(PathBuf::from("/"), "synapse-test", "session-1"),
+        )
+        .with_scope(stamp)
+    }
+
+    fn refusal_code(outcome: Option<HandlerOutcome>) -> Option<String> {
+        match outcome {
+            Some(HandlerOutcome::Error { code, .. }) => Some(code),
+            Some(_) => Some("non-error outcome".into()),
+            None => None,
+        }
+    }
+
+    #[test]
+    fn flow_routes_get_queries_only_and_other_routes_are_unchanged() {
+        let handler = SynapseHandler::new("synapse".into(), PathBuf::new());
+        let inner = &handler.inner;
+        let flow = bind_with_scope(1, Some("flow-7"));
+        let plain = bind_with_scope(2, None);
+        inner.record_bind_scope(&flow);
+        inner.record_bind_scope(&plain);
+
+        let operations = management_operations();
+        let queries = operations
+            .iter()
+            .filter(|op| op.kind == ManagementOperationKind::Query)
+            .count();
+        let mutations = operations.len() - queries;
+        // Denominators: a list with no queries or no mutations would make the
+        // loop below vacuous.
+        assert!(
+            queries > 0 && mutations > 0,
+            "{queries} queries, {mutations} mutations"
+        );
+        for op in &operations {
+            let on_flow = refusal_code(inner.flow_refusal(&flow.handle, &op.name));
+            if op.kind == ManagementOperationKind::Query {
+                assert_eq!(on_flow, None, "query {} must be served to a flow", op.name);
+            } else {
+                assert_eq!(
+                    on_flow.as_deref(),
+                    Some("flow_scope_refused"),
+                    "mutation {} must be refused on a flow route",
+                    op.name
+                );
+            }
+            assert_eq!(
+                refusal_code(inner.flow_refusal(&plain.handle, &op.name)),
+                None,
+                "{} on a route without flow_id must be unaffected",
+                op.name
+            );
+        }
+        // Undeclared names, including the short decode aliases dispatch also
+        // accepts, are refused on a flow route rather than served by default.
+        for undeclared in ["decode", "admit_session", "no.such.method"] {
+            assert_eq!(
+                refusal_code(inner.flow_refusal(&flow.handle, undeclared)).as_deref(),
+                Some("flow_scope_refused"),
+                "{undeclared}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_flow_refusal_names_the_method_and_the_flow() {
+        let handler = SynapseHandler::new("synapse".into(), PathBuf::new());
+        let flow = bind_with_scope(3, Some("flow-9"));
+        handler.inner.record_bind_scope(&flow);
+        match handler.inner.flow_refusal(&flow.handle, "model.load") {
+            Some(HandlerOutcome::Error { code, message }) => {
+                assert_eq!(code, "flow_scope_refused");
+                assert!(message.contains("model.load"), "{message}");
+                assert!(message.contains("flow-9"), "{message}");
+            }
+            _ => panic!("model.load on a flow route must be refused"),
+        }
+        // A rebind of the same handle without flow_id clears the record.
+        handler.inner.record_bind_scope(&bind_with_scope(3, None));
+        assert!(handler
+            .inner
+            .flow_refusal(&flow.handle, "model.load")
+            .is_none());
+    }
+
     #[test]
     fn cuda_floor_probe_retains_child_failure_and_rejects_bad_json() {
         let mut failed = std::process::Command::new(if cfg!(windows) { "cmd.exe" } else { "sh" });
