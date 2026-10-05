@@ -3084,7 +3084,12 @@ impl CatalogProfile {
             family,
             dtype,
             execution: execution.unwrap_or("explicit").into(),
-            attention_units: attention_units.unwrap_or(OWNED_DEFAULT_ATTENTION_UNITS),
+            // A catalog profile always serves up to 8192 tokens, and the engine
+            // refuses to load a model whose attention budget can't cover
+            // max_tokens squared. The generic default (sized for legacy lanes)
+            // is far smaller, so a profile preload that doesn't set the budget
+            // would fail to load at all; default it to what the profile needs.
+            attention_units: attention_units.unwrap_or(8192 * 8192),
             config_locator: None,
             extra_locators: Vec::new(),
             identity_override: Some(identity),
@@ -19983,6 +19988,23 @@ mod tests {
             &JobConfig::default(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn profile_preload_attention_budget_covers_the_8192_token_ceiling() {
+        let catalog = CatalogProfile::load("gte-modernbert-base.owned-metal").unwrap();
+        assert_eq!(
+            catalog.owned_config(None, None).unwrap().attention_units,
+            8192 * 8192
+        );
+        assert_eq!(
+            catalog
+                .owned_config(None, Some(1234))
+                .unwrap()
+                .attention_units,
+            1234,
+            "an explicit budget is kept"
+        );
     }
 
     #[test]
