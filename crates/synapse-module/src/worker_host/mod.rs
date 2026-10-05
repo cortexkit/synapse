@@ -6680,26 +6680,27 @@ pub mod ane_residency {
             let refusal = error.to_engine_error(synapse_core::EngineErrorStage::Load);
             assert_eq!(refusal.retry_after_ms, Some(ANE_RESOURCES_RETRY_AFTER_MS));
             assert!(refusal.safe_to_retry_same_request);
-            let data = ledger.lock().unwrap();
-            assert_eq!(data.admit_attempts[&(model_ref.clone(), 512)], 2);
-            assert_eq!(
-                data.events
-                    .iter()
-                    .filter(|event| event.starts_with("evict "))
-                    .count(),
-                1
-            );
-            assert_eq!(data.connects["worker"], 2);
-            assert_eq!(
-                data.loads.len(),
-                2,
-                "persistent exhaustion must restore pinned models after confirmed owner exit"
-            );
-            assert!(data.resident.is_empty());
-            assert!(supervisor.resident_shapes().is_empty());
-            assert_eq!(supervisor.inner.lock().reserved_executables(), 0);
-            assert_eq!(supervisor.stats().restarts, 1);
-            drop(data);
+            {
+                let data = ledger.lock().unwrap();
+                assert_eq!(data.admit_attempts[&(model_ref.clone(), 512)], 2);
+                assert_eq!(
+                    data.events
+                        .iter()
+                        .filter(|event| event.starts_with("evict "))
+                        .count(),
+                    1
+                );
+                assert_eq!(data.connects["worker"], 2);
+                assert_eq!(
+                    data.loads.len(),
+                    2,
+                    "persistent exhaustion must restore pinned models after confirmed owner exit"
+                );
+                assert!(data.resident.is_empty());
+                assert!(supervisor.resident_shapes().is_empty());
+                assert_eq!(supervisor.inner.lock().reserved_executables(), 0);
+                assert_eq!(supervisor.stats().restarts, 1);
+            }
             drop(supervisor.lease(&worker, &model_ref, 512).await.unwrap());
         }
 

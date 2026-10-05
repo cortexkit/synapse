@@ -84,3 +84,13 @@ unacknowledged_admission_times_out_without_refunding_before_exit ... ok
 unacknowledged_eviction_times_out_without_refunding_before_exit ... ok
 test result: ok. 30 passed;0 failed;3 ignored
 ```
+
+## Final gates
+
+- `cargo clippy --locked -p synapse-module -p synapse-worker-ane-direct --all-targets -- -D warnings`: passed, clippy 0.1.99. This checks both packages and their test targets.
+- `cargo fmt --all -- --check`: passed. Fixed three vendored import-order differences and refreshed only their file digests.
+- `cargo test --locked -p synapse-module --lib -- --test-threads=1`: 577 passed, 9 ignored, zero failures.
+- `cargo test --locked -p synapse-worker-ane-direct`: 11 unit tests passed, 12 hardware tests ignored; vendored integrity test passed.
+- The test-only mutex guard now ends in a lexical scope before the later lease await. The compile-concurrency probe iterates the same shape values without indexing a fixed length array by a range variable.
+
+Commands ran with `TMPDIR` unset and `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer`. Dependency `block` reports a future-incompatibility notice, not a current warnings-as-errors failure. Scoped AFT diagnostics were unavailable because language servers disconnected during initialize; compiler-backed clippy and the full suites are the verification authority.

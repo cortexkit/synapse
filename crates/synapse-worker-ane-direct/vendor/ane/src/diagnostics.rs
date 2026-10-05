@@ -2,11 +2,11 @@
 //! These are experiments, not a promise that private ANE resources are reclaimed.
 use objc2::rc::{Allocated, Retained};
 use objc2::runtime::{AnyObject, Bool, NSObject};
-use objc2::{msg_send, ClassType};
+use objc2::{ClassType, msg_send};
 use objc2_foundation::{NSDictionary, NSError, NSString};
 
-use crate::ane_client::ANEClient;
 use crate::Executable;
+use crate::ane_client::ANEClient;
 
 /// Release paths observed in the Objective-C runtime, never guessed selector names.
 pub enum ReclaimProbe {

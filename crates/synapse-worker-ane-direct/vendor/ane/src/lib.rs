@@ -50,7 +50,7 @@ mod tensor_data;
 pub use error::Error;
 pub use executable::Executable;
 pub use graph::{
-    Convolution2dDescriptor, ConvolutionTranspose2dDescriptor, Graph, Tensor, MIN_SPATIAL_WIDTH,
+    Convolution2dDescriptor, ConvolutionTranspose2dDescriptor, Graph, MIN_SPATIAL_WIDTH, Tensor,
 };
 pub use io_surface::IOSurfaceExt;
 pub use objc2_foundation::NSQualityOfService;

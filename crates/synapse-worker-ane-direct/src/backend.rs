@@ -1184,12 +1184,12 @@ mod fresh_process_hardware {
         let model = model("gte-modernbert-base");
         let mut jobs = Vec::new();
         let lengths = [128, 256, 512, 1024];
-        for index in 0..count {
-            let shape = if full {
-                lengths[index]
-            } else {
-                (index + 1) * 128
-            };
+        let shapes = if full {
+            lengths[..count].to_vec()
+        } else {
+            (1..=count).map(|index| index * 128).collect::<Vec<_>>()
+        };
+        for shape in shapes {
             // Build graphs before the barrier to isolate concurrent compile/load, not graph construction.
             let graphs = (0..if full { 22 } else { 1 })
                 .map(|layer| gte_layer_graph(&model, shape, layer))
