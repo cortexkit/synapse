@@ -179,7 +179,9 @@ impl ModernBertModel {
         let model_root = resolve_model_root(path)?;
         ensure!(config.model_type == "modernbert", "model is not ModernBERT");
         ensure!(
-            config.hidden_size % config.num_attention_heads == 0,
+            config
+                .hidden_size
+                .is_multiple_of(config.num_attention_heads),
             "ModernBERT hidden size must divide attention heads"
         );
         ensure!(
@@ -1382,6 +1384,20 @@ fn rope_tables(seq: usize, head_dim: usize, theta: f32) -> (Vec<f32>, Vec<f32>) 
     (cos, sin)
 }
 
+pub(super) fn load_catalog(
+    path: &Path,
+    precision: Precision,
+    model: &serde_json::Value,
+) -> Result<Box<dyn ModelFamily>> {
+    let config = serde_json::from_value(crate::catalog::config(model))?;
+    let loaded = ModernBertModel::load_with_config(path, precision, config, true)?;
+    ensure!(
+        loaded.classification_head.is_some() == (model["operation"] == "rerank"),
+        "operation_mismatch: classifier head"
+    );
+    Ok(Box::new(loaded))
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
@@ -1575,18 +1591,4 @@ mod tests {
             .to_string()
             .contains("missing tensor; tried classifier.weight"));
     }
-}
-
-pub(super) fn load_catalog(
-    path: &Path,
-    precision: Precision,
-    model: &serde_json::Value,
-) -> Result<Box<dyn ModelFamily>> {
-    let config = serde_json::from_value(crate::catalog::config(model))?;
-    let loaded = ModernBertModel::load_with_config(path, precision, config, true)?;
-    ensure!(
-        loaded.classification_head.is_some() == (model["operation"] == "rerank"),
-        "operation_mismatch: classifier head"
-    );
-    Ok(Box::new(loaded))
 }

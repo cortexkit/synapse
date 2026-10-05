@@ -16,6 +16,10 @@ use super::{
     Precision, Tensor,
 };
 
+/// One padded forward pass: hidden states, attention mask, padded batch and
+/// sequence length, and the number of real (unpadded) rows.
+type ForwardIds = (Vec<f32>, Vec<u8>, usize, usize, usize);
+
 #[derive(Debug, Deserialize)]
 struct Config {
     hidden_size: usize,
@@ -205,7 +209,7 @@ impl Model {
         provider: &mut dyn KernelProvider,
         sequences: &[Vec<u32>],
         shape: Option<BatchShape>,
-    ) -> Result<(Vec<f32>, Vec<u8>, usize, usize, usize)> {
+    ) -> Result<ForwardIds> {
         let real_batch = sequences.len();
         ensure!(real_batch > 0, "Qwen3 batch must not be empty");
         let real_seq = sequences.iter().map(Vec::len).max().unwrap_or(1).max(1);
