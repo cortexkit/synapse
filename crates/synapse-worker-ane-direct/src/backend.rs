@@ -997,11 +997,16 @@ mod fresh_process_hardware {
         let replacement = if qwen { 2048 } else { 4096 };
         let mut model = model(&slug);
         for shape in lengths {
-            ane::diagnostics::with_autorelease_pool(|| {
+            let mut compile = || {
                 model.admit_with_limit(shape, "scoped-pools-development", 64, |graph, _| {
                     graph.compile(NSQualityOfService::UserInteractive)
                 })
-            })
+            };
+            if method == "scoped-compile-no-pool" {
+                compile()
+            } else {
+                ane::diagnostics::with_autorelease_pool(compile)
+            }
             .unwrap();
         }
         let initial_executables = model
@@ -1022,7 +1027,7 @@ mod fresh_process_hardware {
         }
         let offset_ms = started.elapsed().as_secs_f64() * 1000.0;
         let mut loaded = 0;
-        let result = ane::diagnostics::with_autorelease_pool(|| {
+        let mut compile = || {
             model.admit_with_limit(replacement, "scoped-pools-development", 64, |graph, _| {
                 let result = graph.compile(NSQualityOfService::UserInteractive);
                 if result.is_ok() {
@@ -1030,7 +1035,12 @@ mod fresh_process_hardware {
                 }
                 result
             })
-        });
+        };
+        let result = if method == "scoped-compile-no-pool" {
+            compile()
+        } else {
+            ane::diagnostics::with_autorelease_pool(compile)
+        };
         let error = result.err().map(|error| format!("{error:#}"));
         let after = ane::diagnostics::with_autorelease_pool(|| model.run(&tokens)).unwrap();
         assert_eq!(before,after,"retained sibling must remain executable and byte-identical across scoped-pool releases");
