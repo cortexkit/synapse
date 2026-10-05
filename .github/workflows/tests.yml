@@ -86,6 +86,15 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      # bench/parity is its own workspace (kept out of the root lockfile), so the
+      # workspace test run never reaches it. Its evaluator and manifest
+      # validator gate releases, so test them here.
+      - name: Parity manifest and evaluator tests
+        if: matrix.name == 'linux'
+        working-directory: synapse/bench/parity
+        timeout-minutes: 20
+        run: cargo test --locked
+
       # Direct prebuilt-binary install instead of taiki-e/install-action: the
       # action's bootstrap script is broken by a runner-image bash regression
       # (actions/partner-runner-images#169) and took every lane down with it.
