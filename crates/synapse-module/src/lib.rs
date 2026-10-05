@@ -3483,11 +3483,14 @@ fn catalog_model_engine_identity(engine_name: &str) -> Result<EngineIdentity, Mo
                 ("placement_gate", "neural-engine"),
             ],
         )),
-        "owned-vulkan" | "ane-direct-worker" => Ok(worker_catalog_identity(
-            engine_name,
-            "protocol-v2",
-            &[("transport", worker_catalog_transport())],
-        )),
+        // These two lanes exist only as catalog lanes, whose fingerprints are pinned
+        // in the release manifest and must be identical on every platform that
+        // runs them (Vulkan runs on Linux and Windows). The IPC transport differs
+        // by OS and does not affect the vectors, so it stays out of the identity.
+        // The legacy arms above keep it, because live fingerprints depend on it.
+        "owned-vulkan" | "ane-direct-worker" => {
+            Ok(worker_catalog_identity(engine_name, "protocol-v2", &[]))
+        }
         "owned-cuda" => Ok(owned_cuda_engine_identity(
             "unknown",
             "f16",
@@ -19746,6 +19749,20 @@ mod tests {
     }
 
     #[test]
+    fn catalog_only_worker_identities_are_platform_independent() {
+        // Catalog fingerprints are pinned once per release and must match on
+        // every OS that runs the lane; the worker transport differs by OS.
+        for engine in ["owned-vulkan", "ane-direct-worker"] {
+            let identity = catalog_model_engine_identity(engine).unwrap();
+            assert!(
+                !identity.build_flags.contains_key("transport"),
+                "{engine}: {:?}",
+                identity.build_flags
+            );
+        }
+    }
+
+    #[test]
     fn catalog_profiles_bind_identity_and_worker_package() {
         let manifest: Value =
             serde_json::from_slice(include_bytes!("../../../bench/parity/models.json")).unwrap();
@@ -19826,22 +19843,22 @@ mod tests {
                 .fingerprint
             );
             let expected = [
-                "5dba358a35c66331fc782d0df05e17c31db8e3dcafa097acd4b9126f293fcd29",
+                "c0f400f352d41b549b864b9cbe59bc7c401e820c48c0585b98d1bc7d7c6eecd0",
                 "27166bbf06d295c10dad348a8df8bf6774e209791bef402fc4847b24f96b1b39",
                 "3a0b02613e9f7cd7b502de500e28613df43025b59df2cd4b0ec604de42e5a2e2",
-                "b466f1eab750d8916dcc7c1943496a30b04bf0fd562053c33b6e7ba37f817c48",
-                "184c97d9e0879820c2d5da7e639aca2d6daf2a3d1665188bbabbc6a09e954d7c",
+                "7808303bba4061bbd0ee205c22a0a53d039c12b61a380dc7d2c2bf6f240a0934",
+                "a006367b6adb645e44c82c9a56e973f3423fb4f9be2461ff80a38df68aa9c543",
                 "510721ab2b99d667e5461764ac3c129e0244b4f1b32370a269608aa8e56bba20",
                 "bdab90b6bb1d81696d679d3c267c95f90de418fa501a3824f42e0c3c217fe166",
-                "3f22bb43916da0e593d0ed269d033b76de5670766c3a94d33e55a6aecb149e4e",
-                "91a693ac3c9f84777236c242b7a1ef68ae69f846c40142b47654bd941fb0c4e4",
+                "0e6fbb6174c877f4aead2478b182da31106f10a70019afbb0662ab572c1b8258",
+                "df0b8ccadc3696d8e08cca52fda0236fc6a33a59134187c52517291ea94ac902",
                 "896eb823c1ee5d9c31b42a12163684ab6b707968a619a7c0196775cc394f4148",
                 "6553a78dce363808f967655b534db0c1536d837de3dcfba3a30e142a3cb847e9",
-                "aed4309eecdc10a56465650c3bd11d094b1e3d388ba466b822735ea8df078b8a",
-                "a0340856a50c521225feb2533a1e5f687e00c0beb5717733b9ecd12e7675c37e",
+                "fb2d8058714b0b766e5c6847344a3b1651091730388fa38966c7c67a2b88eb13",
+                "6e583acd1cacaf47a1c02873c52441f3b62417ed086fc88346d4d08a8389fbc0",
                 "2c00ee65e9ae43600c62332a0d96f799b790c03339cf43ad286eaaca0f8fd6bd",
                 "16ca0b783714705ca01235bfa7fe3a08da2615abc87cf081a1f0c7041edc2d5a",
-                "e4e7864d7f7d5f18ee7d08701f7cdfe5153c86c5da0fd17bfd9ded674bd865e4",
+                "fb2a4fcb16f3fe2deaf26c0ed11568b1e1c83db5523a666ad1c497ee1580cfbd",
             ];
             let index = manifest["profiles"]
                 .as_object()
