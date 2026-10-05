@@ -52,6 +52,7 @@ fn stable_name(code: StableErrorCode) -> &'static str {
     use StableErrorCode::*;
     match code {
         QueueFull => "queue_full",
+        SequenceTooLong => "sequence_too_long",
         DeadlineExceeded => "deadline_exceeded",
         ModelLoading => "model_loading",
         NotCertified => "not_certified",

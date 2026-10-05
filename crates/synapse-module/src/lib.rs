@@ -19797,6 +19797,21 @@ mod tests {
                 numeric.converted_package_digest.is_some(),
                 profile["lane"] != "owned-metal"
             );
+            if profile["lane"] != "owned-metal" {
+                let mut wrong_package = spec.clone();
+                wrong_package.artifact_digest = catalog.model()["checkpoint_digest"]
+                    .as_str()
+                    .unwrap()
+                    .into();
+                assert!(normalize_catalog_model(
+                    wrong_package,
+                    &InlineConfig::default(),
+                    &JobConfig::default()
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("package_digest_mismatch"));
+            }
             let original = numeric.fingerprint();
             numeric.model_digest.push('0');
             assert_ne!(original, numeric.fingerprint());
@@ -19894,6 +19909,34 @@ mod tests {
             assert_eq!(spec.fingerprint.0, expected);
             assert!(!spec.engine_identity.build_flags.contains_key("profile"));
         }
+    }
+
+    #[test]
+    fn preload_profile_key_builds_every_catalog_lane_without_config_json() {
+        let (dir, _) = test_storage_descriptor("catalog-preload");
+        let manifest: Value =
+            serde_json::from_slice(include_bytes!("../../../bench/parity/models.json")).unwrap();
+        for id in manifest["profiles"].as_object().unwrap().keys() {
+            let fixture = catalog_fixture_config(id);
+            let model = catalog_test_model(&dir, &fixture);
+            let preload: PreloadModelConfig = serde_json::from_value(json!({
+                "model_id":id,"profile":id,"engine":fixture.engine,"task":fixture.task,
+                "pooling":fixture.pooling,"normalize":fixture.normalize,"artifact_digest":fixture.artifact_digest,
+                "model_path":dir.join("converted-package.safetensors"),"tokenizer_path":dir.join("catalog-tokenizer.json")
+            })).unwrap();
+            let stored = build_preload_catalog_model(
+                0,
+                preload,
+                &InlineConfig::default(),
+                &JobConfig::default(),
+            )
+            .unwrap();
+            assert_eq!(stored.max_tokens, 8192);
+            assert_eq!(stored.engine_identity.build_flags["profile"], *id);
+            assert_eq!(stored.artifact_digest, fixture.artifact_digest);
+            assert_eq!(model.tokenizer.max_tokens(), usize::MAX);
+        }
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
