@@ -91,6 +91,8 @@ pub fn dispatch(command: Command, source: Option<&str>) -> Result<serde_json::Va
             options,
         } => {
             let options = options.ok_or_else(|| refuse(LIVE_OPTIONS_MISSING))?;
+            crate::combination(&row, &model)?;
+            crate::live::require_observation_support(&row)?;
             let source = source.ok_or_else(|| refuse("candidate was built from a dirty tree or without git; evidence cannot be bound to a commit"))?;
             let candidate = options
                 .assets
@@ -120,6 +122,42 @@ pub fn dispatch(command: Command, source: Option<&str>) -> Result<serde_json::Va
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn worker_backed_live_run_refuses_missing_observation_and_writes_nothing() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(format!(".live/worker-refusal-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        for row in crate::ROWS {
+            if row == "metal-m5" {
+                continue;
+            }
+            let options = crate::live::Options {
+                assets: root.join("absent-assets"),
+                checkout: root.join("checkout"),
+                weights: root.join("absent-weights"),
+            };
+            let error = super::dispatch(
+                super::Command::Run {
+                    row: row.into(),
+                    model: crate::MODELS[0].into(),
+                    options: Some(options),
+                },
+                Some(&"1".repeat(40)),
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("missing_worker_observation"),
+                "{row}: {error}"
+            );
+            assert!(
+                !root.join("checkout").exists(),
+                "{row} wrote a record before refusing"
+            );
+        }
+        assert!(crate::live::require_observation_support("metal-m5").is_ok());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     use super::*;
     fn args(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()

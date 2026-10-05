@@ -948,3 +948,13 @@ original committed fixture index, and fixture/model/revision identity is checked
 by the parity evaluator. Numerical and semantic gates and manifest tolerances
 are unchanged. Full-corpus and 8192-token coverage remain certification gates,
 not claims made by the small load-time check.
+
+The `ck-synapse certify run` producer currently certifies only `metal-m5`.
+Worker-backed `cuda-*`,
+`vulkan-*`, and `ane-m5` runs refuse with `missing_worker_observation` before
+launching workers or writing a record. Enabling those rows requires capture of
+every worker `ADMITTED` inventory, a sent-request count getter, and the independent
+`stats()` admission count. An unavailable observation stream is never interpreted
+as an empty, complete inventory. The checked-in Metal development evidence lives
+under `crates/synapse-certify/tests/evidence/`; it is labelled development, omits
+the private machine UUID, and is not a release-candidate certification record.

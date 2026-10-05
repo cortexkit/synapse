@@ -65,6 +65,16 @@ fn worker(row: &str) -> Option<&'static str> {
         _ => None,
     }
 }
+// Worker-backed certification needs complete ADMITTED capture and independent
+// counters. The module currently exposes complete snapshots only for Metal;
+// refuse before launching a worker rather than certify an incomplete snapshot.
+pub(crate) fn require_observation_support(row: &str) -> Result<()> {
+    if worker(row).is_some() {
+        return Err(refuse("missing_worker_observation: ADMITTED inventory sink, request-count getter and stats() admitted count are unavailable"));
+    }
+    Ok(())
+}
+
 impl LiveRunner {
     pub fn new(options: Options, source: &str) -> Result<Self> {
         Ok(Self {
@@ -77,6 +87,7 @@ impl LiveRunner {
 }
 impl Runner for LiveRunner {
     fn probe_floor(&mut self, row: &str, _model: &str) -> Result<String> {
+        require_observation_support(row)?;
         let role = worker(row).ok_or_else(|| refuse("metal-m5 has no floor probe"))?;
         let output = self.runtime.block_on(async {
             timeout(
@@ -100,6 +111,7 @@ impl Runner for LiveRunner {
         })
     }
     fn observe(&mut self, row: &str, model: &str) -> Result<RunEvidence> {
+        require_observation_support(row)?;
         self.runtime.block_on(observe(
             &self.options,
             &self.source,
