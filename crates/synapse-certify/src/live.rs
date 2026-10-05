@@ -317,6 +317,16 @@ fn request_params(case: &Value, operation: &str) -> Value {
         json!({"model": "certify-candidate", "query": case["query"], "candidates": [case["document"]], "accept_declared": true})
     }
 }
+fn observed_output(response: &Value, index: usize, operation: &str) -> serde_json::Result<Output> {
+    // ResponseEnvelope flattens the inference payload alongside its metadata.
+    if operation == "embed" {
+        serde_json::from_value::<Vec<f64>>(response["vectors"][index]["vector"].clone())
+            .map(Output::Embedding)
+    } else {
+        serde_json::from_value::<f64>(response["scores"][index].clone()).map(Output::Score)
+    }
+}
+
 const INLINE_ITEMS: usize = 64;
 const INLINE_TOKENS: usize = 8192;
 
@@ -507,15 +517,7 @@ async fn observe(
                 .ok_or_else(|| refuse("worker counter regressed on 8192 input"))?;
         }
         for (index, (case, input_ids)) in group.into_iter().zip(ids).enumerate() {
-            let output = if operation == "embed" {
-                serde_json::from_value::<Vec<f64>>(
-                    response["payload"]["vectors"][index]["vector"].clone(),
-                )
-                .map(Output::Embedding)
-            } else {
-                serde_json::from_value::<f64>(response["payload"]["scores"][index].clone())
-                    .map(Output::Score)
-            };
+            let output = observed_output(&response, index, operation);
             let Ok(output) = output else {
                 continue;
             };
@@ -823,6 +825,29 @@ fn machine_non_apple(row: &str, floor: Option<&Value>) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decodes_flattened_wire_vectors_and_scores_in_item_order() {
+        let embed = json!({"fingerprint": "identity", "vectors": [{"id":"a", "vector":[1.0, 2.0]}, {"id":"b", "vector":[3.0, 4.0]}]});
+        let rerank = json!({"fingerprint": "identity", "scores": [0.25, 0.75]});
+        assert_eq!(
+            observed_output(&embed, 0, "embed").unwrap(),
+            Output::Embedding(vec![1.0, 2.0])
+        );
+        assert_eq!(
+            observed_output(&embed, 1, "embed").unwrap(),
+            Output::Embedding(vec![3.0, 4.0])
+        );
+        assert_eq!(
+            observed_output(&rerank, 0, "rerank").unwrap(),
+            Output::Score(0.25)
+        );
+        assert_eq!(
+            observed_output(&rerank, 1, "rerank").unwrap(),
+            Output::Score(0.75)
+        );
+        assert!(observed_output(&embed, 2, "embed").is_err());
+    }
 
     #[test]
     fn committed_batches_and_pools_use_bounded_multi_item_requests() {
