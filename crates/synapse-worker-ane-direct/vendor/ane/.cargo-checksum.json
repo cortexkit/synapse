@@ -1,7 +1,7 @@
 {
   "files": {
     "Cargo.toml": "bb70d7a091b3272101ca3de7dbde0242ab84405fc307cba5f9dd42b86786d8cd",
-    "VENDORED.md": "b8325a31e475fbf82f418a4de4f160c0637116db00e64b74ccc99e7326139807",
+    "VENDORED.md": "1ae67ea4e79a72e4f87f1a0ef81e46fab0fba385fda2699e8b9af920bf2c3511",
     "build.rs": "d5339f906b4cb1c86b2b7d539729f74c8bc7b3a79f950bf4fffbd312842e8c59",
     "src/ane_client.rs": "9aabbf44811f23a0f13f56349b0f981be55aafe328608c65094a6ba2b681ebf1",
     "src/ane_in_memory_model.rs": "b81487c55abf10bfd35a0e803a2c6a9788fd32e33f5fb35bdb76b3afd714381a",
@@ -21,7 +21,7 @@
     "src/graph/ops.rs": "8c01b946eb7271e644248ddb513bde8ef1650fcb5cfea3977499e00e6d9cb348",
     "src/graph/tensor.rs": "cfeeed0358e0f1100272a88dea7a74ca06ec6100b245705604afc9294a61515f",
     "src/io_surface.rs": "c43169db69f1c0a3b697139d4d2492a6c6daa3b27742930cfe33e528deca4381",
-    "src/lib.rs": "966f2609118e65cb199c4a392588c1c803367a058d70af726b3ea9f6ba282072",
+    "src/lib.rs": "2734947d3b5fdd76372a58ffd34822f4cb76223dfd49c565864b8209dda8f3d4",
     "src/neon_convert.rs": "18a9b272de914196793269c6af9eca79d17cefbbe3e32d59ed82cd5fddd15f69",
     "src/ops/activation.rs": "b0c79817afbfe2bc171a7280f65c617109bf1b2c552a1ff09eecf8a833280603",
     "src/ops/activation_mode.rs": "990b45841df40f7f9b333e480d0546c8e4af4ae3b698545618d30cbd870c8bd3",

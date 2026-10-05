@@ -131,6 +131,13 @@ pub struct Resident {
     residual: TensorData,
     mask: TensorData,
 }
+impl Drop for Model {
+    fn drop(&mut self) {
+        // Model unload, replacement, and connection close release all cached programs.
+        ane::autoreleasepool(|_| self.resident.clear());
+    }
+}
+
 impl Model {
     pub fn load(profile: Profile, path: &Path, digest: &str) -> Result<Self> {
         ensure!(
@@ -215,8 +222,11 @@ impl Model {
             .with_context(|| format!("tensor_missing:{name}"))
     }
     pub fn admit(&mut self, shape: usize, os: &str) -> Result<AnePlacementInventory> {
-        self.admit_with_compiler(shape, os, |graph, _| {
-            graph.compile(NSQualityOfService::UserInteractive)
+        // Compile temporaries retain ANE programs until the autorelease pool drains.
+        ane::autoreleasepool(|_| {
+            self.admit_with_compiler(shape, os, |graph, _| {
+                graph.compile(NSQualityOfService::UserInteractive)
+            })
         })
     }
     fn admit_with_compiler(
@@ -305,8 +315,12 @@ impl Model {
         );
         Ok(inventory)
     }
+    pub fn evict(&mut self, shape: usize) {
+        ane::autoreleasepool(|_| drop(self.resident.remove(&shape)));
+    }
+
     pub fn run(&self, tokens: &[u32]) -> Result<Vec<f32>> {
-        self.run_stages(tokens, false)
+        ane::autoreleasepool(|_| self.run_stages(tokens, false))
     }
     fn run_stages(&self, tokens: &[u32], traced: bool) -> Result<Vec<f32>> {
         let mut stages = StageClock::new(traced);
