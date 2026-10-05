@@ -6604,6 +6604,7 @@ dependencies = [
  "subc-daemon",
  "subc-protocol",
  "subc-transport",
+ "synapse-core",
  "synapse-parity",
  "thiserror 1.0.69",
  "tokio",

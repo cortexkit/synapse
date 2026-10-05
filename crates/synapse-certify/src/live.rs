@@ -92,10 +92,13 @@ impl Runner for LiveRunner {
         let output = self.runtime.block_on(async {
             timeout(
                 Duration::from_secs(60),
-                Command::new(binary(&self.options.assets, role))
-                    .arg("--probe-floor")
-                    .kill_on_drop(true)
-                    .output(),
+                synapse_core::without_launch_nonce_tokio(Command::new(binary(
+                    &self.options.assets,
+                    role,
+                )))
+                .arg("--probe-floor")
+                .kill_on_drop(true)
+                .output(),
             )
             .await
             .map_err(err)?
@@ -271,18 +274,21 @@ async fn start(options: &Options, row: &str, model: &str, manifest: &Value) -> R
     }
     let config = root.join("config.json");
     std::fs::write(&config, serde_json::to_vec(&json!({"certify_observation": true, "preload_models": [preload], "inline": {"deadline_ms": 3600000, "max_queue_ms": 3600000, "max_items": INLINE_ITEMS, "max_tokens": INLINE_TOKENS}})).map_err(err)?).map_err(err)?;
-    let child = Command::new(binary(&options.assets, "ck-synapse"))
-        .arg("--subc")
-        .arg(&conn_path)
-        .env("SUBC_MODULE_ID", "synapse")
-        .env("SYNAPSE_CONFIG_PATH", &config)
-        .env("XDG_DATA_HOME", root.join("data"))
-        .env("CORTEXKIT_LEASE_ROOT", root.join("leases"))
-        .env("CORTEXKIT_STORE_ROOT", root.join("store"))
-        .stderr(std::process::Stdio::inherit())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(err)?;
+    let child = synapse_core::without_launch_nonce_tokio(Command::new(binary(
+        &options.assets,
+        "ck-synapse",
+    )))
+    .arg("--subc")
+    .arg(&conn_path)
+    .env("SUBC_MODULE_ID", "synapse")
+    .env("SYNAPSE_CONFIG_PATH", &config)
+    .env("XDG_DATA_HOME", root.join("data"))
+    .env("CORTEXKIT_LEASE_ROOT", root.join("leases"))
+    .env("CORTEXKIT_STORE_ROOT", root.join("store"))
+    .stderr(std::process::Stdio::inherit())
+    .kill_on_drop(true)
+    .spawn()
+    .map_err(err)?;
     let mut stream = TcpStream::connect(("127.0.0.1", conn.endpoints[0].port))
         .await
         .map_err(err)?;
@@ -707,10 +713,11 @@ async fn latency_series(session: &mut Session, method: &str, params: Value) -> R
 fn machine(row: &str, floor: Option<&Value>) -> Result<Value> {
     #[cfg(target_os = "macos")]
     {
-        let output = std::process::Command::new("system_profiler")
-            .args(["SPHardwareDataType", "-json"])
-            .output()
-            .map_err(err)?;
+        let output =
+            synapse_core::without_launch_nonce(std::process::Command::new("system_profiler"))
+                .args(["SPHardwareDataType", "-json"])
+                .output()
+                .map_err(err)?;
         let hardware: Value = serde_json::from_slice(&output.stdout).map_err(err)?;
         let hardware = &hardware["SPHardwareDataType"][0];
         if !matches!(row, "metal-m5" | "ane-m5")
@@ -727,7 +734,7 @@ fn machine(row: &str, floor: Option<&Value>) -> Result<Value> {
         {
             return Err(refuse("Apple machine identifiers missing"));
         }
-        let os = std::process::Command::new("sw_vers")
+        let os = synapse_core::without_launch_nonce(std::process::Command::new("sw_vers"))
             .arg("-productVersion")
             .output()
             .map_err(err)?;
@@ -744,7 +751,7 @@ fn machine(row: &str, floor: Option<&Value>) -> Result<Value> {
 #[cfg(not(target_os = "macos"))]
 fn machine_non_apple(row: &str, floor: Option<&Value>) -> Result<Value> {
     fn command(program: &str, args: &[&str]) -> Result<String> {
-        let output = std::process::Command::new(program)
+        let output = synapse_core::without_launch_nonce(std::process::Command::new(program))
             .args(args)
             .output()
             .map_err(err)?;
