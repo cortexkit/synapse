@@ -482,3 +482,35 @@ pub fn score_pool(
     }
     Ok(scores)
 }
+
+/// A load-time subset checks numerical and semantic gates, not full-suite
+/// coverage. The underlying comparison and manifest tolerances are identical
+/// to certification; this result cannot certify 8192-token or corpus coverage.
+#[derive(Debug, Serialize)]
+pub struct SubsetEvaluation {
+    pub evaluation: Evaluation,
+}
+impl SubsetEvaluation {
+    pub fn passed(&self) -> bool {
+        let gates = &self.evaluation.gates;
+        gates.complete
+            && gates.dimension
+            && gates.finite
+            && gates.unit_norm
+            && gates.cosine
+            && gates.score
+            && gates.ranking
+            && gates.semantics
+    }
+}
+
+pub fn evaluate_subset(
+    manifest: &Manifest,
+    profile_id: &str,
+    fingerprint: &str,
+    fixtures: &FixtureSet,
+    outputs: &BTreeMap<String, ObservedCase>,
+) -> Result<SubsetEvaluation> {
+    evaluate(manifest, profile_id, fingerprint, fixtures, outputs)
+        .map(|evaluation| SubsetEvaluation { evaluation })
+}

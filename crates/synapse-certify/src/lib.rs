@@ -9,6 +9,7 @@ use std::path::{Component, Path, PathBuf};
 
 pub mod command;
 pub mod live;
+pub mod self_check;
 
 pub const ROWS: [&str; 8] = [
     "vulkan-windows-amd",

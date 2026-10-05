@@ -7857,7 +7857,7 @@ async fn embed_query(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         params.deadline_ms =
             Some(budget.saturating_sub(resolution_started.elapsed().as_millis() as u64));
     }
-    if let Err(error) = ensure_model_certified(
+    if let Err(error) = ensure_pre_tokenization_certified(
         &state,
         &model,
         CertificationClass::Embedding,
@@ -7906,6 +7906,9 @@ async fn embed_query(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         if let Some(details) = error.details.as_mut() {
             details["item_id"] = json!(params.id.as_deref().unwrap_or("query"));
         }
+        return result_outcome(error_payload(&state, error));
+    }
+    if let Err(error) = ensure_profile_request_certified(state.clone(), &model).await {
         return result_outcome(error_payload(&state, error));
     }
     apply_owned_tokenizer_policy(&model, &mut tokenized);
@@ -8226,7 +8229,7 @@ async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         params.deadline_ms =
             Some(budget.saturating_sub(resolution_started.elapsed().as_millis() as u64));
     }
-    if let Err(error) = ensure_model_certified(
+    if let Err(error) = ensure_pre_tokenization_certified(
         &state,
         &model,
         CertificationClass::Embedding,
@@ -8268,6 +8271,9 @@ async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
                 details["item_id"] = json!(items[index].id);
             }
         }
+        return result_outcome(error_payload(&state, error));
+    }
+    if let Err(error) = ensure_profile_request_certified(state.clone(), &model).await {
         return result_outcome(error_payload(&state, error));
     }
     apply_owned_tokenizer_policy(&model, &mut tokenized);
@@ -8850,7 +8856,7 @@ async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
         params.deadline_ms =
             Some(budget.saturating_sub(resolution_started.elapsed().as_millis() as u64));
     }
-    if let Err(error) = ensure_model_certified(
+    if let Err(error) = ensure_pre_tokenization_certified(
         &state,
         &model,
         CertificationClass::Rerank,
@@ -8873,6 +8879,9 @@ async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
         Ok(pairs) => pairs,
         Err(error) => return result_outcome(error_payload(&state, error)),
     };
+    if let Err(error) = ensure_profile_request_certified(state.clone(), &model).await {
+        return result_outcome(error_payload(&state, error));
+    }
     let mut texts = Vec::with_capacity(params.candidates.len() + 1);
     texts.push(params.query.as_str());
     texts.extend(params.candidates.iter().map(String::as_str));
@@ -12491,6 +12500,42 @@ fn equivalent_fingerprints(alias_table: &AliasTable, model: &EmbeddingModel) -> 
         .collect()
 }
 
+// Legacy probes retain their original ordering. A profile's numerical check is
+// deferred until after composed-token validation so an oversized input cannot
+// trigger self-check inference before its sequence_too_long refusal.
+fn ensure_pre_tokenization_certified(
+    state: &ModuleState,
+    model: &EmbeddingModel,
+    class: CertificationClass,
+    accept_declared: bool,
+) -> Result<(), WireOperationError> {
+    if model.engine_identity.build_flags.contains_key("profile") {
+        Ok(())
+    } else {
+        ensure_model_certified(state, model, class, accept_declared)
+    }
+}
+
+async fn ensure_profile_request_certified(
+    state: Arc<ModuleState>,
+    model: &EmbeddingModel,
+) -> Result<(), WireOperationError> {
+    if model.engine_identity.build_flags.contains_key("profile") {
+        ensure_profile_preload_ready(state.clone(), &model.model_id, None).await?;
+        ensure_model_certified(
+            &state,
+            model,
+            if model.task == ModelTask::Embed {
+                CertificationClass::Embedding
+            } else {
+                CertificationClass::Rerank
+            },
+            false,
+        )?;
+    }
+    Ok(())
+}
+
 fn ensure_model_certified(
     state: &ModuleState,
     model: &EmbeddingModel,
@@ -12499,6 +12544,13 @@ fn ensure_model_certified(
 ) -> Result<(), WireOperationError> {
     if resolved_catalog_lane(&state.runtime, &model.model_id).is_some() {
         return Ok(());
+    }
+    if let Some(profile) = model.engine_identity.build_flags.get("profile") {
+        let (id, _) = profile_preload_check_key(state, model, profile)?;
+        return match profile_preload_check_status(state, &id)?.as_str() {
+            "passed" => Ok(()),
+            status => Err(profile_preload_check_error(profile, status)),
+        };
     }
     // Owned-CUDA has no declared or inherited certification path. A measured
     // row must match this exact machine-profile hash before serving.
@@ -16526,6 +16578,95 @@ fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn profile_less_preload_keeps_probe_required() {
+        let (root, descriptor) = test_storage_descriptor("legacy-preload-gate");
+        let store = Arc::new(SynapseStore::open(&descriptor).unwrap());
+        let profile = test_machine_profile("legacy-preload-os");
+        store.observe_profile(&profile, 10, 1).unwrap();
+        let state = test_module_state(store, profile);
+        let error = resolve_model_for_request(state, None, ModelTask::Embed)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.code, "probe_required");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_preload_serving_requires_numeric_self_check() {
+        use synapse_parity::evaluator::{evaluate_subset, ObservedCase, Output};
+        let (root, descriptor) = test_storage_descriptor("profile-preload-gate");
+        let profile = "gte-modernbert-base.owned-vulkan";
+        let state = catalog_test_state(&root, &descriptor, profile);
+        let model = state.runtime.loaded_models().into_iter().next().unwrap();
+        let error = ensure_model_certified(&state, &model, CertificationClass::Embedding, true)
+            .unwrap_err();
+        assert_eq!(error.code, "self_check_failed");
+        let refs = synapse_certify::self_check::load(profile).unwrap();
+        let mut outputs = refs
+            .fixtures
+            .cases()
+            .iter()
+            .map(|case| {
+                (
+                    case.id.clone(),
+                    ObservedCase {
+                        output: case.output.clone(),
+                        input_ids: case.input_ids.clone(),
+                        readout: None,
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let evaluation = evaluate_subset(
+            &refs.manifest,
+            profile,
+            &model.fingerprint.0,
+            &refs.fixtures,
+            &outputs,
+        )
+        .unwrap();
+        assert!(evaluation.passed());
+        let (id, key) = profile_preload_check_key(&state, &model, profile).unwrap();
+        let generation = catalog_check_generation(&state, &id, &key).unwrap();
+        complete_profile_preload_check(&state, profile, &id, generation, &evaluation).unwrap();
+        assert!(
+            ensure_model_certified(&state, &model, CertificationClass::Embedding, true).is_ok()
+        );
+        let Output::Embedding(vector) = &mut outputs.get_mut("short-0").unwrap().output else {
+            unreachable!()
+        };
+        vector.pop();
+        let failed = evaluate_subset(
+            &refs.manifest,
+            profile,
+            &model.fingerprint.0,
+            &refs.fixtures,
+            &outputs,
+        )
+        .unwrap();
+        assert!(!failed.passed());
+        let generation = catalog_check_generation(&state, &id, &key).unwrap();
+        assert_eq!(
+            complete_profile_preload_check(&state, profile, &id, generation, &failed)
+                .unwrap_err()
+                .code,
+            "self_check_failed"
+        );
+        assert_eq!(profile_preload_check_status(&state, &id).unwrap(), "failed");
+        assert_eq!(
+            ensure_model_certified(&state, &model, CertificationClass::Embedding, true)
+                .unwrap_err()
+                .code,
+            "self_check_failed"
+        );
+        drop(model);
+        drop(state);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn certify_observation_off_preserves_response_bytes() {
         let mut response = serde_json::json!({"payload": {"vectors": [[1.0]]}});
@@ -23404,6 +23545,219 @@ fn select_catalog_lane(
     }
     Ok((entry.clone(), backend.clone()))
 }
+fn profile_preload_check_error(profile: &str, reason: &str) -> WireOperationError {
+    catalog_wire_error(
+        "self_check_failed",
+        json!({"profile": profile, "reason": reason}),
+        format!("profile preload numerical self-check failed for {profile}: {reason}"),
+    )
+}
+
+fn profile_preload_check_key(
+    state: &ModuleState,
+    model: &EmbeddingModel,
+    profile: &str,
+) -> Result<(String, Value), WireOperationError> {
+    let seal = synapse_certify::self_check::seal_digest(profile)
+        .map_err(|error| profile_preload_check_error(profile, &error.to_string()))?;
+    let catalog = CatalogProfile::load(profile)
+        .map_err(|error| profile_preload_check_error(profile, &error.to_string()))?;
+    let key = json!({"catalog_id": model.model_id, "manifest_digest": catalog.typed.manifest_digest(), "backend": catalog.profile()["lane"], "fingerprint": model.fingerprint.0, "engine_identity": model.engine_identity, "os_build": state.machine_profile.os_build, "fixture_revision": seal});
+    Ok((
+        sha256_hex(catalog::jcs(&key).map_err(catalog_store_error)?.as_bytes()),
+        key,
+    ))
+}
+
+fn profile_preload_check_status(
+    state: &ModuleState,
+    id: &str,
+) -> Result<String, WireOperationError> {
+    use rusqlite::OptionalExtension;
+    state
+        .store
+        .store
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT state FROM catalog_self_checks WHERE check_id=?1",
+                [id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+        })
+        .map(|row| row.unwrap_or_else(|| "pending".into()))
+        .map_err(catalog_store_error)
+}
+
+fn complete_profile_preload_check(
+    state: &ModuleState,
+    profile: &str,
+    id: &str,
+    generation: u64,
+    evaluation: &synapse_parity::evaluator::SubsetEvaluation,
+) -> Result<(), WireOperationError> {
+    let passed = evaluation.passed();
+    let report = serde_json::to_string(evaluation).map_err(catalog_store_error)?;
+    if !catalog_complete_check(
+        state,
+        id,
+        generation,
+        if passed { "passed" } else { "failed" },
+        Some(&report),
+    )? {
+        return Err(profile_preload_check_error(
+            profile,
+            "self-check generation changed",
+        ));
+    }
+    if passed {
+        Ok(())
+    } else {
+        Err(profile_preload_check_error(profile, &report))
+    }
+}
+
+async fn numerical_profile_preload_check(
+    state: &ModuleState,
+    model: &EmbeddingModel,
+    profile: &str,
+    references: synapse_certify::self_check::References,
+) -> Result<synapse_parity::evaluator::SubsetEvaluation, WireOperationError> {
+    use synapse_parity::evaluator::{ObservedCase, Output};
+    let mut outputs = BTreeMap::new();
+    for case in &references.cases {
+        let id = case["id"].as_str().expect("sealed case id");
+        let (output, input_ids, readout) = if model.task == ModelTask::Embed {
+            let text = case["text"].as_str().expect("sealed embed text");
+            let mut tokenized = model
+                .tokenizer
+                .tokenize_batch(vec![text])
+                .map_err(|error| artifact_invalid_error(error.to_string()))?;
+            compose_catalog_embed(model, &mut tokenized)?;
+            apply_owned_tokenizer_policy(model, &mut tokenized);
+            let input_ids = tokenized.batch.items[0].clone();
+            let vectors =
+                execute_embedding(&state.runtime, model, tokenized.batch, None, None).await?;
+            let vector = vectors
+                .into_iter()
+                .next()
+                .ok_or_else(|| profile_preload_check_error(profile, "missing self-check vector"))?;
+            (
+                Output::Embedding(vector.into_iter().map(f64::from).collect()),
+                input_ids,
+                None,
+            )
+        } else {
+            let query = case["query"].as_str().expect("sealed rerank query");
+            let candidates = vec![case["document"]
+                .as_str()
+                .expect("sealed rerank document")
+                .to_string()];
+            let pairs = owned_rerank_pairs(model, query, &candidates)?
+                .ok_or_else(|| profile_preload_check_error(profile, "missing composed pairs"))?;
+            let input_ids = pairs[0].clone();
+            let scores = execute_rerank(
+                &state.runtime,
+                model,
+                RerankRequest {
+                    query: vec![],
+                    candidates: pairs.clone(),
+                },
+                Some(pairs),
+                None,
+                None,
+            )
+            .await?;
+            let score =
+                scores.scores.into_iter().next().ok_or_else(|| {
+                    profile_preload_check_error(profile, "missing self-check score")
+                })?;
+            let readout = references
+                .manifest
+                .model(&references.manifest.profiles[profile].model)
+                .expect("sealed model")
+                .grammar
+                .readout
+                .yes
+                .as_ref()
+                .zip(
+                    references
+                        .manifest
+                        .model(&references.manifest.profiles[profile].model)
+                        .expect("sealed model")
+                        .grammar
+                        .readout
+                        .no
+                        .as_ref(),
+                )
+                .map(|(yes, no)| (yes.id, no.id));
+            (Output::Score(f64::from(score)), input_ids, readout)
+        };
+        outputs.insert(
+            id.to_string(),
+            ObservedCase {
+                output,
+                input_ids,
+                readout,
+            },
+        );
+    }
+    synapse_parity::evaluator::evaluate_subset(
+        &references.manifest,
+        profile,
+        &model.fingerprint.0,
+        &references.fixtures,
+        &outputs,
+    )
+    .map_err(|error| profile_preload_check_error(profile, &error.to_string()))
+}
+
+async fn ensure_profile_preload_ready(
+    state: Arc<ModuleState>,
+    model_id: &str,
+    deadline_ms: Option<u64>,
+) -> Result<Arc<EmbeddingModel>, WireOperationError> {
+    let lock = catalog_lane_lock(&state.runtime, model_id);
+    let _guard = lock.lock_owned().await;
+    let model = ensure_model_loaded_for_control(state.clone(), model_id, deadline_ms).await?;
+    let profile = model
+        .engine_identity
+        .build_flags
+        .get("profile")
+        .expect("profile preload");
+    let (id, key) = profile_preload_check_key(&state, &model, profile)?;
+    let references = match synapse_certify::self_check::load(profile) {
+        Ok(references) => references,
+        Err(error) => {
+            let generation = catalog_check_generation(&state, &id, &key)?;
+            catalog_complete_check(&state, &id, generation, "failed", Some(&error.to_string()))?;
+            return Err(profile_preload_check_error(profile, &error.to_string()));
+        }
+    };
+    match profile_preload_check_status(&state, &id)?.as_str() {
+        "passed" => return Ok(model),
+        "failed" => {
+            return Err(profile_preload_check_error(
+                profile,
+                "persisted numerical failure",
+            ))
+        }
+        _ => {}
+    }
+    let generation = catalog_check_generation(&state, &id, &key)?;
+    let evaluation =
+        match numerical_profile_preload_check(&state, &model, profile, references).await {
+            Ok(evaluation) => evaluation,
+            Err(error) => {
+                let reason = serde_json::to_string(&error).expect("wire error serializes");
+                catalog_complete_check(&state, &id, generation, "failed", Some(&reason))?;
+                return Err(profile_preload_check_error(profile, &reason));
+            }
+        };
+    complete_profile_preload_check(&state, profile, &id, generation, &evaluation)?;
+    Ok(model)
+}
+
 async fn resolve_serving_model(
     state: Arc<ModuleState>,
     requested: Option<&str>,
@@ -23412,6 +23766,16 @@ async fn resolve_serving_model(
     target: Option<&str>,
     deadline_ms: Option<u64>,
 ) -> Result<Arc<EmbeddingModel>, WireOperationError> {
+    if let Some(model_id) = requested {
+        if model_slot_snapshot(&state.runtime, model_id).is_some_and(|slot| {
+            slot.spec
+                .engine_identity
+                .build_flags
+                .contains_key("profile")
+        }) {
+            return ensure_model_loaded_for_control(state, model_id, deadline_ms).await;
+        }
+    }
     if task == ModelTask::Generate
         || requested.is_some_and(|id| !state.runtime.release_catalog.is_reserved_id(id))
     {

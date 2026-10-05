@@ -925,3 +925,26 @@ owned-only: they never fall back to llama GBNF or retry unconstrained.
 **Consumer notice:** consumers matching the legacy
 `grammar_unavailable_in_build` string (ALF sidekicks and the persona plane) must
 switch to `grammar_disabled` before deploy; the legacy code is no longer emitted.
+
+### Profile preload load-time checks
+
+A preload with a manifest `profile` (`<slug>.<lane>`) uses catalog-style numeric
+admission, independently of `certify_observation`. Before serving it, the module
+runs a quiet, persisted self-check using a compact sealed subset derived from
+`bench/parity/fixtures`. All sixteen profiles use this single reference source;
+the existing catalog-install references are unchanged. An absent reference,
+invalid seal, or numerical mismatch refuses with `self_check_failed`, naming
+the profile. Failed checks stay failed for the same model fingerprint, engine,
+OS build, manifest and subset seal. A preload without `profile` retains its
+existing probe/approval gates, including `probe_required` before probing.
+
+The fixed subset is `short-0`, `boundary-127`, `boundary-128`, `boundary-129`,
+plus `pool10-000`, `pool10-001`, `pool10-002` for rerankers. It covers short input,
+both sides of the 128-token shape boundary, and a small ranking pool without
+running the costly 8192-token case at every load. The original fixture seals are
+verified during deterministic subset generation; at load the subset digest is
+checked against its committed subset index, the source seal is matched to the
+original committed fixture index, and fixture/model/revision identity is checked
+by the parity evaluator. Numerical and semantic gates and manifest tolerances
+are unchanged. Full-corpus and 8192-token coverage remain certification gates,
+not claims made by the small load-time check.
