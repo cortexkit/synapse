@@ -251,14 +251,14 @@ async fn start(options: &Options, row: &str, model: &str, manifest: &Value) -> R
         "task": operation, "model_path": model_path,
         "tokenizer_path": options.weights.join("tokenizer.json"),
         "pooling": match pinned["grammar"]["pooling"].as_str() { Some("cls") => "cls", Some("masked_mean") => "mean", _ => "last" }, "normalize": pinned["output"]["normalization"] == "l2",
-        "execution": "explicit",
+        "execution": "explicit", "attention_units": 8192 * 8192,
     });
     if let Some(role) = worker(row) {
         preload["worker_bin"] = json!(binary(&options.assets, role));
         preload["worker_runtime_dir"] = json!(options.assets);
     }
     let config = root.join("config.json");
-    std::fs::write(&config, serde_json::to_vec(&json!({"certify_observation": true, "preload_models": [preload], "inline": {"deadline_ms": 3600000, "max_queue_ms": 3600000}})).map_err(err)?).map_err(err)?;
+    std::fs::write(&config, serde_json::to_vec(&json!({"certify_observation": true, "preload_models": [preload], "inline": {"deadline_ms": 3600000, "max_queue_ms": 3600000, "max_items": INLINE_ITEMS, "max_tokens": INLINE_TOKENS}})).map_err(err)?).map_err(err)?;
     let child = Command::new(binary(&options.assets, "ck-synapse"))
         .arg("--subc")
         .arg(&conn_path)
@@ -317,6 +317,87 @@ fn request_params(case: &Value, operation: &str) -> Value {
         json!({"model": "certify-candidate", "query": case["query"], "candidates": [case["document"]], "accept_declared": true})
     }
 }
+const INLINE_ITEMS: usize = 64;
+const INLINE_TOKENS: usize = 8192;
+
+// Preserve candidate order and test padding with real multi-item calls. Count
+// every engine-input token, including query/template and special tokens in each
+// pair; their sum bounds the module's inline token limit without understating
+// the tokenizer's request size.
+fn fixture_requests<'a>(cases: &'a [Value], operation: &str) -> Result<Vec<Vec<&'a Value>>> {
+    let mut groups: Vec<Vec<&Value>> = Vec::new();
+    let mut grouped = BTreeMap::new();
+    for case in cases {
+        let count = case["input_ids"]
+            .as_array()
+            .ok_or_else(|| refuse("fixture input IDs missing"))?
+            .len();
+        let key = if count == INLINE_TOKENS {
+            None
+        } else if case["category"] == "batched" {
+            Some("batched".to_string())
+        } else if operation == "rerank" {
+            case["pool"].as_str().map(str::to_string)
+        } else {
+            None
+        };
+        if let Some(key) = key {
+            let index = *grouped.entry(key).or_insert_with(|| {
+                groups.push(Vec::new());
+                groups.len() - 1
+            });
+            groups[index].push(case);
+        } else {
+            groups.push(vec![case]);
+        }
+    }
+    let mut requests = Vec::new();
+    for group in groups {
+        let counts = group
+            .iter()
+            .map(|case| case["input_ids"].as_array().expect("validated IDs").len())
+            .collect::<Vec<_>>();
+        let ranges = synapse_parity::evaluator::split_pool(&counts, INLINE_ITEMS, INLINE_TOKENS)
+            .map_err(err)?;
+        for range in ranges {
+            requests.push(group[range].to_vec());
+        }
+    }
+    Ok(requests)
+}
+
+fn group_params(group: &[&Value], operation: &str) -> Result<(&'static str, Value)> {
+    if group.is_empty() {
+        return Err(refuse("empty fixture request"));
+    }
+    if operation == "embed" {
+        if group.len() == 1 {
+            return Ok(("embed.query", request_params(group[0], operation)));
+        }
+        let items = group
+            .iter()
+            .map(|case| json!({"id": case["id"], "text": case["text"]}))
+            .collect::<Vec<_>>();
+        Ok((
+            "embed.batch",
+            json!({"model": "certify-candidate", "items": items, "accept_declared": true}),
+        ))
+    } else {
+        let query = &group[0]["query"];
+        if group.iter().any(|case| &case["query"] != query) {
+            return Err(refuse("fixture batch queries differ"));
+        }
+        let candidates = group
+            .iter()
+            .map(|case| &case["document"])
+            .collect::<Vec<_>>();
+        Ok((
+            "rerank.score",
+            json!({"model": "certify-candidate", "query": query, "candidates": candidates, "accept_declared": true}),
+        ))
+    }
+}
+
 fn sent(snapshot: &Value) -> Result<usize> {
     snapshot["worker_requests"]
         .as_object()
@@ -387,7 +468,8 @@ async fn observe(
         .map(str::to_string);
     let mut long_response = None;
     let mut long_request_count = 0;
-    for case in cases {
+    for group in fixture_requests(cases, operation)? {
+        let case = group[0];
         let is_long = case["input_ids"]
             .as_array()
             .is_some_and(|ids| ids.len() == 8192);
@@ -396,9 +478,8 @@ async fn observe(
         } else {
             None
         };
-        let response = session
-            .request(method, request_params(case, operation))
-            .await?;
+        let (request_method, params) = group_params(&group, operation)?;
+        let response = session.request(request_method, params).await?;
         if outputs.is_empty() && response.get("error").is_some() {
             eprintln!("certification input {} refused: {response}", case["id"]);
         }
@@ -413,39 +494,43 @@ async fn observe(
                 Ok(ids) => ids,
                 Err(_) => continue,
             };
-        let Some(input_ids) = ids.into_iter().next() else {
+        if ids.len() != group.len() {
             continue;
-        };
-        let output = if operation == "embed" {
-            serde_json::from_value::<Vec<f64>>(response["payload"]["vectors"][0]["vector"].clone())
-                .map(Output::Embedding)
-        } else {
-            serde_json::from_value::<f64>(response["payload"]["scores"][0].clone())
-                .map(Output::Score)
-        };
-        let Ok(output) = output else {
-            continue;
-        };
+        }
         let readout = response["observation"]["readout_ids"]
             .as_array()
             .and_then(|ids| Some((ids.first()?.as_u64()? as u32, ids.get(1)?.as_u64()? as u32)));
-        if is_long && input_ids.len() == 8192 {
+        if is_long && ids[0].len() == 8192 {
             long_response = Some(response.clone());
             long_request_count = sent(&session.observations().await?)?
                 .checked_sub(before_long.expect("long snapshot captured"))
                 .ok_or_else(|| refuse("worker counter regressed on 8192 input"))?;
         }
-        outputs.insert(
-            case["id"]
-                .as_str()
-                .ok_or_else(|| refuse("fixture id missing"))?
-                .to_string(),
-            ObservedCase {
-                output,
-                input_ids,
-                readout,
-            },
-        );
+        for (index, (case, input_ids)) in group.into_iter().zip(ids).enumerate() {
+            let output = if operation == "embed" {
+                serde_json::from_value::<Vec<f64>>(
+                    response["payload"]["vectors"][index]["vector"].clone(),
+                )
+                .map(Output::Embedding)
+            } else {
+                serde_json::from_value::<f64>(response["payload"]["scores"][index].clone())
+                    .map(Output::Score)
+            };
+            let Ok(output) = output else {
+                continue;
+            };
+            outputs.insert(
+                case["id"]
+                    .as_str()
+                    .ok_or_else(|| refuse("fixture id missing"))?
+                    .to_string(),
+                ObservedCase {
+                    output,
+                    input_ids,
+                    readout,
+                },
+            );
+        }
     }
     let fingerprint = fingerprint.ok_or_else(|| refuse("candidate produced no fingerprint"))?;
     let evaluation =
@@ -733,4 +818,72 @@ fn machine_non_apple(row: &str, floor: Option<&Value>) -> Result<Value> {
         machine["instance_id"] = json!(instance);
     }
     Ok(machine)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn committed_batches_and_pools_use_bounded_multi_item_requests() {
+        let parity = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bench/parity");
+        let index: Value =
+            serde_json::from_slice(&std::fs::read(parity.join("fixtures/index.json")).unwrap())
+                .unwrap();
+        for entry in index.as_object().unwrap().values() {
+            let bytes = std::fs::read(parity.join(entry["path"].as_str().unwrap())).unwrap();
+            assert_eq!(
+                synapse_parity::canonical::sha256_hex(&bytes),
+                entry["sha256"].as_str().unwrap()
+            );
+            let document: Value = serde_json::from_slice(&bytes).unwrap();
+            let operation = document["operation"].as_str().unwrap();
+            let cases = document["cases"].as_array().unwrap();
+            let requests = fixture_requests(cases, operation).unwrap();
+            assert_eq!(
+                requests
+                    .iter()
+                    .flatten()
+                    .map(|case| &case["id"])
+                    .collect::<Vec<_>>(),
+                cases.iter().map(|case| &case["id"]).collect::<Vec<_>>()
+            );
+            for request in &requests {
+                assert!(request.len() <= 64);
+                assert!(
+                    request
+                        .iter()
+                        .map(|case| case["input_ids"].as_array().unwrap().len())
+                        .sum::<usize>()
+                        <= 8192
+                );
+                if request[0]["input_ids"].as_array().unwrap().len() == 8192 {
+                    assert_eq!(request.len(), 1);
+                }
+            }
+            let batched = requests
+                .iter()
+                .find(|request| request[0]["category"] == "batched")
+                .unwrap();
+            let (method, params) = group_params(batched, operation).unwrap();
+            if operation == "embed" {
+                assert_eq!(method, "embed.batch");
+                assert_eq!(params["items"].as_array().unwrap().len(), 6);
+                assert_eq!(params["items"][0]["id"], "batch-0");
+            } else {
+                assert_eq!(method, "rerank.score");
+                assert_eq!(params["candidates"].as_array().unwrap().len(), 4);
+                let pool = requests
+                    .iter()
+                    .filter(|request| request[0]["pool"] == "pool-100")
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    pool.iter().map(|request| request.len()).collect::<Vec<_>>(),
+                    [64, 36]
+                );
+                assert_eq!(pool[0][0]["id"], "pool100-000");
+                assert_eq!(pool[1][0]["id"], "pool100-064");
+            }
+        }
+    }
 }
