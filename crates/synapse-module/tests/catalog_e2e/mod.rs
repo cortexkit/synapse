@@ -1459,6 +1459,7 @@ async fn catalog_real_qwen_embedding_serves_catalog_and_lane_ids_then_unloads() 
         )
         .await;
     assert_eq!(done["state"], "committed", "{done}");
+    let cold_started = Instant::now();
     for model in ["qwen3-embedding-0.6b-metal", "qwen3-embedding-0.6b"] {
         let served = h
             .serve_when_ready(
@@ -1469,6 +1470,7 @@ async fn catalog_real_qwen_embedding_serves_catalog_and_lane_ids_then_unloads() 
         assert_eq!(served["fingerprint"], fingerprint, "{served}");
         assert_eq!(served["dims"], 1024);
     }
+    eprintln!("Qwen first cold load wall time: {:?}", cold_started.elapsed());
     let unloaded = h
         .call(
             "model.unload",
