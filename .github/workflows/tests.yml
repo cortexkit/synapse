@@ -115,8 +115,18 @@ jobs:
       - name: Install cargo-nextest (windows)
         if: matrix.name == 'windows'
         shell: pwsh
+        # Windows curl uses schannel, which by default fails the whole TLS
+        # handshake when the certificate's revocation server can't be reached
+        # (CRYPT_E_REVOCATION_OFFLINE); a scheduled run failed that way.
+        # --ssl-revoke-best-effort still checks revocation when the server
+        # answers, and the retries cover a transient network failure. The exit
+        # check stops a failed download from surfacing later as a missing-file
+        # error from tar.
         run: |
-          curl.exe -LsSf https://get.nexte.st/latest/windows-tar -o nextest.tar.gz
+          curl.exe --fail --location --silent --show-error --ssl-revoke-best-effort `
+            --retry 3 --retry-delay 10 --retry-all-errors `
+            --output nextest.tar.gz https://get.nexte.st/latest/windows-tar
+          if ($LASTEXITCODE -ne 0) { throw "cargo-nextest download failed (curl exit $LASTEXITCODE)" }
           tar zxf nextest.tar.gz -C "$env:USERPROFILE\.cargo\bin"
           Remove-Item nextest.tar.gz
 
@@ -481,7 +491,7 @@ jobs:
           # user-agent and bounds every phase of the transfer. --fail turns an
           # HTML challenge page into a non-zero exit instead of a file that then
           # fails the digest check with a misleading message.
-          curl.exe --fail --location --silent --show-error `
+          curl.exe --fail --location --silent --show-error --ssl-revoke-best-effort `
             --connect-timeout 30 --max-time 600 `
             --retry 3 --retry-delay 15 --retry-all-errors `
             --user-agent 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' `
