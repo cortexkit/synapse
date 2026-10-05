@@ -973,6 +973,10 @@ struct PreloadModelConfig {
     #[serde(default)]
     model_id: Option<String>,
     engine: String,
+    #[serde(default)]
+    profile: Option<String>,
+    #[serde(default)]
+    prompt_template: Option<String>,
     #[serde(default, alias = "kind", alias = "capability")]
     task: Option<String>,
     model_path: PathBuf,
@@ -2588,7 +2592,22 @@ fn build_preload_catalog_model(
     let task = parse_model_task(preload.task.as_deref(), &engine_name, &model_id)?;
     let pooling = parse_pooling(preload.pooling.as_deref().unwrap_or("mean"))?;
     let normalize = preload.normalize.unwrap_or(true);
-    let max_tokens = preload.max_tokens.unwrap_or(512);
+    let catalog = preload
+        .profile
+        .as_deref()
+        .map(CatalogProfile::load)
+        .transpose()?;
+    if let Some(catalog) = &catalog {
+        catalog.validate(&engine_name, task, pooling, normalize, preload.max_tokens)?;
+        if catalog.slug == "qwen3-reranker-0.6b" && preload.prompt_template.is_some() {
+            return Err(ModuleError::Config(
+                "catalog Qwen3 rerank refuses prompt_template".into(),
+            ));
+        }
+    }
+    let max_tokens = catalog
+        .as_ref()
+        .map_or_else(|| preload.max_tokens.unwrap_or(512), |_| 8192);
     let artifact_format = preload
         .format
         .clone()
@@ -2597,35 +2616,43 @@ fn build_preload_catalog_model(
         Some(digest) => normalize_digest(&digest),
         None => format!("sha256:{}", sha256_file(&preload.model_path)?),
     };
-    let owned = (engine_name == "owned-metal" || engine_name == CUDA_WORKER_ENGINE)
-        .then(|| {
-            if engine_name == CUDA_WORKER_ENGINE {
-                owned_cuda_catalog_config(
-                    preload.family.as_deref(),
-                    preload.dtype.as_deref(),
-                    preload.execution.as_deref(),
-                    preload.attention_units,
-                    OwnedCudaDeclaredIdentity {
-                        kernel_revision: preload.kernel_revision.as_deref(),
-                        ptx_virtual_arch: preload.ptx_virtual_arch.as_deref(),
-                        minimum_device_cc: preload.minimum_device_cc,
-                        minimum_cuda_driver_api: preload.minimum_cuda_driver_api,
-                    },
-                )
-            } else {
-                owned_catalog_config(
-                    &preload.model_path,
-                    preload.family.as_deref(),
-                    preload.dtype.as_deref(),
-                    preload.execution.as_deref(),
-                    preload.attention_units,
-                    None,
-                    Vec::new(),
-                )
-            }
-        })
-        .transpose()?;
-    let tokenizer_max_tokens = owned_tokenizer_max_tokens(max_tokens, owned.as_ref());
+    let owned = if let Some(catalog) = &catalog {
+        Some(catalog.owned_config(&preload)?)
+    } else {
+        (engine_name == "owned-metal" || engine_name == CUDA_WORKER_ENGINE)
+            .then(|| {
+                if engine_name == CUDA_WORKER_ENGINE {
+                    owned_cuda_catalog_config(
+                        preload.family.as_deref(),
+                        preload.dtype.as_deref(),
+                        preload.execution.as_deref(),
+                        preload.attention_units,
+                        OwnedCudaDeclaredIdentity {
+                            kernel_revision: preload.kernel_revision.as_deref(),
+                            ptx_virtual_arch: preload.ptx_virtual_arch.as_deref(),
+                            minimum_device_cc: preload.minimum_device_cc,
+                            minimum_cuda_driver_api: preload.minimum_cuda_driver_api,
+                        },
+                    )
+                } else {
+                    owned_catalog_config(
+                        &preload.model_path,
+                        preload.family.as_deref(),
+                        preload.dtype.as_deref(),
+                        preload.execution.as_deref(),
+                        preload.attention_units,
+                        None,
+                        Vec::new(),
+                    )
+                }
+            })
+            .transpose()?
+    };
+    let tokenizer_max_tokens = if catalog.is_some() {
+        usize::MAX
+    } else {
+        owned_tokenizer_max_tokens(max_tokens, owned.as_ref())
+    };
     let tokenizer = SanitizedTokenizer::from_file(
         &preload.tokenizer_path,
         TokenizerConfig {
@@ -2745,6 +2772,17 @@ fn normalize_catalog_model(
     inline: &InlineConfig,
     jobs: &JobConfig,
 ) -> Result<StoredModelConfig, ModuleError> {
+    if model.engine_identity.build_flags.contains_key("profile") {
+        let catalog = CatalogProfile::load(&model.engine_identity.build_flags["profile"])?;
+        catalog.validate(
+            &model.engine,
+            parse_model_task(Some(&model.task), &model.engine, &model.model_id)?,
+            parse_pooling(&model.pooling)?,
+            model.normalize,
+            Some(model.max_tokens),
+        )?;
+        return Ok(model);
+    }
     let engine_name = canonical_engine_name(&model.engine);
     let task = parse_model_task(Some(&model.task), &engine_name, &model.model_id)?;
     let pooling = parse_pooling(&model.pooling)?;
@@ -2852,6 +2890,165 @@ fn normalize_catalog_model(
     Ok(spec)
 }
 
+struct CatalogProfile {
+    id: String,
+    slug: String,
+    manifest: Value,
+}
+
+impl CatalogProfile {
+    fn load(id: &str) -> Result<Self, ModuleError> {
+        let manifest: Value =
+            serde_json::from_slice(include_bytes!("../../../bench/parity/models.json"))
+                .map_err(|error| ModuleError::Config(error.to_string()))?;
+        let profile = manifest["profiles"].get(id).ok_or_else(|| {
+            ModuleError::Config(format!("model_unsupported: unknown profile {id}"))
+        })?;
+        let slug = profile["model"]
+            .as_str()
+            .ok_or_else(|| ModuleError::Config("profile missing model".into()))?
+            .to_string();
+        Ok(Self {
+            id: id.into(),
+            slug,
+            manifest,
+        })
+    }
+
+    fn profile(&self) -> &Value {
+        &self.manifest["profiles"][&self.id]
+    }
+    fn model(&self) -> &Value {
+        &self.manifest["models"][&self.slug]
+    }
+    fn artifact_digest(&self) -> String {
+        self.profile()["converted_package_digest"]
+            .as_str()
+            .unwrap_or_else(|| {
+                self.model()["checkpoint_digest"]
+                    .as_str()
+                    .expect("manifest checkpoint digest")
+            })
+            .into()
+    }
+    fn validate(
+        &self,
+        engine: &str,
+        task: ModelTask,
+        pooling: WorkerPooling,
+        normalize: bool,
+        max_tokens: Option<usize>,
+    ) -> Result<(), ModuleError> {
+        let expected_pooling = match self.model()["grammar"]["pooling"].as_str() {
+            Some("cls") => "cls",
+            Some("masked_mean") => "mean",
+            Some("last_non_pad") => "last",
+            _ => return Err(ModuleError::Config("manifest pooling unsupported".into())),
+        };
+        if self.profile()["lane"] != engine
+            || self.model()["operation"] != task.as_str()
+            || pooling.as_str() != expected_pooling
+            || normalize != (self.model()["output"]["normalization"] == "l2")
+            || max_tokens.is_some_and(|limit| limit != 8192)
+        {
+            return Err(ModuleError::Config("catalog entry disagrees with manifest engine, task, pooling, normalize or max_tokens".into()));
+        }
+        Ok(())
+    }
+
+    fn owned_config(
+        &self,
+        preload: &PreloadModelConfig,
+    ) -> Result<OwnedCatalogConfig, ModuleError> {
+        let family = if self.model()["architecture"]["family"] == "qwen3" {
+            OwnedFamily::Qwen3
+        } else {
+            OwnedFamily::GteModernBert
+        };
+        let dtype = OwnedDType::parse(
+            self.profile()["storage_dtype"]
+                .as_str()
+                .expect("manifest storage dtype"),
+        )
+        .map_err(|error| ModuleError::Config(error.to_string()))?;
+        let lane = self.profile()["lane"].as_str().expect("manifest lane");
+        let mut identity = if lane == "owned-metal" {
+            owned_engine_identity(family, dtype)
+        } else {
+            catalog_model_engine_identity(lane)?
+        };
+        // StoredModelConfig already persists engine build flags. Store the profile
+        // there so reloads retain the token-composition rules and the package
+        // identity sent to the worker when loading weights.
+        identity
+            .build_flags
+            .insert("profile".into(), self.id.clone());
+        identity.build_flags.insert(
+            "compute_dtype".into(),
+            self.profile()["compute_dtype"]
+                .as_str()
+                .expect("manifest compute dtype")
+                .into(),
+        );
+        identity
+            .build_flags
+            .insert("storage_dtype".into(), dtype.as_str().into());
+        Ok(OwnedCatalogConfig {
+            family,
+            dtype,
+            execution: preload
+                .execution
+                .clone()
+                .unwrap_or_else(|| "explicit".into()),
+            attention_units: preload
+                .attention_units
+                .unwrap_or(OWNED_DEFAULT_ATTENTION_UNITS),
+            config_locator: None,
+            extra_locators: Vec::new(),
+            identity_override: Some(identity),
+        })
+    }
+
+    fn apply_numeric_profile(&self, numeric: &mut NumericProfile) {
+        let grammar = json!({"model": self.slug, "grammar": self.model()["grammar"]});
+        let input_grammar = synapse_core::input_grammar_identity(
+            &serde_json::to_vec(&grammar).expect("grammar serializes"),
+        );
+        let rotation = self.profile()["rotation"].as_str();
+        let entry = json!({"schema": self.manifest["schema"], "profile_id": self.id, "profile": self.profile(), "model_slug": self.slug, "model": self.model(), "rotation": rotation.filter(|name| *name != "none").map(|name| &self.manifest["rotations"][name]), "admission": self.manifest["admission"], "converter_rule": self.manifest["converter"]["rule"]});
+        numeric.model_digest = self.model()["checkpoint_digest"]
+            .as_str()
+            .expect("checkpoint digest")
+            .into();
+        numeric.operation = Some(
+            self.model()["operation"]
+                .as_str()
+                .expect("operation")
+                .into(),
+        );
+        numeric.input_grammar = Some(input_grammar.clone());
+        numeric.prompt_template =
+            (self.slug == "gte-reranker-modernbert-base").then_some(input_grammar);
+        numeric.rotation = rotation.map(str::to_string);
+        numeric.converted_package_digest = self.profile()["converted_package_digest"]
+            .as_str()
+            .map(str::to_string);
+        numeric.manifest_profile_digest = Some(sha256_hex(
+            &serde_json::to_vec(&entry).expect("profile entry serializes"),
+        ));
+        numeric.kernel_revision = Some(
+            match self.profile()["lane"].as_str().expect("lane") {
+                "owned-metal" => synapse_core::METAL_KERNEL_REVISION,
+                "owned-cuda" => synapse_core::CUDA_KERNEL_REVISION,
+                "owned-vulkan" => synapse_core::VULKAN_KERNEL_REVISION,
+                "ane-direct-worker" => synapse_core::ANE_DIRECT_KERNEL_REVISION,
+                _ => unreachable!("manifest lane"),
+            }
+            .into(),
+        );
+    }
+}
+
 #[derive(Clone, Debug)]
 struct OwnedCatalogConfig {
     family: OwnedFamily,
@@ -2899,7 +3096,11 @@ fn build_stored_model_config(
             "owned-metal-decode supports generation models only".to_string(),
         ));
     }
-    if engine_name == CUDA_WORKER_ENGINE && !matches!(task, ModelTask::Embed | ModelTask::Rerank) {
+    if matches!(
+        engine_name,
+        CUDA_WORKER_ENGINE | "owned-vulkan" | "ane-direct-worker"
+    ) && !matches!(task, ModelTask::Embed | ModelTask::Rerank)
+    {
         return Err(ModuleError::Config(
             "owned-cuda supports embedding and rerank models only".to_string(),
         ));
@@ -2913,7 +3114,21 @@ fn build_stored_model_config(
                 .map(|profile| owned_engine_identity(profile.family, profile.dtype))
         })
         .map_or_else(|| catalog_model_engine_identity(engine_name), Ok)?;
-    let numeric_profile = NumericProfile {
+    let catalog = engine_identity
+        .build_flags
+        .get("profile")
+        .map(|id| CatalogProfile::load(id))
+        .transpose()?;
+    if let Some(catalog) = &catalog {
+        catalog.validate(engine_name, task, pooling, normalize, Some(max_tokens))?;
+        let expected = catalog.artifact_digest();
+        if normalize_digest(&artifact_digest) != normalize_digest(&expected) {
+            return Err(ModuleError::Config(
+                "package_digest_mismatch: catalog artifact digest disagrees with manifest".into(),
+            ));
+        }
+    }
+    let mut numeric_profile = NumericProfile {
         model_digest: artifact_digest.clone(),
         quant,
         engine: engine_identity.clone(),
@@ -2953,6 +3168,9 @@ fn build_stored_model_config(
         converted_package_digest: None,
         manifest_profile_digest: None,
     };
+    if let Some(catalog) = &catalog {
+        catalog.apply_numeric_profile(&mut numeric_profile);
+    }
     Ok(StoredModelConfig {
         model_id,
         engine: engine_name.to_string(),
@@ -3183,6 +3401,11 @@ fn catalog_model_engine_identity(engine_name: &str) -> Result<EngineIdentity, Mo
                 ("transport", worker_catalog_transport()),
                 ("placement_gate", "neural-engine"),
             ],
+        )),
+        "owned-vulkan" | "ane-direct-worker" => Ok(worker_catalog_identity(
+            engine_name,
+            "protocol-v2",
+            &[("transport", worker_catalog_transport())],
         )),
         "owned-cuda" => Ok(owned_cuda_engine_identity(
             "unknown",
@@ -5911,6 +6134,8 @@ fn load_catalog_model_blocking(
             .expect("ANE artifact set always contains the primary model")
             .path
             .clone()
+    } else if spec.engine_identity.build_flags.contains_key("profile") {
+        model_path.path.clone()
     } else if let Some(profile) = owned_profile.as_ref() {
         assemble_owned_model_package(&spec, &model_path.path, &model_cache, profile)?
     } else {
@@ -5919,7 +6144,11 @@ fn load_catalog_model_blocking(
     let tokenizer = SanitizedTokenizer::from_file(
         &tokenizer_path.path,
         TokenizerConfig {
-            max_tokens: owned_tokenizer_max_tokens(spec.max_tokens, owned_profile.as_ref()),
+            max_tokens: if spec.engine_identity.build_flags.contains_key("profile") {
+                usize::MAX
+            } else {
+                owned_tokenizer_max_tokens(spec.max_tokens, owned_profile.as_ref())
+            },
         },
     )
     .map_err(|error| artifact_invalid_error(error.to_string()))?;
@@ -6006,7 +6235,7 @@ fn load_catalog_model_blocking(
             },
             None,
         ),
-        LLAMA_ENGINE | "ane" => {
+        LLAMA_ENGINE | "ane" | "owned-vulkan" | "ane-direct-worker" => {
             let (backend, loaded) = load_worker_backend_blocking(
                 &spec,
                 &artifact,
@@ -6239,6 +6468,14 @@ fn model_runtime_config(
     ane_artifacts: Option<&[ane_artifact::MaterializedCoreMlArtifact]>,
 ) -> RuntimeConfig {
     let mut runtime_config = RuntimeConfig::default();
+    if let Some(profile) = spec.engine_identity.build_flags.get("profile") {
+        runtime_config
+            .values
+            .insert("profile".into(), profile.clone());
+        runtime_config
+            .values
+            .insert("operation".into(), spec.task.clone());
+    }
     runtime_config.values.insert(
         "model_path".to_string(),
         model_path.to_string_lossy().to_string(),
@@ -7541,6 +7778,9 @@ async fn embed_query(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
             ))
         }
     };
+    if let Err(error) = compose_catalog_embed(&model, &mut tokenized) {
+        return result_outcome(error_payload(&state, error));
+    }
     apply_owned_tokenizer_policy(&model, &mut tokenized);
     let ids = vec![params.id.unwrap_or_else(|| "query".to_string())];
     embed_tokenized(
@@ -7892,6 +8132,9 @@ async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
             ))
         }
     };
+    if let Err(error) = compose_catalog_embed(&model, &mut tokenized) {
+        return result_outcome(error_payload(&state, error));
+    }
     apply_owned_tokenizer_policy(&model, &mut tokenized);
     let total_tokens = tokenized
         .real_token_counts
@@ -8491,6 +8734,10 @@ async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
         return result_outcome(error_payload(&state, error));
     }
 
+    let owned_pairs = match owned_rerank_pairs(&model, params.query.as_str(), &params.candidates) {
+        Ok(pairs) => pairs,
+        Err(error) => return result_outcome(error_payload(&state, error)),
+    };
     let mut texts = Vec::with_capacity(params.candidates.len() + 1);
     texts.push(params.query.as_str());
     texts.extend(params.candidates.iter().map(String::as_str));
@@ -8549,10 +8796,6 @@ async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
         Err(error) => return result_outcome(error_payload(&state, error)),
     };
 
-    let owned_pairs = match owned_rerank_pairs(&model, params.query.as_str(), &params.candidates) {
-        Ok(pairs) => pairs,
-        Err(error) => return result_outcome(error_payload(&state, error)),
-    };
     let scores = match execute_rerank(
         &state.runtime,
         &model,
@@ -11455,6 +11698,9 @@ async fn embed_tokenized(
 }
 
 fn apply_owned_tokenizer_policy(model: &EmbeddingModel, tokenized: &mut TokenizedBatch) {
+    if model.engine_identity.build_flags.contains_key("profile") {
+        return;
+    }
     let Some(terminal) = model
         .owned_tokenizer_policy
         .and_then(|policy| policy.terminal_token_id)
@@ -11783,6 +12029,14 @@ async fn execute_rerank(
                     retry_after_ms: Some(100),
                     safe_to_retry_same_request: true,
                 })?;
+                let request = if let Some(pairs) = owned_pairs {
+                    RerankRequest {
+                        query: Vec::new(),
+                        candidates: pairs,
+                    }
+                } else {
+                    request
+                };
                 engine.rerank_with_job(&loaded_model, request, job_id.as_deref())
             })
             .await
@@ -11801,13 +12055,95 @@ async fn execute_rerank(
     result
 }
 
+fn catalog_sequence_ceiling(sequences: &[Vec<u32>]) -> Result<(), WireOperationError> {
+    if let Some((index, ids)) = sequences
+        .iter()
+        .enumerate()
+        .find(|(_, ids)| ids.len() > 8192)
+    {
+        return Err(WireOperationError::from_stable(
+            StableError::sequence_too_long(ids.len(), 8192, Some(&index.to_string())),
+            "composed input exceeds the catalog lane's context limit",
+        ));
+    }
+    Ok(())
+}
+
+fn compose_catalog_embed(
+    model: &EmbeddingModel,
+    tokenized: &mut TokenizedBatch,
+) -> Result<(), WireOperationError> {
+    let Some(id) = model.engine_identity.build_flags.get("profile") else {
+        return Ok(());
+    };
+    let catalog =
+        CatalogProfile::load(id).map_err(|error| artifact_invalid_error(error.to_string()))?;
+    if catalog.slug == "qwen3-embedding-0.6b" {
+        let terminal = catalog.model()["grammar"]["terminal_tokens"][0]["id"]
+            .as_u64()
+            .expect("manifest EOS") as u32;
+        for (index, ids) in tokenized.batch.items.iter_mut().enumerate() {
+            if ids.last() != Some(&terminal) {
+                ids.push(terminal);
+            }
+            let count = ids.len().min(u32::MAX as usize) as u32;
+            tokenized.real_token_counts[index] = count;
+            tokenized.disclosures[index].submitted_tokens = count;
+            tokenized.disclosures[index].effective_tokens = count;
+        }
+    }
+    catalog_sequence_ceiling(&tokenized.batch.items)
+}
+
 fn owned_rerank_pairs(
     model: &EmbeddingModel,
     query: &str,
     candidates: &[String],
 ) -> Result<Option<Vec<Vec<u32>>>, WireOperationError> {
-    if !matches!(&model.backend, EmbedBackend::Owned(_)) {
+    let catalog = model
+        .engine_identity
+        .build_flags
+        .get("profile")
+        .map(|id| CatalogProfile::load(id))
+        .transpose()
+        .map_err(|error| artifact_invalid_error(error.to_string()))?;
+    if !matches!(&model.backend, EmbedBackend::Owned(_)) && catalog.is_none() {
         return Ok(None);
+    }
+    if let Some(catalog) = &catalog {
+        if catalog.model()["grammar"]["kind"] == "template" {
+            let template = &catalog.model()["grammar"]["template"];
+            let encode = |text: &str| {
+                model
+                    .tokenizer
+                    .tokenizer()
+                    .encode(text, false)
+                    .map(|encoding| encoding.get_ids().to_vec())
+                    .map_err(|error| artifact_invalid_error(error.to_string()))
+            };
+            let prefix = encode(template["prefix"].as_str().expect("template prefix"))?;
+            let suffix = encode(template["suffix"].as_str().expect("template suffix"))?;
+            let mut pairs = Vec::with_capacity(candidates.len());
+            for candidate in candidates {
+                let body = template["body_format"]
+                    .as_str()
+                    .expect("template body")
+                    .replace(
+                        "{instruction}",
+                        template["instruction"]
+                            .as_str()
+                            .expect("template instruction"),
+                    )
+                    .replace("{query}", query)
+                    .replace("{doc}", candidate);
+                let mut ids = prefix.clone();
+                ids.extend(encode(&body)?);
+                ids.extend_from_slice(&suffix);
+                pairs.push(ids);
+            }
+            catalog_sequence_ceiling(&pairs)?;
+            return Ok(Some(pairs));
+        }
     }
     let inputs = candidates
         .iter()
@@ -11832,6 +12168,9 @@ fn owned_rerank_pairs(
             StableError::artifact_invalid(),
             "owned-metal rerank pair tokenization produced an empty sequence",
         ));
+    }
+    if catalog.is_some() {
+        catalog_sequence_ceiling(&pairs)?;
     }
     Ok(Some(pairs))
 }
@@ -11966,7 +12305,8 @@ fn check_fingerprint_constraints(
     let requested = required_fingerprint.or(target_fingerprint);
     if let Some(requested) = requested {
         if requested != model.fingerprint.0 {
-            let equivalent = allow_equivalent
+            let equivalent = !model.engine_identity.build_flags.contains_key("profile")
+                && allow_equivalent
                 && equivalent_fingerprints(alias_table, model)
                     .iter()
                     .any(|fingerprint| fingerprint.0 == requested);
@@ -12666,6 +13006,7 @@ async fn execute_embed_probe_for_model(
             })
         }
     };
+    compose_catalog_embed(&model, &mut tokenized)?;
     apply_owned_tokenizer_policy(&model, &mut tokenized);
     let vectors = match execute_embedding(
         &state.runtime,
@@ -15519,6 +15860,13 @@ fn models_list_payload(state: &ModuleState, snapshot: CatalogSnapshot) -> Value 
             };
             if !state.runtime.runnable_backends.contains(&backend.backend) || !installed {
                 continue;
+            }
+        }
+        if let Some(spec) =
+            model_slot_snapshot(&state.runtime, row["model_id"].as_str().unwrap_or(""))
+        {
+            if let Some(profile) = spec.spec.engine_identity.build_flags.get("profile") {
+                row["profile"] = json!(profile);
             }
         }
         if let Err(error) = catalog_list_row(state, &mut row) {
@@ -19249,6 +19597,243 @@ mod tests {
         assert_eq!(stream.generation_id, "generation-9");
     }
 
+    fn catalog_fixture_config(id: &str) -> StoredModelConfig {
+        let catalog = CatalogProfile::load(id).unwrap();
+        let preload: PreloadModelConfig = serde_json::from_value(json!({
+            "engine": catalog.profile()["lane"], "model_path": "package.safetensors", "tokenizer_path": "tokenizer.json"
+        })).unwrap();
+        let pooling = match catalog.model()["grammar"]["pooling"].as_str().unwrap() {
+            "cls" => WorkerPooling::Cls,
+            "masked_mean" => WorkerPooling::Mean,
+            "last_non_pad" => WorkerPooling::Last,
+            _ => unreachable!(),
+        };
+        build_stored_model_config(
+            id.into(),
+            catalog.profile()["lane"].as_str().unwrap(),
+            if catalog.model()["operation"] == "embed" {
+                ModelTask::Embed
+            } else {
+                ModelTask::Rerank
+            },
+            catalog.artifact_digest(),
+            "safetensors".into(),
+            "sha256:fixture-tokenizer".into(),
+            ModelAssetLocator::LocalPath {
+                path: "package.safetensors".into(),
+            },
+            ModelAssetLocator::LocalPath {
+                path: "tokenizer.json".into(),
+            },
+            String::new(),
+            String::new(),
+            pooling,
+            catalog.model()["output"]["normalization"] == "l2",
+            8192,
+            catalog.profile()["storage_dtype"].as_str().unwrap().into(),
+            false,
+            None,
+            None,
+            Vec::new(),
+            Some(catalog.owned_config(&preload).unwrap()),
+            &InlineConfig::default(),
+            &JobConfig::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn catalog_profiles_bind_identity_and_worker_package() {
+        let manifest: Value =
+            serde_json::from_slice(include_bytes!("../../../bench/parity/models.json")).unwrap();
+        for (id, profile) in manifest["profiles"].as_object().unwrap() {
+            let spec = catalog_fixture_config(id);
+            let catalog = CatalogProfile::load(id).unwrap();
+            let mut numeric: NumericProfile = serde_json::from_value(json!({
+                "model_digest": "unused", "quant": spec.quant, "engine": spec.engine_identity,
+                "sanitized_tokenizer_digest": spec.tokenizer_sanitized_digest,
+                "pooling": profile_pooling(parse_pooling(&spec.pooling).unwrap()),
+                "normalization": if spec.normalize { "l2" } else { "none" },
+                "dtype": profile["storage_dtype"], "flash_attention": "disabled",
+                "certified_shape": {"max_context_tokens":8192,"max_batch_tokens":8192,"max_micro_batch_tokens":8192,"max_sequences":64},
+                "thread_policy":"balanced"
+            })).unwrap();
+            catalog.apply_numeric_profile(&mut numeric);
+            assert_eq!(numeric.model_digest, catalog.model()["checkpoint_digest"]);
+            assert_eq!(
+                numeric.manifest_profile_digest.as_deref(),
+                manifest["digests"]["profiles"][id].as_str()
+            );
+            assert_eq!(
+                numeric.input_grammar,
+                Some(format!(
+                    "synapse-input-grammar-v1:{}",
+                    manifest["digests"]["grammar"][&catalog.slug]
+                        .as_str()
+                        .unwrap()
+                ))
+            );
+            assert!(numeric.operation.is_some());
+            assert!(numeric.kernel_revision.is_some());
+            assert_eq!(
+                numeric.prompt_template.is_some(),
+                catalog.slug == "gte-reranker-modernbert-base"
+            );
+            assert_eq!(spec.artifact_digest, catalog.artifact_digest());
+            let config = model_runtime_config(
+                &spec,
+                Path::new("package.safetensors"),
+                &[],
+                Path::new("cache"),
+                64,
+                None,
+            );
+            assert_eq!(config.values["profile"], *id);
+            assert_eq!(config.values["operation"], spec.task);
+            assert_eq!(
+                numeric.converted_package_digest.is_some(),
+                profile["lane"] != "owned-metal"
+            );
+            let original = numeric.fingerprint();
+            numeric.model_digest.push('0');
+            assert_ne!(original, numeric.fingerprint());
+            assert_eq!(
+                spec.fingerprint,
+                normalize_catalog_model(
+                    spec.clone(),
+                    &InlineConfig::default(),
+                    &JobConfig::default()
+                )
+                .unwrap()
+                .fingerprint
+            );
+            println!("{id} {}", spec.fingerprint.0);
+        }
+    }
+
+    #[test]
+    fn preload_fingerprints_rebuild_from_committed_inputs() {
+        for bytes in [
+            include_bytes!("../../../bench/parity/preload/gte-modernbert-base-f16.json").as_slice(),
+            include_bytes!("../../../bench/parity/preload/gte-reranker-modernbert-base-f32.json")
+                .as_slice(),
+        ] {
+            let fixture: Value = serde_json::from_slice(bytes).unwrap();
+            let inline: InlineConfig = serde_json::from_value(fixture["inline"].clone()).unwrap();
+            let jobs: JobConfig = serde_json::from_value(fixture["jobs"].clone()).unwrap();
+            let owned = OwnedCatalogConfig {
+                family: OwnedFamily::parse(fixture["owned_family"].as_str().unwrap()).unwrap(),
+                dtype: OwnedDType::parse(fixture["owned_dtype"].as_str().unwrap()).unwrap(),
+                execution: "explicit".into(),
+                attention_units: OWNED_DEFAULT_ATTENTION_UNITS,
+                config_locator: None,
+                extra_locators: Vec::new(),
+                identity_override: None,
+            };
+            let spec = build_stored_model_config(
+                fixture["model_id"].as_str().unwrap().into(),
+                "owned-metal",
+                parse_model_task(fixture["task"].as_str(), "owned-metal", "fixture").unwrap(),
+                fixture["artifact_digest"].as_str().unwrap().into(),
+                "safetensors".into(),
+                fixture["sanitized_tokenizer_digest"]
+                    .as_str()
+                    .unwrap()
+                    .into(),
+                ModelAssetLocator::LocalPath {
+                    path: "unused".into(),
+                },
+                ModelAssetLocator::LocalPath {
+                    path: "unused".into(),
+                },
+                String::new(),
+                String::new(),
+                parse_pooling(fixture["pooling"].as_str().unwrap()).unwrap(),
+                fixture["normalize"].as_bool().unwrap(),
+                fixture["max_tokens"].as_u64().unwrap() as usize,
+                fixture["quant"].as_str().unwrap().into(),
+                false,
+                None,
+                None,
+                Vec::new(),
+                Some(owned),
+                &inline,
+                &jobs,
+            )
+            .unwrap();
+            let expected = fixture["expected_fingerprint"]
+                .as_str()
+                .expect("preload fixture must pin expected_fingerprint");
+            assert_eq!(spec.fingerprint.0, expected);
+            assert!(!spec.engine_identity.build_flags.contains_key("profile"));
+        }
+    }
+
+    #[test]
+    fn catalog_config_rejects_manifest_disagreements() {
+        let catalog = CatalogProfile::load("qwen3-reranker-0.6b.owned-metal").unwrap();
+        assert!(catalog
+            .validate(
+                "owned-metal",
+                ModelTask::Rerank,
+                WorkerPooling::Last,
+                false,
+                None
+            )
+            .is_ok());
+        for (engine, task, pooling, normalize, max) in [
+            (
+                "owned-cuda",
+                ModelTask::Rerank,
+                WorkerPooling::Last,
+                false,
+                None,
+            ),
+            (
+                "owned-metal",
+                ModelTask::Embed,
+                WorkerPooling::Last,
+                false,
+                None,
+            ),
+            (
+                "owned-metal",
+                ModelTask::Rerank,
+                WorkerPooling::Mean,
+                false,
+                None,
+            ),
+            (
+                "owned-metal",
+                ModelTask::Rerank,
+                WorkerPooling::Last,
+                true,
+                None,
+            ),
+            (
+                "owned-metal",
+                ModelTask::Rerank,
+                WorkerPooling::Last,
+                false,
+                Some(8191),
+            ),
+        ] {
+            assert!(catalog
+                .validate(engine, task, pooling, normalize, max)
+                .is_err());
+        }
+        let preload = serde_json::from_value(json!({"profile": catalog.id, "engine":"owned-metal", "task":"rerank", "pooling":"last", "normalize":false, "prompt_template":"wrong", "model_path":"unused", "tokenizer_path":"unused"})).unwrap();
+        assert!(build_preload_catalog_model(
+            0,
+            preload,
+            &InlineConfig::default(),
+            &JobConfig::default()
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("prompt_template"));
+    }
+
     fn make_test_tokenizer(dir: &Path, max_tokens: usize) -> SanitizedTokenizer {
         let path = dir.join("tokenizer.json");
         std::fs::write(
@@ -22679,6 +23264,7 @@ async fn submit_catalog_embed_job(
                     .tokenizer
                     .tokenize_batch(items.iter().map(|i| i.text.as_str()))
                     .map_err(|e| artifact_invalid_error(e.to_string()))?;
+                compose_catalog_embed(&model, &mut tokenized)?;
                 apply_owned_tokenizer_policy(&model, &mut tokenized);
                 let total_tokens = tokenized
                     .real_token_counts

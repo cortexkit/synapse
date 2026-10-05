@@ -49,6 +49,12 @@ remote additions below. Owned-decode refusals use a separate vocabulary:
 configuration, or when no certified enabled owned-decode grammar lane is
 available.
 
+- `sequence_too_long` — class `permanent`, no `retry_after_ms`, not safe to
+  retry the same request. A catalog-installed lane refuses a composed input
+  exceeding its 8192-token limit before job diversion or execution. `details`:
+  `{tokens, max_tokens, item_id?}`; `item_id` identifies the submitted item when
+  available. No truncation disclosure or job id is emitted. **Consumer
+  disposition:** split or trim the input before resubmitting.
 - `owned_cuda_unsupported` — class `permanent`. Emitted before an owned-CUDA
   worker is created when capability gating finds no usable CUDA capability
   evidence, a driver API below 12040, or compute capability below 7.5.

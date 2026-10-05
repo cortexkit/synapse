@@ -12,6 +12,7 @@ pub enum ErrorClass {
 #[serde(rename_all = "snake_case")]
 pub enum StableErrorCode {
     QueueFull,
+    SequenceTooLong,
     DeadlineExceeded,
     ModelLoading,
     NotCertified,
@@ -44,8 +45,9 @@ pub enum StableErrorCode {
 
 impl StableErrorCode {
     /// Every stable error code in declaration order.
-    pub const ALL: [Self; 29] = [
+    pub const ALL: [Self; 30] = [
         Self::QueueFull,
+        Self::SequenceTooLong,
         Self::DeadlineExceeded,
         Self::ModelLoading,
         Self::NotCertified,
@@ -112,6 +114,22 @@ impl StableError {
     pub fn with_details(mut self, details: Map<String, Value>) -> Self {
         self.details = Some(details);
         self
+    }
+
+    pub fn sequence_too_long(tokens: usize, max_tokens: usize, item_id: Option<&str>) -> Self {
+        let mut details = Map::new();
+        details.insert("tokens".into(), Value::from(tokens));
+        details.insert("max_tokens".into(), Value::from(max_tokens));
+        if let Some(id) = item_id {
+            details.insert("item_id".into(), Value::from(id));
+        }
+        Self::new(
+            StableErrorCode::SequenceTooLong,
+            ErrorClass::Permanent,
+            None,
+            false,
+        )
+        .with_details(details)
     }
 
     pub const fn queue_full(retry_after_ms: Option<u64>) -> Self {
@@ -388,13 +406,14 @@ mod tests {
 
     #[test]
     fn stable_error_code_all_covers_every_variant() {
-        const VARIANT_COUNT: usize = 29;
+        const VARIANT_COUNT: usize = 30;
 
         // This match is intentionally exhaustive so enum additions update the
         // enumeration and its expected cardinality together.
         fn assert_exhaustive(error_code: StableErrorCode) {
             match error_code {
                 StableErrorCode::QueueFull
+                | StableErrorCode::SequenceTooLong
                 | StableErrorCode::DeadlineExceeded
                 | StableErrorCode::ModelLoading
                 | StableErrorCode::NotCertified
@@ -434,6 +453,7 @@ mod tests {
     fn stable_error_contract_round_trips_through_json() {
         let errors = [
             StableError::queue_full(Some(25)),
+            StableError::sequence_too_long(8193, 8192, Some("row")),
             StableError::deadline_exceeded(),
             StableError::model_loading(Some(150)),
             StableError::not_certified(),
