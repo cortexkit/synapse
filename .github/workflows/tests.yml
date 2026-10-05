@@ -82,6 +82,13 @@ jobs:
         working-directory: synapse
         run: python3 -m unittest discover -s crates/synapse-release-checks -v
 
+      # The release benchmark producer must keep emitting reports the tag
+      # validator accepts; its fixtures run without any hardware.
+      - name: Release benchmark producer tests
+        if: matrix.name == 'linux'
+        working-directory: synapse
+        run: python3 -m unittest discover -s bench/harness -p 'test_release_matrix.py' -v
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
