@@ -54,13 +54,7 @@ separately through that binding.
 
 ## Exact cold-run instructions
 
-Working directory: the repository/worktree root containing these files. For this
-measurement checkout it is:
-
-```
-/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1
-```
-
+Working directory: the repository root containing these files.
 Prerequisites: macOS ANE/private framework; full Xcode; four manifest-pinned
 converted packages already in `target/ane-direct-packages/<model>.safetensors` for
 `gte-modernbert-base`, `gte-reranker-modernbert-base`, `qwen3-embedding-0.6b`, and

@@ -6,6 +6,12 @@ fn files(path: &Path, root: &Path, out: &mut BTreeSet<String>) {
         let entry = entry.unwrap();
         let path = entry.path();
         if path.is_dir() {
+            // A tool that treats the vendored crate as its own package (for
+            // example rust-analyzer) writes build output to vendor/ane/target.
+            // That is never part of the vendored source; git ignores it too.
+            if path == root.join("target") {
+                continue;
+            }
             files(&path, root, out);
         } else {
             let name = path
