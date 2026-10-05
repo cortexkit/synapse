@@ -1,0 +1,29 @@
+{
+  "model": "qwen3-embedding-0.6b",
+  "operation": "embed",
+  "profile_id": "qwen3-embedding-0.6b.owned-metal",
+  "fingerprint": "hardware-check:d3f98359d9b76aa1576eb96bec880868e3b35963d8dfdcee21f8cc9a82b45b52",
+  "fixture_set_id": "qwen3-embedding-0.6b.ref-v1.transformers-5.16.1.seed-0",
+  "tolerance_class": "fp16",
+  "completed_fixtures": 17,
+  "expected_fixtures": 17,
+  "metrics": {
+    "min_cosine": 0.9999977881623334,
+    "max_norm_error": 6.59290148807834e-7,
+    "max_absolute_error": null,
+    "pools": {}
+  },
+  "gates": {
+    "complete": true,
+    "dimension": true,
+    "finite": true,
+    "unit_norm": true,
+    "cosine": true,
+    "score": true,
+    "ranking": true,
+    "coverage_8192": true,
+    "coverage": true,
+    "semantics": true
+  },
+  "failures": []
+}

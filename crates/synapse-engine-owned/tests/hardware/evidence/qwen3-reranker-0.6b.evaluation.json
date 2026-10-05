@@ -1,0 +1,46 @@
+{
+  "model": "qwen3-reranker-0.6b",
+  "operation": "rerank",
+  "profile_id": "qwen3-reranker-0.6b.owned-metal",
+  "fingerprint": "hardware-check:25826de645ccad44540bfaecc8a712bbaf1736aa66a05791e1df6e359409dec7",
+  "fixture_set_id": "qwen3-reranker-0.6b.ref-v1.transformers-5.16.1.seed-0",
+  "tolerance_class": "fp16",
+  "completed_fixtures": 125,
+  "expected_fixtures": 125,
+  "metrics": {
+    "min_cosine": null,
+    "max_norm_error": null,
+    "max_absolute_error": 0.00001695007085800171,
+    "pools": {
+      "pool-10": {
+        "concordant": 21,
+        "discordant": 0,
+        "backend_ties": 0,
+        "tau": 1.0,
+        "top10": true,
+        "passed": true
+      },
+      "pool-100": {
+        "concordant": 1924,
+        "discordant": 0,
+        "backend_ties": 0,
+        "tau": 1.0,
+        "top10": true,
+        "passed": true
+      }
+    }
+  },
+  "gates": {
+    "complete": true,
+    "dimension": true,
+    "finite": true,
+    "unit_norm": true,
+    "cosine": true,
+    "score": true,
+    "ranking": true,
+    "coverage_8192": true,
+    "coverage": true,
+    "semantics": true
+  },
+  "failures": []
+}

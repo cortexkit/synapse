@@ -1,0 +1,29 @@
+{
+  "model": "gte-modernbert-base",
+  "operation": "embed",
+  "profile_id": "gte-modernbert-base.owned-metal",
+  "fingerprint": "hardware-check:9ba0521494657eb281532ead061cd82916a1923a9560d1cddb7212ab7e92398a",
+  "fixture_set_id": "gte-modernbert-base.ref-v1.transformers-5.16.1.seed-0",
+  "tolerance_class": "fp16",
+  "completed_fixtures": 17,
+  "expected_fixtures": 17,
+  "metrics": {
+    "min_cosine": 0.9999913583374128,
+    "max_norm_error": 7.429356539967458e-7,
+    "max_absolute_error": null,
+    "pools": {}
+  },
+  "gates": {
+    "complete": true,
+    "dimension": true,
+    "finite": true,
+    "unit_norm": true,
+    "cosine": true,
+    "score": true,
+    "ranking": true,
+    "coverage_8192": true,
+    "coverage": true,
+    "semantics": true
+  },
+  "failures": []
+}

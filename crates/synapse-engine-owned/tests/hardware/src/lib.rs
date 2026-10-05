@@ -219,8 +219,8 @@ mod tests {
         let label = std::env::var("METAL_PRELOAD_LABEL").unwrap_or_else(|_| "current".into());
         write_result(&format!("preload-{label}.f32le"), &bytes);
         if label == "current" {
-            let baseline = fs::read(root().join("results/preload-baseline.f32le"))
-                .expect("run baseline first");
+            let baseline = fs::read(root().join("evidence/preload-baseline.f32le"))
+                .expect("committed master preload baseline");
             assert_eq!(bytes, baseline, "preload logits changed");
             println!(
                 "PRELOAD_BYTE_IDENTITY: {} pairs, {} bytes, sha256={:x}",

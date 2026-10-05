@@ -1,0 +1,46 @@
+{
+  "model": "gte-reranker-modernbert-base",
+  "operation": "rerank",
+  "profile_id": "gte-reranker-modernbert-base.owned-metal",
+  "fingerprint": "hardware-check:96ec4ca41db7fa1716f28d37b88dde89a5fe316e6c91b7ae9c5b96c900fec7a0",
+  "fixture_set_id": "gte-reranker-modernbert-base.ref-v1.transformers-5.16.1.seed-0",
+  "tolerance_class": "fp32",
+  "completed_fixtures": 125,
+  "expected_fixtures": 125,
+  "metrics": {
+    "min_cosine": null,
+    "max_norm_error": null,
+    "max_absolute_error": 5.841255187988281e-6,
+    "pools": {
+      "pool-10": {
+        "concordant": 43,
+        "discordant": 0,
+        "backend_ties": 0,
+        "tau": 1.0,
+        "top10": true,
+        "passed": true
+      },
+      "pool-100": {
+        "concordant": 4232,
+        "discordant": 0,
+        "backend_ties": 0,
+        "tau": 1.0,
+        "top10": true,
+        "passed": true
+      }
+    }
+  },
+  "gates": {
+    "complete": true,
+    "dimension": true,
+    "finite": true,
+    "unit_norm": true,
+    "cosine": true,
+    "score": true,
+    "ranking": true,
+    "coverage_8192": true,
+    "coverage": true,
+    "semantics": true
+  },
+  "failures": []
+}

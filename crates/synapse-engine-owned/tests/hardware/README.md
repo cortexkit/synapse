@@ -23,9 +23,14 @@ The report fingerprint is labeled `hardware-check:<manifest profile digest>`;
 this tests engine math, not module fingerprint construction or certification.
 
 To compare production preload logits, run the ignored
-`preload_gte_raw_logits_match_baseline` test against the pre-slice source with
-`METAL_PRELOAD_LABEL=baseline`, then against the current source without that
-variable. The test scores all 125 committed reference pairs and compares their
-little-endian f32 bytes, not rounded JSON numbers. Baseline and current result
-files remain under `results/`; the current run prints the common SHA-256.
-Both runs must use the same checked weights, toolchain, fixture and cache setup.
+`preload_gte_raw_logits_match_baseline` test. It scores all 125 committed
+reference pairs and compares their little-endian f32 bytes with the committed
+`evidence/preload-baseline.f32le`, not rounded JSON numbers. The current result
+is saved under `results/` and its common SHA-256 is printed.
+
+To independently reproduce that baseline, run the same test against the engine
+source from master commit `d49576a7664d333e4d173adfa8758d850745d317` with
+`METAL_PRELOAD_LABEL=baseline`. This writes `results/preload-baseline.f32le`
+without overwriting the committed baseline. Both runs must use the same checked
+weights, toolchain, fixture and cache setup. See `evidence/README.md` for the
+recorded machine, source revision and verbatim evaluator reports.
