@@ -355,6 +355,10 @@ impl WorkerHost {
         }
     }
 
+    pub fn request_count(&self) -> u64 {
+        self.request_counter
+    }
+
     fn set_log_job_id(&self, job_id: Option<&str>) {
         if let Ok(mut context) = self.log_context.lock() {
             context.job_id = job_id.map(str::to_owned);
@@ -1410,6 +1414,11 @@ impl WorkerEngine {
         self.host
             .lock()
             .map_err(|_| WorkerHostError::Protocol("worker host mutex poisoned".to_string()))
+    }
+
+    pub fn request_count(&self) -> Result<(String, u64), WorkerHostError> {
+        let host = self.lock_host()?;
+        Ok((host.config.worker_id.clone(), host.request_count()))
     }
 
     pub fn health_snapshot(&self) -> Result<WorkerHostHealth, WorkerHostError> {
@@ -3633,6 +3642,9 @@ pub mod ane_residency {
         next_slot: u64,
         clock: u64,
         stats: AneResidencyStats,
+        // Kept outside residency slots so eviction and confirmed-exit recovery
+        // cannot erase certification evidence. Disabled supervisors retain nothing.
+        inventory_sink: Option<Vec<Arc<AnePlacementInventory>>>,
         #[cfg(test)]
         recorded_samples: Vec<BTreeMap<String, Vec<usize>>>,
     }
@@ -3800,6 +3812,25 @@ pub mod ane_residency {
         #[cfg(unix)]
         pub fn lane_lock(&self) -> Option<&AneDirectLaneLock> {
             self.inner.lane_lock.as_ref()
+        }
+
+        /// Enable capture before the first admission; existing events are not reconstructed.
+        pub fn enable_observations(&mut self) {
+            self.inner
+                .lock()
+                .inventory_sink
+                .get_or_insert_with(Vec::new);
+        }
+
+        /// Retained ADMITTED events and the independently maintained admission total.
+        pub fn observations(&self) -> Option<(Vec<AnePlacementInventory>, u64)> {
+            let state = self.inner.lock();
+            state.inventory_sink.as_ref().map(|sink| {
+                (
+                    sink.iter().map(|inventory| (**inventory).clone()).collect(),
+                    state.stats.admitted,
+                )
+            })
         }
 
         pub fn limits(&self) -> AneResidencyLimits {
@@ -4260,6 +4291,9 @@ pub mod ane_residency {
         slot.leases = 1;
         slot.last_used = now;
         slot.inventory = Some(inventory.clone());
+        if let Some(sink) = state.inventory_sink.as_mut() {
+            sink.push(Arc::clone(&inventory));
+        }
         state.stats.admitted += 1;
         state.sample();
         drop(state);
@@ -4448,6 +4482,10 @@ pub mod ane_residency {
                 shape_rpc_timeout: std::time::Duration::from_secs(600),
                 owner_exit_timeout: std::time::Duration::from_secs(30),
             })
+        }
+
+        pub fn request_count(&self) -> u64 {
+            self.request_counter.load(Ordering::Relaxed)
         }
 
         pub fn next_req_id(&self, prefix: &str) -> String {

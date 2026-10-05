@@ -3724,16 +3724,33 @@ fn certify_observations(state: Arc<ModuleState>) -> HandlerOutcome {
     result_outcome(certify_worker_snapshot(&state.runtime))
 }
 
-// In-process Metal has no worker IPC, so its empty snapshot is complete. The
-// temporary worker implementation reports unavailable instead of claiming that
-// unconnected host request counters and ADMITTED capture contain no events.
+// CUDA and Vulkan need request counts, but no ANE placement evidence. Direct
+// ANE remains unavailable until production inference uses the residency supervisor.
 fn certify_worker_snapshot(runtime: &RuntimeState) -> Value {
     let models = runtime.loaded_models();
-    let in_process = !models.is_empty()
-        && models
-            .iter()
-            .all(|model| matches!(&model.backend, EmbedBackend::Owned(_)));
-    json!({"inventories": [], "worker_requests": {}, "admitted_count": 0, "available": in_process})
+    let mut available = !models.is_empty();
+    let mut requests = BTreeMap::new();
+    for model in models {
+        match &model.backend {
+            EmbedBackend::Owned(_) => {}
+            EmbedBackend::Worker(engine) => {
+                let count = engine.lock().ok().and_then(|engine| {
+                    let identity = EmbedEngine::identity(&*engine);
+                    if identity.engine == "ane-direct-worker" {
+                        return None;
+                    }
+                    engine.request_count().ok()
+                });
+                if let Some((worker_id, count)) = count {
+                    requests.insert(worker_id, count);
+                } else {
+                    available = false;
+                }
+            }
+            _ => available = false,
+        }
+    }
+    json!({"inventories": [], "worker_requests": requests, "admitted_count": 0, "available": available})
 }
 
 async fn dispatch_request(

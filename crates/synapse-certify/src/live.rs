@@ -65,12 +65,11 @@ fn worker(row: &str) -> Option<&'static str> {
         _ => None,
     }
 }
-// Worker-backed certification needs complete ADMITTED capture and independent
-// counters. The module currently exposes complete snapshots only for Metal;
-// refuse before launching a worker rather than certify an incomplete snapshot.
+// Direct ANE requires the production engine to use the residency supervisor;
+// transport-only request counts are sufficient for CUDA and Vulkan rows.
 pub(crate) fn require_observation_support(row: &str) -> Result<()> {
-    if worker(row).is_some() {
-        return Err(refuse("missing_worker_observation: ADMITTED inventory sink, request-count getter and stats() admitted count are unavailable"));
+    if row == "ane-m5" {
+        return Err(refuse("missing_worker_observation: direct-ANE production residency supervisor integration is unavailable"));
     }
     Ok(())
 }

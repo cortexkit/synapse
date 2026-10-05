@@ -123,14 +123,11 @@ pub fn dispatch(command: Command, source: Option<&str>) -> Result<serde_json::Va
 #[cfg(test)]
 mod tests {
     #[test]
-    fn worker_backed_live_run_refuses_missing_observation_and_writes_nothing() {
+    fn ane_live_run_refuses_missing_supervisor_integration_and_writes_nothing() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join(format!(".live/worker-refusal-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
-        for row in crate::ROWS {
-            if row == "metal-m5" {
-                continue;
-            }
+        for row in ["ane-m5"] {
             let options = crate::live::Options {
                 assets: root.join("absent-assets"),
                 checkout: root.join("checkout"),
@@ -146,7 +143,9 @@ mod tests {
             )
             .unwrap_err();
             assert!(
-                error.to_string().contains("missing_worker_observation"),
+                error
+                    .to_string()
+                    .contains("production residency supervisor integration"),
                 "{row}: {error}"
             );
             assert!(
@@ -154,7 +153,14 @@ mod tests {
                 "{row} wrote a record before refusing"
             );
         }
-        assert!(crate::live::require_observation_support("metal-m5").is_ok());
+        for row in crate::ROWS {
+            if row != "ane-m5" {
+                assert!(
+                    crate::live::require_observation_support(row).is_ok(),
+                    "{row}"
+                );
+            }
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 
