@@ -12,7 +12,7 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--driver", type=Path, required=True)
 parser.add_argument("--out", type=Path, required=True)
 parser.add_argument("--timeout", type=int, default=3600)
-parser.add_argument("--methods", nargs="+", choices=["drop-client-references", "fresh-client", "fresh-allocated-client", "model-purge", "client-purge", "release-all"], default=["drop-client-references", "fresh-client", "fresh-allocated-client", "model-purge", "client-purge", "release-all"])
+parser.add_argument("--methods", nargs="+", choices=["drop-client-references", "fresh-client", "fresh-allocated-client", "model-purge", "client-purge", "release-all", "autorelease-all", "scoped-single-evict"], default=["drop-client-references", "fresh-client", "fresh-allocated-client", "model-purge", "client-purge", "release-all", "autorelease-all"])
 args = parser.parse_args()
 root = Path(__file__).resolve().parents[3]
 env = dict(os.environ)
@@ -30,7 +30,8 @@ for method in args.methods:
     with tempfile.TemporaryDirectory() as tmp:
         result = Path(tmp) / "result.json"
         child_env = dict(env, ANE_RECLAIM_PATH=method, ANE_CAPACITY_OUT=str(result))
-        command = [str(args.driver.resolve()), "backend::fresh_process_hardware::fresh_process_reclaim_paths", "--exact", "--ignored", "--nocapture", "--test-threads=1"]
+        test = {"autorelease-all": "fresh_process_autorelease_reclaim", "scoped-single-evict": "fresh_process_scoped_pools_reclaim"}.get(method, "fresh_process_reclaim_paths")
+        command = [str(args.driver.resolve()), "backend::fresh_process_hardware::" + test, "--exact", "--ignored", "--nocapture", "--test-threads=1"]
         try:
             child = subprocess.run(command, env=child_env, cwd=root, text=True, capture_output=True, timeout=max(1, deadline-time.monotonic()))
             data = json.loads(result.read_text()) if result.exists() else {"method": method, "result": "no report; isolated probe failed", "exit_code": child.returncode}

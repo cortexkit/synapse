@@ -15,15 +15,25 @@ Each fresh process admitted GTE@128,256,512,1024,2048, for 110 executables. It t
 | Release every resident executable/model/IOSurface object | 13.14 / 18.67 / 18.14 | Zero fully resident executables remain, but still no full-shape replacement | 84.03 s |
 | Fresh allocated client, `initWithRestrictedAccessAllowed:false` | 29.38 / 24.51 / 20.79 | Client distinct from shared; both client unload selectors returned true with no NSError | 42.74 s |
 
-The last control used inherited NSObject allocation and an initializer actually listed by the runtime, after `new` returned nil. It did not enable restricted access. The compiled model getter and hash getter were also enumerated, not invented. All probe objects were released before replacement admission. A successful unload or purge call is not a confirmation of released hardware capacity.
+The last control used inherited NSObject allocation and an initializer actually listed by the runtime, after `new` returned nil. It did not enable restricted access. The compiled model getter and hash getter were also enumerated, not invented. All objects explicitly retained by these diagnostic probes were released before replacement admission; this did not drain unscoped Objective-C autoreleased temporaries. A successful unload or purge call is not a confirmation of released hardware capacity.
 
-The only measured reclaim boundary that restored full-shape capacity remains **confirmed owning-process exit**, as the earlier paired control demonstrates. Proceed with process epochs, not a client-level reset or a short cooldown. These observations do not identify Apple's allocator implementation or claim a lifetime quota beyond the measured retention behavior.
+At the end of these six controls, confirmed owning-process exit was the only observed successful reclaim boundary. The following autorelease-pool controls **supersede that process-only interpretation**: successful unloads were insufficient when Objective-C temporary ownership was not drained.
+
+## Autorelease-pool finding
+
+Start macOS 1-/5-/15-minute load averages (unitless): **12.59 / 12.63 / 13.92**. In one process, compile the same 110 executables inside an Objective-C autorelease pool, drop every resident shape, then drain that pool. A new 22-layer GTE@4096 shape **loads completely**, starting 0.306 seconds after release began and finishing after 59.761 seconds (including compilation). The whole hardware control took 149 seconds. No process exit or client replacement occurred. See `reclaim-autorelease-development.json`.
+
+A second control places each compile/inference/eviction in its own scoped pool while retaining executables across commands. Start macOS 1-/5-/15-minute load averages (unitless): **33.70 / 21.12 / 17.17**. All five GTE shapes remain loaded (110 executables); a sibling GTE@256 inference has finite output. Evict only GTE@128 inside a pool and drain it. Replacement GTE@4096 then loads all 22 layers, beginning after 0.151 seconds and finishing after 75.060 seconds (including compile and sibling verification). The retained sibling runs again with byte-identical output. The full control took 295 seconds. **Single-shape eviction does return usable capacity with scoped autorelease hygiene**, and retained executables survive pool boundaries. See `reclaim-scoped-single-evict-development.json`.
+
+These observations point to un-drained Objective-C temporary ownership, not an unavoidable per-process lifetime quota. Each pool strategy has only one completed fresh-process run so far; these are two different controls, not a repeatability study. The reported 0.151/0.306-second intervals are release-and-pool-drain durations before starting a successful compilation, not direct measurements of the instant the hardware allocator returns capacity. Neither successful first attempt used a separate cooldown. Only one retained sibling (GTE@256) was checked for finite, byte-identical output; this does not establish reference-model parity for all retained shapes. Six selector/reference-release controls plus these two controls stayed under the one-hour hardware budget. Additional admission policy remains pending a ruling because shape-level reclamation now demonstrably works.
 
 Reproduction uses the worker test executable selected as `DRIVER` in `capacity-development.md`:
 
 ```
 python3 crates/synapse-worker-ane-direct/tests/run_reclaim_paths.py --driver "$DRIVER" --timeout 3600 --methods drop-client-references fresh-client model-purge client-purge release-all --out crates/synapse-worker-ane-direct/evidence/reclaim-paths-development.json
 python3 crates/synapse-worker-ane-direct/tests/run_reclaim_paths.py --driver "$DRIVER" --timeout 1200 --methods fresh-allocated-client --out crates/synapse-worker-ane-direct/evidence/reclaim-fresh-allocated-client-development.json
+python3 crates/synapse-worker-ane-direct/tests/run_reclaim_paths.py --driver "$DRIVER" --timeout 1200 --methods autorelease-all --out crates/synapse-worker-ane-direct/evidence/reclaim-autorelease-development.json
+python3 crates/synapse-worker-ane-direct/tests/run_reclaim_paths.py --driver "$DRIVER" --timeout 1200 --methods scoped-single-evict --out crates/synapse-worker-ane-direct/evidence/reclaim-scoped-single-evict-development.json
 ```
 
 Launchers unset TMPDIR, select the required Xcode DEVELOPER_DIR and log before/after load beside every run. Serving does not invoke the explicitly experimental vendor diagnostic helpers.

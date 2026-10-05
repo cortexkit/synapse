@@ -983,6 +983,84 @@ mod fresh_process_hardware {
     }
 
     #[test]
+    #[ignore = "Scoped command pools with live retained executables and single-shape eviction"]
+    fn fresh_process_scoped_pools_reclaim() {
+        let mut model = model("gte-modernbert-base");
+        for shape in [128, 256, 512, 1024, 2048] {
+            ane::diagnostics::with_autorelease_pool(|| {
+                model.admit_with_limit(shape, "scoped-pools-development", 64, |graph, _| {
+                    graph.compile(NSQualityOfService::UserInteractive)
+                })
+            })
+            .unwrap();
+        }
+        let tokens = vec![1u32; 200];
+        let before = ane::diagnostics::with_autorelease_pool(|| model.run(&tokens)).unwrap();
+        assert!(before.iter().all(|value| value.is_finite()));
+        let started = std::time::Instant::now();
+        ane::diagnostics::with_autorelease_pool(|| drop(model.resident.remove(&128)));
+        let offset_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let mut loaded = 0;
+        let result = ane::diagnostics::with_autorelease_pool(|| {
+            model.admit_with_limit(4096, "scoped-pools-development", 64, |graph, _| {
+                let result = graph.compile(NSQualityOfService::UserInteractive);
+                if result.is_ok() {
+                    loaded += 1;
+                }
+                result
+            })
+        });
+        let error = result.err().map(|error| format!("{error:#}"));
+        let after = ane::diagnostics::with_autorelease_pool(|| model.run(&tokens)).unwrap();
+        assert_eq!(before,after,"retained sibling must remain executable and byte-identical across scoped-pool releases");
+        write_experiment(
+            serde_json::json!({"classification":"development","experiment":"in-process-reclaim-paths","method":"scoped-single-evict","initial_executables":110,"observations":["retained sibling runs with finite byte-identical output before and after eviction/new compilation"],"attempts":[{"actual_start_after_reclaim_ms":offset_ms,"finished_after_reclaim_ms":started.elapsed().as_secs_f64()*1000.0,"loaded":loaded,"error":error}],"remaining_fully_resident_executables":model.resident.values().map(|resident|resident.executables.len()).sum::<usize>()}),
+        );
+    }
+
+    #[test]
+    #[ignore = "Bounded autorelease-pool reclamation control with every shape object released"]
+    fn fresh_process_autorelease_reclaim() {
+        let mut model = model("gte-modernbert-base");
+        let mut started = std::time::Instant::now();
+        ane::diagnostics::with_autorelease_pool(|| {
+            for shape in [128, 256, 512, 1024, 2048] {
+                model
+                    .admit_with_limit(shape, "autorelease-reclaim-development", 64, |graph, _| {
+                        graph.compile(NSQualityOfService::UserInteractive)
+                    })
+                    .unwrap();
+            }
+            started = std::time::Instant::now();
+            model.resident.clear();
+        });
+        let mut attempts = Vec::new();
+        for delay_ms in [0, 5000] {
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            let offset_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let mut loaded = 0;
+            let result = ane::diagnostics::with_autorelease_pool(|| {
+                model.admit_with_limit(4096, "autorelease-reclaim-development", 64, |graph, _| {
+                    let result = graph.compile(NSQualityOfService::UserInteractive);
+                    if result.is_ok() {
+                        loaded += 1;
+                    }
+                    result
+                })
+            });
+            let error = result.err().map(|error| format!("{error:#}"));
+            let success = error.is_none();
+            attempts.push(serde_json::json!({"actual_start_after_reclaim_ms":offset_ms,"finished_after_reclaim_ms":started.elapsed().as_secs_f64()*1000.0,"delay_after_previous_attempt_ms":delay_ms,"loaded":loaded,"error":error}));
+            if success {
+                break;
+            }
+        }
+        write_experiment(
+            serde_json::json!({"classification":"development","experiment":"in-process-reclaim-paths","method":"autorelease-all","initial_executables":110,"observations":["all shapes dropped and enclosing Objective-C autorelease pool drained before replacement"],"attempts":attempts,"remaining_fully_resident_executables":model.resident.values().map(|resident|resident.executables.len()).sum::<usize>()}),
+        );
+    }
+
+    #[test]
     #[ignore = "Bounded in-process reclaim alternatives with runtime-enumerated selectors"]
     fn fresh_process_reclaim_paths() {
         let method = std::env::var("ANE_RECLAIM_PATH").unwrap();

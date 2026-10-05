@@ -114,3 +114,9 @@ pub fn reclaim(executables: Vec<Executable>, probe: ReclaimProbe) -> Vec<String>
     drop(models);
     observations
 }
+
+/// Drain Objective-C autoreleased temporary objects after a development probe.
+/// Objects explicitly retained by live executables remain owned across the pool.
+pub fn with_autorelease_pool<R>(body: impl FnOnce() -> R) -> R {
+    objc2::rc::autoreleasepool(|_| body())
+}
