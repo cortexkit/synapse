@@ -39,3 +39,34 @@ New optional version1 JSON fields preserve validation of historical reports:
 - `request_wait_times`: all 37 model/request identifiers, summed admission wait milliseconds, and individual rung waits with success/refusal outcome. Each wait spans the complete `lease` future, including FIFO queueing, eviction, and compilation if necessary, but excludes inference.
 
 Instrumentation is test-only and does not change production admission behavior. Independent odd/even median fixtures, actual delayed worker-response timing, successful/deadline-refused lease timing, and schema type/count checks cover the new records. The deadline-failed debug run in `stress-pooled-live100-development.json` predates these timers, so exact per-request or per-shape timings cannot be reconstructed and are not fabricated.
+
+## Release handoff: built and unit-verified, hardware deferred
+
+Both optimized artifacts built successfully (`cargo build --release --locked -p synapse-worker-ane-direct`; `cargo test --release --locked -p synapse-module --lib --no-run --message-format=json`). The prebuilt release driver ran 22 ordinary residency/schema/timing tests successfully, with three hardware tests ignored. Rust/cargo1.99.0; rustfmt1.10.0; Python3.9.6.
+
+Observed macOS load never met both unchanged gates (one-minute below16, five-minute below20), so it submitted no model requests and produced no release hardware JSON. After approximately two hours waiting, the operator requested termination of the waiter's own PID16941; SIGTERM stopped it (exit143). No measurement remains running. The failed debug JSON remains the only post-fix full-stress hardware run. It records 29 admission-deadline refusals against the 600-second deadline, but no per-shape compile or exact per-request wait durations because timing instrumentation was added later.
+
+From a repository root with `target/ane-direct-packages/<model>.safetensors` present for `gte-modernbert-base`, `gte-reranker-modernbert-base`, `qwen3-embedding-0.6b`, and `qwen3-reranker-0.6b`, each SHA-256 checked against the manifest package pin as recorded in `capacity-development.md`, prebuild and run the release stress cold in a quiet window:
+
+```sh
+unset TMPDIR
+export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
+cargo build --release --locked -p synapse-worker-ane-direct
+cargo test --release --locked -p synapse-module --lib --no-run --message-format=json > target/release-stress-driver.jsonl
+DRIVER=$(python3 - <<'PY'
+import json
+from pathlib import Path
+items = [json.loads(line) for line in Path('target/release-stress-driver.jsonl').read_text().splitlines() if line.startswith('{')]
+paths = [item['executable'] for item in items if item.get('reason') == 'compiler-artifact' and item.get('target', {}).get('name') == 'synapse_module' and item.get('profile', {}).get('test') and item.get('executable')]
+assert len(paths) == 1
+print(paths[0])
+PY
+)
+ANE_TEST_WORKER="$PWD/target/release/ck-synapse-worker-ane-direct" \
+ANE_TEST_PACKAGES="$PWD/target/ane-direct-packages" \
+python3 crates/synapse-worker-ane-direct/tests/run_stress.py \
+  --driver "$DRIVER" --wait-for-load --timeout 28800 \
+  --out crates/synapse-worker-ane-direct/evidence/stress-pooled-live100-release-development.json
+```
+
+The release-driver command above keeps the workload, 600-second admission deadline, policy, and assertions unchanged. The launcher waits for unitless macOS one-minute load below16 and five-minute load below20 and bounds its own process group. It will include per-model compile minimum/median/maximum and all 37 requests' admission waits in the JSON. Build before waiting; do not rebuild after the quiet-window gate.
