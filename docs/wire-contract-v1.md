@@ -174,8 +174,20 @@ The management registry in this snapshot is `embed.query`, `embed.batch`,
 `probe.status`, `probe.report`, `aliases.check_index`, `alias.retract`,
 `alias.declare`, `cache.pin`, `cache.gc`, `admission.status`,
 `approvals.migrate_owned_decode`, `approvals.enable`, `approvals.disable`, and
-`approvals.emergency_rollback`.
+`approvals.emergency_rollback`, and `certify.observations`.
 
+- **certify.observations** {} — query, certification-only surface. Consumers
+  must not use this operation or depend on its output. It refuses with the typed
+  channel error `certify_observation_disabled` unless the generated certification
+  config enables `certify_observation` (false by default). When enabled, it returns
+  all received ADMITTED `inventories` and per-worker `worker_requests` counts.
+  Observation only records execution; it never changes computation.
+- **Certification observation responses** — consumers must not use this surface.
+  With `certify_observation` enabled, inline embed and rerank responses include a
+  top-level `observation`: `input_ids` are the engine-bound token sequences;
+  catalog Qwen rerank also includes `readout_ids: [yes, no]`. Legacy unframed
+  worker rerank instead discloses `query_ids` and `candidate_ids` as sent. Disabled
+  mode omits the block entirely and records nothing.
 - **embed.query** {model, text, …constraints} — interactive class, the
   latency path. Full envelope incl. fingerprint/equivalent_to (one-comparison
   hot path).

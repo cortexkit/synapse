@@ -837,6 +837,9 @@ impl WireOperationError {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ModuleConfig {
+    /// Discloses engine-bound token IDs for candidate certification, not consumer APIs.
+    #[serde(default)]
+    certify_observation: bool,
     #[serde(default = "default_hf_endpoint")]
     hf_endpoint: String,
     #[serde(default)]
@@ -880,6 +883,7 @@ pub(crate) struct ModuleConfig {
 impl Default for ModuleConfig {
     fn default() -> Self {
         Self {
+            certify_observation: false,
             hf_endpoint: default_hf_endpoint(),
             preload_models: Vec::new(),
             inline: InlineConfig::default(),
@@ -1263,6 +1267,7 @@ impl AdmissionTelemetry {
 }
 
 struct RuntimeState {
+    certify_observation: bool,
     hf_endpoint: String,
     release_catalog: catalog::Catalog,
     runnable_backends: BTreeSet<String>,
@@ -2295,6 +2300,7 @@ impl RuntimeState {
             })
             .collect();
         Ok(Self {
+            certify_observation: config.certify_observation,
             hf_endpoint,
             release_catalog,
             runnable_backends,
@@ -3697,6 +3703,28 @@ impl ModuleHandler for SynapseHandler {
     }
 }
 
+fn attach_certify_observation(response: &mut Value, observation: Option<Value>) {
+    if let Some(observation) = observation {
+        response["observation"] = observation;
+    }
+}
+
+fn certify_observations(state: Arc<ModuleState>) -> HandlerOutcome {
+    if !state.runtime.certify_observation {
+        return channel_error(
+            "certify_observation_disabled",
+            "certification observation mode is disabled",
+        );
+    }
+    result_outcome(certify_worker_snapshot(&state.runtime))
+}
+
+// Until worker-host observation hooks are connected, explicitly report unavailable
+// rather than let empty inventories or counts masquerade as measured evidence.
+fn certify_worker_snapshot(_runtime: &RuntimeState) -> Value {
+    json!({"inventories": [], "worker_requests": {}, "available": false})
+}
+
 async fn dispatch_request(
     state: Arc<ModuleState>,
     request: MethodEnvelope,
@@ -3711,6 +3739,7 @@ async fn dispatch_request(
             Ok(snapshot) => result_outcome(models_list_payload(&state, snapshot)),
             Err(error) => channel_error("store_failure", error.to_string()),
         },
+        "certify.observations" => certify_observations(state),
         "embed.query" => embed_query(state, request.params).await,
         "embed.batch" => embed_batch(state, request.params).await,
         "embed.result" => embed_result(state, request.params).await,
@@ -8896,6 +8925,23 @@ async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
         Err(error) => return result_outcome(error_payload(&state, error)),
     };
 
+    let observation = if state.runtime.certify_observation {
+        let mut observation = match &owned_pairs {
+            Some(pairs) => json!({"input_ids": pairs}),
+            None => json!({"query_ids": query, "candidate_ids": token_items}),
+        };
+        if let Some(profile_id) = model.engine_identity.build_flags.get("profile") {
+            if let Ok(profile) = CatalogProfile::load(profile_id) {
+                let readout = &profile.model()["grammar"]["readout"];
+                if !readout.is_null() {
+                    observation["readout_ids"] = json!([readout["yes"]["id"], readout["no"]["id"]]);
+                }
+            }
+        }
+        Some(observation)
+    } else {
+        None
+    };
     let scores = match execute_rerank(
         &state.runtime,
         &model,
@@ -8951,7 +8997,9 @@ async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
         candidate_token_counts,
         started,
     );
-    result_outcome(serde_json::to_value(envelope).expect("rerank envelope should serialize"))
+    let mut response = serde_json::to_value(envelope).expect("rerank envelope should serialize");
+    attach_certify_observation(&mut response, observation);
+    result_outcome(response)
 }
 
 async fn microllm_oneshot(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
@@ -11718,6 +11766,11 @@ async fn embed_tokenized(
         .iter()
         .map(|&tokens| u64::from(tokens))
         .sum::<u64>();
+    let observation = state.runtime.certify_observation.then(|| {
+        json!({
+            "input_ids": tokenized.batch.items,
+        })
+    });
     let vectors = match if use_bulk_quanta {
         execute_embedding_quanta(
             &state.runtime,
@@ -11794,7 +11847,9 @@ async fn embed_tokenized(
         total_tokens,
         started,
     );
-    result_outcome(serde_json::to_value(envelope).expect("embed envelope should serialize"))
+    let mut response = serde_json::to_value(envelope).expect("embed envelope should serialize");
+    attach_certify_observation(&mut response, observation);
+    result_outcome(response)
 }
 
 fn apply_owned_tokenizer_policy(model: &EmbeddingModel, tokenized: &mut TokenizedBatch) {
@@ -16058,6 +16113,7 @@ fn management_operations() -> Vec<ManagementOperation> {
     };
 
     vec![
+        op("certify.observations", Query),
         op("embed.query", Query),
         op("embed.batch", Query),
         op("embed.result", Query),
@@ -16464,6 +16520,26 @@ fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn certify_observation_off_preserves_response_bytes() {
+        let mut response = serde_json::json!({"payload": {"vectors": [[1.0]]}});
+        let before = serde_json::to_vec(&response).unwrap();
+        super::attach_certify_observation(&mut response, None);
+        assert_eq!(serde_json::to_vec(&response).unwrap(), before);
+        assert!(!super::ModuleConfig::default().certify_observation);
+    }
+
+    #[test]
+    fn certify_observation_on_discloses_engine_ids() {
+        let mut response = serde_json::json!({"payload": {"scores": [0.5]}});
+        let observation =
+            serde_json::json!({"input_ids": [[1, 2, 3]], "readout_ids": [9693, 2152]});
+        super::attach_certify_observation(&mut response, Some(observation.clone()));
+        assert_eq!(response["observation"], observation);
+        let config: super::ModuleConfig =
+            serde_json::from_value(serde_json::json!({"certify_observation": true})).unwrap();
+        assert!(config.certify_observation);
+    }
     use super::*;
 
     /// Builds a bind whose scope is decoded from the daemon's wire JSON, so the
