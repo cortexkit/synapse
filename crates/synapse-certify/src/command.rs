@@ -127,7 +127,8 @@ mod tests {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join(format!(".live/worker-refusal-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
-        for row in ["ane-m5"] {
+        {
+            let row = "ane-m5";
             let options = crate::live::Options {
                 assets: root.join("absent-assets"),
                 checkout: root.join("checkout"),
