@@ -1,10 +1,10 @@
 {
   "files": {
     "Cargo.toml": "bb70d7a091b3272101ca3de7dbde0242ab84405fc307cba5f9dd42b86786d8cd",
-    "VENDORED.md": "2ea4d6238852d39cc48dea047d43071eb61a5e132972f4db4b3cace7f5cbe9a8",
+    "VENDORED.md": "7f52e391d8f9fe41f15987b6a2d2f261eae3d7c745219fffecbe115f1bdb8efc",
     "build.rs": "d5339f906b4cb1c86b2b7d539729f74c8bc7b3a79f950bf4fffbd312842e8c59",
     "src/ane_client.rs": "9aabbf44811f23a0f13f56349b0f981be55aafe328608c65094a6ba2b681ebf1",
-    "src/ane_in_memory_model.rs": "902f0d34eee9c2ff0f12764207110c5552011a3ca6b8e796e9f876d4b761f3bd",
+    "src/ane_in_memory_model.rs": "b81487c55abf10bfd35a0e803a2c6a9788fd32e33f5fb35bdb76b3afd714381a",
     "src/ane_in_memory_model_descriptor.rs": "4b944216b68406df32ae6f33d5cb327238724895cb957066fa03478f3aad9f5d",
     "src/ane_io_surface_object.rs": "709bfd167328f5be0651060c07b07f8323e5526f36ad3fc1a827bfbd583582ba",
     "src/ane_performance_stats.rs": "7f70b58b585d3a132b94172ad8445b45e1adccac82da8241feef8f7ee13062d4",

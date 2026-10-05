@@ -3631,6 +3631,8 @@ pub mod ane_residency {
         wait_timeout: std::time::Duration,
         state: Mutex<State>,
         changed: Notify,
+        #[cfg(test)]
+        admission_gate: Option<Arc<tokio::sync::Mutex<()>>>,
         #[cfg(unix)]
         lane_lock: Option<AneDirectLaneLock>,
     }
@@ -3700,6 +3702,8 @@ pub mod ane_residency {
                     wait_timeout: ANE_ADMISSION_WAIT_TIMEOUT,
                     state: Mutex::new(State::default()),
                     changed: Notify::new(),
+                    #[cfg(test)]
+                    admission_gate: None,
                     #[cfg(unix)]
                     lane_lock: None,
                 }),
@@ -3716,6 +3720,8 @@ pub mod ane_residency {
                     wait_timeout: ANE_ADMISSION_WAIT_TIMEOUT,
                     state: Mutex::new(State::default()),
                     changed: Notify::new(),
+                    #[cfg(test)]
+                    admission_gate: None,
                     lane_lock: Some(lock),
                 }),
             }
@@ -3949,6 +3955,11 @@ pub mod ane_residency {
             // if the waiting request is dropped part way through.
             let supervisor = self.clone();
             let task = tokio::spawn(async move {
+                #[cfg(test)]
+                let _serial_admission = match &inner.admission_gate {
+                    Some(gate) => Some(gate.lock().await),
+                    None => None,
+                };
                 match worker.admit_shape(&key.model_ref, key.shape).await {
                     Ok(inventory) => finish_admit(&inner, &key, slot_id, inventory),
                     Err(error) if error.code() == Some(ERR_ANE_RESOURCES_EXHAUSTED) => {
@@ -4852,8 +4863,13 @@ pub mod ane_residency {
             std::fs::create_dir_all(&root).unwrap();
             let lock = AneDirectLaneLock::acquire(&root.join("lane.lock")).unwrap();
             let factory = Factory::new(root.clone(), &lock);
-            let supervisor =
+            let mut supervisor =
                 AneResidencySupervisor::with_lane_lock(AneResidencyLimits::default(), lock);
+            // Serialize shape compiles only in this test to isolate concurrency effects from residency limits.
+            if std::env::var_os("ANE_STRESS_SERIALIZE_ADMISSION").is_some() {
+                Arc::get_mut(&mut supervisor.inner).unwrap().admission_gate =
+                    Some(Arc::new(tokio::sync::Mutex::new(())));
+            }
             let ledger = Arc::new(Mutex::new(Ledger::default()));
             let mut workers = Vec::new();
             for (index, slug) in SLUGS.iter().enumerate() {

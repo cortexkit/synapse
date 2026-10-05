@@ -20,6 +20,10 @@ Local compatibility changes:
   containing workspace also builds on Linux and Windows.
 - `Executable::run_cached_profiled` times cached-request preparation and the
   synchronous evaluate call without changing the request or execution semantics.
+- `ANEInMemoryModel::unload` logs the BOOL and NSError description when
+  `ANE_UNLOAD_DIAGNOSTICS` is set. This observes `Executable::Drop` unload calls
+  without changing their return type or retry policy; success is not a
+  guarantee that hardware capacity is immediately reclaimed.
 - A read-only `Graph::source_payload` accessor exposes the exact submitted MIL
   and weight bytes for resource-limit diagnostics; it does not change compilation.
 - `metal` uses the containing workspace's 0.29 API (the binding builds against

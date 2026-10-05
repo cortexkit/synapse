@@ -1,6 +1,6 @@
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Bool, NSObject};
-use objc2::{ClassType, extern_class, extern_conformance, msg_send};
+use objc2::{extern_class, extern_conformance, msg_send, ClassType};
 use objc2_foundation::{NSDictionary, NSError, NSObjectProtocol, NSQualityOfService, NSString};
 
 use crate::ane_in_memory_model_descriptor::ANEInMemoryModelDescriptor;
@@ -65,6 +65,13 @@ impl ANEInMemoryModel {
 
     pub fn unload(&self, qos: NSQualityOfService) {
         let mut err: *mut NSError = std::ptr::null_mut();
-        let _: Bool = unsafe { msg_send![self, unloadWithQoS: qos.0 as u32, error: &mut err] };
+        let success: Bool =
+            unsafe { msg_send![self, unloadWithQoS: qos.0 as u32, error: &mut err] };
+        if std::env::var_os("ANE_UNLOAD_DIAGNOSTICS").is_some() {
+            // A successful unload call need not mean the hardware has reclaimed its resources yet.
+            let error =
+                unsafe { err.as_ref() }.map(|error| error.localizedDescription().to_string());
+            eprintln!("ANE_UNLOAD success={} error={error:?}", success.as_bool());
+        }
     }
 }
