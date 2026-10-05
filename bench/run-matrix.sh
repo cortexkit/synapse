@@ -5,6 +5,12 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# Keep the existing corpus/power path unchanged; release uses a separate matrix.
+if [ "${1:-}" = "release" ]; then
+  shift
+  exec python3 bench/harness/release_matrix.py "$@"
+fi
+
 BENCH=./target/release/synapse-bench
 RESULTS=bench/results
 # corpus-v2 is the fixture used for release benchmark results. When regenerating
