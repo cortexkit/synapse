@@ -3,6 +3,9 @@
 use crate::{ModelFamily, OwnedDType};
 use serde_json::Value;
 
+// Only the Metal load path calls these, and that path is compiled on macOS alone;
+// the crate itself still builds on Linux and Windows for its CPU-side code.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn model(profile: &str) -> Result<(ModelFamily, OwnedDType, Value), String> {
     let manifest: Value =
         serde_json::from_slice(include_bytes!("../../../bench/parity/models.json"))
@@ -34,6 +37,7 @@ pub(crate) fn model(profile: &str) -> Result<(ModelFamily, OwnedDType, Value), S
     Ok((family, dtype, model))
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn config(model: &Value) -> Value {
     let mut config = model["architecture"]["params"].clone();
     config["model_type"] = model["architecture"]["family"].clone();
