@@ -9,7 +9,7 @@
     "kind": {"type": "string", "const": "development"},
     "harness_profile": {"type": "string", "enum": ["debug", "release"]},
     "source_commit": {"type": "string", "minLength": 40, "maxLength": 40},
-    "machine": {"type": "object", "required": ["model_identifier", "platform_uuid"], "properties": {"model_identifier": {"type": "string", "minLength": 1}, "platform_uuid": {"type": "string", "minLength": 1}}},
+    "machine": {"type": "object", "required": ["model_identifier"], "properties": {"model_identifier": {"type": "string", "minLength": 1}}},
     "os": {"type": "object", "required": ["version", "build"], "properties": {"version": {"type": "string", "minLength": 1}, "build": {"type": "string", "minLength": 1}}},
     "load_1_5_15_start": {"type": "array", "minItems": 3, "maxItems": 3, "items": {"type": "number", "minimum": 0}},
     "load_1_5_15_end": {"type": "array", "minItems": 3, "maxItems": 3, "items": {"type": "number", "minimum": 0}},

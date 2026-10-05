@@ -3359,9 +3359,10 @@ mod tests {
 /// and keeps it resident on the Neural Engine. Too many resident shapes
 /// exhaust the ANE, so the supervisor owns a budget of
 /// [`ANE_RESIDENT_SHAPES_PER_MODEL`] shapes per model ref and
-/// [`ANE_RESIDENT_SHAPES_TOTAL`] overall, enforced with `ANE_ADMIT_SHAPE` and
-/// `ANE_EVICT_SHAPE`. A shape counts against the budget from its admit request
-/// until its `EVICTED` ack. While a request runs on a shape it holds a lease,
+/// [`ANE_RESIDENT_SHAPES_TOTAL`] overall, plus a module-wide
+/// [`ANE_RESIDENT_EXECUTABLES_TOTAL`] layer-executable budget, enforced with
+/// `ANE_ADMIT_SHAPE` and `ANE_EVICT_SHAPE`. A shape counts against both budgets
+/// from its admit request until its `EVICTED` ack. While a request runs on a shape it holds a lease,
 /// and a leased shape is never evicted.
 ///
 /// A request runs its rungs one at a time in ascending order and releases each
@@ -3399,6 +3400,15 @@ pub mod ane_residency {
     pub const ANE_SHAPE_LADDER: [usize; 7] = [128, 256, 512, 1024, 2048, 4096, 8192];
     pub const ANE_RESIDENT_SHAPES_PER_MODEL: usize = 4;
     pub const ANE_RESIDENT_SHAPES_TOTAL: usize = 8;
+    /// Only M5 Max was measured: Mac17,6, OS build 26A434 failed at 115-118
+    /// loaded layer executables across processes, including gte-modernbert-base
+    /// at sequence lengths 4096 and 8192.
+    /// Reserve 15 slots below the lowest observed failure; other ANE users can
+    /// still exhaust resources, so the worker's transient refusal remains a backstop.
+    pub const ANE_RESIDENT_EXECUTABLES_TOTAL: usize = 100;
+    /// Bound admission queue waits; worker admit/evict exchanges finish separately
+    /// so a timed-out waiter cannot leave an unaccounted partially admitted shape.
+    pub const ANE_ADMISSION_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
     pub const ERR_ANE_RESOURCES_EXHAUSTED: &str = "ane_resources_exhausted";
     pub const ANE_RESOURCES_RETRY_AFTER_MS: u64 = 250;
     /// Lock file, relative to the home directory, held by the one module
@@ -3469,6 +3479,33 @@ pub mod ane_residency {
     pub trait AneShapeWorker: Send + Sync {
         /// Stable id of this worker; shapes are dropped per worker on restart.
         fn worker_id(&self) -> &str;
+        /// Full layer count reserved before compilation, from the model profile in
+        /// the repository's versioned bench/parity/models.json manifest.
+        fn executable_count(&self, model_ref: &str) -> Result<usize, AneResidencyError> {
+            static MANIFEST: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+            let manifest = MANIFEST.get_or_init(|| {
+                serde_json::from_str(include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../bench/parity/models.json"
+                )))
+                .expect("pinned parity manifest")
+            });
+            let profile = model_ref
+                .strip_prefix("ane-direct:")
+                .and_then(|value| value.split(':').next());
+            let layers = profile
+                .and_then(|profile| {
+                    let model = manifest["profiles"][profile]["model"].as_str()?;
+                    manifest["models"][model]["architecture"]["params"]["num_hidden_layers"]
+                        .as_u64()
+                })
+                .and_then(|layers| usize::try_from(layers).ok())
+                .filter(|layers| *layers > 0);
+            layers.ok_or_else(|| AneResidencyError::WorkerErr {
+                code: "model_unsupported".into(),
+                msg: "no pinned layer count for direct-ANE model reference".into(),
+            })
+        }
         /// Sends `ANE_ADMIT_SHAPE` and waits for `ADMITTED`.
         fn admit_shape<'a>(
             &'a self,
@@ -3533,6 +3570,7 @@ pub mod ane_residency {
         leases: u32,
         last_used: u64,
         inventory: Option<Arc<AnePlacementInventory>>,
+        executables: usize,
     }
 
     #[derive(Default)]
@@ -3551,6 +3589,11 @@ pub mod ane_residency {
         fn tick(&mut self) -> u64 {
             self.clock += 1;
             self.clock
+        }
+
+        fn reserved_executables(&self) -> usize {
+            // Admitting and evicting shapes retain their full reservation until the worker ack.
+            self.slots.values().map(|slot| slot.executables).sum()
         }
 
         fn model_count(&self, model_ref: &str) -> usize {
@@ -3584,6 +3627,8 @@ pub mod ane_residency {
 
     struct Inner {
         limits: AneResidencyLimits,
+        executable_budget: usize,
+        wait_timeout: std::time::Duration,
         state: Mutex<State>,
         changed: Notify,
         #[cfg(unix)]
@@ -3651,6 +3696,8 @@ pub mod ane_residency {
             Self {
                 inner: Arc::new(Inner {
                     limits,
+                    executable_budget: ANE_RESIDENT_EXECUTABLES_TOTAL,
+                    wait_timeout: ANE_ADMISSION_WAIT_TIMEOUT,
                     state: Mutex::new(State::default()),
                     changed: Notify::new(),
                     #[cfg(unix)]
@@ -3665,6 +3712,8 @@ pub mod ane_residency {
             Self {
                 inner: Arc::new(Inner {
                     limits,
+                    executable_budget: ANE_RESIDENT_EXECUTABLES_TOTAL,
+                    wait_timeout: ANE_ADMISSION_WAIT_TIMEOUT,
                     state: Mutex::new(State::default()),
                     changed: Notify::new(),
                     lane_lock: Some(lock),
@@ -3729,6 +3778,13 @@ pub mod ane_residency {
                 model_ref: model_ref.to_string(),
                 shape,
             };
+            let executables = worker.executable_count(model_ref)?;
+            if executables > self.inner.executable_budget {
+                return Err(resource_refusal(AneResidencyError::Channel(
+                    "shape exceeds executable budget".into(),
+                )));
+            }
+            let deadline = tokio::time::Instant::now() + self.inner.wait_timeout;
             let ticket = QueueTicket::enqueue(&self.inner);
             loop {
                 // Register for wakeups before reading the state, so a change
@@ -3736,7 +3792,7 @@ pub mod ane_residency {
                 let notified = self.inner.changed.notified();
                 tokio::pin!(notified);
                 notified.as_mut().enable();
-                match self.next_step(ticket.id, &key, worker) {
+                match self.next_step(ticket.id, &key, worker, executables) {
                     Step::Leased(lease) => return Ok(lease),
                     Step::Admit(slot_id) => return self.admit(worker.clone(), key, slot_id).await,
                     Step::Evict {
@@ -3746,7 +3802,13 @@ pub mod ane_residency {
                     } => {
                         self.evict(owner, key, slot_id).await;
                     }
-                    Step::Wait => notified.await,
+                    Step::Wait => {
+                        if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                            return Err(resource_refusal(AneResidencyError::Channel(
+                                "admission budget wait deadline exceeded".into(),
+                            )));
+                        }
+                    }
                 }
             }
         }
@@ -3799,7 +3861,13 @@ pub mod ane_residency {
                 .collect())
         }
 
-        fn next_step(&self, ticket: u64, key: &ShapeKey, worker: &Arc<dyn AneShapeWorker>) -> Step {
+        fn next_step(
+            &self,
+            ticket: u64,
+            key: &ShapeKey,
+            worker: &Arc<dyn AneShapeWorker>,
+            executables: usize,
+        ) -> Step {
             let mut state = self.inner.lock();
             if state.waiters.front() != Some(&ticket) {
                 return Step::Wait;
@@ -3824,7 +3892,9 @@ pub mod ane_residency {
             }
             let model_full = state.model_count(&key.model_ref) >= self.inner.limits.per_model;
             let total_full = state.slots.len() >= self.inner.limits.total;
-            if !model_full && !total_full {
+            let executable_full = state.reserved_executables().saturating_add(executables)
+                > self.inner.executable_budget;
+            if !model_full && !total_full && !executable_full {
                 state.next_slot += 1;
                 let id = state.next_slot;
                 state.slots.insert(
@@ -3836,6 +3906,7 @@ pub mod ane_residency {
                         leases: 0,
                         last_used: now,
                         inventory: None,
+                        executables,
                     },
                 );
                 state.waiters.pop_front();
@@ -4733,7 +4804,7 @@ pub mod ane_residency {
         }
         #[test]
         fn stress_schema_rejects_missing_counts_wrong_types_and_invalid_shapes() {
-            let valid = json!({"schema":1,"kind":"development","harness_profile":"debug","source_commit":"1".repeat(40),"machine":{"model_identifier":"test","platform_uuid":"test"},"os":{"version":"test","build":"test"},"load_1_5_15_start":[0,0,0],"load_1_5_15_end":[0,0,0],"request_count":37,"completed_count":37,"request_errors":[],"sample_count":1,"samples":[{"m":[128]}],"max_resident_per_model":1,"max_resident_total":1,"admitted_count":1,"evicted_count":0,"shape_not_admitted_count":0,"leased_evict_count":0,"no_ane_resources":{"count":0},"ane_lane_busy":{"status":"tested"},"metal_ranking_check":{"status":"skipped","reason":"test"},"reranker_pool_check":{"finite":"passed","byte_identical_repeats":"passed"}});
+            let valid = json!({"schema":1,"kind":"development","harness_profile":"debug","source_commit":"1".repeat(40),"machine":{"model_identifier":"test"},"os":{"version":"test","build":"test"},"load_1_5_15_start":[0,0,0],"load_1_5_15_end":[0,0,0],"request_count":37,"completed_count":37,"request_errors":[],"sample_count":1,"samples":[{"m":[128]}],"max_resident_per_model":1,"max_resident_total":1,"admitted_count":1,"evicted_count":0,"shape_not_admitted_count":0,"leased_evict_count":0,"no_ane_resources":{"count":0},"ane_lane_busy":{"status":"tested"},"metal_ranking_check":{"status":"skipped","reason":"test"},"reranker_pool_check":{"finite":"passed","byte_identical_repeats":"passed"}});
             let schema = stress_schema();
             assert!(schema_validate(&valid, &schema).is_ok());
             let mut missing = valid.clone();
@@ -4894,15 +4965,8 @@ pub mod ane_residency {
                 pool_results.iter().map(|entry| entry.0).collect::<Vec<_>>() == [128, 512, 2048];
             let clean = {
                 let ledger = ledger.lock().unwrap();
-                let uuid = output("ioreg", &["-rd1", "-c", "IOPlatformExpertDevice"])
-                    .lines()
-                    .find(|line| line.contains("IOPlatformUUID"))
-                    .unwrap()
-                    .split('"')
-                    .nth(3)
-                    .unwrap()
-                    .to_owned();
-                let report = json!({"schema":1, "kind":"development", "harness_profile":if cfg!(debug_assertions) {"debug"} else {"release"}, "source_commit":output("git", &["rev-parse", "HEAD"]), "machine":{"model_identifier":output("sysctl", &["-n", "hw.model"]), "platform_uuid":uuid}, "os":{"version":output("sw_vers", &["-productVersion"]), "build":output("sw_vers", &["-buildVersion"])}, "load_1_5_15_start":load_start, "load_1_5_15_end":load_averages(), "request_count":37, "completed_count":completed, "request_errors":errors, "sample_count":samples.len(), "samples":samples, "max_resident_per_model":stats.max_resident_per_model, "max_resident_total":stats.max_resident_total, "admitted_count":ledger.admitted, "evicted_count":ledger.evicted, "shape_not_admitted_count":ledger.shape_not_admitted, "leased_evict_count":ledger.leased_evicts, "no_ane_resources":{"count":ledger.no_ane_resources}, "ane_lane_busy":{"status":"covered_by_killed_holder_test"}, "metal_ranking_check":{"status":"skipped", "reason":"Metal rerank package/lane unavailable in isolated worktree; missing2048-rung parity fixture is a parity-crate follow-up"}, "reranker_pool_check":{"finite":if pool_passed {"passed"} else {"failed"}, "byte_identical_repeats":if pool_passed {"passed"} else {"failed"}, "scores_by_rung":pool_results.iter().map(|(shape, score)|json!({"shape":shape, "score":score})).collect::<Vec<_>>()}});
+
+                let report = json!({"schema":1, "kind":"development", "harness_profile":if cfg!(debug_assertions) {"debug"} else {"release"}, "source_commit":output("git", &["rev-parse", "HEAD"]), "machine":{"model_identifier":output("sysctl", &["-n", "hw.model"])}, "os":{"version":output("sw_vers", &["-productVersion"]), "build":output("sw_vers", &["-buildVersion"])}, "load_1_5_15_start":load_start, "load_1_5_15_end":load_averages(), "request_count":37, "completed_count":completed, "request_errors":errors, "sample_count":samples.len(), "samples":samples, "max_resident_per_model":stats.max_resident_per_model, "max_resident_total":stats.max_resident_total, "admitted_count":ledger.admitted, "evicted_count":ledger.evicted, "shape_not_admitted_count":ledger.shape_not_admitted, "leased_evict_count":ledger.leased_evicts, "no_ane_resources":{"count":ledger.no_ane_resources}, "ane_lane_busy":{"status":"covered_by_killed_holder_test"}, "metal_ranking_check":{"status":"skipped", "reason":"Metal rerank package/lane unavailable in isolated worktree; missing2048-rung parity fixture is a parity-crate follow-up"}, "reranker_pool_check":{"finite":if pool_passed {"passed"} else {"failed"}, "byte_identical_repeats":if pool_passed {"passed"} else {"failed"}, "scores_by_rung":pool_results.iter().map(|(shape, score)|json!({"shape":shape, "score":score})).collect::<Vec<_>>()}});
                 let out = std::env::var_os("ANE_STRESS_OUT")
                     .map(PathBuf::from)
                     .unwrap_or_else(|| {
@@ -5061,7 +5125,39 @@ pub mod ane_residency {
         use tokio::io::DuplexStream;
 
         const LAYERS: u32 = 4;
-        type Channel = Arc<AneWorkerChannel<DuplexStream>>;
+        struct MockChannel(AneWorkerChannel<DuplexStream>);
+        impl std::ops::Deref for MockChannel {
+            type Target = AneWorkerChannel<DuplexStream>;
+            fn deref(&self) -> &Self::Target {
+                &self.0
+            }
+        }
+        impl AneShapeWorker for MockChannel {
+            fn worker_id(&self) -> &str {
+                self.0.worker_id()
+            }
+            fn executable_count(&self, _: &str) -> Result<usize, AneResidencyError> {
+                Ok(LAYERS as usize)
+            }
+            fn admit_shape<'a>(
+                &'a self,
+                model_ref: &'a str,
+                shape: usize,
+            ) -> BoxFuture<'a, Result<AnePlacementInventory, AneResidencyError>> {
+                self.0.admit_shape(model_ref, shape)
+            }
+            fn evict_shape<'a>(
+                &'a self,
+                model_ref: &'a str,
+                shape: usize,
+            ) -> BoxFuture<'a, Result<(), AneResidencyError>> {
+                self.0.evict_shape(model_ref, shape)
+            }
+            fn restart(&self) -> BoxFuture<'_, Result<(), AneResidencyError>> {
+                self.0.restart()
+            }
+        }
+        type Channel = Arc<MockChannel>;
 
         /// What the mock workers observe, kept independently of the
         /// supervisor's own accounting so the budget checks can fail.
@@ -5252,6 +5348,153 @@ pub mod ane_residency {
             }
         }
 
+        fn budget_supervisor(budget: usize, wait: Duration) -> AneResidencySupervisor {
+            let mut supervisor = AneResidencySupervisor::new(AneResidencyLimits::default());
+            let inner = Arc::get_mut(&mut supervisor.inner).unwrap();
+            inner.executable_budget = budget;
+            inner.wait_timeout = wait;
+            supervisor
+        }
+
+        #[tokio::test]
+        async fn executable_budget_refuses_before_hardware_limit() {
+            let ledger = Arc::new(Mutex::new(Ledger::default()));
+            let worker: Arc<dyn AneShapeWorker> = mock_channel("worker", &ledger).await;
+            let supervisor = budget_supervisor(7, Duration::from_millis(20));
+            let protected = supervisor.lease(&worker, "model", 128).await.unwrap();
+            let result = supervisor.lease(&worker, "model", 256).await;
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("budget sent an over-budget shape to hardware"),
+            };
+            assert_eq!(error.code(), Some(ERR_ANE_RESOURCES_EXHAUSTED));
+            let data = ledger.lock().unwrap();
+            assert_eq!(data.admit_attempts.len(), 1);
+            assert!(!data.admit_attempts.contains_key(&("model".into(), 256)));
+            assert_eq!(supervisor.inner.lock().reserved_executables(), 4);
+            drop(data);
+            drop(protected);
+        }
+
+        #[tokio::test]
+        async fn pending_compiles_reserve_full_executable_budget() {
+            let ledger = Arc::new(Mutex::new(Ledger::default()));
+            let worker: Arc<dyn AneShapeWorker> = mock_channel("worker", &ledger).await;
+            let supervisor = budget_supervisor(7, Duration::from_secs(1));
+            let first = ShapeKey {
+                model_ref: "model".into(),
+                shape: 128,
+            };
+            let second = ShapeKey {
+                model_ref: "model".into(),
+                shape: 256,
+            };
+            let first_ticket = QueueTicket::enqueue(&supervisor.inner);
+            assert!(matches!(
+                supervisor.next_step(first_ticket.id, &first, &worker, 4),
+                Step::Admit(_)
+            ));
+            assert_eq!(
+                supervisor.inner.lock().slots[&first].state,
+                SlotState::Admitting
+            );
+            let second_ticket = QueueTicket::enqueue(&supervisor.inner);
+            assert!(
+                matches!(
+                    supervisor.next_step(second_ticket.id, &second, &worker, 4),
+                    Step::Wait
+                ),
+                "pending compile's four layers must prevent another four-layer reservation"
+            );
+            assert_eq!(supervisor.inner.lock().reserved_executables(), 4);
+            assert!(ledger.lock().unwrap().admit_attempts.is_empty());
+        }
+
+        #[tokio::test]
+        async fn executable_budget_waits_then_succeeds_when_lease_releases() {
+            let ledger = Arc::new(Mutex::new(Ledger::default()));
+            let worker: Arc<dyn AneShapeWorker> = mock_channel("worker", &ledger).await;
+            let supervisor = budget_supervisor(7, Duration::from_secs(1));
+            let protected = supervisor.lease(&worker, "model", 128).await.unwrap();
+            let task = tokio::spawn({
+                let supervisor = supervisor.clone();
+                let worker = worker.clone();
+                async move { supervisor.lease(&worker, "model", 256).await }
+            });
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while supervisor.inner.lock().waiters.is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(!task.is_finished());
+            assert!(!ledger
+                .lock()
+                .unwrap()
+                .admit_attempts
+                .contains_key(&("model".into(), 256)));
+            drop(protected);
+            let lease = tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let data = ledger.lock().unwrap();
+            assert!(data.events.contains(&"evict model 128".into()));
+            assert!(data.resident.contains(&("model".into(), 256)));
+            assert_eq!(data.leased_evicts, 0);
+            drop(data);
+            drop(lease);
+        }
+
+        #[tokio::test]
+        async fn admission_wait_deadline_is_transient_and_cleans_queue() {
+            let ledger = Arc::new(Mutex::new(Ledger::default()));
+            let worker: Arc<dyn AneShapeWorker> = mock_channel("worker", &ledger).await;
+            let supervisor = budget_supervisor(4, Duration::from_millis(20));
+            let protected = supervisor.lease(&worker, "model", 128).await.unwrap();
+            let error = match supervisor.lease(&worker, "model", 256).await {
+                Err(error) => error,
+                Ok(_) => panic!("leased budget must time out"),
+            };
+            let mapped = error.to_engine_error(synapse_core::EngineErrorStage::Load);
+            assert_eq!(mapped.retry_after_ms, Some(250));
+            assert!(mapped.safe_to_retry_same_request);
+            assert!(supervisor.inner.lock().waiters.is_empty());
+            assert_eq!(supervisor.resident_shapes()["model"], vec![128]);
+            assert_eq!(supervisor.stats().restarts, 0);
+            drop(protected);
+            drop(supervisor.lease(&worker, "model", 256).await.unwrap());
+        }
+
+        #[tokio::test]
+        async fn pinned_layer_counts_charge_gte_and_qwen_before_admission() {
+            let ledger = Arc::new(Mutex::new(Ledger::default()));
+            let channel = mock_channel("worker", &ledger).await;
+            for (slug, count) in [
+                ("gte-modernbert-base", 22),
+                ("gte-reranker-modernbert-base", 22),
+                ("qwen3-embedding-0.6b", 28),
+                ("qwen3-reranker-0.6b", 28),
+            ] {
+                assert_eq!(
+                    channel
+                        .0
+                        .executable_count(&format!(
+                            "ane-direct:{slug}.ane-direct-worker:sha256:placeholder"
+                        ))
+                        .unwrap(),
+                    count
+                );
+            }
+            assert_eq!(
+                channel.0.executable_count("unknown").unwrap_err().code(),
+                Some("model_unsupported")
+            );
+            assert!(ledger.lock().unwrap().admit_attempts.is_empty());
+        }
+
         #[tokio::test]
         async fn resource_exhaustion_evicts_cross_worker_lru_and_retries_once_without_restart() {
             let ledger = Arc::new(Mutex::new(Ledger::default()));
@@ -5393,11 +5636,11 @@ pub mod ane_residency {
                     Ok(host)
                 })
             });
-            Arc::new(
+            Arc::new(MockChannel(
                 AneWorkerChannel::connect(worker_id, DEFAULT_MAX_FRAME_BYTES, connect)
                     .await
                     .unwrap(),
-            )
+            ))
         }
 
         /// One embed request over sequences of `lengths` tokens, run rung by
