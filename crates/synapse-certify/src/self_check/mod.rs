@@ -125,6 +125,49 @@ mod tests {
             assert!(load(profile).is_ok(), "{profile}");
         }
     }
+    /// The load-time seal only proves each subset matches its own recorded
+    /// digest. This ties the subset to the sealed parity corpus it claims to
+    /// come from: every metadata field and every case must be byte-for-byte
+    /// what the source fixture holds, so a hand-edited subset (with its digest
+    /// re-recorded) can't pass as a parity reference.
+    #[test]
+    fn subsets_are_exact_copies_of_the_sealed_source_cases() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bench/parity");
+        let source_index: Value = serde_json::from_slice(SOURCE_INDEX).unwrap();
+        let index: Value = serde_json::from_slice(INDEX).unwrap();
+        for model in [
+            "gte-modernbert-base",
+            "gte-reranker-modernbert-base",
+            "qwen3-embedding-0.6b",
+            "qwen3-reranker-0.6b",
+        ] {
+            let fixture_id = index[model]["fixture_set_id"].as_str().unwrap();
+            let entry = &source_index[fixture_id];
+            let source_bytes = std::fs::read(root.join(entry["path"].as_str().unwrap())).unwrap();
+            assert_eq!(
+                sha256_hex(&source_bytes),
+                entry["sha256"].as_str().unwrap(),
+                "{model}: source fixture digest"
+            );
+            let source: Value = serde_json::from_slice(&source_bytes).unwrap();
+            let subset: Value = serde_json::from_slice(bytes(model).unwrap()).unwrap();
+            for (key, value) in subset.as_object().unwrap() {
+                if key != "cases" {
+                    assert_eq!(value, &source[key], "{model}: field {key}");
+                }
+            }
+            let source_cases = source["cases"].as_array().unwrap();
+            for case in subset["cases"].as_array().unwrap() {
+                let id = case["id"].as_str().unwrap();
+                let original = source_cases
+                    .iter()
+                    .find(|candidate| candidate["id"] == id)
+                    .unwrap_or_else(|| panic!("{model}: case {id} is not in the source corpus"));
+                assert_eq!(case, original, "{model}: case {id}");
+            }
+        }
+    }
+
     #[test]
     fn tampered_subset_digest_refuses_and_names_profile() {
         let profile = "qwen3-reranker-0.6b.owned-metal";
