@@ -3719,10 +3719,16 @@ fn certify_observations(state: Arc<ModuleState>) -> HandlerOutcome {
     result_outcome(certify_worker_snapshot(&state.runtime))
 }
 
-// Until worker-host observation hooks are connected, explicitly report unavailable
-// rather than let empty inventories or counts masquerade as measured evidence.
-fn certify_worker_snapshot(_runtime: &RuntimeState) -> Value {
-    json!({"inventories": [], "worker_requests": {}, "available": false})
+// In-process Metal has no worker IPC, so its empty snapshot is complete. The
+// temporary worker implementation reports unavailable instead of claiming that
+// unconnected host request counters and ADMITTED capture contain no events.
+fn certify_worker_snapshot(runtime: &RuntimeState) -> Value {
+    let models = runtime.loaded_models();
+    let in_process = !models.is_empty()
+        && models
+            .iter()
+            .all(|model| matches!(&model.backend, EmbedBackend::Owned(_)));
+    json!({"inventories": [], "worker_requests": {}, "admitted_count": 0, "available": in_process})
 }
 
 async fn dispatch_request(
@@ -8933,7 +8939,7 @@ async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
         if let Some(profile_id) = model.engine_identity.build_flags.get("profile") {
             if let Ok(profile) = CatalogProfile::load(profile_id) {
                 let readout = &profile.model()["grammar"]["readout"];
-                if !readout.is_null() {
+                if readout["yes"]["id"].is_u64() && readout["no"]["id"].is_u64() {
                     observation["readout_ids"] = json!([readout["yes"]["id"], readout["no"]["id"]]);
                 }
             }
@@ -16527,6 +16533,20 @@ mod tests {
         super::attach_certify_observation(&mut response, None);
         assert_eq!(serde_json::to_vec(&response).unwrap(), before);
         assert!(!super::ModuleConfig::default().certify_observation);
+    }
+
+    #[test]
+    fn certify_observation_query_refuses_when_disabled() {
+        let (root, descriptor) = test_storage_descriptor("certify-disabled");
+        let store = Arc::new(SynapseStore::open(&descriptor).unwrap());
+        let profile = test_machine_profile("certify-disabled-os");
+        store.observe_profile(&profile, 10, 1).unwrap();
+        let state = test_module_state(store, profile);
+        let HandlerOutcome::Error { code, .. } = certify_observations(state) else {
+            panic!("disabled observation must refuse");
+        };
+        assert_eq!(code, "certify_observation_disabled");
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

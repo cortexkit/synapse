@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
 pub mod command;
+pub mod live;
 
 pub const ROWS: [&str; 8] = [
     "vulkan-windows-amd",
@@ -223,6 +224,9 @@ pub struct RunEvidence {
     pub admission: Admission,
     pub layer_count: usize,
     pub inventories: Vec<Inventory>,
+    /// Supervisor admission events counted separately from the captured inventories,
+    /// so an omitted inventory cannot silently reduce both counts.
+    pub admitted_count: usize,
     pub raw_series: Option<RawSeries>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -311,10 +315,11 @@ pub fn produce(runner: &mut impl Runner, assets: &Path, row: &str, model: &str) 
         failures: vec!["no parity output".into()],
     });
     let placement_ok = row != "ane-m5"
-        || evidence
-            .inventories
-            .iter()
-            .all(|i| i.passed(evidence.layer_count, model));
+        || (evidence.inventories.len() == evidence.admitted_count
+            && evidence
+                .inventories
+                .iter()
+                .all(|i| i.passed(evidence.layer_count, model)));
     if !placement_ok {
         return Err(refuse("placement inventory failed"));
     }
@@ -338,7 +343,16 @@ pub fn produce(runner: &mut impl Runner, assets: &Path, row: &str, model: &str) 
             || !evidence.admission.passed()
             || (row == "ane-m5" && evidence.inventories.is_empty()))
     {
-        return Err(refuse("floor, parity or admission failed"));
+        let gate = if !floor_ok {
+            "floor"
+        } else if !parity.passed() {
+            "parity"
+        } else if !evidence.admission.passed() {
+            "admission"
+        } else {
+            "placement inventory"
+        };
+        return Err(refuse(format!("{gate} gate failed")));
     }
     let required_worker = if row.starts_with("cuda-") {
         Some("ck-synapse-worker-cuda")

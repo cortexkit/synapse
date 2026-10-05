@@ -3,14 +3,22 @@ use crate::{refuse, validate_checkout, Result};
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-pub const LIVE_RUNNER_MISSING: &str = "live runner not yet integrated: needs module sequence_too_long, preload profiles, ane-direct routing and the Metal Qwen reranker";
+pub const LIVE_OPTIONS_MISSING: &str =
+    "certify run requires --assets <extracted-dir> --checkout <root> --weights <model-dir>";
 
-pub const USAGE: &str = "usage: ck-synapse certify run --row <row-id> --model <slug> | ck-synapse certify validate --assets <dir> <checkout-root>";
+pub const USAGE: &str = "usage: ck-synapse certify run --row <row-id> --model <slug> --assets <extracted-dir> --checkout <root> --weights <model-dir> | ck-synapse certify validate --assets <dir> <checkout-root>";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
-    Run { row: String, model: String },
-    Validate { assets: PathBuf, checkout: PathBuf },
+    Run {
+        row: String,
+        model: String,
+        options: Option<crate::live::Options>,
+    },
+    Validate {
+        assets: PathBuf,
+        checkout: PathBuf,
+    },
 }
 
 pub fn parse(arguments: &[OsString]) -> Result<Option<Command>> {
@@ -19,9 +27,12 @@ pub fn parse(arguments: &[OsString]) -> Result<Option<Command>> {
     }
     let bad = || refuse(USAGE);
     match arguments.get(1).and_then(|s| s.to_str()) {
-        Some("run") if arguments.len() == 6 => {
+        Some("run") if arguments.len() >= 6 && arguments.len().is_multiple_of(2) => {
             let mut row = None;
             let mut model = None;
+            let mut assets = None;
+            let mut checkout = None;
+            let mut weights = None;
             for pair in arguments[2..].as_chunks::<2>().0 {
                 let value = pair[1]
                     .to_str()
@@ -30,13 +41,31 @@ pub fn parse(arguments: &[OsString]) -> Result<Option<Command>> {
                 match pair[0].to_str() {
                     Some("--row") if row.is_none() => row = Some(value.to_string()),
                     Some("--model") if model.is_none() => model = Some(value.to_string()),
+                    Some("--assets") if assets.is_none() => assets = Some(PathBuf::from(value)),
+                    Some("--checkout") if checkout.is_none() => {
+                        checkout = Some(PathBuf::from(value))
+                    }
+                    Some("--weights") if weights.is_none() => weights = Some(PathBuf::from(value)),
                     _ => return Err(bad()),
                 }
             }
             let row = row.ok_or_else(bad)?;
             let model = model.ok_or_else(bad)?;
             crate::combination(&row, &model)?;
-            Ok(Some(Command::Run { row, model }))
+            let options = match (assets, checkout, weights) {
+                (Some(assets), Some(checkout), Some(weights)) => Some(crate::live::Options {
+                    assets,
+                    checkout,
+                    weights,
+                }),
+                (None, None, None) => None,
+                _ => return Err(refuse(LIVE_OPTIONS_MISSING)),
+            };
+            Ok(Some(Command::Run {
+                row,
+                model,
+                options,
+            }))
         }
         Some("validate") if arguments.len() == 5 && arguments[2] == "--assets" => {
             if arguments[3..]
@@ -56,7 +85,31 @@ pub fn parse(arguments: &[OsString]) -> Result<Option<Command>> {
 
 pub fn dispatch(command: Command, source: Option<&str>) -> Result<serde_json::Value> {
     match command {
-        Command::Run { .. } => Err(refuse(LIVE_RUNNER_MISSING)),
+        Command::Run {
+            row,
+            model,
+            options,
+        } => {
+            let options = options.ok_or_else(|| refuse(LIVE_OPTIONS_MISSING))?;
+            let source = source.ok_or_else(|| refuse("candidate was built from a dirty tree or without git; evidence cannot be bound to a commit"))?;
+            let candidate = options
+                .assets
+                .join(format!("ck-synapse{}", std::env::consts::EXE_SUFFIX));
+            let executable = std::env::current_exe().map_err(|error| refuse(error.to_string()))?;
+            if synapse_parity::canonical::sha256_file(&candidate)
+                .map_err(|error| refuse(error.to_string()))?
+                != synapse_parity::canonical::sha256_file(&executable)
+                    .map_err(|error| refuse(error.to_string()))?
+            {
+                return Err(refuse(
+                    "executing producer does not match the named candidate ck-synapse",
+                ));
+            }
+            let mut runner = crate::live::LiveRunner::new(options.clone(), source)?;
+            let record = crate::produce(&mut runner, &options.assets, &row, &model)?;
+            crate::write_record(&record, &options.checkout)?;
+            serde_json::to_value(record).map_err(|error| refuse(error.to_string()))
+        }
         Command::Validate { assets, checkout } => {
             let source = source.ok_or_else(|| refuse("candidate was built from a dirty tree or without git; evidence cannot be bound to a commit"))?;
             let eligible = validate_checkout(&checkout, &assets, source)?;
@@ -95,7 +148,7 @@ mod tests {
         assert_eq!(parse(&args(&["restore-import"])).unwrap(), None);
     }
     #[test]
-    fn run_refuses_missing_live_runner() {
+    fn run_requires_candidate_paths() {
         let command = parse(&args(&[
             "certify",
             "run",
@@ -108,7 +161,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             dispatch(command, None).unwrap_err().to_string(),
-            format!("certification_refused: {LIVE_RUNNER_MISSING}")
+            format!("certification_refused: {LIVE_OPTIONS_MISSING}")
         );
     }
     #[test]

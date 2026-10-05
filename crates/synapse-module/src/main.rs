@@ -28,7 +28,12 @@ async fn main() {
             } else {
                 None
             };
-            match synapse_certify::command::dispatch(command, source) {
+            match tokio::task::spawn_blocking(move || {
+                synapse_certify::command::dispatch(command, source)
+            })
+            .await
+            .expect("certification runner task panicked")
+            {
                 Ok(report) => println!("{report}"),
                 Err(error) => {
                     eprintln!("{error}");

@@ -6601,7 +6601,12 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "subc-daemon",
+ "subc-protocol",
+ "subc-transport",
+ "synapse-parity",
  "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]

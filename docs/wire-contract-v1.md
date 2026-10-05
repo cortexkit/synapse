@@ -173,7 +173,7 @@ The management registry in this snapshot is `embed.query`, `embed.batch`,
 `models.download`, `models.download.cancel`, `models.remove`, `probe.start`,
 `probe.status`, `probe.report`, `aliases.check_index`, `alias.retract`,
 `alias.declare`, `cache.pin`, `cache.gc`, `admission.status`,
-`approvals.migrate_owned_decode`, `approvals.enable`, `approvals.disable`, and
+`approvals.migrate_owned_decode`, `approvals.enable`, `approvals.disable`,
 `approvals.emergency_rollback`, and `certify.observations`.
 
 - **certify.observations** {} — query, certification-only surface. Consumers

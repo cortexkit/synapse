@@ -91,6 +91,7 @@ fn evidence(model: &str) -> RunEvidence {
         parity: Some(p),
         admission: admission(),
         layer_count: 2,
+        admitted_count: 1,
         inventories: vec![Inventory {
             executables: vec![Executable {
                 id: "graph".into(),
@@ -273,6 +274,7 @@ fn missing_parity_drops_only_qwen_ane_and_parity_precedes_latency() {
         let mut mock = runner(model);
         mock.evidence.parity = None;
         mock.evidence.inventories.clear();
+        mock.evidence.admitted_count = 0;
         mock.evidence.raw_series = Some(series(4.0));
         let result = produce(&mut mock, &assets.0, "ane-m5", model);
         if model.starts_with("qwen3-") {
@@ -454,4 +456,23 @@ fn producer_latency_drop_is_strictly_above_three() {
         assert_eq!(record.status, "dropped", "{model} above 3x");
         assert_eq!(record.drop_cause.as_deref(), Some("latency"));
     }
+}
+
+#[test]
+fn serialized_inventory_omission_fails_placement_gate() {
+    let assets = Assets::new();
+    let mut mock = runner(MODELS[0]);
+    mock.evidence
+        .inventories
+        .push(mock.evidence.inventories[0].clone());
+    mock.evidence.admitted_count = 2;
+    assert!(produce(&mut mock, &assets.0, "ane-m5", MODELS[0]).is_ok());
+    let mut serialized = serde_json::to_value(&mock.evidence).unwrap();
+    serialized["inventories"].as_array_mut().unwrap().pop();
+    mock.evidence = serde_json::from_value(serialized).unwrap();
+    let error = produce(&mut mock, &assets.0, "ane-m5", MODELS[0]).unwrap_err();
+    assert!(
+        error.to_string().contains("placement inventory failed"),
+        "{error}"
+    );
 }

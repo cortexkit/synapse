@@ -13,30 +13,34 @@ Artifact paths are relative to the extracted candidate asset directory, not ZIP 
 validator hashes the files themselves. Only passed combinations appear in the
 returned `eligible` list.
 
-`ck-synapse certify run --row <row-id> --model <slug>` currently refuses with
-`certification_refused: live runner not yet integrated: needs module
-sequence_too_long, preload profiles, ane-direct routing and the Metal Qwen
-reranker`. It creates no record. The `Runner` trait is the seam for the future
-live implementation. The CLI does not accept observations from an external
-program or environment-variable-selected evidence provider.
+`ck-synapse certify run --row <row-id> --model <slug> --assets <extracted-dir>
+--checkout <root> --weights <pinned-model-dir>` executes the named candidate
+asset directory's `ck-synapse` and row worker, never a Cargo-built fallback.
+It starts a private in-process daemon with isolated config, leases and store.
+The generated config selects one `<slug>.<lane>` preload profile from
+`bench/parity/models.json`, pinning the model's numeric execution settings for
+the requested hardware lane, and enables the
+certification-only observation surface. Normal consumer configurations leave it
+inactive. The weights directory contains the original pinned checkpoint files;
+the runner checks them and converts worker profiles with the existing converter.
 
-The live-runner follow-up must:
+The runner sends the committed fixture source text through module tokenization,
+using batch-one requests (also consecutive single-candidate chunks for ranking
+pools), and grades observed outputs with the existing parity evaluator. It
+collects engine-bound IDs, readout IDs, all ADMITTED inventories, an independent
+supervisor admission count and actual worker request counts. Inventory omissions
+fail the producer placement gate. Metal never invokes a floor probe; other rows
+execute their candidate worker's probe. Qwen ANE latency series use three
+warmups and twenty measured 512-token batch-one calls in the same session as the
+Metal reference series. A gate failure writes nothing except for the authorized
+Qwen ANE drop cases. Records are written atomically at their canonical paths.
 
-- Spawn the extracted candidate module and sibling workers via a scratch
-  in-process daemon and construct preload configs from the manifest, packages,
-  and the committed row defaults.
-- Obtain final composed input IDs and actual Qwen readout IDs from execution,
-  not from the expected fixture IDs or manifest alone, and feed actual outputs
-  into the parity evaluator.
-- Observe every ADMITTED inventory and per-lane sent-request count; prove that
-  8193 returns `sequence_too_long` without any worker request and 8192 is
-  processed without truncation or job diversion.
-- Probe each non-Metal row on its extracted worker, obtain real machine
-  identifiers, hash every executed binary and Windows CUDA runtime DLL, and
-  collect same-session 512-token batch-1 latency series where applicable.
-- Reap the module, workers and daemon on every exit path, and cover the live
-  Metal path with a macOS wire test. Observation mode must remain disabled for
-  ordinary consumer traffic.
+Non-Apple machine identification uses `nvidia-smi` for CUDA or the selected
+adapter in `vulkaninfo --summary` for Vulkan. Rented-machine operators must set
+`SYNAPSE_CERTIFY_INSTANCE_ID`. Missing identifiers refuse rather than invent
+identity. Generated run state and hardware-test output live in ignored `.live/`.
+The ignored Mac hardware test accepts `SYNAPSE_CERTIFY_CANDIDATE`, the release
+candidate `ck-synapse` path, and prints the canonical record verbatim.
 
 Records carry only the specified schema-1 fields. Parity is the evaluator's JSON output, with
 its identity, fixture set, metrics and boolean gate results. Admission outcomes
@@ -51,5 +55,5 @@ recomputed ratio strictly greater than three. Producer placement failures never
 justify a drop.
 
 Run `cargo test -p synapse-certify` for the synthetic contract fixtures. These
-prove decisions and validation, not hardware parity or the unintegrated live
-runner.
+prove decisions and validation, not hardware parity. Run the ignored hardware
+test explicitly on the named machine to certify a real candidate.
