@@ -21,3 +21,11 @@ Safe refund mutation: staged the live implementation and confirmed empty `git di
 ## Hardware regression
 
 The full real-worker stress test, not a unit assertion about syntactic pool placement, is the reclamation regression guard. Prebuild the worker and module driver before waiting for unitless macOS load averages below16 over one minute and below20 over five minutes. Record the fresh JSON separately. At this commit the post-fix stress run is pending.
+
+## Low-load post-fix stress result: FAILED on queue deadlines
+
+`stress-pooled-live100-development.json` records commit `6f6abcf0a7e70aa637f4dca80e2253a7d66dc1d7`, Mac17,6, OS27.0.1/build26A434, debug. Start 1-/5-/15-minute macOS load averages **13.39/19.37/25.62** passed both gates; end **17.66/26.82/28.80**. Production's Core ML GTE lane was reported resident by the operator and was not modified. The launcher waited approximately81minutes for a quiet start; the actual hardware test ran1094.94seconds. All processes started for the run have exited; no background measurement remains.
+
+JSON summary: **37 requests,8 completed,29 failed**, all29 failures exactly `admission budget wait deadline exceeded` with250ms retry. **No hardware `no ANE resources` errors**, no nonresident inference errors, no leased eviction. Eight shape admissions, five completed evictions, thirteen residency samples, peak two shapes per model/three overall. The reranker finite/repeat checks did not complete successfully; Metal ranking remains explicitly skipped because its package/lane is unavailable.
+
+This is not a passing hardware regression. The original pre-fix flood failed33 of37 requests while loading layer0 with `Program load failed — no ANE resources`, underlying0x5. This run instead failed only on the admission queue's wait deadline: pooled reclamation has avoided all observed hardware resource refusals, but the37-way cold/debug flood exceeds the unchanged600-second admission wait deadline. No timeout or success assertion was relaxed to turn this run green. A separate decision is needed on cold-start stress scheduling/deadline policy before another run; the evidence does not establish37-request acceptance or a release-quality throughput claim.

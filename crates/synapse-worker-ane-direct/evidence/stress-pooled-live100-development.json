@@ -1,0 +1,194 @@
+{
+  "admitted_count": 8,
+  "ane_lane_busy": {
+    "status": "covered_by_killed_holder_test"
+  },
+  "completed_count": 8,
+  "evicted_count": 5,
+  "harness_profile": "debug",
+  "kind": "development",
+  "leased_evict_count": 0,
+  "load_1_5_15_end": [
+    17.66,
+    26.82,
+    28.8
+  ],
+  "load_1_5_15_start": [
+    13.39,
+    19.37,
+    25.62
+  ],
+  "machine": {
+    "model_identifier": "Mac17,6"
+  },
+  "max_resident_per_model": 2,
+  "max_resident_total": 3,
+  "metal_ranking_check": {
+    "reason": "Metal rerank package/lane unavailable in isolated worktree; missing2048-rung parity fixture is a parity-crate follow-up",
+    "status": "skipped"
+  },
+  "no_ane_resources": {
+    "count": 0
+  },
+  "os": {
+    "build": "26A434",
+    "version": "27.0.1"
+  },
+  "request_count": 37,
+  "request_errors": [
+    "Ok(Err(ResourcesExhausted { msg: \"direct-ANE worker channel: admission budget wait deadline exceeded\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"direct-ANE worker channel: admission budget wait deadline exceeded\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"direct-ANE worker channel: admission budget wait deadline exceeded\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"direct-ANE worker channel: admission budget wait deadline exceeded\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"direct-ANE worker channel: admission budget wait deadline exceeded\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"direct-ANE worker channel: admission budget wait deadline exceeded\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"direct-ANE worker channel: admission budget wait deadline exceeded\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"direct-ANE worker channel: admission budget wait deadline exceeded\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"direct-ANE worker channel: admission budget wait deadline exceeded\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"direct-ANE worker channel: admission budget wait deadline exceeded\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"direct-ANE worker channel: admission budget wait deadline exceeded\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"direct-ANE worker channel: admission budget wait deadline exceeded\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"direct-ANE worker channel: admission budget wait deadline exceeded\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"direct-ANE worker channel: admission budget wait deadline exceeded\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"direct-ANE worker channel: admission budget wait deadline exceeded\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"direct-ANE worker channel: admission budget wait deadline exceeded\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"direct-ANE worker channel: admission budget wait deadline exceeded\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"direct-ANE worker channel: admission budget wait deadline exceeded\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"direct-ANE worker channel: admission budget wait deadline exceeded\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"direct-ANE worker channel: admission budget wait deadline exceeded\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"direct-ANE worker channel: admission budget wait deadline exceeded\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"direct-ANE worker channel: admission budget wait deadline exceeded\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"direct-ANE worker channel: admission budget wait deadline exceeded\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"direct-ANE worker channel: admission budget wait deadline exceeded\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"direct-ANE worker channel: admission budget wait deadline exceeded\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"direct-ANE worker channel: admission budget wait deadline exceeded\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"direct-ANE worker channel: admission budget wait deadline exceeded\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"direct-ANE worker channel: admission budget wait deadline exceeded\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"direct-ANE worker channel: admission budget wait deadline exceeded\", retry_after_ms: 250 }))"
+  ],
+  "reranker_pool_check": {
+    "byte_identical_repeats": "failed",
+    "finite": "failed",
+    "scores_by_rung": []
+  },
+  "sample_count": 13,
+  "samples": [
+    {
+      "ane-direct:gte-reranker-modernbert-base.ane-direct-worker:sha256:2ecb952868e28ed5a45c3f5c057e0f6d46df384ba540e1f05113462fd0d6a1de": [
+        4096
+      ],
+      "ane-direct:qwen3-embedding-0.6b.ane-direct-worker:sha256:1af6d091d7d5f21a998af0f438333d9af051c82af8b27bd2439c60efa09bd5db": [
+        256
+      ],
+      "ane-direct:qwen3-reranker-0.6b.ane-direct-worker:sha256:cc02357cfc81a92562b251914bed5c8d3960b7edf4814ee73de9f21611e22959": [
+        128
+      ]
+    },
+    {
+      "ane-direct:qwen3-embedding-0.6b.ane-direct-worker:sha256:1af6d091d7d5f21a998af0f438333d9af051c82af8b27bd2439c60efa09bd5db": [
+        256
+      ],
+      "ane-direct:qwen3-reranker-0.6b.ane-direct-worker:sha256:cc02357cfc81a92562b251914bed5c8d3960b7edf4814ee73de9f21611e22959": [
+        128
+      ]
+    },
+    {
+      "ane-direct:qwen3-embedding-0.6b.ane-direct-worker:sha256:1af6d091d7d5f21a998af0f438333d9af051c82af8b27bd2439c60efa09bd5db": [
+        256,
+        4096
+      ],
+      "ane-direct:qwen3-reranker-0.6b.ane-direct-worker:sha256:cc02357cfc81a92562b251914bed5c8d3960b7edf4814ee73de9f21611e22959": [
+        128
+      ]
+    },
+    {
+      "ane-direct:qwen3-embedding-0.6b.ane-direct-worker:sha256:1af6d091d7d5f21a998af0f438333d9af051c82af8b27bd2439c60efa09bd5db": [
+        256,
+        4096
+      ],
+      "ane-direct:qwen3-reranker-0.6b.ane-direct-worker:sha256:cc02357cfc81a92562b251914bed5c8d3960b7edf4814ee73de9f21611e22959": [
+        128
+      ]
+    },
+    {
+      "ane-direct:qwen3-embedding-0.6b.ane-direct-worker:sha256:1af6d091d7d5f21a998af0f438333d9af051c82af8b27bd2439c60efa09bd5db": [
+        256,
+        4096
+      ],
+      "ane-direct:qwen3-reranker-0.6b.ane-direct-worker:sha256:cc02357cfc81a92562b251914bed5c8d3960b7edf4814ee73de9f21611e22959": [
+        128
+      ]
+    },
+    {
+      "ane-direct:qwen3-embedding-0.6b.ane-direct-worker:sha256:1af6d091d7d5f21a998af0f438333d9af051c82af8b27bd2439c60efa09bd5db": [
+        4096
+      ],
+      "ane-direct:qwen3-reranker-0.6b.ane-direct-worker:sha256:cc02357cfc81a92562b251914bed5c8d3960b7edf4814ee73de9f21611e22959": [
+        128
+      ]
+    },
+    {
+      "ane-direct:qwen3-embedding-0.6b.ane-direct-worker:sha256:1af6d091d7d5f21a998af0f438333d9af051c82af8b27bd2439c60efa09bd5db": [
+        4096
+      ],
+      "ane-direct:qwen3-reranker-0.6b.ane-direct-worker:sha256:cc02357cfc81a92562b251914bed5c8d3960b7edf4814ee73de9f21611e22959": [
+        128,
+        4096
+      ]
+    },
+    {
+      "ane-direct:qwen3-embedding-0.6b.ane-direct-worker:sha256:1af6d091d7d5f21a998af0f438333d9af051c82af8b27bd2439c60efa09bd5db": [
+        4096
+      ],
+      "ane-direct:qwen3-reranker-0.6b.ane-direct-worker:sha256:cc02357cfc81a92562b251914bed5c8d3960b7edf4814ee73de9f21611e22959": [
+        4096
+      ]
+    },
+    {
+      "ane-direct:qwen3-reranker-0.6b.ane-direct-worker:sha256:cc02357cfc81a92562b251914bed5c8d3960b7edf4814ee73de9f21611e22959": [
+        4096,
+        8192
+      ]
+    },
+    {
+      "ane-direct:gte-reranker-modernbert-base.ane-direct-worker:sha256:2ecb952868e28ed5a45c3f5c057e0f6d46df384ba540e1f05113462fd0d6a1de": [
+        512
+      ],
+      "ane-direct:qwen3-reranker-0.6b.ane-direct-worker:sha256:cc02357cfc81a92562b251914bed5c8d3960b7edf4814ee73de9f21611e22959": [
+        4096,
+        8192
+      ]
+    },
+    {
+      "ane-direct:gte-reranker-modernbert-base.ane-direct-worker:sha256:2ecb952868e28ed5a45c3f5c057e0f6d46df384ba540e1f05113462fd0d6a1de": [
+        512
+      ],
+      "ane-direct:qwen3-reranker-0.6b.ane-direct-worker:sha256:cc02357cfc81a92562b251914bed5c8d3960b7edf4814ee73de9f21611e22959": [
+        4096,
+        8192
+      ]
+    },
+    {
+      "ane-direct:gte-reranker-modernbert-base.ane-direct-worker:sha256:2ecb952868e28ed5a45c3f5c057e0f6d46df384ba540e1f05113462fd0d6a1de": [
+        512
+      ],
+      "ane-direct:qwen3-reranker-0.6b.ane-direct-worker:sha256:cc02357cfc81a92562b251914bed5c8d3960b7edf4814ee73de9f21611e22959": [
+        8192
+      ]
+    },
+    {
+      "ane-direct:gte-reranker-modernbert-base.ane-direct-worker:sha256:2ecb952868e28ed5a45c3f5c057e0f6d46df384ba540e1f05113462fd0d6a1de": [
+        512
+      ],
+      "ane-direct:qwen3-embedding-0.6b.ane-direct-worker:sha256:1af6d091d7d5f21a998af0f438333d9af051c82af8b27bd2439c60efa09bd5db": [
+        1024
+      ],
+      "ane-direct:qwen3-reranker-0.6b.ane-direct-worker:sha256:cc02357cfc81a92562b251914bed5c8d3960b7edf4814ee73de9f21611e22959": [
+        8192
+      ]
+    }
+  ],
+  "schema": 1,
+  "shape_not_admitted_count": 0,
+  "source_commit": "6f6abcf0a7e70aa637f4dca80e2253a7d66dc1d7"
+}
