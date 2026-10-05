@@ -983,6 +983,72 @@ mod fresh_process_hardware {
     }
 
     #[test]
+    #[ignore = "Bounded in-process reclaim alternatives with runtime-enumerated selectors"]
+    fn fresh_process_reclaim_paths() {
+        let method = std::env::var("ANE_RECLAIM_PATH").unwrap();
+        let mut model = model("gte-modernbert-base");
+        for shape in [128, 256, 512, 1024, 2048] {
+            model
+                .admit_with_limit(shape, "reclaim-path-development", 64, |graph, _| {
+                    graph.compile(NSQualityOfService::UserInteractive)
+                })
+                .unwrap();
+        }
+        let started = std::time::Instant::now();
+        let observations = if method == "release-all" {
+            model.resident.clear();
+            vec!["all resident executable/model objects and IOSurfaces dropped".to_owned()]
+        } else {
+            let resident = model.resident.remove(&128).unwrap();
+            let probe = match method.as_str() {
+                "model-purge" => ane::diagnostics::ReclaimProbe::ModelPurge,
+                "client-purge" => ane::diagnostics::ReclaimProbe::ClientPurge,
+                "fresh-client" => ane::diagnostics::ReclaimProbe::FreshClientUnload,
+                "fresh-allocated-client" => {
+                    ane::diagnostics::ReclaimProbe::FreshAllocatedClientUnload
+                }
+                "drop-client-references" => {
+                    ane::diagnostics::ReclaimProbe::DropSharedClientReferences
+                }
+                _ => panic!("unknown reclaim path"),
+            };
+            let observations = ane::diagnostics::reclaim(resident.executables, probe);
+            drop((
+                resident.a,
+                resident.b,
+                resident.residual,
+                resident.mask,
+                resident.inventory,
+            ));
+            observations
+        };
+        let mut attempts = Vec::new();
+        for delay_ms in [0, 5000] {
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            let offset_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let mut loaded = 0;
+            let result =
+                model.admit_with_limit(4096, "reclaim-path-development", 64, |graph, _| {
+                    let result = graph.compile(NSQualityOfService::UserInteractive);
+                    if result.is_ok() {
+                        loaded += 1;
+                    }
+                    result
+                });
+            let error = result.err().map(|e| format!("{e:#}"));
+            let success = error.is_none();
+            attempts.push(serde_json::json!({"delay_after_previous_attempt_ms":delay_ms,"actual_start_after_reclaim_ms":offset_ms,"finished_after_reclaim_ms":started.elapsed().as_secs_f64()*1000.0,"loaded":loaded,"error":error}));
+            if success {
+                break;
+            }
+        }
+        write_experiment(
+            serde_json::json!({"classification":"development","experiment":"in-process-reclaim-paths","method":method,"initial_executables":110,"observations":observations,"attempts":attempts,"remaining_fully_resident_executables":model.resident.values().map(|resident|resident.executables.len()).sum::<usize>()}),
+        );
+        drop(model);
+    }
+
+    #[test]
     #[ignore = "Fresh-process concurrent full-shape and first-layer compiler controls"]
     fn fresh_process_concurrent_compiles() {
         let count: usize = std::env::var("ANE_COMPILE_COUNT").unwrap().parse().unwrap();

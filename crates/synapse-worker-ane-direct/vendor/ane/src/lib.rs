@@ -35,6 +35,7 @@ mod ane_io_surface_object;
 mod ane_performance_stats;
 mod ane_request;
 pub mod client;
+pub mod diagnostics;
 mod error;
 mod executable;
 pub mod graph;
@@ -47,7 +48,7 @@ mod tensor_data;
 pub use error::Error;
 pub use executable::Executable;
 pub use graph::{
-    Convolution2dDescriptor, ConvolutionTranspose2dDescriptor, Graph, MIN_SPATIAL_WIDTH, Tensor,
+    Convolution2dDescriptor, ConvolutionTranspose2dDescriptor, Graph, Tensor, MIN_SPATIAL_WIDTH,
 };
 pub use io_surface::IOSurfaceExt;
 pub use objc2_foundation::NSQualityOfService;

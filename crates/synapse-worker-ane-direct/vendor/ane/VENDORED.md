@@ -20,6 +20,10 @@ Local compatibility changes:
   containing workspace also builds on Linux and Windows.
 - `Executable::run_cached_profiled` times cached-request preparation and the
   synchronous evaluate call without changing the request or execution semantics.
+- `diagnostics::reclaim` is an explicitly invoked development probe of model
+  purge, client purge, fresh-client unload, and shared-client reference release.
+  Selector names and signatures were enumerated from the Objective-C runtime on
+  OS build 26A434; serving code does not call it or assume these calls reclaim capacity.
 - `ANEInMemoryModel::unload` logs the BOOL and NSError description when
   `ANE_UNLOAD_DIAGNOSTICS` is set. This observes `Executable::Drop` unload calls
   without changing their return type or retry policy; success is not a
