@@ -165,6 +165,62 @@ class ReleaseChecks(unittest.TestCase):
         r['executed_artifacts'].append({'file': 'extra.dll', 'sha256': '0' * 64})
         self.rejects(check.inventory, entries, assets, records)
 
+    def stress_fixture(self) -> dict[str, Any]:
+        return dict(schema=1, kind='development', harness_profile='release', source_commit='a' * 40,
+                    machine={'model_identifier': 'Mac17,2', 'platform_uuid': 'fixture'},
+                    os={'version': '26.0', 'build': 'fixture'}, load_1_5_15_start=[0, 0, 0],
+                    load_1_5_15_end=[0, 0, 0], request_count=37, completed_count=37,
+                    request_errors=[], sample_count=2, samples=[{'model': [128]}, {}],
+                    max_resident_per_model=1, max_resident_total=1, admitted_count=1, evicted_count=1,
+                    shape_not_admitted_count=0, leased_evict_count=0, no_ane_resources={'count': 0},
+                    ane_lane_busy={'status': 'passed'}, metal_ranking_check={'status': 'skipped', 'reason': 'no Metal comparison in fixture'},
+                    reranker_pool_check={'finite': 'passed', 'byte_identical_repeats': 'passed'})
+
+    def test_stress_real_resource_failure_refused(self):
+        entries, _, assets, cert, _ = self.evidence_fixture()
+        stress = self.stress_fixture()
+        stress.update(completed_count=4, request_errors=['no ANE resources'] * 33,
+                      no_ane_resources={'count': 33})
+        (cert / 'ane-direct-stress.json').write_text(json.dumps(stress))
+        self.rejects(check.evidence, self.root, 'a' * 40, assets, entries)
+
+    def test_stress_completion_required(self):
+        stress = self.stress_fixture()
+        check.stress_evidence(stress)
+        stress['completed_count'] = 4
+        self.rejects(check.stress_evidence, stress)
+
+    def test_stress_request_errors_forbidden(self):
+        stress = self.stress_fixture()
+        stress['request_errors'] = ['no ANE resources']
+        self.rejects(check.stress_evidence, stress)
+
+    def test_stress_resource_exhaustion_forbidden(self):
+        stress = self.stress_fixture()
+        stress['no_ane_resources']['count'] = 33
+        self.rejects(check.stress_evidence, stress)
+
+    def test_stress_reranker_pool_must_pass(self):
+        for field in ('finite', 'byte_identical_repeats'):
+            stress = self.stress_fixture()
+            stress['reranker_pool_check'][field] = 'failed'
+            with self.subTest(field=field):
+                self.rejects(check.stress_evidence, stress)
+
+    def test_driver_floor_from_agreeing_profiles(self):
+        profiles = {m + '.owned-cuda': {'lane': 'owned-cuda', 'model': m, 'cuda_min_driver_api': 13020} for m in check.MODELS}
+        (self.root / 'bench/parity').mkdir(parents=True)
+        manifest = self.root / 'bench/parity/models.json'
+        manifest.write_text(json.dumps({'profiles': profiles}))
+        self.assertEqual(check.cuda_driver_floor(self.root), 13020)
+        for p in profiles.values():
+            p['cuda_min_driver_api'] = 13040
+        manifest.write_text(json.dumps({'profiles': profiles}))
+        self.assertEqual(check.cuda_driver_floor(self.root), 13040)
+        profiles[check.MODELS[-1] + '.owned-cuda']['cuda_min_driver_api'] = 13080
+        manifest.write_text(json.dumps({'profiles': profiles}))
+        self.rejects(check.cuda_driver_floor, self.root)
+
     def evidence_fixture(self):
         entries, records, assets, _ = self.fixture_inventory()
         cert = self.root / 'docs/evidence/certification' / ('a' * 40)
@@ -173,7 +229,10 @@ class ReleaseChecks(unittest.TestCase):
             path = cert / r['row_id'] / (r['model'] + '.json')
             path.parent.mkdir(exist_ok=True)
             path.write_text(json.dumps(r))
-        (cert / 'ane-direct-stress.json').write_text(json.dumps(dict(request_count=20, sample_count=40, max_resident_per_model=4, max_resident_overall=8, shape_not_admitted_count=0, leased_evict_count=0)))
+        (cert / 'ane-direct-stress.json').write_text(json.dumps(self.stress_fixture()))
+        manifest = self.root / 'bench/parity/models.json'
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text(json.dumps({'profiles': {m + '.owned-cuda': {'lane': 'owned-cuda', 'model': m, 'cuda_min_driver_api': 13020} for m in check.MODELS}}))
         (cert / 'RELEASE-NOTES.md').write_text('No dropped cells')
         preload = self.root / 'bench/parity/preload'
         preload.mkdir(parents=True)
@@ -264,6 +323,10 @@ class ReleaseChecks(unittest.TestCase):
         self.assertIn('check.py source', workflow)
         for runner in ('ubuntu-24.04', 'macos-15', 'windows-2025'):
             self.assertIn(runner, workflow)
+
+    def test_linux_ci_runs_release_gate_fixtures(self):
+        workflow = (Path(__file__).resolve().parents[2] / '.github/workflows/tests.yml').read_text()
+        self.assertIn("      - name: Check tag release gates\n        if: matrix.name == 'linux'\n        working-directory: synapse\n        run: python3 -m unittest discover -s crates/synapse-release-checks -v", workflow)
 
     def test_parent_without_candidate_release_fails(self):
         with patch.object(check, 'source', return_value='a' * 40), patch.object(check.subprocess, 'check_output', side_effect=subprocess.CalledProcessError(1, ['gh'])):

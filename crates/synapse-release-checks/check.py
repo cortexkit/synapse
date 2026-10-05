@@ -142,6 +142,29 @@ def benchmark(report, records):
             require(b['batch_size'] <= c['inline_max_items'] or b.get('request_path') == 'job', 'missing above-inline request path')
 
 
+def cuda_driver_floor(root):
+    profiles = [p for p in load(root / 'bench/parity/models.json')['profiles'].values()
+                if p.get('lane') == 'owned-cuda']
+    require({p['model'] for p in profiles} == set(MODELS), 'missing CUDA profiles')
+    floors = [p['cuda_min_driver_api'] for p in profiles]
+    require(all(type(floor) is int and floor > 0 for floor in floors) and len(set(floors)) == 1,
+            'CUDA profiles disagree on driver floor')
+    return floors[0]
+
+
+def stress_evidence(stress):
+    require(stress['request_count'] > 0 and stress['completed_count'] == stress['request_count'],
+            'incomplete ANE stress requests')
+    require(stress['request_errors'] == [], 'ANE stress request errors')
+    require(stress['no_ane_resources']['count'] == 0, 'ANE stress exhausted resources')
+    require(stress['reranker_pool_check']['finite'] == 'passed' and
+            stress['reranker_pool_check']['byte_identical_repeats'] == 'passed',
+            'ANE stress reranker pool failed')
+    require(stress['leased_evict_count'] == 0 and stress['shape_not_admitted_count'] == 0 and
+            0 <= stress['max_resident_per_model'] <= 4 and 0 <= stress['max_resident_total'] <= 8 and
+            stress['sample_count'] > 0, 'invalid ANE stress')
+
+
 def evidence(root, s, assets, entries):
     cert = root / 'docs/evidence/certification' / s
     records = [load(cert / row / (model + '.json')) for row in ROWS for model in MODELS]
@@ -152,11 +175,12 @@ def evidence(root, s, assets, entries):
     for r, (row, model) in zip(records, ((r, m) for r in ROWS for m in MODELS)):
         require(r['source_commit'] == s and r['row_id'] == row and r['model'] == model, 'record path mismatch')
     inventory(entries, assets, records)
+    driver_floor = cuda_driver_floor(root)
     for model in MODELS:
-        require(any(r['model'] == model and r['row_id'].startswith('cuda-') and r['status'] == 'passed' and r['machine'].get('driver_api') == 13020 for r in records), 'missing CUDA 13020 boundary: ' + model)
+        require(any(r['model'] == model and r['row_id'].startswith('cuda-') and r['status'] == 'passed' and r['machine'].get('driver_api') == driver_floor for r in records), f'missing CUDA {driver_floor} boundary: ' + model)
     if any(r['row_id'] == 'ane-m5' and r['status'] == 'passed' for r in records):
         stress = load(cert / 'ane-direct-stress.json')
-        require(stress['leased_evict_count'] == 0 and stress['shape_not_admitted_count'] == 0 and stress['max_resident_per_model'] <= 4 and stress['max_resident_overall'] <= 8 and stress['request_count'] > 0 and stress['sample_count'] > 0, 'invalid ANE stress')
+        stress_evidence(stress)
     notes = (cert / 'RELEASE-NOTES.md').read_text()
     for r in records:
         if r['status'] == 'dropped':

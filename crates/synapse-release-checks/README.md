@@ -12,8 +12,13 @@ Run fixtures with `python3 -m unittest discover -s crates/synapse-release-checks
 
 The separate evidence formats are JSON objects with the following fields:
 
-- Stress: `request_count`, `sample_count`, `max_resident_per_model`,
-  `max_resident_overall`, `shape_not_admitted_count`, `leased_evict_count`.
+- Stress uses the field names defined in
+  `crates/synapse-worker-ane-direct/tests/fixtures/ane-direct-stress.schema.json`.
+  Every request must complete: `completed_count == request_count`, with empty
+  `request_errors` and `no_ane_resources.count == 0`. Both `reranker_pool_check`
+  results (`finite` and `byte_identical_repeats`) must be `passed`. Residency
+  maxima are `max_resident_per_model` (at most 4) and `max_resident_total` (at
+  most 8); leased evictions and shape-not-admitted events must remain zero.
 - Benchmark report: `cells` contains every row/model combination, with `row_id`,
   `model`, `status`, `metrics`, `probe: {exit_code, stdout, stderr}` and a `cause`
   quoted verbatim from the probe for unavailable/unsupported cells. `embedding`
@@ -30,6 +35,10 @@ Metal notes must name the model and both the catalog record fingerprint and each
 committed preload fingerprint. Models without a committed preload have no pair
 to enumerate. Certification directories keyed by other source commits are
 ignored because their binary hashes do not certify this candidate.
+
+The CUDA boundary comes from `cuda_min_driver_api` in
+`bench/parity/models.json`. All CUDA profiles must agree, and every model must
+have a passed CUDA record at exactly that driver API, not merely a newer one.
 
 The candidate CLI validates numerical parity against reference outputs and the
 permitted Qwen3 ANE drop decisions; these scripts do not infer

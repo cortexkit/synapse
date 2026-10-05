@@ -77,6 +77,11 @@ jobs:
         shell: bash
         run: python3 synapse/scripts/check-release-candidate.py --self-test
 
+      - name: Check tag release gates
+        if: matrix.name == 'linux'
+        working-directory: synapse
+        run: python3 -m unittest discover -s crates/synapse-release-checks -v
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
