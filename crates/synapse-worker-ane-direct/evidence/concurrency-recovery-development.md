@@ -41,3 +41,17 @@ an eviction queued for the retired owner must not reach its replacement
 The test deterministically queues restart first, eviction second behind the same connection mutex, then releases the mutex. After restart, the old eviction must be refused and no eviction command may arrive in the new server. An additional assertion retains a newly admitted sequence-length128 shape while holding its lease and refuses an explicitly old-generation eviction without removing it.
 
 A monotonic owning-process generation is captured in each reservation and supplied to admit/retry/evict operations. The channel checks it while holding the stream mutex before writing. Restart advances it under that same mutex. Detached work whose old reservation has already retired cannot evict or admit on the replacement; stale refusals do not restart the new owner. Direct `exchange` callers (LOAD metadata and inference, as well as shape commands) also capture/check their generation across connection-lock waits. No worker wire protocol changed.
+
+## Cancellation after request write
+
+Before the guard, dropping a written request left its unread response reusable by the next request:
+
+```text
+cancelled_exchange_faults_channel_before_a_later_request_reads_stale_reply ... FAILED
+cancelled exchange must fault the stream instead of returning the abandoned eviction response to Ping
+0 passed;1 failed; finished in0.12s
+```
+
+The mock acknowledges receiving the eviction request, withholds its response, and the client task is aborted. Releasing the mock response must not let a subsequent Ping read the abandoned eviction response. An RAII guard faults any exchange dropped before both JSON and optional raw response frames complete, before releasing the connection mutex. Confirmed-exit restart permits a fresh Ping afterward.
+
+Caller audit of snapshot `0293b3ba`: production `AneWorkerChannel::exchange` calls are the channel's `admit_shape` and `evict_shape` trait methods. The direct embed/rerank exchange in `infer` belongs to the macOS-only hardware-test module; `run_by_rung` groups requests by admitted sequence-length bucket and accepts caller-supplied inference futures, which can be dropped, and the same guard covers those direct exchanges. Regular `WorkerHost` embed/rerank uses separate `send_request`, not this channel, with request-timeout wrappers. Frame `read_json`/`read_raw` in `synapse-core` Unix/Windows transports and framing `read_exact` have no intrinsic timeout; only handshake and ordinary host request wrappers supply one.

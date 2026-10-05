@@ -4378,6 +4378,20 @@ pub mod ane_residency {
         pub confirm_exit: BoxFuture<'static, Result<(), AneResidencyError>>,
     }
 
+    // Dropping a partially completed exchange leaves unread framing on the socket.
+    // Fault it before the stream mutex is released so no next request can consume it.
+    struct ExchangeFaultGuard<'a> {
+        faulted: &'a std::sync::atomic::AtomicBool,
+        completed: bool,
+    }
+    impl Drop for ExchangeFaultGuard<'_> {
+        fn drop(&mut self) {
+            if !self.completed {
+                self.faulted.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
     /// A direct-ANE worker connection used for one exchange at a time, so a
     /// admission waits never hold the connection; an exchange or restart locks it.
     pub struct AneWorkerChannel<S> {
@@ -4459,6 +4473,10 @@ pub mod ane_residency {
             })?;
             let stream = &mut session.stream;
             let max_frame = self.max_frame;
+            let mut exchange_guard = ExchangeFaultGuard {
+                faulted: &self.faulted,
+                completed: false,
+            };
             #[cfg(test)]
             let started = std::time::Instant::now();
             let result = tokio::select! {
@@ -4485,6 +4503,7 @@ pub mod ane_residency {
             }
             match result {
                 Ok((response, raw)) => {
+                    exchange_guard.completed = true;
                     let mut models = self.loaded_models.lock().unwrap_or_else(|p| p.into_inner());
                     match (request, &response) {
                         (
@@ -6330,6 +6349,41 @@ pub mod ane_residency {
             assert_eq!(supervisor.inner.lock().reserved_executables(), 4);
             assert_eq!(ledger.lock().unwrap().connects["worker"], 1);
             drop(held);
+        }
+
+        #[tokio::test]
+        async fn cancelled_exchange_faults_channel_before_a_later_request_reads_stale_reply() {
+            let ledger = SharedLedger::default();
+            let channel = mock_channel("worker", &ledger).await;
+            let started = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            ledger.lock().unwrap().evict_gate = Some((started.clone(), release.clone()));
+            let cancelling = channel.clone();
+            let task = tokio::spawn(async move { cancelling.evict_shape("model", 128).await });
+            started.notified().await;
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            release.notify_one();
+            let response = channel
+                .exchange(
+                    &WorkerRequest::Ping {
+                        req_id: "later".into(),
+                    },
+                    None,
+                )
+                .await;
+            assert!(response.is_err(),"cancelled exchange must fault the stream instead of returning the abandoned eviction response to Ping");
+            assert!(channel.faulted.load(Ordering::Relaxed));
+            channel.restart().await.unwrap();
+            assert!(channel
+                .exchange(
+                    &WorkerRequest::Ping {
+                        req_id: "fresh".into()
+                    },
+                    None
+                )
+                .await
+                .is_ok());
         }
 
         #[tokio::test]
