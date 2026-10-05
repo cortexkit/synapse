@@ -2617,7 +2617,7 @@ fn build_preload_catalog_model(
         None => format!("sha256:{}", sha256_file(&preload.model_path)?),
     };
     let owned = if let Some(catalog) = &catalog {
-        Some(catalog.owned_config(&preload)?)
+        Some(catalog.owned_config(preload.execution.as_deref(), preload.attention_units)?)
     } else {
         (engine_name == "owned-metal" || engine_name == CUDA_WORKER_ENGINE)
             .then(|| {
@@ -2659,6 +2659,9 @@ fn build_preload_catalog_model(
             max_tokens: tokenizer_max_tokens,
         },
     )?;
+    if let Some(catalog) = &catalog {
+        catalog.validate_readout(&tokenizer)?;
+    }
     let quant = preload.quant.clone().unwrap_or_else(|| {
         owned
             .as_ref()
@@ -2774,14 +2777,42 @@ fn normalize_catalog_model(
 ) -> Result<StoredModelConfig, ModuleError> {
     if model.engine_identity.build_flags.contains_key("profile") {
         let catalog = CatalogProfile::load(&model.engine_identity.build_flags["profile"])?;
+        let task = parse_model_task(Some(&model.task), &model.engine, &model.model_id)?;
+        let pooling = parse_pooling(&model.pooling)?;
         catalog.validate(
             &model.engine,
-            parse_model_task(Some(&model.task), &model.engine, &model.model_id)?,
-            parse_pooling(&model.pooling)?,
+            task,
+            pooling,
             model.normalize,
             Some(model.max_tokens),
         )?;
-        return Ok(model);
+        let owned = catalog.owned_config(
+            model.owned_execution.as_deref(),
+            model.owned_attention_units,
+        )?;
+        return build_stored_model_config(
+            model.model_id,
+            &model.engine,
+            task,
+            model.artifact_digest,
+            model.artifact_format,
+            model.tokenizer_sanitized_digest,
+            model.model_locator,
+            model.tokenizer_locator,
+            model.model_source_url,
+            model.tokenizer_source_url,
+            pooling,
+            model.normalize,
+            model.max_tokens,
+            model.quant,
+            model.pin,
+            model.worker_bin,
+            model.worker_runtime_dir,
+            model.extra_locators,
+            Some(owned),
+            inline,
+            jobs,
+        );
     }
     let engine_name = canonical_engine_name(&model.engine);
     let task = parse_model_task(Some(&model.task), &engine_name, &model.model_id)?;
@@ -2894,13 +2925,16 @@ struct CatalogProfile {
     id: String,
     slug: String,
     manifest: Value,
+    typed: synapse_parity::manifest::Manifest,
 }
 
 impl CatalogProfile {
     fn load(id: &str) -> Result<Self, ModuleError> {
-        let manifest: Value =
-            serde_json::from_slice(include_bytes!("../../../bench/parity/models.json"))
-                .map_err(|error| ModuleError::Config(error.to_string()))?;
+        let typed = synapse_parity::manifest::Manifest::from_slice(include_bytes!(
+            "../../../bench/parity/models.json"
+        ))
+        .map_err(|error| ModuleError::Config(error.to_string()))?;
+        let manifest = serde_json::to_value(&typed).expect("manifest serializes");
         let profile = manifest["profiles"].get(id).ok_or_else(|| {
             ModuleError::Config(format!("model_unsupported: unknown profile {id}"))
         })?;
@@ -2908,11 +2942,51 @@ impl CatalogProfile {
             .as_str()
             .ok_or_else(|| ModuleError::Config("profile missing model".into()))?
             .to_string();
-        Ok(Self {
+        let catalog = Self {
             id: id.into(),
             slug,
             manifest,
-        })
+            typed,
+        };
+        catalog.validate_template()?;
+        Ok(catalog)
+    }
+
+    fn validate_template(&self) -> Result<(), ModuleError> {
+        if self.slug == "qwen3-reranker-0.6b" {
+            let model = self
+                .typed
+                .model(&self.slug)
+                .map_err(|error| ModuleError::Config(error.to_string()))?;
+            let template = model.grammar.template.as_ref().ok_or_else(|| {
+                ModuleError::Config("qwen_template_mismatch: missing template".into())
+            })?;
+            synapse_parity::oracle::check_template(
+                template,
+                include_str!("../../../bench/parity/oracles/qwen3-reranker-0.6b-README.md"),
+            )
+            .map_err(|error| ModuleError::Config(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn validate_readout(&self, tokenizer: &SanitizedTokenizer) -> Result<(), ModuleError> {
+        if self.slug == "qwen3-reranker-0.6b" {
+            for role in ["yes", "no"] {
+                let token = &self.model()["grammar"]["readout"][role];
+                let ids = tokenizer
+                    .tokenizer()
+                    .encode(token["text"].as_str().expect("readout text"), false)
+                    .map_err(|error| ModuleError::Config(error.to_string()))?;
+                if ids.get_ids() != [token["id"].as_u64().expect("readout id") as u32] {
+                    return Err(ModuleError::Config(
+                        "qwen_readout_mismatch: yes/no must resolve to their pinned single ids"
+                            .into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn profile(&self) -> &Value {
@@ -2958,7 +3032,8 @@ impl CatalogProfile {
 
     fn owned_config(
         &self,
-        preload: &PreloadModelConfig,
+        execution: Option<&str>,
+        attention_units: Option<usize>,
     ) -> Result<OwnedCatalogConfig, ModuleError> {
         let family = if self.model()["architecture"]["family"] == "qwen3" {
             OwnedFamily::Qwen3
@@ -2974,6 +3049,12 @@ impl CatalogProfile {
         let lane = self.profile()["lane"].as_str().expect("manifest lane");
         let mut identity = if lane == "owned-metal" {
             owned_engine_identity(family, dtype)
+        } else if lane == "owned-cuda" {
+            owned_cuda_engine_identity(
+                family.as_str(),
+                dtype.as_str(),
+                synapse_core::CUDA_KERNEL_REVISION,
+            )
         } else {
             catalog_model_engine_identity(lane)?
         };
@@ -2996,13 +3077,8 @@ impl CatalogProfile {
         Ok(OwnedCatalogConfig {
             family,
             dtype,
-            execution: preload
-                .execution
-                .clone()
-                .unwrap_or_else(|| "explicit".into()),
-            attention_units: preload
-                .attention_units
-                .unwrap_or(OWNED_DEFAULT_ATTENTION_UNITS),
+            execution: execution.unwrap_or("explicit").into(),
+            attention_units: attention_units.unwrap_or(OWNED_DEFAULT_ATTENTION_UNITS),
             config_locator: None,
             extra_locators: Vec::new(),
             identity_override: Some(identity),
@@ -3010,12 +3086,17 @@ impl CatalogProfile {
     }
 
     fn apply_numeric_profile(&self, numeric: &mut NumericProfile) {
-        let grammar = json!({"model": self.slug, "grammar": self.model()["grammar"]});
-        let input_grammar = synapse_core::input_grammar_identity(
-            &serde_json::to_vec(&grammar).expect("grammar serializes"),
+        let input_grammar = format!(
+            "synapse-input-grammar-v1:{}",
+            self.typed
+                .grammar_digest(&self.slug)
+                .expect("manifest grammar")
         );
         let rotation = self.profile()["rotation"].as_str();
-        let entry = json!({"schema": self.manifest["schema"], "profile_id": self.id, "profile": self.profile(), "model_slug": self.slug, "model": self.model(), "rotation": rotation.filter(|name| *name != "none").map(|name| &self.manifest["rotations"][name]), "admission": self.manifest["admission"], "converter_rule": self.manifest["converter"]["rule"]});
+        let entry = self
+            .typed
+            .profile_entry(&self.id)
+            .expect("manifest profile entry");
         numeric.model_digest = self.model()["checkpoint_digest"]
             .as_str()
             .expect("checkpoint digest")
@@ -3034,7 +3115,7 @@ impl CatalogProfile {
             .as_str()
             .map(str::to_string);
         numeric.manifest_profile_digest = Some(sha256_hex(
-            &serde_json::to_vec(&entry).expect("profile entry serializes"),
+            &synapse_parity::canonical::canonical_bytes(&entry),
         ));
         numeric.kernel_revision = Some(
             match self.profile()["lane"].as_str().expect("lane") {
@@ -6152,6 +6233,11 @@ fn load_catalog_model_blocking(
         },
     )
     .map_err(|error| artifact_invalid_error(error.to_string()))?;
+    if let Some(id) = spec.engine_identity.build_flags.get("profile") {
+        CatalogProfile::load(id)
+            .and_then(|catalog| catalog.validate_readout(&tokenizer))
+            .map_err(|error| artifact_invalid_error(error.to_string()))?;
+    }
     let actual_tokenizer_digest = format!("sha256:{}", tokenizer.sanitized_sha256());
     if actual_tokenizer_digest != normalize_digest(&spec.tokenizer_sanitized_digest) {
         return Err(artifact_invalid_error(format!(
@@ -7778,7 +7864,10 @@ async fn embed_query(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
             ))
         }
     };
-    if let Err(error) = compose_catalog_embed(&model, &mut tokenized) {
+    if let Err(mut error) = compose_catalog_embed(&model, &mut tokenized) {
+        if let Some(details) = error.details.as_mut() {
+            details["item_id"] = json!(params.id.as_deref().unwrap_or("query"));
+        }
         return result_outcome(error_payload(&state, error));
     }
     apply_owned_tokenizer_policy(&model, &mut tokenized);
@@ -8132,7 +8221,15 @@ async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
             ))
         }
     };
-    if let Err(error) = compose_catalog_embed(&model, &mut tokenized) {
+    if let Err(mut error) = compose_catalog_embed(&model, &mut tokenized) {
+        if let Some(details) = error.details.as_mut() {
+            if let Some(index) = details["item_id"]
+                .as_str()
+                .and_then(|id| id.parse::<usize>().ok())
+            {
+                details["item_id"] = json!(items[index].id);
+            }
+        }
         return result_outcome(error_payload(&state, error));
     }
     apply_owned_tokenizer_policy(&model, &mut tokenized);
@@ -12125,17 +12222,16 @@ fn owned_rerank_pairs(
             let suffix = encode(template["suffix"].as_str().expect("template suffix"))?;
             let mut pairs = Vec::with_capacity(candidates.len());
             for candidate in candidates {
-                let body = template["body_format"]
-                    .as_str()
-                    .expect("template body")
-                    .replace(
-                        "{instruction}",
-                        template["instruction"]
-                            .as_str()
-                            .expect("template instruction"),
-                    )
-                    .replace("{query}", query)
-                    .replace("{doc}", candidate);
+                let format = template["body_format"].as_str().expect("template body");
+                let (head, tail) = format.split_once("{query}").expect("query placeholder");
+                let (middle, end) = tail.split_once("{doc}").expect("doc placeholder");
+                let head = head.replace(
+                    "{instruction}",
+                    template["instruction"]
+                        .as_str()
+                        .expect("template instruction"),
+                );
+                let body = format!("{head}{query}{middle}{candidate}{end}");
                 let mut ids = prefix.clone();
                 ids.extend(encode(&body)?);
                 ids.extend_from_slice(&suffix);
@@ -15687,22 +15783,25 @@ fn module_catalog_entries(state: &ModuleState) -> Vec<ModelCatalogEntry> {
                 buckets.dedup();
             }
 
-            let (max_tokens, max_tokens_source) = if let Some(ref buckets) = bucket_ladder {
-                if let Some(&largest_bucket) = buckets.last() {
-                    let source = if spec.engine == "owned-metal" {
-                        "runtime_bucket"
+            let (max_tokens, max_tokens_source) =
+                if spec.engine_identity.build_flags.contains_key("profile") {
+                    (Some(8192), Some("manifest".to_string()))
+                } else if let Some(ref buckets) = bucket_ladder {
+                    if let Some(&largest_bucket) = buckets.last() {
+                        let source = if spec.engine == "owned-metal" {
+                            "runtime_bucket"
+                        } else {
+                            "worker_bucket"
+                        };
+                        (Some(largest_bucket), Some(source.to_string()))
                     } else {
-                        "worker_bucket"
-                    };
-                    (Some(largest_bucket), Some(source.to_string()))
-                } else {
+                        (Some(spec.max_tokens), Some("catalog".to_string()))
+                    }
+                } else if is_loaded {
                     (Some(spec.max_tokens), Some("catalog".to_string()))
-                }
-            } else if is_loaded {
-                (Some(spec.max_tokens), Some("catalog".to_string()))
-            } else {
-                (Some(spec.max_tokens), Some("catalog_unloaded".to_string()))
-            };
+                } else {
+                    (Some(spec.max_tokens), Some("catalog_unloaded".to_string()))
+                };
 
             let dims = if is_loaded { exec_info.dims } else { None };
             let dtype = dtype_for_slot(&spec, exec_info.dtype);
@@ -19635,7 +19734,11 @@ mod tests {
             None,
             None,
             Vec::new(),
-            Some(catalog.owned_config(&preload).unwrap()),
+            Some(
+                catalog
+                    .owned_config(preload.execution.as_deref(), preload.attention_units)
+                    .unwrap(),
+            ),
             &InlineConfig::default(),
             &JobConfig::default(),
         )
@@ -19707,7 +19810,31 @@ mod tests {
                 .unwrap()
                 .fingerprint
             );
-            println!("{id} {}", spec.fingerprint.0);
+            let expected = [
+                "5dba358a35c66331fc782d0df05e17c31db8e3dcafa097acd4b9126f293fcd29",
+                "27166bbf06d295c10dad348a8df8bf6774e209791bef402fc4847b24f96b1b39",
+                "3a0b02613e9f7cd7b502de500e28613df43025b59df2cd4b0ec604de42e5a2e2",
+                "b466f1eab750d8916dcc7c1943496a30b04bf0fd562053c33b6e7ba37f817c48",
+                "184c97d9e0879820c2d5da7e639aca2d6daf2a3d1665188bbabbc6a09e954d7c",
+                "510721ab2b99d667e5461764ac3c129e0244b4f1b32370a269608aa8e56bba20",
+                "bdab90b6bb1d81696d679d3c267c95f90de418fa501a3824f42e0c3c217fe166",
+                "3f22bb43916da0e593d0ed269d033b76de5670766c3a94d33e55a6aecb149e4e",
+                "91a693ac3c9f84777236c242b7a1ef68ae69f846c40142b47654bd941fb0c4e4",
+                "896eb823c1ee5d9c31b42a12163684ab6b707968a619a7c0196775cc394f4148",
+                "6553a78dce363808f967655b534db0c1536d837de3dcfba3a30e142a3cb847e9",
+                "aed4309eecdc10a56465650c3bd11d094b1e3d388ba466b822735ea8df078b8a",
+                "a0340856a50c521225feb2533a1e5f687e00c0beb5717733b9ecd12e7675c37e",
+                "2c00ee65e9ae43600c62332a0d96f799b790c03339cf43ad286eaaca0f8fd6bd",
+                "16ca0b783714705ca01235bfa7fe3a08da2615abc87cf081a1f0c7041edc2d5a",
+                "e4e7864d7f7d5f18ee7d08701f7cdfe5153c86c5da0fd17bfd9ded674bd865e4",
+            ];
+            let index = manifest["profiles"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .position(|key| key == id)
+                .unwrap();
+            assert_eq!(spec.fingerprint.0, expected[index], "{id}");
         }
     }
 
@@ -19832,6 +19959,348 @@ mod tests {
         .unwrap_err()
         .to_string()
         .contains("prompt_template"));
+    }
+
+    fn catalog_test_model(dir: &Path, spec: &StoredModelConfig) -> Arc<EmbeddingModel> {
+        use worker_host::{WorkerEngine, WorkerHostConfig};
+        fs::create_dir_all(dir).unwrap();
+        let tokenizer_path = dir.join("catalog-tokenizer.json");
+        let mut tokenizer: Value = serde_json::from_str(r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":{"type":"WhitespaceSplit"},"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"[UNK]":0,"a":1,"yes":9693,"no":2152},"unk_token":"[UNK]"}}"#).unwrap();
+        let catalog = CatalogProfile::load(&spec.engine_identity.build_flags["profile"]).unwrap();
+        if catalog.slug == "qwen3-reranker-0.6b" {
+            for role in ["yes", "no"] {
+                tokenizer["model"]["vocab"][role] =
+                    catalog.model()["grammar"]["readout"][role]["id"].clone();
+            }
+        }
+        let occupied = tokenizer["model"]["vocab"]
+            .as_object()
+            .unwrap()
+            .values()
+            .map(|id| id.as_u64().unwrap())
+            .collect::<std::collections::BTreeSet<_>>();
+        for index in 0..=*occupied.last().unwrap() {
+            if !occupied.contains(&index) {
+                tokenizer["model"]["vocab"][format!("unused-{index}")] = json!(index);
+            }
+        }
+        fs::write(&tokenizer_path, serde_json::to_vec(&tokenizer).unwrap()).unwrap();
+        let worker = dir.join("must-not-start.sh");
+        fs::write(
+            &worker,
+            format!(
+                "#!/bin/sh\nprintf called > '{}'\nexit 1\n",
+                dir.join("worker-called").display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&worker, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let engine =
+            WorkerEngine::new(WorkerHostConfig::new(worker, dir.join("worker-runtime"))).unwrap();
+        let loaded = engine.insert_loaded_model_for_test("catalog-fixture".into(), 1, 8192, None);
+        Arc::new(EmbeddingModel {
+            model_id: spec.model_id.clone(),
+            task: parse_model_task(Some(&spec.task), &spec.engine, &spec.model_id).unwrap(),
+            loaded_model: loaded,
+            backend: EmbedBackend::Worker(Arc::new(Mutex::new(engine))),
+            tokenizer: SanitizedTokenizer::from_file(
+                &tokenizer_path,
+                TokenizerConfig {
+                    max_tokens: usize::MAX,
+                },
+            )
+            .unwrap(),
+            numeric_profile_id: spec.numeric_profile_id.clone(),
+            fingerprint: spec.fingerprint.clone(),
+            certification_fingerprint: spec.fingerprint.clone(),
+            engine_identity: spec.engine_identity.clone(),
+            owned_tokenizer_policy: None,
+            owned_decode_resolution_refusal: None,
+        })
+    }
+
+    fn catalog_test_state(
+        dir: &Path,
+        descriptor: &StorageDescriptor,
+        id: &str,
+    ) -> Arc<ModuleState> {
+        let store = Arc::new(SynapseStore::open(descriptor).unwrap());
+        let profile = test_machine_profile("catalog-test-os");
+        store.activate_profile(&profile, 1, 1000).unwrap();
+        let state = test_module_state(store.clone(), profile.clone());
+        let mut spec = catalog_fixture_config(id);
+        spec.model_id = "catalog-sequence-test".into();
+        let model = catalog_test_model(dir, &spec);
+        store
+            .store_class_scoped_cert_row(&ClassScopedCertificationRow {
+                certification_class: if spec.task == "embed" {
+                    CertificationClass::Embedding
+                } else {
+                    CertificationClass::Rerank
+                },
+                assurance_class: AssuranceClass::Measured,
+                status: CertificationStatus::Certified,
+                key_hash: state.machine_profile_hash.clone(),
+                machine_profile_hash: Some(state.machine_profile_hash.clone()),
+                remote_profile_hash: None,
+                identity_revision: None,
+                numeric_profile_id: Some(spec.numeric_profile_id.clone()),
+                fingerprint: spec.fingerprint.clone(),
+                certified_at_ms: 11,
+                os_build: profile.os_build,
+                module_generation: 1,
+                evidence: json!({}),
+            })
+            .unwrap();
+        state.runtime.catalog.lock().unwrap().insert(
+            spec.model_id.clone(),
+            ModelSlot {
+                spec,
+                loaded: Some(model),
+                state: ModelRuntimeState::Ready,
+                notify: Arc::new(Notify::new()),
+                last_cold_load_ms: None,
+            },
+        );
+        state
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn catalog_embed_ceiling_precedes_job_diversion_and_worker_call() {
+        let (dir, descriptor) = test_storage_descriptor("catalog-embed-ceiling");
+        let state = catalog_test_state(&dir, &descriptor, "gte-modernbert-base.owned-vulkan");
+        let text = std::iter::repeat_n("a", 8193).collect::<Vec<_>>().join(" ");
+        let result = response_result(
+            embed_batch(
+                state.clone(),
+                json!({"model":"catalog-sequence-test", "items":[{"id":"row-8193", "text":text}]}),
+            )
+            .await,
+            "embed.batch",
+        );
+        assert_eq!(result["error"]["code"], "sequence_too_long", "{result}");
+        assert_eq!(result["error"]["class"], "permanent");
+        assert_eq!(
+            result["error"]["details"],
+            json!({"tokens":8193,"max_tokens":8192,"item_id":"row-8193"})
+        );
+        assert!(result.get("job_id").is_none());
+        assert!(result.get("truncation_disclosures").is_none());
+        assert!(!dir.join("worker-called").exists());
+        let text = std::iter::repeat_n("a", 8192).collect::<Vec<_>>().join(" ");
+        let result = response_result(
+            embed_batch(
+                state.clone(),
+                json!({"model":"catalog-sequence-test", "texts":[text]}),
+            )
+            .await,
+            "embed.batch",
+        );
+        assert_ne!(result["error"]["code"], "sequence_too_long", "{result}");
+        assert_ne!(result["error"]["code"], "queue_full", "{result}");
+        assert!(
+            result["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("worker load requires runtime_config"),
+            "8192-token input must reach the worker host: {result}"
+        );
+        let snapshot = state.store.catalog_snapshot().unwrap();
+        let listed = models_list_payload(&state, snapshot);
+        let row = listed["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["model_id"] == "catalog-sequence-test")
+            .unwrap();
+        assert_eq!(row["max_tokens"], 8192);
+        assert_eq!(row["profile"], "gte-modernbert-base.owned-vulkan");
+        drop(state);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn catalog_qwen_rerank_ceiling_precedes_both_token_budget_estimates() {
+        let (dir, descriptor) = test_storage_descriptor("catalog-rerank-ceiling");
+        let state = catalog_test_state(&dir, &descriptor, "qwen3-reranker-0.6b.owned-vulkan");
+        let model = state.runtime.catalog.lock().unwrap()["catalog-sequence-test"]
+            .loaded
+            .clone()
+            .unwrap();
+        let overhead = owned_rerank_pairs(&model, "", &[String::new()])
+            .unwrap()
+            .unwrap()[0]
+            .len();
+        assert!(overhead > 3);
+        for count in [8193 - overhead, 8193] {
+            let doc = std::iter::repeat_n("a", count)
+                .collect::<Vec<_>>()
+                .join(" ");
+            let result = response_result(
+                rerank_score(
+                    state.clone(),
+                    json!({"model":"catalog-sequence-test", "query":"", "candidates":[doc]}),
+                )
+                .await,
+                "rerank.score",
+            );
+            assert_eq!(result["error"]["code"], "sequence_too_long", "{result}");
+            assert!(result.get("job_id").is_none());
+            assert!(!dir.join("worker-called").exists());
+        }
+        let doc = std::iter::repeat_n("a", 8192 - overhead)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let pairs = owned_rerank_pairs(&model, "", &[doc.clone()])
+            .unwrap()
+            .unwrap();
+        assert_eq!(pairs[0].len(), 8192);
+        assert_eq!(
+            pairs[0].last(),
+            Some(&0),
+            "template tail, not EOS or readout ids"
+        );
+        let result = response_result(
+            rerank_score(
+                state.clone(),
+                json!({"model":"catalog-sequence-test", "query":"", "candidates":[doc]}),
+            )
+            .await,
+            "rerank.score",
+        );
+        assert_ne!(result["error"]["code"], "sequence_too_long", "{result}");
+        assert!(
+            result["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("worker load requires runtime_config"),
+            "8192-token composed input must reach worker host: {result}"
+        );
+        drop(model);
+        drop(state);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn catalog_aliases_cannot_substitute_another_backend() {
+        let (dir, _) = test_storage_descriptor("catalog-aliases");
+        for (profile, foreign) in [
+            (
+                "gte-modernbert-base.ane-direct-worker",
+                "coreml-fingerprint",
+            ),
+            ("gte-modernbert-base.owned-cuda", "metal-fingerprint"),
+        ] {
+            let spec = catalog_fixture_config(profile);
+            let model = catalog_test_model(&dir, &spec);
+            let alias = AliasTable {
+                table_epoch: 1,
+                rows: vec![synapse_core::AliasRow::with_evidence(
+                    spec.fingerprint.clone(),
+                    Fingerprint(foreign.into()),
+                    0,
+                    None,
+                    json!({}),
+                )],
+            };
+            assert!(equivalent_fingerprints(&alias, &model)
+                .iter()
+                .any(|fp| fp.0 == foreign));
+            assert_eq!(
+                check_fingerprint_constraints(&model, &alias, Some(foreign), None, true, None)
+                    .unwrap_err()
+                    .code,
+                "substitution_rejected"
+            );
+            check_fingerprint_constraints(
+                &model,
+                &alias,
+                Some(&spec.fingerprint.0),
+                None,
+                true,
+                None,
+            )
+            .unwrap();
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn catalog_embed_composes_one_eos_and_bypasses_legacy_terminal_policy() {
+        let (dir, _) = test_storage_descriptor("catalog-eos");
+        let spec = catalog_fixture_config("qwen3-embedding-0.6b.owned-metal");
+        let mut model = catalog_test_model(&dir, &spec);
+        Arc::get_mut(&mut model).unwrap().owned_tokenizer_policy =
+            Some(synapse_engine_owned::TokenizerPolicy {
+                add_special_tokens: true,
+                pad_token_id: 0,
+                terminal_token_id: Some(999),
+            });
+        let mut tokenized = model.tokenizer.tokenize_batch(["a"]).unwrap();
+        compose_catalog_embed(&model, &mut tokenized).unwrap();
+        let eos = CatalogProfile::load(&spec.engine_identity.build_flags["profile"])
+            .unwrap()
+            .model()["grammar"]["terminal_tokens"][0]["id"]
+            .as_u64()
+            .unwrap() as u32;
+        assert_eq!(tokenized.batch.items, vec![vec![1, eos]]);
+        compose_catalog_embed(&model, &mut tokenized).unwrap();
+        apply_owned_tokenizer_policy(&model, &mut tokenized);
+        assert_eq!(tokenized.batch.items, vec![vec![1, eos]]);
+        assert!(!tokenized.disclosures[0].truncated);
+        Arc::get_mut(&mut model)
+            .unwrap()
+            .engine_identity
+            .build_flags
+            .remove("profile");
+        apply_owned_tokenizer_policy(&model, &mut tokenized);
+        assert_eq!(tokenized.batch.items[0].last(), Some(&999));
+        drop(model);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn catalog_qwen_validates_readout_and_template() {
+        let (dir, _) = test_storage_descriptor("catalog-qwen-validation");
+        let spec = catalog_fixture_config("qwen3-reranker-0.6b.owned-metal");
+        let model = catalog_test_model(&dir, &spec);
+        let mut catalog = CatalogProfile::load("qwen3-reranker-0.6b.owned-metal").unwrap();
+        catalog.validate_readout(&model.tokenizer).unwrap();
+        let yes =
+            catalog.manifest["models"][&catalog.slug]["grammar"]["readout"]["yes"]["id"].clone();
+        let no =
+            catalog.manifest["models"][&catalog.slug]["grammar"]["readout"]["no"]["id"].clone();
+        catalog.manifest["models"][&catalog.slug]["grammar"]["readout"]["yes"]["id"] = no;
+        catalog.manifest["models"][&catalog.slug]["grammar"]["readout"]["no"]["id"] = yes;
+        assert!(catalog
+            .validate_readout(&model.tokenizer)
+            .unwrap_err()
+            .to_string()
+            .contains("qwen_readout_mismatch"));
+        catalog
+            .typed
+            .models
+            .get_mut(&catalog.slug)
+            .unwrap()
+            .grammar
+            .template
+            .as_mut()
+            .unwrap()
+            .prefix
+            .push('x');
+        assert!(catalog
+            .validate_template()
+            .unwrap_err()
+            .to_string()
+            .contains("qwen_template_mismatch"));
+        drop(model);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     fn make_test_tokenizer(dir: &Path, max_tokens: usize) -> SanitizedTokenizer {

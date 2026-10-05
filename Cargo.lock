@@ -6683,6 +6683,7 @@ dependencies = [
  "synapse-core",
  "synapse-engine-owned",
  "synapse-module",
+ "synapse-parity",
  "thiserror 1.0.69",
  "tokenizers 0.21.4",
  "tokio",
@@ -6713,6 +6714,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tokenizers 0.21.4",
 ]
 
 [[package]]

@@ -291,6 +291,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn unbounded_tokenization_preserves_overlength_input_without_disclosure() {
+        let path = std::env::temp_dir().join(format!(
+            "synapse-unbounded-tokenizer-{}.json",
+            unique_suffix()
+        ));
+        write_wordlevel_tokenizer(&path);
+        let tokenizer = SanitizedTokenizer::from_file(
+            &path,
+            TokenizerConfig {
+                max_tokens: usize::MAX,
+            },
+        )
+        .unwrap();
+        let text = std::iter::repeat_n("a", 8193).collect::<Vec<_>>().join(" ");
+        let item = tokenizer.tokenize(&text).unwrap();
+        assert_eq!(item.ids.len(), 8193);
+        assert_eq!(item.disclosure.submitted_tokens, 8193);
+        assert_eq!(item.disclosure.effective_tokens, 8193);
+        assert!(!item.disclosure.truncated);
+        assert_eq!(item.embedded_text, text);
+        std::fs::remove_file(path).unwrap();
+    }
+
     fn write_wordlevel_tokenizer(path: &Path) {
         let mut vocab = AHashMap::new();
         for (index, token) in ["[UNK]", "a", "b", "c", "d", "e"].iter().enumerate() {
