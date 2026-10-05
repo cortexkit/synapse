@@ -36,6 +36,8 @@ pub(crate) struct Model {
     embeddings: Tensor,
     pub(crate) layers: Vec<Layer>,
     final_norm: RmsNorm,
+    readout: Option<(Vec<f32>, Vec<f32>)>,
+    pad_token_id: u32,
 }
 
 pub(crate) struct Layer {
@@ -70,6 +72,16 @@ impl Model {
                 .with_context(|| format!("read config {}", config_path.display()))?,
         )
         .with_context(|| format!("parse config {}", config_path.display()))?;
+        Self::load_with_config(path, precision, config, None)
+    }
+
+    fn load_with_config(
+        path: &Path,
+        precision: Precision,
+        config: Config,
+        model: Option<&serde_json::Value>,
+    ) -> Result<Self> {
+        let root = resolve_model_root(path)?;
         ensure!(config.num_hidden_layers > 0, "Qwen3 config has no layers");
         ensure!(
             config.num_attention_heads > 0,
@@ -150,21 +162,50 @@ impl Model {
         if matches!(precision, super::Precision::F16) {
             final_norm.weight.prepare_metal_f16();
         }
+        let readout = model
+            .filter(|m| m["operation"] == "rerank")
+            .map(|model| -> Result<_> {
+                let spec = &model["grammar"]["readout"];
+                let key = spec["weight"].as_str().context("missing readout weight")?;
+                let weight = tensors
+                    .get(key)
+                    .context("head_tensor_missing: manifest readout key")?;
+                ensure!(
+                    weight.shape == vec![config.vocab_size, config.hidden_size],
+                    "readout shape mismatch"
+                );
+                let row = |name: &str| -> Result<Vec<f32>> {
+                    let id = spec[name]["id"].as_u64().context("missing readout id")? as usize;
+                    ensure!(id < config.vocab_size, "readout id outside vocabulary");
+                    Ok(
+                        weight.data[id * config.hidden_size..(id + 1) * config.hidden_size]
+                            .to_vec(),
+                    )
+                };
+                Ok((row("yes")?, row("no")?))
+            })
+            .transpose()?;
+        let pad_token_id = model
+            .map(|m| m["grammar"]["pad"]["id"].as_u64().context("missing pad id"))
+            .transpose()?
+            .unwrap_or(0) as u32;
         Ok(Self {
             config,
             eos_token_id,
             embeddings,
             layers,
             final_norm,
+            readout,
+            pad_token_id,
         })
     }
 
-    fn embed_ids(
+    fn forward_ids(
         &self,
         provider: &mut dyn KernelProvider,
         sequences: &[Vec<u32>],
         shape: Option<BatchShape>,
-    ) -> Result<Vec<Vec<f32>>> {
+    ) -> Result<(Vec<f32>, Vec<u8>, usize, usize, usize)> {
         let real_batch = sequences.len();
         ensure!(real_batch > 0, "Qwen3 batch must not be empty");
         let real_seq = sequences.iter().map(Vec::len).max().unwrap_or(1).max(1);
@@ -183,15 +224,21 @@ impl Model {
         let (batch, seq) = (target.batch, target.seq);
         let hidden = self.config.hidden_size;
         let mut hidden_states = vec![0.0f32; batch * seq * hidden];
-        let mut attention_mask = vec![0u8; batch * seq];
-        for (row, ids) in sequences.iter().enumerate() {
+        let (input_ids, attention_mask) =
+            super::pad_sequences(sequences, target, self.pad_token_id)?;
+        let rows: Vec<&[u32]> = if self.pad_token_id == 0 {
+            sequences.iter().map(Vec::as_slice).collect()
+        } else {
+            input_ids.chunks(seq).collect()
+        };
+        for (row, ids) in rows.iter().enumerate() {
             for (col, &id) in ids.iter().enumerate() {
                 let id = id as usize;
                 ensure!(
                     id < self.config.vocab_size,
                     "token id {id} outside Qwen3 vocab"
                 );
-                attention_mask[row * seq + col] = 1;
+
                 let source = id * hidden;
                 let target = (row * seq + col) * hidden;
                 hidden_states[target..target + hidden]
@@ -235,9 +282,7 @@ impl Model {
                 &self.final_norm,
             )?;
         }
-        let mut pooled = last_token_pool_l2(&hidden_states, &attention_mask, batch, seq, hidden);
-        pooled.truncate(real_batch);
-        Ok(pooled)
+        Ok((hidden_states, attention_mask, batch, seq, real_batch))
     }
 
     pub(crate) fn default_label(&self, precision: super::Precision) -> String {
@@ -256,6 +301,23 @@ impl Model {
 }
 
 impl ModelFamily for Model {
+    fn supports_rerank(&self) -> bool {
+        self.readout.is_some()
+    }
+
+    fn rerank_batch(
+        &self,
+        provider: &mut dyn KernelProvider,
+        sequences: &[Vec<u32>],
+        shape: Option<BatchShape>,
+    ) -> Result<Vec<f32>> {
+        let (yes, no) = self
+            .readout
+            .as_ref()
+            .context("Qwen3 model has no rerank readout")?;
+        let (states, mask, _, seq, real_batch) = self.forward_ids(provider, sequences, shape)?;
+        yes_no_scores(&states, &mask, real_batch, seq, yes, no)
+    }
     fn family_name(&self) -> &'static str {
         "qwen3-0.6b"
     }
@@ -266,8 +328,8 @@ impl ModelFamily for Model {
 
     fn tokenizer_policy(&self) -> super::FamilyTokenizerPolicy {
         super::FamilyTokenizerPolicy {
-            pad_token_id: 0,
-            terminal_token_id: Some(self.eos_token_id),
+            pad_token_id: self.pad_token_id,
+            terminal_token_id: self.readout.is_none().then_some(self.eos_token_id),
         }
     }
 
@@ -277,7 +339,11 @@ impl ModelFamily for Model {
         sequences: &[Vec<u32>],
         shape: Option<BatchShape>,
     ) -> Result<Vec<Vec<f32>>> {
-        self.embed_ids(provider, sequences, shape)
+        let (states, mask, batch, seq, real_batch) =
+            self.forward_ids(provider, sequences, shape)?;
+        let mut pooled = last_token_pool_l2(&states, &mask, batch, seq, self.config.hidden_size);
+        pooled.truncate(real_batch);
+        Ok(pooled)
     }
 }
 
@@ -1022,5 +1088,143 @@ mod tests {
         let pooled = last_token_pool_l2(&hidden, &[1, 1, 0], 1, 3, 2);
         assert!((pooled[0][0] - 0.6).abs() < 1e-6);
         assert!((pooled[0][1] - 0.8).abs() < 1e-6);
+    }
+}
+
+pub(super) fn load_catalog(
+    path: &Path,
+    precision: Precision,
+    model: &serde_json::Value,
+) -> Result<Box<dyn ModelFamily>> {
+    let config = serde_json::from_value(crate::catalog::config(model))?;
+    Ok(Box::new(Model::load_with_config(
+        path,
+        precision,
+        config,
+        Some(model),
+    )?))
+}
+
+fn yes_no_scores(
+    states: &[f32],
+    mask: &[u8],
+    batch: usize,
+    seq: usize,
+    yes: &[f32],
+    no: &[f32],
+) -> Result<Vec<f32>> {
+    ensure!(yes.len() == no.len(), "readout row widths disagree");
+    let hidden = yes.len();
+    (0..batch)
+        .map(|row| {
+            let last = (0..seq)
+                .rfind(|&col| mask[row * seq + col] != 0)
+                .context("empty rerank sequence")?;
+            let state = &states[(row * seq + last) * hidden..(row * seq + last + 1) * hidden];
+            let logit =
+                |weights: &[f32]| state.iter().zip(weights).map(|(x, w)| x * w).sum::<f32>();
+            // Subtracting the larger logit avoids overflow without involving any other vocabulary row.
+            let ly = logit(yes);
+            let ln = logit(no);
+            let max = ly.max(ln);
+            let y = (ly - max).exp();
+            let n = (ln - max).exp();
+            Ok(y / (y + n))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod rerank_tests {
+    use super::*;
+    #[test]
+    fn catalog_qwen_loads_named_rows_without_config() {
+        use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
+        use serde_json::json;
+        let path =
+            std::env::temp_dir().join(format!("synapse-qwen-catalog-{}", std::process::id()));
+        std::fs::create_dir_all(&path).unwrap();
+        let mut tensors: Vec<(String, Vec<usize>, Vec<u8>)> = Vec::new();
+        let mut push = |name: &str, shape: &[usize], values: &[f32]| {
+            tensors.push((
+                name.into(),
+                shape.to_vec(),
+                values.iter().flat_map(|x| x.to_le_bytes()).collect(),
+            ));
+        };
+        push(
+            "model.embed_tokens.weight",
+            &[3, 2],
+            &[1., 0., 0., 1., 1., 1.],
+        );
+        push("lm_head.weight", &[3, 2], &[0., 1., 1., 0., 20., 20.]);
+        for name in [
+            "input_layernorm",
+            "post_attention_layernorm",
+            "self_attn.q_norm",
+            "self_attn.k_norm",
+        ] {
+            push(&format!("model.layers.0.{name}.weight"), &[2], &[1., 1.]);
+        }
+        for name in [
+            "self_attn.q_proj",
+            "self_attn.k_proj",
+            "self_attn.v_proj",
+            "self_attn.o_proj",
+            "mlp.gate_proj",
+            "mlp.up_proj",
+            "mlp.down_proj",
+        ] {
+            push(&format!("model.layers.0.{name}.weight"), &[2, 2], &[0.; 4]);
+        }
+        push("model.norm.weight", &[2], &[1., 1.]);
+        let views = tensors
+            .iter()
+            .map(|(n, s, b)| {
+                (
+                    n.as_str(),
+                    TensorView::new(Dtype::F32, s.clone(), b).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        serialize_to_file(views, None, &path.join("model.safetensors")).unwrap();
+        let mut model = json!({"operation":"rerank", "architecture":{"family":"qwen3", "params":{
+            "hidden_size":2,"intermediate_size":2,"num_attention_heads":1,"num_key_value_heads":1,
+            "num_hidden_layers":1,"head_dim":2,"norm_eps":0.000001,"rope_theta":10000.,"vocab_size":3,"eos_token_id":2
+        }}, "grammar":{"pad":{"id":2},"readout":{"weight":"model.embed_tokens.weight","yes":{"id":0},"no":{"id":1}}}});
+        let score = |m: &serde_json::Value| {
+            load_catalog(&path, Precision::F32, m)
+                .unwrap()
+                .rerank_batch(
+                    &mut super::super::CpuProvider,
+                    &[vec![1, 0]],
+                    Some(BatchShape { batch: 1, seq: 4 }),
+                )
+                .unwrap()[0]
+        };
+        let tied = score(&model);
+        assert!((tied - 0.8044295).abs() < 1e-5);
+        std::fs::write(path.join("config.json"), b"tampered config").unwrap();
+        assert_eq!(score(&model), tied);
+        assert!(Model::load(&path, Precision::F32).is_err());
+        model["grammar"]["readout"]["weight"] = json!("lm_head.weight");
+        assert!((score(&model) - (1. - tied)).abs() < 1e-6);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn qwen_readout_is_two_way_at_last_non_pad() {
+        let scores = yes_no_scores(
+            &[100., -100., 2., 1., 999., 999.],
+            &[1, 1, 0],
+            1,
+            3,
+            &[1., 0.],
+            &[0., 1.],
+        )
+        .unwrap();
+        assert!((scores[0] - 0.7310586).abs() < 1e-6);
+        let full_vocab_yes = 2f32.exp() / (2f32.exp() + 1f32.exp() + 20f32.exp());
+        assert!((scores[0] - full_vocab_yes).abs() > 0.7);
     }
 }

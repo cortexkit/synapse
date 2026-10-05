@@ -2152,3 +2152,35 @@ mod bucket_policy_tests {
         assert_eq!(plan_batches(&[FULL_CONTEXT], &buckets), Err(FULL_CONTEXT));
     }
 }
+
+pub(crate) fn load_catalog_family(
+    path: &Path,
+    precision: Precision,
+    model: &serde_json::Value,
+) -> Result<Box<dyn ModelFamily>> {
+    match model["architecture"]["family"].as_str() {
+        Some("modernbert") => modernbert::load_catalog(path, precision, model),
+        Some("qwen3") => qwen3::load_catalog(path, precision, model),
+        _ => bail!("model_unsupported"),
+    }
+}
+
+pub(crate) fn pad_sequences(
+    sequences: &[Vec<u32>],
+    shape: BatchShape,
+    pad: u32,
+) -> Result<(Vec<u32>, Vec<u8>)> {
+    ensure!(
+        sequences.len() <= shape.batch && sequences.iter().all(|s| s.len() <= shape.seq),
+        "padding shape does not cover input"
+    );
+    let mut ids = vec![pad; shape.batch * shape.seq];
+    let mut mask = vec![0; shape.batch * shape.seq];
+    for (row, sequence) in sequences.iter().enumerate() {
+        for (col, &id) in sequence.iter().enumerate() {
+            ids[row * shape.seq + col] = id;
+            mask[row * shape.seq + col] = 1;
+        }
+    }
+    Ok((ids, mask))
+}

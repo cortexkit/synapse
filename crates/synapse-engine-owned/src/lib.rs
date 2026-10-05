@@ -18,6 +18,7 @@ use synapse_core::{
     ValidatedArtifact, Vector, Vectors,
 };
 
+mod catalog;
 #[cfg(target_os = "macos")]
 mod runtime;
 
@@ -387,8 +388,28 @@ impl OwnedMetalEmbedEngine {
     #[cfg(target_os = "macos")]
     fn load_macos(&mut self, cfg: &RuntimeConfig) -> Result<LoadedModel, EngineError> {
         let model_path = required_path(cfg, "model_path")?;
-        let detected = detect_family(&model_path)
-            .map_err(|error| Self::error(EngineErrorStage::Load, error.to_string()))?;
+        let catalog_model = cfg
+            .values
+            .get("profile")
+            .map(|profile| catalog::model(profile))
+            .transpose()
+            .map_err(|e| Self::error(EngineErrorStage::Load, e))?;
+        if let Some((_, dtype, model)) = &catalog_model {
+            if *dtype != self.dtype
+                || cfg.values.get("operation").map(String::as_str) != model["operation"].as_str()
+            {
+                return Err(Self::error(
+                    EngineErrorStage::Load,
+                    "operation or dtype mismatch",
+                ));
+            }
+        }
+        let detected = if let Some((family, _, _)) = &catalog_model {
+            *family
+        } else {
+            detect_family(&model_path)
+                .map_err(|error| Self::error(EngineErrorStage::Load, error.to_string()))?
+        };
         if detected != self.family {
             return Err(Self::error(
                 EngineErrorStage::Load,
@@ -427,8 +448,12 @@ impl OwnedMetalEmbedEngine {
             .map_err(|error| Self::error(EngineErrorStage::Load, error))?;
         let config = runtime::MetalExecutionConfig::new(execution, Some(package_root))
             .map_err(|error| Self::error(EngineErrorStage::Load, error.to_string()))?;
-        let family = runtime::load_model_family(&model_path, precision(self.dtype))
-            .map_err(|error| Self::error(EngineErrorStage::Load, error.to_string()))?;
+        let family = if let Some((_, _, model)) = &catalog_model {
+            runtime::load_catalog_family(&model_path, precision(self.dtype), model)
+        } else {
+            runtime::load_model_family(&model_path, precision(self.dtype))
+        }
+        .map_err(|error| Self::error(EngineErrorStage::Load, error.to_string()))?;
         let policy = family.tokenizer_policy();
         let tokenizer_policy = TokenizerPolicy {
             add_special_tokens: true,
@@ -1516,5 +1541,92 @@ mod tests {
         let cache_root = Path::new("/any/cache/path");
         let model_path = Path::new("/any/model/path");
         assert_eq!(remove_compiled_packages(cache_root, model_path), 0);
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod metal_capture_tests {
+    use super::*;
+    use serde_json::Value;
+    struct Capture {
+        fixture: Value,
+    }
+    impl runtime::ModelFamily for Capture {
+        fn family_name(&self) -> &'static str {
+            "capture"
+        }
+        fn output_dim(&self) -> usize {
+            1
+        }
+        fn tokenizer_policy(&self) -> runtime::FamilyTokenizerPolicy {
+            runtime::FamilyTokenizerPolicy {
+                pad_token_id: self.fixture["pad"].as_u64().unwrap() as u32,
+                terminal_token_id: None,
+            }
+        }
+        fn embed_batch(
+            &self,
+            _: &mut dyn runtime::KernelProvider,
+            _: &[Vec<u32>],
+            _: Option<runtime::BatchShape>,
+        ) -> anyhow::Result<Vec<Vec<f32>>> {
+            unreachable!()
+        }
+        fn supports_rerank(&self) -> bool {
+            true
+        }
+        fn rerank_batch(
+            &self,
+            _: &mut dyn runtime::KernelProvider,
+            sequences: &[Vec<u32>],
+            shape: Option<runtime::BatchShape>,
+        ) -> anyhow::Result<Vec<f32>> {
+            assert_eq!(
+                serde_json::to_value(sequences).unwrap(),
+                self.fixture["bucket_pairs"]
+            );
+            let (ids, mask) = runtime::pad_sequences(
+                sequences,
+                shape.unwrap(),
+                self.tokenizer_policy().pad_token_id,
+            )?;
+            assert_eq!(serde_json::to_value(ids).unwrap(), self.fixture["ids"]);
+            assert_eq!(serde_json::to_value(mask).unwrap(), self.fixture["mask"]);
+            let pairs: Vec<Vec<u32>> =
+                serde_json::from_value(self.fixture["pairs"].clone()).unwrap();
+            Ok(sequences
+                .iter()
+                .map(|s| if *s == pairs[0] { 0.25 } else { 0.75 })
+                .collect())
+        }
+    }
+    #[test]
+    fn metal_composed_pairs_and_bucket_mask_match_golden() {
+        for bytes in [
+            include_bytes!("../tests/fixtures/gte-reranker-modernbert-base.metal.json").as_slice(),
+            include_bytes!("../tests/fixtures/qwen3-reranker-0.6b.metal.json").as_slice(),
+        ] {
+            let fixture: Value = serde_json::from_slice(bytes).unwrap();
+            let pairs = serde_json::from_value(fixture["pairs"].clone()).unwrap();
+            let shape = runtime::BatchShape { batch: 2, seq: 128 };
+            let mut loaded = OwnedLoadedModel {
+                family: Box::new(Capture { fixture }),
+                provider: runtime::MetalProvider::new_with_config(
+                    runtime::Precision::F32,
+                    runtime::MetalExecutionConfig::new(runtime::Execution::Lazy, None).unwrap(),
+                )
+                .unwrap(),
+                buckets: vec![shape],
+                tokenizer_policy: TokenizerPolicy {
+                    add_special_tokens: false,
+                    pad_token_id: 0,
+                    terminal_token_id: None,
+                },
+            };
+            assert_eq!(
+                run_rerank_bucketed(&mut loaded, pairs).unwrap().scores,
+                vec![0.25, 0.75]
+            );
+        }
     }
 }

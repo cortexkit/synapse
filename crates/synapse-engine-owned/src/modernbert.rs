@@ -160,12 +160,23 @@ struct ModernBertModel {
     layers: Vec<Layer>,
     final_norm: Vec<f32>,
     classification_head: Option<ClassificationHead>,
+    catalog_readout: bool,
 }
 
 impl ModernBertModel {
     fn load(path: &Path, precision: Precision) -> Result<Self> {
         let model_root = resolve_model_root(path)?;
         let config = load_config(&model_root)?;
+        Self::load_with_config(path, precision, config, false)
+    }
+
+    fn load_with_config(
+        path: &Path,
+        precision: Precision,
+        config: ModernBertConfig,
+        catalog_readout: bool,
+    ) -> Result<Self> {
+        let model_root = resolve_model_root(path)?;
         ensure!(config.model_type == "modernbert", "model is not ModernBERT");
         ensure!(
             config.hidden_size % config.num_attention_heads == 0,
@@ -273,6 +284,7 @@ impl ModernBertModel {
             layers,
             final_norm,
             classification_head,
+            catalog_readout,
         })
     }
 
@@ -384,16 +396,19 @@ impl ModernBertModel {
         );
 
         let (batch, seq) = (target.batch, target.seq);
-        let mut input_ids = vec![self.config.pad_token_id; batch * seq];
-        let mut attention_mask = vec![0_u8; batch * seq];
-        for (row, ids) in sequences.iter().enumerate() {
-            for (col, &id) in ids.iter().enumerate() {
-                input_ids[row * seq + col] = id;
-                attention_mask[row * seq + col] = 1;
-            }
-        }
+        let (input_ids, attention_mask) =
+            super::pad_sequences(sequences, target, self.config.pad_token_id)?;
         let scores = self.forward_rerank(provider, &input_ids, &attention_mask, batch, seq)?;
-        Ok(scores[..real_batch].to_vec())
+        Ok(scores[..real_batch]
+            .iter()
+            .map(|&logit| {
+                if self.catalog_readout {
+                    1.0 / (1.0 + (-logit).exp())
+                } else {
+                    logit
+                }
+            })
+            .collect())
     }
 
     fn initial_hidden(&self, input_ids: &[u32]) -> Result<Vec<f32>> {
@@ -1516,6 +1531,41 @@ mod tests {
     }
 
     #[test]
+    fn catalog_ignores_tampered_config_but_preload_reads_it() {
+        let fixture = ModelFixture::new(HeadFixture::Complete, "gelu");
+        let stored: serde_json::Value =
+            serde_json::from_slice(&fs::read(fixture.path().join("config.json")).unwrap()).unwrap();
+        let mut params = stored.clone();
+        for (key, value) in [
+            ("activation", json!("gelu")),
+            ("norm_eps", json!(1e-5)),
+            ("local_attention", json!(128)),
+            ("global_attn_every_n_layers", json!(3)),
+            ("global_rope_theta", json!(160000.)),
+            ("local_rope_theta", json!(10000.)),
+            ("attention_bias", json!(false)),
+            ("mlp_bias", json!(false)),
+            ("norm_bias", json!(false)),
+        ] {
+            params[key] = value;
+        }
+        let catalog = json!({"architecture": {"family": "modernbert", "params": params}, "operation": "rerank"});
+        let score = |model: Box<dyn ModelFamily>| {
+            model
+                .rerank_batch(&mut CpuProvider, &[vec![1, 2]], None)
+                .unwrap()
+        };
+        let before = score(load_catalog(fixture.path(), Precision::F32, &catalog).unwrap());
+        fs::write(fixture.path().join("config.json"), b"not json").unwrap();
+        assert_eq!(
+            before,
+            score(load_catalog(fixture.path(), Precision::F32, &catalog).unwrap())
+        );
+        assert!(ModernBertModel::load(fixture.path(), Precision::F32).is_err());
+        assert!((before[0] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
     fn partial_classifier_tensors_fail_loading() {
         let fixture = ModelFixture::new(HeadFixture::MissingClassifierWeight, "gelu");
         let error = ModernBertModel::load(fixture.path(), Precision::F32)
@@ -1525,4 +1575,18 @@ mod tests {
             .to_string()
             .contains("missing tensor; tried classifier.weight"));
     }
+}
+
+pub(super) fn load_catalog(
+    path: &Path,
+    precision: Precision,
+    model: &serde_json::Value,
+) -> Result<Box<dyn ModelFamily>> {
+    let config = serde_json::from_value(crate::catalog::config(model))?;
+    let loaded = ModernBertModel::load_with_config(path, precision, config, true)?;
+    ensure!(
+        loaded.classification_head.is_some() == (model["operation"] == "rerank"),
+        "operation_mismatch: classifier head"
+    );
+    Ok(Box::new(loaded))
 }
