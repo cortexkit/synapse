@@ -29,6 +29,61 @@ pub fn worker_binary_file_name(engine: &str) -> Option<&'static str> {
         "ane" => Some("ck-synapse-worker-ane"),
         CUDA_WORKER_ENGINE => Some("ck-synapse-worker-cuda"),
         DECODE_WORKER_ENGINE => Some("ck-synapse-worker-decode"),
+        VULKAN_WORKER_ENGINE => Some("ck-synapse-worker-vulkan"),
+        ANE_DIRECT_WORKER_ENGINE => Some("ck-synapse-worker-ane-direct"),
         _ => None,
+    }
+}
+
+/// CUDA kernel revision used for lane fingerprints and worker HELLO validation.
+/// Keeping the string here lets the host identify kernels without linking GPU code.
+pub const CUDA_KERNEL_REVISION: &str = "4d0ded67c30286fe2be37cc7413359ad745dd751";
+/// SHA-256 of the Vulkan worker's embedded SPIR-V set.
+pub const VULKAN_KERNEL_REVISION: &str =
+    "7351dbef33cda19b4b20e8427ba71497580d9b401d023fdcc7db01456cfc9b4a";
+/// Revision identifying the computations compiled for the direct Neural Engine worker.
+pub const ANE_DIRECT_KERNEL_REVISION: &str = "ane-direct-graph-v1";
+/// Revision identifying owned Metal computations and the policy that pads inputs
+/// to supported sequence-length buckets.
+pub const METAL_KERNEL_REVISION: &str = "owned-metal-graph-4-bucket-2";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn worker_names_resolve_beside_module_on_unix_and_windows() {
+        for windows in [false, true] {
+            let module = Path::new("install").join(if windows {
+                "ck-synapse.exe"
+            } else {
+                "ck-synapse"
+            });
+            for (engine, binary) in [
+                (LLAMA_ENGINE, "ck-synapse-worker-llama"),
+                ("ane", "ck-synapse-worker-ane"),
+                (CUDA_WORKER_ENGINE, "ck-synapse-worker-cuda"),
+                (DECODE_WORKER_ENGINE, "ck-synapse-worker-decode"),
+                (VULKAN_WORKER_ENGINE, "ck-synapse-worker-vulkan"),
+                (ANE_DIRECT_WORKER_ENGINE, "ck-synapse-worker-ane-direct"),
+            ] {
+                let mut sibling = module
+                    .parent()
+                    .unwrap()
+                    .join(worker_binary_file_name(engine).unwrap());
+                if windows {
+                    sibling.set_extension("exe");
+                }
+                let expected = if windows {
+                    format!("{binary}.exe")
+                } else {
+                    binary.to_string()
+                };
+                assert_eq!(sibling, Path::new("install").join(expected));
+            }
+            assert_eq!(worker_binary_file_name(LLAMA_WORKER_ENGINE), None);
+            assert_eq!(worker_binary_file_name(ANE_WORKER_ENGINE), None);
+        }
     }
 }

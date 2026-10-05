@@ -2946,6 +2946,12 @@ fn build_stored_model_config(
         },
         prefix_template: None,
         thread_policy: ThreadPolicyClass::Balanced,
+        operation: None,
+        input_grammar: None,
+        kernel_revision: None,
+        rotation: None,
+        converted_package_digest: None,
+        manifest_profile_digest: None,
     };
     Ok(StoredModelConfig {
         model_id,
@@ -19098,6 +19104,12 @@ mod tests {
                 prompt_template: Some("synapse-rerank-bos-query-sep-doc-eos-v1".to_string()),
                 prefix_template: None,
                 thread_policy: ThreadPolicyClass::Balanced,
+                operation: None,
+                input_grammar: None,
+                kernel_revision: None,
+                rotation: None,
+                converted_package_digest: None,
+                manifest_profile_digest: None,
             }
             .numeric_profile_id()
         );
