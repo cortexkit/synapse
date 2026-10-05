@@ -27,3 +27,17 @@ bounded drain timeout must escalate to confirmed owner exit, not permanently clo
 ```
 
 After fix:25 ordinary tests pass (three hardware ignored), including the drain-timeout regression and `unconfirmed_exit_keeps_worker_closed_and_budget_charged`. The leader escalates at its drain deadline; channel restart faults/notifies active I/O before taking the stream lock, closes the connection and awaits the owning-session exit confirmation. The real process exit callback already escalates to killing its owned child after a ten-second graceful wait and confirms the exit status. Only unconfirmed ownership or failed replacement/restoration remains permanently closed, with reservations charged; a mere drain deadline no longer does. Existing lease-draining and exit-order tests remain green.
+
+## Old-owner eviction queued behind restart
+
+Before owning-process generation checks, queued work could affect a restarted server:
+
+```text
+queued_eviction_from_old_owner_is_refused_after_restart ... FAILED
+an eviction queued for the retired owner must not reach its replacement
+0 passed;1 failed; finished in0.01s
+```
+
+The test deterministically queues restart first, eviction second behind the same connection mutex, then releases the mutex. After restart, the old eviction must be refused and no eviction command may arrive in the new server. An additional assertion retains a newly admitted sequence-length128 shape while holding its lease and refuses an explicitly old-generation eviction without removing it.
+
+A monotonic owning-process generation is captured in each reservation and supplied to admit/retry/evict operations. The channel checks it while holding the stream mutex before writing. Restart advances it under that same mutex. Detached work whose old reservation has already retired cannot evict or admit on the replacement; stale refusals do not restart the new owner. Direct `exchange` callers (LOAD metadata and inference, as well as shape commands) also capture/check their generation across connection-lock waits. No worker wire protocol changed.
