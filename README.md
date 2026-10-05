@@ -138,9 +138,10 @@ This delay-loading behavior is Windows-only. The Linux ELF worker requires
 exactly the CUDA runtime sonames `libcudart.so.13`, `libcublas.so.13` and
 `libcublasLt.so.13` on the library search path. Missing any of them prevents
 even `--probe-floor` from reaching the driver-only probe. The driver library
-`libcuda.so.1` is resolved at runtime, not a load-time dependency. CUDA 13.2.1
-builds require NVIDIA driver API >= 13020 (the raw `cuDriverGetVersion()`
-integer), not merely a driver advertising CUDA 13.0.
+`libcuda.so.1` is resolved at runtime, not a load-time dependency. The worker
+requires NVIDIA driver API >= 13000 (the raw `cuDriverGetVersion()` integer,
+the CUDA 13 driver line), the `cuda_min_driver_api` floor every CUDA profile in
+`bench/parity/models.json` declares.
 
 The `release-candidate` workflow builds these workers from an exact source
 commit and uploads immutable assets to a draft `candidate-<S>` release, where
