@@ -10,6 +10,7 @@ use std::path::Path;
 use synapse_core::{AneExecutable, AnePlacementInventory};
 
 pub const REVISION: &str = "ane-direct-graph-v1";
+const PRODUCTION_SHAPE_LIMIT: usize = 4;
 pub const LADDER: [usize; 7] = [128, 256, 512, 1024, 2048, 4096, 8192];
 pub fn rung(tokens: usize) -> Result<usize> {
     ensure!(tokens > 0, "invalid_request");
@@ -222,13 +223,22 @@ impl Model {
         &mut self,
         shape: usize,
         os: &str,
+        compile: impl FnMut(&Graph, usize) -> std::result::Result<ane::Executable, ane::Error>,
+    ) -> Result<AnePlacementInventory> {
+        self.admit_with_limit(shape, os, PRODUCTION_SHAPE_LIMIT, compile)
+    }
+    fn admit_with_limit(
+        &mut self,
+        shape: usize,
+        os: &str,
+        limit: usize,
         mut compile: impl FnMut(&Graph, usize) -> std::result::Result<ane::Executable, ane::Error>,
     ) -> Result<AnePlacementInventory> {
         ensure!(LADDER.contains(&shape), "invalid_shape");
         if let Some(resident) = self.resident.get(&shape) {
             return Ok(resident.inventory.clone());
         }
-        ensure!(self.resident.len() < 4, "ane_residency_limit");
+        ensure!(self.resident.len() < limit, "ane_residency_limit");
         let inventory = self.profile.inventory(shape, os)?;
         let hidden = self.profile.n("hidden_size");
         let mut executables = Vec::new();
@@ -756,6 +766,122 @@ mod fresh_process_hardware {
             .to_owned();
         Model::load(profile, &root.join(format!("{slug}.safetensors")), &digest).unwrap()
     }
+    #[test]
+    fn production_shape_limit_refuses_fifth_shape() {
+        let profile = Profile::select("gte-modernbert-base.ane-direct-worker", "embed").unwrap();
+        let mut model = Model {
+            profile,
+            tensors: BTreeMap::new(),
+            resident: BTreeMap::new(),
+        };
+        // Empty executables isolate the fifth-shape rejection, which must precede graph construction.
+        for shape in [128, 256, 512, 1024] {
+            model.resident.insert(
+                shape,
+                Resident {
+                    inventory: model
+                        .profile
+                        .inventory(shape, "capacity-unit-test")
+                        .unwrap(),
+                    executables: Vec::new(),
+                    a: TensorData::new(modernbert::shape(1, 1)),
+                    b: TensorData::new(modernbert::shape(1, 1)),
+                    residual: TensorData::new(modernbert::shape(1, 1)),
+                    mask: TensorData::new(modernbert::shape(1, 1)),
+                },
+            );
+        }
+        assert_eq!(
+            model
+                .admit(2048, "capacity-unit-test")
+                .unwrap_err()
+                .to_string(),
+            "ane_residency_limit"
+        );
+        assert_eq!(model.resident.len(), 4);
+    }
+
+    #[test]
+    #[ignore = "Sequential capacity experiment with pinned weights; run alone in a fresh process"]
+    fn fresh_process_residency_capacity() {
+        let mix = std::env::var("ANE_CAPACITY_MIX").expect("ANE_CAPACITY_MIX");
+        let slugs: &[&str] = match mix.as_str() {
+            "gte" => &["gte-modernbert-base"],
+            "qwen" => &["qwen3-embedding-0.6b"],
+            "alternating" => &["gte-modernbert-base", "qwen3-embedding-0.6b"],
+            "all-four" => &[
+                "gte-modernbert-base",
+                "gte-reranker-modernbert-base",
+                "qwen3-embedding-0.6b",
+                "qwen3-reranker-0.6b",
+            ],
+            _ => panic!("unknown capacity mix"),
+        };
+        let mut models: Vec<_> = slugs.iter().map(|slug| model(slug)).collect();
+        let mut resident = Vec::new();
+        let mut resident_mil = 0usize;
+        let mut resident_weights = 0usize;
+        let mut submitted_mil = 0usize;
+        let mut submitted_weights = 0usize;
+        let mut resident_executables = 0usize;
+        let mut admissions = Vec::new();
+        let mut exhausted = false;
+        'ladder: for shape in [128, 256, 512, 1024, 2048] {
+            for (index, model) in models.iter_mut().enumerate() {
+                let mut mil_bytes = 0usize;
+                let mut weight_bytes = 0usize;
+                let mut loaded = 0usize;
+                let started = std::time::Instant::now();
+                // The ignored capacity probe bypasses the four-shape cap to measure hardware exhaustion.
+                let result =
+                    model.admit_with_limit(shape, "capacity-development", 64, |graph, _| {
+                        let (mil, weights) = graph.source_payload();
+                        mil_bytes += mil.len();
+                        weight_bytes += weights.len();
+                        let result = graph.compile(NSQualityOfService::UserInteractive);
+                        if result.is_ok() {
+                            loaded += 1;
+                        }
+                        result
+                    });
+                submitted_mil += mil_bytes;
+                submitted_weights += weight_bytes;
+                if result.is_ok() {
+                    resident.push(serde_json::json!({"model": slugs[index], "length": shape, "executables": loaded, "mil_bytes": mil_bytes, "weight_bytes": weight_bytes}));
+                    resident_executables += loaded;
+                    resident_mil += mil_bytes;
+                    resident_weights += weight_bytes;
+                }
+                let error = result.err().map(|e| format!("{e:#}"));
+                admissions.push(serde_json::json!({"model": slugs[index], "length": shape, "elapsed_ms": started.elapsed().as_secs_f64()*1000.0, "loaded_before_rollback": loaded, "mil_bytes_submitted": mil_bytes, "weight_bytes_submitted": weight_bytes, "error": error}));
+                if let Some(error) = error {
+                    assert!(
+                        error.starts_with("ane_resources_exhausted:"),
+                        "unexpected admission failure: {error}"
+                    );
+                    exhausted = true;
+                    break 'ladder;
+                }
+            }
+        }
+        let report = serde_json::json!({
+            "classification": "development", "mix": mix, "exhausted": exhausted,
+            "resident_shapes": resident, "resident_executables": resident_executables,
+            "resident_mil_bytes": resident_mil, "resident_weight_bytes": resident_weights,
+            "submitted_mil_bytes": submitted_mil, "submitted_weight_bytes": submitted_weights,
+            "admissions": admissions,
+            "accounting": "Compiler source payload, not opaque executable memory. Failed admission's partial executables are rolled back; submitted totals include its failing layer."
+        });
+        std::fs::write(
+            std::env::var_os("ANE_CAPACITY_OUT").expect("ANE_CAPACITY_OUT"),
+            serde_json::to_vec_pretty(&report).unwrap(),
+        )
+        .unwrap();
+        println!("CAPACITY_RESULT {report}");
+        drop(models);
+        cleanup_diagnostic_artifacts();
+    }
+
     #[test]
     #[ignore = "Nth-load rollback uses real ANE executables and pinned weights"]
     fn nth_load_exhaustion_leaves_shape_fully_absent() {
