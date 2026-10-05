@@ -1,0 +1,164 @@
+{
+  "admitted_count": 4,
+  "ane_lane_busy": {
+    "status": "covered_by_killed_holder_test"
+  },
+  "completed_count": 4,
+  "evicted_count": 4,
+  "harness_profile": "debug",
+  "kind": "development",
+  "leased_evict_count": 0,
+  "load_1_5_15_end": [
+    8.93,
+    13.46,
+    18.9
+  ],
+  "load_1_5_15_start": [
+    11.64,
+    19.26,
+    22.6
+  ],
+  "machine": {
+    "model_identifier": "Mac17,6"
+  },
+  "max_resident_per_model": 2,
+  "max_resident_total": 4,
+  "metal_ranking_check": {
+    "reason": "Metal rerank package/lane unavailable in isolated worktree; missing2048-rung parity fixture is a parity-crate follow-up",
+    "status": "skipped"
+  },
+  "no_ane_resources": {
+    "count": 33
+  },
+  "os": {
+    "build": "26A434",
+    "version": "27.0.1"
+  },
+  "request_count": 37,
+  "request_errors": [
+    "Ok(Err(ResourcesExhausted { msg: \"worker returned ane_resources_exhausted: ane_resources_exhausted:compile layer 18: ANE load failed: createProgramInstanceForModel:modelToken:modelFilePath:qos:isPreCompiled:enablePowerSaving:skipPreparePhase:statsMask:memoryPoolID:enableLateLatch:modelIdentityStr:owningPid:cacheUrlIdentifier:aotCacheUrlIdentifier:optOutOfModelMemoryUnwiring:intermediateBufferSizeHint:error:: Program load failed — no ANE resources (transient; retry) (underlying=0x5)\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"worker returned ane_resources_exhausted: ane_resources_exhausted:compile layer 0: ANE load failed: createProgramInstanceForModel:modelToken:modelFilePath:qos:isPreCompiled:enablePowerSaving:skipPreparePhase:statsMask:memoryPoolID:enableLateLatch:modelIdentityStr:owningPid:cacheUrlIdentifier:aotCacheUrlIdentifier:optOutOfModelMemoryUnwiring:intermediateBufferSizeHint:error:: Program load failed — no ANE resources (transient; retry) (underlying=0x5)\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"worker returned ane_resources_exhausted: ane_resources_exhausted:compile layer 0: ANE load failed: createProgramInstanceForModel:modelToken:modelFilePath:qos:isPreCompiled:enablePowerSaving:skipPreparePhase:statsMask:memoryPoolID:enableLateLatch:modelIdentityStr:owningPid:cacheUrlIdentifier:aotCacheUrlIdentifier:optOutOfModelMemoryUnwiring:intermediateBufferSizeHint:error:: Program load failed — no ANE resources (transient; retry) (underlying=0x5)\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"worker returned ane_resources_exhausted: ane_resources_exhausted:compile layer 0: ANE load failed: createProgramInstanceForModel:modelToken:modelFilePath:qos:isPreCompiled:enablePowerSaving:skipPreparePhase:statsMask:memoryPoolID:enableLateLatch:modelIdentityStr:owningPid:cacheUrlIdentifier:aotCacheUrlIdentifier:optOutOfModelMemoryUnwiring:intermediateBufferSizeHint:error:: Program load failed — no ANE resources (transient; retry) (underlying=0x5)\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"worker returned ane_resources_exhausted: ane_resources_exhausted:compile layer 0: ANE load failed: createProgramInstanceForModel:modelToken:modelFilePath:qos:isPreCompiled:enablePowerSaving:skipPreparePhase:statsMask:memoryPoolID:enableLateLatch:modelIdentityStr:owningPid:cacheUrlIdentifier:aotCacheUrlIdentifier:optOutOfModelMemoryUnwiring:intermediateBufferSizeHint:error:: Program load failed — no ANE resources (transient; retry) (underlying=0x5)\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"worker returned ane_resources_exhausted: ane_resources_exhausted:compile layer 0: ANE load failed: createProgramInstanceForModel:modelToken:modelFilePath:qos:isPreCompiled:enablePowerSaving:skipPreparePhase:statsMask:memoryPoolID:enableLateLatch:modelIdentityStr:owningPid:cacheUrlIdentifier:aotCacheUrlIdentifier:optOutOfModelMemoryUnwiring:intermediateBufferSizeHint:error:: Program load failed — no ANE resources (transient; retry) (underlying=0x5)\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"worker returned ane_resources_exhausted: ane_resources_exhausted:compile layer 0: ANE load failed: createProgramInstanceForModel:modelToken:modelFilePath:qos:isPreCompiled:enablePowerSaving:skipPreparePhase:statsMask:memoryPoolID:enableLateLatch:modelIdentityStr:owningPid:cacheUrlIdentifier:aotCacheUrlIdentifier:optOutOfModelMemoryUnwiring:intermediateBufferSizeHint:error:: Program load failed — no ANE resources (transient; retry) (underlying=0x5)\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"worker returned ane_resources_exhausted: ane_resources_exhausted:compile layer 0: ANE load failed: createProgramInstanceForModel:modelToken:modelFilePath:qos:isPreCompiled:enablePowerSaving:skipPreparePhase:statsMask:memoryPoolID:enableLateLatch:modelIdentityStr:owningPid:cacheUrlIdentifier:aotCacheUrlIdentifier:optOutOfModelMemoryUnwiring:intermediateBufferSizeHint:error:: Program load failed — no ANE resources (transient; retry) (underlying=0x5)\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"worker returned ane_resources_exhausted: ane_resources_exhausted:compile layer 0: ANE load failed: createProgramInstanceForModel:modelToken:modelFilePath:qos:isPreCompiled:enablePowerSaving:skipPreparePhase:statsMask:memoryPoolID:enableLateLatch:modelIdentityStr:owningPid:cacheUrlIdentifier:aotCacheUrlIdentifier:optOutOfModelMemoryUnwiring:intermediateBufferSizeHint:error:: Program load failed — no ANE resources (transient; retry) (underlying=0x5)\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"worker returned ane_resources_exhausted: ane_resources_exhausted:compile layer 0: ANE load failed: createProgramInstanceForModel:modelToken:modelFilePath:qos:isPreCompiled:enablePowerSaving:skipPreparePhase:statsMask:memoryPoolID:enableLateLatch:modelIdentityStr:owningPid:cacheUrlIdentifier:aotCacheUrlIdentifier:optOutOfModelMemoryUnwiring:intermediateBufferSizeHint:error:: Program load failed — no ANE resources (transient; retry) (underlying=0x5)\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"worker returned ane_resources_exhausted: ane_resources_exhausted:compile layer 0: ANE load failed: createProgramInstanceForModel:modelToken:modelFilePath:qos:isPreCompiled:enablePowerSaving:skipPreparePhase:statsMask:memoryPoolID:enableLateLatch:modelIdentityStr:owningPid:cacheUrlIdentifier:aotCacheUrlIdentifier:optOutOfModelMemoryUnwiring:intermediateBufferSizeHint:error:: Program load failed — no ANE resources (transient; retry) (underlying=0x5)\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"worker returned ane_resources_exhausted: ane_resources_exhausted:compile layer 0: ANE load failed: createProgramInstanceForModel:modelToken:modelFilePath:qos:isPreCompiled:enablePowerSaving:skipPreparePhase:statsMask:memoryPoolID:enableLateLatch:modelIdentityStr:owningPid:cacheUrlIdentifier:aotCacheUrlIdentifier:optOutOfModelMemoryUnwiring:intermediateBufferSizeHint:error:: Program load failed — no ANE resources (transient; retry) (underlying=0x5)\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"worker returned ane_resources_exhausted: ane_resources_exhausted:compile layer 0: ANE load failed: createProgramInstanceForModel:modelToken:modelFilePath:qos:isPreCompiled:enablePowerSaving:skipPreparePhase:statsMask:memoryPoolID:enableLateLatch:modelIdentityStr:owningPid:cacheUrlIdentifier:aotCacheUrlIdentifier:optOutOfModelMemoryUnwiring:intermediateBufferSizeHint:error:: Program load failed — no ANE resources (transient; retry) (underlying=0x5)\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"worker returned ane_resources_exhausted: ane_resources_exhausted:compile layer 0: ANE load failed: createProgramInstanceForModel:modelToken:modelFilePath:qos:isPreCompiled:enablePowerSaving:skipPreparePhase:statsMask:memoryPoolID:enableLateLatch:modelIdentityStr:owningPid:cacheUrlIdentifier:aotCacheUrlIdentifier:optOutOfModelMemoryUnwiring:intermediateBufferSizeHint:error:: Program load failed — no ANE resources (transient; retry) (underlying=0x5)\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"worker returned ane_resources_exhausted: ane_resources_exhausted:compile layer 0: ANE load failed: createProgramInstanceForModel:modelToken:modelFilePath:qos:isPreCompiled:enablePowerSaving:skipPreparePhase:statsMask:memoryPoolID:enableLateLatch:modelIdentityStr:owningPid:cacheUrlIdentifier:aotCacheUrlIdentifier:optOutOfModelMemoryUnwiring:intermediateBufferSizeHint:error:: Program load failed — no ANE resources (transient; retry) (underlying=0x5)\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"worker returned ane_resources_exhausted: ane_resources_exhausted:compile layer 0: ANE load failed: createProgramInstanceForModel:modelToken:modelFilePath:qos:isPreCompiled:enablePowerSaving:skipPreparePhase:statsMask:memoryPoolID:enableLateLatch:modelIdentityStr:owningPid:cacheUrlIdentifier:aotCacheUrlIdentifier:optOutOfModelMemoryUnwiring:intermediateBufferSizeHint:error:: Program load failed — no ANE resources (transient; retry) (underlying=0x5)\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"worker returned ane_resources_exhausted: ane_resources_exhausted:compile layer 0: ANE load failed: createProgramInstanceForModel:modelToken:modelFilePath:qos:isPreCompiled:enablePowerSaving:skipPreparePhase:statsMask:memoryPoolID:enableLateLatch:modelIdentityStr:owningPid:cacheUrlIdentifier:aotCacheUrlIdentifier:optOutOfModelMemoryUnwiring:intermediateBufferSizeHint:error:: Program load failed — no ANE resources (transient; retry) (underlying=0x5)\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"worker returned ane_resources_exhausted: ane_resources_exhausted:compile layer 0: ANE load failed: createProgramInstanceForModel:modelToken:modelFilePath:qos:isPreCompiled:enablePowerSaving:skipPreparePhase:statsMask:memoryPoolID:enableLateLatch:modelIdentityStr:owningPid:cacheUrlIdentifier:aotCacheUrlIdentifier:optOutOfModelMemoryUnwiring:intermediateBufferSizeHint:error:: Program load failed — no ANE resources (transient; retry) (underlying=0x5)\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"worker returned ane_resources_exhausted: ane_resources_exhausted:compile layer 0: ANE load failed: createProgramInstanceForModel:modelToken:modelFilePath:qos:isPreCompiled:enablePowerSaving:skipPreparePhase:statsMask:memoryPoolID:enableLateLatch:modelIdentityStr:owningPid:cacheUrlIdentifier:aotCacheUrlIdentifier:optOutOfModelMemoryUnwiring:intermediateBufferSizeHint:error:: Program load failed — no ANE resources (transient; retry) (underlying=0x5)\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"worker returned ane_resources_exhausted: ane_resources_exhausted:compile layer 0: ANE load failed: createProgramInstanceForModel:modelToken:modelFilePath:qos:isPreCompiled:enablePowerSaving:skipPreparePhase:statsMask:memoryPoolID:enableLateLatch:modelIdentityStr:owningPid:cacheUrlIdentifier:aotCacheUrlIdentifier:optOutOfModelMemoryUnwiring:intermediateBufferSizeHint:error:: Program load failed — no ANE resources (transient; retry) (underlying=0x5)\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"worker returned ane_resources_exhausted: ane_resources_exhausted:compile layer 0: ANE load failed: createProgramInstanceForModel:modelToken:modelFilePath:qos:isPreCompiled:enablePowerSaving:skipPreparePhase:statsMask:memoryPoolID:enableLateLatch:modelIdentityStr:owningPid:cacheUrlIdentifier:aotCacheUrlIdentifier:optOutOfModelMemoryUnwiring:intermediateBufferSizeHint:error:: Program load failed — no ANE resources (transient; retry) (underlying=0x5)\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"worker returned ane_resources_exhausted: ane_resources_exhausted:compile layer 0: ANE load failed: createProgramInstanceForModel:modelToken:modelFilePath:qos:isPreCompiled:enablePowerSaving:skipPreparePhase:statsMask:memoryPoolID:enableLateLatch:modelIdentityStr:owningPid:cacheUrlIdentifier:aotCacheUrlIdentifier:optOutOfModelMemoryUnwiring:intermediateBufferSizeHint:error:: Program load failed — no ANE resources (transient; retry) (underlying=0x5)\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"worker returned ane_resources_exhausted: ane_resources_exhausted:compile layer 0: ANE load failed: createProgramInstanceForModel:modelToken:modelFilePath:qos:isPreCompiled:enablePowerSaving:skipPreparePhase:statsMask:memoryPoolID:enableLateLatch:modelIdentityStr:owningPid:cacheUrlIdentifier:aotCacheUrlIdentifier:optOutOfModelMemoryUnwiring:intermediateBufferSizeHint:error:: Program load failed — no ANE resources (transient; retry) (underlying=0x5)\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"worker returned ane_resources_exhausted: ane_resources_exhausted:compile layer 0: ANE load failed: createProgramInstanceForModel:modelToken:modelFilePath:qos:isPreCompiled:enablePowerSaving:skipPreparePhase:statsMask:memoryPoolID:enableLateLatch:modelIdentityStr:owningPid:cacheUrlIdentifier:aotCacheUrlIdentifier:optOutOfModelMemoryUnwiring:intermediateBufferSizeHint:error:: Program load failed — no ANE resources (transient; retry) (underlying=0x5)\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"worker returned ane_resources_exhausted: ane_resources_exhausted:compile layer 0: ANE load failed: createProgramInstanceForModel:modelToken:modelFilePath:qos:isPreCompiled:enablePowerSaving:skipPreparePhase:statsMask:memoryPoolID:enableLateLatch:modelIdentityStr:owningPid:cacheUrlIdentifier:aotCacheUrlIdentifier:optOutOfModelMemoryUnwiring:intermediateBufferSizeHint:error:: Program load failed — no ANE resources (transient; retry) (underlying=0x5)\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"worker returned ane_resources_exhausted: ane_resources_exhausted:compile layer 0: ANE load failed: createProgramInstanceForModel:modelToken:modelFilePath:qos:isPreCompiled:enablePowerSaving:skipPreparePhase:statsMask:memoryPoolID:enableLateLatch:modelIdentityStr:owningPid:cacheUrlIdentifier:aotCacheUrlIdentifier:optOutOfModelMemoryUnwiring:intermediateBufferSizeHint:error:: Program load failed — no ANE resources (transient; retry) (underlying=0x5)\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"worker returned ane_resources_exhausted: ane_resources_exhausted:compile layer 0: ANE load failed: createProgramInstanceForModel:modelToken:modelFilePath:qos:isPreCompiled:enablePowerSaving:skipPreparePhase:statsMask:memoryPoolID:enableLateLatch:modelIdentityStr:owningPid:cacheUrlIdentifier:aotCacheUrlIdentifier:optOutOfModelMemoryUnwiring:intermediateBufferSizeHint:error:: Program load failed — no ANE resources (transient; retry) (underlying=0x5)\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"worker returned ane_resources_exhausted: ane_resources_exhausted:compile layer 0: ANE load failed: createProgramInstanceForModel:modelToken:modelFilePath:qos:isPreCompiled:enablePowerSaving:skipPreparePhase:statsMask:memoryPoolID:enableLateLatch:modelIdentityStr:owningPid:cacheUrlIdentifier:aotCacheUrlIdentifier:optOutOfModelMemoryUnwiring:intermediateBufferSizeHint:error:: Program load failed — no ANE resources (transient; retry) (underlying=0x5)\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"worker returned ane_resources_exhausted: ane_resources_exhausted:compile layer 0: ANE load failed: createProgramInstanceForModel:modelToken:modelFilePath:qos:isPreCompiled:enablePowerSaving:skipPreparePhase:statsMask:memoryPoolID:enableLateLatch:modelIdentityStr:owningPid:cacheUrlIdentifier:aotCacheUrlIdentifier:optOutOfModelMemoryUnwiring:intermediateBufferSizeHint:error:: Program load failed — no ANE resources (transient; retry) (underlying=0x5)\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"worker returned ane_resources_exhausted: ane_resources_exhausted:compile layer 0: ANE load failed: createProgramInstanceForModel:modelToken:modelFilePath:qos:isPreCompiled:enablePowerSaving:skipPreparePhase:statsMask:memoryPoolID:enableLateLatch:modelIdentityStr:owningPid:cacheUrlIdentifier:aotCacheUrlIdentifier:optOutOfModelMemoryUnwiring:intermediateBufferSizeHint:error:: Program load failed — no ANE resources (transient; retry) (underlying=0x5)\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"worker returned ane_resources_exhausted: ane_resources_exhausted:compile layer 0: ANE load failed: createProgramInstanceForModel:modelToken:modelFilePath:qos:isPreCompiled:enablePowerSaving:skipPreparePhase:statsMask:memoryPoolID:enableLateLatch:modelIdentityStr:owningPid:cacheUrlIdentifier:aotCacheUrlIdentifier:optOutOfModelMemoryUnwiring:intermediateBufferSizeHint:error:: Program load failed — no ANE resources (transient; retry) (underlying=0x5)\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"worker returned ane_resources_exhausted: ane_resources_exhausted:compile layer 0: ANE load failed: createProgramInstanceForModel:modelToken:modelFilePath:qos:isPreCompiled:enablePowerSaving:skipPreparePhase:statsMask:memoryPoolID:enableLateLatch:modelIdentityStr:owningPid:cacheUrlIdentifier:aotCacheUrlIdentifier:optOutOfModelMemoryUnwiring:intermediateBufferSizeHint:error:: Program load failed — no ANE resources (transient; retry) (underlying=0x5)\", retry_after_ms: 250 }))",
+    "Ok(Err(ResourcesExhausted { msg: \"worker returned ane_resources_exhausted: ane_resources_exhausted:compile layer 0: ANE load failed: createProgramInstanceForModel:modelToken:modelFilePath:qos:isPreCompiled:enablePowerSaving:skipPreparePhase:statsMask:memoryPoolID:enableLateLatch:modelIdentityStr:owningPid:cacheUrlIdentifier:aotCacheUrlIdentifier:optOutOfModelMemoryUnwiring:intermediateBufferSizeHint:error:: Program load failed — no ANE resources (transient; retry) (underlying=0x5)\", retry_after_ms: 250 }))"
+  ],
+  "reranker_pool_check": {
+    "byte_identical_repeats": "failed",
+    "finite": "failed",
+    "scores_by_rung": []
+  },
+  "sample_count": 8,
+  "samples": [
+    {
+      "ane-direct:qwen3-embedding-0.6b.ane-direct-worker:sha256:1af6d091d7d5f21a998af0f438333d9af051c82af8b27bd2439c60efa09bd5db": [
+        128
+      ],
+      "ane-direct:qwen3-reranker-0.6b.ane-direct-worker:sha256:cc02357cfc81a92562b251914bed5c8d3960b7edf4814ee73de9f21611e22959": [
+        256,
+        1024
+      ]
+    },
+    {
+      "ane-direct:qwen3-embedding-0.6b.ane-direct-worker:sha256:1af6d091d7d5f21a998af0f438333d9af051c82af8b27bd2439c60efa09bd5db": [
+        128
+      ],
+      "ane-direct:qwen3-reranker-0.6b.ane-direct-worker:sha256:cc02357cfc81a92562b251914bed5c8d3960b7edf4814ee73de9f21611e22959": [
+        256,
+        1024
+      ]
+    },
+    {
+      "ane-direct:qwen3-embedding-0.6b.ane-direct-worker:sha256:1af6d091d7d5f21a998af0f438333d9af051c82af8b27bd2439c60efa09bd5db": [
+        128
+      ],
+      "ane-direct:qwen3-reranker-0.6b.ane-direct-worker:sha256:cc02357cfc81a92562b251914bed5c8d3960b7edf4814ee73de9f21611e22959": [
+        256
+      ]
+    },
+    {
+      "ane-direct:gte-modernbert-base.ane-direct-worker:sha256:8a31e3d67a89412b4314136f5ec3489a46dacf438480010139c7d6c2dc045375": [
+        2048
+      ],
+      "ane-direct:qwen3-embedding-0.6b.ane-direct-worker:sha256:1af6d091d7d5f21a998af0f438333d9af051c82af8b27bd2439c60efa09bd5db": [
+        128
+      ]
+    },
+    {
+      "ane-direct:gte-modernbert-base.ane-direct-worker:sha256:8a31e3d67a89412b4314136f5ec3489a46dacf438480010139c7d6c2dc045375": [
+        2048
+      ],
+      "ane-direct:gte-reranker-modernbert-base.ane-direct-worker:sha256:2ecb952868e28ed5a45c3f5c057e0f6d46df384ba540e1f05113462fd0d6a1de": [
+        4096
+      ],
+      "ane-direct:qwen3-embedding-0.6b.ane-direct-worker:sha256:1af6d091d7d5f21a998af0f438333d9af051c82af8b27bd2439c60efa09bd5db": [
+        128
+      ],
+      "ane-direct:qwen3-reranker-0.6b.ane-direct-worker:sha256:cc02357cfc81a92562b251914bed5c8d3960b7edf4814ee73de9f21611e22959": [
+        512
+      ]
+    },
+    {
+      "ane-direct:gte-modernbert-base.ane-direct-worker:sha256:8a31e3d67a89412b4314136f5ec3489a46dacf438480010139c7d6c2dc045375": [
+        2048
+      ],
+      "ane-direct:gte-reranker-modernbert-base.ane-direct-worker:sha256:2ecb952868e28ed5a45c3f5c057e0f6d46df384ba540e1f05113462fd0d6a1de": [
+        4096
+      ],
+      "ane-direct:qwen3-reranker-0.6b.ane-direct-worker:sha256:cc02357cfc81a92562b251914bed5c8d3960b7edf4814ee73de9f21611e22959": [
+        512
+      ]
+    },
+    {
+      "ane-direct:gte-modernbert-base.ane-direct-worker:sha256:8a31e3d67a89412b4314136f5ec3489a46dacf438480010139c7d6c2dc045375": [
+        2048
+      ],
+      "ane-direct:gte-reranker-modernbert-base.ane-direct-worker:sha256:2ecb952868e28ed5a45c3f5c057e0f6d46df384ba540e1f05113462fd0d6a1de": [
+        128,
+        4096
+      ],
+      "ane-direct:qwen3-reranker-0.6b.ane-direct-worker:sha256:cc02357cfc81a92562b251914bed5c8d3960b7edf4814ee73de9f21611e22959": [
+        512
+      ]
+    },
+    {
+      "ane-direct:gte-reranker-modernbert-base.ane-direct-worker:sha256:2ecb952868e28ed5a45c3f5c057e0f6d46df384ba540e1f05113462fd0d6a1de": [
+        128,
+        4096
+      ],
+      "ane-direct:qwen3-reranker-0.6b.ane-direct-worker:sha256:cc02357cfc81a92562b251914bed5c8d3960b7edf4814ee73de9f21611e22959": [
+        512
+      ]
+    }
+  ],
+  "schema": 1,
+  "shape_not_admitted_count": 0,
+  "source_commit": "47e4a3682ae2cfa2e0d9d88bd04e58333051f4b1"
+}
