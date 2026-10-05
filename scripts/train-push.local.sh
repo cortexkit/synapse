@@ -54,6 +54,26 @@ else
   say "NOTICE: skipping the Linux clippy preflight (needs zig and 'rustup target add $linux_target'); CI will be the first Linux check"
 fi
 
+# Windows clippy, for the same reason: code behind cfg(windows) or
+# cfg(unix), or a helper whose callers are Unix-only, otherwise fails only on
+# CI's windows job. CI builds with MSVC, which can't run here, so this checks
+# the windows-gnu target instead: cfg(windows) and cfg(unix) resolve the same
+# way on both, so it catches those lints, but not anything specific to MSVC.
+# Same crate list as the Linux check, minus the llama worker.
+windows_target=x86_64-pc-windows-gnu
+if command -v zig >/dev/null 2>&1 && rustup target list --installed 2>/dev/null | grep -qx "$windows_target"; then
+  ci_crates="$(sed -n 's/^ *SYNAPSE_CRATES: *//p' .github/workflows/tests.yml | head -1)"
+  [ -n "$ci_crates" ] || refuse "could not read SYNAPSE_CRATES from .github/workflows/tests.yml for the Windows clippy check"
+  ci_crates="$(printf '%s\n' "$ci_crates" | sed 's/-p synapse-worker-llama//')"
+  # shellcheck disable=SC2086
+  CC_x86_64_pc_windows_gnu="$PWD/scripts/lib/zig-cc-windows.sh" \
+  AR_x86_64_pc_windows_gnu="$PWD/scripts/lib/zig-ar.sh" \
+    cargo clippy --locked --target "$windows_target" $ci_crates --all-targets -- -D warnings \
+    || refuse "Windows-target clippy failed (windows-gnu, standing in for CI's MSVC windows job; see scripts/train-push.local.sh)"
+else
+  say "NOTICE: skipping the Windows clippy preflight (needs zig and 'rustup target add $windows_target'); CI will be the first Windows check"
+fi
+
 # The daily cron on tests.yml is this repository's only scheduled sample of
 # master against the current toolchain and runner images, which a push-only
 # CI never sees change. Its result reaches nobody unless something reads it:
