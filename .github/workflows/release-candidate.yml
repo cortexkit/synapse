@@ -17,7 +17,6 @@ concurrency:
 
 env:
   SOURCE_COMMIT: ${{ inputs.S }}
-  GH_TOKEN: ${{ github.token }}
   CARGO_TERM_COLOR: always
   OWNED_CUDA_REDIST_BASE: https://developer.download.nvidia.com/compute/cuda/redist
   VULKAN_LINUX_URL: https://sdk.lunarg.com/sdk/download/1.4.357.0/linux/vulkansdk-linux-x86_64-1.4.357.0.tar.xz
@@ -32,17 +31,15 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.S }}
+          persist-credentials: false
       - name: Require exact source commit before any build
         shell: bash
         run: |
           set -euo pipefail
-          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
-          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
-          if grep -Fq 'libcublasLt.so.12' README.md; then
-            echo 'README contains the obsolete CUDA 12 soname' >&2
-            exit 1
-          fi
+          python3 scripts/check-release-candidate.py source --commit "$SOURCE_COMMIT"
       - name: Create immutable candidate draft
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
@@ -86,13 +83,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.S }}
+          persist-credentials: false
       - name: Require exact source commit before any build
         shell: bash
         run: |
           set -euo pipefail
-          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
-          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
-          ! grep -Fq 'libcublasLt.so.12' README.md
+          python3 scripts/check-release-candidate.py source --commit "$SOURCE_COMMIT"
       - uses: dtolnay/rust-toolchain@stable
       - name: Select full Xcode
         if: runner.os == 'macOS'
@@ -117,10 +113,8 @@ jobs:
           while read -r name version digest; do
             archive="$name-linux-x86_64-$version-archive.tar.xz"
             curl --fail --location --retry 3 "$OWNED_CUDA_REDIST_BASE/$name/linux-x86_64/$archive" -o "$RUNNER_TEMP/$archive"
-            echo "$digest  $RUNNER_TEMP/$archive" | sha256sum --check --strict
             component="$RUNNER_TEMP/cuda-components/$name"
-            mkdir -p "$component"
-            tar -xJf "$RUNNER_TEMP/$archive" -C "$component" --strip-components=1
+            python3 scripts/check-release-candidate.py extract --archive "$RUNNER_TEMP/$archive" --sha256 "$digest" --destination "$component" --strip-components 1
             cp -a "$component/." "$root/"
           done <<'PINS'
           cuda_nvcc 13.2.78 1dc73b03f1d74081866986ca406f7b5981d14306ccbb03127ba45401f36e1862
@@ -137,9 +131,7 @@ jobs:
           # Runtime search contains only the two verified redistribution components, never driver stubs.
           echo "LD_LIBRARY_PATH=$RUNNER_TEMP/cuda-components/cuda_cudart/lib:$RUNNER_TEMP/cuda-components/libcublas/lib" >> "$GITHUB_ENV"
           curl --fail --location --retry 3 "$VULKAN_LINUX_URL" -o "$RUNNER_TEMP/vulkan.tar.xz"
-          echo "$VULKAN_LINUX_SHA256  $RUNNER_TEMP/vulkan.tar.xz" | sha256sum --check --strict
-          mkdir -p "$RUNNER_TEMP/vulkan"
-          tar -xJf "$RUNNER_TEMP/vulkan.tar.xz" -C "$RUNNER_TEMP/vulkan"
+          python3 scripts/check-release-candidate.py extract --archive "$RUNNER_TEMP/vulkan.tar.xz" --sha256 "$VULKAN_LINUX_SHA256" --destination "$RUNNER_TEMP/vulkan"
           echo "VULKAN_SDK=$RUNNER_TEMP/vulkan/1.4.357.0/x86_64" >> "$GITHUB_ENV"
       - name: Install verified Windows CUDA 13.2.1 components and Vulkan SDK
         if: runner.os == 'Windows'
@@ -160,9 +152,9 @@ jobs:
             $archive = "$($c[0])-windows-x86_64-$($c[1])-archive.zip"
             $zip = "$env:RUNNER_TEMP/$archive"
             Invoke-WebRequest "$env:OWNED_CUDA_REDIST_BASE/$($c[0])/windows-x86_64/$archive" -OutFile $zip
-            if ((Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant() -ne $c[2]) { throw "Digest mismatch: $archive" }
             $component = "$env:RUNNER_TEMP/x-$($c[0])"
-            Expand-Archive $zip $component
+            python scripts/check-release-candidate.py extract --archive $zip --sha256 $c[2] --destination $component
+            if ($LASTEXITCODE -ne 0) { throw "Verified extraction failed: $archive" }
             $package = @(Get-ChildItem $component -Directory)
             if ($package.Count -ne 1) { throw "Unexpected component layout: $archive" }
             Copy-Item "$($package[0].FullName)/*" $root -Recurse -Force
@@ -174,7 +166,8 @@ jobs:
           $installer = "$env:RUNNER_TEMP/vulkan.exe"
           curl.exe --fail --location --retry 3 --output $installer $env:VULKAN_WINDOWS_URL
           if ($LASTEXITCODE -ne 0) { throw 'Vulkan download failed' }
-          if ((Get-FileHash $installer -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:VULKAN_WINDOWS_SHA256) { throw 'Vulkan digest mismatch' }
+          python scripts/check-release-candidate.py digest --archive $installer --sha256 $env:VULKAN_WINDOWS_SHA256
+          if ($LASTEXITCODE -ne 0) { throw 'Vulkan digest mismatch' }
           $sdk = "$env:RUNNER_TEMP/VulkanSDK/1.4.357.0"
           $p = Start-Process $installer -Wait -PassThru -ArgumentList @('--root', $sdk, '--accept-licenses', '--default-answer', '--confirm-command', 'install')
           if ($p.ExitCode -ne 0) { throw "Vulkan installer exit $($p.ExitCode)" }
@@ -199,38 +192,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          import pathlib, re, subprocess, os
-          binary = 'target/release/ck-synapse-worker-vulkan' + ('.exe' if os.name == 'nt' else '')
-          output = subprocess.check_output([binary, '--version'], text=True)
-          print(output)
-          actual = re.search(r'kernel_revision=([0-9a-f]{64})', output).group(1)
-          core = pathlib.Path('crates/synapse-core/src/worker_engine_names.rs').read_text()
-          expected = re.search(r'VULKAN_KERNEL_REVISION: &str =\s*"([0-9a-f]{64})"', core).group(1)
-          assert actual == expected, (actual, expected)
-          PY
+          worker=target/release/ck-synapse-worker-vulkan
+          if [ "${{ runner.os }}" = Windows ]; then worker="$worker.exe"; fi
+          python3 scripts/check-release-candidate.py spirv --worker "$worker"
       - name: Require exact CUDA ELF dependencies and exercise missing runtime loader failure
         if: runner.os == 'Linux'
         shell: bash
-        run: |
-          set -euo pipefail
-          readelf -d target/release/ck-synapse-worker-cuda
-          python3 - <<'PY'
-          import os, pathlib, re, shutil, subprocess, tempfile
-          worker = 'target/release/ck-synapse-worker-cuda'
-          dynamic = subprocess.check_output(['readelf', '-d', worker], text=True)
-          needed = re.findall(r'\(NEEDED\).*?\[(.*?)\]', dynamic)
-          cuda = sorted(n for n in needed if re.match(r'lib(?:cuda|cublas)', n))
-          assert cuda == ['libcublas.so.13', 'libcublasLt.so.13', 'libcudart.so.13'], cuda
-          with tempfile.TemporaryDirectory() as isolated:
-              for directory in os.environ['LD_LIBRARY_PATH'].split(':'):
-                  for lib in pathlib.Path(directory).glob('*.so*'):
-                      if not lib.name.startswith('libcublasLt.so'):
-                          shutil.copy2(lib.resolve(), pathlib.Path(isolated) / lib.name)
-              result = subprocess.run([worker, '--probe-floor', '--model', 'gte-modernbert-base'], env={**os.environ, 'LD_LIBRARY_PATH': isolated}, capture_output=True, text=True)
-              print(result.stderr)
-              assert result.returncode != 0 and 'libcublasLt.so.13' in result.stderr, result
-          PY
+        run: python3 scripts/check-release-candidate.py cuda-elf --worker target/release/ck-synapse-worker-cuda
       - name: Require CUDA DLLs to be absent from load-time imports
         if: runner.os == 'Windows'
         shell: pwsh
@@ -242,62 +210,14 @@ jobs:
           foreach ($dll in @('cudart64_13.dll', 'cublas64_13.dll', 'cublasLt64_13.dll', 'nvcuda.dll')) {
             if ($normal -match [regex]::Escape($dll)) { throw "Load-time CUDA import: $dll" }
           }
-      # The generated integration harness uses absolute release paths. Cargo tests
-      # only synapse-core, so it cannot rebuild a shipped worker in another profile.
-      - name: Generate hosted integration tests for the just-built binaries
+      # Tests only synapse-core and launches absolute release paths; shipped workers are not rebuilt.
+      - name: Hosted protocol integration tests
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p crates/synapse-core/tests
-          cat > crates/synapse-core/tests/candidate_workers.rs <<'RS'
-          use std::{path::PathBuf, time::Duration};
-          use synapse_core::{accept_worker_handshake_with_engine_and_protocol_version, encode_i32_frame, prepare_listener, read_json, write_json, write_raw, WorkerCandidate, WorkerRequest, WorkerResponse, WorkerSequence, DEFAULT_MAX_FRAME_BYTES as MAX};
-          #[tokio::test]
-          async fn candidate_hosted_protocol_matrix() {
-              let root = PathBuf::from(std::env::var_os("CANDIDATE_BIN_DIR").unwrap());
-              let suffix = if cfg!(windows) { ".exe" } else { "" };
-              assert!(std::process::Command::new(root.join(format!("ck-synapse{suffix}"))).arg("--version").status().unwrap().success());
-              let mut workers = vec![("llama", "llama.cpp-worker", true)];
-              if cfg!(target_os="macos") {
-                  workers.extend([("decode", "owned-metal-decode", false), ("ane", "ane-coreml-worker", false), ("ane-direct", "ane-direct-worker", true)]);
-              } else {
-                  workers.extend([("cuda", "owned-cuda", true), ("vulkan", "owned-vulkan", true)]);
-              }
-              for (worker, engine, unsupported) in workers {
-                  println!("hosted protocol: {worker}");
-                  let nonce = format!("candidate-{}-{worker}", std::process::id());
-                  let runtime = std::env::temp_dir().join(&nonce);
-                  let (endpoint, listener) = prepare_listener(&runtime, &nonce).unwrap();
-                  let mut command = tokio::process::Command::new(root.join(format!("ck-synapse-worker-{worker}{suffix}")));
-                  command.arg(if cfg!(windows) { "--pipe" } else { "--socket" }).arg(endpoint).arg("--nonce").arg(&nonce).kill_on_drop(true);
-                  let mut child = command.spawn().unwrap();
-                  let mut stream = accept_worker_handshake_with_engine_and_protocol_version(listener, &nonce, MAX, Duration::from_secs(30), Some(engine), None, None).await.unwrap();
-                  for index in 0..=usize::from(unsupported) {
-                      if index == 1 {
-                          let request = if worker == "llama" {
-                              WorkerRequest::RerankSequences { req_id: "unsupported".into(), model_ref: "not-loaded".into(), sequences: vec![WorkerSequence { n_tokens: 2 }] }
-                          } else {
-                              WorkerRequest::Rerank { req_id: "unsupported".into(), model_ref: "not-loaded".into(), query_n_tokens: 1, candidates: vec![WorkerCandidate { n_tokens: 1 }] }
-                          };
-                          write_json(&mut stream, &request, MAX).await.unwrap();
-                          write_raw(&mut stream, &encode_i32_frame(&[1,2]), MAX).await.unwrap();
-                          let response: WorkerResponse = tokio::time::timeout(Duration::from_secs(30), read_json(&mut stream, MAX)).await.unwrap().unwrap();
-                          assert!(matches!(response, WorkerResponse::Err { code, .. } if code == "unsupported_request"));
-                      }
-                      write_json(&mut stream, &WorkerRequest::Ping { req_id: format!("ping-{index}") }, MAX).await.unwrap();
-                      let response: WorkerResponse = tokio::time::timeout(Duration::from_secs(30), read_json(&mut stream, MAX)).await.unwrap().unwrap();
-                      assert!(matches!(response, WorkerResponse::Pong { req_id, .. } if req_id == format!("ping-{index}")));
-                  }
-                  write_json(&mut stream, &WorkerRequest::Shutdown {}, MAX).await.unwrap();
-                  assert!(tokio::time::timeout(Duration::from_secs(30), child.wait()).await.unwrap().unwrap().success());
-                  let _ = std::fs::remove_dir_all(runtime);
-              }
-          }
-          RS
-          echo "CANDIDATE_BIN_DIR=$(pwd)/target/release" >> "$GITHUB_ENV"
-      - name: Hosted protocol integration tests
-        shell: bash
-        run: cargo test --release --locked -p synapse-core --test candidate_workers -- --nocapture
+          CANDIDATE_BIN_DIR="$(pwd)/target/release"
+          export CANDIDATE_BIN_DIR
+          cargo test --release --locked -p synapse-core --test candidate_workers -- --ignored --nocapture
       - name: Package Windows CUDA with runtime manifests and licenses
         if: runner.os == 'Windows'
         shell: pwsh
@@ -345,6 +265,8 @@ jobs:
           printf '{\n  "requires_core": "0.20.53"\n}\n' > dist/release-manifest.json
           python3 -c "import json;d=json.load(open('dist/release-manifest.json'));assert d['requires_core']=='0.20.53',d"
       - name: Upload assets to candidate draft
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: gh release upload "candidate-$SOURCE_COMMIT" dist/*
 
@@ -355,12 +277,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.S }}
+          persist-credentials: false
       - name: Require exact source commit before any build
         shell: bash
         run: |
           set -euo pipefail
-          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
-          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          python3 scripts/check-release-candidate.py source --commit "$SOURCE_COMMIT"
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
         with:
@@ -392,21 +314,14 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.S }}
+          persist-credentials: false
       - name: Require exact source commit
-        run: test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+        run: python3 scripts/check-release-candidate.py source --commit "$SOURCE_COMMIT"
       - name: Require every inventory entry and sidecar in the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
           gh release view "candidate-$SOURCE_COMMIT" --json isDraft,assets > candidate.json
-          python3 - <<'PY'
-          import json
-          inventory = json.load(open('bench/parity/release-assets.json'))
-          candidate = json.load(open('candidate.json'))
-          assert candidate['isDraft'], 'candidate must remain a draft'
-          names = {asset['name'] for asset in candidate['assets']}
-          expected = {entry['asset'] for entry in inventory['assets']}
-          expected |= {name + inventory['sidecar_suffix'] for name in expected if name.endswith('.zip')}
-          assert expected <= names, f'missing candidate assets: {sorted(expected - names)}'
-          print(f'checked {len(expected)} candidate assets and sidecars')
-          PY
+          python3 scripts/check-release-candidate.py inventory --candidate candidate.json

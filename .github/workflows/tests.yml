@@ -72,6 +72,11 @@ jobs:
         shell: bash
         run: bash synapse/scripts/check-train-preconditions.sh
 
+      - name: Check release-candidate guards
+        if: matrix.name == 'linux'
+        shell: bash
+        run: python3 synapse/scripts/check-release-candidate.py --self-test
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
