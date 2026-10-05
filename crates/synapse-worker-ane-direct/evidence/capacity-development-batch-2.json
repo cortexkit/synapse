@@ -1,0 +1,420 @@
+{
+  "classification": "development",
+  "batch": 2,
+  "machine_model": "Mac17,6",
+  "os_version": "27.0.1",
+  "os_build": "26A434",
+  "package_digests": {
+    "gte-modernbert-base": "sha256:8a31e3d67a89412b4314136f5ec3489a46dacf438480010139c7d6c2dc045375",
+    "gte-reranker-modernbert-base": "sha256:2ecb952868e28ed5a45c3f5c057e0f6d46df384ba540e1f05113462fd0d6a1de",
+    "qwen3-embedding-0.6b": "sha256:1af6d091d7d5f21a998af0f438333d9af051c82af8b27bd2439c60efa09bd5db",
+    "qwen3-reranker-0.6b": "sha256:cc02357cfc81a92562b251914bed5c8d3960b7edf4814ee73de9f21611e22959"
+  },
+  "driver_sha256": "48df1759f28ca8ffa1fa17ea908ac3c05c5ce898b097347fc9b29bcde470e61c",
+  "production_coreml_lane": "Resident per task context; ck-synapse-worker-ane-swift process observed. Not stopped or modified; private residency not independently introspectable.",
+  "runs": [
+    {
+      "accounting": "Compiler source payload, not opaque executable memory. Failed admission's partial executables are rolled back; submitted totals include its failing layer.",
+      "admissions": [
+        {
+          "elapsed_ms": 10643.265917,
+          "error": null,
+          "length": 128,
+          "loaded_before_rollback": 22,
+          "mil_bytes_submitted": 486735,
+          "model": "gte-modernbert-base",
+          "weight_bytes_submitted": 222592928
+        },
+        {
+          "elapsed_ms": 11871.832459,
+          "error": null,
+          "length": 256,
+          "loaded_before_rollback": 22,
+          "mil_bytes_submitted": 565059,
+          "model": "gte-modernbert-base",
+          "weight_bytes_submitted": 224953120
+        },
+        {
+          "elapsed_ms": 17149.186791999997,
+          "error": null,
+          "length": 512,
+          "loaded_before_rollback": 22,
+          "mil_bytes_submitted": 708435,
+          "model": "gte-modernbert-base",
+          "weight_bytes_submitted": 229673504
+        },
+        {
+          "elapsed_ms": 28041.046334000002,
+          "error": null,
+          "length": 1024,
+          "loaded_before_rollback": 22,
+          "mil_bytes_submitted": 998868,
+          "model": "gte-modernbert-base",
+          "weight_bytes_submitted": 239114272
+        },
+        {
+          "elapsed_ms": 39282.272292,
+          "error": null,
+          "length": 2048,
+          "loaded_before_rollback": 22,
+          "mil_bytes_submitted": 1575347,
+          "model": "gte-modernbert-base",
+          "weight_bytes_submitted": 257995808
+        }
+      ],
+      "classification": "development",
+      "exhausted": false,
+      "mix": "gte",
+      "resident_executables": 110,
+      "resident_mil_bytes": 4334444,
+      "resident_shapes": [
+        {
+          "executables": 22,
+          "length": 128,
+          "mil_bytes": 486735,
+          "model": "gte-modernbert-base",
+          "weight_bytes": 222592928
+        },
+        {
+          "executables": 22,
+          "length": 256,
+          "mil_bytes": 565059,
+          "model": "gte-modernbert-base",
+          "weight_bytes": 224953120
+        },
+        {
+          "executables": 22,
+          "length": 512,
+          "mil_bytes": 708435,
+          "model": "gte-modernbert-base",
+          "weight_bytes": 229673504
+        },
+        {
+          "executables": 22,
+          "length": 1024,
+          "mil_bytes": 998868,
+          "model": "gte-modernbert-base",
+          "weight_bytes": 239114272
+        },
+        {
+          "executables": 22,
+          "length": 2048,
+          "mil_bytes": 1575347,
+          "model": "gte-modernbert-base",
+          "weight_bytes": 257995808
+        }
+      ],
+      "resident_weight_bytes": 1174329632,
+      "submitted_mil_bytes": 4334444,
+      "submitted_weight_bytes": 1174329632,
+      "load_before_1_5_15": [
+        14.775390625,
+        22.20458984375,
+        23.025390625
+      ],
+      "load_after_1_5_15": [
+        25.2763671875,
+        24.17138671875,
+        23.74560546875
+      ],
+      "tests_passed": 1
+    },
+    {
+      "accounting": "Compiler source payload, not opaque executable memory. Failed admission's partial executables are rolled back; submitted totals include its failing layer.",
+      "admissions": [
+        {
+          "elapsed_ms": 29033.782292,
+          "error": null,
+          "length": 128,
+          "loaded_before_rollback": 28,
+          "mil_bytes_submitted": 1113362,
+          "model": "qwen3-embedding-0.6b",
+          "weight_bytes_submitted": 885571176
+        },
+        {
+          "elapsed_ms": 27747.11325,
+          "error": null,
+          "length": 256,
+          "loaded_before_rollback": 28,
+          "mil_bytes_submitted": 1217610,
+          "model": "qwen3-embedding-0.6b",
+          "weight_bytes_submitted": 891077992
+        },
+        {
+          "elapsed_ms": 36238.0995,
+          "error": null,
+          "length": 512,
+          "loaded_before_rollback": 28,
+          "mil_bytes_submitted": 1407496,
+          "model": "qwen3-embedding-0.6b",
+          "weight_bytes_submitted": 904844136
+        },
+        {
+          "elapsed_ms": 51060.2155,
+          "error": null,
+          "length": 1024,
+          "loaded_before_rollback": 28,
+          "mil_bytes_submitted": 1792657,
+          "model": "qwen3-embedding-0.6b",
+          "weight_bytes_submitted": 943386472
+        },
+        {
+          "elapsed_ms": 19862.744042,
+          "error": "ane_resources_exhausted:compile layer 3: ANE load failed: createProgramInstanceForModel:modelToken:modelFilePath:qos:isPreCompiled:enablePowerSaving:skipPreparePhase:statsMask:memoryPoolID:enableLateLatch:modelIdentityStr:owningPid:cacheUrlIdentifier:aotCacheUrlIdentifier:optOutOfModelMemoryUnwiring:intermediateBufferSizeHint:error:: Program load failed \u2014 no ANE resources (transient; retry) (underlying=0x5)",
+          "length": 2048,
+          "loaded_before_rollback": 3,
+          "mil_bytes_submitted": 365119,
+          "model": "qwen3-embedding-0.6b",
+          "weight_bytes_submitted": 152073048
+        }
+      ],
+      "classification": "development",
+      "exhausted": true,
+      "mix": "qwen",
+      "resident_executables": 112,
+      "resident_mil_bytes": 5531125,
+      "resident_shapes": [
+        {
+          "executables": 28,
+          "length": 128,
+          "mil_bytes": 1113362,
+          "model": "qwen3-embedding-0.6b",
+          "weight_bytes": 885571176
+        },
+        {
+          "executables": 28,
+          "length": 256,
+          "mil_bytes": 1217610,
+          "model": "qwen3-embedding-0.6b",
+          "weight_bytes": 891077992
+        },
+        {
+          "executables": 28,
+          "length": 512,
+          "mil_bytes": 1407496,
+          "model": "qwen3-embedding-0.6b",
+          "weight_bytes": 904844136
+        },
+        {
+          "executables": 28,
+          "length": 1024,
+          "mil_bytes": 1792657,
+          "model": "qwen3-embedding-0.6b",
+          "weight_bytes": 943386472
+        }
+      ],
+      "resident_weight_bytes": 3624879776,
+      "submitted_mil_bytes": 5896244,
+      "submitted_weight_bytes": 3776952824,
+      "load_before_1_5_15": [
+        25.2763671875,
+        24.17138671875,
+        23.74560546875
+      ],
+      "load_after_1_5_15": [
+        43.9248046875,
+        33.92578125,
+        28.15478515625
+      ],
+      "tests_passed": 1
+    },
+    {
+      "accounting": "Compiler source payload, not opaque executable memory. Failed admission's partial executables are rolled back; submitted totals include its failing layer.",
+      "admissions": [
+        {
+          "elapsed_ms": 14810.903958,
+          "error": null,
+          "length": 128,
+          "loaded_before_rollback": 22,
+          "mil_bytes_submitted": 486728,
+          "model": "gte-modernbert-base",
+          "weight_bytes_submitted": 222592928
+        },
+        {
+          "elapsed_ms": 58171.937541,
+          "error": null,
+          "length": 128,
+          "loaded_before_rollback": 28,
+          "mil_bytes_submitted": 1113292,
+          "model": "qwen3-embedding-0.6b",
+          "weight_bytes_submitted": 885571176
+        },
+        {
+          "elapsed_ms": 38573.400540999995,
+          "error": null,
+          "length": 256,
+          "loaded_before_rollback": 22,
+          "mil_bytes_submitted": 565077,
+          "model": "gte-modernbert-base",
+          "weight_bytes_submitted": 224953120
+        },
+        {
+          "elapsed_ms": 41777.428666,
+          "error": null,
+          "length": 256,
+          "loaded_before_rollback": 28,
+          "mil_bytes_submitted": 1217610,
+          "model": "qwen3-embedding-0.6b",
+          "weight_bytes_submitted": 891077992
+        },
+        {
+          "elapsed_ms": 8396.565667,
+          "error": "ane_resources_exhausted:compile layer 15: ANE load failed: createProgramInstanceForModel:modelToken:modelFilePath:qos:isPreCompiled:enablePowerSaving:skipPreparePhase:statsMask:memoryPoolID:enableLateLatch:modelIdentityStr:owningPid:cacheUrlIdentifier:aotCacheUrlIdentifier:optOutOfModelMemoryUnwiring:intermediateBufferSizeHint:error:: Program load failed \u2014 no ANE resources (transient; retry) (underlying=0x5)",
+          "length": 512,
+          "loaded_before_rollback": 15,
+          "mil_bytes_submitted": 514386,
+          "model": "gte-modernbert-base",
+          "weight_bytes_submitted": 166993052
+        }
+      ],
+      "classification": "development",
+      "exhausted": true,
+      "mix": "alternating",
+      "resident_executables": 100,
+      "resident_mil_bytes": 3382707,
+      "resident_shapes": [
+        {
+          "executables": 22,
+          "length": 128,
+          "mil_bytes": 486728,
+          "model": "gte-modernbert-base",
+          "weight_bytes": 222592928
+        },
+        {
+          "executables": 28,
+          "length": 128,
+          "mil_bytes": 1113292,
+          "model": "qwen3-embedding-0.6b",
+          "weight_bytes": 885571176
+        },
+        {
+          "executables": 22,
+          "length": 256,
+          "mil_bytes": 565077,
+          "model": "gte-modernbert-base",
+          "weight_bytes": 224953120
+        },
+        {
+          "executables": 28,
+          "length": 256,
+          "mil_bytes": 1217610,
+          "model": "qwen3-embedding-0.6b",
+          "weight_bytes": 891077992
+        }
+      ],
+      "resident_weight_bytes": 2224195216,
+      "submitted_mil_bytes": 3897093,
+      "submitted_weight_bytes": 2391188268,
+      "load_before_1_5_15": [
+        43.9248046875,
+        33.92578125,
+        28.15478515625
+      ],
+      "load_after_1_5_15": [
+        28.83154296875,
+        33.251953125,
+        29.46337890625
+      ],
+      "tests_passed": 1
+    },
+    {
+      "accounting": "Compiler source payload, not opaque executable memory. Failed admission's partial executables are rolled back; submitted totals include its failing layer.",
+      "admissions": [
+        {
+          "elapsed_ms": 13930.323375,
+          "error": null,
+          "length": 128,
+          "loaded_before_rollback": 22,
+          "mil_bytes_submitted": 486741,
+          "model": "gte-modernbert-base",
+          "weight_bytes_submitted": 222592928
+        },
+        {
+          "elapsed_ms": 12562.598333,
+          "error": null,
+          "length": 128,
+          "loaded_before_rollback": 22,
+          "mil_bytes_submitted": 486746,
+          "model": "gte-reranker-modernbert-base",
+          "weight_bytes_submitted": 222592928
+        },
+        {
+          "elapsed_ms": 52542.618959,
+          "error": null,
+          "length": 128,
+          "loaded_before_rollback": 28,
+          "mil_bytes_submitted": 1113380,
+          "model": "qwen3-embedding-0.6b",
+          "weight_bytes_submitted": 885571176
+        },
+        {
+          "elapsed_ms": 37843.290250000005,
+          "error": null,
+          "length": 128,
+          "loaded_before_rollback": 28,
+          "mil_bytes_submitted": 1113297,
+          "model": "qwen3-reranker-0.6b",
+          "weight_bytes_submitted": 885571176
+        },
+        {
+          "elapsed_ms": 13587.856917,
+          "error": "ane_resources_exhausted:compile layer 15: ANE load failed: createProgramInstanceForModel:modelToken:modelFilePath:qos:isPreCompiled:enablePowerSaving:skipPreparePhase:statsMask:memoryPoolID:enableLateLatch:modelIdentityStr:owningPid:cacheUrlIdentifier:aotCacheUrlIdentifier:optOutOfModelMemoryUnwiring:intermediateBufferSizeHint:error:: Program load failed \u2014 no ANE resources (transient; retry) (underlying=0x5)",
+          "length": 256,
+          "loaded_before_rollback": 15,
+          "mil_bytes_submitted": 410221,
+          "model": "gte-modernbert-base",
+          "weight_bytes_submitted": 163583900
+        }
+      ],
+      "classification": "development",
+      "exhausted": true,
+      "mix": "all-four",
+      "resident_executables": 100,
+      "resident_mil_bytes": 3200164,
+      "resident_shapes": [
+        {
+          "executables": 22,
+          "length": 128,
+          "mil_bytes": 486741,
+          "model": "gte-modernbert-base",
+          "weight_bytes": 222592928
+        },
+        {
+          "executables": 22,
+          "length": 128,
+          "mil_bytes": 486746,
+          "model": "gte-reranker-modernbert-base",
+          "weight_bytes": 222592928
+        },
+        {
+          "executables": 28,
+          "length": 128,
+          "mil_bytes": 1113380,
+          "model": "qwen3-embedding-0.6b",
+          "weight_bytes": 885571176
+        },
+        {
+          "executables": 28,
+          "length": 128,
+          "mil_bytes": 1113297,
+          "model": "qwen3-reranker-0.6b",
+          "weight_bytes": 885571176
+        }
+      ],
+      "resident_weight_bytes": 2216328208,
+      "submitted_mil_bytes": 3610385,
+      "submitted_weight_bytes": 2379912108,
+      "load_before_1_5_15": [
+        28.83154296875,
+        33.251953125,
+        29.46337890625
+      ],
+      "load_after_1_5_15": [
+        28.171875,
+        30.13671875,
+        29.0361328125
+      ],
+      "tests_passed": 1
+    }
+  ]
+}
