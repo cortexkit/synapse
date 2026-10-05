@@ -12837,6 +12837,38 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// A file that changes while it is being hashed can't vouch for the bytes
+    /// that are loaded afterwards. The hash closure here returns the expected
+    /// digest (as it would if it read the file before the write) but bumps the
+    /// file's mtime mid-hash. The result must not count as verified, and no
+    /// verification row may be recorded, so the next load hashes in full.
+    #[cfg(unix)]
+    #[test]
+    fn catalog_verification_file_changed_during_hash_is_not_recorded() {
+        let (root, store, install, path, digest) = verification_fixture();
+        let result =
+            crate::verified_catalog_file_digest(&store, &install, "weights", &digest, &path, |p| {
+                let old = std::fs::metadata(p).unwrap().modified().unwrap();
+                std::fs::File::options()
+                    .write(true)
+                    .open(p)
+                    .unwrap()
+                    .set_modified(old + std::time::Duration::from_secs(1))
+                    .unwrap();
+                Some(digest.clone())
+            })
+            .unwrap();
+        assert_eq!(result, None, "a file changed mid-hash must not verify");
+        let calls = std::cell::Cell::new(0);
+        crate::verified_catalog_file_digest(&store, &install, "weights", &digest, &path, |p| {
+            calls.set(calls.get() + 1);
+            crate::sha256_file(p).ok()
+        })
+        .unwrap();
+        assert_eq!(calls.get(), 1, "no verification row may have been recorded");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn catalog_verification_content_change_with_restored_mtime_is_refused() {
