@@ -20200,7 +20200,7 @@ mod tests {
         let doc = std::iter::repeat_n("a", 8192 - overhead)
             .collect::<Vec<_>>()
             .join(" ");
-        let pairs = owned_rerank_pairs(&model, "", &[doc.clone()])
+        let pairs = owned_rerank_pairs(&model, "", std::slice::from_ref(&doc))
             .unwrap()
             .unwrap();
         assert_eq!(pairs[0].len(), 8192);
