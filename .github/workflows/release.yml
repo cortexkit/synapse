@@ -1,324 +1,131 @@
 name: release
 
-# Alpha distribution contract (ck setup): every released binary ships as
-# <binary>-<os>-<arch>.zip with the binary at the archive root, beside a
-# <binary>-<os>-<arch>.zip.sha256 holding the hex sha256 of the zip bytes in
-# shasum format. Installers resolve the latest GitHub release, so this
-# workflow only runs on version tags and uploads to the tag's release.
-#
-# Platform sets. Deliberately absent: owned-CUDA (needs an nvcc build
-# environment the hosted runners do not carry; it remains a manual CI gate
-# and joins the matrix when a CUDA build runner exists).
-# - darwin-arm64: module + opctl + llama/ane/decode workers + the Swift ANE
-#                 worker the ane launcher execs from beside itself
-# - linux-x64:    module + opctl + llama worker
-# - windows-x64:  module + opctl + llama worker
-
 on:
   push:
-    tags:
-      - "v*"
+    tags: ['v*']
 
 permissions:
   contents: write
 
-env:
-  CARGO_TERM_COLOR: always
-
 jobs:
-  verify-catalog-evidence:
+  validate:
     runs-on: ubuntu-24.04
+    outputs:
+      source: ${{ steps.source.outputs.commit }}
     steps:
-      # persist-credentials: false keeps the contents:write token out of
-      # .git/config, where any later step (including dependency build scripts
-      # run by cargo) could read it. gh steps get the token through their own env.
       - uses: actions/checkout@v4
         with:
+          fetch-depth: 0
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Verify catalog evidence at the release tag
+      - name: Bind evidence to its sole source parent
+        id: source
         shell: bash
         run: |
           set -euo pipefail
-          cargo test --locked -p synapse-module --lib \
-            catalog::evidence::tests::release_catalog_evidence -- \
-            --ignored --exact --nocapture 2>&1 | tee catalog-evidence.log
-          # Cargo succeeds on a misspelled filter too; require the gate to run.
-          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' catalog-evidence.log
+          S=$(python3 crates/synapse-release-checks/check.py source)
+          echo "commit=$S" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Download immutable candidate bytes
+        run: gh release download "candidate-${{ steps.source.outputs.commit }}" --dir "$RUNNER_TEMP/candidate"
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Validate inventory, release gates and all 32 records
+        run: python3 crates/synapse-release-checks/check.py validate --downloads "$RUNNER_TEMP/candidate" --assets "$RUNNER_TEMP/extracted"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: verified-candidate
+          path: ${{ runner.temp }}/candidate/*
+          if-no-files-found: error
 
-  build:
-    needs: verify-catalog-evidence
+  smoke:
+    needs: validate
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: darwin-arm64
-            runner: macos-15
-            os_arch: darwin-arm64
-            binaries: >-
-              ck-synapse
-              ck-synapse-opctl
-              ck-synapse-worker-llama
-              ck-synapse-worker-ane
-              ck-synapse-worker-ane-swift
-              ck-synapse-worker-decode
-            packages: >-
-              -p synapse-module
-              -p synapse-opctl
-              -p synapse-worker-llama
-              -p synapse-worker-ane
-              -p synapse-worker-decode
-          - name: linux-x64
-            runner: ubuntu-24.04
-            os_arch: linux-x64
-            binaries: >-
-              ck-synapse
-              ck-synapse-opctl
-              ck-synapse-worker-llama
-            packages: >-
-              -p synapse-module
-              -p synapse-opctl
-              -p synapse-worker-llama
-          - name: windows-x64
-            runner: windows-2025
-            os_arch: windows-x64
-            binaries: >-
-              ck-synapse
-              ck-synapse-opctl
-              ck-synapse-worker-llama
-            packages: >-
-              -p synapse-module
-              -p synapse-opctl
-              -p synapse-worker-llama
-    name: ${{ matrix.name }}
-    runs-on: ${{ matrix.runner }}
+          - os: ubuntu-24.04
+            arch: linux-x64
+          - os: windows-2025
+            arch: windows-x64
+          - os: macos-15
+            arch: darwin-arm64
+    runs-on: ${{ matrix.os }}
     steps:
-      - name: Checkout synapse
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
-          path: synapse
           persist-credentials: false
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Select full Xcode (darwin)
-        if: matrix.name == 'darwin-arm64'
-        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
-
-      - name: Install LLVM (windows)
-        if: matrix.name == 'windows-x64'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Download this OS candidate assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARCH: ${{ matrix.arch }}
+          SOURCE: ${{ needs.validate.outputs.source }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/candidate"
+          gh release download "candidate-$SOURCE" --pattern "*-$ARCH.zip*" --dir "$RUNNER_TEMP/candidate"
+          if [ "$ARCH" = linux-x64 ]; then
+            gh release download "candidate-$SOURCE" --pattern 'release-manifest.json*' --dir "$RUNNER_TEMP/candidate"
+          fi
+          python crates/synapse-release-checks/check.py extract --os-arch "$ARCH" --downloads "$RUNNER_TEMP/candidate" --assets "$RUNNER_TEMP/extracted"
+      - name: Install Linux no-GPU runtime prerequisites
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y libvulkan1 mesa-vulkan-drivers
+          mkdir -p "$RUNNER_TEMP/runtime"
+          cd "$RUNNER_TEMP/runtime"
+          while read -r component version sha; do
+            archive="$component.tar.xz"
+            curl --fail --location "https://developer.download.nvidia.com/compute/cuda/redist/$component/linux-x86_64/$component-linux-x86_64-$version-archive.tar.xz" -o "$archive"
+            echo "$sha  $archive" | sha256sum --check
+            tar -xf "$archive"
+          done <<'PINS'
+          cuda_cudart 13.2.75 9502ab2c7824e5ef3b554d290b9f564c5026994f469b99c72451a53578f386b9
+          libcublas 13.4.0.1 eda8001ac6b9a6ad862d054aa9b502ff39684147f1e86d02cc0a58a5ce67f62e
+          PINS
+          echo "LD_LIBRARY_PATH=$RUNNER_TEMP/runtime/cuda_cudart-linux-x86_64-13.2.75-archive/lib:$RUNNER_TEMP/runtime/libcublas-linux-x86_64-13.4.0.1-archive/lib" >> "$GITHUB_ENV"
+      - name: Install pinned Windows Vulkan loader
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $attempts = 0
-          do {
-            $attempts++
-            choco install llvm -y --no-progress
-            if ($LASTEXITCODE -eq 0) { break }
-            Start-Sleep -Seconds (15 * $attempts)
-          } while ($attempts -lt 3)
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-
-      - name: Reject ORT dependencies in every release package
-        working-directory: synapse
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo tree --locked --target all --edges normal,build,dev --prefix none \
-            --format '{p}' ${{ matrix.packages }} > release-dependencies.txt
-          # Match the package name token, not a substring of another crate name.
-          awk '$1 == "ort" || $1 == "synapse-engine-ort" { print; found = 1 }
-               END { exit found ? 1 : 0 }' release-dependencies.txt
-
-      - name: Build release binaries
-        working-directory: synapse
+          $ErrorActionPreference = 'Stop'
+          $installer = "$env:RUNNER_TEMP/vulkan.exe"
+          Invoke-WebRequest 'https://sdk.lunarg.com/sdk/download/1.4.357.0/windows/vulkansdk-windows-X64-1.4.357.0.exe' -OutFile $installer
+          if ((Get-FileHash $installer -Algorithm SHA256).Hash.ToLower() -ne '81f474711e9042f4cd22b31b2f7a8870db2e428b21586fb43dd80150be97310d') { throw 'Vulkan SDK digest mismatch' }
+          $sdk = "$env:RUNNER_TEMP/VulkanSDK/1.4.357.0"
+          $p = Start-Process $installer -ArgumentList @('--root', $sdk, '--accept-licenses', '--default-answer', '--confirm-command', 'install') -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw 'Vulkan SDK install failed' }
+          Copy-Item "$sdk/Bin/vulkan-1.dll" "$env:RUNNER_TEMP/extracted/windows-x64/vulkan-1.dll"
+      - name: Assert exact version and no-GPU refusal contracts
         shell: bash
         env:
-          DEVELOPER_DIR: ${{ matrix.name == 'darwin-arm64' && '/Applications/Xcode.app/Contents/Developer' || '' }}
-        run: cargo build --release --locked ${{ matrix.packages }}
+          ARCH: ${{ matrix.arch }}
+        run: python crates/synapse-release-checks/smoke.py "$RUNNER_TEMP/extracted/$ARCH"
 
-      # The ANE launcher execs a Swift worker it resolves from beside its own
-      # executable. build.rs leaves that worker in cargo's OUT_DIR; it ships as
-      # its own named asset so the installer records and upgrades it like any
-      # other binary.
-      - name: Stage the Swift ANE worker as a release binary
-        if: matrix.name == 'darwin-arm64'
-        working-directory: synapse
-        shell: bash
-        run: |
-          set -euo pipefail
-          swift_worker=$(find target/release/build -type f -name ck-synapse-worker-ane-swift | head -1)
-          [ -n "$swift_worker" ] || { echo "Swift ANE worker artifact not found" >&2; exit 1; }
-          cp "$swift_worker" target/release/ck-synapse-worker-ane-swift
-          target/release/ck-synapse-worker-ane-swift --version
-
-      - name: Package assets (zip + sha256)
-        working-directory: synapse
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p dist
-          for bin in ${{ matrix.binaries }}; do
-            src="target/release/$bin"
-            [ -f "$src" ] || src="target/release/$bin.exe"
-            [ -f "$src" ] || { echo "missing built binary: $bin" >&2; exit 1; }
-            asset="$bin-${{ matrix.os_arch }}.zip"
-            staging="$(mktemp -d)"
-            cp "$src" "$staging/"
-            (cd "$staging" && 7z a -tzip "$OLDPWD/dist/$asset" . >/dev/null)
-            # shasum is absent from the Windows runner's git-bash; sha256sum
-            # prints the identical "<hex>  <name>" sidecar format.
-            if command -v shasum >/dev/null 2>&1; then
-              (cd dist && shasum -a 256 "$asset" > "$asset.sha256")
-            else
-              (cd dist && sha256sum "$asset" > "$asset.sha256")
-            fi
-            rm -rf "$staging"
-          done
-          ls -la dist/
-
-      - name: Reject ONNX Runtime DLLs in Windows assets
-        if: matrix.name == 'windows-x64'
-        working-directory: synapse
-        shell: bash
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-          from zipfile import ZipFile
-          assets = list(Path('dist').glob('*.zip'))
-          assert assets, 'no Windows release archives to inspect'
-          for asset in assets:
-              with ZipFile(asset) as archive:
-                  for name in archive.namelist():
-                      basename = name.replace('\\', '/').rsplit('/', 1)[-1]
-                      assert basename.lower() != 'onnxruntime.dll', f'{asset}: {name}'
-          print(f'checked {len(assets)} Windows release archives: no onnxruntime.dll')
-          PY
-
-      # The oldest ck-subc this build is known to run against. `ck upgrade` and
-      # `ck setup` read this floor and refuse an older daemon up front, instead
-      # of letting the module fail at registration with nothing in the release
-      # explaining why.
-      #
-      # For subc-protocol 0.29 the floor is 0.20.53: the oldest daemon that
-      # 0.29 modules are known to run against, as recorded by SUBC, which owns
-      # the daemon, when the 0.29 wave shipped. Nothing lower has been tested
-      # with a 0.29 module, so nothing lower is claimed.
-      #
-      # The floor is knowledge rather than something derivable from the lock,
-      # so the protocol version it applies to is asserted here: a bump past
-      # 0.29 fails the release instead of publishing a floor nobody rechecked.
-      # One lane emits it because the asset is per-release, not per-platform.
-      - name: Emit release-manifest.json (declares the daemon floor)
-        if: matrix.name == 'linux-x64'
-        working-directory: synapse
-        shell: bash
-        run: |
-          set -euo pipefail
-          protocol=$(awk '/^name = "subc-protocol"$/{getline; gsub(/["]/,""); print $3}' Cargo.lock)
-          case "$protocol" in
-            0.29.*) ;;
-            *)
-              echo "subc-protocol is $protocol, not 0.29.x: recheck the ck-subc floor with subconscious before releasing" >&2
-              exit 1
-              ;;
-          esac
-          printf '{\n  "requires_core": "0.20.53"\n}\n' > dist/release-manifest.json
-          python3 -c "import json;d=json.load(open('dist/release-manifest.json'));assert d['requires_core']=='0.20.53',d"
-          cat dist/release-manifest.json
-
-      - name: Smoke --version from the packaged zip
-        working-directory: synapse
-        shell: bash
-        run: |
-          set -euo pipefail
-          probe="$(mktemp -d)"
-          7z x "dist/ck-synapse-${{ matrix.os_arch }}.zip" -o"$probe" >/dev/null
-          "$probe"/ck-synapse* --version
-
-      # Proves the packaged launcher finds its Swift sibling once both zips
-      # are extracted into one directory, as the installer does: with no
-      # arguments it must reach the Swift worker's usage error, not the
-      # launcher's not-found error.
-      - name: Smoke ANE launcher resolution from the packaged zips (darwin)
-        if: matrix.name == 'darwin-arm64'
-        working-directory: synapse
-        shell: bash
-        run: |
-          set -euo pipefail
-          probe="$(mktemp -d)"
-          7z x "dist/ck-synapse-worker-ane-${{ matrix.os_arch }}.zip" -o"$probe" >/dev/null
-          7z x "dist/ck-synapse-worker-ane-swift-${{ matrix.os_arch }}.zip" -o"$probe" >/dev/null
-          set +e
-          output=$("$probe/ck-synapse-worker-ane" 2>&1)
-          set -e
-          echo "$output"
-          grep -q "usage: synapse-worker-ane" <<<"$output"
-
-      - name: Upload assets to the tag's release
-        working-directory: synapse
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
-          gh release view "$tag" >/dev/null 2>&1 || \
-            gh release create "$tag" --title "$tag" --notes "synapse ${tag} (alpha)" --prerelease
-          gh release upload "$tag" dist/* --clobber
-
-      # Each lane records what it built so the finalize job can prune assets
-      # a previous cut of the same tag left behind (upload --clobber only
-      # replaces names that are still built).
-      - name: Record built asset names
-        working-directory: synapse
-        shell: bash
-        run: ls dist > "built-${{ matrix.name }}.txt"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: built-${{ matrix.name }}
-          path: synapse/built-${{ matrix.name }}.txt
-
-  finalize:
-    name: prune stale assets and publish
-    needs: build
+  promote:
+    needs: [validate, smoke]
     runs-on: ubuntu-24.04
     steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
-          pattern: built-*
-          merge-multiple: true
-      - name: Delete release assets not built by this run
+          name: verified-candidate
+          path: verified
+      - name: Promote verified bytes and release notes
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          SOURCE: ${{ needs.validate.outputs.source }}
+          TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          cat built-*.txt | sort -u > expected.txt
-          echo "expected $(wc -l < expected.txt) assets"
-          # Re-cutting a tag (delete + push) turns its existing release into a
-          # draft, and drafts are invisible to the by-tag lookup, so resolve
-          # the release from the listing instead.
-          release_id=$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
-            --jq ".[] | select(.tag_name == \"${GITHUB_REF_NAME}\") | .id" | head -1)
-          [ -n "$release_id" ] || { echo "no release for ${GITHUB_REF_NAME}" >&2; exit 1; }
-          gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets?per_page=100" \
-            --jq '.[] | "\(.id) \(.name)"' | while read -r id name; do
-            if ! grep -qx "$name" expected.txt; then
-              echo "pruning stale asset $name"
-              gh api -X DELETE "repos/${GITHUB_REPOSITORY}/releases/assets/${id}"
-            fi
-          done
-
-      # Installers resolve the latest non-draft release, so a release that
-      # became a draft through a tag re-cut must be published again once its
-      # asset set is final.
-      - name: Publish the release
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          gh release edit "${GITHUB_REF_NAME}" -R "${GITHUB_REPOSITORY}" --draft=false --prerelease
-          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}" \
-            --jq '"published \(.tag_name) draft=\(.draft) prerelease=\(.prerelease) assets=\(.assets|length)"'
+          python3 crates/synapse-release-checks/promote.py "$TAG" "$SOURCE" verified
