@@ -4194,7 +4194,9 @@ pub mod ane_residency {
 
     /// Recovery stops new leases and waits for already dispatched work to finish.
     /// Reservations remain until confirmed process exit and pinned model restoration.
-    /// Failed recovery stays closed rather than making uncertain capacity available.
+    /// Drain timeout escalates by interrupting active I/O and closing the owner.
+    /// Only an unconfirmed exit or failed replacement/restoration stays closed:
+    /// its hardware ownership cannot safely be made available to another worker.
     async fn recover_worker(inner: &Inner, worker: &Arc<dyn AneShapeWorker>) -> bool {
         let id = worker.worker_id().to_owned();
         let leader = inner.lock().recovering.insert(id.clone());
@@ -4218,7 +4220,10 @@ pub mod ane_residency {
                 break;
             }
             if tokio::time::timeout_at(deadline, notified).await.is_err() {
-                tracing::warn!(target:"worker",worker_id=%id,"worker recovery drain deadline exceeded; reservations retained");
+                if leader {
+                    tracing::warn!(target:"worker",worker_id=%id,"worker recovery drain deadline exceeded; forcing confirmed-exit restart");
+                    break;
+                }
                 return false;
             }
         }
@@ -4304,6 +4309,7 @@ pub mod ane_residency {
         faulted: std::sync::atomic::AtomicBool,
         exit_unconfirmed: std::sync::atomic::AtomicBool,
         request_counter: AtomicU64,
+        stop_exchanges: Notify,
     }
 
     impl<S> AneWorkerChannel<S>
@@ -4325,6 +4331,7 @@ pub mod ane_residency {
                 faulted: std::sync::atomic::AtomicBool::new(false),
                 exit_unconfirmed: std::sync::atomic::AtomicBool::new(false),
                 request_counter: AtomicU64::new(0),
+                stop_exchanges: Notify::new(),
             })
         }
 
@@ -4344,6 +4351,9 @@ pub mod ane_residency {
             raw: Option<&[u8]>,
         ) -> Result<(WorkerResponse, Option<Vec<u8>>), AneResidencyError> {
             let mut guard = self.stream.lock().await;
+            let stopped = self.stop_exchanges.notified();
+            tokio::pin!(stopped);
+            stopped.as_mut().enable();
             if self.faulted.load(Ordering::Relaxed) {
                 return Err(AneResidencyError::Channel(
                     "worker connection requires confirmed-exit restart".into(),
@@ -4356,7 +4366,9 @@ pub mod ane_residency {
             let max_frame = self.max_frame;
             #[cfg(test)]
             let started = std::time::Instant::now();
-            let result = async {
+            let result = tokio::select! {
+                _=stopped=>Err(AneResidencyError::Channel("worker recovery interrupted an active exchange".into())),
+                result=async {
                 write_json(stream, request, max_frame).await?;
                 if let Some(raw) = raw {
                     write_raw(stream, raw, max_frame).await?;
@@ -4367,9 +4379,9 @@ pub mod ane_residency {
                 } else {
                     None
                 };
-                Ok::<_, TransportError>((response, raw))
-            }
-            .await;
+                Ok::<_, AneResidencyError>((response, raw))
+            }=>result
+            };
             #[cfg(test)]
             if matches!(request, WorkerRequest::AneAdmitShape { .. }) {
                 let _ = COMPILE_RPC_MS.try_with(|elapsed| {
@@ -4402,7 +4414,7 @@ pub mod ane_residency {
                 }
                 Err(error) => {
                     self.faulted.store(true, Ordering::Relaxed);
-                    Err(error.into())
+                    Err(error)
                 }
             }
         }
@@ -4472,6 +4484,10 @@ pub mod ane_residency {
 
         fn restart(&self) -> BoxFuture<'_, Result<(), AneResidencyError>> {
             Box::pin(async move {
+                // Stop active I/O before taking the stream lock. A lease or a
+                // nonresponsive request cannot prevent escalation after drain timeout.
+                self.faulted.store(true, Ordering::Relaxed);
+                self.stop_exchanges.notify_waiters();
                 let mut guard = self.stream.lock().await;
                 if self.exit_unconfirmed.load(Ordering::Relaxed) {
                     return Err(AneResidencyError::Channel(
@@ -5541,6 +5557,7 @@ pub mod ane_residency {
             /// Admissions the mock answers with `ERR`, once each.
             fail_admit: HashSet<(String, usize)>,
             fail_evict: HashSet<(String, usize)>,
+            fail_confirm_exit: bool,
             exhaust_admit: HashMap<(String, usize), usize>,
             admit_attempts: HashMap<(String, usize), usize>,
             admit_delay: Duration,
@@ -6132,6 +6149,36 @@ pub mod ane_residency {
         }
 
         #[tokio::test]
+        async fn unconfirmed_exit_keeps_worker_closed_and_budget_charged() {
+            let ledger = SharedLedger::default();
+            ledger.lock().unwrap().fail_confirm_exit = true;
+            let channel = mock_channel("worker", &ledger).await;
+            let worker: Arc<dyn AneShapeWorker> = channel.clone();
+            let supervisor = budget_supervisor(8, Duration::from_millis(20));
+            let held = supervisor.lease(&worker, "model", 128).await.unwrap();
+            assert!(!recover_worker(&supervisor.inner, &worker).await);
+            assert!(channel.exit_unconfirmed.load(Ordering::Relaxed));
+            assert!(supervisor.inner.lock().recovering.contains("worker"));
+            assert_eq!(supervisor.inner.lock().reserved_executables(), 4);
+            assert_eq!(ledger.lock().unwrap().connects["worker"], 1);
+            drop(held);
+        }
+
+        #[tokio::test]
+        async fn drain_timeout_forces_confirmed_exit_and_reopens_worker() {
+            let ledger = SharedLedger::default();
+            let worker: Arc<dyn AneShapeWorker> = mock_channel("worker", &ledger).await;
+            let supervisor = budget_supervisor(8, Duration::from_millis(20));
+            let held = supervisor.lease(&worker, "model", 128).await.unwrap();
+            assert!(tokio::time::timeout(Duration::from_millis(200),recover_worker(&supervisor.inner,&worker)).await.unwrap(),"bounded drain timeout must escalate to confirmed owner exit, not permanently close a live worker");
+            assert_eq!(supervisor.stats().restarts, 1);
+            assert!(supervisor.inner.lock().recovering.is_empty());
+            assert!(supervisor.inner.lock().slots.is_empty());
+            drop(supervisor.lease(&worker, "model", 256).await.unwrap());
+            drop(held);
+        }
+
+        #[tokio::test]
         async fn failed_resource_victim_eviction_recovers_without_waiting_on_its_own_admission() {
             let ledger = SharedLedger::default();
             let worker: Arc<dyn AneShapeWorker> = mock_channel("worker", &ledger).await;
@@ -6344,13 +6391,21 @@ pub mod ane_residency {
                         .connects
                         .entry(worker_id)
                         .or_default() += 1;
+                    let fail_exit = ledger.lock().unwrap().fail_confirm_exit;
                     let task = tokio::spawn(serve_mock(worker, ledger));
                     Ok(AneWorkerSession {
                         stream: host,
                         confirm_exit: Box::pin(async move {
                             task.await.map_err(|error| {
                                 AneResidencyError::Channel(format!("mock owner exit: {error}"))
-                            })
+                            })?;
+                            if fail_exit {
+                                Err(AneResidencyError::Channel(
+                                    "mock owner exit unconfirmed".into(),
+                                ))
+                            } else {
+                                Ok(())
+                            }
                         }),
                     })
                 })
