@@ -180,8 +180,15 @@ The management registry in this snapshot is `embed.query`, `embed.batch`,
   must not use this operation or depend on its output. It refuses with the typed
   channel error `certify_observation_disabled` unless the generated certification
   config enables `certify_observation` (false by default). When enabled, it returns
-  all received ADMITTED `inventories` and per-worker `worker_requests` counts.
-  Observation only records execution; it never changes computation.
+  `inventories`, per-worker `worker_requests` counts, an independent supervisor
+  `admitted_count`, and `available`. In-process Metal uses no worker IPC, so
+  its complete snapshot has empty inventories and request counts and zero admissions.
+  CUDA and Vulkan report request counts without ANE placement inventories.
+  Direct ANE reports `available: false` until production inference is connected
+  to the residency supervisor; `certify run --row ane-m5` still refuses for that
+  missing integration. Supervisor observation capture retains every successful
+  ADMITTED inventory across eviction and confirmed-exit restart, separately from
+  its cumulative admission count. Observation never changes computation.
 - **Certification observation responses** — consumers must not use this surface.
   With `certify_observation` enabled, inline embed and rerank responses include a
   top-level `observation`: `input_ids` are the engine-bound token sequences;

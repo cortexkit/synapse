@@ -3145,6 +3145,7 @@ mod tests {
         for engine in synapse_core::OWNED_WORKER_HELLO_ENGINES {
             let mut host = host_for_engine(engine);
             let mock = attach_mock_worker(&mut host, rerank_mock);
+            assert_eq!(host.request_count(), 0);
             let model = host
                 .load_model(&artifact(), &runtime_config(&[]))
                 .await
@@ -3167,9 +3168,12 @@ mod tests {
                 scores.scores, expected,
                 "{engine} scores keep candidate order"
             );
+            let requests = host.request_count();
             drop(host);
 
             let seen = mock.await.unwrap();
+            assert_eq!(requests, seen.len() as u64);
+            assert_eq!(requests, 2);
             let (request, raw) = &seen[1];
             let WorkerRequest::RerankSequences {
                 sequences: sent, ..
@@ -6319,6 +6323,105 @@ pub mod ane_residency {
                 waits[1].elapsed_ms >= 20.0,
                 "measure the actual admission future, including its wait deadline"
             );
+        }
+
+        #[tokio::test]
+        async fn observations_off_retains_no_admitted_events() {
+            let ledger = SharedLedger::default();
+            let worker: Arc<dyn AneShapeWorker> = mock_channel("worker", &ledger).await;
+            let supervisor = budget_supervisor(4, Duration::from_secs(1));
+            drop(supervisor.lease(&worker, "model", 128).await.unwrap());
+            assert_eq!(supervisor.stats().admitted, 1);
+            assert!(supervisor.observations().is_none());
+            assert!(supervisor.inner.lock().inventory_sink.is_none());
+        }
+
+        #[tokio::test]
+        async fn observations_survive_eviction_restart_and_re_admission() {
+            let ledger = SharedLedger::default();
+            let channel = mock_channel("worker", &ledger).await;
+            let worker: Arc<dyn AneShapeWorker> = channel.clone();
+            let mut supervisor = budget_supervisor(4, Duration::from_secs(1));
+            supervisor.enable_observations();
+            assert_eq!(channel.request_count(), 0);
+            drop(supervisor.lease(&worker, "model", 128).await.unwrap());
+            assert_eq!(channel.request_count(), 1);
+            drop(supervisor.lease(&worker, "model", 256).await.unwrap());
+            assert_eq!(channel.request_count(), 3);
+            assert!(recover_worker(&supervisor.inner, &worker).await);
+            assert!(supervisor.resident_shapes().is_empty());
+            drop(supervisor.lease(&worker, "model", 256).await.unwrap());
+            assert_eq!(channel.request_count(), 4);
+            let (inventories, admitted) = supervisor.observations().unwrap();
+            assert_eq!(admitted, supervisor.stats().admitted);
+            assert_eq!(admitted, 3);
+            assert_eq!(inventories.len(), 3);
+            assert_eq!(inventories[0].executables[0].id, "model-128");
+            assert_eq!(inventories[1].executables[0].id, "model-256");
+            assert_eq!(inventories[2], inventories[1]);
+            assert_eq!(supervisor.stats().evicted, 1);
+            assert_eq!(supervisor.stats().restarts, 1);
+            assert_eq!(ledger.lock().unwrap().connects["worker"], 2);
+            assert_eq!(supervisor.resident_shapes()["model"], vec![256]);
+        }
+
+        #[tokio::test]
+        async fn dropping_retained_inventory_refuses_certify_placement_gate() {
+            struct SnapshotRunner(synapse_certify::RunEvidence);
+            impl synapse_certify::Runner for SnapshotRunner {
+                fn probe_floor(&mut self, _: &str, _: &str) -> synapse_certify::Result<String> {
+                    Ok("ok".into())
+                }
+                fn observe(
+                    &mut self,
+                    _: &str,
+                    _: &str,
+                ) -> synapse_certify::Result<synapse_certify::RunEvidence> {
+                    Ok(self.0.clone())
+                }
+            }
+            let ledger = SharedLedger::default();
+            let worker: Arc<dyn AneShapeWorker> = mock_channel("worker", &ledger).await;
+            let mut supervisor = budget_supervisor(4, Duration::from_secs(1));
+            supervisor.enable_observations();
+            drop(supervisor.lease(&worker, "model", 128).await.unwrap());
+            drop(supervisor.lease(&worker, "model", 256).await.unwrap());
+            let evidence = |supervisor: &AneResidencySupervisor| {
+                let (inventories, admitted) = supervisor.observations().unwrap();
+                serde_json::from_value(serde_json::json!({
+                    "source_commit": "1".repeat(40), "machine": {}, "artifacts": [],
+                    "operation": "embed", "profile_id": "test", "fingerprint": "test",
+                    "fixture_set_id": "test", "expected_fixtures": 1, "tolerance_class": "test",
+                    "parity": null, "admission": {
+                        "tokens_8192": {"outcome":"processed", "truncated":false, "diverted":false, "worker_requests":1},
+                        "tokens_8193": {"outcome":"sequence_too_long", "truncated":false, "diverted":false, "worker_requests":0}
+                    }, "layer_count": LAYERS, "inventories": inventories,
+                    "admitted_count": admitted, "raw_series": null
+                })).unwrap()
+            };
+            let run = |runner: &mut SnapshotRunner| {
+                synapse_certify::produce(
+                    runner,
+                    std::path::Path::new("."),
+                    "ane-m5",
+                    "gte-modernbert-base",
+                )
+                .unwrap_err()
+                .to_string()
+            };
+            // All admitted inventories are present, so the placement check passes.
+            // This fixture intentionally has no parity output and fails that next check.
+            assert!(run(&mut SnapshotRunner(evidence(&supervisor))).contains("parity gate failed"));
+            supervisor
+                .inner
+                .lock()
+                .inventory_sink
+                .as_mut()
+                .unwrap()
+                .pop();
+            assert_eq!(supervisor.stats().admitted, 2);
+            assert!(run(&mut SnapshotRunner(evidence(&supervisor)))
+                .contains("placement inventory failed"));
         }
 
         #[tokio::test]

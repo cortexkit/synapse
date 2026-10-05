@@ -20413,6 +20413,18 @@ mod tests {
     async fn catalog_embed_ceiling_precedes_job_diversion_and_worker_call() {
         let (dir, descriptor) = test_storage_descriptor("catalog-embed-ceiling");
         let state = catalog_test_state(&dir, &descriptor, "gte-modernbert-base.owned-vulkan");
+        let before = certify_worker_snapshot(&state.runtime);
+        assert_eq!(before["available"], true);
+        assert_eq!(before["worker_requests"].as_object().unwrap().len(), 1);
+        assert_eq!(
+            before["worker_requests"]
+                .as_object()
+                .unwrap()
+                .values()
+                .next()
+                .unwrap(),
+            0
+        );
         let text = std::iter::repeat_n("a", 8193).collect::<Vec<_>>().join(" ");
         let result = response_result(
             embed_batch(
@@ -20430,6 +20442,7 @@ mod tests {
         );
         assert!(result.get("job_id").is_none());
         assert!(result.get("truncation_disclosures").is_none());
+        assert_eq!(certify_worker_snapshot(&state.runtime), before);
         assert!(!dir.join("worker-called").exists());
         let text = std::iter::repeat_n("a", 8192).collect::<Vec<_>>().join(" ");
         let result = response_result(
