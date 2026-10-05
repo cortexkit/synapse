@@ -139,9 +139,10 @@ exactly the CUDA runtime sonames `libcudart.so.13`, `libcublas.so.13` and
 `libcublasLt.so.13` on the library search path. Missing any of them prevents
 even `--probe-floor` from reaching the driver-only probe. The driver library
 `libcuda.so.1` is resolved at runtime, not a load-time dependency. The worker
-requires NVIDIA driver API >= 13000 (the raw `cuDriverGetVersion()` integer,
-the CUDA 13 driver line), the `cuda_min_driver_api` floor every CUDA profile in
-`bench/parity/models.json` declares.
+requires NVIDIA driver API >= 13020 (the raw `cuDriverGetVersion()` integer),
+the driver API of the CUDA 13.2 toolkit used to build the worker and the
+`cuda_min_driver_api` floor every CUDA profile in `bench/parity/models.json`
+declares. Because the worker ships PTX, an older driver cannot JIT-compile it.
 
 The `release-candidate` workflow builds these workers from an exact source
 commit and uploads immutable assets to a draft `candidate-<S>` release, where

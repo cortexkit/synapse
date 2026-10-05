@@ -19,7 +19,7 @@ fn all_four_cuda_profiles_agree_with_public_floor_constants() {
         4
     );
     let floor = floor_build::collect_cuda_floor(&manifest).unwrap();
-    assert_eq!(floor, [13000, 7, 5]);
+    assert_eq!(floor, [13020, 7, 5]);
     assert_eq!(synapse_core::OWNED_CUDA_MINIMUM_DRIVER_API, floor[0]);
     assert_eq!(
         synapse_core::OWNED_CUDA_MINIMUM_DEVICE_CC,

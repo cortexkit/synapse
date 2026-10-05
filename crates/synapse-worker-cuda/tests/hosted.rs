@@ -126,7 +126,7 @@ fn probe_is_one_typed_envelope_without_artifact_access() {
     assert_eq!(text.lines().count(), 1);
     let value: serde_json::Value = serde_json::from_str(&text).unwrap();
     assert_eq!(value.as_object().unwrap().len(), 4);
-    assert_eq!(value["required"]["driver_api"], 13000);
+    assert_eq!(value["required"]["driver_api"], 13020);
     assert_eq!(
         output.status.code(),
         Some(if value["status"] == "ok" { 0 } else { 2 })

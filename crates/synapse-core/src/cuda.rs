@@ -222,20 +222,20 @@ mod tests {
     #[test]
     fn floor_rejects_driver_boundary_and_accepts_it_at_the_floor() {
         assert_eq!(
-            evaluate_cuda_floor(12999, 7, 5, None).refusal_code(),
+            evaluate_cuda_floor(13019, 7, 5, None).refusal_code(),
             Some("cuda_driver_too_old")
         );
-        assert!(evaluate_cuda_floor(13000, 7, 5, None).is_supported());
+        assert!(evaluate_cuda_floor(13020, 7, 5, None).is_supported());
     }
 
     #[test]
     fn floor_rejects_compute_boundary_and_accepts_above_it() {
         assert_eq!(
-            evaluate_cuda_floor(13000, 7, 4, None).refusal_code(),
+            evaluate_cuda_floor(13020, 7, 4, None).refusal_code(),
             Some("cuda_compute_capability_too_low")
         );
-        assert!(evaluate_cuda_floor(13000, 7, 5, None).is_supported());
-        assert!(evaluate_cuda_floor(13000, 8, 0, None).is_supported());
+        assert!(evaluate_cuda_floor(13020, 7, 5, None).is_supported());
+        assert!(evaluate_cuda_floor(13020, 8, 0, None).is_supported());
     }
 
     #[test]
@@ -245,7 +245,7 @@ mod tests {
         assert_eq!(identity.build_flags["backend"], OWNED_CUDA_BACKEND);
         assert_eq!(identity.build_flags["ptx_virtual_arch"], "compute_75");
         assert_eq!(identity.build_flags["minimum_device_cc"], "7.5");
-        assert_eq!(identity.build_flags["minimum_cuda_driver_api"], "13000");
+        assert_eq!(identity.build_flags["minimum_cuda_driver_api"], "13020");
         assert_eq!(identity.build_flags["risk_class"], "abort_capable");
     }
 

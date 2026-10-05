@@ -191,7 +191,7 @@ mod tests {
     use super::*;
     #[test]
     fn floor_boundary_is_typed() {
-        for (driver_api, code) in [(12999, "cuda_driver_too_old"), (13000, "ok")] {
+        for (driver_api, code) in [(13019, "cuda_driver_too_old"), (13020, "ok")] {
             let envelope = floor_envelope(
                 Ok(crate::HardwareFloorProbe {
                     driver_api,
@@ -201,7 +201,7 @@ mod tests {
                 None,
             );
             assert_eq!(envelope["code"], code);
-            assert_eq!(envelope["required"]["driver_api"], 13000);
+            assert_eq!(envelope["required"]["driver_api"], 13020);
         }
     }
     #[test]
