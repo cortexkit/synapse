@@ -985,8 +985,18 @@ mod fresh_process_hardware {
     #[test]
     #[ignore = "Scoped command pools with live retained executables and single-shape eviction"]
     fn fresh_process_scoped_pools_reclaim() {
-        let mut model = model("gte-modernbert-base");
-        for shape in [128, 256, 512, 1024, 2048] {
+        let slug = std::env::var("ANE_TEST_MODEL").unwrap_or_else(|_| "gte-modernbert-base".into());
+        let method =
+            std::env::var("ANE_RECLAIM_PATH").unwrap_or_else(|_| "scoped-single-evict".into());
+        let qwen = slug == "qwen3-embedding-0.6b";
+        let lengths = if qwen {
+            vec![128, 256, 512, 1024]
+        } else {
+            vec![128, 256, 512, 1024, 2048]
+        };
+        let replacement = if qwen { 2048 } else { 4096 };
+        let mut model = model(&slug);
+        for shape in lengths {
             ane::diagnostics::with_autorelease_pool(|| {
                 model.admit_with_limit(shape, "scoped-pools-development", 64, |graph, _| {
                     graph.compile(NSQualityOfService::UserInteractive)
@@ -994,15 +1004,26 @@ mod fresh_process_hardware {
             })
             .unwrap();
         }
+        let initial_executables = model
+            .resident
+            .values()
+            .map(|resident| resident.executables.len())
+            .sum::<usize>();
+        assert_eq!(initial_executables, if qwen { 112 } else { 110 });
         let tokens = vec![1u32; 200];
         let before = ane::diagnostics::with_autorelease_pool(|| model.run(&tokens)).unwrap();
+        assert!(!before.is_empty());
         assert!(before.iter().all(|value| value.is_finite()));
         let started = std::time::Instant::now();
-        ane::diagnostics::with_autorelease_pool(|| drop(model.resident.remove(&128)));
+        if method == "scoped-single-evict-no-pool" {
+            drop(model.resident.remove(&128));
+        } else {
+            ane::diagnostics::with_autorelease_pool(|| drop(model.resident.remove(&128)));
+        }
         let offset_ms = started.elapsed().as_secs_f64() * 1000.0;
         let mut loaded = 0;
         let result = ane::diagnostics::with_autorelease_pool(|| {
-            model.admit_with_limit(4096, "scoped-pools-development", 64, |graph, _| {
+            model.admit_with_limit(replacement, "scoped-pools-development", 64, |graph, _| {
                 let result = graph.compile(NSQualityOfService::UserInteractive);
                 if result.is_ok() {
                     loaded += 1;
@@ -1014,7 +1035,7 @@ mod fresh_process_hardware {
         let after = ane::diagnostics::with_autorelease_pool(|| model.run(&tokens)).unwrap();
         assert_eq!(before,after,"retained sibling must remain executable and byte-identical across scoped-pool releases");
         write_experiment(
-            serde_json::json!({"classification":"development","experiment":"in-process-reclaim-paths","method":"scoped-single-evict","initial_executables":110,"observations":["retained sibling runs with finite byte-identical output before and after eviction/new compilation"],"attempts":[{"actual_start_after_reclaim_ms":offset_ms,"finished_after_reclaim_ms":started.elapsed().as_secs_f64()*1000.0,"loaded":loaded,"error":error}],"remaining_fully_resident_executables":model.resident.values().map(|resident|resident.executables.len()).sum::<usize>()}),
+            serde_json::json!({"classification":"development","experiment":"in-process-reclaim-paths","method":method,"model":slug,"replacement_shape":replacement,"initial_executables":initial_executables,"observations":["retained sibling runs with finite byte-identical output before and after eviction/new compilation"],"attempts":[{"actual_start_after_reclaim_ms":offset_ms,"finished_after_reclaim_ms":started.elapsed().as_secs_f64()*1000.0,"loaded":loaded,"error":error}],"remaining_fully_resident_executables":model.resident.values().map(|resident|resident.executables.len()).sum::<usize>()}),
         );
     }
 

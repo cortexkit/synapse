@@ -37,3 +37,22 @@ python3 crates/synapse-worker-ane-direct/tests/run_reclaim_paths.py --driver "$D
 ```
 
 Launchers unset TMPDIR, select the required Xcode DEVELOPER_DIR and log before/after load beside every run. Serving does not invoke the explicitly experimental vendor diagnostic helpers.
+
+## Fresh-process repeats after disk recovery
+
+The disk cleanup removed ignored packages. Rebuilt all four packages using the documented parity converter from worktree-local copies of the pinned HF snapshots: all 16 manifest-listed files copied with symlinks dereferenced and SHA-256 verified; all four converted-package digests matched manifest pins. No parent checkout or production process was modified.
+
+Mac17,6, OS build26A434. The operator reported production's Core ML GTE128/256/512 models resident on the same Neural Engine; these were not stopped or modified, so measurements reflect a shared device. Start load columns are unitless macOS 1-/5-/15-minute averages. Each row is a new process; initial GTE residency is five shapes (128,256,512,1024,2048), Qwen residency is four (128,256,512,1024). Evict128; replace with GTE4096 or Qwen2048. Every row's retained sibling at256 produced finite byte-identical output before/after.
+
+| Control | Initial executables | Start load1/5/15 | Release-to-attempt start ms | Release-to-complete ms | Replacement loaded/error |
+| --- | ---: | --- | ---: | ---: | --- |
+| GTE pooled repeat1 |110|17.78/19.10/25.52|35.858|70228.393|22 / none|
+| GTE pooled repeat2 |110|24.13/21.66/25.37|86.669|73019.327|22 / none|
+| Qwen pooled |112|28.77/27.30/27.16|245.841|90221.922|28 / none|
+| GTE eviction without pool (compile/inference still pooled) |110|29.11/30.31/29.05|47.187|68743.140|22 / none|
+
+The GTE pooled result is now repeatable across three fresh processes (including the original control); Qwen succeeded once. No process/client replacement or cooldown was used. Timings include replacement compilation and sibling verification, not a direct allocator-return measurement.
+
+**The eviction-only negative control unexpectedly succeeded.** Removing only the eviction pool does not reproduce the previous failure when compile/inference are pooled. This falsifies the claim that an eviction's own autorelease pool is necessary for the observed capacity return. It does not contradict draining Objective-C autoreleased temporary objects after each operation or the successful retained-shape reclamation, but exact root-cause placement needs an additional isolated control (compile without pools, inference/eviction with pools). No implementation follows these repeats yet.
+
+Data: `reclaim-scoped-gte-repeats-development.json`, `reclaim-scoped-qwen-development.json`, and `reclaim-eviction-no-pool-development.json`. The four hardware runs completed serially in984seconds. The first launch attempt did not execute any hardware because the ignored file containing the test executable's path was missing after cleanup; reruns used the freshly rebuilt test executable directly.

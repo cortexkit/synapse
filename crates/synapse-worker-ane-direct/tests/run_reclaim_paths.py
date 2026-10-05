@@ -12,7 +12,8 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--driver", type=Path, required=True)
 parser.add_argument("--out", type=Path, required=True)
 parser.add_argument("--timeout", type=int, default=3600)
-parser.add_argument("--methods", nargs="+", choices=["drop-client-references", "fresh-client", "fresh-allocated-client", "model-purge", "client-purge", "release-all", "autorelease-all", "scoped-single-evict"], default=["drop-client-references", "fresh-client", "fresh-allocated-client", "model-purge", "client-purge", "release-all", "autorelease-all"])
+parser.add_argument("--model", choices=["gte-modernbert-base", "qwen3-embedding-0.6b"], default="gte-modernbert-base")
+parser.add_argument("--methods", nargs="+", choices=["drop-client-references", "fresh-client", "fresh-allocated-client", "model-purge", "client-purge", "release-all", "autorelease-all", "scoped-single-evict", "scoped-single-evict-no-pool"], default=["drop-client-references", "fresh-client", "fresh-allocated-client", "model-purge", "client-purge", "release-all", "autorelease-all"])
 args = parser.parse_args()
 root = Path(__file__).resolve().parents[3]
 env = dict(os.environ)
@@ -29,8 +30,8 @@ for method in args.methods:
     print(method, "load1/5/15", before, flush=True)
     with tempfile.TemporaryDirectory() as tmp:
         result = Path(tmp) / "result.json"
-        child_env = dict(env, ANE_RECLAIM_PATH=method, ANE_CAPACITY_OUT=str(result))
-        test = {"autorelease-all": "fresh_process_autorelease_reclaim", "scoped-single-evict": "fresh_process_scoped_pools_reclaim"}.get(method, "fresh_process_reclaim_paths")
+        child_env = dict(env, ANE_RECLAIM_PATH=method, ANE_TEST_MODEL=args.model, ANE_CAPACITY_OUT=str(result))
+        test = {"autorelease-all": "fresh_process_autorelease_reclaim", "scoped-single-evict": "fresh_process_scoped_pools_reclaim", "scoped-single-evict-no-pool": "fresh_process_scoped_pools_reclaim"}.get(method, "fresh_process_reclaim_paths")
         command = [str(args.driver.resolve()), "backend::fresh_process_hardware::" + test, "--exact", "--ignored", "--nocapture", "--test-threads=1"]
         try:
             child = subprocess.run(command, env=child_env, cwd=root, text=True, capture_output=True, timeout=max(1, deadline-time.monotonic()))
@@ -40,6 +41,7 @@ for method in args.methods:
         except subprocess.TimeoutExpired:
             data = {"method": method, "result": "one-hour hardware deadline reached"}
         data["load_before_1_5_15"] = before
+        data["source_commit"] = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
         data["load_after_1_5_15"] = list(os.getloadavg())
         report["runs"].append(data)
         args.out.write_text(json.dumps(report, indent=2) + "\n")
