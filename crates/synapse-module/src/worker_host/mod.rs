@@ -4020,6 +4020,16 @@ pub mod ane_residency {
         }
 
         async fn evict(&self, owner: Arc<dyn AneShapeWorker>, key: ShapeKey, slot_id: u64) -> bool {
+            self.evict_with_recovery(owner, key, slot_id, true).await
+        }
+
+        async fn evict_with_recovery(
+            &self,
+            owner: Arc<dyn AneShapeWorker>,
+            key: ShapeKey,
+            slot_id: u64,
+            recover_on_failure: bool,
+        ) -> bool {
             let inner = self.inner.clone();
             let task = tokio::spawn(async move {
                 match owner.evict_shape(&key.model_ref, key.shape).await {
@@ -4043,7 +4053,9 @@ pub mod ane_residency {
                             error = %error,
                             "direct-ANE evict failed; restarting the worker"
                         );
-                        recover_worker(&inner, &owner).await;
+                        if recover_on_failure {
+                            recover_worker(&inner, &owner).await;
+                        }
                         false
                     }
                 }
@@ -4119,7 +4131,16 @@ pub mod ane_residency {
             forget_failed_admission(&supervisor.inner, &key, slot_id);
             return Err(resource_refusal(error));
         };
-        if !supervisor.evict(owner, victim, victim_id).await {
+        if !supervisor
+            .evict_with_recovery(owner.clone(), victim, victim_id, false)
+            .await
+        {
+            // The admission RPC has finished, but its reservation remains charged.
+            // Recovery must not wait on the operation that is requesting recovery.
+            if owner.worker_id() == worker.worker_id() {
+                mark_failed_admission(&supervisor.inner, &key, slot_id);
+            }
+            recover_worker(&supervisor.inner, &owner).await;
             forget_failed_admission(&supervisor.inner, &key, slot_id);
             return Err(resource_refusal(error));
         }
@@ -5519,6 +5540,7 @@ pub mod ane_residency {
             shape_not_admitted: u64,
             /// Admissions the mock answers with `ERR`, once each.
             fail_admit: HashSet<(String, usize)>,
+            fail_evict: HashSet<(String, usize)>,
             exhaust_admit: HashMap<(String, usize), usize>,
             admit_attempts: HashMap<(String, usize), usize>,
             admit_delay: Duration,
@@ -5634,6 +5656,25 @@ pub mod ane_residency {
                         model_ref,
                         shape,
                     } => {
+                        let failed = ledger
+                            .lock()
+                            .unwrap()
+                            .fail_evict
+                            .remove(&(model_ref.clone(), *shape));
+                        if failed {
+                            write_json(
+                                &mut stream,
+                                &WorkerResponse::Err {
+                                    req_id: Some(req_id.clone()),
+                                    code: "evict_failed".into(),
+                                    msg: "injected eviction failure".into(),
+                                },
+                                max,
+                            )
+                            .await
+                            .unwrap();
+                            continue;
+                        }
                         let gate = ledger.lock().unwrap().evict_gate.clone();
                         if let Some((started, release)) = gate {
                             started.notify_one();
@@ -6088,6 +6129,33 @@ pub mod ane_residency {
             assert!(data.max_per_model <= 4 && data.max_total <= 8);
             drop(data);
             drop(lease);
+        }
+
+        #[tokio::test]
+        async fn failed_resource_victim_eviction_recovers_without_waiting_on_its_own_admission() {
+            let ledger = SharedLedger::default();
+            let worker: Arc<dyn AneShapeWorker> = mock_channel("worker", &ledger).await;
+            let supervisor = budget_supervisor(8, Duration::from_secs(3));
+            drop(supervisor.lease(&worker, "model", 128).await.unwrap());
+            {
+                let mut ledger = ledger.lock().unwrap();
+                ledger.exhaust_admit.insert(("model".into(), 256), 1);
+                ledger.fail_evict.insert(("model".into(), 128));
+            }
+            let refusal = tokio::time::timeout(
+                Duration::from_millis(200),
+                supervisor.lease(&worker, "model", 256),
+            )
+            .await
+            .expect("recovery must not wait for the triggering admission's own slot");
+            assert!(matches!(
+                refusal,
+                Err(AneResidencyError::ResourcesExhausted { .. })
+            ));
+            assert_eq!(supervisor.stats().restarts, 1);
+            assert!(supervisor.inner.lock().recovering.is_empty());
+            assert!(supervisor.inner.lock().slots.is_empty());
+            drop(supervisor.lease(&worker, "model", 256).await.unwrap());
         }
 
         #[tokio::test]
