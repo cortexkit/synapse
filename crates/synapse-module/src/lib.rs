@@ -20066,6 +20066,9 @@ mod tests {
         })
     }
 
+    // Only the Unix-only catalog worker tests call this; gate it with them so
+    // Windows builds don't see it as dead code.
+    #[cfg(unix)]
     fn catalog_test_state(
         dir: &Path,
         descriptor: &StorageDescriptor,
