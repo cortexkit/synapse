@@ -29,7 +29,12 @@ jobs:
   verify-catalog-evidence:
     runs-on: ubuntu-24.04
     steps:
+      # persist-credentials: false keeps the contents:write token out of
+      # .git/config, where any later step (including dependency build scripts
+      # run by cargo) could read it. gh steps get the token through their own env.
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - name: Verify catalog evidence at the release tag
         shell: bash
@@ -92,6 +97,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: synapse
+          persist-credentials: false
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
