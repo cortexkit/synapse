@@ -806,7 +806,7 @@ mod fresh_process_hardware {
     fn fresh_process_residency_capacity() {
         let mix = std::env::var("ANE_CAPACITY_MIX").expect("ANE_CAPACITY_MIX");
         let slugs: &[&str] = match mix.as_str() {
-            "gte" => &["gte-modernbert-base"],
+            "gte" | "gte-large" => &["gte-modernbert-base"],
             "qwen" => &["qwen3-embedding-0.6b"],
             "alternating" => &["gte-modernbert-base", "qwen3-embedding-0.6b"],
             "all-four" => &[
@@ -826,7 +826,13 @@ mod fresh_process_hardware {
         let mut resident_executables = 0usize;
         let mut admissions = Vec::new();
         let mut exhausted = false;
-        'ladder: for shape in [128, 256, 512, 1024, 2048] {
+        let mut layer_events = Vec::new();
+        let ladder: &[usize] = if mix == "gte-large" {
+            &[4096, 8192, 128, 256, 512, 1024, 2048]
+        } else {
+            &[128, 256, 512, 1024, 2048]
+        };
+        'ladder: for &shape in ladder {
             for (index, model) in models.iter_mut().enumerate() {
                 let mut mil_bytes = 0usize;
                 let mut weight_bytes = 0usize;
@@ -839,6 +845,7 @@ mod fresh_process_hardware {
                         mil_bytes += mil.len();
                         weight_bytes += weights.len();
                         let result = graph.compile(NSQualityOfService::UserInteractive);
+                        layer_events.push(serde_json::json!({"unix_ns": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos().to_string(), "loaded": result.is_ok()}));
                         if result.is_ok() {
                             loaded += 1;
                         }
@@ -869,7 +876,7 @@ mod fresh_process_hardware {
             "resident_shapes": resident, "resident_executables": resident_executables,
             "resident_mil_bytes": resident_mil, "resident_weight_bytes": resident_weights,
             "submitted_mil_bytes": submitted_mil, "submitted_weight_bytes": submitted_weights,
-            "admissions": admissions,
+            "admissions": admissions, "layer_events": layer_events,
             "accounting": "Compiler source payload, not opaque executable memory. Failed admission's partial executables are rolled back; submitted totals include its failing layer."
         });
         std::fs::write(
@@ -878,6 +885,17 @@ mod fresh_process_hardware {
         )
         .unwrap();
         println!("CAPACITY_RESULT {report}");
+        if let Some(release) = std::env::var_os("ANE_CAPACITY_RELEASE") {
+            // Hold successful shapes until the paired process reports, preserving simultaneous residency.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1800);
+            while !std::path::Path::new(&release).exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "paired-process release deadline"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
         drop(models);
         cleanup_diagnostic_artifacts();
     }
