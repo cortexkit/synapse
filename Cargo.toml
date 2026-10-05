@@ -21,6 +21,7 @@ members = [
     "crates/synapse-worker-llama",
     "crates/synapse-worker-cuda",
     "crates/synapse-worker-ane",
+    "crates/synapse-worker-ane-direct",
     "crates/synapse-worker-decode",
     "crates/synapse-worker-vulkan",
 ]

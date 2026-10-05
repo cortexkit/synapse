@@ -169,12 +169,18 @@ impl WorkerHostError {
             risk_class: EngineRiskClass::AbortCapable,
             message: self.to_string(),
             retry_after_ms: match self {
+                Self::WorkerErr { code, .. }
+                    if code == ane_residency::ERR_ANE_RESOURCES_EXHAUSTED =>
+                {
+                    Some(ane_residency::ANE_RESOURCES_RETRY_AFTER_MS)
+                }
                 Self::Quarantined { .. } | Self::WorkerErr { .. } | Self::HelloRefused { .. } => {
                     None
                 }
                 _ => Some(250),
             },
-            safe_to_retry_same_request: matches!(self, Self::EngineCrashed { .. }),
+            safe_to_retry_same_request: matches!(self, Self::EngineCrashed { .. })
+                || matches!(self, Self::WorkerErr {code, ..} if code == ane_residency::ERR_ANE_RESOURCES_EXHAUSTED),
         }
     }
 
@@ -3393,6 +3399,8 @@ pub mod ane_residency {
     pub const ANE_SHAPE_LADDER: [usize; 7] = [128, 256, 512, 1024, 2048, 4096, 8192];
     pub const ANE_RESIDENT_SHAPES_PER_MODEL: usize = 4;
     pub const ANE_RESIDENT_SHAPES_TOTAL: usize = 8;
+    pub const ERR_ANE_RESOURCES_EXHAUSTED: &str = "ane_resources_exhausted";
+    pub const ANE_RESOURCES_RETRY_AFTER_MS: u64 = 250;
     /// Lock file, relative to the home directory, held by the one module
     /// process allowed to run direct-ANE workers.
     pub const ANE_DIRECT_LOCK_HOME_PATH: &str = "Library/Caches/ck-synapse/ane-direct.lock";
@@ -3414,6 +3422,8 @@ pub mod ane_residency {
         /// The worker answered `ERR`.
         #[error("worker returned {code}: {msg}")]
         WorkerErr { code: String, msg: String },
+        #[error("ane_resources_exhausted: {msg}; retry after {retry_after_ms}ms")]
+        ResourcesExhausted { msg: String, retry_after_ms: u64 },
         #[error("direct-ANE worker channel: {0}")]
         Channel(String),
         #[error("ane_lane_busy: another live process holds {}", path.display())]
@@ -3423,10 +3433,27 @@ pub mod ane_residency {
     }
 
     impl AneResidencyError {
+        pub fn to_engine_error(
+            &self,
+            stage: synapse_core::EngineErrorStage,
+        ) -> synapse_core::EngineError {
+            synapse_core::EngineError {
+                stage,
+                risk_class: synapse_core::EngineRiskClass::AbortCapable,
+                message: self.to_string(),
+                retry_after_ms: if let Self::ResourcesExhausted { retry_after_ms, .. } = self {
+                    Some(*retry_after_ms)
+                } else {
+                    None
+                },
+                safe_to_retry_same_request: matches!(self, Self::ResourcesExhausted { .. }),
+            }
+        }
         pub fn code(&self) -> Option<&str> {
             match self {
                 Self::WorkerErr { code, .. } => Some(code),
                 Self::LaneBusy { .. } => Some(ERR_ANE_LANE_BUSY),
+                Self::ResourcesExhausted { .. } => Some(ERR_ANE_RESOURCES_EXHAUSTED),
                 _ => None,
             }
         }
@@ -3516,6 +3543,8 @@ pub mod ane_residency {
         next_slot: u64,
         clock: u64,
         stats: AneResidencyStats,
+        #[cfg(test)]
+        recorded_samples: Vec<BTreeMap<String, Vec<usize>>>,
     }
 
     impl State {
@@ -3533,6 +3562,16 @@ pub mod ane_residency {
 
         fn sample(&mut self) {
             self.stats.samples += 1;
+            #[cfg(test)]
+            {
+                let mut map: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+                for key in self.slots.keys() {
+                    map.entry(key.model_ref.clone())
+                        .or_default()
+                        .push(key.shape);
+                }
+                self.recorded_samples.push(map);
+            }
             let mut per_model: BTreeMap<&str, usize> = BTreeMap::new();
             for key in self.slots.keys() {
                 *per_model.entry(key.model_ref.as_str()).or_default() += 1;
@@ -3704,7 +3743,9 @@ pub mod ane_residency {
                         key,
                         slot_id,
                         owner,
-                    } => self.evict(owner, key, slot_id).await,
+                    } => {
+                        self.evict(owner, key, slot_id).await;
+                    }
                     Step::Wait => notified.await,
                 }
             }
@@ -3835,9 +3876,13 @@ pub mod ane_residency {
             let inner = self.inner.clone();
             // The exchange runs on its own task so its outcome is recorded even
             // if the waiting request is dropped part way through.
+            let supervisor = self.clone();
             let task = tokio::spawn(async move {
                 match worker.admit_shape(&key.model_ref, key.shape).await {
                     Ok(inventory) => finish_admit(&inner, &key, slot_id, inventory),
+                    Err(error) if error.code() == Some(ERR_ANE_RESOURCES_EXHAUSTED) => {
+                        retry_resource_admission(&supervisor, &worker, key, slot_id, error).await
+                    }
                     Err(error) => {
                         recover_worker(&inner, &worker).await;
                         Err(error)
@@ -3849,7 +3894,7 @@ pub mod ane_residency {
             })?
         }
 
-        async fn evict(&self, owner: Arc<dyn AneShapeWorker>, key: ShapeKey, slot_id: u64) {
+        async fn evict(&self, owner: Arc<dyn AneShapeWorker>, key: ShapeKey, slot_id: u64) -> bool {
             let inner = self.inner.clone();
             let task = tokio::spawn(async move {
                 match owner.evict_shape(&key.model_ref, key.shape).await {
@@ -3862,6 +3907,7 @@ pub mod ane_residency {
                         }
                         drop(state);
                         inner.changed.notify_waiters();
+                        true
                     }
                     Err(error) => {
                         tracing::warn!(
@@ -3873,11 +3919,83 @@ pub mod ane_residency {
                             "direct-ANE evict failed; restarting the worker"
                         );
                         recover_worker(&inner, &owner).await;
+                        false
                     }
                 }
             });
-            if let Err(error) = task.await {
-                tracing::warn!(target: "worker", error = %error, "direct-ANE eviction task failed");
+            match task.await {
+                Ok(evicted) => evicted,
+                Err(error) => {
+                    tracing::warn!(target: "worker", error = %error, "direct-ANE eviction task failed");
+                    false
+                }
+            }
+        }
+    }
+
+    fn resource_victim(inner: &Inner) -> Option<(ShapeKey, u64, Arc<dyn AneShapeWorker>)> {
+        let mut state = inner.lock();
+        let victim = state
+            .slots
+            .iter()
+            .filter(|(_, slot)| slot.state == SlotState::Resident && slot.leases == 0)
+            .min_by_key(|(_, slot)| slot.last_used)
+            .map(|(key, slot)| (key.clone(), slot.id, slot.worker.clone()));
+        if let Some((key, _, _)) = &victim {
+            state.slots.get_mut(key).unwrap().state = SlotState::Evicting;
+        }
+        victim
+    }
+
+    fn forget_failed_admission(inner: &Inner, key: &ShapeKey, slot_id: u64) {
+        let mut state = inner.lock();
+        if state
+            .slots
+            .get(key)
+            .is_some_and(|slot| slot.id == slot_id && slot.state == SlotState::Admitting)
+        {
+            state.slots.remove(key);
+        }
+        drop(state);
+        inner.changed.notify_waiters();
+    }
+
+    fn resource_refusal(error: AneResidencyError) -> AneResidencyError {
+        AneResidencyError::ResourcesExhausted {
+            msg: error.to_string(),
+            retry_after_ms: ANE_RESOURCES_RETRY_AFTER_MS,
+        }
+    }
+
+    async fn retry_resource_admission(
+        supervisor: &AneResidencySupervisor,
+        worker: &Arc<dyn AneShapeWorker>,
+        key: ShapeKey,
+        slot_id: u64,
+        error: AneResidencyError,
+    ) -> Result<AneShapeLease, AneResidencyError> {
+        // Keep the failed shape's budget reservation while freeing one physical
+        // resident. Selecting and marking the victim under the lock prevents a
+        // new lease from racing the eviction; the worker owns partial rollback.
+        let Some((victim, victim_id, owner)) = resource_victim(&supervisor.inner) else {
+            forget_failed_admission(&supervisor.inner, &key, slot_id);
+            return Err(resource_refusal(error));
+        };
+        if !supervisor.evict(owner, victim, victim_id).await {
+            forget_failed_admission(&supervisor.inner, &key, slot_id);
+            return Err(resource_refusal(error));
+        }
+        // One retry only. A second resource refusal must leave the target absent
+        // without restarting a healthy worker or recursively evicting the lane.
+        match worker.admit_shape(&key.model_ref, key.shape).await {
+            Ok(inventory) => finish_admit(&supervisor.inner, &key, slot_id, inventory),
+            Err(error) if error.code() == Some(ERR_ANE_RESOURCES_EXHAUSTED) => {
+                forget_failed_admission(&supervisor.inner, &key, slot_id);
+                Err(resource_refusal(error))
+            }
+            Err(error) => {
+                recover_worker(&supervisor.inner, worker).await;
+                Err(error)
             }
         }
     }
@@ -3913,8 +4031,8 @@ pub mod ane_residency {
         })
     }
 
-    /// Restarts a worker that answered an admit or evict with `ERR` (or lost
-    /// its connection), then forgets every shape counted for it, since the new
+    /// Restarts a worker after a non-resource admission error or eviction error
+    /// (including a lost connection), then forgets its shapes, since the new
     /// process has none, and wakes the waiting requests.
     async fn recover_worker(inner: &Inner, worker: &Arc<dyn AneShapeWorker>) {
         if let Err(error) = worker.restart().await {
@@ -4184,6 +4302,753 @@ pub mod ane_residency {
         }
     }
 
+    #[cfg(all(test, target_os = "macos"))]
+    mod hardware_tests {
+        use super::*;
+        use crate::worker_host::{WorkerConnection, WorkerHost, WorkerHostConfig};
+        use serde_json::{json, Value};
+        use std::time::Duration;
+        use synapse_core::{
+            decode_f32_frame, encode_i32_frame, WorkerPooling, WorkerSequence, WorkerTokenItem,
+            DEFAULT_MAX_FRAME_BYTES,
+        };
+        use tokio::process::Child;
+        type RealChannel = Arc<AneWorkerChannel<tokio::net::UnixStream>>;
+        const SLUGS: [&str; 4] = [
+            "gte-modernbert-base",
+            "gte-reranker-modernbert-base",
+            "qwen3-embedding-0.6b",
+            "qwen3-reranker-0.6b",
+        ];
+
+        struct Factory {
+            root: PathBuf,
+            children: Arc<Mutex<Vec<Child>>>,
+            lock: Arc<std::fs::File>,
+        }
+        impl Factory {
+            fn new(root: PathBuf, lock: &AneDirectLaneLock) -> Self {
+                std::fs::create_dir_all(&root).unwrap();
+                Self {
+                    root,
+                    children: Arc::new(Mutex::new(Vec::new())),
+                    lock: lock.file.clone(),
+                }
+            }
+            async fn connect(&self, id: &str) -> RealChannel {
+                let children = self.children.clone();
+                let lock = self.lock.clone();
+                let root = self.root.clone();
+                let worker_id = id.to_owned();
+                let connector: AneWorkerConnector<tokio::net::UnixStream> = Box::new(move || {
+                    let children = children.clone();
+                    let lock = lock.clone();
+                    let root = root.clone();
+                    let id = worker_id.clone();
+                    Box::pin(async move {
+                        let binary = std::env::var_os("ANE_TEST_WORKER").expect("ANE_TEST_WORKER");
+                        let mut config = WorkerHostConfig::new(PathBuf::from(binary), root);
+                        config.worker_id = id;
+                        config.inherited_lane_lock = Some(lock);
+                        let mut host = WorkerHost::new(config);
+                        host.ping()
+                            .await
+                            .map_err(|error| AneResidencyError::Channel(format!("{error:?}")))?;
+                        let WorkerConnection { stream, child, .. } =
+                            host.connection.take().unwrap();
+                        children.lock().unwrap().push(child);
+                        Ok(stream)
+                    })
+                });
+                Arc::new(
+                    AneWorkerChannel::connect(id, DEFAULT_MAX_FRAME_BYTES, connector)
+                        .await
+                        .unwrap(),
+                )
+            }
+            fn pids(&self) -> Vec<u32> {
+                self.children
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter_map(Child::id)
+                    .collect()
+            }
+            async fn stop(&self) {
+                let children = std::mem::take(&mut *self.children.lock().unwrap());
+                for mut child in children {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                }
+            }
+        }
+        fn manifest() -> Value {
+            serde_json::from_slice(include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../bench/parity/models.json"
+            )))
+            .unwrap()
+        }
+        fn fixture(slug: &str) -> Value {
+            serde_json::from_slice(&std::fs::read(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("../../bench/parity/fixtures/{slug}/{slug}.ref-v1.transformers-5.16.1.seed-0.json"))).unwrap()).unwrap()
+        }
+        fn fixture_ids(slug: &str, id: &str) -> Vec<i32> {
+            let value = fixture(slug);
+            serde_json::from_value(
+                value["cases"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|case| case["id"] == id)
+                    .unwrap()["input_ids"]
+                    .clone(),
+            )
+            .unwrap()
+        }
+        async fn load(channel: &RealChannel, slug: &str) -> String {
+            let manifest = manifest();
+            let profile = format!("{slug}.ane-direct-worker");
+            let digest = manifest["profiles"][&profile]["converted_package_digest"]
+                .as_str()
+                .unwrap();
+            let root =
+                PathBuf::from(std::env::var_os("ANE_TEST_PACKAGES").expect("ANE_TEST_PACKAGES"));
+            let operation = if slug.contains("reranker") {
+                "rerank"
+            } else {
+                "embed"
+            };
+            let request = WorkerRequest::Load {
+                req_id: channel.next_req_id("load"),
+                artifact_path: root
+                    .join(format!("{slug}.safetensors"))
+                    .to_string_lossy()
+                    .into_owned(),
+                artifact_digest: digest.to_owned(),
+                format: "safetensors".into(),
+                runtime_config: [
+                    ("profile".into(), profile),
+                    ("operation".into(), operation.into()),
+                ]
+                .into_iter()
+                .collect(),
+            };
+            match channel.exchange(&request, None).await.unwrap().0 {
+                WorkerResponse::Loaded { model_ref, .. } => model_ref,
+                other => panic!("real LOAD failed: {other:?}"),
+            }
+        }
+        fn signal(pid: u32, number: i32) {
+            assert!(
+                synapse_core::without_launch_nonce(std::process::Command::new("/bin/kill"))
+                    .args([format!("-{number}"), pid.to_string()])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        #[derive(Default)]
+        struct Ledger {
+            admitted: usize,
+            evicted: usize,
+            leased_evicts: usize,
+            shape_not_admitted: usize,
+            no_ane_resources: usize,
+        }
+        struct Observed {
+            channel: RealChannel,
+            supervisor: std::sync::Weak<Inner>,
+            ledger: Arc<Mutex<Ledger>>,
+            slug: String,
+            model_ref: String,
+        }
+        impl AneShapeWorker for Observed {
+            fn worker_id(&self) -> &str {
+                self.channel.worker_id()
+            }
+            fn admit_shape<'a>(
+                &'a self,
+                model_ref: &'a str,
+                shape: usize,
+            ) -> BoxFuture<'a, Result<AnePlacementInventory, AneResidencyError>> {
+                Box::pin(async move {
+                    let result = self.channel.admit_shape(model_ref, shape).await;
+                    match &result {
+                        Ok(inventory) => {
+                            let model = &manifest()["models"][&self.slug];
+                            let layers = model["architecture"]["params"]["num_hidden_layers"]
+                                .as_u64()
+                                .unwrap() as usize;
+                            let mut covered: Vec<u32> = inventory
+                                .executables
+                                .iter()
+                                .flat_map(|entry| entry.layers.iter().copied())
+                                .collect();
+                            covered.sort();
+                            if covered != (0..layers as u32).collect::<Vec<_>>()
+                                || inventory.cpu_stages.iter().any(|stage| {
+                                    ![
+                                        "token_embedding",
+                                        "mask_position",
+                                        "rotation_in",
+                                        "rotation_out",
+                                        "final_norm",
+                                        "pooling",
+                                        "gte_classifier_head",
+                                        "qwen_yes_no_readout",
+                                    ]
+                                    .contains(&stage.as_str())
+                                })
+                            {
+                                return Err(AneResidencyError::Channel(
+                                    "invalid ADMITTED placement inventory".into(),
+                                ));
+                            }
+                            self.ledger.lock().unwrap().admitted += 1;
+                        }
+                        Err(error) if error.code() == Some(ERR_ANE_RESOURCES_EXHAUSTED) => {
+                            self.ledger.lock().unwrap().no_ane_resources += 1
+                        }
+                        _ => (),
+                    }
+                    result
+                })
+            }
+            fn evict_shape<'a>(
+                &'a self,
+                model_ref: &'a str,
+                shape: usize,
+            ) -> BoxFuture<'a, Result<(), AneResidencyError>> {
+                Box::pin(async move {
+                    if self
+                        .supervisor
+                        .upgrade()
+                        .unwrap()
+                        .lock()
+                        .slots
+                        .get(&ShapeKey {
+                            model_ref: model_ref.into(),
+                            shape,
+                        })
+                        .is_some_and(|slot| slot.leases != 0)
+                    {
+                        self.ledger.lock().unwrap().leased_evicts += 1;
+                    }
+                    self.channel.evict_shape(model_ref, shape).await?;
+                    self.ledger.lock().unwrap().evicted += 1;
+                    Ok(())
+                })
+            }
+            fn restart<'a>(&'a self) -> BoxFuture<'a, Result<(), AneResidencyError>> {
+                Box::pin(async move {
+                    self.channel.restart().await?;
+                    let model_ref = load(&self.channel, &self.slug).await;
+                    if model_ref != self.model_ref {
+                        return Err(AneResidencyError::Channel(
+                            "model_ref changed after restart".into(),
+                        ));
+                    }
+                    Ok(())
+                })
+            }
+        }
+        async fn infer(
+            worker: &Observed,
+            ids: Vec<i32>,
+            rerank: bool,
+        ) -> Result<Vec<f32>, AneResidencyError> {
+            let item = WorkerTokenItem {
+                id: "candidate".into(),
+                n_tokens: ids.len(),
+            };
+            let request = if rerank {
+                WorkerRequest::RerankSequences {
+                    req_id: worker.channel.next_req_id("score"),
+                    model_ref: worker.model_ref.clone(),
+                    sequences: vec![WorkerSequence {
+                        n_tokens: ids.len(),
+                    }],
+                }
+            } else {
+                WorkerRequest::EmbedBatch {
+                    req_id: worker.channel.next_req_id("embed"),
+                    model_ref: worker.model_ref.clone(),
+                    items: vec![item],
+                    pooling: WorkerPooling::Mean,
+                    normalize: true,
+                }
+            };
+            let (response, raw) = worker
+                .channel
+                .exchange(&request, Some(&encode_i32_frame(&ids)))
+                .await?;
+            match response {
+                WorkerResponse::Scores { .. } | WorkerResponse::Vectors { .. } => {
+                    let result = decode_f32_frame(&raw.unwrap())
+                        .map_err(|e| AneResidencyError::Channel(e.to_string()))?;
+                    assert!(!result.is_empty() && result.iter().all(|value| value.is_finite()));
+                    Ok(result)
+                }
+                WorkerResponse::Err { code, msg, .. } => {
+                    if code == "shape_not_admitted" {
+                        worker.ledger.lock().unwrap().shape_not_admitted += 1;
+                    }
+                    Err(AneResidencyError::WorkerErr { code, msg })
+                }
+                other => Err(AneResidencyError::Channel(format!(
+                    "unexpected inference response: {other:?}"
+                ))),
+            }
+        }
+        fn output(command: &str, args: &[&str]) -> String {
+            let result = synapse_core::without_launch_nonce(std::process::Command::new(command))
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(result.status.success(), "metadata command {command} failed");
+            String::from_utf8(result.stdout).unwrap().trim().to_owned()
+        }
+        fn load_averages() -> Vec<f64> {
+            output("sysctl", &["-n", "vm.loadavg"])
+                .split_whitespace()
+                .filter_map(|part| part.parse().ok())
+                .collect()
+        }
+        // This small validator supports the assertions used by the committed
+        // development schema; newly added assertions must not pass unchecked.
+        fn schema_validate(value: &Value, schema: &Value) -> Result<(), String> {
+            for key in schema.as_object().ok_or("schema must be an object")?.keys() {
+                if ![
+                    "$schema",
+                    "title",
+                    "type",
+                    "required",
+                    "additionalProperties",
+                    "properties",
+                    "items",
+                    "const",
+                    "enum",
+                    "minimum",
+                    "minLength",
+                    "maxLength",
+                    "minItems",
+                    "maxItems",
+                    "uniqueItems",
+                ]
+                .contains(&key.as_str())
+                {
+                    return Err(format!("unsupported schema assertion {key}"));
+                }
+            }
+            if let Some(kind) = schema["type"].as_str() {
+                let valid = match kind {
+                    "object" => value.is_object(),
+                    "array" => value.is_array(),
+                    "string" => value.is_string(),
+                    "integer" => value.is_u64() || value.is_i64(),
+                    "number" => value.is_number(),
+                    other => return Err(format!("unsupported schema type {other}")),
+                };
+                if !valid {
+                    return Err(format!("expected {kind}"));
+                }
+            }
+            if let Some(expected) = schema.get("const") {
+                if value != expected {
+                    return Err("const mismatch".into());
+                }
+            }
+            if let Some(choices) = schema["enum"].as_array() {
+                if !choices.contains(value) {
+                    return Err("enum mismatch".into());
+                }
+            }
+            if let Some(minimum) = schema["minimum"].as_f64() {
+                if value.as_f64().unwrap() < minimum {
+                    return Err("below minimum".into());
+                }
+            }
+            if let Some(text) = value.as_str() {
+                for (key, less) in [("minLength", true), ("maxLength", false)] {
+                    if let Some(limit) = schema[key].as_u64() {
+                        let n = text.chars().count() as u64;
+                        if (less && n < limit) || (!less && n > limit) {
+                            return Err(format!("{key} violated"));
+                        }
+                    }
+                }
+            }
+            if let Some(map) = value.as_object() {
+                if let Some(required) = schema["required"].as_array() {
+                    for key in required {
+                        if !map.contains_key(key.as_str().unwrap()) {
+                            return Err(format!("missing {key}"));
+                        }
+                    }
+                }
+                for (key, child) in map {
+                    if let Some(child_schema) = schema["properties"].get(key) {
+                        schema_validate(child, child_schema)
+                            .map_err(|error| format!("{key}: {error}"))?;
+                    } else if schema["additionalProperties"] == false {
+                        return Err(format!("unexpected {key}"));
+                    } else if schema["additionalProperties"].is_object() {
+                        schema_validate(child, &schema["additionalProperties"])?;
+                    }
+                }
+            }
+            if let Some(items) = value.as_array() {
+                if let Some(n) = schema["minItems"].as_u64() {
+                    if items.len() < n as usize {
+                        return Err("too few items".into());
+                    }
+                }
+                if let Some(n) = schema["maxItems"].as_u64() {
+                    if items.len() > n as usize {
+                        return Err("too many items".into());
+                    }
+                }
+                if schema["uniqueItems"] == true
+                    && items
+                        .iter()
+                        .enumerate()
+                        .any(|(i, item)| items[..i].contains(item))
+                {
+                    return Err("duplicate items".into());
+                }
+                if let Some(item_schema) = schema.get("items") {
+                    for item in items {
+                        schema_validate(item, item_schema)?;
+                    }
+                }
+            }
+            Ok(())
+        }
+        fn stress_schema() -> Value {
+            serde_json::from_slice(include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../synapse-worker-ane-direct/tests/fixtures/ane-direct-stress.schema.json"
+            )))
+            .unwrap()
+        }
+        #[test]
+        fn stress_schema_rejects_missing_counts_wrong_types_and_invalid_shapes() {
+            let valid = json!({"schema":1,"kind":"development","harness_profile":"debug","source_commit":"1".repeat(40),"machine":{"model_identifier":"test","platform_uuid":"test"},"os":{"version":"test","build":"test"},"load_1_5_15_start":[0,0,0],"load_1_5_15_end":[0,0,0],"request_count":37,"completed_count":37,"request_errors":[],"sample_count":1,"samples":[{"m":[128]}],"max_resident_per_model":1,"max_resident_total":1,"admitted_count":1,"evicted_count":0,"shape_not_admitted_count":0,"leased_evict_count":0,"no_ane_resources":{"count":0},"ane_lane_busy":{"status":"tested"},"metal_ranking_check":{"status":"skipped","reason":"test"},"reranker_pool_check":{"finite":"passed","byte_identical_repeats":"passed"}});
+            let schema = stress_schema();
+            assert!(schema_validate(&valid, &schema).is_ok());
+            let mut missing = valid.clone();
+            missing.as_object_mut().unwrap().remove("sample_count");
+            assert!(schema_validate(&missing, &schema).is_err());
+            for (field, bad) in [
+                ("load_1_5_15_start", json!(["wrong", 0, 0])),
+                ("load_1_5_15_end", json!([0, 0])),
+                ("samples", json!([{"m":[17]}])),
+                ("samples", json!([{"m":[128,128]}])),
+                ("completed_count", json!("37")),
+                ("schema", json!(2)),
+                ("sample_count", json!(-1)),
+                ("source_commit", json!("short")),
+            ] {
+                let mut malformed = valid.clone();
+                malformed[field] = bad;
+                assert!(
+                    schema_validate(&malformed, &schema).is_err(),
+                    "{field} must be rejected"
+                );
+            }
+            let mut extra = valid;
+            extra["unknown"] = json!(true);
+            assert!(schema_validate(&extra, &schema).is_err());
+        }
+        fn write_stress(out: &Path, report: &Value) {
+            schema_validate(report, &stress_schema()).unwrap();
+            if let Some(parent) = out.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(out, serde_json::to_vec_pretty(report).unwrap()).unwrap();
+            println!("ANE_STRESS_OUTPUT={}", out.display());
+        }
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        #[ignore = "real four-worker stress; load1<16 and load5<20 required"]
+        async fn real_direct_ane_residency_stress() {
+            let load_start = load_averages();
+            assert_eq!(load_start.len(), 3);
+            assert!(
+                load_start[0] < 16.0 && load_start[1] < 20.0,
+                "stress deferred: load={load_start:?}"
+            );
+            let root = PathBuf::from(format!("../../target/ane-stress-{}", std::process::id()));
+            std::fs::create_dir_all(&root).unwrap();
+            let lock = AneDirectLaneLock::acquire(&root.join("lane.lock")).unwrap();
+            let factory = Factory::new(root.clone(), &lock);
+            let supervisor =
+                AneResidencySupervisor::with_lane_lock(AneResidencyLimits::default(), lock);
+            let ledger = Arc::new(Mutex::new(Ledger::default()));
+            let mut workers = Vec::new();
+            for (index, slug) in SLUGS.iter().enumerate() {
+                let channel = factory.connect(&format!("w{index}")).await;
+                let model_ref = load(&channel, slug).await;
+                workers.push(Arc::new(Observed {
+                    channel,
+                    supervisor: Arc::downgrade(&supervisor.inner),
+                    ledger: ledger.clone(),
+                    slug: (*slug).into(),
+                    model_ref,
+                }));
+            }
+            let barrier = Arc::new(tokio::sync::Barrier::new(38));
+            let mut tasks = tokio::task::JoinSet::new();
+            for worker in &workers {
+                for shape in [128, 256, 512, 1024, 2048, 4096, 8192] {
+                    let worker = worker.clone();
+                    let supervisor = supervisor.clone();
+                    let barrier = barrier.clone();
+                    tasks.spawn(async move {
+                        barrier.wait().await;
+                        let channel: Arc<dyn AneShapeWorker> = worker.clone();
+                        let lease = supervisor.lease(&channel, &worker.model_ref, shape).await?;
+                        assert!(!lease.inventory().unwrap().executables.is_empty());
+                        drop(lease);
+                        Ok::<_, AneResidencyError>(())
+                    });
+                }
+            }
+            for _ in 0..8 {
+                let worker = workers[0].clone();
+                let supervisor = supervisor.clone();
+                let barrier = barrier.clone();
+                tasks.spawn(async move {
+                    barrier.wait().await;
+                    let ids = [
+                        fixture_ids(SLUGS[0], "boundary-128"),
+                        fixture_ids(SLUGS[0], "boundary-129"),
+                    ];
+                    let channel: Arc<dyn AneShapeWorker> = worker.clone();
+                    supervisor
+                        .run_by_rung(&channel, &worker.model_ref, &[128, 129], |_, indices| {
+                            let worker = worker.clone();
+                            let input = ids[indices[0]].clone();
+                            async move { infer(&worker, input, false).await.map(|_| vec![()]) }
+                        })
+                        .await
+                        .map(|_| ())
+                });
+            }
+            let pool_results: Arc<Mutex<Vec<(usize, f32)>>> = Arc::new(Mutex::new(Vec::new()));
+            let pool_result_task = pool_results.clone();
+            let worker = workers[1].clone();
+            let supervisor_pool = supervisor.clone();
+            let barrier_pool = barrier.clone();
+            tasks.spawn(async move {
+                barrier_pool.wait().await;
+                let mut long = fixture_ids(SLUGS[1], "long-8192");
+                let eos = *long.last().unwrap();
+                long.truncate(1535);
+                long.push(eos);
+                let ids = [
+                    fixture_ids(SLUGS[1], "short-0"),
+                    fixture_ids(SLUGS[1], "boundary-511"),
+                    long,
+                ];
+                let channel: Arc<dyn AneShapeWorker> = worker.clone();
+                supervisor_pool
+                    .run_by_rung(
+                        &channel,
+                        &worker.model_ref,
+                        &[ids[0].len(), ids[1].len(), ids[2].len()],
+                        |shape, indices| {
+                            let worker = worker.clone();
+                            let input = ids[indices[0]].clone();
+                            let pool_results = pool_result_task.clone();
+                            async move {
+                                let first = infer(&worker, input.clone(), true).await?;
+                                let second = infer(&worker, input, true).await?;
+                                assert_eq!(
+                                    first.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                                    second.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+                                );
+                                assert_eq!(first.len(), 1);
+                                pool_results.lock().unwrap().push((shape, first[0]));
+                                Ok::<_, AneResidencyError>(vec![()])
+                            }
+                        },
+                    )
+                    .await
+                    .map(|_| ())
+            });
+            assert_eq!(tasks.len(), 37);
+            barrier.wait().await;
+            let mut completed = 0;
+            let mut errors = Vec::new();
+            while let Some(result) = tasks.join_next().await {
+                match result {
+                    Ok(Ok(())) => completed += 1,
+                    other => errors.push(format!("{other:?}")),
+                }
+            }
+            let stats = supervisor.stats();
+            let samples = supervisor.inner.lock().recorded_samples.clone();
+            let mut pool_results = pool_results.lock().unwrap().clone();
+            pool_results.sort_by_key(|entry| entry.0);
+            let pool_passed =
+                pool_results.iter().map(|entry| entry.0).collect::<Vec<_>>() == [128, 512, 2048];
+            let clean = {
+                let ledger = ledger.lock().unwrap();
+                let uuid = output("ioreg", &["-rd1", "-c", "IOPlatformExpertDevice"])
+                    .lines()
+                    .find(|line| line.contains("IOPlatformUUID"))
+                    .unwrap()
+                    .split('"')
+                    .nth(3)
+                    .unwrap()
+                    .to_owned();
+                let report = json!({"schema":1, "kind":"development", "harness_profile":if cfg!(debug_assertions) {"debug"} else {"release"}, "source_commit":output("git", &["rev-parse", "HEAD"]), "machine":{"model_identifier":output("sysctl", &["-n", "hw.model"]), "platform_uuid":uuid}, "os":{"version":output("sw_vers", &["-productVersion"]), "build":output("sw_vers", &["-buildVersion"])}, "load_1_5_15_start":load_start, "load_1_5_15_end":load_averages(), "request_count":37, "completed_count":completed, "request_errors":errors, "sample_count":samples.len(), "samples":samples, "max_resident_per_model":stats.max_resident_per_model, "max_resident_total":stats.max_resident_total, "admitted_count":ledger.admitted, "evicted_count":ledger.evicted, "shape_not_admitted_count":ledger.shape_not_admitted, "leased_evict_count":ledger.leased_evicts, "no_ane_resources":{"count":ledger.no_ane_resources}, "ane_lane_busy":{"status":"covered_by_killed_holder_test"}, "metal_ranking_check":{"status":"skipped", "reason":"Metal rerank package/lane unavailable in isolated worktree; missing2048-rung parity fixture is a parity-crate follow-up"}, "reranker_pool_check":{"finite":if pool_passed {"passed"} else {"failed"}, "byte_identical_repeats":if pool_passed {"passed"} else {"failed"}, "scores_by_rung":pool_results.iter().map(|(shape, score)|json!({"shape":shape, "score":score})).collect::<Vec<_>>()}});
+                let out = std::env::var_os("ANE_STRESS_OUT")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| {
+                        std::env::temp_dir()
+                            .join(format!("ane-direct-stress-{}.json", std::process::id()))
+                    });
+                write_stress(&out, &report);
+                pool_passed
+                    && completed == 37
+                    && errors.is_empty()
+                    && stats.samples as usize == ledger.admitted + ledger.evicted
+                    && ledger.leased_evicts == 0
+                    && ledger.shape_not_admitted == 0
+                    && ledger.no_ane_resources == 0
+                    && stats.max_resident_per_model <= 4
+                    && stats.max_resident_total <= 8
+            };
+            drop(workers);
+            drop(supervisor);
+            factory.stop().await;
+            std::fs::remove_dir_all(root).unwrap();
+            assert!(clean, "stress failed; see ANE_STRESS_OUTPUT above");
+        }
+        struct StoppedWorker(Option<u32>);
+        impl Drop for StoppedWorker {
+            fn drop(&mut self) {
+                if let Some(pid) = self.0 {
+                    let _ =
+                        synapse_core::without_launch_nonce(std::process::Command::new("/bin/kill"))
+                            .args(["-9".to_owned(), pid.to_string()])
+                            .status();
+                }
+            }
+        }
+        #[tokio::test]
+        #[ignore = "subprocess entry for the real killed-holder test"]
+        async fn real_lane_holder_process() {
+            let root = PathBuf::from(std::env::var_os("ANE_HOLDER_ROOT").expect("ANE_HOLDER_ROOT"));
+            let lock = AneDirectLaneLock::acquire(&root.join("lane.lock")).unwrap();
+            let factory = Factory::new(root.clone(), &lock);
+            let supervisor =
+                AneResidencySupervisor::with_lane_lock(AneResidencyLimits::default(), lock);
+            let channel = factory.connect("holder").await;
+            let model_ref = load(&channel, SLUGS[0]).await;
+            let worker: Arc<dyn AneShapeWorker> = channel.clone();
+            let _lease = supervisor.lease(&worker, &model_ref, 128).await.unwrap();
+            let ids = fixture_ids(SLUGS[0], "boundary-128");
+            let items: Vec<_> = (0..256)
+                .map(|index| WorkerTokenItem {
+                    id: index.to_string(),
+                    n_tokens: ids.len(),
+                })
+                .collect();
+            let raw = encode_i32_frame(&ids.repeat(256));
+            let request = WorkerRequest::EmbedBatch {
+                req_id: "in-flight".into(),
+                model_ref,
+                pooling: WorkerPooling::Cls,
+                normalize: true,
+                items,
+            };
+            let mut guard = channel.stream.lock().await;
+            let stream = guard.as_mut().unwrap();
+            write_json(stream, &request, DEFAULT_MAX_FRAME_BYTES)
+                .await
+                .unwrap();
+            write_raw(stream, &raw, DEFAULT_MAX_FRAME_BYTES)
+                .await
+                .unwrap();
+            std::fs::write(root.join("ready.tmp"), serde_json::to_vec(&json!({"pids":factory.pids(), "resident":supervisor.resident_shapes(), "in_flight_sequences":256})).unwrap()).unwrap();
+            std::fs::rename(root.join("ready.tmp"), root.join("ready.json")).unwrap();
+            // The parent suspends the worker before killing this holder. The
+            // blocked response keeps the real request and shape lease in flight.
+            let _: WorkerResponse = read_json(stream, DEFAULT_MAX_FRAME_BYTES).await.unwrap();
+            panic!("holder completed before parent killed it");
+        }
+        #[tokio::test]
+        #[ignore = "requires the real worker, pinned weights and macOS ANE"]
+        async fn killed_holder_with_resident_work_keeps_lane_busy_until_old_worker_exits() {
+            let root = PathBuf::from(format!("../../target/ane-holder-{}", std::process::id()));
+            std::fs::create_dir_all(&root).unwrap();
+            let mut holder = synapse_core::without_launch_nonce_tokio(
+                tokio::process::Command::new(std::env::current_exe().unwrap()),
+            )
+            .args([
+                "--ignored",
+                "--exact",
+                "worker_host::ane_residency::hardware_tests::real_lane_holder_process",
+                "--nocapture",
+            ])
+            .env("ANE_HOLDER_ROOT", &root)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+            let ready = tokio::time::timeout(Duration::from_secs(120), async {
+                loop {
+                    if let Ok(bytes) = std::fs::read(root.join("ready.json")) {
+                        break serde_json::from_slice::<Value>(&bytes).unwrap();
+                    }
+                    if let Some(status) = holder.try_wait().unwrap() {
+                        panic!("holder exited before readiness: {status}");
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(ready["resident"]
+                .as_object()
+                .unwrap()
+                .values()
+                .any(|shapes| shapes == &json!([128])));
+            assert_eq!(ready["in_flight_sequences"], 256);
+            let pid = ready["pids"][0].as_u64().unwrap() as u32;
+            signal(pid, 17);
+            let mut stopped = StoppedWorker(Some(pid));
+            holder.kill().await.unwrap();
+            holder.wait().await.unwrap();
+            assert_eq!(
+                AneDirectLaneLock::acquire(&root.join("lane.lock"))
+                    .err()
+                    .unwrap()
+                    .code(),
+                Some(ERR_ANE_LANE_BUSY)
+            );
+            signal(pid, 19);
+            let replacement = tokio::time::timeout(Duration::from_secs(15), async {
+                loop {
+                    match AneDirectLaneLock::acquire(&root.join("lane.lock")) {
+                        Ok(lock) => break lock,
+                        Err(error) => assert_eq!(error.code(), Some(ERR_ANE_LANE_BUSY)),
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            // Acquiring the inherited flock proves the old worker closed its
+            // descriptor after observing supervisor EOF, not merely holder death.
+            println!("KILLED_HOLDER old_worker={pid} resident_shapes=1 in_flight_sequences=256 replacement=ane_lane_busy_then_acquired");
+            stopped.0 = None;
+            drop(replacement);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -4215,6 +5080,8 @@ pub mod ane_residency {
             shape_not_admitted: u64,
             /// Admissions the mock answers with `ERR`, once each.
             fail_admit: HashSet<(String, usize)>,
+            exhaust_admit: HashMap<(String, usize), usize>,
+            admit_attempts: HashMap<(String, usize), usize>,
             admit_delay: Duration,
             connects: HashMap<String, u32>,
         }
@@ -4256,7 +5123,27 @@ pub mod ane_residency {
                         tokio::time::sleep(delay).await;
                         let key = (model_ref.clone(), *shape);
                         let mut ledger = ledger.lock().unwrap();
-                        if ledger.fail_admit.remove(&key) {
+                        *ledger.admit_attempts.entry(key.clone()).or_default() += 1;
+                        let exhausted =
+                            ledger.exhaust_admit.get_mut(&key).is_some_and(|remaining| {
+                                if *remaining > 0 {
+                                    *remaining -= 1;
+                                    true
+                                } else {
+                                    false
+                                }
+                            });
+                        if exhausted {
+                            ledger.events.push(format!("exhaust {model_ref} {shape}"));
+                            (
+                                WorkerResponse::Err {
+                                    req_id: Some(req_id.clone()),
+                                    code: ERR_ANE_RESOURCES_EXHAUSTED.into(),
+                                    msg: "injected ANE resource exhaustion".into(),
+                                },
+                                None,
+                            )
+                        } else if ledger.fail_admit.remove(&key) {
                             (
                                 WorkerResponse::Err {
                                     req_id: Some(req_id.clone()),
@@ -4363,6 +5250,129 @@ pub mod ane_residency {
             for key in own {
                 ledger.resident.remove(&key);
             }
+        }
+
+        #[tokio::test]
+        async fn resource_exhaustion_evicts_cross_worker_lru_and_retries_once_without_restart() {
+            let ledger = Arc::new(Mutex::new(Ledger::default()));
+            let a = mock_channel("a", &ledger).await;
+            let b = mock_channel("b", &ledger).await;
+            let supervisor = AneResidencySupervisor::new(AneResidencyLimits::default());
+            let wa: Arc<dyn AneShapeWorker> = a;
+            let wb: Arc<dyn AneShapeWorker> = b;
+            drop(supervisor.lease(&wa, "old", 128).await.unwrap());
+            drop(supervisor.lease(&wb, "new", 256).await.unwrap());
+            ledger
+                .lock()
+                .unwrap()
+                .exhaust_admit
+                .insert(("new".into(), 512), 1);
+            let lease = supervisor.lease(&wb, "new", 512).await.unwrap();
+            let data = ledger.lock().unwrap();
+            assert_eq!(data.admit_attempts[&("new".into(), 512)], 2);
+            assert_eq!(
+                data.events
+                    .iter()
+                    .filter(|event| event.starts_with("evict "))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                vec!["evict old 128"]
+            );
+            assert_eq!(data.connects["a"], 1);
+            assert_eq!(data.connects["b"], 1);
+            assert_eq!(supervisor.stats().restarts, 0);
+            assert!(data.max_per_model <= 4 && data.max_total <= 8);
+            drop(data);
+            drop(lease);
+        }
+
+        #[tokio::test]
+        async fn two_resource_exhaustions_refuse_transiently_after_exactly_one_retry() {
+            let ledger = Arc::new(Mutex::new(Ledger::default()));
+            let channel = mock_channel("worker", &ledger).await;
+            let worker: Arc<dyn AneShapeWorker> = channel;
+            let supervisor = AneResidencySupervisor::new(AneResidencyLimits::default());
+            for rung in [128, 256] {
+                drop(supervisor.lease(&worker, "model", rung).await.unwrap());
+            }
+            ledger
+                .lock()
+                .unwrap()
+                .exhaust_admit
+                .insert(("model".into(), 512), 2);
+            let error = match supervisor.lease(&worker, "model", 512).await {
+                Err(error) => error,
+                Ok(_) => panic!("second exhaustion was not refused"),
+            };
+            assert_eq!(error.code(), Some(ERR_ANE_RESOURCES_EXHAUSTED));
+            let refusal = error.to_engine_error(synapse_core::EngineErrorStage::Load);
+            assert_eq!(refusal.retry_after_ms, Some(ANE_RESOURCES_RETRY_AFTER_MS));
+            assert!(refusal.safe_to_retry_same_request);
+            let data = ledger.lock().unwrap();
+            assert_eq!(data.admit_attempts[&("model".into(), 512)], 2);
+            assert_eq!(
+                data.events
+                    .iter()
+                    .filter(|e| e.starts_with("evict "))
+                    .count(),
+                1
+            );
+            assert_eq!(data.connects["worker"], 1);
+            assert!(!data.resident.contains(&("model".into(), 512)));
+            assert_eq!(supervisor.resident_shapes()["model"], vec![256]);
+            assert_eq!(supervisor.stats().restarts, 0);
+        }
+
+        #[tokio::test]
+        async fn resource_exhaustion_never_evicts_a_leased_shape() {
+            let ledger = Arc::new(Mutex::new(Ledger::default()));
+            let channel = mock_channel("worker", &ledger).await;
+            let worker: Arc<dyn AneShapeWorker> = channel;
+            let supervisor = AneResidencySupervisor::new(AneResidencyLimits::default());
+            let protected = supervisor.lease(&worker, "model", 128).await.unwrap();
+            ledger
+                .lock()
+                .unwrap()
+                .exhaust_admit
+                .insert(("model".into(), 512), 1);
+            let error = match supervisor.lease(&worker, "model", 512).await {
+                Err(error) => error,
+                Ok(_) => panic!("leased-only lane should refuse instead of evicting"),
+            };
+            assert_eq!(
+                error
+                    .to_engine_error(synapse_core::EngineErrorStage::Load)
+                    .retry_after_ms,
+                Some(250)
+            );
+            let data = ledger.lock().unwrap();
+            assert_eq!(data.admit_attempts[&("model".into(), 512)], 1);
+            assert!(data.resident.contains(&("model".into(), 128)));
+            assert!(!data.events.iter().any(|e| e.starts_with("evict ")));
+            assert_eq!(supervisor.stats().restarts, 0);
+            drop(data);
+            drop(protected);
+        }
+
+        #[test]
+        fn typed_worker_resource_error_has_public_retry_delay() {
+            let error = super::super::WorkerHostError::WorkerErr {
+                code: ERR_ANE_RESOURCES_EXHAUSTED.into(),
+                msg: "pressure".into(),
+            };
+            let mapped = error.to_engine_error(synapse_core::EngineErrorStage::Load);
+            assert_eq!(mapped.retry_after_ms, Some(250));
+            assert!(mapped.safe_to_retry_same_request);
+            let other = super::super::WorkerHostError::WorkerErr {
+                code: "compile_failed".into(),
+                msg: "bad graph".into(),
+            };
+            assert_eq!(
+                other
+                    .to_engine_error(synapse_core::EngineErrorStage::Load)
+                    .retry_after_ms,
+                None
+            );
         }
 
         async fn mock_channel(worker_id: &str, ledger: &SharedLedger) -> Channel {
