@@ -1,0 +1,412 @@
+name: release-candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      S:
+        description: Full 40-character lowercase source commit
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-candidate-${{ inputs.S }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_COMMIT: ${{ inputs.S }}
+  GH_TOKEN: ${{ github.token }}
+  CARGO_TERM_COLOR: always
+  OWNED_CUDA_REDIST_BASE: https://developer.download.nvidia.com/compute/cuda/redist
+  VULKAN_LINUX_URL: https://sdk.lunarg.com/sdk/download/1.4.357.0/linux/vulkansdk-linux-x86_64-1.4.357.0.tar.xz
+  VULKAN_LINUX_SHA256: 0f09bf6a0625e346bf004be70b92907e934a4c76606b323441b2baf3a5a0e66d
+  VULKAN_WINDOWS_URL: https://sdk.lunarg.com/sdk/download/1.4.357.0/windows/vulkansdk-windows-X64-1.4.357.0.exe
+  VULKAN_WINDOWS_SHA256: 81f474711e9042f4cd22b31b2f7a8870db2e428b21586fb43dd80150be97310d
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.S }}
+      - name: Require exact source commit before any build
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          if grep -Fq 'libcublasLt.so.12' README.md; then
+            echo 'README contains the obsolete CUDA 12 soname' >&2
+            exit 1
+          fi
+      - name: Create immutable candidate draft
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="candidate-$SOURCE_COMMIT"
+          # A retry must not silently replace artifacts already used for certification.
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Candidate already exists: $tag; use a new source commit" >&2
+            exit 1
+          fi
+          gh release create "$tag" --target "$SOURCE_COMMIT" --draft --title "$tag" --notes "Certification candidate built from $SOURCE_COMMIT"
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os_arch: linux-x64
+            runner: ubuntu-24.04
+            packages: -p synapse-module -p synapse-opctl -p synapse-worker-llama -p synapse-worker-cuda -p synapse-worker-vulkan
+            features: --features cuda --features vulkan
+            binaries: ck-synapse ck-synapse-opctl ck-synapse-worker-llama ck-synapse-worker-cuda ck-synapse-worker-vulkan
+            toolkits: CUDA 13.2.1 linux-x86_64 components; Vulkan SDK 1.4.357.0 tarball
+            packaging: archive-root zip
+          - os_arch: windows-x64
+            runner: windows-2025
+            packages: -p synapse-module -p synapse-opctl -p synapse-worker-llama -p synapse-worker-cuda -p synapse-worker-vulkan
+            features: --features cuda --features vulkan
+            binaries: ck-synapse ck-synapse-opctl ck-synapse-worker-llama ck-synapse-worker-cuda ck-synapse-worker-vulkan
+            toolkits: CUDA 13.2.1 windows-x86_64 components; Vulkan SDK 1.4.357.0 installer; LLVM
+            packaging: scripts/package-owned-cuda.ps1 for CUDA; archive-root zip otherwise
+          - os_arch: darwin-arm64
+            runner: macos-15
+            packages: -p synapse-module -p synapse-opctl -p synapse-worker-llama -p synapse-worker-ane -p synapse-worker-decode -p synapse-worker-ane-direct
+            features: ''
+            binaries: ck-synapse ck-synapse-opctl ck-synapse-worker-llama ck-synapse-worker-ane ck-synapse-worker-ane-swift ck-synapse-worker-decode ck-synapse-worker-ane-direct
+            toolkits: full Xcode; no CUDA toolkit or Vulkan SDK
+            packaging: archive-root zip
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.S }}
+      - name: Require exact source commit before any build
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          ! grep -Fq 'libcublasLt.so.12' README.md
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Select full Xcode
+        if: runner.os == 'macOS'
+        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+      - name: Install LLVM
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install llvm -y --no-progress
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+        with:
+          arch: x64
+      - name: Install verified Linux CUDA 13.2.1 components and Vulkan SDK
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/cuda-13.2.1"
+          mkdir -p "$root" "$RUNNER_TEMP/cuda-components"
+          while read -r name version digest; do
+            archive="$name-linux-x86_64-$version-archive.tar.xz"
+            curl --fail --location --retry 3 "$OWNED_CUDA_REDIST_BASE/$name/linux-x86_64/$archive" -o "$RUNNER_TEMP/$archive"
+            echo "$digest  $RUNNER_TEMP/$archive" | sha256sum --check --strict
+            component="$RUNNER_TEMP/cuda-components/$name"
+            mkdir -p "$component"
+            tar -xJf "$RUNNER_TEMP/$archive" -C "$component" --strip-components=1
+            cp -a "$component/." "$root/"
+          done <<'PINS'
+          cuda_nvcc 13.2.78 1dc73b03f1d74081866986ca406f7b5981d14306ccbb03127ba45401f36e1862
+          cuda_crt 13.2.78 17e731ba749765c2e2e325e3bffecee94226c866cf59f13ba3792aa4f2b1bb31
+          libnvvm 13.2.78 9c665ebec40d0dec4df1858d5a0129972b00351dd674e783d30405cf712d925d
+          cuda_cccl 13.2.75 1801f304d92085a327ab46db58264d7f7f48cce80f5825637c405c3a2410dadd
+          cuda_cudart 13.2.75 9502ab2c7824e5ef3b554d290b9f564c5026994f469b99c72451a53578f386b9
+          libcublas 13.4.0.1 eda8001ac6b9a6ad862d054aa9b502ff39684147f1e86d02cc0a58a5ce67f62e
+          PINS
+          ln -s lib "$root/lib64"
+          echo "CUDA_HOME=$root" >> "$GITHUB_ENV"
+          echo "CUDA_PATH=$root" >> "$GITHUB_ENV"
+          echo "$root/bin" >> "$GITHUB_PATH"
+          # Runtime search contains only the two verified redistribution components, never driver stubs.
+          echo "LD_LIBRARY_PATH=$RUNNER_TEMP/cuda-components/cuda_cudart/lib:$RUNNER_TEMP/cuda-components/libcublas/lib" >> "$GITHUB_ENV"
+          curl --fail --location --retry 3 "$VULKAN_LINUX_URL" -o "$RUNNER_TEMP/vulkan.tar.xz"
+          echo "$VULKAN_LINUX_SHA256  $RUNNER_TEMP/vulkan.tar.xz" | sha256sum --check --strict
+          mkdir -p "$RUNNER_TEMP/vulkan"
+          tar -xJf "$RUNNER_TEMP/vulkan.tar.xz" -C "$RUNNER_TEMP/vulkan"
+          echo "VULKAN_SDK=$RUNNER_TEMP/vulkan/1.4.357.0/x86_64" >> "$GITHUB_ENV"
+      - name: Install verified Windows CUDA 13.2.1 components and Vulkan SDK
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = "$env:RUNNER_TEMP/cuda-13.2.1"
+          New-Item -ItemType Directory -Force $root | Out-Null
+          $components = @(
+            @('cuda_nvcc','13.2.78','da33f46a1a907a12abd0c192bbe907057b1e2269fdccfc778101fb02161e1c59'),
+            @('cuda_crt','13.2.78','0e19f9d23451d77e32794d53bb110a4eecb26d9542391dbb3f997a688c9ddecc'),
+            @('libnvvm','13.2.78','2cbd83a3d8bd594cb53cb1b7d0e129b0931f21915aa61c71c7491374b23e9b62'),
+            @('cuda_cccl','13.2.75','4c799e2c502ccc9a712d90baa102d9a2f6c50d6303f9e07a227ef4756c4d0a6a'),
+            @('cuda_cudart','13.2.75','8c7f187543545cefdbf55f66ecb8c990e159e38a78694fda50e251fcb2f4fe5f'),
+            @('libcublas','13.4.0.1','af2de4aab12ce773f934529877ae444452ddf9a5b1156aa2d7549f0ca39693ea')
+          )
+          foreach ($c in $components) {
+            $archive = "$($c[0])-windows-x86_64-$($c[1])-archive.zip"
+            $zip = "$env:RUNNER_TEMP/$archive"
+            Invoke-WebRequest "$env:OWNED_CUDA_REDIST_BASE/$($c[0])/windows-x86_64/$archive" -OutFile $zip
+            if ((Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant() -ne $c[2]) { throw "Digest mismatch: $archive" }
+            $component = "$env:RUNNER_TEMP/x-$($c[0])"
+            Expand-Archive $zip $component
+            $package = @(Get-ChildItem $component -Directory)
+            if ($package.Count -ne 1) { throw "Unexpected component layout: $archive" }
+            Copy-Item "$($package[0].FullName)/*" $root -Recurse -Force
+          }
+          "CUDA_PATH=$root" >> $env:GITHUB_ENV
+          "CUDA_HOME=$root" >> $env:GITHUB_ENV
+          "$root/bin/x64" >> $env:GITHUB_PATH
+          "$root/bin" >> $env:GITHUB_PATH
+          $installer = "$env:RUNNER_TEMP/vulkan.exe"
+          curl.exe --fail --location --retry 3 --output $installer $env:VULKAN_WINDOWS_URL
+          if ($LASTEXITCODE -ne 0) { throw 'Vulkan download failed' }
+          if ((Get-FileHash $installer -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:VULKAN_WINDOWS_SHA256) { throw 'Vulkan digest mismatch' }
+          $sdk = "$env:RUNNER_TEMP/VulkanSDK/1.4.357.0"
+          $p = Start-Process $installer -Wait -PassThru -ArgumentList @('--root', $sdk, '--accept-licenses', '--default-answer', '--confirm-command', 'install')
+          if ($p.ExitCode -ne 0) { throw "Vulkan installer exit $($p.ExitCode)" }
+          "VULKAN_SDK=$sdk" >> $env:GITHUB_ENV
+      - name: Build every release asset once
+        shell: bash
+        run: cargo build --release --locked ${{ matrix.packages }} ${{ matrix.features }}
+      - name: Stage Swift Core ML worker
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import shutil
+          workers = list(Path('target/release/build').glob('**/ck-synapse-worker-ane-swift'))
+          assert len(workers) == 1, workers
+          shutil.copy2(workers[0], 'target/release/ck-synapse-worker-ane-swift')
+          PY
+      - name: Check SPIR-V set digest against synapse-core
+        if: runner.os != 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import pathlib, re, subprocess, os
+          binary = 'target/release/ck-synapse-worker-vulkan' + ('.exe' if os.name == 'nt' else '')
+          output = subprocess.check_output([binary, '--version'], text=True)
+          print(output)
+          actual = re.search(r'kernel_revision=([0-9a-f]{64})', output).group(1)
+          core = pathlib.Path('crates/synapse-core/src/worker_engine_names.rs').read_text()
+          expected = re.search(r'VULKAN_KERNEL_REVISION: &str =\s*"([0-9a-f]{64})"', core).group(1)
+          assert actual == expected, (actual, expected)
+          PY
+      - name: Require exact CUDA ELF dependencies and exercise missing runtime loader failure
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          readelf -d target/release/ck-synapse-worker-cuda
+          python3 - <<'PY'
+          import os, pathlib, re, shutil, subprocess, tempfile
+          worker = 'target/release/ck-synapse-worker-cuda'
+          dynamic = subprocess.check_output(['readelf', '-d', worker], text=True)
+          needed = re.findall(r'\(NEEDED\).*?\[(.*?)\]', dynamic)
+          cuda = sorted(n for n in needed if re.match(r'lib(?:cuda|cublas)', n))
+          assert cuda == ['libcublas.so.13', 'libcublasLt.so.13', 'libcudart.so.13'], cuda
+          with tempfile.TemporaryDirectory() as isolated:
+              for directory in os.environ['LD_LIBRARY_PATH'].split(':'):
+                  for lib in pathlib.Path(directory).glob('*.so*'):
+                      if not lib.name.startswith('libcublasLt.so'):
+                          shutil.copy2(lib.resolve(), pathlib.Path(isolated) / lib.name)
+              result = subprocess.run([worker, '--probe-floor', '--model', 'gte-modernbert-base'], env={**os.environ, 'LD_LIBRARY_PATH': isolated}, capture_output=True, text=True)
+              print(result.stderr)
+              assert result.returncode != 0 and 'libcublasLt.so.13' in result.stderr, result
+          PY
+      - name: Require CUDA DLLs to be absent from load-time imports
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $output = & dumpbin /dependents target/release/ck-synapse-worker-cuda.exe
+          if ($LASTEXITCODE -ne 0) { throw 'dumpbin failed' }
+          $output | Write-Output
+          $normal = (($output -join "`n") -split 'Image has the following delay load dependencies:')[0]
+          foreach ($dll in @('cudart64_13.dll', 'cublas64_13.dll', 'cublasLt64_13.dll', 'nvcuda.dll')) {
+            if ($normal -match [regex]::Escape($dll)) { throw "Load-time CUDA import: $dll" }
+          }
+      # The generated integration harness uses absolute release paths. Cargo tests
+      # only synapse-core, so it cannot rebuild a shipped worker in another profile.
+      - name: Generate hosted integration tests for the just-built binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p crates/synapse-core/tests
+          cat > crates/synapse-core/tests/candidate_workers.rs <<'RS'
+          use std::{path::PathBuf, time::Duration};
+          use synapse_core::{accept_worker_handshake_with_engine_and_protocol_version, encode_i32_frame, prepare_listener, read_json, write_json, write_raw, WorkerCandidate, WorkerRequest, WorkerResponse, WorkerSequence, DEFAULT_MAX_FRAME_BYTES as MAX};
+          #[tokio::test]
+          async fn candidate_hosted_protocol_matrix() {
+              let root = PathBuf::from(std::env::var_os("CANDIDATE_BIN_DIR").unwrap());
+              let suffix = if cfg!(windows) { ".exe" } else { "" };
+              assert!(std::process::Command::new(root.join(format!("ck-synapse{suffix}"))).arg("--version").status().unwrap().success());
+              let mut workers = vec![("llama", "llama.cpp-worker", true)];
+              if cfg!(target_os="macos") {
+                  workers.extend([("decode", "owned-metal-decode", false), ("ane", "ane-coreml-worker", false), ("ane-direct", "ane-direct-worker", true)]);
+              } else {
+                  workers.extend([("cuda", "owned-cuda", true), ("vulkan", "owned-vulkan", true)]);
+              }
+              for (worker, engine, unsupported) in workers {
+                  println!("hosted protocol: {worker}");
+                  let nonce = format!("candidate-{}-{worker}", std::process::id());
+                  let runtime = std::env::temp_dir().join(&nonce);
+                  let (endpoint, listener) = prepare_listener(&runtime, &nonce).unwrap();
+                  let mut command = tokio::process::Command::new(root.join(format!("ck-synapse-worker-{worker}{suffix}")));
+                  command.arg(if cfg!(windows) { "--pipe" } else { "--socket" }).arg(endpoint).arg("--nonce").arg(&nonce).kill_on_drop(true);
+                  let mut child = command.spawn().unwrap();
+                  let mut stream = accept_worker_handshake_with_engine_and_protocol_version(listener, &nonce, MAX, Duration::from_secs(30), Some(engine), None, None).await.unwrap();
+                  for index in 0..=usize::from(unsupported) {
+                      if index == 1 {
+                          let request = if worker == "llama" {
+                              WorkerRequest::RerankSequences { req_id: "unsupported".into(), model_ref: "not-loaded".into(), sequences: vec![WorkerSequence { n_tokens: 2 }] }
+                          } else {
+                              WorkerRequest::Rerank { req_id: "unsupported".into(), model_ref: "not-loaded".into(), query_n_tokens: 1, candidates: vec![WorkerCandidate { n_tokens: 1 }] }
+                          };
+                          write_json(&mut stream, &request, MAX).await.unwrap();
+                          write_raw(&mut stream, &encode_i32_frame(&[1,2]), MAX).await.unwrap();
+                          let response: WorkerResponse = tokio::time::timeout(Duration::from_secs(30), read_json(&mut stream, MAX)).await.unwrap().unwrap();
+                          assert!(matches!(response, WorkerResponse::Err { code, .. } if code == "unsupported_request"));
+                      }
+                      write_json(&mut stream, &WorkerRequest::Ping { req_id: format!("ping-{index}") }, MAX).await.unwrap();
+                      let response: WorkerResponse = tokio::time::timeout(Duration::from_secs(30), read_json(&mut stream, MAX)).await.unwrap().unwrap();
+                      assert!(matches!(response, WorkerResponse::Pong { req_id, .. } if req_id == format!("ping-{index}")));
+                  }
+                  write_json(&mut stream, &WorkerRequest::Shutdown {}, MAX).await.unwrap();
+                  assert!(tokio::time::timeout(Duration::from_secs(30), child.wait()).await.unwrap().unwrap().success());
+                  let _ = std::fs::remove_dir_all(runtime);
+              }
+          }
+          RS
+          echo "CANDIDATE_BIN_DIR=$(pwd)/target/release" >> "$GITHUB_ENV"
+      - name: Hosted protocol integration tests
+        shell: bash
+        run: cargo test --release --locked -p synapse-core --test candidate_workers -- --nocapture
+      - name: Package Windows CUDA with runtime manifests and licenses
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          ./scripts/package-owned-cuda.ps1 -Worker target/release/ck-synapse-worker-cuda.exe -RuntimeComponents @("$env:RUNNER_TEMP/x-cuda_cudart", "$env:RUNNER_TEMP/x-libcublas") -Output dist/ck-synapse-worker-cuda-windows-x64.zip
+      - name: Package root-level binaries and shasum-format sidecars
+        shell: bash
+        env:
+          OS_ARCH: ${{ matrix.os_arch }}
+          BINARIES: ${{ matrix.binaries }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for bin in $BINARIES; do
+            asset="$bin-$OS_ARCH.zip"
+            if [ "$bin-$OS_ARCH" != ck-synapse-worker-cuda-windows-x64 ]; then
+              src="target/release/$bin"
+              [ -f "$src" ] || src="$src.exe"
+              test -f "$src"
+              staging="$(mktemp -d)"
+              cp "$src" "$staging/"
+              (cd "$staging" && 7z a -tzip "$OLDPWD/dist/$asset" . >/dev/null)
+              rm -rf "$staging"
+            fi
+            if command -v shasum >/dev/null 2>&1; then
+              (cd dist && shasum -a 256 "$asset" > "$asset.sha256")
+            else
+              (cd dist && sha256sum "$asset" > "$asset.sha256")
+            fi
+          done
+      - name: Emit release-manifest.json (declares the daemon floor)
+        if: matrix.os_arch == 'linux-x64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          protocol=$(awk '/^name = "subc-protocol"$/{getline; gsub(/[\"]/,""); print $3}' Cargo.lock)
+          case "$protocol" in
+            0.29.*) ;;
+            *)
+              echo "subc-protocol is $protocol, not 0.29.x: recheck the ck-subc floor with subconscious before releasing" >&2
+              exit 1
+              ;;
+          esac
+          printf '{\n  "requires_core": "0.20.53"\n}\n' > dist/release-manifest.json
+          python3 -c "import json;d=json.load(open('dist/release-manifest.json'));assert d['requires_core']=='0.20.53',d"
+      - name: Upload assets to candidate draft
+        shell: bash
+        run: gh release upload "candidate-$SOURCE_COMMIT" dist/*
+
+  reconvert:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.S }}
+      - name: Require exact source commit before any build
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Download every pinned checkpoint into a fresh environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/reconvert-venv"
+          "$RUNNER_TEMP/reconvert-venv/bin/pip" install huggingface-hub==0.34.4
+          export HF_HUB_CACHE="$RUNNER_TEMP/reconvert-hub"
+          test ! -e "$HF_HUB_CACHE"
+          "$RUNNER_TEMP/reconvert-venv/bin/python" - <<'PY'
+          import json, os
+          from huggingface_hub import snapshot_download
+          models = json.load(open('bench/parity/models.json'))['models']
+          for slug, model in models.items():
+              print('Downloading pinned checkpoint', slug, model['hf_revision'], flush=True)
+              snapshot_download(repo_id=model['hf_repo'], revision=model['hf_revision'], cache_dir=os.environ['HF_HUB_CACHE'])
+          PY
+          echo "HF_HUB_CACHE=$HF_HUB_CACHE" >> "$GITHUB_ENV"
+      - name: Reproduce every converted-package digest
+        run: cargo run --release --locked --manifest-path bench/parity/Cargo.toml --bin parity-manifest -- reconvert --hf-cache "$HF_HUB_CACHE"
+
+  inventory:
+    needs: [build, reconvert]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.S }}
+      - name: Require exact source commit
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+      - name: Require every inventory entry and sidecar in the draft
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release view "candidate-$SOURCE_COMMIT" --json isDraft,assets > candidate.json
+          python3 - <<'PY'
+          import json
+          inventory = json.load(open('bench/parity/release-assets.json'))
+          candidate = json.load(open('candidate.json'))
+          assert candidate['isDraft'], 'candidate must remain a draft'
+          names = {asset['name'] for asset in candidate['assets']}
+          expected = {entry['asset'] for entry in inventory['assets']}
+          expected |= {name + inventory['sidecar_suffix'] for name in expected if name.endswith('.zip')}
+          assert expected <= names, f'missing candidate assets: {sorted(expected - names)}'
+          print(f'checked {len(expected)} candidate assets and sidecars')
+          PY

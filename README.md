@@ -134,7 +134,16 @@ before CUDA calls. No global PATH changes or extra DLL search directories
 are needed. Release-matrix publication remains separate from this manual
 gate artifact.
 
-This delay-loading behavior is Windows-only. The Linux ELF worker retains a
-`DT_NEEDED` dependency on `libcublasLt.so.12`; without that runtime on the
-library search path, even `--probe-floor` exits 127 before reaching the
-driver-only probe.
+This delay-loading behavior is Windows-only. The Linux ELF worker requires
+exactly the CUDA runtime sonames `libcudart.so.13`, `libcublas.so.13` and
+`libcublasLt.so.13` on the library search path. Missing any of them prevents
+even `--probe-floor` from reaching the driver-only probe. The driver library
+`libcuda.so.1` is resolved at runtime, not a load-time dependency. CUDA 13.2.1
+builds require NVIDIA driver API >= 13020 (the raw `cuDriverGetVersion()`
+integer), not merely a driver advertising CUDA 13.0.
+
+The `release-candidate` workflow builds these workers from an exact source
+commit and uploads immutable assets to a draft `candidate-<S>` release, where
+`S` is the full 40-character source commit identifier, for hardware
+certification. Hosted protocol checks and missing-runtime checks
+are not embedding or reranking certification.
